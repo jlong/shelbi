@@ -79,7 +79,11 @@ pub fn run(project_opt: Option<String>, args: Args) -> Result<()> {
             .context("creating tmux session")?;
     }
 
-    // 2. Create the worktree (git worktree add -b <branch> <path>).
+    // 2. Make sure the repo's .gitignore covers .shelbi/ so the parent
+    //    worktree doesn't get marked dirty by our metadata.
+    ensure_gitignored(&host, &machine)?;
+
+    // 3. Create the worktree (git worktree add -b <branch> <path>).
     create_worktree(&host, &machine, &branch, &worktree, &project)?;
 
     // 3. Spawn the worker window running the agent CLI inside the worktree.
@@ -141,6 +145,32 @@ fn expand_tilde(p: &std::path::Path) -> PathBuf {
         }
     }
     p.to_path_buf()
+}
+
+/// Add `.shelbi/` to the repo's `.gitignore` if it isn't already covered.
+/// Writes to the file on the worker's filesystem via `sh -c`; never commits.
+fn ensure_gitignored(host: &Host, machine: &Machine) -> Result<()> {
+    let repo = machine.work_dir.to_string_lossy().into_owned();
+    // `git check-ignore` exits 0 if the path is ignored, 1 if not, 128 on error.
+    let probe = shelbi_ssh::run(
+        host,
+        ["git", "-C", &repo, "check-ignore", "-q", ".shelbi/"],
+    )
+    .map_err(|e| anyhow!(e))?;
+    if probe.status.success() {
+        return Ok(());
+    }
+    let gitignore = format!("{repo}/.gitignore");
+    let snippet =
+        "\n# shelbi worktrees + metadata (https://github.com/jlong/shelbi)\n.shelbi/\n";
+    // Append via `sh -c` so the redirect works locally and over SSH.
+    let cmd = format!(
+        "printf '%s' {} >> {}",
+        shelbi_agent::shell_escape(snippet),
+        shelbi_agent::shell_escape(&gitignore),
+    );
+    shelbi_ssh::run_capture(host, ["sh", "-c", &cmd]).map_err(|e| anyhow!(e))?;
+    Ok(())
 }
 
 fn create_worktree(
