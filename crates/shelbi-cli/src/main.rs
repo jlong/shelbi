@@ -61,6 +61,8 @@ enum Cmd {
     Archive { id: String },
     /// Scaffold ~/.shelbi/ and an initial project (stub).
     Init,
+    /// Start the orchestrator agent in the project's tmux session window 1.
+    Orchestrate(commands::orchestrate::Args),
 }
 
 fn main() -> Result<()> {
@@ -81,6 +83,7 @@ fn main() -> Result<()> {
         Some(Cmd::Merge { id, pr }) => commands::merge::run(cli.project, id, pr),
         Some(Cmd::Archive { id }) => commands::archive::run(cli.project, id),
         Some(Cmd::Init) => commands::init::run(),
+        Some(Cmd::Orchestrate(args)) => commands::orchestrate::run(cli.project, args),
     }
 }
 

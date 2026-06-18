@@ -22,6 +22,8 @@ shelbi-orchestrator = { workspace = true }
 shelbi-tui = { workspace = true }
 shelbi-palette = { workspace = true }
 
+# clap derive needs to be visible in the orchestrate args struct
+
 anyhow = { workspace = true }
 clap = { workspace = true }
 chrono = { workspace = true }

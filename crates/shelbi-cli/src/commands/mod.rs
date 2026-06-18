@@ -3,6 +3,7 @@ pub mod diff;
 pub mod init;
 pub mod list;
 pub mod merge;
+pub mod orchestrate;
 pub mod send;
 pub mod spawn;
 pub mod status;
