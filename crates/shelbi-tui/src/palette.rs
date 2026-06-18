@@ -169,10 +169,12 @@ pub fn activate(app: &mut App, entry: &Entry) -> bool {
 }
 
 fn centered_rect(area: Rect, percent_x: u16, height: u16) -> Rect {
-    let w = (area.width * percent_x / 100).max(40);
-    let h = height.min(area.height.saturating_sub(2));
-    let x = (area.width.saturating_sub(w)) / 2;
-    let y = (area.height.saturating_sub(h)) / 3;
+    // Always clamp to the frame: writing outside the buffer panics ratatui.
+    let target_w = (area.width.saturating_mul(percent_x) / 100).max(20);
+    let w = target_w.min(area.width);
+    let h = height.min(area.height);
+    let x = area.width.saturating_sub(w) / 2;
+    let y = area.height.saturating_sub(h) / 3;
     Rect {
         x: area.x + x,
         y: area.y + y,

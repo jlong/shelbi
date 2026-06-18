@@ -157,7 +157,7 @@ pub fn ensure_dashboard(project_name: &str) -> Result<BootstrapStatus> {
             "split-window",
             "-h",
             "-l",
-            "78%",
+            "70%",
             "-t",
             &dashboard,
             "sh",
