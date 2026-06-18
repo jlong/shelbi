@@ -6,7 +6,7 @@ use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, List, ListItem, ListState, Padding, Paragraph},
+    widgets::{List, ListItem, ListState, Paragraph},
     Frame,
 };
 
@@ -23,16 +23,21 @@ pub fn render_full(f: &mut Frame, app: &App, area: Rect) {
 }
 
 fn render_list(f: &mut Frame, app: &App, area: Rect) {
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .padding(Padding::new(1, 1, 0, 0))
-        .title(Span::styled(
-            format!(" {} ", app.project_name),
-            Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
-        ));
-    let inner = block.inner(area);
-    f.render_widget(block, area);
+    let layout = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(2), Constraint::Min(1)])
+        .split(area);
 
+    let title = Paragraph::new(vec![
+        Line::from(Span::styled(
+            app.project_name.clone(),
+            Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+        )),
+        Line::raw(""),
+    ]);
+    f.render_widget(title, layout[0]);
+
+    let inner = layout[1];
     let rows = app.rows();
     let mut items: Vec<ListItem> = Vec::new();
     for (i, row) in rows.iter().enumerate() {

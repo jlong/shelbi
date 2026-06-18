@@ -16,7 +16,7 @@ use ratatui::{
     layout::{Constraint, Direction, Layout},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, List, ListItem, ListState, Padding, Paragraph},
+    widgets::{List, ListItem, ListState, Paragraph},
     Frame, Terminal,
 };
 use shelbi_core::{Agent, Status};
@@ -131,22 +131,22 @@ fn picker_loop<B: ratatui::backend::Backend>(
 
 fn render(f: &mut Frame, state: &State, results: &[(Entry, u16)]) {
     let area = f.area();
-    let outer = Block::default()
-        .borders(Borders::ALL)
-        .padding(Padding::new(1, 1, 0, 0))
-        .title(Span::styled(
-            format!(" shelbi · {} ", state.project),
-            Style::default()
-                .fg(Color::Cyan)
-                .add_modifier(Modifier::BOLD),
-        ));
-    let inner = outer.inner(area);
-    f.render_widget(outer, area);
-
     let layout = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Length(2), Constraint::Min(1), Constraint::Length(1)])
-        .split(inner);
+        .constraints([
+            Constraint::Length(1),
+            Constraint::Length(2),
+            Constraint::Min(1),
+            Constraint::Length(1),
+        ])
+        .split(area);
+
+    // Title.
+    let title = Paragraph::new(Line::from(Span::styled(
+        format!("shelbi · {}", state.project),
+        Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+    )));
+    f.render_widget(title, layout[0]);
 
     // Search input.
     let prompt = Line::from(vec![
@@ -154,7 +154,7 @@ fn render(f: &mut Frame, state: &State, results: &[(Entry, u16)]) {
         Span::raw(state.query.clone()),
         Span::styled("▏", Style::default().fg(Color::Cyan)),
     ]);
-    f.render_widget(Paragraph::new(vec![prompt, Line::raw("")]), layout[0]);
+    f.render_widget(Paragraph::new(vec![prompt, Line::raw("")]), layout[1]);
 
     // Result list.
     let items: Vec<ListItem> = results
@@ -187,14 +187,14 @@ fn render(f: &mut Frame, state: &State, results: &[(Entry, u16)]) {
     if !results.is_empty() {
         s.select(Some(state.selected.min(results.len().saturating_sub(1))));
     }
-    f.render_stateful_widget(list, layout[1], &mut s);
+    f.render_stateful_widget(list, layout[2], &mut s);
 
     // Footer.
     let footer = Paragraph::new(Line::from(vec![Span::styled(
-        " ↑↓ navigate · Enter activate · Esc / Ctrl+P close",
+        "↑↓ navigate · Enter activate · Esc / Ctrl+P close",
         Style::default().fg(Color::DarkGray),
     )]));
-    f.render_widget(footer, layout[2]);
+    f.render_widget(footer, layout[3]);
 }
 
 // ---------------------------------------------------------------------------
