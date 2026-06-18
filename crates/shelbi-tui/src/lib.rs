@@ -79,12 +79,17 @@ fn main_loop<B: ratatui::backend::Backend>(
 
         term.draw(|f| {
             let area = f.area();
+            let outer = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([Constraint::Min(10), Constraint::Length(1)])
+                .split(area);
             let chunks = Layout::default()
                 .direction(Direction::Horizontal)
                 .constraints([Constraint::Length(24), Constraint::Min(40)])
-                .split(area);
+                .split(outer[0]);
             sidebar::render(f, app, chunks[0]);
             view::render(f, app, chunks[1]);
+            view::render_footer(f, app, outer[1]);
             palette::render(f, pal, &pal_results);
         })?;
 

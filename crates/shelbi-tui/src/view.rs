@@ -10,6 +10,27 @@ use ratatui::{
 
 use crate::app::{App, View};
 
+/// Render the status footer (one line at the bottom).
+pub fn render_footer(f: &mut Frame, app: &App, area: Rect) {
+    let proj = app.project_name.as_deref().unwrap_or("(no project)");
+    let line = if app.status_line.is_empty() {
+        Line::from(vec![
+            Span::styled(format!(" session: {} ", app.session_name), Style::default().fg(Color::DarkGray)),
+            Span::styled(format!("· project: {} ", proj), Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                "· q quit  ^P palette  ↑↓ nav  Enter activate",
+                Style::default().fg(Color::DarkGray),
+            ),
+        ])
+    } else {
+        Line::from(vec![
+            Span::styled(" ", Style::default()),
+            Span::styled(app.status_line.clone(), Style::default().fg(Color::Yellow)),
+        ])
+    };
+    f.render_widget(Paragraph::new(line), area);
+}
+
 pub fn render(f: &mut Frame, app: &App, area: Rect) {
     let title = app.view.title();
     let block = Block::default()
@@ -37,24 +58,55 @@ fn render_chat(f: &mut Frame, app: &App, area: Rect) {
         .constraints([Constraint::Min(1), Constraint::Length(3)])
         .split(area);
 
-    // Transcript: live capture of the orchestrator pane, or a hint if it
-    // isn't running yet.
+    // Transcript: live capture of the orchestrator pane, or a setup hint.
     let snap = strip_ansi(&app.pane_snapshot);
-    let transcript = if snap.trim().is_empty() {
+    let transcript = if app.project_name.is_none() {
         Paragraph::new(vec![
             Line::from(Span::styled(
-                "no orchestrator pane yet",
-                Style::default().fg(Color::DarkGray),
+                "no project loaded in this session",
+                Style::default().fg(Color::Yellow),
             )),
             Line::from(""),
-            Line::from("start it with:"),
+            Line::from("set one up with:"),
+            Line::from(""),
             Line::from(Span::styled(
-                "  shelbi orchestrate",
+                "  cd /path/to/your/repo",
+                Style::default().fg(Color::Cyan),
+            )),
+            Line::from(Span::styled(
+                "  shelbi init --project myapp",
+                Style::default().fg(Color::Cyan),
+            )),
+            Line::from(""),
+            Line::from("then add it to your session at ~/.shelbi/sessions/default.yaml:"),
+            Line::from(Span::styled(
+                "  projects:",
+                Style::default().fg(Color::Cyan),
+            )),
+            Line::from(Span::styled(
+                "    - { name: myapp, machines: [hub] }",
+                Style::default().fg(Color::Cyan),
+            )),
+            Line::from(""),
+            Line::from("press q to exit, fix the config, and relaunch."),
+        ])
+    } else if snap.trim().is_empty() {
+        let project = app.project_name.as_deref().unwrap_or("");
+        Paragraph::new(vec![
+            Line::from(Span::styled(
+                format!("orchestrator not running for `{project}`"),
+                Style::default().fg(Color::Yellow),
+            )),
+            Line::from(""),
+            Line::from("start it from another terminal:"),
+            Line::from(""),
+            Line::from(Span::styled(
+                format!("  shelbi --project {project} orchestrate"),
                 Style::default().fg(Color::Cyan),
             )),
             Line::from(""),
             Line::from(Span::styled(
-                "then talk to it from the input below or Ctrl+P → New task",
+                "then come back here — the chat below will reach it.",
                 Style::default().fg(Color::DarkGray),
             )),
         ])
