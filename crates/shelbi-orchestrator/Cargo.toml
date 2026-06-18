@@ -11,3 +11,6 @@ description = "Orchestrator pane bootstrap and system prompt for shelbi"
 [dependencies]
 shelbi-core = { workspace = true }
 shelbi-state = { workspace = true }
+shelbi-tmux = { workspace = true }
+shelbi-ssh = { workspace = true }
+shelbi-agent = { workspace = true }

@@ -123,11 +123,15 @@ impl App {
             self.session = shelbi_state::load_session(&self.session_name).ok();
         }
         // Pick a project for "current": first project in the session, else
-        // first thing under ~/.shelbi/projects.
+        // first thing under ~/.shelbi/projects. When we settle on one for
+        // the first time, eagerly ensure its orchestrator pane exists so
+        // the Chat input "just works" without a separate CLI step.
         if self.project_name.is_none() {
             if let Some(s) = &self.session {
                 if let Some(sp) = s.projects.first() {
-                    self.project_name = Some(sp.name.clone());
+                    let pname = sp.name.clone();
+                    self.project_name = Some(pname.clone());
+                    self.bootstrap_orchestrator(&pname);
                 }
             }
         }
@@ -138,6 +142,19 @@ impl App {
         self.last_refresh = Instant::now();
         self.refresh_pane_snapshot();
         Ok(())
+    }
+
+    fn bootstrap_orchestrator(&mut self, project_name: &str) {
+        match shelbi_orchestrator::ensure_running(project_name) {
+            Ok(shelbi_orchestrator::BootstrapStatus::Started) => {
+                self.status_line = format!("✓ started orchestrator for {project_name}");
+            }
+            Ok(shelbi_orchestrator::BootstrapStatus::AlreadyRunning) => {}
+            Err(e) => {
+                self.status_line =
+                    format!("orchestrator bootstrap failed: {e} (try `shelbi --project {project_name} orchestrate` in another terminal)");
+            }
+        }
     }
 
     /// Refresh the right-pane snapshot: capture-pane output for whichever

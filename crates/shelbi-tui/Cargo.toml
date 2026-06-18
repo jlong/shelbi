@@ -12,6 +12,7 @@ description = "ratatui dashboard for shelbi"
 shelbi-core = { workspace = true }
 shelbi-state = { workspace = true }
 shelbi-tmux = { workspace = true }
+shelbi-orchestrator = { workspace = true }
 shelbi-palette = { workspace = true }
 ratatui = { workspace = true }
 crossterm = { workspace = true }
