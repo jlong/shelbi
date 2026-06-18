@@ -75,7 +75,7 @@ fn render_footer(f: &mut Frame, app: &App, area: Rect) {
     let lines = if app.status_line.is_empty() {
         vec![
             Line::from(Span::styled(
-                "  ^P palette  Enter focus",
+                "  C-␣ palette  Enter focus",
                 Style::default().fg(Color::DarkGray),
             )),
             Line::from(Span::styled(
@@ -90,7 +90,7 @@ fn render_footer(f: &mut Frame, app: &App, area: Rect) {
                 Style::default().fg(Color::Yellow),
             )),
             Line::from(Span::styled(
-                "  ^P palette  q quit",
+                "  C-␣ palette  q quit",
                 Style::default().fg(Color::DarkGray),
             )),
         ]

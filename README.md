@@ -47,7 +47,7 @@ shelbi gives you:
                   you (terminal)
                         │
                 ┌───────▼────────┐
-                │ shelbi (TUI)   │   ratatui, Ctrl+P palette
+                │ shelbi (TUI)   │   ratatui, Ctrl+Space palette
                 │   hub binary   │
                 └───┬──────┬─────┘
                     │      │
@@ -110,7 +110,7 @@ actions — same convention as VS Code / JetBrains / Telescope.
 │ ✓ csv-export  hub  ││                                              │
 │ ○ migrate-db  hub  ││ shelbi: editing tests now — should be done   │
 │                    ││   in a couple minutes. Ctrl+P to jump to it. │
-│ ^P to switch       ││ > _                                          │
+│ C-␣ to switch      ││ > _                                          │
 └────────────────────┘└──────────────────────────────────────────────┘
 ```
 
@@ -241,7 +241,7 @@ Fix the login bug on Safari — cookie domain mismatch breaks SSO redirect.
 | 1 |   | Single local worker — `shelbi spawn` opens a tmux window, runs an agent, captures output |
 | 2 |   | Full CLI: spawn / send / status / tail / diff / merge / list / archive |
 | 3 |   | Orchestrator bridge — window 1 + generated system prompt + CLI tool surface |
-| 4 |   | TUI dashboard — two-pane layout + Ctrl+P palette |
+| 4 |   | TUI dashboard — two-pane layout + Ctrl+Space palette |
 | 5 |   | SSH/remote workers — `Local \| Remote` host abstraction |
 | 6 |   | Session config — workspace YAML, multi-project |
 | 7 |   | Review/merge polish — inline diff, `--pr` flow, archive flow |

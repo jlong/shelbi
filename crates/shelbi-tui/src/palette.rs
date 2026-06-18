@@ -91,7 +91,7 @@ pub fn render(f: &mut Frame, state: &PaletteState, results: &[(Entry, u16)]) {
         .borders(Borders::ALL)
         .padding(Padding::new(1, 1, 0, 0))
         .title(Span::styled(
-            " ^P palette ",
+            " C-␣ palette ",
             Style::default()
                 .add_modifier(Modifier::BOLD)
                 .fg(Color::Cyan),

@@ -1,4 +1,4 @@
-//! Command palette (Ctrl+P) — fuzzy matcher backing the TUI's palette overlay.
+//! Command palette (Ctrl+Space) — fuzzy matcher backing the TUI's palette overlay.
 //!
 //! Pure data + matching. Rendering lives in `shelbi-tui`.
 

@@ -4,7 +4,8 @@
 //!   dashboard layout (sidebar + orchestrator) and `exec tmux attach`.
 //!   This is what `shelbi` (no subcommand) invokes.
 //! - `run_sidebar(project)` — the minimal ratatui process that lives in
-//!   the dashboard's left pane: agent list, status footer, Ctrl+P palette.
+//!   the dashboard's left pane: agent list, status footer, Ctrl+Space
+//!   palette.
 //!   Selecting an agent switches the tmux window. This is what
 //!   `shelbi __sidebar PROJECT` invokes.
 
@@ -140,11 +141,13 @@ fn handle_palette_key(
     code: KeyCode,
     mods: KeyModifiers,
 ) {
-    if mods.contains(KeyModifiers::CONTROL) {
-        if matches!(code, KeyCode::Char('c') | KeyCode::Char('p')) {
-            pal.close();
-            return;
-        }
+    if is_palette_chord(code, mods) {
+        pal.close();
+        return;
+    }
+    if mods.contains(KeyModifiers::CONTROL) && matches!(code, KeyCode::Char('c')) {
+        pal.close();
+        return;
     }
     match code {
         KeyCode::Esc => pal.close(),
@@ -172,24 +175,32 @@ fn handle_palette_key(
     }
 }
 
+/// Is this keypress the palette-toggle chord? Ctrl+Space arrives differently
+/// depending on the terminal: crossterm reports it as Char(' ') with CONTROL
+/// on most modern terminals, but some send the legacy NUL byte.
+fn is_palette_chord(code: KeyCode, mods: KeyModifiers) -> bool {
+    if mods.contains(KeyModifiers::CONTROL) && matches!(code, KeyCode::Char(' ')) {
+        return true;
+    }
+    if matches!(code, KeyCode::Null) {
+        return true;
+    }
+    false
+}
+
 fn handle_key(
     app: &mut App,
     pal: &mut palette::PaletteState,
     code: KeyCode,
     mods: KeyModifiers,
 ) {
-    if mods.contains(KeyModifiers::CONTROL) {
-        match code {
-            KeyCode::Char('c') => {
-                app.should_quit = true;
-                return;
-            }
-            KeyCode::Char('p') => {
-                pal.toggle();
-                return;
-            }
-            _ => {}
-        }
+    if is_palette_chord(code, mods) {
+        pal.toggle();
+        return;
+    }
+    if mods.contains(KeyModifiers::CONTROL) && matches!(code, KeyCode::Char('c')) {
+        app.should_quit = true;
+        return;
     }
     match code {
         KeyCode::Char('q') => app.should_quit = true,

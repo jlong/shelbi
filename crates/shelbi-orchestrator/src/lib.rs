@@ -4,7 +4,7 @@
 //! first window is `dashboard`, a two-pane layout:
 //!
 //! - left pane (small): the `shelbi __sidebar <project>` ratatui process —
-//!   nav, agent list, Ctrl+P palette.
+//!   nav, agent list, Ctrl+Space palette.
 //! - right pane: the configured orchestrator agent CLI (e.g. `claude`),
 //!   running natively in the pane. The user types into it directly.
 //!
