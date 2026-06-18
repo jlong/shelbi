@@ -899,6 +899,7 @@ dependencies = [
  "shelbi-core",
  "shelbi-palette",
  "shelbi-state",
+ "tracing",
 ]
 
 [[package]]

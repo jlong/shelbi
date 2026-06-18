@@ -12,9 +12,15 @@ mod commands;
 )]
 struct Cli {
     /// Project to operate on. Defaults to the project named in $SHELBI_PROJECT
-    /// or the current directory's `.shelbi/project` marker.
+    /// or the closest `.shelbi/project` marker file in the current directory's
+    /// ancestors.
     #[arg(long, short = 'p', global = true, env = "SHELBI_PROJECT")]
     project: Option<String>,
+
+    /// Session (workspace) to load — only used when no subcommand is given.
+    /// Defaults to $SHELBI_SESSION or "default".
+    #[arg(env = "SHELBI_SESSION")]
+    session: Option<String>,
 
     #[command(subcommand)]
     cmd: Option<Cmd>,
@@ -62,7 +68,10 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.cmd {
-        None => shelbi_tui::run().context("running TUI"),
+        None => {
+            let session = cli.session.unwrap_or_else(|| "default".to_string());
+            shelbi_tui::run(&session).context("running TUI")
+        }
         Some(Cmd::Spawn(args)) => commands::spawn::run(cli.project, args),
         Some(Cmd::List) => commands::list::run(cli.project),
         Some(Cmd::Status { id }) => commands::status::run(cli.project, id),
