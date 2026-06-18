@@ -5,9 +5,6 @@ use shelbi_core::{Host, Machine, Status};
 use super::require_project;
 
 pub fn run(project_opt: Option<String>, id: String, pr: bool) -> Result<()> {
-    if pr {
-        bail!("`shelbi merge --pr` lands in Phase 7 (GitHub PR flow)");
-    }
     let project_name = require_project(project_opt)?;
     let file = shelbi_state::load_agent(&project_name, &id).map_err(|e| anyhow!(e))?;
     let project = shelbi_state::load_project(&project_name).map_err(|e| anyhow!(e))?;
@@ -18,6 +15,19 @@ pub fn run(project_opt: Option<String>, id: String, pr: bool) -> Result<()> {
     let host = machine.host();
     let branch = file.agent.branch.clone();
     let target = project.default_branch.clone();
+
+    if pr {
+        return run_pr(
+            &project_name,
+            &file,
+            &project,
+            &machine,
+            &host,
+            &branch,
+            &target,
+            &id,
+        );
+    }
 
     preflight(&host, &machine, &target)?;
     capture_uncommitted(&host, &file.agent.worktree, &id)?;
@@ -31,6 +41,80 @@ pub fn run(project_opt: Option<String>, id: String, pr: bool) -> Result<()> {
     shelbi_state::append_log(&project_name, &id, "merge").map_err(|e| anyhow!(e))?;
     println!("✓ merged {id} into {target}");
     Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_pr(
+    project_name: &str,
+    file: &shelbi_state::AgentFile,
+    _project: &shelbi_core::Project,
+    machine: &Machine,
+    host: &Host,
+    branch: &str,
+    target: &str,
+    id: &str,
+) -> Result<()> {
+    // 1. Make sure `gh` is reachable on the worker host.
+    let gh_probe = shelbi_ssh::run(host, ["gh", "--version"]).map_err(|e| anyhow!(e))?;
+    if !gh_probe.status.success() {
+        bail!(
+            "`gh` (GitHub CLI) not found on {} — install it (https://cli.github.com) and \
+             re-run, or use plain `shelbi merge` for a local merge",
+            machine.name
+        );
+    }
+
+    // 2. Capture any uncommitted edits in the worktree.
+    capture_uncommitted(host, &file.agent.worktree, id)?;
+
+    // 3. Push the branch.
+    let wt = file.agent.worktree.to_string_lossy().into_owned();
+    shelbi_ssh::run_capture(host, ["git", "-C", &wt, "push", "-u", "origin", branch])
+        .map_err(|e| anyhow!(e))?;
+
+    // 4. Open the PR. Title pulled from the task heading in the markdown body;
+    //    body is the rest of the agent file (sans the H1).
+    let (title, body) = derive_pr_text(&file.body, id);
+    let pr_url = shelbi_ssh::run_capture(
+        host,
+        [
+            "gh", "-C", &wt, "pr", "create", "--base", target, "--head", branch, "--title",
+            &title, "--body", &body,
+        ],
+    )
+    .map_err(|e| anyhow!(e))?;
+    let pr_url = pr_url.trim();
+
+    // 5. Update state (still Running until merged in PR, but flag Waiting so
+    //    Review view picks it up).
+    let mut updated = file.agent.clone();
+    updated.status = Status::Waiting;
+    updated.updated = Utc::now();
+    shelbi_state::save_agent(project_name, &updated, &file.body).map_err(|e| anyhow!(e))?;
+    shelbi_state::append_log(project_name, id, &format!("pr opened: {pr_url}"))
+        .map_err(|e| anyhow!(e))?;
+
+    println!("✓ branch pushed and PR opened");
+    println!("  {pr_url}");
+    Ok(())
+}
+
+fn derive_pr_text(body_md: &str, id: &str) -> (String, String) {
+    let mut lines = body_md.lines();
+    // First "# Task" h1 is shelbi-emitted; the next non-blank line is the prompt.
+    let mut title = format!("shelbi: {id}");
+    for line in &mut lines {
+        let t = line.trim();
+        if t.is_empty() || t.starts_with('#') {
+            continue;
+        }
+        // First line of task prompt becomes the PR title (truncated).
+        title = if t.len() > 70 { format!("{}…", &t[..69]) } else { t.to_string() };
+        break;
+    }
+    let mut body = String::from(body_md);
+    body.push_str("\n\n— opened by [shelbi](https://github.com/jlong/shelbi)\n");
+    (title, body)
 }
 
 fn preflight(host: &Host, machine: &Machine, target: &str) -> Result<()> {
