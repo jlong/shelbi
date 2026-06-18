@@ -47,6 +47,13 @@ pub struct App {
     pub last_refresh: Instant,
     pub status_line: String,
     pub should_quit: bool,
+
+    /// Chat input buffer; populated when the user types in the Chat view.
+    pub chat_input: String,
+
+    /// Most recent capture-pane output for the currently selected agent, or
+    /// the orchestrator pane when on the Chat view. Updated on each refresh.
+    pub pane_snapshot: String,
 }
 
 impl App {
@@ -61,6 +68,8 @@ impl App {
             last_refresh: Instant::now() - Duration::from_secs(60),
             status_line: String::new(),
             should_quit: false,
+            chat_input: String::new(),
+            pane_snapshot: String::new(),
         }
     }
 
@@ -127,7 +136,45 @@ impl App {
             self.agents = load_agents(p).unwrap_or_default();
         }
         self.last_refresh = Instant::now();
+        self.refresh_pane_snapshot();
         Ok(())
+    }
+
+    /// Refresh the right-pane snapshot: capture-pane output for whichever
+    /// pane is contextually relevant. Best-effort — failures (worker pane
+    /// already gone, no orchestrator yet) are silently ignored.
+    pub fn refresh_pane_snapshot(&mut self) {
+        let snap = match &self.view {
+            View::Chat => self.capture_orchestrator(),
+            View::Agent(id) => self.capture_agent(id),
+            _ => return,
+        };
+        if let Some(s) = snap {
+            self.pane_snapshot = s;
+        }
+    }
+
+    fn capture_orchestrator(&self) -> Option<String> {
+        let project = self.project_name.as_deref()?;
+        let proj = shelbi_state::load_project(project).ok()?;
+        let hub = proj
+            .machines
+            .iter()
+            .find(|m| matches!(m.kind, shelbi_core::MachineKind::Local))?;
+        let host = hub.host();
+        let addr = shelbi_core::TmuxAddr {
+            session: format!("shelbi-{}", proj.name),
+            window: "orchestrator".into(),
+        };
+        shelbi_tmux::capture(&host, &addr).ok()
+    }
+
+    fn capture_agent(&self, id: &str) -> Option<String> {
+        let project = self.project_name.as_deref()?;
+        let proj = shelbi_state::load_project(project).ok()?;
+        let agent = self.agents.iter().find(|a| a.id == id)?;
+        let machine = proj.machine(&agent.machine)?;
+        shelbi_tmux::capture(&machine.host(), &agent.tmux).ok()
     }
 
     pub fn maybe_refresh(&mut self) -> Result<()> {
@@ -162,6 +209,49 @@ impl App {
     pub fn nav_activate(&mut self) {
         if let Some(row) = self.nav().get(self.sidebar_index).cloned() {
             self.view = row.view;
+        }
+    }
+
+    /// Send the current chat input buffer to the orchestrator's tmux pane.
+    /// Clears the buffer on success.
+    pub fn send_chat(&mut self) {
+        if self.chat_input.is_empty() {
+            return;
+        }
+        let project = match self.project_name.clone() {
+            Some(p) => p,
+            None => {
+                self.status_line = "no project loaded".into();
+                return;
+            }
+        };
+        let proj = match shelbi_state::load_project(&project) {
+            Ok(p) => p,
+            Err(e) => {
+                self.status_line = format!("project load: {e}");
+                return;
+            }
+        };
+        let Some(hub) = proj
+            .machines
+            .iter()
+            .find(|m| matches!(m.kind, shelbi_core::MachineKind::Local))
+        else {
+            self.status_line = "project has no local hub".into();
+            return;
+        };
+        let addr = shelbi_core::TmuxAddr {
+            session: format!("shelbi-{}", proj.name),
+            window: "orchestrator".into(),
+        };
+        match shelbi_tmux::send_line(&hub.host(), &addr, &self.chat_input) {
+            Ok(()) => {
+                self.chat_input.clear();
+                self.status_line = "✓ sent to orchestrator".into();
+            }
+            Err(e) => {
+                self.status_line = format!("send failed: {e} (start it: `shelbi orchestrate`)");
+            }
         }
     }
 

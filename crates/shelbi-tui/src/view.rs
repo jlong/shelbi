@@ -1,7 +1,7 @@
 //! Render the right-hand content pane for each view kind.
 
 use ratatui::{
-    layout::{Alignment, Rect},
+    layout::{Alignment, Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::{Block, Borders, List, ListItem, Padding, Paragraph, Wrap},
@@ -31,21 +31,52 @@ pub fn render(f: &mut Frame, app: &App, area: Rect) {
     }
 }
 
-fn render_chat(f: &mut Frame, _app: &App, area: Rect) {
-    let lines = vec![
-        Line::from(Span::styled(
-            "talk to your orchestrator here",
-            Style::default().fg(Color::DarkGray),
-        )),
-        Line::from(""),
-        Line::from("press / to focus the chat input. Phase 4b wires this up."),
-        Line::from(""),
-        Line::from(Span::styled(
-            "tip: ⌘K (Ctrl+K) opens the command palette — switch views, find agents, fire actions.",
-            Style::default().fg(Color::DarkGray),
-        )),
-    ];
-    f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: true }), area);
+fn render_chat(f: &mut Frame, app: &App, area: Rect) {
+    let layout = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(1), Constraint::Length(3)])
+        .split(area);
+
+    // Transcript: live capture of the orchestrator pane, or a hint if it
+    // isn't running yet.
+    let snap = strip_ansi(&app.pane_snapshot);
+    let transcript = if snap.trim().is_empty() {
+        Paragraph::new(vec![
+            Line::from(Span::styled(
+                "no orchestrator pane yet",
+                Style::default().fg(Color::DarkGray),
+            )),
+            Line::from(""),
+            Line::from("start it with:"),
+            Line::from(Span::styled(
+                "  shelbi orchestrate",
+                Style::default().fg(Color::Cyan),
+            )),
+            Line::from(""),
+            Line::from(Span::styled(
+                "then talk to it from the input below or Ctrl+K → New task",
+                Style::default().fg(Color::DarkGray),
+            )),
+        ])
+    } else {
+        let lines: Vec<Line> = snap.lines().map(|l| Line::from(l.to_string())).collect();
+        let take = lines.len().saturating_sub(layout[0].height as usize);
+        Paragraph::new(lines[take..].to_vec()).wrap(Wrap { trim: false })
+    };
+    f.render_widget(transcript, layout[0]);
+
+    // Input.
+    let input = Paragraph::new(Line::from(vec![
+        Span::styled("> ", Style::default().fg(Color::DarkGray)),
+        Span::raw(app.chat_input.clone()),
+        Span::styled("▏", Style::default().fg(Color::Cyan)),
+    ]))
+    .block(
+        Block::default()
+            .borders(Borders::TOP)
+            .padding(Padding::new(0, 0, 1, 0)),
+    );
+    f.render_widget(input, layout[1]);
 }
 
 fn render_tasks(f: &mut Frame, app: &App, area: Rect) {
@@ -167,7 +198,13 @@ fn render_agent(f: &mut Frame, app: &App, area: Rect, id: &str) {
         f.render_widget(p, area);
         return;
     };
-    let lines = vec![
+
+    let layout = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(8), Constraint::Min(1)])
+        .split(area);
+
+    let header = Paragraph::new(vec![
         Line::from(vec![
             Span::styled("status:   ", Style::default().fg(Color::DarkGray)),
             Span::styled(
@@ -178,13 +215,9 @@ fn render_agent(f: &mut Frame, app: &App, area: Rect, id: &str) {
         Line::from(vec![
             Span::styled("machine:  ", Style::default().fg(Color::DarkGray)),
             Span::raw(a.machine.clone()),
-        ]),
-        Line::from(vec![
-            Span::styled("runner:   ", Style::default().fg(Color::DarkGray)),
+            Span::styled("   runner: ", Style::default().fg(Color::DarkGray)),
             Span::raw(a.runner.clone()),
-        ]),
-        Line::from(vec![
-            Span::styled("branch:   ", Style::default().fg(Color::DarkGray)),
+            Span::styled("   branch: ", Style::default().fg(Color::DarkGray)),
             Span::raw(a.branch.clone()),
         ]),
         Line::from(vec![
@@ -197,11 +230,29 @@ fn render_agent(f: &mut Frame, app: &App, area: Rect, id: &str) {
         ]),
         Line::from(""),
         Line::from(Span::styled(
-            "(live tail + diff sub-views land in Phase 4b)",
+            "─── live tail ───",
             Style::default().fg(Color::DarkGray),
         )),
-    ];
-    f.render_widget(Paragraph::new(lines), area);
+    ]);
+    f.render_widget(header, layout[0]);
+
+    let snap = strip_ansi(&app.pane_snapshot);
+    let lines: Vec<Line> = if snap.trim().is_empty() {
+        vec![Line::from(Span::styled(
+            "(pane idle / not yet captured)",
+            Style::default().fg(Color::DarkGray),
+        ))]
+    } else {
+        let v: Vec<Line> = snap.lines().map(|l| Line::from(l.to_string())).collect();
+        let take = v.len().saturating_sub(layout[1].height as usize);
+        v[take..].to_vec()
+    };
+    f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), layout[1]);
+}
+
+fn strip_ansi(s: &str) -> String {
+    String::from_utf8(strip_ansi_escapes::strip(s.as_bytes()))
+        .unwrap_or_else(|_| s.to_string())
 }
 
 fn status_color(s: shelbi_core::Status) -> Color {
