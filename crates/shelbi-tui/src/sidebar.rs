@@ -45,7 +45,7 @@ pub fn render(f: &mut Frame, app: &App, area: Rect) {
 
     items.push(ListItem::new(Span::raw("")));
     items.push(ListItem::new(Span::styled(
-        " ⌘K to switch",
+        " ^P to switch",
         Style::default().fg(Color::DarkGray),
     )));
 

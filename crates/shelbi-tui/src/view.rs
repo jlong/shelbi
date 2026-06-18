@@ -54,7 +54,7 @@ fn render_chat(f: &mut Frame, app: &App, area: Rect) {
             )),
             Line::from(""),
             Line::from(Span::styled(
-                "then talk to it from the input below or Ctrl+K → New task",
+                "then talk to it from the input below or Ctrl+P → New task",
                 Style::default().fg(Color::DarkGray),
             )),
         ])

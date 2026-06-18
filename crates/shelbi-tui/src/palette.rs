@@ -1,4 +1,4 @@
-//! ⌘K command palette overlay.
+//! Ctrl+P command palette overlay.
 //!
 //! Built on top of `shelbi-palette` for matching. This module owns the input
 //! state, entry building, and rendering. Activation logic lives in `App`.
@@ -105,7 +105,7 @@ pub fn render(f: &mut Frame, state: &PaletteState, results: &[(Entry, u16)]) {
         .borders(Borders::ALL)
         .padding(Padding::new(1, 1, 0, 0))
         .title(Span::styled(
-            " ⌘K ",
+            " ^P palette ",
             Style::default()
                 .add_modifier(Modifier::BOLD)
                 .fg(Color::Cyan),

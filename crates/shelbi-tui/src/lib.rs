@@ -2,7 +2,7 @@
 //!
 //! Phase 4a: two-pane layout (sidebar nav + content view) with keyboard
 //! navigation and live state-file polling.
-//! Phase 4b: ⌘K palette overlay, chat input bound to the orchestrator
+//! Phase 4b: Ctrl+P palette overlay, chat input bound to the orchestrator
 //! pane, agent-view live tail.
 
 use std::io;
@@ -113,7 +113,7 @@ fn handle_palette_key(
 ) {
     if mods.contains(KeyModifiers::CONTROL) {
         match code {
-            KeyCode::Char('c') | KeyCode::Char('k') => {
+            KeyCode::Char('c') | KeyCode::Char('p') => {
                 pal.close();
                 return;
             }
@@ -159,7 +159,7 @@ fn handle_key(
                 app.should_quit = true;
                 return;
             }
-            KeyCode::Char('k') => {
+            KeyCode::Char('p') => {
                 pal.toggle();
                 return;
             }

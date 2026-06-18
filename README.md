@@ -47,7 +47,7 @@ shelbi gives you:
                   you (terminal)
                         │
                 ┌───────▼────────┐
-                │ shelbi (TUI)   │   ratatui, ⌘K palette
+                │ shelbi (TUI)   │   ratatui, Ctrl+P palette
                 │   hub binary   │
                 └───┬──────┬─────┘
                     │      │
@@ -93,9 +93,9 @@ shelbi gives you:
 ## TUI
 
 Two-pane layout. Sidebar nav on the left (Chat, Tasks, Review, Machines, plus
-active agents); content view on the right. ⌘K (`Ctrl+K`) opens a fuzzy
+active agents); content view on the right. `Ctrl+P` opens a fuzzy
 command palette for switching views, selecting agents, and triggering
-actions.
+actions — same convention as VS Code / JetBrains / Telescope.
 
 ```
 ┌─ shelbi ───────────┐┌─ Chat — orchestrator ────────────────────────┐
@@ -109,8 +109,8 @@ actions.
 │ ◐ refactor    m2   ││ you: how's it going?                         │
 │ ✓ csv-export  hub  ││                                              │
 │ ○ migrate-db  hub  ││ shelbi: editing tests now — should be done   │
-│                    ││   in a couple minutes. Ctrl+K to jump to it. │
-│ ⌘K to switch       ││ > _                                          │
+│                    ││   in a couple minutes. Ctrl+P to jump to it. │
+│ ^P to switch       ││ > _                                          │
 └────────────────────┘└──────────────────────────────────────────────┘
 ```
 
@@ -151,7 +151,7 @@ shelbi diff fix-login
 shelbi merge fix-login
 ```
 
-Inside the TUI: type into Chat, or press `Ctrl+K` to fuzzy-find anything.
+Inside the TUI: type into Chat, or press `Ctrl+P` to fuzzy-find anything.
 
 ---
 
@@ -241,7 +241,7 @@ Fix the login bug on Safari — cookie domain mismatch breaks SSO redirect.
 | 1 |   | Single local worker — `shelbi spawn` opens a tmux window, runs an agent, captures output |
 | 2 |   | Full CLI: spawn / send / status / tail / diff / merge / list / archive |
 | 3 |   | Orchestrator bridge — window 1 + generated system prompt + CLI tool surface |
-| 4 |   | TUI dashboard — two-pane layout + ⌘K palette |
+| 4 |   | TUI dashboard — two-pane layout + Ctrl+P palette |
 | 5 |   | SSH/remote workers — `Local \| Remote` host abstraction |
 | 6 |   | Session config — workspace YAML, multi-project |
 | 7 |   | Review/merge polish — inline diff, `--pr` flow, archive flow |

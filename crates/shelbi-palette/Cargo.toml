@@ -6,7 +6,7 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 authors.workspace = true
-description = "Fuzzy command palette (Ctrl+K) for shelbi's TUI"
+description = "Fuzzy command palette (Ctrl+P) for shelbi's TUI"
 
 [dependencies]
 shelbi-core = { workspace = true }
