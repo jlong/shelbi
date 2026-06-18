@@ -1,0 +1,7 @@
+name: daily
+projects:
+  - name: myapp
+    machines:
+      - hub
+      - m2
+startup: []

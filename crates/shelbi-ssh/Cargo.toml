@@ -1,0 +1,15 @@
+[package]
+name = "shelbi-ssh"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Local/SSH command execution wrapper for shelbi"
+
+[dependencies]
+shelbi-core = { workspace = true }
+thiserror = { workspace = true }
+which = { workspace = true }
+tracing = { workspace = true }

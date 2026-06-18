@@ -1,0 +1,20 @@
+name: myapp
+repo: git@github.com:me/myapp.git
+default_branch: main
+machines:
+  - name: hub
+    kind: local
+    work_dir: ~/Workspaces/myapp
+  - name: m2
+    kind: ssh
+    host: m2.local
+    work_dir: ~/work/myapp
+orchestrator:
+  runner: claude
+agent_runners:
+  claude:
+    command: claude
+    flags: []
+  codex:
+    command: codex
+    flags: []

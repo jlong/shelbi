@@ -1,0 +1,14 @@
+[package]
+name = "shelbi-tmux"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "tmux send-keys / capture-pane abstractions for shelbi"
+
+[dependencies]
+shelbi-core = { workspace = true }
+shelbi-ssh = { workspace = true }
+tracing = { workspace = true }

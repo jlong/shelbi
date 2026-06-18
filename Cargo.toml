@@ -1,0 +1,58 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/shelbi-core",
+    "crates/shelbi-state",
+    "crates/shelbi-ssh",
+    "crates/shelbi-tmux",
+    "crates/shelbi-agent",
+    "crates/shelbi-orchestrator",
+    "crates/shelbi-tui",
+    "crates/shelbi-palette",
+    "crates/shelbi-cli",
+]
+default-members = ["crates/shelbi-cli"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.80"
+license = "MIT"
+repository = "https://github.com/jlong/shelbi"
+authors = ["John W. Long <john@32pixels.co>"]
+
+[workspace.dependencies]
+# shared deps, pinned at the workspace root
+anyhow = "1"
+thiserror = "1"
+serde = { version = "1", features = ["derive"] }
+serde_yaml = "0.9"
+serde_json = "1"
+gray_matter = "0.2"
+clap = { version = "4", features = ["derive", "env"] }
+dirs = "5"
+which = "6"
+chrono = { version = "0.4", features = ["serde"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+tokio = { version = "1", features = ["full"] }
+strip-ansi-escapes = "0.2"
+similar = { version = "2", features = ["text"] }
+ratatui = "0.28"
+crossterm = "0.28"
+nucleo-matcher = "0.3"
+
+# internal crates
+shelbi-core = { path = "crates/shelbi-core" }
+shelbi-state = { path = "crates/shelbi-state" }
+shelbi-ssh = { path = "crates/shelbi-ssh" }
+shelbi-tmux = { path = "crates/shelbi-tmux" }
+shelbi-agent = { path = "crates/shelbi-agent" }
+shelbi-orchestrator = { path = "crates/shelbi-orchestrator" }
+shelbi-tui = { path = "crates/shelbi-tui" }
+shelbi-palette = { path = "crates/shelbi-palette" }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = "symbols"

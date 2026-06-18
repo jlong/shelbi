@@ -1,0 +1,13 @@
+[package]
+name = "shelbi-orchestrator"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Orchestrator pane bootstrap and system prompt for shelbi"
+
+[dependencies]
+shelbi-core = { workspace = true }
+shelbi-state = { workspace = true }

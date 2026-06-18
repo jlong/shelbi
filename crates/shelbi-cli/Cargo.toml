@@ -1,0 +1,32 @@
+[package]
+name = "shelbi"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Open-source agent orchestrator built on tmux"
+
+[[bin]]
+name = "shelbi"
+path = "src/main.rs"
+
+[dependencies]
+shelbi-core = { workspace = true }
+shelbi-state = { workspace = true }
+shelbi-ssh = { workspace = true }
+shelbi-tmux = { workspace = true }
+shelbi-agent = { workspace = true }
+shelbi-orchestrator = { workspace = true }
+shelbi-tui = { workspace = true }
+shelbi-palette = { workspace = true }
+
+anyhow = { workspace = true }
+clap = { workspace = true }
+chrono = { workspace = true }
+dirs = { workspace = true }
+serde = { workspace = true }
+serde_yaml = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }

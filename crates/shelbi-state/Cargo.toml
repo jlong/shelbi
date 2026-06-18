@@ -1,0 +1,16 @@
+[package]
+name = "shelbi-state"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Markdown + frontmatter state IO for shelbi"
+
+[dependencies]
+shelbi-core = { workspace = true }
+serde = { workspace = true }
+serde_yaml = { workspace = true }
+dirs = { workspace = true }
+chrono = { workspace = true }

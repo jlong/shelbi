@@ -1,0 +1,17 @@
+[package]
+name = "shelbi-tui"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "ratatui dashboard for shelbi"
+
+[dependencies]
+shelbi-core = { workspace = true }
+shelbi-state = { workspace = true }
+shelbi-palette = { workspace = true }
+ratatui = { workspace = true }
+crossterm = { workspace = true }
+anyhow = { workspace = true }
