@@ -21,7 +21,6 @@ use crossterm::{
 use ratatui::{backend::CrosstermBackend, Terminal};
 
 mod app;
-mod palette;
 mod sidebar;
 
 pub use app::{App, View};
@@ -68,10 +67,9 @@ pub fn run_main(project_name: &str) -> Result<()> {
 pub fn run_sidebar(project_name: &str) -> Result<()> {
     let mut term = setup_terminal().context("setting up terminal")?;
     let mut app = App::new_sidebar(project_name);
-    let mut pal = palette::PaletteState::new();
     app.refresh().ok();
 
-    let result = sidebar_loop(&mut term, &mut app, &mut pal);
+    let result = sidebar_loop(&mut term, &mut app);
 
     restore_terminal(&mut term).context("restoring terminal")?;
     result
@@ -96,108 +94,25 @@ fn restore_terminal<B: ratatui::backend::Backend + std::io::Write>(
 fn sidebar_loop<B: ratatui::backend::Backend>(
     term: &mut Terminal<B>,
     app: &mut App,
-    pal: &mut palette::PaletteState,
 ) -> Result<()> {
     while !app.should_quit {
         app.maybe_refresh().ok();
 
-        let pal_entries = if pal.open {
-            palette::entries(app)
-        } else {
-            Vec::new()
-        };
-        let pal_results = if pal.open {
-            shelbi_palette::search(&pal_entries, &pal.query)
-        } else {
-            Vec::new()
-        };
-
-        term.draw(|f| {
-            let area = f.area();
-            sidebar::render_full(f, app, area);
-            palette::render(f, pal, &pal_results);
-        })?;
+        term.draw(|f| sidebar::render_full(f, app, f.area()))?;
 
         if event::poll(Duration::from_millis(200))? {
             if let Event::Key(k) = event::read()? {
                 if k.kind != KeyEventKind::Press {
                     continue;
                 }
-                if pal.open {
-                    handle_palette_key(app, pal, &pal_results, k.code, k.modifiers);
-                } else {
-                    handle_key(app, pal, k.code, k.modifiers);
-                }
+                handle_key(app, k.code, k.modifiers);
             }
         }
     }
     Ok(())
 }
 
-fn handle_palette_key(
-    app: &mut App,
-    pal: &mut palette::PaletteState,
-    results: &[(shelbi_palette::Entry, u16)],
-    code: KeyCode,
-    mods: KeyModifiers,
-) {
-    if is_palette_chord(code, mods) {
-        pal.close();
-        return;
-    }
-    if mods.contains(KeyModifiers::CONTROL) && matches!(code, KeyCode::Char('c')) {
-        pal.close();
-        return;
-    }
-    match code {
-        KeyCode::Esc => pal.close(),
-        KeyCode::Up => {
-            if pal.selected > 0 {
-                pal.selected -= 1;
-            }
-        }
-        KeyCode::Down => {
-            if pal.selected + 1 < results.len() {
-                pal.selected += 1;
-            }
-        }
-        KeyCode::Enter => {
-            if let Some((entry, _)) = results.get(pal.selected) {
-                let keep_open = palette::activate(app, entry);
-                if !keep_open {
-                    pal.close();
-                }
-            }
-        }
-        KeyCode::Backspace => pal.backspace(),
-        KeyCode::Char(c) => pal.type_char(c),
-        _ => {}
-    }
-}
-
-/// Is this keypress the palette-toggle chord? Ctrl+Space arrives differently
-/// depending on the terminal: crossterm reports it as Char(' ') with CONTROL
-/// on most modern terminals, but some send the legacy NUL byte.
-fn is_palette_chord(code: KeyCode, mods: KeyModifiers) -> bool {
-    if mods.contains(KeyModifiers::CONTROL) && matches!(code, KeyCode::Char(' ')) {
-        return true;
-    }
-    if matches!(code, KeyCode::Null) {
-        return true;
-    }
-    false
-}
-
-fn handle_key(
-    app: &mut App,
-    pal: &mut palette::PaletteState,
-    code: KeyCode,
-    mods: KeyModifiers,
-) {
-    if is_palette_chord(code, mods) {
-        pal.toggle();
-        return;
-    }
+fn handle_key(app: &mut App, code: KeyCode, mods: KeyModifiers) {
     if mods.contains(KeyModifiers::CONTROL) && matches!(code, KeyCode::Char('c')) {
         app.should_quit = true;
         return;

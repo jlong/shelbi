@@ -149,6 +149,20 @@ pub fn ensure_dashboard(project_name: &str) -> Result<BootstrapStatus> {
         return Ok(BootstrapStatus::AlreadyRunning);
     }
 
+    // Install the global Ctrl+P tmux binding so the palette popup works
+    // from any pane. Server-scoped; gone if the tmux server restarts.
+    let _ = shelbi_ssh::run(
+        &host,
+        [
+            "tmux",
+            "bind-key",
+            "-n",
+            "C-p",
+            "run-shell",
+            &format!("{} popup", shelbi_agent::shell_escape(&shelbi_bin)),
+        ],
+    );
+
     // 3. Split the dashboard window: orchestrator on the right.
     shelbi_ssh::run_capture(
         &host,

@@ -27,6 +27,8 @@ shelbi-palette = { workspace = true }
 anyhow = { workspace = true }
 clap = { workspace = true }
 chrono = { workspace = true }
+ratatui = { workspace = true }
+crossterm = { workspace = true }
 dirs = { workspace = true }
 serde = { workspace = true }
 serde_yaml = { workspace = true }

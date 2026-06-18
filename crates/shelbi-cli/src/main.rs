@@ -70,6 +70,13 @@ enum Cmd {
     #[command(hide = true)]
     #[command(name = "__sidebar")]
     Sidebar { project: String },
+    /// Open the palette as a tmux popup. Bound to Ctrl+P by default.
+    Popup,
+    /// (internal) Run the palette picker — meant to be invoked inside a
+    /// `tmux display-popup`. Not for direct use.
+    #[command(hide = true)]
+    #[command(name = "__palette")]
+    Palette { project: String },
 }
 
 fn main() -> Result<()> {
@@ -95,6 +102,8 @@ fn main() -> Result<()> {
         Some(Cmd::Init(args)) => commands::init::run(args),
         Some(Cmd::Orchestrate(args)) => commands::orchestrate::run(cli.project, args),
         Some(Cmd::Sidebar { project }) => shelbi_tui::run_sidebar(&project).context("sidebar"),
+        Some(Cmd::Popup) => commands::popup::run(),
+        Some(Cmd::Palette { project }) => commands::palette::run(project),
     }
 }
 

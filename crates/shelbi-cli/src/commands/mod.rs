@@ -5,6 +5,8 @@ pub mod init;
 pub mod list;
 pub mod merge;
 pub mod orchestrate;
+pub mod palette;
+pub mod popup;
 pub mod send;
 pub mod spawn;
 pub mod status;
