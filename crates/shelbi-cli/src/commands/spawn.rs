@@ -88,26 +88,20 @@ pub fn run(project_opt: Option<String>, args: Args) -> Result<()> {
     // 2. Create the worktree (git worktree add -b <branch> <path>).
     create_worktree(&host, &machine, &branch, &worktree, &project)?;
 
-    // 3. Spawn the worker tmux pane.
-    let launch_cmd = shelbi_agent::launch_command(&runner_spec);
-    let cd_cmd = format!(
-        "cd {} && {}",
-        shelbi_agent::shell_escape(&worktree.to_string_lossy()),
-        launch_cmd
-    );
+    // 3. Spawn the worker tmux pane. We open it with an interactive shell
+    //    (no inline command) so the user's rc files run and pick up tools
+    //    installed in shell-specific PATHs (npm-global, asdf, pyenv, nvm).
+    //    Then we send-keys the cd+launch and the initial prompt.
     let addr = if host.is_local() {
-        // Local: open a window in the shared shelbi-<project> session.
         if !shelbi_tmux::has_session(&host, &session).map_err(|e| anyhow!(e))? {
             shelbi_tmux::new_session(&host, &session, "shelbi", None)
                 .map_err(|e| anyhow!(e))
                 .context("creating tmux session")?;
         }
-        shelbi_tmux::new_window(&host, &session, &window_name, Some(&cd_cmd))
+        shelbi_tmux::new_window(&host, &session, &window_name, None)
             .map_err(|e| anyhow!(e))
             .context("creating worker window")?
     } else {
-        // Remote: dedicated `shelbi-w-<id>` session on the remote, so it
-        // survives the SSH connection going away.
         if shelbi_tmux::has_session(&host, &session).map_err(|e| anyhow!(e))? {
             bail!(
                 "remote tmux session `{session}` already exists on {} — pick a new task id, \
@@ -116,7 +110,7 @@ pub fn run(project_opt: Option<String>, args: Args) -> Result<()> {
                 machine.name
             );
         }
-        shelbi_tmux::new_session(&host, &session, &window_name, Some(&cd_cmd))
+        shelbi_tmux::new_session(&host, &session, &window_name, None)
             .map_err(|e| anyhow!(e))
             .context("creating remote worker session")?;
         TmuxAddr {
@@ -125,9 +119,22 @@ pub fn run(project_opt: Option<String>, args: Args) -> Result<()> {
         }
     };
 
-    // 4. Send the initial prompt. (Many agent CLIs need a moment to boot; we
-    //    accept that the first send-keys may be eaten if the CLI isn't ready.
-    //    Phase 1 leaves that to operator inspection.)
+    // 4. Launch the agent in the now-interactive shell. `exec` replaces the
+    //    shell so the window closes naturally when the agent exits.
+    let launch_cmd = shelbi_agent::launch_command(&runner_spec);
+    let cd_launch = format!(
+        "cd {} && exec {}",
+        shelbi_agent::shell_escape(&worktree.to_string_lossy()),
+        launch_cmd
+    );
+    shelbi_tmux::send_line(&host, &addr, &cd_launch)
+        .map_err(|e| anyhow!(e))
+        .context("launching agent")?;
+
+    // 5. Give the agent a moment to boot before piping the initial prompt
+    //    in. claude/codex/etc. tend to print a banner + wait for the TTY
+    //    to settle; sending too early can drop the first character.
+    std::thread::sleep(std::time::Duration::from_millis(1500));
     shelbi_tmux::send_line(&host, &addr, &args.prompt)
         .map_err(|e| anyhow!(e))
         .context("sending initial prompt")?;
