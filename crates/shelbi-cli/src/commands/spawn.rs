@@ -48,11 +48,21 @@ pub fn run(project_opt: Option<String>, args: Args) -> Result<()> {
         .clone();
 
     let host = machine.host();
-    let session = args
-        .session
-        .clone()
-        .unwrap_or_else(|| format!("shelbi-{}", project.name));
-    let window_name = format!("w-{}", args.id);
+    // For LOCAL workers we put them as a window inside `shelbi-<project>` so
+    // they sit alongside the dashboard and orchestrator. For REMOTE workers
+    // we give each worker its own tmux session named `shelbi-w-<id>` on the
+    // remote — so the worker survives a hub disconnect, and re-attaching is
+    // just `ssh host -t tmux attach -t shelbi-w-<id>`.
+    let (session, window_name) = if host.is_local() {
+        (
+            args.session
+                .clone()
+                .unwrap_or_else(|| format!("shelbi-{}", project.name)),
+            format!("w-{}", args.id),
+        )
+    } else {
+        (format!("shelbi-w-{}", args.id), "agent".to_string())
+    };
     let branch = args
         .branch
         .clone()
@@ -71,31 +81,49 @@ pub fn run(project_opt: Option<String>, args: Args) -> Result<()> {
         window_name,
     );
 
-    // 1. Ensure the tmux session exists.
-    if !shelbi_tmux::has_session(&host, &session).map_err(|e| anyhow!(e))? {
-        // Create a placeholder window so we can later add windows alongside it.
-        shelbi_tmux::new_session(&host, &session, "shelbi", None)
-            .map_err(|e| anyhow!(e))
-            .context("creating tmux session")?;
-    }
-
-    // 2. Make sure the repo's .gitignore covers .shelbi/ so the parent
+    // 1. Make sure the repo's .gitignore covers .shelbi/ so the parent
     //    worktree doesn't get marked dirty by our metadata.
     ensure_gitignored(&host, &machine)?;
 
-    // 3. Create the worktree (git worktree add -b <branch> <path>).
+    // 2. Create the worktree (git worktree add -b <branch> <path>).
     create_worktree(&host, &machine, &branch, &worktree, &project)?;
 
-    // 3. Spawn the worker window running the agent CLI inside the worktree.
+    // 3. Spawn the worker tmux pane.
     let launch_cmd = shelbi_agent::launch_command(&runner_spec);
     let cd_cmd = format!(
         "cd {} && {}",
         shelbi_agent::shell_escape(&worktree.to_string_lossy()),
         launch_cmd
     );
-    let addr = shelbi_tmux::new_window(&host, &session, &window_name, Some(&cd_cmd))
-        .map_err(|e| anyhow!(e))
-        .context("creating worker window")?;
+    let addr = if host.is_local() {
+        // Local: open a window in the shared shelbi-<project> session.
+        if !shelbi_tmux::has_session(&host, &session).map_err(|e| anyhow!(e))? {
+            shelbi_tmux::new_session(&host, &session, "shelbi", None)
+                .map_err(|e| anyhow!(e))
+                .context("creating tmux session")?;
+        }
+        shelbi_tmux::new_window(&host, &session, &window_name, Some(&cd_cmd))
+            .map_err(|e| anyhow!(e))
+            .context("creating worker window")?
+    } else {
+        // Remote: dedicated `shelbi-w-<id>` session on the remote, so it
+        // survives the SSH connection going away.
+        if shelbi_tmux::has_session(&host, &session).map_err(|e| anyhow!(e))? {
+            bail!(
+                "remote tmux session `{session}` already exists on {} — pick a new task id, \
+                 or kill it with `ssh {} tmux kill-session -t {session}`",
+                machine.name,
+                machine.name
+            );
+        }
+        shelbi_tmux::new_session(&host, &session, &window_name, Some(&cd_cmd))
+            .map_err(|e| anyhow!(e))
+            .context("creating remote worker session")?;
+        TmuxAddr {
+            session: session.clone(),
+            window: window_name.clone(),
+        }
+    };
 
     // 4. Send the initial prompt. (Many agent CLIs need a moment to boot; we
     //    accept that the first send-keys may be eaten if the CLI isn't ready.

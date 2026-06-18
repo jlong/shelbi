@@ -59,6 +59,8 @@ enum Cmd {
     },
     /// Archive a worker (keep the log, drop the worktree).
     Archive { id: String },
+    /// Attach the terminal to a worker's tmux pane.
+    Attach { id: String },
     /// Scaffold ~/.shelbi/ and an initial project (stub).
     Init,
     /// Start the orchestrator agent in the project's tmux session window 1.
@@ -82,6 +84,7 @@ fn main() -> Result<()> {
         Some(Cmd::Diff { id }) => commands::diff::run(cli.project, id),
         Some(Cmd::Merge { id, pr }) => commands::merge::run(cli.project, id, pr),
         Some(Cmd::Archive { id }) => commands::archive::run(cli.project, id),
+        Some(Cmd::Attach { id }) => commands::attach::run(cli.project, id),
         Some(Cmd::Init) => commands::init::run(),
         Some(Cmd::Orchestrate(args)) => commands::orchestrate::run(cli.project, args),
     }

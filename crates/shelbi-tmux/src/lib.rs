@@ -110,3 +110,146 @@ pub fn capture_history(host: &Host, addr: &TmuxAddr, lines: usize) -> Result<Str
         ],
     )
 }
+
+#[cfg(test)]
+mod tests {
+    //! Structural tests: assert the argv we build for SSH-routed tmux is
+    //! the right shape. We can't run live SSH in CI, but we can verify the
+    //! command construction so the wire format doesn't silently drift.
+
+    use super::*;
+
+    fn ssh_args(cmd: std::process::Command) -> Vec<String> {
+        std::iter::once(cmd.get_program().to_string_lossy().into_owned())
+            .chain(
+                cmd.get_args()
+                    .map(|a| a.to_string_lossy().into_owned()),
+            )
+            .collect()
+    }
+
+    #[test]
+    fn local_send_keys_argv() {
+        let cmd = shelbi_ssh::build_command(
+            &Host::Local,
+            [
+                "tmux",
+                "send-keys",
+                "-t",
+                "shelbi-myapp:w-x",
+                "-l",
+                "hello",
+            ],
+        );
+        assert_eq!(
+            ssh_args(cmd),
+            vec![
+                "tmux",
+                "send-keys",
+                "-t",
+                "shelbi-myapp:w-x",
+                "-l",
+                "hello",
+            ]
+        );
+    }
+
+    #[test]
+    fn remote_send_keys_argv() {
+        let cmd = shelbi_ssh::build_command(
+            &Host::Ssh {
+                host: "m2.local".into(),
+            },
+            [
+                "tmux",
+                "send-keys",
+                "-t",
+                "shelbi-w-fix-login:agent",
+                "-l",
+                "hello",
+            ],
+        );
+        // ssh m2.local -- tmux send-keys -t … -l hello
+        assert_eq!(
+            ssh_args(cmd),
+            vec![
+                "ssh",
+                "m2.local",
+                "--",
+                "tmux",
+                "send-keys",
+                "-t",
+                "shelbi-w-fix-login:agent",
+                "-l",
+                "hello",
+            ]
+        );
+    }
+
+    #[test]
+    fn remote_new_session_argv() {
+        // What `new_session` for a remote worker would build under the hood.
+        let cmd = shelbi_ssh::build_command(
+            &Host::Ssh {
+                host: "m2.local".into(),
+            },
+            [
+                "tmux",
+                "new-session",
+                "-d",
+                "-s",
+                "shelbi-w-fix-login",
+                "-n",
+                "agent",
+                "cd /work/myapp/.shelbi/wt/fix-login && claude",
+            ],
+        );
+        assert_eq!(
+            ssh_args(cmd),
+            vec![
+                "ssh",
+                "m2.local",
+                "--",
+                "tmux",
+                "new-session",
+                "-d",
+                "-s",
+                "shelbi-w-fix-login",
+                "-n",
+                "agent",
+                "cd /work/myapp/.shelbi/wt/fix-login && claude",
+            ]
+        );
+    }
+
+    #[test]
+    fn remote_capture_pane_argv() {
+        let cmd = shelbi_ssh::build_command(
+            &Host::Ssh {
+                host: "m2.local".into(),
+            },
+            [
+                "tmux",
+                "capture-pane",
+                "-p",
+                "-J",
+                "-t",
+                "shelbi-w-fix-login:agent",
+            ],
+        );
+        assert_eq!(
+            ssh_args(cmd),
+            vec![
+                "ssh",
+                "m2.local",
+                "--",
+                "tmux",
+                "capture-pane",
+                "-p",
+                "-J",
+                "-t",
+                "shelbi-w-fix-login:agent",
+            ]
+        );
+    }
+}
