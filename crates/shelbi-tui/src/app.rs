@@ -1,209 +1,76 @@
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
-use shelbi_core::{Agent, Session, Status};
+use shelbi_core::{Agent, Status};
 
-/// What the right pane is showing.
+/// What's currently highlighted in the sidebar — drives selection logic
+/// only; the right pane (orchestrator / agent) is a real tmux pane, not
+/// rendered by this process.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum View {
-    Chat,
-    Tasks,
-    Review,
-    Machines,
-    /// A specific worker agent picked from the sidebar list.
+    /// "Show the orchestrator" — switch tmux focus to the dashboard's
+    /// right pane.
+    Orchestrator,
+    /// A specific worker agent — switch tmux to its window.
     Agent(String),
 }
 
-impl View {
-    pub fn title(&self) -> String {
-        match self {
-            View::Chat => "Chat — orchestrator".into(),
-            View::Tasks => "Tasks".into(),
-            View::Review => "Review".into(),
-            View::Machines => "Machines".into(),
-            View::Agent(id) => format!("agent: {id}"),
-        }
-    }
-}
-
-/// One row in the left-side nav.
-#[derive(Debug, Clone)]
-pub struct NavRow {
-    pub label: String,
-    pub icon: &'static str,
-    pub view: View,
-    /// Optional badge (e.g. count for Review).
-    pub badge: Option<String>,
-}
-
 pub struct App {
-    pub session_name: String,
-    pub session: Option<Session>,
-    pub project_name: Option<String>,
-
+    pub project_name: String,
     pub agents: Vec<Agent>,
-    pub view: View,
     pub sidebar_index: usize,
     pub last_refresh: Instant,
     pub status_line: String,
     pub should_quit: bool,
-
-    /// Chat input buffer; populated when the user types in the Chat view.
-    pub chat_input: String,
-
-    /// Most recent capture-pane output for the currently selected agent, or
-    /// the orchestrator pane when on the Chat view. Updated on each refresh.
-    pub pane_snapshot: String,
 }
 
 impl App {
-    pub fn new(session_name: impl Into<String>) -> Self {
+    pub fn new_sidebar(project_name: impl Into<String>) -> Self {
         Self {
-            session_name: session_name.into(),
-            session: None,
-            project_name: None,
+            project_name: project_name.into(),
             agents: Vec::new(),
-            view: View::Chat,
             sidebar_index: 0,
             last_refresh: Instant::now() - Duration::from_secs(60),
             status_line: String::new(),
             should_quit: false,
-            chat_input: String::new(),
-            pane_snapshot: String::new(),
         }
     }
 
-    /// Rebuild the nav rows from current session state.
-    pub fn nav(&self) -> Vec<NavRow> {
-        let review_count = self
-            .agents
-            .iter()
-            .filter(|a| matches!(a.status, Status::Done | Status::Waiting))
-            .count();
-        let mut rows = vec![
-            NavRow {
-                label: "Chat".into(),
-                icon: "💬",
-                view: View::Chat,
-                badge: None,
-            },
-            NavRow {
-                label: "Tasks".into(),
-                icon: "📋",
-                view: View::Tasks,
-                badge: None,
-            },
-            NavRow {
-                label: "Review".into(),
-                icon: "🔍",
-                view: View::Review,
-                badge: (review_count > 0).then(|| review_count.to_string()),
-            },
-            NavRow {
-                label: "Machines".into(),
-                icon: "🖥 ",
-                view: View::Machines,
-                badge: None,
-            },
-        ];
+    /// The list of selectable rows in the sidebar: orchestrator first,
+    /// then each active worker.
+    pub fn rows(&self) -> Vec<Row> {
+        let mut rows = vec![Row {
+            label: "orchestrator".into(),
+            view: View::Orchestrator,
+            badge: None,
+            status: None,
+        }];
         for a in &self.agents {
-            rows.push(NavRow {
-                label: format!("{} {}", a.status.glyph(), a.id),
-                icon: " ",
+            rows.push(Row {
+                label: a.id.clone(),
                 view: View::Agent(a.id.clone()),
                 badge: Some(a.machine.clone()),
+                status: Some(a.status),
             });
         }
         rows
     }
 
     pub fn refresh(&mut self) -> Result<()> {
-        // Load session (cached on first success).
-        if self.session.is_none() {
-            self.session = shelbi_state::load_session(&self.session_name).ok();
-        }
-        // Pick a project for "current": first project in the session, else
-        // first thing under ~/.shelbi/projects. When we settle on one for
-        // the first time, eagerly ensure its orchestrator pane exists so
-        // the Chat input "just works" without a separate CLI step.
-        if self.project_name.is_none() {
-            if let Some(s) = &self.session {
-                if let Some(sp) = s.projects.first() {
-                    let pname = sp.name.clone();
-                    self.project_name = Some(pname.clone());
-                    self.bootstrap_orchestrator(&pname);
-                }
-            }
-        }
-        // Reload agents from disk.
-        if let Some(p) = &self.project_name {
-            self.agents = load_agents(p).unwrap_or_default();
-        }
+        self.agents = load_agents(&self.project_name).unwrap_or_default();
         self.last_refresh = Instant::now();
-        self.refresh_pane_snapshot();
         Ok(())
     }
 
-    fn bootstrap_orchestrator(&mut self, project_name: &str) {
-        match shelbi_orchestrator::ensure_running(project_name) {
-            Ok(shelbi_orchestrator::BootstrapStatus::Started) => {
-                self.status_line = format!("✓ started orchestrator for {project_name}");
-            }
-            Ok(shelbi_orchestrator::BootstrapStatus::AlreadyRunning) => {}
-            Err(e) => {
-                self.status_line =
-                    format!("orchestrator bootstrap failed: {e} (try `shelbi --project {project_name} orchestrate` in another terminal)");
-            }
-        }
-    }
-
-    /// Refresh the right-pane snapshot: capture-pane output for whichever
-    /// pane is contextually relevant. Best-effort — failures (worker pane
-    /// already gone, no orchestrator yet) are silently ignored.
-    pub fn refresh_pane_snapshot(&mut self) {
-        let snap = match &self.view {
-            View::Chat => self.capture_orchestrator(),
-            View::Agent(id) => self.capture_agent(id),
-            _ => return,
-        };
-        if let Some(s) = snap {
-            self.pane_snapshot = s;
-        }
-    }
-
-    fn capture_orchestrator(&self) -> Option<String> {
-        let project = self.project_name.as_deref()?;
-        let proj = shelbi_state::load_project(project).ok()?;
-        let hub = proj
-            .machines
-            .iter()
-            .find(|m| matches!(m.kind, shelbi_core::MachineKind::Local))?;
-        let host = hub.host();
-        let addr = shelbi_core::TmuxAddr {
-            session: format!("shelbi-{}", proj.name),
-            window: "orchestrator".into(),
-        };
-        shelbi_tmux::capture(&host, &addr).ok()
-    }
-
-    fn capture_agent(&self, id: &str) -> Option<String> {
-        let project = self.project_name.as_deref()?;
-        let proj = shelbi_state::load_project(project).ok()?;
-        let agent = self.agents.iter().find(|a| a.id == id)?;
-        let machine = proj.machine(&agent.machine)?;
-        shelbi_tmux::capture(&machine.host(), &agent.tmux).ok()
-    }
-
     pub fn maybe_refresh(&mut self) -> Result<()> {
-        if self.last_refresh.elapsed() >= Duration::from_millis(500) {
+        if self.last_refresh.elapsed() >= Duration::from_millis(750) {
             self.refresh()?;
         }
         Ok(())
     }
 
-    /// Move the sidebar selection up (wraps).
     pub fn nav_up(&mut self) {
-        let n = self.nav().len();
+        let n = self.rows().len();
         if n == 0 {
             return;
         }
@@ -215,71 +82,53 @@ impl App {
     }
 
     pub fn nav_down(&mut self) {
-        let n = self.nav().len();
+        let n = self.rows().len();
         if n == 0 {
             return;
         }
         self.sidebar_index = (self.sidebar_index + 1) % n;
     }
 
-    /// Activate the highlighted sidebar row.
-    pub fn nav_activate(&mut self) {
-        if let Some(row) = self.nav().get(self.sidebar_index).cloned() {
-            self.view = row.view;
+    /// Act on the currently highlighted row: tmux-select the matching
+    /// window (orchestrator → dashboard's right pane; agent → its window).
+    pub fn activate_selection(&mut self) {
+        if let Some(row) = self.rows().get(self.sidebar_index).cloned() {
+            self.activate_view(&row.view);
         }
     }
 
-    /// Send the current chat input buffer to the orchestrator's tmux pane.
-    /// Clears the buffer on success.
-    pub fn send_chat(&mut self) {
-        if self.chat_input.is_empty() {
-            return;
-        }
-        let project = match self.project_name.clone() {
-            Some(p) => p,
-            None => {
-                self.status_line = "no project loaded".into();
-                return;
+    pub fn activate_view(&mut self, view: &View) {
+        match view {
+            View::Orchestrator => {
+                let win = format!("shelbi-{}:dashboard", self.project_name);
+                let right = format!("{win}.{{right}}");
+                run_tmux(["select-window", "-t", &win]);
+                run_tmux(["select-pane", "-t", &right]);
+                self.status_line = "▶ focus → orchestrator".into();
             }
-        };
-        let proj = match shelbi_state::load_project(&project) {
-            Ok(p) => p,
-            Err(e) => {
-                self.status_line = format!("project load: {e}");
-                return;
-            }
-        };
-        let Some(hub) = proj
-            .machines
-            .iter()
-            .find(|m| matches!(m.kind, shelbi_core::MachineKind::Local))
-        else {
-            self.status_line = "project has no local hub".into();
-            return;
-        };
-        let addr = shelbi_core::TmuxAddr {
-            session: format!("shelbi-{}", proj.name),
-            window: "orchestrator".into(),
-        };
-        match shelbi_tmux::send_line(&hub.host(), &addr, &self.chat_input) {
-            Ok(()) => {
-                self.chat_input.clear();
-                self.status_line = "✓ sent to orchestrator".into();
-            }
-            Err(e) => {
-                self.status_line = format!("send failed: {e} (start it: `shelbi orchestrate`)");
+            View::Agent(id) => {
+                // Switch to the worker's window in the project session.
+                let target = format!("shelbi-{}:{}", self.project_name, id);
+                let out = run_tmux(["select-window", "-t", &target]);
+                if !out {
+                    self.status_line = format!(
+                        "couldn't switch to `{id}` — window not in this session \
+                         (remote workers need `tmux attach -t shelbi-w-{id}` for now)"
+                    );
+                } else {
+                    self.status_line = format!("▶ focus → {id}");
+                }
             }
         }
     }
+}
 
-    /// Jump directly to nav index N (1-based from user, 0-based here).
-    pub fn nav_jump(&mut self, n: usize) {
-        let nav = self.nav();
-        if n < nav.len() {
-            self.sidebar_index = n;
-            self.view = nav[n].view.clone();
-        }
-    }
+#[derive(Clone)]
+pub struct Row {
+    pub label: String,
+    pub view: View,
+    pub badge: Option<String>,
+    pub status: Option<Status>,
 }
 
 fn load_agents(project: &str) -> Result<Vec<Agent>> {
@@ -320,26 +169,15 @@ fn status_order(s: Status) -> u8 {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn nav_jump_changes_view() {
-        let mut a = App::new("default");
-        a.nav_jump(1);
-        assert_eq!(a.view, View::Tasks);
-        a.nav_jump(3);
-        assert_eq!(a.view, View::Machines);
-    }
-
-    #[test]
-    fn nav_wraps() {
-        let mut a = App::new("default");
-        let n = a.nav().len();
-        for _ in 0..n + 2 {
-            a.nav_down();
-        }
-        assert!(a.sidebar_index < n);
-    }
+/// Run `tmux ARGS`. Returns true on success.
+fn run_tmux<I, S>(args: I) -> bool
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<std::ffi::OsStr>,
+{
+    std::process::Command::new("tmux")
+        .args(args)
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
 }

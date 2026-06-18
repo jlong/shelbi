@@ -14,8 +14,8 @@ pub struct Args {
 
 pub fn run(project_opt: Option<String>, args: Args) -> Result<()> {
     let project_name = require_project(project_opt)?;
-    let addr = shelbi_orchestrator::orchestrator_addr(&project_name);
-    let status = shelbi_orchestrator::ensure_running(&project_name).map_err(|e| anyhow!(e))?;
+    let addr = shelbi_orchestrator::dashboard_addr(&project_name);
+    let status = shelbi_orchestrator::ensure_dashboard(&project_name).map_err(|e| anyhow!(e))?;
 
     match status {
         BootstrapStatus::Started => {

@@ -1,87 +1,111 @@
-//! Render the left-hand sidebar: title, nav rows, separator, agents, footer.
+//! Render the sidebar UI — fills the entire pane (it's the only thing
+//! this process renders; the orchestrator and workers live in other tmux
+//! panes / windows).
 
 use ratatui::{
-    layout::Rect,
+    layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, List, ListItem, ListState, Padding},
+    widgets::{Block, Borders, List, ListItem, ListState, Padding, Paragraph},
     Frame,
 };
 
 use crate::app::App;
 
-pub fn render(f: &mut Frame, app: &App, area: Rect) {
-    let nav = app.nav();
-    let mut items: Vec<ListItem> = Vec::new();
+pub fn render_full(f: &mut Frame, app: &App, area: Rect) {
+    let outer = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(1), Constraint::Length(2)])
+        .split(area);
 
-    // Title row.
-    items.push(ListItem::new(Line::from(vec![Span::styled(
-        " shelbi ",
-        Style::default().add_modifier(Modifier::BOLD).fg(Color::Cyan),
-    )])));
-    items.push(ListItem::new(Span::raw("")));
+    render_list(f, app, outer[0]);
+    render_footer(f, app, outer[1]);
+}
 
-    // Pre-compute where the separator falls (after the 4 main nav rows).
-    const MAIN_NAV: usize = 4;
-
-    for (i, row) in nav.iter().enumerate() {
-        if i == MAIN_NAV && i < nav.len() {
-            items.push(ListItem::new(Span::raw("")));
-            items.push(ListItem::new(Span::styled(
-                " — agents —",
-                Style::default().fg(Color::DarkGray),
-            )));
-        }
-        let mut spans: Vec<Span> = vec![Span::raw(format!("{} ", row.icon)), Span::raw(row.label.clone())];
-        if let Some(b) = &row.badge {
-            spans.push(Span::styled(
-                format!("  {}", b),
-                Style::default().fg(Color::DarkGray),
-            ));
-        }
-        let line = Line::from(spans);
-        items.push(ListItem::new(line));
-    }
-
-    items.push(ListItem::new(Span::raw("")));
-    items.push(ListItem::new(Span::styled(
-        " ^P to switch",
-        Style::default().fg(Color::DarkGray),
-    )));
-
+fn render_list(f: &mut Frame, app: &App, area: Rect) {
     let block = Block::default()
         .borders(Borders::ALL)
-        .padding(Padding::new(0, 0, 0, 0));
+        .padding(Padding::new(1, 1, 0, 0))
+        .title(Span::styled(
+            format!(" {} ", app.project_name),
+            Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+        ));
     let inner = block.inner(area);
     f.render_widget(block, area);
 
-    // Compute the listitem index of the highlighted row (account for the
-    // title + blank prefix and the agents-separator).
-    let highlight_idx = item_index_for_nav(app.sidebar_index);
-
-    let list = List::new(items)
-        .highlight_style(
-            Style::default()
-                .bg(Color::Blue)
-                .fg(Color::White)
-                .add_modifier(Modifier::BOLD),
-        )
-        .highlight_symbol("▸");
+    let rows = app.rows();
+    let mut items: Vec<ListItem> = Vec::new();
+    for (i, row) in rows.iter().enumerate() {
+        let mut spans: Vec<Span> = Vec::new();
+        if let Some(status) = row.status {
+            spans.push(Span::styled(
+                format!("{} ", status.glyph()),
+                Style::default().fg(status_color(status)),
+            ));
+        } else {
+            spans.push(Span::styled("▶ ", Style::default().fg(Color::Cyan)));
+        }
+        spans.push(Span::raw(row.label.clone()));
+        if let Some(b) = &row.badge {
+            spans.push(Span::styled(
+                format!("  {b}"),
+                Style::default().fg(Color::DarkGray),
+            ));
+        }
+        let mut style = Style::default();
+        if i == app.sidebar_index {
+            style = style.bg(Color::Blue).fg(Color::White).add_modifier(Modifier::BOLD);
+        }
+        items.push(ListItem::new(Line::from(spans)).style(style));
+    }
+    if rows.len() <= 1 {
+        items.push(ListItem::new(Span::styled(
+            "(no agents yet — ask the orchestrator →)",
+            Style::default().fg(Color::DarkGray),
+        )));
+    }
 
     let mut state = ListState::default();
-    state.select(Some(highlight_idx));
+    state.select(Some(app.sidebar_index));
+    let list = List::new(items);
     f.render_stateful_widget(list, inner, &mut state);
 }
 
-/// Maps `App::sidebar_index` (the nth nav row) to its position in the
-/// rendered list above. There's a 2-row header and a 2-row separator that
-/// appears before the agents rows.
-fn item_index_for_nav(nav_idx: usize) -> usize {
-    const HEADER_ROWS: usize = 2;
-    const MAIN_NAV: usize = 4;
-    if nav_idx < MAIN_NAV {
-        HEADER_ROWS + nav_idx
+fn render_footer(f: &mut Frame, app: &App, area: Rect) {
+    let lines = if app.status_line.is_empty() {
+        vec![
+            Line::from(Span::styled(
+                "  ^P palette  Enter focus",
+                Style::default().fg(Color::DarkGray),
+            )),
+            Line::from(Span::styled(
+                "  q  quit shelbi",
+                Style::default().fg(Color::DarkGray),
+            )),
+        ]
     } else {
-        HEADER_ROWS + MAIN_NAV + 2 + (nav_idx - MAIN_NAV)
+        vec![
+            Line::from(Span::styled(
+                format!("  {}", app.status_line),
+                Style::default().fg(Color::Yellow),
+            )),
+            Line::from(Span::styled(
+                "  ^P palette  q quit",
+                Style::default().fg(Color::DarkGray),
+            )),
+        ]
+    };
+    f.render_widget(Paragraph::new(lines), area);
+}
+
+fn status_color(s: shelbi_core::Status) -> Color {
+    use shelbi_core::Status::*;
+    match s {
+        Running => Color::Green,
+        Waiting => Color::Yellow,
+        Queued => Color::Blue,
+        Done => Color::Cyan,
+        Error => Color::Red,
+        Archived => Color::DarkGray,
     }
 }

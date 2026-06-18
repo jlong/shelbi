@@ -11,11 +11,8 @@ description = "ratatui dashboard for shelbi"
 [dependencies]
 shelbi-core = { workspace = true }
 shelbi-state = { workspace = true }
-shelbi-tmux = { workspace = true }
 shelbi-orchestrator = { workspace = true }
 shelbi-palette = { workspace = true }
 ratatui = { workspace = true }
 crossterm = { workspace = true }
 anyhow = { workspace = true }
-tracing = { workspace = true }
-strip-ansi-escapes = { workspace = true }

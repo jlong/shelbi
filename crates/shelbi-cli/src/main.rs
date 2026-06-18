@@ -65,6 +65,11 @@ enum Cmd {
     Init(commands::init::Args),
     /// Start the orchestrator agent in the project's tmux session window 1.
     Orchestrate(commands::orchestrate::Args),
+    /// (internal) Run the sidebar ratatui process inside the dashboard's
+    /// left pane. Not for direct use.
+    #[command(hide = true)]
+    #[command(name = "__sidebar")]
+    Sidebar { project: String },
 }
 
 fn main() -> Result<()> {
@@ -73,8 +78,10 @@ fn main() -> Result<()> {
 
     match cli.cmd {
         None => {
-            let session = cli.session.unwrap_or_else(|| "default".to_string());
-            shelbi_tui::run(&session).context("running TUI")
+            // Resolve the project the same way the CLI commands do.
+            let project = commands::require_project(cli.project.clone())
+                .context("resolving project for TUI launch")?;
+            shelbi_tui::run_main(&project).context("launching shelbi")
         }
         Some(Cmd::Spawn(args)) => commands::spawn::run(cli.project, args),
         Some(Cmd::List) => commands::list::run(cli.project),
@@ -87,6 +94,7 @@ fn main() -> Result<()> {
         Some(Cmd::Attach { id }) => commands::attach::run(cli.project, id),
         Some(Cmd::Init(args)) => commands::init::run(args),
         Some(Cmd::Orchestrate(args)) => commands::orchestrate::run(cli.project, args),
+        Some(Cmd::Sidebar { project }) => shelbi_tui::run_sidebar(&project).context("sidebar"),
     }
 }
 

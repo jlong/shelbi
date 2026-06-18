@@ -58,7 +58,7 @@ pub fn run(project_opt: Option<String>, args: Args) -> Result<()> {
             args.session
                 .clone()
                 .unwrap_or_else(|| format!("shelbi-{}", project.name)),
-            format!("w-{}", args.id),
+            args.id.clone(),
         )
     } else {
         (format!("shelbi-w-{}", args.id), "agent".to_string())

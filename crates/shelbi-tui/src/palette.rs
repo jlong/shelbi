@@ -1,7 +1,4 @@
-//! Ctrl+P command palette overlay.
-//!
-//! Built on top of `shelbi-palette` for matching. This module owns the input
-//! state, entry building, and rendering. Activation logic lives in `App`.
+//! Ctrl+P fuzzy command palette overlay.
 
 use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
@@ -52,45 +49,34 @@ impl PaletteState {
     }
 }
 
-/// Build the palette's entry catalog from the app's current state.
+/// Palette entries: orchestrator first, then each agent, then actions.
 pub fn entries(app: &App) -> Vec<Entry> {
-    let mut out = Vec::new();
-    let nav = app.nav();
-    // Main nav items.
-    for row in nav.iter().take(4) {
-        out.push(Entry {
-            id: format!("view:{}", row.label.to_lowercase()),
-            label: row.label.clone(),
-            kind: EntryKind::View,
-            subtitle: Some("nav".into()),
-        });
-    }
-    // Agents (every active worker is fuzzy-findable).
+    let mut out = vec![Entry {
+        id: "view:orchestrator".into(),
+        label: "orchestrator".into(),
+        kind: EntryKind::View,
+        subtitle: Some("focus the orchestrator pane".into()),
+    }];
     for a in &app.agents {
         out.push(Entry {
             id: format!("agent:{}", a.id),
             label: a.id.clone(),
             kind: EntryKind::Agent,
-            subtitle: Some(format!(
-                "{} · {:?}",
-                a.machine,
-                a.status
-            )),
+            subtitle: Some(format!("{} · {:?}", a.machine, a.status)),
         });
     }
-    // Global actions.
-    for (id, label, sub) in [
-        ("action:new-task", "New task", "compose"),
-        ("action:refresh", "Refresh state", "reload state files"),
-        ("action:quit", "Quit shelbi", "Ctrl+C also works"),
-    ] {
-        out.push(Entry {
-            id: id.into(),
-            label: label.into(),
-            kind: EntryKind::Action,
-            subtitle: Some(sub.into()),
-        });
-    }
+    out.push(Entry {
+        id: "action:refresh".into(),
+        label: "refresh state".into(),
+        kind: EntryKind::Action,
+        subtitle: Some("reload agent files".into()),
+    });
+    out.push(Entry {
+        id: "action:quit".into(),
+        label: "quit shelbi".into(),
+        kind: EntryKind::Action,
+        subtitle: Some("kills the sidebar; orchestrator keeps running".into()),
+    });
     out
 }
 
@@ -98,7 +84,7 @@ pub fn render(f: &mut Frame, state: &PaletteState, results: &[(Entry, u16)]) {
     if !state.open {
         return;
     }
-    let area = centered_rect(f.area(), 60, 22);
+    let area = centered_rect(f.area(), 90, 18);
     f.render_widget(Clear, area);
 
     let outer = Block::default()
@@ -118,7 +104,6 @@ pub fn render(f: &mut Frame, state: &PaletteState, results: &[(Entry, u16)]) {
         .constraints([Constraint::Length(2), Constraint::Min(1)])
         .split(inner);
 
-    // Input row.
     let prompt = Line::from(vec![
         Span::styled("> ", Style::default().fg(Color::DarkGray)),
         Span::raw(state.query.clone()),
@@ -126,13 +111,15 @@ pub fn render(f: &mut Frame, state: &PaletteState, results: &[(Entry, u16)]) {
     ]);
     f.render_widget(Paragraph::new(vec![prompt, Line::raw("")]), layout[0]);
 
-    // Result list.
     let items: Vec<ListItem> = results
         .iter()
-        .map(|(e, _score)| {
+        .map(|(e, _)| {
             let mut spans = vec![
-                Span::styled(format!(" {} ", e.kind.icon()), Style::default().fg(Color::DarkGray)),
-                Span::raw(format!("{:<22}", e.label)),
+                Span::styled(
+                    format!(" {} ", e.kind.icon()),
+                    Style::default().fg(Color::DarkGray),
+                ),
+                Span::raw(format!("{:<18}", e.label)),
             ];
             if let Some(sub) = &e.subtitle {
                 spans.push(Span::styled(
@@ -157,60 +144,28 @@ pub fn render(f: &mut Frame, state: &PaletteState, results: &[(Entry, u16)]) {
     f.render_stateful_widget(list, layout[1], &mut s);
 }
 
-/// Activate the selected palette entry. Returns true if the palette should
-/// stay open (e.g. we need user follow-up) — false to close it.
+/// Activate the selected entry. Returns true if the palette should stay
+/// open (it never does today).
 pub fn activate(app: &mut App, entry: &Entry) -> bool {
     match entry.kind {
         EntryKind::View => {
-            let label = entry.label.to_lowercase();
-            let view = match label.as_str() {
-                "chat" => View::Chat,
-                "tasks" => View::Tasks,
-                "review" => View::Review,
-                "machines" => View::Machines,
-                _ => return false,
-            };
-            // Sync sidebar_index to match the new view.
-            for (i, row) in app.nav().iter().take(4).enumerate() {
-                if row.view == view {
-                    app.sidebar_index = i;
-                    break;
-                }
-            }
-            app.view = view;
-            false
+            app.activate_view(&View::Orchestrator);
         }
         EntryKind::Agent => {
-            let id = entry.label.clone();
-            for (i, row) in app.nav().iter().enumerate() {
-                if let View::Agent(a) = &row.view {
-                    if a == &id {
-                        app.sidebar_index = i;
-                        break;
-                    }
-                }
-            }
-            app.view = View::Agent(id);
-            false
+            app.activate_view(&View::Agent(entry.label.clone()));
         }
-        EntryKind::Action => {
-            match entry.id.as_str() {
-                "action:quit" => {
-                    app.should_quit = true;
-                }
-                "action:refresh" => {
-                    app.refresh().ok();
-                    app.status_line = "refreshed".into();
-                }
-                "action:new-task" => {
-                    app.status_line =
-                        "(new-task form lands in Phase 7)".into();
-                }
-                _ => {}
+        EntryKind::Action => match entry.id.as_str() {
+            "action:quit" => {
+                app.should_quit = true;
             }
-            false
-        }
+            "action:refresh" => {
+                app.refresh().ok();
+                app.status_line = "refreshed".into();
+            }
+            _ => {}
+        },
     }
+    false
 }
 
 fn centered_rect(area: Rect, percent_x: u16, height: u16) -> Rect {

@@ -1,42 +1,76 @@
-//! ratatui dashboard for shelbi.
+//! shelbi's two top-level entry points:
 //!
-//! Phase 4a: two-pane layout (sidebar nav + content view) with keyboard
-//! navigation and live state-file polling.
-//! Phase 4b: Ctrl+P palette overlay, chat input bound to the orchestrator
-//! pane, agent-view live tail.
+//! - `run_main(project)` — set up the project's tmux session with the
+//!   dashboard layout (sidebar + orchestrator) and `exec tmux attach`.
+//!   This is what `shelbi` (no subcommand) invokes.
+//! - `run_sidebar(project)` — the minimal ratatui process that lives in
+//!   the dashboard's left pane: agent list, status footer, Ctrl+P palette.
+//!   Selecting an agent switches the tmux window. This is what
+//!   `shelbi __sidebar PROJECT` invokes.
 
 use std::io;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
 use crossterm::{
-    event::{
-        self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind, KeyModifiers,
-    },
+    event::{self, Event, KeyCode, KeyEventKind, KeyModifiers},
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
-use ratatui::{
-    backend::CrosstermBackend,
-    layout::{Constraint, Direction, Layout},
-    Terminal,
-};
+use ratatui::{backend::CrosstermBackend, Terminal};
 
 mod app;
 mod palette;
 mod sidebar;
-mod view;
 
 pub use app::{App, View};
 
-/// Open the TUI for the given session name.
-pub fn run(session_name: &str) -> Result<()> {
+/// Set up the project's tmux session and attach to it. If we're already
+/// inside a tmux client, use `switch-client` instead of `attach` (tmux
+/// refuses to nest, modern tmux supports switching).
+pub fn run_main(project_name: &str) -> Result<()> {
+    shelbi_orchestrator::ensure_dashboard(project_name)
+        .with_context(|| format!("setting up dashboard for `{project_name}`"))?;
+
+    let session = format!("shelbi-{project_name}");
+    let inside_tmux = std::env::var("TMUX").is_ok();
+
+    let args: &[&str] = if inside_tmux {
+        &["switch-client", "-t"]
+    } else {
+        &["attach", "-t"]
+    };
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        let err = std::process::Command::new("tmux")
+            .args(args)
+            .arg(&session)
+            .exec();
+        Err(err.into())
+    }
+    #[cfg(not(unix))]
+    {
+        let status = std::process::Command::new("tmux")
+            .args(args)
+            .arg(&session)
+            .status()?;
+        if !status.success() {
+            anyhow::bail!("tmux exited with {status}");
+        }
+        Ok(())
+    }
+}
+
+/// Run the minimal ratatui sidebar in the current pane.
+pub fn run_sidebar(project_name: &str) -> Result<()> {
     let mut term = setup_terminal().context("setting up terminal")?;
-    let mut app = App::new(session_name);
+    let mut app = App::new_sidebar(project_name);
     let mut pal = palette::PaletteState::new();
     app.refresh().ok();
 
-    let result = main_loop(&mut term, &mut app, &mut pal);
+    let result = sidebar_loop(&mut term, &mut app, &mut pal);
 
     restore_terminal(&mut term).context("restoring terminal")?;
     result
@@ -45,7 +79,7 @@ pub fn run(session_name: &str) -> Result<()> {
 fn setup_terminal() -> Result<Terminal<CrosstermBackend<io::Stdout>>> {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
+    execute!(stdout, EnterAlternateScreen)?;
     Ok(Terminal::new(CrosstermBackend::new(stdout))?)
 }
 
@@ -53,12 +87,12 @@ fn restore_terminal<B: ratatui::backend::Backend + std::io::Write>(
     term: &mut Terminal<B>,
 ) -> Result<()> {
     disable_raw_mode()?;
-    execute!(term.backend_mut(), LeaveAlternateScreen, DisableMouseCapture)?;
+    execute!(term.backend_mut(), LeaveAlternateScreen)?;
     term.show_cursor()?;
     Ok(())
 }
 
-fn main_loop<B: ratatui::backend::Backend>(
+fn sidebar_loop<B: ratatui::backend::Backend>(
     term: &mut Terminal<B>,
     app: &mut App,
     pal: &mut palette::PaletteState,
@@ -79,17 +113,7 @@ fn main_loop<B: ratatui::backend::Backend>(
 
         term.draw(|f| {
             let area = f.area();
-            let outer = Layout::default()
-                .direction(Direction::Vertical)
-                .constraints([Constraint::Min(10), Constraint::Length(1)])
-                .split(area);
-            let chunks = Layout::default()
-                .direction(Direction::Horizontal)
-                .constraints([Constraint::Length(24), Constraint::Min(40)])
-                .split(outer[0]);
-            sidebar::render(f, app, chunks[0]);
-            view::render(f, app, chunks[1]);
-            view::render_footer(f, app, outer[1]);
+            sidebar::render_full(f, app, area);
             palette::render(f, pal, &pal_results);
         })?;
 
@@ -117,12 +141,9 @@ fn handle_palette_key(
     mods: KeyModifiers,
 ) {
     if mods.contains(KeyModifiers::CONTROL) {
-        match code {
-            KeyCode::Char('c') | KeyCode::Char('p') => {
-                pal.close();
-                return;
-            }
-            _ => {}
+        if matches!(code, KeyCode::Char('c') | KeyCode::Char('p')) {
+            pal.close();
+            return;
         }
     }
     match code {
@@ -157,7 +178,6 @@ fn handle_key(
     code: KeyCode,
     mods: KeyModifiers,
 ) {
-    // Global shortcuts.
     if mods.contains(KeyModifiers::CONTROL) {
         match code {
             KeyCode::Char('c') => {
@@ -171,40 +191,11 @@ fn handle_key(
             _ => {}
         }
     }
-
-    // Chat view: capture text input for the orchestrator.
-    if matches!(app.view, View::Chat) {
-        match code {
-            KeyCode::Enter => {
-                app.send_chat();
-                return;
-            }
-            KeyCode::Backspace => {
-                app.chat_input.pop();
-                return;
-            }
-            KeyCode::Char(c) => {
-                // Reserve digits + jk for navigation only when the buffer is empty.
-                if app.chat_input.is_empty() && matches!(c, '1'..='4' | 'j' | 'k' | 'q' | 'r') {
-                    // fall through to navigation
-                } else {
-                    app.chat_input.push(c);
-                    return;
-                }
-            }
-            _ => {}
-        }
-    }
-
     match code {
         KeyCode::Char('q') => app.should_quit = true,
-        KeyCode::Char('1') => app.nav_jump(0),
-        KeyCode::Char('2') => app.nav_jump(1),
-        KeyCode::Char('3') => app.nav_jump(2),
-        KeyCode::Char('4') => app.nav_jump(3),
         KeyCode::Up | KeyCode::Char('k') => app.nav_up(),
         KeyCode::Down | KeyCode::Char('j') => app.nav_down(),
-        KeyCode::Enter => app.nav_activate(),
+        KeyCode::Enter => app.activate_selection(),
         KeyCode::Char('r') => {
             app.refresh().ok();
         }
