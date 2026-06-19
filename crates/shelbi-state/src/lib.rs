@@ -10,6 +10,22 @@ use std::path::{Path, PathBuf};
 
 use shelbi_core::{Agent, Column, Project, Result, Session, Task};
 
+mod worker_status;
+
+pub use worker_status::{
+    append_worker_event, events_log_path, load_worker_status, parse_pane_title_state,
+    save_worker_status, worker_status_path, workers_dir, WorkerState, WorkerStatus,
+};
+
+#[cfg(test)]
+pub(crate) mod test_lock {
+    //! Shared mutex for all tests that mutate the process-wide
+    //! `SHELBI_HOME` env var. Per-module locks would race because the
+    //! env var is global.
+    use std::sync::Mutex;
+    pub static LOCK: Mutex<()> = Mutex::new(());
+}
+
 /// Default contents of the per-project worker settings template. Lives at
 /// `~/.shelbi/projects/<name>/worker-settings.json` after `shelbi init
 /// --project <name>` runs. The `{{worker_permissions_mode}}` placeholder is
@@ -373,7 +389,7 @@ fn split_frontmatter(s: &str) -> Option<(&str, &str)> {
 }
 
 /// Atomic write: write to a temp file in the same dir, then rename.
-fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
+pub(crate) fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
     let dir = path
         .parent()
         .ok_or_else(|| shelbi_core::Error::Other(format!("no parent dir for {path:?}")))?;
@@ -530,8 +546,7 @@ mod tests {
     // These exercise the on-disk task layout via $SHELBI_HOME. The env var
     // is process-wide so tests must serialize on it.
 
-    use std::sync::Mutex;
-    static TEST_LOCK: Mutex<()> = Mutex::new(());
+    use crate::test_lock::LOCK as TEST_LOCK;
 
     fn fresh_home() -> PathBuf {
         let p = std::env::temp_dir().join(format!(

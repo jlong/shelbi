@@ -25,11 +25,13 @@ use ratatui::{backend::CrosstermBackend, Terminal};
 
 mod app;
 mod kanban;
+mod poller;
 mod review;
 mod sidebar;
 
 pub use app::{App, View};
 pub use kanban::KanbanApp;
+pub use poller::WorkerPoller;
 pub use review::ReviewApp;
 
 /// Set up the project's tmux session and attach to it. If we're already
@@ -75,6 +77,14 @@ pub fn run_sidebar(project_name: &str) -> Result<()> {
     let mut term = setup_sidebar_terminal().context("setting up terminal")?;
     let mut app = App::new_sidebar(project_name);
     app.refresh().ok();
+
+    // Background poll loop: per-worker `tmux display-message` every
+    // `worker_poll_interval_secs`, parses the `shelbi:<state>` marker,
+    // persists transitions to `~/.shelbi/workers/<name>/status.yaml`
+    // and `~/.shelbi/events.log`. The handle's Drop joins the thread,
+    // so it shuts down when this function returns regardless of which
+    // exit path we took.
+    let _poller = WorkerPoller::start(project_name);
 
     let result = sidebar_loop(&mut term, &mut app);
 

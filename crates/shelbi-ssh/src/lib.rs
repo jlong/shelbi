@@ -11,6 +11,37 @@ use std::process::{Command, Output, Stdio};
 
 use shelbi_core::Host;
 
+/// SSH connection-multiplexing options injected into every SSH-routed
+/// command. With these set, the first invocation opens a master socket and
+/// subsequent invocations reuse it — turning what would be a ~1s TCP +
+/// TLS + auth handshake into a ~10ms write to a local Unix socket. The
+/// sidebar polls workers every few seconds, so this is the difference
+/// between "noticeable lag" and "imperceptible."
+///
+/// `ControlPath` uses `%C` (a hash of host+user+port) so distinct
+/// destinations don't collide on the same socket. `ControlPersist=600`
+/// keeps the master alive for 10 minutes after the last client closes,
+/// which spans most idle gaps in a normal session.
+///
+/// Users with their own `ControlMaster` configuration in `~/.ssh/config`
+/// see our `-o` flags take precedence (command-line `-o` overrides config),
+/// which is the right call — we know our access pattern (many short
+/// commands) better than a generic per-host config does.
+const SSH_CONTROL_OPTS: &[&str] = &[
+    "-o",
+    "ControlMaster=auto",
+    "-o",
+    "ControlPath=~/.ssh/shelbi-cm-%C",
+    "-o",
+    "ControlPersist=600",
+];
+
+fn apply_ssh_control_opts(cmd: &mut Command) {
+    for opt in SSH_CONTROL_OPTS {
+        cmd.arg(opt);
+    }
+}
+
 /// Build (but do not execute) a `Command` that will run the given argv on
 /// `host`. The argv is treated as a single command line for SSH (joined with
 /// spaces, no shell escaping yet — callers are expected to pass pre-escaped
@@ -32,6 +63,7 @@ where
         }
         Host::Ssh { host } => {
             let mut cmd = Command::new("ssh");
+            apply_ssh_control_opts(&mut cmd);
             cmd.arg(host);
             cmd.arg("--");
             for a in &argv {
@@ -61,6 +93,7 @@ where
         }
         Host::Ssh { host } => {
             let mut cmd = Command::new("ssh");
+            apply_ssh_control_opts(&mut cmd);
             cmd.arg("-t");
             cmd.arg(host);
             cmd.arg("--");
@@ -177,10 +210,11 @@ mod tests {
             .get_args()
             .map(|a| a.to_string_lossy().into_owned())
             .collect();
-        assert_eq!(
-            args,
-            vec!["m2.local", "--", "tmux", "new-session"]
-        );
+        // Control-master opts ride in front of every SSH invocation so
+        // back-to-back hub→worker commands reuse a single socket.
+        let mut expected: Vec<String> = SSH_CONTROL_OPTS.iter().map(|s| s.to_string()).collect();
+        expected.extend(["m2.local", "--", "tmux", "new-session"].map(String::from));
+        assert_eq!(args, expected);
     }
 
     #[test]
@@ -195,7 +229,9 @@ mod tests {
             .get_args()
             .map(|a| a.to_string_lossy().into_owned())
             .collect();
-        assert_eq!(args, vec!["-t", "m2.local", "--", "vi", "foo.txt"]);
+        let mut expected: Vec<String> = SSH_CONTROL_OPTS.iter().map(|s| s.to_string()).collect();
+        expected.extend(["-t", "m2.local", "--", "vi", "foo.txt"].map(String::from));
+        assert_eq!(args, expected);
     }
 
     #[test]

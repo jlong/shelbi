@@ -115,6 +115,26 @@ pub fn send_line(host: &Host, addr: &TmuxAddr, text: &str) -> Result<()> {
     Ok(())
 }
 
+/// Read the pane's current title, with the trailing newline trimmed. The
+/// hub uses this to poll workers for state markers — claude's hooks write
+/// `shelbi:<state>` to the title via OSC escapes (see
+/// `shelbi-state::default_worker_settings.json`), and the parser in
+/// `shelbi-state` peels the marker back off.
+pub fn pane_title(host: &Host, addr: &TmuxAddr) -> Result<String> {
+    let raw = shelbi_ssh::run_capture(
+        host,
+        [
+            "tmux",
+            "display-message",
+            "-p",
+            "-t",
+            &addr.target(),
+            "#{pane_title}",
+        ],
+    )?;
+    Ok(raw.trim_end_matches(['\n', '\r']).to_string())
+}
+
 /// Capture the current visible content of the pane as plain text.
 ///
 /// `-p` prints to stdout, `-J` joins wrapped lines.
@@ -153,12 +173,39 @@ mod tests {
     use super::*;
 
     fn ssh_args(cmd: std::process::Command) -> Vec<String> {
-        std::iter::once(cmd.get_program().to_string_lossy().into_owned())
+        let raw: Vec<String> = std::iter::once(cmd.get_program().to_string_lossy().into_owned())
             .chain(
                 cmd.get_args()
                     .map(|a| a.to_string_lossy().into_owned()),
             )
-            .collect()
+            .collect();
+        // For SSH-routed commands, strip the connection-multiplexing
+        // options that shelbi-ssh prepends to every invocation. They're
+        // an orthogonal concern (covered by shelbi-ssh's own tests) and
+        // would otherwise force every structural test below to enumerate
+        // them. Recognized by the leading `ssh` program; for local
+        // commands we pass through unchanged.
+        if raw.first().map(|s| s.as_str()) != Some("ssh") {
+            return raw;
+        }
+        let mut out = Vec::with_capacity(raw.len());
+        out.push(raw[0].clone());
+        let mut i = 1;
+        while i < raw.len() {
+            if raw[i] == "-o" && i + 1 < raw.len() {
+                let v = &raw[i + 1];
+                if v.starts_with("ControlMaster=")
+                    || v.starts_with("ControlPath=")
+                    || v.starts_with("ControlPersist=")
+                {
+                    i += 2;
+                    continue;
+                }
+            }
+            out.push(raw[i].clone());
+            i += 1;
+        }
+        out
     }
 
     #[test]
@@ -310,6 +357,40 @@ mod tests {
                 "-b",
                 "shelbi-send",
                 "-",
+            ]
+        );
+    }
+
+    #[test]
+    fn remote_pane_title_argv() {
+        // The hub-side worker poll uses display-message + #{pane_title}
+        // to read the trailing `shelbi:<state>` marker. Make sure the
+        // SSH-routed argv shape stays stable.
+        let cmd = shelbi_ssh::build_command(
+            &Host::Ssh {
+                host: "m2.local".into(),
+            },
+            [
+                "tmux",
+                "display-message",
+                "-p",
+                "-t",
+                "shelbi-w-fix-login:agent",
+                "#{pane_title}",
+            ],
+        );
+        assert_eq!(
+            ssh_args(cmd),
+            vec![
+                "ssh",
+                "m2.local",
+                "--",
+                "tmux",
+                "display-message",
+                "-p",
+                "-t",
+                "shelbi-w-fix-login:agent",
+                "#{pane_title}",
             ]
         );
     }

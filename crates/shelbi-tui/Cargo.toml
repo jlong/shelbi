@@ -14,9 +14,10 @@ shelbi-state = { workspace = true }
 shelbi-orchestrator = { workspace = true }
 shelbi-agent = { workspace = true }
 shelbi-palette = { workspace = true }
+shelbi-tmux = { workspace = true }
 ratatui = { workspace = true }
 crossterm = { workspace = true }
 anyhow = { workspace = true }
-
-[dev-dependencies]
 chrono = { workspace = true }
+tracing = { workspace = true }
+

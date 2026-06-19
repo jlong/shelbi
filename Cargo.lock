@@ -922,6 +922,8 @@ dependencies = [
  "shelbi-orchestrator",
  "shelbi-palette",
  "shelbi-state",
+ "shelbi-tmux",
+ "tracing",
 ]
 
 [[package]]
