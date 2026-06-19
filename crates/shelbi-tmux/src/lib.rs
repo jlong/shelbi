@@ -73,23 +73,43 @@ pub fn kill_window(host: &Host, addr: &TmuxAddr) -> Result<()> {
 /// user's own buffers.
 const PASTE_BUFFER: &str = "shelbi-send";
 
+/// Decide whether [`send_line`] must stage `text` through a tmux paste
+/// buffer (vs. the faster `send-keys -l` fast path).
+///
+/// Multi-line text always uses the buffer path so embedded newlines
+/// don't get re-parsed as command separators by the remote shell. For
+/// SSH-routed hosts we also force the buffer path on single-line text:
+/// `send-keys -l TEXT` over SSH would be joined into ssh's argv with
+/// single spaces, then re-tokenized by the remote shell — losing
+/// embedded spaces (tmux concatenates `-l` literal-text args with no
+/// separator, producing e.g. `cd/path/to/wt` instead of `cd /path/to/wt`)
+/// and letting shell metacharacters (`&&`, `|`, `;`, `$`) escape into
+/// the remote shell instead of being treated as literal input.
+fn uses_buffer_path(host: &Host, text: &str) -> bool {
+    text.contains('\n') || host.is_ssh()
+}
+
 /// Send a string to the target's keyboard input, followed by Enter.
 ///
-/// For single-line text we use `send-keys -l` so tmux treats it as
+/// For local single-line text we use `send-keys -l` so tmux treats it as
 /// literal characters (avoiding key-name expansion like `C-c`) and Enter
 /// is sent as a separate `Enter` keysym.
 ///
-/// For multi-line text we instead stage the payload in a tmux paste
-/// buffer and replay it with `paste-buffer -p`. `-p` wraps the content
-/// in bracketed-paste markers so the receiving app (e.g. Claude) sees
-/// one atomic paste rather than N individual Enter keypresses — which
-/// matters over SSH, where send-key Enters arrive spaced out far enough
-/// to defeat any heuristic paste detection. We also pipe the payload to
-/// `load-buffer -` via stdin so embedded newlines don't get re-parsed by
-/// the remote shell when ssh joins argv with single spaces.
+/// For multi-line text — and for ALL remote text — we instead stage the
+/// payload in a tmux paste buffer and replay it with `paste-buffer -p`.
+/// `-p` wraps the content in bracketed-paste markers so the receiving
+/// app (e.g. Claude) sees one atomic paste rather than N individual
+/// Enter keypresses — which matters over SSH, where send-key Enters
+/// arrive spaced out far enough to defeat any heuristic paste detection.
+/// We also pipe the payload to `load-buffer -` via stdin so embedded
+/// whitespace and shell metacharacters don't get re-parsed by the remote
+/// shell when ssh joins argv with single spaces — `send-keys -l` over
+/// SSH would otherwise lose spaces (tmux concatenates literal-text args
+/// with no separator) and let `&&`, `|`, etc. escape into the remote
+/// shell.
 pub fn send_line(host: &Host, addr: &TmuxAddr, text: &str) -> Result<()> {
     let target = addr.target();
-    if text.contains('\n') {
+    if uses_buffer_path(host, text) {
         shelbi_ssh::run_with_stdin(
             host,
             ["tmux", "load-buffer", "-b", PASTE_BUFFER, "-"],
@@ -393,6 +413,47 @@ mod tests {
                 "#{pane_title}",
             ]
         );
+    }
+
+    #[test]
+    fn remote_single_line_uses_buffer_path() {
+        // Regression: `tmux send-keys -l TEXT` over SSH loses embedded
+        // spaces — the remote shell re-tokenizes ssh's space-joined argv,
+        // tmux sees each space-separated word as a distinct `-l` literal,
+        // and concatenates them with no separator (producing e.g.
+        // `cd/home/jlong/...` instead of `cd /home/jlong/...`). Worse,
+        // shell metacharacters like `&&` escape into the remote shell.
+        // Force the buffer path for all SSH-routed text so the payload
+        // travels through `load-buffer -` stdin instead of argv.
+        let host = Host::Ssh {
+            host: "devbox".into(),
+        };
+        let text = "cd /home/jlong/Workspaces/shelbi/.shelbi/wt/delta && exec \"${SHELL:-/bin/bash}\" -lc claude";
+        assert!(uses_buffer_path(&host, text));
+        // Single-line text without metachars still routes through the
+        // buffer over SSH — the issue is structural to send-keys -l over
+        // ssh, not specific to the metachars in the payload above.
+        assert!(uses_buffer_path(&host, "hello world"));
+    }
+
+    #[test]
+    fn local_single_line_uses_fast_path() {
+        // Local invocations don't go through ssh re-tokenization, so the
+        // fast `send-keys -l` path stays correct (and saves the extra
+        // load-buffer + paste-buffer round-trips).
+        assert!(!uses_buffer_path(&Host::Local, "hello world"));
+        assert!(!uses_buffer_path(&Host::Local, "cd /tmp && ls"));
+    }
+
+    #[test]
+    fn multiline_always_uses_buffer_path() {
+        assert!(uses_buffer_path(&Host::Local, "line one\nline two"));
+        assert!(uses_buffer_path(
+            &Host::Ssh {
+                host: "devbox".into(),
+            },
+            "line one\nline two",
+        ));
     }
 
     #[test]

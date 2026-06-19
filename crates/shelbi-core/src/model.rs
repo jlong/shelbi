@@ -158,6 +158,10 @@ impl Host {
     pub fn is_local(&self) -> bool {
         matches!(self, Host::Local)
     }
+
+    pub fn is_ssh(&self) -> bool {
+        matches!(self, Host::Ssh { .. })
+    }
 }
 
 // ---------------------------------------------------------------------------
