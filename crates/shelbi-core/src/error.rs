@@ -26,6 +26,12 @@ pub enum Error {
         stderr: String,
     },
 
+    #[error("unknown task id(s) in depends_on: {0}")]
+    UnknownDepends(String),
+
+    #[error("dependency cycle: {0}")]
+    DependencyCycle(String),
+
     #[error("{0}")]
     Other(String),
 }

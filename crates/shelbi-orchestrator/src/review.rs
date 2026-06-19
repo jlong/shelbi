@@ -314,6 +314,7 @@ mod tests {
             priority: 0,
             assigned_to: Some("alice".into()),
             branch: Some("shelbi/fix-thing".into()),
+            depends_on: Vec::new(),
             created_at: now,
             updated_at: now,
         };

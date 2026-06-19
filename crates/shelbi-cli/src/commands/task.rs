@@ -26,9 +26,17 @@ pub enum TaskCmd {
     List {
         #[arg(long)]
         column: Option<String>,
+        /// Show only unblocked todo items, in priority order. Useful for
+        /// orchestrator agents and for users planning next work. Mutually
+        /// exclusive with `--column`.
+        #[arg(long, conflicts_with = "column")]
+        ready: bool,
     },
-    /// Print a task's frontmatter + body.
+    /// Print a task's frontmatter + body, plus the resolved status of each
+    /// `depends_on` entry.
     Show { id: String },
+    /// Edit a task's dependency list.
+    Depends(DependsArgs),
     /// Move a task to another column.
     Move {
         id: String,
@@ -77,6 +85,24 @@ pub struct AddArgs {
     /// `shelbi task edit` to fill it in).
     #[arg(long, short)]
     pub description: Option<String>,
+    /// Task id this task depends on. Repeat for multiple deps:
+    /// `--depends-on a --depends-on b`. Repeat-flag chosen over
+    /// comma-separated to avoid future escaping issues with ids that may
+    /// contain commas or shell metacharacters.
+    #[arg(long = "depends-on", value_name = "ID")]
+    pub depends_on: Vec<String>,
+}
+
+#[derive(Debug, ClapArgs)]
+pub struct DependsArgs {
+    /// Task whose dependency list is being edited.
+    pub id: String,
+    /// Dependency id to add. Repeat for multiple.
+    #[arg(long = "add", value_name = "DEP")]
+    pub add: Vec<String>,
+    /// Dependency id to remove. Repeat for multiple.
+    #[arg(long = "remove", value_name = "DEP")]
+    pub remove: Vec<String>,
 }
 
 #[derive(Debug, ClapArgs)]
@@ -103,8 +129,9 @@ pub fn run(project_opt: Option<String>, cmd: TaskCmd) -> Result<()> {
     let project = require_project(project_opt)?;
     match cmd {
         TaskCmd::Add(args) => add(&project, args),
-        TaskCmd::List { column } => list(&project, column.as_deref()),
+        TaskCmd::List { column, ready } => list(&project, column.as_deref(), ready),
         TaskCmd::Show { id } => show(&project, &id),
+        TaskCmd::Depends(args) => depends(&project, args),
         TaskCmd::Move { id, to } => move_to(&project, &id, &to),
         TaskCmd::Assign { id, to } => assign(&project, &id, &to),
         TaskCmd::Unassign { id } => unassign(&project, &id),
@@ -142,9 +169,14 @@ fn add(project: &str, args: AddArgs) -> Result<()> {
         priority,
         assigned_to: None,
         branch: None,
+        depends_on: dedup_preserving_order(args.depends_on.clone()),
         created_at: now,
         updated_at: now,
     };
+    if !task.depends_on.is_empty() {
+        let existing = shelbi_state::list_tasks(project).map_err(|e| anyhow!(e))?;
+        shelbi_state::validate_depends_on(&task, &existing).map_err(|e| anyhow!(e))?;
+    }
     let body = args
         .description
         .map(|d| format!("# Task\n\n{d}\n"))
@@ -154,7 +186,38 @@ fn add(project: &str, args: AddArgs) -> Result<()> {
     Ok(())
 }
 
-fn list(project: &str, column_filter: Option<&str>) -> Result<()> {
+/// Stable de-dup that preserves first-occurrence order. Used so a user
+/// passing `--depends-on a --depends-on a --depends-on b` lands as `[a, b]`.
+fn dedup_preserving_order(items: Vec<String>) -> Vec<String> {
+    let mut seen = std::collections::HashSet::new();
+    let mut out = Vec::with_capacity(items.len());
+    for item in items {
+        if seen.insert(item.clone()) {
+            out.push(item);
+        }
+    }
+    out
+}
+
+fn list(project: &str, column_filter: Option<&str>, ready: bool) -> Result<()> {
+    if ready {
+        let ready_tasks = shelbi_state::list_ready(project).map_err(|e| anyhow!(e))?;
+        if ready_tasks.is_empty() {
+            println!("(no ready todo items)");
+            return Ok(());
+        }
+        for tf in &ready_tasks {
+            let owner = tf
+                .task
+                .assigned_to
+                .as_deref()
+                .map(|w| format!("  [{w}]"))
+                .unwrap_or_default();
+            println!("  {:<28} {}{owner}", tf.task.id, tf.task.title);
+        }
+        return Ok(());
+    }
+
     let filter = column_filter
         .map(Column::from_str)
         .transpose()
@@ -165,6 +228,10 @@ fn list(project: &str, column_filter: Option<&str>) -> Result<()> {
         println!("(no tasks yet)");
         return Ok(());
     }
+    let columns: std::collections::HashMap<String, Column> = all
+        .iter()
+        .map(|tf| (tf.task.id.clone(), tf.task.column))
+        .collect();
     for col in Column::ALL {
         if let Some(want) = filter {
             if want != col {
@@ -180,7 +247,8 @@ fn list(project: &str, column_filter: Option<&str>) -> Result<()> {
                 .as_deref()
                 .map(|w| format!("  [{w}]"))
                 .unwrap_or_default();
-            println!("  {:<28} {}{owner}", tf.task.id, tf.task.title);
+            let badge = if tf.task.is_blocked(&columns) { " 🔒" } else { "" };
+            println!("  {:<28} {}{owner}{badge}", tf.task.id, tf.task.title);
         }
     }
     Ok(())
@@ -191,6 +259,71 @@ fn show(project: &str, id: &str) -> Result<()> {
     let text = std::fs::read_to_string(&path)
         .with_context(|| format!("reading {}", path.display()))?;
     print!("{text}");
+
+    // Footer: resolved depends_on. Done lazily after the raw file dump so
+    // scripts grepping for frontmatter still get clean output above the line.
+    let tf = shelbi_state::load_task(project, id).map_err(|e| anyhow!(e))?;
+    if !tf.task.depends_on.is_empty() {
+        let columns = shelbi_state::task_columns(project).map_err(|e| anyhow!(e))?;
+        let parts: Vec<String> = tf
+            .task
+            .depends_on
+            .iter()
+            .map(|dep| match columns.get(dep) {
+                Some(col) => format!("{dep} [{col}]"),
+                None => format!("{dep} [missing]"),
+            })
+            .collect();
+        if !text.ends_with('\n') {
+            println!();
+        }
+        println!("→ depends on: {}", parts.join(", "));
+        if tf.task.is_blocked(&columns) {
+            println!("  status: 🔒 blocked");
+        } else {
+            println!("  status: ✓ ready");
+        }
+    }
+    Ok(())
+}
+
+fn depends(project: &str, args: DependsArgs) -> Result<()> {
+    if args.add.is_empty() && args.remove.is_empty() {
+        bail!("specify at least one --add ID or --remove ID");
+    }
+    let mut tf = shelbi_state::load_task(project, &args.id).map_err(|e| anyhow!(e))?;
+
+    let mut updated: Vec<String> = tf.task.depends_on.clone();
+    // Removals first so an --add of an id being removed lands at the end.
+    if !args.remove.is_empty() {
+        let drop: std::collections::HashSet<&str> =
+            args.remove.iter().map(String::as_str).collect();
+        updated.retain(|d| !drop.contains(d.as_str()));
+    }
+    for dep in &args.add {
+        if !updated.iter().any(|d| d == dep) {
+            updated.push(dep.clone());
+        }
+    }
+    if updated == tf.task.depends_on {
+        println!("(no change)");
+        return Ok(());
+    }
+    tf.task.depends_on = updated;
+    tf.task.updated_at = Utc::now();
+
+    let existing = shelbi_state::list_tasks(project).map_err(|e| anyhow!(e))?;
+    shelbi_state::validate_depends_on(&tf.task, &existing).map_err(|e| anyhow!(e))?;
+    shelbi_state::save_task(project, &tf.task, &tf.body).map_err(|e| anyhow!(e))?;
+    if tf.task.depends_on.is_empty() {
+        println!("✓ {} now has no dependencies", args.id);
+    } else {
+        println!(
+            "✓ {} depends on: {}",
+            args.id,
+            tf.task.depends_on.join(", ")
+        );
+    }
     Ok(())
 }
 

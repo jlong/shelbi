@@ -499,6 +499,7 @@ mod tests {
             priority: 0,
             assigned_to: Some("delta".into()),
             branch: Some("shelbi/fix-thing".into()),
+            depends_on: Vec::new(),
             created_at: now,
             updated_at: now,
         };
@@ -541,6 +542,7 @@ mod tests {
                 priority: 0,
                 assigned_to: Some("alpha".into()),
                 branch: None,
+                depends_on: Vec::new(),
                 created_at: now,
                 updated_at: now,
             },

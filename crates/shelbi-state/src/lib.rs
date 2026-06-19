@@ -8,6 +8,8 @@ use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
+use std::collections::{HashMap, HashSet};
+
 use shelbi_core::{Agent, Column, Project, Result, Session, Task};
 
 mod worker_status;
@@ -299,6 +301,124 @@ pub fn list_column(project: &str, column: Column) -> Result<Vec<TaskFile>> {
         .collect())
 }
 
+/// Map of every task id in `project` to its current column. Used to derive
+/// the [blocked](Task::is_blocked) state without reloading individual files.
+pub fn task_columns(project: &str) -> Result<HashMap<String, Column>> {
+    Ok(list_tasks(project)?
+        .into_iter()
+        .map(|tf| (tf.task.id, tf.task.column))
+        .collect())
+}
+
+/// Tasks ready to start: in [`Column::Todo`], not blocked by any unfinished
+/// dependency. Returned in priority order.
+pub fn list_ready(project: &str) -> Result<Vec<TaskFile>> {
+    let columns = task_columns(project)?;
+    Ok(list_column(project, Column::Todo)?
+        .into_iter()
+        .filter(|tf| !tf.task.is_blocked(&columns))
+        .collect())
+}
+
+/// Validate `depends_on` for a task that is about to be saved. Rejects:
+///
+/// 1. Self-references.
+/// 2. IDs that don't exist in the project.
+/// 3. Changes that would introduce a cycle.
+///
+/// `existing_tasks` should be the full task list before the save. The
+/// candidate's own id is taken from `task.id` and excluded from existence
+/// checks (allowing this fn to be used for both add and modification).
+pub fn validate_depends_on(task: &Task, existing_tasks: &[TaskFile]) -> Result<()> {
+    if task.depends_on.is_empty() {
+        return Ok(());
+    }
+
+    // Self-reference rejection.
+    if task.depends_on.iter().any(|d| d == &task.id) {
+        return Err(shelbi_core::Error::DependencyCycle(format!(
+            "{} → {}",
+            task.id, task.id
+        )));
+    }
+
+    // Existence check (every dep must already be a task, EXCEPT the candidate
+    // itself — which may or may not be in `existing_tasks` depending on whether
+    // this is an add or an edit).
+    let known: HashSet<&str> = existing_tasks
+        .iter()
+        .map(|tf| tf.task.id.as_str())
+        .collect();
+    let missing: Vec<&str> = task
+        .depends_on
+        .iter()
+        .filter(|d| d.as_str() != task.id && !known.contains(d.as_str()))
+        .map(String::as_str)
+        .collect();
+    if !missing.is_empty() {
+        return Err(shelbi_core::Error::UnknownDepends(missing.join(", ")));
+    }
+
+    // Cycle detection. Build the dep graph from `existing_tasks` with the
+    // candidate's depends_on substituted in (so we catch cycles introduced
+    // by this change, not just pre-existing ones). DFS from the candidate.
+    let mut graph: HashMap<&str, &[String]> = existing_tasks
+        .iter()
+        .map(|tf| (tf.task.id.as_str(), tf.task.depends_on.as_slice()))
+        .collect();
+    graph.insert(task.id.as_str(), task.depends_on.as_slice());
+
+    if let Some(chain) = find_cycle(&graph, task.id.as_str()) {
+        return Err(shelbi_core::Error::DependencyCycle(chain.join(" → ")));
+    }
+    Ok(())
+}
+
+/// DFS that returns the offending chain (e.g. `["a", "b", "c", "a"]`) if a
+/// cycle is reachable from `start`, otherwise `None`. Iterative to avoid
+/// blowing the stack on pathological graphs.
+fn find_cycle(graph: &HashMap<&str, &[String]>, start: &str) -> Option<Vec<String>> {
+    // Visiting stack with an iteration index so we can backtrack on pop.
+    let mut path: Vec<&str> = vec![start];
+    let mut on_path: HashSet<&str> = [start].into_iter().collect();
+    let mut visited: HashSet<&str> = HashSet::new();
+    let mut iter_stack: Vec<usize> = vec![0];
+
+    while let Some(&node) = path.last() {
+        let i = *iter_stack.last().unwrap();
+        let deps = graph.get(node).copied().unwrap_or(&[]);
+        if i < deps.len() {
+            let next = deps[i].as_str();
+            *iter_stack.last_mut().unwrap() += 1;
+            if on_path.contains(next) {
+                // Found a cycle. Build the offending chain starting from
+                // the first occurrence of `next` in the path.
+                let pos = path.iter().position(|p| *p == next).unwrap();
+                let mut chain: Vec<String> = path[pos..].iter().map(|s| s.to_string()).collect();
+                chain.push(next.to_string());
+                return Some(chain);
+            }
+            if visited.contains(next) {
+                continue;
+            }
+            // Resolve to a stable key in the graph (so &str borrows survive).
+            let key = graph
+                .get_key_value(next)
+                .map(|(k, _)| *k)
+                .unwrap_or(next);
+            path.push(key);
+            on_path.insert(key);
+            iter_stack.push(0);
+        } else {
+            on_path.remove(node);
+            visited.insert(node);
+            path.pop();
+            iter_stack.pop();
+        }
+    }
+    None
+}
+
 /// Move `id` to `new_column`. The task lands at the bottom (priority = N)
 /// and the old column gets renumbered contiguous from 0. No-op if the
 /// column is unchanged.
@@ -570,6 +690,7 @@ mod tests {
             priority,
             assigned_to: None,
             branch: None,
+            depends_on: Vec::new(),
             created_at: now,
             updated_at: now,
         }
@@ -626,6 +747,108 @@ mod tests {
         let col = list_column("p", Column::Backlog).unwrap();
         let ids: Vec<_> = col.iter().map(|tf| tf.task.id.as_str()).collect();
         assert_eq!(ids, vec!["a", "d", "b", "c"]);
+        std::env::remove_var("SHELBI_HOME");
+    }
+
+    fn make_task_with_deps(
+        id: &str,
+        column: Column,
+        priority: u32,
+        deps: &[&str],
+    ) -> shelbi_core::Task {
+        let mut t = make_task(id, column, priority);
+        t.depends_on = deps.iter().map(|s| s.to_string()).collect();
+        t
+    }
+
+    #[test]
+    fn validate_depends_on_rejects_missing_id() {
+        let _g = TEST_LOCK.lock().unwrap();
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+        save_task("p", &make_task("a", Column::Todo, 0), "").unwrap();
+        let existing = list_tasks("p").unwrap();
+        let candidate = make_task_with_deps("b", Column::Todo, 1, &["a", "ghost"]);
+        let err = validate_depends_on(&candidate, &existing).unwrap_err();
+        assert!(matches!(err, shelbi_core::Error::UnknownDepends(_)));
+        assert!(err.to_string().contains("ghost"));
+        std::env::remove_var("SHELBI_HOME");
+    }
+
+    #[test]
+    fn validate_depends_on_accepts_valid_chain() {
+        let _g = TEST_LOCK.lock().unwrap();
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+        save_task("p", &make_task("a", Column::Done, 0), "").unwrap();
+        save_task("p", &make_task_with_deps("b", Column::Todo, 0, &["a"]), "").unwrap();
+        let existing = list_tasks("p").unwrap();
+        let candidate = make_task_with_deps("c", Column::Todo, 1, &["b"]);
+        validate_depends_on(&candidate, &existing).unwrap();
+        std::env::remove_var("SHELBI_HOME");
+    }
+
+    #[test]
+    fn validate_depends_on_rejects_self_reference() {
+        let _g = TEST_LOCK.lock().unwrap();
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+        save_task("p", &make_task("a", Column::Todo, 0), "").unwrap();
+        let existing = list_tasks("p").unwrap();
+        let candidate = make_task_with_deps("a", Column::Todo, 0, &["a"]);
+        let err = validate_depends_on(&candidate, &existing).unwrap_err();
+        assert!(matches!(err, shelbi_core::Error::DependencyCycle(_)));
+        std::env::remove_var("SHELBI_HOME");
+    }
+
+    #[test]
+    fn validate_depends_on_detects_cycle() {
+        let _g = TEST_LOCK.lock().unwrap();
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+        // Existing chain: c → b → a (c depends on b, b depends on a).
+        // Closing the loop with a → c should be rejected.
+        save_task("p", &make_task("a", Column::Todo, 0), "").unwrap();
+        save_task("p", &make_task_with_deps("b", Column::Todo, 1, &["a"]), "").unwrap();
+        save_task("p", &make_task_with_deps("c", Column::Todo, 2, &["b"]), "").unwrap();
+        let existing = list_tasks("p").unwrap();
+        let candidate = make_task_with_deps("a", Column::Todo, 0, &["c"]);
+        let err = validate_depends_on(&candidate, &existing).unwrap_err();
+        match err {
+            shelbi_core::Error::DependencyCycle(chain) => {
+                // Chain should mention a, b, c.
+                for id in ["a", "b", "c"] {
+                    assert!(chain.contains(id), "chain={chain} missing {id}");
+                }
+            }
+            other => panic!("expected cycle, got {other:?}"),
+        }
+        std::env::remove_var("SHELBI_HOME");
+    }
+
+    #[test]
+    fn list_ready_filters_blocked_todos() {
+        let _g = TEST_LOCK.lock().unwrap();
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+        save_task("p", &make_task("done-a", Column::Done, 0), "").unwrap();
+        save_task("p", &make_task("inprog-b", Column::InProgress, 0), "").unwrap();
+        save_task(
+            "p",
+            &make_task_with_deps("free", Column::Todo, 0, &["done-a"]),
+            "",
+        )
+        .unwrap();
+        save_task(
+            "p",
+            &make_task_with_deps("blocked", Column::Todo, 1, &["inprog-b"]),
+            "",
+        )
+        .unwrap();
+        save_task("p", &make_task("no-deps", Column::Todo, 2), "").unwrap();
+        let ready = list_ready("p").unwrap();
+        let ids: Vec<_> = ready.iter().map(|tf| tf.task.id.as_str()).collect();
+        assert_eq!(ids, vec!["free", "no-deps"]);
         std::env::remove_var("SHELBI_HOME");
     }
 

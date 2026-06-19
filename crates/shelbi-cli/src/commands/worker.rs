@@ -165,6 +165,7 @@ mod tests {
             priority,
             assigned_to: assigned_to.map(str::to_string),
             branch: None,
+            depends_on: Vec::new(),
             created_at: now,
             updated_at: now,
         }

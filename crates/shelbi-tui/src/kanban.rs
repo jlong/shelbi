@@ -7,6 +7,7 @@
 //! it in a `while true` loop) — so we deliberately don't bind a quit key.
 //! Switching away is the palette's job.
 
+use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
 use ratatui::{
@@ -120,6 +121,16 @@ impl KanbanApp {
     pub fn column_tasks(&self, col_idx: usize) -> Vec<&TaskFile> {
         let col = self.column(col_idx);
         self.tasks.iter().filter(|tf| tf.task.column == col).collect()
+    }
+
+    /// Snapshot of every task's column, for the blocked derivation. Built
+    /// each render call from the in-memory tasks slice — cheap and avoids
+    /// a stale cache.
+    fn task_columns(&self) -> HashMap<String, Column> {
+        self.tasks
+            .iter()
+            .map(|tf| (tf.task.id.clone(), tf.task.column))
+            .collect()
     }
 
     pub fn selected_task(&self) -> Option<&TaskFile> {
@@ -312,12 +323,19 @@ fn render_columns(f: &mut Frame, app: &KanbanApp, area: Rect) {
         .constraints(vec![Constraint::Ratio(1, 5); 5])
         .split(area);
 
+    let columns = app.task_columns();
     for (i, slot) in slots.iter().enumerate() {
-        render_column(f, app, i, *slot);
+        render_column(f, app, i, *slot, &columns);
     }
 }
 
-fn render_column(f: &mut Frame, app: &KanbanApp, col_idx: usize, area: Rect) {
+fn render_column(
+    f: &mut Frame,
+    app: &KanbanApp,
+    col_idx: usize,
+    area: Rect,
+    columns: &HashMap<String, Column>,
+) {
     let column = app.column(col_idx);
     let tasks = app.column_tasks(col_idx);
     let focused = col_idx == app.selected_column;
@@ -342,11 +360,20 @@ fn render_column(f: &mut Frame, app: &KanbanApp, col_idx: usize, area: Rect) {
     let max_text = area.width.saturating_sub(2) as usize;
     let mut items: Vec<ListItem> = Vec::with_capacity(tasks.len());
     for (row, tf) in tasks.iter().enumerate() {
-        let title = truncate(&tf.task.title, max_text);
-        let mut lines = vec![Line::from(Span::styled(
-            title,
-            Style::default().add_modifier(Modifier::BOLD),
-        ))];
+        let blocked = tf.task.is_blocked(columns);
+        // 2-char prefix when blocked so the badge can't visually melt into
+        // the title text on narrow columns. Lock glyph stays in the same
+        // slot whether or not other rows show one.
+        let badge_prefix = if blocked { "🔒 " } else { "" };
+        let title_text = truncate(&format!("{badge_prefix}{}", tf.task.title), max_text);
+        let title_style = if blocked {
+            Style::default()
+                .fg(Color::DarkGray)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().add_modifier(Modifier::BOLD)
+        };
+        let mut lines = vec![Line::from(Span::styled(title_text, title_style))];
         let id_w = tf.task.id.chars().count();
         let worker_w = tf
             .task
@@ -457,8 +484,13 @@ fn render_popover(f: &mut Frame, app: &KanbanApp, area: Rect) {
     // Clear underneath so the kanban columns don't bleed through.
     f.render_widget(Clear, popover_area);
 
+    let columns = app.task_columns();
     let (header_lines, body_text, title) = match app.popover_task() {
-        Some(tf) => (popover_header(tf), tf.body.clone(), tf.task.title.clone()),
+        Some(tf) => (
+            popover_header(tf, &columns),
+            tf.body.clone(),
+            tf.task.title.clone(),
+        ),
         None => (
             Vec::new(),
             "(task no longer exists — press esc to close)".to_string(),
@@ -518,7 +550,7 @@ fn render_popover(f: &mut Frame, app: &KanbanApp, area: Rect) {
     f.render_widget(Paragraph::new(hint), chunks[3]);
 }
 
-fn popover_header(tf: &TaskFile) -> Vec<Line<'static>> {
+fn popover_header(tf: &TaskFile, columns: &HashMap<String, Column>) -> Vec<Line<'static>> {
     let task = &tf.task;
     let mut lines: Vec<Line<'static>> = Vec::new();
 
@@ -541,6 +573,31 @@ fn popover_header(tf: &TaskFile) -> Vec<Line<'static>> {
 
     if let Some(branch) = &task.branch {
         lines.push(meta_row("branch", branch));
+    }
+
+    if !task.depends_on.is_empty() {
+        let blocked = task.is_blocked(columns);
+        let label = if blocked { "blocked by" } else { "depends on" };
+        let mut spans: Vec<Span<'static>> = vec![meta_label(label)];
+        for (i, dep) in task.depends_on.iter().enumerate() {
+            if i > 0 {
+                spans.push(Span::raw(", "));
+            }
+            let dep_col = columns.get(dep).copied();
+            let label_text = match dep_col {
+                Some(c) => format!("{dep} [{}]", c.as_str()),
+                None => format!("{dep} [missing]"),
+            };
+            let color = match dep_col {
+                Some(c) => column_color(c),
+                None => Color::Red,
+            };
+            spans.push(Span::styled(label_text, Style::default().fg(color)));
+        }
+        lines.push(Line::from(spans));
+    } else {
+        // Only mention readiness when a user might wonder — i.e. never for
+        // tasks with no deps. Skipping this keeps the header compact.
     }
 
     let created = task.created_at.format("%Y-%m-%d %H:%M UTC").to_string();

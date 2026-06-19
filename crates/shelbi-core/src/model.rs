@@ -306,8 +306,26 @@ pub struct Task {
     pub assigned_to: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub branch: Option<String>,
+    /// Other task ids this task depends on. A task is **blocked** (see
+    /// [`Task::is_blocked`]) when any of these are not yet in
+    /// [`Column::Done`]. Stored as a list rather than a reverse `blocks`
+    /// field so cycle detection and dep editing only touch one file.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub depends_on: Vec<String>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+}
+
+impl Task {
+    /// True iff any id in `depends_on` is not yet `Done` in `columns`.
+    /// IDs missing from `columns` are treated as not-done (which matches
+    /// the project-wide validation that rejects unknown ids at save time
+    /// — if a dep id is unknown here, the safer answer is still blocked).
+    pub fn is_blocked(&self, columns: &std::collections::HashMap<String, Column>) -> bool {
+        self.depends_on
+            .iter()
+            .any(|id| columns.get(id).copied() != Some(Column::Done))
+    }
 }
 
 /// Same character set as agent ids (kebab/snake alphanumeric). Aliased so
@@ -397,6 +415,49 @@ mod tests {
         assert_eq!(Column::from_str("ready-for-review").unwrap(), Column::Review);
         assert_eq!(Column::from_str("complete").unwrap(), Column::Done);
         assert!(Column::from_str("garbage").is_err());
+    }
+
+    #[test]
+    fn task_depends_on_defaults_to_empty_and_omits_in_serialization() {
+        let yaml = r#"
+id: a
+title: A
+column: todo
+priority: 0
+created_at: 2026-06-19T00:00:00Z
+updated_at: 2026-06-19T00:00:00Z
+"#;
+        let t: Task = serde_yaml::from_str(yaml).unwrap();
+        assert!(t.depends_on.is_empty());
+        let back = serde_yaml::to_string(&t).unwrap();
+        assert!(!back.contains("depends_on"));
+    }
+
+    #[test]
+    fn task_is_blocked_when_any_dep_not_done() {
+        let now = chrono::Utc::now();
+        let task = Task {
+            id: "a".into(),
+            title: "A".into(),
+            column: Column::Todo,
+            priority: 0,
+            assigned_to: None,
+            branch: None,
+            depends_on: vec!["b".into(), "c".into()],
+            created_at: now,
+            updated_at: now,
+        };
+        let mut cols = std::collections::HashMap::new();
+        cols.insert("b".to_string(), Column::Done);
+        cols.insert("c".to_string(), Column::InProgress);
+        assert!(task.is_blocked(&cols));
+
+        cols.insert("c".to_string(), Column::Done);
+        assert!(!task.is_blocked(&cols));
+
+        // Unknown dep id is treated as not-done.
+        cols.remove("c");
+        assert!(task.is_blocked(&cols));
     }
 
     #[test]
