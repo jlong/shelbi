@@ -59,6 +59,11 @@ enum Cmd {
     },
     /// Archive a worker (keep the log, drop the worktree).
     Archive { id: String },
+    /// Manage the project's Kanban task board.
+    Task {
+        #[command(subcommand)]
+        cmd: commands::task::TaskCmd,
+    },
     /// Attach the terminal to a worker's tmux pane.
     Attach { id: String },
     /// Scaffold ~/.shelbi/ and (optionally) a starter project YAML.
@@ -98,6 +103,7 @@ fn main() -> Result<()> {
         Some(Cmd::Diff { id }) => commands::diff::run(cli.project, id),
         Some(Cmd::Merge { id, pr }) => commands::merge::run(cli.project, id, pr),
         Some(Cmd::Archive { id }) => commands::archive::run(cli.project, id),
+        Some(Cmd::Task { cmd }) => commands::task::run(cli.project, cmd),
         Some(Cmd::Attach { id }) => commands::attach::run(cli.project, id),
         Some(Cmd::Init(args)) => commands::init::run(args),
         Some(Cmd::Orchestrate(args)) => commands::orchestrate::run(cli.project, args),

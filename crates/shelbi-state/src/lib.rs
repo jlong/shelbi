@@ -8,10 +8,16 @@ use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
-use shelbi_core::{Agent, Project, Result, Session};
+use shelbi_core::{Agent, Column, Project, Result, Session, Task};
 
-/// Default shelbi home directory: `~/.shelbi`.
+/// Default shelbi home directory: `~/.shelbi`, overridable via
+/// `$SHELBI_HOME` (useful for tests and sandboxed CI).
 pub fn shelbi_home() -> Result<PathBuf> {
+    if let Ok(p) = std::env::var("SHELBI_HOME") {
+        if !p.is_empty() {
+            return Ok(PathBuf::from(p));
+        }
+    }
     dirs::home_dir()
         .map(|h| h.join(".shelbi"))
         .ok_or_else(|| shelbi_core::Error::Other("no home directory".into()))
@@ -33,6 +39,10 @@ pub fn agents_dir(project: &str) -> Result<PathBuf> {
     Ok(project_dir(project)?.join("agents"))
 }
 
+pub fn tasks_dir(project: &str) -> Result<PathBuf> {
+    Ok(project_dir(project)?.join("tasks"))
+}
+
 /// Ensure a directory exists.
 pub fn ensure_dir(p: &Path) -> Result<()> {
     fs::create_dir_all(p)?;
@@ -45,7 +55,9 @@ pub fn ensure_dir(p: &Path) -> Result<()> {
 pub fn load_project(project: &str) -> Result<Project> {
     let p = projects_dir()?.join(format!("{project}.yaml"));
     let text = fs::read_to_string(&p)?;
-    Ok(serde_yaml::from_str(&text)?)
+    let p: Project = serde_yaml::from_str(&text)?;
+    p.validate_workers()?;
+    Ok(p)
 }
 
 pub fn save_project(p: &Project) -> Result<()> {
@@ -81,19 +93,24 @@ pub fn agent_log_path(project: &str, id: &str) -> Result<PathBuf> {
 pub fn save_agent(project: &str, agent: &Agent, body_md: &str) -> Result<()> {
     ensure_dir(&agents_dir(project)?)?;
     let path = agent_path(project, &agent.id)?;
-    let yaml = serde_yaml::to_string(agent)?;
-    let mut buf = String::with_capacity(yaml.len() + body_md.len() + 32);
+    write_frontmatter_file(&path, agent, body_md)
+}
+
+/// Render a `---\n<yaml>\n---\n<body>` file. Caller owns the path/dir.
+fn write_frontmatter_file<T: serde::Serialize>(path: &Path, front: &T, body: &str) -> Result<()> {
+    let yaml = serde_yaml::to_string(front)?;
+    let mut buf = String::with_capacity(yaml.len() + body.len() + 32);
     buf.push_str("---\n");
     buf.push_str(&yaml);
     if !yaml.ends_with('\n') {
         buf.push('\n');
     }
     buf.push_str("---\n");
-    buf.push_str(body_md);
-    if !body_md.ends_with('\n') {
+    buf.push_str(body);
+    if !body.ends_with('\n') {
         buf.push('\n');
     }
-    atomic_write(&path, buf.as_bytes())
+    atomic_write(path, buf.as_bytes())
 }
 
 /// Parsed result of an agent file.
@@ -128,6 +145,152 @@ pub fn append_log(project: &str, id: &str, line: &str) -> Result<()> {
     let ts = chrono::Utc::now().to_rfc3339();
     writeln!(f, "[{ts}] {line}")?;
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Task markdown files
+
+pub fn task_path(project: &str, id: &str) -> Result<PathBuf> {
+    Ok(tasks_dir(project)?.join(format!("{id}.md")))
+}
+
+pub struct TaskFile {
+    pub task: Task,
+    pub body: String,
+}
+
+pub fn save_task(project: &str, task: &Task, body_md: &str) -> Result<()> {
+    ensure_dir(&tasks_dir(project)?)?;
+    let path = task_path(project, &task.id)?;
+    write_frontmatter_file(&path, task, body_md)
+}
+
+pub fn load_task(project: &str, id: &str) -> Result<TaskFile> {
+    let path = task_path(project, id)?;
+    let text = fs::read_to_string(&path)?;
+    parse_task_file(&text)
+}
+
+pub fn parse_task_file(text: &str) -> Result<TaskFile> {
+    let (front, body) = split_frontmatter(text)
+        .ok_or_else(|| shelbi_core::Error::Other("missing frontmatter".into()))?;
+    let task: Task = serde_yaml::from_str(front)?;
+    Ok(TaskFile {
+        task,
+        body: body.to_string(),
+    })
+}
+
+pub fn delete_task(project: &str, id: &str) -> Result<()> {
+    let path = task_path(project, id)?;
+    if path.exists() {
+        fs::remove_file(&path)?;
+    }
+    Ok(())
+}
+
+/// Every task in the project. Order: column (in [`Column::ALL`] order) then
+/// priority ASC. Files that fail to parse are skipped (and logged).
+pub fn list_tasks(project: &str) -> Result<Vec<TaskFile>> {
+    let dir = tasks_dir(project)?;
+    if !dir.exists() {
+        return Ok(Vec::new());
+    }
+    let mut out = Vec::new();
+    for entry in fs::read_dir(&dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("md") {
+            continue;
+        }
+        let text = match fs::read_to_string(&path) {
+            Ok(t) => t,
+            Err(e) => {
+                eprintln!("shelbi: skipping unreadable task file {}: {e}", path.display());
+                continue;
+            }
+        };
+        match parse_task_file(&text) {
+            Ok(tf) => out.push(tf),
+            Err(e) => eprintln!(
+                "shelbi: skipping malformed task file {}: {e}",
+                path.display()
+            ),
+        }
+    }
+    out.sort_by_key(|tf| {
+        let col_idx = Column::ALL.iter().position(|c| *c == tf.task.column).unwrap_or(0);
+        (col_idx, tf.task.priority)
+    });
+    Ok(out)
+}
+
+/// Tasks in one column, sorted by priority.
+pub fn list_column(project: &str, column: Column) -> Result<Vec<TaskFile>> {
+    Ok(list_tasks(project)?
+        .into_iter()
+        .filter(|tf| tf.task.column == column)
+        .collect())
+}
+
+/// Move `id` to `new_column`. The task lands at the bottom (priority = N)
+/// and the old column gets renumbered contiguous from 0. No-op if the
+/// column is unchanged.
+pub fn move_task(project: &str, id: &str, new_column: Column) -> Result<()> {
+    let TaskFile { mut task, body } = load_task(project, id)?;
+    if task.column == new_column {
+        return Ok(());
+    }
+    let old_column = task.column;
+    let new_priority = list_column(project, new_column)?.len() as u32;
+    task.column = new_column;
+    task.priority = new_priority;
+    task.updated_at = chrono::Utc::now();
+    save_task(project, &task, &body)?;
+    renumber_column(project, old_column)?;
+    Ok(())
+}
+
+/// Re-position `id` to slot `new_priority` within its current column. Other
+/// tasks shift to keep the column contiguous from 0.
+pub fn set_task_priority(project: &str, id: &str, new_priority: u32) -> Result<()> {
+    let target = load_task(project, id)?;
+    let column = target.task.column;
+    let mut col = list_column(project, column)?;
+    let from = col
+        .iter()
+        .position(|tf| tf.task.id == id)
+        .ok_or_else(|| shelbi_core::Error::Other(format!("task `{id}` not in its own column?")))?;
+    let to = (new_priority as usize).min(col.len().saturating_sub(1));
+    if from == to {
+        return Ok(());
+    }
+    let item = col.remove(from);
+    col.insert(to, item);
+    write_column_order(project, &col)
+}
+
+/// Stamp 0..N priorities onto the ordered slice and persist only the
+/// tasks whose priority actually changed.
+fn write_column_order(project: &str, ordered: &[TaskFile]) -> Result<()> {
+    let now = chrono::Utc::now();
+    for (i, tf) in ordered.iter().enumerate() {
+        let want = i as u32;
+        if tf.task.priority == want {
+            continue;
+        }
+        let mut task = tf.task.clone();
+        task.priority = want;
+        task.updated_at = now;
+        save_task(project, &task, &tf.body)?;
+    }
+    Ok(())
+}
+
+/// Reload `column`'s tasks, sort by current priority, and renumber 0..N.
+pub fn renumber_column(project: &str, column: Column) -> Result<()> {
+    let col = list_column(project, column)?;
+    write_column_order(project, &col)
 }
 
 // ---------------------------------------------------------------------------
@@ -196,4 +359,108 @@ mod tests {
         assert!(split_frontmatter(s).is_none());
     }
 
+    // ---- Storage tests ------------------------------------------------
+    //
+    // These exercise the on-disk task layout via $SHELBI_HOME. The env var
+    // is process-wide so tests must serialize on it.
+
+    use std::sync::Mutex;
+    static TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    fn fresh_home() -> PathBuf {
+        let p = std::env::temp_dir().join(format!(
+            "shelbi-state-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&p).unwrap();
+        p
+    }
+
+    fn make_task(id: &str, column: Column, priority: u32) -> shelbi_core::Task {
+        let now = chrono::Utc::now();
+        shelbi_core::Task {
+            id: id.to_string(),
+            title: id.replace('-', " "),
+            column,
+            priority,
+            assigned_to: None,
+            branch: None,
+            created_at: now,
+            updated_at: now,
+        }
+    }
+
+    #[test]
+    fn task_save_load_roundtrip() {
+        let _g = TEST_LOCK.lock().unwrap();
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+        let task = make_task("fix-login", Column::Todo, 3);
+        save_task("proj", &task, "# Description\n").unwrap();
+        let back = load_task("proj", "fix-login").unwrap();
+        assert_eq!(back.task.id, "fix-login");
+        assert_eq!(back.task.column, Column::Todo);
+        assert_eq!(back.task.priority, 3);
+        assert!(back.body.contains("Description"));
+        std::env::remove_var("SHELBI_HOME");
+    }
+
+    #[test]
+    fn move_task_renumbers_old_column() {
+        let _g = TEST_LOCK.lock().unwrap();
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+        for (i, id) in ["a", "b", "c"].iter().enumerate() {
+            save_task("p", &make_task(id, Column::Todo, i as u32), "").unwrap();
+        }
+        move_task("p", "b", Column::InProgress).unwrap();
+
+        let todo = list_column("p", Column::Todo).unwrap();
+        let ids: Vec<_> = todo.iter().map(|tf| tf.task.id.as_str()).collect();
+        let prios: Vec<_> = todo.iter().map(|tf| tf.task.priority).collect();
+        assert_eq!(ids, vec!["a", "c"]);
+        assert_eq!(prios, vec![0, 1]); // renumbered
+
+        let wip = list_column("p", Column::InProgress).unwrap();
+        assert_eq!(wip.len(), 1);
+        assert_eq!(wip[0].task.id, "b");
+        assert_eq!(wip[0].task.priority, 0);
+        std::env::remove_var("SHELBI_HOME");
+    }
+
+    #[test]
+    fn set_priority_reorders_within_column() {
+        let _g = TEST_LOCK.lock().unwrap();
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+        for (i, id) in ["a", "b", "c", "d"].iter().enumerate() {
+            save_task("p", &make_task(id, Column::Backlog, i as u32), "").unwrap();
+        }
+        // Move 'd' to slot 1 → expected order: a, d, b, c
+        set_task_priority("p", "d", 1).unwrap();
+        let col = list_column("p", Column::Backlog).unwrap();
+        let ids: Vec<_> = col.iter().map(|tf| tf.task.id.as_str()).collect();
+        assert_eq!(ids, vec!["a", "d", "b", "c"]);
+        std::env::remove_var("SHELBI_HOME");
+    }
+
+    #[test]
+    fn list_tasks_sorts_by_column_then_priority() {
+        let _g = TEST_LOCK.lock().unwrap();
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+        save_task("p", &make_task("z", Column::Done, 0), "").unwrap();
+        save_task("p", &make_task("a", Column::Backlog, 1), "").unwrap();
+        save_task("p", &make_task("b", Column::Backlog, 0), "").unwrap();
+        save_task("p", &make_task("c", Column::InProgress, 0), "").unwrap();
+        let all = list_tasks("p").unwrap();
+        let ids: Vec<_> = all.iter().map(|tf| tf.task.id.as_str()).collect();
+        // Column::ALL ordering: backlog, todo, in_progress, review, done
+        assert_eq!(ids, vec!["b", "a", "c", "z"]);
+        std::env::remove_var("SHELBI_HOME");
+    }
 }

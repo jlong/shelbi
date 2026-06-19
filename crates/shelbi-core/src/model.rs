@@ -36,6 +36,11 @@ pub struct Project {
     pub agent_runners: std::collections::BTreeMap<String, AgentRunnerSpec>,
     #[serde(default)]
     pub editor: Option<String>,
+    /// Fixed pool of worker agents available to this project. Each owns a
+    /// stable worktree on its machine; the orchestrator routes tasks to
+    /// workers by name. See [`WorkerSpec`].
+    #[serde(default)]
+    pub workers: Vec<WorkerSpec>,
 }
 
 fn default_branch() -> String {
@@ -50,6 +55,37 @@ impl Project {
     pub fn runner(&self, name: &str) -> Option<&AgentRunnerSpec> {
         self.agent_runners.get(name)
     }
+
+    pub fn worker(&self, name: &str) -> Option<&WorkerSpec> {
+        self.workers.iter().find(|w| w.name == name)
+    }
+
+    /// Cross-check workers reference declared machines and runners.
+    pub fn validate_workers(&self) -> crate::Result<()> {
+        for w in &self.workers {
+            if self.machine(&w.machine).is_none() {
+                return Err(crate::Error::UnknownMachine(w.machine.clone()));
+            }
+            if self.runner(&w.runner).is_none() {
+                return Err(crate::Error::UnknownRunner(w.runner.clone()));
+            }
+        }
+        Ok(())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Worker (declared agent in project YAML)
+
+/// A worker is a long-lived slot on a machine: one stable worktree, one
+/// runner. Workers pick up tasks from the board and switch branches between
+/// assignments (with cleared context). The worktree path is derived as
+/// `<machine.work_dir>/.shelbi/wt/<worker-name>` — not configurable yet.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkerSpec {
+    pub name: String,
+    pub machine: String,
+    pub runner: String,
 }
 
 // ---------------------------------------------------------------------------
@@ -174,6 +210,92 @@ impl TmuxAddr {
 }
 
 // ---------------------------------------------------------------------------
+// Tasks (Kanban board)
+
+/// Where on the board a task lives.
+///
+/// Lifecycle:
+///
+/// - `Backlog`: orchestrator-created, awaiting user triage.
+/// - `Todo`: user-curated, ready for a worker to pick up.
+/// - `InProgress`: assigned and active on a worker.
+/// - `Review`: worker reports done; user inspects via the review dir.
+/// - `Done`: accepted by user.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Column {
+    Backlog,
+    Todo,
+    InProgress,
+    Review,
+    Done,
+}
+
+impl Column {
+    pub const ALL: [Column; 5] = [
+        Column::Backlog,
+        Column::Todo,
+        Column::InProgress,
+        Column::Review,
+        Column::Done,
+    ];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Column::Backlog => "backlog",
+            Column::Todo => "todo",
+            Column::InProgress => "in_progress",
+            Column::Review => "review",
+            Column::Done => "done",
+        }
+    }
+}
+
+impl std::fmt::Display for Column {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl std::str::FromStr for Column {
+    type Err = crate::Error;
+    fn from_str(s: &str) -> crate::Result<Self> {
+        // Accept both the canonical form and a few friendly aliases users
+        // are likely to type at the CLI ("in-progress", "wip", "todo").
+        match s.trim().to_ascii_lowercase().as_str() {
+            "backlog" => Ok(Column::Backlog),
+            "todo" | "to_do" | "to-do" => Ok(Column::Todo),
+            "in_progress" | "in-progress" | "wip" => Ok(Column::InProgress),
+            "review" | "ready_for_review" | "ready-for-review" => Ok(Column::Review),
+            "done" | "complete" | "completed" => Ok(Column::Done),
+            other => Err(crate::Error::Other(format!("unknown column: {other}"))),
+        }
+    }
+}
+
+/// One Kanban card. Position within a column is given by `priority`
+/// (0 = top); the storage layer keeps these contiguous within each column.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Task {
+    pub id: String,
+    pub title: String,
+    pub column: Column,
+    pub priority: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub assigned_to: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub branch: Option<String>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+/// Same character set as agent ids (kebab/snake alphanumeric). Aliased so
+/// call sites read clearly at the task layer.
+pub fn validate_task_id(s: &str) -> crate::Result<()> {
+    validate_agent_id(s)
+}
+
+// ---------------------------------------------------------------------------
 // Agent id validation
 
 /// Validate an agent id: kebab-case alphanumerics, hyphen-separated.
@@ -231,5 +353,66 @@ mod tests {
             window: "w-fix-login".to_string(),
         };
         assert_eq!(addr.target(), "shelbi-daily:w-fix-login");
+    }
+
+    #[test]
+    fn column_serde_roundtrip() {
+        for c in Column::ALL {
+            let y = serde_yaml::to_string(&c).unwrap();
+            let back: Column = serde_yaml::from_str(&y).unwrap();
+            assert_eq!(c, back);
+        }
+        // Wire format is the snake_case form.
+        assert_eq!(serde_yaml::to_string(&Column::InProgress).unwrap().trim(), "in_progress");
+    }
+
+    #[test]
+    fn column_from_str_friendly_aliases() {
+        use std::str::FromStr;
+        assert_eq!(Column::from_str("backlog").unwrap(), Column::Backlog);
+        assert_eq!(Column::from_str("to-do").unwrap(), Column::Todo);
+        assert_eq!(Column::from_str("WIP").unwrap(), Column::InProgress);
+        assert_eq!(Column::from_str("in-progress").unwrap(), Column::InProgress);
+        assert_eq!(Column::from_str("ready-for-review").unwrap(), Column::Review);
+        assert_eq!(Column::from_str("complete").unwrap(), Column::Done);
+        assert!(Column::from_str("garbage").is_err());
+    }
+
+    #[test]
+    fn task_id_uses_same_rules_as_agent_id() {
+        assert!(validate_task_id("fix-login").is_ok());
+        assert!(validate_task_id("with spaces").is_err());
+    }
+
+    #[test]
+    fn workers_validate_against_machines_and_runners() {
+        let mut runners = std::collections::BTreeMap::new();
+        runners.insert("claude".to_string(), AgentRunnerSpec { command: "claude".into(), flags: vec![] });
+        let project = Project {
+            name: "p".into(),
+            repo: "r".into(),
+            default_branch: "main".into(),
+            machines: vec![Machine {
+                name: "hub".into(),
+                kind: MachineKind::Local,
+                work_dir: "/tmp".into(),
+                host: None,
+            }],
+            orchestrator: OrchestratorSpec { runner: "claude".into() },
+            agent_runners: runners,
+            editor: None,
+            workers: vec![
+                WorkerSpec { name: "alice".into(), machine: "hub".into(), runner: "claude".into() },
+            ],
+        };
+        assert!(project.validate_workers().is_ok());
+
+        let mut bad = project.clone();
+        bad.workers.push(WorkerSpec { name: "bob".into(), machine: "ghost".into(), runner: "claude".into() });
+        assert!(matches!(bad.validate_workers(), Err(crate::Error::UnknownMachine(_))));
+
+        let mut bad2 = project.clone();
+        bad2.workers.push(WorkerSpec { name: "bob".into(), machine: "hub".into(), runner: "ghost".into() });
+        assert!(matches!(bad2.validate_workers(), Err(crate::Error::UnknownRunner(_))));
     }
 }

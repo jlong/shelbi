@@ -18,3 +18,11 @@ agent_runners:
   codex:
     command: codex
     flags: []
+# Fixed pool of worker agents. Each owns a stable worktree on its machine:
+# `<machine.work_dir>/.shelbi/wt/<worker-name>`. The orchestrator assigns
+# Kanban tasks to workers by name; workers switch branches between tasks
+# with a fresh context each time.
+workers:
+  - { name: alice, machine: hub, runner: claude }
+  - { name: bob,   machine: m2,  runner: claude }
+  - { name: carol, machine: m2,  runner: claude }

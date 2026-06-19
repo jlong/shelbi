@@ -11,6 +11,7 @@ pub mod send;
 pub mod spawn;
 pub mod status;
 pub mod tail;
+pub mod task;
 
 use anyhow::{anyhow, Result};
 use std::path::Path;
