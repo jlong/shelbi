@@ -34,3 +34,4 @@ serde = { workspace = true }
 serde_yaml = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
+inquire = { workspace = true }

@@ -15,6 +15,7 @@ pub mod spawn;
 pub mod status;
 pub mod tail;
 pub mod task;
+pub mod wizard;
 pub mod worker;
 
 use anyhow::{anyhow, Result};

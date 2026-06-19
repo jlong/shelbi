@@ -41,6 +41,7 @@ similar = { version = "2", features = ["text"] }
 ratatui = "0.28"
 crossterm = "0.28"
 nucleo-matcher = "0.3"
+inquire = "0.7"
 
 # internal crates
 shelbi-core = { path = "crates/shelbi-core" }

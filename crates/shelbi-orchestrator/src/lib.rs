@@ -65,13 +65,18 @@ pub enum PaneReloadStatus {
 
 /// Resolve the active orchestrator system prompt for a project: per-project
 /// override (`ORCHESTRATOR.md`) if present, else the bundled default.
+/// The string `{{assistant_name}}` is substituted with the user's chosen
+/// assistant name from `~/.shelbi/shelbi.yaml` (falling back to the
+/// default `Orchestrator` when the wizard hasn't run yet).
 pub fn system_prompt(project: &str) -> Result<String> {
     let path = shelbi_state::project_dir(project)?.join("ORCHESTRATOR.md");
-    if path.exists() {
-        Ok(std::fs::read_to_string(&path).map_err(Error::Io)?)
+    let raw = if path.exists() {
+        std::fs::read_to_string(&path).map_err(Error::Io)?
     } else {
-        Ok(DEFAULT_SYSTEM_PROMPT.to_string())
-    }
+        DEFAULT_SYSTEM_PROMPT.to_string()
+    };
+    let cfg = shelbi_state::load_shelbi_config()?;
+    Ok(raw.replace("{{assistant_name}}", cfg.assistant_name()))
 }
 
 /// The dashboard window's tmux address (orchestrator's session).

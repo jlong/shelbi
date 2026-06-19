@@ -10,6 +10,7 @@ use std::path::{Path, PathBuf};
 
 use std::collections::{HashMap, HashSet};
 
+use serde::{Deserialize, Serialize};
 use shelbi_core::{Agent, Column, Project, Result, Session, Task};
 
 mod worker_status;
@@ -18,6 +19,57 @@ pub use worker_status::{
     append_worker_event, events_log_path, load_worker_status, parse_pane_title_state,
     save_worker_status, worker_status_path, workers_dir, WorkerState, WorkerStatus,
 };
+
+/// Default assistant name surfaced in the sidebar header and the
+/// orchestrator system prompt when the user hasn't picked one yet.
+pub const DEFAULT_ASSISTANT_NAME: &str = "Orchestrator";
+
+/// Global shelbi config, persisted at `~/.shelbi/shelbi.yaml`. Created and
+/// populated by the onboarding wizard; everything is `Option` so that
+/// loading an older or partial file still succeeds.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ShelbiConfig {
+    /// What the user wants to call their assistant — shown above the
+    /// orchestrator pane and substituted into the orchestrator system
+    /// prompt. `None` means the user hasn't been through Phase 1 of the
+    /// wizard yet; callers should fall back to [`DEFAULT_ASSISTANT_NAME`]
+    /// via [`ShelbiConfig::assistant_name`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub assistant_name: Option<String>,
+}
+
+impl ShelbiConfig {
+    /// The configured assistant name, or [`DEFAULT_ASSISTANT_NAME`] if
+    /// the wizard hasn't set one yet.
+    pub fn assistant_name(&self) -> &str {
+        self.assistant_name
+            .as_deref()
+            .unwrap_or(DEFAULT_ASSISTANT_NAME)
+    }
+}
+
+/// Path to the global config file: `$SHELBI_HOME/shelbi.yaml`.
+pub fn shelbi_config_path() -> Result<PathBuf> {
+    Ok(shelbi_home()?.join("shelbi.yaml"))
+}
+
+/// Load the global config. Missing file → default (empty) config; that's
+/// not an error because every consumer has a sensible fallback.
+pub fn load_shelbi_config() -> Result<ShelbiConfig> {
+    let path = shelbi_config_path()?;
+    if !path.exists() {
+        return Ok(ShelbiConfig::default());
+    }
+    let text = fs::read_to_string(&path)?;
+    Ok(serde_yaml::from_str(&text)?)
+}
+
+/// Atomically write the global config.
+pub fn save_shelbi_config(cfg: &ShelbiConfig) -> Result<()> {
+    ensure_dir(&shelbi_home()?)?;
+    let path = shelbi_config_path()?;
+    atomic_write(&path, serde_yaml::to_string(cfg)?.as_bytes())
+}
 
 #[cfg(test)]
 pub(crate) mod test_lock {

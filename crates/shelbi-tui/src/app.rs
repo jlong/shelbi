@@ -76,6 +76,11 @@ impl WorkerBadge {
 
 pub struct App {
     pub project_name: String,
+    /// User-chosen name for the assistant (from `~/.shelbi/shelbi.yaml`).
+    /// Surfaces in the sidebar as the label on the orchestrator row;
+    /// falls back to [`shelbi_state::DEFAULT_ASSISTANT_NAME`] when the
+    /// onboarding wizard hasn't run yet.
+    pub assistant_name: String,
     pub agents: Vec<Agent>,
     pub workers: Vec<WorkerOverview>,
     pub review_queue: Vec<TaskFile>,
@@ -91,8 +96,12 @@ pub struct App {
 
 impl App {
     pub fn new_sidebar(project_name: impl Into<String>) -> Self {
+        let assistant_name = shelbi_state::load_shelbi_config()
+            .map(|c| c.assistant_name().to_string())
+            .unwrap_or_else(|_| shelbi_state::DEFAULT_ASSISTANT_NAME.to_string());
         Self {
             project_name: project_name.into(),
+            assistant_name,
             agents: Vec::new(),
             workers: Vec::new(),
             review_queue: Vec::new(),
@@ -131,7 +140,7 @@ impl App {
     pub fn rows(&self) -> Vec<Row> {
         let mut rows = vec![
             Row {
-                label: "orchestrator".into(),
+                label: self.assistant_name.clone(),
                 view: View::Builtin("orch"),
                 badge: None,
                 status: None,
@@ -670,6 +679,7 @@ mod tests {
                     priority: 0,
                     assigned_to: Some(worker.into()),
                     branch: None,
+                    depends_on: Vec::new(),
                     created_at: now,
                     updated_at: now,
                 },
@@ -718,6 +728,7 @@ mod tests {
                 priority: 0,
                 assigned_to: Some("alpha".into()),
                 branch: None,
+                depends_on: Vec::new(),
                 created_at: now,
                 updated_at: now,
             },
@@ -764,6 +775,7 @@ mod tests {
                 priority: 0,
                 assigned_to: Some("alpha".into()),
                 branch: None,
+                depends_on: Vec::new(),
                 created_at: now,
                 updated_at: now,
             },

@@ -2,6 +2,7 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 
 mod commands;
+mod wizard;
 
 #[derive(Debug, Parser)]
 #[command(
@@ -81,6 +82,10 @@ enum Cmd {
     Attach { id: String },
     /// Scaffold ~/.shelbi/ and (optionally) a starter project YAML.
     Init(commands::init::Args),
+    /// Run the onboarding wizard. Phase 1 prompts for the assistant name
+    /// and writes it to ~/.shelbi/shelbi.yaml. Idempotent — phases whose
+    /// answer is already on disk are skipped.
+    Wizard,
     /// Start the orchestrator agent in the project's tmux session window 1.
     Orchestrate(commands::orchestrate::Args),
     /// Respawn the shelbi-owned panes (sidebar + tasks/review/machines) in
@@ -137,6 +142,7 @@ fn main() -> Result<()> {
         Some(Cmd::Review(args)) => commands::review::run(cli.project, args),
         Some(Cmd::Attach { id }) => commands::attach::run(cli.project, id),
         Some(Cmd::Init(args)) => commands::init::run(args),
+        Some(Cmd::Wizard) => commands::wizard::run(),
         Some(Cmd::Orchestrate(args)) => commands::orchestrate::run(cli.project, args),
         Some(Cmd::Reload) => commands::reload::run(cli.project),
         Some(Cmd::Sidebar { project }) => shelbi_tui::run_sidebar(&project).context("sidebar"),
