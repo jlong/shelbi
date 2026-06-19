@@ -62,6 +62,16 @@ Run any command with `--help` for full flags.
   drives the review from the sidebar.
 - "How's X going?" → `shelbi task show <id>`. If it's in progress, point
   the user at the worker's pane.
+- "Mark review done, merge, and push" → for each task in `review`:
+  squash-merge its branch into `main` with the worker's commit message,
+  resolve any conflicts inline (prefer keeping HEAD when one side is
+  clearly wrong), then `git push origin main` and move each task to
+  `done`. **Then clean up the merged branches**:
+  `git push origin --delete <branch>` and `git branch -D <branch>` for
+  each. Skip any branch currently checked out in a worker's worktree
+  (`git worktree list` to identify) — those will be replaced naturally
+  the next time that worker dispatches. If a branch's content somehow
+  isn't in `main`, stop and report rather than deleting.
 
 ## What you don't do
 
