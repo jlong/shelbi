@@ -10,7 +10,7 @@ use ratatui::{
     Frame,
 };
 
-use crate::app::{App, WorkerBadge};
+use crate::app::{App, Row, WorkerBadge};
 
 pub fn render_full(f: &mut Frame, app: &mut App, area: Rect) {
     let outer = Layout::default()
@@ -23,6 +23,9 @@ pub fn render_full(f: &mut Frame, app: &mut App, area: Rect) {
 }
 
 fn render_list(f: &mut Frame, app: &mut App, area: Rect) {
+    // Project-name header — strong color, blank line below for breathing
+    // room. The wireframe is the spec: the project is the context, so no
+    // 'shelbi' brand chrome.
     let layout = Layout::default()
         .direction(Direction::Vertical)
         .constraints([Constraint::Length(2), Constraint::Min(1)])
@@ -39,47 +42,142 @@ fn render_list(f: &mut Frame, app: &mut App, area: Rect) {
 
     let inner = layout[1];
     app.list_area = inner;
+    let width = inner.width as usize;
     let rows = app.rows();
-    let mut items: Vec<ListItem> = Vec::new();
+    let mut items: Vec<ListItem> = Vec::with_capacity(rows.len());
     for (i, row) in rows.iter().enumerate() {
-        let mut spans: Vec<Span> = Vec::new();
-        if let Some(badge) = row.worker_badge {
-            spans.push(Span::styled(
-                format!("{} ", badge.glyph()),
-                Style::default().fg(worker_badge_color(badge)),
-            ));
-        } else if let Some(status) = row.status {
-            spans.push(Span::styled(
-                format!("{} ", status.glyph()),
-                Style::default().fg(status_color(status)),
-            ));
-        } else {
-            spans.push(Span::styled("▶ ", Style::default().fg(Color::Cyan)));
-        }
-        spans.push(Span::raw(row.label.clone()));
-        if let Some(b) = &row.badge {
-            spans.push(Span::styled(
-                format!("  {b}"),
-                Style::default().fg(Color::DarkGray),
-            ));
-        }
-        let mut style = Style::default();
-        if i == app.sidebar_index {
-            style = style.bg(Color::Blue).fg(Color::White).add_modifier(Modifier::BOLD);
-        }
-        items.push(ListItem::new(Line::from(spans)).style(style));
-    }
-    if rows.len() <= 1 {
-        items.push(ListItem::new(Span::styled(
-            "(no agents yet — ask the orchestrator →)",
-            Style::default().fg(Color::DarkGray),
-        )));
+        let selected = i == app.sidebar_index && row.is_selectable();
+        items.push(render_row(row, selected, width));
     }
 
     let mut state = ListState::default();
     state.select(Some(app.sidebar_index));
     let list = List::new(items);
     f.render_stateful_widget(list, inner, &mut state);
+}
+
+fn render_row(row: &Row, selected: bool, width: usize) -> ListItem<'static> {
+    match row {
+        Row::Nav { icon, label, .. } => {
+            let style = if selected {
+                Style::default()
+                    .fg(Color::White)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(Color::Gray)
+            };
+            ListItem::new(Line::from(vec![Span::styled(
+                format!("{icon} {label}"),
+                style,
+            )]))
+        }
+        Row::Section { label } => {
+            let style = Style::default().fg(Color::DarkGray);
+            ListItem::new(Line::from(vec![Span::styled(
+                format!("— {label} —"),
+                style,
+            )]))
+        }
+        Row::Worker { name, badge, .. } => {
+            let mut spans = vec![
+                Span::styled(
+                    format!("{} ", badge.glyph()),
+                    Style::default().fg(worker_badge_color(*badge)),
+                ),
+                Span::styled(name.clone(), name_style(selected)),
+            ];
+            // No machine badge here — the agents list reflects the worker
+            // pool, not per-row metadata. Machine assignment surfaces on
+            // the Machines view.
+            if selected {
+                spans = bold(spans);
+            }
+            ListItem::new(Line::from(spans))
+        }
+        Row::Review { title, worker, .. } => {
+            // Cyan ✓: the task is review-ready, awaiting human action.
+            // Mirrors the WorkerBadge::ReviewReady glyph so the worker
+            // and its review row share a vocabulary.
+            let badge = Span::styled(
+                "✓ ".to_string(),
+                Style::default().fg(Color::Cyan),
+            );
+            let title_span = Span::styled(title.clone(), name_style(selected));
+            let worker_label = worker.clone().unwrap_or_default();
+            let line = right_align(
+                vec![badge, title_span],
+                worker_label,
+                Style::default().fg(Color::DarkGray),
+                width,
+            );
+            ListItem::new(if selected { Line::from(bold(line)) } else { Line::from(line) })
+        }
+        Row::LegacyAgent {
+            id,
+            machine,
+            status,
+            ..
+        } => {
+            let badge = Span::styled(
+                format!("{} ", status.glyph()),
+                Style::default().fg(status_color(*status)),
+            );
+            let id_span = Span::styled(id.clone(), name_style(selected));
+            let line = right_align(
+                vec![badge, id_span],
+                machine.clone(),
+                Style::default().fg(Color::DarkGray),
+                width,
+            );
+            ListItem::new(if selected { Line::from(bold(line)) } else { Line::from(line) })
+        }
+    }
+}
+
+fn name_style(selected: bool) -> Style {
+    if selected {
+        Style::default()
+            .fg(Color::White)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(Color::Gray)
+    }
+}
+
+fn bold(mut spans: Vec<Span<'static>>) -> Vec<Span<'static>> {
+    for s in &mut spans {
+        s.style = s.style.add_modifier(Modifier::BOLD);
+    }
+    spans
+}
+
+/// Pad `left` so a right-aligned `right` ends at `width`. Right column
+/// dims to DarkGray. If there isn't room for both, the right column is
+/// dropped rather than pushing the title off-screen.
+fn right_align(
+    left: Vec<Span<'static>>,
+    right: String,
+    right_style: Style,
+    width: usize,
+) -> Vec<Span<'static>> {
+    let left_w: usize = left.iter().map(|s| display_width(&s.content)).sum();
+    let right_w = display_width(&right);
+    // Need at least one space between the two columns.
+    if right.is_empty() || left_w + right_w + 1 > width {
+        return left;
+    }
+    let pad = width.saturating_sub(left_w + right_w);
+    let mut out = left;
+    out.push(Span::raw(" ".repeat(pad)));
+    out.push(Span::styled(right, right_style));
+    out
+}
+
+/// Cheap display-width estimate — counts chars rather than full Unicode
+/// width. Enough for the labels we use; multi-cell emojis are rare in
+/// these strings.
+fn display_width(s: &str) -> usize {
+    s.chars().count()
 }
 
 fn render_footer(f: &mut Frame, app: &App, area: Rect) {

@@ -76,11 +76,6 @@ impl WorkerBadge {
 
 pub struct App {
     pub project_name: String,
-    /// User-chosen name for the assistant (from `~/.shelbi/shelbi.yaml`).
-    /// Surfaces in the sidebar as the label on the orchestrator row;
-    /// falls back to [`shelbi_state::DEFAULT_ASSISTANT_NAME`] when the
-    /// onboarding wizard hasn't run yet.
-    pub assistant_name: String,
     pub agents: Vec<Agent>,
     pub workers: Vec<WorkerOverview>,
     pub review_queue: Vec<TaskFile>,
@@ -96,12 +91,8 @@ pub struct App {
 
 impl App {
     pub fn new_sidebar(project_name: impl Into<String>) -> Self {
-        let assistant_name = shelbi_state::load_shelbi_config()
-            .map(|c| c.assistant_name().to_string())
-            .unwrap_or_else(|_| shelbi_state::DEFAULT_ASSISTANT_NAME.to_string());
         Self {
             project_name: project_name.into(),
-            assistant_name,
             agents: Vec::new(),
             workers: Vec::new(),
             review_queue: Vec::new(),
@@ -127,77 +118,70 @@ impl App {
             return None;
         }
         let idx = (row - area.y) as usize;
-        if idx < self.rows().len() {
-            Some(idx)
-        } else {
-            None
-        }
+        let rows = self.rows();
+        rows.get(idx).filter(|r| r.is_selectable()).map(|_| idx)
     }
 
-    /// Sidebar rows: built-in views, declared workers (with machine badge),
-    /// review queue (one per task awaiting review), then any legacy
-    /// `shelbi spawn` agents.
+    /// Sidebar rows: a fixed 3-item nav (Chat / Tasks / Machines), then
+    /// declared workers under an `— agents —` separator, then the review
+    /// queue under `— Ready for Review —`, then any legacy `shelbi spawn`
+    /// agents under `— spawned —`. Each section header and its rows are
+    /// dropped together when that group is empty — Review is intentionally
+    /// not a destination view, only an inline live list.
     pub fn rows(&self) -> Vec<Row> {
         let mut rows = vec![
-            Row {
-                label: self.assistant_name.clone(),
+            Row::Nav {
+                icon: "💬",
+                label: "Chat",
                 view: View::Builtin("orch"),
-                badge: None,
-                status: None,
-                worker_badge: None,
             },
-            Row {
-                label: "tasks".into(),
+            Row::Nav {
+                icon: "📋",
+                label: "Tasks",
                 view: View::Builtin("tasks"),
-                badge: None,
-                status: None,
-                worker_badge: None,
             },
-            Row {
-                label: "review".into(),
-                view: View::Builtin("review"),
-                badge: if self.review_queue.is_empty() {
-                    None
-                } else {
-                    Some(format!("{}", self.review_queue.len()))
-                },
-                status: None,
-                worker_badge: None,
-            },
-            Row {
-                label: "machines".into(),
+            Row::Nav {
+                icon: "🖥",
+                label: "Machines",
                 view: View::Builtin("machines"),
-                badge: None,
-                status: None,
-                worker_badge: None,
             },
         ];
-        for w in &self.workers {
-            rows.push(Row {
-                label: w.name.clone(),
-                view: View::Worker(w.name.clone()),
-                badge: Some(w.machine.clone()),
-                status: None,
-                worker_badge: Some(w.badge),
+        if !self.workers.is_empty() {
+            rows.push(Row::Section {
+                label: "agents".into(),
             });
+            for w in &self.workers {
+                rows.push(Row::Worker {
+                    name: w.name.clone(),
+                    badge: w.badge,
+                    view: View::Worker(w.name.clone()),
+                });
+            }
         }
-        for tf in &self.review_queue {
-            rows.push(Row {
-                label: tf.task.title.clone(),
-                view: View::ReviewTask(tf.task.id.clone()),
-                badge: tf.task.assigned_to.clone(),
-                status: None,
-                worker_badge: None,
+        if !self.review_queue.is_empty() {
+            rows.push(Row::Section {
+                label: "Ready for Review".into(),
             });
+            for tf in &self.review_queue {
+                rows.push(Row::Review {
+                    title: tf.task.title.clone(),
+                    worker: tf.task.assigned_to.clone(),
+                    view: View::ReviewTask(tf.task.id.clone()),
+                });
+            }
         }
-        for a in &self.agents {
-            rows.push(Row {
-                label: a.id.clone(),
-                view: View::Agent(a.id.clone()),
-                badge: Some(a.machine.clone()),
-                status: Some(a.status),
-                worker_badge: None,
+        if !self.agents.is_empty() {
+            rows.push(Row::Section {
+                label: "spawned".into(),
             });
+            for a in &self.agents {
+                rows.push(Row::LegacyAgent {
+                    id: a.id.clone(),
+                    machine: a.machine.clone(),
+                    status: a.status,
+                    view: View::Agent(a.id.clone()),
+                });
+            }
         }
         rows
     }
@@ -220,30 +204,47 @@ impl App {
     }
 
     pub fn nav_up(&mut self) {
-        let n = self.rows().len();
-        if n == 0 {
-            return;
-        }
-        self.sidebar_index = if self.sidebar_index == 0 {
-            n - 1
-        } else {
-            self.sidebar_index - 1
-        };
+        self.step_selection(-1);
     }
 
     pub fn nav_down(&mut self) {
-        let n = self.rows().len();
+        self.step_selection(1);
+    }
+
+    /// Walk the selection by `delta` (±1), skipping non-selectable rows
+    /// (section headers) and wrapping at either end. Caps at one full
+    /// cycle if no selectable row exists.
+    fn step_selection(&mut self, delta: i32) {
+        let rows = self.rows();
+        let n = rows.len();
         if n == 0 {
             return;
         }
-        self.sidebar_index = (self.sidebar_index + 1) % n;
+        let mut idx = self.sidebar_index.min(n - 1);
+        for _ in 0..n {
+            idx = if delta < 0 {
+                if idx == 0 {
+                    n - 1
+                } else {
+                    idx - 1
+                }
+            } else {
+                (idx + 1) % n
+            };
+            if rows[idx].is_selectable() {
+                self.sidebar_index = idx;
+                return;
+            }
+        }
     }
 
     /// Act on the currently highlighted row: tmux-select the matching
     /// window (orchestrator → dashboard's right pane; agent → its window).
     pub fn activate_selection(&mut self) {
         if let Some(row) = self.rows().get(self.sidebar_index).cloned() {
-            self.activate_view(&row.view);
+            if let Some(view) = row.view().cloned() {
+                self.activate_view(&view);
+            }
         }
     }
 
@@ -358,18 +359,56 @@ impl App {
     }
 }
 
+/// One rendered line in the sidebar. Section headers are inert dividers;
+/// everything else activates a view on Enter / click. Kept as an enum so
+/// the renderer pattern-matches the row kind without an `Option<View>`
+/// dance and tests can target one shape unambiguously.
 #[derive(Clone)]
-pub struct Row {
-    pub label: String,
-    pub view: View,
-    pub badge: Option<String>,
-    /// Glyph for legacy `shelbi spawn` agent rows. Workers use
-    /// [`Self::worker_badge`] instead.
-    pub status: Option<Status>,
-    /// Glyph for declared-worker rows — derived from the worker's
-    /// `status.yaml` plus the task board. `None` on built-ins, review
-    /// tasks, and legacy agents.
-    pub worker_badge: Option<WorkerBadge>,
+pub enum Row {
+    /// Top-level destination (Chat / Tasks / Machines).
+    Nav {
+        icon: &'static str,
+        label: &'static str,
+        view: View,
+    },
+    /// `— label —` separator. Not selectable.
+    Section { label: String },
+    /// A declared worker, with its current state badge.
+    Worker {
+        name: String,
+        badge: WorkerBadge,
+        view: View,
+    },
+    /// A task sitting in the review column — title + the worker who
+    /// finished it.
+    Review {
+        title: String,
+        worker: Option<String>,
+        view: View,
+    },
+    /// Legacy `shelbi spawn` agent row — pre-task-board flow.
+    LegacyAgent {
+        id: String,
+        machine: String,
+        status: Status,
+        view: View,
+    },
+}
+
+impl Row {
+    pub fn is_selectable(&self) -> bool {
+        !matches!(self, Row::Section { .. })
+    }
+
+    pub fn view(&self) -> Option<&View> {
+        match self {
+            Row::Nav { view, .. }
+            | Row::Worker { view, .. }
+            | Row::Review { view, .. }
+            | Row::LegacyAgent { view, .. } => Some(view),
+            Row::Section { .. } => None,
+        }
+    }
 }
 
 /// Build the sidebar's view of declared workers from the project YAML, the
@@ -639,22 +678,24 @@ mod tests {
         let mut app = App::new_sidebar("demo");
         app.refresh().unwrap();
 
-        // 4 built-ins + 2 workers + 0 review + 0 legacy agents.
+        // 3 nav + 1 `agents` section header + 2 workers = 6 rows.
         let rows = app.rows();
         assert_eq!(rows.len(), 6);
+        assert!(matches!(&rows[3], Row::Section { label } if label == "agents"));
 
         // alpha (busy, no status file yet) — default to Working.
-        let alpha = rows.iter().find(|r| matches!(&r.view, View::Worker(n) if n == "alpha")).unwrap();
-        assert_eq!(alpha.badge.as_deref(), Some("hub"));
-        assert_eq!(alpha.worker_badge, Some(WorkerBadge::Working));
-        assert!(alpha.status.is_none());
-
+        assert_eq!(find_worker_badge(&rows, "alpha").unwrap(), WorkerBadge::Working);
         // delta (idle remote) — Idle.
-        let delta = rows.iter().find(|r| matches!(&r.view, View::Worker(n) if n == "delta")).unwrap();
-        assert_eq!(delta.badge.as_deref(), Some("devbox"));
-        assert_eq!(delta.worker_badge, Some(WorkerBadge::Idle));
+        assert_eq!(find_worker_badge(&rows, "delta").unwrap(), WorkerBadge::Idle);
 
         std::env::remove_var("SHELBI_HOME");
+    }
+
+    fn find_worker_badge(rows: &[Row], name: &str) -> Option<WorkerBadge> {
+        rows.iter().find_map(|r| match r {
+            Row::Worker { name: n, badge, .. } if n == name => Some(*badge),
+            _ => None,
+        })
     }
 
     #[test]
@@ -701,11 +742,11 @@ mod tests {
         app.refresh().unwrap();
         let rows = app.rows();
 
-        let alpha = rows.iter().find(|r| matches!(&r.view, View::Worker(n) if n == "alpha")).unwrap();
-        assert_eq!(alpha.worker_badge, Some(WorkerBadge::Working));
-
-        let delta = rows.iter().find(|r| matches!(&r.view, View::Worker(n) if n == "delta")).unwrap();
-        assert_eq!(delta.worker_badge, Some(WorkerBadge::AwaitingInput));
+        assert_eq!(find_worker_badge(&rows, "alpha").unwrap(), WorkerBadge::Working);
+        assert_eq!(
+            find_worker_badge(&rows, "delta").unwrap(),
+            WorkerBadge::AwaitingInput
+        );
 
         std::env::remove_var("SHELBI_HOME");
     }
@@ -747,12 +788,11 @@ mod tests {
 
         let mut app = App::new_sidebar("demo");
         app.refresh().unwrap();
-        let alpha = app
-            .rows()
-            .into_iter()
-            .find(|r| matches!(&r.view, View::Worker(n) if n == "alpha"))
-            .unwrap();
-        assert_eq!(alpha.worker_badge, Some(WorkerBadge::AwaitingPermission));
+        let rows = app.rows();
+        assert_eq!(
+            find_worker_badge(&rows, "alpha").unwrap(),
+            WorkerBadge::AwaitingPermission
+        );
 
         std::env::remove_var("SHELBI_HOME");
     }
@@ -796,12 +836,11 @@ mod tests {
 
         let mut app = App::new_sidebar("demo");
         app.refresh().unwrap();
-        let alpha = app
-            .rows()
-            .into_iter()
-            .find(|r| matches!(&r.view, View::Worker(n) if n == "alpha"))
-            .unwrap();
-        assert_eq!(alpha.worker_badge, Some(WorkerBadge::ReviewReady));
+        let rows = app.rows();
+        assert_eq!(
+            find_worker_badge(&rows, "alpha").unwrap(),
+            WorkerBadge::ReviewReady
+        );
 
         std::env::remove_var("SHELBI_HOME");
     }
@@ -830,12 +869,111 @@ mod tests {
 
         let mut app = App::new_sidebar("demo");
         app.refresh().unwrap();
-        let alpha = app
+        let rows = app.rows();
+        assert_eq!(find_worker_badge(&rows, "alpha").unwrap(), WorkerBadge::Idle);
+
+        std::env::remove_var("SHELBI_HOME");
+    }
+
+    #[test]
+    fn nav_is_chat_tasks_machines_only_no_review_destination() {
+        // The sidebar nav must stay at three items — Review is surfaced
+        // inline as a live list below, never as a destination.
+        let _g = TEST_LOCK.lock().unwrap();
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+
+        let project = fixture_project();
+        shelbi_state::save_project(&project).unwrap();
+
+        let mut app = App::new_sidebar("demo");
+        app.refresh().unwrap();
+        let names: Vec<&'static str> = app
             .rows()
             .into_iter()
-            .find(|r| matches!(&r.view, View::Worker(n) if n == "alpha"))
-            .unwrap();
-        assert_eq!(alpha.worker_badge, Some(WorkerBadge::Idle));
+            .filter_map(|r| match r {
+                Row::Nav {
+                    view: View::Builtin(n),
+                    ..
+                } => Some(n),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(names, vec!["orch", "tasks", "machines"]);
+
+        std::env::remove_var("SHELBI_HOME");
+    }
+
+    #[test]
+    fn review_section_hides_when_queue_empty_and_appears_when_populated() {
+        let _g = TEST_LOCK.lock().unwrap();
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+
+        let project = fixture_project();
+        shelbi_state::save_project(&project).unwrap();
+
+        let mut app = App::new_sidebar("demo");
+        app.refresh().unwrap();
+        assert!(
+            !app.rows().iter().any(|r| matches!(r, Row::Section { label } if label == "Ready for Review")),
+            "empty review queue must not render the section header"
+        );
+
+        let now = Utc::now();
+        shelbi_state::save_task(
+            "demo",
+            &Task {
+                id: "ready".into(),
+                title: "Fix login".into(),
+                column: Column::Review,
+                priority: 0,
+                assigned_to: Some("delta".into()),
+                branch: None,
+                depends_on: Vec::new(),
+                created_at: now,
+                updated_at: now,
+            },
+            "",
+        )
+        .unwrap();
+        app.refresh().unwrap();
+        let rows = app.rows();
+        let section_idx = rows
+            .iter()
+            .position(|r| matches!(r, Row::Section { label } if label == "Ready for Review"))
+            .expect("populated review queue must render the section header");
+        assert!(matches!(
+            &rows[section_idx + 1],
+            Row::Review { title, worker, .. } if title == "Fix login" && worker.as_deref() == Some("delta")
+        ));
+
+        std::env::remove_var("SHELBI_HOME");
+    }
+
+    #[test]
+    fn nav_down_skips_section_headers() {
+        let _g = TEST_LOCK.lock().unwrap();
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+
+        let project = fixture_project();
+        shelbi_state::save_project(&project).unwrap();
+
+        let mut app = App::new_sidebar("demo");
+        app.refresh().unwrap();
+        // Start on the last nav item (Machines, idx 2). Next nav_down should
+        // skip the `agents` section header (idx 3) and land on the first
+        // worker row (idx 4).
+        app.sidebar_index = 2;
+        app.nav_down();
+        let rows = app.rows();
+        assert!(rows[app.sidebar_index].is_selectable());
+        assert!(
+            matches!(&rows[app.sidebar_index], Row::Worker { .. }),
+            "nav_down past a section header must land on a worker, got {:?}",
+            app.sidebar_index
+        );
 
         std::env::remove_var("SHELBI_HOME");
     }

@@ -92,27 +92,43 @@ shelbi gives you:
 
 ## TUI
 
-Two-pane layout. Sidebar nav on the left (Chat, Tasks, Review, Machines, plus
-active agents); content view on the right. `Ctrl+P` opens a fuzzy
-command palette for switching views, selecting agents, and triggering
-actions — same convention as VS Code / JetBrains / Telescope.
+Two-pane layout. Borderless sidebar on the left — project name as a
+strong header, a tight 3-item nav (Chat, Tasks, Machines), then live
+inline lists of declared workers (`— agents —`) and tasks waiting on
+you (`— Ready for Review —`). Content view on the right is a real
+tmux pane (orchestrator, worker, or one of the built-in views).
+`Ctrl+P` opens a fuzzy command palette for switching views, selecting
+workers, and triggering actions — same convention as VS Code /
+JetBrains / Telescope.
+
+Review is intentionally *not* in the nav: it surfaces inline below as
+a live list of tasks that need your attention, not a destination to
+jump to.
 
 ```
-┌─ shelbi ───────────┐┌─ Chat — orchestrator ────────────────────────┐
-│ 💬 Chat            ││ you: fix the login bug on safari, send it    │
-│ 📋 Tasks           ││  to m2.                                      │
-│ 🔍 Review (3)      ││                                              │
-│ 🖥  Machines        ││ shelbi: ✓ dispatched to m2.local             │
-│                    ││   agent: fix-login-bug                       │
-│ — agents —         ││   branch: shelbi/fix-login-bug               │
-│ ● fix-login   m2   ││                                              │
-│ ◐ refactor    m2   ││ you: how's it going?                         │
-│ ✓ csv-export  hub  ││                                              │
-│ ○ migrate-db  hub  ││ shelbi: editing tests now — should be done   │
-│                    ││   in a couple minutes. Ctrl+P to jump to it. │
-│ C-␣ to switch      ││ > _                                          │
-└────────────────────┘└──────────────────────────────────────────────┘
+ myapp                  Chat — orchestrator
+                        you: fix the login bug on safari,
+ 💬 Chat                  send it to delta.
+ 📋 Tasks
+ 🖥 Machines            shelbi: ✓ dispatched to devbox.
+                          worker: delta
+ — agents —               branch: shelbi/fix-login-bug
+ ⏵ alpha
+ 💬 bravo               you: how's it going?
+ · charlie
+ ✓ delta                shelbi: editing tests now — should
+                          be done in a couple minutes.
+ — Ready for Review —     Ctrl+P to jump to it.
+ ✓ fix-login     delta
+ ✓ csv-export    charlie  > _
+
+   ^P palette  Enter focus
+   q  quit shelbi
 ```
+
+Worker state badges: `⏵` working · `💬` awaiting input · `⚠`
+awaiting permission · `✓` review-ready · `·` idle. Review rows reuse
+`✓` (cyan) to mean *ready for you*.
 
 Press `e` on any agent or diff hunk to open your `$EDITOR` on the worktree
 (or specific file) — locally or transparently over SSH for remote workers.
