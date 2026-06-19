@@ -60,22 +60,29 @@ pub fn worker_pane_alive(host: &Host, addr: &TmuxAddr) -> Result<bool> {
 
 /// Kill the worker's pane (idempotent — silently OK if already gone).
 pub fn kill_worker_pane(host: &Host, addr: &TmuxAddr) -> Result<()> {
-    // Local: `kill-window -t session:window`. Remote: `kill-session -t
-    // session` (the session IS the worker). Use list to figure out which.
-    if !worker_pane_alive(host, addr)? {
-        return Ok(());
-    }
-    // Count windows in the session — if 1, killing the window would also
-    // kill the session (true for remote workers). Either way, the right
-    // verb on the session itself is fine for remote, and `kill-window`
-    // for a worker window in the multi-window project session is fine for
-    // local. Differentiate by host kind.
+    // Local: `kill-window -t session:window` (the dashboard session
+    // must stay alive). Remote: `kill-session -t session` (the session
+    // IS the worker).
+    //
+    // The liveness check has to differ too. For local we look for the
+    // worker's window inside the shared dashboard session. For remote
+    // we look for the session itself — NOT for a window named `agent`
+    // — because tmux's `automatic-rename` (on by default) renames the
+    // window after whatever command is running (`claude`, `bash`, …),
+    // and a window-name match would miss live sessions and leave them
+    // around to collide with the next `task start`.
     match host {
         Host::Local => {
+            if !worker_pane_alive(host, addr)? {
+                return Ok(());
+            }
             let _ = shelbi_ssh::run(host, ["tmux", "kill-window", "-t", &addr.target()])
                 .map_err(Error::Io)?;
         }
         Host::Ssh { .. } => {
+            if !shelbi_tmux::has_session(host, &addr.session)? {
+                return Ok(());
+            }
             let _ = shelbi_ssh::run(host, ["tmux", "kill-session", "-t", &addr.session])
                 .map_err(Error::Io)?;
         }
