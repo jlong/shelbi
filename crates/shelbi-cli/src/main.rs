@@ -78,6 +78,11 @@ enum Cmd {
     Init(commands::init::Args),
     /// Start the orchestrator agent in the project's tmux session window 1.
     Orchestrate(commands::orchestrate::Args),
+    /// Respawn the shelbi-owned panes (sidebar + tasks/review/machines) in
+    /// place so a freshly installed binary takes effect. Leaves the
+    /// orchestrator pane and worker panes alone — those re-shell into
+    /// shelbi on every call and pick up the new binary automatically.
+    Reload,
     /// (internal) Run the sidebar ratatui process inside the dashboard's
     /// left pane. Not for direct use.
     #[command(hide = true)]
@@ -127,6 +132,7 @@ fn main() -> Result<()> {
         Some(Cmd::Attach { id }) => commands::attach::run(cli.project, id),
         Some(Cmd::Init(args)) => commands::init::run(args),
         Some(Cmd::Orchestrate(args)) => commands::orchestrate::run(cli.project, args),
+        Some(Cmd::Reload) => commands::reload::run(cli.project),
         Some(Cmd::Sidebar { project }) => shelbi_tui::run_sidebar(&project).context("sidebar"),
         Some(Cmd::Tasks { project }) => shelbi_tui::run_tasks(&project).context("tasks"),
         Some(Cmd::ReviewView { project }) => shelbi_tui::run_review(&project).context("review"),

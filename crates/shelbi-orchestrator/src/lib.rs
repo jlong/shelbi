@@ -39,6 +39,30 @@ pub enum BootstrapStatus {
     Started,
 }
 
+/// Per-pane outcome for `reload`. Each pane is independent: the report
+/// records what was found and whether the respawn succeeded.
+#[derive(Debug, Default, Clone)]
+pub struct ReloadReport {
+    pub sidebar: PaneReloadStatus,
+    pub tasks: PaneReloadStatus,
+    pub review: PaneReloadStatus,
+    pub machines: PaneReloadStatus,
+}
+
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub enum PaneReloadStatus {
+    #[default]
+    NotAttempted,
+    Respawned {
+        target: String,
+    },
+    Missing,
+    Failed {
+        target: String,
+        reason: String,
+    },
+}
+
 /// Resolve the active orchestrator system prompt for a project: per-project
 /// override (`ORCHESTRATOR.md`) if present, else the bundled default.
 pub fn system_prompt(project: &str) -> Result<String> {
@@ -151,15 +175,8 @@ pub fn ensure_dashboard(project_name: &str) -> Result<BootstrapStatus> {
     std::fs::write(&clamp_script_path, sidebar_clamp_script(session))
         .map_err(Error::Io)?;
 
-    let shelbi_bin = std::env::current_exe()
-        .map_err(Error::Io)?
-        .to_string_lossy()
-        .into_owned();
-    let sidebar_cmd = format!(
-        "{bin} __sidebar {proj}",
-        bin = shelbi_agent::shell_escape(&shelbi_bin),
-        proj = shelbi_agent::shell_escape(project_name),
-    );
+    let shelbi_bin = current_exe_string()?;
+    let sidebar_cmd_str = sidebar_cmd(&shelbi_bin, project_name);
     let launch = shelbi_agent::launch_command(&runner_spec);
     let orch_cmd = format!(
         "cd {wd} && SHELBI_PROJECT={proj} SHELBI_TMUX_SESSION={sess} exec {launch}",
@@ -183,7 +200,7 @@ pub fn ensure_dashboard(project_name: &str) -> Result<BootstrapStatus> {
                 "dashboard",
                 "sh",
                 "-c",
-                &sidebar_cmd,
+                &sidebar_cmd_str,
             ],
         )?;
     } else {
@@ -204,7 +221,7 @@ pub fn ensure_dashboard(project_name: &str) -> Result<BootstrapStatus> {
                     "dashboard",
                     "sh",
                     "-c",
-                    &sidebar_cmd,
+                    &sidebar_cmd_str,
                 ],
             )?;
         }
@@ -316,33 +333,9 @@ fn create_hidden_views(
         return Ok(());
     }
 
-    let bin = shelbi_agent::shell_escape(shelbi_bin);
-    let proj = shelbi_agent::shell_escape(project_name);
-    // Tasks + review are real ratatui apps (`shelbi __tasks <p>`,
-    // `shelbi __review <p>`). Wrap each in a `while true` loop so an
-    // accidental crash or Ctrl-C respawns the TUI instead of leaving the
-    // stash pane empty — palette swap-pane assumes the pane id stays alive.
-    let tasks_cmd = format!(
-        "while true; do {bin} __tasks {proj}; sleep 1; done",
-        bin = bin,
-        proj = proj,
-    );
-    let review_cmd = format!(
-        "while true; do {bin} __review {proj}; sleep 1; done",
-        bin = bin,
-        proj = proj,
-    );
-    // Live worker/machine table — `shelbi worker list` probes each
-    // worker's tmux pane and prints the assigned task (if any), so remote
-    // workers show up alongside local ones with the same shape. Refresh
-    // every 5s; the SSH probe per remote worker keeps this cheap-but-not-
-    // free, hence the slower cadence than the kanban view.
-    let machines_cmd = format!(
-        "while true; do printf '\\033c'; echo 'workers · {proj_label}'; echo; {bin} --project {proj} worker list 2>&1; sleep 5; done",
-        bin = bin,
-        proj = proj,
-        proj_label = project_name,
-    );
+    let tasks_cmd_str = tasks_cmd(shelbi_bin, project_name);
+    let review_cmd_str = review_cmd(shelbi_bin, project_name);
+    let machines_cmd_str = machines_cmd(shelbi_bin, project_name);
 
     // Create the stash session detached, with tasks pane.
     let tasks_id = shelbi_ssh::run_capture(
@@ -350,7 +343,7 @@ fn create_hidden_views(
         [
             "tmux", "new-session", "-d", "-s", &stash, "-n", "views",
             "-P", "-F", "#{pane_id}",
-            "sh", "-c", &tasks_cmd,
+            "sh", "-c", &tasks_cmd_str,
         ],
     )?;
     let tasks_id = tasks_id.trim().to_string();
@@ -362,7 +355,7 @@ fn create_hidden_views(
         [
             "tmux", "split-window", "-v", "-t", &stash_win,
             "-P", "-F", "#{pane_id}",
-            "sh", "-c", &review_cmd,
+            "sh", "-c", &review_cmd_str,
         ],
     )?;
     let review_id = review_id.trim().to_string();
@@ -372,7 +365,7 @@ fn create_hidden_views(
         [
             "tmux", "split-window", "-v", "-t", &stash_win,
             "-P", "-F", "#{pane_id}",
-            "sh", "-c", &machines_cmd,
+            "sh", "-c", &machines_cmd_str,
         ],
     )?;
     let machines_id = machines_id.trim().to_string();
@@ -459,4 +452,238 @@ fn install_stash_cleanup_hook(host: &shelbi_core::Host) -> Result<()> {
         ["tmux", "set-hook", "-g", "session-closed[42]", hook_cmd],
     );
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Shelbi-owned pane command builders.
+//
+// Single source of truth for what each pane runs. Both `ensure_dashboard`
+// (first-time bootstrap) and `reload` (in-place respawn after a fresh
+// binary install) format their `sh -c` strings through these — otherwise
+// they would drift.
+
+fn current_exe_string() -> Result<String> {
+    Ok(std::env::current_exe()
+        .map_err(Error::Io)?
+        .to_string_lossy()
+        .into_owned())
+}
+
+fn sidebar_cmd(shelbi_bin: &str, project_name: &str) -> String {
+    format!(
+        "{bin} __sidebar {proj}",
+        bin = shelbi_agent::shell_escape(shelbi_bin),
+        proj = shelbi_agent::shell_escape(project_name),
+    )
+}
+
+// Tasks + review are real ratatui apps (`shelbi __tasks <p>`, `shelbi
+// __review <p>`). Wrap each in a `while true` loop so an accidental crash
+// or Ctrl-C respawns the TUI instead of leaving the stash pane empty —
+// palette swap-pane assumes the pane id stays alive.
+fn tasks_cmd(shelbi_bin: &str, project_name: &str) -> String {
+    format!(
+        "while true; do {bin} __tasks {proj}; sleep 1; done",
+        bin = shelbi_agent::shell_escape(shelbi_bin),
+        proj = shelbi_agent::shell_escape(project_name),
+    )
+}
+
+fn review_cmd(shelbi_bin: &str, project_name: &str) -> String {
+    format!(
+        "while true; do {bin} __review {proj}; sleep 1; done",
+        bin = shelbi_agent::shell_escape(shelbi_bin),
+        proj = shelbi_agent::shell_escape(project_name),
+    )
+}
+
+// Live worker/machine table — `shelbi worker list` probes each worker's
+// tmux pane and prints the assigned task (if any), so remote workers
+// show up alongside local ones with the same shape. Refresh every 5s;
+// the SSH probe per remote worker keeps this cheap-but-not-free, hence
+// the slower cadence than the kanban view.
+fn machines_cmd(shelbi_bin: &str, project_name: &str) -> String {
+    format!(
+        "while true; do printf '\\033c'; echo 'workers · {label}'; echo; {bin} --project {proj} worker list 2>&1; sleep 5; done",
+        bin = shelbi_agent::shell_escape(shelbi_bin),
+        proj = shelbi_agent::shell_escape(project_name),
+        label = project_name,
+    )
+}
+
+// ---------------------------------------------------------------------------
+// reload — respawn shelbi-owned panes in-place so a freshly installed
+// binary takes effect without disturbing the orchestrator or workers.
+
+/// Respawn the four long-lived shelbi-owned panes in-place so an updated
+/// `shelbi` binary takes effect. Targets:
+///
+/// - `shelbi-<project>:dashboard.{left}` → `shelbi __sidebar <project>`
+/// - stash `tasks` pane → tasks-view loop
+/// - stash `review` pane → review-view loop
+/// - stash `machines` pane → `shelbi worker list` loop
+///
+/// Out of scope: the orchestrator pane (claude re-shells out on each
+/// CLI call) and worker panes (same). Those pick up the new binary
+/// automatically the next time they invoke `shelbi`.
+///
+/// Idempotent: re-running incurs a visible flicker per pane but no
+/// state loss — the panes' job is to render derived state from disk,
+/// so a fresh process picks up where the old one was.
+pub fn reload(project_name: &str) -> Result<ReloadReport> {
+    let session = format!("shelbi-{project_name}");
+
+    // Session must exist — there's nothing to reload if the user hasn't
+    // booted the dashboard yet.
+    if !local_session_exists(&session)? {
+        return Err(Error::Other(format!(
+            "session `{session}` not running; run `shelbi orchestrate` first"
+        )));
+    }
+
+    let shelbi_bin = current_exe_string()?;
+    let mut report = ReloadReport::default();
+
+    // 1. Sidebar — pane id isn't stored at bootstrap; target positionally.
+    //    `dashboard.{left}` resolves to the leftmost pane in the dashboard
+    //    window, which is always the sidebar (the orchestrator's split
+    //    landed on the right and view-swaps only touch dashboard.{right}).
+    let sidebar_target = format!("{session}:dashboard.{{left}}");
+    report.sidebar = respawn_pane(&sidebar_target, &sidebar_cmd(&shelbi_bin, project_name));
+
+    // 2-4. Stash panes — pane ids are stored in session env at bootstrap.
+    report.tasks = reload_stash_pane(&session, "tasks", &tasks_cmd(&shelbi_bin, project_name));
+    report.review = reload_stash_pane(&session, "review", &review_cmd(&shelbi_bin, project_name));
+    report.machines = reload_stash_pane(
+        &session,
+        "machines",
+        &machines_cmd(&shelbi_bin, project_name),
+    );
+
+    Ok(report)
+}
+
+fn reload_stash_pane(session: &str, view: &str, cmd: &str) -> PaneReloadStatus {
+    match read_pane_id(session, view) {
+        Ok(Some(id)) => respawn_pane(&id, cmd),
+        Ok(None) => PaneReloadStatus::Missing,
+        Err(e) => PaneReloadStatus::Failed {
+            target: format!("(env SHELBI_PANE_{view})"),
+            reason: e.to_string(),
+        },
+    }
+}
+
+/// `tmux has-session -t <name>` — true if the session is alive on the
+/// local tmux server. Reload always runs on the hub (matching the
+/// `show_view` convention), so we don't route through `shelbi-ssh`.
+fn local_session_exists(session: &str) -> Result<bool> {
+    let out = std::process::Command::new("tmux")
+        .args(["has-session", "-t", session])
+        .output()
+        .map_err(Error::Io)?;
+    Ok(out.status.success())
+}
+
+/// Read `SHELBI_PANE_<view>` from the session's tmux environment.
+/// Returns `None` if the variable was never set (older sessions
+/// pre-dating the stash layout, or a partially-bootstrapped session).
+fn read_pane_id(session: &str, view: &str) -> Result<Option<String>> {
+    let key = format!("SHELBI_PANE_{view}");
+    let out = std::process::Command::new("tmux")
+        .args(["show-environment", "-t", session, &key])
+        .output()
+        .map_err(Error::Io)?;
+    if !out.status.success() {
+        return Ok(None);
+    }
+    let line = String::from_utf8_lossy(&out.stdout);
+    let line = line.trim();
+    // `-KEY` form means the variable is explicitly unset on this session.
+    if line.starts_with('-') {
+        return Ok(None);
+    }
+    let Some((_, value)) = line.split_once('=') else {
+        return Ok(None);
+    };
+    if value.is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(value.to_string()))
+    }
+}
+
+/// `tmux respawn-pane -k -t <target> sh -c <cmd>` — kill the running
+/// process in the pane (`-k`) and start a fresh one. The pane's id is
+/// preserved, so any swap-pane references stay valid.
+fn respawn_pane(target: &str, cmd: &str) -> PaneReloadStatus {
+    let out = std::process::Command::new("tmux")
+        .args(["respawn-pane", "-k", "-t", target, "sh", "-c", cmd])
+        .output();
+    match out {
+        Ok(o) if o.status.success() => PaneReloadStatus::Respawned {
+            target: target.to_string(),
+        },
+        Ok(o) => PaneReloadStatus::Failed {
+            target: target.to_string(),
+            reason: String::from_utf8_lossy(&o.stderr).trim().to_string(),
+        },
+        Err(e) => PaneReloadStatus::Failed {
+            target: target.to_string(),
+            reason: e.to_string(),
+        },
+    }
+}
+
+#[cfg(test)]
+mod pane_cmd_tests {
+    use super::*;
+
+    // These tests lock in the exact `sh -c` strings used for each shelbi-
+    // owned pane. Both `ensure_dashboard` and `reload` route through the
+    // same builders, so a regression here means the two paths could
+    // disagree on what the pane runs.
+
+    #[test]
+    fn sidebar_cmd_is_invocation_of_internal_subcommand() {
+        let out = sidebar_cmd("/usr/local/bin/shelbi", "myapp");
+        assert_eq!(out, "/usr/local/bin/shelbi __sidebar myapp");
+    }
+
+    #[test]
+    fn tasks_cmd_wraps_in_respawn_loop() {
+        let out = tasks_cmd("/usr/local/bin/shelbi", "myapp");
+        assert_eq!(
+            out,
+            "while true; do /usr/local/bin/shelbi __tasks myapp; sleep 1; done"
+        );
+    }
+
+    #[test]
+    fn review_cmd_wraps_in_respawn_loop() {
+        let out = review_cmd("/usr/local/bin/shelbi", "myapp");
+        assert_eq!(
+            out,
+            "while true; do /usr/local/bin/shelbi __review myapp; sleep 1; done"
+        );
+    }
+
+    #[test]
+    fn machines_cmd_calls_worker_list_on_a_loop() {
+        let out = machines_cmd("/usr/local/bin/shelbi", "myapp");
+        // sanity check: clears the screen each tick, runs `worker list`,
+        // and threads --project through so the inner subcommand picks the
+        // right project even though it's invoked through `sh -c`.
+        assert!(out.contains("printf '\\033c'"));
+        assert!(out.contains("/usr/local/bin/shelbi --project myapp worker list"));
+        assert!(out.contains("sleep 5"));
+    }
+
+    #[test]
+    fn cmd_builders_shell_escape_paths_with_spaces() {
+        // A binary path with spaces (`/Users/jane doe/.cargo/bin/shelbi`)
+        // would tear apart in `sh -c` without quoting.
+        let out = sidebar_cmd("/Users/jane doe/.cargo/bin/shelbi", "myapp");
+        assert_eq!(out, "'/Users/jane doe/.cargo/bin/shelbi' __sidebar myapp");
+    }
 }

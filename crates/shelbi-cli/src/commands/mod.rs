@@ -7,6 +7,7 @@ pub mod merge;
 pub mod orchestrate;
 pub mod palette;
 pub mod popup;
+pub mod reload;
 pub mod review;
 pub mod send;
 pub mod spawn;
