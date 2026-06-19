@@ -15,6 +15,7 @@ use crate::app::{App, Row, WorkerBadge};
 pub fn render_full(f: &mut Frame, app: &mut App, area: Rect) {
     let outer = Layout::default()
         .direction(Direction::Vertical)
+        .horizontal_margin(1)
         .constraints([Constraint::Min(1), Constraint::Length(2)])
         .split(area);
 
@@ -188,22 +189,22 @@ fn render_footer(f: &mut Frame, app: &App, area: Rect) {
     let lines = if app.status_line.is_empty() {
         vec![
             Line::from(Span::styled(
-                "  ^P palette  Enter focus",
+                "^P palette  Enter focus",
                 Style::default().fg(Color::DarkGray),
             )),
             Line::from(Span::styled(
-                "  q  quit shelbi",
+                "q  quit shelbi",
                 Style::default().fg(Color::DarkGray),
             )),
         ]
     } else {
         vec![
             Line::from(Span::styled(
-                format!("  {}", app.status_line),
+                app.status_line.clone(),
                 Style::default().fg(Color::Yellow),
             )),
             Line::from(Span::styled(
-                "  ^P palette  q quit",
+                "^P palette  q quit",
                 Style::default().fg(Color::DarkGray),
             )),
         ]
