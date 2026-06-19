@@ -191,6 +191,15 @@ pub fn ensure_dashboard(project_name: &str) -> Result<BootstrapStatus> {
         }
     }
 
+    // Enable mouse on the project session so sidebar clicks and scroll
+    // wheel reach the ratatui pane. Scoped to this session — won't disturb
+    // mouse behavior in the user's other tmux sessions. Idempotent; safe
+    // to call every bootstrap.
+    let _ = shelbi_ssh::run_capture(
+        &host,
+        ["tmux", "set-option", "-t", session, "mouse", "on"],
+    );
+
     // 2. If the dashboard already has 2+ panes, layout is set up.
     let panes = shelbi_ssh::run_capture(
         &host,

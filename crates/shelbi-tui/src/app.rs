@@ -1,6 +1,7 @@
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
+use ratatui::layout::Rect;
 use shelbi_core::{Agent, Column, Status};
 use shelbi_state::TaskFile;
 
@@ -27,6 +28,10 @@ pub struct App {
     pub last_refresh: Instant,
     pub status_line: String,
     pub should_quit: bool,
+    /// Screen-space rect occupied by the rendered row list — written each
+    /// frame by the sidebar renderer and read by the mouse-click handler to
+    /// map a click coordinate back to a row index.
+    pub list_area: Rect,
 }
 
 impl App {
@@ -39,6 +44,28 @@ impl App {
             last_refresh: Instant::now() - Duration::from_secs(60),
             status_line: String::new(),
             should_quit: false,
+            list_area: Rect::default(),
+        }
+    }
+
+    /// Translate a click in terminal coordinates into a row index, if the
+    /// point lands inside the rendered list and on a valid row.
+    pub fn row_at(&self, column: u16, row: u16) -> Option<usize> {
+        let area = self.list_area;
+        if area.width == 0 || area.height == 0 {
+            return None;
+        }
+        if column < area.x || column >= area.x.saturating_add(area.width) {
+            return None;
+        }
+        if row < area.y || row >= area.y.saturating_add(area.height) {
+            return None;
+        }
+        let idx = (row - area.y) as usize;
+        if idx < self.rows().len() {
+            Some(idx)
+        } else {
+            None
         }
     }
 

@@ -12,7 +12,7 @@ use ratatui::{
 
 use crate::app::App;
 
-pub fn render_full(f: &mut Frame, app: &App, area: Rect) {
+pub fn render_full(f: &mut Frame, app: &mut App, area: Rect) {
     let outer = Layout::default()
         .direction(Direction::Vertical)
         .constraints([Constraint::Min(1), Constraint::Length(2)])
@@ -22,7 +22,7 @@ pub fn render_full(f: &mut Frame, app: &App, area: Rect) {
     render_footer(f, app, outer[1]);
 }
 
-fn render_list(f: &mut Frame, app: &App, area: Rect) {
+fn render_list(f: &mut Frame, app: &mut App, area: Rect) {
     let layout = Layout::default()
         .direction(Direction::Vertical)
         .constraints([Constraint::Length(2), Constraint::Min(1)])
@@ -38,6 +38,7 @@ fn render_list(f: &mut Frame, app: &App, area: Rect) {
     f.render_widget(title, layout[0]);
 
     let inner = layout[1];
+    app.list_area = inner;
     let rows = app.rows();
     let mut items: Vec<ListItem> = Vec::new();
     for (i, row) in rows.iter().enumerate() {

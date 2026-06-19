@@ -14,7 +14,10 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use crossterm::{
-    event::{self, Event, KeyCode, KeyEventKind, KeyModifiers},
+    event::{
+        self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind, KeyModifiers,
+        MouseButton, MouseEvent, MouseEventKind,
+    },
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
@@ -67,13 +70,13 @@ pub fn run_main(project_name: &str) -> Result<()> {
 
 /// Run the minimal ratatui sidebar in the current pane.
 pub fn run_sidebar(project_name: &str) -> Result<()> {
-    let mut term = setup_terminal().context("setting up terminal")?;
+    let mut term = setup_sidebar_terminal().context("setting up terminal")?;
     let mut app = App::new_sidebar(project_name);
     app.refresh().ok();
 
     let result = sidebar_loop(&mut term, &mut app);
 
-    restore_terminal(&mut term).context("restoring terminal")?;
+    restore_sidebar_terminal(&mut term).context("restoring terminal")?;
     result
 }
 
@@ -108,6 +111,25 @@ fn restore_terminal<B: ratatui::backend::Backend + std::io::Write>(
     Ok(())
 }
 
+/// Same as `setup_terminal` but also enables mouse capture so the sidebar
+/// can react to clicks. Tmux only forwards these to the pane when its
+/// `mouse` option is on — `ensure_dashboard` sets it on shelbi sessions.
+fn setup_sidebar_terminal() -> Result<Terminal<CrosstermBackend<io::Stdout>>> {
+    enable_raw_mode()?;
+    let mut stdout = io::stdout();
+    execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
+    Ok(Terminal::new(CrosstermBackend::new(stdout))?)
+}
+
+fn restore_sidebar_terminal<B: ratatui::backend::Backend + std::io::Write>(
+    term: &mut Terminal<B>,
+) -> Result<()> {
+    disable_raw_mode()?;
+    execute!(term.backend_mut(), DisableMouseCapture, LeaveAlternateScreen)?;
+    term.show_cursor()?;
+    Ok(())
+}
+
 fn sidebar_loop<B: ratatui::backend::Backend>(
     term: &mut Terminal<B>,
     app: &mut App,
@@ -118,11 +140,15 @@ fn sidebar_loop<B: ratatui::backend::Backend>(
         term.draw(|f| sidebar::render_full(f, app, f.area()))?;
 
         if event::poll(Duration::from_millis(200))? {
-            if let Event::Key(k) = event::read()? {
-                if k.kind != KeyEventKind::Press {
-                    continue;
+            match event::read()? {
+                Event::Key(k) => {
+                    if k.kind != KeyEventKind::Press {
+                        continue;
+                    }
+                    handle_key(app, k.code, k.modifiers);
                 }
-                handle_key(app, k.code, k.modifiers);
+                Event::Mouse(m) => handle_mouse(app, m),
+                _ => {}
             }
         }
     }
@@ -197,6 +223,23 @@ fn handle_key(app: &mut App, code: KeyCode, mods: KeyModifiers) {
         KeyCode::Char('r') => {
             app.refresh().ok();
         }
+        _ => {}
+    }
+}
+
+/// Left-click on a sidebar row selects and activates it (same as
+/// nav-then-Enter). Scroll wheel walks the selection up/down without
+/// activating, so a user can preview which row is highlighted.
+fn handle_mouse(app: &mut App, mouse: MouseEvent) {
+    match mouse.kind {
+        MouseEventKind::Down(MouseButton::Left) => {
+            if let Some(idx) = app.row_at(mouse.column, mouse.row) {
+                app.sidebar_index = idx;
+                app.activate_selection();
+            }
+        }
+        MouseEventKind::ScrollDown => app.nav_down(),
+        MouseEventKind::ScrollUp => app.nav_up(),
         _ => {}
     }
 }
