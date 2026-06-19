@@ -141,12 +141,17 @@ impl App {
                 view: View::Builtin("tasks"),
             },
             Row::Nav {
-                icon: "🖥",
+                // U+FE0F variation selector forces emoji-style rendering;
+                // without it the desktop-computer glyph collapses to one cell
+                // in many terminals and the trailing-space gap visually
+                // disappears against 💬 / 📋 above.
+                icon: "🖥\u{fe0f}",
                 label: "Machines",
                 view: View::Builtin("machines"),
             },
         ];
         if !self.workers.is_empty() {
+            rows.push(Row::Blank);
             rows.push(Row::Section {
                 label: "agents".into(),
             });
@@ -159,6 +164,7 @@ impl App {
             }
         }
         if !self.review_queue.is_empty() {
+            rows.push(Row::Blank);
             rows.push(Row::Section {
                 label: "Ready for Review".into(),
             });
@@ -171,6 +177,7 @@ impl App {
             }
         }
         if !self.agents.is_empty() {
+            rows.push(Row::Blank);
             rows.push(Row::Section {
                 label: "spawned".into(),
             });
@@ -373,6 +380,9 @@ pub enum Row {
     },
     /// `— label —` separator. Not selectable.
     Section { label: String },
+    /// Vertical spacing between sections. Renders as an empty line and
+    /// can't be selected — purely for visual rhythm.
+    Blank,
     /// A declared worker, with its current state badge.
     Worker {
         name: String,
@@ -397,7 +407,7 @@ pub enum Row {
 
 impl Row {
     pub fn is_selectable(&self) -> bool {
-        !matches!(self, Row::Section { .. })
+        !matches!(self, Row::Section { .. } | Row::Blank)
     }
 
     pub fn view(&self) -> Option<&View> {
@@ -406,7 +416,7 @@ impl Row {
             | Row::Worker { view, .. }
             | Row::Review { view, .. }
             | Row::LegacyAgent { view, .. } => Some(view),
-            Row::Section { .. } => None,
+            Row::Section { .. } | Row::Blank => None,
         }
     }
 }
@@ -678,10 +688,11 @@ mod tests {
         let mut app = App::new_sidebar("demo");
         app.refresh().unwrap();
 
-        // 3 nav + 1 `agents` section header + 2 workers = 6 rows.
+        // 3 nav + 1 blank spacer + 1 `agents` section header + 2 workers = 7 rows.
         let rows = app.rows();
-        assert_eq!(rows.len(), 6);
-        assert!(matches!(&rows[3], Row::Section { label } if label == "agents"));
+        assert_eq!(rows.len(), 7);
+        assert!(matches!(&rows[3], Row::Blank));
+        assert!(matches!(&rows[4], Row::Section { label } if label == "agents"));
 
         // alpha (busy, no status file yet) — default to Working.
         assert_eq!(find_worker_badge(&rows, "alpha").unwrap(), WorkerBadge::Working);
@@ -963,8 +974,8 @@ mod tests {
         let mut app = App::new_sidebar("demo");
         app.refresh().unwrap();
         // Start on the last nav item (Machines, idx 2). Next nav_down should
-        // skip the `agents` section header (idx 3) and land on the first
-        // worker row (idx 4).
+        // skip the blank spacer (idx 3) and the `agents` section header
+        // (idx 4) and land on the first worker row (idx 5).
         app.sidebar_index = 2;
         app.nav_down();
         let rows = app.rows();

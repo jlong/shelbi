@@ -52,7 +52,10 @@ fn render_list(f: &mut Frame, app: &mut App, area: Rect) {
 
     let mut state = ListState::default();
     state.select(Some(app.sidebar_index));
-    let list = List::new(items);
+    // Full-row dark-gray fill on the selected row. fg/bold for the
+    // selected text is set per-span in render_row so the contrast against
+    // the new bg is explicit.
+    let list = List::new(items).highlight_style(Style::default().bg(Color::DarkGray));
     f.render_stateful_widget(list, inner, &mut state);
 }
 
@@ -78,6 +81,7 @@ fn render_row(row: &Row, selected: bool, width: usize) -> ListItem<'static> {
                 style,
             )]))
         }
+        Row::Blank => ListItem::new(Line::raw("")),
         Row::Worker { name, badge, .. } => {
             let mut spans = vec![
                 Span::styled(
