@@ -7,5 +7,7 @@ pub fn run() -> Result<()> {
     let cfg = shelbi_state::load_shelbi_config()
         .map_err(|e| anyhow::anyhow!(e))?;
     println!("✓ assistant: {}", cfg.assistant_name());
+
+    wizard::phase_2_project_setup()?;
     Ok(())
 }

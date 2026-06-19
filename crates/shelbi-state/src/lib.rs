@@ -608,6 +608,7 @@ mod tests {
             orchestrator: OrchestratorSpec { runner: "claude".into() },
             agent_runners: runners,
             editor: None,
+            github_url: None,
             workers: vec![],
             worker_poll_interval_secs: 5,
             worker_permissions_mode: "auto".into(),

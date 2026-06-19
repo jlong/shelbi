@@ -36,6 +36,11 @@ pub struct Project {
     pub agent_runners: std::collections::BTreeMap<String, AgentRunnerSpec>,
     #[serde(default)]
     pub editor: Option<String>,
+    /// Optional GitHub repo URL (e.g. `git@github.com:owner/repo.git`)
+    /// recorded by the project-setup wizard. Informational for now — the
+    /// merge `--pr` flow still resolves the remote via local git config.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub github_url: Option<String>,
     /// Fixed pool of worker agents available to this project. Each owns a
     /// stable worktree on its machine; the orchestrator routes tasks to
     /// workers by name. See [`WorkerSpec`].
@@ -523,6 +528,7 @@ worker_settings_template: /etc/shelbi/p.json
             orchestrator: OrchestratorSpec { runner: "claude".into() },
             agent_runners: runners,
             editor: None,
+            github_url: None,
             workers: vec![
                 WorkerSpec { name: "alice".into(), machine: "hub".into(), runner: "claude".into() },
             ],

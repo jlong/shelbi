@@ -298,6 +298,7 @@ mod tests {
             orchestrator: OrchestratorSpec { runner: "claude".into() },
             agent_runners: runners,
             editor: None,
+            github_url: None,
             workers: vec![
                 WorkerSpec { name: "alice".into(), machine: "hub".into(), runner: "claude".into() },
                 WorkerSpec { name: "bob".into(), machine: "m2".into(), runner: "claude".into() },

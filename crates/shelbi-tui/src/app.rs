@@ -549,6 +549,7 @@ mod tests {
             },
             agent_runners: runners,
             editor: None,
+            github_url: None,
             workers: vec![
                 WorkerSpec {
                     name: "alpha".into(),

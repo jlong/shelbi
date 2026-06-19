@@ -82,9 +82,10 @@ enum Cmd {
     Attach { id: String },
     /// Scaffold ~/.shelbi/ and (optionally) a starter project YAML.
     Init(commands::init::Args),
-    /// Run the onboarding wizard. Phase 1 prompts for the assistant name
-    /// and writes it to ~/.shelbi/shelbi.yaml. Idempotent — phases whose
-    /// answer is already on disk are skipped.
+    /// Run the onboarding wizard. Phase 1 names the assistant; Phase 2
+    /// walks through project setup (auto-filled from the current git
+    /// checkout when present) and writes ~/.shelbi/projects/<name>.yaml.
+    /// Idempotent — phases whose answer is already on disk are skipped.
     Wizard,
     /// Start the orchestrator agent in the project's tmux session window 1.
     Orchestrate(commands::orchestrate::Args),
