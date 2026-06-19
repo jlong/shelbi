@@ -210,8 +210,13 @@ pub fn ensure_dashboard(project_name: &str) -> Result<BootstrapStatus> {
         return Ok(BootstrapStatus::AlreadyRunning);
     }
 
-    // Install the global Ctrl+P tmux binding so the palette popup works
-    // from any pane. Server-scoped; gone if the tmux server restarts.
+    // Install the Ctrl+P tmux binding for the palette popup. The binding
+    // itself is server-scoped (tmux has no session-local key bindings),
+    // but the action is gated on the session name: outside a `shelbi-*`
+    // session the keystroke is passed straight through with `send-keys`
+    // so the user's other tmux sessions see Ctrl-P with no behavior
+    // change. Gone if the tmux server restarts.
+    let popup_cmd = format!("{} popup", shelbi_agent::shell_escape(&shelbi_bin));
     let _ = shelbi_ssh::run(
         &host,
         [
@@ -219,8 +224,11 @@ pub fn ensure_dashboard(project_name: &str) -> Result<BootstrapStatus> {
             "bind-key",
             "-n",
             "C-p",
-            "run-shell",
-            &format!("{} popup", shelbi_agent::shell_escape(&shelbi_bin)),
+            "if-shell",
+            "-F",
+            "#{m:shelbi-*,#{session_name}}",
+            &format!("run-shell \"{popup_cmd}\""),
+            "send-keys C-p",
         ],
     );
 
