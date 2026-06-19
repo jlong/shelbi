@@ -8,9 +8,9 @@ use shelbi_core::{Agent, Status};
 /// rendered by this process.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum View {
-    /// "Show the orchestrator" — switch tmux focus to the dashboard's
-    /// right pane.
-    Orchestrator,
+    /// One of the built-in views hosted as a hidden tmux pane: swap it
+    /// into the dashboard's right slot.
+    Builtin(&'static str), // "orch" | "tasks" | "review" | "machines"
     /// A specific worker agent — switch tmux to its window.
     Agent(String),
 }
@@ -36,15 +36,35 @@ impl App {
         }
     }
 
-    /// The list of selectable rows in the sidebar: orchestrator first,
-    /// then each active worker.
+    /// Sidebar rows: built-in views first, then a separator, then each
+    /// active worker.
     pub fn rows(&self) -> Vec<Row> {
-        let mut rows = vec![Row {
-            label: "orchestrator".into(),
-            view: View::Orchestrator,
-            badge: None,
-            status: None,
-        }];
+        let mut rows = vec![
+            Row {
+                label: "orchestrator".into(),
+                view: View::Builtin("orch"),
+                badge: None,
+                status: None,
+            },
+            Row {
+                label: "tasks".into(),
+                view: View::Builtin("tasks"),
+                badge: None,
+                status: None,
+            },
+            Row {
+                label: "review".into(),
+                view: View::Builtin("review"),
+                badge: None,
+                status: None,
+            },
+            Row {
+                label: "machines".into(),
+                view: View::Builtin("machines"),
+                badge: None,
+                status: None,
+            },
+        ];
         for a in &self.agents {
             rows.push(Row {
                 label: a.id.clone(),
@@ -99,15 +119,11 @@ impl App {
 
     pub fn activate_view(&mut self, view: &View) {
         match view {
-            View::Orchestrator => {
-                let win = format!("shelbi-{}:dashboard", self.project_name);
-                let right = format!("{win}.{{right}}");
-                run_tmux(["select-window", "-t", &win]);
-                run_tmux(["select-pane", "-t", &right]);
-                self.status_line = "▶ focus → orchestrator".into();
-            }
+            View::Builtin(name) => match shelbi_orchestrator::show_view(&self.project_name, name) {
+                Ok(()) => self.status_line = format!("▶ {name}"),
+                Err(e) => self.status_line = format!("show view `{name}` failed: {e}"),
+            },
             View::Agent(id) => {
-                // Switch to the worker's window in the project session.
                 let target = format!("shelbi-{}:{}", self.project_name, id);
                 let out = run_tmux(["select-window", "-t", &target]);
                 if !out {
@@ -116,7 +132,7 @@ impl App {
                          (remote workers need `tmux attach -t shelbi-w-{id}` for now)"
                     );
                 } else {
-                    self.status_line = format!("▶ focus → {id}");
+                    self.status_line = format!("▶ {id}");
                 }
             }
         }

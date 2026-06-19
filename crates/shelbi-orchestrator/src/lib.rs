@@ -44,6 +44,50 @@ pub fn dashboard_addr(project_name: &str) -> TmuxAddr {
     }
 }
 
+/// Swap the named view's pane into the dashboard's right slot. `view` is
+/// one of `orch`, `tasks`, `review`, `machines`. Reads the stored pane id
+/// from the session's tmux environment.
+pub fn show_view(project_name: &str, view: &str) -> Result<()> {
+    let session = format!("shelbi-{project_name}");
+    let key = format!("SHELBI_PANE_{view}");
+
+    // `show-environment -t session KEY` prints `KEY=value` (or `-KEY` if
+    // unset). Parse it.
+    let out = std::process::Command::new("tmux")
+        .args(["show-environment", "-t", &session, &key])
+        .output()
+        .map_err(Error::Io)?;
+    if !out.status.success() {
+        return Err(Error::Other(format!(
+            "view `{view}` has no stored pane id ({}); is shelbi set up for this session?",
+            String::from_utf8_lossy(&out.stderr).trim()
+        )));
+    }
+    let line = String::from_utf8_lossy(&out.stdout);
+    let line = line.trim();
+    let Some((_k, pane_id)) = line.split_once('=') else {
+        return Err(Error::Other(format!("unexpected tmux env output: {line}")));
+    };
+    if pane_id.is_empty() {
+        return Err(Error::Other(format!("empty pane id for `{view}`")));
+    }
+
+    // Swap the target pane into the dashboard's right slot.
+    let dashboard = format!("{session}:dashboard.{{right}}");
+    let _ = std::process::Command::new("tmux")
+        .args(["swap-pane", "-s", pane_id, "-t", &dashboard])
+        .status()
+        .map_err(Error::Io)?;
+    // Make sure focus lands on the now-visible view.
+    let _ = std::process::Command::new("tmux")
+        .args(["select-window", "-t", &format!("{session}:dashboard")])
+        .status();
+    let _ = std::process::Command::new("tmux")
+        .args(["select-pane", "-t", &dashboard])
+        .status();
+    Ok(())
+}
+
 /// Idempotently set up the project's tmux session with a `dashboard`
 /// window split into sidebar (left) + orchestrator (right). Safe to call
 /// repeatedly.
@@ -164,7 +208,10 @@ pub fn ensure_dashboard(project_name: &str) -> Result<BootstrapStatus> {
     );
 
     // 3. Split the dashboard window: orchestrator on the right.
-    shelbi_ssh::run_capture(
+    //    `-P -F #{pane_id}` echoes the new pane's stable ID (e.g. `%42`)
+    //    which we'll stash in a session env var so the sidebar / palette
+    //    can swap it back in by ID later.
+    let orch_pane_id = shelbi_ssh::run_capture(
         &host,
         [
             "tmux",
@@ -174,17 +221,113 @@ pub fn ensure_dashboard(project_name: &str) -> Result<BootstrapStatus> {
             "70%",
             "-t",
             &dashboard,
+            "-P",
+            "-F",
+            "#{pane_id}",
             "sh",
             "-c",
             &orch_cmd,
         ],
     )?;
+    let orch_pane_id = orch_pane_id.trim().to_string();
+    set_session_env(&host, session, "SHELBI_PANE_orch", &orch_pane_id)?;
+
     // Focus the orchestrator pane so the user can type immediately.
-    // Use the `{right}` selector (portable across pane-base-index 0/1).
     shelbi_ssh::run_capture(
         &host,
         ["tmux", "select-pane", "-t", &format!("{dashboard}.{{right}}")],
     )?;
 
+    // 4. Materialize the hidden `__views` window with tasks/review/machines
+    //    panes. Each runs a tiny watch loop or one-shot script. Sidebar
+    //    swaps them into the dashboard's right pane via `tmux swap-pane`.
+    create_hidden_views(&host, session, project_name, &shelbi_bin)?;
+
     Ok(BootstrapStatus::Started)
+}
+
+fn create_hidden_views(
+    host: &shelbi_core::Host,
+    session: &str,
+    project_name: &str,
+    shelbi_bin: &str,
+) -> Result<()> {
+    let views_win = format!("{session}:__views");
+    // Already there? Skip.
+    let windows = shelbi_ssh::run_capture(
+        host,
+        ["tmux", "list-windows", "-t", session, "-F", "#W"],
+    )?;
+    if windows.lines().any(|w| w.trim() == "__views") {
+        return Ok(());
+    }
+
+    let bin = shelbi_agent::shell_escape(shelbi_bin);
+    let proj = shelbi_agent::shell_escape(project_name);
+    // Each view runs a forever loop that re-renders every 2s. Using `printf
+    // '\\033c'` (full reset) instead of `clear` avoids alt-screen flicker.
+    let tasks_cmd = format!(
+        "while true; do printf '\\033c'; echo 'tasks · {proj_label}'; echo; {bin} --project {proj} list; sleep 2; done",
+        bin = bin,
+        proj = proj,
+        proj_label = project_name,
+    );
+    let review_cmd = format!(
+        "while true; do printf '\\033c'; echo 'review · {proj_label}'; echo; {bin} --project {proj} list | grep -E '^(✓|◐)' || echo '(no agents waiting for review)'; sleep 2; done",
+        bin = bin,
+        proj = proj,
+        proj_label = project_name,
+    );
+    let machines_cmd = format!(
+        "while true; do printf '\\033c'; echo 'machines · {proj_label}'; echo; cat ~/.shelbi/projects/{proj_label}.yaml 2>/dev/null | sed -n '/^machines:/,/^[a-z]/p' | sed '$d'; sleep 5; done",
+        proj_label = project_name,
+    );
+
+    // Create the hidden views window with the first pane (tasks).
+    let tasks_id = shelbi_ssh::run_capture(
+        host,
+        [
+            "tmux", "new-window", "-d", "-t", &format!("{session}:"), "-n", "__views",
+            "-P", "-F", "#{pane_id}",
+            "sh", "-c", &tasks_cmd,
+        ],
+    )?;
+    let tasks_id = tasks_id.trim().to_string();
+
+    // Split for review.
+    let review_id = shelbi_ssh::run_capture(
+        host,
+        [
+            "tmux", "split-window", "-v", "-t", &views_win,
+            "-P", "-F", "#{pane_id}",
+            "sh", "-c", &review_cmd,
+        ],
+    )?;
+    let review_id = review_id.trim().to_string();
+
+    // Split for machines.
+    let machines_id = shelbi_ssh::run_capture(
+        host,
+        [
+            "tmux", "split-window", "-v", "-t", &views_win,
+            "-P", "-F", "#{pane_id}",
+            "sh", "-c", &machines_cmd,
+        ],
+    )?;
+    let machines_id = machines_id.trim().to_string();
+
+    set_session_env(host, session, "SHELBI_PANE_tasks", &tasks_id)?;
+    set_session_env(host, session, "SHELBI_PANE_review", &review_id)?;
+    set_session_env(host, session, "SHELBI_PANE_machines", &machines_id)?;
+    Ok(())
+}
+
+fn set_session_env(
+    host: &shelbi_core::Host,
+    session: &str,
+    key: &str,
+    value: &str,
+) -> Result<()> {
+    shelbi_ssh::run_capture(host, ["tmux", "set-environment", "-t", session, key, value])?;
+    Ok(())
 }

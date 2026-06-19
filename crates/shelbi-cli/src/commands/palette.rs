@@ -201,12 +201,32 @@ fn render(f: &mut Frame, state: &State, results: &[(Entry, u16)]) {
 // Entry building + dispatch
 
 fn build_entries(agents: &[Agent]) -> Vec<Entry> {
-    let mut out = vec![Entry {
-        id: "view:orchestrator".into(),
-        label: "orchestrator".into(),
-        kind: EntryKind::View,
-        subtitle: Some("focus the orchestrator pane".into()),
-    }];
+    let mut out = vec![
+        Entry {
+            id: "view:orch".into(),
+            label: "orchestrator".into(),
+            kind: EntryKind::View,
+            subtitle: Some("the claude pane you talk to".into()),
+        },
+        Entry {
+            id: "view:tasks".into(),
+            label: "tasks".into(),
+            kind: EntryKind::View,
+            subtitle: Some("live `shelbi list`".into()),
+        },
+        Entry {
+            id: "view:review".into(),
+            label: "review".into(),
+            kind: EntryKind::View,
+            subtitle: Some("agents waiting on you".into()),
+        },
+        Entry {
+            id: "view:machines".into(),
+            label: "machines".into(),
+            kind: EntryKind::View,
+            subtitle: Some("project machines + hosts".into()),
+        },
+    ];
     for a in agents {
         out.push(Entry {
             id: format!("agent:{}", a.id),
@@ -227,13 +247,14 @@ fn build_entries(agents: &[Agent]) -> Vec<Entry> {
 fn dispatch(project: &str, entry: &Entry, _agents: &[Agent]) -> Result<()> {
     match entry.kind {
         EntryKind::View => {
-            // The only view today is "orchestrator" — focus the right pane.
-            let win = format!("shelbi-{project}:dashboard");
-            run_tmux(["select-window", "-t", &win]);
-            run_tmux(["select-pane", "-t", &format!("{win}.{{right}}")]);
+            let view = entry
+                .id
+                .strip_prefix("view:")
+                .unwrap_or("orch");
+            shelbi_orchestrator::show_view(project, view)
+                .map_err(|e| anyhow::anyhow!(e))?;
         }
         EntryKind::Agent => {
-            // Strip the "agent:" prefix from id, or use label.
             let id = entry
                 .id
                 .strip_prefix("agent:")
