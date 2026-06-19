@@ -151,13 +151,35 @@ pub fn start_worker_on_task(spec: StartSpec<'_>) -> Result<TmuxAddr> {
         }
     }
 
-    // 5. cd into the worktree and launch the agent. No `exec` — when the
-    //    agent exits, the shell stays so the worker pane is reusable.
+    // 5. cd into the worktree and launch the agent.
+    //
+    //    Local: tmux server inherits the user's already-set-up login env
+    //    (since the user ran shelbi from their own terminal), so a plain
+    //    invocation finds everything on PATH. No `exec` — when the agent
+    //    exits, the shell stays so the worker pane is reusable.
+    //
+    //    Remote: tmux was started by `ssh host -- tmux new-session …`,
+    //    which runs through a NON-login non-interactive shell — so tmux
+    //    (and every pane it spawns) inherits a stripped-down PATH that's
+    //    missing Homebrew, asdf, nvm, etc. Re-exec through `$SHELL -lc`
+    //    so the login rc files (~/.zprofile, ~/.bash_profile) run and we
+    //    pick up the same PATH the user has in their own terminal —
+    //    otherwise claude launches without its expected env and dies with
+    //    "Input must be provided either through stdin or as a prompt
+    //    argument when using --print".
     let launch = shelbi_agent::launch_command(&runner);
-    let cd_launch = format!(
-        "cd {wd} && {launch}",
-        wd = shelbi_agent::shell_escape(&worktree.to_string_lossy()),
-    );
+    let cd_launch = if host.is_local() {
+        format!(
+            "cd {wd} && {launch}",
+            wd = shelbi_agent::shell_escape(&worktree.to_string_lossy()),
+        )
+    } else {
+        format!(
+            "cd {wd} && exec \"${{SHELL:-/bin/bash}}\" -lc {launch}",
+            wd = shelbi_agent::shell_escape(&worktree.to_string_lossy()),
+            launch = shelbi_agent::shell_escape(&launch),
+        )
+    };
     shelbi_tmux::send_line(&host, &addr, &cd_launch)?;
 
     // 6. Let the agent's TTY settle before we type into it (same reason as

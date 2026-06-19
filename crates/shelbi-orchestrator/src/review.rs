@@ -135,11 +135,28 @@ pub fn start_review(spec: ReviewSpec<'_>) -> Result<TmuxAddr> {
         }
     }
 
+    // Local: tmux server inherits the user's already-set-up login env, so
+    // a plain invocation finds everything on PATH. Remote: tmux was
+    // started over SSH through a non-login non-interactive shell and
+    // inherits a stripped-down PATH that's missing Homebrew, asdf, nvm,
+    // etc. Re-exec through `$SHELL -lc` so the login rc files run and we
+    // pick up the same PATH the user has in their own terminal — otherwise
+    // claude launches without its expected env and dies with "Input must
+    // be provided either through stdin or as a prompt argument when using
+    // --print".
     let launch = shelbi_agent::launch_command(&runner);
-    let cd_launch = format!(
-        "cd {wd} && {launch}",
-        wd = shelbi_agent::shell_escape(&spec.machine.work_dir.to_string_lossy()),
-    );
+    let cd_launch = if host.is_local() {
+        format!(
+            "cd {wd} && {launch}",
+            wd = shelbi_agent::shell_escape(&spec.machine.work_dir.to_string_lossy()),
+        )
+    } else {
+        format!(
+            "cd {wd} && exec \"${{SHELL:-/bin/bash}}\" -lc {launch}",
+            wd = shelbi_agent::shell_escape(&spec.machine.work_dir.to_string_lossy()),
+            launch = shelbi_agent::shell_escape(&launch),
+        )
+    };
     shelbi_tmux::send_line(&host, &addr, &cd_launch)?;
 
     std::thread::sleep(std::time::Duration::from_millis(1500));
