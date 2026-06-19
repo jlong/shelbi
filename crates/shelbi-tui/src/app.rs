@@ -3,7 +3,7 @@ use std::time::{Duration, Instant};
 use anyhow::Result;
 use ratatui::layout::Rect;
 use shelbi_core::{Agent, Column, Host, Status};
-use shelbi_state::TaskFile;
+use shelbi_state::{load_worker_status, TaskFile, WorkerState};
 
 /// What's currently highlighted in the sidebar — drives selection logic
 /// only; the right pane (orchestrator / agent) is a real tmux pane, not
@@ -36,6 +36,42 @@ pub struct WorkerOverview {
     /// `Some(task_id)` if this worker is currently assigned an in_progress
     /// task — drives the busy/idle indicator.
     pub current_task: Option<String>,
+    /// Single-char state glyph derived from the worker's status file and
+    /// the task board state.
+    pub badge: WorkerBadge,
+}
+
+/// Per-worker state glyph shown in the sidebar. Derived each refresh from
+/// the task board (review-ready / idle) and from
+/// `~/.shelbi/workers/<name>/status.yaml` (working / awaiting-input /
+/// awaiting-permission), which the [`crate::WorkerPoller`] writes from the
+/// worker pane's `shelbi:<state>` title marker.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WorkerBadge {
+    /// ⏵ — claude is actively running a turn.
+    Working,
+    /// 💬 — claude finished a turn and is sitting at the prompt.
+    AwaitingInput,
+    /// ⚠ — claude is showing a permission dialog.
+    AwaitingPermission,
+    /// ✓ — the worker's task has been moved to the review column.
+    ReviewReady,
+    /// · — no in-flight task assigned.
+    Idle,
+}
+
+impl WorkerBadge {
+    /// Single-char glyph — paired with one trailing space in the renderer
+    /// so the badge column stays narrow on small terminals.
+    pub fn glyph(self) -> &'static str {
+        match self {
+            WorkerBadge::Working => "⏵",
+            WorkerBadge::AwaitingInput => "💬",
+            WorkerBadge::AwaitingPermission => "⚠",
+            WorkerBadge::ReviewReady => "✓",
+            WorkerBadge::Idle => "·",
+        }
+    }
 }
 
 pub struct App {
@@ -99,12 +135,14 @@ impl App {
                 view: View::Builtin("orch"),
                 badge: None,
                 status: None,
+                worker_badge: None,
             },
             Row {
                 label: "tasks".into(),
                 view: View::Builtin("tasks"),
                 badge: None,
                 status: None,
+                worker_badge: None,
             },
             Row {
                 label: "review".into(),
@@ -115,29 +153,23 @@ impl App {
                     Some(format!("{}", self.review_queue.len()))
                 },
                 status: None,
+                worker_badge: None,
             },
             Row {
                 label: "machines".into(),
                 view: View::Builtin("machines"),
                 badge: None,
                 status: None,
+                worker_badge: None,
             },
         ];
         for w in &self.workers {
-            // Status::Running shows a green `●` (busy on a task);
-            // Status::Queued shows a blue `○` (idle slot, waiting for work).
-            // Reusing the existing glyph palette keeps the sidebar visually
-            // consistent — workers ARE the modern "agents".
-            let status = if w.current_task.is_some() {
-                Status::Running
-            } else {
-                Status::Queued
-            };
             rows.push(Row {
                 label: w.name.clone(),
                 view: View::Worker(w.name.clone()),
                 badge: Some(w.machine.clone()),
-                status: Some(status),
+                status: None,
+                worker_badge: Some(w.badge),
             });
         }
         for tf in &self.review_queue {
@@ -146,6 +178,7 @@ impl App {
                 view: View::ReviewTask(tf.task.id.clone()),
                 badge: tf.task.assigned_to.clone(),
                 status: None,
+                worker_badge: None,
             });
         }
         for a in &self.agents {
@@ -154,6 +187,7 @@ impl App {
                 view: View::Agent(a.id.clone()),
                 badge: Some(a.machine.clone()),
                 status: Some(a.status),
+                worker_badge: None,
             });
         }
         rows
@@ -161,9 +195,10 @@ impl App {
 
     pub fn refresh(&mut self) -> Result<()> {
         self.agents = load_agents(&self.project_name).unwrap_or_default();
-        self.workers = load_workers(&self.project_name).unwrap_or_default();
         self.review_queue =
             shelbi_state::list_column(&self.project_name, Column::Review).unwrap_or_default();
+        self.workers =
+            load_workers(&self.project_name, &self.review_queue).unwrap_or_default();
         self.last_refresh = Instant::now();
         Ok(())
     }
@@ -319,18 +354,25 @@ pub struct Row {
     pub label: String,
     pub view: View,
     pub badge: Option<String>,
+    /// Glyph for legacy `shelbi spawn` agent rows. Workers use
+    /// [`Self::worker_badge`] instead.
     pub status: Option<Status>,
+    /// Glyph for declared-worker rows — derived from the worker's
+    /// `status.yaml` plus the task board. `None` on built-ins, review
+    /// tasks, and legacy agents.
+    pub worker_badge: Option<WorkerBadge>,
 }
 
-/// Build the sidebar's view of declared workers from the project YAML and
-/// the in-progress task column. Cheap: a single YAML read + one task-list
-/// scan. Returns an empty vec if the project YAML or task dir is missing.
-fn load_workers(project: &str) -> Result<Vec<WorkerOverview>> {
+/// Build the sidebar's view of declared workers from the project YAML, the
+/// in-progress task column, and the review queue (passed in so we don't
+/// scan tasks twice per refresh). One disk read per worker for the
+/// `status.yaml` lookup. Returns an empty vec if the project YAML or task
+/// dir is missing.
+fn load_workers(project: &str, review_queue: &[TaskFile]) -> Result<Vec<WorkerOverview>> {
     let p = match shelbi_state::load_project(project) {
         Ok(p) => p,
         Err(_) => return Ok(Vec::new()),
     };
-    // Worker→task index for the "busy" indicator. Missing column = empty.
     let in_progress =
         shelbi_state::list_column(project, Column::InProgress).unwrap_or_default();
     let mut out = Vec::with_capacity(p.workers.len());
@@ -344,14 +386,48 @@ fn load_workers(project: &str) -> Result<Vec<WorkerOverview>> {
             .iter()
             .find(|tf| tf.task.assigned_to.as_deref() == Some(worker.name.as_str()))
             .map(|tf| tf.task.id.clone());
+        let has_review = review_queue
+            .iter()
+            .any(|tf| tf.task.assigned_to.as_deref() == Some(worker.name.as_str()));
+        let badge = derive_worker_badge(&worker.name, current_task.is_some(), has_review);
         out.push(WorkerOverview {
             name: worker.name.clone(),
             machine: worker.machine.clone(),
             is_remote,
             current_task,
+            badge,
         });
     }
     Ok(out)
+}
+
+/// Pick the badge for a worker given the task-board signals + an on-disk
+/// state read. Review-ready wins over claude state — once a task is sent
+/// for review the worker is conceptually done with it even if claude is
+/// still mid-turn. Idle wins when there's no in-progress task at all, so
+/// a stale `status.yaml` from a previous run doesn't show "working" for a
+/// worker that has nothing to do.
+fn derive_worker_badge(
+    worker_name: &str,
+    has_in_progress: bool,
+    has_review: bool,
+) -> WorkerBadge {
+    if has_review {
+        return WorkerBadge::ReviewReady;
+    }
+    if !has_in_progress {
+        return WorkerBadge::Idle;
+    }
+    match load_worker_status(worker_name).ok().flatten() {
+        Some(s) => match s.state {
+            WorkerState::Working => WorkerBadge::Working,
+            WorkerState::AwaitingInput => WorkerBadge::AwaitingInput,
+            WorkerState::Blocked => WorkerBadge::AwaitingPermission,
+        },
+        // Task assigned but the poller hasn't observed a marker yet. Show
+        // working as the best guess — it'll firm up within one poll tick.
+        None => WorkerBadge::Working,
+    }
 }
 
 fn load_agents(project: &str) -> Result<Vec<Agent>> {
@@ -505,7 +581,7 @@ mod tests {
         };
         shelbi_state::save_task("demo", &assigned, "# task").unwrap();
 
-        let workers = load_workers("demo").unwrap();
+        let workers = load_workers("demo", &[]).unwrap();
         assert_eq!(workers.len(), 2);
 
         let alpha = &workers[0];
@@ -524,7 +600,7 @@ mod tests {
     }
 
     #[test]
-    fn rows_include_workers_with_busy_glyph_for_assigned_workers() {
+    fn rows_include_workers_with_idle_and_working_badges() {
         let _g = TEST_LOCK.lock().unwrap();
         let home = fresh_home();
         std::env::set_var("SHELBI_HOME", &home);
@@ -557,16 +633,218 @@ mod tests {
         let rows = app.rows();
         assert_eq!(rows.len(), 6);
 
-        // alpha (busy) — Status::Running.
+        // alpha (busy, no status file yet) — default to Working.
         let alpha = rows.iter().find(|r| matches!(&r.view, View::Worker(n) if n == "alpha")).unwrap();
         assert_eq!(alpha.badge.as_deref(), Some("hub"));
-        assert_eq!(alpha.status, Some(Status::Running));
+        assert_eq!(alpha.worker_badge, Some(WorkerBadge::Working));
+        assert!(alpha.status.is_none());
 
-        // delta (idle remote) — Status::Queued.
+        // delta (idle remote) — Idle.
         let delta = rows.iter().find(|r| matches!(&r.view, View::Worker(n) if n == "delta")).unwrap();
         assert_eq!(delta.badge.as_deref(), Some("devbox"));
-        assert_eq!(delta.status, Some(Status::Queued));
+        assert_eq!(delta.worker_badge, Some(WorkerBadge::Idle));
 
         std::env::remove_var("SHELBI_HOME");
+    }
+
+    #[test]
+    fn worker_badge_reflects_status_yaml_when_task_in_progress() {
+        let _g = TEST_LOCK.lock().unwrap();
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+
+        let project = fixture_project();
+        shelbi_state::save_project(&project).unwrap();
+
+        let now = Utc::now();
+        for (id, worker, state) in [
+            ("t-work", "alpha", WorkerState::Working),
+            ("t-wait", "delta", WorkerState::AwaitingInput),
+        ] {
+            shelbi_state::save_task(
+                "demo",
+                &Task {
+                    id: id.into(),
+                    title: id.into(),
+                    column: Column::InProgress,
+                    priority: 0,
+                    assigned_to: Some(worker.into()),
+                    branch: None,
+                    created_at: now,
+                    updated_at: now,
+                },
+                "",
+            )
+            .unwrap();
+            shelbi_state::save_worker_status(&shelbi_state::WorkerStatus {
+                worker: worker.into(),
+                current_task: Some(id.into()),
+                state,
+                last_transition: now,
+                last_seen: now,
+            })
+            .unwrap();
+        }
+
+        let mut app = App::new_sidebar("demo");
+        app.refresh().unwrap();
+        let rows = app.rows();
+
+        let alpha = rows.iter().find(|r| matches!(&r.view, View::Worker(n) if n == "alpha")).unwrap();
+        assert_eq!(alpha.worker_badge, Some(WorkerBadge::Working));
+
+        let delta = rows.iter().find(|r| matches!(&r.view, View::Worker(n) if n == "delta")).unwrap();
+        assert_eq!(delta.worker_badge, Some(WorkerBadge::AwaitingInput));
+
+        std::env::remove_var("SHELBI_HOME");
+    }
+
+    #[test]
+    fn worker_badge_shows_awaiting_permission_when_blocked() {
+        let _g = TEST_LOCK.lock().unwrap();
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+
+        let project = fixture_project();
+        shelbi_state::save_project(&project).unwrap();
+
+        let now = Utc::now();
+        shelbi_state::save_task(
+            "demo",
+            &Task {
+                id: "t".into(),
+                title: "t".into(),
+                column: Column::InProgress,
+                priority: 0,
+                assigned_to: Some("alpha".into()),
+                branch: None,
+                created_at: now,
+                updated_at: now,
+            },
+            "",
+        )
+        .unwrap();
+        shelbi_state::save_worker_status(&shelbi_state::WorkerStatus {
+            worker: "alpha".into(),
+            current_task: Some("t".into()),
+            state: WorkerState::Blocked,
+            last_transition: now,
+            last_seen: now,
+        })
+        .unwrap();
+
+        let mut app = App::new_sidebar("demo");
+        app.refresh().unwrap();
+        let alpha = app
+            .rows()
+            .into_iter()
+            .find(|r| matches!(&r.view, View::Worker(n) if n == "alpha"))
+            .unwrap();
+        assert_eq!(alpha.worker_badge, Some(WorkerBadge::AwaitingPermission));
+
+        std::env::remove_var("SHELBI_HOME");
+    }
+
+    #[test]
+    fn worker_badge_shows_review_ready_when_task_in_review_column() {
+        let _g = TEST_LOCK.lock().unwrap();
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+
+        let project = fixture_project();
+        shelbi_state::save_project(&project).unwrap();
+
+        let now = Utc::now();
+        shelbi_state::save_task(
+            "demo",
+            &Task {
+                id: "ready".into(),
+                title: "ready".into(),
+                column: Column::Review,
+                priority: 0,
+                assigned_to: Some("alpha".into()),
+                branch: None,
+                created_at: now,
+                updated_at: now,
+            },
+            "",
+        )
+        .unwrap();
+        // Even an active "working" status.yaml shouldn't beat review-ready —
+        // once the task moves to review, the worker is conceptually done.
+        shelbi_state::save_worker_status(&shelbi_state::WorkerStatus {
+            worker: "alpha".into(),
+            current_task: None,
+            state: WorkerState::Working,
+            last_transition: now,
+            last_seen: now,
+        })
+        .unwrap();
+
+        let mut app = App::new_sidebar("demo");
+        app.refresh().unwrap();
+        let alpha = app
+            .rows()
+            .into_iter()
+            .find(|r| matches!(&r.view, View::Worker(n) if n == "alpha"))
+            .unwrap();
+        assert_eq!(alpha.worker_badge, Some(WorkerBadge::ReviewReady));
+
+        std::env::remove_var("SHELBI_HOME");
+    }
+
+    #[test]
+    fn worker_badge_idle_overrides_stale_status_yaml_when_no_task() {
+        // status.yaml says working but no in-progress task is assigned —
+        // probably a leftover from a finished task. Show idle so the user
+        // isn't misled.
+        let _g = TEST_LOCK.lock().unwrap();
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+
+        let project = fixture_project();
+        shelbi_state::save_project(&project).unwrap();
+
+        let now = Utc::now();
+        shelbi_state::save_worker_status(&shelbi_state::WorkerStatus {
+            worker: "alpha".into(),
+            current_task: None,
+            state: WorkerState::Working,
+            last_transition: now,
+            last_seen: now,
+        })
+        .unwrap();
+
+        let mut app = App::new_sidebar("demo");
+        app.refresh().unwrap();
+        let alpha = app
+            .rows()
+            .into_iter()
+            .find(|r| matches!(&r.view, View::Worker(n) if n == "alpha"))
+            .unwrap();
+        assert_eq!(alpha.worker_badge, Some(WorkerBadge::Idle));
+
+        std::env::remove_var("SHELBI_HOME");
+    }
+
+    #[test]
+    fn worker_badge_glyphs_are_single_chars() {
+        // Sidebar column must stay narrow for small terminals. Each badge
+        // glyph is one (possibly multi-byte) Unicode char — never a
+        // multi-char string.
+        for b in [
+            WorkerBadge::Working,
+            WorkerBadge::AwaitingInput,
+            WorkerBadge::AwaitingPermission,
+            WorkerBadge::ReviewReady,
+            WorkerBadge::Idle,
+        ] {
+            assert_eq!(
+                b.glyph().chars().count(),
+                1,
+                "{b:?} glyph {:?} must be a single char",
+                b.glyph()
+            );
+        }
     }
 }

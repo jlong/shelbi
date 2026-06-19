@@ -10,7 +10,7 @@ use ratatui::{
     Frame,
 };
 
-use crate::app::App;
+use crate::app::{App, WorkerBadge};
 
 pub fn render_full(f: &mut Frame, app: &mut App, area: Rect) {
     let outer = Layout::default()
@@ -43,7 +43,12 @@ fn render_list(f: &mut Frame, app: &mut App, area: Rect) {
     let mut items: Vec<ListItem> = Vec::new();
     for (i, row) in rows.iter().enumerate() {
         let mut spans: Vec<Span> = Vec::new();
-        if let Some(status) = row.status {
+        if let Some(badge) = row.worker_badge {
+            spans.push(Span::styled(
+                format!("{} ", badge.glyph()),
+                Style::default().fg(worker_badge_color(badge)),
+            ));
+        } else if let Some(status) = row.status {
             spans.push(Span::styled(
                 format!("{} ", status.glyph()),
                 Style::default().fg(status_color(status)),
@@ -113,5 +118,15 @@ fn status_color(s: shelbi_core::Status) -> Color {
         Done => Color::Cyan,
         Error => Color::Red,
         Archived => Color::DarkGray,
+    }
+}
+
+fn worker_badge_color(b: WorkerBadge) -> Color {
+    match b {
+        WorkerBadge::Working => Color::Green,
+        WorkerBadge::AwaitingInput => Color::Yellow,
+        WorkerBadge::AwaitingPermission => Color::Red,
+        WorkerBadge::ReviewReady => Color::Cyan,
+        WorkerBadge::Idle => Color::DarkGray,
     }
 }
