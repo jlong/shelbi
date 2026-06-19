@@ -272,14 +272,17 @@ fn create_hidden_views(
 
     let bin = shelbi_agent::shell_escape(shelbi_bin);
     let proj = shelbi_agent::shell_escape(project_name);
-    // Each view runs a forever loop that re-renders every 2s. Using
-    // `printf '\\033c'` (full reset) avoids alt-screen flicker.
+    // Tasks is a real ratatui Kanban (`shelbi __tasks <p>`). Wrap in a
+    // `while true` loop so an accidental crash or Ctrl-C respawns the TUI
+    // instead of leaving the stash pane empty — palette swap-pane assumes
+    // the pane id stays alive.
     let tasks_cmd = format!(
-        "while true; do printf '\\033c'; echo 'tasks · {proj_label}'; echo; {bin} --project {proj} list; sleep 2; done",
+        "while true; do {bin} __tasks {proj}; sleep 1; done",
         bin = bin,
         proj = proj,
-        proj_label = project_name,
     );
+    // Review + machines stay as simple printf loops until their views grow
+    // their own ratatui apps (Phase D will replace `review`).
     let review_cmd = format!(
         "while true; do printf '\\033c'; echo 'review · {proj_label}'; echo; {bin} --project {proj} list | grep -E '^(✓|◐)' || echo '(no agents waiting for review)'; sleep 2; done",
         bin = bin,

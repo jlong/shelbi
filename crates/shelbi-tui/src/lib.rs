@@ -21,9 +21,11 @@ use crossterm::{
 use ratatui::{backend::CrosstermBackend, Terminal};
 
 mod app;
+mod kanban;
 mod sidebar;
 
 pub use app::{App, View};
+pub use kanban::KanbanApp;
 
 /// Set up the project's tmux session and attach to it. If we're already
 /// inside a tmux client, use `switch-client` instead of `attach` (tmux
@@ -75,6 +77,21 @@ pub fn run_sidebar(project_name: &str) -> Result<()> {
     result
 }
 
+/// Run the Kanban tasks view in the current pane. Meant to be hosted in
+/// the project's hidden stash session and swapped into the dashboard via
+/// the palette. Parent shell wraps invocation in `while true; do …; done`
+/// so an accidental crash respawns instead of leaving an empty pane.
+pub fn run_tasks(project_name: &str) -> Result<()> {
+    let mut term = setup_terminal().context("setting up terminal")?;
+    let mut app = KanbanApp::new(project_name);
+    app.refresh();
+
+    let result = tasks_loop(&mut term, &mut app);
+
+    restore_terminal(&mut term).context("restoring terminal")?;
+    result
+}
+
 fn setup_terminal() -> Result<Terminal<CrosstermBackend<io::Stdout>>> {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
@@ -110,6 +127,61 @@ fn sidebar_loop<B: ratatui::backend::Backend>(
         }
     }
     Ok(())
+}
+
+fn tasks_loop<B: ratatui::backend::Backend>(
+    term: &mut Terminal<B>,
+    app: &mut KanbanApp,
+) -> Result<()> {
+    loop {
+        app.maybe_refresh();
+        term.draw(|f| kanban::render_full(f, app, f.area()))?;
+        if event::poll(Duration::from_millis(200))? {
+            if let Event::Key(k) = event::read()? {
+                if k.kind != KeyEventKind::Press {
+                    continue;
+                }
+                // Ctrl+C exits — the parent shell loop will respawn us.
+                if k.modifiers.contains(KeyModifiers::CONTROL)
+                    && matches!(k.code, KeyCode::Char('c'))
+                {
+                    return Ok(());
+                }
+                handle_kanban_key(app, k.code, k.modifiers);
+            }
+        }
+    }
+}
+
+fn handle_kanban_key(app: &mut KanbanApp, code: KeyCode, mods: KeyModifiers) {
+    let shift = mods.contains(KeyModifiers::SHIFT);
+    match code {
+        KeyCode::Left | KeyCode::Char('h') => app.nav_left(),
+        KeyCode::Right | KeyCode::Char('l') => app.nav_right(),
+        KeyCode::Up | KeyCode::Char('k') => {
+            if shift {
+                app.reorder_up()
+            } else {
+                app.nav_up()
+            }
+        }
+        KeyCode::Down | KeyCode::Char('j') => {
+            if shift {
+                app.reorder_down()
+            } else {
+                app.nav_down()
+            }
+        }
+        // Shifted hjkl: caps-letter form, since shift+h/l won't carry the
+        // SHIFT modifier on most terminals — the keycode arrives as the
+        // uppercase char directly.
+        KeyCode::Char('H') => app.move_card_left(),
+        KeyCode::Char('L') => app.move_card_right(),
+        KeyCode::Char('K') => app.reorder_up(),
+        KeyCode::Char('J') => app.reorder_down(),
+        KeyCode::Char('r') => app.refresh(),
+        _ => {}
+    }
 }
 
 fn handle_key(app: &mut App, code: KeyCode, mods: KeyModifiers) {
