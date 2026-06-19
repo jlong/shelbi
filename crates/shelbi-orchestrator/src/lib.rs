@@ -296,10 +296,15 @@ fn create_hidden_views(
         bin = bin,
         proj = proj,
     );
-    // Machines is still a simple printf loop until its view grows its own
-    // ratatui app.
+    // Live worker/machine table — `shelbi worker list` probes each
+    // worker's tmux pane and prints the assigned task (if any), so remote
+    // workers show up alongside local ones with the same shape. Refresh
+    // every 5s; the SSH probe per remote worker keeps this cheap-but-not-
+    // free, hence the slower cadence than the kanban view.
     let machines_cmd = format!(
-        "while true; do printf '\\033c'; echo 'machines · {proj_label}'; echo; cat ~/.shelbi/projects/{proj_label}.yaml 2>/dev/null | sed -n '/^machines:/,/^[a-z]/p' | sed '$d'; sleep 5; done",
+        "while true; do printf '\\033c'; echo 'workers · {proj_label}'; echo; {bin} --project {proj} worker list 2>&1; sleep 5; done",
+        bin = bin,
+        proj = proj,
         proj_label = project_name,
     );
 
