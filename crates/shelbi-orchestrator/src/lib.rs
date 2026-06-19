@@ -117,6 +117,11 @@ pub fn ensure_dashboard(project_name: &str) -> Result<BootstrapStatus> {
     let session = &addr.session;
     let dashboard = format!("{session}:dashboard");
 
+    // Install the session-closed cleanup hook before doing anything else.
+    // Idempotent and project-agnostic — set every ensure_dashboard call so
+    // it survives shelbi upgrades and tmux-server restarts.
+    install_stash_cleanup_hook(&host)?;
+
     // Materialize the orchestrator's workdir + CLAUDE.md upfront — needed
     // whether we create the session from scratch or just the right pane.
     let workdir = shelbi_state::project_dir(project_name)?;
@@ -332,5 +337,20 @@ fn set_session_env(
     value: &str,
 ) -> Result<()> {
     shelbi_ssh::run_capture(host, ["tmux", "set-environment", "-t", session, key, value])?;
+    Ok(())
+}
+
+/// Install a global `session-closed` hook on the tmux server so that when
+/// the user kills a `shelbi-<project>` session its `_shelbi-<project>`
+/// stash gets cleaned up too. The pattern `shelbi-*` ignores the stash
+/// itself (`_shelbi-*`), so the hook can't recurse. Uses hook array index
+/// 42 to avoid clobbering any unrelated `session-closed` hooks the user
+/// may have set.
+fn install_stash_cleanup_hook(host: &shelbi_core::Host) -> Result<()> {
+    let hook_cmd = r##"run-shell -b "case \"#{hook_session_name}\" in shelbi-*) tmux kill-session -t \"_#{hook_session_name}\" 2>/dev/null;; esac""##;
+    let _ = shelbi_ssh::run(
+        host,
+        ["tmux", "set-hook", "-g", "session-closed[42]", hook_cmd],
+    );
     Ok(())
 }
