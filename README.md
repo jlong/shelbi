@@ -25,9 +25,8 @@ shelbi gives you:
 
 - **One orchestrator, many workers.** Talk to a single agent in chat. It
   dispatches tasks across machines and tracks progress for you.
-- **Run anywhere tmux runs.** Hub-side: Linux, macOS, Windows (via WSL).
-  Workers: any machine reachable by `ssh` with `tmux` + your agent CLI
-  installed.
+- **Run anywhere tmux runs.** Hub-side: Linux or macOS. Workers: any
+  machine reachable by `ssh` with `tmux` + your agent CLI installed.
 - **Worktree isolation per task.** Each task runs on its own git branch in
   its own worktree. Review, merge, archive — independently.
 - **No daemons, no servers.** Just `ssh`, `tmux`, `git`, and your agent CLI.
@@ -41,8 +40,10 @@ shelbi gives you:
 
 ## Install
 
-For now: clone and build from source. `cargo install shelbi` will land once
-the first crate is published.
+For now: clone and run `./scripts/install.sh` — it builds with
+`cargo build --release` and drops the binary at `$HOME/bin/shelbi`
+(override with `SHELBI_INSTALL_PATH=/somewhere/else`). `cargo install
+shelbi` will land once the first crate is published.
 
 ```bash
 git clone https://github.com/jlong/shelbi.git
@@ -50,11 +51,10 @@ cd shelbi
 ./scripts/install.sh
 ```
 
-The script runs `cargo build --release` and drops the binary at
-`$HOME/bin/shelbi` (override with `SHELBI_INSTALL_PATH=/somewhere/else`).
-On macOS it re-signs the copied binary ad-hoc — without that step the kernel
-SIGKILLs the process on first exec with no useful error. Linux and Windows
-need nothing extra.
+On macOS the script re-signs the copied binary ad-hoc — without that step
+the kernel SIGKILLs the process on first exec with no useful error. Linux
+needs nothing extra. Re-run the script any time you pull updates to
+rebuild and reinstall in one shot.
 
 Confirm the install:
 
@@ -91,7 +91,7 @@ $ shelbi
   ? Work directory on remote: /home/you/work/myapp
 ? Add another remote machine? No
 ? Agent runner (used by every worker): claude
-  (memory: 64 GB → recommended 4 workers per machine — configurable later)
+  (memory: 64 GB → recommended 5 workers per machine — configurable later)
 ? Worker count per machine: 4
 ? Worker naming style: phonetic (alpha, bravo, charlie, …)
 ? Orchestrator runner: claude
@@ -107,7 +107,9 @@ What the wizard auto-fills from your environment:
 - **Default branch** — `origin/HEAD` (falls back to `main`).
 - **GitHub repo URL** — `git remote get-url origin`.
 - **Hub work directory** — same as the repo path.
-- **Worker count** — heuristic from total RAM (~16 GB per worker).
+- **Worker count** — heuristic from total RAM, budgeting ~10 GB per
+  worker on a single-machine setup and ~12 GB when work is spread
+  across multiple machines. Clamped to `[1, 16]`.
 - **Worker naming style** — choose between phonetic alphabet, Greek
   letters, or Toy Story characters. Workers are laid out machine by
   machine, so the first N names land on the hub, the next N on the first
@@ -157,12 +159,13 @@ highest-priority unblocked card, checks it out on a fresh branch in the
 worker's worktree, and starts the runner with the task prompt. The card
 moves to **in_progress** automatically.
 
-When a worker finishes, it moves its card to **review** and stops. The
-sidebar surfaces a `Ready for Review` list with a cyan `✓` next to each
-title — that's your queue. Click one (or press Enter) and shelbi checks
-the branch out into the machine's review work_dir and spawns a fresh
-Claude pane there for you to interrogate the diff. Approve → merge into
-the default branch (or push and open a PR with `--pr`). Done.
+When a worker finishes, its card lands in **review** and the worker
+stops. The sidebar surfaces a `Ready for Review` list with a cyan `✓`
+next to each title — that's your queue. Click one (or press Enter) and
+shelbi checks the branch out into the project's working directory on
+the machine that ran the task, then spawns a fresh Claude pane there
+for you to interrogate the diff. Approve → merge into the default
+branch (or push and open a PR with `--pr`). Done.
 
 The orchestrator handles dispatch and progress tracking. You handle
 direction and review. Nothing in the middle needs CLI ceremony.
@@ -194,9 +197,6 @@ tmux pane: the orchestrator, a worker, or one of the built-in views.
  — Ready for Review —
  ✓ fix-login     delta   > _
  ✓ csv-export    charlie
-
-   ^P palette  Enter focus
-   q  quit shelbi
 ```
 
 Worker state badges in the sidebar:
@@ -217,19 +217,21 @@ JetBrains / Telescope.
 `Enter` focuses the highlighted row: a nav item swaps the right pane to
 that view; a worker switches to its tmux window (or opens an SSH proxy
 window for a remote worker); a review row checks out the branch and
-spawns the review pane. Press `e` on any worker to open your `$EDITOR`
-on its worktree.
+spawns the review pane.
 
 The built-in views on the right pane:
 
 - **Chat** — the orchestrator agent running in window 1. This is where you
   talk to shelbi.
 - **Tasks** — a 5-column Kanban (Backlog / Todo / In Progress / Review /
-  Done). Reorder with `j/k`, move with the column-name keybindings.
+  Done). `h/l` step columns, `j/k` step rows, `Enter` / `Space` opens
+  the card, `H/L` moves the selected card to the next column, `K/J`
+  reorders within a column, `r` refreshes.
 - **Machines** — declared machines + their worker assignments and SSH
   health.
-- **Review** — surfaces inline as the review queue; activating a row
-  triggers the review checkout.
+- **Review** — a ratatui list of every task currently in the review
+  column; activating a row triggers the same checkout flow as clicking
+  the inline `Ready for Review` entries in the sidebar.
 
 ---
 
@@ -372,6 +374,7 @@ column: in_progress
 priority: 0
 assigned_to: delta
 branch: shelbi/fix-login-bug
+depends_on: []
 created_at: 2026-06-18T14:22:11Z
 updated_at: 2026-06-19T09:14:02Z
 ---
@@ -385,6 +388,10 @@ Fix the login bug on Safari — cookie domain mismatch breaks SSO redirect.
 - read `src/auth/session.ts`
 - editing tests…
 ```
+
+`depends_on` is a list of other task IDs. A task is **blocked** while any of
+them are not in `done`. The orchestrator skips blocked todo items when
+auto-dispatching; the Kanban shows them with a 🔒 badge.
 
 ---
 
