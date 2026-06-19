@@ -1,6 +1,7 @@
 //! Cross-platform total-RAM probe + a small heuristic the wizard uses to
 //! suggest a sensible worker count.
 
+#[cfg(target_os = "macos")]
 use std::process::Command;
 
 const GIB: u64 = 1024 * 1024 * 1024;
