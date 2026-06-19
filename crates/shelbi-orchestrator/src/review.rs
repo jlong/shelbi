@@ -302,6 +302,9 @@ mod tests {
                 WorkerSpec { name: "alice".into(), machine: "hub".into(), runner: "claude".into() },
                 WorkerSpec { name: "bob".into(), machine: "m2".into(), runner: "claude".into() },
             ],
+            worker_poll_interval_secs: 5,
+            worker_permissions_mode: "auto".into(),
+            worker_settings_template: None,
         };
         let now = chrono::Utc::now();
         let t = Task {

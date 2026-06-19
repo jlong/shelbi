@@ -1,0 +1,35 @@
+{
+  "permissions": {
+    "defaultMode": "{{worker_permissions_mode}}"
+  },
+  "hooks": {
+    "Stop": [
+      {
+        "hooks": [
+          { "type": "command", "command": "printf '\\033]2;shelbi:idle\\007'" }
+        ]
+      }
+    ],
+    "Notification": [
+      {
+        "hooks": [
+          { "type": "command", "command": "printf '\\033]2;shelbi:blocked\\007'" }
+        ]
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          { "type": "command", "command": "printf '\\033]2;shelbi:working\\007'" }
+        ]
+      }
+    ],
+    "PreToolUse": [
+      {
+        "hooks": [
+          { "type": "command", "command": "printf '\\033]2;shelbi:working\\007'" }
+        ]
+      }
+    ]
+  }
+}

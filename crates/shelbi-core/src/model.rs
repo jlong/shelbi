@@ -41,10 +41,31 @@ pub struct Project {
     /// workers by name. See [`WorkerSpec`].
     #[serde(default)]
     pub workers: Vec<WorkerSpec>,
+    /// How often the orchestrator polls each worker pane for state changes.
+    #[serde(default = "default_worker_poll_interval_secs")]
+    pub worker_poll_interval_secs: u64,
+    /// Permissions posture rendered into the worker settings template
+    /// (see [`Project::worker_settings_template`]). The default `auto`
+    /// is mapped to claude's `acceptEdits` at render time.
+    #[serde(default = "default_worker_permissions_mode")]
+    pub worker_permissions_mode: String,
+    /// Optional override for the path to the per-project worker settings
+    /// template. When `None`, the default at
+    /// `~/.shelbi/projects/<name>/worker-settings.json` is used.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worker_settings_template: Option<PathBuf>,
 }
 
 fn default_branch() -> String {
     "main".to_string()
+}
+
+fn default_worker_poll_interval_secs() -> u64 {
+    5
+}
+
+fn default_worker_permissions_mode() -> String {
+    "auto".to_string()
 }
 
 impl Project {
@@ -385,6 +406,46 @@ mod tests {
     }
 
     #[test]
+    fn project_yaml_omits_new_worker_keys_and_uses_defaults() {
+        let yaml = r#"
+name: p
+repo: r
+machines:
+  - { name: hub, kind: local, work_dir: /tmp }
+orchestrator: { runner: claude }
+agent_runners:
+  claude: { command: claude, flags: [] }
+"#;
+        let p: Project = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(p.worker_poll_interval_secs, 5);
+        assert_eq!(p.worker_permissions_mode, "auto");
+        assert!(p.worker_settings_template.is_none());
+    }
+
+    #[test]
+    fn project_yaml_round_trips_explicit_worker_keys() {
+        let yaml = r#"
+name: p
+repo: r
+machines:
+  - { name: hub, kind: local, work_dir: /tmp }
+orchestrator: { runner: claude }
+agent_runners:
+  claude: { command: claude, flags: [] }
+worker_poll_interval_secs: 12
+worker_permissions_mode: acceptEdits
+worker_settings_template: /etc/shelbi/p.json
+"#;
+        let p: Project = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(p.worker_poll_interval_secs, 12);
+        assert_eq!(p.worker_permissions_mode, "acceptEdits");
+        assert_eq!(
+            p.worker_settings_template.as_deref(),
+            Some(std::path::Path::new("/etc/shelbi/p.json"))
+        );
+    }
+
+    #[test]
     fn workers_validate_against_machines_and_runners() {
         let mut runners = std::collections::BTreeMap::new();
         runners.insert("claude".to_string(), AgentRunnerSpec { command: "claude".into(), flags: vec![] });
@@ -404,6 +465,9 @@ mod tests {
             workers: vec![
                 WorkerSpec { name: "alice".into(), machine: "hub".into(), runner: "claude".into() },
             ],
+            worker_poll_interval_secs: default_worker_poll_interval_secs(),
+            worker_permissions_mode: default_worker_permissions_mode(),
+            worker_settings_template: None,
         };
         assert!(project.validate_workers().is_ok());
 

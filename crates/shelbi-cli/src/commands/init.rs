@@ -57,6 +57,24 @@ pub fn run(args: Args) -> Result<()> {
                 .map_err(|e| anyhow!(e))?;
             std::fs::write(&marker, format!("{name}\n"))?;
             println!("✓ wrote project marker: {}", marker.display());
+
+            let template_path = shelbi_state::project_dir(name)
+                .map_err(|e| anyhow!(e))?
+                .join("worker-settings.json");
+            if template_path.exists() {
+                println!(
+                    "(worker settings template already exists at {})",
+                    template_path.display()
+                );
+            } else {
+                shelbi_state::ensure_dir(template_path.parent().unwrap())
+                    .map_err(|e| anyhow!(e))?;
+                std::fs::write(&template_path, shelbi_state::DEFAULT_WORKER_SETTINGS_TEMPLATE)?;
+                println!(
+                    "✓ wrote worker settings template: {}",
+                    template_path.display()
+                );
+            }
         }
     }
 

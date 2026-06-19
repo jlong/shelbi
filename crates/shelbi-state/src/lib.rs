@@ -10,6 +10,14 @@ use std::path::{Path, PathBuf};
 
 use shelbi_core::{Agent, Column, Project, Result, Session, Task};
 
+/// Default contents of the per-project worker settings template. Lives at
+/// `~/.shelbi/projects/<name>/worker-settings.json` after `shelbi init
+/// --project <name>` runs. The `{{worker_permissions_mode}}` placeholder is
+/// filled in later by the worker deploy step from
+/// `Project::worker_permissions_mode`.
+pub const DEFAULT_WORKER_SETTINGS_TEMPLATE: &str =
+    include_str!("default_worker_settings.json");
+
 /// Default shelbi home directory: `~/.shelbi`, overridable via
 /// `$SHELBI_HOME` (useful for tests and sandboxed CI).
 pub fn shelbi_home() -> Result<PathBuf> {
@@ -33,6 +41,25 @@ pub fn sessions_dir() -> Result<PathBuf> {
 
 pub fn project_dir(project: &str) -> Result<PathBuf> {
     Ok(projects_dir()?.join(project))
+}
+
+/// Resolve the worker settings template path for a project: the override
+/// in [`Project::worker_settings_template`] (with `~` expansion) if set,
+/// otherwise the default at `~/.shelbi/projects/<name>/worker-settings.json`.
+pub fn worker_settings_template_path(project: &Project) -> Result<PathBuf> {
+    if let Some(p) = &project.worker_settings_template {
+        return Ok(expand_tilde(p));
+    }
+    Ok(project_dir(&project.name)?.join("worker-settings.json"))
+}
+
+fn expand_tilde(p: &Path) -> PathBuf {
+    if let Some(rest) = p.to_str().and_then(|s| s.strip_prefix("~/")) {
+        if let Some(home) = dirs::home_dir() {
+            return home.join(rest);
+        }
+    }
+    p.to_path_buf()
 }
 
 pub fn agents_dir(project: &str) -> Result<PathBuf> {
@@ -344,6 +371,76 @@ fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn fixture_project(name: &str, override_template: Option<PathBuf>) -> shelbi_core::Project {
+        use shelbi_core::*;
+        let mut runners = std::collections::BTreeMap::new();
+        runners.insert(
+            "claude".to_string(),
+            AgentRunnerSpec { command: "claude".into(), flags: vec![] },
+        );
+        Project {
+            name: name.into(),
+            repo: "r".into(),
+            default_branch: "main".into(),
+            machines: vec![Machine {
+                name: "hub".into(),
+                kind: MachineKind::Local,
+                work_dir: "/tmp".into(),
+                host: None,
+            }],
+            orchestrator: OrchestratorSpec { runner: "claude".into() },
+            agent_runners: runners,
+            editor: None,
+            workers: vec![],
+            worker_poll_interval_secs: 5,
+            worker_permissions_mode: "auto".into(),
+            worker_settings_template: override_template,
+        }
+    }
+
+    #[test]
+    fn worker_settings_template_path_defaults_under_project_dir() {
+        let _g = TEST_LOCK.lock().unwrap();
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+        let p = fixture_project("myapp", None);
+        let path = worker_settings_template_path(&p).unwrap();
+        assert_eq!(path, home.join("projects/myapp/worker-settings.json"));
+        std::env::remove_var("SHELBI_HOME");
+    }
+
+    #[test]
+    fn worker_settings_template_path_honors_override() {
+        let p = fixture_project("myapp", Some(PathBuf::from("/etc/shelbi/p.json")));
+        let path = worker_settings_template_path(&p).unwrap();
+        assert_eq!(path, PathBuf::from("/etc/shelbi/p.json"));
+    }
+
+    #[test]
+    fn worker_settings_template_path_expands_tilde_in_override() {
+        let p = fixture_project("myapp", Some(PathBuf::from("~/custom/p.json")));
+        let path = worker_settings_template_path(&p).unwrap();
+        let expected = dirs::home_dir().unwrap().join("custom/p.json");
+        assert_eq!(path, expected);
+    }
+
+    #[test]
+    fn default_worker_settings_template_contains_hooks_and_placeholder() {
+        let s = DEFAULT_WORKER_SETTINGS_TEMPLATE;
+        assert!(s.contains("{{worker_permissions_mode}}"));
+        assert!(s.contains("Stop"));
+        assert!(s.contains("Notification"));
+        assert!(s.contains("UserPromptSubmit"));
+        assert!(s.contains("PreToolUse"));
+        assert!(s.contains("shelbi:idle"));
+        assert!(s.contains("shelbi:blocked"));
+        assert!(s.contains("shelbi:working"));
+        // The rendered file is JSON after placeholder substitution.
+        let rendered = s.replace("{{worker_permissions_mode}}", "acceptEdits");
+        let _: serde_json::Value =
+            serde_json::from_str(&rendered).expect("template renders to valid JSON");
+    }
 
     #[test]
     fn frontmatter_split_basic() {
