@@ -38,6 +38,13 @@ pub use review::ReviewApp;
 /// inside a tmux client, use `switch-client` instead of `attach` (tmux
 /// refuses to nest, modern tmux supports switching).
 pub fn run_main(project_name: &str) -> Result<()> {
+    // Bump the recently-used timestamp before bootstrapping the session
+    // so the picker's recency sort reflects this launch even if the
+    // tmux exec below replaces the process before normal shutdown.
+    // Best-effort — a missing/unwritable ~/.shelbi/shelbi.yaml should
+    // not block launching.
+    let _ = shelbi_state::touch_project_launched(project_name);
+
     shelbi_orchestrator::ensure_dashboard(project_name)
         .with_context(|| format!("setting up dashboard for `{project_name}`"))?;
 

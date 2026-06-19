@@ -917,6 +917,7 @@ dependencies = [
  "crossterm 0.28.1",
  "dirs",
  "inquire",
+ "nucleo-matcher",
  "ratatui",
  "serde",
  "serde_yaml",

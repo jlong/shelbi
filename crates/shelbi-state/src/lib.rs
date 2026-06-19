@@ -13,8 +13,13 @@ use std::collections::{HashMap, HashSet};
 use serde::{Deserialize, Serialize};
 use shelbi_core::{Agent, Column, Project, Result, Session, Task};
 
+mod hub_config;
 mod worker_status;
 
+pub use hub_config::{
+    hub_config_path, list_projects, load_hub_config, save_hub_config, touch_project_launched,
+    HubConfig, ProjectMeta, ProjectSummary,
+};
 pub use worker_status::{
     append_worker_event, events_log_path, load_worker_status, parse_pane_title_state,
     save_worker_status, worker_status_path, workers_dir, WorkerState, WorkerStatus,

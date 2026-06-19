@@ -123,9 +123,18 @@ fn main() -> Result<()> {
 
     match cli.cmd {
         None => {
-            // Resolve the project the same way the CLI commands do.
-            let project = commands::require_project(cli.project.clone())
-                .context("resolving project for TUI launch")?;
+            // Resolve the project the same way the CLI commands do —
+            // explicit `--project`, then `.shelbi/project` marker. Falling
+            // through to the picker only when neither resolves keeps the
+            // happy path (one cwd, one marker) prompt-free.
+            let project = match commands::require_project(cli.project.clone()) {
+                Ok(p) => p,
+                Err(_) => match commands::picker::pick_or_setup()? {
+                    commands::picker::PickerOutcome::Existing(p) => p,
+                    commands::picker::PickerOutcome::Created(p) => p,
+                    commands::picker::PickerOutcome::Cancelled => return Ok(()),
+                },
+            };
             shelbi_tui::run_main(&project).context("launching shelbi")
         }
         Some(Cmd::Spawn(args)) => commands::spawn::run(cli.project, args),
