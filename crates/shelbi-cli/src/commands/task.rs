@@ -43,6 +43,18 @@ pub enum TaskCmd {
     },
     /// Clear a task's worker assignment.
     Unassign { id: String },
+    /// Launch the assigned worker on this task: ensure the worktree is on
+    /// the task's branch, kill any existing worker pane (clears context),
+    /// start the runner with the task's prompt. Moves the task into
+    /// `in_progress`. Pass `--worker` to assign at the same time.
+    Start {
+        id: String,
+        #[arg(long, value_name = "WORKER")]
+        worker: Option<String>,
+        /// Override the default branch name (`shelbi/<task-id>`).
+        #[arg(long)]
+        branch: Option<String>,
+    },
     /// Re-order a task within its column.
     Prio(PrioArgs),
     /// Open the task file in `$EDITOR`.
@@ -96,6 +108,7 @@ pub fn run(project_opt: Option<String>, cmd: TaskCmd) -> Result<()> {
         TaskCmd::Move { id, to } => move_to(&project, &id, &to),
         TaskCmd::Assign { id, to } => assign(&project, &id, &to),
         TaskCmd::Unassign { id } => unassign(&project, &id),
+        TaskCmd::Start { id, worker, branch } => start(&project, &id, worker.as_deref(), branch.as_deref()),
         TaskCmd::Prio(args) => prio(&project, args),
         TaskCmd::Edit { id } => edit(&project, &id),
         TaskCmd::Rm { id } => rm(&project, &id),
@@ -244,6 +257,94 @@ fn prio(project: &str, args: PrioArgs) -> Result<()> {
     shelbi_state::set_task_priority(project, &args.id, new_pos as u32)
         .map_err(|e| anyhow!(e))?;
     println!("✓ {} now at slot {new_pos} in {}", args.id, tf.task.column);
+    Ok(())
+}
+
+fn start(
+    project: &str,
+    id: &str,
+    worker_arg: Option<&str>,
+    branch_arg: Option<&str>,
+) -> Result<()> {
+    let project_yaml = shelbi_state::load_project(project).map_err(|e| anyhow!(e))?;
+    let mut tf = shelbi_state::load_task(project, id).map_err(|e| anyhow!(e))?;
+
+    // Resolve worker: explicit --worker wins; otherwise reuse task.assigned_to.
+    let worker_name = worker_arg
+        .map(str::to_string)
+        .or_else(|| tf.task.assigned_to.clone())
+        .ok_or_else(|| {
+            anyhow!(
+                "task `{id}` has no assigned worker — pass `--worker NAME` or run \
+                 `shelbi task assign {id} --to <worker>` first"
+            )
+        })?;
+    let worker = project_yaml.worker(&worker_name).ok_or_else(|| {
+        anyhow!(
+            "worker `{worker_name}` not declared in project `{project}` (known: {})",
+            project_yaml
+                .workers
+                .iter()
+                .map(|w| w.name.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        )
+    })?;
+
+    // Refuse to clobber another in-flight task on the same worker. Pulling
+    // a worker off mid-task is intentional — make the user do it explicitly
+    // via `task move <other> --to todo` first.
+    let conflict = shelbi_state::list_column(project, Column::InProgress)
+        .map_err(|e| anyhow!(e))?
+        .into_iter()
+        .find(|tf| {
+            tf.task.assigned_to.as_deref() == Some(worker_name.as_str()) && tf.task.id != id
+        });
+    if let Some(other) = conflict {
+        bail!(
+            "worker `{worker_name}` is already on task `{}` (in_progress) — \
+             move it to another column first",
+            other.task.id
+        );
+    }
+
+    let branch = branch_arg
+        .map(str::to_string)
+        .or_else(|| tf.task.branch.clone())
+        .unwrap_or_else(|| format!("shelbi/{id}"));
+
+    println!("→ launching {worker_name} on {id} (branch: {branch})");
+    let addr = shelbi_orchestrator::worker::start_worker_on_task(
+        shelbi_orchestrator::worker::StartSpec {
+            project: &project_yaml,
+            worker,
+            task_id: id,
+            branch: &branch,
+            task_body: &tf.body,
+        },
+    )
+    .map_err(|e| anyhow!(e))?;
+
+    // Persist task state. Move to in_progress before saving so the
+    // assigned_to/branch land alongside the column change in a single write.
+    let now = Utc::now();
+    tf.task.assigned_to = Some(worker_name.clone());
+    tf.task.branch = Some(branch.clone());
+    tf.task.updated_at = now;
+    let prev_column = tf.task.column;
+    if prev_column != Column::InProgress {
+        let new_priority = shelbi_state::list_column(project, Column::InProgress)
+            .map_err(|e| anyhow!(e))?
+            .len() as u32;
+        tf.task.column = Column::InProgress;
+        tf.task.priority = new_priority;
+    }
+    shelbi_state::save_task(project, &tf.task, &tf.body).map_err(|e| anyhow!(e))?;
+    if prev_column != Column::InProgress {
+        shelbi_state::renumber_column(project, prev_column).map_err(|e| anyhow!(e))?;
+    }
+
+    println!("✓ {id} → in_progress on {worker_name} ({})", addr.target());
     Ok(())
 }
 

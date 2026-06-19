@@ -16,6 +16,8 @@
 
 use shelbi_core::{Error, MachineKind, Result, TmuxAddr};
 
+pub mod worker;
+
 pub const DEFAULT_SYSTEM_PROMPT: &str = include_str!("default_orchestrator.md");
 
 /// Outcome of `ensure_dashboard`.
