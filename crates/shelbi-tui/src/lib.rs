@@ -25,10 +25,12 @@ use ratatui::{backend::CrosstermBackend, Terminal};
 
 mod app;
 mod kanban;
+mod review;
 mod sidebar;
 
 pub use app::{App, View};
 pub use kanban::KanbanApp;
+pub use review::ReviewApp;
 
 /// Set up the project's tmux session and attach to it. If we're already
 /// inside a tmux client, use `switch-client` instead of `attach` (tmux
@@ -90,6 +92,20 @@ pub fn run_tasks(project_name: &str) -> Result<()> {
     app.refresh();
 
     let result = tasks_loop(&mut term, &mut app);
+
+    restore_terminal(&mut term).context("restoring terminal")?;
+    result
+}
+
+/// Run the review-queue ratatui view in the current pane. Hosted in the
+/// hidden stash session and swapped in by the palette / sidebar — same
+/// lifecycle as `run_tasks`.
+pub fn run_review(project_name: &str) -> Result<()> {
+    let mut term = setup_terminal().context("setting up terminal")?;
+    let mut app = ReviewApp::new(project_name);
+    app.refresh();
+
+    let result = review_loop(&mut term, &mut app);
 
     restore_terminal(&mut term).context("restoring terminal")?;
     result
@@ -176,6 +192,45 @@ fn tasks_loop<B: ratatui::backend::Backend>(
                 handle_kanban_key(app, k.code, k.modifiers);
             }
         }
+    }
+}
+
+fn review_loop<B: ratatui::backend::Backend>(
+    term: &mut Terminal<B>,
+    app: &mut ReviewApp,
+) -> Result<()> {
+    loop {
+        app.maybe_refresh();
+        term.draw(|f| review::render_full(f, app, f.area()))?;
+        if event::poll(Duration::from_millis(200))? {
+            if let Event::Key(k) = event::read()? {
+                if k.kind != KeyEventKind::Press {
+                    continue;
+                }
+                // Ctrl+C exits — the parent shell loop will respawn us.
+                if k.modifiers.contains(KeyModifiers::CONTROL)
+                    && matches!(k.code, KeyCode::Char('c'))
+                {
+                    return Ok(());
+                }
+                handle_review_key(app, k.code);
+            }
+        }
+    }
+}
+
+fn handle_review_key(app: &mut ReviewApp, code: KeyCode) {
+    match code {
+        KeyCode::Up | KeyCode::Char('k') => app.nav_up(),
+        KeyCode::Down | KeyCode::Char('j') => app.nav_down(),
+        KeyCode::Char('K') => app.scroll_body_up(),
+        KeyCode::Char('J') => app.scroll_body_down(),
+        KeyCode::PageUp | KeyCode::Char('u') => app.scroll_body_page_up(),
+        KeyCode::PageDown | KeyCode::Char('d') => app.scroll_body_page_down(),
+        KeyCode::Char('g') | KeyCode::Home => app.scroll_body_home(),
+        KeyCode::Enter | KeyCode::Char(' ') => app.activate_selection(),
+        KeyCode::Char('r') => app.refresh(),
+        _ => {}
     }
 }
 

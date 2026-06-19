@@ -282,23 +282,22 @@ fn create_hidden_views(
 
     let bin = shelbi_agent::shell_escape(shelbi_bin);
     let proj = shelbi_agent::shell_escape(project_name);
-    // Tasks is a real ratatui Kanban (`shelbi __tasks <p>`). Wrap in a
-    // `while true` loop so an accidental crash or Ctrl-C respawns the TUI
-    // instead of leaving the stash pane empty — palette swap-pane assumes
-    // the pane id stays alive.
+    // Tasks + review are real ratatui apps (`shelbi __tasks <p>`,
+    // `shelbi __review <p>`). Wrap each in a `while true` loop so an
+    // accidental crash or Ctrl-C respawns the TUI instead of leaving the
+    // stash pane empty — palette swap-pane assumes the pane id stays alive.
     let tasks_cmd = format!(
         "while true; do {bin} __tasks {proj}; sleep 1; done",
         bin = bin,
         proj = proj,
     );
-    // Review + machines stay as simple printf loops until their views grow
-    // their own ratatui apps (Phase D will replace `review`).
     let review_cmd = format!(
-        "while true; do printf '\\033c'; echo 'review · {proj_label}'; echo; {bin} --project {proj} list | grep -E '^(✓|◐)' || echo '(no agents waiting for review)'; sleep 2; done",
+        "while true; do {bin} __review {proj}; sleep 1; done",
         bin = bin,
         proj = proj,
-        proj_label = project_name,
     );
+    // Machines is still a simple printf loop until its view grows its own
+    // ratatui app.
     let machines_cmd = format!(
         "while true; do printf '\\033c'; echo 'machines · {proj_label}'; echo; cat ~/.shelbi/projects/{proj_label}.yaml 2>/dev/null | sed -n '/^machines:/,/^[a-z]/p' | sed '$d'; sleep 5; done",
         proj_label = project_name,
