@@ -53,6 +53,29 @@ pub fn worker_settings_template_path(project: &Project) -> Result<PathBuf> {
     Ok(project_dir(&project.name)?.join("worker-settings.json"))
 }
 
+/// Render the worker settings JSON for `project`: read the template file
+/// resolved by [`worker_settings_template_path`] (falling back to
+/// [`DEFAULT_WORKER_SETTINGS_TEMPLATE`] when the file is missing — a fresh
+/// project that hasn't run `shelbi init --project` yet) and substitute
+/// `{{worker_permissions_mode}}` with `project.worker_permissions_mode`.
+/// The model documents `auto` as a shelbi-level alias for claude's
+/// `acceptEdits`, mapped here at render time.
+pub fn render_worker_settings(project: &Project) -> Result<String> {
+    let path = worker_settings_template_path(project)?;
+    let template = match fs::read_to_string(&path) {
+        Ok(s) => s,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            DEFAULT_WORKER_SETTINGS_TEMPLATE.to_string()
+        }
+        Err(e) => return Err(shelbi_core::Error::Io(e)),
+    };
+    let mode = match project.worker_permissions_mode.as_str() {
+        "auto" => "acceptEdits",
+        other => other,
+    };
+    Ok(template.replace("{{worker_permissions_mode}}", mode))
+}
+
 fn expand_tilde(p: &Path) -> PathBuf {
     if let Some(rest) = p.to_str().and_then(|s| s.strip_prefix("~/")) {
         if let Some(home) = dirs::home_dir() {
@@ -423,6 +446,52 @@ mod tests {
         let path = worker_settings_template_path(&p).unwrap();
         let expected = dirs::home_dir().unwrap().join("custom/p.json");
         assert_eq!(path, expected);
+    }
+
+    #[test]
+    fn render_worker_settings_uses_embedded_default_when_file_missing() {
+        let _g = TEST_LOCK.lock().unwrap();
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+        // No file at ~/.shelbi/projects/myapp/worker-settings.json yet.
+        let p = fixture_project("myapp", None);
+        let rendered = render_worker_settings(&p).unwrap();
+        // `auto` is mapped to `acceptEdits`.
+        assert!(rendered.contains("\"defaultMode\": \"acceptEdits\""));
+        assert!(!rendered.contains("{{worker_permissions_mode}}"));
+        let _: serde_json::Value = serde_json::from_str(&rendered).unwrap();
+        std::env::remove_var("SHELBI_HOME");
+    }
+
+    #[test]
+    fn render_worker_settings_reads_project_template_when_present() {
+        let _g = TEST_LOCK.lock().unwrap();
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+        let p = fixture_project("myapp", None);
+        let tpl_path = worker_settings_template_path(&p).unwrap();
+        ensure_dir(tpl_path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &tpl_path,
+            r#"{"permissions":{"defaultMode":"{{worker_permissions_mode}}"},"custom":true}"#,
+        )
+        .unwrap();
+        let rendered = render_worker_settings(&p).unwrap();
+        assert!(rendered.contains("\"custom\":true"));
+        assert!(rendered.contains("\"defaultMode\":\"acceptEdits\""));
+        std::env::remove_var("SHELBI_HOME");
+    }
+
+    #[test]
+    fn render_worker_settings_passes_through_explicit_modes() {
+        let _g = TEST_LOCK.lock().unwrap();
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+        let mut p = fixture_project("myapp", None);
+        p.worker_permissions_mode = "bypassPermissions".into();
+        let rendered = render_worker_settings(&p).unwrap();
+        assert!(rendered.contains("\"defaultMode\": \"bypassPermissions\""));
+        std::env::remove_var("SHELBI_HOME");
     }
 
     #[test]

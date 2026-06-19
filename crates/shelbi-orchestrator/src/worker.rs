@@ -123,11 +123,18 @@ pub fn start_worker_on_task(spec: StartSpec<'_>) -> Result<TmuxAddr> {
         &spec.project.default_branch,
     )?;
 
-    // 2. Reset the tmux pane — that's how we clear context. If it doesn't
+    // 2. Drop a rendered .claude/settings.json into the worktree so the
+    //    runner picks up shelbi's window-title hooks (idle/working/blocked).
+    //    Overwrite is fine — this is the entire on-worker footprint and we
+    //    re-render it on every task start.
+    let rendered = shelbi_state::render_worker_settings(spec.project)?;
+    deploy_worker_settings(&host, &worktree, &rendered)?;
+
+    // 3. Reset the tmux pane — that's how we clear context. If it doesn't
     //    exist yet, this is a no-op; otherwise the next step recreates it.
     kill_worker_pane(&host, &addr)?;
 
-    // 3. Create the pane. Start with an interactive shell (no `-c <cmd>`)
+    // 4. Create the pane. Start with an interactive shell (no `-c <cmd>`)
     //    so the user's rc files run and the pane outlives the agent
     //    process. Local = window in the project session; remote = its own
     //    session so the worker survives an SSH drop.
@@ -144,7 +151,7 @@ pub fn start_worker_on_task(spec: StartSpec<'_>) -> Result<TmuxAddr> {
         }
     }
 
-    // 4. cd into the worktree and launch the agent. No `exec` — when the
+    // 5. cd into the worktree and launch the agent. No `exec` — when the
     //    agent exits, the shell stays so the worker pane is reusable.
     let launch = shelbi_agent::launch_command(&runner);
     let cd_launch = format!(
@@ -153,13 +160,90 @@ pub fn start_worker_on_task(spec: StartSpec<'_>) -> Result<TmuxAddr> {
     );
     shelbi_tmux::send_line(&host, &addr, &cd_launch)?;
 
-    // 5. Let the agent's TTY settle before we type into it (same reason as
+    // 6. Let the agent's TTY settle before we type into it (same reason as
     //    spawn — banners + prompt redraws can swallow the first chars).
     std::thread::sleep(std::time::Duration::from_millis(1500));
     let prompt = compose_prompt(spec.task_id, spec.branch, spec.task_body);
     shelbi_tmux::send_line(&host, &addr, &prompt)?;
 
     Ok(addr)
+}
+
+/// Write the rendered worker `settings.json` to `<worktree>/.claude/` on
+/// `host`. Local hosts get a direct filesystem write; remote hosts get an
+/// `ssh mkdir -p` followed by `scp` of the rendered file. The worker
+/// machine never executes any shelbi code — this file is the whole
+/// on-worker footprint.
+pub fn deploy_worker_settings(
+    host: &Host,
+    worktree: &std::path::Path,
+    rendered: &str,
+) -> Result<()> {
+    let claude_dir = worktree.join(".claude");
+    let settings_path = claude_dir.join("settings.json");
+    match host {
+        Host::Local => {
+            std::fs::create_dir_all(&claude_dir).map_err(Error::Io)?;
+            std::fs::write(&settings_path, rendered).map_err(Error::Io)?;
+            Ok(())
+        }
+        Host::Ssh { host: ssh_host } => scp_settings_to_remote(
+            ssh_host,
+            &claude_dir.to_string_lossy(),
+            &settings_path.to_string_lossy(),
+            rendered,
+        ),
+    }
+}
+
+fn scp_settings_to_remote(
+    ssh_host: &str,
+    remote_dir: &str,
+    remote_path: &str,
+    rendered: &str,
+) -> Result<()> {
+    // 1. Ensure the .claude/ dir exists on the remote.
+    let mkdir = shelbi_ssh::run(
+        &Host::Ssh { host: ssh_host.to_string() },
+        ["mkdir", "-p", remote_dir],
+    )
+    .map_err(Error::Io)?;
+    if !mkdir.status.success() {
+        return Err(Error::Command {
+            cmd: format!("ssh {ssh_host} mkdir -p {remote_dir}"),
+            status: mkdir.status.to_string(),
+            stderr: String::from_utf8_lossy(&mkdir.stderr).into_owned(),
+        });
+    }
+
+    // 2. Stage the rendered template in a local tempfile, then scp it. The
+    //    tempfile is in $TMPDIR so the local FS handles cleanup if we crash
+    //    before unlinking it.
+    let tmp_path = std::env::temp_dir().join(format!(
+        "shelbi-worker-settings-{}-{}.json",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0),
+    ));
+    std::fs::write(&tmp_path, rendered).map_err(Error::Io)?;
+
+    let dest = format!("{ssh_host}:{remote_path}");
+    let mut cmd = std::process::Command::new("scp");
+    // -q quiets scp's progress chatter; -B disables interactive prompts
+    // (we expect keys via ssh-agent).
+    cmd.arg("-q").arg("-B").arg(&tmp_path).arg(&dest);
+    let out = cmd.output().map_err(Error::Io)?;
+    let _ = std::fs::remove_file(&tmp_path);
+    if !out.status.success() {
+        return Err(Error::Command {
+            cmd: format!("scp {} {dest}", tmp_path.display()),
+            status: out.status.to_string(),
+            stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
+        });
+    }
+    Ok(())
 }
 
 /// Build the initial prompt: the task body + the loop-closing instruction
@@ -370,5 +454,34 @@ mod tests {
         assert!(prompt.contains("fix-login"));
         assert!(prompt.contains("shelbi/fix-login"));
         assert!(prompt.contains("shelbi task move fix-login --to review"));
+    }
+
+    #[test]
+    fn deploy_worker_settings_writes_local_file_and_creates_dir() {
+        let tmp = std::env::temp_dir().join(format!(
+            "shelbi-deploy-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let worktree = tmp.join("wt");
+        std::fs::create_dir_all(&worktree).unwrap();
+        let rendered = r#"{"permissions":{"defaultMode":"acceptEdits"}}"#;
+
+        deploy_worker_settings(&Host::Local, &worktree, rendered).unwrap();
+
+        let settings = worktree.join(".claude/settings.json");
+        let actual = std::fs::read_to_string(&settings).unwrap();
+        assert_eq!(actual, rendered);
+
+        // Idempotent: a second call overwrites without error.
+        let updated = r#"{"permissions":{"defaultMode":"plan"}}"#;
+        deploy_worker_settings(&Host::Local, &worktree, updated).unwrap();
+        let actual2 = std::fs::read_to_string(&settings).unwrap();
+        assert_eq!(actual2, updated);
+
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 }
