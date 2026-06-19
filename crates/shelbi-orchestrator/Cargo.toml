@@ -14,3 +14,6 @@ shelbi-state = { workspace = true }
 shelbi-tmux = { workspace = true }
 shelbi-ssh = { workspace = true }
 shelbi-agent = { workspace = true }
+
+[dev-dependencies]
+chrono = { workspace = true }

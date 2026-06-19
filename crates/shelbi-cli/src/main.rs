@@ -69,6 +69,9 @@ enum Cmd {
         #[command(subcommand)]
         cmd: commands::worker::WorkerCmd,
     },
+    /// Check a task's branch into the machine's review work_dir and
+    /// (re)launch a fresh review-claude pane there.
+    Review(commands::review::Args),
     /// Attach the terminal to a worker's tmux pane.
     Attach { id: String },
     /// Scaffold ~/.shelbi/ and (optionally) a starter project YAML.
@@ -115,6 +118,7 @@ fn main() -> Result<()> {
         Some(Cmd::Archive { id }) => commands::archive::run(cli.project, id),
         Some(Cmd::Task { cmd }) => commands::task::run(cli.project, cmd),
         Some(Cmd::Worker { cmd }) => commands::worker::run(cli.project, cmd),
+        Some(Cmd::Review(args)) => commands::review::run(cli.project, args),
         Some(Cmd::Attach { id }) => commands::attach::run(cli.project, id),
         Some(Cmd::Init(args)) => commands::init::run(args),
         Some(Cmd::Orchestrate(args)) => commands::orchestrate::run(cli.project, args),

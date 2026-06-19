@@ -1,7 +1,8 @@
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
-use shelbi_core::{Agent, Status};
+use shelbi_core::{Agent, Column, Status};
+use shelbi_state::TaskFile;
 
 /// What's currently highlighted in the sidebar — drives selection logic
 /// only; the right pane (orchestrator / agent) is a real tmux pane, not
@@ -13,11 +14,15 @@ pub enum View {
     Builtin(&'static str), // "orch" | "tasks" | "review" | "machines"
     /// A specific worker agent — switch tmux to its window.
     Agent(String),
+    /// A task in the review queue — trigger the review checkout flow and
+    /// focus the review pane.
+    ReviewTask(String),
 }
 
 pub struct App {
     pub project_name: String,
     pub agents: Vec<Agent>,
+    pub review_queue: Vec<TaskFile>,
     pub sidebar_index: usize,
     pub last_refresh: Instant,
     pub status_line: String,
@@ -29,6 +34,7 @@ impl App {
         Self {
             project_name: project_name.into(),
             agents: Vec::new(),
+            review_queue: Vec::new(),
             sidebar_index: 0,
             last_refresh: Instant::now() - Duration::from_secs(60),
             status_line: String::new(),
@@ -36,8 +42,8 @@ impl App {
         }
     }
 
-    /// Sidebar rows: built-in views first, then a separator, then each
-    /// active worker.
+    /// Sidebar rows: built-in views, review queue (one per task awaiting
+    /// review), then any spawned worker agents (legacy / shelbi spawn).
     pub fn rows(&self) -> Vec<Row> {
         let mut rows = vec![
             Row {
@@ -55,7 +61,11 @@ impl App {
             Row {
                 label: "review".into(),
                 view: View::Builtin("review"),
-                badge: None,
+                badge: if self.review_queue.is_empty() {
+                    None
+                } else {
+                    Some(format!("{}", self.review_queue.len()))
+                },
                 status: None,
             },
             Row {
@@ -65,6 +75,14 @@ impl App {
                 status: None,
             },
         ];
+        for tf in &self.review_queue {
+            rows.push(Row {
+                label: tf.task.title.clone(),
+                view: View::ReviewTask(tf.task.id.clone()),
+                badge: tf.task.assigned_to.clone(),
+                status: None,
+            });
+        }
         for a in &self.agents {
             rows.push(Row {
                 label: a.id.clone(),
@@ -78,6 +96,8 @@ impl App {
 
     pub fn refresh(&mut self) -> Result<()> {
         self.agents = load_agents(&self.project_name).unwrap_or_default();
+        self.review_queue =
+            shelbi_state::list_column(&self.project_name, Column::Review).unwrap_or_default();
         self.last_refresh = Instant::now();
         Ok(())
     }
@@ -135,7 +155,30 @@ impl App {
                     self.status_line = format!("▶ {id}");
                 }
             }
+            View::ReviewTask(id) => match self.start_review(id) {
+                Ok(focus_target) => {
+                    let _ = run_tmux(["select-window", "-t", &focus_target]);
+                    self.status_line = format!("▶ reviewing {id}");
+                }
+                Err(e) => self.status_line = format!("review `{id}` failed: {e}"),
+            },
         }
+    }
+
+    fn start_review(&self, id: &str) -> Result<String> {
+        let project = shelbi_state::load_project(&self.project_name)?;
+        let tf = shelbi_state::load_task(&self.project_name, id)?;
+        let machine =
+            shelbi_orchestrator::review::resolve_review_machine(&project, &tf.task, None)?;
+        let addr = shelbi_orchestrator::review::start_review(
+            shelbi_orchestrator::review::ReviewSpec {
+                project: &project,
+                machine,
+                task: &tf.task,
+                task_body: &tf.body,
+            },
+        )?;
+        Ok(addr.target())
     }
 }
 
