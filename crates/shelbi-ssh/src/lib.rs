@@ -6,7 +6,8 @@
 //! ProxyJump, etc. to "just work" — and we want one less thing to maintain.
 
 use std::ffi::OsStr;
-use std::process::{Command, Output};
+use std::io::Write;
+use std::process::{Command, Output, Stdio};
 
 use shelbi_core::Host;
 
@@ -108,6 +109,49 @@ where
     Ok(String::from_utf8_lossy(&output.stdout).into_owned())
 }
 
+/// Run a command with `stdin` piped in. Used to ferry payloads with
+/// embedded newlines (e.g. `tmux load-buffer -`) without smuggling them
+/// through argv, where the SSH wire would join args with single spaces
+/// and the remote shell would re-parse newlines as command separators.
+pub fn run_with_stdin<I, S>(host: &Host, argv: I, stdin: &[u8]) -> shelbi_core::Result<String>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<OsStr>,
+{
+    let argv: Vec<_> = argv.into_iter().collect();
+    let cmd_str = argv
+        .iter()
+        .map(|a| a.as_ref().to_string_lossy().into_owned())
+        .collect::<Vec<_>>()
+        .join(" ");
+
+    let mut cmd = build_command(host, &argv);
+    cmd.stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    tracing::debug!(?cmd, host = ?host, bytes = stdin.len(), "ssh::run_with_stdin");
+
+    let mut child = cmd.spawn().map_err(shelbi_core::Error::Io)?;
+    {
+        let mut child_stdin = child
+            .stdin
+            .take()
+            .expect("stdin was piped");
+        child_stdin
+            .write_all(stdin)
+            .map_err(shelbi_core::Error::Io)?;
+    }
+    let output = child.wait_with_output().map_err(shelbi_core::Error::Io)?;
+    if !output.status.success() {
+        return Err(shelbi_core::Error::Command {
+            cmd: cmd_str,
+            status: output.status.to_string(),
+            stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+        });
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -159,5 +203,15 @@ mod tests {
         let out = run(&Host::Local, ["echo", "shelbi"]).expect("echo failed");
         assert!(out.status.success());
         assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "shelbi");
+    }
+
+    #[test]
+    fn run_with_stdin_pipes_payload_locally() {
+        // `cat` echoes stdin to stdout — round-trips embedded newlines so
+        // we know multi-line payloads survive the pipe end-to-end.
+        let payload = "line one\nline two\nline three";
+        let out = run_with_stdin(&Host::Local, ["cat"], payload.as_bytes())
+            .expect("cat failed");
+        assert_eq!(out, payload);
     }
 }

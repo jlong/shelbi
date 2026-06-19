@@ -68,17 +68,50 @@ pub fn kill_window(host: &Host, addr: &TmuxAddr) -> Result<()> {
     Ok(())
 }
 
-/// Send a literal string to the target's keyboard input, followed by Enter.
+/// Buffer name used by [`send_line`] when routing multi-line payloads
+/// through tmux's paste buffer. Namespaced so we don't collide with the
+/// user's own buffers.
+const PASTE_BUFFER: &str = "shelbi-send";
+
+/// Send a string to the target's keyboard input, followed by Enter.
 ///
-/// The string is sent with `-l` so tmux treats it as literal characters,
-/// avoiding key-name expansion (e.g. `C-c`). Enter is sent as a separate
-/// `Enter` keysym.
+/// For single-line text we use `send-keys -l` so tmux treats it as
+/// literal characters (avoiding key-name expansion like `C-c`) and Enter
+/// is sent as a separate `Enter` keysym.
+///
+/// For multi-line text we instead stage the payload in a tmux paste
+/// buffer and replay it with `paste-buffer -p`. `-p` wraps the content
+/// in bracketed-paste markers so the receiving app (e.g. Claude) sees
+/// one atomic paste rather than N individual Enter keypresses — which
+/// matters over SSH, where send-key Enters arrive spaced out far enough
+/// to defeat any heuristic paste detection. We also pipe the payload to
+/// `load-buffer -` via stdin so embedded newlines don't get re-parsed by
+/// the remote shell when ssh joins argv with single spaces.
 pub fn send_line(host: &Host, addr: &TmuxAddr, text: &str) -> Result<()> {
-    shelbi_ssh::run_capture(
-        host,
-        ["tmux", "send-keys", "-t", &addr.target(), "-l", text],
-    )?;
-    shelbi_ssh::run_capture(host, ["tmux", "send-keys", "-t", &addr.target(), "Enter"])?;
+    let target = addr.target();
+    if text.contains('\n') {
+        shelbi_ssh::run_with_stdin(
+            host,
+            ["tmux", "load-buffer", "-b", PASTE_BUFFER, "-"],
+            text.as_bytes(),
+        )?;
+        shelbi_ssh::run_capture(
+            host,
+            [
+                "tmux",
+                "paste-buffer",
+                "-p",
+                "-d",
+                "-b",
+                PASTE_BUFFER,
+                "-t",
+                &target,
+            ],
+        )?;
+    } else {
+        shelbi_ssh::run_capture(host, ["tmux", "send-keys", "-t", &target, "-l", text])?;
+    }
+    shelbi_ssh::run_capture(host, ["tmux", "send-keys", "-t", &target, "Enter"])?;
     Ok(())
 }
 
@@ -218,6 +251,65 @@ mod tests {
                 "-n",
                 "agent",
                 "cd /work/myapp/.shelbi/wt/fix-login && claude",
+            ]
+        );
+    }
+
+    #[test]
+    fn local_paste_buffer_argv() {
+        // Multi-line payloads use `paste-buffer -p` so bracketed-paste
+        // mode wraps the content and the receiving app treats it as one
+        // atomic paste rather than N Enter keypresses.
+        let cmd = shelbi_ssh::build_command(
+            &Host::Local,
+            [
+                "tmux",
+                "paste-buffer",
+                "-p",
+                "-d",
+                "-b",
+                PASTE_BUFFER,
+                "-t",
+                "shelbi-myapp:w-x",
+            ],
+        );
+        assert_eq!(
+            ssh_args(cmd),
+            vec![
+                "tmux",
+                "paste-buffer",
+                "-p",
+                "-d",
+                "-b",
+                "shelbi-send",
+                "-t",
+                "shelbi-myapp:w-x",
+            ]
+        );
+    }
+
+    #[test]
+    fn remote_load_buffer_argv() {
+        // The payload itself is piped via stdin to `load-buffer -`, not
+        // smuggled through argv — so this asserts only the command shape
+        // and verifies `-` is the last positional (it reads from stdin).
+        let cmd = shelbi_ssh::build_command(
+            &Host::Ssh {
+                host: "m2.local".into(),
+            },
+            ["tmux", "load-buffer", "-b", PASTE_BUFFER, "-"],
+        );
+        assert_eq!(
+            ssh_args(cmd),
+            vec![
+                "ssh",
+                "m2.local",
+                "--",
+                "tmux",
+                "load-buffer",
+                "-b",
+                "shelbi-send",
+                "-",
             ]
         );
     }
