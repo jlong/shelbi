@@ -1,6 +1,7 @@
 pub mod archive;
 pub mod attach;
 pub mod diff;
+pub mod events;
 pub mod init;
 pub mod list;
 pub mod merge;

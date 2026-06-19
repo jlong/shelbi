@@ -69,6 +69,11 @@ enum Cmd {
         #[command(subcommand)]
         cmd: commands::worker::WorkerCmd,
     },
+    /// Inspect the hub-global worker-state transition log.
+    Events {
+        #[command(subcommand)]
+        cmd: commands::events::EventsCmd,
+    },
     /// Check a task's branch into the machine's review work_dir and
     /// (re)launch a fresh review-claude pane there.
     Review(commands::review::Args),
@@ -128,6 +133,7 @@ fn main() -> Result<()> {
         Some(Cmd::Archive { id }) => commands::archive::run(cli.project, id),
         Some(Cmd::Task { cmd }) => commands::task::run(cli.project, cmd),
         Some(Cmd::Worker { cmd }) => commands::worker::run(cli.project, cmd),
+        Some(Cmd::Events { cmd }) => commands::events::run(cmd),
         Some(Cmd::Review(args)) => commands::review::run(cli.project, args),
         Some(Cmd::Attach { id }) => commands::attach::run(cli.project, id),
         Some(Cmd::Init(args)) => commands::init::run(args),
