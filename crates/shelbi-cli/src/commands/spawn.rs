@@ -121,12 +121,31 @@ pub fn run(project_opt: Option<String>, args: Args) -> Result<()> {
 
     // 4. Launch the agent in the now-interactive shell. `exec` replaces the
     //    shell so the window closes naturally when the agent exits.
+    //
+    //    Local: tmux server inherits the user's already-set-up login env
+    //    (since they ran shelbi from a terminal), so a plain `exec` finds
+    //    everything the user has on PATH.
+    //
+    //    Remote: tmux server was started by `ssh host -- tmux new-session …`,
+    //    which runs through a NON-login non-interactive shell — so tmux
+    //    (and every pane it spawns) inherits a stripped-down PATH that's
+    //    missing Homebrew, asdf, nvm, etc. Re-exec through `$SHELL -lc`
+    //    so the login rc files (~/.zprofile, ~/.bash_profile) run and
+    //    we pick up the same PATH the user has in their own terminal.
     let launch_cmd = shelbi_agent::launch_command(&runner_spec);
-    let cd_launch = format!(
-        "cd {} && exec {}",
-        shelbi_agent::shell_escape(&worktree.to_string_lossy()),
-        launch_cmd
-    );
+    let cd_launch = if host.is_local() {
+        format!(
+            "cd {} && exec {}",
+            shelbi_agent::shell_escape(&worktree.to_string_lossy()),
+            launch_cmd
+        )
+    } else {
+        format!(
+            "cd {} && exec \"${{SHELL:-/bin/bash}}\" -lc {}",
+            shelbi_agent::shell_escape(&worktree.to_string_lossy()),
+            shelbi_agent::shell_escape(&launch_cmd),
+        )
+    };
     shelbi_tmux::send_line(&host, &addr, &cd_launch)
         .map_err(|e| anyhow!(e))
         .context("launching agent")?;
