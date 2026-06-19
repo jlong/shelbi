@@ -81,7 +81,7 @@ pub fn run_main(project_name: &str) -> Result<()> {
 
 /// Run the minimal ratatui sidebar in the current pane.
 pub fn run_sidebar(project_name: &str) -> Result<()> {
-    let mut term = setup_sidebar_terminal().context("setting up terminal")?;
+    let mut term = setup_terminal().context("setting up terminal")?;
     let mut app = App::new_sidebar(project_name);
     app.refresh().ok();
 
@@ -95,7 +95,7 @@ pub fn run_sidebar(project_name: &str) -> Result<()> {
 
     let result = sidebar_loop(&mut term, &mut app);
 
-    restore_sidebar_terminal(&mut term).context("restoring terminal")?;
+    restore_terminal(&mut term).context("restoring terminal")?;
     result
 }
 
@@ -128,33 +128,18 @@ pub fn run_review(project_name: &str) -> Result<()> {
     result
 }
 
+/// Enter raw mode + alt screen + mouse capture. Tmux only forwards mouse
+/// events to the pane when its `mouse` option is on — `ensure_dashboard`
+/// sets it on shelbi sessions, so callers don't need to plumb anything.
+/// Views that don't care about mouse just ignore the events.
 fn setup_terminal() -> Result<Terminal<CrosstermBackend<io::Stdout>>> {
-    enable_raw_mode()?;
-    let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen)?;
-    Ok(Terminal::new(CrosstermBackend::new(stdout))?)
-}
-
-fn restore_terminal<B: ratatui::backend::Backend + std::io::Write>(
-    term: &mut Terminal<B>,
-) -> Result<()> {
-    disable_raw_mode()?;
-    execute!(term.backend_mut(), LeaveAlternateScreen)?;
-    term.show_cursor()?;
-    Ok(())
-}
-
-/// Same as `setup_terminal` but also enables mouse capture so the sidebar
-/// can react to clicks. Tmux only forwards these to the pane when its
-/// `mouse` option is on — `ensure_dashboard` sets it on shelbi sessions.
-fn setup_sidebar_terminal() -> Result<Terminal<CrosstermBackend<io::Stdout>>> {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
     Ok(Terminal::new(CrosstermBackend::new(stdout))?)
 }
 
-fn restore_sidebar_terminal<B: ratatui::backend::Backend + std::io::Write>(
+fn restore_terminal<B: ratatui::backend::Backend + std::io::Write>(
     term: &mut Terminal<B>,
 ) -> Result<()> {
     disable_raw_mode()?;
@@ -196,17 +181,21 @@ fn tasks_loop<B: ratatui::backend::Backend>(
         app.maybe_refresh();
         term.draw(|f| kanban::render_full(f, app, f.area()))?;
         if event::poll(Duration::from_millis(200))? {
-            if let Event::Key(k) = event::read()? {
-                if k.kind != KeyEventKind::Press {
-                    continue;
+            match event::read()? {
+                Event::Key(k) => {
+                    if k.kind != KeyEventKind::Press {
+                        continue;
+                    }
+                    // Ctrl+C exits — the parent shell loop will respawn us.
+                    if k.modifiers.contains(KeyModifiers::CONTROL)
+                        && matches!(k.code, KeyCode::Char('c'))
+                    {
+                        return Ok(());
+                    }
+                    handle_kanban_key(app, k.code, k.modifiers);
                 }
-                // Ctrl+C exits — the parent shell loop will respawn us.
-                if k.modifiers.contains(KeyModifiers::CONTROL)
-                    && matches!(k.code, KeyCode::Char('c'))
-                {
-                    return Ok(());
-                }
-                handle_kanban_key(app, k.code, k.modifiers);
+                Event::Mouse(m) => handle_kanban_mouse(app, m),
+                _ => {}
             }
         }
     }
@@ -287,6 +276,20 @@ fn handle_kanban_key(app: &mut KanbanApp, code: KeyCode, mods: KeyModifiers) {
         KeyCode::Char('J') => app.reorder_down(),
         KeyCode::Char('r') => app.refresh(),
         _ => {}
+    }
+}
+
+/// Left-click on a card opens its popover — same path as ENTER/SPACE on the
+/// keyboard. Clicks outside any card are a no-op. With the popover open we
+/// ignore clicks entirely; the popover has its own dismiss keys.
+fn handle_kanban_mouse(app: &mut KanbanApp, mouse: MouseEvent) {
+    if app.popover_is_open() {
+        return;
+    }
+    if let MouseEventKind::Down(MouseButton::Left) = mouse.kind {
+        if let Some((col, row)) = app.card_at(mouse.column, mouse.row) {
+            app.open_popover_at(col, row);
+        }
     }
 }
 

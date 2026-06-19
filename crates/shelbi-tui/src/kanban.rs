@@ -33,6 +33,20 @@ pub struct KanbanApp {
     /// Selection underneath stays put so closing the popover returns the
     /// cursor to the same card.
     pub popover: Option<TaskPopover>,
+    /// Screen-space rects for each rendered card cell, written each frame
+    /// by the renderer and read by the mouse-click handler to map a click
+    /// back to a (column, row) pair.
+    pub card_hits: Vec<CardHit>,
+}
+
+/// One rendered card's screen-space rectangle and its column/row index in
+/// the kanban model. Recorded each frame so click handling and keyboard
+/// selection share the same source of truth for which card sits where.
+#[derive(Clone, Copy, Debug)]
+pub struct CardHit {
+    pub area: Rect,
+    pub col_idx: usize,
+    pub row_idx: usize,
 }
 
 /// State for the open task detail popover. We key by task id (not column/row
@@ -53,7 +67,29 @@ impl KanbanApp {
             last_refresh: Instant::now() - Duration::from_secs(60),
             status_line: String::new(),
             popover: None,
+            card_hits: Vec::new(),
         }
+    }
+
+    /// Hit-test a screen coordinate against the most recently rendered cards.
+    /// Returns `(col_idx, row_idx)` for the card under the point, or `None`
+    /// if the click missed every card (including clicks on column headers,
+    /// the footer, or empty space below the last card).
+    pub fn card_at(&self, x: u16, y: u16) -> Option<(usize, usize)> {
+        self.card_hits.iter().find_map(|hit| {
+            let r = hit.area;
+            let in_x = x >= r.x && x < r.x.saturating_add(r.width);
+            let in_y = y >= r.y && y < r.y.saturating_add(r.height);
+            (in_x && in_y).then_some((hit.col_idx, hit.row_idx))
+        })
+    }
+
+    /// Move selection to the given card and open its popover. Used by the
+    /// click handler so it routes through the same path as ENTER/SPACE.
+    pub fn open_popover_at(&mut self, col_idx: usize, row_idx: usize) {
+        self.selected_column = col_idx;
+        self.selected_row = row_idx;
+        self.open_popover();
     }
 
     pub fn popover_is_open(&self) -> bool {
@@ -276,7 +312,7 @@ impl KanbanApp {
 // ---------------------------------------------------------------------------
 // Rendering
 
-pub fn render_full(f: &mut Frame, app: &KanbanApp, area: Rect) {
+pub fn render_full(f: &mut Frame, app: &mut KanbanApp, area: Rect) {
     let outer = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -286,9 +322,11 @@ pub fn render_full(f: &mut Frame, app: &KanbanApp, area: Rect) {
         ])
         .split(area);
 
+    let mut hits: Vec<CardHit> = Vec::new();
     render_title(f, app, outer[0]);
-    render_columns(f, app, outer[1]);
+    render_columns(f, app, &mut hits, outer[1]);
     render_footer(f, app, outer[2]);
+    app.card_hits = hits;
 
     if app.popover_is_open() {
         render_popover(f, app, area);
@@ -314,7 +352,7 @@ fn render_title(f: &mut Frame, app: &KanbanApp, area: Rect) {
     f.render_widget(Paragraph::new(line), area);
 }
 
-fn render_columns(f: &mut Frame, app: &KanbanApp, area: Rect) {
+fn render_columns(f: &mut Frame, app: &KanbanApp, hits: &mut Vec<CardHit>, area: Rect) {
     // Equal-width columns. With 5 columns at 20% each you get good
     // proportions down to ~50 cols wide; below that things squeeze, but
     // ratatui will still render — just less readable.
@@ -325,7 +363,7 @@ fn render_columns(f: &mut Frame, app: &KanbanApp, area: Rect) {
 
     let columns = app.task_columns();
     for (i, slot) in slots.iter().enumerate() {
-        render_column(f, app, i, *slot, &columns);
+        render_column(f, app, i, *slot, &columns, hits);
     }
 }
 
@@ -335,6 +373,7 @@ fn render_column(
     col_idx: usize,
     area: Rect,
     columns: &HashMap<String, Column>,
+    hits: &mut Vec<CardHit>,
 ) {
     let column = app.column(col_idx);
     let tasks = app.column_tasks(col_idx);
@@ -354,6 +393,17 @@ fn render_column(
             Style::default().fg(Color::DarkGray),
         ),
     ]);
+
+    // Manual title/list split — keeps hit-test geometry unambiguous (no
+    // dependence on Block.inner behavior with title + Borders::NONE).
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(1), Constraint::Min(0)])
+        .split(area);
+    let header_area = chunks[0];
+    let list_area = chunks[1];
+
+    f.render_widget(Paragraph::new(title_line), header_area);
 
     // Reserve a 2-char right gutter so adjacent cells don't visually
     // collide; List doesn't clip Line spans on its own.
@@ -421,13 +471,37 @@ fn render_column(
         ))));
     }
 
-    let block = Block::default().borders(Borders::NONE).title(title_line);
     let mut state = ListState::default();
     if focused && !tasks.is_empty() {
         state.select(Some(app.selected_row));
     }
-    let list = List::new(items).block(block);
-    f.render_stateful_widget(list, area, &mut state);
+    let list = List::new(items);
+    f.render_stateful_widget(list, list_area, &mut state);
+
+    // Each card item renders 3 lines (title, meta, blank). Clip the last
+    // card if it overflows the visible list area so clicks far below it
+    // don't count. Scroll offsets aren't tracked here — a long column that
+    // scrolls past its visible area will mis-attribute clicks for any row
+    // off-screen; tolerable until columns regularly exceed visible height.
+    const ROWS_PER_CARD: u16 = 3;
+    let list_bottom = list_area.y.saturating_add(list_area.height);
+    for (row, _) in tasks.iter().enumerate() {
+        let card_top = list_area.y.saturating_add(row as u16 * ROWS_PER_CARD);
+        if card_top >= list_bottom {
+            break;
+        }
+        let card_height = (list_bottom - card_top).min(ROWS_PER_CARD);
+        hits.push(CardHit {
+            area: Rect {
+                x: list_area.x,
+                y: card_top,
+                width: list_area.width,
+                height: card_height,
+            },
+            col_idx,
+            row_idx: row,
+        });
+    }
 }
 
 fn render_footer(f: &mut Frame, app: &KanbanApp, area: Rect) {
@@ -644,4 +718,53 @@ fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
             Constraint::Percentage((100 - percent_x) / 2),
         ])
         .split(vertical[1])[1]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn hit(area: Rect, col_idx: usize, row_idx: usize) -> CardHit {
+        CardHit { area, col_idx, row_idx }
+    }
+
+    #[test]
+    fn card_at_returns_first_matching_hit() {
+        let mut app = KanbanApp::new("demo");
+        app.card_hits = vec![
+            hit(Rect { x: 0, y: 2, width: 20, height: 3 }, 0, 0),
+            hit(Rect { x: 0, y: 5, width: 20, height: 3 }, 0, 1),
+            hit(Rect { x: 20, y: 2, width: 20, height: 3 }, 1, 0),
+        ];
+        assert_eq!(app.card_at(5, 2), Some((0, 0)));
+        assert_eq!(app.card_at(5, 4), Some((0, 0)));   // last row of card
+        assert_eq!(app.card_at(5, 5), Some((0, 1)));   // first row of next card
+        assert_eq!(app.card_at(25, 3), Some((1, 0)));  // adjacent column
+    }
+
+    #[test]
+    fn card_at_misses_outside_any_rect() {
+        let mut app = KanbanApp::new("demo");
+        app.card_hits = vec![hit(Rect { x: 0, y: 2, width: 20, height: 3 }, 0, 0)];
+        // Above the card.
+        assert_eq!(app.card_at(5, 1), None);
+        // Below the card.
+        assert_eq!(app.card_at(5, 5), None);
+        // Right of the card.
+        assert_eq!(app.card_at(20, 3), None);
+        // Empty hit list.
+        app.card_hits.clear();
+        assert_eq!(app.card_at(5, 3), None);
+    }
+
+    #[test]
+    fn open_popover_at_moves_selection_and_opens() {
+        let mut app = KanbanApp::new("demo");
+        // No tasks → open_popover is a no-op even when called via the click
+        // path, so the popover stays closed. Selection still moves.
+        app.open_popover_at(2, 4);
+        assert_eq!(app.selected_column, 2);
+        assert_eq!(app.selected_row, 4);
+        assert!(!app.popover_is_open());
+    }
 }
