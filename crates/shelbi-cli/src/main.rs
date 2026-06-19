@@ -128,21 +128,7 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.cmd {
-        None => {
-            // Resolve the project the same way the CLI commands do —
-            // explicit `--project`, then `.shelbi/project` marker. Falling
-            // through to the picker only when neither resolves keeps the
-            // happy path (one cwd, one marker) prompt-free.
-            let project = match commands::require_project(cli.project.clone()) {
-                Ok(p) => p,
-                Err(_) => match commands::picker::pick_or_setup()? {
-                    commands::picker::PickerOutcome::Existing(p) => p,
-                    commands::picker::PickerOutcome::Created(p) => p,
-                    commands::picker::PickerOutcome::Cancelled => return Ok(()),
-                },
-            };
-            shelbi_tui::run_main(&project).context("launching shelbi")
-        }
+        None => default_entry(cli.project.clone()),
         Some(Cmd::Spawn(args)) => commands::spawn::run(cli.project, args),
         Some(Cmd::List) => commands::list::run(cli.project),
         Some(Cmd::Status { id }) => commands::status::run(cli.project, id),
@@ -158,7 +144,7 @@ fn main() -> Result<()> {
         Some(Cmd::Review(args)) => commands::review::run(cli.project, args),
         Some(Cmd::Attach { id }) => commands::attach::run(cli.project, id),
         Some(Cmd::Init(args)) => commands::init::run(args),
-        Some(Cmd::Wizard) => commands::wizard::run(),
+        Some(Cmd::Wizard) => commands::wizard::run().map(|_| ()),
         Some(Cmd::Orchestrate(args)) => commands::orchestrate::run(cli.project, args),
         Some(Cmd::Reload) => commands::reload::run(cli.project),
         Some(Cmd::Sidebar { project }) => shelbi_tui::run_sidebar(&project).context("sidebar"),
@@ -167,6 +153,59 @@ fn main() -> Result<()> {
         Some(Cmd::Popup) => commands::popup::run(),
         Some(Cmd::Palette { project }) => commands::palette::run(project),
     }
+}
+
+/// `shelbi` with no subcommand. Dispatches based on what's on disk:
+///
+/// - explicit `--project` / `SHELBI_PROJECT` / `.shelbi/project` marker →
+///   boot that project's TUI (this branch is checked first so a marker
+///   always wins over the picker — matches today's behavior).
+/// - `~/.shelbi/` missing OR `~/.shelbi/projects/` empty → onboarding
+///   wizard. After it completes, if exactly one project now exists boot
+///   it directly; otherwise print a hint and exit.
+/// - exactly one project YAML → boot it.
+/// - two or more → project picker.
+fn default_entry(explicit: Option<String>) -> Result<()> {
+    if let Ok(p) = commands::require_project(explicit) {
+        return shelbi_tui::run_main(&p).context("launching shelbi");
+    }
+
+    let home = shelbi_state::shelbi_home().map_err(|e| anyhow::anyhow!(e))?;
+    let projects = if home.exists() {
+        shelbi_state::list_projects().map_err(|e| anyhow::anyhow!(e))?
+    } else {
+        Vec::new()
+    };
+
+    if projects.is_empty() {
+        return run_wizard_then_dispatch();
+    }
+    if projects.len() == 1 {
+        return shelbi_tui::run_main(&projects[0].name).context("launching shelbi");
+    }
+    match commands::picker::pick_or_setup()? {
+        commands::picker::PickerOutcome::Existing(p)
+        | commands::picker::PickerOutcome::Created(p) => {
+            shelbi_tui::run_main(&p).context("launching shelbi")
+        }
+        commands::picker::PickerOutcome::Cancelled => Ok(()),
+    }
+}
+
+/// Run the wizard and, if it produced exactly one project, boot directly
+/// into its TUI. Any other end-state (cancelled, zero projects, more than
+/// one) exits cleanly — the user can re-run `shelbi` later.
+fn run_wizard_then_dispatch() -> Result<()> {
+    match commands::wizard::run()? {
+        commands::wizard::WizardOutcome::Cancelled => return Ok(()),
+        commands::wizard::WizardOutcome::Completed => {}
+    }
+    let projects = shelbi_state::list_projects().map_err(|e| anyhow::anyhow!(e))?;
+    if projects.len() == 1 {
+        return shelbi_tui::run_main(&projects[0].name).context("launching shelbi");
+    }
+    println!("Run shelbi to launch, or shelbi project add to add another.");
+    Ok(())
 }
 
 fn init_tracing() {
