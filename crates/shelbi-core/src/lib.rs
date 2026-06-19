@@ -1,5 +1,7 @@
 pub mod error;
 pub mod model;
+pub mod system_memory;
+pub mod worker_names;
 
 pub use error::{Error, Result};
 pub use model::{
@@ -7,3 +9,5 @@ pub use model::{
     MachineKind, OrchestratorSpec, Project, Session, SessionProject, Status, Task, TmuxAddr,
     WorkerSpec,
 };
+pub use system_memory::{format_bytes_short, recommended_worker_count, total_memory_bytes};
+pub use worker_names::WorkerNamePreset;
