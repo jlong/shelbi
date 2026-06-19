@@ -13,7 +13,7 @@ use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, List, ListItem, ListState, Paragraph},
+    widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap},
     Frame,
 };
 use shelbi_core::Column;
@@ -28,6 +28,18 @@ pub struct KanbanApp {
     pub selected_row: usize,
     pub last_refresh: Instant,
     pub status_line: String,
+    /// When `Some`, a modal task detail popover is open for the given task id.
+    /// Selection underneath stays put so closing the popover returns the
+    /// cursor to the same card.
+    pub popover: Option<TaskPopover>,
+}
+
+/// State for the open task detail popover. We key by task id (not column/row
+/// indices) so a background refresh that reorders cards doesn't swap the
+/// popover's contents under the user.
+pub struct TaskPopover {
+    pub task_id: String,
+    pub scroll: u16,
 }
 
 impl KanbanApp {
@@ -39,6 +51,65 @@ impl KanbanApp {
             selected_row: 0,
             last_refresh: Instant::now() - Duration::from_secs(60),
             status_line: String::new(),
+            popover: None,
+        }
+    }
+
+    pub fn popover_is_open(&self) -> bool {
+        self.popover.is_some()
+    }
+
+    /// Look up the task currently shown in the popover, if any. Returns
+    /// `None` if the popover is closed OR if the task has since vanished
+    /// from disk (e.g. deleted by another process between refreshes).
+    pub fn popover_task(&self) -> Option<&TaskFile> {
+        let id = &self.popover.as_ref()?.task_id;
+        self.tasks.iter().find(|tf| &tf.task.id == id)
+    }
+
+    /// Open the popover for the currently selected card. No-op if the
+    /// focused column is empty.
+    pub fn open_popover(&mut self) {
+        let Some(tf) = self.selected_task() else {
+            return;
+        };
+        self.popover = Some(TaskPopover {
+            task_id: tf.task.id.clone(),
+            scroll: 0,
+        });
+    }
+
+    pub fn close_popover(&mut self) {
+        self.popover = None;
+    }
+
+    pub fn popover_scroll_up(&mut self) {
+        if let Some(p) = self.popover.as_mut() {
+            p.scroll = p.scroll.saturating_sub(1);
+        }
+    }
+
+    pub fn popover_scroll_down(&mut self) {
+        if let Some(p) = self.popover.as_mut() {
+            p.scroll = p.scroll.saturating_add(1);
+        }
+    }
+
+    pub fn popover_scroll_page_up(&mut self) {
+        if let Some(p) = self.popover.as_mut() {
+            p.scroll = p.scroll.saturating_sub(10);
+        }
+    }
+
+    pub fn popover_scroll_page_down(&mut self) {
+        if let Some(p) = self.popover.as_mut() {
+            p.scroll = p.scroll.saturating_add(10);
+        }
+    }
+
+    pub fn popover_scroll_home(&mut self) {
+        if let Some(p) = self.popover.as_mut() {
+            p.scroll = 0;
         }
     }
 
@@ -207,6 +278,10 @@ pub fn render_full(f: &mut Frame, app: &KanbanApp, area: Rect) {
     render_title(f, app, outer[0]);
     render_columns(f, app, outer[1]);
     render_footer(f, app, outer[2]);
+
+    if app.popover_is_open() {
+        render_popover(f, app, area);
+    }
 }
 
 fn render_title(f: &mut Frame, app: &KanbanApp, area: Rect) {
@@ -330,7 +405,7 @@ fn render_column(f: &mut Frame, app: &KanbanApp, col_idx: usize, area: Rect) {
 
 fn render_footer(f: &mut Frame, app: &KanbanApp, area: Rect) {
     let keys = Line::from(Span::styled(
-        "  h/l col   j/k row   H/L move col   K/J reorder   r refresh",
+        "  h/l col   j/k row   enter/␣ open   H/L move col   K/J reorder   r refresh",
         Style::default().fg(Color::DarkGray),
     ));
     let status = if app.status_line.is_empty() {
@@ -371,4 +446,145 @@ fn truncate(s: &str, max: usize) -> String {
     let mut out: String = s.chars().take(max.saturating_sub(1)).collect();
     out.push('…');
     out
+}
+
+// ---------------------------------------------------------------------------
+// Task detail popover
+
+fn render_popover(f: &mut Frame, app: &KanbanApp, area: Rect) {
+    let popover_area = centered_rect(80, 80, area);
+
+    // Clear underneath so the kanban columns don't bleed through.
+    f.render_widget(Clear, popover_area);
+
+    let (header_lines, body_text, title) = match app.popover_task() {
+        Some(tf) => (popover_header(tf), tf.body.clone(), tf.task.title.clone()),
+        None => (
+            Vec::new(),
+            "(task no longer exists — press esc to close)".to_string(),
+            "Missing task".to_string(),
+        ),
+    };
+
+    let title_text = truncate(&title, popover_area.width.saturating_sub(4) as usize);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Cyan))
+        .title(Line::from(vec![
+            Span::styled(" ", Style::default()),
+            Span::styled(
+                title_text,
+                Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(" "),
+        ]));
+    let inner = block.inner(popover_area);
+    f.render_widget(block, popover_area);
+
+    // Layout inside the border: header (fixed height) → separator → body
+    // (scrollable) → footer (hint line).
+    let header_height = header_lines.len() as u16;
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(header_height),
+            Constraint::Length(1), // separator
+            Constraint::Min(1),    // body
+            Constraint::Length(1), // hint
+        ])
+        .split(inner);
+
+    if !header_lines.is_empty() {
+        f.render_widget(Paragraph::new(header_lines), chunks[0]);
+    }
+    f.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            "─".repeat(chunks[1].width as usize),
+            Style::default().fg(Color::DarkGray),
+        ))),
+        chunks[1],
+    );
+
+    let scroll = app.popover.as_ref().map(|p| p.scroll).unwrap_or(0);
+    let body = Paragraph::new(body_text)
+        .wrap(Wrap { trim: false })
+        .scroll((scroll, 0));
+    f.render_widget(body, chunks[2]);
+
+    let hint = Line::from(Span::styled(
+        "  esc/enter/␣  close      j/k or ↑/↓  scroll      g  top",
+        Style::default().fg(Color::DarkGray),
+    ));
+    f.render_widget(Paragraph::new(hint), chunks[3]);
+}
+
+fn popover_header(tf: &TaskFile) -> Vec<Line<'static>> {
+    let task = &tf.task;
+    let mut lines: Vec<Line<'static>> = Vec::new();
+
+    lines.push(meta_row("id", &task.id));
+    let col_label = column_label(task.column);
+    let col_span = Span::styled(col_label.to_string(), Style::default().fg(column_color(task.column)));
+    let mut col_line = vec![meta_label("column"), col_span];
+    col_line.push(Span::raw("   "));
+    col_line.push(meta_label("priority"));
+    col_line.push(Span::raw(format!("{}", task.priority)));
+    if let Some(w) = &task.assigned_to {
+        col_line.push(Span::raw("   "));
+        col_line.push(meta_label("worker"));
+        col_line.push(Span::styled(
+            format!("@{w}"),
+            Style::default().fg(Color::Magenta),
+        ));
+    }
+    lines.push(Line::from(col_line));
+
+    if let Some(branch) = &task.branch {
+        lines.push(meta_row("branch", branch));
+    }
+
+    let created = task.created_at.format("%Y-%m-%d %H:%M UTC").to_string();
+    let updated = task.updated_at.format("%Y-%m-%d %H:%M UTC").to_string();
+    lines.push(Line::from(vec![
+        meta_label("created"),
+        Span::raw(created),
+        Span::raw("   "),
+        meta_label("updated"),
+        Span::raw(updated),
+    ]));
+
+    lines
+}
+
+fn meta_label(label: &str) -> Span<'static> {
+    Span::styled(
+        format!("{label}: "),
+        Style::default().fg(Color::DarkGray),
+    )
+}
+
+fn meta_row(label: &str, value: &str) -> Line<'static> {
+    Line::from(vec![meta_label(label), Span::raw(value.to_string())])
+}
+
+/// Return a `Rect` centered in `area` whose width and height are the given
+/// percentages of the outer rect. Used as the bounds for the modal popover.
+fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
+    let vertical = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Percentage((100 - percent_y) / 2),
+            Constraint::Percentage(percent_y),
+            Constraint::Percentage((100 - percent_y) / 2),
+        ])
+        .split(area);
+
+    Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Percentage((100 - percent_x) / 2),
+            Constraint::Percentage(percent_x),
+            Constraint::Percentage((100 - percent_x) / 2),
+        ])
+        .split(vertical[1])[1]
 }

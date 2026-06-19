@@ -180,6 +180,13 @@ fn tasks_loop<B: ratatui::backend::Backend>(
 }
 
 fn handle_kanban_key(app: &mut KanbanApp, code: KeyCode, mods: KeyModifiers) {
+    // When the task popover is open it swallows input — board nav keys
+    // would otherwise move the cursor underneath while the user is reading.
+    if app.popover_is_open() {
+        handle_popover_key(app, code);
+        return;
+    }
+
     let shift = mods.contains(KeyModifiers::SHIFT);
     match code {
         KeyCode::Left | KeyCode::Char('h') => app.nav_left(),
@@ -198,6 +205,7 @@ fn handle_kanban_key(app: &mut KanbanApp, code: KeyCode, mods: KeyModifiers) {
                 app.nav_down()
             }
         }
+        KeyCode::Enter | KeyCode::Char(' ') => app.open_popover(),
         // Shifted hjkl: caps-letter form, since shift+h/l won't carry the
         // SHIFT modifier on most terminals — the keycode arrives as the
         // uppercase char directly.
@@ -206,6 +214,20 @@ fn handle_kanban_key(app: &mut KanbanApp, code: KeyCode, mods: KeyModifiers) {
         KeyCode::Char('K') => app.reorder_up(),
         KeyCode::Char('J') => app.reorder_down(),
         KeyCode::Char('r') => app.refresh(),
+        _ => {}
+    }
+}
+
+fn handle_popover_key(app: &mut KanbanApp, code: KeyCode) {
+    match code {
+        KeyCode::Esc | KeyCode::Enter | KeyCode::Char(' ') | KeyCode::Char('q') => {
+            app.close_popover();
+        }
+        KeyCode::Up | KeyCode::Char('k') => app.popover_scroll_up(),
+        KeyCode::Down | KeyCode::Char('j') => app.popover_scroll_down(),
+        KeyCode::PageUp | KeyCode::Char('u') => app.popover_scroll_page_up(),
+        KeyCode::PageDown | KeyCode::Char('d') => app.popover_scroll_page_down(),
+        KeyCode::Char('g') | KeyCode::Home => app.popover_scroll_home(),
         _ => {}
     }
 }
