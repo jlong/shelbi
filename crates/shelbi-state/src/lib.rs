@@ -21,8 +21,9 @@ pub use hub_config::{
     HubConfig, ProjectMeta, ProjectSummary,
 };
 pub use worker_status::{
-    append_worker_event, events_log_path, load_worker_status, parse_pane_title_state,
-    save_worker_status, worker_status_path, workers_dir, WorkerState, WorkerStatus,
+    append_worker_event, events_log_path, load_worker_status, parse_pane_title_marker,
+    parse_pane_title_state, save_worker_status, worker_status_path, workers_dir, PaneMarker,
+    WorkerState, WorkerStatus,
 };
 
 /// Default assistant name surfaced in the sidebar header and the

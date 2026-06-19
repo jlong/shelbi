@@ -275,24 +275,32 @@ fn scp_settings_to_remote(
     Ok(())
 }
 
-/// Build the initial prompt: the task body + the loop-closing instruction
-/// that tells the worker how to mark itself done.
+/// Build the initial prompt: the loop-closing instruction (front-loaded so
+/// claude weights it strongly) followed by the task body.
+///
+/// We can't tell the worker to run `shelbi task move <id> --to review` —
+/// shelbi is only installed on the hub, not on remote worker machines. So
+/// the handoff happens via a tmux pane-title marker (`printf` is a shell
+/// builtin, available everywhere) that the hub poller watches for.
 fn compose_prompt(task_id: &str, branch: &str, body: &str) -> String {
     let trimmed = body.trim();
     let body_section = if trimmed.is_empty() {
-        format!("# Task {task_id}\n")
+        format!("# Task {task_id}")
     } else {
         trimmed.to_string()
     };
     format!(
-        "{body_section}\n\n\
+        "You are working on task `{task_id}` on branch `{branch}`. The task is described below.\n\
+         \n\
+         When the work is complete and committed, signal you're ready for review by emitting this terminal escape sequence (sets the tmux pane title):\n\
+         \n\
+         \x20\x20\x20\x20printf '\\033]2;shelbi:review\\007'\n\
+         \n\
+         The hub detects the title change and moves your task into the review column.\n\
+         \n\
          ---\n\
-         You are working on task `{task_id}` on branch `{branch}`. When \
-         the work is complete and committed, run:\n\
          \n\
-         shelbi task move {task_id} --to review\n\
-         \n\
-         to hand off for review."
+         {body_section}"
     )
 }
 
@@ -483,7 +491,26 @@ mod tests {
         assert!(prompt.contains("Fix the Safari SSO bug."));
         assert!(prompt.contains("fix-login"));
         assert!(prompt.contains("shelbi/fix-login"));
-        assert!(prompt.contains("shelbi task move fix-login --to review"));
+        // Worker can't run shelbi (it's hub-only). Hand-off is via a
+        // pane-title marker that the hub poller watches for.
+        assert!(prompt.contains("printf"));
+        assert!(prompt.contains("shelbi:review"));
+        // Instructions land before the body so claude weights them
+        // strongly, separated by a `---` rule.
+        let instruction_pos = prompt.find("shelbi:review").expect("instruction present");
+        let body_pos = prompt.find("Fix the Safari SSO bug.").expect("body present");
+        assert!(
+            instruction_pos < body_pos,
+            "instructions must appear before the task body"
+        );
+        assert!(prompt.contains("\n---\n"));
+    }
+
+    #[test]
+    fn prompt_falls_back_to_task_id_heading_when_body_empty() {
+        let prompt = compose_prompt("fix-login", "shelbi/fix-login", "   ");
+        assert!(prompt.contains("# Task fix-login"));
+        assert!(prompt.contains("shelbi:review"));
     }
 
     #[test]

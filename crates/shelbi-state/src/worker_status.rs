@@ -54,22 +54,58 @@ impl std::fmt::Display for WorkerState {
     }
 }
 
-/// Extract the trailing `shelbi:<state>` marker from a pane title and map
-/// it to a [`WorkerState`]. Returns `None` if the marker is missing or
-/// unrecognized — the pane is either pre-hook-emit or running something
-/// other than a shelbi-deployed worker.
-pub fn parse_pane_title_state(title: &str) -> Option<WorkerState> {
+/// All recognized `shelbi:<…>` pane-title markers. Distinct from
+/// [`WorkerState`] because two markers — `idle` (mid-task pause, fires on
+/// every claude turn end) and `review` (explicit completion handoff from
+/// the worker prompt) — both map to the same persisted state
+/// ([`WorkerState::AwaitingInput`]) but have very different downstream
+/// semantics: `review` triggers a one-shot kanban move into the review
+/// column, `idle` does not.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PaneMarker {
+    Working,
+    Idle,
+    Review,
+    Blocked,
+}
+
+impl PaneMarker {
+    /// Persisted [`WorkerState`] for this marker. `Idle` and `Review`
+    /// collapse to `AwaitingInput` — the status file just records that
+    /// claude is sitting at a prompt; the review-handoff side effect
+    /// happens elsewhere.
+    pub fn worker_state(self) -> WorkerState {
+        match self {
+            PaneMarker::Working => WorkerState::Working,
+            PaneMarker::Idle | PaneMarker::Review => WorkerState::AwaitingInput,
+            PaneMarker::Blocked => WorkerState::Blocked,
+        }
+    }
+}
+
+/// Extract the trailing `shelbi:<marker>` from a pane title. Returns
+/// `None` if the marker is missing or unrecognized — the pane is either
+/// pre-hook-emit or running something other than a shelbi-deployed worker.
+pub fn parse_pane_title_marker(title: &str) -> Option<PaneMarker> {
     let idx = title.rfind("shelbi:")?;
     let tail = &title[idx + "shelbi:".len()..];
     let marker = tail.split(|c: char| c.is_whitespace()).next()?;
     // Trim trailing control chars (BEL, ST) some terminals leave behind.
     let marker = marker.trim_end_matches(|c: char| c.is_control() || c == '\u{0007}');
     match marker {
-        "working" => Some(WorkerState::Working),
-        "idle" => Some(WorkerState::AwaitingInput),
-        "blocked" => Some(WorkerState::Blocked),
+        "working" => Some(PaneMarker::Working),
+        "idle" => Some(PaneMarker::Idle),
+        "review" => Some(PaneMarker::Review),
+        "blocked" => Some(PaneMarker::Blocked),
         _ => None,
     }
+}
+
+/// Convenience: just the persisted state, dropping the marker
+/// distinction. Callers that need to know `review` vs `idle` should use
+/// [`parse_pane_title_marker`] instead.
+pub fn parse_pane_title_state(title: &str) -> Option<WorkerState> {
+    parse_pane_title_marker(title).map(PaneMarker::worker_state)
 }
 
 /// `~/.shelbi/workers` — root for per-worker status dirs.
@@ -179,6 +215,34 @@ mod tests {
             parse_pane_title_state("claude · shelbi:blocked"),
             Some(WorkerState::Blocked)
         );
+        // `review` is the explicit completion handoff. For status-file
+        // purposes it collapses to AwaitingInput (claude is sitting at a
+        // prompt); the kanban move side-effect is handled by the poller.
+        assert_eq!(
+            parse_pane_title_state("shelbi:review"),
+            Some(WorkerState::AwaitingInput)
+        );
+    }
+
+    #[test]
+    fn marker_parser_distinguishes_idle_from_review() {
+        assert_eq!(
+            parse_pane_title_marker("shelbi:idle"),
+            Some(PaneMarker::Idle)
+        );
+        assert_eq!(
+            parse_pane_title_marker("shelbi:review"),
+            Some(PaneMarker::Review)
+        );
+        assert_eq!(
+            parse_pane_title_marker("shelbi:working"),
+            Some(PaneMarker::Working)
+        );
+        assert_eq!(
+            parse_pane_title_marker("shelbi:blocked"),
+            Some(PaneMarker::Blocked)
+        );
+        assert!(parse_pane_title_marker("shelbi:bogus").is_none());
     }
 
     #[test]

@@ -30,8 +30,8 @@ use chrono::{DateTime, Utc};
 
 use shelbi_core::{Column, Project};
 use shelbi_state::{
-    append_worker_event, load_worker_status, parse_pane_title_state, save_worker_status,
-    WorkerState, WorkerStatus,
+    append_worker_event, load_worker_status, parse_pane_title_marker, save_worker_status,
+    PaneMarker, WorkerState, WorkerStatus,
 };
 
 /// Spawned poller handle. Dropping it asks the thread to exit and joins it.
@@ -119,9 +119,10 @@ fn poll_one(
         Ok(t) => t,
         Err(_) => return,
     };
-    let Some(new_state) = parse_pane_title_state(&title) else {
+    let Some(marker) = parse_pane_title_marker(&title) else {
         return;
     };
+    let new_state = marker.worker_state();
 
     // Bootstrap previous state from disk on first sighting so a hub
     // restart doesn't emit a bogus `none -> X` event for state we've
@@ -143,9 +144,10 @@ fn poll_one(
             }),
     };
 
+    let current_task = current_task_for(project, &worker.name);
     let outcome = decide(
         &worker.name,
-        current_task_for(project, &worker.name),
+        current_task.clone(),
         prior,
         new_state,
         Utc::now(),
@@ -163,6 +165,30 @@ fn poll_one(
             tracing::warn!(worker = %worker.name, error = %e, "append_worker_event failed");
         }
     }
+
+    // `shelbi:review` is the worker's explicit "ready for review" handoff
+    // (distinct from `shelbi:idle`, which fires on every claude turn
+    // end). When we see it, move the worker's in-progress task into the
+    // review column — the same effect `shelbi task move <id> --to review`
+    // would have had, except shelbi isn't installed on remote workers.
+    //
+    // Idempotent: `current_task_for` only finds tasks still in
+    // InProgress, so once the move happens, subsequent observations of
+    // `shelbi:review` produce no task and we no-op. `move_task` is also
+    // itself a no-op when the column is unchanged.
+    if marker == PaneMarker::Review {
+        if let Some(task_id) = &current_task {
+            if let Err(e) = shelbi_state::move_task(&project.name, task_id, Column::Review) {
+                tracing::warn!(
+                    worker = %worker.name,
+                    task = %task_id,
+                    error = %e,
+                    "review handoff: move_task failed",
+                );
+            }
+        }
+    }
+
     last_known.insert(worker.name.clone(), outcome.status.state);
 }
 
