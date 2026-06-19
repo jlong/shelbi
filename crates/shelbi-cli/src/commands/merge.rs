@@ -1,8 +1,13 @@
 use anyhow::{anyhow, bail, Result};
 use chrono::Utc;
-use shelbi_core::{Host, Machine, Status};
+use shelbi_core::{Host, Machine, Status, TmuxAddr};
 
 use super::require_project;
+
+/// How many lines of the worker's tmux scrollback to embed in the PR body.
+/// Chosen to comfortably cover the worker's final report and the last few
+/// commits' chatter while staying well under GitHub's ~65k char PR body cap.
+const TRANSCRIPT_LINES: usize = 500;
 
 pub fn run(project_opt: Option<String>, id: String, pr: bool) -> Result<()> {
     let project_name = require_project(project_opt)?;
@@ -72,9 +77,21 @@ fn run_pr(
     shelbi_ssh::run_capture(host, ["git", "-C", &wt, "push", "-u", "origin", branch])
         .map_err(|e| anyhow!(e))?;
 
-    // 4. Open the PR. Title pulled from the task heading in the markdown body;
-    //    body is the rest of the agent file (sans the H1).
-    let (title, body) = derive_pr_text(&file.body, id);
+    // 4. Gather optional context — `git diff --stat` against the target and
+    //    the tail of the worker's tmux pane. Both are best-effort; if either
+    //    fails we just omit that section rather than blocking the PR.
+    let diff_stat = capture_diff_stat(host, &wt, target, branch);
+    let transcript = capture_transcript(host, &file.agent.tmux);
+
+    // 5. Open the PR. Title pulled from the task heading in the markdown body;
+    //    body is the rest of the agent file (sans the H1) plus the diff stat
+    //    and transcript sections.
+    let (title, body) = derive_pr_text(
+        &file.body,
+        id,
+        diff_stat.as_deref(),
+        transcript.as_deref(),
+    );
     let pr_url = shelbi_ssh::run_capture(
         host,
         [
@@ -85,7 +102,7 @@ fn run_pr(
     .map_err(|e| anyhow!(e))?;
     let pr_url = pr_url.trim();
 
-    // 5. Update state (still Running until merged in PR, but flag Waiting so
+    // 6. Update state (still Running until merged in PR, but flag Waiting so
     //    Review view picks it up).
     let mut updated = file.agent.clone();
     updated.status = Status::Waiting;
@@ -99,7 +116,12 @@ fn run_pr(
     Ok(())
 }
 
-fn derive_pr_text(body_md: &str, id: &str) -> (String, String) {
+fn derive_pr_text(
+    body_md: &str,
+    id: &str,
+    diff_stat: Option<&str>,
+    transcript: Option<&str>,
+) -> (String, String) {
     let mut lines = body_md.lines();
     // First "# Task" h1 is shelbi-emitted; the next non-blank line is the prompt.
     let mut title = format!("shelbi: {id}");
@@ -112,9 +134,58 @@ fn derive_pr_text(body_md: &str, id: &str) -> (String, String) {
         title = if t.len() > 70 { format!("{}…", &t[..69]) } else { t.to_string() };
         break;
     }
-    let mut body = String::from(body_md);
-    body.push_str("\n\n— opened by [shelbi](https://github.com/jlong/shelbi)\n");
+
+    let mut body = body_md.trim_end().to_string();
+    body.push('\n');
+
+    if let Some(stat) = diff_stat.map(str::trim).filter(|s| !s.is_empty()) {
+        body.push_str("\n## Files changed\n\n```\n");
+        body.push_str(stat);
+        if !stat.ends_with('\n') {
+            body.push('\n');
+        }
+        body.push_str("```\n");
+    }
+
+    if let Some(t) = transcript.map(str::trim_end).filter(|s| !s.is_empty()) {
+        body.push_str("\n<details>\n<summary>Worker transcript</summary>\n\n```\n");
+        body.push_str(t);
+        if !t.ends_with('\n') {
+            body.push('\n');
+        }
+        body.push_str("```\n\n</details>\n");
+    }
+
+    body.push_str("\n— opened by [shelbi](https://github.com/jlong/shelbi)\n");
     (title, body)
+}
+
+/// `git diff --stat <target>...<branch>` against the just-pushed branch.
+/// `...` (three dots) compares against the merge-base, so the summary
+/// reflects what the PR actually adds, not unrelated drift on `target`.
+fn capture_diff_stat(host: &Host, worktree: &str, target: &str, branch: &str) -> Option<String> {
+    let range = format!("{target}...{branch}");
+    let out = shelbi_ssh::run_capture(host, ["git", "-C", worktree, "diff", "--stat", &range])
+        .ok()?;
+    let trimmed = out.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
+}
+
+/// Tail of the worker's tmux pane scrollback — the last things the agent
+/// said before it handed off. Best-effort: if the pane is gone or capture
+/// fails, the PR body just won't include this section.
+fn capture_transcript(host: &Host, addr: &TmuxAddr) -> Option<String> {
+    let raw = shelbi_tmux::capture_history(host, addr, TRANSCRIPT_LINES).ok()?;
+    let trimmed = raw.trim_end();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
 }
 
 fn preflight(host: &Host, machine: &Machine, target: &str) -> Result<()> {
@@ -225,4 +296,62 @@ fn cleanup(
         ["git", "-C", &repo, "worktree", "remove", "--force", &wt],
     );
     let _ = shelbi_ssh::run_capture(host, ["git", "-C", &repo, "branch", "-D", branch]);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pr_body_with_no_extras_matches_legacy_shape() {
+        let (title, body) = derive_pr_text("# Task\n\nFix login.\n", "fix-login", None, None);
+        assert_eq!(title, "Fix login.");
+        assert!(body.starts_with("# Task\n\nFix login.\n"));
+        assert!(body.contains("— opened by [shelbi]"));
+        assert!(!body.contains("## Files changed"));
+        assert!(!body.contains("Worker transcript"));
+    }
+
+    #[test]
+    fn pr_body_includes_diff_stat_when_provided() {
+        let stat = " src/foo.rs | 12 +++++++-----\n 1 file changed, 7 insertions(+), 5 deletions(-)";
+        let (_, body) = derive_pr_text("# Task\n\nFix.\n", "fix", Some(stat), None);
+        assert!(body.contains("## Files changed"));
+        assert!(body.contains("src/foo.rs | 12 +++++++-----"));
+        assert!(body.contains("1 file changed, 7 insertions(+), 5 deletions(-)"));
+        // Stat lives inside a fenced block so GitHub renders the columns intact.
+        assert!(body.contains("```\nsrc/foo.rs"));
+    }
+
+    #[test]
+    fn pr_body_includes_transcript_in_collapsed_details() {
+        let transcript = "claude> done\nshelbi task move fix --to review\n";
+        let (_, body) = derive_pr_text("# Task\n\nFix.\n", "fix", None, Some(transcript));
+        assert!(body.contains("<details>"));
+        assert!(body.contains("<summary>Worker transcript</summary>"));
+        assert!(body.contains("claude> done"));
+        assert!(body.contains("</details>"));
+    }
+
+    #[test]
+    fn pr_body_omits_sections_for_empty_or_whitespace_inputs() {
+        let (_, body) = derive_pr_text("# Task\n\nFix.\n", "fix", Some("   \n\n"), Some(""));
+        assert!(!body.contains("## Files changed"));
+        assert!(!body.contains("Worker transcript"));
+    }
+
+    #[test]
+    fn pr_body_orders_sections_diff_then_transcript_then_footer() {
+        let (_, body) = derive_pr_text(
+            "# Task\n\nFix.\n",
+            "fix",
+            Some(" a | 1 +\n"),
+            Some("the transcript"),
+        );
+        let diff_at = body.find("## Files changed").unwrap();
+        let transcript_at = body.find("Worker transcript").unwrap();
+        let footer_at = body.find("— opened by [shelbi]").unwrap();
+        assert!(diff_at < transcript_at);
+        assert!(transcript_at < footer_at);
+    }
 }
