@@ -252,20 +252,21 @@ fn create_hidden_views(
     project_name: &str,
     shelbi_bin: &str,
 ) -> Result<()> {
-    let views_win = format!("{session}:__views");
-    // Already there? Skip.
-    let windows = shelbi_ssh::run_capture(
-        host,
-        ["tmux", "list-windows", "-t", session, "-F", "#W"],
-    )?;
-    if windows.lines().any(|w| w.trim() == "__views") {
+    // Stash lives in a separate session — `_shelbi-<project>` — so the
+    // user never sees a `__views` window in their visible session's
+    // window list. Pane IDs are global in tmux, so swap-pane across
+    // sessions works just like within one.
+    let stash = format!("_{session}");
+
+    // Already exists? Skip (idempotent).
+    if shelbi_tmux::has_session(host, &stash)? {
         return Ok(());
     }
 
     let bin = shelbi_agent::shell_escape(shelbi_bin);
     let proj = shelbi_agent::shell_escape(project_name);
-    // Each view runs a forever loop that re-renders every 2s. Using `printf
-    // '\\033c'` (full reset) instead of `clear` avoids alt-screen flicker.
+    // Each view runs a forever loop that re-renders every 2s. Using
+    // `printf '\\033c'` (full reset) avoids alt-screen flicker.
     let tasks_cmd = format!(
         "while true; do printf '\\033c'; echo 'tasks · {proj_label}'; echo; {bin} --project {proj} list; sleep 2; done",
         bin = bin,
@@ -283,39 +284,41 @@ fn create_hidden_views(
         proj_label = project_name,
     );
 
-    // Create the hidden views window with the first pane (tasks).
+    // Create the stash session detached, with tasks pane.
     let tasks_id = shelbi_ssh::run_capture(
         host,
         [
-            "tmux", "new-window", "-d", "-t", &format!("{session}:"), "-n", "__views",
+            "tmux", "new-session", "-d", "-s", &stash, "-n", "views",
             "-P", "-F", "#{pane_id}",
             "sh", "-c", &tasks_cmd,
         ],
     )?;
     let tasks_id = tasks_id.trim().to_string();
 
-    // Split for review.
+    let stash_win = format!("{stash}:views");
+
     let review_id = shelbi_ssh::run_capture(
         host,
         [
-            "tmux", "split-window", "-v", "-t", &views_win,
+            "tmux", "split-window", "-v", "-t", &stash_win,
             "-P", "-F", "#{pane_id}",
             "sh", "-c", &review_cmd,
         ],
     )?;
     let review_id = review_id.trim().to_string();
 
-    // Split for machines.
     let machines_id = shelbi_ssh::run_capture(
         host,
         [
-            "tmux", "split-window", "-v", "-t", &views_win,
+            "tmux", "split-window", "-v", "-t", &stash_win,
             "-P", "-F", "#{pane_id}",
             "sh", "-c", &machines_cmd,
         ],
     )?;
     let machines_id = machines_id.trim().to_string();
 
+    // Env vars live on the *visible* session — that's where show_view reads
+    // them from. swap-pane finds the target pane by global pane id anyway.
     set_session_env(host, session, "SHELBI_PANE_tasks", &tasks_id)?;
     set_session_env(host, session, "SHELBI_PANE_review", &review_id)?;
     set_session_env(host, session, "SHELBI_PANE_machines", &machines_id)?;
