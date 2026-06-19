@@ -60,7 +60,7 @@ pub fn run(args: Args) -> Result<()> {
 
             let template_path = shelbi_state::project_dir(name)
                 .map_err(|e| anyhow!(e))?
-                .join("worker-settings.json");
+                .join("worker-settings.json.template");
             if template_path.exists() {
                 println!(
                     "(worker settings template already exists at {})",

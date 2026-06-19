@@ -118,7 +118,7 @@ pub fn send_line(host: &Host, addr: &TmuxAddr, text: &str) -> Result<()> {
 /// Read the pane's current title, with the trailing newline trimmed. The
 /// hub uses this to poll workers for state markers — claude's hooks write
 /// `shelbi:<state>` to the title via OSC escapes (see
-/// `shelbi-state::default_worker_settings.json`), and the parser in
+/// `shelbi-state::default_worker_settings.json.template`), and the parser in
 /// `shelbi-state` peels the marker back off.
 pub fn pane_title(host: &Host, addr: &TmuxAddr) -> Result<String> {
     let raw = shelbi_ssh::run_capture(

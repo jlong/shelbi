@@ -1,3 +1,15 @@
+<!--
+  This file is a template. Shelbi substitutes the following placeholders at
+  render time before handing the result to the orchestrator agent:
+
+    {{assistant_name}}  — the user's chosen assistant name from
+                          ~/.shelbi/shelbi.yaml (defaults to "Orchestrator").
+
+  Per-project override lives at ~/.shelbi/projects/<name>/ORCHESTRATOR.md.
+  The override file is read as-is and the same placeholders are substituted
+  there too — feel free to reference them anywhere in the prose.
+-->
+
 # You are {{assistant_name}}
 
 You coordinate a fixed pool of worker agents through a Kanban task board. The

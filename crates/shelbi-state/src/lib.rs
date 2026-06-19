@@ -86,12 +86,13 @@ pub(crate) mod test_lock {
 }
 
 /// Default contents of the per-project worker settings template. Lives at
-/// `~/.shelbi/projects/<name>/worker-settings.json` after `shelbi init
-/// --project <name>` runs. The `{{worker_permissions_mode}}` placeholder is
-/// filled in later by the worker deploy step from
-/// `Project::worker_permissions_mode`.
+/// `~/.shelbi/projects/<name>/worker-settings.json.template` after
+/// `shelbi init --project <name>` runs. The `.template` suffix flags the
+/// file as needing placeholder substitution before use — the
+/// `{{worker_permissions_mode}}` placeholder is filled in later by the
+/// worker deploy step from `Project::worker_permissions_mode`.
 pub const DEFAULT_WORKER_SETTINGS_TEMPLATE: &str =
-    include_str!("default_worker_settings.json");
+    include_str!("default_worker_settings.json.template");
 
 /// Default shelbi home directory: `~/.shelbi`, overridable via
 /// `$SHELBI_HOME` (useful for tests and sandboxed CI).
@@ -120,12 +121,34 @@ pub fn project_dir(project: &str) -> Result<PathBuf> {
 
 /// Resolve the worker settings template path for a project: the override
 /// in [`Project::worker_settings_template`] (with `~` expansion) if set,
-/// otherwise the default at `~/.shelbi/projects/<name>/worker-settings.json`.
+/// otherwise the default at
+/// `~/.shelbi/projects/<name>/worker-settings.json.template`.
+///
+/// As a one-shot migration, if the legacy `worker-settings.json` (no
+/// `.template` suffix) exists in the project dir and the new path doesn't,
+/// the legacy file is renamed in place — see [`migrate_worker_settings_template`].
 pub fn worker_settings_template_path(project: &Project) -> Result<PathBuf> {
     if let Some(p) = &project.worker_settings_template {
         return Ok(expand_tilde(p));
     }
-    Ok(project_dir(&project.name)?.join("worker-settings.json"))
+    let dir = project_dir(&project.name)?;
+    migrate_worker_settings_template(&dir);
+    Ok(dir.join("worker-settings.json.template"))
+}
+
+/// One-shot rename of a legacy `worker-settings.json` to the new
+/// `.json.template` name. Idempotent: skips when the new file already exists
+/// or the legacy file is missing. Best-effort — any IO error is swallowed
+/// so a permissions hiccup doesn't break worker deploy; the caller will
+/// fall back to [`DEFAULT_WORKER_SETTINGS_TEMPLATE`] just like any other
+/// missing-template case.
+fn migrate_worker_settings_template(project_dir: &Path) {
+    let legacy = project_dir.join("worker-settings.json");
+    let renamed = project_dir.join("worker-settings.json.template");
+    if renamed.exists() || !legacy.exists() {
+        return;
+    }
+    let _ = fs::rename(&legacy, &renamed);
 }
 
 /// Render the worker settings JSON for `project`: read the template file
@@ -623,7 +646,47 @@ mod tests {
         std::env::set_var("SHELBI_HOME", &home);
         let p = fixture_project("myapp", None);
         let path = worker_settings_template_path(&p).unwrap();
-        assert_eq!(path, home.join("projects/myapp/worker-settings.json"));
+        assert_eq!(
+            path,
+            home.join("projects/myapp/worker-settings.json.template")
+        );
+        std::env::remove_var("SHELBI_HOME");
+    }
+
+    #[test]
+    fn worker_settings_template_path_renames_legacy_file_in_project_dir() {
+        let _g = TEST_LOCK.lock().unwrap();
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+        let p = fixture_project("myapp", None);
+        let legacy = home.join("projects/myapp/worker-settings.json");
+        ensure_dir(legacy.parent().unwrap()).unwrap();
+        std::fs::write(&legacy, r#"{"custom":true}"#).unwrap();
+        let path = worker_settings_template_path(&p).unwrap();
+        assert!(!legacy.exists(), "legacy file should be renamed away");
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            r#"{"custom":true}"#
+        );
+        std::env::remove_var("SHELBI_HOME");
+    }
+
+    #[test]
+    fn worker_settings_template_path_leaves_legacy_when_new_already_exists() {
+        let _g = TEST_LOCK.lock().unwrap();
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+        let p = fixture_project("myapp", None);
+        let dir = home.join("projects/myapp");
+        ensure_dir(&dir).unwrap();
+        let legacy = dir.join("worker-settings.json");
+        let renamed = dir.join("worker-settings.json.template");
+        std::fs::write(&legacy, "legacy").unwrap();
+        std::fs::write(&renamed, "new").unwrap();
+        let _ = worker_settings_template_path(&p).unwrap();
+        // Both files survive; we never overwrite the new one.
+        assert_eq!(std::fs::read_to_string(&legacy).unwrap(), "legacy");
+        assert_eq!(std::fs::read_to_string(&renamed).unwrap(), "new");
         std::env::remove_var("SHELBI_HOME");
     }
 
@@ -647,7 +710,7 @@ mod tests {
         let _g = TEST_LOCK.lock().unwrap();
         let home = fresh_home();
         std::env::set_var("SHELBI_HOME", &home);
-        // No file at ~/.shelbi/projects/myapp/worker-settings.json yet.
+        // No template at ~/.shelbi/projects/myapp/worker-settings.json.template yet.
         let p = fixture_project("myapp", None);
         let rendered = render_worker_settings(&p).unwrap();
         // `auto` is mapped to `acceptEdits`.

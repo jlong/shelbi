@@ -2,7 +2,7 @@
 //!
 //! Worker `.claude/settings.json` hooks emit `shelbi:working|idle|blocked`
 //! markers via OSC pane-title escapes (see
-//! `default_worker_settings.json`); the hub-side sidebar poll loop reads
+//! `default_worker_settings.json.template`); the hub-side sidebar poll loop reads
 //! the current pane title with `tmux display-message`, parses the trailing
 //! marker, and writes any state transition here.
 //!

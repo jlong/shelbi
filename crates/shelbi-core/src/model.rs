@@ -56,7 +56,7 @@ pub struct Project {
     pub worker_permissions_mode: String,
     /// Optional override for the path to the per-project worker settings
     /// template. When `None`, the default at
-    /// `~/.shelbi/projects/<name>/worker-settings.json` is used.
+    /// `~/.shelbi/projects/<name>/worker-settings.json.template` is used.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub worker_settings_template: Option<PathBuf>,
 }
