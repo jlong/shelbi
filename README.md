@@ -1,3 +1,5 @@
+# Shelbi
+
 ```
    ▄▀▀▀▀▀▄   ▀▀    ▀▀  ▀▀▀▀▀▀▀   ▀▀   ▀▀▀▀▀▀▀▀▀▀▄   ▀▀▀▀▀
   ▀▀        ▀▀    ▀▀  ▀▀        ▀▀        ▀▀    ▀▀   ▀▀
@@ -8,12 +10,12 @@
 
 > An open-source agent orchestrator for the terminal, built on tmux.
 
-shelbi lets you run, supervise, and review AI coding agents (Claude Code,
+Shelbi lets you run, supervise, and review AI coding agents (Claude Code,
 Codex, aider, anything with a CLI) running in parallel across your laptop and
-a fleet of remote machines. You talk to one **orchestrator agent**; it
-delegates work to **worker agents** running in tmux panes — locally or over
-SSH — and reports back. You jump into any worker's pane when you want to
-watch live, and review/merge the diffs from a two-pane TUI.
+on remote machines at the same time. You talk to one **orchestrator agent**;
+it delegates work to **worker agents** running in tmux panes — locally or
+over SSH — and reports back. You jump into any worker's pane when you want
+to watch live, and review/merge the diffs from a two-pane TUI.
 
 Part replacement-for-tmuxinator. Part terminal-native Conductor. All you need
 on a worker machine is `tmux` and your agent CLI.
@@ -22,12 +24,12 @@ on a worker machine is `tmux` and your agent CLI.
 
 ## Why
 
-GUI tools like Conductor are great, but they're Mac-only and single-machine.
-If you live in the terminal and you have spare compute (a Mac mini in the
-closet, a Linux box, a workstation), you want to *spread* your agents across
-them — without standing up a Kubernetes cluster.
+GUI tools like Conductor are great, but if you live in the terminal and have
+spare compute (a Mac mini in the closet, a Linux box, a workstation),
+you want to *spread* your agents across them — without standing up a
+Kubernetes cluster.
 
-shelbi gives you:
+Shelbi gives you:
 
 - **One orchestrator, many workers.** Talk to a single agent in chat. It
   dispatches tasks across machines and tracks progress for you.
