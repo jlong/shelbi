@@ -175,17 +175,17 @@ direction and review. Nothing in the middle needs CLI ceremony.
 ## TUI tour
 
 Two-pane layout. Borderless sidebar on the left — project name as a
-strong header, then a 3-item nav (Chat, Tasks, Machines), then live
-inline lists of declared workers (`— agents —`) and tasks waiting on
-you (`— Ready for Review —`). Content view on the right is a real
-tmux pane: the orchestrator, a worker, or one of the built-in views.
+strong header, then a 2-item nav (Chat, Tasks), then live inline lists
+of declared workers (`— agents —`) and tasks waiting on you
+(`— Ready for Review —`). Content view on the right is a real tmux
+pane: the orchestrator, a worker, or one of the built-in views.
 
 ```
  myapp                  Chat — Orchestrator
                         you: fix the login bug on safari,
  💬 Chat                  send it to delta.
  📋 Tasks
- 🖥 Machines            Orchestrator: ✓ dispatched to delta.
+                        Orchestrator: ✓ dispatched to delta.
                           worker: delta
  — agents —               branch: shelbi/fix-login-bug
  ⏵ alpha

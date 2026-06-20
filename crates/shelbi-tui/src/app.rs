@@ -122,12 +122,14 @@ impl App {
         rows.get(idx).filter(|r| r.is_selectable()).map(|_| idx)
     }
 
-    /// Sidebar rows: a fixed 3-item nav (Chat / Tasks / Machines), then
-    /// declared workers under an `— agents —` separator, then the review
-    /// queue under `— Ready for Review —`, then any legacy `shelbi spawn`
-    /// agents under `— spawned —`. Each section header and its rows are
-    /// dropped together when that group is empty — Review is intentionally
-    /// not a destination view, only an inline live list.
+    /// Sidebar rows: a fixed 2-item nav (Chat / Tasks), then declared
+    /// workers under an `— agents —` separator, then the review queue
+    /// under `— Ready for Review —`, then any legacy `shelbi spawn` agents
+    /// under `— spawned —`. Each section header and its rows are dropped
+    /// together when that group is empty — Review is intentionally not a
+    /// destination view, only an inline live list. The Machines view still
+    /// exists but is reachable only via the Ctrl+P palette; it rarely needs
+    /// a one-keystroke shortcut day-to-day.
     pub fn rows(&self) -> Vec<Row> {
         let mut rows = vec![
             Row::Nav {
@@ -139,15 +141,6 @@ impl App {
                 icon: "📋",
                 label: "Tasks",
                 view: View::Builtin("tasks"),
-            },
-            Row::Nav {
-                // U+FE0F variation selector forces emoji-style rendering;
-                // without it the desktop-computer glyph collapses to one cell
-                // in many terminals and the trailing-space gap visually
-                // disappears against 💬 / 📋 above.
-                icon: "🖥\u{fe0f}",
-                label: "Machines",
-                view: View::Builtin("machines"),
             },
         ];
         if !self.workers.is_empty() {
@@ -372,7 +365,7 @@ impl App {
 /// dance and tests can target one shape unambiguously.
 #[derive(Clone)]
 pub enum Row {
-    /// Top-level destination (Chat / Tasks / Machines).
+    /// Top-level destination (Chat / Tasks).
     Nav {
         icon: &'static str,
         label: &'static str,
@@ -688,11 +681,11 @@ mod tests {
         let mut app = App::new_sidebar("demo");
         app.refresh().unwrap();
 
-        // 3 nav + 1 blank spacer + 1 `agents` section header + 2 workers = 7 rows.
+        // 2 nav + 1 blank spacer + 1 `agents` section header + 2 workers = 6 rows.
         let rows = app.rows();
-        assert_eq!(rows.len(), 7);
-        assert!(matches!(&rows[3], Row::Blank));
-        assert!(matches!(&rows[4], Row::Section { label } if label == "agents"));
+        assert_eq!(rows.len(), 6);
+        assert!(matches!(&rows[2], Row::Blank));
+        assert!(matches!(&rows[3], Row::Section { label } if label == "agents"));
 
         // alpha (busy, no status file yet) — default to Working.
         assert_eq!(find_worker_badge(&rows, "alpha").unwrap(), WorkerBadge::Working);
@@ -887,9 +880,10 @@ mod tests {
     }
 
     #[test]
-    fn nav_is_chat_tasks_machines_only_no_review_destination() {
-        // The sidebar nav must stay at three items — Review is surfaced
-        // inline as a live list below, never as a destination.
+    fn nav_is_chat_tasks_only_no_review_destination() {
+        // The sidebar nav stays at two items — Review is surfaced inline
+        // as a live list below, never as a destination; Machines is reached
+        // via the Ctrl+P palette.
         let _g = TEST_LOCK.lock().unwrap();
         let home = fresh_home();
         std::env::set_var("SHELBI_HOME", &home);
@@ -910,7 +904,7 @@ mod tests {
                 _ => None,
             })
             .collect();
-        assert_eq!(names, vec!["orch", "tasks", "machines"]);
+        assert_eq!(names, vec!["orch", "tasks"]);
 
         std::env::remove_var("SHELBI_HOME");
     }
@@ -973,10 +967,10 @@ mod tests {
 
         let mut app = App::new_sidebar("demo");
         app.refresh().unwrap();
-        // Start on the last nav item (Machines, idx 2). Next nav_down should
-        // skip the blank spacer (idx 3) and the `agents` section header
-        // (idx 4) and land on the first worker row (idx 5).
-        app.sidebar_index = 2;
+        // Start on the last nav item (Tasks, idx 1). Next nav_down should
+        // skip the blank spacer (idx 2) and the `agents` section header
+        // (idx 3) and land on the first worker row (idx 4).
+        app.sidebar_index = 1;
         app.nav_down();
         let rows = app.rows();
         assert!(rows[app.sidebar_index].is_selectable());
