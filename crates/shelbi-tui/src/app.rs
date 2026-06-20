@@ -542,9 +542,8 @@ mod tests {
         AgentRunnerSpec, Column, Machine, MachineKind, OrchestratorSpec, Project, Task, WorkerSpec,
     };
     use std::collections::BTreeMap;
-    use std::sync::Mutex;
 
-    static TEST_LOCK: Mutex<()> = Mutex::new(());
+    use crate::test_support::ENV_LOCK as TEST_LOCK;
 
     fn fresh_home() -> std::path::PathBuf {
         let p = std::env::temp_dir().join(format!(

@@ -109,6 +109,13 @@ fn poll_one(
         return;
     };
 
+    // Review handoff is a file marker the worker writes when it's done, read
+    // independently of the pane title. We check it *before* the pane-title
+    // state below (and unconditionally, even if the pane has since died or
+    // Claude has overwritten its title) so nothing the agent's UI does can
+    // hide the signal.
+    maybe_promote_to_review(project, worker, machine, &host);
+
     // No pane → no marker. The display-message call would fail anyway,
     // but checking up-front keeps stderr noise out of the log.
     if !shelbi_orchestrator::worker::worker_pane_alive(&host, &addr).unwrap_or(false) {
@@ -190,6 +197,58 @@ fn poll_one(
     }
 
     last_known.insert(worker.name.clone(), outcome.status.state);
+}
+
+/// Check the worker's review-ready file marker and, if present, move its
+/// in-progress task to the review column. The marker is the worker's handoff
+/// signal — it writes its task id into `<worktree>/.claude/shelbi-review-ready`
+/// when done (see `shelbi_orchestrator::worker::worker_review_marker`).
+///
+/// Best-effort and idempotent: we consume the marker exactly once by clearing
+/// it after a successful move, and `move_task` is a no-op once the task is
+/// already in review, so a worker that keeps churning in its pane afterward
+/// never gets pulled back out. A stale marker (worktree reused before the
+/// previous one was cleared) names a task that's no longer in-progress for
+/// this worker, so we clear it without moving anything.
+fn maybe_promote_to_review(
+    project: &Project,
+    worker: &shelbi_core::WorkerSpec,
+    machine: &shelbi_core::Machine,
+    host: &shelbi_core::Host,
+) {
+    let marker = shelbi_orchestrator::worker::worker_review_marker(machine, worker);
+    let task_id = match shelbi_orchestrator::worker::read_review_marker(host, &marker) {
+        Ok(Some(id)) => id,
+        Ok(None) => return,
+        Err(e) => {
+            tracing::warn!(worker = %worker.name, error = %e, "read_review_marker failed");
+            return;
+        }
+    };
+
+    match shelbi_state::load_task(&project.name, &task_id) {
+        Ok(tf)
+            if tf.task.column == Column::InProgress
+                && tf.task.assigned_to.as_deref() == Some(worker.name.as_str()) =>
+        {
+            if let Err(e) = shelbi_state::move_task(&project.name, &task_id, Column::Review) {
+                // Leave the marker in place so we retry on the next tick.
+                tracing::warn!(worker = %worker.name, task = %task_id, error = %e, "move_task to review failed");
+                return;
+            }
+            tracing::info!(worker = %worker.name, task = %task_id, "promoted task to review via marker");
+        }
+        Ok(_) => {
+            tracing::debug!(worker = %worker.name, task = %task_id, "stale review marker (task not in-progress for this worker); clearing");
+        }
+        Err(e) => {
+            tracing::warn!(worker = %worker.name, task = %task_id, error = %e, "review marker names unloadable task; clearing");
+        }
+    }
+
+    if let Err(e) = shelbi_orchestrator::worker::clear_review_marker(host, &marker) {
+        tracing::warn!(worker = %worker.name, error = %e, "clear_review_marker failed");
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -303,6 +362,158 @@ mod tests {
         assert_eq!(out.status.state, WorkerState::AwaitingInput);
         assert_eq!(out.status.last_transition, ts(200));
         assert_eq!(out.status.current_task.as_deref(), Some("task-1"));
+    }
+
+    use shelbi_core::{
+        AgentRunnerSpec, Host, Machine, MachineKind, OrchestratorSpec, Task, WorkerSpec,
+    };
+    use std::collections::BTreeMap;
+
+    /// A local-machine project with a single worker whose worktree lives
+    /// under `work_dir`, so the marker path is a real writable local file.
+    fn local_project(work_dir: &std::path::Path) -> Project {
+        let mut runners = BTreeMap::new();
+        runners.insert(
+            "claude".to_string(),
+            AgentRunnerSpec {
+                command: "claude".into(),
+                flags: vec![],
+            },
+        );
+        Project {
+            name: "demo".into(),
+            repo: "git@example:demo.git".into(),
+            default_branch: "main".into(),
+            machines: vec![Machine {
+                name: "hub".into(),
+                kind: MachineKind::Local,
+                work_dir: work_dir.to_path_buf(),
+                host: None,
+            }],
+            orchestrator: OrchestratorSpec {
+                runner: "claude".into(),
+            },
+            agent_runners: runners,
+            editor: None,
+            workers: vec![WorkerSpec {
+                name: "alpha".into(),
+                machine: "hub".into(),
+                runner: "claude".into(),
+            }],
+            worker_poll_interval_secs: 5,
+            worker_permissions_mode: "auto".into(),
+            worker_settings_template: None,
+        }
+    }
+
+    fn in_progress_task(id: &str, worker: &str) -> Task {
+        let now = Utc::now();
+        Task {
+            id: id.into(),
+            title: id.into(),
+            column: Column::InProgress,
+            priority: 0,
+            assigned_to: Some(worker.into()),
+            branch: None,
+            depends_on: Vec::new(),
+            created_at: now,
+            updated_at: now,
+        }
+    }
+
+    fn write_marker(project: &Project, body: &str) -> std::path::PathBuf {
+        let marker = shelbi_orchestrator::worker::worker_review_marker(
+            &project.machines[0],
+            &project.workers[0],
+        );
+        std::fs::create_dir_all(marker.parent().unwrap()).unwrap();
+        std::fs::write(&marker, body).unwrap();
+        marker
+    }
+
+    #[test]
+    fn review_marker_promotes_in_progress_task_then_clears_itself() {
+        let _g = crate::test_support::ENV_LOCK.lock().unwrap();
+        let home = std::env::temp_dir().join(format!(
+            "shelbi-poller-promote-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&home).unwrap();
+        std::env::set_var("SHELBI_HOME", &home);
+
+        let work_dir = home.join("repo");
+        std::fs::create_dir_all(&work_dir).unwrap();
+        let project = local_project(&work_dir);
+        shelbi_state::save_task("demo", &in_progress_task("fix-login", "alpha"), "body").unwrap();
+
+        // Worker signals review by writing its task id into the marker.
+        let marker = write_marker(&project, "fix-login\n");
+
+        maybe_promote_to_review(&project, &project.workers[0], &project.machines[0], &Host::Local);
+
+        assert_eq!(
+            shelbi_state::load_task("demo", "fix-login")
+                .unwrap()
+                .task
+                .column,
+            Column::Review,
+            "task should be promoted to review"
+        );
+        assert!(!marker.exists(), "marker should be consumed (cleared)");
+
+        // A leftover/stale marker naming a task that's no longer in-progress
+        // for this worker is cleared without moving anything back out.
+        let marker = write_marker(&project, "fix-login\n");
+        maybe_promote_to_review(&project, &project.workers[0], &project.machines[0], &Host::Local);
+        assert_eq!(
+            shelbi_state::load_task("demo", "fix-login")
+                .unwrap()
+                .task
+                .column,
+            Column::Review,
+            "task already in review must not be pulled back out"
+        );
+        assert!(!marker.exists(), "stale marker should be cleared");
+
+        std::env::remove_var("SHELBI_HOME");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn absent_review_marker_is_a_noop() {
+        let _g = crate::test_support::ENV_LOCK.lock().unwrap();
+        let home = std::env::temp_dir().join(format!(
+            "shelbi-poller-noop-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&home).unwrap();
+        std::env::set_var("SHELBI_HOME", &home);
+
+        let work_dir = home.join("repo");
+        std::fs::create_dir_all(&work_dir).unwrap();
+        let project = local_project(&work_dir);
+        shelbi_state::save_task("demo", &in_progress_task("fix-login", "alpha"), "body").unwrap();
+
+        // No marker on disk → task stays in progress.
+        maybe_promote_to_review(&project, &project.workers[0], &project.machines[0], &Host::Local);
+        assert_eq!(
+            shelbi_state::load_task("demo", "fix-login")
+                .unwrap()
+                .task
+                .column,
+            Column::InProgress
+        );
+
+        std::env::remove_var("SHELBI_HOME");
+        let _ = std::fs::remove_dir_all(&home);
     }
 }
 

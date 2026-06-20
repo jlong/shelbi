@@ -13,7 +13,7 @@
 //! caller (CLI) is responsible for updating `assigned_to` / `branch` /
 //! `column`. We just stand up the worktree + tmux pane + claude.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use shelbi_core::{Error, Host, Machine, Project, Result, TmuxAddr, WorkerSpec};
 
@@ -40,6 +40,53 @@ pub fn worker_tmux_addr(project: &Project, worker: &WorkerSpec) -> Result<TmuxAd
 /// worktree path on its machine.
 pub fn worker_worktree(machine: &Machine, worker: &WorkerSpec) -> PathBuf {
     machine.work_dir.join(".shelbi").join("wt").join(&worker.name)
+}
+
+/// The review-ready file marker for a worker:
+/// `<worktree>/.claude/shelbi-review-ready`.
+///
+/// The worker writes its current task id here to hand off for review; the
+/// hub poller reads it (`stat`/`cat`, local or over SSH), moves the task to
+/// the review column, and clears the file. This replaces the old
+/// pane-title / `shelbi task move` handoff, both of which raced Claude's own
+/// OSC title writes and the Stop hook. A file survives both: nothing the
+/// agent's UI does can clobber it.
+///
+/// It lives under `.claude/` (not the worktree root) on purpose — `.claude/`
+/// is where shelbi already deploys `settings.json`, and shelbi relies on it
+/// being gitignored so deployed files don't dirty the worktree between
+/// tasks. Keeping the marker there means it never shows up in
+/// `git status --porcelain` and so never trips [`sync_worktree`]'s
+/// clean-worktree check.
+pub fn worker_review_marker(machine: &Machine, worker: &WorkerSpec) -> PathBuf {
+    worker_worktree(machine, worker)
+        .join(".claude")
+        .join("shelbi-review-ready")
+}
+
+/// Read the review-ready marker, returning the task id the worker wrote into
+/// it (trimmed) or `None` if the marker is absent or empty. Works for both
+/// local and remote workers — `cat` is routed through `shelbi-ssh`, which is
+/// a no-op wrapper for [`Host::Local`].
+pub fn read_review_marker(host: &Host, marker: &Path) -> Result<Option<String>> {
+    let path = marker.to_string_lossy().into_owned();
+    let out = shelbi_ssh::run(host, ["cat", path.as_str()]).map_err(Error::Io)?;
+    if !out.status.success() {
+        // Missing file → cat exits non-zero. Not an error for us: the
+        // worker simply hasn't signalled review yet.
+        return Ok(None);
+    }
+    let content = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    Ok((!content.is_empty()).then_some(content))
+}
+
+/// Remove the review-ready marker (idempotent — `rm -f` succeeds if absent).
+/// Called once the poller has consumed the signal, and again at task start to
+/// clear any stale marker before the worktree is reused.
+pub fn clear_review_marker(host: &Host, marker: &Path) -> Result<()> {
+    let path = marker.to_string_lossy().into_owned();
+    shelbi_ssh::run(host, ["rm", "-f", path.as_str()]).map_err(Error::Io)?;
+    Ok(())
 }
 
 /// Does the worker have a live tmux pane right now?
@@ -120,6 +167,13 @@ pub fn start_worker_on_task(spec: StartSpec<'_>) -> Result<TmuxAddr> {
     let host = machine.host();
     let worktree = worker_worktree(&machine, spec.worker);
     let addr = worker_tmux_addr(spec.project, spec.worker)?;
+
+    // 0. Clear any stale review marker left in the worktree from a previous
+    //    task before we reuse the worktree — otherwise the poller could read
+    //    an old task id and misfire. Best-effort: a failure here shouldn't
+    //    block standing up the worker.
+    let marker = worker_review_marker(&machine, spec.worker);
+    let _ = clear_review_marker(&host, &marker);
 
     // 1. Make sure the worktree exists + is on the right branch, clean.
     sync_worktree(
@@ -208,7 +262,7 @@ pub fn start_worker_on_task(spec: StartSpec<'_>) -> Result<TmuxAddr> {
             addr.target(),
         );
     }
-    let prompt = compose_prompt(spec.task_id, spec.branch, spec.task_body);
+    let prompt = compose_prompt(spec.task_id, spec.branch, spec.task_body, &marker);
     shelbi_tmux::send_line(&host, &addr, &prompt)?;
 
     Ok(addr)
@@ -370,32 +424,38 @@ fn scp_settings_to_remote(
     Ok(())
 }
 
-/// Build the initial prompt: the loop-closing instruction (front-loaded so
-/// claude weights it strongly) followed by the task body.
+/// Build the initial prompt: the task body + the loop-closing instruction
+/// that tells the worker how to mark itself done.
 ///
-/// We can't tell the worker to run `shelbi task move <id> --to review` —
-/// shelbi is only installed on the hub, not on remote worker machines. So
-/// the handoff happens via a tmux pane-title marker (`printf` is a shell
-/// builtin, available everywhere) that the hub poller watches for.
-fn compose_prompt(task_id: &str, branch: &str, body: &str) -> String {
+/// The handoff is a file marker, not a pane title or a `shelbi` CLI call.
+/// The worker writes its task id into `<worktree>/.claude/shelbi-review-ready`
+/// (see [`worker_review_marker`]); the hub poller picks it up and moves the
+/// task to the review column. This survives Claude's own OSC pane-title
+/// writes and the Stop hook, both of which used to clobber a `shelbi:review`
+/// title before the poller could read it, and it needs no `shelbi` binary on
+/// the worker host.
+fn compose_prompt(task_id: &str, branch: &str, body: &str, marker: &Path) -> String {
     let trimmed = body.trim();
     let body_section = if trimmed.is_empty() {
-        format!("# Task {task_id}")
+        format!("# Task {task_id}\n")
     } else {
         trimmed.to_string()
     };
+    let id_esc = shelbi_agent::shell_escape(task_id);
+    let marker_esc = shelbi_agent::shell_escape(&marker.to_string_lossy());
     format!(
-        "You are working on task `{task_id}` on branch `{branch}`. The task is described below.\n\
-         \n\
-         When the work is complete and committed, signal you're ready for review by emitting this terminal escape sequence (sets the tmux pane title):\n\
-         \n\
-         \x20\x20\x20\x20printf '\\033]2;shelbi:review\\007'\n\
-         \n\
-         The hub detects the title change and moves your task into the review column.\n\
-         \n\
+        "{body_section}\n\n\
          ---\n\
+         You are working on task `{task_id}` on branch `{branch}`. When \
+         the work is complete and committed, signal that it's ready for \
+         review by writing the task id to the review marker file:\n\
          \n\
-         {body_section}"
+         printf '%s\\n' {id_esc} > {marker_esc}\n\
+         \n\
+         The hub watches for this file and moves your task to the review \
+         column on its next poll. Write the marker once; you can keep \
+         working in this pane and talk to the user afterward without \
+         affecting the handoff."
     )
 }
 
@@ -581,31 +641,30 @@ mod tests {
     }
 
     #[test]
-    fn prompt_includes_task_id_branch_and_done_instruction() {
-        let prompt = compose_prompt("fix-login", "shelbi/fix-login", "Fix the Safari SSO bug.");
+    fn prompt_includes_task_id_branch_and_review_marker_instruction() {
+        let marker = PathBuf::from("/work/myapp/.shelbi/wt/alice/.claude/shelbi-review-ready");
+        let prompt = compose_prompt(
+            "fix-login",
+            "shelbi/fix-login",
+            "Fix the Safari SSO bug.",
+            &marker,
+        );
         assert!(prompt.contains("Fix the Safari SSO bug."));
         assert!(prompt.contains("fix-login"));
         assert!(prompt.contains("shelbi/fix-login"));
-        // Worker can't run shelbi (it's hub-only). Hand-off is via a
-        // pane-title marker that the hub poller watches for.
+        // Hands off via the file marker, not the old pane-title / CLI path.
+        assert!(prompt.contains(".claude/shelbi-review-ready"));
         assert!(prompt.contains("printf"));
-        assert!(prompt.contains("shelbi:review"));
-        // Instructions land before the body so claude weights them
-        // strongly, separated by a `---` rule.
-        let instruction_pos = prompt.find("shelbi:review").expect("instruction present");
-        let body_pos = prompt.find("Fix the Safari SSO bug.").expect("body present");
-        assert!(
-            instruction_pos < body_pos,
-            "instructions must appear before the task body"
-        );
+        assert!(!prompt.contains("shelbi task move"));
         assert!(prompt.contains("\n---\n"));
     }
 
     #[test]
     fn prompt_falls_back_to_task_id_heading_when_body_empty() {
-        let prompt = compose_prompt("fix-login", "shelbi/fix-login", "   ");
+        let marker = PathBuf::from("/work/myapp/.shelbi/wt/alice/.claude/shelbi-review-ready");
+        let prompt = compose_prompt("fix-login", "shelbi/fix-login", "   ", &marker);
         assert!(prompt.contains("# Task fix-login"));
-        assert!(prompt.contains("shelbi:review"));
+        assert!(prompt.contains(".claude/shelbi-review-ready"));
     }
 
     // Real captures observed on a Linux (delta) worker, used to pin the
@@ -655,6 +714,16 @@ mod tests {
         assert!(is_trust_dialog("DO YOU TRUST the files in this folder?"));
         // The live input box is not a trust dialog.
         assert!(!is_trust_dialog(INPUT_BOX_SCREEN));
+    }
+
+    #[test]
+    fn review_marker_lives_under_gitignored_claude_dir() {
+        let p = fixture_project();
+        let marker = worker_review_marker(&p.machines[0], &p.workers[0]);
+        assert_eq!(
+            marker,
+            PathBuf::from("/tmp/myapp/.shelbi/wt/alice/.claude/shelbi-review-ready")
+        );
     }
 
     #[test]

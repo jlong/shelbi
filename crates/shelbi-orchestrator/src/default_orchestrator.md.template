@@ -31,9 +31,10 @@ Work flows through five columns:
 - **done** — accepted by the user.
 
 The user moves cards through the Kanban TUI (Ctrl+P → tasks); you move them
-through the CLI. When a worker finishes a task it runs
-`shelbi task move <id> --to review` itself — that's how completion lands on
-the board.
+through the CLI. When a worker finishes a task it writes a review-ready file
+marker in its worktree; the hub poller picks that up and moves the card to
+review for you — workers never run `shelbi` themselves, so nothing on the
+board depends on a `shelbi` binary being present on the worker's machine.
 
 ## Tool surface
 

@@ -29,6 +29,16 @@ mod poller;
 mod review;
 mod sidebar;
 
+#[cfg(test)]
+pub(crate) mod test_support {
+    use std::sync::Mutex;
+
+    /// Serializes any test that mutates the process-global `SHELBI_HOME`
+    /// env var. Tests across modules share one binary (and thus one env),
+    /// so they must all lock the *same* mutex or they race each other.
+    pub static ENV_LOCK: Mutex<()> = Mutex::new(());
+}
+
 pub use app::{App, View};
 pub use kanban::KanbanApp;
 pub use poller::WorkerPoller;
