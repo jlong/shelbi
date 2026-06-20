@@ -21,6 +21,32 @@ use shelbi_core::{
     AgentRunnerSpec, Machine, MachineKind, OrchestratorSpec, Project, WorkerNamePreset, WorkerSpec,
 };
 
+/// Half-block ASCII banner for the shelbi brand. Reproduced verbatim at
+/// the top of `README.md` — keep both copies identical so the banner is
+/// the same wherever the project surfaces. Written with `concat!` and
+/// explicit `\n` because Rust's `\<newline>` continuation elides the
+/// leading whitespace of the next line, which would erase the 3-space
+/// indent on line 1.
+pub const BANNER: &str = concat!(
+    "   ▄▀▀▀▀▀▄   ▀▀    ▀▀  ▀▀▀▀▀▀▀   ▀▀   ▀▀▀▀▀▀▀▀▀▀▄   ▀▀▀▀▀\n",
+    "  ▀▀        ▀▀    ▀▀  ▀▀        ▀▀        ▀▀    ▀▀   ▀▀\n",
+    "  ▀▀▀▀▄    ▀▀▀▀▀▀▀▀  ▀▀▀▀▀▀    ▀▀      ▀▀▀▀▀▀▀▀▄    ▀▀\n",
+    "▄     ▀▀  ▀▀    ▀▀  ▀▀        ▀▀        ▀▀     ▀▀  ▀▀\n",
+    " ▀▀▀▀▀▀  ▀▀    ▀▀  ▀▀▀▀▀▀▀▀  ▀▀▀▀▀▀▀▀  ▀▀▀▀▀▀▀▀  ▀▀▀▀▀",
+);
+
+/// One-line tagline printed under the banner on first-run.
+pub const TAGLINE: &str = "an open-source agent orchestrator for the terminal";
+
+/// Print the banner + tagline + a trailing blank line. Called once at the
+/// very top of a first-run wizard; never inside `shelbi project add` or
+/// re-entries into `shelbi wizard`.
+pub fn print_banner() {
+    println!("{BANNER}");
+    println!("{TAGLINE}");
+    println!();
+}
+
 /// Single-select prompt with arrow-key navigation. `options` must be
 /// non-empty.
 pub fn select<T: Display>(label: &str, options: Vec<T>) -> Result<T> {

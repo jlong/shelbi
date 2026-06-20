@@ -144,7 +144,7 @@ fn main() -> Result<()> {
         Some(Cmd::Review(args)) => commands::review::run(cli.project, args),
         Some(Cmd::Attach { id }) => commands::attach::run(cli.project, id),
         Some(Cmd::Init(args)) => commands::init::run(args),
-        Some(Cmd::Wizard) => commands::wizard::run().map(|_| ()),
+        Some(Cmd::Wizard) => commands::wizard::run(false).map(|_| ()),
         Some(Cmd::Orchestrate(args)) => commands::orchestrate::run(cli.project, args),
         Some(Cmd::Reload) => commands::reload::run(cli.project),
         Some(Cmd::Sidebar { project }) => shelbi_tui::run_sidebar(&project).context("sidebar"),
@@ -171,14 +171,15 @@ fn default_entry(explicit: Option<String>) -> Result<()> {
     }
 
     let home = shelbi_state::shelbi_home().map_err(|e| anyhow::anyhow!(e))?;
-    let projects = if home.exists() {
+    let home_existed = home.exists();
+    let projects = if home_existed {
         shelbi_state::list_projects().map_err(|e| anyhow::anyhow!(e))?
     } else {
         Vec::new()
     };
 
     if projects.is_empty() {
-        return run_wizard_then_dispatch();
+        return run_wizard_then_dispatch(!home_existed);
     }
     if projects.len() == 1 {
         return shelbi_tui::run_main(&projects[0].name).context("launching shelbi");
@@ -195,8 +196,11 @@ fn default_entry(explicit: Option<String>) -> Result<()> {
 /// Run the wizard and, if it produced exactly one project, boot directly
 /// into its TUI. Any other end-state (cancelled, zero projects, more than
 /// one) exits cleanly — the user can re-run `shelbi` later.
-fn run_wizard_then_dispatch() -> Result<()> {
-    match commands::wizard::run()? {
+///
+/// `first_run` is true when `~/.shelbi/` did not exist before this
+/// invocation; the wizard prints the brand banner only in that case.
+fn run_wizard_then_dispatch(first_run: bool) -> Result<()> {
+    match commands::wizard::run(first_run)? {
         commands::wizard::WizardOutcome::Cancelled => return Ok(()),
         commands::wizard::WizardOutcome::Completed => {}
     }

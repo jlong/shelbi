@@ -14,7 +14,14 @@ pub enum WizardOutcome {
     Cancelled,
 }
 
-pub fn run() -> Result<WizardOutcome> {
+/// Run the wizard. When `first_run` is true (no `~/.shelbi/` existed
+/// before this invocation), the banner + tagline is printed once at the
+/// very top, before any prompt. Re-entries (`shelbi wizard` after the
+/// home dir exists, `shelbi project add`) pass `false`.
+pub fn run(first_run: bool) -> Result<WizardOutcome> {
+    if first_run {
+        wizard::print_banner();
+    }
     match wizard::phase_1_assistant_name() {
         Ok(()) => {}
         Err(e) if is_cancel(&e) => return Ok(WizardOutcome::Cancelled),
