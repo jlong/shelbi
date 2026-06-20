@@ -89,6 +89,23 @@ pub fn kill_review_pane(host: &Host, addr: &TmuxAddr) -> Result<()> {
     Ok(())
 }
 
+/// Look up the project + task on disk and kick off the review for it.
+/// Returns the tmux target string (`session:window`) of the review pane
+/// the caller should focus. Used by the TUI's sidebar and the Ctrl+P
+/// palette so they share one code path.
+pub fn start_review_by_id(project_name: &str, task_id: &str) -> Result<String> {
+    let project = shelbi_state::load_project(project_name)?;
+    let tf = shelbi_state::load_task(project_name, task_id)?;
+    let machine = resolve_review_machine(&project, &tf.task, None)?;
+    let addr = start_review(ReviewSpec {
+        project: &project,
+        machine,
+        task: &tf.task,
+        task_body: &tf.body,
+    })?;
+    Ok(addr.target())
+}
+
 /// Spec passed to `start_review`. The body is the task's markdown body
 /// (the prompt context the user gave the worker), included in the
 /// reviewer's opening prompt so it knows what the work was for.

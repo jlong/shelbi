@@ -14,7 +14,7 @@
 //! call into `ensure_dashboard()` so the bootstrap is idempotent and
 //! consistent.
 
-use shelbi_core::{Error, MachineKind, Result, TmuxAddr};
+use shelbi_core::{Error, Host, MachineKind, Result, TmuxAddr};
 
 pub mod review;
 pub mod worker;
@@ -129,6 +129,90 @@ pub fn show_view(project_name: &str, view: &str) -> Result<()> {
         .args(["select-pane", "-t", &dashboard])
         .status();
     Ok(())
+}
+
+/// Focus the dashboard window on the declared worker's pane.
+///
+/// Local workers live in a window named after the worker inside the
+/// project session (placed there by `shelbi task start`). Remote workers
+/// live in their own tmux session on the remote machine — we surface them
+/// by maintaining a *proxy window* in the project session, named after
+/// the worker, whose command is `ssh -t <host> tmux attach -t
+/// shelbi-w-<worker>`. The proxy is created lazily on first selection and
+/// re-used on subsequent selections; closing it (e.g. detaching from the
+/// remote tmux) lets the next selection spawn a fresh one.
+///
+/// Single source of truth for the sidebar's Enter-on-worker behavior and
+/// the Ctrl+P palette's worker entries — both call here so they can't
+/// drift.
+pub fn focus_worker(project_name: &str, worker_name: &str) -> Result<()> {
+    let project = shelbi_state::load_project(project_name)?;
+    let worker = project.worker(worker_name).ok_or_else(|| {
+        Error::Other(format!(
+            "worker `{worker_name}` not declared in project YAML"
+        ))
+    })?;
+    let machine = project.machine(&worker.machine).ok_or_else(|| {
+        Error::Other(format!(
+            "worker `{worker_name}` references unknown machine `{}`",
+            worker.machine
+        ))
+    })?;
+
+    let project_session = format!("shelbi-{project_name}");
+    let target = format!("{project_session}:{}", worker.name);
+
+    // Window already in the project session — local worker window OR a
+    // remote proxy window we created earlier. Just switch to it.
+    if run_local_tmux(["select-window", "-t", &target]) {
+        return Ok(());
+    }
+
+    match machine.host() {
+        Host::Local => Err(Error::Other(format!(
+            "worker has no live pane — assign a task with \
+             `shelbi task start <task> --worker {worker_name}`"
+        ))),
+        Host::Ssh { host } => {
+            let remote_session = format!("shelbi-w-{}", worker.name);
+            let cmd = format!(
+                "ssh -t {host} tmux attach -t {remote_session}",
+                host = shelbi_agent::shell_escape(&host),
+                remote_session = shelbi_agent::shell_escape(&remote_session),
+            );
+            let ok = run_local_tmux([
+                "new-window",
+                "-t",
+                &format!("{project_session}:"),
+                "-n",
+                &worker.name,
+                "sh",
+                "-c",
+                &cmd,
+            ]);
+            if !ok {
+                return Err(Error::Other(format!(
+                    "couldn't open proxy window for remote worker `{worker_name}` on `{host}`"
+                )));
+            }
+            let _ = run_local_tmux(["select-window", "-t", &target]);
+            Ok(())
+        }
+    }
+}
+
+fn run_local_tmux<I, S>(args: I) -> bool
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<std::ffi::OsStr>,
+{
+    std::process::Command::new("tmux")
+        .args(args)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
 }
 
 /// Idempotently set up the project's tmux session with a `dashboard`

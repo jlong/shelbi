@@ -1,6 +1,8 @@
 //! `shelbi __palette PROJECT` — full-screen ratatui picker meant to run
-//! inside a `tmux display-popup`. Lists the orchestrator + every active
-//! agent + global actions; on Enter, performs the action and exits.
+//! inside a `tmux display-popup`. Lists every destination the sidebar can
+//! reach (Chat, Tasks, each declared worker, each review-ready task, each
+//! legacy spawned agent) plus the global actions; on Enter, performs the
+//! action and exits.
 
 use std::io;
 use std::time::Duration;
@@ -19,9 +21,9 @@ use ratatui::{
     widgets::{List, ListItem, ListState, Paragraph},
     Frame, Terminal,
 };
-use shelbi_core::{Agent, Status};
+use shelbi_core::{Agent, Column, Status};
 use shelbi_palette::{Entry, EntryKind};
-use shelbi_state::ProjectSummary;
+use shelbi_state::{ProjectSummary, TaskFile};
 
 pub fn run(project: String) -> Result<()> {
     let mut term = setup_terminal()?;
@@ -45,7 +47,7 @@ pub fn run(project: String) -> Result<()> {
         switch_to_project(&target)?;
     } else if let Ok(Some(entry)) = chosen {
         if entry.id != "action:switch-project" {
-            dispatch(&project, &entry, &state.agents)?;
+            dispatch(&project, &entry)?;
         }
     }
     Ok(())
@@ -55,19 +57,19 @@ struct State {
     query: String,
     selected: usize,
     all_entries: Vec<Entry>,
-    agents: Vec<Agent>,
     project: String,
 }
 
 impl State {
     fn new(project: &str) -> Result<Self> {
+        let workers = load_workers(project).unwrap_or_default();
+        let review_queue = load_review_queue(project);
         let agents = load_agents(project).unwrap_or_default();
-        let all_entries = build_entries(&agents);
+        let all_entries = build_entries(&workers, &review_queue, &agents);
         Ok(Self {
             query: String::new(),
             selected: 0,
             all_entries,
-            agents,
             project: project.to_string(),
         })
     }
@@ -214,34 +216,50 @@ fn render(f: &mut Frame, state: &State, results: &[(Entry, u16)]) {
 
 // ---------------------------------------------------------------------------
 // Entry building + dispatch
+//
+// Order mirrors `App::rows()` in shelbi-tui: Chat, Tasks, then workers,
+// then review-ready tasks, then legacy spawned agents, then the two
+// global actions. An empty-query palette should read top-to-bottom like
+// the sidebar.
 
-fn build_entries(agents: &[Agent]) -> Vec<Entry> {
+fn build_entries(
+    workers: &[WorkerEntry],
+    review_queue: &[TaskFile],
+    agents: &[Agent],
+) -> Vec<Entry> {
     let mut out = vec![
         Entry {
             id: "view:orch".into(),
-            label: "orchestrator".into(),
+            label: "Chat".into(),
             kind: EntryKind::View,
             subtitle: Some("the claude pane you talk to".into()),
         },
         Entry {
             id: "view:tasks".into(),
-            label: "tasks".into(),
+            label: "Tasks".into(),
             kind: EntryKind::View,
             subtitle: Some("live `shelbi list`".into()),
         },
-        Entry {
-            id: "view:review".into(),
-            label: "review".into(),
-            kind: EntryKind::View,
-            subtitle: Some("agents waiting on you".into()),
-        },
-        Entry {
-            id: "view:machines".into(),
-            label: "machines".into(),
-            kind: EntryKind::View,
-            subtitle: Some("project machines + hosts".into()),
-        },
     ];
+    for w in workers {
+        out.push(Entry {
+            id: format!("worker:{}", w.name),
+            label: w.name.clone(),
+            kind: EntryKind::Agent,
+            subtitle: Some(format!("worker · {}", w.machine)),
+        });
+    }
+    for tf in review_queue {
+        out.push(Entry {
+            id: format!("review:{}", tf.task.id),
+            label: tf.task.title.clone(),
+            kind: EntryKind::Action,
+            subtitle: Some(match tf.task.assigned_to.as_deref() {
+                Some(w) => format!("review · {w}"),
+                None => "review".into(),
+            }),
+        });
+    }
     for a in agents {
         out.push(Entry {
             id: format!("agent:{}", a.id),
@@ -252,42 +270,40 @@ fn build_entries(agents: &[Agent]) -> Vec<Entry> {
     }
     out.push(Entry {
         id: "action:switch-project".into(),
-        label: "Switch project".into(),
+        label: "Switch Project".into(),
         kind: EntryKind::Action,
         subtitle: Some("fuzzy-pick another project and swap the dashboard".into()),
     });
     out.push(Entry {
         id: "action:quit".into(),
-        label: "quit shelbi".into(),
+        label: "Quit Shelbi".into(),
         kind: EntryKind::Action,
         subtitle: Some("kill the shelbi-<project> tmux session".into()),
     });
     out
 }
 
-fn dispatch(project: &str, entry: &Entry, _agents: &[Agent]) -> Result<()> {
-    match entry.kind {
-        EntryKind::View => {
-            let view = entry
-                .id
-                .strip_prefix("view:")
-                .unwrap_or("orch");
-            shelbi_orchestrator::show_view(project, view)
-                .map_err(|e| anyhow::anyhow!(e))?;
-        }
-        EntryKind::Agent => {
-            let id = entry
-                .id
-                .strip_prefix("agent:")
-                .unwrap_or(&entry.label);
-            run_tmux(["select-window", "-t", &format!("shelbi-{project}:{id}")]);
-        }
-        EntryKind::Action => match entry.id.as_str() {
-            "action:quit" => {
-                run_tmux(["kill-session", "-t", &format!("shelbi-{project}")]);
-            }
-            _ => {}
-        },
+fn dispatch(project: &str, entry: &Entry) -> Result<()> {
+    if let Some(view) = entry.id.strip_prefix("view:") {
+        shelbi_orchestrator::show_view(project, view).map_err(|e| anyhow::anyhow!(e))?;
+        return Ok(());
+    }
+    if let Some(worker) = entry.id.strip_prefix("worker:") {
+        shelbi_orchestrator::focus_worker(project, worker).map_err(|e| anyhow::anyhow!(e))?;
+        return Ok(());
+    }
+    if let Some(task_id) = entry.id.strip_prefix("review:") {
+        let target = shelbi_orchestrator::review::start_review_by_id(project, task_id)
+            .map_err(|e| anyhow::anyhow!(e))?;
+        run_tmux(["select-window", "-t", &target]);
+        return Ok(());
+    }
+    if let Some(id) = entry.id.strip_prefix("agent:") {
+        run_tmux(["select-window", "-t", &format!("shelbi-{project}:{id}")]);
+        return Ok(());
+    }
+    if entry.id == "action:quit" {
+        run_tmux(["kill-session", "-t", &format!("shelbi-{project}")]);
     }
     Ok(())
 }
@@ -302,6 +318,36 @@ where
         .status()
         .map(|s| s.success())
         .unwrap_or(false)
+}
+
+/// Minimal palette-side view of a declared worker — just what the entry
+/// list needs (name for the label, machine for the subtitle). Mirrors the
+/// sidebar's worker rows in shelbi-tui without dragging in `WorkerOverview`
+/// (which carries badge state the palette doesn't render).
+struct WorkerEntry {
+    name: String,
+    machine: String,
+}
+
+fn load_workers(project: &str) -> Result<Vec<WorkerEntry>> {
+    let p = shelbi_state::load_project(project).map_err(|e| anyhow::anyhow!(e))?;
+    let mut out = Vec::with_capacity(p.workers.len());
+    for worker in &p.workers {
+        // Silently skip mis-configured workers — same forgiveness the
+        // sidebar uses; surfacing them in the palette would just be noise.
+        if p.machine(&worker.machine).is_none() {
+            continue;
+        }
+        out.push(WorkerEntry {
+            name: worker.name.clone(),
+            machine: worker.machine.clone(),
+        });
+    }
+    Ok(out)
+}
+
+fn load_review_queue(project: &str) -> Vec<TaskFile> {
+    shelbi_state::list_column(project, Column::Review).unwrap_or_default()
 }
 
 fn load_agents(project: &str) -> Result<Vec<Agent>> {
