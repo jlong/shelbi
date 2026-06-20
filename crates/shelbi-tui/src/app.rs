@@ -2,7 +2,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use ratatui::layout::Rect;
-use shelbi_core::{Agent, Column, Host, Status};
+use shelbi_core::{Agent, Column, Status};
 use shelbi_state::{load_worker_status, TaskFile, WorkerState};
 
 /// What's currently highlighted in the sidebar — drives selection logic
@@ -11,8 +11,10 @@ use shelbi_state::{load_worker_status, TaskFile, WorkerState};
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum View {
     /// One of the built-in views hosted as a hidden tmux pane: swap it
-    /// into the dashboard's right slot.
-    Builtin(&'static str), // "orch" | "tasks" | "review" | "machines"
+    /// into the dashboard's right slot. Sidebar nav uses `"orch"` and
+    /// `"tasks"`; the orchestrator can still serve `"review"` /
+    /// `"machines"` for callers that hold onto pane ids directly.
+    Builtin(&'static str),
     /// A declared worker (from project YAML) — switch tmux to its pane
     /// (local: window in the project session; remote: a proxy window in
     /// the project session that ssh-attaches to the worker's remote session).
@@ -127,9 +129,8 @@ impl App {
     /// under `— Ready for Review —`, then any legacy `shelbi spawn` agents
     /// under `— spawned —`. Each section header and its rows are dropped
     /// together when that group is empty — Review is intentionally not a
-    /// destination view, only an inline live list. The Machines view still
-    /// exists but is reachable only via the Ctrl+P palette; it rarely needs
-    /// a one-keystroke shortcut day-to-day.
+    /// destination view, only an inline live list. The Ctrl+P palette
+    /// mirrors this same set of rows for fuzzy access.
     pub fn rows(&self) -> Vec<Row> {
         let mut rows = vec![
             Row::Nav {
@@ -254,10 +255,12 @@ impl App {
                 Ok(()) => self.status_line = format!("▶ {name}"),
                 Err(e) => self.status_line = format!("show view `{name}` failed: {e}"),
             },
-            View::Worker(name) => match self.focus_worker(name) {
-                Ok(()) => self.status_line = format!("▶ {name}"),
-                Err(e) => self.status_line = format!("focus `{name}` failed: {e}"),
-            },
+            View::Worker(name) => {
+                match shelbi_orchestrator::focus_worker(&self.project_name, name) {
+                    Ok(()) => self.status_line = format!("▶ {name}"),
+                    Err(e) => self.status_line = format!("focus `{name}` failed: {e}"),
+                }
+            }
             View::Agent(id) => {
                 let target = format!("shelbi-{}:{}", self.project_name, id);
                 let out = run_tmux(["select-window", "-t", &target]);
@@ -280,82 +283,9 @@ impl App {
         }
     }
 
-    /// Switch the dashboard window to the worker's pane.
-    ///
-    /// Local workers live in a window named after the worker inside the
-    /// project session (placed there by `shelbi task start`). Remote workers
-    /// live in their own tmux session on the remote machine — we surface
-    /// them by maintaining a *proxy window* in the project session, named
-    /// after the worker, whose command is `ssh -t <host> tmux attach -t
-    /// shelbi-w-<worker>`. The proxy is created lazily on first selection
-    /// and re-used on subsequent selections; closing it (e.g. detaching
-    /// from the remote tmux) lets the next selection spawn a fresh one.
-    fn focus_worker(&self, name: &str) -> Result<()> {
-        let project = shelbi_state::load_project(&self.project_name)
-            .map_err(|e| anyhow::anyhow!("load project: {e}"))?;
-        let worker = project.worker(name).ok_or_else(|| {
-            anyhow::anyhow!("worker `{name}` not declared in project YAML")
-        })?;
-        let machine = project.machine(&worker.machine).ok_or_else(|| {
-            anyhow::anyhow!("worker `{name}` references unknown machine `{}`", worker.machine)
-        })?;
-
-        let project_session = format!("shelbi-{}", self.project_name);
-        let target = format!("{project_session}:{}", worker.name);
-
-        // Window already in the project session — local worker window OR a
-        // remote proxy window we created earlier. Just switch to it.
-        if run_tmux(["select-window", "-t", &target]) {
-            return Ok(());
-        }
-
-        match machine.host() {
-            Host::Local => Err(anyhow::anyhow!(
-                "worker has no live pane — assign a task with \
-                 `shelbi task start <task> --worker {name}`"
-            )),
-            Host::Ssh { host } => {
-                let remote_session = format!("shelbi-w-{}", worker.name);
-                let cmd = format!(
-                    "ssh -t {host} tmux attach -t {remote_session}",
-                    host = shelbi_agent::shell_escape(&host),
-                    remote_session = shelbi_agent::shell_escape(&remote_session),
-                );
-                let ok = run_tmux([
-                    "new-window",
-                    "-t",
-                    &format!("{project_session}:"),
-                    "-n",
-                    &worker.name,
-                    "sh",
-                    "-c",
-                    &cmd,
-                ]);
-                if !ok {
-                    return Err(anyhow::anyhow!(
-                        "couldn't open proxy window for remote worker `{name}` on `{host}`"
-                    ));
-                }
-                let _ = run_tmux(["select-window", "-t", &target]);
-                Ok(())
-            }
-        }
-    }
-
     fn start_review(&self, id: &str) -> Result<String> {
-        let project = shelbi_state::load_project(&self.project_name)?;
-        let tf = shelbi_state::load_task(&self.project_name, id)?;
-        let machine =
-            shelbi_orchestrator::review::resolve_review_machine(&project, &tf.task, None)?;
-        let addr = shelbi_orchestrator::review::start_review(
-            shelbi_orchestrator::review::ReviewSpec {
-                project: &project,
-                machine,
-                task: &tf.task,
-                task_body: &tf.body,
-            },
-        )?;
-        Ok(addr.target())
+        shelbi_orchestrator::review::start_review_by_id(&self.project_name, id)
+            .map_err(|e| anyhow::anyhow!(e))
     }
 }
 
@@ -881,8 +811,7 @@ mod tests {
     #[test]
     fn nav_is_chat_tasks_only_no_review_destination() {
         // The sidebar nav stays at two items — Review is surfaced inline
-        // as a live list below, never as a destination; Machines is reached
-        // via the Ctrl+P palette.
+        // as a live list below, never as a destination.
         let _g = TEST_LOCK.lock().unwrap();
         let home = fresh_home();
         std::env::set_var("SHELBI_HOME", &home);
