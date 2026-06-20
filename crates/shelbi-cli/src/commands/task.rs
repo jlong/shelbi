@@ -91,6 +91,11 @@ pub struct AddArgs {
     /// contain commas or shell metacharacters.
     #[arg(long = "depends-on", value_name = "ID")]
     pub depends_on: Vec<String>,
+    /// Hint to the orchestrator that this task should be assigned to a
+    /// worker on this machine. Persisted in the task frontmatter; the
+    /// orchestrator decides whether to honor it.
+    #[arg(long = "prefers-machine", value_name = "NAME")]
+    pub prefers_machine: Option<String>,
 }
 
 #[derive(Debug, ClapArgs)]
@@ -170,6 +175,7 @@ fn add(project: &str, args: AddArgs) -> Result<()> {
         assigned_to: None,
         branch: None,
         depends_on: dedup_preserving_order(args.depends_on.clone()),
+        prefers_machine: args.prefers_machine.clone(),
         created_at: now,
         updated_at: now,
     };

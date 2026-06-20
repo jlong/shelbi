@@ -417,6 +417,7 @@ mod tests {
             assigned_to: Some(worker.into()),
             branch: None,
             depends_on: Vec::new(),
+            prefers_machine: None,
             created_at: now,
             updated_at: now,
         }

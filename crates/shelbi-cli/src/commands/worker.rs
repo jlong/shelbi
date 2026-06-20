@@ -267,6 +267,7 @@ mod tests {
             assigned_to: assigned_to.map(str::to_string),
             branch: None,
             depends_on: Vec::new(),
+            prefers_machine: None,
             created_at: now,
             updated_at: now,
         }
