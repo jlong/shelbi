@@ -115,6 +115,14 @@ pub fn send_line(host: &Host, addr: &TmuxAddr, text: &str) -> Result<()> {
     Ok(())
 }
 
+/// Send a bare Enter keypress to the target — no text. Used to dismiss
+/// modal prompts (e.g. claude's "trust this folder" dialog, whose default
+/// selection is the affirmative option) without typing anything into them.
+pub fn send_enter(host: &Host, addr: &TmuxAddr) -> Result<()> {
+    shelbi_ssh::run_capture(host, ["tmux", "send-keys", "-t", &addr.target(), "Enter"])?;
+    Ok(())
+}
+
 /// Read the pane's current title, with the trailing newline trimmed. The
 /// hub uses this to poll workers for state markers — claude's hooks write
 /// `shelbi:<state>` to the title via OSC escapes (see
@@ -206,6 +214,20 @@ mod tests {
             i += 1;
         }
         out
+    }
+
+    #[test]
+    fn send_enter_argv_is_bare_enter() {
+        // send_enter sends an Enter keysym with no `-l` literal text — that's
+        // what lets it dismiss a modal without typing into it.
+        let cmd = shelbi_ssh::build_command(
+            &Host::Local,
+            ["tmux", "send-keys", "-t", "shelbi-w-bob:agent", "Enter"],
+        );
+        assert_eq!(
+            ssh_args(cmd),
+            vec!["tmux", "send-keys", "-t", "shelbi-w-bob:agent", "Enter"]
+        );
     }
 
     #[test]
