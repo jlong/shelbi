@@ -189,13 +189,42 @@ pub fn start_worker_on_task(spec: StartSpec<'_>) -> Result<TmuxAddr> {
     };
     shelbi_tmux::send_line(&host, &addr, &cd_launch)?;
 
-    // 6. Let the agent's TTY settle before we type into it (same reason as
-    //    spawn — banners + prompt redraws can swallow the first chars).
-    std::thread::sleep(std::time::Duration::from_millis(1500));
+    // 6. Wait for claude to render its input prompt before typing the task
+    //    body. A fixed sleep is unreliable: 1.5s is plenty locally but
+    //    remote workers boot in 3–5s (network + cold caches + worktree
+    //    materialization), so the prompt arrives before claude is reading
+    //    stdin and lands in the void. Poll the pane until the `❯` glyph —
+    //    claude's input prompt — is visible.
+    wait_for_claude_ready(&host, &addr, std::time::Duration::from_secs(15))?;
     let prompt = compose_prompt(spec.task_id, spec.branch, spec.task_body);
     shelbi_tmux::send_line(&host, &addr, &prompt)?;
 
     Ok(addr)
+}
+
+/// Poll the worker's pane until claude's input prompt glyph (`❯`) appears
+/// — i.e., claude has finished booting and is reading stdin. Errors out
+/// after `max` rather than silently sending into the void.
+fn wait_for_claude_ready(
+    host: &Host,
+    addr: &TmuxAddr,
+    max: std::time::Duration,
+) -> Result<()> {
+    let start = std::time::Instant::now();
+    loop {
+        let buf = shelbi_tmux::capture(host, addr)?;
+        if buf.contains('❯') {
+            return Ok(());
+        }
+        if start.elapsed() >= max {
+            return Err(Error::Other(format!(
+                "timed out after {:?} waiting for claude input prompt on {}",
+                max,
+                addr.target()
+            )));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(150));
+    }
 }
 
 /// Write the rendered worker `settings.json` to `<worktree>/.claude/` on
