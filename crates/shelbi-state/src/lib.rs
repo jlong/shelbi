@@ -157,8 +157,8 @@ fn migrate_worker_settings_template(project_dir: &Path) {
 /// [`DEFAULT_WORKER_SETTINGS_TEMPLATE`] when the file is missing — a fresh
 /// project that hasn't run `shelbi init --project` yet) and substitute
 /// `{{worker_permissions_mode}}` with `project.worker_permissions_mode`.
-/// The model documents `auto` as a shelbi-level alias for claude's
-/// `acceptEdits`, mapped here at render time.
+/// Claude Code understands `auto` natively (v2.1.83+, classifier-based);
+/// we pass it through unchanged.
 pub fn render_worker_settings(project: &Project) -> Result<String> {
     let path = worker_settings_template_path(project)?;
     let template = match fs::read_to_string(&path) {
@@ -168,11 +168,7 @@ pub fn render_worker_settings(project: &Project) -> Result<String> {
         }
         Err(e) => return Err(shelbi_core::Error::Io(e)),
     };
-    let mode = match project.worker_permissions_mode.as_str() {
-        "auto" => "acceptEdits",
-        other => other,
-    };
-    Ok(template.replace("{{worker_permissions_mode}}", mode))
+    Ok(template.replace("{{worker_permissions_mode}}", &project.worker_permissions_mode))
 }
 
 fn expand_tilde(p: &Path) -> PathBuf {
@@ -714,8 +710,8 @@ mod tests {
         // No template at ~/.shelbi/projects/myapp/worker-settings.json.template yet.
         let p = fixture_project("myapp", None);
         let rendered = render_worker_settings(&p).unwrap();
-        // `auto` is mapped to `acceptEdits`.
-        assert!(rendered.contains("\"defaultMode\": \"acceptEdits\""));
+        // `auto` passes through — claude understands it natively (v2.1.83+).
+        assert!(rendered.contains("\"defaultMode\": \"auto\""));
         assert!(!rendered.contains("{{worker_permissions_mode}}"));
         let _: serde_json::Value = serde_json::from_str(&rendered).unwrap();
         std::env::remove_var("SHELBI_HOME");
@@ -736,7 +732,7 @@ mod tests {
         .unwrap();
         let rendered = render_worker_settings(&p).unwrap();
         assert!(rendered.contains("\"custom\":true"));
-        assert!(rendered.contains("\"defaultMode\":\"acceptEdits\""));
+        assert!(rendered.contains("\"defaultMode\":\"auto\""));
         std::env::remove_var("SHELBI_HOME");
     }
 
@@ -764,7 +760,7 @@ mod tests {
         assert!(s.contains("shelbi:blocked"));
         assert!(s.contains("shelbi:working"));
         // The rendered file is JSON after placeholder substitution.
-        let rendered = s.replace("{{worker_permissions_mode}}", "acceptEdits");
+        let rendered = s.replace("{{worker_permissions_mode}}", "auto");
         let _: serde_json::Value =
             serde_json::from_str(&rendered).expect("template renders to valid JSON");
     }

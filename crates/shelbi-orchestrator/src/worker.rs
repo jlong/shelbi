@@ -168,10 +168,17 @@ pub fn start_worker_on_task(spec: StartSpec<'_>) -> Result<TmuxAddr> {
     let worktree = worker_worktree(&machine, spec.worker);
     let addr = worker_tmux_addr(spec.project, spec.worker)?;
 
-    // 0. Clear any stale review marker left in the worktree from a previous
-    //    task before we reuse the worktree — otherwise the poller could read
-    //    an old task id and misfire. Best-effort: a failure here shouldn't
-    //    block standing up the worker.
+    // 0a. If the project asks for auto-mode, claude must be v2.1.83+. Older
+    //     versions silently fall back to `default` and the user gets a Bash
+    //     prompt on every command — exactly the bug we're trying to avoid.
+    //     Surface it up front so the failure mode is "shelbi rejected this
+    //     machine" instead of "my worker keeps pausing for no reason."
+    require_auto_mode_supported(&host, &runner, &spec.project.worker_permissions_mode)?;
+
+    // 0b. Clear any stale review marker left in the worktree from a previous
+    //     task before we reuse the worktree — otherwise the poller could read
+    //     an old task id and misfire. Best-effort: a failure here shouldn't
+    //     block standing up the worker.
     let marker = worker_review_marker(&machine, spec.worker);
     let _ = clear_review_marker(&host, &marker);
 
@@ -266,6 +273,85 @@ pub fn start_worker_on_task(spec: StartSpec<'_>) -> Result<TmuxAddr> {
     shelbi_tmux::send_line(&host, &addr, &prompt)?;
 
     Ok(addr)
+}
+
+/// The minimum claude version that understands `defaultMode: "auto"`. Older
+/// versions silently fall back to `default` and the worker pauses on every
+/// Bash prompt.
+const CLAUDE_AUTO_MODE_MIN: (u32, u32, u32) = (2, 1, 83);
+
+/// If the project wants auto-mode and the runner is claude, ensure the
+/// worker host's claude is new enough to understand it. Quiet pass-through
+/// when the probe fails for unrelated reasons (claude missing from PATH,
+/// weird output) — `wait_for_claude_ready` will surface a launch failure
+/// downstream with a clearer signal than "version probe failed."
+fn require_auto_mode_supported(
+    host: &Host,
+    runner: &shelbi_core::AgentRunnerSpec,
+    mode: &str,
+) -> Result<()> {
+    if mode != "auto" {
+        return Ok(());
+    }
+    // Only the `claude` CLI honors the `defaultMode` setting; other runners
+    // (codex etc.) ignore it, so the version probe is meaningless for them.
+    if std::path::Path::new(&runner.command).file_name().and_then(|s| s.to_str()) != Some("claude") {
+        return Ok(());
+    }
+    let Some(version) = probe_claude_version(host) else {
+        eprintln!(
+            "shelbi: couldn't read `claude --version` on {host:?}; \
+             skipping auto-mode compatibility check (claude {}+ required)",
+            format_version(CLAUDE_AUTO_MODE_MIN),
+        );
+        return Ok(());
+    };
+    if version < CLAUDE_AUTO_MODE_MIN {
+        return Err(Error::Other(format!(
+            "claude {} on this worker is too old for worker_permissions_mode: auto \
+             (need {}+, classifier-based auto-approval). Either upgrade claude on the \
+             worker host, or set `worker_permissions_mode` in this project's config to \
+             `acceptEdits` (auto-accept edits but still gate Bash) or `bypassPermissions` \
+             (no seatbelt — auto-accept everything).",
+            format_version(version),
+            format_version(CLAUDE_AUTO_MODE_MIN),
+        )));
+    }
+    Ok(())
+}
+
+/// Run `claude --version` on `host` and parse `(major, minor, patch)` from
+/// its stdout. Returns `None` on any failure — caller decides how to react.
+///
+/// Local: shelbi's own PATH (inherited from the user's terminal) already
+/// has claude. Remote: ssh's default non-login shell strips Homebrew /
+/// nvm / asdf off PATH, so we re-exec through `$SHELL -lc` to source the
+/// user's login rc — same trick we use to launch the agent itself.
+fn probe_claude_version(host: &Host) -> Option<(u32, u32, u32)> {
+    let out = match host {
+        Host::Local => shelbi_ssh::run(host, ["claude", "--version"]).ok()?,
+        Host::Ssh { .. } => {
+            shelbi_ssh::run(host, ["$SHELL", "-lc", "'claude --version'"]).ok()?
+        }
+    };
+    if !out.status.success() {
+        return None;
+    }
+    parse_claude_version(&String::from_utf8_lossy(&out.stdout))
+}
+
+/// Parse `2.1.83 (Claude Code)` (or similar) into `(2, 1, 83)`.
+fn parse_claude_version(s: &str) -> Option<(u32, u32, u32)> {
+    let token = s.split_whitespace().next()?;
+    let mut parts = token.split('.');
+    let major = parts.next()?.parse().ok()?;
+    let minor = parts.next()?.parse().ok()?;
+    let patch = parts.next()?.parse().ok()?;
+    Some((major, minor, patch))
+}
+
+fn format_version((maj, min, pat): (u32, u32, u32)) -> String {
+    format!("{maj}.{min}.{pat}")
 }
 
 /// How long to wait for claude's input box to appear before giving up and
@@ -724,6 +810,55 @@ mod tests {
             marker,
             PathBuf::from("/tmp/myapp/.shelbi/wt/alice/.claude/shelbi-review-ready")
         );
+    }
+
+    #[test]
+    fn parses_typical_claude_version_output() {
+        assert_eq!(parse_claude_version("2.1.83 (Claude Code)\n"), Some((2, 1, 83)));
+        assert_eq!(parse_claude_version("2.1.153 (Claude Code)"), Some((2, 1, 153)));
+        assert_eq!(parse_claude_version("10.0.0\n"), Some((10, 0, 0)));
+    }
+
+    #[test]
+    fn rejects_unparseable_version_output() {
+        // Empty, garbage, missing patch — never block startup on a parse
+        // failure; the caller falls back to a warning + proceed.
+        assert_eq!(parse_claude_version(""), None);
+        assert_eq!(parse_claude_version("not a version\n"), None);
+        assert_eq!(parse_claude_version("2.1\n"), None);
+        assert_eq!(parse_claude_version("2.x.83\n"), None);
+    }
+
+    #[test]
+    fn auto_mode_min_orders_correctly() {
+        // Tuple comparison is the whole point of the check — verify it
+        // behaves the way the require_… code assumes.
+        assert!((2, 1, 83) >= CLAUDE_AUTO_MODE_MIN);
+        assert!((2, 1, 153) >= CLAUDE_AUTO_MODE_MIN);
+        assert!((2, 2, 0) >= CLAUDE_AUTO_MODE_MIN);
+        assert!((3, 0, 0) >= CLAUDE_AUTO_MODE_MIN);
+        assert!((2, 1, 82) < CLAUDE_AUTO_MODE_MIN);
+        assert!((2, 0, 100) < CLAUDE_AUTO_MODE_MIN);
+        assert!((1, 9, 9) < CLAUDE_AUTO_MODE_MIN);
+    }
+
+    #[test]
+    fn require_auto_mode_no_op_for_non_auto_modes() {
+        // Skip the probe entirely if the user picked anything other than
+        // `auto` — other modes don't depend on the classifier.
+        let runner = AgentRunnerSpec { command: "claude".into(), flags: vec![] };
+        for mode in ["acceptEdits", "bypassPermissions", "plan", "default"] {
+            require_auto_mode_supported(&Host::Local, &runner, mode).unwrap();
+        }
+    }
+
+    #[test]
+    fn require_auto_mode_skips_non_claude_runners() {
+        // Auto mode is a claude setting; codex / other runners ignore the
+        // `defaultMode` key, so probing their `--version` would be both
+        // pointless and misleading.
+        let runner = AgentRunnerSpec { command: "codex".into(), flags: vec!["--print".into()] };
+        require_auto_mode_supported(&Host::Local, &runner, "auto").unwrap();
     }
 
     #[test]
