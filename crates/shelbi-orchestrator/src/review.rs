@@ -60,30 +60,60 @@ pub fn resolve_review_machine<'a>(
         .ok_or_else(|| Error::Other("project has no local machine to review on".into()))
 }
 
-/// Idempotent teardown. OK if the pane was never created.
+/// Idempotent teardown. OK if the pane was never created. On the SSH path
+/// the whole session is dedicated to review, so we key liveness off
+/// `has_session` rather than a window-name match — tmux's
+/// `automatic-rename` retitles the window once claude takes over the
+/// pane, so a name-based check would miss live sessions and let the next
+/// `new_session` collide. (Same reasoning as `kill_worker_pane`.) After
+/// killing we poll until tmux confirms the session is gone, so a flaky
+/// SSH round-trip surfaces as a clear error instead of a silent skip
+/// followed by a `duplicate session` failure on `new_session`.
 pub fn kill_review_pane(host: &Host, addr: &TmuxAddr) -> Result<()> {
-    // List-windows is the cheapest existence probe that also gives us
-    // info; we don't actually parse it, we just check exit.
-    let probe = shelbi_ssh::run(
-        host,
-        ["tmux", "list-windows", "-t", &addr.session, "-F", "#W"],
-    )
-    .map_err(Error::Io)?;
-    if !probe.status.success() {
-        return Ok(());
-    }
-    let stdout = String::from_utf8_lossy(&probe.stdout);
-    if !stdout.lines().any(|w| w.trim() == addr.window) {
-        return Ok(());
-    }
     match host {
         Host::Local => {
+            // Local: the review window is one of many in the shared
+            // project session. We still gate the kill on a window
+            // probe — `kill-window -t session:review` would otherwise
+            // return non-zero if the window was auto-renamed away, and
+            // that's not actionable.
+            let probe = shelbi_ssh::run(
+                host,
+                ["tmux", "list-windows", "-t", &addr.session, "-F", "#W"],
+            )
+            .map_err(Error::Io)?;
+            if !probe.status.success() {
+                return Ok(());
+            }
+            let stdout = String::from_utf8_lossy(&probe.stdout);
+            if !stdout.lines().any(|w| w.trim() == addr.window) {
+                return Ok(());
+            }
             let _ = shelbi_ssh::run(host, ["tmux", "kill-window", "-t", &addr.target()])
                 .map_err(Error::Io)?;
         }
         Host::Ssh { .. } => {
+            if !shelbi_tmux::has_session(host, &addr.session)? {
+                return Ok(());
+            }
             let _ = shelbi_ssh::run(host, ["tmux", "kill-session", "-t", &addr.session])
                 .map_err(Error::Io)?;
+            // tmux normally tears the session down synchronously, but if
+            // the kill races (or the SSH round-trip swallowed an error)
+            // we must NOT return Ok with a live session — start_review's
+            // next step is `new_session` and the names would collide.
+            for _ in 0..20 {
+                if !shelbi_tmux::has_session(host, &addr.session)? {
+                    return Ok(());
+                }
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            return Err(Error::Other(format!(
+                "tmux session `{}` still present after kill-session — \
+                 review cannot start; try `tmux kill-session -t {}` on \
+                 the remote and retry",
+                addr.session, addr.session
+            )));
         }
     }
     Ok(())
