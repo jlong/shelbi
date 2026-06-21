@@ -42,6 +42,11 @@ pub enum TaskCmd {
         id: String,
         #[arg(long, value_name = "COLUMN")]
         to: String,
+        /// Reason string recorded in `~/.shelbi/events.log`. The
+        /// orchestrator parses this to identify auto-dispatch moves vs.
+        /// user-driven ones. Defaults to `user:cli`.
+        #[arg(long, value_name = "REASON")]
+        reason: Option<String>,
     },
     /// Assign a task to a worker. Worker must be declared in project YAML.
     Assign {
@@ -62,6 +67,12 @@ pub enum TaskCmd {
         /// Override the default branch name (`shelbi/<task-id>`).
         #[arg(long)]
         branch: Option<String>,
+        /// Reason string recorded in `~/.shelbi/events.log` when the
+        /// column transitions into `in_progress`. The orchestrator uses
+        /// this to identify auto-dispatch starts vs. user-driven ones.
+        /// Defaults to `user:cli:start`.
+        #[arg(long, value_name = "REASON")]
+        reason: Option<String>,
     },
     /// Re-order a task within its column.
     Prio(PrioArgs),
@@ -137,10 +148,12 @@ pub fn run(project_opt: Option<String>, cmd: TaskCmd) -> Result<()> {
         TaskCmd::List { column, ready } => list(&project, column.as_deref(), ready),
         TaskCmd::Show { id } => show(&project, &id),
         TaskCmd::Depends(args) => depends(&project, args),
-        TaskCmd::Move { id, to } => move_to(&project, &id, &to),
+        TaskCmd::Move { id, to, reason } => move_to(&project, &id, &to, reason.as_deref()),
         TaskCmd::Assign { id, to } => assign(&project, &id, &to),
         TaskCmd::Unassign { id } => unassign(&project, &id),
-        TaskCmd::Start { id, worker, branch } => start(&project, &id, worker.as_deref(), branch.as_deref()),
+        TaskCmd::Start { id, worker, branch, reason } => {
+            start(&project, &id, worker.as_deref(), branch.as_deref(), reason.as_deref())
+        }
         TaskCmd::Prio(args) => prio(&project, args),
         TaskCmd::Edit { id } => edit(&project, &id),
         TaskCmd::Rm { id } => rm(&project, &id),
@@ -333,9 +346,15 @@ fn depends(project: &str, args: DependsArgs) -> Result<()> {
     Ok(())
 }
 
-fn move_to(project: &str, id: &str, to: &str) -> Result<()> {
+fn move_to(project: &str, id: &str, to: &str, reason: Option<&str>) -> Result<()> {
     let column = Column::from_str(to).map_err(|e| anyhow!(e))?;
-    shelbi_state::move_task(project, id, column).map_err(|e| anyhow!(e))?;
+    let moved = shelbi_state::move_task(project, id, column).map_err(|e| anyhow!(e))?;
+    if let Some((from, to_col)) = moved {
+        let reason = reason.unwrap_or("user:cli");
+        if let Err(e) = shelbi_state::append_task_event(id, from, to_col, reason) {
+            eprintln!("warning: append_task_event failed: {e}");
+        }
+    }
     println!("✓ {id} → {column}");
     Ok(())
 }
@@ -404,6 +423,7 @@ fn start(
     id: &str,
     worker_arg: Option<&str>,
     branch_arg: Option<&str>,
+    reason: Option<&str>,
 ) -> Result<()> {
     let project_yaml = shelbi_state::load_project(project).map_err(|e| anyhow!(e))?;
     let mut tf = shelbi_state::load_task(project, id).map_err(|e| anyhow!(e))?;
@@ -481,6 +501,12 @@ fn start(
     shelbi_state::save_task(project, &tf.task, &tf.body).map_err(|e| anyhow!(e))?;
     if prev_column != Column::InProgress {
         shelbi_state::renumber_column(project, prev_column).map_err(|e| anyhow!(e))?;
+        let reason = reason.unwrap_or("user:cli:start");
+        if let Err(e) =
+            shelbi_state::append_task_event(id, prev_column, Column::InProgress, reason)
+        {
+            eprintln!("warning: append_task_event failed: {e}");
+        }
     }
 
     println!("✓ {id} → in_progress on {worker_name} ({})", addr.target());
@@ -550,6 +576,37 @@ fn slugify(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::commands::test_support::ENV_LOCK as TEST_LOCK;
+    use std::path::PathBuf;
+
+    fn fresh_home() -> PathBuf {
+        let p = std::env::temp_dir().join(format!(
+            "shelbi-cli-task-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&p).unwrap();
+        p
+    }
+
+    fn task_in(column: Column, id: &str) -> Task {
+        let now = Utc::now();
+        Task {
+            id: id.into(),
+            title: id.replace('-', " "),
+            column,
+            priority: 0,
+            assigned_to: None,
+            branch: None,
+            depends_on: Vec::new(),
+            prefers_machine: None,
+            created_at: now,
+            updated_at: now,
+        }
+    }
 
     #[test]
     fn slugify_basic() {
@@ -558,5 +615,71 @@ mod tests {
         assert_eq!(slugify("CSV → JSON"), "csv-json");
         assert_eq!(slugify("---"), "");
         assert_eq!(slugify("Already-kebab-OK"), "already-kebab-ok");
+    }
+
+    #[test]
+    fn move_to_writes_default_reason_to_events_log() {
+        let _g = TEST_LOCK.lock().unwrap();
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+
+        shelbi_state::save_task("p", &task_in(Column::Backlog, "a"), "").unwrap();
+        move_to("p", "a", "todo", None).unwrap();
+
+        let log = std::fs::read_to_string(shelbi_state::events_log_path().unwrap()).unwrap();
+        let lines: Vec<&str> = log.lines().collect();
+        assert_eq!(lines.len(), 1);
+        let line = lines[0];
+        assert!(line.contains(" task=a "), "line: {line}");
+        assert!(line.contains(" backlog -> todo "), "line: {line}");
+        assert!(line.ends_with("reason=user:cli"), "line: {line}");
+
+        std::env::remove_var("SHELBI_HOME");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn move_to_with_reason_flag_overrides_default() {
+        let _g = TEST_LOCK.lock().unwrap();
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+
+        shelbi_state::save_task("p", &task_in(Column::Todo, "b"), "").unwrap();
+        move_to("p", "b", "in_progress", Some("orchestrator:auto-dispatch worker=alpha"))
+            .unwrap();
+
+        let log = std::fs::read_to_string(shelbi_state::events_log_path().unwrap()).unwrap();
+        let lines: Vec<&str> = log.lines().collect();
+        assert_eq!(lines.len(), 1);
+        // sanitize_reason folds whitespace to underscores so the line stays
+        // parseable; the orchestrator parses by `reason=<prefix>:...`.
+        assert!(
+            lines[0].ends_with("reason=orchestrator:auto-dispatch_worker=alpha"),
+            "line: {}",
+            lines[0],
+        );
+
+        std::env::remove_var("SHELBI_HOME");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn move_to_no_op_emits_no_event() {
+        let _g = TEST_LOCK.lock().unwrap();
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+
+        shelbi_state::save_task("p", &task_in(Column::Todo, "c"), "").unwrap();
+        // Already in `todo` — move_task short-circuits, no event line.
+        move_to("p", "c", "todo", None).unwrap();
+
+        let path = shelbi_state::events_log_path().unwrap();
+        assert!(
+            !path.exists() || std::fs::read_to_string(&path).unwrap().is_empty(),
+            "no-op move must not write an events.log line",
+        );
+
+        std::env::remove_var("SHELBI_HOME");
+        let _ = std::fs::remove_dir_all(&home);
     }
 }

@@ -229,7 +229,13 @@ fn release_worker_tasks(project: &str, worker_name: &str) -> Result<Vec<String>>
         // file, so writing in this order keeps both changes in the final
         // on-disk state.
         shelbi_state::save_task(project, &task, &tf.body).map_err(|e| anyhow!(e))?;
-        shelbi_state::move_task(project, &id, Column::Todo).map_err(|e| anyhow!(e))?;
+        let moved = shelbi_state::move_task(project, &id, Column::Todo)
+            .map_err(|e| anyhow!(e))?;
+        if let Some((from, to)) = moved {
+            if let Err(e) = shelbi_state::append_task_event(&id, from, to, "worker:stop") {
+                eprintln!("warning: append_task_event failed: {e}");
+            }
+        }
         released.push(id);
     }
     Ok(released)
@@ -238,11 +244,9 @@ fn release_worker_tasks(project: &str, worker_name: &str) -> Result<Vec<String>>
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::commands::test_support::ENV_LOCK as TEST_LOCK;
     use shelbi_core::Task;
     use std::path::PathBuf;
-    use std::sync::Mutex;
-
-    static TEST_LOCK: Mutex<()> = Mutex::new(());
 
     fn fresh_home() -> PathBuf {
         let p = std::env::temp_dir().join(format!(
@@ -310,6 +314,19 @@ mod tests {
         assert_eq!(bob_task.task.assigned_to.as_deref(), Some("bob"));
         // After alice's task moves out, in_progress is renumbered 0..N.
         assert_eq!(bob_task.task.priority, 0);
+
+        // The release path emits a `worker:stop` task event so the
+        // orchestrator's events.log tail sees the column return.
+        let log = std::fs::read_to_string(shelbi_state::events_log_path().unwrap()).unwrap();
+        let lines: Vec<&str> = log.lines().collect();
+        assert_eq!(lines.len(), 1);
+        assert!(lines[0].contains(" task=fix-login "), "line: {}", lines[0]);
+        assert!(
+            lines[0].contains(" in_progress -> todo "),
+            "line: {}",
+            lines[0]
+        );
+        assert!(lines[0].ends_with("reason=worker:stop"), "line: {}", lines[0]);
 
         std::env::remove_var("SHELBI_HOME");
     }

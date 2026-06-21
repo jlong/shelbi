@@ -82,6 +82,17 @@ pub(crate) fn _marker_for_test(start: &Path) -> Result<Option<String>> {
 }
 
 #[cfg(test)]
+pub(crate) mod test_support {
+    use std::sync::Mutex;
+
+    /// Shared mutex for any test in this binary that mutates `SHELBI_HOME`.
+    /// Tests across the `task` and `worker` modules race on this env var,
+    /// so they must all lock the *same* static — per-module locks would
+    /// silently interleave and produce flaky failures.
+    pub static ENV_LOCK: Mutex<()> = Mutex::new(());
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
