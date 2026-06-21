@@ -21,7 +21,7 @@ use std::path::PathBuf;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-use shelbi_core::Result;
+use shelbi_core::{Column, Result};
 
 use crate::{atomic_write, ensure_dir, shelbi_home};
 
@@ -165,18 +165,50 @@ pub fn append_worker_event(
     prev: Option<WorkerState>,
     new: WorkerState,
 ) -> Result<()> {
+    let ts = Utc::now().to_rfc3339();
+    let prev_str = prev.map(|s| s.as_str()).unwrap_or("none");
+    append_event_line(&format!("{ts} worker={worker} {prev_str} -> {new}"))
+}
+
+/// Append `<rfc3339> task=<id> <from> -> <to> reason=<short>` to
+/// `~/.shelbi/events.log`. Shares the file with worker events; the
+/// orchestrator distinguishes the two by the `task=` vs `worker=` prefix.
+///
+/// `reason` should be a single short token (whitespace/newlines are folded
+/// to underscores so the line stays parseable).
+pub fn append_task_event(task_id: &str, from: Column, to: Column, reason: &str) -> Result<()> {
+    let ts = Utc::now().to_rfc3339();
+    let reason = sanitize_reason(reason);
+    append_event_line(&format!("{ts} task={task_id} {from} -> {to} reason={reason}"))
+}
+
+/// Open `events.log` with O_APPEND and write one terminated line in a
+/// single `write_all` call. POSIX guarantees that writes <= PIPE_BUF
+/// (4096B) under O_APPEND are atomic relative to other appenders, so
+/// concurrent writes from the CLI and the poller interleave whole lines
+/// rather than tearing. We must hand the kernel one finished buffer —
+/// `writeln!(f, …)` would split the line into separate `write` syscalls
+/// per format fragment, which the OS is free to interleave.
+fn append_event_line(line: &str) -> Result<()> {
     let path = events_log_path()?;
     if let Some(parent) = path.parent() {
         ensure_dir(parent)?;
     }
+    let mut buf = String::with_capacity(line.len() + 1);
+    buf.push_str(line);
+    buf.push('\n');
     let mut f = fs::OpenOptions::new()
         .create(true)
         .append(true)
         .open(&path)?;
-    let ts = Utc::now().to_rfc3339();
-    let prev_str = prev.map(|s| s.as_str()).unwrap_or("none");
-    writeln!(f, "{ts} worker={worker} {prev_str} -> {new}")?;
+    f.write_all(buf.as_bytes())?;
     Ok(())
+}
+
+fn sanitize_reason(s: &str) -> String {
+    s.chars()
+        .map(|c| if c.is_whitespace() { '_' } else { c })
+        .collect()
 }
 
 #[cfg(test)]
@@ -324,6 +356,127 @@ mod tests {
         assert!(lines[0].contains("worker=alpha"));
         assert!(lines[0].contains("none -> working"));
         assert!(lines[1].contains("working -> awaiting_input"));
+
+        std::env::remove_var("SHELBI_HOME");
+    }
+
+    #[test]
+    fn append_task_event_round_trips() {
+        let _g = TEST_LOCK.lock().unwrap();
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+
+        append_task_event("fix-login", Column::Todo, Column::InProgress, "assigned").unwrap();
+        append_task_event("fix-login", Column::InProgress, Column::Review, "worker_review")
+            .unwrap();
+
+        let log = std::fs::read_to_string(events_log_path().unwrap()).unwrap();
+        let lines: Vec<&str> = log.lines().collect();
+        assert_eq!(lines.len(), 2);
+
+        // Each line must split cleanly back into its fields.
+        let parsed: Vec<(&str, &str, &str, &str, &str, &str)> = lines
+            .iter()
+            .map(|line| {
+                let mut it = line.splitn(6, ' ');
+                let ts = it.next().unwrap();
+                let task = it.next().unwrap();
+                let from = it.next().unwrap();
+                let arrow = it.next().unwrap();
+                let to = it.next().unwrap();
+                let reason = it.next().unwrap();
+                (ts, task, from, arrow, to, reason)
+            })
+            .collect();
+
+        // Timestamp parses as RFC3339.
+        for (ts, ..) in &parsed {
+            chrono::DateTime::parse_from_rfc3339(ts)
+                .unwrap_or_else(|_| panic!("not rfc3339: {ts}"));
+        }
+        assert_eq!(parsed[0].1, "task=fix-login");
+        assert_eq!(parsed[0].2, "todo");
+        assert_eq!(parsed[0].3, "->");
+        assert_eq!(parsed[0].4, "in_progress");
+        assert_eq!(parsed[0].5, "reason=assigned");
+        assert_eq!(parsed[1].4, "review");
+        assert_eq!(parsed[1].5, "reason=worker_review");
+
+        std::env::remove_var("SHELBI_HOME");
+    }
+
+    #[test]
+    fn task_event_sanitizes_whitespace_in_reason() {
+        let _g = TEST_LOCK.lock().unwrap();
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+
+        append_task_event("a", Column::Todo, Column::Done, "user moved\nit").unwrap();
+        let log = std::fs::read_to_string(events_log_path().unwrap()).unwrap();
+        let lines: Vec<&str> = log.lines().collect();
+        // The reason newline must not produce a torn line.
+        assert_eq!(lines.len(), 1);
+        assert!(lines[0].ends_with("reason=user_moved_it"));
+
+        std::env::remove_var("SHELBI_HOME");
+    }
+
+    #[test]
+    fn concurrent_task_and_worker_appends_dont_tear() {
+        let _g = TEST_LOCK.lock().unwrap();
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+
+        const N: usize = 200;
+        let task_thread = std::thread::spawn(|| {
+            for i in 0..N {
+                append_task_event(
+                    &format!("t{i:04}"),
+                    Column::Todo,
+                    Column::InProgress,
+                    "assigned",
+                )
+                .unwrap();
+            }
+        });
+        let worker_thread = std::thread::spawn(|| {
+            for i in 0..N {
+                let prev = if i == 0 {
+                    None
+                } else {
+                    Some(WorkerState::Working)
+                };
+                append_worker_event("alpha", prev, WorkerState::AwaitingInput).unwrap();
+            }
+        });
+        task_thread.join().unwrap();
+        worker_thread.join().unwrap();
+
+        let log = std::fs::read_to_string(events_log_path().unwrap()).unwrap();
+        let lines: Vec<&str> = log.lines().collect();
+        assert_eq!(lines.len(), 2 * N, "expected {} lines, got {}", 2 * N, lines.len());
+
+        let mut task_lines = 0usize;
+        let mut worker_lines = 0usize;
+        for line in &lines {
+            // No line should mix prefixes — that would mean an interleaved
+            // write tore one record across another.
+            assert!(line.contains(" -> "), "malformed: {line:?}");
+            let has_task = line.contains(" task=");
+            let has_worker = line.contains(" worker=");
+            assert!(
+                has_task ^ has_worker,
+                "torn or unrecognized line: {line:?}"
+            );
+            if has_task {
+                task_lines += 1;
+                assert!(line.contains("reason="), "task line missing reason: {line:?}");
+            } else {
+                worker_lines += 1;
+            }
+        }
+        assert_eq!(task_lines, N);
+        assert_eq!(worker_lines, N);
 
         std::env::remove_var("SHELBI_HOME");
     }
