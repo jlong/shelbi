@@ -152,7 +152,7 @@ impl App {
         if !self.workers.is_empty() {
             rows.push(Row::Blank);
             rows.push(Row::Section {
-                label: "agents".into(),
+                label: "Agents".into(),
             });
             for w in &self.workers {
                 rows.push(Row::Worker {
@@ -629,7 +629,7 @@ mod tests {
         let rows = app.rows();
         assert_eq!(rows.len(), 6);
         assert!(matches!(&rows[2], Row::Blank));
-        assert!(matches!(&rows[3], Row::Section { label } if label == "agents"));
+        assert!(matches!(&rows[3], Row::Section { label } if label == "Agents"));
 
         // alpha (busy, no status file yet) — default to Working.
         assert_eq!(find_worker_badge(&rows, "alpha").unwrap(), WorkerBadge::Working);
