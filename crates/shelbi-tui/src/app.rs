@@ -144,11 +144,9 @@ impl App {
                 view: View::Builtin("tasks"),
             },
         ];
-        // After the first list section, subsequent section headers get an
-        // extra blank line above them so the break reads as a clean gap
-        // instead of a hairline. The first section keeps a single blank so
-        // it doesn't float far from the nav.
-        let mut had_section = false;
+        // Every list section header gets exactly one blank line above it,
+        // regardless of position, so all section breaks render as the same
+        // uniform gap.
         if !self.workers.is_empty() {
             rows.push(Row::Blank);
             rows.push(Row::Section {
@@ -161,13 +159,9 @@ impl App {
                     view: View::Worker(w.name.clone()),
                 });
             }
-            had_section = true;
         }
         if !self.review_queue.is_empty() {
             rows.push(Row::Blank);
-            if had_section {
-                rows.push(Row::Blank);
-            }
             rows.push(Row::Section {
                 label: "Ready for Review".into(),
             });
@@ -178,13 +172,9 @@ impl App {
                     view: View::ReviewTask(tf.task.id.clone()),
                 });
             }
-            had_section = true;
         }
         if !self.agents.is_empty() {
             rows.push(Row::Blank);
-            if had_section {
-                rows.push(Row::Blank);
-            }
             rows.push(Row::Section {
                 label: "spawned".into(),
             });
@@ -899,55 +889,10 @@ mod tests {
             &rows[section_idx + 1],
             Row::Review { title, worker, .. } if title == "Fix login" && worker.as_deref() == Some("delta")
         ));
-        // Two blank rows separate the agents list from the Ready for Review
-        // header so the break reads as a clean gap, not a hairline.
-        assert!(section_idx >= 2);
-        assert!(matches!(&rows[section_idx - 1], Row::Blank));
-        assert!(matches!(&rows[section_idx - 2], Row::Blank));
-        assert!(!matches!(&rows[section_idx - 3], Row::Blank));
-
-        std::env::remove_var("SHELBI_HOME");
-    }
-
-    #[test]
-    fn review_section_keeps_single_blank_when_no_agents_above() {
-        // With no workers declared, Ready for Review is the first list
-        // section under the nav — it should get a single blank above it,
-        // not two, so it doesn't float off the nav.
-        let _g = TEST_LOCK.lock().unwrap();
-        let home = fresh_home();
-        std::env::set_var("SHELBI_HOME", &home);
-
-        let mut project = fixture_project();
-        project.workers.clear();
-        shelbi_state::save_project(&project).unwrap();
-
-        let now = Utc::now();
-        shelbi_state::save_task(
-            "demo",
-            &Task {
-                id: "ready".into(),
-                title: "Fix login".into(),
-                column: Column::Review,
-                priority: 0,
-                assigned_to: None,
-                branch: None,
-                depends_on: Vec::new(),
-                prefers_machine: None,
-                created_at: now,
-                updated_at: now,
-            },
-            "",
-        )
-        .unwrap();
-
-        let mut app = App::new_sidebar("demo");
-        app.refresh().unwrap();
-        let rows = app.rows();
-        let section_idx = rows
-            .iter()
-            .position(|r| matches!(r, Row::Section { label } if label == "Ready for Review"))
-            .expect("Ready for Review header must render");
+        // Exactly one blank row separates the agents list from the Ready
+        // for Review header — every section header gets the same uniform
+        // single-blank gap.
+        assert!(section_idx >= 1);
         assert!(matches!(&rows[section_idx - 1], Row::Blank));
         assert!(!matches!(&rows[section_idx - 2], Row::Blank));
 
