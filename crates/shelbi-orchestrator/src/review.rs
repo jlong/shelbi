@@ -350,6 +350,7 @@ mod tests {
             assigned_to: Some("alice".into()),
             branch: Some("shelbi/fix-thing".into()),
             depends_on: Vec::new(),
+            prefers_machine: None,
             created_at: now,
             updated_at: now,
         };

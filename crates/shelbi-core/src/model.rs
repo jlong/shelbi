@@ -321,6 +321,11 @@ pub struct Task {
     /// field so cycle detection and dep editing only touch one file.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub depends_on: Vec<String>,
+    /// Optional hint to the orchestrator: prefer assigning this task to a
+    /// worker on the named machine. Persisted only; enforcement (or
+    /// override) is the orchestrator's choice.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prefers_machine: Option<String>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -453,6 +458,7 @@ updated_at: 2026-06-19T00:00:00Z
             assigned_to: None,
             branch: None,
             depends_on: vec!["b".into(), "c".into()],
+            prefers_machine: None,
             created_at: now,
             updated_at: now,
         };
@@ -467,6 +473,46 @@ updated_at: 2026-06-19T00:00:00Z
         // Unknown dep id is treated as not-done.
         cols.remove("c");
         assert!(task.is_blocked(&cols));
+    }
+
+    #[test]
+    fn task_prefers_machine_round_trips() {
+        let now = chrono::Utc::now();
+        let task = Task {
+            id: "linux-probe".into(),
+            title: "Tune the readiness probe".into(),
+            column: Column::Todo,
+            priority: 0,
+            assigned_to: None,
+            branch: None,
+            depends_on: vec![],
+            prefers_machine: Some("devbox".into()),
+            created_at: now,
+            updated_at: now,
+        };
+        let y = serde_yaml::to_string(&task).unwrap();
+        assert!(y.contains("prefers_machine: devbox"));
+        let back: Task = serde_yaml::from_str(&y).unwrap();
+        assert_eq!(back.prefers_machine.as_deref(), Some("devbox"));
+        // YAML representation is stable across a second round trip.
+        let y2 = serde_yaml::to_string(&back).unwrap();
+        assert_eq!(y, y2);
+    }
+
+    #[test]
+    fn task_prefers_machine_defaults_to_none_and_omits_in_serialization() {
+        let yaml = r#"
+id: a
+title: A
+column: todo
+priority: 0
+created_at: 2026-06-19T00:00:00Z
+updated_at: 2026-06-19T00:00:00Z
+"#;
+        let t: Task = serde_yaml::from_str(yaml).unwrap();
+        assert!(t.prefers_machine.is_none());
+        let back = serde_yaml::to_string(&t).unwrap();
+        assert!(!back.contains("prefers_machine"));
     }
 
     #[test]
