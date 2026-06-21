@@ -185,13 +185,29 @@ fn poll_one(
     // itself a no-op when the column is unchanged.
     if marker == PaneMarker::Review {
         if let Some(task_id) = &current_task {
-            if let Err(e) = shelbi_state::move_task(&project.name, task_id, Column::Review) {
-                tracing::warn!(
+            match shelbi_state::move_task(&project.name, task_id, Column::Review) {
+                Ok(Some((from, to))) => {
+                    if let Err(e) = shelbi_state::append_task_event(
+                        task_id,
+                        from,
+                        to,
+                        "worker:review-pane",
+                    ) {
+                        tracing::warn!(
+                            worker = %worker.name,
+                            task = %task_id,
+                            error = %e,
+                            "review handoff: append_task_event failed",
+                        );
+                    }
+                }
+                Ok(None) => {}
+                Err(e) => tracing::warn!(
                     worker = %worker.name,
                     task = %task_id,
                     error = %e,
                     "review handoff: move_task failed",
-                );
+                ),
             }
         }
     }
@@ -231,10 +247,23 @@ fn maybe_promote_to_review(
             if tf.task.column == Column::InProgress
                 && tf.task.assigned_to.as_deref() == Some(worker.name.as_str()) =>
         {
-            if let Err(e) = shelbi_state::move_task(&project.name, &task_id, Column::Review) {
-                // Leave the marker in place so we retry on the next tick.
-                tracing::warn!(worker = %worker.name, task = %task_id, error = %e, "move_task to review failed");
-                return;
+            match shelbi_state::move_task(&project.name, &task_id, Column::Review) {
+                Ok(Some((from, to))) => {
+                    if let Err(e) = shelbi_state::append_task_event(
+                        &task_id,
+                        from,
+                        to,
+                        "worker:review-marker",
+                    ) {
+                        tracing::warn!(worker = %worker.name, task = %task_id, error = %e, "append_task_event failed");
+                    }
+                }
+                Ok(None) => {}
+                Err(e) => {
+                    // Leave the marker in place so we retry on the next tick.
+                    tracing::warn!(worker = %worker.name, task = %task_id, error = %e, "move_task to review failed");
+                    return;
+                }
             }
             tracing::info!(worker = %worker.name, task = %task_id, "promoted task to review via marker");
         }
@@ -466,6 +495,24 @@ mod tests {
             "task should be promoted to review"
         );
         assert!(!marker.exists(), "marker should be consumed (cleared)");
+
+        // The promotion must also append a `task=...` line to events.log
+        // tagged with the marker-driven reason, so `shelbi events tail`
+        // surfaces the handoff as part of the canonical event stream.
+        let log = std::fs::read_to_string(shelbi_state::events_log_path().unwrap()).unwrap();
+        let task_lines: Vec<&str> =
+            log.lines().filter(|l| l.contains(" task=fix-login ")).collect();
+        assert_eq!(task_lines.len(), 1, "log: {log:?}");
+        assert!(
+            task_lines[0].contains(" in_progress -> review "),
+            "line: {}",
+            task_lines[0]
+        );
+        assert!(
+            task_lines[0].ends_with("reason=worker:review-marker"),
+            "line: {}",
+            task_lines[0]
+        );
 
         // A leftover/stale marker naming a task that's no longer in-progress
         // for this worker is cleared without moving anything back out.

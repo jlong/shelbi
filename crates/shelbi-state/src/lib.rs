@@ -497,12 +497,21 @@ fn find_cycle(graph: &HashMap<&str, &[String]>, start: &str) -> Option<Vec<Strin
 }
 
 /// Move `id` to `new_column`. The task lands at the bottom (priority = N)
-/// and the old column gets renumbered contiguous from 0. No-op if the
-/// column is unchanged.
-pub fn move_task(project: &str, id: &str, new_column: Column) -> Result<()> {
+/// and the old column gets renumbered contiguous from 0.
+///
+/// Returns `Some((from, to))` when the move happened, or `None` when the
+/// task was already in `new_column`. Callers use the returned columns to
+/// emit the `events.log` line — keeping the read inside this function
+/// keeps callers from having to re-read the file just to learn the prior
+/// column.
+pub fn move_task(
+    project: &str,
+    id: &str,
+    new_column: Column,
+) -> Result<Option<(Column, Column)>> {
     let TaskFile { mut task, body } = load_task(project, id)?;
     if task.column == new_column {
-        return Ok(());
+        return Ok(None);
     }
     let old_column = task.column;
     let new_priority = list_column(project, new_column)?.len() as u32;
@@ -511,7 +520,7 @@ pub fn move_task(project: &str, id: &str, new_column: Column) -> Result<()> {
     task.updated_at = chrono::Utc::now();
     save_task(project, &task, &body)?;
     renumber_column(project, old_column)?;
-    Ok(())
+    Ok(Some((old_column, new_column)))
 }
 
 /// Re-position `id` to slot `new_priority` within its current column. Other

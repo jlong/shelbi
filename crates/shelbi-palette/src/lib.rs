@@ -54,7 +54,7 @@ pub fn search(entries: &[Entry], query: &str) -> Vec<(Entry, u16)> {
         .iter()
         .filter_map(|e| score(&mut matcher, query, &e.label).map(|s| (e.clone(), s)))
         .collect();
-    hits.sort_by(|a, b| b.1.cmp(&a.1));
+    hits.sort_by_key(|h| std::cmp::Reverse(h.1));
     hits
 }
 

@@ -263,9 +263,17 @@ impl KanbanApp {
 
     fn move_card(&mut self, id: &str, new_col_idx: usize) {
         let new_col = self.column(new_col_idx);
-        if let Err(e) = shelbi_state::move_task(&self.project_name, id, new_col) {
-            self.status_line = format!("move failed: {e}");
-            return;
+        match shelbi_state::move_task(&self.project_name, id, new_col) {
+            Ok(Some((from, to))) => {
+                if let Err(e) = shelbi_state::append_task_event(id, from, to, "user:tui") {
+                    tracing::warn!(task = %id, error = %e, "append_task_event failed");
+                }
+            }
+            Ok(None) => {}
+            Err(e) => {
+                self.status_line = format!("move failed: {e}");
+                return;
+            }
         }
         self.status_line = format!("{id} → {new_col}");
         self.refresh();
@@ -766,5 +774,60 @@ mod tests {
         assert_eq!(app.selected_column, 2);
         assert_eq!(app.selected_row, 4);
         assert!(!app.popover_is_open());
+    }
+
+    /// Driving `move_card` should both persist the column change and append
+    /// a `task=...` line to `~/.shelbi/events.log` so the orchestrator's
+    /// live event tail picks up board nudges from the TUI.
+    #[test]
+    fn move_card_appends_user_tui_event() {
+        let _g = crate::test_support::ENV_LOCK.lock().unwrap();
+        let home = std::env::temp_dir().join(format!(
+            "shelbi-tui-move-card-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&home).unwrap();
+        std::env::set_var("SHELBI_HOME", &home);
+
+        use chrono::Utc;
+        let now = Utc::now();
+        let task = shelbi_core::Task {
+            id: "fix-login".into(),
+            title: "fix login".into(),
+            column: Column::Todo,
+            priority: 0,
+            assigned_to: None,
+            branch: None,
+            depends_on: Vec::new(),
+            prefers_machine: None,
+            created_at: now,
+            updated_at: now,
+        };
+        shelbi_state::save_task("demo", &task, "").unwrap();
+
+        let mut app = KanbanApp::new("demo");
+        app.refresh();
+        // Place the cursor on `fix-login` in the todo column (index 1).
+        app.selected_column = 1;
+        app.selected_row = 0;
+        app.move_card_right();
+
+        let log = std::fs::read_to_string(shelbi_state::events_log_path().unwrap()).unwrap();
+        let lines: Vec<&str> = log.lines().collect();
+        assert_eq!(lines.len(), 1, "log: {log:?}");
+        assert!(lines[0].contains(" task=fix-login "), "line: {}", lines[0]);
+        assert!(
+            lines[0].contains(" todo -> in_progress "),
+            "line: {}",
+            lines[0]
+        );
+        assert!(lines[0].ends_with("reason=user:tui"), "line: {}", lines[0]);
+
+        std::env::remove_var("SHELBI_HOME");
+        let _ = std::fs::remove_dir_all(&home);
     }
 }
