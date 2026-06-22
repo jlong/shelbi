@@ -11,7 +11,7 @@ The need is twofold:
 
 These two surfaces want to share styling, navigation, and deploy pipeline. One Next.js app, two content modes (marketing pages + MDX docs).
 
-The 32pixels brand system gives us a starting template: `~/Workspaces/32pixels/contextstore-website` (Next 16, marketing-only, beta signup) and `~/Workspaces/32pixels/website` (Next 15 + contentlayer + MDX blog). We borrow conventions liberally; visual identity is fresh per user direction.
+The 32pixels Next.js sites give us a tooling template: `~/Workspaces/32pixels/contextstore-website` (Next 16, marketing-only) and `~/Workspaces/32pixels/website` (Next 15 + contentlayer + MDX blog). We borrow the file conventions, dependency choices, and 8px spacing system — but the visual identity is shelbi's own (see §3).
 
 ## Design
 
@@ -30,9 +30,7 @@ shelbi/
 │   │   │   └── layout.tsx
 │   │   ├── docs/
 │   │   │   └── [[...slug]]/page.tsx   # catch-all renders MDX
-│   │   ├── api/
-│   │   │   └── subscribe/route.ts     # newsletter signup endpoint
-│   │   ├── actions.ts                 # server actions
+│   │   ├── opengraph-image.tsx        # @vercel/og — homepage card
 │   │   ├── layout.tsx
 │   │   ├── globals.css
 │   │   └── favicon.ico
@@ -83,7 +81,8 @@ Pinned to the contextstore-website lineage:
 - **motion** for animations
 - **clsx** + **tailwind-merge**
 - **@vercel/analytics**
-- **Resend** for newsletter (matches the 32pixels website)
+- **@vercel/og** for programmatic OG cards
+- **asciinema-player** for the hero cast embed
 
 Critical reminder mirrored into `site/AGENTS.md`: this is Next 16. Read `node_modules/next/dist/docs/` before writing route handlers, server actions, or layouts — APIs and conventions differ from training data.
 
