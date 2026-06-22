@@ -148,11 +148,20 @@ Sections, top to bottom:
 
 No newsletter signup. CTAs are direct: install or read.
 
-**Asciinema specifics (open):**
-- Cast recorded against a fresh `shelbi wizard` flow on a clean machine — exact scenario tracked as a Phase 1 sub-task.
-- Player: `asciinema-player` via npm; loaded only when the section enters the viewport.
-- Theme: matches the strict-mono palette. Use the `--theme` flag at record time or pass a custom theme to the player (`asciinema-player` accepts CSS variables).
-- Total length target: 45–60 seconds. Long enough to land the kanban-flow story, short enough that nobody bounces.
+**Asciinema specifics:**
+
+- **Scenario:** multi-worker showcase. Three workers (alpha/bravo/charlie) declared and idle. Three small tasks added in quick succession, all promoted to todo. The orchestrator dispatches each to a different worker; cards animate across columns in parallel; review markers appear in sequence at the end.
+- **Storyboard timing (target ~45s):**
+  - 0:00 — TUI open, three workers idle in sidebar.
+  - 0:05 — `shelbi task add` three times: small labeled tasks (e.g., "Update README", "Bump dependency", "Add license header").
+  - 0:10 — promote all three to todo via the kanban view.
+  - 0:12 — auto-dispatch lines fire; alpha picks A, bravo picks B, charlie picks C.
+  - 0:25 — cards visibly move through `in_progress` in parallel as each worker reports.
+  - 0:40 — review markers land; all three tasks land in `review` column.
+  - 0:45 — pause on the final board state.
+- **Authenticity caveat:** real workers can't realistically complete tasks in ~15s. Two options to make the cast work: (a) pre-script a rehearsed run with shorter "dummy" tasks that genuinely complete fast, (b) edit the cast minimally to trim long pauses. Prefer (a) — the cast must remain an honest recording.
+- **Player:** `asciinema-player` via npm; loaded only when the section enters the viewport.
+- **Theme:** matches the strict-mono palette via the player's CSS variable hooks.
 
 ### 5. Docs surface (`app/docs/[[...slug]]/page.tsx`)
 
@@ -180,7 +189,7 @@ Content scoping for v1:
 - One page per top-level subcommand (`shelbi task`, `shelbi worker`, `shelbi review`, `shelbi events`, `shelbi merge`, `shelbi reload`). Each page is hand-authored MDX for v1; structure mirrors `--help` output. Auto-generation deferred until the surface stabilizes.
 
 **Changelog**
-- Single `changelog.mdx` page at `/docs/changelog`. v1 implementation tracked as an open question: hand-maintained MDX vs build-time fetch from the GitHub Releases API. Both viable; both fit the sidebar slot identically.
+- Single `changelog.mdx` page at `/docs/changelog`. Hand-maintained: when cutting a release, prepend a new entry. Format: `### v0.x.0 — YYYY-MM-DD` header, prose summary, code samples where useful. Workflow tradeoff is one new ritual at release time in exchange for narrative control.
 
 Each MDX file ships with frontmatter:
 
