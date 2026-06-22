@@ -140,7 +140,7 @@ Sections, top to bottom:
 
 1. **Hero** — wordmark + tagline + primary CTA ("Install now" → `/docs/getting-started/install`) + secondary CTA ("Read the docs"). Background uses the block-character motif as a subtle pattern. Short value statement: one sentence on what shelbi is, one on who it's for. No email field.
 2. **The pitch in 30 seconds** — three-up grid: *Plan tasks*, *Workers do them*, *You review and merge*. Each cell is an icon + ~30 words + a deep link into the docs.
-3. **Live preview (asciinema)** — embedded asciinema cast of the actual TUI: `shelbi wizard` → add a task → promote → auto-dispatch → review handoff. Player loaded async; static frame as fallback for OG cards and prefetch. Re-record when the TUI surface changes materially.
+3. **Live preview (asciinema)** — embedded asciinema cast of the actual TUI showing the multi-worker scenario (full storyboard below). Player loaded async on viewport entry. Re-record when the TUI surface changes materially. OG cards are not derived from the cast — they're rendered separately by `@vercel/og` (see §6).
 4. **Feature grid** — six cells covering Kanban board, multi-machine workers, orchestrator auto-dispatch, review flow, events log, tmux-native. Style: small icon top-left, label, single-sentence elaboration.
 5. **Install CTA (closer)** — second install pitch near the bottom: code block of the install command + link to "Build from source" in docs.
 6. **Footer** — repo link, license, copyright, links to docs / changelog.
@@ -243,7 +243,7 @@ Three phases, each independently shippable:
 
 **Phase 1 — Skeleton & landing**
 - Register `shelbi.dev` and point at Vercel.
-- Scaffold `site/` from the contextstore-website template.
+- Scaffold `site/` borrowing file structure and dependency conventions from contextstore-website (no visual treatment — shelbi's identity is its own, per §3).
 - Wire Tailwind v4 with 8px spacing, Heroicons, motion, Geist Sans + Geist Mono.
 - Build the marketing landing page in its final layout (hero, three-up, asciinema, feature grid, install closer, footer).
 - Record and embed the asciinema cast.
@@ -256,7 +256,7 @@ Three phases, each independently shippable:
 - Migrate getting-started content from the README.
 - Concepts pages (workers / columns / events log / orchestrator).
 - CLI reference pages (hand-authored).
-- Changelog page (decision pending: hand-maintained MDX vs GitHub Releases fetch).
+- Changelog page (`/docs/changelog`, hand-maintained MDX) with an initial entry.
 
 **Phase 3 — Polish**
 - Trim the README to elevator-pitch + links.
