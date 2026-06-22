@@ -215,6 +215,18 @@ Domain: `shelbi.dev`, registered ahead of Phase 1. Vercel-generated URL as the s
 
 Analytics: `@vercel/analytics` mounted in the root layout.
 
+**OG cards (per-page):** programmatic via `@vercel/og`. One reusable `OgCard` component renders at build/edge time, parameterized by page title and section. Strict-mono palette, Geist Sans for the title, block-character "SHELBI" wordmark on the left, page title and `shelbi.dev` on the right.
+
+```tsx
+// app/opengraph-image.tsx (homepage)
+// app/docs/[...slug]/opengraph-image.tsx (per docs page)
+export default async function OG({ params }) {
+  // pull title from MDX frontmatter, render OgCard
+}
+```
+
+Every URL — homepage, docs index, every docs page — gets its own card with the page's own title. No static `og.png` fallback to maintain.
+
 ### 7. Migrating README content
 
 The README today is doing four jobs at once. Once the site ships:
@@ -263,10 +275,11 @@ Three phases, each independently shippable:
 - **Changelog:** reserved nav slot in the docs sidebar; single page (source TBD — see open questions).
 - **CLI reference:** hand-authored MDX for v1. Auto-generation deferred until the `--help` surface stabilizes.
 - **Shiki theme:** `vesper` for Phase 1; swap if it doesn't read against the strict-mono palette.
+- **Changelog source:** hand-maintained MDX at `/docs/changelog`. Prepend a new entry at each release; full prose + formatting control.
+- **Asciinema scenario:** multi-worker showcase — 3 workers, 3 small dummy tasks dispatched in parallel, ~45s. Honest recording with rehearsed fast-completing tasks rather than post-edited pauses.
+- **OG cards:** `@vercel/og` programmatic. One reusable component, per-page titles, strict-mono + Geist on every URL.
 
 ## Open questions
 
-- **Changelog source.** Hand-maintained MDX (simple, requires discipline) vs build-time fetch from the GitHub Releases API (auto-current, adds build-time network call and a token). Decide before Phase 2 lands the page.
-- **Asciinema recording scenario.** Need a scripted scenario for the cast: which workers to declare, which task to demo, target length (~45–60s). Resolve during Phase 1 alongside the recording session.
-- **OG image strategy.** Static frame from the asciinema cast, or a separately-designed OG card with the wordmark + tagline? Static frame is faster; designed OG card looks better in cards on Twitter/Slack.
+_None remaining — plan is ready to execute. Phase 1 sub-tasks (asciinema recording scenario specifics, exact install command, OG component design) will surface during implementation but don't need pre-commitment._
 - **Code highlighting theme.** Strict mono + Geist Mono biases toward `vesper` (mostly-mono Shiki theme) or a custom mono-only theme. Trial `vesper` in Phase 1.
