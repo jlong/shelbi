@@ -1,0 +1,107 @@
+---
+title: shelbi vs OpenHands
+competitor: OpenHands
+order: 2
+summary: shelbi orchestrates the agent CLIs you already trust across every machine you own; OpenHands ships its own sandboxed agent and a cloud automation platform. Here's how to choose.
+---
+
+## shelbi and OpenHands solve the same problem from opposite ends of the stack
+
+Both let you ship real changes with AI coding agents, not just autocomplete.
+But OpenHands gives you *the agent and the sandbox it runs in*, while shelbi
+gives you *the control room* for running the agents you already trust — many of
+them, in parallel, across your own machines.
+
+## At a glance
+
+| | shelbi | OpenHands |
+|---|---|---|
+| What it is | Agent orchestrator for the terminal | Autonomous coding agent + cloud/enterprise platform |
+| The agent | None of its own — drives your CLI (Claude Code, Codex, aider) | Ships the CodeAct agent, which writes and runs Python + bash to act |
+| Where work runs | Many workers in parallel across laptop + remote machines over SSH | One agent per conversation inside a sandboxed runtime |
+| Isolation unit | A git worktree on its own branch, per task | A Docker / Apptainer / remote container, per conversation |
+| Runtime deps | `ssh`, `tmux`, `git`, your agent CLI — no daemons, no servers | Docker (often Docker-in-Docker), agent/automation servers, optional Kubernetes |
+| State | Plain markdown + YAML files on disk | An event-sourced action/observation stream inside the platform |
+| Interface | Two-pane terminal TUI | Web GUI (Agent Canvas), CLI, headless, IDE plugins, SDK |
+| Models | Whatever your agent CLI already uses | Model-agnostic via LiteLLM (Claude, OpenAI, Gemini, local, …) |
+| License & cost | MIT; a single self-installed binary | MIT core + paid hosted cloud + custom-priced Enterprise |
+
+## Where shelbi excels
+
+- **It orchestrates the agents you already trust — it doesn't replace them.**
+  OpenHands is built around its own CodeAct agent. shelbi ships no agent of its
+  own; you point it at whatever CLI you run — `claude`, `codex`, `aider`,
+  anything you can drive interactively. Runners are declared per project, so you
+  can hand backend tasks to one runner and front-end tasks to another without
+  changing tools or relearning a workflow.
+
+- **Many workers in parallel, across every machine you own.** OpenHands runs one
+  agent per conversation inside a sandbox. shelbi runs a pool of named workers
+  concurrently — on your laptop *and* on remote boxes reached over SSH — each in
+  its own git worktree on its own branch. A Mac mini in the closet plus a Linux
+  workstation become a worker pool; the orchestrator picks the highest-priority
+  unblocked task and dispatches it the moment a worker frees up.
+
+- **No daemons, no servers, no Docker-in-Docker.** OpenHands centers on a
+  container runtime — Docker (frequently Docker-in-Docker), agent and automation
+  servers, optional Kubernetes at the enterprise tier — and its docs note the
+  setup "takes real effort." shelbi needs only `ssh`, `tmux`, `git`, and your
+  agent CLI on each machine. Adding a remote worker is a few lines in a YAML file
+  and a `shelbi reload`.
+
+- **State is plain text you can grep, diff, and edit.** OpenHands keeps
+  conversation state as an event-sourced stream inside the platform. shelbi keeps
+  every task, log, and worker status as markdown or YAML under `~/.shelbi/` — no
+  database. A task is just a markdown file with frontmatter (`column`, `branch`,
+  `depends_on`, …); move it between Kanban columns from the TUI or by editing the
+  file in your editor.
+
+- **Review and merge without leaving the terminal.** When a worker finishes, its
+  card lands in a `Ready for Review` queue. Activating it checks the branch out
+  on the machine that ran the task and spawns a fresh agent pane there to
+  interrogate the diff; approve to merge into the default branch, or push and open
+  a PR with `--pr`. The whole loop — dispatch, watch, review, merge — stays in one
+  two-pane TUI.
+
+## Where OpenHands excels
+
+- **It brings its own agent — and a strong one.** If you don't already have an
+  agent CLI you trust, OpenHands hands you the CodeAct agent out of the box. It's
+  among the strongest open agents on SWE-bench Verified — independent reviews cite
+  roughly 72% with Claude Sonnet 4.5, with higher figures on newer models and
+  pass@k. shelbi deliberately ships nothing here; it assumes you bring your own.
+
+- **A real sandboxed execution environment.** OpenHands runs the agent inside an
+  isolated runtime (Docker, Apptainer, or remote) complete with an in-sandbox
+  VS Code IDE, a VNC desktop, and a persistent Chromium browser, plus an optional
+  action-confirmation gate and security analysis before risky commands run.
+  shelbi delegates isolation to git worktrees and to your agent CLI's own
+  safeguards; it does not sandbox execution itself.
+
+- **Org-wide automation and a GUI for non-terminal users.** OpenHands Cloud and
+  the Agent Canvas add scheduled and event-triggered automation wired into Slack,
+  GitHub, Jira, Linear, Notion, and HubSpot, a browser GUI, and an enterprise tier
+  with SSO and VPC self-hosting. shelbi is a terminal tool with no hosted SaaS, no
+  GUI, and no per-seat tier.
+
+- **Deterministic replay and self-verification.** Because every action and
+  observation is an immutable event, OpenHands can replay and recover runs
+  deterministically, and its 2026 Verification Stack layers critic models so the
+  agent catches its own mistakes before producing output. shelbi has no
+  equivalent agent-level verification layer — that responsibility lives with the
+  agent you plug in.
+
+## Choose shelbi if…
+
+You live in the terminal, already run an agent CLI you trust, and want to run
+many of them at once across the machines you already own — each task isolated on
+its own branch, all state in plain files you can read, with no servers to stand
+up and no per-seat bill.
+
+## Choose OpenHands if…
+
+You want a capable autonomous agent and the sandbox to run it in without
+assembling your own; you need org-wide automation triggered from Slack or Jira,
+or a browser GUI for teammates who don't live in a terminal; or you want
+enterprise SSO and VPC self-hosting with a support SLA, deterministic replay,
+and built-in verification.
