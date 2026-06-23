@@ -32,7 +32,7 @@ VM, works on its own branch, can run terminal commands / install
 packages / run tests / browse the web, and opens a pull request when
 done. You can fire one off from the editor, the web dashboard, Slack, a
 GitHub or Bitbucket PR comment, or Linear, then close your laptop while
-it works. It is an IDE/cloud-embedded async agent — the same job shelbi
+it works. It is an IDE/cloud-embedded async agent — the same job Shelbi
 solves, but delivered through Cursor's editor and hosted cloud rather
 than a terminal.
 
@@ -353,17 +353,17 @@ against capability, and directly affects credit consumption.
   secure-sandbox-by-default on macOS, faster cloud-agent startup, and a
   99.9% reliability claim.
 
-## Where shelbi differs
+## Where Shelbi differs
 
 These are factual axes of difference, not claims of superiority.
 
-- **Surface.** shelbi is terminal-native; Cursor's Background/Cloud
+- **Surface.** Shelbi is terminal-native; Cursor's Background/Cloud
   Agents are embedded in the Cursor editor and Cursor's web/cloud
   surfaces.
 - **Where it runs.** Cursor Background Agents default to
   **Cursor-managed cloud VMs** (with read-write
   GitHub/GitLab/Bitbucket/Azure access), and even BYO-compute modes keep
-  the agent loop in Cursor's cloud; shelbi's execution model is not that
+  the agent loop in Cursor's cloud; Shelbi's execution model is not that
   hosted-cloud-by-default model.
 - **Licensing.** Cursor is a **proprietary commercial** product from
   Anysphere; the comparison page should state shelbi's own licensing
