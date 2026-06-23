@@ -156,7 +156,17 @@ impl KanbanApp {
 
     pub fn column_tasks(&self, col_idx: usize) -> Vec<&TaskFile> {
         let col = self.column(col_idx);
-        self.tasks.iter().filter(|tf| tf.task.column == col).collect()
+        let mut tasks: Vec<&TaskFile> =
+            self.tasks.iter().filter(|tf| tf.task.column == col).collect();
+        // Done shows most-recently-completed first: `updated_at` is rewritten
+        // on the move-into-done write, so it's a stable proxy for completion
+        // time. Other columns keep their priority order (the natural order of
+        // `self.tasks`). Stable sort → equal timestamps preserve that order,
+        // so identical-state polls don't reshuffle / flicker.
+        if col == Column::Done {
+            tasks.sort_by(|a, b| b.task.updated_at.cmp(&a.task.updated_at));
+        }
+        tasks
     }
 
     /// Snapshot of every task's column, for the blocked derivation. Built
@@ -734,6 +744,80 @@ mod tests {
 
     fn hit(area: Rect, col_idx: usize, row_idx: usize) -> CardHit {
         CardHit { area, col_idx, row_idx }
+    }
+
+    fn task_file(id: &str, column: Column, priority: u32, updated: &str) -> TaskFile {
+        let updated_at = chrono::DateTime::parse_from_rfc3339(updated)
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        TaskFile {
+            task: shelbi_core::Task {
+                id: id.to_string(),
+                title: id.to_string(),
+                column,
+                priority,
+                assigned_to: None,
+                branch: None,
+                depends_on: Vec::new(),
+                created_at: updated_at,
+                updated_at,
+            },
+            body: String::new(),
+        }
+    }
+
+    const DONE_IDX: usize = 4;
+    const BACKLOG_IDX: usize = 0;
+
+    #[test]
+    fn done_column_orders_newest_completed_first() {
+        let mut app = KanbanApp::new("demo");
+        // Insert in priority order; updated_at is intentionally out of order.
+        app.tasks = vec![
+            task_file("old", Column::Done, 0, "2026-06-20T10:00:00Z"),
+            task_file("newest", Column::Done, 1, "2026-06-22T10:00:00Z"),
+            task_file("middle", Column::Done, 2, "2026-06-21T10:00:00Z"),
+        ];
+        let ids: Vec<&str> = app
+            .column_tasks(DONE_IDX)
+            .iter()
+            .map(|tf| tf.task.id.as_str())
+            .collect();
+        assert_eq!(ids, vec!["newest", "middle", "old"]);
+    }
+
+    #[test]
+    fn non_done_columns_keep_priority_order() {
+        let mut app = KanbanApp::new("demo");
+        app.tasks = vec![
+            task_file("a", Column::Backlog, 0, "2026-06-20T10:00:00Z"),
+            task_file("b", Column::Backlog, 1, "2026-06-22T10:00:00Z"),
+            task_file("c", Column::Backlog, 2, "2026-06-21T10:00:00Z"),
+        ];
+        let ids: Vec<&str> = app
+            .column_tasks(BACKLOG_IDX)
+            .iter()
+            .map(|tf| tf.task.id.as_str())
+            .collect();
+        assert_eq!(ids, vec!["a", "b", "c"]);
+    }
+
+    #[test]
+    fn done_sort_is_stable_for_equal_timestamps() {
+        let mut app = KanbanApp::new("demo");
+        // Equal updated_at → stable sort preserves the priority order, so a
+        // re-poll of the same state never reshuffles (no flicker).
+        app.tasks = vec![
+            task_file("first", Column::Done, 0, "2026-06-20T10:00:00Z"),
+            task_file("second", Column::Done, 1, "2026-06-20T10:00:00Z"),
+            task_file("third", Column::Done, 2, "2026-06-20T10:00:00Z"),
+        ];
+        let ids: Vec<&str> = app
+            .column_tasks(DONE_IDX)
+            .iter()
+            .map(|tf| tf.task.id.as_str())
+            .collect();
+        assert_eq!(ids, vec!["first", "second", "third"]);
     }
 
     #[test]
