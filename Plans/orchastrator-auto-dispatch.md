@@ -6,7 +6,7 @@ Today the orchestrator (the Claude pane in `shelbi-shelbi:dashboard`) is reactiv
 
 The user wants the orchestrator to *be* the scheduler — actively keeping workers busy without being asked. The dispatch decision belongs in the orchestrator's reasoning loop (so it can apply judgment: routing, priority, retries, holding off when something looks wrong), not in deterministic Rust code. To do that the orchestrator needs a live view of the board.
 
-shelbi already has the plumbing for a live view: `~/.shelbi/events.log` is an append-only transition log, written by the poller for worker state changes, and consumed by `shelbi events tail --follow`. Today it only carries worker events. The minimal change is to extend the same log to also carry **task** column transitions, then point the orchestrator at it as its live feed. The initial snapshot comes from `shelbi task list` and `shelbi worker list` — both already exist. No new CLI subcommand.
+Shelbi already has the plumbing for a live view: `~/.shelbi/events.log` is an append-only transition log, written by the poller for worker state changes, and consumed by `shelbi events tail --follow`. Today it only carries worker events. The minimal change is to extend the same log to also carry **task** column transitions, then point the orchestrator at it as its live feed. The initial snapshot comes from `shelbi task list` and `shelbi worker list` — both already exist. No new CLI subcommand.
 
 ## Design
 
