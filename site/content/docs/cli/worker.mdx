@@ -1,0 +1,96 @@
+---
+title: shelbi worker
+order: 21
+summary: Inspect and control the project's declared worker pool — list slots, kill panes, read observed state.
+---
+
+# shelbi worker
+
+```text
+shelbi worker <SUBCOMMAND> [OPTIONS]
+```
+
+`shelbi worker` is read-mostly. The pool itself is declared in the project
+YAML and doesn't change at runtime — there's no `worker add` or `worker rm`
+on the CLI. What you do here is observe (what's idle, what's working, whose
+pane died) and intervene (kill a pane to release a stuck task).
+
+Every subcommand accepts the global `-p / --project <PROJECT>` flag. Omitted
+from the per-subcommand tables for readability.
+
+## list
+
+```text
+shelbi worker list
+```
+
+Print every declared worker as a row: name, machine, runner, the task it's
+currently working (if any), and whether its tmux pane is live. This is the
+first command the orchestrator runs at session start to snapshot the pool;
+it's the same snapshot you want when answering "who's free right now?"
+
+## stop
+
+```text
+shelbi worker stop [OPTIONS] <NAME>
+```
+
+Kill the worker's tmux pane. By default the in-flight task is released back
+to `todo` and its `assigned_to` field is cleared — the board never shows an
+orphaned `in_progress` card pointing at a dead pane. Pass `--keep-task` when
+you're about to restart on the same task and don't want the card to move.
+
+| Flag | Type | Default | Description |
+| --- | --- | --- | --- |
+| `<NAME>` | string | — | Worker name (positional, required). |
+| `--keep-task` | flag | off | Leave the in-flight task in `in_progress` with `assigned_to` pointing at this worker. |
+
+## status
+
+```text
+shelbi worker status [NAME]
+```
+
+Print observed worker state from the hub-side poller — reads
+`~/.shelbi/workers/<name>/status.yaml` files; no tmux probing. Cheaper than
+`list` and safe to call repeatedly. With a `NAME`, prints a single row plus
+the raw status.yaml contents.
+
+| Flag | Type | Default | Description |
+| --- | --- | --- | --- |
+| `[NAME]` | string | — | Worker to inspect (positional, optional). Omit to show every declared worker. |
+
+## Examples
+
+Snapshot the pool to find a free worker:
+
+```bash
+shelbi worker list
+```
+
+Kill a stuck worker and let the board release its task:
+
+```bash
+shelbi worker stop bravo
+```
+
+Restart a worker on the same task without losing the card:
+
+```bash
+shelbi worker stop charlie --keep-task
+shelbi task start docs-write-cli-reference-pages
+```
+
+Inspect a single worker's raw status without spawning a tmux probe:
+
+```bash
+shelbi worker status alpha
+```
+
+## See also
+
+- [Workers](/docs/concepts/workers) — the lifecycle states the
+  status command reports (`idle`, `working`, `awaiting_input`,
+  `awaiting_review`).
+- [Orchestrator](/docs/concepts/orchestrator) — how the scheduler
+  picks a free worker for the next ready task.

@@ -1,0 +1,76 @@
+---
+title: shelbi events
+order: 23
+summary: Inspect the hub-global worker-state transition log — the same feed the orchestrator reacts to.
+---
+
+# shelbi events
+
+```text
+shelbi events <SUBCOMMAND> [OPTIONS]
+```
+
+`shelbi events` exposes `~/.shelbi/events.log`, the append-only log that
+records every column transition and every worker state change across the
+entire hub. The orchestrator follows this log as its trigger stream — when
+you want to see what the orchestrator is seeing, run `events tail --follow`
+in another pane.
+
+Lines come in two shapes:
+
+```text
+<ts> task=<id> <from> -> <to> reason=<short>
+<ts> worker=<name> <prev> -> <new>
+```
+
+Every subcommand accepts the global `-p / --project <PROJECT>` flag.
+
+## tail
+
+```text
+shelbi events tail [OPTIONS]
+```
+
+Print recent transitions, and optionally stream new ones as they're
+appended. Useful for live debugging, for orchestrator bootstrap (`--follow`
+in the background and watch with `Monitor`), and for post-hoc forensics
+(`--since 1h` to scope to a window).
+
+| Flag | Type | Default | Description |
+| --- | --- | --- | --- |
+| `-n, --lines <LINES>` | integer | `20` | Number of trailing lines to print before following (or before exiting if `--follow` is not set). |
+| `--since <SINCE>` | duration (e.g. `10m`, `2h`, `1d`) | — | Only show events newer than this. When set, `-n` is ignored and *all* matching lines print. |
+| `-f, --follow` | flag | off | Stream new transitions as they're appended. Exit on Ctrl-C. |
+
+## Examples
+
+See the last twenty transitions:
+
+```bash
+shelbi events tail
+```
+
+Follow the log live — the same thing the orchestrator does on bootstrap:
+
+```bash
+shelbi events tail --follow
+```
+
+Print everything from the last two hours, no live tail:
+
+```bash
+shelbi events tail --since 2h
+```
+
+Combine a longer history with a live follow:
+
+```bash
+shelbi events tail --lines 100 --follow
+```
+
+## See also
+
+- [Events log](/docs/concepts/events-log) — the full schema of both line
+  kinds and which reason tags the orchestrator recognizes.
+- [Orchestrator](/docs/concepts/orchestrator) — how the scheduler turns
+  events into dispatch decisions.

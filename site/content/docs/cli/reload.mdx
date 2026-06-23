@@ -1,0 +1,47 @@
+---
+title: shelbi reload
+order: 25
+summary: Respawn the shelbi-owned tmux panes in place so a freshly installed binary takes effect.
+---
+
+# shelbi reload
+
+```text
+shelbi reload [OPTIONS]
+```
+
+`shelbi reload` is the "I just rebuilt the binary, pick up the new code"
+command. It respawns the shelbi-owned panes — the sidebar plus the hidden
+tasks / review / machines panes — in place. The orchestrator pane and the
+worker panes are left alone: those re-shell into `shelbi` on every call and
+pick up the new binary automatically on their next invocation, so there's
+nothing to restart.
+
+Use it any time `scripts/install.sh` (or your own build) has produced a new
+binary and you want the long-lived TUI surfaces to start using it without
+tearing down your tmux session.
+
+## Flags
+
+| Flag | Type | Default | Description |
+| --- | --- | --- | --- |
+| `-p, --project <PROJECT>` | string | env / marker file | Project to operate on. |
+
+## Examples
+
+Rebuild, install, and reload the TUI in one shot:
+
+```bash
+./scripts/install.sh && shelbi reload
+```
+
+Reload a specific project's panes from outside that project's directory:
+
+```bash
+shelbi reload --project shelbi
+```
+
+## See also
+
+- [Install](/docs/getting-started/install) — where `scripts/install.sh`
+  is documented; `reload` is its TUI-side counterpart.
