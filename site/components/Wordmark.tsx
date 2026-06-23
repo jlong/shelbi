@@ -45,9 +45,9 @@ function buildRects(lines: readonly string[], colStart = 0, colEnd?: number): Re
   return rects
 }
 
-const COLS = Math.max(...BANNER_LINES.map((l) => [...l].length))
-const PIXEL_ROWS = BANNER_LINES.length * 2
-const WORDMARK_RECTS = buildRects(BANNER_LINES)
+export const WORDMARK_COLS = Math.max(...BANNER_LINES.map((l) => [...l].length))
+export const WORDMARK_PIXEL_ROWS = BANNER_LINES.length * 2
+export const WORDMARK_RECTS = buildRects(BANNER_LINES)
 
 /**
  * Height (px) per size token. The wordmark scales by height; width
@@ -90,9 +90,9 @@ export function Wordmark({
     <Tag className={className} {...rest}>
       <span className="sr-only">{title}</span>
       <svg
-        viewBox={`0 0 ${COLS} ${PIXEL_ROWS}`}
+        viewBox={`0 0 ${WORDMARK_COLS} ${WORDMARK_PIXEL_ROWS}`}
         height={height}
-        width={(height * COLS) / PIXEL_ROWS}
+        width={(height * WORDMARK_COLS) / WORDMARK_PIXEL_ROWS}
         fill="currentColor"
         shapeRendering="crispEdges"
         aria-hidden="true"
