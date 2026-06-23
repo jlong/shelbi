@@ -12,6 +12,7 @@ import {
 } from '@heroicons/react/24/outline'
 import Link from 'next/link'
 import { Footer } from '@/components/Footer'
+import { Hero } from '@/components/Hero'
 import { InstallCloser } from '@/components/InstallCloser'
 
 const pitch = [
@@ -72,16 +73,9 @@ export default function HomePage() {
   return (
     <div className="flex min-h-screen flex-col">
       <main className="flex flex-1 flex-col">
-        <section className="flex flex-1 items-center justify-center p-3">
-          <div className="space-y-2">
-            <h1 className="font-mono text-3xl font-semibold text-fg">shelbi</h1>
-            <p className="text-gray-7">
-              A Kanban board for orchestrating fleets of coding agents.
-            </p>
-          </div>
-        </section>
+        <Hero />
 
-        <section className="border-t border-gray-4">
+        <section>
           <div className="grid grid-cols-1 md:grid-cols-3 gap-px bg-gray-4">
             {pitch.map((item) => (
               <Link
