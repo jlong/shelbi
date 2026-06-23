@@ -9,13 +9,13 @@ import Link from "next/link"
  */
 export const mdxComponents: MDXComponents = {
   h1: (props) => (
-    <h1 className="mt-6 mb-3 text-3xl font-semibold tracking-tight text-fg" {...props} />
+    <h1 className="mt-6 mb-3 scroll-mt-8 text-3xl font-semibold tracking-tight text-fg" {...props} />
   ),
   h2: (props) => (
-    <h2 className="mt-6 mb-2 text-xl font-semibold tracking-tight text-fg" {...props} />
+    <h2 className="mt-6 mb-2 scroll-mt-8 text-xl font-semibold tracking-tight text-fg" {...props} />
   ),
   h3: (props) => (
-    <h3 className="mt-4 mb-2 text-lg font-semibold tracking-tight text-fg" {...props} />
+    <h3 className="mt-4 mb-2 scroll-mt-8 text-lg font-semibold tracking-tight text-fg" {...props} />
   ),
   p: (props) => <p className="my-2 leading-relaxed text-gray-7" {...props} />,
   ul: (props) => (

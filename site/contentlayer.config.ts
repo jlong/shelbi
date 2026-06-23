@@ -1,5 +1,6 @@
 import { defineDocumentType, makeSource } from "contentlayer2/source-files"
 import rehypePrettyCode, { type Options as RehypePrettyCodeOptions } from "rehype-pretty-code"
+import rehypeSlug from "rehype-slug"
 
 /**
  * Docs live under `content/docs/<section>/<slug>.mdx`. The directory directly
@@ -47,6 +48,9 @@ export default makeSource({
   // dropping the document — required fields are enforced at build time.
   onMissingOrIncompatibleData: "fail",
   mdx: {
-    rehypePlugins: [[rehypePrettyCode, rehypePrettyCodeOptions]],
+    // rehype-slug attaches stable IDs to headings so the on-this-page rail and
+    // in-document anchor links resolve to the same slugs we extract from the
+    // raw MDX in `lib/docs.ts`.
+    rehypePlugins: [rehypeSlug, [rehypePrettyCode, rehypePrettyCodeOptions]],
   },
 })

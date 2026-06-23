@@ -2,7 +2,14 @@ import type { Metadata } from "next"
 import { notFound } from "next/navigation"
 import { getMDXComponent } from "next-contentlayer2/hooks"
 import { allDocs } from "contentlayer/generated"
-import { getDocBySlug } from "@/lib/docs"
+import {
+  extractHeadings,
+  getDocBySlug,
+  getEditUrl,
+  getPrevNext,
+} from "@/lib/docs"
+import { DocFooter } from "@/components/DocFooter"
+import { OnThisPage } from "@/components/OnThisPage"
 import { mdxComponents } from "@/components/mdx-components"
 import { OG_CARD_SIZE } from "@/components/OgCard"
 
@@ -44,21 +51,32 @@ export default async function DocsPage({ params }: DocsPageProps) {
   const doc = getDocBySlug(slug)
   if (!doc) notFound()
 
+  const headings = extractHeadings(doc)
+  const { prev, next } = getPrevNext(doc)
+  const editUrl = getEditUrl(doc)
+
   // contentlayer compiles MDX to a code string that must be turned into a
   // component at render — the canonical pattern. Code-block HTML is already
   // highlighted at build time, so this only assembles static elements.
   const MDX = getMDXComponent(doc.body.code)
+
   return (
-    <main className="mx-auto max-w-3xl px-3 py-8 font-sans">
-      <article>
-        <header className="mb-6 border-b border-gray-4 pb-3">
+    <div className="lg:grid lg:grid-cols-[minmax(0,1fr)_12rem] lg:gap-6">
+      <article className="min-w-0 max-w-3xl">
+        <header className="mb-4 border-b border-gray-4 pb-3">
           <h1 className="text-3xl font-semibold tracking-tight text-fg">
             {doc.title}
           </h1>
           <p className="mt-1 text-gray-7">{doc.summary}</p>
         </header>
         <MDX components={mdxComponents} />
+        <DocFooter prev={prev} next={next} editUrl={editUrl} />
       </article>
-    </main>
+      <div className="hidden lg:block">
+        <div className="sticky top-8">
+          <OnThisPage headings={headings} />
+        </div>
+      </div>
+    </div>
   )
 }

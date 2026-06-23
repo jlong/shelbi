@@ -1,6 +1,6 @@
 import type { Metadata } from "next"
 import Link from "next/link"
-import { getSections } from "@/lib/docs"
+import { getSections, humanizeSection } from "@/lib/docs"
 import { OG_CARD_SIZE } from "@/components/OgCard"
 
 export const metadata: Metadata = {
@@ -15,17 +15,10 @@ export const metadata: Metadata = {
   },
 }
 
-function humanize(section: string): string {
-  return section
-    .split("-")
-    .map((word) => (word ? word[0].toUpperCase() + word.slice(1) : word))
-    .join(" ")
-}
-
 export default function DocsIndex() {
   const sections = getSections()
   return (
-    <main className="mx-auto max-w-3xl px-3 py-8 font-sans">
+    <main className="max-w-3xl">
       <h1 className="text-3xl font-semibold tracking-tight text-fg">Docs</h1>
       <p className="mt-1 mb-6 text-gray-7">Guides and reference for shelbi.</p>
       <div className="flex flex-col gap-4">
@@ -33,7 +26,7 @@ export default function DocsIndex() {
           <section key={section || "_root"}>
             {section ? (
               <h2 className="mb-2 text-sm font-semibold tracking-wide text-gray-6 uppercase">
-                {humanize(section)}
+                {humanizeSection(section)}
               </h2>
             ) : null}
             <ul className="flex flex-col gap-1">

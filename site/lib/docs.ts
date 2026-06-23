@@ -1,3 +1,4 @@
+import GithubSlugger from "github-slugger"
 import { allDocs, type Doc } from "contentlayer/generated"
 
 export { allDocs }
@@ -37,4 +38,72 @@ export function getSections(): DocSection[] {
   return [...bySection.entries()]
     .map(([section, docs]) => ({ section, docs }))
     .sort((a, b) => a.docs[0].order - b.docs[0].order)
+}
+
+/** Title-case a kebab-cased section directory name. */
+export function humanizeSection(section: string): string {
+  return section
+    .split("-")
+    .map((word) => (word ? word[0].toUpperCase() + word.slice(1) : word))
+    .join(" ")
+}
+
+export type Heading = { depth: 2 | 3; text: string; id: string }
+
+/**
+ * Extract H2/H3 headings from a doc's raw MDX. IDs are generated with the
+ * same `github-slugger` that backs `rehype-slug`, so they match the IDs
+ * stamped onto the rendered headings — anchor links and scroll-spy stay
+ * in sync.
+ */
+export function extractHeadings(doc: Doc): Heading[] {
+  const slugger = new GithubSlugger()
+  const lines = doc.body.raw.split("\n")
+  const headings: Heading[] = []
+  let inFence = false
+  for (const line of lines) {
+    if (/^\s{0,3}```/.test(line)) {
+      inFence = !inFence
+      continue
+    }
+    if (inFence) continue
+    const match = /^(#{2,3})\s+(.+?)\s*$/.exec(line)
+    if (!match) continue
+    const depth = match[1].length as 2 | 3
+    const text = stripInlineMarkdown(match[2])
+    if (!text) continue
+    headings.push({ depth, text, id: slugger.slug(text) })
+  }
+  return headings
+}
+
+function stripInlineMarkdown(text: string): string {
+  return text
+    .replace(/`([^`]+)`/g, "$1")
+    .replace(/\*\*([^*]+)\*\*/g, "$1")
+    .replace(/\*([^*]+)\*/g, "$1")
+    .replace(/\[([^\]]+)\]\([^)]+\)/g, "$1")
+    .trim()
+}
+
+/**
+ * Prev/next siblings for a doc, walking the flat reading order produced by
+ * `getSections()` — within a section by `order`, then across sections by the
+ * same ordering used in the sidebar. Returns `undefined` at the boundaries.
+ */
+export function getPrevNext(doc: Doc): { prev?: Doc; next?: Doc } {
+  const flat = getSections().flatMap((s) => s.docs)
+  const idx = flat.findIndex((d) => d.url === doc.url)
+  if (idx === -1) return {}
+  return {
+    prev: idx > 0 ? flat[idx - 1] : undefined,
+    next: idx < flat.length - 1 ? flat[idx + 1] : undefined,
+  }
+}
+
+const REPO_EDIT_BASE = "https://github.com/jlong/shelbi/edit/main/site/content"
+
+/** Resolve the `edit on GitHub` URL for a doc, pointing at its source file. */
+export function getEditUrl(doc: Doc): string {
+  return `${REPO_EDIT_BASE}/${doc._raw.sourceFilePath}`
 }
