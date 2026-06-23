@@ -182,6 +182,28 @@ pub fn append_task_event(task_id: &str, from: Column, to: Column, reason: &str) 
     append_event_line(&format!("{ts} task={task_id} {from} -> {to} reason={reason}"))
 }
 
+/// Append `<rfc3339> dispatch task=<id> worker=<name> status=<status> detail=<detail>`
+/// to `~/.shelbi/events.log`. Use this to surface dispatch-time anomalies
+/// (e.g. the initial prompt was pasted but Enter never landed) that aren't
+/// state transitions but still need to show up in `shelbi events tail` so the
+/// orchestrator (and the user) sees them at the moment they happen.
+///
+/// Detail is a single short token; whitespace folds to underscores so the
+/// line stays parseable.
+pub fn append_dispatch_event(
+    task_id: &str,
+    worker: &str,
+    status: &str,
+    detail: &str,
+) -> Result<()> {
+    let ts = Utc::now().to_rfc3339();
+    let status = sanitize_reason(status);
+    let detail = sanitize_reason(detail);
+    append_event_line(&format!(
+        "{ts} dispatch task={task_id} worker={worker} status={status} detail={detail}"
+    ))
+}
+
 /// Open `events.log` with O_APPEND and write one terminated line in a
 /// single `write_all` call. POSIX guarantees that writes <= PIPE_BUF
 /// (4096B) under O_APPEND are atomic relative to other appenders, so
@@ -401,6 +423,35 @@ mod tests {
         assert_eq!(parsed[0].5, "reason=assigned");
         assert_eq!(parsed[1].4, "review");
         assert_eq!(parsed[1].5, "reason=worker_review");
+
+        std::env::remove_var("SHELBI_HOME");
+    }
+
+    #[test]
+    fn dispatch_event_writes_distinct_shape() {
+        let _g = TEST_LOCK.lock().unwrap();
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+
+        append_dispatch_event(
+            "fix-login",
+            "alpha",
+            "enter-stalled",
+            "no shelbi marker after retry",
+        )
+        .unwrap();
+        let log = std::fs::read_to_string(events_log_path().unwrap()).unwrap();
+        let lines: Vec<&str> = log.lines().collect();
+        assert_eq!(lines.len(), 1);
+        // Shape: `<ts> dispatch task=<id> worker=<name> status=<s> detail=<d>`.
+        // The `dispatch` prefix lets `shelbi events tail` show it without
+        // colliding with task=... or worker=... lines.
+        let line = lines[0];
+        assert!(line.contains(" dispatch task=fix-login "), "line: {line}");
+        assert!(line.contains(" worker=alpha "), "line: {line}");
+        assert!(line.contains(" status=enter-stalled "), "line: {line}");
+        // Whitespace in detail folds to underscores so the line stays parseable.
+        assert!(line.ends_with(" detail=no_shelbi_marker_after_retry"), "line: {line}");
 
         std::env::remove_var("SHELBI_HOME");
     }

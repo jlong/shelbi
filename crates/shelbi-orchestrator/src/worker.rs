@@ -279,7 +279,82 @@ pub fn start_worker_on_task(spec: StartSpec<'_>) -> Result<TmuxAddr> {
     let prompt = compose_prompt(spec.task_id, spec.branch, spec.task_body, &marker);
     shelbi_tmux::send_line(&host, &addr, &prompt)?;
 
+    // 7. Verify the prompt actually got submitted, not just typed into the
+    //    input box. claude's `UserPromptSubmit` hook (see worker settings
+    //    template) writes `\033]2;shelbi:working\007` to the pane title on
+    //    every submit — so once any `shelbi:` marker appears in the title,
+    //    we know Enter landed. If it doesn't within a short window, the
+    //    most common cause is that the trailing Enter raced claude's input
+    //    focus and was dropped; resend it once and try again. If still no
+    //    marker, surface a dispatch=stalled line in events.log so the
+    //    orchestrator (and `shelbi events tail`) sees it instead of the
+    //    worker silently sitting on the prompt.
+    confirm_prompt_submitted(&host, &addr, spec.task_id, &spec.worker.name);
+
     Ok(addr)
+}
+
+/// How long to wait for the `UserPromptSubmit` hook to flip the pane title
+/// after sending the initial prompt. Hook firing is a single printf, so a
+/// well-behaved submit lands almost immediately; this just covers the slow
+/// path (busy SSH, sluggish tmux server).
+const PROMPT_SUBMIT_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// How often to re-check the pane title while waiting for the submit signal.
+const PROMPT_SUBMIT_POLL: std::time::Duration = std::time::Duration::from_millis(200);
+
+/// Wait for the prompt-submitted signal; if it doesn't arrive, resend Enter
+/// once and wait again; if it still doesn't arrive, log a dispatch=stalled
+/// event and warn on stderr. Best-effort — failures here don't abort the
+/// task start (the worker may still recover), they just surface the stall
+/// so the orchestrator stops assuming the dispatch succeeded.
+fn confirm_prompt_submitted(host: &Host, addr: &TmuxAddr, task_id: &str, worker: &str) {
+    if wait_for_prompt_submitted(host, addr, PROMPT_SUBMIT_WAIT) {
+        return;
+    }
+    // First Enter likely raced claude's focus — resend a bare Enter and give
+    // the hook one more window to fire. Avoid spamming Enters: a second one
+    // after the prompt is already processed would submit an empty message,
+    // which claude ignores, but more than that starts to look like noise.
+    if let Err(e) = shelbi_tmux::send_enter(host, addr) {
+        eprintln!(
+            "shelbi: retry Enter to {} after stalled dispatch failed: {e}",
+            addr.target(),
+        );
+    }
+    if wait_for_prompt_submitted(host, addr, PROMPT_SUBMIT_WAIT) {
+        return;
+    }
+    eprintln!(
+        "shelbi: dispatched prompt to {} but no shelbi:* pane title appeared \
+         after a retry Enter — worker may be sitting on an unsubmitted prompt; \
+         check the pane",
+        addr.target(),
+    );
+    if let Err(e) = shelbi_state::append_dispatch_event(
+        task_id,
+        worker,
+        "enter-stalled",
+        "no shelbi marker after retry",
+    ) {
+        eprintln!("shelbi: failed to record dispatch stall in events.log: {e}");
+    }
+}
+
+/// Poll the pane title until the `UserPromptSubmit` hook has fired (any
+/// `shelbi:*` marker is present), or `timeout` elapses. Capture failures
+/// during the poll are transient (the SSH socket can hiccup); we just
+/// ignore them and keep polling.
+fn wait_for_prompt_submitted(host: &Host, addr: &TmuxAddr, timeout: std::time::Duration) -> bool {
+    let start = std::time::Instant::now();
+    while start.elapsed() < timeout {
+        let title = shelbi_tmux::pane_title(host, addr).unwrap_or_default();
+        if shelbi_state::parse_pane_title_marker(&title).is_some() {
+            return true;
+        }
+        std::thread::sleep(PROMPT_SUBMIT_POLL);
+    }
+    false
 }
 
 /// The minimum claude version that understands `--permission-mode auto`.
