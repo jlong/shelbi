@@ -90,7 +90,7 @@ Critical reminder mirrored into `site/AGENTS.md`: this is Next 16. Read `node_mo
 
 ### 3. Visual identity
 
-**Strict monochrome.** No accent colors anywhere — the site lives on pure black, pure white, and a deliberate grayscale ramp. Modeled after the Vercel homepage but committing further: where Vercel uses subtle blue for links and CTAs, shelbi uses pure white and weight/treatment changes. Identity work goes into typography, the block-character wordmark, and motion — not into color.
+**Strict monochrome.** No accent colors anywhere — the site lives on pure black, pure white, and a deliberate grayscale ramp. Modeled after the Vercel homepage but committing further: where Vercel uses subtle blue for links and CTAs, Shelbi uses pure white and weight/treatment changes. Identity work goes into typography, the block-character wordmark, and motion — not into color.
 
 **Palette (Tailwind v4 design tokens, defined in `globals.css`):**
 
@@ -126,7 +126,7 @@ This constraint sharpens the rest of the design system — every decision has to
 Why not the alternatives:
 
 - **Inter + JetBrains Mono.** Both free, both well-trodden. Inter is too neutral — reads as generic SaaS. Loses the dev-tool register the rest of the design commits to.
-- **Söhne + Berkeley Mono.** The most distinctive option. Both commercial licenses ($200+ for web). Premium feel, but expensive for an OSS project and license-fragile when contributors fork. The block-character wordmark gives shelbi its distinctiveness; the body type doesn't need to.
+- **Söhne + Berkeley Mono.** The most distinctive option. Both commercial licenses ($200+ for web). Premium feel, but expensive for an OSS project and license-fragile when contributors fork. The block-character wordmark gives Shelbi its distinctiveness; the body type doesn't need to.
 
 Geist lets the wordmark be the identity carrier without the typography fighting for attention.
 
@@ -140,7 +140,7 @@ The 8px spacing system carries over from the 32pixels parent — independent of 
 
 Sections, top to bottom:
 
-1. **Hero** — wordmark + tagline + primary CTA ("Install now" → `/docs/getting-started/install`) + secondary CTA ("Read the docs"). Background uses the block-character motif as a subtle pattern. Short value statement: one sentence on what shelbi is, one on who it's for. No email field.
+1. **Hero** — wordmark + tagline + primary CTA ("Install now" → `/docs/getting-started/install`) + secondary CTA ("Read the docs"). Background uses the block-character motif as a subtle pattern. Short value statement: one sentence on what Shelbi is, one on who it's for. No email field.
 2. **The pitch in 30 seconds** — three-up grid: *Plan tasks*, *Workers do them*, *You review and merge*. Each cell is an icon + ~30 words + a deep link into the docs.
 3. **Live preview (asciinema)** — embedded asciinema cast of the actual TUI showing the multi-worker scenario (full storyboard below). Player loaded async on viewport entry. Re-record when the TUI surface changes materially. OG cards are not derived from the cast — they're rendered separately by `@vercel/og` (see §6).
 4. **Feature grid** — six cells covering Kanban board, multi-machine workers, orchestrator auto-dispatch, review flow, events log, tmux-native. Style: small icon top-left, label, single-sentence elaboration.
@@ -245,7 +245,7 @@ Three phases, each independently shippable:
 
 **Phase 1 — Skeleton & landing**
 - Register `shelbi.dev` and point at Vercel.
-- Scaffold `site/` borrowing file structure and dependency conventions from contextstore-website (no visual treatment — shelbi's identity is its own, per §3).
+- Scaffold `site/` borrowing file structure and dependency conventions from contextstore-website (no visual treatment — Shelbi's identity is its own, per §3).
 - Wire Tailwind v4 with 8px spacing, Heroicons, motion, Geist Sans + Geist Mono.
 - Build the marketing landing page in its final layout (hero, three-up, asciinema, feature grid, install closer, footer).
 - Record and embed the asciinema cast.
