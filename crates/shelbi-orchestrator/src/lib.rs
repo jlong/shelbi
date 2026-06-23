@@ -47,6 +47,7 @@ pub struct ReloadReport {
     pub tasks: PaneReloadStatus,
     pub review: PaneReloadStatus,
     pub machines: PaneReloadStatus,
+    pub activity: PaneReloadStatus,
 }
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
@@ -88,8 +89,8 @@ pub fn dashboard_addr(project_name: &str) -> TmuxAddr {
 }
 
 /// Swap the named view's pane into the dashboard's right slot. `view` is
-/// one of `orch`, `tasks`, `review`, `machines`. Reads the stored pane id
-/// from the session's tmux environment.
+/// one of `orch`, `tasks`, `review`, `machines`, `activity`. Reads the
+/// stored pane id from the session's tmux environment.
 pub fn show_view(project_name: &str, view: &str) -> Result<()> {
     let session = format!("shelbi-{project_name}");
     let key = format!("SHELBI_PANE_{view}");
@@ -425,6 +426,7 @@ fn create_hidden_views(
     let tasks_cmd_str = tasks_cmd(shelbi_bin, project_name);
     let review_cmd_str = review_cmd(shelbi_bin, project_name);
     let machines_cmd_str = machines_cmd(shelbi_bin, project_name);
+    let activity_cmd_str = activity_cmd(shelbi_bin, project_name);
 
     // Create the stash session detached, with tasks pane.
     let tasks_id = shelbi_ssh::run_capture(
@@ -459,11 +461,22 @@ fn create_hidden_views(
     )?;
     let machines_id = machines_id.trim().to_string();
 
+    let activity_id = shelbi_ssh::run_capture(
+        host,
+        [
+            "tmux", "split-window", "-v", "-t", &stash_win,
+            "-P", "-F", "#{pane_id}",
+            "sh", "-c", &activity_cmd_str,
+        ],
+    )?;
+    let activity_id = activity_id.trim().to_string();
+
     // Env vars live on the *visible* session — that's where show_view reads
     // them from. swap-pane finds the target pane by global pane id anyway.
     set_session_env(host, session, "SHELBI_PANE_tasks", &tasks_id)?;
     set_session_env(host, session, "SHELBI_PANE_review", &review_id)?;
     set_session_env(host, session, "SHELBI_PANE_machines", &machines_id)?;
+    set_session_env(host, session, "SHELBI_PANE_activity", &activity_id)?;
     Ok(())
 }
 
@@ -586,6 +599,14 @@ fn review_cmd(shelbi_bin: &str, project_name: &str) -> String {
     )
 }
 
+fn activity_cmd(shelbi_bin: &str, project_name: &str) -> String {
+    format!(
+        "while true; do {bin} __activity {proj}; sleep 1; done",
+        bin = shelbi_agent::shell_escape(shelbi_bin),
+        proj = shelbi_agent::shell_escape(project_name),
+    )
+}
+
 // Live worker/machine table — `shelbi worker list` probes each worker's
 // tmux pane and prints the assigned task (if any), so remote workers
 // show up alongside local ones with the same shape. Refresh every 5s;
@@ -640,7 +661,7 @@ pub fn reload(project_name: &str) -> Result<ReloadReport> {
     let sidebar_target = format!("{session}:dashboard.{{left}}");
     report.sidebar = respawn_pane(&sidebar_target, &sidebar_cmd(&shelbi_bin, project_name));
 
-    // 2-4. Stash panes — pane ids are stored in session env at bootstrap.
+    // 2-5. Stash panes — pane ids are stored in session env at bootstrap.
     report.tasks = reload_stash_pane(&session, "tasks", &tasks_cmd(&shelbi_bin, project_name));
     report.review = reload_stash_pane(&session, "review", &review_cmd(&shelbi_bin, project_name));
     report.machines = reload_stash_pane(
@@ -648,6 +669,8 @@ pub fn reload(project_name: &str) -> Result<ReloadReport> {
         "machines",
         &machines_cmd(&shelbi_bin, project_name),
     );
+    report.activity =
+        reload_stash_pane(&session, "activity", &activity_cmd(&shelbi_bin, project_name));
 
     Ok(report)
 }
@@ -754,6 +777,15 @@ mod pane_cmd_tests {
         assert_eq!(
             out,
             "while true; do /usr/local/bin/shelbi __review myapp; sleep 1; done"
+        );
+    }
+
+    #[test]
+    fn activity_cmd_wraps_in_respawn_loop() {
+        let out = activity_cmd("/usr/local/bin/shelbi", "myapp");
+        assert_eq!(
+            out,
+            "while true; do /usr/local/bin/shelbi __activity myapp; sleep 1; done"
         );
     }
 

@@ -23,6 +23,7 @@ use crossterm::{
 };
 use ratatui::{backend::CrosstermBackend, Terminal};
 
+mod activity;
 mod app;
 mod kanban;
 mod poller;
@@ -39,6 +40,7 @@ pub(crate) mod test_support {
     pub static ENV_LOCK: Mutex<()> = Mutex::new(());
 }
 
+pub use activity::ActivityApp;
 pub use app::{App, View};
 pub use kanban::KanbanApp;
 pub use poller::WorkerPoller;
@@ -138,6 +140,20 @@ pub fn run_review(project_name: &str) -> Result<()> {
     result
 }
 
+/// Run the activity-feed ratatui view in the current pane. Hosted in
+/// the hidden stash session and swapped in by the palette / sidebar —
+/// same lifecycle as `run_tasks` and `run_review`.
+pub fn run_activity(project_name: &str) -> Result<()> {
+    let mut term = setup_terminal().context("setting up terminal")?;
+    let mut app = ActivityApp::new(project_name);
+    app.refresh();
+
+    let result = activity_loop(&mut term, &mut app);
+
+    restore_terminal(&mut term).context("restoring terminal")?;
+    result
+}
+
 /// Enter raw mode + alt screen + mouse capture. Tmux only forwards mouse
 /// events to the pane when its `mouse` option is on — `ensure_dashboard`
 /// sets it on shelbi sessions, so callers don't need to plumb anything.
@@ -232,6 +248,58 @@ fn review_loop<B: ratatui::backend::Backend>(
                 handle_review_key(app, k.code);
             }
         }
+    }
+}
+
+fn activity_loop<B: ratatui::backend::Backend>(
+    term: &mut Terminal<B>,
+    app: &mut ActivityApp,
+) -> Result<()> {
+    loop {
+        app.maybe_refresh();
+        term.draw(|f| activity::render_full(f, app, f.area()))?;
+        if event::poll(Duration::from_millis(200))? {
+            match event::read()? {
+                Event::Key(k) => {
+                    if k.kind != KeyEventKind::Press {
+                        continue;
+                    }
+                    // Ctrl+C exits — the parent shell loop will respawn us.
+                    if k.modifiers.contains(KeyModifiers::CONTROL)
+                        && matches!(k.code, KeyCode::Char('c'))
+                    {
+                        return Ok(());
+                    }
+                    handle_activity_key(app, k.code);
+                }
+                Event::Mouse(m) => handle_activity_mouse(app, m),
+                _ => {}
+            }
+        }
+    }
+}
+
+fn handle_activity_key(app: &mut ActivityApp, code: KeyCode) {
+    match code {
+        KeyCode::Up | KeyCode::Char('k') => app.scroll_up(),
+        KeyCode::Down | KeyCode::Char('j') => app.scroll_down(),
+        KeyCode::PageUp | KeyCode::Char('u') => app.scroll_page_up(),
+        KeyCode::PageDown | KeyCode::Char('d') => app.scroll_page_down(),
+        KeyCode::Char('g') | KeyCode::Home => app.scroll_home(),
+        KeyCode::Char('G') | KeyCode::End => app.scroll_end(),
+        KeyCode::Char('r') => app.refresh(),
+        _ => {}
+    }
+}
+
+/// Mouse-wheel scrolls the feed; left-click is unused (the feed has
+/// no per-row actions). Scroll-up walks toward older events
+/// (positive scroll offset since newest sits at the top).
+fn handle_activity_mouse(app: &mut ActivityApp, mouse: MouseEvent) {
+    match mouse.kind {
+        MouseEventKind::ScrollUp => app.scroll_up(),
+        MouseEventKind::ScrollDown => app.scroll_down(),
+        _ => {}
     }
 }
 

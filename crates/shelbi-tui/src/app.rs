@@ -124,13 +124,13 @@ impl App {
         rows.get(idx).filter(|r| r.is_selectable()).map(|_| idx)
     }
 
-    /// Sidebar rows: a fixed 2-item nav (Chat / Tasks), then declared
-    /// workers under an `— agents —` separator, then the review queue
-    /// under `— Ready for Review —`, then any legacy `shelbi spawn` agents
-    /// under `— spawned —`. Each section header and its rows are dropped
-    /// together when that group is empty — Review is intentionally not a
-    /// destination view, only an inline live list. The Ctrl+P palette
-    /// mirrors this same set of rows for fuzzy access.
+    /// Sidebar rows: a fixed 3-item nav (Chat / Tasks / Activity), then
+    /// declared workers under an `— agents —` separator, then the review
+    /// queue under `— Ready for Review —`, then any legacy `shelbi spawn`
+    /// agents under `— spawned —`. Each section header and its rows are
+    /// dropped together when that group is empty — Review is intentionally
+    /// not a destination view, only an inline live list. The Ctrl+P
+    /// palette mirrors this same set of rows for fuzzy access.
     pub fn rows(&self) -> Vec<Row> {
         let mut rows = vec![
             Row::Nav {
@@ -142,6 +142,11 @@ impl App {
                 icon: "📋",
                 label: "Tasks",
                 view: View::Builtin("tasks"),
+            },
+            Row::Nav {
+                icon: "⚡",
+                label: "Activity",
+                view: View::Builtin("activity"),
             },
         ];
         // Every list section header gets exactly one blank line above it,
@@ -615,11 +620,11 @@ mod tests {
         let mut app = App::new_sidebar("demo");
         app.refresh().unwrap();
 
-        // 2 nav + 1 blank spacer + 1 `agents` section header + 2 workers = 6 rows.
+        // 3 nav + 1 blank spacer + 1 `agents` section header + 2 workers = 7 rows.
         let rows = app.rows();
-        assert_eq!(rows.len(), 6);
-        assert!(matches!(&rows[2], Row::Blank));
-        assert!(matches!(&rows[3], Row::Section { label } if label == "Agents"));
+        assert_eq!(rows.len(), 7);
+        assert!(matches!(&rows[3], Row::Blank));
+        assert!(matches!(&rows[4], Row::Section { label } if label == "Agents"));
 
         // alpha (busy, no status file yet) — default to Working.
         assert_eq!(find_worker_badge(&rows, "alpha").unwrap(), WorkerBadge::Working);
@@ -817,9 +822,9 @@ mod tests {
     }
 
     #[test]
-    fn nav_is_chat_tasks_only_no_review_destination() {
-        // The sidebar nav stays at two items — Review is surfaced inline
-        // as a live list below, never as a destination.
+    fn nav_is_chat_tasks_activity_no_review_destination() {
+        // The sidebar nav stays at three items — Review is surfaced
+        // inline as a live list below, never as a destination.
         let _g = TEST_LOCK.lock().unwrap();
         let home = fresh_home();
         std::env::set_var("SHELBI_HOME", &home);
@@ -840,7 +845,7 @@ mod tests {
                 _ => None,
             })
             .collect();
-        assert_eq!(names, vec!["orch", "tasks"]);
+        assert_eq!(names, vec!["orch", "tasks", "activity"]);
 
         std::env::remove_var("SHELBI_HOME");
     }
@@ -910,10 +915,10 @@ mod tests {
 
         let mut app = App::new_sidebar("demo");
         app.refresh().unwrap();
-        // Start on the last nav item (Tasks, idx 1). Next nav_down should
-        // skip the blank spacer (idx 2) and the `agents` section header
-        // (idx 3) and land on the first worker row (idx 4).
-        app.sidebar_index = 1;
+        // Start on the last nav item (Activity, idx 2). Next nav_down
+        // should skip the blank spacer (idx 3) and the `agents` section
+        // header (idx 4) and land on the first worker row (idx 5).
+        app.sidebar_index = 2;
         app.nav_down();
         let rows = app.rows();
         assert!(rows[app.sidebar_index].is_selectable());

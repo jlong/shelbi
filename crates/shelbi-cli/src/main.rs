@@ -114,6 +114,11 @@ enum Cmd {
     #[command(hide = true)]
     #[command(name = "__review")]
     ReviewView { project: String },
+    /// (internal) Run the activity-feed ratatui view inside the hidden
+    /// stash pane. Not for direct use.
+    #[command(hide = true)]
+    #[command(name = "__activity")]
+    Activity { project: String },
     /// Open the palette as a tmux popup. Bound to Ctrl+P by default.
     Popup,
     /// (internal) Run the palette picker — meant to be invoked inside a
@@ -150,6 +155,7 @@ fn main() -> Result<()> {
         Some(Cmd::Sidebar { project }) => shelbi_tui::run_sidebar(&project).context("sidebar"),
         Some(Cmd::Tasks { project }) => shelbi_tui::run_tasks(&project).context("tasks"),
         Some(Cmd::ReviewView { project }) => shelbi_tui::run_review(&project).context("review"),
+        Some(Cmd::Activity { project }) => shelbi_tui::run_activity(&project).context("activity"),
         Some(Cmd::Popup) => commands::popup::run(),
         Some(Cmd::Palette { project }) => commands::palette::run(project),
     }
@@ -214,8 +220,9 @@ fn run_wizard_then_dispatch(first_run: bool) -> Result<()> {
 
 /// Initialize the tracing subscriber.
 ///
-/// For internal ratatui subcommands (`__sidebar`, `__tasks`, `__review`) we
-/// route output to `~/.shelbi/logs/tui.log` instead of stderr. The TUI process
+/// For internal ratatui subcommands (`__sidebar`, `__tasks`, `__review`,
+/// `__activity`) we route output to `~/.shelbi/logs/tui.log` instead of
+/// stderr. The TUI process
 /// shares its TTY with ratatui's draw cycle, and any stray stderr write
 /// corrupts the cursor position — leaving raw `tracing` lines bleeding across
 /// the sidebar until the next full repaint (e.g. a resize). For all other
@@ -225,7 +232,10 @@ fn init_tracing(cmd: Option<&Cmd>) {
     let filter = EnvFilter::try_from_env("SHELBI_LOG").unwrap_or_else(|_| EnvFilter::new("info"));
     let is_tui = matches!(
         cmd,
-        Some(Cmd::Sidebar { .. }) | Some(Cmd::Tasks { .. }) | Some(Cmd::ReviewView { .. })
+        Some(Cmd::Sidebar { .. })
+            | Some(Cmd::Tasks { .. })
+            | Some(Cmd::ReviewView { .. })
+            | Some(Cmd::Activity { .. })
     );
     if is_tui {
         if let Some(file) = open_tui_log_file() {

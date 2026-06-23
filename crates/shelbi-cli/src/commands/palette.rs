@@ -217,10 +217,10 @@ fn render(f: &mut Frame, state: &State, results: &[(Entry, u16)]) {
 // ---------------------------------------------------------------------------
 // Entry building + dispatch
 //
-// Order mirrors `App::rows()` in shelbi-tui: Chat, Tasks, then workers,
-// then review-ready tasks, then legacy spawned agents, then the two
-// global actions. An empty-query palette should read top-to-bottom like
-// the sidebar.
+// Order mirrors `App::rows()` in shelbi-tui: Chat, Tasks, Activity,
+// then workers, then review-ready tasks, then legacy spawned agents,
+// then the two global actions. An empty-query palette should read
+// top-to-bottom like the sidebar.
 
 fn build_entries(
     workers: &[WorkerEntry],
@@ -239,6 +239,12 @@ fn build_entries(
             label: "Tasks".into(),
             kind: EntryKind::View,
             subtitle: Some("live `shelbi list`".into()),
+        },
+        Entry {
+            id: "view:activity".into(),
+            label: "Activity".into(),
+            kind: EntryKind::View,
+            subtitle: Some("human-readable events feed".into()),
         },
     ];
     for w in workers {
