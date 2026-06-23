@@ -1,7 +1,7 @@
 # OpenHands (formerly OpenDevin)
 
 > Competitive research for the shelbi.dev `/vs/openhands` page.
-> Factual and dated — no marketing fluff, no shelbi advocacy.
+> Factual and dated — no marketing fluff, no Shelbi advocacy.
 > Compiled 2026-06-23. Every claim traces to a dated URL in **Sources**.
 
 ---

@@ -371,7 +371,7 @@ These are factual differences between Herd and Shelbi as architectures, not argu
   Workspace TODOs in Herd (v0.2.1) are the closest analogue, but they are a single-file scratchpad with a one-way promotion path to external issue trackers, not a managed queue.
 
 - **Orchestrator agent vs human-as-driver.**
-  In shelbi, an LLM orchestrator (Claude) tails the event log (`shelbi events tail --follow`) and auto-dispatches ready tasks to free workers per declared reaction rules.
+  In Shelbi, an LLM orchestrator (Claude) tails the event log (`shelbi events tail --follow`) and auto-dispatches ready tasks to free workers per declared reaction rules.
   The orchestrator is a programmable agent in the loop with its own CLAUDE.md instructions about how to react to events like "task moved to todo," "worker became free," or "pane died."
   In Herd, the human is the orchestrator: launches agents, chains them, watches the dashboard.
   Herd's only piece of automation along this axis is the v0.1.0 chain primitive ("when one finishes, the next starts automatically"), which is a serial trigger, not a scheduler.
