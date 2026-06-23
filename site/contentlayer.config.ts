@@ -36,6 +36,29 @@ export const Doc = defineDocumentType(() => ({
   },
 }))
 
+/**
+ * Head-to-head comparisons live under `content/vs/<slug>.mdx`. One MDX per
+ * competitor. `slug` controls the public path (`/vs/<slug>`); files whose
+ * slug begins with `_` (e.g. `_template`) are filtered out of listings and
+ * routes by `lib/comparisons.ts` but still validate against this schema so
+ * the template documents the required shape.
+ */
+export const Comparison = defineDocumentType(() => ({
+  name: "Comparison",
+  filePathPattern: "vs/**/*.mdx",
+  contentType: "mdx",
+  fields: {
+    competitor: { type: "string", required: true },
+    slug: { type: "string", required: true },
+    competitorUrl: { type: "string", required: true },
+    summary: { type: "string", required: true },
+    researchUrl: { type: "string", required: false },
+  },
+  computedFields: {
+    url: { type: "string", resolve: (doc) => `/vs/${doc.slug}` },
+  },
+}))
+
 // Strict-monochrome theme — vesper highlighted bash with vivid cyan-teal
 // (`#99FFE4`) and warm peach (`#FFC799`) accents that read as color on the
 // no-hue surface from §3 of the plan. See `lib/shiki-mono-dark.ts`.
@@ -46,7 +69,7 @@ const rehypePrettyCodeOptions: RehypePrettyCodeOptions = {
 
 export default makeSource({
   contentDirPath: "content",
-  documentTypes: [Doc],
+  documentTypes: [Doc, Comparison],
   // The `contentlayer/generated` alias is provided via tsconfig `paths` (no
   // `baseUrl` needed under `moduleResolution: bundler`), so silence the heuristic.
   disableImportAliasWarning: true,

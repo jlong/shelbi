@@ -46,17 +46,37 @@ export const mdxComponents: MDXComponents = {
       {...props}
     />
   ),
+  // Tables — strict-mono ruling. Cells inherit `text-gray-7` from the table
+  // wrapper; headers and the leftmost label column bump to `text-fg` so the
+  // axis of comparison reads first.
   table: (props) => (
-    <div className="my-3 overflow-x-auto">
-      <table className="w-full border-collapse text-sm" {...props} />
+    <div className="my-3 overflow-x-auto rounded-md border border-gray-4">
+      <table
+        className="w-full border-collapse text-sm text-gray-7 [&_th]:text-fg [&_tbody_td:first-child]:text-fg [&_tbody_td:first-child]:font-medium"
+        {...props}
+      />
     </div>
   ),
-  thead: (props) => <thead className="border-b border-gray-4 bg-gray-1" {...props} />,
-  tr: (props) => <tr className="border-b border-gray-3 last:border-0" {...props} />,
+  thead: (props) => (
+    <thead className="border-b border-gray-4 bg-gray-1" {...props} />
+  ),
+  tr: (props) => (
+    <tr className="border-b border-gray-4 last:border-0" {...props} />
+  ),
   th: (props) => (
-    <th className="px-2 py-1 text-left font-semibold text-fg" {...props} />
+    <th
+      className="px-2 py-1 text-left text-xs font-semibold tracking-wide uppercase"
+      {...props}
+    />
   ),
   td: (props) => (
-    <td className="px-2 py-1 align-top text-gray-7" {...props} />
+    <td className="px-2 py-1 align-top leading-relaxed" {...props} />
+  ),
+  hr: (props) => <hr className="my-6 border-gray-4" {...props} />,
+  blockquote: (props) => (
+    <blockquote
+      className="my-3 border-l-2 border-gray-5 pl-3 text-gray-7 italic"
+      {...props}
+    />
   ),
 }

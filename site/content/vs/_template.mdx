@@ -1,0 +1,74 @@
+---
+competitor: Example Tool
+slug: _template
+competitorUrl: https://example.com
+researchUrl: https://example.com/research
+summary: One-sentence positioning of Example Tool, in their own framing — what kind of thing it is and who it's aimed at.
+---
+
+{/*
+  Comparison template — copy this file to `content/vs/<competitor-slug>.mdx`,
+  flip `slug` to the new value, and fill in the sections below. The hero
+  ("shelbi vs <competitor>" + summary) and the footer (links to research +
+  competitor) are rendered from the frontmatter by the page wrapper, so the
+  MDX body starts at the at-a-glance table.
+*/}
+
+## At a glance
+
+| Dimension          | shelbi                          | Example Tool                |
+| ------------------ | ------------------------------- | --------------------------- |
+| Form factor        | Terminal Kanban + tmux panes    | …                           |
+| Concurrency model  | Fixed pool of persistent workers | …                          |
+| Where work runs    | Your machines, your worktrees   | …                           |
+| Review flow        | Human-in-the-loop column        | …                           |
+| State of the art   | Open source, MIT                | …                           |
+| Pricing            | Free                            | …                           |
+
+## Where shelbi excels
+
+### Persistent workers, not one-shot runs
+
+Shelbi keeps each worker pinned to its own git worktree across tasks. The
+worker's tools, indexes, and shell state survive between cards. Example: a
+worker that's already cloned the repo and warmed its build cache picks up
+the next ready task without re-paying setup cost.
+
+### You own the orchestration loop
+
+The orchestrator runs as a Claude agent on your machine, tailing
+`~/.shelbi/events.log` and dispatching work. Swap models, edit the
+project's `CLAUDE.md`, or replace the orchestrator entirely — there is no
+hosted control plane in the loop.
+
+### Review-first, not merge-first
+
+Finished work lands in a `review` column with the branch ready to inspect.
+The default is *don't merge until a human signs off*. Use the review pane
+in the TUI to read the diff before promoting to `done`.
+
+## Where Example Tool excels
+
+### …
+
+Be honest. Pick a real strength — managed infrastructure, a polished UI, a
+specific integration that shelbi doesn't have. Saying "they're better at X"
+makes the comparison trustworthy.
+
+### …
+
+A second honest strength. If Example Tool is faster to set up, say so. If
+their pricing is simpler, say so.
+
+## Choose shelbi if…
+
+- You want a Kanban-shaped queue across multiple machines you already own.
+- You're comfortable in tmux and want workers that survive SSH drops.
+- Reviewing diffs before merge is non-negotiable.
+- You want the orchestration logic to be inspectable code in your repo.
+
+## Choose Example Tool if…
+
+- You'd rather pay for hosted infrastructure than run workers yourself.
+- Your team already lives inside Example Tool's surface and switching costs are high.
+- A specific Example Tool feature is load-bearing for your workflow.
