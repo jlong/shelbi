@@ -359,26 +359,26 @@ OpenHands licensing.
 
 ---
 
-## Where shelbi differs
+## Where Shelbi differs
 
-_Factual axes of difference, not a value judgment. shelbi is "an open-source
+_Factual axes of difference, not a value judgment. Shelbi is "an open-source
 agent orchestrator for the terminal, built on tmux."_
 
 - **Scope.** OpenHands ships **its own coding agent** (the CodeAct agent) plus
-  a runtime, GUI, cloud SaaS, and enterprise automation platform. shelbi ships
+  a runtime, GUI, cloud SaaS, and enterprise automation platform. Shelbi ships
   **no agent of its own** — it is an orchestrator that drives whatever agent
   CLI you already run (Claude Code, Codex, aider, "anything with a CLI").
 - **Architecture & dependencies.** OpenHands centers on a **Docker/sandbox
   runtime** (Docker-in-Docker, Agent/Automation Servers, optional Kubernetes
-  at the enterprise tier). shelbi has **no daemons and no servers** — it needs
+  at the enterprise tier). Shelbi has **no daemons and no servers** — it needs
   only `ssh`, `tmux`, `git`, and your agent CLI on each machine.
 - **Where work runs.** OpenHands runs one agent per conversation inside a
-  sandbox (cloud-hosted or self-hosted). shelbi runs **many workers in parallel
+  sandbox (cloud-hosted or self-hosted). Shelbi runs **many workers in parallel
   across multiple machines** (laptop + remote boxes over SSH), each in its
   **own git worktree on its own branch**, supervised from a single orchestrator
   and reviewed in a two-pane TUI.
 - **State model.** OpenHands stores conversation state as an **event-sourced
-  stream** inside the platform. shelbi keeps **all state as plain markdown/YAML
+  stream** inside the platform. Shelbi keeps **all state as plain markdown/YAML
   files** (tasks, logs, worker status) — grep-able, version-controllable,
   editor-readable — with no database.
 - **Commercial model.** OpenHands is open-core: an MIT agent plus a paid hosted
