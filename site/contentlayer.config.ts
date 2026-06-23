@@ -1,6 +1,7 @@
 import { defineDocumentType, makeSource } from "contentlayer2/source-files"
 import rehypePrettyCode, { type Options as RehypePrettyCodeOptions } from "rehype-pretty-code"
 import rehypeSlug from "rehype-slug"
+import remarkGfm from "remark-gfm"
 
 import { shelbiMonoDark } from "./lib/shiki-mono-dark"
 
@@ -53,6 +54,9 @@ export default makeSource({
   // dropping the document — required fields are enforced at build time.
   onMissingOrIncompatibleData: "fail",
   mdx: {
+    // remark-gfm enables GitHub-flavored markdown: pipe tables, strikethrough,
+    // autolinks, and task lists — none of which the default remark parser handles.
+    remarkPlugins: [remarkGfm],
     // rehype-slug attaches stable IDs to headings so the on-this-page rail and
     // in-document anchor links resolve to the same slugs we extract from the
     // raw MDX in `lib/docs.ts`.

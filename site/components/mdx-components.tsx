@@ -46,4 +46,17 @@ export const mdxComponents: MDXComponents = {
       {...props}
     />
   ),
+  table: (props) => (
+    <div className="my-3 overflow-x-auto">
+      <table className="w-full border-collapse text-sm" {...props} />
+    </div>
+  ),
+  thead: (props) => <thead className="border-b border-gray-4 bg-gray-1" {...props} />,
+  tr: (props) => <tr className="border-b border-gray-3 last:border-0" {...props} />,
+  th: (props) => (
+    <th className="px-2 py-1 text-left font-semibold text-fg" {...props} />
+  ),
+  td: (props) => (
+    <td className="px-2 py-1 align-top text-gray-7" {...props} />
+  ),
 }
