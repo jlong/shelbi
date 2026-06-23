@@ -437,7 +437,7 @@ independent coverage):
 ## Where Shelbi differs
 
 Factual axes of difference only. The two products target different audiences
-and overlap only partly — Devin is a hosted autonomous-agent SaaS; shelbi is
+and overlap only partly — Devin is a hosted autonomous-agent SaaS; Shelbi is
 an open-source, terminal-native orchestrator for agents you already run.
 
 - **Hosting & ownership.** Devin is a proprietary, hosted SaaS that runs work
