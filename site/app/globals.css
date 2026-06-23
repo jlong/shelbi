@@ -1,0 +1,36 @@
+@import "tailwindcss";
+
+/* ============================================================
+   Theme — fonts, spacing, and strict-mono palette
+   ============================================================ */
+@theme {
+  /* ----- Fonts (Geist Sans + Geist Mono via the `geist` package) ----- */
+  --font-sans: var(--font-geist-sans), system-ui, sans-serif;
+  --font-mono: var(--font-geist-mono), ui-monospace, monospace;
+
+  /* ----- Palette (strict monochrome) ----- */
+  --color-bg: #000000;
+  --color-fg: #FFFFFF;
+  --color-gray-1: #0A0A0A;
+  --color-gray-2: #141414;
+  --color-gray-3: #1F1F1F;
+  --color-gray-4: #2B2B2B;
+  --color-gray-5: #444444;
+  --color-gray-6: #666666;
+  --color-gray-7: #999999;
+
+  /* ----- Spacing (8px base) ----- */
+  --spacing: 8px;
+}
+
+/* ============================================================
+   Base
+   ============================================================ */
+html {
+  scroll-behavior: smooth;
+}
+
+body {
+  background: var(--color-bg);
+  color: var(--color-fg);
+}
