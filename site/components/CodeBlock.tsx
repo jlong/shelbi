@@ -1,4 +1,5 @@
 import { codeToHtml } from "shiki"
+import { shelbiMonoDark } from "@/lib/shiki-mono-dark"
 import { CopyButton } from "./CopyButton"
 
 type CodeBlockProps = {
@@ -9,7 +10,7 @@ type CodeBlockProps = {
 export async function CodeBlock({ code, lang = "bash" }: CodeBlockProps) {
   const html = await codeToHtml(code, {
     lang,
-    theme: "vesper",
+    theme: shelbiMonoDark,
   })
 
   return (

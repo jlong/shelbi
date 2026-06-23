@@ -2,6 +2,8 @@ import { defineDocumentType, makeSource } from "contentlayer2/source-files"
 import rehypePrettyCode, { type Options as RehypePrettyCodeOptions } from "rehype-pretty-code"
 import rehypeSlug from "rehype-slug"
 
+import { shelbiMonoDark } from "./lib/shiki-mono-dark"
+
 /**
  * Docs live under `content/docs/<section>/<slug>.mdx`. The directory directly
  * beneath `docs/` is the section; the flattened path (minus the `docs/` prefix)
@@ -33,8 +35,11 @@ export const Doc = defineDocumentType(() => ({
   },
 }))
 
+// Strict-monochrome theme — vesper highlighted bash with vivid cyan-teal
+// (`#99FFE4`) and warm peach (`#FFC799`) accents that read as color on the
+// no-hue surface from §3 of the plan. See `lib/shiki-mono-dark.ts`.
 const rehypePrettyCodeOptions: RehypePrettyCodeOptions = {
-  theme: "vesper",
+  theme: shelbiMonoDark,
   keepBackground: true,
 }
 
