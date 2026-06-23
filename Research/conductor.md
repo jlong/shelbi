@@ -334,7 +334,7 @@ is consolidating talent and adjacent product surfaces.
    `conductor` CLI (no relation, confusingly same name) target that
    workflow-DAG niche; conductor.build targets workspace orchestration.
 
-## Where shelbi differs
+## Where Shelbi differs
 
 These are **factual axes of difference**, not claims of superiority. Both
 tools solve similar problems and make different design tradeoffs.
@@ -370,7 +370,7 @@ tools solve similar problems and make different design tradeoffs.
 5. **Pricing model and source posture.** Conductor is closed-source, the
    app is free, individuals bring their own Claude/Codex/Cursor
    subscription, and enterprise pricing is contact-sales. Shelbi's
-   licensing and distribution posture is a separate decision the shelbi
+   licensing and distribution posture is a separate decision the Shelbi
    site should state on its own terms.
 
 6. **Process / runtime substrate.** Conductor manages agent processes
@@ -378,7 +378,7 @@ tools solve similar problems and make different design tradeoffs.
    and chat live in the Conductor UI. Shelbi uses **tmux panes** as the
    runtime substrate for each worker; a worker is a long-lived tmux
    pane the user can attach to directly. Closing or restarting the
-   shelbi front-end TUI does not terminate worker panes — they run
+   Shelbi front-end TUI does not terminate worker panes — they run
    independently under tmux. This is a different design choice with
    different operational properties (tmux is universally scriptable and
    survives detach; a native app surface is more discoverable for users
@@ -389,7 +389,7 @@ tools solve similar problems and make different design tradeoffs.
    the workflow. Shelbi uses a **file-based review marker** (a worker
    writes its task id to a known path) plus an **events log**
    (`~/.shelbi/events.log`) that the orchestrator and any tooling can
-   tail. The shelbi handoff is plain-text and scriptable; the Conductor
+   tail. The Shelbi handoff is plain-text and scriptable; the Conductor
    handoff is UI-mediated.
 
 ## Sources
