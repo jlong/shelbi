@@ -1,7 +1,4 @@
 {
-  "permissions": {
-    "defaultMode": "{{worker_permissions_mode}}"
-  },
   "hooks": {
     "Stop": [
       {

@@ -88,10 +88,12 @@ pub(crate) mod test_lock {
 
 /// Default contents of the per-project worker settings template. Lives at
 /// `~/.shelbi/projects/<name>/worker-settings.json.template` after
-/// `shelbi init --project <name>` runs. The `.template` suffix flags the
-/// file as needing placeholder substitution before use — the
-/// `{{worker_permissions_mode}}` placeholder is filled in later by the
-/// worker deploy step from `Project::worker_permissions_mode`.
+/// `shelbi init --project <name>` runs. The `.template` suffix is retained
+/// because user-authored templates may still contain
+/// `{{worker_permissions_mode}}` — see [`render_worker_settings`]. The
+/// embedded default no longer needs that placeholder: the worker spawn path
+/// passes `--permission-mode` directly on claude's command line, so the
+/// rendered `settings.json` is purely the title-state hooks.
 pub const DEFAULT_WORKER_SETTINGS_TEMPLATE: &str =
     include_str!("default_worker_settings.json.template");
 
@@ -157,8 +159,12 @@ fn migrate_worker_settings_template(project_dir: &Path) {
 /// [`DEFAULT_WORKER_SETTINGS_TEMPLATE`] when the file is missing — a fresh
 /// project that hasn't run `shelbi init --project` yet) and substitute
 /// `{{worker_permissions_mode}}` with `project.worker_permissions_mode`.
-/// Claude Code understands `auto` natively (v2.1.83+, classifier-based);
-/// we pass it through unchanged.
+///
+/// The placeholder substitution is kept for backward compatibility with
+/// user-authored templates that still reference it. The shipped default no
+/// longer uses the placeholder: claude's permission mode is now passed on
+/// the CLI by the worker spawn path, which is authoritative and immune to
+/// the settings.json races that motivated this change.
 pub fn render_worker_settings(project: &Project) -> Result<String> {
     let path = worker_settings_template_path(project)?;
     let template = match fs::read_to_string(&path) {
@@ -719,9 +725,14 @@ mod tests {
         // No template at ~/.shelbi/projects/myapp/worker-settings.json.template yet.
         let p = fixture_project("myapp", None);
         let rendered = render_worker_settings(&p).unwrap();
-        // `auto` passes through — claude understands it natively (v2.1.83+).
-        assert!(rendered.contains("\"defaultMode\": \"auto\""));
+        // The default no longer ships a permissions block — claude's
+        // permission mode is passed on the CLI by the spawn path now. What
+        // the default DOES ship is the title-state hooks the sidebar
+        // poller depends on.
+        assert!(!rendered.contains("\"permissions\""));
         assert!(!rendered.contains("{{worker_permissions_mode}}"));
+        assert!(rendered.contains("shelbi:idle"));
+        assert!(rendered.contains("shelbi:working"));
         let _: serde_json::Value = serde_json::from_str(&rendered).unwrap();
         std::env::remove_var("SHELBI_HOME");
     }
@@ -746,21 +757,34 @@ mod tests {
     }
 
     #[test]
-    fn render_worker_settings_passes_through_explicit_modes() {
+    fn render_worker_settings_substitutes_placeholder_in_custom_template() {
+        // Backward compatibility: user-authored templates that still carry
+        // the {{worker_permissions_mode}} placeholder must continue to be
+        // substituted, even though the shipped default no longer uses it.
         let _g = TEST_LOCK.lock().unwrap();
         let home = fresh_home();
         std::env::set_var("SHELBI_HOME", &home);
         let mut p = fixture_project("myapp", None);
         p.worker_permissions_mode = "bypassPermissions".into();
+        let tpl_path = worker_settings_template_path(&p).unwrap();
+        ensure_dir(tpl_path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &tpl_path,
+            r#"{"permissions":{"defaultMode":"{{worker_permissions_mode}}"}}"#,
+        )
+        .unwrap();
         let rendered = render_worker_settings(&p).unwrap();
-        assert!(rendered.contains("\"defaultMode\": \"bypassPermissions\""));
+        assert!(rendered.contains("\"defaultMode\":\"bypassPermissions\""));
         std::env::remove_var("SHELBI_HOME");
     }
 
     #[test]
-    fn default_worker_settings_template_contains_hooks_and_placeholder() {
+    fn default_worker_settings_template_contains_hooks_and_is_valid_json() {
         let s = DEFAULT_WORKER_SETTINGS_TEMPLATE;
-        assert!(s.contains("{{worker_permissions_mode}}"));
+        // The default no longer carries the {{worker_permissions_mode}}
+        // placeholder — claude's mode is set on the CLI by the spawn path.
+        assert!(!s.contains("{{worker_permissions_mode}}"));
+        assert!(!s.contains("defaultMode"));
         assert!(s.contains("Stop"));
         assert!(s.contains("Notification"));
         assert!(s.contains("UserPromptSubmit"));
@@ -768,10 +792,9 @@ mod tests {
         assert!(s.contains("shelbi:idle"));
         assert!(s.contains("shelbi:blocked"));
         assert!(s.contains("shelbi:working"));
-        // The rendered file is JSON after placeholder substitution.
-        let rendered = s.replace("{{worker_permissions_mode}}", "auto");
+        // The default ships ready to use — no substitution required.
         let _: serde_json::Value =
-            serde_json::from_str(&rendered).expect("template renders to valid JSON");
+            serde_json::from_str(s).expect("default template is valid JSON as-shipped");
     }
 
     #[test]

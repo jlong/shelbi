@@ -240,7 +240,14 @@ pub fn start_worker_on_task(spec: StartSpec<'_>) -> Result<TmuxAddr> {
     //    SSH launch can leave the tmux server in the C locale, and forcing
     //    UTF-8 keeps every box-drawing/glyph path well-defined regardless
     //    of host config.
-    let launch = shelbi_agent::launch_command(&runner);
+    // Inject `--permission-mode <mode>` directly on the claude command line
+    // rather than trusting the rendered `.claude/settings.json` to take effect.
+    // Settings-based mode is fragile (silent fallback to interactive on any
+    // I/O race or version regression) — the CLI flag is authoritative and
+    // belongs to the spawn path, where we already know the project's mode.
+    let runner_with_mode =
+        shelbi_agent::with_permission_mode(&runner, &spec.project.worker_permissions_mode);
+    let launch = shelbi_agent::launch_command(&runner_with_mode);
     let cd_launch = if host.is_local() {
         format!(
             "cd {wd} && LANG=C.UTF-8 {launch}",
@@ -275,9 +282,9 @@ pub fn start_worker_on_task(spec: StartSpec<'_>) -> Result<TmuxAddr> {
     Ok(addr)
 }
 
-/// The minimum claude version that understands `defaultMode: "auto"`. Older
-/// versions silently fall back to `default` and the worker pauses on every
-/// Bash prompt.
+/// The minimum claude version that understands `--permission-mode auto`.
+/// Older versions either silently fall back to `default` or reject the flag,
+/// and the worker pauses on every Bash prompt.
 const CLAUDE_AUTO_MODE_MIN: (u32, u32, u32) = (2, 1, 83);
 
 /// If the project wants auto-mode and the runner is claude, ensure the
@@ -293,8 +300,9 @@ fn require_auto_mode_supported(
     if mode != "auto" {
         return Ok(());
     }
-    // Only the `claude` CLI honors the `defaultMode` setting; other runners
-    // (codex etc.) ignore it, so the version probe is meaningless for them.
+    // Only the `claude` CLI accepts `--permission-mode`; other runners
+    // (codex etc.) reject the flag, so the version probe is meaningless
+    // for them.
     if std::path::Path::new(&runner.command).file_name().and_then(|s| s.to_str()) != Some("claude") {
         return Ok(());
     }
@@ -850,6 +858,60 @@ mod tests {
         for mode in ["acceptEdits", "bypassPermissions", "plan", "default"] {
             require_auto_mode_supported(&Host::Local, &runner, mode).unwrap();
         }
+    }
+
+    #[test]
+    fn spawn_path_injects_permission_mode_for_claude() {
+        // Mirror the relevant lines from start_worker_on_task — the spawn
+        // path must compose claude's launch line with --permission-mode so
+        // the worker doesn't depend on settings.json's defaultMode taking
+        // effect (which has silently regressed in the past).
+        let p = fixture_project(); // worker_permissions_mode = "auto"
+        let runner = p.runner("claude").unwrap().clone();
+        let runner_with_mode =
+            shelbi_agent::with_permission_mode(&runner, &p.worker_permissions_mode);
+        let launch = shelbi_agent::launch_command(&runner_with_mode);
+        assert_eq!(launch, "claude --permission-mode auto");
+    }
+
+    #[test]
+    fn spawn_path_passes_through_non_auto_modes() {
+        let mut p = fixture_project();
+        p.worker_permissions_mode = "acceptEdits".into();
+        let runner = p.runner("claude").unwrap().clone();
+        let runner_with_mode =
+            shelbi_agent::with_permission_mode(&runner, &p.worker_permissions_mode);
+        let launch = shelbi_agent::launch_command(&runner_with_mode);
+        assert_eq!(launch, "claude --permission-mode acceptEdits");
+    }
+
+    #[test]
+    fn spawn_path_omits_flag_for_default_mode() {
+        // `default` is claude's own baseline; passing the flag is a no-op
+        // that just clutters the command line.
+        let mut p = fixture_project();
+        p.worker_permissions_mode = "default".into();
+        let runner = p.runner("claude").unwrap().clone();
+        let runner_with_mode =
+            shelbi_agent::with_permission_mode(&runner, &p.worker_permissions_mode);
+        let launch = shelbi_agent::launch_command(&runner_with_mode);
+        assert_eq!(launch, "claude");
+    }
+
+    #[test]
+    fn spawn_path_leaves_non_claude_runners_alone() {
+        // Codex doesn't understand --permission-mode; injecting it would
+        // crash the runner on launch.
+        let mut p = fixture_project();
+        p.agent_runners.insert(
+            "codex".into(),
+            AgentRunnerSpec { command: "codex".into(), flags: vec!["--print".into()] },
+        );
+        let runner = p.runner("codex").unwrap().clone();
+        let runner_with_mode =
+            shelbi_agent::with_permission_mode(&runner, &p.worker_permissions_mode);
+        let launch = shelbi_agent::launch_command(&runner_with_mode);
+        assert_eq!(launch, "codex --print");
     }
 
     #[test]
