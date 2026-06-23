@@ -29,7 +29,9 @@ shelbi/
 │   │   │   ├── page.tsx
 │   │   │   └── layout.tsx
 │   │   ├── docs/
-│   │   │   └── [[...slug]]/page.tsx   # catch-all renders MDX
+│   │   │   └── [[...slug]]/
+│   │   │       ├── page.tsx           # catch-all renders MDX
+│   │   │       └── opengraph-image.tsx  # @vercel/og — per-page card
 │   │   ├── opengraph-image.tsx        # @vercel/og — homepage card
 │   │   ├── layout.tsx
 │   │   ├── globals.css
@@ -266,19 +268,21 @@ Three phases, each independently shippable:
 
 ## Decisions
 
-- **Domain:** `shelbi.dev` — confirmed available via RDAP and DNS, to be registered before Phase 1 ships. .dev TLD also gives free HTTPS via the mandatory HSTS preload list.
-- **Palette:** strict monochrome (pure black background, pure white foreground, 7-step gray ramp). No accent color. State communicated via dot fill, weight, and motion. Full spec in §3.
-- **Typography:** Geist Sans + Geist Mono — pair-designed by Vercel, both SIL OFL, loaded via the `geist` npm package. Full rationale in §3.
-- **Hero treatment:** asciinema cast of the actual TUI (no static screenshot, no animated SVG mockup). Player loaded async; theme matched to the strict-mono palette.
+- **Domain:** `shelbi.dev` — confirmed available via RDAP and DNS, registered ahead of Phase 1. The `.dev` TLD is on the HSTS preload list, so HTTPS is mandatory and free.
+- **Hosting:** Vercel, with **Root Directory** set to `site/`.
+- **Repo layout:** `site/` subdirectory in `jlong/shelbi`, alongside `crates/`. Single repo; CI path-filtered both directions.
+- **Palette:** strict monochrome — pure black background (`#000000`), pure white foreground (`#FFFFFF`), 7-step gray ramp. No accent color. State communicated via dot fill, weight, indentation, iconography, and motion. Full spec in §3.
+- **Typography:** Geist Sans + Geist Mono. Both SIL OFL, loaded via the `geist` npm package. Sans weights 400/500/600, mono 400/500.
+- **Logo:** block-character "SHELBI" wordmark as SVG, in `--color-fg` against `--color-bg`. Reused at favicon, hero, and section-divider scales.
+- **Hero treatment:** asciinema cast of the actual TUI (no static screenshot, no animated SVG mockup). Player loaded async on viewport entry; theme matched to the strict-mono palette.
+- **Asciinema scenario:** multi-worker showcase — 3 workers, 3 small fast-completing tasks dispatched in parallel, ~45s. Honest recording with rehearsed tasks rather than post-edited pauses.
 - **Marketing CTAs:** "Install now" (primary, links to `/docs/getting-started/install`) and "Read the docs" (secondary). No email signup, no newsletter form.
-- **Changelog:** reserved nav slot in the docs sidebar; single page (source TBD — see open questions).
+- **Docs sections (v1):** Getting Started, Concepts, CLI Reference, Changelog — in that sidebar order.
 - **CLI reference:** hand-authored MDX for v1. Auto-generation deferred until the `--help` surface stabilizes.
+- **Changelog:** single page at `/docs/changelog`, hand-maintained MDX. Prepend a new entry at each release; format `### v0.x.0 — YYYY-MM-DD` + prose.
 - **Shiki theme:** `vesper` for Phase 1; swap if it doesn't read against the strict-mono palette.
-- **Changelog source:** hand-maintained MDX at `/docs/changelog`. Prepend a new entry at each release; full prose + formatting control.
-- **Asciinema scenario:** multi-worker showcase — 3 workers, 3 small dummy tasks dispatched in parallel, ~45s. Honest recording with rehearsed fast-completing tasks rather than post-edited pauses.
 - **OG cards:** `@vercel/og` programmatic. One reusable component, per-page titles, strict-mono + Geist on every URL.
 
 ## Open questions
 
-_None remaining — plan is ready to execute. Phase 1 sub-tasks (asciinema recording scenario specifics, exact install command, OG component design) will surface during implementation but don't need pre-commitment._
-- **Code highlighting theme.** Strict mono + Geist Mono biases toward `vesper` (mostly-mono Shiki theme) or a custom mono-only theme. Trial `vesper` in Phase 1.
+_None remaining — plan is ready to execute. Phase 1 sub-tasks (asciinema recording specifics, exact install command, OG component design, tagline copy) will surface during implementation but don't need pre-commitment._
