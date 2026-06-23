@@ -48,7 +48,7 @@ export function DocsSidebar({ sections }: DocsSidebarProps) {
         onClick={() => setOpen((value) => !value)}
         aria-label={open ? "Close navigation" : "Open navigation"}
         aria-expanded={open}
-        className="fixed top-1 right-1 z-50 inline-flex h-4 w-4 items-center justify-center rounded-md border border-gray-4 bg-gray-1 text-fg md:hidden"
+        className="fixed top-7 right-1 z-50 inline-flex h-4 w-4 items-center justify-center rounded-md border border-gray-4 bg-gray-1 text-fg md:hidden"
       >
         {open ? (
           <XMarkIcon className="h-3 w-3" aria-hidden="true" />

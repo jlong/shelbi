@@ -2,6 +2,7 @@ import type { Metadata } from "next"
 import { Analytics } from "@vercel/analytics/react"
 import { GeistSans } from "geist/font/sans"
 import { GeistMono } from "geist/font/mono"
+import { Header } from "@/components/Header"
 import "./globals.css"
 
 const SITE_URL = "https://shelbi.dev"
@@ -36,6 +37,7 @@ export default function RootLayout({
       className={`${GeistSans.variable} ${GeistMono.variable} antialiased`}
     >
       <body className="bg-bg text-fg min-h-screen font-sans">
+        <Header />
         {children}
         <Analytics />
       </body>
