@@ -124,8 +124,8 @@ enum Cmd {
 }
 
 fn main() -> Result<()> {
-    init_tracing();
     let cli = Cli::parse();
+    init_tracing(cli.cmd.as_ref());
 
     match cli.cmd {
         None => default_entry(cli.project.clone()),
@@ -212,8 +212,50 @@ fn run_wizard_then_dispatch(first_run: bool) -> Result<()> {
     Ok(())
 }
 
-fn init_tracing() {
+/// Initialize the tracing subscriber.
+///
+/// For internal ratatui subcommands (`__sidebar`, `__tasks`, `__review`) we
+/// route output to `~/.shelbi/logs/tui.log` instead of stderr. The TUI process
+/// shares its TTY with ratatui's draw cycle, and any stray stderr write
+/// corrupts the cursor position — leaving raw `tracing` lines bleeding across
+/// the sidebar until the next full repaint (e.g. a resize). For all other
+/// commands the default stderr writer is fine.
+fn init_tracing(cmd: Option<&Cmd>) {
     use tracing_subscriber::{fmt, EnvFilter};
     let filter = EnvFilter::try_from_env("SHELBI_LOG").unwrap_or_else(|_| EnvFilter::new("info"));
-    let _ = fmt().with_env_filter(filter).with_target(false).try_init();
+    let is_tui = matches!(
+        cmd,
+        Some(Cmd::Sidebar { .. }) | Some(Cmd::Tasks { .. }) | Some(Cmd::ReviewView { .. })
+    );
+    if is_tui {
+        if let Some(file) = open_tui_log_file() {
+            let _ = fmt()
+                .with_env_filter(filter)
+                .with_target(false)
+                .with_ansi(false)
+                .with_writer(std::sync::Mutex::new(file))
+                .try_init();
+        } else {
+            // Couldn't open the log file. Sink to nowhere rather than stderr
+            // — silence is strictly better than bleeding onto the TUI.
+            let _ = fmt()
+                .with_env_filter(filter)
+                .with_target(false)
+                .with_writer(std::io::sink)
+                .try_init();
+        }
+    } else {
+        let _ = fmt().with_env_filter(filter).with_target(false).try_init();
+    }
+}
+
+fn open_tui_log_file() -> Option<std::fs::File> {
+    let home = shelbi_state::shelbi_home().ok()?;
+    let dir = home.join("logs");
+    std::fs::create_dir_all(&dir).ok()?;
+    std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(dir.join("tui.log"))
+        .ok()
 }
