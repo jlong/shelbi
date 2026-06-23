@@ -27,15 +27,15 @@ export async function generateMetadata({
   const comparison = getComparisonBySlug(slug)
   if (!comparison) {
     return {
-      title: "Comparisons — shelbi",
-      description: "How shelbi compares to other coding-agent tools.",
+      title: "Comparisons — Shelbi",
+      description: "How Shelbi compares to other coding-agent tools.",
     }
   }
   const ogUrl = `/og/vs/${encodeURIComponent(slug)}`
-  const alt = `shelbi vs ${comparison.competitor}`
+  const alt = `Shelbi vs ${comparison.competitor}`
   const ogImage = { url: ogUrl, ...OG_CARD_SIZE, alt }
   return {
-    title: `shelbi vs ${comparison.competitor} — shelbi`,
+    title: `Shelbi vs ${comparison.competitor} — Shelbi`,
     description: comparison.summary,
     openGraph: { images: [ogImage] },
     twitter: { card: "summary_large_image", images: [ogImage] },
@@ -59,7 +59,7 @@ export default async function ComparisonPage({ params }: ComparisonPageProps) {
           Comparison
         </p>
         <h1 className="mt-2 text-4xl font-semibold tracking-tight text-fg">
-          shelbi vs {comparison.competitor}
+          Shelbi vs {comparison.competitor}
         </h1>
         <p className="mt-2 text-balance text-lg leading-relaxed text-gray-7">
           {comparison.summary}

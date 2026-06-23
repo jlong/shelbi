@@ -5,18 +5,18 @@ competitorUrl: https://sketch.dev/
 summary: Both hand routine coding to an agent and give you the diff to review — they disagree about where that agent lives and how long it remembers.
 ---
 
-# shelbi vs Sketch.dev
+# Shelbi vs Sketch.dev
 
-shelbi and Sketch both take a task off your plate, let an agent grind through
+Shelbi and Sketch both take a task off your plate, let an agent grind through
 it, and hand you a git branch to review. Where they part ways is architecture:
-shelbi keeps a persistent fleet of workers across your own machines, while
+Shelbi keeps a persistent fleet of workers across your own machines, while
 Sketch ran each session inside a throwaway Docker container that was wiped
 when the session ended. If your work spans days and machines, that difference
 is the whole story.
 
 ## At a glance
 
-| | shelbi | Sketch.dev |
+| | Shelbi | Sketch.dev |
 |---|---|---|
 | Architecture | Orchestrator + a pool of long-lived worker agents | Single-agent bash loop |
 | Isolation | Per-task git worktree — **persistent** | Per-session Docker / gVisor container — **ephemeral** |
@@ -29,13 +29,13 @@ is the whole story.
 | License | MIT, open source | Apache-2.0, open source |
 | Maintenance | Actively developed | Retired 2026-01-08; succeeded by **Shelley** |
 
-## Where shelbi excels
+## Where Shelbi excels
 
 **Work persists; it isn't wiped every session.** Sketch tied a conversation's
 lifetime to its container's lifetime, so the environment vanished after each
 run — the team's own retrospective put it as "imagine having IT wipe your
 laptop clean every day," and that flaw is exactly why they rebuilt Sketch as
-Shelley. shelbi gives every task its own git worktree on a long-lived worker,
+Shelley. Shelbi gives every task its own git worktree on a long-lived worker,
 so state survives. A worker can finish a turn, sit idle overnight, and pick the
 same branch back up the next morning with its worktree intact. You review,
 merge, and archive each one independently — nothing gets discarded with a
@@ -43,7 +43,7 @@ sandbox.
 
 **A fleet across many machines, not one local box.** Sketch builds and runs its
 container on the single machine you launched it from; "parallel" means opening
-a second Sketch on the same host. shelbi runs one orchestrator that dispatches
+a second Sketch on the same host. Shelbi runs one orchestrator that dispatches
 work to a pool of workers spread across your laptop *and* remote machines
 reached over SSH. Route the auth refactor to the Linux box in the closet and a
 UI tweak to the Mac mini, then watch both from one TUI — spare compute anywhere
@@ -51,12 +51,12 @@ UI tweak to the Mac mini, then watch both from one TUI — spare compute anywher
 
 **Any agent CLI, not just Claude.** Sketch is practically single-provider: the
 only credential it asks for is `ANTHROPIC_API_KEY`, with no first-class OpenAI
-or Gemini support documented. shelbi treats the agent as a pluggable runner
+or Gemini support documented. Shelbi treats the agent as a pluggable runner
 declared per project — Claude Code, Codex, aider, or anything you can drive
 from a CLI — and different workers can run different runners side by side.
 
 **An orchestration layer, not a bare loop.** Sketch is a deliberately minimal
-single-agent loop; coordinating several tasks is manual. shelbi adds an
+single-agent loop; coordinating several tasks is manual. Shelbi adds an
 orchestrator agent that watches the events log and auto-assigns ready tasks to
 free workers, on top of a five-column Kanban with priorities and dependencies.
 Drop five cards into *todo* and the orchestrator dispatches them as workers come
@@ -64,7 +64,7 @@ free, skipping any still blocked by a `depends_on`.
 
 **No Docker, plain-text state.** Sketch hard-requires a Docker runtime and
 leaves you to reclaim disk with `docker system prune -a` as images pile up.
-shelbi needs only `tmux` and your agent CLI on a worker — no daemons, no
+Shelbi needs only `tmux` and your agent CLI on a worker — no daemons, no
 servers — and every task, log, and worker status is a markdown or YAML file you
 can grep, diff, and commit alongside your code.
 
@@ -72,7 +72,7 @@ can grep, diff, and commit alongside your code.
 
 **Stronger isolation.** Sketch runs the agent inside a throwaway container that
 can't reach the host's production credentials or deploy scripts, and a bad run
-is thrown away with the container — a genuine safety boundary. shelbi's
+is thrown away with the container — a genuine safety boundary. Shelbi's
 isolation is at the git-worktree level; the agent runs directly in a tmux pane
 with your environment, so there's no OS-level sandbox between a rogue command
 and your filesystem. If you need the agent fenced off from host secrets,
@@ -80,22 +80,22 @@ Sketch's model is the safer one.
 
 **A richer in-product review surface.** Sketch's web diff view lets you leave
 inline, PR-style comments to steer the agent and type fixes straight into the
-right-hand side of the diff, which it folds back into the commit. shelbi's
+right-hand side of the diff, which it folds back into the commit. Shelbi's
 review is a branch checkout plus a fresh agent pane to interrogate the diff —
 capable, but without that point-and-click inline-comment surface.
 
 **Built-in browser and vision tooling.** Sketch ships browser and screenshot
 tools plus image input, so it can verify UI work and act on a
-screenshot-with-a-sentence. shelbi delegates all of that to whatever agent CLI
-you run; it isn't a first-class shelbi feature.
+screenshot-with-a-sentence. Shelbi delegates all of that to whatever agent CLI
+you run; it isn't a first-class Shelbi feature.
 
 **A web UI and a zero-config start.** Sketch opens a browser chat-and-diff UI
 and fires a notification when a turn completes; you just run `sketch` in a repo
-and it generates the Dockerfile and builds the container for you. shelbi is
+and it generates the Dockerfile and builds the container for you. Shelbi is
 terminal-only and asks you to declare your project, machines, and workers in a
 setup wizard first.
 
-## Choose shelbi if…
+## Choose Shelbi if…
 
 You live in the terminal, have spare machines you'd rather *spread* agents
 across than cluster, want the freedom to mix more than one agent CLI, and need

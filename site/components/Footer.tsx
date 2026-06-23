@@ -28,7 +28,7 @@ export function Footer() {
               MIT License
             </Link>
             {" · "}
-            <span>&copy; {new Date().getFullYear()} shelbi</span>
+            <span>&copy; {new Date().getFullYear()} Shelbi</span>
           </p>
         </div>
         <nav aria-label="Footer" className="flex items-center gap-3">

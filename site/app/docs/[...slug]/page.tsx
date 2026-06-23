@@ -34,12 +34,12 @@ export async function generateMetadata({
   const { slug } = await params
   const doc = getDocBySlug(slug)
   if (!doc) {
-    return { title: "Docs — shelbi", description: "shelbi documentation." }
+    return { title: "Docs — Shelbi", description: "Shelbi documentation." }
   }
   const ogUrl = `/og/docs/${slug.map(encodeURIComponent).join("/")}`
-  const ogImage = { url: ogUrl, ...OG_CARD_SIZE, alt: `${doc.title} — shelbi docs` }
+  const ogImage = { url: ogUrl, ...OG_CARD_SIZE, alt: `${doc.title} — Shelbi docs` }
   return {
-    title: `${doc.title} — shelbi`,
+    title: `${doc.title} — Shelbi`,
     description: doc.summary,
     openGraph: { images: [ogImage] },
     twitter: { card: "summary_large_image", images: [ogImage] },

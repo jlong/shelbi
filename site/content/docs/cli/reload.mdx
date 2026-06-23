@@ -1,7 +1,7 @@
 ---
 title: shelbi reload
 order: 25
-summary: Respawn the shelbi-owned tmux panes in place so a freshly installed binary takes effect.
+summary: Respawn the Shelbi-owned tmux panes in place so a freshly installed binary takes effect.
 ---
 
 # shelbi reload
@@ -11,7 +11,7 @@ shelbi reload [OPTIONS]
 ```
 
 `shelbi reload` is the "I just rebuilt the binary, pick up the new code"
-command. It respawns the shelbi-owned panes — the sidebar plus the hidden
+command. It respawns the Shelbi-owned panes — the sidebar plus the hidden
 tasks / review / machines panes — in place. The orchestrator pane and the
 worker panes are left alone: those re-shell into `shelbi` on every call and
 pick up the new binary automatically on their next invocation, so there's

@@ -4,14 +4,14 @@ import { getSections, humanizeSection } from "@/lib/docs"
 import { OG_CARD_SIZE } from "@/components/OgCard"
 
 export const metadata: Metadata = {
-  title: "Docs — shelbi",
-  description: "shelbi documentation.",
+  title: "Docs — Shelbi",
+  description: "Shelbi documentation.",
   openGraph: {
-    images: [{ url: "/og/docs", ...OG_CARD_SIZE, alt: "shelbi documentation" }],
+    images: [{ url: "/og/docs", ...OG_CARD_SIZE, alt: "Shelbi documentation" }],
   },
   twitter: {
     card: "summary_large_image",
-    images: [{ url: "/og/docs", ...OG_CARD_SIZE, alt: "shelbi documentation" }],
+    images: [{ url: "/og/docs", ...OG_CARD_SIZE, alt: "Shelbi documentation" }],
   },
 }
 
@@ -20,7 +20,7 @@ export default function DocsIndex() {
   return (
     <main className="max-w-3xl">
       <h1 className="text-3xl font-semibold tracking-tight text-fg">Docs</h1>
-      <p className="mt-1 mb-6 text-gray-7">Guides and reference for shelbi.</p>
+      <p className="mt-1 mb-6 text-gray-7">Guides and reference for Shelbi.</p>
       <div className="flex flex-col gap-4">
         {sections.map(({ section, docs }) => (
           <section key={section || "_root"}>

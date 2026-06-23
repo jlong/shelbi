@@ -81,7 +81,7 @@ export interface WordmarkProps extends Omit<React.HTMLAttributes<HTMLElement>, "
 export function Wordmark({
   size = "md",
   as: Tag = "div",
-  title = "shelbi",
+  title = "Shelbi",
   className,
   ...rest
 }: WordmarkProps) {
@@ -174,7 +174,7 @@ const BLOCK_MARK_RECTS: Rect[] = [
   { x: 1, y: 8, w: 6 },
 ]
 
-export function BlockMark({ size = 32, title = "shelbi", ...rest }: BlockMarkProps) {
+export function BlockMark({ size = 32, title = "Shelbi", ...rest }: BlockMarkProps) {
   return (
     <svg
       viewBox="0 0 10 10"

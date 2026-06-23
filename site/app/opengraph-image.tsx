@@ -3,7 +3,7 @@ import { readFile } from "node:fs/promises"
 import { join } from "node:path"
 import { OG_CARD_SIZE, OgCard } from "@/components/OgCard"
 
-export const alt = "shelbi — a Kanban board for your team of coding agents"
+export const alt = "Shelbi — a Kanban board for your team of coding agents"
 export const size = OG_CARD_SIZE
 export const contentType = "image/png"
 

@@ -60,7 +60,7 @@ export default function WordmarkPreviewPage() {
             visible mark is decorative, the <code>title</code> prop provides
             the accessible name via an <code>sr-only</code> span.
           </p>
-          <Wordmark as="h1" size="hero" title="shelbi" />
+          <Wordmark as="h1" size="hero" title="Shelbi" />
         </section>
 
         <BlockDivider />

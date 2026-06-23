@@ -19,7 +19,7 @@ export default function DocsLayout({
     <div className="flex min-h-screen flex-col">
       <header className="sticky top-0 z-30 border-b border-gray-4 bg-bg">
         <div className="mx-auto flex h-6 w-full max-w-[88rem] items-center justify-between px-3 lg:px-4">
-          <Link href="/" aria-label="shelbi home" className="inline-flex">
+          <Link href="/" aria-label="Shelbi home" className="inline-flex">
             <Wordmark size="sm" />
           </Link>
         </div>

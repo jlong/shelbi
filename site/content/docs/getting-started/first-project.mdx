@@ -4,7 +4,7 @@ order: 2
 summary: Walk through the wizard, declare your workers, and write the project YAML.
 ---
 
-A shelbi *project* is a git repo plus the machines it can run on, the
+A Shelbi *project* is a git repo plus the machines it can run on, the
 agent runners those machines have, and the named pool of workers that
 pick up tasks. All of that lives in a single YAML file at
 `~/.shelbi/projects/<name>.yaml`. The wizard writes it for you.
@@ -231,7 +231,7 @@ Two `kind`s, two stories:
 - **`local`** — work runs in your hub's tmux session, in panes you can
   jump straight to with `Enter` on the sidebar row. Worktrees are
   created in the hub's `work_dir`.
-- **`ssh`** — shelbi opens an ssh proxy window into a tmux session on
+- **`ssh`** — Shelbi opens an ssh proxy window into a tmux session on
   the remote. Tasks check out branches into the remote's `work_dir`
   and the worker runs there. You can still watch the pane live from
   the hub; you just have one extra tmux session between you and it.

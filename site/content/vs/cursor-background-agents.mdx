@@ -7,7 +7,7 @@ summary: Cursor's async, cloud-run coding agents — Anysphere-hosted Ubuntu VMs
 
 ## At a glance
 
-| Dimension          | shelbi                                          | Cursor Background Agents                              |
+| Dimension          | Shelbi                                          | Cursor Background Agents                              |
 | ------------------ | ----------------------------------------------- | ----------------------------------------------------- |
 | Form factor        | Terminal Kanban + tmux panes                    | Embedded in Cursor editor + cursor.com/agents         |
 | Where work runs    | Your machines, your worktrees                   | Anysphere-managed Ubuntu VMs (cloud, default)         |
@@ -19,11 +19,11 @@ summary: Cursor's async, cloud-run coding agents — Anysphere-hosted Ubuntu VMs
 | Source             | Open source, MIT                                | Proprietary, commercial (Anysphere)                   |
 | Pricing            | Free                                            | Pro $20/mo+ with credit pool; usage-based on top      |
 
-## Where shelbi excels
+## Where Shelbi excels
 
 ### Persistent workers, not VMs you re-provision per task
 
-Each shelbi worker owns a named worktree at
+Each Shelbi worker owns a named worktree at
 `<machine.work_dir>/.shelbi/wt/<worker-name>` that lives for the whole
 project. Picking up a new task is a branch checkout in a worktree the
 worker already owns — no clone, no `npm install`, no dependency warm-up
@@ -39,7 +39,7 @@ pay it on every run.
 
 ### Your repo stays on your machines
 
-A shelbi worker pulls and pushes from a local checkout. Nothing in the
+A Shelbi worker pulls and pushes from a local checkout. Nothing in the
 loop needs a third-party service to hold a read-write grant against your
 GitHub org.
 
@@ -52,7 +52,7 @@ already have on disk.
 
 ### A review column, not a merge-ready PR
 
-shelbi finishes by moving the card to a `review` column. The branch is
+Shelbi finishes by moving the card to a `review` column. The branch is
 ready to inspect, the diff opens in a review pane, and `review → done`
 is a transition only you can make. Auto-merge is opt-in, per loop, and
 encoded in the orchestrator prompt you can edit.
@@ -64,7 +64,7 @@ nudge toward "click merge" when you don't. The review gate exists
 
 ### Pricing you can predict
 
-shelbi is free and MIT-licensed. Your model bill is whatever you already
+Shelbi is free and MIT-licensed. Your model bill is whatever you already
 pay for `claude` or `codex` — no second meter.
 
 Cursor Background Agents are bundled into paid plans starting at $20/mo
@@ -77,7 +77,7 @@ less so the moment you don't.
 
 ### Scriptable from anything that can shell out
 
-Every shelbi action is a CLI command: `shelbi task add`, `shelbi task
+Every Shelbi action is a CLI command: `shelbi task add`, `shelbi task
 move`, `shelbi worker list`, `shelbi events tail`. A cron job, a
 webhook, another agent — anything that can run a process — can drop
 work onto the board and watch it move.
@@ -91,10 +91,10 @@ Bitbucket PR comments, Linear, and an API — which is a real strength
 
 ### True close-the-laptop async
 
-This is the headline feature, and shelbi does not match it. Cursor's
+This is the headline feature, and Shelbi does not match it. Cursor's
 agents run on Anysphere's cloud VMs — you start a task, shut your
-laptop, and review the PR later from your phone. A shelbi worker on your
-hub or laptop needs that machine awake. A remote shelbi worker on a
+laptop, and review the PR later from your phone. A Shelbi worker on your
+hub or laptop needs that machine awake. A remote Shelbi worker on a
 home-lab box only helps if that box is on. If "I want work to keep
 running when my hardware is off" is the requirement, the cloud-hosted
 model wins.
@@ -104,7 +104,7 @@ model wins.
 `@cursor` in a Slack thread, a Linear comment, a GitHub or Bitbucket PR
 review, or the cursor.com/agents dashboard — all first-class triggers.
 For teams that don't want to context-switch into a terminal to delegate,
-that integration density matters and shelbi doesn't have an equivalent.
+that integration density matters and Shelbi doesn't have an equivalent.
 
 ### Rich PR artifacts out of the box
 
@@ -112,7 +112,7 @@ Cloud Agents can drive a remote desktop and browser, and ship
 **screenshots, videos, and logs** alongside the diff in the PR. For UI
 changes, "here is a 20-second screen capture of the new flow" is a
 materially better review signal than "the diff says it should work."
-shelbi leaves verification to whatever you do in the review pane.
+Shelbi leaves verification to whatever you do in the review pane.
 
 ### Editor and platform polish
 
@@ -123,7 +123,7 @@ audit logs are all part of the same product. If your team is already
 deep in Cursor, the integrated story is hard to beat by stitching
 external tools together.
 
-## Choose shelbi if…
+## Choose Shelbi if…
 
 - You want work running in worktrees you already have on disk, not
   cloud VMs cloned per run.

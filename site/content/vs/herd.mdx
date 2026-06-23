@@ -7,7 +7,7 @@ summary: A desktop IDE for parallel coding agents — one window spawns Claude C
 
 ## At a glance
 
-| Dimension          | shelbi                                       | Herd                                            |
+| Dimension          | Shelbi                                       | Herd                                            |
 | ------------------ | -------------------------------------------- | ----------------------------------------------- |
 | Form factor        | Terminal Kanban + tmux panes                 | Desktop GUI (Windows, macOS, Linux `.deb`/`.rpm`) |
 | Concurrency model  | Fixed pool of persistent workers             | Spawn-on-demand agents, capped by your laptop   |
@@ -18,7 +18,7 @@ summary: A desktop IDE for parallel coding agents — one window spawns Claude C
 | Runners            | Claude Code, Codex (declared per worker)     | Claude Code, Codex, Kimi (mixed per window)     |
 | Source             | Open source, MIT                             | Closed source, free download                    |
 
-## Where shelbi excels
+## Where Shelbi excels
 
 ### A pool that spans more than one laptop
 
@@ -75,10 +75,10 @@ resume in v0.2.1 recovers what it can).
 
 ### CLI-first, scriptable from anywhere
 
-Every shelbi action — `task add`, `task move`, `task start`, `worker list`,
+Every Shelbi action — `task add`, `task move`, `task start`, `worker list`,
 `events tail` — is a command. Cron jobs, webhooks, shell scripts, or
 other LLMs can add tasks and route work without going through a window.
-The orchestrator drives shelbi the same way you do.
+The orchestrator drives Shelbi the same way you do.
 
 Herd exposes its surface only through the desktop GUI. There is no public
 CLI, socket API, or remote-trigger entrypoint, so no external scheduler
@@ -86,12 +86,12 @@ can hand work to a Herd window from outside it.
 
 ## Where Herd excels
 
-### A polished desktop GUI shelbi doesn't try to be
+### A polished desktop GUI Shelbi doesn't try to be
 
 Herd is unapologetically graphical: VS Code-style title bar and file tabs,
 light and dark modes with platform-aware theme tokens, a command palette,
 an animated brand logo, and per-agent Run panels with auto-open URL chips
-for dev servers. If a beautiful window is on the requirement list, shelbi
+for dev servers. If a beautiful window is on the requirement list, Shelbi
 — a TUI — is the wrong answer.
 
 ### Three runners in one window today
@@ -118,7 +118,7 @@ its own commit and PR messages from the worktree diff (v0.1.9 / v0.1.10).
 For the "three agents finished at once, now I have three messages to
 write" problem, Herd has a direct answer.
 
-## Choose shelbi if…
+## Choose Shelbi if…
 
 - You want a worker pool that spans more than one machine you already own.
 - A Kanban with explicit triage and review columns matches how you think

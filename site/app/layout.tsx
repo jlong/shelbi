@@ -9,18 +9,18 @@ const SITE_DESCRIPTION = "A Kanban board for your team of coding agents."
 
 export const metadata: Metadata = {
   metadataBase: new URL(SITE_URL),
-  title: "shelbi",
+  title: "Shelbi",
   description: SITE_DESCRIPTION,
   openGraph: {
     type: "website",
-    siteName: "shelbi",
+    siteName: "Shelbi",
     url: SITE_URL,
-    title: "shelbi",
+    title: "Shelbi",
     description: SITE_DESCRIPTION,
   },
   twitter: {
     card: "summary_large_image",
-    title: "shelbi",
+    title: "Shelbi",
     description: SITE_DESCRIPTION,
   },
 }

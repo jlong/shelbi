@@ -6,7 +6,7 @@ summary: The five-column Kanban board — how tasks move through backlog, todo, 
 
 # Columns
 
-Every task in shelbi lives in exactly one of five columns. Position
+Every task in Shelbi lives in exactly one of five columns. Position
 within a column is a `priority` integer (0 = top), kept contiguous by
 the storage layer.
 
@@ -82,7 +82,7 @@ after accepting the diff.
 
 ### `done`
 
-Accepted. The task is finished from shelbi's point of view; the branch
+Accepted. The task is finished from Shelbi's point of view; the branch
 has typically been squash-merged into `main`.
 
 Done is a user signal — moving cards here means "I've reviewed and
@@ -134,7 +134,7 @@ The orchestrator hears about it through its `shelbi events tail
 --follow` feed and dispatches the next ready task to the now-free
 worker.
 
-That this works without the worker holding any shelbi-specific state is
+That this works without the worker holding any Shelbi-specific state is
 the point. The marker is the *entire* on-worker protocol — see the
 [workers concept page](/docs/concepts/workers#how-a-task-completes) for
 the rationale.

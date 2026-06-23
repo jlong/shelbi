@@ -32,7 +32,7 @@ between — assignment, branch setup, launch, completion detection,
 re-dispatch — is the orchestrator's responsibility.
 
 The shape of that responsibility is encoded in a prompt file shipped
-with shelbi. The orchestrator is *just claude* (or whatever runner you
+with Shelbi. The orchestrator is *just claude* (or whatever runner you
 configured) with that prompt loaded as a system prompt.
 
 ## How the prompt is wired
@@ -115,7 +115,7 @@ Two places to edit:
   substituted, and you can use it anywhere in your override.
 - **Global default:** edit
   `crates/shelbi-orchestrator/src/default_orchestrator.md.template` and
-  rebuild. This is the right place for shipped-with-shelbi changes.
+  rebuild. This is the right place for shipped-with-Shelbi changes.
 
 `system_prompt(project)` reads the override if it exists, otherwise
 returns the default — see `crates/shelbi-orchestrator/src/lib.rs:71`.
@@ -130,7 +130,7 @@ A few things worth keeping when you fork the default:
   `worker list` snapshot and the tail process to do its job.
 - The reaction rules tied to specific reason strings (`user:*`,
   `worker:review-marker`, `orchestrator:auto-dispatch …`). These are
-  the contract the rest of shelbi expects the orchestrator to honor.
+  the contract the rest of Shelbi expects the orchestrator to honor.
 - The "you are the scheduler" framing. Without it, the agent reverts to
   chatbot mode and waits to be told what to do, which defeats the
   point.

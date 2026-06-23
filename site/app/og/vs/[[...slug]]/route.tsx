@@ -30,7 +30,7 @@ export async function GET(_request: Request, { params }: RouteProps) {
   } else {
     const comparison = getComparisonBySlug(slug[0])
     if (!comparison) notFound()
-    title = `shelbi vs ${comparison.competitor}`
+    title = `Shelbi vs ${comparison.competitor}`
   }
 
   const [geistRegular, geistSemiBold, geistMonoRegular] = await Promise.all([
