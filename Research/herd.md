@@ -39,7 +39,7 @@ A note on naming: the user mentioned "Herdr" with an extra `r`. There are two di
 - **Herd** (this document) lives at `joinherd.ai`. It is the desktop multi-agent IDE described here.
 - **Herdr** lives at `herdr.dev`, has a GitHub repo at `github.com/ogulcancelik/herdr`, is written in Rust by a single developer ("Turkish developer Can"), and bills itself as "tmux for agents — an agent multiplexer that lives in your terminal." It is dual-licensed AGPL-3.0 / commercial and is a different product category from Herd.
 
-The remainder of this document refers to **Herd** at `joinherd.ai`, the direct shelbi competitor.
+The remainder of this document refers to **Herd** at `joinherd.ai`, the direct Shelbi competitor.
 
 ## Model
 
@@ -353,9 +353,9 @@ None of this is announced.
   By contrast Vibe Kanban, Crystal, Claude Squad, and Herdr (the multiplexer) all have public source.
   The release cadence has also slowed — only one release in April (v0.1.11), and v0.2.1 in early May is the most recent visible release — which raises a small flag about whether weekly-shipping is sustainable.
 
-## Where shelbi differs
+## Where Shelbi differs
 
-These are factual differences between Herd and shelbi as architectures, not arguments for one over the other.
+These are factual differences between Herd and Shelbi as architectures, not arguments for one over the other.
 
 - **Worker pool topology vs single-machine IDE.**
   Shelbi's workers are long-lived slots declared in project YAML, optionally spread across machines, each with a persistent worktree and a `prefers_machine` routing hint.
