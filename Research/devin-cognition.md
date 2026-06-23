@@ -434,7 +434,7 @@ independent coverage):
 
 ***
 
-## Where shelbi differs
+## Where Shelbi differs
 
 Factual axes of difference only. The two products target different audiences
 and overlap only partly — Devin is a hosted autonomous-agent SaaS; shelbi is
