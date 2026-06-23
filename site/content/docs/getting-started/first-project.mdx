@@ -1,0 +1,258 @@
+---
+title: Set up your first project
+order: 2
+summary: Walk through the wizard, declare your workers, and write the project YAML.
+---
+
+A shelbi *project* is a git repo plus the machines it can run on, the
+agent runners those machines have, and the named pool of workers that
+pick up tasks. All of that lives in a single YAML file at
+`~/.shelbi/projects/<name>.yaml`. The wizard writes it for you.
+
+## Start the wizard
+
+From inside the repo you want to set up:
+
+```bash
+shelbi
+```
+
+With no projects on disk, `shelbi` drops you straight into the wizard.
+You can also run it explicitly any time:
+
+```bash
+shelbi wizard
+```
+
+The first thing you see is the block-character banner:
+
+```
+   ▄▀▀▀▀▀▄   ▀▀    ▀▀  ▀▀▀▀▀▀▀   ▀▀   ▀▀▀▀▀▀▀▀▀▀▄   ▀▀▀▀▀
+  ▀▀        ▀▀    ▀▀  ▀▀        ▀▀        ▀▀    ▀▀   ▀▀
+  ▀▀▀▀▄    ▀▀▀▀▀▀▀▀  ▀▀▀▀▀▀    ▀▀      ▀▀▀▀▀▀▀▀▄    ▀▀
+▄     ▀▀  ▀▀    ▀▀  ▀▀        ▀▀        ▀▀     ▀▀  ▀▀
+ ▀▀▀▀▀▀  ▀▀    ▀▀  ▀▀▀▀▀▀▀▀  ▀▀▀▀▀▀▀▀  ▀▀▀▀▀▀▀▀  ▀▀▀▀▀
+
+an open-source agent orchestrator for the terminal
+```
+
+The wizard has two phases. The first names your assistant. The second
+walks one project through setup. Both are idempotent — re-running skips
+anything already on disk.
+
+## Phase 1 — Name your assistant
+
+```
+? What should we call your assistant? Orchestrator
+```
+
+The assistant name is the persona the orchestrator agent presents as in
+chat. Pick whatever you want — `Orchestrator`, `Hal`, your team's mascot.
+It's cosmetic; it changes the prompt header and the way the agent refers
+to itself, not how dispatch works.
+
+This prompt only fires once per install. Subsequent project setups skip
+it.
+
+## Phase 2 — Project setup
+
+Each prompt has a sensible default, shown in brackets. Press Enter to
+accept; type to override.
+
+### Repo basics
+
+```
+? Project name: myapp
+? Path to the repo: /Users/you/Workspaces/myapp
+? Default branch: main
+? GitHub repo URL (optional): git@github.com:you/myapp.git
+```
+
+Auto-fills from your environment:
+
+- **Project name** — the basename of the current directory.
+- **Path to the repo** — the current working directory.
+- **Default branch** — probed from `git symbolic-ref refs/remotes/origin/HEAD`, falling back to `main`.
+- **GitHub repo URL** — `git remote get-url origin`, blank if there's no remote.
+
+The project name has to be a kebab/snake-case identifier (letters, digits,
+`-`, `_`). It's the slug used in `~/.shelbi/projects/<name>.yaml`, in the
+tmux session name (`shelbi-<name>`), and on the CLI (`shelbi -p <name>`).
+
+### The hub
+
+```
+? Hub machine name: hub
+? Hub work directory: /Users/you/Workspaces/myapp
+```
+
+The **hub** is the machine you're currently sitting at. It owns the tmux
+session, runs the orchestrator pane, and holds any local workers. The
+work directory is where local workers' worktrees get created — usually
+the same as the repo path.
+
+### Remote machines (optional)
+
+```
+? Add a remote machine? Yes
+  ? Remote machine name: devbox
+  ? SSH host: devbox.local
+  ? Work directory on remote: /home/you/work/myapp
+? Add another remote machine? No
+```
+
+A remote machine is any host you can already reach over `ssh` without a
+password prompt, with `tmux` and your agent CLI installed on it. Shelbi
+prefixes every command with `ssh <host> --` and runs the workers there
+in tmux panes you can attach to from the hub.
+
+The SSH host defaults to the machine name — convenient if your
+`~/.ssh/config` already aliases hosts (so `devbox` resolves to a full
+host). The work directory is the path on that *remote* where worktrees
+live.
+
+You can add more machines later by editing the YAML directly and running
+`shelbi reload`.
+
+### Workers
+
+```
+? Agent runner (used by every worker): claude
+  (memory: 64 GB → recommended 5 workers per machine — configurable later)
+? Worker count per machine: 4
+? Worker naming style: NATO phonetic (alpha, bravo, charlie…)
+? Orchestrator runner: claude
+```
+
+- **Agent runner** — `claude` or `codex`. Every worker uses the same
+  runner by default; you can mix runners by editing the YAML later.
+- **Worker count per machine** — the wizard suggests a number based on
+  total RAM, budgeting roughly 10 GB per worker on single-machine
+  setups and 12 GB when work spreads across machines. Clamped to
+  `[1, 16]`. Override with whatever fits your machine.
+- **Worker naming style** — three presets to choose from:
+
+| Preset | Names |
+|---|---|
+| NATO phonetic | alpha, bravo, charlie, delta, echo, foxtrot, golf, … |
+| Greek letters | alpha, beta, gamma, delta, epsilon, zeta, eta, … |
+| Toy Story | woody, buzz, jessie, rex, hamm, slinky, bullseye, … |
+
+  Workers are laid out machine by machine — the first N names go to the
+  hub, the next N to the first remote, and so on.
+
+- **Orchestrator runner** — the agent CLI that runs in window 1 and
+  talks to you. Usually the same as the worker runner, but you can mix.
+
+The wizard writes the YAML, creates the per-worker directories under
+`~/.shelbi/workers/<name>/`, drops a `.shelbi/project` marker at the
+repo root, and launches the TUI.
+
+## The project YAML
+
+The wizard's output looks like this:
+
+```yaml
+# ~/.shelbi/projects/myapp.yaml
+name: myapp
+repo: /Users/you/Workspaces/myapp
+default_branch: main
+github_url: git@github.com:you/myapp.git
+machines:
+  - name: hub
+    kind: local
+    work_dir: /Users/you/Workspaces/myapp
+  - name: devbox
+    kind: ssh
+    host: devbox.local
+    work_dir: /home/you/work/myapp
+orchestrator:
+  runner: claude
+agent_runners:
+  claude: { command: claude, flags: [] }
+  codex:  { command: codex,  flags: [] }
+workers:
+  - { name: alpha,   machine: hub,    runner: claude }
+  - { name: bravo,   machine: hub,    runner: claude }
+  - { name: charlie, machine: hub,    runner: claude }
+  - { name: delta,   machine: hub,    runner: claude }
+  - { name: echo,    machine: devbox, runner: claude }
+  - { name: foxtrot, machine: devbox, runner: claude }
+  - { name: golf,    machine: devbox, runner: claude }
+  - { name: hotel,   machine: devbox, runner: claude }
+```
+
+Field by field:
+
+- **`name`** — the project slug.
+- **`repo`** — absolute path to the local checkout. Used as the source
+  for worktree creation.
+- **`default_branch`** — what new task branches fork from, and what
+  `shelbi merge` lands them on.
+- **`github_url`** — optional, informational. The merge `--pr` flow
+  still resolves the remote via local git config.
+- **`machines[]`** — every host the project can run on.
+  - `name` — referenced by `workers[].machine`.
+  - `kind` — `local` for the hub, `ssh` for a remote.
+  - `work_dir` — where worktrees live on that machine.
+  - `host` — SSH hostname (required when `kind: ssh`).
+- **`orchestrator.runner`** — which agent runner powers the
+  orchestrator window.
+- **`agent_runners`** — the runner registry. Each entry is a
+  `command` plus optional `flags` appended to every invocation. Add
+  custom runners here (e.g. `aider`) to make them available to workers.
+- **`workers[]`** — the fixed worker pool. Each worker is a name, the
+  machine it lives on, and the runner it uses. Order matters: the
+  orchestrator picks free workers in declaration order when
+  dispatching.
+
+### Naming workers by hand
+
+The wizard's presets cover most cases, but the names are just strings —
+nothing about `alpha` or `woody` is special. If you'd rather use roles,
+project codes, or your team's nicknames, edit `workers[]` directly:
+
+```yaml
+workers:
+  - { name: frontend,  machine: hub,    runner: claude }
+  - { name: backend,   machine: hub,    runner: claude }
+  - { name: refactor,  machine: devbox, runner: codex  }
+```
+
+Each worker name has to be a unique kebab/snake-case identifier across
+the project. Renaming a worker means the next dispatch creates a new
+worktree directory under `~/.shelbi/workers/<name>/` — the old one isn't
+deleted automatically.
+
+### Hub vs SSH machines
+
+Two `kind`s, two stories:
+
+- **`local`** — work runs in your hub's tmux session, in panes you can
+  jump straight to with `Enter` on the sidebar row. Worktrees are
+  created in the hub's `work_dir`.
+- **`ssh`** — shelbi opens an ssh proxy window into a tmux session on
+  the remote. Tasks check out branches into the remote's `work_dir`
+  and the worker runs there. You can still watch the pane live from
+  the hub; you just have one extra tmux session between you and it.
+
+You can declare any mix. A common setup is a few local workers on the
+hub for fast iteration plus a beefier remote for slow or
+memory-hungry tasks.
+
+## Reload after editing
+
+Edit the YAML by hand any time — add a machine, rename a worker, swap
+runners. Then refresh the live dashboard:
+
+```bash
+shelbi reload
+```
+
+This respawns the sidebar, Tasks, and Review panes against the new
+config without restarting the orchestrator or losing your chat history.
+
+## Next
+
+You have a project on disk and a worker pool waiting on work. Time to
+[run your first task](/docs/getting-started/first-task).

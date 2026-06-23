@@ -1,14 +1,34 @@
 ---
 title: Install
 order: 1
-summary: Clone shelbi and build the binary onto your PATH.
+summary: Prereqs, build-from-source, and verifying the binary on your PATH.
 ---
 
-# Install
+Shelbi ships as a single Rust binary. Until the first crate publishes, you
+install from source — clone the repo and run `scripts/install.sh`.
 
-For now, install from source — you need a working Rust toolchain and `git`.
+## Prerequisites
 
-## Clone and build
+You need three things before you start:
+
+- **A Rust toolchain.** The binary builds against the stable channel; install
+  with [rustup](https://rustup.rs) if you don't already have it. Anything
+  recent enough to compile the workspace works.
+- **`tmux` 3.2 or later.** Shelbi runs every worker inside a tmux pane and
+  drives them with `send-keys` / `capture-pane`. Older tmux releases miss
+  features the TUI relies on. Install via Homebrew (`brew install tmux`),
+  apt (`sudo apt install tmux`), or your package manager of choice.
+- **An agent CLI.** At least one of `claude`
+  ([Claude Code](https://docs.claude.com/en/docs/claude-code)) or `codex`
+  needs to be installed and authenticated. You can declare more than one
+  later — the project YAML picks per worker.
+
+Remote workers need the same `tmux` and agent CLI on the machine they run
+on, plus an `ssh` host you can already reach without a password prompt.
+
+## Build and install
+
+Clone the repo and run the install script:
 
 ```bash
 git clone https://github.com/jlong/shelbi.git
@@ -16,12 +36,33 @@ cd shelbi
 ./scripts/install.sh
 ```
 
-The script runs `cargo build --release` and drops the binary at `$HOME/bin/shelbi`.
-Override the destination with `SHELBI_INSTALL_PATH`:
+The script runs `cargo build --release` and copies the binary to
+`$HOME/bin/shelbi`. Override the destination with `SHELBI_INSTALL_PATH`:
 
 ```bash
 SHELBI_INSTALL_PATH=/usr/local/bin/shelbi ./scripts/install.sh
 ```
+
+Re-run the script any time you pull updates — it rebuilds and reinstalls in
+one step. The orchestrator and worker panes re-shell into `shelbi` on every
+call, so they pick up the new binary automatically; only the sidebar,
+Tasks, and Review views need a manual `shelbi reload` to respawn against
+the new build.
+
+### macOS: the codesign step
+
+On macOS the script re-signs the copied binary ad-hoc:
+
+```bash
+codesign --remove-signature "$INSTALL_PATH"
+codesign --sign - "$INSTALL_PATH"
+```
+
+`cargo build` produces a binary with an embedded ad-hoc signature. `cp`
+modifies the file enough to invalidate it, and on the next exec the kernel
+SIGKILLs the process with `Killed: 9` and no useful error. Re-signing
+after the copy restores it. Linux and Windows don't need this step and
+the script skips it on those platforms.
 
 ## Verify
 
@@ -29,5 +70,37 @@ SHELBI_INSTALL_PATH=/usr/local/bin/shelbi ./scripts/install.sh
 shelbi --version
 ```
 
-You should see the installed version printed back. From here, head to the
-project setup guide to wire up your first board.
+You should see the installed version printed back. If the shell can't
+find the binary, the install path isn't on your `PATH` — see below.
+
+## Troubleshooting
+
+**`command not found: shelbi`.** The default install path is
+`$HOME/bin/shelbi`. Make sure that directory is on your `PATH`:
+
+```bash
+# zsh / bash
+export PATH="$HOME/bin:$PATH"
+```
+
+Add the line to `~/.zshrc` or `~/.bashrc` to make it persistent. Or pass
+`SHELBI_INSTALL_PATH=/usr/local/bin/shelbi` to the install script so the
+binary lands somewhere already on your `PATH`.
+
+**`Killed: 9` on macOS, no other output.** The codesign step didn't run.
+This usually means you copied the binary out of `target/release/` by hand
+instead of using `scripts/install.sh`. Re-run the script, or run the
+codesign commands yourself against your install path.
+
+**`cargo: command not found`.** Install Rust via
+[rustup](https://rustup.rs) and restart your shell so `~/.cargo/bin` is on
+your `PATH`.
+
+**`tmux: command not found`** (or `tmux 1.x` warnings). Install or
+upgrade tmux to 3.2+. The TUI assumes modern pane title and popup
+support; older versions render incorrectly.
+
+## Next
+
+You have the binary. Now point it at a repo with
+[Set up your first project](/docs/getting-started/first-project).

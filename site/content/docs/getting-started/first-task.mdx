@@ -1,0 +1,219 @@
+---
+title: Run your first task
+order: 3
+summary: Open the TUI, add a task, watch a worker pick it up, and review the diff.
+---
+
+A task moves through five columns: **Backlog → Todo → In Progress →
+Review → Done**. You drive the ends — what lands in the backlog and
+what gets accepted out of review. The orchestrator drives the middle —
+as soon as a card hits todo it picks a free worker and starts them on
+it.
+
+## Open the TUI
+
+From inside a project, or from anywhere with the project on disk:
+
+```bash
+shelbi
+```
+
+With a single project configured, `shelbi` launches its TUI
+directly. With more than one, you get a fuzzy picker — type to filter,
+Enter to launch. Inside a repo with a `.shelbi/project` marker, that
+project always wins.
+
+You can also target a project by name:
+
+```bash
+shelbi -p myapp
+```
+
+The TUI is two panes. A borderless sidebar on the left lists the project
+name, the nav (Chat, Tasks), your declared workers, and any tasks
+waiting on review. The right pane is a real tmux pane — the orchestrator
+agent by default, or one of the built-in views (Chat / Tasks / Machines
+/ Review) when you switch.
+
+`Ctrl+P` opens a fuzzy command palette as a tmux popup. Use it to
+switch projects, jump to a worker pane, or swap the right pane to
+another view. `Enter` on a sidebar row activates it — focus a worker,
+open a review, switch to the Tasks board.
+
+## Add a task
+
+You have two ways in: through the orchestrator (the easy one) or
+directly via the CLI.
+
+### Through the orchestrator
+
+The orchestrator is the conversational front door. Tell it what you
+want in plain English:
+
+```
+you: fix the login bug on Safari — cookie domain mismatch
+     breaks the SSO redirect.
+
+Orchestrator: ✓ added to backlog as `fix-login-bug-on-safari`.
+              branch: shelbi/fix-login-bug-on-safari
+```
+
+The orchestrator creates a markdown task card in the **backlog**
+column. It won't auto-promote — the backlog is *your* triage queue.
+
+### Via the CLI
+
+Same end result, no chat:
+
+```bash
+shelbi task add "Fix login bug on Safari"
+```
+
+Flags you'll reach for occasionally:
+
+```bash
+shelbi task add "Fix login bug" \
+  --id fix-login \
+  --column todo \
+  --description "Cookie domain mismatch breaks the SSO redirect." \
+  --depends-on auth-refactor \
+  --prefers-machine devbox
+```
+
+- `--id` — override the auto-slug.
+- `--column` — drop straight into todo (or any other column).
+- `--description` — fill in the task body now instead of editing later.
+- `--depends-on` — repeat for multiple dependencies. The orchestrator
+  skips a todo card until everything it depends on is in `done`.
+- `--prefers-machine` — soft hint; the orchestrator routes to a free
+  worker on that machine when one's available.
+
+### Via the kanban view
+
+Press `Ctrl+P` and pick "Tasks", or hit `Enter` on the **Tasks**
+sidebar nav. You land on the 5-column Kanban board. Keys:
+
+| Key | Action |
+|---|---|
+| `h` / `l` | Step between columns |
+| `j` / `k` | Step between rows in the current column |
+| `Enter` / `Space` | Open the highlighted card |
+| `H` / `L` (shift) | Move the selected card to the previous / next column |
+| `K` / `J` (shift) | Reorder within a column |
+| `r` | Refresh |
+| `Esc` / `q` | Close an open card |
+
+Adding a task from the kanban view goes through the orchestrator —
+faster to just talk to it in chat.
+
+## Promote to todo, watch the auto-dispatch
+
+Promotion is the start signal. Move a backlog card into **todo** —
+either by hitting `L` (shift-l) on the card in the kanban view, or by
+asking the orchestrator to:
+
+```
+you: promote fix-login-bug-on-safari.
+
+Orchestrator: ✓ moved to todo. dispatched to delta.
+                worker: delta
+                branch: shelbi/fix-login-bug-on-safari
+```
+
+The orchestrator reacts to the move on the event log
+(`~/.shelbi/events.log`). It scans the worker pool, picks the first
+free worker in YAML declaration order (honoring `prefers_machine` if
+set), and runs:
+
+```bash
+shelbi task start fix-login-bug-on-safari --worker delta
+```
+
+That moves the card to **In Progress**, creates the branch
+`shelbi/fix-login-bug-on-safari` in the worker's worktree, and feeds
+the task prompt into the worker's agent CLI. The sidebar badge next to
+`delta` flips from `·` (idle) to `⏵` (working).
+
+Jump in any time. `Enter` on the worker's sidebar row drops you straight
+into its pane to watch the run live.
+
+| Badge | Worker state |
+|---|---|
+| `·` | idle — no task assigned |
+| `⏵` | working — agent actively running a turn |
+| `💬` | awaiting input — finished a turn, sitting at the prompt |
+| `⚠` | awaiting permission — showing a permission dialog |
+| `✓` | review-ready — task moved to the review column |
+
+## Review the worker's branch
+
+When the worker finishes, it writes a review-ready marker into its
+worktree. The hub poller picks it up on the next tick, moves the card
+into **Review**, and the worker's badge flips to `✓`. The sidebar's
+*Ready for Review* list grows a row:
+
+```
+— Ready for Review —
+✓ fix-login   delta
+```
+
+Click that row (or `Enter` on it) and shelbi checks the branch out into
+the project's working directory on the machine that ran the task, then
+spawns a fresh review pane there for you to interrogate the diff. The
+same thing happens from the CLI:
+
+```bash
+shelbi review fix-login-bug-on-safari
+```
+
+`--machine <name>` overrides where the checkout lands — handy when a
+task ran on a remote but you want to review locally.
+
+The review pane is a fresh agent session in the checked-out worktree —
+ask it to walk you through the diff, run tests, or explain a tricky
+hunk. Nothing about the worker's run is locked in yet; you can ask for
+edits and have them committed onto the same branch.
+
+## Accept the task
+
+Two flavors of accept.
+
+**Merge into the default branch.** From the review pane or the chat,
+just ask:
+
+```
+you: merge it.
+```
+
+Under the hood that's `shelbi merge fix-login-bug-on-safari`. The CLI
+squash-merges the branch into `default_branch` and prints the resulting
+commit hash. Add `--pr` to open a PR via the GitHub CLI instead of
+merging directly.
+
+**Move the card to Done.** The orchestrator never auto-completes
+review. You confirm the merge landed and move the card yourself — `L`
+in the kanban view from **Review**, or:
+
+```bash
+shelbi task move fix-login-bug-on-safari --to done
+```
+
+The worker is already free at that point (the review handoff flipped
+its badge back) and the orchestrator dispatches it to the next ready
+todo card on its own.
+
+## What just happened
+
+You added a task, promoted it, watched a worker pick it up, reviewed
+the result, and merged it. The same loop — backlog → todo → in progress
+→ review → done — is the whole product surface. Everything else is
+volume: more tasks at once, more workers, more machines.
+
+From here:
+
+- Read the **Concepts** docs for the full mental model of workers,
+  columns, the events log, and the orchestrator.
+- Browse the **CLI reference** for every flag on every `shelbi`
+  subcommand.
+- Edit `~/.shelbi/projects/<name>.yaml` to grow your worker pool, then
+  `shelbi reload` to pick up the change.
