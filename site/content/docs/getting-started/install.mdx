@@ -1,11 +1,15 @@
 ---
 title: Install
 order: 1
-summary: Prereqs, build-from-source, and verifying the binary on your PATH.
+summary: Hosted install script, build-from-source fallback, and verifying the binary on your PATH.
 ---
 
-Shelbi ships as a single Rust binary. Until the first crate publishes, you
-install from source — clone the repo and run `scripts/install.sh`.
+Shelbi ships as a single Rust binary. The hosted install script downloads
+the latest release and drops the binary on your `PATH`:
+
+<InstallCommand />
+
+Prefer to build it yourself? Skip to [Build from source](#build-from-source).
 
 ## Prerequisites
 
@@ -26,7 +30,7 @@ You need three things before you start:
 Remote workers need the same `tmux` and agent CLI on the machine they run
 on, plus an `ssh` host you can already reach without a password prompt.
 
-## Build and install
+## Build from source
 
 Clone the repo and run the install script:
 

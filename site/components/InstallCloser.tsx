@@ -1,8 +1,6 @@
 import Link from "next/link"
 import { ArrowRightIcon } from "@heroicons/react/24/outline"
-import { CodeBlock } from "./CodeBlock"
-
-const INSTALL_COMMAND = "curl -fsSL https://shelbi.dev/install.sh | sh"
+import { InstallCommand } from "./InstallCommand"
 
 export function InstallCloser() {
   return (
@@ -11,9 +9,9 @@ export function InstallCloser() {
         <h2 className="font-sans text-4xl font-semibold tracking-tight text-fg">
           Get started
         </h2>
-        <CodeBlock code={INSTALL_COMMAND} lang="bash" />
+        <InstallCommand />
         <Link
-          href="/docs/getting-started/install#from-source"
+          href="/docs/getting-started/install#build-from-source"
           className="inline-flex items-center gap-1 self-start font-mono text-sm text-gray-7 transition-colors hover:text-fg"
         >
           <span>Build from source</span>

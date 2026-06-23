@@ -1,5 +1,6 @@
 import type { MDXComponents } from "mdx/types"
 import Link from "next/link"
+import { InstallCommand } from "./InstallCommand"
 
 /**
  * Element overrides applied to rendered docs MDX. Strict-monochrome per
@@ -8,6 +9,8 @@ import Link from "next/link"
  * `pre`/`code` here only carry layout and the surrounding chrome.
  */
 export const mdxComponents: MDXComponents = {
+  // Shared marketing/docs components addressable from MDX by tag name.
+  InstallCommand,
   h1: (props) => (
     <h1 className="mt-6 mb-3 scroll-mt-8 text-3xl font-semibold tracking-tight text-fg" {...props} />
   ),
