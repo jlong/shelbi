@@ -257,14 +257,14 @@ The whole effort has since been superseded by Shelley.
   than discarding it with the sandbox.
 - **Model breadth:** Sketch was effectively single-provider (Claude /
   `ANTHROPIC_API_KEY`); the comparison axis is which model providers
-  shelbi supports.
+  Shelbi supports.
 - **Isolation mechanism:** Sketch's isolation boundary is a per-session
   Docker (locally) / gVisor (hosted) container with output handed back as
-  `sketch/*` git branches; the axis is how shelbi sandboxes agent work
+  `sketch/*` git branches; the axis is how Shelbi sandboxes agent work
   and how it returns results.
 - **Distribution / licensing:** Sketch shipped as an Apache-2.0
   open-source CLI you self-host with your own API key; the axis is
-  shelbi's licensing and hosting model (self-host vs. managed) and how
+  Shelbi's licensing and hosting model (self-host vs. managed) and how
   cost is structured.
 
 ## Appendix — successor (Shelley)
