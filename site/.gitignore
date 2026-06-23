@@ -13,6 +13,9 @@ out/
 build/
 next-env.d.ts
 
+# Contentlayer (generated docs types + bundled MDX)
+.contentlayer/
+
 # Production
 dist/
 

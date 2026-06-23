@@ -1,0 +1,33 @@
+---
+title: Install
+order: 1
+summary: Clone shelbi and build the binary onto your PATH.
+---
+
+# Install
+
+For now, install from source — you need a working Rust toolchain and `git`.
+
+## Clone and build
+
+```bash
+git clone https://github.com/jlong/shelbi.git
+cd shelbi
+./scripts/install.sh
+```
+
+The script runs `cargo build --release` and drops the binary at `$HOME/bin/shelbi`.
+Override the destination with `SHELBI_INSTALL_PATH`:
+
+```bash
+SHELBI_INSTALL_PATH=/usr/local/bin/shelbi ./scripts/install.sh
+```
+
+## Verify
+
+```bash
+shelbi --version
+```
+
+You should see the installed version printed back. From here, head to the
+project setup guide to wire up your first board.
