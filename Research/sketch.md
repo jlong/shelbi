@@ -244,16 +244,16 @@ The whole effort has since been superseded by Shelley.
   that ephemeral per-session environments were the wrong default for
   real, multi-day development work.
 
-## Where shelbi differs
+## Where Shelbi differs
 
 > Factual axes of difference only — not a value judgment.
 
-- **Maintenance status:** shelbi is an actively developed product; Sketch
+- **Maintenance status:** Shelbi is an actively developed product; Sketch
   is retired and frozen (its lineage continues as the separate Shelley
   project).
 - **Environment persistence:** Sketch's defining trait was ephemeral,
   per-session containers that were wiped each run; the comparison axis is
-  whether shelbi persists workspace/agent state across sessions rather
+  whether Shelbi persists workspace/agent state across sessions rather
   than discarding it with the sandbox.
 - **Model breadth:** Sketch was effectively single-provider (Claude /
   `ANTHROPIC_API_KEY`); the comparison axis is which model providers
