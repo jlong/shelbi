@@ -20,6 +20,8 @@ to watch live, and review/merge the diffs from a two-pane TUI.
 Part replacement-for-tmuxinator. Part terminal-native Conductor. All you need
 on a worker machine is `tmux` and your agent CLI.
 
+![Shelbi Kanban TUI with workers and tasks in flight](docs/assets/shelbi-in-action.png)
+
 ---
 
 ## Why
