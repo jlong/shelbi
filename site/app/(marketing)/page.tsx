@@ -11,6 +11,8 @@ import {
   ViewColumnsIcon,
 } from '@heroicons/react/24/outline'
 import Link from 'next/link'
+import { Footer } from '@/components/Footer'
+import { InstallCloser } from '@/components/InstallCloser'
 
 const pitch = [
   {
@@ -68,52 +70,57 @@ const features = [
 
 export default function HomePage() {
   return (
-    <main>
-      <section className="min-h-screen flex items-center justify-center p-3">
-        <div className="space-y-2">
-          <h1 className="font-mono text-3xl font-semibold text-fg">shelbi</h1>
-          <p className="text-gray-7">
-            A Kanban board for orchestrating fleets of coding agents.
-          </p>
-        </div>
-      </section>
+    <div className="flex min-h-screen flex-col">
+      <main className="flex flex-1 flex-col">
+        <section className="flex flex-1 items-center justify-center p-3">
+          <div className="space-y-2">
+            <h1 className="font-mono text-3xl font-semibold text-fg">shelbi</h1>
+            <p className="text-gray-7">
+              A Kanban board for orchestrating fleets of coding agents.
+            </p>
+          </div>
+        </section>
 
-      <section className="border-t border-gray-4">
-        <div className="grid grid-cols-1 md:grid-cols-3 gap-px bg-gray-4">
-          {pitch.map((item) => (
-            <Link
-              key={item.title}
-              href={item.href}
-              className="group flex flex-col gap-2 bg-bg p-4 outline outline-1 -outline-offset-1 outline-transparent transition-[outline-color] hover:outline-fg"
-            >
-              <item.icon className="w-3 h-3 text-fg" aria-hidden="true" />
-              <h3 className="text-xl font-semibold text-fg">{item.title}</h3>
-              <p className="text-gray-7 leading-relaxed">{item.body}</p>
-              <span className="mt-auto inline-flex items-center gap-1 pt-2 text-sm text-gray-7 group-hover:font-semibold group-hover:text-fg">
-                Learn more
-                <ArrowRightIcon className="w-2 h-2" aria-hidden="true" />
-              </span>
-            </Link>
-          ))}
-        </div>
-      </section>
+        <section className="border-t border-gray-4">
+          <div className="grid grid-cols-1 md:grid-cols-3 gap-px bg-gray-4">
+            {pitch.map((item) => (
+              <Link
+                key={item.title}
+                href={item.href}
+                className="group flex flex-col gap-2 bg-bg p-4 outline outline-1 -outline-offset-1 outline-transparent transition-[outline-color] hover:outline-fg"
+              >
+                <item.icon className="w-3 h-3 text-fg" aria-hidden="true" />
+                <h3 className="text-xl font-semibold text-fg">{item.title}</h3>
+                <p className="text-gray-7 leading-relaxed">{item.body}</p>
+                <span className="mt-auto inline-flex items-center gap-1 pt-2 text-sm text-gray-7 group-hover:font-semibold group-hover:text-fg">
+                  Learn more
+                  <ArrowRightIcon className="w-2 h-2" aria-hidden="true" />
+                </span>
+              </Link>
+            ))}
+          </div>
+        </section>
 
-      <section className="border-t border-b border-gray-4">
-        <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-px bg-gray-4">
-          {features.map((feature) => (
-            <div
-              key={feature.label}
-              className="flex flex-col gap-1 bg-bg p-3"
-            >
-              <feature.icon className="w-3 h-3 text-fg" aria-hidden="true" />
-              <h3 className="mt-1 text-base font-semibold text-fg">
-                {feature.label}
-              </h3>
-              <p className="text-sm leading-relaxed text-gray-7">{feature.body}</p>
-            </div>
-          ))}
-        </div>
-      </section>
-    </main>
+        <section className="border-t border-b border-gray-4">
+          <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-px bg-gray-4">
+            {features.map((feature) => (
+              <div
+                key={feature.label}
+                className="flex flex-col gap-1 bg-bg p-3"
+              >
+                <feature.icon className="w-3 h-3 text-fg" aria-hidden="true" />
+                <h3 className="mt-1 text-base font-semibold text-fg">
+                  {feature.label}
+                </h3>
+                <p className="text-sm leading-relaxed text-gray-7">{feature.body}</p>
+              </div>
+            ))}
+          </div>
+        </section>
+
+        <InstallCloser />
+      </main>
+      <Footer />
+    </div>
   )
 }
