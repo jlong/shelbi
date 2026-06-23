@@ -1,0 +1,69 @@
+---
+title: Changelog
+order: 99
+summary: Notable changes to shelbi, newest first.
+---
+
+Notable changes to shelbi, newest first. This page is hand-maintained:
+each release gets one entry, written as prose with code samples where they
+help. Entries are reverse-chronological — **prepend a new one at the top**.
+
+When you cut a release, add an entry directly below this paragraph using the
+template:
+
+{/*
+### vX.Y.Z — YYYY-MM-DD
+
+One or two sentences framing the release, then the notable changes — grouped
+into short prose paragraphs (or a list), with `code` and fenced blocks where
+they earn their keep. Newest entry goes first; never reorder older ones.
+*/}
+
+### v0.1.0 — 2026-06-23
+
+The first cut of shelbi — an open-source agent orchestrator for the terminal,
+built on tmux. You talk to one orchestrator agent; it delegates work to worker
+agents running in tmux panes, locally or over SSH, and reports back. This
+release lands the full local-to-remote loop end to end.
+
+**Onboarding.** A first run with no projects drops you into a two-phase,
+idempotent wizard — name your assistant, then walk each project through setup.
+It auto-fills from your environment (repo path, default branch, GitHub URL) and
+suggests a worker count from available RAM. Pick a naming style (phonetic,
+Greek, or Toy Story) and the workers are laid out machine by machine. A
+`.shelbi/project` marker at the repo root makes later runs auto-select the
+project; `shelbi` with no arguments otherwise launches the sole project's TUI,
+or a fuzzy picker when there's more than one.
+
+**The TUI.** A two-pane ratatui dashboard: a sidebar with Chat/Tasks
+navigation, a live worker roster with state badges (working, awaiting input,
+awaiting permission, review-ready, idle), and a `Ready for Review` queue;
+beside it a content pane that swaps between the orchestrator chat, a five-column
+Kanban (Backlog → Todo → In Progress → Review → Done), a Machines view, and a
+Review list. `Ctrl+P` opens a Nucleo-backed fuzzy command palette as a tmux
+popup for jumping between projects, workers, and views.
+
+**Orchestration.** Move a card to Todo and the orchestrator takes it from
+there — it watches the column and, as soon as a worker frees up, checks out the
+highest-priority unblocked card on a fresh branch in that worker's own
+worktree and starts the runner. `depends_on` blocks a task until its
+dependencies land in Done. Finished work lands in Review and the worker stops;
+activating a review checks the branch out, spawns a fresh agent pane to
+interrogate the diff, and lets you merge into the default branch — or push and
+open a PR with `--pr`.
+
+**Anywhere tmux runs.** Workers run on the hub or on any machine reachable over
+SSH with `tmux` and an agent CLI installed. shelbi drives panes with
+`tmux send-keys` + `capture-pane`, transparently prefixed with `ssh host --`
+for remotes; a poller reads each pane's `shelbi:<state>` title marker into
+worker status, which is what lights up the sidebar badges. Agent runners
+(`claude`, `codex`, or any interactive CLI) are pluggable and declared
+per project.
+
+**State you can read.** No daemons, no servers, no database — every project,
+task, log, and worker status is a markdown or YAML file under `~/.shelbi/`.
+The same `shelbi` CLI the orchestrator drives (`task`, `merge`, `reload`,
+`events`, …) is the one you can run yourself.
+
+Install from source with `./scripts/install.sh` (builds `--release`, drops the
+binary at `$HOME/bin/shelbi`, ad-hoc re-signs on macOS).
