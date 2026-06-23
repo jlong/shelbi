@@ -19,19 +19,19 @@ const pitch = [
   {
     icon: ClipboardDocumentListIcon,
     title: 'Plan tasks',
-    body: 'Capture work as small, well-scoped tasks on a Kanban board. Triage them from backlog into todo when they are ready, set priorities, and route work to specific machines or workers.',
+    body: 'Add work as cards in a backlog. Promote what is ready into todo, set priorities, and pin tasks to a specific machine or worker when it matters.',
     href: '/docs/getting-started/first-task',
   },
   {
     icon: CpuChipIcon,
     title: 'Workers do them',
-    body: 'A fixed pool of long-lived workers picks up ready tasks automatically. Each worker holds one task at a time, in its own persistent git worktree, on the machine you assigned.',
+    body: 'An orchestrator agent watches the board and hands ready tasks to free workers. Each worker holds one task at a time, in its own persistent git worktree, on the machine you assigned.',
     href: '/docs/concepts/workers',
   },
   {
     icon: CheckCircleIcon,
     title: 'You review and merge',
-    body: 'When a worker reports done its card lands in review. Inspect the branch in the review pane, accept or send back for changes, then merge into main on your terms.',
+    body: 'Finished work lands in the review column. Open the branch in the review pane, accept or send it back for changes, then squash-merge into main when you are ready.',
     href: '/docs/concepts/columns',
   },
 ]
@@ -40,7 +40,7 @@ const features = [
   {
     icon: ViewColumnsIcon,
     label: 'Kanban board',
-    body: 'Five columns — backlog, todo, in_progress, review, done — operated from a built-in TUI or the CLI.',
+    body: 'Five columns — backlog, todo, in_progress, review, done — driven from a built-in TUI or the CLI.',
   },
   {
     icon: ServerStackIcon,
@@ -50,22 +50,22 @@ const features = [
   {
     icon: BoltIcon,
     label: 'Orchestrator auto-dispatch',
-    body: 'An orchestrator agent watches the events log and assigns ready tasks to free workers without prompting.',
+    body: 'An orchestrator agent tails the events log and hands ready tasks to free workers without prompting.',
   },
   {
     icon: EyeIcon,
     label: 'Review flow',
-    body: 'Finished work surfaces as a review card; inspect the branch, accept it, send it back, or merge on your terms.',
+    body: 'Finished work lands in a review card — open the branch, accept, send it back, or squash-merge into main.',
   },
   {
     icon: ListBulletIcon,
     label: 'Events log',
-    body: 'Every state change emits one line into ~/.shelbi/events.log — tail it, grep it, audit it after the fact.',
+    body: 'Every state change appends one line to ~/.shelbi/events.log. Tail it, grep it, audit it later.',
   },
   {
     icon: CommandLineIcon,
     label: 'tmux-native',
-    body: 'Workers live in tmux panes — sessions persist across SSH drops and survive client restarts without losing context.',
+    body: 'Workers live in tmux panes — sessions persist across SSH drops and survive client restarts.',
   },
 ]
 

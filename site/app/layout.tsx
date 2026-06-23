@@ -5,7 +5,7 @@ import { GeistMono } from "geist/font/mono"
 import "./globals.css"
 
 const SITE_URL = "https://shelbi.dev"
-const SITE_DESCRIPTION = "A Kanban board for orchestrating fleets of coding agents."
+const SITE_DESCRIPTION = "A Kanban board for your team of coding agents."
 
 export const metadata: Metadata = {
   metadataBase: new URL(SITE_URL),

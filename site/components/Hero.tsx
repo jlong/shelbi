@@ -37,14 +37,14 @@ export function Hero() {
         />
 
         <p className="font-mono text-xs uppercase tracking-[0.25em] text-gray-7 sm:text-sm">
-          A Kanban board for your coding agents
+          A Kanban board for your team of coding agents
         </p>
 
         <p className="max-w-2xl text-balance text-base leading-relaxed text-gray-7 sm:text-lg">
-          Shelbi turns a fleet of long-lived coding agents into a real team —
-          each worker picks up one task at a time, runs it in its own git
-          worktree, and reports back for review. Built for developers who
-          want parallel agent work without losing the diff.
+          Drop tasks into a backlog and a fixed pool of workers picks them
+          up in parallel — each one in its own persistent git worktree, on
+          the machine you assigned. Finished work lands in a review column
+          where you inspect the diff and merge on your terms.
         </p>
 
         <div className="mt-2 flex w-full flex-col gap-2 sm:w-auto sm:flex-row sm:gap-3">
