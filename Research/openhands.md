@@ -383,7 +383,7 @@ agent orchestrator for the terminal, built on tmux."_
   editor-readable — with no database.
 - **Commercial model.** OpenHands is open-core: an MIT agent plus a paid hosted
   cloud and a commercially-licensed Enterprise/VPC tier (SSO, named engineer).
-  shelbi is a single self-installed binary (`cargo build` / `cargo install`),
+  Shelbi is a single self-installed binary (`cargo build` / `cargo install`),
   with no hosted SaaS or per-seat tier in scope.
 
 ---
