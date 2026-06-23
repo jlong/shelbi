@@ -1,0 +1,149 @@
+---
+competitor: Cursor Background Agents
+slug: cursor-background-agents
+competitorUrl: https://cursor.com/docs/background-agent
+summary: Cursor's async, cloud-run coding agents — Anysphere-hosted Ubuntu VMs that clone your repo, work on a branch, and open a merge-ready PR. Renamed Cloud Agents in Cursor 2.0.
+---
+
+## At a glance
+
+| Dimension          | shelbi                                          | Cursor Background Agents                              |
+| ------------------ | ----------------------------------------------- | ----------------------------------------------------- |
+| Form factor        | Terminal Kanban + tmux panes                    | Embedded in Cursor editor + cursor.com/agents         |
+| Where work runs    | Your machines, your worktrees                   | Anysphere-managed Ubuntu VMs (cloud, default)         |
+| Concurrency model  | Fixed pool of named, persistent workers         | Spin-up-per-task VMs; up to 8 fan-out per prompt      |
+| Environment        | Long-lived worktrees with warm caches           | Fresh VM per run; configured via `environment.json` / Dockerfile / snapshot |
+| Repo trust surface | Local checkout, no third-party push grant       | Read-write GitHub / GitLab / Bitbucket / Azure access |
+| Review flow        | Explicit `review` column, human signs off       | Agent opens "merge-ready" PR with artifacts           |
+| Model selection    | Per-worker runner (`claude`, `codex`)           | Forced Max Mode; routes to Anthropic / OpenAI / Google / Composer |
+| Source             | Open source, MIT                                | Proprietary, commercial (Anysphere)                   |
+| Pricing            | Free                                            | Pro $20/mo+ with credit pool; usage-based on top      |
+
+## Where shelbi excels
+
+### Persistent workers, not VMs you re-provision per task
+
+Each shelbi worker owns a named worktree at
+`<machine.work_dir>/.shelbi/wt/<worker-name>` that lives for the whole
+project. Picking up a new task is a branch checkout in a worktree the
+worker already owns — no clone, no `npm install`, no dependency warm-up
+on the hot path. The pool is declared once in YAML and the orchestrator
+routes work into stable slots.
+
+Each Cursor Cloud Agent run provisions a fresh Ubuntu VM, clones the
+repo (and dependent repos / submodules), and replays the configured
+setup commands before the agent does any real work. That fidelity is
+load-bearing — Cursor's own docs flag that "an agent that can't run
+tests, query services, or reach APIs cannot close the loop" — but you
+pay it on every run.
+
+### Your repo stays on your machines
+
+A shelbi worker pulls and pushes from a local checkout. Nothing in the
+loop needs a third-party service to hold a read-write grant against your
+GitHub org.
+
+Cursor Cloud Agents require **read-write access** to the repo and any
+dependent repos or submodules, granted to Anysphere's cloud, so that the
+managed VM can clone the code and push the branch back. That is the
+intended design, and it's the right trade-off for some teams — but it is
+a larger trust surface than running the agent against a worktree you
+already have on disk.
+
+### A review column, not a merge-ready PR
+
+shelbi finishes by moving the card to a `review` column. The branch is
+ready to inspect, the diff opens in a review pane, and `review → done`
+is a transition only you can make. Auto-merge is opt-in, per loop, and
+encoded in the orchestrator prompt you can edit.
+
+Cursor's stated output is a "merge-ready pull request" with screenshots,
+videos, and logs — which is great when you trust the run, and a stronger
+nudge toward "click merge" when you don't. The review gate exists
+(it's still a PR) but the framing is merge-first rather than review-first.
+
+### Pricing you can predict
+
+shelbi is free and MIT-licensed. Your model bill is whatever you already
+pay for `claude` or `codex` — no second meter.
+
+Cursor Background Agents are bundled into paid plans starting at $20/mo
+for Pro, but **always run in Max Mode** (extended context, no opt-out)
+which "consumes credits faster," and historically gate behind enabling
+usage-based spending plus a $10–$20 minimum-funding prompt. Cost-per-run
+depends on task size, model selection, and how many of the 8-way fan-out
+agents you actually spawn. Predictable if you stay inside the bundle;
+less so the moment you don't.
+
+### Scriptable from anything that can shell out
+
+Every shelbi action is a CLI command: `shelbi task add`, `shelbi task
+move`, `shelbi worker list`, `shelbi events tail`. A cron job, a
+webhook, another agent — anything that can run a process — can drop
+work onto the board and watch it move.
+
+Cursor exposes broad launch surfaces — editor, web, Slack, GitHub /
+Bitbucket PR comments, Linear, and an API — which is a real strength
+(see below) but they're the surfaces Cursor ships. Shelbi's surface is
+`exec`.
+
+## Where Cursor Background Agents excels
+
+### True close-the-laptop async
+
+This is the headline feature, and shelbi does not match it. Cursor's
+agents run on Anysphere's cloud VMs — you start a task, shut your
+laptop, and review the PR later from your phone. A shelbi worker on your
+hub or laptop needs that machine awake. A remote shelbi worker on a
+home-lab box only helps if that box is on. If "I want work to keep
+running when my hardware is off" is the requirement, the cloud-hosted
+model wins.
+
+### Launch surfaces wherever work already lives
+
+`@cursor` in a Slack thread, a Linear comment, a GitHub or Bitbucket PR
+review, or the cursor.com/agents dashboard — all first-class triggers.
+For teams that don't want to context-switch into a terminal to delegate,
+that integration density matters and shelbi doesn't have an equivalent.
+
+### Rich PR artifacts out of the box
+
+Cloud Agents can drive a remote desktop and browser, and ship
+**screenshots, videos, and logs** alongside the diff in the PR. For UI
+changes, "here is a 20-second screen capture of the new flow" is a
+materially better review signal than "the diff says it should work."
+shelbi leaves verification to whatever you do in the review pane.
+
+### Editor and platform polish
+
+Cursor 2.0's Composer model is purpose-built for coding turns and
+claims ~4× generation speed for interactive work; Bugbot adds an
+automated review pass; MCP, hooks, secrets, multi-repo, SAML/SCIM, and
+audit logs are all part of the same product. If your team is already
+deep in Cursor, the integrated story is hard to beat by stitching
+external tools together.
+
+## Choose shelbi if…
+
+- You want work running in worktrees you already have on disk, not
+  cloud VMs cloned per run.
+- A read-write repo grant to a third-party cloud is a non-starter for
+  your org.
+- You want an explicit `review` column with a human signing off, not a
+  merge-ready PR landing in your inbox.
+- A fixed, predictable cost (free + your existing model bill) matters
+  more than managed infrastructure.
+- The orchestration loop being editable code in your repo — prompt and
+  all — is something you actively want.
+
+## Choose Cursor Background Agents if…
+
+- "Close the laptop and let it run" is the core requirement.
+- Triggering work from Slack, Linear, or GitHub PR comments is part of
+  how your team already collaborates.
+- Screenshots, videos, and remote-browser verification on every PR are
+  load-bearing for your review process.
+- You're already on a paid Cursor plan and want the bundled feature
+  rather than a second tool.
+- Anysphere holding a read-write grant to your repos is a trade-off
+  your security review is comfortable with.
