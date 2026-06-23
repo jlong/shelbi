@@ -366,14 +366,14 @@ These are factual axes of difference, not claims of superiority.
   the agent loop in Cursor's cloud; Shelbi's execution model is not that
   hosted-cloud-by-default model.
 - **Licensing.** Cursor is a **proprietary commercial** product from
-  Anysphere; the comparison page should state shelbi's own licensing
+  Anysphere; the comparison page should state Shelbi's own licensing
   posture rather than imply parity.
 - **Billing shape.** Cursor charges a per-seat subscription plus
   **usage-based, credit-pool** model billing (forced Max Mode for cloud
-  agents); shelbi's pricing/billing model is its own and should be
+  agents); Shelbi's pricing/billing model is its own and should be
   stated directly.
 - **Editor coupling.** Cursor's agents are richest inside its IDE and
-  ecosystem (Composer model, Subagents, Bugbot, MCP/hooks); shelbi is
+  ecosystem (Composer model, Subagents, Bugbot, MCP/hooks); Shelbi is
   not coupled to a single proprietary editor.
 
 ## Open questions to verify before publishing
