@@ -1,0 +1,170 @@
+---
+title: The orchestrator
+order: 4
+summary: One agent in window 1 you talk to — it dispatches tasks to workers, tails the events log, and reports back. You are the priority-setter; it is the scheduler.
+---
+
+# The orchestrator
+
+The orchestrator is the agent you talk to. It lives in window 1 of the
+project's tmux session (`shelbi-<project>:dashboard`), runs whatever
+runner the project declares (typically `claude`), and treats the
+`shelbi` CLI as its tool surface — the same CLI you use yourself.
+
+The mental model is: **you are the priority-setter and reviewer. It is
+the scheduler.** It does not edit code, it does not accept reviews, it
+does not promote backlog items on its own. It turns natural-language
+requests into Kanban cards, picks free workers, and reports progress
+back.
+
+## You-are-the-scheduler
+
+A useful contrast: a generic chatbot waits to be asked. The orchestrator
+does not. As soon as a task lands in `todo`, that is the start signal —
+the orchestrator's job is to find a free worker, route the task to them,
+and tell you it did. When a worker finishes (its task moves to
+`review`), the orchestrator's job is to give that worker the next ready
+task without waiting to be prompted.
+
+This is what makes the loop feel continuous. You drop work into the
+backlog, triage what's ready, and review what comes back. Everything in
+between — assignment, branch setup, launch, completion detection,
+re-dispatch — is the orchestrator's responsibility.
+
+The shape of that responsibility is encoded in a prompt file shipped
+with shelbi. The orchestrator is *just claude* (or whatever runner you
+configured) with that prompt loaded as a system prompt.
+
+## How the prompt is wired
+
+When you boot a project (`shelbi orchestrate` or via the TUI launcher),
+`ensure_dashboard()` does the following:
+
+1. Resolves the active **system prompt** for this project — see
+   [customizing the prompt](#customizing-the-prompt-per-project) below.
+2. Substitutes `{{assistant_name}}` with the name you set in the wizard
+   (from `~/.shelbi/shelbi.yaml`, defaulting to `Orchestrator`).
+3. Writes the rendered prompt to
+   `~/.shelbi/projects/<name>/CLAUDE.md`.
+4. Launches the orchestrator runner in the right pane of the
+   `dashboard` window, with that path as its working directory.
+
+That working-directory choice is the entire wiring trick. The runner
+(claude) auto-loads `CLAUDE.md` from its `cwd`, so dropping the
+rendered template at `~/.shelbi/projects/<name>/CLAUDE.md` and
+launching claude there is enough — no flags, no env vars, no MCP
+servers. The orchestrator starts with the full prompt in context and
+the `shelbi` CLI on its PATH.
+
+Defined in `crates/shelbi-orchestrator/src/lib.rs`:
+
+- `DEFAULT_SYSTEM_PROMPT` (line 22) — the embedded template.
+- `system_prompt(project)` (line 71) — resolves project override vs
+  default, substitutes placeholders.
+- `ensure_dashboard(project)` (line 221) — writes the rendered
+  `CLAUDE.md` and launches the runner in that directory.
+
+## Bootstrap flow on session start
+
+The prompt instructs the orchestrator to do three things on the first
+reply of a session (or right after `shelbi reload`) — before answering
+the user:
+
+1. **Read the board.** `shelbi task list` for the column membership,
+   priorities, `assigned_to`, and any `prefers_machine` hints on each
+   card.
+2. **Read the worker pool.** `shelbi worker list` to see which workers
+   are free (no in-progress task assigned) and which machine each lives
+   on.
+3. **Start tailing.** Launch `shelbi events tail --follow` in the
+   background and watch it. Every emitted line is a trigger the
+   orchestrator must consider.
+
+After that, the in-memory snapshot is kept up to date from the event
+stream — the orchestrator only re-runs `worker list` / `task list` if
+the tail process dies and it has to rebuild.
+
+The reaction rules are simple:
+
+- `task=<id> backlog -> todo reason=user:*` → find a free eligible
+  worker, dispatch.
+- `task=<id> in_progress -> review reason=worker:review-marker` →
+  that worker is now free, find them the next ready task.
+- `worker=<name> working -> awaiting_input` → same idea, worker just
+  freed up.
+- `worker=<name> pane_alive=false` → surface to the user; don't
+  auto-restart.
+
+When dispatching, the orchestrator picks free eligible workers in the
+order they're declared in the project YAML, honoring `prefers_machine`
+hints. If a task names a machine and no worker on that machine is free,
+it stays in `todo` rather than getting routed to the wrong host.
+
+The full set of rules — including when *not* to dispatch (failed
+retries, deduplicated misclicks, mid-conversation with the user) — is
+in the default prompt. It's worth a read; it doubles as the spec for
+what the orchestrator is supposed to do.
+
+## Customizing the prompt per project
+
+Two places to edit:
+
+- **Per-project override:** drop an `ORCHESTRATOR.md` file at
+  `~/.shelbi/projects/<name>/ORCHESTRATOR.md`. When present, this file
+  replaces the bundled default entirely. `{{assistant_name}}` is still
+  substituted, and you can use it anywhere in your override.
+- **Global default:** edit
+  `crates/shelbi-orchestrator/src/default_orchestrator.md.template` and
+  rebuild. This is the right place for shipped-with-shelbi changes.
+
+`system_prompt(project)` reads the override if it exists, otherwise
+returns the default — see `crates/shelbi-orchestrator/src/lib.rs:71`.
+The rendered output is rewritten to
+`~/.shelbi/projects/<name>/CLAUDE.md` on every `ensure_dashboard` call,
+so your changes take effect the next time the dashboard is
+bootstrapped (or `shelbi reload`d).
+
+A few things worth keeping when you fork the default:
+
+- The bootstrap flow. The orchestrator needs the initial `task list` /
+  `worker list` snapshot and the tail process to do its job.
+- The reaction rules tied to specific reason strings (`user:*`,
+  `worker:review-marker`, `orchestrator:auto-dispatch …`). These are
+  the contract the rest of shelbi expects the orchestrator to honor.
+- The "you are the scheduler" framing. Without it, the agent reverts to
+  chatbot mode and waits to be told what to do, which defeats the
+  point.
+
+What you might *want* to change per project:
+
+- Routing rules — "always send infra tasks to charlie", "never use the
+  hub for benchmarks".
+- Merge policy — by default the orchestrator stops at `review`; you
+  can authorize specific loops where it squash-merges and moves
+  straight to `done` (see the "Mark review done, merge, and push"
+  section in the default prompt for the existing recipe).
+- Reporting style — the one-line activity summary is tunable.
+
+## What the orchestrator does not do
+
+- **It does not edit code.** Workers do that.
+- **It does not move tasks to `done`.** That's your accept signal.
+- **It does not auto-promote backlog → todo.** Triage belongs to the
+  user.
+- **It does not restart a worker whose pane died.** It surfaces the
+  death and waits for direction.
+- **It does not stop workers without asking.**
+
+These are guardrails encoded in the prompt itself. They're worth
+calling out because the temptation when watching a fast loop is to let
+the orchestrator do *more*. Don't — the boundaries are what keep the
+workflow legible.
+
+## See also
+
+- [Workers](/docs/concepts/workers) — what the orchestrator dispatches
+  tasks to.
+- [Columns](/docs/concepts/columns) — the board the orchestrator is
+  reading and writing.
+- [The events log](/docs/concepts/events-log) — the orchestrator's
+  live feed.

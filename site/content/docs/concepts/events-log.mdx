@@ -1,0 +1,177 @@
+---
+title: The events log
+order: 3
+summary: An append-only file at ~/.shelbi/events.log — every worker state change and task column move, in one stream the orchestrator tails.
+---
+
+# The events log
+
+Every state change shelbi observes is appended to one file:
+
+```
+~/.shelbi/events.log
+```
+
+(or `$SHELBI_HOME/events.log` if you've set it). It is the live wire the
+orchestrator listens on to decide what to do next, and the audit trail
+you grep when something looks wrong.
+
+The log is **hub-global**, not per-project: lines for all projects
+running against this hub interleave in the same file. Filtering by
+project (or worker, or task) is the orchestrator's job — at the
+filesystem layer, it's one stream.
+
+Defined in `crates/shelbi-state/src/worker_status.rs` (`events_log_path`,
+`append_worker_event`, `append_task_event`).
+
+## Line shape
+
+There are exactly two kinds of lines. The prefix after the timestamp
+tells you which:
+
+### Worker transitions
+
+```
+<rfc3339-timestamp> worker=<name> <prev-state> -> <new-state>
+```
+
+```
+2026-06-22T14:22:11+00:00 worker=alpha none -> working
+2026-06-22T14:23:47+00:00 worker=alpha working -> awaiting_input
+2026-06-22T14:23:48+00:00 worker=alpha awaiting_input -> working
+```
+
+- `<prev-state>` is `none` on the first observation of that worker.
+- States: `working`, `awaiting_input`, `blocked`. See
+  [worker states](/docs/concepts/workers#worker-states).
+- Written by the hub-side poller every time it observes a state change
+  (not on every tick — only on actual transitions).
+
+### Task transitions
+
+```
+<rfc3339-timestamp> task=<id> <from-column> -> <to-column> reason=<short>
+```
+
+```
+2026-06-22T14:24:03+00:00 task=fix-login backlog -> todo reason=user:cli
+2026-06-22T14:24:11+00:00 task=fix-login todo -> in_progress reason=orchestrator:auto-dispatch_worker=alpha
+2026-06-22T14:31:52+00:00 task=fix-login in_progress -> review reason=worker:review-marker
+```
+
+- `<from-column>` and `<to-column>` are the snake_case column names:
+  `backlog`, `todo`, `in_progress`, `review`, `done`. See
+  [columns](/docs/concepts/columns).
+- `reason=<short>` is a single token (whitespace is folded to
+  underscores) describing who triggered the move.
+
+The orchestrator distinguishes the two line kinds by the `task=` vs
+`worker=` prefix. Anything else on a line is consumer-defined; today,
+nothing else appears.
+
+## Atomicity
+
+Lines are appended via `O_APPEND` in a single `write_all` of the full
+formatted line including the trailing newline. POSIX guarantees that
+appends ≤ `PIPE_BUF` (4096 bytes) under `O_APPEND` are atomic relative
+to other appenders, so concurrent writes from the CLI and the poller
+interleave **whole lines** rather than tearing.
+
+This matters because both the CLI (when you run `shelbi task move`) and
+the poller (when it observes state changes) write to the same file
+concurrently. The test
+`concurrent_task_and_worker_appends_dont_tear` in
+`crates/shelbi-state/src/worker_status.rs` locks this property in.
+
+## Tailing the log
+
+The CLI gives you a `tail -f`-shaped view:
+
+```bash
+shelbi events tail               # last 20 lines, exit
+shelbi events tail -n 100        # last 100 lines, exit
+shelbi events tail --follow      # last 20 lines, then stream
+shelbi events tail --since 10m   # everything in the last 10 minutes
+shelbi events tail --since 2h --follow
+```
+
+`--since` accepts `<n>s|m|h|d` (e.g. `30s`, `5m`, `2h`, `1d`); a bare
+integer is seconds. When `--since` is set, `-n` is ignored and every
+matching line is printed.
+
+The follow loop polls the file every 250ms, holding back the final
+fragment until its newline arrives so you never see a half-written event.
+If the file is truncated or rotated underneath it (`len < offset`), it
+restarts from the top rather than silently dropping the next writer's
+content.
+
+```text
+2026-06-22T14:24:03+00:00 task=fix-login backlog -> todo reason=user:cli
+2026-06-22T14:24:11+00:00 task=fix-login todo -> in_progress reason=orchestrator:auto-dispatch_worker=alpha
+2026-06-22T14:24:11+00:00 worker=alpha awaiting_input -> working
+2026-06-22T14:31:50+00:00 worker=alpha working -> awaiting_input
+2026-06-22T14:31:52+00:00 task=fix-login in_progress -> review reason=worker:review-marker
+```
+
+That five-line burst is what one task moving through the system looks
+like end-to-end: user triages, orchestrator dispatches, worker starts
+working, worker finishes its turn, marker fires, task lands in review.
+
+Implementation: `crates/shelbi-cli/src/commands/events.rs`.
+
+## Reason strings
+
+The `reason=` tag on task lines is a free-form short token — the system
+doesn't enforce a vocabulary, but the orchestrator and CLI use a
+consistent set:
+
+| Reason                                             | Source                                   | Meaning                                                                            |
+|----------------------------------------------------|------------------------------------------|------------------------------------------------------------------------------------|
+| `user:cli`                                         | `shelbi task move`                       | You moved the card from the CLI with no explicit reason.                           |
+| `user:cli:start`                                   | `shelbi task start`                      | You launched a worker on a task from the CLI.                                      |
+| `user:tui:…`                                       | the Kanban TUI                           | You moved the card with `H`/`L` in the TUI.                                        |
+| `user:promote`                                     | a `--reason` you passed                  | Free-form — anything starting with `user:` reads as "the human chose this."        |
+| `orchestrator:auto-dispatch worker=<name>`         | the orchestrator's `shelbi task start`   | The orchestrator picked a free worker and dispatched per its routing rules.        |
+| `worker:review-marker`                             | the hub poller                           | The worker wrote its review-ready marker; the poller promoted the task to review.  |
+
+These aren't enforced by code — they're a convention the orchestrator
+parses to decide whether *it* triggered an event (and shouldn't react)
+or *you* did (and it should respond). The fields the orchestrator pays
+attention to today:
+
+- A `user:*` reason on `backlog -> todo` means "newly triaged" — try to
+  dispatch.
+- `worker:review-marker` on `in_progress -> review` means "the assigned
+  worker just became free" — find them the next task.
+- `orchestrator:auto-dispatch …` is the orchestrator's own action; it
+  doesn't react to it (otherwise it would loop).
+
+Whitespace in your reason is replaced with `_` so the line stays
+parseable on a single token. Newlines and tabs get the same treatment.
+
+## Reading the log from code
+
+If you're building something that consumes the log directly, the
+contract is:
+
+- Append-only. Never truncate; if you need to rotate, do it atomically
+  via rename.
+- One line per event, RFC3339 timestamp first, ASCII fields separated
+  by single spaces.
+- Two prefixes — `worker=` or `task=` — keyed off the second
+  whitespace-separated token after the timestamp.
+- Reason strings are tokens (no whitespace). If you need to embed
+  structured data, encode it inside the token (the convention
+  `key=value` works fine).
+
+The full grammar lives in the two `append_*_event` functions in
+`crates/shelbi-state/src/worker_status.rs`.
+
+## See also
+
+- [Workers](/docs/concepts/workers#worker-states) — what each worker
+  state actually means.
+- [Columns](/docs/concepts/columns) — what each `from -> to` transition
+  means.
+- [The orchestrator](/docs/concepts/orchestrator) — what the
+  orchestrator does with each line it reads.
