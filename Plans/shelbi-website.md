@@ -6,12 +6,12 @@ Shelbi has no public web presence today. Discovery and onboarding live entirely 
 
 The need is twofold:
 
-- **Marketing surface.** A landing page that explains what shelbi is, who it's for, and gives a clear path to "install + try your first task." Same role the `contextstore-website` plays for ContextStore.
+- **Marketing surface.** A landing page that explains what Shelbi is, who it's for, and gives a clear path to "install + try your first task." Same role the `contextstore-website` plays for ContextStore.
 - **Documentation surface.** Getting-started walkthrough, mental-model docs (workers / columns / events log / orchestrator), and a CLI reference. The README is the current single source of truth and is already straining under that load — getting-started, concepts, and reference all rolled into one scroll.
 
 These two surfaces want to share styling, navigation, and deploy pipeline. One Next.js app, two content modes (marketing pages + MDX docs).
 
-The 32pixels Next.js sites give us a tooling template: `~/Workspaces/32pixels/contextstore-website` (Next 16, marketing-only) and `~/Workspaces/32pixels/website` (Next 15 + contentlayer + MDX blog). We borrow the file conventions, dependency choices, and 8px spacing system — but the visual identity is shelbi's own (see §3).
+The 32pixels Next.js sites give us a tooling template: `~/Workspaces/32pixels/contextstore-website` (Next 16, marketing-only) and `~/Workspaces/32pixels/website` (Next 15 + contentlayer + MDX blog). We borrow the file conventions, dependency choices, and 8px spacing system — but the visual identity is Shelbi's own (see §3).
 
 ## Design
 
