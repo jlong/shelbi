@@ -11,7 +11,6 @@ import {
   ViewColumnsIcon,
 } from '@heroicons/react/24/outline'
 import Link from 'next/link'
-import { Footer } from '@/components/Footer'
 import { Hero } from '@/components/Hero'
 import { InstallCloser } from '@/components/InstallCloser'
 
@@ -114,7 +113,6 @@ export default function HomePage() {
 
         <InstallCloser />
       </main>
-      <Footer />
     </div>
   )
 }

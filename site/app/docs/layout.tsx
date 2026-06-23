@@ -3,8 +3,8 @@ import { getSections } from "@/lib/docs"
 
 /**
  * Reading layout for `/docs/*`: a sticky sidebar (mobile drawer below
- * `md`) and the article slot. The site-wide header is rendered by the
- * root layout; the on-this-page rail is rendered by the page itself
+ * `md`) and the article slot. The site-wide header + footer are rendered
+ * by the root layout; the on-this-page rail is rendered by the page itself
  * because it needs the doc-specific heading list.
  */
 export default function DocsLayout({
