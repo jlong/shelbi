@@ -57,6 +57,12 @@ pub enum PaneReloadStatus {
     Respawned {
         target: String,
     },
+    /// The pane didn't exist on the session yet (e.g. session predates a
+    /// view that was added in a newer shelbi). Reload created it fresh
+    /// and pinned the new pane id into the session env.
+    Created {
+        target: String,
+    },
     Missing,
     Failed {
         target: String,
@@ -625,13 +631,20 @@ fn machines_cmd(shelbi_bin: &str, project_name: &str) -> String {
 // reload — respawn shelbi-owned panes in-place so a freshly installed
 // binary takes effect without disturbing the orchestrator or workers.
 
-/// Respawn the four long-lived shelbi-owned panes in-place so an updated
+/// Respawn the long-lived shelbi-owned panes in-place so an updated
 /// `shelbi` binary takes effect. Targets:
 ///
 /// - `shelbi-<project>:dashboard.{left}` → `shelbi __sidebar <project>`
 /// - stash `tasks` pane → tasks-view loop
 /// - stash `review` pane → review-view loop
 /// - stash `machines` pane → `shelbi worker list` loop
+/// - stash `activity` pane → activity-view loop
+///
+/// For each stash view, if `SHELBI_PANE_<view>` isn't set on the
+/// session (the session was bootstrapped before that view existed),
+/// reload creates the pane fresh in the stash window and pins its id
+/// into the session env — so a freshly-installed binary that adds a
+/// new view becomes clickable without re-creating the whole session.
 ///
 /// Out of scope: the orchestrator pane (claude re-shells out on each
 /// CLI call) and worker panes (same). Those pick up the new binary
@@ -639,7 +652,8 @@ fn machines_cmd(shelbi_bin: &str, project_name: &str) -> String {
 ///
 /// Idempotent: re-running incurs a visible flicker per pane but no
 /// state loss — the panes' job is to render derived state from disk,
-/// so a fresh process picks up where the old one was.
+/// so a fresh process picks up where the old one was. A missing pane
+/// is created on the first call and respawned on subsequent ones.
 pub fn reload(project_name: &str) -> Result<ReloadReport> {
     let session = format!("shelbi-{project_name}");
 
@@ -678,10 +692,80 @@ pub fn reload(project_name: &str) -> Result<ReloadReport> {
 fn reload_stash_pane(session: &str, view: &str, cmd: &str) -> PaneReloadStatus {
     match read_pane_id(session, view) {
         Ok(Some(id)) => respawn_pane(&id, cmd),
-        Ok(None) => PaneReloadStatus::Missing,
+        // Session predates this view — allocate a fresh pane in the stash
+        // window and pin its id into the session env so show_view can find
+        // it without requiring the user to recreate the session.
+        Ok(None) => create_stash_pane(session, view, cmd),
         Err(e) => PaneReloadStatus::Failed {
             target: format!("(env SHELBI_PANE_{view})"),
             reason: e.to_string(),
+        },
+    }
+}
+
+/// Allocate a new pane in the stash session's `views` window, run `cmd`
+/// in it, and set `SHELBI_PANE_<view>` on the visible session to the
+/// new pane id. Mirrors what `create_hidden_views` does at bootstrap,
+/// but for a single view at a time and over local tmux (reload always
+/// runs on the hub).
+fn create_stash_pane(session: &str, view: &str, cmd: &str) -> PaneReloadStatus {
+    let stash_win = format!("_{session}:views");
+
+    let split = std::process::Command::new("tmux")
+        .args([
+            "split-window",
+            "-v",
+            "-t",
+            &stash_win,
+            "-P",
+            "-F",
+            "#{pane_id}",
+            "sh",
+            "-c",
+            cmd,
+        ])
+        .output();
+    let pane_id = match split {
+        Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).trim().to_string(),
+        Ok(o) => {
+            return PaneReloadStatus::Failed {
+                target: stash_win,
+                reason: format!(
+                    "split-window failed: {}",
+                    String::from_utf8_lossy(&o.stderr).trim()
+                ),
+            };
+        }
+        Err(e) => {
+            return PaneReloadStatus::Failed {
+                target: stash_win,
+                reason: e.to_string(),
+            };
+        }
+    };
+    if pane_id.is_empty() {
+        return PaneReloadStatus::Failed {
+            target: stash_win,
+            reason: "tmux returned empty pane id from split-window".to_string(),
+        };
+    }
+
+    let key = format!("SHELBI_PANE_{view}");
+    let set = std::process::Command::new("tmux")
+        .args(["set-environment", "-t", session, &key, &pane_id])
+        .output();
+    match set {
+        Ok(o) if o.status.success() => PaneReloadStatus::Created { target: pane_id },
+        Ok(o) => PaneReloadStatus::Failed {
+            target: pane_id,
+            reason: format!(
+                "set-environment failed: {}",
+                String::from_utf8_lossy(&o.stderr).trim()
+            ),
+        },
+        Err(e) => PaneReloadStatus::Failed {
+            target: pane_id,
+            reason: format!("set-environment failed: {e}"),
         },
     }
 }
@@ -806,5 +890,124 @@ mod pane_cmd_tests {
         // would tear apart in `sh -c` without quoting.
         let out = sidebar_cmd("/Users/jane doe/.cargo/bin/shelbi", "myapp");
         assert_eq!(out, "'/Users/jane doe/.cargo/bin/shelbi' __sidebar myapp");
+    }
+}
+
+#[cfg(test)]
+mod create_stash_pane_tmux_tests {
+    //! Tmux-touching integration tests for the create-missing-pane path.
+    //!
+    //! Each test spins up two unique-named tmux sessions on the local
+    //! server (visible + stash, mirroring `create_hidden_views`), exercises
+    //! `create_stash_pane`, then tears the sessions down. Skipped silently
+    //! if `tmux` isn't on PATH so the unit-test suite still runs on
+    //! tmux-less CI.
+    use super::*;
+
+    fn tmux_available() -> bool {
+        std::process::Command::new("tmux")
+            .arg("-V")
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false)
+    }
+
+    fn kill_session(name: &str) {
+        let _ = std::process::Command::new("tmux")
+            .args(["kill-session", "-t", name])
+            .output();
+    }
+
+    /// Provision the two sessions reload expects to find: a visible
+    /// `<vis>` session with a window, and a stash `_<vis>` session whose
+    /// first window is `views` (with one seed pane). Returns the session
+    /// name so the caller can pass it to `create_stash_pane` and clean
+    /// up afterwards.
+    fn provision_sessions(label: &str) -> (String, String) {
+        let vis = format!("shelbi-test-{label}-{}", std::process::id());
+        let stash = format!("_{vis}");
+        // Best-effort cleanup of prior leakage from a crashed test run.
+        kill_session(&vis);
+        kill_session(&stash);
+
+        let ok = std::process::Command::new("tmux")
+            .args([
+                "new-session", "-d", "-s", &vis, "-n", "dashboard", "sh", "-c", "sleep 30",
+            ])
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        assert!(ok, "failed to create visible test session `{vis}`");
+
+        let ok = std::process::Command::new("tmux")
+            .args([
+                "new-session", "-d", "-s", &stash, "-n", "views", "sh", "-c", "sleep 30",
+            ])
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        assert!(ok, "failed to create stash test session `{stash}`");
+
+        (vis, stash)
+    }
+
+    #[test]
+    fn create_stash_pane_allocates_pane_and_sets_session_env() {
+        if !tmux_available() {
+            eprintln!("skipping: tmux not on PATH");
+            return;
+        }
+        let (vis, _stash) = provision_sessions("alloc");
+
+        let status = create_stash_pane(&vis, "activity", "sleep 30");
+        let pane_id = match &status {
+            PaneReloadStatus::Created { target } => target.clone(),
+            other => panic!("expected Created, got {other:?}"),
+        };
+        assert!(pane_id.starts_with('%'), "expected tmux pane id like `%42`, got `{pane_id}`");
+
+        // Env was pinned to the visible session under the canonical key.
+        let env_out = std::process::Command::new("tmux")
+            .args(["show-environment", "-t", &vis, "SHELBI_PANE_activity"])
+            .output()
+            .expect("tmux show-environment");
+        assert!(env_out.status.success());
+        let env_line = String::from_utf8_lossy(&env_out.stdout).trim().to_string();
+        assert_eq!(env_line, format!("SHELBI_PANE_activity={pane_id}"));
+
+        // And read_pane_id (used by reload's respawn branch) finds it now.
+        let round_trip = read_pane_id(&vis, "activity").expect("read_pane_id");
+        assert_eq!(round_trip.as_deref(), Some(pane_id.as_str()));
+
+        kill_session(&vis);
+        kill_session(&format!("_{vis}"));
+    }
+
+    #[test]
+    fn reload_stash_pane_creates_then_respawns_on_second_call() {
+        if !tmux_available() {
+            eprintln!("skipping: tmux not on PATH");
+            return;
+        }
+        let (vis, _stash) = provision_sessions("idem");
+
+        let first = reload_stash_pane(&vis, "activity", "sleep 30");
+        let pane_id = match &first {
+            PaneReloadStatus::Created { target } => target.clone(),
+            other => panic!("expected Created on first call, got {other:?}"),
+        };
+
+        // Second call should find the env entry and respawn in-place,
+        // preserving the pane id.
+        let second = reload_stash_pane(&vis, "activity", "sleep 30");
+        match &second {
+            PaneReloadStatus::Respawned { target } => {
+                assert_eq!(target, &pane_id, "pane id should be reused on respawn");
+            }
+            other => panic!("expected Respawned on second call, got {other:?}"),
+        }
+
+        kill_session(&vis);
+        kill_session(&format!("_{vis}"));
     }
 }

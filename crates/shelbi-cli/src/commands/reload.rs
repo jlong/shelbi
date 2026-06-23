@@ -20,6 +20,7 @@ fn print_report(project: &str, r: &ReloadReport) {
     print_pane("tasks", &r.tasks);
     print_pane("review", &r.review);
     print_pane("machines", &r.machines);
+    print_pane("activity", &r.activity);
 }
 
 fn print_pane(name: &str, status: &PaneReloadStatus) {
@@ -27,8 +28,11 @@ fn print_pane(name: &str, status: &PaneReloadStatus) {
         PaneReloadStatus::Respawned { target } => {
             println!("  ✓ {name:<9} respawned ({target})");
         }
+        PaneReloadStatus::Created { target } => {
+            println!("  ✓ {name:<9} created   ({target})");
+        }
         PaneReloadStatus::Missing => {
-            println!("  · {name:<9} no stored pane id; skipped");
+            println!("  ⚠ {name:<9} no stored pane id; skipped");
         }
         PaneReloadStatus::Failed { target, reason } => {
             println!("  ✗ {name:<9} failed ({target}): {reason}");
