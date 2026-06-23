@@ -37,7 +37,7 @@ export function Hero() {
         />
 
         <p className="font-mono text-xs uppercase tracking-[0.25em] text-gray-7 sm:text-sm">
-          A Kanban board for your team of coding agents
+          Manage a team of coding agents from your terminal
         </p>
 
         <p className="max-w-2xl text-balance text-base leading-relaxed text-gray-7 sm:text-lg">
