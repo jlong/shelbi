@@ -1,14 +1,41 @@
 @import "tailwindcss";
+@custom-variant dark (&:where(.dark, .dark *));
 
 /* ============================================================
-   Theme — fonts, spacing, and strict-mono palette
+   Theme — fonts, spacing, and strict-mono palette (light mode)
+   ============================================================
+   The palette commits to a strict gray ramp with no hue, so the
+   light defaults below mirror the dark ramp by inverting value
+   direction: white background, black foreground, ascending grays.
+   The `.dark` block redefines the same tokens with the original
+   dark values. Tailwind v4 utility classes (e.g. `bg-bg`,
+   `text-gray-7`) resolve through `var()`, so toggling the
+   `.dark` class on `<html>` swaps both modes at the cascade.
    ============================================================ */
 @theme {
   /* ----- Fonts (Geist Sans + Geist Mono via the `geist` package) ----- */
   --font-sans: var(--font-geist-sans), system-ui, sans-serif;
   --font-mono: var(--font-geist-mono), ui-monospace, monospace;
 
-  /* ----- Palette (strict monochrome) ----- */
+  /* ----- Palette (strict monochrome — light) ----- */
+  --color-bg: #FFFFFF;
+  --color-fg: #000000;
+  --color-gray-1: #FAFAFA;
+  --color-gray-2: #F0F0F0;
+  --color-gray-3: #E6E6E6;
+  --color-gray-4: #D4D4D4;
+  --color-gray-5: #999999;
+  --color-gray-6: #666666;
+  --color-gray-7: #333333;
+
+  /* ----- Spacing (8px base) ----- */
+  --spacing: 8px;
+}
+
+/* ============================================================
+   Dark mode — redefine the same tokens
+   ============================================================ */
+.dark {
   --color-bg: #000000;
   --color-fg: #FFFFFF;
   --color-gray-1: #0A0A0A;
@@ -18,9 +45,6 @@
   --color-gray-5: #444444;
   --color-gray-6: #666666;
   --color-gray-7: #999999;
-
-  /* ----- Spacing (8px base) ----- */
-  --spacing: 8px;
 }
 
 /* ============================================================
@@ -33,4 +57,46 @@ html {
 body {
   background: var(--color-bg);
   color: var(--color-fg);
+}
+
+/* ============================================================
+   Shiki dual-theme swap
+   ============================================================
+   rehype-pretty-code (and shiki's `codeToHtml` in dual-theme mode)
+   emit each token with CSS variables for *both* themes — the
+   element's actual `color`/`background-color`/etc. need to come
+   from us. Dark is Shelbi's brand default; we explicitly bind the
+   light variables only when `.dark` is absent from the ancestor
+   chain. We target `[data-theme]` rather than the `.shiki` class
+   because `mdx-components.tsx`'s `pre`/`code` overrides replace
+   the plugin's className with Tailwind classes; `data-theme`
+   survives because it's a data attribute, not a class.
+   ============================================================ */
+/* Dark binding — needed only for the MDX path (rehype-pretty-code
+   strips inline `color` because `defaultColor` is unset there).
+   Shiki's `codeToHtml` already sets inline `color` to the dark
+   value, so this rule no-ops harmlessly for CodeBlock. */
+[data-theme] span,
+pre[data-theme],
+code[data-theme] {
+  color: var(--shiki-dark);
+  background-color: var(--shiki-dark-bg);
+  font-style: var(--shiki-dark-font-style);
+  font-weight: var(--shiki-dark-font-weight);
+  text-decoration: var(--shiki-dark-text-decoration);
+}
+
+/* Light binding — covers both paths, including overriding the
+   inline dark `color`/`background-color` that Shiki bakes into
+   CodeBlock output, so `!important` is required. */
+html:not(.dark) [data-theme] span,
+html:not(.dark) pre[data-theme],
+html:not(.dark) code[data-theme],
+html:not(.dark) pre.shiki,
+html:not(.dark) pre.shiki span {
+  color: var(--shiki-light) !important;
+  background-color: var(--shiki-light-bg) !important;
+  font-style: var(--shiki-light-font-style) !important;
+  font-weight: var(--shiki-light-font-weight) !important;
+  text-decoration: var(--shiki-light-text-decoration) !important;
 }

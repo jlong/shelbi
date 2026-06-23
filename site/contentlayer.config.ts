@@ -4,6 +4,7 @@ import rehypeSlug from "rehype-slug"
 import remarkGfm from "remark-gfm"
 
 import { shelbiMonoDark } from "./lib/shiki-mono-dark"
+import { shelbiMonoLight } from "./lib/shiki-mono-light"
 
 /**
  * Docs live under `content/docs/<section>/<slug>.mdx`. The directory directly
@@ -59,11 +60,18 @@ export const Comparison = defineDocumentType(() => ({
   },
 }))
 
-// Strict-monochrome theme — vesper highlighted bash with vivid cyan-teal
-// (`#99FFE4`) and warm peach (`#FFC799`) accents that read as color on the
-// no-hue surface from §3 of the plan. See `lib/shiki-mono-dark.ts`.
+// Strict-monochrome dual theme. With the object form, rehype-pretty-code
+// emits spans whose inline style is the *first* theme (dark — our brand
+// default) and a `--shiki-<key>` CSS variable for the alternate theme.
+// `app/globals.css` swaps to the light variable when `.dark` is absent
+// from the ancestor chain. See `lib/shiki-mono-dark.ts` and
+// `lib/shiki-mono-light.ts` for the token rules.
 const rehypePrettyCodeOptions: RehypePrettyCodeOptions = {
-  theme: shelbiMonoDark,
+  theme: {
+    dark: shelbiMonoDark,
+    light: shelbiMonoLight,
+  },
+  defaultLang: "plaintext",
   keepBackground: true,
 }
 

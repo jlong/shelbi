@@ -1,5 +1,6 @@
 import { codeToHtml } from "shiki"
 import { shelbiMonoDark } from "@/lib/shiki-mono-dark"
+import { shelbiMonoLight } from "@/lib/shiki-mono-light"
 import { CopyButton } from "./CopyButton"
 
 type CodeBlockProps = {
@@ -8,9 +9,17 @@ type CodeBlockProps = {
 }
 
 export async function CodeBlock({ code, lang = "bash" }: CodeBlockProps) {
+  // Dual-theme highlight. Shiki emits inline styles for the `dark` theme
+  // (our brand default) and CSS variables (`--shiki-light*`) for `light`;
+  // the swap to light values when `.dark` is absent is handled in
+  // `app/globals.css`.
   const html = await codeToHtml(code, {
     lang,
-    theme: shelbiMonoDark,
+    themes: {
+      dark: shelbiMonoDark,
+      light: shelbiMonoLight,
+    },
+    defaultColor: "dark",
   })
 
   return (

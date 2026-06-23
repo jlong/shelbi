@@ -3,6 +3,7 @@
 import { Bars3Icon, XMarkIcon } from "@heroicons/react/24/outline"
 import Link from "next/link"
 import { useEffect, useState } from "react"
+import { ThemeToggle } from "./ThemeToggle"
 import { Wordmark } from "./Wordmark"
 
 const NAV_LINKS = [
@@ -52,6 +53,8 @@ export function Header() {
               </Link>
             ))}
           </nav>
+
+          <ThemeToggle />
 
           <button
             type="button"

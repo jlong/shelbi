@@ -27,6 +27,15 @@ export const metadata: Metadata = {
   },
 }
 
+// Inline boot script — runs before paint to avoid a flash of the wrong
+// theme. Reads localStorage['theme'] (set by ThemeToggle); when missing
+// it falls back to "system" so SSR, this script, and the React component
+// (which also defaults to `preference="system"`) all agree. Resolves the
+// preference against `prefers-color-scheme` and toggles `.dark` on <html>.
+// On any error (localStorage unavailable, etc.) we add `.dark` — Shelbi
+// is terminal-native and the strict-mono dark palette is the safe fallback.
+const THEME_BOOT_SCRIPT = `(function(){try{var t=localStorage.getItem('theme');if(t==='light'){return}if(t!=='dark'&&!matchMedia('(prefers-color-scheme:dark)').matches){return}document.documentElement.classList.add('dark')}catch(e){document.documentElement.classList.add('dark')}})()`
+
 export default function RootLayout({
   children,
 }: Readonly<{
@@ -35,8 +44,15 @@ export default function RootLayout({
   return (
     <html
       lang="en"
+      suppressHydrationWarning
       className={`${GeistSans.variable} ${GeistMono.variable} antialiased`}
     >
+      <head>
+        <script
+          suppressHydrationWarning
+          dangerouslySetInnerHTML={{ __html: THEME_BOOT_SCRIPT }}
+        />
+      </head>
       <body className="bg-bg text-fg flex min-h-screen flex-col font-sans">
         <Header />
         <div className="flex-1">{children}</div>
