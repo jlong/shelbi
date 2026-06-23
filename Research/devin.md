@@ -1,7 +1,7 @@
 # Devin (Cognition)
 
 > Competitive research for the shelbi.dev `/vs/devin` page.
-> Factual and dated — no marketing fluff, no shelbi advocacy.
+> Factual and dated — no marketing fluff, no Shelbi advocacy.
 > Compiled 2026-06-23. Every claim traces to a dated URL in **Sources**.
 
 ---
@@ -370,7 +370,7 @@ independent coverage):
 
 ---
 
-## Where shelbi differs
+## Where Shelbi differs
 
 Factual axes of difference only. The two products target different audiences
 and overlap only partly — Devin is a hosted autonomous-agent SaaS; shelbi is
