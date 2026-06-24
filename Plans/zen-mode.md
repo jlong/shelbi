@@ -25,9 +25,20 @@ Zen Mode is a **per-project runtime flag**, not a configuration file. Reasons:
 Surface as:
 
 - `shelbi zen on` / `shelbi zen off` / `shelbi zen status` — CLI control.
-- **Hotkey toggle in the TUI** — a single chord flips Zen on/off in place, like Shift+Tab flips permission modes in Claude. Exact chord TBD (see Open questions); the constraint is "not typically bound to anything else in the terminal" so the user doesn't fight muscle memory. Pressing the chord re-paints the footer + emits an event-log line.
-- TUI footer indicator: `Mode: Zen` in green when on, plain when off. Click-toggleable.
+- **Hotkey toggle in the TUI** — **Alt+Z** (⌥Z on Mac). Single chord, flips Zen in place, like Shift+Tab flips permission modes in Claude. Pressing the chord re-paints the indicator + emits an event-log line.
+- **Sidebar indicator (when Zen is on).** A pill in the lower-left status block of the sidebar, *replacing* the current selection-state line (`> orch`) and slotted under the `^P palette  q quit` keymap row. Pill style: **green background, black text** ("ZEN ON"). The pill is absent when Zen is off — no chrome wasted on the off state.
 - Persisted in `~/.shelbi/projects/<project>/state.json` so a TUI restart preserves the setting (but a fresh `shelbi reload` doesn't auto-enable; explicit user action only).
+
+Sketch of the sidebar lower-left when Zen is on:
+
+```
+  ^P palette  q quit
+  ┌─────────┐
+  │ ZEN ON  │   ← green bg, black text
+  └─────────┘
+```
+
+When off, that block is empty — keeps the chrome quiet 99% of the time.
 
 The orchestrator reads the flag on every dispatch / merge decision; flipping it off mid-flow stops further auto-actions immediately (in-flight workers keep going; their results just land in review instead of done).
 
