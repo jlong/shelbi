@@ -46,15 +46,36 @@ The orchestrator reads the flag on every dispatch / merge decision; flipping it 
 
 ### 2. Auto-promotion from backlog
 
-When a worker frees up and todo is empty, the orchestrator considers promoting from backlog. Promotion rules:
+Auto-promotion is a **two-stage decision**: the Rust side computes a list of *mechanically eligible* candidates; the orchestrator applies *judgment* to pick which (if any) of those to actually promote. The judgment lives in the orchestrator prompt so the user can tune it per project.
 
-- **Dependency-clean.** Skip tasks whose `depends_on` still has open items.
-- **No file-overlap conflict** with anything currently in flight. Compute the task's likely write surface from the task body — if it mentions files already being touched by an `in_progress` task, hold.
-- **Not opt-out.** A task with `zen: false` in its frontmatter is never auto-promoted. Useful for "let me discuss this one first" markers.
-- **Highest-priority eligible task first.** Existing priority field drives the order.
-- **Sanity bound on parallel auto-promotes.** Don't promote more than the number of free workers in one pass; never auto-promote a task that has already been promoted-then-demoted by the user (that's a clear "stop touching this" signal).
+**Stage 1 — mechanical eligibility (Rust, in `shelbi zen scan`).** Returns the list of tasks that are safe to promote from a state-machine standpoint:
 
-Auto-promotion emits an event-log line tagged `reason=orchestrator:zen-promote`. The activity feed surfaces these visibly — they're the kind of action a user wants to spot-check.
+- **Dependency-clean.** All `depends_on` entries are `done`.
+- **Not opt-out.** Frontmatter doesn't have `zen.enabled: false`.
+- **Not previously demoted.** The events log has no `task=<id> todo -> backlog reason=user:*` line. Once the user has explicitly pulled a task back, Zen never re-promotes it.
+- **No file-overlap with in-flight work.** Heuristic: path-like tokens in the task body don't appear in any `in_progress` task's body.
+- **Sorted by priority** (lower = higher).
+
+The Rust call returns the candidate list. Nothing is promoted yet — this is *what could be*, not *what should be*.
+
+**Stage 2 — judgment (orchestrator prompt).** Given the candidate list, the orchestrator decides which to actually promote based on the user's intent. The orchestrator prompt template ships with a default "Zen Mode" section that lists three categories of work the orchestrator may auto-promote:
+
+> Only auto-promote a candidate task if **at least one** of these is true:
+>
+> 1. **It's the kind of work the user generally trusts you with.** Look at the done column — does the user routinely accept tasks of this shape without changes? (Examples: docs typo fixes, dependency bumps, content sweeps that match a recently-stated convention.) If their done-history shows pattern acceptance, this is in scope.
+> 2. **It's part of fixing an issue the user recently raised.** Did the user mention this bug, feature, or concern in conversation in the last few turns? Tasks that respond to something the user explicitly asked for are in scope.
+> 3. **It's part of a larger body of work the user explicitly kicked off.** If the user filed a batch of related tasks (e.g. 13 vs-pages, a multi-step refactor), the remaining items in that batch are in scope.
+>
+> If a candidate fits none of these, **leave it in backlog** and surface it in your next user-facing reply: *"I considered promoting `<task>` but wasn't sure if it fits your intent — want me to?"* That keeps you out of trouble while still telling the user what's available.
+
+This section is editable. The user can:
+- Add categories ("anything tagged `automation:` in the task title is always in scope").
+- Tighten categories ("only auto-promote if the user has accepted ≥ 3 tasks of this shape without changes").
+- Replace the list entirely with their own taxonomy.
+
+The Rust side never inspects these criteria — it just supplies the candidate list. The orchestrator prompt is where the user owns the policy.
+
+**Event emission.** When the orchestrator promotes a task, it emits `reason=orchestrator:zen-promote category=<which-of-the-three>`. When it declines a candidate, it emits `reason=orchestrator:zen-decline reason-text=<short-explanation>`. The activity feed renders both — the user sees what was promoted AND what was considered.
 
 ### 3. The high-confidence bar
 
