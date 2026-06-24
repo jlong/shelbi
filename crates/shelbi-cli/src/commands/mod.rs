@@ -20,6 +20,7 @@ pub mod tail;
 pub mod task;
 pub mod wizard;
 pub mod worker;
+pub mod zen;
 
 use anyhow::{anyhow, Result};
 use std::path::Path;

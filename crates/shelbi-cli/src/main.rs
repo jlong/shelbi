@@ -119,6 +119,15 @@ enum Cmd {
     #[command(hide = true)]
     #[command(name = "__activity")]
     Activity { project: String },
+    /// Toggle or inspect Zen Mode, the trust boundary that lets the
+    /// orchestrator auto-merge and auto-promote finished tasks without
+    /// human review. `shelbi zen on` → auto-merge permitted; `pause` →
+    /// no new auto-promotions but in-flight Zen merges complete; `off` →
+    /// every promotion goes through manual review.
+    Zen {
+        #[command(subcommand)]
+        cmd: commands::zen::ZenCmd,
+    },
     /// Open the palette as a tmux popup. Bound to Ctrl+P by default.
     Popup,
     /// (internal) Run the palette picker — meant to be invoked inside a
@@ -156,6 +165,7 @@ fn main() -> Result<()> {
         Some(Cmd::Tasks { project }) => shelbi_tui::run_tasks(&project).context("tasks"),
         Some(Cmd::ReviewView { project }) => shelbi_tui::run_review(&project).context("review"),
         Some(Cmd::Activity { project }) => shelbi_tui::run_activity(&project).context("activity"),
+        Some(Cmd::Zen { cmd }) => commands::zen::run(cli.project, cmd),
         Some(Cmd::Popup) => commands::popup::run(),
         Some(Cmd::Palette { project }) => commands::palette::run(project),
     }

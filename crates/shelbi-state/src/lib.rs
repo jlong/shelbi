@@ -239,10 +239,76 @@ pub fn save_session(s: &Session) -> Result<()> {
 /// orchestrator can keep the user from re-arming a flapping pipeline.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct State {
-    #[serde(default)]
-    pub zen_mode: bool,
+    #[serde(default, deserialize_with = "ZenModeState::deserialize_lenient")]
+    pub zen_mode: ZenModeState,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub zen_last_crashed_at: Option<DateTime<Utc>>,
+}
+
+/// Tri-state Zen Mode toggle persisted in `state.json::zen_mode`.
+///
+/// - [`ZenModeState::Off`] — orchestrator never auto-promotes; humans
+///   review every merge.
+/// - [`ZenModeState::Paused`] — no *new* auto-promotions, but tasks
+///   already on the Zen track may still complete their merge.
+/// - [`ZenModeState::On`] — orchestrator may run checks and auto-merge.
+///
+/// Serialized as a lowercase string (`"off"` / `"paused"` / `"on"`). The
+/// custom `deserialize_lenient` adapter also accepts the legacy boolean
+/// representation (`true`/`false`) so older `state.json` files keep
+/// loading after the schema widens.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ZenModeState {
+    #[default]
+    Off,
+    Paused,
+    On,
+}
+
+impl ZenModeState {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ZenModeState::Off => "off",
+            ZenModeState::Paused => "paused",
+            ZenModeState::On => "on",
+        }
+    }
+
+    /// Accept the new lowercase-string form *or* the legacy boolean form
+    /// (`true` → On, `false` → Off). The bool branch only matters for
+    /// existing on-disk files written before the tri-state landed.
+    fn deserialize_lenient<'de, D>(d: D) -> std::result::Result<ZenModeState, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        use serde::de::{Error, Unexpected};
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Repr {
+            Str(String),
+            Bool(bool),
+        }
+        match Repr::deserialize(d)? {
+            Repr::Bool(true) => Ok(ZenModeState::On),
+            Repr::Bool(false) => Ok(ZenModeState::Off),
+            Repr::Str(s) => match s.to_ascii_lowercase().as_str() {
+                "off" => Ok(ZenModeState::Off),
+                "paused" => Ok(ZenModeState::Paused),
+                "on" => Ok(ZenModeState::On),
+                other => Err(D::Error::invalid_value(
+                    Unexpected::Str(other),
+                    &"\"off\", \"paused\", or \"on\"",
+                )),
+            },
+        }
+    }
+}
+
+impl std::fmt::Display for ZenModeState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
 }
 
 /// Path to a project's `state.json`.
@@ -1056,7 +1122,7 @@ mod tests {
         std::env::set_var("SHELBI_HOME", &home);
         let s = read_state("p").unwrap();
         assert_eq!(s, State::default());
-        assert!(!s.zen_mode);
+        assert_eq!(s.zen_mode, ZenModeState::Off);
         assert!(s.zen_last_crashed_at.is_none());
         std::env::remove_var("SHELBI_HOME");
     }
@@ -1067,7 +1133,7 @@ mod tests {
         let home = fresh_home();
         std::env::set_var("SHELBI_HOME", &home);
         let original = State {
-            zen_mode: true,
+            zen_mode: ZenModeState::On,
             zen_last_crashed_at: Some(
                 "2026-06-19T12:34:56Z".parse::<DateTime<Utc>>().unwrap(),
             ),
@@ -1088,10 +1154,47 @@ mod tests {
         let _g = TEST_LOCK.lock().unwrap();
         let home = fresh_home();
         std::env::set_var("SHELBI_HOME", &home);
-        let s = State { zen_mode: true, zen_last_crashed_at: None };
+        let s = State { zen_mode: ZenModeState::On, zen_last_crashed_at: None };
         write_state("p", &s).unwrap();
         let on_disk = std::fs::read_to_string(state_path("p").unwrap()).unwrap();
         assert!(!on_disk.contains("zen_last_crashed_at"));
+        std::env::remove_var("SHELBI_HOME");
+    }
+
+    #[test]
+    fn state_zen_mode_serializes_as_lowercase_string() {
+        let _g = TEST_LOCK.lock().unwrap();
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+        for (mode, expect) in [
+            (ZenModeState::Off, "\"off\""),
+            (ZenModeState::Paused, "\"paused\""),
+            (ZenModeState::On, "\"on\""),
+        ] {
+            let s = State { zen_mode: mode, zen_last_crashed_at: None };
+            write_state("p", &s).unwrap();
+            let on_disk = std::fs::read_to_string(state_path("p").unwrap()).unwrap();
+            assert!(on_disk.contains(expect), "{mode:?} → {on_disk}");
+            let back = read_state("p").unwrap();
+            assert_eq!(back.zen_mode, mode);
+        }
+        std::env::remove_var("SHELBI_HOME");
+    }
+
+    #[test]
+    fn state_accepts_legacy_bool_zen_mode() {
+        // Older state.json files used a bare boolean for zen_mode. The
+        // tri-state widening keeps deserialization tolerant of that form
+        // so existing projects don't crash on first read after upgrade.
+        let _g = TEST_LOCK.lock().unwrap();
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+        let path = state_path("p").unwrap();
+        ensure_dir(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, r#"{"zen_mode": true}"#).unwrap();
+        assert_eq!(read_state("p").unwrap().zen_mode, ZenModeState::On);
+        std::fs::write(&path, r#"{"zen_mode": false}"#).unwrap();
+        assert_eq!(read_state("p").unwrap().zen_mode, ZenModeState::Off);
         std::env::remove_var("SHELBI_HOME");
     }
 
