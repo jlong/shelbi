@@ -177,8 +177,8 @@ The whole loop ships in one phase per user direction — "drop tasks, walk away"
 - Implement the PR-based merge flow via `gh pr create` / `gh pr checks --watch` / `gh pr merge --squash`.
 - Implement auto-promotion: dependency-clean, no file-overlap with in-flight, `zen: false` opt-out, priority order, sanity-bounded.
 - `shelbi zen on/off/pause/status` CLI commands.
-- Hotkey toggle in the TUI (chord TBD — see Decisions).
-- TUI footer indicator: `Mode: Zen` in green when on.
+- Alt+Z hotkey toggle in the TUI (with first-run probe + fallback-chord picker for incompatible terminals).
+- Sidebar indicator pill (green bg, black text, "ZEN ON") in the lower-left status block, replacing the current selection-state line.
 - Activity feed: visually-distinct `zen` rows (badge + tinted background), new event kinds tagged `reason=orchestrator:zen-*` and `reason=zen:*`.
 - Crash recovery: detect recent-crash timestamp on restart, auto-disable Zen, warn user.
 - State persistence in `~/.shelbi/projects/<project>/state.json`.
