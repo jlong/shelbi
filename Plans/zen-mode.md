@@ -93,57 +93,71 @@ The Rust side never inspects these criteria — it just supplies the candidate l
 
 **Event emission.** When the orchestrator promotes a task, it emits `reason=orchestrator:zen-promote category=<which-of-the-three>`. When it declines a candidate, it emits `reason=orchestrator:zen-decline reason-text=<short-explanation>`. The activity feed renders both — the user sees what was promoted AND what was considered.
 
-### 3. The high-confidence bar
+### 3. The high-confidence bar (Rust primitives + prompt policy)
 
-A finished branch (one that landed in review via review-marker) gets auto-merged when **all** of these are true:
+Same architectural split as auto-promotion (§2): Rust supplies **primitives** that report structured data; the orchestrator prompt's `## Zen Mode: Merge Conditions` section encodes the **policy** that decides whether to merge. The user owns the conditions by editing the prompt.
 
-- **Local test suite passes** on the worker's worktree. The check commands live in two places:
+**Rust primitives** (called via `shelbi zen probe <task-id>`, returns JSON):
 
-  **Project-wide baseline** in `~/.shelbi/projects/<project>.yaml`:
+```json
+{
+  "local_checks": [
+    { "command": "cargo test --workspace", "exit_code": 0, "duration_ms": 12400, "output_tail": "test result: ok. 142 passed..." },
+    { "command": "cargo clippy ...",       "exit_code": 0, "duration_ms": 8200,  "output_tail": "" }
+  ],
+  "merge_conflict": { "conflicts": false, "files": [] },
+  "diff_size":      { "files": 4, "lines_added": 87, "lines_removed": 12 },
+  "danger_paths":   { "matched": [] }
+}
+```
 
-      zen:
-        checks:
-          local:
-            - "cargo test --workspace"
-            - "cargo clippy --workspace --all-targets -- -D warnings"
+The probe runs all four primitives in the worker's worktree (parallelizable; no order dependency) and reports the data without judgment. No short-circuit, no thresholds — pure measurement.
 
-  **Per-task override** in task frontmatter (optional). Two shapes:
+**Resolved-checks helper** stays in Rust (it composes the project YAML `zen.checks.local` with the task's `zen.checks_additional` / `zen.checks_only` to produce the actual command list to run). Project-wide config:
 
-      # Extend the project baseline with extra checks:
-      zen:
-        checks_additional:
-          - "cargo test --package shelbi-tui"
+```yaml
+zen:
+  checks:
+    local:
+      - "cargo test --workspace"
+      - "cargo clippy --workspace --all-targets -- -D warnings"
+```
 
-      # Or REPLACE the baseline entirely (e.g., docs-only task):
-      zen:
-        checks_only:
-          - "npm run lint"
+Per-task frontmatter override (`checks_additional` to extend, `checks_only` to replace). The `checks_only` escape hatch is logged to the events feed as a deliberate choice.
 
-  All resolved commands run sequentially on the worker's worktree after the review marker drops, before push. If any exits non-zero, abort the auto-merge. The escape hatch is real — workers can effectively turn off testing per task — so `checks_only` is a deliberate choice that's logged to the events feed.
+**Prompt policy** (in the orchestrator's `## Zen Mode: Merge Conditions` section):
 
-- **No merge conflicts** with current main. Standard squash-merge check; if it conflicts, fall back to user review.
+> Default conditions for auto-merging a task that landed in review. Run `shelbi zen probe <task-id>` to get the data; apply these conditions to it:
+>
+> 1. **All `local_checks` must have `exit_code == 0`.** If any failed, leave in review and emit `reason=zen:failed-checks` with the failing command + output tail.
+> 2. **`merge_conflict.conflicts` must be `false`.** Otherwise emit `reason=zen:merge-conflict` with the files.
+> 3. **`diff_size.files` ≤ 30 AND `diff_size.lines_added + lines_removed` ≤ 2000.** Otherwise emit `reason=zen:diff-too-large` with the stats. (You can raise / lower these per project.)
+> 4. **`danger_paths.matched` must be empty.** Otherwise emit `reason=zen:danger-path` with the paths.
+>
+> If all pre-PR conditions pass: run `shelbi zen pr-create <task-id>` to push + open the PR. Then run `shelbi zen ci-watch <pr-number> --timeout 15m`. The default condition:
+>
+> 5. **CI watch must return `green` within the timeout.** On `red`: emit `reason=zen:failed-checks` with the failed check name. On `timeout`: emit `reason=zen:ci-timeout`.
+>
+> If all conditions met (pre-PR + CI): run `shelbi zen pr-merge <pr-number>` to squash + delete branch + mark done.
 
-- **No size red flag.** If the diff touches more files / more lines than a threshold (e.g., > 2000 lines or > 30 files), surface to user instead. Big diffs warrant a human glance even when tests pass.
+**Edit this section per project.** Examples of the kinds of tuning the prompt enables:
 
-- **No "danger" file paths touched.** Hardcoded list of paths that always require human review:
-  - `.github/workflows/**` (CI changes)
-  - `scripts/install.sh` (anything installers rely on)
-  - `**/*.yaml` and `**/*.yml` in project roots (config drift)
-  - `LICENSE`, `package-lock.json` mass-change, `Cargo.lock` mass-change
-  - The list is configurable per project; sensible default ships.
+- Loosen the size limit for refactor branches: *"Skip the size check if the task title starts with `refactor:`."*
+- Block on missing tests even when checks pass: *"Require a `tests:` line in the task body when any source file is added."*
+- Accept partial CI red: *"If only the `integration-test` job is red and all other checks are green, treat as green."*
+- Add a new pre-merge probe: *"Before merging a task that touches `migrations/`, run `shelbi db dry-run` and only proceed if it returns no schema deltas."* (Requires a new primitive but the policy lives here.)
 
-- **GitHub checks pass** within a timeout (default **15 minutes**, configurable per project via `zen.ci_timeout`). After local checks succeed:
-  1. Push the branch to origin (do not squash-merge yet).
-  2. Open a PR via `gh pr create`.
-  3. Wait for `gh pr checks --watch` to report all-success.
-  4. Squash-merge via `gh pr merge --squash`.
-  5. Delete branch, mark task done.
+The Rust side never inspects the conditions. The orchestrator prompt is where the user owns the merge policy — symmetric with §2's auto-promotion judgment.
 
-If GitHub checks fail or time out, the orchestrator surfaces the failure in the activity feed and leaves the task in `review` with a `reason=zen:failed-checks` event tag — no special column, just the review pane the user already uses. The events feed is the audit surface.
+### 4. The merge flow: PR-based primitives
 
-### 4. The merge flow: PR-based, always
+Every Zen merge goes through a GitHub PR. Three Rust primitives the orchestrator calls in sequence (once Merge Conditions §3 say to proceed):
 
-Every Zen merge goes through a GitHub PR. CI runs on the PR. The PR is auto-merged on green via `gh pr merge --squash`. This gives a clean audit trail in GitHub itself and lets external CI services (Vercel previews, etc.) gate the merge naturally.
+- `shelbi zen pr-create <task-id>` — pushes the branch to origin, runs `gh pr create` with the worker's commit subject + a body that includes the task summary and a "Auto-opened by Shelbi Zen Mode" footer. Returns the PR number on stdout.
+- `shelbi zen ci-watch <pr-number> --timeout DURATION` — runs `gh pr checks <pr> --watch --required` with the given timeout. Returns one of `green` / `red:<check-name>:<summary>` / `timeout` on stdout. Default timeout: 15 minutes (configurable via `zen.ci_timeout`).
+- `shelbi zen pr-merge <pr-number>` — runs `gh pr merge <pr> --squash --delete-branch`. Returns the merge SHA on stdout.
+
+Each is a small, single-purpose command. The orchestrator drives the sequence and decides what to do at each step based on its `Merge Conditions` policy.
 
 No "direct to main with revert-on-fail" alternative — that path was considered and rejected because (a) it would auto-deploy bad merges to Vercel between merge and revert, and (b) revert commits clutter the history. PR-based is the only mode.
 
