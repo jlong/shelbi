@@ -212,14 +212,3 @@ After Phase 1: drop a stack of tasks into backlog, hit the toggle hotkey, walk a
 ## Open questions
 
 _None remaining — plan is ready to execute. Phase 1 sub-tasks (the exact wording of the first-run fallback prompt, the precise event-feed icon set, etc.) will surface during implementation but don't need pre-commitment._
-
-## Open questions
-
-- **Per-project vs. per-task check commands.** Should `checks.local` be project-wide only, or can a task specify additional checks in its frontmatter? Erring toward project-wide for v1 to keep the schema small.
-- **PR vs. no-PR default.** Recommending PR-based; confirming.
-- **Auto-promote at all in v1?** Phase 1 ships auto-merge only and leaves backlog triage to the user. That's the bigger trust ask, and starting narrower means the user gets to see the orchestrator's judgment on a small surface before handing it more rope. Confirm phasing.
-- **What's the failure surface?** When a Zen merge bails (checks fail, conflict, danger path, size), it stays in review. Should we add a new column — "needs-human" — to visually separate "agent has nothing more it can do" from "regular review"? Or is a sidebar badge enough?
-- **CI timeout.** How long does the orchestrator wait for GitHub checks before giving up? Suggest 15min default, configurable.
-- **Revert-on-fail in no-PR mode.** Want to ship this in Phase 1 too, or push to Phase 3 polish?
-- **Tone of the activity feed entries.** Should Zen-promote / Zen-merge events read in the same voice as user actions, or be visually distinct so the user can scan for "what did the orchestrator do without me"?
-- **What about the orchestrator itself failing under load?** If Zen is on and the orchestrator pane crashes, what happens to in-flight Zen tasks? Probably they stay in their current column and the user sees them on restart, but worth thinking through.
