@@ -182,6 +182,18 @@ pub fn append_task_event(task_id: &str, from: Column, to: Column, reason: &str) 
     append_event_line(&format!("{ts} task={task_id} {from} -> {to} reason={reason}"))
 }
 
+/// Append `<rfc3339> project=<name> <action> reason=<reason>` to
+/// `~/.shelbi/events.log`. Use for project-scoped lifecycle events
+/// (currently just `closed` from the palette's quit-project action) that
+/// aren't task or worker transitions but should still surface in the
+/// activity feed.
+pub fn append_project_event(project: &str, action: &str, reason: &str) -> Result<()> {
+    let ts = Utc::now().to_rfc3339();
+    let action = sanitize_reason(action);
+    let reason = sanitize_reason(reason);
+    append_event_line(&format!("{ts} project={project} {action} reason={reason}"))
+}
+
 /// Append `<rfc3339> dispatch task=<id> worker=<name> status=<status> detail=<detail>`
 /// to `~/.shelbi/events.log`. Use this to surface dispatch-time anomalies
 /// (e.g. the initial prompt was pasted but Enter never landed) that aren't

@@ -10,6 +10,7 @@ pub mod palette;
 pub mod picker;
 pub mod popup;
 pub mod project;
+pub mod quit_project;
 pub mod reload;
 pub mod review;
 pub mod send;

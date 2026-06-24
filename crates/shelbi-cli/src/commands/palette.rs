@@ -281,10 +281,12 @@ fn build_entries(
         subtitle: Some("fuzzy-pick another project and swap the dashboard".into()),
     });
     out.push(Entry {
-        id: "action:quit".into(),
-        label: "Quit Shelbi".into(),
+        id: "action:quit-project".into(),
+        label: "Quit Project".into(),
         kind: EntryKind::Action,
-        subtitle: Some("kill the shelbi-<project> tmux session".into()),
+        subtitle: Some(
+            "close every pane (workers + stash + main) and switch to the next project".into(),
+        ),
     });
     out
 }
@@ -308,8 +310,8 @@ fn dispatch(project: &str, entry: &Entry) -> Result<()> {
         run_tmux(["select-window", "-t", &format!("shelbi-{project}:{id}")]);
         return Ok(());
     }
-    if entry.id == "action:quit" {
-        run_tmux(["kill-session", "-t", &format!("shelbi-{project}")]);
+    if entry.id == "action:quit-project" {
+        super::quit_project::run(project)?;
     }
     Ok(())
 }
