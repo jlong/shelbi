@@ -18,6 +18,7 @@ use shelbi_core::{Error, Host, MachineKind, Result, TmuxAddr};
 
 pub mod review;
 pub mod worker;
+pub mod zen;
 
 pub const DEFAULT_SYSTEM_PROMPT: &str = include_str!("default_orchestrator.md.template");
 
