@@ -197,7 +197,7 @@ After Phase 1: drop a stack of tasks into backlog, hit the toggle hotkey, walk a
 
 (All seven open questions closed during plan review.)
 
-- **Activation:** runtime flag (`shelbi zen on/off`), TUI footer indicator, and **Alt+Z** (⌥Z on Mac) hotkey chord that toggles Zen in place. Persisted in `state.json`. No YAML enablement.
+- **Activation:** runtime flag (`shelbi zen on/off`), **Alt+Z** (⌥Z on Mac) hotkey chord that toggles Zen in place, and a sidebar indicator pill (green background, black text, "ZEN ON") in the lower-left status block that replaces the current selection-state line. The pill is absent when Zen is off. Persisted in `state.json`. No YAML enablement.
 - **Hotkey under modals:** swallowed. While the palette / popup has focus, Alt+Z does nothing — the user closes the modal first, then toggles. Matches the behavior of Shift+Tab in Claude.
 - **Fallback chord for incompatible terminals:** first-run probe detects whether Alt is passed cleanly. If not, the user is prompted to pick a fallback (`Ctrl+\\`, `Ctrl+G`, `Ctrl+Shift+Z`, or skip and use the CLI). Persisted to `~/.shelbi/config.yaml` under `keymap.zen_toggle`.
 - **`zen.danger_paths` extend by default.** Project-listed paths are appended to the hardcoded built-in list (`.github/workflows/**`, `scripts/install.sh`, root `*.yaml`/`*.yml`, `LICENSE`, lockfiles). To replace entirely, set `override: true` and supply a `paths:` array. Replacing is the deliberate-opt-out shape; the safe default is additive.
