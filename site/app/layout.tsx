@@ -28,13 +28,12 @@ export const metadata: Metadata = {
 }
 
 // Inline boot script — runs before paint to avoid a flash of the wrong
-// theme. Reads localStorage['theme'] (set by ThemeToggle); when missing
-// it falls back to "system" so SSR, this script, and the React component
-// (which also defaults to `preference="system"`) all agree. Resolves the
-// preference against `prefers-color-scheme` and toggles `.dark` on <html>.
-// On any error (localStorage unavailable, etc.) we add `.dark` — Shelbi
-// is terminal-native and the strict-mono dark palette is the safe fallback.
-const THEME_BOOT_SCRIPT = `(function(){try{var t=localStorage.getItem('theme');if(t==='light'){return}if(t!=='dark'&&!matchMedia('(prefers-color-scheme:dark)').matches){return}document.documentElement.classList.add('dark')}catch(e){document.documentElement.classList.add('dark')}})()`
+// theme. Reads localStorage['theme'] (set by ThemeToggle); when missing,
+// defaults to dark — Shelbi is terminal-native and the strict-mono dark
+// palette is the on-brand default. The OS `prefers-color-scheme` only
+// matters when the user has explicitly chosen "system". The React
+// component's initial state defaults to "dark" to match.
+const THEME_BOOT_SCRIPT = `(function(){try{var t=localStorage.getItem('theme');if(t==='light'){return}if(t==='system'&&!matchMedia('(prefers-color-scheme:dark)').matches){return}document.documentElement.classList.add('dark')}catch(e){document.documentElement.classList.add('dark')}})()`
 
 export default function RootLayout({
   children,

@@ -28,7 +28,7 @@ const options: { value: Preference; label: string; icon: typeof SunIcon }[] = [
 ]
 
 export function ThemeToggle() {
-  const [preference, setPreference] = useState<Preference>("system")
+  const [preference, setPreference] = useState<Preference>("dark")
   const [dark, setDark] = useState(true)
   const [mounted, setMounted] = useState(false)
 
@@ -37,7 +37,7 @@ export function ThemeToggle() {
     const pref =
       stored === "light" || stored === "dark" || stored === "system"
         ? stored
-        : "system"
+        : "dark"
     const resolved = resolveTheme(pref)
     // localStorage and matchMedia are browser-only, so we have to read them
     // post-mount and reconcile our render state. React 19 batches these into
