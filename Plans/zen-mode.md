@@ -162,7 +162,8 @@ Example feed (rendered with the agent-avatars and zen-tint treatment):
 
 Zen-specific event kinds added to the events log:
 
-- `task=<id> backlog -> todo reason=orchestrator:zen-promote`
+- `task=<id> backlog -> todo reason=orchestrator:zen-promote category=<which>` — promoted by judgment.
+- `task=<id> backlog reason=orchestrator:zen-decline reason-text=<short>` — was mechanically eligible, judgment said no.
 - `task=<id> review -> done reason=orchestrator:zen-merge`
 - `task=<id> review reason=zen:failed-checks <summary>` — stays in review with ⚠.
 - `task=<id> review reason=zen:diff-too-large <stats>` — same.
@@ -229,6 +230,7 @@ After Phase 1: drop a stack of tasks into backlog, hit the toggle hotkey, walk a
 - **CI timeout:** 15 minutes default, configurable per project via `zen.ci_timeout`.
 - **Activity feed voice:** Zen events are visually distinct — `zen` badge in the avatar column + subtle tinted-row background. Same one-line shape as user actions; easy to scan as a separate stream.
 - **Crash recovery:** on orchestrator restart after a recent crash (within 1h), Zen auto-disables and surfaces a warning. In-flight workers' results land in review as normal. User must re-enable manually.
+- **Auto-promotion is judgment, not a mechanical rule.** The Rust `shelbi zen scan` returns mechanically-eligible candidates only (deps clean, not opted-out, not user-demoted, no file-overlap). The orchestrator prompt's "Zen Mode" section applies the user-tunable judgment: only auto-promote if the task fits one of three categories — (1) work the user generally trusts the orchestrator with, (2) part of fixing a recently-raised issue, or (3) part of a larger body of work the user explicitly kicked off. Candidates that don't fit are surfaced as "I considered but didn't promote — want me to?" Users edit the prompt section to tune categories per project.
 
 ## Open questions
 
