@@ -975,6 +975,28 @@ mod tests {
     }
 
     #[test]
+    fn spawn_path_doesnt_double_flag_when_yaml_already_has_permission_mode() {
+        // Repro the real shelbi YAML: `agent_runners.claude.flags:
+        // [--permission-mode, auto]` was kept as a pre-bd7a23f quick fix and
+        // the spawn-path injection then produced `claude --permission-mode
+        // auto --permission-mode auto`. The idempotency check in
+        // with_permission_mode must collapse this back to one flag.
+        let mut p = fixture_project();
+        p.agent_runners.insert(
+            "claude".into(),
+            AgentRunnerSpec {
+                command: "claude".into(),
+                flags: vec!["--permission-mode".into(), "auto".into()],
+            },
+        );
+        let runner = p.runner("claude").unwrap().clone();
+        let runner_with_mode =
+            shelbi_agent::with_permission_mode(&runner, &p.worker_permissions_mode);
+        let launch = shelbi_agent::launch_command(&runner_with_mode);
+        assert_eq!(launch, "claude --permission-mode auto");
+    }
+
+    #[test]
     fn spawn_path_leaves_non_claude_runners_alone() {
         // Codex doesn't understand --permission-mode; injecting it would
         // crash the runner on launch.

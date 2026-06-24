@@ -25,12 +25,22 @@ pub fn launch_command(spec: &AgentRunnerSpec) -> String {
 /// `defaultMode` is fragile (silent fallback to interactive on any I/O race
 /// or version regression). For non-claude runners (and the `default` mode,
 /// which is claude's own baseline) the spec is returned unchanged.
+///
+/// Idempotent: if the user-authored YAML already includes `--permission-mode`
+/// in `flags` (common for projects that adopted the flag before this helper
+/// existed), the spec is returned unchanged so the launched command line
+/// doesn't end up with two copies. Two copies don't break claude — the
+/// right-most wins — but they clutter pane captures and obscure which mode
+/// the worker is actually running in.
 pub fn with_permission_mode(spec: &AgentRunnerSpec, mode: &str) -> AgentRunnerSpec {
     let is_claude = std::path::Path::new(&spec.command)
         .file_name()
         .and_then(|s| s.to_str())
         == Some("claude");
     if !is_claude || mode == "default" {
+        return spec.clone();
+    }
+    if spec.flags.iter().any(|f| f == "--permission-mode") {
         return spec.clone();
     }
     let mut out = spec.clone();
@@ -152,5 +162,35 @@ mod tests {
         let spec = AgentRunnerSpec { command: "claude".into(), flags: vec![] };
         let out = with_permission_mode(&spec, "default");
         assert!(out.flags.is_empty());
+    }
+
+    #[test]
+    fn with_permission_mode_idempotent_when_yaml_already_has_flag() {
+        // The shelbi project YAML kept `flags: [--permission-mode, auto]` as a
+        // pre-bd7a23f quick fix; after bd7a23f added with_permission_mode the
+        // spawn path was producing `claude --permission-mode auto
+        // --permission-mode auto`. Detect the existing flag and skip the
+        // append so the launched command line stays clean.
+        let spec = AgentRunnerSpec {
+            command: "claude".into(),
+            flags: vec!["--permission-mode".into(), "auto".into()],
+        };
+        let out = with_permission_mode(&spec, "auto");
+        assert_eq!(out.flags, vec!["--permission-mode", "auto"]);
+        assert_eq!(launch_command(&out), "claude --permission-mode auto");
+    }
+
+    #[test]
+    fn with_permission_mode_idempotent_even_when_yaml_mode_differs() {
+        // If the YAML pins a specific mode, respect it rather than silently
+        // overriding from project.worker_permissions_mode. An explicit flag
+        // in the YAML is intentional configuration; quiet override would be
+        // surprising.
+        let spec = AgentRunnerSpec {
+            command: "claude".into(),
+            flags: vec!["--permission-mode".into(), "plan".into()],
+        };
+        let out = with_permission_mode(&spec, "auto");
+        assert_eq!(out.flags, vec!["--permission-mode", "plan"]);
     }
 }
