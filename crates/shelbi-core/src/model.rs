@@ -1,4 +1,5 @@
 use std::path::PathBuf;
+use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -59,6 +60,10 @@ pub struct Project {
     /// `~/.shelbi/projects/<name>/worker-settings.json.template` is used.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub worker_settings_template: Option<PathBuf>,
+    /// Zen Mode configuration: which checks to run, how long to wait on
+    /// CI, and which paths require human review even in Zen Mode.
+    #[serde(default)]
+    pub zen: ZenConfig,
 }
 
 fn default_branch() -> String {
@@ -326,6 +331,10 @@ pub struct Task {
     /// override) is the orchestrator's choice.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prefers_machine: Option<String>,
+    /// Per-task overrides for Zen Mode: opt-in/out of auto-promote and
+    /// adjust the check set against the project default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub zen: Option<TaskZenConfig>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -346,6 +355,190 @@ impl Task {
 /// call sites read clearly at the task layer.
 pub fn validate_task_id(s: &str) -> crate::Result<()> {
     validate_agent_id(s)
+}
+
+// ---------------------------------------------------------------------------
+// Zen Mode
+
+/// Project-level Zen Mode configuration. Stored under the `zen:` key in
+/// the project YAML. Defaults are tuned for a small repo with a sane CI
+/// pipeline — `checks.local` empty, 15-minute CI timeout, no extra
+/// danger paths beyond the built-in list.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ZenConfig {
+    /// Local checks run before promotion (e.g. `cargo test`, `npm test`).
+    #[serde(default)]
+    pub checks: ZenChecks,
+    /// How long Zen Mode will wait for CI to report a verdict before
+    /// timing out the promotion. Serialized as a number of seconds.
+    #[serde(default = "default_ci_timeout", with = "duration_secs")]
+    pub ci_timeout: Duration,
+    /// Glob patterns considered too sensitive to auto-promote. By default
+    /// this *extends* the built-in list (see [`Project::builtin_danger_paths`]);
+    /// projects can opt into a full override via the `override` variant.
+    #[serde(default)]
+    pub danger_paths: ZenDangerPaths,
+}
+
+impl Default for ZenConfig {
+    fn default() -> Self {
+        Self {
+            checks: ZenChecks::default(),
+            ci_timeout: default_ci_timeout(),
+            danger_paths: ZenDangerPaths::default(),
+        }
+    }
+}
+
+/// Default CI wait: 15 minutes.
+fn default_ci_timeout() -> Duration {
+    Duration::from_secs(15 * 60)
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ZenChecks {
+    /// Shell commands run locally before the worker hands off to CI.
+    /// Each entry is a single command line, executed in the worktree
+    /// root.
+    #[serde(default)]
+    pub local: Vec<String>,
+}
+
+/// How the project's `danger_paths` list interacts with the built-in
+/// list. `Extend` (default) keeps the built-in patterns and adds the
+/// user's; `Override` replaces them entirely. The wire format is a map
+/// with a single `extend:` or `override:` key — we hand-roll it via
+/// [`ZenDangerPathsRepr`] because serde_yaml's externally-tagged
+/// default uses YAML tags (`!extend`), which are awkward to write in a
+/// hand-edited project file.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "ZenDangerPathsRepr", into = "ZenDangerPathsRepr")]
+pub enum ZenDangerPaths {
+    Extend(Vec<String>),
+    Override(Vec<String>),
+}
+
+impl Default for ZenDangerPaths {
+    fn default() -> Self {
+        ZenDangerPaths::Extend(Vec::new())
+    }
+}
+
+/// Wire form for [`ZenDangerPaths`]: exactly one of `extend` / `override`
+/// is set. Both being set, or neither, is a deserialization error.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ZenDangerPathsRepr {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    extend: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none", rename = "override")]
+    override_: Option<Vec<String>>,
+}
+
+impl TryFrom<ZenDangerPathsRepr> for ZenDangerPaths {
+    type Error = &'static str;
+    fn try_from(r: ZenDangerPathsRepr) -> Result<Self, Self::Error> {
+        match (r.extend, r.override_) {
+            (Some(_), Some(_)) => {
+                Err("zen.danger_paths: set either `extend:` or `override:`, not both")
+            }
+            (Some(v), None) => Ok(ZenDangerPaths::Extend(v)),
+            (None, Some(v)) => Ok(ZenDangerPaths::Override(v)),
+            (None, None) => Ok(ZenDangerPaths::default()),
+        }
+    }
+}
+
+impl From<ZenDangerPaths> for ZenDangerPathsRepr {
+    fn from(p: ZenDangerPaths) -> Self {
+        match p {
+            ZenDangerPaths::Extend(v) => Self { extend: Some(v), override_: None },
+            ZenDangerPaths::Override(v) => Self { extend: None, override_: Some(v) },
+        }
+    }
+}
+
+/// Built-in danger paths: always part of the resolved list when the
+/// project uses the `extend` variant (the default). Patterns are glob
+/// strings; matching is the caller's job.
+pub const BUILTIN_DANGER_PATHS: &[&str] = &[
+    ".github/workflows/**",
+    "scripts/install.sh",
+    "*.yaml",
+    "*.yml",
+    "LICENSE",
+    "package-lock.json",
+    "Cargo.lock",
+];
+
+/// Per-task Zen Mode overrides. Lives under `zen:` in the task
+/// frontmatter. Every field is optional so a task can adjust just one
+/// dimension.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TaskZenConfig {
+    /// Explicit opt-in/out of Zen Mode promotion for this task. `None`
+    /// means "follow project default"; `Some(false)` is the canonical
+    /// way to keep a sensitive task on the manual-review path even when
+    /// the project is otherwise in Zen Mode.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enabled: Option<bool>,
+    /// Checks to run *in addition to* the project's `zen.checks.local`.
+    /// Ignored when `checks_only` is set.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub checks_additional: Vec<String>,
+    /// Checks to run *instead of* the project's `zen.checks.local`.
+    /// Takes precedence over `checks_additional`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub checks_only: Vec<String>,
+}
+
+/// Resolve the effective check list for a task: `checks_only` replaces
+/// the project list, `checks_additional` extends it, and absent both the
+/// project's `zen.checks.local` is returned verbatim.
+pub fn checks_for_task(project: &Project, task: &Task) -> Vec<String> {
+    let project_local = &project.zen.checks.local;
+    match task.zen.as_ref() {
+        Some(z) if !z.checks_only.is_empty() => z.checks_only.clone(),
+        Some(z) if !z.checks_additional.is_empty() => {
+            let mut out = project_local.clone();
+            out.extend(z.checks_additional.iter().cloned());
+            out
+        }
+        _ => project_local.clone(),
+    }
+}
+
+/// Resolve the effective danger-path list for a project. `Extend`
+/// returns the built-in list with project additions appended; `Override`
+/// returns the project list verbatim. Duplicates are preserved in
+/// order — callers that care can dedupe.
+pub fn danger_paths_for_project(project: &Project) -> Vec<String> {
+    match &project.zen.danger_paths {
+        ZenDangerPaths::Extend(extra) => {
+            let mut out: Vec<String> =
+                BUILTIN_DANGER_PATHS.iter().map(|s| s.to_string()).collect();
+            out.extend(extra.iter().cloned());
+            out
+        }
+        ZenDangerPaths::Override(custom) => custom.clone(),
+    }
+}
+
+/// Serde adapter that stores a `Duration` as an integer number of
+/// seconds in YAML/JSON. Keeps the project YAML readable while letting
+/// the in-memory type stay a `Duration`.
+mod duration_secs {
+    use std::time::Duration;
+
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    pub fn serialize<S: Serializer>(d: &Duration, s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_u64(d.as_secs())
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Duration, D::Error> {
+        let secs = u64::deserialize(d)?;
+        Ok(Duration::from_secs(secs))
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -459,6 +652,7 @@ updated_at: 2026-06-19T00:00:00Z
             branch: None,
             depends_on: vec!["b".into(), "c".into()],
             prefers_machine: None,
+            zen: None,
             created_at: now,
             updated_at: now,
         };
@@ -487,6 +681,7 @@ updated_at: 2026-06-19T00:00:00Z
             branch: None,
             depends_on: vec![],
             prefers_machine: Some("devbox".into()),
+            zen: None,
             created_at: now,
             updated_at: now,
         };
@@ -585,6 +780,7 @@ worker_settings_template: /etc/shelbi/p.json
             worker_poll_interval_secs: default_worker_poll_interval_secs(),
             worker_permissions_mode: default_worker_permissions_mode(),
             worker_settings_template: None,
+            zen: ZenConfig::default(),
         };
         assert!(project.validate_workers().is_ok());
 
@@ -595,5 +791,262 @@ worker_settings_template: /etc/shelbi/p.json
         let mut bad2 = project.clone();
         bad2.workers.push(WorkerSpec { name: "bob".into(), machine: "hub".into(), runner: "ghost".into() });
         assert!(matches!(bad2.validate_workers(), Err(crate::Error::UnknownRunner(_))));
+    }
+
+    // ---- Zen Mode ----------------------------------------------------------
+
+    fn project_with_zen(zen: ZenConfig) -> Project {
+        let mut runners = std::collections::BTreeMap::new();
+        runners.insert(
+            "claude".to_string(),
+            AgentRunnerSpec { command: "claude".into(), flags: vec![] },
+        );
+        Project {
+            name: "p".into(),
+            repo: "r".into(),
+            default_branch: "main".into(),
+            machines: vec![Machine {
+                name: "hub".into(),
+                kind: MachineKind::Local,
+                work_dir: "/tmp".into(),
+                host: None,
+            }],
+            orchestrator: OrchestratorSpec { runner: "claude".into() },
+            agent_runners: runners,
+            editor: None,
+            github_url: None,
+            workers: vec![],
+            worker_poll_interval_secs: default_worker_poll_interval_secs(),
+            worker_permissions_mode: default_worker_permissions_mode(),
+            worker_settings_template: None,
+            zen,
+        }
+    }
+
+    fn task_with_zen(zen: Option<TaskZenConfig>) -> Task {
+        let now = chrono::Utc::now();
+        Task {
+            id: "t".into(),
+            title: "T".into(),
+            column: Column::Todo,
+            priority: 0,
+            assigned_to: None,
+            branch: None,
+            depends_on: vec![],
+            prefers_machine: None,
+            zen,
+            created_at: now,
+            updated_at: now,
+        }
+    }
+
+    #[test]
+    fn zen_config_defaults_match_spec() {
+        let z = ZenConfig::default();
+        assert!(z.checks.local.is_empty());
+        assert_eq!(z.ci_timeout, Duration::from_secs(15 * 60));
+        assert_eq!(z.danger_paths, ZenDangerPaths::Extend(vec![]));
+    }
+
+    #[test]
+    fn project_yaml_omits_zen_and_uses_defaults() {
+        let yaml = r#"
+name: p
+repo: r
+machines:
+  - { name: hub, kind: local, work_dir: /tmp }
+orchestrator: { runner: claude }
+agent_runners:
+  claude: { command: claude, flags: [] }
+"#;
+        let p: Project = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(p.zen, ZenConfig::default());
+    }
+
+    #[test]
+    fn project_yaml_parses_zen_block() {
+        let yaml = r#"
+name: p
+repo: r
+machines:
+  - { name: hub, kind: local, work_dir: /tmp }
+orchestrator: { runner: claude }
+agent_runners:
+  claude: { command: claude, flags: [] }
+zen:
+  checks:
+    local:
+      - cargo test
+      - cargo clippy
+  ci_timeout: 600
+  danger_paths:
+    extend:
+      - migrations/**
+"#;
+        let p: Project = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(p.zen.checks.local, vec!["cargo test", "cargo clippy"]);
+        assert_eq!(p.zen.ci_timeout, Duration::from_secs(600));
+        assert_eq!(
+            p.zen.danger_paths,
+            ZenDangerPaths::Extend(vec!["migrations/**".into()])
+        );
+    }
+
+    #[test]
+    fn project_yaml_parses_override_danger_paths() {
+        let yaml = r#"
+name: p
+repo: r
+machines:
+  - { name: hub, kind: local, work_dir: /tmp }
+orchestrator: { runner: claude }
+agent_runners:
+  claude: { command: claude, flags: [] }
+zen:
+  danger_paths:
+    override:
+      - "**/*"
+"#;
+        let p: Project = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(
+            p.zen.danger_paths,
+            ZenDangerPaths::Override(vec!["**/*".into()])
+        );
+    }
+
+    #[test]
+    fn zen_config_yaml_round_trip() {
+        let cfg = ZenConfig {
+            checks: ZenChecks { local: vec!["cargo test".into()] },
+            ci_timeout: Duration::from_secs(900),
+            danger_paths: ZenDangerPaths::Extend(vec!["docs/**".into()]),
+        };
+        let y = serde_yaml::to_string(&cfg).unwrap();
+        let back: ZenConfig = serde_yaml::from_str(&y).unwrap();
+        assert_eq!(cfg, back);
+        // ci_timeout serializes as a plain integer (no struct form).
+        assert!(y.contains("ci_timeout: 900"));
+    }
+
+    #[test]
+    fn task_frontmatter_parses_zen_overrides() {
+        let yaml = r#"
+id: a
+title: A
+column: todo
+priority: 0
+zen:
+  enabled: false
+  checks_only:
+    - cargo test --doc
+created_at: 2026-06-19T00:00:00Z
+updated_at: 2026-06-19T00:00:00Z
+"#;
+        let t: Task = serde_yaml::from_str(yaml).unwrap();
+        let z = t.zen.expect("zen block present");
+        assert_eq!(z.enabled, Some(false));
+        assert_eq!(z.checks_only, vec!["cargo test --doc"]);
+        assert!(z.checks_additional.is_empty());
+    }
+
+    #[test]
+    fn task_zen_round_trips_and_defaults_to_none() {
+        let yaml = r#"
+id: a
+title: A
+column: todo
+priority: 0
+created_at: 2026-06-19T00:00:00Z
+updated_at: 2026-06-19T00:00:00Z
+"#;
+        let t: Task = serde_yaml::from_str(yaml).unwrap();
+        assert!(t.zen.is_none());
+        let back = serde_yaml::to_string(&t).unwrap();
+        assert!(!back.contains("zen"));
+    }
+
+    #[test]
+    fn task_zen_config_round_trip() {
+        let cfg = TaskZenConfig {
+            enabled: Some(true),
+            checks_additional: vec!["npm test".into()],
+            checks_only: vec![],
+        };
+        let y = serde_yaml::to_string(&cfg).unwrap();
+        let back: TaskZenConfig = serde_yaml::from_str(&y).unwrap();
+        assert_eq!(cfg, back);
+        // Empty lists omitted on the wire.
+        assert!(!y.contains("checks_only"));
+    }
+
+    #[test]
+    fn checks_for_task_falls_back_to_project_when_no_overrides() {
+        let p = project_with_zen(ZenConfig {
+            checks: ZenChecks { local: vec!["cargo test".into()] },
+            ..Default::default()
+        });
+        let t = task_with_zen(None);
+        assert_eq!(checks_for_task(&p, &t), vec!["cargo test"]);
+    }
+
+    #[test]
+    fn checks_for_task_extends_with_additional() {
+        let p = project_with_zen(ZenConfig {
+            checks: ZenChecks { local: vec!["cargo test".into()] },
+            ..Default::default()
+        });
+        let t = task_with_zen(Some(TaskZenConfig {
+            checks_additional: vec!["cargo clippy".into()],
+            ..Default::default()
+        }));
+        assert_eq!(checks_for_task(&p, &t), vec!["cargo test", "cargo clippy"]);
+    }
+
+    #[test]
+    fn checks_for_task_only_replaces_project_checks() {
+        let p = project_with_zen(ZenConfig {
+            checks: ZenChecks { local: vec!["cargo test".into()] },
+            ..Default::default()
+        });
+        let t = task_with_zen(Some(TaskZenConfig {
+            checks_only: vec!["cargo test --doc".into()],
+            // `checks_only` wins even when both are set.
+            checks_additional: vec!["never-run".into()],
+            ..Default::default()
+        }));
+        assert_eq!(checks_for_task(&p, &t), vec!["cargo test --doc"]);
+    }
+
+    #[test]
+    fn danger_paths_extend_appends_to_builtins() {
+        let p = project_with_zen(ZenConfig {
+            danger_paths: ZenDangerPaths::Extend(vec!["secrets/**".into()]),
+            ..Default::default()
+        });
+        let paths = danger_paths_for_project(&p);
+        for builtin in BUILTIN_DANGER_PATHS {
+            assert!(paths.iter().any(|p| p == builtin), "missing builtin {builtin}");
+        }
+        assert!(paths.iter().any(|p| p == "secrets/**"));
+    }
+
+    #[test]
+    fn danger_paths_override_drops_builtins() {
+        let p = project_with_zen(ZenConfig {
+            danger_paths: ZenDangerPaths::Override(vec!["only/this".into()]),
+            ..Default::default()
+        });
+        let paths = danger_paths_for_project(&p);
+        assert_eq!(paths, vec!["only/this".to_string()]);
+    }
+
+    #[test]
+    fn danger_paths_default_returns_just_builtins() {
+        let p = project_with_zen(ZenConfig::default());
+        let paths = danger_paths_for_project(&p);
+        assert_eq!(paths.len(), BUILTIN_DANGER_PATHS.len());
+        for (got, want) in paths.iter().zip(BUILTIN_DANGER_PATHS.iter()) {
+            assert_eq!(got, want);
+        }
     }
 }

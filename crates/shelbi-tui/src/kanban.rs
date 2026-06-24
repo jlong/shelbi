@@ -759,6 +759,8 @@ mod tests {
                 assigned_to: None,
                 branch: None,
                 depends_on: Vec::new(),
+                prefers_machine: None,
+                zen: None,
                 created_at: updated_at,
                 updated_at,
             },
@@ -888,6 +890,7 @@ mod tests {
             branch: None,
             depends_on: Vec::new(),
             prefers_machine: None,
+            zen: None,
             created_at: now,
             updated_at: now,
         };

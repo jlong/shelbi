@@ -10,6 +10,7 @@ use std::path::{Path, PathBuf};
 
 use std::collections::{HashMap, HashSet};
 
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use shelbi_core::{Agent, Column, Project, Result, Session, Task};
 
@@ -227,6 +228,47 @@ pub fn save_session(s: &Session) -> Result<()> {
     ensure_dir(&sessions_dir()?)?;
     let path = sessions_dir()?.join(format!("{}.yaml", s.name));
     atomic_write(&path, serde_yaml::to_string(s)?.as_bytes())
+}
+
+// ---------------------------------------------------------------------------
+// Per-project runtime state (state.json)
+
+/// Per-project runtime state persisted at
+/// `~/.shelbi/projects/<project>/state.json`. Tracks Zen Mode toggles and
+/// the timestamp of the most recent Zen-Mode auto-promote crash so the
+/// orchestrator can keep the user from re-arming a flapping pipeline.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct State {
+    #[serde(default)]
+    pub zen_mode: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub zen_last_crashed_at: Option<DateTime<Utc>>,
+}
+
+/// Path to a project's `state.json`.
+pub fn state_path(project: &str) -> Result<PathBuf> {
+    Ok(project_dir(project)?.join("state.json"))
+}
+
+/// Read `state.json` for `project`. Returns `State::default()` when the
+/// file is missing — the first call after creating a project shouldn't
+/// require a separate seeding step.
+pub fn read_state(project: &str) -> Result<State> {
+    let path = state_path(project)?;
+    if !path.exists() {
+        return Ok(State::default());
+    }
+    let text = fs::read_to_string(&path)?;
+    serde_json::from_str(&text)
+        .map_err(|e| shelbi_core::Error::Other(format!("state.json: {e}")))
+}
+
+/// Atomically write `state` to `~/.shelbi/projects/<project>/state.json`.
+pub fn write_state(project: &str, state: &State) -> Result<()> {
+    let path = state_path(project)?;
+    let body = serde_json::to_vec_pretty(state)
+        .map_err(|e| shelbi_core::Error::Other(format!("state.json: {e}")))?;
+    atomic_write(&path, &body)
 }
 
 // ---------------------------------------------------------------------------
@@ -648,6 +690,7 @@ mod tests {
             worker_poll_interval_secs: 5,
             worker_permissions_mode: "auto".into(),
             worker_settings_template: override_template,
+            zen: ZenConfig::default(),
         }
     }
 
@@ -842,6 +885,7 @@ mod tests {
             branch: None,
             depends_on: Vec::new(),
             prefers_machine: None,
+            zen: None,
             created_at: now,
             updated_at: now,
         }
@@ -1000,6 +1044,54 @@ mod tests {
         let ready = list_ready("p").unwrap();
         let ids: Vec<_> = ready.iter().map(|tf| tf.task.id.as_str()).collect();
         assert_eq!(ids, vec!["free", "no-deps"]);
+        std::env::remove_var("SHELBI_HOME");
+    }
+
+    // ---- state.json --------------------------------------------------------
+
+    #[test]
+    fn state_defaults_when_file_is_missing() {
+        let _g = TEST_LOCK.lock().unwrap();
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+        let s = read_state("p").unwrap();
+        assert_eq!(s, State::default());
+        assert!(!s.zen_mode);
+        assert!(s.zen_last_crashed_at.is_none());
+        std::env::remove_var("SHELBI_HOME");
+    }
+
+    #[test]
+    fn state_round_trips_through_disk() {
+        let _g = TEST_LOCK.lock().unwrap();
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+        let original = State {
+            zen_mode: true,
+            zen_last_crashed_at: Some(
+                "2026-06-19T12:34:56Z".parse::<DateTime<Utc>>().unwrap(),
+            ),
+        };
+        write_state("p", &original).unwrap();
+        let back = read_state("p").unwrap();
+        assert_eq!(back, original);
+        // Second round-trip is byte-stable.
+        let first = std::fs::read(state_path("p").unwrap()).unwrap();
+        write_state("p", &back).unwrap();
+        let second = std::fs::read(state_path("p").unwrap()).unwrap();
+        assert_eq!(first, second);
+        std::env::remove_var("SHELBI_HOME");
+    }
+
+    #[test]
+    fn state_omits_missing_crashed_at() {
+        let _g = TEST_LOCK.lock().unwrap();
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+        let s = State { zen_mode: true, zen_last_crashed_at: None };
+        write_state("p", &s).unwrap();
+        let on_disk = std::fs::read_to_string(state_path("p").unwrap()).unwrap();
+        assert!(!on_disk.contains("zen_last_crashed_at"));
         std::env::remove_var("SHELBI_HOME");
     }
 

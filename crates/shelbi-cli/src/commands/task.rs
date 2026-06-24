@@ -189,6 +189,7 @@ fn add(project: &str, args: AddArgs) -> Result<()> {
         branch: None,
         depends_on: dedup_preserving_order(args.depends_on.clone()),
         prefers_machine: args.prefers_machine.clone(),
+        zen: None,
         created_at: now,
         updated_at: now,
     };
@@ -603,6 +604,7 @@ mod tests {
             branch: None,
             depends_on: Vec::new(),
             prefers_machine: None,
+            zen: None,
             created_at: now,
             updated_at: now,
         }

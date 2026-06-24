@@ -272,6 +272,7 @@ mod tests {
             branch: None,
             depends_on: Vec::new(),
             prefers_machine: None,
+            zen: None,
             created_at: now,
             updated_at: now,
         }

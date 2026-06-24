@@ -260,6 +260,7 @@ pub fn setup_one_project() -> Result<()> {
         worker_poll_interval_secs: 5,
         worker_permissions_mode: "auto".into(),
         worker_settings_template: None,
+        zen: shelbi_core::ZenConfig::default(),
     };
     project.validate_workers().map_err(|e| anyhow!(e))?;
 

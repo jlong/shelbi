@@ -433,6 +433,7 @@ mod tests {
             worker_poll_interval_secs: 5,
             worker_permissions_mode: "auto".into(),
             worker_settings_template: None,
+            zen: shelbi_core::ZenConfig::default(),
         }
     }
 
@@ -447,6 +448,7 @@ mod tests {
             branch: None,
             depends_on: Vec::new(),
             prefers_machine: None,
+            zen: None,
             created_at: now,
             updated_at: now,
         }
