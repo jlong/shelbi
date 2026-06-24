@@ -1,23 +1,29 @@
 ---
 title: Install
 order: 1
-summary: Hosted install script, build-from-source fallback, and verifying the binary on your PATH.
+summary: Hosted install script and manual source install, both build with cargo, plus verifying the binary on your PATH.
 ---
 
-Shelbi ships as a single Rust binary. The hosted install script downloads
-the latest release and drops the binary on your `PATH`:
+Shelbi is a Rust project — there's no prebuilt binary today, so installing
+means cloning the repo and building with `cargo`. The hosted script does
+that for you:
 
 <InstallCommand />
 
-Prefer to build it yourself? Skip to [Build from source](#build-from-source).
+It clones into a temp dir, runs `cargo build --release`, and drops the
+resulting binary at `~/bin/shelbi` (override with `SHELBI_INSTALL_PATH`).
+Prefer to clone the repo to a permanent path so you can rebuild in place
+later? Skip to [Install from source manually](#install-from-source-manually).
 
 ## Prerequisites
 
-You need three things before you start:
+You need three things before you start. The first one is required for
+both the hosted script and the manual path — both build from source.
 
-- **A Rust toolchain.** The binary builds against the stable channel; install
-  with [rustup](https://rustup.rs) if you don't already have it. Anything
-  recent enough to compile the workspace works.
+- **A Rust toolchain.** Required for every install path. The workspace
+  builds against the stable channel; install with [rustup](https://rustup.rs)
+  if you don't already have it. Anything recent enough to compile the
+  workspace works.
 - **`tmux` 3.2 or later.** Shelbi runs every worker inside a tmux pane and
   drives them with `send-keys` / `capture-pane`. Older tmux releases miss
   features the TUI relies on. Install via Homebrew (`brew install tmux`),
@@ -30,9 +36,12 @@ You need three things before you start:
 Remote workers need the same `tmux` and agent CLI on the machine they run
 on, plus an `ssh` host you can already reach without a password prompt.
 
-## Build from source
+## Install from source manually
 
-Clone the repo and run the install script:
+The hosted script clones into a temp dir and throws the clone away after
+the build. If you'd rather keep the checkout around — to rebuild after
+pulling updates, or to hack on Shelbi itself — clone it to a permanent
+path and run the same install script directly:
 
 ```bash
 git clone https://github.com/jlong/shelbi.git
