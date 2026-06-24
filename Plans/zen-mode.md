@@ -42,6 +42,22 @@ When off, that block is empty — keeps the chrome quiet 99% of the time.
 
 The orchestrator reads the flag on every dispatch / merge decision; flipping it off mid-flow stops further auto-actions immediately (in-flight workers keep going; their results just land in review instead of done).
 
+**How the orchestrator learns about toggles.** Two channels:
+
+1. **Bootstrap.** On session start, the orchestrator reads `state.json::zen_mode` once. This sets the initial value of its in-memory `zen_active` boolean. No event replay needed — `state.json` is the source of truth for "what's the current state right now."
+
+2. **Live (mid-session).** Every toggle path — `shelbi zen on/off/pause`, the Alt+Z hotkey, the crash-recovery auto-disable — emits a new event-log line shape:
+
+       <ts> mode=zen <prev> -> <new> reason=<source>
+
+   Where `<source>` is one of `user:cli`, `user:hotkey`, `system:crash-recovery`. The orchestrator is already tailing `events.log --follow` for task and worker events; `mode=` lines flow through that same stream. Its reaction rules gain a bullet for the new shape:
+
+   > On `mode=zen * -> on`: print the current board + worker snapshot, switch to Zen reaction rules (auto-merge on review, evaluate auto-promote candidates per the Zen Mode prompt section).
+   >
+   > On `mode=zen * -> off` (or `* -> paused`): stop initiating new Zen actions. In-flight Zen merges complete; their results land per the normal flow.
+
+This matches how the orchestrator already tracks worker state via the tail — bootstrap once, react to deltas thereafter. No polling.
+
 **Crash recovery.** If the orchestrator pane dies, on restart it checks `state.json` for a recent crash timestamp. If a crash is detected within the last hour, Zen Mode auto-disables and the orchestrator surfaces a clear warning: *"Zen disabled after crash; re-enable manually if you want to resume."* In-flight workers (which don't know about Zen) keep going and their results land in `review` for the user to inspect. This is the safe default — no surprise auto-merges after a crash, and the user is forced to do a quick check-in before resuming autonomous mode.
 
 ### 2. Auto-promotion from backlog
