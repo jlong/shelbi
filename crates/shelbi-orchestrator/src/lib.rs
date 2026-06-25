@@ -276,7 +276,7 @@ pub fn ensure_dashboard(project_name: &str) -> Result<BootstrapStatus> {
 
     let shelbi_bin = current_exe_string()?;
     let sidebar_cmd_str = sidebar_cmd(&shelbi_bin, project_name);
-    let launch = shelbi_agent::launch_command(&runner_spec);
+    let launch = launch_with_bootstrap(&runner_spec);
     let orch_cmd = orchestrator_pane_cmd(
         &shelbi_bin,
         project_name,
@@ -587,6 +587,44 @@ fn sidebar_cmd(shelbi_bin: &str, project_name: &str) -> String {
         bin = shelbi_agent::shell_escape(shelbi_bin),
         proj = shelbi_agent::shell_escape(project_name),
     )
+}
+
+/// Initial positional prompt fed to the orchestrator agent on launch so
+/// it runs the "Bootstrap on session start" sequence from `CLAUDE.md`
+/// without waiting for the user to type "start monitoring". The prompt
+/// names every step verbatim so the agent can't elide arming the
+/// `shelbi events tail --follow` watch — that's the step that turns
+/// auto-dispatch back on after a cold start.
+const ORCH_BOOTSTRAP_PROMPT: &str = "Run the \"Bootstrap on session start\" sequence \
+    from CLAUDE.md now: snapshot `shelbi task list`, `shelbi worker list`, and \
+    `shelbi zen status`; scan recent `~/.shelbi/events.log` for a \
+    `zen=off reason=crash-recovery` line; then start `shelbi events tail --follow` \
+    in the background and watch it with the Monitor tool so auto-dispatch reacts \
+    to new transitions.";
+
+/// Wrap `launch_command(runner_spec)` with the orchestrator's
+/// auto-bootstrap initial prompt when the runner is `claude`. The
+/// positional-prompt CLI convention is claude-specific (`claude "<msg>"`
+/// submits `<msg>` as the first user message); other runners are
+/// returned untouched so a project that pins `codex` or similar doesn't
+/// get its launch line garbled by an arg the runner doesn't understand.
+fn launch_with_bootstrap(spec: &shelbi_core::AgentRunnerSpec) -> String {
+    let launch = shelbi_agent::launch_command(spec);
+    if is_claude_runner(spec) {
+        format!(
+            "{launch} {prompt}",
+            prompt = shelbi_agent::shell_escape(ORCH_BOOTSTRAP_PROMPT),
+        )
+    } else {
+        launch
+    }
+}
+
+fn is_claude_runner(spec: &shelbi_core::AgentRunnerSpec) -> bool {
+    std::path::Path::new(&spec.command)
+        .file_name()
+        .and_then(|s| s.to_str())
+        == Some("claude")
 }
 
 /// Heartbeat cadence for the orchestrator pane's background liveness
@@ -985,6 +1023,59 @@ mod pane_cmd_tests {
             "claude",
         );
         assert!(out.contains("cd '/Users/me/My Projects/myapp' && "));
+    }
+
+    #[test]
+    fn launch_with_bootstrap_appends_initial_prompt_for_claude() {
+        // Cold-start guarantee: the bootstrap prompt is the agent's first
+        // user message, so the events.log Monitor watch arms without the
+        // user typing "start monitoring".
+        let spec = shelbi_core::AgentRunnerSpec {
+            command: "claude".into(),
+            flags: vec![],
+        };
+        let out = launch_with_bootstrap(&spec);
+        assert!(out.starts_with("claude "), "launch should start with `claude`, got: {out}");
+        // Single-quoted so the whole prompt lands as one positional arg
+        // inside the `sh -c "...; {launch}; ..."` wrapper.
+        assert!(out.contains("'Run the \"Bootstrap on session start\""), "missing escaped prompt: {out}");
+        assert!(out.contains("shelbi events tail --follow"), "prompt must name the tail command");
+        assert!(out.contains("Monitor tool"), "prompt must mention the Monitor tool");
+    }
+
+    #[test]
+    fn launch_with_bootstrap_preserves_existing_flags() {
+        let spec = shelbi_core::AgentRunnerSpec {
+            command: "claude".into(),
+            flags: vec!["--permission-mode".into(), "auto".into()],
+        };
+        let out = launch_with_bootstrap(&spec);
+        assert!(out.starts_with("claude --permission-mode auto "), "flags must come before the prompt: {out}");
+    }
+
+    #[test]
+    fn launch_with_bootstrap_skips_non_claude_runners() {
+        // codex (and any other runner) doesn't accept a positional prompt
+        // in the same way; pasting the bootstrap text would either error
+        // or land in the wrong place. Leave the launch line alone.
+        let spec = shelbi_core::AgentRunnerSpec {
+            command: "codex".into(),
+            flags: vec!["--print".into()],
+        };
+        let out = launch_with_bootstrap(&spec);
+        assert_eq!(out, "codex --print");
+    }
+
+    #[test]
+    fn launch_with_bootstrap_recognizes_absolute_claude_paths() {
+        // Same basename rule as with_permission_mode — a project that
+        // pins `/opt/homebrew/bin/claude` still gets the auto-bootstrap.
+        let spec = shelbi_core::AgentRunnerSpec {
+            command: "/opt/homebrew/bin/claude".into(),
+            flags: vec![],
+        };
+        let out = launch_with_bootstrap(&spec);
+        assert!(out.contains("'Run the \"Bootstrap on session start\""), "claude detected by basename: {out}");
     }
 
     #[test]
