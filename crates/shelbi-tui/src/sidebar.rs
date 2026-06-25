@@ -9,14 +9,23 @@ use ratatui::{
     widgets::{List, ListItem, ListState, Paragraph},
     Frame,
 };
+use shelbi_state::ZenModeState;
 
 use crate::app::{App, Row, WorkerBadge};
 
 pub fn render_full(f: &mut Frame, app: &mut App, area: Rect) {
+    // Footer grows from 2 lines (keymap + status_line) to 4 lines when the
+    // green Zen pill is showing (keymap + 3-line pill). Keeps the list area
+    // tight in the common no-pill case.
+    let footer_height = if matches!(app.zen_mode, ZenModeState::On) {
+        4
+    } else {
+        2
+    };
     let outer = Layout::default()
         .direction(Direction::Vertical)
         .horizontal_margin(1)
-        .constraints([Constraint::Min(1), Constraint::Length(2)])
+        .constraints([Constraint::Min(1), Constraint::Length(footer_height)])
         .split(area);
 
     render_list(f, app, outer[0]);
@@ -186,6 +195,23 @@ fn display_width(s: &str) -> usize {
 }
 
 fn render_footer(f: &mut Frame, app: &App, area: Rect) {
+    if matches!(app.zen_mode, ZenModeState::On) {
+        // Keymap line stays untouched; status_line is sacrificed for the
+        // 3-line green pill underneath it.
+        let layout = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Length(1), Constraint::Length(3)])
+            .split(area);
+        f.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                "^P palette  q quit",
+                Style::default().fg(Color::DarkGray),
+            ))),
+            layout[0],
+        );
+        render_zen_pill(f, layout[1]);
+        return;
+    }
     let lines = if app.status_line.is_empty() {
         vec![
             Line::from(Span::styled(
@@ -212,6 +238,55 @@ fn render_footer(f: &mut Frame, app: &App, area: Rect) {
     f.render_widget(Paragraph::new(lines), area);
 }
 
+/// 3-line, ~11-column green pill anchored to the lower-left status block.
+/// Box-drawing chars are drawn as text (not a `Block` border) so the entire
+/// rectangle — corners, edges, and label — shares the same green fill.
+fn render_zen_pill(f: &mut Frame, area: Rect) {
+    const PILL_WIDTH: u16 = 11;
+    const PILL_HEIGHT: u16 = 3;
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
+    let w = area.width.min(PILL_WIDTH);
+    let h = area.height.min(PILL_HEIGHT);
+    let pill_area = Rect {
+        x: area.x,
+        y: area.y,
+        width: w,
+        height: h,
+    };
+    let style = Style::default()
+        .bg(Color::Rgb(0, 200, 80))
+        .fg(Color::Black)
+        .add_modifier(Modifier::BOLD);
+    let inner = w.saturating_sub(2) as usize;
+    let top = format!("┌{}┐", "─".repeat(inner));
+    let bottom = format!("└{}┘", "─".repeat(inner));
+    // Center " ZEN ON " inside the available inner width; if the cell is
+    // narrower than 8 chars the label gets clipped — preferable to wrapping
+    // onto a fresh row that would break the pill's box.
+    let label = " ZEN ON ";
+    let label_w = label.chars().count();
+    let pad = inner.saturating_sub(label_w);
+    let left_pad = pad / 2;
+    let right_pad = pad - left_pad;
+    let middle = format!(
+        "│{}{}{}│",
+        " ".repeat(left_pad),
+        label,
+        " ".repeat(right_pad)
+    );
+    let mut lines = Vec::with_capacity(h as usize);
+    lines.push(Line::from(Span::styled(top, style)));
+    if h >= 2 {
+        lines.push(Line::from(Span::styled(middle, style)));
+    }
+    if h >= 3 {
+        lines.push(Line::from(Span::styled(bottom, style)));
+    }
+    f.render_widget(Paragraph::new(lines), pill_area);
+}
+
 fn status_color(s: shelbi_core::Status) -> Color {
     use shelbi_core::Status::*;
     match s {
@@ -231,5 +306,94 @@ fn worker_badge_color(b: WorkerBadge) -> Color {
         WorkerBadge::AwaitingPermission => Color::Red,
         WorkerBadge::ReviewReady => Color::Cyan,
         WorkerBadge::Idle => Color::DarkGray,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ratatui::{backend::TestBackend, Terminal};
+
+    /// When Zen is on, the bottom of the sidebar shows the keymap line
+    /// followed by a 3-line pill carrying the " ZEN ON " label. The box
+    /// chars (┌─┐│└┘) come from the renderer's own text — not a ratatui
+    /// `Block` border — so the green fill covers the corners too.
+    #[test]
+    fn pill_renders_three_line_box_with_label_when_zen_on() {
+        let backend = TestBackend::new(24, 16);
+        let mut term = Terminal::new(backend).unwrap();
+        let mut app = App::new_sidebar("demo");
+        app.zen_mode = ZenModeState::On;
+        term.draw(|f| render_full(f, &mut app, f.area())).unwrap();
+        let buf = term.backend().buffer().clone();
+
+        let dump: Vec<String> = (0..buf.area.height)
+            .map(|y| {
+                (0..buf.area.width)
+                    .map(|x| buf[(x, y)].symbol().to_string())
+                    .collect::<Vec<_>>()
+                    .join("")
+            })
+            .collect();
+        let joined = dump.join("\n");
+        assert!(
+            joined.contains("ZEN ON"),
+            "expected ZEN ON label in:\n{joined}"
+        );
+        assert!(joined.contains("┌─"), "expected pill top corner in:\n{joined}");
+        assert!(joined.contains("└─"), "expected pill bottom corner in:\n{joined}");
+        assert!(
+            joined.contains("^P palette  q quit"),
+            "footer keymap line must stay intact in:\n{joined}"
+        );
+    }
+
+    /// When Zen is off, the pill disappears entirely — no green chrome,
+    /// no leftover box characters. The footer collapses back to the
+    /// 2-line keymap.
+    #[test]
+    fn pill_absent_when_zen_off() {
+        let backend = TestBackend::new(24, 16);
+        let mut term = Terminal::new(backend).unwrap();
+        let mut app = App::new_sidebar("demo");
+        app.zen_mode = ZenModeState::Off;
+        term.draw(|f| render_full(f, &mut app, f.area())).unwrap();
+        let buf = term.backend().buffer().clone();
+
+        let dump: Vec<String> = (0..buf.area.height)
+            .map(|y| {
+                (0..buf.area.width)
+                    .map(|x| buf[(x, y)].symbol().to_string())
+                    .collect::<Vec<_>>()
+                    .join("")
+            })
+            .collect();
+        let joined = dump.join("\n");
+        assert!(!joined.contains("ZEN"), "no ZEN label expected, got:\n{joined}");
+        assert!(!joined.contains("┌─"), "no pill corner expected, got:\n{joined}");
+    }
+
+    /// Paused is *not* treated as on — the orchestrator might be draining
+    /// in-flight work, but the pill is a binary visual signal. Showing it
+    /// while paused would mislead the user.
+    #[test]
+    fn pill_absent_when_zen_paused() {
+        let backend = TestBackend::new(24, 16);
+        let mut term = Terminal::new(backend).unwrap();
+        let mut app = App::new_sidebar("demo");
+        app.zen_mode = ZenModeState::Paused;
+        term.draw(|f| render_full(f, &mut app, f.area())).unwrap();
+        let buf = term.backend().buffer().clone();
+
+        let dump: Vec<String> = (0..buf.area.height)
+            .map(|y| {
+                (0..buf.area.width)
+                    .map(|x| buf[(x, y)].symbol().to_string())
+                    .collect::<Vec<_>>()
+                    .join("")
+            })
+            .collect();
+        let joined = dump.join("\n");
+        assert!(!joined.contains("ZEN"), "paused must not show pill, got:\n{joined}");
     }
 }

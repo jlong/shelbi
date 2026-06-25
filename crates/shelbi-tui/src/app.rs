@@ -3,7 +3,10 @@ use std::time::{Duration, Instant};
 use anyhow::Result;
 use ratatui::layout::Rect;
 use shelbi_core::{Agent, Column, Status};
-use shelbi_state::{load_worker_status, TaskFile, WorkerState};
+use shelbi_state::{
+    append_project_event, load_worker_status, read_state, write_state, TaskFile, WorkerState,
+    ZenModeState, ZenToggleChord,
+};
 
 /// What's currently highlighted in the sidebar — drives selection logic
 /// only; the right pane (orchestrator / agent) is a real tmux pane, not
@@ -85,6 +88,13 @@ pub struct App {
     pub last_refresh: Instant,
     pub status_line: String,
     pub should_quit: bool,
+    /// Latest Zen Mode state read from `state.json`. Drives the green pill
+    /// in the lower-left status block and the Alt+Z toggle direction.
+    pub zen_mode: ZenModeState,
+    /// Chord that toggles Zen Mode — picked by the first-run probe, loaded
+    /// from `~/.shelbi/config.yaml::keymap.zen_toggle`. Defaults to Alt+Z
+    /// before the probe runs (matches the fresh-install spec).
+    pub zen_toggle_chord: ZenToggleChord,
     /// Screen-space rect occupied by the rendered row list — written each
     /// frame by the sidebar renderer and read by the mouse-click handler to
     /// map a click coordinate back to a row index.
@@ -102,6 +112,8 @@ impl App {
             last_refresh: Instant::now() - Duration::from_secs(60),
             status_line: String::new(),
             should_quit: false,
+            zen_mode: ZenModeState::Off,
+            zen_toggle_chord: ZenToggleChord::AltZ,
             list_area: Rect::default(),
         }
     }
@@ -201,6 +213,11 @@ impl App {
             shelbi_state::list_column(&self.project_name, Column::Review).unwrap_or_default();
         self.workers =
             load_workers(&self.project_name, &self.review_queue).unwrap_or_default();
+        // A missing state.json is normal (fresh project): default to Off so
+        // the pill stays hidden rather than flashing then disappearing.
+        self.zen_mode = read_state(&self.project_name)
+            .map(|s| s.zen_mode)
+            .unwrap_or(ZenModeState::Off);
         self.last_refresh = Instant::now();
         Ok(())
     }
@@ -294,6 +311,39 @@ impl App {
     fn start_review(&self, id: &str) -> Result<String> {
         shelbi_orchestrator::review::start_review_by_id(&self.project_name, id)
             .map_err(|e| anyhow::anyhow!(e))
+    }
+
+    /// Flip `state.json::zen_mode` between On and Off, mirroring the
+    /// `shelbi zen on|off` CLI: write the new state, then best-effort
+    /// append a `user:zen-<action>` line to `~/.shelbi/events.log`.
+    /// Paused collapses to On here because the spec is a binary toggle —
+    /// the CLI is still the path for Paused.
+    pub fn toggle_zen_mode(&mut self) {
+        let target = match self.zen_mode {
+            ZenModeState::On => ZenModeState::Off,
+            ZenModeState::Off | ZenModeState::Paused => ZenModeState::On,
+        };
+        let action = match target {
+            ZenModeState::On => "on",
+            ZenModeState::Off => "off",
+            ZenModeState::Paused => "pause",
+        };
+        let mut state = read_state(&self.project_name).unwrap_or_default();
+        state.zen_mode = target;
+        if let Err(e) = write_state(&self.project_name, &state) {
+            self.status_line = format!("zen toggle failed: {e}");
+            return;
+        }
+        // Best-effort: event-log write failures don't undo the toggle —
+        // the user flipped Zen and got what they asked for. Mirror the
+        // CLI's pattern in `shelbi zen`.
+        let _ = append_project_event(
+            &self.project_name,
+            &format!("zen={}", target.as_str()),
+            &format!("user:zen-{action}"),
+        );
+        self.zen_mode = target;
+        self.status_line = format!("zen {action}");
     }
 }
 
@@ -957,5 +1007,67 @@ mod tests {
                 b.glyph()
             );
         }
+    }
+
+    #[test]
+    fn toggle_zen_mode_flips_and_writes_state_and_event() {
+        let _g = TEST_LOCK.lock().unwrap();
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+
+        let project = fixture_project();
+        shelbi_state::save_project(&project).unwrap();
+
+        let mut app = App::new_sidebar("demo");
+        app.refresh().unwrap();
+        assert_eq!(app.zen_mode, shelbi_state::ZenModeState::Off);
+
+        app.toggle_zen_mode();
+        assert_eq!(app.zen_mode, shelbi_state::ZenModeState::On);
+        // Persisted to state.json — a re-read sees the toggle.
+        let state = shelbi_state::read_state("demo").unwrap();
+        assert_eq!(state.zen_mode, shelbi_state::ZenModeState::On);
+        // Toggle again returns to Off — Paused is not in the binary path.
+        app.toggle_zen_mode();
+        assert_eq!(app.zen_mode, shelbi_state::ZenModeState::Off);
+
+        // Events log got both transitions in order with the documented
+        // reason tags, so the activity feed can show who flipped what.
+        let log = std::fs::read_to_string(shelbi_state::events_log_path().unwrap()).unwrap();
+        let on_line = log.lines().find(|l| l.contains("reason=user:zen-on"));
+        let off_line = log.lines().find(|l| l.contains("reason=user:zen-off"));
+        assert!(on_line.is_some(), "missing zen-on event in: {log}");
+        assert!(off_line.is_some(), "missing zen-off event in: {log}");
+        assert!(on_line.unwrap().contains("project=demo zen=on"));
+        assert!(off_line.unwrap().contains("project=demo zen=off"));
+
+        std::env::remove_var("SHELBI_HOME");
+    }
+
+    #[test]
+    fn toggle_zen_mode_from_paused_goes_to_on() {
+        // Paused isn't reachable via the hotkey, but state.json may already
+        // be Paused from a CLI invocation; toggling there should mean
+        // "give me the on path", matching the spec's binary-toggle wording.
+        let _g = TEST_LOCK.lock().unwrap();
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+
+        let project = fixture_project();
+        shelbi_state::save_project(&project).unwrap();
+        let paused = shelbi_state::State {
+            zen_mode: shelbi_state::ZenModeState::Paused,
+            zen_last_crashed_at: None,
+        };
+        shelbi_state::write_state("demo", &paused).unwrap();
+
+        let mut app = App::new_sidebar("demo");
+        app.refresh().unwrap();
+        assert_eq!(app.zen_mode, shelbi_state::ZenModeState::Paused);
+
+        app.toggle_zen_mode();
+        assert_eq!(app.zen_mode, shelbi_state::ZenModeState::On);
+
+        std::env::remove_var("SHELBI_HOME");
     }
 }

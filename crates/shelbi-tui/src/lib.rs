@@ -26,9 +26,11 @@ use ratatui::{backend::CrosstermBackend, Terminal};
 mod activity;
 mod app;
 mod kanban;
+mod keymap;
 mod poller;
 mod review;
 mod sidebar;
+mod zen_probe;
 
 #[cfg(test)]
 pub(crate) mod test_support {
@@ -96,6 +98,13 @@ pub fn run_sidebar(project_name: &str) -> Result<()> {
     let mut term = setup_terminal().context("setting up terminal")?;
     let mut app = App::new_sidebar(project_name);
     app.refresh().ok();
+
+    // First-run probe: on fresh installs (no ~/.shelbi/config.yaml),
+    // verify Alt+Z is delivered and let the user pick a fallback if not.
+    // Best-effort: an error here defaults to Alt+Z so the sidebar still
+    // launches with a working binding on cooperative terminals.
+    app.zen_toggle_chord = zen_probe::ensure_zen_keymap(&mut term)
+        .unwrap_or(shelbi_state::ZenToggleChord::AltZ);
 
     // Background poll loop: per-worker `tmux display-message` every
     // `worker_poll_interval_secs`, parses the `shelbi:<state>` marker,
@@ -388,6 +397,15 @@ fn handle_popover_key(app: &mut KanbanApp, code: KeyCode) {
 fn handle_key(app: &mut App, code: KeyCode, mods: KeyModifiers) {
     if mods.contains(KeyModifiers::CONTROL) && matches!(code, KeyCode::Char('c')) {
         app.should_quit = true;
+        return;
+    }
+    // Zen-toggle chord runs before any other binding so a remap to (say)
+    // Ctrl+G can't be eaten by a future `g` nav key. The sidebar has no
+    // modal overlays of its own — the palette is a tmux popup, which
+    // pre-empts our input entirely — so there's no "modal swallow" branch
+    // to check here.
+    if crate::keymap::matches_zen_toggle(code, mods, app.zen_toggle_chord) {
+        app.toggle_zen_mode();
         return;
     }
     match code {

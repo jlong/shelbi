@@ -15,11 +15,15 @@ use serde::{Deserialize, Serialize};
 use shelbi_core::{Agent, Column, Project, Result, Session, Task};
 
 mod hub_config;
+mod user_config;
 mod worker_status;
 
 pub use hub_config::{
     hub_config_path, list_projects, load_hub_config, save_hub_config, touch_project_launched,
     HubConfig, ProjectMeta, ProjectSummary,
+};
+pub use user_config::{
+    load_user_config, save_user_config, user_config_path, Keymap, UserConfig, ZenToggleChord,
 };
 pub use worker_status::{
     append_dispatch_event, append_project_event, append_task_event, append_worker_event,
