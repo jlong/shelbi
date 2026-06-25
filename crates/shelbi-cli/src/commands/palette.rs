@@ -18,7 +18,7 @@ use ratatui::{
     layout::{Constraint, Direction, Layout},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{List, ListItem, ListState, Paragraph},
+    widgets::{List, ListItem, ListState, Paragraph, Wrap},
     Frame, Terminal,
 };
 use shelbi_palette::{Entry, EntryKind};
@@ -31,22 +31,31 @@ pub fn run(project: String) -> Result<()> {
 
     let chosen = picker_loop(&mut term, &mut state);
 
-    // "Switch project" stays inside the same alt-screen so the second
-    // picker is just a re-render — restoring the terminal first would
-    // flash the popup back to its host pane mid-flow.
+    // "Switch project" and "Quit Shelbi" both stay inside the same
+    // alt-screen so the follow-up screen is just a re-render —
+    // restoring the terminal first would flash the popup back to its
+    // host pane mid-flow.
     let switch_target = match &chosen {
         Ok(Some(entry)) if entry.id == "action:switch-project" => {
             run_project_picker(&mut term, &project)?
         }
         _ => None,
     };
+    let quit_shelbi_confirmed = match &chosen {
+        Ok(Some(entry)) if entry.id == "action:quit-shelbi" => {
+            run_quit_shelbi_confirm(&mut term)?
+        }
+        _ => false,
+    };
 
     restore_terminal(&mut term)?;
 
     if let Some(target) = switch_target {
         switch_to_project(&target)?;
+    } else if quit_shelbi_confirmed {
+        super::quit_shelbi::run()?;
     } else if let Ok(Some(entry)) = chosen {
-        if entry.id != "action:switch-project" {
+        if entry.id != "action:switch-project" && entry.id != "action:quit-shelbi" {
             dispatch(&project, &entry)?;
         }
     }
@@ -287,6 +296,20 @@ fn build_entries(app: &App, zen_mode: ZenModeState, zen_chord: ZenToggleChord) -
         kind: EntryKind::Action,
         subtitle: Some(
             "close every pane (workers + stash + main) and switch to the next project".into(),
+        ),
+        shortcut: None,
+        decoration: None,
+    });
+    // Most-destructive action lands last so fuzzy search doesn't
+    // surface it ahead of the per-project quit, and so users who
+    // scroll the list bottom-up have to step over the project-level
+    // option before they hit the global one.
+    out.push(Entry {
+        id: "action:quit-shelbi".into(),
+        label: "Quit Shelbi".into(),
+        kind: EntryKind::Action,
+        subtitle: Some(
+            "close every Shelbi session on this host (all projects + workers + stash)".into(),
         ),
         shortcut: None,
         decoration: None,
@@ -629,6 +652,146 @@ fn render_project_picker(
     f.render_widget(footer, layout[3]);
 }
 
+// ---------------------------------------------------------------------------
+// "Quit Shelbi" confirmation popover
+//
+// A second ratatui screen sharing the palette's alt-screen, same
+// pattern as `run_project_picker`. Lists every project shelbi is
+// currently managing (live `shelbi-<name>` tmux sessions) with a
+// count of each one's active worker panes so users see exactly what
+// they're about to tear down. Cancel is default focus — the popover
+// is a guard against accidental confirmation, so the safe button is
+// the one Enter activates by default.
+
+fn run_quit_shelbi_confirm<B: ratatui::backend::Backend>(
+    term: &mut Terminal<B>,
+) -> Result<bool> {
+    let projects = super::quit_shelbi::list_managed_projects();
+    let mut focus_quit = false;
+
+    loop {
+        term.draw(|f| render_quit_shelbi_confirm(f, &projects, focus_quit))?;
+
+        if event::poll(Duration::from_millis(150))? {
+            if let Event::Key(k) = event::read()? {
+                if k.kind != KeyEventKind::Press {
+                    continue;
+                }
+                // Mirror the main palette: Ctrl+C / Ctrl+P close the
+                // popover without firing the destructive path.
+                if k.modifiers.contains(KeyModifiers::CONTROL)
+                    && matches!(k.code, KeyCode::Char('c') | KeyCode::Char('p'))
+                {
+                    return Ok(false);
+                }
+                match k.code {
+                    KeyCode::Esc => return Ok(false),
+                    KeyCode::Enter => return Ok(focus_quit),
+                    KeyCode::Left
+                    | KeyCode::Right
+                    | KeyCode::Tab
+                    | KeyCode::BackTab => {
+                        focus_quit = !focus_quit;
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+}
+
+fn render_quit_shelbi_confirm(
+    f: &mut Frame,
+    projects: &[super::quit_shelbi::ManagedProject],
+    focus_quit: bool,
+) {
+    let area = f.area();
+    let layout = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(1), // title
+            Constraint::Length(1), // blank
+            Constraint::Length(4), // warning body (wraps)
+            Constraint::Length(1), // blank
+            Constraint::Min(1),    // project list
+            Constraint::Length(1), // blank
+            Constraint::Length(1), // buttons
+            Constraint::Length(1), // footer
+        ])
+        .split(area);
+
+    let title = Paragraph::new(Line::from(Span::styled(
+        "Quit Shelbi?",
+        Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+    )));
+    f.render_widget(title, layout[0]);
+
+    let body = Paragraph::new(
+        "This will close all open Shelbi sessions across every project, including any \
+         active workers. In-flight task changes will remain in worker worktrees but \
+         won't be merged.",
+    )
+    .style(Style::default().fg(Color::Gray))
+    .wrap(Wrap { trim: true });
+    f.render_widget(body, layout[2]);
+
+    let items: Vec<ListItem> = projects
+        .iter()
+        .map(|p| {
+            let count_text = format_active_workers(p.active_workers);
+            ListItem::new(Line::from(vec![
+                Span::raw(format!("  {:<22}  ", p.name)),
+                Span::styled(count_text, Style::default().fg(Color::DarkGray)),
+            ]))
+        })
+        .collect();
+    let list = List::new(items);
+    f.render_widget(list, layout[4]);
+
+    // Destructive button gets the red tint when focused; the cancel
+    // button gets the standard blue highlight. Unfocused buttons
+    // render dim so the focused option is unambiguous at a glance.
+    let cancel_style = if focus_quit {
+        Style::default().fg(Color::DarkGray)
+    } else {
+        Style::default()
+            .bg(Color::Blue)
+            .fg(Color::White)
+            .add_modifier(Modifier::BOLD)
+    };
+    let quit_style = if focus_quit {
+        Style::default()
+            .bg(Color::Red)
+            .fg(Color::White)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(Color::DarkGray)
+    };
+    let buttons = Paragraph::new(Line::from(vec![
+        Span::styled("  [ Cancel ]  ", cancel_style),
+        Span::raw("  "),
+        Span::styled("  [ Quit Shelbi ]  ", quit_style),
+    ]));
+    f.render_widget(buttons, layout[6]);
+
+    let footer = Paragraph::new(Line::from(vec![Span::styled(
+        "←→/Tab switch · Enter activate · Esc cancel",
+        Style::default().fg(Color::DarkGray),
+    )]));
+    f.render_widget(footer, layout[7]);
+}
+
+/// Per-project worker-count suffix shown in the confirm popover.
+/// Singular/plural distinction kept so `1 active worker` reads
+/// naturally — matches how `picker.rs` formats machine/worker counts.
+fn format_active_workers(n: usize) -> String {
+    match n {
+        0 => "(no active workers)".to_string(),
+        1 => "(1 active worker)".to_string(),
+        n => format!("({n} active workers)"),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -691,8 +854,29 @@ mod tests {
                 "action:toggle-zen",
                 "action:switch-project",
                 "action:quit-project",
+                "action:quit-shelbi",
             ]
         );
+    }
+
+    #[test]
+    fn format_active_workers_handles_zero_one_and_many() {
+        assert_eq!(format_active_workers(0), "(no active workers)");
+        assert_eq!(format_active_workers(1), "(1 active worker)");
+        assert_eq!(format_active_workers(2), "(2 active workers)");
+        assert_eq!(format_active_workers(11), "(11 active workers)");
+    }
+
+    #[test]
+    fn quit_shelbi_is_the_absolute_last_entry_in_the_palette() {
+        // Destructive global action — fuzzy search shouldn't surface
+        // it ahead of per-project quit, and a user scrolling bottom-up
+        // should have to step over the project-level option before
+        // hitting the host-wide one. Pinned because the dispatch
+        // assumes this exact id and a rename would silently break it.
+        let app = App::new_sidebar("demo");
+        let entries = build_entries(&app, ZenModeState::Off, ZenToggleChord::AltZ);
+        assert_eq!(entries.last().map(|e| e.id.as_str()), Some("action:quit-shelbi"));
     }
 
     #[test]
@@ -723,7 +907,12 @@ mod tests {
         // and the renderer falls back to the dim `EntryKind::icon()`.
         let app = App::new_sidebar("demo");
         let entries = build_entries(&app, ZenModeState::Off, ZenToggleChord::AltZ);
-        for id in ["action:toggle-zen", "action:switch-project", "action:quit-project"] {
+        for id in [
+            "action:toggle-zen",
+            "action:switch-project",
+            "action:quit-project",
+            "action:quit-shelbi",
+        ] {
             let e = entries
                 .iter()
                 .find(|e| e.id == id)
