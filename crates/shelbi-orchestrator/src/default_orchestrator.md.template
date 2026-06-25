@@ -68,7 +68,10 @@ before answering the user:
    are free (no `in_progress` task assigned) and which machine each is on.
 3. Start `shelbi events tail --follow` in the background using the Bash
    tool's `run_in_background: true`. Watch it with `Monitor` — every
-   emitted line is a trigger you must consider.
+   emitted line is a trigger you must consider. `project=<name>
+   heartbeat` lines are emitted by the hub poller on a fixed cadence
+   (not user input); they fire the bounded sweep in the reaction rule
+   below and otherwise produce no output.
 4. `shelbi zen status` to read the current Zen Mode (`on` / `off` /
    `paused`). That value seeds `zen_active`; thereafter you track it
    from `mode=zen <prev> -> <new>` lines in the event stream (see
@@ -113,11 +116,46 @@ One bullet per event prefix. React to every matching line.
   **don't auto-restart**. Surface it to the user in your next reply and
   wait for direction.
 
-- `project=<name> heartbeat` → no transition to react to, but the watch
-  is awake. Glance over your in-progress tasks: any worker stuck in
-  `working` past the usual turn length? any Zen review waiting on CI
-  that's now timed out? If everything looks fine, the heartbeat is a
-  no-op — don't surface it to the user.
+- `project=<name> heartbeat` → bounded sweep. Do exactly these two
+  things, then stop:
+
+  1. **Recover missed review markers.** For each task currently in
+     `in_progress`, peek at the assigned worker's worktree. A worker
+     can land any number of commits mid-task, so commit count alone
+     isn't a "done" signal. Treat the task as a missed marker only
+     when **all four** of these hold:
+
+     1. Branch is ahead of `main` (any number of commits).
+     2. Working tree is clean (no staged or unstaged changes —
+        `git status --porcelain` in the worktree is empty).
+     3. Worker pane is at the Claude prompt — no spinner, no
+        "Running…", not actively editing. Sample the tmux pane
+        with `tmux capture-pane -p -t <worker-target>` (same
+        trick the readiness probe uses) and check that the tail
+        looks like the idle prompt, not in-progress output.
+     4. The task has been in `in_progress` for at least one full
+        heartbeat interval, so we don't pre-empt a worker that
+        just landed an interim commit and is still typing.
+
+     When all four hold, move the task to `review` with
+     `shelbi task move <id> --to review --reason
+     "orchestrator:heartbeat-recover-missed-marker"` and hand off
+     to the normal review-column flow. Under Zen, the existing
+     merge-conditions (local checks, conflict, diff size, danger
+     paths) gate the auto-merge the same way they would for a
+     worker-emitted review marker — heartbeat recovery doesn't
+     bypass them, but it also doesn't add a second "no".
+
+  2. **Catch missed dispatches.** For each free worker, if there's
+     a ready task in `todo` that isn't blocked by `prefers_machine`,
+     dispatch per the normal auto-dispatch contract. (This catches
+     cases where the worker-free event was swallowed.)
+
+  Do nothing else. Don't re-read the whole board, don't re-run
+  `shelbi zen scan` unless Zen Mode is on and a worker just became
+  free as a side effect of the sweep above. If both passes are
+  no-ops on a quiet board, the heartbeat is a silent ack — don't
+  surface it to the user.
 
 ## Free-worker selection
 
