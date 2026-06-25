@@ -9,9 +9,10 @@ use ratatui::{
     widgets::{List, ListItem, ListState, Paragraph},
     Frame,
 };
+use shelbi_palette::DecorationColor;
 use shelbi_state::ZenModeState;
 
-use crate::app::{App, Row, WorkerBadge};
+use crate::app::{App, Row};
 
 pub fn render_full(f: &mut Frame, app: &mut App, area: Rect) {
     // Footer is always: [status?] keybinds, blank, zen-row. The zen row is
@@ -74,7 +75,8 @@ fn render_list(f: &mut Frame, app: &mut App, area: Rect) {
 
 fn render_row(row: &Row, selected: bool, width: usize) -> ListItem<'static> {
     match row {
-        Row::Nav { icon, label, .. } => {
+        Row::Nav { label, .. } => {
+            let dec = row.decoration().expect("nav rows always have a decoration");
             let style = if selected {
                 Style::default()
                     .fg(Color::White)
@@ -83,7 +85,7 @@ fn render_row(row: &Row, selected: bool, width: usize) -> ListItem<'static> {
                 Style::default().fg(Color::Gray)
             };
             ListItem::new(Line::from(vec![Span::styled(
-                format!("{icon} {label}"),
+                format!("{} {label}", dec.glyph),
                 style,
             )]))
         }
@@ -95,11 +97,12 @@ fn render_row(row: &Row, selected: bool, width: usize) -> ListItem<'static> {
             )]))
         }
         Row::Blank => ListItem::new(Line::raw("")),
-        Row::Worker { name, badge, .. } => {
+        Row::Worker { name, .. } => {
+            let dec = row.decoration().expect("worker rows always have a decoration");
             let mut spans = vec![
                 Span::styled(
-                    format!("{} ", badge.glyph()),
-                    Style::default().fg(worker_badge_color(*badge)),
+                    format!("{} ", dec.glyph),
+                    Style::default().fg(decoration_to_color(dec.color)),
                 ),
                 Span::styled(name.clone(), name_style(selected)),
             ];
@@ -113,11 +116,12 @@ fn render_row(row: &Row, selected: bool, width: usize) -> ListItem<'static> {
         }
         Row::Review { title, worker, .. } => {
             // Cyan ✓: the task is review-ready, awaiting human action.
-            // Mirrors the WorkerBadge::ReviewReady glyph so the worker
-            // and its review row share a vocabulary.
+            // Same decoration the palette uses, so worker / review / palette
+            // row share one visual vocabulary.
+            let dec = row.decoration().expect("review rows always have a decoration");
             let badge = Span::styled(
-                "✓ ".to_string(),
-                Style::default().fg(Color::Cyan),
+                format!("{} ", dec.glyph),
+                Style::default().fg(decoration_to_color(dec.color)),
             );
             let title_span = Span::styled(title.clone(), name_style(selected));
             let worker_label = worker.clone().unwrap_or_default();
@@ -132,12 +136,14 @@ fn render_row(row: &Row, selected: bool, width: usize) -> ListItem<'static> {
         Row::LegacyAgent {
             id,
             machine,
-            status,
             ..
         } => {
+            let dec = row
+                .decoration()
+                .expect("legacy-agent rows always have a decoration");
             let badge = Span::styled(
-                format!("{} ", status.glyph()),
-                Style::default().fg(status_color(*status)),
+                format!("{} ", dec.glyph),
+                Style::default().fg(decoration_to_color(dec.color)),
             );
             let id_span = Span::styled(id.clone(), name_style(selected));
             let line = right_align(
@@ -299,25 +305,19 @@ fn render_zen_row(f: &mut Frame, area: Rect, app: &App) {
     );
 }
 
-fn status_color(s: shelbi_core::Status) -> Color {
-    use shelbi_core::Status::*;
-    match s {
-        Running => Color::Green,
-        Waiting => Color::Yellow,
-        Queued => Color::Blue,
-        Done => Color::Cyan,
-        Error => Color::Red,
-        Archived => Color::DarkGray,
-    }
-}
-
-fn worker_badge_color(b: WorkerBadge) -> Color {
-    match b {
-        WorkerBadge::Working => Color::Green,
-        WorkerBadge::AwaitingInput => Color::Yellow,
-        WorkerBadge::AwaitingPermission => Color::Red,
-        WorkerBadge::ReviewReady => Color::Cyan,
-        WorkerBadge::Idle => Color::DarkGray,
+/// Map the palette's ratatui-free [`DecorationColor`] to a ratatui
+/// [`Color`]. Single conversion point so the sidebar and the palette
+/// agree on what each decoration tint looks like on screen.
+pub fn decoration_to_color(c: DecorationColor) -> Color {
+    match c {
+        DecorationColor::Default => Color::Reset,
+        DecorationColor::Gray => Color::Gray,
+        DecorationColor::DarkGray => Color::DarkGray,
+        DecorationColor::Green => Color::Green,
+        DecorationColor::Yellow => Color::Yellow,
+        DecorationColor::Red => Color::Red,
+        DecorationColor::Cyan => Color::Cyan,
+        DecorationColor::Blue => Color::Blue,
     }
 }
 

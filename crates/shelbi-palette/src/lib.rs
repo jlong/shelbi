@@ -18,6 +18,38 @@ pub struct Entry {
     /// hotkey-equivalent for entries that can also be reached without
     /// the palette, so users learn the chord by spotting it in the row.
     pub shortcut: Option<String>,
+    /// Optional per-entry icon override + color. Set for entries that
+    /// mirror a sidebar row (Chat/Tasks/Activity, workers, review-ready
+    /// tasks, legacy agents) so the palette shows the same glyph and
+    /// status tint the sidebar does. `None` falls back to the dim
+    /// `EntryKind::icon()` used for entries without a sidebar twin.
+    pub decoration: Option<Decoration>,
+}
+
+/// Icon + color attached to an [`Entry`]. Mirrors what the sidebar
+/// renders next to the matching row — the palette receives this
+/// pre-computed so the two surfaces can't drift on glyph or tint.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Decoration {
+    pub glyph: String,
+    pub color: DecorationColor,
+}
+
+/// Palette-side color enum. Kept ratatui-free so `shelbi-palette` stays
+/// a pure-data crate; the renderer maps these to its terminal colors.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum DecorationColor {
+    /// No explicit foreground — let the glyph render in its own color
+    /// (used for emoji icons like 💬 / 📋 / ⚡).
+    #[default]
+    Default,
+    Gray,
+    DarkGray,
+    Green,
+    Yellow,
+    Red,
+    Cyan,
+    Blue,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -74,6 +106,7 @@ mod tests {
                 kind: EntryKind::View,
                 subtitle: None,
                 shortcut: None,
+                decoration: None,
             },
             Entry {
                 id: "agent:fix-login-bug".into(),
@@ -81,6 +114,7 @@ mod tests {
                 kind: EntryKind::Agent,
                 subtitle: Some("m2 · running".into()),
                 shortcut: None,
+                decoration: None,
             },
             Entry {
                 id: "action:new-task".into(),
@@ -88,6 +122,7 @@ mod tests {
                 kind: EntryKind::Action,
                 subtitle: None,
                 shortcut: None,
+                decoration: None,
             },
         ]
     }

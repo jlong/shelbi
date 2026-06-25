@@ -43,10 +43,11 @@ pub(crate) mod test_support {
 }
 
 pub use activity::ActivityApp;
-pub use app::{App, View};
+pub use app::{App, Row, View, WorkerBadge, WorkerOverview};
 pub use kanban::KanbanApp;
 pub use poller::WorkerPoller;
 pub use review::ReviewApp;
+pub use sidebar::decoration_to_color;
 
 /// Set up the project's tmux session and attach to it. If we're already
 /// inside a tmux client, use `switch-client` instead of `attach` (tmux

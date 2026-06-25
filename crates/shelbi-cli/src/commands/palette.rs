@@ -21,11 +21,9 @@ use ratatui::{
     widgets::{List, ListItem, ListState, Paragraph},
     Frame, Terminal,
 };
-use shelbi_core::{Agent, Column, Status};
 use shelbi_palette::{Entry, EntryKind};
-use shelbi_state::{
-    load_user_config, read_state, ProjectSummary, TaskFile, ZenModeState, ZenToggleChord,
-};
+use shelbi_state::{load_user_config, ProjectSummary, ZenModeState, ZenToggleChord};
+use shelbi_tui::{decoration_to_color, App, Row, View, WorkerOverview};
 
 pub fn run(project: String) -> Result<()> {
     let mut term = setup_terminal()?;
@@ -64,19 +62,20 @@ struct State {
 
 impl State {
     fn new(project: &str) -> Result<Self> {
-        let workers = load_workers(project).unwrap_or_default();
-        let review_queue = load_review_queue(project);
-        let agents = load_agents(project).unwrap_or_default();
-        // Best-effort reads — a missing state.json or config.yaml is
-        // normal on a fresh install, and the palette should still open
-        // with sensible defaults rather than refusing to render.
-        let zen_mode = read_state(project)
-            .map(|s| s.zen_mode)
-            .unwrap_or(ZenModeState::Off);
+        // Lean on the sidebar's `App` for the row list — same icons,
+        // same status decorations, same data source. Anything that
+        // changes how the sidebar paints a destination automatically
+        // shows up in the palette on the next open.
+        let mut app = App::new_sidebar(project);
+        app.refresh().ok();
+        // The chord lives in user config (loaded by the sidebar via its
+        // first-run probe, not by `App::refresh`), so the palette has
+        // to read it separately. Defaults to Alt+Z on missing config —
+        // same fallback the probe uses on cooperative terminals.
         let chord = load_user_config()
             .map(|c| c.keymap.zen_toggle)
             .unwrap_or(ZenToggleChord::AltZ);
-        let all_entries = build_entries(&workers, &review_queue, &agents, zen_mode, chord);
+        let all_entries = build_entries(&app, app.zen_mode, chord);
         Ok(Self {
             query: String::new(),
             selected: 0,
@@ -192,11 +191,15 @@ fn render(f: &mut Frame, state: &State, results: &[(Entry, u16)]) {
     let items: Vec<ListItem> = results
         .iter()
         .map(|(e, _)| {
-            let prefix = format!(" {} ", e.kind.icon());
+            let (glyph, glyph_color) = match &e.decoration {
+                Some(d) => (d.glyph.as_str(), decoration_to_color(d.color)),
+                None => (e.kind.icon(), Color::DarkGray),
+            };
+            let prefix = format!(" {glyph} ");
             let label = format!("{:<22}", e.label);
             let mut content_width = prefix.chars().count() + label.chars().count();
             let mut spans = vec![
-                Span::styled(prefix, Style::default().fg(Color::DarkGray)),
+                Span::styled(prefix, Style::default().fg(glyph_color)),
                 Span::raw(label),
             ];
             if let Some(sub) = &e.subtitle {
@@ -251,71 +254,24 @@ fn render(f: &mut Frame, state: &State, results: &[(Entry, u16)]) {
 // Order mirrors `App::rows()` in shelbi-tui: Chat, Tasks, Activity,
 // then workers, then review-ready tasks, then legacy spawned agents,
 // then the two global actions. An empty-query palette should read
-// top-to-bottom like the sidebar.
+// top-to-bottom like the sidebar. We literally walk `app.rows()` to
+// build the entry list so the palette inherits whatever icons and
+// status decorations the sidebar paints — no parallel lookup to drift.
 
-fn build_entries(
-    workers: &[WorkerEntry],
-    review_queue: &[TaskFile],
-    agents: &[Agent],
-    zen_mode: ZenModeState,
-    zen_chord: ZenToggleChord,
-) -> Vec<Entry> {
-    let mut out = vec![
-        Entry {
-            id: "view:orch".into(),
-            label: "Chat".into(),
-            kind: EntryKind::View,
-            subtitle: Some("the claude pane you talk to".into()),
-            shortcut: None,
-        },
-        Entry {
-            id: "view:tasks".into(),
-            label: "Tasks".into(),
-            kind: EntryKind::View,
-            subtitle: Some("live `shelbi list`".into()),
-            shortcut: None,
-        },
-        Entry {
-            id: "view:activity".into(),
-            label: "Activity".into(),
-            kind: EntryKind::View,
-            subtitle: Some("human-readable events feed".into()),
-            shortcut: None,
-        },
-        // View/mode toggles live in the same top block as the nav
-        // entries so users discover Zen Mode where they already look
-        // for the dashboard.
-        zen_toggle_entry(zen_mode, zen_chord),
-    ];
-    for w in workers {
-        out.push(Entry {
-            id: format!("worker:{}", w.name),
-            label: w.name.clone(),
-            kind: EntryKind::Agent,
-            subtitle: Some(format!("worker · {}", w.machine)),
-            shortcut: None,
-        });
-    }
-    for tf in review_queue {
-        out.push(Entry {
-            id: format!("review:{}", tf.task.id),
-            label: tf.task.title.clone(),
-            kind: EntryKind::Action,
-            subtitle: Some(match tf.task.assigned_to.as_deref() {
-                Some(w) => format!("review · {w}"),
-                None => "review".into(),
-            }),
-            shortcut: None,
-        });
-    }
-    for a in agents {
-        out.push(Entry {
-            id: format!("agent:{}", a.id),
-            label: a.id.clone(),
-            kind: EntryKind::Agent,
-            subtitle: Some(format!("{} · {:?}", a.machine, a.status)),
-            shortcut: None,
-        });
+fn build_entries(app: &App, zen_mode: ZenModeState, zen_chord: ZenToggleChord) -> Vec<Entry> {
+    let mut out: Vec<Entry> = Vec::new();
+    // First pass: every sidebar row becomes an entry with the row's
+    // own decoration attached. Section headers and blanks have no
+    // decoration and are skipped.
+    for row in app.rows() {
+        if let Some(entry) = entry_from_row(&row, &app.workers) {
+            out.push(entry);
+        }
+        // The Zen-Mode toggle sits inline with the top nav block so users
+        // discover it where they already look for the dashboard.
+        if matches!(&row, Row::Nav { view: View::Builtin("activity"), .. }) {
+            out.push(zen_toggle_entry(zen_mode, zen_chord));
+        }
     }
     out.push(Entry {
         id: "action:switch-project".into(),
@@ -323,6 +279,7 @@ fn build_entries(
         kind: EntryKind::Action,
         subtitle: Some("fuzzy-pick another project and swap the dashboard".into()),
         shortcut: None,
+        decoration: None,
     });
     out.push(Entry {
         id: "action:quit-project".into(),
@@ -332,8 +289,98 @@ fn build_entries(
             "close every pane (workers + stash + main) and switch to the next project".into(),
         ),
         shortcut: None,
+        decoration: None,
     });
     out
+}
+
+/// Translate one sidebar [`Row`] into a palette [`Entry`]. The row's
+/// `decoration()` is the source of truth for icon + status tint — this
+/// just copies it across and stitches a subtitle suited to the
+/// palette's wider layout. Returns `None` for section headers / blanks
+/// since they have no destination to activate.
+fn entry_from_row(row: &Row, workers: &[WorkerOverview]) -> Option<Entry> {
+    let decoration = row.decoration();
+    match row {
+        Row::Nav { label, view, .. } => {
+            let id = match view {
+                View::Builtin(name) => format!("view:{name}"),
+                _ => return None,
+            };
+            Some(Entry {
+                id,
+                label: label.to_string(),
+                kind: EntryKind::View,
+                subtitle: nav_subtitle(view),
+                shortcut: None,
+                decoration,
+            })
+        }
+        Row::Worker { name, view, .. } => {
+            let machine = workers
+                .iter()
+                .find(|w| w.name == *name)
+                .map(|w| w.machine.clone());
+            let id = match view {
+                View::Worker(_) => format!("worker:{name}"),
+                _ => format!("worker:{name}"),
+            };
+            Some(Entry {
+                id,
+                label: name.clone(),
+                kind: EntryKind::Agent,
+                subtitle: Some(match machine {
+                    Some(m) => format!("worker · {m}"),
+                    None => "worker".into(),
+                }),
+                shortcut: None,
+                decoration,
+            })
+        }
+        Row::Review { title, worker, view } => {
+            let id = match view {
+                View::ReviewTask(task_id) => format!("review:{task_id}"),
+                _ => return None,
+            };
+            Some(Entry {
+                id,
+                label: title.clone(),
+                kind: EntryKind::Action,
+                subtitle: Some(match worker.as_deref() {
+                    Some(w) => format!("review · {w}"),
+                    None => "review".into(),
+                }),
+                shortcut: None,
+                decoration,
+            })
+        }
+        Row::LegacyAgent {
+            id,
+            machine,
+            status,
+            ..
+        } => Some(Entry {
+            id: format!("agent:{id}"),
+            label: id.clone(),
+            kind: EntryKind::Agent,
+            subtitle: Some(format!("{machine} · {status:?}")),
+            shortcut: None,
+            decoration,
+        }),
+        Row::Section { .. } | Row::Blank => None,
+    }
+}
+
+/// Per-destination palette subtitle. Sidebar nav rows render label-only,
+/// so the subtitle is palette-specific copy that explains what each
+/// destination is for first-time users.
+fn nav_subtitle(view: &View) -> Option<String> {
+    match view {
+        View::Builtin("orch") => Some("the claude pane you talk to".into()),
+        View::Builtin("tasks") => Some("live `shelbi list`".into()),
+        View::Builtin("activity") => Some("human-readable events feed".into()),
+        _ => None,
+    }
 }
 
 /// Build the "Toggle Zen Mode" entry. Label flips with current state
@@ -359,6 +406,7 @@ fn zen_toggle_entry(current: ZenModeState, chord: ZenToggleChord) -> Entry {
         kind: EntryKind::Action,
         subtitle: Some(subtitle.into()),
         shortcut,
+        decoration: None,
     }
 }
 
@@ -406,74 +454,6 @@ where
         .status()
         .map(|s| s.success())
         .unwrap_or(false)
-}
-
-/// Minimal palette-side view of a declared worker — just what the entry
-/// list needs (name for the label, machine for the subtitle). Mirrors the
-/// sidebar's worker rows in shelbi-tui without dragging in `WorkerOverview`
-/// (which carries badge state the palette doesn't render).
-struct WorkerEntry {
-    name: String,
-    machine: String,
-}
-
-fn load_workers(project: &str) -> Result<Vec<WorkerEntry>> {
-    let p = shelbi_state::load_project(project).map_err(|e| anyhow::anyhow!(e))?;
-    let mut out = Vec::with_capacity(p.workers.len());
-    for worker in &p.workers {
-        // Silently skip mis-configured workers — same forgiveness the
-        // sidebar uses; surfacing them in the palette would just be noise.
-        if p.machine(&worker.machine).is_none() {
-            continue;
-        }
-        out.push(WorkerEntry {
-            name: worker.name.clone(),
-            machine: worker.machine.clone(),
-        });
-    }
-    Ok(out)
-}
-
-fn load_review_queue(project: &str) -> Vec<TaskFile> {
-    shelbi_state::list_column(project, Column::Review).unwrap_or_default()
-}
-
-fn load_agents(project: &str) -> Result<Vec<Agent>> {
-    let dir = match shelbi_state::agents_dir(project) {
-        Ok(d) => d,
-        Err(_) => return Ok(Vec::new()),
-    };
-    if !dir.exists() {
-        return Ok(Vec::new());
-    }
-    let mut out = Vec::new();
-    for entry in std::fs::read_dir(&dir)? {
-        let entry = entry?;
-        let path = entry.path();
-        let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
-            continue;
-        };
-        if name.ends_with(".log.md") || !name.ends_with(".md") {
-            continue;
-        }
-        let id = name.trim_end_matches(".md");
-        if let Ok(file) = shelbi_state::load_agent(project, id) {
-            out.push(file.agent);
-        }
-    }
-    out.sort_by_key(|a| status_order(a.status));
-    Ok(out)
-}
-
-fn status_order(s: Status) -> u8 {
-    match s {
-        Status::Running => 0,
-        Status::Waiting => 1,
-        Status::Queued => 2,
-        Status::Done => 3,
-        Status::Error => 4,
-        Status::Archived => 5,
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -693,8 +673,11 @@ mod tests {
 
     #[test]
     fn build_entries_places_zen_toggle_directly_after_view_block() {
-        let entries =
-            build_entries(&[], &[], &[], ZenModeState::Off, ZenToggleChord::AltZ);
+        // A fresh `App` (no `refresh`) carries empty worker / review / agent
+        // lists, so `rows()` is just the three nav entries — perfect for
+        // pinning the inline-actions order without touching the disk.
+        let app = App::new_sidebar("demo");
+        let entries = build_entries(&app, ZenModeState::Off, ZenToggleChord::AltZ);
         let ids: Vec<&str> = entries.iter().map(|e| e.id.as_str()).collect();
         // View block first (Chat/Tasks/Activity), then the mode toggle,
         // then the global actions trail. Workers/reviews/agents are
@@ -710,6 +693,47 @@ mod tests {
                 "action:quit-project",
             ]
         );
+    }
+
+    #[test]
+    fn nav_entries_carry_the_sidebar_icon_as_their_decoration() {
+        // The palette must paint each sidebar destination with the same
+        // glyph the sidebar uses, sourced from `Row::decoration` so the
+        // two surfaces can't drift.
+        let app = App::new_sidebar("demo");
+        let entries = build_entries(&app, ZenModeState::Off, ZenToggleChord::AltZ);
+        let by_id = |id: &str| {
+            entries
+                .iter()
+                .find(|e| e.id == id)
+                .unwrap_or_else(|| panic!("missing entry {id}"))
+        };
+        assert_eq!(by_id("view:orch").decoration.as_ref().unwrap().glyph, "💬");
+        assert_eq!(by_id("view:tasks").decoration.as_ref().unwrap().glyph, "📋");
+        assert_eq!(
+            by_id("view:activity").decoration.as_ref().unwrap().glyph,
+            "⚡"
+        );
+    }
+
+    #[test]
+    fn global_actions_without_a_sidebar_twin_keep_their_default_icon() {
+        // The task scope explicitly excludes the global actions — they
+        // have no sidebar row to mirror, so their decoration stays None
+        // and the renderer falls back to the dim `EntryKind::icon()`.
+        let app = App::new_sidebar("demo");
+        let entries = build_entries(&app, ZenModeState::Off, ZenToggleChord::AltZ);
+        for id in ["action:toggle-zen", "action:switch-project", "action:quit-project"] {
+            let e = entries
+                .iter()
+                .find(|e| e.id == id)
+                .unwrap_or_else(|| panic!("missing entry {id}"));
+            assert!(
+                e.decoration.is_none(),
+                "{id} should fall back to the dim default icon, got {:?}",
+                e.decoration
+            );
+        }
     }
 }
 

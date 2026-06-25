@@ -3,6 +3,7 @@ use std::time::{Duration, Instant};
 use anyhow::Result;
 use ratatui::layout::Rect;
 use shelbi_core::{Agent, Column, Status};
+use shelbi_palette::{Decoration, DecorationColor};
 use shelbi_state::{
     load_worker_status, read_state, TaskFile, WorkerState, ZenModeState, ZenToggleChord,
 };
@@ -75,6 +76,47 @@ impl WorkerBadge {
             WorkerBadge::ReviewReady => "✓",
             WorkerBadge::Idle => "·",
         }
+    }
+
+    /// Color the glyph paints in. Shared by the sidebar render path and
+    /// the palette so a worker row gets the same tint in both surfaces.
+    pub fn decoration_color(self) -> DecorationColor {
+        match self {
+            WorkerBadge::Working => DecorationColor::Green,
+            WorkerBadge::AwaitingInput => DecorationColor::Yellow,
+            WorkerBadge::AwaitingPermission => DecorationColor::Red,
+            WorkerBadge::ReviewReady => DecorationColor::Cyan,
+            WorkerBadge::Idle => DecorationColor::DarkGray,
+        }
+    }
+
+    pub fn decoration(self) -> Decoration {
+        Decoration {
+            glyph: self.glyph().to_string(),
+            color: self.decoration_color(),
+        }
+    }
+}
+
+/// Color the legacy-agent status glyph paints in. Pairs with
+/// [`shelbi_core::Status::glyph`] to form a [`Decoration`]; sidebar and
+/// palette both consume this so a `Running` agent renders green in both.
+pub fn status_decoration_color(s: shelbi_core::Status) -> DecorationColor {
+    use shelbi_core::Status::*;
+    match s {
+        Running => DecorationColor::Green,
+        Waiting => DecorationColor::Yellow,
+        Queued => DecorationColor::Blue,
+        Done => DecorationColor::Cyan,
+        Error => DecorationColor::Red,
+        Archived => DecorationColor::DarkGray,
+    }
+}
+
+pub fn status_decoration(s: shelbi_core::Status) -> Decoration {
+    Decoration {
+        glyph: s.glyph().to_string(),
+        color: status_decoration_color(s),
     }
 }
 
@@ -387,6 +429,26 @@ impl Row {
             | Row::Worker { view, .. }
             | Row::Review { view, .. }
             | Row::LegacyAgent { view, .. } => Some(view),
+            Row::Section { .. } | Row::Blank => None,
+        }
+    }
+
+    /// The icon glyph + color the row paints in. Single source of truth
+    /// for both the sidebar renderer and the palette so the two surfaces
+    /// can't drift on what destination shows what mark. Section headers
+    /// and blank spacers have no decoration.
+    pub fn decoration(&self) -> Option<Decoration> {
+        match self {
+            Row::Nav { icon, .. } => Some(Decoration {
+                glyph: (*icon).to_string(),
+                color: DecorationColor::Default,
+            }),
+            Row::Worker { badge, .. } => Some(badge.decoration()),
+            Row::Review { .. } => Some(Decoration {
+                glyph: "✓".into(),
+                color: DecorationColor::Cyan,
+            }),
+            Row::LegacyAgent { status, .. } => Some(status_decoration(*status)),
             Row::Section { .. } | Row::Blank => None,
         }
     }
@@ -999,6 +1061,56 @@ mod tests {
                 b.glyph()
             );
         }
+    }
+
+    #[test]
+    fn row_decoration_centralizes_icon_and_status_for_every_kind() {
+        // `Row::decoration` is the single source of truth for the icon +
+        // status tint each sidebar row paints — the palette consumes the
+        // exact same value via `entry_from_row`, so anything that drifts
+        // here drifts in both surfaces at once (good) instead of leaving
+        // them silently misaligned (bad).
+        use shelbi_palette::DecorationColor;
+
+        let nav = Row::Nav {
+            icon: "💬",
+            label: "Chat",
+            view: View::Builtin("orch"),
+        };
+        let d = nav.decoration().unwrap();
+        assert_eq!(d.glyph, "💬");
+        assert_eq!(d.color, DecorationColor::Default);
+
+        let worker = Row::Worker {
+            name: "alpha".into(),
+            badge: WorkerBadge::AwaitingPermission,
+            view: View::Worker("alpha".into()),
+        };
+        let d = worker.decoration().unwrap();
+        assert_eq!(d.glyph, WorkerBadge::AwaitingPermission.glyph());
+        assert_eq!(d.color, DecorationColor::Red);
+
+        let review = Row::Review {
+            title: "Fix login".into(),
+            worker: Some("delta".into()),
+            view: View::ReviewTask("ready".into()),
+        };
+        let d = review.decoration().unwrap();
+        assert_eq!(d.glyph, "✓");
+        assert_eq!(d.color, DecorationColor::Cyan);
+
+        let agent = Row::LegacyAgent {
+            id: "spawn-1".into(),
+            machine: "hub".into(),
+            status: shelbi_core::Status::Running,
+            view: View::Agent("spawn-1".into()),
+        };
+        let d = agent.decoration().unwrap();
+        assert_eq!(d.glyph, shelbi_core::Status::Running.glyph());
+        assert_eq!(d.color, DecorationColor::Green);
+
+        assert!(Row::Section { label: "Agents".into() }.decoration().is_none());
+        assert!(Row::Blank.decoration().is_none());
     }
 
     #[test]
