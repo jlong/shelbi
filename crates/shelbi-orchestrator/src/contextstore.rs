@@ -203,7 +203,7 @@ fn rsync_argv(src: &str, dst: &str) -> Vec<String> {
         "rsync".to_string(),
         "-az".to_string(),
         "--rsh".to_string(),
-        "ssh -o ControlMaster=auto -o ControlPath=~/.ssh/shelbi-cm-%C -o ControlPersist=600"
+        "ssh -o ControlMaster=auto -o ControlPath=~/.ssh/shelbi-cm-%C -o ControlPersist=600 -o ConnectTimeout=5 -o BatchMode=yes"
             .to_string(),
         src.to_string(),
         dst.to_string(),

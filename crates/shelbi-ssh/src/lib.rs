@@ -23,6 +23,20 @@ use shelbi_core::Host;
 /// keeps the master alive for 10 minutes after the last client closes,
 /// which spans most idle gaps in a normal session.
 ///
+/// `ConnectTimeout=5` bounds the worst case when a worker host is dead
+/// or routed through a slow proxy — the poller spawns one thread per
+/// worker so a hung connect only freezes that worker's thread, but we
+/// still want it to fail fast and try again on the next poll instead of
+/// piling up an OS-level TCP retry sequence (minutes long, by default).
+///
+/// `BatchMode=yes` keeps ssh from blocking on an interactive password /
+/// passphrase prompt that no one will ever answer (we run from the
+/// sidebar's tmux pane, not a tty). Public-key + ssh-agent auth still
+/// works; only interactive fallbacks are suppressed. NB: this does NOT
+/// prevent Tailscale-SSH's web-auth interception — that flow runs
+/// outside the openssh client and ignores BatchMode. Hung Tailscale
+/// auths are bounded by the per-worker thread design instead.
+///
 /// Users with their own `ControlMaster` configuration in `~/.ssh/config`
 /// see our `-o` flags take precedence (command-line `-o` overrides config),
 /// which is the right call — we know our access pattern (many short
@@ -34,6 +48,10 @@ const SSH_CONTROL_OPTS: &[&str] = &[
     "ControlPath=~/.ssh/shelbi-cm-%C",
     "-o",
     "ControlPersist=600",
+    "-o",
+    "ConnectTimeout=5",
+    "-o",
+    "BatchMode=yes",
 ];
 
 fn apply_ssh_control_opts(cmd: &mut Command) {

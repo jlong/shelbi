@@ -225,6 +225,8 @@ mod tests {
                 if v.starts_with("ControlMaster=")
                     || v.starts_with("ControlPath=")
                     || v.starts_with("ControlPersist=")
+                    || v.starts_with("ConnectTimeout=")
+                    || v.starts_with("BatchMode=")
                 {
                     i += 2;
                     continue;

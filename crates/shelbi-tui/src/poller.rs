@@ -1,12 +1,24 @@
 //! Background worker-state poller. Lives in the sidebar process and is
 //! the only place the hub talks to worker panes for observability.
 //!
-//! Cadence: per-project `worker_poll_interval_secs` (default 5s). Each
-//! tick the poller iterates the project's declared workers, asks tmux
-//! for each pane's title (`display-message -p '#{pane_title}'`, routed
-//! over SSH for remote machines via shelbi-ssh — which sets up
-//! ControlMaster so the marginal cost per poll is a socket write, not a
-//! TCP handshake), and parses the trailing `shelbi:<state>` marker.
+//! Cadence: per-project `worker_poll_interval_secs` (default 5s). The
+//! poller spawns ONE thread per declared worker — each running its own
+//! independent poll loop — so a hung SSH call to one machine (unreachable
+//! host, expired Tailscale auth, ProxyJump timeout) only freezes that
+//! worker's thread, never the others. Earlier versions used a single
+//! sequential loop, which would block every local-worker poll behind a
+//! single stuck remote-worker SSH call and silently freeze the review
+//! marker handoff for hours at a time.
+//!
+//! Each cycle asks tmux for the worker pane's title
+//! (`display-message -p '#{pane_title}'`, routed over SSH for remote
+//! machines via shelbi-ssh — which sets up ControlMaster so the marginal
+//! cost per poll is a socket write, not a TCP handshake) and parses the
+//! trailing `shelbi:<state>` marker. The marker file at
+//! `<worktree>/.claude/shelbi-review-ready` is checked first, before any
+//! pane operation, so the review handoff isn't gated on a working pane
+//! title (Claude's own OSC writes often clobber the marker before the
+//! poller sees it).
 //!
 //! On a state change the poller writes two files:
 //! - `~/.shelbi/workers/<name>/status.yaml` — last observed state.
@@ -62,12 +74,17 @@ impl Drop for WorkerPoller {
     }
 }
 
+/// Supervisor: spawns one persistent poll thread per worker declared in
+/// the project YAML, then sleeps until shutdown. Each per-worker thread
+/// owns its own SSH/IO calls, so a hung remote worker only blocks its
+/// own thread — local workers keep polling on cadence.
+///
+/// We re-check the workers list every supervisor tick (5s) so that
+/// workers added to the YAML at runtime get a thread spawned without a
+/// hub restart. Removed workers' threads exit themselves when they
+/// can't find their name in the YAML anymore.
 fn run_poller_loop(project_name: String, shutdown: Arc<AtomicBool>) {
-    // In-memory mirror of each worker's last persisted state so we can
-    // detect transitions without hitting disk every tick. Seeded from
-    // status.yaml on first observation so a hub restart doesn't emit a
-    // bogus `none -> X` event for state we already recorded.
-    let mut last_known: HashMap<String, WorkerState> = HashMap::new();
+    let mut spawned: HashMap<String, JoinHandle<()>> = HashMap::new();
 
     loop {
         if shutdown.load(Ordering::SeqCst) {
@@ -77,20 +94,90 @@ fn run_poller_loop(project_name: String, shutdown: Arc<AtomicBool>) {
             Ok(p) => p,
             // YAML missing or malformed — back off and retry. Re-loading
             // every tick means the user can edit the project file and
-            // the poller picks up the change without a restart.
+            // new workers get threads spawned without a restart.
             Err(_) => {
                 sleep_interruptible(Duration::from_secs(5), &shutdown);
                 continue;
             }
         };
-        let interval = Duration::from_secs(project.worker_poll_interval_secs.max(1));
 
         for worker in &project.workers {
-            if shutdown.load(Ordering::SeqCst) {
-                return;
+            // Drop dead-thread handles so a panic in poll_one for this
+            // worker doesn't leave it un-respawned. (Per-worker threads
+            // shouldn't normally panic — poll_one swallows errors — but
+            // defense-in-depth.)
+            if spawned.get(&worker.name).is_some_and(|h| h.is_finished()) {
+                if let Some(h) = spawned.remove(&worker.name) {
+                    let _ = h.join();
+                }
             }
-            poll_one(&project, worker, &mut last_known);
+            if spawned.contains_key(&worker.name) {
+                continue;
+            }
+            let worker_name = worker.name.clone();
+            let project_name = project_name.clone();
+            let shutdown_clone = shutdown.clone();
+            let handle = thread::Builder::new()
+                .name(format!("shelbi-poller-{worker_name}"))
+                .spawn(move || run_worker_poll_loop(project_name, worker_name, shutdown_clone))
+                .ok();
+            if let Some(h) = handle {
+                spawned.insert(worker.name.clone(), h);
+            }
         }
+
+        // Supervisor cadence is fixed at 5s — independent of
+        // `worker_poll_interval_secs`, which governs each per-worker
+        // loop. Cheap (one YAML reload + map lookup per tick) and fast
+        // enough that a YAML edit gets new threads within ~5s.
+        sleep_interruptible(Duration::from_secs(5), &shutdown);
+    }
+
+    // Drain finished threads on shutdown. Threads stuck on a hung SSH
+    // call won't be joined here — they hold no resources we care about
+    // and the OS reaps them when the sidebar process exits.
+    for (_, h) in spawned.drain() {
+        if h.is_finished() {
+            let _ = h.join();
+        }
+    }
+}
+
+/// One worker's persistent poll loop. Drives [`poll_one`] every
+/// `worker_poll_interval_secs`, reloading the project YAML each cycle so
+/// the user can edit the worker list / interval without a hub restart.
+/// Exits cleanly when shutdown is requested OR the worker is removed
+/// from the YAML.
+fn run_worker_poll_loop(
+    project_name: String,
+    worker_name: String,
+    shutdown: Arc<AtomicBool>,
+) {
+    // Each worker thread keeps its own `last_known` so it doesn't need
+    // to share a Mutex with the supervisor or its peers. Seeded from
+    // status.yaml on first observation (handled inside `poll_one`).
+    let mut last_known: Option<WorkerState> = None;
+
+    loop {
+        if shutdown.load(Ordering::SeqCst) {
+            break;
+        }
+        let project = match shelbi_state::load_project(&project_name) {
+            Ok(p) => p,
+            Err(_) => {
+                sleep_interruptible(Duration::from_secs(5), &shutdown);
+                continue;
+            }
+        };
+        let Some(worker) = project.workers.iter().find(|w| w.name == worker_name) else {
+            // Worker removed from the project YAML — exit this thread.
+            // The supervisor will not respawn it because it's not in the
+            // workers list any more.
+            break;
+        };
+        let interval = Duration::from_secs(project.worker_poll_interval_secs.max(1));
+
+        poll_one(&project, worker, &mut last_known);
 
         sleep_interruptible(interval, &shutdown);
     }
@@ -99,7 +186,7 @@ fn run_poller_loop(project_name: String, shutdown: Arc<AtomicBool>) {
 fn poll_one(
     project: &Project,
     worker: &shelbi_core::WorkerSpec,
-    last_known: &mut HashMap<String, WorkerState>,
+    last_known: &mut Option<WorkerState>,
 ) {
     let Some(machine) = project.machine(&worker.machine) else {
         return;
@@ -134,7 +221,7 @@ fn poll_one(
     // Bootstrap previous state from disk on first sighting so a hub
     // restart doesn't emit a bogus `none -> X` event for state we've
     // already recorded.
-    let prior = match last_known.get(&worker.name).copied() {
+    let prior = match *last_known {
         Some(s) => Some(PriorState {
             state: s,
             last_transition: load_worker_status(&worker.name)
@@ -212,7 +299,7 @@ fn poll_one(
         }
     }
 
-    last_known.insert(worker.name.clone(), outcome.status.state);
+    *last_known = Some(outcome.status.state);
 }
 
 /// Check the worker's review-ready file marker and, if present, move its

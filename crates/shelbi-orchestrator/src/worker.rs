@@ -294,13 +294,13 @@ pub fn start_worker_on_task(spec: StartSpec<'_>) -> Result<TmuxAddr> {
     Ok(addr)
 }
 
-/// How long to wait for the `UserPromptSubmit` hook to flip the pane title
-/// after sending the initial prompt. Hook firing is a single printf, so a
-/// well-behaved submit lands almost immediately; this just covers the slow
-/// path (busy SSH, sluggish tmux server).
+/// How long to wait for proof the prompt got submitted (pane title flips
+/// to a `shelbi:*` marker OR the pane content shows claude is busy
+/// processing). Submit lands almost immediately when the hook fires; this
+/// just covers the slow path (busy SSH, sluggish tmux server).
 const PROMPT_SUBMIT_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
 
-/// How often to re-check the pane title while waiting for the submit signal.
+/// How often to re-check the pane while waiting for the submit signal.
 const PROMPT_SUBMIT_POLL: std::time::Duration = std::time::Duration::from_millis(200);
 
 /// Wait for the prompt-submitted signal; if it doesn't arrive, resend Enter
@@ -326,7 +326,7 @@ fn confirm_prompt_submitted(host: &Host, addr: &TmuxAddr, task_id: &str, worker:
         return;
     }
     eprintln!(
-        "shelbi: dispatched prompt to {} but no shelbi:* pane title appeared \
+        "shelbi: dispatched prompt to {} but no submission signal appeared \
          after a retry Enter — worker may be sitting on an unsubmitted prompt; \
          check the pane",
         addr.target(),
@@ -335,16 +335,33 @@ fn confirm_prompt_submitted(host: &Host, addr: &TmuxAddr, task_id: &str, worker:
         task_id,
         worker,
         "enter-stalled",
-        "no shelbi marker after retry",
+        "no submit signal after retry",
     ) {
         eprintln!("shelbi: failed to record dispatch stall in events.log: {e}");
     }
 }
 
-/// Poll the pane title until the `UserPromptSubmit` hook has fired (any
-/// `shelbi:*` marker is present), or `timeout` elapses. Capture failures
-/// during the poll are transient (the SSH socket can hiccup); we just
-/// ignore them and keep polling.
+/// Poll the worker's pane until we have proof the prompt got submitted, or
+/// `timeout` elapses. Capture failures during the poll are transient (the
+/// SSH socket can hiccup); we just ignore them and keep polling.
+///
+/// Two independent signals — either one is sufficient:
+///
+/// 1. **Pane title carries a `shelbi:*` marker.** The worker's
+///    `UserPromptSubmit` hook writes `shelbi:working` via OSC, so when the
+///    title shows that, Enter definitely landed. The catch is that
+///    Claude's own OSC 2 writes (it updates the title with a live
+///    activity summary as it works) typically clobber `shelbi:working`
+///    within tens of milliseconds — the marker is gone by the time our
+///    poll cycle reads it. So we can't rely on this as the only signal.
+///
+/// 2. **Pane content shows Claude is actively processing.** When the
+///    prompt has been submitted and claude is working, the pane renders a
+///    spinner line like `⏺ Brewed for 5s · …` or `· Booping… (10s · ↑ 2k
+///    tokens)` and an `esc to interrupt` footer — none of which appear in
+///    the empty-input / waiting-for-user state. This signal survives
+///    Claude's title overwrites because we read the pane *body*, not the
+///    title.
 fn wait_for_prompt_submitted(host: &Host, addr: &TmuxAddr, timeout: std::time::Duration) -> bool {
     let start = std::time::Instant::now();
     while start.elapsed() < timeout {
@@ -352,9 +369,46 @@ fn wait_for_prompt_submitted(host: &Host, addr: &TmuxAddr, timeout: std::time::D
         if shelbi_state::parse_pane_title_marker(&title).is_some() {
             return true;
         }
+        // Title-marker missed (probably clobbered by claude's own OSC).
+        // Fall back to the pane body — claude's busy spinner / "esc to
+        // interrupt" line is a much more durable signal that Enter landed.
+        let screen = shelbi_tmux::capture(host, addr).unwrap_or_default();
+        if claude_is_processing(&screen) {
+            return true;
+        }
         std::thread::sleep(PROMPT_SUBMIT_POLL);
     }
     false
+}
+
+/// True when the captured pane shows claude is actively processing a
+/// prompt — the prompt-submitted state, as distinct from an empty input
+/// box waiting for the user to type something.
+///
+/// Why these markers are the right ones: each appears ONLY after a
+/// prompt has been submitted and claude has started work, and NONE of
+/// them appear on the empty-input / ready-for-typing screen. So a match
+/// here is sufficient to conclude Enter landed. We avoid keying on the
+/// prompt body text (claude's history scrollback contains it in both
+/// "submitted" and "still in input" states, depending on how the pane
+/// wrapped) and avoid keying on the static input footer (`shift+tab to
+/// cycle`, `for shortcuts`) — those persist across both states.
+fn claude_is_processing(screen: &str) -> bool {
+    // Lowercase compare so "ESC to interrupt" / "esc to interrupt" both
+    // match — Claude's footer phrasing has drifted across versions.
+    // NB: do NOT add "esc to cancel" here — the trust-this-folder dialog
+    // uses that exact string, and we'd otherwise read the dialog as
+    // "prompt submitted" before the user has cleared it.
+    let lower = screen.to_ascii_lowercase();
+    const BUSY_MARKERS: &[&str] = &[
+        "esc to interrupt", // claude's "currently working" footer
+        "ctrl+c to stop",   // some older versions
+        // Claude's spinner line ends with `(<duration> · ↑ <n> tokens)` or
+        // `(<duration> · ↓ <n> tokens)` once tokens have streamed. Either
+        // direction is proof a prompt got submitted and claude is mid-turn.
+        "tokens)",
+    ];
+    BUSY_MARKERS.iter().any(|m| lower.contains(m))
 }
 
 /// The minimum claude version that understands `--permission-mode auto`.
@@ -886,6 +940,84 @@ mod tests {
         assert!(is_trust_dialog("DO YOU TRUST the files in this folder?"));
         // The live input box is not a trust dialog.
         assert!(!is_trust_dialog(INPUT_BOX_SCREEN));
+    }
+
+    // Captured from a worker pane that had just submitted its prompt and
+    // was mid-turn — used to pin the busy-state heuristic against
+    // claude's actual rendered output. The point of this whole helper is
+    // that nothing here mentions `shelbi:` anywhere: claude's own OSC 2
+    // writes have already clobbered the worker's `shelbi:working` title
+    // marker, so the pane-title probe would have missed this state.
+    const BUSY_SCREEN_SPINNER: &str = "\
+✻ Brewed for 1m 1s · 2 shells, 1 monitor still running
+
+· Booping… (7m 16s · ↑ 19.8k tokens)
+─────────────────────────────────────────────────────
+❯
+─────────────────────────────────────────────────────
+  Model: Opus 4.7 | Ctx Used: 17.0% | Cost: $4.69
+  ⏵⏵ auto mode on (shift+tab to cycle)";
+
+    const BUSY_SCREEN_ESC_FOOTER: &str = "\
+⏺ Update(crates/shelbi-orchestrator/src/review.rs)
+  ⎿  Added 1 line
+
+✳ Working on the fix...
+─────────────────────────────────────────────────────
+❯
+─────────────────────────────────────────────────────
+  esc to interrupt · ctrl+c twice to exit";
+
+    #[test]
+    fn claude_is_processing_detects_busy_pane_when_title_marker_lost() {
+        // Both fixtures are post-submit screens where claude is mid-turn.
+        // Neither has a `shelbi:` title marker (claude's own OSC 2 writes
+        // have already overwritten it), so the title-based probe alone
+        // would mis-fire `enter-stalled`. The content fallback catches
+        // both.
+        assert!(claude_is_processing(BUSY_SCREEN_SPINNER));
+        assert!(claude_is_processing(BUSY_SCREEN_ESC_FOOTER));
+    }
+
+    #[test]
+    fn claude_is_processing_does_not_fire_on_empty_input_or_trust_dialog() {
+        // The empty-input ready screen — what the pane looks like
+        // BEFORE the prompt is typed. Must not match, otherwise the
+        // probe declares success before we've even sent Enter.
+        assert!(!claude_is_processing(INPUT_BOX_SCREEN));
+        // Trust dialog before claude has accepted the first prompt —
+        // the prompt would've been typed INTO this dialog instead of an
+        // input box, and we want the probe to keep waiting (and the
+        // trust-dismiss path to dismiss it) rather than spuriously
+        // signal "submitted."
+        assert!(!claude_is_processing(TRUST_DIALOG_SCREEN));
+        assert!(!claude_is_processing(""));
+        assert!(!claude_is_processing("➜  bob git:(main) claude"));
+    }
+
+    #[test]
+    fn claude_is_processing_matches_case_insensitively() {
+        // Claude's footer text has rendered both "ESC to interrupt" and
+        // "esc to interrupt" across versions; we lower-case the screen
+        // before matching so neither slips through.
+        assert!(claude_is_processing("ESC to interrupt"));
+        // The token-counter parenthetical matches in either streaming
+        // direction (↑ user-prompt, ↓ tool-output).
+        assert!(claude_is_processing("(12s · ↑ 1.2k tokens)"));
+        assert!(claude_is_processing("(45s · ↓ 8k tokens)"));
+    }
+
+    #[test]
+    fn claude_is_processing_does_not_false_positive_on_trust_dialog_footer() {
+        // The trust-this-folder dialog footer reads "Enter to confirm ·
+        // Esc to cancel" — that "esc to" prefix is the same one claude
+        // uses in its busy footer ("esc to interrupt"). We deliberately
+        // do NOT include "esc to cancel" in the busy markers because
+        // the trust dialog must never read as "claude submitted my
+        // prompt and is working" — the prompt was typed INTO the
+        // dialog, not into claude's input. Pin that behavior so a
+        // future "be more inclusive" tweak can't quietly regress it.
+        assert!(!claude_is_processing("Enter to confirm · Esc to cancel"));
     }
 
     #[test]
