@@ -297,17 +297,23 @@ fn handle_activity_key(app: &mut ActivityApp, code: KeyCode) {
         KeyCode::Char('g') | KeyCode::Home => app.scroll_home(),
         KeyCode::Char('G') | KeyCode::End => app.scroll_end(),
         KeyCode::Char('r') => app.refresh(),
+        KeyCode::Char('a') => app.reset_filter(),
+        KeyCode::Char('z') => app.toggle_zen_filter(),
+        KeyCode::Char('w') => app.toggle_workers_filter(),
         _ => {}
     }
 }
 
-/// Mouse-wheel scrolls the feed; left-click is unused (the feed has
-/// no per-row actions). Scroll-up walks toward older events
-/// (positive scroll offset since newest sits at the top).
+/// Mouse-wheel scrolls the feed; left-click on the pill row toggles
+/// the matching filter. Scroll-up walks toward older events (positive
+/// scroll offset since newest sits at the top).
 fn handle_activity_mouse(app: &mut ActivityApp, mouse: MouseEvent) {
     match mouse.kind {
         MouseEventKind::ScrollUp => app.scroll_up(),
         MouseEventKind::ScrollDown => app.scroll_down(),
+        MouseEventKind::Down(MouseButton::Left) => {
+            app.click_pill(mouse.column, mouse.row);
+        }
         _ => {}
     }
 }

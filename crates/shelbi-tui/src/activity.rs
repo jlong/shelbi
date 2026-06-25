@@ -131,6 +131,65 @@ struct TaskMeta {
     mtime: Option<SystemTime>,
 }
 
+/// Active filter pills above the feed. Both flags off means "All" — the
+/// pill row's `All` chip lights up and every event is rendered. Toggling
+/// `zen` or `workers` switches to a multi-select union: any event that
+/// matches at least one active pill is shown.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ActivityFilter {
+    pub zen: bool,
+    pub workers: bool,
+}
+
+impl ActivityFilter {
+    /// `All` is implied — neither specific pill is active, so we show
+    /// every event regardless of kind.
+    pub fn is_all(&self) -> bool {
+        !self.zen && !self.workers
+    }
+
+    /// `true` when this event passes the active filter. With no specific
+    /// pill on, everything passes; otherwise the event must match at
+    /// least one active pill (union, not intersection).
+    pub fn matches(&self, ev: &Event) -> bool {
+        if self.is_all() {
+            return true;
+        }
+        if self.zen {
+            if let Event::Task { reason, .. } = ev {
+                if parse_zen_reason(reason).is_some() {
+                    return true;
+                }
+            }
+        }
+        if self.workers && matches!(ev, Event::Worker { .. }) {
+            return true;
+        }
+        false
+    }
+}
+
+/// One pill's hit-test record. Captured by [`render_pills`] each frame so
+/// the mouse handler can route a left-click on the pill row back to the
+/// correct toggle.
+#[derive(Debug, Clone, Copy)]
+struct PillHit {
+    kind: PillKind,
+    /// Cell row the pill paints into.
+    y: u16,
+    /// Inclusive left column of the pill's clickable label.
+    x0: u16,
+    /// Exclusive right column of the pill's clickable label.
+    x1: u16,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PillKind {
+    All,
+    Zen,
+    Workers,
+}
+
 /// State for the activity TUI.
 pub struct ActivityApp {
     pub project_name: String,
@@ -157,6 +216,13 @@ pub struct ActivityApp {
     /// Total number of lines `build_lines` produced this frame. Used
     /// to clamp scroll at the bottom.
     total_lines: u16,
+    /// Which pill row toggles are active. Lives on the app — and so for
+    /// the lifetime of the view — so the filter survives scrolling and
+    /// refreshes but resets when the view is closed and re-launched.
+    pub filter: ActivityFilter,
+    /// Hit-test records for the pill row, rewritten each frame by
+    /// [`render_pills`] and consumed by the mouse handler.
+    pill_hits: Vec<PillHit>,
 }
 
 impl ActivityApp {
@@ -173,6 +239,67 @@ impl ActivityApp {
             auto_scroll: true,
             viewport_h: 0,
             total_lines: 0,
+            filter: ActivityFilter::default(),
+            pill_hits: Vec::new(),
+        }
+    }
+
+    /// Toggle the Zen pill — flips between including-only-zen and not.
+    /// Snaps scroll back to the newest so the user's eye stays on the
+    /// freshly filtered head instead of a now-empty viewport.
+    pub fn toggle_zen_filter(&mut self) {
+        self.filter.zen = !self.filter.zen;
+        self.snap_to_top();
+    }
+
+    /// Toggle the Workers pill — same shape as [`Self::toggle_zen_filter`].
+    pub fn toggle_workers_filter(&mut self) {
+        self.filter.workers = !self.filter.workers;
+        self.snap_to_top();
+    }
+
+    /// Reset to the "All" pill state — both specific pills off. Bound to
+    /// `a` so the user has a single-keystroke escape back to the
+    /// unfiltered view regardless of what's currently active.
+    pub fn reset_filter(&mut self) {
+        self.filter = ActivityFilter::default();
+        self.snap_to_top();
+    }
+
+    fn snap_to_top(&mut self) {
+        self.scroll = 0;
+        self.auto_scroll = true;
+    }
+
+    /// Find the pill kind under the given click coordinates, if any.
+    /// Uses the hit-test records captured by the last `render_pills`
+    /// call — so a click outside the painted pill area returns `None`
+    /// and the caller leaves the filter alone.
+    fn pill_at(&self, col: u16, row: u16) -> Option<PillKind> {
+        self.pill_hits
+            .iter()
+            .find(|p| p.y == row && col >= p.x0 && col < p.x1)
+            .map(|p| p.kind)
+    }
+
+    /// Route a left-click on the pill row to the matching toggle.
+    /// Public so the input layer in [`crate::lib`] can call it without
+    /// reaching into the hit-test records directly.
+    pub fn click_pill(&mut self, col: u16, row: u16) -> bool {
+        match self.pill_at(col, row) {
+            Some(PillKind::All) => {
+                self.reset_filter();
+                true
+            }
+            Some(PillKind::Zen) => {
+                self.toggle_zen_filter();
+                true
+            }
+            Some(PillKind::Workers) => {
+                self.toggle_workers_filter();
+                true
+            }
+            None => false,
         }
     }
 
@@ -442,15 +569,18 @@ pub fn render_full(f: &mut Frame, app: &mut ActivityApp, area: Rect) {
         .direction(Direction::Vertical)
         .horizontal_margin(2)
         .constraints([
-            Constraint::Length(2), // title
+            Constraint::Length(1), // title
+            Constraint::Length(1), // pills
+            Constraint::Length(1), // spacer
             Constraint::Min(1),    // body
             Constraint::Length(1), // footer
         ])
         .split(area);
 
     render_title(f, app, outer[0]);
-    render_body(f, app, outer[1]);
-    render_footer(f, app, outer[2]);
+    render_pills(f, app, outer[1]);
+    render_body(f, app, outer[3]);
+    render_footer(f, app, outer[4]);
 }
 
 fn render_title(f: &mut Frame, app: &ActivityApp, area: Rect) {
@@ -464,7 +594,60 @@ fn render_title(f: &mut Frame, app: &ActivityApp, area: Rect) {
             Style::default().fg(Color::DarkGray),
         ),
     ]);
-    f.render_widget(Paragraph::new(vec![title, Line::raw("")]), area);
+    f.render_widget(Paragraph::new(title), area);
+}
+
+/// Paint the `All · Zen · Workers` pill row and record each pill's
+/// cell coordinates in `app.pill_hits` so the mouse handler can route
+/// clicks back to the right toggle. Active pills get a bold accent
+/// color; inactive ones sit muted so the eye picks out the live filters
+/// at a glance.
+fn render_pills(f: &mut Frame, app: &mut ActivityApp, area: Rect) {
+    app.pill_hits.clear();
+    if area.height == 0 {
+        return;
+    }
+
+    let pills = [
+        (PillKind::All, "All", app.filter.is_all(), Color::Cyan),
+        (PillKind::Zen, "Zen", app.filter.zen, ZEN_FG),
+        (
+            PillKind::Workers,
+            "Workers",
+            app.filter.workers,
+            Color::Magenta,
+        ),
+    ];
+
+    let inactive = Style::default().fg(Color::DarkGray);
+    let sep_style = Style::default().fg(Color::DarkGray);
+
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    let mut col: u16 = area.x;
+    for (i, (kind, label, active, accent)) in pills.iter().enumerate() {
+        if i > 0 {
+            let sep = "  ·  ";
+            spans.push(Span::styled(sep.to_string(), sep_style));
+            col = col.saturating_add(sep.chars().count() as u16);
+        }
+        let style = if *active {
+            Style::default().fg(*accent).add_modifier(Modifier::BOLD)
+        } else {
+            inactive
+        };
+        let label_owned = (*label).to_string();
+        let len = label_owned.chars().count() as u16;
+        spans.push(Span::styled(label_owned, style));
+        app.pill_hits.push(PillHit {
+            kind: *kind,
+            y: area.y,
+            x0: col,
+            x1: col.saturating_add(len),
+        });
+        col = col.saturating_add(len);
+    }
+
+    f.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
 fn render_body(f: &mut Frame, app: &mut ActivityApp, area: Rect) {
@@ -487,7 +670,7 @@ fn render_body(f: &mut Frame, app: &mut ActivityApp, area: Rect) {
 
 fn render_footer(f: &mut Frame, _app: &ActivityApp, area: Rect) {
     let footer = Paragraph::new(Line::from(Span::styled(
-        "j/k scroll · u/d page · g top · G bottom · r refresh",
+        "j/k scroll · u/d page · g top · G bottom · r refresh · a/z/w filter",
         Style::default().fg(Color::DarkGray),
     )));
     f.render_widget(footer, area);
@@ -510,10 +693,23 @@ fn build_lines(app: &mut ActivityApp, width: usize, now: DateTime<Utc>) -> Vec<L
     let yesterday_local = today_local.pred_opt();
     let mut last_day: Option<chrono::NaiveDate> = None;
 
-    // Newest indices first. Cloning the event out is cheap (small
-    // strings); it dodges a borrow conflict between iterating
-    // `app.events` and calling `app.task_meta` inside the loop body.
-    let order: Vec<usize> = (0..app.events.len()).rev().collect();
+    // Newest indices first, filtered to whatever the pill row says.
+    // Cloning the event out is cheap (small strings); it dodges a
+    // borrow conflict between iterating `app.events` and calling
+    // `app.task_meta` inside the loop body.
+    let filter = app.filter;
+    let order: Vec<usize> = (0..app.events.len())
+        .rev()
+        .filter(|&i| filter.matches(&app.events[i]))
+        .collect();
+
+    if order.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "no events match this filter",
+            Style::default().fg(Color::DarkGray),
+        )));
+        return lines;
+    }
 
     for idx in order {
         let ev = app.events[idx].clone();
@@ -1739,6 +1935,90 @@ mod tests {
                 line_text(l)
             );
         }
+    }
+
+    fn task_event(reason: &str) -> Event {
+        Event::Task {
+            ts: Utc.with_ymd_and_hms(2026, 6, 23, 12, 0, 0).unwrap(),
+            id: "demo-task".into(),
+            from: Column::Todo,
+            to: Column::InProgress,
+            reason: reason.into(),
+            raw: String::new(),
+        }
+    }
+
+    fn worker_event() -> Event {
+        Event::Worker {
+            ts: Utc.with_ymd_and_hms(2026, 6, 23, 12, 0, 0).unwrap(),
+            name: "alpha".into(),
+            prev: None,
+            new: WorkerState::Working,
+            raw: String::new(),
+        }
+    }
+
+    #[test]
+    fn activity_filter_all_matches_every_event() {
+        let f = ActivityFilter::default();
+        assert!(f.is_all());
+        assert!(f.matches(&task_event("user:cli:start")));
+        assert!(f.matches(&task_event("orchestrator:zen-promote category=4")));
+        assert!(f.matches(&worker_event()));
+    }
+
+    #[test]
+    fn activity_filter_zen_keeps_only_zen_task_events() {
+        let f = ActivityFilter {
+            zen: true,
+            workers: false,
+        };
+        assert!(f.matches(&task_event("orchestrator:zen-promote category=4")));
+        assert!(f.matches(&task_event("orchestrator:zen-merge sha=abc")));
+        assert!(f.matches(&task_event("zen:failed-checks cmd=\"cargo test\"")));
+        assert!(!f.matches(&task_event("user:cli:start")));
+        assert!(!f.matches(&worker_event()));
+    }
+
+    #[test]
+    fn activity_filter_workers_keeps_only_worker_events() {
+        let f = ActivityFilter {
+            zen: false,
+            workers: true,
+        };
+        assert!(f.matches(&worker_event()));
+        assert!(!f.matches(&task_event("user:cli:start")));
+        assert!(!f.matches(&task_event("orchestrator:zen-promote category=4")));
+    }
+
+    #[test]
+    fn activity_filter_pills_are_multiselect_union() {
+        let f = ActivityFilter {
+            zen: true,
+            workers: true,
+        };
+        assert!(f.matches(&task_event("orchestrator:zen-promote category=4")));
+        assert!(f.matches(&worker_event()));
+        // Regular user-action task still filtered out — neither pill matches it.
+        assert!(!f.matches(&task_event("user:cli:start")));
+    }
+
+    #[test]
+    fn toggle_filter_methods_flip_state_and_snap_to_top() {
+        let mut app = ActivityApp::new("demo");
+        app.scroll = 25;
+        app.auto_scroll = false;
+
+        app.toggle_zen_filter();
+        assert!(app.filter.zen);
+        assert_eq!(app.scroll, 0, "filter toggle should snap scroll to newest");
+        assert!(app.auto_scroll);
+
+        app.toggle_workers_filter();
+        assert!(app.filter.workers);
+
+        app.reset_filter();
+        assert!(app.filter.is_all(), "`a` resets both pills to off");
     }
 
     #[test]
