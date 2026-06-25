@@ -64,6 +64,20 @@ impl ZenToggleChord {
             ZenToggleChord::None => "(none)",
         }
     }
+
+    /// Compact unicode glyph form for tight shortcut columns (palette
+    /// hint, future menu hints). Empty string when the hotkey is
+    /// disabled — callers showing a shortcut column should skip the row
+    /// entirely in that case.
+    pub fn hint(self) -> &'static str {
+        match self {
+            ZenToggleChord::AltZ => "⌥Z",
+            ZenToggleChord::CtrlBackslash => "⌃\\",
+            ZenToggleChord::CtrlG => "⌃G",
+            ZenToggleChord::CtrlShiftZ => "⇧⌃Z",
+            ZenToggleChord::None => "",
+        }
+    }
 }
 
 /// Load the user config. Missing file → defaults; that's not an error
@@ -136,6 +150,15 @@ mod tests {
         let cfg = load_user_config().unwrap();
         assert_eq!(cfg.keymap.zen_toggle, ZenToggleChord::AltZ);
         std::env::remove_var("SHELBI_HOME");
+    }
+
+    #[test]
+    fn hint_renders_compact_glyph_per_chord_and_empty_for_none() {
+        assert_eq!(ZenToggleChord::AltZ.hint(), "⌥Z");
+        assert_eq!(ZenToggleChord::CtrlBackslash.hint(), "⌃\\");
+        assert_eq!(ZenToggleChord::CtrlG.hint(), "⌃G");
+        assert_eq!(ZenToggleChord::CtrlShiftZ.hint(), "⇧⌃Z");
+        assert_eq!(ZenToggleChord::None.hint(), "");
     }
 
     #[test]

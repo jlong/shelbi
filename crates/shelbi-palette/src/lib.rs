@@ -14,6 +14,10 @@ pub struct Entry {
     pub label: String,
     pub kind: EntryKind,
     pub subtitle: Option<String>,
+    /// Optional right-aligned hotkey hint (e.g. `⌥Z`). Surfaces the
+    /// hotkey-equivalent for entries that can also be reached without
+    /// the palette, so users learn the chord by spotting it in the row.
+    pub shortcut: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -69,18 +73,21 @@ mod tests {
                 label: "Chat".into(),
                 kind: EntryKind::View,
                 subtitle: None,
+                shortcut: None,
             },
             Entry {
                 id: "agent:fix-login-bug".into(),
                 label: "fix-login-bug".into(),
                 kind: EntryKind::Agent,
                 subtitle: Some("m2 · running".into()),
+                shortcut: None,
             },
             Entry {
                 id: "action:new-task".into(),
                 label: "New task".into(),
                 kind: EntryKind::Action,
                 subtitle: None,
+                shortcut: None,
             },
         ]
     }

@@ -4,8 +4,7 @@ use anyhow::Result;
 use ratatui::layout::Rect;
 use shelbi_core::{Agent, Column, Status};
 use shelbi_state::{
-    append_zen_mode_event, load_worker_status, read_state, write_state, TaskFile, WorkerState,
-    ZenModeState, ZenToggleChord,
+    load_worker_status, read_state, TaskFile, WorkerState, ZenModeState, ZenToggleChord,
 };
 
 /// What's currently highlighted in the sidebar — drives selection logic
@@ -313,35 +312,28 @@ impl App {
             .map_err(|e| anyhow::anyhow!(e))
     }
 
-    /// Flip `state.json::zen_mode` between On and Off, mirroring the
-    /// `shelbi zen on|off` CLI: write the new state, then best-effort
-    /// append a `mode=zen <prev> -> <new> reason=user:hotkey` line to
-    /// `~/.shelbi/events.log`. Paused collapses to On here because the
-    /// spec is a binary toggle — the CLI is still the path for Paused.
+    /// Flip `state.json::zen_mode` between On and Off via the shared
+    /// [`shelbi_state::toggle_zen_mode`] path — same read/write/log
+    /// dance as the palette's "Toggle Zen Mode" entry and the CLI's
+    /// `shelbi zen on|off`, just with `reason=user:hotkey` so the
+    /// activity feed can tell the chord apart from the palette
+    /// (`user:palette`) and the CLI (`user:cli`). Paused collapses to
+    /// On because this hotkey is intentionally a two-state hop.
     pub fn toggle_zen_mode(&mut self) {
-        let target = match self.zen_mode {
-            ZenModeState::On => ZenModeState::Off,
-            ZenModeState::Off | ZenModeState::Paused => ZenModeState::On,
-        };
-        let action = match target {
-            ZenModeState::On => "on",
-            ZenModeState::Off => "off",
-            ZenModeState::Paused => "pause",
-        };
-        let mut state = read_state(&self.project_name).unwrap_or_default();
-        let prev = state.zen_mode;
-        state.zen_mode = target;
-        if let Err(e) = write_state(&self.project_name, &state) {
-            self.status_line = format!("zen toggle failed: {e}");
-            return;
+        match shelbi_state::toggle_zen_mode(&self.project_name, "user:hotkey") {
+            Ok(target) => {
+                self.zen_mode = target;
+                let action = match target {
+                    ZenModeState::On => "on",
+                    ZenModeState::Off => "off",
+                    ZenModeState::Paused => "pause",
+                };
+                self.status_line = format!("zen {action}");
+            }
+            Err(e) => {
+                self.status_line = format!("zen toggle failed: {e}");
+            }
         }
-        // Best-effort: event-log write failures don't undo the toggle —
-        // the user flipped Zen and got what they asked for. Source tag
-        // `user:hotkey` distinguishes this path from the CLI (`user:cli`)
-        // and the future crash-recovery path (`system:crash-recovery`).
-        let _ = append_zen_mode_event(prev.as_str(), target.as_str(), "user:hotkey");
-        self.zen_mode = target;
-        self.status_line = format!("zen {action}");
     }
 }
 

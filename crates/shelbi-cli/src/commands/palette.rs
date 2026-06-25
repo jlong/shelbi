@@ -23,7 +23,9 @@ use ratatui::{
 };
 use shelbi_core::{Agent, Column, Status};
 use shelbi_palette::{Entry, EntryKind};
-use shelbi_state::{ProjectSummary, TaskFile};
+use shelbi_state::{
+    load_user_config, read_state, ProjectSummary, TaskFile, ZenModeState, ZenToggleChord,
+};
 
 pub fn run(project: String) -> Result<()> {
     let mut term = setup_terminal()?;
@@ -65,7 +67,16 @@ impl State {
         let workers = load_workers(project).unwrap_or_default();
         let review_queue = load_review_queue(project);
         let agents = load_agents(project).unwrap_or_default();
-        let all_entries = build_entries(&workers, &review_queue, &agents);
+        // Best-effort reads — a missing state.json or config.yaml is
+        // normal on a fresh install, and the palette should still open
+        // with sensible defaults rather than refusing to render.
+        let zen_mode = read_state(project)
+            .map(|s| s.zen_mode)
+            .unwrap_or(ZenModeState::Off);
+        let chord = load_user_config()
+            .map(|c| c.keymap.zen_toggle)
+            .unwrap_or(ZenToggleChord::AltZ);
+        let all_entries = build_entries(&workers, &review_queue, &agents, zen_mode, chord);
         Ok(Self {
             query: String::new(),
             selected: 0,
@@ -173,20 +184,40 @@ fn render(f: &mut Frame, state: &State, results: &[(Entry, u16)]) {
     ]);
     f.render_widget(Paragraph::new(vec![prompt, Line::raw("")]), layout[1]);
 
-    // Result list.
+    // Result list. List row width matches the list pane so we can pad
+    // out to the right edge and tuck the shortcut hint flush against
+    // it; falls back to no padding when the area is narrower than the
+    // content (the shortcut still appears, just not right-aligned).
+    let row_width = layout[2].width as usize;
     let items: Vec<ListItem> = results
         .iter()
         .map(|(e, _)| {
+            let prefix = format!(" {} ", e.kind.icon());
+            let label = format!("{:<22}", e.label);
+            let mut content_width = prefix.chars().count() + label.chars().count();
             let mut spans = vec![
-                Span::styled(
-                    format!(" {} ", e.kind.icon()),
-                    Style::default().fg(Color::DarkGray),
-                ),
-                Span::raw(format!("{:<22}", e.label)),
+                Span::styled(prefix, Style::default().fg(Color::DarkGray)),
+                Span::raw(label),
             ];
             if let Some(sub) = &e.subtitle {
+                let s = format!("  {sub}");
+                content_width += s.chars().count();
+                spans.push(Span::styled(s, Style::default().fg(Color::DarkGray)));
+            }
+            if let Some(short) = &e.shortcut {
+                let sw = short.chars().count();
+                // 1-col right margin keeps the glyph off the pane edge.
+                let pad = row_width
+                    .saturating_sub(content_width)
+                    .saturating_sub(sw)
+                    .saturating_sub(1);
+                if pad > 0 {
+                    spans.push(Span::raw(" ".repeat(pad)));
+                } else {
+                    spans.push(Span::raw("  "));
+                }
                 spans.push(Span::styled(
-                    format!("  {sub}"),
+                    short.clone(),
                     Style::default().fg(Color::DarkGray),
                 ));
             }
@@ -226,6 +257,8 @@ fn build_entries(
     workers: &[WorkerEntry],
     review_queue: &[TaskFile],
     agents: &[Agent],
+    zen_mode: ZenModeState,
+    zen_chord: ZenToggleChord,
 ) -> Vec<Entry> {
     let mut out = vec![
         Entry {
@@ -233,19 +266,26 @@ fn build_entries(
             label: "Chat".into(),
             kind: EntryKind::View,
             subtitle: Some("the claude pane you talk to".into()),
+            shortcut: None,
         },
         Entry {
             id: "view:tasks".into(),
             label: "Tasks".into(),
             kind: EntryKind::View,
             subtitle: Some("live `shelbi list`".into()),
+            shortcut: None,
         },
         Entry {
             id: "view:activity".into(),
             label: "Activity".into(),
             kind: EntryKind::View,
             subtitle: Some("human-readable events feed".into()),
+            shortcut: None,
         },
+        // View/mode toggles live in the same top block as the nav
+        // entries so users discover Zen Mode where they already look
+        // for the dashboard.
+        zen_toggle_entry(zen_mode, zen_chord),
     ];
     for w in workers {
         out.push(Entry {
@@ -253,6 +293,7 @@ fn build_entries(
             label: w.name.clone(),
             kind: EntryKind::Agent,
             subtitle: Some(format!("worker · {}", w.machine)),
+            shortcut: None,
         });
     }
     for tf in review_queue {
@@ -264,6 +305,7 @@ fn build_entries(
                 Some(w) => format!("review · {w}"),
                 None => "review".into(),
             }),
+            shortcut: None,
         });
     }
     for a in agents {
@@ -272,6 +314,7 @@ fn build_entries(
             label: a.id.clone(),
             kind: EntryKind::Agent,
             subtitle: Some(format!("{} · {:?}", a.machine, a.status)),
+            shortcut: None,
         });
     }
     out.push(Entry {
@@ -279,6 +322,7 @@ fn build_entries(
         label: "Switch Project".into(),
         kind: EntryKind::Action,
         subtitle: Some("fuzzy-pick another project and swap the dashboard".into()),
+        shortcut: None,
     });
     out.push(Entry {
         id: "action:quit-project".into(),
@@ -287,8 +331,35 @@ fn build_entries(
         subtitle: Some(
             "close every pane (workers + stash + main) and switch to the next project".into(),
         ),
+        shortcut: None,
     });
     out
+}
+
+/// Build the "Toggle Zen Mode" entry. Label flips with current state
+/// so users can see what's on before activating, and the right-aligned
+/// shortcut hint mirrors the user's configured chord (defaults to
+/// `⌥Z`). When the chord is explicitly disabled we omit the hint
+/// rather than render an empty column.
+fn zen_toggle_entry(current: ZenModeState, chord: ZenToggleChord) -> Entry {
+    let (label, subtitle) = match current {
+        ZenModeState::On => ("Turn Zen Mode off", "currently on"),
+        ZenModeState::Off => ("Turn Zen Mode on", "currently off"),
+        ZenModeState::Paused => ("Turn Zen Mode on", "currently paused"),
+    };
+    let hint = chord.hint();
+    let shortcut = if hint.is_empty() {
+        None
+    } else {
+        Some(hint.to_string())
+    };
+    Entry {
+        id: "action:toggle-zen".into(),
+        label: label.into(),
+        kind: EntryKind::Action,
+        subtitle: Some(subtitle.into()),
+        shortcut,
+    }
 }
 
 fn dispatch(project: &str, entry: &Entry) -> Result<()> {
@@ -308,6 +379,15 @@ fn dispatch(project: &str, entry: &Entry) -> Result<()> {
     }
     if let Some(id) = entry.id.strip_prefix("agent:") {
         run_tmux(["select-window", "-t", &format!("shelbi-{project}:{id}")]);
+        return Ok(());
+    }
+    if entry.id == "action:toggle-zen" {
+        // Shares the read/write/log path with the TUI's Alt+Z handler
+        // and the CLI's `shelbi zen on|off` — only the source tag
+        // differs (`user:palette`) so the activity feed can attribute
+        // the toggle back to the palette.
+        shelbi_state::toggle_zen_mode(project, "user:palette")
+            .map_err(|e| anyhow::anyhow!(e))?;
         return Ok(());
     }
     if entry.id == "action:quit-project" {
@@ -567,6 +647,70 @@ fn render_project_picker(
         Style::default().fg(Color::DarkGray),
     )]));
     f.render_widget(footer, layout[3]);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn zen_toggle_entry_label_and_subtitle_flip_with_current_state() {
+        let on = zen_toggle_entry(ZenModeState::On, ZenToggleChord::AltZ);
+        assert_eq!(on.label, "Turn Zen Mode off");
+        assert_eq!(on.subtitle.as_deref(), Some("currently on"));
+
+        let off = zen_toggle_entry(ZenModeState::Off, ZenToggleChord::AltZ);
+        assert_eq!(off.label, "Turn Zen Mode on");
+        assert_eq!(off.subtitle.as_deref(), Some("currently off"));
+
+        let paused = zen_toggle_entry(ZenModeState::Paused, ZenToggleChord::AltZ);
+        assert_eq!(paused.label, "Turn Zen Mode on");
+        assert_eq!(paused.subtitle.as_deref(), Some("currently paused"));
+    }
+
+    #[test]
+    fn zen_toggle_entry_uses_configured_chord_hint() {
+        let alt = zen_toggle_entry(ZenModeState::Off, ZenToggleChord::AltZ);
+        assert_eq!(alt.shortcut.as_deref(), Some("⌥Z"));
+
+        let bs = zen_toggle_entry(ZenModeState::Off, ZenToggleChord::CtrlBackslash);
+        assert_eq!(bs.shortcut.as_deref(), Some("⌃\\"));
+    }
+
+    #[test]
+    fn zen_toggle_entry_omits_shortcut_when_chord_disabled() {
+        let none = zen_toggle_entry(ZenModeState::On, ZenToggleChord::None);
+        assert!(none.shortcut.is_none());
+    }
+
+    #[test]
+    fn zen_toggle_entry_id_is_stable_dispatch_key() {
+        // The dispatch() match keys off this exact id; renaming the entry
+        // breaks the toggle silently. Pin it.
+        let e = zen_toggle_entry(ZenModeState::Off, ZenToggleChord::AltZ);
+        assert_eq!(e.id, "action:toggle-zen");
+    }
+
+    #[test]
+    fn build_entries_places_zen_toggle_directly_after_view_block() {
+        let entries =
+            build_entries(&[], &[], &[], ZenModeState::Off, ZenToggleChord::AltZ);
+        let ids: Vec<&str> = entries.iter().map(|e| e.id.as_str()).collect();
+        // View block first (Chat/Tasks/Activity), then the mode toggle,
+        // then the global actions trail. Workers/reviews/agents are
+        // empty in this fixture so they don't appear.
+        assert_eq!(
+            ids,
+            vec![
+                "view:orch",
+                "view:tasks",
+                "view:activity",
+                "action:toggle-zen",
+                "action:switch-project",
+                "action:quit-project",
+            ]
+        );
+    }
 }
 
 fn switch_to_project(target: &str) -> Result<()> {

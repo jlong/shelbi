@@ -30,8 +30,8 @@ use clap::Subcommand;
 use shelbi_core::{danger_paths_for_project, Column, Project, Task, ZenDangerPaths};
 use shelbi_orchestrator::zen::{self, CiVerdict, DryRunDecision};
 use shelbi_state::{
-    append_zen_dryrun_event, append_zen_mode_event, list_column, load_project, read_state,
-    write_state, State, ZenModeState,
+    append_zen_dryrun_event, list_column, load_project, read_state, set_zen_mode, State,
+    ZenModeState,
 };
 
 use crate::commands::require_project;
@@ -182,11 +182,8 @@ pub fn run(project_opt: Option<String>, cmd: ZenCmd) -> Result<()> {
 }
 
 fn set(project: &str, target: ZenModeState) -> Result<()> {
-    let mut state = read_state(project).map_err(|e| anyhow!(e))?;
-    let prev = state.zen_mode;
-    state.zen_mode = target;
-    write_state(project, &state).map_err(|e| anyhow!(e))?;
-    let _ = append_zen_mode_event(prev.as_str(), target.as_str(), "user:cli");
+    set_zen_mode(project, target, "user:cli").map_err(|e| anyhow!(e))?;
+    let state = read_state(project).map_err(|e| anyhow!(e))?;
     print_status(project, &state)
 }
 

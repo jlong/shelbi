@@ -416,6 +416,38 @@ pub fn write_state(project: &str, state: &State) -> Result<()> {
     atomic_write(&path, &body)
 }
 
+/// Persist `target` as the project's `zen_mode` and append a
+/// `mode=zen <prev> -> <target> reason=<source>` line to `events.log`.
+/// Single source of truth shared by `shelbi zen on|off|pause` (CLI),
+/// the TUI's Alt+Z handler, and the palette's toggle entry — each
+/// caller picks its own `source` token (`user:cli`, `user:hotkey`,
+/// `user:palette`) so the activity feed can distinguish them. Returns
+/// the prior mode for callers that want to render a diff without a
+/// follow-up read.
+pub fn set_zen_mode(project: &str, target: ZenModeState, source: &str) -> Result<ZenModeState> {
+    let mut state = read_state(project)?;
+    let prev = state.zen_mode;
+    state.zen_mode = target;
+    write_state(project, &state)?;
+    let _ = append_zen_mode_event(prev.as_str(), target.as_str(), source);
+    Ok(prev)
+}
+
+/// Binary toggle on top of [`set_zen_mode`]: On flips to Off, anything
+/// else (Off, Paused) flips to On. Paused collapses to On here because
+/// the toggle is intentionally a two-state hop — the CLI is still the
+/// path that can land on Paused. Returns the new mode so callers can
+/// update their cached state without a re-read.
+pub fn toggle_zen_mode(project: &str, source: &str) -> Result<ZenModeState> {
+    let current = read_state(project)?.zen_mode;
+    let target = match current {
+        ZenModeState::On => ZenModeState::Off,
+        ZenModeState::Off | ZenModeState::Paused => ZenModeState::On,
+    };
+    set_zen_mode(project, target, source)?;
+    Ok(target)
+}
+
 // ---------------------------------------------------------------------------
 // Agent markdown files
 
@@ -1439,6 +1471,65 @@ mod tests {
         assert_eq!(read_state("p").unwrap().zen_mode, ZenModeState::On);
         std::fs::write(&path, r#"{"zen_mode": false}"#).unwrap();
         assert_eq!(read_state("p").unwrap().zen_mode, ZenModeState::Off);
+        std::env::remove_var("SHELBI_HOME");
+    }
+
+    #[test]
+    fn toggle_zen_mode_flips_state_and_logs_under_source() {
+        let _g = TEST_LOCK.lock().unwrap();
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+
+        // From defaults (Off) → On.
+        let new = toggle_zen_mode("p", "user:palette").unwrap();
+        assert_eq!(new, ZenModeState::On);
+        assert_eq!(read_state("p").unwrap().zen_mode, ZenModeState::On);
+
+        // Toggle again → Off.
+        let new = toggle_zen_mode("p", "user:palette").unwrap();
+        assert_eq!(new, ZenModeState::Off);
+
+        // Both transitions appear in the events log under the supplied source.
+        let log = std::fs::read_to_string(events_log_path().unwrap()).unwrap();
+        assert!(
+            log.contains("mode=zen off -> on reason=user:palette"),
+            "missing on transition in: {log}"
+        );
+        assert!(
+            log.contains("mode=zen on -> off reason=user:palette"),
+            "missing off transition in: {log}"
+        );
+        std::env::remove_var("SHELBI_HOME");
+    }
+
+    #[test]
+    fn toggle_zen_mode_from_paused_collapses_to_on() {
+        let _g = TEST_LOCK.lock().unwrap();
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+        write_state(
+            "p",
+            &State { zen_mode: ZenModeState::Paused, zen_last_crashed_at: None },
+        )
+        .unwrap();
+        let new = toggle_zen_mode("p", "user:hotkey").unwrap();
+        assert_eq!(new, ZenModeState::On);
+        std::env::remove_var("SHELBI_HOME");
+    }
+
+    #[test]
+    fn set_zen_mode_returns_prev_and_writes_event() {
+        let _g = TEST_LOCK.lock().unwrap();
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+        let prev = set_zen_mode("p", ZenModeState::Paused, "user:cli").unwrap();
+        assert_eq!(prev, ZenModeState::Off);
+        assert_eq!(read_state("p").unwrap().zen_mode, ZenModeState::Paused);
+        let log = std::fs::read_to_string(events_log_path().unwrap()).unwrap();
+        assert!(
+            log.contains("mode=zen off -> paused reason=user:cli"),
+            "got: {log}"
+        );
         std::env::remove_var("SHELBI_HOME");
     }
 
