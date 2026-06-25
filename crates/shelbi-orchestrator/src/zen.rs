@@ -1668,3 +1668,335 @@ mod scan_tests {
         assert_eq!(got, vec!["t-0", "t-1", "t-2"]);
     }
 }
+
+
+// ===========================================================================
+// Dry-run preview — what would Zen do, without doing it
+// ===========================================================================
+//
+// `dry_run_tick` runs the same two read-only steps Zen Mode runs every loop:
+//
+// 1. Scan the backlog for mechanically-eligible auto-promotion candidates.
+// 2. Probe every task currently in `review` and apply the default mechanical
+//    bar (the thresholds documented in the orchestrator prompt template).
+//
+// It returns one `DryRunDecision` per finding so the CLI can log "would
+// have …" without touching any state. The orchestrator's judgment layer
+// (the auto-promote categories in the prompt) is *not* simulated — that
+// requires an LLM. The decisions for backlog candidates make this
+// explicit by labelling them `WouldConsiderAutoPromote` rather than
+// `WouldAutoPromote`.
+
+/// Default merge-conditions thresholds — mirror the values in the
+/// orchestrator prompt template (`default_orchestrator.md.template`,
+/// "Merge conditions" section). The prompt is the source of truth for
+/// live Zen runs (the user can tune it per project); the dry-run uses
+/// these defaults to give an honest preview of what the out-of-the-box
+/// policy would do.
+pub const DRYRUN_MAX_DIFF_FILES: usize = 30;
+pub const DRYRUN_MAX_DIFF_LINES: usize = 2000;
+
+/// One simulated decision the live Zen loop would have taken.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DryRunDecision {
+    pub action: DryRunAction,
+    pub task_id: String,
+    /// Short, single-token reason (whitespace already collapsed) suitable
+    /// for the `detail=` field of an events.log line.
+    pub detail: String,
+    /// Human-readable explanation for stdout + the dedicated log.
+    pub explanation: String,
+}
+
+impl DryRunDecision {
+    /// Stable key for run-local deduplication — same `(action, task_id,
+    /// detail)` triple shouldn't be re-logged on every tick.
+    pub fn dedup_key(&self) -> String {
+        format!("{}|{}|{}", self.action.as_str(), self.task_id, self.detail)
+    }
+
+    /// One-line stdout/log shape the spec calls for:
+    /// `zen-dryrun: would have <action> <task> because <explanation>`.
+    pub fn as_line(&self) -> String {
+        format!(
+            "zen-dryrun: would have {action} {task} because {why}",
+            action = self.action.verb(),
+            task = self.task_id,
+            why = self.explanation,
+        )
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DryRunAction {
+    /// Backlog task is mechanically eligible — live Zen would surface it
+    /// to the auto-promote judgment layer.
+    ConsiderAutoPromote,
+    /// In-review task passes every mechanical gate — live Zen would have
+    /// kicked off the PR / merge flow.
+    Merge,
+    /// In-review task fails at least one mechanical gate — live Zen
+    /// would have left it for the user with the gate's reason.
+    BlockMerge,
+}
+
+impl DryRunAction {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            DryRunAction::ConsiderAutoPromote => "consider-auto-promote",
+            DryRunAction::Merge => "merge",
+            DryRunAction::BlockMerge => "block-merge",
+        }
+    }
+
+    /// Verb used in the user-facing `would have <verb> <task>` line.
+    pub fn verb(self) -> &'static str {
+        match self {
+            DryRunAction::ConsiderAutoPromote => "considered auto-promoting",
+            DryRunAction::Merge => "merged",
+            DryRunAction::BlockMerge => "blocked merge of",
+        }
+    }
+}
+
+/// Run one read-only Zen pass for `project` and return every decision
+/// the live loop would have made. Probes (which shell out) are best-
+/// effort: a probe that errors is surfaced as a `BlockMerge` decision
+/// labelled `probe-failed` so the user still sees the task, rather than
+/// silently dropping it.
+pub fn dry_run_tick(project: &Project) -> Result<Vec<DryRunDecision>> {
+    let mut decisions = Vec::new();
+
+    // 1. Backlog scan — mechanical eligibility only. The orchestrator's
+    //    judgment categories aren't simulated; we just surface what live
+    //    Zen would *consider*.
+    for task_id in mechanically_eligible(project)? {
+        decisions.push(DryRunDecision {
+            action: DryRunAction::ConsiderAutoPromote,
+            task_id,
+            detail: "mechanically-eligible".into(),
+            explanation: "mechanically eligible (orchestrator judgment still needed)".into(),
+        });
+    }
+
+    // 2. Review-column probes — apply the default mechanical bar.
+    let review_tasks = shelbi_state::list_column(&project.name, Column::Review)?;
+    for tf in review_tasks {
+        let branch = tf
+            .task
+            .branch
+            .clone()
+            .unwrap_or_else(|| format!("shelbi/{}", tf.task.id));
+        match probe(project, &tf.task, &branch) {
+            Ok(report) => {
+                decisions.push(evaluate_probe(&tf.task.id, &report));
+            }
+            Err(e) => {
+                // Don't let one bad probe silence the rest of the pass.
+                // Surface it so the user knows the dry-run couldn't speak
+                // to this task.
+                decisions.push(DryRunDecision {
+                    action: DryRunAction::BlockMerge,
+                    task_id: tf.task.id.clone(),
+                    detail: "probe-failed".into(),
+                    explanation: format!("probe failed: {e}"),
+                });
+            }
+        }
+    }
+
+    Ok(decisions)
+}
+
+/// Apply the default merge-conditions bar to a probe report. Returns a
+/// `Merge` decision if every gate passes, a `BlockMerge` decision tagged
+/// with the first failing gate otherwise.
+///
+/// Gate order matches the prompt template — first failure wins so the
+/// user sees the same single reason live Zen would emit.
+pub fn evaluate_probe(task_id: &str, report: &ProbeReport) -> DryRunDecision {
+    if let Some(failed) = report
+        .local_checks
+        .iter()
+        .find(|c| c.exit_code != 0)
+    {
+        return DryRunDecision {
+            action: DryRunAction::BlockMerge,
+            task_id: task_id.to_string(),
+            detail: "failed-checks".into(),
+            explanation: format!(
+                "local check failed: `{}` (exit {})",
+                failed.command, failed.exit_code
+            ),
+        };
+    }
+    if report.merge_conflict.conflicts {
+        let files = if report.merge_conflict.files.is_empty() {
+            "(unknown files)".to_string()
+        } else {
+            report.merge_conflict.files.join(",")
+        };
+        return DryRunDecision {
+            action: DryRunAction::BlockMerge,
+            task_id: task_id.to_string(),
+            detail: "merge-conflict".into(),
+            explanation: format!("merge conflict in: {files}"),
+        };
+    }
+    let total_lines = report.diff_size.lines_added + report.diff_size.lines_removed;
+    if report.diff_size.files > DRYRUN_MAX_DIFF_FILES || total_lines > DRYRUN_MAX_DIFF_LINES {
+        return DryRunDecision {
+            action: DryRunAction::BlockMerge,
+            task_id: task_id.to_string(),
+            detail: "diff-too-large".into(),
+            explanation: format!(
+                "diff too large ({} files / {} lines; max {} files / {} lines)",
+                report.diff_size.files,
+                total_lines,
+                DRYRUN_MAX_DIFF_FILES,
+                DRYRUN_MAX_DIFF_LINES,
+            ),
+        };
+    }
+    if !report.danger_paths.matched.is_empty() {
+        return DryRunDecision {
+            action: DryRunAction::BlockMerge,
+            task_id: task_id.to_string(),
+            detail: "danger-path".into(),
+            explanation: format!(
+                "danger paths touched: {}",
+                report.danger_paths.matched.join(",")
+            ),
+        };
+    }
+    DryRunDecision {
+        action: DryRunAction::Merge,
+        task_id: task_id.to_string(),
+        detail: "all-gates-passed".into(),
+        explanation: format!(
+            "all gates passed (checks ok, no conflict, {} files / {} lines, no danger paths)",
+            report.diff_size.files, total_lines
+        ),
+    }
+}
+
+#[cfg(test)]
+mod dry_run_tests {
+    use super::*;
+
+    fn ok_report() -> ProbeReport {
+        ProbeReport {
+            local_checks: vec![LocalCheck {
+                command: "cargo test".into(),
+                exit_code: 0,
+                duration_ms: 100,
+                output_tail: String::new(),
+            }],
+            merge_conflict: ConflictProbe::default(),
+            diff_size: DiffSize { files: 3, lines_added: 40, lines_removed: 5 },
+            danger_paths: DangerPaths::default(),
+        }
+    }
+
+    #[test]
+    fn clean_probe_yields_merge_decision() {
+        let d = evaluate_probe("t", &ok_report());
+        assert_eq!(d.action, DryRunAction::Merge);
+        assert_eq!(d.task_id, "t");
+        assert!(d.explanation.contains("all gates passed"));
+    }
+
+    #[test]
+    fn failing_check_blocks_merge_with_check_detail() {
+        let mut r = ok_report();
+        r.local_checks[0].exit_code = 7;
+        let d = evaluate_probe("t", &r);
+        assert_eq!(d.action, DryRunAction::BlockMerge);
+        assert_eq!(d.detail, "failed-checks");
+        assert!(d.explanation.contains("cargo test"));
+        assert!(d.explanation.contains("exit 7"));
+    }
+
+    #[test]
+    fn merge_conflict_blocks_merge_with_files() {
+        let mut r = ok_report();
+        r.merge_conflict = ConflictProbe {
+            conflicts: true,
+            files: vec!["src/a.rs".into(), "src/b.rs".into()],
+        };
+        let d = evaluate_probe("t", &r);
+        assert_eq!(d.action, DryRunAction::BlockMerge);
+        assert_eq!(d.detail, "merge-conflict");
+        assert!(d.explanation.contains("src/a.rs"));
+        assert!(d.explanation.contains("src/b.rs"));
+    }
+
+    #[test]
+    fn oversize_diff_blocks_merge() {
+        let mut r = ok_report();
+        r.diff_size.files = DRYRUN_MAX_DIFF_FILES + 1;
+        let d = evaluate_probe("t", &r);
+        assert_eq!(d.action, DryRunAction::BlockMerge);
+        assert_eq!(d.detail, "diff-too-large");
+
+        let mut r = ok_report();
+        r.diff_size.lines_added = DRYRUN_MAX_DIFF_LINES + 1;
+        let d = evaluate_probe("t", &r);
+        assert_eq!(d.action, DryRunAction::BlockMerge);
+        assert_eq!(d.detail, "diff-too-large");
+    }
+
+    #[test]
+    fn danger_path_match_blocks_merge() {
+        let mut r = ok_report();
+        r.danger_paths.matched = vec![".github/workflows/ci.yml".into()];
+        let d = evaluate_probe("t", &r);
+        assert_eq!(d.action, DryRunAction::BlockMerge);
+        assert_eq!(d.detail, "danger-path");
+        assert!(d.explanation.contains(".github/workflows/ci.yml"));
+    }
+
+    #[test]
+    fn first_failing_gate_wins() {
+        // A report that fails on multiple gates is still labelled with
+        // the first failure in prompt order (checks > conflict > diff
+        // > danger).
+        let mut r = ok_report();
+        r.local_checks[0].exit_code = 1;
+        r.merge_conflict.conflicts = true;
+        r.diff_size.files = DRYRUN_MAX_DIFF_FILES + 1;
+        let d = evaluate_probe("t", &r);
+        assert_eq!(d.detail, "failed-checks");
+    }
+
+    #[test]
+    fn decision_line_matches_spec_shape() {
+        let d = DryRunDecision {
+            action: DryRunAction::ConsiderAutoPromote,
+            task_id: "fix-typo".into(),
+            detail: "mechanically-eligible".into(),
+            explanation: "mechanically eligible".into(),
+        };
+        assert_eq!(
+            d.as_line(),
+            "zen-dryrun: would have considered auto-promoting fix-typo because mechanically eligible"
+        );
+    }
+
+    #[test]
+    fn dedup_key_is_stable_across_identical_decisions() {
+        let a = DryRunDecision {
+            action: DryRunAction::Merge,
+            task_id: "x".into(),
+            detail: "all-gates-passed".into(),
+            explanation: "irrelevant for dedup".into(),
+        };
+        let b = DryRunDecision {
+            action: DryRunAction::Merge,
+            task_id: "x".into(),
+            detail: "all-gates-passed".into(),
+            explanation: "wholly different prose".into(),
+        };
+        assert_eq!(a.dedup_key(), b.dedup_key());
+    }
+}

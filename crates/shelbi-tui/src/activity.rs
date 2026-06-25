@@ -102,6 +102,17 @@ pub enum Event {
         new: WorkerState,
         raw: String,
     },
+    /// A `shelbi zen dry-run` preview decision — recorded but never
+    /// acted on. Rendered with a distinct visual tag so the user can
+    /// tell at a glance these rows reflect what Zen *would* have done,
+    /// not a real state change.
+    ZenDryRun {
+        ts: DateTime<Utc>,
+        task_id: String,
+        action: String,
+        detail: String,
+        raw: String,
+    },
     /// Recognized timestamp but the rest doesn't match the task/worker
     /// shape — render the original line verbatim so nothing vanishes.
     Unknown {
@@ -113,7 +124,9 @@ pub enum Event {
 impl Event {
     pub fn ts(&self) -> Option<DateTime<Utc>> {
         match self {
-            Event::Task { ts, .. } | Event::Worker { ts, .. } => Some(*ts),
+            Event::Task { ts, .. }
+            | Event::Worker { ts, .. }
+            | Event::ZenDryRun { ts, .. } => Some(*ts),
             Event::Unknown { ts, .. } => *ts,
         }
     }
@@ -510,6 +523,32 @@ pub fn parse_event_line(line: &str) -> Event {
                     raw,
                 };
             }
+        }
+        return Event::Unknown { ts: Some(ts), raw };
+    }
+
+    if let Some(rest) = rest.strip_prefix("zen-dryrun ") {
+        // Format: `task=<id> action=<verb> detail=<short>`
+        let mut task_id = String::new();
+        let mut action = String::new();
+        let mut detail = String::new();
+        for tok in rest.split_whitespace() {
+            if let Some(v) = tok.strip_prefix("task=") {
+                task_id = v.to_string();
+            } else if let Some(v) = tok.strip_prefix("action=") {
+                action = v.to_string();
+            } else if let Some(v) = tok.strip_prefix("detail=") {
+                detail = v.to_string();
+            }
+        }
+        if !task_id.is_empty() && !action.is_empty() {
+            return Event::ZenDryRun {
+                ts,
+                task_id,
+                action,
+                detail,
+                raw,
+            };
         }
         return Event::Unknown { ts: Some(ts), raw };
     }
@@ -963,6 +1002,13 @@ fn render_event(
         Event::Worker {
             ts, name, new, ..
         } => render_worker_event(*ts, name, *new, width, now),
+        Event::ZenDryRun {
+            ts,
+            task_id,
+            action,
+            detail,
+            ..
+        } => render_zen_dryrun_event(app, *ts, task_id, action, detail, width, now),
         Event::Unknown { ts, raw } => {
             let when = ts.map(|t| relative_time(t, now)).unwrap_or_default();
             let row = RowText {
@@ -974,6 +1020,63 @@ fn render_event(
             };
             paint_row(AvatarSlot::None, row, width, when, None)
         }
+    }
+}
+
+/// `[DRYRUN]` rows for `shelbi zen dry-run` previews. Italic + dim so
+/// they read as "what would have happened" rather than blending with
+/// real activity above and below. The label is spelled out (not just a
+/// glyph) so a grep over a screenshot still finds it.
+fn render_zen_dryrun_event(
+    app: &mut ActivityApp,
+    ts: DateTime<Utc>,
+    task_id: &str,
+    action: &str,
+    detail: &str,
+    width: usize,
+    now: DateTime<Utc>,
+) -> Vec<Line<'static>> {
+    let meta = app.task_meta(task_id).cloned();
+    let title = meta
+        .as_ref()
+        .map(|m| m.title.clone())
+        .unwrap_or_else(|| task_id.to_string());
+    let when = relative_time(ts, now);
+    let title_quoted = format!("\u{201C}{title}\u{201D}");
+    let row = RowText {
+        primary: vec![
+            Span::styled(
+                "[DRYRUN]".to_string(),
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::raw("  "),
+            Span::styled(
+                format!("would {}", humanize_dryrun_action(action)),
+                Style::default()
+                    .fg(Color::Gray)
+                    .add_modifier(Modifier::ITALIC),
+            ),
+            Span::raw("  "),
+            Span::styled(
+                title_quoted,
+                Style::default()
+                    .fg(Color::DarkGray)
+                    .add_modifier(Modifier::ITALIC),
+            ),
+        ],
+        secondary: Some(detail.replace('_', " ")),
+    };
+    paint_row(AvatarSlot::None, row, width, when)
+}
+
+fn humanize_dryrun_action(action: &str) -> String {
+    match action {
+        "consider-auto-promote" => "consider promoting".into(),
+        "merge" => "merge".into(),
+        "block-merge" => "block merge".into(),
+        other => other.replace('-', " "),
     }
 }
 
@@ -1632,6 +1735,35 @@ mod tests {
                 assert_eq!(new, WorkerState::Working);
             }
             other => panic!("expected worker event, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_zen_dryrun_event() {
+        let line = "2026-06-24T10:00:00Z zen-dryrun task=fix-typo action=consider-auto-promote detail=mechanically-eligible";
+        match parse_event_line(line) {
+            Event::ZenDryRun {
+                task_id,
+                action,
+                detail,
+                ..
+            } => {
+                assert_eq!(task_id, "fix-typo");
+                assert_eq!(action, "consider-auto-promote");
+                assert_eq!(detail, "mechanically-eligible");
+            }
+            other => panic!("expected zen-dryrun event, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn zen_dryrun_without_task_or_action_falls_back_to_unknown() {
+        // Defensive: a malformed dry-run line (missing the required
+        // `task=` and `action=` tokens) must not crash the parser.
+        let line = "2026-06-24T10:00:00Z zen-dryrun detail=oops";
+        match parse_event_line(line) {
+            Event::Unknown { .. } => {}
+            other => panic!("expected unknown, got {other:?}"),
         }
     }
 

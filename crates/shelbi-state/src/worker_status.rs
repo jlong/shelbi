@@ -230,6 +230,23 @@ pub fn append_zen_mode_event(prev: &str, new: &str, source: &str) -> Result<()> 
     append_event_line(&format!("{ts} mode=zen {prev} -> {new} reason={source}"))
 }
 
+/// Append `<rfc3339> zen-dryrun task=<id> action=<action> detail=<detail>`
+/// to `~/.shelbi/events.log`. Emitted by `shelbi zen dry-run` for every
+/// would-have decision it makes — distinct prefix so the activity feed
+/// can render dry-run rows with their own visual tag and so `grep
+/// zen-dryrun` over the log isolates a preview run from real activity.
+///
+/// `action` and `detail` collapse whitespace to underscores so the line
+/// stays a single parseable record (same convention as `append_task_event`).
+pub fn append_zen_dryrun_event(task_id: &str, action: &str, detail: &str) -> Result<()> {
+    let ts = Utc::now().to_rfc3339();
+    let action = sanitize_reason(action);
+    let detail = sanitize_reason(detail);
+    append_event_line(&format!(
+        "{ts} zen-dryrun task={task_id} action={action} detail={detail}"
+    ))
+}
+
 /// Append `<rfc3339> dispatch task=<id> worker=<name> status=<status> detail=<detail>`
 /// to `~/.shelbi/events.log`. Use this to surface dispatch-time anomalies
 /// (e.g. the initial prompt was pasted but Enter never landed) that aren't
@@ -500,6 +517,32 @@ mod tests {
         assert!(line.contains(" status=enter-stalled "), "line: {line}");
         // Whitespace in detail folds to underscores so the line stays parseable.
         assert!(line.ends_with(" detail=no_shelbi_marker_after_retry"), "line: {line}");
+
+        std::env::remove_var("SHELBI_HOME");
+    }
+
+    #[test]
+    fn zen_dryrun_event_writes_canonical_shape() {
+        let _g = TEST_LOCK.lock().unwrap();
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+
+        append_zen_dryrun_event(
+            "fix-typo",
+            "consider-auto-promote",
+            "mechanically eligible",
+        )
+        .unwrap();
+        let log = std::fs::read_to_string(events_log_path().unwrap()).unwrap();
+        let lines: Vec<&str> = log.lines().collect();
+        assert_eq!(lines.len(), 1);
+        let line = lines[0];
+        // Prefix lets the activity feed match and render dry-run rows
+        // with a distinct visual tag. Detail whitespace folds to
+        // underscores so the line stays parseable.
+        assert!(line.contains(" zen-dryrun task=fix-typo "), "line: {line}");
+        assert!(line.contains(" action=consider-auto-promote "), "line: {line}");
+        assert!(line.ends_with(" detail=mechanically_eligible"), "line: {line}");
 
         std::env::remove_var("SHELBI_HOME");
     }

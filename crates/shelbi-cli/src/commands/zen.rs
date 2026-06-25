@@ -17,20 +17,30 @@
 //! and use exit-code + stderr for failures. The orchestrator parses the
 //! lines directly.
 
-use std::time::Duration;
+use std::collections::HashSet;
+use std::fs::OpenOptions;
+use std::io::Write;
+use std::path::PathBuf;
+use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Result};
+use chrono::Utc;
 use clap::Subcommand;
 
-use shelbi_core::{
-    danger_paths_for_project, Column, Project, Task, ZenDangerPaths,
-};
-use shelbi_orchestrator::zen::{self, CiVerdict};
+use shelbi_core::{danger_paths_for_project, Column, Project, Task, ZenDangerPaths};
+use shelbi_orchestrator::zen::{self, CiVerdict, DryRunDecision};
 use shelbi_state::{
-    append_zen_mode_event, list_column, load_project, read_state, write_state, State, ZenModeState,
+    append_zen_dryrun_event, append_zen_mode_event, list_column, load_project, read_state,
+    write_state, State, ZenModeState,
 };
 
 use crate::commands::require_project;
+
+/// Default cadence for the dry-run preview loop. Slow enough that a
+/// busy project doesn't see one probe stomping the next; fast enough
+/// that a state change (worker handing off, user promoting a task)
+/// shows up in the preview within one tick.
+const DRYRUN_DEFAULT_INTERVAL: Duration = Duration::from_secs(5);
 
 #[derive(Debug, Subcommand)]
 pub enum ZenCmd {
@@ -73,6 +83,22 @@ pub enum ZenCmd {
     /// auto-promotion, one per line, in priority order. Mechanical only —
     /// the orchestrator's prompt applies the judgment categories on top.
     Scan,
+    /// Preview what Zen Mode would do without touching any state. Runs
+    /// the backlog scan and the merge-conditions bar on every tick and
+    /// logs each "would have …" decision to stdout, a dedicated dry-run
+    /// log (`~/.shelbi/logs/zen-dryrun.log`), and the activity feed.
+    /// Use this before flipping Zen on for real to confirm the policy
+    /// matches your intent. No PRs, merges, or board moves happen.
+    DryRun {
+        /// Stop after this long. Accepts `30s`, `5m`, `2h`, `1d`, or a
+        /// bare integer of seconds. Omit to run until Ctrl-C.
+        #[arg(long, value_name = "DURATION")]
+        r#for: Option<String>,
+        /// Override the per-tick interval (default 5s). Same duration
+        /// grammar as `--for`.
+        #[arg(long, value_name = "DURATION")]
+        interval: Option<String>,
+    },
 }
 
 pub fn run(project_opt: Option<String>, cmd: ZenCmd) -> Result<()> {
@@ -140,6 +166,17 @@ pub fn run(project_opt: Option<String>, cmd: ZenCmd) -> Result<()> {
                 println!("{id}");
             }
             Ok(())
+        }
+        ZenCmd::DryRun { r#for, interval } => {
+            let duration = r#for
+                .as_deref()
+                .map(super::events::parse_duration)
+                .transpose()?;
+            let tick = match interval {
+                Some(s) => super::events::parse_duration(&s)?,
+                None => DRYRUN_DEFAULT_INTERVAL,
+            };
+            dry_run(&project_name, duration, tick)
         }
     }
 }
@@ -220,6 +257,117 @@ fn zen_applies(task: &Task, mode: ZenModeState) -> bool {
         (None, ZenModeState::On) | (None, ZenModeState::Paused) => true,
         (None, ZenModeState::Off) => false,
     }
+}
+
+/// Drive the read-only Zen preview loop. Ticks every `interval` until
+/// `duration` elapses (or forever, on Ctrl-C, when `duration` is None).
+/// Each tick calls `zen::dry_run_tick` and logs newly-surfaced decisions
+/// to three sinks:
+///
+/// - stdout — single-line, grep-able, machine-readable.
+/// - `~/.shelbi/logs/zen-dryrun.log` — dedicated, timestamped, append-only.
+/// - `~/.shelbi/events.log` — `zen-dryrun task=… action=… detail=…` lines
+///   that the activity feed renders with a distinct visual tag.
+///
+/// Findings are deduplicated by `(action, task_id, detail)` for the
+/// lifetime of the run so a stable board state doesn't produce repeated
+/// log lines on every tick. The dedupe is intentionally lossy across
+/// invocations — re-running `zen dry-run` is meant to give a fresh
+/// preview, not respect history.
+fn dry_run(project: &str, duration: Option<Duration>, interval: Duration) -> Result<()> {
+    let project_obj = load_project(project).map_err(|e| anyhow!(e))?;
+
+    let log_path = dryrun_log_path()?;
+    let header = format!(
+        "# shelbi zen dry-run — project={project} started={start} interval={int} duration={dur}\n",
+        start = Utc::now().to_rfc3339(),
+        int = format_duration(interval),
+        dur = duration
+            .map(format_duration)
+            .unwrap_or_else(|| "until-ctrl-c".to_string()),
+    );
+    init_dryrun_log(&log_path, &header)?;
+
+    eprintln!(
+        "zen dry-run: previewing {project} every {} ({}). Ctrl-C to stop.",
+        format_duration(interval),
+        duration
+            .map(|d| format!("for {}", format_duration(d)))
+            .unwrap_or_else(|| "until interrupted".to_string()),
+    );
+    eprintln!("zen dry-run: log file → {}", log_path.display());
+
+    let deadline = duration.map(|d| Instant::now() + d);
+    let mut seen: HashSet<String> = HashSet::new();
+    let mut first_tick = true;
+
+    loop {
+        let decisions = zen::dry_run_tick(&project_obj).map_err(|e| anyhow!(e))?;
+        let mut new_this_tick = 0_usize;
+        for d in decisions {
+            let key = d.dedup_key();
+            if !seen.insert(key) {
+                continue;
+            }
+            emit_decision(&log_path, &d);
+            new_this_tick += 1;
+        }
+        if first_tick && new_this_tick == 0 {
+            eprintln!("zen dry-run: nothing to preview right now (no backlog candidates, no tasks in review).");
+        }
+        first_tick = false;
+
+        let now = Instant::now();
+        let sleep_for = match deadline {
+            Some(end) if now >= end => break,
+            Some(end) => interval.min(end.saturating_duration_since(now)),
+            None => interval,
+        };
+        std::thread::sleep(sleep_for);
+    }
+
+    eprintln!("zen dry-run: window ended; exiting cleanly.");
+    Ok(())
+}
+
+/// `~/.shelbi/logs/zen-dryrun.log` — the dedicated dry-run log path.
+fn dryrun_log_path() -> Result<PathBuf> {
+    let dir = shelbi_state::shelbi_home()
+        .map_err(|e| anyhow!(e))?
+        .join("logs");
+    Ok(dir.join("zen-dryrun.log"))
+}
+
+/// Truncate + write the header for a fresh dry-run. Each run owns its
+/// own log content — overlapping runs are explicitly out of scope and
+/// would clobber each other here.
+fn init_dryrun_log(path: &PathBuf, header: &str) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let mut f = OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .open(path)?;
+    f.write_all(header.as_bytes())?;
+    Ok(())
+}
+
+/// Surface one decision to all three sinks. Best-effort on the disk-bound
+/// sinks: a transient I/O failure shouldn't kill the preview loop.
+fn emit_decision(log_path: &PathBuf, d: &DryRunDecision) {
+    let line = d.as_line();
+    println!("{line}");
+
+    let ts = Utc::now().to_rfc3339();
+    if let Ok(mut f) = OpenOptions::new().create(true).append(true).open(log_path) {
+        let _ = writeln!(f, "{ts} {line}");
+    }
+    // Activity feed integration — `zen-dryrun` prefix lets the TUI render
+    // these rows with a distinct visual tag without changing the existing
+    // task=/worker= line shapes.
+    let _ = append_zen_dryrun_event(&d.task_id, d.action.as_str(), &d.detail);
 }
 
 fn format_duration(d: Duration) -> String {
