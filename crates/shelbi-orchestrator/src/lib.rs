@@ -557,7 +557,7 @@ fn clamp_sidebar(host: &shelbi_core::Host, script_path: &std::path::Path) -> std
 /// 42 to avoid clobbering any unrelated `session-closed` hooks the user
 /// may have set.
 fn install_stash_cleanup_hook(host: &shelbi_core::Host) -> Result<()> {
-    let hook_cmd = r##"run-shell -b "case \"#{hook_session_name}\" in shelbi-*) tmux kill-session -t \"_#{hook_session_name}\" 2>/dev/null;; esac""##;
+    let hook_cmd = r##"run-shell -b "case \"#{hook_session_name}\" in shelbi-*) tmux kill-session -t \"_#{hook_session_name}\" 2>/dev/null;; esac; true""##;
     let _ = shelbi_ssh::run(
         host,
         ["tmux", "set-hook", "-g", "session-closed[42]", hook_cmd],
