@@ -595,6 +595,7 @@ mod tests {
             worker_permissions_mode: "auto".into(),
             worker_settings_template: None,
             zen: shelbi_core::ZenConfig::default(),
+            contextstore_sync: Vec::new(),
         }
     }
 

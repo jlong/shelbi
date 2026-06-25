@@ -1029,6 +1029,7 @@ dependencies = [
  "shelbi-state",
  "shelbi-tmux",
  "tempfile",
+ "tracing",
 ]
 
 [[package]]

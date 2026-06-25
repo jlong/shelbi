@@ -64,6 +64,24 @@ pub struct Project {
     /// CI, and which paths require human review even in Zen Mode.
     #[serde(default)]
     pub zen: ZenConfig,
+    /// ContextStore spaces that should be rsynced from a remote worker's
+    /// machine back to hub after the worker hands off for review. Each
+    /// space's path is interpreted on both hub and remote — leading `~`
+    /// is expanded by rsync against the respective `$HOME`. See
+    /// `shelbi_orchestrator::contextstore` for the sync path. Default
+    /// empty: no sync runs unless the project opts in.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub contextstore_sync: Vec<ContextStoreSyncSpec>,
+}
+
+/// One ContextStore space that shelbi keeps in sync between hub and
+/// remote workers. The `space` field is matched against the body
+/// heuristic (`"<space>/"` substring) when deciding whether a finished
+/// task touched ContextStore; `path` is fed to rsync on both sides.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ContextStoreSyncSpec {
+    pub space: String,
+    pub path: PathBuf,
 }
 
 fn default_branch() -> String {
@@ -734,6 +752,55 @@ agent_runners:
     }
 
     #[test]
+    fn project_yaml_omits_contextstore_sync_when_not_set() {
+        // Older project YAMLs predate the field. `#[serde(default)]` plus
+        // a Vec default means absence parses cleanly and serializes back
+        // out without leaking the empty list.
+        let yaml = r#"
+name: p
+repo: r
+machines:
+  - { name: hub, kind: local, work_dir: /tmp }
+orchestrator: { runner: claude }
+agent_runners:
+  claude: { command: claude, flags: [] }
+"#;
+        let p: Project = serde_yaml::from_str(yaml).unwrap();
+        assert!(p.contextstore_sync.is_empty());
+        let back = serde_yaml::to_string(&p).unwrap();
+        assert!(!back.contains("contextstore_sync"));
+    }
+
+    #[test]
+    fn project_yaml_round_trips_contextstore_sync_block() {
+        // Real-world shape: opt in by listing the spaces that need to
+        // come back from remote workers, with their on-disk dir.
+        let yaml = r#"
+name: p
+repo: r
+machines:
+  - { name: hub, kind: local, work_dir: /tmp }
+orchestrator: { runner: claude }
+agent_runners:
+  claude: { command: claude, flags: [] }
+contextstore_sync:
+  - space: Shelbi
+    path: ~/Documents/ContextStore/shelbi
+"#;
+        let p: Project = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(p.contextstore_sync.len(), 1);
+        assert_eq!(p.contextstore_sync[0].space, "Shelbi");
+        assert_eq!(
+            p.contextstore_sync[0].path,
+            PathBuf::from("~/Documents/ContextStore/shelbi")
+        );
+        // Round-trip preserves the structure.
+        let back = serde_yaml::to_string(&p).unwrap();
+        let p2: Project = serde_yaml::from_str(&back).unwrap();
+        assert_eq!(p2.contextstore_sync, p.contextstore_sync);
+    }
+
+    #[test]
     fn project_yaml_round_trips_explicit_worker_keys() {
         let yaml = r#"
 name: p
@@ -781,6 +848,7 @@ worker_settings_template: /etc/shelbi/p.json
             worker_permissions_mode: default_worker_permissions_mode(),
             worker_settings_template: None,
             zen: ZenConfig::default(),
+            contextstore_sync: Vec::new(),
         };
         assert!(project.validate_workers().is_ok());
 
@@ -820,6 +888,7 @@ worker_settings_template: /etc/shelbi/p.json
             worker_permissions_mode: default_worker_permissions_mode(),
             worker_settings_template: None,
             zen,
+            contextstore_sync: Vec::new(),
         }
     }
 

@@ -26,9 +26,10 @@ pub use user_config::{
     load_user_config, save_user_config, user_config_path, Keymap, UserConfig, ZenToggleChord,
 };
 pub use worker_status::{
-    append_dispatch_event, append_project_event, append_task_event, append_worker_event,
-    events_log_path, load_worker_status, parse_pane_title_marker, parse_pane_title_state,
-    save_worker_status, worker_status_path, workers_dir, PaneMarker, WorkerState, WorkerStatus,
+    append_contextstore_event, append_dispatch_event, append_project_event, append_task_event,
+    append_worker_event, events_log_path, load_worker_status, parse_pane_title_marker,
+    parse_pane_title_state, save_worker_status, worker_status_path, workers_dir, PaneMarker,
+    WorkerState, WorkerStatus,
 };
 
 /// Default assistant name surfaced in the sidebar header and the
@@ -833,6 +834,7 @@ mod tests {
             worker_permissions_mode: "auto".into(),
             worker_settings_template: override_template,
             zen: ZenConfig::default(),
+            contextstore_sync: Vec::new(),
         }
     }
 

@@ -16,6 +16,7 @@
 
 use shelbi_core::{Error, Host, MachineKind, Result, TmuxAddr};
 
+pub mod contextstore;
 pub mod review;
 pub mod worker;
 pub mod zen;

@@ -15,6 +15,7 @@ shelbi-tmux = { workspace = true }
 shelbi-ssh = { workspace = true }
 shelbi-agent = { workspace = true }
 serde = { workspace = true }
+tracing = { workspace = true }
 globset = "0.4"
 
 [dev-dependencies]

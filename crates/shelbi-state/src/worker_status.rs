@@ -194,6 +194,28 @@ pub fn append_project_event(project: &str, action: &str, reason: &str) -> Result
     append_event_line(&format!("{ts} project={project} {action} reason={reason}"))
 }
 
+/// Append `<rfc3339> contextstore space=<space> machine=<machine> status=<status> detail=<detail>`
+/// to `~/.shelbi/events.log`. Use this to record cross-machine ContextStore
+/// sync attempts run after a remote worker hands off for review, so the user
+/// (and the orchestrator) can see when a worker's `cstore` writes did — or
+/// did not — make it back to the hub copy.
+///
+/// `detail` is folded to a single token (whitespace → underscores) so the
+/// line stays parseable; pass the short rsync stderr excerpt or a status label.
+pub fn append_contextstore_event(
+    space: &str,
+    machine: &str,
+    status: &str,
+    detail: &str,
+) -> Result<()> {
+    let ts = Utc::now().to_rfc3339();
+    let status = sanitize_reason(status);
+    let detail = sanitize_reason(detail);
+    append_event_line(&format!(
+        "{ts} contextstore space={space} machine={machine} status={status} detail={detail}"
+    ))
+}
+
 /// Append `<rfc3339> dispatch task=<id> worker=<name> status=<status> detail=<detail>`
 /// to `~/.shelbi/events.log`. Use this to surface dispatch-time anomalies
 /// (e.g. the initial prompt was pasted but Enter never landed) that aren't

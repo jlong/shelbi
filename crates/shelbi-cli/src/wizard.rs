@@ -261,6 +261,7 @@ pub fn setup_one_project() -> Result<()> {
         worker_permissions_mode: "auto".into(),
         worker_settings_template: None,
         zen: shelbi_core::ZenConfig::default(),
+        contextstore_sync: Vec::new(),
     };
     project.validate_workers().map_err(|e| anyhow!(e))?;
 
