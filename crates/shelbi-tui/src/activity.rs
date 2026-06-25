@@ -581,6 +581,143 @@ enum AvatarSlot {
     None,
 }
 
+/// Background tint for zen-event rows. Indexed-256 #236 is a dark gray
+/// that sits a hair above the default terminal bg on most palettes —
+/// just enough contrast for the eye to pick out machine-driven rows
+/// from the surrounding user-action stream without being loud.
+const ZEN_BG: Color = Color::Indexed(236);
+const ZEN_FG: Color = Color::Green;
+
+/// Avatar art for the zen badge: a 4×3 block-edge frame with "ZEN"
+/// lettering on the middle row. Sits in the same column as the
+/// per-worker creature avatars so layout stays aligned.
+const ZEN_BADGE: [&str; AVATAR_H] = ["▄▄▄▄", " ZEN", "▀▀▀▀"];
+
+/// One parsed `reason=` string from a zen-driven task event. The
+/// orchestrator emits these as `key=value` pairs trailing a
+/// `zen:`/`orchestrator:zen-*` head; this enum is the renderer-facing
+/// shape after stripping the head and lifting out the fields each
+/// variant displays. Unknown keys are dropped — we never want a missing
+/// field to crash the feed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ZenReason {
+    Promote {
+        category: Option<String>,
+    },
+    Merge {
+        sha: Option<String>,
+    },
+    FailedChecks {
+        cmd: Option<String>,
+        exit: Option<String>,
+    },
+    DiffTooLarge {
+        files: Option<String>,
+        lines: Option<String>,
+    },
+    DangerPath {
+        paths: Option<String>,
+    },
+    CiTimeout {
+        duration: Option<String>,
+    },
+    MergeConflict {
+        files: Option<String>,
+    },
+    /// Recognized zen-family prefix but not one of the specific kinds
+    /// above. Renders with the generic zen badge + tint so future
+    /// reasons still look "machine-driven" without a code change.
+    Other,
+}
+
+/// Recognize `orchestrator:zen-*` and `zen:*` reason strings and pull
+/// out the trailing `key=value` pairs each variant cares about. Returns
+/// `None` for non-zen reasons so callers can fall through to the
+/// default user-action renderer.
+fn parse_zen_reason(reason: &str) -> Option<ZenReason> {
+    let (head, rest) = reason.split_once(' ').unwrap_or((reason, ""));
+    let extras = parse_kv(rest);
+    let get = |k: &str| extras.get(k).cloned();
+    Some(match head {
+        "orchestrator:zen-promote" => ZenReason::Promote { category: get("category") },
+        "orchestrator:zen-merge" => ZenReason::Merge { sha: get("sha") },
+        "zen:failed-checks" => ZenReason::FailedChecks {
+            cmd: get("cmd"),
+            exit: get("exit"),
+        },
+        "zen:diff-too-large" => ZenReason::DiffTooLarge {
+            files: get("files"),
+            lines: get("lines"),
+        },
+        "zen:danger-path" => ZenReason::DangerPath { paths: get("paths") },
+        "zen:ci-timeout" => ZenReason::CiTimeout { duration: get("duration") },
+        "zen:merge-conflict" => ZenReason::MergeConflict { files: get("files") },
+        other if other.starts_with("zen:") || other.starts_with("orchestrator:zen-") => {
+            ZenReason::Other
+        }
+        _ => return None,
+    })
+}
+
+/// Parse `k=v k2=v2 …` from a reason tail. Values may be double-quoted
+/// (`cmd="cargo test"`) to allow embedded spaces. Tokens missing a
+/// `=` are skipped silently — the parser should never reject a real
+/// event log line.
+fn parse_kv(s: &str) -> HashMap<String, String> {
+    let mut out = HashMap::new();
+    let mut chars = s.chars().peekable();
+    loop {
+        while matches!(chars.peek(), Some(c) if c.is_whitespace()) {
+            chars.next();
+        }
+        if chars.peek().is_none() {
+            break;
+        }
+        let mut key = String::new();
+        while let Some(&c) = chars.peek() {
+            if c == '=' || c.is_whitespace() {
+                break;
+            }
+            key.push(c);
+            chars.next();
+        }
+        if chars.peek() != Some(&'=') {
+            while let Some(&c) = chars.peek() {
+                if c.is_whitespace() {
+                    break;
+                }
+                chars.next();
+            }
+            continue;
+        }
+        chars.next();
+        let mut val = String::new();
+        if chars.peek() == Some(&'"') {
+            chars.next();
+            while let Some(&c) = chars.peek() {
+                if c == '"' {
+                    chars.next();
+                    break;
+                }
+                val.push(c);
+                chars.next();
+            }
+        } else {
+            while let Some(&c) = chars.peek() {
+                if c.is_whitespace() {
+                    break;
+                }
+                val.push(c);
+                chars.next();
+            }
+        }
+        if !key.is_empty() {
+            out.insert(key, val);
+        }
+    }
+    out
+}
+
 impl AvatarSlot {
     /// Resolve a worker name into either a creature face (when the
     /// name is one of the six phonetic-letter workers) or `Glyph`
@@ -639,7 +776,7 @@ fn render_event(
                 )],
                 secondary: None,
             };
-            paint_row(AvatarSlot::None, row, width, when)
+            paint_row(AvatarSlot::None, row, width, when, None)
         }
     }
 }
@@ -651,7 +788,7 @@ fn render_task_event(
     id: &str,
     from: Column,
     to: Column,
-    _reason: &str,
+    reason: &str,
     raw: &str,
     width: usize,
     now: DateTime<Utc>,
@@ -668,6 +805,12 @@ fn render_task_event(
 
     let when = relative_time(ts, now);
     let title_quoted = format!("\u{201C}{title}\u{201D}");
+
+    // Zen-driven events win over the default (from,to) renderer so the
+    // user can scan machine-driven rows distinctly.
+    if let Some(zr) = parse_zen_reason(reason) {
+        return render_zen_event(zr, &title_quoted, from, to, width, when);
+    }
 
     match (from, to) {
         (Column::Backlog, Column::Todo) => {
@@ -696,6 +839,7 @@ fn render_task_event(
                 row,
                 width,
                 when,
+                None,
             )
         }
         (Column::Todo, Column::InProgress) => {
@@ -725,7 +869,7 @@ fn render_task_event(
                     &fmt_priority(priority),
                 ])),
             };
-            paint_row(slot, row, width, when)
+            paint_row(slot, row, width, when, None)
         }
         (Column::InProgress, Column::Review) => {
             let (worker_span, slot) = worker_attribution(
@@ -759,7 +903,7 @@ fn render_task_event(
                         .unwrap_or_default(),
                 ])),
             };
-            paint_row(slot, row, width, when)
+            paint_row(slot, row, width, when, None)
         }
         (Column::Review, Column::Done) => {
             let row = RowText {
@@ -782,6 +926,7 @@ fn render_task_event(
                 row,
                 width,
                 when,
+                None,
             )
         }
         _ => {
@@ -792,9 +937,186 @@ fn render_task_event(
                 primary: vec![Span::styled(summary, Style::default().fg(Color::Gray))],
                 secondary: Some(raw.to_string()),
             };
-            paint_row(AvatarSlot::None, row, width, when)
+            paint_row(AvatarSlot::None, row, width, when, None)
         }
     }
+}
+
+/// Compose the primary + secondary text for a zen-driven event and
+/// hand it to `paint_row` with the tinted background. Every zen row
+/// follows the same shape — `zen <verb> "<title>"` on the primary line,
+/// a `·`-joined detail string on the secondary, and the ZEN_BADGE
+/// avatar — so the eye recognizes machine-driven rows at a glance.
+fn render_zen_event(
+    zr: ZenReason,
+    title_quoted: &str,
+    from: Column,
+    to: Column,
+    width: usize,
+    when: String,
+) -> Vec<Line<'static>> {
+    let on_zen = |s: Style| s.bg(ZEN_BG);
+    let badge_style = on_zen(
+        Style::default()
+            .fg(ZEN_FG)
+            .add_modifier(Modifier::BOLD),
+    );
+    let verb_style = on_zen(Style::default().fg(Color::Gray));
+    let title_style = on_zen(
+        Style::default()
+            .fg(Color::White)
+            .add_modifier(Modifier::ITALIC),
+    );
+
+    let zen_span = Span::styled("zen", badge_style);
+
+    let (primary, secondary): (Vec<Span<'static>>, Option<String>) = match &zr {
+        ZenReason::Promote { .. } => (
+            vec![
+                zen_span,
+                Span::raw("  "),
+                Span::styled("promoted", verb_style),
+                Span::raw("  "),
+                Span::styled(title_quoted.to_string(), title_style),
+            ],
+            Some("backlog → todo".to_string()),
+        ),
+        ZenReason::Merge { sha } => {
+            let merged = sha
+                .as_deref()
+                .map(|s| format!("merged {s}"))
+                .unwrap_or_else(|| "merged".to_string());
+            (
+                vec![
+                    zen_span,
+                    Span::raw("  "),
+                    Span::styled("merged", verb_style),
+                    Span::raw("  "),
+                    Span::styled(title_quoted.to_string(), title_style),
+                ],
+                Some(join_detail(&["tests green", "ci green", &merged])),
+            )
+        }
+        ZenReason::FailedChecks { cmd, exit } => {
+            let parts: Vec<String> = [
+                cmd.as_ref().map(|c| format!("`{c}`")),
+                exit.as_ref().map(|e| format!("exit {e}")),
+            ]
+            .into_iter()
+            .flatten()
+            .collect();
+            (
+                vec![
+                    zen_span,
+                    Span::raw("  "),
+                    Span::styled("bailed on", verb_style),
+                    Span::raw("  "),
+                    Span::styled(title_quoted.to_string(), title_style),
+                    Span::styled(" — checks failed", on_zen(Style::default().fg(Color::LightRed))),
+                ],
+                if parts.is_empty() {
+                    None
+                } else {
+                    Some(parts.join(" · "))
+                },
+            )
+        }
+        ZenReason::DiffTooLarge { files, lines } => {
+            let parts: Vec<String> = [
+                files.as_ref().map(|f| format!("{f} files")),
+                lines.as_ref().map(|l| format!("{l} lines")),
+            ]
+            .into_iter()
+            .flatten()
+            .collect();
+            (
+                vec![
+                    zen_span,
+                    Span::raw("  "),
+                    Span::styled("bailed on", verb_style),
+                    Span::raw("  "),
+                    Span::styled(title_quoted.to_string(), title_style),
+                    Span::styled(" — diff too large", on_zen(Style::default().fg(Color::Yellow))),
+                ],
+                if parts.is_empty() {
+                    None
+                } else {
+                    Some(parts.join(" · "))
+                },
+            )
+        }
+        ZenReason::DangerPath { paths } => (
+            vec![
+                zen_span,
+                Span::raw("  "),
+                Span::styled("bailed on", verb_style),
+                Span::raw("  "),
+                Span::styled(title_quoted.to_string(), title_style),
+                Span::styled(" — danger path", on_zen(Style::default().fg(Color::Yellow))),
+            ],
+            paths
+                .as_ref()
+                .map(|p| format!("touched: {}", humanize_list(p))),
+        ),
+        ZenReason::CiTimeout { duration } => (
+            vec![
+                zen_span,
+                Span::raw("  "),
+                Span::styled("bailed on", verb_style),
+                Span::raw("  "),
+                Span::styled(title_quoted.to_string(), title_style),
+                Span::styled(" — ci timeout", on_zen(Style::default().fg(Color::Yellow))),
+            ],
+            duration
+                .as_ref()
+                .map(|d| format!("ci timeout after {d}")),
+        ),
+        ZenReason::MergeConflict { files } => (
+            vec![
+                zen_span,
+                Span::raw("  "),
+                Span::styled("bailed on", verb_style),
+                Span::raw("  "),
+                Span::styled(title_quoted.to_string(), title_style),
+                Span::styled(" — merge conflict", on_zen(Style::default().fg(Color::Yellow))),
+            ],
+            files
+                .as_ref()
+                .map(|f| format!("conflict in {}", humanize_list(f))),
+        ),
+        ZenReason::Other => (
+            vec![
+                zen_span,
+                Span::raw("  "),
+                Span::styled(format!("{from} → {to}"), verb_style),
+                Span::raw("  "),
+                Span::styled(title_quoted.to_string(), title_style),
+            ],
+            None,
+        ),
+    };
+
+    paint_row(
+        AvatarSlot::Face {
+            rows: ZEN_BADGE,
+            color: ZEN_FG,
+        },
+        RowText { primary, secondary },
+        width,
+        when,
+        Some(ZEN_BG),
+    )
+}
+
+/// Comma-list → human-readable list: `"a,b,c"` → `"a, b, c"`. Used for
+/// path / file lists that the orchestrator emits as comma-joined
+/// `key=value` payloads.
+fn humanize_list(s: &str) -> String {
+    s.split(',')
+        .map(|p| p.trim())
+        .filter(|p| !p.is_empty())
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 fn render_worker_event(
@@ -841,7 +1163,7 @@ fn render_worker_event(
             color: Color::DarkGray,
         },
     };
-    paint_row(slot, row, width, when)
+    paint_row(slot, row, width, when, None)
 }
 
 /// Build the "<worker>" Span and matching avatar slot for a task
@@ -881,11 +1203,17 @@ const GLYPH_DOT: &str = "·";
 ///   optional secondary on line 2.
 /// - `None` → no avatar column; primary + optional secondary indented
 ///   under the same left margin.
+///
+/// When `bg` is set, every emitted line is given a base style with
+/// that background and each row is padded to `width` so the tint
+/// reaches the right edge — used by [`render_zen_event`] to mark
+/// machine-driven rows.
 fn paint_row(
     slot: AvatarSlot,
     row: RowText,
     width: usize,
     when: String,
+    bg: Option<Color>,
 ) -> Vec<Line<'static>> {
     let when_w = display_w(&when);
     let when_style = Style::default().fg(Color::DarkGray);
@@ -930,26 +1258,32 @@ fn paint_row(
     out.push(Line::from(line1));
 
     // Row 2: avatar + secondary (if any). For glyph/none slots, the
-    // avatar row is blank so the secondary text indents cleanly.
+    // avatar row is blank so the secondary text indents cleanly. When
+    // a bg tint is set every row pads to full width so the highlight
+    // reaches the right edge.
     let row2 = match (row.secondary, has_third_row, !avatar_row2.trim().is_empty()) {
         (Some(detail), _, _) => {
-            let mut spans: Vec<Span<'static>> = vec![
+            let used = display_w(&avatar_row2) + AVATAR_GAP + display_w(&detail);
+            let pad = width.saturating_sub(used);
+            Some(Line::from(vec![
                 Span::styled(avatar_row2, avatar_style),
                 Span::raw(" ".repeat(AVATAR_GAP)),
-            ];
-            spans.push(Span::styled(detail, when_style));
-            Some(Line::from(spans))
+                Span::styled(detail, when_style),
+                Span::raw(" ".repeat(pad)),
+            ]))
         }
         (None, true, _) => {
             // No secondary but we still need the second avatar row to
-            // keep the face intact.
-            Some(Line::from(vec![Span::styled(avatar_row2, avatar_style)]))
+            // keep the face intact. Pad to width so a tint bg fills
+            // the row end-to-end.
+            let pad = width.saturating_sub(display_w(&avatar_row2));
+            Some(Line::from(vec![
+                Span::styled(avatar_row2, avatar_style),
+                Span::raw(" ".repeat(pad)),
+            ]))
         }
         (None, false, false) => None,
-        (None, false, true) => {
-            // Glyph slot with no secondary: skip the row entirely.
-            None
-        }
+        (None, false, true) => None,
     };
     if let Some(l) = row2 {
         out.push(l);
@@ -957,16 +1291,22 @@ fn paint_row(
 
     // Row 3: avatar only (faces); skipped for glyph/none.
     if has_third_row {
-        out.push(Line::from(vec![Span::styled(avatar_row3, avatar_style)]));
+        let pad = width.saturating_sub(display_w(&avatar_row3));
+        out.push(Line::from(vec![
+            Span::styled(avatar_row3, avatar_style),
+            Span::raw(" ".repeat(pad)),
+        ]));
     }
 
-    // For slots with no avatar art at all, indent the secondary line
-    // we already emitted above (or the primary if there was no
-    // secondary) so the column stays anchored. The `indent_w`
-    // constant is used by the empty `pad_to` calls above so this is
-    // automatic — but if the primary line came out shorter than
-    // `indent_w` we don't add extra padding here; the renderer's
-    // left margin already gives us breathing room.
+    // Apply the row tint as a line-level base style — span styles
+    // patch on top, so spans without an explicit bg inherit the tint
+    // and we get a clean contiguous highlight across the row.
+    if let Some(bg) = bg {
+        for l in &mut out {
+            l.style = Style::default().bg(bg);
+        }
+    }
+
     let _ = indent_w;
     out
 }
@@ -1172,6 +1512,233 @@ mod tests {
         let (avatar, color) = avatar_for("frontend");
         assert!(avatar.is_none(), "non-phonetic worker has no avatar");
         assert_eq!(color, Color::Gray);
+    }
+
+    #[test]
+    fn parse_zen_reason_recognizes_each_kind() {
+        assert_eq!(
+            parse_zen_reason("orchestrator:zen-promote category=4"),
+            Some(ZenReason::Promote {
+                category: Some("4".into()),
+            })
+        );
+        assert_eq!(
+            parse_zen_reason("orchestrator:zen-merge sha=abc123"),
+            Some(ZenReason::Merge {
+                sha: Some("abc123".into()),
+            })
+        );
+        assert_eq!(
+            parse_zen_reason("zen:failed-checks cmd=\"cargo test\" exit=1"),
+            Some(ZenReason::FailedChecks {
+                cmd: Some("cargo test".into()),
+                exit: Some("1".into()),
+            }),
+            "quoted command values must survive parsing intact"
+        );
+        assert_eq!(
+            parse_zen_reason("zen:diff-too-large files=12 lines=2543"),
+            Some(ZenReason::DiffTooLarge {
+                files: Some("12".into()),
+                lines: Some("2543".into()),
+            })
+        );
+        assert_eq!(
+            parse_zen_reason("zen:danger-path paths=src/db.rs,migrations/001.sql"),
+            Some(ZenReason::DangerPath {
+                paths: Some("src/db.rs,migrations/001.sql".into()),
+            })
+        );
+        assert_eq!(
+            parse_zen_reason("zen:ci-timeout duration=15m"),
+            Some(ZenReason::CiTimeout {
+                duration: Some("15m".into()),
+            })
+        );
+        assert_eq!(
+            parse_zen_reason("zen:merge-conflict files=Cargo.lock,src/main.rs"),
+            Some(ZenReason::MergeConflict {
+                files: Some("Cargo.lock,src/main.rs".into()),
+            })
+        );
+    }
+
+    #[test]
+    fn parse_zen_reason_keeps_future_zen_prefixes_under_zen_treatment() {
+        // Anything starting with `zen:` or `orchestrator:zen-` we haven't
+        // wired up yet still routes to the zen visual treatment — the
+        // user sees the badge + tint and just doesn't get a per-kind
+        // detail line. Better than silently rendering as a generic row.
+        assert_eq!(
+            parse_zen_reason("orchestrator:zen-decline reason-text=needs-tests"),
+            Some(ZenReason::Other)
+        );
+        assert_eq!(parse_zen_reason("zen:auto-promote"), Some(ZenReason::Other));
+    }
+
+    #[test]
+    fn parse_zen_reason_ignores_non_zen_reasons() {
+        assert!(parse_zen_reason("user:cli:start").is_none());
+        assert!(parse_zen_reason("worker:review-marker").is_none());
+        assert!(parse_zen_reason("").is_none());
+    }
+
+    #[test]
+    fn parse_kv_handles_quotes_and_bare_values() {
+        let kv = parse_kv("a=1 b=\"two words\" c=three");
+        assert_eq!(kv.get("a").map(String::as_str), Some("1"));
+        assert_eq!(kv.get("b").map(String::as_str), Some("two words"));
+        assert_eq!(kv.get("c").map(String::as_str), Some("three"));
+    }
+
+    /// Helper: concatenate the visible content of every span in a
+    /// [`Line`] so tests can assert on rendered text without poking
+    /// into private span structure.
+    fn line_text(line: &Line<'_>) -> String {
+        line.spans
+            .iter()
+            .map(|s| s.content.as_ref())
+            .collect::<String>()
+    }
+
+    /// Helper: build a zen task event the renderer can consume in a
+    /// vacuum (no on-disk task file required — we render the id as the
+    /// title in that case, which is fine for layout tests).
+    fn render_zen_for_test(reason: &str, from: Column, to: Column) -> Vec<Line<'static>> {
+        let mut app = ActivityApp::new("demo");
+        let ts = Utc.with_ymd_and_hms(2026, 6, 23, 12, 0, 0).unwrap();
+        let now = ts + chrono::Duration::minutes(5);
+        let ev = Event::Task {
+            ts,
+            id: "demo-task".into(),
+            from,
+            to,
+            reason: reason.into(),
+            raw: String::new(),
+        };
+        render_event(&ev, &mut app, 80, now, None)
+    }
+
+    #[test]
+    fn render_zen_promote_renders_badge_and_tint() {
+        let lines = render_zen_for_test(
+            "orchestrator:zen-promote category=4",
+            Column::Backlog,
+            Column::Todo,
+        );
+        assert!(
+            lines.len() >= 3,
+            "zen rows always span the 3-row badge avatar"
+        );
+        // Primary line: ZEN badge top edge + 'zen promoted "<title>"'.
+        let l0 = line_text(&lines[0]);
+        assert!(l0.contains("▄▄▄▄"), "top edge of badge missing in {l0:?}");
+        assert!(l0.contains("zen"), "primary missing zen verb in {l0:?}");
+        assert!(l0.contains("promoted"), "primary missing 'promoted' in {l0:?}");
+        // Secondary line carries the "backlog → todo" detail.
+        let l1 = line_text(&lines[1]);
+        assert!(l1.contains("ZEN"), "badge middle row missing in {l1:?}");
+        assert!(l1.contains("backlog → todo"), "secondary detail in {l1:?}");
+        // Every line carries the zen background tint as its base style.
+        for l in &lines {
+            assert_eq!(
+                l.style.bg,
+                Some(ZEN_BG),
+                "every zen row must carry the tint base style: {:?}",
+                line_text(l)
+            );
+        }
+    }
+
+    #[test]
+    fn render_zen_merge_secondary_includes_sha_and_green_checks() {
+        let lines = render_zen_for_test(
+            "orchestrator:zen-merge sha=abc123",
+            Column::Review,
+            Column::Done,
+        );
+        let l0 = line_text(&lines[0]);
+        assert!(l0.contains("merged"), "primary should say 'merged': {l0:?}");
+        let l1 = line_text(&lines[1]);
+        assert!(l1.contains("tests green"), "secondary missing tests-green: {l1:?}");
+        assert!(l1.contains("ci green"), "secondary missing ci-green: {l1:?}");
+        assert!(l1.contains("merged abc123"), "secondary missing sha: {l1:?}");
+    }
+
+    #[test]
+    fn render_zen_failed_checks_shows_command_and_exit_in_secondary() {
+        let lines = render_zen_for_test(
+            "zen:failed-checks cmd=\"cargo test\" exit=1",
+            Column::InProgress,
+            Column::Review,
+        );
+        let l0 = line_text(&lines[0]);
+        assert!(l0.contains("bailed on"), "primary missing 'bailed on': {l0:?}");
+        assert!(l0.contains("— checks failed"), "primary missing bail tag: {l0:?}");
+        let l1 = line_text(&lines[1]);
+        assert!(l1.contains("`cargo test`"), "secondary missing failing cmd: {l1:?}");
+        assert!(l1.contains("exit 1"), "secondary missing exit code: {l1:?}");
+    }
+
+    #[test]
+    fn render_zen_diff_too_large_secondary_is_files_lines() {
+        let lines = render_zen_for_test(
+            "zen:diff-too-large files=12 lines=2543",
+            Column::InProgress,
+            Column::Review,
+        );
+        let l1 = line_text(&lines[1]);
+        assert!(l1.contains("12 files"), "got {l1:?}");
+        assert!(l1.contains("2543 lines"), "got {l1:?}");
+    }
+
+    #[test]
+    fn render_zen_danger_path_humanizes_comma_list() {
+        let lines = render_zen_for_test(
+            "zen:danger-path paths=src/db.rs,migrations/001.sql",
+            Column::InProgress,
+            Column::Review,
+        );
+        let l1 = line_text(&lines[1]);
+        assert!(l1.contains("touched: src/db.rs, migrations/001.sql"), "got {l1:?}");
+    }
+
+    #[test]
+    fn render_zen_ci_timeout_secondary_has_duration() {
+        let lines = render_zen_for_test(
+            "zen:ci-timeout duration=15m",
+            Column::InProgress,
+            Column::Review,
+        );
+        let l1 = line_text(&lines[1]);
+        assert!(l1.contains("ci timeout after 15m"), "got {l1:?}");
+    }
+
+    #[test]
+    fn render_zen_merge_conflict_secondary_humanizes_files() {
+        let lines = render_zen_for_test(
+            "zen:merge-conflict files=Cargo.lock,src/main.rs",
+            Column::InProgress,
+            Column::Review,
+        );
+        let l1 = line_text(&lines[1]);
+        assert!(l1.contains("conflict in Cargo.lock, src/main.rs"), "got {l1:?}");
+    }
+
+    #[test]
+    fn user_action_rows_do_not_carry_zen_tint() {
+        // Regression — `started`, `finished`, default `Promoted`, etc.
+        // must keep `Line.style.bg == None` so the zen tint stays a
+        // distinguishing visual signal.
+        let lines = render_zen_for_test("user:cli:start", Column::Todo, Column::InProgress);
+        for l in &lines {
+            assert_eq!(
+                l.style.bg,
+                None,
+                "user-action row should not carry zen bg: {:?}",
+                line_text(l)
+            );
+        }
     }
 
     #[test]
