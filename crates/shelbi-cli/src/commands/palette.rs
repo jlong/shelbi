@@ -15,7 +15,7 @@ use crossterm::{
 };
 use ratatui::{
     backend::CrosstermBackend,
-    layout::{Constraint, Direction, Layout},
+    layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::{List, ListItem, ListState, Paragraph, Wrap},
@@ -29,17 +29,36 @@ pub fn run(project: String) -> Result<()> {
     let mut term = setup_terminal()?;
     let mut state = State::new(&project)?;
 
-    let chosen = picker_loop(&mut term, &mut state);
-
-    // "Switch project" and "Quit Shelbi" both stay inside the same
-    // alt-screen so the follow-up screen is just a re-render —
-    // restoring the terminal first would flash the popup back to its
-    // host pane mid-flow.
-    let switch_target = match &chosen {
-        Ok(Some(entry)) if entry.id == "action:switch-project" => {
-            run_project_picker(&mut term, &project)?
+    // Sub-screens share the palette's alt-screen so the follow-up
+    // surface is a re-render rather than a popup-pane flash:
+    //
+    // - Switch Project — sub-picker. Esc inside it exits the palette
+    //   (preserves the prior single-shot UX so the popup feels like a
+    //   one-key chord).
+    // - Quit Project — confirmation popover. Cancel bounces back to
+    //   the main picker so a fat-fingered Enter on the destructive
+    //   action doesn't kick the user out of the palette entirely —
+    //   they can pick a different option without re-summoning it.
+    // - Quit Shelbi — confirmation popover. Handled below the loop
+    //   because its cancel-path exits the palette (matches the prior
+    //   single-shot UX for that entry); quit-project's bounce-back
+    //   loop here intentionally diverges.
+    let (chosen, switch_target, quit_project_confirmed) = loop {
+        let chosen = picker_loop(&mut term, &mut state);
+        match &chosen {
+            Ok(Some(entry)) if entry.id == "action:switch-project" => {
+                let target = run_project_picker(&mut term, &project)?;
+                break (chosen, target, false);
+            }
+            Ok(Some(entry)) if entry.id == "action:quit-project" => {
+                if run_quit_project_confirm(&mut term, &project)? {
+                    break (chosen, None, true);
+                }
+                // Cancel: re-enter the main picker with state preserved.
+                continue;
+            }
+            _ => break (chosen, None, false),
         }
-        _ => None,
     };
     let quit_shelbi_confirmed = match &chosen {
         Ok(Some(entry)) if entry.id == "action:quit-shelbi" => {
@@ -52,10 +71,15 @@ pub fn run(project: String) -> Result<()> {
 
     if let Some(target) = switch_target {
         switch_to_project(&target)?;
+    } else if quit_project_confirmed {
+        super::quit_project::run(&project)?;
     } else if quit_shelbi_confirmed {
         super::quit_shelbi::run()?;
     } else if let Ok(Some(entry)) = chosen {
-        if entry.id != "action:switch-project" && entry.id != "action:quit-shelbi" {
+        if entry.id != "action:switch-project"
+            && entry.id != "action:quit-project"
+            && entry.id != "action:quit-shelbi"
+        {
             dispatch(&project, &entry)?;
         }
     }
@@ -461,9 +485,10 @@ fn dispatch(project: &str, entry: &Entry) -> Result<()> {
             .map_err(|e| anyhow::anyhow!(e))?;
         return Ok(());
     }
-    if entry.id == "action:quit-project" {
-        super::quit_project::run(project)?;
-    }
+    // `action:quit-project` is intentionally not handled here — the
+    // outer `run` flow gates it behind a confirmation popover and
+    // invokes `super::quit_project::run` directly on confirm. Routing
+    // it through `dispatch` would bypass the popover.
     Ok(())
 }
 
@@ -677,8 +702,6 @@ fn run_quit_shelbi_confirm<B: ratatui::backend::Backend>(
                 if k.kind != KeyEventKind::Press {
                     continue;
                 }
-                // Mirror the main palette: Ctrl+C / Ctrl+P close the
-                // popover without firing the destructive path.
                 if k.modifiers.contains(KeyModifiers::CONTROL)
                     && matches!(k.code, KeyCode::Char('c') | KeyCode::Char('p'))
                 {
@@ -687,10 +710,49 @@ fn run_quit_shelbi_confirm<B: ratatui::backend::Backend>(
                 match k.code {
                     KeyCode::Esc => return Ok(false),
                     KeyCode::Enter => return Ok(focus_quit),
-                    KeyCode::Left
-                    | KeyCode::Right
-                    | KeyCode::Tab
-                    | KeyCode::BackTab => {
+                    KeyCode::Left | KeyCode::Right | KeyCode::Tab | KeyCode::BackTab => {
+                        focus_quit = !focus_quit;
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+}
+
+// "Quit Project" confirmation popover
+//
+// A second ratatui screen sharing the palette's alt-screen, same
+// pattern as `run_project_picker`. Lists each declared worker whose
+// tmux pane is currently live, with its state + assigned task, so
+// users see exactly what's about to be torn down. Cancel is default
+// focus — this is a guard against accidental confirmation, so the
+// safe button is the one Enter activates by default.
+
+fn run_quit_project_confirm<B: ratatui::backend::Backend>(
+    term: &mut Terminal<B>,
+    project: &str,
+) -> Result<bool> {
+    let workers = super::quit_project::list_active_workers(project);
+    let mut focus_quit = false;
+
+    loop {
+        term.draw(|f| render_quit_project_confirm(f, project, &workers, focus_quit))?;
+
+        if event::poll(Duration::from_millis(150))? {
+            if let Event::Key(k) = event::read()? {
+                if k.kind != KeyEventKind::Press {
+                    continue;
+                }
+                if k.modifiers.contains(KeyModifiers::CONTROL)
+                    && matches!(k.code, KeyCode::Char('c') | KeyCode::Char('p'))
+                {
+                    return Ok(false);
+                }
+                match k.code {
+                    KeyCode::Esc => return Ok(false),
+                    KeyCode::Enter => return Ok(focus_quit),
+                    KeyCode::Left | KeyCode::Right | KeyCode::Tab | KeyCode::BackTab => {
                         focus_quit = !focus_quit;
                     }
                     _ => {}
@@ -745,12 +807,79 @@ fn render_quit_shelbi_confirm(
             ]))
         })
         .collect();
-    let list = List::new(items);
-    f.render_widget(list, layout[4]);
+    f.render_widget(List::new(items), layout[4]);
 
-    // Destructive button gets the red tint when focused; the cancel
-    // button gets the standard blue highlight. Unfocused buttons
-    // render dim so the focused option is unambiguous at a glance.
+    render_confirm_buttons(f, layout[6], "Quit Shelbi", focus_quit);
+    render_confirm_footer(f, layout[7]);
+}
+
+fn render_quit_project_confirm(
+    f: &mut Frame,
+    project: &str,
+    workers: &[super::quit_project::ActiveWorker],
+    focus_quit: bool,
+) {
+    let area = f.area();
+    let layout = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(1), // title
+            Constraint::Length(1), // blank
+            Constraint::Length(3), // warning body (wraps)
+            Constraint::Length(1), // blank
+            Constraint::Min(1),    // worker list / empty state
+            Constraint::Length(1), // blank
+            Constraint::Length(1), // buttons
+            Constraint::Length(1), // footer
+        ])
+        .split(area);
+
+    let title = Paragraph::new(Line::from(Span::styled(
+        format!("Quit project: {project}?"),
+        Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+    )));
+    f.render_widget(title, layout[0]);
+
+    let body = Paragraph::new(
+        "This will close the project session and any worker panes. In-flight \
+         task changes will remain in worker worktrees but won't be merged.",
+    )
+    .style(Style::default().fg(Color::Gray))
+    .wrap(Wrap { trim: true });
+    f.render_widget(body, layout[2]);
+
+    if workers.is_empty() {
+        let empty =
+            Paragraph::new("No active workers.").style(Style::default().fg(Color::DarkGray));
+        f.render_widget(empty, layout[4]);
+    } else {
+        let items: Vec<ListItem> = workers
+            .iter()
+            .map(|w| {
+                ListItem::new(Line::from(vec![
+                    Span::raw(format!("  {:<14}  ", w.name)),
+                    Span::styled(
+                        format!("{:<16}", w.state),
+                        Style::default().fg(Color::Yellow),
+                    ),
+                    Span::styled(
+                        format!("  {}", w.task),
+                        Style::default().fg(Color::DarkGray),
+                    ),
+                ]))
+            })
+            .collect();
+        f.render_widget(List::new(items), layout[4]);
+    }
+
+    render_confirm_buttons(f, layout[6], "Quit project", focus_quit);
+    render_confirm_footer(f, layout[7]);
+}
+
+// Destructive button gets the red tint when focused; the cancel
+// button gets the standard blue highlight. Unfocused buttons
+// render dim so the focused option is unambiguous at a glance.
+fn render_confirm_buttons(f: &mut Frame, area: Rect, quit_label: &str, focus_quit: bool) {
     let cancel_style = if focus_quit {
         Style::default().fg(Color::DarkGray)
     } else {
@@ -770,18 +899,20 @@ fn render_quit_shelbi_confirm(
     let buttons = Paragraph::new(Line::from(vec![
         Span::styled("  [ Cancel ]  ", cancel_style),
         Span::raw("  "),
-        Span::styled("  [ Quit Shelbi ]  ", quit_style),
+        Span::styled(format!("  [ {quit_label} ]  "), quit_style),
     ]));
-    f.render_widget(buttons, layout[6]);
+    f.render_widget(buttons, area);
+}
 
+fn render_confirm_footer(f: &mut Frame, area: Rect) {
     let footer = Paragraph::new(Line::from(vec![Span::styled(
         "←→/Tab switch · Enter activate · Esc cancel",
         Style::default().fg(Color::DarkGray),
     )]));
-    f.render_widget(footer, layout[7]);
+    f.render_widget(footer, area);
 }
 
-/// Per-project worker-count suffix shown in the confirm popover.
+/// Per-project worker-count suffix shown in the Quit Shelbi popover.
 /// Singular/plural distinction kept so `1 active worker` reads
 /// naturally — matches how `picker.rs` formats machine/worker counts.
 fn format_active_workers(n: usize) -> String {
