@@ -7,8 +7,11 @@
 //!   orchestrator sequences to drive a merge.
 //!
 //! Mode toggles persist in `~/.shelbi/projects/<project>/state.json::zen_mode`
-//! and write a `zen=<state>` line to `~/.shelbi/events.log` tagged
-//! `reason=user:zen-<action>`.
+//! and write a `mode=zen <prev> -> <new> reason=user:cli` line to
+//! `~/.shelbi/events.log`. The Alt+Z hotkey and the (future) crash-recovery
+//! path emit the same shape with `reason=user:hotkey` and
+//! `reason=system:crash-recovery` respectively — the orchestrator reacts to
+//! all three the same way.
 //!
 //! All non-toggle commands print a single line on stdout (probe prints JSON)
 //! and use exit-code + stderr for failures. The orchestrator parses the
@@ -22,7 +25,7 @@ use clap::Subcommand;
 use shelbi_core::{Column, Task};
 use shelbi_orchestrator::zen::{self, CiVerdict};
 use shelbi_state::{
-    append_project_event, list_column, load_project, read_state, write_state, State, ZenModeState,
+    append_zen_mode_event, list_column, load_project, read_state, write_state, State, ZenModeState,
 };
 
 use crate::commands::require_project;
@@ -64,15 +67,19 @@ pub enum ZenCmd {
     /// Squash-merge the PR and delete the source branch. Prints the
     /// merge SHA on stdout.
     PrMerge { pr_number: u64 },
+    /// Print backlog task ids that are mechanically eligible for Zen
+    /// auto-promotion, one per line, in priority order. Mechanical only —
+    /// the orchestrator's prompt applies the judgment categories on top.
+    Scan,
 }
 
 pub fn run(project_opt: Option<String>, cmd: ZenCmd) -> Result<()> {
     let project_name = require_project(project_opt)?;
 
     match cmd {
-        ZenCmd::On => set(&project_name, ZenModeState::On, "on"),
-        ZenCmd::Off => set(&project_name, ZenModeState::Off, "off"),
-        ZenCmd::Pause => set(&project_name, ZenModeState::Paused, "pause"),
+        ZenCmd::On => set(&project_name, ZenModeState::On),
+        ZenCmd::Off => set(&project_name, ZenModeState::Off),
+        ZenCmd::Pause => set(&project_name, ZenModeState::Paused),
         ZenCmd::Status => status(&project_name),
         ZenCmd::Probe { task_id } => {
             let project = load_project(&project_name).map_err(|e| anyhow!(e))?;
@@ -124,18 +131,23 @@ pub fn run(project_opt: Option<String>, cmd: ZenCmd) -> Result<()> {
             println!("{sha}");
             Ok(())
         }
+        ZenCmd::Scan => {
+            let project = load_project(&project_name).map_err(|e| anyhow!(e))?;
+            let ids = zen::mechanically_eligible(&project).map_err(|e| anyhow!(e))?;
+            for id in ids {
+                println!("{id}");
+            }
+            Ok(())
+        }
     }
 }
 
-fn set(project: &str, target: ZenModeState, action: &str) -> Result<()> {
+fn set(project: &str, target: ZenModeState) -> Result<()> {
     let mut state = read_state(project).map_err(|e| anyhow!(e))?;
+    let prev = state.zen_mode;
     state.zen_mode = target;
     write_state(project, &state).map_err(|e| anyhow!(e))?;
-    let _ = append_project_event(
-        project,
-        &format!("zen={}", target.as_str()),
-        &format!("user:zen-{action}"),
-    );
+    let _ = append_zen_mode_event(prev.as_str(), target.as_str(), "user:cli");
     print_status(project, &state)
 }
 

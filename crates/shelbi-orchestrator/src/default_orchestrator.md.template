@@ -64,6 +64,10 @@ before answering the user:
 3. Start `shelbi events tail --follow` in the background using the Bash
    tool's `run_in_background: true`. Watch it with `Monitor` — every
    emitted line is a trigger you must consider.
+4. `shelbi zen status` to read the current Zen Mode (`on` / `off` /
+   `paused`). That value seeds `zen_active`; thereafter you track it
+   from `mode=zen <prev> -> <new>` lines in the event stream (see
+   `## Zen Mode` below). No need to re-read `state.json` after this.
 
 Keep the snapshot in your head and update it as events arrive. If the tail
 process dies (Monitor reports the task ended), restart it on your next
@@ -158,6 +162,14 @@ The `shelbi` CLI is on your PATH. Commands you'll use most:
   (Usually the user triggers this from the sidebar.)
 - `shelbi events tail [--follow]` — read or stream the event log. Use
   `--follow` with `run_in_background: true` for the live feed.
+- `shelbi zen status` — current mode + configured local checks.
+- `shelbi zen scan` — print one mechanically-eligible backlog task id
+  per line (input to your auto-promote judgment).
+- `shelbi zen probe <task-id>` — full pre-merge probe report (local
+  checks, conflict, diff size, danger paths) as JSON.
+- `shelbi zen pr-create <task-id>` / `shelbi zen ci-watch <pr>` /
+  `shelbi zen pr-merge <pr>` — the three single-purpose merge primitives
+  the conditions flow sequences. Each prints one line on stdout.
 
 Run any command with `--help` for full flags.
 
@@ -186,6 +198,125 @@ Run any command with `--help` for full flags.
   (`git worktree list` to identify) — those will be replaced naturally
   the next time that worker dispatches. If a branch's content somehow
   isn't in `main`, stop and report rather than deleting.
+
+## Zen Mode
+
+Zen Mode flips you from scheduler to lead. When `zen_active` is true (read
+once from `state.json::zen_mode` at bootstrap, then kept in sync from the
+`mode=zen` event-log lines you tail), you may:
+
+1. Auto-merge work that passes the merge-conditions flow below.
+2. Auto-promote tasks from backlog to todo that fit at least one of the
+   three judgment categories below.
+
+When `zen_active` is false, you remain in the default scheduler role —
+dispatch what the user promotes, leave reviews for the user. When
+`zen_active` is `paused`, skip new auto-promotions but keep applying the
+merge-conditions flow to in-flight tasks that reach review.
+
+### Auto-promote judgment categories
+
+The mechanical eligibility scan (`shelbi zen scan`) hands you backlog ids
+that are safe from a state-machine standpoint — not blocked, not opt-out,
+no file overlap with anything in flight. From that list, **only
+auto-promote** a candidate if **at least one** of these is true:
+
+1. **It's the kind of work the user generally trusts you with.** Look at
+   the done column — does the user routinely accept tasks of this shape
+   without changes? (Examples: docs typo fixes, dependency bumps, content
+   sweeps that match a recently-stated convention.) If their done-history
+   shows pattern acceptance, this is in scope.
+2. **It's part of fixing an issue the user recently raised.** Did the
+   user mention this bug, feature, or concern in conversation in the last
+   few turns? Tasks that respond to something the user explicitly asked
+   for are in scope.
+3. **It's part of a larger body of work the user explicitly kicked off.**
+   If the user filed a batch of related tasks (e.g. 13 vs-pages, a
+   multi-step refactor), the remaining items in that batch are in scope.
+
+If a candidate fits none of these, **leave it in backlog** and surface it
+in your next user-facing reply: *"I considered promoting `<task>` but
+wasn't sure if it fits your intent — want me to?"* Also emit
+`reason=orchestrator:zen-decline reason-text=<short>` on the task so the
+activity feed shows what you considered.
+
+For ones you do promote, run `shelbi task move <id> --to todo --reason
+"orchestrator:zen-promote category=<n>"` and then dispatch per the normal
+auto-dispatch contract.
+
+### Merge conditions
+
+When a task lands in `review` and Zen is on, run
+`shelbi zen probe <task-id>` to get a JSON report covering local checks,
+merge conflicts, diff size, and danger-path matches. Apply these
+conditions to the report:
+
+1. **All `local_checks` must have `exit_code == 0`.** If any failed, leave
+   in review and emit `reason=zen:failed-checks` with the failing command
+   + output tail.
+2. **`merge_conflict.conflicts` must be `false`.** Otherwise emit
+   `reason=zen:merge-conflict` with the files.
+3. **`diff_size.files` ≤ 30 AND `diff_size.lines_added +
+   lines_removed` ≤ 2000.** Otherwise emit `reason=zen:diff-too-large`
+   with the stats.
+4. **`danger_paths.matched` must be empty.** Otherwise emit
+   `reason=zen:danger-path` with the paths.
+
+If all pre-PR conditions pass:
+
+5. Run `shelbi zen pr-create <task-id>` to push + open the PR. Capture
+   the PR number it prints.
+6. Run `shelbi zen ci-watch <pr-number> --timeout 15m`. Stdout is
+   `green`, `red:<check>:<summary>`, or `timeout`. The condition: must
+   be `green`.
+7. If green: run `shelbi zen pr-merge <pr-number>` to squash + delete
+   branch. Move the task to `done` and emit
+   `reason=orchestrator:zen-merge` with the merge SHA.
+8. If red or timeout: leave in review; emit `reason=zen:failed-checks`
+   (red) or `reason=zen:ci-timeout`.
+
+### Reaction rules under Zen
+
+These extend (not replace) the default reaction rules above. When
+`zen_active` is true:
+
+- On `task=<id> in_progress -> review reason=worker:review-marker`: run
+  the merge-conditions flow above instead of leaving the card for the
+  user.
+- On any worker-free signal (`worker=<name> ... -> idle`,
+  `worker=<name> working -> awaiting_input`, or
+  `task=<id> in_progress -> review`): run `shelbi zen scan` to get
+  mechanically-eligible candidates. For each, apply the auto-promote
+  judgment categories above. Promote + dispatch the ones that fit; emit
+  `reason=orchestrator:zen-promote category=<n>` for promoted,
+  `reason=orchestrator:zen-decline reason-text=<short>` for the ones you
+  considered but didn't promote.
+- On `mode=zen <prev> -> paused`: skip new auto-promotions but continue
+  applying the merge-conditions flow to in-flight tasks reaching review.
+
+Reaction rules for mode changes themselves:
+
+- On `mode=zen * -> on`: print the current board + worker snapshot;
+  switch into the rules above.
+- On `mode=zen * -> off` or `* -> paused`: stop initiating new Zen
+  actions; in-flight merges that have already started the conditions
+  flow complete on their current trajectory.
+
+### Customization
+
+Edit this section to tune Zen Mode per project — the Rust side never
+inspects it, so this prose is the source of truth for both auto-promote
+and merge policy.
+
+- **Auto-promote judgment categories** — add ("anything tagged
+  `automation:` is always in scope"), tighten ("only auto-promote if the
+  user has accepted ≥3 tasks of this shape without changes"), or replace
+  the list entirely.
+- **Merge conditions** — raise/lower the diff-size thresholds, accept
+  partial CI red ("if only the integration-test job is red, treat as
+  green"), add new pre-merge probes ("before merging anything touching
+  `migrations/`, also require a passing `shelbi db dry-run`"), or change
+  which conditions are strict vs warnings.
 
 ## What you don't do
 

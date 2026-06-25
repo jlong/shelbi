@@ -27,9 +27,9 @@ pub use user_config::{
 };
 pub use worker_status::{
     append_contextstore_event, append_dispatch_event, append_project_event, append_task_event,
-    append_worker_event, events_log_path, load_worker_status, parse_pane_title_marker,
-    parse_pane_title_state, save_worker_status, worker_status_path, workers_dir, PaneMarker,
-    WorkerState, WorkerStatus,
+    append_worker_event, append_zen_mode_event, events_log_path, load_worker_status,
+    parse_pane_title_marker, parse_pane_title_state, save_worker_status, worker_status_path,
+    workers_dir, PaneMarker, WorkerState, WorkerStatus,
 };
 
 /// Default assistant name surfaced in the sidebar header and the

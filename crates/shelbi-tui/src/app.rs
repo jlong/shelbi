@@ -4,7 +4,7 @@ use anyhow::Result;
 use ratatui::layout::Rect;
 use shelbi_core::{Agent, Column, Status};
 use shelbi_state::{
-    append_project_event, load_worker_status, read_state, write_state, TaskFile, WorkerState,
+    append_zen_mode_event, load_worker_status, read_state, write_state, TaskFile, WorkerState,
     ZenModeState, ZenToggleChord,
 };
 
@@ -315,9 +315,9 @@ impl App {
 
     /// Flip `state.json::zen_mode` between On and Off, mirroring the
     /// `shelbi zen on|off` CLI: write the new state, then best-effort
-    /// append a `user:zen-<action>` line to `~/.shelbi/events.log`.
-    /// Paused collapses to On here because the spec is a binary toggle —
-    /// the CLI is still the path for Paused.
+    /// append a `mode=zen <prev> -> <new> reason=user:hotkey` line to
+    /// `~/.shelbi/events.log`. Paused collapses to On here because the
+    /// spec is a binary toggle — the CLI is still the path for Paused.
     pub fn toggle_zen_mode(&mut self) {
         let target = match self.zen_mode {
             ZenModeState::On => ZenModeState::Off,
@@ -329,19 +329,17 @@ impl App {
             ZenModeState::Paused => "pause",
         };
         let mut state = read_state(&self.project_name).unwrap_or_default();
+        let prev = state.zen_mode;
         state.zen_mode = target;
         if let Err(e) = write_state(&self.project_name, &state) {
             self.status_line = format!("zen toggle failed: {e}");
             return;
         }
         // Best-effort: event-log write failures don't undo the toggle —
-        // the user flipped Zen and got what they asked for. Mirror the
-        // CLI's pattern in `shelbi zen`.
-        let _ = append_project_event(
-            &self.project_name,
-            &format!("zen={}", target.as_str()),
-            &format!("user:zen-{action}"),
-        );
+        // the user flipped Zen and got what they asked for. Source tag
+        // `user:hotkey` distinguishes this path from the CLI (`user:cli`)
+        // and the future crash-recovery path (`system:crash-recovery`).
+        let _ = append_zen_mode_event(prev.as_str(), target.as_str(), "user:hotkey");
         self.zen_mode = target;
         self.status_line = format!("zen {action}");
     }
@@ -1032,15 +1030,18 @@ mod tests {
         app.toggle_zen_mode();
         assert_eq!(app.zen_mode, shelbi_state::ZenModeState::Off);
 
-        // Events log got both transitions in order with the documented
-        // reason tags, so the activity feed can show who flipped what.
+        // Events log got both transitions in the canonical mode=zen shape
+        // tagged with `user:hotkey` so the orchestrator's tail and the
+        // activity feed can both pick them up.
         let log = std::fs::read_to_string(shelbi_state::events_log_path().unwrap()).unwrap();
-        let on_line = log.lines().find(|l| l.contains("reason=user:zen-on"));
-        let off_line = log.lines().find(|l| l.contains("reason=user:zen-off"));
+        let on_line = log
+            .lines()
+            .find(|l| l.contains("mode=zen off -> on reason=user:hotkey"));
+        let off_line = log
+            .lines()
+            .find(|l| l.contains("mode=zen on -> off reason=user:hotkey"));
         assert!(on_line.is_some(), "missing zen-on event in: {log}");
         assert!(off_line.is_some(), "missing zen-off event in: {log}");
-        assert!(on_line.unwrap().contains("project=demo zen=on"));
-        assert!(off_line.unwrap().contains("project=demo zen=off"));
 
         std::env::remove_var("SHELBI_HOME");
     }
