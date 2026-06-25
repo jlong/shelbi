@@ -1,0 +1,204 @@
+---
+title: shelbi zen
+order: 26
+summary: Toggle Zen Mode and run the introspection + merge primitives the orchestrator sequences during auto-merge.
+---
+
+# shelbi zen
+
+```text
+shelbi zen <SUBCOMMAND> [OPTIONS]
+```
+
+`shelbi zen` is the CLI face of [Zen Mode](/docs/concepts/zen-mode).
+The toggle subcommands (`on`, `off`, `pause`, `status`) flip the
+project's mode in `state.json` and write a `mode=zen <prev> -> <new>
+reason=user:cli` line to `~/.shelbi/events.log` — the orchestrator
+reads those events to know when to switch behavior.
+
+The remaining subcommands are single-purpose primitives. The
+orchestrator sequences them per the prompt's merge-conditions
+policy; each one does exactly one thing and prints a single line on
+stdout. The same primitives are available to you at the shell when
+you want to probe a branch or open a PR by hand without flipping the
+global mode.
+
+Every subcommand accepts the global `-p / --project <PROJECT>` flag
+to target a specific project (otherwise the active `$SHELBI_PROJECT`
+or the closest `.shelbi/project` marker wins). It's omitted from the
+per-subcommand tables to keep them readable.
+
+## on
+
+```text
+shelbi zen on
+```
+
+Turn Zen Mode on. The orchestrator may auto-merge and auto-promote
+finished tasks per the project's prompt without waiting on a human
+reviewer. Idempotent. Mirrors `Alt+Z` in the TUI.
+
+## off
+
+```text
+shelbi zen off
+```
+
+Turn Zen Mode off. Every promotion goes through manual review.
+In-flight workers keep going; nothing already running is cancelled.
+
+## pause
+
+```text
+shelbi zen pause
+```
+
+Pause Zen Mode — no *new* auto-promotions, but tasks already on the
+Zen track may still complete their merge. Use this to triage incoming
+work yourself for a bit without losing the auto-merge benefit on
+stuff already in motion.
+
+## status
+
+```text
+shelbi zen status
+```
+
+Print the current mode, the project's configured local check
+commands, the resolved danger-paths list (with detected project
+shapes labeled inline), the last crash timestamp (if any), and the
+count of in-flight tasks on the Zen track. Cheap and safe to call
+repeatedly.
+
+## scan
+
+```text
+shelbi zen scan
+```
+
+Print backlog task ids that are *mechanically* eligible for Zen
+auto-promotion, one per line, in priority order. "Mechanical" means
+not blocked on dependencies, not opted out via task frontmatter, and
+no file overlap with anything currently in flight. The orchestrator's
+prompt applies the judgment categories on top of this list — see
+[the judgment layer](/docs/concepts/zen-mode#the-judgment-layer).
+
+## probe
+
+```text
+shelbi zen probe <ID>
+```
+
+Run every readiness probe for the task and print the full report as
+pretty JSON. Covers the four pre-PR conditions the orchestrator
+checks before opening a PR: local checks, merge-conflict probe, diff
+size, and danger-path matches.
+
+The task must be assigned to a worker so the probe knows which
+worktree to read from.
+
+| Argument | Type | Default | Description |
+| --- | --- | --- | --- |
+| `<ID>` | string | — | Task id to probe (required). |
+
+## pr-create
+
+```text
+shelbi zen pr-create <ID>
+```
+
+Push the worker's branch and open a PR for the task. Idempotent — if
+an open PR for the branch already exists, returns its number instead
+of opening a second one. Prints the PR number on stdout.
+
+| Argument | Type | Default | Description |
+| --- | --- | --- | --- |
+| `<ID>` | string | — | Task id whose branch to push and PR (required). |
+
+## ci-watch
+
+```text
+shelbi zen ci-watch [OPTIONS] <PR_NUMBER>
+```
+
+Poll `gh pr checks --required <PR_NUMBER>` until every required
+check settles or the timeout fires. Prints one of:
+
+- `green` — all required checks passed; exit 0.
+- `red:<check>:<summary>` — at least one required check failed;
+  exit 1.
+- `timeout` — checks still pending when the deadline hit; exit 2.
+
+| Flag | Type | Default | Description |
+| --- | --- | --- | --- |
+| `<PR_NUMBER>` | integer | — | The PR number returned by `pr-create` (required). |
+| `--timeout <DURATION>` | duration | project's `zen.ci_timeout` (default `15m`) | Override the wait. Accepts `30s`, `5m`, `2h`, `1d`, or a bare integer of seconds. |
+
+## pr-merge
+
+```text
+shelbi zen pr-merge <PR_NUMBER>
+```
+
+Squash-merge the PR and delete its source branch. Prints the merge
+SHA on stdout. Use this only after `ci-watch` reports `green` —
+there's no built-in safeguard, the orchestrator's prompt is what
+sequences the checks.
+
+| Argument | Type | Default | Description |
+| --- | --- | --- | --- |
+| `<PR_NUMBER>` | integer | — | The PR number to merge (required). |
+
+## Examples
+
+Flip Zen on for the current project:
+
+```bash
+shelbi zen on
+```
+
+See the resolved danger-path list and configured local checks:
+
+```bash
+shelbi zen status
+```
+
+Inspect what Zen would consider promoting right now (without
+promoting anything):
+
+```bash
+shelbi zen scan
+```
+
+Run the full pre-merge probe by hand on a finished branch and pipe it
+through `jq`:
+
+```bash
+shelbi zen probe docs-write-cli-reference-pages | jq .
+```
+
+Drive the full merge flow manually, one primitive at a time —
+exactly the sequence the orchestrator runs internally:
+
+```bash
+PR=$(shelbi zen pr-create docs-write-cli-reference-pages)
+shelbi zen ci-watch "$PR" --timeout 10m && shelbi zen pr-merge "$PR"
+```
+
+Pause Zen during a release window without aborting in-flight merges:
+
+```bash
+shelbi zen pause
+```
+
+## See also
+
+- [Zen Mode](/docs/concepts/zen-mode) — the full mental model, the
+  high-confidence bar, and how to tune the judgment categories per
+  project.
+- [The orchestrator](/docs/concepts/orchestrator) — how the prompt
+  template that drives Zen's policy is loaded.
+- [The events log](/docs/concepts/events-log) — the `mode=zen` and
+  `orchestrator:zen-*` lines the toggles and primitives emit.
+- [`shelbi merge`](/docs/cli/merge) — the user-driven counterpart
+  that lands a single reviewed branch without the Zen bar.

@@ -160,6 +160,17 @@ calling out because the temptation when watching a fast loop is to let
 the orchestrator do *more*. Don't — the boundaries are what keep the
 workflow legible.
 
+## Going further: Zen Mode
+
+When you're ready to let the orchestrator initiate instead of just
+scheduling, [Zen Mode](/docs/concepts/zen-mode) is the next-level
+autonomy switch. It flips the agent from scheduler to lead: it
+auto-promotes backlog into todo when it judges the work in scope, and
+it lands finished branches past a project-defined confidence bar
+without waiting on a human reviewer. The policy that decides "in
+scope" lives in the same prompt template described above — you tune
+it by editing prose, not code.
+
 ## See also
 
 - [Workers](/docs/concepts/workers) — what the orchestrator dispatches
@@ -168,3 +179,5 @@ workflow legible.
   reading and writing.
 - [The events log](/docs/concepts/events-log) — the orchestrator's
   live feed.
+- [Zen Mode](/docs/concepts/zen-mode) — flipping the orchestrator
+  from scheduler to lead.
