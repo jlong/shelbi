@@ -1068,7 +1068,7 @@ fn render_zen_dryrun_event(
         ],
         secondary: Some(detail.replace('_', " ")),
     };
-    paint_row(AvatarSlot::None, row, width, when)
+    paint_row(AvatarSlot::None, row, width, when, None)
 }
 
 fn humanize_dryrun_action(action: &str) -> String {
