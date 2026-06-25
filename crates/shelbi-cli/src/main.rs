@@ -80,13 +80,6 @@ enum Cmd {
         #[command(subcommand)]
         cmd: commands::events::EventsCmd,
     },
-    /// Zen Mode PR primitives — push a task's branch, watch its CI, and
-    /// squash-merge it. Each subcommand prints a single line on stdout
-    /// for the orchestrator to parse; failure detail goes to stderr.
-    Zen {
-        #[command(subcommand)]
-        cmd: commands::zen::ZenCmd,
-    },
     /// Check a task's branch into the machine's review work_dir and
     /// (re)launch a fresh review-claude pane there.
     Review(commands::review::Args),
@@ -126,11 +119,12 @@ enum Cmd {
     #[command(hide = true)]
     #[command(name = "__activity")]
     Activity { project: String },
-    /// Toggle or inspect Zen Mode, the trust boundary that lets the
-    /// orchestrator auto-merge and auto-promote finished tasks without
-    /// human review. `shelbi zen on` → auto-merge permitted; `pause` →
-    /// no new auto-promotions but in-flight Zen merges complete; `off` →
-    /// every promotion goes through manual review.
+    /// Toggle Zen Mode or run its primitives. `shelbi zen on/off/pause` flip
+    /// the trust boundary that lets the orchestrator auto-merge and
+    /// auto-promote. `probe` reports facts about a finished branch (checks,
+    /// conflict, diff size, danger paths). `pr-create/ci-watch/pr-merge` are
+    /// single-purpose PR primitives the orchestrator sequences per its
+    /// Merge Conditions prompt policy.
     Zen {
         #[command(subcommand)]
         cmd: commands::zen::ZenCmd,
@@ -173,7 +167,6 @@ fn main() -> Result<()> {
         Some(Cmd::Tasks { project }) => shelbi_tui::run_tasks(&project).context("tasks"),
         Some(Cmd::ReviewView { project }) => shelbi_tui::run_review(&project).context("review"),
         Some(Cmd::Activity { project }) => shelbi_tui::run_activity(&project).context("activity"),
-        Some(Cmd::Zen { cmd }) => commands::zen::run(cli.project, cmd),
         Some(Cmd::Popup) => commands::popup::run(),
         Some(Cmd::Palette { project }) => commands::palette::run(project),
     }

@@ -1,15 +1,18 @@
-//! `shelbi zen <subcommand>` — Zen Mode controls (`on/off/pause/status`)
-//! plus the single-purpose PR primitives (`pr-create/ci-watch/pr-merge`)
-//! that the orchestrator sequences to drive a worker's branch through to
-//! merge.
+//! `shelbi zen <subcommand>` — Zen Mode controls + introspection primitives.
+//!
+//! - `on/off/pause/status` toggle and report Zen Mode state.
+//! - `probe` reports facts about a finished branch (local checks, conflict,
+//!   diff size, danger paths) as JSON.
+//! - `pr-create/ci-watch/pr-merge` are the single-purpose PR primitives the
+//!   orchestrator sequences to drive a merge.
 //!
 //! Mode toggles persist in `~/.shelbi/projects/<project>/state.json::zen_mode`
 //! and write a `zen=<state>` line to `~/.shelbi/events.log` tagged
-//! `reason=user:zen-<action>` so the activity feed shows who flipped what.
+//! `reason=user:zen-<action>`.
 //!
-//! PR primitives each print a single line on stdout and use exit-code +
-//! stderr for the failure path. The orchestrator parses the line directly;
-//! verbatim gh stderr is the failure detail.
+//! All non-toggle commands print a single line on stdout (probe prints JSON)
+//! and use exit-code + stderr for failures. The orchestrator parses the
+//! lines directly.
 
 use std::time::Duration;
 
@@ -33,13 +36,16 @@ pub enum ZenCmd {
     /// In-flight workers keep going; nothing already running is cancelled.
     Off,
     /// Pause Zen Mode — no *new* auto-promotions, but tasks already on
-    /// the Zen track may still complete their merge. Useful when you
-    /// want to triage without aborting work that's mid-flight.
+    /// the Zen track may still complete their merge.
     Pause,
-    /// Show the current mode, the configured local check commands, the
-    /// most recent Zen-Mode crash timestamp (if any), and how many
-    /// in-flight tasks are still on the Zen track.
+    /// Show the current mode, configured local check commands, last
+    /// crash timestamp (if any), and how many in-flight tasks are on
+    /// the Zen track.
     Status,
+    /// Run every probe primitive for `task` and print the JSON report.
+    /// The task must be assigned to a worker so we know which worktree
+    /// to probe.
+    Probe { task_id: String },
     /// Push the worker's branch and open a PR for the task. Idempotent —
     /// returns the existing PR number if one is already open for the
     /// branch. Prints the PR number on stdout.
@@ -68,6 +74,18 @@ pub fn run(project_opt: Option<String>, cmd: ZenCmd) -> Result<()> {
         ZenCmd::Off => set(&project_name, ZenModeState::Off, "off"),
         ZenCmd::Pause => set(&project_name, ZenModeState::Paused, "pause"),
         ZenCmd::Status => status(&project_name),
+        ZenCmd::Probe { task_id } => {
+            let project = load_project(&project_name).map_err(|e| anyhow!(e))?;
+            let tf = shelbi_state::load_task(&project_name, &task_id).map_err(|e| anyhow!(e))?;
+            let branch = tf
+                .task
+                .branch
+                .clone()
+                .unwrap_or_else(|| format!("shelbi/{}", tf.task.id));
+            let report = zen::probe(&project, &tf.task, &branch).map_err(|e| anyhow!(e))?;
+            println!("{}", serde_json::to_string_pretty(&report)?);
+            Ok(())
+        }
         ZenCmd::PrCreate { task_id } => {
             let project = load_project(&project_name).map_err(|e| anyhow!(e))?;
             let tf = shelbi_state::load_task(&project_name, &task_id).map_err(|e| anyhow!(e))?;

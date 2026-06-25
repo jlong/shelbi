@@ -14,6 +14,9 @@ shelbi-state = { workspace = true }
 shelbi-tmux = { workspace = true }
 shelbi-ssh = { workspace = true }
 shelbi-agent = { workspace = true }
+serde = { workspace = true }
+globset = "0.4"
 
 [dev-dependencies]
 chrono = { workspace = true }
+tempfile = "3"
