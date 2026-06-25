@@ -69,6 +69,13 @@ Keep the snapshot in your head and update it as events arrive. If the tail
 process dies (Monitor reports the task ended), restart it on your next
 turn.
 
+4. Scan the most recent few lines of `~/.shelbi/events.log` for a
+   `project=<name> zen=off reason=crash-recovery` entry. If one is
+   present, Zen Mode was auto-disabled because the prior orchestrator
+   pane died without a graceful exit — call it out in your first reply
+   so the user knows to review in-flight work before re-enabling Zen
+   with `shelbi zen on`.
+
 ## Reaction rules
 
 One bullet per event prefix. React to every matching line.

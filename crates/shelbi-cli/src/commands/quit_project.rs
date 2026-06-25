@@ -27,8 +27,17 @@ use shelbi_orchestrator::worker as orch_worker;
 ///    work explicitly keeps the teardown order deterministic.
 /// 5. Append a `project=<name> closed reason=user:quit-project` line to
 ///    the events log so the activity feed shows the close.
+///
+/// Before killing anything we also clear `state.json::zen_last_crashed_at`.
+/// The orchestrator pane's heartbeat loop writes a fresh timestamp every
+/// 60s; tearing the session down via `kill-session` sends SIGHUP to the
+/// pane and prevents the wrapper's own `__zen-orch-exit` from running, so
+/// without this explicit clear the next start would misread the quit as
+/// a crash and auto-disable Zen.
 pub fn run(project: &str) -> Result<()> {
     let p = shelbi_state::load_project(project).map_err(|e| anyhow!(e))?;
+
+    let _ = shelbi_state::zen_clear_crash(project);
 
     for worker in &p.workers {
         let Some(machine) = p.machine(&worker.machine) else {

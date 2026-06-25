@@ -320,6 +320,78 @@ pub fn state_path(project: &str) -> Result<PathBuf> {
     Ok(project_dir(project)?.join("state.json"))
 }
 
+/// Window during which a `zen_last_crashed_at` heartbeat counts as a
+/// recent-crash signal. Sized to catch a same-session crash without
+/// sandbagging a fresh Zen run hours after an unrelated abort.
+pub const ZEN_CRASH_RECOVERY_WINDOW_SECS: i64 = 3600;
+
+/// Outcome of [`zen_check_crash_recovery`] — the start-of-orchestrator
+/// crash detector. Returned (rather than logged inline) so the caller
+/// can surface the warning where it makes sense for it: the orchestrator
+/// pane writes a `zen=off reason=crash-recovery` line to `events.log`
+/// and a tracing warning so it shows up in `~/.shelbi/logs/`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ZenCrashRecovery {
+    /// No recent crash signal; nothing was changed.
+    NoCrash,
+    /// `zen_last_crashed_at` was within the recovery window AND
+    /// `zen_mode == On`. The mode has been forced to `Off` on disk;
+    /// the caller should emit the warning event + log line.
+    AutoDisabled {
+        crashed_at: DateTime<Utc>,
+    },
+}
+
+/// Heartbeat tick — refresh `zen_last_crashed_at = now`. The intent is
+/// "the orchestrator was alive at this moment"; if the pane subsequently
+/// dies without [`zen_clear_crash`], the recent timestamp lets the next
+/// [`zen_check_crash_recovery`] detect the crash. Writes only to
+/// `state.json` — keeps the events log clean.
+pub fn zen_heartbeat(project: &str) -> Result<()> {
+    let mut state = read_state(project)?;
+    state.zen_last_crashed_at = Some(Utc::now());
+    write_state(project, &state)
+}
+
+/// Clear `zen_last_crashed_at`. Called from the orchestrator's graceful
+/// exit path and from `quit_project` so a clean shutdown doesn't leave
+/// a stale timestamp on disk that the next start would misread as a
+/// crash. Idempotent — a no-op when nothing is set.
+pub fn zen_clear_crash(project: &str) -> Result<()> {
+    let mut state = read_state(project)?;
+    if state.zen_last_crashed_at.is_none() {
+        return Ok(());
+    }
+    state.zen_last_crashed_at = None;
+    write_state(project, &state)
+}
+
+/// Run at orchestrator start. If `zen_last_crashed_at` is within the
+/// recovery window AND `zen_mode == On`, force the mode to `Off` and
+/// report `AutoDisabled`. Either way the stale timestamp is cleared so
+/// the new heartbeat starts from a fresh state. The signal has been
+/// consumed once read — calling this a second time on the same disk
+/// state returns `NoCrash`.
+pub fn zen_check_crash_recovery(project: &str) -> Result<ZenCrashRecovery> {
+    let mut state = read_state(project)?;
+    let Some(crashed_at) = state.zen_last_crashed_at else {
+        return Ok(ZenCrashRecovery::NoCrash);
+    };
+    let age = Utc::now() - crashed_at;
+    let recent = age <= chrono::Duration::seconds(ZEN_CRASH_RECOVERY_WINDOW_SECS);
+    let should_disable = recent && state.zen_mode == ZenModeState::On;
+    state.zen_last_crashed_at = None;
+    if should_disable {
+        state.zen_mode = ZenModeState::Off;
+    }
+    write_state(project, &state)?;
+    if should_disable {
+        Ok(ZenCrashRecovery::AutoDisabled { crashed_at })
+    } else {
+        Ok(ZenCrashRecovery::NoCrash)
+    }
+}
+
 /// Read `state.json` for `project`. Returns `State::default()` when the
 /// file is missing — the first call after creating a project shouldn't
 /// require a separate seeding step.
@@ -1182,6 +1254,169 @@ mod tests {
             let back = read_state("p").unwrap();
             assert_eq!(back.zen_mode, mode);
         }
+        std::env::remove_var("SHELBI_HOME");
+    }
+
+    // ---- crash recovery ---------------------------------------------------
+
+    #[test]
+    fn zen_heartbeat_writes_timestamp_into_state() {
+        let _g = TEST_LOCK.lock().unwrap();
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+        zen_heartbeat("p").unwrap();
+        let s = read_state("p").unwrap();
+        let ts = s.zen_last_crashed_at.expect("heartbeat should set the timestamp");
+        // Newly written timestamp should be within the last few seconds.
+        let age = (Utc::now() - ts).num_seconds().abs();
+        assert!(age < 5, "heartbeat timestamp suspiciously old: {age}s");
+        std::env::remove_var("SHELBI_HOME");
+    }
+
+    #[test]
+    fn zen_clear_crash_removes_timestamp_idempotently() {
+        let _g = TEST_LOCK.lock().unwrap();
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+        zen_heartbeat("p").unwrap();
+        assert!(read_state("p").unwrap().zen_last_crashed_at.is_some());
+        zen_clear_crash("p").unwrap();
+        assert!(read_state("p").unwrap().zen_last_crashed_at.is_none());
+        // Second call on an already-clean state is a no-op.
+        zen_clear_crash("p").unwrap();
+        assert!(read_state("p").unwrap().zen_last_crashed_at.is_none());
+        std::env::remove_var("SHELBI_HOME");
+    }
+
+    #[test]
+    fn crash_recovery_reports_no_crash_when_timestamp_unset() {
+        let _g = TEST_LOCK.lock().unwrap();
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+        write_state(
+            "p",
+            &State { zen_mode: ZenModeState::On, zen_last_crashed_at: None },
+        )
+        .unwrap();
+        assert_eq!(zen_check_crash_recovery("p").unwrap(), ZenCrashRecovery::NoCrash);
+        // Mode untouched.
+        assert_eq!(read_state("p").unwrap().zen_mode, ZenModeState::On);
+        std::env::remove_var("SHELBI_HOME");
+    }
+
+    #[test]
+    fn crash_recovery_auto_disables_when_recent_crash_and_zen_on() {
+        let _g = TEST_LOCK.lock().unwrap();
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+        let crashed_at = Utc::now() - chrono::Duration::minutes(5);
+        write_state(
+            "p",
+            &State {
+                zen_mode: ZenModeState::On,
+                zen_last_crashed_at: Some(crashed_at),
+            },
+        )
+        .unwrap();
+        match zen_check_crash_recovery("p").unwrap() {
+            ZenCrashRecovery::AutoDisabled { crashed_at: got } => {
+                assert_eq!(got, crashed_at);
+            }
+            other => panic!("expected AutoDisabled, got {other:?}"),
+        }
+        let s = read_state("p").unwrap();
+        assert_eq!(s.zen_mode, ZenModeState::Off);
+        assert!(s.zen_last_crashed_at.is_none(), "signal must be cleared after consumption");
+        std::env::remove_var("SHELBI_HOME");
+    }
+
+    #[test]
+    fn crash_recovery_skips_when_timestamp_is_outside_window() {
+        let _g = TEST_LOCK.lock().unwrap();
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+        // Two hours ago — outside the 1h window.
+        let stale = Utc::now() - chrono::Duration::hours(2);
+        write_state(
+            "p",
+            &State {
+                zen_mode: ZenModeState::On,
+                zen_last_crashed_at: Some(stale),
+            },
+        )
+        .unwrap();
+        assert_eq!(zen_check_crash_recovery("p").unwrap(), ZenCrashRecovery::NoCrash);
+        let s = read_state("p").unwrap();
+        // Mode left alone; stale timestamp cleared so the next heartbeat
+        // starts fresh.
+        assert_eq!(s.zen_mode, ZenModeState::On);
+        assert!(s.zen_last_crashed_at.is_none());
+        std::env::remove_var("SHELBI_HOME");
+    }
+
+    #[test]
+    fn crash_recovery_does_not_change_mode_when_zen_was_off() {
+        let _g = TEST_LOCK.lock().unwrap();
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+        let recent = Utc::now() - chrono::Duration::minutes(5);
+        write_state(
+            "p",
+            &State {
+                zen_mode: ZenModeState::Off,
+                zen_last_crashed_at: Some(recent),
+            },
+        )
+        .unwrap();
+        // Recent crash but Zen wasn't on — nothing to disable, just
+        // clean up the signal.
+        assert_eq!(zen_check_crash_recovery("p").unwrap(), ZenCrashRecovery::NoCrash);
+        let s = read_state("p").unwrap();
+        assert_eq!(s.zen_mode, ZenModeState::Off);
+        assert!(s.zen_last_crashed_at.is_none());
+        std::env::remove_var("SHELBI_HOME");
+    }
+
+    #[test]
+    fn crash_recovery_does_not_change_mode_when_zen_was_paused() {
+        let _g = TEST_LOCK.lock().unwrap();
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+        let recent = Utc::now() - chrono::Duration::minutes(5);
+        write_state(
+            "p",
+            &State {
+                zen_mode: ZenModeState::Paused,
+                zen_last_crashed_at: Some(recent),
+            },
+        )
+        .unwrap();
+        assert_eq!(zen_check_crash_recovery("p").unwrap(), ZenCrashRecovery::NoCrash);
+        assert_eq!(read_state("p").unwrap().zen_mode, ZenModeState::Paused);
+        std::env::remove_var("SHELBI_HOME");
+    }
+
+    #[test]
+    fn crash_recovery_is_idempotent_on_repeat_calls() {
+        // Second call returns NoCrash even when the first auto-disabled,
+        // because the signal was consumed (cleared) by the first call.
+        let _g = TEST_LOCK.lock().unwrap();
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+        let recent = Utc::now() - chrono::Duration::minutes(5);
+        write_state(
+            "p",
+            &State {
+                zen_mode: ZenModeState::On,
+                zen_last_crashed_at: Some(recent),
+            },
+        )
+        .unwrap();
+        assert!(matches!(
+            zen_check_crash_recovery("p").unwrap(),
+            ZenCrashRecovery::AutoDisabled { .. }
+        ));
+        assert_eq!(zen_check_crash_recovery("p").unwrap(), ZenCrashRecovery::NoCrash);
         std::env::remove_var("SHELBI_HOME");
     }
 

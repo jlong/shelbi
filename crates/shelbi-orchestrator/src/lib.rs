@@ -275,11 +275,12 @@ pub fn ensure_dashboard(project_name: &str) -> Result<BootstrapStatus> {
     let shelbi_bin = current_exe_string()?;
     let sidebar_cmd_str = sidebar_cmd(&shelbi_bin, project_name);
     let launch = shelbi_agent::launch_command(&runner_spec);
-    let orch_cmd = format!(
-        "cd {wd} && SHELBI_PROJECT={proj} SHELBI_TMUX_SESSION={sess} exec {launch}",
-        wd = shelbi_agent::shell_escape(&workdir.to_string_lossy()),
-        proj = shelbi_agent::shell_escape(project_name),
-        sess = shelbi_agent::shell_escape(session),
+    let orch_cmd = orchestrator_pane_cmd(
+        &shelbi_bin,
+        project_name,
+        session,
+        &workdir.to_string_lossy(),
+        &launch,
     );
 
     // 1. Ensure the project session exists with a `dashboard` window whose
@@ -586,6 +587,58 @@ fn sidebar_cmd(shelbi_bin: &str, project_name: &str) -> String {
     )
 }
 
+/// Heartbeat cadence for the orchestrator pane's background liveness
+/// loop. Sized so a stalled write or one missed tick still falls
+/// comfortably inside `ZEN_CRASH_RECOVERY_WINDOW_SECS` — the next
+/// startup must see a recent timestamp to infer the crash.
+const ORCH_HEARTBEAT_INTERVAL_SECS: u32 = 60;
+
+/// Build the `sh -c` script the orchestrator pane runs. The script
+/// wraps the agent launch with the Zen Mode lifecycle so a pane crash
+/// auto-disables Zen on the next start:
+///
+/// 1. `__zen-orch-start` — check `state.json` for a recent unmatched
+///    heartbeat; if found, force `zen_mode = off` and warn.
+/// 2. background heartbeat — refresh the timestamp every 60s; bytes
+///    only land in `state.json`, never `events.log`.
+/// 3. `<launch>` — the configured agent (e.g. `claude`).
+/// 4. `__zen-orch-exit` — clears the timestamp on graceful exit.
+///
+/// If the pane is killed mid-run, the whole process group dies before
+/// step 4, leaving the heartbeat timestamp in place — that's the
+/// signal step 1 reads on the next start.
+///
+/// Note we deliberately don't `exec` the launch: the wrapper shell
+/// must survive the agent's exit to run step 4 and reap the
+/// background heartbeat.
+fn orchestrator_pane_cmd(
+    shelbi_bin: &str,
+    project_name: &str,
+    session: &str,
+    workdir: &str,
+    launch: &str,
+) -> String {
+    let bin = shelbi_agent::shell_escape(shelbi_bin);
+    let proj = shelbi_agent::shell_escape(project_name);
+    let sess = shelbi_agent::shell_escape(session);
+    let wd = shelbi_agent::shell_escape(workdir);
+    let interval = ORCH_HEARTBEAT_INTERVAL_SECS;
+    format!(
+        "cd {wd} && \
+         export SHELBI_PROJECT={proj} SHELBI_TMUX_SESSION={sess} && \
+         {bin} __zen-orch-start {proj}; \
+         ({bin} __zen-heartbeat {proj}; \
+            while sleep {interval}; do {bin} __zen-heartbeat {proj}; done) & \
+         HB=$!; \
+         {launch}; \
+         RC=$?; \
+         kill $HB 2>/dev/null; \
+         wait $HB 2>/dev/null; \
+         {bin} __zen-orch-exit {proj}; \
+         exit $RC",
+    )
+}
+
 // Tasks + review are real ratatui apps (`shelbi __tasks <p>`, `shelbi
 // __review <p>`). Wrap each in a `while true` loop so an accidental crash
 // or Ctrl-C respawns the TUI instead of leaving the stash pane empty —
@@ -883,6 +936,53 @@ mod pane_cmd_tests {
         assert!(out.contains("printf '\\033c'"));
         assert!(out.contains("/usr/local/bin/shelbi --project myapp worker list"));
         assert!(out.contains("sleep 5"));
+    }
+
+    #[test]
+    fn orchestrator_pane_cmd_wraps_launch_with_lifecycle_hooks() {
+        let out = orchestrator_pane_cmd(
+            "/usr/local/bin/shelbi",
+            "myapp",
+            "shelbi-myapp",
+            "/Users/me/.shelbi/projects/myapp",
+            "claude --print",
+        );
+        // cd into workdir + export env first. Shell-safe alphanumeric
+        // paths skip the quoting branch — see shelbi_agent::shell_escape.
+        assert!(out.starts_with("cd /Users/me/.shelbi/projects/myapp && "));
+        assert!(out.contains("export SHELBI_PROJECT=myapp SHELBI_TMUX_SESSION=shelbi-myapp"));
+        // Crash recovery check runs before the heartbeat loop spawns.
+        let start_idx = out.find("__zen-orch-start myapp").expect("missing __zen-orch-start");
+        let heartbeat_idx = out
+            .find("__zen-heartbeat myapp")
+            .expect("missing __zen-heartbeat");
+        let launch_idx = out.find("claude --print").expect("missing launch");
+        let exit_idx = out.find("__zen-orch-exit myapp").expect("missing __zen-orch-exit");
+        assert!(start_idx < heartbeat_idx, "start must precede heartbeat");
+        assert!(heartbeat_idx < launch_idx, "heartbeat must spawn before launch");
+        assert!(launch_idx < exit_idx, "exit must run after launch returns");
+        // Heartbeat loop is spawned in the background and killed afterwards.
+        assert!(out.contains("HB=$!"), "must capture heartbeat pid");
+        assert!(out.contains("kill $HB"), "must kill heartbeat after launch exits");
+        // We deliberately don't exec the launch so the wrapper survives.
+        assert!(!out.contains(" exec "), "exec would skip the cleanup hooks");
+        // Exit code of the agent is preserved.
+        assert!(out.contains("RC=$?") && out.contains("exit $RC"));
+    }
+
+    #[test]
+    fn orchestrator_pane_cmd_shell_escapes_workdir_with_spaces() {
+        // Project workdirs can contain spaces (`~/Documents/Project Name/`)
+        // — the wrapper must single-quote the whole `cd` arg, otherwise
+        // sh -c would split it into two tokens.
+        let out = orchestrator_pane_cmd(
+            "/usr/local/bin/shelbi",
+            "myapp",
+            "shelbi-myapp",
+            "/Users/me/My Projects/myapp",
+            "claude",
+        );
+        assert!(out.contains("cd '/Users/me/My Projects/myapp' && "));
     }
 
     #[test]

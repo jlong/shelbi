@@ -131,6 +131,21 @@ enum Cmd {
     },
     /// Open the palette as a tmux popup. Bound to Ctrl+P by default.
     Popup,
+    /// (internal) Crash-recovery check the orchestrator pane wrapper
+    /// runs once at start. Not for direct use.
+    #[command(hide = true)]
+    #[command(name = "__zen-orch-start")]
+    ZenOrchStart { project: String },
+    /// (internal) Per-tick heartbeat refresh from the orchestrator pane
+    /// wrapper's background loop. Not for direct use.
+    #[command(hide = true)]
+    #[command(name = "__zen-heartbeat")]
+    ZenHeartbeat { project: String },
+    /// (internal) Graceful-exit clear the orchestrator pane wrapper
+    /// runs after the agent returns. Not for direct use.
+    #[command(hide = true)]
+    #[command(name = "__zen-orch-exit")]
+    ZenOrchExit { project: String },
     /// (internal) Run the palette picker — meant to be invoked inside a
     /// `tmux display-popup`. Not for direct use.
     #[command(hide = true)]
@@ -169,6 +184,9 @@ fn main() -> Result<()> {
         Some(Cmd::Activity { project }) => shelbi_tui::run_activity(&project).context("activity"),
         Some(Cmd::Popup) => commands::popup::run(),
         Some(Cmd::Palette { project }) => commands::palette::run(project),
+        Some(Cmd::ZenOrchStart { project }) => commands::zen_lifecycle::orch_start(&project),
+        Some(Cmd::ZenHeartbeat { project }) => commands::zen_lifecycle::heartbeat(&project),
+        Some(Cmd::ZenOrchExit { project }) => commands::zen_lifecycle::orch_exit(&project),
     }
 }
 

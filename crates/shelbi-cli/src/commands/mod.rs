@@ -21,6 +21,7 @@ pub mod task;
 pub mod wizard;
 pub mod worker;
 pub mod zen;
+pub mod zen_lifecycle;
 
 use anyhow::{anyhow, Result};
 use std::path::Path;
