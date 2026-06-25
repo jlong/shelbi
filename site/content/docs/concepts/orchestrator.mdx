@@ -94,6 +94,12 @@ The reaction rules are simple:
   freed up.
 - `worker=<name> pane_alive=false` → surface to the user; don't
   auto-restart.
+- `project=<name> heartbeat` → no state change to react to, but the
+  watch is awake — a good time to re-check active tasks for stuck
+  workers or missed markers. See
+  [heartbeats](/docs/concepts/events-log#heartbeats) for the cadence
+  config and rationale; tune it via the `heartbeat` key in
+  `project.yaml`.
 
 When dispatching, the orchestrator picks free eligible workers in the
 order they're declared in the project YAML, honoring `prefers_machine`

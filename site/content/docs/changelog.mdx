@@ -19,6 +19,23 @@ into short prose paragraphs (or a list), with `code` and fenced blocks where
 they earn their keep. Newest entry goes first; never reorder older ones.
 */}
 
+### Unreleased
+
+**Hub heartbeats.** The hub-side worker-state poller now appends a periodic
+`<ts> project=<name> heartbeat` line to `~/.shelbi/events.log`, giving the
+orchestrator's `events tail --follow` watch a guaranteed recurring trigger
+when the board is otherwise quiet. Cadence is set per project via a new
+`heartbeat` key in `project.yaml` — `45s`, `3m`, `1h`, or `"off"` to
+disable; default `3m`. Bare integers (`heartbeat: 180`) are rejected at
+load time, so a missing-unit typo can't silently land as seconds. Emission
+is debounced against any other write to the events log, so active boards
+don't see padding. Heartbeats are filtered out of the TUI activity feed by
+default — they'd produce one "nothing happened" row every few minutes —
+but show up verbatim under `shelbi events tail`. See
+[the events log](/docs/concepts/events-log#heartbeats) for the line shape
+and rationale, and the [project YAML reference](/docs/getting-started/first-project#optional-keys)
+for the new key.
+
 ### v0.1.0 — 2026-06-23
 
 The first cut of Shelbi — an open-source agent orchestrator for the terminal,

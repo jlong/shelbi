@@ -26,8 +26,8 @@ Defined in `crates/shelbi-state/src/worker_status.rs` (`events_log_path`,
 
 ## Line shape
 
-There are exactly two kinds of lines. The prefix after the timestamp
-tells you which:
+The prefix after the timestamp tells you which kind of event the line
+carries:
 
 ### Worker transitions
 
@@ -65,9 +65,39 @@ tells you which:
 - `reason=<short>` is a single token (whitespace is folded to
   underscores) describing who triggered the move.
 
-The orchestrator distinguishes the two line kinds by the `task=` vs
-`worker=` prefix. Anything else on a line is consumer-defined; today,
-nothing else appears.
+### Heartbeats
+
+```
+<rfc3339-timestamp> project=<name> heartbeat
+```
+
+```
+2026-06-22T14:25:11+00:00 project=myapp heartbeat
+```
+
+- Emitted by the hub-side poller on the cadence set by the `heartbeat`
+  key in `project.yaml` (default `3m`). Set to `"off"` to disable.
+- Debounced: if any line was written to the log in the last `heartbeat`
+  interval — including a previous heartbeat — the next tick skips. An
+  active board never sees padding lines.
+- Crash-safe: a poller restart waits one full interval before its first
+  attempt, rather than firing the slot it missed.
+
+Heartbeats exist for the orchestrator's `events tail --follow` watch.
+When nothing's happening on the board, the watch sits idle for as long
+as it takes for *something* to happen — which can be hours, or never if
+a marker-emitting code path silently regresses. The recurring line is
+the orchestrator's fallback trigger to wake up and check active tasks.
+
+The TUI activity feed filters heartbeats out by design — they'd
+produce one "nothing happened" row every few minutes. Use
+`shelbi events tail` if you want to see them.
+
+The orchestrator distinguishes the line kinds by the second token
+(`task=`, `worker=`, `project=`, `dispatch`, `mode=zen`,
+`contextstore`, `zen-dryrun`). New line shapes get added over time;
+consumers that only know the two original prefixes should fall through
+gracefully on the rest.
 
 ## Atomicity
 

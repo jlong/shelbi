@@ -16,12 +16,19 @@ entire hub. The orchestrator follows this log as its trigger stream — when
 you want to see what the orchestrator is seeing, run `events tail --follow`
 in another pane.
 
-Lines come in two shapes:
+The most common line shapes are:
 
 ```text
 <ts> task=<id> <from> -> <to> reason=<short>
 <ts> worker=<name> <prev> -> <new>
+<ts> project=<name> heartbeat
 ```
+
+`heartbeat` is the periodic wake-up the hub poller writes when the
+board is otherwise quiet — cadence comes from the `heartbeat` key in
+`project.yaml` (default `3m`). See
+[the events log](/docs/concepts/events-log#heartbeats) for the full
+shape catalog.
 
 Every subcommand accepts the global `-p / --project <PROJECT>` flag.
 

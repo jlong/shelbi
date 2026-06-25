@@ -36,14 +36,15 @@ use std::sync::{
     Arc,
 };
 use std::thread::{self, JoinHandle};
-use std::time::Duration;
+use std::time::{Duration, Instant, SystemTime};
 
 use chrono::{DateTime, Utc};
 
 use shelbi_core::{Column, Project};
 use shelbi_state::{
-    append_contextstore_event, append_worker_event, load_worker_status, parse_pane_title_marker,
-    save_worker_status, PaneMarker, WorkerState, WorkerStatus,
+    append_contextstore_event, append_heartbeat_event, append_worker_event, events_log_path,
+    load_worker_status, parse_pane_title_marker, save_worker_status, PaneMarker, WorkerState,
+    WorkerStatus,
 };
 
 /// Spawned poller handle. Dropping it asks the thread to exit and joins it.
@@ -86,6 +87,13 @@ impl Drop for WorkerPoller {
 fn run_poller_loop(project_name: String, shutdown: Arc<AtomicBool>) {
     let mut spawned: HashMap<String, JoinHandle<()>> = HashMap::new();
 
+    // Heartbeat schedule. We seed `next_heartbeat_attempt` from "now"
+    // rather than from the last events.log mtime so a poller restart
+    // mid-interval doesn't immediately fire a heartbeat that was
+    // technically "due" before the crash — the spec is one interval
+    // from poller start, not from the missed slot.
+    let mut next_heartbeat_attempt: Option<Instant> = None;
+
     loop {
         if shutdown.load(Ordering::SeqCst) {
             break;
@@ -125,6 +133,12 @@ fn run_poller_loop(project_name: String, shutdown: Arc<AtomicBool>) {
                 spawned.insert(worker.name.clone(), h);
             }
         }
+
+        // Heartbeat is project-wide (one per project, not per worker),
+        // so it lives on the supervisor rather than inside any per-worker
+        // thread. The function is a no-op if heartbeat is off or not yet
+        // due, and debounces against any other events.log activity.
+        maybe_emit_heartbeat(&project, &mut next_heartbeat_attempt);
 
         // Supervisor cadence is fixed at 5s — independent of
         // `worker_poll_interval_secs`, which governs each per-worker
@@ -180,6 +194,81 @@ fn run_worker_poll_loop(
         poll_one(&project, worker, &mut last_known);
 
         sleep_interruptible(interval, &shutdown);
+    }
+}
+
+/// Consider emitting one heartbeat for `project`. Called once per poller
+/// tick. Three rules from the spec land here:
+///
+/// 1. **Off** — `HeartbeatConfig::Off` skips every tick and also clears
+///    any pending schedule so a project that toggles `heartbeat: off`
+///    while the poller is running stops emitting immediately.
+/// 2. **Crash-safe cadence** — the first attempt fires one
+///    `heartbeat` interval after the poller observed the config (not
+///    from the wall clock or the previous run's last write), so a
+///    restart mid-interval doesn't catch up missed slots.
+/// 3. **Debounced against other writes** — if any line was appended to
+///    `events.log` within the last `interval`, skip this attempt.
+///    Otherwise emit. Our own heartbeat counts as activity, so on a
+///    fully quiet board the next emission lands exactly one interval
+///    after the previous one.
+fn maybe_emit_heartbeat(project: &Project, next_attempt: &mut Option<Instant>) {
+    let Some(interval) = project.heartbeat.interval() else {
+        // Heartbeat off — clear the schedule so flipping it back on
+        // re-seeds from the next tick rather than firing a stale due.
+        *next_attempt = None;
+        return;
+    };
+
+    let now = Instant::now();
+    let due = match *next_attempt {
+        None => {
+            // First tick after start (or after the config flipped from
+            // off → on): schedule the first attempt one interval out.
+            *next_attempt = Some(now + interval);
+            return;
+        }
+        Some(t) => now >= t,
+    };
+    if !due {
+        return;
+    }
+
+    // Debounce: skip if anything (us or anyone else) wrote to
+    // events.log within the last interval. We read mtime fresh on each
+    // attempt — cheap (one stat) and avoids tracking writes ourselves.
+    let recent_activity = events_log_modified_within(interval);
+    if !recent_activity {
+        if let Err(e) = append_heartbeat_event(&project.name) {
+            tracing::warn!(
+                project = %project.name,
+                error = %e,
+                "append_heartbeat_event failed",
+            );
+        }
+    }
+
+    *next_attempt = Some(now + interval);
+}
+
+/// True iff `events.log` exists and was modified within the last
+/// `window`. Missing log file → no activity. Any I/O hiccup → assume
+/// active (safer to under-emit than spam the log on a transient stat
+/// failure).
+fn events_log_modified_within(window: Duration) -> bool {
+    let path = match events_log_path() {
+        Ok(p) => p,
+        Err(_) => return true,
+    };
+    let mtime = match std::fs::metadata(&path).and_then(|m| m.modified()) {
+        Ok(t) => t,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return false,
+        Err(_) => return true,
+    };
+    match SystemTime::now().duration_since(mtime) {
+        Ok(elapsed) => elapsed < window,
+        // mtime is in the future (clock skew); treat as recent.
+        Err(_) => true,
     }
 }
 
@@ -598,6 +687,7 @@ mod tests {
             worker_permissions_mode: "auto".into(),
             worker_settings_template: None,
             zen: shelbi_core::ZenConfig::default(),
+            heartbeat: shelbi_core::HeartbeatConfig::default(),
             contextstore_sync: Vec::new(),
             detected_shapes: Vec::new(),
         }
@@ -836,6 +926,139 @@ mod tests {
                 .column,
             Column::InProgress
         );
+
+        std::env::remove_var("SHELBI_HOME");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn maybe_emit_heartbeat_skips_first_tick_then_emits_when_quiet() {
+        // The poller seeds `next_attempt` from "now" so the first tick
+        // after start never fires (one full interval must pass first).
+        // The second consideration, well past the interval and with no
+        // recent events.log activity, emits exactly one heartbeat line.
+        let _g = crate::test_support::ENV_LOCK.lock().unwrap();
+        let home = std::env::temp_dir().join(format!(
+            "shelbi-poller-hb-emit-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&home).unwrap();
+        std::env::set_var("SHELBI_HOME", &home);
+
+        let work_dir = home.join("repo");
+        std::fs::create_dir_all(&work_dir).unwrap();
+        let mut project = local_project(&work_dir);
+        // Tight 1ms interval so the test doesn't have to sleep for the
+        // real 3-minute default.
+        project.heartbeat =
+            shelbi_core::HeartbeatConfig::Every(Duration::from_millis(1));
+
+        let mut next: Option<Instant> = None;
+        // First call seeds the schedule and returns without writing.
+        maybe_emit_heartbeat(&project, &mut next);
+        assert!(next.is_some(), "first tick must seed the schedule");
+        let log = shelbi_state::events_log_path().unwrap();
+        assert!(
+            !log.exists() || std::fs::read_to_string(&log).unwrap().is_empty(),
+            "first tick must not emit a heartbeat"
+        );
+
+        // Wait past the interval, with no other writer touching the
+        // log, and the next attempt emits one line.
+        std::thread::sleep(Duration::from_millis(20));
+        maybe_emit_heartbeat(&project, &mut next);
+        let body = std::fs::read_to_string(&log).unwrap();
+        let lines: Vec<&str> = body.lines().filter(|l| l.contains("heartbeat")).collect();
+        assert_eq!(lines.len(), 1, "expected one heartbeat line, got: {body:?}");
+        assert!(
+            lines[0].contains(" project=demo heartbeat"),
+            "line: {}",
+            lines[0]
+        );
+
+        std::env::remove_var("SHELBI_HOME");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn maybe_emit_heartbeat_debounces_against_recent_activity() {
+        // A worker transition lands in events.log moments before the
+        // heartbeat attempt — the heartbeat must skip this consideration
+        // so active boards don't get padded with no-op lines.
+        let _g = crate::test_support::ENV_LOCK.lock().unwrap();
+        let home = std::env::temp_dir().join(format!(
+            "shelbi-poller-hb-debounce-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&home).unwrap();
+        std::env::set_var("SHELBI_HOME", &home);
+
+        let work_dir = home.join("repo");
+        std::fs::create_dir_all(&work_dir).unwrap();
+        let mut project = local_project(&work_dir);
+        // Use a 1-second window so the events.log mtime test ("written
+        // in the last interval") sees the worker event as recent.
+        project.heartbeat = shelbi_core::HeartbeatConfig::Every(Duration::from_secs(1));
+
+        let mut next: Option<Instant> = None;
+        // Seed.
+        maybe_emit_heartbeat(&project, &mut next);
+        // Force the next attempt to be due immediately, but write
+        // unrelated activity first so the debounce trips.
+        shelbi_state::append_worker_event("alpha", None, WorkerState::Working).unwrap();
+        next = Some(Instant::now());
+
+        maybe_emit_heartbeat(&project, &mut next);
+
+        let log = shelbi_state::events_log_path().unwrap();
+        let body = std::fs::read_to_string(&log).unwrap();
+        let hb_lines: Vec<&str> =
+            body.lines().filter(|l| l.contains("heartbeat")).collect();
+        assert!(
+            hb_lines.is_empty(),
+            "debounce must skip emission when events.log was just written; log: {body:?}"
+        );
+
+        std::env::remove_var("SHELBI_HOME");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn maybe_emit_heartbeat_off_never_emits_and_clears_schedule() {
+        // Project sets `heartbeat: off`: the function must clear any
+        // outstanding schedule (so flipping it back on later starts a
+        // fresh interval) and never append to events.log.
+        let _g = crate::test_support::ENV_LOCK.lock().unwrap();
+        let home = std::env::temp_dir().join(format!(
+            "shelbi-poller-hb-off-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&home).unwrap();
+        std::env::set_var("SHELBI_HOME", &home);
+
+        let work_dir = home.join("repo");
+        std::fs::create_dir_all(&work_dir).unwrap();
+        let mut project = local_project(&work_dir);
+        project.heartbeat = shelbi_core::HeartbeatConfig::Off;
+
+        let mut next = Some(Instant::now() - Duration::from_secs(60));
+        maybe_emit_heartbeat(&project, &mut next);
+        assert!(next.is_none(), "off must clear the pending schedule");
+
+        let log = shelbi_state::events_log_path().unwrap();
+        assert!(!log.exists() || std::fs::read_to_string(&log).unwrap().is_empty());
 
         std::env::remove_var("SHELBI_HOME");
         let _ = std::fs::remove_dir_all(&home);

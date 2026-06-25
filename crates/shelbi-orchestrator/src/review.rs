@@ -371,6 +371,7 @@ mod tests {
             worker_permissions_mode: "auto".into(),
             worker_settings_template: None,
             zen: shelbi_core::ZenConfig::default(),
+            heartbeat: shelbi_core::HeartbeatConfig::default(),
             contextstore_sync: Vec::new(),
             detected_shapes: Vec::new(),
         };

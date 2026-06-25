@@ -113,6 +113,18 @@ pub enum Event {
         detail: String,
         raw: String,
     },
+    /// Hub-poller heartbeat — `<ts> project=<name> heartbeat`. The
+    /// orchestrator follows the events log and uses these as a
+    /// guaranteed recurring wake-up when the board is otherwise quiet,
+    /// but a human reading the activity feed shouldn't see them — they
+    /// produce one row every few minutes saying nothing happened. We
+    /// keep the parsed variant so the raw line survives any future
+    /// "show internal events" toggle, then filter it out at render time.
+    Heartbeat {
+        ts: DateTime<Utc>,
+        project: String,
+        raw: String,
+    },
     /// Recognized timestamp but the rest doesn't match the task/worker
     /// shape — render the original line verbatim so nothing vanishes.
     Unknown {
@@ -126,7 +138,8 @@ impl Event {
         match self {
             Event::Task { ts, .. }
             | Event::Worker { ts, .. }
-            | Event::ZenDryRun { ts, .. } => Some(*ts),
+            | Event::ZenDryRun { ts, .. }
+            | Event::Heartbeat { ts, .. } => Some(*ts),
             Event::Unknown { ts, .. } => *ts,
         }
     }
@@ -164,7 +177,15 @@ impl ActivityFilter {
     /// `true` when this event passes the active filter. With no specific
     /// pill on, everything passes; otherwise the event must match at
     /// least one active pill (union, not intersection).
+    ///
+    /// Heartbeats are always rejected, regardless of which pill is
+    /// active. They're an orchestrator wake-up, not human-facing
+    /// activity — a row saying "nothing happened" every three minutes
+    /// would drown the feed.
     pub fn matches(&self, ev: &Event) -> bool {
+        if matches!(ev, Event::Heartbeat { .. }) {
+            return false;
+        }
         if self.is_all() {
             return true;
         }
@@ -547,6 +568,25 @@ pub fn parse_event_line(line: &str) -> Event {
                 task_id,
                 action,
                 detail,
+                raw,
+            };
+        }
+        return Event::Unknown { ts: Some(ts), raw };
+    }
+
+    if let Some(rest) = rest.strip_prefix("project=") {
+        // Heartbeat shape: `project=<name> heartbeat`. We recognize it
+        // here so the parser doesn't fall through to `Unknown` (which
+        // would render a `?`-prefixed raw line if the filter were ever
+        // bypassed). Other `project=...` lines fall through to the
+        // existing Unknown handling — no other shape is defined yet.
+        let mut tokens = rest.splitn(2, ' ');
+        let name = tokens.next().unwrap_or("");
+        let action = tokens.next().unwrap_or("").trim();
+        if !name.is_empty() && action == "heartbeat" {
+            return Event::Heartbeat {
+                ts,
+                project: name.to_string(),
                 raw,
             };
         }
@@ -1009,6 +1049,11 @@ fn render_event(
             detail,
             ..
         } => render_zen_dryrun_event(app, *ts, task_id, action, detail, width, now),
+        // Heartbeats never reach this branch in normal operation
+        // because `ActivityFilter::matches` rejects them, but exhaustive
+        // matching keeps a future "show internal events" toggle from
+        // silently dropping them.
+        Event::Heartbeat { .. } => Vec::new(),
         Event::Unknown { ts, raw } => {
             let when = ts.map(|t| relative_time(t, now)).unwrap_or_default();
             let row = RowText {
@@ -2087,6 +2132,43 @@ mod tests {
             prev: None,
             new: WorkerState::Working,
             raw: String::new(),
+        }
+    }
+
+    fn heartbeat_event() -> Event {
+        Event::Heartbeat {
+            ts: Utc.with_ymd_and_hms(2026, 6, 23, 12, 0, 0).unwrap(),
+            project: "demo".into(),
+            raw: "2026-06-23T12:00:00+00:00 project=demo heartbeat".into(),
+        }
+    }
+
+    #[test]
+    fn parse_heartbeat_line_round_trips() {
+        // Shape: `<ts> project=<name> heartbeat`. Must come back as the
+        // `Heartbeat` variant (not `Unknown`) so the filter knows to
+        // drop it.
+        let line = "2026-06-23T12:00:00+00:00 project=demo heartbeat";
+        match parse_event_line(line) {
+            Event::Heartbeat { project, .. } => assert_eq!(project, "demo"),
+            other => panic!("expected Heartbeat, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn activity_filter_rejects_heartbeat_under_every_pill() {
+        // Heartbeats are an orchestrator wake-up signal, not human-facing
+        // activity. They must be filtered out regardless of which pill
+        // (or no pill) is on — otherwise the feed gets a "nothing
+        // happened" row every few minutes.
+        let configs = [
+            ActivityFilter::default(),
+            ActivityFilter { zen: true, workers: false },
+            ActivityFilter { zen: false, workers: true },
+            ActivityFilter { zen: true, workers: true },
+        ];
+        for f in configs {
+            assert!(!f.matches(&heartbeat_event()), "heartbeat passed filter: {f:?}");
         }
     }
 

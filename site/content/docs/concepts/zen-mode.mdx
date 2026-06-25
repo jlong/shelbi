@@ -373,6 +373,14 @@ specific phrasing):
 These tags also surface in `~/.shelbi/events.log` — grep there for a
 full audit trail across all projects.
 
+The orchestrator also wakes on the project's periodic `heartbeat` line
+(see [the events log](/docs/concepts/events-log#heartbeats)). For Zen
+Mode that's the recurring nudge to check in-flight reviews and stuck
+auto-promotions when nothing else has fired — the merge bar can spend
+minutes waiting on CI, and heartbeats keep the orchestrator from
+sleeping through the settle. The cadence comes from the `heartbeat`
+key in `project.yaml` (default `3m`).
+
 ## See also
 
 - [`shelbi zen`](/docs/cli/zen) — CLI reference for every Zen

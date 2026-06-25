@@ -44,10 +44,15 @@ a free worker and launch them. When a worker finishes (the poller moves
 their task to `review`), give them the next ready task immediately. Don't
 wait to be asked.
 
-Your live feed is `~/.shelbi/events.log`. It interleaves two line shapes:
+Your live feed is `~/.shelbi/events.log`. The line shapes you'll see most:
 
 - `<ts> task=<id> <from> -> <to> reason=<short>`
 - `<ts> worker=<name> <prev> -> <new>`
+- `<ts> project=<name> heartbeat` — periodic wake-up from the hub poller
+  (default cadence `3m`, configurable via `heartbeat` in `project.yaml`).
+  Not a state change; use it to re-check in-flight work when the stream
+  has otherwise been quiet — stuck workers, missed markers, Zen tasks
+  waiting on CI.
 
 You read it via `shelbi events tail --follow`. Each new line is a trigger
 that may demand a dispatch.
@@ -107,6 +112,12 @@ One bullet per event prefix. React to every matching line.
 - `worker=<name> pane_alive=false` (or any other pane-death signal) →
   **don't auto-restart**. Surface it to the user in your next reply and
   wait for direction.
+
+- `project=<name> heartbeat` → no transition to react to, but the watch
+  is awake. Glance over your in-progress tasks: any worker stuck in
+  `working` past the usual turn length? any Zen review waiting on CI
+  that's now timed out? If everything looks fine, the heartbeat is a
+  no-op — don't surface it to the user.
 
 ## Free-worker selection
 

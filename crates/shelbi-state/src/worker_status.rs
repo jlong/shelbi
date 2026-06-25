@@ -247,6 +247,18 @@ pub fn append_zen_dryrun_event(task_id: &str, action: &str, detail: &str) -> Res
     ))
 }
 
+/// Append `<rfc3339> project=<name> heartbeat` to `~/.shelbi/events.log`.
+/// The hub-side poller emits this on its configured `heartbeat` cadence
+/// (see `shelbi_core::HeartbeatConfig`) so the orchestrator's
+/// `events tail --follow` watch has a guaranteed recurring trigger even
+/// when the board is otherwise silent. Heartbeats are filtered out of
+/// the human-facing activity feed by default — they're a wake-up signal,
+/// not user-facing news.
+pub fn append_heartbeat_event(project: &str) -> Result<()> {
+    let ts = Utc::now().to_rfc3339();
+    append_event_line(&format!("{ts} project={project} heartbeat"))
+}
+
 /// Append `<rfc3339> dispatch task=<id> worker=<name> status=<status> detail=<detail>`
 /// to `~/.shelbi/events.log`. Use this to surface dispatch-time anomalies
 /// (e.g. the initial prompt was pasted but Enter never landed) that aren't
@@ -488,6 +500,38 @@ mod tests {
         assert_eq!(parsed[0].5, "reason=assigned");
         assert_eq!(parsed[1].4, "review");
         assert_eq!(parsed[1].5, "reason=worker_review");
+
+        std::env::remove_var("SHELBI_HOME");
+    }
+
+    #[test]
+    fn heartbeat_event_writes_project_scoped_line() {
+        // Shape: `<ts> project=<name> heartbeat`. No `task=`/`worker=`
+        // prefix on purpose — the orchestrator's tail uses the leading
+        // token after the timestamp to dispatch handlers, and the
+        // `project=…` form lets a heartbeat live alongside other
+        // future project-scoped events without colliding.
+        let _g = TEST_LOCK.lock().unwrap();
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+
+        append_heartbeat_event("myapp").unwrap();
+        append_heartbeat_event("myapp").unwrap();
+
+        let log = std::fs::read_to_string(events_log_path().unwrap()).unwrap();
+        let lines: Vec<&str> = log.lines().collect();
+        assert_eq!(lines.len(), 2);
+        for line in &lines {
+            assert!(
+                line.ends_with(" project=myapp heartbeat"),
+                "line: {line}"
+            );
+            // Timestamp parses as RFC3339 so `--since` filtering works
+            // the same way it does for every other event shape.
+            let ts = line.split_whitespace().next().unwrap();
+            chrono::DateTime::parse_from_rfc3339(ts)
+                .unwrap_or_else(|_| panic!("not rfc3339: {ts}"));
+        }
 
         std::env::remove_var("SHELBI_HOME");
     }

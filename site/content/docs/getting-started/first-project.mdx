@@ -206,6 +206,38 @@ Field by field:
   orchestrator picks free workers in declaration order when
   dispatching.
 
+### Optional keys
+
+A few keys aren't written by the wizard but can be added by hand. The
+ones most worth knowing about:
+
+- **`heartbeat`** — how often the hub poller appends a `project=<name>
+  heartbeat` line to [`~/.shelbi/events.log`](/docs/concepts/events-log)
+  when the board is otherwise quiet. The orchestrator follows the log
+  with `shelbi events tail --follow`; the heartbeat is its guaranteed
+  recurring wake-up when nothing else has fired. Default `3m`.
+
+  Accepts a duration string with an explicit unit suffix — `45s`, `3m`,
+  `1h` — or the literal `"off"` (quote it; YAML otherwise reads bare
+  `off` as the boolean `false`). Bare integers like `heartbeat: 180`
+  are rejected — there's no implicit unit, on purpose.
+
+  ```yaml
+  heartbeat: 3m         # default
+  heartbeat: 90s        # tighter cadence
+  heartbeat: 1h         # background project
+  heartbeat: "off"      # disable
+  ```
+
+  Emission is debounced against everything else in the log: if any
+  line was written in the last `heartbeat` interval — a worker
+  transition, a task move, another heartbeat — the next tick skips
+  rather than padding an already-active feed.
+
+  Heartbeats are intentionally absent from the TUI activity feed —
+  they'd produce one "nothing happened" row every few minutes. Use
+  `shelbi events tail` if you want to see them.
+
 ### Naming workers by hand
 
 The wizard's presets cover most cases, but the names are just strings —

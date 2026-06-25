@@ -64,6 +64,12 @@ pub struct Project {
     /// CI, and which paths require human review even in Zen Mode.
     #[serde(default)]
     pub zen: ZenConfig,
+    /// Periodic heartbeat the hub-side poller writes into
+    /// `~/.shelbi/events.log` so the orchestrator's `events tail --follow`
+    /// watch has a guaranteed recurring trigger when the board is quiet.
+    /// Default `3m`; set to `off` to disable. See [`HeartbeatConfig`].
+    #[serde(default)]
+    pub heartbeat: HeartbeatConfig,
     /// ContextStore spaces that should be rsynced from a remote worker's
     /// machine back to hub after the worker hands off for review. Each
     /// space's path is interpreted on both hub and remote — leading `~`
@@ -89,6 +95,119 @@ pub struct Project {
 pub struct ContextStoreSyncSpec {
     pub space: String,
     pub path: PathBuf,
+}
+
+/// How often the hub poller emits a `project=<name> heartbeat` line into
+/// `~/.shelbi/events.log`. The heartbeat is the orchestrator's fallback
+/// trigger — `events tail --follow` may sit silent for hours on a quiet
+/// board, and a recurring line guarantees the watch wakes up to check
+/// active tasks even when no real transition has fired.
+///
+/// On disk the value is a duration string (`45s`, `3m`, `1h`) or the
+/// literal `off`. Bare integers are rejected — there's no implicit unit.
+/// See `HEARTBEAT_DEFAULT` for the default interval.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Serialize, Deserialize)]
+#[serde(try_from = "String", into = "String")]
+pub enum HeartbeatConfig {
+    Off,
+    Every(Duration),
+}
+
+/// Default heartbeat cadence: 3 minutes. Tuned to be frequent enough that
+/// a stuck orchestrator wakes up within a couple of intervals, but rare
+/// enough that an idle hub doesn't bloat `events.log` with thousands of
+/// lines a day.
+pub const HEARTBEAT_DEFAULT: Duration = Duration::from_secs(180);
+
+impl Default for HeartbeatConfig {
+    fn default() -> Self {
+        HeartbeatConfig::Every(HEARTBEAT_DEFAULT)
+    }
+}
+
+impl HeartbeatConfig {
+    /// The cadence, or `None` if heartbeats are turned off.
+    pub fn interval(&self) -> Option<Duration> {
+        match self {
+            HeartbeatConfig::Off => None,
+            HeartbeatConfig::Every(d) => Some(*d),
+        }
+    }
+}
+
+impl std::fmt::Display for HeartbeatConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            HeartbeatConfig::Off => f.write_str("off"),
+            HeartbeatConfig::Every(d) => {
+                let secs = d.as_secs();
+                if secs == 0 {
+                    return f.write_str("0s");
+                }
+                if secs % 3600 == 0 {
+                    write!(f, "{}h", secs / 3600)
+                } else if secs % 60 == 0 {
+                    write!(f, "{}m", secs / 60)
+                } else {
+                    write!(f, "{secs}s")
+                }
+            }
+        }
+    }
+}
+
+impl From<HeartbeatConfig> for String {
+    fn from(h: HeartbeatConfig) -> Self {
+        h.to_string()
+    }
+}
+
+impl TryFrom<String> for HeartbeatConfig {
+    type Error = String;
+    fn try_from(s: String) -> std::result::Result<Self, Self::Error> {
+        s.parse()
+    }
+}
+
+impl std::str::FromStr for HeartbeatConfig {
+    type Err = String;
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        let trimmed = s.trim();
+        if trimmed.is_empty() {
+            return Err(
+                "heartbeat: empty string — use a duration like `3m` or `off`".to_string(),
+            );
+        }
+        if trimmed.eq_ignore_ascii_case("off") {
+            return Ok(HeartbeatConfig::Off);
+        }
+        // Require an explicit unit suffix. Without one we'd have to guess
+        // (seconds? minutes?) and a bug like `heartbeat: 3` silently
+        // becoming three-of-the-wrong-unit is exactly the foot-gun this
+        // type is meant to avoid.
+        let last = trimmed.chars().last().unwrap();
+        let (num_part, mult) = match last {
+            's' | 'S' => (&trimmed[..trimmed.len() - last.len_utf8()], 1u64),
+            'm' | 'M' => (&trimmed[..trimmed.len() - last.len_utf8()], 60u64),
+            'h' | 'H' => (&trimmed[..trimmed.len() - last.len_utf8()], 3_600u64),
+            _ => {
+                return Err(format!(
+                    "heartbeat `{s}`: missing unit — use `s`, `m`, `h` (e.g. `45s`, `3m`, `1h`) or `off`"
+                ));
+            }
+        };
+        let n: u64 = num_part.trim().parse().map_err(|_| {
+            format!("heartbeat `{s}`: not a number followed by `s`/`m`/`h`")
+        })?;
+        if n == 0 {
+            return Err(format!("heartbeat `{s}`: zero interval — use `off` to disable"));
+        }
+        let secs = n
+            .checked_mul(mult)
+            .ok_or_else(|| format!("heartbeat `{s}`: duration overflows"))?;
+        Ok(HeartbeatConfig::Every(Duration::from_secs(secs)))
+    }
 }
 
 fn default_branch() -> String {
@@ -980,6 +1099,7 @@ worker_settings_template: /etc/shelbi/p.json
             worker_permissions_mode: default_worker_permissions_mode(),
             worker_settings_template: None,
             zen: ZenConfig::default(),
+            heartbeat: HeartbeatConfig::default(),
             contextstore_sync: Vec::new(),
             detected_shapes: Vec::new(),
         };
@@ -1021,6 +1141,7 @@ worker_settings_template: /etc/shelbi/p.json
             worker_permissions_mode: default_worker_permissions_mode(),
             worker_settings_template: None,
             zen,
+            heartbeat: HeartbeatConfig::default(),
             contextstore_sync: Vec::new(),
             detected_shapes: Vec::new(),
         }
@@ -1397,5 +1518,164 @@ updated_at: 2026-06-19T00:00:00Z
         let mut p = project_with_zen(ZenConfig::default());
         p.detect_shapes(&root);
         assert_eq!(p.detected_shapes, vec![ProjectShape::CargoWorkspace]);
+    }
+
+    // ---- HeartbeatConfig --------------------------------------------------
+
+    #[test]
+    fn heartbeat_config_default_is_three_minutes() {
+        assert_eq!(
+            HeartbeatConfig::default(),
+            HeartbeatConfig::Every(Duration::from_secs(180))
+        );
+        assert_eq!(
+            HeartbeatConfig::default().interval(),
+            Some(Duration::from_secs(180))
+        );
+    }
+
+    #[test]
+    fn heartbeat_config_parses_seconds_minutes_hours() {
+        use std::str::FromStr;
+        assert_eq!(
+            HeartbeatConfig::from_str("45s").unwrap(),
+            HeartbeatConfig::Every(Duration::from_secs(45))
+        );
+        assert_eq!(
+            HeartbeatConfig::from_str("3m").unwrap(),
+            HeartbeatConfig::Every(Duration::from_secs(180))
+        );
+        assert_eq!(
+            HeartbeatConfig::from_str("1h").unwrap(),
+            HeartbeatConfig::Every(Duration::from_secs(3_600))
+        );
+        // Case-insensitive on both the unit and the `off` keyword so
+        // hand-edited YAML doesn't surprise on capitalization.
+        assert_eq!(
+            HeartbeatConfig::from_str("2H").unwrap(),
+            HeartbeatConfig::Every(Duration::from_secs(7_200))
+        );
+        assert_eq!(HeartbeatConfig::from_str("OFF").unwrap(), HeartbeatConfig::Off);
+        assert_eq!(HeartbeatConfig::from_str("off").unwrap(), HeartbeatConfig::Off);
+    }
+
+    #[test]
+    fn heartbeat_config_rejects_bare_integers_and_unknown_units() {
+        use std::str::FromStr;
+        // No unit suffix — explicitly rejected so `heartbeat: 3`
+        // doesn't silently become 3 of some default unit.
+        assert!(HeartbeatConfig::from_str("3").is_err());
+        assert!(HeartbeatConfig::from_str("180").is_err());
+        // Unknown units.
+        assert!(HeartbeatConfig::from_str("5x").is_err());
+        assert!(HeartbeatConfig::from_str("1d").is_err()); // days unsupported
+        // Zero interval is a misuse; ask for `off` instead.
+        assert!(HeartbeatConfig::from_str("0s").is_err());
+        assert!(HeartbeatConfig::from_str("0m").is_err());
+        // Empty.
+        assert!(HeartbeatConfig::from_str("").is_err());
+        assert!(HeartbeatConfig::from_str("   ").is_err());
+    }
+
+    #[test]
+    fn heartbeat_config_serializes_as_compact_string() {
+        // Round-trips through serde_yaml as a plain string.
+        let cfg = HeartbeatConfig::Every(Duration::from_secs(180));
+        let y = serde_yaml::to_string(&cfg).unwrap();
+        assert!(y.contains("3m"), "got {y:?}");
+        let back: HeartbeatConfig = serde_yaml::from_str(&y).unwrap();
+        assert_eq!(back, cfg);
+
+        let cfg = HeartbeatConfig::Off;
+        let y = serde_yaml::to_string(&cfg).unwrap();
+        assert!(y.contains("off"), "got {y:?}");
+        let back: HeartbeatConfig = serde_yaml::from_str(&y).unwrap();
+        assert_eq!(back, cfg);
+
+        // Non-round-number seconds stay in seconds.
+        let cfg = HeartbeatConfig::Every(Duration::from_secs(45));
+        let y = serde_yaml::to_string(&cfg).unwrap();
+        assert!(y.contains("45s"), "got {y:?}");
+    }
+
+    #[test]
+    fn project_yaml_omits_heartbeat_when_default() {
+        // Older project YAMLs predate the field — `#[serde(default)]`
+        // means parsing fills in the default and serialization should
+        // emit the canonical string.
+        let yaml = r#"
+name: p
+repo: r
+machines:
+  - { name: hub, kind: local, work_dir: /tmp }
+orchestrator: { runner: claude }
+agent_runners:
+  claude: { command: claude, flags: [] }
+"#;
+        let p: Project = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(p.heartbeat, HeartbeatConfig::default());
+    }
+
+    #[test]
+    fn project_yaml_parses_heartbeat_off_and_string_form() {
+        let yaml = r#"
+name: p
+repo: r
+machines:
+  - { name: hub, kind: local, work_dir: /tmp }
+orchestrator: { runner: claude }
+agent_runners:
+  claude: { command: claude, flags: [] }
+heartbeat: off
+"#;
+        // YAML interprets bare `off` as the boolean `false`. Quote it
+        // explicitly when handing user-written configs — but the
+        // wizard / serializer always writes the quoted form below.
+        let yaml_quoted = yaml.replace("heartbeat: off", "heartbeat: \"off\"");
+        let p: Project = serde_yaml::from_str(&yaml_quoted).unwrap();
+        assert_eq!(p.heartbeat, HeartbeatConfig::Off);
+
+        let yaml = r#"
+name: p
+repo: r
+machines:
+  - { name: hub, kind: local, work_dir: /tmp }
+orchestrator: { runner: claude }
+agent_runners:
+  claude: { command: claude, flags: [] }
+heartbeat: 90s
+"#;
+        let p: Project = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(
+            p.heartbeat,
+            HeartbeatConfig::Every(Duration::from_secs(90))
+        );
+    }
+
+    #[test]
+    fn project_yaml_rejects_heartbeat_without_unit() {
+        let yaml = r#"
+name: p
+repo: r
+machines:
+  - { name: hub, kind: local, work_dir: /tmp }
+orchestrator: { runner: claude }
+agent_runners:
+  claude: { command: claude, flags: [] }
+heartbeat: 180
+"#;
+        // YAML parses `180` as an integer, not a string — so deserialization
+        // fails at the type level (`expected String`). Quote it and we
+        // get the explicit "missing unit" error.
+        assert!(serde_yaml::from_str::<Project>(yaml).is_err());
+
+        let yaml_quoted = yaml.replace("heartbeat: 180", "heartbeat: \"180\"");
+        let err = serde_yaml::from_str::<Project>(&yaml_quoted)
+            .expect_err("must reject unitless heartbeat");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("missing unit") || msg.contains("180"),
+            "expected error to mention the missing unit, got: {msg}"
+        );
     }
 }
