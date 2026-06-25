@@ -24,8 +24,8 @@ use std::time::{Duration, Instant};
 use globset::{Glob, GlobSetBuilder};
 use serde::Serialize;
 use shelbi_core::{
-    checks_for_task, danger_paths_for_project, Error, Host, Machine, MachineKind, Project, Result,
-    Task, WorkerSpec,
+    checks_for_task, danger_paths_for_project, Column, Error, Host, Machine, MachineKind, Project,
+    Result, Task, WorkerSpec,
 };
 
 use crate::worker::worker_worktree;
@@ -922,7 +922,7 @@ pub fn match_danger_paths(patterns: &[String], changed: &[&str]) -> DangerPaths 
 // Tests
 
 #[cfg(test)]
-mod tests {
+mod probe_tests {
     use super::*;
     use std::process::Command;
 
@@ -1254,5 +1254,417 @@ mod tests {
         assert_eq!(line_count, OUTPUT_TAIL_LINES);
         // Last line is line-199.
         assert!(res.output_tail.ends_with("line-199"));
+    }
+}
+
+
+// ===========================================================================
+// Backlog scan — mechanical eligibility for Zen auto-promotion
+// ===========================================================================
+//
+// `mechanically_eligible` answers a narrow question: which backlog task ids
+// are safe to lift to `todo` purely from a state-machine standpoint? It is
+// *not* the final say — the orchestrator's prompt layers judgment about
+// "type of work", "recent issue follow-up", and "larger body of work the
+// user kicked off" on top of this list. That separation is deliberate: the
+// rules here are mechanical (and Rust-tested); the rules there are
+// user-tunable (and live in the prompt).
+
+/// Backlog task ids that are mechanically eligible for Zen auto-promotion,
+/// sorted by priority (lower number = higher priority). See module docs for
+/// the rules — and what we *don't* check.
+///
+/// I/O: loads every task file in the project plus the events log. Returns an
+/// empty list when the backlog is empty or every backlog task is blocked.
+pub fn mechanically_eligible(project: &Project) -> Result<Vec<String>> {
+    let tasks = shelbi_state::list_tasks(&project.name)?;
+    let demoted = read_demoted_task_ids()?;
+    Ok(mechanically_eligible_from(&tasks, &demoted))
+}
+
+/// Pure-logic core of [`mechanically_eligible`]. Split out so the unit
+/// tests can drive it with in-memory fixtures without touching disk or
+/// `SHELBI_HOME`.
+pub fn mechanically_eligible_from(
+    tasks: &[shelbi_state::TaskFile],
+    demoted: &std::collections::HashSet<String>,
+) -> Vec<String> {
+    let columns: std::collections::HashMap<String, Column> = tasks
+        .iter()
+        .map(|tf| (tf.task.id.clone(), tf.task.column))
+        .collect();
+
+    let in_flight_bodies: Vec<&str> = tasks
+        .iter()
+        .filter(|tf| tf.task.column == Column::InProgress)
+        .map(|tf| tf.body.as_str())
+        .collect();
+
+    let mut candidates: Vec<&Task> = tasks
+        .iter()
+        .filter(|tf| tf.task.column == Column::Backlog)
+        .filter(|tf| !tf.task.is_blocked(&columns))
+        .filter(|tf| !zen_disabled(&tf.task))
+        .filter(|tf| !demoted.contains(&tf.task.id))
+        .filter(|tf| !file_overlaps_in_flight(&tf.body, &in_flight_bodies))
+        .map(|tf| &tf.task)
+        .collect();
+
+    // Stable secondary sort by id so equal-priority ties have a deterministic
+    // order — matters for the CLI wrapper that prints one ID per line.
+    candidates.sort_by(|a, b| a.priority.cmp(&b.priority).then_with(|| a.id.cmp(&b.id)));
+    candidates.into_iter().map(|t| t.id.clone()).collect()
+}
+
+/// True iff the task's frontmatter explicitly opts out via `zen.enabled:
+/// false`. `None` (no override) and `Some(true)` both count as "follow
+/// project default" — which, for this gate, means "eligible".
+fn zen_disabled(task: &Task) -> bool {
+    matches!(task.zen.as_ref().and_then(|z| z.enabled), Some(false))
+}
+
+/// File-overlap heuristic: extract path-like tokens from `candidate_body`
+/// and return true iff any token appears as a substring in any in-flight
+/// task body. Asymmetric on purpose — the candidate is the new arrival we
+/// might queue behind something already being touched.
+fn file_overlaps_in_flight(candidate_body: &str, in_flight_bodies: &[&str]) -> bool {
+    let tokens = extract_path_tokens(candidate_body);
+    tokens
+        .iter()
+        .any(|tok| in_flight_bodies.iter().any(|body| body.contains(tok.as_str())))
+}
+
+/// Pull out tokens that look like file paths. A "path-like" token is a
+/// run of `[A-Za-z0-9._/-]` that contains at least one `/` and ends in a
+/// `.<ext>` segment of 1–8 word characters. This catches the common cases
+/// the spec calls out (`crates/shelbi-tui/src/app.rs`,
+/// `site/components/Footer.tsx`) without dragging in unrelated dotted
+/// identifiers like `task.zen.enabled`. Markdown wrappers (backticks,
+/// brackets) drop out automatically because they're not in the path
+/// alphabet.
+pub fn extract_path_tokens(body: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    for raw in body.split(|c: char| {
+        !(c.is_alphanumeric() || c == '/' || c == '.' || c == '-' || c == '_')
+    }) {
+        if let Some(tok) = canonical_path_token(raw) {
+            out.push(tok);
+        }
+    }
+    out
+}
+
+fn canonical_path_token(raw: &str) -> Option<String> {
+    // Only trim the *trailing* end. Stripping leading punctuation would
+    // eat the slash in tokens like `./foo.rs` and lose the path signal.
+    let trimmed = raw.trim_end_matches(|c: char| c == '.' || c == '/' || c == '-' || c == '_');
+    if trimmed.is_empty() || !trimmed.contains('/') {
+        return None;
+    }
+    let last_seg = trimmed.rsplit('/').next()?;
+    let (_, ext) = last_seg.rsplit_once('.')?;
+    if ext.is_empty() || ext.len() > 8 {
+        return None;
+    }
+    if !ext.chars().all(|c| c.is_ascii_alphanumeric()) {
+        return None;
+    }
+    Some(trimmed.to_string())
+}
+
+/// Read every `task=<id> todo -> backlog reason=user:*` line from the
+/// events log and collect the demoted task ids. Once a user demotes a
+/// task, Zen never re-promotes it — see the spec.
+fn read_demoted_task_ids() -> Result<std::collections::HashSet<String>> {
+    let path = shelbi_state::events_log_path()?;
+    if !path.exists() {
+        return Ok(std::collections::HashSet::new());
+    }
+    let text = std::fs::read_to_string(&path).map_err(Error::Io)?;
+    Ok(parse_demoted_task_ids(&text))
+}
+
+/// Pure scan over event-log text. Each matching line contributes one id.
+pub fn parse_demoted_task_ids(log: &str) -> std::collections::HashSet<String> {
+    let mut out = std::collections::HashSet::new();
+    for line in log.lines() {
+        if let Some(id) = parse_user_demotion_line(line) {
+            out.insert(id.to_string());
+        }
+    }
+    out
+}
+
+/// Returns the task id from a line of the form
+/// `<ts> task=<id> todo -> backlog reason=user:<rest>`, or `None` if the
+/// line is anything else (worker events, other transitions, non-user
+/// reasons, etc.).
+fn parse_user_demotion_line(line: &str) -> Option<&str> {
+    // Cheap prefilter — most lines aren't demotions.
+    if !line.contains(" todo -> backlog ") {
+        return None;
+    }
+    if !line.contains(" reason=user:") {
+        return None;
+    }
+    let after_task = line.split(" task=").nth(1)?;
+    let id_end = after_task.find(' ')?;
+    let id = &after_task[..id_end];
+    // Re-anchor the transition + reason check to the slice *after* the id,
+    // so an unrelated " task=" elsewhere in the line can't fool us.
+    let rest = &after_task[id_end..];
+    if !rest.starts_with(" todo -> backlog ") {
+        return None;
+    }
+    let reason = rest.split(" reason=").nth(1)?;
+    if !reason.starts_with("user:") {
+        return None;
+    }
+    Some(id)
+}
+
+#[cfg(test)]
+mod scan_tests {
+    use super::*;
+    use chrono::Utc;
+    use shelbi_core::Column;
+    use shelbi_state::TaskFile;
+    use std::collections::HashSet;
+
+    fn task(id: &str, column: Column, priority: u32, deps: &[&str]) -> Task {
+        Task {
+            id: id.into(),
+            title: id.into(),
+            column,
+            priority,
+            assigned_to: None,
+            branch: None,
+            depends_on: deps.iter().map(|s| s.to_string()).collect(),
+            prefers_machine: None,
+            zen: None,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        }
+    }
+
+    fn tf(task: Task, body: &str) -> TaskFile {
+        TaskFile {
+            task,
+            body: body.into(),
+        }
+    }
+
+    #[test]
+    fn empty_backlog_returns_empty() {
+        let tasks = vec![
+            tf(task("done-a", Column::Done, 0, &[]), ""),
+            tf(task("todo-a", Column::Todo, 0, &[]), ""),
+        ];
+        let got = mechanically_eligible_from(&tasks, &HashSet::new());
+        assert!(got.is_empty());
+    }
+
+    #[test]
+    fn returns_eligible_in_priority_order() {
+        let tasks = vec![
+            tf(task("b", Column::Backlog, 2, &[]), ""),
+            tf(task("a", Column::Backlog, 0, &[]), ""),
+            tf(task("c", Column::Backlog, 1, &[]), ""),
+        ];
+        let got = mechanically_eligible_from(&tasks, &HashSet::new());
+        assert_eq!(got, vec!["a", "c", "b"]);
+    }
+
+    #[test]
+    fn excludes_blocked_by_unfinished_deps() {
+        let tasks = vec![
+            tf(task("blocked", Column::Backlog, 0, &["other"]), ""),
+            tf(task("other", Column::Todo, 0, &[]), ""),
+        ];
+        let got = mechanically_eligible_from(&tasks, &HashSet::new());
+        assert!(got.is_empty(), "{got:?}");
+    }
+
+    #[test]
+    fn returns_empty_when_every_backlog_task_is_blocked() {
+        // Mix of blocked-by-todo and blocked-by-in-progress. None can move.
+        let tasks = vec![
+            tf(task("a", Column::Backlog, 0, &["x"]), ""),
+            tf(task("b", Column::Backlog, 1, &["y"]), ""),
+            tf(task("x", Column::Todo, 0, &[]), ""),
+            tf(task("y", Column::InProgress, 0, &[]), ""),
+        ];
+        let got = mechanically_eligible_from(&tasks, &HashSet::new());
+        assert!(got.is_empty(), "{got:?}");
+    }
+
+    #[test]
+    fn done_deps_unblock_a_task() {
+        let tasks = vec![
+            tf(task("waiting", Column::Backlog, 0, &["dep"]), ""),
+            tf(task("dep", Column::Done, 0, &[]), ""),
+        ];
+        let got = mechanically_eligible_from(&tasks, &HashSet::new());
+        assert_eq!(got, vec!["waiting"]);
+    }
+
+    #[test]
+    fn excludes_zen_enabled_false() {
+        let mut t = task("opt-out", Column::Backlog, 0, &[]);
+        t.zen = Some(shelbi_core::TaskZenConfig {
+            enabled: Some(false),
+            ..Default::default()
+        });
+        let tasks = vec![tf(t, "")];
+        let got = mechanically_eligible_from(&tasks, &HashSet::new());
+        assert!(got.is_empty(), "{got:?}");
+    }
+
+    #[test]
+    fn zen_enabled_true_or_unset_is_eligible() {
+        let mut opt_in = task("opt-in", Column::Backlog, 0, &[]);
+        opt_in.zen = Some(shelbi_core::TaskZenConfig {
+            enabled: Some(true),
+            ..Default::default()
+        });
+        let unset = task("unset", Column::Backlog, 1, &[]);
+        let tasks = vec![tf(opt_in, ""), tf(unset, "")];
+        let got = mechanically_eligible_from(&tasks, &HashSet::new());
+        assert_eq!(got, vec!["opt-in", "unset"]);
+    }
+
+    #[test]
+    fn excludes_previously_user_demoted() {
+        let tasks = vec![
+            tf(task("demoted", Column::Backlog, 0, &[]), ""),
+            tf(task("fresh", Column::Backlog, 1, &[]), ""),
+        ];
+        let mut demoted = HashSet::new();
+        demoted.insert("demoted".to_string());
+        let got = mechanically_eligible_from(&tasks, &demoted);
+        assert_eq!(got, vec!["fresh"]);
+    }
+
+    #[test]
+    fn file_overlap_with_in_progress_excludes_candidate() {
+        // Both backlog tasks mention crates/shelbi-cli/src/main.rs; one of
+        // those tasks is already in_progress, so the *other* must be
+        // skipped (the spec's worked example).
+        let body_a = "Refactor `crates/shelbi-cli/src/main.rs` to split the dispatch path.";
+        let body_b = "Add tests covering crates/shelbi-cli/src/main.rs error paths.";
+        let tasks = vec![
+            tf(task("in-flight", Column::InProgress, 0, &[]), body_a),
+            tf(task("candidate", Column::Backlog, 0, &[]), body_b),
+        ];
+        let got = mechanically_eligible_from(&tasks, &HashSet::new());
+        assert!(got.is_empty(), "{got:?}");
+    }
+
+    #[test]
+    fn file_overlap_does_not_trigger_on_unrelated_paths() {
+        let in_flight_body = "Working on `crates/shelbi-tui/src/app.rs`.";
+        let candidate_body = "Touch `crates/shelbi-state/src/lib.rs` only.";
+        let tasks = vec![
+            tf(task("in-flight", Column::InProgress, 0, &[]), in_flight_body),
+            tf(task("candidate", Column::Backlog, 0, &[]), candidate_body),
+        ];
+        let got = mechanically_eligible_from(&tasks, &HashSet::new());
+        assert_eq!(got, vec!["candidate"]);
+    }
+
+    #[test]
+    fn does_not_cap_result_count() {
+        // Ten eligible tasks; we get all ten back. The orchestrator's
+        // judgment layer picks how many to actually promote.
+        let tasks: Vec<TaskFile> = (0..10)
+            .map(|i| tf(task(&format!("t-{i}"), Column::Backlog, i, &[]), ""))
+            .collect();
+        let got = mechanically_eligible_from(&tasks, &HashSet::new());
+        assert_eq!(got.len(), 10);
+    }
+
+    // --- helpers --------------------------------------------------------
+
+    #[test]
+    fn path_token_extraction_picks_up_typical_paths() {
+        let body = "Edit `crates/shelbi-tui/src/app.rs` and \
+                    `site/components/Footer.tsx`. Also: bare/path.rs.";
+        let toks = extract_path_tokens(body);
+        assert!(toks.iter().any(|t| t == "crates/shelbi-tui/src/app.rs"));
+        assert!(toks.iter().any(|t| t == "site/components/Footer.tsx"));
+        assert!(toks.iter().any(|t| t == "bare/path.rs"));
+    }
+
+    #[test]
+    fn path_token_extraction_ignores_dotted_identifiers() {
+        // `task.zen.enabled` is a config key, not a file path — no slash.
+        let toks = extract_path_tokens("Set task.zen.enabled to false.");
+        assert!(toks.is_empty(), "{toks:?}");
+    }
+
+    #[test]
+    fn path_token_extraction_handles_dot_slash_prefix() {
+        // `./foo.rs` is uncommon in markdown but still a path — the leading
+        // `./` shouldn't disqualify it.
+        let toks = extract_path_tokens("Edit ./foo.rs please.");
+        assert!(toks.iter().any(|t| t == "./foo.rs"), "{toks:?}");
+    }
+
+    #[test]
+    fn path_token_extraction_strips_trailing_period() {
+        // `bare/path.rs.` at end of a sentence loses the trailing period.
+        let toks = extract_path_tokens("Touch bare/path.rs.");
+        assert!(toks.iter().any(|t| t == "bare/path.rs"), "{toks:?}");
+        assert!(!toks.iter().any(|t| t.ends_with('.')), "{toks:?}");
+    }
+
+    #[test]
+    fn path_token_extraction_ignores_extensionless_words() {
+        // No `.<ext>` segment after the last `/` → drop.
+        let toks = extract_path_tokens("See README under crates/shelbi-core directory.");
+        assert!(toks.is_empty(), "{toks:?}");
+    }
+
+    #[test]
+    fn parse_demoted_task_ids_matches_user_demotions_only() {
+        let log = "\
+2026-06-24T00:00:00+00:00 worker=alpha none -> working
+2026-06-24T00:01:00+00:00 task=foo backlog -> todo reason=zen:auto-promote
+2026-06-24T00:02:00+00:00 task=foo todo -> backlog reason=user:cli
+2026-06-24T00:03:00+00:00 task=bar todo -> backlog reason=zen:rollback
+2026-06-24T00:04:00+00:00 task=baz todo -> in_progress reason=user:cli:start
+2026-06-24T00:05:00+00:00 task=qux todo -> backlog reason=user:tui
+";
+        let demoted = parse_demoted_task_ids(log);
+        assert!(demoted.contains("foo"));
+        assert!(demoted.contains("qux"));
+        assert!(!demoted.contains("bar"));
+        assert!(!demoted.contains("baz"));
+        assert_eq!(demoted.len(), 2);
+    }
+
+    #[test]
+    fn parse_demoted_task_ids_handles_empty_log() {
+        assert!(parse_demoted_task_ids("").is_empty());
+    }
+
+    #[test]
+    fn does_not_inspect_body_for_judgment_signals() {
+        // Wording the spec explicitly tells us NOT to gate on — task type
+        // hints, "recent issue" language, kickoff-context phrases. None of
+        // these should keep the task out of the eligible list; the
+        // orchestrator decides what to do with the signal.
+        let bodies = [
+            "Quick docs typo.",
+            "Follow-up to the auth incident we just shipped a hotfix for.",
+            "Phase 3 of the kickoff John kicked off yesterday.",
+        ];
+        let tasks: Vec<TaskFile> = bodies
+            .iter()
+            .enumerate()
+            .map(|(i, body)| tf(task(&format!("t-{i}"), Column::Backlog, i as u32, &[]), body))
+            .collect();
+        let got = mechanically_eligible_from(&tasks, &HashSet::new());
+        assert_eq!(got, vec!["t-0", "t-1", "t-2"]);
     }
 }
