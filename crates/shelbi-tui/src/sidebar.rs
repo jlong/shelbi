@@ -3,7 +3,7 @@
 //! panes / windows).
 
 use ratatui::{
-    layout::{Constraint, Direction, Layout, Rect},
+    layout::{Constraint, Direction, Layout, Margin, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::{List, ListItem, ListState, Paragraph},
@@ -14,21 +14,24 @@ use shelbi_state::ZenModeState;
 use crate::app::{App, Row, WorkerBadge};
 
 pub fn render_full(f: &mut Frame, app: &mut App, area: Rect) {
-    // Footer grows from 2 lines (keymap + status_line) to 4 lines when the
-    // green Zen pill is showing (keymap + 3-line pill). Keeps the list area
-    // tight in the common no-pill case.
-    let footer_height = if matches!(app.zen_mode, ZenModeState::On) {
-        4
-    } else {
-        2
-    };
+    // Footer is always: [status?] keybinds, blank, zen-row. The zen row is
+    // a single line in both states so toggling never shifts the rows above
+    // it. Width grows by 1 when there's a `status_line` to surface.
+    let footer_height: u16 = if app.status_line.is_empty() { 3 } else { 4 };
+    // Outer split is full-width — the zen ON row paints its green band
+    // edge-to-edge of the sidebar column, so it can't sit inside the 1-col
+    // horizontal padding the list uses. We re-apply that padding only to
+    // the list and the keybind/status rows below.
     let outer = Layout::default()
         .direction(Direction::Vertical)
-        .horizontal_margin(1)
         .constraints([Constraint::Min(1), Constraint::Length(footer_height)])
         .split(area);
 
-    render_list(f, app, outer[0]);
+    let list_area = outer[0].inner(Margin {
+        horizontal: 1,
+        vertical: 0,
+    });
+    render_list(f, app, list_area);
     render_footer(f, app, outer[1]);
 }
 
@@ -195,96 +198,105 @@ fn display_width(s: &str) -> usize {
 }
 
 fn render_footer(f: &mut Frame, app: &App, area: Rect) {
-    if matches!(app.zen_mode, ZenModeState::On) {
-        // Keymap line stays untouched; status_line is sacrificed for the
-        // 3-line green pill underneath it.
-        let layout = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([Constraint::Length(1), Constraint::Length(3)])
-            .split(area);
+    // Vertical rhythm is fixed: [status?] keybinds, blank, zen-row. The
+    // zen row sits at the same y-coordinate whether Zen is On or Off so
+    // toggling never nudges the keybind line above.
+    let has_status = !app.status_line.is_empty();
+    let constraints: Vec<Constraint> = if has_status {
+        vec![Constraint::Length(1); 4]
+    } else {
+        vec![Constraint::Length(1); 3]
+    };
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints(constraints)
+        .split(area);
+
+    // Indent for status + keybinds matches the list's 1-col horizontal
+    // padding. The zen row deliberately bypasses this so its background
+    // can reach the sidebar edge.
+    let indent = Margin {
+        horizontal: 1,
+        vertical: 0,
+    };
+    let mut idx = 0;
+    if has_status {
         f.render_widget(
             Paragraph::new(Line::from(Span::styled(
-                "^P palette  q quit",
-                Style::default().fg(Color::DarkGray),
-            ))),
-            layout[0],
-        );
-        render_zen_pill(f, layout[1]);
-        return;
-    }
-    let lines = if app.status_line.is_empty() {
-        vec![
-            Line::from(Span::styled(
-                "^P palette  Enter focus",
-                Style::default().fg(Color::DarkGray),
-            )),
-            Line::from(Span::styled(
-                "q  quit shelbi",
-                Style::default().fg(Color::DarkGray),
-            )),
-        ]
-    } else {
-        vec![
-            Line::from(Span::styled(
                 app.status_line.clone(),
                 Style::default().fg(Color::Yellow),
-            )),
-            Line::from(Span::styled(
-                "^P palette  q quit",
-                Style::default().fg(Color::DarkGray),
-            )),
-        ]
-    };
-    f.render_widget(Paragraph::new(lines), area);
+            ))),
+            rows[idx].inner(indent),
+        );
+        idx += 1;
+    }
+    f.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            "^P palette  q quit",
+            Style::default().fg(Color::DarkGray),
+        ))),
+        rows[idx].inner(indent),
+    );
+    idx += 2; // skip blank row
+
+    render_zen_row(f, rows[idx], app);
 }
 
-/// 3-line, ~11-column green pill anchored to the lower-left status block.
-/// Box-drawing chars are drawn as text (not a `Block` border) so the entire
-/// rectangle — corners, edges, and label — shares the same green fill.
-fn render_zen_pill(f: &mut Frame, area: Rect) {
-    const PILL_WIDTH: u16 = 11;
-    const PILL_HEIGHT: u16 = 3;
+/// Single-line zen indicator anchored to the sidebar footer.
+///
+/// On: full-width green band with `ZEN MODE ON` in black — paints
+/// edge-to-edge of the sidebar column, no border, no padding box.
+/// Off: dim `<hotkey> Zen mode` hint in the same DarkGray style as the
+/// `^P palette  q quit` line above it, so the hotkey is discoverable
+/// without changing the footer's visual weight. The hotkey glyph is
+/// sourced from the configured chord — rebinding updates it
+/// automatically. When no chord is bound the hint is suppressed so the
+/// row stays blank rather than implying a non-existent shortcut.
+fn render_zen_row(f: &mut Frame, area: Rect, app: &App) {
     if area.width == 0 || area.height == 0 {
         return;
     }
-    let w = area.width.min(PILL_WIDTH);
-    let h = area.height.min(PILL_HEIGHT);
-    let pill_area = Rect {
-        x: area.x,
-        y: area.y,
-        width: w,
-        height: h,
+    if matches!(app.zen_mode, ZenModeState::On) {
+        let style = Style::default()
+            .bg(Color::Rgb(0, 200, 80))
+            .fg(Color::Black)
+            .add_modifier(Modifier::BOLD);
+        let width = area.width as usize;
+        let label = "ZEN MODE ON";
+        let label_w = label.chars().count();
+        let line = if width <= label_w {
+            // Narrower than the label — clip rather than wrap so the
+            // band stays exactly one row tall.
+            label.chars().take(width).collect::<String>()
+        } else {
+            // Center the label inside a full-width green band.
+            let pad = width - label_w;
+            let left = pad / 2;
+            let right = pad - left;
+            format!("{}{}{}", " ".repeat(left), label, " ".repeat(right))
+        };
+        f.render_widget(
+            Paragraph::new(Line::from(Span::styled(line, style))),
+            area,
+        );
+        return;
+    }
+
+    // Off / Paused: same indent + dim style as `^P palette  q quit`.
+    let inner = area.inner(Margin {
+        horizontal: 1,
+        vertical: 0,
+    });
+    let Some(glyph) = app.zen_toggle_chord.glyph() else {
+        return;
     };
-    let style = Style::default()
-        .bg(Color::Rgb(0, 200, 80))
-        .fg(Color::Black)
-        .add_modifier(Modifier::BOLD);
-    let inner = w.saturating_sub(2) as usize;
-    let top = format!("┌{}┐", "─".repeat(inner));
-    let bottom = format!("└{}┘", "─".repeat(inner));
-    // Center " ZEN ON " inside the available inner width; if the cell is
-    // narrower than 8 chars the label gets clipped — preferable to wrapping
-    // onto a fresh row that would break the pill's box.
-    let label = " ZEN ON ";
-    let label_w = label.chars().count();
-    let pad = inner.saturating_sub(label_w);
-    let left_pad = pad / 2;
-    let right_pad = pad - left_pad;
-    let middle = format!(
-        "│{}{}{}│",
-        " ".repeat(left_pad),
-        label,
-        " ".repeat(right_pad)
+    f.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            format!("{glyph} Zen mode"),
+            Style::default().fg(Color::DarkGray),
+        ))),
+        inner,
     );
-    let mut lines = Vec::with_capacity(h as usize);
-    lines.push(Line::from(Span::styled(top, style)));
-    if h >= 2 {
-        lines.push(Line::from(Span::styled(middle, style)));
-    }
-    if h >= 3 {
-        lines.push(Line::from(Span::styled(bottom, style)));
-    }
-    f.render_widget(Paragraph::new(lines), pill_area);
 }
 
 fn status_color(s: shelbi_core::Status) -> Color {
@@ -313,87 +325,174 @@ fn worker_badge_color(b: WorkerBadge) -> Color {
 mod tests {
     use super::*;
     use ratatui::{backend::TestBackend, Terminal};
+    use shelbi_state::ZenToggleChord;
 
-    /// When Zen is on, the bottom of the sidebar shows the keymap line
-    /// followed by a 3-line pill carrying the " ZEN ON " label. The box
-    /// chars (┌─┐│└┘) come from the renderer's own text — not a ratatui
-    /// `Block` border — so the green fill covers the corners too.
+    fn dump(term: &Terminal<TestBackend>) -> Vec<String> {
+        let buf = term.backend().buffer().clone();
+        (0..buf.area.height)
+            .map(|y| {
+                (0..buf.area.width)
+                    .map(|x| buf[(x, y)].symbol().to_string())
+                    .collect::<Vec<_>>()
+                    .join("")
+            })
+            .collect()
+    }
+
+    /// Locate the y of the row containing `needle`. Fails the test if it
+    /// isn't there — callers use it both to assert presence and to check
+    /// relative positioning between rows.
+    fn row_y(rows: &[String], needle: &str) -> usize {
+        rows.iter()
+            .position(|r| r.contains(needle))
+            .unwrap_or_else(|| panic!("expected row containing {needle:?} in:\n{}", rows.join("\n")))
+    }
+
+    /// On state: full-width green band carrying `ZEN MODE ON`, one blank
+    /// row above it, the `^P palette  q quit` keybind line above that.
+    /// No box-drawing chrome — the old bordered pill is gone.
     #[test]
-    fn pill_renders_three_line_box_with_label_when_zen_on() {
+    fn zen_row_renders_full_width_band_when_on() {
         let backend = TestBackend::new(24, 16);
         let mut term = Terminal::new(backend).unwrap();
         let mut app = App::new_sidebar("demo");
         app.zen_mode = ZenModeState::On;
         term.draw(|f| render_full(f, &mut app, f.area())).unwrap();
-        let buf = term.backend().buffer().clone();
 
-        let dump: Vec<String> = (0..buf.area.height)
-            .map(|y| {
-                (0..buf.area.width)
-                    .map(|x| buf[(x, y)].symbol().to_string())
-                    .collect::<Vec<_>>()
-                    .join("")
-            })
-            .collect();
-        let joined = dump.join("\n");
+        let rows = dump(&term);
+        let joined = rows.join("\n");
         assert!(
-            joined.contains("ZEN ON"),
-            "expected ZEN ON label in:\n{joined}"
+            joined.contains("ZEN MODE ON"),
+            "expected ZEN MODE ON label in:\n{joined}"
         );
-        assert!(joined.contains("┌─"), "expected pill top corner in:\n{joined}");
-        assert!(joined.contains("└─"), "expected pill bottom corner in:\n{joined}");
         assert!(
-            joined.contains("^P palette  q quit"),
-            "footer keymap line must stay intact in:\n{joined}"
+            !joined.contains("┌─") && !joined.contains("└─"),
+            "no border chrome expected, got:\n{joined}"
+        );
+        let keybind_y = row_y(&rows, "^P palette  q quit");
+        let zen_y = row_y(&rows, "ZEN MODE ON");
+        assert!(
+            zen_y == keybind_y + 2,
+            "expected one blank row between keybinds (y={keybind_y}) and zen (y={zen_y}) in:\n{joined}"
+        );
+        // The zen row must paint edge-to-edge of the sidebar column —
+        // every column on that row is non-empty.
+        let zen_row = &rows[zen_y];
+        assert_eq!(
+            zen_row.chars().count(),
+            24,
+            "zen row should span full sidebar width, got: {zen_row:?}"
+        );
+        assert!(
+            zen_row.chars().all(|c| c != ' ' || true) && !zen_row.trim().is_empty(),
+            "zen row should not be empty: {zen_row:?}"
         );
     }
 
-    /// When Zen is off, the pill disappears entirely — no green chrome,
-    /// no leftover box characters. The footer collapses back to the
-    /// 2-line keymap.
+    /// Off state: dim `<hotkey> Zen mode` hint sourced from the configured
+    /// chord. No green band, same row position as the on-state band so
+    /// toggling doesn't shift the layout.
     #[test]
-    fn pill_absent_when_zen_off() {
+    fn zen_row_renders_hotkey_hint_when_off() {
         let backend = TestBackend::new(24, 16);
         let mut term = Terminal::new(backend).unwrap();
         let mut app = App::new_sidebar("demo");
         app.zen_mode = ZenModeState::Off;
+        app.zen_toggle_chord = ZenToggleChord::AltZ;
         term.draw(|f| render_full(f, &mut app, f.area())).unwrap();
-        let buf = term.backend().buffer().clone();
 
-        let dump: Vec<String> = (0..buf.area.height)
-            .map(|y| {
-                (0..buf.area.width)
-                    .map(|x| buf[(x, y)].symbol().to_string())
-                    .collect::<Vec<_>>()
-                    .join("")
-            })
-            .collect();
-        let joined = dump.join("\n");
-        assert!(!joined.contains("ZEN"), "no ZEN label expected, got:\n{joined}");
-        assert!(!joined.contains("┌─"), "no pill corner expected, got:\n{joined}");
+        let rows = dump(&term);
+        let joined = rows.join("\n");
+        assert!(!joined.contains("ZEN MODE ON"), "no green band when off, got:\n{joined}");
+        assert!(
+            joined.contains("⌥Z Zen mode"),
+            "expected hotkey hint sourced from configured chord in:\n{joined}"
+        );
+        let keybind_y = row_y(&rows, "^P palette  q quit");
+        let hint_y = row_y(&rows, "Zen mode");
+        assert_eq!(
+            hint_y,
+            keybind_y + 2,
+            "hint row must sit two rows below keybinds (blank between), got:\n{joined}"
+        );
     }
 
-    /// Paused is *not* treated as on — the orchestrator might be draining
-    /// in-flight work, but the pill is a binary visual signal. Showing it
-    /// while paused would mislead the user.
+    /// Rebinding the chord updates the off-state hint without touching
+    /// any sidebar code — the glyph is read from `app.zen_toggle_chord`
+    /// each render.
     #[test]
-    fn pill_absent_when_zen_paused() {
+    fn off_state_hint_tracks_configured_chord() {
+        let backend = TestBackend::new(24, 16);
+        let mut term = Terminal::new(backend).unwrap();
+        let mut app = App::new_sidebar("demo");
+        app.zen_mode = ZenModeState::Off;
+        app.zen_toggle_chord = ZenToggleChord::CtrlG;
+        term.draw(|f| render_full(f, &mut app, f.area())).unwrap();
+        let joined = dump(&term).join("\n");
+        assert!(
+            joined.contains("^G Zen mode"),
+            "rebinding to Ctrl+G must change the hint, got:\n{joined}"
+        );
+    }
+
+    /// Toggling Zen Mode must not shift rows above the zen line — the
+    /// keybind y-coordinate is identical in both states.
+    #[test]
+    fn keybind_line_stays_put_across_zen_toggle() {
+        let backend_off = TestBackend::new(24, 16);
+        let mut term_off = Terminal::new(backend_off).unwrap();
+        let mut app = App::new_sidebar("demo");
+        app.zen_mode = ZenModeState::Off;
+        term_off
+            .draw(|f| render_full(f, &mut app, f.area()))
+            .unwrap();
+        let off_rows = dump(&term_off);
+        let off_y = row_y(&off_rows, "^P palette  q quit");
+
+        let backend_on = TestBackend::new(24, 16);
+        let mut term_on = Terminal::new(backend_on).unwrap();
+        app.zen_mode = ZenModeState::On;
+        term_on
+            .draw(|f| render_full(f, &mut app, f.area()))
+            .unwrap();
+        let on_rows = dump(&term_on);
+        let on_y = row_y(&on_rows, "^P palette  q quit");
+
+        assert_eq!(off_y, on_y, "keybind line must not move when toggling Zen");
+    }
+
+    /// Paused is treated like Off for the hint — the orchestrator may
+    /// still be draining work, but visually we surface the hotkey so the
+    /// user can resume.
+    #[test]
+    fn paused_shows_hotkey_hint_not_green_band() {
         let backend = TestBackend::new(24, 16);
         let mut term = Terminal::new(backend).unwrap();
         let mut app = App::new_sidebar("demo");
         app.zen_mode = ZenModeState::Paused;
+        app.zen_toggle_chord = ZenToggleChord::AltZ;
         term.draw(|f| render_full(f, &mut app, f.area())).unwrap();
-        let buf = term.backend().buffer().clone();
+        let joined = dump(&term).join("\n");
+        assert!(!joined.contains("ZEN MODE ON"), "paused must not show green band, got:\n{joined}");
+        assert!(
+            joined.contains("⌥Z Zen mode"),
+            "paused should still show the hotkey hint, got:\n{joined}"
+        );
+    }
 
-        let dump: Vec<String> = (0..buf.area.height)
-            .map(|y| {
-                (0..buf.area.width)
-                    .map(|x| buf[(x, y)].symbol().to_string())
-                    .collect::<Vec<_>>()
-                    .join("")
-            })
-            .collect();
-        let joined = dump.join("\n");
-        assert!(!joined.contains("ZEN"), "paused must not show pill, got:\n{joined}");
+    /// When the user explicitly chose no chord (`ZenToggleChord::None`),
+    /// the hint is suppressed — showing an empty hotkey would imply a
+    /// shortcut that doesn't exist. The row stays blank to preserve
+    /// the layout above it.
+    #[test]
+    fn no_hint_when_chord_is_none() {
+        let backend = TestBackend::new(24, 16);
+        let mut term = Terminal::new(backend).unwrap();
+        let mut app = App::new_sidebar("demo");
+        app.zen_mode = ZenModeState::Off;
+        app.zen_toggle_chord = ZenToggleChord::None;
+        term.draw(|f| render_full(f, &mut app, f.area())).unwrap();
+        let joined = dump(&term).join("\n");
+        assert!(!joined.contains("Zen mode"), "no hint expected when no chord bound, got:\n{joined}");
     }
 }

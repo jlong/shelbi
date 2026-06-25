@@ -78,6 +78,20 @@ impl ZenToggleChord {
             ZenToggleChord::None => "",
         }
     }
+
+    /// Terminal-glyph form for inline keybind hints — `⌥` for Alt,
+    /// `^` for Ctrl, `⇧` for Shift, matching how `^P` is rendered in
+    /// the sidebar footer. `None` when no chord is bound, so callers
+    /// can suppress the hint instead of showing an empty hotkey.
+    pub fn glyph(self) -> Option<&'static str> {
+        match self {
+            ZenToggleChord::AltZ => Some("⌥Z"),
+            ZenToggleChord::CtrlBackslash => Some("^\\"),
+            ZenToggleChord::CtrlG => Some("^G"),
+            ZenToggleChord::CtrlShiftZ => Some("^⇧Z"),
+            ZenToggleChord::None => None,
+        }
+    }
 }
 
 /// Load the user config. Missing file → defaults; that's not an error

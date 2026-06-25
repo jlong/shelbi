@@ -24,9 +24,10 @@ pub mod zen;
 pub const DEFAULT_SYSTEM_PROMPT: &str = include_str!("default_orchestrator.md.template");
 
 // Sidebar pane width is clamped to this char range. Below the min the
-// footer hint (`  ^P palette  Enter focus`, 24 chars) starts to
-// truncate; above the max the orchestrator pane loses room without the
-// sidebar gaining anything useful. Within the range the sidebar tracks
+// footer hint (`  ^P palette  q quit`, ~20 chars) starts to truncate
+// and the green `ZEN MODE ON` band has no room to breathe; above the
+// max the orchestrator pane loses room without the sidebar gaining
+// anything useful. Within the range the sidebar tracks
 // `SIDEBAR_TARGET_PCT` of the window width — chosen so the
 // orchestrator gets noticeably more room on both narrow and wide
 // terminals than the previous fixed 30% split.
