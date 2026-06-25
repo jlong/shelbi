@@ -212,8 +212,10 @@ pub fn ensure_dir(p: &Path) -> Result<()> {
 pub fn load_project(project: &str) -> Result<Project> {
     let p = projects_dir()?.join(format!("{project}.yaml"));
     let text = fs::read_to_string(&p)?;
-    let p: Project = serde_yaml::from_str(&text)?;
+    let mut p: Project = serde_yaml::from_str(&text)?;
     p.validate_workers()?;
+    let repo = p.repo.clone();
+    p.detect_shapes(repo);
     Ok(p)
 }
 
@@ -835,6 +837,7 @@ mod tests {
             worker_settings_template: override_template,
             zen: ZenConfig::default(),
             contextstore_sync: Vec::new(),
+            detected_shapes: Vec::new(),
         }
     }
 

@@ -262,6 +262,7 @@ pub fn setup_one_project() -> Result<()> {
         worker_settings_template: None,
         zen: shelbi_core::ZenConfig::default(),
         contextstore_sync: Vec::new(),
+        detected_shapes: Vec::new(),
     };
     project.validate_workers().map_err(|e| anyhow!(e))?;
 

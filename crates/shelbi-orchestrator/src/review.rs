@@ -372,6 +372,7 @@ mod tests {
             worker_settings_template: None,
             zen: shelbi_core::ZenConfig::default(),
             contextstore_sync: Vec::new(),
+            detected_shapes: Vec::new(),
         };
         let now = chrono::Utc::now();
         let t = Task {

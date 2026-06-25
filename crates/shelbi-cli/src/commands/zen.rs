@@ -22,7 +22,9 @@ use std::time::Duration;
 use anyhow::{anyhow, Result};
 use clap::Subcommand;
 
-use shelbi_core::{Column, Task};
+use shelbi_core::{
+    danger_paths_for_project, Column, Project, Task, ZenDangerPaths,
+};
 use shelbi_orchestrator::zen::{self, CiVerdict};
 use shelbi_state::{
     append_zen_mode_event, list_column, load_project, read_state, write_state, State, ZenModeState,
@@ -159,14 +161,18 @@ fn status(project: &str) -> Result<()> {
 fn print_status(project: &str, state: &State) -> Result<()> {
     println!("zen mode: {}", state.zen_mode);
     match load_project(project) {
-        Ok(p) if p.zen.checks.local.is_empty() => {
-            println!("checks: (none configured — set zen.checks.local in {project}.yaml)");
-        }
         Ok(p) => {
-            println!("checks:");
-            for c in &p.zen.checks.local {
-                println!("  - {c}");
+            if p.zen.checks.local.is_empty() {
+                println!(
+                    "checks: (none configured — set zen.checks.local in {project}.yaml)"
+                );
+            } else {
+                println!("checks:");
+                for c in &p.zen.checks.local {
+                    println!("  - {c}");
+                }
             }
+            print_danger_paths(&p);
         }
         Err(e) => println!("checks: (could not read {project}.yaml: {e})"),
     }
@@ -177,6 +183,29 @@ fn print_status(project: &str, state: &State) -> Result<()> {
     let in_flight = count_in_flight_zen(project, state.zen_mode).unwrap_or(0);
     println!("in-flight zen tasks: {in_flight}");
     Ok(())
+}
+
+fn print_danger_paths(p: &Project) {
+    let resolved = danger_paths_for_project(p);
+    let header = match &p.zen.danger_paths {
+        ZenDangerPaths::Override(_) => "danger paths (project override):".to_string(),
+        ZenDangerPaths::Extend(_) if p.detected_shapes.is_empty() => {
+            "danger paths:".to_string()
+        }
+        ZenDangerPaths::Extend(_) => {
+            let labels: Vec<&'static str> =
+                p.detected_shapes.iter().map(|s| s.label()).collect();
+            format!("danger paths (detected: {}):", labels.join(", "))
+        }
+    };
+    println!("{header}");
+    if resolved.is_empty() {
+        println!("  (none)");
+    } else {
+        for path in &resolved {
+            println!("  - {path}");
+        }
+    }
 }
 
 fn count_in_flight_zen(project: &str, mode: ZenModeState) -> Result<usize> {

@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
@@ -72,6 +72,13 @@ pub struct Project {
     /// empty: no sync runs unless the project opts in.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub contextstore_sync: Vec<ContextStoreSyncSpec>,
+    /// Project-shape signals discovered at load time (Cargo workspace,
+    /// Next.js, Docker, …). Populated by [`Project::detect_shapes`] when
+    /// the project YAML is loaded; serialization is skipped so the on-disk
+    /// form stays declarative. Drives the auto-extended danger-paths list
+    /// in [`danger_paths_for_project`].
+    #[serde(skip)]
+    pub detected_shapes: Vec<ProjectShape>,
 }
 
 /// One ContextStore space that shelbi keeps in sync between hub and
@@ -107,6 +114,14 @@ impl Project {
 
     pub fn worker(&self, name: &str) -> Option<&WorkerSpec> {
         self.workers.iter().find(|w| w.name == name)
+    }
+
+    /// Inspect the filesystem at `root` (typically `self.repo`) and cache
+    /// the recognized [`ProjectShape`]s on `self.detected_shapes`. Safe
+    /// to call from `load_project`: any I/O error is treated as "no
+    /// signal" rather than fatal.
+    pub fn detect_shapes(&mut self, root: impl AsRef<Path>) {
+        self.detected_shapes = detect_project_shapes(root.as_ref());
     }
 
     /// Cross-check workers reference declared machines and runners.
@@ -488,6 +503,100 @@ pub const BUILTIN_DANGER_PATHS: &[&str] = &[
     "Cargo.lock",
 ];
 
+/// Recognized project shapes. Each shape contributes a fixed set of
+/// danger paths that get merged on top of [`BUILTIN_DANGER_PATHS`] when
+/// the project uses the `extend` variant.
+///
+/// Detection is intentionally coarse: presence of a single sentinel
+/// file. The goal is "good defaults for the common case", not exhaustive
+/// classification — a project that wants finer control sets
+/// `zen.danger_paths.override:`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ProjectShape {
+    /// `Cargo.toml` with a `[workspace]` section at the repo root.
+    CargoWorkspace,
+    /// `package.json` at the repo root (covers Next.js, plain Node,
+    /// monorepos that hoist a root manifest).
+    Node,
+    /// `.github/` directory at the repo root.
+    GitHub,
+    /// `Dockerfile` or `compose.yaml` at the repo root.
+    Docker,
+    /// `shelbi.yaml` or `.shelbi/` directory at the repo root.
+    Shelbi,
+}
+
+impl ProjectShape {
+    /// Short human label, used by `shelbi zen status`.
+    pub fn label(self) -> &'static str {
+        match self {
+            ProjectShape::CargoWorkspace => "cargo workspace",
+            ProjectShape::Node => "node / next.js",
+            ProjectShape::GitHub => "github",
+            ProjectShape::Docker => "docker",
+            ProjectShape::Shelbi => "shelbi",
+        }
+    }
+
+    /// Danger paths contributed by this shape. Order is stable so the
+    /// resolved list is deterministic.
+    pub fn danger_paths(self) -> &'static [&'static str] {
+        match self {
+            ProjectShape::CargoWorkspace => &[
+                "Cargo.toml",
+                "Cargo.lock",
+                "rust-toolchain.toml",
+                ".cargo/config.toml",
+            ],
+            ProjectShape::Node => &[
+                "package.json",
+                "package-lock.json",
+                "next.config.*",
+                "vercel.json",
+                ".npmrc",
+            ],
+            ProjectShape::GitHub => &[
+                ".github/CODEOWNERS",
+                ".github/dependabot.yml",
+            ],
+            ProjectShape::Docker => &["Dockerfile", "compose.yaml"],
+            ProjectShape::Shelbi => &[".shelbi/**", "shelbi.yaml"],
+        }
+    }
+}
+
+/// Scan `root` for the project-shape signals listed on [`ProjectShape`].
+/// Returns shapes in a stable order (Cargo → Node → GitHub → Docker →
+/// Shelbi); duplicate shapes never appear. Missing or unreadable files
+/// produce no signal — the function never errors.
+pub fn detect_project_shapes(root: &Path) -> Vec<ProjectShape> {
+    let mut out = Vec::new();
+
+    if let Ok(s) = std::fs::read_to_string(root.join("Cargo.toml")) {
+        if s.contains("[workspace]") {
+            out.push(ProjectShape::CargoWorkspace);
+        }
+    }
+
+    if root.join("package.json").is_file() {
+        out.push(ProjectShape::Node);
+    }
+
+    if root.join(".github").is_dir() {
+        out.push(ProjectShape::GitHub);
+    }
+
+    if root.join("Dockerfile").is_file() || root.join("compose.yaml").is_file() {
+        out.push(ProjectShape::Docker);
+    }
+
+    if root.join("shelbi.yaml").is_file() || root.join(".shelbi").is_dir() {
+        out.push(ProjectShape::Shelbi);
+    }
+
+    out
+}
+
 /// Per-task Zen Mode overrides. Lives under `zen:` in the task
 /// frontmatter. Every field is optional so a task can adjust just one
 /// dimension.
@@ -525,20 +634,43 @@ pub fn checks_for_task(project: &Project, task: &Task) -> Vec<String> {
     }
 }
 
-/// Resolve the effective danger-path list for a project. `Extend`
-/// returns the built-in list with project additions appended; `Override`
-/// returns the project list verbatim. Duplicates are preserved in
-/// order — callers that care can dedupe.
+/// Resolve the effective danger-path list for a project.
+///
+/// In `Extend` mode (the default) the result is `builtin ++ detected ++
+/// user-extend`, deduplicated while preserving first occurrence. The
+/// `detected` segment comes from [`Project::detect_shapes`] and is empty
+/// for any project whose YAML hasn't been loaded through `load_project`
+/// (e.g. fixtures constructed inline in tests).
+///
+/// In `Override` mode the user's list wins outright — no builtins, no
+/// detected paths. This is the escape hatch for projects with a
+/// non-standard layout that the shape detector would mis-classify.
 pub fn danger_paths_for_project(project: &Project) -> Vec<String> {
     match &project.zen.danger_paths {
         ZenDangerPaths::Extend(extra) => {
             let mut out: Vec<String> =
                 BUILTIN_DANGER_PATHS.iter().map(|s| s.to_string()).collect();
+            for shape in &project.detected_shapes {
+                for p in shape.danger_paths() {
+                    out.push((*p).to_string());
+                }
+            }
             out.extend(extra.iter().cloned());
-            out
+            dedupe_preserve_order(out)
         }
         ZenDangerPaths::Override(custom) => custom.clone(),
     }
+}
+
+fn dedupe_preserve_order(items: Vec<String>) -> Vec<String> {
+    let mut seen = std::collections::HashSet::with_capacity(items.len());
+    let mut out = Vec::with_capacity(items.len());
+    for s in items {
+        if seen.insert(s.clone()) {
+            out.push(s);
+        }
+    }
+    out
 }
 
 /// Serde adapter that stores a `Duration` as an integer number of
@@ -849,6 +981,7 @@ worker_settings_template: /etc/shelbi/p.json
             worker_settings_template: None,
             zen: ZenConfig::default(),
             contextstore_sync: Vec::new(),
+            detected_shapes: Vec::new(),
         };
         assert!(project.validate_workers().is_ok());
 
@@ -889,6 +1022,7 @@ worker_settings_template: /etc/shelbi/p.json
             worker_settings_template: None,
             zen,
             contextstore_sync: Vec::new(),
+            detected_shapes: Vec::new(),
         }
     }
 
@@ -1117,5 +1251,151 @@ updated_at: 2026-06-19T00:00:00Z
         for (got, want) in paths.iter().zip(BUILTIN_DANGER_PATHS.iter()) {
             assert_eq!(got, want);
         }
+    }
+
+    // ---- ProjectShape detection -------------------------------------------
+
+    fn fresh_tempdir(tag: &str) -> std::path::PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let p = std::env::temp_dir().join(format!("shelbi-shape-{tag}-{nanos}"));
+        std::fs::create_dir_all(&p).unwrap();
+        p
+    }
+
+    #[test]
+    fn detect_cargo_workspace_requires_workspace_marker() {
+        let root = fresh_tempdir("cargo-ws");
+        std::fs::write(root.join("Cargo.toml"), "[workspace]\nmembers = [\"a\"]\n").unwrap();
+        assert_eq!(
+            detect_project_shapes(&root),
+            vec![ProjectShape::CargoWorkspace]
+        );
+    }
+
+    #[test]
+    fn detect_cargo_single_crate_is_not_a_workspace() {
+        let root = fresh_tempdir("cargo-crate");
+        std::fs::write(root.join("Cargo.toml"), "[package]\nname = \"x\"\n").unwrap();
+        assert!(detect_project_shapes(&root).is_empty());
+    }
+
+    #[test]
+    fn detect_node_package() {
+        let root = fresh_tempdir("node");
+        std::fs::write(root.join("package.json"), "{}").unwrap();
+        assert_eq!(detect_project_shapes(&root), vec![ProjectShape::Node]);
+    }
+
+    #[test]
+    fn detect_github_dir() {
+        let root = fresh_tempdir("gh");
+        std::fs::create_dir_all(root.join(".github")).unwrap();
+        assert_eq!(detect_project_shapes(&root), vec![ProjectShape::GitHub]);
+    }
+
+    #[test]
+    fn detect_docker_dockerfile_or_compose() {
+        let with_df = fresh_tempdir("df");
+        std::fs::write(with_df.join("Dockerfile"), "FROM scratch\n").unwrap();
+        assert_eq!(detect_project_shapes(&with_df), vec![ProjectShape::Docker]);
+
+        let with_compose = fresh_tempdir("compose");
+        std::fs::write(with_compose.join("compose.yaml"), "services: {}\n").unwrap();
+        assert_eq!(detect_project_shapes(&with_compose), vec![ProjectShape::Docker]);
+    }
+
+    #[test]
+    fn detect_shelbi_via_dir_or_yaml() {
+        let with_dir = fresh_tempdir("shelbi-dir");
+        std::fs::create_dir_all(with_dir.join(".shelbi")).unwrap();
+        assert_eq!(detect_project_shapes(&with_dir), vec![ProjectShape::Shelbi]);
+
+        let with_yaml = fresh_tempdir("shelbi-yaml");
+        std::fs::write(with_yaml.join("shelbi.yaml"), "").unwrap();
+        assert_eq!(detect_project_shapes(&with_yaml), vec![ProjectShape::Shelbi]);
+    }
+
+    #[test]
+    fn detect_multiple_shapes_in_stable_order() {
+        let root = fresh_tempdir("multi");
+        std::fs::write(root.join("Cargo.toml"), "[workspace]\nmembers = []\n").unwrap();
+        std::fs::write(root.join("package.json"), "{}").unwrap();
+        std::fs::create_dir_all(root.join(".github")).unwrap();
+        std::fs::write(root.join("Dockerfile"), "FROM scratch\n").unwrap();
+        std::fs::write(root.join("shelbi.yaml"), "").unwrap();
+        assert_eq!(
+            detect_project_shapes(&root),
+            vec![
+                ProjectShape::CargoWorkspace,
+                ProjectShape::Node,
+                ProjectShape::GitHub,
+                ProjectShape::Docker,
+                ProjectShape::Shelbi,
+            ]
+        );
+    }
+
+    #[test]
+    fn detect_missing_root_is_empty_not_error() {
+        let nowhere = std::env::temp_dir().join("shelbi-shape-nowhere-does-not-exist-12345");
+        // Don't create it.
+        assert!(detect_project_shapes(&nowhere).is_empty());
+    }
+
+    // ---- danger_paths_for_project + detected_shapes -----------------------
+
+    #[test]
+    fn danger_paths_extend_merges_detected_after_builtins() {
+        let mut p = project_with_zen(ZenConfig::default());
+        p.detected_shapes = vec![ProjectShape::CargoWorkspace];
+        let paths = danger_paths_for_project(&p);
+
+        // Builtins come first, in order.
+        for (got, want) in paths.iter().zip(BUILTIN_DANGER_PATHS.iter()) {
+            assert_eq!(got, want);
+        }
+        // Detected paths appear after — and Cargo.lock from the shape
+        // dedupes against the builtin (which is also Cargo.lock).
+        assert!(paths.iter().any(|p| p == "Cargo.toml"));
+        assert!(paths.iter().any(|p| p == "rust-toolchain.toml"));
+        assert!(paths.iter().any(|p| p == ".cargo/config.toml"));
+        let cargo_lock_count = paths.iter().filter(|p| *p == "Cargo.lock").count();
+        assert_eq!(cargo_lock_count, 1, "Cargo.lock must be deduplicated");
+    }
+
+    #[test]
+    fn danger_paths_extend_keeps_builtin_detected_and_user_extras() {
+        let mut p = project_with_zen(ZenConfig {
+            danger_paths: ZenDangerPaths::Extend(vec!["secrets/**".into()]),
+            ..Default::default()
+        });
+        p.detected_shapes = vec![ProjectShape::Node];
+        let paths = danger_paths_for_project(&p);
+        assert!(paths.iter().any(|p| p == ".github/workflows/**")); // builtin
+        assert!(paths.iter().any(|p| p == "vercel.json")); // detected
+        assert!(paths.iter().any(|p| p == "secrets/**")); // user
+    }
+
+    #[test]
+    fn danger_paths_override_drops_detected_shapes() {
+        let mut p = project_with_zen(ZenConfig {
+            danger_paths: ZenDangerPaths::Override(vec!["only/this".into()]),
+            ..Default::default()
+        });
+        p.detected_shapes = vec![ProjectShape::CargoWorkspace, ProjectShape::Node];
+        let paths = danger_paths_for_project(&p);
+        assert_eq!(paths, vec!["only/this".to_string()]);
+    }
+
+    #[test]
+    fn project_detect_shapes_populates_field_from_repo() {
+        let root = fresh_tempdir("project-detect");
+        std::fs::write(root.join("Cargo.toml"), "[workspace]\nmembers = []\n").unwrap();
+        let mut p = project_with_zen(ZenConfig::default());
+        p.detect_shapes(&root);
+        assert_eq!(p.detected_shapes, vec![ProjectShape::CargoWorkspace]);
     }
 }
