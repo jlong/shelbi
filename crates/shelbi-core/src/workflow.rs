@@ -312,37 +312,31 @@ pub fn default_workflow() -> Workflow {
                 name: "Backlog".into(),
                 category: StatusCategory::Backlog,
                 owner: Owner::User,
-                description: None,
             },
             Status {
                 name: "Todo".into(),
                 category: StatusCategory::Ready,
                 owner: Owner::Agent,
-                description: None,
             },
             Status {
                 name: "InProgress".into(),
                 category: StatusCategory::Active,
                 owner: Owner::Agent,
-                description: None,
             },
             Status {
                 name: "Review".into(),
                 category: StatusCategory::Handoff,
                 owner: Owner::User,
-                description: None,
             },
             Status {
                 name: "Done".into(),
                 category: StatusCategory::Done,
                 owner: Owner::User,
-                description: None,
             },
             Status {
                 name: "Canceled".into(),
                 category: StatusCategory::Archived,
                 owner: Owner::User,
-                description: None,
             },
         ],
         initial_status: None,
@@ -369,8 +363,6 @@ pub struct Status {
     pub name: String,
     pub category: StatusCategory,
     pub owner: Owner,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub description: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -705,8 +697,6 @@ statuses:
         // Nothing was set, so neither key should appear on the wire.
         assert!(!y.contains("initial_status"));
         assert!(!y.contains("transitions"));
-        // Per-status `description` not set either.
-        assert!(!y.contains("description: null"));
     }
 
     #[test]

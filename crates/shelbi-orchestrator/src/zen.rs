@@ -2019,7 +2019,6 @@ mod dry_run_tests {
                     name: (*n).into(),
                     category: *c,
                     owner: shelbi_core::Owner::Agent,
-                    description: None,
                 })
                 .collect(),
             initial_status: None,
