@@ -25,7 +25,7 @@ use globset::{Glob, GlobSetBuilder};
 use serde::Serialize;
 use shelbi_core::{
     checks_for_task_in_workflow, danger_paths_for_workflow, Column, Error, Host, Machine, Project,
-    Result, Task, WorkerSpec, Workflow,
+    Result, StatusCategory, Task, WorkerSpec, Workflow, WorkflowStatus,
 };
 
 use crate::git::{
@@ -1700,16 +1700,20 @@ impl DryRunAction {
 /// labelled `probe-failed` so the user still sees the task, rather than
 /// silently dropping it.
 ///
-/// The merge bar is **action-based**: for each task in `Review`, we
-/// look up the task's workflow and apply the bar only when the
-/// workflow declares a `merge` action on an outgoing transition from
-/// the task's current status. A workflow with no `transitions:` block
+/// The merge bar is **action-based**: for each task in a `handoff`-
+/// category status, we look up the task's workflow and apply the bar
+/// only when the workflow declares a `merge` action on an outgoing
+/// transition from that status. A workflow with no `transitions:` block
 /// at all (e.g., the migrated `default.yaml` on existing projects) falls
 /// back to the legacy "Review fires the bar" semantic — see
 /// [`Workflow::fires_merge_bar`]. Tasks in workflows whose transitions
 /// explicitly *don't* declare merge (a pure-bookkeeping research
-/// workflow, say) sit in `Review` without ever tripping the dry-run
-/// preview.
+/// workflow, say) sit in their handoff status without ever tripping the
+/// dry-run preview.
+///
+/// Iteration is by **category**, not by hardcoded [`Column::Review`]:
+/// a custom workflow whose handoff status is named `QA` or
+/// `Awaiting Sign-off` (instead of `Review`) trips the same bar.
 pub fn dry_run_tick(project: &Project) -> Result<Vec<DryRunDecision>> {
     let mut decisions = Vec::new();
 
@@ -1725,13 +1729,23 @@ pub fn dry_run_tick(project: &Project) -> Result<Vec<DryRunDecision>> {
         });
     }
 
-    // 2. Review-column probes — action-based bar gated by the task's
-    //    workflow.
-    let review_tasks = shelbi_state::list_column(&project.name, Column::Review)?;
-    for tf in review_tasks {
+    // 2. Handoff-category probes — action-based bar gated by the task's
+    //    workflow. Filter is on the resolved workflow status's category
+    //    rather than `Column::Review` so custom workflows with renamed
+    //    handoff statuses still get probed.
+    for tf in shelbi_state::list_tasks(&project.name)? {
         let workflow = load_task_workflow(&project.name, &tf.task);
         let workflow_ref = workflow.as_ref();
-        let status_name = tf.task.column.default_status_name();
+        let status = workflow_ref.and_then(|w| resolve_task_status(&tf.task, w));
+        let category = status
+            .map(|s| s.category)
+            .unwrap_or_else(|| tf.task.column.category());
+        if category != StatusCategory::Handoff {
+            continue;
+        }
+        let status_name = status
+            .map(|s| s.name.as_str())
+            .unwrap_or_else(|| tf.task.column.default_status_name());
         let fires_bar = workflow_ref
             .map(|w| w.fires_merge_bar(status_name))
             .unwrap_or(true);
@@ -1765,6 +1779,31 @@ pub fn dry_run_tick(project: &Project) -> Result<Vec<DryRunDecision>> {
     }
 
     Ok(decisions)
+}
+
+/// Resolve which workflow status `task` currently lives in. Mirrors the
+/// TUI's `resolve_task_status` (kanban.rs) so generic code can ask
+/// "what status is this task in?" without assuming the task's column
+/// is `Review` for a handoff-category resolution.
+///
+/// Resolution order:
+///
+/// 1. **Name match** — workflow declares a status named
+///    `task.column.default_status_name()` (Backlog / Todo / InProgress /
+///    Review / Done). Covers the default workflow and any custom
+///    workflow that reuses the canonical names.
+/// 2. **Category match** — first status in the workflow whose category
+///    equals `task.column.category()`. Lets a custom workflow that
+///    renamed `Review` to `QA` still resolve to a handoff status.
+/// 3. **None** — the workflow declares no compatible status. Callers
+///    fall back to column-level metadata.
+fn resolve_task_status<'w>(task: &Task, workflow: &'w Workflow) -> Option<&'w WorkflowStatus> {
+    let canonical = task.column.default_status_name();
+    if let Some(s) = workflow.status(canonical) {
+        return Some(s);
+    }
+    let cat = task.column.category();
+    workflow.statuses.iter().find(|s| s.category == cat)
 }
 
 /// Best-effort load of a task's workflow definition. Returns `None`
@@ -1968,5 +2007,95 @@ mod dry_run_tests {
             explanation: "wholly different prose".into(),
         };
         assert_eq!(a.dedup_key(), b.dedup_key());
+    }
+
+    fn workflow_with(name: &str, statuses: &[(&str, StatusCategory)]) -> Workflow {
+        Workflow {
+            name: name.into(),
+            description: None,
+            statuses: statuses
+                .iter()
+                .map(|(n, c)| WorkflowStatus {
+                    name: (*n).into(),
+                    category: *c,
+                    owner: shelbi_core::Owner::Agent,
+                    description: None,
+                })
+                .collect(),
+            initial_status: None,
+            transitions: None,
+            git: None,
+            zen: None,
+        }
+    }
+
+    fn task_in_column(id: &str, column: Column) -> Task {
+        let now = chrono::Utc::now();
+        Task {
+            id: id.into(),
+            title: id.into(),
+            column,
+            priority: 0,
+            assigned_to: None,
+            workflow: None,
+            branch: None,
+            depends_on: Vec::new(),
+            prefers_machine: None,
+            zen: None,
+            created_at: now,
+            updated_at: now,
+            params: std::collections::BTreeMap::new(),
+        }
+    }
+
+    /// A task in `Column::Review` against the canonical default workflow
+    /// resolves to the `Review` status — name match wins. The category
+    /// readback is what the dry-run handoff filter keys off.
+    #[test]
+    fn resolve_status_name_match_picks_default_review() {
+        let wf = shelbi_core::default_workflow();
+        let t = task_in_column("t", Column::Review);
+        let s = resolve_task_status(&t, &wf).expect("default workflow declares Review");
+        assert_eq!(s.name, "Review");
+        assert_eq!(s.category, StatusCategory::Handoff);
+    }
+
+    /// A custom workflow that renames the handoff status (here `QA`)
+    /// drops the `Review` name match but the category fallback still
+    /// resolves a Handoff status — exactly the case the iterate-by-
+    /// category change exists for.
+    #[test]
+    fn resolve_status_category_fallback_picks_renamed_handoff() {
+        let wf = workflow_with(
+            "design-review",
+            &[
+                ("Backlog", StatusCategory::Backlog),
+                ("Design", StatusCategory::Active),
+                ("QA", StatusCategory::Handoff),
+                ("Done", StatusCategory::Done),
+            ],
+        );
+        let t = task_in_column("t", Column::Review);
+        let s = resolve_task_status(&t, &wf).expect("category fallback should find QA");
+        assert_eq!(s.name, "QA");
+        assert_eq!(s.category, StatusCategory::Handoff);
+    }
+
+    /// A workflow that declares neither a `Review`-named status nor any
+    /// handoff-category status returns `None`. Dry-run callers then
+    /// fall back to `task.column.category()`, which is the legacy
+    /// 5-column semantic.
+    #[test]
+    fn resolve_status_returns_none_when_workflow_has_no_match() {
+        let wf = workflow_with(
+            "research",
+            &[
+                ("Inbox", StatusCategory::Backlog),
+                ("Reading", StatusCategory::Active),
+                ("Shipped", StatusCategory::Done),
+            ],
+        );
+        let t = task_in_column("t", Column::Review);
+        assert!(resolve_task_status(&t, &wf).is_none());
     }
 }
