@@ -276,7 +276,13 @@ pub fn start_worker_on_task(spec: StartSpec<'_>) -> Result<TmuxAddr> {
             addr.target(),
         );
     }
-    let prompt = compose_prompt(spec.task_id, spec.branch, spec.task_body, &marker);
+    let prompt = compose_prompt(
+        spec.task_id,
+        spec.branch,
+        spec.task_body,
+        &marker,
+        &spec.project.default_branch,
+    );
     shelbi_tmux::send_line(&host, &addr, &prompt)?;
 
     // 7. Verify the prompt actually got submitted, not just typed into the
@@ -647,8 +653,9 @@ fn scp_settings_to_remote(
     Ok(())
 }
 
-/// Build the initial prompt: the task body + the loop-closing instruction
-/// that tells the worker how to mark itself done.
+/// Build the initial prompt: the task body + the loop-closing instructions
+/// that tell the worker how to rebase onto current `default_branch` and then
+/// mark itself done.
 ///
 /// The handoff is a file marker, not a pane title or a `shelbi` CLI call.
 /// The worker writes its task id into `<worktree>/.claude/shelbi-review-ready`
@@ -657,7 +664,18 @@ fn scp_settings_to_remote(
 /// writes and the Stop hook, both of which used to clobber a `shelbi:review`
 /// title before the poller could read it, and it needs no `shelbi` binary on
 /// the worker host.
-fn compose_prompt(task_id: &str, branch: &str, body: &str, marker: &Path) -> String {
+///
+/// The rebase step lives in the prompt (not in poll-side promotion code) so
+/// the worker re-runs its checks against the rebased base before signalling
+/// review — a hub-side rebase happens after handoff, when there's no agent
+/// around to fix conflicts or re-run tests.
+fn compose_prompt(
+    task_id: &str,
+    branch: &str,
+    body: &str,
+    marker: &Path,
+    default_branch: &str,
+) -> String {
     let trimmed = body.trim();
     let body_section = if trimmed.is_empty() {
         format!("# Task {task_id}\n")
@@ -670,8 +688,22 @@ fn compose_prompt(task_id: &str, branch: &str, body: &str, marker: &Path) -> Str
         "{body_section}\n\n\
          ---\n\
          You are working on task `{task_id}` on branch `{branch}`. When \
-         the work is complete and committed, signal that it's ready for \
-         review by writing the task id to the review marker file:\n\
+         the work is complete and committed, do these two things in order:\n\
+         \n\
+         1. Rebase your branch onto current `{default_branch}` so the review \
+         sees a clean diff against an up-to-date base — a stale base produces \
+         test failures that have nothing to do with your change and inflates \
+         the diff with commits already on `{default_branch}`:\n\
+         \n\
+         git fetch origin {default_branch} && git rebase origin/{default_branch}\n\
+         \n\
+         If the rebase produces conflicts, resolve them, run `git rebase \
+         --continue`, and re-run any affected tests before moving on. Do NOT \
+         write the marker until the rebase is complete and your work still \
+         passes against the rebased base.\n\
+         \n\
+         2. Signal that it's ready for review by writing the task id to the \
+         review marker file:\n\
          \n\
          printf '%s\\n' {id_esc} > {marker_esc}\n\
          \n\
@@ -876,6 +908,7 @@ mod tests {
             "shelbi/fix-login",
             "Fix the Safari SSO bug.",
             &marker,
+            "main",
         );
         assert!(prompt.contains("Fix the Safari SSO bug."));
         assert!(prompt.contains("fix-login"));
@@ -890,9 +923,63 @@ mod tests {
     #[test]
     fn prompt_falls_back_to_task_id_heading_when_body_empty() {
         let marker = PathBuf::from("/work/myapp/.shelbi/wt/alice/.claude/shelbi-review-ready");
-        let prompt = compose_prompt("fix-login", "shelbi/fix-login", "   ", &marker);
+        let prompt = compose_prompt("fix-login", "shelbi/fix-login", "   ", &marker, "main");
         assert!(prompt.contains("# Task fix-login"));
         assert!(prompt.contains(".claude/shelbi-review-ready"));
+    }
+
+    #[test]
+    fn prompt_instructs_worker_to_rebase_onto_default_branch_before_marker() {
+        // The whole point of this rebase step is to keep the review's base
+        // fresh — otherwise tests fail against a stale `default_branch` and
+        // the diff_size includes commits that are already on main. Pin the
+        // ordering (rebase → marker) and the exact command so a future
+        // prompt rewording can't quietly drop the rebase or invert the
+        // sequence.
+        let marker = PathBuf::from("/work/myapp/.shelbi/wt/alice/.claude/shelbi-review-ready");
+        let prompt = compose_prompt(
+            "fix-login",
+            "shelbi/fix-login",
+            "Fix the Safari SSO bug.",
+            &marker,
+            "main",
+        );
+        assert!(
+            prompt.contains("git fetch origin main && git rebase origin/main"),
+            "missing rebase command in prompt: {prompt}"
+        );
+        let rebase_at = prompt
+            .find("git rebase origin/main")
+            .expect("rebase command must appear in prompt");
+        let marker_at = prompt
+            .find("printf '%s\\n'")
+            .expect("marker printf must appear in prompt");
+        assert!(
+            rebase_at < marker_at,
+            "rebase must be instructed BEFORE the marker write; prompt: {prompt}"
+        );
+    }
+
+    #[test]
+    fn prompt_uses_projects_default_branch_for_rebase_target() {
+        // Not every project's main branch is named `main` — verify the
+        // command picks up `default_branch` rather than hard-coding it.
+        let marker = PathBuf::from("/work/myapp/.shelbi/wt/alice/.claude/shelbi-review-ready");
+        let prompt = compose_prompt(
+            "fix-login",
+            "shelbi/fix-login",
+            "Fix the Safari SSO bug.",
+            &marker,
+            "trunk",
+        );
+        assert!(
+            prompt.contains("git fetch origin trunk && git rebase origin/trunk"),
+            "rebase must target the project's default_branch: {prompt}"
+        );
+        assert!(
+            !prompt.contains("origin/main"),
+            "stale `main` reference leaked into prompt: {prompt}"
+        );
     }
 
     // Real captures observed on a Linux (delta) worker, used to pin the
