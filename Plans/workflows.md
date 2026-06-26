@@ -120,11 +120,12 @@ If `workflow` is absent, the task runs the default workflow. If `workflow` refer
 
 ### 6. Owner semantics
 
-`owner: user | agent | either` declares who is *expected* to act when a task is in that status:
+`owner: user | agent` declares who is *expected* to act when a task is in that status:
 
 - **`agent`** → eligible for auto-dispatch. The orchestrator picks free workers matching any `prefers_machine` constraint.
 - **`user`** → the orchestrator does NOT dispatch; the task waits for a user action. Surfaced in the activity feed + sidebar so the user knows their attention is requested.
-- **`either`** → can be dispatched if a worker is free; otherwise waits indefinitely without alerting (low-priority "could go either way").
+
+There is no third "either" value — a task is either work for a worker or work for the user. If the user wants to grab an agent-owned task, they reassign it through the normal CLI/TUI; no schema field needed for that.
 
 In Zen Mode (see §8), the owner determines what counts as "ready for auto-merge" — a transition from an `agent`-owned `active` status to a `user`-owned `handoff` status is the canonical auto-merge trigger.
 
@@ -236,7 +237,6 @@ After Phase 2: rich multi-workflow filtering on the existing Kanban board; singl
 - **Are transitions restricted by default, or any-to-any?** Today the user can move tasks freely between any columns. The YAML schema has an optional `transitions:` map. Question: when absent, is the default any-to-any or only adjacent? Recommend any-to-any (matches today's freedom).
 - **Workflow inheritance?** Should a workflow be able to `extends: default` and only specify deltas (add a status, override an owner)? Useful for projects with many similar workflows; more schema to maintain. Recommend: not in v1; revisit if users actually author 4+ workflows.
 - **Cross-workflow task moves?** Can a task switch its `workflow:` after creation (e.g., from `default` to `design-review`)? If yes, what status does it land in (the new workflow's `initial_status`?). Recommend: yes, allowed; lands in the new workflow's initial status; emits a `workflow-change` event.
-- **What does `owner: either` actually mean for auto-dispatch?** Specifically: should the orchestrator pick `either` tasks automatically when a worker frees, or treat them as user-driven by default? Recommend: dispatch automatically; the `either` is for tasks where the user might want to grab them but defaults to agent.
 - **Filter persistence across sessions.** When the user switches the Kanban filter away from `All` and quits, does the next session re-open on `All` or remember the last selection? Recommend: remember per-project so context survives a restart; reset to `All` only when the previously-chosen workflow's YAML is deleted.
 - **Same-category card ordering in `All` mode.** When multiple workflows' tasks share a category column (e.g., two `active` statuses from different workflows both pour into `Active`), how are cards ordered within the column? Options: by task priority (`shelbi task prio`), grouped by workflow first then priority within group, or fully interleaved by priority. Recommend: fully interleaved by priority, with the workflow label on each card carrying the visual distinction.
 - **Migration safety.** Touching every task file to add `workflow: default` to frontmatter is a write operation across many files. Want a `--dry-run` flag on the migration, plus a single squashed commit so the diff is reviewable. Confirm.
