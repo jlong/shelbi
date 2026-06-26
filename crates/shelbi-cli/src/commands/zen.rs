@@ -27,11 +27,14 @@ use anyhow::{anyhow, Result};
 use chrono::Utc;
 use clap::Subcommand;
 
-use shelbi_core::{danger_paths_for_project, Column, Project, Task, ZenDangerPaths};
+use shelbi_core::{
+    ci_timeout_for_workflow, danger_paths_for_project, Column, Project, Task, Workflow,
+    ZenDangerPaths,
+};
 use shelbi_orchestrator::zen::{self, CiVerdict, DryRunDecision};
 use shelbi_state::{
-    append_zen_dryrun_event, list_column, load_project, read_state, set_zen_mode, State,
-    ZenModeState,
+    append_zen_dryrun_event, list_column, load_project, load_workflow, read_state, set_zen_mode,
+    State, ZenModeState,
 };
 
 use crate::commands::require_project;
@@ -70,11 +73,18 @@ pub enum ZenCmd {
     /// stdout. Exit code is 0 only for `green`.
     CiWatch {
         pr_number: u64,
-        /// Override the project-level CI timeout (default 15m, set via
-        /// `zen.ci_timeout` in the project YAML). Accepts `30s`, `5m`,
-        /// `2h`, `1d`, or a bare integer of seconds.
+        /// Override the project-level (and per-workflow, if `--task` is
+        /// passed) CI timeout. Accepts `30s`, `5m`, `2h`, `1d`, or a
+        /// bare integer of seconds.
         #[arg(long, value_name = "DURATION")]
         timeout: Option<String>,
+        /// Resolve the default timeout against the task's workflow's
+        /// `zen.ci_timeout` (if set), falling back to
+        /// `project.zen.ci_timeout`. Without this flag, the project
+        /// default is used directly — `--task` is the opt-in for
+        /// per-workflow resolution.
+        #[arg(long, value_name = "TASK_ID")]
+        task: Option<String>,
     },
     /// Squash-merge the PR and delete the source branch. Prints the
     /// merge SHA on stdout.
@@ -112,12 +122,17 @@ pub fn run(project_opt: Option<String>, cmd: ZenCmd) -> Result<()> {
         ZenCmd::Probe { task_id } => {
             let project = load_project(&project_name).map_err(|e| anyhow!(e))?;
             let tf = shelbi_state::load_task(&project_name, &task_id).map_err(|e| anyhow!(e))?;
+            // Best-effort workflow lookup. A missing or malformed YAML
+            // means we fall back to project-level zen config — matching
+            // legacy `zen::probe` behavior.
+            let workflow = load_workflow_for_task(&project_name, &tf.task);
             let branch = tf
                 .task
                 .branch
                 .clone()
                 .unwrap_or_else(|| format!("shelbi/{}", tf.task.id));
-            let report = zen::probe(&project, &tf.task, &branch).map_err(|e| anyhow!(e))?;
+            let report = zen::probe_in_workflow(&project, workflow.as_ref(), &tf.task, &branch)
+                .map_err(|e| anyhow!(e))?;
             println!("{}", serde_json::to_string_pretty(&report)?);
             Ok(())
         }
@@ -129,11 +144,26 @@ pub fn run(project_opt: Option<String>, cmd: ZenCmd) -> Result<()> {
             println!("{pr}");
             Ok(())
         }
-        ZenCmd::CiWatch { pr_number, timeout } => {
+        ZenCmd::CiWatch {
+            pr_number,
+            timeout,
+            task,
+        } => {
             let project = load_project(&project_name).map_err(|e| anyhow!(e))?;
             let timeout = match timeout {
                 Some(s) => super::events::parse_duration(&s)?,
-                None => project.zen.ci_timeout,
+                None => {
+                    // Opt-in workflow resolution: if `--task <id>` was
+                    // passed, look up that task's workflow and apply its
+                    // `zen.ci_timeout` (when set) instead of the project
+                    // default. Errors (missing task, malformed YAML)
+                    // silently fall back to the project default.
+                    let workflow = task.as_deref().and_then(|tid| {
+                        let tf = shelbi_state::load_task(&project_name, tid).ok()?;
+                        load_workflow_for_task(&project_name, &tf.task)
+                    });
+                    ci_timeout_for_workflow(&project, workflow.as_ref())
+                }
             };
             let verdict =
                 zen::ci_watch(&project, pr_number, timeout).map_err(|e| anyhow!(e))?;
@@ -206,7 +236,9 @@ fn print_status(project: &str, state: &State) -> Result<()> {
                     println!("  - {c}");
                 }
             }
+            println!("ci timeout: {}", format_duration(p.zen.ci_timeout));
             print_danger_paths(&p);
+            print_workflow_zen_overrides(project, &p);
         }
         Err(e) => println!("checks: (could not read {project}.yaml: {e})"),
     }
@@ -217,6 +249,66 @@ fn print_status(project: &str, state: &State) -> Result<()> {
     let in_flight = count_in_flight_zen(project, state.zen_mode).unwrap_or(0);
     println!("in-flight zen tasks: {in_flight}");
     Ok(())
+}
+
+/// Surface which workflows declare a `zen:` block, and which dimensions
+/// they override. Quiet when no workflow overrides anything — the
+/// project-level summary above already covers that case.
+fn print_workflow_zen_overrides(project: &str, p: &Project) {
+    let Ok(workflows) = shelbi_state::list_workflows(project) else {
+        return;
+    };
+    let with_overrides: Vec<_> = workflows
+        .iter()
+        .filter(|w| w.zen.as_ref().map(|z| !z.is_empty()).unwrap_or(false))
+        .collect();
+    if with_overrides.is_empty() {
+        return;
+    }
+    println!("per-workflow zen overrides:");
+    for w in with_overrides {
+        let z = w.zen.as_ref().expect("filtered to Some(non-empty)");
+        let mut dims: Vec<&'static str> = Vec::new();
+        if z.checks.is_some() {
+            dims.push("checks");
+        }
+        if z.ci_timeout.is_some() {
+            dims.push("ci_timeout");
+        }
+        if z.danger_paths.is_some() {
+            dims.push("danger_paths");
+        }
+        println!("  - {}: {}", w.name, dims.join(", "));
+        if let Some(t) = z.ci_timeout {
+            println!("      ci_timeout: {}", format_duration(t));
+        }
+        if let Some(ref c) = z.checks {
+            if c.local.is_empty() {
+                println!("      checks: (empty — replaces project checks with none)");
+            } else {
+                println!("      checks:");
+                for cmd in &c.local {
+                    println!("        - {cmd}");
+                }
+            }
+        }
+        if let Some(ref dp) = z.danger_paths {
+            let resolved =
+                shelbi_core::danger_paths_for_workflow(p, Some(w));
+            let label = match dp {
+                ZenDangerPaths::Override(_) => "override",
+                ZenDangerPaths::Extend(_) => "extend",
+            };
+            println!("      danger_paths ({label}):");
+            if resolved.is_empty() {
+                println!("        (none)");
+            } else {
+                for path in &resolved {
+                    println!("        - {path}");
+                }
+            }
+        }
+    }
 }
 
 fn print_danger_paths(p: &Project) {
@@ -240,6 +332,16 @@ fn print_danger_paths(p: &Project) {
             println!("  - {path}");
         }
     }
+}
+
+/// Best-effort load of a task's workflow definition. Returns `None`
+/// when the workflow YAML is absent or malformed — call sites should
+/// treat that as "fall back to project-level config" rather than
+/// erroring out. Resolves the workflow name through
+/// [`Task::workflow_or_default`] so a task without an explicit
+/// `workflow:` field routes to the project's default workflow.
+fn load_workflow_for_task(project: &str, task: &Task) -> Option<Workflow> {
+    load_workflow(project, task.workflow_or_default()).ok()
 }
 
 fn count_in_flight_zen(project: &str, mode: ZenModeState) -> Result<usize> {
