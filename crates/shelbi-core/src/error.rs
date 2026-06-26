@@ -35,6 +35,36 @@ pub enum Error {
     #[error("invalid workflow: {0}")]
     InvalidWorkflow(String),
 
+    /// A workflow's `git:` block references one or more `{{var}}`
+    /// placeholders that aren't present in the task's frontmatter
+    /// parameters. The message is hand-tuned (singular vs. plural,
+    /// concrete example) so the user immediately knows what to add —
+    /// see `Plans/workflows.md` §12 "Parameterization".
+    #[error("{}", missing_task_params_message(.workflow, .params))]
+    MissingTaskParams { workflow: String, params: Vec<String> },
+
     #[error("{0}")]
     Other(String),
+}
+
+fn missing_task_params_message(workflow: &str, params: &[String]) -> String {
+    match params {
+        [] => format!("workflow `{workflow}` requires unknown parameters"),
+        [one] => format!(
+            "workflow `{workflow}` requires parameter `{one}`; \
+             add `{one}: <value>` to the task frontmatter"
+        ),
+        many => {
+            let list = many
+                .iter()
+                .map(|p| format!("`{p}`"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let first = &many[0];
+            format!(
+                "workflow `{workflow}` requires parameters {list}; \
+                 add them to the task frontmatter (e.g. `{first}: <value>`)"
+            )
+        }
+    }
 }

@@ -1,5 +1,6 @@
 pub mod error;
 pub mod model;
+pub mod placeholders;
 pub mod system_memory;
 pub mod worker_names;
 pub mod workflow;
@@ -13,6 +14,7 @@ pub use model::{
     WorkerSpec, ZenChecks, ZenConfig, ZenDangerPaths, BUILTIN_DANGER_PATHS, DEFAULT_WORKFLOW_NAME,
     HEARTBEAT_DEFAULT,
 };
+pub use placeholders::substitute_placeholders;
 pub use system_memory::{format_bytes_short, recommended_worker_count, total_memory_bytes};
 pub use worker_names::WorkerNamePreset;
 pub use workflow::{

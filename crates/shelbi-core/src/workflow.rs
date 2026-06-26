@@ -18,7 +18,8 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
-use crate::Error;
+use crate::placeholders::substitute_placeholders;
+use crate::{Error, GitConfig};
 
 // ---------------------------------------------------------------------------
 // Workflow
@@ -58,6 +59,15 @@ pub struct Workflow {
     /// unrestricted (any-to-any) — matching today's freedom.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub transitions: Option<BTreeMap<String, Vec<String>>>,
+
+    /// Per-workflow override of the project-level `git:` defaults. When
+    /// `None`, callers inherit `Project::base_branch` and
+    /// `Project::merge_strategy` unchanged. Field values may contain
+    /// `{{var}}` placeholders that are resolved against the task's
+    /// params at task-load time — see [`Workflow::resolve_git`] and
+    /// `Plans/workflows.md` §12 "Parameterization".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub git: Option<GitConfig>,
 }
 
 impl Workflow {
@@ -170,6 +180,39 @@ impl Workflow {
 
         Ok(())
     }
+
+    /// Resolve this workflow's `git:` block against a task's
+    /// frontmatter params, returning a fully substituted [`GitConfig`].
+    ///
+    /// Returns `Ok(None)` when the workflow has no `git:` block — the
+    /// caller should fall back to project-level git defaults.
+    /// Returns `Err(Error::MissingTaskParams)` listing every unresolved
+    /// `{{key}}` across every git field (one error per workflow, even
+    /// when multiple keys are missing) so the user can fix the task's
+    /// frontmatter in a single edit. See `Plans/workflows.md` §12.
+    pub fn resolve_git(
+        &self,
+        params: &BTreeMap<String, String>,
+    ) -> crate::Result<Option<GitConfig>> {
+        let Some(git) = &self.git else {
+            return Ok(None);
+        };
+        let mut missing: Vec<String> = Vec::new();
+        let base_branch = git
+            .base_branch
+            .as_ref()
+            .map(|s| substitute_placeholders(s, params, &mut missing));
+        if !missing.is_empty() {
+            return Err(Error::MissingTaskParams {
+                workflow: self.name.clone(),
+                params: missing,
+            });
+        }
+        Ok(Some(GitConfig {
+            base_branch,
+            merge_strategy: git.merge_strategy,
+        }))
+    }
 }
 
 /// The canonical five-status default workflow shipped with every new
@@ -216,6 +259,7 @@ pub fn default_workflow() -> Workflow {
         ],
         initial_status: None,
         transitions: None,
+        git: None,
     }
 }
 
@@ -287,6 +331,7 @@ fn workflow_err(msg: impl Into<String>) -> Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::MergeStrategy;
 
     const DEFAULT_YAML: &str = r#"
 name: default
@@ -541,5 +586,154 @@ statuses:
 "#;
         let err = Workflow::from_yaml_str(yaml).unwrap_err();
         assert!(matches!(err, Error::Yaml(_)), "got: {err}");
+    }
+
+    // ---------------------------------------------------------------------
+    // git: block + {{var}} parameterization
+
+    fn params(pairs: &[(&str, &str)]) -> BTreeMap<String, String> {
+        pairs
+            .iter()
+            .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn workflow_git_block_parses_with_placeholders() {
+        let yaml = r#"
+name: feature-task
+statuses:
+  - { name: Todo, category: ready, owner: agent }
+git:
+  base_branch: feature/{{feature}}
+"#;
+        let wf = Workflow::from_yaml_str(yaml).expect("parse");
+        let git = wf.git.expect("git block parsed");
+        assert_eq!(git.base_branch.as_deref(), Some("feature/{{feature}}"));
+    }
+
+    #[test]
+    fn workflow_with_no_git_block_resolves_to_none() {
+        // `default` workflow has no `git:`, so callers fall back to the
+        // project-level `Project::base_branch` / `merge_strategy` without
+        // any per-task substitution.
+        let wf = default_workflow();
+        let out = wf.resolve_git(&params(&[])).unwrap();
+        assert!(out.is_none());
+    }
+
+    #[test]
+    fn workflow_git_omits_when_none_on_the_wire() {
+        // A round trip of `default_workflow()` (no `git:`) must not emit
+        // an empty `git:` key — the field has to be entirely absent so
+        // legacy workflow YAMLs keep their existing shape.
+        let wf = default_workflow();
+        let y = serde_yaml::to_string(&wf).unwrap();
+        assert!(!y.contains("git:"), "unexpected git: in {y}");
+    }
+
+    #[test]
+    fn resolve_git_substitutes_placeholders_from_params() {
+        let yaml = r#"
+name: feature-task
+statuses:
+  - { name: Todo, category: ready, owner: agent }
+git:
+  base_branch: feature/{{feature}}
+  merge_strategy: merge
+"#;
+        let wf = Workflow::from_yaml_str(yaml).unwrap();
+        let resolved = wf
+            .resolve_git(&params(&[("feature", "auth-rewrite")]))
+            .unwrap()
+            .expect("git block present");
+        assert_eq!(resolved.base_branch.as_deref(), Some("feature/auth-rewrite"));
+        assert_eq!(resolved.merge_strategy, MergeStrategy::Merge);
+    }
+
+    #[test]
+    fn resolve_git_errors_with_actionable_message_when_param_missing() {
+        // The error wording is the user contract — `Plans/workflows.md`
+        // §12 quotes the message verbatim so the hint matches whatever
+        // a confused user pastes into a search.
+        let yaml = r#"
+name: feature-task
+statuses:
+  - { name: Todo, category: ready, owner: agent }
+git:
+  base_branch: feature/{{feature}}
+"#;
+        let wf = Workflow::from_yaml_str(yaml).unwrap();
+        let err = wf.resolve_git(&params(&[])).unwrap_err();
+        match err {
+            Error::MissingTaskParams {
+                ref workflow,
+                ref params,
+            } => {
+                assert_eq!(workflow, "feature-task");
+                assert_eq!(params, &vec!["feature".to_string()]);
+            }
+            other => panic!("expected MissingTaskParams, got {other:?}"),
+        }
+        let msg = err.to_string();
+        assert!(msg.contains("workflow `feature-task`"), "msg: {msg}");
+        assert!(msg.contains("parameter `feature`"), "msg: {msg}");
+        assert!(msg.contains("`feature: <value>`"), "msg: {msg}");
+        assert!(msg.contains("frontmatter"), "msg: {msg}");
+    }
+
+    #[test]
+    fn resolve_git_lists_every_missing_param_in_one_error() {
+        let yaml = r#"
+name: stack
+statuses:
+  - { name: Todo, category: ready, owner: agent }
+git:
+  base_branch: feature/{{feature}}-{{region}}
+"#;
+        let wf = Workflow::from_yaml_str(yaml).unwrap();
+        let err = wf
+            .resolve_git(&params(&[("feature", "auth")]))
+            .unwrap_err();
+        match err {
+            Error::MissingTaskParams { params, .. } => {
+                assert_eq!(params, vec!["region".to_string()]);
+            }
+            other => panic!("expected MissingTaskParams, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn resolve_git_preserves_branches_without_placeholders() {
+        // A plain (non-templated) `git:` block resolves to itself, so
+        // the call site can use `resolve_git` unconditionally.
+        let yaml = r#"
+name: feature-release
+statuses:
+  - { name: Todo, category: ready, owner: agent }
+git:
+  base_branch: main
+  merge_strategy: squash
+"#;
+        let wf = Workflow::from_yaml_str(yaml).unwrap();
+        let resolved = wf.resolve_git(&params(&[])).unwrap().unwrap();
+        assert_eq!(resolved.base_branch.as_deref(), Some("main"));
+        assert_eq!(resolved.merge_strategy, MergeStrategy::Squash);
+    }
+
+    #[test]
+    fn workflow_git_round_trips_through_yaml() {
+        let yaml = r#"
+name: feature-task
+statuses:
+  - { name: Todo, category: ready, owner: agent }
+git:
+  base_branch: feature/{{feature}}
+  merge_strategy: merge
+"#;
+        let wf = Workflow::from_yaml_str(yaml).unwrap();
+        let serialized = serde_yaml::to_string(&wf).unwrap();
+        let back = Workflow::from_yaml_str(&serialized).unwrap();
+        assert_eq!(wf, back);
     }
 }

@@ -677,6 +677,7 @@ mod tests {
             zen: None,
             created_at: now,
             updated_at: now,
+            params: std::collections::BTreeMap::new(),
         };
         shelbi_state::save_task("demo", &assigned, "# task").unwrap();
 
@@ -723,6 +724,7 @@ mod tests {
                 zen: None,
                 created_at: now,
                 updated_at: now,
+                params: std::collections::BTreeMap::new(),
             },
             "",
         )
@@ -781,6 +783,7 @@ mod tests {
                     zen: None,
                     created_at: now,
                     updated_at: now,
+                    params: std::collections::BTreeMap::new(),
                 },
                 "",
             )
@@ -833,6 +836,7 @@ mod tests {
                 zen: None,
                 created_at: now,
                 updated_at: now,
+                params: std::collections::BTreeMap::new(),
             },
             "",
         )
@@ -882,6 +886,7 @@ mod tests {
                 zen: None,
                 created_at: now,
                 updated_at: now,
+                params: std::collections::BTreeMap::new(),
             },
             "",
         )
@@ -999,6 +1004,7 @@ mod tests {
                 zen: None,
                 created_at: now,
                 updated_at: now,
+                params: std::collections::BTreeMap::new(),
             },
             "",
         )
