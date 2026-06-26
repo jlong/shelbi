@@ -1,7 +1,8 @@
 //! Shared git/gh helpers for the per-workflow action primitives and the
 //! Zen Mode merge primitives. Kept here so `zen.rs` and `actions.rs` don't
 //! drift on the basics — running a shell command in a worktree, finding
-//! the right host for an operation, looking up an open PR.
+//! the right host for an operation, looking up an open PR, composing a PR
+//! body, parsing the PR number out of `gh pr create`'s URL.
 
 use std::path::PathBuf;
 use std::process::Output;
@@ -104,4 +105,80 @@ pub(crate) fn lookup_open_pr(host: &Host, wt: &str, branch: &str) -> Result<Opti
             "gh pr list returned non-numeric value `{trimmed}` for branch `{branch}`"
         ))
     })
+}
+
+/// `git log -1 --format=%s` in `wt` — used as the default PR title when
+/// opening a fresh PR. Falls back to a generic title only if the caller
+/// preprocesses the empty case; we prefer surfacing a hard error here so
+/// a broken worktree doesn't silently produce a blank-title PR.
+pub(crate) fn head_commit_subject(host: &Host, wt: &str) -> Result<String> {
+    let out = run_in_dir(host, wt, &["git", "log", "-1", "--format=%s"])?;
+    if !out.status.success() {
+        return Err(Error::Command {
+            cmd: format!("git -C {wt} log -1 --format=%s"),
+            status: out.status.to_string(),
+            stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
+        });
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
+}
+
+/// Lay out the PR body: the task summary (or an empty body when the task
+/// has no body) followed by an auto-opened footer that points the reviewer
+/// back at the task file on disk.
+pub(crate) fn compose_pr_body(task_body: &str, task_path: &str) -> String {
+    let trimmed = task_body.trim();
+    let summary = if trimmed.is_empty() {
+        String::new()
+    } else {
+        format!("{trimmed}\n\n")
+    };
+    format!("{summary}---\n\nAuto-opened by Shelbi — review at: {task_path}\n")
+}
+
+/// `gh pr create` prints the new PR's URL like
+/// `https://github.com/owner/repo/pull/42`. Pull the trailing `42`.
+pub(crate) fn parse_pr_number_from_url(s: &str) -> Option<u64> {
+    let last = s
+        .rsplit_terminator(|c: char| c == '/' || c.is_whitespace())
+        .next()?;
+    last.parse().ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pr_body_includes_summary_and_footer() {
+        let body = compose_pr_body("Add foo to bar.", "/tmp/p/tasks/add-foo.md");
+        assert!(body.starts_with("Add foo to bar.\n\n---\n"));
+        assert!(body.contains("Auto-opened by Shelbi"));
+        assert!(body.contains("/tmp/p/tasks/add-foo.md"));
+    }
+
+    #[test]
+    fn pr_body_handles_empty_task_body() {
+        let body = compose_pr_body("", "/tmp/t.md");
+        assert!(body.starts_with("---\n"));
+        assert!(body.contains("Auto-opened by Shelbi"));
+    }
+
+    #[test]
+    fn parses_pr_number_from_url() {
+        assert_eq!(
+            parse_pr_number_from_url("https://github.com/jlong/shelbi/pull/42"),
+            Some(42)
+        );
+        assert_eq!(
+            parse_pr_number_from_url("https://github.com/jlong/shelbi/pull/42\n"),
+            Some(42)
+        );
+    }
+
+    #[test]
+    fn parse_pr_number_rejects_garbage() {
+        assert_eq!(parse_pr_number_from_url(""), None);
+        assert_eq!(parse_pr_number_from_url("not a url"), None);
+    }
 }

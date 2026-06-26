@@ -27,7 +27,10 @@ use shelbi_core::{
     Task, WorkerSpec,
 };
 
-use crate::git::{locate_hub_workdir, locate_worker_worktree, lookup_open_pr, run_in_dir};
+use crate::git::{
+    compose_pr_body, head_commit_subject, locate_hub_workdir, locate_worker_worktree,
+    lookup_open_pr, parse_pr_number_from_url, run_in_dir,
+};
 use crate::worker::worker_worktree;
 
 /// How often `ci_watch` re-runs `gh pr checks` while waiting for the
@@ -248,26 +251,6 @@ pub fn pr_merge(project: &Project, pr: u64) -> Result<String> {
 // ---------------------------------------------------------------------------
 // helpers (kept `pub` where they're worth unit-testing on their own)
 
-/// Lay out the PR body: the task summary (or a `# Task <id>` placeholder
-/// when the body is empty) followed by an auto-opened footer that points
-/// the reviewer back at the task file on disk.
-pub fn compose_pr_body(task_body: &str, task_path: &str) -> String {
-    let trimmed = task_body.trim();
-    let summary = if trimmed.is_empty() {
-        String::new()
-    } else {
-        format!("{trimmed}\n\n")
-    };
-    format!("{summary}---\n\nAuto-opened by Shelbi Zen Mode — review at: {task_path}\n")
-}
-
-/// `gh pr create` prints the new PR's URL like
-/// `https://github.com/owner/repo/pull/42`. Pull the trailing `42`.
-pub fn parse_pr_number_from_url(s: &str) -> Option<u64> {
-    let last = s.rsplit_terminator(|c: char| c == '/' || c.is_whitespace()).next()?;
-    last.parse().ok()
-}
-
 /// Best-effort extraction of the first failing required check from the
 /// `gh pr checks` output. Rows are tab-separated:
 /// `NAME\tSTATUS\tELAPSED\tURL\t[description]`. Status buckets that count
@@ -300,54 +283,9 @@ pub fn first_failing_check(stdout: &str) -> Option<(String, String)> {
     None
 }
 
-fn head_commit_subject(host: &Host, wt: &str) -> Result<String> {
-    let out = run_in_dir(host, wt, &["git", "log", "-1", "--format=%s"])?;
-    if !out.status.success() {
-        return Err(Error::Command {
-            cmd: format!("git -C {wt} log -1 --format=%s"),
-            status: out.status.to_string(),
-            stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
-        });
-    }
-    Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn pr_body_includes_summary_and_footer() {
-        let body = compose_pr_body("Add foo to bar.", "/tmp/p/tasks/add-foo.md");
-        assert!(body.starts_with("Add foo to bar.\n\n---\n"));
-        assert!(body.contains("Auto-opened by Shelbi Zen Mode"));
-        assert!(body.contains("/tmp/p/tasks/add-foo.md"));
-    }
-
-    #[test]
-    fn pr_body_handles_empty_task_body() {
-        let body = compose_pr_body("", "/tmp/t.md");
-        assert!(body.starts_with("---\n"));
-        assert!(body.contains("Auto-opened by Shelbi Zen Mode"));
-    }
-
-    #[test]
-    fn parses_pr_number_from_url() {
-        assert_eq!(
-            parse_pr_number_from_url("https://github.com/jlong/shelbi/pull/42"),
-            Some(42)
-        );
-        assert_eq!(
-            parse_pr_number_from_url("https://github.com/jlong/shelbi/pull/42\n"),
-            Some(42)
-        );
-    }
-
-    #[test]
-    fn parse_pr_number_rejects_garbage() {
-        assert_eq!(parse_pr_number_from_url(""), None);
-        assert_eq!(parse_pr_number_from_url("not a url"), None);
-    }
 
     #[test]
     fn first_failing_check_picks_the_first_fail() {
