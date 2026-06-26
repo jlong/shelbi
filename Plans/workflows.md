@@ -51,62 +51,66 @@ description: |             # surfaces in CLI listings + TUI workflow picker
   The standard one-track flow shipped with every project.
 
 statuses:
-  - name: Backlog          # display label
+  - id: backlog            # stable identifier — referenced by tasks and transitions
+    name: Backlog          # display label (renamable without breaking references)
     category: backlog
     owner: user            # user | agent
-    description: |
-      Untriaged work. The user moves things into Todo when ready.
 
-  - name: Todo
+  - id: todo
+    name: Todo
     category: ready
     owner: agent
 
-  - name: InProgress
+  - id: in-progress
+    name: In Progress
     category: active
     owner: agent
 
-  - name: Review
+  - id: review
+    name: Review
     category: handoff
-    owner: user            # user reviews; next owner is user
+    owner: user
 
-  - name: Done
+  - id: done
+    name: Done
     category: done
     owner: user
 
-  - name: Canceled
+  - id: canceled
+    name: Canceled
     category: archived
     owner: user
 
-# Optional: which status a new task lands in by default. If absent, the
-# first status in the list is used.
-initial_status: Backlog
+# Optional: which status (id) a new task lands in. Defaults to the first
+# status in the list above.
+initial_status: backlog
 
-# Optional: restrict allowed transitions. If absent, any-to-any is allowed.
-# allowed_transitions:
-# Backlog: [Todo]
-# Todo: [InProgress, Backlog]
-# InProgress: [Review, Todo]
-# Review: [Done, Todo, InProgress]
-# Done: []
-
-# Optional: git-side behavior and per-edge actions. See §12 for the full
-# action set, semantics, and worked scenarios. Omitting both blocks gives a
+# Optional: per-workflow override of the project-level `git:` defaults.
+# Most workflows omit this entirely and inherit `base_branch: main,
+# merge_strategy: squash` from `project.yaml`. Declare here only when this
+# workflow needs a different target (e.g., a feature-task workflow targeting
+# a feature branch). See §12 for the action set, semantics, and worked
+# scenarios. Omitting the `git:` and `transitions:` blocks both gives a
 # pure bookkeeping workflow (no git side-effects).
-git:
-  base_branch: main
-  merge_strategy: squash
+# git:
+#   base_branch: main
+#   merge_strategy: squash         # squash | merge
 
 transitions:
-  - from: InProgress
-    to: Review
+  - from: in-progress
+    to: review
     actions: [push_branch, open_pr]
 
-  - from: Review
-    to: Done
+  - from: review
+    to: done
     actions: [merge, delete_branch]
 
-  - from: any
-    to: Canceled
+  - from: in-progress
+    to: canceled
+    actions: [close_pr, delete_branch]
+
+  - from: review
+    to: canceled
     actions: [close_pr, delete_branch]
 ```
 
@@ -141,7 +145,7 @@ Tasks declare their workflow in frontmatter:
 id: design-the-thing
 title: Design the thing
 workflow: design-review        # optional; defaults to "default" if omitted
-column: Designing              # uses a status from the assigned workflow
+column: designing              # uses a status id from the assigned workflow
 ---
 ```
 
@@ -212,12 +216,12 @@ If any check on a high-bar transition fails or is ambiguous, Zen leaves the task
 The orchestrator's reaction rules already key off events like `task=<id> in_progress -> review reason=worker:review-marker`. With Workflows, the events log line shape becomes:
 
 ```
-<ts> task=<id> workflow=<name> <from-status> -> <to-status> reason=<short> category=<from-cat>->...<to-cat>
+<ts> task=<id> workflow=<name> <from-status> -> <to-status> reason=<short> from_category=<cat> to_category=<cat>
 ```
 
 The `category` annotation lets the orchestrator's reactions match on semantic transitions rather than literal status names:
 
-- *"On any transition into a* *`handoff`-category status whose next owner is* *`user`"* → that's the Zen Mode auto-merge trigger, regardless of whether the user called the status `Review` or `QA` or `Awaiting Sign-off`.
+- *"On any transition into a* *`handoff`-category status whose* *`owner`* *is* *`user`"* → that's the Zen Mode auto-merge trigger, regardless of whether the user called the status `Review` or `QA` or `Awaiting Sign-off`.
 
 - *"On any* *`active`-owned-by-agent status becoming idle"* → auto-dispatch logic.
 
@@ -244,9 +248,9 @@ Zen Mode's `## Merge Conditions` prompt section keeps working unchanged — it r
 ### 10. Events log shape change
 
 Existing line: `<ts> task=<id> <from> -> <to> reason=<short>`
-New line: `<ts> task=<id> workflow=<name> <from> -> <to> reason=<short> category=<from-cat>-><to-cat>`
+New line: `<ts> task=<id> workflow=<name> <from> -> <to> reason=<short> from_category=<cat> to_category=<cat>`
 
-The orchestrator's events tail parser gains the new fields; old lines (from before the change) parse with defaults (`workflow=default`, computed `category` from the canonical 5-name map).
+The `<from>` and `<to>` fields use the status **id**, not the display name, so events stay stable across status renames. The orchestrator's events tail parser gains the new fields; old lines (from before the change) parse with defaults (`workflow=default`, computed `from_category`/`to_category` from the canonical 5-name map).
 
 ### 11. Migration of existing projects
 
@@ -259,41 +263,47 @@ Task files are **not** modified. A task with no `workflow:` field is treated as 
 
 ### 12. Branch + PR semantics
 
-Workflows declare more than statuses and owners — they also declare the **git side-effects that fire on each transition**. The schema extends with a `git:` block (project-level defaults) and a `transitions:` block (per-edge action lists). Status names — not categories — are the anchor: branching policy is most naturally read against the user's actual pipeline labels.
+Workflows declare more than statuses and owners — they also declare the **git side-effects that fire on each transition**. Two pieces:
+
+1. **Project-level git defaults** live in `project.yaml`. Most projects set `base_branch: main, merge_strategy: squash` once here and never repeat them.
+2. **Per-workflow `git:` overrides** live in the workflow YAML, declared only when this workflow targets something different (e.g., a `feature-task.yaml` whose tasks branch off a feature branch instead of `main`).
+
+The `transitions:` block sits inside each workflow YAML and declares **per-edge action lists**. Status ids — not categories — are the anchor: branching policy is most naturally read against the workflow's actual pipeline.
 
 ```yaml
-# workflows/default.yaml (the git + transitions extension)
-git:
-  base_branch: main             # default branch tasks branch off
-  merge_strategy: squash        # squash | merge | rebase
+# workflows/default.yaml — transitions and an optional per-workflow git override.
+# Project-level `base_branch: main, merge_strategy: squash` live in project.yaml;
+# this workflow inherits them, so no `git:` block is needed here.
 
 transitions:
-  - from: InProgress
-    to: Review
+  - from: in-progress
+    to: review
     actions: [push_branch, open_pr]
 
-  - from: Review
-    to: Done
+  - from: review
+    to: done
     actions: [merge, delete_branch]
 
-  - from: any                   # wildcard — applies regardless of source status
-    to: Canceled
+  - from: in-progress
+    to: canceled
+    actions: [close_pr, delete_branch]
+
+  - from: review
+    to: canceled
     actions: [close_pr, delete_branch]
 ```
 
-**Action set.** Five primitives, each idempotent and silently no-op when not applicable:
+**Action set.** Five primitives, all hub-side (the orchestrator or CLI on the hub machine runs them; workers never invoke actions directly). Each is idempotent and silently no-ops when not applicable:
 
-| Action          | Effect                                                                                                          |
-| --------------- | --------------------------------------------------------------------------------------------------------------- |
-| `push_branch`   | Push the task's branch to `origin`.                                                                             |
-| `open_pr`       | Open a PR against `git.base_branch`. No-op if one is already open.                                              |
-| `merge`         | Merge the branch using `git.merge_strategy`. If a PR is open, merges via PR; otherwise merges branch-to-branch. |
-| `close_pr`      | Close any open PR without merging. No-op if none open.                                                          |
-| `delete_branch` | Delete the local + remote branch. Skipped if the branch is checked out in a worker worktree.                    |
+| Action          | Effect                                                                                                                                                                                                                                                                       |
+| --------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `push_branch`   | Push the task's branch to `origin`.                                                                                                                                                                                                                                          |
+| `open_pr`       | Open a PR against the effective `base_branch` (workflow override or project default). No-op if one is already open.                                                                                                                                                          |
+| `merge`         | Merge the task's branch using the effective `merge_strategy`. If a PR is open, merges via `gh pr merge --<strategy>`. If no PR is open, the hub fetches the branch and runs `git merge --<strategy>` locally. `merge_strategy:` is one of `squash` or `merge` in v1 (no `rebase`). |
+| `close_pr`      | Close any open PR without merging. No-op if none open.                                                                                                                                                                                                                       |
+| `delete_branch` | Delete the local + remote branch. Skipped if the branch is checked out in a worker worktree (those branches replace naturally on the worker's next dispatch).                                                                                                                |
 
-Missing transitions are no-ops — a workflow only declares the edges where work needs to happen.
-
-**Wildcards.** `from: any` declares an action set that applies regardless of the source status. Useful for "any path into Canceled deletes the branch." Only one wildcard per `to:` value, to keep resolution unambiguous.
+Missing transitions are no-ops — a workflow only declares the edges where work needs to happen. There is no wildcard syntax in v1; list the from-statuses explicitly.
 
 **The `branch:` task field.** Every task carries an optional `branch:` field in its frontmatter — the name of the git branch the task operates on. Its presence (or absence) at task creation controls whether shelbi cuts a fresh branch or uses an existing one.
 
@@ -319,32 +329,29 @@ Single source of truth: the workflow YAML declares behavior; Zen and the user-dr
 ```yaml
 # workflows/feature-task.yaml — reused by any number of concurrent features
 git:
-  base_branch: feature/{{feature}}        # {{feature}} is supplied per task
-  merge_strategy: squash
+  base_branch: feature/{{feature}}        # {{feature}} is supplied per task; overrides project default
 
 transitions:
-  - from: InProgress
-    to: Review
+  - from: in-progress
+    to: review
     actions: [push_branch]                # push so reviewers can see; NO open_pr — work just stacks
 
-  - from: Review
-    to: Done
+  - from: review
+    to: done
     actions: [merge, delete_branch]       # merge directly into feature/{{feature}}
 ```
 
 ```yaml
-# workflows/feature-release.yaml — ships any pre-existing branch into main
-git:
-  base_branch: main
-  merge_strategy: squash
+# workflows/feature-release.yaml — ships any pre-existing branch into main.
+# Inherits project default `base_branch: main, merge_strategy: squash` — no `git:` block needed.
 
 transitions:
-  - from: InProgress
-    to: Review
+  - from: in-progress
+    to: review
     actions: [push_branch, open_pr]       # PR the existing feature branch against main
 
-  - from: Review
-    to: Done
+  - from: review
+    to: done
     actions: [merge, delete_branch]       # squash-merge into main, then delete the feature branch
 ```
 
@@ -424,7 +431,7 @@ After Phase 2: rich multi-workflow filtering on the existing Kanban board; singl
 
 ## Decisions
 
-- **Transitions are any-to-any by default.** Users can move cards freely between any columns. Projects that want a strict state machine declare an optional `allowed_transitions:` map in the workflow YAML (see §2). This preserves today's freedom.
+- **Transitions are any-to-any.** Users can move cards freely between any columns. v1 does not support declaring a restricted state machine in YAML — if a project genuinely needs that, we'll add the field once a real use case appears. Preserves today's freedom.
 - **No workflow inheritance in v1.** Workflows do not support `extends:` — each YAML stands alone. Revisit only if users author 4+ similar workflows and copy-paste pain becomes real.
 - **A task is bound to its workflow at creation.** Cross-workflow moves are not allowed. To switch a task into a different workflow, the user creates a fresh task in the target workflow (and optionally archives the original).
 - **The status-category set is closed at six.** `backlog`, `ready`, `active`, `handoff`, `done`, `archived`. Custom workflows pick from these — they can't define new categories. Keeps generic code (Zen Mode, activity feed, sidebar) correct across arbitrary workflows.
