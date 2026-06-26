@@ -1,4 +1,4 @@
-# Orchastrator Auto-Dispatch
+# Orchestrator Auto-Dispatch
 
 ## Context
 

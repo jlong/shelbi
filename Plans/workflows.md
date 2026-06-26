@@ -99,11 +99,9 @@ A project can have any number of workflow files. Examples:
     design-review.yaml   # 6-status pipeline with a user-owned QA step before done
 ```
 
-When multiple workflows are present:
+Workflows are **configuration**, not a UI surface — they're authored as YAML and surfaced only through (a) the `shelbi workflow ...` CLI (§9) and (b) a **workflow filter** on the existing Tasks Kanban board (§7). There is no dedicated "Workflows" view in the TUI.
 
-- The TUI Kanban view defaults to showing the **default workflow** with a workflow picker (top-of-board dropdown or palette entry) to switch.
-- Per-workflow views render only that workflow's tasks, using its status names as column headers.
-- An "All workflows" view aggregates everything, grouped by workflow (each workflow as a vertical strip; sections collapsible).
+**By default the filter is `All` — every task across every workflow is visible.** In `All` mode the column set is the five **status categories** from §1 (Backlog / Ready / Active / Handoff / Done), since every status in every workflow maps to one of them. Cards from different workflows can sit in the same column; a small workflow label on each card (Phase 2) tells them apart. Selecting a specific workflow from the filter swaps the columns to that workflow's native status names and hides tasks from other workflows.
 
 ### 5. Per-task workflow assignment
 
@@ -132,19 +130,35 @@ In Zen Mode (see §8), the owner determines what counts as "ready for auto-merge
 
 ### 7. TUI rendering
 
-The Kanban TUI gains a **workflow picker** at the top of the board:
+The Tasks Kanban board gains a **workflow filter** at the top:
 
 ```
-Kanban  ·  [Workflow: default ▾]                              (q to quit, ? for help)
-
-Backlog  ·  Todo  ·  InProgress  ·  Review  ·  Done
+Kanban  ·  [Workflow: All ▾]                                  (q to quit, ? for help)
 ```
 
-Switching the picker re-renders the board with the selected workflow's status columns and only its tasks. The sidebar's worker badges and activity feed are unaffected (workflow-agnostic).
+The filter defaults to **`All`** — every task across every workflow is visible, with columns drawn from the five status categories (Backlog / Ready / Active / Handoff / Done). Selecting a specific workflow switches columns to that workflow's native status names and narrows the cards to only that workflow's tasks. There is no separate "Workflows" view; workflows are configuration (see §4).
 
-A second view, `Workflows`, lists every defined workflow with its status set + task count. From there the user can pick + jump to that workflow's board.
+**Every column is always shown**, in declaration order — the full structure stays visible at a glance, regardless of where work currently sits. Empty columns aren't hidden; they're collapsed. The same rules apply in both modes: in `All`, the columns are the five status categories; in a workflow-specific filter, they're that workflow's declared statuses.
 
-Per-workflow context lives in the page chrome; the sidebar nav stays workflow-agnostic.
+- Columns with one or more tasks render as **full-width columns** (card list inside).
+- Columns with **no tasks collapse to a thin vertical strip** ~3 cells wide, with the column name written top-to-bottom (one character per row). The strip spans the full board height so the column rail stays visually aligned. Cards can still be dropped onto a collapsed strip; moving the cursor onto one expands it temporarily until focus leaves.
+- When the combined width of expanded columns exceeds the terminal, the board **scrolls horizontally**. Left/right arrows (or `h`/`l`) move the cursor between columns; the visible window scrolls to keep the cursor in view. The workflow filter, header, and footer stay pinned — only the column track scrolls.
+
+Example of a workflow-specific filter (7-status `design-review`) where only `Build` and `Review` have cards:
+
+```
+┌─┐ ┌─┐ ┌────────────┐ ┌─┐ ┌────────────┐ ┌─┐ ┌─┐
+│B│ │D│ │   Build    │ │Q│ │   Review   │ │S│ │D│
+│a│ │e│ │            │ │A│ │            │ │h│ │o│
+│c│ │s│ │ • foo      │ │ │ │ • baz      │ │i│ │n│
+│k│ │i│ │ • bar      │ │ │ │ • qux      │ │p│ │e│
+│l│ │g│ │            │ │ │ │            │ │ │ │ │
+│o│ │n│ │            │ │ │ │            │ │ │ │ │
+│g│ │ │ │            │ │ │ │            │ │ │ │ │
+└─┘ └─┘ └────────────┘ └─┘ └────────────┘ └─┘ └─┘
+```
+
+Switching the filter re-renders with the selected workflow's status set — or back to the five status categories when set to `All`. The sidebar's worker badges and activity feed are workflow-agnostic.
 
 ### 8. Orchestrator + Zen integration
 
@@ -207,12 +221,11 @@ After Phase 1: existing projects keep working; users can author additional workf
 
 **Phase 2 — TUI polish.**
 
-- Workflow picker in the Kanban view.
-- `Workflows` index view in the sidebar nav (alongside Chat / Tasks / Activity).
-- "All workflows" aggregate Kanban with per-workflow strips.
-- Per-task workflow indicator (small label in the task card).
+- Workflow filter in the Tasks Kanban view.
+- All-statuses-visible rendering: cards-bearing columns full-width; empty statuses collapsed to vertical-text strips; horizontal scroll when the column track outgrows the terminal.
+- Per-task workflow indicator (small label in the task card) so the user can tell at a glance which workflow a card belongs to when the filter is switched away from it.
 
-After Phase 2: rich multi-workflow UI; "single workflow" projects look identical to today.
+After Phase 2: rich multi-workflow filtering on the existing Kanban board; single-workflow projects look identical to today.
 
 ## Decisions
 
@@ -224,7 +237,8 @@ After Phase 2: rich multi-workflow UI; "single workflow" projects look identical
 - **Workflow inheritance?** Should a workflow be able to `extends: default` and only specify deltas (add a status, override an owner)? Useful for projects with many similar workflows; more schema to maintain. Recommend: not in v1; revisit if users actually author 4+ workflows.
 - **Cross-workflow task moves?** Can a task switch its `workflow:` after creation (e.g., from `default` to `design-review`)? If yes, what status does it land in (the new workflow's `initial_status`?). Recommend: yes, allowed; lands in the new workflow's initial status; emits a `workflow-change` event.
 - **What does `owner: either` actually mean for auto-dispatch?** Specifically: should the orchestrator pick `either` tasks automatically when a worker frees, or treat them as user-driven by default? Recommend: dispatch automatically; the `either` is for tasks where the user might want to grab them but defaults to agent.
-- **Workflow picker default behavior with multiple workflows.** If a project has 3 workflows and the user opens the Kanban view fresh, does it show the default workflow only, or "All workflows" stacked? Recommend: default workflow only (less visual noise; jumping to All is a one-key palette action).
+- **Filter persistence across sessions.** When the user switches the Kanban filter away from `All` and quits, does the next session re-open on `All` or remember the last selection? Recommend: remember per-project so context survives a restart; reset to `All` only when the previously-chosen workflow's YAML is deleted.
+- **Same-category card ordering in `All` mode.** When multiple workflows' tasks share a category column (e.g., two `active` statuses from different workflows both pour into `Active`), how are cards ordered within the column? Options: by task priority (`shelbi task prio`), grouped by workflow first then priority within group, or fully interleaved by priority. Recommend: fully interleaved by priority, with the workflow label on each card carrying the visual distinction.
 - **Migration safety.** Touching every task file to add `workflow: default` to frontmatter is a write operation across many files. Want a `--dry-run` flag on the migration, plus a single squashed commit so the diff is reviewable. Confirm.
 - **Per-workflow Zen config?** Should `zen.checks.local` / `zen.ci_timeout` / `zen.danger_paths` be definable per-workflow as well as per-project? Useful when a `research` workflow has no code-checks but the `default` does. Recommend: per-workflow with fallback to project-level.
 - **Auto-creation of categories.** Could a custom workflow define a NEW category beyond the five listed? Probably not — keep the category set closed so generic code stays correct. Confirm.
