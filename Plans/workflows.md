@@ -252,11 +252,10 @@ The orchestrator's events tail parser gains the new fields; old lines (from befo
 
 Existing projects have no `workflows/` directory. On first load after the upgrade:
 
-1. Shelbi creates `workflows/default.yaml` with the canonical 5-status definition.
-2. All existing tasks get `workflow: default` written to their frontmatter (idempotent; only adds if absent).
-3. Existing events log lines are left alone — the parser handles old-shape lines transparently.
+1. Shelbi creates `workflows/default.yaml` with the canonical six-status definition (the five historical statuses plus `Canceled`).
+2. Existing events log lines are left alone — the parser handles old-shape lines transparently.
 
-One-time migration, then the project is on the new schema.
+Task files are **not** modified. A task with no `workflow:` field is treated as belonging to the default workflow, so there's nothing to backfill. The same rule covers tasks created in the future when the user doesn't specify a workflow.
 
 ### 12. Branch + PR semantics
 
@@ -399,7 +398,7 @@ Two phases.
 
 - `workflows/` directory scaffold for new projects.
 
-- One-time migration for existing projects (auto-create `default.yaml`, backfill task frontmatter).
+- One-time migration for existing projects (auto-create `default.yaml` if missing; no per-task changes — see §11).
 
 - Per-task `workflow:` frontmatter support.
 
@@ -425,24 +424,16 @@ After Phase 2: rich multi-workflow filtering on the existing Kanban board; singl
 
 ## Decisions
 
-(Locked once we walk through the plan together.)
+- **Transitions are any-to-any by default.** Users can move cards freely between any columns. Projects that want a strict state machine declare an optional `allowed_transitions:` map in the workflow YAML (see §2). This preserves today's freedom.
+- **No workflow inheritance in v1.** Workflows do not support `extends:` — each YAML stands alone. Revisit only if users author 4+ similar workflows and copy-paste pain becomes real.
+- **A task is bound to its workflow at creation.** Cross-workflow moves are not allowed. To switch a task into a different workflow, the user creates a fresh task in the target workflow (and optionally archives the original).
+- **The status-category set is closed at six.** `backlog`, `ready`, `active`, `handoff`, `done`, `archived`. Custom workflows pick from these — they can't define new categories. Keeps generic code (Zen Mode, activity feed, sidebar) correct across arbitrary workflows.
+- **Kanban workflow filter persists per project.** When the user switches the filter away from `All`, the next session re-opens on the same selection. Reset to `All` only when the previously-chosen workflow's YAML is deleted.
+- **`All`-mode card ordering is interleaved by priority.** Cards from multiple workflows mix freely within each category column, sorted by task priority (`shelbi task prio`). The per-card workflow label (Phase 2) provides visual distinction; no grouping or separators.
+- **Migration is minimal.** Shelbi creates `workflows/default.yaml` if missing; task files are not modified. Tasks without an explicit `workflow:` field implicitly use the default workflow (see §11).
+- **Zen config is per-workflow with project-level fallback.** `zen.checks.local`, `zen.ci_timeout`, and `zen.danger_paths` can be declared in a workflow's YAML; missing values fall back to project-level settings. A `research` workflow can opt out of code-style checks without affecting `default`.
+- **Naming stays as "Workflows".** The "Shelbi" prefix is used in prose when disambiguation from CI/GitHub Actions workflows is needed (i.e., "Shelbi Workflows").
 
 ## Open questions
 
-- **Are transitions restricted by default, or any-to-any?** Today the user can move tasks freely between any columns. The YAML schema has an optional `allowed_transitions:` map (§2). Question: when absent, is the default any-to-any or only adjacent? Recommend any-to-any (matches today's freedom). (Note: `allowed_transitions:` controls *which edges may be taken*; `transitions:` in §12 declares *what actions fire* on the edges that are taken — two different concerns.)
-
-- **Workflow inheritance?** Should a workflow be able to `extends: default` and only specify deltas (add a status, override an owner)? Useful for projects with many similar workflows; more schema to maintain. Recommend: not in v1; revisit if users actually author 4+ workflows.
-
-- **Cross-workflow task moves?** Can a task switch its `workflow:` after creation (e.g., from `default` to `design-review`)? If yes, what status does it land in (the new workflow's `initial_status`?). Recommend: yes, allowed; lands in the new workflow's initial status; emits a `workflow-change` event.
-
-- **Filter persistence across sessions.** When the user switches the Kanban filter away from `All` and quits, does the next session re-open on `All` or remember the last selection? Recommend: remember per-project so context survives a restart; reset to `All` only when the previously-chosen workflow's YAML is deleted.
-
-- **Same-category card ordering in** **`All`** **mode.** When multiple workflows' tasks share a category column (e.g., two `active` statuses from different workflows both pour into `Active`), how are cards ordered within the column? Options: by task priority (`shelbi task prio`), grouped by workflow first then priority within group, or fully interleaved by priority. Recommend: fully interleaved by priority, with the workflow label on each card carrying the visual distinction.
-
-- **Migration safety.** Touching every task file to add `workflow: default` to frontmatter is a write operation across many files. Want a `--dry-run` flag on the migration, plus a single squashed commit so the diff is reviewable. Confirm.
-
-- **Per-workflow Zen config?** Should `zen.checks.local` / `zen.ci_timeout` / `zen.danger_paths` be definable per-workflow as well as per-project? Useful when a `research` workflow has no code-checks but the `default` does. Recommend: per-workflow with fallback to project-level.
-
-- **Auto-creation of categories.** Could a custom workflow define a NEW category beyond the six listed? Probably not — keep the category set closed so generic code stays correct. Confirm.
-
-- **Naming.** "Workflow" is a heavy word (overloaded with CI workflows, GitHub Actions workflows, n8n workflows). Should this feature have a different name (e.g., "Pipelines", "Tracks", "Boards")? "Workflows" is what the user named it; sticking with it unless something better emerges.
+_All previously-listed questions are resolved above in Decisions. New questions will land here as the design evolves._
