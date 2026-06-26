@@ -1,7 +1,16 @@
-//! Kanban Tasks view — 5 columns (backlog / todo / in_progress / review /
-//! done), rendered into the dashboard's right pane via the same hidden-pane
-//! swap mechanism the other built-in views use. State is read from / written
-//! to the task markdown files via `shelbi_state`; no separate cache.
+//! Kanban Tasks view — rendered into the dashboard's right pane via the
+//! same hidden-pane swap mechanism the other built-in views use. State is
+//! read from / written to the task markdown files via `shelbi_state`; no
+//! separate cache.
+//!
+//! In "All" mode the board renders the **union of every loaded workflow's
+//! `(workflow, status)` pairs** as columns, in workflow-declaration order
+//! (workflows themselves sorted by name via [`shelbi_state::list_workflows`]).
+//! A project with only the default workflow looks identical to the old
+//! 5-column flow; a project with a second workflow gets that workflow's
+//! statuses appended to the right. Each task is bucketed into the column
+//! for `(task.workflow_or_default(), task.column)` — see
+//! [`resolve_task_status`].
 //!
 //! The pane is meant to outlive any one TUI process (the parent shell wraps
 //! it in a `while true` loop) — so we deliberately don't bind a quit key.
@@ -17,7 +26,9 @@ use ratatui::{
     widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap},
     Frame,
 };
-use shelbi_core::Column;
+use shelbi_core::{
+    default_workflow, Column, StatusCategory, Task, Workflow, DEFAULT_WORKFLOW_NAME,
+};
 use shelbi_state::TaskFile;
 
 /// State for the Kanban TUI. Selection is `(column, row)` — `row` is the
@@ -57,6 +68,19 @@ pub struct KanbanApp {
     /// Hit-test entries for the open dropdown's option rows. Empty when
     /// the dropdown is closed.
     pub dropdown_hits: Vec<DropdownHit>,
+    /// Loaded workflows, in `list_workflows` order (alphabetical by name,
+    /// with `default` last when present unless another workflow sorts
+    /// after it lexicographically). Reloaded each [`refresh`], so an
+    /// edited `workflows/<name>.yaml` shows up on the next poll without
+    /// a respawn. Empty when the loader errors — the board degrades to
+    /// the canonical default workflow via [`KanbanApp::workflows_or_default`].
+    pub workflows: Vec<Workflow>,
+    /// The All-mode column list: one entry per `(workflow, status)` pair
+    /// taken from every loaded workflow, in declared order. Selection
+    /// indices ([`KanbanApp::selected_column`]) refer to slots in this
+    /// vec, and the renderer walks it left-to-right. Rebuilt each
+    /// refresh from [`KanbanApp::workflows`].
+    pub all_columns: Vec<WorkflowColumn>,
 }
 
 /// Worker filter applied to the visible cards. Separate from the
@@ -154,6 +178,32 @@ pub struct CardHit {
     pub row_idx: usize,
 }
 
+/// One column in the All-mode kanban view — a `(workflow, status)` pair.
+///
+/// Each loaded workflow contributes one [`WorkflowColumn`] per status it
+/// declares, in declared order. The status's [`StatusCategory`] is mirrored
+/// here so:
+///
+/// - the renderer can colour the header using the same palette the legacy
+///   5-column flow uses (Backlog grey, Ready blue, Active yellow…), and
+/// - the move handler can map a target column back to the legacy
+///   [`Column`] enum that `shelbi_state::move_task` still takes — see
+///   [`category_to_column`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkflowColumn {
+    /// Workflow name this column belongs to. Matches the workflow's
+    /// YAML `name:` field. Used both to bucket tasks and to render the
+    /// subscript label under the status name when more than one
+    /// workflow is loaded.
+    pub workflow: String,
+    /// Status name as declared in the workflow YAML. Doubles as the
+    /// header label rendered above the column.
+    pub status_name: String,
+    /// Semantic category the status reports — controls header colour
+    /// and the legacy-column mapping used when moving cards.
+    pub category: StatusCategory,
+}
+
 /// State for the open task detail popover. We key by task id (not column/row
 /// indices) so a background refresh that reorders cards doesn't swap the
 /// popover's contents under the user.
@@ -164,6 +214,14 @@ pub struct TaskPopover {
 
 impl KanbanApp {
     pub fn new(project_name: impl Into<String>) -> Self {
+        // Seed `all_columns` with the canonical default workflow so a
+        // brand-new app pre-`refresh` already paints a board (and
+        // exercises the same code path as a refresh that found exactly
+        // one default workflow on disk). Tests that drive the app
+        // directly without calling `refresh` also benefit — they don't
+        // have to populate `all_columns` by hand to navigate.
+        let default = default_workflow();
+        let all_columns = workflow_columns(std::slice::from_ref(&default));
         Self {
             project_name: project_name.into(),
             tasks: Vec::new(),
@@ -178,6 +236,8 @@ impl KanbanApp {
             worker_dropdown: None,
             filter_chip_hit: None,
             dropdown_hits: Vec::new(),
+            workflows: vec![default],
+            all_columns,
         }
     }
 
@@ -260,27 +320,56 @@ impl KanbanApp {
         }
     }
 
-    pub fn column(&self, idx: usize) -> Column {
-        Column::ALL[idx.min(Column::ALL.len() - 1)]
+    /// Resolved `(workflow, status)` pair for column slot `idx`. Returns
+    /// the last slot when `idx` overshoots — the same clamp-to-end the
+    /// legacy `Column::ALL[idx.min(_)]` implementation had — so callers
+    /// that pass a stale selection index still get a usable column.
+    /// Never returns `None`: `all_columns` is seeded with the default
+    /// workflow in [`Self::new`] and rebuilt to at least the canonical
+    /// default on every refresh.
+    pub fn column(&self, idx: usize) -> &WorkflowColumn {
+        let last = self.all_columns.len().saturating_sub(1);
+        &self.all_columns[idx.min(last)]
     }
 
     pub fn column_tasks(&self, col_idx: usize) -> Vec<&TaskFile> {
-        let col = self.column(col_idx);
+        let ac = self.column(col_idx);
         let mut tasks: Vec<&TaskFile> = self
             .tasks
             .iter()
-            .filter(|tf| tf.task.column == col)
             .filter(|tf| self.task_matches_filter(tf))
+            .filter(|tf| self.task_belongs_to(&tf.task, ac))
             .collect();
         // Done shows most-recently-completed first: `updated_at` is rewritten
         // on the move-into-done write, so it's a stable proxy for completion
         // time. Other columns keep their priority order (the natural order of
         // `self.tasks`). Stable sort → equal timestamps preserve that order,
         // so identical-state polls don't reshuffle / flicker.
-        if col == Column::Done {
+        if ac.category == StatusCategory::Done {
             tasks.sort_by(|a, b| b.task.updated_at.cmp(&a.task.updated_at));
         }
         tasks
+    }
+
+    /// True when `task` lives in the All-mode column `ac` — i.e. its
+    /// workflow matches and its column resolves to `ac.status_name`
+    /// inside that workflow. Tasks whose declared workflow is missing
+    /// from `self.workflows` are treated as belonging to the default
+    /// workflow, so they still show up somewhere instead of vanishing.
+    fn task_belongs_to(&self, task: &Task, ac: &WorkflowColumn) -> bool {
+        let task_wf_name = task.workflow_or_default();
+        let resolved_wf_name = if self.workflows.iter().any(|w| w.name == task_wf_name) {
+            task_wf_name
+        } else {
+            DEFAULT_WORKFLOW_NAME
+        };
+        if resolved_wf_name != ac.workflow {
+            return false;
+        }
+        let Some(wf) = self.workflows.iter().find(|w| w.name == ac.workflow) else {
+            return false;
+        };
+        resolve_task_status(task, wf) == ac.status_name
     }
 
     /// True when `tf` passes the active worker filter. With no filter
@@ -323,6 +412,19 @@ impl KanbanApp {
             .ok()
             .and_then(|s| s.worker_filter)
             .map(|s| WorkerFilter::from_disk(&s));
+        // Workflows drive the All-mode column layout. A broken
+        // `workflows/<name>.yaml` surfaces as a status_line warning and
+        // we fall back to the canonical default so the board still
+        // paints — better than a blank screen while the user fixes the
+        // YAML.
+        self.workflows = match shelbi_state::list_workflows(&self.project_name) {
+            Ok(wfs) => wfs,
+            Err(e) => {
+                self.status_line = format!("workflow load failed: {e}");
+                vec![default_workflow()]
+            }
+        };
+        self.all_columns = workflow_columns(&self.workflows);
         match shelbi_state::list_tasks(&self.project_name) {
             Ok(tasks) => {
                 self.tasks = tasks;
@@ -512,8 +614,9 @@ impl KanbanApp {
     }
 
     pub fn nav_left(&mut self) {
+        let n = self.all_columns.len().max(1);
         if self.selected_column == 0 {
-            self.selected_column = Column::ALL.len() - 1;
+            self.selected_column = n - 1;
         } else {
             self.selected_column -= 1;
         }
@@ -521,7 +624,8 @@ impl KanbanApp {
     }
 
     pub fn nav_right(&mut self) {
-        self.selected_column = (self.selected_column + 1) % Column::ALL.len();
+        let n = self.all_columns.len().max(1);
+        self.selected_column = (self.selected_column + 1) % n;
         self.clamp_selection();
     }
 
@@ -545,16 +649,18 @@ impl KanbanApp {
         self.selected_row = (self.selected_row + 1) % n;
     }
 
-    /// Shove the selected card one column to the left, wrapping at backlog.
-    /// Keeps focus on the moved card in its new column.
+    /// Shove the selected card one column to the left **within its
+    /// current workflow**, wrapping at the workflow's first status.
+    /// Cards never jump between workflows here — moving a card carries
+    /// its `task.workflow` along, so wrapping inside the workflow
+    /// matches the semantic the user expects.
     pub fn move_card_left(&mut self) {
         let Some(id) = self.selected_task().map(|tf| tf.task.id.clone()) else {
             return;
         };
-        let new_col_idx = if self.selected_column == 0 {
-            Column::ALL.len() - 1
-        } else {
-            self.selected_column - 1
+        let Some(new_col_idx) = self.adjacent_column_in_same_workflow(self.selected_column, false)
+        else {
+            return;
         };
         self.move_card(&id, new_col_idx);
     }
@@ -563,12 +669,59 @@ impl KanbanApp {
         let Some(id) = self.selected_task().map(|tf| tf.task.id.clone()) else {
             return;
         };
-        let new_col_idx = (self.selected_column + 1) % Column::ALL.len();
+        let Some(new_col_idx) = self.adjacent_column_in_same_workflow(self.selected_column, true)
+        else {
+            return;
+        };
         self.move_card(&id, new_col_idx);
     }
 
+    /// Find the index of the slot immediately before/after `from_idx`
+    /// that belongs to the same workflow, wrapping around within that
+    /// workflow's contiguous slice. Returns `None` when the workflow
+    /// has only one status (nowhere to move to) or `from_idx` is out
+    /// of range.
+    fn adjacent_column_in_same_workflow(
+        &self,
+        from_idx: usize,
+        forward: bool,
+    ) -> Option<usize> {
+        let from = self.all_columns.get(from_idx)?;
+        // Collect the indices of every column belonging to the same
+        // workflow. `all_columns` keeps each workflow's statuses
+        // contiguous (see `workflow_columns`) so this is a tight
+        // range in practice, but iterating defensively keeps us
+        // correct if the invariant ever slips.
+        let same_wf: Vec<usize> = self
+            .all_columns
+            .iter()
+            .enumerate()
+            .filter(|(_, c)| c.workflow == from.workflow)
+            .map(|(i, _)| i)
+            .collect();
+        if same_wf.len() <= 1 {
+            return None;
+        }
+        let pos = same_wf.iter().position(|&i| i == from_idx)?;
+        let next = if forward {
+            (pos + 1) % same_wf.len()
+        } else if pos == 0 {
+            same_wf.len() - 1
+        } else {
+            pos - 1
+        };
+        Some(same_wf[next])
+    }
+
     fn move_card(&mut self, id: &str, new_col_idx: usize) {
-        let new_col = self.column(new_col_idx);
+        // `shelbi_state::move_task` still takes the legacy 5-column
+        // enum; map the workflow column's semantic category back to
+        // the matching Column so the on-disk task file lands in the
+        // right bucket. For default-workflow status names this is a
+        // pure identity; for custom workflows the category is the
+        // bridge (`Plans/workflows.md` §1).
+        let target_col = self.column(new_col_idx).clone();
+        let new_col = category_to_column(target_col.category);
         // Lifecycle hook: when a move actually transitions a task INTO
         // `in_progress`, cut its branch on the hub (depends_on aware) and
         // persist `branch:` first — see `shelbi_orchestrator::lifecycle`.
@@ -615,7 +768,7 @@ impl KanbanApp {
                 return;
             }
         }
-        self.status_line = format!("{id} → {new_col}");
+        self.status_line = format!("{id} → {}", target_col.status_name);
         self.refresh();
         // Follow the card.
         self.selected_column = new_col_idx;
@@ -759,17 +912,20 @@ fn filter_chip_text(app: &KanbanApp) -> String {
 }
 
 fn render_columns(f: &mut Frame, app: &KanbanApp, hits: &mut Vec<CardHit>, area: Rect) {
-    // Equal-width columns. With 5 columns at 20% each you get good
-    // proportions down to ~50 cols wide; below that things squeeze, but
-    // ratatui will still render — just less readable.
+    // Equal-width columns across however many `(workflow, status)`
+    // pairs are loaded — `Ratio(1, n)` gives every slot the same
+    // fraction. Below ~10 col-wide slots things squeeze, but ratatui
+    // will still render, just less readable.
+    let n = app.all_columns.len().max(1) as u32;
     let slots = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints(vec![Constraint::Ratio(1, 5); 5])
+        .constraints(vec![Constraint::Ratio(1, n); n as usize])
         .split(area);
 
     let columns = app.task_columns();
+    let show_workflow_label = app.workflows.len() > 1;
     for (i, slot) in slots.iter().enumerate() {
-        render_column(f, app, i, *slot, &columns, hits);
+        render_column(f, app, i, *slot, &columns, hits, show_workflow_label);
     }
 }
 
@@ -780,36 +936,60 @@ fn render_column(
     area: Rect,
     columns: &HashMap<String, Column>,
     hits: &mut Vec<CardHit>,
+    show_workflow_label: bool,
 ) {
-    let column = app.column(col_idx);
+    let column = app.column(col_idx).clone();
     let tasks = app.column_tasks(col_idx);
     let focused = col_idx == app.selected_column;
 
+    let header_color = category_color(column.category);
     let header_style = if focused {
         Style::default()
-            .fg(column_color(column))
+            .fg(header_color)
             .add_modifier(Modifier::BOLD | Modifier::UNDERLINED)
     } else {
-        Style::default().fg(column_color(column))
+        Style::default().fg(header_color)
     };
     let title_line = Line::from(vec![
-        Span::styled(column_label(column), header_style),
+        Span::styled(column_label(&column.status_name), header_style),
         Span::styled(
             format!(" ({})", tasks.len()),
             Style::default().fg(Color::DarkGray),
         ),
     ]);
 
+    // Reserve a 1-line subscript under the status header when more than
+    // one workflow is loaded, so the user can tell which workflow each
+    // column belongs to. Skip the line entirely for single-workflow
+    // projects so the layout matches the legacy 5-column view exactly.
+    let header_rows = if show_workflow_label { 2 } else { 1 };
+
     // Manual title/list split — keeps hit-test geometry unambiguous (no
     // dependence on Block.inner behavior with title + Borders::NONE).
     let chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Length(1), Constraint::Min(0)])
+        .constraints([Constraint::Length(header_rows), Constraint::Min(0)])
         .split(area);
     let header_area = chunks[0];
     let list_area = chunks[1];
 
-    f.render_widget(Paragraph::new(title_line), header_area);
+    if show_workflow_label {
+        let split = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Length(1), Constraint::Length(1)])
+            .split(header_area);
+        f.render_widget(Paragraph::new(title_line), split[0]);
+        let label = truncate(&column.workflow, area.width.saturating_sub(1) as usize);
+        f.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                label,
+                Style::default().fg(Color::DarkGray).add_modifier(Modifier::ITALIC),
+            ))),
+            split[1],
+        );
+    } else {
+        f.render_widget(Paragraph::new(title_line), header_area);
+    }
 
     // Reserve a 2-char right gutter so adjacent cells don't visually
     // collide; List doesn't clip Line spans on its own.
@@ -1061,24 +1241,42 @@ fn dropdown_row_text(opt: &DropdownOption) -> String {
     format!("{} ({})", label, opt.count)
 }
 
-fn column_label(c: Column) -> &'static str {
-    match c {
-        Column::Backlog => "BACKLOG",
-        Column::Todo => "TO DO",
-        Column::InProgress => "IN PROGRESS",
-        Column::Review => "REVIEW",
-        Column::Done => "DONE",
+/// Header text for a workflow column. The canonical 5-status names get
+/// the familiar uppercase labels (`BACKLOG`, `IN PROGRESS`, …); custom
+/// status names fall through to a generic uppercase rendering so a
+/// `Design` status renders as `DESIGN` without the renderer needing a
+/// per-workflow lookup table.
+fn column_label(status_name: &str) -> String {
+    match status_name {
+        "Backlog" => "BACKLOG".to_string(),
+        "Todo" => "TO DO".to_string(),
+        "InProgress" => "IN PROGRESS".to_string(),
+        "Review" => "REVIEW".to_string(),
+        "Done" => "DONE".to_string(),
+        other => other.to_uppercase(),
     }
 }
 
-fn column_color(c: Column) -> Color {
-    match c {
-        Column::Backlog => Color::Gray,
-        Column::Todo => Color::Blue,
-        Column::InProgress => Color::Yellow,
-        Column::Review => Color::Magenta,
-        Column::Done => Color::Green,
+/// Header colour for a column. Driven by [`StatusCategory`] so a
+/// renamed Review-step column (e.g. a workflow's `QA` status with
+/// `category: handoff`) still gets the same magenta the canonical
+/// Review column has — generic code keys off category, not name.
+fn category_color(category: StatusCategory) -> Color {
+    match category {
+        StatusCategory::Backlog => Color::Gray,
+        StatusCategory::Ready => Color::Blue,
+        StatusCategory::Active => Color::Yellow,
+        StatusCategory::Handoff => Color::Magenta,
+        StatusCategory::Done => Color::Green,
     }
+}
+
+/// Per-Column header colour, retained for spots (the popover header,
+/// the dep-list badges) that still take a `Column` directly. Routes
+/// through [`category_color`] so the canonical 5-status palette stays
+/// the single source of truth.
+fn column_color(c: Column) -> Color {
+    category_color(c.category())
 }
 
 fn truncate(s: &str, max: usize) -> String {
@@ -1088,6 +1286,74 @@ fn truncate(s: &str, max: usize) -> String {
     let mut out: String = s.chars().take(max.saturating_sub(1)).collect();
     out.push('…');
     out
+}
+
+// ---------------------------------------------------------------------------
+// All-mode column builders
+
+/// Build the All-mode column list as the union of every loaded
+/// workflow's declared `(workflow, status)` pairs. Workflow order is
+/// whatever the caller passed in (`list_workflows` already sorts
+/// alphabetically); inside each workflow the statuses are emitted in
+/// their declared order — that order *is* the workflow's left-to-right
+/// column order in the YAML, so workflow authors get exactly the layout
+/// they declared.
+fn workflow_columns(workflows: &[Workflow]) -> Vec<WorkflowColumn> {
+    let mut out: Vec<WorkflowColumn> =
+        Vec::with_capacity(workflows.iter().map(|w| w.statuses.len()).sum());
+    for wf in workflows {
+        for st in &wf.statuses {
+            out.push(WorkflowColumn {
+                workflow: wf.name.clone(),
+                status_name: st.name.clone(),
+                category: st.category,
+            });
+        }
+    }
+    out
+}
+
+/// Resolve which workflow status `task` lives in. Task storage still
+/// uses the legacy [`Column`] enum on disk (`Plans/workflows.md` §10
+/// hasn't moved tasks to status-name yet), so we have to bridge.
+///
+/// Resolution order, mirroring the events log writer's behaviour:
+///
+/// 1. **Name match** — if the workflow declares a status whose name
+///    equals `task.column.default_status_name()` (Backlog / Todo /
+///    InProgress / Review / Done), use that. Covers the default
+///    workflow and any custom workflow that reuses the canonical names.
+/// 2. **Category match** — fall back to the first status in the
+///    workflow whose category equals the task's column category.
+///    Handles a custom workflow that renamed `InProgress` to `Design`
+///    (both report `StatusCategory::Active`).
+/// 3. **Canonical** — if the workflow declares no status that matches
+///    by name or category, return the canonical name unchanged. The
+///    task won't bucket cleanly, but the renderer never crashes.
+fn resolve_task_status(task: &Task, workflow: &Workflow) -> String {
+    let canonical = task.column.default_status_name();
+    if workflow.status(canonical).is_some() {
+        return canonical.to_string();
+    }
+    let cat = task.column.category();
+    if let Some(st) = workflow.statuses.iter().find(|s| s.category == cat) {
+        return st.name.clone();
+    }
+    canonical.to_string()
+}
+
+/// Map a [`StatusCategory`] back to the canonical [`Column`] enum the
+/// task storage layer still takes. The mapping is 1:1 since each
+/// category maps to exactly one default-workflow status (see the
+/// table in [`Column::category`]).
+fn category_to_column(category: StatusCategory) -> Column {
+    match category {
+        StatusCategory::Backlog => Column::Backlog,
+        StatusCategory::Ready => Column::Todo,
+        StatusCategory::Active => Column::InProgress,
+        StatusCategory::Handoff => Column::Review,
+        StatusCategory::Done => Column::Done,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1170,8 +1436,8 @@ fn popover_header(tf: &TaskFile, columns: &HashMap<String, Column>) -> Vec<Line<
     let mut lines: Vec<Line<'static>> = Vec::new();
 
     lines.push(meta_row("id", &task.id));
-    let col_label = column_label(task.column);
-    let col_span = Span::styled(col_label.to_string(), Style::default().fg(column_color(task.column)));
+    let col_label = column_label(task.column.default_status_name());
+    let col_span = Span::styled(col_label, Style::default().fg(column_color(task.column)));
     let mut col_line = vec![meta_label("column"), col_span];
     col_line.push(Span::raw("   "));
     col_line.push(meta_label("priority"));
@@ -1837,5 +2103,345 @@ mod tests {
         assert_eq!(app.dropdown_option_at(55, 1), Some(0));
         assert_eq!(app.dropdown_option_at(55, 2), Some(1));
         assert_eq!(app.dropdown_option_at(10, 1), None, "miss outside chip x range");
+    }
+
+    // ---- All-mode column rendering ---------------------------------------
+
+    /// Build a workflow inline. Keeping a builder here (rather than
+    /// loading YAML from disk) lets every All-mode test stay
+    /// hermetic — no `SHELBI_HOME` juggling.
+    fn workflow(name: &str, statuses: &[(&str, StatusCategory)]) -> Workflow {
+        Workflow {
+            name: name.into(),
+            description: None,
+            statuses: statuses
+                .iter()
+                .map(|(n, c)| shelbi_core::WorkflowStatus {
+                    name: (*n).into(),
+                    category: *c,
+                    owner: shelbi_core::Owner::Agent,
+                    description: None,
+                })
+                .collect(),
+            initial_status: None,
+            transitions: None,
+            git: None,
+            zen: None,
+        }
+    }
+
+    /// Same as `task_file_for` but lets the test pin the task's
+    /// workflow frontmatter field — All-mode bucket lookups key off
+    /// `task.workflow_or_default()`, so the workflow has to be
+    /// settable per task.
+    fn task_in_workflow(
+        id: &str,
+        column: Column,
+        workflow: Option<&str>,
+        updated: &str,
+    ) -> TaskFile {
+        let updated_at = chrono::DateTime::parse_from_rfc3339(updated)
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        TaskFile {
+            task: shelbi_core::Task {
+                id: id.to_string(),
+                title: id.to_string(),
+                column,
+                priority: 0,
+                assigned_to: None,
+                workflow: workflow.map(|s| s.to_string()),
+                branch: None,
+                depends_on: Vec::new(),
+                prefers_machine: None,
+                zen: None,
+                created_at: updated_at,
+                updated_at,
+                params: std::collections::BTreeMap::new(),
+            },
+            body: String::new(),
+        }
+    }
+
+    /// With only the canonical default workflow loaded, `all_columns`
+    /// reduces to exactly the 5 legacy columns in declared order — the
+    /// view degrades gracefully to the pre-workflows layout.
+    #[test]
+    fn workflow_columns_for_default_only_matches_legacy_five() {
+        let cols = workflow_columns(std::slice::from_ref(&default_workflow()));
+        let pairs: Vec<(&str, &str)> = cols
+            .iter()
+            .map(|c| (c.workflow.as_str(), c.status_name.as_str()))
+            .collect();
+        assert_eq!(
+            pairs,
+            vec![
+                ("default", "Backlog"),
+                ("default", "Todo"),
+                ("default", "InProgress"),
+                ("default", "Review"),
+                ("default", "Done"),
+            ]
+        );
+    }
+
+    /// Two workflows → union is the concatenation in `list_workflows`
+    /// order, with each workflow's statuses kept in declared order.
+    /// A custom `design-review` workflow appended after `default`
+    /// adds its statuses to the right of the canonical five.
+    #[test]
+    fn workflow_columns_unions_pairs_across_workflows_in_declared_order() {
+        let design = workflow(
+            "design-review",
+            &[
+                ("Backlog", StatusCategory::Backlog),
+                ("Design", StatusCategory::Active),
+                ("QA", StatusCategory::Handoff),
+                ("Done", StatusCategory::Done),
+            ],
+        );
+        let wfs = vec![default_workflow(), design];
+        let cols = workflow_columns(&wfs);
+        let pairs: Vec<(&str, &str)> = cols
+            .iter()
+            .map(|c| (c.workflow.as_str(), c.status_name.as_str()))
+            .collect();
+        assert_eq!(
+            pairs,
+            vec![
+                ("default", "Backlog"),
+                ("default", "Todo"),
+                ("default", "InProgress"),
+                ("default", "Review"),
+                ("default", "Done"),
+                ("design-review", "Backlog"),
+                ("design-review", "Design"),
+                ("design-review", "QA"),
+                ("design-review", "Done"),
+            ]
+        );
+    }
+
+    /// A task whose Column has a status-name match in its workflow
+    /// resolves directly. A task whose Column has no name match falls
+    /// back to the first status in the workflow with the same
+    /// category (the events log's bridge rule) — so a task with
+    /// `column: InProgress` and `workflow: design-review` lands in
+    /// design-review's `Design` column, not its `Backlog`.
+    #[test]
+    fn resolve_task_status_name_match_then_category_fallback() {
+        let design = workflow(
+            "design-review",
+            &[
+                ("Backlog", StatusCategory::Backlog),
+                ("Design", StatusCategory::Active),
+                ("QA", StatusCategory::Handoff),
+                ("Done", StatusCategory::Done),
+            ],
+        );
+        let t_backlog =
+            task_in_workflow("a", Column::Backlog, Some("design-review"), "2026-06-20T10:00:00Z")
+                .task;
+        let t_wip =
+            task_in_workflow("b", Column::InProgress, Some("design-review"), "2026-06-20T10:00:00Z")
+                .task;
+        let t_review =
+            task_in_workflow("c", Column::Review, Some("design-review"), "2026-06-20T10:00:00Z")
+                .task;
+        // Name match.
+        assert_eq!(resolve_task_status(&t_backlog, &design), "Backlog");
+        // Category fallback — `InProgress` is not declared by name.
+        assert_eq!(resolve_task_status(&t_wip, &design), "Design");
+        // Category fallback — `Review` is not declared by name.
+        assert_eq!(resolve_task_status(&t_review, &design), "QA");
+    }
+
+    /// `column_tasks(idx)` honours both the workflow and status fields
+    /// of the `WorkflowColumn` at `idx`. A task whose `workflow`
+    /// frontmatter is `default` only shows up in default's columns;
+    /// a task whose workflow is `design-review` only shows up in
+    /// design-review's columns. Tasks pointing at a workflow that
+    /// isn't loaded fall back to the default workflow.
+    #[test]
+    fn column_tasks_buckets_by_workflow_and_status_pair() {
+        let design = workflow(
+            "design-review",
+            &[
+                ("Backlog", StatusCategory::Backlog),
+                ("Design", StatusCategory::Active),
+                ("QA", StatusCategory::Handoff),
+                ("Done", StatusCategory::Done),
+            ],
+        );
+        let mut app = KanbanApp::new("demo");
+        app.workflows = vec![default_workflow(), design];
+        app.all_columns = workflow_columns(&app.workflows);
+        app.tasks = vec![
+            // Default-workflow tasks land in default's columns.
+            task_in_workflow("a", Column::Todo, None, "2026-06-20T10:00:00Z"),
+            task_in_workflow("b", Column::Review, Some("default"), "2026-06-20T10:00:00Z"),
+            // design-review tasks land in design-review's columns.
+            task_in_workflow(
+                "c",
+                Column::InProgress,
+                Some("design-review"),
+                "2026-06-20T10:00:00Z",
+            ),
+            task_in_workflow(
+                "d",
+                Column::Done,
+                Some("design-review"),
+                "2026-06-20T10:00:00Z",
+            ),
+            // Task pointing at a workflow that doesn't exist falls
+            // back to default — Todo lands in default's Todo column.
+            task_in_workflow("orphan", Column::Todo, Some("ghost"), "2026-06-20T10:00:00Z"),
+        ];
+
+        // default order: Backlog Todo InProgress Review Done
+        // design-review order: Backlog Design QA Done
+        // → all_columns indexes:
+        //     0 default/Backlog       5 design-review/Backlog
+        //     1 default/Todo          6 design-review/Design
+        //     2 default/InProgress    7 design-review/QA
+        //     3 default/Review        8 design-review/Done
+        //     4 default/Done
+        let ids = |idx: usize| -> Vec<&str> {
+            app.column_tasks(idx)
+                .iter()
+                .map(|t| t.task.id.as_str())
+                .collect()
+        };
+        assert_eq!(ids(0), Vec::<&str>::new(), "default/Backlog");
+        assert_eq!(ids(1), vec!["a", "orphan"], "default/Todo");
+        assert_eq!(ids(3), vec!["b"], "default/Review");
+        assert_eq!(ids(6), vec!["c"], "design-review/Design (category fallback)");
+        assert_eq!(ids(8), vec!["d"], "design-review/Done");
+    }
+
+    /// With two workflows loaded, nav_right after the last default
+    /// column lands on the first design-review column, and wraps
+    /// back to default/Backlog after the last design-review column.
+    /// `move_card_right`, on the other hand, must NEVER cross
+    /// workflow boundaries — a card in default/Done wraps back to
+    /// default/Backlog instead of jumping into design-review.
+    #[test]
+    fn nav_right_crosses_workflows_but_move_card_does_not() {
+        let design = workflow(
+            "design-review",
+            &[
+                ("Backlog", StatusCategory::Backlog),
+                ("Design", StatusCategory::Active),
+                ("QA", StatusCategory::Handoff),
+                ("Done", StatusCategory::Done),
+            ],
+        );
+        let mut app = KanbanApp::new("demo");
+        app.workflows = vec![default_workflow(), design];
+        app.all_columns = workflow_columns(&app.workflows);
+
+        // From default/Done (idx 4), nav_right → design-review/Backlog (idx 5).
+        app.selected_column = 4;
+        app.nav_right();
+        assert_eq!(app.selected_column, 5);
+        // Continue: design-review/Backlog → Design → QA → Done → wrap to 0.
+        app.nav_right();
+        app.nav_right();
+        app.nav_right();
+        assert_eq!(app.selected_column, 8, "should be on design-review/Done");
+        app.nav_right();
+        assert_eq!(app.selected_column, 0, "wraps back to default/Backlog");
+
+        // Move-card boundaries: from default/Done, move-right wraps
+        // back to default/Backlog. Test through the helper so we
+        // don't need a real task on disk.
+        assert_eq!(
+            app.adjacent_column_in_same_workflow(4, true),
+            Some(0),
+            "default/Done → default/Backlog (wrap inside workflow)"
+        );
+        assert_eq!(
+            app.adjacent_column_in_same_workflow(0, false),
+            Some(4),
+            "default/Backlog → default/Done (wrap backwards inside workflow)"
+        );
+        // Same check on the other workflow.
+        assert_eq!(
+            app.adjacent_column_in_same_workflow(8, true),
+            Some(5),
+            "design-review/Done → design-review/Backlog (wrap inside workflow)"
+        );
+    }
+
+    /// A workflow with a single status has nowhere to move-card to,
+    /// so the move-card helpers return `None` and the caller noops.
+    #[test]
+    fn adjacent_column_returns_none_for_singleton_workflow() {
+        let single = workflow("solo", &[("OnlyStatus", StatusCategory::Active)]);
+        let mut app = KanbanApp::new("demo");
+        app.workflows = vec![single];
+        app.all_columns = workflow_columns(&app.workflows);
+        assert_eq!(app.adjacent_column_in_same_workflow(0, true), None);
+        assert_eq!(app.adjacent_column_in_same_workflow(0, false), None);
+    }
+
+    /// Two workflows render side-by-side. The header for each column
+    /// shows the status name; a subscript row labels the workflow
+    /// underneath so the user can tell which `Backlog` is which.
+    /// Single-workflow projects omit the subscript so the layout
+    /// matches the legacy 5-column view exactly.
+    #[test]
+    fn rendering_two_workflows_shows_status_names_and_workflow_subscript() {
+        use ratatui::{backend::TestBackend, Terminal};
+        let design = workflow(
+            "design-review",
+            &[
+                ("Backlog", StatusCategory::Backlog),
+                ("Design", StatusCategory::Active),
+                ("QA", StatusCategory::Handoff),
+                ("Done", StatusCategory::Done),
+            ],
+        );
+        let mut app = KanbanApp::new("demo");
+        app.workflows = vec![default_workflow(), design];
+        app.all_columns = workflow_columns(&app.workflows);
+        app.tasks = vec![task_in_workflow(
+            "a",
+            Column::InProgress,
+            Some("design-review"),
+            "2026-06-20T10:00:00Z",
+        )];
+
+        // 9 columns total → keep the terminal wide so every status
+        // header has room to render its label.
+        let backend = TestBackend::new(160, 18);
+        let mut term = Terminal::new(backend).unwrap();
+        term.draw(|f| render_full(f, &mut app, f.area())).unwrap();
+
+        let buf = term.backend().buffer().clone();
+        let rendered: String = (0..buf.area.height)
+            .map(|y| {
+                (0..buf.area.width)
+                    .map(|x| buf[(x, y)].symbol().to_string())
+                    .collect::<Vec<_>>()
+                    .join("")
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        // Canonical headers (truncated to fit narrow slots when 9 columns share 160 cells).
+        assert!(rendered.contains("BACKLOG"), "BACKLOG header missing:\n{rendered}");
+        assert!(rendered.contains("DESIGN"), "DESIGN header missing:\n{rendered}");
+        assert!(rendered.contains("QA"), "QA header missing:\n{rendered}");
+        // Workflow subscript labels appear under the headers when >1
+        // workflow is loaded.
+        assert!(
+            rendered.contains("default"),
+            "default workflow subscript missing:\n{rendered}"
+        );
+        assert!(
+            rendered.contains("design-review") || rendered.contains("design-revi"),
+            "design-review subscript missing:\n{rendered}"
+        );
     }
 }
