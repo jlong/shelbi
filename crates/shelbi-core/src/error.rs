@@ -32,6 +32,9 @@ pub enum Error {
     #[error("dependency cycle: {0}")]
     DependencyCycle(String),
 
+    #[error("invalid workflow: {0}")]
+    InvalidWorkflow(String),
+
     #[error("{0}")]
     Other(String),
 }
