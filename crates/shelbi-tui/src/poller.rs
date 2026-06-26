@@ -31,6 +31,7 @@
 //! emit the markers via their `.claude/settings.json` hooks.
 
 use std::collections::HashMap;
+use std::net::{SocketAddr, TcpStream};
 use std::sync::{
     atomic::{AtomicBool, Ordering},
     Arc,
@@ -138,7 +139,10 @@ fn run_poller_loop(project_name: String, shutdown: Arc<AtomicBool>) {
         // so it lives on the supervisor rather than inside any per-worker
         // thread. The function is a no-op if heartbeat is off or not yet
         // due, and debounces against any other events.log activity.
-        maybe_emit_heartbeat(&project, &mut next_heartbeat_attempt);
+        // `online_probe` is the connectivity gate: while the box is
+        // offline the heartbeat skips silently so the feed doesn't fill
+        // with no-op lines during a network drop.
+        maybe_emit_heartbeat(&project, &mut next_heartbeat_attempt, online_probe);
 
         // Supervisor cadence is fixed at 5s — independent of
         // `worker_poll_interval_secs`, which governs each per-worker
@@ -198,7 +202,7 @@ fn run_worker_poll_loop(
 }
 
 /// Consider emitting one heartbeat for `project`. Called once per poller
-/// tick. Three rules from the spec land here:
+/// tick. Four rules from the spec land here:
 ///
 /// 1. **Off** — `HeartbeatConfig::Off` skips every tick and also clears
 ///    any pending schedule so a project that toggles `heartbeat: off`
@@ -212,7 +216,18 @@ fn run_worker_poll_loop(
 ///    Otherwise emit. Our own heartbeat counts as activity, so on a
 ///    fully quiet board the next emission lands exactly one interval
 ///    after the previous one.
-fn maybe_emit_heartbeat(project: &Project, next_attempt: &mut Option<Instant>) {
+/// 4. **Paused while offline** — if `is_online()` returns false at the
+///    moment of emission, skip silently. The schedule still advances by
+///    one interval so we don't probe (and pay its timeout) every
+///    supervisor tick, and emission resumes naturally on the first
+///    interval after connectivity is back. The "avoid noise" framing
+///    is deliberate: a heartbeat during an offline window communicates
+///    nothing — the only consumer (the orchestrator) can't act on it.
+fn maybe_emit_heartbeat(
+    project: &Project,
+    next_attempt: &mut Option<Instant>,
+    is_online: impl Fn() -> bool,
+) {
     let Some(interval) = project.heartbeat.interval() else {
         // Heartbeat off — clear the schedule so flipping it back on
         // re-seeds from the next tick rather than firing a stale due.
@@ -238,7 +253,7 @@ fn maybe_emit_heartbeat(project: &Project, next_attempt: &mut Option<Instant>) {
     // events.log within the last interval. We read mtime fresh on each
     // attempt — cheap (one stat) and avoids tracking writes ourselves.
     let recent_activity = events_log_modified_within(interval);
-    if !recent_activity {
+    if !recent_activity && is_online() {
         if let Err(e) = append_heartbeat_event(&project.name) {
             tracing::warn!(
                 project = %project.name,
@@ -249,6 +264,21 @@ fn maybe_emit_heartbeat(project: &Project, next_attempt: &mut Option<Instant>) {
     }
 
     *next_attempt = Some(now + interval);
+}
+
+/// Default connectivity probe used by the poller. TCP-connects to
+/// `1.1.1.1:443` with a 1 s timeout — Cloudflare's anycast resolver, a
+/// raw IP so we don't trip on local DNS being the first thing to die on
+/// a captive portal. A successful connect (the TLS handshake never
+/// runs) is enough signal that the box has an upstream route.
+///
+/// Runs at most once per `heartbeat` interval (default 3 min) on the
+/// supervisor thread, so the 1 s blocking cost only matters when we're
+/// already offline — the round-trip on a healthy connection is well
+/// under 50 ms.
+fn online_probe() -> bool {
+    let addr: SocketAddr = ([1, 1, 1, 1], 443).into();
+    TcpStream::connect_timeout(&addr, Duration::from_secs(1)).is_ok()
 }
 
 /// True iff `events.log` exists and was modified within the last
@@ -959,7 +989,7 @@ mod tests {
 
         let mut next: Option<Instant> = None;
         // First call seeds the schedule and returns without writing.
-        maybe_emit_heartbeat(&project, &mut next);
+        maybe_emit_heartbeat(&project, &mut next, || true);
         assert!(next.is_some(), "first tick must seed the schedule");
         let log = shelbi_state::events_log_path().unwrap();
         assert!(
@@ -970,7 +1000,7 @@ mod tests {
         // Wait past the interval, with no other writer touching the
         // log, and the next attempt emits one line.
         std::thread::sleep(Duration::from_millis(20));
-        maybe_emit_heartbeat(&project, &mut next);
+        maybe_emit_heartbeat(&project, &mut next, || true);
         let body = std::fs::read_to_string(&log).unwrap();
         let lines: Vec<&str> = body.lines().filter(|l| l.contains("heartbeat")).collect();
         assert_eq!(lines.len(), 1, "expected one heartbeat line, got: {body:?}");
@@ -1010,13 +1040,13 @@ mod tests {
 
         let mut next: Option<Instant> = None;
         // Seed.
-        maybe_emit_heartbeat(&project, &mut next);
+        maybe_emit_heartbeat(&project, &mut next, || true);
         // Force the next attempt to be due immediately, but write
         // unrelated activity first so the debounce trips.
         shelbi_state::append_worker_event("alpha", None, WorkerState::Working).unwrap();
         next = Some(Instant::now());
 
-        maybe_emit_heartbeat(&project, &mut next);
+        maybe_emit_heartbeat(&project, &mut next, || true);
 
         let log = shelbi_state::events_log_path().unwrap();
         let body = std::fs::read_to_string(&log).unwrap();
@@ -1054,11 +1084,71 @@ mod tests {
         project.heartbeat = shelbi_core::HeartbeatConfig::Off;
 
         let mut next = Some(Instant::now() - Duration::from_secs(60));
-        maybe_emit_heartbeat(&project, &mut next);
+        maybe_emit_heartbeat(&project, &mut next, || true);
         assert!(next.is_none(), "off must clear the pending schedule");
 
         let log = shelbi_state::events_log_path().unwrap();
         assert!(!log.exists() || std::fs::read_to_string(&log).unwrap().is_empty());
+
+        std::env::remove_var("SHELBI_HOME");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn maybe_emit_heartbeat_pauses_while_offline_then_resumes_when_back_online() {
+        // Disconnected box: probe returns false on every due tick, so
+        // the feed must stay silent — no padding lines during the
+        // offline window. The schedule still advances each attempt, and
+        // once the probe flips back to true the next due tick emits.
+        let _g = crate::test_support::ENV_LOCK.lock().unwrap();
+        let home = std::env::temp_dir().join(format!(
+            "shelbi-poller-hb-offline-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&home).unwrap();
+        std::env::set_var("SHELBI_HOME", &home);
+
+        let work_dir = home.join("repo");
+        std::fs::create_dir_all(&work_dir).unwrap();
+        let mut project = local_project(&work_dir);
+        project.heartbeat = shelbi_core::HeartbeatConfig::Every(Duration::from_millis(1));
+
+        let mut next: Option<Instant> = None;
+        // Seed, then drive several "due" attempts while offline.
+        maybe_emit_heartbeat(&project, &mut next, || false);
+        for _ in 0..3 {
+            std::thread::sleep(Duration::from_millis(5));
+            maybe_emit_heartbeat(&project, &mut next, || false);
+        }
+        let log = shelbi_state::events_log_path().unwrap();
+        let body = if log.exists() {
+            std::fs::read_to_string(&log).unwrap()
+        } else {
+            String::new()
+        };
+        let offline_hb_lines: Vec<&str> =
+            body.lines().filter(|l| l.contains("heartbeat")).collect();
+        assert!(
+            offline_hb_lines.is_empty(),
+            "offline windows must not emit heartbeats; log: {body:?}"
+        );
+
+        // Internet returns. The next due tick (past the interval and
+        // with no recent activity) emits one heartbeat line.
+        std::thread::sleep(Duration::from_millis(5));
+        maybe_emit_heartbeat(&project, &mut next, || true);
+        let body = std::fs::read_to_string(&log).unwrap();
+        let online_hb_lines: Vec<&str> =
+            body.lines().filter(|l| l.contains("heartbeat")).collect();
+        assert_eq!(
+            online_hb_lines.len(),
+            1,
+            "exactly one heartbeat after reconnect, got: {body:?}"
+        );
 
         std::env::remove_var("SHELBI_HOME");
         let _ = std::fs::remove_dir_all(&home);

@@ -82,6 +82,11 @@ carries:
   active board never sees padding lines.
 - Crash-safe: a poller restart waits one full interval before its first
   attempt, rather than firing the slot it missed.
+- Paused while offline: each due tick TCP-probes `1.1.1.1:443` with a
+  one-second timeout, and skips emission if the probe fails. Heartbeats
+  resume on the first interval after connectivity is restored. The
+  motivation is that the orchestrator can't act on a heartbeat during a
+  network drop, so the line would only fill the feed with noise.
 
 Heartbeats exist for the orchestrator's `events tail --follow` watch.
 When nothing's happening on the board, the watch sits idle for as long
