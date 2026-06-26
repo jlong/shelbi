@@ -102,7 +102,7 @@ A project can have any number of workflow files. Examples:
 
 Workflows are **configuration**, not a UI surface — they're authored as YAML and surfaced only through (a) the `shelbi workflow ...` CLI (§9) and (b) a **workflow filter** on the existing Tasks Kanban board (§7). There is no dedicated "Workflows" view in the TUI.
 
-**By default the filter is `All` — every task across every workflow is visible.** In `All` mode the column set is the five **status categories** from §1 (Backlog / Ready / Active / Handoff / Done), since every status in every workflow maps to one of them. Cards from different workflows can sit in the same column; a small workflow label on each card (Phase 2) tells them apart. Selecting a specific workflow from the filter swaps the columns to that workflow's native status names and hides tasks from other workflows.
+**By default the filter is `All` — every task across every workflow is visible.** In `All` mode the column set is the six **status categories** from §1 (Backlog / Ready / Active / Handoff / Done / Archived), since every status in every workflow maps to one of them. Cards from different workflows can sit in the same column; a small workflow label on each card (Phase 2) tells them apart. Selecting a specific workflow from the filter swaps the columns to that workflow's native status names and hides tasks from other workflows.
 
 ### 5. Per-task workflow assignment
 
@@ -138,7 +138,7 @@ The Tasks Kanban board gains a **workflow filter** at the top:
 Kanban  ·  [Workflow: All ▾]                                  (q to quit, ? for help)
 ```
 
-The filter defaults to **`All`** — every task across every workflow is visible, with columns drawn from the five status categories (Backlog / Ready / Active / Handoff / Done). Selecting a specific workflow switches columns to that workflow's native status names and narrows the cards to only that workflow's tasks. There is no separate "Workflows" view; workflows are configuration (see §4).
+The filter defaults to **`All`** — every task across every workflow is visible, with columns drawn from the six status categories (Backlog / Ready / Active / Handoff / Done / Archived). Selecting a specific workflow switches columns to that workflow's native status names and narrows the cards to only that workflow's tasks. There is no separate "Workflows" view; workflows are configuration (see §4).
 
 **Every column is always shown**, in declaration order — the full structure stays visible at a glance, regardless of where work currently sits. Empty columns aren't hidden; they're collapsed. The same rules apply in both modes: in `All`, the columns are the five status categories; in a workflow-specific filter, they're that workflow's declared statuses.
 
