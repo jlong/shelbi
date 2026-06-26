@@ -48,7 +48,7 @@ description: |             # surfaces in CLI listings + TUI workflow picker
 statuses:
   - name: Backlog          # display label
     category: backlog
-    owner: user            # user | agent | either
+    owner: user            # user | agent
     description: |
       Untriaged work. The user moves things into Todo when ready.
 
