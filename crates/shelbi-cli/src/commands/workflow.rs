@@ -122,11 +122,12 @@ fn edit_cmd(project: &str, name: &str) -> Result<()> {
 }
 
 /// Write a starter workflow YAML for `name`. The shape is the canonical
-/// five-status default; only the workflow id changes so the file's
-/// `name:` matches its basename (the convention the loader documents).
-/// For non-default names we drop the description — the default's copy
-/// ("standard one-track flow…") would misrepresent a freshly-named
-/// workflow whose author hasn't written a real description yet.
+/// six-status default (the five historical lanes plus `Canceled`); only
+/// the workflow id changes so the file's `name:` matches its basename
+/// (the convention the loader documents). For non-default names we drop
+/// the description — the default's copy ("standard one-track flow…")
+/// would misrepresent a freshly-named workflow whose author hasn't
+/// written a real description yet.
 fn write_starter(path: &Path, name: &str) -> Result<()> {
     let mut wf: Workflow = default_workflow();
     wf.name = name.to_string();
