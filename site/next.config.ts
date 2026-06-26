@@ -11,6 +11,11 @@ const nextConfig: NextConfig = {
         destination: "/docs/concepts/workflows",
         permanent: true,
       },
+      {
+        source: "/docs/concepts/zen-mode",
+        destination: "/docs/features/zen-mode",
+        permanent: true,
+      },
     ];
   },
 };
