@@ -74,14 +74,14 @@ Flags you'll reach for occasionally:
 ```bash
 shelbi task add "Fix login bug" \
   --id fix-login \
-  --column todo \
+  --status todo \
   --description "Cookie domain mismatch breaks the SSO redirect." \
   --depends-on auth-refactor \
   --prefers-machine devbox
 ```
 
 - `--id` — override the auto-slug.
-- `--column` — drop straight into todo (or any other column).
+- `--status` — drop straight into todo (or any other column).
 - `--description` — fill in the task body now instead of editing later.
 - `--depends-on` — repeat for multiple dependencies. The orchestrator
   skips a todo card until everything it depends on is in `done`.

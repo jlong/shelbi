@@ -24,14 +24,16 @@ use super::require_project;
 pub enum TaskCmd {
     /// Create a new task. Defaults to the backlog column.
     Add(AddArgs),
-    /// List tasks (all columns, or one with `--column`).
+    /// List tasks (all statuses, or one with `--status`).
     List {
-        #[arg(long)]
-        column: Option<String>,
+        /// Restrict to a single status. `--column` accepted as a hidden
+        /// alias for one release while older scripts catch up.
+        #[arg(long = "status", alias = "column", value_name = "STATUS")]
+        status: Option<String>,
         /// Show only unblocked todo items, in priority order. Useful for
         /// orchestrator agents and for users planning next work. Mutually
-        /// exclusive with `--column`.
-        #[arg(long, conflicts_with = "column")]
+        /// exclusive with `--status`.
+        #[arg(long, conflicts_with = "status")]
         ready: bool,
         /// Restrict to tasks pinned to the named workflow. Tasks with no
         /// explicit `workflow:` field are treated as the canonical
@@ -44,10 +46,10 @@ pub enum TaskCmd {
     Show { id: String },
     /// Edit a task's dependency list.
     Depends(DependsArgs),
-    /// Move a task to another column.
+    /// Move a task to another status.
     Move {
         id: String,
-        #[arg(long, value_name = "COLUMN")]
+        #[arg(long, value_name = "STATUS")]
         to: String,
         /// Reason string recorded in `~/.shelbi/events.log`. The
         /// orchestrator parses this to identify auto-dispatch moves vs.
@@ -96,9 +98,10 @@ pub struct AddArgs {
     /// Override the auto-generated id (slugified from the title).
     #[arg(long)]
     pub id: Option<String>,
-    /// Initial column. Defaults to `backlog`.
-    #[arg(long, default_value = "backlog")]
-    pub column: String,
+    /// Initial status. Defaults to `backlog`. `--column` accepted as a
+    /// hidden alias for one release while older scripts catch up.
+    #[arg(long = "status", alias = "column", default_value = "backlog", value_name = "STATUS")]
+    pub status: String,
     /// Optional description; if omitted, the body starts empty (use
     /// `shelbi task edit` to fill it in).
     #[arg(long, short)]
@@ -162,8 +165,8 @@ pub fn run(project_opt: Option<String>, cmd: TaskCmd) -> Result<()> {
     let project = require_project(project_opt)?;
     match cmd {
         TaskCmd::Add(args) => add(&project, args),
-        TaskCmd::List { column, ready, workflow } => {
-            list(&project, column.as_deref(), ready, workflow.as_deref())
+        TaskCmd::List { status, ready, workflow } => {
+            list(&project, status.as_deref(), ready, workflow.as_deref())
         }
         TaskCmd::Show { id } => show(&project, &id),
         TaskCmd::Depends(args) => depends(&project, args),
@@ -180,7 +183,7 @@ pub fn run(project_opt: Option<String>, cmd: TaskCmd) -> Result<()> {
 }
 
 fn add(project: &str, args: AddArgs) -> Result<()> {
-    let column = Column::from_str(&args.column).map_err(|e| anyhow!(e))?;
+    let column = Column::from_str(&args.status).map_err(|e| anyhow!(e))?;
     let id = match args.id {
         Some(id) => {
             validate_task_id(&id).map_err(|e| anyhow!(e))?;
@@ -245,7 +248,7 @@ fn dedup_preserving_order(items: Vec<String>) -> Vec<String> {
 
 fn list(
     project: &str,
-    column_filter: Option<&str>,
+    status_filter: Option<&str>,
     ready: bool,
     workflow_filter: Option<&str>,
 ) -> Result<()> {
@@ -278,7 +281,7 @@ fn list(
         return Ok(());
     }
 
-    let filter = column_filter
+    let filter = status_filter
         .map(Column::from_str)
         .transpose()
         .map_err(|e| anyhow!(e))?;

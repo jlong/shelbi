@@ -29,13 +29,13 @@ shelbi task add [OPTIONS] <TITLE>
 ```
 
 Create a new task. Lands in `backlog` by default — your inbox for triage.
-Pass `--column todo` to skip triage when you're already sure.
+Pass `--status todo` to skip triage when you're already sure.
 
 | Flag | Type | Default | Description |
 | --- | --- | --- | --- |
 | `<TITLE>` | string | — | Human-readable title (positional, required). |
 | `--id <ID>` | string | slug of title | Override the auto-generated id. |
-| `--column <COLUMN>` | string | `backlog` | Initial column. |
+| `--status <STATUS>` | string | `backlog` | Initial status. `--column` is a deprecated alias kept for one release. |
 | `-d, --description <DESCRIPTION>` | string | empty | Task body. Use `shelbi task edit` later if omitted. |
 | `--depends-on <ID>` | string (repeatable) | — | Block this task on another. Repeat for multiple deps. |
 | `--prefers-machine <NAME>` | string | — | Hint for the orchestrator to route this task to a worker on a specific machine. |
@@ -49,16 +49,16 @@ shelbi task list [OPTIONS]
 ```
 
 Print every task grouped by column, in priority order within each column. Use
-`--column <NAME>` to scope to one column, or `--ready` to see only unblocked
+`--status <NAME>` to scope to one status, or `--ready` to see only unblocked
 `todo` items in dispatch order — that's the orchestrator's view of "what
 should I assign next." `--workflow <NAME>` narrows either view to a single
 workflow.
 
 | Flag | Type | Default | Description |
 | --- | --- | --- | --- |
-| `--column <COLUMN>` | string | — | Restrict to a single column. |
-| `--ready` | flag | off | Show only unblocked `todo` items, in priority order. Mutually exclusive with `--column`. |
-| `--workflow <NAME>` | string | — | Restrict to tasks pinned to the named workflow. Tasks with no explicit `workflow:` field are treated as the canonical `default` workflow. Composes with `--column` and `--ready`. |
+| `--status <STATUS>` | string | — | Restrict to a single status. `--column` is a deprecated alias kept for one release. |
+| `--ready` | flag | off | Show only unblocked `todo` items, in priority order. Mutually exclusive with `--status`. |
+| `--workflow <NAME>` | string | — | Restrict to tasks pinned to the named workflow. Tasks with no explicit `workflow:` field are treated as the canonical `default` workflow. Composes with `--status` and `--ready`. |
 
 ## show
 
@@ -86,10 +86,10 @@ Edit a task's dependency list without opening the file.
 ## move
 
 ```text
-shelbi task move --to <COLUMN> [OPTIONS] <ID>
+shelbi task move --to <STATUS> [OPTIONS] <ID>
 ```
 
-Move a task between columns. Promoting a task to `todo` is the start signal
+Move a task between statuses. Promoting a task to `todo` is the start signal
 for the orchestrator — it will pick a free worker and call `task start` on
 its own.
 
@@ -103,7 +103,7 @@ the YAML matches `in_progress` on the CLI).
 
 | Flag | Type | Default | Description |
 | --- | --- | --- | --- |
-| `--to <COLUMN>` | string | — | Destination column (required). Must be a status declared by the task's workflow. |
+| `--to <STATUS>` | string | — | Destination status (required). Must be a status declared by the task's workflow. |
 | `--reason <REASON>` | string | `user:cli` | Reason tag recorded in `~/.shelbi/events.log`. The orchestrator parses this to tell auto-dispatches apart from user actions. |
 
 ## assign
