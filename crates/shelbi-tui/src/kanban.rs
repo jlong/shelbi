@@ -37,6 +37,111 @@ pub struct KanbanApp {
     /// by the renderer and read by the mouse-click handler to map a click
     /// back to a (column, row) pair.
     pub card_hits: Vec<CardHit>,
+    /// Declared worker names from project.yaml, in YAML order. Reloaded
+    /// on every refresh so an edited project file shows up without a
+    /// restart. Empty when the project YAML is missing.
+    pub workers: Vec<String>,
+    /// Active filter — `None` means "All workers".
+    /// [`WorkerFilter::Unassigned`] keeps only cards with no `assigned_to`.
+    /// Mirrored to `state.json::worker_filter` so the chip survives a
+    /// respawn or project switch.
+    pub worker_filter: Option<WorkerFilter>,
+    /// When `Some`, the worker filter dropdown is open; carries the
+    /// in-flight cursor position so navigation can move through the
+    /// options list. Selection only commits on Enter/Space.
+    pub worker_dropdown: Option<WorkerDropdown>,
+    /// Screen-space rect of the filter chip in the title row, captured
+    /// each frame by the renderer so a click on the chip can open the
+    /// dropdown without keyboard.
+    pub filter_chip_hit: Option<Rect>,
+    /// Hit-test entries for the open dropdown's option rows. Empty when
+    /// the dropdown is closed.
+    pub dropdown_hits: Vec<DropdownHit>,
+}
+
+/// Worker filter applied to the visible cards. Separate from the
+/// dropdown's cursor (which can hover the same options without
+/// committing) so the active filter and the in-flight selection can't
+/// silently desync.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WorkerFilter {
+    /// Show only tasks assigned to this worker name.
+    Worker(String),
+    /// Show only tasks with no `assigned_to`. Distinct from "All" so the
+    /// user can isolate the orchestrator-untouched backlog.
+    Unassigned,
+}
+
+impl WorkerFilter {
+    /// Wire format stored in `state.json::worker_filter`. `Unassigned`
+    /// gets a sentinel string rather than its own enum variant on disk
+    /// so the schema stays a plain `Option<String>` — no migration
+    /// needed when older code reads the field.
+    pub const UNASSIGNED_SENTINEL: &'static str = "__unassigned__";
+
+    fn from_disk(s: &str) -> WorkerFilter {
+        if s == Self::UNASSIGNED_SENTINEL {
+            WorkerFilter::Unassigned
+        } else {
+            WorkerFilter::Worker(s.to_string())
+        }
+    }
+
+    fn to_disk(&self) -> String {
+        match self {
+            WorkerFilter::Worker(w) => w.clone(),
+            WorkerFilter::Unassigned => Self::UNASSIGNED_SENTINEL.to_string(),
+        }
+    }
+
+    /// Predicate against a task's `assigned_to` field.
+    pub fn matches(&self, assigned_to: Option<&str>) -> bool {
+        match self {
+            WorkerFilter::Worker(w) => assigned_to == Some(w.as_str()),
+            WorkerFilter::Unassigned => assigned_to.is_none(),
+        }
+    }
+
+    /// Short label used in the chip and the dropdown row.
+    pub fn label(&self) -> String {
+        match self {
+            WorkerFilter::Worker(w) => w.clone(),
+            WorkerFilter::Unassigned => "Unassigned".to_string(),
+        }
+    }
+}
+
+/// One entry rendered in the open dropdown — `None` is the "All
+/// workers" reset row, `Some(filter)` is a concrete filter the user can
+/// commit to. Order matches the rendered options list, so the dropdown
+/// cursor and this slice can share an index.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DropdownOption {
+    pub filter: Option<WorkerFilter>,
+    /// How many tasks currently match this option — shown in the
+    /// dropdown row as a hint. Computed at render time from the
+    /// in-memory tasks slice.
+    pub count: usize,
+}
+
+/// State carried while the worker filter dropdown is open. Lives only
+/// for the lifetime of the popover — selecting an option closes it and
+/// drops this back to `None`.
+#[derive(Debug, Clone)]
+pub struct WorkerDropdown {
+    /// Cursor row inside the options list; never out of range because
+    /// [`KanbanApp::open_worker_dropdown`] seeds it from the active
+    /// filter and the nav methods clamp.
+    pub cursor: usize,
+}
+
+/// One option row's hit-test rect. Captured each frame by the dropdown
+/// renderer so a click can map a screen coordinate back to an option
+/// index in the rendered options list.
+#[derive(Clone, Copy, Debug)]
+pub struct DropdownHit {
+    pub area: Rect,
+    pub option_idx: usize,
 }
 
 /// One rendered card's screen-space rectangle and its column/row index in
@@ -68,6 +173,11 @@ impl KanbanApp {
             status_line: String::new(),
             popover: None,
             card_hits: Vec::new(),
+            workers: Vec::new(),
+            worker_filter: None,
+            worker_dropdown: None,
+            filter_chip_hit: None,
+            dropdown_hits: Vec::new(),
         }
     }
 
@@ -156,8 +266,12 @@ impl KanbanApp {
 
     pub fn column_tasks(&self, col_idx: usize) -> Vec<&TaskFile> {
         let col = self.column(col_idx);
-        let mut tasks: Vec<&TaskFile> =
-            self.tasks.iter().filter(|tf| tf.task.column == col).collect();
+        let mut tasks: Vec<&TaskFile> = self
+            .tasks
+            .iter()
+            .filter(|tf| tf.task.column == col)
+            .filter(|tf| self.task_matches_filter(tf))
+            .collect();
         // Done shows most-recently-completed first: `updated_at` is rewritten
         // on the move-into-done write, so it's a stable proxy for completion
         // time. Other columns keep their priority order (the natural order of
@@ -167,6 +281,16 @@ impl KanbanApp {
             tasks.sort_by(|a, b| b.task.updated_at.cmp(&a.task.updated_at));
         }
         tasks
+    }
+
+    /// True when `tf` passes the active worker filter. With no filter
+    /// active everything passes; otherwise the task's `assigned_to`
+    /// must match the filter's predicate.
+    fn task_matches_filter(&self, tf: &TaskFile) -> bool {
+        match &self.worker_filter {
+            None => true,
+            Some(f) => f.matches(tf.task.assigned_to.as_deref()),
+        }
     }
 
     /// Snapshot of every task's column, for the blocked derivation. Built
@@ -185,6 +309,20 @@ impl KanbanApp {
     }
 
     pub fn refresh(&mut self) {
+        // Project YAML may be missing on a fresh project — surface an
+        // empty worker list rather than failing the refresh; the
+        // dropdown will degrade to just "All" / "Unassigned" until the
+        // project file appears.
+        self.workers = shelbi_state::load_project(&self.project_name)
+            .map(|p| p.workers.into_iter().map(|w| w.name).collect())
+            .unwrap_or_default();
+        // Filter is purely view state — a missing / unreadable
+        // state.json falls back to "All" silently. Reload every tick so
+        // a CLI or palette edit shows up without a respawn.
+        self.worker_filter = shelbi_state::read_state(&self.project_name)
+            .ok()
+            .and_then(|s| s.worker_filter)
+            .map(|s| WorkerFilter::from_disk(&s));
         match shelbi_state::list_tasks(&self.project_name) {
             Ok(tasks) => {
                 self.tasks = tasks;
@@ -194,6 +332,164 @@ impl KanbanApp {
             Err(e) => {
                 self.status_line = format!("refresh failed: {e}");
             }
+        }
+    }
+
+    /// Options shown in the worker dropdown — `All`, then each worker
+    /// in YAML order, then `Unassigned` if any task lacks an
+    /// `assigned_to`. Counts are computed against the unfiltered task
+    /// list so a worker with zero matching cards still appears
+    /// (otherwise the user couldn't pick it to clear a previously-set
+    /// filter on another worker).
+    pub fn dropdown_options(&self) -> Vec<DropdownOption> {
+        let mut opts: Vec<DropdownOption> = Vec::with_capacity(self.workers.len() + 2);
+        opts.push(DropdownOption {
+            filter: None,
+            count: self.tasks.len(),
+        });
+        for w in &self.workers {
+            let count = self
+                .tasks
+                .iter()
+                .filter(|tf| tf.task.assigned_to.as_deref() == Some(w.as_str()))
+                .count();
+            opts.push(DropdownOption {
+                filter: Some(WorkerFilter::Worker(w.clone())),
+                count,
+            });
+        }
+        let unassigned_count = self
+            .tasks
+            .iter()
+            .filter(|tf| tf.task.assigned_to.is_none())
+            .count();
+        if unassigned_count > 0 {
+            opts.push(DropdownOption {
+                filter: Some(WorkerFilter::Unassigned),
+                count: unassigned_count,
+            });
+        }
+        opts
+    }
+
+    /// Index of the option that matches the active filter, used to seed
+    /// the dropdown cursor when it opens. Falls back to the "All" row
+    /// (idx 0) if the active filter no longer appears in the options —
+    /// e.g. a worker was removed from project.yaml while a filter on it
+    /// was still persisted.
+    fn current_filter_idx(&self, opts: &[DropdownOption]) -> usize {
+        opts.iter()
+            .position(|o| o.filter == self.worker_filter)
+            .unwrap_or(0)
+    }
+
+    pub fn worker_dropdown_is_open(&self) -> bool {
+        self.worker_dropdown.is_some()
+    }
+
+    pub fn open_worker_dropdown(&mut self) {
+        let opts = self.dropdown_options();
+        let cursor = self.current_filter_idx(&opts);
+        self.worker_dropdown = Some(WorkerDropdown { cursor });
+    }
+
+    pub fn close_worker_dropdown(&mut self) {
+        self.worker_dropdown = None;
+    }
+
+    pub fn toggle_worker_dropdown(&mut self) {
+        if self.worker_dropdown_is_open() {
+            self.close_worker_dropdown();
+        } else {
+            self.open_worker_dropdown();
+        }
+    }
+
+    pub fn dropdown_nav_up(&mut self) {
+        let n = self.dropdown_options().len();
+        if n == 0 {
+            return;
+        }
+        if let Some(d) = self.worker_dropdown.as_mut() {
+            d.cursor = if d.cursor == 0 { n - 1 } else { d.cursor - 1 };
+        }
+    }
+
+    pub fn dropdown_nav_down(&mut self) {
+        let n = self.dropdown_options().len();
+        if n == 0 {
+            return;
+        }
+        if let Some(d) = self.worker_dropdown.as_mut() {
+            d.cursor = (d.cursor + 1) % n;
+        }
+    }
+
+    /// Commit the cursor's option as the active filter and close the
+    /// dropdown. Persists to `state.json` so the chip survives a
+    /// respawn.
+    pub fn dropdown_select(&mut self) {
+        let opts = self.dropdown_options();
+        let Some(d) = self.worker_dropdown.as_ref() else {
+            return;
+        };
+        let Some(opt) = opts.get(d.cursor) else {
+            self.close_worker_dropdown();
+            return;
+        };
+        self.apply_filter(opt.filter.clone());
+        self.close_worker_dropdown();
+    }
+
+    /// Persist `filter` as the new active worker filter and update the
+    /// in-memory state. Best-effort on the disk write — view state
+    /// shouldn't block the UI on a transient FS error.
+    fn apply_filter(&mut self, filter: Option<WorkerFilter>) {
+        self.worker_filter = filter.clone();
+        let disk = filter.as_ref().map(|f| f.to_disk());
+        if let Err(e) = shelbi_state::set_worker_filter(&self.project_name, disk.as_deref()) {
+            self.status_line = format!("filter persist failed: {e}");
+        }
+        // The selection may now point past the end of a column that
+        // just shrank; clamp before the next render reads it.
+        self.clamp_selection();
+        self.status_line = match &self.worker_filter {
+            None => "filter: all workers".to_string(),
+            Some(f) => format!("filter: {}", f.label()),
+        };
+    }
+
+    /// One-shot reset bound to the dropdown's `c` key — clears the
+    /// filter without needing to navigate to the "All" row.
+    pub fn dropdown_clear(&mut self) {
+        self.apply_filter(None);
+        self.close_worker_dropdown();
+    }
+
+    /// Map a screen coordinate to an option index in the open
+    /// dropdown, or `None` if the click missed every row. Used by the
+    /// mouse handler to route a left-click to the same path as the
+    /// keyboard `Enter`.
+    pub fn dropdown_option_at(&self, x: u16, y: u16) -> Option<usize> {
+        self.dropdown_hits.iter().find_map(|hit| {
+            let r = hit.area;
+            let in_x = x >= r.x && x < r.x.saturating_add(r.width);
+            let in_y = y >= r.y && y < r.y.saturating_add(r.height);
+            (in_x && in_y).then_some(hit.option_idx)
+        })
+    }
+
+    /// True when the screen coordinate falls inside the most-recently
+    /// rendered filter chip. The chip lives in the title row; a click
+    /// on it opens / closes the dropdown.
+    pub fn filter_chip_at(&self, x: u16, y: u16) -> bool {
+        match self.filter_chip_hit {
+            Some(r) => {
+                let in_x = x >= r.x && x < r.x.saturating_add(r.width);
+                let in_y = y >= r.y && y < r.y.saturating_add(r.height);
+                in_x && in_y
+            }
+            None => false,
         }
     }
 
@@ -348,18 +644,47 @@ pub fn render_full(f: &mut Frame, app: &mut KanbanApp, area: Rect) {
     render_footer(f, app, outer[2]);
     app.card_hits = hits;
 
+    // Dropdown sits above the columns but below the popover so a card
+    // detail dialog can still open over the dropdown without rendering
+    // chrome bleeding through.
+    if app.worker_dropdown_is_open() {
+        render_worker_dropdown(f, app, area);
+    } else {
+        // Stale hits from a previous open would route clicks to a row
+        // that's no longer on screen — clear them every frame we render
+        // without the dropdown.
+        app.dropdown_hits.clear();
+    }
+
     if app.popover_is_open() {
         render_popover(f, app, area);
     }
 }
 
-fn render_title(f: &mut Frame, app: &KanbanApp, area: Rect) {
+fn render_title(f: &mut Frame, app: &mut KanbanApp, area: Rect) {
+    // Title row: project meta on the left, worker filter chip pinned
+    // to the right. We compute the chip text first so the left split
+    // knows exactly how many columns the chip will consume — the chip
+    // never wraps and never truncates.
     let total = app.tasks.len();
-    let line = Line::from(vec![
-        Span::styled(
-            "Tasks · ",
-            Style::default().fg(Color::DarkGray),
-        ),
+    let chip_text = filter_chip_text(app);
+    let chip_w = chip_text.chars().count() as u16;
+
+    let (left_area, chip_area) = if area.width > chip_w {
+        let chunks = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Min(0), Constraint::Length(chip_w)])
+            .split(area);
+        (chunks[0], Some(chunks[1]))
+    } else {
+        // Title bar is too narrow to fit the chip — drop the chip and
+        // give all the space to the left. The dropdown is still
+        // reachable by hotkey; the chip is just a hint.
+        (area, None)
+    };
+
+    let left = Line::from(vec![
+        Span::styled("Tasks · ", Style::default().fg(Color::DarkGray)),
         Span::styled(
             app.project_name.clone(),
             Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
@@ -369,7 +694,36 @@ fn render_title(f: &mut Frame, app: &KanbanApp, area: Rect) {
             Style::default().fg(Color::DarkGray),
         ),
     ]);
-    f.render_widget(Paragraph::new(line), area);
+    f.render_widget(Paragraph::new(left), left_area);
+
+    if let Some(chip_area) = chip_area {
+        let chip_style = if app.worker_filter.is_some() {
+            // Active filter — cyan to match the popover border + the
+            // sidebar's project header, so the eye notices the board is
+            // narrowed.
+            Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(Color::DarkGray)
+        };
+        f.render_widget(
+            Paragraph::new(Line::from(Span::styled(chip_text, chip_style))),
+            chip_area,
+        );
+        app.filter_chip_hit = Some(chip_area);
+    } else {
+        app.filter_chip_hit = None;
+    }
+}
+
+/// Single-line label shown in the right edge of the title bar. Leading
+/// space keeps the chip from sitting flush against the rightmost
+/// column. ▾ glyph hints that it's a dropdown affordance.
+fn filter_chip_text(app: &KanbanApp) -> String {
+    let label = match &app.worker_filter {
+        None => "All".to_string(),
+        Some(f) => f.label(),
+    };
+    format!(" Worker: {label} ▾")
 }
 
 fn render_columns(f: &mut Frame, app: &KanbanApp, hits: &mut Vec<CardHit>, area: Rect) {
@@ -526,7 +880,7 @@ fn render_column(
 
 fn render_footer(f: &mut Frame, app: &KanbanApp, area: Rect) {
     let keys = Line::from(Span::styled(
-        "  h/l col   j/k row   enter/␣ open   H/L move col   K/J reorder   r refresh",
+        "  h/l col   j/k row   enter/␣ open   H/L move col   K/J reorder   f filter   r refresh",
         Style::default().fg(Color::DarkGray),
     ));
     let status = if app.status_line.is_empty() {
@@ -538,6 +892,141 @@ fn render_footer(f: &mut Frame, app: &KanbanApp, area: Rect) {
         ))
     };
     f.render_widget(Paragraph::new(vec![keys, status]), area);
+}
+
+/// Render the worker filter dropdown as a small popover anchored under
+/// the filter chip. The popover paints over the column headers + cards
+/// (`Clear` strips whatever was underneath), but does NOT suppress the
+/// title-row chip itself — keeping the chip visible while the dropdown
+/// is open is the visual link between the two.
+fn render_worker_dropdown(f: &mut Frame, app: &mut KanbanApp, area: Rect) {
+    let opts = app.dropdown_options();
+    if opts.is_empty() {
+        // Defensive: an empty options list means there's nothing to
+        // pick. Close it so a stale dropdown doesn't linger.
+        app.close_worker_dropdown();
+        return;
+    }
+    let cursor = app.worker_dropdown.as_ref().map(|d| d.cursor).unwrap_or(0);
+
+    // Width = widest "Worker name (count)" row + 4 chars of chrome
+    // (border + arrow + padding). Cap so the popover never spans more
+    // than ~⅓ of the screen — narrow lists shouldn't sprawl.
+    let max_label_w = opts
+        .iter()
+        .map(|o| dropdown_row_text(o).chars().count())
+        .max()
+        .unwrap_or(10);
+    let desired_w = (max_label_w + 4).max(20) as u16;
+    let popover_w = desired_w.min(area.width).min(area.width / 3 + 8);
+    // Anchor right edge to the chip's right edge so the dropdown
+    // visually drops out of the chip. Fall back to right-aligned in
+    // the full area if the chip rect isn't recorded (narrow term).
+    let popover_x = match app.filter_chip_hit {
+        Some(chip) => {
+            let right = chip.x.saturating_add(chip.width);
+            right.saturating_sub(popover_w).max(area.x)
+        }
+        None => area.x.saturating_add(area.width).saturating_sub(popover_w),
+    };
+    // 2 lines of chrome (top + bottom borders), 1 footer hint, then
+    // one line per option. Cap at the available terminal height so the
+    // popover can't render off-screen.
+    let popover_h = (opts.len() as u16 + 3).min(area.height.saturating_sub(1));
+    // Place directly under the title row (area.y + 1) so the chip
+    // remains visible above it.
+    let popover_y = area.y.saturating_add(1).min(area.y + area.height.saturating_sub(popover_h));
+
+    let popover_area = Rect {
+        x: popover_x,
+        y: popover_y,
+        width: popover_w,
+        height: popover_h,
+    };
+
+    f.render_widget(Clear, popover_area);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Cyan))
+        .title(Line::from(vec![Span::styled(
+            " Filter by worker ",
+            Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+        )]));
+    let inner = block.inner(popover_area);
+    f.render_widget(block, popover_area);
+
+    // Split inner: option list on top, single-line hint footer on bottom.
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(1), Constraint::Length(1)])
+        .split(inner);
+    let list_area = chunks[0];
+    let hint_area = chunks[1];
+
+    let mut hits: Vec<DropdownHit> = Vec::with_capacity(opts.len());
+    let mut items: Vec<ListItem> = Vec::with_capacity(opts.len());
+    for (idx, opt) in opts.iter().enumerate() {
+        let active = app.worker_filter == opt.filter;
+        let label = dropdown_row_text(opt);
+        // Active filter gets a leading bullet so the user can tell at
+        // a glance which row is currently applied. The selected row
+        // (cursor) gets a Blue bg via List highlight_style below.
+        let prefix = if active { "● " } else { "  " };
+        let label_style = if active {
+            Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)
+        } else {
+            Style::default()
+        };
+        let line = Line::from(vec![
+            Span::styled(prefix, Style::default().fg(Color::Cyan)),
+            Span::styled(label, label_style),
+        ]);
+        items.push(ListItem::new(line));
+        // Hit-test rect is one terminal row tall, full inner width.
+        // List indents items by 0; the cursor highlight bg is applied
+        // by the List widget so we don't need to model it here.
+        let row_y = list_area.y.saturating_add(idx as u16);
+        if row_y < list_area.y.saturating_add(list_area.height) {
+            hits.push(DropdownHit {
+                area: Rect {
+                    x: list_area.x,
+                    y: row_y,
+                    width: list_area.width,
+                    height: 1,
+                },
+                option_idx: idx,
+            });
+        }
+    }
+
+    let mut state = ListState::default();
+    state.select(Some(cursor.min(opts.len().saturating_sub(1))));
+    let list = List::new(items).highlight_style(
+        Style::default()
+            .bg(Color::Blue)
+            .fg(Color::White)
+            .add_modifier(Modifier::BOLD),
+    );
+    f.render_stateful_widget(list, list_area, &mut state);
+
+    let hint = Line::from(Span::styled(
+        " ↑↓ nav · ↵ select · c clear · esc close",
+        Style::default().fg(Color::DarkGray),
+    ));
+    f.render_widget(Paragraph::new(hint), hint_area);
+
+    app.dropdown_hits = hits;
+}
+
+/// Single-row text for an option: `<label> (<count>)`. Used both for
+/// layout (computing popover width) and for rendering, so the two stay
+/// byte-identical.
+fn dropdown_row_text(opt: &DropdownOption) -> String {
+    let label = match &opt.filter {
+        None => "All".to_string(),
+        Some(f) => f.label(),
+    };
+    format!("{} ({})", label, opt.count)
 }
 
 fn column_label(c: Column) -> &'static str {
@@ -749,6 +1238,16 @@ mod tests {
     }
 
     fn task_file(id: &str, column: Column, priority: u32, updated: &str) -> TaskFile {
+        task_file_for(id, column, priority, updated, None)
+    }
+
+    fn task_file_for(
+        id: &str,
+        column: Column,
+        priority: u32,
+        updated: &str,
+        assigned_to: Option<&str>,
+    ) -> TaskFile {
         let updated_at = chrono::DateTime::parse_from_rfc3339(updated)
             .unwrap()
             .with_timezone(&chrono::Utc);
@@ -758,7 +1257,7 @@ mod tests {
                 title: id.to_string(),
                 column,
                 priority,
-                assigned_to: None,
+                assigned_to: assigned_to.map(|s| s.to_string()),
                 workflow: None,
                 branch: None,
                 depends_on: Vec::new(),
@@ -927,5 +1426,375 @@ mod tests {
 
         std::env::remove_var("SHELBI_HOME");
         let _ = std::fs::remove_dir_all(&home);
+    }
+
+    // ---- worker filter ---------------------------------------------------
+
+    /// `column_tasks` applies both the column filter and the active
+    /// worker filter — a worker filter shrinks every column at once,
+    /// not just the focused one.
+    #[test]
+    fn column_tasks_applies_worker_filter() {
+        let mut app = KanbanApp::new("demo");
+        app.tasks = vec![
+            task_file_for("a", Column::Todo, 0, "2026-06-20T10:00:00Z", Some("alpha")),
+            task_file_for("b", Column::Todo, 1, "2026-06-20T10:00:00Z", Some("bravo")),
+            task_file_for("c", Column::InProgress, 0, "2026-06-20T10:00:00Z", Some("alpha")),
+            task_file_for("d", Column::Todo, 2, "2026-06-20T10:00:00Z", None),
+        ];
+        // No filter — all tasks pass through their column filter.
+        assert_eq!(app.column_tasks(1).len(), 3);
+        assert_eq!(app.column_tasks(2).len(), 1);
+
+        app.worker_filter = Some(WorkerFilter::Worker("alpha".into()));
+        let todo: Vec<&str> = app.column_tasks(1).iter().map(|t| t.task.id.as_str()).collect();
+        assert_eq!(todo, vec!["a"]);
+        let wip: Vec<&str> = app.column_tasks(2).iter().map(|t| t.task.id.as_str()).collect();
+        assert_eq!(wip, vec!["c"]);
+
+        app.worker_filter = Some(WorkerFilter::Unassigned);
+        let todo: Vec<&str> = app.column_tasks(1).iter().map(|t| t.task.id.as_str()).collect();
+        assert_eq!(todo, vec!["d"], "Unassigned filter keeps only `assigned_to: None`");
+    }
+
+    /// `dropdown_options` builds `All` + each worker + (optional)
+    /// `Unassigned`, in that order. Counts reflect the unfiltered task
+    /// list so workers with zero matching cards still appear (the user
+    /// has to be able to pick them to clear an unrelated filter).
+    #[test]
+    fn dropdown_options_lists_all_then_workers_then_unassigned() {
+        let mut app = KanbanApp::new("demo");
+        app.workers = vec!["alpha".into(), "bravo".into(), "charlie".into()];
+        app.tasks = vec![
+            task_file_for("a", Column::Todo, 0, "2026-06-20T10:00:00Z", Some("alpha")),
+            task_file_for("b", Column::Todo, 1, "2026-06-20T10:00:00Z", Some("alpha")),
+            task_file_for("c", Column::Todo, 2, "2026-06-20T10:00:00Z", Some("bravo")),
+            task_file_for("d", Column::Todo, 3, "2026-06-20T10:00:00Z", None),
+        ];
+        let opts = app.dropdown_options();
+        // All / alpha(2) / bravo(1) / charlie(0) / Unassigned(1)
+        assert_eq!(opts.len(), 5);
+        assert!(opts[0].filter.is_none());
+        assert_eq!(opts[0].count, 4);
+        assert_eq!(opts[1].filter, Some(WorkerFilter::Worker("alpha".into())));
+        assert_eq!(opts[1].count, 2);
+        assert_eq!(opts[3].filter, Some(WorkerFilter::Worker("charlie".into())));
+        assert_eq!(opts[3].count, 0, "zero-count workers still appear");
+        assert_eq!(opts[4].filter, Some(WorkerFilter::Unassigned));
+        assert_eq!(opts[4].count, 1);
+    }
+
+    /// No tasks lack `assigned_to` → the Unassigned row is suppressed
+    /// so the dropdown isn't padded with a useless option.
+    #[test]
+    fn dropdown_options_omits_unassigned_when_zero() {
+        let mut app = KanbanApp::new("demo");
+        app.workers = vec!["alpha".into()];
+        app.tasks = vec![task_file_for(
+            "a",
+            Column::Todo,
+            0,
+            "2026-06-20T10:00:00Z",
+            Some("alpha"),
+        )];
+        let opts = app.dropdown_options();
+        assert!(
+            !opts.iter().any(|o| o.filter == Some(WorkerFilter::Unassigned)),
+            "no unassigned tasks → no Unassigned row, got {:?}",
+            opts.iter().map(|o| &o.filter).collect::<Vec<_>>()
+        );
+    }
+
+    /// Opening the dropdown seeds the cursor on the row matching the
+    /// active filter — opening then immediately hitting Enter must be
+    /// a no-op (idempotent). Up / Down wrap at either end.
+    #[test]
+    fn dropdown_open_seeds_cursor_on_active_filter_and_nav_wraps() {
+        let mut app = KanbanApp::new("demo");
+        app.workers = vec!["alpha".into(), "bravo".into()];
+        app.tasks = vec![
+            task_file_for("a", Column::Todo, 0, "2026-06-20T10:00:00Z", Some("alpha")),
+            task_file_for("b", Column::Todo, 1, "2026-06-20T10:00:00Z", Some("bravo")),
+        ];
+        app.worker_filter = Some(WorkerFilter::Worker("bravo".into()));
+        app.open_worker_dropdown();
+        // Options are [All, alpha, bravo] → bravo is index 2.
+        assert_eq!(app.worker_dropdown.as_ref().unwrap().cursor, 2);
+
+        app.dropdown_nav_down();
+        assert_eq!(app.worker_dropdown.as_ref().unwrap().cursor, 0, "wraps to top");
+        app.dropdown_nav_up();
+        assert_eq!(app.worker_dropdown.as_ref().unwrap().cursor, 2, "wraps to bottom");
+    }
+
+    /// An active filter that no longer matches any option (e.g. a
+    /// worker was removed from project.yaml) seeds the cursor on `All`
+    /// rather than panicking on an out-of-range index. The active
+    /// filter itself isn't auto-cleared — only the cursor lands at 0.
+    #[test]
+    fn dropdown_open_falls_back_to_all_when_filter_missing_from_options() {
+        let mut app = KanbanApp::new("demo");
+        app.workers = vec!["alpha".into()];
+        app.worker_filter = Some(WorkerFilter::Worker("removed".into()));
+        app.open_worker_dropdown();
+        assert_eq!(app.worker_dropdown.as_ref().unwrap().cursor, 0);
+    }
+
+    /// `apply_filter` (via `dropdown_select`) updates the in-memory
+    /// state, persists to `state.json`, and a fresh app picks it up on
+    /// refresh. The disk format stores the sentinel for Unassigned so
+    /// the schema stays a plain `Option<String>`.
+    #[test]
+    fn apply_filter_persists_to_state_json_and_refresh_restores() {
+        let _g = crate::test_support::ENV_LOCK.lock().unwrap();
+        let home = std::env::temp_dir().join(format!(
+            "shelbi-tui-worker-filter-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&home).unwrap();
+        std::env::set_var("SHELBI_HOME", &home);
+
+        // Project needs to exist so refresh() can populate workers.
+        let project = shelbi_core::Project {
+            name: "demo".into(),
+            repo: "git@example:demo.git".into(),
+            default_branch: "main".into(),
+            machines: vec![shelbi_core::Machine {
+                name: "hub".into(),
+                kind: shelbi_core::MachineKind::Local,
+                work_dir: "/tmp/demo".into(),
+                host: None,
+            }],
+            orchestrator: shelbi_core::OrchestratorSpec {
+                runner: "claude".into(),
+            },
+            agent_runners: {
+                let mut m = std::collections::BTreeMap::new();
+                m.insert(
+                    "claude".into(),
+                    shelbi_core::AgentRunnerSpec {
+                        command: "claude".into(),
+                        flags: vec![],
+                    },
+                );
+                m
+            },
+            editor: None,
+            github_url: None,
+            workers: vec![
+                shelbi_core::WorkerSpec {
+                    name: "alpha".into(),
+                    machine: "hub".into(),
+                    runner: "claude".into(),
+                },
+                shelbi_core::WorkerSpec {
+                    name: "bravo".into(),
+                    machine: "hub".into(),
+                    runner: "claude".into(),
+                },
+            ],
+            worker_poll_interval_secs: 5,
+            worker_permissions_mode: "auto".into(),
+            worker_settings_template: None,
+            zen: shelbi_core::ZenConfig::default(),
+            heartbeat: shelbi_core::HeartbeatConfig::default(),
+            contextstore_sync: Vec::new(),
+            detected_shapes: Vec::new(),
+        };
+        shelbi_state::save_project(&project).unwrap();
+
+        let mut app = KanbanApp::new("demo");
+        app.refresh();
+        assert!(app.worker_filter.is_none(), "fresh state.json → no filter");
+        assert_eq!(app.workers, vec!["alpha".to_string(), "bravo".to_string()]);
+
+        // Open, navigate to the bravo row (All=0, alpha=1, bravo=2),
+        // commit. The dropdown closes itself.
+        app.open_worker_dropdown();
+        app.dropdown_nav_down();
+        app.dropdown_nav_down();
+        app.dropdown_select();
+        assert!(!app.worker_dropdown_is_open());
+        assert_eq!(app.worker_filter, Some(WorkerFilter::Worker("bravo".into())));
+
+        // A fresh app rehydrates the same filter from disk.
+        let mut app2 = KanbanApp::new("demo");
+        app2.refresh();
+        assert_eq!(app2.worker_filter, Some(WorkerFilter::Worker("bravo".into())));
+
+        // Unassigned round-trips through the sentinel.
+        app2.open_worker_dropdown();
+        // Options: All / alpha / bravo / Unassigned? — we need an
+        // unassigned task to surface it. Seed one and refresh.
+        let now = chrono::Utc::now();
+        shelbi_state::save_task(
+            "demo",
+            &shelbi_core::Task {
+                id: "orphan".into(),
+                title: "orphan".into(),
+                column: Column::Backlog,
+                priority: 0,
+                assigned_to: None,
+                branch: None,
+                depends_on: Vec::new(),
+                prefers_machine: None,
+                zen: None,
+                created_at: now,
+                updated_at: now,
+            },
+            "",
+        )
+        .unwrap();
+        app2.refresh();
+        app2.open_worker_dropdown();
+        let opts = app2.dropdown_options();
+        let unassigned_idx = opts
+            .iter()
+            .position(|o| o.filter == Some(WorkerFilter::Unassigned))
+            .expect("Unassigned row should now appear");
+        if let Some(d) = app2.worker_dropdown.as_mut() {
+            d.cursor = unassigned_idx;
+        }
+        app2.dropdown_select();
+        assert_eq!(app2.worker_filter, Some(WorkerFilter::Unassigned));
+        let on_disk = shelbi_state::read_state("demo").unwrap();
+        assert_eq!(
+            on_disk.worker_filter.as_deref(),
+            Some(WorkerFilter::UNASSIGNED_SENTINEL),
+            "Unassigned must serialize to its sentinel string"
+        );
+
+        // `dropdown_clear` resets to None and writes that through to
+        // disk so a subsequent refresh sees the cleared filter.
+        app2.open_worker_dropdown();
+        app2.dropdown_clear();
+        assert_eq!(app2.worker_filter, None);
+        let on_disk = shelbi_state::read_state("demo").unwrap();
+        assert!(on_disk.worker_filter.is_none());
+
+        std::env::remove_var("SHELBI_HOME");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// Selecting the `All` row clears the filter even when it was
+    /// previously set to a specific worker — the dropdown commit path
+    /// has to accept `None` as a valid choice.
+    #[test]
+    fn dropdown_select_all_clears_filter() {
+        let mut app = KanbanApp::new("demo");
+        app.workers = vec!["alpha".into()];
+        app.worker_filter = Some(WorkerFilter::Worker("alpha".into()));
+        app.open_worker_dropdown();
+        // Cursor seeds on alpha (idx 1). Walk back to All.
+        app.dropdown_nav_up();
+        assert_eq!(app.worker_dropdown.as_ref().unwrap().cursor, 0);
+        // No disk write here because no SHELBI_HOME is set — the
+        // persist error lands in status_line but the in-memory state
+        // still updates.
+        app.dropdown_select();
+        assert!(app.worker_filter.is_none());
+        assert!(!app.worker_dropdown_is_open());
+    }
+
+    /// Toggling the dropdown closes it when open, opens when closed —
+    /// matches the chord-style "press the same key to dismiss" UX.
+    #[test]
+    fn toggle_worker_dropdown_is_self_inverse() {
+        let mut app = KanbanApp::new("demo");
+        assert!(!app.worker_dropdown_is_open());
+        app.toggle_worker_dropdown();
+        assert!(app.worker_dropdown_is_open());
+        app.toggle_worker_dropdown();
+        assert!(!app.worker_dropdown_is_open());
+    }
+
+    /// Rendering the kanban with the dropdown open must show the
+    /// chip in the title row, paint every worker option (plus All), and
+    /// populate `dropdown_hits` so click routing has rects to test
+    /// against.
+    #[test]
+    fn rendering_dropdown_paints_options_and_chip() {
+        use ratatui::{backend::TestBackend, Terminal};
+        let mut app = KanbanApp::new("demo");
+        app.workers = vec!["alpha".into(), "bravo".into()];
+        app.tasks = vec![
+            task_file_for("a", Column::Todo, 0, "2026-06-20T10:00:00Z", Some("alpha")),
+            task_file_for("b", Column::Todo, 1, "2026-06-20T10:00:00Z", Some("bravo")),
+        ];
+        app.open_worker_dropdown();
+
+        // Wide enough to hold the chip on the right and the dropdown.
+        let backend = TestBackend::new(80, 20);
+        let mut term = Terminal::new(backend).unwrap();
+        term.draw(|f| render_full(f, &mut app, f.area())).unwrap();
+
+        let buf = term.backend().buffer().clone();
+        let rendered: Vec<String> = (0..buf.area.height)
+            .map(|y| {
+                (0..buf.area.width)
+                    .map(|x| buf[(x, y)].symbol().to_string())
+                    .collect::<Vec<_>>()
+                    .join("")
+            })
+            .collect();
+        let joined = rendered.join("\n");
+
+        assert!(joined.contains("Worker: All ▾"), "chip missing in:\n{joined}");
+        assert!(joined.contains("Filter by worker"), "dropdown title missing");
+        assert!(joined.contains("All (2)"), "All row missing in:\n{joined}");
+        assert!(joined.contains("alpha (1)"), "alpha row missing in:\n{joined}");
+        assert!(joined.contains("bravo (1)"), "bravo row missing in:\n{joined}");
+
+        assert!(app.filter_chip_hit.is_some(), "chip rect not recorded");
+        assert_eq!(
+            app.dropdown_hits.len(),
+            3,
+            "expected 3 dropdown hits (All + 2 workers), got {}",
+            app.dropdown_hits.len()
+        );
+    }
+
+    /// `dropdown_option_at` and `filter_chip_at` are pure hit-tests
+    /// against the most recently rendered geometry — no rendering
+    /// required for the assertion.
+    #[test]
+    fn hit_tests_route_to_recorded_rects() {
+        let mut app = KanbanApp::new("demo");
+        app.filter_chip_hit = Some(Rect {
+            x: 50,
+            y: 0,
+            width: 18,
+            height: 1,
+        });
+        app.dropdown_hits = vec![
+            DropdownHit {
+                area: Rect {
+                    x: 50,
+                    y: 1,
+                    width: 18,
+                    height: 1,
+                },
+                option_idx: 0,
+            },
+            DropdownHit {
+                area: Rect {
+                    x: 50,
+                    y: 2,
+                    width: 18,
+                    height: 1,
+                },
+                option_idx: 1,
+            },
+        ];
+        assert!(app.filter_chip_at(55, 0));
+        assert!(!app.filter_chip_at(40, 0));
+        assert!(!app.filter_chip_at(55, 1), "chip lives on y=0 only");
+        assert_eq!(app.dropdown_option_at(55, 1), Some(0));
+        assert_eq!(app.dropdown_option_at(55, 2), Some(1));
+        assert_eq!(app.dropdown_option_at(10, 1), None, "miss outside chip x range");
     }
 }

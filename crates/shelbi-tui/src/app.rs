@@ -1179,6 +1179,7 @@ mod tests {
         let paused = shelbi_state::State {
             zen_mode: shelbi_state::ZenModeState::Paused,
             zen_last_crashed_at: None,
+            ..shelbi_state::State::default()
         };
         shelbi_state::write_state("demo", &paused).unwrap();
 

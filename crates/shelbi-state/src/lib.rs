@@ -286,6 +286,11 @@ pub struct State {
     pub zen_mode: ZenModeState,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub zen_last_crashed_at: Option<DateTime<Utc>>,
+    /// Persisted Kanban worker filter — `None` means "All workers". The
+    /// Tasks TUI restores this on each launch so the user's last view
+    /// survives a respawn or project switch.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worker_filter: Option<String>,
 }
 
 /// Tri-state Zen Mode toggle persisted in `state.json::zen_mode`.
@@ -467,6 +472,16 @@ pub fn set_zen_mode(project: &str, target: ZenModeState, source: &str) -> Result
     write_state(project, &state)?;
     let _ = append_zen_mode_event(prev.as_str(), target.as_str(), source);
     Ok(prev)
+}
+
+/// Persist the Kanban worker filter for `project`. `None` clears it
+/// back to "All workers". Reads, mutates, and re-writes `state.json` so
+/// the other fields (Zen mode, crash timestamp) are preserved. No event
+/// log entry — view-state changes are noise in the activity feed.
+pub fn set_worker_filter(project: &str, filter: Option<&str>) -> Result<()> {
+    let mut state = read_state(project)?;
+    state.worker_filter = filter.map(|s| s.to_string());
+    write_state(project, &state)
 }
 
 /// Binary toggle on top of [`set_zen_mode`]: On flips to Off, anything
@@ -1291,6 +1306,7 @@ mod tests {
             zen_last_crashed_at: Some(
                 "2026-06-19T12:34:56Z".parse::<DateTime<Utc>>().unwrap(),
             ),
+            ..State::default()
         };
         write_state("p", &original).unwrap();
         let back = read_state("p").unwrap();
@@ -1308,7 +1324,7 @@ mod tests {
         let _g = TEST_LOCK.lock().unwrap();
         let home = fresh_home();
         std::env::set_var("SHELBI_HOME", &home);
-        let s = State { zen_mode: ZenModeState::On, zen_last_crashed_at: None };
+        let s = State { zen_mode: ZenModeState::On, zen_last_crashed_at: None, ..State::default() };
         write_state("p", &s).unwrap();
         let on_disk = std::fs::read_to_string(state_path("p").unwrap()).unwrap();
         assert!(!on_disk.contains("zen_last_crashed_at"));
@@ -1325,7 +1341,7 @@ mod tests {
             (ZenModeState::Paused, "\"paused\""),
             (ZenModeState::On, "\"on\""),
         ] {
-            let s = State { zen_mode: mode, zen_last_crashed_at: None };
+            let s = State { zen_mode: mode, zen_last_crashed_at: None, ..State::default() };
             write_state("p", &s).unwrap();
             let on_disk = std::fs::read_to_string(state_path("p").unwrap()).unwrap();
             assert!(on_disk.contains(expect), "{mode:?} → {on_disk}");
@@ -1373,7 +1389,7 @@ mod tests {
         std::env::set_var("SHELBI_HOME", &home);
         write_state(
             "p",
-            &State { zen_mode: ZenModeState::On, zen_last_crashed_at: None },
+            &State { zen_mode: ZenModeState::On, zen_last_crashed_at: None, ..State::default() },
         )
         .unwrap();
         assert_eq!(zen_check_crash_recovery("p").unwrap(), ZenCrashRecovery::NoCrash);
@@ -1393,6 +1409,7 @@ mod tests {
             &State {
                 zen_mode: ZenModeState::On,
                 zen_last_crashed_at: Some(crashed_at),
+                ..State::default()
             },
         )
         .unwrap();
@@ -1420,6 +1437,7 @@ mod tests {
             &State {
                 zen_mode: ZenModeState::On,
                 zen_last_crashed_at: Some(stale),
+                ..State::default()
             },
         )
         .unwrap();
@@ -1443,6 +1461,7 @@ mod tests {
             &State {
                 zen_mode: ZenModeState::Off,
                 zen_last_crashed_at: Some(recent),
+                ..State::default()
             },
         )
         .unwrap();
@@ -1466,6 +1485,7 @@ mod tests {
             &State {
                 zen_mode: ZenModeState::Paused,
                 zen_last_crashed_at: Some(recent),
+                ..State::default()
             },
         )
         .unwrap();
@@ -1487,6 +1507,7 @@ mod tests {
             &State {
                 zen_mode: ZenModeState::On,
                 zen_last_crashed_at: Some(recent),
+                ..State::default()
             },
         )
         .unwrap();
@@ -1550,7 +1571,7 @@ mod tests {
         std::env::set_var("SHELBI_HOME", &home);
         write_state(
             "p",
-            &State { zen_mode: ZenModeState::Paused, zen_last_crashed_at: None },
+            &State { zen_mode: ZenModeState::Paused, zen_last_crashed_at: None, ..State::default() },
         )
         .unwrap();
         let new = toggle_zen_mode("p", "user:hotkey").unwrap();
