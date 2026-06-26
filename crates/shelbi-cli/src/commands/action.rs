@@ -21,6 +21,20 @@ pub enum ActionCmd {
     /// `origin`. Idempotent — pushing an up-to-date branch is a clean
     /// success.
     PushBranch { task_id: String },
+    /// Open a PR for the task's branch. Prints the PR number on stdout.
+    /// Idempotent — if an open PR for the branch already exists, returns
+    /// that PR's number unchanged. The PR base is resolved by the chain
+    /// documented on [`shelbi_orchestrator::actions::open_pr`]:
+    /// `--target` (per-transition override) → first non-`Done`
+    /// `depends_on:` parent's branch → project's effective `base_branch`.
+    OpenPr {
+        task_id: String,
+        /// Override the PR base branch for this open_pr call. Mirrors
+        /// the per-transition `target:` field on the workflow YAML when
+        /// the workflow engine invokes this primitive.
+        #[arg(long)]
+        target: Option<String>,
+    },
     /// Close any open PR for the task's branch. Prints the closed PR
     /// number on stdout, or `none` if there was nothing to close.
     ClosePr { task_id: String },
@@ -39,6 +53,19 @@ pub fn run(project_opt: Option<String>, cmd: ActionCmd) -> Result<()> {
             let tf = load_task(&project_name, &task_id).map_err(|e| anyhow!(e))?;
             actions::push_branch(&project, &tf.task).map_err(|e| anyhow!(e))?;
             println!("pushed");
+            Ok(())
+        }
+        ActionCmd::OpenPr { task_id, target } => {
+            let tf = load_task(&project_name, &task_id).map_err(|e| anyhow!(e))?;
+            let pr = actions::open_pr(
+                &project,
+                &project_name,
+                &tf.task,
+                &tf.body,
+                target.as_deref(),
+            )
+            .map_err(|e| anyhow!(e))?;
+            println!("{pr}");
             Ok(())
         }
         ActionCmd::ClosePr { task_id } => {
