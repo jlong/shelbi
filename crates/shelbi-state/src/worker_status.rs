@@ -311,6 +311,32 @@ pub fn append_dispatch_event(
     ))
 }
 
+/// Append `<rfc3339> rebase task=<id> worker=<name> branch=<branch> status=<status> detail=<detail>`
+/// to `~/.shelbi/events.log`. Emitted by the poller's review-marker handler
+/// when it auto-rebases a worker's branch onto the project's default branch
+/// — so the user (and `shelbi events tail`) can see whether the rebase
+/// succeeded, was a no-op (`up-to-date`), conflicted (`conflict`, worktree
+/// returned to a clean pre-rebase state), or was skipped (`skipped`, e.g.
+/// missing default branch ref or dirty worktree).
+///
+/// Detail is a single short token (short shas, conflict excerpt, or reason
+/// snippet); whitespace folds to underscores so the line stays parseable.
+pub fn append_rebase_event(
+    task_id: &str,
+    worker: &str,
+    branch: &str,
+    status: &str,
+    detail: &str,
+) -> Result<()> {
+    let ts = Utc::now().to_rfc3339();
+    let branch = sanitize_reason(branch);
+    let status = sanitize_reason(status);
+    let detail = sanitize_reason(detail);
+    append_event_line(&format!(
+        "{ts} rebase task={task_id} worker={worker} branch={branch} status={status} detail={detail}"
+    ))
+}
+
 /// Open `events.log` with O_APPEND and write one terminated line in a
 /// single `write_all` call. POSIX guarantees that writes <= PIPE_BUF
 /// (4096B) under O_APPEND are atomic relative to other appenders, so

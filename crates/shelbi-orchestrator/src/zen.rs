@@ -18,6 +18,7 @@
 //! verdict.
 
 use std::path::PathBuf;
+use std::process::Output;
 use std::time::{Duration, Instant};
 
 use globset::{Glob, GlobSetBuilder};

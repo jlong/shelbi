@@ -89,6 +89,260 @@ pub fn clear_review_marker(host: &Host, marker: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Outcome of [`rebase_worker_branch_onto_default`]. Pure data — the caller
+/// decides what to log and whether to surface a warning to the user. We
+/// distinguish "rebase wasn't needed" from "rebase succeeded" so the
+/// events.log line can call out the actually-rebased commits when there
+/// are any.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RebaseOutcome {
+    /// Default branch is already an ancestor of the worker's HEAD — the
+    /// branch is up to date and no rewrite was needed.
+    AlreadyUpToDate { default_sha: String },
+    /// Rebase finished cleanly; the worker's branch is now on top of
+    /// `default_sha`. `before_sha`/`after_sha` are HEAD before/after the
+    /// rewrite — equal when the rebase ran but produced an empty result
+    /// (rare; harmless).
+    Rebased {
+        before_sha: String,
+        after_sha: String,
+        default_sha: String,
+    },
+    /// Rebase ran into conflicts. We aborted it so the worktree returned to
+    /// a clean state and the worker's branch HEAD is unchanged — the human
+    /// reviewer will resolve the conflict during the review checkout.
+    Conflict {
+        default_sha: String,
+        stderr_excerpt: String,
+    },
+    /// The rebase couldn't even be attempted (default branch missing,
+    /// uncommitted changes that aren't ours to absorb, git itself errored).
+    /// The reason field explains why so the events.log row is actionable.
+    Skipped { reason: String },
+}
+
+impl RebaseOutcome {
+    /// Short status token for the `events.log` `status=` field. Stable
+    /// over time — UI consumers parse this.
+    pub fn status_token(&self) -> &'static str {
+        match self {
+            RebaseOutcome::AlreadyUpToDate { .. } => "up-to-date",
+            RebaseOutcome::Rebased { .. } => "ok",
+            RebaseOutcome::Conflict { .. } => "conflict",
+            RebaseOutcome::Skipped { .. } => "skipped",
+        }
+    }
+
+    /// Compact one-line detail string for the `events.log` `detail=`
+    /// field. Short SHAs on the happy paths, a snippet of git's stderr
+    /// (or the reason) on the failure paths.
+    pub fn detail(&self) -> String {
+        fn short(sha: &str) -> &str {
+            sha.get(..7).unwrap_or(sha)
+        }
+        match self {
+            RebaseOutcome::AlreadyUpToDate { default_sha } => {
+                format!("default={}", short(default_sha))
+            }
+            RebaseOutcome::Rebased {
+                before_sha,
+                after_sha,
+                default_sha,
+            } => format!(
+                "{}..{}_onto_{}",
+                short(before_sha),
+                short(after_sha),
+                short(default_sha),
+            ),
+            RebaseOutcome::Conflict {
+                default_sha,
+                stderr_excerpt,
+            } => {
+                let excerpt = stderr_excerpt.trim();
+                if excerpt.is_empty() {
+                    format!("default={}", short(default_sha))
+                } else {
+                    format!("default={} {}", short(default_sha), excerpt)
+                }
+            }
+            RebaseOutcome::Skipped { reason } => reason.clone(),
+        }
+    }
+}
+
+/// Rebase the worker's current branch in `worktree` onto `default_branch`,
+/// leaving the worktree on the same branch (now rewritten) on success.
+///
+/// Why this exists: when a prereq task lands on `main` after a worker has
+/// already started its own task, the worker's branch sits one or more
+/// commits behind main by the time the review marker fires. Without this
+/// hook the user had to drop into the worker's worktree and run
+/// `git rebase main` themselves before the review checkout would surface a
+/// clean diff — exactly the manual rebase + force-push the task title
+/// names. Running it here eliminates that step on the happy path, and
+/// fails safely (worktree returned to its pre-rebase state) when a
+/// conflict means a human has to step in anyway.
+///
+/// The worktree shares its `.git` with the project's main clone via
+/// `git worktree add`, so `default_branch` already reflects whatever the
+/// orchestrator merged onto it on the hub — no fetch is needed.
+///
+/// Contract:
+///
+/// - Worktree must be clean (anything outside `.claude/` would be lost
+///   to a rebase conflict). The worker is expected to have committed
+///   before writing the review marker; a dirty worktree returns
+///   [`RebaseOutcome::Skipped`].
+/// - On conflict we run `git rebase --abort` and return
+///   [`RebaseOutcome::Conflict`] — the worker's branch HEAD is unchanged.
+/// - Never panics; every git failure surfaces as `Skipped` or `Conflict`
+///   so the caller can log it and continue the review promotion.
+pub fn rebase_worker_branch_onto_default(
+    host: &Host,
+    worktree: &Path,
+    default_branch: &str,
+) -> RebaseOutcome {
+    let wt_str = worktree.to_string_lossy().into_owned();
+
+    // 1. Bail on a dirty worktree. `.claude/` is shelbi's deploy footprint
+    //    (settings.json, the review marker itself); it's gitignored so it
+    //    never trips `status --porcelain`, but if a user-authored
+    //    `.gitignore` doesn't yet exclude it we still don't want a rebase
+    //    aborted by our own files. Mirror the carve-out in `preflight_workdir`.
+    let dirty = match shelbi_ssh::run_capture(
+        host,
+        ["git", "-C", &wt_str, "status", "--porcelain"],
+    ) {
+        Ok(s) => s,
+        Err(e) => {
+            return RebaseOutcome::Skipped {
+                reason: format!("git_status_failed:{e}"),
+            };
+        }
+    };
+    let user_dirty: Vec<&str> = dirty
+        .lines()
+        .filter(|l| {
+            let path = l.get(3..).unwrap_or("");
+            !(path.starts_with(".claude/") || path == ".claude")
+        })
+        .collect();
+    if !user_dirty.is_empty() {
+        return RebaseOutcome::Skipped {
+            reason: format!("dirty_worktree({}_entries)", user_dirty.len()),
+        };
+    }
+
+    // 2. Resolve the default branch ref. If the worker's repo doesn't even
+    //    know about `default_branch` (fresh clone never fetched, name
+    //    typo'd in project YAML), there's nothing to rebase onto.
+    let default_sha = match shelbi_ssh::run(
+        host,
+        [
+            "git",
+            "-C",
+            &wt_str,
+            "rev-parse",
+            "--verify",
+            &format!("{default_branch}^{{commit}}"),
+        ],
+    ) {
+        Ok(o) if o.status.success() => {
+            String::from_utf8_lossy(&o.stdout).trim().to_string()
+        }
+        Ok(_) | Err(_) => {
+            return RebaseOutcome::Skipped {
+                reason: format!("default_branch_{default_branch}_not_found"),
+            };
+        }
+    };
+
+    let before_sha = match shelbi_ssh::run_capture(
+        host,
+        ["git", "-C", &wt_str, "rev-parse", "HEAD"],
+    ) {
+        Ok(s) => s.trim().to_string(),
+        Err(e) => {
+            return RebaseOutcome::Skipped {
+                reason: format!("rev_parse_HEAD_failed:{e}"),
+            };
+        }
+    };
+
+    // 3. Already a descendant? `merge-base --is-ancestor` exits 0 when
+    //    `default_branch` is reachable from HEAD — i.e. the worker's
+    //    branch already contains every commit on main. No rewrite needed.
+    let ancestor = shelbi_ssh::run(
+        host,
+        [
+            "git",
+            "-C",
+            &wt_str,
+            "merge-base",
+            "--is-ancestor",
+            default_branch,
+            "HEAD",
+        ],
+    );
+    if matches!(ancestor, Ok(ref o) if o.status.success()) {
+        return RebaseOutcome::AlreadyUpToDate { default_sha };
+    }
+
+    // 4. Run the rebase. Plain `git rebase` (no autostash — we already
+    //    proved the worktree is clean; no `--rebase-merges` — workers
+    //    produce linear branches).
+    let out = match shelbi_ssh::run(host, ["git", "-C", &wt_str, "rebase", default_branch]) {
+        Ok(o) => o,
+        Err(e) => {
+            return RebaseOutcome::Skipped {
+                reason: format!("rebase_spawn_failed:{e}"),
+            };
+        }
+    };
+
+    if !out.status.success() {
+        // Conflict (or some other rebase-time error). Abort so the
+        // worktree returns to its pre-rebase state — the worker's branch
+        // HEAD is unchanged and the next `git status` is clean. Abort is
+        // best-effort: a hung rebase that won't abort would leave the
+        // worktree in an interactive state, but we still want to log
+        // the conflict and let the review proceed.
+        let _ = shelbi_ssh::run(host, ["git", "-C", &wt_str, "rebase", "--abort"]);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let combined = format!("{stderr}{stdout}");
+        let excerpt = combined
+            .lines()
+            .find(|l| {
+                let lc = l.to_ascii_lowercase();
+                lc.contains("conflict") || lc.contains("error")
+            })
+            .map(|l| l.trim().to_string())
+            .unwrap_or_else(|| {
+                combined
+                    .lines()
+                    .map(|l| l.trim())
+                    .find(|l| !l.is_empty())
+                    .unwrap_or("rebase failed")
+                    .to_string()
+            });
+        return RebaseOutcome::Conflict {
+            default_sha,
+            stderr_excerpt: excerpt,
+        };
+    }
+
+    let after_sha = shelbi_ssh::run_capture(host, ["git", "-C", &wt_str, "rev-parse", "HEAD"])
+        .map(|s| s.trim().to_string())
+        .unwrap_or_default();
+
+    RebaseOutcome::Rebased {
+        before_sha,
+        after_sha,
+        default_sha,
+    }
+}
+
 /// Does the worker have a live tmux pane right now?
 pub fn worker_pane_alive(host: &Host, addr: &TmuxAddr) -> Result<bool> {
     // Local: check `session:window` exists. Remote: it's a whole session.
@@ -1271,5 +1525,343 @@ mod tests {
         assert_eq!(actual2, updated);
 
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+}
+
+#[cfg(test)]
+mod rebase_git_tests {
+    //! Real-git tests for [`rebase_worker_branch_onto_default`]. Each test
+    //! provisions a tiny on-disk repo with a `main` branch + a feature
+    //! branch off it, then exercises one outcome of the rebase function.
+    //! Skipped silently if `git` isn't on PATH so the suite still runs on
+    //! a git-less sandbox.
+    //!
+    //! The shape under test is the worker-side worktree path: in the real
+    //! system the worktree shares a `.git` with the project's main clone
+    //! (via `git worktree add`), but for the rebase function only the
+    //! worktree's own ref/object access matters, so a plain `git init`
+    //! repo with a working tree is enough fidelity.
+    use super::*;
+
+    fn git_available() -> bool {
+        std::process::Command::new("git")
+            .arg("--version")
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false)
+    }
+
+    fn run_git_in(repo: &std::path::Path, args: &[&str]) -> std::process::Output {
+        let mut cmd = std::process::Command::new("git");
+        cmd.arg("-C").arg(repo);
+        for a in args {
+            cmd.arg(a);
+        }
+        // Pin author identity so commit creation works on hosts without
+        // a configured user (CI sandboxes, fresh containers). These are
+        // process-scoped via env vars, so they don't touch the user's
+        // global git config.
+        cmd.env("GIT_AUTHOR_NAME", "Shelbi Test");
+        cmd.env("GIT_AUTHOR_EMAIL", "test@shelbi.local");
+        cmd.env("GIT_COMMITTER_NAME", "Shelbi Test");
+        cmd.env("GIT_COMMITTER_EMAIL", "test@shelbi.local");
+        cmd.output().expect("git command failed to spawn")
+    }
+
+    /// Create a fresh repo with `main` as the default branch and one
+    /// committed README so that branching is meaningful. Returns the
+    /// repo path.
+    fn init_repo(label: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "shelbi-rebase-{label}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos(),
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let init = run_git_in(&dir, &["init", "-q", "-b", "main"]);
+        assert!(
+            init.status.success(),
+            "git init failed: {}",
+            String::from_utf8_lossy(&init.stderr)
+        );
+        std::fs::write(dir.join("README.md"), "# repo\n").unwrap();
+        let add = run_git_in(&dir, &["add", "README.md"]);
+        assert!(add.status.success());
+        let commit = run_git_in(&dir, &["commit", "-q", "-m", "initial"]);
+        assert!(
+            commit.status.success(),
+            "initial commit failed: {}",
+            String::from_utf8_lossy(&commit.stderr)
+        );
+        dir
+    }
+
+    fn commit_file(repo: &std::path::Path, name: &str, contents: &str, message: &str) {
+        std::fs::write(repo.join(name), contents).unwrap();
+        let add = run_git_in(repo, &["add", name]);
+        assert!(add.status.success());
+        let commit = run_git_in(repo, &["commit", "-q", "-m", message]);
+        assert!(
+            commit.status.success(),
+            "commit failed: {}",
+            String::from_utf8_lossy(&commit.stderr),
+        );
+    }
+
+    fn head_sha(repo: &std::path::Path) -> String {
+        let out = run_git_in(repo, &["rev-parse", "HEAD"]);
+        assert!(out.status.success());
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
+    fn branch_sha(repo: &std::path::Path, branch: &str) -> String {
+        let out = run_git_in(repo, &["rev-parse", branch]);
+        assert!(out.status.success());
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
+    #[test]
+    fn already_up_to_date_when_branch_contains_default() {
+        // Feature branch that's strictly ahead of main → nothing to rebase.
+        if !git_available() {
+            eprintln!("skipping: git not on PATH");
+            return;
+        }
+        let repo = init_repo("uptodate");
+        run_git_in(&repo, &["checkout", "-q", "-b", "feature"])
+            .status
+            .success()
+            .then_some(())
+            .expect("branch checkout");
+        commit_file(&repo, "feature.txt", "hi\n", "feature work");
+
+        let outcome = rebase_worker_branch_onto_default(&Host::Local, &repo, "main");
+        match outcome {
+            RebaseOutcome::AlreadyUpToDate { default_sha } => {
+                assert_eq!(default_sha, branch_sha(&repo, "main"));
+            }
+            other => panic!("expected AlreadyUpToDate, got {other:?}"),
+        }
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    #[test]
+    fn rebases_cleanly_when_main_advanced_independently() {
+        // Branch off main, then advance main with a non-conflicting commit,
+        // then run the auto-rebase. The feature branch should be rewritten
+        // on top of the new main, with the feature commit preserved.
+        if !git_available() {
+            eprintln!("skipping: git not on PATH");
+            return;
+        }
+        let repo = init_repo("clean");
+
+        // Branch off main's current tip.
+        run_git_in(&repo, &["checkout", "-q", "-b", "feature"]);
+        commit_file(&repo, "feature.txt", "feature\n", "feature work");
+        let feature_before = head_sha(&repo);
+
+        // Advance main with a commit on a separate file.
+        run_git_in(&repo, &["checkout", "-q", "main"]);
+        commit_file(&repo, "prereq.txt", "prereq\n", "prereq landed");
+        let new_main = head_sha(&repo);
+
+        // Back to the feature branch (this is how the worker's worktree
+        // would be left at the moment the marker fires).
+        run_git_in(&repo, &["checkout", "-q", "feature"]);
+        assert_eq!(head_sha(&repo), feature_before);
+
+        let outcome = rebase_worker_branch_onto_default(&Host::Local, &repo, "main");
+        match outcome {
+            RebaseOutcome::Rebased {
+                before_sha,
+                after_sha,
+                default_sha,
+            } => {
+                assert_eq!(before_sha, feature_before);
+                assert_eq!(default_sha, new_main);
+                assert_ne!(after_sha, feature_before, "HEAD must move");
+                // Post-rebase: the feature commit sits on top of new main.
+                let parent_of_head = String::from_utf8_lossy(
+                    &run_git_in(&repo, &["rev-parse", "HEAD~1"]).stdout,
+                )
+                .trim()
+                .to_string();
+                assert_eq!(parent_of_head, new_main);
+                // Both files survive the rewrite.
+                assert!(repo.join("feature.txt").exists());
+                assert!(repo.join("prereq.txt").exists());
+            }
+            other => panic!("expected Rebased, got {other:?}"),
+        }
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    #[test]
+    fn conflict_is_aborted_and_branch_head_unchanged() {
+        // Both branches touch the same file; the rebase must conflict,
+        // we must abort it, and the worker's branch HEAD must return to
+        // its pre-rebase state with a clean worktree. The human reviewer
+        // resolves the conflict during the review checkout.
+        if !git_available() {
+            eprintln!("skipping: git not on PATH");
+            return;
+        }
+        let repo = init_repo("conflict");
+
+        // Seed a file on main, then branch off.
+        commit_file(&repo, "shared.txt", "v0\n", "seed shared");
+        run_git_in(&repo, &["checkout", "-q", "-b", "feature"]);
+        commit_file(&repo, "shared.txt", "feature change\n", "feature edit");
+        let feature_before = head_sha(&repo);
+
+        // Conflicting main commit on the same file.
+        run_git_in(&repo, &["checkout", "-q", "main"]);
+        commit_file(&repo, "shared.txt", "main change\n", "main edit");
+
+        run_git_in(&repo, &["checkout", "-q", "feature"]);
+        assert_eq!(head_sha(&repo), feature_before);
+
+        let outcome = rebase_worker_branch_onto_default(&Host::Local, &repo, "main");
+        match outcome {
+            RebaseOutcome::Conflict { stderr_excerpt, .. } => {
+                assert!(
+                    !stderr_excerpt.is_empty(),
+                    "expected a non-empty conflict excerpt"
+                );
+            }
+            other => panic!("expected Conflict, got {other:?}"),
+        }
+
+        // HEAD must be unchanged after the abort, and the worktree must be
+        // clean (no rebase-in-progress state, no merge conflict markers).
+        assert_eq!(
+            head_sha(&repo),
+            feature_before,
+            "branch HEAD must roll back after abort"
+        );
+        let status = run_git_in(&repo, &["status", "--porcelain"]);
+        assert!(status.status.success());
+        let stdout = String::from_utf8_lossy(&status.stdout);
+        assert!(
+            stdout.trim().is_empty(),
+            "worktree must be clean after abort, got: {stdout}"
+        );
+
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    #[test]
+    fn missing_default_branch_is_skipped() {
+        // Default-branch name in project YAML doesn't exist in the
+        // worktree (renamed branch, typo, fresh shallow clone). Function
+        // must skip rather than fail the whole review handoff.
+        if !git_available() {
+            eprintln!("skipping: git not on PATH");
+            return;
+        }
+        let repo = init_repo("missing-default");
+        run_git_in(&repo, &["checkout", "-q", "-b", "feature"]);
+        commit_file(&repo, "feature.txt", "hi\n", "feature work");
+
+        let outcome =
+            rebase_worker_branch_onto_default(&Host::Local, &repo, "ghost-branch-does-not-exist");
+        match outcome {
+            RebaseOutcome::Skipped { reason } => {
+                assert!(
+                    reason.contains("ghost-branch-does-not-exist"),
+                    "reason should name the missing branch: {reason}"
+                );
+            }
+            other => panic!("expected Skipped, got {other:?}"),
+        }
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    #[test]
+    fn dirty_worktree_is_skipped() {
+        // Worker forgot to commit before writing the marker. The function
+        // must NOT run the rebase (it would lose the uncommitted work) and
+        // must report a skip reason explaining why.
+        if !git_available() {
+            eprintln!("skipping: git not on PATH");
+            return;
+        }
+        let repo = init_repo("dirty");
+        run_git_in(&repo, &["checkout", "-q", "-b", "feature"]);
+        commit_file(&repo, "feature.txt", "v0\n", "feature work");
+
+        // Advance main so a rebase would otherwise be needed.
+        run_git_in(&repo, &["checkout", "-q", "main"]);
+        commit_file(&repo, "prereq.txt", "prereq\n", "prereq");
+        run_git_in(&repo, &["checkout", "-q", "feature"]);
+
+        // Uncommitted change in the worker's worktree.
+        std::fs::write(repo.join("feature.txt"), "wip change\n").unwrap();
+
+        let outcome = rebase_worker_branch_onto_default(&Host::Local, &repo, "main");
+        match outcome {
+            RebaseOutcome::Skipped { reason } => {
+                assert!(
+                    reason.contains("dirty"),
+                    "reason should mention dirty: {reason}"
+                );
+            }
+            other => panic!("expected Skipped on dirty worktree, got {other:?}"),
+        }
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    #[test]
+    fn dirty_only_in_dot_claude_is_ignored() {
+        // shelbi's own deploy footprint lives under `.claude/` (settings,
+        // review marker). It's gitignored in normal use, but if a user
+        // hasn't ignored it yet we still don't want it blocking a rebase
+        // — same carve-out the review preflight applies.
+        if !git_available() {
+            eprintln!("skipping: git not on PATH");
+            return;
+        }
+        let repo = init_repo("dotclaude");
+        run_git_in(&repo, &["checkout", "-q", "-b", "feature"]);
+        commit_file(&repo, "feature.txt", "v0\n", "feature work");
+
+        run_git_in(&repo, &["checkout", "-q", "main"]);
+        commit_file(&repo, "prereq.txt", "prereq\n", "prereq");
+        run_git_in(&repo, &["checkout", "-q", "feature"]);
+
+        // Drop a marker-style file under .claude/. It's untracked, but
+        // the carve-out skips it from the dirty check.
+        std::fs::create_dir_all(repo.join(".claude")).unwrap();
+        std::fs::write(repo.join(".claude/shelbi-review-ready"), "task-id\n").unwrap();
+
+        let outcome = rebase_worker_branch_onto_default(&Host::Local, &repo, "main");
+        assert!(
+            matches!(outcome, RebaseOutcome::Rebased { .. }),
+            "expected Rebased despite .claude/ presence, got {outcome:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    #[test]
+    fn detail_format_uses_short_shas() {
+        // The detail helper feeds straight into events.log; downstream
+        // parsers expect a stable, compact shape — short 7-char SHAs and
+        // a recognizable `default=` prefix.
+        let outcome = RebaseOutcome::Rebased {
+            before_sha: "abcdef0123456789".into(),
+            after_sha: "1234567890abcdef".into(),
+            default_sha: "fedcba9876543210".into(),
+        };
+        assert_eq!(outcome.detail(), "abcdef0..1234567_onto_fedcba9");
+
+        let outcome = RebaseOutcome::AlreadyUpToDate {
+            default_sha: "abcdef0123456789".into(),
+        };
+        assert_eq!(outcome.detail(), "default=abcdef0");
     }
 }
