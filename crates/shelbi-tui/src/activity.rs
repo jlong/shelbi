@@ -39,7 +39,7 @@ use ratatui::{
     Frame,
 };
 
-use shelbi_core::Column;
+use shelbi_core::{Column, StatusCategory, DEFAULT_WORKFLOW_NAME};
 use shelbi_state::{events_log_path, WorkerState};
 
 /// Avatar size in character cells. Each cell covers two vertical
@@ -87,12 +87,21 @@ fn avatar_for(name: &str) -> (Option<[&'static str; AVATAR_H]>, Color) {
 /// in the file should ever be silently dropped.
 #[derive(Debug, Clone)]
 pub enum Event {
+    /// A task transition. Carries the workflow-aware fields documented in
+    /// `Plans/workflows.md` §10 (`workflow=`, `from_category=`,
+    /// `to_category=`); pre-workflow lines have those filled in by the
+    /// back-compat parser — `workflow` defaults to
+    /// [`DEFAULT_WORKFLOW_NAME`] and the categories are derived from the
+    /// canonical 5-status column-to-category map.
     Task {
         ts: DateTime<Utc>,
         id: String,
+        workflow: String,
         from: Column,
         to: Column,
         reason: String,
+        from_category: StatusCategory,
+        to_category: StatusCategory,
         raw: String,
     },
     Worker {
@@ -522,25 +531,53 @@ pub fn parse_event_line(line: &str) -> Event {
     };
 
     if let Some(rest) = rest.strip_prefix("task=") {
-        // Format: `<id> <from> -> <to> reason=<reason>`
-        let mut tokens = rest.splitn(5, ' ');
-        let id = tokens.next().unwrap_or("");
-        let from_s = tokens.next().unwrap_or("");
+        // Two on-the-wire shapes coexist (`Plans/workflows.md` §10):
+        //
+        //   Old: `<id> <from> -> <to> reason=<reason>`
+        //   New: `<id> workflow=<name> <from> -> <to> reason=<reason>
+        //         from_category=<cat> to_category=<cat>`
+        //
+        // The second token after `task=<id>` disambiguates — if it starts
+        // with `workflow=` we read the new fields, otherwise we default
+        // `workflow` to "default" and derive categories from the canonical
+        // 5-status column-to-category map (`Column::category`).
+        let mut tokens = rest.split(' ');
+        let id = tokens.next().unwrap_or("").to_string();
+        let mut next = tokens.next().unwrap_or("");
+        let workflow = if let Some(name) = next.strip_prefix("workflow=") {
+            let name = name.to_string();
+            next = tokens.next().unwrap_or("");
+            name
+        } else {
+            DEFAULT_WORKFLOW_NAME.to_string()
+        };
+        let from_s = next;
         let arrow = tokens.next().unwrap_or("");
         let to_s = tokens.next().unwrap_or("");
-        let reason_s = tokens.next().unwrap_or("");
+        // Everything after `<to>` is k=v tokens (reason, from_category,
+        // to_category) in any order — defensive against future field
+        // shuffles, and tolerant of missing trailing fields on old lines.
+        let kv = parse_kv(tokens.collect::<Vec<&str>>().join(" ").as_str());
         if arrow == "->" {
             if let (Ok(from), Ok(to)) = (from_s.parse::<Column>(), to_s.parse::<Column>()) {
-                let reason = reason_s
-                    .strip_prefix("reason=")
-                    .unwrap_or(reason_s)
-                    .to_string();
+                let reason = kv.get("reason").cloned().unwrap_or_default();
+                let from_category = kv
+                    .get("from_category")
+                    .and_then(|s| s.parse::<StatusCategory>().ok())
+                    .unwrap_or_else(|| from.category());
+                let to_category = kv
+                    .get("to_category")
+                    .and_then(|s| s.parse::<StatusCategory>().ok())
+                    .unwrap_or_else(|| to.category());
                 return Event::Task {
                     ts,
-                    id: id.to_string(),
+                    id,
+                    workflow,
                     from,
                     to,
                     reason,
+                    from_category,
+                    to_category,
                     raw,
                 };
             }
@@ -1038,6 +1075,7 @@ fn render_event(
             to,
             reason,
             raw,
+            ..
         } => render_task_event(app, *ts, id, *from, *to, reason, raw, width, now, started_at),
         Event::Worker {
             ts, name, new, ..
@@ -1742,16 +1780,83 @@ mod tests {
     use chrono::TimeZone;
 
     #[test]
-    fn parses_task_event() {
+    fn parses_legacy_task_event_with_defaults() {
+        // Pre-workflow line shape (`Plans/workflows.md` §10). The
+        // back-compat parser must fill `workflow=default` and derive
+        // categories from the canonical 5-status map — that's what the
+        // orchestrator's reaction rules now key off, so old lines have to
+        // come through with the same shape new ones do.
         let line = "2026-06-23T04:19:33.715717+00:00 task=foo todo -> in_progress reason=user:cli:start";
         match parse_event_line(line) {
             Event::Task {
-                id, from, to, reason, ..
+                id,
+                workflow,
+                from,
+                to,
+                reason,
+                from_category,
+                to_category,
+                ..
             } => {
                 assert_eq!(id, "foo");
+                assert_eq!(workflow, "default");
                 assert_eq!(from, Column::Todo);
                 assert_eq!(to, Column::InProgress);
                 assert_eq!(reason, "user:cli:start");
+                assert_eq!(from_category, StatusCategory::Ready);
+                assert_eq!(to_category, StatusCategory::Active);
+            }
+            other => panic!("expected task event, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_workflow_aware_task_event() {
+        // Full shape from §10:
+        // `<ts> task=<id> workflow=<name> <from> -> <to> reason=<r>
+        //  from_category=<c> to_category=<c>`
+        let line = "2026-06-23T04:19:33+00:00 task=ship-it workflow=feature-task \
+                    in_progress -> review reason=worker:review-marker \
+                    from_category=active to_category=handoff";
+        match parse_event_line(line) {
+            Event::Task {
+                id,
+                workflow,
+                from,
+                to,
+                reason,
+                from_category,
+                to_category,
+                ..
+            } => {
+                assert_eq!(id, "ship-it");
+                assert_eq!(workflow, "feature-task");
+                assert_eq!(from, Column::InProgress);
+                assert_eq!(to, Column::Review);
+                assert_eq!(reason, "worker:review-marker");
+                assert_eq!(from_category, StatusCategory::Active);
+                assert_eq!(to_category, StatusCategory::Handoff);
+            }
+            other => panic!("expected task event, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn workflow_aware_parser_tolerates_missing_category_fields() {
+        // A future writer that drops the category annotations (or an
+        // intermediate-format line) must still parse — the parser falls
+        // back to deriving them from the canonical column map.
+        let line = "2026-06-23T04:19:33+00:00 task=foo workflow=default todo -> in_progress reason=user:cli";
+        match parse_event_line(line) {
+            Event::Task {
+                workflow,
+                from_category,
+                to_category,
+                ..
+            } => {
+                assert_eq!(workflow, "default");
+                assert_eq!(from_category, StatusCategory::Ready);
+                assert_eq!(to_category, StatusCategory::Active);
             }
             other => panic!("expected task event, got {other:?}"),
         }
@@ -1984,9 +2089,12 @@ mod tests {
         let ev = Event::Task {
             ts,
             id: "demo-task".into(),
+            workflow: DEFAULT_WORKFLOW_NAME.into(),
             from,
             to,
             reason: reason.into(),
+            from_category: from.category(),
+            to_category: to.category(),
             raw: String::new(),
         };
         render_event(&ev, &mut app, 80, now, None)
@@ -2118,9 +2226,12 @@ mod tests {
         Event::Task {
             ts: Utc.with_ymd_and_hms(2026, 6, 23, 12, 0, 0).unwrap(),
             id: "demo-task".into(),
+            workflow: DEFAULT_WORKFLOW_NAME.into(),
             from: Column::Todo,
             to: Column::InProgress,
             reason: reason.into(),
+            from_category: Column::Todo.category(),
+            to_category: Column::InProgress.category(),
             raw: String::new(),
         }
     }
@@ -2245,26 +2356,35 @@ mod tests {
         app.events.push(Event::Task {
             ts: Utc.with_ymd_and_hms(2026, 1, 1, 10, 0, 0).unwrap(),
             id: "foo".into(),
+            workflow: DEFAULT_WORKFLOW_NAME.into(),
             from: Column::Todo,
             to: Column::InProgress,
             reason: "user:cli".into(),
+            from_category: Column::Todo.category(),
+            to_category: Column::InProgress.category(),
             raw: String::new(),
         });
         // Unrelated task in between — must not affect the lookup.
         app.events.push(Event::Task {
             ts: Utc.with_ymd_and_hms(2026, 1, 1, 10, 5, 0).unwrap(),
             id: "bar".into(),
+            workflow: DEFAULT_WORKFLOW_NAME.into(),
             from: Column::Todo,
             to: Column::InProgress,
             reason: "user:cli".into(),
+            from_category: Column::Todo.category(),
+            to_category: Column::InProgress.category(),
             raw: String::new(),
         });
         app.events.push(Event::Task {
             ts: Utc.with_ymd_and_hms(2026, 1, 1, 10, 18, 0).unwrap(),
             id: "foo".into(),
+            workflow: DEFAULT_WORKFLOW_NAME.into(),
             from: Column::InProgress,
             to: Column::Review,
             reason: "worker:review-marker".into(),
+            from_category: Column::InProgress.category(),
+            to_category: Column::Review.category(),
             raw: String::new(),
         });
         let started = app.started_at(2, "foo");

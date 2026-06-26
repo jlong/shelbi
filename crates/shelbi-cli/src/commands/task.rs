@@ -365,9 +365,9 @@ fn depends(project: &str, args: DependsArgs) -> Result<()> {
 fn move_to(project: &str, id: &str, to: &str, reason: Option<&str>) -> Result<()> {
     let column = Column::from_str(to).map_err(|e| anyhow!(e))?;
     let moved = shelbi_state::move_task(project, id, column).map_err(|e| anyhow!(e))?;
-    if let Some((from, to_col)) = moved {
+    if let Some((from, to_col, workflow)) = moved {
         let reason = reason.unwrap_or("user:cli");
-        if let Err(e) = shelbi_state::append_task_event(id, from, to_col, reason) {
+        if let Err(e) = shelbi_state::append_task_event(id, &workflow, from, to_col, reason) {
             eprintln!("warning: append_task_event failed: {e}");
         }
     }
@@ -518,9 +518,14 @@ fn start(
     if prev_column != Column::InProgress {
         shelbi_state::renumber_column(project, prev_column).map_err(|e| anyhow!(e))?;
         let reason = reason.unwrap_or("user:cli:start");
-        if let Err(e) =
-            shelbi_state::append_task_event(id, prev_column, Column::InProgress, reason)
-        {
+        let workflow = tf.task.workflow_or_default();
+        if let Err(e) = shelbi_state::append_task_event(
+            id,
+            workflow,
+            prev_column,
+            Column::InProgress,
+            reason,
+        ) {
             eprintln!("warning: append_task_event failed: {e}");
         }
     }
@@ -649,9 +654,14 @@ mod tests {
         let lines: Vec<&str> = log.lines().collect();
         assert_eq!(lines.len(), 1);
         let line = lines[0];
+        // Workflow-aware shape: `<ts> task=<id> workflow=<name> <from> ->
+        // <to> reason=<r> from_category=<c> to_category=<c>` (§10).
         assert!(line.contains(" task=a "), "line: {line}");
+        assert!(line.contains(" workflow=default "), "line: {line}");
         assert!(line.contains(" backlog -> todo "), "line: {line}");
-        assert!(line.ends_with("reason=user:cli"), "line: {line}");
+        assert!(line.contains(" reason=user:cli "), "line: {line}");
+        assert!(line.contains(" from_category=backlog "), "line: {line}");
+        assert!(line.ends_with(" to_category=ready"), "line: {line}");
 
         std::env::remove_var("SHELBI_HOME");
         let _ = std::fs::remove_dir_all(&home);
@@ -670,10 +680,16 @@ mod tests {
         let log = std::fs::read_to_string(shelbi_state::events_log_path().unwrap()).unwrap();
         let lines: Vec<&str> = log.lines().collect();
         assert_eq!(lines.len(), 1);
-        // sanitize_reason folds whitespace to underscores so the line stays
-        // parseable; the orchestrator parses by `reason=<prefix>:...`.
+        // sanitize_reason folds whitespace to underscores so the `reason=`
+        // value stays a single token even with the `from_category=` /
+        // `to_category=` annotations trailing it (§10 shape).
         assert!(
-            lines[0].ends_with("reason=orchestrator:auto-dispatch_worker=alpha"),
+            lines[0].contains(" reason=orchestrator:auto-dispatch_worker=alpha "),
+            "line: {}",
+            lines[0],
+        );
+        assert!(
+            lines[0].ends_with(" to_category=active"),
             "line: {}",
             lines[0],
         );

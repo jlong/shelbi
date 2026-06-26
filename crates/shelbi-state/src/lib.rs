@@ -760,28 +760,29 @@ fn find_cycle(graph: &HashMap<&str, &[String]>, start: &str) -> Option<Vec<Strin
 /// Move `id` to `new_column`. The task lands at the bottom (priority = N)
 /// and the old column gets renumbered contiguous from 0.
 ///
-/// Returns `Some((from, to))` when the move happened, or `None` when the
-/// task was already in `new_column`. Callers use the returned columns to
-/// emit the `events.log` line — keeping the read inside this function
-/// keeps callers from having to re-read the file just to learn the prior
-/// column.
+/// Returns `Some((from, to, workflow))` when the move happened, or `None`
+/// when the task was already in `new_column`. The workflow name is the
+/// task's resolved workflow (`task.workflow_or_default()`) so callers can
+/// hand it straight to [`append_task_event`] without re-reading the task
+/// file just to fill the events log line.
 pub fn move_task(
     project: &str,
     id: &str,
     new_column: Column,
-) -> Result<Option<(Column, Column)>> {
+) -> Result<Option<(Column, Column, String)>> {
     let TaskFile { mut task, body } = load_task(project, id)?;
     if task.column == new_column {
         return Ok(None);
     }
     let old_column = task.column;
+    let workflow = task.workflow_or_default().to_string();
     let new_priority = list_column(project, new_column)?.len() as u32;
     task.column = new_column;
     task.priority = new_priority;
     task.updated_at = chrono::Utc::now();
     save_task(project, &task, &body)?;
     renumber_column(project, old_column)?;
-    Ok(Some((old_column, new_column)))
+    Ok(Some((old_column, new_column, workflow)))
 }
 
 /// Re-position `id` to slot `new_priority` within its current column. Other

@@ -21,7 +21,7 @@ use std::path::PathBuf;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-use shelbi_core::{Column, Result};
+use shelbi_core::{Column, Result, DEFAULT_WORKFLOW_NAME};
 
 use crate::{atomic_write, ensure_dir, shelbi_home};
 
@@ -170,16 +170,46 @@ pub fn append_worker_event(
     append_event_line(&format!("{ts} worker={worker} {prev_str} -> {new}"))
 }
 
-/// Append `<rfc3339> task=<id> <from> -> <to> reason=<short>` to
-/// `~/.shelbi/events.log`. Shares the file with worker events; the
-/// orchestrator distinguishes the two by the `task=` vs `worker=` prefix.
+/// Append a task transition line to `~/.shelbi/events.log` using the
+/// workflow-aware line shape from `Plans/workflows.md` §10:
+///
+/// ```text
+/// <rfc3339> task=<id> workflow=<name> <from> -> <to> reason=<short> from_category=<cat> to_category=<cat>
+/// ```
+///
+/// Shares the file with worker events; the orchestrator distinguishes the
+/// two by the `task=` vs `worker=` prefix.
+///
+/// `workflow` is the name from the task's frontmatter (typically
+/// `task.workflow_or_default()`); passing `""` is treated as the default
+/// workflow so callers that haven't yet plumbed through the lookup don't
+/// emit a malformed line. `<from>` / `<to>` are the column-status ids
+/// (lowercase) and the `from_category` / `to_category` annotations are
+/// derived from [`Column::category`] so reaction rules can match
+/// semantically without re-reading the workflow YAML.
 ///
 /// `reason` should be a single short token (whitespace/newlines are folded
 /// to underscores so the line stays parseable).
-pub fn append_task_event(task_id: &str, from: Column, to: Column, reason: &str) -> Result<()> {
+pub fn append_task_event(
+    task_id: &str,
+    workflow: &str,
+    from: Column,
+    to: Column,
+    reason: &str,
+) -> Result<()> {
     let ts = Utc::now().to_rfc3339();
     let reason = sanitize_reason(reason);
-    append_event_line(&format!("{ts} task={task_id} {from} -> {to} reason={reason}"))
+    let workflow_name = if workflow.trim().is_empty() {
+        DEFAULT_WORKFLOW_NAME
+    } else {
+        workflow
+    };
+    let from_category = from.category();
+    let to_category = to.category();
+    append_event_line(&format!(
+        "{ts} task={task_id} workflow={workflow_name} {from} -> {to} \
+         reason={reason} from_category={from_category} to_category={to_category}"
+    ))
 }
 
 /// Append `<rfc3339> project=<name> <action> reason=<reason>` to
@@ -465,41 +495,92 @@ mod tests {
         let home = fresh_home();
         std::env::set_var("SHELBI_HOME", &home);
 
-        append_task_event("fix-login", Column::Todo, Column::InProgress, "assigned").unwrap();
-        append_task_event("fix-login", Column::InProgress, Column::Review, "worker_review")
-            .unwrap();
+        append_task_event(
+            "fix-login",
+            "default",
+            Column::Todo,
+            Column::InProgress,
+            "assigned",
+        )
+        .unwrap();
+        append_task_event(
+            "fix-login",
+            "default",
+            Column::InProgress,
+            Column::Review,
+            "worker_review",
+        )
+        .unwrap();
 
         let log = std::fs::read_to_string(events_log_path().unwrap()).unwrap();
         let lines: Vec<&str> = log.lines().collect();
         assert_eq!(lines.len(), 2);
 
-        // Each line must split cleanly back into its fields.
-        let parsed: Vec<(&str, &str, &str, &str, &str, &str)> = lines
+        // Each line must split cleanly back into its fields:
+        // `<ts> task=<id> workflow=<name> <from> -> <to> reason=<r>
+        //  from_category=<c> to_category=<c>` — see `Plans/workflows.md` §10.
+        let parsed: Vec<Vec<&str>> = lines
             .iter()
-            .map(|line| {
-                let mut it = line.splitn(6, ' ');
-                let ts = it.next().unwrap();
-                let task = it.next().unwrap();
-                let from = it.next().unwrap();
-                let arrow = it.next().unwrap();
-                let to = it.next().unwrap();
-                let reason = it.next().unwrap();
-                (ts, task, from, arrow, to, reason)
-            })
+            .map(|line| line.split(' ').collect::<Vec<&str>>())
             .collect();
 
         // Timestamp parses as RFC3339.
-        for (ts, ..) in &parsed {
+        for tokens in &parsed {
+            let ts = tokens[0];
             chrono::DateTime::parse_from_rfc3339(ts)
                 .unwrap_or_else(|_| panic!("not rfc3339: {ts}"));
         }
-        assert_eq!(parsed[0].1, "task=fix-login");
-        assert_eq!(parsed[0].2, "todo");
-        assert_eq!(parsed[0].3, "->");
-        assert_eq!(parsed[0].4, "in_progress");
-        assert_eq!(parsed[0].5, "reason=assigned");
-        assert_eq!(parsed[1].4, "review");
-        assert_eq!(parsed[1].5, "reason=worker_review");
+        assert_eq!(parsed[0][1], "task=fix-login");
+        assert_eq!(parsed[0][2], "workflow=default");
+        assert_eq!(parsed[0][3], "todo");
+        assert_eq!(parsed[0][4], "->");
+        assert_eq!(parsed[0][5], "in_progress");
+        assert_eq!(parsed[0][6], "reason=assigned");
+        assert_eq!(parsed[0][7], "from_category=ready");
+        assert_eq!(parsed[0][8], "to_category=active");
+        assert_eq!(parsed[1][5], "review");
+        assert_eq!(parsed[1][6], "reason=worker_review");
+        assert_eq!(parsed[1][7], "from_category=active");
+        assert_eq!(parsed[1][8], "to_category=handoff");
+
+        std::env::remove_var("SHELBI_HOME");
+    }
+
+    #[test]
+    fn append_task_event_uses_default_workflow_when_blank() {
+        // Callers that haven't yet plumbed through `task.workflow_or_default()`
+        // can pass an empty string and still get a well-formed line — the
+        // line never carries `workflow=` with no value.
+        let _g = TEST_LOCK.lock().unwrap();
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+
+        append_task_event("a", "", Column::Todo, Column::Done, "assigned").unwrap();
+        let log = std::fs::read_to_string(events_log_path().unwrap()).unwrap();
+        let line = log.lines().next().unwrap();
+        assert!(line.contains(" workflow=default "), "line: {line}");
+
+        std::env::remove_var("SHELBI_HOME");
+    }
+
+    #[test]
+    fn append_task_event_emits_workflow_name_verbatim() {
+        let _g = TEST_LOCK.lock().unwrap();
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+
+        append_task_event(
+            "ship-it",
+            "feature-task",
+            Column::InProgress,
+            Column::Review,
+            "worker:review-marker",
+        )
+        .unwrap();
+        let log = std::fs::read_to_string(events_log_path().unwrap()).unwrap();
+        let line = log.lines().next().unwrap();
+        assert!(line.contains(" workflow=feature-task "), "line: {line}");
+        assert!(line.ends_with(" to_category=handoff"), "line: {line}");
 
         std::env::remove_var("SHELBI_HOME");
     }
@@ -620,12 +701,18 @@ mod tests {
         let home = fresh_home();
         std::env::set_var("SHELBI_HOME", &home);
 
-        append_task_event("a", Column::Todo, Column::Done, "user moved\nit").unwrap();
+        append_task_event("a", "default", Column::Todo, Column::Done, "user moved\nit").unwrap();
         let log = std::fs::read_to_string(events_log_path().unwrap()).unwrap();
         let lines: Vec<&str> = log.lines().collect();
-        // The reason newline must not produce a torn line.
+        // The reason newline must not produce a torn line — the line keeps
+        // going past `reason=` into the trailing category annotations.
         assert_eq!(lines.len(), 1);
-        assert!(lines[0].ends_with("reason=user_moved_it"));
+        assert!(
+            lines[0].contains(" reason=user_moved_it "),
+            "line: {}",
+            lines[0]
+        );
+        assert!(lines[0].ends_with(" to_category=done"), "line: {}", lines[0]);
 
         std::env::remove_var("SHELBI_HOME");
     }
@@ -641,6 +728,7 @@ mod tests {
             for i in 0..N {
                 append_task_event(
                     &format!("t{i:04}"),
+                    "default",
                     Column::Todo,
                     Column::InProgress,
                     "assigned",

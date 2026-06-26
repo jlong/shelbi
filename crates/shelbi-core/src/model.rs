@@ -532,6 +532,22 @@ impl Column {
             Column::Done => "done",
         }
     }
+
+    /// The semantic [`crate::StatusCategory`] this column maps to under
+    /// the canonical default workflow. Used by the events log writer to
+    /// fill the `from_category=`/`to_category=` fields on the new line
+    /// shape, and by the back-compat parser to derive a category for
+    /// pre-workflow lines that don't carry one. See `Plans/workflows.md`
+    /// §1 for the category table.
+    pub fn category(self) -> crate::StatusCategory {
+        match self {
+            Column::Backlog => crate::StatusCategory::Backlog,
+            Column::Todo => crate::StatusCategory::Ready,
+            Column::InProgress => crate::StatusCategory::Active,
+            Column::Review => crate::StatusCategory::Handoff,
+            Column::Done => crate::StatusCategory::Done,
+        }
+    }
 }
 
 impl std::fmt::Display for Column {

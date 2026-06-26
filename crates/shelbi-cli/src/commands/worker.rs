@@ -231,8 +231,10 @@ fn release_worker_tasks(project: &str, worker_name: &str) -> Result<Vec<String>>
         shelbi_state::save_task(project, &task, &tf.body).map_err(|e| anyhow!(e))?;
         let moved = shelbi_state::move_task(project, &id, Column::Todo)
             .map_err(|e| anyhow!(e))?;
-        if let Some((from, to)) = moved {
-            if let Err(e) = shelbi_state::append_task_event(&id, from, to, "worker:stop") {
+        if let Some((from, to, workflow)) = moved {
+            if let Err(e) =
+                shelbi_state::append_task_event(&id, &workflow, from, to, "worker:stop")
+            {
                 eprintln!("warning: append_task_event failed: {e}");
             }
         }
@@ -319,17 +321,28 @@ mod tests {
         assert_eq!(bob_task.task.priority, 0);
 
         // The release path emits a `worker:stop` task event so the
-        // orchestrator's events.log tail sees the column return.
+        // orchestrator's events.log tail sees the column return — with the
+        // workflow-aware shape from `Plans/workflows.md` §10.
         let log = std::fs::read_to_string(shelbi_state::events_log_path().unwrap()).unwrap();
         let lines: Vec<&str> = log.lines().collect();
         assert_eq!(lines.len(), 1);
         assert!(lines[0].contains(" task=fix-login "), "line: {}", lines[0]);
         assert!(
+            lines[0].contains(" workflow=default "),
+            "line: {}",
+            lines[0]
+        );
+        assert!(
             lines[0].contains(" in_progress -> todo "),
             "line: {}",
             lines[0]
         );
-        assert!(lines[0].ends_with("reason=worker:stop"), "line: {}", lines[0]);
+        assert!(
+            lines[0].contains(" reason=worker:stop "),
+            "line: {}",
+            lines[0]
+        );
+        assert!(lines[0].ends_with(" to_category=ready"), "line: {}", lines[0]);
 
         std::env::remove_var("SHELBI_HOME");
     }
