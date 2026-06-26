@@ -269,6 +269,7 @@ mod tests {
             column,
             priority,
             assigned_to: assigned_to.map(str::to_string),
+            workflow: None,
             branch: None,
             depends_on: Vec::new(),
             prefers_machine: None,

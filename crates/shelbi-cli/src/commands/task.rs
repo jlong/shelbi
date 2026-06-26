@@ -14,7 +14,7 @@ use std::str::FromStr;
 use anyhow::{anyhow, bail, Context, Result};
 use chrono::Utc;
 use clap::{Args as ClapArgs, Subcommand};
-use shelbi_core::{validate_task_id, Column, Task};
+use shelbi_core::{validate_task_id, validate_workflow_name, Column, Task};
 
 use super::require_project;
 
@@ -107,6 +107,16 @@ pub struct AddArgs {
     /// orchestrator decides whether to honor it.
     #[arg(long = "prefers-machine", value_name = "NAME")]
     pub prefers_machine: Option<String>,
+    /// Workflow this task runs under. Names a file in `workflows/<NAME>.yaml`.
+    /// Omit to inherit the project's default workflow.
+    #[arg(long = "workflow", value_name = "NAME")]
+    pub workflow: Option<String>,
+    /// Pre-fill the task's `branch:` frontmatter field. Omit to let the
+    /// orchestrator cut `shelbi/<task-id>` off the resolved base branch
+    /// at dispatch time; supply a value to point the task at an existing
+    /// branch (the *release task* pattern in `Plans/workflows.md` §12).
+    #[arg(long = "branch", value_name = "BRANCH")]
+    pub branch: Option<String>,
 }
 
 #[derive(Debug, ClapArgs)]
@@ -176,6 +186,9 @@ fn add(project: &str, args: AddArgs) -> Result<()> {
         None => generate_unique_id(project, &args.title)?,
     };
 
+    if let Some(name) = args.workflow.as_deref() {
+        validate_workflow_name(name).map_err(|e| anyhow!(e))?;
+    }
     let priority = shelbi_state::list_column(project, column)
         .map_err(|e| anyhow!(e))?
         .len() as u32;
@@ -186,7 +199,8 @@ fn add(project: &str, args: AddArgs) -> Result<()> {
         column,
         priority,
         assigned_to: None,
-        branch: None,
+        workflow: args.workflow.clone(),
+        branch: args.branch.clone(),
         depends_on: dedup_preserving_order(args.depends_on.clone()),
         prefers_machine: args.prefers_machine.clone(),
         zen: None,
@@ -601,6 +615,7 @@ mod tests {
             column,
             priority: 0,
             assigned_to: None,
+            workflow: None,
             branch: None,
             depends_on: Vec::new(),
             prefers_machine: None,

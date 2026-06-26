@@ -383,6 +383,7 @@ mod tests {
             column: shelbi_core::Column::Review,
             priority: 0,
             assigned_to: Some("alice".into()),
+            workflow: None,
             branch: Some("shelbi/fix-thing".into()),
             depends_on: Vec::new(),
             prefers_machine: None,

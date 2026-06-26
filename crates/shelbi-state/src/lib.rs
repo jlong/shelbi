@@ -1064,6 +1064,7 @@ mod tests {
             column,
             priority,
             assigned_to: None,
+            workflow: None,
             branch: None,
             depends_on: Vec::new(),
             prefers_machine: None,
