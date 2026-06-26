@@ -83,11 +83,11 @@ initial_status: Backlog
 
 # Optional: restrict allowed transitions. If absent, any-to-any is allowed.
 # allowed_transitions:
-#   Backlog: [Todo]
-#   Todo: [InProgress, Backlog]
-#   InProgress: [Review, Todo]
-#   Review: [Done, Todo, InProgress]
-#   Done: []
+# Backlog: [Todo]
+# Todo: [InProgress, Backlog]
+# InProgress: [Review, Todo]
+# Review: [Done, Todo, InProgress]
+# Done: []
 
 # Optional: git-side behavior and per-edge actions. See §12 for the full
 # action set, semantics, and worked scenarios. Omitting both blocks gives a
@@ -285,7 +285,7 @@ transitions:
 **Action set.** Five primitives, each idempotent and silently no-op when not applicable:
 
 | Action          | Effect                                                                                                          |
-|-----------------|-----------------------------------------------------------------------------------------------------------------|
+| --------------- | --------------------------------------------------------------------------------------------------------------- |
 | `push_branch`   | Push the task's branch to `origin`.                                                                             |
 | `open_pr`       | Open a PR against `git.base_branch`. No-op if one is already open.                                              |
 | `merge`         | Merge the branch using `git.merge_strategy`. If a PR is open, merges via PR; otherwise merges branch-to-branch. |
@@ -299,20 +299,21 @@ Missing transitions are no-ops — a workflow only declares the edges where work
 **Who executes the actions.**
 
 - **In Zen Mode**, the orchestrator runs the actions for transitions it auto-triggers, gated by §8's confidence bars. A failed precheck (local checks, conflict, diff size, danger paths, CI) short-circuits the transition; the task stays where it is.
+
 - **Outside Zen**, the same `transitions:` block drives the manual CLI and TUI. Moving a card from Review to Done (via `shelbi task move` or the TUI) executes `merge, delete_branch` in sequence.
 
 Single source of truth: the workflow YAML declares behavior; Zen and the user-driven flow share the execution path.
 
 **Two worked scenarios.**
 
-*Gitflow — one PR per task, all merging to `main`.* The default block above, no overrides. Every task gets a branch off `main`, PR opens on `InProgress → Review`, squash-merge on `Review → Done`.
+*Gitflow — one PR per task, all merging to* *`main`.* The default block above, no overrides. Every task gets a branch off `main`, PR opens on `InProgress → Review`, squash-merge on `Review → Done`.
 
 *Stack tasks on a long-lived feature branch, then one PR shipping the feature.* Two workflows working together:
 
 ```yaml
-# workflows/feature-task.yaml — for individual tasks within a feature
+# workflows/feature-task.yaml — reused by any number of concurrent features
 git:
-  base_branch: feature/cool-thing
+  base_branch: feature/{{feature}}        # {{feature}} is supplied per task
   merge_strategy: squash
 
 transitions:
@@ -322,14 +323,15 @@ transitions:
 
   - from: Review
     to: Done
-    actions: [merge, delete_branch]       # merge directly into feature/cool-thing
+    actions: [merge, delete_branch]       # merge directly into feature/{{feature}}
 ```
 
 ```yaml
-# workflows/feature-release.yaml — used for the single task that ships the feature
+# workflows/feature-release.yaml — one workflow ships any feature
 git:
   base_branch: main
   merge_strategy: squash
+release_branch: feature/{{feature}}       # the existing branch being shipped (not a new task branch)
 
 transitions:
   - from: InProgress
@@ -338,10 +340,42 @@ transitions:
 
   - from: Review
     to: Done
-    actions: [merge, delete_branch]
+    actions: [merge, delete_branch]       # squash-merge into main, then delete feature/{{feature}}
 ```
 
-When the feature is ready to ship, the user creates a task in `feature-release` (cross-workflow moves are allowed per §4). The feature branch goes through one final PR-and-merge cycle into `main`.
+A task in `feature-task` carries `feature: auth-rewrite` in its frontmatter; another task in a different feature carries `feature: dashboard-v2`. Same workflow file, two concurrent stacks. When a feature is ready to ship, the user creates a task in `feature-release` with the matching `feature` value (cross-workflow moves are allowed per §4). The feature branch goes through one final PR-and-merge cycle into `main`.
+
+**Parameterization.** Workflow YAML supports `{{var}}` placeholders, resolved from the task's frontmatter at load time. This is what makes one `feature-task.yaml` reusable across any number of concurrent features.
+
+- Substitution is plain string replacement — no conditionals, no expressions, no defaults. A `{{name}}` token in any `git:` field is replaced by the value of `name:` in the task frontmatter.
+
+- Placeholders are allowed anywhere in `git:` field values. They are not allowed in status names, category names, or the `transitions:` shape itself — only in git-side strings.
+
+- At task load (and `shelbi task add`), shelbi scans the resolved workflow for unresolved `{{...}}` tokens. Any that remain produce a clear error: *"Workflow* *`feature-task`* *requires parameter* *`feature`; add* *`feature: <value>`* *to the task frontmatter."*
+
+- The TUI's per-task workflow indicator (Phase 2) shows the workflow name plus the resolved parameter — e.g., `feature-task[auth-rewrite]` — so the user can tell two parallel feature stacks apart at a glance in the `All` filter.
+
+Example task frontmatter for the `feature-task` workflow above:
+
+```markdown
+---
+id: build-login-form
+title: Build the login form
+workflow: feature-task
+feature: auth-rewrite                # resolves base_branch → feature/auth-rewrite
+---
+```
+
+A second feature's task uses the same workflow file with a different value:
+
+```markdown
+---
+id: wire-dashboard-shell
+title: Wire the dashboard shell
+workflow: feature-task
+feature: dashboard-v2                # resolves base_branch → feature/dashboard-v2
+---
+```
 
 **Workflows without git.** Research, planning, and other no-code workflows can omit both `git:` and `transitions:` entirely. Tasks move through statuses purely as bookkeeping — no side-effects fire.
 
