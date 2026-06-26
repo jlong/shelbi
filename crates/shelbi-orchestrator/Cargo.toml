@@ -16,8 +16,8 @@ shelbi-ssh = { workspace = true }
 shelbi-agent = { workspace = true }
 serde = { workspace = true }
 tracing = { workspace = true }
+chrono = { workspace = true }
 globset = "0.4"
 
 [dev-dependencies]
-chrono = { workspace = true }
 tempfile = "3"

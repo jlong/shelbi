@@ -19,9 +19,30 @@ use shelbi_core::{Error, Host, MachineKind, Result, TmuxAddr};
 pub mod actions;
 pub mod contextstore;
 mod git;
+pub mod lifecycle;
 pub mod review;
 pub mod worker;
 pub mod zen;
+
+#[cfg(test)]
+pub(crate) mod test_lock {
+    //! Shared mutex for any orchestrator-crate test that mutates the
+    //! process-wide `SHELBI_HOME` env var. `actions.rs` and `lifecycle.rs`
+    //! both spin up fixture homes; without a *single* lock they race the
+    //! env var and produce flaky "No such file or directory" failures.
+    use std::sync::{Mutex, MutexGuard};
+
+    pub static LOCK: Mutex<()> = Mutex::new(());
+
+    /// Acquire the lock, recovering from a prior test that panicked with
+    /// the guard held. A `PoisonError` here doesn't mean the test that
+    /// poisoned it touched any state we care about — only that some
+    /// other lock-holder panicked — so we take the inner guard and
+    /// proceed.
+    pub fn acquire() -> MutexGuard<'static, ()> {
+        LOCK.lock().unwrap_or_else(|p| p.into_inner())
+    }
+}
 
 pub const DEFAULT_SYSTEM_PROMPT: &str = include_str!("default_orchestrator.md.template");
 

@@ -2388,16 +2388,13 @@ mod tests {
     // on top of an already-tested `merge()`.
     //
     // These tests need a `SHELBI_HOME` because `restack_children` calls
-    // `shelbi_state::list_tasks`. We serialize them with a local mutex so
-    // concurrent test runs don't fight over the env var; the unwrap on
-    // the lock is resilient to a prior test panicking with the lock held.
-
-    static AUTO_FIRE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    // `shelbi_state::list_tasks`. We serialize them on the orchestrator-
+    // crate-wide `test_lock` so `lifecycle::tests` (which also mutates
+    // `SHELBI_HOME`) can't race us — a per-module lock would silently
+    // interleave on the global env var.
 
     fn auto_fire_lock() -> std::sync::MutexGuard<'static, ()> {
-        AUTO_FIRE_LOCK
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
+        crate::test_lock::acquire()
     }
 
     fn write_task_file(project: &str, task: &Task) {
