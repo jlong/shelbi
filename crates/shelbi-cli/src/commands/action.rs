@@ -44,8 +44,13 @@ pub enum ActionCmd {
     /// runs `gh pr merge --<strategy>`; otherwise the hub fetches the
     /// branch from `origin` and runs `git merge --<strategy>` locally,
     /// then pushes the result back. Prints `pr:<n>:<sha>` or
-    /// `hub:<target>:<sha>` so the caller can tell the two paths apart.
-    /// Does not delete the branch — pair with `delete-branch` for that.
+    /// `hub:<target>:<sha>` on the first line so the caller can tell
+    /// the two paths apart. Does not delete the branch — pair with
+    /// `delete-branch` for that.
+    ///
+    /// Auto-fires `restack` on every not-`Done` task that lists this
+    /// task in its `depends_on:`; one extra line per child appears
+    /// after the merge line (`restacked:...` or `skipped:...`).
     Merge {
         task_id: String,
         /// Override the merge target for this call. Mirrors the
@@ -58,6 +63,25 @@ pub enum ActionCmd {
     /// refs. Skipped if a worker still has the branch checked out.
     /// Prints `deleted` / `skipped:<reason>` / `not-present`.
     DeleteBranch { task_id: String },
+    /// Rewrite the task's branch onto a new base — typically the
+    /// `target` the parent just merged into — and retarget any open PR.
+    /// Idempotent: re-running on a branch that's already based on
+    /// `--onto` prints `skipped:<id>:already-restacked`. Run on the
+    /// hub via a detached worktree, so the hub's main work_dir keeps
+    /// whatever branch you have checked out.
+    Restack {
+        /// The child task whose branch we're rebasing.
+        task_id: String,
+        /// The branch the child branch is currently based on. Usually
+        /// the parent task's branch — the parent that just merged.
+        #[arg(long)]
+        from: String,
+        /// New base for the child branch. Defaults to the project's
+        /// effective `base_branch` when omitted, matching the common
+        /// "stack collapses to main" shape.
+        #[arg(long)]
+        onto: Option<String>,
+    },
 }
 
 pub fn run(project_opt: Option<String>, cmd: ActionCmd) -> Result<()> {
@@ -94,14 +118,26 @@ pub fn run(project_opt: Option<String>, cmd: ActionCmd) -> Result<()> {
         }
         ActionCmd::Merge { task_id, target } => {
             let tf = load_task(&project_name, &task_id).map_err(|e| anyhow!(e))?;
-            let outcome =
-                actions::merge(&project, &tf.task, target.as_deref()).map_err(|e| anyhow!(e))?;
-            println!("{}", outcome.as_line());
+            let result =
+                actions::merge(&project, &project_name, &tf.task, target.as_deref())
+                    .map_err(|e| anyhow!(e))?;
+            println!("{}", result.merge.as_line());
+            for r in &result.restacks {
+                println!("{}", r.as_line());
+            }
             Ok(())
         }
         ActionCmd::DeleteBranch { task_id } => {
             let tf = load_task(&project_name, &task_id).map_err(|e| anyhow!(e))?;
             let outcome = actions::delete_branch(&project, &tf.task).map_err(|e| anyhow!(e))?;
+            println!("{}", outcome.as_line());
+            Ok(())
+        }
+        ActionCmd::Restack { task_id, from, onto } => {
+            let tf = load_task(&project_name, &task_id).map_err(|e| anyhow!(e))?;
+            let outcome =
+                actions::restack(&project, &tf.task, &from, onto.as_deref())
+                    .map_err(|e| anyhow!(e))?;
             println!("{}", outcome.as_line());
             Ok(())
         }

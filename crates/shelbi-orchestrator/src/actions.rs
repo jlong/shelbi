@@ -1,11 +1,15 @@
 //! Workflow action primitives — `push_branch`, `open_pr`, `merge`,
-//! `close_pr`, `delete_branch`.
+//! `close_pr`, `delete_branch`, `restack`.
 //!
 //! Each function does one git/gh thing the workflow `transitions:` block
 //! can name (see Plans/workflows.md, "Action set"). They are deliberately
 //! single-purpose so the workflow engine — and a human at the CLI — can
 //! sequence them per the active workflow without the primitive deciding
-//! what should run next.
+//! what should run next. The one exception is `merge`, which auto-fires
+//! `restack` on every not-`Done` child task that lists the merging task
+//! in its `depends_on:` — stacked workflows are only coherent if the
+//! cascade happens atomically with the parent's merge, so we bake it in
+//! rather than asking every workflow YAML to declare it.
 //!
 //! All actions are idempotent and silently no-op when not applicable:
 //!
@@ -18,12 +22,17 @@
 //! - `merge` integrates the task's branch into the target branch using the
 //!   project's configured merge strategy. Two paths: if a PR is open, runs
 //!   `gh pr merge --<strategy>`; otherwise the hub fetches from origin and
-//!   performs a local `git merge --<strategy>` on the target. See [`merge`].
+//!   performs a local `git merge --<strategy>` on the target. After the
+//!   integration commit lands, fires `restack` on every not-`Done` child
+//!   that depends on this task. See [`merge`].
 //! - `close_pr` closes any *open* PR for the task's branch; with no open
 //!   PR it returns `None` instead of erroring.
 //! - `delete_branch` removes the branch from origin and from the hub's
 //!   local refs. Skipped when a worker still has it checked out so we
 //!   don't yank a branch out from under an active task.
+//! - `restack` rewrites a child task's branch onto a new base — typically
+//!   fired after the parent task's branch was merged — and retargets its
+//!   open PR (if any). See [`restack`].
 //!
 //! `push_branch` and `open_pr` run against the worker's worktree (that's
 //! where the branch lives, and `gh pr create` needs a remote-tracking
@@ -101,6 +110,67 @@ impl MergeOutcome {
     pub fn sha(&self) -> &str {
         match self {
             MergeOutcome::ViaPr { sha, .. } | MergeOutcome::HubSide { sha, .. } => sha,
+        }
+    }
+}
+
+/// Bundled return shape for [`merge`]: the integration commit on top, plus
+/// one [`RestackOutcome`] per child task that depends on the merged task.
+/// Children appear in `shelbi_state::list_tasks` order so the wire format
+/// is deterministic.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MergeResult {
+    pub merge: MergeOutcome,
+    pub restacks: Vec<RestackOutcome>,
+}
+
+/// Outcome of a single [`restack`] pass against one child task. The two
+/// variants split "we rewrote the branch" from "we left it alone" so the
+/// caller (and a human at the CLI) can tell at a glance whether anything
+/// moved.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RestackOutcome {
+    /// Child branch was rebased onto `new_base` and force-pushed. `sha`
+    /// is the resulting tip of the branch on origin. `retargeted_pr` is
+    /// `Some(n)` when an open PR existed and was retargeted to `new_base`
+    /// in the same pass, `None` otherwise.
+    Restacked {
+        task_id: String,
+        branch: String,
+        new_base: String,
+        sha: String,
+        retargeted_pr: Option<u64>,
+    },
+    /// Nothing was rewritten. `reason` is a short token-style label
+    /// (`held-by-<worker>`, `no-branch`, `already-restacked`,
+    /// `no-commits-beyond-from-base`, `rebase-conflict`, …) so a caller
+    /// can match on a prefix without parsing free-form text.
+    Skipped { task_id: String, reason: String },
+}
+
+impl RestackOutcome {
+    /// Single-line wire format printed on stdout by `shelbi action restack`
+    /// and by `shelbi action merge` (one line per auto-fired child).
+    /// Prefix-keyed (`restacked:` / `skipped:`) so a caller can dispatch on
+    /// the first colon without parsing the rest.
+    pub fn as_line(&self) -> String {
+        match self {
+            RestackOutcome::Restacked {
+                task_id,
+                branch,
+                new_base,
+                sha,
+                retargeted_pr,
+            } => {
+                let pr = retargeted_pr
+                    .map(|p| format!(" pr={p}"))
+                    .unwrap_or_default();
+                format!("restacked:{task_id}:{branch}:{new_base}:{sha}{pr}")
+            }
+            RestackOutcome::Skipped { task_id, reason } => {
+                let safe = reason.replace('\n', " ");
+                format!("skipped:{task_id}:{safe}")
+            }
         }
     }
 }
@@ -286,11 +356,26 @@ where
 /// `delete_branch`'s job. Workflows sequence them as
 /// `[merge, delete_branch]` so each action stays single-purpose and the
 /// user can tweak the policy independently.
+///
+/// **Auto-fire: restack children.** After the integration commit lands,
+/// `merge` walks every not-`Done` task that lists `task.id` in its
+/// `depends_on:` and calls [`restack`] on each, passing the merged task's
+/// `branch` as `from_base` and the merge `target` as `onto`. Children
+/// without a branch, children whose branch is held by a live worker, and
+/// children whose branch is already based on the new target are skipped —
+/// see [`RestackOutcome`]. Errors inside a single child's restack land in
+/// the bundled outcome as `Skipped { reason: "restack-error:..." }` rather
+/// than rolling back the parent's merge.
+///
+/// This piece is *not* single-purpose by design — stacked workflows are
+/// only coherent if the child cascade fires atomically with the parent's
+/// merge. The workflow YAML doesn't need to sequence it; `merge` owns it.
 pub fn merge(
     project: &Project,
+    project_name: &str,
     task: &Task,
     target_override: Option<&str>,
-) -> Result<MergeOutcome> {
+) -> Result<MergeResult> {
     let branch = require_branch(task)?;
     let strategy = require_supported_strategy(project.merge_strategy())?;
     let target = target_override
@@ -299,13 +384,379 @@ pub fn merge(
     let (host, dir) = locate_hub_workdir(project)?;
     let wt = dir.to_string_lossy().into_owned();
 
-    if let Some(pr) = lookup_open_pr(&host, &wt, &branch)? {
+    let outcome = if let Some(pr) = lookup_open_pr(&host, &wt, &branch)? {
         let sha = merge_via_pr(&host, &wt, pr, strategy)?;
-        return Ok(MergeOutcome::ViaPr { pr, sha });
+        MergeOutcome::ViaPr { pr, sha }
+    } else {
+        let sha = merge_hub_side(&host, &wt, &branch, &target, strategy, &task.id)?;
+        MergeOutcome::HubSide {
+            sha,
+            target: target.clone(),
+        }
+    };
+
+    let merged_target = match &outcome {
+        MergeOutcome::HubSide { target, .. } => target.clone(),
+        // gh pr merge respects the PR's stored base — that base was picked
+        // by `open_pr` (or the user), which is also where `target_override`
+        // would have applied. Mirror the same fallback chain here so the
+        // children we restack land on the right ref.
+        MergeOutcome::ViaPr { .. } => target.clone(),
+    };
+
+    let restacks = restack_children(project, project_name, task, &branch, &merged_target);
+
+    Ok(MergeResult {
+        merge: outcome,
+        restacks,
+    })
+}
+
+/// Walk every not-`Done` task in the project, restacking the ones that
+/// list `parent_task.id` in their `depends_on:`. Used by [`merge`] to keep
+/// stacked PR chains coherent after the parent merges. Errors inside a
+/// single child's restack are captured as a `Skipped` outcome rather than
+/// short-circuiting the cascade — the parent has already been integrated,
+/// so a child rebase conflict shouldn't roll back the merge.
+fn restack_children(
+    project: &Project,
+    project_name: &str,
+    parent_task: &Task,
+    parent_branch: &str,
+    onto: &str,
+) -> Vec<RestackOutcome> {
+    let mut outcomes = Vec::new();
+    let tasks = match shelbi_state::list_tasks(project_name) {
+        Ok(t) => t,
+        Err(e) => {
+            // We can't enumerate tasks — surface a single synthetic skip
+            // so the operator sees that the cascade didn't run, without
+            // blowing up the merge that already succeeded.
+            outcomes.push(RestackOutcome::Skipped {
+                task_id: parent_task.id.clone(),
+                reason: format!("list-tasks-error:{e}").replace(' ', "_"),
+            });
+            return outcomes;
+        }
+    };
+    for tf in tasks {
+        let child = tf.task;
+        if child.column == Column::Done {
+            continue;
+        }
+        if !child.depends_on.iter().any(|id| id == &parent_task.id) {
+            continue;
+        }
+        let id = child.id.clone();
+        match restack(project, &child, parent_branch, Some(onto)) {
+            Ok(outcome) => outcomes.push(outcome),
+            Err(e) => outcomes.push(RestackOutcome::Skipped {
+                task_id: id,
+                reason: format!("restack-error:{e}").replace(' ', "_"),
+            }),
+        }
+    }
+    outcomes
+}
+
+/// Rewrite `child_task`'s branch onto a new base.
+///
+/// The intended call shape is the cascade fired by [`merge`] after a
+/// parent task lands: with `from_base` set to the parent task's branch and
+/// `onto_override` set to the parent's merge target, this primitive does
+/// `git rebase --onto <onto> <from_base> <child_branch>` and force-pushes
+/// the result back to origin. The same primitive is reachable from the
+/// CLI (`shelbi action restack`) so a human can re-anchor a child branch
+/// manually after an out-of-band base change.
+///
+/// **Resolution of `onto`.** When `onto_override` is `Some(...)`, that
+/// wins. Otherwise the project's effective `base_branch()` is used. Unlike
+/// [`open_pr`], we don't walk `depends_on:` for a fallback parent — by the
+/// time `restack` fires, the parent on top of which we *were* stacked has
+/// just merged; there's no other "stacking parent" to chain through.
+///
+/// **Where it runs.** The hub. Restack provisions a detached worktree off
+/// `origin/<child_branch>` under the system temp dir, runs the rebase
+/// there, force-pushes with `--force-with-lease`, then removes the
+/// worktree. The hub's main `work_dir` is never moved off whatever branch
+/// the operator left it on. The hub must therefore be local
+/// ([`locate_hub_workdir`] already enforces this).
+///
+/// **Skips.** Restack returns a [`RestackOutcome::Skipped`] (not an error)
+/// for the cases the workflow contract says are normal:
+///
+/// - child task has no `branch:` field;
+/// - a worker has the child branch checked out (we'd otherwise diverge
+///   it from under live work — same rule as `delete_branch`);
+/// - the child branch isn't on `origin` yet (`push_branch` hasn't fired);
+/// - the child is already based on `onto` (`origin/<onto>` is an ancestor
+///   of `origin/<child_branch>`);
+/// - the child has no commits beyond `from_base` (nothing to replay);
+/// - the rebase produces conflicts (we abort and leave the branch alone).
+///
+/// Hard errors — missing `onto` ref on origin, push failure under
+/// `--force-with-lease`, `gh pr edit` failure — propagate as
+/// [`Error::Command`] so a misconfiguration surfaces loudly.
+pub fn restack(
+    project: &Project,
+    child_task: &Task,
+    from_base: &str,
+    onto_override: Option<&str>,
+) -> Result<RestackOutcome> {
+    let task_id = child_task.id.clone();
+    let Some(child_branch) = child_task.branch.clone() else {
+        return Ok(RestackOutcome::Skipped {
+            task_id,
+            reason: "no-branch".into(),
+        });
+    };
+
+    if let Some(worker_name) = worker_holding_branch(project, &child_branch)? {
+        return Ok(RestackOutcome::Skipped {
+            task_id,
+            reason: format!("held-by-{worker_name}"),
+        });
     }
 
-    let sha = merge_hub_side(&host, &wt, &branch, &target, strategy, &task.id)?;
-    Ok(MergeOutcome::HubSide { sha, target })
+    let onto = onto_override
+        .map(str::to_string)
+        .unwrap_or_else(|| project.base_branch().to_string());
+
+    let (host, dir) = locate_hub_workdir(project)?;
+    let wt = dir.to_string_lossy().into_owned();
+
+    // Fetch every ref we'll touch in one pass so the rebase sees their
+    // current tips on origin. A missing ref aborts the fetch with a
+    // non-zero exit — handle the "not on origin" cases below explicitly
+    // so the error message names the action the operator should run.
+    if !remote_branch_exists(&host, &wt, &child_branch)? {
+        return Ok(RestackOutcome::Skipped {
+            task_id,
+            reason: "child-branch-not-on-origin".into(),
+        });
+    }
+    if !remote_branch_exists(&host, &wt, from_base)? {
+        return Ok(RestackOutcome::Skipped {
+            task_id,
+            reason: format!("from-base-not-on-origin:{from_base}"),
+        });
+    }
+    if !remote_branch_exists(&host, &wt, &onto)? {
+        return Err(Error::Other(format!(
+            "restack: target branch `{onto}` is not on origin — push it first \
+             or fix the workflow `target:`/project `base_branch` config"
+        )));
+    }
+    run_or_command_err(
+        &host,
+        &wt,
+        &["git", "fetch", "origin", &child_branch, from_base, &onto],
+        || format!("git -C {wt} fetch origin {child_branch} {from_base} {onto}"),
+    )?;
+
+    let onto_ref = format!("origin/{onto}");
+    let child_ref = format!("origin/{child_branch}");
+    let from_ref = format!("origin/{from_base}");
+
+    // Already-restacked guard: if the child branch already contains every
+    // commit on `onto`, there's nothing for us to do. Re-running the
+    // rebase would still rewrite SHAs (rebasing onto an ancestor produces
+    // identical-content but different-author-date commits if dates
+    // changed), which is a needless force-push from a primitive that's
+    // supposed to be idempotent.
+    let behind_onto = run_capture_stdout(
+        &host,
+        &wt,
+        &[
+            "git",
+            "rev-list",
+            "--count",
+            &format!("{child_ref}..{onto_ref}"),
+        ],
+    )?;
+    if behind_onto.trim() == "0" {
+        return Ok(RestackOutcome::Skipped {
+            task_id,
+            reason: "already-restacked".into(),
+        });
+    }
+
+    // Nothing-to-replay guard: if the child branch has zero commits past
+    // `from_base`, the rebase would advance the branch tip to `onto` —
+    // turning an empty stack-tip into "the target," which is almost
+    // certainly not what the user wants. Surface it as a skip rather than
+    // a silent fast-forward.
+    let ahead_of_from = run_capture_stdout(
+        &host,
+        &wt,
+        &[
+            "git",
+            "rev-list",
+            "--count",
+            &format!("{from_ref}..{child_ref}"),
+        ],
+    )?;
+    if ahead_of_from.trim() == "0" {
+        return Ok(RestackOutcome::Skipped {
+            task_id,
+            reason: "no-commits-beyond-from-base".into(),
+        });
+    }
+
+    // Make the path unique per call so concurrent restacks (and parallel
+    // test runs) don't collide on a shared `$TMPDIR/shelbi-restack-<id>/`
+    // — git worktree add refuses to overwrite an existing path.
+    static RESTACK_COUNTER: std::sync::atomic::AtomicU64 =
+        std::sync::atomic::AtomicU64::new(0);
+    let seq = RESTACK_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let tmp_path = std::env::temp_dir().join(format!(
+        "shelbi-restack-{}-{}-{}",
+        std::process::id(),
+        sanitize_path_segment(&task_id),
+        seq,
+    ));
+    // git worktree add refuses to overwrite an existing path. Clean up
+    // any stale dir from a previous crashed restack before we re-add.
+    let _ = std::fs::remove_dir_all(&tmp_path);
+    let tmp = tmp_path.to_string_lossy().into_owned();
+
+    run_or_command_err(
+        &host,
+        &wt,
+        &["git", "worktree", "add", "--detach", &tmp, &child_ref],
+        || format!("git -C {wt} worktree add --detach {tmp} {child_ref}"),
+    )?;
+
+    let rebase = run_in_dir(
+        &host,
+        &tmp,
+        &["git", "rebase", "--onto", &onto_ref, &from_ref],
+    )?;
+    if !rebase.status.success() {
+        // Abort the rebase so the worktree is in a clean state for the
+        // remove that follows, then remove the worktree. Both are
+        // best-effort — even on failure we still want to surface the
+        // skip rather than tangle the cleanup with the conflict report.
+        let _ = run_in_dir(&host, &tmp, &["git", "rebase", "--abort"]);
+        let _ = run_in_dir(
+            &host,
+            &wt,
+            &["git", "worktree", "remove", "--force", &tmp],
+        );
+        let _ = std::fs::remove_dir_all(&tmp_path);
+        return Ok(RestackOutcome::Skipped {
+            task_id,
+            reason: "rebase-conflict".into(),
+        });
+    }
+
+    let new_sha = run_capture_stdout(&host, &tmp, &["git", "rev-parse", "HEAD"])?
+        .trim()
+        .to_string();
+
+    // --force-with-lease without an expected SHA uses the local copy of
+    // refs/remotes/origin/<branch> as the lease. We just fetched that ref
+    // above, so a race between fetch and push is the only way the lease
+    // would (correctly) fail — exactly the case we want to refuse.
+    let push = run_in_dir(
+        &host,
+        &tmp,
+        &[
+            "git",
+            "push",
+            &format!("--force-with-lease={child_branch}"),
+            "origin",
+            &format!("HEAD:{child_branch}"),
+        ],
+    )?;
+    let push_status = push.status;
+    let push_stderr = String::from_utf8_lossy(&push.stderr).into_owned();
+
+    // Tear the worktree down before bailing on a push error so we don't
+    // leak it; the error is what the caller gets, regardless.
+    let _ = run_in_dir(
+        &host,
+        &wt,
+        &["git", "worktree", "remove", "--force", &tmp],
+    );
+    let _ = std::fs::remove_dir_all(&tmp_path);
+
+    if !push_status.success() {
+        return Err(Error::Command {
+            cmd: format!(
+                "git -C {tmp} push --force-with-lease={child_branch} origin HEAD:{child_branch}"
+            ),
+            status: push_status.to_string(),
+            stderr: push_stderr,
+        });
+    }
+
+    // Retargeting the PR is a best-effort follow-on: a project whose
+    // origin isn't a GitHub remote (and therefore has no `gh` configured)
+    // can still benefit from the rebase + push above; we don't want the
+    // restack to fail end-to-end just because there's nothing to retarget.
+    // Tolerate the specific gh signal for "no GitHub host" and treat it
+    // as "no PR to touch."
+    let retargeted_pr = match lookup_open_pr_tolerant(&host, &wt, &child_branch)? {
+        Some(pr) => {
+            let pr_str = pr.to_string();
+            let out = run_in_dir(
+                &host,
+                &wt,
+                &["gh", "pr", "edit", &pr_str, "--base", &onto],
+            )?;
+            if !out.status.success() {
+                return Err(Error::Command {
+                    cmd: format!("gh pr edit {pr_str} --base {onto}"),
+                    status: out.status.to_string(),
+                    stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
+                });
+            }
+            Some(pr)
+        }
+        None => None,
+    };
+
+    Ok(RestackOutcome::Restacked {
+        task_id,
+        branch: child_branch,
+        new_base: onto,
+        sha: new_sha,
+        retargeted_pr,
+    })
+}
+
+/// [`lookup_open_pr`] degraded to "no PR" when gh reports that origin
+/// isn't a GitHub remote. Used by [`restack`] for the optional PR
+/// retarget step — a project pointing at a non-GitHub remote can still
+/// benefit from the rebase + push, so we don't want the action to fail
+/// end-to-end just because there's nothing for `gh pr edit` to touch.
+///
+/// We match on the specific stderr fragment gh prints in this case
+/// rather than treating *every* gh failure as "no PR" — a real
+/// authentication or network failure should still propagate so the
+/// operator can see it.
+fn lookup_open_pr_tolerant(host: &Host, wt: &str, branch: &str) -> Result<Option<u64>> {
+    match lookup_open_pr(host, wt, branch) {
+        Ok(v) => Ok(v),
+        Err(Error::Command { ref stderr, .. })
+            if stderr.contains("none of the git remotes configured for this repository point to a known GitHub host") =>
+        {
+            Ok(None)
+        }
+        Err(e) => Err(e),
+    }
+}
+
+/// Map a task id (already validated to be kebab/snake alphanumeric) to a
+/// safe filesystem segment for the temp worktree path. Belt-and-suspenders
+/// against an out-of-band frontmatter edit that snuck a `/` past
+/// validation — the worktree path lives in $TMPDIR, never inside the
+/// repo.
+fn sanitize_path_segment(s: &str) -> String {
+    s.chars()
+        .map(|c| if c.is_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
+        .collect()
 }
 
 /// `gh pr merge <pr> --<strategy>` on the hub, then read the resulting
@@ -1451,7 +1902,11 @@ mod tests {
         advance_feature_with_origin(&local);
         let project = project_at(&local, MergeStrategy::Rebase);
 
-        let err = merge(&project, &task_on_branch("t", "feature"), None).unwrap_err();
+        // The rebase gate fires before merge() reaches the child-task
+        // enumeration, so it never touches shelbi_state. No SHELBI_HOME
+        // dance needed here.
+        let err = merge(&project, "fixture", &task_on_branch("t", "feature"), None)
+            .unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("rebase"), "{msg}");
 
@@ -1573,5 +2028,520 @@ mod tests {
         )
         .unwrap();
         assert!(!sha.is_empty());
+    }
+
+    // --- restack: wire format ---------------------------------------------
+
+    #[test]
+    fn restack_outcome_as_line_is_prefix_keyed() {
+        let restacked = RestackOutcome::Restacked {
+            task_id: "child".into(),
+            branch: "shelbi/child".into(),
+            new_base: "main".into(),
+            sha: "deadbeef".into(),
+            retargeted_pr: None,
+        };
+        assert_eq!(
+            restacked.as_line(),
+            "restacked:child:shelbi/child:main:deadbeef"
+        );
+
+        let with_pr = RestackOutcome::Restacked {
+            task_id: "child".into(),
+            branch: "shelbi/child".into(),
+            new_base: "main".into(),
+            sha: "deadbeef".into(),
+            retargeted_pr: Some(42),
+        };
+        assert_eq!(
+            with_pr.as_line(),
+            "restacked:child:shelbi/child:main:deadbeef pr=42"
+        );
+
+        let skipped = RestackOutcome::Skipped {
+            task_id: "child".into(),
+            reason: "already-restacked".into(),
+        };
+        assert_eq!(skipped.as_line(), "skipped:child:already-restacked");
+
+        // Reason newlines collapse so the line stays parseable.
+        let multiline = RestackOutcome::Skipped {
+            task_id: "child".into(),
+            reason: "first\nsecond".into(),
+        };
+        assert!(!multiline.as_line().contains('\n'));
+    }
+
+    // --- restack: hub-side integration ------------------------------------
+    //
+    // Build a stacked fixture: main → parent → child. After "parent" merges
+    // into main, restack should rewrite child's history so its commits land
+    // on top of main (no longer on top of parent).
+
+    /// Build a fixture with `main`, `parent` (one commit past main), and
+    /// `child` (one commit past parent). Origin tracks all three. Returns
+    /// the temp dir guard, the bare remote path, and the working clone.
+    fn fixture_repo_with_stacked_branches() -> (tempfile::TempDir, PathBuf, PathBuf) {
+        let (tmp, remote, local) = fixture_repo_with_origin();
+        // The `feature` branch from the origin fixture isn't needed for
+        // these tests — leave it alone.
+
+        // Create `parent` off main with a commit.
+        run_git(&local, &["checkout", "-b", "parent", "main"]);
+        std::fs::write(local.join("parent.txt"), "from parent\n").unwrap();
+        run_git(&local, &["add", "parent.txt"]);
+        run_git(&local, &["commit", "-q", "-m", "parent work"]);
+        run_git(&local, &["push", "-u", "origin", "parent"]);
+
+        // Create `child` off parent with a commit.
+        run_git(&local, &["checkout", "-b", "child", "parent"]);
+        std::fs::write(local.join("child.txt"), "from child\n").unwrap();
+        run_git(&local, &["add", "child.txt"]);
+        run_git(&local, &["commit", "-q", "-m", "child work"]);
+        run_git(&local, &["push", "-u", "origin", "child"]);
+
+        // Park HEAD on main so restack's hub work_dir starts in the same
+        // state the orchestrator usually leaves it in.
+        run_git(&local, &["checkout", "main"]);
+
+        (tmp, remote, local)
+    }
+
+    /// Simulate that `parent` already merged into `main` on origin (squash
+    /// strategy: one new commit on main containing parent's content). The
+    /// `parent` branch itself is left in place so restack's `from_base`
+    /// ref still resolves — `delete_branch` runs *after* restack in the
+    /// workflow.
+    ///
+    /// We use `git merge --squash` with an explicit shelbi-flavored
+    /// commit message instead of `cherry-pick` so the resulting commit
+    /// SHA is guaranteed distinct from parent's tip — a cherry-pick on
+    /// the same wall-clock second as the original commit collides on
+    /// timestamps and (since everything else matches) produces an
+    /// identical SHA, which silently breaks the "behind_onto" guard's
+    /// preconditions in tests.
+    fn advance_main_with_parent_squashed(local: &std::path::Path) {
+        run_git(local, &["checkout", "main"]);
+        run_git(local, &["merge", "--squash", "parent"]);
+        run_git(local, &["commit", "-q", "-m", "shelbi: squash parent into main"]);
+        run_git(local, &["push", "origin", "main"]);
+    }
+
+    fn project_with_no_workers(local: &std::path::Path) -> Project {
+        project_at(local, MergeStrategy::Squash)
+    }
+
+    fn child_task_on_branch(id: &str, branch: &str, depends_on: &[&str]) -> Task {
+        let mut t = bare_task(id);
+        t.branch = Some(branch.into());
+        t.depends_on = depends_on.iter().map(|s| s.to_string()).collect();
+        t
+    }
+
+    #[test]
+    fn restack_rebases_child_onto_new_base_and_force_pushes() {
+        let (_tmp, _remote, local) = fixture_repo_with_stacked_branches();
+        advance_main_with_parent_squashed(&local);
+
+        let project = project_with_no_workers(&local);
+        let child = child_task_on_branch("ch", "child", &["par"]);
+
+        let out = restack(&project, &child, "parent", Some("main")).unwrap();
+        match out {
+            RestackOutcome::Restacked {
+                task_id,
+                branch,
+                new_base,
+                sha,
+                retargeted_pr,
+            } => {
+                assert_eq!(task_id, "ch");
+                assert_eq!(branch, "child");
+                assert_eq!(new_base, "main");
+                assert!(!sha.is_empty());
+                // No PR exists in this bare-remote fixture, so there's
+                // nothing for gh pr edit to retarget.
+                assert!(retargeted_pr.is_none());
+            }
+            other => panic!("expected Restacked, got {other:?}"),
+        }
+
+        // origin/child now sits on top of origin/main. Concretely: it
+        // contains main + a single "child work" commit, NOT the original
+        // "parent work" commit (that's been squashed into main).
+        let wt = local.to_string_lossy().into_owned();
+        // Refetch so the local repo sees the force-pushed history.
+        run_or_command_err(&Host::Local, &wt, &["git", "fetch", "origin"], || {
+            "git fetch origin".into()
+        })
+        .unwrap();
+        let child_log = run_capture_stdout(
+            &Host::Local,
+            &wt,
+            &["git", "log", "origin/child", "--format=%s"],
+        )
+        .unwrap();
+        let subjects: Vec<&str> = child_log.lines().collect();
+        assert_eq!(subjects[0], "child work", "{child_log}");
+        // Subsequent commits are main's history (init + the squashed
+        // parent commit our fixture wrote — the message matches
+        // `advance_main_with_parent_squashed`).
+        assert!(
+            subjects.contains(&"shelbi: squash parent into main"),
+            "{child_log}",
+        );
+        assert!(subjects.contains(&"init"), "{child_log}");
+
+        // And the child branch is now a direct descendant of main —
+        // i.e., origin/main is an ancestor of origin/child.
+        let merge_base = run_capture_stdout(
+            &Host::Local,
+            &wt,
+            &[
+                "git",
+                "merge-base",
+                "--is-ancestor",
+                "origin/main",
+                "origin/child",
+            ],
+        );
+        // `--is-ancestor` exits 0 iff true; run_capture_stdout already
+        // errors on non-zero exit, so any value here means yes.
+        assert!(merge_base.is_ok());
+    }
+
+    #[test]
+    fn restack_is_idempotent_when_already_on_new_base() {
+        // After a successful restack, re-running with the same args must
+        // be a clean no-op. The rebase that *would* run replays the same
+        // commits onto the same base, but we'd still force-push — which
+        // a primitive that claims idempotency shouldn't do.
+        let (_tmp, _remote, local) = fixture_repo_with_stacked_branches();
+        advance_main_with_parent_squashed(&local);
+
+        let project = project_with_no_workers(&local);
+        let child = child_task_on_branch("ch", "child", &["par"]);
+
+        // First pass: real work.
+        let first = restack(&project, &child, "parent", Some("main")).unwrap();
+        assert!(matches!(first, RestackOutcome::Restacked { .. }));
+
+        // Second pass: already-restacked guard fires.
+        let second = restack(&project, &child, "parent", Some("main")).unwrap();
+        match second {
+            RestackOutcome::Skipped { reason, .. } => {
+                assert_eq!(reason, "already-restacked");
+            }
+            other => panic!("expected Skipped, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn restack_skips_when_worker_holds_the_child_branch() {
+        // A worker actively working in the child branch's worktree would
+        // diverge from a force-push. Mirror `delete_branch`'s skip-on-hold
+        // policy: surface the worker name so the operator can choose to
+        // wait or rotate the worker, but don't tamper with origin.
+        let (_tmp, _remote, local) = fixture_repo_with_stacked_branches();
+        advance_main_with_parent_squashed(&local);
+
+        let project = project_with_local_worker_holding(&local, "alice", "child");
+        let child = child_task_on_branch("ch", "child", &["par"]);
+
+        let out = restack(&project, &child, "parent", Some("main")).unwrap();
+        match out {
+            RestackOutcome::Skipped { reason, .. } => {
+                assert!(reason.starts_with("held-by-"), "{reason}");
+                assert!(reason.contains("alice"), "{reason}");
+            }
+            other => panic!("expected Skipped(held), got {other:?}"),
+        }
+
+        // Origin/child is untouched (still has parent's commit in its
+        // history, not main's squashed version).
+        let wt = local.to_string_lossy().into_owned();
+        let child_log = run_capture_stdout(
+            &Host::Local,
+            &wt,
+            &["git", "log", "origin/child", "--format=%s"],
+        )
+        .unwrap();
+        let subjects: Vec<&str> = child_log.lines().collect();
+        assert_eq!(subjects[0], "child work");
+        assert_eq!(subjects[1], "parent work");
+    }
+
+    #[test]
+    fn restack_skips_when_child_has_no_branch() {
+        let (_tmp, _remote, local) = fixture_repo_with_stacked_branches();
+        let project = project_with_no_workers(&local);
+
+        let mut child = bare_task("ch");
+        child.depends_on = vec!["par".into()];
+        // No branch set.
+
+        let out = restack(&project, &child, "parent", Some("main")).unwrap();
+        match out {
+            RestackOutcome::Skipped { task_id, reason } => {
+                assert_eq!(task_id, "ch");
+                assert_eq!(reason, "no-branch");
+            }
+            other => panic!("expected Skipped(no-branch), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn restack_skips_when_child_branch_is_not_on_origin() {
+        // push_branch hasn't fired yet — restack has nothing to rewrite.
+        let (_tmp, _remote, local) = fixture_repo_with_stacked_branches();
+        advance_main_with_parent_squashed(&local);
+        // Remove origin/child but keep the local ref.
+        run_git(&local, &["push", "origin", "--delete", "child"]);
+
+        let project = project_with_no_workers(&local);
+        let child = child_task_on_branch("ch", "child", &["par"]);
+
+        let out = restack(&project, &child, "parent", Some("main")).unwrap();
+        match out {
+            RestackOutcome::Skipped { reason, .. } => {
+                assert_eq!(reason, "child-branch-not-on-origin");
+            }
+            other => panic!("expected Skipped(child-branch-not-on-origin), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn restack_skips_when_child_has_no_commits_past_from_base() {
+        // If child's tip is at parent's tip (worker's branch was opened
+        // but never advanced), the rebase would slide the branch tip up
+        // to `onto` — turning an empty stack into "the merged target."
+        // Skip rather than do that silently.
+        let (_tmp, _remote, local) = fixture_repo_with_stacked_branches();
+        advance_main_with_parent_squashed(&local);
+
+        // Reset origin/child back to origin/parent so it has no commits
+        // beyond parent.
+        run_git(&local, &["checkout", "child"]);
+        run_git(&local, &["reset", "--hard", "parent"]);
+        run_git(&local, &["push", "origin", "+child"]);
+        run_git(&local, &["checkout", "main"]);
+
+        let project = project_with_no_workers(&local);
+        let child = child_task_on_branch("ch", "child", &["par"]);
+
+        let out = restack(&project, &child, "parent", Some("main")).unwrap();
+        match out {
+            RestackOutcome::Skipped { reason, .. } => {
+                assert_eq!(reason, "no-commits-beyond-from-base");
+            }
+            other => panic!("expected Skipped(no-commits), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn restack_skips_when_rebase_produces_conflicts() {
+        // Cook a conflict: have child write to a file that main also
+        // changes (after the parent squash). When restack tries to replay
+        // child's commit onto main, git refuses with a conflict.
+        let (_tmp, _remote, local) = fixture_repo_with_stacked_branches();
+
+        // Edit main on origin so it touches `child.txt` differently.
+        run_git(&local, &["checkout", "main"]);
+        std::fs::write(local.join("child.txt"), "main version\n").unwrap();
+        run_git(&local, &["add", "child.txt"]);
+        run_git(&local, &["commit", "-q", "-m", "conflicting main change"]);
+        run_git(&local, &["push", "origin", "main"]);
+
+        let project = project_with_no_workers(&local);
+        let child = child_task_on_branch("ch", "child", &["par"]);
+
+        let out = restack(&project, &child, "parent", Some("main")).unwrap();
+        match out {
+            RestackOutcome::Skipped { reason, .. } => {
+                assert_eq!(reason, "rebase-conflict");
+            }
+            other => panic!("expected Skipped(rebase-conflict), got {other:?}"),
+        }
+
+        // origin/child is untouched.
+        let wt = local.to_string_lossy().into_owned();
+        let child_log = run_capture_stdout(
+            &Host::Local,
+            &wt,
+            &["git", "log", "origin/child", "--format=%s"],
+        )
+        .unwrap();
+        let subjects: Vec<&str> = child_log.lines().collect();
+        assert_eq!(subjects[0], "child work");
+        assert_eq!(subjects[1], "parent work");
+    }
+
+    // --- merge: auto-fire restack on not-Done children --------------------
+    //
+    // `merge()`'s very first step is a `gh pr list` probe, and `gh`
+    // refuses to query a non-GitHub remote — so these tests can't drive
+    // the public `merge()` against the bare-remote fixture (same caveat
+    // the existing merge tests call out above `project_at`). Instead we
+    // cover the cascade by driving the private `restack_children` helper
+    // directly: it's the function that owns the "find not-Done children
+    // and restack each" logic, and it's the only behaviour that's *new*
+    // on top of an already-tested `merge()`.
+    //
+    // These tests need a `SHELBI_HOME` because `restack_children` calls
+    // `shelbi_state::list_tasks`. We serialize them with a local mutex so
+    // concurrent test runs don't fight over the env var; the unwrap on
+    // the lock is resilient to a prior test panicking with the lock held.
+
+    static AUTO_FIRE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn auto_fire_lock() -> std::sync::MutexGuard<'static, ()> {
+        AUTO_FIRE_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    fn write_task_file(project: &str, task: &Task) {
+        shelbi_state::save_task(project, task, "").unwrap();
+    }
+
+    fn fresh_shelbi_home(tag: &str) -> PathBuf {
+        let p = std::env::temp_dir().join(format!(
+            "shelbi-restack-test-{}-{}-{}",
+            std::process::id(),
+            tag,
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&p).unwrap();
+        p
+    }
+
+    #[test]
+    fn restack_children_cascades_only_to_not_done_dependents() {
+        let _g = auto_fire_lock();
+        let home = fresh_shelbi_home("auto-fire");
+        std::env::set_var("SHELBI_HOME", &home);
+
+        let (_tmp, _remote, local) = fixture_repo_with_stacked_branches();
+        advance_main_with_parent_squashed(&local);
+        let project = project_with_no_workers(&local);
+
+        // Parent task at column=InProgress on branch `parent`.
+        let mut parent = bare_task("par");
+        parent.branch = Some("parent".into());
+        write_task_file("fixture", &parent);
+
+        // Child task at column=InProgress depending on `par`, branch `child`.
+        let mut child = bare_task("ch");
+        child.branch = Some("child".into());
+        child.depends_on = vec!["par".into()];
+        write_task_file("fixture", &child);
+
+        // Done child that depends on `par` — must NOT be restacked even
+        // though its dep list matches.
+        let mut done_child = bare_task("done-ch");
+        done_child.branch = Some("done-ch-branch".into());
+        done_child.depends_on = vec!["par".into()];
+        done_child.column = Column::Done;
+        write_task_file("fixture", &done_child);
+
+        // Unrelated InProgress task with no dep on `par` — must NOT be
+        // restacked. Catches a "scan returned everyone" regression.
+        let mut unrelated = bare_task("solo");
+        unrelated.branch = Some("solo-branch".into());
+        write_task_file("fixture", &unrelated);
+
+        let outcomes =
+            restack_children(&project, "fixture", &parent, "parent", "main");
+
+        // Exactly one outcome — for `ch`.
+        assert_eq!(outcomes.len(), 1, "{outcomes:?}");
+        match &outcomes[0] {
+            RestackOutcome::Restacked {
+                task_id, new_base, ..
+            } => {
+                assert_eq!(task_id, "ch");
+                assert_eq!(new_base, "main");
+            }
+            other => panic!("expected Restacked for `ch`, got {other:?}"),
+        }
+
+        // origin/child is now on top of origin/main: its tip commit is
+        // child work, and origin/main is an ancestor.
+        let wt = local.to_string_lossy().into_owned();
+        run_or_command_err(&Host::Local, &wt, &["git", "fetch", "origin"], || {
+            "git fetch origin".into()
+        })
+        .unwrap();
+        let child_log = run_capture_stdout(
+            &Host::Local,
+            &wt,
+            &["git", "log", "origin/child", "--format=%s"],
+        )
+        .unwrap();
+        let subjects: Vec<&str> = child_log.lines().collect();
+        assert_eq!(subjects[0], "child work", "{child_log}");
+
+        std::env::remove_var("SHELBI_HOME");
+    }
+
+    #[test]
+    fn restack_children_with_no_dependents_returns_empty() {
+        let _g = auto_fire_lock();
+        let home = fresh_shelbi_home("no-children");
+        std::env::set_var("SHELBI_HOME", &home);
+
+        let (_tmp, _remote, local) = fixture_repo_with_stacked_branches();
+        advance_main_with_parent_squashed(&local);
+        let project = project_with_no_workers(&local);
+
+        // Parent on disk, but nobody depends on it.
+        let mut parent = bare_task("par");
+        parent.branch = Some("parent".into());
+        write_task_file("fixture", &parent);
+
+        let outcomes =
+            restack_children(&project, "fixture", &parent, "parent", "main");
+        assert!(outcomes.is_empty(), "{outcomes:?}");
+
+        std::env::remove_var("SHELBI_HOME");
+    }
+
+    #[test]
+    fn restack_children_skips_dependent_held_by_a_worker() {
+        // A worker holding the child's branch makes `restack` skip — we
+        // surface that as the cascade's outcome rather than dropping it,
+        // so the operator can see *why* the child wasn't moved.
+        let _g = auto_fire_lock();
+        let home = fresh_shelbi_home("held");
+        std::env::set_var("SHELBI_HOME", &home);
+
+        let (_tmp, _remote, local) = fixture_repo_with_stacked_branches();
+        advance_main_with_parent_squashed(&local);
+        let project = project_with_local_worker_holding(&local, "alice", "child");
+
+        let mut parent = bare_task("par");
+        parent.branch = Some("parent".into());
+        write_task_file("fixture", &parent);
+
+        let mut child = bare_task("ch");
+        child.branch = Some("child".into());
+        child.depends_on = vec!["par".into()];
+        write_task_file("fixture", &child);
+
+        let outcomes =
+            restack_children(&project, "fixture", &parent, "parent", "main");
+        assert_eq!(outcomes.len(), 1, "{outcomes:?}");
+        match &outcomes[0] {
+            RestackOutcome::Skipped { task_id, reason } => {
+                assert_eq!(task_id, "ch");
+                assert!(reason.starts_with("held-by-"), "{reason}");
+            }
+            other => panic!("expected Skipped(held), got {other:?}"),
+        }
+
+        std::env::remove_var("SHELBI_HOME");
     }
 }
