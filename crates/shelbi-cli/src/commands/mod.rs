@@ -1,3 +1,4 @@
+pub mod action;
 pub mod archive;
 pub mod attach;
 pub mod diff;

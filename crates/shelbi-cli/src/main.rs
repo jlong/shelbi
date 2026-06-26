@@ -129,6 +129,14 @@ enum Cmd {
         #[command(subcommand)]
         cmd: commands::zen::ZenCmd,
     },
+    /// Run a single-purpose workflow action primitive. `push-branch`,
+    /// `close-pr`, and `delete-branch` are the git/gh primitives the
+    /// workflow `transitions:` block can sequence — each is idempotent
+    /// and silently no-ops when there's nothing to do.
+    Action {
+        #[command(subcommand)]
+        cmd: commands::action::ActionCmd,
+    },
     /// Open the palette as a tmux popup. Bound to Ctrl+P by default.
     Popup,
     /// (internal) Crash-recovery check the orchestrator pane wrapper
@@ -172,6 +180,7 @@ fn main() -> Result<()> {
         Some(Cmd::Project { cmd }) => commands::project::run(cmd),
         Some(Cmd::Events { cmd }) => commands::events::run(cmd),
         Some(Cmd::Zen { cmd }) => commands::zen::run(cli.project, cmd),
+        Some(Cmd::Action { cmd }) => commands::action::run(cli.project, cmd),
         Some(Cmd::Review(args)) => commands::review::run(cli.project, args),
         Some(Cmd::Attach { id }) => commands::attach::run(cli.project, id),
         Some(Cmd::Init(args)) => commands::init::run(args),
