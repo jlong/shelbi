@@ -569,6 +569,38 @@ impl KanbanApp {
 
     fn move_card(&mut self, id: &str, new_col_idx: usize) {
         let new_col = self.column(new_col_idx);
+        // Lifecycle hook: when a move actually transitions a task INTO
+        // `in_progress`, cut its branch on the hub (depends_on aware) and
+        // persist `branch:` first — see `shelbi_orchestrator::lifecycle`.
+        // If the cut fails (e.g. depends_on names a branch that doesn't
+        // exist locally yet) we bail without moving the card so the YAML
+        // and the git refs stay consistent.
+        if matches!(new_col, Column::InProgress) {
+            if let Some(tf) = self
+                .column_tasks(self.selected_column)
+                .iter()
+                .find(|tf| tf.task.id == id)
+            {
+                if tf.task.column != Column::InProgress {
+                    match shelbi_state::load_project(&self.project_name) {
+                        Ok(project) => {
+                            if let Err(e) =
+                                shelbi_orchestrator::lifecycle::ensure_branch_for_in_progress(
+                                    &project, id,
+                                )
+                            {
+                                self.status_line = format!("branch cut failed: {e}");
+                                return;
+                            }
+                        }
+                        Err(e) => {
+                            self.status_line = format!("load project failed: {e}");
+                            return;
+                        }
+                    }
+                }
+            }
+        }
         match shelbi_state::move_task(&self.project_name, id, new_col) {
             Ok(Some((from, to, workflow))) => {
                 if let Err(e) =
@@ -1381,6 +1413,12 @@ mod tests {
         ));
         std::fs::create_dir_all(&home).unwrap();
         std::env::set_var("SHELBI_HOME", &home);
+        // `move_card` now runs the lifecycle branch-cut hook
+        // (`shelbi_orchestrator::lifecycle::ensure_branch_for_in_progress`)
+        // whenever a card lands in `in_progress`. That hook needs both a
+        // loadable project YAML and a real git repo at the hub workdir,
+        // so we provision them here before the move fires.
+        crate::test_support::provision_hub_repo_for_project(&home, "demo");
 
         use chrono::Utc;
         let now = Utc::now();

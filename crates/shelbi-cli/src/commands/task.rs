@@ -378,6 +378,25 @@ fn move_to(project: &str, id: &str, to: &str, reason: Option<&str>) -> Result<()
         );
     }
 
+    // Lifecycle hook: a move INTO `in_progress` cuts the task's branch on
+    // the hub (with depends_on awareness — see
+    // `shelbi_orchestrator::lifecycle`) and persists `branch:` onto the
+    // task. Skip when the destination matches the current column (the
+    // `shelbi_state::move_task` short-circuit would treat it as a no-op
+    // anyway) and when no column change is actually happening — that
+    // keeps `task move ... --to in_progress` on an already-in-progress
+    // task from running the cut for no reason. A failure inside the cut
+    // (e.g. depends_on names a branch that hasn't been pushed yet) DOES
+    // abort the move — silently dropping the depends_on intent and
+    // shipping the card to in_progress without a usable branch would be
+    // the worst of both worlds.
+    if column == Column::InProgress && tf.task.column != Column::InProgress {
+        let project_yaml =
+            shelbi_state::load_project(project).map_err(|e| anyhow!(e))?;
+        shelbi_orchestrator::lifecycle::ensure_branch_for_in_progress(&project_yaml, id)
+            .map_err(|e| anyhow!(e))?;
+    }
+
     let moved = shelbi_state::move_task(project, id, column).map_err(|e| anyhow!(e))?;
     if let Some((from, to_col, workflow)) = moved {
         let reason = reason.unwrap_or("user:cli");
@@ -529,6 +548,23 @@ fn start(
         );
     }
 
+    // Cut the branch on the hub if it hasn't been already (depends_on
+    // aware — see `shelbi_orchestrator::lifecycle`). Doing this BEFORE
+    // `start_worker_on_task` means the worker's `sync_worktree` sees an
+    // existing branch and just checks it out; for a hub-local worker
+    // they share the repo, so the cut we just made is the same ref the
+    // worker will resolve. An explicit `--branch` override still wins:
+    // it bypasses the lifecycle cut and tells `sync_worktree` to use
+    // that ref directly (the *release task* pattern, Plans/workflows.md
+    // §12).
+    if branch_arg.is_none() {
+        let updated = shelbi_orchestrator::lifecycle::ensure_branch_for_in_progress(
+            &project_yaml,
+            id,
+        )
+        .map_err(|e| anyhow!(e))?;
+        tf = updated;
+    }
     let branch = branch_arg
         .map(str::to_string)
         .or_else(|| tf.task.branch.clone())
@@ -718,6 +754,11 @@ mod tests {
         let _g = TEST_LOCK.lock().unwrap();
         let home = fresh_home();
         std::env::set_var("SHELBI_HOME", &home);
+        // `move_to` now runs the depends_on-aware branch cut on hub when
+        // a card lands in `in_progress` — see `commands::task::move_to`.
+        // The hook needs both a loadable project YAML and a real git
+        // repo at the hub's `work_dir`, so we provision them up front.
+        crate::commands::test_support::provision_hub_repo_for_project(&home, "p");
 
         shelbi_state::save_task("p", &task_in(Column::Todo, "b"), "").unwrap();
         move_to("p", "b", "in_progress", Some("orchestrator:auto-dispatch worker=alpha"))

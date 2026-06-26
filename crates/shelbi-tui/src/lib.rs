@@ -34,12 +34,89 @@ mod zen_probe;
 
 #[cfg(test)]
 pub(crate) mod test_support {
+    use std::path::{Path, PathBuf};
     use std::sync::Mutex;
 
     /// Serializes any test that mutates the process-global `SHELBI_HOME`
     /// env var. Tests across modules share one binary (and thus one env),
     /// so they must all lock the *same* mutex or they race each other.
     pub static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    /// Provision a real git repo + project YAML at `<home>/projects/<name>.yaml`
+    /// pointing the hub machine at the repo. The kanban TUI's
+    /// `move_card` now runs the depends_on-aware branch cut via
+    /// `shelbi_orchestrator::lifecycle` when a task lands in
+    /// `in_progress`; that hook needs a loadable project YAML and a
+    /// real git repo at the hub workdir. Tests reach for this helper to
+    /// produce both.
+    ///
+    /// Caller must hold `ENV_LOCK` and have already pointed
+    /// `SHELBI_HOME` at `home`. Returns the repo path so the test can
+    /// drive further git operations against it.
+    pub fn provision_hub_repo_for_project(home: &Path, project_name: &str) -> PathBuf {
+        use shelbi_core::{
+            AgentRunnerSpec, GitConfig, HeartbeatConfig, Machine, MachineKind,
+            OrchestratorSpec, Project, ZenConfig,
+        };
+        use std::collections::BTreeMap;
+        use std::process::Command;
+
+        let repo = home.join(format!("{project_name}-repo"));
+        std::fs::create_dir_all(&repo).unwrap();
+
+        let run = |args: &[&str]| {
+            let ok = Command::new("git")
+                .current_dir(&repo)
+                .args(args)
+                .status()
+                .unwrap()
+                .success();
+            assert!(ok, "git {args:?} failed in {}", repo.display());
+        };
+        run(&["init", "-q", "-b", "main", "."]);
+        run(&["config", "user.email", "test@example.com"]);
+        run(&["config", "user.name", "Test"]);
+        std::fs::write(repo.join("README.md"), "hi\n").unwrap();
+        run(&["add", "README.md"]);
+        run(&["commit", "-q", "-m", "init"]);
+
+        let mut runners = BTreeMap::new();
+        runners.insert(
+            "claude".to_string(),
+            AgentRunnerSpec {
+                command: "claude".into(),
+                flags: vec![],
+            },
+        );
+        let project = Project {
+            name: project_name.into(),
+            repo: repo.to_string_lossy().into(),
+            default_branch: "main".into(),
+            machines: vec![Machine {
+                name: "hub".into(),
+                kind: MachineKind::Local,
+                work_dir: repo.clone(),
+                host: None,
+            }],
+            orchestrator: OrchestratorSpec {
+                runner: "claude".into(),
+            },
+            agent_runners: runners,
+            editor: None,
+            github_url: None,
+            workers: Vec::new(),
+            worker_poll_interval_secs: 5,
+            worker_permissions_mode: "auto".into(),
+            worker_settings_template: None,
+            zen: ZenConfig::default(),
+            heartbeat: HeartbeatConfig::default(),
+            contextstore_sync: Vec::new(),
+            detected_shapes: Vec::new(),
+            git: GitConfig::default(),
+        };
+        shelbi_state::save_project(&project).unwrap();
+        repo
+    }
 }
 
 pub use activity::ActivityApp;
