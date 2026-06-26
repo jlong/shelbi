@@ -1,0 +1,124 @@
+---
+title: shelbi workflow
+order: 22
+summary: Manage the per-project workflow YAML files — list, show, scaffold, and edit the status schemas tasks run under.
+---
+
+# shelbi workflow
+
+```text
+shelbi workflow <SUBCOMMAND> [OPTIONS]
+```
+
+`shelbi workflow` manages the YAML files that declare what statuses a task
+moves through, who owns each one, and which git side-effects fire on each
+transition. Every project ships with a built-in `default` workflow — the
+canonical five-status flow (`Backlog → Todo → InProgress → Review → Done`) —
+and these subcommands surface it and any custom workflows the project has
+authored.
+
+Workflow files live at
+`~/.shelbi/projects/<project>/workflows/<name>.yaml`. A file's basename is
+its name; the in-file `name:` field must match. The loader auto-creates
+`default.yaml` on first load when the directory is empty, so most projects
+never need to touch this command — it's there when you want a second
+pipeline (a docs-only flow, a research track that never opens PRs, a
+feature-stacking flow off a long-lived branch).
+
+Every subcommand accepts the global `-p / --project <PROJECT>` flag to
+target a specific project (otherwise the active `$SHELBI_PROJECT` or the
+closest `.shelbi/project` marker wins). It's omitted from the per-subcommand
+tables below to keep them readable.
+
+## list
+
+```text
+shelbi workflow list
+```
+
+Print every workflow under
+`~/.shelbi/projects/<project>/workflows/`, one per line, with a count of
+statuses and the YAML description. A `·` marker in the first column means
+the workflow is the built-in fallback — no file has been written yet. A
+blank marker means a file exists on disk.
+
+When the workflows directory is empty, the only entry is the built-in
+`default` workflow.
+
+## show
+
+```text
+shelbi workflow show <NAME>
+```
+
+Print a workflow's YAML to stdout. Equivalent to `cat`-ing the file, with
+one convenience: `show default` succeeds even before any file has been
+written — the built-in default is serialized from code with a header
+comment pointing at `workflow new default` / `workflow edit default` for
+customization. Any other missing name errors with the resolved file path.
+
+## new
+
+```text
+shelbi workflow new [OPTIONS] <NAME>
+```
+
+Scaffold a new workflow YAML pre-populated with the canonical five-status
+default. The file's `name:` field is set to `<NAME>` so it matches the
+basename. For non-`default` names the placeholder description is dropped —
+the default's "standard one-track flow…" copy would misrepresent a freshly
+scaffolded workflow whose author hasn't written a real description yet.
+
+Errors if a workflow with that name already exists. Names must be
+non-empty, must not start with `.`, and may only contain `a-z`, `0-9`, `-`,
+`_` — the name doubles as a YAML identifier referenced from task
+frontmatter, so the validator is stricter than POSIX.
+
+| Flag | Type | Default | Description |
+| --- | --- | --- | --- |
+| `<NAME>` | string | — | Workflow name (positional, required). |
+| `--edit` | flag | off | Open the new file in `$EDITOR` after creating it. |
+
+## edit
+
+```text
+shelbi workflow edit <NAME>
+```
+
+Open a workflow YAML in `$EDITOR` (defaults to `vi`). If the file doesn't
+exist and the name is `default`, the built-in default is materialized to
+disk first so you have something concrete to tweak. Any other missing name
+errors with a hint to run `shelbi workflow new <NAME>` first.
+
+## Examples
+
+See every declared workflow plus the built-in default fallback:
+
+```bash
+shelbi workflow list
+```
+
+Inspect the canonical default before customizing it:
+
+```bash
+shelbi workflow show default
+```
+
+Scaffold a docs-only workflow and open it in `$EDITOR`:
+
+```bash
+shelbi workflow new docs --edit
+```
+
+Materialize the built-in default to disk and edit it:
+
+```bash
+shelbi workflow edit default
+```
+
+## See also
+
+- [Workflows](/docs/concepts/workflows) — the schema, the
+  category model, and how transitions wire into the orchestrator.
+- [`shelbi task`](/docs/cli/task) — the `--workflow` flag on
+  `task add` and the workflow-aware `--to` validation on `task move`.

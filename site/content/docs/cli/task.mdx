@@ -39,6 +39,8 @@ Pass `--column todo` to skip triage when you're already sure.
 | `-d, --description <DESCRIPTION>` | string | empty | Task body. Use `shelbi task edit` later if omitted. |
 | `--depends-on <ID>` | string (repeatable) | — | Block this task on another. Repeat for multiple deps. |
 | `--prefers-machine <NAME>` | string | — | Hint for the orchestrator to route this task to a worker on a specific machine. |
+| `--workflow <NAME>` | string | project default | Workflow this task runs under. Names a file in `workflows/<NAME>.yaml`. Omit to inherit the project's default workflow. |
+| `--branch <BRANCH>` | string | `shelbi/<task-id>` at dispatch | Pre-fill the task's `branch:` frontmatter field. Omit to let the orchestrator cut `shelbi/<task-id>` off the resolved base branch at dispatch time; supply a value to point the task at an existing branch (the *release task* pattern). |
 
 ## list
 
@@ -89,9 +91,17 @@ Move a task between columns. Promoting a task to `todo` is the start signal
 for the orchestrator — it will pick a free worker and call `task start` on
 its own.
 
+The destination column is validated against the task's workflow — moving
+to a status the workflow doesn't declare errors with the list of valid
+statuses and the task stays put. Tasks pinned to a workflow that has no
+YAML on disk fall back to the canonical `default` workflow so legacy
+projects keep moving while the workflows directory is empty. Column ↔
+status comparison is case- and punctuation-insensitive (`InProgress` in
+the YAML matches `in_progress` on the CLI).
+
 | Flag | Type | Default | Description |
 | --- | --- | --- | --- |
-| `--to <COLUMN>` | string | — | Destination column (required). |
+| `--to <COLUMN>` | string | — | Destination column (required). Must be a status declared by the task's workflow. |
 | `--reason <REASON>` | string | `user:cli` | Reason tag recorded in `~/.shelbi/events.log`. The orchestrator parses this to tell auto-dispatches apart from user actions. |
 
 ## assign
@@ -204,6 +214,10 @@ shelbi task start docs-write-changelog-page --worker delta
 
 - [Columns](/docs/concepts/columns) — what each column means and how
   transitions trigger orchestrator behavior.
+- [Workflows](/docs/concepts/workflows) — the schema behind `--workflow`
+  and what `--to` is validated against on `task move`.
+- [`shelbi workflow`](/docs/cli/workflow) — list, show, scaffold, and
+  edit the workflow YAMLs tasks run under.
 - [Workers](/docs/concepts/workers) — the pool model that `assign` /
   `start` route into.
 - [Orchestrator](/docs/concepts/orchestrator) — how `--reason` tags get
