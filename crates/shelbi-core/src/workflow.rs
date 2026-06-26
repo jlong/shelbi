@@ -295,10 +295,12 @@ impl Workflow {
     }
 }
 
-/// The canonical five-status default workflow shipped with every new
+/// The canonical six-status default workflow shipped with every new
 /// project. The constructor that drops `workflows/default.yaml` into a
 /// fresh project should serialize this. Matches the table in
-/// `Plans/workflows.md` §3.
+/// `Plans/workflows.md` §3 — the five historical statuses plus a
+/// `Canceled` lane (`archived` category) so closing-without-shipping
+/// has a home that round-trips through every layer.
 pub fn default_workflow() -> Workflow {
     Workflow {
         name: "default".to_string(),
@@ -333,6 +335,12 @@ pub fn default_workflow() -> Workflow {
             Status {
                 name: "Done".into(),
                 category: StatusCategory::Done,
+                owner: Owner::User,
+                description: None,
+            },
+            Status {
+                name: "Canceled".into(),
+                category: StatusCategory::Archived,
                 owner: Owner::User,
                 description: None,
             },
@@ -614,25 +622,29 @@ mod tests {
     const DEFAULT_YAML: &str = r#"
 name: default
 description: |
-  Five-status default.
+  Six-status default.
 statuses:
-  - { name: Backlog,    category: backlog, owner: user  }
-  - { name: Todo,       category: ready,   owner: agent }
-  - { name: InProgress, category: active,  owner: agent }
-  - { name: Review,     category: handoff, owner: user  }
-  - { name: Done,       category: done,    owner: user  }
+  - { name: Backlog,    category: backlog,  owner: user  }
+  - { name: Todo,       category: ready,    owner: agent }
+  - { name: InProgress, category: active,   owner: agent }
+  - { name: Review,     category: handoff,  owner: user  }
+  - { name: Done,       category: done,     owner: user  }
+  - { name: Canceled,   category: archived, owner: user  }
 "#;
 
     #[test]
     fn parses_the_default_workflow_yaml() {
         let wf = Workflow::from_yaml_str(DEFAULT_YAML).expect("parse default");
         assert_eq!(wf.name, "default");
-        assert_eq!(wf.statuses.len(), 5);
+        assert_eq!(wf.statuses.len(), 6);
         assert_eq!(wf.statuses[0].name, "Backlog");
         assert_eq!(wf.statuses[0].category, StatusCategory::Backlog);
         assert_eq!(wf.statuses[0].owner, Owner::User);
         assert_eq!(wf.statuses[2].category, StatusCategory::Active);
         assert_eq!(wf.statuses[2].owner, Owner::Agent);
+        assert_eq!(wf.statuses[5].name, "Canceled");
+        assert_eq!(wf.statuses[5].category, StatusCategory::Archived);
+        assert_eq!(wf.statuses[5].owner, Owner::User);
         assert!(wf.initial_status.is_none());
         assert!(wf.transitions.is_none());
     }
@@ -641,6 +653,12 @@ statuses:
     fn default_workflow_helper_matches_documented_table() {
         let wf = default_workflow();
         wf.validate().expect("built-in default validates");
+
+        let names: Vec<_> = wf.statuses.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(
+            names,
+            vec!["Backlog", "Todo", "InProgress", "Review", "Done", "Canceled"]
+        );
 
         let cats: Vec<_> = wf.statuses.iter().map(|s| s.category).collect();
         assert_eq!(
@@ -651,13 +669,21 @@ statuses:
                 StatusCategory::Active,
                 StatusCategory::Handoff,
                 StatusCategory::Done,
+                StatusCategory::Archived,
             ]
         );
 
         let owners: Vec<_> = wf.statuses.iter().map(|s| s.owner).collect();
         assert_eq!(
             owners,
-            vec![Owner::User, Owner::Agent, Owner::Agent, Owner::User, Owner::User]
+            vec![
+                Owner::User,
+                Owner::Agent,
+                Owner::Agent,
+                Owner::User,
+                Owner::User,
+                Owner::User,
+            ]
         );
     }
 

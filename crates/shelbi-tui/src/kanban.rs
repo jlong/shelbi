@@ -2864,10 +2864,10 @@ mod tests {
     }
 
     /// With only the canonical default workflow loaded, `all_columns`
-    /// reduces to exactly the 5 legacy columns in declared order — the
-    /// view degrades gracefully to the pre-workflows layout.
+    /// reduces to exactly the 6 declared columns in order — the five
+    /// legacy lanes plus the `Canceled` terminal lane.
     #[test]
-    fn workflow_columns_for_default_only_matches_legacy_five() {
+    fn workflow_columns_for_default_only_matches_documented_six() {
         let cols = workflow_columns(std::slice::from_ref(&default_workflow()));
         let pairs: Vec<(&str, &str)> = cols
             .iter()
@@ -2881,6 +2881,7 @@ mod tests {
                 ("default", "InProgress"),
                 ("default", "Review"),
                 ("default", "Done"),
+                ("default", "Canceled"),
             ]
         );
     }
@@ -2914,6 +2915,7 @@ mod tests {
                 ("default", "InProgress"),
                 ("default", "Review"),
                 ("default", "Done"),
+                ("default", "Canceled"),
                 ("design-review", "Backlog"),
                 ("design-review", "Design"),
                 ("design-review", "QA"),
@@ -2998,14 +3000,15 @@ mod tests {
             task_in_workflow("orphan", Column::Todo, Some("ghost"), "2026-06-20T10:00:00Z"),
         ];
 
-        // default order: Backlog Todo InProgress Review Done
+        // default order: Backlog Todo InProgress Review Done Canceled
         // design-review order: Backlog Design QA Done
         // → all_columns indexes:
-        //     0 default/Backlog       5 design-review/Backlog
-        //     1 default/Todo          6 design-review/Design
-        //     2 default/InProgress    7 design-review/QA
-        //     3 default/Review        8 design-review/Done
+        //     0 default/Backlog       6 design-review/Backlog
+        //     1 default/Todo          7 design-review/Design
+        //     2 default/InProgress    8 design-review/QA
+        //     3 default/Review        9 design-review/Done
         //     4 default/Done
+        //     5 default/Canceled
         let ids = |idx: usize| -> Vec<&str> {
             app.column_tasks(idx)
                 .iter()
@@ -3015,8 +3018,8 @@ mod tests {
         assert_eq!(ids(0), Vec::<&str>::new(), "default/Backlog");
         assert_eq!(ids(1), vec!["a", "orphan"], "default/Todo");
         assert_eq!(ids(3), vec!["b"], "default/Review");
-        assert_eq!(ids(6), vec!["c"], "design-review/Design (category fallback)");
-        assert_eq!(ids(8), vec!["d"], "design-review/Done");
+        assert_eq!(ids(7), vec!["c"], "design-review/Design (category fallback)");
+        assert_eq!(ids(9), vec!["d"], "design-review/Done");
     }
 
     /// With two workflows loaded, nav_right after the last default
@@ -3040,35 +3043,35 @@ mod tests {
         app.workflows = vec![default_workflow(), design];
         app.all_columns = workflow_columns(&app.workflows);
 
-        // From default/Done (idx 4), nav_right → design-review/Backlog (idx 5).
-        app.selected_column = 4;
+        // From default/Canceled (idx 5), nav_right → design-review/Backlog (idx 6).
+        app.selected_column = 5;
         app.nav_right();
-        assert_eq!(app.selected_column, 5);
+        assert_eq!(app.selected_column, 6);
         // Continue: design-review/Backlog → Design → QA → Done → wrap to 0.
         app.nav_right();
         app.nav_right();
         app.nav_right();
-        assert_eq!(app.selected_column, 8, "should be on design-review/Done");
+        assert_eq!(app.selected_column, 9, "should be on design-review/Done");
         app.nav_right();
         assert_eq!(app.selected_column, 0, "wraps back to default/Backlog");
 
-        // Move-card boundaries: from default/Done, move-right wraps
+        // Move-card boundaries: from default/Canceled, move-right wraps
         // back to default/Backlog. Test through the helper so we
         // don't need a real task on disk.
         assert_eq!(
-            app.adjacent_column_in_same_workflow(4, true),
+            app.adjacent_column_in_same_workflow(5, true),
             Some(0),
-            "default/Done → default/Backlog (wrap inside workflow)"
+            "default/Canceled → default/Backlog (wrap inside workflow)"
         );
         assert_eq!(
             app.adjacent_column_in_same_workflow(0, false),
-            Some(4),
-            "default/Backlog → default/Done (wrap backwards inside workflow)"
+            Some(5),
+            "default/Backlog → default/Canceled (wrap backwards inside workflow)"
         );
         // Same check on the other workflow.
         assert_eq!(
-            app.adjacent_column_in_same_workflow(8, true),
-            Some(5),
+            app.adjacent_column_in_same_workflow(9, true),
+            Some(6),
             "design-review/Done → design-review/Backlog (wrap inside workflow)"
         );
     }
@@ -3141,8 +3144,11 @@ mod tests {
             ),
         ];
 
-        // 9 columns total → keep the terminal wide so every status
-        // header has room to render its label.
+        // 10 columns total (default's six + design's four) → keep the
+        // terminal wide so every status header has room to render its
+        // label. The unseeded `Canceled` column collapses to
+        // EMPTY_MIN_W, leaving plenty of slack for the headers the
+        // assertions below look for.
         let backend = TestBackend::new(160, 18);
         let mut term = Terminal::new(backend).unwrap();
         term.draw(|f| render_full(f, &mut app, f.area())).unwrap();
@@ -3158,9 +3164,10 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
 
-        // Canonical headers render full when every column is non-empty
-        // and the layout has enough room (9 × non-empty min = 126; 160
-        // cells leaves slack for full headers).
+        // Canonical headers render full when the layout has enough
+        // room. With 9 non-empty columns (× 14) + 1 empty Canceled (8)
+        // = 134 min, 160 cells leaves slack for full headers on the
+        // seeded columns.
         assert!(rendered.contains("BACKLOG"), "BACKLOG header missing:\n{rendered}");
         assert!(rendered.contains("DESIGN"), "DESIGN header missing:\n{rendered}");
         assert!(rendered.contains("QA"), "QA header missing:\n{rendered}");
@@ -3194,7 +3201,7 @@ mod tests {
         let mut app = KanbanApp::new("demo");
         app.workflows = vec![default_workflow(), design];
         app.all_columns = app.compute_all_columns();
-        assert_eq!(app.all_columns.len(), 5 + 3);
+        assert_eq!(app.all_columns.len(), 6 + 3);
 
         app.workflow_filter = Some("design-review".into());
         app.all_columns = app.compute_all_columns();
@@ -3214,7 +3221,7 @@ mod tests {
 
         app.workflow_filter = None;
         app.all_columns = app.compute_all_columns();
-        assert_eq!(app.all_columns.len(), 5 + 3, "clear restores All-mode");
+        assert_eq!(app.all_columns.len(), 6 + 3, "clear restores All-mode");
     }
 
     /// A stale workflow filter (workflow no longer loaded) falls back
@@ -3227,7 +3234,7 @@ mod tests {
         app.workflows = vec![default_workflow()];
         app.workflow_filter = Some("removed".into());
         app.all_columns = app.compute_all_columns();
-        assert_eq!(app.all_columns.len(), 5);
+        assert_eq!(app.all_columns.len(), 6);
         assert_eq!(app.workflow_filter, Some("removed".into()));
     }
 
@@ -3269,16 +3276,16 @@ mod tests {
 
     /// `compute_column_widths` collapses empty columns to a fixed
     /// minimum and gives the slack to the non-empty ones. With a
-    /// single non-empty column out of five, it should grow well past
+    /// single non-empty column out of six, it should grow well past
     /// the others.
     #[test]
     fn compute_column_widths_collapses_empty_and_grows_non_empty() {
         let workflows = vec![default_workflow()];
         let cols = workflow_columns(&workflows);
-        // 4 empty columns, 1 non-empty.
-        let counts = vec![0, 0, 3, 0, 0];
+        // 5 empty columns, 1 non-empty.
+        let counts = vec![0, 0, 3, 0, 0, 0];
         let widths = compute_column_widths(&cols, &counts, 0, 100);
-        assert_eq!(widths.len(), 5);
+        assert_eq!(widths.len(), 6);
         // Empty columns sit at EMPTY_MIN_W exactly; non-empty consumes
         // the rest.
         for (i, w) in &widths {
@@ -3302,7 +3309,7 @@ mod tests {
     /// window forward.
     #[test]
     fn compute_column_widths_drops_overflow_and_scrolls() {
-        // 9 columns × NONEMPTY_MIN_W (14) = 126 > 80. Some columns
+        // 10 columns × NONEMPTY_MIN_W (14) = 140 > 80. Some columns
         // must drop out.
         let design = workflow(
             "design-review",
