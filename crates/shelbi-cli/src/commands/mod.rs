@@ -21,6 +21,7 @@ pub mod tail;
 pub mod task;
 pub mod wizard;
 pub mod worker;
+pub mod workflow;
 pub mod zen;
 pub mod zen_lifecycle;
 

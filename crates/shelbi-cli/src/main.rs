@@ -70,6 +70,11 @@ enum Cmd {
         #[command(subcommand)]
         cmd: commands::worker::WorkerCmd,
     },
+    /// Manage the project's workflow definitions (status sets).
+    Workflow {
+        #[command(subcommand)]
+        cmd: commands::workflow::WorkflowCmd,
+    },
     /// Manage projects (add, ...).
     Project {
         #[command(subcommand)]
@@ -169,6 +174,7 @@ fn main() -> Result<()> {
         Some(Cmd::Archive { id }) => commands::archive::run(cli.project, id),
         Some(Cmd::Task { cmd }) => commands::task::run(cli.project, cmd),
         Some(Cmd::Worker { cmd }) => commands::worker::run(cli.project, cmd),
+        Some(Cmd::Workflow { cmd }) => commands::workflow::run(cli.project, cmd),
         Some(Cmd::Project { cmd }) => commands::project::run(cmd),
         Some(Cmd::Events { cmd }) => commands::events::run(cmd),
         Some(Cmd::Zen { cmd }) => commands::zen::run(cli.project, cmd),
