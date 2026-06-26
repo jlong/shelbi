@@ -274,8 +274,10 @@ impl KanbanApp {
     fn move_card(&mut self, id: &str, new_col_idx: usize) {
         let new_col = self.column(new_col_idx);
         match shelbi_state::move_task(&self.project_name, id, new_col) {
-            Ok(Some((from, to))) => {
-                if let Err(e) = shelbi_state::append_task_event(id, from, to, "user:tui") {
+            Ok(Some((from, to, workflow))) => {
+                if let Err(e) =
+                    shelbi_state::append_task_event(id, &workflow, from, to, "user:tui")
+                {
                     tracing::warn!(task = %id, error = %e, "append_task_event failed");
                 }
             }
@@ -908,13 +910,18 @@ mod tests {
         let log = std::fs::read_to_string(shelbi_state::events_log_path().unwrap()).unwrap();
         let lines: Vec<&str> = log.lines().collect();
         assert_eq!(lines.len(), 1, "log: {log:?}");
+        // Workflow-aware shape (`Plans/workflows.md` §10): the line carries
+        // `workflow=`, `reason=`, and trailing `from_category=` /
+        // `to_category=` annotations.
         assert!(lines[0].contains(" task=fix-login "), "line: {}", lines[0]);
+        assert!(lines[0].contains(" workflow=default "), "line: {}", lines[0]);
         assert!(
             lines[0].contains(" todo -> in_progress "),
             "line: {}",
             lines[0]
         );
-        assert!(lines[0].ends_with("reason=user:tui"), "line: {}", lines[0]);
+        assert!(lines[0].contains(" reason=user:tui "), "line: {}", lines[0]);
+        assert!(lines[0].ends_with(" to_category=active"), "line: {}", lines[0]);
 
         std::env::remove_var("SHELBI_HOME");
         let _ = std::fs::remove_dir_all(&home);

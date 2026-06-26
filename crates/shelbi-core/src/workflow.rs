@@ -258,6 +258,43 @@ pub enum StatusCategory {
     Done,
 }
 
+impl StatusCategory {
+    /// Stable snake_case spelling used on the wire (events log line shape,
+    /// YAML config). Matches the serde rename so callers don't have to
+    /// round-trip through serde to format a single value.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            StatusCategory::Backlog => "backlog",
+            StatusCategory::Ready => "ready",
+            StatusCategory::Active => "active",
+            StatusCategory::Handoff => "handoff",
+            StatusCategory::Done => "done",
+        }
+    }
+}
+
+impl std::fmt::Display for StatusCategory {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl std::str::FromStr for StatusCategory {
+    type Err = crate::Error;
+    fn from_str(s: &str) -> crate::Result<Self> {
+        match s.trim() {
+            "backlog" => Ok(StatusCategory::Backlog),
+            "ready" => Ok(StatusCategory::Ready),
+            "active" => Ok(StatusCategory::Active),
+            "handoff" => Ok(StatusCategory::Handoff),
+            "done" => Ok(StatusCategory::Done),
+            other => Err(crate::Error::Other(format!(
+                "unknown status category: {other}"
+            ))),
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Owner
 

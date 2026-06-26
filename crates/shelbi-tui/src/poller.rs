@@ -362,9 +362,10 @@ fn poll_one(
     if marker == PaneMarker::Review {
         if let Some(task_id) = &current_task {
             match shelbi_state::move_task(&project.name, task_id, Column::Review) {
-                Ok(Some((from, to))) => {
+                Ok(Some((from, to, workflow))) => {
                     if let Err(e) = shelbi_state::append_task_event(
                         task_id,
+                        &workflow,
                         from,
                         to,
                         "worker:review-pane",
@@ -430,9 +431,10 @@ fn maybe_promote_to_review(
                 && tf.task.assigned_to.as_deref() == Some(worker.name.as_str()) =>
         {
             match shelbi_state::move_task(&project.name, &task_id, Column::Review) {
-                Ok(Some((from, to))) => {
+                Ok(Some((from, to, workflow))) => {
                     if let Err(e) = shelbi_state::append_task_event(
                         &task_id,
+                        &workflow,
                         from,
                         to,
                         "worker:review-marker",
@@ -759,17 +761,28 @@ mod tests {
         // The promotion must also append a `task=...` line to events.log
         // tagged with the marker-driven reason, so `shelbi events tail`
         // surfaces the handoff as part of the canonical event stream.
+        // Shape from `Plans/workflows.md` §10.
         let log = std::fs::read_to_string(shelbi_state::events_log_path().unwrap()).unwrap();
         let task_lines: Vec<&str> =
             log.lines().filter(|l| l.contains(" task=fix-login ")).collect();
         assert_eq!(task_lines.len(), 1, "log: {log:?}");
+        assert!(
+            task_lines[0].contains(" workflow=default "),
+            "line: {}",
+            task_lines[0]
+        );
         assert!(
             task_lines[0].contains(" in_progress -> review "),
             "line: {}",
             task_lines[0]
         );
         assert!(
-            task_lines[0].ends_with("reason=worker:review-marker"),
+            task_lines[0].contains(" reason=worker:review-marker "),
+            "line: {}",
+            task_lines[0]
+        );
+        assert!(
+            task_lines[0].ends_with(" to_category=handoff"),
             "line: {}",
             task_lines[0]
         );
