@@ -2,6 +2,7 @@ pub mod error;
 pub mod model;
 pub mod system_memory;
 pub mod worker_names;
+pub mod workflow;
 
 pub use error::{Error, Result};
 pub use model::{
@@ -13,3 +14,6 @@ pub use model::{
 };
 pub use system_memory::{format_bytes_short, recommended_worker_count, total_memory_bytes};
 pub use worker_names::WorkerNamePreset;
+pub use workflow::{
+    default_workflow, Owner, Status as WorkflowStatus, StatusCategory, Workflow,
+};
