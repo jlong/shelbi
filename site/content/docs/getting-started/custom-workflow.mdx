@@ -1,0 +1,265 @@
+---
+title: Author a custom Shelbi workflow
+order: 6
+summary: Fork the orchestrator's prompt to encode routing rules, project-specific Zen judgment, and reporting style — the workflow lives in one markdown file you own.
+---
+
+The orchestrator is *just* your runner (`claude`, `codex`, …) booted
+with a system prompt that explains the board, the workers, and the
+loop. That prompt is the **workflow** — the contract between you and
+the agent for who initiates what, how dispatch is decided, and how
+the agent reports back. Shelbi ships a sensible default and lets
+every project replace it.
+
+This page walks through creating a project-level override from
+scratch, encoding three concrete tweaks, and applying them. The
+underlying machinery is covered in
+[the orchestrator concept page](/docs/concepts/orchestrator#customizing-the-prompt-per-project);
+this is the practical version.
+
+## Where the workflow lives
+
+Two places matter:
+
+- **The bundled default** —
+  `crates/shelbi-orchestrator/src/default_orchestrator.md.template`
+  in the Shelbi source. Edit this when you want to change the prompt
+  for *every* project that doesn't override it (typically only useful
+  if you're hacking on Shelbi itself).
+- **Your per-project override** —
+  `~/.shelbi/projects/<name>/ORCHESTRATOR.md`. When this file exists
+  it **replaces the bundled default entirely**. `{{assistant_name}}`
+  is still substituted from `~/.shelbi/shelbi.yaml` so the agent
+  still introduces itself the way the wizard set up.
+
+On every `shelbi reload` (and at session start), Shelbi resolves the
+active prompt, substitutes the assistant name, and writes the
+rendered output to `~/.shelbi/projects/<name>/CLAUDE.md`. The
+orchestrator runner is launched in that directory, so it auto-loads
+the rendered prompt without any flags. No env vars, no MCP, no
+restart of running workers — just `shelbi reload` and the next
+orchestrator turn picks up the new prompt.
+
+## Start from the default
+
+Don't write a workflow from a blank file. The default prompt
+encodes a bunch of load-bearing contracts (bootstrap, reaction
+rules, reason strings) that the rest of Shelbi expects the
+orchestrator to honor. Fork it, then edit:
+
+```bash
+# From the Shelbi source tree (the repo you ran ./scripts/install.sh in).
+cp crates/shelbi-orchestrator/src/default_orchestrator.md.template \
+   ~/.shelbi/projects/myapp/ORCHESTRATOR.md
+```
+
+If you don't have the Shelbi source on disk locally, clone it once
+just for the copy:
+
+```bash
+git clone https://github.com/jlong/shelbi.git /tmp/shelbi
+cp /tmp/shelbi/crates/shelbi-orchestrator/src/default_orchestrator.md.template \
+   ~/.shelbi/projects/myapp/ORCHESTRATOR.md
+```
+
+The file is plain markdown with `{{assistant_name}}` placeholders.
+Open it in your editor of choice and read it top to bottom before
+changing anything — the comments explain why each section exists.
+
+## What to keep when you fork
+
+A handful of pieces are the contract between the orchestrator and the
+rest of the system. Edit them carefully, but don't delete:
+
+- **The bootstrap flow.** The first reply of every session runs
+  `shelbi task list`, `shelbi worker list`, starts
+  `shelbi events tail --follow`, and reads `shelbi zen status`.
+  Drop any of these and the orchestrator boots without state.
+- **The reaction rules tied to specific reason strings.** The
+  orchestrator dispatches on `user:*` promotions, rolls workers on
+  `worker:review-marker`, and wakes on `heartbeat` lines. The rest
+  of Shelbi emits those strings — your prompt has to recognize them.
+- **The "you are the scheduler" framing.** Without it, the agent
+  reverts to chatbot mode and waits to be told what to do. The
+  whole loop falls apart.
+- **The Zen-Mode section** (if you intend to use Zen). Replace the
+  judgment categories and the merge conditions if they don't fit
+  your project, but keep the section structure — the wrapper around
+  `shelbi zen probe` reads the same primitives regardless of the
+  prose around them.
+
+Everything else is fair game.
+
+## Three example tweaks
+
+A workflow override pays for itself the first time the agent stops
+asking a question you've answered the same way a dozen times. Three
+patterns worth stealing.
+
+### 1. Pin certain task shapes to specific workers
+
+The default scheduler picks the first free worker in YAML
+declaration order, honoring `prefers_machine` hints. If your project
+has natural routing — infra tasks always to a beefy box, UI tasks
+always somewhere with the design system pre-cached — bake it into
+the workflow:
+
+```markdown
+## Routing rules
+
+In addition to the project YAML's `prefers_machine` hints, apply
+these project-specific rules when picking a worker for a `todo`
+card:
+
+- **Infra tasks** — titles containing `infra:`, `terraform`,
+  `helm`, `kubectl`, or paths under `infra/`. Always route to
+  `devbox` (the beefier remote). If no `devbox` worker is free,
+  leave the card in `todo` rather than routing to the hub.
+- **Docs and content** — titles containing `docs:` or paths under
+  `site/content/**`. Route to the first free hub worker; these
+  are short, IO-light tasks that don't need the remote.
+- **Migration touch-ups** — anything matching `db/migrate/**` or
+  `crates/shelbi-state/src/migrations/**` always goes to
+  `charlie` (so the same agent context accumulates across the
+  series). If charlie is busy, hold in `todo`.
+
+These rules take precedence over default declaration-order
+selection. The YAML's `prefers_machine` hint still overrides
+everything if set explicitly on a card.
+```
+
+The orchestrator now applies your routing on top of the default
+free-worker scan. No code change.
+
+### 2. Tune Zen's judgment categories for this project's reality
+
+The bundled default's judgment categories are deliberately
+conservative: promote if you've routinely accepted this shape, or
+the user just raised the issue, or it's part of a larger body of
+work they kicked off. That's a sensible starting bar — but every
+project has its own "always safe" pattern. Encode it:
+
+```markdown
+## Zen Mode
+
+### Auto-promote judgment categories
+
+Promote a backlog candidate to `todo` only if **at least one** is
+true:
+
+1. **Tagged `automation:` in the title.** Always in scope —
+   these are bot-filed PR-bumps and lint sweeps we have years of
+   acceptance history on.
+2. **Touches only `docs/**` or `site/content/**`.** Content
+   edits are reversible and never reach prod. If the task body
+   names a file outside those globs, fall through.
+3. **The user has accepted ≥3 tasks of the same shape (same
+   verb-prefix, same target directory) without changes in the
+   last week.** Track this against the `done` column via
+   `shelbi task list --column done`.
+
+If none of the above, leave the card in `backlog`, emit
+`reason=orchestrator:zen-decline reason-text=<short>`, and surface
+it in the next reply ("I considered promoting `<task>` but wasn't
+sure — want me to?").
+
+### Merge conditions
+
+(Inherit from the default — see the bundled template.)
+```
+
+The Rust side (`shelbi zen scan`) never inspects this prose — it
+just emits the mechanically-eligible candidates. Your override
+decides which of those actually get promoted.
+
+### 3. Change the reporting style
+
+The default prompt errs toward terse one-line status updates ("✓
+dispatched to delta. branch: shelbi/fix-login"). If you'd rather
+get a richer rundown — or a quieter one — say so:
+
+```markdown
+## Reporting style
+
+When dispatching, reply with:
+
+- The card id and chosen worker (always).
+- The full first line of the task body (so the user sees what
+  you're about to make the worker work on).
+- An estimated complexity tag (`xs` / `s` / `m` / `l`) based on
+  the body and any `depends_on`. Don't overthink it — a one-token
+  guess is better than nothing.
+
+When reporting a finished review:
+
+- The card id, the worker, and the branch.
+- A two-bullet summary of what the diff changed (read it via
+  `git diff main..<branch> --stat`).
+- Whether a relevant `done`-column precedent exists for this
+  shape of change.
+
+Background sweeps (heartbeat-triggered re-checks) report nothing
+unless they take action. Silence is fine when the board is quiet.
+```
+
+This is the easiest place to start customizing. The behavior the
+orchestrator gives you is downstream of the prose you write here —
+ask for the report you actually want.
+
+## Apply the override
+
+Three steps:
+
+```bash
+# Edit the override.
+$EDITOR ~/.shelbi/projects/myapp/ORCHESTRATOR.md
+
+# Re-render and respawn the dashboard against the new prompt.
+shelbi reload
+
+# Confirm the rendered file picked up your changes.
+diff ~/.shelbi/projects/myapp/ORCHESTRATOR.md \
+     ~/.shelbi/projects/myapp/CLAUDE.md
+```
+
+`shelbi reload` respawns the sidebar, Tasks, and Review panes
+against the new config without restarting workers or losing chat
+history. The orchestrator pane is recycled, which means its
+conversation context resets — that's the cost of changing the
+system prompt mid-session. Heads up before the next turn.
+
+## Iterate from prose, not code
+
+The whole point of putting the workflow in markdown is that you can
+keep tightening it. Two practical habits:
+
+- **Treat surprises as prompt bugs.** When the orchestrator does
+  something you didn't expect — promotes a card you'd have held,
+  reports in a style you find noisy, picks the wrong worker — open
+  `ORCHESTRATOR.md` and add the rule that would have produced the
+  outcome you wanted. Reload. Try again.
+- **Version-control the override.** Check it into the repo (or a
+  dotfiles repo) and symlink it into place. The override is the
+  single most opinionated artifact in your Shelbi setup, and the one
+  most worth preserving across machine moves and reinstalls.
+
+What you should **not** do is try to encode policy in code. The
+mechanical layer (the Rust CLI) is intentionally generous —
+`shelbi zen scan` will hand the orchestrator everything that's
+mechanically safe, and your prompt picks which of those to actually
+run. That separation is what lets you raise or lower the bar by
+editing prose.
+
+## See also
+
+- [The orchestrator](/docs/concepts/orchestrator) — how the prompt
+  template is loaded, the bootstrap flow it triggers, and the
+  reaction rules tied to specific event reason strings.
+- [Zen Mode](/docs/concepts/zen-mode) — the high-confidence bar
+  your custom judgment categories sit on top of.
+- [The events log](/docs/concepts/events-log) — the full reason
+  string vocabulary the orchestrator emits and your override may
+  want to recognize or extend.
+- [`shelbi zen`](/docs/cli/zen) — the single-purpose primitives the
+  orchestrator sequences during auto-merge, available to call by
+  hand any time.

@@ -1,0 +1,256 @@
+---
+title: Enable Zen Mode
+order: 5
+summary: Add local checks, flip the toggle, and watch the orchestrator take over both ends of the loop — auto-promoting backlog into todo and auto-merging finished branches that clear your confidence bar.
+---
+
+By default the orchestrator is the scheduler and you own both ends:
+you decide what gets promoted out of backlog, and you accept what
+comes back from review. **Zen Mode flips it.** The orchestrator takes
+the lead on both ends — promoting backlog items it judges safe to run
+and landing finished branches that clear a project-defined
+confidence bar — and you stay in the loop only for the cases it
+decides it can't judge.
+
+This page is the practical on-ramp: configure the bar, flip the
+switch, and watch one task land end-to-end without a human stop. The
+[Zen Mode concept page](/docs/concepts/zen-mode) has the full
+reference for everything you can tune.
+
+## Set the confidence bar
+
+Before turning Zen on, tell Shelbi what "safe to merge" means for
+this project. The minimum useful config is a list of local checks
+the orchestrator runs against every Zen-eligible review before it
+opens a PR.
+
+Open `~/.shelbi/projects/<name>.yaml` and add a `zen` block:
+
+```yaml
+# ~/.shelbi/projects/<name>.yaml
+name: myapp
+repo: /Users/you/Workspaces/myapp
+# … the rest of the wizard's output …
+
+zen:
+  checks:
+    local:
+      - 'cargo test --workspace'
+      - 'cargo clippy --workspace --all-targets -- -D warnings'
+  ci_timeout: 15m
+  danger_paths:
+    extend:
+      - 'crates/shelbi-state/src/migrations/**'
+```
+
+Three things to know about that block:
+
+- **`checks.local`** — shell commands run from the worktree root.
+  Each must exit `0` for the branch to clear the bar. Anything red
+  leaves the task in `review` for you, with a tagged reason in the
+  activity feed.
+- **`ci_timeout`** — how long to wait for required GitHub checks to
+  settle after the PR opens. Anything still pending when the deadline
+  hits bails out. Default `15m`.
+- **`danger_paths.extend`** — globs the orchestrator treats as too
+  sensitive to auto-merge. Shelbi already ships built-in danger
+  paths and detects more from your project shape (cargo workspace,
+  next.js app, `.github/`, etc.); `extend` adds yours on top.
+  `override` replaces everything if you want the explicit list.
+
+Apply the change:
+
+```bash
+shelbi reload
+```
+
+Verify Shelbi sees the config:
+
+```bash
+shelbi zen status
+```
+
+```
+mode: off
+checks.local:
+  - cargo test --workspace
+  - cargo clippy --workspace --all-targets -- -D warnings
+ci_timeout: 15m
+danger_paths (resolved):
+  built-in:        .github/workflows/**, scripts/install.sh, *.yaml, *.yml, LICENSE, package-lock.json, Cargo.lock
+  cargo workspace: Cargo.toml, Cargo.lock, rust-toolchain.toml, .cargo/config.toml
+  github:          .github/CODEOWNERS, .github/dependabot.yml
+  extend:          crates/shelbi-state/src/migrations/**
+in-flight zen tasks: 0
+```
+
+The resolved danger-path list labels every contribution so you can see
+which globs came from where. If something you expected to be guarded
+isn't on the list, add it under `extend`.
+
+## Flip the switch
+
+Three ways:
+
+- **CLI** — `shelbi zen on`
+- **TUI** — `Alt+Z` from any sidebar focus
+- **First-run hotkey probe** — the very first time you launch the
+  sidebar, Shelbi runs a tiny probe to confirm `Alt+Z` survives your
+  terminal (some, like macOS Terminal.app, swallow `Alt`). If the
+  chord doesn't arrive, a chooser offers `Ctrl+\`, `Ctrl+G`, or
+  `Ctrl+Shift+Z` as fallbacks. Pick one and it's persisted to
+  `~/.shelbi/shelbi.yaml`.
+
+You'll know it's on by the **ZEN ON** pill anchored to the bottom of
+the workers column in the sidebar. That pill is the at-a-glance "the
+agent is in lead mode" signal — if it's not there, Zen is off or
+paused.
+
+```
+ — agents —
+ · alpha
+ · bravo
+ · charlie
+
+ — Ready for Review —
+ (empty)
+
+                          [ ZEN ON ]
+```
+
+## Watch one task land end-to-end
+
+Drop a small, clearly-in-scope task into the backlog:
+
+```
+you: tighten the rate-limit error copy to mention the retry window.
+```
+
+With Zen off, the card would sit in `backlog` waiting for you to
+promote it. With Zen on, the orchestrator scans backlog when a
+worker frees up, runs the **judgment categories** from its prompt
+against each mechanically-eligible card, and promotes the ones at
+least one category applies to. You'll see a Zen-tagged line in the
+activity feed:
+
+```
+ZEN promoted tighten-rate-limit-error-copy
+     (category: routine task shape you accept without changes)
+```
+
+The dispatch and run that follow look exactly like the manual loop —
+the card moves to `in_progress`, the worker badge flips to `⏵`, and
+the agent works the prompt.
+
+What changes is what happens when the worker writes its review-ready
+marker. Instead of stopping at `review` for your inspection, the
+orchestrator runs the bar:
+
+```text
+review-marker -> probe -> local checks -> merge conflict -> diff size
+              -> danger paths -> pr-create -> ci-watch -> pr-merge
+```
+
+Each step is a single-purpose CLI primitive (see
+[`shelbi zen`](/docs/cli/zen)). Pass them all and the branch lands
+on `default_branch`, the card moves to `done`, and a tagged line
+hits the events log:
+
+```
+2026-06-22T14:31:08+00:00 task=tighten-rate-limit-error-copy review -> done reason=orchestrator:zen-merge sha=abc1234
+```
+
+Fail any of them — a flaky test, a too-large diff, a touch on a
+danger path, a red CI — and the card stops in `review` for you, with
+a tagged reason line that tells you why:
+
+| Reason | Meaning |
+| --- | --- |
+| `zen:failed-checks cmd=… exit=…` | A `checks.local` command exited non-zero. |
+| `zen:diff-too-large files=… lines=…` | Diff exceeded the size threshold. |
+| `zen:danger-path paths=…` | One or more danger-path globs matched. |
+| `zen:merge-conflict files=…` | Branch wouldn't merge cleanly. |
+| `zen:ci-timeout duration=…` | CI didn't settle within `ci_timeout`. |
+
+The card behaves like any other manual review from there. You review
+the branch, fix what needs fixing, and either merge by hand or push
+new commits that clear the bar on the next attempt.
+
+## The activity feed
+
+Zen-driven moves get distinct visual treatment in the sidebar's
+activity feed: a small **ZEN** badge in the avatar column, and a
+dark-tinted row background, so machine-initiated actions are
+visually separable from anything you did. The most common reason
+strings:
+
+| Reason | When it fires |
+| --- | --- |
+| `orchestrator:zen-promote category=<n>` | The orchestrator promoted a backlog card under judgment category `<n>`. |
+| `orchestrator:zen-decline reason-text=<short>` | A mechanically-eligible card was considered and explicitly left in backlog — the orchestrator surfaces it in its next reply. |
+| `orchestrator:zen-merge sha=<short>` | A reviewed task cleared the bar and landed on `main`. |
+
+`shelbi events tail --follow` shows the same lines in raw form if you
+want to watch from a shell.
+
+## Pause and stop
+
+Three flavors of "stop", in increasing severity:
+
+- **`shelbi zen pause`** — softer. No *new* auto-promotions, but
+  Zen tasks already mid-flight keep applying the bar. Use this when
+  you want to triage incoming work yourself for a bit without
+  aborting in-flight merges.
+- **`shelbi zen off`** (or `Alt+Z` toggle) — hard off. New
+  auto-promotions stop and the orchestrator stops initiating the
+  merge bar on review handoffs. Anything already in the bar runs to
+  completion on its current trajectory.
+- **`shelbi task move <id> --to backlog`** from `review` — pull one
+  specific card out of Zen's hands without changing the global mode.
+
+### Crash recovery
+
+If the orchestrator pane dies mid-session (kill signal, machine
+power loss, SIGHUP), Zen auto-disables on the next orchestrator
+start. The wrapper writes a heartbeat every 60s; an ungraceful exit
+flips Zen off, writes a `zen=off reason=crash-recovery` event line,
+and prints a stderr warning. The orchestrator's bootstrap also calls
+this out in its first reply so you don't miss it. Re-enable with
+`shelbi zen on` once you've reviewed any work that was in flight.
+
+## Tune the bar over time
+
+The values you set in `project.yaml` are the easy half — the
+**judgment categories** that decide *which* backlog items the
+orchestrator considers promoting live in its prompt, not the YAML.
+That prompt is a file you own:
+
+```text
+~/.shelbi/projects/<name>/ORCHESTRATOR.md
+```
+
+When that file exists, it replaces the bundled default entirely.
+You can tune the auto-promote logic for your project — what counts
+as "routine," when to refuse, how to phrase a decline — by editing
+prose, not code. The next page,
+[author a custom workflow](/docs/getting-started/custom-workflow),
+walks through writing one from scratch.
+
+In the meantime, the deep reference for everything Zen touches:
+
+- [Zen Mode](/docs/concepts/zen-mode) — the full mental model, the
+  high-confidence bar, judgment categories, per-task overrides,
+  configuration reference.
+- [`shelbi zen`](/docs/cli/zen) — every subcommand the orchestrator
+  sequences during auto-merge, callable by hand for one-off probes.
+- [The events log](/docs/concepts/events-log) — the canonical format
+  of every `mode=zen` and `orchestrator:zen-*` line Zen emits.
+
+## Next
+
+You've handed the agent the lead on both ends of the loop and given
+it a confidence bar that matches this project. The last step is
+making the workflow itself yours — [author a custom Shelbi
+workflow](/docs/getting-started/custom-workflow) to change routing
+rules, tune Zen's judgment, and adjust how the orchestrator reports
+back to you.
