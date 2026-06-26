@@ -14,7 +14,7 @@ That model fits a single-track *one user + agents* workflow well, but it can't m
 
 **Workflows** generalizes the status set per project. The defaults stay, but now they're one workflow definition among many. A workflow is a named YAML file declaring its statuses, who owns each one (user vs agent), and how work moves between them. Tasks are assigned to a workflow (default if unassigned). Multiple workflows can coexist; the TUI and orchestrator respect each task's workflow when rendering and routing.
 
-The five hardcoded statuses become the **default workflow** — one definition file that ships with every new project. Adding a new workflow is a YAML edit. Custom workflows can introduce custom statuses, but every status maps to a **status category** (the underlying semantic) so generic code (Zen Mode auto-merge, activity feed rendering, "what does this column mean?") still works across arbitrary status names.
+The five hardcoded statuses plus a new `Canceled` lane (mapping to the `archived` category) become the **default workflow** — one definition file that ships with every new project. Adding a new workflow is a YAML edit. Custom workflows can introduce custom statuses, but every status maps to a **status category** (the underlying semantic) so generic code (Zen Mode auto-merge, activity feed rendering, "what does this column mean?") still works across arbitrary status names.
 
 ## Design
 
@@ -73,6 +73,10 @@ statuses:
     category: done
     owner: user
 
+  - name: Canceled
+    category: archived
+    owner: user
+
 # Optional: which status a new task lands in by default. If absent, the
 # first status in the list is used.
 initial_status: Backlog
@@ -88,7 +92,7 @@ initial_status: Backlog
 
 ### 3. Default workflow
 
-Every new project ships with `workflows/default.yaml` containing the five-status definition above. This makes the default an editable file rather than implicit behavior — the user can immediately customize names (e.g., rename `Todo` to `Ready`) without breaking anything.
+Every new project ships with `workflows/default.yaml` containing the six-status definition above. This makes the default an editable file rather than implicit behavior — the user can immediately customize names (e.g., rename `Todo` to `Ready`) without breaking anything.
 
 If a project has no `workflows/` directory at all (legacy state), shelbi auto-generates `default.yaml` on first load and migrates existing tasks to reference it.
 
