@@ -1,6 +1,6 @@
 ---
 title: Zen Mode
-order: 5
+order: 14
 summary: Hands-off autonomy — the orchestrator triages backlog, runs the high-confidence merge bar, and lands work without waiting on you. You stay in the loop for anything ambiguous.
 ---
 
@@ -484,5 +484,7 @@ key in `project.yaml` (default `3m`).
   underlying scheduler is wired and where the prompt template lives.
 - [The events log](/docs/concepts/events-log) — the canonical
   format of the `mode=zen` and `orchestrator:zen-*` lines Zen emits.
-- [Columns](/docs/concepts/columns) — what `review` and `done` mean
-  in the default flow that Zen accelerates.
+- [Workflows](/docs/concepts/workflows#lifecycle-who-moves-a-task-between-the-default-statuses)
+  — what `Review` and `Done` mean in the default flow Zen accelerates,
+  and how custom workflows declare their own `handoff` and `done`
+  statuses.

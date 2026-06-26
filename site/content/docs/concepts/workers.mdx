@@ -1,6 +1,6 @@
 ---
 title: Workers
-order: 1
+order: 11
 summary: A worker is a long-lived agent slot pinned to a machine and a worktree — the unit the orchestrator dispatches tasks to.
 ---
 
@@ -158,8 +158,9 @@ hard-coded; you can `tmux ls` on the remote to inspect.
 
 ## See also
 
-- [Columns](/docs/concepts/columns) — what `in_progress` and `review`
-  mean, and where workers fit in the task lifecycle.
+- [Workflows](/docs/concepts/workflows#lifecycle-who-moves-a-task-between-the-default-statuses)
+  — what the default workflow's statuses mean, and where workers fit
+  in the task lifecycle.
 - [The events log](/docs/concepts/events-log) — the shape of every
   worker transition line.
 - [The orchestrator](/docs/concepts/orchestrator) — how it picks which
