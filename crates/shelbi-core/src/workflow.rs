@@ -387,6 +387,8 @@ pub enum StatusCategory {
     Handoff,
     /// Terminal state — accepted, shipped.
     Done,
+    /// Terminal — closed without shipping (cancelled, won't fix, duplicate, etc.).
+    Archived,
 }
 
 impl StatusCategory {
@@ -400,6 +402,7 @@ impl StatusCategory {
             StatusCategory::Active => "active",
             StatusCategory::Handoff => "handoff",
             StatusCategory::Done => "done",
+            StatusCategory::Archived => "archived",
         }
     }
 }
@@ -419,6 +422,7 @@ impl std::str::FromStr for StatusCategory {
             "active" => Ok(StatusCategory::Active),
             "handoff" => Ok(StatusCategory::Handoff),
             "done" => Ok(StatusCategory::Done),
+            "archived" => Ok(StatusCategory::Archived),
             other => Err(crate::Error::Other(format!(
                 "unknown status category: {other}"
             ))),
@@ -674,6 +678,35 @@ statuses:
         assert!(!y.contains("transitions"));
         // Per-status `description` not set either.
         assert!(!y.contains("description: null"));
+    }
+
+    #[test]
+    fn archived_category_round_trips_through_yaml_and_from_str() {
+        use std::str::FromStr;
+
+        // YAML deserialization (serde rename_all = "snake_case") accepts
+        // `archived` as a category — a workflow with a `Canceled`/`Won't
+        // Fix` terminal status needs this to land on disk.
+        let yaml = r#"
+name: w
+statuses:
+  - { name: Canceled, category: archived, owner: user }
+"#;
+        let wf = Workflow::from_yaml_str(yaml).unwrap();
+        assert_eq!(wf.statuses[0].category, StatusCategory::Archived);
+
+        // Round-trip back out — wire form is the snake_case spelling.
+        let y = serde_yaml::to_string(&wf).unwrap();
+        assert!(y.contains("category: archived"));
+
+        // FromStr (used by the events-log parser to lift
+        // `from_category=`/`to_category=` tokens) accepts it too.
+        assert_eq!(
+            StatusCategory::from_str("archived").unwrap(),
+            StatusCategory::Archived,
+        );
+        assert_eq!(StatusCategory::Archived.as_str(), "archived");
+        assert_eq!(StatusCategory::Archived.to_string(), "archived");
     }
 
     #[test]

@@ -1882,6 +1882,10 @@ fn category_color(category: StatusCategory) -> Color {
         StatusCategory::Active => Color::Yellow,
         StatusCategory::Handoff => Color::Magenta,
         StatusCategory::Done => Color::Green,
+        // Closed-without-shipping (Cancelled / Won't Fix / Duplicate).
+        // Darker than Backlog so the eye reads it as terminal-inactive,
+        // not waiting-for-triage.
+        StatusCategory::Archived => Color::DarkGray,
     }
 }
 
@@ -1985,6 +1989,10 @@ fn category_to_column(category: StatusCategory) -> Column {
         StatusCategory::Active => Column::InProgress,
         StatusCategory::Handoff => Column::Review,
         StatusCategory::Done => Column::Done,
+        // Legacy `Column` has no Archived bucket — both terminal
+        // categories collapse to `Done` on disk until task storage
+        // moves off the 5-column enum (`Plans/workflows.md` §10).
+        StatusCategory::Archived => Column::Done,
     }
 }
 
