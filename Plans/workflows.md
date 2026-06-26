@@ -140,7 +140,7 @@ Kanban  ·  [Workflow: All ▾]                                  (q to quit, ? f
 
 The filter defaults to **`All`** — every task across every workflow is visible, with columns drawn from the six status categories (Backlog / Ready / Active / Handoff / Done / Archived). Selecting a specific workflow switches columns to that workflow's native status names and narrows the cards to only that workflow's tasks. There is no separate "Workflows" view; workflows are configuration (see §4).
 
-**Every column is always shown**, in declaration order — the full structure stays visible at a glance, regardless of where work currently sits. Empty columns aren't hidden; they're collapsed. The same rules apply in both modes: in `All`, the columns are the five status categories; in a workflow-specific filter, they're that workflow's declared statuses.
+**Every column is always shown**, in declaration order — the full structure stays visible at a glance, regardless of where work currently sits. Empty columns aren't hidden; they're collapsed. The same rules apply in both modes: in `All`, the columns are the six status categories; in a workflow-specific filter, they're that workflow's declared statuses.
 
 - Columns with one or more tasks render as **full-width columns** (card list inside).
 - Columns with **no tasks collapse to a thin vertical strip** ~3 cells wide, with the column name written top-to-bottom (one character per row). The strip spans the full board height so the column rail stays visually aligned. Cards can still be dropped onto a collapsed strip; moving the cursor onto one expands it temporarily until focus leaves.
@@ -160,7 +160,7 @@ Example of a workflow-specific filter (7-status `design-review`) where only `Bui
 └─┘ └─┘ └────────────┘ └─┘ └────────────┘ └─┘ └─┘
 ```
 
-Switching the filter re-renders with the selected workflow's status set — or back to the five status categories when set to `All`. The sidebar's worker badges and activity feed are workflow-agnostic.
+Switching the filter re-renders with the selected workflow's status set — or back to the six status categories when set to `All`. The sidebar's worker badges and activity feed are workflow-agnostic.
 
 ### 8. Orchestrator + Zen integration
 
