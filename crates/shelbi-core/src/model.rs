@@ -70,6 +70,14 @@ pub struct Project {
     /// Default `3m`; set to `off` to disable. See [`HeartbeatConfig`].
     #[serde(default)]
     pub heartbeat: HeartbeatConfig,
+    /// Project-level git config: where worker branches are based and how
+    /// `shelbi merge` (and Zen Mode's auto-merge path) integrates them
+    /// back. `base_branch` falls back to [`Project::default_branch`] when
+    /// unset, so existing project YAMLs keep working without a `git:`
+    /// block. See [`GitConfig`] and [`Project::base_branch`] /
+    /// [`Project::merge_strategy`].
+    #[serde(default)]
+    pub git: GitConfig,
     /// ContextStore spaces that should be rsynced from a remote worker's
     /// machine back to hub after the worker hands off for review. Each
     /// space's path is interpreted on both hub and remote — leading `~`
@@ -214,6 +222,77 @@ fn default_branch() -> String {
     "main".to_string()
 }
 
+// ---------------------------------------------------------------------------
+// Git config (base branch + merge strategy)
+
+/// Project-level git config: which branch to base feature branches on
+/// and how to integrate them back. Stored under the `git:` key in the
+/// project YAML; absent altogether on existing projects, in which case
+/// every field falls back to its default.
+///
+/// `base_branch` is intentionally `Option` so old YAMLs that only carry
+/// the top-level `default_branch:` keep working — the accessor
+/// [`Project::base_branch`] resolves the effective value.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct GitConfig {
+    /// Branch to base worker branches on and target when merging. When
+    /// `None`, callers fall back to [`Project::default_branch`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_branch: Option<String>,
+    /// How `shelbi merge` (and Zen Mode's auto-merge path) integrates a
+    /// worker branch back into [`Project::base_branch`]. Default
+    /// [`MergeStrategy::Squash`] preserves the historical behavior.
+    #[serde(default)]
+    pub merge_strategy: MergeStrategy,
+}
+
+/// How a worker branch is integrated back into the base branch. Maps
+/// 1:1 onto `gh pr merge --{squash,merge,rebase}` and the equivalent
+/// local `git merge` / `git rebase` invocations.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum MergeStrategy {
+    /// Collapse the branch into a single commit on the base branch.
+    /// Default — matches the original hardcoded behavior of `shelbi
+    /// merge` and Zen Mode's auto-merge.
+    #[default]
+    Squash,
+    /// Standard three-way merge — preserves every commit on the branch
+    /// plus a merge commit on top.
+    Merge,
+    /// Replay the branch's commits on top of the base branch (no merge
+    /// commit).
+    Rebase,
+}
+
+impl MergeStrategy {
+    /// The `gh pr merge` flag corresponding to this strategy: `--squash`,
+    /// `--merge`, or `--rebase`. The hyphen-prefixed form matches what
+    /// the existing call sites pass to `gh`.
+    pub fn gh_flag(self) -> &'static str {
+        match self {
+            MergeStrategy::Squash => "--squash",
+            MergeStrategy::Merge => "--merge",
+            MergeStrategy::Rebase => "--rebase",
+        }
+    }
+
+    /// Short label for diagnostics — matches the YAML wire form.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            MergeStrategy::Squash => "squash",
+            MergeStrategy::Merge => "merge",
+            MergeStrategy::Rebase => "rebase",
+        }
+    }
+}
+
+impl std::fmt::Display for MergeStrategy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 fn default_worker_poll_interval_secs() -> u64 {
     5
 }
@@ -225,6 +304,22 @@ fn default_worker_permissions_mode() -> String {
 impl Project {
     pub fn machine(&self, name: &str) -> Option<&Machine> {
         self.machines.iter().find(|m| m.name == name)
+    }
+
+    /// Effective base branch — `git.base_branch` when set, otherwise the
+    /// top-level `default_branch`. Call this instead of reading
+    /// `default_branch` directly so a project that adopts the `git:`
+    /// block transparently overrides the older field.
+    pub fn base_branch(&self) -> &str {
+        self.git
+            .base_branch
+            .as_deref()
+            .unwrap_or(&self.default_branch)
+    }
+
+    /// Configured merge strategy, defaulting to [`MergeStrategy::Squash`].
+    pub fn merge_strategy(&self) -> MergeStrategy {
+        self.git.merge_strategy
     }
 
     pub fn runner(&self, name: &str) -> Option<&AgentRunnerSpec> {
@@ -1100,6 +1195,7 @@ worker_settings_template: /etc/shelbi/p.json
             worker_settings_template: None,
             zen: ZenConfig::default(),
             heartbeat: HeartbeatConfig::default(),
+            git: GitConfig::default(),
             contextstore_sync: Vec::new(),
             detected_shapes: Vec::new(),
         };
@@ -1142,6 +1238,7 @@ worker_settings_template: /etc/shelbi/p.json
             worker_settings_template: None,
             zen,
             heartbeat: HeartbeatConfig::default(),
+            git: GitConfig::default(),
             contextstore_sync: Vec::new(),
             detected_shapes: Vec::new(),
         }
@@ -1677,5 +1774,150 @@ heartbeat: 180
             msg.contains("missing unit") || msg.contains("180"),
             "expected error to mention the missing unit, got: {msg}"
         );
+    }
+
+    // ---- Git config (base_branch, merge_strategy) -------------------------
+
+    #[test]
+    fn git_config_defaults_to_squash_and_no_base_branch_override() {
+        let g = GitConfig::default();
+        assert!(g.base_branch.is_none());
+        assert_eq!(g.merge_strategy, MergeStrategy::Squash);
+    }
+
+    #[test]
+    fn merge_strategy_yaml_wire_form_is_snake_case() {
+        assert_eq!(
+            serde_yaml::to_string(&MergeStrategy::Squash).unwrap().trim(),
+            "squash"
+        );
+        assert_eq!(
+            serde_yaml::to_string(&MergeStrategy::Merge).unwrap().trim(),
+            "merge"
+        );
+        assert_eq!(
+            serde_yaml::to_string(&MergeStrategy::Rebase).unwrap().trim(),
+            "rebase"
+        );
+        for s in [MergeStrategy::Squash, MergeStrategy::Merge, MergeStrategy::Rebase] {
+            let y = serde_yaml::to_string(&s).unwrap();
+            let back: MergeStrategy = serde_yaml::from_str(&y).unwrap();
+            assert_eq!(s, back);
+        }
+    }
+
+    #[test]
+    fn merge_strategy_gh_flags_match_cli() {
+        assert_eq!(MergeStrategy::Squash.gh_flag(), "--squash");
+        assert_eq!(MergeStrategy::Merge.gh_flag(), "--merge");
+        assert_eq!(MergeStrategy::Rebase.gh_flag(), "--rebase");
+    }
+
+    #[test]
+    fn project_yaml_omits_git_block_and_uses_defaults() {
+        // Pre-existing project YAMLs don't carry a `git:` block; the
+        // accessors must fall back to `default_branch` and `Squash`.
+        let yaml = r#"
+name: p
+repo: r
+default_branch: develop
+machines:
+  - { name: hub, kind: local, work_dir: /tmp }
+orchestrator: { runner: claude }
+agent_runners:
+  claude: { command: claude, flags: [] }
+"#;
+        let p: Project = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(p.git, GitConfig::default());
+        assert_eq!(p.base_branch(), "develop");
+        assert_eq!(p.merge_strategy(), MergeStrategy::Squash);
+    }
+
+    #[test]
+    fn project_yaml_parses_git_block() {
+        let yaml = r#"
+name: p
+repo: r
+default_branch: main
+machines:
+  - { name: hub, kind: local, work_dir: /tmp }
+orchestrator: { runner: claude }
+agent_runners:
+  claude: { command: claude, flags: [] }
+git:
+  base_branch: trunk
+  merge_strategy: rebase
+"#;
+        let p: Project = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(p.git.base_branch.as_deref(), Some("trunk"));
+        assert_eq!(p.git.merge_strategy, MergeStrategy::Rebase);
+        // base_branch() prefers git.base_branch over default_branch when
+        // both are present.
+        assert_eq!(p.base_branch(), "trunk");
+        assert_eq!(p.merge_strategy(), MergeStrategy::Rebase);
+    }
+
+    #[test]
+    fn project_yaml_parses_partial_git_block_only_merge_strategy() {
+        // A common shape: keep the historical default_branch, just opt
+        // into a non-squash merge.
+        let yaml = r#"
+name: p
+repo: r
+default_branch: main
+machines:
+  - { name: hub, kind: local, work_dir: /tmp }
+orchestrator: { runner: claude }
+agent_runners:
+  claude: { command: claude, flags: [] }
+git:
+  merge_strategy: merge
+"#;
+        let p: Project = serde_yaml::from_str(yaml).unwrap();
+        assert!(p.git.base_branch.is_none());
+        assert_eq!(p.git.merge_strategy, MergeStrategy::Merge);
+        assert_eq!(p.base_branch(), "main");
+        assert_eq!(p.merge_strategy(), MergeStrategy::Merge);
+    }
+
+    #[test]
+    fn git_block_round_trips_and_omits_unset_base_branch() {
+        let cfg = GitConfig {
+            base_branch: None,
+            merge_strategy: MergeStrategy::Merge,
+        };
+        let y = serde_yaml::to_string(&cfg).unwrap();
+        // base_branch is None → must not surface on the wire.
+        assert!(!y.contains("base_branch"), "got: {y}");
+        assert!(y.contains("merge_strategy: merge"), "got: {y}");
+        let back: GitConfig = serde_yaml::from_str(&y).unwrap();
+        assert_eq!(cfg, back);
+
+        let cfg = GitConfig {
+            base_branch: Some("trunk".into()),
+            merge_strategy: MergeStrategy::Squash,
+        };
+        let y = serde_yaml::to_string(&cfg).unwrap();
+        assert!(y.contains("base_branch: trunk"), "got: {y}");
+        let back: GitConfig = serde_yaml::from_str(&y).unwrap();
+        assert_eq!(cfg, back);
+    }
+
+    #[test]
+    fn project_yaml_rejects_unknown_merge_strategy() {
+        let yaml = r#"
+name: p
+repo: r
+machines:
+  - { name: hub, kind: local, work_dir: /tmp }
+orchestrator: { runner: claude }
+agent_runners:
+  claude: { command: claude, flags: [] }
+git:
+  merge_strategy: ff_only
+"#;
+        // `ff_only` isn't a known variant — serde must reject so a typo
+        // doesn't silently fall back to `Squash`.
+        assert!(serde_yaml::from_str::<Project>(yaml).is_err());
     }
 }

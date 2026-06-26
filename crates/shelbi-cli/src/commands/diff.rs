@@ -12,7 +12,7 @@ pub fn run(project: Option<String>, id: String) -> Result<()> {
     let host = machine.host();
 
     let wt = file.agent.worktree.to_string_lossy().into_owned();
-    let parent_branch = project.default_branch.clone();
+    let parent_branch = project.base_branch().to_string();
     let merge_base = shelbi_ssh::run_capture(
         &host,
         ["git", "-C", &wt, "merge-base", &parent_branch, "HEAD"],

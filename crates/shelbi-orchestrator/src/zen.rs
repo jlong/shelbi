@@ -84,7 +84,7 @@ pub fn pr_create(
         .branch
         .clone()
         .unwrap_or_else(|| format!("shelbi/{}", task.id));
-    let target = project.default_branch.as_str();
+    let target = project.base_branch();
 
     // Idempotency: if a PR for this branch is already open, return it
     // unchanged. Picking `state=open` intentionally — a closed/merged PR
@@ -193,20 +193,22 @@ pub fn ci_watch(project: &Project, pr: u64, timeout: Duration) -> Result<CiVerdi
     }
 }
 
-/// Squash-merge `pr` and delete its source branch. Returns the merge SHA.
+/// Integrate `pr` and delete its source branch using the project's
+/// configured [`shelbi_core::MergeStrategy`]. Returns the merge SHA.
 pub fn pr_merge(project: &Project, pr: u64) -> Result<String> {
     let (host, dir) = locate_hub_workdir(project)?;
     let wt = dir.to_string_lossy().into_owned();
     let pr_str = pr.to_string();
+    let strategy_flag = project.merge_strategy().gh_flag();
 
     let out = run_in_dir(
         &host,
         &wt,
-        &["gh", "pr", "merge", &pr_str, "--squash", "--delete-branch"],
+        &["gh", "pr", "merge", &pr_str, strategy_flag, "--delete-branch"],
     )?;
     if !out.status.success() {
         return Err(Error::Command {
-            cmd: format!("gh pr merge {pr_str} --squash --delete-branch"),
+            cmd: format!("gh pr merge {pr_str} {strategy_flag} --delete-branch"),
             status: out.status.to_string(),
             stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
         });
@@ -569,8 +571,9 @@ pub fn probe(project: &Project, task: &Task, branch: &str) -> Result<ProbeReport
     let host = machine.host();
     let worktree = worker_worktree(&machine, worker);
 
-    let merge_conflict = probe_merge_conflict(&host, &worktree, branch, &project.default_branch)?;
-    let diff_size = probe_diff_size(&host, &worktree, branch, &project.default_branch)?;
+    let base = project.base_branch();
+    let merge_conflict = probe_merge_conflict(&host, &worktree, branch, base)?;
+    let diff_size = probe_diff_size(&host, &worktree, branch, base)?;
     let danger_paths = probe_danger_paths(project, &host, &worktree, branch)?;
     let local_checks = probe_local_checks(&host, &worktree, project, task)?;
 
@@ -881,7 +884,7 @@ fn probe_danger_paths(
         return Ok(DangerPaths::default());
     }
     let wt = worktree.to_string_lossy().into_owned();
-    let range = format!("{}..{}", project.default_branch, branch);
+    let range = format!("{}..{}", project.base_branch(), branch);
     let stdout = shelbi_ssh::run_capture(
         host,
         ["git", "-C", wt.as_str(), "diff", "--name-only", range.as_str()],
