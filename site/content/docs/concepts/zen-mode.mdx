@@ -53,9 +53,11 @@ instead). Your pick is persisted to `~/.shelbi/shelbi.yaml`.
 
 Zen Mode does exactly two things the default scheduler doesn't:
 
-1. **Auto-merge** — when a worker hands a task off to `review`, Zen
-   runs the high-confidence bar (below). If everything passes, the
-   task lands on `main` and moves to `done` without a human stop.
+1. **Auto-merge** — when a task is queued for a workflow transition
+   whose `actions:` include `merge`, Zen runs the high-confidence bar
+   (below). If everything passes, the branch lands on its target and
+   the task moves to the transition's `to` status — typically `done`
+   — without a human stop.
 2. **Auto-promote** — when a worker frees up, Zen scans the backlog
    for tasks that are *mechanically eligible* (see
    [`shelbi zen scan`](/docs/cli/zen#scan)) and then applies the
@@ -68,34 +70,61 @@ per project. That's the most important point on this page.
 
 ## The high-confidence bar
 
-When a Zen-eligible task lands in `review`, the orchestrator runs
-`shelbi zen probe <task-id>` to get a single JSON report covering
-every dimension below. Then it applies the conditions in order. Any
-failure leaves the task in `review` with a tagged reason event so the
-activity feed shows what happened.
+The bar fires on **any [workflow](/docs/concepts/workflows#transitions)
+transition whose `actions:` list includes `merge`** — not on the
+`Review` column per se. The canonical default workflow happens to put
+`merge` on the `Review → Done` edge, so the practical effect is the
+same as before: a task that hands off to `review` trips the bar. But a
+trunk-based workflow that skips `Review` entirely and merges straight
+from `InProgress → Done` runs through the *same* probe — gating is
+action-based, not status-pair-based. See [What fires Zen Mode's
+high-confidence bar](/docs/concepts/workflows#what-fires-zen-modes-high-confidence-bar).
+
+When such a transition is queued, the orchestrator runs
+`shelbi zen probe <task-id>` (which threads the task's workflow
+through `probe_in_workflow` so per-workflow overrides take effect — see
+below) to get a single JSON report covering every dimension below.
+Then it applies the conditions in order. Any failure leaves the task
+where it was, with a tagged reason event so the activity feed shows
+what happened.
 
 ```text
-review-marker -> probe -> local checks -> merge conflict -> diff size
-              -> danger paths -> pr-create -> ci-watch -> pr-merge
+merge-transition -> probe -> local checks -> merge conflict -> diff size
+                 -> danger paths -> pr-create -> ci-watch -> pr-merge
 ```
+
+**Back-compat fallback** — a workflow with no `transitions:` block at
+all (every existing `default.yaml` on disk) still fires the bar on the
+legacy `Review` status. New workflows that declare a `transitions:`
+block get the action-based semantic exclusively.
 
 The conditions, in order:
 
 1. **All `local_checks` pass** (exit 0). These are the commands you
-   listed under `zen.checks.local` in the project YAML.
-2. **No merge conflicts** with the project's default branch.
+   listed under `zen.checks.local` in the project YAML — or under the
+   workflow's own `zen.checks` block when one is set (see
+   [per-workflow overrides](#per-workflow-overrides)).
+2. **No merge conflicts** with the transition's target branch (the
+   workflow's resolved `base_branch`, or a per-transition `target:` if
+   one is set).
 3. **Diff size within bounds** — by default `files ≤ 30` and
    `lines_added + lines_removed ≤ 2000`. Tunable in the prompt.
-4. **No danger-path matches** — anything matching the project's
-   resolved danger-paths list (built-ins + detected shape + your
-   `zen.danger_paths.extend`) bails out.
+4. **No danger-path matches** — anything matching the resolved
+   danger-paths list (built-ins + detected shape + project
+   `zen.danger_paths.extend` + the active workflow's `zen.danger_paths`
+   override, if any) bails out.
 5. **PR opens cleanly** via `shelbi zen pr-create`.
-6. **CI is green** — `shelbi zen ci-watch <pr> --timeout 15m`
-   polls `gh pr checks --required` until every required check
-   settles. Anything red or a timeout bails.
-7. **Squash-merge** via `shelbi zen pr-merge`. The branch is deleted,
-   the task moves to `done`, and a `reason=orchestrator:zen-merge
-   sha=<short>` line lands in the events log.
+6. **CI is green** — `shelbi zen ci-watch <pr> --task <id>` polls
+   `gh pr checks --required` until every required check settles. The
+   `--task` flag resolves the timeout against the task's workflow
+   (`zen.ci_timeout` override, then project default of `15m`); plain
+   `--timeout <duration>` still overrides explicitly. Anything red or
+   a timeout bails.
+7. **Merge** via `shelbi zen pr-merge`, using the workflow's
+   `merge_strategy` (default `squash`). The branch is deleted, the
+   task moves into the transition's `to` status (typically `done`),
+   and a `reason=orchestrator:zen-merge sha=<short>` line lands in the
+   events log.
 
 Each step uses a single-purpose CLI primitive. The Rust side does
 mechanical I/O; the orchestrator's prompt holds the policy. That
@@ -117,6 +146,58 @@ zen:
       - 'site/public/install.sh'
       - 'crates/shelbi-state/src/migrations/**'
 ```
+
+## Per-workflow overrides
+
+Each [workflow](/docs/concepts/workflows) may carry its own `zen:`
+block that overrides any subset of the three project-level Zen knobs:
+`checks`, `ci_timeout`, `danger_paths`. Anything you don't set falls
+back to the project default — so a workflow can swap *just* its
+checks without restating the rest.
+
+```yaml
+# ~/.shelbi/projects/<project>/workflows/research.yaml
+name: research
+description: Long-running investigations — no code-style checks, longer CI.
+
+statuses:
+  - { name: Drafting, category: active, owner: agent }
+  - { name: Review,   category: handoff, owner: user  }
+  - { name: Done,     category: done,    owner: user  }
+
+zen:
+  checks:
+    local:
+      - 'pytest -k research'
+  ci_timeout: 3600           # seconds — 1h, vs the project's 15m
+  danger_paths:
+    override:
+      - 'fixtures/**'
+```
+
+Why this exists: a `research:` workflow doesn't want the project's
+`cargo clippy -D warnings` gate, and an integration-test-heavy
+workflow may legitimately need an hour of CI. Pinning those to the
+*workflow* rather than the project lets one project's `default`
+workflow stay strict while another workflow in the same project runs
+on relaxed rules.
+
+Resolution rules:
+
+- **`checks`** — when set on the workflow, the workflow's list
+  replaces the project's list outright. Per-task `checks_only` /
+  `checks_additional` still apply on top (see
+  [per-task overrides](#per-task-overrides)).
+- **`ci_timeout`** — when set on the workflow, the workflow's value
+  wins. `shelbi zen ci-watch <pr> --task <id>` resolves through this
+  override; without `--task`, the project default is used.
+- **`danger_paths`** — uses the same `extend:` vs `override:` shape as
+  the project block. `extend:` adds to the project's resolved list
+  (built-ins + detected shapes + project `extend`). `override:`
+  replaces the whole resolved list for tasks in this workflow.
+
+An empty block (`zen: {}`) parses but overrides nothing — semantically
+identical to omitting the block.
 
 ## The judgment layer
 
@@ -260,10 +341,18 @@ Resolution rules:
   (rare but supported).
 - `checks_only` takes precedence over `checks_additional`. If both
   are set, `checks_only` wins and `checks_additional` is ignored.
-- Absent both, the task uses the project's `zen.checks.local`
-  verbatim.
+- `checks_additional` extends whichever list the workflow layer
+  resolved to — workflow `zen.checks.local` if set, else project
+  `zen.checks.local`.
+- Absent both, the task inherits that resolved list verbatim. Full
+  precedence: per-task `checks_only` > per-task `checks_additional` >
+  per-workflow `zen.checks.local` > project `zen.checks.local`.
 
 ## Configuration reference
+
+Zen Mode reads config from two places: the project YAML (project-wide
+defaults) and per-workflow YAMLs (workflow-scoped overrides, covered
+in [Per-workflow overrides](#per-workflow-overrides) above).
 
 The full project-level schema:
 
@@ -316,7 +405,9 @@ in your repo root and adds shape-specific paths:
 
 Run `shelbi zen status` to see the resolved list for your project
 (it labels the detected shapes inline so you know which contributions
-came from where).
+came from where). When any workflow declares its own `zen:` block, the
+status output also lists each one and which dimensions it overrides,
+with the resolved per-workflow values printed underneath.
 
 ## Turning it off
 
@@ -324,15 +415,16 @@ Three levels of "stop":
 
 - **`shelbi zen off`** (or `Alt+Z` toggle) — hard off. No new
   auto-promotions, and the orchestrator stops initiating the merge
-  bar on review handoffs. Anything already mid-flight in the
-  conditions flow runs to completion on its current trajectory.
+  bar on any `merge`-action transition. Anything already mid-flight
+  in the conditions flow runs to completion on its current trajectory.
 - **`shelbi zen pause`** — softer. No new auto-promotions, but the
-  merge bar keeps applying to in-flight tasks that reach review. Use
-  this when you want to triage incoming work yourself for a bit
-  without losing the auto-merge benefit on stuff already in motion.
+  merge bar keeps applying to in-flight tasks that reach a
+  `merge`-action transition. Use this when you want to triage
+  incoming work yourself for a bit without losing the auto-merge
+  benefit on stuff already in motion.
 - **Per-task pull-back** — `shelbi task move <id> --to backlog`
-  from review pulls a specific card out of Zen's hands without
-  changing the global mode.
+  from a handoff status pulls a specific card out of Zen's hands
+  without changing the global mode.
 
 ### Crash recovery
 
@@ -385,6 +477,9 @@ key in `project.yaml` (default `3m`).
 
 - [`shelbi zen`](/docs/cli/zen) — CLI reference for every Zen
   subcommand.
+- [Workflows](/docs/concepts/workflows) — how a workflow's
+  `transitions:` declares which edges fire the merge bar, and where
+  the per-workflow `zen:` override block lives.
 - [The orchestrator](/docs/concepts/orchestrator) — how the
   underlying scheduler is wired and where the prompt template lives.
 - [The events log](/docs/concepts/events-log) — the canonical
