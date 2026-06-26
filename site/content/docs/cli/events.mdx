@@ -27,7 +27,7 @@ The most common line shapes are:
 `heartbeat` is the periodic wake-up the hub poller writes when the
 board is otherwise quiet — cadence comes from the `heartbeat` key in
 `project.yaml` (default `3m`). See
-[the events log](/docs/concepts/events-log#heartbeats) for the full
+[the events log](/docs/features/events-log#heartbeats) for the full
 shape catalog.
 
 Every subcommand accepts the global `-p / --project <PROJECT>` flag.
@@ -77,7 +77,7 @@ shelbi events tail --lines 100 --follow
 
 ## See also
 
-- [Events log](/docs/concepts/events-log) — the full schema of both line
+- [Events log](/docs/features/events-log) — the full schema of both line
   kinds and which reason tags the orchestrator recognizes.
 - [Orchestrator](/docs/concepts/orchestrator) — how the scheduler turns
   events into dispatch decisions.
