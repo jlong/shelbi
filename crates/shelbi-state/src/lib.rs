@@ -12,7 +12,7 @@ use std::collections::{HashMap, HashSet};
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use shelbi_core::{Agent, Column, Project, Result, Session, Task};
+use shelbi_core::{default_workflow, Agent, Column, Project, Result, Session, Task};
 
 mod hub_config;
 mod user_config;
@@ -161,6 +161,27 @@ fn migrate_worker_settings_template(project_dir: &Path) {
     let _ = fs::rename(&legacy, &renamed);
 }
 
+/// One-shot migration: write `workflows/default.yaml` into the project's
+/// workflows directory if it's missing. Serializes the canonical
+/// [`default_workflow`] from `shelbi-core` so existing projects pick up
+/// an editable copy on their next load without forcing a manual step.
+///
+/// Idempotent — already-present files are left untouched (the user may
+/// have edited them). Best-effort — any IO or serialization error is
+/// swallowed so a permissions hiccup or full disk doesn't break opening
+/// the project; the loader's in-memory fallback covers the file-missing
+/// case until the next successful run.
+fn migrate_default_workflow(project_dir: &Path) {
+    let path = project_dir.join("workflows").join("default.yaml");
+    if path.exists() {
+        return;
+    }
+    let Ok(yaml) = serde_yaml::to_string(&default_workflow()) else {
+        return;
+    };
+    let _ = atomic_write(&path, yaml.as_bytes());
+}
+
 /// Render the worker settings JSON for `project`: read the template file
 /// resolved by [`worker_settings_template_path`] (falling back to
 /// [`DEFAULT_WORKER_SETTINGS_TEMPLATE`] when the file is missing — a fresh
@@ -201,6 +222,20 @@ pub fn tasks_dir(project: &str) -> Result<PathBuf> {
     Ok(project_dir(project)?.join("tasks"))
 }
 
+/// Per-project workflows directory:
+/// `~/.shelbi/projects/<project>/workflows/`. Holds one YAML per workflow
+/// definition (`default.yaml` ships out of the box; users can drop more).
+pub fn workflows_dir(project: &str) -> Result<PathBuf> {
+    Ok(project_dir(project)?.join("workflows"))
+}
+
+/// Path to a project's default workflow YAML
+/// (`<workflows_dir>/default.yaml`). Auto-created on first load when
+/// missing — see [`migrate_default_workflow`].
+pub fn default_workflow_path(project: &str) -> Result<PathBuf> {
+    Ok(workflows_dir(project)?.join("default.yaml"))
+}
+
 /// Ensure a directory exists.
 pub fn ensure_dir(p: &Path) -> Result<()> {
     fs::create_dir_all(p)?;
@@ -217,6 +252,11 @@ pub fn load_project(project: &str) -> Result<Project> {
     p.validate_workers()?;
     let repo = p.repo.clone();
     p.detect_shapes(repo);
+    // Best-effort: drop workflows/default.yaml into the project directory
+    // on first load. Idempotent — see migrate_default_workflow.
+    if let Ok(dir) = project_dir(&p.name) {
+        migrate_default_workflow(&dir);
+    }
     Ok(p)
 }
 
@@ -1549,6 +1589,78 @@ mod tests {
         let ids: Vec<_> = all.iter().map(|tf| tf.task.id.as_str()).collect();
         // Column::ALL ordering: backlog, todo, in_progress, review, done
         assert_eq!(ids, vec!["b", "a", "c", "z"]);
+        std::env::remove_var("SHELBI_HOME");
+    }
+
+    // ---- workflows/default.yaml migration --------------------------------
+
+    #[test]
+    fn migrate_default_workflow_writes_yaml_when_directory_missing() {
+        let _g = TEST_LOCK.lock().unwrap();
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+        let dir = home.join("projects/myapp");
+        migrate_default_workflow(&dir);
+        let path = dir.join("workflows/default.yaml");
+        assert!(path.exists(), "default.yaml should be created");
+        let text = std::fs::read_to_string(&path).unwrap();
+        let parsed = shelbi_core::Workflow::from_yaml_str(&text)
+            .expect("created default.yaml should round-trip through the workflow parser");
+        assert_eq!(parsed, default_workflow());
+        std::env::remove_var("SHELBI_HOME");
+    }
+
+    #[test]
+    fn migrate_default_workflow_is_noop_when_file_already_exists() {
+        let _g = TEST_LOCK.lock().unwrap();
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+        let dir = home.join("projects/myapp");
+        let path = dir.join("workflows/default.yaml");
+        ensure_dir(path.parent().unwrap()).unwrap();
+        // A user-edited file we must not stomp on.
+        std::fs::write(&path, "name: custom\n").unwrap();
+        migrate_default_workflow(&dir);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "name: custom\n");
+        std::env::remove_var("SHELBI_HOME");
+    }
+
+    #[test]
+    fn load_project_auto_creates_default_workflow_on_first_load() {
+        let _g = TEST_LOCK.lock().unwrap();
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+        let p = fixture_project("myapp", None);
+        save_project(&p).unwrap();
+        let workflow_path = default_workflow_path("myapp").unwrap();
+        assert!(!workflow_path.exists(), "precondition: workflow file absent");
+        let loaded = load_project("myapp").unwrap();
+        assert_eq!(loaded.name, "myapp");
+        assert!(
+            workflow_path.exists(),
+            "load_project should auto-create workflows/default.yaml"
+        );
+        // Second load is a no-op — content unchanged.
+        let first_bytes = std::fs::read(&workflow_path).unwrap();
+        let _ = load_project("myapp").unwrap();
+        let second_bytes = std::fs::read(&workflow_path).unwrap();
+        assert_eq!(first_bytes, second_bytes);
+        std::env::remove_var("SHELBI_HOME");
+    }
+
+    #[test]
+    fn load_project_preserves_user_edits_to_default_workflow() {
+        let _g = TEST_LOCK.lock().unwrap();
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+        let p = fixture_project("myapp", None);
+        save_project(&p).unwrap();
+        let workflow_path = default_workflow_path("myapp").unwrap();
+        ensure_dir(workflow_path.parent().unwrap()).unwrap();
+        let user_yaml = "name: default\nstatuses:\n  - { name: Inbox, category: backlog, owner: user }\n";
+        std::fs::write(&workflow_path, user_yaml).unwrap();
+        let _ = load_project("myapp").unwrap();
+        assert_eq!(std::fs::read_to_string(&workflow_path).unwrap(), user_yaml);
         std::env::remove_var("SHELBI_HOME");
     }
 }
