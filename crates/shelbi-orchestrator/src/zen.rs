@@ -512,13 +512,12 @@ fn probe_local_checks(
 
 fn run_one_check(host: &Host, worktree: &std::path::Path, cmd: &str) -> LocalCheck {
     let wt = worktree.to_string_lossy().into_owned();
-    // `sh -c` so the project author can chain commands, use pipes, etc.
     // We `cd` into the worktree first because some checks (cargo, pytest)
     // care about the working directory, not just argv[0]'s path.
     let script = format!("cd {} && {}", shell_escape(&wt), cmd);
 
     let started = Instant::now();
-    let output = shelbi_ssh::run(host, ["sh", "-c", script.as_str()]);
+    let output = run_check_script(host, &script);
     let elapsed = started.elapsed();
 
     let (exit_code, combined) = match output {
@@ -542,6 +541,33 @@ fn run_one_check(host: &Host, worktree: &std::path::Path, cmd: &str) -> LocalChe
         exit_code,
         duration_ms: ms_truncating(elapsed),
         output_tail: tail_lines(&combined, OUTPUT_TAIL_LINES),
+    }
+}
+
+/// Run a check script through a login shell so the user's rc files
+/// (~/.zprofile, ~/.bash_profile, etc.) populate `PATH` with tools
+/// installed via rustup, asdf, homebrew, etc. before the check runs.
+///
+/// The hub process can inherit a stripped-down `PATH` when it's launched
+/// outside the user's terminal — from launchd / Spotlight, or from a
+/// tmux server that itself started in a non-login context — so trusting
+/// the inherited environment isn't enough. Re-execing through a login
+/// shell is the same trick `worker.rs`, `spawn.rs`, and `run_in_dir` use
+/// to keep agent launches and `gh`/`git` calls finding the same tools the
+/// user sees in their own terminal.
+///
+/// Local: read `$SHELL` from the hub's env (defaulting to `/bin/sh`) so
+/// zsh users source `.zprofile`/`.zshenv` instead of bash's startup files.
+/// Remote: pass `$SHELL` literally — it's expanded by the user's login
+/// shell that sshd hands the command to, so we don't need to guess which
+/// shells exist on the remote.
+fn run_check_script(host: &Host, script: &str) -> std::io::Result<Output> {
+    match host {
+        Host::Local => {
+            let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".into());
+            shelbi_ssh::run(host, [shell.as_str(), "-lc", script])
+        }
+        Host::Ssh { .. } => shelbi_ssh::run(host, ["$SHELL", "-lc", script]),
     }
 }
 
@@ -1113,6 +1139,38 @@ mod probe_tests {
         assert_eq!(res.exit_code, 0);
         assert!(res.output_tail.contains("out"));
         assert!(res.output_tail.contains("err"));
+    }
+
+    #[test]
+    fn local_check_runs_in_a_login_shell() {
+        // Login shells prepend `-` to `$0` (e.g. `-bash`, `-sh`), per the
+        // POSIX convention every UNIX shell honors. If `run_one_check`
+        // regresses to a non-login `sh -c`, this assertion catches it —
+        // and with it the rustup/asdf/homebrew-PATH bug that motivated
+        // the login-shell switch.
+        //
+        // Override `$SHELL` to `/bin/sh` so the test doesn't depend on the
+        // developer's preferred login shell being installed and well-
+        // behaved (e.g. zsh's compinit complaining about insecure dirs).
+        let prev_shell = std::env::var_os("SHELL");
+        std::env::set_var("SHELL", "/bin/sh");
+        let tmp = tempfile::tempdir().unwrap();
+        let wt = tmp.path();
+        let res = run_one_check(
+            &Host::Local,
+            wt,
+            r#"case "$0" in -*) echo login;; *) echo non-login;; esac"#,
+        );
+        match prev_shell {
+            Some(v) => std::env::set_var("SHELL", v),
+            None => std::env::remove_var("SHELL"),
+        }
+        assert_eq!(res.exit_code, 0);
+        assert!(
+            res.output_tail.contains("login"),
+            "expected login-shell `$0`; got: {}",
+            res.output_tail
+        );
     }
 
     #[test]
