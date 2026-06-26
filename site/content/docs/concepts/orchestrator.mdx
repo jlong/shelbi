@@ -20,22 +20,56 @@ back.
 ## You-are-the-scheduler
 
 A useful contrast: a generic chatbot waits to be asked. The orchestrator
-does not. As soon as a task lands in `todo`, that is the start signal —
-the orchestrator's job is to find a free worker, route the task to them,
-and tell you it did. When a worker finishes (its task moves to
-`review`), the orchestrator's job is to give that worker the next ready
-task without waiting to be prompted.
+does not. As soon as a task lands in the `ready` category (`todo` in the
+default workflow), that is the start signal — the orchestrator's job is
+to find a free worker, route the task to them, and tell you it did. When
+a worker hands off (its task moves into the `handoff` category — `review`
+in the default workflow), the orchestrator's job is to give that worker
+the next ready task without waiting to be prompted.
 
 This is what makes the loop feel continuous. You drop work into the
 backlog, triage what's ready, and review what comes back. Everything in
 between — assignment, branch setup, launch, completion detection,
 re-dispatch — is the orchestrator's responsibility.
 
-The shape of that responsibility is encoded in a prompt file shipped
-with Shelbi. The orchestrator is *just claude* (or whatever runner you
-configured) with that prompt loaded as a system prompt.
+## Categories: the vocabulary the orchestrator reasons in
+
+A [workflow](/docs/concepts/workflows) can rename statuses, split a
+category across multiple statuses, or drop columns the project doesn't
+need. To keep generic code (auto-dispatch, Zen Mode, the activity feed)
+working unchanged across every workflow, the orchestrator reasons in a
+fixed, closed set of **status categories** rather than literal status
+names:
+
+| Category   | What it means                                                        | Default workflow status |
+| ---------- | -------------------------------------------------------------------- | ----------------------- |
+| `backlog`  | Not yet ready for work — triage stage.                               | `backlog`               |
+| `ready`    | Queued for whoever owns it next (typically a worker).                | `todo`                  |
+| `active`   | Owner is working on it now.                                          | `in_progress`           |
+| `handoff`  | One owner finished their part; another's input is required next.    | `review`                |
+| `done`     | Terminal — accepted by the user.                                     | `done`                  |
+
+The category set is fixed; status names are user-customizable per
+workflow. A workflow that renames `Review` to `QA`, or splits `handoff`
+into `Code Review` and `QA`, still triggers the same auto-dispatch and
+auto-merge rules because the orchestrator matches on the category, not
+the name. See the [Workflows](/docs/concepts/workflows#status-categories)
+concept page for the full schema.
+
+The `shelbi task move --to <status>` CLI accepts the literal status name
+from the active workflow — `<status>` is never a category. The category
+is the semantic layer above; the orchestrator reads it from each task's
+status definition (and, on the wire, from the `from_category=` /
+`to_category=` tokens on every task event line — see [the events
+log](/docs/concepts/events-log#task-transitions)).
 
 ## How the prompt is wired
+
+The shape of the orchestrator's responsibility — the bootstrap flow,
+the category-keyed reaction rules, the dispatch contract — is encoded
+in a prompt file shipped with Shelbi. The orchestrator is *just claude*
+(or whatever runner you configured) with that prompt loaded as a system
+prompt.
 
 When you boot a project (`shelbi orchestrate` or via the TUI launcher),
 `ensure_dashboard()` does the following:
@@ -72,10 +106,11 @@ the user:
 
 1. **Read the board.** `shelbi task list` for the column membership,
    priorities, `assigned_to`, and any `prefers_machine` hints on each
-   card.
+   card. Each status belongs to one of the five categories above; the
+   orchestrator maps column → category from the active workflow.
 2. **Read the worker pool.** `shelbi worker list` to see which workers
-   are free (no in-progress task assigned) and which machine each lives
-   on.
+   are free (no `active`-category task assigned) and which machine each
+   lives on.
 3. **Start tailing.** Launch `shelbi events tail --follow` in the
    background and watch it. Every emitted line is a trigger the
    orchestrator must consider.
@@ -84,19 +119,22 @@ After that, the in-memory snapshot is kept up to date from the event
 stream — the orchestrator only re-runs `worker list` / `task list` if
 the tail process dies and it has to rebuild.
 
-The reaction rules are simple:
+The reaction rules pattern-match the **category** tokens on each task
+event line, not the literal `<from> -> <to>` status pair. That's what
+keeps these rules correct under a workflow that renames or splits
+statuses:
 
-- `task=<id> backlog -> todo reason=user:*` → find a free eligible
+- `task=<id> ... to_category=ready reason=user:*` → find a free eligible
   worker, dispatch.
-- `task=<id> in_progress -> review reason=worker:review-marker` →
+- `task=<id> ... to_category=handoff reason=worker:review-marker` →
   that worker is now free, find them the next ready task.
 - `worker=<name> working -> awaiting_input` → same idea, worker just
   freed up.
 - `worker=<name> pane_alive=false` → surface to the user; don't
   auto-restart.
 - `project=<name> heartbeat` → no state change to react to, but the
-  watch is awake — a good time to re-check active tasks for stuck
-  workers or missed markers. See
+  watch is awake — a good time to re-check `active`-category tasks for
+  stuck workers or missed markers. See
   [heartbeats](/docs/concepts/events-log#heartbeats) for the cadence
   config and rationale; tune it via the `heartbeat` key in
   `project.yaml`.
@@ -104,7 +142,8 @@ The reaction rules are simple:
 When dispatching, the orchestrator picks free eligible workers in the
 order they're declared in the project YAML, honoring `prefers_machine`
 hints. If a task names a machine and no worker on that machine is free,
-it stays in `todo` rather than getting routed to the wrong host.
+it stays in the `ready` category rather than getting routed to the wrong
+host.
 
 The full set of rules — including when *not* to dispatch (failed
 retries, deduplicated misclicks, mid-conversation with the user) — is
@@ -134,6 +173,12 @@ A few things worth keeping when you fork the default:
 
 - The bootstrap flow. The orchestrator needs the initial `task list` /
   `worker list` snapshot and the tail process to do its job.
+- The **category-based** reaction-rule matching. Patterns key off
+  `to_category=<c>` (`ready`, `handoff`) rather than the literal status
+  pair, so the rules survive workflow customization. Hardcoding default-
+  workflow status names here is a footgun — a project that later renames
+  `Todo` to `Ready` or splits `Review` into `Code Review` + `QA` will
+  fall through the matches.
 - The reaction rules tied to specific reason strings (`user:*`,
   `worker:review-marker`, `orchestrator:auto-dispatch …`). These are
   the contract the rest of Shelbi expects the orchestrator to honor.
@@ -145,18 +190,20 @@ What you might *want* to change per project:
 
 - Routing rules — "always send infra tasks to charlie", "never use the
   hub for benchmarks".
-- Merge policy — by default the orchestrator stops at `review`; you
-  can authorize specific loops where it squash-merges and moves
-  straight to `done` (see the "Mark review done, merge, and push"
-  section in the default prompt for the existing recipe).
+- Merge policy — by default the orchestrator stops at the `handoff`
+  category (`review` in the default workflow); you can authorize specific
+  loops where it squash-merges and moves straight to `done` (see the
+  "Mark review done, merge, and push" section in the default prompt for
+  the existing recipe).
 - Reporting style — the one-line activity summary is tunable.
 
 ## What the orchestrator does not do
 
 - **It does not edit code.** Workers do that.
-- **It does not move tasks to `done`.** That's your accept signal.
-- **It does not auto-promote backlog → todo.** Triage belongs to the
-  user.
+- **It does not move tasks into the `done` category.** That's your
+  accept signal.
+- **It does not auto-promote `backlog` → `ready`.** Triage belongs to
+  the user.
 - **It does not restart a worker whose pane died.** It surfaces the
   death and waits for direction.
 - **It does not stop workers without asking.**
@@ -171,18 +218,21 @@ workflow legible.
 When you're ready to let the orchestrator initiate instead of just
 scheduling, [Zen Mode](/docs/concepts/zen-mode) is the next-level
 autonomy switch. It flips the agent from scheduler to lead: it
-auto-promotes backlog into todo when it judges the work in scope, and
-it lands finished branches past a project-defined confidence bar
-without waiting on a human reviewer. The policy that decides "in
-scope" lives in the same prompt template described above — you tune
-it by editing prose, not code.
+auto-promotes `backlog`-category tasks into `ready` when it judges the
+work in scope, and it lands finished branches past a project-defined
+confidence bar without waiting on a human reviewer. The policy that
+decides "in scope" lives in the same prompt template described above —
+you tune it by editing prose, not code.
 
 ## See also
 
 - [Workers](/docs/concepts/workers) — what the orchestrator dispatches
   tasks to.
-- [Columns](/docs/concepts/columns) — the board the orchestrator is
-  reading and writing.
+- [Columns](/docs/concepts/columns) — the default workflow's board, in
+  its concrete form.
+- [Workflows](/docs/concepts/workflows) — the schema behind the board,
+  including the full category set and the events-log annotations the
+  orchestrator pattern-matches on.
 - [The events log](/docs/concepts/events-log) — the orchestrator's
   live feed.
 - [Zen Mode](/docs/concepts/zen-mode) — flipping the orchestrator
