@@ -10,7 +10,7 @@ summary: Toggle Zen Mode and run the introspection + merge primitives the orches
 shelbi zen <SUBCOMMAND> [OPTIONS]
 ```
 
-`shelbi zen` is the CLI face of [Zen Mode](/docs/concepts/zen-mode).
+`shelbi zen` is the CLI face of [Zen Mode](/docs/features/zen-mode).
 The toggle subcommands (`on`, `off`, `pause`, `status`) flip the
 project's mode in `state.json` and write a `mode=zen <prev> -> <new>
 reason=user:cli` line to `~/.shelbi/events.log` — the orchestrator
@@ -81,7 +81,7 @@ auto-promotion, one per line, in priority order. "Mechanical" means
 not blocked on dependencies, not opted out via task frontmatter, and
 no file overlap with anything currently in flight. The orchestrator's
 prompt applies the judgment categories on top of this list — see
-[the judgment layer](/docs/concepts/zen-mode#the-judgment-layer).
+[the judgment layer](/docs/features/zen-mode#the-judgment-layer).
 
 ## probe
 
@@ -193,7 +193,7 @@ shelbi zen pause
 
 ## See also
 
-- [Zen Mode](/docs/concepts/zen-mode) — the full mental model, the
+- [Zen Mode](/docs/features/zen-mode) — the full mental model, the
   high-confidence bar, and how to tune the judgment categories per
   project.
 - [The orchestrator](/docs/concepts/orchestrator) — how the prompt
