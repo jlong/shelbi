@@ -29,9 +29,13 @@ when the board is otherwise quiet. Cadence is set per project via a new
 disable; default `3m`. Bare integers (`heartbeat: 180`) are rejected at
 load time, so a missing-unit typo can't silently land as seconds. Emission
 is debounced against any other write to the events log, so active boards
-don't see padding. Heartbeats are filtered out of the TUI activity feed by
-default — they'd produce one "nothing happened" row every few minutes —
-but show up verbatim under `shelbi events tail`. See
+don't see padding. Heartbeats also pause while the hub is offline — a
+quick TCP probe of `1.1.1.1:443` gates each due tick and emission resumes
+once connectivity is back, so a coffee-shop wifi drop doesn't fill the
+feed with no-op lines the orchestrator can't act on anyway. Heartbeats
+are filtered out of the TUI activity feed by default — they'd produce
+one "nothing happened" row every few minutes — but show up verbatim
+under `shelbi events tail`. See
 [the events log](/docs/concepts/events-log#heartbeats) for the line shape
 and rationale, and the [project YAML reference](/docs/getting-started/first-project#optional-keys)
 for the new key.
