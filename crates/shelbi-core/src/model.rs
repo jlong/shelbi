@@ -533,12 +533,13 @@ impl Column {
         }
     }
 
-    /// The PascalCase status name this column maps to under the canonical
-    /// default workflow (see `default_workflow()`). Workflows that
-    /// introduce custom statuses still use these names by convention for
-    /// the legacy 5; generic code that needs to ask "is this task in the
-    /// merge-bar trigger status?" routes through here so the lookup
-    /// matches the workflow YAML's `from:` / `to:` strings.
+    /// The PascalCase status *display name* this column maps to under
+    /// the canonical default workflow (see `default_workflow()`). Used
+    /// when rendering labels for tasks whose only known position is the
+    /// legacy [`Column`]. Generic code that needs to ask "is this task
+    /// in the merge-bar trigger status?" should use
+    /// [`Column::default_status_id`] instead — workflow lookups are
+    /// keyed by the stable `id`, not the renamable display label.
     pub fn default_status_name(self) -> &'static str {
         match self {
             Column::Backlog => "Backlog",
@@ -546,6 +547,21 @@ impl Column {
             Column::InProgress => "InProgress",
             Column::Review => "Review",
             Column::Done => "Done",
+        }
+    }
+
+    /// The stable status *id* this column maps to under the canonical
+    /// default workflow (see `default_workflow()`). Matches the `id:`
+    /// fields the workflow YAML's `from:` / `to:` strings reference, so
+    /// `workflow.status(col.default_status_id())` is the right lookup
+    /// for "find the canonical status for this task's legacy column."
+    pub fn default_status_id(self) -> &'static str {
+        match self {
+            Column::Backlog => "backlog",
+            Column::Todo => "todo",
+            Column::InProgress => "in-progress",
+            Column::Review => "review",
+            Column::Done => "done",
         }
     }
 

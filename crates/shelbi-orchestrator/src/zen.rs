@@ -1743,11 +1743,11 @@ pub fn dry_run_tick(project: &Project) -> Result<Vec<DryRunDecision>> {
         if category != StatusCategory::Handoff {
             continue;
         }
-        let status_name = status
-            .map(|s| s.name.as_str())
-            .unwrap_or_else(|| tf.task.column.default_status_name());
+        let status_id = status
+            .map(|s| s.id.as_str())
+            .unwrap_or_else(|| tf.task.column.default_status_id());
         let fires_bar = workflow_ref
-            .map(|w| w.fires_merge_bar(status_name))
+            .map(|w| w.fires_merge_bar(status_id))
             .unwrap_or(true);
         if !fires_bar {
             // Workflow explicitly declares transitions but none from this
@@ -1788,17 +1788,17 @@ pub fn dry_run_tick(project: &Project) -> Result<Vec<DryRunDecision>> {
 ///
 /// Resolution order:
 ///
-/// 1. **Name match** — workflow declares a status named
-///    `task.column.default_status_name()` (Backlog / Todo / InProgress /
-///    Review / Done). Covers the default workflow and any custom
-///    workflow that reuses the canonical names.
+/// 1. **Id match** — workflow declares a status whose `id` equals
+///    `task.column.default_status_id()` (`backlog` / `todo` /
+///    `in-progress` / `review` / `done`). Covers the default workflow
+///    and any custom workflow that reuses the canonical ids.
 /// 2. **Category match** — first status in the workflow whose category
 ///    equals `task.column.category()`. Lets a custom workflow that
 ///    renamed `Review` to `QA` still resolve to a handoff status.
 /// 3. **None** — the workflow declares no compatible status. Callers
 ///    fall back to column-level metadata.
 fn resolve_task_status<'w>(task: &Task, workflow: &'w Workflow) -> Option<&'w WorkflowStatus> {
-    let canonical = task.column.default_status_name();
+    let canonical = task.column.default_status_id();
     if let Some(s) = workflow.status(canonical) {
         return Some(s);
     }
@@ -2016,6 +2016,14 @@ mod dry_run_tests {
             statuses: statuses
                 .iter()
                 .map(|(n, c)| WorkflowStatus {
+                    // Tests pass a single label; collapse it onto both
+                    // id and name. resolve_task_status keys off id, so
+                    // it has to match `task.column.default_status_id()`
+                    // for the name-match branch — but the inputs here
+                    // (`Backlog`, `Design`, `QA`, …) are deliberate
+                    // mismatches against the canonical ids, leaving the
+                    // category-fallback path as the one under test.
+                    id: (*n).into(),
                     name: (*n).into(),
                     category: *c,
                     owner: shelbi_core::Owner::Agent,

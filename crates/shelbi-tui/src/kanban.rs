@@ -248,8 +248,14 @@ pub struct WorkflowColumn {
     /// subscript label under the status name when more than one
     /// workflow is loaded.
     pub workflow: String,
-    /// Status name as declared in the workflow YAML. Doubles as the
-    /// header label rendered above the column.
+    /// Stable status id ([`shelbi_core::WorkflowStatus::id`]) used for
+    /// bucketing tasks into this column. Decoupled from the display
+    /// label so a workflow that renames `Review → QA` keeps every task
+    /// reference pointing at the same id.
+    pub status_id: String,
+    /// Status display label rendered above the column. Mirrors
+    /// [`shelbi_core::WorkflowStatus::name`] — free to change without
+    /// breaking the matching path, which keys off [`status_id`].
     pub status_name: String,
     /// Semantic category the status reports — controls header colour
     /// and the legacy-column mapping used when moving cards.
@@ -410,7 +416,7 @@ impl KanbanApp {
     }
 
     /// True when `task` lives in the All-mode column `ac` — i.e. its
-    /// workflow matches and its column resolves to `ac.status_name`
+    /// workflow matches and its column resolves to `ac.status_id`
     /// inside that workflow. Tasks whose declared workflow is missing
     /// from `self.workflows` are treated as belonging to the default
     /// workflow, so they still show up somewhere instead of vanishing.
@@ -427,7 +433,7 @@ impl KanbanApp {
         let Some(wf) = self.workflows.iter().find(|w| w.name == ac.workflow) else {
             return false;
         };
-        resolve_task_status(task, wf) == ac.status_name
+        resolve_task_status(task, wf) == ac.status_id
     }
 
     /// True when `tf` passes the active worker filter. With no filter
@@ -1983,6 +1989,7 @@ fn workflow_columns(workflows: &[Workflow]) -> Vec<WorkflowColumn> {
         for st in &wf.statuses {
             out.push(WorkflowColumn {
                 workflow: wf.name.clone(),
+                status_id: st.id.clone(),
                 status_name: st.name.clone(),
                 category: st.category,
             });
@@ -2001,6 +2008,7 @@ fn workflow_columns_from_refs(workflows: &[&Workflow]) -> Vec<WorkflowColumn> {
         for st in &wf.statuses {
             out.push(WorkflowColumn {
                 workflow: wf.name.clone(),
+                status_id: st.id.clone(),
                 status_name: st.name.clone(),
                 category: st.category,
             });
@@ -2009,31 +2017,32 @@ fn workflow_columns_from_refs(workflows: &[&Workflow]) -> Vec<WorkflowColumn> {
     out
 }
 
-/// Resolve which workflow status `task` lives in. Task storage still
+/// Resolve the workflow status *id* `task` lives in. Task storage still
 /// uses the legacy [`Column`] enum on disk (`Plans/workflows.md` §10
-/// hasn't moved tasks to status-name yet), so we have to bridge.
+/// hasn't moved tasks to status-id yet), so we have to bridge.
 ///
 /// Resolution order, mirroring the events log writer's behaviour:
 ///
-/// 1. **Name match** — if the workflow declares a status whose name
-///    equals `task.column.default_status_name()` (Backlog / Todo /
-///    InProgress / Review / Done), use that. Covers the default
-///    workflow and any custom workflow that reuses the canonical names.
+/// 1. **Id match** — if the workflow declares a status whose id equals
+///    `task.column.default_status_id()` (`backlog` / `todo` /
+///    `in-progress` / `review` / `done`), use that id. Covers the
+///    default workflow and any custom workflow that reuses the
+///    canonical ids.
 /// 2. **Category match** — fall back to the first status in the
 ///    workflow whose category equals the task's column category.
 ///    Handles a custom workflow that renamed `InProgress` to `Design`
 ///    (both report `StatusCategory::Active`).
 /// 3. **Canonical** — if the workflow declares no status that matches
-///    by name or category, return the canonical name unchanged. The
-///    task won't bucket cleanly, but the renderer never crashes.
+///    by id or category, return the canonical id unchanged. The task
+///    won't bucket cleanly, but the renderer never crashes.
 fn resolve_task_status(task: &Task, workflow: &Workflow) -> String {
-    let canonical = task.column.default_status_name();
+    let canonical = task.column.default_status_id();
     if workflow.status(canonical).is_some() {
         return canonical.to_string();
     }
     let cat = task.column.category();
     if let Some(st) = workflow.statuses.iter().find(|s| s.category == cat) {
-        return st.name.clone();
+        return st.id.clone();
     }
     canonical.to_string()
 }
@@ -2817,6 +2826,11 @@ mod tests {
             statuses: statuses
                 .iter()
                 .map(|(n, c)| shelbi_core::WorkflowStatus {
+                    // Tests pass a single label; collapse it onto both
+                    // id and name. Real workflows split these (kebab id
+                    // vs. display name), but the All-mode rendering
+                    // tests don't care about the split.
+                    id: (*n).into(),
                     name: (*n).into(),
                     category: *c,
                     owner: shelbi_core::Owner::Agent,
@@ -3472,6 +3486,7 @@ mod tests {
             name: name.into(),
             description: None,
             statuses: vec![shelbi_core::WorkflowStatus {
+                id: "todo".into(),
                 name: "Todo".into(),
                 category: StatusCategory::Ready,
                 owner: shelbi_core::Owner::Agent,

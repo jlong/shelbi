@@ -17,7 +17,7 @@
 use std::collections::BTreeMap;
 use std::time::Duration;
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 
 use crate::placeholders::substitute_placeholders;
 use crate::{Error, GitConfig, ZenChecks, ZenDangerPaths};
@@ -47,9 +47,9 @@ pub struct Workflow {
     /// one status is required.
     pub statuses: Vec<Status>,
 
-    /// Which status a freshly created task lands in. When `None`, the
-    /// first status in [`Workflow::statuses`] is used. Must reference a
-    /// status declared in this workflow.
+    /// Stable id of the status a freshly created task lands in. When
+    /// `None`, the first status in [`Workflow::statuses`] is used. Must
+    /// reference a status declared in this workflow by [`Status::id`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub initial_status: Option<String>,
 
@@ -100,28 +100,30 @@ impl Workflow {
         Ok(wf)
     }
 
-    /// Resolved initial status — explicit `initial_status` if set,
-    /// otherwise the first status in the list. Returns `None` only if
-    /// [`Workflow::statuses`] is empty (which a validated workflow never
-    /// is).
+    /// Resolved initial status id — explicit `initial_status` if set,
+    /// otherwise the id of the first status in the list. Returns `None`
+    /// only if [`Workflow::statuses`] is empty (which a validated
+    /// workflow never is).
     pub fn resolved_initial_status(&self) -> Option<&str> {
         if let Some(s) = self.initial_status.as_deref() {
             return Some(s);
         }
-        self.statuses.first().map(|s| s.name.as_str())
+        self.statuses.first().map(|s| s.id.as_str())
     }
 
-    /// Look up a status by name. Linear scan — workflows are tiny (<10
-    /// statuses in practice) so a hash map isn't worth the allocation.
-    pub fn status(&self, name: &str) -> Option<&Status> {
-        self.statuses.iter().find(|s| s.name == name)
+    /// Look up a status by its stable [`Status::id`]. Linear scan —
+    /// workflows are tiny (<10 statuses in practice) so a hash map isn't
+    /// worth the allocation.
+    pub fn status(&self, id: &str) -> Option<&Status> {
+        self.statuses.iter().find(|s| s.id == id)
     }
 
-    /// True iff `from -> to` is a legal status move. Per
-    /// `Plans/workflows.md` §11, transitions are any-to-any: both
-    /// statuses just have to be declared in this workflow. Listing an
-    /// edge in [`Workflow::transitions`] only declares its side-effects;
-    /// it does not restrict which moves are legal.
+    /// True iff `from -> to` is a legal status move. Both arguments are
+    /// status ids ([`Status::id`]). Per `Plans/workflows.md` §11,
+    /// transitions are any-to-any: both ids just have to be declared in
+    /// this workflow. Listing an edge in [`Workflow::transitions`] only
+    /// declares its side-effects; it does not restrict which moves are
+    /// legal.
     pub fn transition_allowed(&self, from: &str, to: &str) -> bool {
         self.status(from).is_some() && self.status(to).is_some()
     }
@@ -191,8 +193,8 @@ impl Workflow {
 
     /// Full semantic check. Run after deserialization to catch the
     /// cross-reference errors that serde alone can't see: duplicate
-    /// status names, an `initial_status` pointing at nothing, a
-    /// transition that names a status the workflow doesn't define.
+    /// status ids, an `initial_status` pointing at nothing, a transition
+    /// that references an id the workflow doesn't declare.
     pub fn validate(&self) -> crate::Result<()> {
         if self.name.trim().is_empty() {
             return Err(workflow_err("workflow name must not be empty"));
@@ -205,29 +207,38 @@ impl Workflow {
             )));
         }
 
-        // Status names: non-empty + unique. Linear-scan dup detection
-        // keeps the error message deterministic (first dup wins).
+        // Status ids: non-empty + unique. Linear-scan dup detection keeps
+        // the error message deterministic (first dup wins). Names are the
+        // user-facing display label — required non-empty but allowed to
+        // collide between statuses since they aren't referenced by
+        // anything stable.
         let mut seen: Vec<&str> = Vec::with_capacity(self.statuses.len());
         for st in &self.statuses {
-            if st.name.trim().is_empty() {
+            if st.id.trim().is_empty() {
                 return Err(workflow_err(format!(
-                    "workflow `{}`: status name must not be empty",
+                    "workflow `{}`: status id must not be empty",
                     self.name
                 )));
             }
-            if seen.contains(&st.name.as_str()) {
+            if st.name.trim().is_empty() {
                 return Err(workflow_err(format!(
-                    "workflow `{}`: duplicate status name `{}`",
-                    self.name, st.name
+                    "workflow `{}`: status `{}`: name must not be empty",
+                    self.name, st.id
                 )));
             }
-            seen.push(st.name.as_str());
+            if seen.contains(&st.id.as_str()) {
+                return Err(workflow_err(format!(
+                    "workflow `{}`: duplicate status id `{}`",
+                    self.name, st.id
+                )));
+            }
+            seen.push(st.id.as_str());
         }
 
         if let Some(init) = self.initial_status.as_deref() {
             if self.status(init).is_none() {
                 return Err(workflow_err(format!(
-                    "workflow `{}`: initial_status `{}` does not match any declared status",
+                    "workflow `{}`: initial_status `{}` does not match any declared status id",
                     self.name, init
                 )));
             }
@@ -238,13 +249,13 @@ impl Workflow {
             for t in tr {
                 if self.status(&t.from).is_none() {
                     return Err(workflow_err(format!(
-                        "workflow `{}`: transition `{} -> {}` from undeclared status `{}`",
+                        "workflow `{}`: transition `{} -> {}` from undeclared status id `{}`",
                         self.name, t.from, t.to, t.from
                     )));
                 }
                 if self.status(&t.to).is_none() {
                     return Err(workflow_err(format!(
-                        "workflow `{}`: transition `{} -> {}` targets undeclared status `{}`",
+                        "workflow `{}`: transition `{} -> {}` targets undeclared status id `{}`",
                         self.name, t.from, t.to, t.to
                     )));
                 }
@@ -309,31 +320,37 @@ pub fn default_workflow() -> Workflow {
         ),
         statuses: vec![
             Status {
+                id: "backlog".into(),
                 name: "Backlog".into(),
                 category: StatusCategory::Backlog,
                 owner: Owner::User,
             },
             Status {
+                id: "todo".into(),
                 name: "Todo".into(),
                 category: StatusCategory::Ready,
                 owner: Owner::Agent,
             },
             Status {
+                id: "in-progress".into(),
                 name: "InProgress".into(),
                 category: StatusCategory::Active,
                 owner: Owner::Agent,
             },
             Status {
+                id: "review".into(),
                 name: "Review".into(),
                 category: StatusCategory::Handoff,
                 owner: Owner::User,
             },
             Status {
+                id: "done".into(),
                 name: "Done".into(),
                 category: StatusCategory::Done,
                 owner: Owner::User,
             },
             Status {
+                id: "canceled".into(),
                 name: "Canceled".into(),
                 category: StatusCategory::Archived,
                 owner: Owner::User,
@@ -355,14 +372,75 @@ pub fn default_workflow() -> Workflow {
 // ---------------------------------------------------------------------------
 // Status
 
-/// One step in a workflow. `name` doubles as the stable identifier
-/// (referenced from task frontmatter and from [`Workflow::transitions`])
-/// and the user-facing column label.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+/// One step in a workflow.
+///
+/// `id` is the stable identifier — referenced from task frontmatter and
+/// from [`Workflow::transitions`]; conventional form is lowercase
+/// kebab-case (`backlog`, `in-progress`). Renaming `id` invalidates
+/// every transition and task that references it, so it's intended to be
+/// frozen at workflow-creation time.
+///
+/// `name` is the user-facing display label rendered in CLI listings and
+/// the Kanban column header. Free to change without invalidating any
+/// references — display lives here, stable references live in `id`.
+///
+/// On the wire `id` and `name` are both first-class fields. For
+/// backward compatibility with workflow YAMLs that pre-date the split,
+/// the deserializer accepts either field alone and uses it for both —
+/// see the custom `Deserialize` impl below.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct Status {
+    pub id: String,
     pub name: String,
     pub category: StatusCategory,
     pub owner: Owner,
+}
+
+impl<'de> Deserialize<'de> for Status {
+    fn deserialize<D: Deserializer<'de>>(d: D) -> std::result::Result<Self, D::Error> {
+        // Both `id` and `name` are optional at the syntactic layer so
+        // legacy YAMLs that only carry `name` (the field that did
+        // double duty before the split) parse without an error. The
+        // post-deserialize step enforces "at least one of the two"
+        // and fills the missing one from the other — a workflow
+        // authored before the split gets `id` derived from its old
+        // `name`, which is exactly the stable identifier it had
+        // implicitly already.
+        #[derive(Deserialize)]
+        struct Raw {
+            #[serde(default)]
+            id: Option<String>,
+            #[serde(default)]
+            name: Option<String>,
+            category: StatusCategory,
+            owner: Owner,
+            #[serde(default)]
+            description: Option<String>,
+        }
+        let raw = Raw::deserialize(d)?;
+        let (id, name) = match (raw.id, raw.name) {
+            (Some(id), Some(name)) => (id, name),
+            (Some(id), None) => {
+                let n = id.clone();
+                (id, n)
+            }
+            (None, Some(name)) => {
+                let i = name.clone();
+                (i, name)
+            }
+            (None, None) => {
+                return Err(serde::de::Error::custom(
+                    "status requires at least one of `id` or `name`",
+                ))
+            }
+        };
+        Ok(Status {
+            id,
+            name,
+            category: raw.category,
+            owner: raw.owner,
+        })
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -449,10 +527,11 @@ pub enum Owner {
     Agent,
 }
 
-/// The legacy 5-status workflow's handoff status name. Used as the
+/// The legacy 5-status workflow's handoff status id. Used as the
 /// fallback merge-bar trigger for workflows without an explicit
-/// `transitions:` block — see [`Workflow::fires_merge_bar`].
-pub const LEGACY_REVIEW_STATUS: &str = "Review";
+/// `transitions:` block — see [`Workflow::fires_merge_bar`]. Matches
+/// the `id:` of the `Review` status in [`default_workflow`].
+pub const LEGACY_REVIEW_STATUS: &str = "review";
 
 // ---------------------------------------------------------------------------
 // Transition + TransitionAction
@@ -464,10 +543,12 @@ pub const LEGACY_REVIEW_STATUS: &str = "Review";
 /// `Plans/workflows.md` §12.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Transition {
-    /// Status name a task moves out of. Must match a declared status.
+    /// Stable id ([`Status::id`]) a task moves out of. Must match a
+    /// declared status in the enclosing workflow.
     pub from: String,
 
-    /// Status name a task moves into. Must match a declared status.
+    /// Stable id ([`Status::id`]) a task moves into. Must match a
+    /// declared status in the enclosing workflow.
     pub to: String,
 
     /// Hub-side actions to run when this transition fires. Order is the
@@ -619,12 +700,12 @@ name: default
 description: |
   Six-status default.
 statuses:
-  - { name: Backlog,    category: backlog,  owner: user  }
-  - { name: Todo,       category: ready,    owner: agent }
-  - { name: InProgress, category: active,   owner: agent }
-  - { name: Review,     category: handoff,  owner: user  }
-  - { name: Done,       category: done,     owner: user  }
-  - { name: Canceled,   category: archived, owner: user  }
+  - { id: backlog,     name: Backlog,    category: backlog,  owner: user  }
+  - { id: todo,        name: Todo,       category: ready,    owner: agent }
+  - { id: in-progress, name: InProgress, category: active,   owner: agent }
+  - { id: review,      name: Review,     category: handoff,  owner: user  }
+  - { id: done,        name: Done,       category: done,     owner: user  }
+  - { id: canceled,    name: Canceled,   category: archived, owner: user  }
 "#;
 
     #[test]
@@ -632,11 +713,14 @@ statuses:
         let wf = Workflow::from_yaml_str(DEFAULT_YAML).expect("parse default");
         assert_eq!(wf.name, "default");
         assert_eq!(wf.statuses.len(), 6);
+        assert_eq!(wf.statuses[0].id, "backlog");
         assert_eq!(wf.statuses[0].name, "Backlog");
         assert_eq!(wf.statuses[0].category, StatusCategory::Backlog);
         assert_eq!(wf.statuses[0].owner, Owner::User);
+        assert_eq!(wf.statuses[2].id, "in-progress");
         assert_eq!(wf.statuses[2].category, StatusCategory::Active);
         assert_eq!(wf.statuses[2].owner, Owner::Agent);
+        assert_eq!(wf.statuses[5].id, "canceled");
         assert_eq!(wf.statuses[5].name, "Canceled");
         assert_eq!(wf.statuses[5].category, StatusCategory::Archived);
         assert_eq!(wf.statuses[5].owner, Owner::User);
@@ -645,9 +729,64 @@ statuses:
     }
 
     #[test]
+    fn legacy_yaml_without_id_falls_back_to_name() {
+        // Workflow YAML authored before the id/name split (and the
+        // built-in fixtures the original tests relied on) only carries
+        // `name:`. The deserializer must fill `id` from `name` so old
+        // files keep loading — the alternative would be silently
+        // rejecting every existing on-disk workflow.
+        let yaml = r#"
+name: legacy
+statuses:
+  - { name: Backlog, category: backlog, owner: user }
+  - { name: Review,  category: handoff, owner: user }
+"#;
+        let wf = Workflow::from_yaml_str(yaml).expect("legacy yaml parses");
+        assert_eq!(wf.statuses[0].id, "Backlog");
+        assert_eq!(wf.statuses[0].name, "Backlog");
+        assert_eq!(wf.statuses[1].id, "Review");
+        assert_eq!(wf.statuses[1].name, "Review");
+    }
+
+    #[test]
+    fn yaml_with_only_id_uses_id_for_name() {
+        // The mirror case of the legacy fallback — a workflow that
+        // declares `id:` but leaves `name:` off uses the id as the
+        // display label until a user picks a better one.
+        let yaml = r#"
+name: w
+statuses:
+  - { id: backlog, category: backlog, owner: user }
+"#;
+        let wf = Workflow::from_yaml_str(yaml).expect("yaml parses");
+        assert_eq!(wf.statuses[0].id, "backlog");
+        assert_eq!(wf.statuses[0].name, "backlog");
+    }
+
+    #[test]
+    fn rejects_status_with_neither_id_nor_name() {
+        let yaml = r#"
+name: w
+statuses:
+  - { category: backlog, owner: user }
+"#;
+        let err = Workflow::from_yaml_str(yaml).unwrap_err();
+        assert!(
+            matches!(err, Error::Yaml(_)),
+            "missing id/name should be a parse error, got: {err}"
+        );
+    }
+
+    #[test]
     fn default_workflow_helper_matches_documented_table() {
         let wf = default_workflow();
         wf.validate().expect("built-in default validates");
+
+        let ids: Vec<_> = wf.statuses.iter().map(|s| s.id.as_str()).collect();
+        assert_eq!(
+            ids,
+            vec!["backlog", "todo", "in-progress", "review", "done", "canceled"]
+        );
 
         let names: Vec<_> = wf.statuses.iter().map(|s| s.name.as_str()).collect();
         assert_eq!(
@@ -770,26 +909,62 @@ statuses:
     }
 
     #[test]
-    fn rejects_blank_status_name() {
+    fn rejects_blank_status_id() {
         let yaml = r#"
 name: w
 statuses:
-  - { name: "", category: ready, owner: agent }
+  - { id: "", name: Todo, category: ready, owner: agent }
 "#;
         let err = Workflow::from_yaml_str(yaml).unwrap_err();
-        assert!(matches!(err, Error::InvalidWorkflow(ref m) if m.contains("status name must not be empty")));
+        assert!(matches!(err, Error::InvalidWorkflow(ref m) if m.contains("status id must not be empty")));
     }
 
     #[test]
-    fn rejects_duplicate_status_names() {
+    fn rejects_blank_status_name_when_id_is_set() {
+        // Both id and name are required non-empty after the split. A
+        // workflow that nulls out name (`name: ""`) while keeping a real
+        // id still has to render a header somewhere — surface the error
+        // at validation time.
         let yaml = r#"
 name: w
 statuses:
-  - { name: Todo, category: ready, owner: agent }
-  - { name: Todo, category: active, owner: agent }
+  - { id: todo, name: "", category: ready, owner: agent }
 "#;
         let err = Workflow::from_yaml_str(yaml).unwrap_err();
-        assert!(matches!(err, Error::InvalidWorkflow(ref m) if m.contains("duplicate status name")));
+        assert!(
+            matches!(err, Error::InvalidWorkflow(ref m) if m.contains("name must not be empty")),
+            "got: {err}",
+        );
+    }
+
+    #[test]
+    fn rejects_duplicate_status_ids() {
+        let yaml = r#"
+name: w
+statuses:
+  - { id: todo, name: Todo,     category: ready,  owner: agent }
+  - { id: todo, name: TodoTwo,  category: active, owner: agent }
+"#;
+        let err = Workflow::from_yaml_str(yaml).unwrap_err();
+        assert!(
+            matches!(err, Error::InvalidWorkflow(ref m) if m.contains("duplicate status id")),
+            "got: {err}",
+        );
+    }
+
+    #[test]
+    fn duplicate_names_are_allowed_when_ids_differ() {
+        // Names are display-only; two distinct ids may render the same
+        // human-readable label without that being a validation failure.
+        // (Likely unusual in practice — but it's the user's call, not
+        // ours.)
+        let yaml = r#"
+name: w
+statuses:
+  - { id: review-a, name: Review, category: handoff, owner: user }
+  - { id: review-b, name: Review, category: handoff, owner: user }
+"#;
+        Workflow::from_yaml_str(yaml).expect("distinct ids with same name validate");
     }
 
     #[test]
@@ -797,8 +972,8 @@ statuses:
         let yaml = r#"
 name: w
 statuses:
-  - { name: Todo, category: ready, owner: agent }
-initial_status: Backlog
+  - { id: todo, name: Todo, category: ready, owner: agent }
+initial_status: backlog
 "#;
         let err = Workflow::from_yaml_str(yaml).unwrap_err();
         assert!(matches!(err, Error::InvalidWorkflow(ref m) if m.contains("initial_status")));
@@ -809,18 +984,20 @@ initial_status: Backlog
         let yaml = r#"
 name: w
 statuses:
-  - { name: Backlog, category: backlog, owner: user  }
-  - { name: Todo,    category: ready,   owner: agent }
-initial_status: Todo
+  - { id: backlog, name: Backlog, category: backlog, owner: user  }
+  - { id: todo,    name: Todo,    category: ready,   owner: agent }
+initial_status: todo
 "#;
         let wf = Workflow::from_yaml_str(yaml).unwrap();
-        assert_eq!(wf.resolved_initial_status(), Some("Todo"));
+        assert_eq!(wf.resolved_initial_status(), Some("todo"));
     }
 
     #[test]
-    fn resolved_initial_status_falls_back_to_first() {
+    fn resolved_initial_status_falls_back_to_first_status_id() {
         let wf = default_workflow();
-        assert_eq!(wf.resolved_initial_status(), Some("Backlog"));
+        // First status's `id`, not `name` — the resolved value feeds
+        // transition lookups and task frontmatter, both keyed by id.
+        assert_eq!(wf.resolved_initial_status(), Some("backlog"));
     }
 
     #[test]
@@ -828,13 +1005,13 @@ initial_status: Todo
         let yaml = r#"
 name: w
 statuses:
-  - { name: Todo, category: ready, owner: agent }
+  - { id: todo, name: Todo, category: ready, owner: agent }
 transitions:
-  - { from: Bogus, to: Todo, actions: [push_branch] }
+  - { from: bogus, to: todo, actions: [push_branch] }
 "#;
         let err = Workflow::from_yaml_str(yaml).unwrap_err();
         assert!(
-            matches!(err, Error::InvalidWorkflow(ref m) if m.contains("from undeclared status `Bogus`")),
+            matches!(err, Error::InvalidWorkflow(ref m) if m.contains("undeclared status id `bogus`")),
             "got: {err}"
         );
     }
@@ -844,14 +1021,14 @@ transitions:
         let yaml = r#"
 name: w
 statuses:
-  - { name: Todo, category: ready,  owner: agent }
-  - { name: Done, category: done,   owner: user  }
+  - { id: todo, name: Todo, category: ready,  owner: agent }
+  - { id: done, name: Done, category: done,   owner: user  }
 transitions:
-  - { from: Todo, to: Phantom, actions: [merge] }
+  - { from: todo, to: phantom, actions: [merge] }
 "#;
         let err = Workflow::from_yaml_str(yaml).unwrap_err();
         assert!(
-            matches!(err, Error::InvalidWorkflow(ref m) if m.contains("undeclared status `Phantom`")),
+            matches!(err, Error::InvalidWorkflow(ref m) if m.contains("undeclared status id `phantom`")),
             "got: {err}"
         );
     }
@@ -861,11 +1038,11 @@ transitions:
         let yaml = r#"
 name: w
 statuses:
-  - { name: Todo, category: ready,  owner: agent }
-  - { name: Done, category: done,   owner: user  }
+  - { id: todo, name: Todo, category: ready,  owner: agent }
+  - { id: done, name: Done, category: done,   owner: user  }
 transitions:
-  - { from: Todo, to: Done, actions: [merge] }
-  - { from: Todo, to: Done, actions: [close_pr] }
+  - { from: todo, to: done, actions: [merge] }
+  - { from: todo, to: done, actions: [close_pr] }
 "#;
         let err = Workflow::from_yaml_str(yaml).unwrap_err();
         assert!(
@@ -877,12 +1054,18 @@ transitions:
     #[test]
     fn transition_allowed_is_any_to_any_between_declared_statuses() {
         let wf = default_workflow();
-        // Both endpoints exist → allowed, no whitelist semantic.
-        assert!(wf.transition_allowed("Backlog", "Done"));
-        assert!(wf.transition_allowed("Done", "Backlog"));
-        // Unknown status is never reachable.
-        assert!(!wf.transition_allowed("Ghost", "Done"));
-        assert!(!wf.transition_allowed("Backlog", "Ghost"));
+        // Both endpoints exist → allowed, no whitelist semantic. The
+        // lookup is keyed by `id`, so the kebab-case stable identifiers
+        // are what cross the wire — the PascalCase display names are
+        // not addressable here.
+        assert!(wf.transition_allowed("backlog", "done"));
+        assert!(wf.transition_allowed("done", "backlog"));
+        // PascalCase names (the old hardcoded form) no longer resolve —
+        // they aren't ids anymore.
+        assert!(!wf.transition_allowed("Backlog", "Done"));
+        // Unknown id is never reachable.
+        assert!(!wf.transition_allowed("ghost", "done"));
+        assert!(!wf.transition_allowed("backlog", "ghost"));
     }
 
     #[test]
@@ -968,12 +1151,15 @@ transitions:
         // A workflow with no `transitions:` block (the default, what
         // existing projects have on disk) keeps the historic "Review →
         // Done" trigger. Lets existing zen users not have to edit YAML to
-        // keep the bar firing.
+        // keep the bar firing. The trigger is keyed by status `id`, so
+        // the canonical `review` id trips it — display labels (`Review`)
+        // never enter the comparison.
         let wf = default_workflow();
         assert!(wf.transitions.is_none(), "default ships without transitions");
-        assert!(wf.fires_merge_bar("Review"));
-        assert!(!wf.fires_merge_bar("InProgress"));
-        assert!(!wf.fires_merge_bar("Backlog"));
+        assert!(wf.fires_merge_bar("review"));
+        assert!(!wf.fires_merge_bar("Review"), "name no longer matches");
+        assert!(!wf.fires_merge_bar("in-progress"));
+        assert!(!wf.fires_merge_bar("backlog"));
     }
 
     #[test]
