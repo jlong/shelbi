@@ -17,6 +17,7 @@ use shelbi_core::{Agent, Column, Project, Result, Session, Task};
 mod hub_config;
 mod user_config;
 mod worker_status;
+mod workflows;
 
 pub use hub_config::{
     hub_config_path, list_projects, load_hub_config, save_hub_config, touch_project_launched,
@@ -32,6 +33,7 @@ pub use worker_status::{
     parse_pane_title_state, save_worker_status, worker_status_path, workers_dir, PaneMarker,
     WorkerState, WorkerStatus,
 };
+pub use workflows::{list_workflows, load_workflow, workflow_path, workflows_dir};
 
 /// Default assistant name surfaced in the sidebar header and the
 /// orchestrator system prompt when the user hasn't picked one yet.
