@@ -15,11 +15,12 @@
 //! See `Plans/workflows.md` §2 for the canonical schema.
 
 use std::collections::BTreeMap;
+use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
 use crate::placeholders::substitute_placeholders;
-use crate::{Error, GitConfig};
+use crate::{Error, GitConfig, ZenChecks, ZenDangerPaths};
 
 // ---------------------------------------------------------------------------
 // Workflow
@@ -52,13 +53,16 @@ pub struct Workflow {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub initial_status: Option<String>,
 
-    /// Optional whitelist of allowed status transitions. Key = from-status
-    /// name; value = list of statuses the task may move to from there. A
-    /// key whose value is `[]` declares a terminal status (no outgoing
-    /// moves). When the entire field is `None`, transitions are
-    /// unrestricted (any-to-any) — matching today's freedom.
+    /// Action-based transition table: each entry declares which side-effect
+    /// actions (`push_branch`, `open_pr`, `merge`, `close_pr`,
+    /// `delete_branch`, `restack`) fire when a task crosses that edge.
+    /// Transitions are **any-to-any** per `Plans/workflows.md` §11 — this
+    /// block does *not* restrict which moves are legal, it only declares
+    /// the side-effects to run on the edges where work needs to happen.
+    /// Edges not listed are pure status moves with no actions. `None` ↔
+    /// `Some(vec![])` ↔ no actions on any edge.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub transitions: Option<BTreeMap<String, Vec<String>>>,
+    pub transitions: Option<Vec<Transition>>,
 
     /// Per-workflow override of the project-level `git:` defaults. When
     /// `None`, callers inherit `Project::base_branch` and
@@ -68,6 +72,22 @@ pub struct Workflow {
     /// `Plans/workflows.md` §12 "Parameterization".
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub git: Option<GitConfig>,
+
+    /// Per-workflow override of project-level Zen Mode config.
+    ///
+    /// Each subfield is independently optional — a workflow can override
+    /// just `checks`, just `ci_timeout`, just `danger_paths`, or any
+    /// combination. Unset subfields fall back to the project's
+    /// [`crate::ZenConfig`]. Resolution helpers
+    /// ([`crate::ci_timeout_for_workflow`], [`crate::danger_paths_for_workflow`],
+    /// [`crate::checks_for_task_in_workflow`]) do the merging — call sites
+    /// shouldn't reach into this field directly.
+    ///
+    /// Letting a `research:` workflow opt out of code-style checks
+    /// without affecting `default` is the canonical use case
+    /// (`Plans/workflows.md` §Decisions).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub zen: Option<WorkflowZenConfig>,
 }
 
 impl Workflow {
@@ -97,21 +117,75 @@ impl Workflow {
         self.statuses.iter().find(|s| s.name == name)
     }
 
-    /// True iff `from -> to` is permitted under this workflow's
-    /// transition rules. When [`Workflow::transitions`] is unset, every
-    /// move between declared statuses is allowed; an unknown status is
-    /// never reachable. Self-loops are allowed (`Todo -> Todo`) so
-    /// callers don't have to special-case "no change."
+    /// True iff `from -> to` is a legal status move. Per
+    /// `Plans/workflows.md` §11, transitions are any-to-any: both
+    /// statuses just have to be declared in this workflow. Listing an
+    /// edge in [`Workflow::transitions`] only declares its side-effects;
+    /// it does not restrict which moves are legal.
     pub fn transition_allowed(&self, from: &str, to: &str) -> bool {
-        if self.status(from).is_none() || self.status(to).is_none() {
-            return false;
-        }
+        self.status(from).is_some() && self.status(to).is_some()
+    }
+
+    /// Look up the [`Transition`] entry for `from -> to`, if one is
+    /// declared. Returns `None` when no edge is declared (a pure status
+    /// move with no side-effects).
+    pub fn transition(&self, from: &str, to: &str) -> Option<&Transition> {
+        self.transitions
+            .as_ref()?
+            .iter()
+            .find(|t| t.from == from && t.to == to)
+    }
+
+    /// Action list to fire when a task moves `from -> to`. Empty when no
+    /// edge is declared — that's the explicit "no side-effects" path,
+    /// not an error.
+    pub fn actions_for_transition(&self, from: &str, to: &str) -> &[TransitionAction] {
+        self.transition(from, to)
+            .map(|t| t.actions.as_slice())
+            .unwrap_or(&[])
+    }
+
+    /// True iff the `from -> to` edge declares the `merge` action.
+    ///
+    /// Zen Mode's confidence bar fires on *any* transition whose actions
+    /// include `merge`, regardless of source/target categories — see
+    /// `Plans/workflows.md` §8 "The underlying rule is action-based, not
+    /// category-pair-based." A trunk-based workflow that skips `Review`
+    /// and merges straight from `InProgress -> Done` still trips the
+    /// same high-bar probe.
+    pub fn is_merge_transition(&self, from: &str, to: &str) -> bool {
+        self.actions_for_transition(from, to)
+            .contains(&TransitionAction::Merge)
+    }
+
+    /// All outgoing edges from `from` that fire `merge`. The orchestrator
+    /// uses this to ask "if I'm in status X, is there a merge target I
+    /// should be probing toward?" — useful for the dry-run preview and
+    /// reaction-rule logic where we have the current status but not yet
+    /// the proposed `to`.
+    pub fn outgoing_merge_transitions(&self, from: &str) -> Vec<&Transition> {
+        let Some(ts) = &self.transitions else {
+            return Vec::new();
+        };
+        ts.iter()
+            .filter(|t| t.from == from && t.actions.contains(&TransitionAction::Merge))
+            .collect()
+    }
+
+    /// True iff a task in `from` is on a transition that fires `merge` —
+    /// i.e., Zen Mode's confidence bar should apply.
+    ///
+    /// When this workflow has *no* `transitions:` block declared at all,
+    /// fall back to the legacy 5-status convention: a task in `Review`
+    /// triggers the bar. This back-compat path keeps existing projects
+    /// (whose migrated `default.yaml` carries no transitions block) on
+    /// the same trigger they had before workflows landed; new projects
+    /// that opt into the action-based bar by declaring transitions get
+    /// the action-based semantic exclusively.
+    pub fn fires_merge_bar(&self, from: &str) -> bool {
         match &self.transitions {
-            None => true,
-            Some(map) => map
-                .get(from)
-                .map(|v| v.iter().any(|s| s == to))
-                .unwrap_or(false),
+            Some(_) => !self.outgoing_merge_transitions(from).is_empty(),
+            None => from == LEGACY_REVIEW_STATUS,
         }
     }
 
@@ -160,20 +234,26 @@ impl Workflow {
         }
 
         if let Some(tr) = &self.transitions {
-            for (from, tos) in tr {
-                if self.status(from).is_none() {
+            let mut seen: BTreeMap<(&str, &str), ()> = BTreeMap::new();
+            for t in tr {
+                if self.status(&t.from).is_none() {
                     return Err(workflow_err(format!(
-                        "workflow `{}`: transitions key `{}` is not a declared status",
-                        self.name, from
+                        "workflow `{}`: transition `{} -> {}` from undeclared status `{}`",
+                        self.name, t.from, t.to, t.from
                     )));
                 }
-                for to in tos {
-                    if self.status(to).is_none() {
-                        return Err(workflow_err(format!(
-                            "workflow `{}`: transition `{}` -> `{}` targets undeclared status `{}`",
-                            self.name, from, to, to
-                        )));
-                    }
+                if self.status(&t.to).is_none() {
+                    return Err(workflow_err(format!(
+                        "workflow `{}`: transition `{} -> {}` targets undeclared status `{}`",
+                        self.name, t.from, t.to, t.to
+                    )));
+                }
+                let key = (t.from.as_str(), t.to.as_str());
+                if seen.insert(key, ()).is_some() {
+                    return Err(workflow_err(format!(
+                        "workflow `{}`: duplicate transition `{} -> {}`",
+                        self.name, t.from, t.to
+                    )));
                 }
             }
         }
@@ -258,8 +338,15 @@ pub fn default_workflow() -> Workflow {
             },
         ],
         initial_status: None,
+        // Default workflow ships *without* explicit transitions so the
+        // on-disk `default.yaml` stays lean and matches what existing
+        // projects already have after Phase 1's migration. Generic code
+        // (Zen Mode, action-based confidence bar) treats a workflow with
+        // no transitions declared as the legacy 5-status flow — see
+        // [`Workflow::merge_trigger_status_or_legacy`].
         transitions: None,
         git: None,
+        zen: None,
     }
 }
 
@@ -353,6 +440,156 @@ pub enum Owner {
     User,
     Agent,
     Either,
+}
+
+/// The legacy 5-status workflow's handoff status name. Used as the
+/// fallback merge-bar trigger for workflows without an explicit
+/// `transitions:` block — see [`Workflow::fires_merge_bar`].
+pub const LEGACY_REVIEW_STATUS: &str = "Review";
+
+// ---------------------------------------------------------------------------
+// Transition + TransitionAction
+
+/// One edge in a workflow's action graph. Declares the side-effects that
+/// fire when a task moves from `from` to `to`, plus an optional `target:`
+/// override for `merge` and `open_pr` actions that should land somewhere
+/// other than the workflow's resolved `git.base_branch`. See
+/// `Plans/workflows.md` §12.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Transition {
+    /// Status name a task moves out of. Must match a declared status.
+    pub from: String,
+
+    /// Status name a task moves into. Must match a declared status.
+    pub to: String,
+
+    /// Hub-side actions to run when this transition fires. Order is the
+    /// order they execute; failures short-circuit the rest. Empty
+    /// (omitted on the wire) means the edge declares no side-effects —
+    /// the move is a pure status change.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub actions: Vec<TransitionAction>,
+
+    /// Per-transition `merge` / `open_pr` target override. When `None`,
+    /// the workflow's resolved `git.base_branch` (or the project
+    /// fallback) wins. Useful for multi-hop pipelines: a feature
+    /// workflow that merges intermediate work into `develop` here but
+    /// ships to `main` on a later transition.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target: Option<String>,
+}
+
+/// One of the six hub-side action primitives the workflow engine can
+/// fire. Matches the action set in `Plans/workflows.md` §12 and the
+/// functions in `shelbi-orchestrator::actions`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TransitionAction {
+    /// Push the task's branch to origin.
+    PushBranch,
+    /// Open a PR for the task's branch.
+    OpenPr,
+    /// Merge the task's branch into its target.
+    Merge,
+    /// Close any open PR without merging.
+    ClosePr,
+    /// Delete the local + remote branch.
+    DeleteBranch,
+    /// Rebase the task's branch onto its parent's current branch.
+    Restack,
+}
+
+impl TransitionAction {
+    /// Stable wire-format spelling. Matches the serde rename so callers
+    /// don't need to round-trip through serde to format a single value.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            TransitionAction::PushBranch => "push_branch",
+            TransitionAction::OpenPr => "open_pr",
+            TransitionAction::Merge => "merge",
+            TransitionAction::ClosePr => "close_pr",
+            TransitionAction::DeleteBranch => "delete_branch",
+            TransitionAction::Restack => "restack",
+        }
+    }
+}
+
+impl std::fmt::Display for TransitionAction {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// WorkflowZenConfig
+
+/// Per-workflow override of the project-level [`crate::ZenConfig`]. Every
+/// field is optional so a workflow can pick which dimensions to override
+/// — typically `checks:` for a workflow that needs a different test
+/// suite, `danger_paths:` to widen or replace the danger-glob set, and
+/// `ci_timeout:` for pipelines whose CI takes substantially longer (or
+/// shorter) than the project default.
+///
+/// Use the resolution helpers — [`crate::checks_for_task_in_workflow`],
+/// [`crate::ci_timeout_for_workflow`],
+/// [`crate::danger_paths_for_workflow`] — to look up the effective value
+/// for a (project, workflow, task) triple. Callers should not pattern-
+/// match on this struct directly; the helpers handle the "unset → fall
+/// back to project" rule in one place.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WorkflowZenConfig {
+    /// Local checks to run before the merge bar — overrides
+    /// `project.zen.checks` outright when set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub checks: Option<ZenChecks>,
+
+    /// CI watch timeout for this workflow — overrides
+    /// `project.zen.ci_timeout` when set. Serialized as a number of
+    /// seconds, matching the project-level field's wire format.
+    #[serde(default, with = "opt_duration_secs", skip_serializing_if = "Option::is_none")]
+    pub ci_timeout: Option<Duration>,
+
+    /// Danger-glob list for this workflow — overrides
+    /// `project.zen.danger_paths` (including its `extend` / `override`
+    /// semantics) when set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub danger_paths: Option<ZenDangerPaths>,
+}
+
+impl WorkflowZenConfig {
+    /// True iff every override field is unset. A workflow with an
+    /// `zen: {}` block parses to this — semantically identical to omitting
+    /// the block entirely, but cheap to detect for diagnostics ("you
+    /// declared `zen:` but didn't override anything").
+    pub fn is_empty(&self) -> bool {
+        self.checks.is_none() && self.ci_timeout.is_none() && self.danger_paths.is_none()
+    }
+}
+
+/// Serde adapter for `Option<Duration>` stored as an optional integer
+/// number of seconds. Used by [`WorkflowZenConfig::ci_timeout`] so the
+/// wire format matches the project-level `zen.ci_timeout` field.
+mod opt_duration_secs {
+    use std::time::Duration;
+
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    pub fn serialize<S: Serializer>(
+        d: &Option<Duration>,
+        s: S,
+    ) -> Result<S::Ok, S::Error> {
+        match d {
+            Some(d) => s.serialize_u64(d.as_secs()),
+            None => s.serialize_none(),
+        }
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(
+        d: D,
+    ) -> Result<Option<Duration>, D::Error> {
+        let opt = Option::<u64>::deserialize(d)?;
+        Ok(opt.map(Duration::from_secs))
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -531,30 +768,30 @@ initial_status: Todo
     }
 
     #[test]
-    fn rejects_transitions_key_pointing_at_undeclared_status() {
+    fn rejects_transition_from_undeclared_status() {
         let yaml = r#"
 name: w
 statuses:
   - { name: Todo, category: ready, owner: agent }
 transitions:
-  Bogus: [Todo]
+  - { from: Bogus, to: Todo, actions: [push_branch] }
 "#;
         let err = Workflow::from_yaml_str(yaml).unwrap_err();
         assert!(
-            matches!(err, Error::InvalidWorkflow(ref m) if m.contains("transitions key `Bogus`")),
+            matches!(err, Error::InvalidWorkflow(ref m) if m.contains("from undeclared status `Bogus`")),
             "got: {err}"
         );
     }
 
     #[test]
-    fn rejects_transitions_value_pointing_at_undeclared_status() {
+    fn rejects_transition_to_undeclared_status() {
         let yaml = r#"
 name: w
 statuses:
   - { name: Todo, category: ready,  owner: agent }
   - { name: Done, category: done,   owner: user  }
 transitions:
-  Todo: [Done, Phantom]
+  - { from: Todo, to: Phantom, actions: [merge] }
 "#;
         let err = Workflow::from_yaml_str(yaml).unwrap_err();
         assert!(
@@ -564,8 +801,27 @@ transitions:
     }
 
     #[test]
-    fn transition_allowed_is_any_to_any_when_unset() {
+    fn rejects_duplicate_transition_edge() {
+        let yaml = r#"
+name: w
+statuses:
+  - { name: Todo, category: ready,  owner: agent }
+  - { name: Done, category: done,   owner: user  }
+transitions:
+  - { from: Todo, to: Done, actions: [merge] }
+  - { from: Todo, to: Done, actions: [close_pr] }
+"#;
+        let err = Workflow::from_yaml_str(yaml).unwrap_err();
+        assert!(
+            matches!(err, Error::InvalidWorkflow(ref m) if m.contains("duplicate transition")),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn transition_allowed_is_any_to_any_between_declared_statuses() {
         let wf = default_workflow();
+        // Both endpoints exist → allowed, no whitelist semantic.
         assert!(wf.transition_allowed("Backlog", "Done"));
         assert!(wf.transition_allowed("Done", "Backlog"));
         // Unknown status is never reachable.
@@ -574,31 +830,111 @@ transitions:
     }
 
     #[test]
-    fn transition_allowed_honors_restricted_map() {
+    fn transition_allowed_does_not_restrict_when_transitions_declared() {
+        // §11 in the workflows plan: declaring a `transitions:` block only
+        // adds *side-effects* to edges. It does NOT restrict which moves
+        // are legal — any declared status can move to any other.
         let yaml = r#"
 name: w
 statuses:
-  - { name: Backlog,    category: backlog, owner: user  }
-  - { name: Todo,       category: ready,   owner: agent }
-  - { name: InProgress, category: active,  owner: agent }
-  - { name: Review,     category: handoff, owner: user  }
-  - { name: Done,       category: done,    owner: user  }
+  - { name: Todo,    category: ready,  owner: agent }
+  - { name: Doing,   category: active, owner: agent }
+  - { name: Done,    category: done,   owner: user  }
 transitions:
-  Backlog:    [Todo]
-  Todo:       [InProgress, Backlog]
-  InProgress: [Review, Todo]
-  Review:     [Done, Todo, InProgress]
-  Done:       []
+  - { from: Doing, to: Done, actions: [merge] }
 "#;
         let wf = Workflow::from_yaml_str(yaml).unwrap();
-        assert!(wf.transition_allowed("Backlog", "Todo"));
-        assert!(wf.transition_allowed("Review", "Done"));
-        // Not in the whitelist:
-        assert!(!wf.transition_allowed("Backlog", "Done"));
-        // Terminal state: nothing leaves.
-        assert!(!wf.transition_allowed("Done", "Backlog"));
-        // Self-loops require an explicit listing under restricted mode.
-        assert!(!wf.transition_allowed("Todo", "Todo"));
+        assert!(wf.transition_allowed("Todo", "Doing"));
+        assert!(wf.transition_allowed("Todo", "Done"));
+        // Backwards is just as legal — the edge is just "an edge."
+        assert!(wf.transition_allowed("Done", "Todo"));
+    }
+
+    #[test]
+    fn transition_action_helpers_match_declared_edges() {
+        let yaml = r#"
+name: w
+statuses:
+  - { name: Doing,  category: active,  owner: agent }
+  - { name: Review, category: handoff, owner: user  }
+  - { name: Done,   category: done,    owner: user  }
+transitions:
+  - { from: Doing,  to: Review, actions: [push_branch, open_pr] }
+  - { from: Review, to: Done,   actions: [merge, delete_branch] }
+"#;
+        let wf = Workflow::from_yaml_str(yaml).unwrap();
+
+        assert_eq!(
+            wf.actions_for_transition("Doing", "Review"),
+            &[TransitionAction::PushBranch, TransitionAction::OpenPr]
+        );
+        assert_eq!(
+            wf.actions_for_transition("Review", "Done"),
+            &[TransitionAction::Merge, TransitionAction::DeleteBranch]
+        );
+        // Unlisted edges have no actions — the move is a pure status change.
+        assert!(wf.actions_for_transition("Doing", "Done").is_empty());
+
+        assert!(wf.is_merge_transition("Review", "Done"));
+        assert!(!wf.is_merge_transition("Doing", "Review"));
+
+        let outgoing: Vec<&str> = wf
+            .outgoing_merge_transitions("Review")
+            .into_iter()
+            .map(|t| t.to.as_str())
+            .collect();
+        assert_eq!(outgoing, vec!["Done"]);
+    }
+
+    #[test]
+    fn fires_merge_bar_uses_actions_when_transitions_declared() {
+        // Workflow has an explicit transitions block → action-based: only
+        // statuses with an outgoing merge edge fire the bar.
+        let yaml = r#"
+name: w
+statuses:
+  - { name: Doing,  category: active,  owner: agent }
+  - { name: Review, category: handoff, owner: user  }
+  - { name: Done,   category: done,    owner: user  }
+transitions:
+  - { from: Doing,  to: Review, actions: [push_branch] }
+  - { from: Review, to: Done,   actions: [merge] }
+"#;
+        let wf = Workflow::from_yaml_str(yaml).unwrap();
+        assert!(wf.fires_merge_bar("Review"));
+        assert!(!wf.fires_merge_bar("Doing"));
+        // Unknown statuses don't trip the bar.
+        assert!(!wf.fires_merge_bar("Ghost"));
+    }
+
+    #[test]
+    fn fires_merge_bar_falls_back_to_legacy_review_when_no_transitions() {
+        // A workflow with no `transitions:` block (the default, what
+        // existing projects have on disk) keeps the historic "Review →
+        // Done" trigger. Lets existing zen users not have to edit YAML to
+        // keep the bar firing.
+        let wf = default_workflow();
+        assert!(wf.transitions.is_none(), "default ships without transitions");
+        assert!(wf.fires_merge_bar("Review"));
+        assert!(!wf.fires_merge_bar("InProgress"));
+        assert!(!wf.fires_merge_bar("Backlog"));
+    }
+
+    #[test]
+    fn trunk_based_workflow_fires_bar_on_active_to_done() {
+        // Worked example from `Plans/workflows.md` §8: a workflow that
+        // skips `Review` and goes straight `InProgress -> Done` with a
+        // merge action gets the same high bar — no special-casing.
+        let yaml = r#"
+name: trunk
+statuses:
+  - { name: Doing, category: active, owner: agent }
+  - { name: Done,  category: done,   owner: user  }
+transitions:
+  - { from: Doing, to: Done, actions: [merge, delete_branch] }
+"#;
+        let wf = Workflow::from_yaml_str(yaml).unwrap();
+        assert!(wf.fires_merge_bar("Doing"));
     }
 
     #[test]
@@ -772,5 +1108,101 @@ git:
         let serialized = serde_yaml::to_string(&wf).unwrap();
         let back = Workflow::from_yaml_str(&serialized).unwrap();
         assert_eq!(wf, back);
+    }
+
+    // ---------------------------------------------------------------------
+    // zen: block (per-workflow override of project zen config)
+
+    #[test]
+    fn workflow_zen_block_parses_all_three_overrides() {
+        let yaml = r#"
+name: research
+statuses:
+  - { name: Drafting, category: active, owner: agent }
+zen:
+  checks:
+    local:
+      - 'pytest -k research'
+  ci_timeout: 600
+  danger_paths:
+    override:
+      - 'fixtures/**'
+"#;
+        let wf = Workflow::from_yaml_str(yaml).unwrap();
+        let z = wf.zen.as_ref().expect("zen block parsed");
+        let checks = z.checks.as_ref().expect("checks set");
+        assert_eq!(checks.local, vec!["pytest -k research".to_string()]);
+        assert_eq!(z.ci_timeout, Some(Duration::from_secs(600)));
+        assert!(matches!(
+            z.danger_paths.as_ref().unwrap(),
+            ZenDangerPaths::Override(v) if v == &vec!["fixtures/**".to_string()]
+        ));
+    }
+
+    #[test]
+    fn workflow_zen_subfields_independently_optional() {
+        // A workflow can override just one dimension and leave the others
+        // to fall back to the project default.
+        let yaml = r#"
+name: long-ci
+statuses:
+  - { name: Todo, category: ready, owner: agent }
+zen:
+  ci_timeout: 3600
+"#;
+        let wf = Workflow::from_yaml_str(yaml).unwrap();
+        let z = wf.zen.expect("zen block parsed");
+        assert!(z.checks.is_none());
+        assert_eq!(z.ci_timeout, Some(Duration::from_secs(3600)));
+        assert!(z.danger_paths.is_none());
+        assert!(!z.is_empty());
+    }
+
+    #[test]
+    fn workflow_zen_empty_block_is_recognized_as_empty() {
+        // `zen: {}` parses and is structurally equivalent to omitting the
+        // block — every override unset.
+        let yaml = r#"
+name: w
+statuses:
+  - { name: Todo, category: ready, owner: agent }
+zen: {}
+"#;
+        let wf = Workflow::from_yaml_str(yaml).unwrap();
+        let z = wf.zen.expect("zen block parsed");
+        assert!(z.is_empty());
+    }
+
+    #[test]
+    fn workflow_with_no_zen_block_omits_field_on_the_wire() {
+        let wf = default_workflow();
+        let y = serde_yaml::to_string(&wf).unwrap();
+        assert!(!y.contains("zen:"), "unexpected zen: in {y}");
+    }
+
+    #[test]
+    fn workflow_zen_round_trips_through_yaml() {
+        let yaml = r#"
+name: research
+statuses:
+  - { name: Drafting, category: active, owner: agent }
+zen:
+  checks:
+    local:
+      - 'pytest -k research'
+  ci_timeout: 600
+  danger_paths:
+    extend:
+      - 'fixtures/**'
+"#;
+        let wf = Workflow::from_yaml_str(yaml).unwrap();
+        let serialized = serde_yaml::to_string(&wf).unwrap();
+        let back = Workflow::from_yaml_str(&serialized).unwrap();
+        assert_eq!(wf, back);
+        // ci_timeout serializes as a bare integer (no struct form).
+        assert!(
+            serialized.contains("ci_timeout: 600"),
+            "expected `ci_timeout: 600` in serialized form, got:\n{serialized}"
+        );
     }
 }

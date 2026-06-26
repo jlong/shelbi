@@ -533,6 +533,22 @@ impl Column {
         }
     }
 
+    /// The PascalCase status name this column maps to under the canonical
+    /// default workflow (see `default_workflow()`). Workflows that
+    /// introduce custom statuses still use these names by convention for
+    /// the legacy 5; generic code that needs to ask "is this task in the
+    /// merge-bar trigger status?" routes through here so the lookup
+    /// matches the workflow YAML's `from:` / `to:` strings.
+    pub fn default_status_name(self) -> &'static str {
+        match self {
+            Column::Backlog => "Backlog",
+            Column::Todo => "Todo",
+            Column::InProgress => "InProgress",
+            Column::Review => "Review",
+            Column::Done => "Done",
+        }
+    }
+
     /// The semantic [`crate::StatusCategory`] this column maps to under
     /// the canonical default workflow. Used by the events log writer to
     /// fill the `from_category=`/`to_category=` fields on the new line
@@ -899,16 +915,93 @@ pub struct TaskZenConfig {
 /// Resolve the effective check list for a task: `checks_only` replaces
 /// the project list, `checks_additional` extends it, and absent both the
 /// project's `zen.checks.local` is returned verbatim.
+///
+/// This is the legacy (workflow-unaware) form. New call sites should
+/// prefer [`checks_for_task_in_workflow`], which threads the task's
+/// workflow into the resolution chain so a per-workflow `zen.checks`
+/// override wins over the project-level default.
 pub fn checks_for_task(project: &Project, task: &Task) -> Vec<String> {
-    let project_local = &project.zen.checks.local;
+    checks_for_task_in_workflow(project, None, task)
+}
+
+/// Resolve the effective check list for `task` against `project`, with
+/// an optional `workflow` whose per-workflow `zen.checks` override (if
+/// set) supersedes `project.zen.checks`. Per-task overrides on the task
+/// frontmatter (`zen.checks_only` / `checks_additional`) still win
+/// against whichever layer supplied the workflow-level base list.
+///
+/// Resolution order from base to override:
+///
+/// 1. Project-level `zen.checks.local`.
+/// 2. Per-workflow `WorkflowZenConfig::checks.local` (if set), replacing 1.
+/// 3. Per-task `TaskZenConfig::checks_only` (if set), replacing 2.
+/// 4. Otherwise per-task `TaskZenConfig::checks_additional` extending 2.
+///
+/// Pass `workflow: None` to skip the workflow layer entirely — the
+/// helper still applies the project + per-task rules and matches the
+/// legacy [`checks_for_task`] behavior.
+pub fn checks_for_task_in_workflow(
+    project: &Project,
+    workflow: Option<&crate::Workflow>,
+    task: &Task,
+) -> Vec<String> {
+    let base = workflow
+        .and_then(|w| w.zen.as_ref())
+        .and_then(|z| z.checks.as_ref())
+        .map(|c| c.local.clone())
+        .unwrap_or_else(|| project.zen.checks.local.clone());
     match task.zen.as_ref() {
         Some(z) if !z.checks_only.is_empty() => z.checks_only.clone(),
         Some(z) if !z.checks_additional.is_empty() => {
-            let mut out = project_local.clone();
+            let mut out = base;
             out.extend(z.checks_additional.iter().cloned());
             out
         }
-        _ => project_local.clone(),
+        _ => base,
+    }
+}
+
+/// Resolve the effective Zen `ci_timeout` for `project` + an optional
+/// `workflow`. The workflow's `zen.ci_timeout` override wins when set;
+/// otherwise the project default applies.
+pub fn ci_timeout_for_workflow(
+    project: &Project,
+    workflow: Option<&crate::Workflow>,
+) -> Duration {
+    workflow
+        .and_then(|w| w.zen.as_ref())
+        .and_then(|z| z.ci_timeout)
+        .unwrap_or(project.zen.ci_timeout)
+}
+
+/// Resolve the effective danger-glob list for `project` + an optional
+/// `workflow`. When the workflow declares `zen.danger_paths`, *that*
+/// list owns the `extend` vs `override` decision — the workflow's
+/// `extend` extends the project's resolved list, and `override`
+/// replaces it outright. When the workflow has no `danger_paths`
+/// override, falls back to [`danger_paths_for_project`].
+///
+/// This mirrors the project-level resolution rule one level out: the
+/// per-workflow override is structurally the same shape as the
+/// project-level config, so a workflow can shadow `extend`/`override`
+/// independently.
+pub fn danger_paths_for_workflow(
+    project: &Project,
+    workflow: Option<&crate::Workflow>,
+) -> Vec<String> {
+    let Some(wz) = workflow.and_then(|w| w.zen.as_ref()) else {
+        return danger_paths_for_project(project);
+    };
+    let Some(custom) = wz.danger_paths.as_ref() else {
+        return danger_paths_for_project(project);
+    };
+    match custom {
+        ZenDangerPaths::Extend(extra) => {
+            let mut out = danger_paths_for_project(project);
+            out.extend(extra.iter().cloned());
+            dedupe_preserve_order(out)
+        }
+        ZenDangerPaths::Override(custom) => custom.clone(),
     }
 }
 
@@ -994,6 +1087,7 @@ pub fn validate_agent_id(s: &str) -> crate::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::WorkflowZenConfig;
 
     #[test]
     fn agent_id_validation() {
@@ -2143,5 +2237,198 @@ git:
         // `ff_only` isn't a known variant — serde must reject so a typo
         // doesn't silently fall back to `Squash`.
         assert!(serde_yaml::from_str::<Project>(yaml).is_err());
+    }
+
+    // ---- Per-workflow zen resolution helpers ------------------------------
+    //
+    // `checks_for_task_in_workflow`, `ci_timeout_for_workflow`,
+    // `danger_paths_for_workflow` collapse the three-layer hierarchy
+    // (project → workflow → task) into a single resolved value per call
+    // site. The contract these tests pin down: workflow override wins
+    // over project default; per-task override wins over both for the
+    // check list; workflow-omitted resolution is identical to passing
+    // `None`.
+
+    fn workflow_with_zen(zen: WorkflowZenConfig) -> crate::Workflow {
+        let mut wf = crate::default_workflow();
+        wf.zen = Some(zen);
+        wf
+    }
+
+    #[test]
+    fn ci_timeout_for_workflow_uses_workflow_override_when_set() {
+        let project = project_with_zen(ZenConfig::default());
+        let wf = workflow_with_zen(WorkflowZenConfig {
+            ci_timeout: Some(Duration::from_secs(60)),
+            ..Default::default()
+        });
+        assert_eq!(
+            ci_timeout_for_workflow(&project, Some(&wf)),
+            Duration::from_secs(60)
+        );
+    }
+
+    #[test]
+    fn ci_timeout_for_workflow_falls_back_to_project_when_unset() {
+        let project = project_with_zen(ZenConfig {
+            ci_timeout: Duration::from_secs(1234),
+            ..Default::default()
+        });
+        let wf = workflow_with_zen(WorkflowZenConfig::default());
+        assert_eq!(
+            ci_timeout_for_workflow(&project, Some(&wf)),
+            Duration::from_secs(1234)
+        );
+        // None-workflow is the same as a workflow with no zen overrides.
+        assert_eq!(
+            ci_timeout_for_workflow(&project, None),
+            Duration::from_secs(1234)
+        );
+    }
+
+    #[test]
+    fn danger_paths_for_workflow_extend_appends_to_resolved_project_list() {
+        let project = project_with_zen(ZenConfig {
+            danger_paths: ZenDangerPaths::Extend(vec!["site/public/install.sh".into()]),
+            ..Default::default()
+        });
+        let wf = workflow_with_zen(WorkflowZenConfig {
+            danger_paths: Some(ZenDangerPaths::Extend(vec!["fixtures/**".into()])),
+            ..Default::default()
+        });
+        let resolved = danger_paths_for_workflow(&project, Some(&wf));
+        // Builtins still present + project extend + workflow extend, in
+        // that order, with dedupe preserving first occurrence.
+        assert!(resolved.iter().any(|p| p == ".github/workflows/**"));
+        assert!(resolved.iter().any(|p| p == "site/public/install.sh"));
+        assert!(resolved.iter().any(|p| p == "fixtures/**"));
+    }
+
+    #[test]
+    fn danger_paths_for_workflow_override_replaces_everything() {
+        // The project may have a wide list with builtins; an `override:`
+        // at the workflow level wins outright.
+        let project = project_with_zen(ZenConfig {
+            danger_paths: ZenDangerPaths::Extend(vec!["site/public/install.sh".into()]),
+            ..Default::default()
+        });
+        let wf = workflow_with_zen(WorkflowZenConfig {
+            danger_paths: Some(ZenDangerPaths::Override(vec!["config/**".into()])),
+            ..Default::default()
+        });
+        let resolved = danger_paths_for_workflow(&project, Some(&wf));
+        assert_eq!(resolved, vec!["config/**".to_string()]);
+    }
+
+    #[test]
+    fn danger_paths_for_workflow_falls_back_when_workflow_lacks_override() {
+        let project = project_with_zen(ZenConfig {
+            danger_paths: ZenDangerPaths::Override(vec!["just/this".into()]),
+            ..Default::default()
+        });
+        let wf = workflow_with_zen(WorkflowZenConfig::default());
+        // Workflow has no danger_paths override → project's resolved list
+        // wins. `Override` mode at the project level means the list IS
+        // exactly the user's, no builtins.
+        let resolved = danger_paths_for_workflow(&project, Some(&wf));
+        assert_eq!(resolved, vec!["just/this".to_string()]);
+        // None-workflow matches Some(workflow-with-no-override).
+        assert_eq!(danger_paths_for_workflow(&project, None), resolved);
+    }
+
+    #[test]
+    fn checks_for_task_in_workflow_uses_workflow_checks_when_set() {
+        let project = project_with_zen(ZenConfig {
+            checks: ZenChecks {
+                local: vec!["cargo test".into()],
+            },
+            ..Default::default()
+        });
+        let wf = workflow_with_zen(WorkflowZenConfig {
+            checks: Some(ZenChecks {
+                local: vec!["pytest -q".into()],
+            }),
+            ..Default::default()
+        });
+        let task = task_with_zen(None);
+        assert_eq!(
+            checks_for_task_in_workflow(&project, Some(&wf), &task),
+            vec!["pytest -q".to_string()]
+        );
+    }
+
+    #[test]
+    fn checks_for_task_only_replaces_workflow_base() {
+        // `checks_only` on the task wins over both project AND workflow
+        // base lists.
+        let project = project_with_zen(ZenConfig {
+            checks: ZenChecks {
+                local: vec!["cargo test".into()],
+            },
+            ..Default::default()
+        });
+        let wf = workflow_with_zen(WorkflowZenConfig {
+            checks: Some(ZenChecks {
+                local: vec!["pytest -q".into()],
+            }),
+            ..Default::default()
+        });
+        let task = task_with_zen(Some(TaskZenConfig {
+            enabled: None,
+            checks_only: vec!["just this one".into()],
+            checks_additional: vec![],
+        }));
+        assert_eq!(
+            checks_for_task_in_workflow(&project, Some(&wf), &task),
+            vec!["just this one".to_string()]
+        );
+    }
+
+    #[test]
+    fn checks_for_task_additional_extends_workflow_base() {
+        let project = project_with_zen(ZenConfig {
+            checks: ZenChecks {
+                local: vec!["cargo test".into()],
+            },
+            ..Default::default()
+        });
+        let wf = workflow_with_zen(WorkflowZenConfig {
+            checks: Some(ZenChecks {
+                local: vec!["pytest -q".into()],
+            }),
+            ..Default::default()
+        });
+        let task = task_with_zen(Some(TaskZenConfig {
+            enabled: None,
+            checks_only: vec![],
+            checks_additional: vec!["npm test".into()],
+        }));
+        assert_eq!(
+            checks_for_task_in_workflow(&project, Some(&wf), &task),
+            vec!["pytest -q".to_string(), "npm test".to_string()],
+            "workflow checks form the base, per-task additional appended"
+        );
+    }
+
+    #[test]
+    fn checks_for_task_no_workflow_matches_legacy_helper() {
+        // Passing `None` for the workflow must produce the exact same
+        // list as the older `checks_for_task` helper — call sites that
+        // haven't migrated yet need that invariant.
+        let project = project_with_zen(ZenConfig {
+            checks: ZenChecks {
+                local: vec!["cargo test".into(), "cargo clippy".into()],
+            },
+            ..Default::default()
+        });
+        let task = task_with_zen(Some(TaskZenConfig {
+            enabled: None,
+            checks_additional: vec!["npm test".into()],
+            checks_only: vec![],
+        }));
+        assert_eq!(
+            checks_for_task_in_workflow(&project, None, &task),
+            checks_for_task(&project, &task),
+        );
     }
 }

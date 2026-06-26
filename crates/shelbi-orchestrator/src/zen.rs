@@ -23,8 +23,8 @@ use std::time::{Duration, Instant};
 use globset::{Glob, GlobSetBuilder};
 use serde::Serialize;
 use shelbi_core::{
-    checks_for_task, danger_paths_for_project, Column, Error, Host, Machine, Project, Result,
-    Task, WorkerSpec,
+    checks_for_task_in_workflow, danger_paths_for_workflow, Column, Error, Host, Machine, Project,
+    Result, Task, WorkerSpec, Workflow,
 };
 
 use crate::git::{
@@ -412,7 +412,30 @@ pub struct ProbeReport {
 /// not against the hub's parent repo. This matters for remote workers: the
 /// branch only exists in the remote worktree's git repo until it's
 /// pushed.
+///
+/// Legacy entry point (workflow-unaware) — calls
+/// [`probe_in_workflow`] with `workflow = None`. New callers should
+/// reach for the workflow-aware form so per-workflow `zen:` overrides
+/// (checks, danger_paths) take effect.
 pub fn probe(project: &Project, task: &Task, branch: &str) -> Result<ProbeReport> {
+    probe_in_workflow(project, None, task, branch)
+}
+
+/// Run every primitive for `task` on `branch`, threading `workflow`
+/// through the per-workflow zen resolution helpers.
+///
+/// When `workflow` is `Some`, that workflow's `zen.checks` and
+/// `zen.danger_paths` shadow the project-level defaults (see
+/// [`shelbi_core::checks_for_task_in_workflow`] and
+/// [`shelbi_core::danger_paths_for_workflow`] for the exact rules).
+/// `None` matches legacy [`probe`] behavior — useful for callers that
+/// haven't migrated to workflow-aware lookups yet.
+pub fn probe_in_workflow(
+    project: &Project,
+    workflow: Option<&Workflow>,
+    task: &Task,
+    branch: &str,
+) -> Result<ProbeReport> {
     let (machine, worker) = resolve_worker(project, task)?;
     let host = machine.host();
     let worktree = worker_worktree(&machine, worker);
@@ -420,8 +443,8 @@ pub fn probe(project: &Project, task: &Task, branch: &str) -> Result<ProbeReport
     let base = project.base_branch();
     let merge_conflict = probe_merge_conflict(&host, &worktree, branch, base)?;
     let diff_size = probe_diff_size(&host, &worktree, branch, base)?;
-    let danger_paths = probe_danger_paths(project, &host, &worktree, branch)?;
-    let local_checks = probe_local_checks(&host, &worktree, project, task)?;
+    let danger_paths = probe_danger_paths(project, workflow, &host, &worktree, branch)?;
+    let local_checks = probe_local_checks(&host, &worktree, project, workflow, task)?;
 
     Ok(ProbeReport {
         local_checks,
@@ -461,9 +484,10 @@ fn probe_local_checks(
     host: &Host,
     worktree: &std::path::Path,
     project: &Project,
+    workflow: Option<&Workflow>,
     task: &Task,
 ) -> Result<Vec<LocalCheck>> {
-    let commands = checks_for_task(project, task);
+    let commands = checks_for_task_in_workflow(project, workflow, task);
     if commands.is_empty() {
         return Ok(Vec::new());
     }
@@ -721,11 +745,12 @@ fn strip_suffix_then_parse(s: &str, suffix: &str) -> Option<usize> {
 
 fn probe_danger_paths(
     project: &Project,
+    workflow: Option<&Workflow>,
     host: &Host,
     worktree: &std::path::Path,
     branch: &str,
 ) -> Result<DangerPaths> {
-    let patterns = danger_paths_for_project(project);
+    let patterns = danger_paths_for_workflow(project, workflow);
     if patterns.is_empty() {
         return Ok(DangerPaths::default());
     }
@@ -1615,6 +1640,17 @@ impl DryRunAction {
 /// effort: a probe that errors is surfaced as a `BlockMerge` decision
 /// labelled `probe-failed` so the user still sees the task, rather than
 /// silently dropping it.
+///
+/// The merge bar is **action-based**: for each task in `Review`, we
+/// look up the task's workflow and apply the bar only when the
+/// workflow declares a `merge` action on an outgoing transition from
+/// the task's current status. A workflow with no `transitions:` block
+/// at all (e.g., the migrated `default.yaml` on existing projects) falls
+/// back to the legacy "Review fires the bar" semantic — see
+/// [`Workflow::fires_merge_bar`]. Tasks in workflows whose transitions
+/// explicitly *don't* declare merge (a pure-bookkeeping research
+/// workflow, say) sit in `Review` without ever tripping the dry-run
+/// preview.
 pub fn dry_run_tick(project: &Project) -> Result<Vec<DryRunDecision>> {
     let mut decisions = Vec::new();
 
@@ -1630,15 +1666,28 @@ pub fn dry_run_tick(project: &Project) -> Result<Vec<DryRunDecision>> {
         });
     }
 
-    // 2. Review-column probes — apply the default mechanical bar.
+    // 2. Review-column probes — action-based bar gated by the task's
+    //    workflow.
     let review_tasks = shelbi_state::list_column(&project.name, Column::Review)?;
     for tf in review_tasks {
+        let workflow = load_task_workflow(&project.name, &tf.task);
+        let workflow_ref = workflow.as_ref();
+        let status_name = tf.task.column.default_status_name();
+        let fires_bar = workflow_ref
+            .map(|w| w.fires_merge_bar(status_name))
+            .unwrap_or(true);
+        if !fires_bar {
+            // Workflow explicitly declares transitions but none from this
+            // status fire `merge` — skip silently. The task lives in this
+            // workflow for bookkeeping only.
+            continue;
+        }
         let branch = tf
             .task
             .branch
             .clone()
             .unwrap_or_else(|| format!("shelbi/{}", tf.task.id));
-        match probe(project, &tf.task, &branch) {
+        match probe_in_workflow(project, workflow_ref, &tf.task, &branch) {
             Ok(report) => {
                 decisions.push(evaluate_probe(&tf.task.id, &report));
             }
@@ -1657,6 +1706,17 @@ pub fn dry_run_tick(project: &Project) -> Result<Vec<DryRunDecision>> {
     }
 
     Ok(decisions)
+}
+
+/// Best-effort load of a task's workflow definition. Returns `None`
+/// when the workflow file can't be read or fails validation — the
+/// caller should treat that as "fall back to project-level config".
+/// Loading is best-effort because the dry-run loop runs against live
+/// state, and a transient typo in a workflow YAML shouldn't kill the
+/// whole preview pass for unrelated tasks.
+fn load_task_workflow(project: &str, task: &Task) -> Option<Workflow> {
+    let name = task.workflow_or_default();
+    shelbi_state::load_workflow(project, name).ok()
 }
 
 /// Apply the default merge-conditions bar to a probe report. Returns a
