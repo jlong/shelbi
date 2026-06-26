@@ -42,9 +42,9 @@ use chrono::{DateTime, Utc};
 
 use shelbi_core::{Column, Project};
 use shelbi_state::{
-    append_contextstore_event, append_heartbeat_event, append_worker_event, events_log_path,
-    load_worker_status, parse_pane_title_marker, save_worker_status, PaneMarker, WorkerState,
-    WorkerStatus,
+    append_contextstore_event, append_heartbeat_event, append_rebase_event, append_worker_event,
+    events_log_path, load_worker_status, parse_pane_title_marker, save_worker_status, PaneMarker,
+    WorkerState, WorkerStatus,
 };
 
 /// Spawned poller handle. Dropping it asks the thread to exit and joins it.
@@ -430,6 +430,19 @@ fn maybe_promote_to_review(
             if tf.task.column == Column::InProgress
                 && tf.task.assigned_to.as_deref() == Some(worker.name.as_str()) =>
         {
+            // Auto-rebase the worker's branch onto the project's default
+            // branch before the column move. The goal is to absorb any
+            // prereq commits that landed on main while the worker was
+            // working, so the human reviewer sees a single clean diff
+            // instead of having to drop into the worktree and run the
+            // rebase + force-push by hand. We do this BEFORE the column
+            // move (rather than blocking on it) so the row showing up in
+            // `review` already reflects the rewritten branch; a conflict
+            // is logged but doesn't block the promotion — the human still
+            // wants to see the work in review and resolve the conflict
+            // during the review checkout.
+            rebase_worker_branch_before_review(project, worker, machine, host, &task_id);
+
             match shelbi_state::move_task(&project.name, &task_id, Column::Review) {
                 Ok(Some((from, to, workflow))) => {
                     if let Err(e) = shelbi_state::append_task_event(
@@ -469,6 +482,82 @@ fn maybe_promote_to_review(
 
     if let Err(e) = shelbi_orchestrator::worker::clear_review_marker(host, &marker) {
         tracing::warn!(worker = %worker.name, error = %e, "clear_review_marker failed");
+    }
+}
+
+/// Resolve the worker's branch for the in-progress task and rebase it onto
+/// the project's default branch. Records one `rebase` line in `events.log`
+/// describing the outcome (ok / up-to-date / conflict / skipped). Never
+/// blocks the calling review promotion — failures here are advisory.
+///
+/// `branch` falls back to the conventional `shelbi/<task-id>` when the task
+/// frontmatter doesn't pin one explicitly; that mirrors `start_review`.
+fn rebase_worker_branch_before_review(
+    project: &Project,
+    worker: &shelbi_core::WorkerSpec,
+    machine: &shelbi_core::Machine,
+    host: &shelbi_core::Host,
+    task_id: &str,
+) {
+    let task_file = match shelbi_state::load_task(&project.name, task_id) {
+        Ok(tf) => tf,
+        Err(e) => {
+            tracing::debug!(worker = %worker.name, task = %task_id, error = %e, "skip rebase: load_task failed");
+            return;
+        }
+    };
+    let branch = task_file
+        .task
+        .branch
+        .clone()
+        .unwrap_or_else(|| format!("shelbi/{task_id}"));
+
+    let worktree = shelbi_orchestrator::worker::worker_worktree(machine, worker);
+    let outcome = shelbi_orchestrator::worker::rebase_worker_branch_onto_default(
+        host,
+        &worktree,
+        &project.default_branch,
+    );
+
+    let status = outcome.status_token();
+    let detail = outcome.detail();
+    if let Err(e) = append_rebase_event(task_id, &worker.name, &branch, status, &detail) {
+        tracing::warn!(
+            worker = %worker.name,
+            task = %task_id,
+            error = %e,
+            "append_rebase_event failed",
+        );
+    }
+    match &outcome {
+        shelbi_orchestrator::worker::RebaseOutcome::Conflict { .. } => {
+            tracing::warn!(
+                worker = %worker.name,
+                task = %task_id,
+                branch = %branch,
+                detail = %detail,
+                "auto-rebase onto default branch conflicted; worktree returned to pre-rebase state",
+            );
+        }
+        shelbi_orchestrator::worker::RebaseOutcome::Skipped { .. } => {
+            tracing::info!(
+                worker = %worker.name,
+                task = %task_id,
+                branch = %branch,
+                detail = %detail,
+                "auto-rebase skipped",
+            );
+        }
+        _ => {
+            tracing::info!(
+                worker = %worker.name,
+                task = %task_id,
+                branch = %branch,
+                status = %status,
+                detail = %detail,
+                "auto-rebase outcome",
+            );
+        }
     }
 }
 
@@ -762,10 +851,20 @@ mod tests {
         // The promotion must also append a `task=...` line to events.log
         // tagged with the marker-driven reason, so `shelbi events tail`
         // surfaces the handoff as part of the canonical event stream.
-        // Shape from `Plans/workflows.md` §10.
+        // Shape from `Plans/workflows.md` §10. We match on the canonical
+        // `<ts> task=<id> <from> -> <to>` shape so other event kinds that
+        // happen to mention the same task id (e.g. the auto-rebase line
+        // emitted just before the promotion) don't get counted as task
+        // transitions.
         let log = std::fs::read_to_string(shelbi_state::events_log_path().unwrap()).unwrap();
-        let task_lines: Vec<&str> =
-            log.lines().filter(|l| l.contains(" task=fix-login ")).collect();
+        let task_lines: Vec<&str> = log
+            .lines()
+            .filter(|l| {
+                let mut parts = l.splitn(3, ' ');
+                let _ts = parts.next();
+                parts.next() == Some("task=fix-login")
+            })
+            .collect();
         assert_eq!(task_lines.len(), 1, "log: {log:?}");
         assert!(
             task_lines[0].contains(" workflow=default "),
@@ -786,6 +885,37 @@ mod tests {
             task_lines[0].ends_with(" to_category=handoff"),
             "line: {}",
             task_lines[0]
+        );
+
+        // Auto-rebase also lands one line per promotion. In this test the
+        // work_dir isn't a real git repo, so the rebase short-circuits to
+        // `skipped`; the event still gets recorded so the user can tell
+        // from events.log whether the auto-rebase ran or punted.
+        let rebase_lines: Vec<&str> = log
+            .lines()
+            .filter(|l| {
+                let mut parts = l.splitn(3, ' ');
+                let _ts = parts.next();
+                parts.next() == Some("rebase")
+            })
+            .collect();
+        assert_eq!(rebase_lines.len(), 1, "log: {log:?}");
+        let rebase_line = rebase_lines[0];
+        assert!(
+            rebase_line.contains("task=fix-login"),
+            "line: {rebase_line}"
+        );
+        assert!(
+            rebase_line.contains("worker=alpha"),
+            "line: {rebase_line}"
+        );
+        assert!(
+            rebase_line.contains("branch=shelbi/fix-login"),
+            "line: {rebase_line}"
+        );
+        assert!(
+            rebase_line.contains("status=skipped"),
+            "expected skipped on a non-git work_dir, got: {rebase_line}"
         );
 
         // A leftover/stale marker naming a task that's no longer in-progress
