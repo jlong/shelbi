@@ -231,10 +231,12 @@ The built-in views on the right pane:
 
 - **Chat** — the orchestrator agent running in window 1. This is where you
   talk to shelbi.
-- **Tasks** — a 5-column Kanban (Backlog / Todo / In Progress / Review /
-  Done). `h/l` step columns, `j/k` step rows, `Enter` / `Space` opens
-  the card, `H/L` moves the selected card to the next column, `K/J`
-  reorders within a column, `r` refreshes.
+- **Tasks** — a Kanban board for the task's workflow. The default
+  workflow ships with Backlog / Todo / In Progress / Review / Done;
+  custom workflows can rename or split those into any sequence of
+  statuses. `h/l` step columns, `j/k` step rows, `Enter` / `Space`
+  opens the card, `H/L` moves the selected card to the next column,
+  `K/J` reorders within a column, `r` refreshes.
 - **Machines** — declared machines + their worker assignments and SSH
   health.
 - **Review** — a ratatui list of every task currently in the review
@@ -252,7 +254,8 @@ The built-in views on the right pane:
 | **Agent runner** | A pluggable CLI command shelbi knows how to launch (`claude`, `codex`, …). |
 | **Worker** | A named, persistent slot pinned to a machine and a runner. Picks up the next ready task and runs it in an isolated worktree. |
 | **Orchestrator** | The agent in window 1 you talk to. Creates tasks, dispatches workers via the `shelbi` CLI. |
-| **Task** | A markdown file in `~/.shelbi/projects/<name>/tasks/`. Moves through Backlog → Todo → In Progress → Review → Done. |
+| **Workflow** | A YAML schema that declares the statuses a task moves through and what happens on each transition. The default workflow is the canonical Backlog → Todo → In Progress → Review → Done; projects can drop additional workflow YAMLs alongside it. |
+| **Task** | A markdown file in `~/.shelbi/projects/<name>/tasks/`. Moves through its workflow's statuses (Backlog → Todo → In Progress → Review → Done in the default workflow). |
 
 ---
 
