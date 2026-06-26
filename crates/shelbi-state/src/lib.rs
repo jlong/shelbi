@@ -291,6 +291,13 @@ pub struct State {
     /// survives a respawn or project switch.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub worker_filter: Option<String>,
+    /// Persisted Kanban workflow filter — `None` means "All workflows"
+    /// (All-mode rendering). When set to a workflow name, the board
+    /// narrows to that workflow's columns only. Same lifecycle as
+    /// `worker_filter`: written by the dropdown commit path, read on
+    /// every refresh.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workflow_filter: Option<String>,
 }
 
 /// Tri-state Zen Mode toggle persisted in `state.json::zen_mode`.
@@ -481,6 +488,16 @@ pub fn set_zen_mode(project: &str, target: ZenModeState, source: &str) -> Result
 pub fn set_worker_filter(project: &str, filter: Option<&str>) -> Result<()> {
     let mut state = read_state(project)?;
     state.worker_filter = filter.map(|s| s.to_string());
+    write_state(project, &state)
+}
+
+/// Persist the Kanban workflow filter for `project`. `None` clears it
+/// back to "All workflows" (All-mode union rendering). Mirrors
+/// [`set_worker_filter`] — same merge-then-write pattern, no event log
+/// entry.
+pub fn set_workflow_filter(project: &str, filter: Option<&str>) -> Result<()> {
+    let mut state = read_state(project)?;
+    state.workflow_filter = filter.map(|s| s.to_string());
     write_state(project, &state)
 }
 

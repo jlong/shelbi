@@ -419,11 +419,15 @@ fn handle_kanban_key(app: &mut KanbanApp, code: KeyCode, mods: KeyModifiers) {
         return;
     }
 
-    // Worker filter dropdown is also modal — same precedence reason as
-    // the popover. Sits below the popover so a card detail open over
-    // the dropdown still routes input to the card view.
+    // Filter dropdowns are also modal — same precedence reason as the
+    // popover. Sits below the popover so a card detail open over the
+    // dropdown still routes input to the card view.
     if app.worker_dropdown_is_open() {
         handle_worker_dropdown_key(app, code);
+        return;
+    }
+    if app.workflow_dropdown_is_open() {
+        handle_workflow_dropdown_key(app, code);
         return;
     }
 
@@ -454,6 +458,7 @@ fn handle_kanban_key(app: &mut KanbanApp, code: KeyCode, mods: KeyModifiers) {
         KeyCode::Char('K') => app.reorder_up(),
         KeyCode::Char('J') => app.reorder_down(),
         KeyCode::Char('f') => app.toggle_worker_dropdown(),
+        KeyCode::Char('w') => app.toggle_workflow_dropdown(),
         KeyCode::Char('r') => app.refresh(),
         _ => {}
     }
@@ -486,6 +491,25 @@ fn handle_kanban_mouse(app: &mut KanbanApp, mouse: MouseEvent) {
                 // dismiss without changing the filter.
                 app.close_worker_dropdown();
             }
+            return;
+        }
+        if app.workflow_dropdown_is_open() {
+            if let Some(idx) = app.workflow_dropdown_option_at(mouse.column, mouse.row) {
+                if let Some(d) = app.workflow_dropdown.as_mut() {
+                    d.cursor = idx;
+                }
+                app.workflow_dropdown_select();
+            } else {
+                // Click on the chip → close. Click outside → close.
+                // Both paths collapse to the same dismiss behaviour;
+                // the chip branch exists only so the chip's click
+                // routes here instead of bubbling to a kanban card.
+                app.close_workflow_dropdown();
+            }
+            return;
+        }
+        if app.workflow_chip_at(mouse.column, mouse.row) {
+            app.open_workflow_dropdown();
             return;
         }
         if app.filter_chip_at(mouse.column, mouse.row) {
@@ -524,6 +548,19 @@ fn handle_worker_dropdown_key(app: &mut KanbanApp, code: KeyCode) {
         KeyCode::Down | KeyCode::Char('j') => app.dropdown_nav_down(),
         KeyCode::Enter | KeyCode::Char(' ') => app.dropdown_select(),
         KeyCode::Char('c') => app.dropdown_clear(),
+        _ => {}
+    }
+}
+
+/// Sibling of [`handle_worker_dropdown_key`] — same shape, `w` toggles
+/// the workflow dropdown so the same key opens and closes it.
+fn handle_workflow_dropdown_key(app: &mut KanbanApp, code: KeyCode) {
+    match code {
+        KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('w') => app.close_workflow_dropdown(),
+        KeyCode::Up | KeyCode::Char('k') => app.workflow_dropdown_nav_up(),
+        KeyCode::Down | KeyCode::Char('j') => app.workflow_dropdown_nav_down(),
+        KeyCode::Enter | KeyCode::Char(' ') => app.workflow_dropdown_select(),
+        KeyCode::Char('c') => app.workflow_dropdown_clear(),
         _ => {}
     }
 }

@@ -81,6 +81,34 @@ pub struct KanbanApp {
     /// vec, and the renderer walks it left-to-right. Rebuilt each
     /// refresh from [`KanbanApp::workflows`].
     pub all_columns: Vec<WorkflowColumn>,
+    /// Active workflow filter — `None` means "All workflows" (the union
+    /// All-mode view). When `Some(name)`, [`KanbanApp::all_columns`] is
+    /// narrowed to that single workflow's columns and tasks belonging
+    /// to other workflows drop out of the board. Persisted to
+    /// `state.json::workflow_filter` so the chip survives a respawn.
+    pub workflow_filter: Option<String>,
+    /// When `Some`, the workflow filter dropdown is open. Same
+    /// modal-cursor shape as [`KanbanApp::worker_dropdown`] — selection
+    /// commits on Enter / click.
+    pub workflow_dropdown: Option<WorkflowDropdown>,
+    /// Screen-space rect of the workflow filter chip in the title row,
+    /// captured each frame by the renderer so a click on the chip can
+    /// open the dropdown without keyboard.
+    pub workflow_chip_hit: Option<Rect>,
+    /// Hit-test entries for the open workflow dropdown's option rows.
+    /// Empty when the dropdown is closed.
+    pub workflow_dropdown_hits: Vec<DropdownHit>,
+    /// Leftmost visible column index. Stays at 0 unless the full
+    /// `all_columns` list can't fit at minimum width — then the renderer
+    /// scrolls horizontally to keep the selected column on screen.
+    /// Tracked on the app (not the renderer) so frames stay stable as
+    /// selection moves.
+    pub column_scroll: usize,
+    /// Last-rendered horizontal scroll window: the slice of
+    /// `all_columns` that was actually drawn this frame, recorded so
+    /// selection-driven scrolling can ask "is the selected column
+    /// currently visible?" without redoing the layout pass.
+    pub visible_columns: std::ops::Range<usize>,
 }
 
 /// Worker filter applied to the visible cards. Separate from the
@@ -157,6 +185,30 @@ pub struct WorkerDropdown {
     /// [`KanbanApp::open_worker_dropdown`] seeds it from the active
     /// filter and the nav methods clamp.
     pub cursor: usize,
+}
+
+/// State carried while the workflow filter dropdown is open. Mirrors
+/// [`WorkerDropdown`] — just a cursor — but split into its own struct
+/// so the two dropdowns can't be confused at the call site and so a
+/// future workflow-only field (e.g. a filter substring) has somewhere
+/// to live.
+#[derive(Debug, Clone)]
+pub struct WorkflowDropdown {
+    /// Cursor row inside the workflow options list; seeded from the
+    /// active filter by [`KanbanApp::open_workflow_dropdown`].
+    pub cursor: usize,
+}
+
+/// One entry rendered in the workflow filter dropdown. `None` is the
+/// "All workflows" reset row; `Some(name)` filters the board to that
+/// workflow's columns.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkflowDropdownOption {
+    pub filter: Option<String>,
+    /// How many tasks currently sit in this workflow (or the whole
+    /// board, for the `All` row). Computed at render time against the
+    /// unfiltered tasks slice so an empty workflow can still be picked.
+    pub count: usize,
 }
 
 /// One option row's hit-test rect. Captured each frame by the dropdown
@@ -238,6 +290,12 @@ impl KanbanApp {
             dropdown_hits: Vec::new(),
             workflows: vec![default],
             all_columns,
+            workflow_filter: None,
+            workflow_dropdown: None,
+            workflow_chip_hit: None,
+            workflow_dropdown_hits: Vec::new(),
+            column_scroll: 0,
+            visible_columns: 0..0,
         }
     }
 
@@ -408,10 +466,14 @@ impl KanbanApp {
         // Filter is purely view state — a missing / unreadable
         // state.json falls back to "All" silently. Reload every tick so
         // a CLI or palette edit shows up without a respawn.
-        self.worker_filter = shelbi_state::read_state(&self.project_name)
-            .ok()
-            .and_then(|s| s.worker_filter)
+        let state_snapshot = shelbi_state::read_state(&self.project_name).ok();
+        self.worker_filter = state_snapshot
+            .as_ref()
+            .and_then(|s| s.worker_filter.clone())
             .map(|s| WorkerFilter::from_disk(&s));
+        self.workflow_filter = state_snapshot
+            .as_ref()
+            .and_then(|s| s.workflow_filter.clone());
         // Workflows drive the All-mode column layout. A broken
         // `workflows/<name>.yaml` surfaces as a status_line warning and
         // we fall back to the canonical default so the board still
@@ -424,7 +486,7 @@ impl KanbanApp {
                 vec![default_workflow()]
             }
         };
-        self.all_columns = workflow_columns(&self.workflows);
+        self.all_columns = self.compute_all_columns();
         match shelbi_state::list_tasks(&self.project_name) {
             Ok(tasks) => {
                 self.tasks = tasks;
@@ -566,6 +628,209 @@ impl KanbanApp {
     pub fn dropdown_clear(&mut self) {
         self.apply_filter(None);
         self.close_worker_dropdown();
+    }
+
+    // ----- workflow filter --------------------------------------------------
+
+    /// Build [`Self::all_columns`] honouring the active workflow
+    /// filter. With no filter set this is the union across every loaded
+    /// workflow (the All-mode behaviour). With a filter set, only that
+    /// workflow's columns participate — if the filter targets a
+    /// workflow that no longer exists in `self.workflows`, the columns
+    /// fall back to the union so the board doesn't go blank and the
+    /// user can still see the chip to clear it.
+    fn compute_all_columns(&self) -> Vec<WorkflowColumn> {
+        let filtered: Vec<&Workflow> = match &self.workflow_filter {
+            Some(name) => self.workflows.iter().filter(|w| &w.name == name).collect(),
+            None => self.workflows.iter().collect(),
+        };
+        if filtered.is_empty() {
+            // Filter doesn't match any loaded workflow — degrade to the
+            // unfiltered union so the user keeps a usable board.
+            return workflow_columns_from_refs(&self.workflows.iter().collect::<Vec<_>>());
+        }
+        workflow_columns_from_refs(&filtered)
+    }
+
+    /// Options for the workflow dropdown: `All` (count = all tasks),
+    /// then each loaded workflow with its task count. A workflow with
+    /// zero matching tasks still appears so the user can pick it (the
+    /// scaffolding behaviour the worker dropdown uses for the same
+    /// reason).
+    pub fn workflow_dropdown_options(&self) -> Vec<WorkflowDropdownOption> {
+        let mut opts: Vec<WorkflowDropdownOption> =
+            Vec::with_capacity(self.workflows.len() + 1);
+        opts.push(WorkflowDropdownOption {
+            filter: None,
+            count: self.tasks.len(),
+        });
+        for w in &self.workflows {
+            let count = self
+                .tasks
+                .iter()
+                .filter(|tf| tf.task.workflow_or_default() == w.name)
+                .count();
+            opts.push(WorkflowDropdownOption {
+                filter: Some(w.name.clone()),
+                count,
+            });
+        }
+        opts
+    }
+
+    fn current_workflow_filter_idx(&self, opts: &[WorkflowDropdownOption]) -> usize {
+        opts.iter()
+            .position(|o| o.filter == self.workflow_filter)
+            .unwrap_or(0)
+    }
+
+    pub fn workflow_dropdown_is_open(&self) -> bool {
+        self.workflow_dropdown.is_some()
+    }
+
+    pub fn open_workflow_dropdown(&mut self) {
+        let opts = self.workflow_dropdown_options();
+        let cursor = self.current_workflow_filter_idx(&opts);
+        self.workflow_dropdown = Some(WorkflowDropdown { cursor });
+    }
+
+    pub fn close_workflow_dropdown(&mut self) {
+        self.workflow_dropdown = None;
+    }
+
+    pub fn toggle_workflow_dropdown(&mut self) {
+        if self.workflow_dropdown_is_open() {
+            self.close_workflow_dropdown();
+        } else {
+            self.open_workflow_dropdown();
+        }
+    }
+
+    pub fn workflow_dropdown_nav_up(&mut self) {
+        let n = self.workflow_dropdown_options().len();
+        if n == 0 {
+            return;
+        }
+        if let Some(d) = self.workflow_dropdown.as_mut() {
+            d.cursor = if d.cursor == 0 { n - 1 } else { d.cursor - 1 };
+        }
+    }
+
+    pub fn workflow_dropdown_nav_down(&mut self) {
+        let n = self.workflow_dropdown_options().len();
+        if n == 0 {
+            return;
+        }
+        if let Some(d) = self.workflow_dropdown.as_mut() {
+            d.cursor = (d.cursor + 1) % n;
+        }
+    }
+
+    pub fn workflow_dropdown_select(&mut self) {
+        let opts = self.workflow_dropdown_options();
+        let Some(d) = self.workflow_dropdown.as_ref() else {
+            return;
+        };
+        let Some(opt) = opts.get(d.cursor) else {
+            self.close_workflow_dropdown();
+            return;
+        };
+        self.apply_workflow_filter(opt.filter.clone());
+        self.close_workflow_dropdown();
+    }
+
+    pub fn workflow_dropdown_clear(&mut self) {
+        self.apply_workflow_filter(None);
+        self.close_workflow_dropdown();
+    }
+
+    /// Persist `filter` as the active workflow filter, rebuild
+    /// `all_columns`, and clamp selection so it lands on an existing
+    /// column after the layout shrinks. Mirrors [`apply_filter`] for
+    /// the worker filter.
+    fn apply_workflow_filter(&mut self, filter: Option<String>) {
+        self.workflow_filter = filter.clone();
+        if let Err(e) =
+            shelbi_state::set_workflow_filter(&self.project_name, filter.as_deref())
+        {
+            self.status_line = format!("workflow filter persist failed: {e}");
+        }
+        self.all_columns = self.compute_all_columns();
+        // Selection may sit past the new column count — clamp before
+        // the next render reads it. Selection-driven scroll updates
+        // happen on the next render pass.
+        let last = self.all_columns.len().saturating_sub(1);
+        if self.selected_column > last {
+            self.selected_column = last;
+        }
+        self.column_scroll = 0;
+        self.clamp_selection();
+        self.status_line = match &self.workflow_filter {
+            None => "workflow: all".to_string(),
+            Some(w) => format!("workflow: {w}"),
+        };
+    }
+
+    pub fn workflow_dropdown_option_at(&self, x: u16, y: u16) -> Option<usize> {
+        self.workflow_dropdown_hits.iter().find_map(|hit| {
+            let r = hit.area;
+            let in_x = x >= r.x && x < r.x.saturating_add(r.width);
+            let in_y = y >= r.y && y < r.y.saturating_add(r.height);
+            (in_x && in_y).then_some(hit.option_idx)
+        })
+    }
+
+    pub fn workflow_chip_at(&self, x: u16, y: u16) -> bool {
+        match self.workflow_chip_hit {
+            Some(r) => {
+                let in_x = x >= r.x && x < r.x.saturating_add(r.width);
+                let in_y = y >= r.y && y < r.y.saturating_add(r.height);
+                in_x && in_y
+            }
+            None => false,
+        }
+    }
+
+    /// Adjust [`Self::column_scroll`] so the selected column will be
+    /// inside the next render's visible window. Called by `render_full`
+    /// before the layout pass with the actual area width.
+    ///
+    /// Two passes — first widen leftward (scroll left if the selection
+    /// fell off the left edge), then widen rightward (scroll right if
+    /// the selection won't fit in the current window). Together they
+    /// keep `column_scroll <= selected_column < scroll + visible_len`.
+    pub fn ensure_selected_visible(&mut self, area_w: u16) {
+        if self.all_columns.is_empty() {
+            self.column_scroll = 0;
+            return;
+        }
+        let sel = self.selected_column.min(self.all_columns.len() - 1);
+        if self.column_scroll > sel {
+            self.column_scroll = sel;
+        }
+        // Walk right: keep incrementing column_scroll until the
+        // selected column fits inside the window the layout pass will
+        // build. `compute_column_widths` is the source of truth for
+        // which columns fit, so we drive the loop with it.
+        let counts: Vec<usize> = (0..self.all_columns.len())
+            .map(|i| self.column_tasks(i).len())
+            .collect();
+        loop {
+            let widths =
+                compute_column_widths(&self.all_columns, &counts, self.column_scroll, area_w);
+            let last_visible = widths.last().map(|(i, _)| *i);
+            match last_visible {
+                Some(idx) if sel <= idx => break,
+                Some(_) => {
+                    self.column_scroll = self.column_scroll.saturating_add(1);
+                    if self.column_scroll >= self.all_columns.len() {
+                        self.column_scroll = self.all_columns.len() - 1;
+                        break;
+                    }
+                }
+                None => break,
+            }
+        }
     }
 
     /// Map a screen coordinate to an option index in the open
@@ -825,6 +1090,11 @@ pub fn render_full(f: &mut Frame, app: &mut KanbanApp, area: Rect) {
 
     let mut hits: Vec<CardHit> = Vec::new();
     render_title(f, app, outer[0]);
+    // Selection-driven horizontal scroll: nudge the scroll offset so
+    // the selected column lands inside the visible window before the
+    // column-layout pass reads it. Done here (not in `nav_left/right`)
+    // so the layout has the final area width to work with.
+    app.ensure_selected_visible(outer[1].width);
     render_columns(f, app, &mut hits, outer[1]);
     render_footer(f, app, outer[2]);
     app.card_hits = hits;
@@ -840,6 +1110,11 @@ pub fn render_full(f: &mut Frame, app: &mut KanbanApp, area: Rect) {
         // without the dropdown.
         app.dropdown_hits.clear();
     }
+    if app.workflow_dropdown_is_open() {
+        render_workflow_dropdown(f, app, area);
+    } else {
+        app.workflow_dropdown_hits.clear();
+    }
 
     if app.popover_is_open() {
         render_popover(f, app, area);
@@ -847,25 +1122,44 @@ pub fn render_full(f: &mut Frame, app: &mut KanbanApp, area: Rect) {
 }
 
 fn render_title(f: &mut Frame, app: &mut KanbanApp, area: Rect) {
-    // Title row: project meta on the left, worker filter chip pinned
-    // to the right. We compute the chip text first so the left split
-    // knows exactly how many columns the chip will consume — the chip
-    // never wraps and never truncates.
+    // Title row: project meta on the left, filter chips pinned to the
+    // right. Two chips when there are multiple workflows loaded (so a
+    // workflow filter is meaningful); otherwise just the worker chip.
+    // Chip widths are precomputed so the left split knows exactly how
+    // many columns the chips will consume — chips never wrap.
     let total = app.tasks.len();
-    let chip_text = filter_chip_text(app);
-    let chip_w = chip_text.chars().count() as u16;
+    let worker_text = filter_chip_text(app);
+    let workflow_text = workflow_chip_text(app);
+    let show_workflow_chip = app.workflows.len() > 1;
+    let worker_w = worker_text.chars().count() as u16;
+    let workflow_w = workflow_text.chars().count() as u16;
+    let total_chip_w = if show_workflow_chip {
+        worker_w + workflow_w
+    } else {
+        worker_w
+    };
 
-    let (left_area, chip_area) = if area.width > chip_w {
+    let (left_area, workflow_area, worker_area) = if area.width > total_chip_w {
+        let mut constraints = Vec::with_capacity(3);
+        constraints.push(Constraint::Min(0));
+        if show_workflow_chip {
+            constraints.push(Constraint::Length(workflow_w));
+        }
+        constraints.push(Constraint::Length(worker_w));
         let chunks = Layout::default()
             .direction(Direction::Horizontal)
-            .constraints([Constraint::Min(0), Constraint::Length(chip_w)])
+            .constraints(constraints)
             .split(area);
-        (chunks[0], Some(chunks[1]))
+        if show_workflow_chip {
+            (chunks[0], Some(chunks[1]), Some(chunks[2]))
+        } else {
+            (chunks[0], None, Some(chunks[1]))
+        }
     } else {
-        // Title bar is too narrow to fit the chip — drop the chip and
-        // give all the space to the left. The dropdown is still
-        // reachable by hotkey; the chip is just a hint.
-        (area, None)
+        // Title bar is too narrow for the chips — drop them and give
+        // all the space to the left. Dropdowns remain reachable by
+        // hotkey; the chips are just a hint.
+        (area, None, None)
     };
 
     let left = Line::from(vec![
@@ -881,20 +1175,32 @@ fn render_title(f: &mut Frame, app: &mut KanbanApp, area: Rect) {
     ]);
     f.render_widget(Paragraph::new(left), left_area);
 
-    if let Some(chip_area) = chip_area {
-        let chip_style = if app.worker_filter.is_some() {
-            // Active filter — cyan to match the popover border + the
-            // sidebar's project header, so the eye notices the board is
-            // narrowed.
+    if let Some(area) = workflow_area {
+        let style = if app.workflow_filter.is_some() {
             Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)
         } else {
             Style::default().fg(Color::DarkGray)
         };
         f.render_widget(
-            Paragraph::new(Line::from(Span::styled(chip_text, chip_style))),
-            chip_area,
+            Paragraph::new(Line::from(Span::styled(workflow_text, style))),
+            area,
         );
-        app.filter_chip_hit = Some(chip_area);
+        app.workflow_chip_hit = Some(area);
+    } else {
+        app.workflow_chip_hit = None;
+    }
+
+    if let Some(area) = worker_area {
+        let style = if app.worker_filter.is_some() {
+            Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(Color::DarkGray)
+        };
+        f.render_widget(
+            Paragraph::new(Line::from(Span::styled(worker_text, style))),
+            area,
+        );
+        app.filter_chip_hit = Some(area);
     } else {
         app.filter_chip_hit = None;
     }
@@ -911,24 +1217,201 @@ fn filter_chip_text(app: &KanbanApp) -> String {
     format!(" Worker: {label} ▾")
 }
 
-fn render_columns(f: &mut Frame, app: &KanbanApp, hits: &mut Vec<CardHit>, area: Rect) {
-    // Equal-width columns across however many `(workflow, status)`
-    // pairs are loaded — `Ratio(1, n)` gives every slot the same
-    // fraction. Below ~10 col-wide slots things squeeze, but ratatui
-    // will still render, just less readable.
-    let n = app.all_columns.len().max(1) as u32;
-    let slots = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints(vec![Constraint::Ratio(1, n); n as usize])
-        .split(area);
-
-    let columns = app.task_columns();
-    let show_workflow_label = app.workflows.len() > 1;
-    for (i, slot) in slots.iter().enumerate() {
-        render_column(f, app, i, *slot, &columns, hits, show_workflow_label);
-    }
+/// Workflow filter chip text — sits left of the worker chip when more
+/// than one workflow is loaded. Identical shape to [`filter_chip_text`]
+/// so the two chips line up visually.
+fn workflow_chip_text(app: &KanbanApp) -> String {
+    let label = match &app.workflow_filter {
+        None => "All".to_string(),
+        Some(name) => name.clone(),
+    };
+    format!(" Workflow: {label} ▾")
 }
 
+fn render_columns(f: &mut Frame, app: &mut KanbanApp, hits: &mut Vec<CardHit>, area: Rect) {
+    // Layout pass: decide which columns are visible and how wide each
+    // gets. Two refinements over the previous equal-fraction layout:
+    //
+    //   1. **Collapse empty** — a column with zero matching cards
+    //      shrinks to a fixed minimum width so cards-bearing columns
+    //      get the screen real estate. Without this an All-mode board
+    //      across two workflows would slice the screen into many empty
+    //      lanes the eye has to scan past.
+    //
+    //   2. **Horizontal scroll** — when the minimum total width
+    //      overflows the available area, render only a window starting
+    //      at `column_scroll` and walk forward until the next column
+    //      no longer fits. Selection-driven scroll (run before this
+    //      pass) keeps the selected column inside that window.
+    if app.all_columns.is_empty() {
+        // Nothing to render — typically a stale workflow_filter that
+        // doesn't match any loaded workflow. The compute_all_columns
+        // fallback should keep us out of this branch in practice.
+        return;
+    }
+    let counts: Vec<usize> = (0..app.all_columns.len())
+        .map(|i| app.column_tasks(i).len())
+        .collect();
+    let widths = compute_column_widths(&app.all_columns, &counts, app.column_scroll, area.width);
+    let visible_start = app.column_scroll;
+    let visible_end = visible_start + widths.len();
+
+    let columns = app.task_columns();
+    // The workflow subscript only adds value when the rendered slice
+    // actually mixes workflows — narrowing to one workflow (via filter
+    // or via a single-workflow project) means every visible column
+    // already shares a workflow, so the subscript would be redundant.
+    let visible_workflows: std::collections::HashSet<&str> = app
+        .all_columns
+        .get(visible_start..visible_end)
+        .unwrap_or(&[])
+        .iter()
+        .map(|c| c.workflow.as_str())
+        .collect();
+    let show_workflow_label = visible_workflows.len() > 1;
+    let mut x = area.x;
+    for (i, w) in widths.iter().copied() {
+        let slot = Rect {
+            x,
+            y: area.y,
+            width: w,
+            height: area.height,
+        };
+        let collapsed = counts.get(i).copied().unwrap_or(0) == 0;
+        render_column(
+            f,
+            app,
+            i,
+            slot,
+            &columns,
+            hits,
+            show_workflow_label,
+            collapsed,
+        );
+        x = x.saturating_add(w);
+    }
+
+    // Tiny horizontal-scroll indicators painted in the topmost row of
+    // the columns area when the board can't fit everything at minimum
+    // width. Anchored to the visible window's edges, not the area, so
+    // the user can tell which side they can scroll toward.
+    if visible_start > 0 {
+        let glyph = Span::styled(
+            "◂",
+            Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+        );
+        let pos = Rect {
+            x: area.x,
+            y: area.y,
+            width: 1,
+            height: 1,
+        };
+        f.render_widget(Paragraph::new(Line::from(glyph)), pos);
+    }
+    if visible_end < app.all_columns.len() {
+        let glyph = Span::styled(
+            "▸",
+            Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+        );
+        let pos = Rect {
+            x: area.x.saturating_add(area.width).saturating_sub(1),
+            y: area.y,
+            width: 1,
+            height: 1,
+        };
+        f.render_widget(Paragraph::new(Line::from(glyph)), pos);
+    }
+
+    app.visible_columns = visible_start..visible_end;
+}
+
+/// Minimum width for a non-empty column — enough to fit the canonical
+/// `IN PROGRESS (NN)` header without clipping plus the 2-char right
+/// gutter cards rely on.
+const NONEMPTY_MIN_W: u16 = 14;
+/// Minimum width for a collapsed (empty) column — wide enough for the
+/// status label's first few letters plus the `(0)` count, so the user
+/// can still tell what each lane is.
+const EMPTY_MIN_W: u16 = 8;
+
+/// Lay out `[scroll, scroll + k)` of `columns` into `area_w` columns of
+/// terminal cells. Returns `(col_idx, width)` pairs in render order.
+///
+/// Two-pass algorithm:
+///
+/// 1. **Fit pass** — walk forward from `scroll`, assigning each column
+///    its minimum width (empty → `EMPTY_MIN_W`, non-empty →
+///    `NONEMPTY_MIN_W`). Stop as soon as adding the next column would
+///    push past `area_w`.
+///
+/// 2. **Expand pass** — divide whatever slack remains among the
+///    non-empty visible columns. Empty columns stay at the minimum so
+///    they don't reclaim space the user said is "uninteresting".
+///
+/// At least one column always renders, even if it doesn't reach its
+/// minimum — better to clip than to paint nothing at all.
+fn compute_column_widths(
+    columns: &[WorkflowColumn],
+    counts: &[usize],
+    scroll: usize,
+    area_w: u16,
+) -> Vec<(usize, u16)> {
+    let mut out: Vec<(usize, u16)> = Vec::new();
+    if columns.is_empty() || area_w == 0 {
+        return out;
+    }
+    let start = scroll.min(columns.len().saturating_sub(1));
+    let mut used: u16 = 0;
+    for i in start..columns.len() {
+        let min_w = if counts.get(i).copied().unwrap_or(0) == 0 {
+            EMPTY_MIN_W
+        } else {
+            NONEMPTY_MIN_W
+        };
+        let next_used = used.saturating_add(min_w);
+        if next_used > area_w {
+            if out.is_empty() {
+                // Render at least one column even if it overflows —
+                // empty board with `area_w < EMPTY_MIN_W` only happens
+                // in tiny test terminals.
+                out.push((i, area_w));
+                used = area_w;
+            }
+            break;
+        }
+        out.push((i, min_w));
+        used = next_used;
+    }
+    // Expand pass: hand slack to non-empty columns.
+    let slack = area_w.saturating_sub(used);
+    let non_empty_positions: Vec<usize> = out
+        .iter()
+        .enumerate()
+        .filter(|(_, (idx, _))| counts.get(*idx).copied().unwrap_or(0) > 0)
+        .map(|(pos, _)| pos)
+        .collect();
+    let grow_targets = if non_empty_positions.is_empty() {
+        // Nothing is non-empty in the visible window — share the slack
+        // across every visible column so we don't leave a gap on the
+        // right.
+        (0..out.len()).collect::<Vec<_>>()
+    } else {
+        non_empty_positions
+    };
+    if !grow_targets.is_empty() && slack > 0 {
+        let n = grow_targets.len() as u16;
+        let bonus = slack / n;
+        let remainder = (slack % n) as usize;
+        for (n_idx, &pos) in grow_targets.iter().enumerate() {
+            out[pos].1 = out[pos]
+                .1
+                .saturating_add(bonus + if n_idx < remainder { 1 } else { 0 });
+        }
+    }
+    out
+}
+
+#[allow(clippy::too_many_arguments)]
 fn render_column(
     f: &mut Frame,
     app: &KanbanApp,
@@ -937,6 +1420,7 @@ fn render_column(
     columns: &HashMap<String, Column>,
     hits: &mut Vec<CardHit>,
     show_workflow_label: bool,
+    collapsed: bool,
 ) {
     let column = app.column(col_idx).clone();
     let tasks = app.column_tasks(col_idx);
@@ -950,8 +1434,16 @@ fn render_column(
     } else {
         Style::default().fg(header_color)
     };
+    // Collapsed columns truncate the canonical label hard so the
+    // narrow slot can still tell the user which lane it is. Non-empty
+    // columns get the full label.
+    let header_text = if collapsed {
+        truncate(&column_label(&column.status_name), area.width.saturating_sub(4) as usize)
+    } else {
+        column_label(&column.status_name)
+    };
     let title_line = Line::from(vec![
-        Span::styled(column_label(&column.status_name), header_style),
+        Span::styled(header_text, header_style),
         Span::styled(
             format!(" ({})", tasks.len()),
             Style::default().fg(Color::DarkGray),
@@ -1092,7 +1584,7 @@ fn render_column(
 
 fn render_footer(f: &mut Frame, app: &KanbanApp, area: Rect) {
     let keys = Line::from(Span::styled(
-        "  h/l col   j/k row   enter/␣ open   H/L move col   K/J reorder   f filter   r refresh",
+        "  h/l col   j/k row   enter/␣ open   H/L move col   K/J reorder   w workflow   f filter   r refresh",
         Style::default().fg(Color::DarkGray),
     ));
     let status = if app.status_line.is_empty() {
@@ -1241,6 +1733,128 @@ fn dropdown_row_text(opt: &DropdownOption) -> String {
     format!("{} ({})", label, opt.count)
 }
 
+/// Workflow filter dropdown — same anchor logic as the worker one but
+/// keyed off [`KanbanApp::workflow_chip_hit`] so it drops below the
+/// workflow chip. Kept as a separate function from the worker dropdown
+/// so each can evolve (footer hints, future per-dropdown affordances)
+/// independently.
+fn render_workflow_dropdown(f: &mut Frame, app: &mut KanbanApp, area: Rect) {
+    let opts = app.workflow_dropdown_options();
+    if opts.is_empty() {
+        app.close_workflow_dropdown();
+        return;
+    }
+    let cursor = app
+        .workflow_dropdown
+        .as_ref()
+        .map(|d| d.cursor)
+        .unwrap_or(0);
+
+    let max_label_w = opts
+        .iter()
+        .map(|o| workflow_dropdown_row_text(o).chars().count())
+        .max()
+        .unwrap_or(10);
+    let desired_w = (max_label_w + 4).max(22) as u16;
+    let popover_w = desired_w.min(area.width).min(area.width / 3 + 8);
+    let popover_x = match app.workflow_chip_hit {
+        Some(chip) => {
+            let right = chip.x.saturating_add(chip.width);
+            right.saturating_sub(popover_w).max(area.x)
+        }
+        None => area.x.saturating_add(area.width).saturating_sub(popover_w),
+    };
+    let popover_h = (opts.len() as u16 + 3).min(area.height.saturating_sub(1));
+    let popover_y = area
+        .y
+        .saturating_add(1)
+        .min(area.y + area.height.saturating_sub(popover_h));
+
+    let popover_area = Rect {
+        x: popover_x,
+        y: popover_y,
+        width: popover_w,
+        height: popover_h,
+    };
+
+    f.render_widget(Clear, popover_area);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Cyan))
+        .title(Line::from(vec![Span::styled(
+            " Filter by workflow ",
+            Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+        )]));
+    let inner = block.inner(popover_area);
+    f.render_widget(block, popover_area);
+
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(1), Constraint::Length(1)])
+        .split(inner);
+    let list_area = chunks[0];
+    let hint_area = chunks[1];
+
+    let mut hits: Vec<DropdownHit> = Vec::with_capacity(opts.len());
+    let mut items: Vec<ListItem> = Vec::with_capacity(opts.len());
+    for (idx, opt) in opts.iter().enumerate() {
+        let active = app.workflow_filter == opt.filter;
+        let label = workflow_dropdown_row_text(opt);
+        let prefix = if active { "● " } else { "  " };
+        let label_style = if active {
+            Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)
+        } else {
+            Style::default()
+        };
+        let line = Line::from(vec![
+            Span::styled(prefix, Style::default().fg(Color::Cyan)),
+            Span::styled(label, label_style),
+        ]);
+        items.push(ListItem::new(line));
+        let row_y = list_area.y.saturating_add(idx as u16);
+        if row_y < list_area.y.saturating_add(list_area.height) {
+            hits.push(DropdownHit {
+                area: Rect {
+                    x: list_area.x,
+                    y: row_y,
+                    width: list_area.width,
+                    height: 1,
+                },
+                option_idx: idx,
+            });
+        }
+    }
+
+    let mut state = ListState::default();
+    state.select(Some(cursor.min(opts.len().saturating_sub(1))));
+    let list = List::new(items).highlight_style(
+        Style::default()
+            .bg(Color::Blue)
+            .fg(Color::White)
+            .add_modifier(Modifier::BOLD),
+    );
+    f.render_stateful_widget(list, list_area, &mut state);
+
+    let hint = Line::from(Span::styled(
+        " ↑↓ nav · ↵ select · c clear · esc close",
+        Style::default().fg(Color::DarkGray),
+    ));
+    f.render_widget(Paragraph::new(hint), hint_area);
+
+    app.workflow_dropdown_hits = hits;
+}
+
+/// Sibling of [`dropdown_row_text`] for workflow options. Keeping it
+/// separate avoids overloading the worker-side row formatter with a
+/// trait/enum that adds nothing to the only two callers.
+fn workflow_dropdown_row_text(opt: &WorkflowDropdownOption) -> String {
+    let label = match &opt.filter {
+        None => "All".to_string(),
+        Some(name) => name.clone(),
+    };
+    format!("{} ({})", label, opt.count)
+}
+
 /// Header text for a workflow column. The canonical 5-status names get
 /// the familiar uppercase labels (`BACKLOG`, `IN PROGRESS`, …); custom
 /// status names fall through to a generic uppercase rendering so a
@@ -1299,6 +1913,24 @@ fn truncate(s: &str, max: usize) -> String {
 /// column order in the YAML, so workflow authors get exactly the layout
 /// they declared.
 fn workflow_columns(workflows: &[Workflow]) -> Vec<WorkflowColumn> {
+    let mut out: Vec<WorkflowColumn> =
+        Vec::with_capacity(workflows.iter().map(|w| w.statuses.len()).sum());
+    for wf in workflows {
+        for st in &wf.statuses {
+            out.push(WorkflowColumn {
+                workflow: wf.name.clone(),
+                status_name: st.name.clone(),
+                category: st.category,
+            });
+        }
+    }
+    out
+}
+
+/// Same as [`workflow_columns`] but takes references — used by the
+/// filter pass, which builds a `Vec<&Workflow>` from the loaded
+/// workflows without cloning. Identical semantics.
+fn workflow_columns_from_refs(workflows: &[&Workflow]) -> Vec<WorkflowColumn> {
     let mut out: Vec<WorkflowColumn> =
         Vec::with_capacity(workflows.iter().map(|w| w.statuses.len()).sum());
     for wf in workflows {
@@ -2405,12 +3037,41 @@ mod tests {
         let mut app = KanbanApp::new("demo");
         app.workflows = vec![default_workflow(), design];
         app.all_columns = workflow_columns(&app.workflows);
-        app.tasks = vec![task_in_workflow(
-            "a",
-            Column::InProgress,
-            Some("design-review"),
-            "2026-06-20T10:00:00Z",
-        )];
+        // Seed every column with one task so collapse-empty doesn't
+        // truncate the header text — the test is checking that the
+        // multi-workflow layout paints labels at all, not that the
+        // collapse logic kicks in.
+        app.tasks = vec![
+            task_in_workflow("d-backlog", Column::Backlog, None, "2026-06-20T10:00:00Z"),
+            task_in_workflow("d-todo", Column::Todo, None, "2026-06-20T10:00:00Z"),
+            task_in_workflow("d-wip", Column::InProgress, None, "2026-06-20T10:00:00Z"),
+            task_in_workflow("d-review", Column::Review, None, "2026-06-20T10:00:00Z"),
+            task_in_workflow("d-done", Column::Done, None, "2026-06-20T10:00:00Z"),
+            task_in_workflow(
+                "dr-backlog",
+                Column::Backlog,
+                Some("design-review"),
+                "2026-06-20T10:00:00Z",
+            ),
+            task_in_workflow(
+                "dr-design",
+                Column::InProgress,
+                Some("design-review"),
+                "2026-06-20T10:00:00Z",
+            ),
+            task_in_workflow(
+                "dr-qa",
+                Column::Review,
+                Some("design-review"),
+                "2026-06-20T10:00:00Z",
+            ),
+            task_in_workflow(
+                "dr-done",
+                Column::Done,
+                Some("design-review"),
+                "2026-06-20T10:00:00Z",
+            ),
+        ];
 
         // 9 columns total → keep the terminal wide so every status
         // header has room to render its label.
@@ -2429,7 +3090,9 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
 
-        // Canonical headers (truncated to fit narrow slots when 9 columns share 160 cells).
+        // Canonical headers render full when every column is non-empty
+        // and the layout has enough room (9 × non-empty min = 126; 160
+        // cells leaves slack for full headers).
         assert!(rendered.contains("BACKLOG"), "BACKLOG header missing:\n{rendered}");
         assert!(rendered.contains("DESIGN"), "DESIGN header missing:\n{rendered}");
         assert!(rendered.contains("QA"), "QA header missing:\n{rendered}");
@@ -2443,5 +3106,257 @@ mod tests {
             rendered.contains("design-review") || rendered.contains("design-revi"),
             "design-review subscript missing:\n{rendered}"
         );
+    }
+
+    // ---- workflow filter -------------------------------------------------
+
+    /// With `workflow_filter` set to a loaded workflow, `compute_all_columns`
+    /// emits only that workflow's columns. Clearing the filter restores the
+    /// All-mode union.
+    #[test]
+    fn workflow_filter_narrows_all_columns_to_one_workflow() {
+        let design = workflow(
+            "design-review",
+            &[
+                ("Backlog", StatusCategory::Backlog),
+                ("Design", StatusCategory::Active),
+                ("Done", StatusCategory::Done),
+            ],
+        );
+        let mut app = KanbanApp::new("demo");
+        app.workflows = vec![default_workflow(), design];
+        app.all_columns = app.compute_all_columns();
+        assert_eq!(app.all_columns.len(), 5 + 3);
+
+        app.workflow_filter = Some("design-review".into());
+        app.all_columns = app.compute_all_columns();
+        let pairs: Vec<(&str, &str)> = app
+            .all_columns
+            .iter()
+            .map(|c| (c.workflow.as_str(), c.status_name.as_str()))
+            .collect();
+        assert_eq!(
+            pairs,
+            vec![
+                ("design-review", "Backlog"),
+                ("design-review", "Design"),
+                ("design-review", "Done"),
+            ]
+        );
+
+        app.workflow_filter = None;
+        app.all_columns = app.compute_all_columns();
+        assert_eq!(app.all_columns.len(), 5 + 3, "clear restores All-mode");
+    }
+
+    /// A stale workflow filter (workflow no longer loaded) falls back
+    /// to the unfiltered union so the board still paints. The filter
+    /// itself isn't auto-cleared — the user can see the chip and
+    /// dismiss it.
+    #[test]
+    fn workflow_filter_for_missing_workflow_falls_back_to_union() {
+        let mut app = KanbanApp::new("demo");
+        app.workflows = vec![default_workflow()];
+        app.workflow_filter = Some("removed".into());
+        app.all_columns = app.compute_all_columns();
+        assert_eq!(app.all_columns.len(), 5);
+        assert_eq!(app.workflow_filter, Some("removed".into()));
+    }
+
+    /// `workflow_dropdown_options` lists All + every loaded workflow.
+    /// Counts use the unfiltered tasks list (zero-count workflows
+    /// still appear so the user can pick them).
+    #[test]
+    fn workflow_dropdown_options_lists_all_then_each_workflow() {
+        let design = workflow("design-review", &[("Backlog", StatusCategory::Backlog)]);
+        let mut app = KanbanApp::new("demo");
+        app.workflows = vec![default_workflow(), design];
+        app.tasks = vec![
+            task_in_workflow("a", Column::Todo, None, "2026-06-20T10:00:00Z"),
+            task_in_workflow("b", Column::Backlog, Some("design-review"), "2026-06-20T10:00:00Z"),
+        ];
+        let opts = app.workflow_dropdown_options();
+        assert_eq!(opts.len(), 3);
+        assert!(opts[0].filter.is_none());
+        assert_eq!(opts[0].count, 2);
+        assert_eq!(opts[1].filter.as_deref(), Some("default"));
+        assert_eq!(opts[1].count, 1);
+        assert_eq!(opts[2].filter.as_deref(), Some("design-review"));
+        assert_eq!(opts[2].count, 1);
+    }
+
+    /// Toggling the workflow dropdown is self-inverse, the same way
+    /// the worker dropdown is — the same key opens and closes it.
+    #[test]
+    fn toggle_workflow_dropdown_is_self_inverse() {
+        let mut app = KanbanApp::new("demo");
+        assert!(!app.workflow_dropdown_is_open());
+        app.toggle_workflow_dropdown();
+        assert!(app.workflow_dropdown_is_open());
+        app.toggle_workflow_dropdown();
+        assert!(!app.workflow_dropdown_is_open());
+    }
+
+    // ---- collapse-empty + horizontal scroll ------------------------------
+
+    /// `compute_column_widths` collapses empty columns to a fixed
+    /// minimum and gives the slack to the non-empty ones. With a
+    /// single non-empty column out of five, it should grow well past
+    /// the others.
+    #[test]
+    fn compute_column_widths_collapses_empty_and_grows_non_empty() {
+        let workflows = vec![default_workflow()];
+        let cols = workflow_columns(&workflows);
+        // 4 empty columns, 1 non-empty.
+        let counts = vec![0, 0, 3, 0, 0];
+        let widths = compute_column_widths(&cols, &counts, 0, 100);
+        assert_eq!(widths.len(), 5);
+        // Empty columns sit at EMPTY_MIN_W exactly; non-empty consumes
+        // the rest.
+        for (i, w) in &widths {
+            if counts[*i] == 0 {
+                assert_eq!(*w, EMPTY_MIN_W, "empty column {i} should stay at min");
+            } else {
+                assert!(
+                    *w > NONEMPTY_MIN_W,
+                    "non-empty column {i} should grow beyond min, got {w}"
+                );
+            }
+        }
+        // Total width matches the area exactly — no gap on the right.
+        let total: u16 = widths.iter().map(|(_, w)| *w).sum();
+        assert_eq!(total, 100);
+    }
+
+    /// When the minimum widths overflow the available area,
+    /// `compute_column_widths` drops trailing columns from the visible
+    /// window so the remaining ones fit. `scroll` then walks the
+    /// window forward.
+    #[test]
+    fn compute_column_widths_drops_overflow_and_scrolls() {
+        // 9 columns × NONEMPTY_MIN_W (14) = 126 > 80. Some columns
+        // must drop out.
+        let design = workflow(
+            "design-review",
+            &[
+                ("Backlog", StatusCategory::Backlog),
+                ("Design", StatusCategory::Active),
+                ("QA", StatusCategory::Handoff),
+                ("Done", StatusCategory::Done),
+            ],
+        );
+        let wfs = vec![default_workflow(), design];
+        let cols = workflow_columns(&wfs);
+        let counts = vec![1; cols.len()];
+
+        let widths = compute_column_widths(&cols, &counts, 0, 80);
+        assert!(widths.len() < cols.len(), "should drop trailing cols");
+        assert_eq!(widths[0].0, 0, "starts at scroll=0");
+
+        // Scrolling reveals later columns at the cost of earlier ones.
+        let widths = compute_column_widths(&cols, &counts, 4, 80);
+        assert_eq!(widths[0].0, 4, "starts at scroll=4");
+        assert!(
+            widths.iter().map(|(_, w)| *w).sum::<u16>() <= 80,
+            "respects area width"
+        );
+    }
+
+    /// Full render with a workflow filter applied: only that
+    /// workflow's columns paint, and the workflow chip shows the
+    /// active filter. The worker chip stays in place beside it.
+    #[test]
+    fn rendering_workflow_filter_narrows_visible_columns() {
+        use ratatui::{backend::TestBackend, Terminal};
+        let design = workflow(
+            "design-review",
+            &[
+                ("Backlog", StatusCategory::Backlog),
+                ("Design", StatusCategory::Active),
+                ("Done", StatusCategory::Done),
+            ],
+        );
+        let mut app = KanbanApp::new("demo");
+        app.workflows = vec![default_workflow(), design];
+        app.workflow_filter = Some("design-review".into());
+        app.all_columns = app.compute_all_columns();
+        app.tasks = vec![
+            task_in_workflow("d1", Column::Todo, None, "2026-06-20T10:00:00Z"),
+            task_in_workflow(
+                "dr1",
+                Column::InProgress,
+                Some("design-review"),
+                "2026-06-20T10:00:00Z",
+            ),
+        ];
+
+        let backend = TestBackend::new(120, 14);
+        let mut term = Terminal::new(backend).unwrap();
+        term.draw(|f| render_full(f, &mut app, f.area())).unwrap();
+
+        let buf = term.backend().buffer().clone();
+        let rendered: String = (0..buf.area.height)
+            .map(|y| {
+                (0..buf.area.width)
+                    .map(|x| buf[(x, y)].symbol().to_string())
+                    .collect::<Vec<_>>()
+                    .join("")
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        // Filter chip shows the active filter; only design-review
+        // columns render. The default workflow's TODO label must not
+        // appear — that's the proof the filter narrowed the layout.
+        assert!(
+            rendered.contains("Workflow: design-review ▾"),
+            "workflow chip missing or wrong:\n{rendered}"
+        );
+        assert!(rendered.contains("DESIGN"), "DESIGN column missing");
+        // TO DO is a default-workflow column with the legacy uppercase
+        // label — never paints under design-review filter. (Using
+        // `IN PROGRESS` would false-positive against a generic prefix.)
+        assert!(
+            !rendered.contains("TO DO"),
+            "default-workflow TO DO leaked into filtered view:\n{rendered}"
+        );
+        // dr1 should render in design-review/Design.
+        assert!(rendered.contains("dr1"), "filtered card missing");
+    }
+
+    /// `ensure_selected_visible` advances `column_scroll` when the
+    /// selection falls past the visible window, and pulls it back to
+    /// the selection when scrolled too far right.
+    #[test]
+    fn ensure_selected_visible_keeps_selection_in_view() {
+        let design = workflow(
+            "design-review",
+            &[
+                ("Backlog", StatusCategory::Backlog),
+                ("Design", StatusCategory::Active),
+                ("QA", StatusCategory::Handoff),
+                ("Done", StatusCategory::Done),
+            ],
+        );
+        let mut app = KanbanApp::new("demo");
+        app.workflows = vec![default_workflow(), design];
+        app.all_columns = workflow_columns(&app.workflows);
+        // Every column non-empty so they all want full width.
+        app.tasks = (0..app.all_columns.len())
+            .map(|i| task_in_workflow(&format!("t{i}"), Column::Todo, None, "2026-06-20T10:00:00Z"))
+            .collect();
+
+        // Select a column that won't fit at scroll=0 in 60 cells.
+        app.selected_column = 7;
+        app.column_scroll = 0;
+        app.ensure_selected_visible(60);
+        assert!(app.column_scroll > 0, "should scroll right");
+
+        // Scroll back: selection at 1 with scroll at 5 → scroll snaps
+        // back to 1.
+        app.selected_column = 1;
+        app.column_scroll = 5;
+        app.ensure_selected_visible(60);
+        assert!(app.column_scroll <= 1, "should snap back left");
     }
 }
