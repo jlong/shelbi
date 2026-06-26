@@ -51,12 +51,14 @@ shelbi task list [OPTIONS]
 Print every task grouped by column, in priority order within each column. Use
 `--column <NAME>` to scope to one column, or `--ready` to see only unblocked
 `todo` items in dispatch order — that's the orchestrator's view of "what
-should I assign next."
+should I assign next." `--workflow <NAME>` narrows either view to a single
+workflow.
 
 | Flag | Type | Default | Description |
 | --- | --- | --- | --- |
 | `--column <COLUMN>` | string | — | Restrict to a single column. |
 | `--ready` | flag | off | Show only unblocked `todo` items, in priority order. Mutually exclusive with `--column`. |
+| `--workflow <NAME>` | string | — | Restrict to tasks pinned to the named workflow. Tasks with no explicit `workflow:` field are treated as the canonical `default` workflow. Composes with `--column` and `--ready`. |
 
 ## show
 
