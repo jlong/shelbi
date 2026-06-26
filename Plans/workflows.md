@@ -296,6 +296,13 @@ Missing transitions are no-ops — a workflow only declares the edges where work
 
 **Wildcards.** `from: any` declares an action set that applies regardless of the source status. Useful for "any path into Canceled deletes the branch." Only one wildcard per `to:` value, to keep resolution unambiguous.
 
+**The `branch:` task field.** Every task carries an optional `branch:` field in its frontmatter — the name of the git branch the task operates on. Its presence (or absence) at task creation controls whether shelbi cuts a fresh branch or uses an existing one.
+
+- **Omitted at creation** → the orchestrator cuts a new branch off the workflow's resolved `git.base_branch` when the task transitions to `InProgress`, names it conventionally (`shelbi/<task-id>`), and writes the name back into the task's frontmatter. The user never types a branch name. This is the common case.
+- **Set at creation** → the orchestrator uses that branch as-is. No new branch is cut. This is how *release tasks* work: the user already knows the branch (typically `feature/<name>`) and pre-fills it.
+
+Once populated, `branch:` is the source of truth for every subsequent action — `push_branch`, `open_pr`, `merge`, `delete_branch` all operate on it. Workflows don't need a separate "what branch to ship" field; the task carries that.
+
 **Who executes the actions.**
 
 - **In Zen Mode**, the orchestrator runs the actions for transitions it auto-triggers, gated by §8's confidence bars. A failed precheck (local checks, conflict, diff size, danger paths, CI) short-circuits the transition; the task stays where it is.
@@ -327,23 +334,24 @@ transitions:
 ```
 
 ```yaml
-# workflows/feature-release.yaml — one workflow ships any feature
+# workflows/feature-release.yaml — ships any pre-existing branch into main
 git:
   base_branch: main
   merge_strategy: squash
-release_branch: feature/{{feature}}       # the existing branch being shipped (not a new task branch)
 
 transitions:
   - from: InProgress
     to: Review
-    actions: [push_branch, open_pr]       # the big feature-completion PR against main
+    actions: [push_branch, open_pr]       # PR the existing feature branch against main
 
   - from: Review
     to: Done
-    actions: [merge, delete_branch]       # squash-merge into main, then delete feature/{{feature}}
+    actions: [merge, delete_branch]       # squash-merge into main, then delete the feature branch
 ```
 
-A task in `feature-task` carries `feature: auth-rewrite` in its frontmatter; another task in a different feature carries `feature: dashboard-v2`. Same workflow file, two concurrent stacks. When a feature is ready to ship, the user creates a task in `feature-release` with the matching `feature` value (cross-workflow moves are allowed per §4). The feature branch goes through one final PR-and-merge cycle into `main`.
+A task in `feature-task` carries `feature: auth-rewrite` in its frontmatter — `feature-task`'s `base_branch` resolves to `feature/auth-rewrite`, and the orchestrator cuts a fresh task branch off it at dispatch. A second feature's tasks carry `feature: dashboard-v2`. Same workflow file, two concurrent stacks.
+
+When a feature is ready to ship, the user creates a task in `feature-release` with `branch: feature/auth-rewrite` pre-filled in its frontmatter. Because `branch:` is set, the orchestrator skips the "cut a new branch" step and operates directly on the existing feature branch — one PR-and-merge cycle lands the whole feature into `main`.
 
 **Parameterization.** Workflow YAML supports `{{var}}` placeholders, resolved from the task's frontmatter at load time. This is what makes one `feature-task.yaml` reusable across any number of concurrent features.
 
