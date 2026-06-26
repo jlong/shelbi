@@ -402,7 +402,7 @@ fn move_to(project: &str, id: &str, to: &str, reason: Option<&str>) -> Result<()
 
     let workflow = resolve_task_workflow(project, &tf.task)?;
     if !workflow_contains_column(&workflow, column) {
-        let valid: Vec<String> = workflow.statuses.iter().map(|s| s.name.clone()).collect();
+        let valid: Vec<String> = workflow.statuses.iter().map(|s| s.id.clone()).collect();
         bail!(
             "`{to}` is not a status in workflow `{}` (valid: {})",
             workflow.name,
@@ -453,19 +453,22 @@ fn resolve_task_workflow(project: &str, task: &Task) -> Result<Workflow> {
     }
 }
 
-/// True iff one of the workflow's statuses matches `column` once both
-/// names are normalized to lowercase alphanumerics. Bridges the
-/// PascalCase YAML form (`InProgress`) with the underscore CLI form
-/// (`in_progress`) without requiring callers to remember which is which.
+/// True iff one of the workflow's status ids matches `column` once both
+/// strings are normalized to lowercase alphanumerics. Bridges the
+/// underscore CLI form (`in_progress` from [`Column::as_str`]) with the
+/// kebab-case id form (`in-progress` from
+/// [`Column::default_status_id`]) — and tolerates the historic
+/// PascalCase form for workflows that pre-date the id/name split and
+/// only carry a name (which our deserializer back-fills into id).
 fn workflow_contains_column(workflow: &Workflow, column: Column) -> bool {
-    let target = norm_status_name(column.as_str());
+    let target = norm_status_id(column.as_str());
     workflow
         .statuses
         .iter()
-        .any(|s| norm_status_name(&s.name) == target)
+        .any(|s| norm_status_id(&s.id) == target)
 }
 
-fn norm_status_name(s: &str) -> String {
+fn norm_status_id(s: &str) -> String {
     s.chars()
         .filter(char::is_ascii_alphanumeric)
         .map(|c| c.to_ascii_lowercase())
