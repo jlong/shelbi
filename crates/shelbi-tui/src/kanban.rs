@@ -1563,6 +1563,7 @@ mod tests {
             name: "demo".into(),
             repo: "git@example:demo.git".into(),
             default_branch: "main".into(),
+            git: shelbi_core::GitConfig::default(),
             machines: vec![shelbi_core::Machine {
                 name: "hub".into(),
                 kind: shelbi_core::MachineKind::Local,
@@ -1639,8 +1640,10 @@ mod tests {
                 column: Column::Backlog,
                 priority: 0,
                 assigned_to: None,
+                workflow: None,
                 branch: None,
                 depends_on: Vec::new(),
+                params: Default::default(),
                 prefers_machine: None,
                 zen: None,
                 created_at: now,
