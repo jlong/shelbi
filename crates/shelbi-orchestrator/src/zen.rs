@@ -18,16 +18,16 @@
 //! verdict.
 
 use std::path::PathBuf;
-use std::process::Output;
 use std::time::{Duration, Instant};
 
 use globset::{Glob, GlobSetBuilder};
 use serde::Serialize;
 use shelbi_core::{
-    checks_for_task, danger_paths_for_project, Column, Error, Host, Machine, MachineKind, Project,
-    Result, Task, WorkerSpec,
+    checks_for_task, danger_paths_for_project, Column, Error, Host, Machine, Project, Result,
+    Task, WorkerSpec,
 };
 
+use crate::git::{locate_hub_workdir, locate_worker_worktree, lookup_open_pr, run_in_dir};
 use crate::worker::worker_worktree;
 
 /// How often `ci_watch` re-runs `gh pr checks` while waiting for the
@@ -298,98 +298,6 @@ pub fn first_failing_check(stdout: &str) -> Option<(String, String)> {
         return Some((name.to_string(), summary));
     }
     None
-}
-
-/// Find the worker assigned to `task`, then return its host + worktree.
-/// Errors if the task is unassigned or the worker/machine resolution
-/// fails — those are orchestrator bugs, not orchestrator decisions.
-fn locate_worker_worktree(project: &Project, task: &Task) -> Result<(Host, PathBuf)> {
-    let worker_name = task.assigned_to.as_deref().ok_or_else(|| {
-        Error::Other(format!(
-            "task `{}` has no assigned worker — assign one before running zen primitives",
-            task.id
-        ))
-    })?;
-    let worker = project.worker(worker_name).ok_or_else(|| {
-        Error::Other(format!(
-            "task `{}` references unknown worker `{worker_name}`",
-            task.id
-        ))
-    })?;
-    let machine = project
-        .machine(&worker.machine)
-        .ok_or_else(|| Error::UnknownMachine(worker.machine.clone()))?;
-    Ok((machine.host(), worker_worktree(machine, worker)))
-}
-
-/// The first local machine in the project — by convention the hub. The
-/// hub's `work_dir` is a clean checkout of the project repo, so gh
-/// commands routed through it have a remote to talk to without needing
-/// a worker's worktree to exist yet.
-fn locate_hub_workdir(project: &Project) -> Result<(Host, PathBuf)> {
-    let machine = project
-        .machines
-        .iter()
-        .find(|m| matches!(m.kind, MachineKind::Local))
-        .ok_or_else(|| {
-            Error::Other(
-                "project has no local machine to run gh on — zen mode requires a hub".into(),
-            )
-        })?;
-    Ok((machine.host(), machine.work_dir.clone()))
-}
-
-/// Run `argv` with cwd = `dir` on `host`, picking up the user's login
-/// `PATH` on remote SSH hosts so `gh` and `git` resolve the same way
-/// they do in the user's terminal.
-fn run_in_dir(host: &Host, dir: &str, argv: &[&str]) -> Result<Output> {
-    let escaped: Vec<String> = argv.iter().map(|a| shelbi_agent::shell_escape(a)).collect();
-    let line = format!(
-        "cd {} && {}",
-        shelbi_agent::shell_escape(dir),
-        escaped.join(" ")
-    );
-    // Local: bash -c is fine — the user already has gh on PATH.
-    // Remote: bash -lc so .zprofile/.bash_profile populate PATH first.
-    let flag = if host.is_local() { "-c" } else { "-lc" };
-    shelbi_ssh::run(host, ["bash", flag, line.as_str()]).map_err(Error::Io)
-}
-
-fn lookup_open_pr(host: &Host, wt: &str, branch: &str) -> Result<Option<u64>> {
-    let out = run_in_dir(
-        host,
-        wt,
-        &[
-            "gh",
-            "pr",
-            "list",
-            "--head",
-            branch,
-            "--state",
-            "open",
-            "--json",
-            "number",
-            "--jq",
-            ".[0].number // empty",
-        ],
-    )?;
-    if !out.status.success() {
-        return Err(Error::Command {
-            cmd: format!("gh pr list --head {branch}"),
-            status: out.status.to_string(),
-            stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
-        });
-    }
-    let s = String::from_utf8_lossy(&out.stdout);
-    let trimmed = s.trim();
-    if trimmed.is_empty() {
-        return Ok(None);
-    }
-    trimmed.parse::<u64>().map(Some).map_err(|_| {
-        Error::Other(format!(
-            "gh pr list returned non-numeric value `{trimmed}` for branch `{branch}`"
-        ))
-    })
 }
 
 fn head_commit_subject(host: &Host, wt: &str) -> Result<String> {
