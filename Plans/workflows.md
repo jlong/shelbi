@@ -272,6 +272,6 @@ After Phase 2: rich multi-workflow filtering on the existing Kanban board; singl
 
 - **Per-workflow Zen config?** Should `zen.checks.local` / `zen.ci_timeout` / `zen.danger_paths` be definable per-workflow as well as per-project? Useful when a `research` workflow has no code-checks but the `default` does. Recommend: per-workflow with fallback to project-level.
 
-- **Auto-creation of categories.** Could a custom workflow define a NEW category beyond the five listed? Probably not — keep the category set closed so generic code stays correct. Confirm.
+- **Auto-creation of categories.** Could a custom workflow define a NEW category beyond the six listed? Probably not — keep the category set closed so generic code stays correct. Confirm.
 
 - **Naming.** "Workflow" is a heavy word (overloaded with CI workflows, GitHub Actions workflows, n8n workflows). Should this feature have a different name (e.g., "Pipelines", "Tracks", "Boards")? "Workflows" is what the user named it; sticking with it unless something better emerges.
