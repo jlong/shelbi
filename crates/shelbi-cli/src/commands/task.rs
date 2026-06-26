@@ -206,6 +206,7 @@ fn add(project: &str, args: AddArgs) -> Result<()> {
         zen: None,
         created_at: now,
         updated_at: now,
+        params: std::collections::BTreeMap::new(),
     };
     if !task.depends_on.is_empty() {
         let existing = shelbi_state::list_tasks(project).map_err(|e| anyhow!(e))?;
@@ -622,6 +623,7 @@ mod tests {
             zen: None,
             created_at: now,
             updated_at: now,
+            params: std::collections::BTreeMap::new(),
         }
     }
 

@@ -764,6 +764,7 @@ mod tests {
                 zen: None,
                 created_at: updated_at,
                 updated_at,
+                params: std::collections::BTreeMap::new(),
             },
             body: String::new(),
         }
@@ -895,6 +896,7 @@ mod tests {
             zen: None,
             created_at: now,
             updated_at: now,
+            params: std::collections::BTreeMap::new(),
         };
         shelbi_state::save_task("demo", &task, "").unwrap();
 

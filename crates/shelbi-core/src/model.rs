@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -597,6 +598,19 @@ pub struct Task {
     pub zen: Option<TaskZenConfig>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+    /// Free-form parameters carried at the top level of the task's
+    /// frontmatter. Used by a workflow's `git:` block to resolve `{{var}}`
+    /// placeholders at task-load time (`Plans/workflows.md` §12). Captured
+    /// via `#[serde(flatten)]` so a task can declare `feature: auth-rewrite`
+    /// directly alongside the structured fields, which is what the workflow
+    /// docs and `feature-task` example assume.
+    ///
+    /// Anything that is not a typed Task field lands here. Values are
+    /// constrained to YAML strings — workflow git fields are always strings,
+    /// and forcing string-typed params keeps `{{feature}}` substitution from
+    /// silently coercing numeric or boolean YAML values.
+    #[serde(flatten, default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub params: BTreeMap<String, String>,
 }
 
 impl Task {
@@ -1155,6 +1169,7 @@ updated_at: 2026-06-19T00:00:00Z
             zen: None,
             created_at: now,
             updated_at: now,
+            params: BTreeMap::new(),
         };
         let mut cols = std::collections::HashMap::new();
         cols.insert("b".to_string(), Column::Done);
@@ -1185,6 +1200,7 @@ updated_at: 2026-06-19T00:00:00Z
             zen: None,
             created_at: now,
             updated_at: now,
+            params: BTreeMap::new(),
         };
         let y = serde_yaml::to_string(&task).unwrap();
         assert!(y.contains("prefers_machine: devbox"));
@@ -1215,6 +1231,59 @@ updated_at: 2026-06-19T00:00:00Z
     fn task_id_uses_same_rules_as_agent_id() {
         assert!(validate_task_id("fix-login").is_ok());
         assert!(validate_task_id("with spaces").is_err());
+    }
+
+    #[test]
+    fn task_params_capture_top_level_extra_keys() {
+        // The `feature:` and `region:` keys are extra frontmatter fields
+        // that the workflow's `git:` block references with `{{feature}}`
+        // / `{{region}}`. They round-trip through serde flatten without
+        // any special wrapper, matching the worked example in
+        // `Plans/workflows.md` §12.
+        let yaml = r#"
+id: build-login-form
+title: Build the login form
+column: todo
+priority: 0
+workflow: feature-task
+feature: auth-rewrite
+region: us-east
+created_at: 2026-06-19T00:00:00Z
+updated_at: 2026-06-19T00:00:00Z
+"#;
+        let t: Task = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(t.params.get("feature").map(String::as_str), Some("auth-rewrite"));
+        assert_eq!(t.params.get("region").map(String::as_str), Some("us-east"));
+        // Structured fields aren't double-counted in params.
+        assert!(!t.params.contains_key("id"));
+        assert!(!t.params.contains_key("workflow"));
+
+        let back = serde_yaml::to_string(&t).unwrap();
+        assert!(back.contains("feature: auth-rewrite"), "out: {back}");
+        assert!(back.contains("region: us-east"), "out: {back}");
+    }
+
+    #[test]
+    fn task_params_default_to_empty_and_serialize_silently() {
+        // No extra keys → `params` is empty → nothing extra on the wire.
+        // The schema stays identical to existing tasks; only tasks that
+        // opt into `{{var}}` parameterization carry extra frontmatter.
+        let yaml = r#"
+id: a
+title: A
+column: todo
+priority: 0
+created_at: 2026-06-19T00:00:00Z
+updated_at: 2026-06-19T00:00:00Z
+"#;
+        let t: Task = serde_yaml::from_str(yaml).unwrap();
+        assert!(t.params.is_empty());
+        let back = serde_yaml::to_string(&t).unwrap();
+        // There's no good single token to grep for "params:" since it
+        // would only appear if we'd nested under that key — instead
+        // assert that the round-trip is stable.
+        let t2: Task = serde_yaml::from_str(&back).unwrap();
+        assert!(t2.params.is_empty());
     }
 
     #[test]
@@ -1396,6 +1465,7 @@ worker_settings_template: /etc/shelbi/p.json
             zen,
             created_at: now,
             updated_at: now,
+            params: BTreeMap::new(),
         }
     }
 

@@ -404,6 +404,7 @@ mod tests {
             }),
             created_at: now,
             updated_at: now,
+            params: std::collections::BTreeMap::new(),
         }
     }
 

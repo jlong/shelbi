@@ -224,13 +224,6 @@ pub fn tasks_dir(project: &str) -> Result<PathBuf> {
     Ok(project_dir(project)?.join("tasks"))
 }
 
-/// Per-project workflows directory:
-/// `~/.shelbi/projects/<project>/workflows/`. Holds one YAML per workflow
-/// definition (`default.yaml` ships out of the box; users can drop more).
-pub fn workflows_dir(project: &str) -> Result<PathBuf> {
-    Ok(project_dir(project)?.join("workflows"))
-}
-
 /// Path to a project's default workflow YAML
 /// (`<workflows_dir>/default.yaml`). Auto-created on first load when
 /// missing — see [`migrate_default_workflow`].
@@ -1113,6 +1106,7 @@ mod tests {
             zen: None,
             created_at: now,
             updated_at: now,
+            params: std::collections::BTreeMap::new(),
         }
     }
 

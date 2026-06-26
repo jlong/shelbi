@@ -276,6 +276,7 @@ mod tests {
             zen: None,
             created_at: now,
             updated_at: now,
+            params: std::collections::BTreeMap::new(),
         }
     }
 

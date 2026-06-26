@@ -1356,6 +1356,7 @@ mod scan_tests {
             zen: None,
             created_at: Utc::now(),
             updated_at: Utc::now(),
+            params: std::collections::BTreeMap::new(),
         }
     }
 
