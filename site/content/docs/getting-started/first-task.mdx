@@ -209,11 +209,25 @@ the result, and merged it. The same loop — backlog → todo → in progress
 → review → done — is the whole product surface. Everything else is
 volume: more tasks at once, more workers, more machines.
 
-From here:
+## Next
 
-- Read the **Concepts** docs for the full mental model of workers,
+The rest of getting-started walks the same loop at increasing levels
+of autonomy:
+
+- [Run a multi-worker dispatch loop](/docs/getting-started/multi-worker)
+  — fill the backlog with a stack of work and watch every worker in
+  your pool run in parallel without you touching the dispatcher.
+- [Enable Zen Mode](/docs/getting-started/enable-zen-mode) — flip the
+  orchestrator from scheduler to lead. It auto-promotes eligible
+  backlog cards and auto-merges finished branches that clear a
+  project-defined confidence bar.
+- [Author a custom Shelbi workflow](/docs/getting-started/custom-workflow)
+  — fork the orchestrator's prompt and encode routing rules, Zen
+  judgment categories, and reporting style for this project
+  specifically.
+
+For deeper reference any time:
+
+- The **Concepts** docs for the full mental model of workers,
   columns, the events log, and the orchestrator.
-- Browse the **CLI reference** for every flag on every `shelbi`
-  subcommand.
-- Edit `~/.shelbi/projects/<name>.yaml` to grow your worker pool, then
-  `shelbi reload` to pick up the change.
+- The **CLI reference** for every flag on every `shelbi` subcommand.
