@@ -1,6 +1,6 @@
 use anyhow::{anyhow, bail, Result};
 use chrono::Utc;
-use shelbi_core::{Host, Machine, Status, TmuxAddr};
+use shelbi_core::{Host, Machine, MergeStrategy, Status, TmuxAddr};
 
 use super::require_project;
 
@@ -19,7 +19,8 @@ pub fn run(project_opt: Option<String>, id: String, pr: bool) -> Result<()> {
         .clone();
     let host = machine.host();
     let branch = file.agent.branch.clone();
-    let target = project.default_branch.clone();
+    let target = project.base_branch().to_string();
+    let strategy = project.merge_strategy();
 
     if pr {
         return run_pr(
@@ -30,13 +31,14 @@ pub fn run(project_opt: Option<String>, id: String, pr: bool) -> Result<()> {
             &host,
             &branch,
             &target,
+            strategy,
             &id,
         );
     }
 
     preflight(&host, &machine, &target)?;
     capture_uncommitted(&host, &file.agent.worktree, &id)?;
-    squash_merge(&host, &machine, &branch, &target, &id)?;
+    integrate_branch(&host, &machine, &branch, &target, strategy, &id)?;
     cleanup(&host, &machine, &file.agent.worktree, &branch, &file.agent.tmux);
 
     let mut updated = file.agent.clone();
@@ -44,7 +46,7 @@ pub fn run(project_opt: Option<String>, id: String, pr: bool) -> Result<()> {
     updated.updated = Utc::now();
     shelbi_state::save_agent(&project_name, &updated, &file.body).map_err(|e| anyhow!(e))?;
     shelbi_state::append_log(&project_name, &id, "merge").map_err(|e| anyhow!(e))?;
-    println!("✓ merged {id} into {target}");
+    println!("✓ merged {id} into {target} ({strategy})");
     Ok(())
 }
 
@@ -57,6 +59,7 @@ fn run_pr(
     host: &Host,
     branch: &str,
     target: &str,
+    _strategy: MergeStrategy,
     id: &str,
 ) -> Result<()> {
     // 1. Make sure `gh` is reachable on the worker host.
@@ -246,11 +249,15 @@ fn capture_uncommitted(host: &Host, worktree: &std::path::Path, id: &str) -> Res
     Ok(())
 }
 
-fn squash_merge(
+/// Integrate `branch` into `target` using `strategy`. Runs in `machine.work_dir`
+/// — the parent repo checkout — which `preflight` has already verified is
+/// clean and sitting on `target`.
+fn integrate_branch(
     host: &Host,
     machine: &Machine,
     branch: &str,
     target: &str,
+    strategy: MergeStrategy,
     id: &str,
 ) -> Result<()> {
     let repo = machine.work_dir.to_string_lossy().into_owned();
@@ -271,11 +278,42 @@ fn squash_merge(
         bail!("branch `{branch}` has no commits beyond `{target}` — nothing to merge");
     }
 
-    shelbi_ssh::run_capture(host, ["git", "-C", &repo, "merge", "--squash", branch])
-        .map_err(|e| anyhow!(e))?;
     let summary = format!("shelbi: merge {id} from {branch}");
-    shelbi_ssh::run_capture(host, ["git", "-C", &repo, "commit", "-m", &summary])
-        .map_err(|e| anyhow!(e))?;
+    match strategy {
+        MergeStrategy::Squash => {
+            shelbi_ssh::run_capture(host, ["git", "-C", &repo, "merge", "--squash", branch])
+                .map_err(|e| anyhow!(e))?;
+            shelbi_ssh::run_capture(host, ["git", "-C", &repo, "commit", "-m", &summary])
+                .map_err(|e| anyhow!(e))?;
+        }
+        MergeStrategy::Merge => {
+            // `--no-ff` so the merge commit is preserved even when the
+            // branch is a fast-forward — matches gh's behavior.
+            shelbi_ssh::run_capture(
+                host,
+                ["git", "-C", &repo, "merge", "--no-ff", "-m", &summary, branch],
+            )
+            .map_err(|e| anyhow!(e))?;
+        }
+        MergeStrategy::Rebase => {
+            // `git rebase <target> <branch>` checks out the branch and
+            // replays it onto target. Switch back to target and fast-
+            // forward so the parent repo lands on the rebased tip with
+            // `target` as the current branch.
+            shelbi_ssh::run_capture(
+                host,
+                ["git", "-C", &repo, "rebase", target, branch],
+            )
+            .map_err(|e| anyhow!(e))?;
+            shelbi_ssh::run_capture(host, ["git", "-C", &repo, "checkout", target])
+                .map_err(|e| anyhow!(e))?;
+            shelbi_ssh::run_capture(
+                host,
+                ["git", "-C", &repo, "merge", "--ff-only", branch],
+            )
+            .map_err(|e| anyhow!(e))?;
+        }
+    }
     Ok(())
 }
 

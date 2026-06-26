@@ -188,7 +188,7 @@ pub fn start_worker_on_task(spec: StartSpec<'_>) -> Result<TmuxAddr> {
         &machine,
         &worktree,
         spec.branch,
-        &spec.project.default_branch,
+        spec.project.base_branch(),
     )?;
 
     // 2. Drop a rendered .claude/settings.json into the worktree so the
@@ -839,6 +839,7 @@ mod tests {
             worker_settings_template: None,
             zen: shelbi_core::ZenConfig::default(),
             heartbeat: shelbi_core::HeartbeatConfig::default(),
+            git: shelbi_core::GitConfig::default(),
             contextstore_sync: Vec::new(),
             detected_shapes: Vec::new(),
         }
