@@ -14,7 +14,9 @@ use std::str::FromStr;
 use anyhow::{anyhow, bail, Context, Result};
 use chrono::Utc;
 use clap::{Args as ClapArgs, Subcommand};
-use shelbi_core::{validate_task_id, validate_workflow_name, Column, Task};
+use shelbi_core::{
+    default_workflow, validate_task_id, validate_workflow_name, Column, Task, Workflow,
+};
 
 use super::require_project;
 
@@ -363,7 +365,19 @@ fn depends(project: &str, args: DependsArgs) -> Result<()> {
 }
 
 fn move_to(project: &str, id: &str, to: &str, reason: Option<&str>) -> Result<()> {
+    let tf = shelbi_state::load_task(project, id).map_err(|e| anyhow!(e))?;
     let column = Column::from_str(to).map_err(|e| anyhow!(e))?;
+
+    let workflow = resolve_task_workflow(project, &tf.task)?;
+    if !workflow_contains_column(&workflow, column) {
+        let valid: Vec<String> = workflow.statuses.iter().map(|s| s.name.clone()).collect();
+        bail!(
+            "`{to}` is not a status in workflow `{}` (valid: {})",
+            workflow.name,
+            valid.join(", "),
+        );
+    }
+
     let moved = shelbi_state::move_task(project, id, column).map_err(|e| anyhow!(e))?;
     if let Some((from, to_col, workflow)) = moved {
         let reason = reason.unwrap_or("user:cli");
@@ -373,6 +387,38 @@ fn move_to(project: &str, id: &str, to: &str, reason: Option<&str>) -> Result<()
     }
     println!("✓ {id} → {column}");
     Ok(())
+}
+
+/// Load the workflow assigned to `task`, falling back to the canonical
+/// [`default_workflow`] when the project hasn't authored a YAML for it.
+/// Plans/workflows.md §5 specifies that missing workflows are tolerated:
+/// "If `workflow` references a missing definition, shelbi falls back to
+/// default."
+fn resolve_task_workflow(project: &str, task: &Task) -> Result<Workflow> {
+    let name = task.workflow_or_default();
+    match shelbi_state::load_workflow(project, name) {
+        Ok(wf) => Ok(wf),
+        Err(_) => Ok(default_workflow()),
+    }
+}
+
+/// True iff one of the workflow's statuses matches `column` once both
+/// names are normalized to lowercase alphanumerics. Bridges the
+/// PascalCase YAML form (`InProgress`) with the underscore CLI form
+/// (`in_progress`) without requiring callers to remember which is which.
+fn workflow_contains_column(workflow: &Workflow, column: Column) -> bool {
+    let target = norm_status_name(column.as_str());
+    workflow
+        .statuses
+        .iter()
+        .any(|s| norm_status_name(&s.name) == target)
+}
+
+fn norm_status_name(s: &str) -> String {
+    s.chars()
+        .filter(char::is_ascii_alphanumeric)
+        .map(|c| c.to_ascii_lowercase())
+        .collect()
 }
 
 fn assign(project: &str, id: &str, worker: &str) -> Result<()> {
@@ -713,6 +759,71 @@ mod tests {
             !path.exists() || std::fs::read_to_string(&path).unwrap().is_empty(),
             "no-op move must not write an events.log line",
         );
+
+        std::env::remove_var("SHELBI_HOME");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn move_to_rejects_status_missing_from_workflow() {
+        let _g = TEST_LOCK.lock().unwrap();
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+
+        // Author a workflow that omits `Review` — moves to it must fail.
+        let wf_dir = shelbi_state::workflows_dir("p").unwrap();
+        std::fs::create_dir_all(&wf_dir).unwrap();
+        std::fs::write(
+            wf_dir.join("research.yaml"),
+            r#"name: research
+statuses:
+  - { name: Backlog,    category: backlog, owner: user  }
+  - { name: Todo,       category: ready,   owner: agent }
+  - { name: InProgress, category: active,  owner: agent }
+  - { name: Done,       category: done,    owner: user  }
+"#,
+        )
+        .unwrap();
+
+        let mut task = task_in(Column::Todo, "d");
+        task.workflow = Some("research".into());
+        shelbi_state::save_task("p", &task, "").unwrap();
+
+        let err = move_to("p", "d", "review", None).unwrap_err().to_string();
+        assert!(err.contains("workflow `research`"), "{err}");
+        assert!(err.contains("Backlog"), "{err}");
+        assert!(err.contains("Done"), "{err}");
+        assert!(!err.contains("Review"), "{err}");
+
+        // Task must stay put — no event written.
+        let path = shelbi_state::events_log_path().unwrap();
+        assert!(
+            !path.exists() || std::fs::read_to_string(&path).unwrap().is_empty(),
+            "rejected move must not write an events.log line",
+        );
+
+        std::env::remove_var("SHELBI_HOME");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn move_to_missing_workflow_falls_back_to_default() {
+        // A task pinned to a workflow the project hasn't authored falls
+        // back to the canonical default — same five statuses, so a move
+        // to `review` still succeeds.
+        let _g = TEST_LOCK.lock().unwrap();
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+
+        let mut task = task_in(Column::Todo, "e");
+        task.workflow = Some("nonexistent".into());
+        shelbi_state::save_task("p", &task, "").unwrap();
+
+        move_to("p", "e", "review", None).unwrap();
+
+        let log = std::fs::read_to_string(shelbi_state::events_log_path().unwrap()).unwrap();
+        assert!(log.contains(" task=e "), "{log}");
+        assert!(log.contains(" todo -> review "), "{log}");
 
         std::env::remove_var("SHELBI_HOME");
         let _ = std::fs::remove_dir_all(&home);
