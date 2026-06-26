@@ -439,7 +439,6 @@ impl<'de> Deserialize<'de> for Status {
             name,
             category: raw.category,
             owner: raw.owner,
-            description: raw.description,
         })
     }
 }
