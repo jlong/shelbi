@@ -1,0 +1,492 @@
+---
+title: Workflows
+order: 6
+summary: A per-project YAML that generalizes the Kanban board — declare your own statuses, who owns each one, what side-effects fire on each transition, and how dependent tasks stack. The default workflow is the same five-column flow as before; custom workflows are a YAML edit.
+---
+
+# Workflows
+
+A **workflow** is a YAML file that declares the statuses a task moves
+through, who owns each one, and what git side-effects fire on each
+transition. Every project ships with a `default` workflow that matches
+the canonical five-column board (`Backlog → Todo → InProgress → Review
+→ Done`). Drop another YAML next to it and you have a second pipeline —
+a docs-only flow, a research pipeline that never opens PRs, a
+feature-stacking flow whose tasks branch off a long-lived feature
+branch.
+
+The mental model: **[columns](/docs/concepts/columns) are the
+*instance*; workflows are the *schema*.** Generic code (orchestrator
+auto-dispatch, Zen Mode's confidence bar, the events log, the activity
+feed) keeps working unchanged because every status maps to a small,
+closed set of **categories** — `backlog`, `ready`, `active`, `handoff`,
+`done`. Status *names* are user-facing labels; categories are the
+vocabulary the rest of the system reasons in.
+
+Schema and parser live in `crates/shelbi-core/src/workflow.rs`.
+Workflow files live at
+`~/.shelbi/projects/<project>/workflows/<name>.yaml`.
+
+## Schema
+
+```yaml
+# ~/.shelbi/projects/<project>/workflows/default.yaml
+name: default
+description: The standard one-track flow shipped with every project.
+
+statuses:
+  - { name: Backlog,    category: backlog, owner: user  }
+  - { name: Todo,       category: ready,   owner: agent }
+  - { name: InProgress, category: active,  owner: agent }
+  - { name: Review,     category: handoff, owner: user  }
+  - { name: Done,       category: done,    owner: user  }
+
+# Optional. Which status a new task lands in. Defaults to the first
+# entry in `statuses:` above.
+# initial_status: Backlog
+
+# Optional. Per-workflow override of the project-level `git:` block in
+# project.yaml. Most workflows omit it and inherit base_branch/merge_strategy
+# unchanged.
+# git:
+#   base_branch: main
+#   merge_strategy: squash         # squash | merge
+
+# Optional. Edge-by-edge action declarations. Each entry says what side
+# effects to run when a task crosses that edge. Omitted edges run no
+# actions — pure status moves. Transitions are any-to-any: this block
+# does NOT restrict which moves are legal.
+# transitions:
+#   - from: InProgress
+#     to: Review
+#     actions: [push_branch, open_pr]
+#   - from: Review
+#     to: Done
+#     actions: [merge, delete_branch]
+```
+
+The required fields are `name` and `statuses` (at least one). Everything
+else is optional. A workflow without `transitions:` is a pure
+bookkeeping workflow — no git side-effects fire on any move.
+
+Validation runs at load time and catches duplicate status names,
+`initial_status` pointing at nothing, and transition edges referencing
+undeclared statuses. The error message names the workflow and the bad
+field.
+
+## Status categories
+
+Every status — default or custom — declares one of five categories:
+
+| Category   | Semantic                                                            | Example status names                                  |
+| ---------- | ------------------------------------------------------------------- | ----------------------------------------------------- |
+| `backlog`  | Not yet ready for work — triage stage.                              | `Backlog`, `Inbox`, `Triage`                          |
+| `ready`    | Ready for whoever owns it to pick up.                               | `Todo`, `Ready`, `Next Up`                            |
+| `active`   | Owner is working on it now.                                         | `InProgress`, `Building`, `Designing`, `Drafting`     |
+| `handoff`  | One owner has finished their part; another's input is required.     | `Review`, `QA`, `Awaiting Sign-off`                   |
+| `done`     | Terminal — accepted, shipped.                                       | `Done`, `Shipped`, `Released`                         |
+
+The category set is **closed at five**. A workflow can't introduce a
+sixth — generic code (Zen Mode, activity feed, orchestrator routing)
+keys off the category, and an unknown one would have nowhere to fit. A
+workflow *can* repeat a category, though: a long pipeline might have
+three `active` statuses (Design, Build, QA) with different owners.
+
+Categories let the rest of the system reason without caring about
+names:
+
+- The orchestrator dispatches `ready`-category statuses whose `owner`
+  is `agent`. It doesn't care whether you called the column `Todo` or
+  `Ready` or `Next Up`.
+- The hub poller's review-marker promotion lands a task in the next
+  `handoff` status — same code path for `Review`, `QA`,
+  `Awaiting Sign-off`.
+- The activity feed renders an `active → handoff` move as
+  "handed off" regardless of the actual status names involved.
+
+The category for each status appears on every events log line so
+consumers can match on the semantic without looking up the workflow.
+See [events log line shape](/docs/concepts/events-log#task-transitions).
+
+## Owners
+
+Each status declares `owner: user | agent`:
+
+- **`agent`** — the orchestrator is the next mover. Tasks sitting in
+  an `agent`-owned `ready` status are eligible for auto-dispatch onto
+  a free worker.
+- **`user`** — the orchestrator does not dispatch. The task waits for
+  you to move it. Surfaced in the activity feed so you know your
+  attention is requested.
+
+There's no third "either" — a status is either work for a worker or
+work for a human. If you want to grab an agent-owned task by hand,
+reassign it through the normal CLI/TUI; that's an action, not a schema
+field.
+
+## Transitions
+
+The `transitions:` block declares **side-effects**, not legal moves.
+Cards can be dragged between any two declared statuses; what `transitions:`
+controls is what *happens* on the way. An undeclared edge is a pure
+status change with no git activity.
+
+Each transition lists actions in execution order. Failures
+short-circuit the rest — if `merge` fails, `delete_branch` does not
+run.
+
+| Action          | Effect                                                                                                                                                                                                |
+| --------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `push_branch`   | Push the task's branch to `origin`. No-op if already up to date.                                                                                                                                      |
+| `open_pr`       | Open a PR. Base is `transition.target` if set, else the workflow's resolved `base_branch`, else the parent task's branch when `depends_on` is set. No-op if a PR is already open.                     |
+| `merge`         | Merge the task's branch with the effective `merge_strategy`. Via `gh pr merge` when a PR is open; via local `git merge` on the hub otherwise. v1 strategies: `squash`, `merge`.                       |
+| `close_pr`      | Close any open PR without merging.                                                                                                                                                                    |
+| `delete_branch` | Delete the local + remote branch. Skipped if a worker still has the branch checked out — that worktree replaces the branch on its next dispatch.                                                      |
+| `restack`       | Rebase the task's branch onto its parent task's current branch. Fires automatically on dependent tasks when a parent's `merge` completes (see [`depends_on`](#dependent-tasks-with-depends-on)).      |
+
+All actions are **hub-side** and idempotent. The orchestrator (or the
+CLI) on the hub machine runs them; workers never invoke actions
+directly.
+
+The canonical default workflow's transitions, written out:
+
+```yaml
+transitions:
+  - from: InProgress
+    to: Review
+    actions: [push_branch, open_pr]
+
+  - from: Review
+    to: Done
+    actions: [merge, delete_branch]
+```
+
+### Per-transition `target:`
+
+Each transition may declare a `target:` field that overrides where
+`merge` and `open_pr` land for *that edge only*:
+
+```yaml
+transitions:
+  - from: InProgress
+    to: Review
+    target: develop                # merge feature work into develop here
+    actions: [push_branch, merge]
+
+  - from: Review
+    to: Done
+    # no target → uses the workflow's base_branch (e.g., main)
+    actions: [open_pr, merge]
+```
+
+`target:` does **not** affect where new task branches are cut from —
+that's always the resolved `base_branch`. It only controls where
+merges land for this particular hop.
+
+### What fires Zen Mode's high-confidence bar
+
+[Zen Mode](/docs/concepts/zen-mode#the-high-confidence-bar) gates *any*
+transition whose actions include `merge`, regardless of which
+statuses sit on either side. A trunk-based workflow that skips
+`Review` and goes straight `Active → Done` with `actions: [merge,
+delete_branch]` trips the same probe as the canonical `Review → Done`.
+That's the whole point of expressing side-effects as actions: the
+gate is action-based, not status-pair-based.
+
+## The `branch:` task field
+
+Every task carries an optional `branch:` field in its frontmatter — the
+name of the git branch the task operates on. Its presence at creation
+controls whether shelbi cuts a fresh branch or uses an existing one.
+
+```yaml
+---
+id: build-login-form
+title: Build the login form
+workflow: default
+# branch:  ← omitted → orchestrator cuts shelbi/build-login-form on dispatch
+---
+```
+
+- **Omitted at creation.** When the task moves into its first
+  `active`-category status (typically `InProgress`), the orchestrator
+  cuts a fresh branch off the workflow's resolved `base_branch`, names
+  it `shelbi/<task-id>`, and writes the name back into the task's
+  frontmatter. The user never types a branch name. This is the common
+  case.
+- **Set at creation.** The orchestrator uses that branch as-is. No new
+  branch is cut. This is how **release tasks** work: the user already
+  knows the branch (typically `feature/<name>`) and pre-fills it.
+
+```yaml
+---
+id: ship-auth-rewrite
+title: Ship the auth rewrite to main
+workflow: feature-release
+branch: feature/auth-rewrite       # pre-existing — use this branch as-is
+---
+```
+
+Once populated, `branch:` is the source of truth for every subsequent
+action — `push_branch`, `open_pr`, `merge`, `delete_branch` all
+operate on it. Workflows don't carry a separate "what branch to ship"
+field; the task does.
+
+## Parameterization
+
+A `git:` block can use `{{var}}` placeholders that resolve from the
+task's frontmatter at load time. This is what makes one
+`feature-task.yaml` reusable across any number of concurrent features:
+
+```yaml
+# workflows/feature-task.yaml
+name: feature-task
+git:
+  base_branch: feature/{{feature}}     # resolved per task
+  merge_strategy: squash
+
+statuses:
+  - { name: Todo,       category: ready,   owner: agent }
+  - { name: InProgress, category: active,  owner: agent }
+  - { name: Review,     category: handoff, owner: user  }
+  - { name: Done,       category: done,    owner: user  }
+
+transitions:
+  - from: InProgress
+    to: Review
+    actions: [push_branch]             # push so reviewers can see; no PR
+  - from: Review
+    to: Done
+    actions: [merge, delete_branch]    # merge into feature/{{feature}}
+```
+
+Two tasks, two features, one workflow file:
+
+```markdown
+---
+id: build-login-form
+title: Build the login form
+workflow: feature-task
+feature: auth-rewrite            # base_branch resolves to feature/auth-rewrite
+---
+```
+
+```markdown
+---
+id: wire-dashboard-shell
+title: Wire the dashboard shell
+workflow: feature-task
+feature: dashboard-v2            # base_branch resolves to feature/dashboard-v2
+---
+```
+
+Substitution rules:
+
+- Plain string replacement. No conditionals, no expressions, no
+  defaults.
+- Placeholders are allowed in `git:` field values only. They are not
+  resolved inside status names, category names, or the `transitions:`
+  shape.
+- A missing key produces one clear error per workflow listing every
+  unresolved placeholder, so a single edit to the task's frontmatter
+  fixes them all: *"workflow `feature-task` requires task params:
+  `feature`"*.
+
+## Dependent tasks with `depends_on`
+
+Tasks declare a `depends_on:` list in their frontmatter to express a
+parent/child relationship. This is how Graphite-style stacked PRs are
+modeled — task B builds on top of task A's branch, which builds on
+`main`.
+
+```markdown
+---
+id: build-login-form
+title: Build the login form
+workflow: default
+---
+```
+
+```markdown
+---
+id: build-dashboard
+title: Build the dashboard (uses login form)
+workflow: default
+depends_on: [build-login-form]   # branch cut off build-login-form's branch
+---
+```
+
+Three behaviors fire when `depends_on:` is set:
+
+1. **Blocked while waiting.** A task is blocked from auto-dispatch
+   while any id in `depends_on` is not yet in a `done`-category
+   status. The Kanban renders blocked cards with a `🔒` badge; they
+   sit in the `ready`-category column until their dependencies clear.
+   See [Columns](/docs/concepts/columns#in_progress) for the existing
+   behavior — this is the same gate.
+2. **Branch cut from the parent.** When the dependent task transitions
+   into its first `active`-category status, the orchestrator cuts its
+   branch off the **parent task's `branch:`** (not the workflow's
+   `base_branch`). The child branch is still named conventionally
+   (`shelbi/<child-task-id>`).
+3. **PR base is the parent.** When the dependent task's `open_pr`
+   action runs, the PR's base is the parent task's branch — not the
+   workflow's `base_branch`.
+
+A fourth behavior fires *on the parent*:
+
+4. **Auto-restack on parent merge.** When the parent's `merge` action
+   completes, the orchestrator iterates every task with
+   `depends_on:` containing the parent's id and runs the `restack`
+   action on each. The child branch is rebased onto the parent's
+   target (typically `main`), and any open PR's base is updated to
+   match. Chains restack transitively.
+
+Cycles in `depends_on:` are rejected at task-load time with a clear
+error naming the offending task and the cycle path. A task whose
+parent ended up in a non-`done` terminal state (cancelled, won't fix)
+is surfaced in the activity feed and won't proceed past the
+`ready`-category column until the user resolves it.
+
+## Per-task workflow assignment
+
+Tasks declare which workflow they belong to in frontmatter:
+
+```yaml
+---
+id: design-the-thing
+title: Design the thing
+workflow: design-review         # optional; defaults to "default" if omitted
+column: Designing               # uses a status name from the assigned workflow
+---
+```
+
+If `workflow:` is absent, the task uses the default workflow. If
+`workflow:` references a missing definition, shelbi falls back to
+`default` and logs a warning to the events feed.
+
+A task is bound to its workflow at creation. **Cross-workflow moves are
+not allowed.** To switch a task into a different workflow, create a
+fresh task in the target workflow (and archive the original if you
+want).
+
+## Default workflow
+
+Every new project ships with `workflows/default.yaml`:
+
+```yaml
+name: default
+description: The standard one-track flow shipped with every project.
+
+statuses:
+  - { name: Backlog,    category: backlog, owner: user  }
+  - { name: Todo,       category: ready,   owner: agent }
+  - { name: InProgress, category: active,  owner: agent }
+  - { name: Review,     category: handoff, owner: user  }
+  - { name: Done,       category: done,    owner: user  }
+```
+
+This makes the default an editable file rather than implicit behavior
+— you can rename `Todo` to `Ready` without breaking anything, since
+the rest of the system reasons in categories.
+
+If a project has no `workflows/` directory at all (legacy state),
+shelbi auto-generates `default.yaml` on first load. Existing task files
+are not modified — a task with no `workflow:` field is treated as
+belonging to the default workflow, so there's nothing to backfill.
+
+The shipped default omits `transitions:` for a reason: a workflow with
+no transitions block falls back to the legacy 5-status convention for
+Zen Mode's merge-bar trigger (a task in `Review` trips the bar). Once
+you declare a `transitions:` block, the trigger becomes
+action-based exclusively — any edge whose actions include `merge`.
+
+## A worked example: stacked feature branches
+
+The full picture — two workflows working together to ship a multi-task
+feature.
+
+`workflows/feature-task.yaml`:
+
+```yaml
+name: feature-task
+description: Stack tasks on a long-lived feature branch.
+
+git:
+  base_branch: feature/{{feature}}     # supplied per task
+
+statuses:
+  - { name: Todo,       category: ready,   owner: agent }
+  - { name: InProgress, category: active,  owner: agent }
+  - { name: Review,     category: handoff, owner: user  }
+  - { name: Done,       category: done,    owner: user  }
+
+transitions:
+  - from: InProgress
+    to: Review
+    actions: [push_branch]             # push so reviewers see it; no PR
+  - from: Review
+    to: Done
+    actions: [merge, delete_branch]    # squash into feature/{{feature}}
+```
+
+`workflows/feature-release.yaml`:
+
+```yaml
+name: feature-release
+description: Ship a long-lived feature branch into main.
+
+# Inherits project default base_branch: main, merge_strategy: squash —
+# no git: block needed.
+
+statuses:
+  - { name: Todo,       category: ready,   owner: agent }
+  - { name: InProgress, category: active,  owner: agent }
+  - { name: Review,     category: handoff, owner: user  }
+  - { name: Done,       category: done,    owner: user  }
+
+transitions:
+  - from: InProgress
+    to: Review
+    actions: [push_branch, open_pr]    # PR the existing feature branch
+  - from: Review
+    to: Done
+    actions: [merge, delete_branch]    # squash into main, delete branch
+```
+
+Now tasks in `feature-task` carry `feature: auth-rewrite` in their
+frontmatter — `feature-task`'s `base_branch` resolves to
+`feature/auth-rewrite`, and the orchestrator cuts each task branch off
+it at dispatch. A second feature's tasks carry `feature: dashboard-v2`.
+Same workflow file, two concurrent stacks.
+
+When auth-rewrite is ready to ship, create a task in `feature-release`
+with `branch: feature/auth-rewrite` pre-filled. Because `branch:` is
+set, the orchestrator skips the "cut a new branch" step and operates
+directly on the feature branch — one PR-and-merge cycle lands the
+whole feature into `main`.
+
+## CLI reference
+
+- `shelbi workflow list` — list every workflow in the project.
+- `shelbi workflow show <name>` — print the resolved YAML.
+- `shelbi workflow new <name>` — scaffold a starter file.
+- `shelbi workflow edit <name>` — open in `$EDITOR`.
+- `shelbi task add "Title" [--workflow <name>]` — create a card,
+  optionally in a non-default workflow.
+- `shelbi task move <id> --to <status>` — validates that `<status>`
+  is a member of the task's workflow; errors with a list of valid
+  options on mismatch.
+- `shelbi task list [--workflow <name>]` — filter by workflow.
+
+## See also
+
+- [Columns](/docs/concepts/columns) — the default workflow's columns,
+  in their pre-workflows form.
+- [The orchestrator](/docs/concepts/orchestrator) — how
+  `ready`-category statuses get dispatched.
+- [The events log](/docs/concepts/events-log#task-transitions) — line
+  shape for task transitions, including the workflow + category
+  annotations.
+- [Zen Mode](/docs/concepts/zen-mode) — what the action-based
+  confidence bar gates, and how per-workflow `zen:` overrides work.
