@@ -236,7 +236,7 @@ fn create_worktree(
 ) -> Result<()> {
     let repo_dir = machine.work_dir.to_string_lossy().into_owned();
     let wt_str = worktree.to_string_lossy().into_owned();
-    let parent_branch = project.default_branch.clone();
+    let parent_branch = project.base_branch().to_string();
 
     // Check if branch already exists locally. If yes, attach the worktree to it;
     // if not, create it from the default branch.

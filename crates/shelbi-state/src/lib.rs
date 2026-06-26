@@ -870,6 +870,7 @@ mod tests {
             worker_settings_template: override_template,
             zen: ZenConfig::default(),
             heartbeat: HeartbeatConfig::default(),
+            git: GitConfig::default(),
             contextstore_sync: Vec::new(),
             detected_shapes: Vec::new(),
         }

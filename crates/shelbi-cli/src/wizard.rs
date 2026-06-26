@@ -262,6 +262,7 @@ pub fn setup_one_project() -> Result<()> {
         worker_settings_template: None,
         zen: shelbi_core::ZenConfig::default(),
         heartbeat: shelbi_core::HeartbeatConfig::default(),
+        git: shelbi_core::GitConfig::default(),
         contextstore_sync: Vec::new(),
         detected_shapes: Vec::new(),
     };
