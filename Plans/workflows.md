@@ -18,21 +18,22 @@ The five hardcoded statuses become the **default workflow** — one definition f
 
 ### 1. Status categories (the semantic floor)
 
-Every status — default or custom — belongs to one of five categories. Categories are the vocabulary the rest of the system speaks; status *names* are user-facing labels.
+Every status — default or custom — belongs to one of six categories. Categories are the vocabulary the rest of the system speaks; status *names* are user-facing labels.
 
-| Category    | Semantic                                                                  | Default-workflow status using it |
-|-------------|---------------------------------------------------------------------------|----------------------------------|
-| `backlog`   | Not yet ready for work — triage stage.                                    | `Backlog`                        |
-| `ready`     | Ready to be picked up by whoever owns it.                                 | `Todo`                           |
-| `active`    | Owner is working on it now.                                               | `InProgress`                     |
-| `handoff`   | One owner has finished their part; another's input is required next.      | `Review`                         |
-| `done`      | Terminal state — accepted, shipped.                                       | `Done`                           |
+| Category    | Semantic                                                                  | Default-workflow status using it | Example custom names                  |
+|-------------|---------------------------------------------------------------------------|----------------------------------|---------------------------------------|
+| `backlog`   | Not yet ready for work — triage stage.                                    | `Backlog`                        | `Inbox`, `Triage`                     |
+| `ready`     | Ready to be picked up by whoever owns it.                                 | `Todo`                           | `Ready`, `Next Up`                    |
+| `active`    | Owner is working on it now.                                               | `InProgress`                     | `Building`, `Designing`, `Drafting`   |
+| `handoff`   | One owner has finished their part; another's input is required next.      | `Review`                         | `QA`, `Awaiting Sign-off`             |
+| `done`      | Terminal — accepted, shipped.                                             | `Done`                           | `Shipped`, `Released`                 |
+| `archived`  | Terminal — closed without shipping (cancelled, won't fix, duplicate, etc.). | _(none)_                       | `Cancelled`, `Won't Fix`, `Duplicate` |
 
 Generic code reasons in categories, never in literal status names:
 
-- Zen Mode's auto-merge trigger: *"when a task transitions to any `handoff` status whose next owner is the user, evaluate the merge-conditions flow."*
-- Activity feed renderers: *"a `ready -> active` transition reads as 'started.'"*
-- Orchestrator auto-dispatch: *"a task in a `ready` status whose owner is `agent` is dispatchable."*
+- Zen Mode's auto-merge trigger: *"when a task transitions to any `handoff` status whose next owner is the user, evaluate the merge-conditions flow."* Transitions into `archived` never trigger merge.
+- Activity feed renderers: *"a `ready -> active` transition reads as 'started.'"* An `active -> archived` transition reads as *"dropped"* or *"closed without shipping."*
+- Orchestrator auto-dispatch: *"a task in a `ready` status whose owner is `agent` is dispatchable."* Tasks in `done` or `archived` (both terminal) are never dispatched.
 
 A workflow can repeat a category — e.g., a long pipeline might have three `active` statuses (Design, Build, QA) all in the same category but with different owners.
 
