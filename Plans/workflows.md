@@ -175,6 +175,20 @@ Switching the filter re-renders with the selected workflow's status set — or b
 
 ### 8. Orchestrator + Zen mode
 
+**Underlying principle.** Zen Mode grants the orchestrator permission to act *as if the user is absent* — but only as far as it can do so with high confidence its decisions would match the user's. Low confidence → wait for the user. The goal is to let the system blitz through routine work without ever taking a judgment call the user wouldn't have approved.
+
+The category abstraction is what makes this tractable across arbitrary workflows. Instead of bespoke rules per status name, the orchestrator reasons about the *kind* of transition in front of it — a `handoff → done` accept, a `backlog → ready` promotion, an `active → archived` close — and applies the appropriate confidence bar before acting. Each category transition has its own bar:
+
+| Transition                        | Confidence bar in Zen                                                                       |
+| --------------------------------- | ------------------------------------------------------------------------------------------- |
+| `backlog → ready` (auto-promote)  | High — one of the three judgment categories in the orchestrator prompt must match.          |
+| `ready → active` (dispatch)       | Always allowed — purely mechanical.                                                         |
+| `active → handoff` (worker done)  | Always allowed — the worker raised it, not the orchestrator.                                |
+| `handoff → done` (accept + merge) | Highest — local checks pass, no conflicts, diff under threshold, no danger paths, green CI. |
+| `* → archived` (cancel/close)     | Never auto — closing without shipping is always the user's call.                            |
+
+If any check on a high-bar transition fails or is ambiguous, Zen leaves the task where it is and surfaces the reason in the activity feed. Blitzing stops the moment confidence drops; the user picks up where Zen paused.
+
 The orchestrator's reaction rules already key off events like `task=<id> in_progress -> review reason=worker:review-marker`. With Workflows, the events log line shape becomes:
 
 ```
