@@ -82,12 +82,32 @@ statuses:
 initial_status: Backlog
 
 # Optional: restrict allowed transitions. If absent, any-to-any is allowed.
-# transitions:
-# Backlog: [Todo]
-# Todo: [InProgress, Backlog]
-# InProgress: [Review, Todo]
-# Review: [Done, Todo, InProgress]
-# Done: []
+# allowed_transitions:
+#   Backlog: [Todo]
+#   Todo: [InProgress, Backlog]
+#   InProgress: [Review, Todo]
+#   Review: [Done, Todo, InProgress]
+#   Done: []
+
+# Optional: git-side behavior and per-edge actions. See §12 for the full
+# action set, semantics, and worked scenarios. Omitting both blocks gives a
+# pure bookkeeping workflow (no git side-effects).
+git:
+  base_branch: main
+  merge_strategy: squash
+
+transitions:
+  - from: InProgress
+    to: Review
+    actions: [push_branch, open_pr]
+
+  - from: Review
+    to: Done
+    actions: [merge, delete_branch]
+
+  - from: any
+    to: Canceled
+    actions: [close_pr, delete_branch]
 ```
 
 ### 3. Default workflow
@@ -201,6 +221,8 @@ The `category` annotation lets the orchestrator's reactions match on semantic tr
 
 - *"On any* *`active`-owned-by-agent status becoming idle"* → auto-dispatch logic.
 
+The mechanical work for each transition (push, open PR, merge, delete branch, close PR) is declared in the workflow's `transitions:` block — see §12. Zen consults that block to know *what* to execute when its confidence bar is met; the same block drives non-Zen flow via `shelbi merge` and the TUI.
+
 Zen Mode's `## Merge Conditions` prompt section keeps working unchanged — it references "tasks that reach review" semantically, and the orchestrator interprets that against the assigned workflow's category map.
 
 ### 9. CLI changes
@@ -235,6 +257,95 @@ Existing projects have no `workflows/` directory. On first load after the upgrad
 3. Existing events log lines are left alone — the parser handles old-shape lines transparently.
 
 One-time migration, then the project is on the new schema.
+
+### 12. Branch + PR semantics
+
+Workflows declare more than statuses and owners — they also declare the **git side-effects that fire on each transition**. The schema extends with a `git:` block (project-level defaults) and a `transitions:` block (per-edge action lists). Status names — not categories — are the anchor: branching policy is most naturally read against the user's actual pipeline labels.
+
+```yaml
+# workflows/default.yaml (the git + transitions extension)
+git:
+  base_branch: main             # default branch tasks branch off
+  merge_strategy: squash        # squash | merge | rebase
+
+transitions:
+  - from: InProgress
+    to: Review
+    actions: [push_branch, open_pr]
+
+  - from: Review
+    to: Done
+    actions: [merge, delete_branch]
+
+  - from: any                   # wildcard — applies regardless of source status
+    to: Canceled
+    actions: [close_pr, delete_branch]
+```
+
+**Action set.** Five primitives, each idempotent and silently no-op when not applicable:
+
+| Action          | Effect                                                                                                          |
+|-----------------|-----------------------------------------------------------------------------------------------------------------|
+| `push_branch`   | Push the task's branch to `origin`.                                                                             |
+| `open_pr`       | Open a PR against `git.base_branch`. No-op if one is already open.                                              |
+| `merge`         | Merge the branch using `git.merge_strategy`. If a PR is open, merges via PR; otherwise merges branch-to-branch. |
+| `close_pr`      | Close any open PR without merging. No-op if none open.                                                          |
+| `delete_branch` | Delete the local + remote branch. Skipped if the branch is checked out in a worker worktree.                    |
+
+Missing transitions are no-ops — a workflow only declares the edges where work needs to happen.
+
+**Wildcards.** `from: any` declares an action set that applies regardless of the source status. Useful for "any path into Canceled deletes the branch." Only one wildcard per `to:` value, to keep resolution unambiguous.
+
+**Who executes the actions.**
+
+- **In Zen Mode**, the orchestrator runs the actions for transitions it auto-triggers, gated by §8's confidence bars. A failed precheck (local checks, conflict, diff size, danger paths, CI) short-circuits the transition; the task stays where it is.
+- **Outside Zen**, the same `transitions:` block drives the manual CLI and TUI. Moving a card from Review to Done (via `shelbi task move` or the TUI) executes `merge, delete_branch` in sequence.
+
+Single source of truth: the workflow YAML declares behavior; Zen and the user-driven flow share the execution path.
+
+**Two worked scenarios.**
+
+*Gitflow — one PR per task, all merging to `main`.* The default block above, no overrides. Every task gets a branch off `main`, PR opens on `InProgress → Review`, squash-merge on `Review → Done`.
+
+*Stack tasks on a long-lived feature branch, then one PR shipping the feature.* Two workflows working together:
+
+```yaml
+# workflows/feature-task.yaml — for individual tasks within a feature
+git:
+  base_branch: feature/cool-thing
+  merge_strategy: squash
+
+transitions:
+  - from: InProgress
+    to: Review
+    actions: [push_branch]                # push so reviewers can see; NO open_pr — work just stacks
+
+  - from: Review
+    to: Done
+    actions: [merge, delete_branch]       # merge directly into feature/cool-thing
+```
+
+```yaml
+# workflows/feature-release.yaml — used for the single task that ships the feature
+git:
+  base_branch: main
+  merge_strategy: squash
+
+transitions:
+  - from: InProgress
+    to: Review
+    actions: [push_branch, open_pr]       # the big feature-completion PR against main
+
+  - from: Review
+    to: Done
+    actions: [merge, delete_branch]
+```
+
+When the feature is ready to ship, the user creates a task in `feature-release` (cross-workflow moves are allowed per §4). The feature branch goes through one final PR-and-merge cycle into `main`.
+
+**Workflows without git.** Research, planning, and other no-code workflows can omit both `git:` and `transitions:` entirely. Tasks move through statuses purely as bookkeeping — no side-effects fire.
+
+**Relationship to categories.** §8's confidence bars speak in *categories* (semantic reasoning: "this is a `handoff → done` accept, apply the highest bar"). The `transitions:` block speaks in *statuses* (concrete actions: "on `Review → Done`, run `merge` and `delete_branch`"). Both layers coexist: categories tell Zen *whether* it has permission to act; transitions tell *anyone acting* what to do.
 
 ## Rollout
 
@@ -276,7 +387,7 @@ After Phase 2: rich multi-workflow filtering on the existing Kanban board; singl
 
 ## Open questions
 
-- **Are transitions restricted by default, or any-to-any?** Today the user can move tasks freely between any columns. The YAML schema has an optional `transitions:` map. Question: when absent, is the default any-to-any or only adjacent? Recommend any-to-any (matches today's freedom).
+- **Are transitions restricted by default, or any-to-any?** Today the user can move tasks freely between any columns. The YAML schema has an optional `allowed_transitions:` map (§2). Question: when absent, is the default any-to-any or only adjacent? Recommend any-to-any (matches today's freedom). (Note: `allowed_transitions:` controls *which edges may be taken*; `transitions:` in §12 declares *what actions fire* on the edges that are taken — two different concerns.)
 
 - **Workflow inheritance?** Should a workflow be able to `extends: default` and only specify deltas (add a status, override an owner)? Useful for projects with many similar workflows; more schema to maintain. Recommend: not in v1; revisit if users actually author 4+ workflows.
 
