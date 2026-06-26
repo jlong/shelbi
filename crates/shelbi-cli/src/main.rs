@@ -135,9 +135,11 @@ enum Cmd {
         cmd: commands::zen::ZenCmd,
     },
     /// Run a single-purpose workflow action primitive. `push-branch`,
-    /// `open-pr`, `merge`, `close-pr`, and `delete-branch` are the git/gh
-    /// primitives the workflow `transitions:` block can sequence — each
-    /// is idempotent and silently no-ops when there's nothing to do.
+    /// `open-pr`, `merge`, `close-pr`, `delete-branch`, and `restack`
+    /// are the git/gh primitives the workflow `transitions:` block can
+    /// sequence — each is idempotent and silently no-ops when there's
+    /// nothing to do. `merge` also auto-fires `restack` on every
+    /// not-`Done` child that depends on the merging task.
     Action {
         #[command(subcommand)]
         cmd: commands::action::ActionCmd,
