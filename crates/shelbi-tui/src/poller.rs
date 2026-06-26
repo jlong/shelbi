@@ -702,6 +702,7 @@ mod tests {
             column: Column::InProgress,
             priority: 0,
             assigned_to: Some(worker.into()),
+            workflow: None,
             branch: None,
             depends_on: Vec::new(),
             prefers_machine: None,

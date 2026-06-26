@@ -565,12 +565,25 @@ pub struct Task {
     pub priority: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub assigned_to: Option<String>,
+    /// Name of the workflow this task runs under, matching the filename
+    /// (`workflows/<name>.yaml`) minus the extension. Absent means the
+    /// task uses the project's default workflow — see
+    /// [`Task::workflow_or_default`] and [`DEFAULT_WORKFLOW_NAME`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workflow: Option<String>,
+    /// The git branch this task operates on. Two modes (`Plans/workflows.md`
+    /// §12): omitted at creation means the orchestrator will cut
+    /// `shelbi/<task-id>` off the resolved base branch when the task moves
+    /// to `InProgress` and write the name back here; pre-filled at creation
+    /// means use that branch as-is (the *release task* pattern).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub branch: Option<String>,
     /// Other task ids this task depends on. A task is **blocked** (see
     /// [`Task::is_blocked`]) when any of these are not yet in
     /// [`Column::Done`]. Stored as a list rather than a reverse `blocks`
     /// field so cycle detection and dep editing only touch one file.
+    /// Cycles are rejected at save time by
+    /// [`shelbi_state::validate_depends_on`].
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub depends_on: Vec<String>,
     /// Optional hint to the orchestrator: prefer assigning this task to a
@@ -596,11 +609,32 @@ impl Task {
             .iter()
             .any(|id| columns.get(id).copied() != Some(Column::Done))
     }
+
+    /// The workflow name this task runs under: the explicit
+    /// [`Task::workflow`] field if set, otherwise [`DEFAULT_WORKFLOW_NAME`].
+    /// Callers that need to look up the YAML definition should hit this
+    /// instead of the raw `workflow` field so absence routes to the
+    /// default uniformly.
+    pub fn workflow_or_default(&self) -> &str {
+        self.workflow.as_deref().unwrap_or(DEFAULT_WORKFLOW_NAME)
+    }
 }
+
+/// Name of the workflow used when a task's `workflow:` frontmatter field
+/// is absent. Matches the filename of the workflow YAML that ships with
+/// every new project (`workflows/default.yaml`).
+pub const DEFAULT_WORKFLOW_NAME: &str = "default";
 
 /// Same character set as agent ids (kebab/snake alphanumeric). Aliased so
 /// call sites read clearly at the task layer.
 pub fn validate_task_id(s: &str) -> crate::Result<()> {
+    validate_agent_id(s)
+}
+
+/// Validate the `workflow:` value on a task frontmatter. The string is
+/// used as a filename component (`workflows/<name>.yaml`) so it follows
+/// the same character set as agent and task ids.
+pub fn validate_workflow_name(s: &str) -> crate::Result<()> {
     validate_agent_id(s)
 }
 
@@ -1005,6 +1039,107 @@ updated_at: 2026-06-19T00:00:00Z
     }
 
     #[test]
+    fn task_workflow_branch_depends_on_round_trip_together() {
+        // The three frontmatter fields added in
+        // `tasks-add-workflow-branch-depends-on-frontmatter-fields...`
+        // round-trip together with their expected wire shape: a string,
+        // a string, and a sequence of strings.
+        let yaml = r#"
+id: build-login
+title: Build the login form
+column: in_progress
+priority: 0
+workflow: feature-task
+branch: feature/auth-rewrite
+depends_on:
+  - scaffold-auth
+created_at: 2026-06-19T00:00:00Z
+updated_at: 2026-06-19T00:00:00Z
+"#;
+        let t: Task = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(t.workflow.as_deref(), Some("feature-task"));
+        assert_eq!(t.branch.as_deref(), Some("feature/auth-rewrite"));
+        assert_eq!(t.depends_on, vec!["scaffold-auth".to_string()]);
+
+        let back = serde_yaml::to_string(&t).unwrap();
+        assert!(back.contains("workflow: feature-task"));
+        assert!(back.contains("branch: feature/auth-rewrite"));
+        assert!(back.contains("depends_on"));
+        assert!(back.contains("- scaffold-auth"));
+
+        // Stable second round-trip — no spurious normalization.
+        let t2: Task = serde_yaml::from_str(&back).unwrap();
+        assert_eq!(serde_yaml::to_string(&t2).unwrap(), back);
+    }
+
+    #[test]
+    fn task_workflow_defaults_to_none_and_omits_in_serialization() {
+        let yaml = r#"
+id: a
+title: A
+column: todo
+priority: 0
+created_at: 2026-06-19T00:00:00Z
+updated_at: 2026-06-19T00:00:00Z
+"#;
+        let t: Task = serde_yaml::from_str(yaml).unwrap();
+        assert!(t.workflow.is_none());
+        // Absent `workflow:` routes to the canonical default name; no
+        // caller has to special-case `Option::None`.
+        assert_eq!(t.workflow_or_default(), DEFAULT_WORKFLOW_NAME);
+        let back = serde_yaml::to_string(&t).unwrap();
+        assert!(!back.contains("workflow"));
+    }
+
+    #[test]
+    fn task_workflow_or_default_prefers_explicit() {
+        let mut t: Task = serde_yaml::from_str(
+            r#"
+id: a
+title: A
+column: todo
+priority: 0
+created_at: 2026-06-19T00:00:00Z
+updated_at: 2026-06-19T00:00:00Z
+"#,
+        )
+        .unwrap();
+        assert_eq!(t.workflow_or_default(), DEFAULT_WORKFLOW_NAME);
+        t.workflow = Some("design-review".into());
+        assert_eq!(t.workflow_or_default(), "design-review");
+    }
+
+    #[test]
+    fn task_branch_defaults_to_none_and_omits_in_serialization() {
+        let yaml = r#"
+id: a
+title: A
+column: todo
+priority: 0
+created_at: 2026-06-19T00:00:00Z
+updated_at: 2026-06-19T00:00:00Z
+"#;
+        let t: Task = serde_yaml::from_str(yaml).unwrap();
+        assert!(t.branch.is_none());
+        let back = serde_yaml::to_string(&t).unwrap();
+        assert!(!back.contains("branch"));
+    }
+
+    #[test]
+    fn workflow_name_validation_matches_id_rules() {
+        // Same character class as task ids — workflow names are filename
+        // components (`workflows/<name>.yaml`), so spaces and slashes are
+        // rejected for the same reason.
+        assert!(validate_workflow_name("default").is_ok());
+        assert!(validate_workflow_name("feature-task").is_ok());
+        assert!(validate_workflow_name("design_review").is_ok());
+        assert!(validate_workflow_name("").is_err());
+        assert!(validate_workflow_name("has spaces").is_err());
+        assert!(validate_workflow_name("slash/in/name").is_err());
+        assert!(validate_workflow_name("-leading-hyphen").is_err());
+    }
+
+    #[test]
     fn task_is_blocked_when_any_dep_not_done() {
         let now = chrono::Utc::now();
         let task = Task {
@@ -1013,6 +1148,7 @@ updated_at: 2026-06-19T00:00:00Z
             column: Column::Todo,
             priority: 0,
             assigned_to: None,
+            workflow: None,
             branch: None,
             depends_on: vec!["b".into(), "c".into()],
             prefers_machine: None,
@@ -1042,6 +1178,7 @@ updated_at: 2026-06-19T00:00:00Z
             column: Column::Todo,
             priority: 0,
             assigned_to: None,
+            workflow: None,
             branch: None,
             depends_on: vec![],
             prefers_machine: Some("devbox".into()),
@@ -1252,6 +1389,7 @@ worker_settings_template: /etc/shelbi/p.json
             column: Column::Todo,
             priority: 0,
             assigned_to: None,
+            workflow: None,
             branch: None,
             depends_on: vec![],
             prefers_machine: None,

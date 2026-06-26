@@ -1441,6 +1441,7 @@ mod scan_tests {
             column,
             priority,
             assigned_to: None,
+            workflow: None,
             branch: None,
             depends_on: deps.iter().map(|s| s.to_string()).collect(),
             prefers_machine: None,
