@@ -69,7 +69,7 @@ fn render_list(f: &mut Frame, app: &mut App, area: Rect) {
     // Full-row dark-gray fill on the selected row. fg/bold for the
     // selected text is set per-span in render_row so the contrast against
     // the new bg is explicit.
-    let list = List::new(items).highlight_style(Style::default().bg(Color::DarkGray));
+    let list = List::new(items).highlight_style(Style::default().bg(Color::Rgb(63,63,63)));
     f.render_stateful_widget(list, inner, &mut state);
 }
 
@@ -264,8 +264,8 @@ fn render_zen_row(f: &mut Frame, area: Rect, app: &App) {
     }
     if matches!(app.zen_mode, ZenModeState::On) {
         let style = Style::default()
-            .bg(Color::Rgb(0, 200, 80))
-            .fg(Color::Black)
+            .bg(Color::Rgb(0, 127, 0))
+            .fg(Color::Rgb(255, 255, 255))
             .add_modifier(Modifier::BOLD);
         let width = area.width as usize;
         let label = "ZEN MODE ON";
@@ -275,9 +275,9 @@ fn render_zen_row(f: &mut Frame, area: Rect, app: &App) {
             // band stays exactly one row tall.
             label.chars().take(width).collect::<String>()
         } else {
-            // Center the label inside a full-width green band.
+            // Align the label left inside a full-width green band.
             let pad = width - label_w;
-            let left = pad / 2;
+            let left = 1;
             let right = pad - left;
             format!("{}{}{}", " ".repeat(left), label, " ".repeat(right))
         };
