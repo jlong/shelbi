@@ -1,5 +1,5 @@
-//! Workflow action primitives — `push_branch`, `open_pr`, `close_pr`,
-//! `delete_branch`.
+//! Workflow action primitives — `push_branch`, `open_pr`, `merge`,
+//! `close_pr`, `delete_branch`.
 //!
 //! Each function does one git/gh thing the workflow `transitions:` block
 //! can name (see Plans/workflows.md, "Action set"). They are deliberately
@@ -15,6 +15,10 @@
 //! - `open_pr` opens a PR for the task's branch. If one is already open,
 //!   returns its number unchanged. The base branch is picked by a fallback
 //!   chain — see [`open_pr`].
+//! - `merge` integrates the task's branch into the target branch using the
+//!   project's configured merge strategy. Two paths: if a PR is open, runs
+//!   `gh pr merge --<strategy>`; otherwise the hub fetches from origin and
+//!   performs a local `git merge --<strategy>` on the target. See [`merge`].
 //! - `close_pr` closes any *open* PR for the task's branch; with no open
 //!   PR it returns `None` instead of erroring.
 //! - `delete_branch` removes the branch from origin and from the hub's
@@ -23,11 +27,12 @@
 //!
 //! `push_branch` and `open_pr` run against the worker's worktree (that's
 //! where the branch lives, and `gh pr create` needs a remote-tracking
-//! branch to associate with). `close_pr` and `delete_branch` run on the
-//! hub — by the time the orchestrator is cleaning up a branch the branch
-//! is on origin, so gh / git from any hub checkout work fine.
+//! branch to associate with). `merge`, `close_pr`, and `delete_branch`
+//! run on the hub — by the time the orchestrator is integrating or
+//! cleaning up a branch the branch is on origin, so gh / git from any
+//! hub checkout work fine.
 
-use shelbi_core::{Column, Error, Host, Project, Result, Task};
+use shelbi_core::{Column, Error, Host, MergeStrategy, Project, Result, Task};
 
 use crate::git::{
     compose_pr_body, head_commit_subject, locate_hub_workdir, locate_worker_worktree,
@@ -60,6 +65,42 @@ impl DeleteOutcome {
                 format!("skipped:{safe}")
             }
             DeleteOutcome::NotPresent => "not-present".to_string(),
+        }
+    }
+}
+
+/// Outcome of [`merge`]. Tells the caller which path actually ran so a
+/// follow-on action (or the user staring at stdout) can tell whether the
+/// integration went through GitHub or stayed entirely on the hub.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MergeOutcome {
+    /// An open PR for the task's branch was found and merged via
+    /// `gh pr merge --<strategy>`. GitHub picked the merge commit SHA.
+    ViaPr { pr: u64, sha: String },
+    /// No PR was open. The hub fetched the branch from origin and ran
+    /// `git merge --<strategy>` against `target` locally, then pushed
+    /// `target` back to origin. The SHA is the resulting tip of
+    /// `target`.
+    HubSide { sha: String, target: String },
+}
+
+impl MergeOutcome {
+    /// Single-line wire format printed on stdout by `shelbi action merge`.
+    /// Prefix-keyed (`pr:` / `hub:`) so a caller can tell the two paths
+    /// apart without parsing JSON.
+    pub fn as_line(&self) -> String {
+        match self {
+            MergeOutcome::ViaPr { pr, sha } => format!("pr:{pr}:{sha}"),
+            MergeOutcome::HubSide { sha, target } => format!("hub:{target}:{sha}"),
+        }
+    }
+
+    /// SHA of the integration commit, regardless of which path took it
+    /// there. The caller usually wants this to log the merge or to feed
+    /// a follow-on `delete_branch` / restack pass.
+    pub fn sha(&self) -> &str {
+        match self {
+            MergeOutcome::ViaPr { sha, .. } | MergeOutcome::HubSide { sha, .. } => sha,
         }
     }
 }
@@ -215,6 +256,294 @@ where
         }
     }
     project_base_branch.to_string()
+}
+
+/// Integrate the task's branch into the target branch using the project's
+/// configured [`MergeStrategy`].
+///
+/// Two paths share this primitive, picked by whether a PR is currently
+/// open for the branch:
+///
+/// - **`gh pr merge` path** — when an open PR exists, the hub runs
+///   `gh pr merge <pr> --<strategy>`. GitHub picks the merge commit and
+///   we read the SHA back via `gh pr view --json mergeCommit`. The PR's
+///   own base wins; we don't re-target it from `target_override` because
+///   `open_pr` was already responsible for picking the right base.
+/// - **Hub-side fetch path** — when no PR is open, the hub fetches the
+///   branch (and `target`) from origin, fast-forwards `target` to
+///   `origin/target`, runs `git merge --<strategy>` against `target`,
+///   then pushes `target` back to origin. The hub's work_dir must be
+///   clean of user changes (`.shelbi/` is ignored, the same way
+///   `shelbi merge` preflight does it).
+///
+/// The effective target is `target_override` (the per-transition `target:`
+/// from the workflow YAML) if set, else [`Project::base_branch`]. The
+/// effective strategy is [`Project::merge_strategy`]. In v1 only `squash`
+/// and `merge` are accepted — `rebase` is reserved for a follow-up and
+/// returns a clear error rather than silently choosing one of the others.
+///
+/// `merge` does **not** delete the branch as a side-effect — that's
+/// `delete_branch`'s job. Workflows sequence them as
+/// `[merge, delete_branch]` so each action stays single-purpose and the
+/// user can tweak the policy independently.
+pub fn merge(
+    project: &Project,
+    task: &Task,
+    target_override: Option<&str>,
+) -> Result<MergeOutcome> {
+    let branch = require_branch(task)?;
+    let strategy = require_supported_strategy(project.merge_strategy())?;
+    let target = target_override
+        .map(str::to_string)
+        .unwrap_or_else(|| project.base_branch().to_string());
+    let (host, dir) = locate_hub_workdir(project)?;
+    let wt = dir.to_string_lossy().into_owned();
+
+    if let Some(pr) = lookup_open_pr(&host, &wt, &branch)? {
+        let sha = merge_via_pr(&host, &wt, pr, strategy)?;
+        return Ok(MergeOutcome::ViaPr { pr, sha });
+    }
+
+    let sha = merge_hub_side(&host, &wt, &branch, &target, strategy, &task.id)?;
+    Ok(MergeOutcome::HubSide { sha, target })
+}
+
+/// `gh pr merge <pr> --<strategy>` on the hub, then read the resulting
+/// merge commit SHA back with `gh pr view`. Mirrors the shape of
+/// [`crate::zen::pr_merge`] but stops short of `--delete-branch` — the
+/// workflow's `delete_branch` action is responsible for that.
+fn merge_via_pr(host: &Host, wt: &str, pr: u64, strategy: MergeStrategy) -> Result<String> {
+    let pr_str = pr.to_string();
+    let strategy_flag = strategy.gh_flag();
+    let out = run_in_dir(host, wt, &["gh", "pr", "merge", &pr_str, strategy_flag])?;
+    if !out.status.success() {
+        return Err(Error::Command {
+            cmd: format!("gh pr merge {pr_str} {strategy_flag}"),
+            status: out.status.to_string(),
+            stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
+        });
+    }
+
+    // gh pr merge doesn't print the merge SHA. Ask gh for it separately.
+    let view = run_in_dir(
+        host,
+        wt,
+        &[
+            "gh",
+            "pr",
+            "view",
+            &pr_str,
+            "--json",
+            "mergeCommit",
+            "--jq",
+            ".mergeCommit.oid // empty",
+        ],
+    )?;
+    if !view.status.success() {
+        return Err(Error::Command {
+            cmd: format!("gh pr view {pr_str} --json mergeCommit"),
+            status: view.status.to_string(),
+            stderr: String::from_utf8_lossy(&view.stderr).into_owned(),
+        });
+    }
+    let sha = String::from_utf8_lossy(&view.stdout).trim().to_string();
+    if sha.is_empty() {
+        return Err(Error::Other(format!(
+            "gh pr view {pr_str}: merge reported success but mergeCommit.oid is empty"
+        )));
+    }
+    Ok(sha)
+}
+
+/// Hub-side fetch + local merge — used when no PR exists for the branch.
+/// Steps:
+/// 1. Refuse if the hub work_dir has uncommitted user changes (`.shelbi/`
+///    is exempt; the orchestrator scribbles there during normal operation).
+/// 2. `git fetch origin <target> <branch>` so we have the latest tips.
+/// 3. Refuse if the branch never made it to origin — that's a workflow
+///    contract violation: `merge` runs after `push_branch` (or after the
+///    user pushed the branch some other way). The error names the missing
+///    ref so the operator can fix it.
+/// 4. Check out `target` and fast-forward to `origin/target` so the hub's
+///    target tracks the remote. A non-FF target means the hub diverged
+///    from origin — surface the failure rather than papering over it with
+///    a destructive reset.
+/// 5. Run `git merge --<strategy>` against `origin/<branch>` and, for
+///    `--squash`, follow with a commit since `--squash` only stages.
+/// 6. Push the resulting `target` tip to origin and return its SHA.
+fn merge_hub_side(
+    host: &Host,
+    wt: &str,
+    branch: &str,
+    target: &str,
+    strategy: MergeStrategy,
+    task_id: &str,
+) -> Result<String> {
+    let dirty = run_capture_stdout(host, wt, &["git", "status", "--porcelain"])?;
+    let user_dirty: Vec<&str> = dirty
+        .lines()
+        .filter(|l| {
+            let path = l.get(3..).unwrap_or("");
+            !(path.starts_with(".shelbi/") || path == ".shelbi" || path == ".gitignore")
+        })
+        .collect();
+    if !user_dirty.is_empty() {
+        return Err(Error::Other(format!(
+            "hub work_dir at {wt} has uncommitted changes — commit or stash before merging:\n{}",
+            user_dirty.join("\n")
+        )));
+    }
+
+    // Probe `origin` for the branch *before* fetching so we can surface
+    // the workflow-contract violation directly. A bare `git fetch
+    // origin <branch>` against a missing ref dies with `couldn't find
+    // remote ref <branch>`, which is accurate but doesn't tell the
+    // operator the action they need to run.
+    if !remote_branch_exists(host, wt, branch)? {
+        return Err(Error::Other(format!(
+            "branch `{branch}` is not on origin — run the `push_branch` action \
+             first, or push the branch manually and retry"
+        )));
+    }
+
+    run_or_command_err(
+        host,
+        wt,
+        &["git", "fetch", "origin", target, branch],
+        || format!("git -C {wt} fetch origin {target} {branch}"),
+    )?;
+
+    run_or_command_err(host, wt, &["git", "checkout", target], || {
+        format!("git -C {wt} checkout {target}")
+    })?;
+    run_or_command_err(
+        host,
+        wt,
+        &["git", "merge", "--ff-only", &format!("origin/{target}")],
+        || format!("git -C {wt} merge --ff-only origin/{target}"),
+    )?;
+
+    // Guard against "no commits beyond target." A no-op merge is not what
+    // any caller wants; bailing here surfaces the misconfiguration loudly
+    // instead of returning yesterday's HEAD as the "merge SHA."
+    let ahead = run_capture_stdout(
+        host,
+        wt,
+        &[
+            "git",
+            "rev-list",
+            "--count",
+            &format!("{target}..origin/{branch}"),
+        ],
+    )?;
+    if ahead.trim() == "0" {
+        return Err(Error::Other(format!(
+            "branch `{branch}` has no commits beyond `{target}` — nothing to merge"
+        )));
+    }
+
+    let origin_branch = format!("origin/{branch}");
+    match strategy {
+        MergeStrategy::Squash => {
+            run_or_command_err(
+                host,
+                wt,
+                &["git", "merge", "--squash", &origin_branch],
+                || format!("git -C {wt} merge --squash origin/{branch}"),
+            )?;
+            // `--squash` only stages; we still owe a commit. The message
+            // matches the legacy `shelbi merge` shape so log readers see
+            // the same prefix regardless of which path produced the
+            // commit.
+            let msg = format!("shelbi: merge {task_id} from {branch}");
+            run_or_command_err(host, wt, &["git", "commit", "-m", &msg], || {
+                format!("git -C {wt} commit -m \"{msg}\"")
+            })?;
+        }
+        MergeStrategy::Merge => {
+            // `--no-ff` forces a merge commit even when the branch could
+            // fast-forward — the spec's "Merge" strategy explicitly
+            // preserves the branch's commits *plus* a merge commit on
+            // top, which is what `gh pr merge --merge` produces on
+            // GitHub. `--no-edit` keeps git from launching $EDITOR; the
+            // default `Merge branch '…'` message stays.
+            run_or_command_err(
+                host,
+                wt,
+                &[
+                    "git",
+                    "merge",
+                    "--no-ff",
+                    "--no-edit",
+                    &origin_branch,
+                ],
+                || format!("git -C {wt} merge --no-ff origin/{branch}"),
+            )?;
+        }
+        MergeStrategy::Rebase => unreachable!("rejected upstream by require_supported_strategy"),
+    }
+
+    run_or_command_err(host, wt, &["git", "push", "origin", target], || {
+        format!("git -C {wt} push origin {target}")
+    })?;
+
+    let sha = run_capture_stdout(host, wt, &["git", "rev-parse", "HEAD"])?
+        .trim()
+        .to_string();
+    if sha.is_empty() {
+        return Err(Error::Other(format!(
+            "post-merge `git rev-parse HEAD` returned empty output in {wt}"
+        )));
+    }
+    Ok(sha)
+}
+
+/// v1 of the `merge` action supports `squash` and `merge`. `rebase` is
+/// reserved (see Plans/workflows.md §12 "Action set"); reject it loudly
+/// rather than silently picking one of the other strategies.
+fn require_supported_strategy(strategy: MergeStrategy) -> Result<MergeStrategy> {
+    match strategy {
+        MergeStrategy::Squash | MergeStrategy::Merge => Ok(strategy),
+        MergeStrategy::Rebase => Err(Error::Other(
+            "merge action does not support `merge_strategy: rebase` yet — \
+             set `git.merge_strategy` to `squash` or `merge` in the project \
+             or workflow YAML"
+                .into(),
+        )),
+    }
+}
+
+/// `run_in_dir` + convert a non-zero status into [`Error::Command`] using
+/// a caller-supplied `cmd` description. Sugar to keep the merge orchestration
+/// readable.
+fn run_or_command_err<F>(host: &Host, wt: &str, argv: &[&str], cmd_for_err: F) -> Result<()>
+where
+    F: FnOnce() -> String,
+{
+    let out = run_in_dir(host, wt, argv)?;
+    if !out.status.success() {
+        return Err(Error::Command {
+            cmd: cmd_for_err(),
+            status: out.status.to_string(),
+            stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
+        });
+    }
+    Ok(())
+}
+
+/// `run_in_dir` and return stdout as an owned String, surfacing failures
+/// as [`Error::Command`]. Sugar for the merge orchestration's read
+/// commands.
+fn run_capture_stdout(host: &Host, wt: &str, argv: &[&str]) -> Result<String> {
+    let out = run_in_dir(host, wt, argv)?;
+    if !out.status.success() {
+        return Err(Error::Command {
+            cmd: argv.join(" "),
+            status: out.status.to_string(),
+            stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
+        });
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
 /// Close any open PR for the task's branch on the hub.
@@ -870,5 +1199,379 @@ mod tests {
         let parents = lookup(Vec::new());
         let target = resolve_pr_target_from("trunk", &ch, None, parents);
         assert_eq!(target, "trunk");
+    }
+
+    // --- merge wire format + strategy gate --------------------------------
+
+    #[test]
+    fn merge_outcome_as_line_is_prefix_keyed() {
+        let pr = MergeOutcome::ViaPr {
+            pr: 42,
+            sha: "deadbeefcafef00d".into(),
+        };
+        assert_eq!(pr.as_line(), "pr:42:deadbeefcafef00d");
+        assert_eq!(pr.sha(), "deadbeefcafef00d");
+
+        let hub = MergeOutcome::HubSide {
+            sha: "beadc0de".into(),
+            target: "main".into(),
+        };
+        assert_eq!(hub.as_line(), "hub:main:beadc0de");
+        assert_eq!(hub.sha(), "beadc0de");
+    }
+
+    #[test]
+    fn supported_strategies_pass_through() {
+        assert_eq!(
+            require_supported_strategy(MergeStrategy::Squash).unwrap(),
+            MergeStrategy::Squash
+        );
+        assert_eq!(
+            require_supported_strategy(MergeStrategy::Merge).unwrap(),
+            MergeStrategy::Merge
+        );
+    }
+
+    #[test]
+    fn rebase_strategy_errors_with_actionable_message() {
+        let err = require_supported_strategy(MergeStrategy::Rebase).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("rebase"), "{msg}");
+        // The message must name the YAML knob the user has to flip; a
+        // bare "unsupported" wouldn't tell them where to look.
+        assert!(msg.contains("merge_strategy"), "{msg}");
+        assert!(msg.contains("squash"), "{msg}");
+    }
+
+    // --- merge hub-side integration ---------------------------------------
+    //
+    // We exercise the hub-side fetch path against the same bare-remote
+    // fixture used by `delete_branch_removes_local_and_remote`. Tests
+    // drive `merge_hub_side` directly rather than the public `merge()`
+    // because `merge()`'s very first step is `gh pr list` — and gh
+    // refuses to query a non-GitHub remote, so the fixture's plain
+    // bare repo can't be probed. The PR-branching decision in `merge()`
+    // is a one-line `if let`; integration testing against real GitHub
+    // covers it (see `zen::pr_merge`'s existing harness, same shape).
+    //
+    // The gh-pr path is integration-only (requires GitHub), so we don't
+    // try to simulate it here — the strategy flag selection and SHA
+    // round-trip are covered by the existing `zen::pr_merge` tests on
+    // real PRs.
+
+    /// Build a project pointing at `local` with the given strategy.
+    /// Kept around because the rebase-gate test still goes through the
+    /// public `merge()` entry point.
+    fn project_at(local: &std::path::Path, strategy: MergeStrategy) -> Project {
+        let mut runners = BTreeMap::new();
+        runners.insert(
+            "claude".to_string(),
+            AgentRunnerSpec { command: "claude".into(), flags: vec![] },
+        );
+        Project {
+            name: "fixture".into(),
+            repo: local.to_string_lossy().into(),
+            default_branch: "main".into(),
+            machines: vec![Machine {
+                name: "hub".into(),
+                kind: MachineKind::Local,
+                work_dir: local.to_path_buf(),
+                host: None,
+            }],
+            orchestrator: OrchestratorSpec { runner: "claude".into() },
+            agent_runners: runners,
+            editor: None,
+            github_url: None,
+            workers: Vec::new(),
+            worker_poll_interval_secs: 5,
+            worker_permissions_mode: "auto".into(),
+            worker_settings_template: None,
+            zen: ZenConfig::default(),
+            heartbeat: HeartbeatConfig::default(),
+            contextstore_sync: Vec::new(),
+            detected_shapes: Vec::new(),
+            git: shelbi_core::GitConfig {
+                base_branch: None,
+                merge_strategy: strategy,
+            },
+        }
+    }
+
+    /// Add a commit to `feature` so it has something beyond `main`, then
+    /// push it.
+    fn advance_feature_with_origin(local: &std::path::Path) {
+        run_git(local, &["checkout", "feature"]);
+        std::fs::write(local.join("feature.txt"), "from feature\n").unwrap();
+        run_git(local, &["add", "feature.txt"]);
+        run_git(local, &["commit", "-q", "-m", "feature work"]);
+        run_git(local, &["push", "origin", "feature"]);
+        run_git(local, &["checkout", "main"]);
+    }
+
+    #[test]
+    fn hub_side_squash_merges_branch_into_target() {
+        let (_tmp, _remote, local) = fixture_repo_with_origin();
+        advance_feature_with_origin(&local);
+        let wt = local.to_string_lossy().into_owned();
+
+        let sha = merge_hub_side(
+            &Host::Local,
+            &wt,
+            "feature",
+            "main",
+            MergeStrategy::Squash,
+            "t",
+        )
+        .unwrap();
+        assert!(!sha.is_empty());
+
+        // The squashed change made it onto main locally.
+        let head_sha = run_capture_stdout(&Host::Local, &wt, &["git", "rev-parse", "HEAD"])
+            .unwrap()
+            .trim()
+            .to_string();
+        assert_eq!(head_sha, sha);
+        assert!(local.join("feature.txt").exists());
+
+        // The squash commit is a single new commit on main (the message
+        // is shelbi's, not the worker's), so log shape: init, then merge.
+        let log = run_capture_stdout(
+            &Host::Local,
+            &wt,
+            &["git", "log", "main", "--format=%s"],
+        )
+        .unwrap();
+        let lines: Vec<&str> = log.lines().collect();
+        assert_eq!(lines.len(), 2, "{log}");
+        assert_eq!(lines[0], "shelbi: merge t from feature");
+        assert_eq!(lines[1], "init");
+
+        // And the merge made it to origin too.
+        let remote_sha = run_capture_stdout(
+            &Host::Local,
+            &wt,
+            &["git", "rev-parse", "origin/main"],
+        )
+        .unwrap()
+        .trim()
+        .to_string();
+        assert_eq!(remote_sha, sha);
+    }
+
+    #[test]
+    fn hub_side_merge_strategy_preserves_branch_history() {
+        let (_tmp, _remote, local) = fixture_repo_with_origin();
+        advance_feature_with_origin(&local);
+        let wt = local.to_string_lossy().into_owned();
+
+        let _sha = merge_hub_side(
+            &Host::Local,
+            &wt,
+            "feature",
+            "main",
+            MergeStrategy::Merge,
+            "t",
+        )
+        .unwrap();
+
+        // `--merge` strategy preserves the feature commit AND adds a
+        // merge commit on top, so three subjects show up in main's log:
+        // the merge commit, the feature commit, and the initial commit.
+        // We don't pin their interleaving — git log's default ordering
+        // for merges is topology-driven and can differ between git
+        // versions — but all three must be present and exactly one of
+        // them must be the merge commit.
+        let log = run_capture_stdout(
+            &Host::Local,
+            &wt,
+            &["git", "log", "main", "--format=%s"],
+        )
+        .unwrap();
+        let subjects: std::collections::HashSet<&str> = log.lines().collect();
+        assert_eq!(subjects.len(), 3, "{log}");
+        assert!(subjects.contains("feature work"), "{log}");
+        assert!(subjects.contains("init"), "{log}");
+        assert!(
+            subjects.iter().any(|s| s.starts_with("Merge")),
+            "expected a merge commit subject in {log}",
+        );
+    }
+
+    #[test]
+    fn hub_side_routes_merge_to_an_arbitrary_target() {
+        // The `target_override` -> `merge_hub_side(target=...)` plumbing
+        // shouldn't care which branch is named. Cut a `develop` branch
+        // off `main` on both local and origin and aim the merge at it,
+        // mirroring a workflow with `target: develop` on its review edge.
+        let (_tmp, _remote, local) = fixture_repo_with_origin();
+        advance_feature_with_origin(&local);
+        run_git(&local, &["branch", "develop"]);
+        run_git(&local, &["push", "origin", "develop"]);
+        let wt = local.to_string_lossy().into_owned();
+
+        let _sha = merge_hub_side(
+            &Host::Local,
+            &wt,
+            "feature",
+            "develop",
+            MergeStrategy::Squash,
+            "t",
+        )
+        .unwrap();
+
+        // main untouched; develop got the squash commit.
+        let main_log = run_capture_stdout(
+            &Host::Local,
+            &wt,
+            &["git", "log", "main", "--format=%s"],
+        )
+        .unwrap();
+        assert_eq!(main_log.trim(), "init");
+        let dev_log = run_capture_stdout(
+            &Host::Local,
+            &wt,
+            &["git", "log", "develop", "--format=%s"],
+        )
+        .unwrap();
+        let dev_lines: Vec<&str> = dev_log.lines().collect();
+        assert_eq!(dev_lines[0], "shelbi: merge t from feature");
+    }
+
+    #[test]
+    fn rebase_strategy_blocks_action_before_any_git_runs() {
+        // The gate is at the top of `merge` so a misconfigured project
+        // fails fast, before we touch the working tree. Use a fixture
+        // that *would* otherwise be a clean merge candidate — the test
+        // proves the gate fires regardless of whether the merge could
+        // have succeeded. This is the one merge test that drives the
+        // public `merge()` rather than `merge_hub_side`: the gate sits
+        // before the `gh pr list` probe, so the bare-remote fixture
+        // never hits gh.
+        let (_tmp, _remote, local) = fixture_repo_with_origin();
+        advance_feature_with_origin(&local);
+        let project = project_at(&local, MergeStrategy::Rebase);
+
+        let err = merge(&project, &task_on_branch("t", "feature"), None).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("rebase"), "{msg}");
+
+        // Tree untouched — main still at the initial commit.
+        let wt = local.to_string_lossy().into_owned();
+        let log = run_capture_stdout(
+            &Host::Local,
+            &wt,
+            &["git", "log", "main", "--format=%s"],
+        )
+        .unwrap();
+        assert_eq!(log.trim(), "init");
+    }
+
+    #[test]
+    fn missing_origin_branch_errors_pointing_at_push_branch() {
+        // No `push_branch` ran first → no `origin/feature` ref. The
+        // error must name the action the operator should run, not just
+        // bubble up git's "couldn't find remote ref" message.
+        let (_tmp, _remote, local) = fixture_repo_with_origin();
+        // Remove the feature branch from origin so the precondition fails.
+        run_git(&local, &["push", "origin", "--delete", "feature"]);
+        let wt = local.to_string_lossy().into_owned();
+
+        let err = merge_hub_side(
+            &Host::Local,
+            &wt,
+            "feature",
+            "main",
+            MergeStrategy::Squash,
+            "t",
+        )
+        .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("not on origin"), "{msg}");
+        assert!(msg.contains("push_branch"), "{msg}");
+    }
+
+    #[test]
+    fn no_commits_beyond_target_errors_instead_of_recording_a_no_op() {
+        // If feature is identical to main, there's nothing to merge.
+        // Returning the current HEAD as the "merge SHA" would silently
+        // log a successful integration that did nothing — refuse loudly.
+        let (_tmp, _remote, local) = fixture_repo_with_origin();
+        // `feature` was branched off init but never advanced, so it's
+        // sitting at the same SHA as main. Push it so origin/feature
+        // exists (the precondition).
+        run_git(&local, &["push", "origin", "feature"]);
+        let wt = local.to_string_lossy().into_owned();
+
+        let err = merge_hub_side(
+            &Host::Local,
+            &wt,
+            "feature",
+            "main",
+            MergeStrategy::Squash,
+            "t",
+        )
+        .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("no commits beyond"), "{msg}");
+    }
+
+    #[test]
+    fn dirty_hub_work_dir_errors_before_touching_anything() {
+        let (_tmp, _remote, local) = fixture_repo_with_origin();
+        advance_feature_with_origin(&local);
+
+        // Plant an unstaged user change in the hub work_dir.
+        std::fs::write(local.join("user-wip.txt"), "scratch\n").unwrap();
+        let wt = local.to_string_lossy().into_owned();
+
+        let err = merge_hub_side(
+            &Host::Local,
+            &wt,
+            "feature",
+            "main",
+            MergeStrategy::Squash,
+            "t",
+        )
+        .unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("uncommitted changes"),
+            "expected dirty-tree error, got {msg}",
+        );
+        assert!(msg.contains("user-wip.txt"), "error should name the dirty file: {msg}");
+
+        // Main untouched.
+        let log = run_capture_stdout(
+            &Host::Local,
+            &wt,
+            &["git", "log", "main", "--format=%s"],
+        )
+        .unwrap();
+        assert_eq!(log.trim(), "init");
+    }
+
+    #[test]
+    fn dirty_shelbi_subdir_does_not_block_merge() {
+        // `.shelbi/` is the orchestrator's scratch space — it's always
+        // dirty during normal operation (state.json, logs/, …) and the
+        // user never edits it directly. Mirroring `shelbi merge`'s
+        // preflight, ignore changes under that path.
+        let (_tmp, _remote, local) = fixture_repo_with_origin();
+        advance_feature_with_origin(&local);
+
+        std::fs::create_dir_all(local.join(".shelbi")).unwrap();
+        std::fs::write(local.join(".shelbi/state.json"), "{}\n").unwrap();
+        let wt = local.to_string_lossy().into_owned();
+
+        let sha = merge_hub_side(
+            &Host::Local,
+            &wt,
+            "feature",
+            "main",
+            MergeStrategy::Squash,
+            "t",
+        )
+        .unwrap();
+        assert!(!sha.is_empty());
     }
 }

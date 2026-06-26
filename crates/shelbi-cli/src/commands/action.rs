@@ -38,6 +38,22 @@ pub enum ActionCmd {
     /// Close any open PR for the task's branch. Prints the closed PR
     /// number on stdout, or `none` if there was nothing to close.
     ClosePr { task_id: String },
+    /// Integrate the task's branch into the target branch using the
+    /// project's configured `merge_strategy`. Picks one of two paths
+    /// per `Plans/workflows.md` §12: if a PR is open for the branch,
+    /// runs `gh pr merge --<strategy>`; otherwise the hub fetches the
+    /// branch from `origin` and runs `git merge --<strategy>` locally,
+    /// then pushes the result back. Prints `pr:<n>:<sha>` or
+    /// `hub:<target>:<sha>` so the caller can tell the two paths apart.
+    /// Does not delete the branch — pair with `delete-branch` for that.
+    Merge {
+        task_id: String,
+        /// Override the merge target for this call. Mirrors the
+        /// per-transition `target:` field on the workflow YAML; absent,
+        /// the merge lands on the project's effective `base_branch`.
+        #[arg(long)]
+        target: Option<String>,
+    },
     /// Delete the task's branch from `origin` and from the hub's local
     /// refs. Skipped if a worker still has the branch checked out.
     /// Prints `deleted` / `skipped:<reason>` / `not-present`.
@@ -74,6 +90,13 @@ pub fn run(project_opt: Option<String>, cmd: ActionCmd) -> Result<()> {
                 Some(pr) => println!("{pr}"),
                 None => println!("none"),
             }
+            Ok(())
+        }
+        ActionCmd::Merge { task_id, target } => {
+            let tf = load_task(&project_name, &task_id).map_err(|e| anyhow!(e))?;
+            let outcome =
+                actions::merge(&project, &tf.task, target.as_deref()).map_err(|e| anyhow!(e))?;
+            println!("{}", outcome.as_line());
             Ok(())
         }
         ActionCmd::DeleteBranch { task_id } => {
