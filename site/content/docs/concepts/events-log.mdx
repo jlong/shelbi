@@ -1,7 +1,7 @@
 ---
 title: The events log
-order: 3
-summary: An append-only file at ~/.shelbi/events.log — every worker state change and task column move, in one stream the orchestrator tails.
+order: 13
+summary: An append-only file at ~/.shelbi/events.log — every worker state change and task status move, in one stream the orchestrator tails.
 ---
 
 # The events log
@@ -59,9 +59,10 @@ carries:
 2026-06-22T14:31:52+00:00 task=fix-login in_progress -> review reason=worker:review-marker
 ```
 
-- `<from-column>` and `<to-column>` are the snake_case column names:
-  `backlog`, `todo`, `in_progress`, `review`, `done`. See
-  [columns](/docs/concepts/columns).
+- `<from-column>` and `<to-column>` are the snake_case status names
+  from the task's workflow (default workflow: `backlog`, `todo`,
+  `in_progress`, `review`, `done`). See
+  [workflows](/docs/concepts/workflows).
 - `reason=<short>` is a single token (whitespace is folded to
   underscores) describing who triggered the move.
 
@@ -206,7 +207,8 @@ The full grammar lives in the two `append_*_event` functions in
 
 - [Workers](/docs/concepts/workers#worker-states) — what each worker
   state actually means.
-- [Columns](/docs/concepts/columns) — what each `from -> to` transition
-  means.
+- [Workflows](/docs/concepts/workflows) — what each `from -> to`
+  transition means, including the per-workflow status schema and the
+  default workflow's lifecycle.
 - [The orchestrator](/docs/concepts/orchestrator) — what the
   orchestrator does with each line it reads.
