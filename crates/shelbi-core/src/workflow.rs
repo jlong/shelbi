@@ -445,13 +445,16 @@ impl std::str::FromStr for StatusCategory {
 ///
 /// - `User` keeps the task waiting; the orchestrator does not dispatch.
 /// - `Agent` makes the task eligible for auto-dispatch onto a free worker.
-/// - `Either` is dispatchable but low-priority; the user can grab it.
+///
+/// `Plans/workflows.md` §6 explicitly rejects a third "either" value — a
+/// task is either work for a worker or work for the user. If the user
+/// wants to grab an agent-owned task, they reassign it through the
+/// normal CLI/TUI; no schema field is needed for that.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Owner {
     User,
     Agent,
-    Either,
 }
 
 /// The legacy 5-status workflow's handoff status name. Used as the
@@ -736,16 +739,20 @@ statuses:
     }
 
     #[test]
-    fn either_owner_round_trips() {
+    fn rejects_either_owner() {
+        // Plans/workflows.md §6 closes the Owner vocabulary to `user` and
+        // `agent`. Anything else — including the previously-considered
+        // `either` value — has to be a parse error so a workflow author
+        // who reaches for it gets a fast, clear signal rather than a
+        // silently-tolerated third state.
         let yaml = r#"
 name: w
 statuses:
   - { name: Open, category: ready, owner: either }
 "#;
-        let wf = Workflow::from_yaml_str(yaml).unwrap();
-        assert_eq!(wf.statuses[0].owner, Owner::Either);
-        let y = serde_yaml::to_string(&wf).unwrap();
-        assert!(y.contains("owner: either"));
+        let err = Workflow::from_yaml_str(yaml).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("either"), "got: {msg}");
     }
 
     #[test]
