@@ -134,7 +134,7 @@ A project can have any number of workflow files. Examples:
 
 Workflows are **configuration**, not a UI surface — they're authored as YAML and surfaced only through (a) the `shelbi workflow ...` CLI (§9) and (b) a **workflow filter** on the existing Tasks Kanban board (§7). There is no dedicated "Workflows" view in the TUI.
 
-**By default the filter is** **`All`** **— every task across every workflow is visible.** In `All` mode the column set is the six **status categories** from §1 (Backlog / Ready / Active / Handoff / Done / Archived), since every status in every workflow maps to one of them. Cards from different workflows can sit in the same column; a small workflow label on each card (Phase 2) tells them apart. Selecting a specific workflow from the filter swaps the columns to that workflow's native status names and hides tasks from other workflows.
+**By default the filter is** **`All`** **— every task across every workflow is visible.** In `All` mode, columns are the union of `(workflow, status)` pairs that have at least one card. Empty pairs are not shown. Cards from different workflows each live in their own column (no collapsing across workflows). Selecting a specific workflow from the filter swaps the columns to that workflow's full declared status list (with empty columns collapsed per §7) and narrows the cards to only that workflow's tasks. The six **status categories** from §1 are an orchestrator-reasoning concept (§8) — they never appear as columns on the board.
 
 ### 5. Per-task workflow assignment
 
@@ -161,7 +161,7 @@ If `workflow` is absent, the task runs the default workflow. If `workflow` refer
 
 There is no third "either" value — a task is either work for a worker or work for the user. If the user wants to grab an agent-owned task, they reassign it through the normal CLI/TUI; no schema field needed for that.
 
-In Zen Mode (see §8), the owner determines what counts as "ready for auto-merge" — a transition from an `agent`-owned `active` status to a `user`-owned `handoff` status is the canonical auto-merge trigger.
+In Zen Mode (see §8), the owner of each status determines what counts as "ready for auto-merge." Any transition whose actions include `merge` is gated by Zen's confidence bar; the canonical case is `active → handoff` (worker raises marker, orchestrator merges), but a trunk-based `active → done` is treated identically.
 
 ### 7. TUI rendering
 
@@ -171,15 +171,20 @@ The Tasks Kanban board gains a **workflow filter** at the top:
 Kanban  ·  [Workflow: All ▾]                                  (q to quit, ? for help)
 ```
 
-The filter defaults to **`All`** — every task across every workflow is visible, with columns drawn from the six status categories (Backlog / Ready / Active / Handoff / Done / Archived). Selecting a specific workflow switches columns to that workflow's native status names and narrows the cards to only that workflow's tasks. There is no separate "Workflows" view; workflows are configuration (see §4).
+The filter defaults to **`All`**. The column set differs by mode:
 
-**Every column is always shown**, in declaration order — the full structure stays visible at a glance, regardless of where work currently sits. Empty columns aren't hidden; they're collapsed. The same rules apply in both modes: in `All`, the columns are the six status categories; in a workflow-specific filter, they're that workflow's declared statuses.
+- **`All` mode** — columns are the union of `(workflow, status)` pairs that have at least one card. Empty pairs are not shown. Column order: by the status's category in canonical order (backlog → ready → active → handoff → done → archived), then by workflow declaration order within a category. Column headers carry both the workflow name and the status name (e.g., `feature-task[auth-rewrite] · In Progress`) so cards from different workflows in the same category stay visually distinct.
+- **Workflow-filtered mode** — columns are that workflow's full declared status list, in declaration order. Empty columns are not hidden; they're collapsed to a thin vertical strip so the full pipeline shape stays visible at a glance.
+
+There is no separate "Workflows" view; workflows are configuration (see §4).
+
+For workflow-filtered mode, the collapse + scroll rules:
 
 - Columns with one or more tasks render as **full-width columns** (card list inside).
 
 - Columns with **no tasks collapse to a thin vertical strip** \~3 cells wide, with the column name written top-to-bottom (one character per row). The strip spans the full board height so the column rail stays visually aligned. Cards can still be dropped onto a collapsed strip; moving the cursor onto one expands it temporarily until focus leaves.
 
-- When the combined width of expanded columns exceeds the terminal, the board **scrolls horizontally**. Left/right arrows (or `h`/`l`) move the cursor between columns; the visible window scrolls to keep the cursor in view. The workflow filter, header, and footer stay pinned — only the column track scrolls.
+- When the combined width of expanded columns exceeds the terminal, the board **scrolls horizontally**. Left/right arrows (or `h`/`l`) move the cursor between columns; the visible window scrolls to keep the cursor in view. The workflow filter, header, and footer stay pinned — only the column track scrolls. (Horizontal scroll applies in `All` mode too if the dynamic column set is wider than the terminal — there's just no collapsing.)
 
 Example of a workflow-specific filter (7-status `design-review`) where only `Build` and `Review` have cards:
 
@@ -195,7 +200,7 @@ Example of a workflow-specific filter (7-status `design-review`) where only `Bui
 └─┘ └─┘ └────────────┘ └─┘ └────────────┘ └─┘ └─┘
 ```
 
-Switching the filter re-renders with the selected workflow's status set — or back to the six status categories when set to `All`. The sidebar's worker badges and activity feed are workflow-agnostic.
+Switching the filter re-renders with the selected workflow's status set — or back to the dynamic `(workflow, status)` column union when set to `All`. The sidebar's worker badges and activity feed are workflow-agnostic.
 
 ### 8. Orchestrator + Zen mode
 
@@ -212,6 +217,8 @@ The category abstraction is what makes this tractable across arbitrary workflows
 | `* → archived` (cancel/close)     | Never auto — closing without shipping is always the user's call.                            |
 
 If any check on a high-bar transition fails or is ambiguous, Zen leaves the task where it is and surfaces the reason in the activity feed. Blitzing stops the moment confidence drops; the user picks up where Zen paused.
+
+The table above is illustrative for the canonical 5-status workflow. The underlying rule is action-based, not category-pair-based: **any transition whose `transitions:` actions include `merge` gets the highest bar** (the full merge-conditions probe), regardless of source/target categories. This covers trunk-based workflows that skip a `handoff` status and go straight `active → done` with merge actions — same gate, no special-casing.
 
 The orchestrator's reaction rules already key off events like `task=<id> in_progress -> review reason=worker:review-marker`. With Workflows, the events log line shape becomes:
 
@@ -295,15 +302,33 @@ transitions:
 
 **Action set.** Five primitives, all hub-side (the orchestrator or CLI on the hub machine runs them; workers never invoke actions directly). Each is idempotent and silently no-ops when not applicable:
 
-| Action          | Effect                                                                                                                                                                                                                                                                       |
-| --------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `push_branch`   | Push the task's branch to `origin`.                                                                                                                                                                                                                                          |
-| `open_pr`       | Open a PR against the effective `base_branch` (workflow override or project default). No-op if one is already open.                                                                                                                                                          |
-| `merge`         | Merge the task's branch using the effective `merge_strategy`. If a PR is open, merges via `gh pr merge --<strategy>`. If no PR is open, the hub fetches the branch and runs `git merge --<strategy>` locally. `merge_strategy:` is one of `squash` or `merge` in v1 (no `rebase`). |
-| `close_pr`      | Close any open PR without merging. No-op if none open.                                                                                                                                                                                                                       |
-| `delete_branch` | Delete the local + remote branch. Skipped if the branch is checked out in a worker worktree (those branches replace naturally on the worker's next dispatch).                                                                                                                |
+| Action          | Effect                                                                                                                                                                                                                                                                                                                                       |
+| --------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `push_branch`   | Push the task's branch to `origin`.                                                                                                                                                                                                                                                                                                          |
+| `open_pr`       | Open a PR. PR base is `transition.target` if set, else `git.base_branch` (workflow override or project default), else the parent task's branch when `depends_on:` is set. No-op if a PR is already open.                                                                                                                                     |
+| `merge`         | Merge the task's branch using the effective `merge_strategy`. Target is `transition.target` if set, else `git.base_branch`. If a PR is open, merges via `gh pr merge --<strategy>`; if not, the hub fetches the branch and runs `git merge --<strategy>` locally. `merge_strategy` is one of `squash` or `merge` in v1 (no `rebase`). |
+| `close_pr`      | Close any open PR without merging. No-op if none open.                                                                                                                                                                                                                                                                                       |
+| `delete_branch` | Delete the local + remote branch. Skipped if the branch is checked out in a worker worktree (those branches replace naturally on the worker's next dispatch).                                                                                                                                                                                |
+| `restack`       | Rebase the task's branch onto its parent task's current branch. Fires automatically on dependent tasks when a parent's `merge` action completes; rarely declared by hand. See "Dependent tasks" below.                                                                                                                                        |
 
 Missing transitions are no-ops — a workflow only declares the edges where work needs to happen. There is no wildcard syntax in v1; list the from-statuses explicitly.
+
+**Per-transition merge target (`target:`).** Each transition may declare an optional `target:` field that overrides where `merge` and `open_pr` land for *that transition only*. Useful when a workflow has multiple merge hops with different destinations:
+
+```yaml
+transitions:
+  - from: in-progress
+    to: review
+    target: develop                  # merge feature branch into develop here
+    actions: [push_branch, merge]
+
+  - from: review
+    to: done
+    # no target → uses base_branch (e.g., main)
+    actions: [open_pr, merge]
+```
+
+`target:` does **not** affect where new task branches are cut from — that's always `git.base_branch`. It only controls where merges land.
 
 **The `branch:` task field.** Every task carries an optional `branch:` field in its frontmatter — the name of the git branch the task operates on. Its presence (or absence) at task creation controls whether shelbi cuts a fresh branch or uses an existing one.
 
@@ -393,7 +418,41 @@ feature: dashboard-v2                # resolves base_branch → feature/dashboar
 
 **Workflows without git.** Research, planning, and other no-code workflows can omit both `git:` and `transitions:` entirely. Tasks move through statuses purely as bookkeeping — no side-effects fire.
 
-**Relationship to categories.** §8's confidence bars speak in *categories* (semantic reasoning: "this is a `handoff → done` accept, apply the highest bar"). The `transitions:` block speaks in *statuses* (concrete actions: "on `Review → Done`, run `merge` and `delete_branch`"). Both layers coexist: categories tell Zen *whether* it has permission to act; transitions tell *anyone acting* what to do.
+**Dependent tasks (stacked PRs).** Tasks may declare a `depends_on: <task-id>` field in their frontmatter to express a parent/child relationship. This is how Graphite-style stacked PRs are modeled — task B builds on top of task A's branch, which builds on `main`.
+
+Two behaviors fire when `depends_on:` is set:
+
+1. **Branch cut.** When the child task transitions to `in-progress`, the orchestrator cuts its branch off the **parent task's `branch:`** (not the workflow's `base_branch`). The child branch is named conventionally (`shelbi/<child-task-id>`).
+2. **PR base.** When the child task's `open_pr` action runs, the PR's base is the parent task's branch — not the workflow's `base_branch`.
+
+A third behavior fires *on the parent*:
+
+3. **Auto-restack on parent merge.** When the parent task's `merge` action completes, the orchestrator iterates every task with `depends_on: <parent-id>` and runs the `restack` action on each: the child's branch is rebased onto the parent's target (typically `main`), and any open PR's base is updated to match. Chains restack transitively — a grandchild whose parent restacked also restacks.
+
+Worked example:
+
+```markdown
+---
+id: build-login-form
+title: Build the login form
+workflow: default
+---
+```
+
+```markdown
+---
+id: build-dashboard
+title: Build the dashboard (uses login form)
+workflow: default
+depends_on: build-login-form          # branch cut off build-login-form's branch
+---
+```
+
+Both tasks proceed in parallel. `build-login-form` lands on `main`; the orchestrator immediately restacks `build-dashboard` onto `main` and updates its PR base. `build-dashboard` continues review, then merges. Arbitrary chain depth supported.
+
+Cyclic `depends_on:` is rejected at task-load time. A task whose parent is in `archived` or `canceled` is marked broken in the activity feed and won't proceed past `todo` until the user resolves it.
+
+**Relationship to categories.** §8's confidence bars speak in *categories* (semantic reasoning: "this is a `handoff → done` accept, apply the highest bar"). The `transitions:` block speaks in *statuses* (concrete actions: "on `review → done`, run `merge` and `delete_branch`"). Both layers coexist: categories tell Zen *whether* it has permission to act; transitions tell *anyone acting* what to do. Categories never appear as columns on the Kanban board — they're an orchestrator-reasoning concept only (see §7).
 
 ## Rollout
 
@@ -413,7 +472,7 @@ Two phases.
 
 - Events log line shape extended; backward-compatible parser.
 
-- Orchestrator prompt updates: reaction rules speak in categories not status names.
+- **Orchestrator prompt rewrite (top-to-bottom).** Today's `~/.shelbi/projects/<project>/CLAUDE.md` hardcodes the five legacy status names (Backlog, Todo, InProgress, Review, Done) in its reaction rules. Phase 1 includes a rewrite that keys reactions on (a) status categories and (b) the workflow YAML's `transitions:` block — not literal status names. Scope: every section of CLAUDE.md that references specific status names. Output: a reviewable new draft.
 
 - Zen Mode: confirm `Merge Conditions` works against the category abstraction.
 
@@ -436,7 +495,7 @@ After Phase 2: rich multi-workflow filtering on the existing Kanban board; singl
 - **A task is bound to its workflow at creation.** Cross-workflow moves are not allowed. To switch a task into a different workflow, the user creates a fresh task in the target workflow (and optionally archives the original).
 - **The status-category set is closed at six.** `backlog`, `ready`, `active`, `handoff`, `done`, `archived`. Custom workflows pick from these — they can't define new categories. Keeps generic code (Zen Mode, activity feed, sidebar) correct across arbitrary workflows.
 - **Kanban workflow filter persists per project.** When the user switches the filter away from `All`, the next session re-opens on the same selection. Reset to `All` only when the previously-chosen workflow's YAML is deleted.
-- **`All`-mode card ordering is interleaved by priority.** Cards from multiple workflows mix freely within each category column, sorted by task priority (`shelbi task prio`). The per-card workflow label (Phase 2) provides visual distinction; no grouping or separators.
+- **`All`-mode columns are `(workflow, status)` pairs with cards.** Columns are dynamic in `All` mode — only pairs with at least one card are shown. Cards from different workflows do **not** mix in a single column; each workflow's status gets its own column. Within a column, cards are sorted by task priority (`shelbi task prio`). Column order: canonical category order, then workflow declaration order. (Cross-workflow card interleaving from the earlier design is gone — the column itself is now the workflow-identifier.)
 - **Migration is minimal.** Shelbi creates `workflows/default.yaml` if missing; task files are not modified. Tasks without an explicit `workflow:` field implicitly use the default workflow (see §11).
 - **Zen config is per-workflow with project-level fallback.** `zen.checks.local`, `zen.ci_timeout`, and `zen.danger_paths` can be declared in a workflow's YAML; missing values fall back to project-level settings. A `research` workflow can opt out of code-style checks without affecting `default`.
 - **Naming stays as "Workflows".** The "Shelbi" prefix is used in prose when disambiguation from CI/GitHub Actions workflows is needed (i.e., "Shelbi Workflows").
