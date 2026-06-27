@@ -1,6 +1,6 @@
 ---
 title: Zen Mode
-order: 15
+order: 14
 summary: Hands-off autonomy — the orchestrator triages backlog, runs the high-confidence merge bar, and lands work without waiting on you. You stay in the loop for anything ambiguous.
 ---
 
@@ -466,7 +466,7 @@ These tags also surface in `~/.shelbi/events.log` — grep there for a
 full audit trail across all projects.
 
 The orchestrator also wakes on the project's periodic `heartbeat` line
-(see [the events log](/docs/features/events-log#heartbeats)). For Zen
+(see [the events log](/docs/concepts/events-log#heartbeats)). For Zen
 Mode that's the recurring nudge to check in-flight reviews and stuck
 auto-promotions when nothing else has fired — the merge bar can spend
 minutes waiting on CI, and heartbeats keep the orchestrator from
@@ -480,9 +480,9 @@ key in `project.yaml` (default `3m`).
 - [Workflows](/docs/concepts/workflows) — how a workflow's
   `transitions:` declares which edges fire the merge bar, and where
   the per-workflow `zen:` override block lives.
-- [The orchestrator](/docs/concepts/orchestrator) — how the
+- [Orchestrator](/docs/concepts/orchestrator) — how the
   underlying scheduler is wired and where the prompt template lives.
-- [The events log](/docs/features/events-log) — the canonical
+- [The events log](/docs/concepts/events-log) — the canonical
   format of the `mode=zen` and `orchestrator:zen-*` lines Zen emits.
 - [Workflows](/docs/concepts/workflows#lifecycle-who-moves-a-task-between-the-default-statuses)
   — what `Review` and `Done` mean in the default flow Zen accelerates,

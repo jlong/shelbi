@@ -12,8 +12,13 @@ const nextConfig: NextConfig = {
         permanent: true,
       },
       {
-        source: "/docs/concepts/zen-mode",
-        destination: "/docs/features/zen-mode",
+        source: "/docs/features/zen-mode",
+        destination: "/docs/concepts/zen-mode",
+        permanent: true,
+      },
+      {
+        source: "/docs/features/events-log",
+        destination: "/docs/concepts/events-log",
         permanent: true,
       },
     ];
