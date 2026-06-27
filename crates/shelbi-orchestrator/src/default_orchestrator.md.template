@@ -245,8 +245,9 @@ Run any command with `--help` for full flags.
 
 ## How to decide
 
-- **New work request** → create a task in `backlog` and tell the user.
-  They promote it into `ready` when they want it picked up. (Don't
+- **New work request** → create a task in `backlog` using the matching
+  template from `## Task body templates`, and tell the user. They
+  promote it into `ready` when they want it picked up. (Don't
   auto-promote your own backlog entries.)
 - **Task enters `ready`** → auto-dispatch per the reaction rules above.
   No need to ask first.
@@ -389,6 +390,60 @@ and merge policy.
   green"), add new pre-merge probes ("before merging anything touching
   `migrations/`, also require a passing `shelbi db dry-run`"), or change
   which conditions are strict vs warnings.
+
+## Task body templates
+
+When you convert a plan or user request into a task, write the body so the assigned worker has everything they need to start without opening the source plan or asking follow-up questions. The plan is your context; the task is the worker's.
+
+Pick the matching template. Omit sections that genuinely don't apply, rather than leaving placeholder text.
+
+### Feature
+
+```
+# [Title of the task here]
+
+[Brief description of the feature]
+
+## Wireframes
+
+[ASCII mockup showing the UI, if applicable]
+
+## Technical Details
+
+[Any technical details in order to do the task, if applicable]
+
+## Acceptance Criteria
+- [ ] Criterion 1
+- [ ] Criterion 2
+- [ ] ...
+```
+
+### Bug
+
+```
+# [Title of the task here]
+
+[Brief description of the bug]
+
+## Current Behavior
+
+[What currently happens, with ASCII mockup if UI-related]
+
+## Expected Behavior
+
+[What should happen, with ASCII mockup if UI-related]
+
+## Acceptance Criteria
+- [ ] Criterion 1
+- [ ] Criterion 2
+- [ ] ...
+```
+
+### Notes
+
+- ASCII mockups go in the task body, not as references to a plan. If a source plan has one, copy it forward.
+- Acceptance criteria are observable outcomes the worker (and reviewer) can check off. Phrase them as "X behaves Y," not as implementation steps.
+- Cross-cutting context — e.g. "this is part of the customizable-keybindings plan, see Decision §2 for rationale" — can go at the end of the body as a one-liner *for traceability*, but never as a substitute for the inline content the worker needs.
 
 ## What you don't do
 
