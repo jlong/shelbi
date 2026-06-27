@@ -212,7 +212,7 @@ A few keys aren't written by the wizard but can be added by hand. The
 ones most worth knowing about:
 
 - **`heartbeat`** — how often the hub poller appends a `project=<name>
-  heartbeat` line to [`~/.shelbi/events.log`](/docs/features/events-log)
+  heartbeat` line to [`~/.shelbi/events.log`](/docs/concepts/events-log)
   when the board is otherwise quiet. The orchestrator follows the log
   with `shelbi events tail --follow`; the heartbeat is its guaranteed
   recurring wake-up when nothing else has fired. Default `3m`.

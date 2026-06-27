@@ -81,7 +81,7 @@ State changes are also appended to `~/.shelbi/events.log`:
 ```
 
 That feed is what the orchestrator tails to know when to dispatch more
-work. See [the events log](/docs/features/events-log).
+work. See [the events log](/docs/concepts/events-log).
 
 ## Switching tasks clears context
 
@@ -161,7 +161,7 @@ hard-coded; you can `tmux ls` on the remote to inspect.
 - [Workflows](/docs/concepts/workflows#lifecycle-who-moves-a-task-between-the-default-statuses)
   — what the default workflow's statuses mean, and where workers fit
   in the task lifecycle.
-- [The events log](/docs/features/events-log) — the shape of every
+- [The events log](/docs/concepts/events-log) — the shape of every
   worker transition line.
-- [The orchestrator](/docs/concepts/orchestrator) — how it picks which
+- [Orchestrator](/docs/concepts/orchestrator) — how it picks which
   worker to dispatch a task to.

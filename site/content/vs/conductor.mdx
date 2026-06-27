@@ -60,7 +60,7 @@ project by dropping an `ORCHESTRATOR.md` at
 `~/.shelbi/projects/<name>/ORCHESTRATOR.md`. Want it to auto-merge a
 specific authorized loop? Edit the prompt. Want a different routing
 rule? Edit the prompt. The scheduler is text. (See
-[The orchestrator — customizing the prompt](/docs/concepts/orchestrator#customizing-the-prompt-per-project).)
+[Orchestrator — customizing the prompt](/docs/concepts/orchestrator#customizing-the-prompt-per-project).)
 
 ### A plain-text protocol, not a UI
 
@@ -72,7 +72,7 @@ review-ready marker the hub poller watches. The worker never runs a
 `shelbi` command — `printf '%s\n' <task-id> > .claude/shelbi-review-ready`
 is the entire on-worker protocol. That is how a remote worker can ship
 with nothing installed but `tmux`, `git`, and an agent CLI. (See
-[The events log](/docs/features/events-log) and
+[The events log](/docs/concepts/events-log) and
 [Workers — how a task completes](/docs/concepts/workers#how-a-task-completes).)
 
 ### A review column that exists on purpose

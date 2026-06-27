@@ -184,7 +184,7 @@ merges land for this particular hop.
 
 ### What fires Zen Mode's high-confidence bar
 
-[Zen Mode](/docs/features/zen-mode#the-high-confidence-bar) gates *any*
+[Zen Mode](/docs/concepts/zen-mode#the-high-confidence-bar) gates *any*
 transition whose actions include `merge`, regardless of which
 statuses sit on either side. A trunk-based workflow that skips
 `Review` and goes straight `Active → Done` with `actions: [merge,
@@ -433,7 +433,7 @@ default workflow legible at a glance:
 - **`Review → Done` — you.** Accepting a diff is the moment the human
   signs off on the work. The orchestrator never crosses this edge on
   its own (except under specific multi-task loops the user has
-  authorized — typically via [Zen Mode's auto-merge](/docs/features/zen-mode#the-high-confidence-bar)).
+  authorized — typically via [Zen Mode's auto-merge](/docs/concepts/zen-mode#the-high-confidence-bar)).
 
 The pattern generalizes: **you own the intent boundaries (triage and
 accept), the system handles the mechanical middle**. A custom
@@ -553,10 +553,10 @@ whole feature into `main`.
 - [Workers](/docs/concepts/workers) — what's on the receiving end of
   an `active`-category dispatch, and the review-marker mechanism
   workers use to hand off.
-- [The orchestrator](/docs/concepts/orchestrator) — how
+- [Orchestrator](/docs/concepts/orchestrator) — how
   `ready`-category statuses get dispatched.
 - [The events log](/docs/concepts/events-log#task-transitions) — line
   shape for task transitions, including the workflow + category
   annotations.
-- [Zen Mode](/docs/features/zen-mode) — what the action-based
+- [Zen Mode](/docs/concepts/zen-mode) — what the action-based
   confidence bar gates, and how per-workflow `zen:` overrides work.
