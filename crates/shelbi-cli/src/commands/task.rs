@@ -16,6 +16,7 @@ use chrono::Utc;
 use clap::{Args as ClapArgs, Subcommand};
 use shelbi_core::{
     default_workflow, validate_task_id, validate_workflow_name, Column, Task, Workflow,
+    MAX_TASK_ID_LEN,
 };
 
 use super::require_project;
@@ -690,6 +691,16 @@ fn generate_unique_id(project: &str, title: &str) -> Result<String> {
         candidate = format!("{base}-{n}");
         n += 1;
     }
+    // Reword the length error so it points at the title the user actually
+    // typed rather than the slugified id they never saw.
+    if candidate.len() > MAX_TASK_ID_LEN {
+        bail!(
+            "title is too long: it slugifies to a {}-byte id (max {MAX_TASK_ID_LEN}) — \
+             the worker branch `shelbi/<id>` would exceed GitHub's 255-byte ref limit. \
+             Shorten the title or pass --id with an explicit shorter id.",
+            candidate.len(),
+        );
+    }
     Ok(candidate)
 }
 
@@ -756,6 +767,28 @@ mod tests {
         assert_eq!(slugify("CSV → JSON"), "csv-json");
         assert_eq!(slugify("---"), "");
         assert_eq!(slugify("Already-kebab-OK"), "already-kebab-ok");
+    }
+
+    #[test]
+    fn generate_unique_id_rejects_titles_that_produce_overlong_ids() {
+        let _g = TEST_LOCK.lock().unwrap();
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+
+        // A title whose slug exceeds the limit by a few bytes is enough to
+        // trip the worker branch over GitHub's 255-byte ref cap.
+        let long_title = "a".repeat(MAX_TASK_ID_LEN + 10);
+        let err = generate_unique_id("p", &long_title).unwrap_err().to_string();
+        assert!(err.contains("title is too long"), "err: {err}");
+        assert!(err.contains(&MAX_TASK_ID_LEN.to_string()), "err: {err}");
+
+        // A title at exactly the limit slugifies to the limit and is accepted.
+        let exact = "a".repeat(MAX_TASK_ID_LEN);
+        let id = generate_unique_id("p", &exact).unwrap();
+        assert_eq!(id.len(), MAX_TASK_ID_LEN);
+
+        std::env::remove_var("SHELBI_HOME");
+        let _ = std::fs::remove_dir_all(&home);
     }
 
     #[test]
