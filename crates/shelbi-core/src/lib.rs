@@ -13,7 +13,7 @@ pub use model::{
     GitConfig, HeartbeatConfig, Host, Machine, MachineKind, MergeStrategy, OrchestratorSpec,
     Project, ProjectShape, Session, SessionProject, Status, Task, TaskZenConfig, TmuxAddr,
     WorkerSpec, ZenChecks, ZenConfig, ZenDangerPaths, BUILTIN_DANGER_PATHS, DEFAULT_WORKFLOW_NAME,
-    HEARTBEAT_DEFAULT,
+    HEARTBEAT_DEFAULT, MAX_TASK_ID_LEN,
 };
 pub use placeholders::substitute_placeholders;
 pub use system_memory::{format_bytes_short, recommended_worker_count, total_memory_bytes};

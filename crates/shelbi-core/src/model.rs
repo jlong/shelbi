@@ -687,10 +687,23 @@ impl Task {
 /// every new project (`workflows/default.yaml`).
 pub const DEFAULT_WORKFLOW_NAME: &str = "default";
 
-/// Same character set as agent ids (kebab/snake alphanumeric). Aliased so
-/// call sites read clearly at the task layer.
+/// Max byte length of a task id. The worker branch is `shelbi/<id>` (7-byte
+/// prefix) and GitHub caps ref names at 255 bytes; we leave a 15-byte buffer
+/// so refs derived from the id stay at most 240 bytes.
+pub const MAX_TASK_ID_LEN: usize = 233;
+
+/// Same character set as agent ids (kebab/snake alphanumeric), plus a length
+/// cap so the derived `shelbi/<id>` branch stays pushable to GitHub.
 pub fn validate_task_id(s: &str) -> crate::Result<()> {
-    validate_agent_id(s)
+    validate_agent_id(s)?;
+    if s.len() > MAX_TASK_ID_LEN {
+        return Err(crate::Error::TaskIdTooLong {
+            id: s.to_string(),
+            len: s.len(),
+            max: MAX_TASK_ID_LEN,
+        });
+    }
+    Ok(())
 }
 
 /// Validate the `workflow:` value on a task frontmatter. The string is
@@ -1357,6 +1370,24 @@ updated_at: 2026-06-19T00:00:00Z
     fn task_id_uses_same_rules_as_agent_id() {
         assert!(validate_task_id("fix-login").is_ok());
         assert!(validate_task_id("with spaces").is_err());
+    }
+
+    #[test]
+    fn task_id_rejects_lengths_that_would_overflow_a_git_ref() {
+        let at_limit = "a".repeat(MAX_TASK_ID_LEN);
+        assert!(validate_task_id(&at_limit).is_ok());
+
+        let one_over = "a".repeat(MAX_TASK_ID_LEN + 1);
+        match validate_task_id(&one_over) {
+            Err(crate::Error::TaskIdTooLong { len, max, .. }) => {
+                assert_eq!(len, MAX_TASK_ID_LEN + 1);
+                assert_eq!(max, MAX_TASK_ID_LEN);
+            }
+            other => panic!("expected TaskIdTooLong, got {other:?}"),
+        }
+
+        // Agent ids are unaffected — only the task wrapper enforces length.
+        assert!(validate_agent_id(&"a".repeat(MAX_TASK_ID_LEN + 1)).is_ok());
     }
 
     #[test]

@@ -13,6 +13,12 @@ pub enum Error {
     #[error("invalid agent id: {0}")]
     InvalidAgentId(String),
 
+    #[error(
+        "task id `{id}` is too long: {len} bytes (max {max}); git ref names \
+         (`shelbi/<id>`) must stay under GitHub's 255-byte limit"
+    )]
+    TaskIdTooLong { id: String, len: usize, max: usize },
+
     #[error("machine `{0}` not found in project")]
     UnknownMachine(String),
 
