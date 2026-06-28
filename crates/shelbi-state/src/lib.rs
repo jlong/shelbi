@@ -15,6 +15,7 @@ use serde::{Deserialize, Serialize};
 use shelbi_core::{default_workflow, Agent, Column, Project, Result, Session, Task};
 
 mod hub_config;
+pub mod keymap;
 mod user_config;
 mod worker_status;
 mod workflows;

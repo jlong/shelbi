@@ -1055,11 +1055,13 @@ name = "shelbi-state"
 version = "0.1.0"
 dependencies = [
  "chrono",
+ "crossterm 0.28.1",
  "dirs",
  "serde",
  "serde_json",
  "serde_yaml",
  "shelbi-core",
+ "thiserror",
 ]
 
 [[package]]
