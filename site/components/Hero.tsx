@@ -1,6 +1,6 @@
 import Link from "next/link"
 import { ArrowRightIcon } from "@heroicons/react/24/outline"
-import { BlockDivider, Wordmark } from "./Wordmark"
+import { BlockDivider, WordmarkSvg } from "./Wordmark"
 
 /**
  * Decorative field of evenly-spaced block characters, faded at the
@@ -27,14 +27,16 @@ const CTA_BASE =
 
 export function Hero() {
   return (
-    <section className="relative isolate overflow-hidden border-b border-gray-4">
+    <section
+      data-hero
+      className="relative isolate overflow-hidden border-b border-gray-4"
+    >
       <HeroPattern />
       <div className="relative mx-auto flex w-full max-w-4xl flex-col items-center gap-5 px-3 py-12 text-center md:py-16">
-        <Wordmark
-          as="h1"
-          size="hero"
-          className="w-full max-w-[320px] text-fg md:max-w-[680px] [&>svg]:!h-auto [&>svg]:!w-full"
-        />
+        <h1 className="w-full max-w-[320px] text-fg md:max-w-[680px]">
+          <span className="sr-only">Shelbi</span>
+          <WordmarkSvg className="w-full" aria-hidden="true" />
+        </h1>
 
         <p className="font-mono text-xs uppercase tracking-[0.25em] text-gray-7 sm:text-sm">
           Manage a team of coding agents from your terminal
