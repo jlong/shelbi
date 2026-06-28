@@ -40,7 +40,9 @@ use ratatui::{
 };
 
 use shelbi_core::{Column, StatusCategory, DEFAULT_WORKFLOW_NAME};
-use shelbi_state::{events_log_path, WorkerState};
+use shelbi_state::{
+    events_log_path, keymap::load_keymaps, keymap::Keymaps, WorkerState, ZenModeState,
+};
 
 /// Avatar size in character cells. Each cell covers two vertical
 /// pixels with the half-block glyphs (`▀▄█`), so the effective canvas
@@ -266,12 +268,27 @@ pub struct ActivityApp {
     /// Hit-test records for the pill row, rewritten each frame by
     /// [`render_pills`] and consumed by the mouse handler.
     pill_hits: Vec<PillHit>,
+    /// Resolved per-mode chord → action maps used by the input handler.
+    /// Loaded once at construction from `~/.shelbi/keys.yml` (or the
+    /// embedded built-ins when no file exists) so a single key press is
+    /// one HashMap lookup per layer rather than a long `match` chain.
+    keymaps: Keymaps,
+    /// Set true when the handler observes a `GlobalAction::Quit`; the
+    /// outer event loop polls this each tick and returns when it flips.
+    /// The parent shell loop respawns us, matching the legacy Ctrl+C
+    /// inline return.
+    pub should_quit: bool,
 }
 
 impl ActivityApp {
     pub fn new(project_name: impl Into<String>) -> Self {
+        let project_name = project_name.into();
+        // Diagnostics aren't surfaced here — bad/missing keys.yml falls
+        // back to built-in defaults silently, same as every other handler
+        // that consumes the loader. Surfacing them is the wizard's job.
+        let (keymaps, _diags) = load_keymaps(Some(&project_name));
         Self {
-            project_name: project_name.into(),
+            project_name,
             events: Vec::new(),
             log_offset: 0,
             log_mtime: None,
@@ -284,6 +301,37 @@ impl ActivityApp {
             total_lines: 0,
             filter: ActivityFilter::default(),
             pill_hits: Vec::new(),
+            keymaps,
+            should_quit: false,
+        }
+    }
+
+    /// Borrow the resolved keymaps for the input handler to dispatch
+    /// chords against. Snapshot once outside the per-tick loop so the
+    /// handler can take a `&mut self` without conflicting with the
+    /// keymap borrow.
+    pub fn keymaps(&self) -> &Keymaps {
+        &self.keymaps
+    }
+
+    /// Flip `state.json::zen_mode` between On and Off via the shared
+    /// [`shelbi_state::toggle_zen_mode`] path — same read/write/log
+    /// dance the sidebar and palette use, tagged `user:hotkey` so the
+    /// events log can tell the chord apart from the CLI / palette
+    /// sources.
+    pub fn toggle_zen_mode(&mut self) {
+        match shelbi_state::toggle_zen_mode(&self.project_name, "user:hotkey") {
+            Ok(target) => {
+                let label = match target {
+                    ZenModeState::On => "on",
+                    ZenModeState::Off => "off",
+                    ZenModeState::Paused => "pause",
+                };
+                self.status_line = format!("zen {label}");
+            }
+            Err(e) => {
+                self.status_line = format!("zen toggle failed: {e}");
+            }
         }
     }
 
