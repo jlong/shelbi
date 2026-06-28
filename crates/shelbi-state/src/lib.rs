@@ -372,6 +372,90 @@ pub fn state_path(project: &str) -> Result<PathBuf> {
     Ok(project_dir(project)?.join("state.json"))
 }
 
+// ---------------------------------------------------------------------------
+// Global runtime state (~/.shelbi/state.json)
+
+/// Global cross-project runtime state at `~/.shelbi/state.json`. Currently
+/// only tracks `tmux_palette_key` — the most recently installed tmux
+/// `bind-key` for the palette popup — so the orchestrator can unbind it
+/// cleanly when the user rebinds the chord or switches to a project that
+/// overrides the global default.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GlobalState {
+    /// The exact tmux key string passed to `tmux bind-key -n …` on the
+    /// most recent install (e.g. `C-p`, `M-z`). `None` means no shelbi
+    /// session has installed a palette binding yet.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tmux_palette_key: Option<String>,
+}
+
+/// Path to the global `state.json` (`~/.shelbi/state.json`).
+pub fn global_state_path() -> Result<PathBuf> {
+    Ok(shelbi_home()?.join("state.json"))
+}
+
+/// Read `~/.shelbi/state.json`. Missing file → `GlobalState::default()`.
+pub fn read_global_state() -> Result<GlobalState> {
+    let path = global_state_path()?;
+    if !path.exists() {
+        return Ok(GlobalState::default());
+    }
+    let text = fs::read_to_string(&path)?;
+    serde_json::from_str(&text)
+        .map_err(|e| shelbi_core::Error::Other(format!("state.json: {e}")))
+}
+
+/// Atomically write `state` to `~/.shelbi/state.json`.
+pub fn write_global_state(state: &GlobalState) -> Result<()> {
+    let path = global_state_path()?;
+    let body = serde_json::to_vec_pretty(state)
+        .map_err(|e| shelbi_core::Error::Other(format!("state.json: {e}")))?;
+    atomic_write(&path, &body)
+}
+
+#[cfg(test)]
+mod global_state_tests {
+    use super::*;
+    use crate::test_lock::LOCK;
+
+    fn fresh_home() -> PathBuf {
+        let p = std::env::temp_dir().join(format!(
+            "shelbi-global-state-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&p).unwrap();
+        p
+    }
+
+    #[test]
+    fn missing_state_file_returns_default() {
+        let _g = LOCK.lock().unwrap();
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+        let s = read_global_state().unwrap();
+        assert_eq!(s, GlobalState::default());
+        assert!(s.tmux_palette_key.is_none());
+        std::env::remove_var("SHELBI_HOME");
+    }
+
+    #[test]
+    fn round_trips_tmux_palette_key() {
+        let _g = LOCK.lock().unwrap();
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+        let mut s = read_global_state().unwrap();
+        s.tmux_palette_key = Some("M-z".into());
+        write_global_state(&s).unwrap();
+        let read_back = read_global_state().unwrap();
+        assert_eq!(read_back.tmux_palette_key.as_deref(), Some("M-z"));
+        std::env::remove_var("SHELBI_HOME");
+    }
+}
+
 /// Window during which a `zen_last_crashed_at` heartbeat counts as a
 /// recent-crash signal. Sized to catch a same-session crash without
 /// sandbagging a fresh Zen run hours after an unrelated abort.

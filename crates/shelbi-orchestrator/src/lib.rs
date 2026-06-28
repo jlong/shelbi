@@ -15,6 +15,7 @@
 //! consistent.
 
 use shelbi_core::{Error, Host, MachineKind, Result, TmuxAddr};
+use shelbi_state::keymap::{load_keymaps, GlobalAction};
 
 pub mod actions;
 pub mod contextstore;
@@ -359,6 +360,12 @@ pub fn ensure_dashboard(project_name: &str) -> Result<BootstrapStatus> {
         ["tmux", "set-option", "-t", session, "mouse", "on"],
     );
 
+    // Install / re-install the palette popup tmux binding using the chord
+    // resolved from `keys.yml` (with this project's overrides applied).
+    // Runs on every bootstrap so switching to a project whose override
+    // changes the chord rebinds tmux without manual fiddling.
+    let _ = apply_palette_binding(&host, project_name, &shelbi_bin);
+
     // 2. If the dashboard already has 2+ panes, layout is set up.
     let panes = shelbi_ssh::run_capture(
         &host,
@@ -368,28 +375,6 @@ pub fn ensure_dashboard(project_name: &str) -> Result<BootstrapStatus> {
     if pane_count >= 2 {
         return Ok(BootstrapStatus::AlreadyRunning);
     }
-
-    // Install the Ctrl+P tmux binding for the palette popup. The binding
-    // itself is server-scoped (tmux has no session-local key bindings),
-    // but the action is gated on the session name: outside a `shelbi-*`
-    // session the keystroke is passed straight through with `send-keys`
-    // so the user's other tmux sessions see Ctrl-P with no behavior
-    // change. Gone if the tmux server restarts.
-    let popup_cmd = format!("{} popup", shelbi_agent::shell_escape(&shelbi_bin));
-    let _ = shelbi_ssh::run(
-        &host,
-        [
-            "tmux",
-            "bind-key",
-            "-n",
-            "C-p",
-            "if-shell",
-            "-F",
-            "#{m:shelbi-*,#{session_name}}",
-            &format!("run-shell \"{popup_cmd}\""),
-            "send-keys C-p",
-        ],
-    );
 
     // 3. Split the dashboard window: orchestrator on the right.
     //    Initial split is 50/50 — the sidebar-clamp hooks installed
@@ -437,6 +422,87 @@ pub fn ensure_dashboard(project_name: &str) -> Result<BootstrapStatus> {
     create_hidden_views(&host, session, project_name, &shelbi_bin)?;
 
     Ok(BootstrapStatus::Started)
+}
+
+/// Resolve the palette-open chord from the user's keys.yml (with this
+/// project's overrides applied) and install it as a tmux `bind-key`. The
+/// previous binding — read from `~/.shelbi/state.json::tmux_palette_key` —
+/// is unbound first so we don't leave a stale entry behind when the chord
+/// changes between bootstraps or project switches.
+///
+/// The bind itself uses tmux `if-shell` to scope the palette popup to
+/// `shelbi-*` sessions: outside one, the keystroke is passed through with
+/// `send-keys` so the user's other tmux sessions see the chord unchanged.
+/// That preserves the historical behavior of the hardcoded `C-p` bind
+/// the user could rely on in their own sessions.
+///
+/// Chords that can't be expressed in tmux syntax (currently anything with
+/// the `super` modifier — see [`shelbi_state::keymap::KeyChord::to_tmux_key`])
+/// fall back to `C-p` with a stderr warning. Refusing to install anything
+/// would brick palette access, which is worse than ignoring the override.
+fn apply_palette_binding(
+    host: &shelbi_core::Host,
+    project_name: &str,
+    shelbi_bin: &str,
+) -> Result<String> {
+    let (keymaps, _diags) = load_keymaps(Some(project_name));
+    let chord = keymaps
+        .global
+        .first_chord_for(GlobalAction::OpenPalette)
+        .copied()
+        .expect("OpenPalette must have a default chord");
+
+    let tmux_key = chord.to_tmux_key().unwrap_or_else(|| {
+        eprintln!(
+            "warning: palette chord `{}` is not tmux-expressible; falling back to C-p",
+            chord.canonical(),
+        );
+        "C-p".to_string()
+    });
+
+    // Unbind the prior key (if any) so a chord change doesn't leave the
+    // old binding hanging around on the tmux server.
+    let prev = shelbi_state::read_global_state()
+        .ok()
+        .and_then(|s| s.tmux_palette_key);
+    if let Some(prev_key) = prev.as_deref() {
+        if prev_key != tmux_key {
+            let _ = shelbi_ssh::run(host, ["tmux", "unbind-key", "-n", prev_key]);
+        }
+    }
+
+    // Install the binding. Gated to shelbi-* sessions; non-shelbi
+    // sessions see the chord pass straight through via send-keys so the
+    // user's other tmux sessions are unaffected. The binding is global
+    // to the tmux server and is gone if the server restarts — bootstrap
+    // re-installs it on the next `ensure_dashboard` call.
+    let popup_cmd = format!("{} popup", shelbi_agent::shell_escape(shelbi_bin));
+    let _ = shelbi_ssh::run(
+        host,
+        [
+            "tmux",
+            "bind-key",
+            "-n",
+            &tmux_key,
+            "if-shell",
+            "-F",
+            "#{m:shelbi-*,#{session_name}}",
+            &format!("run-shell \"{popup_cmd}\""),
+            &format!("send-keys {tmux_key}"),
+        ],
+    );
+
+    // Persist the new key so the next bootstrap / project switch knows
+    // what to unbind. Best-effort: a missing $SHELBI_HOME (already
+    // surfaced elsewhere) shouldn't block the rest of bootstrap.
+    if let Ok(mut state) = shelbi_state::read_global_state() {
+        if state.tmux_palette_key.as_deref() != Some(tmux_key.as_str()) {
+            state.tmux_palette_key = Some(tmux_key.clone());
+            let _ = shelbi_state::write_global_state(&state);
+        }
+    }
+
+    Ok(tmux_key)
 }
 
 fn create_hidden_views(
@@ -784,6 +850,10 @@ pub fn reload(project_name: &str) -> Result<ReloadReport> {
 
     let shelbi_bin = current_exe_string()?;
     let mut report = ReloadReport::default();
+
+    // Re-apply the palette tmux binding so reload picks up `keys.yml`
+    // edits without forcing the user to kill + restart the dashboard.
+    let _ = apply_palette_binding(&Host::Local, project_name, &shelbi_bin);
 
     // 1. Sidebar — pane id isn't stored at bootstrap; target positionally.
     //    `dashboard.{left}` resolves to the leftmost pane in the dashboard
