@@ -4,6 +4,7 @@ import { GeistSans } from "geist/font/sans"
 import { GeistMono } from "geist/font/mono"
 import { Header } from "@/components/Header"
 import { Footer } from "@/components/Footer"
+import { getSections, humanizeSection } from "@/lib/docs"
 import "./globals.css"
 
 const SITE_URL = "https://shelbi.dev"
@@ -40,6 +41,10 @@ export default function RootLayout({
 }: Readonly<{
   children: React.ReactNode
 }>) {
+  const docsSections = getSections().map(({ section, docs }) => ({
+    label: section ? humanizeSection(section) : "",
+    items: docs.map((doc) => ({ label: doc.title, href: doc.url })),
+  }))
   return (
     <html
       lang="en"
@@ -53,7 +58,7 @@ export default function RootLayout({
         />
       </head>
       <body className="bg-bg text-fg flex min-h-screen flex-col font-sans">
-        <Header />
+        <Header docsSections={docsSections} />
         <div className="flex-1">{children}</div>
         <Footer />
         <Analytics />
