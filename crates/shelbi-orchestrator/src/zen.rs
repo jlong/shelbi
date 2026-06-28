@@ -64,7 +64,7 @@ impl CiVerdict {
             CiVerdict::Green => "green".to_string(),
             CiVerdict::Red { check, summary } => {
                 let safe_check = check.replace(':', "_");
-                let safe_summary = summary.replace('\n', " ").replace(':', " ");
+                let safe_summary = summary.replace(['\n', ':'], " ");
                 let trimmed = safe_summary.trim();
                 format!("red:{safe_check}:{trimmed}")
             }
@@ -1290,7 +1290,7 @@ pub fn extract_path_tokens(body: &str) -> Vec<String> {
 fn canonical_path_token(raw: &str) -> Option<String> {
     // Only trim the *trailing* end. Stripping leading punctuation would
     // eat the slash in tokens like `./foo.rs` and lose the path signal.
-    let trimmed = raw.trim_end_matches(|c: char| c == '.' || c == '/' || c == '-' || c == '_');
+    let trimmed = raw.trim_end_matches(['.', '/', '-', '_']);
     if trimmed.is_empty() || !trimmed.contains('/') {
         return None;
     }

@@ -160,8 +160,8 @@ fn status(project: &str, name: Option<&str>) -> Result<()> {
 fn print_status_table(names: &[String]) -> Result<()> {
     let now = Utc::now();
     println!(
-        "{:<12} {:<24} {:<14} {:<12} {}",
-        "WORKER", "TASK", "STATE", "LAST SEEN", "IN STATE"
+        "{:<12} {:<24} {:<14} {:<12} IN STATE",
+        "WORKER", "TASK", "STATE", "LAST SEEN"
     );
     for name in names {
         let row = shelbi_state::load_worker_status(name).map_err(|e| anyhow!(e))?;
@@ -175,8 +175,8 @@ fn print_status_table(names: &[String]) -> Result<()> {
                 format_ago(now, s.last_transition),
             ),
             None => println!(
-                "{:<12} {:<24} {:<14} {:<12} {}",
-                name, "—", "?", "never", "—"
+                "{:<12} {:<24} {:<14} {:<12} —",
+                name, "—", "?", "never"
             ),
         }
     }

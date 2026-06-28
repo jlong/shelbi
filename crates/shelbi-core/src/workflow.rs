@@ -414,7 +414,10 @@ impl<'de> Deserialize<'de> for Status {
             name: Option<String>,
             category: StatusCategory,
             owner: Owner,
+            // Accepted-and-discarded for legacy YAML compatibility; serde
+            // reads it but the post-deserialize step doesn't need it.
             #[serde(default)]
+            #[allow(dead_code)]
             description: Option<String>,
         }
         let raw = Raw::deserialize(d)?;

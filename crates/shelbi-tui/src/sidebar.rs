@@ -384,7 +384,7 @@ mod tests {
             "zen row should span full sidebar width, got: {zen_row:?}"
         );
         assert!(
-            zen_row.chars().all(|c| c != ' ' || true) && !zen_row.trim().is_empty(),
+            !zen_row.trim().is_empty(),
             "zen row should not be empty: {zen_row:?}"
         );
     }
