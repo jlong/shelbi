@@ -10,14 +10,10 @@
 //!   `shelbi __sidebar PROJECT` invokes.
 
 use std::io;
-use std::time::Duration;
 
 use anyhow::{Context, Result};
 use crossterm::{
-    event::{
-        self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind, KeyModifiers,
-        MouseButton, MouseEvent, MouseEventKind,
-    },
+    event::{DisableMouseCapture, EnableMouseCapture},
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
@@ -25,6 +21,7 @@ use ratatui::{backend::CrosstermBackend, Terminal};
 
 mod activity;
 mod app;
+mod handlers;
 mod kanban;
 mod keymap;
 mod poller;
@@ -192,7 +189,7 @@ pub fn run_sidebar(project_name: &str) -> Result<()> {
     // exit path we took.
     let _poller = WorkerPoller::start(project_name);
 
-    let result = sidebar_loop(&mut term, &mut app);
+    let result = handlers::sidebar::sidebar_loop(&mut term, &mut app);
 
     restore_terminal(&mut term).context("restoring terminal")?;
     result
@@ -207,7 +204,7 @@ pub fn run_tasks(project_name: &str) -> Result<()> {
     let mut app = KanbanApp::new(project_name);
     app.refresh();
 
-    let result = tasks_loop(&mut term, &mut app);
+    let result = handlers::kanban::tasks_loop(&mut term, &mut app);
 
     restore_terminal(&mut term).context("restoring terminal")?;
     result
@@ -221,7 +218,7 @@ pub fn run_review(project_name: &str) -> Result<()> {
     let mut app = ReviewApp::new(project_name);
     app.refresh();
 
-    let result = review_loop(&mut term, &mut app);
+    let result = handlers::review::review_loop(&mut term, &mut app);
 
     restore_terminal(&mut term).context("restoring terminal")?;
     result
@@ -235,7 +232,7 @@ pub fn run_activity(project_name: &str) -> Result<()> {
     let mut app = ActivityApp::new(project_name);
     app.refresh();
 
-    let result = activity_loop(&mut term, &mut app);
+    let result = handlers::activity::activity_loop(&mut term, &mut app);
 
     restore_terminal(&mut term).context("restoring terminal")?;
     result
@@ -259,351 +256,4 @@ fn restore_terminal<B: ratatui::backend::Backend + std::io::Write>(
     execute!(term.backend_mut(), DisableMouseCapture, LeaveAlternateScreen)?;
     term.show_cursor()?;
     Ok(())
-}
-
-fn sidebar_loop<B: ratatui::backend::Backend>(
-    term: &mut Terminal<B>,
-    app: &mut App,
-) -> Result<()> {
-    while !app.should_quit {
-        app.maybe_refresh().ok();
-
-        term.draw(|f| sidebar::render_full(f, app, f.area()))?;
-
-        if event::poll(Duration::from_millis(200))? {
-            match event::read()? {
-                Event::Key(k) => {
-                    if k.kind != KeyEventKind::Press {
-                        continue;
-                    }
-                    handle_key(app, k.code, k.modifiers);
-                }
-                Event::Mouse(m) => handle_mouse(app, m),
-                _ => {}
-            }
-        }
-    }
-    Ok(())
-}
-
-fn tasks_loop<B: ratatui::backend::Backend>(
-    term: &mut Terminal<B>,
-    app: &mut KanbanApp,
-) -> Result<()> {
-    loop {
-        app.maybe_refresh();
-        term.draw(|f| kanban::render_full(f, app, f.area()))?;
-        if event::poll(Duration::from_millis(200))? {
-            match event::read()? {
-                Event::Key(k) => {
-                    if k.kind != KeyEventKind::Press {
-                        continue;
-                    }
-                    // Ctrl+C exits — the parent shell loop will respawn us.
-                    if k.modifiers.contains(KeyModifiers::CONTROL)
-                        && matches!(k.code, KeyCode::Char('c'))
-                    {
-                        return Ok(());
-                    }
-                    handle_kanban_key(app, k.code, k.modifiers);
-                }
-                Event::Mouse(m) => handle_kanban_mouse(app, m),
-                _ => {}
-            }
-        }
-    }
-}
-
-fn review_loop<B: ratatui::backend::Backend>(
-    term: &mut Terminal<B>,
-    app: &mut ReviewApp,
-) -> Result<()> {
-    loop {
-        app.maybe_refresh();
-        term.draw(|f| review::render_full(f, app, f.area()))?;
-        if event::poll(Duration::from_millis(200))? {
-            if let Event::Key(k) = event::read()? {
-                if k.kind != KeyEventKind::Press {
-                    continue;
-                }
-                // Ctrl+C exits — the parent shell loop will respawn us.
-                if k.modifiers.contains(KeyModifiers::CONTROL)
-                    && matches!(k.code, KeyCode::Char('c'))
-                {
-                    return Ok(());
-                }
-                handle_review_key(app, k.code);
-            }
-        }
-    }
-}
-
-fn activity_loop<B: ratatui::backend::Backend>(
-    term: &mut Terminal<B>,
-    app: &mut ActivityApp,
-) -> Result<()> {
-    loop {
-        app.maybe_refresh();
-        term.draw(|f| activity::render_full(f, app, f.area()))?;
-        if event::poll(Duration::from_millis(200))? {
-            match event::read()? {
-                Event::Key(k) => {
-                    if k.kind != KeyEventKind::Press {
-                        continue;
-                    }
-                    // Ctrl+C exits — the parent shell loop will respawn us.
-                    if k.modifiers.contains(KeyModifiers::CONTROL)
-                        && matches!(k.code, KeyCode::Char('c'))
-                    {
-                        return Ok(());
-                    }
-                    handle_activity_key(app, k.code);
-                }
-                Event::Mouse(m) => handle_activity_mouse(app, m),
-                _ => {}
-            }
-        }
-    }
-}
-
-fn handle_activity_key(app: &mut ActivityApp, code: KeyCode) {
-    match code {
-        KeyCode::Up | KeyCode::Char('k') => app.scroll_up(),
-        KeyCode::Down | KeyCode::Char('j') => app.scroll_down(),
-        KeyCode::PageUp | KeyCode::Char('u') => app.scroll_page_up(),
-        KeyCode::PageDown | KeyCode::Char('d') => app.scroll_page_down(),
-        KeyCode::Char('g') | KeyCode::Home => app.scroll_home(),
-        KeyCode::Char('G') | KeyCode::End => app.scroll_end(),
-        KeyCode::Char('r') => app.refresh(),
-        KeyCode::Char('a') => app.reset_filter(),
-        KeyCode::Char('z') => app.toggle_zen_filter(),
-        KeyCode::Char('w') => app.toggle_workers_filter(),
-        _ => {}
-    }
-}
-
-/// Mouse-wheel scrolls the feed; left-click on the pill row toggles
-/// the matching filter. Scroll-up walks toward older events (positive
-/// scroll offset since newest sits at the top).
-fn handle_activity_mouse(app: &mut ActivityApp, mouse: MouseEvent) {
-    match mouse.kind {
-        MouseEventKind::ScrollUp => app.scroll_up(),
-        MouseEventKind::ScrollDown => app.scroll_down(),
-        MouseEventKind::Down(MouseButton::Left) => {
-            app.click_pill(mouse.column, mouse.row);
-        }
-        _ => {}
-    }
-}
-
-fn handle_review_key(app: &mut ReviewApp, code: KeyCode) {
-    match code {
-        KeyCode::Up | KeyCode::Char('k') => app.nav_up(),
-        KeyCode::Down | KeyCode::Char('j') => app.nav_down(),
-        KeyCode::Char('K') => app.scroll_body_up(),
-        KeyCode::Char('J') => app.scroll_body_down(),
-        KeyCode::PageUp | KeyCode::Char('u') => app.scroll_body_page_up(),
-        KeyCode::PageDown | KeyCode::Char('d') => app.scroll_body_page_down(),
-        KeyCode::Char('g') | KeyCode::Home => app.scroll_body_home(),
-        KeyCode::Enter | KeyCode::Char(' ') => app.activate_selection(),
-        KeyCode::Char('r') => app.refresh(),
-        _ => {}
-    }
-}
-
-fn handle_kanban_key(app: &mut KanbanApp, code: KeyCode, mods: KeyModifiers) {
-    // When the task popover is open it swallows input — board nav keys
-    // would otherwise move the cursor underneath while the user is reading.
-    if app.popover_is_open() {
-        handle_popover_key(app, code);
-        return;
-    }
-
-    // Filter dropdowns are also modal — same precedence reason as the
-    // popover. Sits below the popover so a card detail open over the
-    // dropdown still routes input to the card view.
-    if app.worker_dropdown_is_open() {
-        handle_worker_dropdown_key(app, code);
-        return;
-    }
-    if app.workflow_dropdown_is_open() {
-        handle_workflow_dropdown_key(app, code);
-        return;
-    }
-
-    let shift = mods.contains(KeyModifiers::SHIFT);
-    match code {
-        KeyCode::Left | KeyCode::Char('h') => app.nav_left(),
-        KeyCode::Right | KeyCode::Char('l') => app.nav_right(),
-        KeyCode::Up | KeyCode::Char('k') => {
-            if shift {
-                app.reorder_up()
-            } else {
-                app.nav_up()
-            }
-        }
-        KeyCode::Down | KeyCode::Char('j') => {
-            if shift {
-                app.reorder_down()
-            } else {
-                app.nav_down()
-            }
-        }
-        KeyCode::Enter | KeyCode::Char(' ') => app.open_popover(),
-        // Shifted hjkl: caps-letter form, since shift+h/l won't carry the
-        // SHIFT modifier on most terminals — the keycode arrives as the
-        // uppercase char directly.
-        KeyCode::Char('H') => app.move_card_left(),
-        KeyCode::Char('L') => app.move_card_right(),
-        KeyCode::Char('K') => app.reorder_up(),
-        KeyCode::Char('J') => app.reorder_down(),
-        KeyCode::Char('f') => app.toggle_worker_dropdown(),
-        KeyCode::Char('w') => app.toggle_workflow_dropdown(),
-        KeyCode::Char('r') => app.refresh(),
-        _ => {}
-    }
-}
-
-/// Left-click on a card opens its popover — same path as ENTER/SPACE on the
-/// keyboard. Clicks outside any card are a no-op. With the popover open we
-/// ignore clicks entirely; the popover has its own dismiss keys. With only
-/// the worker filter dropdown open, a click on an option commits it; a
-/// click anywhere outside the dropdown closes it (drop-to-dismiss pattern
-/// that matches what users expect from native dropdowns).
-fn handle_kanban_mouse(app: &mut KanbanApp, mouse: MouseEvent) {
-    if app.popover_is_open() {
-        return;
-    }
-    if let MouseEventKind::Down(MouseButton::Left) = mouse.kind {
-        if app.worker_dropdown_is_open() {
-            if let Some(idx) = app.dropdown_option_at(mouse.column, mouse.row) {
-                if let Some(d) = app.worker_dropdown.as_mut() {
-                    d.cursor = idx;
-                }
-                app.dropdown_select();
-            } else if app.filter_chip_at(mouse.column, mouse.row) {
-                // Click on the chip while open → close. Mirrors a
-                // native dropdown's "click the trigger again to dismiss"
-                // behavior.
-                app.close_worker_dropdown();
-            } else {
-                // Click outside the dropdown and outside the chip →
-                // dismiss without changing the filter.
-                app.close_worker_dropdown();
-            }
-            return;
-        }
-        if app.workflow_dropdown_is_open() {
-            if let Some(idx) = app.workflow_dropdown_option_at(mouse.column, mouse.row) {
-                if let Some(d) = app.workflow_dropdown.as_mut() {
-                    d.cursor = idx;
-                }
-                app.workflow_dropdown_select();
-            } else {
-                // Click on the chip → close. Click outside → close.
-                // Both paths collapse to the same dismiss behaviour;
-                // the chip branch exists only so the chip's click
-                // routes here instead of bubbling to a kanban card.
-                app.close_workflow_dropdown();
-            }
-            return;
-        }
-        if app.workflow_chip_at(mouse.column, mouse.row) {
-            app.open_workflow_dropdown();
-            return;
-        }
-        if app.filter_chip_at(mouse.column, mouse.row) {
-            app.open_worker_dropdown();
-            return;
-        }
-        if let Some((col, row)) = app.card_at(mouse.column, mouse.row) {
-            app.open_popover_at(col, row);
-        }
-    }
-}
-
-fn handle_popover_key(app: &mut KanbanApp, code: KeyCode) {
-    match code {
-        KeyCode::Esc | KeyCode::Enter | KeyCode::Char(' ') | KeyCode::Char('q') => {
-            app.close_popover();
-        }
-        KeyCode::Up | KeyCode::Char('k') => app.popover_scroll_up(),
-        KeyCode::Down | KeyCode::Char('j') => app.popover_scroll_down(),
-        KeyCode::PageUp | KeyCode::Char('u') => app.popover_scroll_page_up(),
-        KeyCode::PageDown | KeyCode::Char('d') => app.popover_scroll_page_down(),
-        KeyCode::Char('g') | KeyCode::Home => app.popover_scroll_home(),
-        _ => {}
-    }
-}
-
-/// Keys consumed while the worker filter dropdown is open. Enter /
-/// Space commit the cursor's option; Esc dismisses without changing
-/// the filter; `c` clears the filter back to "All" without needing to
-/// navigate. `f` toggles the dropdown so the same key opens and closes
-/// it.
-fn handle_worker_dropdown_key(app: &mut KanbanApp, code: KeyCode) {
-    match code {
-        KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('f') => app.close_worker_dropdown(),
-        KeyCode::Up | KeyCode::Char('k') => app.dropdown_nav_up(),
-        KeyCode::Down | KeyCode::Char('j') => app.dropdown_nav_down(),
-        KeyCode::Enter | KeyCode::Char(' ') => app.dropdown_select(),
-        KeyCode::Char('c') => app.dropdown_clear(),
-        _ => {}
-    }
-}
-
-/// Sibling of [`handle_worker_dropdown_key`] — same shape, `w` toggles
-/// the workflow dropdown so the same key opens and closes it.
-fn handle_workflow_dropdown_key(app: &mut KanbanApp, code: KeyCode) {
-    match code {
-        KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('w') => app.close_workflow_dropdown(),
-        KeyCode::Up | KeyCode::Char('k') => app.workflow_dropdown_nav_up(),
-        KeyCode::Down | KeyCode::Char('j') => app.workflow_dropdown_nav_down(),
-        KeyCode::Enter | KeyCode::Char(' ') => app.workflow_dropdown_select(),
-        KeyCode::Char('c') => app.workflow_dropdown_clear(),
-        _ => {}
-    }
-}
-
-fn handle_key(app: &mut App, code: KeyCode, mods: KeyModifiers) {
-    if mods.contains(KeyModifiers::CONTROL) && matches!(code, KeyCode::Char('c')) {
-        app.should_quit = true;
-        return;
-    }
-    // Zen-toggle chord runs before any other binding so a remap to (say)
-    // Ctrl+G can't be eaten by a future `g` nav key. The sidebar has no
-    // modal overlays of its own — the palette is a tmux popup, which
-    // pre-empts our input entirely — so there's no "modal swallow" branch
-    // to check here.
-    if crate::keymap::matches_zen_toggle(code, mods, app.zen_toggle_chord) {
-        app.toggle_zen_mode();
-        return;
-    }
-    match code {
-        KeyCode::Char('q') => app.should_quit = true,
-        KeyCode::Up | KeyCode::Char('k') => app.nav_up(),
-        KeyCode::Down | KeyCode::Char('j') => app.nav_down(),
-        KeyCode::Enter => app.activate_selection(),
-        KeyCode::Char('r') => {
-            app.refresh().ok();
-        }
-        _ => {}
-    }
-}
-
-/// Left-click on a sidebar row selects and activates it (same as
-/// nav-then-Enter). Scroll wheel walks the selection up/down without
-/// activating, so a user can preview which row is highlighted.
-fn handle_mouse(app: &mut App, mouse: MouseEvent) {
-    match mouse.kind {
-        MouseEventKind::Down(MouseButton::Left) => {
-            if let Some(idx) = app.row_at(mouse.column, mouse.row) {
-                app.sidebar_index = idx;
-                app.activate_selection();
-            }
-        }
-        MouseEventKind::ScrollDown => app.nav_down(),
-        MouseEventKind::ScrollUp => app.nav_up(),
-        _ => {}
-    }
 }
