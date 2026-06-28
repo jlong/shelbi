@@ -10,7 +10,7 @@ const PRODUCT = [
 
 const DOCS = [
   { label: "Getting Started", href: "/docs/getting-started/install" },
-  { label: "Concepts", href: "/docs/concepts/workers" },
+  { label: "Concepts", href: "/docs/concepts/workflows" },
   { label: "CLI Reference", href: "/docs/cli/task" },
   { label: "Changelog", href: "/docs/changelog" },
 ] as const
