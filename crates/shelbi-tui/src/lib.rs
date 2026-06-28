@@ -225,11 +225,36 @@ pub fn run_sidebar(project_name: &str) -> Result<()> {
 /// the palette. Parent shell wraps invocation in `while true; do …; done`
 /// so an accidental crash respawns instead of leaving an empty pane.
 pub fn run_tasks(project_name: &str) -> Result<()> {
+    // Load `keys.yml` before the alt-screen swap so parse / collision
+    // diagnostics land on the terminal the user can still see. Bad
+    // config never blocks launch — affected actions fall back to
+    // built-in defaults. Formatting mirrors `run_sidebar` so both
+    // entry points present diagnostics the same way.
+    let (keymaps, diags) = shelbi_state::keymap::load_keymaps(Some(project_name));
+    for d in &diags {
+        match d {
+            shelbi_state::keymap::KeymapDiagnostic::Error { message, location, .. } => {
+                if let Some(loc) = location {
+                    eprintln!("shelbi: keys.yml error: {message} (at {loc})");
+                } else {
+                    eprintln!("shelbi: keys.yml error: {message}");
+                }
+            }
+            shelbi_state::keymap::KeymapDiagnostic::Warning { message, location, .. } => {
+                if let Some(loc) = location {
+                    eprintln!("shelbi: keys.yml warning: {message} (at {loc})");
+                } else {
+                    eprintln!("shelbi: keys.yml warning: {message}");
+                }
+            }
+        }
+    }
+
     let mut term = setup_terminal().context("setting up terminal")?;
     let mut app = KanbanApp::new(project_name);
     app.refresh();
 
-    let result = handlers::kanban::tasks_loop(&mut term, &mut app);
+    let result = handlers::kanban::tasks_loop(&mut term, &mut app, &keymaps);
 
     restore_terminal(&mut term).context("restoring terminal")?;
     result
