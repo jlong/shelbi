@@ -410,7 +410,7 @@ impl KanbanApp {
         // `self.tasks`). Stable sort → equal timestamps preserve that order,
         // so identical-state polls don't reshuffle / flicker.
         if ac.category == StatusCategory::Done {
-            tasks.sort_by(|a, b| b.task.updated_at.cmp(&a.task.updated_at));
+            tasks.sort_by_key(|tf| std::cmp::Reverse(tf.task.updated_at));
         }
         tasks
     }

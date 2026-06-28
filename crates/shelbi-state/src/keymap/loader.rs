@@ -331,6 +331,25 @@ pub fn load_keymaps(project_name: Option<&str>) -> (Keymaps, Vec<KeymapDiagnosti
         }
     }
 
+    // Reserved-chord check: `ctrl-c` must always quit. If the merged
+    // `global.quit` chord list no longer contains it (the user rebound the
+    // action away), emit a warning but don't block — the user may have an
+    // intentional reason (e.g. a Git pre-commit hook that allows it).
+    if let Ok(ctrl_c) = KeyChord::parse("ctrl-c") {
+        let quit_has_ctrl_c = parsed
+            .get(&Action::Global(GlobalAction::Quit))
+            .map(|v| v.contains(&ctrl_c))
+            .unwrap_or(false);
+        if !quit_has_ctrl_c {
+            diags.push(KeymapDiagnostic::warn(
+                WarningKind::ReservedChordRebind,
+                "chord `ctrl-c` is reserved (must always quit); \
+                 keep it in defaults.global.quit",
+                Some("defaults.global.quit".into()),
+            ));
+        }
+    }
+
     let keymaps = build_keymaps(&parsed);
     (keymaps, diags)
 }

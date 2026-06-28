@@ -22,11 +22,10 @@ pub fn run(project_opt: Option<String>, args: Args) -> Result<()> {
             println!("✓ orchestrator started in {}", addr.target());
         }
         BootstrapStatus::AlreadyRunning => {
-            if args.status {
-                println!("orchestrator already running in {}", addr.target());
-            } else {
-                println!("orchestrator already running in {}", addr.target());
-            }
+            // `args.status` is reserved for future status-only output; for
+            // now both branches print the same line.
+            let _ = args.status;
+            println!("orchestrator already running in {}", addr.target());
         }
     }
     print_attach(&addr.session, &addr.window);

@@ -30,6 +30,7 @@ mod sidebar;
 mod zen_probe;
 
 #[cfg(test)]
+#[allow(clippy::items_after_test_module)]
 pub(crate) mod test_support {
     use std::path::{Path, PathBuf};
     use std::sync::Mutex;
