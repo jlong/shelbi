@@ -5,7 +5,8 @@ use ratatui::layout::Rect;
 use shelbi_core::{Agent, Column, Status};
 use shelbi_palette::{Decoration, DecorationColor};
 use shelbi_state::{
-    load_worker_status, read_state, TaskFile, WorkerState, ZenModeState, ZenToggleChord,
+    keymap::Keymaps, load_worker_status, read_state, TaskFile, WorkerState, ZenModeState,
+    ZenToggleChord,
 };
 
 /// What's currently highlighted in the sidebar — drives selection logic
@@ -136,6 +137,12 @@ pub struct App {
     /// from `~/.shelbi/config.yaml::keymap.zen_toggle`. Defaults to Alt+Z
     /// before the probe runs (matches the fresh-install spec).
     pub zen_toggle_chord: ZenToggleChord,
+    /// Merged keymaps for every TUI mode — populated once at startup by
+    /// `run_sidebar` calling [`shelbi_state::keymap::load_keymaps`]. The
+    /// sidebar handler dispatches `KeyEvent`s through `keymaps.global` then
+    /// `keymaps.sidebar`. Default is empty bindings; callers that exercise
+    /// the handler (entry points, tests) replace this before dispatching.
+    pub keymaps: Keymaps,
     /// Screen-space rect occupied by the rendered row list — written each
     /// frame by the sidebar renderer and read by the mouse-click handler to
     /// map a click coordinate back to a row index.
@@ -155,8 +162,16 @@ impl App {
             should_quit: false,
             zen_mode: ZenModeState::Off,
             zen_toggle_chord: ZenToggleChord::AltZ,
+            keymaps: Keymaps::default(),
             list_area: Rect::default(),
         }
+    }
+
+    /// Borrow the keymaps populated at startup by `run_sidebar`. The
+    /// sidebar handler reads this once per loop entry rather than
+    /// re-parsing `keys.yml` per keystroke.
+    pub fn keymaps(&self) -> &Keymaps {
+        &self.keymaps
     }
 
     /// Translate a click in terminal coordinates into a row index, if the

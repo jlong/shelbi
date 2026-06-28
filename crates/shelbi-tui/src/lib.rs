@@ -175,6 +175,30 @@ pub fn run_sidebar(project_name: &str) -> Result<()> {
     let mut app = App::new_sidebar(project_name);
     app.refresh().ok();
 
+    // Load merged keymaps once — embedded builtins, then
+    // `~/.shelbi/keys.yml::defaults`, then `projects.<project_name>`.
+    // Diagnostics print to stderr; bad config never blocks launch.
+    let (keymaps, diags) = shelbi_state::keymap::load_keymaps(Some(project_name));
+    for d in &diags {
+        match d {
+            shelbi_state::keymap::KeymapDiagnostic::Error { message, location, .. } => {
+                if let Some(loc) = location {
+                    eprintln!("shelbi: keys.yml error: {message} (at {loc})");
+                } else {
+                    eprintln!("shelbi: keys.yml error: {message}");
+                }
+            }
+            shelbi_state::keymap::KeymapDiagnostic::Warning { message, location, .. } => {
+                if let Some(loc) = location {
+                    eprintln!("shelbi: keys.yml warning: {message} (at {loc})");
+                } else {
+                    eprintln!("shelbi: keys.yml warning: {message}");
+                }
+            }
+        }
+    }
+    app.keymaps = keymaps;
+
     // First-run probe: on fresh installs (no ~/.shelbi/config.yaml),
     // verify Alt+Z is delivered and let the user pick a fallback if not.
     // Best-effort: an error here defaults to Alt+Z so the sidebar still
