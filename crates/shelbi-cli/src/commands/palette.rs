@@ -22,10 +22,22 @@ use ratatui::{
     Frame, Terminal,
 };
 use shelbi_palette::{Entry, EntryKind};
+use shelbi_state::keymap::{
+    load_keymaps, GlobalAction, KeyChord, KeymapDiagnostic, Keymaps, PaletteAction,
+};
 use shelbi_state::{load_user_config, ProjectSummary, ZenModeState, ZenToggleChord};
 use shelbi_tui::{decoration_to_color, App, Row, View, WorkerOverview};
 
 pub fn run(project: String) -> Result<()> {
+    // Load the merged keymaps before entering the alt-screen so any
+    // parse / collision diagnostics land on the terminal the user can
+    // still see. Out-of-process palette → no shared Keymaps with the
+    // sidebar; we load our own copy.
+    let (keymaps, diags) = load_keymaps(Some(&project));
+    for d in &diags {
+        eprintln!("{}", format_diag(d));
+    }
+
     let mut term = setup_terminal()?;
     let mut state = State::new(&project)?;
 
@@ -44,14 +56,14 @@ pub fn run(project: String) -> Result<()> {
     //   single-shot UX for that entry); quit-project's bounce-back
     //   loop here intentionally diverges.
     let (chosen, switch_target, quit_project_confirmed) = loop {
-        let chosen = picker_loop(&mut term, &mut state);
+        let chosen = picker_loop(&mut term, &mut state, &keymaps);
         match &chosen {
             Ok(Some(entry)) if entry.id == "action:switch-project" => {
-                let target = run_project_picker(&mut term, &project)?;
+                let target = run_project_picker(&mut term, &project, &keymaps)?;
                 break (chosen, target, false);
             }
             Ok(Some(entry)) if entry.id == "action:quit-project" => {
-                if run_quit_project_confirm(&mut term, &project)? {
+                if run_quit_project_confirm(&mut term, &project, &keymaps)? {
                     break (chosen, None, true);
                 }
                 // Cancel: re-enter the main picker with state preserved.
@@ -62,7 +74,7 @@ pub fn run(project: String) -> Result<()> {
     };
     let quit_shelbi_confirmed = match &chosen {
         Ok(Some(entry)) if entry.id == "action:quit-shelbi" => {
-            run_quit_shelbi_confirm(&mut term)?
+            run_quit_shelbi_confirm(&mut term, &keymaps)?
         }
         _ => false,
     };
@@ -138,10 +150,35 @@ fn restore_terminal<B: ratatui::backend::Backend + std::io::Write>(
     Ok(())
 }
 
+/// Format a keymap diagnostic for stderr. The foundation crate doesn't
+/// implement Display for KeymapDiagnostic, so we tag the severity and
+/// location inline.
+fn format_diag(d: &KeymapDiagnostic) -> String {
+    match d {
+        KeymapDiagnostic::Error { message, location, .. } => match location {
+            Some(loc) => format!("keys.yml error [{loc}]: {message}"),
+            None => format!("keys.yml error: {message}"),
+        },
+        KeymapDiagnostic::Warning { message, location, .. } => match location {
+            Some(loc) => format!("keys.yml warning [{loc}]: {message}"),
+            None => format!("keys.yml warning: {message}"),
+        },
+    }
+}
+
 fn picker_loop<B: ratatui::backend::Backend>(
     term: &mut Terminal<B>,
     state: &mut State,
+    keymaps: &Keymaps,
 ) -> Result<Option<Entry>> {
+    // Opener-as-close: whatever the user configured for opening the
+    // palette also closes it. Resolved at startup so a future runtime
+    // reload would need a re-entry — fine here, the palette is a
+    // single-shot process.
+    let opener_close = keymaps
+        .global
+        .first_chord_for(GlobalAction::OpenPalette)
+        .copied();
     loop {
         let results = state.results();
         term.draw(|f| render(f, state, &results))?;
@@ -151,38 +188,44 @@ fn picker_loop<B: ratatui::backend::Backend>(
                 if k.kind != KeyEventKind::Press {
                     continue;
                 }
-                // Allow closing with Ctrl+C / Ctrl+P / Esc.
-                if k.modifiers.contains(KeyModifiers::CONTROL)
-                    && matches!(k.code, KeyCode::Char('c') | KeyCode::Char('p'))
-                {
-                    return Ok(None);
+                if let Some(c) = opener_close {
+                    if c == KeyChord::from_event(k) {
+                        return Ok(None);
+                    }
                 }
-                match k.code {
-                    KeyCode::Esc => return Ok(None),
-                    KeyCode::Enter => {
+                match keymaps.palette.dispatch(k) {
+                    Some(PaletteAction::Close) => return Ok(None),
+                    Some(PaletteAction::Activate) => {
                         if let Some((entry, _)) = results.get(state.selected) {
                             return Ok(Some(entry.clone()));
                         }
                     }
-                    KeyCode::Up => {
+                    Some(PaletteAction::NavUp) => {
                         if state.selected > 0 {
                             state.selected -= 1;
                         }
                     }
-                    KeyCode::Down => {
+                    Some(PaletteAction::NavDown) => {
                         if state.selected + 1 < results.len() {
                             state.selected += 1;
                         }
                     }
-                    KeyCode::Backspace => {
+                    Some(PaletteAction::Backspace) => {
                         state.query.pop();
                         state.selected = 0;
                     }
-                    KeyCode::Char(c) => {
-                        state.query.push(c);
-                        state.selected = 0;
+                    None => {
+                        // Unbound printable Char appends to the query.
+                        // Binding a printable character (e.g. `space`) to
+                        // a palette action makes it un-typeable in the
+                        // query — that's the documented trade-off.
+                        if let KeyCode::Char(c) = k.code {
+                            if k.modifiers.is_empty() || k.modifiers == KeyModifiers::SHIFT {
+                                state.query.push(c);
+                                state.selected = 0;
+                            }
+                        }
                     }
-                    _ => {}
                 }
             }
         }
@@ -514,6 +557,7 @@ where
 fn run_project_picker<B: ratatui::backend::Backend>(
     term: &mut Terminal<B>,
     current: &str,
+    keymaps: &Keymaps,
 ) -> Result<Option<String>> {
     let projects: Vec<ProjectSummary> = shelbi_state::list_projects()
         .map_err(|e| anyhow::anyhow!(e))?
@@ -526,6 +570,10 @@ fn run_project_picker<B: ratatui::backend::Backend>(
         return Ok(None);
     }
 
+    let opener_close = keymaps
+        .global
+        .first_chord_for(GlobalAction::OpenPalette)
+        .copied();
     let mut query = String::new();
     let mut selected = 0usize;
 
@@ -538,35 +586,38 @@ fn run_project_picker<B: ratatui::backend::Backend>(
                 if k.kind != KeyEventKind::Press {
                     continue;
                 }
-                if k.modifiers.contains(KeyModifiers::CONTROL)
-                    && matches!(k.code, KeyCode::Char('c') | KeyCode::Char('p'))
-                {
-                    return Ok(None);
+                if let Some(c) = opener_close {
+                    if c == KeyChord::from_event(k) {
+                        return Ok(None);
+                    }
                 }
-                match k.code {
-                    KeyCode::Esc => return Ok(None),
-                    KeyCode::Enter => {
+                match keymaps.palette.dispatch(k) {
+                    Some(PaletteAction::Close) => return Ok(None),
+                    Some(PaletteAction::Activate) => {
                         if let Some(p) = results.get(selected) {
                             return Ok(Some(p.name.clone()));
                         }
                     }
-                    KeyCode::Up => {
+                    Some(PaletteAction::NavUp) => {
                         selected = selected.saturating_sub(1);
                     }
-                    KeyCode::Down => {
+                    Some(PaletteAction::NavDown) => {
                         if selected + 1 < results.len() {
                             selected += 1;
                         }
                     }
-                    KeyCode::Backspace => {
+                    Some(PaletteAction::Backspace) => {
                         query.pop();
                         selected = 0;
                     }
-                    KeyCode::Char(c) => {
-                        query.push(c);
-                        selected = 0;
+                    None => {
+                        if let KeyCode::Char(c) = k.code {
+                            if k.modifiers.is_empty() || k.modifiers == KeyModifiers::SHIFT {
+                                query.push(c);
+                                selected = 0;
+                            }
+                        }
                     }
-                    _ => {}
                 }
             }
         }
@@ -690,8 +741,13 @@ fn render_project_picker(
 
 fn run_quit_shelbi_confirm<B: ratatui::backend::Backend>(
     term: &mut Terminal<B>,
+    keymaps: &Keymaps,
 ) -> Result<bool> {
     let projects = super::quit_shelbi::list_managed_projects();
+    let opener_close = keymaps
+        .global
+        .first_chord_for(GlobalAction::OpenPalette)
+        .copied();
     let mut focus_quit = false;
 
     loop {
@@ -702,18 +758,29 @@ fn run_quit_shelbi_confirm<B: ratatui::backend::Backend>(
                 if k.kind != KeyEventKind::Press {
                     continue;
                 }
-                if k.modifiers.contains(KeyModifiers::CONTROL)
-                    && matches!(k.code, KeyCode::Char('c') | KeyCode::Char('p'))
-                {
-                    return Ok(false);
+                if let Some(c) = opener_close {
+                    if c == KeyChord::from_event(k) {
+                        return Ok(false);
+                    }
                 }
+                // Button-focus toggle (Left/Right/Tab/BackTab) stays
+                // hardcoded — it's a confirmation-modal specific that
+                // isn't part of the customizable palette action set.
                 match k.code {
-                    KeyCode::Esc => return Ok(false),
-                    KeyCode::Enter => return Ok(focus_quit),
                     KeyCode::Left | KeyCode::Right | KeyCode::Tab | KeyCode::BackTab => {
                         focus_quit = !focus_quit;
+                        continue;
                     }
                     _ => {}
+                }
+                match keymaps.palette.dispatch(k) {
+                    Some(PaletteAction::Close) => return Ok(false),
+                    Some(PaletteAction::Activate) => return Ok(focus_quit),
+                    // NavUp / NavDown / Backspace have no meaningful
+                    // effect on a confirmation popover; swallow them so
+                    // a stray j/k doesn't fall through to printable
+                    // input (there is none here, but keeps parity).
+                    Some(_) | None => {}
                 }
             }
         }
@@ -732,8 +799,13 @@ fn run_quit_shelbi_confirm<B: ratatui::backend::Backend>(
 fn run_quit_project_confirm<B: ratatui::backend::Backend>(
     term: &mut Terminal<B>,
     project: &str,
+    keymaps: &Keymaps,
 ) -> Result<bool> {
     let workers = super::quit_project::list_active_workers(project);
+    let opener_close = keymaps
+        .global
+        .first_chord_for(GlobalAction::OpenPalette)
+        .copied();
     let mut focus_quit = false;
 
     loop {
@@ -744,18 +816,25 @@ fn run_quit_project_confirm<B: ratatui::backend::Backend>(
                 if k.kind != KeyEventKind::Press {
                     continue;
                 }
-                if k.modifiers.contains(KeyModifiers::CONTROL)
-                    && matches!(k.code, KeyCode::Char('c') | KeyCode::Char('p'))
-                {
-                    return Ok(false);
+                if let Some(c) = opener_close {
+                    if c == KeyChord::from_event(k) {
+                        return Ok(false);
+                    }
                 }
+                // Button-focus toggle (Left/Right/Tab/BackTab) stays
+                // hardcoded — see `run_quit_shelbi_confirm` for the
+                // reasoning.
                 match k.code {
-                    KeyCode::Esc => return Ok(false),
-                    KeyCode::Enter => return Ok(focus_quit),
                     KeyCode::Left | KeyCode::Right | KeyCode::Tab | KeyCode::BackTab => {
                         focus_quit = !focus_quit;
+                        continue;
                     }
                     _ => {}
+                }
+                match keymaps.palette.dispatch(k) {
+                    Some(PaletteAction::Close) => return Ok(false),
+                    Some(PaletteAction::Activate) => return Ok(focus_quit),
+                    Some(_) | None => {}
                 }
             }
         }
