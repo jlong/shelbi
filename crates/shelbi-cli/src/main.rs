@@ -80,6 +80,14 @@ enum Cmd {
         #[command(subcommand)]
         cmd: commands::project::ProjectCmd,
     },
+    /// Inspect and validate the user's keybinding configuration.
+    /// `list-actions` shows every action's current chord(s); `dump-keybindings`
+    /// writes a starter `keys.yml`; `check` validates `~/.shelbi/keys.yml`
+    /// and reports any errors/warnings.
+    Config {
+        #[command(subcommand)]
+        cmd: commands::config::ConfigCmd,
+    },
     /// Inspect the hub-global worker-state transition log.
     Events {
         #[command(subcommand)]
@@ -186,6 +194,7 @@ fn main() -> Result<()> {
         Some(Cmd::Worker { cmd }) => commands::worker::run(cli.project, cmd),
         Some(Cmd::Workflow { cmd }) => commands::workflow::run(cli.project, cmd),
         Some(Cmd::Project { cmd }) => commands::project::run(cmd),
+        Some(Cmd::Config { cmd }) => commands::config::run(cli.project, cmd),
         Some(Cmd::Events { cmd }) => commands::events::run(cmd),
         Some(Cmd::Zen { cmd }) => commands::zen::run(cli.project, cmd),
         Some(Cmd::Action { cmd }) => commands::action::run(cli.project, cmd),
