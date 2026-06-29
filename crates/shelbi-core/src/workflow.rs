@@ -3,16 +3,41 @@
 //!
 //! A workflow is the structure described in `Plans/workflows.md`: a named
 //! list of statuses, each carrying a [`StatusCategory`] (the semantic
-//! vocabulary the rest of the system reasons in) and an [`Owner`] (who is
-//! expected to act). Workflows live at
-//! `~/.shelbi/projects/<project>/workflows/<name>.yaml` and are loaded
-//! through [`Workflow::from_yaml_str`].
+//! vocabulary the rest of the system reasons in), an [`Owner`] (who is
+//! expected to act when automation is off), and an optional **`agent:`**
+//! (which agent the orchestrator dispatches to when automation is on).
+//! Workflows live at `~/.shelbi/projects/<project>/workflows/<name>.yaml`
+//! and are loaded through [`Workflow::from_yaml_str`].
 //!
-//! This module is **only** the schema + validator. Wiring workflows into
-//! the orchestrator, TUI, events log, or task frontmatter happens in
-//! later phases; this is the foundation those phases rely on.
+//! ## The two-field owner / agent split
 //!
-//! See `Plans/workflows.md` §2 for the canonical schema.
+//! - `owner` (strict `user | agent`) — who is responsible when Zen is
+//!   off. `user` waits for a human; `agent` is dispatchable.
+//! - `agent` (optional, a directory name under `agents/`) — which agent
+//!   is empowered to act when Zen is on. A `user`-owned status with an
+//!   `agent:` value means "under Zen, this agent can do the work without
+//!   me." A status with no `agent:` has no automation path — even Zen
+//!   leaves it alone.
+//!
+//! See `Plans/agents-workspaces.md` §4 and `Plans/workflows.md` §1 for
+//! the full design.
+//!
+//! ## Legacy migration
+//!
+//! Existing workflows authored before the split keep loading:
+//!
+//! - `owner: agent` (no `agent:` field) → fills in `agent:` from
+//!   category (`ready` → `orchestrator`, `active` → `developer`). Any
+//!   other category with bare `owner: agent` is a hard error.
+//! - `owner: <name>` (a never-shipped named-owner design that may exist
+//!   in test fixtures) → rewrites to `owner: agent, agent: <name>`.
+//!
+//! Either form causes [`Workflow::from_yaml_str_with_diagnostics`] to
+//! return one summary deprecation diagnostic per workflow, which the
+//! state-layer loader surfaces to stderr once per workflow per process.
+//!
+//! This module is the schema + validator. Wiring workflows into the
+//! orchestrator, TUI, events log, or task frontmatter happens elsewhere.
 
 use std::collections::BTreeMap;
 use std::time::Duration;
@@ -29,7 +54,7 @@ use crate::{Error, GitConfig, ZenChecks, ZenDangerPaths};
 /// plus the optional rules that constrain those moves. Round-trips through
 /// YAML; call [`Workflow::validate`] (or the all-in-one
 /// [`Workflow::from_yaml_str`]) before trusting the values.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct Workflow {
     /// Workflow id. Conventionally matches the filename
     /// (`workflows/<name>.yaml`); used in task frontmatter to point a
@@ -94,10 +119,32 @@ impl Workflow {
     /// Parse YAML and validate in one step. The convenience constructor
     /// callers should reach for; raw [`serde_yaml::from_str`] skips the
     /// semantic checks that catch broken cross-references.
+    ///
+    /// Legacy single-field owner forms migrate silently. Use
+    /// [`Workflow::from_yaml_str_with_diagnostics`] when you need the
+    /// deprecation warning to surface (the state-layer loader does).
     pub fn from_yaml_str(s: &str) -> crate::Result<Self> {
-        let wf: Workflow = serde_yaml::from_str(s)?;
-        wf.validate()?;
+        let (wf, _diags) = Self::from_yaml_str_with_diagnostics(s)?;
         Ok(wf)
+    }
+
+    /// Parse, migrate legacy forms, and validate — returning the workflow
+    /// plus any migration warnings as human-readable diagnostic strings.
+    ///
+    /// At most one diagnostic per workflow: the loader bundles every
+    /// migrated status into a single multiline warning so the user sees
+    /// one "please update this YAML" message regardless of how many
+    /// statuses are legacy.
+    pub fn from_yaml_str_with_diagnostics(s: &str) -> crate::Result<(Self, Vec<String>)> {
+        let raw: RawWorkflow = serde_yaml::from_str(s)?;
+        let (wf, migrations) = convert_raw_workflow(raw)?;
+        wf.validate()?;
+        let diagnostics = if migrations.is_empty() {
+            Vec::new()
+        } else {
+            vec![format_legacy_warning(&wf.name, &migrations)]
+        };
+        Ok((wf, diagnostics))
     }
 
     /// Resolved initial status id — explicit `initial_status` if set,
@@ -194,7 +241,8 @@ impl Workflow {
     /// Full semantic check. Run after deserialization to catch the
     /// cross-reference errors that serde alone can't see: duplicate
     /// status ids, an `initial_status` pointing at nothing, a transition
-    /// that references an id the workflow doesn't declare.
+    /// that references an id the workflow doesn't declare, and the
+    /// two-field rule that `owner: agent` requires an explicit `agent:`.
     pub fn validate(&self) -> crate::Result<()> {
         if self.name.trim().is_empty() {
             return Err(workflow_err("workflow name must not be empty"));
@@ -233,6 +281,19 @@ impl Workflow {
                 )));
             }
             seen.push(st.id.as_str());
+
+            // The two-field rule: a status owned by `agent` must name the
+            // agent that runs it. Bare `owner: agent` is migrated by
+            // [`convert_raw_workflow`] for the categories where a default
+            // exists (`ready`, `active`) — anything that reaches `validate`
+            // without an `agent:` set is an authoring bug.
+            if matches!(st.owner, Owner::Agent) && st.agent.is_none() {
+                return Err(workflow_err(format!(
+                    "workflow `{}`: status `{}` has owner: agent but no agent: field \
+                     — which agent should run here?",
+                    self.name, st.id,
+                )));
+            }
         }
 
         if let Some(init) = self.initial_status.as_deref() {
@@ -306,12 +367,29 @@ impl Workflow {
     }
 }
 
+impl<'de> Deserialize<'de> for Workflow {
+    /// Custom deserializer: route through [`RawWorkflow`] so the lenient
+    /// status schema (legacy `owner: <name>` rewrites, optional id/name
+    /// fallback) applies whenever a Workflow is read from YAML —
+    /// including the `serde_yaml::to_string` → `serde_yaml::from_str`
+    /// round-trip the round-trip tests rely on. Direct callers that
+    /// want the migration warning surfaced must use
+    /// [`Workflow::from_yaml_str_with_diagnostics`]; this path runs the
+    /// migration silently.
+    fn deserialize<D: Deserializer<'de>>(d: D) -> std::result::Result<Self, D::Error> {
+        let raw = RawWorkflow::deserialize(d)?;
+        let (wf, _diags) = convert_raw_workflow(raw).map_err(serde::de::Error::custom)?;
+        Ok(wf)
+    }
+}
+
 /// The canonical six-status default workflow shipped with every new
 /// project. The constructor that drops `workflows/default.yaml` into a
 /// fresh project should serialize this. Matches the table in
-/// `Plans/workflows.md` §3 — the five historical statuses plus a
-/// `Canceled` lane (`archived` category) so closing-without-shipping
-/// has a home that round-trips through every layer.
+/// `Plans/agents-workspaces.md` §4 — Backlog/Review delegate to the
+/// orchestrator agent when Zen is on, Todo always dispatches to the
+/// orchestrator, InProgress hands off to the developer agent, and the
+/// terminal Done/Canceled lanes have no automation path.
 pub fn default_workflow() -> Workflow {
     Workflow {
         name: "default".to_string(),
@@ -324,36 +402,42 @@ pub fn default_workflow() -> Workflow {
                 name: "Backlog".into(),
                 category: StatusCategory::Backlog,
                 owner: Owner::User,
+                agent: Some("orchestrator".into()),
             },
             Status {
                 id: "todo".into(),
                 name: "Todo".into(),
                 category: StatusCategory::Ready,
                 owner: Owner::Agent,
+                agent: Some("orchestrator".into()),
             },
             Status {
                 id: "in-progress".into(),
                 name: "InProgress".into(),
                 category: StatusCategory::Active,
                 owner: Owner::Agent,
+                agent: Some("developer".into()),
             },
             Status {
                 id: "review".into(),
                 name: "Review".into(),
                 category: StatusCategory::Handoff,
                 owner: Owner::User,
+                agent: Some("orchestrator".into()),
             },
             Status {
                 id: "done".into(),
                 name: "Done".into(),
                 category: StatusCategory::Done,
                 owner: Owner::User,
+                agent: None,
             },
             Status {
                 id: "canceled".into(),
                 name: "Canceled".into(),
                 category: StatusCategory::Archived,
                 owner: Owner::User,
+                agent: None,
             },
         ],
         initial_status: None,
@@ -362,7 +446,7 @@ pub fn default_workflow() -> Workflow {
         // projects already have after Phase 1's migration. Generic code
         // (Zen Mode, action-based confidence bar) treats a workflow with
         // no transitions declared as the legacy 5-status flow — see
-        // [`Workflow::merge_trigger_status_or_legacy`].
+        // [`Workflow::fires_merge_bar`].
         transitions: None,
         git: None,
         zen: None,
@@ -384,66 +468,29 @@ pub fn default_workflow() -> Workflow {
 /// the Kanban column header. Free to change without invalidating any
 /// references — display lives here, stable references live in `id`.
 ///
+/// `owner` is whose responsibility this status is when automation is
+/// off — strict `user | agent`. `agent` is the optional name of the
+/// agent the orchestrator dispatches to when automation is on; it
+/// references a directory under the project's `agents/` workspace. A
+/// `user`-owned status may still set `agent:` to declare "under Zen,
+/// this agent can do the work without me"; a terminal status (Done /
+/// Canceled) leaves it `None` to declare "no automation here, period."
+///
 /// On the wire `id` and `name` are both first-class fields. For
 /// backward compatibility with workflow YAMLs that pre-date the split,
 /// the deserializer accepts either field alone and uses it for both —
-/// see the custom `Deserialize` impl below.
-#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+/// see [`convert_raw_workflow`].
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Status {
     pub id: String,
     pub name: String,
     pub category: StatusCategory,
     pub owner: Owner,
-}
-
-impl<'de> Deserialize<'de> for Status {
-    fn deserialize<D: Deserializer<'de>>(d: D) -> std::result::Result<Self, D::Error> {
-        // Both `id` and `name` are optional at the syntactic layer so
-        // legacy YAMLs that only carry `name` (the field that did
-        // double duty before the split) parse without an error. The
-        // post-deserialize step enforces "at least one of the two"
-        // and fills the missing one from the other — a workflow
-        // authored before the split gets `id` derived from its old
-        // `name`, which is exactly the stable identifier it had
-        // implicitly already.
-        #[derive(Deserialize)]
-        struct Raw {
-            #[serde(default)]
-            id: Option<String>,
-            #[serde(default)]
-            name: Option<String>,
-            category: StatusCategory,
-            owner: Owner,
-            // Accepted-and-discarded for legacy YAML compatibility; serde
-            // reads it but the post-deserialize step doesn't need it.
-            #[serde(default)]
-            #[allow(dead_code)]
-            description: Option<String>,
-        }
-        let raw = Raw::deserialize(d)?;
-        let (id, name) = match (raw.id, raw.name) {
-            (Some(id), Some(name)) => (id, name),
-            (Some(id), None) => {
-                let n = id.clone();
-                (id, n)
-            }
-            (None, Some(name)) => {
-                let i = name.clone();
-                (i, name)
-            }
-            (None, None) => {
-                return Err(serde::de::Error::custom(
-                    "status requires at least one of `id` or `name`",
-                ))
-            }
-        };
-        Ok(Status {
-            id,
-            name,
-            category: raw.category,
-            owner: raw.owner,
-        })
-    }
+    /// Which agent runs this status when automation is on. `None` means
+    /// no automation path even under Zen. See module-level docs for the
+    /// owner / agent split.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -514,10 +561,15 @@ impl std::str::FromStr for StatusCategory {
 // ---------------------------------------------------------------------------
 // Owner
 
-/// Who is expected to act when a task sits in a given status.
+/// Who is expected to act when a task sits in a given status — when
+/// automation is *off*.
 ///
 /// - `User` keeps the task waiting; the orchestrator does not dispatch.
 /// - `Agent` makes the task eligible for auto-dispatch onto a free workspace.
+///
+/// The closed vocabulary is intentional. The orthogonal "which agent
+/// runs this when Zen is on" question lives in [`Status::agent`] — see
+/// module-level docs for the split.
 ///
 /// `Plans/workflows.md` §6 explicitly rejects a third "either" value — a
 /// task is either work for a workspace or work for the user. If the user
@@ -535,6 +587,15 @@ pub enum Owner {
 /// `transitions:` block — see [`Workflow::fires_merge_bar`]. Matches
 /// the `id:` of the `Review` status in [`default_workflow`].
 pub const LEGACY_REVIEW_STATUS: &str = "review";
+
+/// Default agent name dispatched for a status whose legacy YAML used
+/// bare `owner: agent` on a `ready`-category status. Matches the
+/// `agents/orchestrator/` workspace materialized by `shelbi init`.
+const DEFAULT_READY_AGENT: &str = "orchestrator";
+
+/// Same idea as [`DEFAULT_READY_AGENT`] but for `active`-category
+/// statuses, where the developer agent does the work.
+const DEFAULT_ACTIVE_AGENT: &str = "developer";
 
 // ---------------------------------------------------------------------------
 // Transition + TransitionAction
@@ -684,6 +745,222 @@ mod opt_duration_secs {
 }
 
 // ---------------------------------------------------------------------------
+// Raw parsing types + legacy migration
+
+/// Lenient raw shape used for YAML deserialization. Every field that
+/// went through a legacy form before the two-field split is widened
+/// here, then narrowed in [`convert_raw_workflow`]. Direct callers must
+/// not depend on this type — it's an internal staging buffer.
+#[derive(Deserialize)]
+struct RawWorkflow {
+    name: String,
+    #[serde(default)]
+    description: Option<String>,
+    statuses: Vec<RawStatus>,
+    #[serde(default)]
+    initial_status: Option<String>,
+    #[serde(default)]
+    transitions: Option<Vec<Transition>>,
+    #[serde(default)]
+    git: Option<GitConfig>,
+    #[serde(default)]
+    zen: Option<WorkflowZenConfig>,
+}
+
+#[derive(Deserialize)]
+struct RawStatus {
+    #[serde(default)]
+    id: Option<String>,
+    #[serde(default)]
+    name: Option<String>,
+    category: StatusCategory,
+    /// Accepted as any string so legacy named-owner YAMLs can migrate
+    /// rather than fail at the type layer. Anything other than `user` /
+    /// `agent` becomes `Owner::Agent` + `agent: <raw>` in the conversion
+    /// step.
+    owner: String,
+    #[serde(default)]
+    agent: Option<String>,
+    /// Accepted-and-discarded for legacy YAML compatibility; serde reads
+    /// it but the conversion step doesn't need it.
+    #[serde(default)]
+    #[allow(dead_code)]
+    description: Option<String>,
+}
+
+/// Per-status migration record captured during [`convert_raw_workflow`].
+/// Used to format the single bundled deprecation diagnostic returned by
+/// [`Workflow::from_yaml_str_with_diagnostics`].
+struct StatusMigration {
+    status_id: String,
+    kind: MigrationKind,
+}
+
+enum MigrationKind {
+    /// Bare `owner: agent` with no `agent:` field — derived from
+    /// category. Only `ready` (→ orchestrator) and `active` (→ developer)
+    /// have defaults; other categories error out.
+    BareAgentOwner { derived_agent: String },
+    /// Legacy `owner: <name>` where `<name>` is something other than
+    /// `user` / `agent`. Rewrites to `owner: agent, agent: <name>`.
+    NamedOwner { original: String },
+}
+
+/// Convert a [`RawWorkflow`] into the public [`Workflow`], applying
+/// legacy migrations and collecting per-status diagnostics. The caller
+/// is responsible for running [`Workflow::validate`] on the result —
+/// `convert_raw_workflow` only handles the parse-layer reshaping, not
+/// the cross-reference checks.
+fn convert_raw_workflow(raw: RawWorkflow) -> crate::Result<(Workflow, Vec<StatusMigration>)> {
+    let mut statuses = Vec::with_capacity(raw.statuses.len());
+    let mut migrations = Vec::new();
+
+    for st in raw.statuses {
+        let (id, name) = resolve_id_name(st.id, st.name)?;
+        let (owner, agent, migration) = resolve_owner_agent(&id, &st.owner, st.agent, st.category)?;
+        if let Some(m) = migration {
+            migrations.push(m);
+        }
+        statuses.push(Status {
+            id,
+            name,
+            category: st.category,
+            owner,
+            agent,
+        });
+    }
+
+    Ok((
+        Workflow {
+            name: raw.name,
+            description: raw.description,
+            statuses,
+            initial_status: raw.initial_status,
+            transitions: raw.transitions,
+            git: raw.git,
+            zen: raw.zen,
+        },
+        migrations,
+    ))
+}
+
+/// Fill in the id↔name fallback for legacy workflow YAMLs that only
+/// carried one of the two before the split.
+fn resolve_id_name(
+    id: Option<String>,
+    name: Option<String>,
+) -> crate::Result<(String, String)> {
+    match (id, name) {
+        (Some(id), Some(name)) => Ok((id, name)),
+        (Some(id), None) => {
+            let n = id.clone();
+            Ok((id, n))
+        }
+        (None, Some(name)) => {
+            let i = name.clone();
+            Ok((i, name))
+        }
+        (None, None) => Err(workflow_err(
+            "status requires at least one of `id` or `name`",
+        )),
+    }
+}
+
+/// Classify `raw_owner` and decide the post-migration `(owner, agent,
+/// migration?)` tuple. The status `id` and `category` are needed for
+/// the category-default migration and for diagnostic messages.
+fn resolve_owner_agent(
+    status_id: &str,
+    raw_owner: &str,
+    raw_agent: Option<String>,
+    category: StatusCategory,
+) -> crate::Result<(Owner, Option<String>, Option<StatusMigration>)> {
+    match raw_owner {
+        "user" => Ok((Owner::User, raw_agent, None)),
+        "agent" => match raw_agent {
+            Some(agent) => Ok((Owner::Agent, Some(agent), None)),
+            None => {
+                // Legacy single-field design. Derive `agent:` from
+                // category for the two categories where a default makes
+                // sense; everything else is an authoring bug we surface
+                // immediately.
+                let derived = match category {
+                    StatusCategory::Ready => DEFAULT_READY_AGENT,
+                    StatusCategory::Active => DEFAULT_ACTIVE_AGENT,
+                    other => {
+                        return Err(workflow_err(format!(
+                            "status `{status_id}` has owner: agent but no agent: field \
+                             — which agent should run here? (no category default for `{other}`)",
+                        )));
+                    }
+                };
+                Ok((
+                    Owner::Agent,
+                    Some(derived.to_string()),
+                    Some(StatusMigration {
+                        status_id: status_id.to_string(),
+                        kind: MigrationKind::BareAgentOwner {
+                            derived_agent: derived.to_string(),
+                        },
+                    }),
+                ))
+            }
+        },
+        other => {
+            // Legacy named-owner design (`owner: alice`). Rewrite to
+            // `owner: agent, agent: <name>` so the in-memory
+            // representation is strict. A conflicting explicit `agent:`
+            // is an authoring bug — refuse to silently pick a winner.
+            if let Some(explicit) = raw_agent {
+                if explicit != other {
+                    return Err(workflow_err(format!(
+                        "status `{status_id}`: legacy named owner `{other}` conflicts with \
+                         explicit `agent: {explicit}` — drop one",
+                    )));
+                }
+            }
+            Ok((
+                Owner::Agent,
+                Some(other.to_string()),
+                Some(StatusMigration {
+                    status_id: status_id.to_string(),
+                    kind: MigrationKind::NamedOwner {
+                        original: other.to_string(),
+                    },
+                }),
+            ))
+        }
+    }
+}
+
+/// Bundle every per-status migration into one human-readable warning
+/// the loader can drop straight onto stderr. One warning per workflow
+/// — even if multiple statuses migrated — keeps the noise floor low.
+fn format_legacy_warning(workflow_name: &str, migrations: &[StatusMigration]) -> String {
+    let mut buf = format!(
+        "workflow `{workflow_name}` uses the legacy single-field owner form; \
+         update to the two-field form (`owner: <user|agent>` + optional `agent: <name>`):"
+    );
+    for m in migrations {
+        match &m.kind {
+            MigrationKind::BareAgentOwner { derived_agent } => {
+                buf.push_str(&format!(
+                    "\n  - status `{id}`: bare `owner: agent` migrated to `owner: agent, agent: {derived_agent}` (derived from category)",
+                    id = m.status_id,
+                ));
+            }
+            MigrationKind::NamedOwner { original } => {
+                buf.push_str(&format!(
+                    "\n  - status `{id}`: legacy `owner: {original}` rewrote to `owner: agent, agent: {original}`",
+                    id = m.status_id,
+                ));
+            }
+        }
+    }
+    buf
+}
+
+// ---------------------------------------------------------------------------
 // Error helper
 
 fn workflow_err(msg: impl Into<String>) -> Error {
@@ -703,10 +980,10 @@ name: default
 description: |
   Six-status default.
 statuses:
-  - { id: backlog,     name: Backlog,    category: backlog,  owner: user  }
-  - { id: todo,        name: Todo,       category: ready,    owner: agent }
-  - { id: in-progress, name: InProgress, category: active,   owner: agent }
-  - { id: review,      name: Review,     category: handoff,  owner: user  }
+  - { id: backlog,     name: Backlog,    category: backlog,  owner: user,  agent: orchestrator }
+  - { id: todo,        name: Todo,       category: ready,    owner: agent, agent: orchestrator }
+  - { id: in-progress, name: InProgress, category: active,   owner: agent, agent: developer    }
+  - { id: review,      name: Review,     category: handoff,  owner: user,  agent: orchestrator }
   - { id: done,        name: Done,       category: done,     owner: user  }
   - { id: canceled,    name: Canceled,   category: archived, owner: user  }
 "#;
@@ -720,15 +997,61 @@ statuses:
         assert_eq!(wf.statuses[0].name, "Backlog");
         assert_eq!(wf.statuses[0].category, StatusCategory::Backlog);
         assert_eq!(wf.statuses[0].owner, Owner::User);
+        assert_eq!(wf.statuses[0].agent.as_deref(), Some("orchestrator"));
         assert_eq!(wf.statuses[2].id, "in-progress");
         assert_eq!(wf.statuses[2].category, StatusCategory::Active);
         assert_eq!(wf.statuses[2].owner, Owner::Agent);
+        assert_eq!(wf.statuses[2].agent.as_deref(), Some("developer"));
         assert_eq!(wf.statuses[5].id, "canceled");
         assert_eq!(wf.statuses[5].name, "Canceled");
         assert_eq!(wf.statuses[5].category, StatusCategory::Archived);
         assert_eq!(wf.statuses[5].owner, Owner::User);
+        assert!(wf.statuses[5].agent.is_none());
         assert!(wf.initial_status.is_none());
         assert!(wf.transitions.is_none());
+    }
+
+    #[test]
+    fn two_field_form_parses_without_diagnostics() {
+        // The canonical new shape — every `agent: ...` declared explicitly —
+        // is the silent path. No deprecation warning fires.
+        let (_, diags) = Workflow::from_yaml_str_with_diagnostics(DEFAULT_YAML).unwrap();
+        assert!(diags.is_empty(), "expected no diagnostics, got: {diags:?}");
+    }
+
+    #[test]
+    fn user_owned_status_with_agent_field_parses() {
+        // A user-owned status MAY name an agent: under Zen that agent can
+        // act without the user's hand. The new schema permits this even
+        // though `owner: user` doesn't require an agent.
+        let yaml = r#"
+name: w
+statuses:
+  - { id: review, name: Review, category: handoff, owner: user, agent: orchestrator }
+  - { id: done,   name: Done,   category: done,    owner: user                       }
+"#;
+        let (wf, diags) = Workflow::from_yaml_str_with_diagnostics(yaml).unwrap();
+        assert!(diags.is_empty());
+        assert_eq!(wf.statuses[0].owner, Owner::User);
+        assert_eq!(wf.statuses[0].agent.as_deref(), Some("orchestrator"));
+        assert_eq!(wf.statuses[1].owner, Owner::User);
+        assert!(wf.statuses[1].agent.is_none());
+    }
+
+    #[test]
+    fn terminal_statuses_with_no_agent_parse_cleanly() {
+        // Acceptance test (e): Done / Canceled are terminal — they
+        // legitimately have no automation path. The schema must accept
+        // them without complaint.
+        let yaml = r#"
+name: w
+statuses:
+  - { id: done,     name: Done,     category: done,     owner: user }
+  - { id: canceled, name: Canceled, category: archived, owner: user }
+"#;
+        let (wf, diags) = Workflow::from_yaml_str_with_diagnostics(yaml).unwrap();
+        assert!(diags.is_empty());
+        assert!(wf.statuses.iter().all(|s| s.agent.is_none()));
     }
 
     #[test]
@@ -775,8 +1098,8 @@ statuses:
 "#;
         let err = Workflow::from_yaml_str(yaml).unwrap_err();
         assert!(
-            matches!(err, Error::Yaml(_)),
-            "missing id/name should be a parse error, got: {err}"
+            matches!(err, Error::InvalidWorkflow(ref m) if m.contains("at least one of `id` or `name`")),
+            "missing id/name should be an invalid-workflow error, got: {err}"
         );
     }
 
@@ -820,6 +1143,22 @@ statuses:
                 Owner::User,
                 Owner::User,
                 Owner::User,
+            ]
+        );
+
+        // The two-field design: each non-terminal status names the agent
+        // that runs it under Zen. Terminal Done / Canceled stay None.
+        let agents: Vec<Option<&str>> =
+            wf.statuses.iter().map(|s| s.agent.as_deref()).collect();
+        assert_eq!(
+            agents,
+            vec![
+                Some("orchestrator"),
+                Some("orchestrator"),
+                Some("developer"),
+                Some("orchestrator"),
+                None,
+                None,
             ]
         );
     }
@@ -871,20 +1210,25 @@ statuses:
     }
 
     #[test]
-    fn rejects_either_owner() {
-        // Plans/workflows.md §6 closes the Owner vocabulary to `user` and
-        // `agent`. Anything else — including the previously-considered
-        // `either` value — has to be a parse error so a workflow author
-        // who reaches for it gets a fast, clear signal rather than a
-        // silently-tolerated third state.
+    fn either_owner_migrates_to_named_agent() {
+        // Plans/workflows.md §6 closes the in-memory Owner vocabulary to
+        // `user` / `agent`. A YAML that says `owner: either` (or any
+        // other non-standard name) is the legacy named-owner design —
+        // the loader rewrites it to `owner: agent, agent: either` and
+        // surfaces a deprecation diagnostic. The downstream agent-
+        // existence check (in the state-layer loader) then catches that
+        // `either` isn't a real agent.
         let yaml = r#"
 name: w
 statuses:
-  - { name: Open, category: ready, owner: either }
+  - { id: open, name: Open, category: ready, owner: either }
 "#;
-        let err = Workflow::from_yaml_str(yaml).unwrap_err();
-        let msg = err.to_string();
-        assert!(msg.contains("either"), "got: {msg}");
+        let (wf, diags) = Workflow::from_yaml_str_with_diagnostics(yaml).unwrap();
+        assert_eq!(wf.statuses[0].owner, Owner::Agent);
+        assert_eq!(wf.statuses[0].agent.as_deref(), Some("either"));
+        assert_eq!(diags.len(), 1, "expected one bundled diagnostic, got {diags:?}");
+        assert!(diags[0].contains("legacy"));
+        assert!(diags[0].contains("either"));
     }
 
     #[test]
@@ -905,7 +1249,7 @@ statuses: []
         let yaml = r#"
 name: "   "
 statuses:
-  - { name: Todo, category: ready, owner: agent }
+  - { name: Todo, category: ready, owner: agent, agent: orchestrator }
 "#;
         let err = Workflow::from_yaml_str(yaml).unwrap_err();
         assert!(matches!(err, Error::InvalidWorkflow(ref m) if m.contains("name must not be empty")));
@@ -916,7 +1260,7 @@ statuses:
         let yaml = r#"
 name: w
 statuses:
-  - { id: "", name: Todo, category: ready, owner: agent }
+  - { id: "", name: Todo, category: ready, owner: agent, agent: orchestrator }
 "#;
         let err = Workflow::from_yaml_str(yaml).unwrap_err();
         assert!(matches!(err, Error::InvalidWorkflow(ref m) if m.contains("status id must not be empty")));
@@ -931,7 +1275,7 @@ statuses:
         let yaml = r#"
 name: w
 statuses:
-  - { id: todo, name: "", category: ready, owner: agent }
+  - { id: todo, name: "", category: ready, owner: agent, agent: orchestrator }
 "#;
         let err = Workflow::from_yaml_str(yaml).unwrap_err();
         assert!(
@@ -945,8 +1289,8 @@ statuses:
         let yaml = r#"
 name: w
 statuses:
-  - { id: todo, name: Todo,     category: ready,  owner: agent }
-  - { id: todo, name: TodoTwo,  category: active, owner: agent }
+  - { id: todo, name: Todo,    category: ready,  owner: agent, agent: orchestrator }
+  - { id: todo, name: TodoTwo, category: active, owner: agent, agent: developer    }
 "#;
         let err = Workflow::from_yaml_str(yaml).unwrap_err();
         assert!(
@@ -964,8 +1308,8 @@ statuses:
         let yaml = r#"
 name: w
 statuses:
-  - { id: review-a, name: Review, category: handoff, owner: user }
-  - { id: review-b, name: Review, category: handoff, owner: user }
+  - { id: review-a, name: Review, category: handoff, owner: user, agent: orchestrator }
+  - { id: review-b, name: Review, category: handoff, owner: user, agent: orchestrator }
 "#;
         Workflow::from_yaml_str(yaml).expect("distinct ids with same name validate");
     }
@@ -975,7 +1319,7 @@ statuses:
         let yaml = r#"
 name: w
 statuses:
-  - { id: todo, name: Todo, category: ready, owner: agent }
+  - { id: todo, name: Todo, category: ready, owner: agent, agent: orchestrator }
 initial_status: backlog
 "#;
         let err = Workflow::from_yaml_str(yaml).unwrap_err();
@@ -987,8 +1331,8 @@ initial_status: backlog
         let yaml = r#"
 name: w
 statuses:
-  - { id: backlog, name: Backlog, category: backlog, owner: user  }
-  - { id: todo,    name: Todo,    category: ready,   owner: agent }
+  - { id: backlog, name: Backlog, category: backlog, owner: user                       }
+  - { id: todo,    name: Todo,    category: ready,   owner: agent, agent: orchestrator }
 initial_status: todo
 "#;
         let wf = Workflow::from_yaml_str(yaml).unwrap();
@@ -1008,7 +1352,7 @@ initial_status: todo
         let yaml = r#"
 name: w
 statuses:
-  - { id: todo, name: Todo, category: ready, owner: agent }
+  - { id: todo, name: Todo, category: ready, owner: agent, agent: orchestrator }
 transitions:
   - { from: bogus, to: todo, actions: [push_branch] }
 "#;
@@ -1024,8 +1368,8 @@ transitions:
         let yaml = r#"
 name: w
 statuses:
-  - { id: todo, name: Todo, category: ready,  owner: agent }
-  - { id: done, name: Done, category: done,   owner: user  }
+  - { id: todo, name: Todo, category: ready, owner: agent, agent: orchestrator }
+  - { id: done, name: Done, category: done,  owner: user                       }
 transitions:
   - { from: todo, to: phantom, actions: [merge] }
 "#;
@@ -1041,8 +1385,8 @@ transitions:
         let yaml = r#"
 name: w
 statuses:
-  - { id: todo, name: Todo, category: ready,  owner: agent }
-  - { id: done, name: Done, category: done,   owner: user  }
+  - { id: todo, name: Todo, category: ready, owner: agent, agent: orchestrator }
+  - { id: done, name: Done, category: done,  owner: user                       }
 transitions:
   - { from: todo, to: done, actions: [merge] }
   - { from: todo, to: done, actions: [close_pr] }
@@ -1079,9 +1423,9 @@ transitions:
         let yaml = r#"
 name: w
 statuses:
-  - { name: Todo,    category: ready,  owner: agent }
-  - { name: Doing,   category: active, owner: agent }
-  - { name: Done,    category: done,   owner: user  }
+  - { name: Todo,    category: ready,  owner: agent, agent: orchestrator }
+  - { name: Doing,   category: active, owner: agent, agent: developer    }
+  - { name: Done,    category: done,   owner: user                       }
 transitions:
   - { from: Doing, to: Done, actions: [merge] }
 "#;
@@ -1097,9 +1441,9 @@ transitions:
         let yaml = r#"
 name: w
 statuses:
-  - { name: Doing,  category: active,  owner: agent }
-  - { name: Review, category: handoff, owner: user  }
-  - { name: Done,   category: done,    owner: user  }
+  - { name: Doing,  category: active,  owner: agent, agent: developer    }
+  - { name: Review, category: handoff, owner: user                       }
+  - { name: Done,   category: done,    owner: user                       }
 transitions:
   - { from: Doing,  to: Review, actions: [push_branch, open_pr] }
   - { from: Review, to: Done,   actions: [merge, delete_branch] }
@@ -1135,9 +1479,9 @@ transitions:
         let yaml = r#"
 name: w
 statuses:
-  - { name: Doing,  category: active,  owner: agent }
-  - { name: Review, category: handoff, owner: user  }
-  - { name: Done,   category: done,    owner: user  }
+  - { name: Doing,  category: active,  owner: agent, agent: developer    }
+  - { name: Review, category: handoff, owner: user                       }
+  - { name: Done,   category: done,    owner: user                       }
 transitions:
   - { from: Doing,  to: Review, actions: [push_branch] }
   - { from: Review, to: Done,   actions: [merge] }
@@ -1173,8 +1517,8 @@ transitions:
         let yaml = r#"
 name: trunk
 statuses:
-  - { name: Doing, category: active, owner: agent }
-  - { name: Done,  category: done,   owner: user  }
+  - { name: Doing, category: active, owner: agent, agent: developer }
+  - { name: Done,  category: done,   owner: user                    }
 transitions:
   - { from: Doing, to: Done, actions: [merge, delete_branch] }
 "#;
@@ -1187,7 +1531,7 @@ transitions:
         let yaml = r#"
 name: w
 statuses:
-  - { name: Todo, category: pending, owner: agent }
+  - { name: Todo, category: pending, owner: agent, agent: orchestrator }
 "#;
         // serde rejects this at the type level — InvalidWorkflow is for
         // semantic errors, parse-time errors surface as Error::Yaml.
@@ -1195,15 +1539,148 @@ statuses:
         assert!(matches!(err, Error::Yaml(_)), "got: {err}");
     }
 
+    // ---------------------------------------------------------------------
+    // Two-field owner/agent design — strict + legacy migration
+
     #[test]
-    fn rejects_status_with_unknown_owner() {
+    fn owner_agent_with_explicit_agent_field_parses_without_warning() {
         let yaml = r#"
 name: w
 statuses:
-  - { name: Todo, category: ready, owner: robot }
+  - { id: todo, name: Todo, category: ready, owner: agent, agent: orchestrator }
+"#;
+        let (wf, diags) = Workflow::from_yaml_str_with_diagnostics(yaml).unwrap();
+        assert!(diags.is_empty(), "explicit two-field form should not warn: {diags:?}");
+        assert_eq!(wf.statuses[0].owner, Owner::Agent);
+        assert_eq!(wf.statuses[0].agent.as_deref(), Some("orchestrator"));
+    }
+
+    #[test]
+    fn owner_agent_without_agent_field_in_done_category_hard_errors() {
+        // Acceptance test (b): bare `owner: agent` on a category that has
+        // no default migration target must surface immediately with a
+        // diagnostic that names the status and explains the rule.
+        let yaml = r#"
+name: w
+statuses:
+  - { id: ship, name: Ship, category: done, owner: agent }
 "#;
         let err = Workflow::from_yaml_str(yaml).unwrap_err();
-        assert!(matches!(err, Error::Yaml(_)), "got: {err}");
+        match &err {
+            Error::InvalidWorkflow(msg) => {
+                assert!(msg.contains("`ship`"), "msg: {msg}");
+                assert!(msg.contains("owner: agent"), "msg: {msg}");
+                assert!(msg.contains("agent:"), "msg: {msg}");
+            }
+            other => panic!("expected InvalidWorkflow, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn legacy_bare_owner_agent_migrates_by_category_with_one_warning() {
+        // Acceptance test (d): bare `owner: agent` on the two categories
+        // that have defaults (ready → orchestrator, active → developer)
+        // migrates silently in-memory and surfaces a single bundled
+        // deprecation diagnostic.
+        let yaml = r#"
+name: legacy
+statuses:
+  - { id: todo,     name: Todo,     category: ready,  owner: agent }
+  - { id: doing,    name: Doing,    category: active, owner: agent }
+"#;
+        let (wf, diags) = Workflow::from_yaml_str_with_diagnostics(yaml).unwrap();
+        assert_eq!(wf.statuses[0].owner, Owner::Agent);
+        assert_eq!(wf.statuses[0].agent.as_deref(), Some("orchestrator"));
+        assert_eq!(wf.statuses[1].owner, Owner::Agent);
+        assert_eq!(wf.statuses[1].agent.as_deref(), Some("developer"));
+        // Exactly one diagnostic, even though two statuses migrated.
+        assert_eq!(diags.len(), 1, "expected one bundled diagnostic, got: {diags:?}");
+        let msg = &diags[0];
+        assert!(msg.contains("legacy"), "msg: {msg}");
+        assert!(msg.contains("`todo`"), "msg: {msg}");
+        assert!(msg.contains("`doing`"), "msg: {msg}");
+        assert!(msg.contains("orchestrator"), "msg: {msg}");
+        assert!(msg.contains("developer"), "msg: {msg}");
+    }
+
+    #[test]
+    fn legacy_named_owner_rewrites_to_owner_agent_plus_agent_field() {
+        let yaml = r#"
+name: legacy
+statuses:
+  - { id: design, name: Design, category: active, owner: alice }
+"#;
+        let (wf, diags) = Workflow::from_yaml_str_with_diagnostics(yaml).unwrap();
+        assert_eq!(wf.statuses[0].owner, Owner::Agent);
+        assert_eq!(wf.statuses[0].agent.as_deref(), Some("alice"));
+        assert_eq!(diags.len(), 1);
+        assert!(diags[0].contains("alice"));
+    }
+
+    #[test]
+    fn named_owner_conflicting_with_explicit_agent_errors() {
+        // Authoring bug: someone wrote both `owner: alice` (legacy named
+        // owner that would migrate to `agent: alice`) AND `agent: bob`
+        // (explicit two-field form). The two disagree — refuse rather
+        // than silently picking one.
+        let yaml = r#"
+name: w
+statuses:
+  - { id: design, name: Design, category: active, owner: alice, agent: bob }
+"#;
+        let err = Workflow::from_yaml_str(yaml).unwrap_err();
+        match &err {
+            Error::InvalidWorkflow(msg) => {
+                assert!(msg.contains("alice"), "msg: {msg}");
+                assert!(msg.contains("bob"), "msg: {msg}");
+                assert!(msg.contains("conflict") || msg.contains("drop one"), "msg: {msg}");
+            }
+            other => panic!("expected InvalidWorkflow, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn named_owner_matching_explicit_agent_accepts_silently_via_migration() {
+        // Redundant-but-consistent legacy form: same name on both fields.
+        // The migration still rewrites owner to `agent`, keeping the agent
+        // name; this is not an error.
+        let yaml = r#"
+name: w
+statuses:
+  - { id: design, name: Design, category: active, owner: alice, agent: alice }
+"#;
+        let (wf, _diags) = Workflow::from_yaml_str_with_diagnostics(yaml).unwrap();
+        assert_eq!(wf.statuses[0].owner, Owner::Agent);
+        assert_eq!(wf.statuses[0].agent.as_deref(), Some("alice"));
+    }
+
+    #[test]
+    fn validate_rejects_owner_agent_without_agent_field_for_directly_constructed_workflow() {
+        // Direct construction (bypassing convert_raw_workflow) is the path
+        // a programmatic builder might take. validate() is the safety net.
+        let wf = Workflow {
+            name: "w".into(),
+            description: None,
+            statuses: vec![Status {
+                id: "todo".into(),
+                name: "Todo".into(),
+                category: StatusCategory::Ready,
+                owner: Owner::Agent,
+                agent: None,
+            }],
+            initial_status: None,
+            transitions: None,
+            git: None,
+            zen: None,
+        };
+        let err = wf.validate().unwrap_err();
+        match &err {
+            Error::InvalidWorkflow(msg) => {
+                assert!(msg.contains("`todo`"), "msg: {msg}");
+                assert!(msg.contains("owner: agent"), "msg: {msg}");
+            }
+            other => panic!("expected InvalidWorkflow, got {other:?}"),
+        }
     }
 
     // ---------------------------------------------------------------------
@@ -1221,7 +1698,7 @@ statuses:
         let yaml = r#"
 name: feature-task
 statuses:
-  - { name: Todo, category: ready, owner: agent }
+  - { name: Todo, category: ready, owner: agent, agent: orchestrator }
 git:
   base_branch: feature/{{feature}}
 "#;
@@ -1255,7 +1732,7 @@ git:
         let yaml = r#"
 name: feature-task
 statuses:
-  - { name: Todo, category: ready, owner: agent }
+  - { name: Todo, category: ready, owner: agent, agent: orchestrator }
 git:
   base_branch: feature/{{feature}}
   merge_strategy: merge
@@ -1277,7 +1754,7 @@ git:
         let yaml = r#"
 name: feature-task
 statuses:
-  - { name: Todo, category: ready, owner: agent }
+  - { name: Todo, category: ready, owner: agent, agent: orchestrator }
 git:
   base_branch: feature/{{feature}}
 "#;
@@ -1305,7 +1782,7 @@ git:
         let yaml = r#"
 name: stack
 statuses:
-  - { name: Todo, category: ready, owner: agent }
+  - { name: Todo, category: ready, owner: agent, agent: orchestrator }
 git:
   base_branch: feature/{{feature}}-{{region}}
 "#;
@@ -1328,7 +1805,7 @@ git:
         let yaml = r#"
 name: feature-release
 statuses:
-  - { name: Todo, category: ready, owner: agent }
+  - { name: Todo, category: ready, owner: agent, agent: orchestrator }
 git:
   base_branch: main
   merge_strategy: squash
@@ -1344,7 +1821,7 @@ git:
         let yaml = r#"
 name: feature-task
 statuses:
-  - { name: Todo, category: ready, owner: agent }
+  - { name: Todo, category: ready, owner: agent, agent: orchestrator }
 git:
   base_branch: feature/{{feature}}
   merge_strategy: merge
@@ -1363,7 +1840,7 @@ git:
         let yaml = r#"
 name: research
 statuses:
-  - { name: Drafting, category: active, owner: agent }
+  - { name: Drafting, category: active, owner: agent, agent: developer }
 zen:
   checks:
     local:
@@ -1391,7 +1868,7 @@ zen:
         let yaml = r#"
 name: long-ci
 statuses:
-  - { name: Todo, category: ready, owner: agent }
+  - { name: Todo, category: ready, owner: agent, agent: orchestrator }
 zen:
   ci_timeout: 3600
 "#;
@@ -1410,7 +1887,7 @@ zen:
         let yaml = r#"
 name: w
 statuses:
-  - { name: Todo, category: ready, owner: agent }
+  - { name: Todo, category: ready, owner: agent, agent: orchestrator }
 zen: {}
 "#;
         let wf = Workflow::from_yaml_str(yaml).unwrap();
@@ -1430,7 +1907,7 @@ zen: {}
         let yaml = r#"
 name: research
 statuses:
-  - { name: Drafting, category: active, owner: agent }
+  - { name: Drafting, category: active, owner: agent, agent: developer }
 zen:
   checks:
     local:
