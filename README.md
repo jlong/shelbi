@@ -128,8 +128,9 @@ What the wizard auto-fills from your environment:
   remote, and so on.
 
 After the wizard, shelbi launches the TUI for the project it just created.
-A `.shelbi/project` marker is dropped at the repo root so subsequent
-invocations from inside the repo auto-select it.
+Subsequent invocations from inside the repo auto-select it: shelbi matches
+the current directory against each registered project's `work_dir` in
+`~/.shelbi/projects/*.yaml` — no marker file is left in your repo.
 
 ---
 
@@ -141,8 +142,8 @@ invocations from inside the repo auto-select it.
 - **One project** → launches its TUI directly.
 - **Two or more** → fuzzy project picker (type to filter, most-recently-
   launched at the top, `+ Add a new project` at the bottom).
-- **Inside a repo with a `.shelbi/project` marker** → that project always
-  wins.
+- **Inside a registered project's `work_dir` (or a subdirectory)** → that
+  project always wins, matched against `~/.shelbi/projects/*.yaml`.
 
 Skip the picker explicitly:
 

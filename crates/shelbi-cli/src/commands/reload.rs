@@ -15,6 +15,12 @@ use super::require_project;
 /// re-aligned with the shipped default (users who want customization
 /// point `workspace_settings_template` at their own file).
 pub fn run(project_opt: Option<String>) -> Result<()> {
+    // Migration hook for the dropped `.shelbi/project` marker: sweep every
+    // registered project's work_dir, delete any leftover marker, and warn
+    // about work_dirs that have gone missing. Runs before `require_project`
+    // so the cleanup happens even when this invocation targets one project.
+    cleanup_legacy_markers();
+
     let project_name = require_project(project_opt)?;
     // Re-materialize the resolved root + standard subdirectories before
     // the reload work runs. If the user nuked ~/.shelbi (or pointed
@@ -39,6 +45,33 @@ pub fn run(project_opt: Option<String>) -> Result<()> {
         shelbi_state::self_heal_workspace_settings_template(&project).map_err(|e| anyhow!(e))?;
     print_workspace_settings_template_outcome(&template_outcome);
     Ok(())
+}
+
+/// Sweep registered project trees for the now-redundant `.shelbi/project`
+/// marker and report missing work_dirs. Best-effort — a scan failure here
+/// shouldn't block the pane respawn that is reload's primary job.
+fn cleanup_legacy_markers() {
+    let report = match shelbi_state::cleanup_legacy_markers() {
+        Ok(r) => r,
+        Err(_) => return,
+    };
+    for c in report {
+        if c.marker_removed {
+            println!(
+                "shelbi: cleaned up legacy .shelbi/project marker in {} \
+                 (resolution now uses ~/.shelbi/projects/*.yaml)",
+                c.work_dir.display()
+            );
+        }
+        if c.work_dir_missing {
+            eprintln!(
+                "shelbi: warning: project '{}' work_dir {} no longer exists — \
+                 it won't resolve until you re-point or remove it",
+                c.name,
+                c.work_dir.display()
+            );
+        }
+    }
 }
 
 fn print_workspace_settings_template_outcome(outcome: &WorkspaceSettingsTemplateOutcome) {

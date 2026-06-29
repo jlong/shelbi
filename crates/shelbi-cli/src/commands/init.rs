@@ -1,4 +1,4 @@
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use anyhow::{anyhow, Result};
 use clap::Args as ClapArgs;
@@ -39,9 +39,11 @@ pub fn run(args: Args) -> Result<()> {
 /// would just scroll off-screen).
 ///
 /// Resolves the project root (prompting interactively, or honoring
-/// `--root` when supplied), then writes the project YAML, the in-repo
-/// `.shelbi/project` marker, the workspace-settings template, the
-/// default agent workspaces, and the project-wide statuses catalogue.
+/// `--root` when supplied), then writes the project YAML, the
+/// workspace-settings template, the default agent workspaces, and the
+/// project-wide statuses catalogue. No `.shelbi/project` marker is
+/// dropped — resolution reverse-looks-up the directory against the
+/// registered project YAMLs (see [`shelbi_state::resolve_project_for_cwd`]).
 pub fn scaffold_with_prompt(args: Args) -> Result<ResolvedProjectRoot> {
     // Hard-fail with a clear, source-tagged error if the shelbi root is
     // unwritable; otherwise materialize the standard layout
@@ -73,9 +75,10 @@ pub fn scaffold_with_prompt(args: Args) -> Result<ResolvedProjectRoot> {
     Ok(resolved)
 }
 
-/// Write the project YAML, the in-repo `.shelbi/project` marker, the
-/// workspace-settings template, materialize the default agents, and
-/// write the project-wide statuses catalogue.
+/// Write the project YAML, the workspace-settings template, materialize
+/// the default agents, and write the project-wide statuses catalogue.
+/// Deliberately does **not** drop a `.shelbi/project` marker: the project
+/// tree stays clean and resolution reads the registered YAMLs instead.
 ///
 /// The collision check in [`resolve_root_for_init`] guarantees the YAML
 /// path is free at the time we're called. We still guard the write
@@ -109,7 +112,6 @@ fn scaffold_project(resolved: &ResolvedProjectRoot) -> Result<()> {
     std::fs::write(&yaml_path, yaml)?;
     println!("✓ wrote project: {}", yaml_path.display());
 
-    write_marker(&resolved.path, &resolved.name)?;
     write_workspace_settings_template(&resolved.name)?;
 
     let outcomes = shelbi_state::materialize_default_agents(&resolved.name)
@@ -133,14 +135,6 @@ fn scaffold_project(resolved: &ResolvedProjectRoot) -> Result<()> {
         .map_err(|e| anyhow!(e))?;
         println!("✓ wrote project statuses: {}", statuses_path.display());
     }
-    Ok(())
-}
-
-fn write_marker(root: &Path, project: &str) -> Result<()> {
-    let marker = root.join(".shelbi/project");
-    shelbi_state::ensure_dir(marker.parent().unwrap()).map_err(|e| anyhow!(e))?;
-    std::fs::write(&marker, format!("{project}\n"))?;
-    println!("✓ wrote project marker: {}", marker.display());
     Ok(())
 }
 
@@ -186,5 +180,61 @@ pub(super) fn print_agent_materialize_outcome(outcome: &AgentMaterializeOutcome)
                 println!("(preserved your custom agents/{agent}/instructions.md)");
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::commands::test_support::ENV_LOCK;
+
+    fn fresh_dir(tag: &str) -> PathBuf {
+        let p = std::env::temp_dir().join(format!(
+            "shelbi-init-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&p).unwrap();
+        p
+    }
+
+    #[test]
+    fn scaffold_writes_yaml_but_no_marker() {
+        let _g = ENV_LOCK.lock().unwrap();
+        let home = fresh_dir("home");
+        let project_root = fresh_dir("repo");
+        std::env::set_var("SHELBI_HOME", &home);
+        // Materialize projects/, sessions/, … the way `scaffold_with_prompt`
+        // does before reaching `scaffold_project`.
+        shelbi_state::ensure_root_subdirs().unwrap();
+
+        let resolved = ResolvedProjectRoot {
+            path: project_root.clone(),
+            name: "myapp".to_string(),
+        };
+        scaffold_project(&resolved).unwrap();
+
+        // The project YAML lands under the shelbi home, pointing the hub
+        // machine at the project root...
+        let yaml = home.join("projects/myapp.yaml");
+        assert!(yaml.is_file(), "expected project YAML at {}", yaml.display());
+        let body = std::fs::read_to_string(&yaml).unwrap();
+        assert!(body.contains(&format!("work_dir: {}", project_root.display())));
+
+        // ...but the project tree stays clean — no `.shelbi/project` marker
+        // and no `.shelbi` directory created by init.
+        assert!(
+            !project_root.join(".shelbi/project").exists(),
+            "init must not write a .shelbi/project marker"
+        );
+        assert!(
+            !project_root.join(".shelbi").exists(),
+            "init must not create a .shelbi directory in the project tree"
+        );
+
+        std::env::remove_var("SHELBI_HOME");
     }
 }

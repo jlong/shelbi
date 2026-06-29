@@ -20,8 +20,8 @@ struct Cli {
     root: Option<std::path::PathBuf>,
 
     /// Project to operate on. Defaults to the project named in $SHELBI_PROJECT
-    /// or the closest `.shelbi/project` marker file in the current directory's
-    /// ancestors.
+    /// or the registered project whose work_dir contains the current
+    /// directory (matched against ~/.shelbi/projects/*.yaml).
     #[arg(long, short = 'p', global = true, env = "SHELBI_PROJECT")]
     project: Option<String>,
 
@@ -250,14 +250,15 @@ fn main() -> Result<()> {
 
 /// `shelbi` with no subcommand. Dispatches based on what's on disk:
 ///
-/// - explicit `--project` / `SHELBI_PROJECT` / `.shelbi/project` marker
-///   that resolves to a YAML on disk → boot that project's TUI.
-/// - marker resolves but its YAML is missing on this machine (common
-///   after `git clone` if `.shelbi/project` shipped with the repo) →
-///   print a friendly note and fall through to the first-run prompt
-///   so the user can set up the project locally. We deliberately re-
-///   derive the project name from the chosen root's basename rather
-///   than re-using the stale marker's name.
+/// - `--project` / `SHELBI_PROJECT`, or a cwd inside a registered
+///   project's `work_dir`, that resolves to a YAML on disk → boot that
+///   project's TUI. (cwd resolution is reverse-lookup against the
+///   project YAMLs, so it only ever returns names backed by a YAML.)
+/// - an explicit `--project` / `SHELBI_PROJECT` names a project with no
+///   YAML on this machine → print a friendly note and fall through to
+///   the first-run prompt so the user can set up the project locally. We
+///   deliberately re-derive the project name from the chosen root's
+///   basename rather than re-using the missing name.
 /// - `~/.shelbi/` missing OR `~/.shelbi/projects/` empty → onboarding
 ///   first-run flow (banner + assistant name + project-root prompt +
 ///   scaffold + launch TUI).
@@ -265,16 +266,14 @@ fn main() -> Result<()> {
 /// - two or more → project picker.
 fn default_entry(explicit: Option<String>) -> Result<()> {
     let resolved = commands::require_project(explicit).ok();
-    let stale_marker = match resolved.as_deref() {
+    let needs_first_run = match resolved.as_deref() {
         Some(name) if project_yaml_exists(name) => {
             return shelbi_tui::run_main(name).context("launching shelbi");
         }
         Some(name) => {
             eprintln!(
-                "Found a .shelbi/project marker for `{name}`, but no \
-                 ~/.shelbi/projects/{name}.yaml on this machine. The marker \
-                 likely shipped via git clone — let's set up the project \
-                 here.\n"
+                "No ~/.shelbi/projects/{name}.yaml on this machine — \
+                 let's set up a project here.\n"
             );
             true
         }
@@ -289,10 +288,10 @@ fn default_entry(explicit: Option<String>) -> Result<()> {
         Vec::new()
     };
 
-    // Stale marker forces first-run regardless of how many other projects
-    // are on disk — the user is sitting in a repo that needs scaffolding
-    // and that's the action that maps to their intent.
-    if stale_marker || projects.is_empty() {
+    // A missing-YAML explicit project forces first-run regardless of how
+    // many other projects are on disk — the user named a project that
+    // needs scaffolding and that's the action that maps to their intent.
+    if needs_first_run || projects.is_empty() {
         return run_wizard_then_dispatch(!home_existed);
     }
     if projects.len() == 1 {
@@ -458,12 +457,13 @@ mod cli_tests {
         }
     }
 
-    /// Stale-marker detection: `project_yaml_exists` is the predicate
-    /// `default_entry` uses to decide whether a resolved marker is live
-    /// or stale. The test pins both branches against a tempfile
-    /// `SHELBI_HOME` so a future refactor can't silently invert it.
+    /// `project_yaml_exists` is the predicate `default_entry` uses to
+    /// decide whether an explicitly-named project is live (boot it) or
+    /// missing on this machine (fall through to first-run). The test pins
+    /// both branches against a tempfile `SHELBI_HOME` so a future refactor
+    /// can't silently invert it.
     #[test]
-    fn project_yaml_exists_pins_stale_marker_branch() {
+    fn project_yaml_exists_pins_missing_project_branch() {
         let _g = commands::test_support::ENV_LOCK.lock().unwrap();
         let home = std::env::temp_dir().join(format!(
             "shelbi-stale-marker-test-{}-{}",

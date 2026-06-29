@@ -272,7 +272,6 @@ pub fn setup_one_project() -> Result<()> {
     shelbi_state::save_project(&project).map_err(|e| anyhow!(e))?;
 
     write_workspace_settings_template(&name)?;
-    write_project_marker(&PathBuf::from(&repo_path), &name)?;
     let _ = shelbi_state::materialize_default_agents(&name)
         .map_err(|e| anyhow!(e))?;
 
@@ -480,21 +479,6 @@ fn write_workspace_settings_template(project: &str) -> Result<()> {
     shelbi_state::ensure_dir(path.parent().unwrap()).map_err(|e| anyhow!(e))?;
     std::fs::write(&path, shelbi_state::DEFAULT_WORKSPACE_SETTINGS_TEMPLATE)
         .with_context(|| format!("writing {}", path.display()))?;
-    Ok(())
-}
-
-/// Write `<repo>/.shelbi/project` so subsequent `shelbi` invocations
-/// inside the repo auto-resolve the project name. Best-effort — if the
-/// repo path doesn't exist yet (user typed an aspirational path), we
-/// skip silently rather than mkdir into an unrelated tree.
-fn write_project_marker(repo_path: &Path, project: &str) -> Result<()> {
-    if !repo_path.is_dir() {
-        return Ok(());
-    }
-    let marker = repo_path.join(".shelbi/project");
-    shelbi_state::ensure_dir(marker.parent().unwrap()).map_err(|e| anyhow!(e))?;
-    std::fs::write(&marker, format!("{project}\n"))
-        .with_context(|| format!("writing {}", marker.display()))?;
     Ok(())
 }
 
