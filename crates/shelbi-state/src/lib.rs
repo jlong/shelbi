@@ -344,9 +344,15 @@ pub fn load_project(project: &str) -> Result<Project> {
     Ok(p)
 }
 
-/// One-time-per-process stderr nag when a legacy `workers:` top-level key is
+/// One-time-per-process nag when a legacy `workers:` top-level key is
 /// observed in a project YAML. Detection is line-prefix only — we scan for
 /// an unindented `workers:` to avoid tripping on nested keys or substrings.
+///
+/// Routed through `tracing::warn!` (not `eprintln!`) so the TUI subcommands
+/// — which init tracing with a file writer at `~/.shelbi/logs/tui.log` —
+/// don't paint the warning straight onto the alt-screen pane the sidebar /
+/// tasks / review TUIs are drawing on. CLI invocations from a real shell
+/// keep the default stderr writer, so the warning still surfaces there.
 fn warn_legacy_workers_key(project: &str, yaml: &str) {
     use std::sync::Mutex;
     static WARNED: Mutex<Option<HashSet<String>>> = Mutex::new(None);
@@ -367,7 +373,8 @@ fn warn_legacy_workers_key(project: &str, yaml: &str) {
     let mut guard = WARNED.lock().unwrap();
     let seen = guard.get_or_insert_with(HashSet::new);
     if seen.insert(project.to_string()) {
-        eprintln!(
+        tracing::warn!(
+            project,
             "shelbi: project `{project}` uses the legacy `workers:` key; \
              rename it to `workspaces:` (the alias will be removed in a future release)"
         );

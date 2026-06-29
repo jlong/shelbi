@@ -448,4 +448,104 @@ mod tests {
             "raw diagnostic text leaked onto the pane:\n{joined}",
         );
     }
+
+    /// Regression for the agents-workspaces variant of the
+    /// startup-warnings-interleave bug. A project YAML still using the
+    /// legacy `workers:` top-level key fires
+    /// `shelbi_state::warn_legacy_workers_key`; before the fix this was
+    /// an `eprintln!` that landed on the shared pane TTY mid-refresh
+    /// (the sidebar `App::refresh` path calls `load_project` on every
+    /// poll), splicing fragments of `shelbi: project \`<name>\` uses
+    /// the legacy \`workers:\`…` through ratatui's nav labels. The fix
+    /// routes the warning through `tracing::warn!` so the TUI's
+    /// file-backed writer captures it. This test asserts the contract
+    /// the render path now relies on: a refresh against a legacy
+    /// `workers:` YAML leaves the nav labels intact and does not
+    /// surface the deprecation copy anywhere in the rendered buffer.
+    #[test]
+    fn sidebar_renders_cleanly_when_project_yaml_uses_legacy_workers_key() {
+        let _g = test_support::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let home = std::env::temp_dir().join(format!(
+            "shelbi-tui-sidebar-legacy-workers-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos(),
+        ));
+        std::fs::create_dir_all(&home).unwrap();
+        std::env::set_var("SHELBI_HOME", &home);
+
+        // Hand-author the project YAML with the legacy `workers:` key.
+        // `save_project` would round-trip through the canonical
+        // `workspaces:` form; we deliberately exercise the loader path
+        // that fires the deprecation warning.
+        let projects_dir = home.join("projects");
+        std::fs::create_dir_all(&projects_dir).unwrap();
+        let yaml = "\
+name: demo
+repo: /tmp/demo-legacy-workers
+default_branch: main
+machines:
+  - name: hub
+    kind: local
+    work_dir: /tmp/demo-legacy-workers
+orchestrator:
+  runner: claude
+agent_runners:
+  claude:
+    command: claude
+    flags: []
+workers:
+  - name: alpha
+    machine: hub
+    runner: claude
+workspace_poll_interval_secs: 5
+workspace_permissions_mode: auto
+";
+        std::fs::write(projects_dir.join("demo.yaml"), yaml).unwrap();
+
+        let mut app = App::new_sidebar("demo");
+        let _ = app.refresh();
+
+        let backend = TestBackend::new(60, 20);
+        let mut term = Terminal::new(backend).unwrap();
+        term.draw(|f| sidebar::render_full(f, &mut app, f.area()))
+            .unwrap();
+        let buf = term.backend().buffer().clone();
+        let joined: String = (0..buf.area.height)
+            .map(|y| {
+                (0..buf.area.width)
+                    .map(|x| buf[(x, y)].symbol().to_string())
+                    .collect::<Vec<_>>()
+                    .join("")
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        for (emoji, text) in [("💬", "Chat"), ("📋", "Tasks"), ("⚡", "Activity")] {
+            let label = format!("{emoji}  {text}");
+            assert!(
+                joined.matches(&label).count() == 1,
+                "expected `{label}` to render exactly once and contiguously, but got:\n{joined}",
+            );
+        }
+
+        // The deprecation copy must not surface in the render buffer
+        // through any side channel (status line, error pane, etc.) —
+        // it belongs in the log file, not on the sidebar TTY. Each
+        // needle is a distinctive fragment of the warning message that
+        // would only land here via a regression.
+        for needle in ["workers:", "legacy", "future release"] {
+            assert!(
+                !joined.contains(needle),
+                "deprecation warning text leaked onto the sidebar pane:\n  \
+                 needle = {needle:?}\n  buffer:\n{joined}",
+            );
+        }
+
+        std::env::remove_var("SHELBI_HOME");
+    }
 }

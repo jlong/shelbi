@@ -1062,6 +1062,7 @@ dependencies = [
  "serde_yaml",
  "shelbi-core",
  "thiserror",
+ "tracing",
 ]
 
 [[package]]

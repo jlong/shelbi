@@ -147,9 +147,9 @@ pub fn legacy_claude_md_path(project: &str) -> Result<PathBuf> {
     Ok(project_dir(project)?.join("CLAUDE.md"))
 }
 
-/// Emit a one-time stderr hint when a legacy `CLAUDE.md` is still
-/// present at the project root. The orchestrator no longer reads it on
-/// dispatch — this nudges the user toward `agents/_shared/preamble.md`
+/// Emit a one-time hint when a legacy `CLAUDE.md` is still present at
+/// the project root. The orchestrator no longer reads it on dispatch —
+/// this nudges the user toward `agents/_shared/preamble.md`
 /// (project-wide) and `agents/orchestrator/instructions.md`
 /// (orchestrator-specific overrides) and to delete `CLAUDE.md` once the
 /// migration is done.
@@ -158,6 +158,11 @@ pub fn legacy_claude_md_path(project: &str) -> Result<PathBuf> {
 /// flag gates emission so multiple workspace dispatches inside the same
 /// orchestrator session only see the hint once. Reset the flag with
 /// [`reset_claude_md_migration_hint`] at orchestrator startup.
+///
+/// Routed through `tracing::warn!` (not `eprintln!`) so TUI subcommands
+/// — which init tracing with a file writer at `~/.shelbi/logs/tui.log`
+/// — keep the hint off the alt-screen pane. CLI invocations from a
+/// real shell still surface it on stderr via the default writer.
 ///
 /// Best-effort — IO failures from `read_state`/`write_state` are
 /// returned to the caller so the spawn path can decide whether to bail
@@ -172,7 +177,9 @@ pub fn maybe_emit_claude_md_migration_hint(project: &str) -> Result<()> {
     if !path.exists() {
         return Ok(());
     }
-    eprintln!(
+    tracing::warn!(
+        project,
+        claude_md = %path.display(),
         "shelbi: CLAUDE.md detected at {} but no longer read.\n  \
          → project-wide context belongs in agents/_shared/preamble.md\n  \
          → orchestrator-specific overrides belong in agents/orchestrator/instructions.md\n  \

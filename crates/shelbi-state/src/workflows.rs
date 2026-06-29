@@ -25,9 +25,15 @@
 //!
 //! Workflow YAMLs authored before the two-field owner/agent split
 //! ([`shelbi_core::Workflow::from_yaml_str_with_diagnostics`] surfaces
-//! these) trigger a one-time-per-workflow stderr deprecation warning.
-//! The dedupe is process-local, keyed by workflow path — repeated calls
-//! to `list_workflows` from a polling TUI emit the warning once.
+//! these) trigger a one-time-per-workflow deprecation warning. The
+//! dedupe is process-local, keyed by workflow path — repeated calls to
+//! `list_workflows` from a polling TUI emit the warning once.
+//!
+//! The warning routes through `tracing::warn!` so TUI subcommands (which
+//! init tracing with a file writer at `~/.shelbi/logs/tui.log`) don't
+//! paint it straight onto the alt-screen pane the sidebar / tasks /
+//! review TUIs are drawing on. Plain CLI invocations inherit the
+//! default stderr writer, so the warning still surfaces in a real shell.
 
 use std::collections::{BTreeSet, HashSet};
 use std::fs;
@@ -58,8 +64,10 @@ pub fn workflow_path(project: &str, name: &str) -> Result<PathBuf> {
 /// loading.
 ///
 /// Legacy single-field owner forms migrate silently in-memory and
-/// surface a one-time-per-workflow-path stderr deprecation warning so
-/// repeated loads from a polling UI don't flood the console.
+/// surface a one-time-per-workflow-path deprecation warning so
+/// repeated loads from a polling UI don't flood the console. The
+/// warning routes through `tracing::warn!` so it lands in the TUI's
+/// log file rather than on the alt-screen pane.
 pub fn load_workflow(project: &str, name: &str) -> Result<Workflow> {
     let path = workflow_path(project, name)?;
     let text = fs::read_to_string(&path)?;
@@ -173,10 +181,14 @@ fn list_known_agents(dir: &Path) -> Result<BTreeSet<String>> {
 /// other.
 static EMITTED_DEPRECATIONS: Mutex<Option<HashSet<PathBuf>>> = Mutex::new(None);
 
-/// Surface every diagnostic in `diags` to stderr — once per workflow
-/// path. Repeated loads (the sidebar's poll loop, a `list_workflows`
-/// call followed by `load_workflow`) silently no-op so the user isn't
+/// Surface every diagnostic in `diags` — once per workflow path.
+/// Repeated loads (the sidebar's poll loop, a `list_workflows` call
+/// followed by `load_workflow`) silently no-op so the user isn't
 /// spammed.
+///
+/// Routes through `tracing::warn!` (not `eprintln!`) so the TUI
+/// subcommands' file-backed tracing writer captures these instead of
+/// letting them race ratatui's redraw on the shared pane TTY.
 fn emit_deprecation_warnings_once(path: &Path, diags: &[String]) {
     if diags.is_empty() {
         return;
@@ -191,7 +203,7 @@ fn emit_deprecation_warnings_once(path: &Path, diags: &[String]) {
     }
     drop(guard);
     for d in diags {
-        eprintln!("shelbi: {} — {d}", path.display());
+        tracing::warn!(workflow = %path.display(), "shelbi: {} — {d}", path.display());
     }
 }
 

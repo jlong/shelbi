@@ -17,3 +17,4 @@ dirs = { workspace = true }
 chrono = { workspace = true }
 crossterm = { workspace = true }
 thiserror = { workspace = true }
+tracing = { workspace = true }
