@@ -294,16 +294,33 @@ pub fn append_zen_dryrun_event(task_id: &str, action: &str, detail: &str) -> Res
     ))
 }
 
-/// Append `<rfc3339> project=<name> heartbeat` to `~/.shelbi/events.log`.
-/// The hub-side poller emits this on its configured `heartbeat` cadence
-/// (see `shelbi_core::HeartbeatConfig`) so the orchestrator's
-/// `events tail --follow` watch has a guaranteed recurring trigger even
-/// when the board is otherwise silent. Heartbeats are filtered out of
-/// the human-facing activity feed by default — they're a wake-up signal,
-/// not user-facing news.
-pub fn append_heartbeat_event(project: &str) -> Result<()> {
+/// Append `<rfc3339> project=<name> heartbeat zen_eligible=<N>
+/// idle_workspaces=<M>` to `~/.shelbi/events.log`. The hub-side poller emits
+/// this on its configured `heartbeat` cadence (see
+/// `shelbi_core::HeartbeatConfig`) so the orchestrator's `events tail --follow`
+/// watch has a guaranteed recurring trigger even when the board is otherwise
+/// silent. Heartbeats are filtered out of the human-facing activity feed by
+/// default — they're a wake-up signal, not user-facing news.
+///
+/// The two trailing counts are computed fresh at emit time:
+/// - `zen_eligible` — how many `backlog`-category tasks `shelbi zen scan`
+///   would return right now (mechanical eligibility only).
+/// - `idle_workspaces` — workspaces with no active-category task assigned.
+///
+/// Together they're the safety net for a skipped post-merge scan: a heartbeat
+/// with `zen_eligible > 0` and `idle_workspaces > 0` forces the orchestrator
+/// back into the scan loop. The tokens are appended after the `heartbeat`
+/// keyword so existing parsers that key off the leading `project=<name>
+/// heartbeat` prefix keep working.
+pub fn append_heartbeat_event(
+    project: &str,
+    zen_eligible: usize,
+    idle_workspaces: usize,
+) -> Result<()> {
     let ts = Utc::now().to_rfc3339();
-    append_event_line(&format!("{ts} project={project} heartbeat"))
+    append_event_line(&format!(
+        "{ts} project={project} heartbeat zen_eligible={zen_eligible} idle_workspaces={idle_workspaces}"
+    ))
 }
 
 /// Append `<rfc3339> dispatch task=<id> workspace=<name> status=<status> detail=<detail>`
@@ -629,27 +646,35 @@ mod tests {
     }
 
     #[test]
-    fn heartbeat_event_writes_project_scoped_line() {
-        // Shape: `<ts> project=<name> heartbeat`. No `task=`/`workspace=`
-        // prefix on purpose — the orchestrator's tail uses the leading
-        // token after the timestamp to dispatch handlers, and the
-        // `project=…` form lets a heartbeat live alongside other
-        // future project-scoped events without colliding.
+    fn heartbeat_event_writes_project_scoped_line_with_counts() {
+        // Shape: `<ts> project=<name> heartbeat zen_eligible=<N>
+        // idle_workspaces=<M>`. No `task=`/`workspace=` prefix on purpose —
+        // the orchestrator's tail uses the leading token after the timestamp
+        // to dispatch handlers, and the `project=…` form lets a heartbeat
+        // live alongside other project-scoped events without colliding. The
+        // two counts trail the `heartbeat` keyword so prefix-keyed parsers
+        // are unaffected.
         let _g = TEST_LOCK.lock().unwrap();
         let home = fresh_home();
         std::env::set_var("SHELBI_HOME", &home);
 
-        append_heartbeat_event("myapp").unwrap();
-        append_heartbeat_event("myapp").unwrap();
+        append_heartbeat_event("myapp", 5, 4).unwrap();
+        append_heartbeat_event("myapp", 0, 0).unwrap();
 
         let log = std::fs::read_to_string(events_log_path().unwrap()).unwrap();
         let lines: Vec<&str> = log.lines().collect();
         assert_eq!(lines.len(), 2);
+        assert!(
+            lines[0].ends_with(" project=myapp heartbeat zen_eligible=5 idle_workspaces=4"),
+            "line: {}",
+            lines[0]
+        );
+        assert!(
+            lines[1].ends_with(" project=myapp heartbeat zen_eligible=0 idle_workspaces=0"),
+            "line: {}",
+            lines[1]
+        );
         for line in &lines {
-            assert!(
-                line.ends_with(" project=myapp heartbeat"),
-                "line: {line}"
-            );
             // Timestamp parses as RFC3339 so `--since` filtering works
             // the same way it does for every other event shape.
             let ts = line.split_whitespace().next().unwrap();

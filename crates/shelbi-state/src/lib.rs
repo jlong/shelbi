@@ -1092,6 +1092,32 @@ pub fn list_ready(project: &str) -> Result<Vec<TaskFile>> {
         .collect())
 }
 
+/// Count workspaces with no `active`-category (in-progress) task assigned to
+/// them. A workspace is "idle" when nothing in [`Column::InProgress`] names it
+/// in `assigned_to` — the same predicate the poller uses to decide a workspace
+/// is free. Surfaced in the heartbeat payload so the orchestrator can tell, at
+/// emit time, whether there's spare capacity to absorb eligible backlog work.
+pub fn idle_workspace_count(project: &Project) -> Result<usize> {
+    let in_progress = list_column(&project.name, Column::InProgress)?;
+    Ok(idle_workspace_count_from(&project.workspaces, &in_progress))
+}
+
+/// Pure core of [`idle_workspace_count`]. Split out so unit tests can drive it
+/// with in-memory fixtures without touching disk or `SHELBI_HOME`.
+pub fn idle_workspace_count_from(
+    workspaces: &[shelbi_core::WorkspaceSpec],
+    in_progress: &[TaskFile],
+) -> usize {
+    let busy: HashSet<&str> = in_progress
+        .iter()
+        .filter_map(|tf| tf.task.assigned_to.as_deref())
+        .collect();
+    workspaces
+        .iter()
+        .filter(|w| !busy.contains(w.name.as_str()))
+        .count()
+}
+
 /// Validate `depends_on` for a task that is about to be saved. Rejects:
 ///
 /// 1. Self-references.
@@ -1719,6 +1745,48 @@ mod tests {
             updated_at: now,
             params: std::collections::BTreeMap::new(),
         }
+    }
+
+    fn workspace(name: &str) -> shelbi_core::WorkspaceSpec {
+        shelbi_core::WorkspaceSpec {
+            name: name.to_string(),
+            machine: "local".to_string(),
+            runner: "claude".to_string(),
+        }
+    }
+
+    fn assigned(id: &str, to: &str) -> TaskFile {
+        let mut task = make_task(id, Column::InProgress, 0);
+        task.assigned_to = Some(to.to_string());
+        TaskFile {
+            task,
+            body: String::new(),
+        }
+    }
+
+    #[test]
+    fn idle_workspace_count_excludes_only_assigned_workspaces() {
+        // Four workspaces, two of which hold an active-category task. The
+        // other two are idle. An InProgress task whose `assigned_to` names a
+        // workspace not in the pool doesn't suppress any real workspace.
+        let workspaces = [
+            workspace("alpha"),
+            workspace("bravo"),
+            workspace("charlie"),
+            workspace("delta"),
+        ];
+        let in_progress = [
+            assigned("t1", "alpha"),
+            assigned("t2", "charlie"),
+            assigned("t3", "ghost"), // stale assignment, no such workspace
+        ];
+        assert_eq!(idle_workspace_count_from(&workspaces, &in_progress), 2);
+    }
+
+    #[test]
+    fn idle_workspace_count_all_idle_when_nothing_in_progress() {
+        let workspaces = [workspace("alpha"), workspace("bravo")];
+        assert_eq!(idle_workspace_count_from(&workspaces, &[]), 2);
     }
 
     #[test]
