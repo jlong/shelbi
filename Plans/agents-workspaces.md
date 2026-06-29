@@ -379,16 +379,16 @@ After Phase 2: custom workflows + custom agents are fully composable. A user can
 
 ## Open questions
 
-- **CLI vocabulary follow-through:** **`shelbi worker *`** **→** **`shelbi workspace *`?** The sidebar rename (Workers → Workspaces) implies a CLI rename for consistency: `shelbi worker list` → `shelbi workspace list`, `shelbi worker stop` → `shelbi workspace stop`, and the `worker:*` event reason prefixes too. Cost: every CLAUDE.md / orchestrator-prompt / doc reference has to follow, plus a deprecation alias period for users with muscle memory. Benefit: one vocabulary across UI, CLI, events, and prose. Lean toward doing it as a v2 follow-up after the sidebar reorg has lived long enough to confirm the workspace framing actually feels right.
+Two questions remain genuinely open; everything else has been folded into Decisions.
 
-- **Per-workspace preferred agent?** Should a workspace declare `prefers_agent: developer` so the orchestrator routes that workspace to developer-statuses when possible? Useful if certain hosts have tools or auth only Developer needs. Probably overkill for v1 — defer.
+**Deferred to v2 (not blockers, no current demand):**
 
-- **Global agent library at** **`~/.shelbi/agents/`?** Cross-project agents (a single "Security Review" agent reused across every project). Cheap to add but no current user demand. Defer until someone asks.
+- **Per-workspace preferred agent?** Should a workspace declare `prefers_agent: developer` so the orchestrator routes that workspace to matching statuses when possible? Useful if certain hosts have tools or auth only one agent needs. Deferred — no concrete use case yet; pairs naturally with `prefers_machine` if it ships.
 
-- **`CLAUDE.md`** **migration path.** Today the project's `CLAUDE.md` is the orchestrator's prompt (mixing orchestrator content with project-specific overrides). After Phase 1, the orchestrator agent's prompt lives in `agents/orchestrator/instructions.md`. What's left for `CLAUDE.md`? Maybe project-wide context for *all* agents (the "you're working in the Shelbi monorepo, here's the layout" preamble), prepended to whatever agent runs. Worth a separate design pass before Phase 1 lands.
+- **Global agent library at** **`~/.shelbi/agents/`?** Cross-project agents (one "Security Review" agent reused everywhere). Deferred — no cross-project sharing demand yet; revisit when someone hits the pain of maintaining the same agent in N projects. (Also blocks the related "skill inheritance / composition" question, since there's nothing to compose with until global agents exist.)
 
-- **Skill inheritance / composition.** If a project has both a `developer` agent (with its own skills) AND ships some skills at `~/.shelbi/skills/` (global), do the agent's skills override or compose? Lean toward compose, agent-skills-win-on-conflict. Out of scope for v1.
+**Still genuinely open:**
 
-- **Worker** **`agent`** **column name vs** **`claude`** **column.** Today the third column of `shelbi worker list` is "claude" (the runtime). The new "agent" column is the role. Adjacency might be confusing — should the runtime column rename to "runtime" or stay "claude"? Lean toward keep as-is for v1; rename later if real users get confused.
+- **`shelbi agent edit <name>`** — opens the agent's `instructions.md` in `$EDITOR` (mirroring `shelbi workflow edit` if/when that exists). Trivial to ship; only question is whether it's necessary. Deferred to v2 by default; revisit if users ask.
 
-- **Reserved owner names.** `user` is reserved (means human). Should `agent` (the old generic value) also be reserved as forever-invalid, or just deprecated-then-removed? Current plan: deprecated-with-auto-migration in Phase 1, hard-reject in a later release. Open to making it a hard error from day one.
+- **Sidebar mockup glyph legend.** §1's tree mockup uses `▶` for active workspaces and `·` for idle; the prose doesn't yet name those glyphs. Worth a one-liner legend or sticking with "infer from context." (Not blocking; cosmetic.)
