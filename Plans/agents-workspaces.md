@@ -242,12 +242,14 @@ When the agent runs, its `skills/` directory is exposed to Claude Code's skill l
 Agents can share skills by symlinking — no separate "library" mechanism in v1.
 
 ### 8. The Orchestrator agent's special status
-The Orchestrator agent runs differently from other agents in two ways:
 
-1. **Persistent pane.** Other agents dispatch and clear between tasks; the orchestrator runs continuously in its own tmux session and reacts to events.
-2. **Doesn't own a single status.** It owns the *transitions out of* multiple statuses (auto-promote out of backlog under Zen, auto-dispatch out of todo, run Zen merge conditions out of review). The `agent: orchestrator` field on `todo` (and on user-owned statuses that allow Zen automation, like `backlog` and `review`) is documentation — the orchestrator process runs whether or not any particular status names it, since the orchestrator IS the dispatch loop.
+The Orchestrator agent runs differently from worker agents in two ways:
 
-Plan position: keep both — let multiple statuses declare `agent: orchestrator` for documentation purposes, and run the orchestrator process unconditionally. The CLI command `shelbi agent show orchestrator` should make this special status visible.
+1. **Persistent pane.** A worker dispatches and clears between tasks; the orchestrator runs continuously in its own tmux session and reacts to events.
+2. **Doesn't own a single status.** It owns the *transitions out of* multiple statuses (auto-promote out of backlog under Zen, auto-dispatch out of todo, run Zen merge conditions out of review). The `owner: orchestrator` field on `todo` is a *convenience* — the orchestrator runs whether or not todo lists it explicitly, since the orchestrator IS the dispatch loop.
+
+Plan position: keep both — let `todo` (and any other "transient ready" statuses) declare `owner: orchestrator` for documentation purposes. The orchestrator process itself runs always. The CLI command `shelbi agent show orchestrator` should make this special status visible.
+
 ### 9. CLI surface
 
 Four new commands under `shelbi agent`, all in v1:
@@ -350,31 +352,29 @@ After Phase 1: the abstraction exists, the default workflow uses it, the CLI voc
 After Phase 2: custom workflows + custom agents are fully composable. A user can drop in a QA agent, wire it to a `qa` status, and have every task pass through their custom verification gate.
 
 ## Decisions
-
 - **Sidebar rebrand + reorganize: "Agents" → "Workspaces", grouped by machine.** Frees the word "Agent" for the new concept and aligns with the persistent-slot mental model (each workspace = one pane + one git worktree on a specific machine). Group headers collapse to a flat list when the project has only one machine. Vocabulary: workspace = slot, agent = role, task = work.
 
-- **CLI rename to** **`shelbi workspace *`** **in v1.** The sidebar rename pulls the CLI rename forward: `shelbi worker list` → `shelbi workspace list`, etc. `shelbi worker *` stays as a deprecation alias for one release with a one-line stderr nag. Event-line `worker=<name>` renames to `workspace=<name>` with parser fallback for one release.
+- **CLI rename to `shelbi workspace *` in v1.** The sidebar rename pulls the CLI rename forward: `shelbi worker list` → `shelbi workspace list`, etc. `shelbi worker *` stays as a deprecation alias for one release with a one-line stderr nag. Event-line `worker=<name>` renames to `workspace=<name>` with parser fallback for one release.
 
 - **Agent storage:** **`~/.shelbi/projects/<project>/agents/<name>/`** containing `instructions.md` and `skills/`. Mirrors the workflows folder layout.
 
 - **Default agents: Orchestrator + Developer**, shipped in the binary and materialized into the project on init / self-healed on reload. Editable per-project; binary upgrade doesn't clobber edits.
 
-- **Workflow binding: two fields,** **`owner: user | agent`** **+ optional** **`agent: <name>`.** `owner` is the binary "whose responsibility under no-automation"; `agent` names which agent acts when automation (Zen, etc.) is on. Decouples responsibility from automation, so a `user`-owned status can still have an agent-driven Zen path (e.g. `review: owner: user, agent: orchestrator` for auto-merge). Hard-fail if `owner: agent` without `agent:`. Legacy single-field workflows auto-migrate with a deprecation warning. Net effect: Zen behavior becomes declarative data in the workflow YAML instead of orchestrator-prompt prose.
+- **Workflow binding: two fields, `owner: user | agent` + optional `agent: <name>`.** `owner` is the binary "whose responsibility under no-automation"; `agent` names which agent acts when automation (Zen, etc.) is on. Decouples responsibility from automation, so a `user`-owned status can still have an agent-driven Zen path (e.g. `review: owner: user, agent: orchestrator` for auto-merge). Hard-fail if `owner: agent` without `agent:`. Legacy single-field workflows auto-migrate with a deprecation warning. Net effect: Zen behavior becomes declarative data in the workflow YAML instead of orchestrator-prompt prose.
 
-- **Workspace spawn loads agent's** **`instructions.md`** **as system prompt** (prepended with `agents/_shared/preamble.md` if the project has one) and mounts the agent's `skills/` into `.claude/skills/`. The same workspace slot runs different agents on consecutive dispatches.
+- **Workspace spawn loads agent's `instructions.md` as system prompt** (prepended with `agents/_shared/preamble.md` if the project has one) and mounts the agent's `skills/` into `.claude/skills/`. The same workspace slot runs different agents on consecutive dispatches.
 
-- **Deprecate** **`CLAUDE.md`.** Project-wide context for all agents moves into `agents/_shared/preamble.md`; orchestrator-specific overrides go into `agents/orchestrator/instructions.md`. Removes the special-case file and unifies how agents source their context. v1 still reads an existing `CLAUDE.md` if present (with a one-time migration hint); v2 drops the read path.
+- **Deprecate `CLAUDE.md`.** Project-wide context for all agents moves into `agents/_shared/preamble.md`; orchestrator-specific overrides go into `agents/orchestrator/instructions.md`. Removes the special-case file and unifies how agents source their context. v1 still reads an existing `CLAUDE.md` if present (with a one-time migration hint); v2 drops the read path.
 
 - **Orchestrator agent is special** — runs persistently on its own pane, not per-task-dispatch. Statuses declaring `agent: orchestrator` are declarative documentation of what the orchestrator does; the orchestrator process itself runs always.
 
 - **Skills format follows Claude Code's existing convention** — `.md` with YAML frontmatter declaring trigger criteria. No new skill format to learn.
 
-- **CLI surface:** **`shelbi agent list / show`** in v1; `new` in v2; `edit` deferred (open question).
+- **CLI surface:** full `shelbi agent list / show / new / edit` quartet in v1. Mirrors what `shelbi workspace *` and `shelbi task *` offer; no command deferred.
 
-- **Events log gains** **`agent=<name>`** **field** on dispatch events (redundant with the status's `agent:`, but keeps the feed self-contained).
+- **Events log gains `agent=<name>` field** on dispatch events (redundant with the status's `agent:`, but keeps the feed self-contained).
 
-- **`shelbi workspace list`** **columns:** **`NAME`,** **`HOST`,** **`MODEL`,** **`AGENT`,** **`STATE`.** Replaces today's `claude` column with `MODEL` (more generic, future-proofs for non-Claude runtimes); adds new `AGENT` column for the loaded role.
-
+- **`shelbi workspace list` columns: `NAME`, `HOST`, `MODEL`, `AGENT`, `STATE`.** Replaces today's `claude` column with `MODEL` (more generic, future-proofs for non-Claude runtimes); adds new `AGENT` column for the loaded role.
 ## Open questions
 
 Two questions remain genuinely open; everything else has been folded into Decisions.
