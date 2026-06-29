@@ -1,5 +1,6 @@
 use anyhow::{anyhow, Result};
 use clap::Args as ClapArgs;
+use shelbi_state::AgentMaterializeOutcome;
 
 #[derive(Debug, ClapArgs)]
 pub struct Args {
@@ -75,6 +76,12 @@ pub fn run(args: Args) -> Result<()> {
                     template_path.display()
                 );
             }
+
+            let outcomes = shelbi_state::materialize_default_agents(name)
+                .map_err(|e| anyhow!(e))?;
+            for outcome in outcomes {
+                print_agent_materialize_outcome(&outcome);
+            }
         }
     }
 
@@ -92,4 +99,29 @@ pub fn run(args: Args) -> Result<()> {
         println!("  3. spawn your first agent: shelbi spawn TASK --on hub --runner claude \"…\"");
     }
     Ok(())
+}
+
+/// Stringify a [`shelbi_state::AgentMaterializeOutcome`] for the init /
+/// reload report. Same renderer used by both commands so the user sees
+/// the same wording for the same outcome regardless of which path
+/// touched the agent workspace.
+pub(super) fn print_agent_materialize_outcome(outcome: &AgentMaterializeOutcome) {
+    match outcome {
+        AgentMaterializeOutcome::Created { agent } => {
+            println!("✓ created agent workspace: agents/{agent}/");
+        }
+        AgentMaterializeOutcome::Unchanged { agent } => {
+            println!("(agent workspace already exists: agents/{agent}/)");
+        }
+        AgentMaterializeOutcome::Preserved { agent, first_notice } => {
+            if *first_notice {
+                println!(
+                    "(preserved your custom agents/{agent}/instructions.md — \
+                     differs from the bundled default; the project owns the override)"
+                );
+            } else {
+                println!("(preserved your custom agents/{agent}/instructions.md)");
+            }
+        }
+    }
 }

@@ -45,7 +45,12 @@ pub(crate) mod test_lock {
     }
 }
 
-pub const DEFAULT_SYSTEM_PROMPT: &str = include_str!("default_orchestrator.md.template");
+/// Bundled orchestrator system prompt. The template file lives in
+/// `shelbi-state` so the per-project `agents/orchestrator/instructions.md`
+/// materialize / self-heal path and this constant agree byte-for-byte.
+/// Re-exported here so existing callers (the dashboard bootstrap) don't
+/// have to learn a new import path.
+pub const DEFAULT_SYSTEM_PROMPT: &str = shelbi_state::DEFAULT_ORCHESTRATOR_INSTRUCTIONS;
 
 // Sidebar pane width is clamped to this char range. Below the min the
 // footer hint (`  ^P palette  q quit`, ~20 chars) starts to truncate

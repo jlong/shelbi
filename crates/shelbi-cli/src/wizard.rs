@@ -273,6 +273,8 @@ pub fn setup_one_project() -> Result<()> {
 
     write_worker_settings_template(&name)?;
     write_project_marker(&PathBuf::from(&repo_path), &name)?;
+    let _ = shelbi_state::materialize_default_agents(&name)
+        .map_err(|e| anyhow!(e))?;
 
     // ---- Done -----------------------------------------------------------
     let names_csv = project
