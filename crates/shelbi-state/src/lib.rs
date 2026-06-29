@@ -227,10 +227,11 @@ fn migrate_default_workflow(project_dir: &Path) {
 /// ids declared here and add per-workflow owner/agent.
 ///
 /// Idempotent and best-effort, same semantics as
-/// [`migrate_default_workflow`]. Either file may exist alone (e.g. a
-/// user-managed `statuses.yml` with no workflow files yet, or a legacy
-/// `default.yaml` whose `statuses.yml` was just stripped); the workflow
-/// loader's migration path covers both cases on the next read.
+/// [`migrate_default_workflow`]. The workflow loader requires
+/// `statuses.yml` to be present whenever workflow files exist — this
+/// helper is what `shelbi init` / `shelbi reload` (via `load_project`)
+/// call to satisfy that contract for existing projects that pre-date
+/// the file.
 fn migrate_default_statuses(project_dir: &Path) {
     let path = project_dir.join("workflows").join("statuses.yml");
     if path.exists() {
@@ -366,9 +367,9 @@ pub fn load_project(project: &str) -> Result<Project> {
     p.detect_shapes(repo);
     // Best-effort: drop workflows/default.yaml and workflows/statuses.yml
     // into the project directory on first load. Idempotent — see
-    // migrate_default_workflow / migrate_default_statuses. The workflow
-    // loader will additionally run the legacy-form migration on demand
-    // when it discovers inline name/category fields.
+    // migrate_default_workflow / migrate_default_statuses. After this
+    // runs, the workflow loader's "statuses.yml must exist" contract
+    // holds for any subsequent open of this project.
     if let Ok(dir) = project_dir(&p.name) {
         migrate_default_workflow(&dir);
         migrate_default_statuses(&dir);

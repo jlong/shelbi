@@ -208,12 +208,15 @@ mod tests {
         p
     }
 
+    /// Reference-form fixture — identity (name + category) lives in
+    /// `statuses.yml`. Tests that load this must also write the default
+    /// catalogue so the loader can resolve the ids.
     const DESIGN_YAML: &str = r#"
 name: design
 description: Smoke-test fixture.
 statuses:
-  - { name: Backlog, category: backlog, owner: user }
-  - { name: Done,    category: done,    owner: user }
+  - { id: backlog, owner: user }
+  - { id: done,    owner: user }
 "#;
 
     #[test]
@@ -341,6 +344,15 @@ statuses:
         let _g = TEST_LOCK.lock().unwrap();
         let home = fresh_home();
         std::env::set_var("SHELBI_HOME", &home);
+        // `shelbi workflow new` only writes the workflow file; the
+        // project-wide status catalogue is materialized by
+        // `shelbi init` / `shelbi reload` (via `load_project`). Stand
+        // in for that step here so the loader has its prerequisite.
+        shelbi_state::save_project_statuses(
+            "p",
+            &shelbi_core::default_project_statuses(),
+        )
+        .unwrap();
         new("p", "design-review", false).unwrap();
         // The loader returns the on-disk workflow plus skips the default
         // fallback once at least one file exists.
@@ -357,6 +369,11 @@ statuses:
         std::env::set_var("SHELBI_HOME", &home);
         let dir = shelbi_state::workflows_dir("p").unwrap();
         shelbi_state::ensure_dir(&dir).unwrap();
+        shelbi_state::save_project_statuses(
+            "p",
+            &shelbi_core::default_project_statuses(),
+        )
+        .unwrap();
         std::fs::write(dir.join("design.yaml"), DESIGN_YAML).unwrap();
         show("p", "design").unwrap();
         std::env::remove_var("SHELBI_HOME");

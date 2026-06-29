@@ -473,6 +473,13 @@ mod tests {
         let home = fresh_home();
         std::env::set_var("SHELBI_HOME", &home);
         materialize_defaults("p");
+        // The workflow loader requires `statuses.yml` to be present —
+        // stand in for the `shelbi init` / `shelbi reload` step.
+        shelbi_state::save_project_statuses(
+            "p",
+            &shelbi_core::default_project_statuses(),
+        )
+        .unwrap();
         // Author two workflows that both bind a status to `developer`.
         let dir = shelbi_state::workflows_dir("p").unwrap();
         std::fs::create_dir_all(&dir).unwrap();
@@ -480,8 +487,8 @@ mod tests {
             dir.join("default.yaml"),
             r#"name: default
 statuses:
-  - { id: todo, name: Todo, category: ready, owner: agent, agent: developer }
-  - { id: done, name: Done, category: done,  owner: user }
+  - { id: todo, owner: agent, agent: developer }
+  - { id: done, owner: user }
 "#,
         )
         .unwrap();
@@ -489,9 +496,9 @@ statuses:
             dir.join("research.yaml"),
             r#"name: research
 statuses:
-  - { id: todo,     name: Todo,     category: ready, owner: agent, agent: developer }
-  - { id: drafting, name: Drafting, category: active, owner: agent, agent: developer }
-  - { id: done,     name: Done,     category: done,  owner: user }
+  - { id: todo,        owner: agent, agent: developer }
+  - { id: in-progress, owner: agent, agent: developer }
+  - { id: done,        owner: user }
 "#,
         )
         .unwrap();
@@ -508,7 +515,7 @@ statuses:
         }
         let joined = set.iter().cloned().collect::<Vec<_>>().join(", ");
         // `todo` appears in both workflows; we want it once.
-        assert_eq!(joined, "drafting, todo");
+        assert_eq!(joined, "in-progress, todo");
 
         // Drive the list path itself to make sure it doesn't panic on the fixture.
         list("p").unwrap();

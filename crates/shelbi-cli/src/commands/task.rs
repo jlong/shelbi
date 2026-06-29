@@ -956,17 +956,25 @@ mod tests {
         let home = fresh_home();
         std::env::set_var("SHELBI_HOME", &home);
 
-        // Author a workflow that omits `Review` — moves to it must fail.
+        // Stand in for `shelbi init` — the workflow loader requires
+        // the project's status catalogue to be on disk.
+        shelbi_state::save_project_statuses(
+            "p",
+            &shelbi_core::default_project_statuses(),
+        )
+        .unwrap();
+
+        // Author a workflow that omits `review` — moves to it must fail.
         let wf_dir = shelbi_state::workflows_dir("p").unwrap();
         std::fs::create_dir_all(&wf_dir).unwrap();
         std::fs::write(
             wf_dir.join("research.yaml"),
             r#"name: research
 statuses:
-  - { name: Backlog,    category: backlog, owner: user  }
-  - { name: Todo,       category: ready,   owner: agent }
-  - { name: InProgress, category: active,  owner: agent }
-  - { name: Done,       category: done,    owner: user  }
+  - { id: backlog,     owner: user                          }
+  - { id: todo,        owner: agent, agent: orchestrator    }
+  - { id: in-progress, owner: agent, agent: developer       }
+  - { id: done,        owner: user                          }
 "#,
         )
         .unwrap();
@@ -977,9 +985,18 @@ statuses:
 
         let err = move_to("p", "d", "review", None).unwrap_err().to_string();
         assert!(err.contains("workflow `research`"), "{err}");
-        assert!(err.contains("Backlog"), "{err}");
-        assert!(err.contains("Done"), "{err}");
-        assert!(!err.contains("Review"), "{err}");
+        // The error lists valid status ids (stable identifiers) in kebab
+        // form. Pull out the `(valid: ...)` segment so the assertion on
+        // "review missing from the workflow" isn't fooled by the
+        // destination id (`review`) that opens the message.
+        let valid = err
+            .split_once("(valid:")
+            .and_then(|(_, tail)| tail.split_once(')'))
+            .map(|(list, _)| list.trim())
+            .unwrap_or("");
+        assert!(valid.contains("backlog"), "{err}");
+        assert!(valid.contains("done"), "{err}");
+        assert!(!valid.contains("review"), "{err}");
 
         // Task must stay put — no event written.
         let path = shelbi_state::events_log_path().unwrap();
