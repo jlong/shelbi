@@ -1,5 +1,17 @@
 # Agents
 
+## Vocabulary
+
+This plan cleanly separates three concepts that Shelbi has been conflating:
+
+- **Workspace** — a persistent slot tied to a machine: one tmux pane + one git worktree at `.shelbi/wt/<name>`. Long-lived. `alpha`, `bravo`, `charlie` on hub; `delta`, `echo`, `foxtrot` on devbox. Today's "workers" are workspaces.
+- **Agent** — a system prompt + a skill set. Logical and reusable across workspaces. `Orchestrator`, `Developer`, `QA`, `Security Review` are agents.
+- **Task** — a unit of work that gets dispatched.
+
+A dispatch reads cleanly as: *"run task **T** using agent **A** in workspace **W**."*
+
+The `owner:` field on a workflow status names the **agent** that handles the status — the orchestrator picks a free **workspace** to run it in based on machine constraints and declaration order. Workspaces are capacity; agents are roles; tasks are work.
+
 ## Context
 
 Shelbi today conflates two distinct ideas under the word "Agent":
@@ -17,7 +29,7 @@ The user means something more specific by "Agent": **an LLM run with a particula
 
 The workflow schema (`workflows/<name>.yaml`) already has the seam — every status has an `owner:` field, currently either `user` or `agent`. Today, statuses with `owner: agent` are handled by "whatever Claude pops out of `claude` with the project's CLAUDE.md as system prompt." We want to make that explicit: each agent-owned status names **which agent runs in it**, and the agent supplies the system prompt + skill set.
 
-This plan splits the two ideas. The sidebar gets renamed to reflect what it actually shows (capacity / slots / workers). "Agent" becomes a first-class concept stored on disk, configurable per-project, named directly in the workflow's `owner` field on each status.
+This plan splits the two ideas. The sidebar gets renamed to reflect what it actually shows (capacity / persistent slots) — see Vocabulary above — and reorganized to group those slots by their host machine. "Agent" becomes a first-class concept stored on disk, configurable per-project, named directly in the workflow's `owner` field on each status.
 
 ## Design
 
