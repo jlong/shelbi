@@ -24,10 +24,11 @@ mod workspace_status;
 mod workflows;
 
 pub use agent_workspaces::{
-    agent_instructions_path, agent_skills_dir, agent_workspace_dir,
-    materialize_default_agents, self_heal_default_agents, AgentMaterializeOutcome,
-    DEFAULT_AGENTS, DEFAULT_DEVELOPER_INSTRUCTIONS, DEFAULT_ORCHESTRATOR_INSTRUCTIONS,
-    DEVELOPER_AGENT, ORCHESTRATOR_AGENT,
+    agent_instructions_path, agent_skills_dir, agent_workspace_dir, count_agent_skills,
+    default_agent_body, is_default_agent, list_agents, materialize_default_agents,
+    self_heal_default_agents, AgentMaterializeOutcome, DEFAULT_AGENTS,
+    DEFAULT_DEVELOPER_INSTRUCTIONS, DEFAULT_ORCHESTRATOR_INSTRUCTIONS, DEVELOPER_AGENT,
+    ORCHESTRATOR_AGENT,
 };
 pub use hub_config::{
     hub_config_path, list_projects, load_hub_config, save_hub_config, touch_project_launched,
