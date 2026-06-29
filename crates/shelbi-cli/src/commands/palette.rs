@@ -28,6 +28,8 @@ use shelbi_state::keymap::{
 use shelbi_state::{load_user_config, ProjectSummary, ZenModeState, ZenToggleChord};
 use shelbi_tui::{decoration_to_color, App, Row, View, WorkspaceOverview};
 
+use super::zen_intro::{render_intro, step_intro, IntroOutcome, IntroState};
+
 pub fn run(project: String) -> Result<()> {
     // Load the merged keymaps before entering the alt-screen so any
     // parse / collision diagnostics land on the terminal the user can
@@ -55,6 +57,10 @@ pub fn run(project: String) -> Result<()> {
     //   because its cancel-path exits the palette (matches the prior
     //   single-shot UX for that entry); quit-project's bounce-back
     //   loop here intentionally diverges.
+    // - Toggle Zen (off → on, first time only) — intro popover. The
+    //   gate lives inside the loop body because the popover *may*
+    //   suppress the toggle entirely (Cancel) and we still want to
+    //   handle the don't-show-again checkbox uniformly.
     let (chosen, switch_target, quit_project_confirmed) = loop {
         let chosen = picker_loop(&mut term, &mut state, &keymaps);
         match &chosen {
@@ -68,6 +74,16 @@ pub fn run(project: String) -> Result<()> {
                 }
                 // Cancel: re-enter the main picker with state preserved.
                 continue;
+            }
+            Ok(Some(entry))
+                if entry.id == "action:toggle-zen"
+                    && should_show_zen_intro(&project) =>
+            {
+                handle_zen_intro_then_toggle(&mut term, &project, &keymaps)?;
+                // Toggle (or its suppression) was handled inline — we
+                // don't want the post-loop dispatch to fire a second
+                // `toggle_zen_mode` call.
+                break (Ok(None), None, false);
             }
             _ => break (chosen, None, false),
         }
@@ -548,6 +564,125 @@ where
         .status()
         .map(|s| s.success())
         .unwrap_or(false)
+}
+
+// ---------------------------------------------------------------------------
+// Zen Mode first-enable intro popover
+//
+// The popover gates the off → on transition when the user-level
+// `zen_intro_seen` flag is unset. Other transitions (paused → on, on →
+// off, on → paused) toggle immediately — once the user has *been* in
+// Zen, the explanation is redundant.
+
+/// Decide whether the user should see the intro popover for an
+/// `action:toggle-zen` invocation. True only when (a) the current
+/// project's Zen mode is Off — paused → on means the user already
+/// knew about Zen when they paused it — and (b) the user-level
+/// `zen_intro_seen` flag is still unset. A missing `state.json` (or
+/// `~/.shelbi/state.json`) defaults to "show": the gate degrades
+/// permissively so we never silently swallow the first-enable UI.
+fn should_show_zen_intro(project: &str) -> bool {
+    let project_off = shelbi_state::read_state(project)
+        .map(|s| s.zen_mode == ZenModeState::Off)
+        .unwrap_or(true);
+    if !project_off {
+        return false;
+    }
+    let intro_seen = shelbi_state::read_global_state()
+        .map(|s| s.zen_intro_seen)
+        .unwrap_or(false);
+    !intro_seen
+}
+
+/// Run the intro popover, then apply the user's choice. The render +
+/// IO step is wrapped here; the project-state side effects (toggle Zen,
+/// persist the flag) live in [`apply_zen_intro_result`] so they can be
+/// unit-tested without spinning up a terminal.
+fn handle_zen_intro_then_toggle<B: ratatui::backend::Backend>(
+    term: &mut Terminal<B>,
+    project: &str,
+    keymaps: &Keymaps,
+) -> Result<()> {
+    let outcome = run_zen_intro_popover(term, keymaps)?;
+    apply_zen_intro_result(project, outcome)
+}
+
+/// Apply the popover's exit signal to disk. On Confirm we toggle Zen
+/// (same canonical `toggle_zen_mode("user:palette")` event the inline
+/// dispatch fires); on Cancel we drop the toggle entirely. In both
+/// branches, if the "Don't show this again" checkbox was set we persist
+/// `zen_intro_seen = true` so the popover never re-fires — either
+/// choice acknowledges that the user has read the explanation.
+fn apply_zen_intro_result(project: &str, outcome: ZenIntroResult) -> Result<()> {
+    if outcome.dont_show_again {
+        // Best-effort — a write failure shouldn't block the toggle (the
+        // popover re-firing once more is much milder than swallowing
+        // the user's confirm action).
+        let _ = shelbi_state::mark_zen_intro_seen();
+    }
+    if outcome.confirmed {
+        shelbi_state::toggle_zen_mode(project, "user:palette")
+            .map_err(|e| anyhow::anyhow!(e))?;
+    }
+    Ok(())
+}
+
+/// Captures the popover's exit signal. Separate struct so the caller
+/// can treat the "did the user check the box" question independently
+/// of the confirm/cancel decision.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ZenIntroResult {
+    confirmed: bool,
+    dont_show_again: bool,
+}
+
+fn run_zen_intro_popover<B: ratatui::backend::Backend>(
+    term: &mut Terminal<B>,
+    keymaps: &Keymaps,
+) -> Result<ZenIntroResult> {
+    // The palette opener-as-close convention extends to the popover —
+    // re-pressing the palette chord while the intro is up exits as if
+    // the user cancelled. Matches the Quit popovers' behavior.
+    let opener_close = keymaps
+        .global
+        .first_chord_for(GlobalAction::OpenPalette)
+        .copied();
+
+    let mut state = IntroState::default();
+    loop {
+        let snapshot = state;
+        term.draw(|f| render_intro(f, f.area(), &snapshot))?;
+        if event::poll(Duration::from_millis(150))? {
+            if let Event::Key(k) = event::read()? {
+                if k.kind != KeyEventKind::Press {
+                    continue;
+                }
+                if let Some(c) = opener_close {
+                    if c == KeyChord::from_event(k) {
+                        return Ok(ZenIntroResult {
+                            confirmed: false,
+                            dont_show_again: state.dont_show_again,
+                        });
+                    }
+                }
+                match step_intro(&mut state, k) {
+                    IntroOutcome::Continue => {}
+                    IntroOutcome::Cancelled => {
+                        return Ok(ZenIntroResult {
+                            confirmed: false,
+                            dont_show_again: state.dont_show_again,
+                        });
+                    }
+                    IntroOutcome::Confirmed => {
+                        return Ok(ZenIntroResult {
+                            confirmed: true,
+                            dont_show_again: state.dont_show_again,
+                        });
+                    }
+                }
+            }
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1137,6 +1272,242 @@ mod tests {
                 e.decoration
             );
         }
+    }
+
+    // ---- Zen intro popover gate + apply -----------------------------------
+    //
+    // These exercise the two project-state helpers wrapping the popover:
+    //  - `should_show_zen_intro` — gating decision (acceptance criteria f, g).
+    //  - `apply_zen_intro_result` — Confirm/Cancel side effects + flag
+    //    persistence (acceptance criteria b, c, d, e).
+    //
+    // The popover state machine itself lives in `commands::zen_intro` and is
+    // covered by the pure-data tests in that module.
+
+    use super::super::test_support::ENV_LOCK;
+    use shelbi_state::{
+        mark_zen_intro_seen, read_global_state, read_state, write_state, ZenModeState,
+    };
+    use std::path::PathBuf;
+
+    fn fresh_home() -> PathBuf {
+        let p = std::env::temp_dir().join(format!(
+            "shelbi-palette-zen-intro-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&p).unwrap();
+        p
+    }
+
+    /// Seed the project dir so `read_state`/`write_state` have somewhere
+    /// to land. Mirrors how the real palette would be invoked — a
+    /// `state.json` may or may not exist yet but the project itself does.
+    fn seed_project(home: &std::path::Path, name: &str) {
+        let p = home.join("projects").join(name);
+        std::fs::create_dir_all(&p).unwrap();
+    }
+
+    #[test]
+    fn intro_shows_on_fresh_state_with_zen_off() {
+        // Acceptance (a): first enable on a fresh `~/.shelbi/state.json` —
+        // zen_mode is Off (no `state.json` yet) AND zen_intro_seen is
+        // unset, so the popover gate fires.
+        let _g = ENV_LOCK.lock().unwrap();
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+        seed_project(&home, "demo");
+
+        assert!(
+            should_show_zen_intro("demo"),
+            "fresh state must trigger the intro popover"
+        );
+
+        std::env::remove_var("SHELBI_HOME");
+    }
+
+    #[test]
+    fn intro_is_skipped_once_zen_intro_seen_is_set() {
+        // Acceptance (f): subsequent enables with the flag set skip the
+        // popover entirely — the toggle should fall through to the
+        // normal dispatch path.
+        let _g = ENV_LOCK.lock().unwrap();
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+        seed_project(&home, "demo");
+
+        mark_zen_intro_seen().unwrap();
+        assert!(
+            !should_show_zen_intro("demo"),
+            "with zen_intro_seen=true the gate must say skip the popover"
+        );
+
+        std::env::remove_var("SHELBI_HOME");
+    }
+
+    #[test]
+    fn intro_is_skipped_when_zen_is_paused_or_already_on() {
+        // Acceptance (g): paused → on (and on → off / on → paused)
+        // never trigger the popover. The user knew about Zen when they
+        // paused / turned it on the first time, so re-explaining is
+        // noise. We check both non-Off states to pin the gate.
+        let _g = ENV_LOCK.lock().unwrap();
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+        seed_project(&home, "demo");
+
+        for non_off in [ZenModeState::Paused, ZenModeState::On] {
+            let mut s = read_state("demo").unwrap();
+            s.zen_mode = non_off;
+            write_state("demo", &s).unwrap();
+            assert!(
+                !should_show_zen_intro("demo"),
+                "zen_mode={non_off:?} must not trigger the popover"
+            );
+        }
+
+        std::env::remove_var("SHELBI_HOME");
+    }
+
+    #[test]
+    fn apply_cancel_does_not_toggle_zen() {
+        // Acceptance (b): Cancel closes the popover without enabling Zen.
+        // No `mode=zen` event line should land in the activity log either.
+        let _g = ENV_LOCK.lock().unwrap();
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+        seed_project(&home, "demo");
+
+        apply_zen_intro_result(
+            "demo",
+            ZenIntroResult {
+                confirmed: false,
+                dont_show_again: false,
+            },
+        )
+        .unwrap();
+
+        // Zen mode untouched.
+        let state = read_state("demo").unwrap_or_default();
+        assert_eq!(state.zen_mode, ZenModeState::Off);
+        // No event line was logged. The events log may or may not exist
+        // — either way it must not mention `mode=zen`.
+        let evt = shelbi_state::events_log_path().unwrap();
+        if evt.exists() {
+            let log = std::fs::read_to_string(&evt).unwrap();
+            assert!(
+                !log.contains("mode=zen"),
+                "Cancel must not emit a mode=zen event; got {log}"
+            );
+        }
+        // And the flag is still unset — cancel without checkbox doesn't
+        // mark seen.
+        assert!(!read_global_state().unwrap().zen_intro_seen);
+
+        std::env::remove_var("SHELBI_HOME");
+    }
+
+    #[test]
+    fn apply_confirm_toggles_zen_on_and_emits_event() {
+        // Acceptance (c): Confirm enables Zen and emits the canonical
+        // event line tagged with `user:palette` so the activity feed
+        // can attribute the toggle to the palette source.
+        let _g = ENV_LOCK.lock().unwrap();
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+        seed_project(&home, "demo");
+
+        apply_zen_intro_result(
+            "demo",
+            ZenIntroResult {
+                confirmed: true,
+                dont_show_again: false,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(read_state("demo").unwrap().zen_mode, ZenModeState::On);
+        let log = std::fs::read_to_string(shelbi_state::events_log_path().unwrap()).unwrap();
+        assert!(
+            log.lines()
+                .any(|l| l.contains("mode=zen off -> on reason=user:palette")),
+            "missing canonical palette-toggle event in: {log}"
+        );
+
+        std::env::remove_var("SHELBI_HOME");
+    }
+
+    #[test]
+    fn apply_confirm_with_checkbox_persists_the_flag() {
+        // Acceptance (d): checkbox-then-Confirm both enables Zen and
+        // persists the flag so the popover never re-fires.
+        let _g = ENV_LOCK.lock().unwrap();
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+        seed_project(&home, "demo");
+
+        apply_zen_intro_result(
+            "demo",
+            ZenIntroResult {
+                confirmed: true,
+                dont_show_again: true,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(read_state("demo").unwrap().zen_mode, ZenModeState::On);
+        assert!(
+            read_global_state().unwrap().zen_intro_seen,
+            "checkbox + Confirm must persist zen_intro_seen=true"
+        );
+        // Gate now says skip — second enable from off goes straight
+        // through.
+        let mut s = read_state("demo").unwrap();
+        s.zen_mode = ZenModeState::Off;
+        write_state("demo", &s).unwrap();
+        assert!(!should_show_zen_intro("demo"));
+
+        std::env::remove_var("SHELBI_HOME");
+    }
+
+    #[test]
+    fn apply_cancel_with_checkbox_persists_the_flag_but_does_not_toggle() {
+        // Acceptance (e): checkbox-then-Cancel persists the flag — the
+        // user has read the explanation and explicitly opted out of
+        // seeing it again, even though they didn't enable Zen this time.
+        let _g = ENV_LOCK.lock().unwrap();
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+        seed_project(&home, "demo");
+
+        apply_zen_intro_result(
+            "demo",
+            ZenIntroResult {
+                confirmed: false,
+                dont_show_again: true,
+            },
+        )
+        .unwrap();
+
+        // Zen stays off.
+        let state = read_state("demo").unwrap_or_default();
+        assert_eq!(state.zen_mode, ZenModeState::Off);
+        // But the flag is now set.
+        assert!(read_global_state().unwrap().zen_intro_seen);
+        // No event line either.
+        let evt = shelbi_state::events_log_path().unwrap();
+        if evt.exists() {
+            let log = std::fs::read_to_string(&evt).unwrap();
+            assert!(
+                !log.contains("mode=zen"),
+                "checkbox-then-Cancel must not emit a mode=zen event; got {log}"
+            );
+        }
+
+        std::env::remove_var("SHELBI_HOME");
     }
 }
 
