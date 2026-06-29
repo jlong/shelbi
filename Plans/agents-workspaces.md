@@ -197,19 +197,19 @@ For projects with a richer workflow, custom agents bind via the same two fields:
 
 When the orchestrator dispatches a task to a worker, it now resolves three things:
 
-1. **Which worker?** Same logic as today — first free worker in declaration order, honoring `prefers_machine`.
-2. **Which agent?** Look up the task's current status in the workflow; read its `owner:` field. If `user`, no dispatch (this status is human-driven). Otherwise the value IS the agent name.
-3. **Spawn the worker pane with that agent's context.**
+1. **Which workspace?** Same logic as today — first free workspace in declaration order, honoring `prefers_machine`.
+2. **Which agent?** Look up the task's current status in the workflow. Check `owner:` — if `user` AND no automation mode is active (Zen off), no dispatch (this status is human-driven by design). Otherwise read the `agent:` field; that's the agent to spawn. If `owner: user` and the status has no `agent:` field, no dispatch even under Zen — that status is fully human-driven.
+3. **Spawn the workspace pane with that agent's context.**
 
-"Spawning with the agent's context" means: when `shelbi task start` spawns Claude in the worker's tmux pane, it:
+"Spawning with the agent's context" means: when `shelbi task start` spawns Claude in the workspace's tmux pane, it:
 
 - Passes `--system-prompt $(cat agents/<agent>/instructions.md)` (or equivalent).
 
-- Mounts the agent's `skills/` directory into the worker's `.claude/skills/` (symlink or copy) so the skill files are discoverable by Claude Code's skills mechanism.
+- Mounts the agent's `skills/` directory into the workspace's `.claude/skills/` (symlink or copy) so the skill files are discoverable by Claude Code's skills mechanism.
 
-- Drops the existing project `CLAUDE.md` mechanism for worker spawns — the agent's `instructions.md` is the source of truth. (`CLAUDE.md` stays for the Orchestrator agent until it's fully migrated to `agents/orchestrator/instructions.md`.)
+- Drops the existing project `CLAUDE.md` mechanism for workspace spawns — the agent's `instructions.md` is the source of truth. (`CLAUDE.md` stays for the Orchestrator agent until it's fully migrated to `agents/orchestrator/instructions.md`.)
 
-The same worker slot can run different agents on consecutive dispatches. Today switching tasks already clears the worker's context; switching agents is the same flush plus a different system prompt.
+The same workspace slot can run different agents on consecutive dispatches. Today switching tasks already clears the workspace's context; switching agents is the same flush plus a different system prompt.
 
 ### 6. Project overrides + defaults
 
