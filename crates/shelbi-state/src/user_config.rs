@@ -12,6 +12,7 @@ use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
 use shelbi_core::Result;
 
+use crate::keymap::KeyChord;
 use crate::{atomic_write, ensure_dir, shelbi_home};
 
 /// Path to `~/.shelbi/config.yaml` (or `$SHELBI_HOME/config.yaml`).
@@ -90,6 +91,20 @@ impl ZenToggleChord {
             ZenToggleChord::CtrlG => Some("^G"),
             ZenToggleChord::CtrlShiftZ => Some("^⇧Z"),
             ZenToggleChord::None => None,
+        }
+    }
+
+    /// Map a resolved [`KeyChord`] back to the four-value preset enum
+    /// used by the sidebar glyph and palette hint. Returns `None` for
+    /// arbitrary chords the enum can't represent (e.g. `f6`,
+    /// `ctrl-alt-shift-x`) so callers can fall back to a sane default.
+    pub fn from_chord(chord: &KeyChord) -> Option<ZenToggleChord> {
+        match chord.canonical().as_str() {
+            "alt-z" => Some(ZenToggleChord::AltZ),
+            "ctrl-\\" => Some(ZenToggleChord::CtrlBackslash),
+            "ctrl-g" => Some(ZenToggleChord::CtrlG),
+            "ctrl-shift-z" => Some(ZenToggleChord::CtrlShiftZ),
+            _ => None,
         }
     }
 }

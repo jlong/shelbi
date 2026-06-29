@@ -133,9 +133,14 @@ pub struct App {
     /// Latest Zen Mode state read from `state.json`. Drives the green pill
     /// in the lower-left status block and the Alt+Z toggle direction.
     pub zen_mode: ZenModeState,
-    /// Chord that toggles Zen Mode — picked by the first-run probe, loaded
-    /// from `~/.shelbi/config.yaml::keymap.zen_toggle`. Defaults to Alt+Z
-    /// before the probe runs (matches the fresh-install spec).
+    /// Chord that toggles Zen Mode — resolved from
+    /// `keys.yml::defaults.global.zen_toggle` via
+    /// [`Keymaps::zen_toggle_chord`], falling back to the legacy
+    /// `~/.shelbi/config.yaml::keymap.zen_toggle` for chords the
+    /// four-value preset enum can't represent. Defaults to Alt+Z before
+    /// any of those layers have been read.
+    ///
+    /// [`Keymaps::zen_toggle_chord`]: shelbi_state::keymap::Keymaps::zen_toggle_chord
     pub zen_toggle_chord: ZenToggleChord,
     /// Merged keymaps for every TUI mode — populated once at startup by
     /// `run_sidebar` calling [`shelbi_state::keymap::load_keymaps`]. The

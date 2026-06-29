@@ -39,7 +39,7 @@ pub fn run(project: String) -> Result<()> {
     }
 
     let mut term = setup_terminal()?;
-    let mut state = State::new(&project)?;
+    let mut state = State::new(&project, &keymaps)?;
 
     // Sub-screens share the palette's alt-screen so the follow-up
     // surface is a re-render rather than a popup-pane flash:
@@ -106,20 +106,23 @@ struct State {
 }
 
 impl State {
-    fn new(project: &str) -> Result<Self> {
+    fn new(project: &str, keymaps: &Keymaps) -> Result<Self> {
         // Lean on the sidebar's `App` for the row list — same icons,
         // same status decorations, same data source. Anything that
         // changes how the sidebar paints a destination automatically
         // shows up in the palette on the next open.
         let mut app = App::new_sidebar(project);
         app.refresh().ok();
-        // The chord lives in user config (loaded by the sidebar via its
-        // first-run probe, not by `App::refresh`), so the palette has
-        // to read it separately. Defaults to Alt+Z on missing config —
-        // same fallback the probe uses on cooperative terminals.
-        let chord = load_user_config()
+        // Resolve the Zen toggle chord. Prefer the keys.yml binding
+        // (canonical source of truth after the legacy migration); fall
+        // back to the legacy `config.yaml` field for non-preset chords
+        // the four-value enum can't represent. Defaults to Alt+Z on a
+        // missing config — same fallback the probe uses on cooperative
+        // terminals.
+        let legacy = load_user_config()
             .map(|c| c.keymap.zen_toggle)
             .unwrap_or(ZenToggleChord::AltZ);
+        let chord = keymaps.zen_toggle_chord(legacy);
         let all_entries = build_entries(&app, app.zen_mode, chord);
         Ok(Self {
             query: String::new(),
