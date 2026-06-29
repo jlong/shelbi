@@ -450,13 +450,6 @@ pub struct State {
     /// survives a respawn or project switch.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workspace_filter: Option<String>,
-    /// Persisted Kanban workflow filter — `None` means "All workflows"
-    /// (All-mode rendering). When set to a workflow name, the board
-    /// narrows to that workflow's columns only. Same lifecycle as
-    /// `workspace_filter`: written by the dropdown commit path, read on
-    /// every refresh.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub workflow_filter: Option<String>,
     /// Default-agent names whose `instructions.md` we've already
     /// observed to differ from the bundled template. `shelbi reload`'s
     /// self-heal path uses this to fire its "you've customized this
@@ -938,16 +931,6 @@ pub fn set_zen_mode(project: &str, target: ZenModeState, source: &str) -> Result
 pub fn set_workspace_filter(project: &str, filter: Option<&str>) -> Result<()> {
     let mut state = read_state(project)?;
     state.workspace_filter = filter.map(|s| s.to_string());
-    write_state(project, &state)
-}
-
-/// Persist the Kanban workflow filter for `project`. `None` clears it
-/// back to "All workflows" (All-mode union rendering). Mirrors
-/// [`set_workspace_filter`] — same merge-then-write pattern, no event log
-/// entry.
-pub fn set_workflow_filter(project: &str, filter: Option<&str>) -> Result<()> {
-    let mut state = read_state(project)?;
-    state.workflow_filter = filter.map(|s| s.to_string());
     write_state(project, &state)
 }
 

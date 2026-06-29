@@ -95,11 +95,13 @@ pub struct KanbanApp {
     /// workflow declares — still in `statuses.yml` order. Rebuilt each
     /// refresh.
     pub all_columns: Vec<KanbanColumn>,
-    /// Active workflow filter — `None` means "All workflows" (the union
-    /// All-mode view). When `Some(name)`, [`KanbanApp::all_columns`] is
-    /// narrowed to that single workflow's columns and tasks belonging
-    /// to other workflows drop out of the board. Persisted to
-    /// `state.json::workflow_filter` so the chip survives a respawn.
+    /// Active workflow filter — `None` means "All workflows" (the
+    /// all-view rendering). When `Some(name)`,
+    /// [`KanbanApp::all_columns`] is narrowed to that single workflow's
+    /// columns and tasks belonging to other workflows drop out of the
+    /// board. **Per-session, not persisted** — a `shelbi reload` returns
+    /// the user to "All". The filter is a momentary view choice, not a
+    /// preference worth surviving across runs.
     pub workflow_filter: Option<String>,
     /// When `Some`, the workflow filter dropdown is open. Same
     /// modal-cursor shape as [`KanbanApp::workspace_dropdown`] — selection
@@ -453,7 +455,18 @@ impl KanbanApp {
     /// whose declared workflow is missing from `self.workflows` fall
     /// back to the legacy [`Column`]-derived id so they still show up
     /// somewhere instead of vanishing.
+    ///
+    /// When [`Self::workflow_filter`] is set, tasks whose
+    /// `workflow_or_default()` doesn't match are filtered out — even
+    /// if their resolved status id matches a visible column. This is
+    /// what makes the filter actually narrow the board (otherwise two
+    /// workflows that both declare `review` would share that column).
     fn task_belongs_to(&self, task: &Task, ac: &KanbanColumn) -> bool {
+        if let Some(name) = &self.workflow_filter {
+            if task.workflow_or_default() != name.as_str() {
+                return false;
+            }
+        }
         self.resolved_status_id(task) == ac.status_id
     }
 
@@ -508,17 +521,17 @@ impl KanbanApp {
         self.workspaces = shelbi_state::load_project(&self.project_name)
             .map(|p| p.workspaces.into_iter().map(|w| w.name).collect())
             .unwrap_or_default();
-        // Filter is purely view state — a missing / unreadable
-        // state.json falls back to "All" silently. Reload every tick so
-        // a CLI or palette edit shows up without a respawn.
+        // Workspace filter is persisted view state — a missing /
+        // unreadable state.json falls back to "All" silently. Reload
+        // every tick so a CLI or palette edit shows up without a
+        // respawn. The workflow filter is intentionally NOT loaded
+        // here: it's per-session by design (resets on `shelbi reload`),
+        // matching how the column-scroll position is per-session.
         let state_snapshot = shelbi_state::read_state(&self.project_name).ok();
         self.workspace_filter = state_snapshot
             .as_ref()
             .and_then(|s| s.workspace_filter.clone())
             .map(|s| WorkspaceFilter::from_disk(&s));
-        self.workflow_filter = state_snapshot
-            .as_ref()
-            .and_then(|s| s.workflow_filter.clone());
         // Workflows are still loaded — per-task overlays and the move
         // semantics need them — but they no longer drive the column
         // layout. A broken `workflows/<name>.yaml` surfaces as a
@@ -796,17 +809,43 @@ impl KanbanApp {
         self.close_workflow_dropdown();
     }
 
-    /// Persist `filter` as the active workflow filter, rebuild
-    /// `all_columns`, and clamp selection so it lands on an existing
-    /// column after the layout shrinks. Mirrors [`apply_filter`] for
-    /// the workspace filter.
-    fn apply_workflow_filter(&mut self, filter: Option<String>) {
-        self.workflow_filter = filter.clone();
-        if let Err(e) =
-            shelbi_state::set_workflow_filter(&self.project_name, filter.as_deref())
-        {
-            self.status_line = format!("workflow filter persist failed: {e}");
+    /// Cycle the workflow filter through `None → workflows[0] →
+    /// workflows[1] → ... → None`. Bound to
+    /// [`KanbanAction::CycleWorkflowFilter`] (default chord `tab`) so a
+    /// keyboard user can narrow the board without opening the dropdown.
+    /// A single-workflow project cycles between `None` and that one
+    /// workflow — degenerate but harmless.
+    pub fn cycle_workflow_filter(&mut self) {
+        if self.workflows.is_empty() {
+            return;
         }
+        let next = match &self.workflow_filter {
+            None => Some(self.workflows[0].name.clone()),
+            Some(current) => {
+                let pos = self.workflows.iter().position(|w| &w.name == current);
+                match pos {
+                    Some(i) if i + 1 < self.workflows.len() => {
+                        Some(self.workflows[i + 1].name.clone())
+                    }
+                    // Cycled past the last workflow, or the active
+                    // filter targets a workflow that no longer exists —
+                    // wrap back to "All" so the user always reaches the
+                    // unfiltered view.
+                    _ => None,
+                }
+            }
+        };
+        self.apply_workflow_filter(next);
+    }
+
+    /// Set `filter` as the active workflow filter, rebuild
+    /// `all_columns`, and clamp selection so it lands on an existing
+    /// column after the layout shrinks. Filter state is in-memory only
+    /// — it deliberately doesn't survive a `shelbi reload` (mirrors how
+    /// the column-scroll position is per-session). Mirrors
+    /// [`apply_filter`] for the workspace filter otherwise.
+    fn apply_workflow_filter(&mut self, filter: Option<String>) {
+        self.workflow_filter = filter;
         self.all_columns = self.compute_all_columns();
         // Selection may sit past the new column count — clamp before
         // the next render reads it. Selection-driven scroll updates
@@ -1626,15 +1665,15 @@ fn render_column(
 }
 
 fn render_footer(f: &mut Frame, app: &KanbanApp, area: Rect) {
-    // Nav / move / reorder / open / refresh glyphs come from the merged
-    // keymaps, rendered in the host platform's convention. `workflow` and
-    // `filter` aren't keymap-driven actions (the dropdowns own those keys),
-    // so they stay literal. Multi-bound actions show their first chord.
+    // Nav / move / reorder / open / refresh / workflow glyphs come from
+    // the merged keymaps, rendered in the host platform's convention.
+    // `filter` (workspace dropdown) is still ad-hoc on `f`, so it stays
+    // literal. Multi-bound actions show their first chord.
     let km = app.keymaps();
     let style = app.display_style();
     let fc = |c| format_chord_or_unbound(c, style);
     let text = format!(
-        "  {}/{} col   {}/{} row   {} open   {}/{} move col   {}/{} reorder   w workflow   f filter   {} refresh",
+        "  {}/{} col   {}/{} row   {} open   {}/{} move col   {}/{} reorder   {} workflow   f filter   {} refresh",
         fc(km.kanban.first_chord_for(KanbanAction::NavLeft)),
         fc(km.kanban.first_chord_for(KanbanAction::NavRight)),
         fc(km.kanban.first_chord_for(KanbanAction::NavDown)),
@@ -1644,6 +1683,7 @@ fn render_footer(f: &mut Frame, app: &KanbanApp, area: Rect) {
         fc(km.kanban.first_chord_for(KanbanAction::MoveCardRight)),
         fc(km.kanban.first_chord_for(KanbanAction::ReorderUp)),
         fc(km.kanban.first_chord_for(KanbanAction::ReorderDown)),
+        fc(km.kanban.first_chord_for(KanbanAction::CycleWorkflowFilter)),
         fc(km.kanban.first_chord_for(KanbanAction::Refresh)),
     );
     let keys = Line::from(Span::styled(text, Style::default().fg(Color::DarkGray)));
@@ -2819,11 +2859,12 @@ mod tests {
         );
     }
 
-    /// The board footer sources every nav/move/reorder/open/refresh glyph
-    /// from the merged keymaps and renders it in the host platform's
-    /// convention. Pinning the Linux spelling guards the action→slot
-    /// mapping (a swapped `MoveCardLeft`/`Right` would surface here) and
-    /// confirms `workflow`/`filter` stay literal.
+    /// The board footer sources every nav/move/reorder/open/refresh/
+    /// workflow glyph from the merged keymaps and renders it in the
+    /// host platform's convention. Pinning the Linux spelling guards
+    /// the action→slot mapping (a swapped `MoveCardLeft`/`Right` would
+    /// surface here) and confirms `filter` stays literal (the
+    /// workspace-filter dropdown is still ad-hoc).
     #[test]
     fn board_footer_renders_chords_from_keymaps() {
         use ratatui::{backend::TestBackend, Terminal};
@@ -2842,6 +2883,7 @@ mod tests {
             (KanbanAction::ReorderUp, "K"),
             (KanbanAction::ReorderDown, "J"),
             (KanbanAction::Refresh, "r"),
+            (KanbanAction::CycleWorkflowFilter, "tab"),
         ] {
             app.keymaps
                 .kanban
@@ -2865,7 +2907,7 @@ mod tests {
         assert!(
             joined.contains(
                 "h/l col   j/k row   Enter open   Shift+h/Shift+l move col   \
-                 Shift+k/Shift+j reorder   w workflow   f filter   r refresh"
+                 Shift+k/Shift+j reorder   Tab workflow   f filter   r refresh"
             ),
             "footer mismatch in:\n{joined}"
         );
@@ -3360,6 +3402,190 @@ mod tests {
         assert!(app.workflow_dropdown_is_open());
         app.toggle_workflow_dropdown();
         assert!(!app.workflow_dropdown_is_open());
+    }
+
+    /// Default filter state on a fresh app is `None` — the "All
+    /// workflows" view. Acceptance criterion: cycling starts from the
+    /// unfiltered state.
+    #[test]
+    fn workflow_filter_defaults_to_all() {
+        let app = KanbanApp::new("demo");
+        assert!(app.workflow_filter.is_none(), "fresh app starts at All");
+    }
+
+    /// `cycle_workflow_filter` walks `None → workflows[0] →
+    /// workflows[1] → ... → None`, in the order workflows are loaded.
+    /// Wrapping past the last workflow returns to `None` so the user
+    /// always reaches the unfiltered view exactly once per cycle.
+    #[test]
+    fn cycle_workflow_filter_walks_all_then_each_workflow_then_wraps() {
+        let mut app = KanbanApp::new("demo");
+        app.workflows = vec![
+            default_workflow(),
+            workflow_using("design-review", &["backlog", "in-progress", "done"]),
+        ];
+        app.project_statuses = default_project_statuses();
+        app.all_columns = app.compute_all_columns();
+        assert!(app.workflow_filter.is_none(), "starts at All");
+
+        app.cycle_workflow_filter();
+        assert_eq!(app.workflow_filter.as_deref(), Some("default"));
+
+        app.cycle_workflow_filter();
+        assert_eq!(app.workflow_filter.as_deref(), Some("design-review"));
+
+        app.cycle_workflow_filter();
+        assert!(app.workflow_filter.is_none(), "wraps to All");
+
+        // And cycles again from All — proves the wrap is stable.
+        app.cycle_workflow_filter();
+        assert_eq!(app.workflow_filter.as_deref(), Some("default"));
+    }
+
+    /// `cycle_workflow_filter` from a filter that targets a workflow
+    /// no longer loaded jumps back to `None` rather than getting
+    /// stuck — the user can always cycle out of a stale chip.
+    #[test]
+    fn cycle_workflow_filter_from_stale_filter_returns_to_all() {
+        let mut app = KanbanApp::new("demo");
+        app.workflows = vec![default_workflow()];
+        app.workflow_filter = Some("removed".into());
+        app.cycle_workflow_filter();
+        assert!(app.workflow_filter.is_none());
+    }
+
+    /// `cycle_workflow_filter` with no workflows loaded (the loader
+    /// surfaced an error and `self.workflows` is empty) is a no-op so
+    /// the keybinding can't panic.
+    #[test]
+    fn cycle_workflow_filter_no_workflows_loaded_is_noop() {
+        let mut app = KanbanApp::new("demo");
+        app.workflows = Vec::new();
+        app.workflow_filter = None;
+        app.cycle_workflow_filter();
+        assert!(app.workflow_filter.is_none());
+    }
+
+    /// With a workflow filter active, `column_tasks` hides cards whose
+    /// `workflow:` frontmatter doesn't match — even when their resolved
+    /// status id matches a visible column. Two workflows that both
+    /// declare `backlog` would otherwise share that column; the filter
+    /// is what narrows the board to one workflow's cards.
+    #[test]
+    fn column_tasks_hides_other_workflow_cards_when_filter_set() {
+        let mut app = KanbanApp::new("demo");
+        app.workflows = vec![
+            default_workflow(),
+            // design-review shares `backlog` with the default workflow.
+            workflow_using("design-review", &["backlog", "in-progress", "done"]),
+        ];
+        app.project_statuses = default_project_statuses();
+        app.workflow_filter = Some("design-review".into());
+        app.all_columns = app.compute_all_columns();
+        app.tasks = vec![
+            // Default-workflow card in Backlog — design-review also has
+            // a `backlog` column, so without the workflow check this
+            // card would leak in.
+            task_in_workflow("default-card", Column::Backlog, None, "2026-06-20T10:00:00Z"),
+            // design-review card in Backlog — should be the only card
+            // visible in the backlog column.
+            task_in_workflow(
+                "dr-card",
+                Column::Backlog,
+                Some("design-review"),
+                "2026-06-20T10:00:00Z",
+            ),
+        ];
+
+        let backlog_idx = app
+            .all_columns
+            .iter()
+            .position(|c| c.status_id == "backlog")
+            .expect("design-review declares backlog");
+        let ids: Vec<&str> = app
+            .column_tasks(backlog_idx)
+            .iter()
+            .map(|tf| tf.task.id.as_str())
+            .collect();
+        assert_eq!(
+            ids,
+            vec!["dr-card"],
+            "default-workflow card must be hidden by the design-review filter"
+        );
+    }
+
+    /// Empty columns still render under a single-workflow filter — the
+    /// Phase 2 stable-layout decision. If design-review declares
+    /// `backlog, in-progress, done` and only `in-progress` has cards,
+    /// the other two columns still appear as empty headers.
+    #[test]
+    fn empty_columns_render_under_workflow_filter() {
+        let mut app = KanbanApp::new("demo");
+        app.workflows = vec![
+            default_workflow(),
+            workflow_using("design-review", &["backlog", "in-progress", "done"]),
+        ];
+        app.project_statuses = default_project_statuses();
+        app.workflow_filter = Some("design-review".into());
+        app.all_columns = app.compute_all_columns();
+        app.tasks = vec![task_in_workflow(
+            "dr",
+            Column::InProgress,
+            Some("design-review"),
+            "2026-06-20T10:00:00Z",
+        )];
+
+        let ids: Vec<&str> = app.all_columns.iter().map(|c| c.status_id.as_str()).collect();
+        assert_eq!(
+            ids,
+            vec!["backlog", "in-progress", "done"],
+            "all three of the filtered workflow's statuses paint"
+        );
+        let counts: Vec<usize> = (0..app.all_columns.len())
+            .map(|i| app.column_tasks(i).len())
+            .collect();
+        assert_eq!(counts, vec![0, 1, 0], "empty columns persist alongside the populated one");
+    }
+
+    /// Filter state is in-memory only — `apply_workflow_filter` must
+    /// not touch `state.json`. Acceptance criterion: filter resets on
+    /// `shelbi reload` (the orchestrator-side relaunch path), so it
+    /// can't be written to the cross-session state file.
+    #[test]
+    fn apply_workflow_filter_does_not_write_state_json() {
+        let _g = crate::test_support::ENV_LOCK.lock().unwrap();
+        let tmp = std::env::temp_dir().join(format!(
+            "shelbi-kanban-workflow-filter-noop-persist-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&tmp).unwrap();
+        std::env::set_var("SHELBI_HOME", &tmp);
+        // Project dir must exist for `read_state` not to error, but
+        // the state.json itself shouldn't be created by setting the
+        // filter — that's the contract under test.
+        let proj_dir = tmp.join("projects").join("demo");
+        std::fs::create_dir_all(&proj_dir).unwrap();
+
+        let mut app = KanbanApp::new("demo");
+        app.workflows = vec![
+            default_workflow(),
+            workflow_using("design-review", &["backlog", "in-progress", "done"]),
+        ];
+        app.project_statuses = default_project_statuses();
+        app.cycle_workflow_filter();
+        assert_eq!(app.workflow_filter.as_deref(), Some("default"));
+
+        let state_file = proj_dir.join("state.json");
+        assert!(
+            !state_file.exists(),
+            "workflow filter must NOT be persisted; state.json should not be created"
+        );
+
+        std::env::remove_var("SHELBI_HOME");
     }
 
     // ---- collapse-empty + horizontal scroll ------------------------------

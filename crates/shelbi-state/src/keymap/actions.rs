@@ -57,6 +57,7 @@ pub enum KanbanAction {
     ReorderDown,
     OpenPopover,
     Refresh,
+    CycleWorkflowFilter,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -138,6 +139,9 @@ impl Action {
                 KanbanAction::ReorderDown => "Kanban: reorder card down within column",
                 KanbanAction::OpenPopover => "Kanban: open card popover",
                 KanbanAction::Refresh => "Kanban: refresh",
+                KanbanAction::CycleWorkflowFilter => {
+                    "Kanban: cycle workflow filter (All → wf1 → wf2 → All)"
+                }
             },
             Action::Popover(a) => match a {
                 PopoverAction::Close => "Popover: close",
@@ -213,6 +217,7 @@ impl Action {
                 KanbanAction::ReorderDown => &["J", "shift-down"],
                 KanbanAction::OpenPopover => &["enter", "space"],
                 KanbanAction::Refresh => &["r"],
+                KanbanAction::CycleWorkflowFilter => &["tab"],
             },
             Action::Popover(a) => match a {
                 PopoverAction::Close => &["esc", "enter", "space", "q"],
@@ -296,6 +301,7 @@ impl Action {
                 KanbanAction::ReorderDown => "reorder_down",
                 KanbanAction::OpenPopover => "open_popover",
                 KanbanAction::Refresh => "refresh",
+                KanbanAction::CycleWorkflowFilter => "cycle_workflow_filter",
             },
             Action::Popover(a) => match a {
                 PopoverAction::Close => "close",
@@ -365,6 +371,7 @@ impl Action {
             KanbanAction::ReorderDown,
             KanbanAction::OpenPopover,
             KanbanAction::Refresh,
+            KanbanAction::CycleWorkflowFilter,
         ];
         const POPOVER: &[PopoverAction] = &[
             PopoverAction::Close,

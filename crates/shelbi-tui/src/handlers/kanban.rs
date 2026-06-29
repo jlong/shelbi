@@ -94,6 +94,7 @@ pub fn handle_kanban_key(app: &mut KanbanApp, key: KeyEvent, km: &Keymaps) -> Ou
         Some(KanbanAction::ReorderDown) => app.reorder_down(),
         Some(KanbanAction::OpenPopover) => app.open_popover(),
         Some(KanbanAction::Refresh) => app.refresh(),
+        Some(KanbanAction::CycleWorkflowFilter) => app.cycle_workflow_filter(),
         None => {
             // The dropdown toggles live outside the action enum for now —
             // dropdown-open is a transient UI mode, not a stand-alone
@@ -394,6 +395,36 @@ mod tests {
 
         let out = handle_kanban_key(&mut app, key(KeyCode::Char('x')), &km);
         assert_eq!(out, Outcome::Continue);
+
+        std::env::remove_var("SHELBI_HOME");
+    }
+
+    #[test]
+    fn default_tab_chord_dispatches_to_cycle_workflow_filter() {
+        // Acceptance criterion: a keybinding cycles through the
+        // available workflows + an "All" state, going through the
+        // KanbanAction enum (not the ad-hoc match the dropdown uses).
+        // Tab is the default chord; this pins the route from the
+        // dispatcher to the action so a future rebinding only changes
+        // the chord, not the wiring.
+        let _g = ENV_LOCK.lock().unwrap();
+        let km = fresh_keymaps();
+        assert_eq!(
+            km.kanban.dispatch(key(KeyCode::Tab)),
+            Some(KanbanAction::CycleWorkflowFilter)
+        );
+
+        // And the handler routes that action to the cycle method —
+        // observe the side effect on `workflow_filter` via the
+        // KanbanApp's pre-seeded default workflow.
+        let mut app = KanbanApp::new("demo");
+        assert!(app.workflow_filter.is_none(), "fresh app starts at All");
+        handle_kanban_key(&mut app, key(KeyCode::Tab), &km);
+        assert_eq!(
+            app.workflow_filter.as_deref(),
+            Some("default"),
+            "Tab advances filter past All into the first loaded workflow"
+        );
 
         std::env::remove_var("SHELBI_HOME");
     }
