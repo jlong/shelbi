@@ -153,6 +153,61 @@ export function BlockDivider({
 }
 
 /**
+ * Source of truth for the SVG wordmark asset and its native aspect.
+ * The actual artwork lives at `public/wordmark.svg`; we reference it
+ * here so the Header / Hero stay in sync if the path or art moves.
+ *
+ * The SVG itself uses `fill="currentColor"`, but `<img>` strips that
+ * because the file is rendered as a separate document. We render the
+ * mark via a CSS `mask` so the visible color comes from the host
+ * element's `background-color: currentColor` — themes keep working.
+ */
+export const WORDMARK_SVG_PATH = "/wordmark.svg"
+export const WORDMARK_SVG_ASPECT = "684 / 108"
+
+export interface WordmarkSvgProps extends React.HTMLAttributes<HTMLSpanElement> {
+  /** Accessible name for the wordmark (`<span class="sr-only">`). */
+  title?: string
+}
+
+/**
+ * Renders `public/wordmark.svg` as a CSS mask so the visible color
+ * comes from the host's text color (theme-aware). Width comes from
+ * the SVG's 684:108 aspect ratio applied to whatever `height` /
+ * `width` the caller sizes the span to — pass sizing via `className`
+ * or `style`, no defaults baked in.
+ */
+export function WordmarkSvg({
+  title = "Shelbi",
+  className,
+  style,
+  ...rest
+}: WordmarkSvgProps) {
+  return (
+    <span
+      role="img"
+      aria-label={title}
+      className={className}
+      style={{
+        display: "block",
+        backgroundColor: "currentColor",
+        aspectRatio: WORDMARK_SVG_ASPECT,
+        WebkitMaskImage: `url(${WORDMARK_SVG_PATH})`,
+        maskImage: `url(${WORDMARK_SVG_PATH})`,
+        WebkitMaskRepeat: "no-repeat",
+        maskRepeat: "no-repeat",
+        WebkitMaskSize: "contain",
+        maskSize: "contain",
+        WebkitMaskPosition: "center",
+        maskPosition: "center",
+        ...style,
+      }}
+      {...rest}
+    />
+  )
+}
+
+/**
  * Square block-character mark. Renders just the "S" letter of the
  * wordmark in a 10×10 viewBox — a reusable favicon-ready glyph. Inherits
  * currentColor like the wordmark.
