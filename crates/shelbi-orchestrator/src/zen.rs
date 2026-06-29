@@ -30,7 +30,7 @@ use shelbi_core::{
 
 use crate::git::{
     compose_pr_body, head_commit_subject, locate_hub_workdir, locate_worker_worktree,
-    lookup_open_pr, parse_pr_number_from_url, run_in_dir,
+    login_shell_prefix, lookup_open_pr, parse_pr_number_from_url, run_in_dir,
 };
 use crate::worker::worker_worktree;
 
@@ -493,6 +493,8 @@ fn probe_local_checks(
         return Ok(Vec::new());
     }
 
+    ensure_worktree_present(host, worktree)?;
+
     // Best-effort log file on the hub. A failure here just means the log
     // is missing; it doesn't block the probe.
     let log_path = log_file_path(&task.id).ok();
@@ -511,10 +513,29 @@ fn probe_local_checks(
     Ok(out)
 }
 
+/// Refuse to launch any check whose `cd <worktree>` would silently land
+/// in `$HOME`. The local-host case is the easy one to detect: just stat
+/// the path. For SSH hosts we let the remote shell surface its own cd
+/// error rather than round-trip a separate "does the path exist" probe —
+/// it still surfaces in the `output_tail` for the very first check.
+fn ensure_worktree_present(host: &Host, worktree: &std::path::Path) -> Result<()> {
+    if matches!(host, Host::Local) && !worktree.exists() {
+        return Err(Error::Other(format!(
+            "worker worktree `{}` does not exist on disk — \
+             dispatch the task to its worker before probing, \
+             or remove the stale assignment from the task",
+            worktree.display()
+        )));
+    }
+    Ok(())
+}
+
 fn run_one_check(host: &Host, worktree: &std::path::Path, cmd: &str) -> LocalCheck {
     let wt = worktree.to_string_lossy().into_owned();
-    // We `cd` into the worktree first because some checks (cargo, pytest)
-    // care about the working directory, not just argv[0]'s path.
+    // We `cd` into the worktree first because some checks care about the
+    // working directory, not just argv[0]'s path — anything that walks up
+    // to a project root (Cargo.toml / package.json / pyproject.toml /
+    // go.mod / mix.exs / Gemfile / ...) breaks if launched from `$HOME`.
     let script = format!("cd {} && {}", shell_escape(&wt), cmd);
 
     let started = Instant::now();
@@ -537,39 +558,62 @@ fn run_one_check(host: &Host, worktree: &std::path::Path, cmd: &str) -> LocalChe
         Err(e) => (-1, format!("(shelbi: failed to launch command: {e})\n")),
     };
 
+    let tail = tail_lines(&combined, OUTPUT_TAIL_LINES);
+    let tail = augment_command_not_found(host, cmd, exit_code, tail);
+
     LocalCheck {
         command: cmd.to_string(),
         exit_code,
         duration_ms: ms_truncating(elapsed),
-        output_tail: tail_lines(&combined, OUTPUT_TAIL_LINES),
+        output_tail: tail,
     }
 }
 
 /// Run a check script through a login shell so the user's rc files
 /// (~/.zprofile, ~/.bash_profile, etc.) populate `PATH` with tools
-/// installed via rustup, asdf, homebrew, etc. before the check runs.
+/// installed via rustup, asdf, mise, nvm, pyenv, rbenv, volta, or
+/// homebrew before the check runs.
 ///
 /// The hub process can inherit a stripped-down `PATH` when it's launched
 /// outside the user's terminal — from launchd / Spotlight, or from a
 /// tmux server that itself started in a non-login context — so trusting
-/// the inherited environment isn't enough. Re-execing through a login
-/// shell is the same trick `worker.rs`, `spawn.rs`, and `run_in_dir` use
-/// to keep agent launches and `gh`/`git` calls finding the same tools the
-/// user sees in their own terminal.
-///
-/// Local: read `$SHELL` from the hub's env (defaulting to `/bin/sh`) so
-/// zsh users source `.zprofile`/`.zshenv` instead of bash's startup files.
-/// Remote: pass `$SHELL` literally — it's expanded by the user's login
-/// shell that sshd hands the command to, so we don't need to guess which
-/// shells exist on the remote.
+/// the inherited environment isn't enough. Same trick `worker.rs`,
+/// `spawn.rs`, and [`run_in_dir`] use to keep agent launches and
+/// `gh`/`git` calls finding the same tools the user sees in their own
+/// terminal — see [`login_shell_prefix`] for the host-specific shell
+/// resolution.
 fn run_check_script(host: &Host, script: &str) -> std::io::Result<Output> {
-    match host {
-        Host::Local => {
-            let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".into());
-            shelbi_ssh::run(host, [shell.as_str(), "-lc", script])
-        }
-        Host::Ssh { .. } => shelbi_ssh::run(host, ["$SHELL", "-lc", script]),
+    let (shell, flag) = login_shell_prefix(host);
+    shelbi_ssh::run(host, [shell.as_str(), flag, script])
+}
+
+/// If the check exited 127 (POSIX "command not found"), append a shelbi
+/// hint that names the first token tried and what was searched. The hint
+/// is templated on the user's actual command — no specific tool name is
+/// baked into the binary, so this stays language-agnostic.
+fn augment_command_not_found(host: &Host, cmd: &str, exit_code: i32, tail: String) -> String {
+    if exit_code != 127 {
+        return tail;
     }
+    let Some(tool) = cmd.split_whitespace().next() else {
+        return tail;
+    };
+    let (shell, _) = login_shell_prefix(host);
+    // Strip a trailing `;` / `&&` / `|` if someone happened to chain on
+    // the first token (`foo; bar`) — the human-readable name is just `foo`.
+    let tool = tool.trim_end_matches(|c: char| matches!(c, ';' | '&' | '|'));
+    let hint = format!(
+        "shelbi: `{tool}` was not found on the login-shell PATH \
+         (checked via `{shell} -lc 'command -v {tool}'`). \
+         Install it or add it to PATH in your login shell's rc \
+         (e.g. ~/.zprofile, ~/.bash_profile)."
+    );
+    let mut out = tail;
+    if !out.is_empty() && !out.ends_with('\n') {
+        out.push('\n');
+    }
+    out.push_str(&hint);
+    out
 }
 
 /// How many trailing lines of combined output to keep per check.
@@ -1153,6 +1197,7 @@ mod probe_tests {
         // Override `$SHELL` to `/bin/sh` so the test doesn't depend on the
         // developer's preferred login shell being installed and well-
         // behaved (e.g. zsh's compinit complaining about insecure dirs).
+        let _guard = crate::test_lock::acquire();
         let prev_shell = std::env::var_os("SHELL");
         std::env::set_var("SHELL", "/bin/sh");
         let tmp = tempfile::tempdir().unwrap();
@@ -1172,6 +1217,127 @@ mod probe_tests {
             "expected login-shell `$0`; got: {}",
             res.output_tail
         );
+    }
+
+    #[test]
+    fn local_check_missing_tool_appends_shelbi_hint() {
+        // A check whose first token genuinely isn't on the login-shell
+        // PATH must surface a friendly "shelbi:" hint that names the
+        // tool and what was searched — never the bare
+        // `sh: <tool>: command not found` that bricks users new to
+        // version-manager setups. Verified with a deliberately-random
+        // identifier (not "cargo"/"npm"/"go" etc.) so the test stays
+        // language-agnostic — same as the production code.
+        let tmp = tempfile::tempdir().unwrap();
+        let wt = tmp.path();
+        let tool = "shelbi-test-no-such-tool-9c3a7b";
+        let res = run_one_check(&Host::Local, wt, tool);
+        assert_eq!(res.exit_code, 127, "expected POSIX 'command not found' exit");
+        assert!(
+            res.output_tail.contains("shelbi:"),
+            "expected shelbi-prefixed hint, got: {}",
+            res.output_tail
+        );
+        assert!(
+            res.output_tail.contains(tool),
+            "expected hint to name the missing tool `{tool}`, got: {}",
+            res.output_tail
+        );
+        assert!(
+            res.output_tail.contains("login-shell PATH"),
+            "expected hint to name what was searched, got: {}",
+            res.output_tail
+        );
+    }
+
+    #[test]
+    fn local_check_resolves_tool_only_on_login_shell_path() {
+        // Simulate the "tool installed via a version manager that
+        // initialises PATH from the user's rc" case without touching
+        // the developer's real rustup/asdf/nvm setup. Drops a fake
+        // binary into a temp dir, then writes a private rc file that
+        // adds that dir to PATH and points $SHELL/$ZDOTDIR/$HOME at
+        // the test setup so the login shell sources it.
+        //
+        // Mirrors the rustup/asdf/mise/nvm/pyenv/rbenv/volta/homebrew
+        // failure mode from the task spec — same shape, but with a
+        // fixture binary so the test isn't Rust-coupled.
+        let _guard = crate::test_lock::acquire();
+        let tmp = tempfile::tempdir().unwrap();
+        let bindir = tmp.path().join("custom-bin");
+        std::fs::create_dir_all(&bindir).unwrap();
+        let tool = "shelbi-test-login-shell-tool";
+        let tool_path = bindir.join(tool);
+        std::fs::write(&tool_path, "#!/bin/sh\necho login-shell-tool-ran\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&tool_path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+
+        // Login bash-as-sh sources ~/.profile. Override $HOME so we drop
+        // the rc file in the fixture's tmp dir without touching the
+        // developer's real shell setup. Same shape every login shell
+        // honors (bash, dash, ksh, ash) so the test isn't pinned to a
+        // specific shell.
+        let profile = tmp.path().join(".profile");
+        std::fs::write(
+            &profile,
+            format!("export PATH=\"{}:$PATH\"\n", bindir.display()),
+        )
+        .unwrap();
+
+        let prev_shell = std::env::var_os("SHELL");
+        let prev_home = std::env::var_os("HOME");
+        std::env::set_var("SHELL", "/bin/sh");
+        std::env::set_var("HOME", tmp.path());
+
+        let res = run_one_check(&Host::Local, tmp.path(), tool);
+
+        match prev_shell {
+            Some(v) => std::env::set_var("SHELL", v),
+            None => std::env::remove_var("SHELL"),
+        }
+        match prev_home {
+            Some(v) => std::env::set_var("HOME", v),
+            None => std::env::remove_var("HOME"),
+        }
+
+        assert_eq!(
+            res.exit_code, 0,
+            "expected fake tool to be reachable via login-shell PATH; got: {}",
+            res.output_tail
+        );
+        assert!(
+            res.output_tail.contains("login-shell-tool-ran"),
+            "expected fake tool's output, got: {}",
+            res.output_tail
+        );
+    }
+
+    #[test]
+    fn ensure_worktree_present_errors_with_friendly_message() {
+        // The whole point of the preflight: when the worktree is gone,
+        // the error has to name the path and explain *why* (so the user
+        // knows they probed an unassigned task, not that cargo / npm /
+        // pytest is broken). Hard-fail before we ever `cd $HOME && cmd`.
+        let missing = std::path::Path::new("/definitely/does/not/exist/shelbi-probe-test");
+        let err = ensure_worktree_present(&Host::Local, missing).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("does not exist on disk"),
+            "expected 'does not exist on disk' in error, got: {msg}"
+        );
+        assert!(
+            msg.contains(missing.to_str().unwrap()),
+            "expected error to name the missing path, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn ensure_worktree_present_accepts_real_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        ensure_worktree_present(&Host::Local, tmp.path()).unwrap();
     }
 
     #[test]
