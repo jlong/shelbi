@@ -70,6 +70,88 @@ pub fn agent_skills_dir(project: &str, agent: &str) -> Result<PathBuf> {
     Ok(agent_workspace_dir(project, agent)?.join("skills"))
 }
 
+/// Names of every agent under `~/.shelbi/projects/<project>/agents/`,
+/// sorted ascending. A "name" is the immediate child directory's basename;
+/// non-directories (stray files in the agents/ dir) and hidden entries
+/// (anything starting with `.`) are skipped. Returns an empty vec when
+/// the agents directory doesn't exist yet — that's the legitimate state
+/// for a fresh project that hasn't run `shelbi init --project`.
+pub fn list_agents(project: &str) -> Result<Vec<String>> {
+    let dir = agents_dir(project)?;
+    if !dir.exists() {
+        return Ok(Vec::new());
+    }
+    let mut out = Vec::new();
+    for entry in fs::read_dir(&dir)? {
+        let entry = entry.map_err(Error::Io)?;
+        if !entry.file_type().map_err(Error::Io)?.is_dir() {
+            continue;
+        }
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        if name.starts_with('.') {
+            continue;
+        }
+        // `_shared` (the preamble dir mentioned in default_developer.md)
+        // isn't an agent — skip it so it doesn't pollute `agent list`.
+        if name.starts_with('_') {
+            continue;
+        }
+        out.push(name.to_string());
+    }
+    out.sort();
+    Ok(out)
+}
+
+/// Bundled `instructions.md` body for the named default agent, or `None`
+/// if `name` isn't a shipped default. Used to decide whether the agent's
+/// on-disk `instructions.md` is `CUSTOMIZED` for the `shelbi agent list`
+/// report.
+pub fn default_agent_body(name: &str) -> Option<&'static str> {
+    DEFAULT_AGENTS
+        .iter()
+        .find(|(n, _)| *n == name)
+        .map(|(_, body)| *body)
+}
+
+/// True iff `name` is a shipped default agent (currently `orchestrator`
+/// or `developer`). Convenience over [`default_agent_body`] for callers
+/// that only care about presence, not the bundled body.
+pub fn is_default_agent(name: &str) -> bool {
+    default_agent_body(name).is_some()
+}
+
+/// Count of `*.md` files immediately under `<workspace>/skills/`. Returns
+/// 0 when the directory doesn't exist (an agent without a skills/ subdir
+/// is treated as having zero skills, not as an error). Non-recursive —
+/// only immediate children are counted.
+pub fn count_agent_skills(project: &str, agent: &str) -> Result<usize> {
+    let dir = agent_skills_dir(project, agent)?;
+    if !dir.exists() {
+        return Ok(0);
+    }
+    let mut n = 0;
+    for entry in fs::read_dir(&dir)? {
+        let entry = entry.map_err(Error::Io)?;
+        if !entry.file_type().map_err(Error::Io)?.is_file() {
+            continue;
+        }
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        if name.starts_with('.') {
+            continue;
+        }
+        if std::path::Path::new(name)
+            .extension()
+            .and_then(|e| e.to_str())
+            == Some("md")
+        {
+            n += 1;
+        }
+    }
+    Ok(n)
+}
+
 /// Per-agent result of a materialize / self-heal pass.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AgentMaterializeOutcome {
@@ -460,5 +542,85 @@ mod tests {
         assert!(DEFAULT_DEVELOPER_INSTRUCTIONS.contains("review marker"));
         assert!(DEFAULT_DEVELOPER_INSTRUCTIONS.contains("agents/_shared/preamble.md"));
         assert!(DEFAULT_DEVELOPER_INSTRUCTIONS.contains("skills"));
+    }
+
+    #[test]
+    fn list_agents_returns_empty_when_directory_missing() {
+        let _g = LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+        assert!(list_agents("p").unwrap().is_empty());
+        std::env::remove_var("SHELBI_HOME");
+    }
+
+    #[test]
+    fn list_agents_returns_subdirs_sorted_and_skips_files_and_reserved_prefixes() {
+        let _g = LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+        let dir = crate::agents_dir("p").unwrap();
+        fs::create_dir_all(dir.join("zeta")).unwrap();
+        fs::create_dir_all(dir.join("alpha")).unwrap();
+        fs::create_dir_all(dir.join(".hidden")).unwrap();
+        fs::create_dir_all(dir.join("_shared")).unwrap();
+        // Stray file at the top of agents/ — must not appear in the listing.
+        fs::write(dir.join("README.md"), "ignore me").unwrap();
+
+        let got = list_agents("p").unwrap();
+        assert_eq!(got, vec!["alpha".to_string(), "zeta".to_string()]);
+
+        std::env::remove_var("SHELBI_HOME");
+    }
+
+    #[test]
+    fn count_agent_skills_counts_md_files_only_non_recursively() {
+        let _g = LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+        materialize_default_agents("p").unwrap();
+        let skills = agent_skills_dir("p", DEVELOPER_AGENT).unwrap();
+        fs::write(skills.join("a.md"), "x").unwrap();
+        fs::write(skills.join("b.md"), "x").unwrap();
+        // .txt should be ignored.
+        fs::write(skills.join("c.txt"), "x").unwrap();
+        // Hidden file ignored.
+        fs::write(skills.join(".swp"), "x").unwrap();
+        // Subdirectory's contents are NOT counted (non-recursive contract).
+        fs::create_dir_all(skills.join("nested")).unwrap();
+        fs::write(skills.join("nested/deep.md"), "x").unwrap();
+
+        assert_eq!(count_agent_skills("p", DEVELOPER_AGENT).unwrap(), 2);
+
+        std::env::remove_var("SHELBI_HOME");
+    }
+
+    #[test]
+    fn count_agent_skills_zero_when_skills_dir_absent() {
+        let _g = LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+        assert_eq!(count_agent_skills("p", "ghost").unwrap(), 0);
+        std::env::remove_var("SHELBI_HOME");
+    }
+
+    #[test]
+    fn is_default_agent_only_recognizes_bundled_names() {
+        assert!(is_default_agent(ORCHESTRATOR_AGENT));
+        assert!(is_default_agent(DEVELOPER_AGENT));
+        assert!(!is_default_agent("qa"));
+        assert!(!is_default_agent(""));
+    }
+
+    #[test]
+    fn default_agent_body_matches_const_for_bundled_defaults() {
+        assert_eq!(
+            default_agent_body(ORCHESTRATOR_AGENT),
+            Some(DEFAULT_ORCHESTRATOR_INSTRUCTIONS),
+        );
+        assert_eq!(
+            default_agent_body(DEVELOPER_AGENT),
+            Some(DEFAULT_DEVELOPER_INSTRUCTIONS),
+        );
+        assert_eq!(default_agent_body("qa"), None);
     }
 }

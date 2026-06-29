@@ -77,6 +77,12 @@ enum Cmd {
         #[command(subcommand)]
         cmd: commands::workspace::WorkspaceCmd,
     },
+    /// Inspect and manage the project's `agents/<name>/` workspaces:
+    /// `list`, `show`, `new`, `edit`.
+    Agent {
+        #[command(subcommand)]
+        cmd: commands::agent::AgentCmd,
+    },
     /// Manage the project's workflow definitions (status sets).
     Workflow {
         #[command(subcommand)]
@@ -203,6 +209,7 @@ fn main() -> Result<()> {
             eprintln!("shelbi: 'worker' is deprecated; use 'workspace' instead.");
             commands::workspace::run(cli.project, cmd)
         }
+        Some(Cmd::Agent { cmd }) => commands::agent::run(cli.project, cmd),
         Some(Cmd::Workflow { cmd }) => commands::workflow::run(cli.project, cmd),
         Some(Cmd::Project { cmd }) => commands::project::run(cmd),
         Some(Cmd::Config { cmd }) => commands::config::run(cli.project, cmd),
