@@ -21,6 +21,7 @@ use shelbi_core::{
 mod agent_workspaces;
 mod hub_config;
 pub mod keymap;
+mod resolve;
 mod root;
 mod user_config;
 mod workspace_status;
@@ -43,6 +44,9 @@ pub use agent_workspaces::{
 pub use hub_config::{
     hub_config_path, list_projects, load_hub_config, save_hub_config, touch_project_launched,
     HubConfig, ProjectMeta, ProjectSummary,
+};
+pub use resolve::{
+    cleanup_legacy_markers, project_roots, resolve_project_for_cwd, MarkerCleanup, ProjectRoot,
 };
 pub use user_config::{
     load_user_config, save_user_config, user_config_path, Keymap, UserConfig, ZenToggleChord,
