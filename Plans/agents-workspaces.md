@@ -351,17 +351,17 @@ After Phase 2: custom workflows + custom agents are fully composable. A user can
 
 - **Default agents: Orchestrator + Developer**, shipped in the binary and materialized into the project on init / self-healed on reload. Editable per-project; binary upgrade doesn't clobber edits.
 
-- **Workflow binding via the existing** **`owner:`** **field.** Value is either the reserved sentinel `user` (human-owned) or a named agent (matching a `agents/<name>/` directory). One field, not two. Legacy `owner: agent` auto-migrates with a deprecation warning.
+- **Workflow binding: two fields,** **`owner: user | agent`** **+ optional** **`agent: <name>`.** `owner` is the binary "whose responsibility under no-automation"; `agent` names which agent acts when automation (Zen, etc.) is on. Decouples responsibility from automation, so a `user`-owned status can still have an agent-driven Zen path (e.g. `review: owner: user, agent: orchestrator` for auto-merge). Hard-fail if `owner: agent` without `agent:`. Legacy single-field workflows auto-migrate with a deprecation warning. Net effect: Zen behavior becomes declarative data in the workflow YAML instead of orchestrator-prompt prose.
 
-- **Worker spawn loads agent's** **`instructions.md`** **as system prompt** and mounts the agent's `skills/` into `.claude/skills/`. The same worker slot runs different agents on consecutive dispatches.
+- **Workspace spawn loads agent's** **`instructions.md`** **as system prompt** and mounts the agent's `skills/` into `.claude/skills/`. The same workspace slot runs different agents on consecutive dispatches.
 
-- **Orchestrator agent is special** — runs persistently on its own pane, not per-task-dispatch. `todo` declaring `owner: orchestrator` is documentation; the orchestrator process runs independent of the workflow's status declarations.
+- **Orchestrator agent is special** — runs persistently on its own pane, not per-task-dispatch. Statuses declaring `agent: orchestrator` are declarative documentation of what the orchestrator does; the orchestrator process itself runs always.
 
 - **Skills format follows Claude Code's existing convention** — `.md` with YAML frontmatter declaring trigger criteria. No new skill format to learn.
 
 - **CLI surface:** **`shelbi agent list / show / new`** for v1. `edit` deferred to v2 if needed.
 
-- **Events log gains** **`agent=<name>`** **field** on dispatch events (redundant with the status's owner, but keeps the feed self-contained). `shelbi worker list` gains an "agent" column showing the currently-loaded agent (or `-` when idle).
+- **Events log gains** **`agent=<name>`** **field** on dispatch events (redundant with the status's `agent:`, but keeps the feed self-contained). `shelbi worker list` gains an "agent" column showing the currently-loaded agent (or `-` when idle).
 
 - **The "claude" column in worker list = the runtime.** Stays as-is for v1 (rename later if it becomes confusing). New "agent" column is additive, not a replacement.
 
