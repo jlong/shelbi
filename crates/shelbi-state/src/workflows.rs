@@ -24,23 +24,20 @@
 //! skip the check — the workflow loads as-is and the next `shelbi
 //! reload` materializes the defaults.
 //!
-//! ## statuses.yml migration
+//! ## statuses.yml requirement
 //!
-//! When `statuses.yml` is missing but the project already has workflow
-//! files in the pre-split (legacy) form — `id` + `name` + `category` +
-//! `owner` inline under `statuses:` — the loader runs a one-time
-//! migration:
+//! `workflows/statuses.yml` is the project-wide source of truth for
+//! status identity (id, name, category, ordering). Whenever at least
+//! one workflow file is on disk, the loader requires `statuses.yml`
+//! and hard-fails when it's missing — `shelbi init` and `shelbi
+//! reload` materialize the shipped default, so the user fix is "run
+//! one of those" rather than hand-editing.
 //!
-//! 1. Walk every workflow file and collect each inline status's
-//!    `(id, name, category)`.
-//! 2. Hard-fail if two workflows declare the same id with different
-//!    names or categories (the conflict the project-wide source of
-//!    truth was meant to eliminate).
-//! 3. Write `statuses.yml` with the merged set, preserving first-seen
-//!    declaration order across files.
-//! 4. Rewrite each workflow file's `statuses:` block to the new
-//!    reference-only form, dropping `name:` and `category:`.
-//! 5. Emit a one-time stderr hint summarizing what was migrated.
+//! Workflow files must use the reference-only form
+//! (`id` + `owner` + optional `agent`). An inline `name:` or
+//! `category:` under a `statuses:` entry — the pre-Phase-1 form
+//! supported in a prior release — is rejected at parse time with a
+//! pointer to move identity into `statuses.yml`.
 //!
 //! ## Legacy migration warnings
 //!
@@ -59,8 +56,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 use shelbi_core::{
-    default_project_statuses, default_workflow, Error, ProjectStatus, ProjectStatuses, Result,
-    StatusCategory, Workflow,
+    default_project_statuses, default_workflow, Error, ProjectStatuses, Result, Workflow,
 };
 
 use crate::{agents_dir, atomic_write, project_dir};
@@ -104,35 +100,35 @@ pub fn save_project_statuses(project: &str, statuses: &ProjectStatuses) -> Resul
 }
 
 /// Load and validate a single workflow by name. Errors if the file is
-/// missing, the YAML doesn't pass [`Workflow::validate`], or any
-/// `agent:` reference fails the agents-directory existence check. The
-/// file's basename is *not* substituted for the workflow's declared
-/// `name:` — callers that need that contract should compare after
-/// loading.
+/// missing, the YAML doesn't pass [`Workflow::validate`], the file
+/// still carries pre-statuses.yml inline identity fields, the project's
+/// `workflows/statuses.yml` is missing, or any `agent:` reference fails
+/// the agents-directory existence check. The file's basename is *not*
+/// substituted for the workflow's declared `name:` — callers that need
+/// that contract should compare after loading.
 ///
-/// Resolves the workflow against the project's `statuses.yml` when one
-/// exists; otherwise validates the (legacy) inline form directly and
-/// surfaces the one-time-per-workflow-path deprecation warning. The
-/// warning routes through `tracing::warn!` so it lands in the TUI's
-/// log file rather than on the alt-screen pane.
+/// Resolves the workflow against the project's `statuses.yml`, which
+/// must exist (the post-Phase-1 contract). `shelbi init` and `shelbi
+/// reload` materialize the shipped default when missing.
 pub fn load_workflow(project: &str, name: &str) -> Result<Workflow> {
     let path = workflow_path(project, name)?;
     let text = fs::read_to_string(&path)?;
+
+    let inline = Workflow::inline_identity_fields(&text).map_err(|e| annotate(&path, e))?;
+    if !inline.is_empty() {
+        return Err(mixed_form_error(&path, &inline));
+    }
+
     let (wf, diags) =
         Workflow::from_yaml_str_with_diagnostics(&text).map_err(|e| annotate(&path, e))?;
     emit_deprecation_warnings_once(&path, &diags);
 
     let st_path = statuses_path(project)?;
-    let resolved = if st_path.exists() {
-        let inline = Workflow::inline_identity_fields(&text).map_err(|e| annotate(&path, e))?;
-        if !inline.is_empty() {
-            return Err(mixed_form_error(&path, &inline));
-        }
-        let statuses = load_project_statuses(project)?;
-        wf.resolve_against(&statuses).map_err(|e| annotate(&path, e))?
-    } else {
-        wf
-    };
+    if !st_path.exists() {
+        return Err(missing_statuses_error(&st_path));
+    }
+    let statuses = load_project_statuses(project)?;
+    let resolved = wf.resolve_against(&statuses).map_err(|e| annotate(&path, e))?;
 
     validate_agent_references(project, &resolved).map_err(|e| annotate(&path, e))?;
     Ok(resolved)
@@ -148,10 +144,12 @@ pub fn load_workflow(project: &str, name: &str) -> Result<Workflow> {
 /// 1. The `workflows/` directory does not exist (legacy projects), or
 /// 2. The directory exists but contains no `*.yaml` files.
 ///
-/// **Migration.** When `statuses.yml` is missing but legacy workflow
-/// files are present, runs the one-time migration described in the
-/// module docs before resolving — so the very next read sees the
-/// post-migration form.
+/// **`statuses.yml` required.** Once at least one workflow file is on
+/// disk, the loader requires `workflows/statuses.yml`. Missing →
+/// hard-fail with a pointer to `shelbi init` / `shelbi reload`. A
+/// workflow file that still carries inline `name:` / `category:` under
+/// `statuses:` is rejected at parse time with a pointer to move
+/// identity into `statuses.yml`.
 ///
 /// Bad workflow files surface as errors (with the file path quoted in
 /// the message) rather than being silently skipped — a malformed
@@ -163,29 +161,15 @@ pub fn list_workflows(project: &str) -> Result<Vec<Workflow>> {
         return Ok(vec![default_workflow()]);
     }
 
-    let initial = read_raw_workflow_files(&dir)?;
-    if initial.is_empty() {
+    let raw_files = read_raw_workflow_files(&dir)?;
+    if raw_files.is_empty() {
         return Ok(vec![default_workflow()]);
     }
 
     let st_path = dir.join("statuses.yml");
     if !st_path.exists() {
-        // First load after this lands and the project has legacy inline
-        // workflows. Run the one-shot migration, which rewrites the
-        // files on disk — we re-read them below to pick up the new form.
-        run_migration(&dir, &initial)?;
+        return Err(missing_statuses_error(&st_path));
     }
-
-    let raw_files = if st_path.exists() {
-        read_raw_workflow_files(&dir)?
-    } else {
-        // No statuses.yml + no legacy form — write the default so the
-        // post-condition (statuses.yml present whenever workflows/ has
-        // at least one .yaml) holds.
-        let s = default_project_statuses();
-        atomic_write(&st_path, serde_yaml::to_string(&s)?.as_bytes())?;
-        initial
-    };
 
     let st_text = fs::read_to_string(&st_path)?;
     let statuses = ProjectStatuses::from_yaml_str(&st_text).map_err(|e| annotate(&st_path, e))?;
@@ -210,9 +194,9 @@ pub fn list_workflows(project: &str) -> Result<Vec<Workflow>> {
     Ok(out)
 }
 
-/// One unparsed workflow file on disk — path + raw text. Buffered so the
-/// migration can re-read and rewrite without hitting the filesystem
-/// twice per file.
+/// One unparsed workflow file on disk — path + raw text. Buffered so
+/// the inline-form probe, parse, and resolve steps all run off the
+/// same in-memory copy without hitting disk three times per file.
 struct RawWorkflowFile {
     path: PathBuf,
     text: String,
@@ -238,138 +222,6 @@ fn read_raw_workflow_files(dir: &Path) -> Result<Vec<RawWorkflowFile>> {
     Ok(out)
 }
 
-/// Walk the raw workflow files, collect every inline status declaration,
-/// hard-fail on name/category conflicts across workflows, write
-/// `statuses.yml`, and rewrite each workflow file to the reference-only
-/// form. Emits a one-time stderr deprecation hint when at least one
-/// file was rewritten.
-fn run_migration(dir: &Path, files: &[RawWorkflowFile]) -> Result<()> {
-    let mut collected: Vec<ProjectStatus> = Vec::new();
-    let mut rewrites: Vec<(PathBuf, String)> = Vec::new();
-    let mut had_inline = false;
-
-    for file in files {
-        let inline = Workflow::inline_identity_fields(&file.text)
-            .map_err(|e| annotate(&file.path, e))?;
-        let value: serde_yaml::Value =
-            serde_yaml::from_str(&file.text).map_err(|e| annotate(&file.path, e.into()))?;
-        let statuses = value
-            .get(serde_yaml::Value::String("statuses".into()))
-            .and_then(|v| v.as_sequence())
-            .cloned()
-            .unwrap_or_default();
-
-        for entry in &statuses {
-            let id = entry
-                .get(serde_yaml::Value::String("id".into()))
-                .and_then(|v| v.as_str())
-                .or_else(|| {
-                    entry
-                        .get(serde_yaml::Value::String("name".into()))
-                        .and_then(|v| v.as_str())
-                })
-                .unwrap_or("")
-                .to_string();
-            if id.is_empty() {
-                continue;
-            }
-            let name = entry
-                .get(serde_yaml::Value::String("name".into()))
-                .and_then(|v| v.as_str())
-                .unwrap_or(&id)
-                .to_string();
-            let category = entry
-                .get(serde_yaml::Value::String("category".into()))
-                .and_then(|v| v.as_str())
-                .map(parse_category)
-                .transpose()
-                .map_err(|e| annotate(&file.path, e))?
-                .unwrap_or(StatusCategory::Backlog);
-
-            if let Some(existing) = collected.iter().find(|s| s.id == id) {
-                if existing.name != name || existing.category != category {
-                    return Err(conflict_error(&id, existing, &name, category, &file.path));
-                }
-            } else {
-                collected.push(ProjectStatus {
-                    id: id.clone(),
-                    name,
-                    category,
-                });
-            }
-        }
-
-        if !inline.is_empty() {
-            had_inline = true;
-            rewrites.push((file.path.clone(), rewrite_workflow_yaml(&file.text)?));
-        }
-    }
-
-    if !had_inline {
-        // No legacy files — fall back to writing the default catalogue
-        // so the loader's post-condition (statuses.yml present whenever
-        // workflows/ has at least one .yaml) holds.
-        let statuses = default_project_statuses();
-        atomic_write(
-            &dir.join("statuses.yml"),
-            serde_yaml::to_string(&statuses)?.as_bytes(),
-        )?;
-        return Ok(());
-    }
-
-    let statuses = ProjectStatuses { statuses: collected };
-    statuses.validate()?;
-    atomic_write(
-        &dir.join("statuses.yml"),
-        serde_yaml::to_string(&statuses)?.as_bytes(),
-    )?;
-
-    let count = rewrites.len();
-    for (path, text) in rewrites {
-        atomic_write(&path, text.as_bytes())?;
-    }
-
-    eprintln!(
-        "shelbi: migrated {count} workflow file(s) and wrote {} — please commit",
-        dir.join("statuses.yml").display()
-    );
-    Ok(())
-}
-
-fn parse_category(s: &str) -> Result<StatusCategory> {
-    s.trim()
-        .parse::<StatusCategory>()
-        .map_err(|_| Error::InvalidWorkflow(format!("unknown status category: {s}")))
-}
-
-fn conflict_error(
-    id: &str,
-    existing: &ProjectStatus,
-    new_name: &str,
-    new_category: StatusCategory,
-    file: &Path,
-) -> Error {
-    let mut diff = Vec::new();
-    if existing.name != new_name {
-        diff.push(format!(
-            "  name:     `{}` vs `{}`",
-            existing.name, new_name
-        ));
-    }
-    if existing.category != new_category {
-        diff.push(format!(
-            "  category: `{}` vs `{}`",
-            existing.category, new_category
-        ));
-    }
-    Error::InvalidWorkflow(format!(
-        "migration aborted: status id `{id}` declared with conflicting identity in {file_disp}:\n{diff}\n\
-         resolve the diff in the workflow YAMLs before re-running, or pre-create `workflows/statuses.yml`",
-        file_disp = file.display(),
-        diff = diff.join("\n"),
-    ))
-}
-
 fn mixed_form_error(path: &Path, inline: &[shelbi_core::InlineIdentityField]) -> Error {
     let mut diff = String::new();
     for entry in inline {
@@ -387,53 +239,21 @@ fn mixed_form_error(path: &Path, inline: &[shelbi_core::InlineIdentityField]) ->
         ));
     }
     Error::InvalidWorkflow(format!(
-        "{} carries inline status identity after migration — \
-         workflows/statuses.yml is now the source of truth. \
+        "{} carries inline status identity — \
+         workflows/statuses.yml is the source of truth for `name:` and `category:`. \
          Remove the following inline fields:\n{}",
         path.display(),
         diff,
     ))
 }
 
-/// Rewrite a workflow YAML's `statuses:` block to the post-migration
-/// reference-only form: drop `name:`, `category:`, and `description:`
-/// (the discarded legacy field) from each entry, keep `id`, `owner`,
-/// `agent`. Everything outside the statuses block is preserved
-/// verbatim so user comments at the top of the file aren't disturbed.
-fn rewrite_workflow_yaml(text: &str) -> Result<String> {
-    let value: serde_yaml::Value = serde_yaml::from_str(text)?;
-    let mapping = match value {
-        serde_yaml::Value::Mapping(m) => m,
-        _ => return Err(Error::InvalidWorkflow("workflow root must be a mapping".into())),
-    };
-
-    let mut out = serde_yaml::Mapping::new();
-    for (k, v) in mapping {
-        if matches!(&k, serde_yaml::Value::String(s) if s == "statuses") {
-            if let serde_yaml::Value::Sequence(seq) = v {
-                let rewritten = seq
-                    .into_iter()
-                    .map(|entry| match entry {
-                        serde_yaml::Value::Mapping(mut m) => {
-                            m.remove(serde_yaml::Value::String("name".into()));
-                            m.remove(serde_yaml::Value::String("category".into()));
-                            m.remove(serde_yaml::Value::String("description".into()));
-                            serde_yaml::Value::Mapping(m)
-                        }
-                        other => other,
-                    })
-                    .collect::<Vec<_>>();
-                out.insert(k, serde_yaml::Value::Sequence(rewritten));
-            } else {
-                out.insert(k, v);
-            }
-        } else {
-            out.insert(k, v);
-        }
-    }
-
-    let yaml = serde_yaml::to_string(&serde_yaml::Value::Mapping(out))?;
-    Ok(yaml)
+fn missing_statuses_error(path: &Path) -> Error {
+    Error::InvalidWorkflow(format!(
+        "{} is missing — `workflows/statuses.yml` is the project-wide source of truth \
+         for status identity. Run `shelbi init --project <name>` or `shelbi reload` \
+         to materialize the shipped default.",
+        path.display(),
+    ))
 }
 
 /// Check each declared `agent:` reference against the on-disk
@@ -533,6 +353,7 @@ mod tests {
     };
     use crate::ensure_dir;
     use crate::test_lock::LOCK as TEST_LOCK;
+    use shelbi_core::{ProjectStatus, StatusCategory};
     use std::path::Path;
 
     fn fresh_home() -> PathBuf {
@@ -553,6 +374,13 @@ mod tests {
         std::fs::write(dir.join(format!("{name}.yaml")), yaml).unwrap();
     }
 
+    /// Materialize the shipped default `statuses.yml` for `project` —
+    /// every test that exercises [`list_workflows`] / [`load_workflow`]
+    /// past the directory-empty fallback needs it on disk.
+    fn write_default_statuses(project: &str) {
+        save_project_statuses(project, &default_project_statuses()).unwrap();
+    }
+
     fn reset_deprecation_cache() {
         let mut guard = match EMITTED_DEPRECATIONS.lock() {
             Ok(g) => g,
@@ -563,14 +391,17 @@ mod tests {
         }
     }
 
+    /// Reference-form workflow that picks a subset of the default
+    /// statuses. The post-Phase-3 on-disk shape — `id` + `owner` +
+    /// optional `agent`, with identity coming from `statuses.yml`.
     const SIMPLE_WORKFLOW: &str = r#"
 name: design-review
-description: Design pipeline with a user-owned QA step.
+description: A subset of the default catalogue.
 statuses:
-  - { id: backlog, name: Backlog, category: backlog, owner: user                          }
-  - { id: design,  name: Design,  category: active,  owner: agent, agent: developer       }
-  - { id: qa,      name: QA,      category: handoff, owner: user                          }
-  - { id: done,    name: Done,    category: done,    owner: user                          }
+  - { id: backlog,     owner: user                          }
+  - { id: in-progress, owner: agent, agent: developer       }
+  - { id: review,      owner: user                          }
+  - { id: done,        owner: user                          }
 "#;
 
     #[test]
@@ -647,6 +478,7 @@ statuses:
         let home = fresh_home();
         std::env::set_var("SHELBI_HOME", &home);
         materialize_default_agents("p").unwrap();
+        write_default_statuses("p");
         let dir = workflows_dir("p").unwrap();
         write_workflow(&dir, "design-review", SIMPLE_WORKFLOW);
         write_workflow(
@@ -655,15 +487,14 @@ statuses:
             r#"
 name: default
 statuses:
-  - { id: backlog, name: Backlog, category: backlog, owner: user }
-  - { id: done,    name: Done,    category: done,    owner: user }
+  - { id: backlog, owner: user }
+  - { id: done,    owner: user }
 "#,
         );
         let out = list_workflows("p").unwrap();
         assert_eq!(out.len(), 2);
         assert_eq!(out[0].name, "default");
         assert_eq!(out[1].name, "design-review");
-        assert!(statuses_path("p").unwrap().exists());
         std::env::remove_var("SHELBI_HOME");
     }
 
@@ -672,8 +503,8 @@ statuses:
         let _g = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let home = fresh_home();
         std::env::set_var("SHELBI_HOME", &home);
+        write_default_statuses("p");
         let dir = workflows_dir("p").unwrap();
-        ensure_dir(&dir).unwrap();
         std::fs::write(dir.join("broken.yaml"), "name: broken\n").unwrap();
         let err = list_workflows("p").unwrap_err();
         let msg = err.to_string();
@@ -687,8 +518,8 @@ statuses:
     #[test]
     fn list_workflows_does_not_create_directory_as_side_effect() {
         // The loader is read-only when the project has no `workflows/`
-        // directory yet — migration only runs once at least one workflow
-        // file is on disk.
+        // directory yet — the default-when-absent fallback never
+        // materializes files on disk.
         let _g = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let home = fresh_home();
         std::env::set_var("SHELBI_HOME", &home);
@@ -699,11 +530,33 @@ statuses:
     }
 
     #[test]
+    fn list_workflows_hard_fails_when_statuses_yml_missing() {
+        // Acceptance criterion: once at least one workflow file is on
+        // disk, the loader requires `statuses.yml`. The error must
+        // point the user at the init/reload escape hatch rather than
+        // expecting them to hand-author the file.
+        let _g = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+        materialize_default_agents("p").unwrap();
+        let dir = workflows_dir("p").unwrap();
+        write_workflow(&dir, "default", SIMPLE_WORKFLOW);
+        let err = list_workflows("p").unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("statuses.yml"), "msg: {msg}");
+        assert!(msg.contains("shelbi init") || msg.contains("shelbi reload"), "msg: {msg}");
+        // No file was materialized as a side effect.
+        assert!(!statuses_path("p").unwrap().exists(), "loader must not auto-create statuses.yml");
+        std::env::remove_var("SHELBI_HOME");
+    }
+
+    #[test]
     fn load_workflow_reads_and_validates_single_file() {
         let _g = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let home = fresh_home();
         std::env::set_var("SHELBI_HOME", &home);
         materialize_default_agents("p").unwrap();
+        write_default_statuses("p");
         let dir = workflows_dir("p").unwrap();
         write_workflow(&dir, "design-review", SIMPLE_WORKFLOW);
         let wf = load_workflow("p", "design-review").unwrap();
@@ -722,6 +575,21 @@ statuses:
         std::env::remove_var("SHELBI_HOME");
     }
 
+    #[test]
+    fn load_workflow_hard_fails_when_statuses_yml_missing() {
+        let _g = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+        materialize_default_agents("p").unwrap();
+        let dir = workflows_dir("p").unwrap();
+        write_workflow(&dir, "default", SIMPLE_WORKFLOW);
+        let err = load_workflow("p", "default").unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("statuses.yml"), "msg: {msg}");
+        assert!(msg.contains("shelbi init") || msg.contains("shelbi reload"), "msg: {msg}");
+        std::env::remove_var("SHELBI_HOME");
+    }
+
     // ---------------------------------------------------------------------
     // Two-field owner/agent validation
 
@@ -731,6 +599,7 @@ statuses:
         let home = fresh_home();
         std::env::set_var("SHELBI_HOME", &home);
         materialize_default_agents("p").unwrap();
+        write_default_statuses("p");
         let dir = workflows_dir("p").unwrap();
         write_workflow(
             &dir,
@@ -738,12 +607,12 @@ statuses:
             r#"
 name: default
 statuses:
-  - { id: backlog,     name: Backlog,    category: backlog,  owner: user,  agent: orchestrator }
-  - { id: todo,        name: Todo,       category: ready,    owner: agent, agent: orchestrator }
-  - { id: in-progress, name: InProgress, category: active,   owner: agent, agent: developer    }
-  - { id: review,      name: Review,     category: handoff,  owner: user,  agent: orchestrator }
-  - { id: done,        name: Done,       category: done,     owner: user  }
-  - { id: canceled,    name: Canceled,   category: archived, owner: user  }
+  - { id: backlog,     owner: user,  agent: orchestrator }
+  - { id: todo,        owner: agent, agent: orchestrator }
+  - { id: in-progress, owner: agent, agent: developer    }
+  - { id: review,      owner: user,  agent: orchestrator }
+  - { id: done,        owner: user  }
+  - { id: canceled,    owner: user  }
 "#,
         );
         let wf = load_workflow("p", "default").unwrap();
@@ -758,6 +627,17 @@ statuses:
         let home = fresh_home();
         std::env::set_var("SHELBI_HOME", &home);
         materialize_default_agents("p").unwrap();
+        save_project_statuses(
+            "p",
+            &ProjectStatuses {
+                statuses: vec![ProjectStatus {
+                    id: "doing".into(),
+                    name: "Doing".into(),
+                    category: StatusCategory::Active,
+                }],
+            },
+        )
+        .unwrap();
         let dir = workflows_dir("p").unwrap();
         write_workflow(
             &dir,
@@ -765,7 +645,7 @@ statuses:
             r#"
 name: custom
 statuses:
-  - { id: doing, name: Doing, category: active, owner: agent, agent: reviewer }
+  - { id: doing, owner: agent, agent: reviewer }
 "#,
         );
         let err = load_workflow("p", "custom").unwrap_err();
@@ -778,33 +658,11 @@ statuses:
     }
 
     #[test]
-    fn load_workflow_rejects_bare_owner_agent_in_done_category() {
-        let _g = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
-        let home = fresh_home();
-        std::env::set_var("SHELBI_HOME", &home);
-        materialize_default_agents("p").unwrap();
-        let dir = workflows_dir("p").unwrap();
-        write_workflow(
-            &dir,
-            "broken",
-            r#"
-name: broken
-statuses:
-  - { id: ship, name: Ship, category: done, owner: agent }
-"#,
-        );
-        let err = load_workflow("p", "broken").unwrap_err();
-        let msg = err.to_string();
-        assert!(msg.contains("`ship`"), "msg: {msg}");
-        assert!(msg.contains("owner: agent"), "msg: {msg}");
-        std::env::remove_var("SHELBI_HOME");
-    }
-
-    #[test]
     fn load_workflow_skips_agent_check_when_agents_dir_absent() {
         let _g = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let home = fresh_home();
         std::env::set_var("SHELBI_HOME", &home);
+        write_default_statuses("p");
         let dir = workflows_dir("p").unwrap();
         write_workflow(
             &dir,
@@ -812,7 +670,7 @@ statuses:
             r#"
 name: default
 statuses:
-  - { id: todo, name: Todo, category: ready, owner: agent, agent: orchestrator }
+  - { id: todo, owner: agent, agent: orchestrator }
 "#,
         );
         let wf = load_workflow("p", "default").unwrap();
@@ -822,10 +680,17 @@ statuses:
 
     #[test]
     fn load_workflow_deprecation_warning_fires_once_per_workflow_path() {
+        // The owner/agent migration warning (separate from the
+        // inline-form rejection) still fires when a workflow uses the
+        // legacy named-owner form — `owner: <name>` migrates to
+        // `owner: agent, agent: <name>` and surfaces one bundled
+        // diagnostic per workflow path. Skip the agents-dir materialize
+        // step so [`validate_agent_references`] stays a no-op; we're
+        // exercising the dedupe path, not the agent existence check.
         let _g = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let home = fresh_home();
         std::env::set_var("SHELBI_HOME", &home);
-        materialize_default_agents("p").unwrap();
+        write_default_statuses("p");
         reset_deprecation_cache();
 
         let dir = workflows_dir("p").unwrap();
@@ -835,14 +700,14 @@ statuses:
             r#"
 name: legacy
 statuses:
-  - { id: todo,  name: Todo,  category: ready,  owner: agent }
-  - { id: doing, name: Doing, category: active, owner: agent }
+  - { id: todo,        owner: alice }
+  - { id: in-progress, owner: bob   }
 "#,
         );
 
         let wf = load_workflow("p", "legacy").unwrap();
-        assert_eq!(wf.statuses[0].agent.as_deref(), Some("orchestrator"));
-        assert_eq!(wf.statuses[1].agent.as_deref(), Some("developer"));
+        assert_eq!(wf.statuses[0].agent.as_deref(), Some("alice"));
+        assert_eq!(wf.statuses[1].agent.as_deref(), Some("bob"));
 
         let path = workflow_path("p", "legacy").unwrap();
         let guard = EMITTED_DEPRECATIONS.lock().unwrap();
@@ -874,7 +739,7 @@ statuses:
     }
 
     // ---------------------------------------------------------------------
-    // statuses.yml + migration
+    // statuses.yml validation
 
     #[test]
     fn statuses_yml_round_trips_through_parser() {
@@ -927,7 +792,7 @@ statuses:
         let home = fresh_home();
         std::env::set_var("SHELBI_HOME", &home);
         let dir = workflows_dir("p").unwrap();
-        save_project_statuses("p", &default_project_statuses()).unwrap();
+        write_default_statuses("p");
         write_workflow(
             &dir,
             "mixed",
@@ -949,198 +814,32 @@ statuses:
     }
 
     #[test]
-    fn migration_hard_fails_on_conflicting_names_or_categories() {
+    fn loader_rejects_inline_form_even_when_statuses_yml_missing() {
+        // Acceptance criterion: an inline-form workflow file is
+        // rejected at parse time regardless of whether statuses.yml
+        // exists. The error directs the user to move identity to
+        // workflows/statuses.yml — no auto-migration runs.
         let _g = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let home = fresh_home();
         std::env::set_var("SHELBI_HOME", &home);
         let dir = workflows_dir("p").unwrap();
         write_workflow(
             &dir,
-            "a",
+            "mixed",
             r#"
-name: a
-statuses:
-  - { id: review, name: Review, category: handoff, owner: user }
-"#,
-        );
-        write_workflow(
-            &dir,
-            "b",
-            r#"
-name: b
-statuses:
-  - { id: review, name: QA, category: handoff, owner: user }
-"#,
-        );
-        let err = list_workflows("p").unwrap_err();
-        let msg = err.to_string();
-        assert!(
-            msg.contains("status id `review`"),
-            "should name the conflicting id: {msg}"
-        );
-        assert!(msg.contains("Review"), "should echo the existing name: {msg}");
-        assert!(msg.contains("QA"), "should echo the new name: {msg}");
-        assert!(!statuses_path("p").unwrap().exists());
-        std::env::remove_var("SHELBI_HOME");
-    }
-
-    #[test]
-    fn migration_hard_fails_on_conflicting_categories() {
-        let _g = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
-        let home = fresh_home();
-        std::env::set_var("SHELBI_HOME", &home);
-        let dir = workflows_dir("p").unwrap();
-        write_workflow(
-            &dir,
-            "a",
-            r#"
-name: a
-statuses:
-  - { id: review, name: Review, category: handoff, owner: user }
-"#,
-        );
-        write_workflow(
-            &dir,
-            "b",
-            r#"
-name: b
-statuses:
-  - { id: review, name: Review, category: active, owner: user }
-"#,
-        );
-        let err = list_workflows("p").unwrap_err();
-        let msg = err.to_string();
-        assert!(msg.contains("category"), "msg: {msg}");
-        assert!(msg.contains("handoff"), "msg: {msg}");
-        assert!(msg.contains("active"), "msg: {msg}");
-        std::env::remove_var("SHELBI_HOME");
-    }
-
-    #[test]
-    fn migration_rewrites_every_workflow_and_writes_statuses_yml() {
-        let _g = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
-        let home = fresh_home();
-        std::env::set_var("SHELBI_HOME", &home);
-        materialize_default_agents("p").unwrap();
-        let dir = workflows_dir("p").unwrap();
-        write_workflow(&dir, "design-review", SIMPLE_WORKFLOW);
-        write_workflow(
-            &dir,
-            "default",
-            r#"
-name: default
+name: mixed
 statuses:
   - { id: backlog, name: Backlog, category: backlog, owner: user }
-  - { id: done,    name: Done,    category: done,    owner: user }
 "#,
         );
-
-        let workflows = list_workflows("p").unwrap();
-        assert_eq!(workflows.len(), 2);
-
-        let statuses = load_project_statuses("p").unwrap();
-        let ids: Vec<&str> = statuses.statuses.iter().map(|s| s.id.as_str()).collect();
-        // First-seen ordering across files sorted by path. `default.yaml`
-        // alphabetically precedes `design-review.yaml`, so its ids land
-        // first; ids unique to `design-review` follow in declaration
-        // order.
-        assert_eq!(ids, vec!["backlog", "done", "design", "qa"]);
-
-        let design_text =
-            std::fs::read_to_string(dir.join("design-review.yaml")).unwrap();
-        assert!(!design_text.contains("name: Backlog"), "{design_text}");
-        assert!(!design_text.contains("category:"), "{design_text}");
-        let default_text = std::fs::read_to_string(dir.join("default.yaml")).unwrap();
-        assert!(!default_text.contains("name: Backlog"), "{default_text}");
-        assert!(!default_text.contains("category:"), "{default_text}");
-
-        let workflows2 = list_workflows("p").unwrap();
-        assert_eq!(workflows, workflows2);
-
-        std::env::remove_var("SHELBI_HOME");
-    }
-
-    #[test]
-    fn migration_emits_one_time_hint_only_on_first_load() {
-        // Load-twice probe: statuses.yml contents don't change on the
-        // second load — proxy for "no side effects after first migration".
-        let _g = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
-        let home = fresh_home();
-        std::env::set_var("SHELBI_HOME", &home);
-        materialize_default_agents("p").unwrap();
-        let dir = workflows_dir("p").unwrap();
-        write_workflow(&dir, "default", SIMPLE_WORKFLOW);
-
-        let first = list_workflows("p").unwrap();
-        let after_first =
-            std::fs::read_to_string(dir.join("statuses.yml")).unwrap();
-        let second = list_workflows("p").unwrap();
-        let after_second =
-            std::fs::read_to_string(dir.join("statuses.yml")).unwrap();
-        assert_eq!(first, second);
-        assert_eq!(after_first, after_second);
-        std::env::remove_var("SHELBI_HOME");
-    }
-
-    #[test]
-    fn shipped_templates_parse_cleanly_after_migration() {
-        // Stand-in for the four real shipped workflow files (app,
-        // app-feature, default, site). All four declare the same six
-        // status ids in the same legacy inline form, so a representative
-        // pair is enough to exercise the migration path end-to-end.
-        let _g = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
-        let home = fresh_home();
-        std::env::set_var("SHELBI_HOME", &home);
-        materialize_default_agents("p").unwrap();
-        let dir = workflows_dir("p").unwrap();
-
-        const SHIPPED_DEFAULT: &str = r#"
-name: default
-description: The standard one-track flow shipped with every project.
-statuses:
-  - { id: backlog,     name: Backlog,     category: backlog,  owner: user,  agent: orchestrator }
-  - { id: todo,        name: Todo,        category: ready,    owner: agent, agent: orchestrator }
-  - { id: in-progress, name: In Progress, category: active,   owner: agent, agent: developer    }
-  - { id: review,      name: Review,      category: handoff,  owner: user,  agent: orchestrator }
-  - { id: done,        name: Done,        category: done,     owner: user  }
-  - { id: canceled,    name: Canceled,    category: archived, owner: user  }
-"#;
-        const SHIPPED_APP: &str = r#"
-name: app
-statuses:
-  - { id: backlog,     name: Backlog,     category: backlog,  owner: user,  agent: orchestrator }
-  - { id: todo,        name: Todo,        category: ready,    owner: agent, agent: orchestrator }
-  - { id: in-progress, name: In Progress, category: active,   owner: agent, agent: developer    }
-  - { id: review,      name: Review,      category: handoff,  owner: user,  agent: orchestrator }
-  - { id: done,        name: Done,        category: done,     owner: user  }
-  - { id: canceled,    name: Canceled,    category: archived, owner: user  }
-initial_status: backlog
-transitions:
-  - { from: in-progress, to: review,   actions: [push_branch, open_pr]      }
-  - { from: review,      to: done,     actions: [merge, delete_branch]      }
-  - { from: in-progress, to: canceled, actions: [close_pr, delete_branch]   }
-"#;
-        write_workflow(&dir, "default", SHIPPED_DEFAULT);
-        write_workflow(&dir, "app", SHIPPED_APP);
-
-        let workflows = list_workflows("p").unwrap();
-        assert_eq!(workflows.len(), 2);
-        for wf in &workflows {
-            assert_eq!(wf.statuses.len(), 6);
-            assert!(
-                wf.statuses.iter().all(|s| !s.name.is_empty()),
-                "all statuses must have a resolved name"
-            );
-        }
-        let statuses = load_project_statuses("p").unwrap();
-        assert_eq!(statuses.statuses.len(), 6);
-        assert_eq!(
-            statuses
-                .statuses
-                .iter()
-                .map(|s| s.id.as_str())
-                .collect::<Vec<_>>(),
-            vec!["backlog", "todo", "in-progress", "review", "done", "canceled"],
+        let err = load_workflow("p", "mixed").unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("inline status identity"), "msg: {msg}");
+        assert!(msg.contains("workflows/statuses.yml"), "msg: {msg}");
+        // No statuses.yml was generated from the inline content.
+        assert!(
+            !statuses_path("p").unwrap().exists(),
+            "loader must not synthesize statuses.yml from inline content"
         );
         std::env::remove_var("SHELBI_HOME");
     }
