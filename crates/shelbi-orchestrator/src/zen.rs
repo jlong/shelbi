@@ -32,7 +32,7 @@ use crate::git::{
     compose_pr_body, head_commit_subject, locate_hub_workdir, locate_workspace_worktree,
     login_shell_prefix, lookup_open_pr, parse_pr_number_from_url, run_in_dir,
 };
-use crate::workspace::workspace_worktree;
+use crate::workspace::{rebase_workspace_branch_onto_default, workspace_worktree, RebaseOutcome};
 
 /// How often `ci_watch` re-runs `gh pr checks` while waiting for the
 /// pending bucket to clear. Matches gh's own `--watch` default.
@@ -399,8 +399,30 @@ pub struct DangerPaths {
 pub struct ProbeReport {
     pub local_checks: Vec<LocalCheck>,
     pub merge_conflict: ConflictProbe,
+    /// Outcome of rebasing the branch onto the *current* default before the
+    /// probe ran. Populated only under [`RebasePolicy::RebaseOntoDefault`];
+    /// always clean under `AsIs`. When `conflicts` is true the rebase was
+    /// aborted (worktree left on the pre-rebase HEAD) and the local checks
+    /// were skipped — `files` names the conflicting paths.
+    pub rebase_conflict: ConflictProbe,
     pub diff_size: DiffSize,
     pub danger_paths: DangerPaths,
+}
+
+/// Whether [`probe_in_workflow`] rebases the branch onto the current
+/// default before gathering facts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RebasePolicy {
+    /// Fetch the project's default branch and rebase the workspace branch
+    /// onto it before probing, so every fact reflects the default as it
+    /// stands *now* — not as it stood at handoff. This is what
+    /// `shelbi zen probe` wants: a re-probe after a blocker merges must
+    /// reflect the merged fix without a manual `git rebase`.
+    RebaseOntoDefault,
+    /// Probe the worktree exactly as it sits — no fetch, no rewrite. Used
+    /// by the read-only dry-run preview (which must not mutate any
+    /// worktree) and the legacy [`probe`] entry point.
+    AsIs,
 }
 
 // ---------------------------------------------------------------------------
@@ -419,7 +441,7 @@ pub struct ProbeReport {
 /// reach for the workflow-aware form so per-workflow `zen:` overrides
 /// (checks, danger_paths) take effect.
 pub fn probe(project: &Project, task: &Task, branch: &str) -> Result<ProbeReport> {
-    probe_in_workflow(project, None, task, branch)
+    probe_in_workflow(project, None, task, branch, RebasePolicy::AsIs)
 }
 
 /// Run every primitive for `task` on `branch`, threading `workflow`
@@ -436,23 +458,76 @@ pub fn probe_in_workflow(
     workflow: Option<&Workflow>,
     task: &Task,
     branch: &str,
+    policy: RebasePolicy,
 ) -> Result<ProbeReport> {
     let (machine, workspace) = resolve_workspace(project, task)?;
     let host = machine.host();
     let worktree = workspace_worktree(&machine, workspace);
 
-    let base = project.base_branch();
-    let merge_conflict = probe_merge_conflict(&host, &worktree, branch, base)?;
-    let diff_size = probe_diff_size(&host, &worktree, branch, base)?;
-    let danger_paths = probe_danger_paths(project, workflow, &host, &worktree, branch)?;
-    let local_checks = probe_local_checks(&host, &worktree, project, workflow, task)?;
+    // Resolve the base ref every fact below is computed against. Under
+    // `RebaseOntoDefault` we fetch the current default and rebase the branch
+    // onto it first, so the probe reflects the default as it stands *now* —
+    // a prereq fix that merged after handoff is already absorbed before the
+    // local checks run, and `base` points at the freshly-fetched ref so the
+    // conflict/diff/danger facts line up with it. Under `AsIs` (the
+    // read-only dry-run preview and the legacy entry point) nothing is
+    // fetched or rewritten.
+    let default_branch = project.base_branch();
+    let (base, rebase_conflict) = match policy {
+        RebasePolicy::AsIs => (default_branch.to_string(), ConflictProbe::default()),
+        RebasePolicy::RebaseOntoDefault => {
+            let target = fetch_probe_base(&host, &worktree, default_branch);
+            let outcome = rebase_workspace_branch_onto_default(&host, &worktree, &target);
+            let conflict = match &outcome {
+                RebaseOutcome::Conflict { files, .. } => ConflictProbe {
+                    conflicts: true,
+                    files: files.clone(),
+                },
+                _ => ConflictProbe::default(),
+            };
+            (target, conflict)
+        }
+    };
+
+    let merge_conflict = probe_merge_conflict(&host, &worktree, branch, &base)?;
+    let diff_size = probe_diff_size(&host, &worktree, branch, &base)?;
+    let danger_paths = probe_danger_paths(project, workflow, &host, &worktree, branch, &base)?;
+    // A rebase conflict means the rebase was aborted and the worktree is
+    // back on the stale handoff HEAD. Running the local checks now would
+    // re-test the exact stale state the probe is meant to move past, so skip
+    // them and let `rebase_conflict` carry the signal.
+    let local_checks = if rebase_conflict.conflicts {
+        Vec::new()
+    } else {
+        probe_local_checks(&host, &worktree, project, workflow, task)?
+    };
 
     Ok(ProbeReport {
         local_checks,
         merge_conflict,
+        rebase_conflict,
         diff_size,
         danger_paths,
     })
+}
+
+/// Fetch `base` from `origin` into the workspace worktree and return the
+/// ref the probe should rebase onto and compare against.
+///
+/// On a successful fetch that's the freshly-updated remote-tracking ref
+/// (`origin/<base>`), so the probe sees whatever merged upstream since the
+/// workspace handed off — the case where the hub's local `<base>` is stale
+/// because the fix landed via a GitHub PR merge, not a local one. A fetch
+/// failure — no `origin` remote (local-only project), an offline host, an
+/// unknown branch name — is non-fatal: we fall back to the local `<base>`
+/// ref the worktree already has, which is exactly the pre-fetch behavior.
+/// This fetch is the only network call the probe makes.
+fn fetch_probe_base(host: &Host, worktree: &std::path::Path, base: &str) -> String {
+    let wt = worktree.to_string_lossy().into_owned();
+    match shelbi_ssh::run(host, ["git", "-C", wt.as_str(), "fetch", "origin", base]) {
+        Ok(o) if o.status.success() => format!("origin/{base}"),
+        _ => base.to_string(),
+    }
 }
 
 fn resolve_workspace<'a>(
@@ -820,13 +895,14 @@ fn probe_danger_paths(
     host: &Host,
     worktree: &std::path::Path,
     branch: &str,
+    base: &str,
 ) -> Result<DangerPaths> {
     let patterns = danger_paths_for_workflow(project, workflow);
     if patterns.is_empty() {
         return Ok(DangerPaths::default());
     }
     let wt = worktree.to_string_lossy().into_owned();
-    let range = format!("{}..{}", project.base_branch(), branch);
+    let range = format!("{base}..{branch}");
     let stdout = shelbi_ssh::run_capture(
         host,
         ["git", "-C", wt.as_str(), "diff", "--name-only", range.as_str()],
@@ -1353,6 +1429,257 @@ mod probe_tests {
         assert_eq!(line_count, OUTPUT_TAIL_LINES);
         // Last line is line-199.
         assert!(res.output_tail.ends_with("line-199"));
+    }
+
+    // --- rebase-onto-default before probing -------------------------------
+    //
+    // These exercise `probe_in_workflow` end-to-end against real git repos
+    // wired exactly the way production does: a workspace worktree at
+    // `<machine.work_dir>/.shelbi/wt/<workspace>` with an `origin` it can
+    // fetch from. The scenarios mirror the bug: the default branch advanced
+    // after handoff, so the probe must fetch + rebase before it can speak
+    // to the *current* state.
+
+    use shelbi_core::{
+        AgentRunnerSpec, GitConfig, HeartbeatConfig, MachineKind, OrchestratorSpec, ZenChecks,
+        ZenConfig,
+    };
+
+    /// Stand up an `origin` bare repo seeded with `main` (one commit adding
+    /// `seed.txt`) and clone it into the workspace's conventional worktree
+    /// path. Returns the temp base (machine work_dir), the origin path, and
+    /// the worktree path. The caller advances `origin/main` and creates the
+    /// task branch to shape each scenario.
+    fn setup_origin_and_worktree() -> (tempfile::TempDir, PathBuf, PathBuf) {
+        let base = tempfile::tempdir().unwrap();
+        let base_path = base.path().to_path_buf();
+
+        // Bare origin holding the canonical default branch.
+        let origin = base_path.join("origin.git");
+        run_git(&base_path, &["init", "-q", "--bare", "-b", "main", origin.to_str().unwrap()]);
+
+        // A throwaway seed clone to push the initial `main` commit.
+        let seed = base_path.join("seed");
+        run_git(&base_path, &["clone", "-q", origin.to_str().unwrap(), seed.to_str().unwrap()]);
+        run_git(&seed, &["config", "user.email", "test@example.com"]);
+        run_git(&seed, &["config", "user.name", "Test"]);
+        std::fs::write(seed.join("seed.txt"), "seed\n").unwrap();
+        run_git(&seed, &["add", "seed.txt"]);
+        run_git(&seed, &["commit", "-q", "-m", "seed main"]);
+        run_git(&seed, &["push", "-q", "origin", "main"]);
+
+        // The workspace worktree lives at the path `workspace_worktree`
+        // computes, so `probe_in_workflow` resolves to it unchanged.
+        let wt = base_path.join(".shelbi").join("wt").join("ws1");
+        std::fs::create_dir_all(wt.parent().unwrap()).unwrap();
+        run_git(&base_path, &["clone", "-q", origin.to_str().unwrap(), wt.to_str().unwrap()]);
+        run_git(&wt, &["config", "user.email", "test@example.com"]);
+        run_git(&wt, &["config", "user.name", "Test"]);
+
+        (base, origin, wt)
+    }
+
+    /// Push a new commit onto `origin/main` from a fresh clone — simulating a
+    /// blocker fix landing on the default branch after the workspace handed
+    /// off. `mutate` shapes the working tree of that commit.
+    fn advance_origin_main<F: FnOnce(&std::path::Path)>(
+        base: &std::path::Path,
+        origin: &std::path::Path,
+        msg: &str,
+        mutate: F,
+    ) {
+        let bump = base.join(format!("bump-{msg}").replace(' ', "-"));
+        run_git(base, &["clone", "-q", origin.to_str().unwrap(), bump.to_str().unwrap()]);
+        run_git(&bump, &["config", "user.email", "test@example.com"]);
+        run_git(&bump, &["config", "user.name", "Test"]);
+        mutate(&bump);
+        run_git(&bump, &["add", "-A"]);
+        run_git(&bump, &["commit", "-q", "-m", msg]);
+        run_git(&bump, &["push", "-q", "origin", "main"]);
+    }
+
+    /// Project pointing its single workspace's worktree at `work_dir`, with
+    /// `local_checks` as its Zen local checks.
+    fn probe_project(work_dir: &std::path::Path, local_checks: &[&str]) -> Project {
+        let mut runners = std::collections::BTreeMap::new();
+        runners.insert(
+            "claude".to_string(),
+            AgentRunnerSpec { command: "claude".into(), flags: vec![] },
+        );
+        Project {
+            name: "probe-test".into(),
+            repo: work_dir.to_string_lossy().into(),
+            default_branch: "main".into(),
+            machines: vec![Machine {
+                name: "hub".into(),
+                kind: MachineKind::Local,
+                work_dir: work_dir.to_path_buf(),
+                host: None,
+            }],
+            orchestrator: OrchestratorSpec { runner: "claude".into() },
+            agent_runners: runners,
+            editor: None,
+            github_url: None,
+            workspaces: vec![WorkspaceSpec {
+                name: "ws1".into(),
+                machine: "hub".into(),
+                runner: "claude".into(),
+            }],
+            workspace_poll_interval_secs: 5,
+            workspace_permissions_mode: "auto".into(),
+            workspace_settings_template: None,
+            zen: ZenConfig {
+                checks: ZenChecks {
+                    local: local_checks.iter().map(|s| s.to_string()).collect(),
+                },
+                ..ZenConfig::default()
+            },
+            heartbeat: HeartbeatConfig::default(),
+            contextstore_sync: Vec::new(),
+            detected_shapes: Vec::new(),
+            git: GitConfig::default(),
+        }
+    }
+
+    fn probe_task(branch: &str) -> Task {
+        let now = chrono::Utc::now();
+        Task {
+            id: "task1".into(),
+            title: "task1".into(),
+            column: Column::Review,
+            priority: 0,
+            assigned_to: Some("ws1".into()),
+            workflow: None,
+            branch: Some(branch.into()),
+            depends_on: Vec::new(),
+            prefers_machine: None,
+            zen: None,
+            created_at: now,
+            updated_at: now,
+            params: std::collections::BTreeMap::new(),
+        }
+    }
+
+    fn head_sha(repo: &std::path::Path) -> String {
+        String::from_utf8_lossy(
+            &Command::new("git").current_dir(repo).args(["rev-parse", "HEAD"]).output().unwrap().stdout,
+        )
+        .trim()
+        .to_string()
+    }
+
+    #[test]
+    fn probe_rebases_stale_worktree_onto_advanced_default() {
+        // (a) The default advanced (a blocker fix added `fix.txt`) after the
+        // workspace handed off. The probe must fetch + rebase so the local
+        // check — which only passes when `fix.txt` is present — sees the new
+        // default. Before the rebase the worktree is stale and the check
+        // would fail.
+        let (base, origin, wt) = setup_origin_and_worktree();
+
+        // Task branch off the seed commit, with its own work.
+        run_git(&wt, &["checkout", "-q", "-b", "shelbi/task1"]);
+        std::fs::write(wt.join("work.txt"), "task work\n").unwrap();
+        run_git(&wt, &["add", "-A"]);
+        run_git(&wt, &["commit", "-q", "-m", "task work"]);
+        let before = head_sha(&wt);
+
+        // Blocker fix lands on origin/main after handoff.
+        advance_origin_main(base.path(), &origin, "add fix", |r| {
+            std::fs::write(r.join("fix.txt"), "fixed\n").unwrap();
+        });
+
+        let project = probe_project(base.path(), &["test -f fix.txt"]);
+        let task = probe_task("shelbi/task1");
+        let report =
+            probe_in_workflow(&project, None, &task, "shelbi/task1", RebasePolicy::RebaseOntoDefault)
+                .unwrap();
+
+        assert!(!report.rebase_conflict.conflicts, "clean rebase expected");
+        assert_eq!(report.local_checks.len(), 1, "the local check must run");
+        assert_eq!(
+            report.local_checks[0].exit_code, 0,
+            "check should see the rebased default (fix.txt present): {}",
+            report.local_checks[0].output_tail
+        );
+        // The branch was actually rewritten onto the advanced default.
+        assert_ne!(head_sha(&wt), before, "HEAD must move after the rebase");
+        assert!(wt.join("fix.txt").exists(), "worktree must contain the fix after rebase");
+    }
+
+    #[test]
+    fn probe_reports_rebase_conflict_and_skips_checks() {
+        // (b) The default advanced on the same lines the task touched, so the
+        // rebase conflicts. The probe must report `rebase_conflict` with the
+        // conflicting file, abort the rebase, and NOT run the local checks.
+        let (base, origin, wt) = setup_origin_and_worktree();
+
+        // Task edits seed.txt.
+        run_git(&wt, &["checkout", "-q", "-b", "shelbi/task1"]);
+        std::fs::write(wt.join("seed.txt"), "task side\n").unwrap();
+        run_git(&wt, &["commit", "-q", "-am", "task edits seed"]);
+
+        // Conflicting edit lands on origin/main.
+        advance_origin_main(base.path(), &origin, "main edits seed", |r| {
+            std::fs::write(r.join("seed.txt"), "main side\n").unwrap();
+        });
+
+        // A check that would obviously "pass" — proving the skip, not the
+        // check result, is what suppresses it.
+        let project = probe_project(base.path(), &["true"]);
+        let task = probe_task("shelbi/task1");
+        let report =
+            probe_in_workflow(&project, None, &task, "shelbi/task1", RebasePolicy::RebaseOntoDefault)
+                .unwrap();
+
+        assert!(report.rebase_conflict.conflicts, "expected a rebase conflict");
+        assert!(
+            report.rebase_conflict.files.iter().any(|f| f == "seed.txt"),
+            "conflict files should name seed.txt, got {:?}",
+            report.rebase_conflict.files
+        );
+        assert!(
+            report.local_checks.is_empty(),
+            "local checks must be skipped on rebase conflict, got {:?}",
+            report.local_checks
+        );
+
+        // The abort left the worktree clean and on the original branch HEAD.
+        let status = Command::new("git")
+            .current_dir(&wt)
+            .args(["status", "--porcelain"])
+            .output()
+            .unwrap();
+        assert!(
+            status.stdout.is_empty(),
+            "worktree must be clean after the aborted rebase"
+        );
+    }
+
+    #[test]
+    fn probe_on_current_worktree_does_not_rewrite_and_runs_checks() {
+        // (c) The worktree already contains the current default — fetch is a
+        // no-op, the rebase is up-to-date, and the checks run immediately. We
+        // prove "no extra work" by asserting HEAD is byte-for-byte unchanged
+        // (no rewrite happened).
+        let (base, _origin, wt) = setup_origin_and_worktree();
+
+        run_git(&wt, &["checkout", "-q", "-b", "shelbi/task1"]);
+        std::fs::write(wt.join("work.txt"), "task work\n").unwrap();
+        run_git(&wt, &["add", "-A"]);
+        run_git(&wt, &["commit", "-q", "-m", "task work"]);
+        let before = head_sha(&wt);
+
+        let project = probe_project(base.path(), &["true"]);
+        let task = probe_task("shelbi/task1");
+        let report =
+            probe_in_workflow(&project, None, &task, "shelbi/task1", RebasePolicy::RebaseOntoDefault)
+                .unwrap();
+
+        assert!(!report.rebase_conflict.conflicts, "no conflict on a current worktree");
+        assert_eq!(report.local_checks.len(), 1, "the check runs when up to date");
+        assert_eq!(report.local_checks[0].exit_code, 0);
+        assert_eq!(head_sha(&wt), before, "an up-to-date branch must not be rewritten");
     }
 }
 
@@ -1926,7 +2253,9 @@ pub fn dry_run_tick(project: &Project) -> Result<Vec<DryRunDecision>> {
             .branch
             .clone()
             .unwrap_or_else(|| format!("shelbi/{}", tf.task.id));
-        match probe_in_workflow(project, workflow_ref, &tf.task, &branch) {
+        // Dry-run is a read-only preview — never fetch or rewrite a
+        // worktree here. `AsIs` keeps the branch exactly as it sits.
+        match probe_in_workflow(project, workflow_ref, &tf.task, &branch, RebasePolicy::AsIs) {
             Ok(report) => {
                 decisions.push(evaluate_probe(&tf.task.id, &report));
             }
@@ -2005,6 +2334,19 @@ pub fn evaluate_probe(task_id: &str, report: &ProbeReport) -> DryRunDecision {
             ),
         };
     }
+    if report.rebase_conflict.conflicts {
+        let files = if report.rebase_conflict.files.is_empty() {
+            "(unknown files)".to_string()
+        } else {
+            report.rebase_conflict.files.join(",")
+        };
+        return DryRunDecision {
+            action: DryRunAction::BlockMerge,
+            task_id: task_id.to_string(),
+            detail: "rebase-conflict".into(),
+            explanation: format!("rebase conflict in: {files}"),
+        };
+    }
     if report.merge_conflict.conflicts {
         let files = if report.merge_conflict.files.is_empty() {
             "(unknown files)".to_string()
@@ -2068,6 +2410,7 @@ mod dry_run_tests {
                 output_tail: String::new(),
             }],
             merge_conflict: ConflictProbe::default(),
+            rebase_conflict: ConflictProbe::default(),
             diff_size: DiffSize { files: 3, lines_added: 40, lines_removed: 5 },
             danger_paths: DangerPaths::default(),
         }
@@ -2104,6 +2447,30 @@ mod dry_run_tests {
         assert_eq!(d.detail, "merge-conflict");
         assert!(d.explanation.contains("src/a.rs"));
         assert!(d.explanation.contains("src/b.rs"));
+    }
+
+    #[test]
+    fn rebase_conflict_blocks_merge_with_files() {
+        let mut r = ok_report();
+        r.rebase_conflict = ConflictProbe {
+            conflicts: true,
+            files: vec!["src/lib.rs".into()],
+        };
+        let d = evaluate_probe("t", &r);
+        assert_eq!(d.action, DryRunAction::BlockMerge);
+        assert_eq!(d.detail, "rebase-conflict");
+        assert!(d.explanation.contains("src/lib.rs"));
+    }
+
+    #[test]
+    fn rebase_conflict_outranks_merge_conflict() {
+        // A rebase that couldn't even complete is the more fundamental
+        // blocker — surface it before the (now meaningless) merge-tree probe.
+        let mut r = ok_report();
+        r.rebase_conflict.conflicts = true;
+        r.merge_conflict.conflicts = true;
+        let d = evaluate_probe("t", &r);
+        assert_eq!(d.detail, "rebase-conflict");
     }
 
     #[test]

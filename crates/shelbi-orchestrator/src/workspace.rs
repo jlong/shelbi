@@ -114,6 +114,11 @@ pub enum RebaseOutcome {
     Conflict {
         default_sha: String,
         stderr_excerpt: String,
+        /// Paths git left in a conflicted (unmerged) state, captured before
+        /// the abort. Empty when git couldn't enumerate them. Callers that
+        /// report conflicts machine-readably (e.g. `zen probe`'s
+        /// `rebase_conflict`) surface this list.
+        files: Vec<String>,
     },
     /// The rebase couldn't even be attempted (default branch missing,
     /// uncommitted changes that aren't ours to absorb, git itself errored).
@@ -157,6 +162,7 @@ impl RebaseOutcome {
             RebaseOutcome::Conflict {
                 default_sha,
                 stderr_excerpt,
+                ..
             } => {
                 let excerpt = stderr_excerpt.trim();
                 if excerpt.is_empty() {
@@ -301,12 +307,27 @@ pub fn rebase_workspace_branch_onto_default(
     };
 
     if !out.status.success() {
-        // Conflict (or some other rebase-time error). Abort so the
-        // worktree returns to its pre-rebase state — the workspace's branch
-        // HEAD is unchanged and the next `git status` is clean. Abort is
-        // best-effort: a hung rebase that won't abort would leave the
-        // worktree in an interactive state, but we still want to log
-        // the conflict and let the review proceed.
+        // Conflict (or some other rebase-time error). Capture the unmerged
+        // paths *before* aborting — `git rebase --abort` rolls the worktree
+        // back and forgets them. `--diff-filter=U` lists exactly the files
+        // left in a conflicted state.
+        let files: Vec<String> = shelbi_ssh::run_capture(
+            host,
+            ["git", "-C", &wt_str, "diff", "--name-only", "--diff-filter=U"],
+        )
+        .map(|s| {
+            s.lines()
+                .map(|l| l.trim().to_string())
+                .filter(|l| !l.is_empty())
+                .collect()
+        })
+        .unwrap_or_default();
+
+        // Abort so the worktree returns to its pre-rebase state — the
+        // workspace's branch HEAD is unchanged and the next `git status` is
+        // clean. Abort is best-effort: a hung rebase that won't abort would
+        // leave the worktree in an interactive state, but we still want to
+        // log the conflict and let the review proceed.
         let _ = shelbi_ssh::run(host, ["git", "-C", &wt_str, "rebase", "--abort"]);
         let stderr = String::from_utf8_lossy(&out.stderr);
         let stdout = String::from_utf8_lossy(&out.stdout);
@@ -329,6 +350,7 @@ pub fn rebase_workspace_branch_onto_default(
         return RebaseOutcome::Conflict {
             default_sha,
             stderr_excerpt: excerpt,
+            files,
         };
     }
 
@@ -2289,10 +2311,14 @@ mod rebase_git_tests {
 
         let outcome = rebase_workspace_branch_onto_default(&Host::Local, &repo, "main");
         match outcome {
-            RebaseOutcome::Conflict { stderr_excerpt, .. } => {
+            RebaseOutcome::Conflict { stderr_excerpt, files, .. } => {
                 assert!(
                     !stderr_excerpt.is_empty(),
                     "expected a non-empty conflict excerpt"
+                );
+                assert!(
+                    files.iter().any(|f| f == "shared.txt"),
+                    "conflict must name the unmerged file, got {files:?}"
                 );
             }
             other => panic!("expected Conflict, got {other:?}"),
