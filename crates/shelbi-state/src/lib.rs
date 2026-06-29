@@ -21,9 +21,15 @@ use shelbi_core::{
 mod agent_workspaces;
 mod hub_config;
 pub mod keymap;
+mod root;
 mod user_config;
 mod workspace_status;
 mod workflows;
+
+pub use root::{
+    ensure_root_subdirs, expand_tilde_path, expand_tilde_str, resolve as resolve_root, root,
+    set_root_override, RootSource, STANDARD_SUBDIRS,
+};
 
 pub use agent_workspaces::{
     agent_instructions_path, agent_shared_preamble_path, agent_skills_dir, agent_workspace_dir,
@@ -124,17 +130,14 @@ pub(crate) mod test_lock {
 pub const DEFAULT_WORKSPACE_SETTINGS_TEMPLATE: &str =
     include_str!("default_workspace_settings.json.template");
 
-/// Default shelbi home directory: `~/.shelbi`, overridable via
-/// `$SHELBI_HOME` (useful for tests and sandboxed CI).
+/// Default shelbi root directory.
+///
+/// Resolves via [`root::resolve`] — see that function for the full
+/// precedence chain. This name is kept for the many in-flight callers
+/// that pre-date the `--root` flag; new code should call
+/// [`root::root`] directly.
 pub fn shelbi_home() -> Result<PathBuf> {
-    if let Ok(p) = std::env::var("SHELBI_HOME") {
-        if !p.is_empty() {
-            return Ok(PathBuf::from(p));
-        }
-    }
-    dirs::home_dir()
-        .map(|h| h.join(".shelbi"))
-        .ok_or_else(|| shelbi_core::Error::Other("no home directory".into()))
+    root::root()
 }
 
 pub fn projects_dir() -> Result<PathBuf> {
@@ -326,12 +329,7 @@ pub fn self_heal_workspace_settings_template(
 }
 
 fn expand_tilde(p: &Path) -> PathBuf {
-    if let Some(rest) = p.to_str().and_then(|s| s.strip_prefix("~/")) {
-        if let Some(home) = dirs::home_dir() {
-            return home.join(rest);
-        }
-    }
-    p.to_path_buf()
+    root::expand_tilde_path(p)
 }
 
 pub fn agents_dir(project: &str) -> Result<PathBuf> {
