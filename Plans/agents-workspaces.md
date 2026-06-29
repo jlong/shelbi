@@ -274,58 +274,66 @@ A fourth, optional: **`shelbi agent edit <name>`** — opens the agent's `instru
 New event line shape for agent-driven dispatches:
 
 ```
-<ts> task=<id> ready -> active reason=orchestrator:auto-dispatch_worker=alpha_agent=developer
+<ts> task=<id> ready -> active reason=orchestrator:auto-dispatch_workspace=alpha_agent=developer
 ```
 
-The `agent=<name>` field appears on every event where a worker is spawned. The activity feed surfaces it as a small badge or tag next to the worker name, so the user can see at a glance which role each worker is playing. Yes, the agent name is already derivable from the status's `owner` field — but having it on the dispatch event keeps the feed self-contained (no need to cross-reference the workflow YAML to know which agent was running).
+Two name changes from today: `worker=` becomes `workspace=` (matches the v1 vocabulary rename), and the new `agent=<name>` field appears on every event where a workspace is spawned. The activity feed surfaces the agent inline as a small badge or tag next to the workspace name, so the user reads role + slot in one glance. Yes, the agent name is already derivable from the status's `agent:` field — but having it on the dispatch event keeps the feed self-contained.
 
-`shelbi worker list` gains an "agent" column (replacing or augmenting the current "claude" column, which is the runtime):
+`shelbi workspace list` (renamed from `shelbi worker list` in v1) restructures its columns:
 
 ```
-NAME      HOST    AGENT          STATE
-alpha     hub     developer      in_progress: <task-id>
-bravo     hub     -              idle
-charlie   hub     developer      in_progress: <task-id>
-delta     devbox  qa             in_progress: <task-id>
+NAME      HOST    MODEL           AGENT          STATE
+alpha     hub     opus-4-7        developer      in_progress: <task-id>
+bravo     hub     opus-4-7        -              idle
+charlie   hub     opus-4-7        developer      in_progress: <task-id>
+delta     devbox  sonnet-4-6      qa             in_progress: <task-id>
 ```
 
-When idle, the agent column shows `-`; when running, it shows the agent that was loaded for the current task.
+- `MODEL` replaces today's `claude` column. More generic name future-proofs for non-Claude runtimes and disambiguates from the new `AGENT` column.
+
+- `AGENT` is new. Shows `-` when the workspace is idle; the agent name (matching a directory under `agents/`) when a task is dispatched.
+
+Event parsers should accept both `worker=` and `workspace=` for one release (deprecation window for the rename).
 
 ## Rollout
 
-Two phases. Each is independently shippable; v1 does the rebrand + introduces the abstraction; v2 turns on the per-status binding for richer workflows.
+Two phases. Each is independently shippable; v1 does the rebrand + introduces the abstraction + completes the CLI rename; v2 polishes for custom workflows.
 
-**Phase 1 — Rebrand + Orchestrator + Developer.**
+**Phase 1 — Rebrand + Orchestrator + Developer + CLI rename.**
 
-- Rename sidebar section "Agents" → "Workers".
+- Rename sidebar section "Agents" → "Workspaces" (grouped-by-machine tree per §1).
+
+- **Rename** **`shelbi worker *`** **→** **`shelbi workspace *`** **across the entire surface** — CLI command, all flags' help text, every CLAUDE.md / doc / orchestrator-prompt reference, the `worker:*` event-line reason prefixes. `shelbi worker *` stays as a deprecation alias for one release with a one-line stderr nag.
 
 - Add `~/.shelbi/projects/<project>/agents/` to the project layout. Materialize `orchestrator/` and `developer/` on `shelbi init` (and self-heal on `shelbi reload` if either is missing).
 
-- Move the embedded orchestrator prompt from `crates/shelbi-orchestrator/src/default_orchestrator.md.template` into `agents/orchestrator/instructions.md` (the shipped default). The template still exists in the binary for init/self-heal.
+- Move the embedded orchestrator prompt from `crates/shelbi-orchestrator/src/default_orchestrator.md.template` into `agents/orchestrator/instructions.md` (the shipped default). Template still exists in the binary for init/self-heal.
 
-- Extend the workflow loader to accept any agent name in the `owner:` field (not just `user` / `agent`). Validate against the project's `agents/` directory. Auto-migrate legacy `owner: agent` entries with a deprecation warning. Default workflow gets `owner: orchestrator` on `todo` and `owner: developer` on `in-progress`.
+- **Deprecate** **`CLAUDE.md`.** Project-wide context moves into `agents/_shared/preamble.md` (prepended to every agent's prompt); orchestrator-specific overrides go into `agents/orchestrator/instructions.md`. The orchestrator stops auto-loading `CLAUDE.md`; if a project still has one, emit a one-time migration hint pointing at the new locations.
 
-- Update `shelbi task start`'s worker-spawn path to load the agent's `instructions.md` as system prompt and mount its `skills/` into `.claude/skills/`.
+- Extend the workflow loader for the two-field design: `owner: user | agent` + optional `agent: <name>`. Hard-fail if `owner: agent` without `agent:`. Auto-migrate legacy single-field workflows (`owner: <name>` → `owner: agent, agent: <name>`; bare `owner: agent` → category-defaulted `agent:`) with a one-time deprecation warning.
 
-- Add the `agent=<name>` field to dispatch event lines.
+- Update `shelbi task start`'s spawn path: load the agent's `instructions.md` as system prompt (prepended with the project's `agents/_shared/preamble.md` if present), mount `skills/` into `.claude/skills/`.
 
-- Add the "agent" column to `shelbi worker list`.
+- Add the `agent=<name>` field to dispatch event lines. Rename `worker=<name>` → `workspace=<name>` in events (with the parser tolerating the old form for one release).
+
+- Restructure `shelbi workspace list` columns: `NAME`, `HOST`, `MODEL`, `AGENT`, `STATE`. (`MODEL` replaces today's `claude` column with a more general name; `AGENT` is new.)
 
 - Add `shelbi agent list` and `shelbi agent show`.
 
-After Phase 1: the abstraction exists and the default workflow uses it, but visibly nothing changes for users who don't customize agents. The Developer agent's behavior matches today's "default Claude on a worker."
+After Phase 1: the abstraction exists, the default workflow uses it, the CLI vocabulary is fully migrated, and Zen behavior is declarative. Users running plain dispatcher mode see the column changes and the sidebar reorg; nothing else visibly changes.
 
-**CLI compatibility — what v1 promises to existing** **`shelbi worker *`** **users.**
+**CLI compatibility — v1 promises to existing** **`shelbi worker *`** **users.**
 
-- `shelbi worker list` — gains an `AGENT` column showing the agent currently loaded (or `-` when idle). `NAME`, `HOST`, `STATE` unchanged. No flag changes.
+- **Every** **`shelbi worker <subcommand>`** **invocation keeps working** as a deprecation alias that resolves to `shelbi workspace <subcommand>` and prints a one-line stderr hint pointing at the new name. Aliases stay for at least one release; remove in v2.
 
-- `shelbi worker stop <name>` — unchanged. The agent loaded in the pane (if any) dies with the pane; agents aren't long-lived state.
+- `shelbi workspace list` (the new canonical name) — columns are `NAME` / `HOST` / `MODEL` / `AGENT` / `STATE`. The old `claude` column is replaced by `MODEL`; `AGENT` is new (shows `-` when idle).
 
-- `shelbi worker --help` — description text updated to use "workspace" where the command operates on a slot, but command names and flags are untouched.
+- `shelbi workspace stop <name>` — same semantics as `shelbi worker stop` today.
 
-- **New parallel surface:** **`shelbi agent list / show`** (and `new` in Phase 2). These don't replace `worker *`; they're a separate noun for the agent concept.
+- Event-log reasons: `worker:*` prefixes rename to `workspace:*`. Parsers should accept both for one release.
 
-- **`shelbi worker *`** **is NOT renamed in v1.** The eventual `worker → workspace` rename lives in Open Questions, deferred to v2. Until then every CLAUDE.md, every doc, every muscle-memory invocation keeps working.
+- **New parallel surface:** **`shelbi agent list / show`** (and `new` in Phase 2). Operates on the agent concept, not workspaces.
 
 **Phase 2 — Custom agents + workflow integration polish.**
 
@@ -337,9 +345,9 @@ After Phase 1: the abstraction exists and the default workflow uses it, but visi
 
 - Refine the orchestrator self-heal on binary upgrade (detect modified-from-default, leave alone; refresh if untouched).
 
-- Optional: `shelbi agent edit <name>` opens in `$EDITOR`.
+- Drop the `shelbi worker *` deprecation aliases and the `worker=` event-line parser fallback.
 
-- Optional: global agent library at `~/.shelbi/agents/` (cross-project), if real usage demands it.
+- Optional: `shelbi agent edit <name>` opens in `$EDITOR`.
 
 After Phase 2: custom workflows + custom agents are fully composable. A user can drop in a QA agent, wire it to a `qa` status, and have every task pass through their custom verification gate.
 
