@@ -19,6 +19,7 @@ use shelbi_state::keymap::{load_keymaps, GlobalAction};
 
 pub mod actions;
 pub mod contextstore;
+pub mod dispatch;
 mod git;
 pub mod lifecycle;
 pub mod review;

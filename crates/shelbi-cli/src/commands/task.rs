@@ -476,6 +476,60 @@ fn norm_status_id(s: &str) -> String {
         .collect()
 }
 
+/// Resolve which agent should drive the workspace once it lands in the
+/// active (in-progress) status. `shelbi task start` is an explicit user
+/// invocation — we don't gate on Zen here even when the active status
+/// is `owner: user` (the user typed the command, that's the override).
+/// Falls back to the bundled `developer` agent when the workflow can't
+/// be loaded or has no active-category status (legacy workflows without
+/// the two-field design); the worktree's agent context still deploys so
+/// the bundled developer prompt + skills are wired up correctly.
+fn resolve_active_agent_for_dispatch(project: &str, task: &Task) -> Result<String> {
+    use shelbi_core::StatusCategory;
+    use shelbi_orchestrator::dispatch::{resolve_dispatch_agent, DispatchDecision};
+    use shelbi_state::DEVELOPER_AGENT;
+
+    let workflow = resolve_task_workflow(project, task)?;
+    // The active-category status is what the task lands in after `task
+    // start` — its `agent:` field is the runner we want spawned.
+    let active = workflow
+        .statuses
+        .iter()
+        .find(|s| s.category == StatusCategory::Active);
+
+    let zen_on = matches!(
+        shelbi_state::read_state(project).map(|s| s.zen_mode),
+        Ok(shelbi_state::ZenModeState::On),
+    );
+
+    let Some(status) = active else {
+        // Workflow without an active status (rare; legacy minimal
+        // workflows from before the two-field design). Fall back to the
+        // built-in developer so the spawn path still mounts agent
+        // context.
+        return Ok(DEVELOPER_AGENT.to_string());
+    };
+
+    match resolve_dispatch_agent(status, zen_on) {
+        DispatchDecision::Dispatch { agent } => Ok(agent),
+        DispatchDecision::Skip(reason) => {
+            // The CLI is the explicit-intent path: a `Skip` here means
+            // the loader allowed a workflow whose active status has no
+            // `agent:` (legacy, fully-human workflow). Fall back to the
+            // developer agent so the spawn path still has *something*
+            // to deploy, and surface the resolver's diagnostic so the
+            // user knows why we didn't honor the workflow's wish.
+            eprintln!(
+                "shelbi: workflow `{}` active status had no dispatchable agent \
+                 ({}); falling back to `{DEVELOPER_AGENT}`",
+                workflow.name,
+                reason.human_message(),
+            );
+            Ok(DEVELOPER_AGENT.to_string())
+        }
+    }
+}
+
 fn assign(project: &str, id: &str, workspace: &str) -> Result<()> {
     let project_yaml = shelbi_state::load_project(project).map_err(|e| anyhow!(e))?;
     if project_yaml.workspace(workspace).is_none() {
@@ -606,7 +660,19 @@ fn start(
         .or_else(|| tf.task.branch.clone())
         .unwrap_or_else(|| format!("shelbi/{id}"));
 
-    println!("→ launching {workspace_name} on {id} (branch: {branch})");
+    // Resolve which agent runs in the spawned pane. `shelbi task start`
+    // is always putting the task into `in_progress`, so we look up the
+    // workflow's active status and ask the dispatch resolver which
+    // agent answers for it under the project's current Zen state. The
+    // CLI is an explicit user invocation, so we don't honor the
+    // "owner: user + Zen off → skip" rule here — the user typed the
+    // command, that's the intent override. We still surface the
+    // resolver's verdict via the `agent=` field on StartSpec so the
+    // worktree picks up the right `instructions.md` + skills mount.
+    let agent_name = resolve_active_agent_for_dispatch(project, &tf.task)
+        .map_err(|e| anyhow!(e))?;
+
+    println!("→ launching {workspace_name} on {id} (branch: {branch}, agent: {agent_name})");
     let addr = shelbi_orchestrator::workspace::start_workspace_on_task(
         shelbi_orchestrator::workspace::StartSpec {
             project: &project_yaml,
@@ -614,6 +680,7 @@ fn start(
             task_id: id,
             branch: &branch,
             task_body: &tf.body,
+            agent: Some(agent_name.as_str()),
         },
     )
     .map_err(|e| anyhow!(e))?;
@@ -968,6 +1035,83 @@ statuses:
         let mut research = task_in(Column::Todo, "r");
         research.workflow = Some("research".into());
         assert_eq!(research.workflow_or_default(), "research");
+    }
+
+    fn write_workflow(project: &str, name: &str, yaml: &str) {
+        let dir = shelbi_state::workflows_dir(project).unwrap();
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join(format!("{name}.yaml")), yaml).unwrap();
+    }
+
+    fn materialize_default_agents_for_test(project: &str) {
+        // The workflow loader rejects `agent:` references that don't
+        // point at a real `agents/<name>/` directory. The resolver's
+        // workflow loads pass through that check, so the test fixture
+        // has to materialize the default agent set just like a real
+        // `shelbi init` does.
+        shelbi_state::materialize_default_agents(project).unwrap();
+    }
+
+    #[test]
+    fn resolve_active_agent_dispatches_developer_for_default_workflow() {
+        // Acceptance criterion (a) from the task: a default `shelbi task
+        // start` resolves the active status's agent and lands on
+        // `developer`. The resolver doesn't care about Zen mode for an
+        // `owner: agent` status, so this passes regardless of state.
+        let _g = TEST_LOCK.lock().unwrap();
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+        materialize_default_agents_for_test("p");
+        write_workflow(
+            "p",
+            "default",
+            r#"
+name: default
+statuses:
+  - { id: backlog,     name: Backlog,    category: backlog,  owner: user                       }
+  - { id: todo,        name: Todo,       category: ready,    owner: agent, agent: orchestrator }
+  - { id: in-progress, name: InProgress, category: active,   owner: agent, agent: developer    }
+  - { id: review,      name: Review,     category: handoff,  owner: user,  agent: orchestrator }
+  - { id: done,        name: Done,       category: done,     owner: user                       }
+"#,
+        );
+
+        let task = task_in(Column::Todo, "t1");
+        let agent = resolve_active_agent_for_dispatch("p", &task).unwrap();
+        assert_eq!(agent, "developer");
+
+        std::env::remove_var("SHELBI_HOME");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn resolve_active_agent_falls_back_to_developer_for_workflow_without_active() {
+        // A legacy workflow without an `active`-category status (rare,
+        // but possible with the historic minimal flow). The resolver
+        // can't resolve through the workflow, so it falls back to the
+        // bundled `developer` agent — that way the spawn path still
+        // mounts agent context, instead of silently dispatching with
+        // nothing.
+        let _g = TEST_LOCK.lock().unwrap();
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+        materialize_default_agents_for_test("p");
+        write_workflow(
+            "p",
+            "default",
+            r#"
+name: default
+statuses:
+  - { id: backlog, name: Backlog, category: backlog, owner: user }
+  - { id: done,    name: Done,    category: done,    owner: user }
+"#,
+        );
+        let task = task_in(Column::Todo, "t2");
+        let agent = resolve_active_agent_for_dispatch("p", &task).unwrap();
+        assert_eq!(agent, shelbi_state::DEVELOPER_AGENT);
+
+        std::env::remove_var("SHELBI_HOME");
+        let _ = std::fs::remove_dir_all(&home);
     }
 
     #[test]
