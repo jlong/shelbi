@@ -131,8 +131,18 @@ pub fn run(project_opt: Option<String>, cmd: ZenCmd) -> Result<()> {
                 .branch
                 .clone()
                 .unwrap_or_else(|| format!("shelbi/{}", tf.task.id));
-            let report = zen::probe_in_workflow(&project, workflow.as_ref(), &tf.task, &branch)
-                .map_err(|e| anyhow!(e))?;
+            // `zen probe` wants facts about the branch as it would land
+            // *today* — fetch the current default and rebase onto it first
+            // so a re-probe after a blocker merges reflects the merged fix
+            // without a manual `git rebase`.
+            let report = zen::probe_in_workflow(
+                &project,
+                workflow.as_ref(),
+                &tf.task,
+                &branch,
+                zen::RebasePolicy::RebaseOntoDefault,
+            )
+            .map_err(|e| anyhow!(e))?;
             println!("{}", serde_json::to_string_pretty(&report)?);
             Ok(())
         }
