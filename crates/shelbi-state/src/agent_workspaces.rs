@@ -26,13 +26,25 @@ use std::path::PathBuf;
 
 use shelbi_core::{Error, Result};
 
-use crate::{agents_dir, ensure_dir, read_state, write_state};
+use crate::{agents_dir, ensure_dir, load_shelbi_config, project_dir, read_state, write_state};
 
 /// Stable identifier of the default orchestrator agent.
 pub const ORCHESTRATOR_AGENT: &str = "orchestrator";
 
 /// Stable identifier of the default developer agent.
 pub const DEVELOPER_AGENT: &str = "developer";
+
+/// Reserved subdirectory name under `agents/` that holds the per-project
+/// shared preamble — project-wide context prepended to every agent's
+/// `instructions.md` at dispatch time. NOT an agent itself; the
+/// [`list_agents`] / `shelbi agent new` paths skip names starting with
+/// `_` so this stays out of the agent list.
+pub const SHARED_AGENT_DIR: &str = "_shared";
+
+/// File name of the project-wide preamble that gets prepended to every
+/// dispatched agent's `instructions.md`. Optional — absent file means
+/// agents see their own instructions verbatim.
+pub const SHARED_PREAMBLE_FILE: &str = "preamble.md";
 
 /// Bundled orchestrator `instructions.md` content. Source of truth for
 /// both the agent workspace materialize/self-heal path and the legacy
@@ -68,6 +80,123 @@ pub fn agent_instructions_path(project: &str, agent: &str) -> Result<PathBuf> {
 /// task-dispatch path (landed in a later subtask). Ships empty in v1.
 pub fn agent_skills_dir(project: &str, agent: &str) -> Result<PathBuf> {
     Ok(agent_workspace_dir(project, agent)?.join("skills"))
+}
+
+/// `~/.shelbi/projects/<project>/agents/_shared/preamble.md` — the
+/// optional, per-project shared preamble that gets prepended to every
+/// dispatched agent's `instructions.md`.
+pub fn agent_shared_preamble_path(project: &str) -> Result<PathBuf> {
+    Ok(agents_dir(project)?
+        .join(SHARED_AGENT_DIR)
+        .join(SHARED_PREAMBLE_FILE))
+}
+
+/// Read the per-project shared preamble if it exists, otherwise return
+/// `None`. The preamble is optional — a missing file is a normal state
+/// (not every project has shared context to inject), not an error.
+pub fn load_shared_preamble(project: &str) -> Result<Option<String>> {
+    let path = agent_shared_preamble_path(project)?;
+    match fs::read_to_string(&path) {
+        Ok(s) => Ok(Some(s)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(Error::Io(e)),
+    }
+}
+
+/// Build the system prompt for `agent` in `project` by composing
+/// `agents/_shared/preamble.md` (if present) with the agent's own
+/// `instructions.md`. The two halves are joined with a single blank line
+/// so the agent's first H1 doesn't collide with the preamble's tail.
+///
+/// `{{assistant_name}}` is substituted in the composed body using the
+/// user's chosen assistant name from `~/.shelbi/shelbi.yaml` (falling
+/// back to [`crate::DEFAULT_ASSISTANT_NAME`] when the wizard hasn't
+/// run). Agent prompts that don't reference the placeholder are
+/// unaffected — `String::replace` on a no-match is free.
+pub fn compose_agent_prompt(project: &str, agent: &str) -> Result<String> {
+    let instructions_path = agent_instructions_path(project, agent)?;
+    let instructions = fs::read_to_string(&instructions_path).map_err(|e| {
+        Error::Other(format!(
+            "agent `{agent}` instructions.md unreadable at {}: {e}",
+            instructions_path.display(),
+        ))
+    })?;
+    let preamble = load_shared_preamble(project)?;
+    let composed = match preamble {
+        Some(p) => {
+            let mut out = String::with_capacity(p.len() + instructions.len() + 2);
+            out.push_str(&p);
+            if !p.ends_with('\n') {
+                out.push('\n');
+            }
+            out.push('\n');
+            out.push_str(&instructions);
+            out
+        }
+        None => instructions,
+    };
+    let cfg = load_shelbi_config()?;
+    Ok(composed.replace("{{assistant_name}}", cfg.assistant_name()))
+}
+
+/// Path to the legacy orchestrator `CLAUDE.md` file that pre-shelbi
+/// versions wrote at `~/.shelbi/projects/<project>/CLAUDE.md`. Kept as a
+/// helper so the migration-hint code path and a future cleanup utility
+/// agree on the location.
+pub fn legacy_claude_md_path(project: &str) -> Result<PathBuf> {
+    Ok(project_dir(project)?.join("CLAUDE.md"))
+}
+
+/// Emit a one-time stderr hint when a legacy `CLAUDE.md` is still
+/// present at the project root. The orchestrator no longer reads it on
+/// dispatch — this nudges the user toward `agents/_shared/preamble.md`
+/// (project-wide) and `agents/orchestrator/instructions.md`
+/// (orchestrator-specific overrides) and to delete `CLAUDE.md` once the
+/// migration is done.
+///
+/// Idempotent: the per-project [`State::claude_md_migration_hinted`]
+/// flag gates emission so multiple workspace dispatches inside the same
+/// orchestrator session only see the hint once. Reset the flag with
+/// [`reset_claude_md_migration_hint`] at orchestrator startup.
+///
+/// Best-effort — IO failures from `read_state`/`write_state` are
+/// returned to the caller so the spawn path can decide whether to bail
+/// or proceed. In practice every caller treats the hint as advisory and
+/// uses `let _ = …` to ignore the result.
+pub fn maybe_emit_claude_md_migration_hint(project: &str) -> Result<()> {
+    let mut state = read_state(project)?;
+    if state.claude_md_migration_hinted {
+        return Ok(());
+    }
+    let path = legacy_claude_md_path(project)?;
+    if !path.exists() {
+        return Ok(());
+    }
+    eprintln!(
+        "shelbi: CLAUDE.md detected at {} but no longer read.\n  \
+         → project-wide context belongs in agents/_shared/preamble.md\n  \
+         → orchestrator-specific overrides belong in agents/orchestrator/instructions.md\n  \
+         → remove CLAUDE.md when migration is complete.",
+        path.display(),
+    );
+    state.claude_md_migration_hinted = true;
+    write_state(project, &state)
+}
+
+/// Clear the per-project "migration hint already fired" flag so the
+/// next [`maybe_emit_claude_md_migration_hint`] call (in this
+/// orchestrator session) re-checks the disk and emits if applicable.
+/// Called from `__zen-orch-start` so each new orchestrator session
+/// starts with a clean slate — the v1 deprecation guidepost should
+/// surface once per session regardless of where the first dispatch
+/// originates.
+pub fn reset_claude_md_migration_hint(project: &str) -> Result<()> {
+    let mut state = read_state(project)?;
+    if !state.claude_md_migration_hinted {
+        return Ok(());
+    }
+    state.claude_md_migration_hinted = false;
+    write_state(project, &state)
 }
 
 /// Names of every agent under `~/.shelbi/projects/<project>/agents/`,
@@ -526,8 +655,9 @@ mod tests {
 
     /// The orchestrator's `DEFAULT_SYSTEM_PROMPT` re-export must keep
     /// pointing at the same bytes the agent workspace ships, otherwise
-    /// the dashboard's CLAUDE.md and the per-project
-    /// `agents/orchestrator/instructions.md` will drift.
+    /// the dashboard's deployed `.claude/agent-instructions.md` and
+    /// the per-project `agents/orchestrator/instructions.md` will
+    /// drift.
     #[test]
     fn orchestrator_template_byte_matches_default_instructions_const() {
         assert!(!DEFAULT_ORCHESTRATOR_INSTRUCTIONS.is_empty());
@@ -622,5 +752,189 @@ mod tests {
             Some(DEFAULT_DEVELOPER_INSTRUCTIONS),
         );
         assert_eq!(default_agent_body("qa"), None);
+    }
+
+    /// Acceptance criterion (b): missing `agents/_shared/preamble.md` is
+    /// a no-op — the agent's own `instructions.md` flows through
+    /// verbatim (modulo `{{assistant_name}}` substitution).
+    #[test]
+    fn compose_agent_prompt_returns_just_instructions_when_preamble_absent() {
+        let _g = LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+
+        let workspace = agent_workspace_dir("p", "developer").unwrap();
+        ensure_dir(&workspace).unwrap();
+        fs::write(
+            agent_instructions_path("p", "developer").unwrap(),
+            "# Developer\nbody\n",
+        )
+        .unwrap();
+        // Sanity: no _shared/ dir on disk.
+        assert!(!agent_shared_preamble_path("p").unwrap().exists());
+
+        let composed = compose_agent_prompt("p", "developer").unwrap();
+        assert_eq!(composed, "# Developer\nbody\n");
+        std::env::remove_var("SHELBI_HOME");
+    }
+
+    /// Acceptance criterion (a): when `agents/_shared/preamble.md`
+    /// exists, its contents land before the agent's `instructions.md`
+    /// with a single blank line between them so a heading at the top
+    /// of `instructions.md` doesn't collide with the preamble's tail.
+    #[test]
+    fn compose_agent_prompt_prepends_preamble_with_blank_separator() {
+        let _g = LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+
+        let workspace = agent_workspace_dir("p", "developer").unwrap();
+        ensure_dir(&workspace).unwrap();
+        fs::write(
+            agent_instructions_path("p", "developer").unwrap(),
+            "# Developer\nbody\n",
+        )
+        .unwrap();
+        let preamble_path = agent_shared_preamble_path("p").unwrap();
+        ensure_dir(preamble_path.parent().unwrap()).unwrap();
+        fs::write(&preamble_path, "project monorepo overview\n").unwrap();
+
+        let composed = compose_agent_prompt("p", "developer").unwrap();
+        assert_eq!(
+            composed, "project monorepo overview\n\n# Developer\nbody\n",
+            "preamble must come first, blank line separator, then instructions"
+        );
+        std::env::remove_var("SHELBI_HOME");
+    }
+
+    /// Preamble that doesn't end with a newline still gets a clean
+    /// blank-line separator before the agent body. Otherwise the
+    /// composed text would read `preamble# Developer` and the agent's
+    /// heading would be mis-rendered.
+    #[test]
+    fn compose_agent_prompt_normalizes_preamble_missing_trailing_newline() {
+        let _g = LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+
+        let workspace = agent_workspace_dir("p", "developer").unwrap();
+        ensure_dir(&workspace).unwrap();
+        fs::write(
+            agent_instructions_path("p", "developer").unwrap(),
+            "# Developer\n",
+        )
+        .unwrap();
+        let preamble_path = agent_shared_preamble_path("p").unwrap();
+        ensure_dir(preamble_path.parent().unwrap()).unwrap();
+        // NB: no trailing \n in the preamble body.
+        fs::write(&preamble_path, "preamble").unwrap();
+
+        let composed = compose_agent_prompt("p", "developer").unwrap();
+        assert_eq!(composed, "preamble\n\n# Developer\n");
+        std::env::remove_var("SHELBI_HOME");
+    }
+
+    /// The `{{assistant_name}}` placeholder used by the orchestrator
+    /// template still gets substituted when the prompt flows through
+    /// the compose pipeline (formerly `system_prompt()` did it).
+    #[test]
+    fn compose_agent_prompt_substitutes_assistant_name_placeholder() {
+        let _g = LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+
+        let workspace = agent_workspace_dir("p", ORCHESTRATOR_AGENT).unwrap();
+        ensure_dir(&workspace).unwrap();
+        fs::write(
+            agent_instructions_path("p", ORCHESTRATOR_AGENT).unwrap(),
+            "# You are {{assistant_name}}\nbody\n",
+        )
+        .unwrap();
+        // No custom config — falls back to DEFAULT_ASSISTANT_NAME.
+        let composed = compose_agent_prompt("p", ORCHESTRATOR_AGENT).unwrap();
+        assert!(
+            composed.contains(&format!("# You are {}", crate::DEFAULT_ASSISTANT_NAME)),
+            "placeholder should be substituted: {composed}",
+        );
+        assert!(
+            !composed.contains("{{assistant_name}}"),
+            "no raw placeholder should survive: {composed}",
+        );
+        std::env::remove_var("SHELBI_HOME");
+    }
+
+    /// Acceptance criterion (c): the migration hint fires exactly once
+    /// per orchestrator session when a legacy CLAUDE.md is present.
+    /// Reset clears the latch so the next session re-emits.
+    #[test]
+    fn maybe_emit_claude_md_migration_hint_is_one_shot_per_session() {
+        let _g = LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+
+        // Seed a legacy CLAUDE.md at the project workdir.
+        let path = legacy_claude_md_path("p").unwrap();
+        ensure_dir(path.parent().unwrap()).unwrap();
+        fs::write(&path, "old orchestrator prompt\n").unwrap();
+
+        // First emission flips the latch.
+        maybe_emit_claude_md_migration_hint("p").unwrap();
+        assert!(read_state("p").unwrap().claude_md_migration_hinted);
+
+        // Subsequent calls in the same session are no-ops — flag stays
+        // set, no extra writes.
+        maybe_emit_claude_md_migration_hint("p").unwrap();
+        assert!(read_state("p").unwrap().claude_md_migration_hinted);
+
+        // Reset (called at orch_start) re-arms emission for the new
+        // session.
+        reset_claude_md_migration_hint("p").unwrap();
+        assert!(!read_state("p").unwrap().claude_md_migration_hinted);
+
+        // After reset, the next emission re-flips the latch.
+        maybe_emit_claude_md_migration_hint("p").unwrap();
+        assert!(read_state("p").unwrap().claude_md_migration_hinted);
+
+        std::env::remove_var("SHELBI_HOME");
+    }
+
+    /// Acceptance criterion (d): the migration hint does NOT fire when
+    /// no legacy CLAUDE.md is present at the project root.
+    #[test]
+    fn maybe_emit_claude_md_migration_hint_does_not_fire_when_file_absent() {
+        let _g = LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+
+        // No CLAUDE.md at the project workdir — the only place we look.
+        let path = legacy_claude_md_path("p").unwrap();
+        assert!(!path.exists());
+
+        maybe_emit_claude_md_migration_hint("p").unwrap();
+        // Latch stays unset so a CLAUDE.md that appears later (e.g.
+        // user pulls a teammate's branch) is still detected.
+        assert!(!read_state("p").unwrap().claude_md_migration_hinted);
+
+        std::env::remove_var("SHELBI_HOME");
+    }
+
+    /// Reset is a no-op when the latch is already clear — important so
+    /// orch_start doesn't dirty `state.json` (and the resulting write
+    /// can't race) on every cold start.
+    #[test]
+    fn reset_claude_md_migration_hint_is_noop_when_already_clear() {
+        let _g = LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+
+        // No prior emission, so the flag is clear.
+        assert!(!read_state("p").unwrap().claude_md_migration_hinted);
+        // Reset must not panic, must not write, must not flip the flag.
+        reset_claude_md_migration_hint("p").unwrap();
+        assert!(!read_state("p").unwrap().claude_md_migration_hinted);
+        // state.json was never created since nothing was dirty.
+        assert!(!crate::state_path("p").unwrap().exists());
+
+        std::env::remove_var("SHELBI_HOME");
     }
 }

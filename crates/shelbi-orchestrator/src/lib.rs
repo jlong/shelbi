@@ -103,21 +103,12 @@ pub enum PaneReloadStatus {
     },
 }
 
-/// Resolve the active orchestrator system prompt for a project: per-project
-/// override (`ORCHESTRATOR.md`) if present, else the bundled default.
-/// The string `{{assistant_name}}` is substituted with the user's chosen
-/// assistant name from `~/.shelbi/shelbi.yaml` (falling back to the
-/// default `Orchestrator` when the wizard hasn't run yet).
-pub fn system_prompt(project: &str) -> Result<String> {
-    let path = shelbi_state::project_dir(project)?.join("ORCHESTRATOR.md");
-    let raw = if path.exists() {
-        std::fs::read_to_string(&path).map_err(Error::Io)?
-    } else {
-        DEFAULT_SYSTEM_PROMPT.to_string()
-    };
-    let cfg = shelbi_state::load_shelbi_config()?;
-    Ok(raw.replace("{{assistant_name}}", cfg.assistant_name()))
-}
+/// Relative path (from the orchestrator's workdir) where the composed
+/// orchestrator system prompt is staged for claude's
+/// `--append-system-prompt` flag. Mirrors the workspace-side
+/// [`crate::workspace::WORKTREE_AGENT_INSTRUCTIONS_REL`] so both panes
+/// load their agent context from the same conventional location.
+pub const ORCH_AGENT_INSTRUCTIONS_REL: &str = ".claude/agent-instructions.md";
 
 /// The dashboard window's tmux address (orchestrator's session).
 pub fn dashboard_addr(project_name: &str) -> TmuxAddr {
@@ -289,12 +280,24 @@ pub fn ensure_dashboard(project_name: &str) -> Result<BootstrapStatus> {
     // it survives shelbi upgrades and tmux-server restarts.
     install_stash_cleanup_hook(&host)?;
 
-    // Materialize the orchestrator's workdir + CLAUDE.md upfront — needed
-    // whether we create the session from scratch or just the right pane.
+    // Materialize the orchestrator's workdir upfront — needed whether we
+    // create the session from scratch or just the right pane. The
+    // orchestrator's agent context (composed preamble +
+    // `agents/orchestrator/instructions.md` + skills) is deployed into
+    // the workdir's `.claude/` footprint and wired through claude's
+    // `--append-system-prompt` flag below; the legacy
+    // `<workdir>/CLAUDE.md` write is gone (see `aw-deprecate-claude-md-…`
+    // task). A missing `agents/orchestrator/` is best-effort — the user
+    // may have nuked it; the launch still succeeds, just without the
+    // bundled orchestrator prompt.
     let workdir = shelbi_state::project_dir(project_name)?;
     shelbi_state::ensure_dir(&workdir)?;
-    let prompt = system_prompt(project_name)?;
-    std::fs::write(workdir.join("CLAUDE.md"), &prompt).map_err(Error::Io)?;
+    let _ = workspace::deploy_agent_context(
+        &host,
+        &workdir,
+        project_name,
+        shelbi_state::ORCHESTRATOR_AGENT,
+    );
 
     // Drop the sidebar-clamp script. The bootstrapped hooks invoke it
     // via `sh <path>` — keeping the body in a file dodges all of the
@@ -685,29 +688,33 @@ fn sidebar_cmd(shelbi_bin: &str, project_name: &str) -> String {
 }
 
 /// Initial positional prompt fed to the orchestrator agent on launch so
-/// it runs the "Bootstrap on session start" sequence from `CLAUDE.md`
-/// without waiting for the user to type "start monitoring". The prompt
-/// names every step verbatim so the agent can't elide arming the
-/// `shelbi events tail --follow` watch — that's the step that turns
-/// auto-dispatch back on after a cold start.
+/// it runs the "Bootstrap on session start" sequence from its
+/// `instructions.md` without waiting for the user to type "start
+/// monitoring". The prompt names every step verbatim so the agent can't
+/// elide arming the `shelbi events tail --follow` watch — that's the
+/// step that turns auto-dispatch back on after a cold start.
 const ORCH_BOOTSTRAP_PROMPT: &str = "Run the \"Bootstrap on session start\" sequence \
-    from CLAUDE.md now: snapshot `shelbi task list`, `shelbi workspace list`, and \
+    from your instructions now: snapshot `shelbi task list`, `shelbi workspace list`, and \
     `shelbi zen status`; scan recent `~/.shelbi/events.log` for a \
     `zen=off reason=crash-recovery` line; then start `shelbi events tail --follow` \
     in the background and watch it with the Monitor tool so auto-dispatch reacts \
     to new transitions.";
 
 /// Wrap `launch_command(runner_spec)` with the orchestrator's
-/// auto-bootstrap initial prompt when the runner is `claude`. The
-/// positional-prompt CLI convention is claude-specific (`claude "<msg>"`
-/// submits `<msg>` as the first user message); other runners are
-/// returned untouched so a project that pins `codex` or similar doesn't
-/// get its launch line garbled by an arg the runner doesn't understand.
+/// auto-bootstrap initial prompt and the `--append-system-prompt` flag
+/// that loads `<workdir>/.claude/agent-instructions.md` (composed by
+/// [`ensure_dashboard`] from the shared preamble + the orchestrator's
+/// `instructions.md`) when the runner is `claude`. The positional-prompt
+/// CLI convention is claude-specific (`claude "<msg>"` submits `<msg>`
+/// as the first user message); other runners are returned untouched so
+/// a project that pins `codex` or similar doesn't get its launch line
+/// garbled by flags it doesn't understand.
 fn launch_with_bootstrap(spec: &shelbi_core::AgentRunnerSpec) -> String {
     let launch = shelbi_agent::launch_command(spec);
     if is_claude_runner(spec) {
         format!(
-            "{launch} {prompt}",
+            "{launch} --append-system-prompt \"$(cat {rel})\" {prompt}",
+            rel = shelbi_agent::shell_escape(ORCH_AGENT_INSTRUCTIONS_REL),
             prompt = shelbi_agent::shell_escape(ORCH_BOOTSTRAP_PROMPT),
         )
     } else {
@@ -1140,6 +1147,19 @@ mod pane_cmd_tests {
         assert!(out.contains("'Run the \"Bootstrap on session start\""), "missing escaped prompt: {out}");
         assert!(out.contains("shelbi events tail --follow"), "prompt must name the tail command");
         assert!(out.contains("Monitor tool"), "prompt must mention the Monitor tool");
+        // Orchestrator now sources its system prompt from
+        // `agents/orchestrator/instructions.md` (composed with the
+        // shared preamble) via `--append-system-prompt`, replacing the
+        // pre-task `<workdir>/CLAUDE.md` auto-load that this task
+        // (`aw-deprecate-claude-md-…`) sunsets.
+        assert!(
+            out.contains("--append-system-prompt"),
+            "missing --append-system-prompt flag: {out}"
+        );
+        assert!(
+            out.contains("$(cat .claude/agent-instructions.md)"),
+            "expected cat-from-relative-path substitution: {out}"
+        );
     }
 
     #[test]
@@ -1149,7 +1169,19 @@ mod pane_cmd_tests {
             flags: vec!["--permission-mode".into(), "auto".into()],
         };
         let out = launch_with_bootstrap(&spec);
-        assert!(out.starts_with("claude --permission-mode auto "), "flags must come before the prompt: {out}");
+        // The runner's own flags must land before `--append-system-prompt`
+        // (so `--permission-mode` isn't consumed by the wrong parser) and
+        // both must land before the positional bootstrap prompt.
+        assert!(
+            out.starts_with("claude --permission-mode auto --append-system-prompt"),
+            "runner flags must precede --append-system-prompt: {out}"
+        );
+        let append_idx = out.find("--append-system-prompt").unwrap();
+        let prompt_idx = out.find("'Run the").expect("missing bootstrap prompt");
+        assert!(
+            append_idx < prompt_idx,
+            "--append-system-prompt must precede the positional bootstrap prompt: {out}"
+        );
     }
 
     #[test]

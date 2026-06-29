@@ -21,8 +21,8 @@
 use anyhow::{anyhow, Result};
 
 use shelbi_state::{
-    append_project_event, zen_check_crash_recovery, zen_clear_crash, zen_heartbeat,
-    ZenCrashRecovery,
+    append_project_event, maybe_emit_claude_md_migration_hint, reset_claude_md_migration_hint,
+    zen_check_crash_recovery, zen_clear_crash, zen_heartbeat, ZenCrashRecovery,
 };
 
 /// `shelbi __zen-orch-start <project>` — runs once at the top of the
@@ -31,7 +31,20 @@ use shelbi_state::{
 /// on, force it off, emit a `zen=off reason=crash-recovery` line to
 /// `events.log`, and print a single warning to stderr so the user sees
 /// it the moment the pane respawns.
+///
+/// Also resets the per-session "CLAUDE.md migration hint already
+/// fired" latch and (best-effort) re-fires the hint if a legacy
+/// `~/.shelbi/projects/<project>/CLAUDE.md` still exists. The reset
+/// happens unconditionally so a fresh orchestrator session always
+/// re-checks; the hint itself is a one-shot stderr nudge that v2 will
+/// drop entirely.
 pub fn orch_start(project: &str) -> Result<()> {
+    // Best-effort: a write failure here doesn't change Zen-recovery
+    // semantics, and the migration hint is purely advisory. We don't
+    // want a state.json hiccup to kill the orchestrator pane on start.
+    let _ = reset_claude_md_migration_hint(project);
+    let _ = maybe_emit_claude_md_migration_hint(project);
+
     match zen_check_crash_recovery(project).map_err(|e| anyhow!(e))? {
         ZenCrashRecovery::NoCrash => Ok(()),
         ZenCrashRecovery::AutoDisabled { crashed_at } => {
