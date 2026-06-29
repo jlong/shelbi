@@ -519,11 +519,12 @@ pub fn state_path(project: &str) -> Result<PathBuf> {
 // ---------------------------------------------------------------------------
 // Global runtime state (~/.shelbi/state.json)
 
-/// Global cross-project runtime state at `~/.shelbi/state.json`. Currently
-/// only tracks `tmux_palette_key` — the most recently installed tmux
-/// `bind-key` for the palette popup — so the orchestrator can unbind it
-/// cleanly when the user rebinds the chord or switches to a project that
-/// overrides the global default.
+/// Global cross-project runtime state at `~/.shelbi/state.json`. Tracks
+/// preferences that should follow the user across every project — the
+/// most recent tmux palette binding (so the orchestrator can unbind it
+/// cleanly on rebind / project switch), and the one-shot acknowledgement
+/// of the Zen Mode intro popover (so first-time-Zen explanation doesn't
+/// re-fire in every project the user opens).
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GlobalState {
     /// The exact tmux key string passed to `tmux bind-key -n …` on the
@@ -531,6 +532,13 @@ pub struct GlobalState {
     /// session has installed a palette binding yet.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tmux_palette_key: Option<String>,
+    /// Set to `true` once the user has dismissed the Zen Mode intro
+    /// popover with "Don't show this again" checked. The popover gates
+    /// on this flag before rendering on every `off → on` toggle.
+    /// Defaults to `false` (or absent on older `state.json` files) so a
+    /// fresh install gets the explanation on the first enable.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub zen_intro_seen: bool,
 }
 
 /// Path to the global `state.json` (`~/.shelbi/state.json`).
@@ -555,6 +563,18 @@ pub fn write_global_state(state: &GlobalState) -> Result<()> {
     let body = serde_json::to_vec_pretty(state)
         .map_err(|e| shelbi_core::Error::Other(format!("state.json: {e}")))?;
     atomic_write(&path, &body)
+}
+
+/// Mark the Zen Mode intro popover as acknowledged. Reads, mutates, and
+/// re-writes `~/.shelbi/state.json` so the other fields are preserved.
+/// Idempotent — a no-op when already set.
+pub fn mark_zen_intro_seen() -> Result<()> {
+    let mut state = read_global_state()?;
+    if state.zen_intro_seen {
+        return Ok(());
+    }
+    state.zen_intro_seen = true;
+    write_global_state(&state)
 }
 
 #[cfg(test)]
@@ -596,6 +616,51 @@ mod global_state_tests {
         write_global_state(&s).unwrap();
         let read_back = read_global_state().unwrap();
         assert_eq!(read_back.tmux_palette_key.as_deref(), Some("M-z"));
+        std::env::remove_var("SHELBI_HOME");
+    }
+
+    #[test]
+    fn zen_intro_seen_defaults_to_false_and_omits_when_unset() {
+        let _g = LOCK.lock().unwrap();
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+        let s = read_global_state().unwrap();
+        assert!(!s.zen_intro_seen);
+        // Empty (default) state must not carry a `zen_intro_seen` line —
+        // the flag is opt-in for users who've actually dismissed the
+        // popover, so default state.json files stay compact.
+        write_global_state(&s).unwrap();
+        let body = fs::read_to_string(global_state_path().unwrap()).unwrap();
+        assert!(
+            !body.contains("zen_intro_seen"),
+            "default state must omit zen_intro_seen; got {body}",
+        );
+        std::env::remove_var("SHELBI_HOME");
+    }
+
+    #[test]
+    fn mark_zen_intro_seen_sets_flag_and_is_idempotent() {
+        let _g = LOCK.lock().unwrap();
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+        mark_zen_intro_seen().unwrap();
+        assert!(read_global_state().unwrap().zen_intro_seen);
+        // Second call is a no-op (still true, no panic).
+        mark_zen_intro_seen().unwrap();
+        assert!(read_global_state().unwrap().zen_intro_seen);
+        std::env::remove_var("SHELBI_HOME");
+    }
+
+    #[test]
+    fn zen_intro_seen_round_trips_through_disk() {
+        let _g = LOCK.lock().unwrap();
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+        let mut s = read_global_state().unwrap();
+        s.zen_intro_seen = true;
+        write_global_state(&s).unwrap();
+        let read_back = read_global_state().unwrap();
+        assert!(read_back.zen_intro_seen);
         std::env::remove_var("SHELBI_HOME");
     }
 }

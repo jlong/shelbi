@@ -26,6 +26,7 @@ pub mod wizard;
 pub mod workspace;
 pub mod workflow;
 pub mod zen;
+pub mod zen_intro;
 pub mod zen_lifecycle;
 
 use anyhow::{anyhow, Result};
