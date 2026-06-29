@@ -33,11 +33,42 @@ This plan splits the two ideas. The sidebar gets renamed to reflect what it actu
 
 ## Design
 
-### 1. Sidebar rebrand: "Agents" → "Workers"
+### 1. Sidebar rebrand + reorganization: "Agents" → "Workspaces", grouped by machine
 
-The sidebar `Section { label: "Agents" }` becomes `Section { label: "Workers" }`. Matches the existing CLI vocabulary (`shelbi worker list`, `shelbi worker stop`, `worker:tui` event reasons), matches what each row actually is (a long-lived tmux slot tied to a machine), and frees the word "Agent" for the new concept.
+The sidebar `Section { label: "Agents" }` becomes `Section { label: "Workspaces" }` and its contents reorganize into a two-level tree: each machine is a group, each workspace is a row underneath the machine that hosts it. Today's "agents in the sidebar" was a flat list that hid which machine each entry lived on — making `prefers_machine` routing a fact you had to memorize rather than read off the screen.
 
-A worker is a slot. An agent is a role. The slot runs the role — same way a CI runner runs jobs.
+**Multi-machine project (hub + devbox), default layout:**
+
+```
+WORKSPACES
+▾ hub
+   ● alpha     idle
+   ● bravo     idle
+   ● charlie   idle
+▾ devbox
+   · delta     keybindings-phase-2-platform-aware-help-text   [developer]
+   · echo      idle
+   · foxtrot   idle
+```
+
+The `[developer]` tag is the currently-loaded agent (see §10), surfaced inline so the user can read role + slot in one glance.
+
+**Single-machine project, collapsed:**
+
+```
+WORKSPACES
+● alpha     idle
+● bravo     idle
+● charlie   in_progress: <task-id>   [developer]
+```
+
+When the project has only one machine, the group header collapses away — the tree degenerates to today's flat list, no setting needed. Group headers appear automatically the moment a second machine is declared in `project.yaml`.
+
+Group headers are themselves focusable: pressing enter on a machine row could navigate to a "machine view" (status, in-flight tasks, log tail), but that's a separate plan — out of scope here.
+
+The word "workspace" matches the persistent-slot-with-worktree mental model better than "worker." A worker is what runs; a workspace is what holds it. The slot persists across task switches, owns a worktree on disk, and is tied to a specific machine — all properties of a workspace. The agent (developer, QA, etc.) is what *runs* inside the workspace; "worker" used to mean both, which is why we're disentangling.
+
+CLI vocabulary (`shelbi worker list`, etc.) is left untouched in v1 — see Open questions about whether to rename in a follow-up.
 
 ### 2. The Agent concept
 
@@ -256,7 +287,7 @@ After Phase 2: custom workflows + custom agents are fully composable. A user can
 
 ## Decisions
 
-- **Sidebar rebrand: "Agents" → "Workers".** Matches CLI vocabulary and frees the word "Agent" for the new concept. Slot = worker; role = agent.
+- **Sidebar rebrand + reorganize: "Agents" → "Workspaces", grouped by machine.** Frees the word "Agent" for the new concept and aligns with the persistent-slot mental model (each workspace = one pane + one git worktree on a specific machine). Group headers collapse to a flat list when the project has only one machine. CLI vocabulary stays as `shelbi worker *` in v1 — rename deferred (see Open questions). Vocabulary: workspace = slot, agent = role, task = work.
 - **Agent storage: `~/.shelbi/projects/<project>/agents/<name>/`** containing `instructions.md` and `skills/`. Mirrors the workflows folder layout.
 - **Default agents: Orchestrator + Developer**, shipped in the binary and materialized into the project on init / self-healed on reload. Editable per-project; binary upgrade doesn't clobber edits.
 - **Workflow binding via the existing `owner:` field.** Value is either the reserved sentinel `user` (human-owned) or a named agent (matching a `agents/<name>/` directory). One field, not two. Legacy `owner: agent` auto-migrates with a deprecation warning.
