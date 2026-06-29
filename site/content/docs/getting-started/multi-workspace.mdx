@@ -1,15 +1,15 @@
 ---
-title: Run a multi-worker dispatch loop
+title: Run a multi-workspace dispatch loop
 order: 4
-summary: Fill the backlog, promote a stack of cards, and watch the orchestrator keep every worker in your pool loaded with work in parallel.
+summary: Fill the backlog, promote a stack of cards, and watch the orchestrator keep every workspace in your pool loaded with work in parallel.
 ---
 
 One task at a time is the on-ramp. The reason Shelbi exists is the
-other direction — half a dozen workers all running in their own
+other direction — half a dozen workspaces all running in their own
 worktrees, the orchestrator keeping every free slot loaded with the
 next ready card. This page walks the loop end-to-end.
 
-You should already have a project with at least two workers declared.
+You should already have a project with at least two workspaces declared.
 If you only have one, edit `~/.shelbi/projects/<name>.yaml`, bump the
 pool, and run `shelbi reload` before you start.
 
@@ -18,23 +18,24 @@ pool, and run `shelbi reload` before you start.
 From the orchestrator pane (or any shell):
 
 ```bash
-shelbi worker list
+shelbi workspace list
 ```
 
 ```
-NAME      MACHINE   RUNNER   TASK             PANE
-alpha     hub       claude                    alive
-bravo     hub       claude                    alive
-charlie   hub       claude                    alive
-delta     devbox    claude                    alive
-echo      devbox    claude                    alive
-foxtrot   devbox    claude                    alive
+NAME      HOST      MODEL    AGENT      STATE
+alpha     hub                          idle
+bravo     hub                          idle
+charlie   hub                          idle
+delta     devbox                       idle
+echo      devbox                       idle
+foxtrot   devbox                       idle
 ```
 
-Every row should show `alive` under `PANE` and an empty `TASK`. If a
-pane is dead, jump to the worker (`Enter` on its sidebar row) — the
-session may have stalled on a permission dialog. Resolving it puts the
-worker back in the rotation.
+Every row should show `idle` under `STATE`, with empty `MODEL`/`AGENT` —
+nothing is loaded into a slot yet. If a pane is dead, jump to the
+workspace (`Enter` on its sidebar row) — the session may have stalled on
+a permission dialog. Resolving it puts the workspace back in the
+rotation.
 
 You want at least three free slots to actually see the dispatch loop
 do its job. Two cards on a one-slot pool is a queue, not a loop.
@@ -78,9 +79,9 @@ shelbi task add "Re-encode the marketing video assets" \
   --prefers-machine devbox
 ```
 
-The orchestrator's dispatcher honors the hint when at least one worker
-on that machine is free. If `devbox` is fully busy when the task
-becomes ready, the card stays in `todo` — Shelbi will not silently
+The orchestrator's dispatcher honors the hint when at least one
+workspace on that machine is free. If `devbox` is fully busy when the
+task becomes ready, the card stays in `todo` — Shelbi will not silently
 re-route to the hub.
 
 ### Block one task on another
@@ -97,7 +98,8 @@ shelbi task add "Update the OpenAPI spec for the new auth module" \
 The dependent card carries a `🔒` badge in the Kanban view and the
 orchestrator skips it during dispatch until every id in its
 `depends_on` list reaches `done`. See
-[columns](/docs/concepts/columns) for the full state model.
+[dependent tasks](/docs/concepts/workflows#dependent-tasks-with-depends_on)
+for the full state model.
 
 ## Promote everything to todo
 
@@ -127,16 +129,19 @@ and triggers an immediate dispatch attempt.
 
 ## Watch the loop in action
 
-Within a second or two, the sidebar lights up. Worker badges flip
+Within a second or two, the sidebar lights up. Workspace badges flip
 from `·` to `⏵` in YAML declaration order — `alpha`, then `bravo`,
 then `charlie`, until either the `todo` column is empty or every
-worker is busy:
+workspace is busy. The sidebar groups slots under the machine they're
+pinned to, and a busy row shows the agent it's running:
 
 ```
- — agents —
- ⏵ alpha       add-csv-export-to-reports
- ⏵ bravo       fix-cookie-domain-bug-on-safari-sso
- ⏵ charlie     tighten-rate-limit-error-copy
+ — hub —
+ ⏵ alpha    developer   add-csv-export-to-reports
+ ⏵ bravo    developer   fix-cookie-domain-bug-on-safari-sso
+ ⏵ charlie  developer   tighten-rate-limit-error-copy
+
+ — devbox —
  · delta
  · echo
  · foxtrot
@@ -157,8 +162,9 @@ To see the raw stream, open a second pane and tail the log:
 shelbi events tail --follow
 ```
 
-You'll see the column moves and the worker state changes interleaved —
-exactly what the orchestrator is reacting to:
+You'll see the column moves and the workspace state changes interleaved
+— exactly what the orchestrator is reacting to (the `worker=` token on
+those lines is the retained backward-compatible spelling):
 
 ```
 2026-06-22T14:11:02+00:00 task=add-csv-export-to-reports backlog -> todo reason=user:cli
@@ -169,24 +175,24 @@ exactly what the orchestrator is reacting to:
 …
 ```
 
-Jump between worker panes any time. `Enter` on `bravo` drops you
+Jump between workspace panes any time. `Enter` on `bravo` drops you
 straight into its pane to watch the Safari fix happen live. Pop back
 to the orchestrator with `Ctrl+P` → Chat when you're done.
 
 ## Review one branch while the others keep running
 
-Workers finish at their own pace. When the first one writes its
+Workspaces finish at their own pace. When the first one writes its
 review-ready marker, three things happen at once:
 
 1. The hub poller moves the task from `in_progress` to `review` and
    clears the marker.
-2. The worker's badge flips from `⏵` to `✓` and the **Ready for
+2. The workspace's badge flips from `⏵` to `✓` and the **Ready for
    Review** list in the sidebar grows a row.
-3. The orchestrator, watching the event stream, sees the worker free
+3. The orchestrator, watching the event stream, sees the workspace free
    up and immediately dispatches the next ready `todo` card to that
    slot (if any).
 
-That last step is the loop. You don't have to ask. The worker that
+That last step is the loop. You don't have to ask. The workspace that
 just handed off a finished branch is already on its next task by the
 time you've clicked into the review pane.
 
@@ -199,7 +205,7 @@ Open the review:
 Shelbi checks the branch out into the project's working directory on
 the machine that ran the task and spawns a fresh agent session pointed
 at the diff. Ask it to walk you through the change, run tests, or
-request edits — the worker that produced the branch is busy on
+request edits — the workspace that produced the branch is busy on
 something else, but the review pane is its own conversation in the
 same worktree.
 
@@ -230,14 +236,15 @@ intent for breakage:
 - **The card is blocked.** Anything in `depends_on` is not yet `done`.
   The card renders with `🔒` in the kanban view. Land the dependency
   first.
-- **The card prefers a machine and no worker on it is free.** The
+- **The card prefers a machine and no workspace on it is free.** The
   orchestrator parks it in `todo` rather than mis-routing. Free a
-  worker on the target machine (kill another task, or remove the
+  workspace on the target machine (kill another task, or remove the
   preference).
-- **The worker's pane died.** The orchestrator surfaces it
-  (`worker=<name> pane_alive=false`) and waits for you. Re-launch with
-  `Enter` on the worker row, or `shelbi worker stop <name>` to
-  release the in-flight task back to `todo`.
+- **The workspace's pane died.** The orchestrator surfaces it
+  (`worker=<name> pane_alive=false` — the retained backward-compatible
+  token) and waits for you. Re-launch with `Enter` on the workspace
+  row, or `shelbi workspace stop <name>` to release the in-flight task
+  back to `todo`.
 - **The mid-conversation guard.** If you're actively chatting with
   the orchestrator about a specific task, it holds off on
   back-to-back dispatches that would talk over you. The next event
@@ -249,7 +256,7 @@ move on.
 
 ## Next
 
-The orchestrator is now keeping every worker fed without your
+The orchestrator is now keeping every workspace fed without your
 involvement past triage and review. The next step is letting it
 initiate, too: [enable Zen Mode](/docs/getting-started/enable-zen-mode)
 to have the orchestrator auto-promote eligible backlog cards and

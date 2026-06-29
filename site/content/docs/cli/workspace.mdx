@@ -1,0 +1,133 @@
+---
+title: shelbi workspace
+order: 22
+summary: Inspect and control the project's declared workspace pool — list slots with their host, model, and loaded agent, and stop a pane to release a stuck task.
+---
+
+```text
+shelbi workspace <SUBCOMMAND> [OPTIONS]
+```
+
+`shelbi workspace` is read-mostly. The pool itself is declared in the project
+YAML and doesn't change at runtime — there's no `workspace add` or
+`workspace rm` on the CLI. What you do here is observe (what's idle, what's
+working, which agent is loaded where) and intervene (stop a pane to release a
+stuck task).
+
+A [workspace](/docs/concepts/workspaces) is capacity — a machine, a tmux
+pane, and a worktree. The [agent](/docs/concepts/agents) running inside it is
+chosen per task by the workflow, which is why `list` reports both.
+
+Every subcommand accepts the global `-p / --project <PROJECT>` flag. Omitted
+from the per-subcommand tables for readability.
+
+## list
+
+```text
+shelbi workspace list
+```
+
+Print every declared workspace as a row. The columns:
+
+| Column  | What it shows                                                                 |
+| ------- | ----------------------------------------------------------------------------- |
+| `NAME`  | The workspace's stable name (`alpha`, `bravo`, …).                            |
+| `HOST`  | The machine it's pinned to — `hub` or a declared remote.                      |
+| `MODEL` | The model the running agent is configured to use (e.g. `opus`, `sonnet`). Blank when idle. |
+| `AGENT` | The [agent](/docs/concepts/agents) role currently loaded (`developer`, `qa`, …). Blank when idle. |
+| `STATE` | The observed state from the poller — `working`, `awaiting_input`, `blocked`, `awaiting_review`, or `idle`. |
+
+```text
+NAME      HOST      MODEL    AGENT            STATE
+alpha     hub       opus     developer        working
+bravo     hub       opus     developer        awaiting_input
+charlie   hub                                 idle
+delta     devbox    sonnet   qa               working
+echo      devbox                              idle
+```
+
+This is the first command the orchestrator runs at session start to snapshot
+the pool; it's the same snapshot you want when answering "who's free right
+now, and what are they running?" An empty `AGENT`/`MODEL` with `idle` state
+is a free slot.
+
+## stop
+
+```text
+shelbi workspace stop [OPTIONS] <NAME>
+```
+
+Stop the workspace's tmux pane. By default the in-flight task is released
+back to its `ready` status (`todo` in the default workflow) and its
+`assigned_to` field is cleared — the board never shows an orphaned
+`in_progress` card pointing at a dead pane. Pass `--keep-task` when you're
+about to restart on the same task and don't want the card to move.
+
+For a remote workspace, `stop` also kills the remote tmux session so no
+detached agent process lingers on the other machine.
+
+| Flag | Type | Default | Description |
+| --- | --- | --- | --- |
+| `<NAME>` | string | — | Workspace name (positional, required). |
+| `--keep-task` | flag | off | Leave the in-flight task in its `active` status with `assigned_to` pointing at this workspace. |
+
+## status
+
+```text
+shelbi workspace status [NAME]
+```
+
+Print observed workspace state from the hub-side poller — reads
+`~/.shelbi/workspaces/<name>/status.yaml` files; no tmux probing. Cheaper
+than `list` and safe to call repeatedly. With a `NAME`, prints a single row
+plus the raw status.yaml contents.
+
+| Flag | Type | Default | Description |
+| --- | --- | --- | --- |
+| `[NAME]` | string | — | Workspace to inspect (positional, optional). Omit to show every declared workspace. |
+
+## Examples
+
+Snapshot the pool to find a free workspace:
+
+```bash
+shelbi workspace list
+```
+
+Stop a stuck workspace and let the board release its task:
+
+```bash
+shelbi workspace stop bravo
+```
+
+Restart a workspace on the same task without losing the card:
+
+```bash
+shelbi workspace stop charlie --keep-task
+shelbi task start docs-write-cli-reference-pages
+```
+
+Inspect a single workspace's raw status without spawning a tmux probe:
+
+```bash
+shelbi workspace status alpha
+```
+
+## Deprecation: `shelbi worker`
+
+`shelbi worker` is a deprecated alias for `shelbi workspace`. Every
+subcommand still works under the old name — `shelbi worker list`,
+`shelbi worker stop bravo` — and prints a one-line deprecation notice
+pointing at the new spelling. The alias is kept so muscle memory and
+existing scripts don't break; new docs, output, and tab-completion use
+`workspace`. The alias may be removed in a future release, so migrate when
+convenient.
+
+## See also
+
+- [Workspaces](/docs/concepts/workspaces) — the slot model, the
+  machine-grouped sidebar, and the lifecycle states `status` reports.
+- [Agents](/docs/concepts/agents) — the role shown in the `AGENT` column.
+- [`shelbi agent`](/docs/cli/agent) — manage the agents a workspace can run.
+- [Orchestrator](/docs/concepts/orchestrator) — how the scheduler picks a
+  free workspace for the next ready task.

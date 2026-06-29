@@ -1,6 +1,6 @@
 ---
 title: The events log
-order: 13
+order: 14
 summary: An append-only file at ~/.shelbi/events.log — every worker state change and task status move, in one stream the orchestrator tails.
 ---
 
@@ -41,7 +41,9 @@ carries:
 
 - `<prev-state>` is `none` on the first observation of that worker.
 - States: `working`, `awaiting_input`, `blocked`. See
-  [worker states](/docs/concepts/workers#worker-states).
+  [workspace states](/docs/concepts/workspaces#workspace-states).
+- The `worker=` token is retained for backward compatibility — the slot it
+  names is a [workspace](/docs/concepts/workspaces).
 - Written by the hub-side poller every time it observes a state change
   (not on every tick — only on actual transitions).
 
@@ -203,8 +205,8 @@ The full grammar lives in the two `append_*_event` functions in
 
 ## See also
 
-- [Workers](/docs/concepts/workers#worker-states) — what each worker
-  state actually means.
+- [Workspaces](/docs/concepts/workspaces#workspace-states) — what each
+  workspace state actually means.
 - [Workflows](/docs/concepts/workflows) — what each `from -> to`
   transition means, including the per-workflow status schema and the
   default workflow's lifecycle.

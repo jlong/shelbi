@@ -5,7 +5,7 @@ summary: Fork the orchestrator's prompt to encode routing rules, project-specifi
 ---
 
 The orchestrator is *just* your runner (`claude`, `codex`, …) booted
-with a system prompt that explains the board, the workers, and the
+with a system prompt that explains the board, the workspaces, and the
 loop. That prompt is the **workflow** — the contract between you and
 the agent for who initiates what, how dispatch is decided, and how
 the agent reports back. Shelbi ships a sensible default and lets
@@ -37,7 +37,7 @@ active prompt, substitutes the assistant name, and writes the
 rendered output to `~/.shelbi/projects/<name>/CLAUDE.md`. The
 orchestrator runner is launched in that directory, so it auto-loads
 the rendered prompt without any flags. No env vars, no MCP, no
-restart of running workers — just `shelbi reload` and the next
+restart of running workspaces — just `shelbi reload` and the next
 orchestrator turn picks up the new prompt.
 
 ## Start from the default
@@ -72,11 +72,11 @@ A handful of pieces are the contract between the orchestrator and the
 rest of the system. Edit them carefully, but don't delete:
 
 - **The bootstrap flow.** The first reply of every session runs
-  `shelbi task list`, `shelbi worker list`, starts
+  `shelbi task list`, `shelbi workspace list`, starts
   `shelbi events tail --follow`, and reads `shelbi zen status`.
   Drop any of these and the orchestrator boots without state.
 - **The reaction rules tied to specific reason strings.** The
-  orchestrator dispatches on `user:*` promotions, rolls workers on
+  orchestrator dispatches on `user:*` promotions, rolls workspaces on
   `worker:review-marker`, and wakes on `heartbeat` lines. The rest
   of Shelbi emits those strings — your prompt has to recognize them.
 - **The "you are the scheduler" framing.** Without it, the agent
@@ -96,9 +96,9 @@ A workflow override pays for itself the first time the agent stops
 asking a question you've answered the same way a dozen times. Three
 patterns worth stealing.
 
-### 1. Pin certain task shapes to specific workers
+### 1. Pin certain task shapes to specific workspaces
 
-The default scheduler picks the first free worker in YAML
+The default scheduler picks the first free workspace in YAML
 declaration order, honoring `prefers_machine` hints. If your project
 has natural routing — infra tasks always to a beefy box, UI tasks
 always somewhere with the design system pre-cached — bake it into
@@ -108,15 +108,15 @@ the workflow:
 ## Routing rules
 
 In addition to the project YAML's `prefers_machine` hints, apply
-these project-specific rules when picking a worker for a `todo`
+these project-specific rules when picking a workspace for a `todo`
 card:
 
 - **Infra tasks** — titles containing `infra:`, `terraform`,
   `helm`, `kubectl`, or paths under `infra/`. Always route to
-  `devbox` (the beefier remote). If no `devbox` worker is free,
+  `devbox` (the beefier remote). If no `devbox` workspace is free,
   leave the card in `todo` rather than routing to the hub.
 - **Docs and content** — titles containing `docs:` or paths under
-  `site/content/**`. Route to the first free hub worker; these
+  `site/content/**`. Route to the first free hub workspace; these
   are short, IO-light tasks that don't need the remote.
 - **Migration touch-ups** — anything matching `db/migrate/**` or
   `crates/shelbi-state/src/migrations/**` always goes to
@@ -129,7 +129,7 @@ everything if set explicitly on a card.
 ```
 
 The orchestrator now applies your routing on top of the default
-free-worker scan. No code change.
+free-workspace scan. No code change.
 
 ### 2. Tune Zen's judgment categories for this project's reality
 
@@ -183,16 +183,16 @@ get a richer rundown — or a quieter one — say so:
 
 When dispatching, reply with:
 
-- The card id and chosen worker (always).
+- The card id and chosen workspace (always).
 - The full first line of the task body (so the user sees what
-  you're about to make the worker work on).
+  you're about to make the workspace work on).
 - An estimated complexity tag (`xs` / `s` / `m` / `l`) based on
   the body and any `depends_on`. Don't overthink it — a one-token
   guess is better than nothing.
 
 When reporting a finished review:
 
-- The card id, the worker, and the branch.
+- The card id, the workspace, and the branch.
 - A two-bullet summary of what the diff changed (read it via
   `git diff main..<branch> --stat`).
 - Whether a relevant `done`-column precedent exists for this
@@ -223,7 +223,7 @@ diff ~/.shelbi/projects/myapp/ORCHESTRATOR.md \
 ```
 
 `shelbi reload` respawns the sidebar, Tasks, and Review panes
-against the new config without restarting workers or losing chat
+against the new config without restarting workspaces or losing chat
 history. The orchestrator pane is recycled, which means its
 conversation context resets — that's the cost of changing the
 system prompt mid-session. Heads up before the next turn.
@@ -235,7 +235,7 @@ keep tightening it. Two practical habits:
 
 - **Treat surprises as prompt bugs.** When the orchestrator does
   something you didn't expect — promotes a card you'd have held,
-  reports in a style you find noisy, picks the wrong worker — open
+  reports in a style you find noisy, picks the wrong workspace — open
   `ORCHESTRATOR.md` and add the rule that would have produced the
   outcome you wanted. Reload. Try again.
 - **Version-control the override.** Check it into the repo (or a

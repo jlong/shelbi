@@ -1,11 +1,11 @@
 ---
 title: Set up your first project
 order: 2
-summary: Walk through the wizard, declare your workers, and write the project YAML.
+summary: Walk through the wizard, declare your workspaces, and write the project YAML.
 ---
 
 A Shelbi *project* is a git repo plus the machines it can run on, the
-agent runners those machines have, and the named pool of workers that
+agent runners those machines have, and the named pool of workspaces that
 pick up tasks. All of that lives in a single YAML file at
 `~/.shelbi/projects/<name>.yaml`. The wizard writes it for you.
 
@@ -87,8 +87,8 @@ tmux session name (`shelbi-<name>`), and on the CLI (`shelbi -p <name>`).
 ```
 
 The **hub** is the machine you're currently sitting at. It owns the tmux
-session, runs the orchestrator pane, and holds any local workers. The
-work directory is where local workers' worktrees get created — usually
+session, runs the orchestrator pane, and holds any local workspaces. The
+work directory is where local workspaces' worktrees get created — usually
 the same as the repo path.
 
 ### Remote machines (optional)
@@ -103,7 +103,7 @@ the same as the repo path.
 
 A remote machine is any host you can already reach over `ssh` without a
 password prompt, with `tmux` and your agent CLI installed on it. Shelbi
-prefixes every command with `ssh <host> --` and runs the workers there
+prefixes every command with `ssh <host> --` and runs the workspaces there
 in tmux panes you can attach to from the hub.
 
 The SSH host defaults to the machine name — convenient if your
@@ -114,23 +114,23 @@ live.
 You can add more machines later by editing the YAML directly and running
 `shelbi reload`.
 
-### Workers
+### Workspaces
 
 ```
-? Agent runner (used by every worker): claude
-  (memory: 64 GB → recommended 5 workers per machine — configurable later)
-? Worker count per machine: 4
-? Worker naming style: NATO phonetic (alpha, bravo, charlie…)
+? Agent runner (used by every workspace): claude
+  (memory: 64 GB → recommended 5 workspaces per machine — configurable later)
+? Workspace count per machine: 4
+? Workspace naming style: NATO phonetic (alpha, bravo, charlie…)
 ? Orchestrator runner: claude
 ```
 
-- **Agent runner** — `claude` or `codex`. Every worker uses the same
+- **Agent runner** — `claude` or `codex`. Every workspace uses the same
   runner by default; you can mix runners by editing the YAML later.
-- **Worker count per machine** — the wizard suggests a number based on
-  total RAM, budgeting roughly 10 GB per worker on single-machine
+- **Workspace count per machine** — the wizard suggests a number based on
+  total RAM, budgeting roughly 10 GB per workspace on single-machine
   setups and 12 GB when work spreads across machines. Clamped to
   `[1, 16]`. Override with whatever fits your machine.
-- **Worker naming style** — three presets to choose from:
+- **Workspace naming style** — three presets to choose from:
 
 | Preset | Names |
 |---|---|
@@ -138,14 +138,14 @@ You can add more machines later by editing the YAML directly and running
 | Greek letters | alpha, beta, gamma, delta, epsilon, zeta, eta, … |
 | Toy Story | woody, buzz, jessie, rex, hamm, slinky, bullseye, … |
 
-  Workers are laid out machine by machine — the first N names go to the
+  Workspaces are laid out machine by machine — the first N names go to the
   hub, the next N to the first remote, and so on.
 
 - **Orchestrator runner** — the agent CLI that runs in window 1 and
-  talks to you. Usually the same as the worker runner, but you can mix.
+  talks to you. Usually the same as the workspace runner, but you can mix.
 
-The wizard writes the YAML, creates the per-worker directories under
-`~/.shelbi/workers/<name>/`, drops a `.shelbi/project` marker at the
+The wizard writes the YAML, creates the per-workspace directories under
+`~/.shelbi/workspaces/<name>/`, drops a `.shelbi/project` marker at the
 repo root, and launches the TUI.
 
 ## The project YAML
@@ -171,7 +171,7 @@ orchestrator:
 agent_runners:
   claude: { command: claude, flags: [] }
   codex:  { command: codex,  flags: [] }
-workers:
+workspaces:
   - { name: alpha,   machine: hub,    runner: claude }
   - { name: bravo,   machine: hub,    runner: claude }
   - { name: charlie, machine: hub,    runner: claude }
@@ -192,7 +192,7 @@ Field by field:
 - **`github_url`** — optional, informational. The merge `--pr` flow
   still resolves the remote via local git config.
 - **`machines[]`** — every host the project can run on.
-  - `name` — referenced by `workers[].machine`.
+  - `name` — referenced by `workspaces[].machine`.
   - `kind` — `local` for the hub, `ssh` for a remote.
   - `work_dir` — where worktrees live on that machine.
   - `host` — SSH hostname (required when `kind: ssh`).
@@ -200,10 +200,10 @@ Field by field:
   orchestrator window.
 - **`agent_runners`** — the runner registry. Each entry is a
   `command` plus optional `flags` appended to every invocation. Add
-  custom runners here (e.g. `aider`) to make them available to workers.
-- **`workers[]`** — the fixed worker pool. Each worker is a name, the
-  machine it lives on, and the runner it uses. Order matters: the
-  orchestrator picks free workers in declaration order when
+  custom runners here (e.g. `aider`) to make them available to workspaces.
+- **`workspaces[]`** — the fixed workspace pool. Each workspace is a name,
+  the machine it lives on, and the runner it uses. Order matters: the
+  orchestrator picks free workspaces in declaration order when
   dispatching.
 
 ### Optional keys
@@ -230,7 +230,7 @@ ones most worth knowing about:
   ```
 
   Emission is debounced against everything else in the log: if any
-  line was written in the last `heartbeat` interval — a worker
+  line was written in the last `heartbeat` interval — a workspace
   transition, a task move, another heartbeat — the next tick skips
   rather than padding an already-active feed.
 
@@ -238,22 +238,22 @@ ones most worth knowing about:
   they'd produce one "nothing happened" row every few minutes. Use
   `shelbi events tail` if you want to see them.
 
-### Naming workers by hand
+### Naming workspaces by hand
 
 The wizard's presets cover most cases, but the names are just strings —
 nothing about `alpha` or `woody` is special. If you'd rather use roles,
-project codes, or your team's nicknames, edit `workers[]` directly:
+project codes, or your team's nicknames, edit `workspaces[]` directly:
 
 ```yaml
-workers:
+workspaces:
   - { name: frontend,  machine: hub,    runner: claude }
   - { name: backend,   machine: hub,    runner: claude }
   - { name: refactor,  machine: devbox, runner: codex  }
 ```
 
-Each worker name has to be a unique kebab/snake-case identifier across
-the project. Renaming a worker means the next dispatch creates a new
-worktree directory under `~/.shelbi/workers/<name>/` — the old one isn't
+Each workspace name has to be a unique kebab/snake-case identifier across
+the project. Renaming a workspace means the next dispatch creates a new
+worktree directory under `~/.shelbi/workspaces/<name>/` — the old one isn't
 deleted automatically.
 
 ### Hub vs SSH machines
@@ -265,16 +265,16 @@ Two `kind`s, two stories:
   created in the hub's `work_dir`.
 - **`ssh`** — Shelbi opens an ssh proxy window into a tmux session on
   the remote. Tasks check out branches into the remote's `work_dir`
-  and the worker runs there. You can still watch the pane live from
+  and the workspace runs there. You can still watch the pane live from
   the hub; you just have one extra tmux session between you and it.
 
-You can declare any mix. A common setup is a few local workers on the
+You can declare any mix. A common setup is a few local workspaces on the
 hub for fast iteration plus a beefier remote for slow or
 memory-hungry tasks.
 
 ## Reload after editing
 
-Edit the YAML by hand any time — add a machine, rename a worker, swap
+Edit the YAML by hand any time — add a machine, rename a workspace, swap
 runners. Then refresh the live dashboard:
 
 ```bash
@@ -286,5 +286,5 @@ config without restarting the orchestrator or losing your chat history.
 
 ## Next
 
-You have a project on disk and a worker pool waiting on work. Time to
+You have a project on disk and a workspace pool waiting on work. Time to
 [run your first task](/docs/getting-started/first-task).

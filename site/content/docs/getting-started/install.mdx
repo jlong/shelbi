@@ -24,16 +24,16 @@ both the hosted script and the manual path — both build from source.
   builds against the stable channel; install with [rustup](https://rustup.rs)
   if you don't already have it. Anything recent enough to compile the
   workspace works.
-- **`tmux` 3.2 or later.** Shelbi runs every worker inside a tmux pane and
+- **`tmux` 3.2 or later.** Shelbi runs every workspace inside a tmux pane and
   drives them with `send-keys` / `capture-pane`. Older tmux releases miss
   features the TUI relies on. Install via Homebrew (`brew install tmux`),
   apt (`sudo apt install tmux`), or your package manager of choice.
 - **An agent CLI.** At least one of `claude`
   ([Claude Code](https://docs.claude.com/en/docs/claude-code)) or `codex`
   needs to be installed and authenticated. You can declare more than one
-  later — the project YAML picks per worker.
+  later — the project YAML picks per workspace.
 
-Remote workers need the same `tmux` and agent CLI on the machine they run
+Remote workspaces need the same `tmux` and agent CLI on the machine they run
 on, plus an `ssh` host you can already reach without a password prompt.
 
 ## Install from source manually
@@ -57,7 +57,7 @@ SHELBI_INSTALL_PATH=/usr/local/bin/shelbi ./scripts/install.sh
 ```
 
 Re-run the script any time you pull updates — it rebuilds and reinstalls in
-one step. The orchestrator and worker panes re-shell into `shelbi` on every
+one step. The orchestrator and workspace panes re-shell into `shelbi` on every
 call, so they pick up the new binary automatically; only the sidebar,
 Tasks, and Review views need a manual `shelbi reload` to respawn against
 the new build.

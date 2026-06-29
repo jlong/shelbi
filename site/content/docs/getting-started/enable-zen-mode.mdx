@@ -102,12 +102,12 @@ Three ways:
   `~/.shelbi/shelbi.yaml`.
 
 You'll know it's on by the **ZEN ON** pill anchored to the bottom of
-the workers column in the sidebar. That pill is the at-a-glance "the
+the workspaces column in the sidebar. That pill is the at-a-glance "the
 agent is in lead mode" signal — if it's not there, Zen is off or
 paused.
 
 ```
- — agents —
+ — hub —
  · alpha
  · bravo
  · charlie
@@ -128,7 +128,7 @@ you: tighten the rate-limit error copy to mention the retry window.
 
 With Zen off, the card would sit in `backlog` waiting for you to
 promote it. With Zen on, the orchestrator scans backlog when a
-worker frees up, runs the **judgment categories** from its prompt
+workspace frees up, runs the **judgment categories** from its prompt
 against each mechanically-eligible card, and promotes the ones at
 least one category applies to. You'll see a Zen-tagged line in the
 activity feed:
@@ -139,10 +139,10 @@ ZEN promoted tighten-rate-limit-error-copy
 ```
 
 The dispatch and run that follow look exactly like the manual loop —
-the card moves to `in_progress`, the worker badge flips to `⏵`, and
+the card moves to `in_progress`, the workspace badge flips to `⏵`, and
 the agent works the prompt.
 
-What changes is what happens when the worker writes its review-ready
+What changes is what happens when the workspace writes its review-ready
 marker. Instead of stopping at `review` for your inspection, the
 orchestrator runs the bar:
 
