@@ -1,16 +1,48 @@
+use std::path::{Path, PathBuf};
+
 use anyhow::{anyhow, Result};
 use clap::Args as ClapArgs;
 use shelbi_state::AgentMaterializeOutcome;
 
+use crate::project_root::{resolve_root_for_init, ResolvedProjectRoot};
+
 #[derive(Debug, ClapArgs)]
 pub struct Args {
-    /// Also scaffold a starter project YAML at ~/.shelbi/projects/<name>.yaml
-    /// (using the current directory as the work_dir for a local hub).
+    /// Override the project name. Defaults to the basename of the
+    /// project root (current directory or `--root`).
     #[arg(long)]
     pub project: Option<String>,
+
+    /// Project root directory — the repo `shelbi` will manage. Skips
+    /// the interactive "Project root?" prompt. Required when stdin
+    /// is not a TTY (CI, piped input).
+    #[arg(long)]
+    pub root: Option<PathBuf>,
 }
 
 pub fn run(args: Args) -> Result<()> {
+    let resolved = scaffold_with_prompt(args)?;
+    println!();
+    println!("next:");
+    println!(
+        "  1. add machines to ~/.shelbi/projects/{}.yaml if you have remote hubs",
+        resolved.name
+    );
+    println!("  2. add the project to ~/.shelbi/sessions/default.yaml's projects: list");
+    println!("  3. spawn your first agent: shelbi spawn TASK --on hub --runner claude \"…\"");
+    Ok(())
+}
+
+/// `shelbi init` entry point factored so the no-subcommand first-run
+/// path can share the same scaffolding without printing the trailing
+/// `next:` block (that path is about to launch the TUI, so the hints
+/// would just scroll off-screen).
+///
+/// Resolves the project root (prompting interactively, or honoring
+/// `--root` when supplied), then writes the project YAML, the in-repo
+/// `.shelbi/project` marker, the workspace-settings template, the
+/// default agent workspaces, and the project-wide statuses catalogue.
+pub fn scaffold_with_prompt(args: Args) -> Result<ResolvedProjectRoot> {
     let home = shelbi_state::shelbi_home().map_err(|e| anyhow!(e))?;
     shelbi_state::ensure_dir(&home).map_err(|e| anyhow!(e))?;
 
@@ -29,91 +61,107 @@ pub fn run(args: Args) -> Result<()> {
 
     println!("✓ scaffolded {}", home.display());
 
-    if let Some(name) = args.project.as_deref() {
-        let cwd = std::env::current_dir()?;
-        let yaml_path = projects_dir.join(format!("{name}.yaml"));
-        if yaml_path.exists() {
-            println!("(project YAML already exists at {})", yaml_path.display());
-        } else {
-            let yaml = format!(
-                "name: {name}\n\
-                 repo: \n\
-                 default_branch: main\n\
-                 machines:\n\
-                 \x20\x20- name: hub\n\
-                 \x20\x20\x20\x20kind: local\n\
-                 \x20\x20\x20\x20work_dir: {cwd}\n\
-                 orchestrator:\n\
-                 \x20\x20runner: claude\n\
-                 agent_runners:\n\
-                 \x20\x20claude: {{ command: claude, flags: [] }}\n\
-                 \x20\x20codex:  {{ command: codex,  flags: [] }}\n",
-                cwd = cwd.display(),
-            );
-            std::fs::write(&yaml_path, yaml)?;
-            println!("✓ wrote project: {}", yaml_path.display());
-
-            let marker = cwd.join(".shelbi/project");
-            shelbi_state::ensure_dir(marker.parent().unwrap())
-                .map_err(|e| anyhow!(e))?;
-            std::fs::write(&marker, format!("{name}\n"))?;
-            println!("✓ wrote project marker: {}", marker.display());
-
-            let template_path = shelbi_state::project_dir(name)
-                .map_err(|e| anyhow!(e))?
-                .join("workspace-settings.json.template");
-            if template_path.exists() {
-                println!(
-                    "(workspace settings template already exists at {})",
-                    template_path.display()
-                );
-            } else {
-                shelbi_state::ensure_dir(template_path.parent().unwrap())
-                    .map_err(|e| anyhow!(e))?;
-                std::fs::write(&template_path, shelbi_state::DEFAULT_WORKSPACE_SETTINGS_TEMPLATE)?;
-                println!(
-                    "✓ wrote workspace settings template: {}",
-                    template_path.display()
-                );
-            }
-
-            let outcomes = shelbi_state::materialize_default_agents(name)
-                .map_err(|e| anyhow!(e))?;
-            for outcome in outcomes {
-                print_agent_materialize_outcome(&outcome);
-            }
-
-            // Materialize `workflows/statuses.yml` so a fresh project
-            // ships with the project-wide status catalogue alongside
-            // its starter `default.yaml`. `load_project` runs the same
-            // migration when the project is opened, but writing them
-            // here keeps the `shelbi init --project` post-condition
-            // self-contained.
-            let statuses_path = shelbi_state::statuses_path(name).map_err(|e| anyhow!(e))?;
-            if !statuses_path.exists() {
-                shelbi_state::save_project_statuses(
-                    name,
-                    &shelbi_core::default_project_statuses(),
-                )
-                .map_err(|e| anyhow!(e))?;
-                println!("✓ wrote project statuses: {}", statuses_path.display());
-            }
-        }
+    if std::io::IsTerminal::is_terminal(&std::io::stdin()) && args.root.is_none() {
+        println!();
+        println!("shelbi setup — let's get your project configured.");
+        println!();
     }
 
-    println!();
-    println!("next:");
-    if args.project.is_none() {
-        println!("  1. drop a project YAML at ~/.shelbi/projects/<name>.yaml");
-        println!("     (or rerun: shelbi init --project <name>)");
-        println!("  2. reference it from ~/.shelbi/sessions/default.yaml");
-        println!("  3. cd into your repo and `echo NAME > .shelbi/project`");
-    } else {
-        println!("  1. add machines to ~/.shelbi/projects/{}.yaml if you have remote hubs",
-            args.project.as_deref().unwrap());
-        println!("  2. add the project to ~/.shelbi/sessions/default.yaml's projects: list");
-        println!("  3. spawn your first agent: shelbi spawn TASK --on hub --runner claude \"…\"");
+    let cwd = std::env::current_dir()?;
+    let resolved = resolve_root_for_init(&cwd, args.root.clone(), args.project.as_deref())?;
+
+    scaffold_project(&resolved)?;
+    Ok(resolved)
+}
+
+/// Write the project YAML, the in-repo `.shelbi/project` marker, the
+/// workspace-settings template, materialize the default agents, and
+/// write the project-wide statuses catalogue.
+///
+/// The collision check in [`resolve_root_for_init`] guarantees the YAML
+/// path is free at the time we're called. We still guard the write
+/// with `exists()` so a race against a concurrent `shelbi init` doesn't
+/// blow away another invocation's freshly-written YAML.
+fn scaffold_project(resolved: &ResolvedProjectRoot) -> Result<()> {
+    let projects_dir = shelbi_state::projects_dir().map_err(|e| anyhow!(e))?;
+    let yaml_path = projects_dir.join(format!("{}.yaml", resolved.name));
+
+    if yaml_path.exists() {
+        println!("(project YAML already exists at {})", yaml_path.display());
+        return Ok(());
     }
+
+    let yaml = format!(
+        "name: {name}\n\
+         repo: \n\
+         default_branch: main\n\
+         machines:\n\
+         \x20\x20- name: hub\n\
+         \x20\x20\x20\x20kind: local\n\
+         \x20\x20\x20\x20work_dir: {root}\n\
+         orchestrator:\n\
+         \x20\x20runner: claude\n\
+         agent_runners:\n\
+         \x20\x20claude: {{ command: claude, flags: [] }}\n\
+         \x20\x20codex:  {{ command: codex,  flags: [] }}\n",
+        name = resolved.name,
+        root = resolved.path.display(),
+    );
+    std::fs::write(&yaml_path, yaml)?;
+    println!("✓ wrote project: {}", yaml_path.display());
+
+    write_marker(&resolved.path, &resolved.name)?;
+    write_workspace_settings_template(&resolved.name)?;
+
+    let outcomes = shelbi_state::materialize_default_agents(&resolved.name)
+        .map_err(|e| anyhow!(e))?;
+    for outcome in outcomes {
+        print_agent_materialize_outcome(&outcome);
+    }
+
+    // Materialize `workflows/statuses.yml` so a fresh project ships with
+    // the project-wide status catalogue alongside its starter
+    // `default.yaml`. `load_project` runs the same migration when the
+    // project is opened, but writing it here keeps `shelbi init`'s
+    // post-condition self-contained.
+    let statuses_path =
+        shelbi_state::statuses_path(&resolved.name).map_err(|e| anyhow!(e))?;
+    if !statuses_path.exists() {
+        shelbi_state::save_project_statuses(
+            &resolved.name,
+            &shelbi_core::default_project_statuses(),
+        )
+        .map_err(|e| anyhow!(e))?;
+        println!("✓ wrote project statuses: {}", statuses_path.display());
+    }
+    Ok(())
+}
+
+fn write_marker(root: &Path, project: &str) -> Result<()> {
+    let marker = root.join(".shelbi/project");
+    shelbi_state::ensure_dir(marker.parent().unwrap()).map_err(|e| anyhow!(e))?;
+    std::fs::write(&marker, format!("{project}\n"))?;
+    println!("✓ wrote project marker: {}", marker.display());
+    Ok(())
+}
+
+fn write_workspace_settings_template(project: &str) -> Result<()> {
+    let template_path = shelbi_state::project_dir(project)
+        .map_err(|e| anyhow!(e))?
+        .join("workspace-settings.json.template");
+    if template_path.exists() {
+        println!(
+            "(workspace settings template already exists at {})",
+            template_path.display()
+        );
+        return Ok(());
+    }
+    shelbi_state::ensure_dir(template_path.parent().unwrap()).map_err(|e| anyhow!(e))?;
+    std::fs::write(&template_path, shelbi_state::DEFAULT_WORKSPACE_SETTINGS_TEMPLATE)?;
+    println!(
+        "✓ wrote workspace settings template: {}",
+        template_path.display()
+    );
     Ok(())
 }
 
