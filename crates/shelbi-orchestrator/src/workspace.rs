@@ -400,6 +400,15 @@ pub struct StartSpec<'a> {
     pub branch: &'a str,
     /// Body of the task markdown — appended to the prompt as context.
     pub task_body: &'a str,
+    /// Name of the agent (under `agents/<name>/`) whose `instructions.md`
+    /// is wired up as the runner's system prompt and whose `skills/` dir
+    /// is mounted into the worktree's `.claude/skills/`. `None` skips
+    /// the agent-context deploy entirely — kept optional so non-CLI
+    /// callers that don't yet resolve through
+    /// [`crate::dispatch::resolve_dispatch_agent`] (or tests that
+    /// exercise the spawn path in isolation) can opt out without
+    /// fabricating an agent name.
+    pub agent: Option<&'a str>,
 }
 
 /// Tear down the workspace's pane, switch its worktree to `branch` (creating
@@ -452,6 +461,18 @@ pub fn start_workspace_on_task(spec: StartSpec<'_>) -> Result<TmuxAddr> {
     let rendered = shelbi_state::render_workspace_settings(spec.project)?;
     deploy_workspace_settings(&host, &worktree, &rendered)?;
 
+    // 2b. Deploy the dispatched agent's `instructions.md` + skills into the
+    //     worktree's `.claude/` footprint. The instructions file becomes the
+    //     runner's `--append-system-prompt` source (see step 5 below); the
+    //     skills directory is wiped and re-mounted from
+    //     `agents/<agent>/skills/` so consecutive dispatches with different
+    //     agents on the same workspace don't accumulate skills from earlier
+    //     runs. Skipped entirely when `agent` is `None` (e.g. an embed test
+    //     that exercises the spawn path without resolving an agent).
+    if let Some(agent) = spec.agent {
+        deploy_agent_context(&host, &worktree, &spec.project.name, agent)?;
+    }
+
     // 3. Reset the tmux pane — that's how we clear context. If it doesn't
     //    exist yet, this is a no-op; otherwise the next step recreates it.
     kill_workspace_pane(&host, &addr)?;
@@ -501,7 +522,11 @@ pub fn start_workspace_on_task(spec: StartSpec<'_>) -> Result<TmuxAddr> {
     // belongs to the spawn path, where we already know the project's mode.
     let runner_with_mode =
         shelbi_agent::with_permission_mode(&runner, &spec.project.workspace_permissions_mode);
-    let launch = shelbi_agent::launch_command(&runner_with_mode);
+    let launch = with_agent_system_prompt(
+        &shelbi_agent::launch_command(&runner_with_mode),
+        spec.agent.map(|_| WORKTREE_AGENT_INSTRUCTIONS_REL),
+        &runner,
+    );
     let cd_launch = if host.is_local() {
         format!(
             "cd {wd} && LANG=C.UTF-8 {launch}",
@@ -857,11 +882,246 @@ pub fn deploy_workspace_settings(
     }
 }
 
+/// Relative path (from the worktree root) where the dispatched agent's
+/// `instructions.md` is deployed. Kept in `.claude/` alongside the
+/// settings + review marker so the whole shelbi deploy footprint is
+/// gitignored together and there's exactly one place to look when
+/// debugging an agent that loaded the wrong prompt.
+pub const WORKTREE_AGENT_INSTRUCTIONS_REL: &str = ".claude/agent-instructions.md";
+
+/// Relative path (from the worktree root) where the dispatched agent's
+/// `skills/` directory is mounted. Claude Code auto-loads any
+/// `.claude/skills/` entries on launch.
+pub const WORKTREE_AGENT_SKILLS_REL: &str = ".claude/skills";
+
+/// Deploy the dispatched agent's `instructions.md` to the worktree and
+/// refresh `.claude/skills/` from the agent's `skills/` directory. One
+/// orchestration helper so the spawn path doesn't have to manage the
+/// individual primitives; the caller just hands us a (host, worktree,
+/// project, agent) tuple and we do the rest.
+///
+/// Idempotent and overwrite-safe: every call rewrites the instructions
+/// file and clears `.claude/skills/` before mounting, so the worktree's
+/// agent context reflects the *current* agent — not a leftover from a
+/// prior task on the same workspace.
+pub fn deploy_agent_context(
+    host: &Host,
+    worktree: &Path,
+    project_name: &str,
+    agent: &str,
+) -> Result<()> {
+    let instructions_src = shelbi_state::agent_instructions_path(project_name, agent)?;
+    let instructions_body = std::fs::read_to_string(&instructions_src).map_err(|e| {
+        Error::Other(format!(
+            "agent `{agent}` instructions.md unreadable at {}: {e}",
+            instructions_src.display(),
+        ))
+    })?;
+    deploy_agent_instructions(host, worktree, &instructions_body)?;
+
+    let skills_src = shelbi_state::agent_skills_dir(project_name, agent)?;
+    refresh_agent_skills(host, worktree, &skills_src)?;
+    Ok(())
+}
+
+/// Write `instructions` to `<worktree>/.claude/agent-instructions.md` so
+/// the runner can `--append-system-prompt "$(cat …)"` from it on launch.
+/// Mirrors [`deploy_workspace_settings`]'s local-vs-remote split.
+pub fn deploy_agent_instructions(
+    host: &Host,
+    worktree: &Path,
+    instructions: &str,
+) -> Result<()> {
+    let claude_dir = worktree.join(".claude");
+    let dest_path = claude_dir.join("agent-instructions.md");
+    match host {
+        Host::Local => {
+            std::fs::create_dir_all(&claude_dir).map_err(Error::Io)?;
+            std::fs::write(&dest_path, instructions).map_err(Error::Io)?;
+            Ok(())
+        }
+        Host::Ssh { host: ssh_host } => scp_text_to_remote(
+            ssh_host,
+            &claude_dir.to_string_lossy(),
+            &dest_path.to_string_lossy(),
+            instructions,
+            "agent-instructions",
+        ),
+    }
+}
+
+/// Clear `<worktree>/.claude/skills/` and recursively mirror
+/// `skills_src` into it. A non-existent or empty `skills_src` just
+/// produces an empty destination — the v1 default agents ship with no
+/// skills, so this is the normal happy path.
+pub fn refresh_agent_skills(host: &Host, worktree: &Path, skills_src: &Path) -> Result<()> {
+    let dest = worktree.join(".claude").join("skills");
+    let dest_str = dest.to_string_lossy().into_owned();
+
+    // Clear first. `rm -rf` is idempotent — succeeds whether the path
+    // exists or not, which keeps the first-dispatch (nothing there yet)
+    // and Nth-dispatch (carry-over from a different agent) cases on the
+    // same code path.
+    let rm = shelbi_ssh::run(host, ["rm", "-rf", &dest_str]).map_err(Error::Io)?;
+    if !rm.status.success() {
+        return Err(Error::Command {
+            cmd: format!("rm -rf {dest_str}"),
+            status: rm.status.to_string(),
+            stderr: String::from_utf8_lossy(&rm.stderr).into_owned(),
+        });
+    }
+
+    // Always (re)create the destination — even when skills_src is empty
+    // we want `.claude/skills/` to exist so the runner's skill loader
+    // doesn't trip on a missing path.
+    let mkdir = shelbi_ssh::run(host, ["mkdir", "-p", &dest_str]).map_err(Error::Io)?;
+    if !mkdir.status.success() {
+        return Err(Error::Command {
+            cmd: format!("mkdir -p {dest_str}"),
+            status: mkdir.status.to_string(),
+            stderr: String::from_utf8_lossy(&mkdir.stderr).into_owned(),
+        });
+    }
+
+    if !skills_src.is_dir() {
+        // Agent's skills/ dir not on disk (legacy materialize, user nuked
+        // it, etc.). The hub side's self-heal will recreate it on next
+        // `shelbi reload`; for now an empty deploy is correct.
+        return Ok(());
+    }
+
+    let entries: Vec<_> = std::fs::read_dir(skills_src)
+        .map_err(Error::Io)?
+        .collect::<std::result::Result<_, _>>()
+        .map_err(Error::Io)?;
+    if entries.is_empty() {
+        return Ok(());
+    }
+
+    match host {
+        Host::Local => copy_dir_contents_local(skills_src, &dest)?,
+        Host::Ssh { host: ssh_host } => copy_dir_contents_to_remote(ssh_host, skills_src, &dest)?,
+    }
+    Ok(())
+}
+
+/// Recursively copy the contents of `src` (a directory) into `dest`. The
+/// destination must already exist. Used to mirror the agent's `skills/`
+/// directory into the worktree on local hosts; remote hosts go through
+/// [`copy_dir_contents_to_remote`].
+fn copy_dir_contents_local(src: &Path, dest: &Path) -> Result<()> {
+    for entry in std::fs::read_dir(src).map_err(Error::Io)? {
+        let entry = entry.map_err(Error::Io)?;
+        let file_type = entry.file_type().map_err(Error::Io)?;
+        let entry_path = entry.path();
+        let target = dest.join(entry.file_name());
+        if file_type.is_dir() {
+            std::fs::create_dir_all(&target).map_err(Error::Io)?;
+            copy_dir_contents_local(&entry_path, &target)?;
+        } else {
+            std::fs::copy(&entry_path, &target).map_err(Error::Io)?;
+        }
+    }
+    Ok(())
+}
+
+/// Recursively copy `src` (a directory's contents) into a remote `dest`
+/// over SCP. v1 default agents ship with empty skills, so this happy
+/// path is normally a no-op; when users start populating `skills/` the
+/// tree is expected to be small (a handful of `.md`s + maybe an
+/// `assets/` dir). Per-file SCP is plenty.
+fn copy_dir_contents_to_remote(ssh_host: &str, src: &Path, dest: &Path) -> Result<()> {
+    for entry in std::fs::read_dir(src).map_err(Error::Io)? {
+        let entry = entry.map_err(Error::Io)?;
+        let file_type = entry.file_type().map_err(Error::Io)?;
+        let entry_path = entry.path();
+        let target = dest.join(entry.file_name());
+        let target_str = target.to_string_lossy().into_owned();
+        if file_type.is_dir() {
+            let mkdir = shelbi_ssh::run(
+                &Host::Ssh { host: ssh_host.to_string() },
+                ["mkdir", "-p", &target_str],
+            )
+            .map_err(Error::Io)?;
+            if !mkdir.status.success() {
+                return Err(Error::Command {
+                    cmd: format!("ssh {ssh_host} mkdir -p {target_str}"),
+                    status: mkdir.status.to_string(),
+                    stderr: String::from_utf8_lossy(&mkdir.stderr).into_owned(),
+                });
+            }
+            copy_dir_contents_to_remote(ssh_host, &entry_path, &target)?;
+        } else {
+            let dest_uri = format!("{ssh_host}:{target_str}");
+            let mut cmd = std::process::Command::new("scp");
+            cmd.arg("-q").arg("-B").arg(&entry_path).arg(&dest_uri);
+            let out = cmd.output().map_err(Error::Io)?;
+            if !out.status.success() {
+                return Err(Error::Command {
+                    cmd: format!("scp {} {dest_uri}", entry_path.display()),
+                    status: out.status.to_string(),
+                    stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Append the `--append-system-prompt "$(cat .claude/agent-instructions.md)"`
+/// flag to the runner's launch command when an agent is being dispatched
+/// AND the runner is `claude` (the only CLI that understands the flag).
+/// Returns `launch` unchanged for non-claude runners or when no agent
+/// instructions are being deployed.
+///
+/// The `$(cat …)` substitution is intentional: keeping the prompt body
+/// out of the command line means the launched line stays human-readable
+/// in the pane (no 10 KB of `# Task …\n\n` scrollback noise) and avoids
+/// the per-platform ARG_MAX risk of inlining a large prompt.
+fn with_agent_system_prompt(
+    launch: &str,
+    instructions_rel: Option<&str>,
+    runner: &shelbi_core::AgentRunnerSpec,
+) -> String {
+    let Some(rel) = instructions_rel else {
+        return launch.to_string();
+    };
+    let is_claude = std::path::Path::new(&runner.command)
+        .file_name()
+        .and_then(|s| s.to_str())
+        == Some("claude");
+    if !is_claude {
+        // Other runners (codex etc.) don't understand the flag; leave
+        // them alone. The agent's instructions.md is still deployed to
+        // the worktree for callers that want to read it manually.
+        return launch.to_string();
+    }
+    format!(
+        "{launch} --append-system-prompt \"$(cat {rel})\"",
+        rel = shelbi_agent::shell_escape(rel),
+    )
+}
+
 fn scp_settings_to_remote(
     ssh_host: &str,
     remote_dir: &str,
     remote_path: &str,
     rendered: &str,
+) -> Result<()> {
+    scp_text_to_remote(ssh_host, remote_dir, remote_path, rendered, "workspace-settings")
+}
+
+/// Push `body` to `remote_path` on `ssh_host`, ensuring `remote_dir`
+/// exists first. Shared by the workspace-settings and agent-instructions
+/// deploy paths so both go through the same scp + mkdir routine. `tag`
+/// is folded into the local tempfile name so a crash mid-deploy leaves
+/// debuggable breadcrumbs.
+fn scp_text_to_remote(
+    ssh_host: &str,
+    remote_dir: &str,
+    remote_path: &str,
+    body: &str,
+    tag: &str,
 ) -> Result<()> {
     // 1. Ensure the .claude/ dir exists on the remote.
     let mkdir = shelbi_ssh::run(
@@ -877,18 +1137,18 @@ fn scp_settings_to_remote(
         });
     }
 
-    // 2. Stage the rendered template in a local tempfile, then scp it. The
-    //    tempfile is in $TMPDIR so the local FS handles cleanup if we crash
+    // 2. Stage the body in a local tempfile, then scp it. The tempfile
+    //    is in $TMPDIR so the local FS handles cleanup if we crash
     //    before unlinking it.
     let tmp_path = std::env::temp_dir().join(format!(
-        "shelbi-workspace-settings-{}-{}.json",
+        "shelbi-{tag}-{}-{}",
         std::process::id(),
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_nanos())
             .unwrap_or(0),
     ));
-    std::fs::write(&tmp_path, rendered).map_err(Error::Io)?;
+    std::fs::write(&tmp_path, body).map_err(Error::Io)?;
 
     let dest = format!("{ssh_host}:{remote_path}");
     let mut cmd = std::process::Command::new("scp");
@@ -1524,6 +1784,266 @@ mod tests {
         let actual2 = std::fs::read_to_string(&settings).unwrap();
         assert_eq!(actual2, updated);
 
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    fn agent_test_tmpdir(tag: &str) -> PathBuf {
+        let p = std::env::temp_dir().join(format!(
+            "shelbi-agent-deploy-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos(),
+        ));
+        std::fs::create_dir_all(&p).unwrap();
+        p
+    }
+
+    #[test]
+    fn deploy_agent_instructions_writes_to_claude_dir() {
+        // The runner's --append-system-prompt sources from this file; the
+        // spawn path's job is to put the agent's instructions.md there
+        // verbatim. Pin the destination path so a refactor that moves the
+        // deploy footprint can't silently break the runner's loader.
+        let tmp = agent_test_tmpdir("instructions");
+        let worktree = tmp.join("wt");
+        std::fs::create_dir_all(&worktree).unwrap();
+        let body = "# Developer Agent\n\nYou are the developer.\n";
+
+        deploy_agent_instructions(&Host::Local, &worktree, body).unwrap();
+        let dest = worktree.join(".claude/agent-instructions.md");
+        assert_eq!(std::fs::read_to_string(&dest).unwrap(), body);
+
+        // Idempotent — a dispatch on the same workspace overwrites with
+        // the new agent's body (e.g. developer → orchestrator).
+        let new_body = "# Orchestrator Agent\n";
+        deploy_agent_instructions(&Host::Local, &worktree, new_body).unwrap();
+        assert_eq!(std::fs::read_to_string(&dest).unwrap(), new_body);
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn refresh_agent_skills_mirrors_source_and_creates_empty_dir_when_no_src() {
+        let tmp = agent_test_tmpdir("skills-empty");
+        let worktree = tmp.join("wt");
+        std::fs::create_dir_all(&worktree).unwrap();
+
+        // First case: source skills dir doesn't exist on disk at all.
+        // Refresh must still leave `.claude/skills/` in place (empty) so
+        // the runner's loader doesn't trip on a missing path.
+        let missing_src = tmp.join("agent-with-no-skills/skills");
+        refresh_agent_skills(&Host::Local, &worktree, &missing_src).unwrap();
+        let dest = worktree.join(".claude/skills");
+        assert!(dest.is_dir(), "skills dest must exist even with no source");
+        assert_eq!(std::fs::read_dir(&dest).unwrap().count(), 0);
+
+        // Second case: source has files — they should appear at the dest.
+        let src = tmp.join("agent-with-skills/skills");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(src.join("greet.md"), "say hi\n").unwrap();
+        std::fs::create_dir_all(src.join("nested")).unwrap();
+        std::fs::write(src.join("nested/inner.md"), "inner skill\n").unwrap();
+        refresh_agent_skills(&Host::Local, &worktree, &src).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(dest.join("greet.md")).unwrap(),
+            "say hi\n",
+        );
+        assert_eq!(
+            std::fs::read_to_string(dest.join("nested/inner.md")).unwrap(),
+            "inner skill\n",
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn refresh_agent_skills_clears_carryover_from_previous_dispatch() {
+        // The "different agent on the same workspace" scenario: dispatch
+        // A leaves `.claude/skills/a-tool.md`; dispatch B (different
+        // agent) must not see A's leftovers. The refresh contract is
+        // "destination reflects current source, period."
+        let tmp = agent_test_tmpdir("skills-clear");
+        let worktree = tmp.join("wt");
+        std::fs::create_dir_all(&worktree).unwrap();
+
+        // Dispatch A.
+        let agent_a_skills = tmp.join("agent-a/skills");
+        std::fs::create_dir_all(&agent_a_skills).unwrap();
+        std::fs::write(agent_a_skills.join("a-tool.md"), "agent A skill\n").unwrap();
+        refresh_agent_skills(&Host::Local, &worktree, &agent_a_skills).unwrap();
+        let dest = worktree.join(".claude/skills");
+        assert!(dest.join("a-tool.md").exists());
+
+        // Dispatch B with different skills — A's file must be gone.
+        let agent_b_skills = tmp.join("agent-b/skills");
+        std::fs::create_dir_all(&agent_b_skills).unwrap();
+        std::fs::write(agent_b_skills.join("b-tool.md"), "agent B skill\n").unwrap();
+        refresh_agent_skills(&Host::Local, &worktree, &agent_b_skills).unwrap();
+        assert!(
+            !dest.join("a-tool.md").exists(),
+            "agent A's skill must be cleared on dispatch B"
+        );
+        assert!(dest.join("b-tool.md").exists(), "agent B's skill missing");
+
+        // Dispatch C with no skills at all (or back to A's empty agent)
+        // — the dest must be empty afterwards.
+        let agent_c_skills = tmp.join("agent-c/skills");
+        std::fs::create_dir_all(&agent_c_skills).unwrap();
+        refresh_agent_skills(&Host::Local, &worktree, &agent_c_skills).unwrap();
+        assert!(dest.is_dir(), "skills dir must persist (just empty)");
+        assert_eq!(
+            std::fs::read_dir(&dest).unwrap().count(),
+            0,
+            "skills dir must be empty after dispatch C",
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn with_agent_system_prompt_appends_claude_flag_when_agent_set() {
+        let runner = AgentRunnerSpec { command: "claude".into(), flags: vec![] };
+        let launch = "claude --permission-mode auto";
+        let out = with_agent_system_prompt(
+            launch,
+            Some(WORKTREE_AGENT_INSTRUCTIONS_REL),
+            &runner,
+        );
+        // The flag reads from the worktree-relative file so it works
+        // identically on local and remote hosts (cwd is the worktree).
+        assert!(
+            out.contains("--append-system-prompt"),
+            "missing flag: {out}"
+        );
+        assert!(
+            out.contains("$(cat .claude/agent-instructions.md)"),
+            "expected cat substitution in launch line: {out}"
+        );
+        // The pre-existing flags must survive the append.
+        assert!(out.starts_with("claude --permission-mode auto"), "got: {out}");
+    }
+
+    #[test]
+    fn with_agent_system_prompt_noop_when_no_agent_or_non_claude() {
+        let claude = AgentRunnerSpec { command: "claude".into(), flags: vec![] };
+        let codex = AgentRunnerSpec { command: "codex".into(), flags: vec![] };
+        let base = "claude --permission-mode auto";
+
+        // No agent → no flag injection (e.g. a test or non-CLI caller
+        // that omits the agent context).
+        assert_eq!(
+            with_agent_system_prompt(base, None, &claude),
+            base,
+        );
+
+        // Codex doesn't understand the flag; injecting would crash the
+        // runner. The agent's instructions.md is still on disk for any
+        // future runner-specific loader to pick up.
+        assert_eq!(
+            with_agent_system_prompt(
+                "codex",
+                Some(WORKTREE_AGENT_INSTRUCTIONS_REL),
+                &codex,
+            ),
+            "codex",
+        );
+    }
+
+    /// Hub-side fixture: lays out `<SHELBI_HOME>/projects/<p>/agents/
+    /// <developer,orchestrator>/{instructions.md,skills/}` so the
+    /// deploy_agent_context happy path has something real to read from.
+    fn install_default_agents_under_home(home: &Path, project: &str) {
+        let dev = home.join(format!("projects/{project}/agents/developer"));
+        let orch = home.join(format!("projects/{project}/agents/orchestrator"));
+        std::fs::create_dir_all(dev.join("skills")).unwrap();
+        std::fs::create_dir_all(orch.join("skills")).unwrap();
+        std::fs::write(dev.join("instructions.md"), "# developer\nfix the bug\n").unwrap();
+        std::fs::write(orch.join("instructions.md"), "# orchestrator\ncoordinate\n").unwrap();
+        // One skill on the developer to prove mounting carries content.
+        std::fs::write(dev.join("skills/debug.md"), "# skill: debug\n").unwrap();
+    }
+
+    #[test]
+    fn deploy_agent_context_loads_named_agent_into_worktree() {
+        // Acceptance criterion (a): the developer agent's instructions.md
+        // lands at `.claude/agent-instructions.md` and its skills/ dir
+        // mirrors into `.claude/skills/`. Exercises the full hub-side
+        // path that the spawn function calls in step 2b.
+        let _g = crate::test_lock::acquire();
+        let tmp = agent_test_tmpdir("ctx-developer");
+        let home = tmp.join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        std::env::set_var("SHELBI_HOME", &home);
+        install_default_agents_under_home(&home, "p");
+
+        let worktree = tmp.join("wt");
+        std::fs::create_dir_all(&worktree).unwrap();
+
+        deploy_agent_context(&Host::Local, &worktree, "p", "developer").unwrap();
+
+        let instructions = worktree.join(".claude/agent-instructions.md");
+        assert_eq!(
+            std::fs::read_to_string(&instructions).unwrap(),
+            "# developer\nfix the bug\n",
+            "developer's instructions.md must land verbatim in the worktree",
+        );
+        let skill = worktree.join(".claude/skills/debug.md");
+        assert_eq!(
+            std::fs::read_to_string(&skill).unwrap(),
+            "# skill: debug\n",
+            "developer's skills/ contents must mirror into .claude/skills/",
+        );
+
+        std::env::remove_var("SHELBI_HOME");
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn deploy_agent_context_swaps_agents_on_successive_dispatches() {
+        // Acceptance criteria (b) + (c) combined: same workspace, two
+        // back-to-back dispatches under DIFFERENT agents (the
+        // user-owned-status-under-Zen path is one common producer of
+        // this). The second dispatch must clear the first's skills and
+        // overwrite the instructions.md — the worktree's agent context
+        // reflects the *current* agent, not whatever shipped first.
+        let _g = crate::test_lock::acquire();
+        let tmp = agent_test_tmpdir("ctx-swap");
+        let home = tmp.join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        std::env::set_var("SHELBI_HOME", &home);
+        install_default_agents_under_home(&home, "p");
+
+        let worktree = tmp.join("wt");
+        std::fs::create_dir_all(&worktree).unwrap();
+
+        // Dispatch 1 — developer.
+        deploy_agent_context(&Host::Local, &worktree, "p", "developer").unwrap();
+        let instructions = worktree.join(".claude/agent-instructions.md");
+        let skills_dir = worktree.join(".claude/skills");
+        assert!(skills_dir.join("debug.md").exists());
+        assert!(std::fs::read_to_string(&instructions)
+            .unwrap()
+            .contains("developer"));
+
+        // Dispatch 2 — orchestrator. Different agent, no skills of its
+        // own. The developer's `debug.md` must NOT survive the swap; the
+        // instructions file is overwritten.
+        deploy_agent_context(&Host::Local, &worktree, "p", "orchestrator").unwrap();
+        assert!(
+            !skills_dir.join("debug.md").exists(),
+            "developer's skill leaked into orchestrator dispatch",
+        );
+        assert!(
+            skills_dir.is_dir(),
+            "skills dir must persist after agent swap (just empty)",
+        );
+        assert!(std::fs::read_to_string(&instructions)
+            .unwrap()
+            .contains("orchestrator"));
+
+        std::env::remove_var("SHELBI_HOME");
         let _ = std::fs::remove_dir_all(&tmp);
     }
 }
