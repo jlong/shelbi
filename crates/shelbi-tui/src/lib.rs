@@ -171,33 +171,23 @@ pub fn run_main(project_name: &str) -> Result<()> {
 
 /// Run the minimal ratatui sidebar in the current pane.
 pub fn run_sidebar(project_name: &str) -> Result<()> {
+    // Load merged keymaps once — embedded builtins, then
+    // `~/.shelbi/keys.yml::defaults`, then `projects.<project_name>`.
+    // Diagnostics route through `tracing` so they land in
+    // `~/.shelbi/logs/tui.log` instead of fighting ratatui for the pane
+    // TTY (eprintln! into the alt-screen pane interleaves with the
+    // sidebar redraw and corrupts the nav labels). Resolve them before
+    // `setup_terminal` so the count is ready for the status line.
+    let (keymaps, diags) = shelbi_state::keymap::load_keymaps(Some(project_name));
+    let startup_warnings = log_keymap_diagnostics(&diags);
+
     let mut term = setup_terminal().context("setting up terminal")?;
     let mut app = App::new_sidebar(project_name);
     app.refresh().ok();
-
-    // Load merged keymaps once — embedded builtins, then
-    // `~/.shelbi/keys.yml::defaults`, then `projects.<project_name>`.
-    // Diagnostics print to stderr; bad config never blocks launch.
-    let (keymaps, diags) = shelbi_state::keymap::load_keymaps(Some(project_name));
-    for d in &diags {
-        match d {
-            shelbi_state::keymap::KeymapDiagnostic::Error { message, location, .. } => {
-                if let Some(loc) = location {
-                    eprintln!("shelbi: keys.yml error: {message} (at {loc})");
-                } else {
-                    eprintln!("shelbi: keys.yml error: {message}");
-                }
-            }
-            shelbi_state::keymap::KeymapDiagnostic::Warning { message, location, .. } => {
-                if let Some(loc) = location {
-                    eprintln!("shelbi: keys.yml warning: {message} (at {loc})");
-                } else {
-                    eprintln!("shelbi: keys.yml warning: {message}");
-                }
-            }
-        }
-    }
     app.keymaps = keymaps;
+    if startup_warnings > 0 {
+        app.status_line = startup_warnings_status_line(startup_warnings);
+    }
 
     // First-run probe: on fresh installs (no ~/.shelbi/config.yaml),
     // verify Alt+Z is delivered and let the user pick a fallback if not.
@@ -225,30 +215,14 @@ pub fn run_sidebar(project_name: &str) -> Result<()> {
 /// the palette. Parent shell wraps invocation in `while true; do …; done`
 /// so an accidental crash respawns instead of leaving an empty pane.
 pub fn run_tasks(project_name: &str) -> Result<()> {
-    // Load `keys.yml` before the alt-screen swap so parse / collision
-    // diagnostics land on the terminal the user can still see. Bad
+    // Load `keys.yml` before the alt-screen swap. Diagnostics route
+    // through `tracing` (→ `~/.shelbi/logs/tui.log`) so they can't
+    // interleave with ratatui's redraw on the shared pane TTY. Bad
     // config never blocks launch — affected actions fall back to
-    // built-in defaults. Formatting mirrors `run_sidebar` so both
-    // entry points present diagnostics the same way.
+    // built-in defaults. The sidebar pane surfaces a discoverable
+    // count in its status line.
     let (keymaps, diags) = shelbi_state::keymap::load_keymaps(Some(project_name));
-    for d in &diags {
-        match d {
-            shelbi_state::keymap::KeymapDiagnostic::Error { message, location, .. } => {
-                if let Some(loc) = location {
-                    eprintln!("shelbi: keys.yml error: {message} (at {loc})");
-                } else {
-                    eprintln!("shelbi: keys.yml error: {message}");
-                }
-            }
-            shelbi_state::keymap::KeymapDiagnostic::Warning { message, location, .. } => {
-                if let Some(loc) = location {
-                    eprintln!("shelbi: keys.yml warning: {message} (at {loc})");
-                } else {
-                    eprintln!("shelbi: keys.yml warning: {message}");
-                }
-            }
-        }
-    }
+    log_keymap_diagnostics(&diags);
 
     let mut term = setup_terminal().context("setting up terminal")?;
     let mut app = KanbanApp::new(project_name);
@@ -268,30 +242,14 @@ pub fn run_tasks(project_name: &str) -> Result<()> {
 /// hidden stash session and swapped in by the palette / sidebar — same
 /// lifecycle as `run_tasks`.
 pub fn run_review(project_name: &str) -> Result<()> {
-    // Load `keys.yml` before the alt-screen swap so parse / collision
-    // diagnostics land on the terminal the user can still see. Bad
+    // Load `keys.yml` before the alt-screen swap. Diagnostics route
+    // through `tracing` (→ `~/.shelbi/logs/tui.log`) so they can't
+    // interleave with ratatui's redraw on the shared pane TTY. Bad
     // config never blocks launch — affected actions fall back to
-    // built-in defaults. Formatting mirrors `run_sidebar` and
-    // `run_tasks` so all entry points present diagnostics the same way.
+    // built-in defaults. The sidebar pane surfaces a discoverable
+    // count in its status line.
     let (keymaps, diags) = shelbi_state::keymap::load_keymaps(Some(project_name));
-    for d in &diags {
-        match d {
-            shelbi_state::keymap::KeymapDiagnostic::Error { message, location, .. } => {
-                if let Some(loc) = location {
-                    eprintln!("shelbi: keys.yml error: {message} (at {loc})");
-                } else {
-                    eprintln!("shelbi: keys.yml error: {message}");
-                }
-            }
-            shelbi_state::keymap::KeymapDiagnostic::Warning { message, location, .. } => {
-                if let Some(loc) = location {
-                    eprintln!("shelbi: keys.yml warning: {message} (at {loc})");
-                } else {
-                    eprintln!("shelbi: keys.yml warning: {message}");
-                }
-            }
-        }
-    }
+    log_keymap_diagnostics(&diags);
 
     let mut term = setup_terminal().context("setting up terminal")?;
     let mut app = ReviewApp::new(project_name);
@@ -339,4 +297,150 @@ fn restore_terminal<B: ratatui::backend::Backend + std::io::Write>(
     execute!(term.backend_mut(), DisableMouseCapture, LeaveAlternateScreen)?;
     term.show_cursor()?;
     Ok(())
+}
+
+/// Route every keys.yml load diagnostic through `tracing` so the TUI's
+/// `init_tracing` writer drops them into `~/.shelbi/logs/tui.log`
+/// instead of the shared pane TTY. Direct `eprintln!` after the
+/// alt-screen swap collides with ratatui's redraw cycle and corrupts
+/// whichever cells happen to be re-painting at the same moment — the
+/// observed failure mode is a sidebar with the warning text spliced
+/// through the nav labels. Returns the diagnostic count so the caller
+/// can surface a discoverable "⚠ N startup warnings" hint.
+fn log_keymap_diagnostics(diags: &[shelbi_state::keymap::KeymapDiagnostic]) -> usize {
+    use shelbi_state::keymap::KeymapDiagnostic;
+    for d in diags {
+        match d {
+            KeymapDiagnostic::Error { message, location, .. } => match location {
+                Some(loc) => tracing::error!("keys.yml error: {message} (at {loc})"),
+                None => tracing::error!("keys.yml error: {message}"),
+            },
+            KeymapDiagnostic::Warning { message, location, .. } => match location {
+                Some(loc) => tracing::warn!("keys.yml warning: {message} (at {loc})"),
+                None => tracing::warn!("keys.yml warning: {message}"),
+            },
+        }
+    }
+    diags.len()
+}
+
+/// Build the sidebar status-line text that surfaces a startup-warning
+/// count and points the user at the log file where the full diagnostic
+/// text lives. Kept tiny so the line still fits on a narrow sidebar.
+fn startup_warnings_status_line(count: usize) -> String {
+    let suffix = if count == 1 { "" } else { "s" };
+    format!("⚠ {count} startup warning{suffix} — see ~/.shelbi/logs/tui.log")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ratatui::{backend::TestBackend, Terminal};
+    use shelbi_state::keymap::{ErrorKind, KeymapDiagnostic, WarningKind};
+
+    fn warning(message: &str, location: Option<&str>) -> KeymapDiagnostic {
+        KeymapDiagnostic::Warning {
+            kind: WarningKind::LegacyZenToggleField,
+            message: message.into(),
+            location: location.map(str::to_string),
+        }
+    }
+
+    fn error(message: &str, location: Option<&str>) -> KeymapDiagnostic {
+        KeymapDiagnostic::Error {
+            kind: ErrorKind::UnknownAction,
+            message: message.into(),
+            location: location.map(str::to_string),
+        }
+    }
+
+    /// The diagnostic-routing helper returns the diagnostic count. The
+    /// caller uses this to drive the sidebar's status-line surface; if
+    /// the count drifts the hint silently disappears.
+    #[test]
+    fn log_keymap_diagnostics_returns_count() {
+        let diags = vec![
+            warning("legacy zen_toggle field", Some("config.yaml")),
+            error("unknown action `nope`", None),
+        ];
+        assert_eq!(log_keymap_diagnostics(&diags), 2);
+        assert_eq!(log_keymap_diagnostics(&[]), 0);
+    }
+
+    /// Plural / singular suffix on the status-line copy. One warning
+    /// reads "1 startup warning", two read "2 startup warnings"; both
+    /// point at the log file so the user knows where to look.
+    #[test]
+    fn startup_warnings_status_line_uses_correct_plural() {
+        let one = startup_warnings_status_line(1);
+        assert!(one.contains("1 startup warning "), "{one}");
+        assert!(one.contains("~/.shelbi/logs/tui.log"), "{one}");
+        let many = startup_warnings_status_line(3);
+        assert!(many.contains("3 startup warnings "), "{many}");
+    }
+
+    /// Regression for the startup-warnings-interleave bug. The sidebar
+    /// must render its three nav labels (`💬 Chat`, `📋 Tasks`,
+    /// `⚡ Activity`) uninterrupted even when a keys.yml load produced
+    /// warnings. The pre-fix code `eprintln!`'d after the alt-screen
+    /// swap and the diagnostic text landed mid-label; the new path
+    /// routes diagnostics to `tracing` and surfaces a count in the
+    /// status line, so the nav labels stay clean.
+    #[test]
+    fn sidebar_nav_labels_render_uninterrupted_with_startup_warnings() {
+        let diags = vec![
+            warning(
+                "config.yaml::keymap.zen_toggle has no keys.yml::default for zen_toggle",
+                Some("config.yaml"),
+            ),
+        ];
+        let count = log_keymap_diagnostics(&diags);
+        let mut app = App::new_sidebar("demo");
+        if count > 0 {
+            app.status_line = startup_warnings_status_line(count);
+        }
+
+        let backend = TestBackend::new(60, 20);
+        let mut term = Terminal::new(backend).unwrap();
+        term.draw(|f| sidebar::render_full(f, &mut app, f.area())).unwrap();
+        let buf = term.backend().buffer().clone();
+        let dumped: Vec<String> = (0..buf.area.height)
+            .map(|y| {
+                (0..buf.area.width)
+                    .map(|x| buf[(x, y)].symbol().to_string())
+                    .collect::<Vec<_>>()
+                    .join("")
+            })
+            .collect();
+        let joined = dumped.join("\n");
+
+        // Each nav label appears once, contiguously, in the rendered
+        // pane. TestBackend reserves a filler cell after each wide
+        // emoji glyph, so the buffer dump shows two spaces between the
+        // icon and the label text — that's the layout the user sees on
+        // a real terminal too, just collapsed to one cell.
+        for (emoji, text) in [("💬", "Chat"), ("📋", "Tasks"), ("⚡", "Activity")] {
+            let label = format!("{emoji}  {text}");
+            assert!(
+                joined.matches(&label).count() == 1,
+                "expected `{label}` to render exactly once and contiguously, but got:\n{joined}",
+            );
+        }
+
+        // And the status line surfaces a discoverable count.
+        assert!(
+            joined.contains("⚠ 1 startup warning"),
+            "expected startup-warning hint in:\n{joined}",
+        );
+        assert!(
+            joined.contains("~/.shelbi/logs/tui.log"),
+            "expected log-file pointer in:\n{joined}",
+        );
+
+        // No raw diagnostic text leaks onto the pane — only the count.
+        assert!(
+            !joined.contains("zen_toggle"),
+            "raw diagnostic text leaked onto the pane:\n{joined}",
+        );
+    }
 }
