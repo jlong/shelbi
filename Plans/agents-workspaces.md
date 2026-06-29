@@ -352,19 +352,20 @@ After Phase 1: the abstraction exists, the default workflow uses it, the CLI voc
 After Phase 2: custom workflows + custom agents are fully composable. A user can drop in a QA agent, wire it to a `qa` status, and have every task pass through their custom verification gate.
 
 ## Decisions
+
 - **Sidebar rebrand + reorganize: "Agents" → "Workspaces", grouped by machine.** Frees the word "Agent" for the new concept and aligns with the persistent-slot mental model (each workspace = one pane + one git worktree on a specific machine). Group headers collapse to a flat list when the project has only one machine. Vocabulary: workspace = slot, agent = role, task = work.
 
-- **CLI rename to `shelbi workspace *` in v1.** The sidebar rename pulls the CLI rename forward: `shelbi worker list` → `shelbi workspace list`, etc. `shelbi worker *` stays as a deprecation alias for one release with a one-line stderr nag. Event-line `worker=<name>` renames to `workspace=<name>` with parser fallback for one release.
+- **CLI rename to** **`shelbi workspace *`** **in v1.** The sidebar rename pulls the CLI rename forward: `shelbi worker list` → `shelbi workspace list`, etc. `shelbi worker *` stays as a deprecation alias for one release with a one-line stderr nag. Event-line `worker=<name>` renames to `workspace=<name>` with parser fallback for one release.
 
 - **Agent storage:** **`~/.shelbi/projects/<project>/agents/<name>/`** containing `instructions.md` and `skills/`. Mirrors the workflows folder layout.
 
 - **Default agents: Orchestrator + Developer**, shipped in the binary and materialized into the project on init / self-healed on reload. Editable per-project; binary upgrade doesn't clobber edits.
 
-- **Workflow binding: two fields, `owner: user | agent` + optional `agent: <name>`.** `owner` is the binary "whose responsibility under no-automation"; `agent` names which agent acts when automation (Zen, etc.) is on. Decouples responsibility from automation, so a `user`-owned status can still have an agent-driven Zen path (e.g. `review: owner: user, agent: orchestrator` for auto-merge). Hard-fail if `owner: agent` without `agent:`. Legacy single-field workflows auto-migrate with a deprecation warning. Net effect: Zen behavior becomes declarative data in the workflow YAML instead of orchestrator-prompt prose.
+- **Workflow binding: two fields,** **`owner: user | agent`** **+ optional** **`agent: <name>`.** `owner` is the binary "whose responsibility under no-automation"; `agent` names which agent acts when automation (Zen, etc.) is on. Decouples responsibility from automation, so a `user`-owned status can still have an agent-driven Zen path (e.g. `review: owner: user, agent: orchestrator` for auto-merge). Hard-fail if `owner: agent` without `agent:`. Legacy single-field workflows auto-migrate with a deprecation warning. Net effect: Zen behavior becomes declarative data in the workflow YAML instead of orchestrator-prompt prose.
 
-- **Workspace spawn loads agent's `instructions.md` as system prompt** (prepended with `agents/_shared/preamble.md` if the project has one) and mounts the agent's `skills/` into `.claude/skills/`. The same workspace slot runs different agents on consecutive dispatches.
+- **Workspace spawn loads agent's** **`instructions.md`** **as system prompt** (prepended with `agents/_shared/preamble.md` if the project has one) and mounts the agent's `skills/` into `.claude/skills/`. The same workspace slot runs different agents on consecutive dispatches.
 
-- **Deprecate `CLAUDE.md`.** Project-wide context for all agents moves into `agents/_shared/preamble.md`; orchestrator-specific overrides go into `agents/orchestrator/instructions.md`. Removes the special-case file and unifies how agents source their context. v1 still reads an existing `CLAUDE.md` if present (with a one-time migration hint); v2 drops the read path.
+- **Deprecate** **`CLAUDE.md`.** Project-wide context for all agents moves into `agents/_shared/preamble.md`; orchestrator-specific overrides go into `agents/orchestrator/instructions.md`. Removes the special-case file and unifies how agents source their context. v1 still reads an existing `CLAUDE.md` if present (with a one-time migration hint); v2 drops the read path.
 
 - **Orchestrator agent is special** — runs persistently on its own pane, not per-task-dispatch. Statuses declaring `agent: orchestrator` are declarative documentation of what the orchestrator does; the orchestrator process itself runs always.
 
@@ -372,21 +373,14 @@ After Phase 2: custom workflows + custom agents are fully composable. A user can
 
 - **CLI surface:** full `shelbi agent list / show / new / edit` quartet in v1. Mirrors what `shelbi workspace *` and `shelbi task *` offer; no command deferred.
 
-- **Events log gains `agent=<name>` field** on dispatch events (redundant with the status's `agent:`, but keeps the feed self-contained).
+- **Events log gains** **`agent=<name>`** **field** on dispatch events (redundant with the status's `agent:`, but keeps the feed self-contained).
 
-- **`shelbi workspace list` columns: `NAME`, `HOST`, `MODEL`, `AGENT`, `STATE`.** Replaces today's `claude` column with `MODEL` (more generic, future-proofs for non-Claude runtimes); adds new `AGENT` column for the loaded role.
+- **`shelbi workspace list`** **columns:** **`NAME`,** **`HOST`,** **`MODEL`,** **`AGENT`,** **`STATE`.** Replaces today's `claude` column with `MODEL` (more generic, future-proofs for non-Claude runtimes); adds new `AGENT` column for the loaded role.
+
 ## Open questions
 
-Two questions remain genuinely open; everything else has been folded into Decisions.
-
-**Deferred to v2 (not blockers, no current demand):**
+Substantively the plan is locked. Two items deferred to v2 with no current blocker:
 
 - **Per-workspace preferred agent?** Should a workspace declare `prefers_agent: developer` so the orchestrator routes that workspace to matching statuses when possible? Useful if certain hosts have tools or auth only one agent needs. Deferred — no concrete use case yet; pairs naturally with `prefers_machine` if it ships.
 
-- **Global agent library at** **`~/.shelbi/agents/`?** Cross-project agents (one "Security Review" agent reused everywhere). Deferred — no cross-project sharing demand yet; revisit when someone hits the pain of maintaining the same agent in N projects. (Also blocks the related "skill inheritance / composition" question, since there's nothing to compose with until global agents exist.)
-
-**Still genuinely open:**
-
-- **`shelbi agent edit <name>`** — opens the agent's `instructions.md` in `$EDITOR` (mirroring `shelbi workflow edit` if/when that exists). Trivial to ship; only question is whether it's necessary. Deferred to v2 by default; revisit if users ask.
-
-- **Sidebar mockup glyph legend.** §1's tree mockup uses `▶` for active workspaces and `·` for idle; the prose doesn't yet name those glyphs. Worth a one-liner legend or sticking with "infer from context." (Not blocking; cosmetic.)
+- **Global agent library at** **`~/.shelbi/agents/`?** Cross-project agents (one "Security Review" agent reused everywhere). Deferred — no cross-project sharing demand yet; revisit when someone hits the pain of maintaining the same agent in N projects. The related "skill inheritance / composition" question is moot until a global library exists (nothing to compose with).
