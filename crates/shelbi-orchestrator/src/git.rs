@@ -12,8 +12,18 @@ use shelbi_core::{Error, Host, MachineKind, Project, Result, Task};
 use crate::worker::worker_worktree;
 
 /// Run `argv` with cwd = `dir` on `host`, picking up the user's login
-/// `PATH` on remote SSH hosts so `gh` and `git` resolve the same way
-/// they do in the user's terminal.
+/// `PATH` on both local and remote hosts so `gh` / `git` (and anything
+/// else a per-workflow primitive may reach for) resolve the same way they
+/// do in the user's own terminal.
+///
+/// We can't trust the orchestrator's inherited environment on local
+/// either: when shelbi is launched outside an interactive terminal (from
+/// launchd, Spotlight, a cron schedule, or a tmux server that itself
+/// started in a non-login context), the inherited `PATH` is the
+/// `/usr/bin:/bin` skeleton and is missing every tool installed via a
+/// version manager or under `/opt/homebrew/bin`. The login shell sources
+/// the user's rc files and rebuilds `PATH` the same way it does in
+/// their terminal — see [`login_shell_prefix`] for the exact contract.
 pub(crate) fn run_in_dir(host: &Host, dir: &str, argv: &[&str]) -> Result<Output> {
     let escaped: Vec<String> = argv.iter().map(|a| shelbi_agent::shell_escape(a)).collect();
     let line = format!(
@@ -21,10 +31,32 @@ pub(crate) fn run_in_dir(host: &Host, dir: &str, argv: &[&str]) -> Result<Output
         shelbi_agent::shell_escape(dir),
         escaped.join(" ")
     );
-    // Local: bash -c is fine — the user already has gh on PATH.
-    // Remote: bash -lc so .zprofile/.bash_profile populate PATH first.
-    let flag = if host.is_local() { "-c" } else { "-lc" };
-    shelbi_ssh::run(host, ["bash", flag, line.as_str()]).map_err(Error::Io)
+    let (shell, flag) = login_shell_prefix(host);
+    shelbi_ssh::run(host, [shell.as_str(), flag, line.as_str()]).map_err(Error::Io)
+}
+
+/// `(shell, "-lc")` — the pair shelbi prepends to a shell script so it
+/// runs through a login shell on `host`. Used by every primitive that
+/// shells out to environment-sensitive tools (zen probe's local checks,
+/// pr-create / ci-watch / pr-merge, the per-workflow actions).
+///
+/// Local: read `$SHELL` from the orchestrator's env, defaulting to
+/// `/bin/sh` for the no-`$SHELL` edge case (launchd, container, etc.).
+/// Reading `$SHELL` matters because zsh users want `.zprofile` /
+/// `.zshenv` sourced rather than bash's startup files — picking the
+/// wrong shell silently runs the wrong rc files and misses whatever
+/// `PATH` mutations the user wired up there.
+///
+/// Remote: pass the literal string `"$SHELL"` so the user's login shell
+/// — which `sshd` hands the command to — expands it to whichever shell
+/// that account actually uses. Avoids us guessing which shells are
+/// installed on the remote.
+pub(crate) fn login_shell_prefix(host: &Host) -> (String, &'static str) {
+    let shell = match host {
+        Host::Local => std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".into()),
+        Host::Ssh { .. } => "$SHELL".to_string(),
+    };
+    (shell, "-lc")
 }
 
 /// Find the worker assigned to `task`, then return its host + worktree.
@@ -180,5 +212,79 @@ mod tests {
     fn parse_pr_number_rejects_garbage() {
         assert_eq!(parse_pr_number_from_url(""), None);
         assert_eq!(parse_pr_number_from_url("not a url"), None);
+    }
+
+    #[test]
+    fn login_shell_prefix_local_uses_shell_env() {
+        let _guard = crate::test_lock::acquire();
+        let prev = std::env::var_os("SHELL");
+        std::env::set_var("SHELL", "/bin/sh");
+        let (shell, flag) = login_shell_prefix(&Host::Local);
+        match prev {
+            Some(v) => std::env::set_var("SHELL", v),
+            None => std::env::remove_var("SHELL"),
+        }
+        assert_eq!(shell, "/bin/sh");
+        assert_eq!(flag, "-lc");
+    }
+
+    #[test]
+    fn login_shell_prefix_local_defaults_when_shell_unset() {
+        let _guard = crate::test_lock::acquire();
+        let prev = std::env::var_os("SHELL");
+        std::env::remove_var("SHELL");
+        let (shell, _) = login_shell_prefix(&Host::Local);
+        match prev {
+            Some(v) => std::env::set_var("SHELL", v),
+            None => std::env::remove_var("SHELL"),
+        }
+        assert_eq!(shell, "/bin/sh");
+    }
+
+    #[test]
+    fn run_in_dir_runs_in_login_shell_that_sources_rc() {
+        let _guard = crate::test_lock::acquire();
+        // `pr_create` / `ci_watch` / `pr_merge` all funnel through
+        // `run_in_dir` — they have to launch under a login shell so the
+        // user's `PATH` (gh/git installed via homebrew, asdf, mise, nvm,
+        // etc.) is rebuilt from their rc files before the command runs.
+        //
+        // Override `$HOME` to a tempdir, drop a `.profile` that exports
+        // a marker, and assert the marker came through — proving the
+        // outer login shell sourced rc files before executing the
+        // wrapped argv. (Bash, dash, and bash-as-sh in login mode all
+        // source `~/.profile`; zsh sources `~/.zprofile` / `~/.zshenv`
+        // — pinning `$SHELL` to `/bin/sh` keeps this hermetic.)
+        let tmp = tempfile::tempdir().unwrap();
+        let profile = tmp.path().join(".profile");
+        std::fs::write(&profile, "export SHELBI_LOGIN_MARK=ran-in-login\n").unwrap();
+
+        let prev_shell = std::env::var_os("SHELL");
+        let prev_home = std::env::var_os("HOME");
+        std::env::set_var("SHELL", "/bin/sh");
+        std::env::set_var("HOME", tmp.path());
+
+        let out = run_in_dir(
+            &Host::Local,
+            tmp.path().to_str().unwrap(),
+            &["sh", "-c", "echo $SHELBI_LOGIN_MARK"],
+        );
+
+        match prev_shell {
+            Some(v) => std::env::set_var("SHELL", v),
+            None => std::env::remove_var("SHELL"),
+        }
+        match prev_home {
+            Some(v) => std::env::set_var("HOME", v),
+            None => std::env::remove_var("HOME"),
+        }
+
+        let out = out.expect("run_in_dir failed");
+        assert!(out.status.success(), "exited {:?}", out.status);
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            stdout.contains("ran-in-login"),
+            "expected outer login shell to source ~/.profile, got: {stdout}"
+        );
     }
 }
