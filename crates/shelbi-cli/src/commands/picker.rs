@@ -158,6 +158,7 @@ fn add_new_project() -> Result<PickerOutcome> {
         Ok(name) => {
             crate::commands::init::run(crate::commands::init::Args {
                 project: Some(name.clone()),
+                root: None,
             })
             .context("running init for new project")?;
             Ok(PickerOutcome::Created(name))

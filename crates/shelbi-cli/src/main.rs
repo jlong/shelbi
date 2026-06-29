@@ -2,6 +2,7 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 
 mod commands;
+mod project_root;
 mod wizard;
 
 #[derive(Debug, Parser)]
@@ -238,18 +239,36 @@ fn main() -> Result<()> {
 
 /// `shelbi` with no subcommand. Dispatches based on what's on disk:
 ///
-/// - explicit `--project` / `SHELBI_PROJECT` / `.shelbi/project` marker →
-///   boot that project's TUI (this branch is checked first so a marker
-///   always wins over the picker — matches today's behavior).
+/// - explicit `--project` / `SHELBI_PROJECT` / `.shelbi/project` marker
+///   that resolves to a YAML on disk → boot that project's TUI.
+/// - marker resolves but its YAML is missing on this machine (common
+///   after `git clone` if `.shelbi/project` shipped with the repo) →
+///   print a friendly note and fall through to the first-run prompt
+///   so the user can set up the project locally. We deliberately re-
+///   derive the project name from the chosen root's basename rather
+///   than re-using the stale marker's name.
 /// - `~/.shelbi/` missing OR `~/.shelbi/projects/` empty → onboarding
-///   wizard. After it completes, if exactly one project now exists boot
-///   it directly; otherwise print a hint and exit.
+///   first-run flow (banner + assistant name + project-root prompt +
+///   scaffold + launch TUI).
 /// - exactly one project YAML → boot it.
 /// - two or more → project picker.
 fn default_entry(explicit: Option<String>) -> Result<()> {
-    if let Ok(p) = commands::require_project(explicit) {
-        return shelbi_tui::run_main(&p).context("launching shelbi");
-    }
+    let resolved = commands::require_project(explicit).ok();
+    let stale_marker = match resolved.as_deref() {
+        Some(name) if project_yaml_exists(name) => {
+            return shelbi_tui::run_main(name).context("launching shelbi");
+        }
+        Some(name) => {
+            eprintln!(
+                "Found a .shelbi/project marker for `{name}`, but no \
+                 ~/.shelbi/projects/{name}.yaml on this machine. The marker \
+                 likely shipped via git clone — let's set up the project \
+                 here.\n"
+            );
+            true
+        }
+        None => false,
+    };
 
     let home = shelbi_state::shelbi_home().map_err(|e| anyhow::anyhow!(e))?;
     let home_existed = home.exists();
@@ -259,7 +278,10 @@ fn default_entry(explicit: Option<String>) -> Result<()> {
         Vec::new()
     };
 
-    if projects.is_empty() {
+    // Stale marker forces first-run regardless of how many other projects
+    // are on disk — the user is sitting in a repo that needs scaffolding
+    // and that's the action that maps to their intent.
+    if stale_marker || projects.is_empty() {
         return run_wizard_then_dispatch(!home_existed);
     }
     if projects.len() == 1 {
@@ -274,23 +296,64 @@ fn default_entry(explicit: Option<String>) -> Result<()> {
     }
 }
 
-/// Run the wizard and, if it produced exactly one project, boot directly
-/// into its TUI. Any other end-state (cancelled, zero projects, more than
-/// one) exits cleanly — the user can re-run `shelbi` later.
+/// Whether `~/.shelbi/projects/<name>.yaml` is on this machine. Used to
+/// distinguish a live marker from a stale one without round-tripping
+/// through the TUI loader's error path.
+fn project_yaml_exists(name: &str) -> bool {
+    match shelbi_state::projects_dir() {
+        Ok(dir) => dir.join(format!("{name}.yaml")).exists(),
+        Err(_) => false,
+    }
+}
+
+/// First-run dispatcher when `default_entry` finds no projects on disk.
+/// Prints the brand banner (only on a truly-fresh install), captures the
+/// assistant name once (idempotent — phase 1 is a no-op if it's already
+/// on file), then runs the same `shelbi init` prompt + scaffold the
+/// explicit command runs and finally launches the TUI against the newly-
+/// scaffolded project.
 ///
 /// `first_run` is true when `~/.shelbi/` did not exist before this
-/// invocation; the wizard prints the brand banner only in that case.
+/// invocation; the banner only prints in that case.
+///
+/// Cancellation (`Ctrl-C` / `Esc`) at any prompt exits cleanly without
+/// scaffolding anything — the per-step `inquire` calls write state only
+/// at the end of their phase.
 fn run_wizard_then_dispatch(first_run: bool) -> Result<()> {
-    match commands::wizard::run(first_run)? {
-        commands::wizard::WizardOutcome::Cancelled => return Ok(()),
-        commands::wizard::WizardOutcome::Completed => {}
+    if first_run {
+        wizard::print_banner();
     }
-    let projects = shelbi_state::list_projects().map_err(|e| anyhow::anyhow!(e))?;
-    if projects.len() == 1 {
-        return shelbi_tui::run_main(&projects[0].name).context("launching shelbi");
+    match wizard::phase_1_assistant_name() {
+        Ok(()) => {}
+        Err(e) if is_inquire_cancel(&e) => return Ok(()),
+        Err(e) => return Err(e),
     }
-    println!("Run shelbi to launch, or shelbi project add to add another.");
-    Ok(())
+    let cfg = shelbi_state::load_shelbi_config().map_err(|e| anyhow::anyhow!(e))?;
+    println!("✓ assistant: {}", cfg.assistant_name());
+
+    let resolved = match commands::init::scaffold_with_prompt(commands::init::Args {
+        project: None,
+        root: None,
+    }) {
+        Ok(r) => r,
+        Err(e) if is_inquire_cancel(&e) => return Ok(()),
+        Err(e) => return Err(e),
+    };
+    shelbi_tui::run_main(&resolved.name).context("launching shelbi")
+}
+
+/// True if `e` was produced by an `inquire` prompt being cancelled or
+/// interrupted (`Esc` / `Ctrl-C`). Walks the anyhow source chain because
+/// the wizard/init helpers wrap each `prompt()` call in
+/// `.with_context(...)`.
+fn is_inquire_cancel(e: &anyhow::Error) -> bool {
+    matches!(
+        e.downcast_ref::<inquire::error::InquireError>(),
+        Some(
+            inquire::error::InquireError::OperationCanceled
+                | inquire::error::InquireError::OperationInterrupted
+        )
+    )
 }
 
 /// Initialize the tracing subscriber.
@@ -382,5 +445,30 @@ mod cli_tests {
             Some(Cmd::Workspace { cmd: WorkspaceCmd::List }) => {}
             other => panic!("expected Cmd::Workspace::List, got {other:?}"),
         }
+    }
+
+    /// Stale-marker detection: `project_yaml_exists` is the predicate
+    /// `default_entry` uses to decide whether a resolved marker is live
+    /// or stale. The test pins both branches against a tempfile
+    /// `SHELBI_HOME` so a future refactor can't silently invert it.
+    #[test]
+    fn project_yaml_exists_pins_stale_marker_branch() {
+        let _g = commands::test_support::ENV_LOCK.lock().unwrap();
+        let home = std::env::temp_dir().join(format!(
+            "shelbi-stale-marker-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(home.join("projects")).unwrap();
+        std::env::set_var("SHELBI_HOME", &home);
+
+        assert!(!project_yaml_exists("nope"), "missing YAML should be stale");
+        std::fs::write(home.join("projects/live.yaml"), "name: live\n").unwrap();
+        assert!(project_yaml_exists("live"), "present YAML should be live");
+
+        std::env::remove_var("SHELBI_HOME");
     }
 }
