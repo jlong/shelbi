@@ -184,7 +184,6 @@ pub fn run_sidebar(project_name: &str) -> Result<()> {
     let mut term = setup_terminal().context("setting up terminal")?;
     let mut app = App::new_sidebar(project_name);
     app.refresh().ok();
-    app.keymaps = keymaps;
     if startup_warnings > 0 {
         app.status_line = startup_warnings_status_line(startup_warnings);
     }
@@ -193,8 +192,14 @@ pub fn run_sidebar(project_name: &str) -> Result<()> {
     // verify Alt+Z is delivered and let the user pick a fallback if not.
     // Best-effort: an error here defaults to Alt+Z so the sidebar still
     // launches with a working binding on cooperative terminals.
-    app.zen_toggle_chord = zen_probe::ensure_zen_keymap(&mut term)
+    let probe_chord = zen_probe::ensure_zen_keymap(&mut term)
         .unwrap_or(shelbi_state::ZenToggleChord::AltZ);
+    // Prefer the keys.yml-resolved chord (so a migrated `zen_toggle`
+    // shows the right glyph even though `config.yaml` is now at default)
+    // and fall back to the probe's answer for chords the four-value
+    // [`ZenToggleChord`] enum can't represent.
+    app.zen_toggle_chord = keymaps.zen_toggle_chord(probe_chord);
+    app.keymaps = keymaps;
 
     // Background poll loop: per-worker `tmux display-message` every
     // `worker_poll_interval_secs`, parses the `shelbi:<state>` marker,
