@@ -4,20 +4,20 @@
 //!
 //! Each machine has its own local ContextStore git repo (typically under
 //! `~/Documents/ContextStore/<space>`). They are independent repos, not
-//! clones of a shared remote — so when a devbox-worker writes
+//! clones of a shared remote — so when a devbox-workspace writes
 //! `Shelbi/Research/<slug>.md` via `cstore new`, the file lives ONLY on
 //! devbox until something pulls it back to the user's primary machine
 //! (hub). The user browses ContextStore from hub. Without sync, every
-//! research note / plan authored by a remote worker is effectively
+//! research note / plan authored by a remote workspace is effectively
 //! invisible.
 //!
 //! ## What this does (Plan B from the original task)
 //!
-//! After the hub-side poller promotes a worker's task to the review
+//! After the hub-side poller promotes a workspace's task to the review
 //! column, we check the task body against a small heuristic (was
 //! `cstore` mentioned, or a `<configured-space>/` path referenced?) and,
-//! if matched, rsync each matching space dir from the remote worker's
-//! machine back to hub. Local workers skip — the files are already on
+//! if matched, rsync each matching space dir from the remote workspace's
+//! machine back to hub. Local workspaces skip — the files are already on
 //! hub. Failures log to `events.log` and surface in the activity feed,
 //! but never block the promotion: the worst case is the user notices
 //! the missing file and re-runs sync, which beats silently failing to
@@ -25,22 +25,22 @@
 //!
 //! ## What this does NOT do
 //!
-//! - Push hub edits *out* to remote workers. The next worker dispatch
-//!   on that machine reuses the worker's stable worktree, which is
+//! - Push hub edits *out* to remote workspaces. The next workspace dispatch
+//!   on that machine reuses the workspace's stable worktree, which is
 //!   independent of ContextStore; staleness on remote is acceptable for
 //!   v1. A future Plan A (real shared git remote) or Plan C (`cstore
 //!   sync` primitives) replaces this.
-//! - Resolve write/write conflicts. We trust the worker as the source
+//! - Resolve write/write conflicts. We trust the workspace as the source
 //!   of truth at handoff time — `rsync --delete` is NOT used so hub-only
 //!   files survive, but a hub-and-remote concurrent edit of the same
 //!   file resolves to whichever wrote last on the remote side. In
-//!   practice the worker is the only writer during its turn.
+//!   practice the workspace is the only writer during its turn.
 
 use shelbi_core::{ContextStoreSyncSpec, Host, Machine, Project};
 
 /// Outcome of trying to sync one space from one remote machine. Returned
 /// to callers (and surfaced via `events.log`) so the orchestrator can
-/// see — and tell the user — when a remote-worker write didn't make it
+/// see — and tell the user — when a remote-workspace write didn't make it
 /// back.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SyncOutcome {
@@ -56,7 +56,7 @@ pub enum SyncStatus {
     /// rsync exited non-zero or couldn't be invoked. `detail` is the
     /// short reason (stderr first line, or the io::Error message).
     Failed { detail: String },
-    /// Local hub-side worker — sync is a no-op. Returned so callers can
+    /// Local hub-side workspace — sync is a no-op. Returned so callers can
     /// still log the decision uniformly without special-casing the
     /// caller side.
     SkippedLocal,
@@ -89,7 +89,7 @@ impl SyncStatus {
 ///
 /// We're deliberately generous: the cost of a false positive (one
 /// extra rsync that finds no changes) is much smaller than the cost
-/// of a false negative (worker write stranded on the remote).
+/// of a false negative (workspace write stranded on the remote).
 pub fn body_matches<'a>(
     body: &str,
     specs: &'a [ContextStoreSyncSpec],
@@ -195,7 +195,7 @@ fn sync_one(host: &Host, spec: &ContextStoreSyncSpec) -> SyncStatus {
 ///   sync doesn't trigger a separate auth handshake.
 ///
 /// No `--delete`: hub-only files (e.g. notes the user wrote locally
-/// between the worker's start and finish) must survive. We're catching
+/// between the workspace's start and finish) must survive. We're catching
 /// up, not mirroring. No `--mkpath` either — macOS's bundled openrsync
 /// rejects the flag; the caller `mkdir -p`s the destination instead.
 fn rsync_argv(src: &str, dst: &str) -> Vec<String> {
@@ -298,7 +298,7 @@ mod tests {
 
     #[test]
     fn sync_one_skips_local_host_without_invoking_rsync() {
-        // Local hub-side workers don't need a sync — their writes
+        // Local hub-side workspaces don't need a sync — their writes
         // already land on the hub's filesystem. Returning SkippedLocal
         // surfaces the decision so callers log it uniformly.
         let status = sync_one(

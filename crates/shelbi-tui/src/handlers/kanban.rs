@@ -62,8 +62,8 @@ pub fn handle_kanban_key(app: &mut KanbanApp, key: KeyEvent, km: &Keymaps) -> Ou
     // Filter dropdowns are also modal — same precedence reason as the
     // popover. Sits below the popover so a card detail open over the
     // dropdown still routes input to the card view.
-    if app.worker_dropdown_is_open() {
-        handle_worker_dropdown_key(app, key.code);
+    if app.workspace_dropdown_is_open() {
+        handle_workspace_dropdown_key(app, key.code);
         return Outcome::Continue;
     }
     if app.workflow_dropdown_is_open() {
@@ -101,7 +101,7 @@ pub fn handle_kanban_key(app: &mut KanbanApp, key: KeyEvent, km: &Keymaps) -> Ou
             // promote them; until then, route `f` / `w` directly so
             // parity with the pre-refactor handler holds.
             match key.code {
-                KeyCode::Char('f') => app.toggle_worker_dropdown(),
+                KeyCode::Char('f') => app.toggle_workspace_dropdown(),
                 KeyCode::Char('w') => app.toggle_workflow_dropdown(),
                 _ => {}
             }
@@ -113,7 +113,7 @@ pub fn handle_kanban_key(app: &mut KanbanApp, key: KeyEvent, km: &Keymaps) -> Ou
 /// Left-click on a card opens its popover — same path as ENTER/SPACE on the
 /// keyboard. Clicks outside any card are a no-op. With the popover open we
 /// ignore clicks entirely; the popover has its own dismiss keys. With only
-/// the worker filter dropdown open, a click on an option commits it; a
+/// the workspace filter dropdown open, a click on an option commits it; a
 /// click anywhere outside the dropdown closes it (drop-to-dismiss pattern
 /// that matches what users expect from native dropdowns).
 pub fn handle_kanban_mouse(app: &mut KanbanApp, mouse: MouseEvent) {
@@ -121,9 +121,9 @@ pub fn handle_kanban_mouse(app: &mut KanbanApp, mouse: MouseEvent) {
         return;
     }
     if let MouseEventKind::Down(MouseButton::Left) = mouse.kind {
-        if app.worker_dropdown_is_open() {
+        if app.workspace_dropdown_is_open() {
             if let Some(idx) = app.dropdown_option_at(mouse.column, mouse.row) {
-                if let Some(d) = app.worker_dropdown.as_mut() {
+                if let Some(d) = app.workspace_dropdown.as_mut() {
                     d.cursor = idx;
                 }
                 app.dropdown_select();
@@ -131,11 +131,11 @@ pub fn handle_kanban_mouse(app: &mut KanbanApp, mouse: MouseEvent) {
                 // Click on the chip while open → close. Mirrors a
                 // native dropdown's "click the trigger again to dismiss"
                 // behavior.
-                app.close_worker_dropdown();
+                app.close_workspace_dropdown();
             } else {
                 // Click outside the dropdown and outside the chip →
                 // dismiss without changing the filter.
-                app.close_worker_dropdown();
+                app.close_workspace_dropdown();
             }
             return;
         }
@@ -159,7 +159,7 @@ pub fn handle_kanban_mouse(app: &mut KanbanApp, mouse: MouseEvent) {
             return;
         }
         if app.filter_chip_at(mouse.column, mouse.row) {
-            app.open_worker_dropdown();
+            app.open_workspace_dropdown();
             return;
         }
         if let Some((col, row)) = app.card_at(mouse.column, mouse.row) {
@@ -183,14 +183,14 @@ pub fn handle_popover_key(app: &mut KanbanApp, key: KeyEvent, km: &Keymaps) {
     }
 }
 
-/// Keys consumed while the worker filter dropdown is open. Enter /
+/// Keys consumed while the workspace filter dropdown is open. Enter /
 /// Space commit the cursor's option; Esc dismisses without changing
 /// the filter; `c` clears the filter back to "All" without needing to
 /// navigate. `f` toggles the dropdown so the same key opens and closes
 /// it.
-pub fn handle_worker_dropdown_key(app: &mut KanbanApp, code: KeyCode) {
+pub fn handle_workspace_dropdown_key(app: &mut KanbanApp, code: KeyCode) {
     match code {
-        KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('f') => app.close_worker_dropdown(),
+        KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('f') => app.close_workspace_dropdown(),
         KeyCode::Up | KeyCode::Char('k') => app.dropdown_nav_up(),
         KeyCode::Down | KeyCode::Char('j') => app.dropdown_nav_down(),
         KeyCode::Enter | KeyCode::Char(' ') => app.dropdown_select(),
@@ -199,7 +199,7 @@ pub fn handle_worker_dropdown_key(app: &mut KanbanApp, code: KeyCode) {
     }
 }
 
-/// Sibling of [`handle_worker_dropdown_key`] — same shape, `w` toggles
+/// Sibling of [`handle_workspace_dropdown_key`] — same shape, `w` toggles
 /// the workflow dropdown so the same key opens and closes it.
 pub fn handle_workflow_dropdown_key(app: &mut KanbanApp, code: KeyCode) {
     match code {

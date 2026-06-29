@@ -31,7 +31,7 @@ pub fn launch_command(spec: &AgentRunnerSpec) -> String {
 /// existed), the spec is returned unchanged so the launched command line
 /// doesn't end up with two copies. Two copies don't break claude — the
 /// right-most wins — but they clutter pane captures and obscure which mode
-/// the worker is actually running in.
+/// the workspace is actually running in.
 pub fn with_permission_mode(spec: &AgentRunnerSpec, mode: &str) -> AgentRunnerSpec {
     let is_claude = std::path::Path::new(&spec.command)
         .file_name()
@@ -183,7 +183,7 @@ mod tests {
     #[test]
     fn with_permission_mode_idempotent_even_when_yaml_mode_differs() {
         // If the YAML pins a specific mode, respect it rather than silently
-        // overriding from project.worker_permissions_mode. An explicit flag
+        // overriding from project.workspace_permissions_mode. An explicit flag
         // in the YAML is intentional configuration; quiet override would be
         // surprising.
         let spec = AgentRunnerSpec {

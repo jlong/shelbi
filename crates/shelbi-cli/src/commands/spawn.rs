@@ -11,7 +11,7 @@ use super::require_project;
 
 #[derive(Debug, ClapArgs)]
 pub struct Args {
-    /// Kebab-case worker id, used as branch + worktree dir + tmux window name.
+    /// Kebab-case workspace id, used as branch + worktree dir + tmux window name.
     pub id: String,
     /// Machine to run on (must be declared in the project).
     #[arg(long)]
@@ -24,7 +24,7 @@ pub struct Args {
     /// Override the default branch name (`shelbi/<id>`).
     #[arg(long)]
     pub branch: Option<String>,
-    /// tmux session to attach the worker window to. Defaults to
+    /// tmux session to attach the workspace window to. Defaults to
     /// `shelbi-<project>`.
     #[arg(long, env = "SHELBI_TMUX_SESSION")]
     pub session: Option<String>,
@@ -48,10 +48,10 @@ pub fn run(project_opt: Option<String>, args: Args) -> Result<()> {
         .clone();
 
     let host = machine.host();
-    // For LOCAL workers we put them as a window inside `shelbi-<project>` so
-    // they sit alongside the dashboard and orchestrator. For REMOTE workers
-    // we give each worker its own tmux session named `shelbi-w-<id>` on the
-    // remote — so the worker survives a hub disconnect, and re-attaching is
+    // For LOCAL workspaces we put them as a window inside `shelbi-<project>` so
+    // they sit alongside the dashboard and orchestrator. For REMOTE workspaces
+    // we give each workspace its own tmux session named `shelbi-w-<id>` on the
+    // remote — so the workspace survives a hub disconnect, and re-attaching is
     // just `ssh host -t tmux attach -t shelbi-w-<id>`.
     let (session, window_name) = if host.is_local() {
         (
@@ -88,7 +88,7 @@ pub fn run(project_opt: Option<String>, args: Args) -> Result<()> {
     // 2. Create the worktree (git worktree add -b <branch> <path>).
     create_worktree(&host, &machine, &branch, &worktree, &project)?;
 
-    // 3. Spawn the worker tmux pane. We open it with an interactive shell
+    // 3. Spawn the workspace tmux pane. We open it with an interactive shell
     //    (no inline command) so the user's rc files run and pick up tools
     //    installed in shell-specific PATHs (npm-global, asdf, pyenv, nvm).
     //    Then we send-keys the cd+launch and the initial prompt.
@@ -100,7 +100,7 @@ pub fn run(project_opt: Option<String>, args: Args) -> Result<()> {
         }
         shelbi_tmux::new_window(&host, &session, &window_name, None)
             .map_err(|e| anyhow!(e))
-            .context("creating worker window")?
+            .context("creating workspace window")?
     } else {
         if shelbi_tmux::has_session(&host, &session).map_err(|e| anyhow!(e))? {
             bail!(
@@ -112,7 +112,7 @@ pub fn run(project_opt: Option<String>, args: Args) -> Result<()> {
         }
         shelbi_tmux::new_session(&host, &session, &window_name, None)
             .map_err(|e| anyhow!(e))
-            .context("creating remote worker session")?;
+            .context("creating remote workspace session")?;
         TmuxAddr {
             session: session.clone(),
             window: window_name.clone(),
@@ -202,7 +202,7 @@ fn expand_tilde(p: &std::path::Path) -> PathBuf {
 }
 
 /// Add `.shelbi/` to the repo's `.gitignore` if it isn't already covered.
-/// Writes to the file on the worker's filesystem via `sh -c`; never commits.
+/// Writes to the file on the workspace's filesystem via `sh -c`; never commits.
 fn ensure_gitignored(host: &Host, machine: &Machine) -> Result<()> {
     let repo = machine.work_dir.to_string_lossy().into_owned();
     // `git check-ignore` exits 0 if the path is ignored, 1 if not, 128 on error.

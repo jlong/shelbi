@@ -1,16 +1,16 @@
-//! Background worker-state poller. Lives in the sidebar process and is
-//! the only place the hub talks to worker panes for observability.
+//! Background workspace-state poller. Lives in the sidebar process and is
+//! the only place the hub talks to workspace panes for observability.
 //!
-//! Cadence: per-project `worker_poll_interval_secs` (default 5s). The
-//! poller spawns ONE thread per declared worker — each running its own
+//! Cadence: per-project `workspace_poll_interval_secs` (default 5s). The
+//! poller spawns ONE thread per declared workspace — each running its own
 //! independent poll loop — so a hung SSH call to one machine (unreachable
 //! host, expired Tailscale auth, ProxyJump timeout) only freezes that
-//! worker's thread, never the others. Earlier versions used a single
-//! sequential loop, which would block every local-worker poll behind a
-//! single stuck remote-worker SSH call and silently freeze the review
+//! workspace's thread, never the others. Earlier versions used a single
+//! sequential loop, which would block every local-workspace poll behind a
+//! single stuck remote-workspace SSH call and silently freeze the review
 //! marker handoff for hours at a time.
 //!
-//! Each cycle asks tmux for the worker pane's title
+//! Each cycle asks tmux for the workspace pane's title
 //! (`display-message -p '#{pane_title}'`, routed over SSH for remote
 //! machines via shelbi-ssh — which sets up ControlMaster so the marginal
 //! cost per poll is a socket write, not a TCP handshake) and parses the
@@ -21,13 +21,13 @@
 //! poller sees it).
 //!
 //! On a state change the poller writes two files:
-//! - `~/.shelbi/workers/<name>/status.yaml` — last observed state.
+//! - `~/.shelbi/workspaces/<name>/status.yaml` — last observed state.
 //! - `~/.shelbi/events.log` — append-only transition history.
 //!
 //! On a same-state observation it still bumps `last_seen` in
 //! `status.yaml` so the UI can tell stale from fresh observations.
 //!
-//! All authoritative state stays on the hub — workers themselves only
+//! All authoritative state stays on the hub — workspaces themselves only
 //! emit the markers via their `.claude/settings.json` hooks.
 
 use std::collections::HashMap;
@@ -43,18 +43,18 @@ use chrono::{DateTime, Utc};
 
 use shelbi_core::{Column, Project};
 use shelbi_state::{
-    append_contextstore_event, append_heartbeat_event, append_rebase_event, append_worker_event,
-    events_log_path, load_worker_status, parse_pane_title_marker, save_worker_status, PaneMarker,
-    WorkerState, WorkerStatus,
+    append_contextstore_event, append_heartbeat_event, append_rebase_event, append_workspace_event,
+    events_log_path, load_workspace_status, parse_pane_title_marker, save_workspace_status, PaneMarker,
+    WorkspaceState, WorkspaceStatus,
 };
 
 /// Spawned poller handle. Dropping it asks the thread to exit and joins it.
-pub struct WorkerPoller {
+pub struct WorkspacePoller {
     shutdown: Arc<AtomicBool>,
     handle: Option<JoinHandle<()>>,
 }
 
-impl WorkerPoller {
+impl WorkspacePoller {
     pub fn start(project_name: impl Into<String>) -> Self {
         let project_name = project_name.into();
         let shutdown = Arc::new(AtomicBool::new(false));
@@ -67,7 +67,7 @@ impl WorkerPoller {
     }
 }
 
-impl Drop for WorkerPoller {
+impl Drop for WorkspacePoller {
     fn drop(&mut self) {
         self.shutdown.store(true, Ordering::SeqCst);
         if let Some(h) = self.handle.take() {
@@ -76,14 +76,14 @@ impl Drop for WorkerPoller {
     }
 }
 
-/// Supervisor: spawns one persistent poll thread per worker declared in
-/// the project YAML, then sleeps until shutdown. Each per-worker thread
-/// owns its own SSH/IO calls, so a hung remote worker only blocks its
-/// own thread — local workers keep polling on cadence.
+/// Supervisor: spawns one persistent poll thread per workspace declared in
+/// the project YAML, then sleeps until shutdown. Each per-workspace thread
+/// owns its own SSH/IO calls, so a hung remote workspace only blocks its
+/// own thread — local workspaces keep polling on cadence.
 ///
-/// We re-check the workers list every supervisor tick (5s) so that
-/// workers added to the YAML at runtime get a thread spawned without a
-/// hub restart. Removed workers' threads exit themselves when they
+/// We re-check the workspaces list every supervisor tick (5s) so that
+/// workspaces added to the YAML at runtime get a thread spawned without a
+/// hub restart. Removed workspaces' threads exit themselves when they
 /// can't find their name in the YAML anymore.
 fn run_poller_loop(project_name: String, shutdown: Arc<AtomicBool>) {
     let mut spawned: HashMap<String, JoinHandle<()>> = HashMap::new();
@@ -103,40 +103,40 @@ fn run_poller_loop(project_name: String, shutdown: Arc<AtomicBool>) {
             Ok(p) => p,
             // YAML missing or malformed — back off and retry. Re-loading
             // every tick means the user can edit the project file and
-            // new workers get threads spawned without a restart.
+            // new workspaces get threads spawned without a restart.
             Err(_) => {
                 sleep_interruptible(Duration::from_secs(5), &shutdown);
                 continue;
             }
         };
 
-        for worker in &project.workers {
+        for workspace in &project.workspaces {
             // Drop dead-thread handles so a panic in poll_one for this
-            // worker doesn't leave it un-respawned. (Per-worker threads
+            // workspace doesn't leave it un-respawned. (Per-workspace threads
             // shouldn't normally panic — poll_one swallows errors — but
             // defense-in-depth.)
-            if spawned.get(&worker.name).is_some_and(|h| h.is_finished()) {
-                if let Some(h) = spawned.remove(&worker.name) {
+            if spawned.get(&workspace.name).is_some_and(|h| h.is_finished()) {
+                if let Some(h) = spawned.remove(&workspace.name) {
                     let _ = h.join();
                 }
             }
-            if spawned.contains_key(&worker.name) {
+            if spawned.contains_key(&workspace.name) {
                 continue;
             }
-            let worker_name = worker.name.clone();
+            let workspace_name = workspace.name.clone();
             let project_name = project_name.clone();
             let shutdown_clone = shutdown.clone();
             let handle = thread::Builder::new()
-                .name(format!("shelbi-poller-{worker_name}"))
-                .spawn(move || run_worker_poll_loop(project_name, worker_name, shutdown_clone))
+                .name(format!("shelbi-poller-{workspace_name}"))
+                .spawn(move || run_workspace_poll_loop(project_name, workspace_name, shutdown_clone))
                 .ok();
             if let Some(h) = handle {
-                spawned.insert(worker.name.clone(), h);
+                spawned.insert(workspace.name.clone(), h);
             }
         }
 
-        // Heartbeat is project-wide (one per project, not per worker),
-        // so it lives on the supervisor rather than inside any per-worker
+        // Heartbeat is project-wide (one per project, not per workspace),
+        // so it lives on the supervisor rather than inside any per-workspace
         // thread. The function is a no-op if heartbeat is off or not yet
         // due, and debounces against any other events.log activity.
         // `online_probe` is the connectivity gate: while the box is
@@ -145,7 +145,7 @@ fn run_poller_loop(project_name: String, shutdown: Arc<AtomicBool>) {
         maybe_emit_heartbeat(&project, &mut next_heartbeat_attempt, online_probe);
 
         // Supervisor cadence is fixed at 5s — independent of
-        // `worker_poll_interval_secs`, which governs each per-worker
+        // `workspace_poll_interval_secs`, which governs each per-workspace
         // loop. Cheap (one YAML reload + map lookup per tick) and fast
         // enough that a YAML edit gets new threads within ~5s.
         sleep_interruptible(Duration::from_secs(5), &shutdown);
@@ -161,20 +161,20 @@ fn run_poller_loop(project_name: String, shutdown: Arc<AtomicBool>) {
     }
 }
 
-/// One worker's persistent poll loop. Drives [`poll_one`] every
-/// `worker_poll_interval_secs`, reloading the project YAML each cycle so
-/// the user can edit the worker list / interval without a hub restart.
-/// Exits cleanly when shutdown is requested OR the worker is removed
+/// One workspace's persistent poll loop. Drives [`poll_one`] every
+/// `workspace_poll_interval_secs`, reloading the project YAML each cycle so
+/// the user can edit the workspace list / interval without a hub restart.
+/// Exits cleanly when shutdown is requested OR the workspace is removed
 /// from the YAML.
-fn run_worker_poll_loop(
+fn run_workspace_poll_loop(
     project_name: String,
-    worker_name: String,
+    workspace_name: String,
     shutdown: Arc<AtomicBool>,
 ) {
-    // Each worker thread keeps its own `last_known` so it doesn't need
+    // Each workspace thread keeps its own `last_known` so it doesn't need
     // to share a Mutex with the supervisor or its peers. Seeded from
     // status.yaml on first observation (handled inside `poll_one`).
-    let mut last_known: Option<WorkerState> = None;
+    let mut last_known: Option<WorkspaceState> = None;
 
     loop {
         if shutdown.load(Ordering::SeqCst) {
@@ -187,15 +187,15 @@ fn run_worker_poll_loop(
                 continue;
             }
         };
-        let Some(worker) = project.workers.iter().find(|w| w.name == worker_name) else {
-            // Worker removed from the project YAML — exit this thread.
+        let Some(workspace) = project.workspaces.iter().find(|w| w.name == workspace_name) else {
+            // Workspace removed from the project YAML — exit this thread.
             // The supervisor will not respawn it because it's not in the
-            // workers list any more.
+            // workspaces list any more.
             break;
         };
-        let interval = Duration::from_secs(project.worker_poll_interval_secs.max(1));
+        let interval = Duration::from_secs(project.workspace_poll_interval_secs.max(1));
 
-        poll_one(&project, worker, &mut last_known);
+        poll_one(&project, workspace, &mut last_known);
 
         sleep_interruptible(interval, &shutdown);
     }
@@ -304,27 +304,27 @@ fn events_log_modified_within(window: Duration) -> bool {
 
 fn poll_one(
     project: &Project,
-    worker: &shelbi_core::WorkerSpec,
-    last_known: &mut Option<WorkerState>,
+    workspace: &shelbi_core::WorkspaceSpec,
+    last_known: &mut Option<WorkspaceState>,
 ) {
-    let Some(machine) = project.machine(&worker.machine) else {
+    let Some(machine) = project.machine(&workspace.machine) else {
         return;
     };
     let host = machine.host();
-    let Ok(addr) = shelbi_orchestrator::worker::worker_tmux_addr(project, worker) else {
+    let Ok(addr) = shelbi_orchestrator::workspace::workspace_tmux_addr(project, workspace) else {
         return;
     };
 
-    // Review handoff is a file marker the worker writes when it's done, read
+    // Review handoff is a file marker the workspace writes when it's done, read
     // independently of the pane title. We check it *before* the pane-title
     // state below (and unconditionally, even if the pane has since died or
     // Claude has overwritten its title) so nothing the agent's UI does can
     // hide the signal.
-    maybe_promote_to_review(project, worker, machine, &host);
+    maybe_promote_to_review(project, workspace, machine, &host);
 
     // No pane → no marker. The display-message call would fail anyway,
     // but checking up-front keeps stderr noise out of the log.
-    if !shelbi_orchestrator::worker::worker_pane_alive(&host, &addr).unwrap_or(false) {
+    if !shelbi_orchestrator::workspace::workspace_pane_alive(&host, &addr).unwrap_or(false) {
         return;
     }
 
@@ -335,7 +335,7 @@ fn poll_one(
     let Some(marker) = parse_pane_title_marker(&title) else {
         return;
     };
-    let new_state = marker.worker_state();
+    let new_state = marker.workspace_state();
 
     // Bootstrap previous state from disk on first sighting so a hub
     // restart doesn't emit a bogus `none -> X` event for state we've
@@ -343,12 +343,12 @@ fn poll_one(
     let prior = match *last_known {
         Some(s) => Some(PriorState {
             state: s,
-            last_transition: load_worker_status(&worker.name)
+            last_transition: load_workspace_status(&workspace.name)
                 .ok()
                 .flatten()
                 .map(|s| s.last_transition),
         }),
-        None => load_worker_status(&worker.name)
+        None => load_workspace_status(&workspace.name)
             .ok()
             .flatten()
             .map(|s| PriorState {
@@ -357,33 +357,33 @@ fn poll_one(
             }),
     };
 
-    let current_task = current_task_for(project, &worker.name);
+    let current_task = current_task_for(project, &workspace.name);
     let outcome = decide(
-        &worker.name,
+        &workspace.name,
         current_task.clone(),
         prior,
         new_state,
         Utc::now(),
     );
 
-    if let Err(e) = save_worker_status(&outcome.status) {
-        tracing::warn!(worker = %worker.name, error = %e, "save_worker_status failed");
+    if let Err(e) = save_workspace_status(&outcome.status) {
+        tracing::warn!(workspace = %workspace.name, error = %e, "save_workspace_status failed");
     }
     if outcome.transitioned {
-        if let Err(e) = append_worker_event(
-            &worker.name,
+        if let Err(e) = append_workspace_event(
+            &workspace.name,
             outcome.prev_state,
             outcome.status.state,
         ) {
-            tracing::warn!(worker = %worker.name, error = %e, "append_worker_event failed");
+            tracing::warn!(workspace = %workspace.name, error = %e, "append_workspace_event failed");
         }
     }
 
-    // `shelbi:review` is the worker's explicit "ready for review" handoff
+    // `shelbi:review` is the workspace's explicit "ready for review" handoff
     // (distinct from `shelbi:idle`, which fires on every claude turn
-    // end). When we see it, move the worker's in-progress task into the
+    // end). When we see it, move the workspace's in-progress task into the
     // review column — the same effect `shelbi task move <id> --to review`
-    // would have had, except shelbi isn't installed on remote workers.
+    // would have had, except shelbi isn't installed on remote workspaces.
     //
     // Idempotent: `current_task_for` only finds tasks still in
     // InProgress, so once the move happens, subsequent observations of
@@ -398,10 +398,10 @@ fn poll_one(
                         &workflow,
                         from,
                         to,
-                        "worker:review-pane",
+                        "workspace:review-pane",
                     ) {
                         tracing::warn!(
-                            worker = %worker.name,
+                            workspace = %workspace.name,
                             task = %task_id,
                             error = %e,
                             "review handoff: append_task_event failed",
@@ -410,7 +410,7 @@ fn poll_one(
                 }
                 Ok(None) => {}
                 Err(e) => tracing::warn!(
-                    worker = %worker.name,
+                    workspace = %workspace.name,
                     task = %task_id,
                     error = %e,
                     "review handoff: move_task failed",
@@ -422,29 +422,29 @@ fn poll_one(
     *last_known = Some(outcome.status.state);
 }
 
-/// Check the worker's review-ready file marker and, if present, move its
-/// in-progress task to the review column. The marker is the worker's handoff
+/// Check the workspace's review-ready file marker and, if present, move its
+/// in-progress task to the review column. The marker is the workspace's handoff
 /// signal — it writes its task id into `<worktree>/.claude/shelbi-review-ready`
-/// when done (see `shelbi_orchestrator::worker::worker_review_marker`).
+/// when done (see `shelbi_orchestrator::workspace::workspace_review_marker`).
 ///
 /// Best-effort and idempotent: we consume the marker exactly once by clearing
 /// it after a successful move, and `move_task` is a no-op once the task is
-/// already in review, so a worker that keeps churning in its pane afterward
+/// already in review, so a workspace that keeps churning in its pane afterward
 /// never gets pulled back out. A stale marker (worktree reused before the
 /// previous one was cleared) names a task that's no longer in-progress for
-/// this worker, so we clear it without moving anything.
+/// this workspace, so we clear it without moving anything.
 fn maybe_promote_to_review(
     project: &Project,
-    worker: &shelbi_core::WorkerSpec,
+    workspace: &shelbi_core::WorkspaceSpec,
     machine: &shelbi_core::Machine,
     host: &shelbi_core::Host,
 ) {
-    let marker = shelbi_orchestrator::worker::worker_review_marker(machine, worker);
-    let task_id = match shelbi_orchestrator::worker::read_review_marker(host, &marker) {
+    let marker = shelbi_orchestrator::workspace::workspace_review_marker(machine, workspace);
+    let task_id = match shelbi_orchestrator::workspace::read_review_marker(host, &marker) {
         Ok(Some(id)) => id,
         Ok(None) => return,
         Err(e) => {
-            tracing::warn!(worker = %worker.name, error = %e, "read_review_marker failed");
+            tracing::warn!(workspace = %workspace.name, error = %e, "read_review_marker failed");
             return;
         }
     };
@@ -458,11 +458,11 @@ fn maybe_promote_to_review(
     match &task_file {
         Ok(tf)
             if tf.task.column == Column::InProgress
-                && tf.task.assigned_to.as_deref() == Some(worker.name.as_str()) =>
+                && tf.task.assigned_to.as_deref() == Some(workspace.name.as_str()) =>
         {
-            // Auto-rebase the worker's branch onto the project's default
+            // Auto-rebase the workspace's branch onto the project's default
             // branch before the column move. The goal is to absorb any
-            // prereq commits that landed on main while the worker was
+            // prereq commits that landed on main while the workspace was
             // working, so the human reviewer sees a single clean diff
             // instead of having to drop into the worktree and run the
             // rebase + force-push by hand. We do this BEFORE the column
@@ -471,7 +471,7 @@ fn maybe_promote_to_review(
             // is logged but doesn't block the promotion — the human still
             // wants to see the work in review and resolve the conflict
             // during the review checkout.
-            rebase_worker_branch_before_review(project, worker, machine, host, &task_id);
+            rebase_workspace_branch_before_review(project, workspace, machine, host, &task_id);
 
             match shelbi_state::move_task(&project.name, &task_id, Column::Review) {
                 Ok(Some((from, to, workflow))) => {
@@ -480,51 +480,51 @@ fn maybe_promote_to_review(
                         &workflow,
                         from,
                         to,
-                        "worker:review-marker",
+                        "workspace:review-marker",
                     ) {
-                        tracing::warn!(worker = %worker.name, task = %task_id, error = %e, "append_task_event failed");
+                        tracing::warn!(workspace = %workspace.name, task = %task_id, error = %e, "append_task_event failed");
                     }
                 }
                 Ok(None) => {}
                 Err(e) => {
                     // Leave the marker in place so we retry on the next tick.
-                    tracing::warn!(worker = %worker.name, task = %task_id, error = %e, "move_task to review failed");
+                    tracing::warn!(workspace = %workspace.name, task = %task_id, error = %e, "move_task to review failed");
                     return;
                 }
             }
-            tracing::info!(worker = %worker.name, task = %task_id, "promoted task to review via marker");
+            tracing::info!(workspace = %workspace.name, task = %task_id, "promoted task to review via marker");
 
-            // Best-effort: pull any ContextStore writes the worker made
+            // Best-effort: pull any ContextStore writes the workspace made
             // on its machine back to hub. Skipped silently when the
             // project has no `contextstore_sync` configured, when the
-            // body doesn't trip the heuristic, or when the worker is
+            // body doesn't trip the heuristic, or when the workspace is
             // local. Failures log to events.log but never block the
             // promotion — that's the contract on this path.
-            sync_contextstore_from_worker(project, machine, &tf.body);
+            sync_contextstore_from_workspace(project, machine, &tf.body);
         }
         Ok(_) => {
-            tracing::debug!(worker = %worker.name, task = %task_id, "stale review marker (task not in-progress for this worker); clearing");
+            tracing::debug!(workspace = %workspace.name, task = %task_id, "stale review marker (task not in-progress for this workspace); clearing");
         }
         Err(e) => {
-            tracing::warn!(worker = %worker.name, task = %task_id, error = %e, "review marker names unloadable task; clearing");
+            tracing::warn!(workspace = %workspace.name, task = %task_id, error = %e, "review marker names unloadable task; clearing");
         }
     }
 
-    if let Err(e) = shelbi_orchestrator::worker::clear_review_marker(host, &marker) {
-        tracing::warn!(worker = %worker.name, error = %e, "clear_review_marker failed");
+    if let Err(e) = shelbi_orchestrator::workspace::clear_review_marker(host, &marker) {
+        tracing::warn!(workspace = %workspace.name, error = %e, "clear_review_marker failed");
     }
 }
 
-/// Resolve the worker's branch for the in-progress task and rebase it onto
+/// Resolve the workspace's branch for the in-progress task and rebase it onto
 /// the project's default branch. Records one `rebase` line in `events.log`
 /// describing the outcome (ok / up-to-date / conflict / skipped). Never
 /// blocks the calling review promotion — failures here are advisory.
 ///
 /// `branch` falls back to the conventional `shelbi/<task-id>` when the task
 /// frontmatter doesn't pin one explicitly; that mirrors `start_review`.
-fn rebase_worker_branch_before_review(
+fn rebase_workspace_branch_before_review(
     project: &Project,
-    worker: &shelbi_core::WorkerSpec,
+    workspace: &shelbi_core::WorkspaceSpec,
     machine: &shelbi_core::Machine,
     host: &shelbi_core::Host,
     task_id: &str,
@@ -532,7 +532,7 @@ fn rebase_worker_branch_before_review(
     let task_file = match shelbi_state::load_task(&project.name, task_id) {
         Ok(tf) => tf,
         Err(e) => {
-            tracing::debug!(worker = %worker.name, task = %task_id, error = %e, "skip rebase: load_task failed");
+            tracing::debug!(workspace = %workspace.name, task = %task_id, error = %e, "skip rebase: load_task failed");
             return;
         }
     };
@@ -542,8 +542,8 @@ fn rebase_worker_branch_before_review(
         .clone()
         .unwrap_or_else(|| format!("shelbi/{task_id}"));
 
-    let worktree = shelbi_orchestrator::worker::worker_worktree(machine, worker);
-    let outcome = shelbi_orchestrator::worker::rebase_worker_branch_onto_default(
+    let worktree = shelbi_orchestrator::workspace::workspace_worktree(machine, workspace);
+    let outcome = shelbi_orchestrator::workspace::rebase_workspace_branch_onto_default(
         host,
         &worktree,
         &project.default_branch,
@@ -551,27 +551,27 @@ fn rebase_worker_branch_before_review(
 
     let status = outcome.status_token();
     let detail = outcome.detail();
-    if let Err(e) = append_rebase_event(task_id, &worker.name, &branch, status, &detail) {
+    if let Err(e) = append_rebase_event(task_id, &workspace.name, &branch, status, &detail) {
         tracing::warn!(
-            worker = %worker.name,
+            workspace = %workspace.name,
             task = %task_id,
             error = %e,
             "append_rebase_event failed",
         );
     }
     match &outcome {
-        shelbi_orchestrator::worker::RebaseOutcome::Conflict { .. } => {
+        shelbi_orchestrator::workspace::RebaseOutcome::Conflict { .. } => {
             tracing::warn!(
-                worker = %worker.name,
+                workspace = %workspace.name,
                 task = %task_id,
                 branch = %branch,
                 detail = %detail,
                 "auto-rebase onto default branch conflicted; worktree returned to pre-rebase state",
             );
         }
-        shelbi_orchestrator::worker::RebaseOutcome::Skipped { .. } => {
+        shelbi_orchestrator::workspace::RebaseOutcome::Skipped { .. } => {
             tracing::info!(
-                worker = %worker.name,
+                workspace = %workspace.name,
                 task = %task_id,
                 branch = %branch,
                 detail = %detail,
@@ -580,7 +580,7 @@ fn rebase_worker_branch_before_review(
         }
         _ => {
             tracing::info!(
-                worker = %worker.name,
+                workspace = %workspace.name,
                 task = %task_id,
                 branch = %branch,
                 status = %status,
@@ -599,7 +599,7 @@ fn rebase_worker_branch_before_review(
 /// "where to log it" lives with the rest of the poller's event-logging
 /// calls. Failures here are intentionally swallowed: the task is already
 /// in review and the user can re-run sync manually if needed.
-fn sync_contextstore_from_worker(
+fn sync_contextstore_from_workspace(
     project: &Project,
     machine: &shelbi_core::Machine,
     task_body: &str,
@@ -632,7 +632,7 @@ fn sync_contextstore_from_worker(
                 tracing::info!(
                     space = %outcome.space,
                     machine = %outcome.machine,
-                    "contextstore synced from remote worker",
+                    "contextstore synced from remote workspace",
                 );
             }
             shelbi_orchestrator::contextstore::SyncStatus::Failed { .. } => {
@@ -647,7 +647,7 @@ fn sync_contextstore_from_worker(
                 tracing::debug!(
                     space = %outcome.space,
                     machine = %outcome.machine,
-                    "contextstore sync skipped — worker is local",
+                    "contextstore sync skipped — workspace is local",
                 );
             }
         }
@@ -656,25 +656,25 @@ fn sync_contextstore_from_worker(
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct PriorState {
-    state: WorkerState,
+    state: WorkspaceState,
     last_transition: Option<DateTime<Utc>>,
 }
 
 #[derive(Debug)]
 struct PollOutcome {
     transitioned: bool,
-    prev_state: Option<WorkerState>,
-    status: WorkerStatus,
+    prev_state: Option<WorkspaceState>,
+    status: WorkspaceStatus,
 }
 
 /// Pure transition decision: given the previous state (if any) and a
-/// fresh observation, build the [`WorkerStatus`] to persist and decide
+/// fresh observation, build the [`WorkspaceStatus`] to persist and decide
 /// whether the change deserves an `events.log` line.
 fn decide(
-    worker: &str,
+    workspace: &str,
     current_task: Option<String>,
     prior: Option<PriorState>,
-    new_state: WorkerState,
+    new_state: WorkspaceState,
     now: DateTime<Utc>,
 ) -> PollOutcome {
     let prev_state = prior.map(|p| p.state);
@@ -692,8 +692,8 @@ fn decide(
     PollOutcome {
         transitioned,
         prev_state,
-        status: WorkerStatus {
-            worker: worker.to_string(),
+        status: WorkspaceStatus {
+            workspace: workspace.to_string(),
             current_task,
             state: new_state,
             last_transition,
@@ -702,13 +702,13 @@ fn decide(
     }
 }
 
-/// In-progress task currently assigned to `worker`, if any. Cheap (one
-/// task-dir scan); called once per worker per poll tick.
-fn current_task_for(project: &Project, worker_name: &str) -> Option<String> {
+/// In-progress task currently assigned to `workspace`, if any. Cheap (one
+/// task-dir scan); called once per workspace per poll tick.
+fn current_task_for(project: &Project, workspace_name: &str) -> Option<String> {
     shelbi_state::list_column(&project.name, Column::InProgress)
         .ok()?
         .into_iter()
-        .find(|tf| tf.task.assigned_to.as_deref() == Some(worker_name))
+        .find(|tf| tf.task.assigned_to.as_deref() == Some(workspace_name))
         .map(|tf| tf.task.id)
 }
 
@@ -724,10 +724,10 @@ mod tests {
 
     #[test]
     fn first_observation_is_a_transition_from_none() {
-        let out = decide("alpha", None, None, WorkerState::Working, ts(100));
+        let out = decide("alpha", None, None, WorkspaceState::Working, ts(100));
         assert!(out.transitioned);
         assert!(out.prev_state.is_none());
-        assert_eq!(out.status.state, WorkerState::Working);
+        assert_eq!(out.status.state, WorkspaceState::Working);
         assert_eq!(out.status.last_transition, ts(100));
         assert_eq!(out.status.last_seen, ts(100));
     }
@@ -738,10 +738,10 @@ mod tests {
         // marker on the next poll: keep `last_transition` put, bump
         // `last_seen` to now.
         let prior = Some(PriorState {
-            state: WorkerState::Working,
+            state: WorkspaceState::Working,
             last_transition: Some(ts(50)),
         });
-        let out = decide("alpha", None, prior, WorkerState::Working, ts(120));
+        let out = decide("alpha", None, prior, WorkspaceState::Working, ts(120));
         assert!(!out.transitioned);
         assert_eq!(out.status.last_transition, ts(50));
         assert_eq!(out.status.last_seen, ts(120));
@@ -751,29 +751,29 @@ mod tests {
     fn state_change_records_previous_and_resets_transition() {
         // Working → AwaitingInput → Blocked.
         let prior = Some(PriorState {
-            state: WorkerState::Working,
+            state: WorkspaceState::Working,
             last_transition: Some(ts(50)),
         });
         let out = decide(
             "alpha",
             Some("task-1".into()),
             prior,
-            WorkerState::AwaitingInput,
+            WorkspaceState::AwaitingInput,
             ts(200),
         );
         assert!(out.transitioned);
-        assert_eq!(out.prev_state, Some(WorkerState::Working));
-        assert_eq!(out.status.state, WorkerState::AwaitingInput);
+        assert_eq!(out.prev_state, Some(WorkspaceState::Working));
+        assert_eq!(out.status.state, WorkspaceState::AwaitingInput);
         assert_eq!(out.status.last_transition, ts(200));
         assert_eq!(out.status.current_task.as_deref(), Some("task-1"));
     }
 
     use shelbi_core::{
-        AgentRunnerSpec, Host, Machine, MachineKind, OrchestratorSpec, Task, WorkerSpec,
+        AgentRunnerSpec, Host, Machine, MachineKind, OrchestratorSpec, Task, WorkspaceSpec,
     };
     use std::collections::BTreeMap;
 
-    /// A local-machine project with a single worker whose worktree lives
+    /// A local-machine project with a single workspace whose worktree lives
     /// under `work_dir`, so the marker path is a real writable local file.
     fn local_project(work_dir: &std::path::Path) -> Project {
         let mut runners = BTreeMap::new();
@@ -800,14 +800,14 @@ mod tests {
             agent_runners: runners,
             editor: None,
             github_url: None,
-            workers: vec![WorkerSpec {
+            workspaces: vec![WorkspaceSpec {
                 name: "alpha".into(),
                 machine: "hub".into(),
                 runner: "claude".into(),
             }],
-            worker_poll_interval_secs: 5,
-            worker_permissions_mode: "auto".into(),
-            worker_settings_template: None,
+            workspace_poll_interval_secs: 5,
+            workspace_permissions_mode: "auto".into(),
+            workspace_settings_template: None,
             zen: shelbi_core::ZenConfig::default(),
             heartbeat: shelbi_core::HeartbeatConfig::default(),
             git: shelbi_core::GitConfig::default(),
@@ -816,14 +816,14 @@ mod tests {
         }
     }
 
-    fn in_progress_task(id: &str, worker: &str) -> Task {
+    fn in_progress_task(id: &str, workspace: &str) -> Task {
         let now = Utc::now();
         Task {
             id: id.into(),
             title: id.into(),
             column: Column::InProgress,
             priority: 0,
-            assigned_to: Some(worker.into()),
+            assigned_to: Some(workspace.into()),
             workflow: None,
             branch: None,
             depends_on: Vec::new(),
@@ -836,9 +836,9 @@ mod tests {
     }
 
     fn write_marker(project: &Project, body: &str) -> std::path::PathBuf {
-        let marker = shelbi_orchestrator::worker::worker_review_marker(
+        let marker = shelbi_orchestrator::workspace::workspace_review_marker(
             &project.machines[0],
-            &project.workers[0],
+            &project.workspaces[0],
         );
         std::fs::create_dir_all(marker.parent().unwrap()).unwrap();
         std::fs::write(&marker, body).unwrap();
@@ -864,10 +864,10 @@ mod tests {
         let project = local_project(&work_dir);
         shelbi_state::save_task("demo", &in_progress_task("fix-login", "alpha"), "body").unwrap();
 
-        // Worker signals review by writing its task id into the marker.
+        // Workspace signals review by writing its task id into the marker.
         let marker = write_marker(&project, "fix-login\n");
 
-        maybe_promote_to_review(&project, &project.workers[0], &project.machines[0], &Host::Local);
+        maybe_promote_to_review(&project, &project.workspaces[0], &project.machines[0], &Host::Local);
 
         assert_eq!(
             shelbi_state::load_task("demo", "fix-login")
@@ -908,7 +908,7 @@ mod tests {
             task_lines[0]
         );
         assert!(
-            task_lines[0].contains(" reason=worker:review-marker "),
+            task_lines[0].contains(" reason=workspace:review-marker "),
             "line: {}",
             task_lines[0]
         );
@@ -937,7 +937,7 @@ mod tests {
             "line: {rebase_line}"
         );
         assert!(
-            rebase_line.contains("worker=alpha"),
+            rebase_line.contains("workspace=alpha"),
             "line: {rebase_line}"
         );
         assert!(
@@ -950,9 +950,9 @@ mod tests {
         );
 
         // A leftover/stale marker naming a task that's no longer in-progress
-        // for this worker is cleared without moving anything back out.
+        // for this workspace is cleared without moving anything back out.
         let marker = write_marker(&project, "fix-login\n");
-        maybe_promote_to_review(&project, &project.workers[0], &project.machines[0], &Host::Local);
+        maybe_promote_to_review(&project, &project.workspaces[0], &project.machines[0], &Host::Local);
         assert_eq!(
             shelbi_state::load_task("demo", "fix-login")
                 .unwrap()
@@ -969,7 +969,7 @@ mod tests {
 
     #[test]
     fn promotion_with_contextstore_match_on_local_logs_skipped_event() {
-        // Local-host worker — sync must short-circuit to SkippedLocal so
+        // Local-host workspace — sync must short-circuit to SkippedLocal so
         // we don't shell out to rsync for files already on hub. Even on
         // the skip path we still log the decision: that's the contract
         // for surfacing what happened.
@@ -1003,7 +1003,7 @@ mod tests {
         .unwrap();
         let _marker = write_marker(&project, "write-notes\n");
 
-        maybe_promote_to_review(&project, &project.workers[0], &project.machines[0], &Host::Local);
+        maybe_promote_to_review(&project, &project.workspaces[0], &project.machines[0], &Host::Local);
 
         let log = std::fs::read_to_string(shelbi_state::events_log_path().unwrap()).unwrap();
         let cs_lines: Vec<&str> = log
@@ -1011,7 +1011,7 @@ mod tests {
             .filter(|l| l.contains(" contextstore "))
             .collect();
         assert_eq!(cs_lines.len(), 1, "log: {log:?}");
-        // Local worker = SkippedLocal status (`skipped-local`).
+        // Local workspace = SkippedLocal status (`skipped-local`).
         assert!(
             cs_lines[0].contains("space=Shelbi"),
             "line: {}",
@@ -1063,7 +1063,7 @@ mod tests {
         .unwrap();
         let _marker = write_marker(&project, "fix-login\n");
 
-        maybe_promote_to_review(&project, &project.workers[0], &project.machines[0], &Host::Local);
+        maybe_promote_to_review(&project, &project.workspaces[0], &project.machines[0], &Host::Local);
 
         let log = std::fs::read_to_string(shelbi_state::events_log_path().unwrap()).unwrap();
         assert!(
@@ -1095,7 +1095,7 @@ mod tests {
         shelbi_state::save_task("demo", &in_progress_task("fix-login", "alpha"), "body").unwrap();
 
         // No marker on disk → task stays in progress.
-        maybe_promote_to_review(&project, &project.workers[0], &project.machines[0], &Host::Local);
+        maybe_promote_to_review(&project, &project.workspaces[0], &project.machines[0], &Host::Local);
         assert_eq!(
             shelbi_state::load_task("demo", "fix-login")
                 .unwrap()
@@ -1163,7 +1163,7 @@ mod tests {
 
     #[test]
     fn maybe_emit_heartbeat_debounces_against_recent_activity() {
-        // A worker transition lands in events.log moments before the
+        // A workspace transition lands in events.log moments before the
         // heartbeat attempt — the heartbeat must skip this consideration
         // so active boards don't get padded with no-op lines.
         let _g = crate::test_support::ENV_LOCK.lock().unwrap();
@@ -1182,7 +1182,7 @@ mod tests {
         std::fs::create_dir_all(&work_dir).unwrap();
         let mut project = local_project(&work_dir);
         // Use a 1-second window so the events.log mtime test ("written
-        // in the last interval") sees the worker event as recent.
+        // in the last interval") sees the workspace event as recent.
         project.heartbeat = shelbi_core::HeartbeatConfig::Every(Duration::from_secs(1));
 
         let mut next: Option<Instant> = None;
@@ -1190,7 +1190,7 @@ mod tests {
         maybe_emit_heartbeat(&project, &mut next, || true);
         // Force the next attempt to be due immediately, but write
         // unrelated activity first so the debounce trips.
-        shelbi_state::append_worker_event("alpha", None, WorkerState::Working).unwrap();
+        shelbi_state::append_workspace_event("alpha", None, WorkspaceState::Working).unwrap();
         next = Some(Instant::now());
 
         maybe_emit_heartbeat(&project, &mut next, || true);

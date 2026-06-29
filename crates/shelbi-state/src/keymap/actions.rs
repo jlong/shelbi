@@ -93,7 +93,7 @@ pub enum ActivityAction {
     Refresh,
     ResetFilter,
     ToggleZenFilter,
-    ToggleWorkersFilter,
+    ToggleWorkspacesFilter,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -168,7 +168,7 @@ impl Action {
                 ActivityAction::Refresh => "Activity: refresh",
                 ActivityAction::ResetFilter => "Activity: reset filter",
                 ActivityAction::ToggleZenFilter => "Activity: toggle Zen filter",
-                ActivityAction::ToggleWorkersFilter => "Activity: toggle workers filter",
+                ActivityAction::ToggleWorkspacesFilter => "Activity: toggle workspaces filter",
             },
             Action::Palette(a) => match a {
                 PaletteAction::Close => "Palette: close",
@@ -239,7 +239,7 @@ impl Action {
                 ActivityAction::Refresh => &["r"],
                 ActivityAction::ResetFilter => &["a"],
                 ActivityAction::ToggleZenFilter => &["z"],
-                ActivityAction::ToggleWorkersFilter => &["w"],
+                ActivityAction::ToggleWorkspacesFilter => &["w"],
             },
             Action::Palette(a) => match a {
                 PaletteAction::Close => &["esc", "ctrl-c", "ctrl-p"],
@@ -322,7 +322,7 @@ impl Action {
                 ActivityAction::Refresh => "refresh",
                 ActivityAction::ResetFilter => "reset_filter",
                 ActivityAction::ToggleZenFilter => "toggle_zen_filter",
-                ActivityAction::ToggleWorkersFilter => "toggle_workers_filter",
+                ActivityAction::ToggleWorkspacesFilter => "toggle_workspaces_filter",
             },
             Action::Palette(a) => match a {
                 PaletteAction::Close => "close",
@@ -391,7 +391,7 @@ impl Action {
             ActivityAction::Refresh,
             ActivityAction::ResetFilter,
             ActivityAction::ToggleZenFilter,
-            ActivityAction::ToggleWorkersFilter,
+            ActivityAction::ToggleWorkspacesFilter,
         ];
         const PALETTE: &[PaletteAction] = &[
             PaletteAction::Close,

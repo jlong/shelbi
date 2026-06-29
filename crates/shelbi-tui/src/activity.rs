@@ -4,7 +4,7 @@
 //! consumes, but reformatted as a date-bucketed reverse-chronological
 //! feed: who started what, who finished what, who's idle, who's waiting.
 //! Per-agent avatars sit to the left of every row attributed to a
-//! worker so the eye can group runs without re-reading names.
+//! workspace so the eye can group runs without re-reading names.
 //!
 //! Hosted in the project's hidden stash session (`shelbi __activity
 //! <project>`) and swapped into the dashboard's right pane by
@@ -41,7 +41,7 @@ use ratatui::{
 
 use shelbi_core::{Column, StatusCategory, DEFAULT_WORKFLOW_NAME};
 use shelbi_state::keymap::{load_keymaps, ActivityAction, DisplayStyle, Keymaps};
-use shelbi_state::{events_log_path, WorkerState, ZenModeState};
+use shelbi_state::{events_log_path, WorkspaceState, ZenModeState};
 
 use crate::keymap::format_chord_or_unbound;
 
@@ -57,7 +57,7 @@ const AVATAR_H: usize = 3;
 /// renderer lines up against the same left margin.
 const AVATAR_GAP: usize = 2;
 
-/// Phonetic-letter creature avatars. One per phonetic-alphabet worker
+/// Phonetic-letter creature avatars. One per phonetic-alphabet workspace
 /// name (alpha…foxtrot). Selected by name lookup in [`avatar_for`];
 /// unknown names fall back to a single-line ` · ` placeholder.
 const ALPHA_AVATAR: [&str; AVATAR_H] = ["▄▀▀▄", "█▄▄█", " ▀▀ "];
@@ -67,10 +67,10 @@ const DELTA_AVATAR: [&str; AVATAR_H] = ["▄▄▄▄", "▌▄▄▐", "▐  �
 const ECHO_AVATAR: [&str; AVATAR_H] = ["▄▀▀▄", "█  █", "▀▀▀▀"];
 const FOXTROT_AVATAR: [&str; AVATAR_H] = ["▄  ▄", "█▀▀█", "▐▄▄▌"];
 
-/// Pick the (rows, tint-color) avatar for a worker name. Mapping is
-/// hard-coded to the six declared phonetic-letter workers — every
+/// Pick the (rows, tint-color) avatar for a workspace name. Mapping is
+/// hard-coded to the six declared phonetic-letter workspaces — every
 /// other name falls back to `None` and the default fg color, so a
-/// project that names workers `frontend` / `backend` still renders,
+/// project that names workspaces `frontend` / `backend` still renders,
 /// just without a unique face.
 fn avatar_for(name: &str) -> (Option<[&'static str; AVATAR_H]>, Color) {
     match name {
@@ -107,11 +107,11 @@ pub enum Event {
         to_category: StatusCategory,
         raw: String,
     },
-    Worker {
+    Workspace {
         ts: DateTime<Utc>,
         name: String,
-        prev: Option<WorkerState>,
-        new: WorkerState,
+        prev: Option<WorkspaceState>,
+        new: WorkspaceState,
         raw: String,
     },
     /// A `shelbi zen dry-run` preview decision — recorded but never
@@ -137,7 +137,7 @@ pub enum Event {
         project: String,
         raw: String,
     },
-    /// Recognized timestamp but the rest doesn't match the task/worker
+    /// Recognized timestamp but the rest doesn't match the task/workspace
     /// shape — render the original line verbatim so nothing vanishes.
     Unknown {
         ts: Option<DateTime<Utc>>,
@@ -149,7 +149,7 @@ impl Event {
     pub fn ts(&self) -> Option<DateTime<Utc>> {
         match self {
             Event::Task { ts, .. }
-            | Event::Worker { ts, .. }
+            | Event::Workspace { ts, .. }
             | Event::ZenDryRun { ts, .. }
             | Event::Heartbeat { ts, .. } => Some(*ts),
             Event::Unknown { ts, .. } => *ts,
@@ -171,19 +171,19 @@ struct TaskMeta {
 
 /// Active filter pills above the feed. Both flags off means "All" — the
 /// pill row's `All` chip lights up and every event is rendered. Toggling
-/// `zen` or `workers` switches to a multi-select union: any event that
+/// `zen` or `workspaces` switches to a multi-select union: any event that
 /// matches at least one active pill is shown.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct ActivityFilter {
     pub zen: bool,
-    pub workers: bool,
+    pub workspaces: bool,
 }
 
 impl ActivityFilter {
     /// `All` is implied — neither specific pill is active, so we show
     /// every event regardless of kind.
     pub fn is_all(&self) -> bool {
-        !self.zen && !self.workers
+        !self.zen && !self.workspaces
     }
 
     /// `true` when this event passes the active filter. With no specific
@@ -208,7 +208,7 @@ impl ActivityFilter {
                 }
             }
         }
-        if self.workers && matches!(ev, Event::Worker { .. }) {
+        if self.workspaces && matches!(ev, Event::Workspace { .. }) {
             return true;
         }
         false
@@ -233,7 +233,7 @@ struct PillHit {
 enum PillKind {
     All,
     Zen,
-    Workers,
+    Workspaces,
 }
 
 /// State for the activity TUI.
@@ -354,9 +354,9 @@ impl ActivityApp {
         self.snap_to_top();
     }
 
-    /// Toggle the Workers pill — same shape as [`Self::toggle_zen_filter`].
-    pub fn toggle_workers_filter(&mut self) {
-        self.filter.workers = !self.filter.workers;
+    /// Toggle the Workspaces pill — same shape as [`Self::toggle_zen_filter`].
+    pub fn toggle_workspaces_filter(&mut self) {
+        self.filter.workspaces = !self.filter.workspaces;
         self.snap_to_top();
     }
 
@@ -397,8 +397,8 @@ impl ActivityApp {
                 self.toggle_zen_filter();
                 true
             }
-            Some(PillKind::Workers) => {
-                self.toggle_workers_filter();
+            Some(PillKind::Workspaces) => {
+                self.toggle_workspaces_filter();
                 true
             }
             None => false,
@@ -689,7 +689,14 @@ pub fn parse_event_line(line: &str) -> Event {
         return Event::Unknown { ts: Some(ts), raw };
     }
 
-    if let Some(rest) = rest.strip_prefix("worker=") {
+    // Workspace state transition lines. New emissions use `workspace=<name>`;
+    // legacy lines (and one-release tooling that still emits the old form)
+    // use `worker=<name>` — we accept both. Phase 2 will drop the `worker=`
+    // fallback once enough time has passed.
+    let ws_rest = rest
+        .strip_prefix("workspace=")
+        .or_else(|| rest.strip_prefix("worker="));
+    if let Some(rest) = ws_rest {
         // Format: `<name> <prev> -> <new>`
         let mut tokens = rest.splitn(4, ' ');
         let name = tokens.next().unwrap_or("");
@@ -697,13 +704,13 @@ pub fn parse_event_line(line: &str) -> Event {
         let arrow = tokens.next().unwrap_or("");
         let new_s = tokens.next().unwrap_or("");
         if arrow == "->" {
-            if let Some(new) = parse_worker_state(new_s) {
+            if let Some(new) = parse_workspace_state(new_s) {
                 let prev = if prev_s == "none" {
                     None
                 } else {
-                    parse_worker_state(prev_s)
+                    parse_workspace_state(prev_s)
                 };
-                return Event::Worker {
+                return Event::Workspace {
                     ts,
                     name: name.to_string(),
                     prev,
@@ -718,11 +725,11 @@ pub fn parse_event_line(line: &str) -> Event {
     Event::Unknown { ts: Some(ts), raw }
 }
 
-fn parse_worker_state(s: &str) -> Option<WorkerState> {
+fn parse_workspace_state(s: &str) -> Option<WorkspaceState> {
     match s {
-        "working" => Some(WorkerState::Working),
-        "awaiting_input" => Some(WorkerState::AwaitingInput),
-        "blocked" => Some(WorkerState::Blocked),
+        "working" => Some(WorkspaceState::Working),
+        "awaiting_input" => Some(WorkspaceState::AwaitingInput),
+        "blocked" => Some(WorkspaceState::Blocked),
         _ => None,
     }
 }
@@ -772,7 +779,7 @@ fn render_title(f: &mut Frame, app: &ActivityApp, area: Rect) {
     f.render_widget(Paragraph::new(title), area);
 }
 
-/// Paint the `All · Zen · Workers` pill row and record each pill's
+/// Paint the `All · Zen · Workspaces` pill row and record each pill's
 /// cell coordinates in `app.pill_hits` so the mouse handler can route
 /// clicks back to the right toggle. Active pills get a bold accent
 /// color; inactive ones sit muted so the eye picks out the live filters
@@ -787,9 +794,9 @@ fn render_pills(f: &mut Frame, app: &mut ActivityApp, area: Rect) {
         (PillKind::All, "All", app.filter.is_all(), Color::Cyan),
         (PillKind::Zen, "Zen", app.filter.zen, ZEN_FG),
         (
-            PillKind::Workers,
-            "Workers",
-            app.filter.workers,
+            PillKind::Workspaces,
+            "Workspaces",
+            app.filter.workspaces,
             Color::Magenta,
         ),
     ];
@@ -862,7 +869,7 @@ fn render_footer(f: &mut Frame, app: &ActivityApp, area: Rect) {
         fc(km.activity.first_chord_for(ActivityAction::Refresh)),
         fc(km.activity.first_chord_for(ActivityAction::ResetFilter)),
         fc(km.activity.first_chord_for(ActivityAction::ToggleZenFilter)),
-        fc(km.activity.first_chord_for(ActivityAction::ToggleWorkersFilter)),
+        fc(km.activity.first_chord_for(ActivityAction::ToggleWorkspacesFilter)),
     );
     let footer = Paragraph::new(Line::from(Span::styled(
         text,
@@ -958,7 +965,7 @@ fn date_header(label: &str, width: usize) -> Line<'static> {
 }
 
 /// What sits in the avatar column. Three shapes — a full 3-row
-/// creature face for worker-attributed task transitions, a single
+/// creature face for workspace-attributed task transitions, a single
 /// glyph (★ / ◆ / ✓) for task-only events, or nothing (raw fallback).
 enum AvatarSlot {
     Face {
@@ -981,7 +988,7 @@ const ZEN_FG: Color = Color::Green;
 
 /// Avatar art for the zen badge: a 4×3 block-edge frame with "ZEN"
 /// lettering on the middle row. Sits in the same column as the
-/// per-worker creature avatars so layout stays aligned.
+/// per-workspace creature avatars so layout stays aligned.
 const ZEN_BADGE: [&str; AVATAR_H] = ["▄▄▄▄", " ZEN", "▀▀▀▀"];
 
 /// One parsed `reason=` string from a zen-driven task event. The
@@ -1110,11 +1117,11 @@ fn parse_kv(s: &str) -> HashMap<String, String> {
 }
 
 impl AvatarSlot {
-    /// Resolve a worker name into either a creature face (when the
-    /// name is one of the six phonetic-letter workers) or `Glyph`
+    /// Resolve a workspace name into either a creature face (when the
+    /// name is one of the six phonetic-letter workspaces) or `Glyph`
     /// stand-in keyed by the fallback symbol.
-    fn for_worker(worker: Option<&str>, fallback_glyph: &'static str, default_color: Color) -> Self {
-        match worker {
+    fn for_workspace(workspace: Option<&str>, fallback_glyph: &'static str, default_color: Color) -> Self {
+        match workspace {
             Some(w) => match avatar_for(w) {
                 (Some(rows), color) => AvatarSlot::Face { rows, color },
                 (None, _) => AvatarSlot::Glyph {
@@ -1132,8 +1139,8 @@ impl AvatarSlot {
 
 /// The primary + secondary text for one event row.
 struct RowText {
-    /// Top line — bold worker name (if any), verb, italic title.
-    /// Pre-spanned so workers and verbs can carry different styles.
+    /// Top line — bold workspace name (if any), verb, italic title.
+    /// Pre-spanned so workspaces and verbs can carry different styles.
     primary: Vec<Span<'static>>,
     /// Optional muted detail line under the primary.
     secondary: Option<String>,
@@ -1156,9 +1163,9 @@ fn render_event(
             raw,
             ..
         } => render_task_event(app, *ts, id, *from, *to, reason, raw, width, now, started_at),
-        Event::Worker {
+        Event::Workspace {
             ts, name, new, ..
-        } => render_worker_event(*ts, name, *new, width, now),
+        } => render_workspace_event(*ts, name, *new, width, now),
         Event::ZenDryRun {
             ts,
             task_id,
@@ -1262,7 +1269,7 @@ fn render_task_event(
         .unwrap_or_else(|| id.to_string());
     let priority = meta.as_ref().map(|m| m.priority);
     let branch = meta.as_ref().and_then(|m| m.branch.clone());
-    let worker = meta.as_ref().and_then(|m| m.assigned_to.clone());
+    let workspace = meta.as_ref().and_then(|m| m.assigned_to.clone());
 
     let when = relative_time(ts, now);
     let title_quoted = format!("\u{201C}{title}\u{201D}");
@@ -1304,14 +1311,14 @@ fn render_task_event(
             )
         }
         (Column::Todo, Column::InProgress) => {
-            let (worker_span, slot) = worker_attribution(
-                worker.as_deref(),
+            let (workspace_span, slot) = workspace_attribution(
+                workspace.as_deref(),
                 GLYPH_STARTED,
                 Color::Green,
             );
             let row = RowText {
                 primary: vec![
-                    worker_span,
+                    workspace_span,
                     Span::raw("  "),
                     Span::styled("started".to_string(), Style::default().fg(Color::Gray)),
                     Span::raw("  "),
@@ -1333,15 +1340,15 @@ fn render_task_event(
             paint_row(slot, row, width, when, None)
         }
         (Column::InProgress, Column::Review) => {
-            let (worker_span, slot) = worker_attribution(
-                worker.as_deref(),
+            let (workspace_span, slot) = workspace_attribution(
+                workspace.as_deref(),
                 GLYPH_FINISHED,
                 Color::Cyan,
             );
             let took = started_at.map(|s| format!("took {}", short_duration(ts - s)));
             let row = RowText {
                 primary: vec![
-                    worker_span,
+                    workspace_span,
                     Span::raw("  "),
                     Span::styled("finished".to_string(), Style::default().fg(Color::Gray)),
                     Span::raw("  "),
@@ -1580,16 +1587,16 @@ fn humanize_list(s: &str) -> String {
         .join(", ")
 }
 
-fn render_worker_event(
+fn render_workspace_event(
     ts: DateTime<Utc>,
     name: &str,
-    new: WorkerState,
+    new: WorkspaceState,
     width: usize,
     now: DateTime<Utc>,
 ) -> Vec<Line<'static>> {
     let when = relative_time(ts, now);
 
-    // Worker-state events are noisier than task transitions — render
+    // Workspace-state events are noisier than task transitions — render
     // the primary muted so the eye skims past them in aggregate but
     // can still see them when looking for context.
     let muted_name = Style::default()
@@ -1598,9 +1605,9 @@ fn render_worker_event(
     let muted = Style::default().fg(Color::DarkGray);
 
     let (verb, detail) = match new {
-        WorkerState::Working => ("is working", None),
-        WorkerState::AwaitingInput => ("is waiting for input", None),
-        WorkerState::Blocked => (
+        WorkspaceState::Working => ("is working", None),
+        WorkspaceState::AwaitingInput => ("is waiting for input", None),
+        WorkspaceState::Blocked => (
             "is blocked on a permission prompt",
             Some("needs human approval"),
         ),
@@ -1627,23 +1634,23 @@ fn render_worker_event(
     paint_row(slot, row, width, when, None)
 }
 
-/// Build the "<worker>" Span and matching avatar slot for a task
+/// Build the "<workspace>" Span and matching avatar slot for a task
 /// transition. Falls back to the supplied glyph + color when the
 /// task isn't assigned to anyone (or is assigned to a non-phonetic
 /// name we don't have art for).
-fn worker_attribution(
-    worker: Option<&str>,
+fn workspace_attribution(
+    workspace: Option<&str>,
     fallback_glyph: &'static str,
     fallback_color: Color,
 ) -> (Span<'static>, AvatarSlot) {
-    let label = worker.unwrap_or("orchestrator").to_string();
+    let label = workspace.unwrap_or("orchestrator").to_string();
     let span = Span::styled(
         label,
         Style::default()
             .fg(Color::White)
             .add_modifier(Modifier::BOLD),
     );
-    let slot = AvatarSlot::for_worker(worker, fallback_glyph, fallback_color);
+    let slot = AvatarSlot::for_workspace(workspace, fallback_glyph, fallback_color);
     (span, slot)
 }
 
@@ -1895,7 +1902,7 @@ mod tests {
         // `<ts> task=<id> workflow=<name> <from> -> <to> reason=<r>
         //  from_category=<c> to_category=<c>`
         let line = "2026-06-23T04:19:33+00:00 task=ship-it workflow=feature-task \
-                    in_progress -> review reason=worker:review-marker \
+                    in_progress -> review reason=workspace:review-marker \
                     from_category=active to_category=handoff";
         match parse_event_line(line) {
             Event::Task {
@@ -1912,7 +1919,7 @@ mod tests {
                 assert_eq!(workflow, "feature-task");
                 assert_eq!(from, Column::InProgress);
                 assert_eq!(to, Column::Review);
-                assert_eq!(reason, "worker:review-marker");
+                assert_eq!(reason, "workspace:review-marker");
                 assert_eq!(from_category, StatusCategory::Active);
                 assert_eq!(to_category, StatusCategory::Handoff);
             }
@@ -1942,28 +1949,46 @@ mod tests {
     }
 
     #[test]
-    fn parses_worker_event() {
-        let line = "2026-06-23T04:19:33Z worker=alpha working -> awaiting_input";
+    fn parses_workspace_event() {
+        let line = "2026-06-23T04:19:33Z workspace=alpha working -> awaiting_input";
         match parse_event_line(line) {
-            Event::Worker { name, prev, new, .. } => {
+            Event::Workspace { name, prev, new, .. } => {
                 assert_eq!(name, "alpha");
-                assert_eq!(prev, Some(WorkerState::Working));
-                assert_eq!(new, WorkerState::AwaitingInput);
+                assert_eq!(prev, Some(WorkspaceState::Working));
+                assert_eq!(new, WorkspaceState::AwaitingInput);
             }
-            other => panic!("expected worker event, got {other:?}"),
+            other => panic!("expected workspace event, got {other:?}"),
         }
     }
 
     #[test]
-    fn parses_first_observation_worker_event_with_none_prev() {
-        let line = "2026-06-23T04:19:33Z worker=alpha none -> working";
+    fn parses_first_observation_workspace_event_with_none_prev() {
+        let line = "2026-06-23T04:19:33Z workspace=alpha none -> working";
         match parse_event_line(line) {
-            Event::Worker { name, prev, new, .. } => {
+            Event::Workspace { name, prev, new, .. } => {
                 assert_eq!(name, "alpha");
                 assert!(prev.is_none(), "`none` prev must parse as Option::None");
-                assert_eq!(new, WorkerState::Working);
+                assert_eq!(new, WorkspaceState::Working);
             }
-            other => panic!("expected worker event, got {other:?}"),
+            other => panic!("expected workspace event, got {other:?}"),
+        }
+    }
+
+    /// Legacy event-log lines (and any tooling that lags behind the
+    /// `worker=` → `workspace=` rename for one release) must still parse
+    /// as workspace events. Both forms route to the same `Event::Workspace`
+    /// variant — the parser cares about the shape of the rest of the line,
+    /// not which prefix introduced it.
+    #[test]
+    fn parses_legacy_worker_event_form_as_workspace_event() {
+        let line = "2026-06-23T04:19:33Z worker=alpha working -> awaiting_input";
+        match parse_event_line(line) {
+            Event::Workspace { name, prev, new, .. } => {
+                assert_eq!(name, "alpha");
+                assert_eq!(prev, Some(WorkspaceState::Working));
+                assert_eq!(new, WorkspaceState::AwaitingInput);
+            }
+            other => panic!("expected workspace event, got {other:?}"),
         }
     }
 
@@ -2050,13 +2075,13 @@ mod tests {
     }
 
     #[test]
-    fn each_phonetic_worker_has_unique_avatar() {
-        // The recognizability of the feed depends on each worker
+    fn each_phonetic_workspace_has_unique_avatar() {
+        // The recognizability of the feed depends on each workspace
         // getting a distinct face — regression-test that no two
         // phonetic names accidentally share avatar art.
-        let workers = ["alpha", "bravo", "charlie", "delta", "echo", "foxtrot"];
+        let workspaces = ["alpha", "bravo", "charlie", "delta", "echo", "foxtrot"];
         let mut seen: Vec<[&str; AVATAR_H]> = Vec::new();
-        for w in workers {
+        for w in workspaces {
             let (avatar, _) = avatar_for(w);
             let av = avatar.unwrap_or_else(|| panic!("{w} must have an avatar"));
             assert!(!seen.contains(&av), "duplicate avatar for {w}");
@@ -2065,9 +2090,9 @@ mod tests {
     }
 
     #[test]
-    fn unknown_worker_has_no_avatar_but_default_color() {
+    fn unknown_workspace_has_no_avatar_but_default_color() {
         let (avatar, color) = avatar_for("frontend");
-        assert!(avatar.is_none(), "non-phonetic worker has no avatar");
+        assert!(avatar.is_none(), "non-phonetic workspace has no avatar");
         assert_eq!(color, Color::Gray);
     }
 
@@ -2136,7 +2161,7 @@ mod tests {
     #[test]
     fn parse_zen_reason_ignores_non_zen_reasons() {
         assert!(parse_zen_reason("user:cli:start").is_none());
-        assert!(parse_zen_reason("worker:review-marker").is_none());
+        assert!(parse_zen_reason("workspace:review-marker").is_none());
         assert!(parse_zen_reason("").is_none());
     }
 
@@ -2315,12 +2340,12 @@ mod tests {
         }
     }
 
-    fn worker_event() -> Event {
-        Event::Worker {
+    fn workspace_event() -> Event {
+        Event::Workspace {
             ts: Utc.with_ymd_and_hms(2026, 6, 23, 12, 0, 0).unwrap(),
             name: "alpha".into(),
             prev: None,
-            new: WorkerState::Working,
+            new: WorkspaceState::Working,
             raw: String::new(),
         }
     }
@@ -2353,9 +2378,9 @@ mod tests {
         // happened" row every few minutes.
         let configs = [
             ActivityFilter::default(),
-            ActivityFilter { zen: true, workers: false },
-            ActivityFilter { zen: false, workers: true },
-            ActivityFilter { zen: true, workers: true },
+            ActivityFilter { zen: true, workspaces: false },
+            ActivityFilter { zen: false, workspaces: true },
+            ActivityFilter { zen: true, workspaces: true },
         ];
         for f in configs {
             assert!(!f.matches(&heartbeat_event()), "heartbeat passed filter: {f:?}");
@@ -2368,29 +2393,29 @@ mod tests {
         assert!(f.is_all());
         assert!(f.matches(&task_event("user:cli:start")));
         assert!(f.matches(&task_event("orchestrator:zen-promote category=4")));
-        assert!(f.matches(&worker_event()));
+        assert!(f.matches(&workspace_event()));
     }
 
     #[test]
     fn activity_filter_zen_keeps_only_zen_task_events() {
         let f = ActivityFilter {
             zen: true,
-            workers: false,
+            workspaces: false,
         };
         assert!(f.matches(&task_event("orchestrator:zen-promote category=4")));
         assert!(f.matches(&task_event("orchestrator:zen-merge sha=abc")));
         assert!(f.matches(&task_event("zen:failed-checks cmd=\"cargo test\"")));
         assert!(!f.matches(&task_event("user:cli:start")));
-        assert!(!f.matches(&worker_event()));
+        assert!(!f.matches(&workspace_event()));
     }
 
     #[test]
-    fn activity_filter_workers_keeps_only_worker_events() {
+    fn activity_filter_workspaces_keeps_only_workspace_events() {
         let f = ActivityFilter {
             zen: false,
-            workers: true,
+            workspaces: true,
         };
-        assert!(f.matches(&worker_event()));
+        assert!(f.matches(&workspace_event()));
         assert!(!f.matches(&task_event("user:cli:start")));
         assert!(!f.matches(&task_event("orchestrator:zen-promote category=4")));
     }
@@ -2399,10 +2424,10 @@ mod tests {
     fn activity_filter_pills_are_multiselect_union() {
         let f = ActivityFilter {
             zen: true,
-            workers: true,
+            workspaces: true,
         };
         assert!(f.matches(&task_event("orchestrator:zen-promote category=4")));
-        assert!(f.matches(&worker_event()));
+        assert!(f.matches(&workspace_event()));
         // Regular user-action task still filtered out — neither pill matches it.
         assert!(!f.matches(&task_event("user:cli:start")));
     }
@@ -2418,8 +2443,8 @@ mod tests {
         assert_eq!(app.scroll, 0, "filter toggle should snap scroll to newest");
         assert!(app.auto_scroll);
 
-        app.toggle_workers_filter();
-        assert!(app.filter.workers);
+        app.toggle_workspaces_filter();
+        assert!(app.filter.workspaces);
 
         app.reset_filter();
         assert!(app.filter.is_all(), "`a` resets both pills to off");
@@ -2461,7 +2486,7 @@ mod tests {
             workflow: DEFAULT_WORKFLOW_NAME.into(),
             from: Column::InProgress,
             to: Column::Review,
-            reason: "worker:review-marker".into(),
+            reason: "workspace:review-marker".into(),
             from_category: Column::InProgress.category(),
             to_category: Column::Review.category(),
             raw: String::new(),

@@ -13,12 +13,12 @@
 Shelbi lets you run, supervise, and review AI coding agents (Claude Code,
 Codex, aider, anything with a CLI) running in parallel across your laptop and
 on remote machines at the same time. You talk to one **orchestrator agent**;
-it delegates work to **worker agents** running in tmux panes — locally or
-over SSH — and reports back. You jump into any worker's pane when you want
+it delegates work to **workspace agents** running in tmux panes — locally or
+over SSH — and reports back. You jump into any workspace's pane when you want
 to watch live, and review/merge the diffs from a two-pane TUI.
 
 Part replacement-for-tmuxinator. Part terminal-native Conductor. All you need
-on a worker machine is `tmux` and your agent CLI.
+on a workspace machine is `tmux` and your agent CLI.
 
 ---
 
@@ -31,16 +31,16 @@ Kubernetes cluster.
 
 Shelbi gives you:
 
-- **One orchestrator, many workers.** Talk to a single agent in chat. It
+- **One orchestrator, many workspaces.** Talk to a single agent in chat. It
   dispatches tasks across machines and tracks progress for you.
-- **Run anywhere tmux runs.** Hub-side: Linux or macOS. Workers: any
+- **Run anywhere tmux runs.** Hub-side: Linux or macOS. Workspaces: any
   machine reachable by `ssh` with `tmux` + your agent CLI installed.
 - **Worktree isolation per task.** Each task runs on its own git branch in
   its own worktree. Review, merge, archive — independently.
 - **No daemons, no servers.** Just `ssh`, `tmux`, `git`, and your agent CLI.
 - **Pluggable agents.** Claude Code, Codex, or any CLI you can drive
   interactively — declared per project.
-- **Markdown state, not a database.** Every task, log, and worker status is
+- **Markdown state, not a database.** Every task, log, and workspace status is
   a markdown or YAML file. Grep it, version-control it, read it from your
   editor.
 
@@ -70,7 +70,7 @@ Confirm the install:
 shelbi --version
 ```
 
-You'll also want `tmux` (≥ 3.2) on the hub and on any remote worker
+You'll also want `tmux` (≥ 3.2) on the hub and on any remote workspace
 machines, plus whichever agent CLI you intend to run (`claude`, `codex`, …).
 
 ---
@@ -98,12 +98,12 @@ $ shelbi
   ? SSH host: devbox.local
   ? Work directory on remote: /home/you/work/myapp
 ? Add another remote machine? No
-? Agent runner (used by every worker): claude
-  (memory: 64 GB → recommended 5 workers per machine — configurable later)
-? Worker count per machine: 4
-? Worker naming style: phonetic (alpha, bravo, charlie, …)
+? Agent runner (used by every workspace): claude
+  (memory: 64 GB → recommended 5 workspaces per machine — configurable later)
+? Workspace count per machine: 4
+? Workspace naming style: phonetic (alpha, bravo, charlie, …)
 ? Orchestrator runner: claude
-✓ Project myapp created (8 workers: alpha, bravo, charlie, delta, echo, foxtrot, golf, hotel).
+✓ Project myapp created (8 workspaces: alpha, bravo, charlie, delta, echo, foxtrot, golf, hotel).
 
 ? Set up another project? No
 ```
@@ -115,11 +115,11 @@ What the wizard auto-fills from your environment:
 - **Default branch** — `origin/HEAD` (falls back to `main`).
 - **GitHub repo URL** — `git remote get-url origin`.
 - **Hub work directory** — same as the repo path.
-- **Worker count** — heuristic from total RAM, budgeting ~10 GB per
-  worker on a single-machine setup and ~12 GB when work is spread
+- **Workspace count** — heuristic from total RAM, budgeting ~10 GB per
+  workspace on a single-machine setup and ~12 GB when work is spread
   across multiple machines. Clamped to `[1, 16]`.
-- **Worker naming style** — choose between phonetic alphabet, Greek
-  letters, or Toy Story characters. Workers are laid out machine by
+- **Workspace naming style** — choose between phonetic alphabet, Greek
+  letters, or Toy Story characters. Workspaces are laid out machine by
   machine, so the first N names land on the hub, the next N on the first
   remote, and so on.
 
@@ -162,12 +162,12 @@ service into its own crate." It drops cards into the **backlog** column,
 each one a markdown file with a short prompt and a proposed branch name.
 
 You triage the backlog by moving cards to **todo**. The orchestrator
-watches the todo column: as soon as a worker frees up, it picks the
+watches the todo column: as soon as a workspace frees up, it picks the
 highest-priority unblocked card, checks it out on a fresh branch in the
-worker's worktree, and starts the runner with the task prompt. The card
+workspace's worktree, and starts the runner with the task prompt. The card
 moves to **in_progress** automatically.
 
-When a worker finishes, its card lands in **review** and the worker
+When a workspace finishes, its card lands in **review** and the workspace
 stops. The sidebar surfaces a `Ready for Review` list with a cyan `✓`
 next to each title — that's your queue. Click one (or press Enter) and
 shelbi checks the branch out into the project's working directory on
@@ -184,9 +184,9 @@ direction and review. Nothing in the middle needs CLI ceremony.
 
 Two-pane layout. Borderless sidebar on the left — project name as a
 strong header, then a 2-item nav (Chat, Tasks), then live inline lists
-of declared workers (`— agents —`) and tasks waiting on you
+of declared workspaces (`— agents —`) and tasks waiting on you
 (`— Ready for Review —`). Content view on the right is a real tmux
-pane: the orchestrator, a worker, or one of the built-in views.
+pane: the orchestrator, a workspace, or one of the built-in views.
 
 ```
  myapp                  Chat — Orchestrator
@@ -194,7 +194,7 @@ pane: the orchestrator, a worker, or one of the built-in views.
  💬 Chat                  send it to delta.
  📋 Tasks
                         Orchestrator: ✓ dispatched to delta.
-                          worker: delta
+                          workspace: delta
  — agents —               branch: shelbi/fix-login-bug
  ⏵ alpha
  💬 bravo               you: how's it going?
@@ -207,7 +207,7 @@ pane: the orchestrator, a worker, or one of the built-in views.
  ✓ csv-export    charlie
 ```
 
-Worker state badges in the sidebar:
+Workspace state badges in the sidebar:
 
 | Badge | Meaning |
 |---|---|
@@ -218,13 +218,13 @@ Worker state badges in the sidebar:
 | `·` | idle — no in-flight task assigned |
 
 `Ctrl+P` opens a fuzzy command palette as a tmux popup — for switching
-projects, jumping to a worker, swapping the right pane to Tasks /
+projects, jumping to a workspace, swapping the right pane to Tasks /
 Machines / Review, or triggering actions. Same convention as VS Code /
 JetBrains / Telescope.
 
 `Enter` focuses the highlighted row: a nav item swaps the right pane to
-that view; a worker switches to its tmux window (or opens an SSH proxy
-window for a remote worker); a review row checks out the branch and
+that view; a workspace switches to its tmux window (or opens an SSH proxy
+window for a remote workspace); a review row checks out the branch and
 spawns the review pane.
 
 The built-in views on the right pane:
@@ -237,7 +237,7 @@ The built-in views on the right pane:
   statuses. `h/l` step columns, `j/k` step rows, `Enter` / `Space`
   opens the card, `H/L` moves the selected card to the next column,
   `K/J` reorders within a column, `r` refreshes.
-- **Machines** — declared machines + their worker assignments and SSH
+- **Machines** — declared machines + their workspace assignments and SSH
   health.
 - **Review** — a ratatui list of every task currently in the review
   column; activating a row triggers the same checkout flow as clicking
@@ -249,11 +249,11 @@ The built-in views on the right pane:
 
 | Concept | What it is |
 |---|---|
-| **Project** | A git repo + the machines it can run on + the worker pool + the agent runners available. Declared in `~/.shelbi/projects/<name>.yaml`. |
+| **Project** | A git repo + the machines it can run on + the workspace pool + the agent runners available. Declared in `~/.shelbi/projects/<name>.yaml`. |
 | **Machine** | A host. Either `local` (the hub) or `ssh` with a host and a working directory. |
 | **Agent runner** | A pluggable CLI command shelbi knows how to launch (`claude`, `codex`, …). |
-| **Worker** | A named, persistent slot pinned to a machine and a runner. Picks up the next ready task and runs it in an isolated worktree. |
-| **Orchestrator** | The agent in window 1 you talk to. Creates tasks, dispatches workers via the `shelbi` CLI. |
+| **Workspace** | A named, persistent slot pinned to a machine and a runner. Picks up the next ready task and runs it in an isolated worktree. |
+| **Orchestrator** | The agent in window 1 you talk to. Creates tasks, dispatches workspaces via the `shelbi` CLI. |
 | **Workflow** | A YAML schema that declares the statuses a task moves through and what happens on each transition. The default workflow is the canonical Backlog → Todo → In Progress → Review → Done; projects can drop additional workflow YAMLs alongside it. |
 | **Task** | A markdown file in `~/.shelbi/projects/<name>/tasks/`. Moves through its workflow's statuses (Backlog → Todo → In Progress → Review → Done in the default workflow). |
 
@@ -286,7 +286,7 @@ The built-in views on the right pane:
                  │     │ diff, merge…   │
                  │     └────┬───────────┘
                  │          │
-                 │   for each worker:
+                 │   for each workspace:
                  ▼          ▼
        ┌──────────────────────────────────┐
        │ ssh remote -- tmux send-keys /   │
@@ -298,26 +298,26 @@ The built-in views on the right pane:
 - The **orchestrator** is just another agent CLI — running in window 1 of
   shelbi's tmux session. It uses the `shelbi` CLI as its tool surface (the
   same CLI you use yourself).
-- Each **worker** is `claude` (or codex, etc.) running interactively in a
+- Each **workspace** is `claude` (or codex, etc.) running interactively in a
   tmux pane — locally on the hub, or in a tmux session on a remote machine
   reached over SSH.
-- shelbi drives workers with `tmux send-keys` + `capture-pane`,
+- shelbi drives workspaces with `tmux send-keys` + `capture-pane`,
   transparently prefixed with `ssh host --` for remotes. A poller watches
-  each worker's pane title for `shelbi:<state>` markers and writes them to
-  `~/.shelbi/workers/<name>/status.yaml`, which is what drives the sidebar
+  each workspace's pane title for `shelbi:<state>` markers and writes them to
+  `~/.shelbi/workspaces/<name>/status.yaml`, which is what drives the sidebar
   badges.
 - Project state lives in `~/.shelbi/projects/<name>/` — tasks, agents,
-  worker settings, and a YAML config. Worker state lives in
-  `~/.shelbi/workers/<name>/`. Everything is plain text.
+  workspace settings, and a YAML config. Workspace state lives in
+  `~/.shelbi/workspaces/<name>/`. Everything is plain text.
 
 ---
 
 ## Common workflows
 
-**Dispatch a worker explicitly without waiting for the orchestrator.**
+**Dispatch a workspace explicitly without waiting for the orchestrator.**
 
 ```bash
-shelbi task start fix-login --worker delta
+shelbi task start fix-login --workspace delta
 ```
 
 **Switch projects from anywhere.**
@@ -328,14 +328,14 @@ shelbi -p sideproj    # or just `shelbi` and pick from the fuzzy list
 
 **Add a remote machine to a project that already exists.** Edit
 `~/.shelbi/projects/<name>.yaml` — append a machine to the `machines:`
-list and a worker per slot to `workers:`. Reload the dashboard:
+list and a workspace per slot to `workspaces:`. Reload the dashboard:
 
 ```bash
 shelbi reload
 ```
 
 **Pick up a fresh binary after `./scripts/install.sh`.** The orchestrator
-and worker panes re-shell into shelbi on every call, so they pick up
+and workspace panes re-shell into shelbi on every call, so they pick up
 the new binary automatically. The sidebar / Tasks / Review panes don't
 — respawn them in place with:
 
@@ -368,7 +368,7 @@ orchestrator:
 agent_runners:
   claude: { command: claude, flags: [] }
   codex:  { command: codex,  flags: [] }
-workers:
+workspaces:
   - { name: alpha,    machine: hub,    runner: claude }
   - { name: bravo,    machine: hub,    runner: claude }
   - { name: charlie,  machine: devbox, runner: claude }
@@ -413,11 +413,11 @@ shelbi is a Cargo workspace under `crates/`:
 | Crate | Purpose |
 |---|---|
 | `shelbi-cli` | The `shelbi` binary, subcommands, wizard. |
-| `shelbi-core` | Domain model — Project, Task, Machine, Worker, Column. |
+| `shelbi-core` | Domain model — Project, Task, Machine, Workspace, Column. |
 | `shelbi-state` | Filesystem layout — load/save YAML and markdown under `~/.shelbi/`. |
 | `shelbi-tui` | Ratatui sidebar, Kanban, review queue. |
 | `shelbi-tmux` | tmux session/window/pane helpers. |
-| `shelbi-ssh` | SSH-prefixed command execution for remote workers. |
+| `shelbi-ssh` | SSH-prefixed command execution for remote workspaces. |
 | `shelbi-agent` | Agent-runner abstraction and pane-driving logic. |
 | `shelbi-orchestrator` | Orchestrator window setup, review checkout, palette views. |
 | `shelbi-palette` | Nucleo-backed fuzzy matcher used by the picker and palette. |

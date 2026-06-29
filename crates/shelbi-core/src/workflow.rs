@@ -517,10 +517,10 @@ impl std::str::FromStr for StatusCategory {
 /// Who is expected to act when a task sits in a given status.
 ///
 /// - `User` keeps the task waiting; the orchestrator does not dispatch.
-/// - `Agent` makes the task eligible for auto-dispatch onto a free worker.
+/// - `Agent` makes the task eligible for auto-dispatch onto a free workspace.
 ///
 /// `Plans/workflows.md` §6 explicitly rejects a third "either" value — a
-/// task is either work for a worker or work for the user. If the user
+/// task is either work for a workspace or work for the user. If the user
 /// wants to grab an agent-owned task, they reassign it through the
 /// normal CLI/TUI; no schema field is needed for that.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]

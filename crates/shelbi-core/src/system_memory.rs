@@ -1,5 +1,5 @@
 //! Cross-platform total-RAM probe + a small heuristic the wizard uses to
-//! suggest a sensible worker count.
+//! suggest a sensible workspace count.
 
 #[cfg(target_os = "macos")]
 use std::process::Command;
@@ -84,21 +84,21 @@ fn parse_meminfo_total(contents: &str) -> crate::Result<u64> {
     ))
 }
 
-/// Suggest a comfortable number of workers for a single machine.
+/// Suggest a comfortable number of workspaces for a single machine.
 ///
-/// Anchored on the observation that one Claude worker holds roughly 2 GB
-/// resident, but in practice each worker pulls in editors, language
-/// servers, and build processes — so the effective per-worker footprint
+/// Anchored on the observation that one Claude workspace holds roughly 2 GB
+/// resident, but in practice each workspace pulls in editors, language
+/// servers, and build processes — so the effective per-workspace footprint
 /// is closer to 10 GB on the hub (where the user is also working) and a
 /// bit more headroom when work is spread across several boxes.
 ///
-/// Clamped to `[1, 16]` so a 2 GB Raspberry Pi still gets one worker and
+/// Clamped to `[1, 16]` so a 2 GB Raspberry Pi still gets one workspace and
 /// a 512 GB workstation doesn't get a wall-of-claude.
-pub fn recommended_worker_count(total_mem_bytes: u64, machine_count: u32) -> u32 {
+pub fn recommended_workspace_count(total_mem_bytes: u64, machine_count: u32) -> u32 {
     let total_gb = (total_mem_bytes / GIB) as f64;
-    let per_worker_gb = if machine_count > 1 { 12.0 } else { 10.0 };
-    let workers = (total_gb / per_worker_gb).floor() as u32;
-    workers.clamp(1, 16)
+    let per_workspace_gb = if machine_count > 1 { 12.0 } else { 10.0 };
+    let workspaces = (total_gb / per_workspace_gb).floor() as u32;
+    workspaces.clamp(1, 16)
 }
 
 /// Format `bytes` as a short GB/MB string suitable for the wizard prompt
@@ -122,25 +122,25 @@ mod tests {
 
     #[test]
     fn recommendation_matches_documented_example() {
-        // 64 GB hub-only → 6 workers per machine (matches the wizard prompt).
-        assert_eq!(recommended_worker_count(64 * GIB, 1), 6);
+        // 64 GB hub-only → 6 workspaces per machine (matches the wizard prompt).
+        assert_eq!(recommended_workspace_count(64 * GIB, 1), 6);
     }
 
     #[test]
     fn recommendation_is_clamped() {
-        // Tiny boxes still get one worker.
-        assert_eq!(recommended_worker_count(2 * GIB, 1), 1);
-        assert_eq!(recommended_worker_count(0, 1), 1);
+        // Tiny boxes still get one workspace.
+        assert_eq!(recommended_workspace_count(2 * GIB, 1), 1);
+        assert_eq!(recommended_workspace_count(0, 1), 1);
         // Huge boxes don't get a wall-of-claude.
-        assert_eq!(recommended_worker_count(1024 * GIB, 1), 16);
+        assert_eq!(recommended_workspace_count(1024 * GIB, 1), 16);
     }
 
     #[test]
     fn recommendation_eases_off_in_multi_machine_projects() {
         // With remotes in the picture, each machine gets a slightly more
-        // generous per-worker budget — work can spread.
-        let single = recommended_worker_count(64 * GIB, 1);
-        let multi = recommended_worker_count(64 * GIB, 3);
+        // generous per-workspace budget — work can spread.
+        let single = recommended_workspace_count(64 * GIB, 1);
+        let multi = recommended_workspace_count(64 * GIB, 3);
         assert!(multi <= single);
     }
 

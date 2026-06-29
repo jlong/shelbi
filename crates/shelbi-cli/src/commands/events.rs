@@ -1,10 +1,10 @@
 //! `shelbi events <subcommand>` — read-only views over
 //! `~/.shelbi/events.log`, the append-only transition log written by the
-//! hub's worker-state poller.
+//! hub's workspace-state poller.
 //!
-//! Hub-global, not per-project: every line is `<rfc3339> worker=<name>
+//! Hub-global, not per-project: every line is `<rfc3339> workspace=<name>
 //! <prev> -> <new>`. Filtering by project is out of scope here — the
-//! orchestrator can grep its own workers out of the stream.
+//! orchestrator can grep its own workspaces out of the stream.
 
 use std::fs;
 use std::io::{Read, Seek, SeekFrom};
@@ -17,7 +17,7 @@ use clap::Subcommand;
 
 #[derive(Debug, Subcommand)]
 pub enum EventsCmd {
-    /// Print the most recent worker-state transitions and optionally
+    /// Print the most recent workspace-state transitions and optionally
     /// follow new ones as they're appended.
     Tail {
         /// Number of trailing lines to print before following (or
@@ -79,8 +79,8 @@ fn tail(lines: usize, since: Option<String>, follow: bool) -> Result<()> {
 }
 
 /// `tail -f` shape: park at `start_offset` and print any newly appended
-/// bytes. Polling cadence (250ms) matches the worker poller's typical
-/// inter-tick gap — fast enough to feel live, slow enough that a 10-worker
+/// bytes. Polling cadence (250ms) matches the workspace poller's typical
+/// inter-tick gap — fast enough to feel live, slow enough that a 10-workspace
 /// project barely touches the filesystem.
 fn follow_from(path: &std::path::PathBuf, start_offset: u64) -> Result<()> {
     let interval = Duration::from_millis(250);
@@ -193,8 +193,8 @@ mod tests {
     #[test]
     fn line_after_filters_old_timestamps() {
         let cutoff = Utc.with_ymd_and_hms(2026, 6, 19, 12, 0, 0).unwrap();
-        let old = "2026-06-19T11:59:59+00:00 worker=alpha none -> working";
-        let recent = "2026-06-19T12:00:01+00:00 worker=alpha working -> awaiting_input";
+        let old = "2026-06-19T11:59:59+00:00 workspace=alpha none -> working";
+        let recent = "2026-06-19T12:00:01+00:00 workspace=alpha working -> awaiting_input";
         assert!(!line_after(old, cutoff));
         assert!(line_after(recent, cutoff));
     }

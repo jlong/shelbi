@@ -5,7 +5,7 @@
 //!
 //! Left column: the tasks currently in the [`Column::Review`] column,
 //! sorted by priority. Right column: full detail of whatever is
-//! highlighted — id, branch, worker, timestamps, and the task body the
+//! highlighted — id, branch, workspace, timestamps, and the task body the
 //! orchestrator wrote when it routed the work.
 //!
 //! Pressing Enter on a task kicks off the same review checkout flow the
@@ -333,7 +333,7 @@ fn detail_header(tf: &TaskFile) -> Vec<Line<'static>> {
     lines.push(meta_row("id", &task.id));
     if let Some(w) = &task.assigned_to {
         lines.push(Line::from(vec![
-            meta_label("worker"),
+            meta_label("workspace"),
             Span::styled(format!("@{w}"), Style::default().fg(Color::Magenta)),
         ]));
     }

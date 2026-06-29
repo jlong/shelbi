@@ -10,7 +10,7 @@ use clap::Subcommand;
 #[derive(Debug, Subcommand)]
 pub enum ProjectCmd {
     /// Set up a new project interactively. Walks through the same prompt
-    /// sequence as initial onboarding (project name, machines, workers,
+    /// sequence as initial onboarding (project name, machines, workspaces,
     /// runners) and writes `~/.shelbi/projects/<name>.yaml`. Does not
     /// launch the TUI on completion.
     Add,

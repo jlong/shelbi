@@ -102,10 +102,10 @@ pub(crate) mod test_support {
             agent_runners: runners,
             editor: None,
             github_url: None,
-            workers: Vec::new(),
-            worker_poll_interval_secs: 5,
-            worker_permissions_mode: "auto".into(),
-            worker_settings_template: None,
+            workspaces: Vec::new(),
+            workspace_poll_interval_secs: 5,
+            workspace_permissions_mode: "auto".into(),
+            workspace_settings_template: None,
             zen: ZenConfig::default(),
             heartbeat: HeartbeatConfig::default(),
             contextstore_sync: Vec::new(),
@@ -118,9 +118,9 @@ pub(crate) mod test_support {
 }
 
 pub use activity::ActivityApp;
-pub use app::{App, Row, View, WorkerBadge, WorkerOverview};
+pub use app::{App, Row, View, WorkspaceBadge, WorkspaceOverview};
 pub use kanban::KanbanApp;
-pub use poller::WorkerPoller;
+pub use poller::WorkspacePoller;
 pub use review::ReviewApp;
 pub use sidebar::decoration_to_color;
 
@@ -201,13 +201,13 @@ pub fn run_sidebar(project_name: &str) -> Result<()> {
     app.zen_toggle_chord = keymaps.zen_toggle_chord(probe_chord);
     app.keymaps = keymaps;
 
-    // Background poll loop: per-worker `tmux display-message` every
-    // `worker_poll_interval_secs`, parses the `shelbi:<state>` marker,
-    // persists transitions to `~/.shelbi/workers/<name>/status.yaml`
+    // Background poll loop: per-workspace `tmux display-message` every
+    // `workspace_poll_interval_secs`, parses the `shelbi:<state>` marker,
+    // persists transitions to `~/.shelbi/workspaces/<name>/status.yaml`
     // and `~/.shelbi/events.log`. The handle's Drop joins the thread,
     // so it shuts down when this function returns regardless of which
     // exit path we took.
-    let _poller = WorkerPoller::start(project_name);
+    let _poller = WorkspacePoller::start(project_name);
 
     let result = handlers::sidebar::sidebar_loop(&mut term, &mut app);
 

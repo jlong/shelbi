@@ -41,7 +41,7 @@ use crate::commands::require_project;
 
 /// Default cadence for the dry-run preview loop. Slow enough that a
 /// busy project doesn't see one probe stomping the next; fast enough
-/// that a state change (worker handing off, user promoting a task)
+/// that a state change (workspace handing off, user promoting a task)
 /// shows up in the preview within one tick.
 const DRYRUN_DEFAULT_INTERVAL: Duration = Duration::from_secs(5);
 
@@ -51,7 +51,7 @@ pub enum ZenCmd {
     /// finished tasks without waiting on a human reviewer.
     On,
     /// Turn Zen Mode off — every promotion goes through manual review.
-    /// In-flight workers keep going; nothing already running is cancelled.
+    /// In-flight workspaces keep going; nothing already running is cancelled.
     Off,
     /// Pause Zen Mode — no *new* auto-promotions, but tasks already on
     /// the Zen track may still complete their merge.
@@ -61,10 +61,10 @@ pub enum ZenCmd {
     /// the Zen track.
     Status,
     /// Run every probe primitive for `task` and print the JSON report.
-    /// The task must be assigned to a worker so we know which worktree
+    /// The task must be assigned to a workspace so we know which worktree
     /// to probe.
     Probe { task_id: String },
-    /// Push the worker's branch and open a PR for the task. Idempotent —
+    /// Push the workspace's branch and open a PR for the task. Idempotent —
     /// returns the existing PR number if one is already open for the
     /// branch. Prints the PR number on stdout.
     PrCreate { task_id: String },
@@ -465,7 +465,7 @@ fn emit_decision(log_path: &PathBuf, d: &DryRunDecision) {
     }
     // Activity feed integration — `zen-dryrun` prefix lets the TUI render
     // these rows with a distinct visual tag without changing the existing
-    // task=/worker= line shapes.
+    // task=/workspace= line shapes.
     let _ = append_zen_dryrun_event(&d.task_id, d.action.as_str(), &d.detail);
 }
 

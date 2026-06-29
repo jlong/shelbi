@@ -8,7 +8,7 @@
 //! - right pane: the configured orchestrator agent CLI (e.g. `claude`),
 //!   running natively in the pane. The user types into it directly.
 //!
-//! Worker agents are additional windows in the same session (local) or
+//! Workspace agents are additional windows in the same session (local) or
 //! their own `shelbi-w-<id>` sessions on a remote machine (so they survive
 //! SSH disconnect). The `shelbi orchestrate` CLI and the TUI launcher both
 //! call into `ensure_dashboard()` so the bootstrap is idempotent and
@@ -22,7 +22,7 @@ pub mod contextstore;
 mod git;
 pub mod lifecycle;
 pub mod review;
-pub mod worker;
+pub mod workspace;
 pub mod zen;
 
 #[cfg(test)]
@@ -170,38 +170,38 @@ pub fn show_view(project_name: &str, view: &str) -> Result<()> {
     Ok(())
 }
 
-/// Focus the dashboard window on the declared worker's pane.
+/// Focus the dashboard window on the declared workspace's pane.
 ///
-/// Local workers live in a window named after the worker inside the
-/// project session (placed there by `shelbi task start`). Remote workers
+/// Local workspaces live in a window named after the workspace inside the
+/// project session (placed there by `shelbi task start`). Remote workspaces
 /// live in their own tmux session on the remote machine — we surface them
 /// by maintaining a *proxy window* in the project session, named after
-/// the worker, whose command is `ssh -t <host> tmux attach -t
-/// shelbi-w-<worker>`. The proxy is created lazily on first selection and
+/// the workspace, whose command is `ssh -t <host> tmux attach -t
+/// shelbi-w-<workspace>`. The proxy is created lazily on first selection and
 /// re-used on subsequent selections; closing it (e.g. detaching from the
 /// remote tmux) lets the next selection spawn a fresh one.
 ///
-/// Single source of truth for the sidebar's Enter-on-worker behavior and
-/// the Ctrl+P palette's worker entries — both call here so they can't
+/// Single source of truth for the sidebar's Enter-on-workspace behavior and
+/// the Ctrl+P palette's workspace entries — both call here so they can't
 /// drift.
-pub fn focus_worker(project_name: &str, worker_name: &str) -> Result<()> {
+pub fn focus_workspace(project_name: &str, workspace_name: &str) -> Result<()> {
     let project = shelbi_state::load_project(project_name)?;
-    let worker = project.worker(worker_name).ok_or_else(|| {
+    let workspace = project.workspace(workspace_name).ok_or_else(|| {
         Error::Other(format!(
-            "worker `{worker_name}` not declared in project YAML"
+            "workspace `{workspace_name}` not declared in project YAML"
         ))
     })?;
-    let machine = project.machine(&worker.machine).ok_or_else(|| {
+    let machine = project.machine(&workspace.machine).ok_or_else(|| {
         Error::Other(format!(
-            "worker `{worker_name}` references unknown machine `{}`",
-            worker.machine
+            "workspace `{workspace_name}` references unknown machine `{}`",
+            workspace.machine
         ))
     })?;
 
     let project_session = format!("shelbi-{project_name}");
-    let target = format!("{project_session}:{}", worker.name);
+    let target = format!("{project_session}:{}", workspace.name);
 
-    // Window already in the project session — local worker window OR a
+    // Window already in the project session — local workspace window OR a
     // remote proxy window we created earlier. Just switch to it.
     if run_local_tmux(["select-window", "-t", &target]) {
         return Ok(());
@@ -209,11 +209,11 @@ pub fn focus_worker(project_name: &str, worker_name: &str) -> Result<()> {
 
     match machine.host() {
         Host::Local => Err(Error::Other(format!(
-            "worker has no live pane — assign a task with \
-             `shelbi task start <task> --worker {worker_name}`"
+            "workspace has no live pane — assign a task with \
+             `shelbi task start <task> --workspace {workspace_name}`"
         ))),
         Host::Ssh { host } => {
-            let remote_session = format!("shelbi-w-{}", worker.name);
+            let remote_session = format!("shelbi-w-{}", workspace.name);
             let cmd = format!(
                 "ssh -t {host} tmux attach -t {remote_session}",
                 host = shelbi_agent::shell_escape(&host),
@@ -224,14 +224,14 @@ pub fn focus_worker(project_name: &str, worker_name: &str) -> Result<()> {
                 "-t",
                 &format!("{project_session}:"),
                 "-n",
-                &worker.name,
+                &workspace.name,
                 "sh",
                 "-c",
                 &cmd,
             ]);
             if !ok {
                 return Err(Error::Other(format!(
-                    "couldn't open proxy window for remote worker `{worker_name}` on `{host}`"
+                    "couldn't open proxy window for remote workspace `{workspace_name}` on `{host}`"
                 )));
             }
             let _ = run_local_tmux(["select-window", "-t", &target]);
@@ -690,7 +690,7 @@ fn sidebar_cmd(shelbi_bin: &str, project_name: &str) -> String {
 /// `shelbi events tail --follow` watch — that's the step that turns
 /// auto-dispatch back on after a cold start.
 const ORCH_BOOTSTRAP_PROMPT: &str = "Run the \"Bootstrap on session start\" sequence \
-    from CLAUDE.md now: snapshot `shelbi task list`, `shelbi worker list`, and \
+    from CLAUDE.md now: snapshot `shelbi task list`, `shelbi workspace list`, and \
     `shelbi zen status`; scan recent `~/.shelbi/events.log` for a \
     `zen=off reason=crash-recovery` line; then start `shelbi events tail --follow` \
     in the background and watch it with the Monitor tool so auto-dispatch reacts \
@@ -801,14 +801,14 @@ fn activity_cmd(shelbi_bin: &str, project_name: &str) -> String {
     )
 }
 
-// Live worker/machine table — `shelbi worker list` probes each worker's
-// tmux pane and prints the assigned task (if any), so remote workers
+// Live workspace/machine table — `shelbi workspace list` probes each workspace's
+// tmux pane and prints the assigned task (if any), so remote workspaces
 // show up alongside local ones with the same shape. Refresh every 5s;
-// the SSH probe per remote worker keeps this cheap-but-not-free, hence
+// the SSH probe per remote workspace keeps this cheap-but-not-free, hence
 // the slower cadence than the kanban view.
 fn machines_cmd(shelbi_bin: &str, project_name: &str) -> String {
     format!(
-        "while true; do printf '\\033c'; echo 'workers · {label}'; echo; {bin} --project {proj} worker list 2>&1; sleep 5; done",
+        "while true; do printf '\\033c'; echo 'workspaces · {label}'; echo; {bin} --project {proj} workspace list 2>&1; sleep 5; done",
         bin = shelbi_agent::shell_escape(shelbi_bin),
         proj = shelbi_agent::shell_escape(project_name),
         label = project_name,
@@ -817,7 +817,7 @@ fn machines_cmd(shelbi_bin: &str, project_name: &str) -> String {
 
 // ---------------------------------------------------------------------------
 // reload — respawn shelbi-owned panes in-place so a freshly installed
-// binary takes effect without disturbing the orchestrator or workers.
+// binary takes effect without disturbing the orchestrator or workspaces.
 
 /// Respawn the long-lived shelbi-owned panes in-place so an updated
 /// `shelbi` binary takes effect. Targets:
@@ -825,7 +825,7 @@ fn machines_cmd(shelbi_bin: &str, project_name: &str) -> String {
 /// - `shelbi-<project>:dashboard.{left}` → `shelbi __sidebar <project>`
 /// - stash `tasks` pane → tasks-view loop
 /// - stash `review` pane → review-view loop
-/// - stash `machines` pane → `shelbi worker list` loop
+/// - stash `machines` pane → `shelbi workspace list` loop
 /// - stash `activity` pane → activity-view loop
 ///
 /// For each stash view, if `SHELBI_PANE_<view>` isn't set on the
@@ -835,7 +835,7 @@ fn machines_cmd(shelbi_bin: &str, project_name: &str) -> String {
 /// new view becomes clickable without re-creating the whole session.
 ///
 /// Out of scope: the orchestrator pane (claude re-shells out on each
-/// CLI call) and worker panes (same). Those pick up the new binary
+/// CLI call) and workspace panes (same). Those pick up the new binary
 /// automatically the next time they invoke `shelbi`.
 ///
 /// Idempotent: re-running incurs a visible flicker per pane but no
@@ -1066,13 +1066,13 @@ mod pane_cmd_tests {
     }
 
     #[test]
-    fn machines_cmd_calls_worker_list_on_a_loop() {
+    fn machines_cmd_calls_workspace_list_on_a_loop() {
         let out = machines_cmd("/usr/local/bin/shelbi", "myapp");
-        // sanity check: clears the screen each tick, runs `worker list`,
+        // sanity check: clears the screen each tick, runs `workspace list`,
         // and threads --project through so the inner subcommand picks the
         // right project even though it's invoked through `sh -c`.
         assert!(out.contains("printf '\\033c'"));
-        assert!(out.contains("/usr/local/bin/shelbi --project myapp worker list"));
+        assert!(out.contains("/usr/local/bin/shelbi --project myapp workspace list"));
         assert!(out.contains("sleep 5"));
     }
 

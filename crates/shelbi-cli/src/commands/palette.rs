@@ -1,6 +1,6 @@
 //! `shelbi __palette PROJECT` — full-screen ratatui picker meant to run
 //! inside a `tmux display-popup`. Lists every destination the sidebar can
-//! reach (Chat, Tasks, each declared worker, each review-ready task, each
+//! reach (Chat, Tasks, each declared workspace, each review-ready task, each
 //! legacy spawned agent) plus the global actions; on Enter, performs the
 //! action and exits.
 
@@ -26,7 +26,7 @@ use shelbi_state::keymap::{
     load_keymaps, GlobalAction, KeyChord, KeymapDiagnostic, Keymaps, PaletteAction,
 };
 use shelbi_state::{load_user_config, ProjectSummary, ZenModeState, ZenToggleChord};
-use shelbi_tui::{decoration_to_color, App, Row, View, WorkerOverview};
+use shelbi_tui::{decoration_to_color, App, Row, View, WorkspaceOverview};
 
 pub fn run(project: String) -> Result<()> {
     // Load the merged keymaps before entering the alt-screen so any
@@ -331,7 +331,7 @@ fn render(f: &mut Frame, state: &State, results: &[(Entry, u16)]) {
 // Entry building + dispatch
 //
 // Order mirrors `App::rows()` in shelbi-tui: Chat, Tasks, Activity,
-// then workers, then review-ready tasks, then legacy spawned agents,
+// then workspaces, then review-ready tasks, then legacy spawned agents,
 // then the two global actions. An empty-query palette should read
 // top-to-bottom like the sidebar. We literally walk `app.rows()` to
 // build the entry list so the palette inherits whatever icons and
@@ -343,7 +343,7 @@ fn build_entries(app: &App, zen_mode: ZenModeState, zen_chord: ZenToggleChord) -
     // own decoration attached. Section headers and blanks have no
     // decoration and are skipped.
     for row in app.rows() {
-        if let Some(entry) = entry_from_row(&row, &app.workers) {
+        if let Some(entry) = entry_from_row(&row, &app.workspaces) {
             out.push(entry);
         }
         // The Zen-Mode toggle sits inline with the top nav block so users
@@ -365,7 +365,7 @@ fn build_entries(app: &App, zen_mode: ZenModeState, zen_chord: ZenToggleChord) -
         label: "Quit Project".into(),
         kind: EntryKind::Action,
         subtitle: Some(
-            "close every pane (workers + stash + main) and switch to the next project".into(),
+            "close every pane (workspaces + stash + main) and switch to the next project".into(),
         ),
         shortcut: None,
         decoration: None,
@@ -379,7 +379,7 @@ fn build_entries(app: &App, zen_mode: ZenModeState, zen_chord: ZenToggleChord) -
         label: "Quit Shelbi".into(),
         kind: EntryKind::Action,
         subtitle: Some(
-            "close every Shelbi session on this host (all projects + workers + stash)".into(),
+            "close every Shelbi session on this host (all projects + workspaces + stash)".into(),
         ),
         shortcut: None,
         decoration: None,
@@ -392,7 +392,7 @@ fn build_entries(app: &App, zen_mode: ZenModeState, zen_chord: ZenToggleChord) -
 /// just copies it across and stitches a subtitle suited to the
 /// palette's wider layout. Returns `None` for section headers / blanks
 /// since they have no destination to activate.
-fn entry_from_row(row: &Row, workers: &[WorkerOverview]) -> Option<Entry> {
+fn entry_from_row(row: &Row, workspaces: &[WorkspaceOverview]) -> Option<Entry> {
     let decoration = row.decoration();
     match row {
         Row::Nav { label, view, .. } => {
@@ -409,28 +409,28 @@ fn entry_from_row(row: &Row, workers: &[WorkerOverview]) -> Option<Entry> {
                 decoration,
             })
         }
-        Row::Worker { name, view, .. } => {
-            let machine = workers
+        Row::Workspace { name, view, .. } => {
+            let machine = workspaces
                 .iter()
                 .find(|w| w.name == *name)
                 .map(|w| w.machine.clone());
             let id = match view {
-                View::Worker(_) => format!("worker:{name}"),
-                _ => format!("worker:{name}"),
+                View::Workspace(_) => format!("workspace:{name}"),
+                _ => format!("workspace:{name}"),
             };
             Some(Entry {
                 id,
                 label: name.clone(),
                 kind: EntryKind::Agent,
                 subtitle: Some(match machine {
-                    Some(m) => format!("worker · {m}"),
-                    None => "worker".into(),
+                    Some(m) => format!("workspace · {m}"),
+                    None => "workspace".into(),
                 }),
                 shortcut: None,
                 decoration,
             })
         }
-        Row::Review { title, worker, view } => {
+        Row::Review { title, workspace, view } => {
             let id = match view {
                 View::ReviewTask(task_id) => format!("review:{task_id}"),
                 _ => return None,
@@ -439,7 +439,7 @@ fn entry_from_row(row: &Row, workers: &[WorkerOverview]) -> Option<Entry> {
                 id,
                 label: title.clone(),
                 kind: EntryKind::Action,
-                subtitle: Some(match worker.as_deref() {
+                subtitle: Some(match workspace.as_deref() {
                     Some(w) => format!("review · {w}"),
                     None => "review".into(),
                 }),
@@ -508,8 +508,8 @@ fn dispatch(project: &str, entry: &Entry) -> Result<()> {
         shelbi_orchestrator::show_view(project, view).map_err(|e| anyhow::anyhow!(e))?;
         return Ok(());
     }
-    if let Some(worker) = entry.id.strip_prefix("worker:") {
-        shelbi_orchestrator::focus_worker(project, worker).map_err(|e| anyhow::anyhow!(e))?;
+    if let Some(workspace) = entry.id.strip_prefix("workspace:") {
+        shelbi_orchestrator::focus_workspace(project, workspace).map_err(|e| anyhow::anyhow!(e))?;
         return Ok(());
     }
     if let Some(task_id) = entry.id.strip_prefix("review:") {
@@ -695,16 +695,16 @@ fn render_project_picker(
             } else {
                 "machines"
             };
-            let w = if p.worker_count == 1 {
-                "worker"
+            let w = if p.workspace_count == 1 {
+                "workspace"
             } else {
-                "workers"
+                "workspaces"
             };
             let spans = vec![
                 Span::styled(" ◉ ", Style::default().fg(Color::DarkGray)),
                 Span::raw(format!("{:<22}", p.name)),
                 Span::styled(
-                    format!("  {} {m} · {} {w}", p.machine_count, p.worker_count),
+                    format!("  {} {m} · {} {w}", p.machine_count, p.workspace_count),
                     Style::default().fg(Color::DarkGray),
                 ),
             ];
@@ -737,7 +737,7 @@ fn render_project_picker(
 // A second ratatui screen sharing the palette's alt-screen, same
 // pattern as `run_project_picker`. Lists every project shelbi is
 // currently managing (live `shelbi-<name>` tmux sessions) with a
-// count of each one's active worker panes so users see exactly what
+// count of each one's active workspace panes so users see exactly what
 // they're about to tear down. Cancel is default focus — the popover
 // is a guard against accidental confirmation, so the safe button is
 // the one Enter activates by default.
@@ -793,7 +793,7 @@ fn run_quit_shelbi_confirm<B: ratatui::backend::Backend>(
 // "Quit Project" confirmation popover
 //
 // A second ratatui screen sharing the palette's alt-screen, same
-// pattern as `run_project_picker`. Lists each declared worker whose
+// pattern as `run_project_picker`. Lists each declared workspace whose
 // tmux pane is currently live, with its state + assigned task, so
 // users see exactly what's about to be torn down. Cancel is default
 // focus — this is a guard against accidental confirmation, so the
@@ -804,7 +804,7 @@ fn run_quit_project_confirm<B: ratatui::backend::Backend>(
     project: &str,
     keymaps: &Keymaps,
 ) -> Result<bool> {
-    let workers = super::quit_project::list_active_workers(project);
+    let workspaces = super::quit_project::list_active_workspaces(project);
     let opener_close = keymaps
         .global
         .first_chord_for(GlobalAction::OpenPalette)
@@ -812,7 +812,7 @@ fn run_quit_project_confirm<B: ratatui::backend::Backend>(
     let mut focus_quit = false;
 
     loop {
-        term.draw(|f| render_quit_project_confirm(f, project, &workers, focus_quit))?;
+        term.draw(|f| render_quit_project_confirm(f, project, &workspaces, focus_quit))?;
 
         if event::poll(Duration::from_millis(150))? {
             if let Event::Key(k) = event::read()? {
@@ -872,7 +872,7 @@ fn render_quit_shelbi_confirm(
 
     let body = Paragraph::new(
         "This will close all open Shelbi sessions across every project, including any \
-         active workers. In-flight task changes will remain in worker worktrees but \
+         active workspaces. In-flight task changes will remain in workspace worktrees but \
          won't be merged.",
     )
     .style(Style::default().fg(Color::Gray))
@@ -882,7 +882,7 @@ fn render_quit_shelbi_confirm(
     let items: Vec<ListItem> = projects
         .iter()
         .map(|p| {
-            let count_text = format_active_workers(p.active_workers);
+            let count_text = format_active_workspaces(p.active_workspaces);
             ListItem::new(Line::from(vec![
                 Span::raw(format!("  {:<22}  ", p.name)),
                 Span::styled(count_text, Style::default().fg(Color::DarkGray)),
@@ -898,7 +898,7 @@ fn render_quit_shelbi_confirm(
 fn render_quit_project_confirm(
     f: &mut Frame,
     project: &str,
-    workers: &[super::quit_project::ActiveWorker],
+    workspaces: &[super::quit_project::ActiveWorkspace],
     focus_quit: bool,
 ) {
     let area = f.area();
@@ -909,7 +909,7 @@ fn render_quit_project_confirm(
             Constraint::Length(1), // blank
             Constraint::Length(3), // warning body (wraps)
             Constraint::Length(1), // blank
-            Constraint::Min(1),    // worker list / empty state
+            Constraint::Min(1),    // workspace list / empty state
             Constraint::Length(1), // blank
             Constraint::Length(1), // buttons
             Constraint::Length(1), // footer
@@ -923,19 +923,19 @@ fn render_quit_project_confirm(
     f.render_widget(title, layout[0]);
 
     let body = Paragraph::new(
-        "This will close the project session and any worker panes. In-flight \
-         task changes will remain in worker worktrees but won't be merged.",
+        "This will close the project session and any workspace panes. In-flight \
+         task changes will remain in workspace worktrees but won't be merged.",
     )
     .style(Style::default().fg(Color::Gray))
     .wrap(Wrap { trim: true });
     f.render_widget(body, layout[2]);
 
-    if workers.is_empty() {
+    if workspaces.is_empty() {
         let empty =
-            Paragraph::new("No active workers.").style(Style::default().fg(Color::DarkGray));
+            Paragraph::new("No active workspaces.").style(Style::default().fg(Color::DarkGray));
         f.render_widget(empty, layout[4]);
     } else {
-        let items: Vec<ListItem> = workers
+        let items: Vec<ListItem> = workspaces
             .iter()
             .map(|w| {
                 ListItem::new(Line::from(vec![
@@ -994,14 +994,14 @@ fn render_confirm_footer(f: &mut Frame, area: Rect) {
     f.render_widget(footer, area);
 }
 
-/// Per-project worker-count suffix shown in the Quit Shelbi popover.
-/// Singular/plural distinction kept so `1 active worker` reads
-/// naturally — matches how `picker.rs` formats machine/worker counts.
-fn format_active_workers(n: usize) -> String {
+/// Per-project workspace-count suffix shown in the Quit Shelbi popover.
+/// Singular/plural distinction kept so `1 active workspace` reads
+/// naturally — matches how `picker.rs` formats machine/workspace counts.
+fn format_active_workspaces(n: usize) -> String {
     match n {
-        0 => "(no active workers)".to_string(),
-        1 => "(1 active worker)".to_string(),
-        n => format!("({n} active workers)"),
+        0 => "(no active workspaces)".to_string(),
+        1 => "(1 active workspace)".to_string(),
+        n => format!("({n} active workspaces)"),
     }
 }
 
@@ -1050,14 +1050,14 @@ mod tests {
 
     #[test]
     fn build_entries_places_zen_toggle_directly_after_view_block() {
-        // A fresh `App` (no `refresh`) carries empty worker / review / agent
+        // A fresh `App` (no `refresh`) carries empty workspace / review / agent
         // lists, so `rows()` is just the three nav entries — perfect for
         // pinning the inline-actions order without touching the disk.
         let app = App::new_sidebar("demo");
         let entries = build_entries(&app, ZenModeState::Off, ZenToggleChord::AltZ);
         let ids: Vec<&str> = entries.iter().map(|e| e.id.as_str()).collect();
         // View block first (Chat/Tasks/Activity), then the mode toggle,
-        // then the global actions trail. Workers/reviews/agents are
+        // then the global actions trail. Workspaces/reviews/agents are
         // empty in this fixture so they don't appear.
         assert_eq!(
             ids,
@@ -1074,11 +1074,11 @@ mod tests {
     }
 
     #[test]
-    fn format_active_workers_handles_zero_one_and_many() {
-        assert_eq!(format_active_workers(0), "(no active workers)");
-        assert_eq!(format_active_workers(1), "(1 active worker)");
-        assert_eq!(format_active_workers(2), "(2 active workers)");
-        assert_eq!(format_active_workers(11), "(11 active workers)");
+    fn format_active_workspaces_handles_zero_one_and_many() {
+        assert_eq!(format_active_workspaces(0), "(no active workspaces)");
+        assert_eq!(format_active_workspaces(1), "(1 active workspace)");
+        assert_eq!(format_active_workspaces(2), "(2 active workspaces)");
+        assert_eq!(format_active_workspaces(11), "(11 active workspaces)");
     }
 
     #[test]

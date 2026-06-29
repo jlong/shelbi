@@ -1,6 +1,6 @@
-//! `shelbi worker <subcommand>` — manage the project's declared worker
-//! pool. Workers are durable slots (one worktree each); tasks come and go.
-//! See [`shelbi_orchestrator::worker`] for the lifecycle primitives.
+//! `shelbi workspace <subcommand>` — manage the project's declared workspace
+//! pool. Workspaces are durable slots (one worktree each); tasks come and go.
+//! See [`shelbi_orchestrator::workspace`] for the lifecycle primitives.
 
 use std::fs;
 
@@ -8,69 +8,69 @@ use anyhow::{anyhow, Result};
 use chrono::{DateTime, Utc};
 use clap::Subcommand;
 use shelbi_core::Column;
-use shelbi_orchestrator::worker as orch_worker;
-use shelbi_state::WorkerStatus;
+use shelbi_orchestrator::workspace as orch_workspace;
+use shelbi_state::WorkspaceStatus;
 
 use super::require_project;
 
 #[derive(Debug, Subcommand)]
-pub enum WorkerCmd {
-    /// List declared workers, their machine/runner, current task (if any),
+pub enum WorkspaceCmd {
+    /// List declared workspaces, their machine/runner, current task (if any),
     /// and whether their tmux pane is live.
     List,
-    /// Kill a worker's tmux pane. Releases the worker's in-flight task back
+    /// Kill a workspace's tmux pane. Releases the workspace's in-flight task back
     /// to `todo` (unassigned) so the board doesn't show an orphaned
     /// in_progress card; pass `--keep-task` to leave the task in place.
     Stop {
         name: String,
         /// Leave the in-flight task in `in_progress` with `assigned_to`
-        /// pointing at this worker. Use when you're about to restart the
-        /// worker on the same task and don't want the card to move.
+        /// pointing at this workspace. Use when you're about to restart the
+        /// workspace on the same task and don't want the card to move.
         #[arg(long)]
         keep_task: bool,
     },
-    /// Show observed worker state from the hub-side poller. Reads
-    /// `~/.shelbi/workers/<name>/status.yaml` files, no tmux probing.
+    /// Show observed workspace state from the hub-side poller. Reads
+    /// `~/.shelbi/workspaces/<name>/status.yaml` files, no tmux probing.
     /// With NAME, prints a single row + the raw status.yaml.
     Status {
-        /// Worker to inspect. Omit to show every declared worker.
+        /// Workspace to inspect. Omit to show every declared workspace.
         name: Option<String>,
     },
 }
 
-pub fn run(project_opt: Option<String>, cmd: WorkerCmd) -> Result<()> {
+pub fn run(project_opt: Option<String>, cmd: WorkspaceCmd) -> Result<()> {
     let project = require_project(project_opt)?;
     match cmd {
-        WorkerCmd::List => list(&project),
-        WorkerCmd::Stop { name, keep_task } => stop(&project, &name, keep_task),
-        WorkerCmd::Status { name } => status(&project, name.as_deref()),
+        WorkspaceCmd::List => list(&project),
+        WorkspaceCmd::Stop { name, keep_task } => stop(&project, &name, keep_task),
+        WorkspaceCmd::Status { name } => status(&project, name.as_deref()),
     }
 }
 
 fn list(project: &str) -> Result<()> {
     let p = shelbi_state::load_project(project).map_err(|e| anyhow!(e))?;
-    if p.workers.is_empty() {
-        println!("(no workers declared in {project} — add a `workers:` block to the project YAML)");
+    if p.workspaces.is_empty() {
+        println!("(no workspaces declared in {project} — add a `workspaces:` block to the project YAML)");
         return Ok(());
     }
 
-    // Build a {worker -> task_id} index from in-progress tasks. There
-    // should be at most one in-progress task per worker, but if shelbi's
+    // Build a {workspace -> task_id} index from in-progress tasks. There
+    // should be at most one in-progress task per workspace, but if shelbi's
     // state diverged we surface all of them so the user can see the mess.
     let in_progress = shelbi_state::list_column(project, Column::InProgress)
         .map_err(|e| anyhow!(e))?;
 
-    for worker in &p.workers {
+    for workspace in &p.workspaces {
         let machine = p
-            .machine(&worker.machine)
-            .ok_or_else(|| anyhow!("worker `{}` references unknown machine `{}`", worker.name, worker.machine))?;
+            .machine(&workspace.machine)
+            .ok_or_else(|| anyhow!("workspace `{}` references unknown machine `{}`", workspace.name, workspace.machine))?;
         let host = machine.host();
-        let addr = orch_worker::worker_tmux_addr(&p, worker).map_err(|e| anyhow!(e))?;
-        let alive = orch_worker::worker_pane_alive(&host, &addr).unwrap_or(false);
+        let addr = orch_workspace::workspace_tmux_addr(&p, workspace).map_err(|e| anyhow!(e))?;
+        let alive = orch_workspace::workspace_pane_alive(&host, &addr).unwrap_or(false);
 
         let mine: Vec<&str> = in_progress
             .iter()
-            .filter(|tf| tf.task.assigned_to.as_deref() == Some(worker.name.as_str()))
+            .filter(|tf| tf.task.assigned_to.as_deref() == Some(workspace.name.as_str()))
             .map(|tf| tf.task.id.as_str())
             .collect();
 
@@ -82,7 +82,7 @@ fn list(project: &str) -> Result<()> {
         };
         println!(
             "{pane_state} {:<12} {:<8} {:<8} {}",
-            worker.name, worker.machine, worker.runner, task_summary
+            workspace.name, workspace.machine, workspace.runner, task_summary
         );
     }
     Ok(())
@@ -90,10 +90,10 @@ fn list(project: &str) -> Result<()> {
 
 fn stop(project: &str, name: &str, keep_task: bool) -> Result<()> {
     let p = shelbi_state::load_project(project).map_err(|e| anyhow!(e))?;
-    let worker = p.worker(name).ok_or_else(|| {
+    let workspace = p.workspace(name).ok_or_else(|| {
         anyhow!(
-            "worker `{name}` not declared in project `{project}` (known: {})",
-            p.workers
+            "workspace `{name}` not declared in project `{project}` (known: {})",
+            p.workspaces
                 .iter()
                 .map(|w| w.name.as_str())
                 .collect::<Vec<_>>()
@@ -101,18 +101,18 @@ fn stop(project: &str, name: &str, keep_task: bool) -> Result<()> {
         )
     })?;
     let machine = p
-        .machine(&worker.machine)
-        .ok_or_else(|| anyhow!("worker references unknown machine `{}`", worker.machine))?;
+        .machine(&workspace.machine)
+        .ok_or_else(|| anyhow!("workspace references unknown machine `{}`", workspace.machine))?;
     let host = machine.host();
-    let addr = orch_worker::worker_tmux_addr(&p, worker).map_err(|e| anyhow!(e))?;
-    orch_worker::kill_worker_pane(&host, &addr).map_err(|e| anyhow!(e))?;
+    let addr = orch_workspace::workspace_tmux_addr(&p, workspace).map_err(|e| anyhow!(e))?;
+    orch_workspace::kill_workspace_pane(&host, &addr).map_err(|e| anyhow!(e))?;
     println!("✓ {name} pane stopped");
 
     if keep_task {
         return Ok(());
     }
 
-    for id in release_worker_tasks(project, name)? {
+    for id in release_workspace_tasks(project, name)? {
         println!("✓ {id} released → todo (was assigned to {name})");
     }
     Ok(())
@@ -122,10 +122,10 @@ fn status(project: &str, name: Option<&str>) -> Result<()> {
     let p = shelbi_state::load_project(project).map_err(|e| anyhow!(e))?;
 
     if let Some(only) = name {
-        if p.worker(only).is_none() {
+        if p.workspace(only).is_none() {
             return Err(anyhow!(
-                "worker `{only}` not declared in project `{project}` (known: {})",
-                p.workers
+                "workspace `{only}` not declared in project `{project}` (known: {})",
+                p.workspaces
                     .iter()
                     .map(|w| w.name.as_str())
                     .collect::<Vec<_>>()
@@ -134,7 +134,7 @@ fn status(project: &str, name: Option<&str>) -> Result<()> {
         }
         print_status_table(&[only.to_string()])?;
         println!();
-        let path = shelbi_state::worker_status_path(only).map_err(|e| anyhow!(e))?;
+        let path = shelbi_state::workspace_status_path(only).map_err(|e| anyhow!(e))?;
         if path.exists() {
             let yaml = fs::read_to_string(&path)
                 .map_err(|e| anyhow!("reading {}: {e}", path.display()))?;
@@ -144,16 +144,16 @@ fn status(project: &str, name: Option<&str>) -> Result<()> {
                 println!();
             }
         } else {
-            println!("(no status.yaml yet — worker hasn't been polled)");
+            println!("(no status.yaml yet — workspace hasn't been polled)");
         }
         return Ok(());
     }
 
-    if p.workers.is_empty() {
-        println!("(no workers declared in {project})");
+    if p.workspaces.is_empty() {
+        println!("(no workspaces declared in {project})");
         return Ok(());
     }
-    let names: Vec<String> = p.workers.iter().map(|w| w.name.clone()).collect();
+    let names: Vec<String> = p.workspaces.iter().map(|w| w.name.clone()).collect();
     print_status_table(&names)
 }
 
@@ -161,14 +161,14 @@ fn print_status_table(names: &[String]) -> Result<()> {
     let now = Utc::now();
     println!(
         "{:<12} {:<24} {:<14} {:<12} IN STATE",
-        "WORKER", "TASK", "STATE", "LAST SEEN"
+        "WORKSPACE", "TASK", "STATE", "LAST SEEN"
     );
     for name in names {
-        let row = shelbi_state::load_worker_status(name).map_err(|e| anyhow!(e))?;
+        let row = shelbi_state::load_workspace_status(name).map_err(|e| anyhow!(e))?;
         match row {
             Some(s) => println!(
                 "{:<12} {:<24} {:<14} {:<12} {}",
-                s.worker,
+                s.workspace,
                 task_cell(&s),
                 s.state.as_str(),
                 format_ago(now, s.last_seen),
@@ -183,7 +183,7 @@ fn print_status_table(names: &[String]) -> Result<()> {
     Ok(())
 }
 
-fn task_cell(s: &WorkerStatus) -> String {
+fn task_cell(s: &WorkspaceStatus) -> String {
     s.current_task.clone().unwrap_or_else(|| "(idle)".to_string())
 }
 
@@ -209,16 +209,16 @@ fn format_ago(now: DateTime<Utc>, then: DateTime<Utc>) -> String {
 }
 
 /// Unassign and move-to-todo every in-flight task currently owned by
-/// `worker_name`. Returns the released task ids in the order they were
+/// `workspace_name`. Returns the released task ids in the order they were
 /// processed. There should be at most one, but if state diverged we
 /// release them all so the board doesn't keep dangling cards pointing at
 /// a dead pane.
-fn release_worker_tasks(project: &str, worker_name: &str) -> Result<Vec<String>> {
+fn release_workspace_tasks(project: &str, workspace_name: &str) -> Result<Vec<String>> {
     let in_progress = shelbi_state::list_column(project, Column::InProgress)
         .map_err(|e| anyhow!(e))?;
     let mut released = Vec::new();
     for tf in in_progress {
-        if tf.task.assigned_to.as_deref() != Some(worker_name) {
+        if tf.task.assigned_to.as_deref() != Some(workspace_name) {
             continue;
         }
         let id = tf.task.id.clone();
@@ -233,7 +233,7 @@ fn release_worker_tasks(project: &str, worker_name: &str) -> Result<Vec<String>>
             .map_err(|e| anyhow!(e))?;
         if let Some((from, to, workflow)) = moved {
             if let Err(e) =
-                shelbi_state::append_task_event(&id, &workflow, from, to, "worker:stop")
+                shelbi_state::append_task_event(&id, &workflow, from, to, "workspace:stop")
             {
                 eprintln!("warning: append_task_event failed: {e}");
             }
@@ -252,7 +252,7 @@ mod tests {
 
     fn fresh_home() -> PathBuf {
         let p = std::env::temp_dir().join(format!(
-            "shelbi-cli-worker-test-{}-{}",
+            "shelbi-cli-workspace-test-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -303,7 +303,7 @@ mod tests {
         .unwrap();
         shelbi_state::save_task("p", &make_task("a", Column::Todo, 0, None), "").unwrap();
 
-        let released = release_worker_tasks("p", "alice").unwrap();
+        let released = release_workspace_tasks("p", "alice").unwrap();
         assert_eq!(released, vec!["fix-login"]);
 
         let fix = shelbi_state::load_task("p", "fix-login").unwrap();
@@ -320,7 +320,7 @@ mod tests {
         // After alice's task moves out, in_progress is renumbered 0..N.
         assert_eq!(bob_task.task.priority, 0);
 
-        // The release path emits a `worker:stop` task event so the
+        // The release path emits a `workspace:stop` task event so the
         // orchestrator's events.log tail sees the column return — with the
         // workflow-aware shape from `Plans/workflows.md` §10.
         let log = std::fs::read_to_string(shelbi_state::events_log_path().unwrap()).unwrap();
@@ -338,7 +338,7 @@ mod tests {
             lines[0]
         );
         assert!(
-            lines[0].contains(" reason=worker:stop "),
+            lines[0].contains(" reason=workspace:stop "),
             "line: {}",
             lines[0]
         );
@@ -362,13 +362,13 @@ mod tests {
     }
 
     #[test]
-    fn release_is_noop_when_worker_has_no_in_flight_task() {
+    fn release_is_noop_when_workspace_has_no_in_flight_task() {
         let _g = TEST_LOCK.lock().unwrap();
         let home = fresh_home();
         std::env::set_var("SHELBI_HOME", &home);
         shelbi_state::save_task("p", &make_task("a", Column::Todo, 0, None), "").unwrap();
 
-        let released = release_worker_tasks("p", "alice").unwrap();
+        let released = release_workspace_tasks("p", "alice").unwrap();
         assert!(released.is_empty());
 
         std::env::remove_var("SHELBI_HOME");

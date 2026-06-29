@@ -14,7 +14,7 @@ pub struct Args {
     /// Task id to review.
     pub id: String,
     /// Override the machine to review on. Defaults to the machine of the
-    /// task's assigned worker, or the first local machine otherwise.
+    /// task's assigned workspace, or the first local machine otherwise.
     #[arg(long)]
     pub machine: Option<String>,
 }

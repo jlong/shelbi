@@ -144,9 +144,9 @@ pub fn send_enter(host: &Host, addr: &TmuxAddr) -> Result<()> {
 }
 
 /// Read the pane's current title, with the trailing newline trimmed. The
-/// hub uses this to poll workers for state markers — claude's hooks write
+/// hub uses this to poll workspaces for state markers — claude's hooks write
 /// `shelbi:<state>` to the title via OSC escapes (see
-/// `shelbi-state::default_worker_settings.json.template`), and the parser in
+/// `shelbi-state::default_workspace_settings.json.template`), and the parser in
 /// `shelbi-state` peels the marker back off.
 pub fn pane_title(host: &Host, addr: &TmuxAddr) -> Result<String> {
     let raw = shelbi_ssh::run_capture(
@@ -312,7 +312,7 @@ mod tests {
 
     #[test]
     fn remote_new_session_argv() {
-        // What `new_session` for a remote worker would build under the hood.
+        // What `new_session` for a remote workspace would build under the hood.
         let cmd = shelbi_ssh::build_command(
             &Host::Ssh {
                 host: "m2.local".into(),
@@ -407,7 +407,7 @@ mod tests {
 
     #[test]
     fn remote_pane_title_argv() {
-        // The hub-side worker poll uses display-message + #{pane_title}
+        // The hub-side workspace poll uses display-message + #{pane_title}
         // to read the trailing `shelbi:<state>` marker. Make sure the
         // SSH-routed argv shape stays stable.
         let cmd = shelbi_ssh::build_command(

@@ -20,7 +20,7 @@ mod agent_workspaces;
 mod hub_config;
 pub mod keymap;
 mod user_config;
-mod worker_status;
+mod workspace_status;
 mod workflows;
 
 pub use agent_workspaces::{
@@ -36,12 +36,12 @@ pub use hub_config::{
 pub use user_config::{
     load_user_config, save_user_config, user_config_path, Keymap, UserConfig, ZenToggleChord,
 };
-pub use worker_status::{
+pub use workspace_status::{
     append_contextstore_event, append_dispatch_event, append_heartbeat_event,
-    append_project_event, append_rebase_event, append_task_event, append_worker_event,
-    append_zen_dryrun_event, append_zen_mode_event, events_log_path, load_worker_status,
-    parse_pane_title_marker, parse_pane_title_state, save_worker_status, worker_status_path,
-    workers_dir, PaneMarker, WorkerState, WorkerStatus,
+    append_project_event, append_rebase_event, append_task_event, append_workspace_event,
+    append_zen_dryrun_event, append_zen_mode_event, events_log_path, load_workspace_status,
+    parse_pane_title_marker, parse_pane_title_state, save_workspace_status, workspace_status_path,
+    workspaces_dir, PaneMarker, WorkspaceState, WorkspaceStatus,
 };
 pub use workflows::{list_workflows, load_workflow, workflow_path, workflows_dir};
 
@@ -105,16 +105,16 @@ pub(crate) mod test_lock {
     pub static LOCK: Mutex<()> = Mutex::new(());
 }
 
-/// Default contents of the per-project worker settings template. Lives at
-/// `~/.shelbi/projects/<name>/worker-settings.json.template` after
+/// Default contents of the per-project workspace settings template. Lives at
+/// `~/.shelbi/projects/<name>/workspace-settings.json.template` after
 /// `shelbi init --project <name>` runs. The `.template` suffix is retained
 /// because user-authored templates may still contain
-/// `{{worker_permissions_mode}}` — see [`render_worker_settings`]. The
-/// embedded default no longer needs that placeholder: the worker spawn path
+/// `{{workspace_permissions_mode}}` — see [`render_workspace_settings`]. The
+/// embedded default no longer needs that placeholder: the workspace spawn path
 /// passes `--permission-mode` directly on claude's command line, so the
 /// rendered `settings.json` is purely the title-state hooks.
-pub const DEFAULT_WORKER_SETTINGS_TEMPLATE: &str =
-    include_str!("default_worker_settings.json.template");
+pub const DEFAULT_WORKSPACE_SETTINGS_TEMPLATE: &str =
+    include_str!("default_workspace_settings.json.template");
 
 /// Default shelbi home directory: `~/.shelbi`, overridable via
 /// `$SHELBI_HOME` (useful for tests and sandboxed CI).
@@ -141,36 +141,48 @@ pub fn project_dir(project: &str) -> Result<PathBuf> {
     Ok(projects_dir()?.join(project))
 }
 
-/// Resolve the worker settings template path for a project: the override
-/// in [`Project::worker_settings_template`] (with `~` expansion) if set,
+/// Resolve the workspace settings template path for a project: the override
+/// in [`Project::workspace_settings_template`] (with `~` expansion) if set,
 /// otherwise the default at
-/// `~/.shelbi/projects/<name>/worker-settings.json.template`.
+/// `~/.shelbi/projects/<name>/workspace-settings.json.template`.
 ///
-/// As a one-shot migration, if the legacy `worker-settings.json` (no
+/// As a one-shot migration, if the legacy `workspace-settings.json` (no
 /// `.template` suffix) exists in the project dir and the new path doesn't,
-/// the legacy file is renamed in place — see [`migrate_worker_settings_template`].
-pub fn worker_settings_template_path(project: &Project) -> Result<PathBuf> {
-    if let Some(p) = &project.worker_settings_template {
+/// the legacy file is renamed in place — see [`migrate_workspace_settings_template`].
+pub fn workspace_settings_template_path(project: &Project) -> Result<PathBuf> {
+    if let Some(p) = &project.workspace_settings_template {
         return Ok(expand_tilde(p));
     }
     let dir = project_dir(&project.name)?;
-    migrate_worker_settings_template(&dir);
-    Ok(dir.join("worker-settings.json.template"))
+    migrate_workspace_settings_template(&dir);
+    Ok(dir.join("workspace-settings.json.template"))
 }
 
-/// One-shot rename of a legacy `worker-settings.json` to the new
-/// `.json.template` name. Idempotent: skips when the new file already exists
-/// or the legacy file is missing. Best-effort — any IO error is swallowed
-/// so a permissions hiccup doesn't break worker deploy; the caller will
-/// fall back to [`DEFAULT_WORKER_SETTINGS_TEMPLATE`] just like any other
+/// One-shot rename of a legacy `workspace-settings.json` to the new
+/// `.json.template` name, plus the older `worker-settings.json[.template]`
+/// path that pre-dates the worker→workspace rename. Idempotent: skips
+/// when the new file already exists or the legacy file is missing.
+/// Best-effort — any IO error is swallowed so a permissions hiccup
+/// doesn't break workspace deploy; the caller will fall back to
+/// [`DEFAULT_WORKSPACE_SETTINGS_TEMPLATE`] just like any other
 /// missing-template case.
-fn migrate_worker_settings_template(project_dir: &Path) {
-    let legacy = project_dir.join("worker-settings.json");
-    let renamed = project_dir.join("worker-settings.json.template");
-    if renamed.exists() || !legacy.exists() {
+fn migrate_workspace_settings_template(project_dir: &Path) {
+    let renamed = project_dir.join("workspace-settings.json.template");
+    if renamed.exists() {
         return;
     }
-    let _ = fs::rename(&legacy, &renamed);
+    // Try each legacy name in turn, newest first. First hit wins.
+    for legacy_name in [
+        "workspace-settings.json",
+        "worker-settings.json.template",
+        "worker-settings.json",
+    ] {
+        let legacy = project_dir.join(legacy_name);
+        if legacy.exists() {
+            let _ = fs::rename(&legacy, &renamed);
+            return;
+        }
+    }
 }
 
 /// One-shot migration: write `workflows/default.yaml` into the project's
@@ -194,27 +206,27 @@ fn migrate_default_workflow(project_dir: &Path) {
     let _ = atomic_write(&path, yaml.as_bytes());
 }
 
-/// Render the worker settings JSON for `project`: read the template file
-/// resolved by [`worker_settings_template_path`] (falling back to
-/// [`DEFAULT_WORKER_SETTINGS_TEMPLATE`] when the file is missing — a fresh
+/// Render the workspace settings JSON for `project`: read the template file
+/// resolved by [`workspace_settings_template_path`] (falling back to
+/// [`DEFAULT_WORKSPACE_SETTINGS_TEMPLATE`] when the file is missing — a fresh
 /// project that hasn't run `shelbi init --project` yet) and substitute
-/// `{{worker_permissions_mode}}` with `project.worker_permissions_mode`.
+/// `{{workspace_permissions_mode}}` with `project.workspace_permissions_mode`.
 ///
 /// The placeholder substitution is kept for backward compatibility with
 /// user-authored templates that still reference it. The shipped default no
 /// longer uses the placeholder: claude's permission mode is now passed on
-/// the CLI by the worker spawn path, which is authoritative and immune to
+/// the CLI by the workspace spawn path, which is authoritative and immune to
 /// the settings.json races that motivated this change.
-pub fn render_worker_settings(project: &Project) -> Result<String> {
-    let path = worker_settings_template_path(project)?;
+pub fn render_workspace_settings(project: &Project) -> Result<String> {
+    let path = workspace_settings_template_path(project)?;
     let template = match fs::read_to_string(&path) {
         Ok(s) => s,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            DEFAULT_WORKER_SETTINGS_TEMPLATE.to_string()
+            DEFAULT_WORKSPACE_SETTINGS_TEMPLATE.to_string()
         }
         Err(e) => return Err(shelbi_core::Error::Io(e)),
     };
-    Ok(template.replace("{{worker_permissions_mode}}", &project.worker_permissions_mode))
+    Ok(template.replace("{{workspace_permissions_mode}}", &project.workspace_permissions_mode))
 }
 
 fn expand_tilde(p: &Path) -> PathBuf {
@@ -253,8 +265,9 @@ pub fn ensure_dir(p: &Path) -> Result<()> {
 pub fn load_project(project: &str) -> Result<Project> {
     let p = projects_dir()?.join(format!("{project}.yaml"));
     let text = fs::read_to_string(&p)?;
+    warn_legacy_workers_key(project, &text);
     let mut p: Project = serde_yaml::from_str(&text)?;
-    p.validate_workers()?;
+    p.validate_workspaces()?;
     let repo = p.repo.clone();
     p.detect_shapes(repo);
     // Best-effort: drop workflows/default.yaml into the project directory
@@ -263,6 +276,36 @@ pub fn load_project(project: &str) -> Result<Project> {
         migrate_default_workflow(&dir);
     }
     Ok(p)
+}
+
+/// One-time-per-process stderr nag when a legacy `workers:` top-level key is
+/// observed in a project YAML. Detection is line-prefix only — we scan for
+/// an unindented `workers:` to avoid tripping on nested keys or substrings.
+fn warn_legacy_workers_key(project: &str, yaml: &str) {
+    use std::sync::Mutex;
+    static WARNED: Mutex<Option<HashSet<String>>> = Mutex::new(None);
+
+    let has_legacy = yaml.lines().any(|line| {
+        let stripped = line.trim_end();
+        stripped.starts_with("workers:")
+            && (stripped.len() == "workers:".len()
+                || stripped[("workers:".len())..]
+                    .chars()
+                    .next()
+                    .map(|c| c.is_whitespace())
+                    .unwrap_or(false))
+    });
+    if !has_legacy {
+        return;
+    }
+    let mut guard = WARNED.lock().unwrap();
+    let seen = guard.get_or_insert_with(HashSet::new);
+    if seen.insert(project.to_string()) {
+        eprintln!(
+            "shelbi: project `{project}` uses the legacy `workers:` key; \
+             rename it to `workspaces:` (the alias will be removed in a future release)"
+        );
+    }
 }
 
 pub fn save_project(p: &Project) -> Result<()> {
@@ -296,15 +339,15 @@ pub struct State {
     pub zen_mode: ZenModeState,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub zen_last_crashed_at: Option<DateTime<Utc>>,
-    /// Persisted Kanban worker filter — `None` means "All workers". The
+    /// Persisted Kanban workspace filter — `None` means "All workspaces". The
     /// Tasks TUI restores this on each launch so the user's last view
     /// survives a respawn or project switch.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub worker_filter: Option<String>,
+    pub workspace_filter: Option<String>,
     /// Persisted Kanban workflow filter — `None` means "All workflows"
     /// (All-mode rendering). When set to a workflow name, the board
     /// narrows to that workflow's columns only. Same lifecycle as
-    /// `worker_filter`: written by the dropdown commit path, read on
+    /// `workspace_filter`: written by the dropdown commit path, read on
     /// every refresh.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workflow_filter: Option<String>,
@@ -583,19 +626,19 @@ pub fn set_zen_mode(project: &str, target: ZenModeState, source: &str) -> Result
     Ok(prev)
 }
 
-/// Persist the Kanban worker filter for `project`. `None` clears it
-/// back to "All workers". Reads, mutates, and re-writes `state.json` so
+/// Persist the Kanban workspace filter for `project`. `None` clears it
+/// back to "All workspaces". Reads, mutates, and re-writes `state.json` so
 /// the other fields (Zen mode, crash timestamp) are preserved. No event
 /// log entry — view-state changes are noise in the activity feed.
-pub fn set_worker_filter(project: &str, filter: Option<&str>) -> Result<()> {
+pub fn set_workspace_filter(project: &str, filter: Option<&str>) -> Result<()> {
     let mut state = read_state(project)?;
-    state.worker_filter = filter.map(|s| s.to_string());
+    state.workspace_filter = filter.map(|s| s.to_string());
     write_state(project, &state)
 }
 
 /// Persist the Kanban workflow filter for `project`. `None` clears it
 /// back to "All workflows" (All-mode union rendering). Mirrors
-/// [`set_worker_filter`] — same merge-then-write pattern, no event log
+/// [`set_workspace_filter`] — same merge-then-write pattern, no event log
 /// entry.
 pub fn set_workflow_filter(project: &str, filter: Option<&str>) -> Result<()> {
     let mut state = read_state(project)?;
@@ -1108,10 +1151,10 @@ mod tests {
             agent_runners: runners,
             editor: None,
             github_url: None,
-            workers: vec![],
-            worker_poll_interval_secs: 5,
-            worker_permissions_mode: "auto".into(),
-            worker_settings_template: override_template,
+            workspaces: vec![],
+            workspace_poll_interval_secs: 5,
+            workspace_permissions_mode: "auto".into(),
+            workspace_settings_template: override_template,
             zen: ZenConfig::default(),
             heartbeat: HeartbeatConfig::default(),
             git: GitConfig::default(),
@@ -1121,29 +1164,29 @@ mod tests {
     }
 
     #[test]
-    fn worker_settings_template_path_defaults_under_project_dir() {
+    fn workspace_settings_template_path_defaults_under_project_dir() {
         let _g = TEST_LOCK.lock().unwrap();
         let home = fresh_home();
         std::env::set_var("SHELBI_HOME", &home);
         let p = fixture_project("myapp", None);
-        let path = worker_settings_template_path(&p).unwrap();
+        let path = workspace_settings_template_path(&p).unwrap();
         assert_eq!(
             path,
-            home.join("projects/myapp/worker-settings.json.template")
+            home.join("projects/myapp/workspace-settings.json.template")
         );
         std::env::remove_var("SHELBI_HOME");
     }
 
     #[test]
-    fn worker_settings_template_path_renames_legacy_file_in_project_dir() {
+    fn workspace_settings_template_path_renames_legacy_file_in_project_dir() {
         let _g = TEST_LOCK.lock().unwrap();
         let home = fresh_home();
         std::env::set_var("SHELBI_HOME", &home);
         let p = fixture_project("myapp", None);
-        let legacy = home.join("projects/myapp/worker-settings.json");
+        let legacy = home.join("projects/myapp/workspace-settings.json");
         ensure_dir(legacy.parent().unwrap()).unwrap();
         std::fs::write(&legacy, r#"{"custom":true}"#).unwrap();
-        let path = worker_settings_template_path(&p).unwrap();
+        let path = workspace_settings_template_path(&p).unwrap();
         assert!(!legacy.exists(), "legacy file should be renamed away");
         assert_eq!(
             std::fs::read_to_string(&path).unwrap(),
@@ -1153,18 +1196,18 @@ mod tests {
     }
 
     #[test]
-    fn worker_settings_template_path_leaves_legacy_when_new_already_exists() {
+    fn workspace_settings_template_path_leaves_legacy_when_new_already_exists() {
         let _g = TEST_LOCK.lock().unwrap();
         let home = fresh_home();
         std::env::set_var("SHELBI_HOME", &home);
         let p = fixture_project("myapp", None);
         let dir = home.join("projects/myapp");
         ensure_dir(&dir).unwrap();
-        let legacy = dir.join("worker-settings.json");
-        let renamed = dir.join("worker-settings.json.template");
+        let legacy = dir.join("workspace-settings.json");
+        let renamed = dir.join("workspace-settings.json.template");
         std::fs::write(&legacy, "legacy").unwrap();
         std::fs::write(&renamed, "new").unwrap();
-        let _ = worker_settings_template_path(&p).unwrap();
+        let _ = workspace_settings_template_path(&p).unwrap();
         // Both files survive; we never overwrite the new one.
         assert_eq!(std::fs::read_to_string(&legacy).unwrap(), "legacy");
         assert_eq!(std::fs::read_to_string(&renamed).unwrap(), "new");
@@ -1172,34 +1215,34 @@ mod tests {
     }
 
     #[test]
-    fn worker_settings_template_path_honors_override() {
+    fn workspace_settings_template_path_honors_override() {
         let p = fixture_project("myapp", Some(PathBuf::from("/etc/shelbi/p.json")));
-        let path = worker_settings_template_path(&p).unwrap();
+        let path = workspace_settings_template_path(&p).unwrap();
         assert_eq!(path, PathBuf::from("/etc/shelbi/p.json"));
     }
 
     #[test]
-    fn worker_settings_template_path_expands_tilde_in_override() {
+    fn workspace_settings_template_path_expands_tilde_in_override() {
         let p = fixture_project("myapp", Some(PathBuf::from("~/custom/p.json")));
-        let path = worker_settings_template_path(&p).unwrap();
+        let path = workspace_settings_template_path(&p).unwrap();
         let expected = dirs::home_dir().unwrap().join("custom/p.json");
         assert_eq!(path, expected);
     }
 
     #[test]
-    fn render_worker_settings_uses_embedded_default_when_file_missing() {
+    fn render_workspace_settings_uses_embedded_default_when_file_missing() {
         let _g = TEST_LOCK.lock().unwrap();
         let home = fresh_home();
         std::env::set_var("SHELBI_HOME", &home);
-        // No template at ~/.shelbi/projects/myapp/worker-settings.json.template yet.
+        // No template at ~/.shelbi/projects/myapp/workspace-settings.json.template yet.
         let p = fixture_project("myapp", None);
-        let rendered = render_worker_settings(&p).unwrap();
+        let rendered = render_workspace_settings(&p).unwrap();
         // The default no longer ships a permissions block — claude's
         // permission mode is passed on the CLI by the spawn path now. What
         // the default DOES ship is the title-state hooks the sidebar
         // poller depends on.
         assert!(!rendered.contains("\"permissions\""));
-        assert!(!rendered.contains("{{worker_permissions_mode}}"));
+        assert!(!rendered.contains("{{workspace_permissions_mode}}"));
         assert!(rendered.contains("shelbi:idle"));
         assert!(rendered.contains("shelbi:working"));
         let _: serde_json::Value = serde_json::from_str(&rendered).unwrap();
@@ -1207,52 +1250,52 @@ mod tests {
     }
 
     #[test]
-    fn render_worker_settings_reads_project_template_when_present() {
+    fn render_workspace_settings_reads_project_template_when_present() {
         let _g = TEST_LOCK.lock().unwrap();
         let home = fresh_home();
         std::env::set_var("SHELBI_HOME", &home);
         let p = fixture_project("myapp", None);
-        let tpl_path = worker_settings_template_path(&p).unwrap();
+        let tpl_path = workspace_settings_template_path(&p).unwrap();
         ensure_dir(tpl_path.parent().unwrap()).unwrap();
         std::fs::write(
             &tpl_path,
-            r#"{"permissions":{"defaultMode":"{{worker_permissions_mode}}"},"custom":true}"#,
+            r#"{"permissions":{"defaultMode":"{{workspace_permissions_mode}}"},"custom":true}"#,
         )
         .unwrap();
-        let rendered = render_worker_settings(&p).unwrap();
+        let rendered = render_workspace_settings(&p).unwrap();
         assert!(rendered.contains("\"custom\":true"));
         assert!(rendered.contains("\"defaultMode\":\"auto\""));
         std::env::remove_var("SHELBI_HOME");
     }
 
     #[test]
-    fn render_worker_settings_substitutes_placeholder_in_custom_template() {
+    fn render_workspace_settings_substitutes_placeholder_in_custom_template() {
         // Backward compatibility: user-authored templates that still carry
-        // the {{worker_permissions_mode}} placeholder must continue to be
+        // the {{workspace_permissions_mode}} placeholder must continue to be
         // substituted, even though the shipped default no longer uses it.
         let _g = TEST_LOCK.lock().unwrap();
         let home = fresh_home();
         std::env::set_var("SHELBI_HOME", &home);
         let mut p = fixture_project("myapp", None);
-        p.worker_permissions_mode = "bypassPermissions".into();
-        let tpl_path = worker_settings_template_path(&p).unwrap();
+        p.workspace_permissions_mode = "bypassPermissions".into();
+        let tpl_path = workspace_settings_template_path(&p).unwrap();
         ensure_dir(tpl_path.parent().unwrap()).unwrap();
         std::fs::write(
             &tpl_path,
-            r#"{"permissions":{"defaultMode":"{{worker_permissions_mode}}"}}"#,
+            r#"{"permissions":{"defaultMode":"{{workspace_permissions_mode}}"}}"#,
         )
         .unwrap();
-        let rendered = render_worker_settings(&p).unwrap();
+        let rendered = render_workspace_settings(&p).unwrap();
         assert!(rendered.contains("\"defaultMode\":\"bypassPermissions\""));
         std::env::remove_var("SHELBI_HOME");
     }
 
     #[test]
-    fn default_worker_settings_template_contains_hooks_and_is_valid_json() {
-        let s = DEFAULT_WORKER_SETTINGS_TEMPLATE;
-        // The default no longer carries the {{worker_permissions_mode}}
+    fn default_workspace_settings_template_contains_hooks_and_is_valid_json() {
+        let s = DEFAULT_WORKSPACE_SETTINGS_TEMPLATE;
+        // The default no longer carries the {{workspace_permissions_mode}}
         // placeholder — claude's mode is set on the CLI by the spawn path.
-        assert!(!s.contains("{{worker_permissions_mode}}"));
+        assert!(!s.contains("{{workspace_permissions_mode}}"));
         assert!(!s.contains("defaultMode"));
         assert!(s.contains("Stop"));
         assert!(s.contains("Notification"));
@@ -2035,6 +2078,73 @@ mod tests {
         std::fs::write(&workflow_path, user_yaml).unwrap();
         let _ = load_project("myapp").unwrap();
         assert_eq!(std::fs::read_to_string(&workflow_path).unwrap(), user_yaml);
+        std::env::remove_var("SHELBI_HOME");
+    }
+
+    /// One-release back-compat: a project YAML that still uses the legacy
+    /// `workers:` key parses into `Project::workspaces` via the serde alias.
+    /// New projects emit `workspaces:`; this test guards the inbound path.
+    #[test]
+    fn load_project_accepts_legacy_workers_key_as_workspaces() {
+        let _g = TEST_LOCK.lock().unwrap();
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+        let dir = home.join("projects");
+        std::fs::create_dir_all(&dir).unwrap();
+        let repo = home.join("legacy-repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        let yaml = format!(
+            "name: legacy\n\
+             repo: {}\n\
+             default_branch: main\n\
+             machines:\n\
+             \x20\x20- {{ name: hub, kind: local, work_dir: {} }}\n\
+             orchestrator: {{ runner: claude }}\n\
+             agent_runners:\n\
+             \x20\x20claude: {{ command: claude, flags: [] }}\n\
+             workers:\n\
+             \x20\x20- {{ name: alpha, machine: hub, runner: claude }}\n\
+             \x20\x20- {{ name: bravo, machine: hub, runner: claude }}\n",
+            repo.display(),
+            repo.display(),
+        );
+        std::fs::write(dir.join("legacy.yaml"), yaml).unwrap();
+        let loaded = load_project("legacy").unwrap();
+        assert_eq!(loaded.workspaces.len(), 2);
+        assert_eq!(loaded.workspaces[0].name, "alpha");
+        assert_eq!(loaded.workspaces[1].name, "bravo");
+        std::env::remove_var("SHELBI_HOME");
+    }
+
+    /// New projects: `workspaces:` is the canonical key and parses into
+    /// `Project::workspaces` directly (no alias path).
+    #[test]
+    fn load_project_accepts_new_workspaces_key() {
+        let _g = TEST_LOCK.lock().unwrap();
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+        let dir = home.join("projects");
+        std::fs::create_dir_all(&dir).unwrap();
+        let repo = home.join("modern-repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        let yaml = format!(
+            "name: modern\n\
+             repo: {}\n\
+             default_branch: main\n\
+             machines:\n\
+             \x20\x20- {{ name: hub, kind: local, work_dir: {} }}\n\
+             orchestrator: {{ runner: claude }}\n\
+             agent_runners:\n\
+             \x20\x20claude: {{ command: claude, flags: [] }}\n\
+             workspaces:\n\
+             \x20\x20- {{ name: alpha, machine: hub, runner: claude }}\n",
+            repo.display(),
+            repo.display(),
+        );
+        std::fs::write(dir.join("modern.yaml"), yaml).unwrap();
+        let loaded = load_project("modern").unwrap();
+        assert_eq!(loaded.workspaces.len(), 1);
+        assert_eq!(loaded.workspaces[0].name, "alpha");
         std::env::remove_var("SHELBI_HOME");
     }
 }

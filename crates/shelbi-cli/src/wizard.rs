@@ -17,8 +17,8 @@ use std::process::Command;
 use anyhow::{anyhow, Context, Result};
 use inquire::{Confirm, Select, Text};
 use shelbi_core::{
-    format_bytes_short, recommended_worker_count, total_memory_bytes, validate_agent_id,
-    AgentRunnerSpec, Machine, MachineKind, OrchestratorSpec, Project, WorkerNamePreset, WorkerSpec,
+    format_bytes_short, recommended_workspace_count, total_memory_bytes, validate_agent_id,
+    AgentRunnerSpec, Machine, MachineKind, OrchestratorSpec, Project, WorkspaceNamePreset, WorkspaceSpec,
 };
 
 /// Half-block ASCII banner for the shelbi brand. Reproduced verbatim at
@@ -189,25 +189,25 @@ pub fn setup_one_project() -> Result<()> {
 
     // ---- Agent runner ---------------------------------------------------
     let agent_runner = select(
-        "Agent runner (used by every worker):",
+        "Agent runner (used by every workspace):",
         vec![Runner::Claude, Runner::Codex],
     )?;
 
-    // ---- Worker count ---------------------------------------------------
+    // ---- Workspace count ---------------------------------------------------
     let machine_count = machines.len() as u32;
-    let (recommended, recommendation_hint) = worker_count_recommendation(machine_count);
+    let (recommended, recommendation_hint) = workspace_count_recommendation(machine_count);
     if let Some(hint) = recommendation_hint {
         println!("  ({hint} — configurable later)");
     }
-    let count = prompt_worker_count(recommended)?;
+    let count = prompt_workspace_count(recommended)?;
 
-    // ---- Worker naming preset -------------------------------------------
+    // ---- Workspace naming preset -------------------------------------------
     let preset = select(
-        "Worker naming style:",
+        "Workspace naming style:",
         vec![
-            PresetChoice(WorkerNamePreset::Phonetic),
-            PresetChoice(WorkerNamePreset::Greek),
-            PresetChoice(WorkerNamePreset::ToyStory),
+            PresetChoice(WorkspaceNamePreset::Phonetic),
+            PresetChoice(WorkspaceNamePreset::Greek),
+            PresetChoice(WorkspaceNamePreset::ToyStory),
         ],
     )?
     .0;
@@ -225,8 +225,8 @@ pub fn setup_one_project() -> Result<()> {
     .prompt()
     .context("orchestrator runner select")?;
 
-    // ---- Assemble workers ----------------------------------------------
-    let workers = assign_worker_names(&machines, count, preset)?;
+    // ---- Assemble workspaces ----------------------------------------------
+    let workspaces = assign_workspace_names(&machines, count, preset)?;
 
     // ---- Assemble Project struct ---------------------------------------
     let mut agent_runners = BTreeMap::new();
@@ -256,37 +256,37 @@ pub fn setup_one_project() -> Result<()> {
         agent_runners,
         editor: None,
         github_url,
-        workers,
-        worker_poll_interval_secs: 5,
-        worker_permissions_mode: "auto".into(),
-        worker_settings_template: None,
+        workspaces,
+        workspace_poll_interval_secs: 5,
+        workspace_permissions_mode: "auto".into(),
+        workspace_settings_template: None,
         zen: shelbi_core::ZenConfig::default(),
         heartbeat: shelbi_core::HeartbeatConfig::default(),
         git: shelbi_core::GitConfig::default(),
         contextstore_sync: Vec::new(),
         detected_shapes: Vec::new(),
     };
-    project.validate_workers().map_err(|e| anyhow!(e))?;
+    project.validate_workspaces().map_err(|e| anyhow!(e))?;
 
     // ---- Persist --------------------------------------------------------
     shelbi_state::save_project(&project).map_err(|e| anyhow!(e))?;
 
-    write_worker_settings_template(&name)?;
+    write_workspace_settings_template(&name)?;
     write_project_marker(&PathBuf::from(&repo_path), &name)?;
     let _ = shelbi_state::materialize_default_agents(&name)
         .map_err(|e| anyhow!(e))?;
 
     // ---- Done -----------------------------------------------------------
     let names_csv = project
-        .workers
+        .workspaces
         .iter()
         .map(|w| w.name.as_str())
         .collect::<Vec<_>>()
         .join(", ");
     println!(
-        "✓ Project {} created ({} workers: {}).",
+        "✓ Project {} created ({} workspaces: {}).",
         name,
-        project.workers.len(),
+        project.workspaces.len(),
         names_csv
     );
     Ok(())
@@ -316,9 +316,9 @@ impl Display for Runner {
     }
 }
 
-/// Newtype that gives [`WorkerNamePreset`] a Select-friendly label
+/// Newtype that gives [`WorkspaceNamePreset`] a Select-friendly label
 /// without leaking display formatting into the core crate.
-struct PresetChoice(WorkerNamePreset);
+struct PresetChoice(WorkspaceNamePreset);
 
 impl Display for PresetChoice {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -409,12 +409,12 @@ fn prompt_project_name(default: &str) -> Result<String> {
 /// Hint is `None` when the platform doesn't expose total memory (so the
 /// user gets to pick blind with `1` as the default — same as the
 /// system_memory module's clamp floor).
-fn worker_count_recommendation(machine_count: u32) -> (u32, Option<String>) {
+fn workspace_count_recommendation(machine_count: u32) -> (u32, Option<String>) {
     match total_memory_bytes() {
         Ok(bytes) => {
-            let count = recommended_worker_count(bytes, machine_count);
+            let count = recommended_workspace_count(bytes, machine_count);
             let hint = format!(
-                "memory: {} → recommended {} worker{} per machine",
+                "memory: {} → recommended {} workspace{} per machine",
                 format_bytes_short(bytes),
                 count,
                 if count == 1 { "" } else { "s" }
@@ -425,9 +425,9 @@ fn worker_count_recommendation(machine_count: u32) -> (u32, Option<String>) {
     }
 }
 
-fn prompt_worker_count(default: u32) -> Result<u32> {
+fn prompt_workspace_count(default: u32) -> Result<u32> {
     loop {
-        let raw = text("Worker count per machine:", &default.to_string())?;
+        let raw = text("Workspace count per machine:", &default.to_string())?;
         match raw.trim().parse::<u32>() {
             Ok(n) if n >= 1 => return Ok(n),
             _ => println!("  (expected a positive integer)"),
@@ -435,18 +435,18 @@ fn prompt_worker_count(default: u32) -> Result<u32> {
     }
 }
 
-/// Build the per-machine worker list. Names are taken from `preset` and
+/// Build the per-machine workspace list. Names are taken from `preset` and
 /// laid out machine-by-machine, so the first `count` names go to the
 /// first machine, the next `count` to the second, etc. Falls back to
 /// `<machine>-<index>` once the preset is exhausted.
-fn assign_worker_names(
+fn assign_workspace_names(
     machines: &[Machine],
     count: u32,
-    preset: WorkerNamePreset,
-) -> Result<Vec<WorkerSpec>> {
+    preset: WorkspaceNamePreset,
+) -> Result<Vec<WorkspaceSpec>> {
     let preset_names = preset.names();
     let total = (count as usize) * machines.len();
-    let mut workers = Vec::with_capacity(total);
+    let mut workspaces = Vec::with_capacity(total);
     let mut cursor = 0usize;
     for machine in machines {
         for slot in 0..count {
@@ -457,28 +457,28 @@ fn assign_worker_names(
             } else {
                 format!("{}-{}", machine.name, slot + 1)
             };
-            workers.push(WorkerSpec {
+            workspaces.push(WorkspaceSpec {
                 name,
                 machine: machine.name.clone(),
                 runner: Runner::Claude.id().to_string(),
             });
         }
     }
-    Ok(workers)
+    Ok(workspaces)
 }
 
-/// Drop the per-project worker-settings template at
-/// `~/.shelbi/projects/<name>/worker-settings.json` so the worker deploy
+/// Drop the per-project workspace-settings template at
+/// `~/.shelbi/projects/<name>/workspace-settings.json` so the workspace deploy
 /// step has something to render. Mirrors `shelbi init --project`.
-fn write_worker_settings_template(project: &str) -> Result<()> {
+fn write_workspace_settings_template(project: &str) -> Result<()> {
     let path = shelbi_state::project_dir(project)
         .map_err(|e| anyhow!(e))?
-        .join("worker-settings.json");
+        .join("workspace-settings.json");
     if path.exists() {
         return Ok(());
     }
     shelbi_state::ensure_dir(path.parent().unwrap()).map_err(|e| anyhow!(e))?;
-    std::fs::write(&path, shelbi_state::DEFAULT_WORKER_SETTINGS_TEMPLATE)
+    std::fs::write(&path, shelbi_state::DEFAULT_WORKSPACE_SETTINGS_TEMPLATE)
         .with_context(|| format!("writing {}", path.display()))?;
     Ok(())
 }
@@ -503,20 +503,20 @@ mod tests {
     use super::*;
 
     #[test]
-    fn assign_worker_names_uses_preset_in_order() {
+    fn assign_workspace_names_uses_preset_in_order() {
         let machines = vec![Machine {
             name: "hub".into(),
             kind: MachineKind::Local,
             work_dir: "/tmp".into(),
             host: None,
         }];
-        let workers = assign_worker_names(&machines, 3, WorkerNamePreset::Phonetic).unwrap();
-        let names: Vec<_> = workers.iter().map(|w| w.name.as_str()).collect();
+        let workspaces = assign_workspace_names(&machines, 3, WorkspaceNamePreset::Phonetic).unwrap();
+        let names: Vec<_> = workspaces.iter().map(|w| w.name.as_str()).collect();
         assert_eq!(names, vec!["alpha", "bravo", "charlie"]);
     }
 
     #[test]
-    fn assign_worker_names_spreads_across_machines() {
+    fn assign_workspace_names_spreads_across_machines() {
         let machines = vec![
             Machine {
                 name: "hub".into(),
@@ -531,20 +531,20 @@ mod tests {
                 host: Some("remote".into()),
             },
         ];
-        let workers = assign_worker_names(&machines, 2, WorkerNamePreset::Phonetic).unwrap();
-        assert_eq!(workers.len(), 4);
-        assert_eq!(workers[0].name, "alpha");
-        assert_eq!(workers[0].machine, "hub");
-        assert_eq!(workers[1].name, "bravo");
-        assert_eq!(workers[1].machine, "hub");
-        assert_eq!(workers[2].name, "charlie");
-        assert_eq!(workers[2].machine, "remote");
-        assert_eq!(workers[3].name, "delta");
-        assert_eq!(workers[3].machine, "remote");
+        let workspaces = assign_workspace_names(&machines, 2, WorkspaceNamePreset::Phonetic).unwrap();
+        assert_eq!(workspaces.len(), 4);
+        assert_eq!(workspaces[0].name, "alpha");
+        assert_eq!(workspaces[0].machine, "hub");
+        assert_eq!(workspaces[1].name, "bravo");
+        assert_eq!(workspaces[1].machine, "hub");
+        assert_eq!(workspaces[2].name, "charlie");
+        assert_eq!(workspaces[2].machine, "remote");
+        assert_eq!(workspaces[3].name, "delta");
+        assert_eq!(workspaces[3].machine, "remote");
     }
 
     #[test]
-    fn assign_worker_names_falls_back_when_preset_exhausted() {
+    fn assign_workspace_names_falls_back_when_preset_exhausted() {
         let machines = vec![Machine {
             name: "hub".into(),
             kind: MachineKind::Local,
@@ -552,19 +552,19 @@ mod tests {
             host: None,
         }];
         // Toy Story has 20 names; ask for 22.
-        let workers = assign_worker_names(&machines, 22, WorkerNamePreset::ToyStory).unwrap();
-        assert_eq!(workers.len(), 22);
+        let workspaces = assign_workspace_names(&machines, 22, WorkspaceNamePreset::ToyStory).unwrap();
+        assert_eq!(workspaces.len(), 22);
         // First 20 come from the preset; tail falls back to <machine>-<n>.
-        assert_eq!(workers[0].name, "woody");
-        assert_eq!(workers[20].name, "hub-21");
-        assert_eq!(workers[21].name, "hub-22");
+        assert_eq!(workspaces[0].name, "woody");
+        assert_eq!(workspaces[20].name, "hub-21");
+        assert_eq!(workspaces[21].name, "hub-22");
     }
 
     #[test]
-    fn worker_count_recommendation_returns_hint_when_memory_known() {
+    fn workspace_count_recommendation_returns_hint_when_memory_known() {
         // Either branch is acceptable — the test just pins the shape of
         // the contract so callers can rely on it.
-        let (count, hint) = worker_count_recommendation(1);
+        let (count, hint) = workspace_count_recommendation(1);
         assert!(count >= 1);
         if let Some(h) = hint {
             assert!(h.contains("recommended"));

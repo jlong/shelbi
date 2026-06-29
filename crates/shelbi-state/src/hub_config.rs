@@ -4,7 +4,7 @@
 //! written until something needs persisting (e.g. a launch timestamp).
 //!
 //! ProjectSummary carries the minimum a picker needs (name + repo path +
-//! machine/worker counts + recency) without forcing every caller through
+//! machine/workspace counts + recency) without forcing every caller through
 //! the full Project deserialization at display time.
 
 use std::collections::BTreeMap;
@@ -65,14 +65,14 @@ pub fn touch_project_launched(project: &str) -> Result<()> {
 }
 
 /// What pickers display per project. Counts come straight from the YAML so
-/// a project with no `workers:` reads as 0 — same shape as the CLI's
-/// existing `worker list`.
+/// a project with no `workspaces:` reads as 0 — same shape as the CLI's
+/// existing `workspace list`.
 #[derive(Debug, Clone)]
 pub struct ProjectSummary {
     pub name: String,
     pub repo_path: String,
     pub machine_count: usize,
-    pub worker_count: usize,
+    pub workspace_count: usize,
     pub last_launched: Option<DateTime<Utc>>,
 }
 
@@ -110,7 +110,7 @@ pub fn list_projects() -> Result<Vec<ProjectSummary>> {
             name: project.name.clone(),
             repo_path: project.repo.clone(),
             machine_count: project.machines.len(),
-            worker_count: project.workers.len(),
+            workspace_count: project.workspaces.len(),
             last_launched,
         });
     }
@@ -144,10 +144,10 @@ mod tests {
         p
     }
 
-    fn write_project_yaml(home: &std::path::Path, name: &str, workers: usize) {
+    fn write_project_yaml(home: &std::path::Path, name: &str, workspaces: usize) {
         let dir = home.join("projects");
         fs::create_dir_all(&dir).unwrap();
-        let workers_yaml: String = (0..workers)
+        let workspaces_yaml: String = (0..workspaces)
             .map(|i| format!("  - {{ name: w{i}, machine: hub, runner: claude }}\n"))
             .collect();
         let yaml = format!(
@@ -158,8 +158,8 @@ mod tests {
              orchestrator: {{ runner: claude }}\n\
              agent_runners:\n\
              \x20\x20claude: {{ command: claude, flags: [] }}\n\
-             workers:\n\
-             {workers_yaml}"
+             workspaces:\n\
+             {workspaces_yaml}"
         );
         fs::write(dir.join(format!("{name}.yaml")), yaml).unwrap();
     }
@@ -178,8 +178,8 @@ mod tests {
         let alpha = by_name["alpha"];
         assert_eq!(alpha.repo_path, "/tmp/alpha");
         assert_eq!(alpha.machine_count, 1);
-        assert_eq!(alpha.worker_count, 2);
-        assert_eq!(by_name["beta"].worker_count, 0);
+        assert_eq!(alpha.workspace_count, 2);
+        assert_eq!(by_name["beta"].workspace_count, 0);
         std::env::remove_var("SHELBI_HOME");
     }
 

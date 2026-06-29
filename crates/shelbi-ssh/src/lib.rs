@@ -15,7 +15,7 @@ use shelbi_core::Host;
 /// command. With these set, the first invocation opens a master socket and
 /// subsequent invocations reuse it — turning what would be a ~1s TCP +
 /// TLS + auth handshake into a ~10ms write to a local Unix socket. The
-/// sidebar polls workers every few seconds, so this is the difference
+/// sidebar polls workspaces every few seconds, so this is the difference
 /// between "noticeable lag" and "imperceptible."
 ///
 /// `ControlPath` uses `%C` (a hash of host+user+port) so distinct
@@ -23,9 +23,9 @@ use shelbi_core::Host;
 /// keeps the master alive for 10 minutes after the last client closes,
 /// which spans most idle gaps in a normal session.
 ///
-/// `ConnectTimeout=5` bounds the worst case when a worker host is dead
+/// `ConnectTimeout=5` bounds the worst case when a workspace host is dead
 /// or routed through a slow proxy — the poller spawns one thread per
-/// worker so a hung connect only freezes that worker's thread, but we
+/// workspace so a hung connect only freezes that workspace's thread, but we
 /// still want it to fail fast and try again on the next poll instead of
 /// piling up an OS-level TCP retry sequence (minutes long, by default).
 ///
@@ -35,7 +35,7 @@ use shelbi_core::Host;
 /// works; only interactive fallbacks are suppressed. NB: this does NOT
 /// prevent Tailscale-SSH's web-auth interception — that flow runs
 /// outside the openssh client and ignores BatchMode. Hung Tailscale
-/// auths are bounded by the per-worker thread design instead.
+/// auths are bounded by the per-workspace thread design instead.
 ///
 /// Users with their own `ControlMaster` configuration in `~/.ssh/config`
 /// see our `-o` flags take precedence (command-line `-o` overrides config),
@@ -229,7 +229,7 @@ mod tests {
             .map(|a| a.to_string_lossy().into_owned())
             .collect();
         // Control-master opts ride in front of every SSH invocation so
-        // back-to-back hub→worker commands reuse a single socket.
+        // back-to-back hub→workspace commands reuse a single socket.
         let mut expected: Vec<String> = SSH_CONTROL_OPTS.iter().map(|s| s.to_string()).collect();
         expected.extend(["m2.local", "--", "tmux", "new-session"].map(String::from));
         assert_eq!(args, expected);
