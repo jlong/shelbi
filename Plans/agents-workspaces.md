@@ -252,9 +252,9 @@ Plan position: keep both — let `todo` (and any other "transient ready" statuse
 
 ### 9. CLI surface
 
-Three new commands under `shelbi agent`:
+Four new commands under `shelbi agent`, all in v1:
 
-- **`shelbi agent list`** — prints every agent in the current project's `agents/` directory, columnar: name, status assignments from the workflow (which statuses have `owner: <this-agent>`), skill count, modified-since-default indicator.
+- **`shelbi agent list`** — prints every agent in the current project's `agents/` directory, columnar: name, status assignments from the workflow (which statuses have `agent: <this-agent>`), skill count, modified-since-default indicator.
 
   ```
   AGENT          STATUSES         SKILLS  CUSTOMIZED
@@ -265,9 +265,9 @@ Three new commands under `shelbi agent`:
 
 - **`shelbi agent show <name>`** — prints the agent's `instructions.md` plus a list of its skills with their descriptions. Useful for understanding what an agent does without opening files.
 
-- **`shelbi agent new <name>`** — scaffolds a new agent directory with an empty `instructions.md` (with a documented frontmatter / header), an empty `skills/` dir, and prints a hint about how to bind it to a workflow status (set `owner: <name>` on a status in `workflows/<workflow>.yaml`).
+- **`shelbi agent new <name>`** — scaffolds a new agent directory with an empty `instructions.md` (with a documented frontmatter / header), an empty `skills/` dir, and prints a hint about how to bind it to a workflow status (set `agent: <name>` on a status in `workflows/<workflow>.yaml`).
 
-A fourth, optional: **`shelbi agent edit <name>`** — opens the agent's `instructions.md` in `$EDITOR` (mirrors `shelbi workflow edit` if that exists). Skip in v1 if not needed.
+- **`shelbi agent edit <name>`** — opens the agent's `instructions.md` in `$EDITOR`. Rounds out the `list / show / new / edit` quartet so the natural next step after `list` and `show` is discoverable from `--help` instead of "go find the file."
 
 ### 10. Events + observability
 
