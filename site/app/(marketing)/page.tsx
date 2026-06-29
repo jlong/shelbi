@@ -18,14 +18,14 @@ const pitch = [
   {
     icon: ClipboardDocumentListIcon,
     title: 'Plan tasks',
-    body: 'Add work as cards in a backlog. Promote what is ready into todo, set priorities, and pin tasks to a specific machine or worker when it matters.',
+    body: 'Add work as cards in a backlog. Promote what is ready into todo, set priorities, and pin tasks to a specific machine or workspace when it matters.',
     href: '/docs/getting-started/first-task',
   },
   {
     icon: CpuChipIcon,
-    title: 'Workers do them',
-    body: 'An orchestrator agent watches the board and hands ready tasks to free workers. Each worker holds one task at a time, in its own persistent git worktree, on the machine you assigned.',
-    href: '/docs/concepts/workers',
+    title: 'Workspaces do them',
+    body: 'An orchestrator agent watches the board and hands ready tasks to free workspaces. Each workspace holds one task at a time, in its own persistent git worktree, on the machine you assigned.',
+    href: '/docs/concepts/workspaces',
   },
   {
     icon: CheckCircleIcon,

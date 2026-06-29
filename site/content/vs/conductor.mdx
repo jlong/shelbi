@@ -17,7 +17,7 @@ summary: A native macOS desktop app that wraps git worktrees and the major codin
 | ------------------ | -------------------------------------- | ---------------------------------------- |
 | Form factor        | Terminal Kanban TUI + tmux panes       | Native macOS desktop app                 |
 | Platforms          | macOS, Linux, remote over SSH          | macOS only (Windows on waitlist)         |
-| Concurrency model  | Fixed pool of named persistent workers | Ephemeral workspace per task             |
+| Concurrency model  | Fixed pool of named, persistent workspaces | Ephemeral workspace spawned per task |
 | Where work runs    | Hub + any SSH-reachable machine        | Single Mac, locally                      |
 | Worktrees          | Persistent, pre-warmed, branch-switched | Created and disposed per task           |
 | Scheduler          | A Claude agent reading `CLAUDE.md`     | In-app dispatcher (v0.63)                |
@@ -27,39 +27,40 @@ summary: A native macOS desktop app that wraps git worktrees and the major codin
 
 ## Where Shelbi excels
 
-### A worker pool you size and name, not workspaces you spawn
+### A workspace pool you size and name, not one spawned per task
 
-Conductor's unit is the workspace — ⌘N spins up a fresh worktree per task
-and disposes of it on archive. Shelbi declares a *fixed pool of named
-workers* in the project YAML; each one owns a persistent worktree at a
-known path and handles one task at a time. The pool size is the
+Conductor's unit is also called a workspace, but it's ephemeral — ⌘N spins
+up a fresh worktree per task and disposes of it on archive. Shelbi declares
+a *fixed pool of named workspaces* in the project YAML; each one owns a
+persistent worktree at a known path and handles one task at a time. The
+pool size is the
 parallelism cap — no accidental fan-out that outruns your RAM, and no
 `git worktree add` on the hot path. A new task on `bravo` is a branch
 switch in the worktree `bravo` already owns. (See
-[Workers](/docs/concepts/workers).)
+[Workspaces](/docs/concepts/workspaces).)
 
-### Workers across more than one machine
+### Workspaces across more than one machine
 
 Conductor is explicitly single-Mac: every workspace runs on the laptop
 the app is installed on, and if the Mac sleeps, everything freezes.
-Shelbi treats *machine* as a first-class worker property. The pool can
-mix hub-local workers with workers on any SSH-reachable host — a Linux
-devbox, a beefy build server, a teammate's idle machine — and tasks can
-carry a `prefers_machine` hint that the orchestrator honors when it
+Shelbi treats *machine* as a first-class workspace property. The pool can
+mix hub-local workspaces with workspaces on any SSH-reachable host — a
+Linux devbox, a beefy build server, a teammate's idle machine — and tasks
+can carry a `prefers_machine` hint that the orchestrator honors when it
 dispatches. Concretely: route GPU work to your CUDA box, infra changes
 to a hardened Linux runner, and quick edits to the laptop, all from the
 same Kanban board. (See
-[Workers — local vs remote workers](/docs/concepts/workers#local-vs-remote-workers).)
+[Workspaces — local vs. remote workspaces](/docs/concepts/workspaces#local-vs-remote-workspaces).)
 
 ### An orchestration loop you can read and edit
 
 Conductor's dispatcher is a closed-source feature inside a closed-source
 app. Shelbi's orchestrator is *just a Claude session* in a tmux pane,
-loaded with a `CLAUDE.md` you can read in the repo and override per
-project by dropping an `ORCHESTRATOR.md` at
-`~/.shelbi/projects/<name>/ORCHESTRATOR.md`. Want it to auto-merge a
-specific authorized loop? Edit the prompt. Want a different routing
-rule? Edit the prompt. The scheduler is text. (See
+loaded from a plain-text agent prompt you edit per project at
+`~/.shelbi/projects/<name>/agents/orchestrator/instructions.md` (with
+project-wide context in `agents/_shared/preamble.md`). Want it to
+auto-merge a specific authorized loop? Edit the prompt. Want a different
+routing rule? Edit the prompt. The scheduler is text. (See
 [Orchestrator — customizing the prompt](/docs/concepts/orchestrator#customizing-the-prompt-per-project).)
 
 ### A plain-text protocol, not a UI
@@ -67,20 +68,21 @@ rule? Edit the prompt. The scheduler is text. (See
 Conductor's workflow is mediated by the sidebar — clicks, contextual
 action prompts, in-app diff. Shelbi's wire format is two files anyone
 can `tail` or `grep`: an append-only events log at
-`~/.shelbi/events.log` with one line per state change, and a per-worker
-review-ready marker the hub poller watches. The worker never runs a
-`shelbi` command — `printf '%s\n' <task-id> > .claude/shelbi-review-ready`
-is the entire on-worker protocol. That is how a remote worker can ship
-with nothing installed but `tmux`, `git`, and an agent CLI. (See
+`~/.shelbi/events.log` with one line per state change, and a
+per-workspace review-ready marker the hub poller watches. The workspace
+never runs a `shelbi` command —
+`printf '%s\n' <task-id> > .claude/shelbi-review-ready` is the entire
+on-workspace protocol. That is how a remote workspace can ship with
+nothing installed but `tmux`, `git`, and an agent CLI. (See
 [The events log](/docs/concepts/events-log) and
-[Workers — how a task completes](/docs/concepts/workers#how-a-task-completes).)
+[Workspaces — how a task completes](/docs/concepts/workspaces#how-a-task-completes).)
 
 ### A review column that exists on purpose
 
 Conductor's default loop is workspace → diff → PR → merge → archive,
 with the user moving through contextual actions. Shelbi makes "ready for
 human review" its own column. The hub poller promotes a card to `review`
-the moment the worker writes its marker; the sidebar's *Ready for
+the moment the workspace writes its marker; the sidebar's *Ready for
 Review* list mirrors it; `shelbi review <id>` checks the branch into a
 dedicated review pane with a fresh Claude window pointed at the diff.
 `review → done` is *yours* — the orchestrator does not make that move
@@ -104,7 +106,7 @@ Conductor speaks Claude Code, Codex, *and* Cursor through a single model
 picker, with custom routing through Amazon Bedrock and Google Vertex for
 enterprise Claude traffic. You can A/B the same task on Claude and Codex
 in adjacent workspaces and compare diffs. Shelbi runs whatever CLI a
-worker is configured for; mixing providers per task isn't its native
+workspace is configured for; mixing providers per task isn't its native
 shape.
 
 ### First-class GitHub and Linear integration
@@ -124,7 +126,7 @@ five live previews open at once, that's a real ergonomic win.
 
 ## Choose Shelbi if…
 
-- Your team has workers on more than one machine, or you want work to
+- Your team has workspaces on more than one machine, or you want work to
   survive a laptop reboot or SSH drop.
 - You want the scheduler to be code you can read and override per
   project.
@@ -143,4 +145,4 @@ five live previews open at once, that's a real ergonomic win.
 - Tight GitHub-PR and Linear-issue integration is load-bearing for your
   team's workflow.
 - You'd rather pay nothing for the app and bring your existing Claude or
-  Codex subscription than configure a worker pool yourself.
+  Codex subscription than configure a workspace pool yourself.

@@ -1,7 +1,7 @@
 ---
 title: Orchestrator
-order: 12
-summary: One agent in window 1 you talk to — it dispatches tasks to workers, tails the events log, and reports back. You are the priority-setter; it is the scheduler.
+order: 13
+summary: One agent in window 1 you talk to — it dispatches tasks to workspaces, tails the events log, and reports back. You are the priority-setter; it is the scheduler.
 ---
 
 The orchestrator is the agent you talk to. It lives in window 1 of the
@@ -9,10 +9,17 @@ project's tmux session (`shelbi-<project>:dashboard`), runs whatever
 runner the project declares (typically `claude`), and treats the
 `shelbi` CLI as its tool surface — the same CLI you use yourself.
 
+It is a [**named agent**](/docs/concepts/agents) like any other —
+`agents/orchestrator/` — with an editable `instructions.md` for its system
+prompt. What makes it special is only *where* it runs: window 1, talking to
+you, rather than in a [workspace](/docs/concepts/workspaces) picking up
+tasks. The `developer`, `qa`, and `security-review` agents run inside
+workspaces; the orchestrator runs the board.
+
 The mental model is: **you are the priority-setter and reviewer. It is
 the scheduler.** It does not edit code, it does not accept reviews, it
 does not promote backlog items on its own. It turns natural-language
-requests into Kanban cards, picks free workers, and reports progress
+requests into Kanban cards, picks free workspaces, and reports progress
 back.
 
 ## You-are-the-scheduler
@@ -20,10 +27,10 @@ back.
 A useful contrast: a generic chatbot waits to be asked. The orchestrator
 does not. As soon as a task lands in the `ready` category (`todo` in the
 default workflow), that is the start signal — the orchestrator's job is
-to find a free worker, route the task to them, and tell you it did. When
-a worker hands off (its task moves into the `handoff` category — `review`
-in the default workflow), the orchestrator's job is to give that worker
-the next ready task without waiting to be prompted.
+to find a free workspace, route the task to it, and tell you it did. When
+a workspace hands off (its task moves into the `handoff` category —
+`review` in the default workflow), the orchestrator's job is to give that
+workspace the next ready task without waiting to be prompted.
 
 This is what makes the loop feel continuous. You drop work into the
 backlog, triage what's ready, and review what comes back. Everything in
@@ -42,7 +49,7 @@ names:
 | Category   | What it means                                                        | Default workflow status |
 | ---------- | -------------------------------------------------------------------- | ----------------------- |
 | `backlog`  | Not yet ready for work — triage stage.                               | `backlog`               |
-| `ready`    | Queued for whoever owns it next (typically a worker).                | `todo`                  |
+| `ready`    | Queued for whoever owns it next (typically a workspace).             | `todo`                  |
 | `active`   | Owner is working on it now.                                          | `in_progress`           |
 | `handoff`  | One owner finished their part; another's input is required next.    | `review`                |
 | `done`     | Terminal — accepted by the user.                                     | `done`                  |
@@ -64,37 +71,38 @@ log](/docs/concepts/events-log#task-transitions)).
 ## How the prompt is wired
 
 The shape of the orchestrator's responsibility — the bootstrap flow,
-the category-keyed reaction rules, the dispatch contract — is encoded
-in a prompt file shipped with Shelbi. The orchestrator is *just claude*
-(or whatever runner you configured) with that prompt loaded as a system
-prompt.
+the category-keyed reaction rules, the dispatch contract — is encoded in
+the orchestrator agent's `instructions.md`. Like every
+[agent](/docs/concepts/agents), its rendered prompt is its
+`agents/_shared/preamble.md` (project-wide context) followed by its own
+`agents/orchestrator/instructions.md`. The orchestrator is *just claude*
+(or whatever runner you configured) with that prompt loaded.
 
 When you boot a project (`shelbi orchestrate` or via the TUI launcher),
 `ensure_dashboard()` does the following:
 
-1. Resolves the active **system prompt** for this project — see
-   [customizing the prompt](#customizing-the-prompt-per-project) below.
+1. Resolves the orchestrator agent's prompt — `_shared/preamble.md`
+   prepended to `agents/orchestrator/instructions.md` (see
+   [customizing the prompt](#customizing-the-prompt-per-project) below).
 2. Substitutes `{{assistant_name}}` with the name you set in the wizard
    (from `~/.shelbi/shelbi.yaml`, defaulting to `Orchestrator`).
-3. Writes the rendered prompt to
-   `~/.shelbi/projects/<name>/CLAUDE.md`.
+3. Writes the rendered prompt to the launch directory's `CLAUDE.md`.
 4. Launches the orchestrator runner in the right pane of the
    `dashboard` window, with that path as its working directory.
 
 That working-directory choice is the entire wiring trick. The runner
-(claude) auto-loads `CLAUDE.md` from its `cwd`, so dropping the
-rendered template at `~/.shelbi/projects/<name>/CLAUDE.md` and
-launching claude there is enough — no flags, no env vars, no MCP
-servers. The orchestrator starts with the full prompt in context and
-the `shelbi` CLI on its PATH.
+(claude) auto-loads `CLAUDE.md` from its `cwd`, so rendering the
+orchestrator agent's prompt to a `CLAUDE.md` in the launch directory and
+launching claude there is enough — no flags, no env vars, no MCP servers.
+The orchestrator starts with the full prompt in context and the `shelbi`
+CLI on its PATH. Note the split: the *source* you edit is
+`instructions.md`; `CLAUDE.md` is a rendered build artifact, not a file
+you maintain by hand (see [the CLAUDE.md note](#claudemd-is-now-a-build-artifact)).
 
-Defined in `crates/shelbi-orchestrator/src/lib.rs`:
-
-- `DEFAULT_SYSTEM_PROMPT` (line 22) — the embedded template.
-- `system_prompt(project)` (line 71) — resolves project override vs
-  default, substitutes placeholders.
-- `ensure_dashboard(project)` (line 221) — writes the rendered
-  `CLAUDE.md` and launches the runner in that directory.
+Orchestrator window setup lives in
+`crates/shelbi-orchestrator/src/lib.rs` — `ensure_dashboard(project)`
+resolves the agent prompt, renders it, and launches the runner in that
+directory.
 
 ## Bootstrap flow on session start
 
@@ -106,40 +114,41 @@ the user:
    priorities, `assigned_to`, and any `prefers_machine` hints on each
    card. Each status belongs to one of the five categories above; the
    orchestrator maps column → category from the active workflow.
-2. **Read the worker pool.** `shelbi worker list` to see which workers
-   are free (no `active`-category task assigned) and which machine each
-   lives on.
+2. **Read the workspace pool.** `shelbi workspace list` to see which
+   workspaces are free (no `active`-category task assigned), which machine
+   each lives on, and which agent each is running.
 3. **Start tailing.** Launch `shelbi events tail --follow` in the
    background and watch it. Every emitted line is a trigger the
    orchestrator must consider.
 
 After that, the in-memory snapshot is kept up to date from the event
-stream — the orchestrator only re-runs `worker list` / `task list` if
+stream — the orchestrator only re-runs `workspace list` / `task list` if
 the tail process dies and it has to rebuild.
 
 The reaction rules pattern-match the **category** tokens on each task
 event line, not the literal `<from> -> <to>` status pair. That's what
 keeps these rules correct under a workflow that renames or splits
-statuses:
+statuses (the `worker=` token on workspace lines is retained for
+backward compatibility):
 
 - `task=<id> ... to_category=ready reason=user:*` → find a free eligible
-  worker, dispatch.
+  workspace, dispatch.
 - `task=<id> ... to_category=handoff reason=worker:review-marker` →
-  that worker is now free, find them the next ready task.
-- `worker=<name> working -> awaiting_input` → same idea, worker just
-  freed up.
+  that workspace is now free, find it the next ready task.
+- `worker=<name> working -> awaiting_input` → same idea, the workspace
+  just freed up.
 - `worker=<name> pane_alive=false` → surface to the user; don't
   auto-restart.
 - `project=<name> heartbeat` → no state change to react to, but the
   watch is awake — a good time to re-check `active`-category tasks for
-  stuck workers or missed markers. See
+  stuck workspaces or missed markers. See
   [heartbeats](/docs/concepts/events-log#heartbeats) for the cadence
   config and rationale; tune it via the `heartbeat` key in
   `project.yaml`.
 
-When dispatching, the orchestrator picks free eligible workers in the
+When dispatching, the orchestrator picks free eligible workspaces in the
 order they're declared in the project YAML, honoring `prefers_machine`
-hints. If a task names a machine and no worker on that machine is free,
+hints. If a task names a machine and no workspace on that machine is free,
 it stays in the `ready` category rather than getting routed to the wrong
 host.
 
@@ -150,27 +159,44 @@ what the orchestrator is supposed to do.
 
 ## Customizing the prompt per project
 
-Two places to edit:
+The orchestrator is a [project-local agent with shipped defaults](/docs/concepts/agents#customizing-an-agent),
+so customizing it is the same as customizing any other agent — edit a file:
 
-- **Per-project override:** drop an `ORCHESTRATOR.md` file at
-  `~/.shelbi/projects/<name>/ORCHESTRATOR.md`. When present, this file
-  replaces the bundled default entirely. `{{assistant_name}}` is still
-  substituted, and you can use it anywhere in your override.
-- **Global default:** edit
-  `crates/shelbi-orchestrator/src/default_orchestrator.md.template` and
-  rebuild. This is the right place for shipped-with-Shelbi changes.
+- **Per-project prompt:** edit
+  `~/.shelbi/projects/<name>/agents/orchestrator/instructions.md`. This is
+  the orchestrator's system prompt; Shelbi seeds it with the shipped default
+  on first load and never clobbers your edits on upgrade.
+  `{{assistant_name}}` is substituted anywhere you use it. Or run
+  `shelbi agent edit orchestrator`.
+- **Project-wide context:** put anything that should apply to *every* agent
+  — repo layout, house style, the test command — in
+  `~/.shelbi/projects/<name>/agents/_shared/preamble.md`. It's prepended to
+  the orchestrator's prompt (and every other agent's), so you write it once
+  instead of pasting it into four `instructions.md` files.
+- **Shipped default:** the bundled orchestrator prompt lives in the
+  `shelbi-orchestrator` crate. That's the right place for
+  shipped-with-Shelbi changes; edit it and rebuild.
 
-`system_prompt(project)` reads the override if it exists, otherwise
-returns the default — see `crates/shelbi-orchestrator/src/lib.rs:71`.
-The rendered output is rewritten to
-`~/.shelbi/projects/<name>/CLAUDE.md` on every `ensure_dashboard` call,
-so your changes take effect the next time the dashboard is
-bootstrapped (or `shelbi reload`d).
+The rendered output (preamble + instructions, with `{{assistant_name}}`
+substituted) is rewritten to the launch directory's `CLAUDE.md` on every
+`ensure_dashboard` call, so your edits take effect the next time the
+dashboard is bootstrapped (or `shelbi reload`d).
 
-A few things worth keeping when you fork the default:
+### CLAUDE.md is now a build artifact
+
+Earlier versions had you edit an `ORCHESTRATOR.md` override and treated
+`~/.shelbi/projects/<name>/CLAUDE.md` as the source of the prompt. That's
+deprecated. The *source* is now `agents/orchestrator/instructions.md` plus
+`agents/_shared/preamble.md`; the `CLAUDE.md` Shelbi writes is a rendered
+artifact for the runner to auto-load — don't hand-edit it, your changes are
+overwritten on the next render. If you have content in an old `CLAUDE.md`,
+move the project-wide parts into `_shared/preamble.md` and the
+orchestrator-specific parts into `agents/orchestrator/instructions.md`.
+
+A few things worth keeping when you fork the default prompt:
 
 - The bootstrap flow. The orchestrator needs the initial `task list` /
-  `worker list` snapshot and the tail process to do its job.
+  `workspace list` snapshot and the tail process to do its job.
 - The **category-based** reaction-rule matching. Patterns key off
   `to_category=<c>` (`ready`, `handoff`) rather than the literal status
   pair, so the rules survive workflow customization. Hardcoding default-
@@ -197,14 +223,15 @@ What you might *want* to change per project:
 
 ## What the orchestrator does not do
 
-- **It does not edit code.** Workers do that.
+- **It does not edit code.** The `developer` (and other workspace) agents
+  do that.
 - **It does not move tasks into the `done` category.** That's your
   accept signal.
 - **It does not auto-promote `backlog` → `ready`.** Triage belongs to
   the user.
-- **It does not restart a worker whose pane died.** It surfaces the
+- **It does not restart a workspace whose pane died.** It surfaces the
   death and waits for direction.
-- **It does not stop workers without asking.**
+- **It does not stop workspaces without asking.**
 
 These are guardrails encoded in the prompt itself. They're worth
 calling out because the temptation when watching a fast loop is to let
@@ -219,13 +246,17 @@ autonomy switch. It flips the agent from scheduler to lead: it
 auto-promotes `backlog`-category tasks into `ready` when it judges the
 work in scope, and it lands finished branches past a project-defined
 confidence bar without waiting on a human reviewer. The policy that
-decides "in scope" lives in the same prompt template described above —
-you tune it by editing prose, not code.
+decides "in scope" lives in the orchestrator agent's `instructions.md`
+described above — you tune it by editing prose, not code. Whether a given
+status is automated and which agent handles it is separate, and lives in
+the [workflow YAML](/docs/concepts/workflows#owners-and-agents).
 
 ## See also
 
-- [Workers](/docs/concepts/workers) — what the orchestrator dispatches
-  tasks to.
+- [Agents](/docs/concepts/agents) — the orchestrator is one; this is how
+  its prompt, skills, and customization work.
+- [Workspaces](/docs/concepts/workspaces) — what the orchestrator
+  dispatches tasks to.
 - [Workflows](/docs/concepts/workflows) — the schema behind the board,
   including the full category set and the events-log annotations the
   orchestrator pattern-matches on.

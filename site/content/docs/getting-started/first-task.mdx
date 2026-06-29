@@ -1,13 +1,13 @@
 ---
 title: Run your first task
 order: 3
-summary: Open the TUI, add a task, watch a worker pick it up, and review the diff.
+summary: Open the TUI, add a task, watch a workspace pick it up, and review the diff.
 ---
 
 A task moves through five columns: **Backlog → Todo → In Progress →
 Review → Done**. You drive the ends — what lands in the backlog and
 what gets accepted out of review. The orchestrator drives the middle —
-as soon as a card hits todo it picks a free worker and starts them on
+as soon as a card hits todo it picks a free workspace and starts them on
 it.
 
 ## Open the TUI
@@ -30,14 +30,14 @@ shelbi -p myapp
 ```
 
 The TUI is two panes. A borderless sidebar on the left lists the project
-name, the nav (Chat, Tasks), your declared workers, and any tasks
+name, the nav (Chat, Tasks), your declared workspaces, and any tasks
 waiting on review. The right pane is a real tmux pane — the orchestrator
 agent by default, or one of the built-in views (Chat / Tasks / Machines
 / Review) when you switch.
 
 `Ctrl+P` opens a fuzzy command palette as a tmux popup. Use it to
-switch projects, jump to a worker pane, or swap the right pane to
-another view. `Enter` on a sidebar row activates it — focus a worker,
+switch projects, jump to a workspace pane, or swap the right pane to
+another view. `Enter` on a sidebar row activates it — focus a workspace,
 open a review, switch to the Tasks board.
 
 ## Add a task
@@ -86,7 +86,7 @@ shelbi task add "Fix login bug" \
 - `--depends-on` — repeat for multiple dependencies. The orchestrator
   skips a todo card until everything it depends on is in `done`.
 - `--prefers-machine` — soft hint; the orchestrator routes to a free
-  worker on that machine when one's available.
+  workspace on that machine when one's available.
 
 ### Via the kanban view
 
@@ -116,13 +116,13 @@ asking the orchestrator to:
 you: promote fix-login-bug-on-safari.
 
 Orchestrator: ✓ moved to todo. dispatched to delta.
-                worker: delta
+                workspace: delta
                 branch: shelbi/fix-login-bug-on-safari
 ```
 
 The orchestrator reacts to the move on the event log
-(`~/.shelbi/events.log`). It scans the worker pool, picks the first
-free worker in YAML declaration order (honoring `prefers_machine` if
+(`~/.shelbi/events.log`). It scans the workspace pool, picks the first
+free workspace in YAML declaration order (honoring `prefers_machine` if
 set), and runs:
 
 ```bash
@@ -130,14 +130,14 @@ shelbi task start fix-login-bug-on-safari --worker delta
 ```
 
 That moves the card to **In Progress**, creates the branch
-`shelbi/fix-login-bug-on-safari` in the worker's worktree, and feeds
-the task prompt into the worker's agent CLI. The sidebar badge next to
+`shelbi/fix-login-bug-on-safari` in the workspace's worktree, and feeds
+the task prompt into the workspace's agent CLI. The sidebar badge next to
 `delta` flips from `·` (idle) to `⏵` (working).
 
-Jump in any time. `Enter` on the worker's sidebar row drops you straight
+Jump in any time. `Enter` on the workspace's sidebar row drops you straight
 into its pane to watch the run live.
 
-| Badge | Worker state |
+| Badge | Workspace state |
 |---|---|
 | `·` | idle — no task assigned |
 | `⏵` | working — agent actively running a turn |
@@ -145,11 +145,11 @@ into its pane to watch the run live.
 | `⚠` | awaiting permission — showing a permission dialog |
 | `✓` | review-ready — task moved to the review column |
 
-## Review the worker's branch
+## Review the workspace's branch
 
-When the worker finishes, it writes a review-ready marker into its
+When the workspace finishes, it writes a review-ready marker into its
 worktree. The hub poller picks it up on the next tick, moves the card
-into **Review**, and the worker's badge flips to `✓`. The sidebar's
+into **Review**, and the workspace's badge flips to `✓`. The sidebar's
 *Ready for Review* list grows a row:
 
 ```
@@ -171,7 +171,7 @@ task ran on a remote but you want to review locally.
 
 The review pane is a fresh agent session in the checked-out worktree —
 ask it to walk you through the diff, run tests, or explain a tricky
-hunk. Nothing about the worker's run is locked in yet; you can ask for
+hunk. Nothing about the workspace's run is locked in yet; you can ask for
 edits and have them committed onto the same branch.
 
 ## Accept the task
@@ -198,24 +198,24 @@ in the kanban view from **Review**, or:
 shelbi task move fix-login-bug-on-safari --to done
 ```
 
-The worker is already free at that point (the review handoff flipped
+The workspace is already free at that point (the review handoff flipped
 its badge back) and the orchestrator dispatches it to the next ready
 todo card on its own.
 
 ## What just happened
 
-You added a task, promoted it, watched a worker pick it up, reviewed
+You added a task, promoted it, watched a workspace pick it up, reviewed
 the result, and merged it. The same loop — backlog → todo → in progress
 → review → done — is the whole product surface. Everything else is
-volume: more tasks at once, more workers, more machines.
+volume: more tasks at once, more workspaces, more machines.
 
 ## Next
 
 The rest of getting-started walks the same loop at increasing levels
 of autonomy:
 
-- [Run a multi-worker dispatch loop](/docs/getting-started/multi-worker)
-  — fill the backlog with a stack of work and watch every worker in
+- [Run a multi-workspace dispatch loop](/docs/getting-started/multi-workspace)
+  — fill the backlog with a stack of work and watch every workspace in
   your pool run in parallel without you touching the dispatcher.
 - [Enable Zen Mode](/docs/getting-started/enable-zen-mode) — flip the
   orchestrator from scheduler to lead. It auto-promotes eligible
@@ -228,6 +228,6 @@ of autonomy:
 
 For deeper reference any time:
 
-- The **Concepts** docs for the full mental model of workers,
+- The **Concepts** docs for the full mental model of workspaces,
   columns, the events log, and the orchestrator.
 - The **CLI reference** for every flag on every `shelbi` subcommand.

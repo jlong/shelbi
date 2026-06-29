@@ -1,0 +1,125 @@
+---
+title: Agents
+order: 11
+summary: An agent is a role — a system prompt plus a skill set — not the task it's handed or the slot it runs in. Shelbi ships four (orchestrator, developer, QA, security review); each is a directory you can edit per project.
+---
+
+An **agent** is a *role*: a system prompt plus a set of skills. It is the
+"who" of a piece of work — the orchestrator that schedules, the developer
+that writes the code, the reviewer that checks it. An agent is deliberately
+*not* the task it's handed, and *not* the slot it runs in. Those are separate
+things:
+
+- The **task** is the work — a markdown card with a prompt and a branch.
+- The **[workspace](/docs/concepts/workspaces)** is the capacity — a tmux
+  pane plus a git worktree on some machine.
+- The **agent** is the role — the prompt and skills that decide *how* the
+  work gets done.
+
+Splitting these apart is what lets the same workspace run a developer agent
+on one task and a QA agent on the next, and what lets a
+[workflow](/docs/concepts/workflows#owners-and-agents) say "this status is reviewed by
+the security agent" as a line of YAML rather than a paragraph of prompt prose.
+
+## The four shipped agents
+
+Every project ships with four agents out of the box. They cover the full
+loop — schedule, build, check, sign off — and they're the defaults the
+generic machinery wires up unless you say otherwise.
+
+| Agent | Role |
+| --- | --- |
+| `orchestrator` | The agent you talk to. Turns requests into cards, dispatches tasks to free workspaces, tails the events log, reports back. Runs in window 1, never in a workspace. See [Orchestrator](/docs/concepts/orchestrator). |
+| `developer` | The default workspace agent. Implements a task on its branch, runs the project's checks, writes the review-ready marker. This is the agent an `agent`-owned status uses when no other is named. |
+| `qa` | A reviewer role. Exercises a finished branch against acceptance criteria before it reaches a human — useful as the agent on a `handoff`-category status. |
+| `security-review` | A focused reviewer for sensitive diffs — auth, migrations, install scripts. Pair it with a status (or a danger-path-heavy workflow) where an extra adversarial pass is worth the latency. |
+
+`developer` is the one that runs most often. The other three are the seams
+where you customize the loop: who schedules, who reviews, who signs off.
+
+## Where agents live on disk
+
+An agent is a directory under the project's Shelbi config:
+
+```text
+~/.shelbi/projects/<project>/agents/
+├── _shared/
+│   └── preamble.md          # project-wide context, prepended to every agent
+├── orchestrator/
+│   └── instructions.md      # the orchestrator's system prompt
+├── developer/
+│   ├── instructions.md      # the developer agent's system prompt
+│   └── skills/              # agent-scoped skills (optional)
+├── qa/
+│   └── instructions.md
+└── security-review/
+    └── instructions.md
+```
+
+Each agent has at minimum an `instructions.md` — its system prompt. It may
+also carry a `skills/` directory of agent-scoped skills the runner loads when
+that agent is active. The `_shared/preamble.md` file is special: its contents
+are prepended to *every* agent's instructions, so project-wide context (the
+repo layout, the house style, the test command) lives in one place instead of
+being copy-pasted into four prompts.
+
+When a task is dispatched, the agent named for that status (or `developer` by
+default) has its rendered prompt — `_shared/preamble.md` followed by the
+agent's own `instructions.md` — handed to the runner in the workspace. The
+[orchestrator's own prompt](/docs/concepts/orchestrator#how-the-prompt-is-wired)
+is rendered the same way; it's just the agent that happens to run in window 1.
+
+## Customizing an agent
+
+Agents are **project-local with shipped defaults**. The first time a project
+loads, Shelbi materializes the four default agents into the directory above.
+From then on they're yours to edit — change `developer/instructions.md` to
+bake in your repo's conventions, drop a skill into `qa/skills/`, tighten the
+`security-review` prompt to your threat model.
+
+The defaults are *seeded, not enforced*. On upgrade, Shelbi only writes an
+agent file that doesn't already exist — it never clobbers a file you've
+edited. New shipped agents (or new skills) show up; your customizations stay
+put. If you want to reset an agent to the current default, delete its
+`instructions.md` and reload.
+
+Edit an agent by hand, or through the CLI:
+
+```bash
+shelbi agent list                 # the four (plus any you've added)
+shelbi agent show developer       # print the resolved prompt
+shelbi agent edit developer       # open instructions.md in $EDITOR
+shelbi agent new reviewer         # scaffold a fifth agent
+```
+
+See the [`shelbi agent`](/docs/cli/agent) reference for the full quartet.
+
+## Assigning an agent to work
+
+You rarely assign an agent to a task directly. Instead, a
+[workflow](/docs/concepts/workflows#owners-and-agents) status declares who owns it:
+
+```yaml
+statuses:
+  - { name: Todo,       category: ready,   owner: agent                  }
+  - { name: InProgress, category: active,  owner: agent                  }
+  - { name: Review,     category: handoff, owner: agent, agent: qa       }
+  - { name: Done,       category: done,    owner: user                   }
+```
+
+`owner: agent` makes a status the orchestrator's to act on; the optional
+`agent:` field names *which* agent does it. Omit `agent:` and the
+`developer` agent is used. The `Review` status above is auto-reviewed by the
+`qa` agent before a human ever sees it — that's the whole "a reviewer is a
+role you can drop on a status" idea, expressed declaratively. See
+[owners](/docs/concepts/workflows#owners-and-agents) for the rules.
+
+## See also
+
+- [Workspaces](/docs/concepts/workspaces) — the capacity an agent runs in,
+  and the agent/workspace split (role vs. slot).
+- [Workflows](/docs/concepts/workflows#owners-and-agents) — the `owner` + `agent`
+  fields that route work to a named agent.
+- [Orchestrator](/docs/concepts/orchestrator) — the agent in window 1, and
+  how its prompt is wired.
+- [`shelbi agent`](/docs/cli/agent) — list, show, scaffold, and edit agents.

@@ -1,6 +1,6 @@
 ---
 title: Zen Mode
-order: 14
+order: 15
 summary: Hands-off autonomy — the orchestrator triages backlog, runs the high-confidence merge bar, and lands work without waiting on you. You stay in the loop for anything ambiguous.
 ---
 
@@ -13,7 +13,7 @@ orchestrator decides it can't judge.
 
 The mental model is **lead vs. scheduler**. Zen on, the agent makes
 calls; you redirect when you disagree. Zen off (the default), the
-agent waits to be told. Same prompt, same workers, same board — the
+agent waits to be told. Same prompt, same workspaces, same board — the
 only thing that changes is who initiates.
 
 ## Turning it on
@@ -27,7 +27,7 @@ Three ways to flip the switch:
   timestamp (if any), and the count of in-flight Zen tasks.
 
 When Zen is **on**, the sidebar shows a green **ZEN ON** pill anchored
-to the bottom of the workers column. That pill is the at-a-glance
+to the bottom of the workspaces column. That pill is the at-a-glance
 "the agent is in lead mode" signal — if it's not there, Zen is off or
 paused.
 
@@ -56,7 +56,7 @@ Zen Mode does exactly two things the default scheduler doesn't:
    (below). If everything passes, the branch lands on its target and
    the task moves to the transition's `to` status — typically `done`
    — without a human stop.
-2. **Auto-promote** — when a worker frees up, Zen scans the backlog
+2. **Auto-promote** — when a workspace frees up, Zen scans the backlog
    for tasks that are *mechanically eligible* (see
    [`shelbi zen scan`](/docs/cli/zen#scan)) and then applies the
    **judgment categories** from the orchestrator's prompt to decide
@@ -65,6 +65,36 @@ Zen Mode does exactly two things the default scheduler doesn't:
 The mechanical layer is in Rust. The judgment layer is in the
 orchestrator's prompt — which means **you own it** and can tune it
 per project. That's the most important point on this page.
+
+## Per-status automation is declarative
+
+Zen's *judgment* — which backlog items are in scope, where the confidence
+bar sits — is prompt prose, covered below. But the more basic question of
+**which statuses the orchestrator is allowed to act on, and which agent it
+uses**, is no longer prompt prose at all. It's the
+[`owner` and `agent` fields](/docs/concepts/workflows#owners-and-agents) on
+each workflow status.
+
+This is what changed. Behaviors that used to be paragraphs in the
+orchestrator's prompt are now lines of YAML:
+
+- **"Auto-merge but don't auto-promote."** Make the merge-bearing handoff
+  status `owner: agent`, but leave `Backlog` as `owner: user`. The
+  orchestrator lands finished work autonomously while your triage queue
+  stays yours. Previously this was a carve-out you wrote into the prompt;
+  now it's two `owner:` values.
+- **"Review with QA before a human signs off."** Give the `Review` status
+  `owner: agent, agent: qa`. The [`qa` agent](/docs/concepts/agents) runs
+  the review pass automatically; a downstream `owner: user` status holds
+  the final accept. Which agent reviews is data, not a prompt instruction.
+
+Flipping Zen on/off still gates whether the orchestrator *exercises* this
+autonomy at all. But once Zen is on, the workflow YAML — not the prompt —
+decides per status whether the orchestrator acts and which agent it loads.
+The prompt is left to hold only the genuinely judgment-shaped policy: scope
+and the confidence bar. See
+[owners and agents](/docs/concepts/workflows#owners-and-agents) for the
+field semantics and the four validation rules.
 
 ## The high-confidence bar
 
@@ -442,7 +472,7 @@ lines for this pattern and calls it out in its first reply.
 
 Zen-driven events get distinct visual treatment in the sidebar's
 activity feed: a small **ZEN** avatar badge in the same column the
-per-worker avatars use, and a subtle dark-tinted row background so
+per-workspace avatars use, and a subtle dark-tinted row background so
 machine-driven actions are visually separable from user actions in
 the same stream.
 

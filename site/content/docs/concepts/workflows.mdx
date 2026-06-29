@@ -67,9 +67,9 @@ else is optional. A workflow without `transitions:` is a pure
 bookkeeping workflow — no git side-effects fire on any move.
 
 Validation runs at load time and catches duplicate status names,
-`initial_status` pointing at nothing, and transition edges referencing
-undeclared statuses. The error message names the workflow and the bad
-field.
+`initial_status` pointing at nothing, transition edges referencing
+undeclared statuses, and the [`owner`/`agent` rules](#validation-rules)
+covered below. The error message names the workflow and the bad field.
 
 ## Status categories
 
@@ -105,21 +105,84 @@ The category for each status appears on every events log line so
 consumers can match on the semantic without looking up the workflow.
 See [events log line shape](/docs/concepts/events-log#task-transitions).
 
-## Owners
+## Owners and agents
 
-Each status declares `owner: user | agent`:
+Each status declares two things about who handles it — one required, one
+optional:
 
-- **`agent`** — the orchestrator is the next mover. Tasks sitting in
-  an `agent`-owned `ready` status are eligible for auto-dispatch onto
-  a free worker.
-- **`user`** — the orchestrator does not dispatch. The task waits for
-  you to move it. Surfaced in the activity feed so you know your
-  attention is requested.
+```yaml
+statuses:
+  - { name: Todo,       category: ready,   owner: agent                   }
+  - { name: InProgress, category: active,  owner: agent                   }
+  - { name: Review,     category: handoff, owner: agent, agent: qa        }
+  - { name: Signoff,    category: handoff, owner: user                    }
+  - { name: Done,       category: done,    owner: user                    }
+```
 
-There's no third "either" — a status is either work for a worker or
-work for a human. If you want to grab an agent-owned task by hand,
-reassign it through the normal CLI/TUI; that's an action, not a schema
-field.
+**`owner: user | agent`** — *who* the next mover is:
+
+- **`agent`** — the orchestrator is the next mover. Tasks sitting in an
+  `agent`-owned `ready` status are eligible for auto-dispatch onto a free
+  [workspace](/docs/concepts/workspaces).
+- **`user`** — the orchestrator does not act. The task waits for you to
+  move it, surfaced in the activity feed so you know your attention is
+  requested.
+
+There's no third "either" — a status is either work the orchestrator will
+pick up or work that waits for a human. If you want to grab an agent-owned
+task by hand, reassign it through the normal CLI/TUI; that's an action, not
+a schema field.
+
+**`agent: <agent-name>`** — *which* [agent](/docs/concepts/agents) role does
+the work, when `owner: agent`. Omit it and the `developer` agent runs. Name
+one — `qa`, `security-review`, or any agent you've authored — and the
+orchestrator loads *that* role into the workspace it dispatches to. The
+`Review` status above is auto-handled by the `qa` agent before any human is
+involved; that's how "this status is reviewed by QA" becomes a line of YAML
+instead of a paragraph of orchestrator prompt.
+
+### Validation rules
+
+The loader enforces four rules on the `owner`/`agent` pair, failing the
+load with a message that names the workflow and status:
+
+1. **`owner` is `user` or `agent`.** No other value parses, and a missing
+   `owner` is an error too — there's no implicit default.
+2. **`agent:` requires `owner: agent`.** Naming an agent on a
+   `user`-owned status is a contradiction (a human is the mover, not an
+   agent) and is rejected.
+3. **A named `agent:` must exist.** The value has to match an agent
+   directory under `agents/` (see
+   [Agents](/docs/concepts/agents#where-agents-live-on-disk)). A typo fails
+   the load and the error lists the known agent names.
+4. **`agent: orchestrator` is not allowed**, and an `agent`-owned status
+   with `agent:` omitted defaults to `developer`. The orchestrator runs in
+   window 1, never inside a workspace, so it can't be the agent for a
+   workspace-dispatched status; the default workspace agent is `developer`.
+
+### Zen as declarative data
+
+Because the `owner`/`agent` pair lives in the workflow YAML, *per-status
+automation is data, not prompt prose*. Whether the orchestrator acts at a
+given edge is the `owner` field; which agent it uses is the `agent` field.
+That turns choices that used to be buried in the orchestrator's prompt into
+a YAML edit:
+
+- **"Auto-merge but don't auto-promote."** Keep `Backlog` as
+  `owner: user` (you still triage), but make the merge-bearing handoff
+  status `owner: agent`. The orchestrator lands finished work without
+  touching your triage queue — no prompt surgery.
+- **"Review with QA, sign off by hand."** Split the handoff into a
+  `Review` status (`owner: agent, agent: qa`) and a `Signoff` status
+  (`owner: user`), as in the example above. The QA pass is automated; the
+  final accept stays human.
+
+The [judgment policy](/docs/concepts/zen-mode#the-judgment-layer) — *which*
+backlog items are in scope to promote, and the confidence bar a merge must
+clear — still lives in the orchestrator's prompt, because it's a judgment
+call. But the structural "is this status automated, and by whom" question is
+now answered declaratively in the workflow. See
+[Zen Mode](/docs/concepts/zen-mode#per-status-automation-is-declarative).
 
 ## Transitions
 
@@ -138,11 +201,11 @@ run.
 | `open_pr`       | Open a PR. Base is `transition.target` if set, else the workflow's resolved `base_branch`, else the parent task's branch when `depends_on` is set. No-op if a PR is already open.                     |
 | `merge`         | Merge the task's branch with the effective `merge_strategy`. Via `gh pr merge` when a PR is open; via local `git merge` on the hub otherwise. v1 strategies: `squash`, `merge`.                       |
 | `close_pr`      | Close any open PR without merging.                                                                                                                                                                    |
-| `delete_branch` | Delete the local + remote branch. Skipped if a worker still has the branch checked out — that worktree replaces the branch on its next dispatch.                                                      |
-| `restack`       | Rebase the task's branch onto its parent task's current branch. Fires automatically on dependent tasks when a parent's `merge` completes (see [`depends_on`](#dependent-tasks-with-depends-on)).      |
+| `delete_branch` | Delete the local + remote branch. Skipped if a workspace still has the branch checked out — that worktree replaces the branch on its next dispatch.                                                   |
+| `restack`       | Rebase the task's branch onto its parent task's current branch. Fires automatically on dependent tasks when a parent's `merge` completes (see [`depends_on`](#dependent-tasks-with-depends_on)).      |
 
 All actions are **hub-side** and idempotent. The orchestrator (or the
-CLI) on the hub machine runs them; workers never invoke actions
+CLI) on the hub machine runs them; workspaces never invoke actions
 directly.
 
 The canonical default workflow's transitions, written out:
@@ -419,15 +482,15 @@ default workflow legible at a glance:
   what's worth doing now, and in what order. Order within `Todo` is
   your priority list; the orchestrator dispatches from the top.
 - **`Todo → InProgress` — orchestrator.** As soon as a card sits in
-  `Todo` (or a worker frees up), the orchestrator routes it to a
-  free worker. This is the auto-dispatch loop. A task is **blocked**
-  and skipped while any id in [`depends_on:`](#dependent-tasks-with-depends-on)
+  `Todo` (or a workspace frees up), the orchestrator routes it to a
+  free workspace. This is the auto-dispatch loop. A task is **blocked**
+  and skipped while any id in [`depends_on:`](#dependent-tasks-with-depends_on)
   is not yet in a `done`-category status — the Kanban shows blocked
   cards with a `🔒` badge.
 - **`InProgress → Review` — hub poller.** Promoted automatically the
-  moment the worker writes its review-ready marker (see
+  moment the workspace writes its review-ready marker (see
   [next subsection](#review-marker-promotion)). No `shelbi` command
-  on the worker, no orchestrator participation.
+  on the workspace, no orchestrator participation.
 - **`Review → Done` — you.** Accepting a diff is the moment the human
   signs off on the work. The orchestrator never crosses this edge on
   its own (except under specific multi-task loops the user has
@@ -442,29 +505,29 @@ waits for you.
 ### Review-marker promotion
 
 The `active → handoff` transition (`InProgress → Review` in the
-default workflow) doesn't need any active participant. The worker
+default workflow) doesn't need any active participant. The workspace
 doesn't run a `shelbi` command. The orchestrator doesn't watch the
-worker's pane. Instead:
+workspace's pane. Instead:
 
-1. The worker, when done, writes its task id into
+1. The workspace, when done, writes its task id into
    `<worktree>/.claude/shelbi-review-ready`. This instruction is part
    of the initial prompt every task ships with (see `compose_prompt`
    in `crates/shelbi-orchestrator/src/worker.rs`).
 2. The hub poller `cat`s that file on every tick (locally for hub
-   workers, via SSH for remote ones).
+   workspaces, via SSH for remote ones).
 3. If the file is non-empty and names a task that's in an
-   `active`-category status for this worker, the poller moves the
+   `active`-category status for this workspace, the poller moves the
    task into the next `handoff` status, clears the marker, and
    appends `task=<id> <from> -> <to> reason=worker:review-marker` to
    the events log.
 
 The orchestrator hears about it through its `shelbi events tail
 --follow` feed and dispatches the next ready task to the now-free
-worker.
+workspace.
 
-That this works without the worker holding any Shelbi-specific state
-is the point. The marker is the *entire* on-worker protocol — see the
-[workers concept page](/docs/concepts/workers#how-a-task-completes)
+That this works without the workspace holding any Shelbi-specific state
+is the point. The marker is the *entire* on-workspace protocol — see the
+[workspaces concept page](/docs/concepts/workspaces#how-a-task-completes)
 for the rationale and the [reason strings reference](/docs/concepts/events-log#reason-strings)
 for the full set of tokens.
 
@@ -548,9 +611,10 @@ whole feature into `main`.
 
 ## See also
 
-- [Workers](/docs/concepts/workers) — what's on the receiving end of
-  an `active`-category dispatch, and the review-marker mechanism
-  workers use to hand off.
+- [Workspaces](/docs/concepts/workspaces) — what's on the receiving end
+  of an `active`-category dispatch, and the review-marker mechanism
+  workspaces use to hand off.
+- [Agents](/docs/concepts/agents) — the role the `agent:` field names.
 - [Orchestrator](/docs/concepts/orchestrator) — how
   `ready`-category statuses get dispatched.
 - [The events log](/docs/concepts/events-log#task-transitions) — line
