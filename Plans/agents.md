@@ -51,7 +51,7 @@ The sidebar `Section { label: "Agents" }` becomes `Section { label: "Workspaces"
    ▶ bravo     QA
    · charlie   idle
 ▾ devbox
-   · delta     keybindings-phase-2-platform-aware-help-text   [developer]
+   ▶ delta     keybindings-phase-2-platform-aware-help-text   [developer]
    · echo      idle
    · foxtrot   idle
 ```
