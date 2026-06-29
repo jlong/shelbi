@@ -47,7 +47,7 @@ The sidebar `Section { label: "Agents" }` becomes `Section { label: "Workspaces"
 ```
 - Workspaces -
 ▾ hub
-   · alpha     idle
+    alpha     idle
    · bravo     idle
    · charlie   idle
 ▾ devbox
