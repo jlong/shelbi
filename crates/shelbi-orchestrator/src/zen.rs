@@ -2193,6 +2193,7 @@ mod dry_run_tests {
                     name: (*n).into(),
                     category: *c,
                     owner: shelbi_core::Owner::Agent,
+                    agent: Some("orchestrator".into()),
                 })
                 .collect(),
             initial_status: None,
