@@ -1,5 +1,5 @@
 //! Render the sidebar UI — fills the entire pane (it's the only thing
-//! this process renders; the orchestrator and workers live in other tmux
+//! this process renders; the orchestrator and workspaces live in other tmux
 //! panes / windows).
 
 use ratatui::{
@@ -99,8 +99,8 @@ fn render_row(row: &Row, selected: bool, width: usize) -> ListItem<'static> {
             )]))
         }
         Row::Blank => ListItem::new(Line::raw("")),
-        Row::Worker { name, .. } => {
-            let dec = row.decoration().expect("worker rows always have a decoration");
+        Row::Workspace { name, .. } => {
+            let dec = row.decoration().expect("workspace rows always have a decoration");
             let mut spans = vec![
                 Span::styled(
                     format!("{} ", dec.glyph),
@@ -108,7 +108,7 @@ fn render_row(row: &Row, selected: bool, width: usize) -> ListItem<'static> {
                 ),
                 Span::styled(name.clone(), name_style(selected)),
             ];
-            // No machine badge here — the agents list reflects the worker
+            // No machine badge here — the agents list reflects the workspace
             // pool, not per-row metadata. Machine assignment surfaces on
             // the Machines view.
             if selected {
@@ -116,9 +116,9 @@ fn render_row(row: &Row, selected: bool, width: usize) -> ListItem<'static> {
             }
             ListItem::new(Line::from(spans))
         }
-        Row::Review { title, worker, .. } => {
+        Row::Review { title, workspace, .. } => {
             // Cyan ✓: the task is review-ready, awaiting human action.
-            // Same decoration the palette uses, so worker / review / palette
+            // Same decoration the palette uses, so workspace / review / palette
             // row share one visual vocabulary.
             let dec = row.decoration().expect("review rows always have a decoration");
             let badge = Span::styled(
@@ -126,10 +126,10 @@ fn render_row(row: &Row, selected: bool, width: usize) -> ListItem<'static> {
                 Style::default().fg(decoration_to_color(dec.color)),
             );
             let title_span = Span::styled(title.clone(), name_style(selected));
-            let worker_label = worker.clone().unwrap_or_default();
+            let workspace_label = workspace.clone().unwrap_or_default();
             let line = right_align(
                 vec![badge, title_span],
-                worker_label,
+                workspace_label,
                 Style::default().fg(Color::DarkGray),
                 width,
             );

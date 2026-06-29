@@ -61,18 +61,18 @@ pub fn run(args: Args) -> Result<()> {
 
             let template_path = shelbi_state::project_dir(name)
                 .map_err(|e| anyhow!(e))?
-                .join("worker-settings.json.template");
+                .join("workspace-settings.json.template");
             if template_path.exists() {
                 println!(
-                    "(worker settings template already exists at {})",
+                    "(workspace settings template already exists at {})",
                     template_path.display()
                 );
             } else {
                 shelbi_state::ensure_dir(template_path.parent().unwrap())
                     .map_err(|e| anyhow!(e))?;
-                std::fs::write(&template_path, shelbi_state::DEFAULT_WORKER_SETTINGS_TEMPLATE)?;
+                std::fs::write(&template_path, shelbi_state::DEFAULT_WORKSPACE_SETTINGS_TEMPLATE)?;
                 println!(
-                    "✓ wrote worker settings template: {}",
+                    "✓ wrote workspace settings template: {}",
                     template_path.display()
                 );
             }

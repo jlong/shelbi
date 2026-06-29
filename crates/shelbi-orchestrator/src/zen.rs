@@ -5,7 +5,7 @@
 //! Same shape as the readiness probe primitives: Rust performs the I/O,
 //! the orchestrator's prompt makes the decisions.
 //!
-//! `pr_create` runs against the worker's worktree (the branch lives there
+//! `pr_create` runs against the workspace's worktree (the branch lives there
 //! until it's pushed). `ci_watch` and `pr_merge` run on the project's
 //! first local machine — by convention the hub — because by the time the
 //! orchestrator is watching CI the branch is already on origin and gh is
@@ -25,14 +25,14 @@ use globset::{Glob, GlobSetBuilder};
 use serde::Serialize;
 use shelbi_core::{
     checks_for_task_in_workflow, danger_paths_for_workflow, Column, Error, Host, Machine, Project,
-    Result, StatusCategory, Task, WorkerSpec, Workflow, WorkflowStatus,
+    Result, StatusCategory, Task, WorkspaceSpec, Workflow, WorkflowStatus,
 };
 
 use crate::git::{
-    compose_pr_body, head_commit_subject, locate_hub_workdir, locate_worker_worktree,
+    compose_pr_body, head_commit_subject, locate_hub_workdir, locate_workspace_worktree,
     login_shell_prefix, lookup_open_pr, parse_pr_number_from_url, run_in_dir,
 };
-use crate::worker::worker_worktree;
+use crate::workspace::workspace_worktree;
 
 /// How often `ci_watch` re-runs `gh pr checks` while waiting for the
 /// pending bucket to clear. Matches gh's own `--watch` default.
@@ -82,7 +82,7 @@ pub fn pr_create(
     task: &Task,
     task_body: &str,
 ) -> Result<u64> {
-    let (host, worktree) = locate_worker_worktree(project, task)?;
+    let (host, worktree) = locate_workspace_worktree(project, task)?;
     let wt = worktree.to_string_lossy().into_owned();
     let branch = task
         .branch
@@ -408,9 +408,9 @@ pub struct ProbeReport {
 
 /// Run every primitive for `task` on `branch` and return the report.
 ///
-/// Resolves the worker's worktree (and machine) from `task.assigned_to` —
-/// the probe always operates against the worker that produced the branch,
-/// not against the hub's parent repo. This matters for remote workers: the
+/// Resolves the workspace's worktree (and machine) from `task.assigned_to` —
+/// the probe always operates against the workspace that produced the branch,
+/// not against the hub's parent repo. This matters for remote workspaces: the
 /// branch only exists in the remote worktree's git repo until it's
 /// pushed.
 ///
@@ -437,9 +437,9 @@ pub fn probe_in_workflow(
     task: &Task,
     branch: &str,
 ) -> Result<ProbeReport> {
-    let (machine, worker) = resolve_worker(project, task)?;
+    let (machine, workspace) = resolve_workspace(project, task)?;
     let host = machine.host();
-    let worktree = worker_worktree(&machine, worker);
+    let worktree = workspace_worktree(&machine, workspace);
 
     let base = project.base_branch();
     let merge_conflict = probe_merge_conflict(&host, &worktree, branch, base)?;
@@ -455,27 +455,27 @@ pub fn probe_in_workflow(
     })
 }
 
-fn resolve_worker<'a>(
+fn resolve_workspace<'a>(
     project: &'a Project,
     task: &Task,
-) -> Result<(Machine, &'a WorkerSpec)> {
-    let worker_name = task.assigned_to.as_deref().ok_or_else(|| {
+) -> Result<(Machine, &'a WorkspaceSpec)> {
+    let workspace_name = task.assigned_to.as_deref().ok_or_else(|| {
         Error::Other(format!(
-            "task `{}` has no assigned worker — assign one before probing",
+            "task `{}` has no assigned workspace — assign one before probing",
             task.id
         ))
     })?;
-    let worker = project.worker(worker_name).ok_or_else(|| {
+    let workspace = project.workspace(workspace_name).ok_or_else(|| {
         Error::Other(format!(
-            "worker `{}` (assigned to task `{}`) is not declared in project `{}`",
-            worker_name, task.id, project.name
+            "workspace `{}` (assigned to task `{}`) is not declared in project `{}`",
+            workspace_name, task.id, project.name
         ))
     })?;
     let machine = project
-        .machine(&worker.machine)
-        .ok_or_else(|| Error::UnknownMachine(worker.machine.clone()))?
+        .machine(&workspace.machine)
+        .ok_or_else(|| Error::UnknownMachine(workspace.machine.clone()))?
         .clone();
-    Ok((machine, worker))
+    Ok((machine, workspace))
 }
 
 // ---------------------------------------------------------------------------
@@ -521,8 +521,8 @@ fn probe_local_checks(
 fn ensure_worktree_present(host: &Host, worktree: &std::path::Path) -> Result<()> {
     if matches!(host, Host::Local) && !worktree.exists() {
         return Err(Error::Other(format!(
-            "worker worktree `{}` does not exist on disk — \
-             dispatch the task to its worker before probing, \
+            "workspace worktree `{}` does not exist on disk — \
+             dispatch the task to its workspace before probing, \
              or remove the stale assignment from the task",
             worktree.display()
         )));
@@ -577,7 +577,7 @@ fn run_one_check(host: &Host, worktree: &std::path::Path, cmd: &str) -> LocalChe
 /// The hub process can inherit a stripped-down `PATH` when it's launched
 /// outside the user's terminal — from launchd / Spotlight, or from a
 /// tmux server that itself started in a non-login context — so trusting
-/// the inherited environment isn't enough. Same trick `worker.rs`,
+/// the inherited environment isn't enough. Same trick `workspace.rs`,
 /// `spawn.rs`, and [`run_in_dir`] use to keep agent launches and
 /// `gh`/`git` calls finding the same tools the user sees in their own
 /// terminal — see [`login_shell_prefix`] for the host-specific shell
@@ -1496,7 +1496,7 @@ pub fn parse_demoted_task_ids(log: &str) -> std::collections::HashSet<String> {
 
 /// Returns the task id from a line of the form
 /// `<ts> task=<id> todo -> backlog reason=user:<rest>`, or `None` if the
-/// line is anything else (worker events, other transitions, non-user
+/// line is anything else (workspace events, other transitions, non-user
 /// reasons, etc.).
 fn parse_user_demotion_line(line: &str) -> Option<&str> {
     // Cheap prefilter — most lines aren't demotions.
@@ -1729,7 +1729,7 @@ mod scan_tests {
     #[test]
     fn parse_demoted_task_ids_matches_user_demotions_only() {
         let log = "\
-2026-06-24T00:00:00+00:00 worker=alpha none -> working
+2026-06-24T00:00:00+00:00 workspace=alpha none -> working
 2026-06-24T00:01:00+00:00 task=foo backlog -> todo reason=zen:auto-promote
 2026-06-24T00:02:00+00:00 task=foo todo -> backlog reason=user:cli
 2026-06-24T00:03:00+00:00 task=bar todo -> backlog reason=zen:rollback

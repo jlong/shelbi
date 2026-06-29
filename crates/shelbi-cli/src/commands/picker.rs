@@ -71,15 +71,15 @@ impl std::fmt::Display for Choice {
                 } else {
                     "machines"
                 };
-                let w = if p.worker_count == 1 {
-                    "worker"
+                let w = if p.workspace_count == 1 {
+                    "workspace"
                 } else {
-                    "workers"
+                    "workspaces"
                 };
                 write!(
                     f,
                     "{:<24}  {} {m} · {} {w}",
-                    p.name, p.machine_count, p.worker_count
+                    p.name, p.machine_count, p.workspace_count
                 )
             }
             Choice::AddNew => f.write_str("+ Add a new project"),

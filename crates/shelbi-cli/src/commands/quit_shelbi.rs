@@ -1,6 +1,6 @@
 //! Tear down every Shelbi-owned tmux session on the host — every
 //! `shelbi-<project>` and every `_shelbi-<project>` stash, plus the
-//! per-worker panes (local windows + remote sessions). Detaches the
+//! per-workspace panes (local windows + remote sessions). Detaches the
 //! attached client at the end so the user's terminal lands back on a
 //! shell rather than getting orphaned.
 //!
@@ -9,12 +9,12 @@
 //! project, this closes all of them.
 //!
 //! Like `quit_project`, this writes no task or worktree state; the
-//! agents on disk are already authoritative, and any in-flight worker
+//! agents on disk are already authoritative, and any in-flight workspace
 //! changes stay in their worktrees for the user to pick up later.
 
 use anyhow::Result;
 
-use shelbi_orchestrator::worker as orch_worker;
+use shelbi_orchestrator::workspace as orch_workspace;
 
 /// One project the host is currently managing — has a live
 /// `shelbi-<name>` tmux session. Used by the confirmation popover so
@@ -22,29 +22,29 @@ use shelbi_orchestrator::worker as orch_worker;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ManagedProject {
     pub name: String,
-    /// Workers whose tmux pane is currently live. Zero is rendered as
-    /// "no active workers" in the popover; the project still appears
+    /// Workspaces whose tmux pane is currently live. Zero is rendered as
+    /// "no active workspaces" in the popover; the project still appears
     /// because the main session is open.
-    pub active_workers: usize,
+    pub active_workspaces: usize,
 }
 
 /// Enumerate every project with a live `shelbi-<name>` session,
-/// decorated with a count of its currently-live worker panes.
+/// decorated with a count of its currently-live workspace panes.
 /// Sorted alphabetically so the popover order is stable across runs.
 ///
 /// Best-effort: a project whose YAML fails to load shows up with
-/// `active_workers = 0` rather than being dropped — the session is
+/// `active_workspaces = 0` rather than being dropped — the session is
 /// still real and still needs to be killed.
 pub fn list_managed_projects() -> Vec<ManagedProject> {
     let listing = list_sessions_listing();
     let mut out: Vec<ManagedProject> = shelbi_project_session_names(&listing)
         .map(|name| {
-            let active_workers = shelbi_state::load_project(&name)
-                .map(|p| count_active_workers(&p))
+            let active_workspaces = shelbi_state::load_project(&name)
+                .map(|p| count_active_workspaces(&p))
                 .unwrap_or(0);
             ManagedProject {
                 name,
-                active_workers,
+                active_workspaces,
             }
         })
         .collect();
@@ -52,24 +52,24 @@ pub fn list_managed_projects() -> Vec<ManagedProject> {
     out
 }
 
-fn count_active_workers(project: &shelbi_core::Project) -> usize {
+fn count_active_workspaces(project: &shelbi_core::Project) -> usize {
     let mut count = 0;
-    for worker in &project.workers {
-        let Some(machine) = project.machine(&worker.machine) else {
+    for workspace in &project.workspaces {
+        let Some(machine) = project.machine(&workspace.machine) else {
             continue;
         };
         let host = machine.host();
-        let Ok(addr) = orch_worker::worker_tmux_addr(project, worker) else {
+        let Ok(addr) = orch_workspace::workspace_tmux_addr(project, workspace) else {
             continue;
         };
-        if orch_worker::worker_pane_alive(&host, &addr).unwrap_or(false) {
+        if orch_workspace::workspace_pane_alive(&host, &addr).unwrap_or(false) {
             count += 1;
         }
     }
     count
 }
 
-/// Tear down everything. For each managed project, kill its worker
+/// Tear down everything. For each managed project, kill its workspace
 /// panes (local windows + remote sessions), clear its zen crash
 /// heartbeat so the next start doesn't misread the explicit shutdown
 /// as a crash, and append a `closed reason=user:quit-shelbi` event so
@@ -89,15 +89,15 @@ pub fn run() -> Result<()> {
     for name in &names {
         let _ = shelbi_state::zen_clear_crash(name);
         if let Ok(p) = shelbi_state::load_project(name) {
-            for worker in &p.workers {
-                let Some(machine) = p.machine(&worker.machine) else {
+            for workspace in &p.workspaces {
+                let Some(machine) = p.machine(&workspace.machine) else {
                     continue;
                 };
                 let host = machine.host();
-                let Ok(addr) = orch_worker::worker_tmux_addr(&p, worker) else {
+                let Ok(addr) = orch_workspace::workspace_tmux_addr(&p, workspace) else {
                     continue;
                 };
-                let _ = orch_worker::kill_worker_pane(&host, &addr);
+                let _ = orch_workspace::kill_workspace_pane(&host, &addr);
             }
         }
         let _ = shelbi_state::append_project_event(name, "closed", "user:quit-shelbi");

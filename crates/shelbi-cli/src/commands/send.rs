@@ -8,7 +8,7 @@ pub fn run(project: Option<String>, id: String, message: String) -> Result<()> {
     let project_name = require_project(project)?;
     let mut file = shelbi_state::load_agent(&project_name, &id).map_err(|e| anyhow!(e))?;
 
-    // Resolve the worker's host via its project / machine.
+    // Resolve the workspace's host via its project / machine.
     let project = shelbi_state::load_project(&project_name).map_err(|e| anyhow!(e))?;
     let machine = project
         .machine(&file.agent.machine)

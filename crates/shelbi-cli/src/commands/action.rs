@@ -17,7 +17,7 @@ use crate::commands::require_project;
 
 #[derive(Debug, Subcommand)]
 pub enum ActionCmd {
-    /// Push the task's branch from its assigned worker's worktree to
+    /// Push the task's branch from its assigned workspace's worktree to
     /// `origin`. Idempotent — pushing an up-to-date branch is a clean
     /// success.
     PushBranch { task_id: String },
@@ -60,7 +60,7 @@ pub enum ActionCmd {
         target: Option<String>,
     },
     /// Delete the task's branch from `origin` and from the hub's local
-    /// refs. Skipped if a worker still has the branch checked out.
+    /// refs. Skipped if a workspace still has the branch checked out.
     /// Prints `deleted` / `skipped:<reason>` / `not-present`.
     DeleteBranch { task_id: String },
     /// Rewrite the task's branch onto a new base — typically the

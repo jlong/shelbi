@@ -13,7 +13,7 @@
 //!
 //! All actions are idempotent and silently no-op when not applicable:
 //!
-//! - `push_branch` pushes the task's branch from the worker's worktree.
+//! - `push_branch` pushes the task's branch from the workspace's worktree.
 //!   Pushing an up-to-date branch reports `Everything up-to-date` and
 //!   still succeeds.
 //! - `open_pr` opens a PR for the task's branch. If one is already open,
@@ -28,13 +28,13 @@
 //! - `close_pr` closes any *open* PR for the task's branch; with no open
 //!   PR it returns `None` instead of erroring.
 //! - `delete_branch` removes the branch from origin and from the hub's
-//!   local refs. Skipped when a worker still has it checked out so we
+//!   local refs. Skipped when a workspace still has it checked out so we
 //!   don't yank a branch out from under an active task.
 //! - `restack` rewrites a child task's branch onto a new base — typically
 //!   fired after the parent task's branch was merged — and retargets its
 //!   open PR (if any). See [`restack`].
 //!
-//! `push_branch` and `open_pr` run against the worker's worktree (that's
+//! `push_branch` and `open_pr` run against the workspace's worktree (that's
 //! where the branch lives, and `gh pr create` needs a remote-tracking
 //! branch to associate with). `merge`, `close_pr`, and `delete_branch`
 //! run on the hub — by the time the orchestrator is integrating or
@@ -44,19 +44,19 @@
 use shelbi_core::{Column, Error, Host, MergeStrategy, Project, Result, Task};
 
 use crate::git::{
-    compose_pr_body, head_commit_subject, locate_hub_workdir, locate_worker_worktree,
+    compose_pr_body, head_commit_subject, locate_hub_workdir, locate_workspace_worktree,
     lookup_open_pr, parse_pr_number_from_url, run_in_dir,
 };
-use crate::worker::worker_worktree;
+use crate::workspace::workspace_worktree;
 
 /// Outcome of [`delete_branch`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DeleteOutcome {
     /// Branch was removed from at least one of (origin, hub local).
     Deleted,
-    /// A worker still has the branch checked out; nothing was touched.
+    /// A workspace still has the branch checked out; nothing was touched.
     /// Per the workflow spec, the branch will be replaced naturally on
-    /// that worker's next dispatch.
+    /// that workspace's next dispatch.
     Skipped { reason: String },
     /// Branch wasn't present in either location — there was nothing to do.
     NotPresent,
@@ -142,7 +142,7 @@ pub enum RestackOutcome {
         retargeted_pr: Option<u64>,
     },
     /// Nothing was rewritten. `reason` is a short token-style label
-    /// (`held-by-<worker>`, `no-branch`, `already-restacked`,
+    /// (`held-by-<workspace>`, `no-branch`, `already-restacked`,
     /// `no-commits-beyond-from-base`, `rebase-conflict`, …) so a caller
     /// can match on a prefix without parsing free-form text.
     Skipped { task_id: String, reason: String },
@@ -175,14 +175,14 @@ impl RestackOutcome {
     }
 }
 
-/// Push the task's branch from the worker's worktree to `origin`.
+/// Push the task's branch from the workspace's worktree to `origin`.
 ///
-/// Errors when the task has no assigned worker or no `branch` field — both
+/// Errors when the task has no assigned workspace or no `branch` field — both
 /// are caller bugs (the workflow contract guarantees both fields by the
 /// time this fires). Re-pushing an up-to-date branch is a clean success.
 pub fn push_branch(project: &Project, task: &Task) -> Result<()> {
     let branch = require_branch(task)?;
-    let (host, worktree) = locate_worker_worktree(project, task)?;
+    let (host, worktree) = locate_workspace_worktree(project, task)?;
     let wt = worktree.to_string_lossy().into_owned();
 
     let out = run_in_dir(&host, &wt, &["git", "push", "-u", "origin", &branch])?;
@@ -232,7 +232,7 @@ pub fn open_pr(
     target_override: Option<&str>,
 ) -> Result<u64> {
     let branch = require_branch(task)?;
-    let (host, worktree) = locate_worker_worktree(project, task)?;
+    let (host, worktree) = locate_workspace_worktree(project, task)?;
     let wt = worktree.to_string_lossy().into_owned();
 
     // Idempotency: an open PR for this branch is the spec's "no-op if a
@@ -361,7 +361,7 @@ where
 /// `merge` walks every not-`Done` task that lists `task.id` in its
 /// `depends_on:` and calls [`restack`] on each, passing the merged task's
 /// `branch` as `from_base` and the merge `target` as `onto`. Children
-/// without a branch, children whose branch is held by a live worker, and
+/// without a branch, children whose branch is held by a live workspace, and
 /// children whose branch is already based on the new target are skipped —
 /// see [`RestackOutcome`]. Errors inside a single child's restack land in
 /// the bundled outcome as `Skipped { reason: "restack-error:..." }` rather
@@ -486,7 +486,7 @@ fn restack_children(
 /// for the cases the workflow contract says are normal:
 ///
 /// - child task has no `branch:` field;
-/// - a worker has the child branch checked out (we'd otherwise diverge
+/// - a workspace has the child branch checked out (we'd otherwise diverge
 ///   it from under live work — same rule as `delete_branch`);
 /// - the child branch isn't on `origin` yet (`push_branch` hasn't fired);
 /// - the child is already based on `onto` (`origin/<onto>` is an ancestor
@@ -511,10 +511,10 @@ pub fn restack(
         });
     };
 
-    if let Some(worker_name) = worker_holding_branch(project, &child_branch)? {
+    if let Some(workspace_name) = workspace_holding_branch(project, &child_branch)? {
         return Ok(RestackOutcome::Skipped {
             task_id,
-            reason: format!("held-by-{worker_name}"),
+            reason: format!("held-by-{workspace_name}"),
         });
     }
 
@@ -1023,17 +1023,17 @@ pub fn close_pr(project: &Project, task: &Task) -> Result<Option<u64>> {
 
 /// Delete the task's branch from origin and from the hub's local refs.
 ///
-/// Skipped when any of the project's workers currently has the branch
+/// Skipped when any of the project's workspaces currently has the branch
 /// checked out in its worktree — yanking the branch out from under an
-/// active task would force the worker into a detached HEAD on its next
+/// active task would force the workspace into a detached HEAD on its next
 /// fetch. Returns [`DeleteOutcome::NotPresent`] when the branch is already
 /// gone in both places (idempotent).
 pub fn delete_branch(project: &Project, task: &Task) -> Result<DeleteOutcome> {
     let branch = require_branch(task)?;
 
-    if let Some(worker_name) = worker_holding_branch(project, &branch)? {
+    if let Some(workspace_name) = workspace_holding_branch(project, &branch)? {
         return Ok(DeleteOutcome::Skipped {
-            reason: format!("branch is checked out in worker `{worker_name}`"),
+            reason: format!("branch is checked out in workspace `{workspace_name}`"),
         });
     }
 
@@ -1091,23 +1091,23 @@ fn require_branch(task: &Task) -> Result<String> {
     })
 }
 
-/// Return the name of the first worker whose worktree has `branch` checked
-/// out, or `None` if no worker is holding it. Workers whose worktree
+/// Return the name of the first workspace whose worktree has `branch` checked
+/// out, or `None` if no workspace is holding it. Workspaces whose worktree
 /// doesn't exist yet are silently skipped — they can't be holding any
 /// branch.
-fn worker_holding_branch(project: &Project, branch: &str) -> Result<Option<String>> {
-    for worker in &project.workers {
-        let Some(machine) = project.machine(&worker.machine) else {
-            // Misconfiguration — `validate_workers` already rejects this
+fn workspace_holding_branch(project: &Project, branch: &str) -> Result<Option<String>> {
+    for workspace in &project.workspaces {
+        let Some(machine) = project.machine(&workspace.machine) else {
+            // Misconfiguration — `validate_workspaces` already rejects this
             // shape on project load, so we can defensively skip it here
             // without short-circuiting the whole delete on an unrelated
             // YAML typo.
             continue;
         };
         let host = machine.host();
-        let wt = worker_worktree(machine, worker);
+        let wt = workspace_worktree(machine, workspace);
         match worktree_branch(&host, &wt.to_string_lossy())? {
-            Some(b) if b == branch => return Ok(Some(worker.name.clone())),
+            Some(b) if b == branch => return Ok(Some(workspace.name.clone())),
             _ => {}
         }
     }
@@ -1115,13 +1115,13 @@ fn worker_holding_branch(project: &Project, branch: &str) -> Result<Option<Strin
 }
 
 /// Return the current branch name in `wt`, or `None` if the worktree
-/// doesn't exist yet (a fresh worker that's never been dispatched) or is
+/// doesn't exist yet (a fresh workspace that's never been dispatched) or is
 /// in a detached HEAD state.
 fn worktree_branch(host: &Host, wt: &str) -> Result<Option<String>> {
     let out = run_in_dir(host, wt, &["git", "rev-parse", "--abbrev-ref", "HEAD"])?;
     if !out.status.success() {
         // No worktree, no git repo, or read failure — none of which means
-        // "this worker is holding our branch." Treat as "nothing to skip
+        // "this workspace is holding our branch." Treat as "nothing to skip
         // here" rather than failing the delete.
         return Ok(None);
     }
@@ -1161,7 +1161,7 @@ mod tests {
     use super::*;
     use shelbi_core::{
         AgentRunnerSpec, Column, HeartbeatConfig, Machine, MachineKind, OrchestratorSpec,
-        WorkerSpec, ZenConfig,
+        WorkspaceSpec, ZenConfig,
     };
     use std::collections::BTreeMap;
     use std::path::PathBuf;
@@ -1174,7 +1174,7 @@ mod tests {
         assert_eq!(DeleteOutcome::Deleted.as_line(), "deleted");
         assert_eq!(DeleteOutcome::NotPresent.as_line(), "not-present");
         let line = DeleteOutcome::Skipped {
-            reason: "branch is checked out in worker `alice`".into(),
+            reason: "branch is checked out in workspace `alice`".into(),
         }
         .as_line();
         assert!(line.starts_with("skipped:"));
@@ -1276,20 +1276,20 @@ mod tests {
         let wt = missing.to_string_lossy().into_owned();
         // No git repo here — the helper must report "no branch" rather
         // than error, so the delete probe can keep looking at the
-        // remaining workers.
+        // remaining workspaces.
         assert_eq!(worktree_branch(&Host::Local, &wt).unwrap(), None);
     }
 
-    /// Build a project with one local worker pointed at `repo` so the
+    /// Build a project with one local workspace pointed at `repo` so the
     /// worktree-branch probe finds the right HEAD. We piggy-back on
-    /// `worker_worktree`'s `<work_dir>/.shelbi/wt/<worker>` derivation
+    /// `workspace_worktree`'s `<work_dir>/.shelbi/wt/<workspace>` derivation
     /// by creating a worktree at that path off `repo`.
-    fn project_with_local_worker_holding(
+    fn project_with_local_workspace_holding(
         repo: &std::path::Path,
-        worker: &str,
+        workspace: &str,
         branch: &str,
     ) -> Project {
-        let wt_path = repo.join(".shelbi").join("wt").join(worker);
+        let wt_path = repo.join(".shelbi").join("wt").join(workspace);
         // git worktree add requires the parent dir to exist.
         std::fs::create_dir_all(wt_path.parent().unwrap()).unwrap();
         run_git(
@@ -1321,14 +1321,14 @@ mod tests {
             agent_runners: runners,
             editor: None,
             github_url: None,
-            workers: vec![WorkerSpec {
-                name: worker.into(),
+            workspaces: vec![WorkspaceSpec {
+                name: workspace.into(),
                 machine: "hub".into(),
                 runner: "claude".into(),
             }],
-            worker_poll_interval_secs: 5,
-            worker_permissions_mode: "auto".into(),
-            worker_settings_template: None,
+            workspace_poll_interval_secs: 5,
+            workspace_permissions_mode: "auto".into(),
+            workspace_settings_template: None,
             zen: ZenConfig::default(),
             heartbeat: HeartbeatConfig::default(),
             contextstore_sync: Vec::new(),
@@ -1338,20 +1338,20 @@ mod tests {
     }
 
     #[test]
-    fn worker_holding_branch_finds_the_holder() {
+    fn workspace_holding_branch_finds_the_holder() {
         let (_tmp, repo) = fixture_repo_with_feature();
-        let project = project_with_local_worker_holding(&repo, "alice", "feature");
+        let project = project_with_local_workspace_holding(&repo, "alice", "feature");
 
-        let holder = worker_holding_branch(&project, "feature").unwrap();
+        let holder = workspace_holding_branch(&project, "feature").unwrap();
         assert_eq!(holder.as_deref(), Some("alice"));
 
         // A branch nobody holds returns None.
-        assert!(worker_holding_branch(&project, "other").unwrap().is_none());
+        assert!(workspace_holding_branch(&project, "other").unwrap().is_none());
     }
 
     #[test]
-    fn worker_holding_branch_ignores_missing_worktrees() {
-        // A worker whose worktree hasn't been provisioned yet must not
+    fn workspace_holding_branch_ignores_missing_worktrees() {
+        // A workspace whose worktree hasn't been provisioned yet must not
         // count as holding any branch — otherwise a delete_branch on a
         // fresh project would always say "skipped".
         let (_tmp, repo) = fixture_repo_with_feature();
@@ -1374,21 +1374,21 @@ mod tests {
             agent_runners: runners,
             editor: None,
             github_url: None,
-            workers: vec![WorkerSpec {
+            workspaces: vec![WorkspaceSpec {
                 name: "never-spawned".into(),
                 machine: "hub".into(),
                 runner: "claude".into(),
             }],
-            worker_poll_interval_secs: 5,
-            worker_permissions_mode: "auto".into(),
-            worker_settings_template: None,
+            workspace_poll_interval_secs: 5,
+            workspace_permissions_mode: "auto".into(),
+            workspace_settings_template: None,
             zen: ZenConfig::default(),
             heartbeat: HeartbeatConfig::default(),
             contextstore_sync: Vec::new(),
             detected_shapes: Vec::new(),
             git: shelbi_core::GitConfig::default(),
         };
-        assert!(worker_holding_branch(&project, "feature").unwrap().is_none());
+        assert!(workspace_holding_branch(&project, "feature").unwrap().is_none());
     }
 
     fn task_on_branch(id: &str, branch: &str) -> Task {
@@ -1398,9 +1398,9 @@ mod tests {
     }
 
     #[test]
-    fn delete_branch_skipped_when_a_worker_holds_it() {
+    fn delete_branch_skipped_when_a_workspace_holds_it() {
         let (_tmp, repo) = fixture_repo_with_feature();
-        let project = project_with_local_worker_holding(&repo, "alice", "feature");
+        let project = project_with_local_workspace_holding(&repo, "alice", "feature");
 
         let out = delete_branch(&project, &task_on_branch("t", "feature")).unwrap();
         match out {
@@ -1442,10 +1442,10 @@ mod tests {
             agent_runners: runners,
             editor: None,
             github_url: None,
-            workers: Vec::new(),
-            worker_poll_interval_secs: 5,
-            worker_permissions_mode: "auto".into(),
-            worker_settings_template: None,
+            workspaces: Vec::new(),
+            workspace_poll_interval_secs: 5,
+            workspace_permissions_mode: "auto".into(),
+            workspace_settings_template: None,
             zen: ZenConfig::default(),
             heartbeat: HeartbeatConfig::default(),
             contextstore_sync: Vec::new(),
@@ -1503,10 +1503,10 @@ mod tests {
             agent_runners: runners,
             editor: None,
             github_url: None,
-            workers: Vec::new(),
-            worker_poll_interval_secs: 5,
-            worker_permissions_mode: "auto".into(),
-            worker_settings_template: None,
+            workspaces: Vec::new(),
+            workspace_poll_interval_secs: 5,
+            workspace_permissions_mode: "auto".into(),
+            workspace_settings_template: None,
             zen: ZenConfig::default(),
             heartbeat: HeartbeatConfig::default(),
             contextstore_sync: Vec::new(),
@@ -1733,10 +1733,10 @@ mod tests {
             agent_runners: runners,
             editor: None,
             github_url: None,
-            workers: Vec::new(),
-            worker_poll_interval_secs: 5,
-            worker_permissions_mode: "auto".into(),
-            worker_settings_template: None,
+            workspaces: Vec::new(),
+            workspace_poll_interval_secs: 5,
+            workspace_permissions_mode: "auto".into(),
+            workspace_settings_template: None,
             zen: ZenConfig::default(),
             heartbeat: HeartbeatConfig::default(),
             contextstore_sync: Vec::new(),
@@ -1785,7 +1785,7 @@ mod tests {
         assert!(local.join("feature.txt").exists());
 
         // The squash commit is a single new commit on main (the message
-        // is shelbi's, not the worker's), so log shape: init, then merge.
+        // is shelbi's, not the workspace's), so log shape: init, then merge.
         let log = run_capture_stdout(
             &Host::Local,
             &wt,
@@ -2127,7 +2127,7 @@ mod tests {
         run_git(local, &["push", "origin", "main"]);
     }
 
-    fn project_with_no_workers(local: &std::path::Path) -> Project {
+    fn project_with_no_workspaces(local: &std::path::Path) -> Project {
         project_at(local, MergeStrategy::Squash)
     }
 
@@ -2143,7 +2143,7 @@ mod tests {
         let (_tmp, _remote, local) = fixture_repo_with_stacked_branches();
         advance_main_with_parent_squashed(&local);
 
-        let project = project_with_no_workers(&local);
+        let project = project_with_no_workspaces(&local);
         let child = child_task_on_branch("ch", "child", &["par"]);
 
         let out = restack(&project, &child, "parent", Some("main")).unwrap();
@@ -2219,7 +2219,7 @@ mod tests {
         let (_tmp, _remote, local) = fixture_repo_with_stacked_branches();
         advance_main_with_parent_squashed(&local);
 
-        let project = project_with_no_workers(&local);
+        let project = project_with_no_workspaces(&local);
         let child = child_task_on_branch("ch", "child", &["par"]);
 
         // First pass: real work.
@@ -2237,15 +2237,15 @@ mod tests {
     }
 
     #[test]
-    fn restack_skips_when_worker_holds_the_child_branch() {
-        // A worker actively working in the child branch's worktree would
+    fn restack_skips_when_workspace_holds_the_child_branch() {
+        // A workspace actively working in the child branch's worktree would
         // diverge from a force-push. Mirror `delete_branch`'s skip-on-hold
-        // policy: surface the worker name so the operator can choose to
-        // wait or rotate the worker, but don't tamper with origin.
+        // policy: surface the workspace name so the operator can choose to
+        // wait or rotate the workspace, but don't tamper with origin.
         let (_tmp, _remote, local) = fixture_repo_with_stacked_branches();
         advance_main_with_parent_squashed(&local);
 
-        let project = project_with_local_worker_holding(&local, "alice", "child");
+        let project = project_with_local_workspace_holding(&local, "alice", "child");
         let child = child_task_on_branch("ch", "child", &["par"]);
 
         let out = restack(&project, &child, "parent", Some("main")).unwrap();
@@ -2274,7 +2274,7 @@ mod tests {
     #[test]
     fn restack_skips_when_child_has_no_branch() {
         let (_tmp, _remote, local) = fixture_repo_with_stacked_branches();
-        let project = project_with_no_workers(&local);
+        let project = project_with_no_workspaces(&local);
 
         let mut child = bare_task("ch");
         child.depends_on = vec!["par".into()];
@@ -2298,7 +2298,7 @@ mod tests {
         // Remove origin/child but keep the local ref.
         run_git(&local, &["push", "origin", "--delete", "child"]);
 
-        let project = project_with_no_workers(&local);
+        let project = project_with_no_workspaces(&local);
         let child = child_task_on_branch("ch", "child", &["par"]);
 
         let out = restack(&project, &child, "parent", Some("main")).unwrap();
@@ -2312,7 +2312,7 @@ mod tests {
 
     #[test]
     fn restack_skips_when_child_has_no_commits_past_from_base() {
-        // If child's tip is at parent's tip (worker's branch was opened
+        // If child's tip is at parent's tip (workspace's branch was opened
         // but never advanced), the rebase would slide the branch tip up
         // to `onto` — turning an empty stack into "the merged target."
         // Skip rather than do that silently.
@@ -2326,7 +2326,7 @@ mod tests {
         run_git(&local, &["push", "origin", "+child"]);
         run_git(&local, &["checkout", "main"]);
 
-        let project = project_with_no_workers(&local);
+        let project = project_with_no_workspaces(&local);
         let child = child_task_on_branch("ch", "child", &["par"]);
 
         let out = restack(&project, &child, "parent", Some("main")).unwrap();
@@ -2352,7 +2352,7 @@ mod tests {
         run_git(&local, &["commit", "-q", "-m", "conflicting main change"]);
         run_git(&local, &["push", "origin", "main"]);
 
-        let project = project_with_no_workers(&local);
+        let project = project_with_no_workspaces(&local);
         let child = child_task_on_branch("ch", "child", &["par"]);
 
         let out = restack(&project, &child, "parent", Some("main")).unwrap();
@@ -2423,7 +2423,7 @@ mod tests {
 
         let (_tmp, _remote, local) = fixture_repo_with_stacked_branches();
         advance_main_with_parent_squashed(&local);
-        let project = project_with_no_workers(&local);
+        let project = project_with_no_workspaces(&local);
 
         // Parent task at column=InProgress on branch `parent`.
         let mut parent = bare_task("par");
@@ -2492,7 +2492,7 @@ mod tests {
 
         let (_tmp, _remote, local) = fixture_repo_with_stacked_branches();
         advance_main_with_parent_squashed(&local);
-        let project = project_with_no_workers(&local);
+        let project = project_with_no_workspaces(&local);
 
         // Parent on disk, but nobody depends on it.
         let mut parent = bare_task("par");
@@ -2507,8 +2507,8 @@ mod tests {
     }
 
     #[test]
-    fn restack_children_skips_dependent_held_by_a_worker() {
-        // A worker holding the child's branch makes `restack` skip — we
+    fn restack_children_skips_dependent_held_by_a_workspace() {
+        // A workspace holding the child's branch makes `restack` skip — we
         // surface that as the cascade's outcome rather than dropping it,
         // so the operator can see *why* the child wasn't moved.
         let _g = auto_fire_lock();
@@ -2517,7 +2517,7 @@ mod tests {
 
         let (_tmp, _remote, local) = fixture_repo_with_stacked_branches();
         advance_main_with_parent_squashed(&local);
-        let project = project_with_local_worker_holding(&local, "alice", "child");
+        let project = project_with_local_workspace_holding(&local, "alice", "child");
 
         let mut parent = bare_task("par");
         parent.branch = Some("parent".into());

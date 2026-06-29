@@ -3,11 +3,11 @@ use shelbi_core::{Host, MachineKind};
 
 use super::require_project;
 
-/// Attach the user's terminal to a worker's tmux pane.
+/// Attach the user's terminal to a workspace's tmux pane.
 ///
-/// Local worker: switch the user into `shelbi-<project>:w-<id>` (if they're
+/// Local workspace: switch the user into `shelbi-<project>:w-<id>` (if they're
 /// already inside a tmux client) or print the attach command.
-/// Remote worker: print the `ssh -t host -- tmux attach -t shelbi-w-<id>`
+/// Remote workspace: print the `ssh -t host -- tmux attach -t shelbi-w-<id>`
 /// command. We don't exec it directly — it would steal the user's terminal
 /// from this process; safer to let them run it.
 pub fn run(project_opt: Option<String>, id: String) -> Result<()> {

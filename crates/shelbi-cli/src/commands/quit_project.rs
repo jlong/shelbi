@@ -2,29 +2,29 @@
 //! attached client to whatever shelbi project session is next-most-recent.
 //!
 //! Invoked from the palette's "Quit Project" entry. Replaces the older
-//! plain-`kill-session` flow, which left remote worker sessions orphaned
-//! (they live on each worker's machine — the local `session-closed` hook
+//! plain-`kill-session` flow, which left remote workspace sessions orphaned
+//! (they live on each workspace's machine — the local `session-closed` hook
 //! only catches the local stash) and dropped the user wherever tmux
 //! happened to switch by default.
 
 use anyhow::{anyhow, Result};
 
 use shelbi_core::Column;
-use shelbi_orchestrator::worker as orch_worker;
-use shelbi_state::WorkerState;
+use shelbi_orchestrator::workspace as orch_workspace;
+use shelbi_state::WorkspaceState;
 
-/// One declared worker whose tmux pane is currently live. Surfaced in the
+/// One declared workspace whose tmux pane is currently live. Surfaced in the
 /// palette's quit-project confirmation popover so users see exactly what
 /// they're about to tear down.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ActiveWorker {
+pub struct ActiveWorkspace {
     pub name: String,
     /// Display label: `"working"`, `"awaiting input"`, `"idle"`, or
     /// `"blocked"`. Derived from the same on-disk signals the sidebar's
-    /// per-worker badge reads (in-progress task assignment + status.yaml).
+    /// per-workspace badge reads (in-progress task assignment + status.yaml).
     pub state: &'static str,
-    /// Task id the worker is currently assigned to, or `"idle"` if it has
-    /// no in-progress card. Multiple ids get comma-joined — the worker
+    /// Task id the workspace is currently assigned to, or `"idle"` if it has
+    /// no in-progress card. Multiple ids get comma-joined — the workspace
     /// pool should never carry more than one but if it does, the popover
     /// should expose it rather than hide it.
     pub task: String,
@@ -32,7 +32,7 @@ pub struct ActiveWorker {
 
 /// Quit `project`:
 ///
-/// 1. Kill every worker pane (local windows + remote sessions). The user
+/// 1. Kill every workspace pane (local windows + remote sessions). The user
 ///    is closing the whole project, so we don't try to preserve in-flight
 ///    task assignments here — the cards stay on the board and get picked
 ///    up the next time the project's dispatched.
@@ -58,15 +58,15 @@ pub fn run(project: &str) -> Result<()> {
 
     let _ = shelbi_state::zen_clear_crash(project);
 
-    for worker in &p.workers {
-        let Some(machine) = p.machine(&worker.machine) else {
+    for workspace in &p.workspaces {
+        let Some(machine) = p.machine(&workspace.machine) else {
             continue;
         };
         let host = machine.host();
-        let Ok(addr) = orch_worker::worker_tmux_addr(&p, worker) else {
+        let Ok(addr) = orch_workspace::workspace_tmux_addr(&p, workspace) else {
             continue;
         };
-        let _ = orch_worker::kill_worker_pane(&host, &addr);
+        let _ = orch_workspace::kill_workspace_pane(&host, &addr);
     }
 
     let current = format!("shelbi-{project}");
@@ -82,17 +82,17 @@ pub fn run(project: &str) -> Result<()> {
     Ok(())
 }
 
-/// Enumerate declared workers whose tmux pane is currently live, decorated
+/// Enumerate declared workspaces whose tmux pane is currently live, decorated
 /// with their state + current task. Used by the palette's quit-project
-/// confirmation popover; the workers themselves are not consulted, the
-/// hub-side `worker_pane_alive` check + `status.yaml` snapshot are.
+/// confirmation popover; the workspaces themselves are not consulted, the
+/// hub-side `workspace_pane_alive` check + `status.yaml` snapshot are.
 ///
 /// Best-effort: a missing project YAML returns an empty list (the popover
-/// then shows "No active workers."); workers whose machine lookup or tmux
+/// then shows "No active workspaces."); workspaces whose machine lookup or tmux
 /// addr derivation fails are silently dropped — the same shape as the
 /// teardown loop below, so the popover only ever lists things this
 /// process knows how to actually kill.
-pub fn list_active_workers(project_name: &str) -> Vec<ActiveWorker> {
+pub fn list_active_workspaces(project_name: &str) -> Vec<ActiveWorkspace> {
     let project = match shelbi_state::load_project(project_name) {
         Ok(p) => p,
         Err(_) => return Vec::new(),
@@ -101,21 +101,21 @@ pub fn list_active_workers(project_name: &str) -> Vec<ActiveWorker> {
         shelbi_state::list_column(project_name, Column::InProgress).unwrap_or_default();
 
     let mut out = Vec::new();
-    for worker in &project.workers {
-        let Some(machine) = project.machine(&worker.machine) else {
+    for workspace in &project.workspaces {
+        let Some(machine) = project.machine(&workspace.machine) else {
             continue;
         };
         let host = machine.host();
-        let Ok(addr) = orch_worker::worker_tmux_addr(&project, worker) else {
+        let Ok(addr) = orch_workspace::workspace_tmux_addr(&project, workspace) else {
             continue;
         };
-        if !orch_worker::worker_pane_alive(&host, &addr).unwrap_or(false) {
+        if !orch_workspace::workspace_pane_alive(&host, &addr).unwrap_or(false) {
             continue;
         }
 
         let assigned: Vec<&str> = in_progress
             .iter()
-            .filter(|tf| tf.task.assigned_to.as_deref() == Some(worker.name.as_str()))
+            .filter(|tf| tf.task.assigned_to.as_deref() == Some(workspace.name.as_str()))
             .map(|tf| tf.task.id.as_str())
             .collect();
         let has_task = !assigned.is_empty();
@@ -125,20 +125,20 @@ pub fn list_active_workers(project_name: &str) -> Vec<ActiveWorker> {
             "idle".to_string()
         };
 
-        let status_state = shelbi_state::load_worker_status(&worker.name)
+        let status_state = shelbi_state::load_workspace_status(&workspace.name)
             .ok()
             .flatten()
             .map(|s| s.state);
-        out.push(ActiveWorker {
-            name: worker.name.clone(),
-            state: worker_state_label(has_task, status_state),
+        out.push(ActiveWorkspace {
+            name: workspace.name.clone(),
+            state: workspace_state_label(has_task, status_state),
             task,
         });
     }
     out
 }
 
-/// Pick the popover's state label for one worker. Pure so the mapping is
+/// Pick the popover's state label for one workspace. Pure so the mapping is
 /// testable without standing up tmux + an HOME fixture.
 ///
 /// - No in-progress card → `"idle"`. The status.yaml may still claim
@@ -148,14 +148,14 @@ pub fn list_active_workers(project_name: &str) -> Vec<ActiveWorker> {
 /// - In-progress card with no snapshot → `"working"`. The poller hasn't
 ///   observed a marker yet; default the optimistic side rather than
 ///   showing nothing — matches the sidebar's badge fallback.
-fn worker_state_label(has_task: bool, status: Option<WorkerState>) -> &'static str {
+fn workspace_state_label(has_task: bool, status: Option<WorkspaceState>) -> &'static str {
     if !has_task {
         return "idle";
     }
     match status {
-        Some(WorkerState::Working) => "working",
-        Some(WorkerState::AwaitingInput) => "awaiting input",
-        Some(WorkerState::Blocked) => "blocked",
+        Some(WorkspaceState::Working) => "working",
+        Some(WorkspaceState::AwaitingInput) => "awaiting input",
+        Some(WorkspaceState::Blocked) => "blocked",
         None => "working",
     }
 }
@@ -273,29 +273,29 @@ shelbi-bravo 0
 
     #[test]
     fn state_label_falls_back_to_idle_when_no_task_assigned() {
-        // No in-progress card on the board — the worker is idle even if
+        // No in-progress card on the board — the workspace is idle even if
         // the status.yaml still says "working" from a previous turn.
-        assert_eq!(worker_state_label(false, None), "idle");
-        assert_eq!(worker_state_label(false, Some(WorkerState::Working)), "idle");
+        assert_eq!(workspace_state_label(false, None), "idle");
+        assert_eq!(workspace_state_label(false, Some(WorkspaceState::Working)), "idle");
         assert_eq!(
-            worker_state_label(false, Some(WorkerState::AwaitingInput)),
+            workspace_state_label(false, Some(WorkspaceState::AwaitingInput)),
             "idle"
         );
-        assert_eq!(worker_state_label(false, Some(WorkerState::Blocked)), "idle");
+        assert_eq!(workspace_state_label(false, Some(WorkspaceState::Blocked)), "idle");
     }
 
     #[test]
     fn state_label_mirrors_status_when_task_assigned() {
         assert_eq!(
-            worker_state_label(true, Some(WorkerState::Working)),
+            workspace_state_label(true, Some(WorkspaceState::Working)),
             "working"
         );
         assert_eq!(
-            worker_state_label(true, Some(WorkerState::AwaitingInput)),
+            workspace_state_label(true, Some(WorkspaceState::AwaitingInput)),
             "awaiting input"
         );
         assert_eq!(
-            worker_state_label(true, Some(WorkerState::Blocked)),
+            workspace_state_label(true, Some(WorkspaceState::Blocked)),
             "blocked"
         );
     }
@@ -305,7 +305,7 @@ shelbi-bravo 0
         // Sidebar uses the same optimistic fallback — the poller hasn't
         // observed a marker yet, so show `working` rather than dropping
         // the row or guessing idle.
-        assert_eq!(worker_state_label(true, None), "working");
+        assert_eq!(workspace_state_label(true, None), "working");
     }
 
     #[test]

@@ -19,7 +19,7 @@ pub struct Entry {
     /// the palette, so users learn the chord by spotting it in the row.
     pub shortcut: Option<String>,
     /// Optional per-entry icon override + color. Set for entries that
-    /// mirror a sidebar row (Chat/Tasks/Activity, workers, review-ready
+    /// mirror a sidebar row (Chat/Tasks/Activity, workspaces, review-ready
     /// tasks, legacy agents) so the palette shows the same glyph and
     /// status tint the sidebar does. `None` falls back to the dim
     /// `EntryKind::icon()` used for entries without a sidebar twin.

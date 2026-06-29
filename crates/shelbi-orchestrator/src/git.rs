@@ -9,7 +9,7 @@ use std::process::Output;
 
 use shelbi_core::{Error, Host, MachineKind, Project, Result, Task};
 
-use crate::worker::worker_worktree;
+use crate::workspace::workspace_worktree;
 
 /// Run `argv` with cwd = `dir` on `host`, picking up the user's login
 /// `PATH` on both local and remote hosts so `gh` / `git` (and anything
@@ -59,32 +59,32 @@ pub(crate) fn login_shell_prefix(host: &Host) -> (String, &'static str) {
     (shell, "-lc")
 }
 
-/// Find the worker assigned to `task`, then return its host + worktree.
-/// Errors if the task is unassigned or the worker/machine resolution
+/// Find the workspace assigned to `task`, then return its host + worktree.
+/// Errors if the task is unassigned or the workspace/machine resolution
 /// fails — those are caller bugs, not policy decisions.
-pub(crate) fn locate_worker_worktree(project: &Project, task: &Task) -> Result<(Host, PathBuf)> {
-    let worker_name = task.assigned_to.as_deref().ok_or_else(|| {
+pub(crate) fn locate_workspace_worktree(project: &Project, task: &Task) -> Result<(Host, PathBuf)> {
+    let workspace_name = task.assigned_to.as_deref().ok_or_else(|| {
         Error::Other(format!(
-            "task `{}` has no assigned worker — assign one before running this action",
+            "task `{}` has no assigned workspace — assign one before running this action",
             task.id
         ))
     })?;
-    let worker = project.worker(worker_name).ok_or_else(|| {
+    let workspace = project.workspace(workspace_name).ok_or_else(|| {
         Error::Other(format!(
-            "task `{}` references unknown worker `{worker_name}`",
+            "task `{}` references unknown workspace `{workspace_name}`",
             task.id
         ))
     })?;
     let machine = project
-        .machine(&worker.machine)
-        .ok_or_else(|| Error::UnknownMachine(worker.machine.clone()))?;
-    Ok((machine.host(), worker_worktree(machine, worker)))
+        .machine(&workspace.machine)
+        .ok_or_else(|| Error::UnknownMachine(workspace.machine.clone()))?;
+    Ok((machine.host(), workspace_worktree(machine, workspace)))
 }
 
 /// The first local machine in the project — by convention the hub. The
 /// hub's `work_dir` is a clean checkout of the project repo, so gh / git
 /// commands routed through it have a remote to talk to without needing
-/// a worker's worktree to exist yet.
+/// a workspace's worktree to exist yet.
 pub(crate) fn locate_hub_workdir(project: &Project) -> Result<(Host, PathBuf)> {
     let machine = project
         .machines

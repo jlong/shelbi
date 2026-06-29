@@ -1,22 +1,22 @@
-//! Review flow: check a worker's branch out into the machine's main
+//! Review flow: check a workspace's branch out into the machine's main
 //! work_dir and launch a fresh claude pane there for the user to inspect
 //! the changes, make small tweaks, and decide accept / send-back.
 //!
 //! One review per project per machine — same machine.work_dir, same tmux
 //! window. Invoking review on a second task swaps the checkout and
-//! restarts the pane (clearing claude context, same semantics as workers).
+//! restarts the pane (clearing claude context, same semantics as workspaces).
 //!
 //! Worktree conflict: git refuses to check out a branch that's already
 //! checked out in another worktree. So before the review checkout we
-//! release any worker worktree currently sitting on the task's branch,
+//! release any workspace worktree currently sitting on the task's branch,
 //! switching it back to `default_branch` — but only if that worktree is
-//! clean. A dirty worker worktree bails the review with a clear message.
+//! clean. A dirty workspace worktree bails the review with a clear message.
 
 use std::path::PathBuf;
 
 use shelbi_core::{Error, Host, Machine, Project, Result, Task, TmuxAddr};
 
-use crate::worker::worker_worktree;
+use crate::workspace::workspace_worktree;
 
 /// Where the review pane lives. Local = window in the project's session;
 /// remote = its own session (so an SSH drop doesn't kill the review).
@@ -34,7 +34,7 @@ pub fn review_tmux_addr(project: &Project, machine: &Machine) -> TmuxAddr {
 }
 
 /// Resolve which machine to review on. Order of preference: explicit
-/// override, the worker the task is assigned to, the first local machine
+/// override, the workspace the task is assigned to, the first local machine
 /// in the project.
 pub fn resolve_review_machine<'a>(
     project: &'a Project,
@@ -46,9 +46,9 @@ pub fn resolve_review_machine<'a>(
             .machine(name)
             .ok_or_else(|| Error::UnknownMachine(name.to_string()));
     }
-    if let Some(worker_name) = &task.assigned_to {
-        if let Some(worker) = project.worker(worker_name) {
-            if let Some(m) = project.machine(&worker.machine) {
+    if let Some(workspace_name) = &task.assigned_to {
+        if let Some(workspace) = project.workspace(workspace_name) {
+            if let Some(m) = project.machine(&workspace.machine) {
                 return Ok(m);
             }
         }
@@ -65,7 +65,7 @@ pub fn resolve_review_machine<'a>(
 /// `has_session` rather than a window-name match — tmux's
 /// `automatic-rename` retitles the window once claude takes over the
 /// pane, so a name-based check would miss live sessions and let the next
-/// `new_session` collide. (Same reasoning as `kill_worker_pane`.) After
+/// `new_session` collide. (Same reasoning as `kill_workspace_pane`.) After
 /// killing we poll until tmux confirms the session is gone, so a flaky
 /// SSH round-trip surfaces as a clear error instead of a silent skip
 /// followed by a `duplicate session` failure on `new_session`.
@@ -137,7 +137,7 @@ pub fn start_review_by_id(project_name: &str, task_id: &str) -> Result<String> {
 }
 
 /// Spec passed to `start_review`. The body is the task's markdown body
-/// (the prompt context the user gave the worker), included in the
+/// (the prompt context the user gave the workspace), included in the
 /// reviewer's opening prompt so it knows what the work was for.
 pub struct ReviewSpec<'a> {
     pub project: &'a Project,
@@ -156,7 +156,7 @@ pub fn start_review(spec: ReviewSpec<'_>) -> Result<TmuxAddr> {
         .unwrap_or_else(|| format!("shelbi/{}", spec.task.id));
 
     preflight_workdir(&host, spec.machine)?;
-    release_branch_from_worker_worktrees(&host, spec.project, spec.machine, &branch)?;
+    release_branch_from_workspace_worktrees(&host, spec.project, spec.machine, &branch)?;
     checkout(&host, spec.machine, &branch)?;
 
     let addr = review_tmux_addr(spec.project, spec.machine);
@@ -257,22 +257,22 @@ fn preflight_workdir(host: &Host, machine: &Machine) -> Result<()> {
     Ok(())
 }
 
-/// If a worker worktree on this machine is currently on `branch`, switch
+/// If a workspace worktree on this machine is currently on `branch`, switch
 /// it to `default_branch` so the main work_dir is free to check out
-/// `branch`. Bails on a dirty worker worktree (we'd silently lose work).
-fn release_branch_from_worker_worktrees(
+/// `branch`. Bails on a dirty workspace worktree (we'd silently lose work).
+fn release_branch_from_workspace_worktrees(
     host: &Host,
     project: &Project,
     machine: &Machine,
     branch: &str,
 ) -> Result<()> {
-    for worker in &project.workers {
-        if worker.machine != machine.name {
+    for workspace in &project.workspaces {
+        if workspace.machine != machine.name {
             continue;
         }
-        let wt: PathBuf = worker_worktree(machine, worker);
+        let wt: PathBuf = workspace_worktree(machine, workspace);
         let wt_str = wt.to_string_lossy().into_owned();
-        // Skip workers without an actual worktree yet.
+        // Skip workspaces without an actual worktree yet.
         let exists = shelbi_ssh::run(host, ["test", "-e", &format!("{wt_str}/.git")])
             .map_err(Error::Io)?
             .status
@@ -290,17 +290,17 @@ fn release_branch_from_worker_worktrees(
         let dirty = shelbi_ssh::run_capture(host, ["git", "-C", &wt_str, "status", "--porcelain"])?;
         if !dirty.trim().is_empty() {
             return Err(Error::Other(format!(
-                "worker `{}`'s worktree is on `{branch}` with uncommitted \
+                "workspace `{}`'s worktree is on `{branch}` with uncommitted \
                  changes — commit, stash, or discard before reviewing",
-                worker.name
+                workspace.name
             )));
         }
-        // Detach HEAD on the worker's worktree — frees the branch ref so
+        // Detach HEAD on the workspace's worktree — frees the branch ref so
         // the main clone can claim it. We avoid switching to a named
         // branch here because the natural choice (`default_branch`) is
         // typically checked out in the main clone, and git refuses to
         // double-claim a branch across worktrees. sync_worktree will
-        // re-attach to the right branch the next time the worker gets a
+        // re-attach to the right branch the next time the workspace gets a
         // task.
         let out = shelbi_ssh::run(host, ["git", "-C", &wt_str, "checkout", "--detach"])
             .map_err(Error::Io)?;
@@ -332,7 +332,7 @@ fn checkout(host: &Host, machine: &Machine, branch: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use shelbi_core::{AgentRunnerSpec, MachineKind, OrchestratorSpec, WorkerSpec};
+    use shelbi_core::{AgentRunnerSpec, MachineKind, OrchestratorSpec, WorkspaceSpec};
     use std::collections::BTreeMap;
 
     fn fixture() -> (Project, Task) {
@@ -363,13 +363,13 @@ mod tests {
             agent_runners: runners,
             editor: None,
             github_url: None,
-            workers: vec![
-                WorkerSpec { name: "alice".into(), machine: "hub".into(), runner: "claude".into() },
-                WorkerSpec { name: "bob".into(), machine: "m2".into(), runner: "claude".into() },
+            workspaces: vec![
+                WorkspaceSpec { name: "alice".into(), machine: "hub".into(), runner: "claude".into() },
+                WorkspaceSpec { name: "bob".into(), machine: "m2".into(), runner: "claude".into() },
             ],
-            worker_poll_interval_secs: 5,
-            worker_permissions_mode: "auto".into(),
-            worker_settings_template: None,
+            workspace_poll_interval_secs: 5,
+            workspace_permissions_mode: "auto".into(),
+            workspace_settings_template: None,
             zen: shelbi_core::ZenConfig::default(),
             heartbeat: shelbi_core::HeartbeatConfig::default(),
             git: shelbi_core::GitConfig::default(),
@@ -412,7 +412,7 @@ mod tests {
     }
 
     #[test]
-    fn machine_resolution_prefers_assigned_worker() {
+    fn machine_resolution_prefers_assigned_workspace() {
         let (p, t) = fixture();
         let m = resolve_review_machine(&p, &t, None).unwrap();
         assert_eq!(m.name, "hub"); // alice is on hub

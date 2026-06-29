@@ -22,7 +22,7 @@ pub mod status;
 pub mod tail;
 pub mod task;
 pub mod wizard;
-pub mod worker;
+pub mod workspace;
 pub mod workflow;
 pub mod zen;
 pub mod zen_lifecycle;
@@ -94,7 +94,7 @@ pub(crate) mod test_support {
     use std::sync::Mutex;
 
     /// Shared mutex for any test in this binary that mutates `SHELBI_HOME`.
-    /// Tests across the `task` and `worker` modules race on this env var,
+    /// Tests across the `task` and `workspace` modules race on this env var,
     /// so they must all lock the *same* static — per-module locks would
     /// silently interleave and produce flaky failures.
     pub static ENV_LOCK: Mutex<()> = Mutex::new(());
@@ -160,10 +160,10 @@ pub(crate) mod test_support {
             agent_runners: runners,
             editor: None,
             github_url: None,
-            workers: Vec::new(),
-            worker_poll_interval_secs: 5,
-            worker_permissions_mode: "auto".into(),
-            worker_settings_template: None,
+            workspaces: Vec::new(),
+            workspace_poll_interval_secs: 5,
+            workspace_permissions_mode: "auto".into(),
+            workspace_settings_template: None,
             zen: ZenConfig::default(),
             heartbeat: HeartbeatConfig::default(),
             contextstore_sync: Vec::new(),

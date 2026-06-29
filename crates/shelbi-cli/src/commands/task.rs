@@ -3,7 +3,7 @@
 //! Tasks are stored as `<shelbi_home>/projects/<project>/tasks/<id>.md`
 //! files (markdown body + YAML frontmatter). The orchestrator creates
 //! tasks (typically into `backlog`); the user curates them through the
-//! columns; workers pick up `todo` tasks.
+//! columns; workspaces pick up `todo` tasks.
 //!
 //! Priorities within a column are contiguous integers 0..N. Any operation
 //! that changes a column's membership renumbers it before returning, so
@@ -58,22 +58,22 @@ pub enum TaskCmd {
         #[arg(long, value_name = "REASON")]
         reason: Option<String>,
     },
-    /// Assign a task to a worker. Worker must be declared in project YAML.
+    /// Assign a task to a workspace. Workspace must be declared in project YAML.
     Assign {
         id: String,
-        #[arg(long, value_name = "WORKER")]
+        #[arg(long, value_name = "WORKSPACE")]
         to: String,
     },
-    /// Clear a task's worker assignment.
+    /// Clear a task's workspace assignment.
     Unassign { id: String },
-    /// Launch the assigned worker on this task: ensure the worktree is on
-    /// the task's branch, kill any existing worker pane (clears context),
+    /// Launch the assigned workspace on this task: ensure the worktree is on
+    /// the task's branch, kill any existing workspace pane (clears context),
     /// start the runner with the task's prompt. Moves the task into
-    /// `in_progress`. Pass `--worker` to assign at the same time.
+    /// `in_progress`. Pass `--workspace` to assign at the same time.
     Start {
         id: String,
-        #[arg(long, value_name = "WORKER")]
-        worker: Option<String>,
+        #[arg(long, value_name = "WORKSPACE")]
+        workspace: Option<String>,
         /// Override the default branch name (`shelbi/<task-id>`).
         #[arg(long)]
         branch: Option<String>,
@@ -114,7 +114,7 @@ pub struct AddArgs {
     #[arg(long = "depends-on", value_name = "ID")]
     pub depends_on: Vec<String>,
     /// Hint to the orchestrator that this task should be assigned to a
-    /// worker on this machine. Persisted in the task frontmatter; the
+    /// workspace on this machine. Persisted in the task frontmatter; the
     /// orchestrator decides whether to honor it.
     #[arg(long = "prefers-machine", value_name = "NAME")]
     pub prefers_machine: Option<String>,
@@ -174,8 +174,8 @@ pub fn run(project_opt: Option<String>, cmd: TaskCmd) -> Result<()> {
         TaskCmd::Move { id, to, reason } => move_to(&project, &id, &to, reason.as_deref()),
         TaskCmd::Assign { id, to } => assign(&project, &id, &to),
         TaskCmd::Unassign { id } => unassign(&project, &id),
-        TaskCmd::Start { id, worker, branch, reason } => {
-            start(&project, &id, worker.as_deref(), branch.as_deref(), reason.as_deref())
+        TaskCmd::Start { id, workspace, branch, reason } => {
+            start(&project, &id, workspace.as_deref(), branch.as_deref(), reason.as_deref())
         }
         TaskCmd::Prio(args) => prio(&project, args),
         TaskCmd::Edit { id } => edit(&project, &id),
@@ -476,13 +476,13 @@ fn norm_status_id(s: &str) -> String {
         .collect()
 }
 
-fn assign(project: &str, id: &str, worker: &str) -> Result<()> {
+fn assign(project: &str, id: &str, workspace: &str) -> Result<()> {
     let project_yaml = shelbi_state::load_project(project).map_err(|e| anyhow!(e))?;
-    if project_yaml.worker(worker).is_none() {
+    if project_yaml.workspace(workspace).is_none() {
         bail!(
-            "worker `{worker}` not declared in project `{project}` (known: {})",
+            "workspace `{workspace}` not declared in project `{project}` (known: {})",
             project_yaml
-                .workers
+                .workspaces
                 .iter()
                 .map(|w| w.name.as_str())
                 .collect::<Vec<_>>()
@@ -490,10 +490,10 @@ fn assign(project: &str, id: &str, worker: &str) -> Result<()> {
         );
     }
     let mut tf = shelbi_state::load_task(project, id).map_err(|e| anyhow!(e))?;
-    tf.task.assigned_to = Some(worker.to_string());
+    tf.task.assigned_to = Some(workspace.to_string());
     tf.task.updated_at = Utc::now();
     shelbi_state::save_task(project, &tf.task, &tf.body).map_err(|e| anyhow!(e))?;
-    println!("✓ {id} assigned to {worker}");
+    println!("✓ {id} assigned to {workspace}");
     Ok(())
 }
 
@@ -538,28 +538,28 @@ fn prio(project: &str, args: PrioArgs) -> Result<()> {
 fn start(
     project: &str,
     id: &str,
-    worker_arg: Option<&str>,
+    workspace_arg: Option<&str>,
     branch_arg: Option<&str>,
     reason: Option<&str>,
 ) -> Result<()> {
     let project_yaml = shelbi_state::load_project(project).map_err(|e| anyhow!(e))?;
     let mut tf = shelbi_state::load_task(project, id).map_err(|e| anyhow!(e))?;
 
-    // Resolve worker: explicit --worker wins; otherwise reuse task.assigned_to.
-    let worker_name = worker_arg
+    // Resolve workspace: explicit --workspace wins; otherwise reuse task.assigned_to.
+    let workspace_name = workspace_arg
         .map(str::to_string)
         .or_else(|| tf.task.assigned_to.clone())
         .ok_or_else(|| {
             anyhow!(
-                "task `{id}` has no assigned worker — pass `--worker NAME` or run \
-                 `shelbi task assign {id} --to <worker>` first"
+                "task `{id}` has no assigned workspace — pass `--workspace NAME` or run \
+                 `shelbi task assign {id} --to <workspace>` first"
             )
         })?;
-    let worker = project_yaml.worker(&worker_name).ok_or_else(|| {
+    let workspace = project_yaml.workspace(&workspace_name).ok_or_else(|| {
         anyhow!(
-            "worker `{worker_name}` not declared in project `{project}` (known: {})",
+            "workspace `{workspace_name}` not declared in project `{project}` (known: {})",
             project_yaml
-                .workers
+                .workspaces
                 .iter()
                 .map(|w| w.name.as_str())
                 .collect::<Vec<_>>()
@@ -567,18 +567,18 @@ fn start(
         )
     })?;
 
-    // Refuse to clobber another in-flight task on the same worker. Pulling
-    // a worker off mid-task is intentional — make the user do it explicitly
+    // Refuse to clobber another in-flight task on the same workspace. Pulling
+    // a workspace off mid-task is intentional — make the user do it explicitly
     // via `task move <other> --to todo` first.
     let conflict = shelbi_state::list_column(project, Column::InProgress)
         .map_err(|e| anyhow!(e))?
         .into_iter()
         .find(|tf| {
-            tf.task.assigned_to.as_deref() == Some(worker_name.as_str()) && tf.task.id != id
+            tf.task.assigned_to.as_deref() == Some(workspace_name.as_str()) && tf.task.id != id
         });
     if let Some(other) = conflict {
         bail!(
-            "worker `{worker_name}` is already on task `{}` (in_progress) — \
+            "workspace `{workspace_name}` is already on task `{}` (in_progress) — \
              move it to another column first",
             other.task.id
         );
@@ -586,10 +586,10 @@ fn start(
 
     // Cut the branch on the hub if it hasn't been already (depends_on
     // aware — see `shelbi_orchestrator::lifecycle`). Doing this BEFORE
-    // `start_worker_on_task` means the worker's `sync_worktree` sees an
-    // existing branch and just checks it out; for a hub-local worker
+    // `start_workspace_on_task` means the workspace's `sync_worktree` sees an
+    // existing branch and just checks it out; for a hub-local workspace
     // they share the repo, so the cut we just made is the same ref the
-    // worker will resolve. An explicit `--branch` override still wins:
+    // workspace will resolve. An explicit `--branch` override still wins:
     // it bypasses the lifecycle cut and tells `sync_worktree` to use
     // that ref directly (the *release task* pattern, Plans/workflows.md
     // §12).
@@ -606,11 +606,11 @@ fn start(
         .or_else(|| tf.task.branch.clone())
         .unwrap_or_else(|| format!("shelbi/{id}"));
 
-    println!("→ launching {worker_name} on {id} (branch: {branch})");
-    let addr = shelbi_orchestrator::worker::start_worker_on_task(
-        shelbi_orchestrator::worker::StartSpec {
+    println!("→ launching {workspace_name} on {id} (branch: {branch})");
+    let addr = shelbi_orchestrator::workspace::start_workspace_on_task(
+        shelbi_orchestrator::workspace::StartSpec {
             project: &project_yaml,
-            worker,
+            workspace,
             task_id: id,
             branch: &branch,
             task_body: &tf.body,
@@ -621,7 +621,7 @@ fn start(
     // Persist task state. Move to in_progress before saving so the
     // assigned_to/branch land alongside the column change in a single write.
     let now = Utc::now();
-    tf.task.assigned_to = Some(worker_name.clone());
+    tf.task.assigned_to = Some(workspace_name.clone());
     tf.task.branch = Some(branch.clone());
     tf.task.updated_at = now;
     let prev_column = tf.task.column;
@@ -648,7 +648,7 @@ fn start(
         }
     }
 
-    println!("✓ {id} → in_progress on {worker_name} ({})", addr.target());
+    println!("✓ {id} → in_progress on {workspace_name} ({})", addr.target());
     Ok(())
 }
 
@@ -696,7 +696,7 @@ fn generate_unique_id(project: &str, title: &str) -> Result<String> {
     if candidate.len() > MAX_TASK_ID_LEN {
         bail!(
             "title is too long: it slugifies to a {}-byte id (max {MAX_TASK_ID_LEN}) — \
-             the worker branch `shelbi/<id>` would exceed GitHub's 255-byte ref limit. \
+             the workspace branch `shelbi/<id>` would exceed GitHub's 255-byte ref limit. \
              Shorten the title or pass --id with an explicit shorter id.",
             candidate.len(),
         );
@@ -776,7 +776,7 @@ mod tests {
         std::env::set_var("SHELBI_HOME", &home);
 
         // A title whose slug exceeds the limit by a few bytes is enough to
-        // trip the worker branch over GitHub's 255-byte ref cap.
+        // trip the workspace branch over GitHub's 255-byte ref cap.
         let long_title = "a".repeat(MAX_TASK_ID_LEN + 10);
         let err = generate_unique_id("p", &long_title).unwrap_err().to_string();
         assert!(err.contains("title is too long"), "err: {err}");
@@ -829,7 +829,7 @@ mod tests {
         crate::commands::test_support::provision_hub_repo_for_project(&home, "p");
 
         shelbi_state::save_task("p", &task_in(Column::Todo, "b"), "").unwrap();
-        move_to("p", "b", "in_progress", Some("orchestrator:auto-dispatch worker=alpha"))
+        move_to("p", "b", "in_progress", Some("orchestrator:auto-dispatch workspace=alpha"))
             .unwrap();
 
         let log = std::fs::read_to_string(shelbi_state::events_log_path().unwrap()).unwrap();
@@ -839,7 +839,7 @@ mod tests {
         // value stays a single token even with the `from_category=` /
         // `to_category=` annotations trailing it (§10 shape).
         assert!(
-            lines[0].contains(" reason=orchestrator:auto-dispatch_worker=alpha "),
+            lines[0].contains(" reason=orchestrator:auto-dispatch_workspace=alpha "),
             "line: {}",
             lines[0],
         );

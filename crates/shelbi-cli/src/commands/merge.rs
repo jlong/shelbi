@@ -4,8 +4,8 @@ use shelbi_core::{Host, Machine, MergeStrategy, Status, TmuxAddr};
 
 use super::require_project;
 
-/// How many lines of the worker's tmux scrollback to embed in the PR body.
-/// Chosen to comfortably cover the worker's final report and the last few
+/// How many lines of the workspace's tmux scrollback to embed in the PR body.
+/// Chosen to comfortably cover the workspace's final report and the last few
 /// commits' chatter while staying well under GitHub's ~65k char PR body cap.
 const TRANSCRIPT_LINES: usize = 500;
 
@@ -62,7 +62,7 @@ fn run_pr(
     _strategy: MergeStrategy,
     id: &str,
 ) -> Result<()> {
-    // 1. Make sure `gh` is reachable on the worker host.
+    // 1. Make sure `gh` is reachable on the workspace host.
     let gh_probe = shelbi_ssh::run(host, ["gh", "--version"]).map_err(|e| anyhow!(e))?;
     if !gh_probe.status.success() {
         bail!(
@@ -81,7 +81,7 @@ fn run_pr(
         .map_err(|e| anyhow!(e))?;
 
     // 4. Gather optional context — `git diff --stat` against the target and
-    //    the tail of the worker's tmux pane. Both are best-effort; if either
+    //    the tail of the workspace's tmux pane. Both are best-effort; if either
     //    fails we just omit that section rather than blocking the PR.
     let diff_stat = capture_diff_stat(host, &wt, target, branch);
     let transcript = capture_transcript(host, &file.agent.tmux);
@@ -151,7 +151,7 @@ fn derive_pr_text(
     }
 
     if let Some(t) = transcript.map(str::trim_end).filter(|s| !s.is_empty()) {
-        body.push_str("\n<details>\n<summary>Worker transcript</summary>\n\n```\n");
+        body.push_str("\n<details>\n<summary>Workspace transcript</summary>\n\n```\n");
         body.push_str(t);
         if !t.ends_with('\n') {
             body.push('\n');
@@ -178,7 +178,7 @@ fn capture_diff_stat(host: &Host, worktree: &str, target: &str, branch: &str) ->
     }
 }
 
-/// Tail of the worker's tmux pane scrollback — the last things the agent
+/// Tail of the workspace's tmux pane scrollback — the last things the agent
 /// said before it handed off. Best-effort: if the pane is gone or capture
 /// fails, the PR body just won't include this section.
 fn capture_transcript(host: &Host, addr: &TmuxAddr) -> Option<String> {
@@ -347,7 +347,7 @@ mod tests {
         assert!(body.starts_with("# Task\n\nFix login.\n"));
         assert!(body.contains("— opened by [shelbi]"));
         assert!(!body.contains("## Files changed"));
-        assert!(!body.contains("Worker transcript"));
+        assert!(!body.contains("Workspace transcript"));
     }
 
     #[test]
@@ -366,7 +366,7 @@ mod tests {
         let transcript = "claude> done\nshelbi task move fix --to review\n";
         let (_, body) = derive_pr_text("# Task\n\nFix.\n", "fix", None, Some(transcript));
         assert!(body.contains("<details>"));
-        assert!(body.contains("<summary>Worker transcript</summary>"));
+        assert!(body.contains("<summary>Workspace transcript</summary>"));
         assert!(body.contains("claude> done"));
         assert!(body.contains("</details>"));
     }
@@ -375,7 +375,7 @@ mod tests {
     fn pr_body_omits_sections_for_empty_or_whitespace_inputs() {
         let (_, body) = derive_pr_text("# Task\n\nFix.\n", "fix", Some("   \n\n"), Some(""));
         assert!(!body.contains("## Files changed"));
-        assert!(!body.contains("Worker transcript"));
+        assert!(!body.contains("Workspace transcript"));
     }
 
     #[test]
@@ -387,7 +387,7 @@ mod tests {
             Some("the transcript"),
         );
         let diff_at = body.find("## Files changed").unwrap();
-        let transcript_at = body.find("Worker transcript").unwrap();
+        let transcript_at = body.find("Workspace transcript").unwrap();
         let footer_at = body.find("— opened by [shelbi]").unwrap();
         assert!(diff_at < transcript_at);
         assert!(transcript_at < footer_at);

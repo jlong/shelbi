@@ -29,46 +29,53 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Cmd {
-    /// Spawn a new worker agent on a machine.
+    /// Spawn a new workspace agent on a machine.
     Spawn(commands::spawn::Args),
-    /// List active workers.
+    /// List active workspaces.
     List,
-    /// Show the status of one or all workers.
+    /// Show the status of one or all workspaces.
     Status {
-        /// Worker id; omit to list all.
+        /// Workspace id; omit to list all.
         id: Option<String>,
     },
-    /// Send a follow-up message to a running worker.
+    /// Send a follow-up message to a running workspace.
     Send {
         id: String,
         message: String,
     },
-    /// Tail a worker's recent output.
+    /// Tail a workspace's recent output.
     Tail {
         id: String,
         #[arg(long, default_value_t = 40)]
         lines: usize,
     },
-    /// Show a worker's working-tree diff.
+    /// Show a workspace's working-tree diff.
     Diff { id: String },
-    /// Merge a worker's branch into the project's default branch.
+    /// Merge a workspace's branch into the project's default branch.
     Merge {
         id: String,
         /// Push branch + open a GitHub PR instead of a local merge.
         #[arg(long)]
         pr: bool,
     },
-    /// Archive a worker (keep the log, drop the worktree).
+    /// Archive a workspace (keep the log, drop the worktree).
     Archive { id: String },
     /// Manage the project's Kanban task board.
     Task {
         #[command(subcommand)]
         cmd: commands::task::TaskCmd,
     },
-    /// Inspect and control the project's declared worker pool.
+    /// Inspect and control the project's declared workspace pool.
+    Workspace {
+        #[command(subcommand)]
+        cmd: commands::workspace::WorkspaceCmd,
+    },
+    /// Deprecated alias for `shelbi workspace`. Will be removed in a future
+    /// release — see the stderr nag emitted on invocation.
+    #[command(hide = true)]
     Worker {
         #[command(subcommand)]
-        cmd: commands::worker::WorkerCmd,
+        cmd: commands::workspace::WorkspaceCmd,
     },
     /// Manage the project's workflow definitions (status sets).
     Workflow {
@@ -88,7 +95,7 @@ enum Cmd {
         #[command(subcommand)]
         cmd: commands::config::ConfigCmd,
     },
-    /// Inspect the hub-global worker-state transition log.
+    /// Inspect the hub-global workspace-state transition log.
     Events {
         #[command(subcommand)]
         cmd: commands::events::EventsCmd,
@@ -96,7 +103,7 @@ enum Cmd {
     /// Check a task's branch into the machine's review work_dir and
     /// (re)launch a fresh review-claude pane there.
     Review(commands::review::Args),
-    /// Attach the terminal to a worker's tmux pane.
+    /// Attach the terminal to a workspace's tmux pane.
     Attach { id: String },
     /// Scaffold ~/.shelbi/ and (optionally) a starter project YAML.
     Init(commands::init::Args),
@@ -109,7 +116,7 @@ enum Cmd {
     Orchestrate(commands::orchestrate::Args),
     /// Respawn the shelbi-owned panes (sidebar + tasks/review/machines) in
     /// place so a freshly installed binary takes effect. Leaves the
-    /// orchestrator pane and worker panes alone — those re-shell into
+    /// orchestrator pane and workspace panes alone — those re-shell into
     /// shelbi on every call and pick up the new binary automatically.
     Reload,
     /// (internal) Run the sidebar ratatui process inside the dashboard's
@@ -191,7 +198,11 @@ fn main() -> Result<()> {
         Some(Cmd::Merge { id, pr }) => commands::merge::run(cli.project, id, pr),
         Some(Cmd::Archive { id }) => commands::archive::run(cli.project, id),
         Some(Cmd::Task { cmd }) => commands::task::run(cli.project, cmd),
-        Some(Cmd::Worker { cmd }) => commands::worker::run(cli.project, cmd),
+        Some(Cmd::Workspace { cmd }) => commands::workspace::run(cli.project, cmd),
+        Some(Cmd::Worker { cmd }) => {
+            eprintln!("shelbi: 'worker' is deprecated; use 'workspace' instead.");
+            commands::workspace::run(cli.project, cmd)
+        }
         Some(Cmd::Workflow { cmd }) => commands::workflow::run(cli.project, cmd),
         Some(Cmd::Project { cmd }) => commands::project::run(cmd),
         Some(Cmd::Config { cmd }) => commands::config::run(cli.project, cmd),
@@ -323,4 +334,44 @@ fn open_tui_log_file() -> Option<std::fs::File> {
         .append(true)
         .open(dir.join("tui.log"))
         .ok()
+}
+
+#[cfg(test)]
+mod cli_tests {
+    use super::*;
+    use clap::Parser;
+    use commands::workspace::WorkspaceCmd;
+
+    /// `shelbi worker list` resolves to the same handler as
+    /// `shelbi workspace list` — clap parses both into the dispatch
+    /// chain that ends in `commands::workspace::run`. The deprecation
+    /// nag is a stderr side effect of the `Cmd::Worker` arm in `main`;
+    /// the parse-side guarantee tested here is that the alias accepts
+    /// every `WorkspaceCmd` subcommand.
+    #[test]
+    fn worker_alias_parses_into_workspace_subcommands() {
+        for verb in ["list", "stop"] {
+            let cli = match verb {
+                "stop" => Cli::parse_from(["shelbi", "worker", verb, "alpha"]),
+                _ => Cli::parse_from(["shelbi", "worker", verb]),
+            };
+            match cli.cmd {
+                Some(Cmd::Worker { cmd: WorkspaceCmd::List }) if verb == "list" => {}
+                Some(Cmd::Worker { cmd: WorkspaceCmd::Stop { name, .. } })
+                    if verb == "stop" && name == "alpha" => {}
+                other => panic!("expected Cmd::Worker for `{verb}`, got {other:?}"),
+            }
+        }
+    }
+
+    /// `shelbi workspace list` is the canonical form and parses into
+    /// `Cmd::Workspace` (no alias path).
+    #[test]
+    fn workspace_canonical_form_parses() {
+        let cli = Cli::parse_from(["shelbi", "workspace", "list"]);
+        match cli.cmd {
+            Some(Cmd::Workspace { cmd: WorkspaceCmd::List }) => {}
+            other => panic!("expected Cmd::Workspace::List, got {other:?}"),
+        }
+    }
 }

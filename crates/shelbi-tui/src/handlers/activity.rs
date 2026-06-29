@@ -53,7 +53,7 @@ pub fn handle_activity_key(app: &mut ActivityApp, key: KeyEvent, km: &Keymaps) {
         Some(ActivityAction::Refresh) => app.refresh(),
         Some(ActivityAction::ResetFilter) => app.reset_filter(),
         Some(ActivityAction::ToggleZenFilter) => app.toggle_zen_filter(),
-        Some(ActivityAction::ToggleWorkersFilter) => app.toggle_workers_filter(),
+        Some(ActivityAction::ToggleWorkspacesFilter) => app.toggle_workspaces_filter(),
         None => {}
     }
 }
@@ -200,7 +200,7 @@ mod tests {
     fn default_keymap_a_resets_filter() {
         let (mut app, km) = default_app_and_keymaps();
         app.filter.zen = true;
-        app.filter.workers = true;
+        app.filter.workspaces = true;
         app.scroll = 9;
         handle_activity_key(&mut app, ev_plain(KeyCode::Char('a')), &km);
         assert!(app.filter.is_all(), "a should clear both pills");
@@ -260,12 +260,12 @@ mod tests {
     }
 
     #[test]
-    fn default_keymap_w_toggles_workers_filter() {
+    fn default_keymap_w_toggles_workspaces_filter() {
         let (mut app, km) = default_app_and_keymaps();
         handle_activity_key(&mut app, ev_plain(KeyCode::Char('w')), &km);
-        assert!(app.filter.workers, "w should flip the workers pill on");
+        assert!(app.filter.workspaces, "w should flip the workspaces pill on");
         handle_activity_key(&mut app, ev_plain(KeyCode::Char('w')), &km);
-        assert!(!app.filter.workers, "w should flip the workers pill off");
+        assert!(!app.filter.workspaces, "w should flip the workspaces pill off");
     }
 
     #[test]

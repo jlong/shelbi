@@ -51,19 +51,19 @@ pub struct KanbanApp {
     /// by the renderer and read by the mouse-click handler to map a click
     /// back to a (column, row) pair.
     pub card_hits: Vec<CardHit>,
-    /// Declared worker names from project.yaml, in YAML order. Reloaded
+    /// Declared workspace names from project.yaml, in YAML order. Reloaded
     /// on every refresh so an edited project file shows up without a
     /// restart. Empty when the project YAML is missing.
-    pub workers: Vec<String>,
-    /// Active filter — `None` means "All workers".
-    /// [`WorkerFilter::Unassigned`] keeps only cards with no `assigned_to`.
-    /// Mirrored to `state.json::worker_filter` so the chip survives a
+    pub workspaces: Vec<String>,
+    /// Active filter — `None` means "All workspaces".
+    /// [`WorkspaceFilter::Unassigned`] keeps only cards with no `assigned_to`.
+    /// Mirrored to `state.json::workspace_filter` so the chip survives a
     /// respawn or project switch.
-    pub worker_filter: Option<WorkerFilter>,
-    /// When `Some`, the worker filter dropdown is open; carries the
+    pub workspace_filter: Option<WorkspaceFilter>,
+    /// When `Some`, the workspace filter dropdown is open; carries the
     /// in-flight cursor position so navigation can move through the
     /// options list. Selection only commits on Enter/Space.
-    pub worker_dropdown: Option<WorkerDropdown>,
+    pub workspace_dropdown: Option<WorkspaceDropdown>,
     /// Screen-space rect of the filter chip in the title row, captured
     /// each frame by the renderer so a click on the chip can open the
     /// dropdown without keyboard.
@@ -91,7 +91,7 @@ pub struct KanbanApp {
     /// `state.json::workflow_filter` so the chip survives a respawn.
     pub workflow_filter: Option<String>,
     /// When `Some`, the workflow filter dropdown is open. Same
-    /// modal-cursor shape as [`KanbanApp::worker_dropdown`] — selection
+    /// modal-cursor shape as [`KanbanApp::workspace_dropdown`] — selection
     /// commits on Enter / click.
     pub workflow_dropdown: Option<WorkflowDropdown>,
     /// Screen-space rect of the workflow filter chip in the title row,
@@ -122,84 +122,84 @@ pub struct KanbanApp {
     pub display_style: DisplayStyle,
 }
 
-/// Worker filter applied to the visible cards. Separate from the
+/// Workspace filter applied to the visible cards. Separate from the
 /// dropdown's cursor (which can hover the same options without
 /// committing) so the active filter and the in-flight selection can't
 /// silently desync.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum WorkerFilter {
-    /// Show only tasks assigned to this worker name.
-    Worker(String),
+pub enum WorkspaceFilter {
+    /// Show only tasks assigned to this workspace name.
+    Workspace(String),
     /// Show only tasks with no `assigned_to`. Distinct from "All" so the
     /// user can isolate the orchestrator-untouched backlog.
     Unassigned,
 }
 
-impl WorkerFilter {
-    /// Wire format stored in `state.json::worker_filter`. `Unassigned`
+impl WorkspaceFilter {
+    /// Wire format stored in `state.json::workspace_filter`. `Unassigned`
     /// gets a sentinel string rather than its own enum variant on disk
     /// so the schema stays a plain `Option<String>` — no migration
     /// needed when older code reads the field.
     pub const UNASSIGNED_SENTINEL: &'static str = "__unassigned__";
 
-    fn from_disk(s: &str) -> WorkerFilter {
+    fn from_disk(s: &str) -> WorkspaceFilter {
         if s == Self::UNASSIGNED_SENTINEL {
-            WorkerFilter::Unassigned
+            WorkspaceFilter::Unassigned
         } else {
-            WorkerFilter::Worker(s.to_string())
+            WorkspaceFilter::Workspace(s.to_string())
         }
     }
 
     fn to_disk(&self) -> String {
         match self {
-            WorkerFilter::Worker(w) => w.clone(),
-            WorkerFilter::Unassigned => Self::UNASSIGNED_SENTINEL.to_string(),
+            WorkspaceFilter::Workspace(w) => w.clone(),
+            WorkspaceFilter::Unassigned => Self::UNASSIGNED_SENTINEL.to_string(),
         }
     }
 
     /// Predicate against a task's `assigned_to` field.
     pub fn matches(&self, assigned_to: Option<&str>) -> bool {
         match self {
-            WorkerFilter::Worker(w) => assigned_to == Some(w.as_str()),
-            WorkerFilter::Unassigned => assigned_to.is_none(),
+            WorkspaceFilter::Workspace(w) => assigned_to == Some(w.as_str()),
+            WorkspaceFilter::Unassigned => assigned_to.is_none(),
         }
     }
 
     /// Short label used in the chip and the dropdown row.
     pub fn label(&self) -> String {
         match self {
-            WorkerFilter::Worker(w) => w.clone(),
-            WorkerFilter::Unassigned => "Unassigned".to_string(),
+            WorkspaceFilter::Workspace(w) => w.clone(),
+            WorkspaceFilter::Unassigned => "Unassigned".to_string(),
         }
     }
 }
 
 /// One entry rendered in the open dropdown — `None` is the "All
-/// workers" reset row, `Some(filter)` is a concrete filter the user can
+/// workspaces" reset row, `Some(filter)` is a concrete filter the user can
 /// commit to. Order matches the rendered options list, so the dropdown
 /// cursor and this slice can share an index.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DropdownOption {
-    pub filter: Option<WorkerFilter>,
+    pub filter: Option<WorkspaceFilter>,
     /// How many tasks currently match this option — shown in the
     /// dropdown row as a hint. Computed at render time from the
     /// in-memory tasks slice.
     pub count: usize,
 }
 
-/// State carried while the worker filter dropdown is open. Lives only
+/// State carried while the workspace filter dropdown is open. Lives only
 /// for the lifetime of the popover — selecting an option closes it and
 /// drops this back to `None`.
 #[derive(Debug, Clone)]
-pub struct WorkerDropdown {
+pub struct WorkspaceDropdown {
     /// Cursor row inside the options list; never out of range because
-    /// [`KanbanApp::open_worker_dropdown`] seeds it from the active
+    /// [`KanbanApp::open_workspace_dropdown`] seeds it from the active
     /// filter and the nav methods clamp.
     pub cursor: usize,
 }
 
 /// State carried while the workflow filter dropdown is open. Mirrors
-/// [`WorkerDropdown`] — just a cursor — but split into its own struct
+/// [`WorkspaceDropdown`] — just a cursor — but split into its own struct
 /// so the two dropdowns can't be confused at the call site and so a
 /// future workflow-only field (e.g. a filter substring) has somewhere
 /// to live.
@@ -300,9 +300,9 @@ impl KanbanApp {
             status_line: String::new(),
             popover: None,
             card_hits: Vec::new(),
-            workers: Vec::new(),
-            worker_filter: None,
-            worker_dropdown: None,
+            workspaces: Vec::new(),
+            workspace_filter: None,
+            workspace_dropdown: None,
             filter_chip_hit: None,
             dropdown_hits: Vec::new(),
             workflows: vec![default],
@@ -460,11 +460,11 @@ impl KanbanApp {
         resolve_task_status(task, wf) == ac.status_id
     }
 
-    /// True when `tf` passes the active worker filter. With no filter
+    /// True when `tf` passes the active workspace filter. With no filter
     /// active everything passes; otherwise the task's `assigned_to`
     /// must match the filter's predicate.
     fn task_matches_filter(&self, tf: &TaskFile) -> bool {
-        match &self.worker_filter {
+        match &self.workspace_filter {
             None => true,
             Some(f) => f.matches(tf.task.assigned_to.as_deref()),
         }
@@ -487,20 +487,20 @@ impl KanbanApp {
 
     pub fn refresh(&mut self) {
         // Project YAML may be missing on a fresh project — surface an
-        // empty worker list rather than failing the refresh; the
+        // empty workspace list rather than failing the refresh; the
         // dropdown will degrade to just "All" / "Unassigned" until the
         // project file appears.
-        self.workers = shelbi_state::load_project(&self.project_name)
-            .map(|p| p.workers.into_iter().map(|w| w.name).collect())
+        self.workspaces = shelbi_state::load_project(&self.project_name)
+            .map(|p| p.workspaces.into_iter().map(|w| w.name).collect())
             .unwrap_or_default();
         // Filter is purely view state — a missing / unreadable
         // state.json falls back to "All" silently. Reload every tick so
         // a CLI or palette edit shows up without a respawn.
         let state_snapshot = shelbi_state::read_state(&self.project_name).ok();
-        self.worker_filter = state_snapshot
+        self.workspace_filter = state_snapshot
             .as_ref()
-            .and_then(|s| s.worker_filter.clone())
-            .map(|s| WorkerFilter::from_disk(&s));
+            .and_then(|s| s.workspace_filter.clone())
+            .map(|s| WorkspaceFilter::from_disk(&s));
         self.workflow_filter = state_snapshot
             .as_ref()
             .and_then(|s| s.workflow_filter.clone());
@@ -529,26 +529,26 @@ impl KanbanApp {
         }
     }
 
-    /// Options shown in the worker dropdown — `All`, then each worker
+    /// Options shown in the workspace dropdown — `All`, then each workspace
     /// in YAML order, then `Unassigned` if any task lacks an
     /// `assigned_to`. Counts are computed against the unfiltered task
-    /// list so a worker with zero matching cards still appears
+    /// list so a workspace with zero matching cards still appears
     /// (otherwise the user couldn't pick it to clear a previously-set
-    /// filter on another worker).
+    /// filter on another workspace).
     pub fn dropdown_options(&self) -> Vec<DropdownOption> {
-        let mut opts: Vec<DropdownOption> = Vec::with_capacity(self.workers.len() + 2);
+        let mut opts: Vec<DropdownOption> = Vec::with_capacity(self.workspaces.len() + 2);
         opts.push(DropdownOption {
             filter: None,
             count: self.tasks.len(),
         });
-        for w in &self.workers {
+        for w in &self.workspaces {
             let count = self
                 .tasks
                 .iter()
                 .filter(|tf| tf.task.assigned_to.as_deref() == Some(w.as_str()))
                 .count();
             opts.push(DropdownOption {
-                filter: Some(WorkerFilter::Worker(w.clone())),
+                filter: Some(WorkspaceFilter::Workspace(w.clone())),
                 count,
             });
         }
@@ -559,7 +559,7 @@ impl KanbanApp {
             .count();
         if unassigned_count > 0 {
             opts.push(DropdownOption {
-                filter: Some(WorkerFilter::Unassigned),
+                filter: Some(WorkspaceFilter::Unassigned),
                 count: unassigned_count,
             });
         }
@@ -569,33 +569,33 @@ impl KanbanApp {
     /// Index of the option that matches the active filter, used to seed
     /// the dropdown cursor when it opens. Falls back to the "All" row
     /// (idx 0) if the active filter no longer appears in the options —
-    /// e.g. a worker was removed from project.yaml while a filter on it
+    /// e.g. a workspace was removed from project.yaml while a filter on it
     /// was still persisted.
     fn current_filter_idx(&self, opts: &[DropdownOption]) -> usize {
         opts.iter()
-            .position(|o| o.filter == self.worker_filter)
+            .position(|o| o.filter == self.workspace_filter)
             .unwrap_or(0)
     }
 
-    pub fn worker_dropdown_is_open(&self) -> bool {
-        self.worker_dropdown.is_some()
+    pub fn workspace_dropdown_is_open(&self) -> bool {
+        self.workspace_dropdown.is_some()
     }
 
-    pub fn open_worker_dropdown(&mut self) {
+    pub fn open_workspace_dropdown(&mut self) {
         let opts = self.dropdown_options();
         let cursor = self.current_filter_idx(&opts);
-        self.worker_dropdown = Some(WorkerDropdown { cursor });
+        self.workspace_dropdown = Some(WorkspaceDropdown { cursor });
     }
 
-    pub fn close_worker_dropdown(&mut self) {
-        self.worker_dropdown = None;
+    pub fn close_workspace_dropdown(&mut self) {
+        self.workspace_dropdown = None;
     }
 
-    pub fn toggle_worker_dropdown(&mut self) {
-        if self.worker_dropdown_is_open() {
-            self.close_worker_dropdown();
+    pub fn toggle_workspace_dropdown(&mut self) {
+        if self.workspace_dropdown_is_open() {
+            self.close_workspace_dropdown();
         } else {
-            self.open_worker_dropdown();
+            self.open_workspace_dropdown();
         }
     }
 
@@ -604,7 +604,7 @@ impl KanbanApp {
         if n == 0 {
             return;
         }
-        if let Some(d) = self.worker_dropdown.as_mut() {
+        if let Some(d) = self.workspace_dropdown.as_mut() {
             d.cursor = if d.cursor == 0 { n - 1 } else { d.cursor - 1 };
         }
     }
@@ -614,7 +614,7 @@ impl KanbanApp {
         if n == 0 {
             return;
         }
-        if let Some(d) = self.worker_dropdown.as_mut() {
+        if let Some(d) = self.workspace_dropdown.as_mut() {
             d.cursor = (d.cursor + 1) % n;
         }
     }
@@ -624,31 +624,31 @@ impl KanbanApp {
     /// respawn.
     pub fn dropdown_select(&mut self) {
         let opts = self.dropdown_options();
-        let Some(d) = self.worker_dropdown.as_ref() else {
+        let Some(d) = self.workspace_dropdown.as_ref() else {
             return;
         };
         let Some(opt) = opts.get(d.cursor) else {
-            self.close_worker_dropdown();
+            self.close_workspace_dropdown();
             return;
         };
         self.apply_filter(opt.filter.clone());
-        self.close_worker_dropdown();
+        self.close_workspace_dropdown();
     }
 
-    /// Persist `filter` as the new active worker filter and update the
+    /// Persist `filter` as the new active workspace filter and update the
     /// in-memory state. Best-effort on the disk write — view state
     /// shouldn't block the UI on a transient FS error.
-    fn apply_filter(&mut self, filter: Option<WorkerFilter>) {
-        self.worker_filter = filter.clone();
+    fn apply_filter(&mut self, filter: Option<WorkspaceFilter>) {
+        self.workspace_filter = filter.clone();
         let disk = filter.as_ref().map(|f| f.to_disk());
-        if let Err(e) = shelbi_state::set_worker_filter(&self.project_name, disk.as_deref()) {
+        if let Err(e) = shelbi_state::set_workspace_filter(&self.project_name, disk.as_deref()) {
             self.status_line = format!("filter persist failed: {e}");
         }
         // The selection may now point past the end of a column that
         // just shrank; clamp before the next render reads it.
         self.clamp_selection();
-        self.status_line = match &self.worker_filter {
-            None => "filter: all workers".to_string(),
+        self.status_line = match &self.workspace_filter {
+            None => "filter: all workspaces".to_string(),
             Some(f) => format!("filter: {}", f.label()),
         };
     }
@@ -657,7 +657,7 @@ impl KanbanApp {
     /// filter without needing to navigate to the "All" row.
     pub fn dropdown_clear(&mut self) {
         self.apply_filter(None);
-        self.close_worker_dropdown();
+        self.close_workspace_dropdown();
     }
 
     // ----- workflow filter --------------------------------------------------
@@ -685,7 +685,7 @@ impl KanbanApp {
     /// Options for the workflow dropdown: `All` (count = all tasks),
     /// then each loaded workflow with its task count. A workflow with
     /// zero matching tasks still appears so the user can pick it (the
-    /// scaffolding behaviour the worker dropdown uses for the same
+    /// scaffolding behaviour the workspace dropdown uses for the same
     /// reason).
     pub fn workflow_dropdown_options(&self) -> Vec<WorkflowDropdownOption> {
         let mut opts: Vec<WorkflowDropdownOption> =
@@ -777,7 +777,7 @@ impl KanbanApp {
     /// Persist `filter` as the active workflow filter, rebuild
     /// `all_columns`, and clamp selection so it lands on an existing
     /// column after the layout shrinks. Mirrors [`apply_filter`] for
-    /// the worker filter.
+    /// the workspace filter.
     fn apply_workflow_filter(&mut self, filter: Option<String>) {
         self.workflow_filter = filter.clone();
         if let Err(e) =
@@ -1132,8 +1132,8 @@ pub fn render_full(f: &mut Frame, app: &mut KanbanApp, area: Rect) {
     // Dropdown sits above the columns but below the popover so a card
     // detail dialog can still open over the dropdown without rendering
     // chrome bleeding through.
-    if app.worker_dropdown_is_open() {
-        render_worker_dropdown(f, app, area);
+    if app.workspace_dropdown_is_open() {
+        render_workspace_dropdown(f, app, area);
     } else {
         // Stale hits from a previous open would route clicks to a row
         // that's no longer on screen — clear them every frame we render
@@ -1154,28 +1154,28 @@ pub fn render_full(f: &mut Frame, app: &mut KanbanApp, area: Rect) {
 fn render_title(f: &mut Frame, app: &mut KanbanApp, area: Rect) {
     // Title row: project meta on the left, filter chips pinned to the
     // right. Two chips when there are multiple workflows loaded (so a
-    // workflow filter is meaningful); otherwise just the worker chip.
+    // workflow filter is meaningful); otherwise just the workspace chip.
     // Chip widths are precomputed so the left split knows exactly how
     // many columns the chips will consume — chips never wrap.
     let total = app.tasks.len();
-    let worker_text = filter_chip_text(app);
+    let workspace_text = filter_chip_text(app);
     let workflow_text = workflow_chip_text(app);
     let show_workflow_chip = app.workflows.len() > 1;
-    let worker_w = worker_text.chars().count() as u16;
+    let workspace_w = workspace_text.chars().count() as u16;
     let workflow_w = workflow_text.chars().count() as u16;
     let total_chip_w = if show_workflow_chip {
-        worker_w + workflow_w
+        workspace_w + workflow_w
     } else {
-        worker_w
+        workspace_w
     };
 
-    let (left_area, workflow_area, worker_area) = if area.width > total_chip_w {
+    let (left_area, workflow_area, workspace_area) = if area.width > total_chip_w {
         let mut constraints = Vec::with_capacity(3);
         constraints.push(Constraint::Min(0));
         if show_workflow_chip {
             constraints.push(Constraint::Length(workflow_w));
         }
-        constraints.push(Constraint::Length(worker_w));
+        constraints.push(Constraint::Length(workspace_w));
         let chunks = Layout::default()
             .direction(Direction::Horizontal)
             .constraints(constraints)
@@ -1220,14 +1220,14 @@ fn render_title(f: &mut Frame, app: &mut KanbanApp, area: Rect) {
         app.workflow_chip_hit = None;
     }
 
-    if let Some(area) = worker_area {
-        let style = if app.worker_filter.is_some() {
+    if let Some(area) = workspace_area {
+        let style = if app.workspace_filter.is_some() {
             Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)
         } else {
             Style::default().fg(Color::DarkGray)
         };
         f.render_widget(
-            Paragraph::new(Line::from(Span::styled(worker_text, style))),
+            Paragraph::new(Line::from(Span::styled(workspace_text, style))),
             area,
         );
         app.filter_chip_hit = Some(area);
@@ -1240,14 +1240,14 @@ fn render_title(f: &mut Frame, app: &mut KanbanApp, area: Rect) {
 /// space keeps the chip from sitting flush against the rightmost
 /// column. ▾ glyph hints that it's a dropdown affordance.
 fn filter_chip_text(app: &KanbanApp) -> String {
-    let label = match &app.worker_filter {
+    let label = match &app.workspace_filter {
         None => "All".to_string(),
         Some(f) => f.label(),
     };
-    format!(" Worker: {label} ▾")
+    format!(" Workspace: {label} ▾")
 }
 
-/// Workflow filter chip text — sits left of the worker chip when more
+/// Workflow filter chip text — sits left of the workspace chip when more
 /// than one workflow is loaded. Identical shape to [`filter_chip_text`]
 /// so the two chips line up visually.
 fn workflow_chip_text(app: &KanbanApp) -> String {
@@ -1533,13 +1533,13 @@ fn render_column(
         };
         let mut lines = vec![Line::from(Span::styled(title_text, title_style))];
         let id_w = tf.task.id.chars().count();
-        let worker_w = tf
+        let workspace_w = tf
             .task
             .assigned_to
             .as_deref()
             .map(|w| 3 + w.chars().count())
             .unwrap_or(0);
-        let meta_line = if id_w + worker_w <= max_text {
+        let meta_line = if id_w + workspace_w <= max_text {
             let mut spans = vec![Span::styled(
                 tf.task.id.clone(),
                 Style::default().fg(Color::DarkGray),
@@ -1652,30 +1652,31 @@ fn render_footer(f: &mut Frame, app: &KanbanApp, area: Rect) {
     f.render_widget(Paragraph::new(vec![keys, status]), area);
 }
 
-/// Render the worker filter dropdown as a small popover anchored under
+/// Render the workspace filter dropdown as a small popover anchored under
 /// the filter chip. The popover paints over the column headers + cards
 /// (`Clear` strips whatever was underneath), but does NOT suppress the
 /// title-row chip itself — keeping the chip visible while the dropdown
 /// is open is the visual link between the two.
-fn render_worker_dropdown(f: &mut Frame, app: &mut KanbanApp, area: Rect) {
+fn render_workspace_dropdown(f: &mut Frame, app: &mut KanbanApp, area: Rect) {
     let opts = app.dropdown_options();
     if opts.is_empty() {
         // Defensive: an empty options list means there's nothing to
         // pick. Close it so a stale dropdown doesn't linger.
-        app.close_worker_dropdown();
+        app.close_workspace_dropdown();
         return;
     }
-    let cursor = app.worker_dropdown.as_ref().map(|d| d.cursor).unwrap_or(0);
+    let cursor = app.workspace_dropdown.as_ref().map(|d| d.cursor).unwrap_or(0);
 
-    // Width = widest "Worker name (count)" row + 4 chars of chrome
+    // Width = widest "Workspace name (count)" row + 4 chars of chrome
     // (border + arrow + padding). Cap so the popover never spans more
-    // than ~⅓ of the screen — narrow lists shouldn't sprawl.
+    // than ~⅓ of the screen — narrow lists shouldn't sprawl. The lower
+    // bound is sized to fit the " Filter by workspace " title.
     let max_label_w = opts
         .iter()
         .map(|o| dropdown_row_text(o).chars().count())
         .max()
         .unwrap_or(10);
-    let desired_w = (max_label_w + 4).max(20) as u16;
+    let desired_w = (max_label_w + 4).max(24) as u16;
     let popover_w = desired_w.min(area.width).min(area.width / 3 + 8);
     // Anchor right edge to the chip's right edge so the dropdown
     // visually drops out of the chip. Fall back to right-aligned in
@@ -1707,7 +1708,7 @@ fn render_worker_dropdown(f: &mut Frame, app: &mut KanbanApp, area: Rect) {
         .borders(Borders::ALL)
         .border_style(Style::default().fg(Color::Cyan))
         .title(Line::from(vec![Span::styled(
-            " Filter by worker ",
+            " Filter by workspace ",
             Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
         )]));
     let inner = block.inner(popover_area);
@@ -1724,7 +1725,7 @@ fn render_worker_dropdown(f: &mut Frame, app: &mut KanbanApp, area: Rect) {
     let mut hits: Vec<DropdownHit> = Vec::with_capacity(opts.len());
     let mut items: Vec<ListItem> = Vec::with_capacity(opts.len());
     for (idx, opt) in opts.iter().enumerate() {
-        let active = app.worker_filter == opt.filter;
+        let active = app.workspace_filter == opt.filter;
         let label = dropdown_row_text(opt);
         // Active filter gets a leading bullet so the user can tell at
         // a glance which row is currently applied. The selected row
@@ -1787,9 +1788,9 @@ fn dropdown_row_text(opt: &DropdownOption) -> String {
     format!("{} ({})", label, opt.count)
 }
 
-/// Workflow filter dropdown — same anchor logic as the worker one but
+/// Workflow filter dropdown — same anchor logic as the workspace one but
 /// keyed off [`KanbanApp::workflow_chip_hit`] so it drops below the
-/// workflow chip. Kept as a separate function from the worker dropdown
+/// workflow chip. Kept as a separate function from the workspace dropdown
 /// so each can evolve (footer hints, future per-dropdown affordances)
 /// independently.
 fn render_workflow_dropdown(f: &mut Frame, app: &mut KanbanApp, area: Rect) {
@@ -1899,7 +1900,7 @@ fn render_workflow_dropdown(f: &mut Frame, app: &mut KanbanApp, area: Rect) {
 }
 
 /// Sibling of [`dropdown_row_text`] for workflow options. Keeping it
-/// separate avoids overloading the worker-side row formatter with a
+/// separate avoids overloading the workspace-side row formatter with a
 /// trait/enum that adds nothing to the only two callers.
 fn workflow_dropdown_row_text(opt: &WorkflowDropdownOption) -> String {
     let label = match &opt.filter {
@@ -2207,7 +2208,7 @@ fn popover_header(tf: &TaskFile, columns: &HashMap<String, Column>) -> Vec<Line<
     col_line.push(Span::raw(format!("{}", task.priority)));
     if let Some(w) = &task.assigned_to {
         col_line.push(Span::raw("   "));
-        col_line.push(meta_label("worker"));
+        col_line.push(meta_label("workspace"));
         col_line.push(Span::styled(
             format!("@{w}"),
             Style::default().fg(Color::Magenta),
@@ -2495,13 +2496,13 @@ mod tests {
         let _ = std::fs::remove_dir_all(&home);
     }
 
-    // ---- worker filter ---------------------------------------------------
+    // ---- workspace filter ---------------------------------------------------
 
     /// `column_tasks` applies both the column filter and the active
-    /// worker filter — a worker filter shrinks every column at once,
+    /// workspace filter — a workspace filter shrinks every column at once,
     /// not just the focused one.
     #[test]
-    fn column_tasks_applies_worker_filter() {
+    fn column_tasks_applies_workspace_filter() {
         let mut app = KanbanApp::new("demo");
         app.tasks = vec![
             task_file_for("a", Column::Todo, 0, "2026-06-20T10:00:00Z", Some("alpha")),
@@ -2513,25 +2514,25 @@ mod tests {
         assert_eq!(app.column_tasks(1).len(), 3);
         assert_eq!(app.column_tasks(2).len(), 1);
 
-        app.worker_filter = Some(WorkerFilter::Worker("alpha".into()));
+        app.workspace_filter = Some(WorkspaceFilter::Workspace("alpha".into()));
         let todo: Vec<&str> = app.column_tasks(1).iter().map(|t| t.task.id.as_str()).collect();
         assert_eq!(todo, vec!["a"]);
         let wip: Vec<&str> = app.column_tasks(2).iter().map(|t| t.task.id.as_str()).collect();
         assert_eq!(wip, vec!["c"]);
 
-        app.worker_filter = Some(WorkerFilter::Unassigned);
+        app.workspace_filter = Some(WorkspaceFilter::Unassigned);
         let todo: Vec<&str> = app.column_tasks(1).iter().map(|t| t.task.id.as_str()).collect();
         assert_eq!(todo, vec!["d"], "Unassigned filter keeps only `assigned_to: None`");
     }
 
-    /// `dropdown_options` builds `All` + each worker + (optional)
+    /// `dropdown_options` builds `All` + each workspace + (optional)
     /// `Unassigned`, in that order. Counts reflect the unfiltered task
-    /// list so workers with zero matching cards still appear (the user
+    /// list so workspaces with zero matching cards still appear (the user
     /// has to be able to pick them to clear an unrelated filter).
     #[test]
-    fn dropdown_options_lists_all_then_workers_then_unassigned() {
+    fn dropdown_options_lists_all_then_workspaces_then_unassigned() {
         let mut app = KanbanApp::new("demo");
-        app.workers = vec!["alpha".into(), "bravo".into(), "charlie".into()];
+        app.workspaces = vec!["alpha".into(), "bravo".into(), "charlie".into()];
         app.tasks = vec![
             task_file_for("a", Column::Todo, 0, "2026-06-20T10:00:00Z", Some("alpha")),
             task_file_for("b", Column::Todo, 1, "2026-06-20T10:00:00Z", Some("alpha")),
@@ -2543,11 +2544,11 @@ mod tests {
         assert_eq!(opts.len(), 5);
         assert!(opts[0].filter.is_none());
         assert_eq!(opts[0].count, 4);
-        assert_eq!(opts[1].filter, Some(WorkerFilter::Worker("alpha".into())));
+        assert_eq!(opts[1].filter, Some(WorkspaceFilter::Workspace("alpha".into())));
         assert_eq!(opts[1].count, 2);
-        assert_eq!(opts[3].filter, Some(WorkerFilter::Worker("charlie".into())));
-        assert_eq!(opts[3].count, 0, "zero-count workers still appear");
-        assert_eq!(opts[4].filter, Some(WorkerFilter::Unassigned));
+        assert_eq!(opts[3].filter, Some(WorkspaceFilter::Workspace("charlie".into())));
+        assert_eq!(opts[3].count, 0, "zero-count workspaces still appear");
+        assert_eq!(opts[4].filter, Some(WorkspaceFilter::Unassigned));
         assert_eq!(opts[4].count, 1);
     }
 
@@ -2556,7 +2557,7 @@ mod tests {
     #[test]
     fn dropdown_options_omits_unassigned_when_zero() {
         let mut app = KanbanApp::new("demo");
-        app.workers = vec!["alpha".into()];
+        app.workspaces = vec!["alpha".into()];
         app.tasks = vec![task_file_for(
             "a",
             Column::Todo,
@@ -2566,7 +2567,7 @@ mod tests {
         )];
         let opts = app.dropdown_options();
         assert!(
-            !opts.iter().any(|o| o.filter == Some(WorkerFilter::Unassigned)),
+            !opts.iter().any(|o| o.filter == Some(WorkspaceFilter::Unassigned)),
             "no unassigned tasks → no Unassigned row, got {:?}",
             opts.iter().map(|o| &o.filter).collect::<Vec<_>>()
         );
@@ -2578,33 +2579,33 @@ mod tests {
     #[test]
     fn dropdown_open_seeds_cursor_on_active_filter_and_nav_wraps() {
         let mut app = KanbanApp::new("demo");
-        app.workers = vec!["alpha".into(), "bravo".into()];
+        app.workspaces = vec!["alpha".into(), "bravo".into()];
         app.tasks = vec![
             task_file_for("a", Column::Todo, 0, "2026-06-20T10:00:00Z", Some("alpha")),
             task_file_for("b", Column::Todo, 1, "2026-06-20T10:00:00Z", Some("bravo")),
         ];
-        app.worker_filter = Some(WorkerFilter::Worker("bravo".into()));
-        app.open_worker_dropdown();
+        app.workspace_filter = Some(WorkspaceFilter::Workspace("bravo".into()));
+        app.open_workspace_dropdown();
         // Options are [All, alpha, bravo] → bravo is index 2.
-        assert_eq!(app.worker_dropdown.as_ref().unwrap().cursor, 2);
+        assert_eq!(app.workspace_dropdown.as_ref().unwrap().cursor, 2);
 
         app.dropdown_nav_down();
-        assert_eq!(app.worker_dropdown.as_ref().unwrap().cursor, 0, "wraps to top");
+        assert_eq!(app.workspace_dropdown.as_ref().unwrap().cursor, 0, "wraps to top");
         app.dropdown_nav_up();
-        assert_eq!(app.worker_dropdown.as_ref().unwrap().cursor, 2, "wraps to bottom");
+        assert_eq!(app.workspace_dropdown.as_ref().unwrap().cursor, 2, "wraps to bottom");
     }
 
     /// An active filter that no longer matches any option (e.g. a
-    /// worker was removed from project.yaml) seeds the cursor on `All`
+    /// workspace was removed from project.yaml) seeds the cursor on `All`
     /// rather than panicking on an out-of-range index. The active
     /// filter itself isn't auto-cleared — only the cursor lands at 0.
     #[test]
     fn dropdown_open_falls_back_to_all_when_filter_missing_from_options() {
         let mut app = KanbanApp::new("demo");
-        app.workers = vec!["alpha".into()];
-        app.worker_filter = Some(WorkerFilter::Worker("removed".into()));
-        app.open_worker_dropdown();
-        assert_eq!(app.worker_dropdown.as_ref().unwrap().cursor, 0);
+        app.workspaces = vec!["alpha".into()];
+        app.workspace_filter = Some(WorkspaceFilter::Workspace("removed".into()));
+        app.open_workspace_dropdown();
+        assert_eq!(app.workspace_dropdown.as_ref().unwrap().cursor, 0);
     }
 
     /// `apply_filter` (via `dropdown_select`) updates the in-memory
@@ -2615,7 +2616,7 @@ mod tests {
     fn apply_filter_persists_to_state_json_and_refresh_restores() {
         let _g = crate::test_support::ENV_LOCK.lock().unwrap();
         let home = std::env::temp_dir().join(format!(
-            "shelbi-tui-worker-filter-{}-{}",
+            "shelbi-tui-workspace-filter-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -2625,7 +2626,7 @@ mod tests {
         std::fs::create_dir_all(&home).unwrap();
         std::env::set_var("SHELBI_HOME", &home);
 
-        // Project needs to exist so refresh() can populate workers.
+        // Project needs to exist so refresh() can populate workspaces.
         let project = shelbi_core::Project {
             name: "demo".into(),
             repo: "git@example:demo.git".into(),
@@ -2653,21 +2654,21 @@ mod tests {
             },
             editor: None,
             github_url: None,
-            workers: vec![
-                shelbi_core::WorkerSpec {
+            workspaces: vec![
+                shelbi_core::WorkspaceSpec {
                     name: "alpha".into(),
                     machine: "hub".into(),
                     runner: "claude".into(),
                 },
-                shelbi_core::WorkerSpec {
+                shelbi_core::WorkspaceSpec {
                     name: "bravo".into(),
                     machine: "hub".into(),
                     runner: "claude".into(),
                 },
             ],
-            worker_poll_interval_secs: 5,
-            worker_permissions_mode: "auto".into(),
-            worker_settings_template: None,
+            workspace_poll_interval_secs: 5,
+            workspace_permissions_mode: "auto".into(),
+            workspace_settings_template: None,
             zen: shelbi_core::ZenConfig::default(),
             heartbeat: shelbi_core::HeartbeatConfig::default(),
             contextstore_sync: Vec::new(),
@@ -2677,25 +2678,25 @@ mod tests {
 
         let mut app = KanbanApp::new("demo");
         app.refresh();
-        assert!(app.worker_filter.is_none(), "fresh state.json → no filter");
-        assert_eq!(app.workers, vec!["alpha".to_string(), "bravo".to_string()]);
+        assert!(app.workspace_filter.is_none(), "fresh state.json → no filter");
+        assert_eq!(app.workspaces, vec!["alpha".to_string(), "bravo".to_string()]);
 
         // Open, navigate to the bravo row (All=0, alpha=1, bravo=2),
         // commit. The dropdown closes itself.
-        app.open_worker_dropdown();
+        app.open_workspace_dropdown();
         app.dropdown_nav_down();
         app.dropdown_nav_down();
         app.dropdown_select();
-        assert!(!app.worker_dropdown_is_open());
-        assert_eq!(app.worker_filter, Some(WorkerFilter::Worker("bravo".into())));
+        assert!(!app.workspace_dropdown_is_open());
+        assert_eq!(app.workspace_filter, Some(WorkspaceFilter::Workspace("bravo".into())));
 
         // A fresh app rehydrates the same filter from disk.
         let mut app2 = KanbanApp::new("demo");
         app2.refresh();
-        assert_eq!(app2.worker_filter, Some(WorkerFilter::Worker("bravo".into())));
+        assert_eq!(app2.workspace_filter, Some(WorkspaceFilter::Workspace("bravo".into())));
 
         // Unassigned round-trips through the sentinel.
-        app2.open_worker_dropdown();
+        app2.open_workspace_dropdown();
         // Options: All / alpha / bravo / Unassigned? — we need an
         // unassigned task to surface it. Seed one and refresh.
         let now = chrono::Utc::now();
@@ -2720,82 +2721,82 @@ mod tests {
         )
         .unwrap();
         app2.refresh();
-        app2.open_worker_dropdown();
+        app2.open_workspace_dropdown();
         let opts = app2.dropdown_options();
         let unassigned_idx = opts
             .iter()
-            .position(|o| o.filter == Some(WorkerFilter::Unassigned))
+            .position(|o| o.filter == Some(WorkspaceFilter::Unassigned))
             .expect("Unassigned row should now appear");
-        if let Some(d) = app2.worker_dropdown.as_mut() {
+        if let Some(d) = app2.workspace_dropdown.as_mut() {
             d.cursor = unassigned_idx;
         }
         app2.dropdown_select();
-        assert_eq!(app2.worker_filter, Some(WorkerFilter::Unassigned));
+        assert_eq!(app2.workspace_filter, Some(WorkspaceFilter::Unassigned));
         let on_disk = shelbi_state::read_state("demo").unwrap();
         assert_eq!(
-            on_disk.worker_filter.as_deref(),
-            Some(WorkerFilter::UNASSIGNED_SENTINEL),
+            on_disk.workspace_filter.as_deref(),
+            Some(WorkspaceFilter::UNASSIGNED_SENTINEL),
             "Unassigned must serialize to its sentinel string"
         );
 
         // `dropdown_clear` resets to None and writes that through to
         // disk so a subsequent refresh sees the cleared filter.
-        app2.open_worker_dropdown();
+        app2.open_workspace_dropdown();
         app2.dropdown_clear();
-        assert_eq!(app2.worker_filter, None);
+        assert_eq!(app2.workspace_filter, None);
         let on_disk = shelbi_state::read_state("demo").unwrap();
-        assert!(on_disk.worker_filter.is_none());
+        assert!(on_disk.workspace_filter.is_none());
 
         std::env::remove_var("SHELBI_HOME");
         let _ = std::fs::remove_dir_all(&home);
     }
 
     /// Selecting the `All` row clears the filter even when it was
-    /// previously set to a specific worker — the dropdown commit path
+    /// previously set to a specific workspace — the dropdown commit path
     /// has to accept `None` as a valid choice.
     #[test]
     fn dropdown_select_all_clears_filter() {
         let mut app = KanbanApp::new("demo");
-        app.workers = vec!["alpha".into()];
-        app.worker_filter = Some(WorkerFilter::Worker("alpha".into()));
-        app.open_worker_dropdown();
+        app.workspaces = vec!["alpha".into()];
+        app.workspace_filter = Some(WorkspaceFilter::Workspace("alpha".into()));
+        app.open_workspace_dropdown();
         // Cursor seeds on alpha (idx 1). Walk back to All.
         app.dropdown_nav_up();
-        assert_eq!(app.worker_dropdown.as_ref().unwrap().cursor, 0);
+        assert_eq!(app.workspace_dropdown.as_ref().unwrap().cursor, 0);
         // No disk write here because no SHELBI_HOME is set — the
         // persist error lands in status_line but the in-memory state
         // still updates.
         app.dropdown_select();
-        assert!(app.worker_filter.is_none());
-        assert!(!app.worker_dropdown_is_open());
+        assert!(app.workspace_filter.is_none());
+        assert!(!app.workspace_dropdown_is_open());
     }
 
     /// Toggling the dropdown closes it when open, opens when closed —
     /// matches the chord-style "press the same key to dismiss" UX.
     #[test]
-    fn toggle_worker_dropdown_is_self_inverse() {
+    fn toggle_workspace_dropdown_is_self_inverse() {
         let mut app = KanbanApp::new("demo");
-        assert!(!app.worker_dropdown_is_open());
-        app.toggle_worker_dropdown();
-        assert!(app.worker_dropdown_is_open());
-        app.toggle_worker_dropdown();
-        assert!(!app.worker_dropdown_is_open());
+        assert!(!app.workspace_dropdown_is_open());
+        app.toggle_workspace_dropdown();
+        assert!(app.workspace_dropdown_is_open());
+        app.toggle_workspace_dropdown();
+        assert!(!app.workspace_dropdown_is_open());
     }
 
     /// Rendering the kanban with the dropdown open must show the
-    /// chip in the title row, paint every worker option (plus All), and
+    /// chip in the title row, paint every workspace option (plus All), and
     /// populate `dropdown_hits` so click routing has rects to test
     /// against.
     #[test]
     fn rendering_dropdown_paints_options_and_chip() {
         use ratatui::{backend::TestBackend, Terminal};
         let mut app = KanbanApp::new("demo");
-        app.workers = vec!["alpha".into(), "bravo".into()];
+        app.workspaces = vec!["alpha".into(), "bravo".into()];
         app.tasks = vec![
             task_file_for("a", Column::Todo, 0, "2026-06-20T10:00:00Z", Some("alpha")),
             task_file_for("b", Column::Todo, 1, "2026-06-20T10:00:00Z", Some("bravo")),
         ];
-        app.open_worker_dropdown();
+        app.open_workspace_dropdown();
 
         // Wide enough to hold the chip on the right and the dropdown.
         let backend = TestBackend::new(80, 20);
@@ -2813,8 +2814,8 @@ mod tests {
             .collect();
         let joined = rendered.join("\n");
 
-        assert!(joined.contains("Worker: All ▾"), "chip missing in:\n{joined}");
-        assert!(joined.contains("Filter by worker"), "dropdown title missing");
+        assert!(joined.contains("Workspace: All ▾"), "chip missing in:\n{joined}");
+        assert!(joined.contains("Filter by workspace"), "dropdown title missing");
         assert!(joined.contains("All (2)"), "All row missing in:\n{joined}");
         assert!(joined.contains("alpha (1)"), "alpha row missing in:\n{joined}");
         assert!(joined.contains("bravo (1)"), "bravo row missing in:\n{joined}");
@@ -2823,7 +2824,7 @@ mod tests {
         assert_eq!(
             app.dropdown_hits.len(),
             3,
-            "expected 3 dropdown hits (All + 2 workers), got {}",
+            "expected 3 dropdown hits (All + 2 workspaces), got {}",
             app.dropdown_hits.len()
         );
     }
@@ -3380,7 +3381,7 @@ mod tests {
     }
 
     /// Toggling the workflow dropdown is self-inverse, the same way
-    /// the worker dropdown is — the same key opens and closes it.
+    /// the workspace dropdown is — the same key opens and closes it.
     #[test]
     fn toggle_workflow_dropdown_is_self_inverse() {
         let mut app = KanbanApp::new("demo");
@@ -3458,7 +3459,7 @@ mod tests {
 
     /// Full render with a workflow filter applied: only that
     /// workflow's columns paint, and the workflow chip shows the
-    /// active filter. The worker chip stays in place beside it.
+    /// active filter. The workspace chip stays in place beside it.
     #[test]
     fn rendering_workflow_filter_narrows_visible_columns() {
         use ratatui::{backend::TestBackend, Terminal};

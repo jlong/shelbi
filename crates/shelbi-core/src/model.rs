@@ -43,24 +43,29 @@ pub struct Project {
     /// merge `--pr` flow still resolves the remote via local git config.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub github_url: Option<String>,
-    /// Fixed pool of worker agents available to this project. Each owns a
+    /// Fixed pool of workspace agents available to this project. Each owns a
     /// stable worktree on its machine; the orchestrator routes tasks to
-    /// workers by name. See [`WorkerSpec`].
-    #[serde(default)]
-    pub workers: Vec<WorkerSpec>,
-    /// How often the orchestrator polls each worker pane for state changes.
-    #[serde(default = "default_worker_poll_interval_secs")]
-    pub worker_poll_interval_secs: u64,
-    /// Permissions posture rendered into the worker settings template
-    /// (see [`Project::worker_settings_template`]). The default `auto`
+    /// workspaces by name. See [`WorkspaceSpec`].
+    ///
+    /// Accepts the legacy `workers:` key as an alias for one release; new
+    /// projects materialized by the wizard / `shelbi init` emit
+    /// `workspaces:`. See `shelbi_state::load_project` for the
+    /// one-shot deprecation warning that fires when the legacy key is read.
+    #[serde(default, alias = "workers")]
+    pub workspaces: Vec<WorkspaceSpec>,
+    /// How often the orchestrator polls each workspace pane for state changes.
+    #[serde(default = "default_workspace_poll_interval_secs")]
+    pub workspace_poll_interval_secs: u64,
+    /// Permissions posture rendered into the workspace settings template
+    /// (see [`Project::workspace_settings_template`]). The default `auto`
     /// is mapped to claude's `acceptEdits` at render time.
-    #[serde(default = "default_worker_permissions_mode")]
-    pub worker_permissions_mode: String,
-    /// Optional override for the path to the per-project worker settings
+    #[serde(default = "default_workspace_permissions_mode")]
+    pub workspace_permissions_mode: String,
+    /// Optional override for the path to the per-project workspace settings
     /// template. When `None`, the default at
-    /// `~/.shelbi/projects/<name>/worker-settings.json.template` is used.
+    /// `~/.shelbi/projects/<name>/workspace-settings.json.template` is used.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub worker_settings_template: Option<PathBuf>,
+    pub workspace_settings_template: Option<PathBuf>,
     /// Zen Mode configuration: which checks to run, how long to wait on
     /// CI, and which paths require human review even in Zen Mode.
     #[serde(default)]
@@ -71,7 +76,7 @@ pub struct Project {
     /// Default `3m`; set to `off` to disable. See [`HeartbeatConfig`].
     #[serde(default)]
     pub heartbeat: HeartbeatConfig,
-    /// Project-level git config: where worker branches are based and how
+    /// Project-level git config: where workspace branches are based and how
     /// `shelbi merge` (and Zen Mode's auto-merge path) integrates them
     /// back. `base_branch` falls back to [`Project::default_branch`] when
     /// unset, so existing project YAMLs keep working without a `git:`
@@ -79,8 +84,8 @@ pub struct Project {
     /// [`Project::merge_strategy`].
     #[serde(default)]
     pub git: GitConfig,
-    /// ContextStore spaces that should be rsynced from a remote worker's
-    /// machine back to hub after the worker hands off for review. Each
+    /// ContextStore spaces that should be rsynced from a remote workspace's
+    /// machine back to hub after the workspace hands off for review. Each
     /// space's path is interpreted on both hub and remote — leading `~`
     /// is expanded by rsync against the respective `$HOME`. See
     /// `shelbi_orchestrator::contextstore` for the sync path. Default
@@ -97,7 +102,7 @@ pub struct Project {
 }
 
 /// One ContextStore space that shelbi keeps in sync between hub and
-/// remote workers. The `space` field is matched against the body
+/// remote workspaces. The `space` field is matched against the body
 /// heuristic (`"<space>/"` substring) when deciding whether a finished
 /// task touched ContextStore; `path` is fed to rsync on both sides.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -236,18 +241,18 @@ fn default_branch() -> String {
 /// [`Project::base_branch`] resolves the effective value.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct GitConfig {
-    /// Branch to base worker branches on and target when merging. When
+    /// Branch to base workspace branches on and target when merging. When
     /// `None`, callers fall back to [`Project::default_branch`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub base_branch: Option<String>,
     /// How `shelbi merge` (and Zen Mode's auto-merge path) integrates a
-    /// worker branch back into [`Project::base_branch`]. Default
+    /// workspace branch back into [`Project::base_branch`]. Default
     /// [`MergeStrategy::Squash`] preserves the historical behavior.
     #[serde(default)]
     pub merge_strategy: MergeStrategy,
 }
 
-/// How a worker branch is integrated back into the base branch. Maps
+/// How a workspace branch is integrated back into the base branch. Maps
 /// 1:1 onto `gh pr merge --{squash,merge,rebase}` and the equivalent
 /// local `git merge` / `git rebase` invocations.
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -294,11 +299,11 @@ impl std::fmt::Display for MergeStrategy {
     }
 }
 
-fn default_worker_poll_interval_secs() -> u64 {
+fn default_workspace_poll_interval_secs() -> u64 {
     5
 }
 
-fn default_worker_permissions_mode() -> String {
+fn default_workspace_permissions_mode() -> String {
     "auto".to_string()
 }
 
@@ -327,8 +332,8 @@ impl Project {
         self.agent_runners.get(name)
     }
 
-    pub fn worker(&self, name: &str) -> Option<&WorkerSpec> {
-        self.workers.iter().find(|w| w.name == name)
+    pub fn workspace(&self, name: &str) -> Option<&WorkspaceSpec> {
+        self.workspaces.iter().find(|w| w.name == name)
     }
 
     /// Inspect the filesystem at `root` (typically `self.repo`) and cache
@@ -339,9 +344,9 @@ impl Project {
         self.detected_shapes = detect_project_shapes(root.as_ref());
     }
 
-    /// Cross-check workers reference declared machines and runners.
-    pub fn validate_workers(&self) -> crate::Result<()> {
-        for w in &self.workers {
+    /// Cross-check workspaces reference declared machines and runners.
+    pub fn validate_workspaces(&self) -> crate::Result<()> {
+        for w in &self.workspaces {
             if self.machine(&w.machine).is_none() {
                 return Err(crate::Error::UnknownMachine(w.machine.clone()));
             }
@@ -354,14 +359,14 @@ impl Project {
 }
 
 // ---------------------------------------------------------------------------
-// Worker (declared agent in project YAML)
+// Workspace (declared agent in project YAML)
 
-/// A worker is a long-lived slot on a machine: one stable worktree, one
-/// runner. Workers pick up tasks from the board and switch branches between
+/// A workspace is a long-lived slot on a machine: one stable worktree, one
+/// runner. Workspaces pick up tasks from the board and switch branches between
 /// assignments (with cleared context). The worktree path is derived as
-/// `<machine.work_dir>/.shelbi/wt/<worker-name>` — not configurable yet.
+/// `<machine.work_dir>/.shelbi/wt/<workspace-name>` — not configurable yet.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct WorkerSpec {
+pub struct WorkspaceSpec {
     pub name: String,
     pub machine: String,
     pub runner: String,
@@ -436,9 +441,9 @@ pub struct OrchestratorSpec {
 }
 
 // ---------------------------------------------------------------------------
-// Worker / Agent state
+// Workspace / Agent state
 
-/// Persistent state for a single worker agent.
+/// Persistent state for a single workspace agent.
 ///
 /// Serialized as YAML frontmatter on disk. The markdown body lives separately.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -479,7 +484,7 @@ impl Status {
     }
 }
 
-/// A tmux address — `session:window` (we keep pane implicit; one pane per worker).
+/// A tmux address — `session:window` (we keep pane implicit; one pane per workspace).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TmuxAddr {
     pub session: String,
@@ -500,9 +505,9 @@ impl TmuxAddr {
 /// Lifecycle:
 ///
 /// - `Backlog`: orchestrator-created, awaiting user triage.
-/// - `Todo`: user-curated, ready for a worker to pick up.
-/// - `InProgress`: assigned and active on a worker.
-/// - `Review`: worker reports done; user inspects via the review dir.
+/// - `Todo`: user-curated, ready for a workspace to pick up.
+/// - `InProgress`: assigned and active on a workspace.
+/// - `Review`: workspace reports done; user inspects via the review dir.
 /// - `Done`: accepted by user.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -636,7 +641,7 @@ pub struct Task {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub depends_on: Vec<String>,
     /// Optional hint to the orchestrator: prefer assigning this task to a
-    /// worker on the named machine. Persisted only; enforcement (or
+    /// workspace on the named machine. Persisted only; enforcement (or
     /// override) is the orchestrator's choice.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prefers_machine: Option<String>,
@@ -687,7 +692,7 @@ impl Task {
 /// every new project (`workflows/default.yaml`).
 pub const DEFAULT_WORKFLOW_NAME: &str = "default";
 
-/// Max byte length of a task id. The worker branch is `shelbi/<id>` (7-byte
+/// Max byte length of a task id. The workspace branch is `shelbi/<id>` (7-byte
 /// prefix) and GitHub caps ref names at 255 bytes; we leave a 15-byte buffer
 /// so refs derived from the id stay at most 240 bytes.
 pub const MAX_TASK_ID_LEN: usize = 233;
@@ -753,7 +758,7 @@ fn default_ci_timeout() -> Duration {
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ZenChecks {
-    /// Shell commands run locally before the worker hands off to CI.
+    /// Shell commands run locally before the workspace hands off to CI.
     /// Each entry is a single command line, executed in the worktree
     /// root.
     #[serde(default)]
@@ -1444,7 +1449,7 @@ updated_at: 2026-06-19T00:00:00Z
     }
 
     #[test]
-    fn project_yaml_omits_new_worker_keys_and_uses_defaults() {
+    fn project_yaml_omits_new_workspace_keys_and_uses_defaults() {
         let yaml = r#"
 name: p
 repo: r
@@ -1455,9 +1460,9 @@ agent_runners:
   claude: { command: claude, flags: [] }
 "#;
         let p: Project = serde_yaml::from_str(yaml).unwrap();
-        assert_eq!(p.worker_poll_interval_secs, 5);
-        assert_eq!(p.worker_permissions_mode, "auto");
-        assert!(p.worker_settings_template.is_none());
+        assert_eq!(p.workspace_poll_interval_secs, 5);
+        assert_eq!(p.workspace_permissions_mode, "auto");
+        assert!(p.workspace_settings_template.is_none());
     }
 
     #[test]
@@ -1483,7 +1488,7 @@ agent_runners:
     #[test]
     fn project_yaml_round_trips_contextstore_sync_block() {
         // Real-world shape: opt in by listing the spaces that need to
-        // come back from remote workers, with their on-disk dir.
+        // come back from remote workspaces, with their on-disk dir.
         let yaml = r#"
 name: p
 repo: r
@@ -1510,7 +1515,7 @@ contextstore_sync:
     }
 
     #[test]
-    fn project_yaml_round_trips_explicit_worker_keys() {
+    fn project_yaml_round_trips_explicit_workspace_keys() {
         let yaml = r#"
 name: p
 repo: r
@@ -1519,21 +1524,21 @@ machines:
 orchestrator: { runner: claude }
 agent_runners:
   claude: { command: claude, flags: [] }
-worker_poll_interval_secs: 12
-worker_permissions_mode: acceptEdits
-worker_settings_template: /etc/shelbi/p.json
+workspace_poll_interval_secs: 12
+workspace_permissions_mode: acceptEdits
+workspace_settings_template: /etc/shelbi/p.json
 "#;
         let p: Project = serde_yaml::from_str(yaml).unwrap();
-        assert_eq!(p.worker_poll_interval_secs, 12);
-        assert_eq!(p.worker_permissions_mode, "acceptEdits");
+        assert_eq!(p.workspace_poll_interval_secs, 12);
+        assert_eq!(p.workspace_permissions_mode, "acceptEdits");
         assert_eq!(
-            p.worker_settings_template.as_deref(),
+            p.workspace_settings_template.as_deref(),
             Some(std::path::Path::new("/etc/shelbi/p.json"))
         );
     }
 
     #[test]
-    fn workers_validate_against_machines_and_runners() {
+    fn workspaces_validate_against_machines_and_runners() {
         let mut runners = std::collections::BTreeMap::new();
         runners.insert("claude".to_string(), AgentRunnerSpec { command: "claude".into(), flags: vec![] });
         let project = Project {
@@ -1550,27 +1555,27 @@ worker_settings_template: /etc/shelbi/p.json
             agent_runners: runners,
             editor: None,
             github_url: None,
-            workers: vec![
-                WorkerSpec { name: "alice".into(), machine: "hub".into(), runner: "claude".into() },
+            workspaces: vec![
+                WorkspaceSpec { name: "alice".into(), machine: "hub".into(), runner: "claude".into() },
             ],
-            worker_poll_interval_secs: default_worker_poll_interval_secs(),
-            worker_permissions_mode: default_worker_permissions_mode(),
-            worker_settings_template: None,
+            workspace_poll_interval_secs: default_workspace_poll_interval_secs(),
+            workspace_permissions_mode: default_workspace_permissions_mode(),
+            workspace_settings_template: None,
             zen: ZenConfig::default(),
             heartbeat: HeartbeatConfig::default(),
             git: GitConfig::default(),
             contextstore_sync: Vec::new(),
             detected_shapes: Vec::new(),
         };
-        assert!(project.validate_workers().is_ok());
+        assert!(project.validate_workspaces().is_ok());
 
         let mut bad = project.clone();
-        bad.workers.push(WorkerSpec { name: "bob".into(), machine: "ghost".into(), runner: "claude".into() });
-        assert!(matches!(bad.validate_workers(), Err(crate::Error::UnknownMachine(_))));
+        bad.workspaces.push(WorkspaceSpec { name: "bob".into(), machine: "ghost".into(), runner: "claude".into() });
+        assert!(matches!(bad.validate_workspaces(), Err(crate::Error::UnknownMachine(_))));
 
         let mut bad2 = project.clone();
-        bad2.workers.push(WorkerSpec { name: "bob".into(), machine: "hub".into(), runner: "ghost".into() });
-        assert!(matches!(bad2.validate_workers(), Err(crate::Error::UnknownRunner(_))));
+        bad2.workspaces.push(WorkspaceSpec { name: "bob".into(), machine: "hub".into(), runner: "ghost".into() });
+        assert!(matches!(bad2.validate_workspaces(), Err(crate::Error::UnknownRunner(_))));
     }
 
     // ---- Zen Mode ----------------------------------------------------------
@@ -1595,10 +1600,10 @@ worker_settings_template: /etc/shelbi/p.json
             agent_runners: runners,
             editor: None,
             github_url: None,
-            workers: vec![],
-            worker_poll_interval_secs: default_worker_poll_interval_secs(),
-            worker_permissions_mode: default_worker_permissions_mode(),
-            worker_settings_template: None,
+            workspaces: vec![],
+            workspace_poll_interval_secs: default_workspace_poll_interval_secs(),
+            workspace_permissions_mode: default_workspace_permissions_mode(),
+            workspace_settings_template: None,
             zen,
             heartbeat: HeartbeatConfig::default(),
             git: GitConfig::default(),

@@ -14,9 +14,9 @@
 //! start` also routes through here so the same branch ends up persisted
 //! whether the user did `move` then `start` or `start` straight from
 //! `todo`. The cut runs against the project's *hub* workdir
-//! (`crate::git::locate_hub_workdir`); for a hub-local worker that's
+//! (`crate::git::locate_hub_workdir`); for a hub-local workspace that's
 //! the same repo `sync_worktree` later reads, so the next `git worktree
-//! add` sees the branch already in place. SSH workers still inherit the
+//! add` sees the branch already in place. SSH workspaces still inherit the
 //! pre-existing `sync_worktree` fallback (cut off `default_branch` on
 //! the remote machine) when the resolved base isn't visible there — a
 //! depends_on chain across machines is out of scope for this pass.
@@ -148,7 +148,7 @@ mod tests {
     use chrono::Utc;
     use shelbi_core::{
         AgentRunnerSpec, Column, GitConfig, HeartbeatConfig, Machine, MachineKind,
-        OrchestratorSpec, WorkerSpec, ZenConfig,
+        OrchestratorSpec, WorkspaceSpec, ZenConfig,
     };
     use std::collections::BTreeMap;
     use std::path::PathBuf;
@@ -220,14 +220,14 @@ mod tests {
             agent_runners: runners,
             editor: None,
             github_url: None,
-            workers: vec![WorkerSpec {
+            workspaces: vec![WorkspaceSpec {
                 name: "alice".into(),
                 machine: "hub".into(),
                 runner: "claude".into(),
             }],
-            worker_poll_interval_secs: 5,
-            worker_permissions_mode: "auto".into(),
-            worker_settings_template: None,
+            workspace_poll_interval_secs: 5,
+            workspace_permissions_mode: "auto".into(),
+            workspace_settings_template: None,
             zen: ZenConfig::default(),
             heartbeat: HeartbeatConfig::default(),
             contextstore_sync: Vec::new(),
@@ -370,7 +370,7 @@ mod tests {
         cut_branch_on_hub(&p, "shelbi/feat", "main").unwrap();
         // Second call is a no-op success — and explicitly does NOT
         // re-cut, so the branch's HEAD doesn't move underneath the
-        // worker. We verify that by advancing `main` first, then
+        // workspace. We verify that by advancing `main` first, then
         // re-cutting, then confirming the feature branch is still at
         // the original commit.
         let head_before = Command::new("git")
@@ -541,7 +541,7 @@ mod tests {
     #[test]
     fn ensure_surfaces_missing_base_error_with_dep_branch_name() {
         // Dep declared with a branch that doesn't actually exist on the
-        // hub yet (e.g. an SSH worker that hasn't pushed). The cut must
+        // hub yet (e.g. an SSH workspace that hasn't pushed). The cut must
         // refuse rather than silently rebase onto main and pretend
         // depends_on was satisfied.
         let _g = test_lock::acquire();

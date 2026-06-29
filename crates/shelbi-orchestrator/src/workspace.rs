@@ -1,12 +1,12 @@
-//! Worker lifecycle: the pre-declared agent slots that pick up Kanban
+//! Workspace lifecycle: the pre-declared agent slots that pick up Kanban
 //! tasks. See [`crate::ensure_dashboard`] for the project's overall tmux
-//! layout; this module is concerned only with the per-worker slot.
+//! layout; this module is concerned only with the per-workspace slot.
 //!
-//! Each worker owns a stable worktree at
-//! `<machine.work_dir>/.shelbi/wt/<worker-name>`. The worktree persists
-//! across tasks; the worker switches branches between assignments. The
-//! worker's tmux pane (window for local hub workers, session for remote
-//! workers) is killed and re-created on every assignment to clear the
+//! Each workspace owns a stable worktree at
+//! `<machine.work_dir>/.shelbi/wt/<workspace-name>`. The worktree persists
+//! across tasks; the workspace switches branches between assignments. The
+//! workspace's tmux pane (window for local hub workspaces, session for remote
+//! workspaces) is killed and re-created on every assignment to clear the
 //! agent's context — that's the user-specified semantics.
 //!
 //! Reviewer hint: this module does no state writes to task files; the
@@ -15,37 +15,37 @@
 
 use std::path::{Path, PathBuf};
 
-use shelbi_core::{Error, Host, Machine, Project, Result, TmuxAddr, WorkerSpec};
+use shelbi_core::{Error, Host, Machine, Project, Result, TmuxAddr, WorkspaceSpec};
 
-/// Where a worker's pane lives in tmux. Local workers get a window in the
-/// project session; remote workers get their own session (so they survive
+/// Where a workspace's pane lives in tmux. Local workspaces get a window in the
+/// project session; remote workspaces get their own session (so they survive
 /// SSH drops).
-pub fn worker_tmux_addr(project: &Project, worker: &WorkerSpec) -> Result<TmuxAddr> {
+pub fn workspace_tmux_addr(project: &Project, workspace: &WorkspaceSpec) -> Result<TmuxAddr> {
     let machine = project
-        .machine(&worker.machine)
-        .ok_or_else(|| Error::UnknownMachine(worker.machine.clone()))?;
+        .machine(&workspace.machine)
+        .ok_or_else(|| Error::UnknownMachine(workspace.machine.clone()))?;
     Ok(match machine.host() {
         Host::Local => TmuxAddr {
             session: format!("shelbi-{}", project.name),
-            window: worker.name.clone(),
+            window: workspace.name.clone(),
         },
         Host::Ssh { .. } => TmuxAddr {
-            session: format!("shelbi-w-{}", worker.name),
+            session: format!("shelbi-w-{}", workspace.name),
             window: "agent".into(),
         },
     })
 }
 
-/// `<machine.work_dir>/.shelbi/wt/<worker-name>` — the worker's persistent
+/// `<machine.work_dir>/.shelbi/wt/<workspace-name>` — the workspace's persistent
 /// worktree path on its machine.
-pub fn worker_worktree(machine: &Machine, worker: &WorkerSpec) -> PathBuf {
-    machine.work_dir.join(".shelbi").join("wt").join(&worker.name)
+pub fn workspace_worktree(machine: &Machine, workspace: &WorkspaceSpec) -> PathBuf {
+    machine.work_dir.join(".shelbi").join("wt").join(&workspace.name)
 }
 
-/// The review-ready file marker for a worker:
+/// The review-ready file marker for a workspace:
 /// `<worktree>/.claude/shelbi-review-ready`.
 ///
-/// The worker writes its current task id here to hand off for review; the
+/// The workspace writes its current task id here to hand off for review; the
 /// hub poller reads it (`stat`/`cat`, local or over SSH), moves the task to
 /// the review column, and clears the file. This replaces the old
 /// pane-title / `shelbi task move` handoff, both of which raced Claude's own
@@ -58,22 +58,22 @@ pub fn worker_worktree(machine: &Machine, worker: &WorkerSpec) -> PathBuf {
 /// tasks. Keeping the marker there means it never shows up in
 /// `git status --porcelain` and so never trips [`sync_worktree`]'s
 /// clean-worktree check.
-pub fn worker_review_marker(machine: &Machine, worker: &WorkerSpec) -> PathBuf {
-    worker_worktree(machine, worker)
+pub fn workspace_review_marker(machine: &Machine, workspace: &WorkspaceSpec) -> PathBuf {
+    workspace_worktree(machine, workspace)
         .join(".claude")
         .join("shelbi-review-ready")
 }
 
-/// Read the review-ready marker, returning the task id the worker wrote into
+/// Read the review-ready marker, returning the task id the workspace wrote into
 /// it (trimmed) or `None` if the marker is absent or empty. Works for both
-/// local and remote workers — `cat` is routed through `shelbi-ssh`, which is
+/// local and remote workspaces — `cat` is routed through `shelbi-ssh`, which is
 /// a no-op wrapper for [`Host::Local`].
 pub fn read_review_marker(host: &Host, marker: &Path) -> Result<Option<String>> {
     let path = marker.to_string_lossy().into_owned();
     let out = shelbi_ssh::run(host, ["cat", path.as_str()]).map_err(Error::Io)?;
     if !out.status.success() {
         // Missing file → cat exits non-zero. Not an error for us: the
-        // worker simply hasn't signalled review yet.
+        // workspace simply hasn't signalled review yet.
         return Ok(None);
     }
     let content = String::from_utf8_lossy(&out.stdout).trim().to_string();
@@ -89,17 +89,17 @@ pub fn clear_review_marker(host: &Host, marker: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Outcome of [`rebase_worker_branch_onto_default`]. Pure data — the caller
+/// Outcome of [`rebase_workspace_branch_onto_default`]. Pure data — the caller
 /// decides what to log and whether to surface a warning to the user. We
 /// distinguish "rebase wasn't needed" from "rebase succeeded" so the
 /// events.log line can call out the actually-rebased commits when there
 /// are any.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RebaseOutcome {
-    /// Default branch is already an ancestor of the worker's HEAD — the
+    /// Default branch is already an ancestor of the workspace's HEAD — the
     /// branch is up to date and no rewrite was needed.
     AlreadyUpToDate { default_sha: String },
-    /// Rebase finished cleanly; the worker's branch is now on top of
+    /// Rebase finished cleanly; the workspace's branch is now on top of
     /// `default_sha`. `before_sha`/`after_sha` are HEAD before/after the
     /// rewrite — equal when the rebase ran but produced an empty result
     /// (rare; harmless).
@@ -109,7 +109,7 @@ pub enum RebaseOutcome {
         default_sha: String,
     },
     /// Rebase ran into conflicts. We aborted it so the worktree returned to
-    /// a clean state and the worker's branch HEAD is unchanged — the human
+    /// a clean state and the workspace's branch HEAD is unchanged — the human
     /// reviewer will resolve the conflict during the review checkout.
     Conflict {
         default_sha: String,
@@ -170,13 +170,13 @@ impl RebaseOutcome {
     }
 }
 
-/// Rebase the worker's current branch in `worktree` onto `default_branch`,
+/// Rebase the workspace's current branch in `worktree` onto `default_branch`,
 /// leaving the worktree on the same branch (now rewritten) on success.
 ///
-/// Why this exists: when a prereq task lands on `main` after a worker has
-/// already started its own task, the worker's branch sits one or more
+/// Why this exists: when a prereq task lands on `main` after a workspace has
+/// already started its own task, the workspace's branch sits one or more
 /// commits behind main by the time the review marker fires. Without this
-/// hook the user had to drop into the worker's worktree and run
+/// hook the user had to drop into the workspace's worktree and run
 /// `git rebase main` themselves before the review checkout would surface a
 /// clean diff — exactly the manual rebase + force-push the task title
 /// names. Running it here eliminates that step on the happy path, and
@@ -190,14 +190,14 @@ impl RebaseOutcome {
 /// Contract:
 ///
 /// - Worktree must be clean (anything outside `.claude/` would be lost
-///   to a rebase conflict). The worker is expected to have committed
+///   to a rebase conflict). The workspace is expected to have committed
 ///   before writing the review marker; a dirty worktree returns
 ///   [`RebaseOutcome::Skipped`].
 /// - On conflict we run `git rebase --abort` and return
-///   [`RebaseOutcome::Conflict`] — the worker's branch HEAD is unchanged.
+///   [`RebaseOutcome::Conflict`] — the workspace's branch HEAD is unchanged.
 /// - Never panics; every git failure surfaces as `Skipped` or `Conflict`
 ///   so the caller can log it and continue the review promotion.
-pub fn rebase_worker_branch_onto_default(
+pub fn rebase_workspace_branch_onto_default(
     host: &Host,
     worktree: &Path,
     default_branch: &str,
@@ -233,7 +233,7 @@ pub fn rebase_worker_branch_onto_default(
         };
     }
 
-    // 2. Resolve the default branch ref. If the worker's repo doesn't even
+    // 2. Resolve the default branch ref. If the workspace's repo doesn't even
     //    know about `default_branch` (fresh clone never fetched, name
     //    typo'd in project YAML), there's nothing to rebase onto.
     let default_sha = match shelbi_ssh::run(
@@ -270,7 +270,7 @@ pub fn rebase_worker_branch_onto_default(
     };
 
     // 3. Already a descendant? `merge-base --is-ancestor` exits 0 when
-    //    `default_branch` is reachable from HEAD — i.e. the worker's
+    //    `default_branch` is reachable from HEAD — i.e. the workspace's
     //    branch already contains every commit on main. No rewrite needed.
     let ancestor = shelbi_ssh::run(
         host,
@@ -289,7 +289,7 @@ pub fn rebase_worker_branch_onto_default(
     }
 
     // 4. Run the rebase. Plain `git rebase` (no autostash — we already
-    //    proved the worktree is clean; no `--rebase-merges` — workers
+    //    proved the worktree is clean; no `--rebase-merges` — workspaces
     //    produce linear branches).
     let out = match shelbi_ssh::run(host, ["git", "-C", &wt_str, "rebase", default_branch]) {
         Ok(o) => o,
@@ -302,7 +302,7 @@ pub fn rebase_worker_branch_onto_default(
 
     if !out.status.success() {
         // Conflict (or some other rebase-time error). Abort so the
-        // worktree returns to its pre-rebase state — the worker's branch
+        // worktree returns to its pre-rebase state — the workspace's branch
         // HEAD is unchanged and the next `git status` is clean. Abort is
         // best-effort: a hung rebase that won't abort would leave the
         // worktree in an interactive state, but we still want to log
@@ -343,8 +343,8 @@ pub fn rebase_worker_branch_onto_default(
     }
 }
 
-/// Does the worker have a live tmux pane right now?
-pub fn worker_pane_alive(host: &Host, addr: &TmuxAddr) -> Result<bool> {
+/// Does the workspace have a live tmux pane right now?
+pub fn workspace_pane_alive(host: &Host, addr: &TmuxAddr) -> Result<bool> {
     // Local: check `session:window` exists. Remote: it's a whole session.
     // `tmux list-windows -t session -F #W | grep -w window` does both.
     let out = shelbi_ssh::run(
@@ -359,14 +359,14 @@ pub fn worker_pane_alive(host: &Host, addr: &TmuxAddr) -> Result<bool> {
     Ok(stdout.lines().any(|w| w.trim() == addr.window))
 }
 
-/// Kill the worker's pane (idempotent — silently OK if already gone).
-pub fn kill_worker_pane(host: &Host, addr: &TmuxAddr) -> Result<()> {
+/// Kill the workspace's pane (idempotent — silently OK if already gone).
+pub fn kill_workspace_pane(host: &Host, addr: &TmuxAddr) -> Result<()> {
     // Local: `kill-window -t session:window` (the dashboard session
     // must stay alive). Remote: `kill-session -t session` (the session
-    // IS the worker).
+    // IS the workspace).
     //
     // The liveness check has to differ too. For local we look for the
-    // worker's window inside the shared dashboard session. For remote
+    // workspace's window inside the shared dashboard session. For remote
     // we look for the session itself — NOT for a window named `agent`
     // — because tmux's `automatic-rename` (on by default) renames the
     // window after whatever command is running (`claude`, `bash`, …),
@@ -374,7 +374,7 @@ pub fn kill_worker_pane(host: &Host, addr: &TmuxAddr) -> Result<()> {
     // around to collide with the next `task start`.
     match host {
         Host::Local => {
-            if !worker_pane_alive(host, addr)? {
+            if !workspace_pane_alive(host, addr)? {
                 return Ok(());
             }
             let _ = shelbi_ssh::run(host, ["tmux", "kill-window", "-t", &addr.target()])
@@ -391,49 +391,49 @@ pub fn kill_worker_pane(host: &Host, addr: &TmuxAddr) -> Result<()> {
     Ok(())
 }
 
-/// Spec for `start_worker_on_task`. We don't take a `&Task` because the
+/// Spec for `start_workspace_on_task`. We don't take a `&Task` because the
 /// caller may have a fresh task id without a frontmatter file yet.
 pub struct StartSpec<'a> {
     pub project: &'a Project,
-    pub worker: &'a WorkerSpec,
+    pub workspace: &'a WorkspaceSpec,
     pub task_id: &'a str,
     pub branch: &'a str,
     /// Body of the task markdown — appended to the prompt as context.
     pub task_body: &'a str,
 }
 
-/// Tear down the worker's pane, switch its worktree to `branch` (creating
+/// Tear down the workspace's pane, switch its worktree to `branch` (creating
 /// the worktree off `default_branch` and the branch off `default_branch` if
 /// needed), and start the runner with an initial prompt. Bails on a dirty
 /// worktree so the user doesn't silently lose work.
-pub fn start_worker_on_task(spec: StartSpec<'_>) -> Result<TmuxAddr> {
+pub fn start_workspace_on_task(spec: StartSpec<'_>) -> Result<TmuxAddr> {
     let machine = spec
         .project
-        .machine(&spec.worker.machine)
-        .ok_or_else(|| Error::UnknownMachine(spec.worker.machine.clone()))?
+        .machine(&spec.workspace.machine)
+        .ok_or_else(|| Error::UnknownMachine(spec.workspace.machine.clone()))?
         .clone();
     let runner = spec
         .project
-        .runner(&spec.worker.runner)
-        .ok_or_else(|| Error::UnknownRunner(spec.worker.runner.clone()))?
+        .runner(&spec.workspace.runner)
+        .ok_or_else(|| Error::UnknownRunner(spec.workspace.runner.clone()))?
         .clone();
 
     let host = machine.host();
-    let worktree = worker_worktree(&machine, spec.worker);
-    let addr = worker_tmux_addr(spec.project, spec.worker)?;
+    let worktree = workspace_worktree(&machine, spec.workspace);
+    let addr = workspace_tmux_addr(spec.project, spec.workspace)?;
 
     // 0a. If the project asks for auto-mode, claude must be v2.1.83+. Older
     //     versions silently fall back to `default` and the user gets a Bash
     //     prompt on every command — exactly the bug we're trying to avoid.
     //     Surface it up front so the failure mode is "shelbi rejected this
-    //     machine" instead of "my worker keeps pausing for no reason."
-    require_auto_mode_supported(&host, &runner, &spec.project.worker_permissions_mode)?;
+    //     machine" instead of "my workspace keeps pausing for no reason."
+    require_auto_mode_supported(&host, &runner, &spec.project.workspace_permissions_mode)?;
 
     // 0b. Clear any stale review marker left in the worktree from a previous
     //     task before we reuse the worktree — otherwise the poller could read
     //     an old task id and misfire. Best-effort: a failure here shouldn't
-    //     block standing up the worker.
-    let marker = worker_review_marker(&machine, spec.worker);
+    //     block standing up the workspace.
+    let marker = workspace_review_marker(&machine, spec.workspace);
     let _ = clear_review_marker(&host, &marker);
 
     // 1. Make sure the worktree exists + is on the right branch, clean.
@@ -447,19 +447,19 @@ pub fn start_worker_on_task(spec: StartSpec<'_>) -> Result<TmuxAddr> {
 
     // 2. Drop a rendered .claude/settings.json into the worktree so the
     //    runner picks up shelbi's window-title hooks (idle/working/blocked).
-    //    Overwrite is fine — this is the entire on-worker footprint and we
+    //    Overwrite is fine — this is the entire on-workspace footprint and we
     //    re-render it on every task start.
-    let rendered = shelbi_state::render_worker_settings(spec.project)?;
-    deploy_worker_settings(&host, &worktree, &rendered)?;
+    let rendered = shelbi_state::render_workspace_settings(spec.project)?;
+    deploy_workspace_settings(&host, &worktree, &rendered)?;
 
     // 3. Reset the tmux pane — that's how we clear context. If it doesn't
     //    exist yet, this is a no-op; otherwise the next step recreates it.
-    kill_worker_pane(&host, &addr)?;
+    kill_workspace_pane(&host, &addr)?;
 
     // 4. Create the pane. Start with an interactive shell (no `-c <cmd>`)
     //    so the user's rc files run and the pane outlives the agent
     //    process. Local = window in the project session; remote = its own
-    //    session so the worker survives an SSH drop.
+    //    session so the workspace survives an SSH drop.
     match &host {
         Host::Local => {
             if !shelbi_tmux::has_session(&host, &addr.session)? {
@@ -478,7 +478,7 @@ pub fn start_worker_on_task(spec: StartSpec<'_>) -> Result<TmuxAddr> {
     //    Local: tmux server inherits the user's already-set-up login env
     //    (since the user ran shelbi from their own terminal), so a plain
     //    invocation finds everything on PATH. No `exec` — when the agent
-    //    exits, the shell stays so the worker pane is reusable.
+    //    exits, the shell stays so the workspace pane is reusable.
     //
     //    Remote: tmux was started by `ssh host -- tmux new-session …`,
     //    which runs through a NON-login non-interactive shell — so tmux
@@ -500,7 +500,7 @@ pub fn start_worker_on_task(spec: StartSpec<'_>) -> Result<TmuxAddr> {
     // I/O race or version regression) — the CLI flag is authoritative and
     // belongs to the spawn path, where we already know the project's mode.
     let runner_with_mode =
-        shelbi_agent::with_permission_mode(&runner, &spec.project.worker_permissions_mode);
+        shelbi_agent::with_permission_mode(&runner, &spec.project.workspace_permissions_mode);
     let launch = shelbi_agent::launch_command(&runner_with_mode);
     let cd_launch = if host.is_local() {
         format!(
@@ -540,7 +540,7 @@ pub fn start_worker_on_task(spec: StartSpec<'_>) -> Result<TmuxAddr> {
     shelbi_tmux::send_line(&host, &addr, &prompt)?;
 
     // 7. Verify the prompt actually got submitted, not just typed into the
-    //    input box. claude's `UserPromptSubmit` hook (see worker settings
+    //    input box. claude's `UserPromptSubmit` hook (see workspace settings
     //    template) writes `\033]2;shelbi:working\007` to the pane title on
     //    every submit — so once any `shelbi:` marker appears in the title,
     //    we know Enter landed. If it doesn't within a short window, the
@@ -548,8 +548,8 @@ pub fn start_worker_on_task(spec: StartSpec<'_>) -> Result<TmuxAddr> {
     //    focus and was dropped; resend it once and try again. If still no
     //    marker, surface a dispatch=stalled line in events.log so the
     //    orchestrator (and `shelbi events tail`) sees it instead of the
-    //    worker silently sitting on the prompt.
-    confirm_prompt_submitted(&host, &addr, spec.task_id, &spec.worker.name);
+    //    workspace silently sitting on the prompt.
+    confirm_prompt_submitted(&host, &addr, spec.task_id, &spec.workspace.name);
 
     Ok(addr)
 }
@@ -566,9 +566,9 @@ const PROMPT_SUBMIT_POLL: std::time::Duration = std::time::Duration::from_millis
 /// Wait for the prompt-submitted signal; if it doesn't arrive, resend Enter
 /// once and wait again; if it still doesn't arrive, log a dispatch=stalled
 /// event and warn on stderr. Best-effort — failures here don't abort the
-/// task start (the worker may still recover), they just surface the stall
+/// task start (the workspace may still recover), they just surface the stall
 /// so the orchestrator stops assuming the dispatch succeeded.
-fn confirm_prompt_submitted(host: &Host, addr: &TmuxAddr, task_id: &str, worker: &str) {
+fn confirm_prompt_submitted(host: &Host, addr: &TmuxAddr, task_id: &str, workspace: &str) {
     if wait_for_prompt_submitted(host, addr, PROMPT_SUBMIT_WAIT) {
         return;
     }
@@ -587,13 +587,13 @@ fn confirm_prompt_submitted(host: &Host, addr: &TmuxAddr, task_id: &str, worker:
     }
     eprintln!(
         "shelbi: dispatched prompt to {} but no submission signal appeared \
-         after a retry Enter — worker may be sitting on an unsubmitted prompt; \
+         after a retry Enter — workspace may be sitting on an unsubmitted prompt; \
          check the pane",
         addr.target(),
     );
     if let Err(e) = shelbi_state::append_dispatch_event(
         task_id,
-        worker,
+        workspace,
         "enter-stalled",
         "no submit signal after retry",
     ) {
@@ -601,13 +601,13 @@ fn confirm_prompt_submitted(host: &Host, addr: &TmuxAddr, task_id: &str, worker:
     }
 }
 
-/// Poll the worker's pane until we have proof the prompt got submitted, or
+/// Poll the workspace's pane until we have proof the prompt got submitted, or
 /// `timeout` elapses. Capture failures during the poll are transient (the
 /// SSH socket can hiccup); we just ignore them and keep polling.
 ///
 /// Two independent signals — either one is sufficient:
 ///
-/// 1. **Pane title carries a `shelbi:*` marker.** The worker's
+/// 1. **Pane title carries a `shelbi:*` marker.** The workspace's
 ///    `UserPromptSubmit` hook writes `shelbi:working` via OSC, so when the
 ///    title shows that, Enter definitely landed. The catch is that
 ///    Claude's own OSC 2 writes (it updates the title with a live
@@ -673,11 +673,11 @@ fn claude_is_processing(screen: &str) -> bool {
 
 /// The minimum claude version that understands `--permission-mode auto`.
 /// Older versions either silently fall back to `default` or reject the flag,
-/// and the worker pauses on every Bash prompt.
+/// and the workspace pauses on every Bash prompt.
 const CLAUDE_AUTO_MODE_MIN: (u32, u32, u32) = (2, 1, 83);
 
 /// If the project wants auto-mode and the runner is claude, ensure the
-/// worker host's claude is new enough to understand it. Quiet pass-through
+/// workspace host's claude is new enough to understand it. Quiet pass-through
 /// when the probe fails for unrelated reasons (claude missing from PATH,
 /// weird output) — `wait_for_claude_ready` will surface a launch failure
 /// downstream with a clearer signal than "version probe failed."
@@ -705,9 +705,9 @@ fn require_auto_mode_supported(
     };
     if version < CLAUDE_AUTO_MODE_MIN {
         return Err(Error::Other(format!(
-            "claude {} on this worker is too old for worker_permissions_mode: auto \
+            "claude {} on this workspace is too old for workspace_permissions_mode: auto \
              (need {}+, classifier-based auto-approval). Either upgrade claude on the \
-             worker host, or set `worker_permissions_mode` in this project's config to \
+             workspace host, or set `workspace_permissions_mode` in this project's config to \
              `acceptEdits` (auto-accept edits but still gate Bash) or `bypassPermissions` \
              (no seatbelt — auto-accept everything).",
             format_version(version),
@@ -758,15 +758,15 @@ const READY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 /// How often to re-capture the pane while waiting for readiness.
 const READY_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(250);
 
-/// Poll the worker pane until claude's input box is on screen and ready to
+/// Poll the workspace pane until claude's input box is on screen and ready to
 /// accept the initial prompt. Returns `Ok(true)` once ready, `Ok(false)` on
 /// timeout (the caller sends anyway).
 ///
 /// ## Why this exists / what the bug actually was
 ///
 /// The original code slept a fixed 1500ms then typed. That fails on a
-/// fresh devbox worker for a reason that is *not* terminal encoding:
-/// investigation on a Linux worker showed claude emits the `❯` prompt glyph
+/// fresh devbox workspace for a reason that is *not* terminal encoding:
+/// investigation on a Linux workspace showed claude emits the `❯` prompt glyph
 /// (`e2 9d af`) under both `en_US.UTF-8` and the bare `C` locale, and
 /// `tmux capture-pane` preserves those bytes intact. So a single-glyph probe
 /// matches fine on Linux — encoding is a red herring.
@@ -830,12 +830,12 @@ fn is_trust_dialog(screen: &str) -> bool {
     s.contains("trust this folder") || s.contains("do you trust")
 }
 
-/// Write the rendered worker `settings.json` to `<worktree>/.claude/` on
+/// Write the rendered workspace `settings.json` to `<worktree>/.claude/` on
 /// `host`. Local hosts get a direct filesystem write; remote hosts get an
-/// `ssh mkdir -p` followed by `scp` of the rendered file. The worker
+/// `ssh mkdir -p` followed by `scp` of the rendered file. The workspace
 /// machine never executes any shelbi code — this file is the whole
-/// on-worker footprint.
-pub fn deploy_worker_settings(
+/// on-workspace footprint.
+pub fn deploy_workspace_settings(
     host: &Host,
     worktree: &std::path::Path,
     rendered: &str,
@@ -881,7 +881,7 @@ fn scp_settings_to_remote(
     //    tempfile is in $TMPDIR so the local FS handles cleanup if we crash
     //    before unlinking it.
     let tmp_path = std::env::temp_dir().join(format!(
-        "shelbi-worker-settings-{}-{}.json",
+        "shelbi-workspace-settings-{}-{}.json",
         std::process::id(),
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -908,19 +908,19 @@ fn scp_settings_to_remote(
 }
 
 /// Build the initial prompt: the task body + the loop-closing instructions
-/// that tell the worker how to rebase onto current `default_branch` and then
+/// that tell the workspace how to rebase onto current `default_branch` and then
 /// mark itself done.
 ///
 /// The handoff is a file marker, not a pane title or a `shelbi` CLI call.
-/// The worker writes its task id into `<worktree>/.claude/shelbi-review-ready`
-/// (see [`worker_review_marker`]); the hub poller picks it up and moves the
+/// The workspace writes its task id into `<worktree>/.claude/shelbi-review-ready`
+/// (see [`workspace_review_marker`]); the hub poller picks it up and moves the
 /// task to the review column. This survives Claude's own OSC pane-title
 /// writes and the Stop hook, both of which used to clobber a `shelbi:review`
 /// title before the poller could read it, and it needs no `shelbi` binary on
-/// the worker host.
+/// the workspace host.
 ///
 /// The rebase step lives in the prompt (not in poll-side promotion code) so
-/// the worker re-runs its checks against the rebased base before signalling
+/// the workspace re-runs its checks against the rebased base before signalling
 /// review — a hub-side rebase happens after handoff, when there's no agent
 /// around to fix conflicts or re-run tests.
 fn compose_prompt(
@@ -1036,7 +1036,7 @@ fn sync_worktree(
     let dirty = shelbi_ssh::run_capture(host, ["git", "-C", &wt_str, "status", "--porcelain"])?;
     if !dirty.trim().is_empty() {
         return Err(Error::Other(format!(
-            "worker worktree at {wt_str} has uncommitted changes — \
+            "workspace worktree at {wt_str} has uncommitted changes — \
              commit, stash, or discard before assigning a new task:\n{dirty}"
         )));
     }
@@ -1108,21 +1108,21 @@ mod tests {
             agent_runners: runners,
             editor: None,
             github_url: None,
-            workers: vec![
-                WorkerSpec {
+            workspaces: vec![
+                WorkspaceSpec {
                     name: "alice".into(),
                     machine: "hub".into(),
                     runner: "claude".into(),
                 },
-                WorkerSpec {
+                WorkspaceSpec {
                     name: "bob".into(),
                     machine: "m2".into(),
                     runner: "claude".into(),
                 },
             ],
-            worker_poll_interval_secs: 5,
-            worker_permissions_mode: "auto".into(),
-            worker_settings_template: None,
+            workspace_poll_interval_secs: 5,
+            workspace_permissions_mode: "auto".into(),
+            workspace_settings_template: None,
             zen: shelbi_core::ZenConfig::default(),
             heartbeat: shelbi_core::HeartbeatConfig::default(),
             git: shelbi_core::GitConfig::default(),
@@ -1132,17 +1132,17 @@ mod tests {
     }
 
     #[test]
-    fn local_worker_lives_in_project_session_window() {
+    fn local_workspace_lives_in_project_session_window() {
         let p = fixture_project();
-        let addr = worker_tmux_addr(&p, &p.workers[0]).unwrap();
+        let addr = workspace_tmux_addr(&p, &p.workspaces[0]).unwrap();
         assert_eq!(addr.session, "shelbi-myapp");
         assert_eq!(addr.window, "alice");
     }
 
     #[test]
-    fn remote_worker_gets_its_own_session() {
+    fn remote_workspace_gets_its_own_session() {
         let p = fixture_project();
-        let addr = worker_tmux_addr(&p, &p.workers[1]).unwrap();
+        let addr = workspace_tmux_addr(&p, &p.workspaces[1]).unwrap();
         assert_eq!(addr.session, "shelbi-w-bob");
         assert_eq!(addr.window, "agent");
     }
@@ -1150,7 +1150,7 @@ mod tests {
     #[test]
     fn worktree_path_under_machine_workdir() {
         let p = fixture_project();
-        let wt = worker_worktree(&p.machines[0], &p.workers[0]);
+        let wt = workspace_worktree(&p.machines[0], &p.workspaces[0]);
         assert_eq!(wt, PathBuf::from("/tmp/myapp/.shelbi/wt/alice"));
     }
 
@@ -1183,7 +1183,7 @@ mod tests {
     }
 
     #[test]
-    fn prompt_instructs_worker_to_rebase_onto_default_branch_before_marker() {
+    fn prompt_instructs_workspace_to_rebase_onto_default_branch_before_marker() {
         // The whole point of this rebase step is to keep the review's base
         // fresh — otherwise tests fail against a stale `default_branch` and
         // the diff_size includes commits that are already on main. Pin the
@@ -1236,7 +1236,7 @@ mod tests {
         );
     }
 
-    // Real captures observed on a Linux (delta) worker, used to pin the
+    // Real captures observed on a Linux (delta) workspace, used to pin the
     // readiness/trust detection against claude's actual rendered output.
     const TRUST_DIALOG_SCREEN: &str = "\
  Do you trust the files in this folder?
@@ -1285,11 +1285,11 @@ mod tests {
         assert!(!is_trust_dialog(INPUT_BOX_SCREEN));
     }
 
-    // Captured from a worker pane that had just submitted its prompt and
+    // Captured from a workspace pane that had just submitted its prompt and
     // was mid-turn — used to pin the busy-state heuristic against
     // claude's actual rendered output. The point of this whole helper is
     // that nothing here mentions `shelbi:` anywhere: claude's own OSC 2
-    // writes have already clobbered the worker's `shelbi:working` title
+    // writes have already clobbered the workspace's `shelbi:working` title
     // marker, so the pane-title probe would have missed this state.
     const BUSY_SCREEN_SPINNER: &str = "\
 ✻ Brewed for 1m 1s · 2 shells, 1 monitor still running
@@ -1366,7 +1366,7 @@ mod tests {
     #[test]
     fn review_marker_lives_under_gitignored_claude_dir() {
         let p = fixture_project();
-        let marker = worker_review_marker(&p.machines[0], &p.workers[0]);
+        let marker = workspace_review_marker(&p.machines[0], &p.workspaces[0]);
         assert_eq!(
             marker,
             PathBuf::from("/tmp/myapp/.shelbi/wt/alice/.claude/shelbi-review-ready")
@@ -1415,14 +1415,14 @@ mod tests {
 
     #[test]
     fn spawn_path_injects_permission_mode_for_claude() {
-        // Mirror the relevant lines from start_worker_on_task — the spawn
+        // Mirror the relevant lines from start_workspace_on_task — the spawn
         // path must compose claude's launch line with --permission-mode so
-        // the worker doesn't depend on settings.json's defaultMode taking
+        // the workspace doesn't depend on settings.json's defaultMode taking
         // effect (which has silently regressed in the past).
-        let p = fixture_project(); // worker_permissions_mode = "auto"
+        let p = fixture_project(); // workspace_permissions_mode = "auto"
         let runner = p.runner("claude").unwrap().clone();
         let runner_with_mode =
-            shelbi_agent::with_permission_mode(&runner, &p.worker_permissions_mode);
+            shelbi_agent::with_permission_mode(&runner, &p.workspace_permissions_mode);
         let launch = shelbi_agent::launch_command(&runner_with_mode);
         assert_eq!(launch, "claude --permission-mode auto");
     }
@@ -1430,10 +1430,10 @@ mod tests {
     #[test]
     fn spawn_path_passes_through_non_auto_modes() {
         let mut p = fixture_project();
-        p.worker_permissions_mode = "acceptEdits".into();
+        p.workspace_permissions_mode = "acceptEdits".into();
         let runner = p.runner("claude").unwrap().clone();
         let runner_with_mode =
-            shelbi_agent::with_permission_mode(&runner, &p.worker_permissions_mode);
+            shelbi_agent::with_permission_mode(&runner, &p.workspace_permissions_mode);
         let launch = shelbi_agent::launch_command(&runner_with_mode);
         assert_eq!(launch, "claude --permission-mode acceptEdits");
     }
@@ -1443,10 +1443,10 @@ mod tests {
         // `default` is claude's own baseline; passing the flag is a no-op
         // that just clutters the command line.
         let mut p = fixture_project();
-        p.worker_permissions_mode = "default".into();
+        p.workspace_permissions_mode = "default".into();
         let runner = p.runner("claude").unwrap().clone();
         let runner_with_mode =
-            shelbi_agent::with_permission_mode(&runner, &p.worker_permissions_mode);
+            shelbi_agent::with_permission_mode(&runner, &p.workspace_permissions_mode);
         let launch = shelbi_agent::launch_command(&runner_with_mode);
         assert_eq!(launch, "claude");
     }
@@ -1468,7 +1468,7 @@ mod tests {
         );
         let runner = p.runner("claude").unwrap().clone();
         let runner_with_mode =
-            shelbi_agent::with_permission_mode(&runner, &p.worker_permissions_mode);
+            shelbi_agent::with_permission_mode(&runner, &p.workspace_permissions_mode);
         let launch = shelbi_agent::launch_command(&runner_with_mode);
         assert_eq!(launch, "claude --permission-mode auto");
     }
@@ -1484,7 +1484,7 @@ mod tests {
         );
         let runner = p.runner("codex").unwrap().clone();
         let runner_with_mode =
-            shelbi_agent::with_permission_mode(&runner, &p.worker_permissions_mode);
+            shelbi_agent::with_permission_mode(&runner, &p.workspace_permissions_mode);
         let launch = shelbi_agent::launch_command(&runner_with_mode);
         assert_eq!(launch, "codex --print");
     }
@@ -1499,7 +1499,7 @@ mod tests {
     }
 
     #[test]
-    fn deploy_worker_settings_writes_local_file_and_creates_dir() {
+    fn deploy_workspace_settings_writes_local_file_and_creates_dir() {
         let tmp = std::env::temp_dir().join(format!(
             "shelbi-deploy-test-{}-{}",
             std::process::id(),
@@ -1512,7 +1512,7 @@ mod tests {
         std::fs::create_dir_all(&worktree).unwrap();
         let rendered = r#"{"permissions":{"defaultMode":"acceptEdits"}}"#;
 
-        deploy_worker_settings(&Host::Local, &worktree, rendered).unwrap();
+        deploy_workspace_settings(&Host::Local, &worktree, rendered).unwrap();
 
         let settings = worktree.join(".claude/settings.json");
         let actual = std::fs::read_to_string(&settings).unwrap();
@@ -1520,7 +1520,7 @@ mod tests {
 
         // Idempotent: a second call overwrites without error.
         let updated = r#"{"permissions":{"defaultMode":"plan"}}"#;
-        deploy_worker_settings(&Host::Local, &worktree, updated).unwrap();
+        deploy_workspace_settings(&Host::Local, &worktree, updated).unwrap();
         let actual2 = std::fs::read_to_string(&settings).unwrap();
         assert_eq!(actual2, updated);
 
@@ -1530,13 +1530,13 @@ mod tests {
 
 #[cfg(test)]
 mod rebase_git_tests {
-    //! Real-git tests for [`rebase_worker_branch_onto_default`]. Each test
+    //! Real-git tests for [`rebase_workspace_branch_onto_default`]. Each test
     //! provisions a tiny on-disk repo with a `main` branch + a feature
     //! branch off it, then exercises one outcome of the rebase function.
     //! Skipped silently if `git` isn't on PATH so the suite still runs on
     //! a git-less sandbox.
     //!
-    //! The shape under test is the worker-side worktree path: in the real
+    //! The shape under test is the workspace-side worktree path: in the real
     //! system the worktree shares a `.git` with the project's main clone
     //! (via `git worktree add`), but for the rebase function only the
     //! worktree's own ref/object access matters, so a plain `git init`
@@ -1638,7 +1638,7 @@ mod rebase_git_tests {
             .expect("branch checkout");
         commit_file(&repo, "feature.txt", "hi\n", "feature work");
 
-        let outcome = rebase_worker_branch_onto_default(&Host::Local, &repo, "main");
+        let outcome = rebase_workspace_branch_onto_default(&Host::Local, &repo, "main");
         match outcome {
             RebaseOutcome::AlreadyUpToDate { default_sha } => {
                 assert_eq!(default_sha, branch_sha(&repo, "main"));
@@ -1669,12 +1669,12 @@ mod rebase_git_tests {
         commit_file(&repo, "prereq.txt", "prereq\n", "prereq landed");
         let new_main = head_sha(&repo);
 
-        // Back to the feature branch (this is how the worker's worktree
+        // Back to the feature branch (this is how the workspace's worktree
         // would be left at the moment the marker fires).
         run_git_in(&repo, &["checkout", "-q", "feature"]);
         assert_eq!(head_sha(&repo), feature_before);
 
-        let outcome = rebase_worker_branch_onto_default(&Host::Local, &repo, "main");
+        let outcome = rebase_workspace_branch_onto_default(&Host::Local, &repo, "main");
         match outcome {
             RebaseOutcome::Rebased {
                 before_sha,
@@ -1703,7 +1703,7 @@ mod rebase_git_tests {
     #[test]
     fn conflict_is_aborted_and_branch_head_unchanged() {
         // Both branches touch the same file; the rebase must conflict,
-        // we must abort it, and the worker's branch HEAD must return to
+        // we must abort it, and the workspace's branch HEAD must return to
         // its pre-rebase state with a clean worktree. The human reviewer
         // resolves the conflict during the review checkout.
         if !git_available() {
@@ -1725,7 +1725,7 @@ mod rebase_git_tests {
         run_git_in(&repo, &["checkout", "-q", "feature"]);
         assert_eq!(head_sha(&repo), feature_before);
 
-        let outcome = rebase_worker_branch_onto_default(&Host::Local, &repo, "main");
+        let outcome = rebase_workspace_branch_onto_default(&Host::Local, &repo, "main");
         match outcome {
             RebaseOutcome::Conflict { stderr_excerpt, .. } => {
                 assert!(
@@ -1768,7 +1768,7 @@ mod rebase_git_tests {
         commit_file(&repo, "feature.txt", "hi\n", "feature work");
 
         let outcome =
-            rebase_worker_branch_onto_default(&Host::Local, &repo, "ghost-branch-does-not-exist");
+            rebase_workspace_branch_onto_default(&Host::Local, &repo, "ghost-branch-does-not-exist");
         match outcome {
             RebaseOutcome::Skipped { reason } => {
                 assert!(
@@ -1783,7 +1783,7 @@ mod rebase_git_tests {
 
     #[test]
     fn dirty_worktree_is_skipped() {
-        // Worker forgot to commit before writing the marker. The function
+        // Workspace forgot to commit before writing the marker. The function
         // must NOT run the rebase (it would lose the uncommitted work) and
         // must report a skip reason explaining why.
         if !git_available() {
@@ -1799,10 +1799,10 @@ mod rebase_git_tests {
         commit_file(&repo, "prereq.txt", "prereq\n", "prereq");
         run_git_in(&repo, &["checkout", "-q", "feature"]);
 
-        // Uncommitted change in the worker's worktree.
+        // Uncommitted change in the workspace's worktree.
         std::fs::write(repo.join("feature.txt"), "wip change\n").unwrap();
 
-        let outcome = rebase_worker_branch_onto_default(&Host::Local, &repo, "main");
+        let outcome = rebase_workspace_branch_onto_default(&Host::Local, &repo, "main");
         match outcome {
             RebaseOutcome::Skipped { reason } => {
                 assert!(
@@ -1838,7 +1838,7 @@ mod rebase_git_tests {
         std::fs::create_dir_all(repo.join(".claude")).unwrap();
         std::fs::write(repo.join(".claude/shelbi-review-ready"), "task-id\n").unwrap();
 
-        let outcome = rebase_worker_branch_onto_default(&Host::Local, &repo, "main");
+        let outcome = rebase_workspace_branch_onto_default(&Host::Local, &repo, "main");
         assert!(
             matches!(outcome, RebaseOutcome::Rebased { .. }),
             "expected Rebased despite .claude/ presence, got {outcome:?}"
