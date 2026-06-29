@@ -195,7 +195,11 @@ impl Action {
                 SidebarAction::Quit => &["q", "ctrl-c"],
                 SidebarAction::NavUp => &["k", "up"],
                 SidebarAction::NavDown => &["j", "down"],
-                SidebarAction::Activate => &["enter"],
+                // Space joins Enter so a user can collapse / expand a
+                // focused machine row without leaving the keyboard. The
+                // same chord activates a focused workspace row — matches
+                // the kanban's "enter or space" affordance.
+                SidebarAction::Activate => &["enter", "space"],
                 SidebarAction::Refresh => &["r"],
             },
             Action::Kanban(a) => match a {

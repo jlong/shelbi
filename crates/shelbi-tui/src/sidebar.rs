@@ -99,17 +99,44 @@ fn render_row(row: &Row, selected: bool, width: usize) -> ListItem<'static> {
             )]))
         }
         Row::Blank => ListItem::new(Line::raw("")),
-        Row::MachineGroup { name } => {
-            // `▾ <machine>` divider — open-triangle prefix mirrors the
-            // task wireframe. Collapsing is out of scope, so the glyph is
-            // always the open form; the row is non-selectable and rendered
-            // in the same dim style as section headers so it reads as
-            // structure, not a destination.
-            let style = Style::default().fg(Color::DarkGray);
-            ListItem::new(Line::from(vec![Span::styled(
-                format!("▾ {name}"),
-                style,
-            )]))
+        Row::MachineGroup {
+            name,
+            collapsed,
+            total,
+            active,
+        } => {
+            // `▾` when expanded (workspace rows follow), `▸` when
+            // collapsed (rows hidden). `▶` stays reserved for an active
+            // workspace row's Working badge, so the two never collide on
+            // screen. The header is dim by default and brightens to
+            // white-bold when focused so the user can see what Space /
+            // Enter will toggle.
+            let glyph = if *collapsed { "▸" } else { "▾" };
+            let header_style = if selected {
+                Style::default()
+                    .fg(Color::White)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(Color::DarkGray)
+            };
+            let left = vec![Span::styled(format!("{glyph} {name}"), header_style)];
+            if *collapsed {
+                // `(<total>, <active> active)` right-aligned in dim
+                // gray — same column treatment workspace / review rows
+                // use for their right label so the sidebar reads in one
+                // visual vocabulary. The count is suppressed when
+                // expanded; per-workspace rows surface the same info.
+                let right_label = format!("({total}, {active} active)");
+                let spans = right_align(
+                    left,
+                    right_label,
+                    Style::default().fg(Color::DarkGray),
+                    width,
+                );
+                ListItem::new(Line::from(spans))
+            } else {
+                ListItem::new(Line::from(left))
+            }
         }
         Row::Workspace {
             name, agent, indent, ..
@@ -691,6 +718,133 @@ mod tests {
             rows[alpha_y].starts_with("   "),
             "indented workspace rows expect ≥3 leading spaces (sidebar pad + indent), got: {:?}",
             rows[alpha_y]
+        );
+    }
+
+    /// A collapsed machine renders `▸ <name>` plus a right-aligned
+    /// `(<total>, <active> active)` suffix, and the workspace rows
+    /// beneath it vanish from the rendered buffer. The expanded
+    /// machine's rows continue to use their badge glyph (`⏵` for an
+    /// active workspace's Working badge) — distinct from the collapsed
+    /// `▸` so the two never collide on screen.
+    #[test]
+    fn collapsed_machine_renders_count_suffix_and_hides_workspaces() {
+        let backend = TestBackend::new(40, 20);
+        let mut term = Terminal::new(backend).unwrap();
+        let mut app = App::new_sidebar("demo");
+        app.workspaces = vec![
+            crate::app::WorkspaceOverview {
+                name: "alpha".into(),
+                machine: "hub".into(),
+                is_remote: false,
+                current_task: Some("t-1".into()),
+                badge: crate::app::WorkspaceBadge::Working,
+                agent: Some("developer".into()),
+            },
+            crate::app::WorkspaceOverview {
+                name: "bravo".into(),
+                machine: "hub".into(),
+                is_remote: false,
+                current_task: None,
+                badge: crate::app::WorkspaceBadge::Idle,
+                agent: None,
+            },
+            crate::app::WorkspaceOverview {
+                name: "charlie".into(),
+                machine: "hub".into(),
+                is_remote: false,
+                current_task: None,
+                badge: crate::app::WorkspaceBadge::Idle,
+                agent: None,
+            },
+            crate::app::WorkspaceOverview {
+                name: "delta".into(),
+                machine: "devbox".into(),
+                is_remote: true,
+                current_task: None,
+                badge: crate::app::WorkspaceBadge::Idle,
+                agent: None,
+            },
+        ];
+        app.collapsed_machines.insert("hub".into());
+        term.draw(|f| render_full(f, &mut app, f.area())).unwrap();
+        let rows = dump(&term);
+        let joined = rows.join("\n");
+
+        // The collapsed glyph + name appear, but with no per-workspace
+        // rows under hub — alpha/bravo/charlie are gone.
+        let hub_y = row_y(&rows, "▸ hub");
+        assert!(
+            rows[hub_y].contains("(3, 1 active)"),
+            "collapsed hub must surface count suffix, got: {:?}",
+            rows[hub_y]
+        );
+        assert!(
+            !joined.contains("alpha"),
+            "collapsed hub must hide its workspaces, got:\n{joined}"
+        );
+        assert!(
+            !joined.contains("bravo") && !joined.contains("charlie"),
+            "collapsed hub must hide all workspace rows, got:\n{joined}"
+        );
+        // devbox is still expanded — its single workspace renders.
+        assert!(joined.contains("▾ devbox"), "devbox stays expanded, got:\n{joined}");
+        assert!(joined.contains("delta"), "expanded devbox surfaces its workspace, got:\n{joined}");
+    }
+
+    /// Active workspaces use the `Working` badge glyph (`⏵`). Collapsed
+    /// machines use `▸`. The two never share a row, and they're distinct
+    /// glyphs — acceptance criterion (e) from the task spec.
+    #[test]
+    fn collapsed_machine_glyph_and_active_workspace_glyph_do_not_collide() {
+        let backend = TestBackend::new(40, 20);
+        let mut term = Terminal::new(backend).unwrap();
+        let mut app = App::new_sidebar("demo");
+        app.workspaces = vec![
+            crate::app::WorkspaceOverview {
+                name: "alpha".into(),
+                machine: "hub".into(),
+                is_remote: false,
+                current_task: Some("t-1".into()),
+                badge: crate::app::WorkspaceBadge::Working,
+                agent: Some("developer".into()),
+            },
+            crate::app::WorkspaceOverview {
+                name: "delta".into(),
+                machine: "devbox".into(),
+                is_remote: true,
+                current_task: Some("t-2".into()),
+                badge: crate::app::WorkspaceBadge::Working,
+                agent: Some("developer".into()),
+            },
+        ];
+        // Collapse devbox; leave hub expanded so an active workspace
+        // glyph and a collapsed machine glyph share the same render.
+        app.collapsed_machines.insert("devbox".into());
+        term.draw(|f| render_full(f, &mut app, f.area())).unwrap();
+        let rows = dump(&term);
+        let joined = rows.join("\n");
+
+        let working_glyph = crate::app::WorkspaceBadge::Working.glyph();
+        assert_ne!(
+            working_glyph, "▸",
+            "Working badge must not reuse the collapsed-machine glyph"
+        );
+        assert!(joined.contains("▾ hub"));
+        let alpha_y = row_y(&rows, "alpha");
+        assert!(
+            rows[alpha_y].contains(working_glyph),
+            "expanded hub's active workspace must use the Working badge ({working_glyph}), got: {:?}",
+            rows[alpha_y]
+        );
+        let devbox_y = row_y(&rows, "▸ devbox");
+        // The collapsed header row carries `▸` but NOT the active
+        // workspace glyph (the per-row badge stays with the row, even
+        // though the row is hidden).
+        assert!(
+            !rows[devbox_y].contains(working_glyph),
+            "collapsed machine header must not borrow the workspace badge glyph, got: {:?}",
+            rows[devbox_y]
         );
     }
 

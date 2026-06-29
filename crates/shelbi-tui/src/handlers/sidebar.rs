@@ -189,6 +189,18 @@ mod tests {
             Outcome::Continue
         );
 
+        // Space → Activate. Same action as Enter — used to toggle a
+        // focused machine row's collapse state without leaving the
+        // keyboard.
+        assert_eq!(
+            km.sidebar.dispatch(ev(KeyCode::Char(' '), KeyModifiers::NONE)),
+            Some(SidebarAction::Activate)
+        );
+        assert_eq!(
+            handle_sidebar_key(&mut app, ev(KeyCode::Char(' '), KeyModifiers::NONE), &km),
+            Outcome::Continue
+        );
+
         // r → Refresh. A missing project YAML is fine — `app.refresh()`
         // swallows the error and returns `()`; the handler returns
         // Continue.
