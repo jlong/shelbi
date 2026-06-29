@@ -56,7 +56,7 @@ The sidebar `Section { label: "Agents" }` becomes `Section { label: "Workspaces"
    · foxtrot   idle
 ```
 
-The `[developer]` tag is the currently-loaded agent (see §10), surfaced inline so the user can read role + slot in one glance.
+The agent name (e.g. `Developer`, `QA`) is the currently-loaded agent (see §10), surfaced inline so the user can read role + slot in one glance. The `▶` glyph marks an active workspace (a task is dispatched); `·` marks an idle workspace.
 
 **Single-machine project, collapsed:**
 
@@ -71,9 +71,9 @@ When the project has only one machine, the group header collapses away — the t
 
 Group headers are themselves focusable: pressing enter on a machine row could navigate to a "machine view" (status, in-flight tasks, log tail), but that's a separate plan — out of scope here.
 
-The word "workspace" matches the persistent-slot-with-worktree mental model better than "worker." A worker is what runs; a workspace is what holds it. The slot persists across task switches, owns a worktree on disk, and is tied to a specific machine — all properties of a workspace. The agent (developer, QA, etc.) is what *runs* inside the workspace; "worker" used to mean both, which is why we're disentangling.
+The word "workspace" matches the persistent-slot-with-worktree mental model better than "worker." A worker is what runs; a workspace is what holds it. The slot persists across task switches, owns a worktree on disk, and is tied to a specific machine — all properties of a workspace. The agent (Developer, QA, etc.) is what *runs* inside the workspace; "worker" used to mean both, which is why we're disentangling.
 
-CLI vocabulary (`shelbi worker list`, etc.) is left untouched in v1 — see Open questions about whether to rename in a follow-up.
+CLI vocabulary follows in v1 — `shelbi worker *` renames to `shelbi workspace *` with deprecation aliases for one release. See Rollout and CLI compatibility for the per-command breakdown.
 
 ### 2. The Agent concept
 
