@@ -702,14 +702,15 @@ fn start(
     shelbi_state::save_task(project, &tf.task, &tf.body).map_err(|e| anyhow!(e))?;
     if prev_column != Column::InProgress {
         shelbi_state::renumber_column(project, prev_column).map_err(|e| anyhow!(e))?;
-        let reason = reason.unwrap_or("user:cli:start");
+        let base_reason = reason.unwrap_or("user:cli:start");
+        let dispatched_reason = dispatch_reason_with_agent(base_reason, &agent_name);
         let workflow = tf.task.workflow_or_default();
         if let Err(e) = shelbi_state::append_task_event(
             id,
             workflow,
             prev_column,
             Column::InProgress,
-            reason,
+            &dispatched_reason,
         ) {
             eprintln!("warning: append_task_event failed: {e}");
         }
@@ -717,6 +718,15 @@ fn start(
 
     println!("✓ {id} → in_progress on {workspace_name} ({})", addr.target());
     Ok(())
+}
+
+/// Compose the dispatch event's `reason=` value by appending the
+/// resolved agent name. `append_task_event` folds the embedded space into
+/// an underscore so the final on-the-wire shape is
+/// `<base>_agent=<agent>` — keeping the field readable to a human and to
+/// the activity-feed parser without breaking the single-token contract.
+fn dispatch_reason_with_agent(base: &str, agent: &str) -> String {
+    format!("{base} agent={agent}")
 }
 
 fn edit(project: &str, id: &str) -> Result<()> {
@@ -1050,6 +1060,72 @@ statuses:
         // has to materialize the default agent set just like a real
         // `shelbi init` does.
         shelbi_state::materialize_default_agents(project).unwrap();
+    }
+
+    #[test]
+    fn dispatch_reason_appends_agent_segment_for_both_default_and_orchestrator_paths() {
+        // Acceptance (a) — every event emitted when `shelbi task start`
+        // spawns a workspace must include `_agent=<name>` in `reason=`.
+        // The helper composes the raw reason; `append_task_event` folds
+        // the embedded space into the underscore that ends up on disk.
+
+        // Default (user-driven) reason.
+        let r = dispatch_reason_with_agent("user:cli:start", "developer");
+        assert_eq!(r, "user:cli:start agent=developer");
+
+        // Orchestrator-supplied reason (the auto-dispatch contract from
+        // the default orchestrator playbook).
+        let r = dispatch_reason_with_agent(
+            "orchestrator:auto-dispatch workspace=alpha",
+            "developer",
+        );
+        assert_eq!(r, "orchestrator:auto-dispatch workspace=alpha agent=developer");
+
+        // After the sanitizer runs (whitespace → underscore) the on-disk
+        // shape becomes a single parseable token — that's what the
+        // activity-feed parser keys off `_agent=` to extract.
+        let sanitized: String = r
+            .chars()
+            .map(|c| if c.is_whitespace() { '_' } else { c })
+            .collect();
+        assert_eq!(
+            sanitized,
+            "orchestrator:auto-dispatch_workspace=alpha_agent=developer"
+        );
+    }
+
+    #[test]
+    fn start_event_line_carries_agent_segment_via_move_to_round_trip() {
+        // Acceptance (a) end-to-end check: the on-disk line shape after
+        // emission contains the `_agent=<name>` segment. We exercise the
+        // emission path through `append_task_event` directly with the
+        // composed reason (mirrors what `start()` writes) so the test
+        // doesn't need to stand up a real tmux pane to spawn the
+        // workspace.
+        let _g = TEST_LOCK.lock().unwrap();
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+
+        let dispatched =
+            dispatch_reason_with_agent("orchestrator:auto-dispatch workspace=alpha", "developer");
+        shelbi_state::append_task_event(
+            "demo",
+            "default",
+            Column::Todo,
+            Column::InProgress,
+            &dispatched,
+        )
+        .unwrap();
+
+        let log =
+            std::fs::read_to_string(shelbi_state::events_log_path().unwrap()).unwrap();
+        assert!(
+            log.contains(" reason=orchestrator:auto-dispatch_workspace=alpha_agent=developer "),
+            "log: {log}",
+        );
+
+        std::env::remove_var("SHELBI_HOME");
+        let _ = std::fs::remove_dir_all(&home);
     }
 
     #[test]
