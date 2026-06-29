@@ -43,13 +43,12 @@ pub fn run(args: Args) -> Result<()> {
 /// `.shelbi/project` marker, the workspace-settings template, the
 /// default agent workspaces, and the project-wide statuses catalogue.
 pub fn scaffold_with_prompt(args: Args) -> Result<ResolvedProjectRoot> {
-    let home = shelbi_state::shelbi_home().map_err(|e| anyhow!(e))?;
-    shelbi_state::ensure_dir(&home).map_err(|e| anyhow!(e))?;
+    // Hard-fail with a clear, source-tagged error if the shelbi root is
+    // unwritable; otherwise materialize the standard layout
+    // (projects/, sessions/, agents/, logs/, workspaces/).
+    let home = shelbi_state::ensure_root_subdirs().map_err(|e| anyhow!(e))?;
 
-    let projects_dir = shelbi_state::projects_dir().map_err(|e| anyhow!(e))?;
     let sessions_dir = shelbi_state::sessions_dir().map_err(|e| anyhow!(e))?;
-    shelbi_state::ensure_dir(&projects_dir).map_err(|e| anyhow!(e))?;
-    shelbi_state::ensure_dir(&sessions_dir).map_err(|e| anyhow!(e))?;
 
     let default_session = sessions_dir.join("default.yaml");
     if !default_session.exists() {

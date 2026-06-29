@@ -13,6 +13,12 @@ mod wizard;
     long_about = None,
 )]
 struct Cli {
+    /// Override the shelbi root directory (default: baked at install time;
+    /// also overridable via $SHELBI_ROOT). The flag wins over both env vars
+    /// and the compile-time default; `~/.shelbi` is the final fallback.
+    #[arg(long, global = true, value_name = "PATH")]
+    root: Option<std::path::PathBuf>,
+
     /// Project to operate on. Defaults to the project named in $SHELBI_PROJECT
     /// or the closest `.shelbi/project` marker file in the current directory's
     /// ancestors.
@@ -194,6 +200,11 @@ enum Cmd {
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
+    if let Some(root) = cli.root.clone() {
+        // Stash before any helper reads the resolved root. `expand_tilde_*`
+        // happens inside `resolve()` so the user can pass `~/scratch`.
+        shelbi_state::set_root_override(root);
+    }
     init_tracing(cli.cmd.as_ref());
 
     match cli.cmd {
@@ -470,5 +481,21 @@ mod cli_tests {
         assert!(project_yaml_exists("live"), "present YAML should be live");
 
         std::env::remove_var("SHELBI_HOME");
+    }
+
+    /// `--root <path>` is a top-level global flag — accepted before *or*
+    /// after the subcommand, and stashed into [`Cli::root`] either way.
+    /// The actual override wiring is exercised in `shelbi-state`'s
+    /// `root` module tests; this test just pins the parse surface.
+    #[test]
+    fn root_flag_parses_before_and_after_subcommand() {
+        let pre = Cli::parse_from(["shelbi", "--root", "/tmp/r1", "list"]);
+        assert_eq!(pre.root.as_deref(), Some(std::path::Path::new("/tmp/r1")));
+        assert!(matches!(pre.cmd, Some(Cmd::List)));
+        let post = Cli::parse_from(["shelbi", "list", "--root", "/tmp/r2"]);
+        assert_eq!(post.root.as_deref(), Some(std::path::Path::new("/tmp/r2")));
+        assert!(matches!(post.cmd, Some(Cmd::List)));
+        let absent = Cli::parse_from(["shelbi", "list"]);
+        assert!(absent.root.is_none());
     }
 }
