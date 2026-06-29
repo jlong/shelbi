@@ -40,9 +40,10 @@ use ratatui::{
 };
 
 use shelbi_core::{Column, StatusCategory, DEFAULT_WORKFLOW_NAME};
-use shelbi_state::{
-    events_log_path, keymap::load_keymaps, keymap::Keymaps, WorkerState, ZenModeState,
-};
+use shelbi_state::keymap::{load_keymaps, ActivityAction, DisplayStyle, Keymaps};
+use shelbi_state::{events_log_path, WorkerState, ZenModeState};
+
+use crate::keymap::format_chord_or_unbound;
 
 /// Avatar size in character cells. Each cell covers two vertical
 /// pixels with the half-block glyphs (`▀▄█`), so the effective canvas
@@ -273,6 +274,9 @@ pub struct ActivityApp {
     /// embedded built-ins when no file exists) so a single key press is
     /// one HashMap lookup per layer rather than a long `match` chain.
     keymaps: Keymaps,
+    /// Host-platform chord-display convention, detected once at
+    /// construction so the footer renderer never re-probes the OS.
+    display_style: DisplayStyle,
     /// Set true when the handler observes a `GlobalAction::Quit`; the
     /// outer event loop polls this each tick and returns when it flips.
     /// The parent shell loop respawns us, matching the legacy Ctrl+C
@@ -302,6 +306,7 @@ impl ActivityApp {
             filter: ActivityFilter::default(),
             pill_hits: Vec::new(),
             keymaps,
+            display_style: DisplayStyle::detect(),
             should_quit: false,
         }
     }
@@ -312,6 +317,12 @@ impl ActivityApp {
     /// keymap borrow.
     pub fn keymaps(&self) -> &Keymaps {
         &self.keymaps
+    }
+
+    /// Cached host-platform chord-display convention. Read by the footer
+    /// renderer instead of probing the OS each frame.
+    pub fn display_style(&self) -> DisplayStyle {
+        self.display_style
     }
 
     /// Flip `state.json::zen_mode` between On and Off via the shared
@@ -832,9 +843,29 @@ fn render_body(f: &mut Frame, app: &mut ActivityApp, area: Rect) {
     f.render_widget(body, area);
 }
 
-fn render_footer(f: &mut Frame, _app: &ActivityApp, area: Rect) {
+fn render_footer(f: &mut Frame, app: &ActivityApp, area: Rect) {
+    // Every key glyph is sourced from the merged keymaps and rendered in
+    // the host platform's convention — rebinding any of these actions in
+    // `keys.yml` updates the hint on next launch. Multi-bound actions show
+    // their first chord only (the full list lives in `config list-actions`).
+    let km = app.keymaps();
+    let style = app.display_style();
+    let fc = |c| format_chord_or_unbound(c, style);
+    let text = format!(
+        "{}/{} scroll · {}/{} page · {} top · {} bottom · {} refresh · {}/{}/{} filter",
+        fc(km.activity.first_chord_for(ActivityAction::ScrollDown)),
+        fc(km.activity.first_chord_for(ActivityAction::ScrollUp)),
+        fc(km.activity.first_chord_for(ActivityAction::PageUp)),
+        fc(km.activity.first_chord_for(ActivityAction::PageDown)),
+        fc(km.activity.first_chord_for(ActivityAction::ScrollHome)),
+        fc(km.activity.first_chord_for(ActivityAction::ScrollEnd)),
+        fc(km.activity.first_chord_for(ActivityAction::Refresh)),
+        fc(km.activity.first_chord_for(ActivityAction::ResetFilter)),
+        fc(km.activity.first_chord_for(ActivityAction::ToggleZenFilter)),
+        fc(km.activity.first_chord_for(ActivityAction::ToggleWorkersFilter)),
+    );
     let footer = Paragraph::new(Line::from(Span::styled(
-        "j/k scroll · u/d page · g top · G bottom · r refresh · a/z/w filter",
+        text,
         Style::default().fg(Color::DarkGray),
     )));
     f.render_widget(footer, area);

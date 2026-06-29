@@ -252,6 +252,10 @@ pub fn run_tasks(project_name: &str) -> Result<()> {
 
     let mut term = setup_terminal().context("setting up terminal")?;
     let mut app = KanbanApp::new(project_name);
+    // Hand the footer renderer its own copy of the resolved keymaps; the
+    // handler keeps the `&keymaps` local below to dodge a borrow conflict
+    // with `&mut app`.
+    app.keymaps = keymaps.clone();
     app.refresh();
 
     let result = handlers::kanban::tasks_loop(&mut term, &mut app, &keymaps);
@@ -291,6 +295,10 @@ pub fn run_review(project_name: &str) -> Result<()> {
 
     let mut term = setup_terminal().context("setting up terminal")?;
     let mut app = ReviewApp::new(project_name);
+    // Hand the footer renderer its own copy of the resolved keymaps; the
+    // handler keeps the `&keymaps` local below to dodge a borrow conflict
+    // with `&mut app`.
+    app.keymaps = keymaps.clone();
     app.refresh();
 
     let result = handlers::review::review_loop(&mut term, &mut app, &keymaps);

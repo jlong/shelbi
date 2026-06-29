@@ -24,7 +24,10 @@ use ratatui::{
     Frame,
 };
 use shelbi_core::Column;
+use shelbi_state::keymap::{DisplayStyle, Keymaps, ReviewAction};
 use shelbi_state::TaskFile;
+
+use crate::keymap::format_chord_or_unbound;
 
 pub struct ReviewApp {
     pub project_name: String,
@@ -34,6 +37,13 @@ pub struct ReviewApp {
     pub status_line: String,
     /// Vertical scroll offset for the detail panel's body (Markdown).
     pub body_scroll: u16,
+    /// Merged keymaps, assigned by `run_review` at startup from the same
+    /// load that surfaces `keys.yml` diagnostics. The footer reads this to
+    /// render hints in the user's configured chords. Defaults to empty —
+    /// isolated render tests that don't exercise the footer leave it so.
+    pub keymaps: Keymaps,
+    /// Cached host-platform chord-display convention.
+    pub display_style: DisplayStyle,
 }
 
 impl ReviewApp {
@@ -45,7 +55,20 @@ impl ReviewApp {
             last_refresh: Instant::now() - Duration::from_secs(60),
             status_line: String::new(),
             body_scroll: 0,
+            keymaps: Keymaps::default(),
+            display_style: DisplayStyle::detect(),
         }
+    }
+
+    /// Borrow the keymaps the footer renders hints from. Populated by
+    /// `run_review`; empty by default.
+    pub fn keymaps(&self) -> &Keymaps {
+        &self.keymaps
+    }
+
+    /// Cached host-platform chord-display convention.
+    pub fn display_style(&self) -> DisplayStyle {
+        self.display_style
     }
 
     pub fn refresh(&mut self) {
@@ -334,10 +357,23 @@ fn meta_row(label: &str, value: &str) -> Line<'static> {
 }
 
 fn render_footer(f: &mut Frame, app: &ReviewApp, area: Rect) {
-    let keys = Line::from(Span::styled(
-        "  j/k select   enter review   J/K scroll body   g top   r refresh",
-        Style::default().fg(Color::DarkGray),
-    ));
+    // Hints are sourced from the merged keymaps and rendered in the host
+    // platform's convention; rebinding any of these review actions updates
+    // the row. Multi-bound actions show their first chord only.
+    let km = app.keymaps();
+    let style = app.display_style();
+    let fc = |c| format_chord_or_unbound(c, style);
+    let text = format!(
+        "  {}/{} select   {} review   {}/{} scroll body   {} top   {} refresh",
+        fc(km.review.first_chord_for(ReviewAction::NavDown)),
+        fc(km.review.first_chord_for(ReviewAction::NavUp)),
+        fc(km.review.first_chord_for(ReviewAction::Activate)),
+        fc(km.review.first_chord_for(ReviewAction::ScrollBodyDown)),
+        fc(km.review.first_chord_for(ReviewAction::ScrollBodyUp)),
+        fc(km.review.first_chord_for(ReviewAction::ScrollBodyHome)),
+        fc(km.review.first_chord_for(ReviewAction::Refresh)),
+    );
+    let keys = Line::from(Span::styled(text, Style::default().fg(Color::DarkGray)));
     let status = if app.status_line.is_empty() {
         Line::raw("")
     } else {

@@ -6,7 +6,19 @@
 //! Alt+Z, Ctrl+G, etc. must take priority over `g` / `z` as nav keys.
 
 use crossterm::event::{KeyCode, KeyModifiers};
+use shelbi_state::keymap::{format_chord, DisplayStyle, KeyChord};
 use shelbi_state::ZenToggleChord;
+
+/// Render a chord for a help footer, falling back to `<unbound>` when the
+/// action has no binding. Help rows reference actions by enum, so a user
+/// who unbinds a help-referenced action (via `keys.yml`) gets a visible
+/// `<unbound>` marker rather than a panic or a silently dropped hint.
+pub fn format_chord_or_unbound(chord: Option<&KeyChord>, style: DisplayStyle) -> String {
+    match chord {
+        Some(c) => format_chord(c, style),
+        None => "<unbound>".to_string(),
+    }
+}
 
 /// True when the given key event matches the configured Zen toggle chord.
 /// [`ZenToggleChord::None`] never matches — that's the "skip" outcome of
