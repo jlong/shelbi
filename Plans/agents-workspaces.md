@@ -242,14 +242,12 @@ When the agent runs, its `skills/` directory is exposed to Claude Code's skill l
 Agents can share skills by symlinking — no separate "library" mechanism in v1.
 
 ### 8. The Orchestrator agent's special status
+The Orchestrator agent runs differently from other agents in two ways:
 
-The Orchestrator agent runs differently from worker agents in two ways:
+1. **Persistent pane.** Other agents dispatch and clear between tasks; the orchestrator runs continuously in its own tmux session and reacts to events.
+2. **Doesn't own a single status.** It owns the *transitions out of* multiple statuses (auto-promote out of backlog under Zen, auto-dispatch out of todo, run Zen merge conditions out of review). The `agent: orchestrator` field on `todo` (and on user-owned statuses that allow Zen automation, like `backlog` and `review`) is documentation — the orchestrator process runs whether or not any particular status names it, since the orchestrator IS the dispatch loop.
 
-1. **Persistent pane.** A worker dispatches and clears between tasks; the orchestrator runs continuously in its own tmux session and reacts to events.
-2. **Doesn't own a single status.** It owns the *transitions out of* multiple statuses (auto-promote out of backlog under Zen, auto-dispatch out of todo, run Zen merge conditions out of review). The `owner: orchestrator` field on `todo` is a *convenience* — the orchestrator runs whether or not todo lists it explicitly, since the orchestrator IS the dispatch loop.
-
-Plan position: keep both — let `todo` (and any other "transient ready" statuses) declare `owner: orchestrator` for documentation purposes. The orchestrator process itself runs always. The CLI command `shelbi agent show orchestrator` should make this special status visible.
-
+Plan position: keep both — let multiple statuses declare `agent: orchestrator` for documentation purposes, and run the orchestrator process unconditionally. The CLI command `shelbi agent show orchestrator` should make this special status visible.
 ### 9. CLI surface
 
 Four new commands under `shelbi agent`, all in v1:
