@@ -61,7 +61,7 @@ The `[developer]` tag is the currently-loaded agent (see §10), surfaced inline 
 **Single-machine project, collapsed:**
 
 ```
-WORKSPACES
+- Workspaces -
 ● alpha     idle
 ● bravo     idle
 ● charlie   in_progress: <task-id>   [developer]
