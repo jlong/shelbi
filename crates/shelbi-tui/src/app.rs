@@ -5,8 +5,8 @@ use ratatui::layout::Rect;
 use shelbi_core::{Agent, Column, Status};
 use shelbi_palette::{Decoration, DecorationColor};
 use shelbi_state::{
-    keymap::Keymaps, load_worker_status, read_state, TaskFile, WorkerState, ZenModeState,
-    ZenToggleChord,
+    keymap::{DisplayStyle, Keymaps},
+    load_worker_status, read_state, TaskFile, WorkerState, ZenModeState, ZenToggleChord,
 };
 
 /// What's currently highlighted in the sidebar — drives selection logic
@@ -143,6 +143,10 @@ pub struct App {
     /// `keymaps.sidebar`. Default is empty bindings; callers that exercise
     /// the handler (entry points, tests) replace this before dispatching.
     pub keymaps: Keymaps,
+    /// Platform convention for rendering chord hints — detected once here
+    /// at construction so per-frame footer rendering never re-probes the
+    /// host OS. Read via [`App::display_style`].
+    pub display_style: DisplayStyle,
     /// Screen-space rect occupied by the rendered row list — written each
     /// frame by the sidebar renderer and read by the mouse-click handler to
     /// map a click coordinate back to a row index.
@@ -163,6 +167,7 @@ impl App {
             zen_mode: ZenModeState::Off,
             zen_toggle_chord: ZenToggleChord::AltZ,
             keymaps: Keymaps::default(),
+            display_style: DisplayStyle::detect(),
             list_area: Rect::default(),
         }
     }
@@ -172,6 +177,13 @@ impl App {
     /// re-parsing `keys.yml` per keystroke.
     pub fn keymaps(&self) -> &Keymaps {
         &self.keymaps
+    }
+
+    /// The cached host-platform chord-display convention. Detected once at
+    /// construction; help rendering reads this rather than calling
+    /// [`DisplayStyle::detect`] per frame.
+    pub fn display_style(&self) -> DisplayStyle {
+        self.display_style
     }
 
     /// Translate a click in terminal coordinates into a row index, if the

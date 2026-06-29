@@ -1,9 +1,9 @@
-//! Customizable keybindings — actions, chord parser, and `keys.yml`
-//! loader. Wired into the TUI handlers by subsequent tasks; this module
-//! is dead code on its own.
+//! Customizable keybindings — actions, chord parser, `keys.yml` loader,
+//! and platform-aware help-text rendering.
 
 pub mod actions;
 pub mod chord;
+pub mod display;
 pub mod loader;
 
 pub use actions::{
@@ -11,6 +11,7 @@ pub use actions::{
     ReviewAction, SidebarAction, MODE_NAMES,
 };
 pub use chord::{ChordParseError, KeyChord};
+pub use display::{format_chord, DisplayStyle};
 pub use loader::{
     load_keymaps, ErrorKind, KeymapDiagnostic, Keymaps, ModeKeymap, WarningKind, KEYS_FILENAME,
 };

@@ -10,9 +10,11 @@ use ratatui::{
     Frame,
 };
 use shelbi_palette::DecorationColor;
+use shelbi_state::keymap::{GlobalAction, SidebarAction};
 use shelbi_state::ZenModeState;
 
 use crate::app::{App, Row};
+use crate::keymap::format_chord_or_unbound;
 
 pub fn render_full(f: &mut Frame, app: &mut App, area: Rect) {
     // Footer is always: [status?] keybinds, blank, zen-row. The zen row is
@@ -236,9 +238,16 @@ fn render_footer(f: &mut Frame, app: &App, area: Rect) {
         );
         idx += 1;
     }
+    let km = app.keymaps();
+    let style = app.display_style();
+    let keybinds = format!(
+        "{} palette  {} quit",
+        format_chord_or_unbound(km.global.first_chord_for(GlobalAction::OpenPalette), style),
+        format_chord_or_unbound(km.sidebar.first_chord_for(SidebarAction::Quit), style),
+    );
     f.render_widget(
         Paragraph::new(Line::from(Span::styled(
-            "^P palette  q quit",
+            keybinds,
             Style::default().fg(Color::DarkGray),
         ))),
         rows[idx].inner(indent),
@@ -253,7 +262,7 @@ fn render_footer(f: &mut Frame, app: &App, area: Rect) {
 /// On: full-width green band with `ZEN MODE ON` in black — paints
 /// edge-to-edge of the sidebar column, no border, no padding box.
 /// Off: dim `<hotkey> Zen mode` hint in the same DarkGray style as the
-/// `^P palette  q quit` line above it, so the hotkey is discoverable
+/// palette/quit keybind line above it, so the hotkey is discoverable
 /// without changing the footer's visual weight. The hotkey glyph is
 /// sourced from the configured chord — rebinding updates it
 /// automatically. When no chord is bound the hint is suppressed so the
@@ -288,7 +297,7 @@ fn render_zen_row(f: &mut Frame, area: Rect, app: &App) {
         return;
     }
 
-    // Off / Paused: same indent + dim style as `^P palette  q quit`.
+    // Off / Paused: same indent + dim style as the palette.
     let inner = area.inner(Margin {
         horizontal: 1,
         vertical: 0,
@@ -325,7 +334,73 @@ pub fn decoration_to_color(c: DecorationColor) -> Color {
 mod tests {
     use super::*;
     use ratatui::{backend::TestBackend, Terminal};
+    use shelbi_state::keymap::{DisplayStyle, KeyChord};
     use shelbi_state::ZenToggleChord;
+
+    /// Render the footer at a width wide enough for the longest expected
+    /// keybind string and return the flattened buffer.
+    fn footer_text(app: &mut App) -> String {
+        let backend = TestBackend::new(40, 16);
+        let mut term = Terminal::new(backend).unwrap();
+        term.draw(|f| render_full(f, app, f.area())).unwrap();
+        dump(&term).join("\n")
+    }
+
+    fn bind(app: &mut App, palette: Option<&str>, quit: Option<&str>) {
+        if let Some(c) = palette {
+            app.keymaps
+                .global
+                .by_action
+                .insert(GlobalAction::OpenPalette, vec![KeyChord::parse(c).unwrap()]);
+        }
+        if let Some(c) = quit {
+            app.keymaps
+                .sidebar
+                .by_action
+                .insert(SidebarAction::Quit, vec![KeyChord::parse(c).unwrap()]);
+        }
+    }
+
+    /// Default chords (`ctrl-p` palette, `q` quit) render in the host
+    /// platform's convention — the whole point of the platform-aware row.
+    #[test]
+    fn footer_renders_default_chords_per_platform() {
+        let mut app = App::new_sidebar("demo");
+        bind(&mut app, Some("ctrl-p"), Some("q"));
+        let joined = footer_text(&mut app);
+        let want = match app.display_style() {
+            DisplayStyle::Mac => "⌃P palette  q quit",
+            DisplayStyle::Linux => "Ctrl+P palette  q quit",
+        };
+        assert!(joined.contains(want), "expected {want:?} in:\n{joined}");
+    }
+
+    /// Overriding `global.open_palette` to a new chord updates the footer
+    /// — it's sourced from the keymap, not hardcoded.
+    #[test]
+    fn footer_reflects_open_palette_override() {
+        let mut app = App::new_sidebar("demo");
+        bind(&mut app, Some("ctrl-shift-space"), Some("q"));
+        let joined = footer_text(&mut app);
+        let want = match app.display_style() {
+            DisplayStyle::Mac => "⌃⇧Space palette",
+            DisplayStyle::Linux => "Ctrl+Shift+Space palette",
+        };
+        assert!(joined.contains(want), "expected {want:?} in:\n{joined}");
+    }
+
+    /// Unbinding a help-referenced action renders `<unbound>` rather than
+    /// panicking or dropping the hint.
+    #[test]
+    fn footer_shows_unbound_for_missing_binding() {
+        let mut app = App::new_sidebar("demo");
+        // Leave keymaps at default (empty) — no binding for either action.
+        let joined = footer_text(&mut app);
+        assert!(
+            joined.contains("<unbound> palette  <unbound> quit"),
+            "expected <unbound> markers in:\n{joined}"
+        );
+    }
 
     fn dump(term: &Terminal<TestBackend>) -> Vec<String> {
         let buf = term.backend().buffer().clone();
@@ -349,7 +424,7 @@ mod tests {
     }
 
     /// On state: full-width green band carrying `ZEN MODE ON`, one blank
-    /// row above it, the `^P palette  q quit` keybind line above that.
+    /// row above it, the palette/quit keybind line above that.
     /// No box-drawing chrome — the old bordered pill is gone.
     #[test]
     fn zen_row_renders_full_width_band_when_on() {
@@ -369,7 +444,7 @@ mod tests {
             !joined.contains("┌─") && !joined.contains("└─"),
             "no border chrome expected, got:\n{joined}"
         );
-        let keybind_y = row_y(&rows, "^P palette  q quit");
+        let keybind_y = row_y(&rows, "palette");
         let zen_y = row_y(&rows, "ZEN MODE ON");
         assert!(
             zen_y == keybind_y + 2,
@@ -408,7 +483,7 @@ mod tests {
             joined.contains("⌥Z Zen mode"),
             "expected hotkey hint sourced from configured chord in:\n{joined}"
         );
-        let keybind_y = row_y(&rows, "^P palette  q quit");
+        let keybind_y = row_y(&rows, "palette");
         let hint_y = row_y(&rows, "Zen mode");
         assert_eq!(
             hint_y,
@@ -447,7 +522,7 @@ mod tests {
             .draw(|f| render_full(f, &mut app, f.area()))
             .unwrap();
         let off_rows = dump(&term_off);
-        let off_y = row_y(&off_rows, "^P palette  q quit");
+        let off_y = row_y(&off_rows, "palette");
 
         let backend_on = TestBackend::new(24, 16);
         let mut term_on = Terminal::new(backend_on).unwrap();
@@ -456,7 +531,7 @@ mod tests {
             .draw(|f| render_full(f, &mut app, f.area()))
             .unwrap();
         let on_rows = dump(&term_on);
-        let on_y = row_y(&on_rows, "^P palette  q quit");
+        let on_y = row_y(&on_rows, "palette");
 
         assert_eq!(off_y, on_y, "keybind line must not move when toggling Zen");
     }

@@ -29,7 +29,10 @@ use ratatui::{
 use shelbi_core::{
     default_workflow, Column, StatusCategory, Task, Workflow, DEFAULT_WORKFLOW_NAME,
 };
+use shelbi_state::keymap::{DisplayStyle, KanbanAction, Keymaps, PopoverAction};
 use shelbi_state::TaskFile;
+
+use crate::keymap::format_chord_or_unbound;
 
 /// State for the Kanban TUI. Selection is `(column, row)` — `row` is the
 /// index inside the currently focused column.
@@ -109,6 +112,14 @@ pub struct KanbanApp {
     /// selection-driven scrolling can ask "is the selected column
     /// currently visible?" without redoing the layout pass.
     pub visible_columns: std::ops::Range<usize>,
+    /// Merged keymaps, assigned by `run_tasks` at startup from the same
+    /// load that surfaces `keys.yml` diagnostics. The board + popover
+    /// footers read this to render hints in the user's configured chords.
+    /// Defaults to empty — isolated render tests that don't exercise the
+    /// footers leave it so.
+    pub keymaps: Keymaps,
+    /// Cached host-platform chord-display convention.
+    pub display_style: DisplayStyle,
 }
 
 /// Worker filter applied to the visible cards. Separate from the
@@ -302,7 +313,20 @@ impl KanbanApp {
             workflow_dropdown_hits: Vec::new(),
             column_scroll: 0,
             visible_columns: 0..0,
+            keymaps: Keymaps::default(),
+            display_style: DisplayStyle::detect(),
         }
+    }
+
+    /// Borrow the keymaps the footers render hints from. Populated by
+    /// `run_tasks`; empty by default.
+    pub fn keymaps(&self) -> &Keymaps {
+        &self.keymaps
+    }
+
+    /// Cached host-platform chord-display convention.
+    pub fn display_style(&self) -> DisplayStyle {
+        self.display_style
     }
 
     /// Hit-test a screen coordinate against the most recently rendered cards.
@@ -1596,10 +1620,27 @@ fn render_column(
 }
 
 fn render_footer(f: &mut Frame, app: &KanbanApp, area: Rect) {
-    let keys = Line::from(Span::styled(
-        "  h/l col   j/k row   enter/␣ open   H/L move col   K/J reorder   w workflow   f filter   r refresh",
-        Style::default().fg(Color::DarkGray),
-    ));
+    // Nav / move / reorder / open / refresh glyphs come from the merged
+    // keymaps, rendered in the host platform's convention. `workflow` and
+    // `filter` aren't keymap-driven actions (the dropdowns own those keys),
+    // so they stay literal. Multi-bound actions show their first chord.
+    let km = app.keymaps();
+    let style = app.display_style();
+    let fc = |c| format_chord_or_unbound(c, style);
+    let text = format!(
+        "  {}/{} col   {}/{} row   {} open   {}/{} move col   {}/{} reorder   w workflow   f filter   {} refresh",
+        fc(km.kanban.first_chord_for(KanbanAction::NavLeft)),
+        fc(km.kanban.first_chord_for(KanbanAction::NavRight)),
+        fc(km.kanban.first_chord_for(KanbanAction::NavDown)),
+        fc(km.kanban.first_chord_for(KanbanAction::NavUp)),
+        fc(km.kanban.first_chord_for(KanbanAction::OpenPopover)),
+        fc(km.kanban.first_chord_for(KanbanAction::MoveCardLeft)),
+        fc(km.kanban.first_chord_for(KanbanAction::MoveCardRight)),
+        fc(km.kanban.first_chord_for(KanbanAction::ReorderUp)),
+        fc(km.kanban.first_chord_for(KanbanAction::ReorderDown)),
+        fc(km.kanban.first_chord_for(KanbanAction::Refresh)),
+    );
+    let keys = Line::from(Span::styled(text, Style::default().fg(Color::DarkGray)));
     let status = if app.status_line.is_empty() {
         Line::raw("")
     } else {
@@ -2133,8 +2174,21 @@ fn render_popover(f: &mut Frame, app: &KanbanApp, area: Rect) {
         .scroll((scroll, 0));
     f.render_widget(body, chunks[2]);
 
+    // First-chord-only: the popover's `close` and `scroll` actions each
+    // carry several bindings (esc/enter/space/q, j/k/↑/↓), but the hint
+    // shows just the first — the full list lives in `config list-actions`.
+    let km = app.keymaps();
+    let style = app.display_style();
+    let fc = |c| format_chord_or_unbound(c, style);
+    let hint_text = format!(
+        "  {}  close      {}/{}  scroll      {}  top",
+        fc(km.popover.first_chord_for(PopoverAction::Close)),
+        fc(km.popover.first_chord_for(PopoverAction::ScrollDown)),
+        fc(km.popover.first_chord_for(PopoverAction::ScrollUp)),
+        fc(km.popover.first_chord_for(PopoverAction::ScrollHome)),
+    );
     let hint = Line::from(Span::styled(
-        "  esc/enter/␣  close      j/k or ↑/↓  scroll      g  top",
+        hint_text,
         Style::default().fg(Color::DarkGray),
     ));
     f.render_widget(Paragraph::new(hint), chunks[3]);
@@ -2771,6 +2825,58 @@ mod tests {
             3,
             "expected 3 dropdown hits (All + 2 workers), got {}",
             app.dropdown_hits.len()
+        );
+    }
+
+    /// The board footer sources every nav/move/reorder/open/refresh glyph
+    /// from the merged keymaps and renders it in the host platform's
+    /// convention. Pinning the Linux spelling guards the action→slot
+    /// mapping (a swapped `MoveCardLeft`/`Right` would surface here) and
+    /// confirms `workflow`/`filter` stay literal.
+    #[test]
+    fn board_footer_renders_chords_from_keymaps() {
+        use ratatui::{backend::TestBackend, Terminal};
+        use shelbi_state::keymap::KeyChord;
+
+        let mut app = KanbanApp::new("demo");
+        app.display_style = DisplayStyle::Linux;
+        for (action, chord) in [
+            (KanbanAction::NavLeft, "h"),
+            (KanbanAction::NavRight, "l"),
+            (KanbanAction::NavDown, "j"),
+            (KanbanAction::NavUp, "k"),
+            (KanbanAction::OpenPopover, "enter"),
+            (KanbanAction::MoveCardLeft, "H"),
+            (KanbanAction::MoveCardRight, "L"),
+            (KanbanAction::ReorderUp, "K"),
+            (KanbanAction::ReorderDown, "J"),
+            (KanbanAction::Refresh, "r"),
+        ] {
+            app.keymaps
+                .kanban
+                .by_action
+                .insert(action, vec![KeyChord::parse(chord).unwrap()]);
+        }
+
+        let backend = TestBackend::new(160, 14);
+        let mut term = Terminal::new(backend).unwrap();
+        term.draw(|f| render_full(f, &mut app, f.area())).unwrap();
+        let buf = term.backend().buffer().clone();
+        let joined: String = (0..buf.area.height)
+            .map(|y| {
+                (0..buf.area.width)
+                    .map(|x| buf[(x, y)].symbol().to_string())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(
+            joined.contains(
+                "h/l col   j/k row   Enter open   Shift+h/Shift+l move col   \
+                 Shift+k/Shift+j reorder   w workflow   f filter   r refresh"
+            ),
+            "footer mismatch in:\n{joined}"
         );
     }
 
