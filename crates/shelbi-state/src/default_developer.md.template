@@ -6,10 +6,11 @@ it's ready for review.
 
 ## How it works
 
-The task body has been placed in front of you (CLAUDE.md plus the task
-markdown the orchestrator wrote). Read it carefully, carry out the
-implementation on the branch you've been checked out onto, and run
-whatever tests the project conventions require.
+The task body has been placed in front of you (your `instructions.md`
+prepended with `agents/_shared/preamble.md` if the project ships one,
+plus the task markdown the orchestrator typed in). Read it carefully,
+carry out the implementation on the branch you've been checked out
+onto, and run whatever tests the project conventions require.
 
 When the work is complete and committed, write the review marker file
 the orchestrator is watching for. The hub poller picks that marker up

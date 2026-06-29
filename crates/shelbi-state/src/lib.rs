@@ -24,11 +24,13 @@ mod workspace_status;
 mod workflows;
 
 pub use agent_workspaces::{
-    agent_instructions_path, agent_skills_dir, agent_workspace_dir, count_agent_skills,
-    default_agent_body, is_default_agent, list_agents, materialize_default_agents,
-    self_heal_default_agents, AgentMaterializeOutcome, DEFAULT_AGENTS,
-    DEFAULT_DEVELOPER_INSTRUCTIONS, DEFAULT_ORCHESTRATOR_INSTRUCTIONS, DEVELOPER_AGENT,
-    ORCHESTRATOR_AGENT,
+    agent_instructions_path, agent_shared_preamble_path, agent_skills_dir, agent_workspace_dir,
+    compose_agent_prompt, count_agent_skills, default_agent_body, is_default_agent,
+    legacy_claude_md_path, list_agents, load_shared_preamble, materialize_default_agents,
+    maybe_emit_claude_md_migration_hint, reset_claude_md_migration_hint, self_heal_default_agents,
+    AgentMaterializeOutcome, DEFAULT_AGENTS, DEFAULT_DEVELOPER_INSTRUCTIONS,
+    DEFAULT_ORCHESTRATOR_INSTRUCTIONS, DEVELOPER_AGENT, ORCHESTRATOR_AGENT, SHARED_AGENT_DIR,
+    SHARED_PREAMBLE_FILE,
 };
 pub use hub_config::{
     hub_config_path, list_projects, load_hub_config, save_hub_config, touch_project_launched,
@@ -360,6 +362,17 @@ pub struct State {
     /// re-notifies.
     #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
     pub notified_diverged_agents: BTreeSet<String>,
+    /// Per-orchestrator-session latch for the legacy `CLAUDE.md`
+    /// migration hint. Set the first time
+    /// [`maybe_emit_claude_md_migration_hint`] sees a leftover
+    /// `~/.shelbi/projects/<project>/CLAUDE.md` and emits its stderr
+    /// hint, so subsequent workspace dispatches inside the same session
+    /// don't re-fire it. Cleared at orchestrator startup via
+    /// [`reset_claude_md_migration_hint`] so a fresh session re-checks
+    /// the disk. v2 drops the file entirely; v1 keeps it as a one-shot
+    /// guidepost.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub claude_md_migration_hinted: bool,
 }
 
 /// Tri-state Zen Mode toggle persisted in `state.json::zen_mode`.

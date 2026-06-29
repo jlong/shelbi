@@ -910,17 +910,24 @@ pub fn deploy_agent_context(
     project_name: &str,
     agent: &str,
 ) -> Result<()> {
-    let instructions_src = shelbi_state::agent_instructions_path(project_name, agent)?;
-    let instructions_body = std::fs::read_to_string(&instructions_src).map_err(|e| {
-        Error::Other(format!(
-            "agent `{agent}` instructions.md unreadable at {}: {e}",
-            instructions_src.display(),
-        ))
-    })?;
-    deploy_agent_instructions(host, worktree, &instructions_body)?;
+    // Compose preamble (`agents/_shared/preamble.md`, if present) + the
+    // agent's `instructions.md` into one body. `compose_agent_prompt`
+    // handles the missing-preamble case (just the agent's prompt) and
+    // the `{{assistant_name}}` substitution. Any file-read failure
+    // surfaces from there with the same shape the old direct-read used.
+    let composed = shelbi_state::compose_agent_prompt(project_name, agent)
+        .map_err(|e| Error::Other(format!("{e}")))?;
+    deploy_agent_instructions(host, worktree, &composed)?;
 
     let skills_src = shelbi_state::agent_skills_dir(project_name, agent)?;
     refresh_agent_skills(host, worktree, &skills_src)?;
+
+    // Best-effort: nudge the user toward the new agents/ layout the
+    // first time a dispatch lands while a legacy CLAUDE.md is still on
+    // disk. Idempotent across multiple dispatches per orchestrator
+    // session (state-flag gated). Don't fail the dispatch on a hint
+    // write error — the user can still hand-migrate.
+    let _ = shelbi_state::maybe_emit_claude_md_migration_hint(project_name);
     Ok(())
 }
 
@@ -1994,6 +2001,41 @@ mod tests {
             std::fs::read_to_string(&skill).unwrap(),
             "# skill: debug\n",
             "developer's skills/ contents must mirror into .claude/skills/",
+        );
+
+        std::env::remove_var("SHELBI_HOME");
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// Acceptance criterion (a): when `agents/_shared/preamble.md`
+    /// exists, the workspace spawn path deploys the agent's
+    /// `.claude/agent-instructions.md` with the preamble prepended (and
+    /// a blank line separator) — the runner's --append-system-prompt
+    /// then loads the composed prompt as one body.
+    #[test]
+    fn deploy_agent_context_prepends_shared_preamble_when_present() {
+        let _g = crate::test_lock::acquire();
+        let tmp = agent_test_tmpdir("ctx-preamble");
+        let home = tmp.join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        std::env::set_var("SHELBI_HOME", &home);
+        install_default_agents_under_home(&home, "p");
+        // Seed the optional shared preamble. The compose pipeline must
+        // pick it up without any opt-in flag.
+        let preamble_path = shelbi_state::agent_shared_preamble_path("p").unwrap();
+        std::fs::create_dir_all(preamble_path.parent().unwrap()).unwrap();
+        std::fs::write(&preamble_path, "monorepo overview\n").unwrap();
+
+        let worktree = tmp.join("wt");
+        std::fs::create_dir_all(&worktree).unwrap();
+
+        deploy_agent_context(&Host::Local, &worktree, "p", "developer").unwrap();
+
+        let instructions = worktree.join(".claude/agent-instructions.md");
+        let body = std::fs::read_to_string(&instructions).unwrap();
+        assert_eq!(
+            body, "monorepo overview\n\n# developer\nfix the bug\n",
+            "preamble must lead, blank line separator, then the agent's instructions"
         );
 
         std::env::remove_var("SHELBI_HOME");
