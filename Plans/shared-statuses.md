@@ -41,12 +41,14 @@ statuses:
 Fields per status:
 
 - `id` — stable identifier referenced by workflows and tasks
+
 - `name` — display label
+
 - `category` — semantic floor (`backlog`/`ready`/`active`/`handoff`/`done`/`archived`)
 
-**No `owner` or `agent` in this file.** Those are workflow-scoped concerns.
+**No** **`owner`** **or** **`agent`** **in this file.** Those are workflow-scoped concerns.
 
-**Status declaration order in `statuses.yml` is the canonical column order for every view in the project** — the all view, per-workflow boards, and any future analytics surfaces. Workflows cannot reorder columns; they can only choose which statuses to include.
+**Status declaration order in** **`statuses.yml`** **is the canonical column order for every view in the project** — the all view, per-workflow boards, and any future analytics surfaces. Workflows cannot reorder columns; they can only choose which statuses to include.
 
 ### 2. Workflow YAML declares semantics per status
 
@@ -106,7 +108,9 @@ zen:
 Per-status fields in the workflow:
 
 - `id` — must reference a status in `statuses.yml`
+
 - `owner` — `user` | `agent` (whose responsibility when Zen is off)
+
 - `agent` (optional) — which agent runs when Zen is on; names a directory under `agents/`
 
 A workflow's `statuses:` list is the subset of `statuses.yml` the workflow uses. **There is no implicit "all statuses" shortcut** — each workflow lists what it uses. Keeps the workflow self-documenting and prevents a future addition to `statuses.yml` from silently extending every workflow's board.
@@ -124,16 +128,23 @@ Per-task rendering details (activity-feed reasons, orchestrator routing, Zen han
 **`statuses.yml`:**
 
 - Must exist in the project's `workflows/` directory. On `shelbi init` and on `shelbi reload`, materialize the default file if missing (the six-status set in §1 is the shipped default).
+
 - Each entry must have a unique non-empty `id`, a non-empty `name`, and a valid `category` (one of the six values).
+
 - `id` is a slug-shaped string (`[a-z0-9-]+`). `name` is free-form text.
 
 **Workflow YAML:**
 
 - Each `statuses:` entry's `id` must reference an id defined in `statuses.yml`. Unknown ids hard-fail with the list of available status ids.
+
 - `owner` is required, must be `user` or `agent`.
+
 - `agent` is optional; if present must match an agent directory under `agents/`.
+
 - A workflow's `transitions:` `from` and `to` must reference status ids the workflow includes.
+
 - A workflow's `initial_status` must be in the workflow's `statuses:` list.
+
 - The same status id cannot appear twice in a single workflow's `statuses:` list.
 
 ### 5. Legacy migration
@@ -141,9 +152,13 @@ Per-task rendering details (activity-feed reasons, orchestrator routing, Zen han
 Today's inline `statuses:` block already carries `id`, `name`, `category`, `owner` together. The migration on first load:
 
 - The loader walks every workflow file. For each inline status definition, it extracts `id` + `name` + `category` into a working set.
+
 - If multiple workflows define the same `id` with **different** names or categories, the migration **hard-fails** and tells the user to reconcile (a project-wide id should have one display name and one category).
+
 - The working set is written out as `workflows/statuses.yml` in the union order observed (first-seen wins for ordering when ids appear in multiple workflows).
+
 - Each workflow's inline `statuses:` block is **rewritten** to the new form (id + owner + agent), dropping `name` and `category`.
+
 - The loader emits a **one-time** stderr deprecation hint summarizing what was migrated.
 
 On subsequent loads, the loader detects mixed-form workflows (an inline status definition with `name:` or `category:` still present and `statuses.yml` already on disk) and hard-fails with a diff — once the user has `statuses.yml`, workflow files must use the reference-only form.
@@ -197,10 +212,15 @@ No new flags on `shelbi task move`, `shelbi task list`, etc. — they keep refer
 One task on the `app` Shelbi Workflow:
 
 - Add `workflows/statuses.yml` to the project layout. Materialize the default file on `shelbi init` and self-heal on `shelbi reload`.
+
 - Update the loader to read `statuses.yml`, apply the §4 validation rules, and parse the new workflow `statuses:` form (id + owner + agent).
+
 - Implement the legacy migration (§5) with the one-time deprecation hint.
+
 - Update each shipped workflow file (`app`, `app-feature`, `default`, `site`) to the reference form.
+
 - Add `shelbi status list` and `shelbi workflow show <name>` CLI commands.
+
 - Tests: round-trip statuses.yml + workflows; reject unknown ids; reject mixed forms after migration; reject conflicting names or categories across workflows; migration rewrites every workflow correctly.
 
 ### Phase 2 — TUI all view
@@ -208,13 +228,17 @@ One task on the `app` Shelbi Workflow:
 One task on the `app` Shelbi Workflow:
 
 - Update the all-view Kanban renderer to consume `statuses.yml` directly for column order.
+
 - Drop any workflow-by-workflow column reconciliation logic.
+
 - Render stable empty columns for statuses that no current task uses.
+
 - Per-task overlays (badges, activity-feed reasons) read the owning workflow's declared owner/agent for that status.
 
-### Phase 3 — remove legacy (file later)
+### Phase 3 — remove legacy
 
 One task on the `app` Shelbi Workflow, filed after Phase 1 has been live for one release:
 
 - Delete the inline-form migration path; workflow files must use the reference form.
+
 - Drop the migration helper code.
