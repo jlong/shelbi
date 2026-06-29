@@ -1,3 +1,4 @@
+use std::collections::BTreeSet;
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
@@ -6,7 +7,8 @@ use shelbi_core::{Agent, Column, Status};
 use shelbi_palette::{Decoration, DecorationColor};
 use shelbi_state::{
     keymap::{DisplayStyle, Keymaps},
-    load_workspace_status, read_state, TaskFile, WorkspaceState, ZenModeState, ZenToggleChord,
+    load_workspace_status, read_state, sidebar_collapsed_machines, toggle_sidebar_machine_collapsed,
+    TaskFile, WorkspaceState, ZenModeState, ZenToggleChord,
 };
 
 /// What's currently highlighted in the sidebar — drives selection logic
@@ -163,6 +165,14 @@ pub struct App {
     /// frame by the sidebar renderer and read by the mouse-click handler to
     /// map a click coordinate back to a row index.
     pub list_area: Rect,
+    /// Names of machines the user has collapsed in the Workspaces tree.
+    /// Mirrored to `~/.shelbi/state.json::sidebar.collapsed_machines` so
+    /// the choice survives a sidebar respawn and follows the user across
+    /// projects that share a machine name. Loaded once at refresh; the
+    /// toggle path mutates this set and writes to disk in one shot.
+    /// Stale entries (machine names not declared in the current project)
+    /// are silently ignored at row-build time — no error, no warning.
+    pub collapsed_machines: BTreeSet<String>,
 }
 
 impl App {
@@ -181,6 +191,7 @@ impl App {
             keymaps: Keymaps::default(),
             display_style: DisplayStyle::detect(),
             list_area: Rect::default(),
+            collapsed_machines: BTreeSet::new(),
         }
     }
 
@@ -267,10 +278,36 @@ impl App {
             let grouped = machines.len() > 1;
             if grouped {
                 for machine in &machines {
+                    let machine_str = *machine;
+                    let on_machine: Vec<&WorkspaceOverview> = self
+                        .workspaces
+                        .iter()
+                        .filter(|w| w.machine == machine_str)
+                        .collect();
+                    let total = on_machine.len();
+                    // "Active" = the workspace is currently running a task
+                    // (`current_task.is_some()`). Review-ready workspaces
+                    // have no in-progress task assigned, so they don't
+                    // count — matches the wireframe's "agent loaded vs
+                    // idle" reading of the workspace row.
+                    let active = on_machine
+                        .iter()
+                        .filter(|w| w.current_task.is_some())
+                        .count();
+                    let collapsed = self.collapsed_machines.contains(machine_str);
                     rows.push(Row::MachineGroup {
-                        name: (*machine).to_string(),
+                        name: machine_str.to_string(),
+                        collapsed,
+                        total,
+                        active,
                     });
-                    for w in self.workspaces.iter().filter(|w| w.machine == *machine) {
+                    if collapsed {
+                        // Hide the workspace rows beneath. The header row
+                        // carries the count suffix so the user still sees
+                        // overall capacity at a glance.
+                        continue;
+                    }
+                    for w in on_machine {
                         rows.push(Row::Workspace {
                             name: w.name.clone(),
                             badge: w.badge,
@@ -333,6 +370,10 @@ impl App {
         self.zen_mode = read_state(&self.project_name)
             .map(|s| s.zen_mode)
             .unwrap_or(ZenModeState::Off);
+        // Refresh the cached collapse set from disk. Missing
+        // `~/.shelbi/state.json` is normal on a fresh install — default
+        // to empty (every machine expanded) without surfacing an error.
+        self.collapsed_machines = sidebar_collapsed_machines().unwrap_or_default();
         self.last_refresh = Instant::now();
         Ok(())
     }
@@ -380,11 +421,39 @@ impl App {
     }
 
     /// Act on the currently highlighted row: tmux-select the matching
-    /// window (orchestrator → dashboard's right pane; agent → its window).
+    /// window (orchestrator → dashboard's right pane; agent → its window)
+    /// or, when the row is a [`Row::MachineGroup`], toggle the machine's
+    /// collapse state. Space and Enter both route here, so a user can
+    /// fold/unfold a machine without leaving the keyboard.
     pub fn activate_selection(&mut self) {
-        if let Some(row) = self.rows().get(self.sidebar_index).cloned() {
-            if let Some(view) = row.view().cloned() {
-                self.activate_view(&view);
+        let Some(row) = self.rows().get(self.sidebar_index).cloned() else {
+            return;
+        };
+        if let Row::MachineGroup { name, .. } = &row {
+            self.toggle_machine_collapsed(name);
+            return;
+        }
+        if let Some(view) = row.view().cloned() {
+            self.activate_view(&view);
+        }
+    }
+
+    /// Flip the collapse state for `machine` in the sidebar tree. Writes
+    /// the new state to `~/.shelbi/state.json` and mirrors it into the
+    /// in-memory cache so the next render reflects the toggle without an
+    /// extra refresh tick. A disk failure surfaces in the status line —
+    /// the cache is not updated in that case so the row keeps reading
+    /// what's on disk.
+    pub fn toggle_machine_collapsed(&mut self, machine: &str) {
+        match toggle_sidebar_machine_collapsed(machine) {
+            Ok(true) => {
+                self.collapsed_machines.insert(machine.to_string());
+            }
+            Ok(false) => {
+                self.collapsed_machines.remove(machine);
+            }
+            Err(e) => {
+                self.status_line = format!("collapse `{machine}` failed: {e}");
             }
         }
     }
@@ -470,12 +539,28 @@ pub enum Row {
     /// Vertical spacing between sections. Renders as an empty line and
     /// can't be selected — purely for visual rhythm.
     Blank,
-    /// Machine group header inside the Workspaces section — renders as
-    /// `▾ <machine>` to introduce the rows that follow. Only emitted when
-    /// the project declares more than one machine; single-machine projects
-    /// skip the header entirely. Not selectable: expansion / collapse is
-    /// out of scope for this row kind, so it's purely a divider.
-    MachineGroup { name: String },
+    /// Machine group header inside the Workspaces section. Renders as
+    /// `▾ <machine>` when expanded and `▸ <machine>   (<total>, <active>
+    /// active)` when collapsed. Only emitted when the project declares
+    /// more than one machine; single-machine projects skip the header
+    /// entirely and have nothing to collapse. Selectable so Space/Enter
+    /// on the focused row can toggle the collapse state via
+    /// [`App::toggle_machine_collapsed`].
+    MachineGroup {
+        name: String,
+        /// Whether the user has folded this machine — workspace rows
+        /// under it are then suppressed from the row list. Loaded from
+        /// `~/.shelbi/state.json::sidebar.collapsed_machines` via
+        /// [`App::collapsed_machines`].
+        collapsed: bool,
+        /// Total workspaces declared on this machine. Surfaced as the
+        /// first number in the `(total, active)` suffix when collapsed.
+        total: usize,
+        /// Workspaces currently running an in-progress task — matches
+        /// the "Developer"-vs-"idle" reading of the right column on the
+        /// expanded rows. Second number in the `(total, active)` suffix.
+        active: usize,
+    },
     /// A declared workspace, with its current state badge.
     Workspace {
         name: String,
@@ -509,10 +594,10 @@ pub enum Row {
 
 impl Row {
     pub fn is_selectable(&self) -> bool {
-        !matches!(
-            self,
-            Row::Section { .. } | Row::Blank | Row::MachineGroup { .. }
-        )
+        // Machine group rows are selectable now — focusing one and
+        // pressing Space/Enter toggles the collapse state. Section
+        // headers and blank spacers stay inert (no useful action).
+        !matches!(self, Row::Section { .. } | Row::Blank)
     }
 
     pub fn view(&self) -> Option<&View> {
@@ -859,8 +944,8 @@ mod tests {
         // order (hub before devbox) — not workspace order, so a project
         // that flips the workspace list still renders machines top-down
         // in the order they were declared.
-        assert!(matches!(&rows[5], Row::MachineGroup { name } if name == "hub"));
-        assert!(matches!(&rows[7], Row::MachineGroup { name } if name == "devbox"));
+        assert!(matches!(&rows[5], Row::MachineGroup { name, .. } if name == "hub"));
+        assert!(matches!(&rows[7], Row::MachineGroup { name, .. } if name == "devbox"));
 
         // alpha (busy, no status file yet) — default to Working.
         assert_eq!(find_workspace_badge(&rows, "alpha").unwrap(), WorkspaceBadge::Working);
@@ -928,6 +1013,277 @@ mod tests {
     }
 
     #[test]
+    fn machine_group_carries_collapse_state_and_counts() {
+        // Multi-machine project, one assigned task → hub has 1 active /
+        // 1 total (alpha), devbox has 0 active / 1 total (delta idle).
+        // Both machines render expanded by default; the row carries the
+        // counts even when expanded so the renderer can decide whether
+        // to surface them.
+        let _g = TEST_LOCK.lock().unwrap();
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+
+        let project = fixture_project();
+        shelbi_state::save_project(&project).unwrap();
+
+        let now = Utc::now();
+        shelbi_state::save_task(
+            "demo",
+            &Task {
+                id: "wip".into(),
+                title: "wip".into(),
+                column: Column::InProgress,
+                priority: 0,
+                assigned_to: Some("alpha".into()),
+                workflow: None,
+                branch: None,
+                depends_on: Vec::new(),
+                prefers_machine: None,
+                zen: None,
+                created_at: now,
+                updated_at: now,
+                params: std::collections::BTreeMap::new(),
+            },
+            "",
+        )
+        .unwrap();
+
+        let mut app = App::new_sidebar("demo");
+        app.refresh().unwrap();
+        let rows = app.rows();
+        let hub = rows
+            .iter()
+            .find(|r| matches!(r, Row::MachineGroup { name, .. } if name == "hub"))
+            .expect("hub group must render");
+        let devbox = rows
+            .iter()
+            .find(|r| matches!(r, Row::MachineGroup { name, .. } if name == "devbox"))
+            .expect("devbox group must render");
+        assert!(matches!(
+            hub,
+            Row::MachineGroup { collapsed: false, total: 1, active: 1, .. }
+        ));
+        assert!(matches!(
+            devbox,
+            Row::MachineGroup { collapsed: false, total: 1, active: 0, .. }
+        ));
+
+        std::env::remove_var("SHELBI_HOME");
+    }
+
+    #[test]
+    fn toggle_machine_collapse_hides_workspace_rows_and_persists_to_state() {
+        // Activate on a focused machine row toggles its collapse state.
+        // While collapsed, workspace rows under it are dropped from
+        // `App::rows`; expanding re-emits them. The choice persists to
+        // `~/.shelbi/state.json::sidebar.collapsed_machines`, so a
+        // fresh `App` reads it back on first refresh — that's the
+        // `shelbi reload` survival path the spec calls out.
+        let _g = TEST_LOCK.lock().unwrap();
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+
+        let project = fixture_project();
+        shelbi_state::save_project(&project).unwrap();
+
+        let mut app = App::new_sidebar("demo");
+        app.refresh().unwrap();
+        // Pre-condition: hub is expanded, alpha is rendered under it.
+        assert!(find_workspace_row(&app.rows(), "alpha").is_some());
+
+        // Toggle hub → collapsed. The header carries the new flag and
+        // the workspace row beneath it disappears.
+        app.toggle_machine_collapsed("hub");
+        let rows = app.rows();
+        let hub = rows
+            .iter()
+            .find(|r| matches!(r, Row::MachineGroup { name, .. } if name == "hub"))
+            .expect("hub header still renders when collapsed");
+        assert!(matches!(hub, Row::MachineGroup { collapsed: true, .. }));
+        assert!(
+            find_workspace_row(&rows, "alpha").is_none(),
+            "collapsed hub must hide its workspace rows"
+        );
+        // devbox is unaffected — collapsing one machine doesn't fold
+        // the other.
+        assert!(
+            find_workspace_row(&rows, "delta").is_some(),
+            "devbox stays expanded"
+        );
+
+        // Persisted to ~/.shelbi/state.json — a brand-new App reads it
+        // back and starts up with hub already collapsed.
+        let persisted = shelbi_state::sidebar_collapsed_machines().unwrap();
+        assert!(persisted.contains("hub"));
+        let mut app2 = App::new_sidebar("demo");
+        app2.refresh().unwrap();
+        assert!(app2.collapsed_machines.contains("hub"));
+        assert!(find_workspace_row(&app2.rows(), "alpha").is_none());
+
+        // Toggle hub again → expanded.
+        app.toggle_machine_collapsed("hub");
+        assert!(find_workspace_row(&app.rows(), "alpha").is_some());
+        assert!(!shelbi_state::sidebar_collapsed_machines().unwrap().contains("hub"));
+
+        std::env::remove_var("SHELBI_HOME");
+    }
+
+    #[test]
+    fn collapsed_machine_count_reflects_active_vs_idle_workspaces() {
+        // 3 workspaces on hub: 2 with an assigned in-progress task
+        // (active), 1 idle. Collapsing hub surfaces "(3, 2 active)" via
+        // the row's total/active fields — that's the count the
+        // renderer hangs off the header.
+        let _g = TEST_LOCK.lock().unwrap();
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+
+        let mut project = fixture_project();
+        // Replace the original fixture (alpha on hub, delta on devbox)
+        // with three workspaces on hub plus one on devbox. The
+        // grouped-layout branch keys off the set of machines that have
+        // at least one workspace, so we need devbox to carry a row too
+        // for the `▾ hub` header to be emitted at all.
+        project.workspaces = vec![
+            shelbi_core::WorkspaceSpec {
+                name: "alpha".into(),
+                machine: "hub".into(),
+                runner: "claude".into(),
+            },
+            shelbi_core::WorkspaceSpec {
+                name: "bravo".into(),
+                machine: "hub".into(),
+                runner: "claude".into(),
+            },
+            shelbi_core::WorkspaceSpec {
+                name: "charlie".into(),
+                machine: "hub".into(),
+                runner: "claude".into(),
+            },
+            shelbi_core::WorkspaceSpec {
+                name: "delta".into(),
+                machine: "devbox".into(),
+                runner: "claude".into(),
+            },
+        ];
+        shelbi_state::save_project(&project).unwrap();
+
+        let now = Utc::now();
+        for (id, ws) in [("t-a", "alpha"), ("t-b", "bravo")] {
+            shelbi_state::save_task(
+                "demo",
+                &Task {
+                    id: id.into(),
+                    title: id.into(),
+                    column: Column::InProgress,
+                    priority: 0,
+                    assigned_to: Some(ws.into()),
+                    workflow: None,
+                    branch: None,
+                    depends_on: Vec::new(),
+                    prefers_machine: None,
+                    zen: None,
+                    created_at: now,
+                    updated_at: now,
+                    params: std::collections::BTreeMap::new(),
+                },
+                "",
+            )
+            .unwrap();
+        }
+
+        let mut app = App::new_sidebar("demo");
+        app.refresh().unwrap();
+        app.toggle_machine_collapsed("hub");
+        let rows = app.rows();
+        let hub = rows
+            .iter()
+            .find(|r| matches!(r, Row::MachineGroup { name, .. } if name == "hub"))
+            .expect("hub header must render even when collapsed");
+        assert!(matches!(
+            hub,
+            Row::MachineGroup { collapsed: true, total: 3, active: 2, .. }
+        ));
+
+        std::env::remove_var("SHELBI_HOME");
+    }
+
+    #[test]
+    fn collapsed_state_for_unknown_machine_is_silently_ignored() {
+        // ~/.shelbi/state.json names a machine that the current project
+        // doesn't declare. The sidebar must load and render without
+        // error, and the unknown entry stays on disk untouched so
+        // re-adding the machine later restores the prior state.
+        let _g = TEST_LOCK.lock().unwrap();
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+
+        // Pre-populate state.json with a stale machine name.
+        shelbi_state::toggle_sidebar_machine_collapsed("ghost").unwrap();
+
+        let project = fixture_project();
+        shelbi_state::save_project(&project).unwrap();
+
+        let mut app = App::new_sidebar("demo");
+        app.refresh().unwrap();
+        // The stale name is loaded into the cache (so re-adding the
+        // machine restores the collapse state) but doesn't produce a
+        // MachineGroup row — there's no machine called `ghost` in this
+        // project. Hub and devbox render normally.
+        assert!(app.collapsed_machines.contains("ghost"));
+        let rows = app.rows();
+        assert!(!rows.iter().any(
+            |r| matches!(r, Row::MachineGroup { name, .. } if name == "ghost")
+        ));
+        // Real machines are still rendered expanded — `ghost` doesn't
+        // leak its collapse state to anyone else.
+        let hub = rows
+            .iter()
+            .find(|r| matches!(r, Row::MachineGroup { name, .. } if name == "hub"))
+            .expect("hub header must render");
+        assert!(matches!(hub, Row::MachineGroup { collapsed: false, .. }));
+
+        // And the on-disk entry survives the render pass — no silent
+        // pruning.
+        assert!(shelbi_state::sidebar_collapsed_machines()
+            .unwrap()
+            .contains("ghost"));
+
+        std::env::remove_var("SHELBI_HOME");
+    }
+
+    #[test]
+    fn activate_on_machine_row_toggles_collapse_instead_of_view() {
+        // Activate on a `MachineGroup` row routes to
+        // `toggle_machine_collapsed`, not `activate_view` — Space and
+        // Enter both flow through `activate_selection`, so this is the
+        // behavior the keymap depends on.
+        let _g = TEST_LOCK.lock().unwrap();
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+
+        let project = fixture_project();
+        shelbi_state::save_project(&project).unwrap();
+
+        let mut app = App::new_sidebar("demo");
+        app.refresh().unwrap();
+        let hub_idx = app
+            .rows()
+            .iter()
+            .position(|r| matches!(r, Row::MachineGroup { name, .. } if name == "hub"))
+            .unwrap();
+        app.sidebar_index = hub_idx;
+        app.activate_selection();
+        assert!(app.collapsed_machines.contains("hub"));
+        // No status_line change relating to view focus — activation on
+        // a MachineGroup never reaches `activate_view`, so it can't
+        // accidentally try to focus a workspace pane.
+        assert!(!app.status_line.starts_with("▶ "));
+
+        std::env::remove_var("SHELBI_HOME");
+    }
+
+    #[test]
     fn multi_machine_project_groups_workspaces_under_machine_headers_with_indent() {
         // Two machines, two workspaces — each workspace sits underneath a
         // `Row::MachineGroup` for its host and carries the `indent: true`
@@ -946,7 +1302,7 @@ mod tests {
 
         let hub_idx = rows
             .iter()
-            .position(|r| matches!(r, Row::MachineGroup { name } if name == "hub"))
+            .position(|r| matches!(r, Row::MachineGroup { name, .. } if name == "hub"))
             .expect("hub group header must render in a multi-machine project");
         assert!(matches!(
             &rows[hub_idx + 1],
@@ -954,7 +1310,7 @@ mod tests {
         ));
         let devbox_idx = rows
             .iter()
-            .position(|r| matches!(r, Row::MachineGroup { name } if name == "devbox"))
+            .position(|r| matches!(r, Row::MachineGroup { name, .. } if name == "devbox"))
             .expect("devbox group header must render in a multi-machine project");
         assert!(devbox_idx > hub_idx, "machine headers must follow project declaration order");
         assert!(matches!(
@@ -1376,17 +1732,24 @@ mod tests {
         let mut app = App::new_sidebar("demo");
         app.refresh().unwrap();
         // Start on the last nav item (Activity, idx 2). Next nav_down
-        // should skip the blank spacer (idx 3), the `Workspaces` section
-        // header (idx 4) and the first machine-group header (idx 5) — all
-        // non-selectable — and land on the first workspace row (idx 6).
+        // skips the blank spacer (idx 3) and the `Workspaces` section
+        // header (idx 4) — both inert — and lands on the first machine
+        // group header (idx 5), which is now selectable so Space/Enter
+        // can toggle the machine's collapse state.
         app.sidebar_index = 2;
         app.nav_down();
         let rows = app.rows();
         assert!(rows[app.sidebar_index].is_selectable());
         assert!(
-            matches!(&rows[app.sidebar_index], Row::Workspace { .. }),
-            "nav_down past a section header must land on a workspace, got {:?}",
+            matches!(&rows[app.sidebar_index], Row::MachineGroup { name, .. } if name == "hub"),
+            "nav_down past a section header must land on a machine group, got {:?}",
             app.sidebar_index
+        );
+        // One more nav_down lands on the first workspace under hub.
+        app.nav_down();
+        assert!(
+            matches!(&app.rows()[app.sidebar_index], Row::Workspace { name, .. } if name == "alpha"),
+            "nav_down past a machine group must land on its first workspace",
         );
 
         std::env::remove_var("SHELBI_HOME");
@@ -1464,7 +1827,14 @@ mod tests {
         assert!(Row::Section { label: "Workspaces".into() }.decoration().is_none());
         assert!(Row::Blank.decoration().is_none());
         assert!(
-            Row::MachineGroup { name: "hub".into() }.decoration().is_none(),
+            Row::MachineGroup {
+                name: "hub".into(),
+                collapsed: false,
+                total: 0,
+                active: 0,
+            }
+            .decoration()
+            .is_none(),
             "machine group headers are dividers, not decorated rows"
         );
     }

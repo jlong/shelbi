@@ -554,11 +554,13 @@ pub fn state_path(project: &str) -> Result<PathBuf> {
 // Global runtime state (~/.shelbi/state.json)
 
 /// Global cross-project runtime state at `~/.shelbi/state.json`. Tracks
-/// preferences that should follow the user across every project — the
-/// most recent tmux palette binding (so the orchestrator can unbind it
-/// cleanly on rebind / project switch), and the one-shot acknowledgement
-/// of the Zen Mode intro popover (so first-time-Zen explanation doesn't
-/// re-fire in every project the user opens).
+/// preferences that follow the user across every project: the most
+/// recent tmux palette binding (so the orchestrator can unbind it
+/// cleanly on rebind / project switch), the one-shot acknowledgement
+/// of the Zen Mode intro popover (so the explanation doesn't re-fire in
+/// every project the user opens), and the sidebar's per-machine
+/// collapse state (a UI preference that follows the user across
+/// projects sharing a machine name).
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GlobalState {
     /// The exact tmux key string passed to `tmux bind-key -n …` on the
@@ -573,6 +575,56 @@ pub struct GlobalState {
     /// fresh install gets the explanation on the first enable.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub zen_intro_seen: bool,
+    /// Sidebar UI preferences — currently just the per-machine collapse
+    /// state for the Workspaces tree. Skipped when default so a fresh
+    /// state.json doesn't carry the empty `"sidebar":{}` block.
+    #[serde(default, skip_serializing_if = "SidebarPrefs::is_default")]
+    pub sidebar: SidebarPrefs,
+}
+
+/// User-level sidebar preferences persisted under
+/// [`GlobalState::sidebar`]. Currently only carries the set of machine
+/// names the user has collapsed in the Workspaces tree; a missing entry
+/// means "expanded" (today's default). Machine names that don't exist in
+/// the current project are silently ignored at render time — the entry
+/// is left in place so re-adding the machine restores the prior state.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SidebarPrefs {
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub collapsed_machines: BTreeSet<String>,
+}
+
+impl SidebarPrefs {
+    pub fn is_default(&self) -> bool {
+        self.collapsed_machines.is_empty()
+    }
+}
+
+/// Flip the collapse state for `machine` in `~/.shelbi/state.json` and
+/// return whether the machine is now collapsed. Reads the current
+/// [`GlobalState`], mutates the set, and writes it back — the rest of
+/// the file is preserved (no overwriting `tmux_palette_key` or
+/// `zen_intro_seen`). Used by the sidebar's Space/Enter handler when
+/// focus is on a `MachineGroup` row.
+pub fn toggle_sidebar_machine_collapsed(machine: &str) -> Result<bool> {
+    let mut state = read_global_state()?;
+    let now_collapsed = if state.sidebar.collapsed_machines.contains(machine) {
+        state.sidebar.collapsed_machines.remove(machine);
+        false
+    } else {
+        state.sidebar.collapsed_machines.insert(machine.to_string());
+        true
+    };
+    write_global_state(&state)?;
+    Ok(now_collapsed)
+}
+
+/// Snapshot of the user's currently-collapsed machine names. The TUI
+/// reads this once per refresh tick instead of doing a fresh disk read
+/// per render. Missing file → empty set (today's default — every
+/// machine expanded).
+pub fn sidebar_collapsed_machines() -> Result<BTreeSet<String>> {
+    Ok(read_global_state()?.sidebar.collapsed_machines)
 }
 
 /// Path to the global `state.json` (`~/.shelbi/state.json`).
@@ -695,6 +747,77 @@ mod global_state_tests {
         write_global_state(&s).unwrap();
         let read_back = read_global_state().unwrap();
         assert!(read_back.zen_intro_seen);
+        std::env::remove_var("SHELBI_HOME");
+    }
+
+    /// `toggle_sidebar_machine_collapsed` flips set membership in
+    /// `~/.shelbi/state.json::sidebar.collapsed_machines` and returns
+    /// the new state. A round-trip read sees the same set, so the
+    /// sidebar collapse state survives a TUI respawn.
+    #[test]
+    fn sidebar_collapse_toggle_round_trips_through_state_file() {
+        let _g = LOCK.lock().unwrap();
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+
+        // First toggle inserts.
+        assert!(toggle_sidebar_machine_collapsed("hub").unwrap());
+        let collapsed = sidebar_collapsed_machines().unwrap();
+        assert!(collapsed.contains("hub"));
+        assert_eq!(collapsed.len(), 1);
+
+        // Second toggle removes.
+        assert!(!toggle_sidebar_machine_collapsed("hub").unwrap());
+        assert!(sidebar_collapsed_machines().unwrap().is_empty());
+
+        // Multiple machines can coexist.
+        toggle_sidebar_machine_collapsed("hub").unwrap();
+        toggle_sidebar_machine_collapsed("devbox").unwrap();
+        let collapsed = sidebar_collapsed_machines().unwrap();
+        assert!(collapsed.contains("hub"));
+        assert!(collapsed.contains("devbox"));
+
+        std::env::remove_var("SHELBI_HOME");
+    }
+
+    /// Toggling sidebar collapse must not clobber unrelated fields in
+    /// `state.json`. A `tmux_palette_key` and `zen_intro_seen` set
+    /// first must survive a subsequent collapse toggle.
+    #[test]
+    fn sidebar_collapse_toggle_preserves_other_global_fields() {
+        let _g = LOCK.lock().unwrap();
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+
+        let mut s = read_global_state().unwrap();
+        s.tmux_palette_key = Some("M-z".into());
+        s.zen_intro_seen = true;
+        write_global_state(&s).unwrap();
+
+        toggle_sidebar_machine_collapsed("hub").unwrap();
+        let after = read_global_state().unwrap();
+        assert_eq!(after.tmux_palette_key.as_deref(), Some("M-z"));
+        assert!(after.zen_intro_seen);
+        assert!(after.sidebar.collapsed_machines.contains("hub"));
+
+        std::env::remove_var("SHELBI_HOME");
+    }
+
+    /// A fresh `state.json` (no `sidebar` key) loads without error and
+    /// reports an empty set — the "today's default" path.
+    #[test]
+    fn sidebar_collapse_missing_field_loads_as_empty() {
+        let _g = LOCK.lock().unwrap();
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+        // Hand-write a state.json that lacks the `sidebar` field so we
+        // exercise the `#[serde(default)]` fallback rather than a clean
+        // default-constructed state.
+        fs::create_dir_all(&home).unwrap();
+        std::fs::write(home.join("state.json"), r#"{"tmux_palette_key":"C-p"}"#).unwrap();
+        let s = read_global_state().unwrap();
+        assert!(s.sidebar.collapsed_machines.is_empty());
+        assert_eq!(s.tmux_palette_key.as_deref(), Some("C-p"));
         std::env::remove_var("SHELBI_HOME");
     }
 }
