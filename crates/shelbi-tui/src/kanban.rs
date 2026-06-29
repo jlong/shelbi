@@ -1919,7 +1919,10 @@ fn column_label(status_name: &str) -> String {
     match status_name {
         "Backlog" => "BACKLOG".to_string(),
         "Todo" => "TO DO".to_string(),
-        "InProgress" => "IN PROGRESS".to_string(),
+        // Accept both the post-split "In Progress" (matches the spec
+        // wireframe) and the pre-split "InProgress" written into legacy
+        // workflow YAMLs that haven't been migrated yet.
+        "In Progress" | "InProgress" => "IN PROGRESS".to_string(),
         "Review" => "REVIEW".to_string(),
         "Done" => "DONE".to_string(),
         other => other.to_uppercase(),
@@ -2999,7 +3002,7 @@ mod tests {
             vec![
                 ("default", "Backlog"),
                 ("default", "Todo"),
-                ("default", "InProgress"),
+                ("default", "In Progress"),
                 ("default", "Review"),
                 ("default", "Done"),
                 ("default", "Canceled"),
@@ -3033,7 +3036,7 @@ mod tests {
             vec![
                 ("default", "Backlog"),
                 ("default", "Todo"),
-                ("default", "InProgress"),
+                ("default", "In Progress"),
                 ("default", "Review"),
                 ("default", "Done"),
                 ("default", "Canceled"),

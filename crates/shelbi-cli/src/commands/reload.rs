@@ -16,6 +16,12 @@ use super::require_project;
 /// point `workspace_settings_template` at their own file).
 pub fn run(project_opt: Option<String>) -> Result<()> {
     let project_name = require_project(project_opt)?;
+    // Touching `load_project` runs the `workflows/statuses.yml` +
+    // `workflows/default.yaml` materialization migration as a side
+    // effect. The pane respawn below already triggers `load_project`
+    // indirectly, but doing it here makes the contract explicit:
+    // `shelbi reload` always leaves both files on disk.
+    let _ = shelbi_state::load_project(&project_name);
     let report = shelbi_orchestrator::reload(&project_name).map_err(|e| anyhow!(e))?;
     print_report(&project_name, &report);
     let outcomes = shelbi_state::self_heal_default_agents(&project_name)
