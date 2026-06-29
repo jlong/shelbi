@@ -293,6 +293,18 @@ Two phases. Each is independently shippable; v1 does the rebrand + introduces th
 
 After Phase 1: the abstraction exists and the default workflow uses it, but visibly nothing changes for users who don't customize agents. The Developer agent's behavior matches today's "default Claude on a worker."
 
+**CLI compatibility — what v1 promises to existing** **`shelbi worker *`** **users.**
+
+- `shelbi worker list` — gains an `AGENT` column showing the agent currently loaded (or `-` when idle). `NAME`, `HOST`, `STATE` unchanged. No flag changes.
+
+- `shelbi worker stop <name>` — unchanged. The agent loaded in the pane (if any) dies with the pane; agents aren't long-lived state.
+
+- `shelbi worker --help` — description text updated to use "workspace" where the command operates on a slot, but command names and flags are untouched.
+
+- **New parallel surface:** **`shelbi agent list / show`** (and `new` in Phase 2). These don't replace `worker *`; they're a separate noun for the agent concept.
+
+- **`shelbi worker *`** **is NOT renamed in v1.** The eventual `worker → workspace` rename lives in Open Questions, deferred to v2. Until then every CLAUDE.md, every doc, every muscle-memory invocation keeps working.
+
 **Phase 2 — Custom agents + workflow integration polish.**
 
 - Add `shelbi agent new` to scaffold custom agents.
