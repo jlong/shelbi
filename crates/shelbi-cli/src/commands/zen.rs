@@ -197,6 +197,16 @@ pub fn run(project_opt: Option<String>, cmd: ZenCmd) -> Result<()> {
             let project = load_project(&project_name).map_err(|e| anyhow!(e))?;
             let sha = zen::pr_merge(&project, pr_number).map_err(|e| anyhow!(e))?;
             println!("{sha}");
+            // Forcing function: append the post-merge eligibility scan to the
+            // command's own stdout so the orchestrator can't drop the scan it's
+            // supposed to run on every worker-free signal. Best-effort — the
+            // merge already succeeded, so a scan hiccup must not fail the
+            // command (and stderr stays clean per the migration-warning
+            // contract). An empty or unreadable scan prints the explicit
+            // `next eligible: none` marker; the next heartbeat re-surfaces any
+            // real candidates regardless.
+            let ids = zen::mechanically_eligible(&project).unwrap_or_default();
+            println!("{}", format_next_eligible(&ids));
             Ok(())
         }
         ZenCmd::Scan => {
@@ -479,6 +489,25 @@ fn emit_decision(log_path: &PathBuf, d: &DryRunDecision) {
     let _ = append_zen_dryrun_event(&d.task_id, d.action.as_str(), &d.detail);
 }
 
+/// Render the post-merge "next eligible" block appended to `shelbi zen
+/// pr-merge` stdout. Takes the mechanically-eligible backlog ids (exactly what
+/// `shelbi zen scan` would print) and formats one per line under a header that
+/// points back at `shelbi zen scan` for a fresh re-evaluation. An empty list
+/// renders the explicit `next eligible: none` marker — an explicit no-op beats
+/// silence, so the orchestrator can confirm it didn't miss anything. The
+/// orchestrator still owns the judgment call on each candidate.
+fn format_next_eligible(ids: &[String]) -> String {
+    if ids.is_empty() {
+        return "next eligible: none".to_string();
+    }
+    let mut out = String::from("next eligible (run shelbi zen scan to re-evaluate):");
+    for id in ids {
+        out.push_str("\n  ");
+        out.push_str(id);
+    }
+    out
+}
+
 fn format_duration(d: Duration) -> String {
     let secs = d.as_secs();
     if secs % 86_400 == 0 {
@@ -554,5 +583,30 @@ mod tests {
         assert_eq!(format_duration(Duration::from_secs(300)), "5m");
         assert_eq!(format_duration(Duration::from_secs(7200)), "2h");
         assert_eq!(format_duration(Duration::from_secs(86_400)), "1d");
+    }
+
+    #[test]
+    fn next_eligible_lists_candidates_indented_under_header() {
+        // pr-merge appends this block so the orchestrator can't drop the
+        // post-merge scan. One candidate per line, indented, in the order
+        // `shelbi zen scan` returned them (priority order, already sorted by
+        // the caller).
+        let ids = vec![
+            "shared-statuses-tui-all-view".to_string(),
+            "init-prompt-for-project-root".to_string(),
+        ];
+        let out = format_next_eligible(&ids);
+        assert_eq!(
+            out,
+            "next eligible (run shelbi zen scan to re-evaluate):\n  \
+             shared-statuses-tui-all-view\n  init-prompt-for-project-root"
+        );
+    }
+
+    #[test]
+    fn next_eligible_prints_none_marker_when_empty() {
+        // Explicit no-op marker beats silence — the orchestrator confirms it
+        // didn't miss anything.
+        assert_eq!(format_next_eligible(&[]), "next eligible: none");
     }
 }

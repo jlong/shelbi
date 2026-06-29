@@ -254,7 +254,16 @@ fn maybe_emit_heartbeat(
     // attempt — cheap (one stat) and avoids tracking writes ourselves.
     let recent_activity = events_log_modified_within(interval);
     if !recent_activity && is_online() {
-        if let Err(e) = append_heartbeat_event(&project.name) {
+        // Both counts are cheap on-disk reads (task YAMLs + the events log,
+        // same files the tick already touches) and are computed fresh so the
+        // heartbeat is accurate at emit time. A read failure shouldn't sink
+        // the heartbeat — fall back to 0, which the orchestrator treats as
+        // "nothing to do" (a silent ack), the same as a genuinely quiet board.
+        let zen_eligible = shelbi_orchestrator::zen::mechanically_eligible(project)
+            .map(|ids| ids.len())
+            .unwrap_or(0);
+        let idle_workspaces = shelbi_state::idle_workspace_count(project).unwrap_or(0);
+        if let Err(e) = append_heartbeat_event(&project.name, zen_eligible, idle_workspaces) {
             tracing::warn!(
                 project = %project.name,
                 error = %e,
@@ -1151,8 +1160,12 @@ mod tests {
         let body = std::fs::read_to_string(&log).unwrap();
         let lines: Vec<&str> = body.lines().filter(|l| l.contains("heartbeat")).collect();
         assert_eq!(lines.len(), 1, "expected one heartbeat line, got: {body:?}");
+        // Empty backlog → zen_eligible=0; the one declared workspace ("alpha")
+        // holds no active-category task → idle_workspaces=1. Both counts are
+        // always present so the orchestrator's react-to-heartbeat rule can
+        // parse them every tick.
         assert!(
-            lines[0].contains(" project=demo heartbeat"),
+            lines[0].contains(" project=demo heartbeat zen_eligible=0 idle_workspaces=1"),
             "line: {}",
             lines[0]
         );

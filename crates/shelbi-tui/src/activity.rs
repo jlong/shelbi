@@ -679,14 +679,17 @@ pub fn parse_event_line(line: &str) -> Event {
     }
 
     if let Some(rest) = rest.strip_prefix("project=") {
-        // Heartbeat shape: `project=<name> heartbeat`. We recognize it
-        // here so the parser doesn't fall through to `Unknown` (which
-        // would render a `?`-prefixed raw line if the filter were ever
-        // bypassed). Other `project=...` lines fall through to the
-        // existing Unknown handling — no other shape is defined yet.
-        let mut tokens = rest.splitn(2, ' ');
+        // Heartbeat shape: `project=<name> heartbeat zen_eligible=<N>
+        // idle_workspaces=<M>`. We recognize it here so the parser doesn't
+        // fall through to `Unknown` (which would render a `?`-prefixed raw
+        // line if the filter were ever bypassed). We match on the keyword
+        // token alone — the trailing `zen_eligible=`/`idle_workspaces=`
+        // counts are for the orchestrator's react rule, not the activity
+        // feed, so they don't change how this row is classified. Other
+        // `project=...` lines fall through to the existing Unknown handling.
+        let mut tokens = rest.split_whitespace();
         let name = tokens.next().unwrap_or("");
-        let action = tokens.next().unwrap_or("").trim();
+        let action = tokens.next().unwrap_or("");
         if !name.is_empty() && action == "heartbeat" {
             return Event::Heartbeat {
                 ts,
@@ -2512,6 +2515,20 @@ mod tests {
         // `Heartbeat` variant (not `Unknown`) so the filter knows to
         // drop it.
         let line = "2026-06-23T12:00:00+00:00 project=demo heartbeat";
+        match parse_event_line(line) {
+            Event::Heartbeat { project, .. } => assert_eq!(project, "demo"),
+            other => panic!("expected Heartbeat, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_heartbeat_line_with_counts_round_trips() {
+        // The poller appends `zen_eligible=`/`idle_workspaces=` counts after
+        // the `heartbeat` keyword. The activity parser keys off the keyword
+        // alone, so the row still classifies as `Heartbeat` (and stays
+        // filtered out of the feed) regardless of the trailing tokens.
+        let line =
+            "2026-06-23T12:00:00+00:00 project=demo heartbeat zen_eligible=5 idle_workspaces=4";
         match parse_event_line(line) {
             Event::Heartbeat { project, .. } => assert_eq!(project, "demo"),
             other => panic!("expected Heartbeat, got {other:?}"),
