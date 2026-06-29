@@ -10,18 +10,25 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::SystemTime;
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use shelbi_core::{default_workflow, Agent, Column, Project, Result, Session, Task};
 
+mod agent_workspaces;
 mod hub_config;
 pub mod keymap;
 mod user_config;
 mod worker_status;
 mod workflows;
 
+pub use agent_workspaces::{
+    agent_instructions_path, agent_skills_dir, agent_workspace_dir,
+    materialize_default_agents, self_heal_default_agents, AgentMaterializeOutcome,
+    DEFAULT_AGENTS, DEFAULT_DEVELOPER_INSTRUCTIONS, DEFAULT_ORCHESTRATOR_INSTRUCTIONS,
+    DEVELOPER_AGENT, ORCHESTRATOR_AGENT,
+};
 pub use hub_config::{
     hub_config_path, list_projects, load_hub_config, save_hub_config, touch_project_launched,
     HubConfig, ProjectMeta, ProjectSummary,
@@ -301,6 +308,14 @@ pub struct State {
     /// every refresh.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workflow_filter: Option<String>,
+    /// Default-agent names whose `instructions.md` we've already
+    /// observed to differ from the bundled template. `shelbi reload`'s
+    /// self-heal path uses this to fire its "you've customized this
+    /// agent's prompt" notice exactly once per divergence — re-aligning
+    /// with the default clears the agent's entry so a future edit
+    /// re-notifies.
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub notified_diverged_agents: BTreeSet<String>,
 }
 
 /// Tri-state Zen Mode toggle persisted in `state.json::zen_mode`.

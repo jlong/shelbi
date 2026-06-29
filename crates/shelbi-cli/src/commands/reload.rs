@@ -1,16 +1,24 @@
 use anyhow::{anyhow, Result};
 use shelbi_orchestrator::{PaneReloadStatus, ReloadReport};
 
+use super::init::print_agent_materialize_outcome;
 use super::require_project;
 
 /// Respawn the four shelbi-owned panes (sidebar + tasks/review/machines
-/// stash) in-place. Used after installing a new shelbi binary — the
-/// long-lived processes hold the old code in memory until they're
-/// respawned.
+/// stash) in-place, then self-heal the per-project agent workspaces
+/// (`agents/{orchestrator,developer}/`) so a freshly installed binary
+/// that ships an updated default prompt — or a wiped agent directory —
+/// lands on disk without forcing the user to recreate the project.
+/// User-edited `instructions.md` files are preserved byte-for-byte.
 pub fn run(project_opt: Option<String>) -> Result<()> {
     let project_name = require_project(project_opt)?;
     let report = shelbi_orchestrator::reload(&project_name).map_err(|e| anyhow!(e))?;
     print_report(&project_name, &report);
+    let outcomes = shelbi_state::self_heal_default_agents(&project_name)
+        .map_err(|e| anyhow!(e))?;
+    for outcome in outcomes {
+        print_agent_materialize_outcome(&outcome);
+    }
     Ok(())
 }
 
