@@ -601,7 +601,7 @@ fn augment_command_not_found(host: &Host, cmd: &str, exit_code: i32, tail: Strin
     let (shell, _) = login_shell_prefix(host);
     // Strip a trailing `;` / `&&` / `|` if someone happened to chain on
     // the first token (`foo; bar`) — the human-readable name is just `foo`.
-    let tool = tool.trim_end_matches(|c: char| matches!(c, ';' | '&' | '|'));
+    let tool = tool.trim_end_matches([';', '&', '|']);
     let hint = format!(
         "shelbi: `{tool}` was not found on the login-shell PATH \
          (checked via `{shell} -lc 'command -v {tool}'`). \
