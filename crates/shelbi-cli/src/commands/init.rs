@@ -82,6 +82,22 @@ pub fn run(args: Args) -> Result<()> {
             for outcome in outcomes {
                 print_agent_materialize_outcome(&outcome);
             }
+
+            // Materialize `workflows/statuses.yml` so a fresh project
+            // ships with the project-wide status catalogue alongside
+            // its starter `default.yaml`. `load_project` runs the same
+            // migration when the project is opened, but writing them
+            // here keeps the `shelbi init --project` post-condition
+            // self-contained.
+            let statuses_path = shelbi_state::statuses_path(name).map_err(|e| anyhow!(e))?;
+            if !statuses_path.exists() {
+                shelbi_state::save_project_statuses(
+                    name,
+                    &shelbi_core::default_project_statuses(),
+                )
+                .map_err(|e| anyhow!(e))?;
+                println!("✓ wrote project statuses: {}", statuses_path.display());
+            }
         }
     }
 

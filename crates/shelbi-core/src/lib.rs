@@ -1,11 +1,13 @@
 pub mod error;
 pub mod model;
 pub mod placeholders;
+pub mod statuses;
 pub mod system_memory;
 pub mod workspace_names;
 pub mod workflow;
 
 pub use error::{Error, Result};
+pub use statuses::{default_project_statuses, ProjectStatus, ProjectStatuses};
 pub use model::{
     checks_for_task, checks_for_task_in_workflow, ci_timeout_for_workflow,
     danger_paths_for_project, danger_paths_for_workflow, detect_project_shapes, validate_agent_id,
@@ -19,6 +21,6 @@ pub use placeholders::substitute_placeholders;
 pub use system_memory::{format_bytes_short, recommended_workspace_count, total_memory_bytes};
 pub use workspace_names::WorkspaceNamePreset;
 pub use workflow::{
-    default_workflow, Owner, Status as WorkflowStatus, StatusCategory, Transition,
-    TransitionAction, Workflow, WorkflowZenConfig, LEGACY_REVIEW_STATUS,
+    default_workflow, InlineIdentityField, Owner, Status as WorkflowStatus, StatusCategory,
+    Transition, TransitionAction, Workflow, WorkflowZenConfig, LEGACY_REVIEW_STATUS,
 };

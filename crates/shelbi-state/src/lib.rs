@@ -14,7 +14,9 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use shelbi_core::{default_workflow, Agent, Column, Project, Result, Session, Task};
+use shelbi_core::{
+    default_project_statuses, default_workflow, Agent, Column, Project, Result, Session, Task,
+};
 
 mod agent_workspaces;
 mod hub_config;
@@ -46,7 +48,10 @@ pub use workspace_status::{
     parse_pane_title_marker, parse_pane_title_state, save_workspace_status, workspace_status_path,
     workspaces_dir, PaneMarker, WorkspaceState, WorkspaceStatus,
 };
-pub use workflows::{list_workflows, load_workflow, workflow_path, workflows_dir};
+pub use workflows::{
+    list_workflows, load_project_statuses, load_workflow, save_project_statuses, statuses_path,
+    workflow_path, workflows_dir,
+};
 
 /// Default assistant name surfaced in the sidebar header and the
 /// orchestrator system prompt when the user hasn't picked one yet.
@@ -198,12 +203,37 @@ fn migrate_workspace_settings_template(project_dir: &Path) {
 /// swallowed so a permissions hiccup or full disk doesn't break opening
 /// the project; the loader's in-memory fallback covers the file-missing
 /// case until the next successful run.
+///
+/// Companion to [`migrate_default_statuses`] — the on-disk form is the
+/// post-split reference-only shape (id + owner + optional agent), with
+/// status identity (id, name, category) living in `statuses.yml`.
 fn migrate_default_workflow(project_dir: &Path) {
     let path = project_dir.join("workflows").join("default.yaml");
     if path.exists() {
         return;
     }
     let Ok(yaml) = serde_yaml::to_string(&default_workflow()) else {
+        return;
+    };
+    let _ = atomic_write(&path, yaml.as_bytes());
+}
+
+/// One-shot migration companion: write `workflows/statuses.yml` if
+/// missing. The file is the project-wide source of truth for status
+/// identity (id, name, category, ordering); workflow YAMLs reference
+/// ids declared here and add per-workflow owner/agent.
+///
+/// Idempotent and best-effort, same semantics as
+/// [`migrate_default_workflow`]. Either file may exist alone (e.g. a
+/// user-managed `statuses.yml` with no workflow files yet, or a legacy
+/// `default.yaml` whose `statuses.yml` was just stripped); the workflow
+/// loader's migration path covers both cases on the next read.
+fn migrate_default_statuses(project_dir: &Path) {
+    let path = project_dir.join("workflows").join("statuses.yml");
+    if path.exists() {
+        return;
+    }
+    let Ok(yaml) = serde_yaml::to_string(&default_project_statuses()) else {
         return;
     };
     let _ = atomic_write(&path, yaml.as_bytes());
@@ -336,10 +366,14 @@ pub fn load_project(project: &str) -> Result<Project> {
     p.validate_workspaces()?;
     let repo = p.repo.clone();
     p.detect_shapes(repo);
-    // Best-effort: drop workflows/default.yaml into the project directory
-    // on first load. Idempotent — see migrate_default_workflow.
+    // Best-effort: drop workflows/default.yaml and workflows/statuses.yml
+    // into the project directory on first load. Idempotent — see
+    // migrate_default_workflow / migrate_default_statuses. The workflow
+    // loader will additionally run the legacy-form migration on demand
+    // when it discovers inline name/category fields.
     if let Ok(dir) = project_dir(&p.name) {
         migrate_default_workflow(&dir);
+        migrate_default_statuses(&dir);
     }
     Ok(p)
 }
@@ -2343,12 +2377,51 @@ mod tests {
         std::env::set_var("SHELBI_HOME", &home);
         let dir = home.join("projects/myapp");
         migrate_default_workflow(&dir);
+        migrate_default_statuses(&dir);
         let path = dir.join("workflows/default.yaml");
         assert!(path.exists(), "default.yaml should be created");
+        // The on-disk form is post-migration (id + owner + agent only).
+        // Resolve it against the freshly written statuses.yml before
+        // comparing to the canonical default.
         let text = std::fs::read_to_string(&path).unwrap();
+        let st_text =
+            std::fs::read_to_string(dir.join("workflows/statuses.yml")).unwrap();
+        let statuses = shelbi_core::ProjectStatuses::from_yaml_str(&st_text).unwrap();
         let parsed = shelbi_core::Workflow::from_yaml_str(&text)
-            .expect("created default.yaml should round-trip through the workflow parser");
+            .expect("created default.yaml should round-trip through the workflow parser")
+            .resolve_against(&statuses)
+            .expect("resolved workflow validates against statuses.yml");
         assert_eq!(parsed, default_workflow());
+        std::env::remove_var("SHELBI_HOME");
+    }
+
+    #[test]
+    fn migrate_default_statuses_writes_yaml_when_directory_missing() {
+        let _g = TEST_LOCK.lock().unwrap();
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+        let dir = home.join("projects/myapp");
+        migrate_default_statuses(&dir);
+        let path = dir.join("workflows/statuses.yml");
+        assert!(path.exists(), "statuses.yml should be created");
+        let text = std::fs::read_to_string(&path).unwrap();
+        let parsed = shelbi_core::ProjectStatuses::from_yaml_str(&text)
+            .expect("statuses.yml should parse");
+        assert_eq!(parsed, default_project_statuses());
+        std::env::remove_var("SHELBI_HOME");
+    }
+
+    #[test]
+    fn migrate_default_statuses_is_noop_when_file_already_exists() {
+        let _g = TEST_LOCK.lock().unwrap();
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+        let dir = home.join("projects/myapp");
+        let path = dir.join("workflows/statuses.yml");
+        ensure_dir(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, "statuses: []\n").unwrap();
+        migrate_default_statuses(&dir);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "statuses: []\n");
         std::env::remove_var("SHELBI_HOME");
     }
 

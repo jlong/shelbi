@@ -333,6 +333,82 @@ impl Workflow {
         Ok(())
     }
 
+    /// Resolve a parsed-but-unfilled workflow against a [`ProjectStatuses`]
+    /// loaded from `workflows/statuses.yml`. Fills in each status's
+    /// `name` + `category` from the project-wide source of truth, errors
+    /// if a workflow declares an `id` the project doesn't know about, and
+    /// runs [`Workflow::validate`] afterward.
+    ///
+    /// The error for an unknown id includes the full list of available
+    /// ids — the user contract documented in `Plans/shared-statuses.md`
+    /// (Loader validation rules).
+    pub fn resolve_against(
+        mut self,
+        statuses: &crate::ProjectStatuses,
+    ) -> crate::Result<Self> {
+        for st in &mut self.statuses {
+            let known = statuses.get(&st.id).ok_or_else(|| {
+                let available = statuses
+                    .ids()
+                    .iter()
+                    .map(|s| format!("`{s}`"))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                workflow_err(format!(
+                    "workflow `{wf}`: status id `{id}` is not declared in \
+                     `workflows/statuses.yml` (available: {available})",
+                    wf = self.name,
+                    id = st.id,
+                ))
+            })?;
+            st.name = known.name.clone();
+            st.category = known.category;
+        }
+        self.validate()?;
+        Ok(self)
+    }
+
+    /// Probe the raw YAML form of this workflow for inline `name:` or
+    /// `category:` fields under any `statuses:` entry. Used by the
+    /// loader to enforce "once `statuses.yml` is in place, workflow
+    /// files must use the reference-only form."
+    ///
+    /// Returns the list of status ids that still carry inline identity
+    /// fields, paired with which field(s) were present. Empty when the
+    /// file is in the new (reference-only) form.
+    pub fn inline_identity_fields(yaml: &str) -> crate::Result<Vec<InlineIdentityField>> {
+        let value: serde_yaml::Value = serde_yaml::from_str(yaml)?;
+        let mut out = Vec::new();
+        let Some(statuses) = value
+            .get(serde_yaml::Value::String("statuses".into()))
+            .and_then(|v| v.as_sequence())
+        else {
+            return Ok(out);
+        };
+        for entry in statuses {
+            let (has_name, has_category) = Status::parse_presence(entry);
+            if !has_name && !has_category {
+                continue;
+            }
+            let id = entry
+                .get(serde_yaml::Value::String("id".into()))
+                .and_then(|v| v.as_str())
+                .or_else(|| {
+                    entry
+                        .get(serde_yaml::Value::String("name".into()))
+                        .and_then(|v| v.as_str())
+                })
+                .unwrap_or("?")
+                .to_string();
+            out.push(InlineIdentityField {
+                id,
+                has_name,
+                has_category,
+            });
+        }
+        Ok(out)
+    }
+
     /// Resolve this workflow's `git:` block against a task's
     /// frontmatter params, returning a fully substituted [`GitConfig`].
     ///
@@ -413,7 +489,7 @@ pub fn default_workflow() -> Workflow {
             },
             Status {
                 id: "in-progress".into(),
-                name: "InProgress".into(),
+                name: "In Progress".into(),
                 category: StatusCategory::Active,
                 owner: Owner::Agent,
                 agent: Some("developer".into()),
@@ -480,7 +556,15 @@ pub fn default_workflow() -> Workflow {
 /// backward compatibility with workflow YAMLs that pre-date the split,
 /// the deserializer accepts either field alone and uses it for both —
 /// see [`convert_raw_workflow`].
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+///
+/// `agent` is the optional per-workflow agent assignment — when set,
+/// the orchestrator dispatches a task in this status to a worker
+/// running that agent's prompt. The same status id can carry different
+/// `agent` values across workflows; identity (`name`, `category`,
+/// ordering) is project-wide and lives in `workflows/statuses.yml`
+/// (loaded via [`Workflow::resolve_against`] when the loader joins the
+/// two files).
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 pub struct Status {
     pub id: String,
     pub name: String,
@@ -491,6 +575,53 @@ pub struct Status {
     /// owner / agent split.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent: Option<String>,
+}
+
+impl serde::Serialize for Status {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> std::result::Result<S::Ok, S::Error> {
+        // Post-migration on-disk shape: `id` + `owner` + optional
+        // `agent` only. `name` and `category` belong to
+        // `workflows/statuses.yml`; emitting them here would duplicate
+        // the source of truth and re-introduce the conflict class the
+        // split was designed to eliminate. The loader's
+        // [`Workflow::resolve_against`] step fills both back in on
+        // read.
+        use serde::ser::SerializeMap;
+        let len = 2 + usize::from(self.agent.is_some());
+        let mut m = s.serialize_map(Some(len))?;
+        m.serialize_entry("id", &self.id)?;
+        // `owner` round-trips through the `Owner` enum's snake_case
+        // representation — call the existing Serialize impl by
+        // reference so we don't have to duplicate the wire form here.
+        m.serialize_entry("owner", &self.owner)?;
+        if let Some(agent) = &self.agent {
+            m.serialize_entry("agent", agent)?;
+        }
+        m.end()
+    }
+}
+
+impl Status {
+    /// Re-parse the raw on-disk form of a single status entry so the
+    /// loader can detect "this workflow file still carries inline `name:`
+    /// or `category:` after migration" — see
+    /// [`Workflow::inline_identity_fields`]. The check needs the
+    /// presence bits the regular [`Deserialize`] impl throws away.
+    pub(crate) fn parse_presence(value: &serde_yaml::Value) -> (bool, bool) {
+        let m = match value {
+            serde_yaml::Value::Mapping(m) => m,
+            _ => return (false, false),
+        };
+        let has_name = m
+            .get(serde_yaml::Value::String("name".into()))
+            .map(|v| !v.is_null())
+            .unwrap_or(false);
+        let has_category = m
+            .get(serde_yaml::Value::String("category".into()))
+            .map(|v| !v.is_null())
+            .unwrap_or(false);
+        (has_name, has_category)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -596,6 +727,22 @@ const DEFAULT_READY_AGENT: &str = "orchestrator";
 /// Same idea as [`DEFAULT_READY_AGENT`] but for `active`-category
 /// statuses, where the developer agent does the work.
 const DEFAULT_ACTIVE_AGENT: &str = "developer";
+
+/// One status entry in a workflow file that still carries pre-migration
+/// inline identity fields (`name:` and/or `category:`). Returned by
+/// [`Workflow::inline_identity_fields`] so the loader can build a "you
+/// haven't migrated this status yet" error with the specific fields
+/// listed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InlineIdentityField {
+    /// Status id (or `name`, if `id` wasn't supplied — pre-split YAMLs
+    /// used `name` as the stable identifier).
+    pub id: String,
+    /// True iff this entry carries a top-level `name:` key.
+    pub has_name: bool,
+    /// True iff this entry carries a top-level `category:` key.
+    pub has_category: bool,
+}
 
 // ---------------------------------------------------------------------------
 // Transition + TransitionAction
@@ -773,7 +920,14 @@ struct RawStatus {
     id: Option<String>,
     #[serde(default)]
     name: Option<String>,
-    category: StatusCategory,
+    /// Optional at the wire layer so post-migration workflow YAMLs
+    /// (which carry only `id` + `owner` + optional `agent`) parse
+    /// without erroring. When missing, [`convert_raw_workflow`]
+    /// leaves a `Backlog` sentinel; the loader replaces it with the
+    /// real value from `workflows/statuses.yml` via
+    /// [`Workflow::resolve_against`].
+    #[serde(default)]
+    category: Option<StatusCategory>,
     /// Accepted as any string so legacy named-owner YAMLs can migrate
     /// rather than fail at the type layer. Anything other than `user` /
     /// `agent` becomes `Owner::Agent` + `agent: <raw>` in the conversion
@@ -817,14 +971,19 @@ fn convert_raw_workflow(raw: RawWorkflow) -> crate::Result<(Workflow, Vec<Status
 
     for st in raw.statuses {
         let (id, name) = resolve_id_name(st.id, st.name)?;
-        let (owner, agent, migration) = resolve_owner_agent(&id, &st.owner, st.agent, st.category)?;
+        // Sentinel when `category:` is absent on the wire — the loader
+        // fills it in from `workflows/statuses.yml` via
+        // [`Workflow::resolve_against`] before any validation that
+        // depends on the real value runs.
+        let category = st.category.unwrap_or(StatusCategory::Backlog);
+        let (owner, agent, migration) = resolve_owner_agent(&id, &st.owner, st.agent, category)?;
         if let Some(m) = migration {
             migrations.push(m);
         }
         statuses.push(Status {
             id,
             name,
-            category: st.category,
+            category,
             owner,
             agent,
         });
@@ -1117,7 +1276,7 @@ statuses:
         let names: Vec<_> = wf.statuses.iter().map(|s| s.name.as_str()).collect();
         assert_eq!(
             names,
-            vec!["Backlog", "Todo", "InProgress", "Review", "Done", "Canceled"]
+            vec!["Backlog", "Todo", "In Progress", "Review", "Done", "Canceled"]
         );
 
         let cats: Vec<_> = wf.statuses.iter().map(|s| s.category).collect();
@@ -1164,10 +1323,28 @@ statuses:
     }
 
     #[test]
-    fn round_trips_through_yaml() {
+    fn round_trips_through_yaml_via_resolve_against() {
+        // Post-migration round-trip: serialize the compact form, parse
+        // it back, resolve against the canonical `statuses.yml`. The
+        // wire form drops `name:`/`category:` from each status entry —
+        // identity lives in `workflows/statuses.yml` after migration.
         let wf = default_workflow();
         let y = serde_yaml::to_string(&wf).unwrap();
-        let back: Workflow = serde_yaml::from_str(&y).unwrap();
+        // Identity fields are absent on the wire — that's the contract.
+        assert!(!y.contains("category:"), "unexpected category: in {y}");
+        // `name:` only appears as the top-level workflow name, never on
+        // a status entry.
+        for line in y.lines() {
+            assert!(
+                !line.trim_start().starts_with("name:") || !line.starts_with("  -")
+                    && !line.starts_with("    name:"),
+                "unexpected per-status name: in {y}",
+            );
+        }
+        let back = Workflow::from_yaml_str(&y)
+            .unwrap()
+            .resolve_against(&crate::default_project_statuses())
+            .unwrap();
         assert_eq!(wf, back);
     }
 
@@ -1186,17 +1363,17 @@ statuses:
 
         // YAML deserialization (serde rename_all = "snake_case") accepts
         // `archived` as a category — a workflow with a `Canceled`/`Won't
-        // Fix` terminal status needs this to land on disk.
+        // Fix` terminal status needs this to land on disk via
+        // `workflows/statuses.yml`.
         let yaml = r#"
-name: w
 statuses:
-  - { name: Canceled, category: archived, owner: user }
+  - { id: canceled, name: Canceled, category: archived }
 "#;
-        let wf = Workflow::from_yaml_str(yaml).unwrap();
-        assert_eq!(wf.statuses[0].category, StatusCategory::Archived);
+        let ps = crate::ProjectStatuses::from_yaml_str(yaml).unwrap();
+        assert_eq!(ps.statuses[0].category, StatusCategory::Archived);
 
         // Round-trip back out — wire form is the snake_case spelling.
-        let y = serde_yaml::to_string(&wf).unwrap();
+        let y = serde_yaml::to_string(&ps).unwrap();
         assert!(y.contains("category: archived"));
 
         // FromStr (used by the events-log parser to lift
@@ -1818,17 +1995,27 @@ git:
 
     #[test]
     fn workflow_git_round_trips_through_yaml() {
+        // Post-migration round-trip: identity fields (`name`, `category`)
+        // live in `workflows/statuses.yml`, so the workflow YAML round-trip
+        // goes through `resolve_against` to refill them.
         let yaml = r#"
 name: feature-task
 statuses:
-  - { name: Todo, category: ready, owner: agent, agent: orchestrator }
+  - { id: todo, name: Todo, category: ready, owner: agent, agent: orchestrator }
 git:
   base_branch: feature/{{feature}}
   merge_strategy: merge
 "#;
         let wf = Workflow::from_yaml_str(yaml).unwrap();
+        let statuses = crate::ProjectStatuses::from_yaml_str(
+            "statuses:\n  - { id: todo, name: Todo, category: ready }\n",
+        )
+        .unwrap();
         let serialized = serde_yaml::to_string(&wf).unwrap();
-        let back = Workflow::from_yaml_str(&serialized).unwrap();
+        let back = Workflow::from_yaml_str(&serialized)
+            .unwrap()
+            .resolve_against(&statuses)
+            .unwrap();
         assert_eq!(wf, back);
     }
 
@@ -1907,7 +2094,7 @@ zen: {}
         let yaml = r#"
 name: research
 statuses:
-  - { name: Drafting, category: active, owner: agent, agent: developer }
+  - { id: drafting, name: Drafting, category: active, owner: agent, agent: developer }
 zen:
   checks:
     local:
@@ -1918,13 +2105,136 @@ zen:
       - 'fixtures/**'
 "#;
         let wf = Workflow::from_yaml_str(yaml).unwrap();
+        let statuses = crate::ProjectStatuses::from_yaml_str(
+            "statuses:\n  - { id: drafting, name: Drafting, category: active }\n",
+        )
+        .unwrap();
         let serialized = serde_yaml::to_string(&wf).unwrap();
-        let back = Workflow::from_yaml_str(&serialized).unwrap();
+        let back = Workflow::from_yaml_str(&serialized)
+            .unwrap()
+            .resolve_against(&statuses)
+            .unwrap();
         assert_eq!(wf, back);
         // ci_timeout serializes as a bare integer (no struct form).
         assert!(
             serialized.contains("ci_timeout: 600"),
             "expected `ci_timeout: 600` in serialized form, got:\n{serialized}"
         );
+    }
+
+    // ---------------------------------------------------------------------
+    // resolve_against + inline-identity probe (statuses.yml)
+
+    #[test]
+    fn resolve_against_fills_name_and_category_from_project_statuses() {
+        // Workflow declares status ids only — identity comes from the
+        // canonical `statuses.yml`. The resolver fills `name` +
+        // `category` from there.
+        let workflow_yaml = r#"
+name: app
+statuses:
+  - { id: backlog, owner: user  }
+  - { id: review,  owner: user, agent: orchestrator }
+  - { id: done,    owner: user  }
+"#;
+        let wf = Workflow::from_yaml_str(workflow_yaml).unwrap();
+        let resolved = wf
+            .resolve_against(&crate::default_project_statuses())
+            .unwrap();
+        assert_eq!(resolved.statuses[0].name, "Backlog");
+        assert_eq!(resolved.statuses[0].category, StatusCategory::Backlog);
+        assert_eq!(resolved.statuses[1].name, "Review");
+        assert_eq!(resolved.statuses[1].category, StatusCategory::Handoff);
+        assert_eq!(resolved.statuses[1].agent.as_deref(), Some("orchestrator"));
+        assert_eq!(resolved.statuses[2].name, "Done");
+        assert_eq!(resolved.statuses[2].category, StatusCategory::Done);
+    }
+
+    #[test]
+    fn resolve_against_rejects_unknown_status_id_and_lists_available() {
+        // The error must echo the full available list — the contract in
+        // `Plans/shared-statuses.md` (Loader validation rules) so the
+        // user can immediately see what they probably meant to type.
+        let workflow_yaml = r#"
+name: app
+statuses:
+  - { id: ghost, owner: user }
+"#;
+        let wf = Workflow::from_yaml_str(workflow_yaml).unwrap();
+        let err = wf
+            .resolve_against(&crate::default_project_statuses())
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("workflow `app`"), "msg: {msg}");
+        assert!(msg.contains("status id `ghost`"), "msg: {msg}");
+        assert!(msg.contains("`backlog`"), "msg: {msg}");
+        assert!(msg.contains("`todo`"), "msg: {msg}");
+        assert!(msg.contains("`in-progress`"), "msg: {msg}");
+        assert!(msg.contains("`review`"), "msg: {msg}");
+        assert!(msg.contains("`done`"), "msg: {msg}");
+        assert!(msg.contains("`canceled`"), "msg: {msg}");
+    }
+
+    #[test]
+    fn inline_identity_fields_detects_legacy_form() {
+        // The loader uses this probe to refuse a workflow that still
+        // carries inline `name:` / `category:` after `statuses.yml` is
+        // already on disk — the post-migration "mixed forms" hard-fail.
+        let yaml = r#"
+name: w
+statuses:
+  - { id: backlog, name: Backlog, category: backlog, owner: user }
+  - { id: review,  owner: user }
+"#;
+        let found = Workflow::inline_identity_fields(yaml).unwrap();
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].id, "backlog");
+        assert!(found[0].has_name);
+        assert!(found[0].has_category);
+    }
+
+    #[test]
+    fn inline_identity_fields_returns_empty_for_reference_form() {
+        let yaml = r#"
+name: w
+statuses:
+  - { id: backlog, owner: user }
+  - { id: review,  owner: user, agent: orchestrator }
+"#;
+        let found = Workflow::inline_identity_fields(yaml).unwrap();
+        assert!(found.is_empty(), "expected empty, got: {found:?}");
+    }
+
+    #[test]
+    fn status_serializes_only_id_owner_and_agent() {
+        // Post-migration on-disk shape contract: never emit `name:` or
+        // `category:` inside a status entry. Anything that does would
+        // re-introduce the conflict class the split eliminated.
+        let s = Status {
+            id: "review".into(),
+            name: "Review".into(),
+            category: StatusCategory::Handoff,
+            owner: Owner::User,
+            agent: Some("orchestrator".into()),
+        };
+        let y = serde_yaml::to_string(&s).unwrap();
+        assert!(y.contains("id: review"), "got: {y}");
+        assert!(y.contains("owner: user"), "got: {y}");
+        assert!(y.contains("agent: orchestrator"), "got: {y}");
+        assert!(!y.contains("name:"), "unexpected name: in {y}");
+        assert!(!y.contains("category:"), "unexpected category: in {y}");
+    }
+
+    #[test]
+    fn status_serializes_without_agent_when_none() {
+        let s = Status {
+            id: "todo".into(),
+            name: "Todo".into(),
+            category: StatusCategory::Ready,
+            owner: Owner::Agent,
+            agent: None,
+        };
+        let y = serde_yaml::to_string(&s).unwrap();
+        assert!(!y.contains("agent:"), "unexpected agent: in {y}");
     }
 }

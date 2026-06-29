@@ -33,10 +33,12 @@ enum Cmd {
     Spawn(commands::spawn::Args),
     /// List active workspaces.
     List,
-    /// Show the status of one or all workspaces.
+    /// Inspect the project-wide status catalogue declared in
+    /// `workflows/statuses.yml`. Use `shelbi workspace status <id>` (or
+    /// `shelbi list`) for per-workspace observability.
     Status {
-        /// Workspace id; omit to list all.
-        id: Option<String>,
+        #[command(subcommand)]
+        cmd: commands::status::StatusCmd,
     },
     /// Send a follow-up message to a running workspace.
     Send {
@@ -197,7 +199,7 @@ fn main() -> Result<()> {
         None => default_entry(cli.project.clone()),
         Some(Cmd::Spawn(args)) => commands::spawn::run(cli.project, args),
         Some(Cmd::List) => commands::list::run(cli.project),
-        Some(Cmd::Status { id }) => commands::status::run(cli.project, id),
+        Some(Cmd::Status { cmd }) => commands::status::run(cli.project, cmd),
         Some(Cmd::Send { id, message }) => commands::send::run(cli.project, id, message),
         Some(Cmd::Tail { id, lines }) => commands::tail::run(cli.project, id, lines),
         Some(Cmd::Diff { id }) => commands::diff::run(cli.project, id),

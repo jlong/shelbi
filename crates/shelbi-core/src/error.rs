@@ -41,6 +41,9 @@ pub enum Error {
     #[error("invalid workflow: {0}")]
     InvalidWorkflow(String),
 
+    #[error("invalid statuses.yml: {0}")]
+    InvalidProjectStatuses(String),
+
     /// A workflow's `git:` block references one or more `{{var}}`
     /// placeholders that aren't present in the task's frontmatter
     /// parameters. The message is hand-tuned (singular vs. plural,

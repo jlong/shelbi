@@ -11,7 +11,7 @@ use std::path::Path;
 
 use anyhow::{anyhow, bail, Result};
 use clap::Subcommand;
-use shelbi_core::{default_workflow, Workflow};
+use shelbi_core::{default_project_statuses, default_workflow, ProjectStatuses, Workflow};
 
 use super::require_project;
 
@@ -21,8 +21,9 @@ pub enum WorkflowCmd {
     /// `~/.shelbi/projects/<project>/workflows/`. Shows the built-in
     /// default with a `·` marker when no files have been written yet.
     List,
-    /// Print a workflow YAML. The built-in `default` workflow is shown
-    /// even when no file has been written; any other missing name errors.
+    /// Print a workflow's per-status owner / agent table. Statuses are
+    /// listed in the canonical `statuses.yml` order, filtered to the
+    /// subset the workflow declares.
     Show { name: String },
     /// Create a new workflow YAML pre-populated with the default
     /// statuses. Errors if a workflow with that name already exists.
@@ -62,30 +63,47 @@ fn list(project: &str) -> Result<()> {
 }
 
 fn show(project: &str, name: &str) -> Result<()> {
+    // Either load the workflow (and the project's statuses.yml) from
+    // disk, or fall back to the built-in default. The fallback mirrors
+    // `list`: it lets users probe the canonical shape on a fresh project
+    // before any files have been written.
     let path = shelbi_state::workflow_path(project, name).map_err(|e| anyhow!(e))?;
-    if path.exists() {
-        let text = fs::read_to_string(&path)
-            .map_err(|e| anyhow!("reading {}: {e}", path.display()))?;
-        print!("{text}");
-        if !text.ends_with('\n') {
-            println!();
-        }
-        return Ok(());
+    let (workflow, statuses): (Workflow, ProjectStatuses) = if path.exists() {
+        let wf = shelbi_state::load_workflow(project, name).map_err(|e| anyhow!(e))?;
+        let st = shelbi_state::load_project_statuses(project).map_err(|e| anyhow!(e))?;
+        (wf, st)
+    } else if name == "default" {
+        (default_workflow(), default_project_statuses())
+    } else {
+        bail!("workflow `{name}` not found at {}", path.display());
+    };
+    print_table(&workflow, &statuses);
+    Ok(())
+}
+
+/// Render the workflow → status table in canonical statuses.yml order.
+/// Columns are STATUS / OWNER / AGENT, matching the wireframe in
+/// `Plans/shared-statuses.md`. Status order follows the project-wide
+/// declaration in `statuses.yml`; statuses the workflow doesn't include
+/// are dropped from the listing.
+fn print_table(workflow: &Workflow, statuses: &ProjectStatuses) {
+    // Sort the workflow's statuses by their position in `statuses.yml`
+    // so a workflow that lists `[done, backlog]` still renders the
+    // catalogue order. Unknown ids (won't happen for a loaded workflow,
+    // but defensive for the built-in fallback paired with a custom
+    // `statuses.yml`) land at the end in declaration order.
+    let mut entries: Vec<&shelbi_core::WorkflowStatus> = workflow.statuses.iter().collect();
+    entries.sort_by_key(|s| statuses.position(&s.id).unwrap_or(usize::MAX));
+
+    println!("{:<13} {:<8} AGENT", "STATUS", "OWNER");
+    for st in entries {
+        let owner = match st.owner {
+            shelbi_core::Owner::User => "user",
+            shelbi_core::Owner::Agent => "agent",
+        };
+        let agent = st.agent.as_deref().unwrap_or("—");
+        println!("{:<13} {:<8} {}", st.id, owner, agent);
     }
-    // The default workflow is the one name we can serialize from code
-    // even when no file exists on disk — surface it so users can see
-    // the shape before deciding to customize.
-    if name == "default" {
-        let yaml = serde_yaml::to_string(&default_workflow())
-            .map_err(|e| anyhow!("serializing built-in default: {e}"))?;
-        println!(
-            "# built-in default — no file on disk yet. \
-             Run `shelbi workflow new default` (or `edit default`) to customize."
-        );
-        print!("{yaml}");
-        return Ok(());
-    }
-    bail!("workflow `{name}` not found at {}", path.display())
 }
 
 fn new(project: &str, name: &str, edit_after: bool) -> Result<()> {
@@ -294,7 +312,13 @@ statuses:
 
         let path = shelbi_state::workflow_path("p", "default").unwrap();
         assert!(path.exists(), "default workflow should be on disk after edit");
-        let wf = Workflow::from_yaml_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        // The materialized file is in post-migration form — identity
+        // lives in `statuses.yml`. Resolve before comparing.
+        let wf = Workflow::from_yaml_str(&text)
+            .unwrap()
+            .resolve_against(&default_project_statuses())
+            .unwrap();
         assert_eq!(wf, default_workflow());
 
         std::env::remove_var("EDITOR");
@@ -335,6 +359,40 @@ statuses:
         shelbi_state::ensure_dir(&dir).unwrap();
         std::fs::write(dir.join("design.yaml"), DESIGN_YAML).unwrap();
         show("p", "design").unwrap();
+        std::env::remove_var("SHELBI_HOME");
+    }
+
+    #[test]
+    fn show_renders_owner_agent_table_in_statuses_yml_order() {
+        // Smoke-check the table layout against a workflow whose
+        // statuses are declared in a different order than `statuses.yml`.
+        // The renderer must re-sort by the canonical position so the
+        // table reads top-to-bottom in column order.
+        let _g = TEST_LOCK.lock().unwrap();
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+        let dir = shelbi_state::workflows_dir("p").unwrap();
+        shelbi_state::ensure_dir(&dir).unwrap();
+        shelbi_state::save_project_statuses(
+            "p",
+            &shelbi_core::default_project_statuses(),
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("app.yaml"),
+            r#"
+name: app
+statuses:
+  - { id: done,    owner: user }
+  - { id: backlog, owner: user }
+  - { id: review,  owner: user, agent: orchestrator }
+"#,
+        )
+        .unwrap();
+        // The loader resolves + sorts internally; `show` reuses that
+        // order. Just make sure the call succeeds without erroring on
+        // the reordering — we can't easily capture stdout here.
+        show("p", "app").unwrap();
         std::env::remove_var("SHELBI_HOME");
     }
 
