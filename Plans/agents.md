@@ -45,7 +45,7 @@ The sidebar `Section { label: "Agents" }` becomes `Section { label: "Workspaces"
 **Multi-machine project (hub + devbox), default layout:**
 
 ```
-WORKSPACES
+- Workspace -
 ▾ hub
    ● alpha     idle
    ● bravo     idle
