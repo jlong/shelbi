@@ -47,8 +47,8 @@ The sidebar `Section { label: "Agents" }` becomes `Section { label: "Workspaces"
 ```
 - Workspaces -
 ▾ hub
-   ▶ alpha     idle
-   ▶ bravo     idle
+   ▶ alpha     Developer
+   ▶ bravo     Developer
    · charlie   idle
 ▾ devbox
    · delta     keybindings-phase-2-platform-aware-help-text   [developer]
