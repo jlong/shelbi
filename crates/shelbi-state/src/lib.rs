@@ -7,6 +7,8 @@
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
+use std::time::SystemTime;
 
 use std::collections::{HashMap, HashSet};
 
@@ -712,35 +714,109 @@ pub fn delete_task(project: &str, id: &str) -> Result<()> {
     Ok(())
 }
 
+/// `(mtime, message)` cached per malformed task path. Lazily allocated
+/// because `HashMap::new()` isn't `const`, so the outer `Mutex` wraps an
+/// `Option` that's populated on first write.
+type ParseWarnCache = HashMap<PathBuf, (Option<SystemTime>, String)>;
+
+/// Per-file dedupe cache for the parse/read warnings emitted by
+/// [`list_tasks`]. A warning fires only when the cached entry is absent or
+/// its `(mtime, message)` differs from what we just observed — so a sidebar
+/// that calls `list_tasks` on every refresh tick stops flooding stderr with
+/// the same error.
+///
+/// Entries are removed when a file parses cleanly, when its mtime advances
+/// (the user edited it and the warning fires fresh), and when the file
+/// disappears from its tasks directory.
+static PARSE_WARN_CACHE: Mutex<Option<ParseWarnCache>> = Mutex::new(None);
+
+/// Returns `true` if `(path, mtime, msg)` differs from the cached entry —
+/// the caller should emit. Updates the cache to the new tuple as a
+/// side-effect so subsequent identical observations are suppressed.
+fn should_warn_about_parse(path: &Path, mtime: Option<SystemTime>, msg: &str) -> bool {
+    let mut guard = PARSE_WARN_CACHE.lock().unwrap();
+    let cache = guard.get_or_insert_with(HashMap::new);
+    if let Some((prev_mtime, prev_msg)) = cache.get(path) {
+        if *prev_mtime == mtime && prev_msg == msg {
+            return false;
+        }
+    }
+    cache.insert(path.to_path_buf(), (mtime, msg.to_string()));
+    true
+}
+
+/// Drop the cache entry for `path` — used after a successful parse so a
+/// future regression on the same file is treated as a fresh warning.
+fn forget_parse_warn(path: &Path) {
+    if let Ok(mut guard) = PARSE_WARN_CACHE.lock() {
+        if let Some(cache) = guard.as_mut() {
+            cache.remove(path);
+        }
+    }
+}
+
+/// Prune cache entries inside `dir` whose path wasn't observed in the most
+/// recent scan — covers the "file was deleted" recovery so a freshly
+/// re-created file with the same error path emits cleanly. Other projects'
+/// directories are left untouched.
+fn prune_parse_warn(dir: &Path, seen: &HashSet<PathBuf>) {
+    if let Ok(mut guard) = PARSE_WARN_CACHE.lock() {
+        if let Some(cache) = guard.as_mut() {
+            cache.retain(|p, _| p.parent() != Some(dir) || seen.contains(p));
+        }
+    }
+}
+
 /// Every task in the project. Order: column (in [`Column::ALL`] order) then
-/// priority ASC. Files that fail to parse are skipped (and logged).
+/// priority ASC. Files that fail to parse are skipped — each per-file
+/// warning is deduped via [`PARSE_WARN_CACHE`] so a refresh loop that calls
+/// `list_tasks` repeatedly only sees a malformed file's warning once per
+/// unchanged state.
 pub fn list_tasks(project: &str) -> Result<Vec<TaskFile>> {
     let dir = tasks_dir(project)?;
     if !dir.exists() {
         return Ok(Vec::new());
     }
     let mut out = Vec::new();
+    let mut seen: HashSet<PathBuf> = HashSet::new();
     for entry in fs::read_dir(&dir)? {
         let entry = entry?;
         let path = entry.path();
         if path.extension().and_then(|e| e.to_str()) != Some("md") {
             continue;
         }
+        seen.insert(path.clone());
+        let mtime = entry.metadata().and_then(|m| m.modified()).ok();
         let text = match fs::read_to_string(&path) {
             Ok(t) => t,
             Err(e) => {
-                eprintln!("shelbi: skipping unreadable task file {}: {e}", path.display());
+                let msg = format!(
+                    "shelbi: skipping unreadable task file {}: {e}",
+                    path.display()
+                );
+                if should_warn_about_parse(&path, mtime, &msg) {
+                    eprintln!("{msg}");
+                }
                 continue;
             }
         };
         match parse_task_file(&text) {
-            Ok(tf) => out.push(tf),
-            Err(e) => eprintln!(
-                "shelbi: skipping malformed task file {}: {e}",
-                path.display()
-            ),
+            Ok(tf) => {
+                forget_parse_warn(&path);
+                out.push(tf);
+            }
+            Err(e) => {
+                let msg = format!(
+                    "shelbi: skipping malformed task file {}: {e}",
+                    path.display()
+                );
+                if should_warn_about_parse(&path, mtime, &msg) {
+                    eprintln!("{msg}");
+                }
+            }
         }
     }
+    prune_parse_warn(&dir, &seen);
     out.sort_by_key(|tf| {
         let col_idx = Column::ALL.iter().position(|c| *c == tf.task.column).unwrap_or(0);
         (col_idx, tf.task.priority)
@@ -1710,6 +1786,168 @@ mod tests {
         let ids: Vec<_> = all.iter().map(|tf| tf.task.id.as_str()).collect();
         // Column::ALL ordering: backlog, todo, in_progress, review, done
         assert_eq!(ids, vec!["b", "a", "c", "z"]);
+        std::env::remove_var("SHELBI_HOME");
+    }
+
+    // ---- list_tasks parse-warning dedupe ---------------------------------
+    //
+    // Regression: pre-fix, every refresh tick re-emitted "skipping malformed
+    // task file …" for the same broken file, drowning the sidebar in
+    // duplicates. The dedupe is keyed by (path, mtime, message) — these
+    // tests pin the four state-transition rules listed in the bug.
+
+    fn cached_parse_warn(path: &Path) -> Option<(Option<SystemTime>, String)> {
+        PARSE_WARN_CACHE
+            .lock()
+            .unwrap()
+            .as_ref()
+            .and_then(|c| c.get(path).cloned())
+    }
+
+    #[test]
+    fn should_warn_about_parse_suppresses_identical_observation() {
+        let path = std::env::temp_dir().join(format!(
+            "shelbi-dedupe-{}-{}.md",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let mtime = Some(SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1));
+        let msg = format!("shelbi: skipping malformed task file {}: missing field `created_at`", path.display());
+        assert!(should_warn_about_parse(&path, mtime, &msg));
+        assert!(!should_warn_about_parse(&path, mtime, &msg));
+    }
+
+    #[test]
+    fn should_warn_about_parse_fires_when_mtime_advances() {
+        let path = std::env::temp_dir().join(format!(
+            "shelbi-dedupe-mtime-{}-{}.md",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let earlier = Some(SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1));
+        let later = Some(SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(2));
+        let msg = "shelbi: skipping malformed task file: missing field `created_at`".to_string();
+        assert!(should_warn_about_parse(&path, earlier, &msg));
+        assert!(!should_warn_about_parse(&path, earlier, &msg));
+        assert!(should_warn_about_parse(&path, later, &msg));
+    }
+
+    #[test]
+    fn should_warn_about_parse_fires_when_error_signature_changes() {
+        let path = std::env::temp_dir().join(format!(
+            "shelbi-dedupe-msg-{}-{}.md",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let mtime = Some(SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1));
+        let missing_created = "shelbi: skipping malformed task file: missing field `created_at`".to_string();
+        let missing_title = "shelbi: skipping malformed task file: missing field `title`".to_string();
+        assert!(should_warn_about_parse(&path, mtime, &missing_created));
+        assert!(should_warn_about_parse(&path, mtime, &missing_title));
+        // Latest signature is now cached — same args suppress.
+        assert!(!should_warn_about_parse(&path, mtime, &missing_title));
+    }
+
+    #[test]
+    fn forget_parse_warn_lets_next_emit_through() {
+        let path = std::env::temp_dir().join(format!(
+            "shelbi-dedupe-forget-{}-{}.md",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let mtime = Some(SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1));
+        let msg = "shelbi: skipping malformed task file: missing field `created_at`".to_string();
+        assert!(should_warn_about_parse(&path, mtime, &msg));
+        forget_parse_warn(&path);
+        // After forget, an identical observation emits again — covers the
+        // "file was fixed, then broke again with the same error" recovery.
+        assert!(should_warn_about_parse(&path, mtime, &msg));
+    }
+
+    #[test]
+    fn list_tasks_caches_malformed_warning_across_repeat_calls() {
+        let _g = TEST_LOCK.lock().unwrap();
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+        let path = tasks_dir("p").unwrap().join("broken.md");
+        ensure_dir(path.parent().unwrap()).unwrap();
+        // Missing `created_at` — the bug-report exemplar.
+        std::fs::write(
+            &path,
+            "---\nid: broken\ntitle: t\ncolumn: todo\npriority: 0\n---\nbody\n",
+        )
+        .unwrap();
+
+        let _ = list_tasks("p").unwrap();
+        let first = cached_parse_warn(&path).expect("cache entry after first scan");
+        assert!(first.1.contains("skipping malformed task file"));
+
+        // Second scan — same file, same mtime, same error: cache unchanged.
+        let _ = list_tasks("p").unwrap();
+        let second = cached_parse_warn(&path).expect("cache entry preserved");
+        assert_eq!(first, second);
+
+        // The dedupe predicate also reports "suppress" for this exact tuple.
+        assert!(!should_warn_about_parse(&path, second.0, &second.1));
+        std::env::remove_var("SHELBI_HOME");
+    }
+
+    #[test]
+    fn list_tasks_clears_cache_when_file_becomes_valid() {
+        let _g = TEST_LOCK.lock().unwrap();
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+        let path = tasks_dir("p").unwrap().join("fixme.md");
+        ensure_dir(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, "---\nid: fixme\ntitle: t\ncolumn: todo\npriority: 0\n---\n")
+            .unwrap();
+
+        let _ = list_tasks("p").unwrap();
+        assert!(
+            cached_parse_warn(&path).is_some(),
+            "broken file should populate cache"
+        );
+
+        // User fixes the file (a full valid frontmatter via save_task).
+        save_task("p", &make_task("fixme", Column::Todo, 0), "body\n").unwrap();
+        let _ = list_tasks("p").unwrap();
+        assert!(
+            cached_parse_warn(&path).is_none(),
+            "valid file should drop its cache entry so a later regression emits cleanly"
+        );
+        std::env::remove_var("SHELBI_HOME");
+    }
+
+    #[test]
+    fn list_tasks_prunes_cache_when_file_deleted() {
+        let _g = TEST_LOCK.lock().unwrap();
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+        let path = tasks_dir("p").unwrap().join("ghost.md");
+        ensure_dir(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, "---\nid: ghost\n---\nbody\n").unwrap();
+
+        let _ = list_tasks("p").unwrap();
+        assert!(cached_parse_warn(&path).is_some());
+
+        std::fs::remove_file(&path).unwrap();
+        let _ = list_tasks("p").unwrap();
+        assert!(
+            cached_parse_warn(&path).is_none(),
+            "deleted file should be pruned so a re-create emits fresh"
+        );
         std::env::remove_var("SHELBI_HOME");
     }
 
