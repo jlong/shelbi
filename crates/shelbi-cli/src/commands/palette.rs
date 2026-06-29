@@ -460,7 +460,7 @@ fn entry_from_row(row: &Row, workspaces: &[WorkspaceOverview]) -> Option<Entry> 
             shortcut: None,
             decoration,
         }),
-        Row::Section { .. } | Row::Blank => None,
+        Row::Section { .. } | Row::Blank | Row::MachineGroup { .. } => None,
     }
 }
 

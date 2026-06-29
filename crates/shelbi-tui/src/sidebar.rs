@@ -99,22 +99,53 @@ fn render_row(row: &Row, selected: bool, width: usize) -> ListItem<'static> {
             )]))
         }
         Row::Blank => ListItem::new(Line::raw("")),
-        Row::Workspace { name, .. } => {
+        Row::MachineGroup { name } => {
+            // `▾ <machine>` divider — open-triangle prefix mirrors the
+            // task wireframe. Collapsing is out of scope, so the glyph is
+            // always the open form; the row is non-selectable and rendered
+            // in the same dim style as section headers so it reads as
+            // structure, not a destination.
+            let style = Style::default().fg(Color::DarkGray);
+            ListItem::new(Line::from(vec![Span::styled(
+                format!("▾ {name}"),
+                style,
+            )]))
+        }
+        Row::Workspace {
+            name, agent, indent, ..
+        } => {
             let dec = row.decoration().expect("workspace rows always have a decoration");
-            let mut spans = vec![
+            // Multi-machine projects indent workspace rows by two columns
+            // so they sit visually inside their `▾ <machine>` group; flat
+            // single-machine layouts skip the indent.
+            let leading = if *indent { "  " } else { "" };
+            let left = vec![
+                Span::raw(leading),
                 Span::styled(
                     format!("{} ", dec.glyph),
                     Style::default().fg(decoration_to_color(dec.color)),
                 ),
                 Span::styled(name.clone(), name_style(selected)),
             ];
-            // No machine badge here — the agents list reflects the workspace
-            // pool, not per-row metadata. Machine assignment surfaces on
-            // the Machines view.
-            if selected {
-                spans = bold(spans);
-            }
-            ListItem::new(Line::from(spans))
+            // Right column: title-cased agent name when an agent is loaded,
+            // dim `idle` placeholder otherwise. Same dim style as the
+            // review row's machine column so the two surfaces read in one
+            // visual vocabulary.
+            let right_label = match agent {
+                Some(a) => title_case(a),
+                None => "idle".to_string(),
+            };
+            let spans = right_align(
+                left,
+                right_label,
+                Style::default().fg(Color::DarkGray),
+                width,
+            );
+            ListItem::new(if selected {
+                Line::from(bold(spans))
+            } else {
+                Line::from(spans)
+            })
         }
         Row::Review { title, workspace, .. } => {
             // Cyan ✓: the task is review-ready, awaiting human action.
@@ -203,6 +234,18 @@ fn right_align(
 /// these strings.
 fn display_width(s: &str) -> usize {
     s.chars().count()
+}
+
+/// Uppercase the first character of a lowercase identifier (e.g.
+/// `developer` → `Developer`). Agent directory names live on disk in
+/// lowercase; the sidebar surfaces them in display form. Empty input
+/// is preserved as-is so callers don't need a guard.
+fn title_case(s: &str) -> String {
+    let mut chars = s.chars();
+    match chars.next() {
+        Some(c) => c.to_uppercase().collect::<String>() + chars.as_str(),
+        None => String::new(),
+    }
 }
 
 fn render_footer(f: &mut Frame, app: &App, area: Rect) {
@@ -569,5 +612,126 @@ mod tests {
         term.draw(|f| render_full(f, &mut app, f.area())).unwrap();
         let joined = dump(&term).join("\n");
         assert!(!joined.contains("Zen mode"), "no hint expected when no chord bound, got:\n{joined}");
+    }
+
+    /// Multi-machine layout reads like the wireframe: the renamed
+    /// `Workspaces` section, a `▾ <machine>` header per declared host,
+    /// each workspace name on its own row with its agent (or `idle`)
+    /// right-aligned. Asserting on the textual buffer keeps the rename +
+    /// grouping change anchored in the visible output, not just the row
+    /// shape.
+    #[test]
+    fn workspaces_section_renders_grouped_layout_with_agent_column() {
+        let backend = TestBackend::new(28, 16);
+        let mut term = Terminal::new(backend).unwrap();
+        let mut app = App::new_sidebar("demo");
+        app.workspaces = vec![
+            crate::app::WorkspaceOverview {
+                name: "alpha".into(),
+                machine: "hub".into(),
+                is_remote: false,
+                current_task: Some("t-1".into()),
+                badge: crate::app::WorkspaceBadge::Working,
+                agent: Some("developer".into()),
+            },
+            crate::app::WorkspaceOverview {
+                name: "charlie".into(),
+                machine: "hub".into(),
+                is_remote: false,
+                current_task: None,
+                badge: crate::app::WorkspaceBadge::Idle,
+                agent: None,
+            },
+            crate::app::WorkspaceOverview {
+                name: "delta".into(),
+                machine: "devbox".into(),
+                is_remote: true,
+                current_task: Some("t-2".into()),
+                badge: crate::app::WorkspaceBadge::Working,
+                agent: Some("developer".into()),
+            },
+        ];
+        term.draw(|f| render_full(f, &mut app, f.area())).unwrap();
+        let rows = dump(&term);
+        let joined = rows.join("\n");
+
+        assert!(
+            joined.contains("Workspaces"),
+            "section header must read 'Workspaces' post-rebrand, got:\n{joined}"
+        );
+        assert!(
+            !joined.contains("— Agents —"),
+            "old 'Agents' label must be gone, got:\n{joined}"
+        );
+        assert!(
+            joined.contains("▾ hub"),
+            "expected '▾ hub' machine header in multi-machine layout, got:\n{joined}"
+        );
+        assert!(
+            joined.contains("▾ devbox"),
+            "expected '▾ devbox' machine header in multi-machine layout, got:\n{joined}"
+        );
+        // Title-cased agent on the active row, dim `idle` on the idle one
+        // — same wireframe vocabulary the task spec calls out.
+        let alpha_y = row_y(&rows, "alpha");
+        assert!(
+            rows[alpha_y].contains("Developer"),
+            "active workspace row must surface title-cased agent, got: {:?}",
+            rows[alpha_y]
+        );
+        let charlie_y = row_y(&rows, "charlie");
+        assert!(
+            rows[charlie_y].contains("idle"),
+            "idle workspace row must surface the `idle` placeholder, got: {:?}",
+            rows[charlie_y]
+        );
+        // Grouped rows indent under their machine header (two-column
+        // shift) so they read as nested rather than peers of the divider.
+        assert!(
+            rows[alpha_y].starts_with("   "),
+            "indented workspace rows expect ≥3 leading spaces (sidebar pad + indent), got: {:?}",
+            rows[alpha_y]
+        );
+    }
+
+    /// Single-machine layout collapses the group header — the section
+    /// goes straight to a flat list of workspace rows with no indent and
+    /// no `▾ <machine>` divider. Adding a second machine to the same
+    /// project flips back to grouped form (verified by the test above).
+    #[test]
+    fn single_machine_skips_group_header_and_indent() {
+        let backend = TestBackend::new(28, 16);
+        let mut term = Terminal::new(backend).unwrap();
+        let mut app = App::new_sidebar("demo");
+        app.workspaces = vec![crate::app::WorkspaceOverview {
+            name: "alpha".into(),
+            machine: "hub".into(),
+            is_remote: false,
+            current_task: Some("t-1".into()),
+            badge: crate::app::WorkspaceBadge::Working,
+            agent: Some("qa".into()),
+        }];
+        term.draw(|f| render_full(f, &mut app, f.area())).unwrap();
+        let rows = dump(&term);
+        let joined = rows.join("\n");
+
+        assert!(joined.contains("Workspaces"));
+        assert!(
+            !joined.contains("▾ hub"),
+            "single-machine projects must not emit the group header, got:\n{joined}"
+        );
+        let alpha_y = row_y(&rows, "alpha");
+        // Sidebar pad is 1 col; flat rows skip the extra indent, so the
+        // first non-space column lands at index 1 (the badge glyph).
+        assert!(
+            !rows[alpha_y].starts_with("   "),
+            "flat-list workspace rows must not carry the indent, got: {:?}",
+            rows[alpha_y]
+        );
+        assert!(
+            rows[alpha_y].contains("Qa"),
+            "agent name must title-case verbatim (no special-casing for known acronyms), got: {:?}",
+            rows[alpha_y]
+        );
     }
 }

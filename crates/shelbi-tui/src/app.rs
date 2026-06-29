@@ -45,6 +45,13 @@ pub struct WorkspaceOverview {
     /// Single-char state glyph derived from the workspace's status file and
     /// the task board state.
     pub badge: WorkspaceBadge,
+    /// Name of the agent loaded into this workspace's pane. Resolved from
+    /// the assigned task's frontmatter `agent:` (falling back to the
+    /// project's default task agent) — same lookup `shelbi workspace list`
+    /// uses for its AGENT column. `None` when the workspace is idle (no
+    /// in-progress task assigned), in which case the sidebar renders the
+    /// "idle" placeholder instead.
+    pub agent: Option<String>,
 }
 
 /// Per-workspace state glyph shown in the sidebar. Derived each refresh from
@@ -240,14 +247,49 @@ impl App {
         if !self.workspaces.is_empty() {
             rows.push(Row::Blank);
             rows.push(Row::Section {
-                label: "Agents".into(),
+                label: "Workspaces".into(),
             });
-            for w in &self.workspaces {
-                rows.push(Row::Workspace {
-                    name: w.name.clone(),
-                    badge: w.badge,
-                    view: View::Workspace(w.name.clone()),
-                });
+            // Group workspaces by their machine when the project declares
+            // more than one machine — header per machine in declaration
+            // order, each workspace indented underneath. A single-machine
+            // project collapses to a flat list (no group header, no
+            // indent) so the sidebar stays compact when grouping carries
+            // no information.
+            let machines: Vec<&str> = {
+                let mut seen: Vec<&str> = Vec::new();
+                for w in &self.workspaces {
+                    if !seen.iter().any(|m| *m == w.machine) {
+                        seen.push(&w.machine);
+                    }
+                }
+                seen
+            };
+            let grouped = machines.len() > 1;
+            if grouped {
+                for machine in &machines {
+                    rows.push(Row::MachineGroup {
+                        name: (*machine).to_string(),
+                    });
+                    for w in self.workspaces.iter().filter(|w| w.machine == *machine) {
+                        rows.push(Row::Workspace {
+                            name: w.name.clone(),
+                            badge: w.badge,
+                            agent: w.agent.clone(),
+                            indent: true,
+                            view: View::Workspace(w.name.clone()),
+                        });
+                    }
+                }
+            } else {
+                for w in &self.workspaces {
+                    rows.push(Row::Workspace {
+                        name: w.name.clone(),
+                        badge: w.badge,
+                        agent: w.agent.clone(),
+                        indent: false,
+                        view: View::Workspace(w.name.clone()),
+                    });
+                }
             }
         }
         if !self.review_queue.is_empty() {
@@ -428,10 +470,25 @@ pub enum Row {
     /// Vertical spacing between sections. Renders as an empty line and
     /// can't be selected — purely for visual rhythm.
     Blank,
+    /// Machine group header inside the Workspaces section — renders as
+    /// `▾ <machine>` to introduce the rows that follow. Only emitted when
+    /// the project declares more than one machine; single-machine projects
+    /// skip the header entirely. Not selectable: expansion / collapse is
+    /// out of scope for this row kind, so it's purely a divider.
+    MachineGroup { name: String },
     /// A declared workspace, with its current state badge.
     Workspace {
         name: String,
         badge: WorkspaceBadge,
+        /// Name of the agent loaded into this workspace's pane (lowercase
+        /// directory name as it lives on disk; the renderer title-cases it
+        /// for display). `None` means idle and the renderer surfaces the
+        /// "idle" placeholder in the agent column.
+        agent: Option<String>,
+        /// Whether this row sits under a [`Row::MachineGroup`] header and
+        /// therefore needs a leading indent. `false` in single-machine
+        /// projects where the section is rendered as a flat list.
+        indent: bool,
         view: View,
     },
     /// A task sitting in the review column — title + the workspace who
@@ -452,7 +509,10 @@ pub enum Row {
 
 impl Row {
     pub fn is_selectable(&self) -> bool {
-        !matches!(self, Row::Section { .. } | Row::Blank)
+        !matches!(
+            self,
+            Row::Section { .. } | Row::Blank | Row::MachineGroup { .. }
+        )
     }
 
     pub fn view(&self) -> Option<&View> {
@@ -461,7 +521,7 @@ impl Row {
             | Row::Workspace { view, .. }
             | Row::Review { view, .. }
             | Row::LegacyAgent { view, .. } => Some(view),
-            Row::Section { .. } | Row::Blank => None,
+            Row::Section { .. } | Row::Blank | Row::MachineGroup { .. } => None,
         }
     }
 
@@ -481,7 +541,7 @@ impl Row {
                 color: DecorationColor::Cyan,
             }),
             Row::LegacyAgent { status, .. } => Some(status_decoration(*status)),
-            Row::Section { .. } | Row::Blank => None,
+            Row::Section { .. } | Row::Blank | Row::MachineGroup { .. } => None,
         }
     }
 }
@@ -505,10 +565,23 @@ fn load_workspaces(project: &str, review_queue: &[TaskFile]) -> Result<Vec<Works
             None => continue, // mis-configured workspace, skip silently
         };
         let is_remote = !machine.host().is_local();
-        let current_task = in_progress
+        let assigned_task = in_progress
             .iter()
-            .find(|tf| tf.task.assigned_to.as_deref() == Some(workspace.name.as_str()))
-            .map(|tf| tf.task.id.clone());
+            .find(|tf| tf.task.assigned_to.as_deref() == Some(workspace.name.as_str()));
+        let current_task = assigned_task.map(|tf| tf.task.id.clone());
+        // Mirror `shelbi workspace list`'s AGENT column: take the task's
+        // frontmatter `agent:` when present (matching the lookup the
+        // task-start path uses to load agent instructions/skills), and
+        // fall back to the project's default task agent. Idle workspaces
+        // get `None` — the renderer surfaces "idle" in that case rather
+        // than the default agent name.
+        let agent = assigned_task.map(|tf| {
+            tf.task
+                .params
+                .get("agent")
+                .cloned()
+                .unwrap_or_else(|| DEFAULT_TASK_AGENT.to_string())
+        });
         let has_review = review_queue
             .iter()
             .any(|tf| tf.task.assigned_to.as_deref() == Some(workspace.name.as_str()));
@@ -519,10 +592,16 @@ fn load_workspaces(project: &str, review_queue: &[TaskFile]) -> Result<Vec<Works
             is_remote,
             current_task,
             badge,
+            agent,
         });
     }
     Ok(out)
 }
+
+/// Default agent surfaced when a task has no explicit `agent:` in its
+/// frontmatter — matches `shelbi workspace list`'s `DEFAULT_TASK_AGENT`
+/// so the sidebar and the CLI never disagree about what's loaded.
+const DEFAULT_TASK_AGENT: &str = "developer";
 
 /// Pick the badge for a workspace given the task-board signals + an on-disk
 /// state read. Review-ready wins over claude state — once a task is sent
@@ -727,6 +806,10 @@ mod tests {
         assert_eq!(delta.machine, "devbox");
         assert!(delta.is_remote, "ssh-machine workspaces must report is_remote=true");
         assert_eq!(delta.current_task.as_deref(), Some("fix-thing"));
+        // Default agent — the task carries no `agent:` in params, so the
+        // sidebar surfaces the project's default task agent verbatim.
+        assert_eq!(delta.agent.as_deref(), Some("developer"));
+        assert!(alpha.agent.is_none(), "idle workspaces must not carry an agent name");
 
         std::env::remove_var("SHELBI_HOME");
     }
@@ -765,11 +848,19 @@ mod tests {
         let mut app = App::new_sidebar("demo");
         app.refresh().unwrap();
 
-        // 3 nav + 1 blank spacer + 1 `agents` section header + 2 workspaces = 7 rows.
+        // 3 nav + 1 blank spacer + 1 `Workspaces` section header + 2
+        // machine-group headers (one per declared machine, in declaration
+        // order) + 2 workspaces = 9 rows.
         let rows = app.rows();
-        assert_eq!(rows.len(), 7);
+        assert_eq!(rows.len(), 9);
         assert!(matches!(&rows[3], Row::Blank));
-        assert!(matches!(&rows[4], Row::Section { label } if label == "Agents"));
+        assert!(matches!(&rows[4], Row::Section { label } if label == "Workspaces"));
+        // Machine group headers appear in `project.yaml` declaration
+        // order (hub before devbox) — not workspace order, so a project
+        // that flips the workspace list still renders machines top-down
+        // in the order they were declared.
+        assert!(matches!(&rows[5], Row::MachineGroup { name } if name == "hub"));
+        assert!(matches!(&rows[7], Row::MachineGroup { name } if name == "devbox"));
 
         // alpha (busy, no status file yet) — default to Working.
         assert_eq!(find_workspace_badge(&rows, "alpha").unwrap(), WorkspaceBadge::Working);
@@ -784,6 +875,218 @@ mod tests {
             Row::Workspace { name: n, badge, .. } if n == name => Some(*badge),
             _ => None,
         })
+    }
+
+    fn find_workspace_row<'a>(rows: &'a [Row], name: &str) -> Option<&'a Row> {
+        rows.iter().find(|r| match r {
+            Row::Workspace { name: n, .. } => n == name,
+            _ => false,
+        })
+    }
+
+    /// Single-machine fixture — the second machine and its workspace are
+    /// stripped from [`fixture_project`] so the grouped-vs-flat rendering
+    /// path tests can exercise the collapsed-header branch.
+    fn single_machine_fixture() -> Project {
+        let mut p = fixture_project();
+        p.machines.retain(|m| m.name == "hub");
+        p.workspaces.retain(|w| w.machine == "hub");
+        p
+    }
+
+    #[test]
+    fn single_machine_project_renders_workspaces_as_flat_list_without_group_header() {
+        // When only one machine is declared, the `▾ <machine>` group
+        // header is suppressed and rows are emitted at the section root
+        // without indent — grouping carries no information so the sidebar
+        // stays compact. Adding a second machine flips the layout into
+        // the grouped form (covered by [`rows_include_workspaces_with_idle_and_working_badges`]).
+        let _g = TEST_LOCK.lock().unwrap();
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+
+        let project = single_machine_fixture();
+        shelbi_state::save_project(&project).unwrap();
+
+        let mut app = App::new_sidebar("demo");
+        app.refresh().unwrap();
+
+        let rows = app.rows();
+        assert!(
+            !rows.iter().any(|r| matches!(r, Row::MachineGroup { .. })),
+            "single-machine project must not emit any machine group headers"
+        );
+        // 3 nav + 1 blank + 1 Workspaces section + 1 workspace = 6 rows.
+        assert_eq!(rows.len(), 6);
+        let alpha = find_workspace_row(&rows, "alpha").expect("alpha must render at the section root");
+        assert!(
+            matches!(alpha, Row::Workspace { indent: false, .. }),
+            "flat-list rows render without indent"
+        );
+
+        std::env::remove_var("SHELBI_HOME");
+    }
+
+    #[test]
+    fn multi_machine_project_groups_workspaces_under_machine_headers_with_indent() {
+        // Two machines, two workspaces — each workspace sits underneath a
+        // `Row::MachineGroup` for its host and carries the `indent: true`
+        // flag so the renderer can shift it right by the leading-space
+        // amount the wireframe specifies.
+        let _g = TEST_LOCK.lock().unwrap();
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+
+        let project = fixture_project();
+        shelbi_state::save_project(&project).unwrap();
+
+        let mut app = App::new_sidebar("demo");
+        app.refresh().unwrap();
+        let rows = app.rows();
+
+        let hub_idx = rows
+            .iter()
+            .position(|r| matches!(r, Row::MachineGroup { name } if name == "hub"))
+            .expect("hub group header must render in a multi-machine project");
+        assert!(matches!(
+            &rows[hub_idx + 1],
+            Row::Workspace { name, indent: true, .. } if name == "alpha"
+        ));
+        let devbox_idx = rows
+            .iter()
+            .position(|r| matches!(r, Row::MachineGroup { name } if name == "devbox"))
+            .expect("devbox group header must render in a multi-machine project");
+        assert!(devbox_idx > hub_idx, "machine headers must follow project declaration order");
+        assert!(matches!(
+            &rows[devbox_idx + 1],
+            Row::Workspace { name, indent: true, .. } if name == "delta"
+        ));
+
+        std::env::remove_var("SHELBI_HOME");
+    }
+
+    #[test]
+    fn workspace_row_carries_agent_from_task_params_with_developer_default() {
+        // The sidebar's per-row agent name mirrors `shelbi workspace list`
+        // — `agent:` from the task's frontmatter wins, falling back to
+        // `developer` when the task didn't pin one. Idle workspaces (no
+        // assigned in-progress task) collapse to `agent: None` so the
+        // renderer surfaces the "idle" placeholder rather than the
+        // default agent.
+        let _g = TEST_LOCK.lock().unwrap();
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+
+        let project = fixture_project();
+        shelbi_state::save_project(&project).unwrap();
+
+        let now = Utc::now();
+        // alpha → explicit `agent: qa` frontmatter
+        let mut params = std::collections::BTreeMap::new();
+        params.insert("agent".into(), "qa".into());
+        shelbi_state::save_task(
+            "demo",
+            &Task {
+                id: "explicit".into(),
+                title: "explicit".into(),
+                column: Column::InProgress,
+                priority: 0,
+                assigned_to: Some("alpha".into()),
+                workflow: None,
+                branch: None,
+                depends_on: Vec::new(),
+                prefers_machine: None,
+                zen: None,
+                created_at: now,
+                updated_at: now,
+                params,
+            },
+            "",
+        )
+        .unwrap();
+        // delta → no `agent:` in frontmatter, so the default applies
+        shelbi_state::save_task(
+            "demo",
+            &Task {
+                id: "default".into(),
+                title: "default".into(),
+                column: Column::InProgress,
+                priority: 0,
+                assigned_to: Some("delta".into()),
+                workflow: None,
+                branch: None,
+                depends_on: Vec::new(),
+                prefers_machine: None,
+                zen: None,
+                created_at: now,
+                updated_at: now,
+                params: std::collections::BTreeMap::new(),
+            },
+            "",
+        )
+        .unwrap();
+
+        let workspaces = load_workspaces("demo", &[]).unwrap();
+        let alpha = workspaces.iter().find(|w| w.name == "alpha").unwrap();
+        let delta = workspaces.iter().find(|w| w.name == "delta").unwrap();
+        assert_eq!(alpha.agent.as_deref(), Some("qa"));
+        assert_eq!(delta.agent.as_deref(), Some("developer"));
+
+        std::env::remove_var("SHELBI_HOME");
+    }
+
+    #[test]
+    fn idle_workspace_renders_no_agent_active_renders_resolved_agent() {
+        // Acceptance criterion: idle workspaces drop their agent column,
+        // active workspaces carry it. The renderer keys off `agent` being
+        // `Some` / `None` — this test pins the data shape so a future
+        // refactor can't silently render a placeholder agent on idle rows.
+        let _g = TEST_LOCK.lock().unwrap();
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+
+        let project = fixture_project();
+        shelbi_state::save_project(&project).unwrap();
+
+        let now = Utc::now();
+        shelbi_state::save_task(
+            "demo",
+            &Task {
+                id: "active".into(),
+                title: "active".into(),
+                column: Column::InProgress,
+                priority: 0,
+                assigned_to: Some("alpha".into()),
+                workflow: None,
+                branch: None,
+                depends_on: Vec::new(),
+                prefers_machine: None,
+                zen: None,
+                created_at: now,
+                updated_at: now,
+                params: std::collections::BTreeMap::new(),
+            },
+            "",
+        )
+        .unwrap();
+
+        let mut app = App::new_sidebar("demo");
+        app.refresh().unwrap();
+        let rows = app.rows();
+
+        let alpha = find_workspace_row(&rows, "alpha").unwrap();
+        assert!(matches!(
+            alpha,
+            Row::Workspace { agent: Some(a), .. } if a == "developer"
+        ));
+        let delta = find_workspace_row(&rows, "delta").unwrap();
+        assert!(matches!(delta, Row::Workspace { agent: None, .. }));
+
+        // Active row's badge is not Idle; idle row's badge is.
+        assert_ne!(find_workspace_badge(&rows, "alpha").unwrap(), WorkspaceBadge::Idle);
+        assert_eq!(find_workspace_badge(&rows, "delta").unwrap(), WorkspaceBadge::Idle);
+
+        std::env::remove_var("SHELBI_HOME");
     }
 
     #[test]
@@ -1073,8 +1376,9 @@ mod tests {
         let mut app = App::new_sidebar("demo");
         app.refresh().unwrap();
         // Start on the last nav item (Activity, idx 2). Next nav_down
-        // should skip the blank spacer (idx 3) and the `agents` section
-        // header (idx 4) and land on the first workspace row (idx 5).
+        // should skip the blank spacer (idx 3), the `Workspaces` section
+        // header (idx 4) and the first machine-group header (idx 5) — all
+        // non-selectable — and land on the first workspace row (idx 6).
         app.sidebar_index = 2;
         app.nav_down();
         let rows = app.rows();
@@ -1130,6 +1434,8 @@ mod tests {
         let workspace = Row::Workspace {
             name: "alpha".into(),
             badge: WorkspaceBadge::AwaitingPermission,
+            agent: Some("developer".into()),
+            indent: false,
             view: View::Workspace("alpha".into()),
         };
         let d = workspace.decoration().unwrap();
@@ -1155,8 +1461,12 @@ mod tests {
         assert_eq!(d.glyph, shelbi_core::Status::Running.glyph());
         assert_eq!(d.color, DecorationColor::Green);
 
-        assert!(Row::Section { label: "Agents".into() }.decoration().is_none());
+        assert!(Row::Section { label: "Workspaces".into() }.decoration().is_none());
         assert!(Row::Blank.decoration().is_none());
+        assert!(
+            Row::MachineGroup { name: "hub".into() }.decoration().is_none(),
+            "machine group headers are dividers, not decorated rows"
+        );
     }
 
     #[test]
