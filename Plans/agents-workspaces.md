@@ -111,7 +111,7 @@ Two agents are bundled with `shelbi init` (and re-applied if missing):
 
 - **Orchestrator** — `instructions.md` is what's currently in `crates/shelbi-orchestrator/src/default_orchestrator.md.template`. It moves from being "the embedded CLAUDE.md template" to being "the Orchestrator agent's prompt." Same content, new home. The `skills/` directory ships with whatever distilled flows we want to make discoverable (Zen merge conditions, auto-dispatch contract, etc.).
 
-- **Developer** — `instructions.md` is a small system prompt: "You're a worker on the Shelbi kanban board. You've been handed a task; read the task body, implement it, and write a review marker when done. Follow the conventions in the project's CLAUDE.md and any agent-level skills." The `skills/` directory ships with conventions like commit style, "don't run shelbi yourself," etc.
+- **Developer** — `instructions.md` is a small system prompt: "You're working in a Shelbi workspace. You've been handed a task; read the task body, implement it, and write a review marker when done. Follow project conventions in `agents/_shared/preamble.md` (if present) and any agent-level skills." The `skills/` directory ships with conventions like commit style, "don't run shelbi yourself," etc.
 
 Both are overridable per-project — see §6 below.
 
