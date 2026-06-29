@@ -103,6 +103,12 @@ pub enum Event {
         from: Column,
         to: Column,
         reason: String,
+        /// Agent name embedded in the `reason=` field as `_agent=<name>`
+        /// — set by `shelbi task start` when it spawns a workspace with a
+        /// specific agent loaded. `None` for events without the segment
+        /// (older lines from before this field was emitted, plus
+        /// transitions that don't spawn an agent).
+        agent: Option<String>,
         from_category: StatusCategory,
         to_category: StatusCategory,
         raw: String,
@@ -620,6 +626,7 @@ pub fn parse_event_line(line: &str) -> Event {
         if arrow == "->" {
             if let (Ok(from), Ok(to)) = (from_s.parse::<Column>(), to_s.parse::<Column>()) {
                 let reason = kv.get("reason").cloned().unwrap_or_default();
+                let agent = agent_from_reason(&reason);
                 let from_category = kv
                     .get("from_category")
                     .and_then(|s| s.parse::<StatusCategory>().ok())
@@ -635,6 +642,7 @@ pub fn parse_event_line(line: &str) -> Event {
                     from,
                     to,
                     reason,
+                    agent,
                     from_category,
                     to_category,
                     raw,
@@ -1057,6 +1065,18 @@ fn parse_zen_reason(reason: &str) -> Option<ZenReason> {
     })
 }
 
+/// Pull `agent=<name>` out of a sanitized reason value. The writer
+/// (`shelbi task start`) appends ` agent=<name>` to the human reason and
+/// `append_task_event` folds the space into an underscore — so on disk
+/// the field lives as one of the underscore-joined segments inside
+/// `reason=<value>` (e.g. `orchestrator:auto-dispatch_workspace=alpha_agent=developer`).
+/// Returns `None` for lines emitted before this field existed.
+fn agent_from_reason(reason: &str) -> Option<String> {
+    reason
+        .split('_')
+        .find_map(|seg| seg.strip_prefix("agent=").map(str::to_string))
+}
+
 /// Parse `k=v k2=v2 …` from a reason tail. Values may be double-quoted
 /// (`cmd="cargo test"`) to allow embedded spaces. Tokens missing a
 /// `=` are skipped silently — the parser should never reject a real
@@ -1160,9 +1180,22 @@ fn render_event(
             from,
             to,
             reason,
+            agent,
             raw,
             ..
-        } => render_task_event(app, *ts, id, *from, *to, reason, raw, width, now, started_at),
+        } => render_task_event(
+            app,
+            *ts,
+            id,
+            *from,
+            *to,
+            reason,
+            agent.as_deref(),
+            raw,
+            width,
+            now,
+            started_at,
+        ),
         Event::Workspace {
             ts, name, new, ..
         } => render_workspace_event(*ts, name, *new, width, now),
@@ -1257,6 +1290,7 @@ fn render_task_event(
     from: Column,
     to: Column,
     reason: &str,
+    agent: Option<&str>,
     raw: &str,
     width: usize,
     now: DateTime<Utc>,
@@ -1316,19 +1350,25 @@ fn render_task_event(
                 GLYPH_STARTED,
                 Color::Green,
             );
+            let mut primary = vec![workspace_span];
+            if let Some(name) = agent {
+                primary.push(Span::raw(" "));
+                primary.push(Span::styled(
+                    format!("[{name}]"),
+                    Style::default().fg(Color::DarkGray),
+                ));
+            }
+            primary.push(Span::raw("  "));
+            primary.push(Span::styled("started".to_string(), Style::default().fg(Color::Gray)));
+            primary.push(Span::raw("  "));
+            primary.push(Span::styled(
+                title_quoted,
+                Style::default()
+                    .fg(Color::White)
+                    .add_modifier(Modifier::ITALIC),
+            ));
             let row = RowText {
-                primary: vec![
-                    workspace_span,
-                    Span::raw("  "),
-                    Span::styled("started".to_string(), Style::default().fg(Color::Gray)),
-                    Span::raw("  "),
-                    Span::styled(
-                        title_quoted,
-                        Style::default()
-                            .fg(Color::White)
-                            .add_modifier(Modifier::ITALIC),
-                    ),
-                ],
+                primary,
                 secondary: Some(join_detail(&[
                     &branch
                         .as_ref()
@@ -1949,6 +1989,41 @@ mod tests {
     }
 
     #[test]
+    fn task_event_parser_extracts_agent_from_dispatch_reason() {
+        // `shelbi task start` writes the resolved agent into `reason=` as
+        // a `_agent=<name>` segment. The parser exposes it on the event
+        // struct so the activity feed can render an inline `[<agent>]`
+        // tag without re-parsing the line.
+        let line = "2026-06-23T04:19:33+00:00 task=foo workflow=default \
+                    todo -> in_progress \
+                    reason=orchestrator:auto-dispatch_workspace=alpha_agent=developer \
+                    from_category=ready to_category=active";
+        match parse_event_line(line) {
+            Event::Task { agent, reason, .. } => {
+                assert_eq!(agent.as_deref(), Some("developer"));
+                // Reason value is preserved verbatim; the agent field is
+                // a parsed convenience layered on top, not a replacement.
+                assert!(reason.contains("agent=developer"), "reason: {reason}");
+            }
+            other => panic!("expected task event, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn task_event_parser_leaves_agent_none_when_field_absent() {
+        // Older lines (and transitions emitted from paths that don't
+        // spawn a workspace) have no `_agent=` segment. The parser must
+        // leave `agent` as `None` rather than guessing.
+        let line = "2026-06-23T04:19:33+00:00 task=foo workflow=default \
+                    backlog -> todo reason=user:cli \
+                    from_category=backlog to_category=ready";
+        match parse_event_line(line) {
+            Event::Task { agent, .. } => assert!(agent.is_none(), "agent: {agent:?}"),
+            other => panic!("expected task event, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn parses_workspace_event() {
         let line = "2026-06-23T04:19:33Z workspace=alpha working -> awaiting_input";
         match parse_event_line(line) {
@@ -2166,6 +2241,77 @@ mod tests {
     }
 
     #[test]
+    fn agent_from_reason_extracts_agent_segment() {
+        // On disk the dispatch line carries
+        // `reason=orchestrator:auto-dispatch_workspace=alpha_agent=developer` —
+        // the leading whitespace from the human reason has been folded
+        // to underscores by `append_task_event`'s sanitizer. The helper
+        // splits on `_` and surfaces the named segment.
+        assert_eq!(
+            agent_from_reason("orchestrator:auto-dispatch_workspace=alpha_agent=developer"),
+            Some("developer".to_string())
+        );
+        assert_eq!(
+            agent_from_reason("user:cli:start_agent=orchestrator"),
+            Some("orchestrator".to_string())
+        );
+        assert_eq!(agent_from_reason("user:cli"), None);
+        assert_eq!(agent_from_reason(""), None);
+    }
+
+    #[test]
+    fn render_started_row_includes_agent_tag_after_workspace_name() {
+        // Acceptance (b) — dispatch rows surface the agent name as
+        // `[<agent>]` inline next to the workspace, so the user can read
+        // which role is on the workspace without going back to the
+        // workflow YAML.
+        let mut app = ActivityApp::new("demo");
+        let ts = Utc.with_ymd_and_hms(2026, 6, 23, 12, 0, 0).unwrap();
+        let now = ts + chrono::Duration::minutes(1);
+        let ev = Event::Task {
+            ts,
+            id: "demo-task".into(),
+            workflow: DEFAULT_WORKFLOW_NAME.into(),
+            from: Column::Todo,
+            to: Column::InProgress,
+            reason: "orchestrator:auto-dispatch_workspace=alpha_agent=developer".into(),
+            agent: Some("developer".into()),
+            from_category: Column::Todo.category(),
+            to_category: Column::InProgress.category(),
+            raw: String::new(),
+        };
+        let lines = render_event(&ev, &mut app, 80, now, None);
+        let primary = line_text(&lines[0]);
+        assert!(primary.contains("[developer]"), "missing tag in: {primary:?}");
+        assert!(primary.contains("started"), "missing verb in: {primary:?}");
+    }
+
+    #[test]
+    fn render_started_row_without_agent_field_skips_tag() {
+        // Acceptance (b) — backward compat: a legacy event line with no
+        // `agent` field renders cleanly, no empty `[]` left behind.
+        let mut app = ActivityApp::new("demo");
+        let ts = Utc.with_ymd_and_hms(2026, 6, 23, 12, 0, 0).unwrap();
+        let now = ts + chrono::Duration::minutes(1);
+        let ev = Event::Task {
+            ts,
+            id: "demo-task".into(),
+            workflow: DEFAULT_WORKFLOW_NAME.into(),
+            from: Column::Todo,
+            to: Column::InProgress,
+            reason: "user:cli:start".into(),
+            agent: None,
+            from_category: Column::Todo.category(),
+            to_category: Column::InProgress.category(),
+            raw: String::new(),
+        };
+        let lines = render_event(&ev, &mut app, 80, now, None);
+        let primary = line_text(&lines[0]);
+        assert!(!primary.contains('['), "stray bracket in: {primary:?}");
+        assert!(primary.contains("started"), "missing verb in: {primary:?}");
+    }
+
+    #[test]
     fn parse_kv_handles_quotes_and_bare_values() {
         let kv = parse_kv("a=1 b=\"two words\" c=three");
         assert_eq!(kv.get("a").map(String::as_str), Some("1"));
@@ -2197,6 +2343,7 @@ mod tests {
             from,
             to,
             reason: reason.into(),
+            agent: None,
             from_category: from.category(),
             to_category: to.category(),
             raw: String::new(),
@@ -2334,6 +2481,7 @@ mod tests {
             from: Column::Todo,
             to: Column::InProgress,
             reason: reason.into(),
+            agent: agent_from_reason(reason),
             from_category: Column::Todo.category(),
             to_category: Column::InProgress.category(),
             raw: String::new(),
@@ -2464,6 +2612,7 @@ mod tests {
             from: Column::Todo,
             to: Column::InProgress,
             reason: "user:cli".into(),
+            agent: None,
             from_category: Column::Todo.category(),
             to_category: Column::InProgress.category(),
             raw: String::new(),
@@ -2476,6 +2625,7 @@ mod tests {
             from: Column::Todo,
             to: Column::InProgress,
             reason: "user:cli".into(),
+            agent: None,
             from_category: Column::Todo.category(),
             to_category: Column::InProgress.category(),
             raw: String::new(),
@@ -2487,6 +2637,7 @@ mod tests {
             from: Column::InProgress,
             to: Column::Review,
             reason: "workspace:review-marker".into(),
+            agent: None,
             from_category: Column::InProgress.category(),
             to_category: Column::Review.category(),
             raw: String::new(),
