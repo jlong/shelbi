@@ -117,13 +117,15 @@ Both are overridable per-project — see §6 below.
 
 ### 4. Workflow status → agent binding
 
-The existing `owner:` field on each status becomes either:
+Each status declares two related fields:
 
-- **`user`** — a human owns this status (triage, review, accept). Reserved sentinel.
+- **`owner: user | agent`** — whose responsibility this status is when automation is OFF. `user` means a human acts (triage, review, accept); `agent` means the orchestrator dispatches automatically (e.g. out-of-todo work). Binary — exactly two valid values. This is what shows up in any "do I need to look at this?" filter.
 
-- **`<agent-name>`** — the named agent runs when a task is in this status. Must match a directory under `agents/`.
+- **`agent: <agent-name>`** *(optional)* — which agent is empowered to act when automation IS on. Names a directory under `agents/`. The field is what makes Zen behavior **declarative**: a `user`-owned status with an `agent:` value means "under Zen, this agent can do the work without me." A status with no `agent:` has no automation path — even Zen leaves it alone.
 
-The default workflow becomes:
+The split moves Zen behavior from orchestrator-prompt prose into the workflow schema. Today CLAUDE.md tells the orchestrator "under Zen, auto-promote backlog and run merge-conditions on review." After this, `backlog` and `review` simply declare `agent: orchestrator` and the orchestrator enacts what the workflow says. Per-status Zen ("auto-merge but don't auto-promote") becomes a YAML edit, not a prompt change. Each project picks its own Zen surface.
+
+The default workflow:
 
 ```yaml
 name: default
@@ -132,43 +134,63 @@ statuses:
   name: Backlog
   category: backlog
   owner: user
+  agent: orchestrator    # Zen: orchestrator auto-promotes per judgment categories
 - id: todo
   name: Todo
   category: ready
-  owner: orchestrator    # the orchestrator handles auto-dispatch out of todo
+  owner: agent
+  agent: orchestrator    # always: orchestrator dispatches
 - id: in-progress
   name: InProgress
   category: active
-  owner: developer       # the developer agent does the work
+  owner: agent
+  agent: developer       # the developer agent does the work
 - id: review
   name: Review
   category: handoff
   owner: user
+  agent: orchestrator    # Zen: orchestrator runs merge-conditions
 - id: done
   name: Done
   category: done
   owner: user
+  # terminal — no agent, no automation
+- id: canceled
+  name: Canceled
+  category: archived
+  owner: user
+  # terminal — no agent, no automation
 ```
 
 Loader validation:
 
-- `owner: user` is always accepted.
+- `owner` must be exactly `user` or `agent`. Any other value is a parse error.
 
-- Any other value must match a subdirectory under `agents/`. Loader errors at parse time with a list of available agent names if the value doesn't match.
+- `agent` (when present) must match a subdirectory under `agents/`. The loader errors at parse time with the list of available agent names if it doesn't match.
 
-- Reserved word: `agent` itself becomes invalid as an owner value once this lands (it's no longer a generic placeholder; the agent must be named). The loader auto-migrates legacy `owner: agent` entries — `ready`-category statuses default to `owner: orchestrator`, `active`-category statuses default to `owner: developer` — and emits a one-time deprecation warning telling the user to update the YAML.
+- **`owner: agent`** **without an** **`agent:`** **field is a hard error** — the whole point of the split is to make automation explicit. Diagnostic: "status '<id>' has `owner: agent` but no `agent:` field — which agent should run here?"
 
-For projects with a richer workflow, additional statuses can point at custom agents:
+- `owner: user` without an `agent:` field is fine; means "no automation for this status, period." Terminal states (`done`, `canceled`) typically take this shape.
+
+Legacy migration: existing workflows that use the single-field design (`owner: agent` alone, or `owner: <agent-name>`) auto-migrate with a one-time deprecation warning:
+
+- `owner: agent` alone → defaults `agent:` by category (`ready` → `orchestrator`, `active` → `developer`, anything else → error).
+
+- `owner: <name>` (the abandoned named-owner design) → rewrites to `owner: agent, agent: <name>`.
+
+For projects with a richer workflow, custom agents bind via the same two fields:
 
 ```yaml
 - id: qa
   name: QA
   category: handoff   # or 'active' — depends on whether QA blocks done
-  owner: qa
+  owner: user         # human signs off normally
+  agent: qa           # Zen: qa agent runs the verification gate
 - id: security-review
   name: Security Review
   category: handoff
-  owner: security-review
+  owner: user
+  agent: security-review
 ```
 
 ### 5. Worker dispatch with agents
