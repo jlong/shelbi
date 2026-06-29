@@ -232,6 +232,69 @@ pub fn render_workspace_settings(project: &Project) -> Result<String> {
     Ok(template.replace("{{workspace_permissions_mode}}", &project.workspace_permissions_mode))
 }
 
+/// Outcome of [`self_heal_workspace_settings_template`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WorkspaceSettingsTemplateOutcome {
+    /// Project YAML points at a custom `workspace_settings_template` path —
+    /// the shipped default is not in play, so the user owns that file
+    /// and self-heal stays out of the way.
+    SkippedOverride,
+    /// Template was missing; the bundled default has been written.
+    Created,
+    /// On-disk template byte-matches the bundled default. Nothing changed.
+    Unchanged,
+    /// On-disk template diverged from the bundled default and has been
+    /// overwritten. `had_legacy_placeholder` is set when the prior
+    /// contents carried a `{{worker_*}}` placeholder — the broken state
+    /// left by binaries from before the agents-workspaces rename, which
+    /// would render an invalid `defaultMode` into `.claude/settings.json`
+    /// and put claude into plan mode.
+    Overwritten { had_legacy_placeholder: bool },
+}
+
+/// `shelbi reload`'s self-heal pass for the workspace-settings template.
+/// The shipped default is a fixed asset the binary owns — claude's
+/// permission mode is set via `--permission-mode` on the CLI, not via
+/// the JSON, so there's no per-project knob the template needs to carry
+/// and no reason for users to hand-edit the file at the default path.
+/// When a stale template is found (notably the pre-rename
+/// `{{worker_permissions_mode}}` placeholder that leaks through the
+/// substituter and breaks claude's settings.json), we overwrite with
+/// the shipped default.
+///
+/// Users who deliberately want a custom template can point
+/// [`Project::workspace_settings_template`] at their own file — in that
+/// case we return [`WorkspaceSettingsTemplateOutcome::SkippedOverride`]
+/// without touching disk.
+pub fn self_heal_workspace_settings_template(
+    project: &Project,
+) -> Result<WorkspaceSettingsTemplateOutcome> {
+    if project.workspace_settings_template.is_some() {
+        return Ok(WorkspaceSettingsTemplateOutcome::SkippedOverride);
+    }
+    let path = workspace_settings_template_path(project)?;
+    if let Some(parent) = path.parent() {
+        ensure_dir(parent)?;
+    }
+    match fs::read_to_string(&path) {
+        Ok(s) if s == DEFAULT_WORKSPACE_SETTINGS_TEMPLATE => {
+            Ok(WorkspaceSettingsTemplateOutcome::Unchanged)
+        }
+        Ok(s) => {
+            let had_legacy_placeholder = s.contains("{{worker_");
+            atomic_write(&path, DEFAULT_WORKSPACE_SETTINGS_TEMPLATE.as_bytes())?;
+            Ok(WorkspaceSettingsTemplateOutcome::Overwritten {
+                had_legacy_placeholder,
+            })
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            atomic_write(&path, DEFAULT_WORKSPACE_SETTINGS_TEMPLATE.as_bytes())?;
+            Ok(WorkspaceSettingsTemplateOutcome::Created)
+        }
+        Err(e) => Err(shelbi_core::Error::Io(e)),
+    }
+}
+
 fn expand_tilde(p: &Path) -> PathBuf {
     if let Some(rest) = p.to_str().and_then(|s| s.strip_prefix("~/")) {
         if let Some(home) = dirs::home_dir() {
@@ -1321,6 +1384,182 @@ mod tests {
         // The default ships ready to use — no substitution required.
         let _: serde_json::Value =
             serde_json::from_str(s).expect("default template is valid JSON as-shipped");
+    }
+
+    /// The bug this self-heal exists for: the agents-workspaces rename
+    /// renamed every `{{worker_*}}` placeholder to `{{workspace_*}}`. A
+    /// pre-rename template binary materialized into a project still
+    /// referenced `{{worker_permissions_mode}}`, which slipped through
+    /// the substituter and left an invalid `"defaultMode"` in claude's
+    /// settings.json. Verify the shipped default has no surviving
+    /// `{{worker_*}}` strings.
+    #[test]
+    fn default_workspace_settings_template_has_no_legacy_worker_placeholder() {
+        assert!(
+            !DEFAULT_WORKSPACE_SETTINGS_TEMPLATE.contains("{{worker_"),
+            "shipped template carries a pre-rename `{{{{worker_*}}}}` placeholder: {DEFAULT_WORKSPACE_SETTINGS_TEMPLATE}",
+        );
+    }
+
+    /// Acceptance criterion (a): the shipped default flows through the
+    /// substituter without leaving any unresolved `{{…}}` placeholders.
+    /// Renders against every `workspace_permissions_mode` value that
+    /// could plausibly be configured.
+    #[test]
+    fn render_workspace_settings_default_has_no_unresolved_placeholders() {
+        let _g = TEST_LOCK.lock().unwrap();
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+        for mode in ["auto", "acceptEdits", "bypassPermissions", "default", "plan"] {
+            let mut p = fixture_project("myapp", None);
+            p.workspace_permissions_mode = mode.into();
+            let rendered = render_workspace_settings(&p).unwrap();
+            assert!(
+                !rendered.contains("{{"),
+                "mode `{mode}` left an unresolved placeholder: {rendered}",
+            );
+            // The output must still parse as valid JSON for claude.
+            let _: serde_json::Value = serde_json::from_str(&rendered).unwrap();
+        }
+        std::env::remove_var("SHELBI_HOME");
+    }
+
+    /// `shelbi reload` self-heal — file missing → bundled default lands
+    /// on disk; outcome reports `Created`.
+    #[test]
+    fn self_heal_workspace_settings_template_creates_when_missing() {
+        let _g = TEST_LOCK.lock().unwrap();
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+        let p = fixture_project("myapp", None);
+        let path = workspace_settings_template_path(&p).unwrap();
+        assert!(!path.exists());
+
+        let outcome = self_heal_workspace_settings_template(&p).unwrap();
+        assert_eq!(outcome, WorkspaceSettingsTemplateOutcome::Created);
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            DEFAULT_WORKSPACE_SETTINGS_TEMPLATE
+        );
+        std::env::remove_var("SHELBI_HOME");
+    }
+
+    /// `shelbi reload` self-heal — on-disk template byte-matches the
+    /// shipped default → outcome reports `Unchanged` and disk is not
+    /// touched.
+    #[test]
+    fn self_heal_workspace_settings_template_is_noop_when_aligned() {
+        let _g = TEST_LOCK.lock().unwrap();
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+        let p = fixture_project("myapp", None);
+        let path = workspace_settings_template_path(&p).unwrap();
+        ensure_dir(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, DEFAULT_WORKSPACE_SETTINGS_TEMPLATE).unwrap();
+
+        let outcome = self_heal_workspace_settings_template(&p).unwrap();
+        assert_eq!(outcome, WorkspaceSettingsTemplateOutcome::Unchanged);
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            DEFAULT_WORKSPACE_SETTINGS_TEMPLATE
+        );
+        std::env::remove_var("SHELBI_HOME");
+    }
+
+    /// Acceptance criterion (c): the bug-specific case. A project whose
+    /// on-disk template still has the pre-rename
+    /// `{{worker_permissions_mode}}` placeholder is healed back to the
+    /// shipped default, with `had_legacy_placeholder` set so reload can
+    /// surface a "we fixed your stale template" line.
+    #[test]
+    fn self_heal_workspace_settings_template_overwrites_stale_worker_placeholder() {
+        let _g = TEST_LOCK.lock().unwrap();
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+        let p = fixture_project("myapp", None);
+        let path = workspace_settings_template_path(&p).unwrap();
+        ensure_dir(path.parent().unwrap()).unwrap();
+        // Mimic the broken on-disk template a pre-rename binary would
+        // have materialized into the project.
+        std::fs::write(
+            &path,
+            r#"{"permissions":{"defaultMode":"{{worker_permissions_mode}}"}}"#,
+        )
+        .unwrap();
+
+        let outcome = self_heal_workspace_settings_template(&p).unwrap();
+        assert_eq!(
+            outcome,
+            WorkspaceSettingsTemplateOutcome::Overwritten {
+                had_legacy_placeholder: true
+            }
+        );
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            DEFAULT_WORKSPACE_SETTINGS_TEMPLATE
+        );
+        // And the renderer now produces a clean settings.json for claude.
+        let rendered = render_workspace_settings(&p).unwrap();
+        assert!(!rendered.contains("{{worker_"));
+        assert!(!rendered.contains("{{workspace_"));
+        std::env::remove_var("SHELBI_HOME");
+    }
+
+    /// Divergent on-disk content with no legacy placeholder is still
+    /// overwritten by the shipped default — the template is a managed
+    /// asset; users who want a custom one use the
+    /// `workspace_settings_template` override field. The outcome
+    /// reflects that no legacy placeholder was found.
+    #[test]
+    fn self_heal_workspace_settings_template_overwrites_divergent_content() {
+        let _g = TEST_LOCK.lock().unwrap();
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+        let p = fixture_project("myapp", None);
+        let path = workspace_settings_template_path(&p).unwrap();
+        ensure_dir(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, r#"{"custom":true}"#).unwrap();
+
+        let outcome = self_heal_workspace_settings_template(&p).unwrap();
+        assert_eq!(
+            outcome,
+            WorkspaceSettingsTemplateOutcome::Overwritten {
+                had_legacy_placeholder: false
+            }
+        );
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            DEFAULT_WORKSPACE_SETTINGS_TEMPLATE
+        );
+        std::env::remove_var("SHELBI_HOME");
+    }
+
+    /// Self-heal must respect the per-project
+    /// `workspace_settings_template` override — that path belongs to the
+    /// user, not the binary, and we never touch it on reload.
+    #[test]
+    fn self_heal_workspace_settings_template_skips_when_project_overrides_path() {
+        let _g = TEST_LOCK.lock().unwrap();
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+        let custom = home.join("etc/custom-settings.json.template");
+        ensure_dir(custom.parent().unwrap()).unwrap();
+        std::fs::write(&custom, r#"{"user":"owns this"}"#).unwrap();
+        let p = fixture_project("myapp", Some(custom.clone()));
+
+        let outcome = self_heal_workspace_settings_template(&p).unwrap();
+        assert_eq!(outcome, WorkspaceSettingsTemplateOutcome::SkippedOverride);
+        // User's custom file is untouched.
+        assert_eq!(
+            std::fs::read_to_string(&custom).unwrap(),
+            r#"{"user":"owns this"}"#
+        );
+        // The default-path location was never created — we stayed out of
+        // the way entirely.
+        let default_path =
+            home.join("projects/myapp/workspace-settings.json.template");
+        assert!(!default_path.exists());
+        std::env::remove_var("SHELBI_HOME");
     }
 
     #[test]

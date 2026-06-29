@@ -1,15 +1,19 @@
 use anyhow::{anyhow, Result};
 use shelbi_orchestrator::{PaneReloadStatus, ReloadReport};
+use shelbi_state::WorkspaceSettingsTemplateOutcome;
 
 use super::init::print_agent_materialize_outcome;
 use super::require_project;
 
 /// Respawn the four shelbi-owned panes (sidebar + tasks/review/machines
 /// stash) in-place, then self-heal the per-project agent workspaces
-/// (`agents/{orchestrator,developer}/`) so a freshly installed binary
-/// that ships an updated default prompt — or a wiped agent directory —
-/// lands on disk without forcing the user to recreate the project.
-/// User-edited `instructions.md` files are preserved byte-for-byte.
+/// (`agents/{orchestrator,developer}/`) and the workspace-settings
+/// template so a freshly installed binary that ships updated defaults —
+/// or a wiped/stale on-disk copy — lands without forcing the user to
+/// recreate the project. User-edited `instructions.md` files are
+/// preserved byte-for-byte; the workspace-settings template is always
+/// re-aligned with the shipped default (users who want customization
+/// point `workspace_settings_template` at their own file).
 pub fn run(project_opt: Option<String>) -> Result<()> {
     let project_name = require_project(project_opt)?;
     let report = shelbi_orchestrator::reload(&project_name).map_err(|e| anyhow!(e))?;
@@ -19,7 +23,41 @@ pub fn run(project_opt: Option<String>) -> Result<()> {
     for outcome in outcomes {
         print_agent_materialize_outcome(&outcome);
     }
+    let project = shelbi_state::load_project(&project_name).map_err(|e| anyhow!(e))?;
+    let template_outcome =
+        shelbi_state::self_heal_workspace_settings_template(&project).map_err(|e| anyhow!(e))?;
+    print_workspace_settings_template_outcome(&template_outcome);
     Ok(())
+}
+
+fn print_workspace_settings_template_outcome(outcome: &WorkspaceSettingsTemplateOutcome) {
+    match outcome {
+        WorkspaceSettingsTemplateOutcome::SkippedOverride => {
+            println!(
+                "(skipped workspace-settings.json.template self-heal: project uses a \
+                 custom `workspace_settings_template` path)"
+            );
+        }
+        WorkspaceSettingsTemplateOutcome::Created => {
+            println!("✓ wrote workspace-settings.json.template (was missing)");
+        }
+        WorkspaceSettingsTemplateOutcome::Unchanged => {
+            println!("(workspace-settings.json.template already matches the shipped default)");
+        }
+        WorkspaceSettingsTemplateOutcome::Overwritten { had_legacy_placeholder } => {
+            if *had_legacy_placeholder {
+                println!(
+                    "✓ healed workspace-settings.json.template — stale \
+                     `{{{{worker_*}}}}` placeholder replaced with the shipped default"
+                );
+            } else {
+                println!(
+                    "✓ overwrote workspace-settings.json.template — on-disk copy diverged \
+                     from the shipped default"
+                );
+            }
+        }
+    }
 }
 
 fn print_report(project: &str, r: &ReloadReport) {
