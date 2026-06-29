@@ -62,9 +62,9 @@ The `[developer]` tag is the currently-loaded agent (see §10), surfaced inline 
 
 ```
 - Workspaces -
- ▶ alpha     Developer
- ▶ bravo     QA
- · charlie   idle
+▶ alpha     Developer
+▶ bravo     QA
+· charlie   idle
 ```
 
 When the project has only one machine, the group header collapses away — the tree degenerates to today's flat list, no setting needed. Group headers appear automatically the moment a second machine is declared in `project.yaml`.
