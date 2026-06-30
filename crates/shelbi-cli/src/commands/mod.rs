@@ -9,6 +9,7 @@ pub mod events;
 pub mod init;
 pub mod list;
 pub mod merge;
+pub mod message;
 pub mod open;
 pub mod orchestrate;
 pub mod palette;

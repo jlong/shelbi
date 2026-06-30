@@ -198,6 +198,17 @@ pub fn append_workspace_event(
     append_event_line(&format!("{ts} workspace={workspace} {prev_str} -> {new}"))
 }
 
+/// Append `<rfc3339> message=<msg_id> task=<task-id> push=ok` to
+/// `~/.shelbi/events.log`. Records a hub → workspace push on the file-based
+/// message channel (see `shelbi message`) so the channel is auditable from
+/// the same stream as workspace/task transitions. The leading timestamp
+/// keeps every events.log line uniform and parseable by the activity feed
+/// and `shelbi events tail`.
+pub fn append_message_event(msg_id: &str, task_id: &str) -> Result<()> {
+    let ts = Utc::now().to_rfc3339();
+    append_event_line(&format!("{ts} message={msg_id} task={task_id} push=ok"))
+}
+
 /// Append a task transition line to `~/.shelbi/events.log` using the
 /// workflow-aware line shape from `Plans/workflows.md` §10:
 ///
@@ -678,6 +689,25 @@ mod tests {
             "line: {}",
             lines[2],
         );
+
+        std::env::remove_var("SHELBI_HOME");
+    }
+
+    #[test]
+    fn append_message_event_writes_push_line() {
+        let _g = TEST_LOCK.lock().unwrap();
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+
+        append_message_event("m-123", "fix-login").unwrap();
+        let log = std::fs::read_to_string(events_log_path().unwrap()).unwrap();
+        let line = log.lines().next().unwrap();
+        // Leading RFC3339 timestamp keeps the line uniform with the rest of
+        // events.log (and parseable by the activity feed / `events tail`).
+        assert!(DateTime::parse_from_rfc3339(line.split_whitespace().next().unwrap()).is_ok());
+        assert!(line.contains("message=m-123"));
+        assert!(line.contains("task=fix-login"));
+        assert!(line.ends_with("push=ok"));
 
         std::env::remove_var("SHELBI_HOME");
     }

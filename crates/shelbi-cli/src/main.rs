@@ -59,6 +59,23 @@ enum Cmd {
         id: String,
         message: String,
     },
+    /// Push a message to a task's workspace via the file-based message log
+    /// (`<worktree>/.shelbi/messages/<task-id>.log`). Distinct from `send`:
+    /// `send` injects keystrokes into a tmux pane; `message` appends a
+    /// durable JSON record the workspace tails and acks.
+    Message {
+        /// Task id whose assigned workspace receives the message.
+        id: String,
+        /// Message kind.
+        #[arg(value_enum)]
+        kind: commands::message::MessageKind,
+        /// Message body.
+        body: String,
+        /// Question id this message replies to (sets `in_response_to`).
+        /// Typically paired with `kind = reply`.
+        #[arg(long = "in-response-to", value_name = "QUESTION-ID")]
+        in_response_to: Option<String>,
+    },
     /// [legacy spawn flow] Tail a spawn-agent's recent output. Workspaces
     /// don't write to the legacy log — use `tmux capture-pane` against
     /// `shelbi-<project>:<workspace>` (local) or
@@ -263,6 +280,12 @@ fn main() -> Result<()> {
         Some(Cmd::List) => commands::list::run(cli.project),
         Some(Cmd::Status { cmd }) => commands::status::run(cli.project, cmd),
         Some(Cmd::Send { id, message }) => commands::send::run(cli.project, id, message),
+        Some(Cmd::Message {
+            id,
+            kind,
+            body,
+            in_response_to,
+        }) => commands::message::run(cli.project, id, kind, body, in_response_to),
         Some(Cmd::Tail { id, lines }) => commands::tail::run(cli.project, id, lines),
         Some(Cmd::Diff { id }) => commands::diff::run(cli.project, id),
         Some(Cmd::Merge { id, pr }) => commands::merge::run(cli.project, id, pr),
