@@ -114,22 +114,9 @@ workspace\_settings\_template: workspace-settings.json.template
 
 **User-specific (\`\~/.shelbi/projects/<project>/local.yaml\` in in-repo mode; absent in global mode where everything's in the main YAML):**
 
-\`\`\`yaml
+```yaml
 machines:
-
-- name: hub
-  kind: local
-  work\_dir: /Users/jlong/Workspaces/shelbi
-
-- name: devbox
-  kind: ssh
-  host: devbox
-  work\_dir: /home/jlong/Workspaces/shelbi
-  workspaces:
-
-- name: alpha
-  machine: hub
-  runner: claude
+```
 
 # ...
 
