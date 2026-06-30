@@ -127,15 +127,12 @@ machines:
   work_dir: /home/jlong/Workspaces/shelbi
   workspaces:
 
-name: alpha
-machine: hub
-runner: claude
-
+- name: alpha
+  machine: hub
+  runner: claude
 ```
 
-# ...
-
-\`\`\`
+<br />
 
 Rationale: every dev has their own machines and workspace names. The shared \`project.yaml\` is what gets committed; the local \`local.yaml\` is per-user.
 
