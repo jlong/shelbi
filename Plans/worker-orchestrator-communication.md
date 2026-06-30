@@ -1,10 +1,11 @@
-# Remote Worker → Orchestrator Communication
+# Worker → Orchestrator Communication
 
 ## Context
 
 Workers — both hub-local (alpha, bravo, charlie) and remote (delta, echo, foxtrot behind SSH) — need to send signals back to the orchestrator: "my pane died," "I finished a task," "the build failed." Today there is no proper channel:
 
 - **Hub workers** append directly to `~/.shelbi/events.log`. This works because the filesystem is shared, but multiple writers race on the same file (today only "happens to work" because hub is largely the sole writer).
+
 - **Remote workers** write `status.yaml` on the remote box; the hub-side poller `ssh`s in and reads it. Read-only, polling, eventually-consistent, no event semantics.
 
 Symmetrically, the orchestrator needs a way to push messages *into* a worker — clarification replies, "stop, the spec changed," "you're on the wrong branch." Today this goes through `tmux send-keys`, which is fragile: input can land in a feedback survey, permission prompt, or any UI element claude-code surfaces between turns.
@@ -45,6 +46,7 @@ remote worker --write-> | (nc -U / socat / python)   |
 Two channels:
 
 - **Worker → Hub**: JSON lines into a Unix socket. `shelbi daemon` validates and appends to `events.log`.
+
 - **Hub → Worker**: append-only `.shelbi/messages/$TASK_ID.log` file in the worktree. Worker tails it; orchestrator appends to it. Worker acks each read via the socket channel so the orchestrator knows whether a message landed.
 
 Both channels are file/socket primitives — no agent-specific protocol, no install on workers.
@@ -86,7 +88,9 @@ Remote workers set `SHELBI_HUB_SOCK=/tmp/shelbi-hub.sock` (the reverse-forward l
 A subcommand of the main `shelbi` binary — one install path. Listens on `~/.shelbi/hub.sock`. For each newline-delimited JSON message, validates and dispatches:
 
 - `event` → append to project's `events.log`
+
 - `request-clarification` → surface to orchestrator + emit board-visible event
+
 - `message-ack` → mark the referenced message as delivered (see §9, §13)
 
 One daemon per user, not per project — projects multiplex through the `project` field.
@@ -110,6 +114,7 @@ Reuses existing SSH trust, zero new public listeners.
 #### Daemon supervision — OS-native user services
 
 - **macOS**: `~/Library/LaunchAgents/co.32pixels.shelbi.plist` with `KeepAlive: true`, `RunAtLoad: true`.
+
 - **Linux**: `~/.config/systemd/user/shelbi.service` with `Restart=always`, `RestartSec=1s`. Headless boxes need `loginctl enable-linger <user>` — install script prints the instruction.
 
 `scripts/install.sh` writes the platform-appropriate unit file. `--no-daemon` for opt-out.
@@ -117,6 +122,7 @@ Reuses existing SSH trust, zero new public listeners.
 Runtime management:
 
 - `shelbi daemon install` / `uninstall` / `status` / `restart`
+
 - `shelbi daemon` (no subcommand) — foreground entry point.
 
 ### 7. Loss handling — best-effort + hub-side detection
@@ -141,7 +147,9 @@ Agent-instructions paragraph (`agents/developer/instructions.md`):
 
 > When facing ambiguity in a task spec, prefer asking over guessing. Send a clarification request by writing this JSON to `$SHELBI_HUB_SOCK`:
 >
->     {"verb":"request-clarification","project":"<project>","task_id":"<your-task-id>","question_id":"<short-unique-id>","question":"<concise question>","context":"<short excerpt>"}
+> ```
+> {"verb":"request-clarification","project":"<project>","task_id":"<your-task-id>","question_id":"<short-unique-id>","question":"<concise question>","context":"<short excerpt>"}
+> ```
 >
 > The orchestrator will surface your question to the user and append the reply to your message log. You'll see it via the always-on tail.
 >
@@ -174,6 +182,7 @@ The daemon writes an `event` line `message=m-042 task=feat-X ack=worker` so the 
 Hub-side write path:
 
 - Hub workers: `echo '<json>' >> <worktree>/.shelbi/messages/<task-id>.log`
+
 - Remote workers: `ssh <host> 'cat >> <worktree>/.shelbi/messages/<task-id>.log' <<<'<json>'`
 
 Single primitive — file append. Orchestrator CLI: `shelbi message <task-id> <kind> "<body>"` (or `--in-response-to <question-id>` for replies).
@@ -233,13 +242,17 @@ Codex's task prompt includes:
 
 > Your message log is at `.shelbi/messages/<your-task-id>.log`. **After every Bash, Edit, or Read tool call**, check it with:
 >
->     CURSOR=$(cat .shelbi/messages/<task-id>.cursor 2>/dev/null || echo 1)
->     tail -n +$CURSOR .shelbi/messages/<task-id>.log
->     wc -l < .shelbi/messages/<task-id>.log > .shelbi/messages/<task-id>.cursor
+> ```
+> CURSOR=$(cat .shelbi/messages/<task-id>.cursor 2>/dev/null || echo 1)
+> tail -n +$CURSOR .shelbi/messages/<task-id>.log
+> wc -l < .shelbi/messages/<task-id>.log > .shelbi/messages/<task-id>.cursor
+> ```
 >
 > Act on any messages you find before continuing. For each new message, ack via:
 >
->     echo '{"verb":"message-ack","project":"<project>","task_id":"<task-id>","msg_id":"<msg-id>"}' | nc -U $SHELBI_HUB_SOCK
+> ```
+> echo '{"verb":"message-ack","project":"<project>","task_id":"<task-id>","msg_id":"<msg-id>"}' | nc -U $SHELBI_HUB_SOCK
+> ```
 
 Tying the poll to specific concrete tool calls (Bash, Edit, Read) avoids the "the agent ran one giant tool call and never polled" failure mode.
 
@@ -254,34 +267,40 @@ None beyond SSH and Unix-socket / filesystem file permissions. The reverse forwa
 Threat model:
 
 - **Devbox compromise** — attacker can forge `events.log` lines and tamper with their own message log. Both strictly weaker than what the agent's identity already grants.
+
 - **Network MITM** — SSH is the encryption + integrity layer.
+
 - **Multi-tenant devbox** — scope to `$XDG_RUNTIME_DIR/shelbi.sock` if shared.
+
 - **Multi-user hub** — socket and worktrees are per-user.
 
 ### 12. What this does NOT solve
 
 - **Hub → remote eventing for non-worker concerns.** Already covered by SSH command invocation.
+
 - **Multi-hub coordination.** One project, one hub.
+
 - **Cross-project events at the wire level.** Per-message `project` field; no cross-project subscribe.
+
 - **Real-time interrupts on codex workers.** Codex sees messages on its next poll. Acceptable for clarification/directive use cases.
 
 ### 13. Robustness — known weak spots and mitigations
 
 Honest catalogue of where the design is fragile, baked-in mitigations, and accepted residual risk.
 
-| Weak spot | Where it surfaces | Mitigation in the design |
-|---|---|---|
-| Worker dies / hangs without reading message | Orchestrator pushes a directive; worker never processes it | Worker acks each read via socket (§9). Unacked > 60s surfaces in the orchestrator as a warning. |
-| Claude Code hook misconfigured / disabled | Push delivery silently fails | Agent prompt (§8) includes "if no reply in 5 min, manually tail the log." Pull path always works. |
-| Tail process duplication on session restart | Two tails write to the same unread.log → duplicate injections | SessionStart hook (§10) kills any prior tail by PID lock file before spawning. |
-| Race between Stop hook clearing unread.log and orchestrator append | Message written during the clear window is lost | Atomic `mv unread.log unread.processing` then `touch unread.log` — new writes go to the fresh file (§10). |
-| Stale SSH ControlMaster after hub restart | Remote panes hold a `/tmp/shelbi-hub.sock` pointing at a dead socket | Hub startup kills stale shelbi-owned CMs in `~/.shelbi/ssh/` and re-establishes (§7). |
-| Codex polls in giant tool call | Worker never checks the message log mid-step | Prompt ties polling to concrete triggers (after every Bash/Edit/Read), not the vague "between significant steps" (§10). |
-| Daemon throughput under fan-out | Many remote workers fill kernel socket buffer; workers block on write | Daemon does JSON parse + file append only — no synchronous IO bottleneck. Realistic risk only with dozens of workers; today's pool is 3. Worth revisiting if scale grows. |
-| Best-effort remote events lost in seconds before SSH drop | Pre-drop chatter never lands | Accepted residual risk. Pane_alive specifically is recovered hub-side via SSH-drop detection (§7); other events are low-stakes. |
-| Old "stop" directive read by worker minutes later | Time-sensitive directive no longer applies | Messages include `ts`. Agent prompt: "treat directives older than 5 min as informational, not as live interrupts." |
-| Hook output is trusted as a system reminder | If attacker writes to unread.log, they inject prompts | Same trust boundary as the worktree filesystem — attacker with filesystem write already has agent-level execution. No new attack surface. |
-| Message log location not derivable for arbitrary host | Orchestrator needs `<worktree>` path for remote write | Orchestrator already knows each workspace's worktree (it spawned them). Resolution lives in the workspace state. |
+| Weak spot                                                          | Where it surfaces                                                     | Mitigation in the design                                                                                                                                                  |
+| ------------------------------------------------------------------ | --------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Worker dies / hangs without reading message                        | Orchestrator pushes a directive; worker never processes it            | Worker acks each read via socket (§9). Unacked > 60s surfaces in the orchestrator as a warning.                                                                           |
+| Claude Code hook misconfigured / disabled                          | Push delivery silently fails                                          | Agent prompt (§8) includes "if no reply in 5 min, manually tail the log." Pull path always works.                                                                         |
+| Tail process duplication on session restart                        | Two tails write to the same unread.log → duplicate injections         | SessionStart hook (§10) kills any prior tail by PID lock file before spawning.                                                                                            |
+| Race between Stop hook clearing unread.log and orchestrator append | Message written during the clear window is lost                       | Atomic `mv unread.log unread.processing` then `touch unread.log` — new writes go to the fresh file (§10).                                                                 |
+| Stale SSH ControlMaster after hub restart                          | Remote panes hold a `/tmp/shelbi-hub.sock` pointing at a dead socket  | Hub startup kills stale shelbi-owned CMs in `~/.shelbi/ssh/` and re-establishes (§7).                                                                                     |
+| Codex polls in giant tool call                                     | Worker never checks the message log mid-step                          | Prompt ties polling to concrete triggers (after every Bash/Edit/Read), not the vague "between significant steps" (§10).                                                   |
+| Daemon throughput under fan-out                                    | Many remote workers fill kernel socket buffer; workers block on write | Daemon does JSON parse + file append only — no synchronous IO bottleneck. Realistic risk only with dozens of workers; today's pool is 3. Worth revisiting if scale grows. |
+| Best-effort remote events lost in seconds before SSH drop          | Pre-drop chatter never lands                                          | Accepted residual risk. Pane\_alive specifically is recovered hub-side via SSH-drop detection (§7); other events are low-stakes.                                          |
+| Old "stop" directive read by worker minutes later                  | Time-sensitive directive no longer applies                            | Messages include `ts`. Agent prompt: "treat directives older than 5 min as informational, not as live interrupts."                                                        |
+| Hook output is trusted as a system reminder                        | If attacker writes to unread.log, they inject prompts                 | Same trust boundary as the worktree filesystem — attacker with filesystem write already has agent-level execution. No new attack surface.                                 |
+| Message log location not derivable for arbitrary host              | Orchestrator needs `<worktree>` path for remote write                 | Orchestrator already knows each workspace's worktree (it spawned them). Resolution lives in the workspace state.                                                          |
 
 **Accepted residual risk**: best-effort delivery of low-stakes events in the seconds-before-SSH-drop window. Everything else has a mitigation in the design.
 
@@ -299,7 +318,7 @@ Honest catalogue of where the design is fragile, baked-in mitigations, and accep
 
 ## Phasing
 
-1. **Phase 1 — `shelbi daemon` + local socket on hub.** Daemon listens, validates, appends `events.log`. Socket write with O_APPEND fallback.
+1. **Phase 1 —** **`shelbi daemon`** **+ local socket on hub.** Daemon listens, validates, appends `events.log`. Socket write with O\_APPEND fallback.
 2. **Phase 2 — daemon supervision.** launchd plist + systemd unit. `shelbi daemon install/uninstall/status/restart`. `scripts/install.sh` integration.
 3. **Phase 3 — hub workers use the socket.** Agent instructions updated; `shelbi open` sets `SHELBI_HUB_SOCK=~/.shelbi/hub.sock`.
 4. **Phase 4 — reverse forward in remote-pane SSH.** Extend hub's outbound SSH with `-R`. Stale-CM cleanup on hub start.
