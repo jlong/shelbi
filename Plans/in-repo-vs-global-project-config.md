@@ -2,7 +2,7 @@
 
 ## Context
 
-Today every project's configuration lives in a global location: `/.shelbi/projects/````/` (and the project YAML at `/.shelbi/projects/````.yaml`). That dir holds the workflows, agent prompts, task board, settings templates, and runtime state. Nothing is committed to the project repo.
+Today every project's configuration lives in a global location: `/.shelbi/projects/{project}/` (and the project YAML at `/.shelbi/projects/````.yaml`). That dir holds the workflows, agent prompts, task board, settings templates, and runtime state. Nothing is committed to the project repo.
 
 This is fine for solo use on a single machine. It breaks down when:
 
