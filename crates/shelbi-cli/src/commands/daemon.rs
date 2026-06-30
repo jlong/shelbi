@@ -1,18 +1,42 @@
 //! `shelbi daemon` — hub-side Unix-socket listener for worker → hub
 //! messages plus the OS-supervisor install/uninstall/status/restart
-//! plumbing that makes the daemon survive crashes and reboots. Phases 1
-//! and 2 of the Worker → Orchestrator Communication feature
-//! (see `Plans/worker-orchestrator-communication.md` §5 and §6).
+//! plumbing that makes the daemon survive crashes and reboots. Phases 1,
+//! 2, 4, and 9 of the Worker → Orchestrator Communication feature
+//! (see `Plans/worker-orchestrator-communication.md` §5, §6, §8, §9, §13).
 //!
 //! ## Foreground (`shelbi daemon`, no subcommand)
 //!
 //! Binds `~/.shelbi/hub.sock` (overridable via `$SHELBI_HUB_SOCK`), reads
 //! newline-delimited JSON messages from any number of concurrent clients,
-//! and dispatches them by `verb`. Phase 1 handles only the `event` verb:
-//! the body line is timestamped and appended to `~/.shelbi/events.log`.
+//! and dispatches them by `verb`:
+//!
+//! - `event` (Phase 1) — body line is timestamped and appended to
+//!   `~/.shelbi/events.log`.
+//! - `request-clarification` (Phase 9) — emits a `question=… task=…
+//!   kind=clarification text=…` event so the orchestrator's tail surfaces
+//!   the question alongside every other transition. The reply travels back
+//!   on the file-based `<worktree>/.shelbi/messages/<task-id>.log`
+//!   channel via `shelbi message --in-response-to`.
+//! - `message-pushed` (Phase 9, internal) — emitted by `shelbi message`
+//!   after a successful file append; adds the (task, msg) pair to an
+//!   in-memory pending map so the daemon can synthesize an `ack=timeout`
+//!   event when the worker never confirms delivery.
+//! - `message-ack` (Phase 9) — emitted by the worker after it processes a
+//!   message; appends an `ack=worker` event and clears the pending entry.
+//!
 //! Unknown verbs and malformed payloads are logged to stderr and the
 //! daemon keeps running — a single bad client must not be able to take
 //! the listener down.
+//!
+//! ## Unacked-message reaper (Phase 9)
+//!
+//! Spawned at startup, the reaper wakes every second, scans the pending
+//! map for `(task, msg)` pairs whose push timestamp is older than the
+//! configurable threshold ([`ack_timeout_from_env`]; default 60s,
+//! `$SHELBI_ACK_TIMEOUT_SECS` to override), and for each one emits a
+//! single `message=… task=… ack=timeout` event before removing the
+//! entry. Idempotent on shutdown: the reaper checks the same stop flag
+//! the accept loop does, so SIGTERM stops both promptly.
 //!
 //! Phase 4 additions:
 //!   - On startup, walks `~/.shelbi/ssh/` and removes orphaned SSH
@@ -23,9 +47,12 @@
 //!   - Records its own PID at `~/.shelbi/shelbi.pid` so the next
 //!     start's cleanup can make the same decision.
 //!
-//! The daemon is stateless across restarts: `events.log` is the durable
-//! record, and in-flight bytes live in the kernel's socket buffers. A
-//! crash + restart resumes accepting messages.
+//! The daemon is stateless across *restarts* with respect to events.log
+//! (the durable record). The pending map is in-memory by design — a
+//! crash drops it; the orchestrator's view of which messages are
+//! outstanding rebuilds organically as `push=ok` events stop pairing
+//! with future `ack=worker` lines. We accept this tradeoff because the
+//! safety net is "no silent loss", not "perfect delivery accounting".
 //!
 //! ## Supervision (`shelbi daemon install|uninstall|status|restart`)
 //!
@@ -38,6 +65,7 @@
 //! installed binary takes effect without losing the auto-restart
 //! guarantee.
 
+use std::collections::HashMap;
 use std::fs;
 use std::io::{BufRead, BufReader};
 use std::os::unix::fs::PermissionsExt;
@@ -45,8 +73,9 @@ use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::thread;
+use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, bail, Context, Result};
 use serde::Deserialize;
@@ -63,6 +92,79 @@ const SERVICE_LABEL: &str = "co.32pixels.shelbi";
 /// macOS builds compile it but never read it.
 #[allow(dead_code)]
 const SYSTEMD_SERVICE_NAME: &str = "shelbi.service";
+
+/// Environment variable that overrides the default unacked-message ack
+/// timeout. Value is parsed as whole seconds; any non-positive or
+/// unparseable value falls back to [`DEFAULT_ACK_TIMEOUT`] with a stderr
+/// warning so a typo never silently disables the reaper.
+const ACK_TIMEOUT_ENV: &str = "SHELBI_ACK_TIMEOUT_SECS";
+
+/// Default time the daemon waits for a worker `message-ack` before
+/// synthesizing an `ack=timeout` event. 60s matches the threshold called
+/// out in `Plans/worker-orchestrator-communication.md` §9; long enough
+/// to outwait a healthy hook/poll round-trip even under load, short
+/// enough that the orchestrator notices a wedged worker within the
+/// human reaction window.
+const DEFAULT_ACK_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// How often the reaper wakes to scan the pending map. One second is
+/// short enough that an `ack=timeout` lands within ~1s of crossing the
+/// threshold, long enough that an idle daemon spends near-zero CPU.
+const REAPER_TICK: Duration = Duration::from_secs(1);
+
+/// In-memory map of pushed-but-unacked messages, keyed by `(task_id,
+/// msg_id)` with the push time recorded against [`Instant::now`] at
+/// arrival. Shared between the listener (insert on `message-pushed`,
+/// remove on `message-ack`) and the reaper (drain on timeout). Wrapped
+/// in `Arc<Mutex<…>>` so cheap clones move with each thread.
+type PendingMap = HashMap<(String, String), Instant>;
+
+/// Resolve the ack timeout once at daemon start. Env var wins so tests
+/// and operators can dial it down without rebuilding; an unparseable
+/// value warns and falls back to the default rather than silently
+/// disabling the reaper.
+fn ack_timeout_from_env() -> Duration {
+    match std::env::var(ACK_TIMEOUT_ENV) {
+        Ok(raw) => match raw.trim().parse::<u64>() {
+            Ok(0) => {
+                eprintln!(
+                    "shelbi daemon: {ACK_TIMEOUT_ENV}=0 disabled — using default {}s",
+                    DEFAULT_ACK_TIMEOUT.as_secs()
+                );
+                DEFAULT_ACK_TIMEOUT
+            }
+            Ok(n) => Duration::from_secs(n),
+            Err(_) => {
+                eprintln!(
+                    "shelbi daemon: {ACK_TIMEOUT_ENV}=`{raw}` is not a non-negative integer; \
+                     using default {}s",
+                    DEFAULT_ACK_TIMEOUT.as_secs()
+                );
+                DEFAULT_ACK_TIMEOUT
+            }
+        },
+        Err(_) => DEFAULT_ACK_TIMEOUT,
+    }
+}
+
+/// Per-process daemon state shared across the accept loop, every client
+/// handler thread, and the reaper. Holds the pending message map and the
+/// resolved ack timeout; both are stamped at startup and never mutated.
+/// Clones are cheap — the `Arc` is the only field that needs to move.
+#[derive(Clone)]
+struct Daemon {
+    pending: Arc<Mutex<PendingMap>>,
+    ack_timeout: Duration,
+}
+
+impl Daemon {
+    fn new(ack_timeout: Duration) -> Self {
+        Self {
+            pending: Arc::new(Mutex::new(PendingMap::new())),
+            ack_timeout,
+        }
+    }
+}
 
 /// `shelbi daemon <subcommand>`. The foreground entry runs when no
 /// subcommand is supplied — launchd/systemd invoke us with bare
@@ -121,10 +223,16 @@ fn run_foreground() -> Result<()> {
         eprintln!("shelbi daemon: failed to write PID file: {e}");
     }
 
-    eprintln!("shelbi daemon: listening at {}", sock.display());
+    let daemon = Daemon::new(ack_timeout_from_env());
+    eprintln!(
+        "shelbi daemon: listening at {} (ack timeout {}s)",
+        sock.display(),
+        daemon.ack_timeout.as_secs()
+    );
 
     let stop = Arc::new(AtomicBool::new(false));
     install_shutdown_listener(stop.clone(), sock.clone())?;
+    spawn_reaper(daemon.clone(), stop.clone());
 
     for incoming in listener.incoming() {
         // Shutdown wakes us via a self-connect; the resulting accept
@@ -135,7 +243,8 @@ fn run_foreground() -> Result<()> {
         }
         match incoming {
             Ok(stream) => {
-                thread::spawn(move || handle_client(stream));
+                let daemon = daemon.clone();
+                thread::spawn(move || handle_client(stream, &daemon));
             }
             Err(e) => {
                 eprintln!("shelbi daemon: accept error: {e}");
@@ -152,6 +261,65 @@ fn run_foreground() -> Result<()> {
     }
     eprintln!("shelbi daemon: stopped");
     Ok(())
+}
+
+/// Spawn the unacked-message reaper thread. Wakes every [`REAPER_TICK`],
+/// drains pending entries past `ack_timeout`, emits one `ack=timeout`
+/// event per drained pair, and exits when the shared stop flag is set
+/// (same flag the accept loop watches, so SIGTERM stops both).
+fn spawn_reaper(daemon: Daemon, stop: Arc<AtomicBool>) {
+    thread::spawn(move || {
+        while !stop.load(Ordering::SeqCst) {
+            // Sleep in short slices so SIGTERM wakes us within a tick
+            // rather than waiting up to REAPER_TICK for the next scan.
+            let slice = Duration::from_millis(250);
+            let mut waited = Duration::ZERO;
+            while waited < REAPER_TICK && !stop.load(Ordering::SeqCst) {
+                thread::sleep(slice);
+                waited += slice;
+            }
+            if stop.load(Ordering::SeqCst) {
+                break;
+            }
+            reap_expired(&daemon);
+        }
+    });
+}
+
+/// Drain all `(task, msg)` pairs in the pending map whose push time is
+/// older than `daemon.ack_timeout`. For each drained pair emit one
+/// `message=<id> task=<id> ack=timeout` event. Holds the map lock only
+/// while collecting the expired keys — the event-append IO happens
+/// after the lock is released so a slow events.log write never blocks
+/// new pushes or acks on the listener side.
+fn reap_expired(daemon: &Daemon) {
+    let timeout = daemon.ack_timeout;
+    let now = Instant::now();
+    let expired: Vec<(String, String)> = {
+        let mut map = match daemon.pending.lock() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        let keys: Vec<(String, String)> = map
+            .iter()
+            .filter_map(|(k, t)| {
+                if now.saturating_duration_since(*t) >= timeout {
+                    Some(k.clone())
+                } else {
+                    None
+                }
+            })
+            .collect();
+        for k in &keys {
+            map.remove(k);
+        }
+        keys
+    };
+    for (task_id, msg_id) in expired {
+        if let Err(e) = shelbi_state::append_message_ack_event(&msg_id, &task_id, "timeout") {
+            eprintln!("shelbi daemon: failed to record ack=timeout for {msg_id}/{task_id}: {e}");
+        }
+    }
 }
 
 /// Walk `$SHELBI_HOME/ssh/` and unlink orphaned ControlMaster sockets
@@ -242,7 +410,7 @@ fn install_shutdown_listener(stop: Arc<AtomicBool>, sock: PathBuf) -> Result<()>
 /// One client → one BufReader → newline-delimited JSON. Each line is
 /// dispatched independently so a bad line in the middle of a batch
 /// doesn't kill the rest. EOF closes the handler cleanly.
-fn handle_client(stream: UnixStream) {
+fn handle_client(stream: UnixStream, daemon: &Daemon) {
     let reader = BufReader::new(stream);
     for line in reader.lines() {
         let line = match line {
@@ -255,7 +423,7 @@ fn handle_client(stream: UnixStream) {
         if line.trim().is_empty() {
             continue;
         }
-        if let Err(e) = dispatch(&line) {
+        if let Err(e) = dispatch(&line, daemon) {
             // Log + continue; one bad message must not take down a
             // multi-message client connection.
             eprintln!("shelbi daemon: rejected message: {e}: {line}");
@@ -266,20 +434,51 @@ fn handle_client(stream: UnixStream) {
 #[derive(Debug, Deserialize)]
 struct Message {
     verb: String,
-    /// Reserved for future verbs (`request-clarification`, `message-ack`)
-    /// that route per-project. Phase 1 only logs it.
+    /// Project name the message belongs to. Currently audit-only on the
+    /// daemon side — the per-project routing surface lives in the
+    /// orchestrator, not here — but every verb carries it so future
+    /// per-project consumers don't have to re-version the wire format.
     #[serde(default)]
     project: Option<String>,
     /// Body of an `event` message. Required for `event`; ignored for
-    /// other verbs (which Phase 1 doesn't support yet).
+    /// every other verb.
     #[serde(default)]
     line: Option<String>,
+    /// Task this message references. Required for `request-clarification`,
+    /// `message-ack`, and `message-pushed`; ignored for `event`.
+    #[serde(default)]
+    task_id: Option<String>,
+    /// Opaque question id minted by the worker — echoed back in the
+    /// orchestrator's reply (`shelbi message ... --in-response-to`) so
+    /// multiple in-flight clarifications correlate cleanly. Required for
+    /// `request-clarification`.
+    #[serde(default)]
+    question_id: Option<String>,
+    /// Free-form question text the worker wants the user to answer.
+    /// Truncated + folded before it lands in `events.log`. Required for
+    /// `request-clarification`.
+    #[serde(default)]
+    question: Option<String>,
+    /// Optional short excerpt the worker thinks is useful context for
+    /// the question — currently emitted only as a debug-trace breadcrumb
+    /// since the full question/context exchange lives in the message log,
+    /// not the events stream.
+    #[serde(default)]
+    context: Option<String>,
+    /// Opaque message id from `shelbi message`. Required for
+    /// `message-ack` (worker referencing the message it processed) and
+    /// `message-pushed` (the CLI announcing the push to the daemon).
+    #[serde(default)]
+    msg_id: Option<String>,
 }
 
-fn dispatch(raw: &str) -> Result<()> {
+fn dispatch(raw: &str, daemon: &Daemon) -> Result<()> {
     let msg: Message = serde_json::from_str(raw).context("invalid JSON payload")?;
     match msg.verb.as_str() {
         "event" => handle_event(&msg),
+        "request-clarification" => handle_request_clarification(&msg),
+        "message-pushed" => handle_message_pushed(&msg, daemon),
+        "message-ack" => handle_message_ack(&msg, daemon),
         other => Err(anyhow!("unknown verb `{other}`")),
     }
 }
@@ -303,6 +502,83 @@ fn handle_event(msg: &Message) -> Result<()> {
         tracing::debug!(project, "shelbi daemon: appended event");
     }
     Ok(())
+}
+
+/// Worker-side clarification request. Required fields are `task_id`,
+/// `question_id`, and `question`; `context` is optional and currently
+/// emitted only as a debug breadcrumb since the full body lives in the
+/// per-task message log, not the events stream.
+fn handle_request_clarification(msg: &Message) -> Result<()> {
+    let task_id = required(msg.task_id.as_deref(), "request-clarification", "task_id")?;
+    let question_id = required(
+        msg.question_id.as_deref(),
+        "request-clarification",
+        "question_id",
+    )?;
+    let question = required(msg.question.as_deref(), "request-clarification", "question")?;
+    shelbi_state::append_clarification_event(question_id, task_id, question)
+        .map_err(|e| anyhow!(e))?;
+    if msg.context.is_some() || msg.project.is_some() {
+        tracing::debug!(
+            project = msg.project.as_deref().unwrap_or("?"),
+            task = task_id,
+            question = question_id,
+            has_context = msg.context.is_some(),
+            "shelbi daemon: recorded clarification"
+        );
+    }
+    Ok(())
+}
+
+/// Internal verb: `shelbi message` calls into the daemon after a
+/// successful file append so the daemon can start the ack-timeout clock.
+/// No event is emitted here — the CLI already wrote `push=ok` to
+/// `events.log` via [`shelbi_state::append_message_event`]; we just
+/// arm the in-memory timer that will fire `ack=timeout` if the worker
+/// never confirms. A repeat `message-pushed` for the same (task, msg)
+/// pair refreshes the timer rather than erroring; the CLI shouldn't
+/// send duplicates but a manual retry under operator control should
+/// reset the clock instead of failing.
+fn handle_message_pushed(msg: &Message, daemon: &Daemon) -> Result<()> {
+    let task_id = required(msg.task_id.as_deref(), "message-pushed", "task_id")?;
+    let msg_id = required(msg.msg_id.as_deref(), "message-pushed", "msg_id")?;
+    let mut map = daemon
+        .pending
+        .lock()
+        .map_err(|_| anyhow!("pending map poisoned"))?;
+    map.insert((task_id.to_string(), msg_id.to_string()), Instant::now());
+    Ok(())
+}
+
+/// Worker-side delivery confirmation. Clears the matching pending entry
+/// (no-op if the timer already expired and the reaper claimed it) and
+/// emits a single `message=<id> task=<id> ack=worker` event so the
+/// orchestrator's tail sees delivery on the same stream that carried
+/// the original `push=ok` line.
+fn handle_message_ack(msg: &Message, daemon: &Daemon) -> Result<()> {
+    let task_id = required(msg.task_id.as_deref(), "message-ack", "task_id")?;
+    let msg_id = required(msg.msg_id.as_deref(), "message-ack", "msg_id")?;
+    {
+        let mut map = daemon
+            .pending
+            .lock()
+            .map_err(|_| anyhow!("pending map poisoned"))?;
+        map.remove(&(task_id.to_string(), msg_id.to_string()));
+    }
+    shelbi_state::append_message_ack_event(msg_id, task_id, "worker").map_err(|e| anyhow!(e))?;
+    Ok(())
+}
+
+/// Reject the request with a uniform "missing required field" error
+/// when a verb-specific field arrives unset (or set to an empty
+/// string). Centralized so the wire-protocol error messages stay
+/// consistent across verbs — every line in the daemon log reads the
+/// same way regardless of which verb tripped.
+fn required<'a>(field: Option<&'a str>, verb: &str, name: &str) -> Result<&'a str> {
+    match field {
+        Some(s) if !s.is_empty() => Ok(s),
+        _ => Err(anyhow!("{verb} message missing `{name}` field")),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -783,35 +1059,223 @@ mod tests {
     use super::*;
     use std::path::PathBuf;
 
+    fn test_daemon() -> Daemon {
+        // Tests that exercise the timeout branch override `ack_timeout`
+        // locally; everything else uses the production default so the
+        // unit tests reflect real config.
+        Daemon::new(DEFAULT_ACK_TIMEOUT)
+    }
+
     #[test]
     fn dispatch_rejects_malformed_json() {
-        let err = dispatch("not json").unwrap_err();
+        let err = dispatch("not json", &test_daemon()).unwrap_err();
         assert!(err.to_string().contains("invalid JSON"), "{err}");
     }
 
     #[test]
     fn dispatch_rejects_unknown_verb() {
-        let err =
-            dispatch(r#"{"verb":"task-claim","project":"shelbi","line":"x=1"}"#).unwrap_err();
+        let err = dispatch(
+            r#"{"verb":"task-claim","project":"shelbi","line":"x=1"}"#,
+            &test_daemon(),
+        )
+        .unwrap_err();
         assert!(err.to_string().contains("unknown verb"), "{err}");
     }
 
     #[test]
     fn dispatch_event_requires_line_field() {
-        let err = dispatch(r#"{"verb":"event","project":"shelbi"}"#).unwrap_err();
+        let err = dispatch(r#"{"verb":"event","project":"shelbi"}"#, &test_daemon()).unwrap_err();
         assert!(err.to_string().contains("missing `line`"), "{err}");
     }
 
     #[test]
     fn dispatch_event_rejects_empty_line() {
-        let err = dispatch(r#"{"verb":"event","project":"shelbi","line":""}"#).unwrap_err();
+        let err = dispatch(
+            r#"{"verb":"event","project":"shelbi","line":""}"#,
+            &test_daemon(),
+        )
+        .unwrap_err();
         assert!(err.to_string().contains("empty"), "{err}");
     }
 
     #[test]
     fn dispatch_event_rejects_embedded_newline() {
-        let err = dispatch(r#"{"verb":"event","project":"shelbi","line":"a\nb"}"#).unwrap_err();
+        let err = dispatch(
+            r#"{"verb":"event","project":"shelbi","line":"a\nb"}"#,
+            &test_daemon(),
+        )
+        .unwrap_err();
         assert!(err.to_string().contains("newlines"), "{err}");
+    }
+
+    #[test]
+    fn dispatch_request_clarification_requires_core_fields() {
+        let d = test_daemon();
+        // Missing task_id
+        let err = dispatch(
+            r#"{"verb":"request-clarification","project":"shelbi","question_id":"q-1","question":"ok?"}"#,
+            &d,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("task_id"), "{err}");
+
+        // Missing question_id
+        let err = dispatch(
+            r#"{"verb":"request-clarification","project":"shelbi","task_id":"t-1","question":"ok?"}"#,
+            &d,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("question_id"), "{err}");
+
+        // Missing question
+        let err = dispatch(
+            r#"{"verb":"request-clarification","project":"shelbi","task_id":"t-1","question_id":"q-1"}"#,
+            &d,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("question"), "{err}");
+    }
+
+    #[test]
+    fn dispatch_message_ack_requires_core_fields() {
+        let d = test_daemon();
+        let err = dispatch(
+            r#"{"verb":"message-ack","project":"shelbi","task_id":"t-1"}"#,
+            &d,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("msg_id"), "{err}");
+
+        let err = dispatch(
+            r#"{"verb":"message-ack","project":"shelbi","msg_id":"m-1"}"#,
+            &d,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("task_id"), "{err}");
+    }
+
+    #[test]
+    fn dispatch_message_pushed_requires_core_fields() {
+        let d = test_daemon();
+        let err = dispatch(
+            r#"{"verb":"message-pushed","project":"shelbi","task_id":"t-1"}"#,
+            &d,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("msg_id"), "{err}");
+    }
+
+    #[test]
+    fn message_pushed_then_ack_clears_pending_map() {
+        let d = test_daemon();
+        // Push: pending map gains the entry.
+        dispatch(
+            r#"{"verb":"message-pushed","project":"shelbi","task_id":"t-1","msg_id":"m-1"}"#,
+            &d,
+        )
+        .unwrap();
+        assert_eq!(d.pending.lock().unwrap().len(), 1);
+        assert!(d
+            .pending
+            .lock()
+            .unwrap()
+            .contains_key(&("t-1".to_string(), "m-1".to_string())));
+
+        // Ack: pending map is cleared.
+        dispatch(
+            r#"{"verb":"message-ack","project":"shelbi","task_id":"t-1","msg_id":"m-1"}"#,
+            &d,
+        )
+        .unwrap();
+        assert!(d.pending.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn message_pushed_is_idempotent_per_pair() {
+        // A duplicate `message-pushed` for the same (task, msg) shouldn't
+        // duplicate the entry — it should refresh the push time so a
+        // legitimate operator retry doesn't trip the reaper while the
+        // worker is still actively processing.
+        let d = test_daemon();
+        dispatch(
+            r#"{"verb":"message-pushed","project":"shelbi","task_id":"t-1","msg_id":"m-1"}"#,
+            &d,
+        )
+        .unwrap();
+        let first = *d
+            .pending
+            .lock()
+            .unwrap()
+            .get(&("t-1".to_string(), "m-1".to_string()))
+            .unwrap();
+        std::thread::sleep(Duration::from_millis(5));
+        dispatch(
+            r#"{"verb":"message-pushed","project":"shelbi","task_id":"t-1","msg_id":"m-1"}"#,
+            &d,
+        )
+        .unwrap();
+        let second = *d
+            .pending
+            .lock()
+            .unwrap()
+            .get(&("t-1".to_string(), "m-1".to_string()))
+            .unwrap();
+        assert_eq!(d.pending.lock().unwrap().len(), 1);
+        assert!(second > first, "expected timer refresh");
+    }
+
+    #[test]
+    fn message_ack_for_unknown_pair_is_a_noop_not_an_error() {
+        // The reaper may have claimed the entry first, or the daemon
+        // restarted between push and ack — either way the worker's ack
+        // is still meaningful for `events.log` and must not bounce off
+        // a "no such pending message" error.
+        let d = test_daemon();
+        dispatch(
+            r#"{"verb":"message-ack","project":"shelbi","task_id":"t-ghost","msg_id":"m-ghost"}"#,
+            &d,
+        )
+        .expect("ack for unknown pair should be accepted");
+    }
+
+    #[test]
+    fn ack_timeout_env_parses_valid_value() {
+        let key = ACK_TIMEOUT_ENV;
+        // Cooperate with parallel tests by saving/restoring the var.
+        let saved = std::env::var(key).ok();
+        std::env::set_var(key, "5");
+        assert_eq!(ack_timeout_from_env(), Duration::from_secs(5));
+        std::env::set_var(key, "bogus");
+        assert_eq!(ack_timeout_from_env(), DEFAULT_ACK_TIMEOUT);
+        std::env::set_var(key, "0");
+        assert_eq!(ack_timeout_from_env(), DEFAULT_ACK_TIMEOUT);
+        match saved {
+            Some(v) => std::env::set_var(key, v),
+            None => std::env::remove_var(key),
+        }
+    }
+
+    #[test]
+    fn reap_expired_drains_entries_past_threshold_and_keeps_fresh_ones() {
+        let mut d = test_daemon();
+        d.ack_timeout = Duration::from_millis(50);
+        // Backdate one entry so it's already expired, and leave the
+        // other at "just now" so it survives the scan.
+        {
+            let mut map = d.pending.lock().unwrap();
+            map.insert(
+                ("t-old".into(), "m-old".into()),
+                Instant::now()
+                    .checked_sub(Duration::from_millis(200))
+                    .unwrap(),
+            );
+            map.insert(("t-new".into(), "m-new".into()), Instant::now());
+        }
+        reap_expired(&d);
+        let map = d.pending.lock().unwrap();
+        assert_eq!(map.len(), 1);
+        assert!(map.contains_key(&("t-new".to_string(), "m-new".to_string())));
+        assert!(!map.contains_key(&("t-old".to_string(), "m-old".to_string())));
     }
 
     #[test]

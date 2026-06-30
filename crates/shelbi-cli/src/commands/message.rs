@@ -135,8 +135,49 @@ pub fn run(
     // Audit the push on the shared events stream.
     shelbi_state::append_message_event(&msg_id, &id).map_err(|e| anyhow!(e))?;
 
+    // Best-effort: tell the hub daemon so it can arm the
+    // unacked-message timer. The file append above is the durable record;
+    // the daemon-side timer is only the safety net that turns into an
+    // `ack=timeout` event if the worker never confirms. A down or
+    // missing daemon silently skips this — `events.log` still has the
+    // `push=ok` line and an operator watching the stream will notice
+    // the missing ack themselves.
+    notify_daemon_message_pushed(&project_name, &id, &msg_id);
+
     println!("✓ {msg_id} → {id} ({})", kind.as_str());
     Ok(())
+}
+
+/// Send a `message-pushed` verb to the hub daemon over the Unix socket.
+/// Mirrors the worker → hub one-liner pattern (single newline-terminated
+/// JSON, write-only, half-close) so the daemon handler treats it like
+/// every other inbound message. Best-effort: any error is swallowed —
+/// the push is durable on disk regardless of whether the timer arms.
+fn notify_daemon_message_pushed(project: &str, task_id: &str, msg_id: &str) {
+    use std::io::Write;
+    use std::os::unix::net::UnixStream;
+    use std::time::Duration;
+
+    let sock = match shelbi_state::hub_socket_path() {
+        Ok(p) => p,
+        Err(_) => return,
+    };
+    let Ok(mut stream) = UnixStream::connect(&sock) else {
+        return;
+    };
+    let _ = stream.set_write_timeout(Some(Duration::from_millis(500)));
+    let payload = serde_json::json!({
+        "verb": "message-pushed",
+        "project": project,
+        "task_id": task_id,
+        "msg_id": msg_id,
+    });
+    let Ok(mut bytes) = serde_json::to_vec(&payload) else {
+        return;
+    };
+    bytes.push(b'\n');
+    let _ = stream.write_all(&bytes);
+    let _ = stream.shutdown(std::net::Shutdown::Write);
 }
 
 /// Is `path` a directory on `host`? `test -d` is a real binary on both Linux

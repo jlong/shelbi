@@ -211,6 +211,60 @@ pub fn append_message_event(msg_id: &str, task_id: &str) -> Result<()> {
     append_event_line(&format!("{ts} message={msg_id} task={task_id} push=ok"))
 }
 
+/// Append `<rfc3339> message=<msg_id> task=<task-id> ack=<kind>` to
+/// `~/.shelbi/events.log`. `kind` is the literal worker/timeout token that
+/// the worker emitted (`worker`) or the daemon synthesized
+/// (`timeout`) — see Phase 9 of `Plans/worker-orchestrator-communication.md`
+/// §9 / §13. The shared `message=` prefix lets the activity feed correlate
+/// pushes (`push=ok`) with their delivery state without re-reading the
+/// pending map.
+pub fn append_message_ack_event(msg_id: &str, task_id: &str, kind: &str) -> Result<()> {
+    let ts = Utc::now().to_rfc3339();
+    let kind = sanitize_reason(kind);
+    append_event_line(&format!("{ts} message={msg_id} task={task_id} ack={kind}"))
+}
+
+/// Append `<rfc3339> question=<question-id> task=<task-id> kind=clarification text=<truncated>`
+/// to `~/.shelbi/events.log`. Emitted by the hub daemon when a worker sends
+/// `{"verb":"request-clarification", ...}` over the hub socket — surfaces
+/// the question to the orchestrator via the same events stream every other
+/// transition rides on. The original question text is folded (whitespace →
+/// underscores) and truncated so the line stays single-record and bounded,
+/// then the trailing `…` marker tells operators reading the log that the
+/// full body lives in the worker's `.shelbi/messages/<task-id>.log` thread
+/// (the daemon never persists clarification text — it's hands-off
+/// orchestration metadata).
+pub fn append_clarification_event(question_id: &str, task_id: &str, text: &str) -> Result<()> {
+    let ts = Utc::now().to_rfc3339();
+    let truncated = sanitize_reason(&truncate_with_ellipsis(text, CLARIFICATION_TEXT_BUDGET));
+    append_event_line(&format!(
+        "{ts} question={question_id} task={task_id} kind=clarification text={truncated}"
+    ))
+}
+
+/// Maximum chars of the clarification question we copy into the event line.
+/// Bounded so a verbose question doesn't blow the line past readable
+/// terminals; the full text lives in the orchestrator's message log thread
+/// anyway. Picked at 120 — long enough to be informative in `events tail`,
+/// short enough to stay on one screen-line in a typical 200-col terminal
+/// after the timestamp + key/value prefixes.
+const CLARIFICATION_TEXT_BUDGET: usize = 120;
+
+/// Truncate `s` to at most `max` *chars* (not bytes — we never want to
+/// split a UTF-8 codepoint), appending a single `…` marker when content
+/// was elided so downstream readers see the truncation explicitly.
+fn truncate_with_ellipsis(s: &str, max: usize) -> String {
+    let mut out = String::with_capacity(s.len().min(max * 4) + 1);
+    for (count, ch) in s.chars().enumerate() {
+        if count >= max {
+            out.push('…');
+            return out;
+        }
+        out.push(ch);
+    }
+    out
+}
+
 /// Append a task transition line to `~/.shelbi/events.log` using the
 /// workflow-aware line shape from `Plans/workflows.md` §10:
 ///
@@ -938,6 +992,96 @@ mod tests {
         assert!(line.ends_with("push=ok"));
 
         std::env::remove_var("SHELBI_HOME");
+    }
+
+    #[test]
+    fn append_message_ack_event_writes_worker_and_timeout_lines() {
+        let _g = TEST_LOCK.lock().unwrap();
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+
+        append_message_ack_event("m-1", "fix-login", "worker").unwrap();
+        append_message_ack_event("m-1", "fix-login", "timeout").unwrap();
+        let log = std::fs::read_to_string(events_log_path().unwrap()).unwrap();
+        let lines: Vec<&str> = log.lines().collect();
+        assert_eq!(lines.len(), 2);
+        // Each line is `<ts> message=<id> task=<id> ack=<kind>` and the
+        // ack kind must round-trip verbatim so the activity feed can
+        // distinguish worker-confirmed from synthesized timeouts.
+        assert!(
+            lines[0].contains(" message=m-1 task=fix-login ack=worker"),
+            "{}",
+            lines[0]
+        );
+        assert!(
+            lines[1].contains(" message=m-1 task=fix-login ack=timeout"),
+            "{}",
+            lines[1]
+        );
+        for line in &lines {
+            let ts = line.split_whitespace().next().unwrap();
+            DateTime::parse_from_rfc3339(ts).unwrap();
+        }
+
+        std::env::remove_var("SHELBI_HOME");
+    }
+
+    #[test]
+    fn append_clarification_event_truncates_long_text_and_folds_whitespace() {
+        let _g = TEST_LOCK.lock().unwrap();
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+
+        // 240 chars — well past the 120-char budget, so the line should
+        // get a trailing `…` and stop expanding events.log into a
+        // multi-screen blob. Whitespace folds to `_` so the line stays
+        // parseable as a single space-separated record.
+        let q = "lorem ipsum dolor sit amet ".repeat(10);
+        append_clarification_event("q-001", "feat-X", &q).unwrap();
+        let log = std::fs::read_to_string(events_log_path().unwrap()).unwrap();
+        let line = log.lines().next().unwrap();
+        // Shape: `<ts> question=q-001 task=feat-X kind=clarification text=…`
+        assert!(line.contains(" question=q-001 "), "{line}");
+        assert!(line.contains(" task=feat-X "), "{line}");
+        assert!(line.contains(" kind=clarification "), "{line}");
+        assert!(line.contains(" text="), "{line}");
+        assert!(line.ends_with('…'), "expected ellipsis tail: {line}");
+        // No internal whitespace inside the text= token — sanitize_reason
+        // collapsed it. The 120-char body + one ellipsis lands well under
+        // a typical terminal width.
+        let text = line.split(" text=").nth(1).unwrap();
+        assert!(
+            !text.contains(' '),
+            "internal whitespace not folded: {text}"
+        );
+
+        std::env::remove_var("SHELBI_HOME");
+    }
+
+    #[test]
+    fn append_clarification_event_keeps_short_text_intact_and_no_ellipsis() {
+        let _g = TEST_LOCK.lock().unwrap();
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+
+        append_clarification_event("q-002", "fix-bug", "use http or https?").unwrap();
+        let log = std::fs::read_to_string(events_log_path().unwrap()).unwrap();
+        let line = log.lines().next().unwrap();
+        // Short question fits entirely; sanitize folds the two spaces in
+        // the question to underscores so the record stays single-line.
+        assert!(line.ends_with(" text=use_http_or_https?"), "{line}");
+    }
+
+    #[test]
+    fn truncate_with_ellipsis_respects_char_boundary() {
+        // Non-ASCII content must split cleanly on character boundaries —
+        // a byte-level slice could panic mid-codepoint. We construct a
+        // 130-char string of 3-byte chars and assert the output is exactly
+        // 120 chars + the ellipsis.
+        let s: String = "é".repeat(130);
+        let out = truncate_with_ellipsis(&s, 120);
+        assert_eq!(out.chars().count(), 121, "chars: {}", out.chars().count());
+        assert!(out.ends_with('…'));
     }
 
     #[test]

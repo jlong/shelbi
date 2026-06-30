@@ -76,6 +76,42 @@ it still fails, you have two options:
 Embedded newlines tear records across multiple log lines. Keep the
 `line` body to a single line of `key=value` tokens.
 
+## Asking the user a question
+
+When you hit ambiguity in a task spec, **prefer asking over guessing**.
+Send a clarification request by writing this JSON to `$SHELBI_HUB_SOCK`:
+
+```sh
+echo '{"verb":"request-clarification","project":"<project>","task_id":"<your-task-id>","question_id":"<short-unique-id>","question":"<concise question>","context":"<short excerpt>"}' \
+  | nc -U "$SHELBI_HUB_SOCK"
+```
+
+Pick any `question_id` that's unique to *you*: short, opaque, your
+choice (e.g. `q-001`). The orchestrator echoes it back in the reply's
+`in_response_to` field so you can correlate multiple in-flight questions.
+
+The orchestrator surfaces your question to the user and appends the
+reply to your message log at `.shelbi/messages/<task-id>.log`. If you
+have a tail running (Phase 7 hooks inject new messages into your context
+automatically) you'll see it the next turn; otherwise read the file
+yourself before continuing.
+
+**Safety net.** If you've been waiting more than ~5 minutes without a
+reply, fall back to manually checking `.shelbi/messages/<task-id>.log`
+— push delivery may have failed silently and the file is the durable
+record. Don't escalate the question by re-sending; the user has it.
+
+## Summarize decisions in your commit message
+
+Before writing the review marker, **briefly summarize the key
+decisions** you made in the commit message — especially the calls you
+*didn't* ask about. This is the orthogonal safety net for the failure
+mode where you didn't realize you should have asked: a one-paragraph
+"here's what I chose and why" lets the orchestrator (and the human
+reviewer) catch silent wrong-assumption cases at review time instead of
+after merge. Prefer concrete decisions ("used X over Y because Z") over
+generic restatements of the task.
+
 ## What you don't do
 
 - Don't start a new task on your own — wait for one to be dispatched.
