@@ -132,8 +132,6 @@ machines:
   runner: claude
 ```
 
-<br />
-
 Rationale: every dev has their own machines and workspace names. The shared \`project.yaml\` is what gets committed; the local \`local.yaml\` is per-user.
 
 ### 4. Tasks stay user-local
