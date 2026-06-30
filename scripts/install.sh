@@ -15,6 +15,36 @@ set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 INSTALL_PATH="${SHELBI_INSTALL_PATH:-$HOME/bin/shelbi}"
 
+# Parse flags. The only one we care about is --no-daemon, which skips the
+# `shelbi daemon install` step at the end (useful in CI, containers, or
+# anywhere the user wants to drive the daemon manually).
+install_daemon=1
+for arg in "$@"; do
+  case "$arg" in
+    --no-daemon) install_daemon=0 ;;
+    -h|--help)
+      cat <<'USAGE'
+Usage: scripts/install.sh [--no-daemon]
+
+Builds shelbi in release mode and installs it to $SHELBI_INSTALL_PATH
+(default: $HOME/bin/shelbi). After installing the binary, registers the
+hub daemon with the platform supervisor (launchd on macOS, systemd --user
+on Linux) so it auto-starts at login and is restarted on crash.
+
+Options:
+  --no-daemon   Skip `shelbi daemon install` at the end.
+  -h, --help    Show this message.
+USAGE
+      exit 0
+      ;;
+    *)
+      echo "error: unknown argument: $arg" >&2
+      echo "       run \`$0 --help\` for usage." >&2
+      exit 1
+      ;;
+  esac
+done
+
 cd "$REPO_ROOT"
 
 # ----------------------------------------------------------------------------
@@ -84,3 +114,29 @@ if [[ "$(uname -s)" == "Darwin" ]]; then
 fi
 
 echo "==> $("$INSTALL_PATH" --version)"
+
+# ----------------------------------------------------------------------------
+# Register the hub daemon with the platform supervisor so it auto-starts at
+# login and is restarted on crash. Skipped when --no-daemon was passed, or
+# on platforms `shelbi daemon install` knows it can't handle (it emits its
+# own warning and exits 0 in that case).
+
+if [[ $install_daemon -eq 1 ]]; then
+  echo
+  echo "==> registering daemon with platform supervisor"
+  "$INSTALL_PATH" daemon install
+
+  if [[ "$(uname -s)" == "Linux" ]] && [[ -z "${DISPLAY:-}" ]] && [[ -z "${WAYLAND_DISPLAY:-}" ]]; then
+    cat <<'LINGER'
+
+  note: this looks like a headless Linux box. The systemd --user service
+  stops when you log out unless lingering is enabled for the user. Run
+  this once (requires sudo — system-wide change, so this install script
+  does not do it for you):
+
+    sudo loginctl enable-linger "$USER"
+
+  Once lingering is on, the daemon survives logout and reboots.
+LINGER
+  fi
+fi

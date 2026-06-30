@@ -156,10 +156,15 @@ enum Cmd {
     },
     /// Run the hub-side daemon that listens on `~/.shelbi/hub.sock`
     /// (overridable via `$SHELBI_HUB_SOCK`) for worker messages and
-    /// appends `event`-verb payloads to `~/.shelbi/events.log`.
-    /// Foreground entry point — meant to be supervised by launchd /
-    /// systemd, but runnable directly for development and smoke tests.
-    Daemon,
+    /// appends `event`-verb payloads to `~/.shelbi/events.log`. Bare
+    /// `shelbi daemon` (no subcommand) is the foreground entry that
+    /// launchd/systemd call into. The `install`/`uninstall`/`status`/
+    /// `restart` subcommands manage that platform supervisor on the
+    /// user's behalf.
+    Daemon {
+        #[command(subcommand)]
+        cmd: Option<commands::daemon::DaemonCmd>,
+    },
     /// Check a task's branch into the machine's review work_dir and
     /// (re)launch a fresh review-claude pane there.
     Review(commands::review::Args),
@@ -274,7 +279,7 @@ fn main() -> Result<()> {
         Some(Cmd::Project { cmd }) => commands::project::run(cmd),
         Some(Cmd::Config { cmd }) => commands::config::run(cli.project, cmd),
         Some(Cmd::Events { cmd }) => commands::events::run(cmd),
-        Some(Cmd::Daemon) => commands::daemon::run(),
+        Some(Cmd::Daemon { cmd }) => commands::daemon::run(cmd),
         Some(Cmd::Zen { cmd }) => commands::zen::run(cli.project, cmd),
         Some(Cmd::Action { cmd }) => commands::action::run(cli.project, cmd),
         Some(Cmd::Review(args)) => commands::review::run(cli.project, args),
