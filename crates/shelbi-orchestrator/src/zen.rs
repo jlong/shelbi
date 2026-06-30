@@ -31,6 +31,7 @@ use shelbi_core::{
 use crate::git::{
     compose_pr_body, head_commit_subject, locate_hub_workdir, locate_workspace_worktree,
     login_shell_prefix, lookup_open_pr, parse_pr_number_from_url, run_in_dir,
+    run_login_shell_script,
 };
 use crate::workspace::{rebase_workspace_branch_onto_default, workspace_worktree, RebaseOutcome};
 
@@ -658,8 +659,7 @@ fn run_one_check(host: &Host, worktree: &std::path::Path, cmd: &str) -> LocalChe
 /// terminal — see [`login_shell_prefix`] for the host-specific shell
 /// resolution.
 fn run_check_script(host: &Host, script: &str) -> std::io::Result<Output> {
-    let (shell, flag) = login_shell_prefix(host);
-    shelbi_ssh::run(host, [shell.as_str(), flag, script])
+    run_login_shell_script(host, script)
 }
 
 /// If the check exited 127 (POSIX "command not found"), append a shelbi
