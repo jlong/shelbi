@@ -346,7 +346,7 @@ pub fn append_dispatch_event(
 }
 
 /// Append `<rfc3339> workspace=<name> pane_alive=<bool> reason=<short>` to
-/// `~/.shelbi/events.log`. Emitted by the `shelbi workspace open --as-pane`
+/// `~/.shelbi/events.log`. Emitted by the `shelbi open --as-pane`
 /// wrapper when its agent subprocess exits (any reason — clean exit,
 /// signal, tmux teardown) so the orchestrator's reaction rules can fire
 /// on a pane death.

@@ -85,6 +85,29 @@ enum Cmd {
     /// `shelbi workspace stop <name>` to release the slot's in-flight task
     /// instead.
     Archive { id: String },
+    /// Focus the workspace's tmux pane, creating it (with the agent
+    /// running) if it doesn't exist yet. Single entry point for both
+    /// the sidebar click-to-focus path and the dispatch path — the
+    /// "exists?" check lives here so callers don't have to branch on it.
+    ///
+    /// For LOCAL workspaces, an empty pane is created with this same
+    /// command re-entered under `--as-pane` (the wrapper that owns the
+    /// agent subprocess and emits a `pane_alive=false` event on exit).
+    ///
+    /// For REMOTE workspaces, the pane is a proxy window that
+    /// `ssh -t … tmux attach -t shelbi-w-<name>` into the workspace's
+    /// own remote tmux session — the lifecycle wrapper isn't deployed
+    /// to remote machines.
+    Open {
+        /// Name of the workspace to open.
+        name: String,
+        /// Internal re-entry flag. When set, this process *is* the
+        /// pane's top-level command: it fork+execs the agent runner,
+        /// waits, and emits the `pane_alive=false` event on any exit
+        /// path (including SIGHUP/SIGTERM/SIGINT). Not for direct use.
+        #[arg(long, hide = true)]
+        as_pane: bool,
+    },
     /// Manage the project's Kanban task board.
     Task {
         #[command(subcommand)]
@@ -233,6 +256,7 @@ fn main() -> Result<()> {
         Some(Cmd::Diff { id }) => commands::diff::run(cli.project, id),
         Some(Cmd::Merge { id, pr }) => commands::merge::run(cli.project, id, pr),
         Some(Cmd::Archive { id }) => commands::archive::run(cli.project, id),
+        Some(Cmd::Open { name, as_pane }) => commands::open::run(cli.project, name, as_pane),
         Some(Cmd::Task { cmd }) => commands::task::run(cli.project, cmd),
         Some(Cmd::Workspace { cmd }) => commands::workspace::run(cli.project, cmd),
         Some(Cmd::Worker { cmd }) => {
@@ -473,26 +497,22 @@ mod cli_tests {
         }
     }
 
-    /// `shelbi workspace open <name>` is the focus-or-create entry point
+    /// `shelbi open <name>` is the top-level focus-or-create entry point
     /// used by the sidebar's Enter handler and the dispatch path. The
     /// `--as-pane` re-entry flag is hidden from `--help` but still
     /// parseable so the wrapper-spawn line from focus_or_create lands.
     #[test]
-    fn workspace_open_parses_with_and_without_as_pane() {
-        let plain = Cli::parse_from(["shelbi", "workspace", "open", "alpha"]);
+    fn open_parses_with_and_without_as_pane() {
+        let plain = Cli::parse_from(["shelbi", "open", "alpha"]);
         match plain.cmd {
-            Some(Cmd::Workspace {
-                cmd: WorkspaceCmd::Open { ref name, as_pane },
-            }) if name == "alpha" && !as_pane => {}
+            Some(Cmd::Open { ref name, as_pane }) if name == "alpha" && !as_pane => {}
             other => panic!("expected Open {{ alpha, as_pane=false }}, got {other:?}"),
         }
 
         let wrapped =
-            Cli::parse_from(["shelbi", "workspace", "open", "delta", "--as-pane"]);
+            Cli::parse_from(["shelbi", "open", "delta", "--as-pane"]);
         match wrapped.cmd {
-            Some(Cmd::Workspace {
-                cmd: WorkspaceCmd::Open { ref name, as_pane },
-            }) if name == "delta" && as_pane => {}
+            Some(Cmd::Open { ref name, as_pane }) if name == "delta" && as_pane => {}
             other => panic!("expected Open {{ delta, as_pane=true }}, got {other:?}"),
         }
     }

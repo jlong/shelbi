@@ -1,4 +1,4 @@
-//! `shelbi workspace open <name> --as-pane` — the lifecycle wrapper that
+//! `shelbi open <name> --as-pane` — the lifecycle wrapper that
 //! becomes a workspace pane's top-level process. It owns the agent
 //! subprocess, installs signal handlers so tmux teardown / kill-window /
 //! Ctrl-C all flow through the same exit path, and writes a
@@ -30,7 +30,7 @@ use shelbi_orchestrator::workspace as orch_workspace;
 /// `start_workspace_on_task` use the exact same string and can't drift.
 pub fn wrapper_invocation(shelbi_bin: &str, project: &str, workspace: &str) -> String {
     format!(
-        "{bin} --project {proj} workspace open {ws} --as-pane",
+        "{bin} --project {proj} open {ws} --as-pane",
         bin = shelbi_agent::shell_escape(shelbi_bin),
         proj = shelbi_agent::shell_escape(project),
         ws = shelbi_agent::shell_escape(workspace),
@@ -59,7 +59,7 @@ pub fn run(project: &Project, workspace: &WorkspaceSpec, machine: &Machine) -> R
 
     // Conditional --append-system-prompt: only when the agent context has
     // been deployed (which task start does) and we're launching claude.
-    // Bare `workspace open` from sidebar click on a workspace that's
+    // Bare `shelbi open` from sidebar click on a workspace that's
     // never run a task yet won't have the file — no flag in that case.
     let has_agent_instructions = worktree
         .join(orch_workspace::WORKTREE_AGENT_INSTRUCTIONS_REL)
@@ -243,7 +243,7 @@ mod tests {
         // name containing a space would split across the argv.
         let s = wrapper_invocation("/usr/local/bin/shelbi", "my project", "alpha");
         assert!(s.contains("--project 'my project'"), "got: {s}");
-        assert!(s.contains("workspace open alpha --as-pane"), "got: {s}");
+        assert!(s.contains("open alpha --as-pane"), "got: {s}");
     }
 
     #[test]
@@ -252,7 +252,7 @@ mod tests {
         // (plus `-_./:=`) tokens unquoted so the rendered command is
         // readable in `ps` / pane captures.
         let s = wrapper_invocation("shelbi", "demo", "bravo");
-        assert_eq!(s, "shelbi --project demo workspace open bravo --as-pane");
+        assert_eq!(s, "shelbi --project demo open bravo --as-pane");
     }
 
     #[test]

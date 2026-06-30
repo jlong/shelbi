@@ -526,7 +526,7 @@ pub fn start_workspace_on_task(spec: StartSpec<'_>) -> Result<TmuxAddr> {
 
     // 4 + 5. Create the pane and launch the agent.
     //
-    // Local: the pane's top-level process is the `shelbi workspace open
+    // Local: the pane's top-level process is the `shelbi open
     //   <name> --as-pane` lifecycle wrapper. The wrapper cd's into the
     //   worktree, execs the agent, waits for it, and writes a
     //   `pane_alive=false reason=<…>` line to events.log on any exit
@@ -556,7 +556,7 @@ pub fn start_workspace_on_task(spec: StartSpec<'_>) -> Result<TmuxAddr> {
         Host::Local => {
             let shelbi_bin = current_exe_string()?;
             let pane_cmd = format!(
-                "{bin} --project {proj} workspace open {ws} --as-pane",
+                "{bin} --project {proj} open {ws} --as-pane",
                 bin = shelbi_agent::shell_escape(&shelbi_bin),
                 proj = shelbi_agent::shell_escape(&spec.project.name),
                 ws = shelbi_agent::shell_escape(&spec.workspace.name),

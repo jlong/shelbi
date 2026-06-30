@@ -165,7 +165,7 @@ pub fn show_view(project_name: &str, view: &str) -> Result<()> {
 /// Focus the dashboard window on the declared workspace's pane,
 /// lazily creating it if it doesn't exist yet.
 ///
-/// Delegates to `shelbi workspace open <name>` so the focus-or-create
+/// Delegates to `shelbi open <name>` so the focus-or-create
 /// decision lives in exactly one place. That CLI subcommand owns the
 /// lifecycle wrapper that wraps local workspace panes (so a worker
 /// dying writes a `pane_alive=false` event to `~/.shelbi/events.log`)
@@ -180,7 +180,6 @@ pub fn focus_workspace(project_name: &str, workspace_name: &str) -> Result<()> {
         .args([
             "--project",
             project_name,
-            "workspace",
             "open",
             workspace_name,
         ])
@@ -196,7 +195,7 @@ pub fn focus_workspace(project_name: &str, workspace_name: &str) -> Result<()> {
             stderr
         };
         return Err(Error::Other(format!(
-            "shelbi workspace open `{workspace_name}` failed: {detail}"
+            "shelbi open `{workspace_name}` failed: {detail}"
         )));
     }
     Ok(())
