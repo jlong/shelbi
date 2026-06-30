@@ -20,8 +20,9 @@ shelbi
 
 With a single project configured, `shelbi` launches its TUI
 directly. With more than one, you get a fuzzy picker — type to filter,
-Enter to launch. Inside a repo with a `.shelbi/project` marker, that
-project always wins.
+Enter to launch. Inside a registered project's `work_dir`, that
+project always wins (Shelbi resolves by reverse-lookup against
+`~/.shelbi/projects/*.yaml`).
 
 You can also target a project by name:
 
@@ -126,7 +127,7 @@ free workspace in YAML declaration order (honoring `prefers_machine` if
 set), and runs:
 
 ```bash
-shelbi task start fix-login-bug-on-safari --worker delta
+shelbi task start fix-login-bug-on-safari --workspace delta
 ```
 
 That moves the card to **In Progress**, creates the branch

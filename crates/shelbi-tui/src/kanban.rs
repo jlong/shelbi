@@ -32,7 +32,7 @@ use shelbi_core::{
     Workflow, DEFAULT_WORKFLOW_NAME,
 };
 use shelbi_state::keymap::{DisplayStyle, KanbanAction, Keymaps, PopoverAction};
-use shelbi_state::TaskFile;
+use shelbi_state::{KanbanColumnOverride, TaskFile};
 
 use crate::keymap::format_chord_or_unbound;
 
@@ -133,6 +133,57 @@ pub struct KanbanApp {
     pub keymaps: Keymaps,
     /// Cached host-platform chord-display convention.
     pub display_style: DisplayStyle,
+    /// Screen-space rects for the header band of each visible column.
+    /// Used by the mouse handler to toggle collapsed/expanded state on
+    /// a click. Re-written each render call by [`render_columns`].
+    pub header_hits: Vec<HeaderHit>,
+    /// Explicit user overrides on column collapse state, keyed by
+    /// (workflow_name, status_id). Columns with no entry render in
+    /// `Auto` mode — empty collapses, non-empty expands. Loaded on
+    /// every [`refresh`] and rewritten through
+    /// [`shelbi_state::set_kanban_column_override`] whenever a user
+    /// click toggles a column. The workflow scope is the task's
+    /// `workflow_or_default()` so a `review` column shared by two
+    /// workflows can carry independent overrides per workflow view.
+    pub column_overrides: std::collections::BTreeMap<String, KanbanColumnOverride>,
+}
+
+/// One rendered column header's screen-space rectangle plus the index
+/// of the column it covers. Captured each frame by the column renderer
+/// so a click on either the horizontal banner of an expanded column
+/// or the rotated label of a collapsed one routes to the same toggle.
+#[derive(Clone, Copy, Debug)]
+pub struct HeaderHit {
+    pub area: Rect,
+    pub col_idx: usize,
+}
+
+/// Resolved collapse state for one column on a given frame. Combines
+/// the three logical states a column can be in:
+///
+/// - **Auto** — no user override; non-empty columns expand, empty
+///   columns collapse.
+/// - **Explicit collapsed** — user clicked to collapse; respected
+///   regardless of count.
+/// - **Explicit expanded** — user clicked to expand; respected
+///   regardless of count.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ColumnExpansion {
+    Auto,
+    Collapsed,
+    Expanded,
+}
+
+impl ColumnExpansion {
+    /// True when the column should render in the rotated single-char
+    /// strip instead of the full horizontal layout.
+    pub fn is_collapsed(self, task_count: usize) -> bool {
+        match self {
+            ColumnExpansion::Collapsed => true,
+            ColumnExpansion::Expanded => false,
+            ColumnExpansion::Auto => task_count == 0,
+        }
+    }
 }
 
 /// Workspace filter applied to the visible cards. Separate from the
@@ -324,6 +375,8 @@ impl KanbanApp {
             visible_columns: 0..0,
             keymaps: Keymaps::default(),
             display_style: DisplayStyle::detect(),
+            header_hits: Vec::new(),
+            column_overrides: std::collections::BTreeMap::new(),
         }
     }
 
@@ -349,6 +402,80 @@ impl KanbanApp {
             let in_y = y >= r.y && y < r.y.saturating_add(r.height);
             (in_x && in_y).then_some((hit.col_idx, hit.row_idx))
         })
+    }
+
+    /// Hit-test a screen coordinate against the most recently rendered
+    /// column headers. Returns the column index whose header band
+    /// (horizontal banner of an expanded column or the rotated label /
+    /// count strip of a collapsed one) covers the point. Used by the
+    /// mouse handler to route a header click to the collapse toggle.
+    pub fn header_at(&self, x: u16, y: u16) -> Option<usize> {
+        self.header_hits.iter().find_map(|hit| {
+            let r = hit.area;
+            let in_x = x >= r.x && x < r.x.saturating_add(r.width);
+            let in_y = y >= r.y && y < r.y.saturating_add(r.height);
+            (in_x && in_y).then_some(hit.col_idx)
+        })
+    }
+
+    /// Persistence-key scope for a column override. Combines the column's
+    /// owning view (the active workflow filter, or `default` when no filter
+    /// is active) with the column's `status_id` so a `review` column in two
+    /// different workflows tracks its expansion state independently.
+    fn override_key_for(&self, col_idx: usize) -> Option<String> {
+        let col = self.all_columns.get(col_idx)?;
+        let workflow = self.workflow_filter.as_deref().unwrap_or("default");
+        Some(shelbi_state::kanban_column_override_key(workflow, &col.status_id))
+    }
+
+    /// Resolved collapse state for column slot `col_idx`. Explicit
+    /// overrides win; an absent override resolves to `Auto` (the
+    /// renderer collapses on empty / expands otherwise).
+    pub fn column_expansion(&self, col_idx: usize) -> ColumnExpansion {
+        match self.override_key_for(col_idx).and_then(|k| self.column_overrides.get(&k)) {
+            Some(KanbanColumnOverride::Collapsed) => ColumnExpansion::Collapsed,
+            Some(KanbanColumnOverride::Expanded) => ColumnExpansion::Expanded,
+            None => ColumnExpansion::Auto,
+        }
+    }
+
+    /// Whether column slot `col_idx` should render in its collapsed
+    /// (rotated-label) form on the current frame. Resolves the
+    /// auto-default by consulting the column's task count.
+    pub fn is_column_collapsed(&self, col_idx: usize) -> bool {
+        let count = self.column_tasks(col_idx).len();
+        self.column_expansion(col_idx).is_collapsed(count)
+    }
+
+    /// Flip column slot `col_idx` between collapsed and expanded. The
+    /// override that lands on disk is the OPPOSITE of the column's
+    /// currently-rendered state — so clicking an empty column (auto →
+    /// collapsed) sets the explicit-expanded override, and clicking
+    /// a non-empty column (auto → expanded) sets the explicit-collapsed
+    /// override. Subsequent clicks alternate between the two explicit
+    /// states; the column never silently slides back to `Auto`. Best-
+    /// effort on the disk write — view state shouldn't block the UI on
+    /// a transient FS error.
+    pub fn toggle_column(&mut self, col_idx: usize) {
+        let Some(key) = self.override_key_for(col_idx) else {
+            return;
+        };
+        let new_state = if self.is_column_collapsed(col_idx) {
+            KanbanColumnOverride::Expanded
+        } else {
+            KanbanColumnOverride::Collapsed
+        };
+        self.column_overrides.insert(key.clone(), new_state);
+        let col = self.all_columns[col_idx].clone();
+        let workflow = self.workflow_filter.clone().unwrap_or_else(|| "default".to_string());
+        if let Err(e) = shelbi_state::set_kanban_column_override(
+            &self.project_name,
+            &workflow,
+            &col.status_id,
+            Some(new_state),
+        ) {
+            self.status_line = format!("column override persist failed: {e}");
+        }
     }
 
     /// Move selection to the given card and open its popover. Used by the
@@ -532,6 +659,10 @@ impl KanbanApp {
             .as_ref()
             .and_then(|s| s.workspace_filter.clone())
             .map(|s| WorkspaceFilter::from_disk(&s));
+        self.column_overrides = state_snapshot
+            .as_ref()
+            .map(|s| s.kanban_column_overrides.clone())
+            .unwrap_or_default();
         // Workflows are still loaded — per-task overlays and the move
         // semantics need them — but they no longer drive the column
         // layout. A broken `workflows/<name>.yaml` surfaces as a
@@ -903,12 +1034,12 @@ impl KanbanApp {
         // selected column fits inside the window the layout pass will
         // build. `compute_column_widths` is the source of truth for
         // which columns fit, so we drive the loop with it.
-        let counts: Vec<usize> = (0..self.all_columns.len())
-            .map(|i| self.column_tasks(i).len())
+        let collapsed: Vec<bool> = (0..self.all_columns.len())
+            .map(|i| self.is_column_collapsed(i))
             .collect();
         loop {
             let widths =
-                compute_column_widths(&self.all_columns, &counts, self.column_scroll, area_w);
+                compute_column_widths(&self.all_columns, &collapsed, self.column_scroll, area_w);
             let last_visible = widths.last().map(|(i, _)| *i);
             match last_visible {
                 Some(idx) if sel <= idx => break,
@@ -1352,12 +1483,19 @@ fn render_columns(f: &mut Frame, app: &mut KanbanApp, hits: &mut Vec<CardHit>, a
         // Nothing to render — typically a stale workflow_filter that
         // doesn't match any loaded workflow. The compute_all_columns
         // fallback should keep us out of this branch in practice.
+        // Clear stale header hits so clicks can't route into the
+        // previous frame's now-vanished columns.
+        app.header_hits.clear();
         return;
     }
     let counts: Vec<usize> = (0..app.all_columns.len())
         .map(|i| app.column_tasks(i).len())
         .collect();
-    let widths = compute_column_widths(&app.all_columns, &counts, app.column_scroll, area.width);
+    let collapsed_states: Vec<bool> = (0..app.all_columns.len())
+        .map(|i| app.is_column_collapsed(i))
+        .collect();
+    let widths =
+        compute_column_widths(&app.all_columns, &collapsed_states, app.column_scroll, area.width);
     let visible_start = app.column_scroll;
     let visible_end = visible_start + widths.len();
 
@@ -1366,6 +1504,7 @@ fn render_columns(f: &mut Frame, app: &mut KanbanApp, hits: &mut Vec<CardHit>, a
     // actually mix workflows in a single column — i.e. multiple
     // workflows are loaded AND no filter narrows the view to one.
     let show_card_workflow_label = app.workflows.len() > 1 && app.workflow_filter.is_none();
+    let mut header_hits: Vec<HeaderHit> = Vec::with_capacity(widths.len());
     let mut x = area.x;
     for (i, w) in widths.iter().copied() {
         let slot = Rect {
@@ -1374,19 +1513,25 @@ fn render_columns(f: &mut Frame, app: &mut KanbanApp, hits: &mut Vec<CardHit>, a
             width: w,
             height: area.height,
         };
-        let collapsed = counts.get(i).copied().unwrap_or(0) == 0;
-        render_column(
-            f,
-            app,
-            i,
-            slot,
-            &columns,
-            hits,
-            show_card_workflow_label,
-            collapsed,
-        );
+        let is_collapsed = collapsed_states.get(i).copied().unwrap_or(false);
+        let count = counts.get(i).copied().unwrap_or(0);
+        if is_collapsed {
+            render_collapsed_column(f, app, i, slot, count, &mut header_hits);
+        } else {
+            render_column(
+                f,
+                app,
+                i,
+                slot,
+                &columns,
+                hits,
+                show_card_workflow_label,
+                &mut header_hits,
+            );
+        }
         x = x.saturating_add(w);
     }
+    app.header_hits = header_hits;
 
     // Tiny horizontal-scroll indicators painted in the topmost row of
     // the columns area when the board can't fit everything at minimum
@@ -1422,14 +1567,17 @@ fn render_columns(f: &mut Frame, app: &mut KanbanApp, hits: &mut Vec<CardHit>, a
     app.visible_columns = visible_start..visible_end;
 }
 
-/// Minimum width for a non-empty column — enough to fit the canonical
+/// Minimum width for an expanded column — enough to fit the canonical
 /// `IN PROGRESS (NN)` header without clipping plus the 2-char right
 /// gutter cards rely on.
-const NONEMPTY_MIN_W: u16 = 14;
-/// Minimum width for a collapsed (empty) column — wide enough for the
-/// status label's first few letters plus the `(0)` count, so the user
-/// can still tell what each lane is.
-const EMPTY_MIN_W: u16 = 8;
+const EXPANDED_MIN_W: u16 = 14;
+/// Minimum (and only) width for a collapsed column — one cell for the
+/// rotated label glyph plus one cell of breathing room either side.
+const COLLAPSED_MIN_W: u16 = 3;
+/// Back-compat alias retained so existing tests reference the old name
+/// for the non-collapsed minimum. Same value as [`EXPANDED_MIN_W`].
+#[cfg(test)]
+const NONEMPTY_MIN_W: u16 = EXPANDED_MIN_W;
 
 /// Lay out `[scroll, scroll + k)` of `columns` into `area_w` columns of
 /// terminal cells. Returns `(col_idx, width)` pairs in render order.
@@ -1437,19 +1585,23 @@ const EMPTY_MIN_W: u16 = 8;
 /// Two-pass algorithm:
 ///
 /// 1. **Fit pass** — walk forward from `scroll`, assigning each column
-///    its minimum width (empty → `EMPTY_MIN_W`, non-empty →
-///    `NONEMPTY_MIN_W`). Stop as soon as adding the next column would
-///    push past `area_w`.
+///    its minimum width (collapsed → [`COLLAPSED_MIN_W`], expanded →
+///    [`EXPANDED_MIN_W`]). Stop as soon as adding the next column
+///    would push past `area_w`.
 ///
 /// 2. **Expand pass** — divide whatever slack remains among the
-///    non-empty visible columns. Empty columns stay at the minimum so
-///    they don't reclaim space the user said is "uninteresting".
+///    expanded visible columns. Collapsed columns stay at the minimum
+///    so they don't reclaim space the user said is "uninteresting".
 ///
 /// At least one column always renders, even if it doesn't reach its
 /// minimum — better to clip than to paint nothing at all.
+///
+/// `collapsed` is a parallel slice to `columns`/`counts`: index `i`
+/// holds the resolved collapsed-or-not state for that column (see
+/// [`ColumnExpansion::is_collapsed`]).
 fn compute_column_widths(
     columns: &[KanbanColumn],
-    counts: &[usize],
+    collapsed: &[bool],
     scroll: usize,
     area_w: u16,
 ) -> Vec<(usize, u16)> {
@@ -1460,17 +1612,17 @@ fn compute_column_widths(
     let start = scroll.min(columns.len().saturating_sub(1));
     let mut used: u16 = 0;
     for i in start..columns.len() {
-        let min_w = if counts.get(i).copied().unwrap_or(0) == 0 {
-            EMPTY_MIN_W
+        let min_w = if collapsed.get(i).copied().unwrap_or(false) {
+            COLLAPSED_MIN_W
         } else {
-            NONEMPTY_MIN_W
+            EXPANDED_MIN_W
         };
         let next_used = used.saturating_add(min_w);
         if next_used > area_w {
             if out.is_empty() {
                 // Render at least one column even if it overflows —
-                // empty board with `area_w < EMPTY_MIN_W` only happens
-                // in tiny test terminals.
+                // empty board with `area_w < COLLAPSED_MIN_W` only
+                // happens in tiny test terminals.
                 out.push((i, area_w));
                 used = area_w;
             }
@@ -1479,21 +1631,21 @@ fn compute_column_widths(
         out.push((i, min_w));
         used = next_used;
     }
-    // Expand pass: hand slack to non-empty columns.
+    // Expand pass: hand slack to expanded columns.
     let slack = area_w.saturating_sub(used);
-    let non_empty_positions: Vec<usize> = out
+    let expanded_positions: Vec<usize> = out
         .iter()
         .enumerate()
-        .filter(|(_, (idx, _))| counts.get(*idx).copied().unwrap_or(0) > 0)
+        .filter(|(_, (idx, _))| !collapsed.get(*idx).copied().unwrap_or(false))
         .map(|(pos, _)| pos)
         .collect();
-    let grow_targets = if non_empty_positions.is_empty() {
-        // Nothing is non-empty in the visible window — share the slack
+    let grow_targets = if expanded_positions.is_empty() {
+        // Nothing is expanded in the visible window — share the slack
         // across every visible column so we don't leave a gap on the
         // right.
         (0..out.len()).collect::<Vec<_>>()
     } else {
-        non_empty_positions
+        expanded_positions
     };
     if !grow_targets.is_empty() && slack > 0 {
         let n = grow_targets.len() as u16;
@@ -1508,6 +1660,109 @@ fn compute_column_widths(
     out
 }
 
+/// Render a column in its collapsed (rotated-label) form. The label
+/// fills one cell per character, with a blank row preserved for each
+/// space in the status name; `(<count>)` sits below the label after a
+/// one-row gap. The whole label-plus-count block is centred vertically
+/// in `area` so very tall terminals don't strand the strip at the top.
+///
+/// The full `area` (header band + the cells below it) is registered as
+/// the column's header hit-rect so clicking anywhere on the strip
+/// toggles back to the expanded view — there's nothing else to click
+/// in a collapsed column.
+fn render_collapsed_column(
+    f: &mut Frame,
+    app: &KanbanApp,
+    col_idx: usize,
+    area: Rect,
+    count: usize,
+    header_hits: &mut Vec<HeaderHit>,
+) {
+    let column = app.column(col_idx).clone();
+    let focused = col_idx == app.selected_column;
+    let header_color = category_color(column.category);
+    let label_style = if focused {
+        Style::default()
+            .fg(header_color)
+            .add_modifier(Modifier::BOLD | Modifier::UNDERLINED)
+    } else {
+        Style::default().fg(header_color).add_modifier(Modifier::BOLD)
+    };
+
+    // Whole column area routes clicks to the toggle — there's nothing
+    // else to interact with in this strip.
+    header_hits.push(HeaderHit { area, col_idx });
+
+    if area.height == 0 || area.width == 0 {
+        return;
+    }
+
+    let label = column_label(&column.status_name);
+    let label_chars: Vec<char> = label.chars().collect();
+    let count_text = format!("({count})");
+    let count_w = count_text.chars().count() as u16;
+
+    // Total height occupied by the label rows + a 1-row gap +
+    // count row. Clamp to area.height so a tiny terminal still
+    // paints something.
+    let label_rows = label_chars.len() as u16;
+    let block_h = label_rows.saturating_add(1).saturating_add(1).min(area.height);
+    let top = area
+        .y
+        .saturating_add(area.height.saturating_sub(block_h) / 2);
+    // Horizontal center inside the column slot.
+    let glyph_x = area.x.saturating_add(area.width / 2);
+
+    for (i, ch) in label_chars.iter().enumerate() {
+        let row = top.saturating_add(i as u16);
+        if row >= area.y.saturating_add(area.height) {
+            break;
+        }
+        if *ch == ' ' {
+            // Spaces in the status name render as blank rows so the
+            // word break is visible.
+            continue;
+        }
+        let cell = Rect {
+            x: glyph_x,
+            y: row,
+            width: 1,
+            height: 1,
+        };
+        f.render_widget(
+            Paragraph::new(Line::from(Span::styled(ch.to_string(), label_style))),
+            cell,
+        );
+    }
+
+    // Count line sits one blank row below the last label character.
+    let count_y = top.saturating_add(label_rows).saturating_add(1);
+    let count_bottom = area.y.saturating_add(area.height);
+    if count_y < count_bottom {
+        // Center the `(N)` horizontally inside the column slot. When
+        // the slot is narrower than the count text, anchor left so the
+        // leading paren is the first thing the user sees.
+        let count_x = if area.width > count_w {
+            area.x.saturating_add((area.width - count_w) / 2)
+        } else {
+            area.x
+        };
+        let count_rect = Rect {
+            x: count_x,
+            y: count_y,
+            width: area.width.saturating_sub(count_x - area.x).min(count_w),
+            height: 1,
+        };
+        f.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                count_text,
+                Style::default().fg(Color::DarkGray),
+            ))),
+            count_rect,
+        );
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn render_column(
     f: &mut Frame,
@@ -1517,7 +1772,7 @@ fn render_column(
     columns: &HashMap<String, Column>,
     hits: &mut Vec<CardHit>,
     show_card_workflow_label: bool,
-    collapsed: bool,
+    header_hits: &mut Vec<HeaderHit>,
 ) {
     let column = app.column(col_idx).clone();
     let tasks = app.column_tasks(col_idx);
@@ -1531,14 +1786,7 @@ fn render_column(
     } else {
         Style::default().fg(header_color)
     };
-    // Collapsed columns truncate the canonical label hard so the
-    // narrow slot can still tell the user which lane it is. Non-empty
-    // columns get the full label.
-    let header_text = if collapsed {
-        truncate(&column_label(&column.status_name), area.width.saturating_sub(4) as usize)
-    } else {
-        column_label(&column.status_name)
-    };
+    let header_text = column_label(&column.status_name);
     let title_line = Line::from(vec![
         Span::styled(header_text, header_style),
         Span::styled(
@@ -1557,6 +1805,7 @@ fn render_column(
     let header_area = chunks[0];
     let list_area = chunks[1];
     f.render_widget(Paragraph::new(title_line), header_area);
+    header_hits.push(HeaderHit { area: header_area, col_idx });
 
     // Reserve a 2-char right gutter so adjacent cells don't visually
     // collide; List doesn't clip Line spans on its own.
@@ -3597,19 +3846,17 @@ mod tests {
     #[test]
     fn compute_column_widths_collapses_empty_and_grows_non_empty() {
         let cols = kanban_columns_from(&default_project_statuses(), None);
-        // 5 empty columns, 1 non-empty.
-        let counts = vec![0, 0, 3, 0, 0, 0];
-        let widths = compute_column_widths(&cols, &counts, 0, 100);
+        // 5 collapsed columns, 1 expanded.
+        let collapsed = vec![true, true, false, true, true, true];
+        let widths = compute_column_widths(&cols, &collapsed, 0, 100);
         assert_eq!(widths.len(), 6);
-        // Empty columns sit at EMPTY_MIN_W exactly; non-empty consumes
-        // the rest.
         for (i, w) in &widths {
-            if counts[*i] == 0 {
-                assert_eq!(*w, EMPTY_MIN_W, "empty column {i} should stay at min");
+            if collapsed[*i] {
+                assert_eq!(*w, COLLAPSED_MIN_W, "collapsed column {i} should stay at min");
             } else {
                 assert!(
                     *w > NONEMPTY_MIN_W,
-                    "non-empty column {i} should grow beyond min, got {w}"
+                    "expanded column {i} should grow beyond min, got {w}"
                 );
             }
         }
@@ -3635,14 +3882,14 @@ mod tests {
                 .collect(),
         };
         let cols = kanban_columns_from(&ps, None);
-        let counts = vec![1; cols.len()];
+        let collapsed = vec![false; cols.len()];
 
-        let widths = compute_column_widths(&cols, &counts, 0, 80);
+        let widths = compute_column_widths(&cols, &collapsed, 0, 80);
         assert!(widths.len() < cols.len(), "should drop trailing cols");
         assert_eq!(widths[0].0, 0, "starts at scroll=0");
 
         // Scrolling reveals later columns at the cost of earlier ones.
-        let widths = compute_column_widths(&cols, &counts, 4, 80);
+        let widths = compute_column_widths(&cols, &collapsed, 4, 80);
         assert_eq!(widths[0].0, 4, "starts at scroll=4");
         assert!(
             widths.iter().map(|(_, w)| *w).sum::<u16>() <= 80,
@@ -3719,8 +3966,11 @@ mod tests {
     /// `ensure_selected_visible` advances `column_scroll` when the
     /// selection falls past the visible window, and pulls it back to
     /// the selection when scrolled too far right. Uses a synthesized
-    /// 10-status catalogue so the minimum width overflows the 60-cell
-    /// area we measure against.
+    /// 10-status catalogue and forces every column into the explicit
+    /// `Expanded` override so the minimum width (14 × 10 = 140)
+    /// overflows the 60-cell area we measure against — without the
+    /// overrides each empty column would auto-collapse to its
+    /// 3-cell strip and the whole row would fit.
     #[test]
     fn ensure_selected_visible_keeps_selection_in_view() {
         let ps = shelbi_core::ProjectStatuses {
@@ -3735,11 +3985,16 @@ mod tests {
         let mut app = KanbanApp::new("demo");
         app.project_statuses = ps;
         app.all_columns = kanban_columns_from(&app.project_statuses, None);
-        // Every column non-empty so they all want full width. Stuff a
-        // task into each by raw assignment — we're only exercising the
-        // scroll-window math, not the column bucketing.
-        app.tasks = (0..app.all_columns.len())
-            .map(|i| task_in_workflow(&format!("t{i}"), Column::Todo, None, "2026-06-20T10:00:00Z"))
+        // Force every synthesized column into the explicit-expanded
+        // state. Using `kanban_column_override_key` keeps this in
+        // lock-step with the production override path.
+        app.column_overrides = (0..app.all_columns.len())
+            .map(|i| {
+                (
+                    shelbi_state::kanban_column_override_key("default", &format!("s{i}")),
+                    KanbanColumnOverride::Expanded,
+                )
+            })
             .collect();
 
         // Select a column that won't fit at scroll=0 in 60 cells.
@@ -3937,6 +4192,227 @@ mod tests {
         assert_eq!(text.chars().count(), 20, "got: {text:?}");
         assert!(text.ends_with('…'), "should end with ellipsis: {text:?}");
         assert!(text.starts_with("feature-task"), "kept the leading workflow name: {text:?}");
+    }
+
+    // ---- column collapse / expand ----------------------------------------
+
+    /// `ColumnExpansion::Auto` defers to task count: empty collapses,
+    /// non-empty expands. Explicit states win regardless.
+    #[test]
+    fn column_expansion_auto_resolves_against_count() {
+        assert!(ColumnExpansion::Auto.is_collapsed(0));
+        assert!(!ColumnExpansion::Auto.is_collapsed(1));
+        assert!(ColumnExpansion::Collapsed.is_collapsed(0));
+        assert!(ColumnExpansion::Collapsed.is_collapsed(99));
+        assert!(!ColumnExpansion::Expanded.is_collapsed(0));
+        assert!(!ColumnExpansion::Expanded.is_collapsed(99));
+    }
+
+    /// A fresh KanbanApp has no overrides → every column resolves to
+    /// `Auto`. Empty columns are collapsed-by-rendering; non-empty
+    /// expand.
+    #[test]
+    fn fresh_app_columns_are_auto_and_collapse_on_empty() {
+        let mut app = KanbanApp::new("demo");
+        // Backlog (idx 0) is empty; Todo (idx 1) has one card.
+        app.tasks = vec![task_file("a", Column::Todo, 0, "2026-06-20T10:00:00Z")];
+        assert_eq!(app.column_expansion(0), ColumnExpansion::Auto);
+        assert!(app.is_column_collapsed(0), "empty Backlog auto-collapses");
+        assert!(!app.is_column_collapsed(1), "non-empty Todo auto-expands");
+    }
+
+    /// Clicking an empty (auto-collapsed) column promotes it to
+    /// `Explicit Expanded`; clicking again promotes it to `Explicit
+    /// Collapsed`. The state never silently slides back to `Auto` —
+    /// each click alternates between the two explicit states.
+    #[test]
+    fn toggle_column_alternates_explicit_states() {
+        let _g = crate::test_support::ENV_LOCK.lock().unwrap();
+        let home = std::env::temp_dir().join(format!(
+            "shelbi-tui-toggle-column-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&home).unwrap();
+        std::env::set_var("SHELBI_HOME", &home);
+
+        let mut app = KanbanApp::new("demo");
+        // Backlog (idx 0) starts empty → Auto → collapsed.
+        assert!(app.is_column_collapsed(0));
+        // Click → explicit expanded.
+        app.toggle_column(0);
+        assert_eq!(app.column_expansion(0), ColumnExpansion::Expanded);
+        assert!(!app.is_column_collapsed(0));
+        // Click again → explicit collapsed.
+        app.toggle_column(0);
+        assert_eq!(app.column_expansion(0), ColumnExpansion::Collapsed);
+        assert!(app.is_column_collapsed(0));
+
+        std::env::remove_var("SHELBI_HOME");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// An explicit-collapsed override on a non-empty column survives
+    /// a fresh KanbanApp (i.e. a shelbi restart): writing the override
+    /// through `toggle_column` then rebuilding the app and calling
+    /// `refresh` rehydrates the same state.
+    #[test]
+    fn explicit_overrides_persist_across_app_restart() {
+        let _g = crate::test_support::ENV_LOCK.lock().unwrap();
+        let home = std::env::temp_dir().join(format!(
+            "shelbi-tui-column-override-persist-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&home).unwrap();
+        std::env::set_var("SHELBI_HOME", &home);
+
+        // First app: collapse a non-empty column explicitly.
+        let mut app = KanbanApp::new("demo");
+        app.tasks = vec![task_file("a", Column::Todo, 0, "2026-06-20T10:00:00Z")];
+        assert!(!app.is_column_collapsed(1), "non-empty Todo expands by default");
+        app.toggle_column(1);
+        assert_eq!(app.column_expansion(1), ColumnExpansion::Collapsed);
+
+        // Second app: refresh hydrates the override from disk.
+        let mut app2 = KanbanApp::new("demo");
+        app2.refresh();
+        assert_eq!(
+            app2.column_expansion(1),
+            ColumnExpansion::Collapsed,
+            "explicit collapse must survive a fresh app",
+        );
+
+        std::env::remove_var("SHELBI_HOME");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// When a task lands in an explicitly-collapsed column the override
+    /// stays — only the `(N)` count surfaces the change. The
+    /// acceptance criterion: a non-empty + explicitly-collapsed column
+    /// must not auto-expand just because a card showed up.
+    #[test]
+    fn explicit_collapse_persists_when_tasks_arrive() {
+        let _g = crate::test_support::ENV_LOCK.lock().unwrap();
+        let home = std::env::temp_dir().join(format!(
+            "shelbi-tui-explicit-collapse-arrival-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&home).unwrap();
+        std::env::set_var("SHELBI_HOME", &home);
+
+        let mut app = KanbanApp::new("demo");
+        // Empty board → Backlog auto-collapses. Promote to explicit
+        // collapsed (one toggle goes auto→expanded, second goes to
+        // explicit collapsed).
+        app.toggle_column(0);
+        app.toggle_column(0);
+        assert_eq!(app.column_expansion(0), ColumnExpansion::Collapsed);
+
+        // Task lands in the column — override stands, count updates.
+        app.tasks = vec![task_file("a", Column::Backlog, 0, "2026-06-20T10:00:00Z")];
+        assert!(
+            app.is_column_collapsed(0),
+            "explicit-collapsed must persist after a task arrives",
+        );
+        assert_eq!(app.column_tasks(0).len(), 1, "count surfaces the new task");
+
+        std::env::remove_var("SHELBI_HOME");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// Full-frame render confirms a collapsed column paints its label
+    /// one character per row, preserves the space in `IN PROGRESS` as
+    /// a blank row, and writes the `(N)` count at the bottom of the
+    /// strip. Acceptance: zero-task columns render in the rotated form
+    /// and the count surfaces.
+    #[test]
+    fn rendering_empty_column_uses_rotated_label_with_count() {
+        use ratatui::{backend::TestBackend, Terminal};
+        let mut app = KanbanApp::new("demo");
+        // Seed a single Backlog card so the Backlog column expands —
+        // we want a NON-Backlog empty column to verify the strip.
+        app.tasks = vec![task_file("seed", Column::Backlog, 0, "2026-06-20T10:00:00Z")];
+
+        let backend = TestBackend::new(120, 20);
+        let mut term = Terminal::new(backend).unwrap();
+        term.draw(|f| render_full(f, &mut app, f.area())).unwrap();
+
+        let buf = term.backend().buffer().clone();
+        // Find the column slot for "in-progress" — it's empty so
+        // auto-collapses. Walk down the centre of its slot and confirm
+        // the letters of "IN PROGRESS" paint top-down (with a blank
+        // row for the space).
+        let in_progress_idx = app
+            .all_columns
+            .iter()
+            .position(|c| c.status_id == "in-progress")
+            .expect("default catalogue declares in-progress");
+        let header_hit = app
+            .header_hits
+            .iter()
+            .find(|h| h.col_idx == in_progress_idx)
+            .expect("collapsed in-progress column registered a header hit");
+        let col_area = header_hit.area;
+        let glyph_x = col_area.x + col_area.width / 2;
+
+        let mut glyphs: Vec<String> = (col_area.y..col_area.y + col_area.height)
+            .map(|y| buf[(glyph_x, y)].symbol().to_string())
+            .collect();
+        // Trim leading / trailing empty cells from the centre of the
+        // strip so the assertion is order-insensitive to where the
+        // block centres vertically.
+        while glyphs.first().is_some_and(|s| s.trim().is_empty()) {
+            glyphs.remove(0);
+        }
+        while glyphs.last().is_some_and(|s| s.trim().is_empty()) {
+            glyphs.pop();
+        }
+        let stripped: String = glyphs.join("");
+        // The count `(N)` paints horizontally, so only the leading
+        // `(` falls on the centre column. Expect the rotated label
+        // followed by the count line's leading paren.
+        assert!(
+            stripped.starts_with("IN PROGRESS"),
+            "expected leading rotated label, got centre column: {stripped:?}"
+        );
+    }
+
+    /// `header_at` resolves a click within a recorded header rect to
+    /// the right column index, and misses outside it.
+    #[test]
+    fn header_at_resolves_clicks_to_column() {
+        let mut app = KanbanApp::new("demo");
+        app.header_hits = vec![
+            HeaderHit {
+                area: Rect { x: 0, y: 1, width: 20, height: 1 },
+                col_idx: 0,
+            },
+            HeaderHit {
+                area: Rect { x: 20, y: 1, width: 20, height: 1 },
+                col_idx: 1,
+            },
+            // A collapsed column registers its whole vertical strip.
+            HeaderHit {
+                area: Rect { x: 40, y: 1, width: 3, height: 12 },
+                col_idx: 2,
+            },
+        ];
+        assert_eq!(app.header_at(5, 1), Some(0));
+        assert_eq!(app.header_at(25, 1), Some(1));
+        assert_eq!(app.header_at(41, 8), Some(2));
+        assert_eq!(app.header_at(41, 14), None, "below the strip");
+        assert_eq!(app.header_at(50, 1), None, "right of every header");
     }
 
     /// Per-task overlay reads from the **owning workflow**, not

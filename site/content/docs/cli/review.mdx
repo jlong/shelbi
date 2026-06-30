@@ -8,16 +8,16 @@ summary: Check a task's branch into the review work_dir and (re)launch a fresh r
 shelbi review [OPTIONS] <ID>
 ```
 
-`shelbi review` is how you (or the sidebar) sit down with a worker's finished
-branch. It checks the task's branch into the machine's dedicated review
-work_dir, then spawns a fresh `review-claude` pane in that directory. The
-branch is isolated from the worker's own worktree, so reviewing doesn't
-interfere with the worker if you reload them onto the next task while the
-review pane stays open.
+`shelbi review` is how you (or the sidebar) sit down with a workspace's
+finished branch. It checks the task's branch into the machine's dedicated
+review work_dir, then spawns a fresh `review-claude` pane in that
+directory. The branch is isolated from the workspace's own worktree, so
+reviewing doesn't interfere if you reload the workspace onto the next
+task while the review pane stays open.
 
 By default the command runs on the machine of the task's `assigned_to`
-worker. Pass `--machine` to override — useful when reviewing on your laptop
-even though the worker ran remotely.
+workspace. Pass `--machine` to override — useful when reviewing on your
+laptop even though the workspace ran remotely.
 
 ## Arguments
 
@@ -29,19 +29,19 @@ even though the worker ran remotely.
 
 | Flag | Type | Default | Description |
 | --- | --- | --- | --- |
-| `--machine <MACHINE>` | string | task's worker's machine, else first local machine | Override the machine to review on. |
-| `-p, --project <PROJECT>` | string | env / marker file | Project to operate on. |
+| `--machine <MACHINE>` | string | task's workspace's machine, else first local machine | Override the machine to review on. |
+| `-p, --project <PROJECT>` | string | env / cwd lookup | Project to operate on. |
 
 ## Examples
 
-Review a task on the same machine its worker ran on (most common — the
-sidebar's "Review" action runs exactly this):
+Review a task on the same machine its workspace ran on (most common —
+the sidebar's "Review" action runs exactly this):
 
 ```bash
 shelbi review docs-write-cli-reference-pages
 ```
 
-Pull a remote worker's branch onto your laptop for a closer look:
+Pull a remote workspace's branch onto your laptop for a closer look:
 
 ```bash
 shelbi review docs-write-cli-reference-pages --machine laptop

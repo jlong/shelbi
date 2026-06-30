@@ -23,8 +23,9 @@ global mode.
 
 Every subcommand accepts the global `-p / --project <PROJECT>` flag
 to target a specific project (otherwise the active `$SHELBI_PROJECT`
-or the closest `.shelbi/project` marker wins). It's omitted from the
-per-subcommand tables to keep them readable.
+or the registered project whose `work_dir` contains the current
+directory wins). It's omitted from the per-subcommand tables to keep
+them readable.
 
 ## on
 
@@ -43,7 +44,7 @@ shelbi zen off
 ```
 
 Turn Zen Mode off. Every promotion goes through manual review.
-In-flight workers keep going; nothing already running is cancelled.
+In-flight workspaces keep going; nothing already running is cancelled.
 
 ## pause
 
@@ -81,6 +82,24 @@ no file overlap with anything currently in flight. The orchestrator's
 prompt applies the judgment categories on top of this list — see
 [the judgment layer](/docs/concepts/zen-mode#the-judgment-layer).
 
+## dry-run
+
+```text
+shelbi zen dry-run [OPTIONS]
+```
+
+Preview what Zen Mode would do without touching any state. On every
+tick the backlog scan and the merge-conditions bar are evaluated, and
+each "would have …" decision is logged to stdout, the dedicated
+dry-run log (`~/.shelbi/logs/zen-dryrun.log`), and the activity feed.
+No PRs, merges, or board moves happen. Use it before flipping Zen on
+for real to confirm the policy matches your intent.
+
+| Flag | Type | Default | Description |
+| --- | --- | --- | --- |
+| `--for <DURATION>` | duration | run until Ctrl-C | Stop after this long. Accepts `30s`, `5m`, `2h`, `1d`, or a bare integer of seconds. |
+| `--interval <DURATION>` | duration | `5s` | Override the per-tick interval. Same duration grammar as `--for`. |
+
 ## probe
 
 ```text
@@ -92,7 +111,7 @@ pretty JSON. Covers the four pre-PR conditions the orchestrator
 checks before opening a PR: local checks, merge-conflict probe, diff
 size, and danger-path matches.
 
-The task must be assigned to a worker so the probe knows which
+The task must be assigned to a workspace so the probe knows which
 worktree to read from.
 
 | Argument | Type | Default | Description |
@@ -105,9 +124,9 @@ worktree to read from.
 shelbi zen pr-create <ID>
 ```
 
-Push the worker's branch and open a PR for the task. Idempotent — if
-an open PR for the branch already exists, returns its number instead
-of opening a second one. Prints the PR number on stdout.
+Push the workspace's branch and open a PR for the task. Idempotent —
+if an open PR for the branch already exists, returns its number
+instead of opening a second one. Prints the PR number on stdout.
 
 | Argument | Type | Default | Description |
 | --- | --- | --- | --- |
@@ -166,6 +185,12 @@ promoting anything):
 
 ```bash
 shelbi zen scan
+```
+
+Watch the policy in motion for ten minutes without committing to it:
+
+```bash
+shelbi zen dry-run --for 10m
 ```
 
 Run the full pre-merge probe by hand on a finished branch and pipe it

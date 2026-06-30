@@ -1,19 +1,19 @@
 ---
 title: shelbi merge
 order: 26
-summary: Merge a worker's branch into the project's default branch, locally or via a GitHub PR.
+summary: Merge a workspace's branch into the project's default branch, locally or via a GitHub PR.
 ---
 
 ```text
 shelbi merge [OPTIONS] <ID>
 ```
 
-`shelbi merge` is the bridge between a task in `review` and a clean default
-branch. By default it performs a local squash-merge of the task's branch
-into the project's default branch (typically `main`) using the worker's
-commit message. Pass `--pr` to push the branch and open a GitHub pull
-request instead — useful when your team's workflow requires a code-review
-roundtrip before anything lands.
+`shelbi merge` is the bridge between a task in `review` and a clean
+default branch. By default it performs a local squash-merge of the
+task's branch into the project's default branch (typically `main`)
+using the workspace's commit message. Pass `--pr` to push the branch
+and open a GitHub pull request instead — useful when your team's
+workflow requires a code-review roundtrip before anything lands.
 
 The command does not move the card. After a successful local merge, the
 orchestrator's "merged → done" sweep (or you, manually) moves the task to
@@ -31,7 +31,7 @@ itself lands.
 | Flag | Type | Default | Description |
 | --- | --- | --- | --- |
 | `--pr` | flag | off | Push the branch and open a GitHub PR instead of a local squash-merge. |
-| `-p, --project <PROJECT>` | string | env / marker file | Project to operate on. |
+| `-p, --project <PROJECT>` | string | env / cwd lookup | Project to operate on. |
 
 ## Examples
 

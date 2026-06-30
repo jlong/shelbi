@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::SystemTime;
 
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -481,6 +481,24 @@ pub struct State {
     /// guidepost.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub claude_md_migration_hinted: bool,
+    /// Explicit Kanban-column collapse overrides keyed by
+    /// `"<workflow_name>:<status_id>"`. Only deviations from the
+    /// auto-default are persisted — an empty / non-existent entry means
+    /// the column is in `Auto` mode (empty columns render collapsed,
+    /// non-empty render expanded). See
+    /// [`shelbi_tui::kanban::ColumnExpansion`] for the in-memory model.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub kanban_column_overrides: BTreeMap<String, KanbanColumnOverride>,
+}
+
+/// Persisted form of an explicit user override on a Kanban column's
+/// collapse state. Serialized as a lowercase string (`"collapsed"` /
+/// `"expanded"`) so the on-disk shape stays human-readable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum KanbanColumnOverride {
+    Collapsed,
+    Expanded,
 }
 
 /// Tri-state Zen Mode toggle persisted in `state.json::zen_mode`.
@@ -943,6 +961,38 @@ pub fn set_zen_mode(project: &str, target: ZenModeState, source: &str) -> Result
 pub fn set_workspace_filter(project: &str, filter: Option<&str>) -> Result<()> {
     let mut state = read_state(project)?;
     state.workspace_filter = filter.map(|s| s.to_string());
+    write_state(project, &state)
+}
+
+/// Compose the persistence key for a Kanban column override. The key
+/// combines `workflow_name` and `status_id` so a column override scoped
+/// to one workflow's view never bleeds into another workflow that
+/// happens to share the same status id.
+pub fn kanban_column_override_key(workflow: &str, status_id: &str) -> String {
+    format!("{workflow}:{status_id}")
+}
+
+/// Persist (or clear) an explicit collapse override for one Kanban
+/// column. Passing `None` removes the entry, returning that column to
+/// its auto default. Reads, mutates, and re-writes `state.json` so
+/// unrelated fields stay intact. No event-log entry — view-state
+/// changes are noise in the activity feed.
+pub fn set_kanban_column_override(
+    project: &str,
+    workflow: &str,
+    status_id: &str,
+    override_state: Option<KanbanColumnOverride>,
+) -> Result<()> {
+    let mut state = read_state(project)?;
+    let key = kanban_column_override_key(workflow, status_id);
+    match override_state {
+        Some(v) => {
+            state.kanban_column_overrides.insert(key, v);
+        }
+        None => {
+            state.kanban_column_overrides.remove(&key);
+        }
+    }
     write_state(project, &state)
 }
 
@@ -2128,6 +2178,54 @@ mod tests {
             let back = read_state("p").unwrap();
             assert_eq!(back.zen_mode, mode);
         }
+        std::env::remove_var("SHELBI_HOME");
+    }
+
+    // ---- kanban column overrides -----------------------------------------
+
+    #[test]
+    fn set_kanban_column_override_round_trips_and_clears() {
+        let _g = TEST_LOCK.lock().unwrap();
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+
+        // Setting an override persists under the composed
+        // workflow:status_id key so two workflows with the same status
+        // id stay distinct.
+        set_kanban_column_override("p", "default", "in-progress", Some(KanbanColumnOverride::Collapsed))
+            .unwrap();
+        set_kanban_column_override("p", "design-review", "in-progress", Some(KanbanColumnOverride::Expanded))
+            .unwrap();
+        let s = read_state("p").unwrap();
+        assert_eq!(
+            s.kanban_column_overrides.get("default:in-progress").copied(),
+            Some(KanbanColumnOverride::Collapsed)
+        );
+        assert_eq!(
+            s.kanban_column_overrides.get("design-review:in-progress").copied(),
+            Some(KanbanColumnOverride::Expanded)
+        );
+
+        // Clearing removes the entry without touching siblings.
+        set_kanban_column_override("p", "default", "in-progress", None).unwrap();
+        let s = read_state("p").unwrap();
+        assert!(!s.kanban_column_overrides.contains_key("default:in-progress"));
+        assert!(s.kanban_column_overrides.contains_key("design-review:in-progress"));
+
+        std::env::remove_var("SHELBI_HOME");
+    }
+
+    #[test]
+    fn state_omits_empty_kanban_column_overrides() {
+        let _g = TEST_LOCK.lock().unwrap();
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+        write_state("p", &State::default()).unwrap();
+        let on_disk = std::fs::read_to_string(state_path("p").unwrap()).unwrap();
+        assert!(
+            !on_disk.contains("kanban_column_overrides"),
+            "empty overrides map must be skipped; got {on_disk}",
+        );
         std::env::remove_var("SHELBI_HOME");
     }
 

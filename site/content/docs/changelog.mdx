@@ -21,7 +21,20 @@ they earn their keep. Newest entry goes first; never reorder older ones.
 
 ### Unreleased
 
-**Hub heartbeats.** The hub-side worker-state poller now appends a periodic
+**Project resolution by reverse-lookup.** Shelbi no longer drops a
+`.shelbi/project` marker into each repo to identify the active project.
+Resolution now scans `~/.shelbi/projects/*.yaml`, collects each project's
+local `work_dir`, and matches the current directory against them
+(deepest match wins). `shelbi reload` sweeps any leftover marker files
+on the first run after upgrade. Less stray state on disk; the project
+YAML is the single source of truth.
+
+**`shelbi open` (was `shelbi workspace open`).** The pane-lifecycle
+entry point is now a top-level command. Same behavior — focus a
+workspace pane, creating it if it doesn't exist yet — under a shorter
+name. Use `shelbi open <workspace>` from anywhere.
+
+**Hub heartbeats.** The hub-side workspace-state poller now appends a periodic
 `<ts> project=<name> heartbeat` line to `~/.shelbi/events.log`, giving the
 orchestrator's `events tail --follow` watch a guaranteed recurring trigger
 when the board is otherwise quiet. Cadence is set per project via a new
