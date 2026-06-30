@@ -121,11 +121,11 @@ machines:
   kind: local
   work_dir: /Users/jlong/Workspaces/shelbi
 
-name: devbox
-kind: ssh
-host: devbox
-work_dir: /home/jlong/Workspaces/shelbi
-workspaces:
+- name: devbox
+  kind: ssh
+  host: devbox
+  work_dir: /home/jlong/Workspaces/shelbi
+  workspaces:
 
 name: alpha
 machine: hub
