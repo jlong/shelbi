@@ -11,19 +11,23 @@ shelbi reload [OPTIONS]
 `shelbi reload` is the "I just rebuilt the binary, pick up the new code"
 command. It respawns the Shelbi-owned panes — the sidebar plus the hidden
 tasks / review / machines panes — in place. The orchestrator pane and the
-worker panes are left alone: those re-shell into `shelbi` on every call and
-pick up the new binary automatically on their next invocation, so there's
-nothing to restart.
+workspace panes are left alone: they re-shell into `shelbi` on every call
+and pick up the new binary automatically on their next invocation, so
+there's nothing to restart.
 
 Use it any time `scripts/install.sh` (or your own build) has produced a new
 binary and you want the long-lived TUI surfaces to start using it without
 tearing down your tmux session.
 
+`shelbi reload` also sweeps any leftover `.shelbi/project` marker files
+left over from earlier versions — resolution by reverse-lookup against
+the registered project YAMLs has made them redundant.
+
 ## Flags
 
 | Flag | Type | Default | Description |
 | --- | --- | --- | --- |
-| `-p, --project <PROJECT>` | string | env / marker file | Project to operate on. |
+| `-p, --project <PROJECT>` | string | env / cwd lookup | Project to operate on. |
 
 ## Examples
 

@@ -145,8 +145,9 @@ You can add more machines later by editing the YAML directly and running
   talks to you. Usually the same as the workspace runner, but you can mix.
 
 The wizard writes the YAML, creates the per-workspace directories under
-`~/.shelbi/workspaces/<name>/`, drops a `.shelbi/project` marker at the
-repo root, and launches the TUI.
+`~/.shelbi/workspaces/<name>/`, and launches the TUI. Project resolution
+is by reverse-lookup against the registered YAMLs — no marker file is
+dropped in your repo.
 
 ## The project YAML
 

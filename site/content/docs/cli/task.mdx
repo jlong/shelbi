@@ -16,9 +16,9 @@ this command — most user-facing edits flow through the kanban view, but
 scripting, automation, and one-off fixes all live here.
 
 Every subcommand accepts the global `-p / --project <PROJECT>` flag to target
-a specific project (otherwise the active `$SHELBI_PROJECT` or the closest
-`.shelbi/project` marker wins). It's omitted from the per-subcommand tables
-below to keep them readable.
+a specific project (otherwise the active `$SHELBI_PROJECT` or the registered
+project whose `work_dir` contains the current directory wins). It's omitted
+from the per-subcommand tables below to keep them readable.
 
 ## add
 
@@ -36,7 +36,7 @@ Pass `--status todo` to skip triage when you're already sure.
 | `--status <STATUS>` | string | `backlog` | Initial status. `--column` is a deprecated alias kept for one release. |
 | `-d, --description <DESCRIPTION>` | string | empty | Task body. Use `shelbi task edit` later if omitted. |
 | `--depends-on <ID>` | string (repeatable) | — | Block this task on another. Repeat for multiple deps. |
-| `--prefers-machine <NAME>` | string | — | Hint for the orchestrator to route this task to a worker on a specific machine. |
+| `--prefers-machine <NAME>` | string | — | Hint for the orchestrator to route this task to a workspace on a specific machine. |
 | `--workflow <NAME>` | string | project default | Workflow this task runs under. Names a file in `workflows/<NAME>.yaml`. Omit to inherit the project's default workflow. |
 | `--branch <BRANCH>` | string | `shelbi/<task-id>` at dispatch | Pre-fill the task's `branch:` frontmatter field. Omit to let the orchestrator cut `shelbi/<task-id>` off the resolved base branch at dispatch time; supply a value to point the task at an existing branch (the *release task* pattern). |
 
@@ -88,7 +88,7 @@ shelbi task move --to <STATUS> [OPTIONS] <ID>
 ```
 
 Move a task between statuses. Promoting a task to `todo` is the start signal
-for the orchestrator — it will pick a free worker and call `task start` on
+for the orchestrator — it picks a free workspace and calls `task start` on
 its own.
 
 The destination column is validated against the task's workflow — moving
@@ -107,16 +107,16 @@ the YAML matches `in_progress` on the CLI).
 ## assign
 
 ```text
-shelbi task assign --to <WORKER> <ID>
+shelbi task assign --to <WORKSPACE> <ID>
 ```
 
-Set the task's `assigned_to` field without launching the worker. Use this
-when you want to pre-allocate before promoting to `todo`. Worker must be
-declared in the project YAML.
+Set the task's `assigned_to` field without launching the workspace. Use
+this when you want to pre-allocate before promoting to `todo`. The
+workspace must be declared in the project YAML.
 
 | Flag | Type | Default | Description |
 | --- | --- | --- | --- |
-| `--to <WORKER>` | string | — | Worker name (required). |
+| `--to <WORKSPACE>` | string | — | Workspace name (required). |
 
 ## unassign
 
@@ -132,20 +132,20 @@ Clear a task's `assigned_to` field. The task stays in its current column.
 shelbi task start [OPTIONS] <ID>
 ```
 
-Launch the assigned worker on this task. Three things happen in one shot:
+Launch the assigned workspace on this task. Three things happen in one shot:
 
-1. The worker's worktree is checked out to the task's branch (defaults to
-   `shelbi/<task-id>`).
-2. Any existing pane for that worker is killed — context is wiped clean.
+1. The workspace's worktree is checked out to the task's branch (defaults
+   to `shelbi/<task-id>`).
+2. Any existing pane for that workspace is killed — context is wiped clean.
 3. The runner relaunches with the task prompt and the column transitions
    into `in_progress`.
 
-Pass `--worker` to assign and launch in one call. This is the command the
-orchestrator runs when a task hits `todo`.
+Pass `--workspace` to assign and launch in one call. This is the command
+the orchestrator runs when a task hits `todo`.
 
 | Flag | Type | Default | Description |
 | --- | --- | --- | --- |
-| `--worker <WORKER>` | string | task's `assigned_to` | Assign and launch in one call. |
+| `--workspace <WORKSPACE>` | string | task's `assigned_to` | Assign and launch in one call. |
 | `--branch <BRANCH>` | string | `shelbi/<task-id>` | Override the default branch name. |
 | `--reason <REASON>` | string | `user:cli:start` | Reason tag recorded in `~/.shelbi/events.log` when the column transitions to `in_progress`. |
 
@@ -204,10 +204,10 @@ Reorder ready work so a specific task is dispatched first:
 shelbi task prio fix-sidebar-clamp --top
 ```
 
-Manually dispatch an explicit worker (overrides the orchestrator's routing):
+Manually dispatch an explicit workspace (overrides the orchestrator's routing):
 
 ```bash
-shelbi task start docs-write-changelog-page --worker delta
+shelbi task start docs-write-changelog-page --workspace delta
 ```
 
 ## See also

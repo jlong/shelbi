@@ -1,7 +1,7 @@
 ---
 title: shelbi agent
 order: 21
-summary: Manage the project's agents — the roles (system prompt + skills) a workspace runs. List them, print a resolved prompt, scaffold a new one, or open one in your editor.
+summary: Manage the project's agents — the roles (system prompt + skills) a workspace runs. List them, print one's instructions, scaffold a new one, or open one in your editor.
 ---
 
 ```text
@@ -16,9 +16,9 @@ project starts with four (`orchestrator`, `developer`, `qa`,
 
 Agents live under `~/.shelbi/projects/<project>/agents/<name>/`, each with an
 `instructions.md` (its prompt) and an optional `skills/` directory. The
-shared `agents/_shared/preamble.md` is prepended to every agent's prompt. The
-defaults are seeded on first load and never clobbered on upgrade — see
-[customizing an agent](/docs/concepts/agents#customizing-an-agent).
+shared `agents/_shared/preamble.md` is prepended to every agent's prompt at
+launch time. The defaults are seeded on first load and never clobbered on
+upgrade — see [customizing an agent](/docs/concepts/agents#customizing-an-agent).
 
 Every subcommand accepts the global `-p / --project <PROJECT>` flag. It's
 omitted from the per-subcommand tables below to keep them readable.
@@ -29,20 +29,27 @@ omitted from the per-subcommand tables below to keep them readable.
 shelbi agent list
 ```
 
-Print every agent in the project, one per line, with whether it's a shipped
-default or one you authored, and which workflow statuses reference it via
-their [`agent:` field](/docs/concepts/workflows#owners-and-agents).
+Print a table of every agent in the project: its name, the workflow
+statuses that reference it via the
+[`agent:` field](/docs/concepts/workflows#owners-and-agents), the count of
+skill files under its `skills/` dir, and whether its `instructions.md`
+has been customized away from the bundled default.
 
 ```text
-NAME              SOURCE     USED BY
-orchestrator      default    (window 1)
-developer         default    Todo, InProgress
-qa                default    Review
-security-review   default    —
+AGENT          STATUSES                   SKILLS  CUSTOMIZED
+orchestrator   -                          0       no
+developer      InProgress, Todo           0       no
+qa             Review                     0       no
+security-review -                         0       no
 ```
 
-An agent with no referencing status (`—`) is defined but unused — fine for
-one you're about to wire into a workflow.
+The `CUSTOMIZED` column reads:
+
+- `no` — shipped default whose `instructions.md` matches the bundled body
+  byte-for-byte.
+- `yes` — shipped default that's been edited (or whose file is missing on
+  disk and would re-materialize on the next `shelbi reload`).
+- `-` — an agent you authored; there's no bundled body to compare against.
 
 ## show
 
@@ -50,21 +57,23 @@ one you're about to wire into a workflow.
 shelbi agent show <NAME>
 ```
 
-Print an agent's **resolved** prompt to stdout — `_shared/preamble.md`
-prepended to the agent's own `instructions.md`, with `{{assistant_name}}`
-substituted, exactly as the runner would receive it. This is the quickest way
-to see what an agent will actually be told, preamble included. Pass
-`--raw` to print just the agent's `instructions.md` without the preamble.
+Print the agent's `instructions.md` to stdout, followed by a `Skills:`
+section listing each `skills/*.md` file with the `description` from its
+frontmatter. Errors if the agent doesn't exist.
 
-| Flag | Type | Default | Description |
+This shows you what *one* agent's file holds in isolation. It does **not**
+prepend `agents/_shared/preamble.md` or substitute `{{assistant_name}}` —
+that composition happens at launch time, not at `show` time. To see the
+shared preamble, `cat ~/.shelbi/projects/<name>/agents/_shared/preamble.md`.
+
+| Argument | Type | Default | Description |
 | --- | --- | --- | --- |
 | `<NAME>` | string | — | Agent name (positional, required). |
-| `--raw` | flag | off | Print only `instructions.md`, skipping the shared preamble and substitution. |
 
 ## new
 
 ```text
-shelbi agent new [OPTIONS] <NAME>
+shelbi agent new <NAME>
 ```
 
 Scaffold a new agent directory under `agents/<NAME>/` with a starter
@@ -72,14 +81,13 @@ Scaffold a new agent directory under `agents/<NAME>/` with a starter
 role template, not a copy of `developer` — it's there to be replaced.
 
 Errors if an agent with that name already exists. Names must be non-empty,
-must not start with `.`, and may only contain `a-z`, `0-9`, `-`, `_` — the
-name doubles as the identifier referenced from workflow `agent:` fields, so
-the validator is stricter than POSIX.
+must not start with `.` or `_`, and may only contain `a-z`, `0-9`, `-`, `_`
+— the name doubles as the identifier referenced from workflow `agent:`
+fields, so the validator is stricter than POSIX.
 
-| Flag | Type | Default | Description |
+| Argument | Type | Default | Description |
 | --- | --- | --- | --- |
 | `<NAME>` | string | — | Agent name (positional, required). |
-| `--edit` | flag | off | Open the new `instructions.md` in `$EDITOR` after creating it. |
 
 ## edit
 
@@ -87,15 +95,14 @@ the validator is stricter than POSIX.
 shelbi agent edit <NAME>
 ```
 
-Open an agent's `instructions.md` in `$EDITOR` (defaults to `vi`). If the
-named agent is a shipped default that hasn't been materialized to disk yet,
-its default `instructions.md` is written out first so you have something
-concrete to tweak. Any other missing name errors with a hint to run
-`shelbi agent new <NAME>` first.
+Open the agent's `instructions.md` in `$EDITOR` (falling back to `$VISUAL`,
+then `vim`). Errors if the agent doesn't exist — run `shelbi agent new
+<NAME>` first, or `shelbi reload` to materialize the shipped defaults if
+this is the first time the project's been opened.
 
 Edits take effect the next time the affected agent is launched — for the
-orchestrator, on the next `shelbi reload`; for a workspace agent, on its next
-task dispatch.
+orchestrator, on the next `shelbi reload`; for a workspace agent, on its
+next task dispatch.
 
 ## Examples
 
@@ -105,7 +112,7 @@ See the project's agents and where each is used:
 shelbi agent list
 ```
 
-Read exactly what the QA agent will be told, preamble and all:
+Read the QA agent's instructions:
 
 ```bash
 shelbi agent show qa
@@ -117,10 +124,11 @@ Bake your repo's conventions into the default developer agent:
 shelbi agent edit developer
 ```
 
-Scaffold a focused reviewer and open it straight away:
+Scaffold a focused reviewer:
 
 ```bash
-shelbi agent new perf-review --edit
+shelbi agent new perf-review
+shelbi agent edit perf-review
 ```
 
 Then wire it into a workflow status:
@@ -132,8 +140,8 @@ statuses:
 
 ## See also
 
-- [Agents](/docs/concepts/agents) — the concept: what an agent is, the four
-  shipped roles, on-disk layout, and the customization story.
+- [Agents](/docs/concepts/agents) — what an agent is, the four shipped
+  roles, on-disk layout, and the customization story.
 - [Workflows](/docs/concepts/workflows#owners-and-agents) — the `owner` +
   `agent` fields that route a status to one of these agents.
 - [`shelbi workspace`](/docs/cli/workspace) — the slots agents run in, and

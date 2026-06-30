@@ -1,7 +1,7 @@
 ---
 title: shelbi events
 order: 25
-summary: Inspect the hub-global worker-state transition log — the same feed the orchestrator reacts to.
+summary: Inspect the hub-global workspace-state transition log — the same feed the orchestrator reacts to.
 ---
 
 ```text
@@ -9,10 +9,10 @@ shelbi events <SUBCOMMAND> [OPTIONS]
 ```
 
 `shelbi events` exposes `~/.shelbi/events.log`, the append-only log that
-records every column transition and every worker state change across the
-entire hub. The orchestrator follows this log as its trigger stream — when
-you want to see what the orchestrator is seeing, run `events tail --follow`
-in another pane.
+records every column transition and every workspace state change across
+the hub. The orchestrator follows this log as its trigger stream — to
+see what the orchestrator is seeing, run `events tail --follow` in
+another pane.
 
 The most common line shapes are:
 

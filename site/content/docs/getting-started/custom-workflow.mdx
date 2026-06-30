@@ -1,70 +1,64 @@
 ---
 title: Author a custom Shelbi workflow
 order: 6
-summary: Fork the orchestrator's prompt to encode routing rules, project-specific Zen judgment, and reporting style — the workflow lives in one markdown file you own.
+summary: Edit the orchestrator agent's instructions to encode routing rules, project-specific Zen judgment, and reporting style — the workflow is two markdown files you own.
 ---
 
-The orchestrator is *just* your runner (`claude`, `codex`, …) booted
-with a system prompt that explains the board, the workspaces, and the
-loop. That prompt is the **workflow** — the contract between you and
-the agent for who initiates what, how dispatch is decided, and how
-the agent reports back. Shelbi ships a sensible default and lets
-every project replace it.
+The orchestrator is your runner (`claude`, `codex`, …) booted with a
+system prompt that explains the board, the workspaces, and the loop.
+That prompt is the **workflow** — the contract between you and the
+agent for who initiates what, how dispatch is decided, and how the
+agent reports back. Shelbi ships a sensible default and seeds it into
+every project as an editable file.
 
-This page walks through creating a project-level override from
-scratch, encoding three concrete tweaks, and applying them. The
-underlying machinery is covered in
+This page walks through customizing the orchestrator's prompt,
+encoding three concrete tweaks, and applying them. The underlying
+machinery is covered in
 [the orchestrator concept page](/docs/concepts/orchestrator#customizing-the-prompt-per-project);
 this is the practical version.
 
-## Where the workflow lives
+## Where the prompt lives
 
-Two places matter:
+The orchestrator is a [project-local agent with shipped defaults](/docs/concepts/agents).
+Its prompt is composed from two files:
 
-- **The bundled default** —
-  `crates/shelbi-orchestrator/src/default_orchestrator.md.template`
-  in the Shelbi source. Edit this when you want to change the prompt
-  for *every* project that doesn't override it (typically only useful
-  if you're hacking on Shelbi itself).
-- **Your per-project override** —
-  `~/.shelbi/projects/<name>/ORCHESTRATOR.md`. When this file exists
-  it **replaces the bundled default entirely**. `{{assistant_name}}`
-  is still substituted from `~/.shelbi/shelbi.yaml` so the agent
-  still introduces itself the way the wizard set up.
+- **`~/.shelbi/projects/<name>/agents/orchestrator/instructions.md`** —
+  the orchestrator-specific system prompt. Seeded with the shipped
+  default on first load; your edits stay put on upgrade.
+  `{{assistant_name}}` is substituted from `~/.shelbi/shelbi.yaml`.
+- **`~/.shelbi/projects/<name>/agents/_shared/preamble.md`** —
+  project-wide context prepended to every agent (developer, qa,
+  orchestrator…). Put the repo layout, house style, and test command
+  here so you write it once instead of pasting it into four prompts.
 
-On every `shelbi reload` (and at session start), Shelbi resolves the
-active prompt, substitutes the assistant name, and writes the
-rendered output to `~/.shelbi/projects/<name>/CLAUDE.md`. The
-orchestrator runner is launched in that directory, so it auto-loads
-the rendered prompt without any flags. No env vars, no MCP, no
-restart of running workspaces — just `shelbi reload` and the next
-orchestrator turn picks up the new prompt.
+On every `shelbi reload` (and at session start) Shelbi composes
+`preamble.md + instructions.md`, substitutes the assistant name, and
+writes the rendered output to `~/.shelbi/projects/<name>/CLAUDE.md`.
+The orchestrator launches in that directory and auto-loads the
+rendered prompt — no flags, no env vars, no MCP.
+
+> The legacy `ORCHESTRATOR.md` override file is deprecated. If you
+> have content there from an earlier version, move project-wide bits
+> into `_shared/preamble.md` and orchestrator-specific bits into
+> `agents/orchestrator/instructions.md`. `CLAUDE.md` is now a
+> rendered artifact — don't hand-edit it.
 
 ## Start from the default
 
-Don't write a workflow from a blank file. The default prompt
-encodes a bunch of load-bearing contracts (bootstrap, reaction
-rules, reason strings) that the rest of Shelbi expects the
-orchestrator to honor. Fork it, then edit:
+Don't rewrite from a blank file. The default prompt encodes
+load-bearing contracts (bootstrap, reaction rules, reason strings)
+that the rest of Shelbi expects the orchestrator to honor. Open the
+seeded default and edit in place:
 
 ```bash
-# From the Shelbi source tree (the repo you ran ./scripts/install.sh in).
-cp crates/shelbi-orchestrator/src/default_orchestrator.md.template \
-   ~/.shelbi/projects/myapp/ORCHESTRATOR.md
+shelbi agent edit orchestrator
 ```
 
-If you don't have the Shelbi source on disk locally, clone it once
-just for the copy:
-
-```bash
-git clone https://github.com/jlong/shelbi.git /tmp/shelbi
-cp /tmp/shelbi/crates/shelbi-orchestrator/src/default_orchestrator.md.template \
-   ~/.shelbi/projects/myapp/ORCHESTRATOR.md
-```
-
-The file is plain markdown with `{{assistant_name}}` placeholders.
-Open it in your editor of choice and read it top to bottom before
-changing anything — the comments explain why each section exists.
+That opens `agents/orchestrator/instructions.md` in `$EDITOR` (and
+materializes the shipped default first if you haven't touched it
+yet). The file is plain markdown with `{{assistant_name}}`
+placeholders. Read it top to bottom before changing anything — the
+comments explain why each section exists.
 
 ## What to keep when you fork
 
@@ -206,21 +200,29 @@ This is the easiest place to start customizing. The behavior the
 orchestrator gives you is downstream of the prose you write here —
 ask for the report you actually want.
 
-## Apply the override
+## Apply the edits
 
-Three steps:
+Two steps:
 
 ```bash
-# Edit the override.
-$EDITOR ~/.shelbi/projects/myapp/ORCHESTRATOR.md
+# Edit the orchestrator's instructions.
+shelbi agent edit orchestrator
 
 # Re-render and respawn the dashboard against the new prompt.
 shelbi reload
-
-# Confirm the rendered file picked up your changes.
-diff ~/.shelbi/projects/myapp/ORCHESTRATOR.md \
-     ~/.shelbi/projects/myapp/CLAUDE.md
 ```
+
+To verify what landed in your instructions file:
+
+```bash
+shelbi agent show orchestrator
+```
+
+That prints `instructions.md` followed by the agent's `skills/`. The
+composed prompt (preamble + instructions, `{{assistant_name}}`
+substituted) is written to `~/.shelbi/projects/<name>/CLAUDE.md` on
+every `shelbi reload` — read that file to see exactly what the runner
+loads.
 
 `shelbi reload` respawns the sidebar, Tasks, and Review panes
 against the new config without restarting workspaces or losing chat
@@ -236,12 +238,13 @@ keep tightening it. Two practical habits:
 - **Treat surprises as prompt bugs.** When the orchestrator does
   something you didn't expect — promotes a card you'd have held,
   reports in a style you find noisy, picks the wrong workspace — open
-  `ORCHESTRATOR.md` and add the rule that would have produced the
-  outcome you wanted. Reload. Try again.
-- **Version-control the override.** Check it into the repo (or a
-  dotfiles repo) and symlink it into place. The override is the
-  single most opinionated artifact in your Shelbi setup, and the one
-  most worth preserving across machine moves and reinstalls.
+  `agents/orchestrator/instructions.md` and add the rule that would
+  have produced the outcome you wanted. Reload. Try again.
+- **Version-control the prompt.** Check `agents/orchestrator/` and
+  `agents/_shared/` into the repo (or a dotfiles repo) and symlink
+  them into place. These prompts are the most opinionated artifacts
+  in your Shelbi setup, and the ones most worth preserving across
+  machine moves and reinstalls.
 
 What you should **not** do is try to encode policy in code. The
 mechanical layer (the Rust CLI) is intentionally generous —

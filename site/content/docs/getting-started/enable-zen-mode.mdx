@@ -226,15 +226,15 @@ orchestrator considers promoting live in its prompt, not the YAML.
 That prompt is a file you own:
 
 ```text
-~/.shelbi/projects/<name>/ORCHESTRATOR.md
+~/.shelbi/projects/<name>/agents/orchestrator/instructions.md
 ```
 
-When that file exists, it replaces the bundled default entirely.
-You can tune the auto-promote logic for your project — what counts
-as "routine," when to refuse, how to phrase a decline — by editing
+Edit it directly, or run `shelbi agent edit orchestrator`. You can
+tune the auto-promote logic for your project — what counts as
+"routine," when to refuse, how to phrase a decline — by editing
 prose, not code. The next page,
 [author a custom workflow](/docs/getting-started/custom-workflow),
-walks through writing one from scratch.
+walks through doing it end-to-end.
 
 In the meantime, the deep reference for everything Zen touches:
 

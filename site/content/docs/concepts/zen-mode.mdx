@@ -264,17 +264,18 @@ This is the power-user invitation. The judgment categories live in
 the orchestrator's prompt — the section titled `## Zen Mode` in the
 default template. **You can edit it.**
 
-To override the prompt for a single project, drop a file at:
+The orchestrator is a [project-local agent with shipped defaults](/docs/concepts/agents),
+so its prompt is a file you own:
 
 ```text
-~/.shelbi/projects/<name>/ORCHESTRATOR.md
+~/.shelbi/projects/<name>/agents/orchestrator/instructions.md
 ```
 
-When present, this file replaces the bundled default entirely (with
-`{{assistant_name}}` still substituted). The rendered output is
-rewritten to `~/.shelbi/projects/<name>/CLAUDE.md` on every
-`ensure_dashboard` call, so your changes take effect on the next
-`shelbi reload`.
+Edit it directly, or run `shelbi agent edit orchestrator`. The
+rendered output (preamble + instructions, with `{{assistant_name}}`
+substituted) is rewritten to `~/.shelbi/projects/<name>/CLAUDE.md`
+on every `ensure_dashboard` call, so your changes take effect on the
+next `shelbi reload`.
 
 A starter override that tunes Zen's judgment:
 
