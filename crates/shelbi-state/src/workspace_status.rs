@@ -345,6 +345,26 @@ pub fn append_dispatch_event(
     ))
 }
 
+/// Append `<rfc3339> workspace=<name> pane_alive=<bool> reason=<short>` to
+/// `~/.shelbi/events.log`. Emitted by the `shelbi workspace open --as-pane`
+/// wrapper when its agent subprocess exits (any reason — clean exit,
+/// signal, tmux teardown) so the orchestrator's reaction rules can fire
+/// on a pane death.
+///
+/// `reason` is folded to a single short token (whitespace → underscores) so
+/// the line stays parseable.
+pub fn append_workspace_pane_event(
+    workspace: &str,
+    alive: bool,
+    reason: &str,
+) -> Result<()> {
+    let ts = Utc::now().to_rfc3339();
+    let reason = sanitize_reason(reason);
+    append_event_line(&format!(
+        "{ts} workspace={workspace} pane_alive={alive} reason={reason}"
+    ))
+}
+
 /// Append `<rfc3339> rebase task=<id> workspace=<name> branch=<branch> status=<status> detail=<detail>`
 /// to `~/.shelbi/events.log`. Emitted by the poller's review-marker handler
 /// when it auto-rebases a workspace's branch onto the project's default branch
@@ -545,6 +565,44 @@ mod tests {
         assert!(lines[0].contains("workspace=alpha"));
         assert!(lines[0].contains("none -> working"));
         assert!(lines[1].contains("working -> awaiting_input"));
+
+        std::env::remove_var("SHELBI_HOME");
+    }
+
+    #[test]
+    fn append_workspace_pane_event_writes_lifecycle_line() {
+        // The wrapper writes this line whenever its agent subprocess
+        // exits (any reason — clean exit, signal, kill-window, child
+        // crash). The orchestrator's reaction rules key on the
+        // `workspace=` prefix + `pane_alive=` field, so pin both.
+        // `reason` whitespace folds to underscores so the line stays a
+        // single parseable record alongside the other event shapes.
+        let _g = TEST_LOCK.lock().unwrap();
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+
+        append_workspace_pane_event("alpha", false, "signal:SIGTERM").unwrap();
+        append_workspace_pane_event("bravo", false, "exit:0").unwrap();
+        append_workspace_pane_event("charlie", false, "claude exited normally").unwrap();
+
+        let log = std::fs::read_to_string(events_log_path().unwrap()).unwrap();
+        let lines: Vec<&str> = log.lines().collect();
+        assert_eq!(lines.len(), 3, "log: {log}");
+
+        assert!(lines[0].contains(" workspace=alpha "), "line: {}", lines[0]);
+        assert!(lines[0].contains(" pane_alive=false "), "line: {}", lines[0]);
+        assert!(lines[0].ends_with(" reason=signal:SIGTERM"), "line: {}", lines[0]);
+
+        assert!(lines[1].ends_with(" reason=exit:0"), "line: {}", lines[1]);
+
+        // Whitespace in reason folds to underscores so the field stays a
+        // single token (matches the sanitize_reason contract used by the
+        // other append_… helpers).
+        assert!(
+            lines[2].ends_with(" reason=claude_exited_normally"),
+            "line: {}",
+            lines[2],
+        );
 
         std::env::remove_var("SHELBI_HOME");
     }

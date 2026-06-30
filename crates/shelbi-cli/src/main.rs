@@ -457,6 +457,30 @@ mod cli_tests {
         }
     }
 
+    /// `shelbi workspace open <name>` is the focus-or-create entry point
+    /// used by the sidebar's Enter handler and the dispatch path. The
+    /// `--as-pane` re-entry flag is hidden from `--help` but still
+    /// parseable so the wrapper-spawn line from focus_or_create lands.
+    #[test]
+    fn workspace_open_parses_with_and_without_as_pane() {
+        let plain = Cli::parse_from(["shelbi", "workspace", "open", "alpha"]);
+        match plain.cmd {
+            Some(Cmd::Workspace {
+                cmd: WorkspaceCmd::Open { ref name, as_pane },
+            }) if name == "alpha" && !as_pane => {}
+            other => panic!("expected Open {{ alpha, as_pane=false }}, got {other:?}"),
+        }
+
+        let wrapped =
+            Cli::parse_from(["shelbi", "workspace", "open", "delta", "--as-pane"]);
+        match wrapped.cmd {
+            Some(Cmd::Workspace {
+                cmd: WorkspaceCmd::Open { ref name, as_pane },
+            }) if name == "delta" && as_pane => {}
+            other => panic!("expected Open {{ delta, as_pane=true }}, got {other:?}"),
+        }
+    }
+
     /// `project_yaml_exists` is the predicate `default_entry` uses to
     /// decide whether an explicitly-named project is live (boot it) or
     /// missing on this machine (fall through to first-run). The test pins

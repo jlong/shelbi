@@ -17,6 +17,18 @@ use std::path::{Path, PathBuf};
 
 use shelbi_core::{Error, Host, Machine, Project, Result, TmuxAddr, WorkspaceSpec};
 
+/// Absolute path to the currently-running `shelbi` binary, so the
+/// wrapper invocation we hand to tmux is anchored to *this* build
+/// rather than whatever happens to be on PATH inside the pane's
+/// shell. Mirrors the helper in `crate::current_exe_string`; kept
+/// module-local so workspace.rs has no upward dependency on lib.rs.
+fn current_exe_string() -> Result<String> {
+    Ok(std::env::current_exe()
+        .map_err(Error::Io)?
+        .to_string_lossy()
+        .into_owned())
+}
+
 /// Where a workspace's pane lives in tmux. Local workspaces get a window in the
 /// project session; remote workspaces get their own session (so they survive
 /// SSH drops).
@@ -499,44 +511,6 @@ pub fn start_workspace_on_task(spec: StartSpec<'_>) -> Result<TmuxAddr> {
     //    exist yet, this is a no-op; otherwise the next step recreates it.
     kill_workspace_pane(&host, &addr)?;
 
-    // 4. Create the pane. Start with an interactive shell (no `-c <cmd>`)
-    //    so the user's rc files run and the pane outlives the agent
-    //    process. Local = window in the project session; remote = its own
-    //    session so the workspace survives an SSH drop.
-    match &host {
-        Host::Local => {
-            if !shelbi_tmux::has_session(&host, &addr.session)? {
-                shelbi_tmux::new_session(&host, &addr.session, &addr.window, None)?;
-            } else {
-                shelbi_tmux::new_window(&host, &addr.session, &addr.window, None)?;
-            }
-        }
-        Host::Ssh { .. } => {
-            shelbi_tmux::new_session(&host, &addr.session, &addr.window, None)?;
-        }
-    }
-
-    // 5. cd into the worktree and launch the agent.
-    //
-    //    Local: tmux server inherits the user's already-set-up login env
-    //    (since the user ran shelbi from their own terminal), so a plain
-    //    invocation finds everything on PATH. No `exec` — when the agent
-    //    exits, the shell stays so the workspace pane is reusable.
-    //
-    //    Remote: tmux was started by `ssh host -- tmux new-session …`,
-    //    which runs through a NON-login non-interactive shell — so tmux
-    //    (and every pane it spawns) inherits a stripped-down PATH that's
-    //    missing Homebrew, asdf, nvm, etc. Re-exec through `$SHELL -lc`
-    //    so the login rc files (~/.zprofile, ~/.bash_profile) run and we
-    //    pick up the same PATH the user has in their own terminal —
-    //    otherwise claude launches without its expected env and dies with
-    //    "Input must be provided either through stdin or as a prompt
-    //    argument when using --print".
-    //
-    //    `LANG=C.UTF-8` is cheap, low-risk insurance: a non-interactive
-    //    SSH launch can leave the tmux server in the C locale, and forcing
-    //    UTF-8 keeps every box-drawing/glyph path well-defined regardless
-    //    of host config.
     // Inject `--permission-mode <mode>` directly on the claude command line
     // rather than trusting the rendered `.claude/settings.json` to take effect.
     // Settings-based mode is fragile (silent fallback to interactive on any
@@ -549,19 +523,93 @@ pub fn start_workspace_on_task(spec: StartSpec<'_>) -> Result<TmuxAddr> {
         spec.agent.map(|_| WORKTREE_AGENT_INSTRUCTIONS_REL),
         &runner,
     );
-    let cd_launch = if host.is_local() {
-        format!(
-            "cd {wd} && LANG=C.UTF-8 {launch}",
-            wd = shelbi_agent::shell_escape(&worktree.to_string_lossy()),
-        )
-    } else {
-        format!(
-            "cd {wd} && LANG=C.UTF-8 exec \"${{SHELL:-/bin/bash}}\" -lc {launch}",
-            wd = shelbi_agent::shell_escape(&worktree.to_string_lossy()),
-            launch = shelbi_agent::shell_escape(&launch),
-        )
-    };
-    shelbi_tmux::send_line(&host, &addr, &cd_launch)?;
+
+    // 4 + 5. Create the pane and launch the agent.
+    //
+    // Local: the pane's top-level process is the `shelbi workspace open
+    //   <name> --as-pane` lifecycle wrapper. The wrapper cd's into the
+    //   worktree, execs the agent, waits for it, and writes a
+    //   `pane_alive=false reason=<…>` line to events.log on any exit
+    //   path (clean exit, SIGHUP from tmux teardown, SIGTERM from
+    //   kill-window, SIGINT, child crash). Same wrapper invocation as
+    //   the sidebar-click path so a manual `tmux kill-window` and a
+    //   workspace dispatch can't drift apart.
+    //
+    // Remote: the lifecycle wrapper isn't deployed to remote machines
+    //   (no shelbi binary on the workspace host), so the historical
+    //   `send_line(cd && claude)` flow stays. We still create an empty
+    //   session first so the user's login rc files run when the shell
+    //   spawns.
+    //
+    //   `LANG=C.UTF-8` is cheap, low-risk insurance: a non-interactive
+    //   SSH launch can leave the tmux server in the C locale, and forcing
+    //   UTF-8 keeps every box-drawing/glyph path well-defined regardless
+    //   of host config.
+    //
+    //   The `$SHELL -lc` re-exec on the remote path is needed because
+    //   tmux was started by `ssh host -- tmux new-session …`, which runs
+    //   through a NON-login non-interactive shell — tmux (and every pane
+    //   it spawns) inherits a stripped-down PATH missing Homebrew, asdf,
+    //   nvm, etc. The login shell sources ~/.zprofile / ~/.bash_profile
+    //   and picks up the same PATH the user has in their own terminal.
+    match &host {
+        Host::Local => {
+            let shelbi_bin = current_exe_string()?;
+            let pane_cmd = format!(
+                "{bin} --project {proj} workspace open {ws} --as-pane",
+                bin = shelbi_agent::shell_escape(&shelbi_bin),
+                proj = shelbi_agent::shell_escape(&spec.project.name),
+                ws = shelbi_agent::shell_escape(&spec.workspace.name),
+            );
+            // Mirror the orchestrator pane's bootstrap shape (lib.rs):
+            // pass `sh`, `-c`, `<cmd>` as three positionals so tmux runs
+            // the wrapper through a shell, picking up the user's PATH
+            // from the local tmux server's existing env.
+            let target = format!("{}:", addr.session);
+            if !shelbi_tmux::has_session(&host, &addr.session)? {
+                shelbi_ssh::run_capture(
+                    &host,
+                    [
+                        "tmux",
+                        "new-session",
+                        "-d",
+                        "-s",
+                        &addr.session,
+                        "-n",
+                        &addr.window,
+                        "sh",
+                        "-c",
+                        &pane_cmd,
+                    ],
+                )?;
+            } else {
+                shelbi_ssh::run_capture(
+                    &host,
+                    [
+                        "tmux",
+                        "new-window",
+                        "-d",
+                        "-t",
+                        &target,
+                        "-n",
+                        &addr.window,
+                        "sh",
+                        "-c",
+                        &pane_cmd,
+                    ],
+                )?;
+            }
+        }
+        Host::Ssh { .. } => {
+            shelbi_tmux::new_session(&host, &addr.session, &addr.window, None)?;
+            let cd_launch = format!(
+                "cd {wd} && LANG=C.UTF-8 exec \"${{SHELL:-/bin/bash}}\" -lc {launch}",
+                wd = shelbi_agent::shell_escape(&worktree.to_string_lossy()),
+                launch = shelbi_agent::shell_escape(&launch),
+            );
+            shelbi_tmux::send_line(&host, &addr, &cd_launch)?;
+        }
+    }
 
     // 6. Wait until claude has drawn its input box before typing the prompt.
     //    A fixed sleep is fragile: claude's boot time varies with load, and

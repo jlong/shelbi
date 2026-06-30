@@ -162,88 +162,44 @@ pub fn show_view(project_name: &str, view: &str) -> Result<()> {
     Ok(())
 }
 
-/// Focus the dashboard window on the declared workspace's pane.
+/// Focus the dashboard window on the declared workspace's pane,
+/// lazily creating it if it doesn't exist yet.
 ///
-/// Local workspaces live in a window named after the workspace inside the
-/// project session (placed there by `shelbi task start`). Remote workspaces
-/// live in their own tmux session on the remote machine — we surface them
-/// by maintaining a *proxy window* in the project session, named after
-/// the workspace, whose command is `ssh -t <host> tmux attach -t
-/// shelbi-w-<workspace>`. The proxy is created lazily on first selection and
-/// re-used on subsequent selections; closing it (e.g. detaching from the
-/// remote tmux) lets the next selection spawn a fresh one.
+/// Delegates to `shelbi workspace open <name>` so the focus-or-create
+/// decision lives in exactly one place. That CLI subcommand owns the
+/// lifecycle wrapper that wraps local workspace panes (so a worker
+/// dying writes a `pane_alive=false` event to `~/.shelbi/events.log`)
+/// and preserves the remote proxy-window mechanism that makes devbox
+/// workspaces clickable from the local sidebar.
 ///
-/// Single source of truth for the sidebar's Enter-on-workspace behavior and
-/// the Ctrl+P palette's workspace entries — both call here so they can't
-/// drift.
+/// Used by the sidebar's Enter-on-workspace handler and the Ctrl+P
+/// palette's workspace entries — both call here so they can't drift.
 pub fn focus_workspace(project_name: &str, workspace_name: &str) -> Result<()> {
-    let project = shelbi_state::load_project(project_name)?;
-    let workspace = project.workspace(workspace_name).ok_or_else(|| {
-        Error::Other(format!(
-            "workspace `{workspace_name}` not declared in project YAML"
-        ))
-    })?;
-    let machine = project.machine(&workspace.machine).ok_or_else(|| {
-        Error::Other(format!(
-            "workspace `{workspace_name}` references unknown machine `{}`",
-            workspace.machine
-        ))
-    })?;
-
-    let project_session = format!("shelbi-{project_name}");
-    let target = format!("{project_session}:{}", workspace.name);
-
-    // Window already in the project session — local workspace window OR a
-    // remote proxy window we created earlier. Just switch to it.
-    if run_local_tmux(["select-window", "-t", &target]) {
-        return Ok(());
-    }
-
-    match machine.host() {
-        Host::Local => Err(Error::Other(format!(
-            "workspace has no live pane — assign a task with \
-             `shelbi task start <task> --workspace {workspace_name}`"
-        ))),
-        Host::Ssh { host } => {
-            let remote_session = format!("shelbi-w-{}", workspace.name);
-            let cmd = format!(
-                "ssh -t {host} tmux attach -t {remote_session}",
-                host = shelbi_agent::shell_escape(&host),
-                remote_session = shelbi_agent::shell_escape(&remote_session),
-            );
-            let ok = run_local_tmux([
-                "new-window",
-                "-t",
-                &format!("{project_session}:"),
-                "-n",
-                &workspace.name,
-                "sh",
-                "-c",
-                &cmd,
-            ]);
-            if !ok {
-                return Err(Error::Other(format!(
-                    "couldn't open proxy window for remote workspace `{workspace_name}` on `{host}`"
-                )));
-            }
-            let _ = run_local_tmux(["select-window", "-t", &target]);
-            Ok(())
-        }
-    }
-}
-
-fn run_local_tmux<I, S>(args: I) -> bool
-where
-    I: IntoIterator<Item = S>,
-    S: AsRef<std::ffi::OsStr>,
-{
-    std::process::Command::new("tmux")
-        .args(args)
+    let shelbi_bin = current_exe_string()?;
+    let out = std::process::Command::new(&shelbi_bin)
+        .args([
+            "--project",
+            project_name,
+            "workspace",
+            "open",
+            workspace_name,
+        ])
         .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false)
+        .stderr(std::process::Stdio::piped())
+        .output()
+        .map_err(Error::Io)?;
+    if !out.status.success() {
+        let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
+        let detail = if stderr.is_empty() {
+            format!("status={}", out.status)
+        } else {
+            stderr
+        };
+        return Err(Error::Other(format!(
+            "shelbi workspace open `{workspace_name}` failed: {detail}"
+        )));
+    }
+    Ok(())
 }
 
 /// Idempotently set up the project's tmux session with a `dashboard`

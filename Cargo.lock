@@ -982,6 +982,7 @@ dependencies = [
  "crossterm 0.28.1",
  "dirs",
  "inquire",
+ "libc",
  "nucleo-matcher",
  "ratatui",
  "serde",
@@ -995,6 +996,7 @@ dependencies = [
  "shelbi-state",
  "shelbi-tmux",
  "shelbi-tui",
+ "signal-hook",
  "tracing",
  "tracing-subscriber",
 ]

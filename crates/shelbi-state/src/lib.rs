@@ -54,9 +54,10 @@ pub use user_config::{
 pub use workspace_status::{
     append_contextstore_event, append_dispatch_event, append_heartbeat_event,
     append_project_event, append_rebase_event, append_task_event, append_workspace_event,
-    append_zen_dryrun_event, append_zen_mode_event, events_log_path, load_workspace_status,
-    parse_pane_title_marker, parse_pane_title_state, save_workspace_status, workspace_status_path,
-    workspaces_dir, PaneMarker, WorkspaceState, WorkspaceStatus,
+    append_workspace_pane_event, append_zen_dryrun_event, append_zen_mode_event, events_log_path,
+    load_workspace_status, parse_pane_title_marker, parse_pane_title_state,
+    save_workspace_status, workspace_status_path, workspaces_dir, PaneMarker, WorkspaceState,
+    WorkspaceStatus,
 };
 pub use workflows::{
     list_workflows, load_project_statuses, load_workflow, save_project_statuses, statuses_path,
