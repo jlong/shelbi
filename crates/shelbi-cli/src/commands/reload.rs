@@ -1,4 +1,5 @@
 use anyhow::{anyhow, Result};
+use shelbi_orchestrator::handoff::HandoffOutcome;
 use shelbi_orchestrator::{PaneReloadStatus, ReloadReport};
 use shelbi_state::WorkspaceSettingsTemplateOutcome;
 
@@ -6,14 +7,24 @@ use super::init::print_agent_materialize_outcome;
 use super::require_project;
 
 /// Respawn the four shelbi-owned panes (sidebar + tasks/review/machines
-/// stash) in-place, then self-heal the per-project agent workspaces
-/// (`agents/{orchestrator,developer}/`) and the workspace-settings
-/// template so a freshly installed binary that ships updated defaults —
-/// or a wiped/stale on-disk copy — lands without forcing the user to
-/// recreate the project. User-edited `instructions.md` files are
-/// preserved byte-for-byte; the workspace-settings template is always
-/// re-aligned with the shipped default (users who want customization
-/// point `workspace_settings_template` at their own file).
+/// stash) AND the orchestrator pane in-place, then self-heal the
+/// per-project agent workspaces (`agents/{orchestrator,developer}/`)
+/// and the workspace-settings template so a freshly installed binary
+/// that ships updated defaults — or a wiped/stale on-disk copy —
+/// lands without forcing the user to recreate the project.
+///
+/// Before respawning the orchestrator pane, the previous instance is
+/// asked to write `agents/orchestrator/handoff.md` covering its
+/// in-flight state. The new instance ingests that file as a
+/// `<system-reminder>` block in its system prompt and deletes it, so
+/// `shelbi reload` carries the orchestrator's mid-thought context
+/// forward instead of starting cold. A missing or timed-out handoff
+/// is degraded (next orchestrator starts cold) but not fatal.
+///
+/// User-edited `instructions.md` files are preserved byte-for-byte;
+/// the workspace-settings template is always re-aligned with the
+/// shipped default (users who want customization point
+/// `workspace_settings_template` at their own file).
 pub fn run(project_opt: Option<String>) -> Result<()> {
     // Migration hook for the dropped `.shelbi/project` marker: sweep every
     // registered project's work_dir, delete any leftover marker, and warn
@@ -111,6 +122,30 @@ fn print_report(project: &str, r: &ReloadReport) {
     print_pane("review", &r.review);
     print_pane("machines", &r.machines);
     print_pane("activity", &r.activity);
+    if let Some(h) = &r.handoff {
+        print_handoff(h);
+    }
+    print_pane("orch", &r.orchestrator);
+}
+
+fn print_handoff(outcome: &HandoffOutcome) {
+    match outcome {
+        HandoffOutcome::Written { path } => {
+            println!("  ✓ handoff   captured ({})", path.display());
+        }
+        HandoffOutcome::PaneNotAlive => {
+            println!("  · handoff   skipped (orchestrator pane not running)");
+        }
+        HandoffOutcome::Timeout => {
+            println!(
+                "  ⚠ handoff   timed out waiting for the orchestrator to write \
+                 handoff.md; next start will be cold"
+            );
+        }
+        HandoffOutcome::SendFailed { reason } => {
+            println!("  ⚠ handoff   couldn't ask the orchestrator: {reason}");
+        }
+    }
 }
 
 fn print_pane(name: &str, status: &PaneReloadStatus) {

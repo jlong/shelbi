@@ -49,6 +49,20 @@ pub const SHARED_AGENT_DIR: &str = "_shared";
 /// agents see their own instructions verbatim.
 pub const SHARED_PREAMBLE_FILE: &str = "preamble.md";
 
+/// File name of the orchestrator's one-shot state-transfer file. Lives
+/// inside `agents/orchestrator/` and is written by the outgoing
+/// orchestrator (on `shelbi reload` / `shelbi quit`) and ingested by the
+/// next instance (on startup / post-reload respawn), then deleted. Not
+/// persistent state — durable orchestrator state lives in `state.json`.
+pub const HANDOFF_FILE: &str = "handoff.md";
+
+/// Relative path (from the orchestrator's workdir) where its handoff
+/// file lives. The orchestrator's workdir IS `~/.shelbi/projects/<name>/`
+/// (see `ensure_dashboard`), and its agent dir is `agents/orchestrator/`,
+/// so a CWD-relative `agents/orchestrator/handoff.md` is the path the
+/// running orchestrator sees in its filesystem.
+pub const ORCHESTRATOR_HANDOFF_REL: &str = "agents/orchestrator/handoff.md";
+
 /// Bundled orchestrator `instructions.md` content. Source of truth for
 /// both the agent workspace materialize/self-heal path and the legacy
 /// `shelbi_orchestrator::DEFAULT_SYSTEM_PROMPT` re-export.
@@ -141,6 +155,50 @@ pub fn agent_shared_preamble_path(project: &str) -> Result<PathBuf> {
     Ok(agents_dir(project)?
         .join(SHARED_AGENT_DIR)
         .join(SHARED_PREAMBLE_FILE))
+}
+
+/// `~/.shelbi/projects/<project>/agents/orchestrator/handoff.md` — the
+/// orchestrator's one-shot state-transfer file. Written by the outgoing
+/// orchestrator on `shelbi reload` / `shelbi quit` and ingested
+/// (then deleted) by the next instance on startup. Same path the
+/// orchestrator's instructions reference, so the directory layout the
+/// running orchestrator sees agrees with the path callers compute.
+pub fn orchestrator_handoff_path(project: &str) -> Result<PathBuf> {
+    Ok(agent_workspace_dir(project, ORCHESTRATOR_AGENT)?.join(HANDOFF_FILE))
+}
+
+/// Read and delete the orchestrator's handoff file. Returns `Ok(None)`
+/// when the file isn't there — the normal case on a clean start.
+///
+/// "Take" semantics (read-then-delete) keep the handoff one-shot: even
+/// if a downstream caller crashes between the read and the next
+/// orchestrator launch, the stale file is already gone so the next
+/// instance won't re-ingest it. A failed delete is logged but not
+/// surfaced as an error — leaving the file behind degrades to a
+/// (re-)ingest on the next start, which is recoverable, whereas
+/// failing the launch on a stuck `rm` would be worse.
+///
+/// Best-effort: malformed UTF-8 or partial writes are returned to the
+/// caller as-is; the [`compose_agent_prompt`] splice path treats the
+/// content as opaque text, and the orchestrator can sanity-check what
+/// it received when ingesting.
+pub fn take_orchestrator_handoff(project: &str) -> Result<Option<String>> {
+    let path = orchestrator_handoff_path(project)?;
+    match fs::read_to_string(&path) {
+        Ok(s) => {
+            if let Err(e) = fs::remove_file(&path) {
+                tracing::warn!(
+                    project,
+                    handoff = %path.display(),
+                    error = %e,
+                    "failed to delete handoff.md after ingestion (will re-ingest on next start)",
+                );
+            }
+            Ok(Some(s))
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(Error::Io(e)),
+    }
 }
 
 /// Read the per-project shared preamble if it exists, otherwise return
@@ -788,6 +846,71 @@ mod tests {
         // Retry-once-then-continue is the spec's loss-handling rule —
         // pin it so a future copy edit can't quietly drop the policy.
         assert!(DEFAULT_DEVELOPER_INSTRUCTIONS.contains("retry once"));
+    }
+
+    #[test]
+    fn orchestrator_handoff_path_lives_inside_orchestrator_workspace() {
+        // The path must land at `agents/orchestrator/handoff.md` so the
+        // orchestrator (running with cwd = project dir) sees the same
+        // path its instructions reference.
+        let _g = LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+
+        let path = orchestrator_handoff_path("p").unwrap();
+        let expected_tail = "agents/orchestrator/handoff.md";
+        let path_str = path.to_string_lossy();
+        assert!(
+            path_str.ends_with(expected_tail),
+            "expected path ending with {expected_tail}, got {path_str}"
+        );
+
+        // And the orchestrator-instructions-relative constant exposed
+        // for the request message must match the path's tail so the
+        // request message points the agent at the correct file.
+        assert!(
+            path_str.ends_with(ORCHESTRATOR_HANDOFF_REL),
+            "ORCHESTRATOR_HANDOFF_REL ({ORCHESTRATOR_HANDOFF_REL}) must match the on-disk path tail",
+        );
+
+        std::env::remove_var("SHELBI_HOME");
+    }
+
+    #[test]
+    fn take_orchestrator_handoff_reads_then_deletes_the_file() {
+        // Acceptance criterion: handoff is one-shot. Read returns
+        // the body and the file is gone afterwards so a second
+        // ingestion on the next reload doesn't replay stale state.
+        let _g = LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+
+        let path = orchestrator_handoff_path("p").unwrap();
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, "in-flight: X\n").unwrap();
+
+        let got = take_orchestrator_handoff("p").unwrap();
+        assert_eq!(got.as_deref(), Some("in-flight: X\n"));
+        assert!(
+            !path.exists(),
+            "handoff.md must be deleted after take_orchestrator_handoff"
+        );
+
+        std::env::remove_var("SHELBI_HOME");
+    }
+
+    #[test]
+    fn take_orchestrator_handoff_returns_none_when_absent() {
+        // Cold-start case — no handoff on disk is normal, not an
+        // error. Caller treats `None` as "start fresh".
+        let _g = LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+
+        let got = take_orchestrator_handoff("p").unwrap();
+        assert!(got.is_none());
+
+        std::env::remove_var("SHELBI_HOME");
     }
 
     #[test]

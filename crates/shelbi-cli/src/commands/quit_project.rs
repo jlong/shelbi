@@ -32,19 +32,26 @@ pub struct ActiveWorkspace {
 
 /// Quit `project`:
 ///
-/// 1. Kill every workspace pane (local windows + remote sessions). The user
+/// 1. Ask the live orchestrator to write
+///    `agents/orchestrator/handoff.md` covering its in-flight state.
+///    The file persists between quit and the next `shelbi` launch
+///    (deleted only after the new instance ingests it), so a
+///    quit/start cycle carries the orchestrator's mid-thought
+///    context forward. Best-effort — a missing/timed-out handoff
+///    degrades to a cold next start, not a stuck quit.
+/// 2. Kill every workspace pane (local windows + remote sessions). The user
 ///    is closing the whole project, so we don't try to preserve in-flight
 ///    task assignments here — the cards stay on the board and get picked
 ///    up the next time the project's dispatched.
-/// 2. Pick the most-recently-attached *other* `shelbi-*` session.
-/// 3. `switch-client` to it BEFORE killing the current session — without
+/// 3. Pick the most-recently-attached *other* `shelbi-*` session.
+/// 4. `switch-client` to it BEFORE killing the current session — without
 ///    this the popup's tmux client briefly disconnects, which can flash
 ///    a bare terminal at the user.
-/// 4. Kill the hidden stash session (`_shelbi-<project>`) and then the
+/// 5. Kill the hidden stash session (`_shelbi-<project>`) and then the
 ///    visible session (`shelbi-<project>`). Both are idempotent and
 ///    cleared by the local `session-closed` hook anyway, but doing the
 ///    work explicitly keeps the teardown order deterministic.
-/// 5. Append a `project=<name> closed reason=user:quit-project` line to
+/// 6. Append a `project=<name> closed reason=user:quit-project` line to
 ///    the events log so the activity feed shows the close.
 ///
 /// Before killing anything we also clear `state.json::zen_last_crashed_at`.
@@ -55,6 +62,13 @@ pub struct ActiveWorkspace {
 /// a crash and auto-disable Zen.
 pub fn run(project: &str) -> Result<()> {
     let p = shelbi_state::load_project(project).map_err(|e| anyhow!(e))?;
+
+    // Capture the orchestrator's in-flight state before any kill. We
+    // ignore the outcome — list_active_workspaces and the palette
+    // popover have already shown the user what's about to happen and
+    // they confirmed; a degraded handoff (timeout, send failed) means
+    // the next start is cold, not that the quit should fail.
+    let _ = shelbi_orchestrator::handoff::request_orchestrator_handoff(project);
 
     let _ = shelbi_state::zen_clear_crash(project);
 

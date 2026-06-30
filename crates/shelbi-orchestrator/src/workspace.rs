@@ -1020,8 +1020,34 @@ pub fn deploy_agent_context(
     // handles the missing-preamble case (just the agent's prompt) and
     // the `{{assistant_name}}` substitution. Any file-read failure
     // surfaces from there with the same shape the old direct-read used.
-    let composed = shelbi_state::compose_agent_prompt(project_name, agent)
+    let mut composed = shelbi_state::compose_agent_prompt(project_name, agent)
         .map_err(|e| Error::Other(format!("{e}")))?;
+    // Orchestrator-only: if a `handoff.md` was left by the previous
+    // instance (on `shelbi reload` or `shelbi quit`), splice it onto
+    // the end of the system prompt as a `<system-reminder>` block so
+    // the new instance picks up where the old one left off. Read-and-
+    // delete — handoff is one-shot; persistent state lives in
+    // `state.json`. Skipped silently for every non-orchestrator agent
+    // (developer dispatches, custom agents) so a worktree's deploy
+    // never ingests handoff data meant for the dashboard.
+    if agent == shelbi_state::ORCHESTRATOR_AGENT {
+        match shelbi_state::take_orchestrator_handoff(project_name) {
+            Ok(Some(handoff)) => {
+                composed = splice_orchestrator_handoff(&composed, &handoff);
+            }
+            Ok(None) => {}
+            Err(e) => {
+                // Surface but don't fail the deploy — a missing handoff
+                // is a degraded start (new instance is cold), not a
+                // broken one.
+                tracing::warn!(
+                    project = project_name,
+                    error = %e,
+                    "take_orchestrator_handoff failed; starting orchestrator cold",
+                );
+            }
+        }
+    }
     deploy_agent_instructions(host, worktree, &composed)?;
 
     let skills_src = shelbi_state::agent_skills_dir(project_name, agent)?;
@@ -1034,6 +1060,32 @@ pub fn deploy_agent_context(
     // write error — the user can still hand-migrate.
     let _ = shelbi_state::maybe_emit_claude_md_migration_hint(project_name);
     Ok(())
+}
+
+/// Wrap `handoff` in a `<system-reminder>` block and append it to
+/// `composed`. The block is rendered as plain text — the orchestrator's
+/// claude runtime renders it as a system-reminder in the conversation
+/// transcript, which is exactly how we want the next instance to read
+/// it (load-bearing context from the previous instance, distinct from
+/// the evergreen instructions above it).
+///
+/// Pure on its inputs so it's unit-testable without a real handoff
+/// file on disk.
+fn splice_orchestrator_handoff(composed: &str, handoff: &str) -> String {
+    let mut out =
+        String::with_capacity(composed.len() + handoff.len() + 64);
+    out.push_str(composed);
+    if !composed.ends_with('\n') {
+        out.push('\n');
+    }
+    out.push('\n');
+    out.push_str("<system-reminder>\n");
+    out.push_str(handoff);
+    if !handoff.ends_with('\n') {
+        out.push('\n');
+    }
+    out.push_str("</system-reminder>\n");
+    out
 }
 
 /// Write `instructions` to `<worktree>/.claude/agent-instructions.md` so
@@ -2366,6 +2418,137 @@ mod tests {
         assert_eq!(
             body, "monorepo overview\n\n# developer\nfix the bug\n",
             "preamble must lead, blank line separator, then the agent's instructions"
+        );
+
+        std::env::remove_var("SHELBI_HOME");
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn splice_orchestrator_handoff_wraps_in_system_reminder_block() {
+        // The next orchestrator instance reads the handoff as system-
+        // reminder context — locked-in shape so a renamer doesn't
+        // silently move the marker tags.
+        let out = splice_orchestrator_handoff(
+            "# orchestrator\nbody\n",
+            "in-flight: nothing\n",
+        );
+        assert!(out.starts_with("# orchestrator\nbody\n"));
+        assert!(out.contains("<system-reminder>\nin-flight: nothing\n</system-reminder>\n"));
+    }
+
+    #[test]
+    fn splice_orchestrator_handoff_normalises_missing_trailing_newlines() {
+        // Either input may lack a trailing newline (the orchestrator
+        // wrote without one, or a hand-edited instructions.md was
+        // saved without one). The splice has to leave the block tags
+        // on their own lines regardless.
+        let out = splice_orchestrator_handoff("body", "handoff");
+        assert!(out.ends_with("</system-reminder>\n"));
+        assert!(out.contains("\n<system-reminder>\nhandoff\n</system-reminder>\n"));
+    }
+
+    #[test]
+    fn deploy_agent_context_splices_handoff_into_orchestrator_prompt_then_deletes_file() {
+        // Acceptance criterion: on orchestrator (re)launch, if
+        // `agents/orchestrator/handoff.md` exists, the deploy step
+        // splices it in as a <system-reminder> block AND deletes the
+        // file so the next launch doesn't double-ingest the same
+        // handoff.
+        let _g = crate::test_lock::acquire();
+        let tmp = agent_test_tmpdir("ctx-handoff-splice");
+        let home = tmp.join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        std::env::set_var("SHELBI_HOME", &home);
+        install_default_agents_under_home(&home, "p");
+
+        // Seed the handoff file the previous instance would have left
+        // behind on `shelbi reload` / `shelbi quit`.
+        let handoff_path = shelbi_state::orchestrator_handoff_path("p").unwrap();
+        std::fs::write(&handoff_path, "watching: task xyz\n").unwrap();
+
+        let worktree = tmp.join("wt");
+        std::fs::create_dir_all(&worktree).unwrap();
+
+        deploy_agent_context(&Host::Local, &worktree, "p", "orchestrator").unwrap();
+
+        let instructions = worktree.join(".claude/agent-instructions.md");
+        let body = std::fs::read_to_string(&instructions).unwrap();
+        assert!(
+            body.contains("# orchestrator\ncoordinate"),
+            "orchestrator instructions should still be present: {body}"
+        );
+        assert!(
+            body.contains("<system-reminder>\nwatching: task xyz\n</system-reminder>"),
+            "handoff must be spliced as a system-reminder block: {body}"
+        );
+        assert!(
+            !handoff_path.exists(),
+            "handoff.md must be deleted after ingestion (one-shot transfer file)"
+        );
+
+        std::env::remove_var("SHELBI_HOME");
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn deploy_agent_context_skips_handoff_splice_for_non_orchestrator_agents() {
+        // A workspace dispatch under the developer agent must NEVER
+        // ingest the orchestrator's handoff — that file is private to
+        // the dashboard pane, and a leaked splice would dump
+        // unrelated state into a worker's prompt.
+        let _g = crate::test_lock::acquire();
+        let tmp = agent_test_tmpdir("ctx-handoff-dev-skip");
+        let home = tmp.join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        std::env::set_var("SHELBI_HOME", &home);
+        install_default_agents_under_home(&home, "p");
+
+        let handoff_path = shelbi_state::orchestrator_handoff_path("p").unwrap();
+        std::fs::write(&handoff_path, "private orch state\n").unwrap();
+
+        let worktree = tmp.join("wt");
+        std::fs::create_dir_all(&worktree).unwrap();
+
+        deploy_agent_context(&Host::Local, &worktree, "p", "developer").unwrap();
+
+        let instructions = worktree.join(".claude/agent-instructions.md");
+        let body = std::fs::read_to_string(&instructions).unwrap();
+        assert!(
+            !body.contains("private orch state"),
+            "developer dispatch must NOT ingest orchestrator handoff: {body}"
+        );
+        assert!(
+            handoff_path.exists(),
+            "developer dispatch must NOT consume the orchestrator's handoff file"
+        );
+
+        std::env::remove_var("SHELBI_HOME");
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn deploy_agent_context_orchestrator_works_without_handoff_file() {
+        // No handoff file is the normal cold-start case (first launch,
+        // first reload, etc.). Deploy must not error or splice an
+        // empty block.
+        let _g = crate::test_lock::acquire();
+        let tmp = agent_test_tmpdir("ctx-handoff-none");
+        let home = tmp.join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        std::env::set_var("SHELBI_HOME", &home);
+        install_default_agents_under_home(&home, "p");
+
+        let worktree = tmp.join("wt");
+        std::fs::create_dir_all(&worktree).unwrap();
+
+        deploy_agent_context(&Host::Local, &worktree, "p", "orchestrator").unwrap();
+
+        let instructions = worktree.join(".claude/agent-instructions.md");
+        let body = std::fs::read_to_string(&instructions).unwrap();
+        assert!(
+            !body.contains("<system-reminder>"),
+            "cold start must NOT inject an empty system-reminder block: {body}"
         );
 
         std::env::remove_var("SHELBI_HOME");

@@ -196,10 +196,16 @@ enum Cmd {
     Wizard,
     /// Start the orchestrator agent in the project's tmux session window 1.
     Orchestrate(commands::orchestrate::Args),
-    /// Respawn the shelbi-owned panes (sidebar + tasks/review/machines) in
-    /// place so a freshly installed binary takes effect. Leaves the
-    /// orchestrator pane and workspace panes alone — those re-shell into
-    /// shelbi on every call and pick up the new binary automatically.
+    /// Respawn the shelbi-owned panes (sidebar + tasks/review/machines)
+    /// AND the orchestrator pane in place so a freshly installed binary
+    /// takes effect — and edits to the orchestrator's instructions /
+    /// preamble land without a manual tear-down. The previous
+    /// orchestrator is asked to write `agents/orchestrator/handoff.md`
+    /// covering its in-flight state; the new instance ingests that
+    /// file (then deletes it), so reload carries the orchestrator's
+    /// mid-thought context forward. Workspace panes are left alone —
+    /// they re-shell into shelbi on every call and pick up the new
+    /// binary automatically.
     Reload,
     /// (internal) Run the sidebar ratatui process inside the dashboard's
     /// left pane. Not for direct use.

@@ -132,6 +132,14 @@ fn any_user_dirty_line(porcelain: &str) -> bool {
 
 /// Tear down every shelbi tmux session on this host.
 ///
+/// First, fan out: ask every live orchestrator pane to write its
+/// `agents/orchestrator/handoff.md` in parallel. Each request runs in
+/// its own thread (capped at 30s by
+/// [`shelbi_orchestrator::handoff::request_orchestrator_handoff`]) so a
+/// multi-project quit doesn't serialize the per-project wait. Files
+/// persist between quit and the next launch; the next instance
+/// ingests + deletes them.
+///
 /// Synchronously: per project, kill workspace panes (local windows +
 /// remote `shelbi-w-*` sessions), clear the zen crash heartbeat so the
 /// next launch doesn't misread the quit as a crash, and append a
@@ -160,6 +168,25 @@ fn any_user_dirty_line(porcelain: &str) -> bool {
 pub fn run() -> Result<()> {
     let listing = list_sessions_listing();
     let names: Vec<String> = shelbi_project_session_names(&listing).collect();
+
+    // Fan out the handoff requests so multiple projects' orchestrators
+    // can write their handoff in parallel. Each thread is bounded by
+    // the 30s timeout inside `request_orchestrator_handoff`, so the
+    // worst-case wait is ~30s regardless of how many projects are
+    // live. Best-effort — every variant of the outcome is "okay to
+    // proceed" and we don't surface it to the user here.
+    let handoff_threads: Vec<_> = names
+        .iter()
+        .cloned()
+        .map(|name| {
+            std::thread::spawn(move || {
+                let _ = shelbi_orchestrator::handoff::request_orchestrator_handoff(&name);
+            })
+        })
+        .collect();
+    for t in handoff_threads {
+        let _ = t.join();
+    }
 
     for name in &names {
         let _ = shelbi_state::zen_clear_crash(name);

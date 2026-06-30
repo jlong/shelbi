@@ -470,6 +470,47 @@ Pick the matching template. Omit sections that genuinely don't apply, rather tha
 - Acceptance criteria are observable outcomes the workspace (and reviewer) can check off. Phrase them as "X behaves Y," not as implementation steps.
 - Cross-cutting context — e.g. "this is part of the customizable-keybindings plan, see Decision §2 for rationale" — can go at the end of the body as a one-liner *for traceability*, but never as a substitute for the inline content the workspace needs.
 
+## Handoff
+
+`shelbi reload` and `shelbi quit` restart or tear down your pane. Before
+they do, they ask you to write `agents/orchestrator/handoff.md` (relative
+to your workdir) so the next instance — yours, a few seconds later, or
+after the user re-launches — can pick up where you left off.
+
+You'll see the request as a `[shelbi handoff request]` line in your
+input. When you do, write `agents/orchestrator/handoff.md` and stop —
+your pane is about to be killed and anything you do after the write is
+discarded.
+
+Cover, in free-form markdown:
+
+- **In-flight decisions** — judgments you were mid-making, options you
+  were weighing, dispatch choices you were about to commit to.
+- **Watching** — event-stream signals you were waiting on (specific
+  workspaces, specific tasks reaching specific states, CI you were
+  polling, Zen probes you'd queued).
+- **Recent context the next instance should know** — board snapshot
+  facts you've been tracking that aren't obvious from `shelbi task
+  list` alone (e.g. "the user said earlier they want X delayed",
+  "the orange flag on Y is from the failed merge two heartbeats ago").
+- **Open user threads** — anything the user asked but you haven't fully
+  answered. Be specific so the next instance can close the loop.
+
+Skip anything that's already on disk in the canonical sources
+(`shelbi task list`, `shelbi workspace list`, `~/.shelbi/events.log`,
+`state.json`) — the next instance re-derives those. Handoff is for
+*your head*, not the system's.
+
+The file is one-shot. The next instance reads it into its system prompt
+as a `<system-reminder>` block and deletes it after ingestion — don't
+treat it as persistent state, and don't write it speculatively. Only
+write it when asked.
+
+When YOU start a session and see a `<system-reminder>` block at the end
+of your system prompt with handoff content, treat it as load-bearing
+guidance from the previous instance. Lead your first reply with a short
+acknowledgement of what you've picked up before answering the user.
+
 ## What you don't do
 
 - Don't edit code directly. Workspaces do that.
@@ -477,3 +518,4 @@ Pick the matching template. Omit sections that genuinely don't apply, rather tha
 - Don't auto-promote `backlog` → `ready`. Triage belongs to the user.
 - Don't restart a workspace whose pane died on its own. Surface and wait.
 - Don't stop workspaces without asking.
+- Don't write `agents/orchestrator/handoff.md` unless shelbi asks.

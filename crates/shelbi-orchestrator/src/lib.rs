@@ -21,6 +21,7 @@ pub mod actions;
 pub mod contextstore;
 pub mod dispatch;
 mod git;
+pub mod handoff;
 pub mod lifecycle;
 pub mod review;
 pub mod workspace;
@@ -81,6 +82,19 @@ pub struct ReloadReport {
     pub review: PaneReloadStatus,
     pub machines: PaneReloadStatus,
     pub activity: PaneReloadStatus,
+    /// Orchestrator (dashboard right pane). Respawned after the four
+    /// shelbi-owned panes above so a freshly installed binary's
+    /// updated `instructions.md` / preamble takes effect without the
+    /// user having to manually tear down the orchestrator pane. The
+    /// previous instance's in-flight state is carried forward via
+    /// [`handoff::request_orchestrator_handoff`], whose outcome lives
+    /// on [`ReloadReport::handoff`].
+    pub orchestrator: PaneReloadStatus,
+    /// What happened when we asked the previous orchestrator to write
+    /// `agents/orchestrator/handoff.md` before the respawn. `None` is
+    /// the legacy/no-attempt state; otherwise carries the outcome of
+    /// the request (file written, pane already dead, timeout, etc.).
+    pub handoff: Option<handoff::HandoffOutcome>,
 }
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
@@ -790,6 +804,15 @@ fn machines_cmd(shelbi_bin: &str, project_name: &str) -> String {
 /// - stash `review` pane → review-view loop
 /// - stash `machines` pane → `shelbi workspace list` loop
 /// - stash `activity` pane → activity-view loop
+/// - orchestrator pane (`dashboard.{right}`) → its launch wrapper
+///
+/// Before respawning the orchestrator pane, the previous instance is
+/// asked to write `agents/orchestrator/handoff.md` — a one-shot
+/// state-transfer file the new instance ingests via the
+/// `deploy_agent_context` splice path. See
+/// [`handoff::request_orchestrator_handoff`] for the request/poll
+/// dance, [`handoff::HandoffOutcome`] for the variants. A missing or
+/// timed-out handoff degrades to a cold start, not a stuck reload.
 ///
 /// For each stash view, if `SHELBI_PANE_<view>` isn't set on the
 /// session (the session was bootstrapped before that view existed),
@@ -797,9 +820,9 @@ fn machines_cmd(shelbi_bin: &str, project_name: &str) -> String {
 /// into the session env — so a freshly-installed binary that adds a
 /// new view becomes clickable without re-creating the whole session.
 ///
-/// Out of scope: the orchestrator pane (claude re-shells out on each
-/// CLI call) and workspace panes (same). Those pick up the new binary
-/// automatically the next time they invoke `shelbi`.
+/// Out of scope: workspace panes (claude re-shells out on each CLI
+/// call). Those pick up the new binary automatically the next time
+/// they invoke `shelbi`.
 ///
 /// Idempotent: re-running incurs a visible flicker per pane but no
 /// state loss — the panes' job is to render derived state from disk,
@@ -817,7 +840,28 @@ pub fn reload(project_name: &str) -> Result<ReloadReport> {
     }
 
     let shelbi_bin = current_exe_string()?;
-    let mut report = ReloadReport::default();
+
+    // 0. Ask the previous orchestrator to write its handoff before we
+    //    touch any pane. Done up front so the orchestrator has the most
+    //    time possible to respond before we get to the respawn step,
+    //    and so its write doesn't race the sidebar flicker. Errors are
+    //    swallowed — the report's `handoff` field records what
+    //    happened for the caller's display.
+    let handoff_outcome = match handoff::request_orchestrator_handoff(project_name) {
+        Ok(outcome) => Some(outcome),
+        Err(e) => {
+            tracing::warn!(
+                project = project_name,
+                error = %e,
+                "request_orchestrator_handoff failed; orchestrator will restart cold",
+            );
+            None
+        }
+    };
+    let mut report = ReloadReport {
+        handoff: handoff_outcome,
+        ..Default::default()
+    };
 
     // Re-apply the palette tmux binding so reload picks up `keys.yml`
     // edits without forcing the user to kill + restart the dashboard.
@@ -841,7 +885,100 @@ pub fn reload(project_name: &str) -> Result<ReloadReport> {
     report.activity =
         reload_stash_pane(&session, "activity", &activity_cmd(&shelbi_bin, project_name));
 
+    // 6. Orchestrator pane. Re-deploy the agent context first so the new
+    //    launch sees the latest `instructions.md` / `preamble.md` AND
+    //    splices in the handoff (then deletes it). Then respawn the
+    //    pane in place — the pane id is preserved by `respawn-pane`,
+    //    so `show_view("orch")` keeps working.
+    report.orchestrator = reload_orchestrator_pane(&session, project_name, &shelbi_bin);
+
     Ok(report)
+}
+
+/// Respawn the orchestrator pane in place. Re-deploys the agent
+/// context (which composes `agents/_shared/preamble.md` +
+/// `agents/orchestrator/instructions.md` + spliced handoff) and
+/// rebuilds the launch wrapper. Failures are surfaced as
+/// `PaneReloadStatus::Failed` rather than aborting the broader reload
+/// — the four shelbi-owned panes have already been respawned
+/// successfully and the user can still drive the dashboard while the
+/// orchestrator is down.
+fn reload_orchestrator_pane(
+    session: &str,
+    project_name: &str,
+    shelbi_bin: &str,
+) -> PaneReloadStatus {
+    let project = match shelbi_state::load_project(project_name) {
+        Ok(p) => p,
+        Err(e) => {
+            return PaneReloadStatus::Failed {
+                target: format!("{session}:dashboard.{{right}}"),
+                reason: format!("load_project: {e}"),
+            };
+        }
+    };
+    let runner_spec = match project.runner(&project.orchestrator.runner) {
+        Some(r) => r.clone(),
+        None => {
+            return PaneReloadStatus::Failed {
+                target: format!("{session}:dashboard.{{right}}"),
+                reason: format!(
+                    "orchestrator runner `{}` not declared in project",
+                    project.orchestrator.runner,
+                ),
+            };
+        }
+    };
+    let workdir = match shelbi_state::project_dir(project_name) {
+        Ok(d) => d,
+        Err(e) => {
+            return PaneReloadStatus::Failed {
+                target: format!("{session}:dashboard.{{right}}"),
+                reason: format!("project_dir: {e}"),
+            };
+        }
+    };
+    // Re-stage `.claude/agent-instructions.md` from current on-disk
+    // instructions + preamble, splicing in handoff.md if present and
+    // deleting it after read. Best-effort — failures are logged and
+    // the launch proceeds with whatever's already in the file.
+    if let Err(e) = workspace::deploy_agent_context(
+        &Host::Local,
+        &workdir,
+        project_name,
+        shelbi_state::ORCHESTRATOR_AGENT,
+    ) {
+        tracing::warn!(
+            project = project_name,
+            error = %e,
+            "deploy_agent_context failed during reload; using stale agent-instructions.md",
+        );
+    }
+
+    let launch = launch_with_bootstrap(&runner_spec);
+    let cmd = orchestrator_pane_cmd(
+        shelbi_bin,
+        project_name,
+        session,
+        &workdir.to_string_lossy(),
+        &launch,
+    );
+
+    // Prefer the stored pane id so a view-swap-mid-reload (orchestrator
+    // not currently visible in the right slot) still hits the right
+    // pane. Fall back to the positional `{right}` target for older
+    // sessions that pre-date the `SHELBI_PANE_orch` env pin.
+    let target = match read_pane_id(session, "orch") {
+        Ok(Some(id)) => id,
+        Ok(None) => format!("{session}:dashboard.{{right}}"),
+        Err(e) => {
+            return PaneReloadStatus::Failed {
+                target: "(env SHELBI_PANE_orch)".into(),
+                reason: e.to_string(),
+            };
+        }
+    };
+    respawn_pane(&target, &cmd)
 }
 
 fn reload_stash_pane(session: &str, view: &str, cmd: &str) -> PaneReloadStatus {
