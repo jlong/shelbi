@@ -140,9 +140,16 @@ pub fn run(project_opt: Option<String>, args: Args) -> Result<()> {
             launch_cmd
         )
     } else {
+        // Prefix with `SHELBI_HUB_SOCK=<remote sock>` so the agent's
+        // socket-write paragraph (see agents/developer/instructions.md)
+        // can reach the SSH-reverse-forwarded hub socket. Without the
+        // env var the agent's instructions short-circuit and worker→hub
+        // events are dropped (per Phase 5's accepted residual risk).
+        let sock = shelbi_state::remote_hub_socket_path();
         format!(
-            "cd {} && exec \"${{SHELL:-/bin/bash}}\" -lc {}",
+            "cd {} && SHELBI_HUB_SOCK={} exec \"${{SHELL:-/bin/bash}}\" -lc {}",
             shelbi_agent::shell_escape(&worktree.to_string_lossy()),
+            shelbi_agent::shell_escape(&sock.to_string_lossy()),
             shelbi_agent::shell_escape(&launch_cmd),
         )
     };

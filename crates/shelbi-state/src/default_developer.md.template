@@ -25,10 +25,12 @@ and any agent-level skills under your `skills/` directory.
 
 The hub daemon listens on a Unix-domain socket at `$SHELBI_HUB_SOCK`
 (`~/.shelbi/hub.sock` by default — the pane wrapper pins it in your env
-so you don't have to derive it). To emit an event, write one
-newline-terminated JSON object to that socket. The verb is `event`; the
-body line goes in `line` and lands in `events.log` with a hub-side
-timestamp prepended.
+so you don't have to derive it). The same env var works whether you're
+on the hub (writes go directly to the local socket) or a remote machine
+(writes go through an SSH reverse-forward landing on hub's daemon). To
+emit an event, write one newline-terminated JSON object to that socket.
+The verb is `event`; the body line goes in `line` and lands in
+`events.log` with a hub-side timestamp prepended.
 
 ```sh
 # Pick whichever is on PATH. nc -U is the smallest and most common.

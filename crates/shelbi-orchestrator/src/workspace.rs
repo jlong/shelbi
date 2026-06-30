@@ -602,11 +602,7 @@ pub fn start_workspace_on_task(spec: StartSpec<'_>) -> Result<TmuxAddr> {
         }
         Host::Ssh { .. } => {
             shelbi_tmux::new_session(&host, &addr.session, &addr.window, None)?;
-            let cd_launch = format!(
-                "cd {wd} && LANG=C.UTF-8 exec \"${{SHELL:-/bin/bash}}\" -lc {launch}",
-                wd = shelbi_agent::shell_escape(&worktree.to_string_lossy()),
-                launch = shelbi_agent::shell_escape(&launch),
-            );
+            let cd_launch = remote_cd_launch(&worktree, &launch);
             shelbi_tmux::send_line(&host, &addr, &cd_launch)?;
         }
     }
@@ -1143,6 +1139,29 @@ fn copy_dir_contents_to_remote(ssh_host: &str, src: &Path, dest: &Path) -> Resul
         }
     }
     Ok(())
+}
+
+/// Build the `cd <wt> && … exec $SHELL -lc <launch>` line we send into
+/// the remote tmux pane, prefixing the exec with `SHELBI_HUB_SOCK=<path>`
+/// so the agent picks up the SSH-reverse-forwarded hub socket
+/// ([`shelbi_state::remote_hub_socket_path`], default
+/// `/tmp/shelbi-hub.sock`). Worker→hub events (`pane_alive=false`,
+/// future verbs) flow through that socket; with no `SHELBI_HUB_SOCK` set
+/// the agent's instructions paragraph falls through to a no-op and loss
+/// is accepted (the spec calls this "best-effort + hub-side detection").
+///
+/// We park the assignment immediately before `exec` so it scopes to the
+/// agent process (the surrounding `$SHELL -lc` strips its own
+/// environment otherwise — env-prefix-before-exec is the POSIX idiom
+/// for "set var for THIS command only and inherit it").
+fn remote_cd_launch(worktree: &Path, launch: &str) -> String {
+    let sock = shelbi_state::remote_hub_socket_path();
+    format!(
+        "cd {wd} && LANG=C.UTF-8 SHELBI_HUB_SOCK={sock} exec \"${{SHELL:-/bin/bash}}\" -lc {launch}",
+        wd = shelbi_agent::shell_escape(&worktree.to_string_lossy()),
+        sock = shelbi_agent::shell_escape(&sock.to_string_lossy()),
+        launch = shelbi_agent::shell_escape(launch),
+    )
 }
 
 /// Append the `--append-system-prompt "$(cat .claude/agent-instructions.md)"`
@@ -1977,6 +1996,47 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// Phase 5 acceptance criterion: the line we send into a remote
+    /// pane sets `SHELBI_HUB_SOCK` so the agent can write
+    /// worker→hub events through the SSH-reverse-forwarded socket.
+    /// The default landing path is `/tmp/shelbi-hub.sock`.
+    #[test]
+    fn remote_cd_launch_prefixes_exec_with_hub_socket_env_var() {
+        let _g = crate::test_lock::acquire();
+        std::env::remove_var("SHELBI_REMOTE_HUB_SOCK");
+        let wt = PathBuf::from("/work/myapp/.shelbi/wt/bob");
+        let line = remote_cd_launch(&wt, "claude --permission-mode auto");
+        assert!(
+            line.contains("SHELBI_HUB_SOCK=/tmp/shelbi-hub.sock"),
+            "expected default socket path in: {line}"
+        );
+        // Must scope to the exec'd shell, not the surrounding tmux
+        // pane — otherwise the `$SHELL -lc` env-strip drops it before
+        // claude inherits it.
+        let env_at = line.find("SHELBI_HUB_SOCK=").unwrap();
+        let exec_at = line.find("exec ").unwrap();
+        assert!(env_at < exec_at, "SHELBI_HUB_SOCK must come BEFORE exec: {line}");
+        assert!(line.starts_with("cd "), "still cd's into the worktree: {line}");
+        assert!(line.contains("LANG=C.UTF-8"), "LANG fix preserved: {line}");
+    }
+
+    /// `$SHELBI_REMOTE_HUB_SOCK` is the hub-side override knob (per
+    /// [`shelbi_state::remote_hub_socket_path`]) — if a user retargets
+    /// the reverse forward, the env var injected into the remote pane
+    /// must follow.
+    #[test]
+    fn remote_cd_launch_honors_remote_hub_socket_path_override() {
+        let _g = crate::test_lock::acquire();
+        std::env::set_var("SHELBI_REMOTE_HUB_SOCK", "/run/user/1000/shelbi.sock");
+        let wt = PathBuf::from("/work/myapp/.shelbi/wt/bob");
+        let line = remote_cd_launch(&wt, "claude");
+        assert!(
+            line.contains("SHELBI_HUB_SOCK=/run/user/1000/shelbi.sock"),
+            "override not honored: {line}"
+        );
+        std::env::remove_var("SHELBI_REMOTE_HUB_SOCK");
     }
 
     #[test]

@@ -672,13 +672,26 @@ mod tests {
     }
 
     /// Sanity-check the developer prompt has the spec-required hooks
-    /// (review marker handoff, agents/_shared/preamble.md reference)
-    /// so a regression doesn't quietly ship a half-written prompt.
+    /// (review marker handoff, agents/_shared/preamble.md reference,
+    /// the Phase 5 socket-emit paragraph) so a regression doesn't
+    /// quietly ship a half-written prompt.
     #[test]
     fn developer_template_contains_required_hooks() {
         assert!(DEFAULT_DEVELOPER_INSTRUCTIONS.contains("review marker"));
         assert!(DEFAULT_DEVELOPER_INSTRUCTIONS.contains("agents/_shared/preamble.md"));
         assert!(DEFAULT_DEVELOPER_INSTRUCTIONS.contains("skills"));
+        // Phase 5: the same socket-emit paragraph covers hub and remote
+        // workers — the only thing that differs between them is the
+        // path `$SHELBI_HUB_SOCK` resolves to. All three tool variants
+        // must be named so the agent can fall back gracefully when one
+        // isn't on PATH.
+        assert!(DEFAULT_DEVELOPER_INSTRUCTIONS.contains("$SHELBI_HUB_SOCK"));
+        assert!(DEFAULT_DEVELOPER_INSTRUCTIONS.contains("nc -U"));
+        assert!(DEFAULT_DEVELOPER_INSTRUCTIONS.contains("socat"));
+        assert!(DEFAULT_DEVELOPER_INSTRUCTIONS.contains("python3"));
+        // Retry-once-then-continue is the spec's loss-handling rule —
+        // pin it so a future copy edit can't quietly drop the policy.
+        assert!(DEFAULT_DEVELOPER_INSTRUCTIONS.contains("retry once"));
     }
 
     #[test]
