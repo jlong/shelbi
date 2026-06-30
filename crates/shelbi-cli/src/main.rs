@@ -36,29 +36,42 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Cmd {
-    /// Spawn a new workspace agent on a machine.
+    /// [legacy spawn flow] Spawn a one-shot agent on a machine. The
+    /// workspace-based flow (`shelbi task start` + the project YAML's
+    /// `workspaces:` block) is canonical now; `spawn` keeps working for
+    /// projects that haven't migrated.
     Spawn(commands::spawn::Args),
-    /// List active workspaces.
+    /// [legacy spawn flow] List agents written by `shelbi spawn`.
+    /// `shelbi workspace list` is the canonical view of the workspace pool
+    /// and what `shelbi send`/`task start` operate against.
     List,
     /// Inspect the project-wide status catalogue declared in
-    /// `workflows/statuses.yml`. Use `shelbi workspace status <id>` (or
-    /// `shelbi list`) for per-workspace observability.
+    /// `workflows/statuses.yml`. Use `shelbi workspace status <id>` for
+    /// per-workspace observability.
     Status {
         #[command(subcommand)]
         cmd: commands::status::StatusCmd,
     },
-    /// Send a follow-up message to a running workspace.
+    /// Send a follow-up message to a running workspace (or legacy spawn
+    /// agent). Resolves NAME against the project YAML's `workspaces:`
+    /// block first, then falls back to the legacy spawn agent registry.
     Send {
         id: String,
         message: String,
     },
-    /// Tail a workspace's recent output.
+    /// [legacy spawn flow] Tail a spawn-agent's recent output. Workspaces
+    /// don't write to the legacy log — use `tmux capture-pane` against
+    /// `shelbi-<project>:<workspace>` (local) or
+    /// `shelbi-w-<workspace>:agent` (remote) instead.
     Tail {
         id: String,
         #[arg(long, default_value_t = 40)]
         lines: usize,
     },
-    /// Show a workspace's working-tree diff.
+    /// [legacy spawn flow] Show a spawn-agent's working-tree diff. For
+    /// workspaces the worktree is at
+    /// `<machine.work_dir>/.shelbi/wt/<workspace>` — run `git -C` there
+    /// directly.
     Diff { id: String },
     /// Merge a workspace's branch into the project's default branch.
     Merge {
@@ -67,7 +80,10 @@ enum Cmd {
         #[arg(long)]
         pr: bool,
     },
-    /// Archive a workspace (keep the log, drop the worktree).
+    /// [legacy spawn flow] Archive a spawn agent (keep the log, drop the
+    /// worktree). Workspaces are durable slots — use
+    /// `shelbi workspace stop <name>` to release the slot's in-flight task
+    /// instead.
     Archive { id: String },
     /// Manage the project's Kanban task board.
     Task {
