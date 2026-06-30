@@ -985,6 +985,12 @@ fn render_quit_shelbi_confirm(
     focus_quit: bool,
 ) {
     let area = f.area();
+    let dirty_summary = format_dirty_summary(projects);
+    // The dirty-workspaces summary line is reserved unconditionally so
+    // the buttons / footer don't reflow when one shows up — bordering
+    // a red warning on shifting geometry would feel worse than the
+    // single line of dim spacing we get when there are no dirty
+    // worktrees.
     let layout = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -993,6 +999,7 @@ fn render_quit_shelbi_confirm(
             Constraint::Length(4), // warning body (wraps)
             Constraint::Length(1), // blank
             Constraint::Min(1),    // project list
+            Constraint::Length(1), // dirty-workspaces warning (blank if none)
             Constraint::Length(1), // blank
             Constraint::Length(1), // buttons
             Constraint::Length(1), // footer
@@ -1026,8 +1033,40 @@ fn render_quit_shelbi_confirm(
         .collect();
     f.render_widget(List::new(items), layout[4]);
 
-    render_confirm_buttons(f, layout[6], "Quit Shelbi", focus_quit);
-    render_confirm_footer(f, layout[7]);
+    if let Some(summary) = dirty_summary {
+        let warning = Paragraph::new(Line::from(Span::styled(
+            summary,
+            Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+        )));
+        f.render_widget(warning, layout[5]);
+    }
+
+    render_confirm_buttons(f, layout[7], "Quit Shelbi", focus_quit);
+    render_confirm_footer(f, layout[8]);
+}
+
+/// Compose the popover's "⚠ uncommitted changes in …" line, or `None`
+/// when every project's worktrees are clean (the warning row stays
+/// blank in that case).
+///
+/// Workspaces are namespaced by project so two projects with a
+/// same-named workspace don't collide in the message — pulled
+/// straight from [`super::quit_shelbi::ManagedProject::dirty_workspaces`]
+/// which already excludes shelbi's `.claude/` deploy footprint.
+fn format_dirty_summary(projects: &[super::quit_shelbi::ManagedProject]) -> Option<String> {
+    let mut labels: Vec<String> = projects
+        .iter()
+        .flat_map(|p| {
+            p.dirty_workspaces
+                .iter()
+                .map(move |w| format!("{}/{}", p.name, w))
+        })
+        .collect();
+    if labels.is_empty() {
+        return None;
+    }
+    labels.sort();
+    Some(format!("⚠ uncommitted changes in: {}", labels.join(", ")))
 }
 
 fn render_quit_project_confirm(
@@ -1214,6 +1253,56 @@ mod tests {
         assert_eq!(format_active_workspaces(1), "(1 active workspace)");
         assert_eq!(format_active_workspaces(2), "(2 active workspaces)");
         assert_eq!(format_active_workspaces(11), "(11 active workspaces)");
+    }
+
+    fn dirty_project(name: &str, active: usize, dirty: &[&str]) -> super::super::quit_shelbi::ManagedProject {
+        super::super::quit_shelbi::ManagedProject {
+            name: name.to_string(),
+            active_workspaces: active,
+            dirty_workspaces: dirty.iter().map(|s| s.to_string()).collect(),
+        }
+    }
+
+    #[test]
+    fn dirty_summary_is_none_when_every_workspace_is_clean() {
+        // No warning row when every active workspace's worktree is
+        // clean — the popover's reserved warning line stays blank.
+        let projects = vec![
+            dirty_project("alpha", 2, &[]),
+            dirty_project("bravo", 0, &[]),
+        ];
+        assert!(format_dirty_summary(&projects).is_none());
+    }
+
+    #[test]
+    fn dirty_summary_namespaces_workspaces_with_their_project() {
+        // Two projects each have a workspace named `alice`; without
+        // the `project/workspace` prefix the user can't tell them
+        // apart from the warning line.
+        let projects = vec![
+            dirty_project("alpha", 2, &["alice"]),
+            dirty_project("bravo", 1, &["alice"]),
+        ];
+        let summary = format_dirty_summary(&projects).expect("expected warning");
+        assert!(summary.starts_with("⚠ uncommitted changes in: "));
+        assert!(summary.contains("alpha/alice"));
+        assert!(summary.contains("bravo/alice"));
+    }
+
+    #[test]
+    fn dirty_summary_sorts_labels_for_stable_ordering() {
+        // The warning is destructive-confirmation copy: the order
+        // shouldn't change between re-renders or runs, otherwise the
+        // user's eye can't anchor on a stable list.
+        let projects = vec![
+            dirty_project("zeta", 2, &["zoe", "carol"]),
+            dirty_project("alpha", 1, &["bob"]),
+        ];
+        let summary = format_dirty_summary(&projects).expect("expected warning");
+        assert_eq!(
+            summary,
+            "⚠ uncommitted changes in: alpha/bob, zeta/carol, zeta/zoe"
+        );
     }
 
     #[test]
