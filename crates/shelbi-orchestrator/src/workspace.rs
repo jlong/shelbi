@@ -627,6 +627,8 @@ pub fn start_workspace_on_task(spec: StartSpec<'_>) -> Result<TmuxAddr> {
         spec.task_body,
         &marker,
         &spec.project.default_branch,
+        &spec.project.name,
+        shelbi_agent::polls_for_messages(&runner),
     );
     shelbi_tmux::send_line(&host, &addr, &prompt)?;
 
@@ -1285,6 +1287,8 @@ fn compose_prompt(
     body: &str,
     marker: &Path,
     default_branch: &str,
+    project: &str,
+    polls_messages: bool,
 ) -> String {
     let trimmed = body.trim();
     let body_section = if trimmed.is_empty() {
@@ -1294,6 +1298,11 @@ fn compose_prompt(
     };
     let id_esc = shelbi_agent::shell_escape(task_id);
     let marker_esc = shelbi_agent::shell_escape(&marker.to_string_lossy());
+    let polling_section = if polls_messages {
+        message_polling_section(task_id, project, &id_esc)
+    } else {
+        String::new()
+    };
     format!(
         "{body_section}\n\n\
          ---\n\
@@ -1320,7 +1329,44 @@ fn compose_prompt(
          The hub watches for this file and moves your task to the review \
          column on its next poll. Write the marker once; you can keep \
          working in this pane and talk to the user afterward without \
-         affecting the handoff."
+         affecting the handoff.{polling_section}"
+    )
+}
+
+/// The pull-style message-delivery paragraph appended to the prompt for
+/// runners without a hook surface (codex, aider, …). Claude Code receives
+/// hub messages through its hooks and never sees this section.
+///
+/// Codex drives every step — file reads, edits, and commands — through its
+/// `shell` tool, so "after every shell command" is the concrete, guaranteed
+/// cadence the task plan asks for: any non-trivial work runs at least one
+/// shell command in a short window, where "between significant steps" would
+/// be vague enough to skip.
+///
+/// The cursor file holds the 1-indexed number of the *next* unread line. It
+/// starts at 1 (read from the top), and after each poll advances to
+/// `<line count> + 1` so the following `tail -n +$CURSOR` begins past the
+/// last line already read — re-reading is what an off-by-one here would
+/// cause, so the `+ 1` is load-bearing. The `2>/dev/null` guards keep a
+/// cold start (no log yet) from erroring before the hub's first write.
+fn message_polling_section(task_id: &str, project: &str, id_esc: &str) -> String {
+    format!(
+        "\n\n\
+         ---\n\
+         Your message log is at `.shelbi/messages/{task_id}.log` (relative to \
+         this worktree). The orchestrator appends directives there while you \
+         work, and you must pull them yourself. **After every shell command \
+         you run**, check the log for new lines:\n\
+         \n\
+         CURSOR=$(cat .shelbi/messages/{id_esc}.cursor 2>/dev/null || echo 1)\n\
+         tail -n +\"$CURSOR\" .shelbi/messages/{id_esc}.log 2>/dev/null\n\
+         echo $(($(wc -l < .shelbi/messages/{id_esc}.log 2>/dev/null || echo 0) + 1)) > .shelbi/messages/{id_esc}.cursor\n\
+         \n\
+         Act on any new messages before continuing your current work. Each \
+         line is one JSON message with a `msg_id`; for every new message, ack \
+         it so the orchestrator knows it landed:\n\
+         \n\
+         echo '{{\"verb\":\"message-ack\",\"project\":\"{project}\",\"task_id\":\"{task_id}\",\"msg_id\":\"<msg-id>\"}}' | nc -U \"$SHELBI_HUB_SOCK\""
     )
 }
 
@@ -1519,6 +1565,8 @@ mod tests {
             "Fix the Safari SSO bug.",
             &marker,
             "main",
+            "myapp",
+            false,
         );
         assert!(prompt.contains("Fix the Safari SSO bug."));
         assert!(prompt.contains("fix-login"));
@@ -1528,14 +1576,49 @@ mod tests {
         assert!(prompt.contains("printf"));
         assert!(!prompt.contains("shelbi task move"));
         assert!(prompt.contains("\n---\n"));
+        // A hook-capable runner (claude) gets no polling instructions.
+        assert!(!prompt.contains(".shelbi/messages/"));
+        assert!(!prompt.contains("message-ack"));
     }
 
     #[test]
     fn prompt_falls_back_to_task_id_heading_when_body_empty() {
         let marker = PathBuf::from("/work/myapp/.shelbi/wt/alice/.claude/shelbi-review-ready");
-        let prompt = compose_prompt("fix-login", "shelbi/fix-login", "   ", &marker, "main");
+        let prompt =
+            compose_prompt("fix-login", "shelbi/fix-login", "   ", &marker, "main", "myapp", false);
         assert!(prompt.contains("# Task fix-login"));
         assert!(prompt.contains(".claude/shelbi-review-ready"));
+    }
+
+    #[test]
+    fn polling_runner_prompt_includes_message_log_instructions() {
+        let marker = PathBuf::from("/work/myapp/.shelbi/wt/alice/.claude/shelbi-review-ready");
+        let prompt = compose_prompt(
+            "fix-login",
+            "shelbi/fix-login",
+            "Fix the Safari SSO bug.",
+            &marker,
+            "main",
+            "myapp",
+            true,
+        );
+        // Still hands off the same way, and still rebases first.
+        assert!(prompt.contains(".claude/shelbi-review-ready"));
+        assert!(prompt.contains("git rebase origin/main"));
+        // Concrete poll cadence + the per-task log/cursor paths.
+        assert!(prompt.contains("After every shell command"));
+        assert!(prompt.contains(".shelbi/messages/fix-login.log"));
+        assert!(prompt.contains(".shelbi/messages/fix-login.cursor"));
+        // Cursor advances past the last-read line (the +1 that avoids a
+        // re-delivery off-by-one).
+        assert!(prompt.contains("wc -l < .shelbi/messages/fix-login.log"));
+        assert!(prompt.contains(") + 1)) > .shelbi/messages/fix-login.cursor"));
+        assert!(prompt.contains("tail -n +\"$CURSOR\" .shelbi/messages/fix-login.log"));
+        // Ack carries the project + task id and goes to the hub socket.
+        assert!(prompt.contains("\"verb\":\"message-ack\""));
+        assert!(prompt.contains("\"project\":\"myapp\""));
+        assert!(prompt.contains("\"task_id\":\"fix-login\""));
+        assert!(prompt.contains("nc -U \"$SHELBI_HUB_SOCK\""));
     }
 
     #[test]
@@ -1553,6 +1636,8 @@ mod tests {
             "Fix the Safari SSO bug.",
             &marker,
             "main",
+            "myapp",
+            false,
         );
         assert!(
             prompt.contains("git fetch origin main && git rebase origin/main"),
@@ -1581,6 +1666,8 @@ mod tests {
             "Fix the Safari SSO bug.",
             &marker,
             "trunk",
+            "myapp",
+            false,
         );
         assert!(
             prompt.contains("git fetch origin trunk && git rebase origin/trunk"),

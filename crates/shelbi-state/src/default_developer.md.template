@@ -53,7 +53,7 @@ orchestrator's reaction rules will recognize, e.g. `workspace=<name>
 pane_alive=false reason=<short>` or a domain-specific status the
 orchestrator's instructions cover.
 
-**Retry policy.** If the write fails, wait 500ms and try once more. If
+**Retry policy.** If the write fails, wait 500ms and retry once. If
 it still fails, you have two options:
 
 - **Continue your work without retrying further.** The orchestrator

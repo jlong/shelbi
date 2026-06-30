@@ -19,6 +19,17 @@ pub fn launch_command(spec: &AgentRunnerSpec) -> String {
     parts.join(" ")
 }
 
+/// Whether `command` launches Claude Code. Keyed off the path basename so a
+/// runner declared as `/usr/local/bin/claude` classifies the same as a bare
+/// `claude`. The one runtime shelbi knows to have a hook surface is claude;
+/// every other runner is treated as a non-claude (polling) runner.
+fn is_claude_runner(command: &str) -> bool {
+    std::path::Path::new(command)
+        .file_name()
+        .and_then(|s| s.to_str())
+        == Some("claude")
+}
+
 /// Return a copy of `spec` with `--permission-mode <mode>` appended when the
 /// runner is `claude` and the mode is non-default. Passing the mode on the
 /// command line is the authoritative signal; relying on `settings.json`'s
@@ -33,11 +44,7 @@ pub fn launch_command(spec: &AgentRunnerSpec) -> String {
 /// right-most wins — but they clutter pane captures and obscure which mode
 /// the workspace is actually running in.
 pub fn with_permission_mode(spec: &AgentRunnerSpec, mode: &str) -> AgentRunnerSpec {
-    let is_claude = std::path::Path::new(&spec.command)
-        .file_name()
-        .and_then(|s| s.to_str())
-        == Some("claude");
-    if !is_claude || mode == "default" {
+    if !is_claude_runner(&spec.command) || mode == "default" {
         return spec.clone();
     }
     if spec.flags.iter().any(|f| f == "--permission-mode") {
@@ -47,6 +54,17 @@ pub fn with_permission_mode(spec: &AgentRunnerSpec, mode: &str) -> AgentRunnerSp
     out.flags.push("--permission-mode".into());
     out.flags.push(mode.into());
     out
+}
+
+/// Does this runner pull hub→workspace messages by polling the log itself?
+///
+/// Claude Code receives messages through its hook surface (a PostToolUse /
+/// Stop hook the hub drives — Phase 7), so it never needs to poll. Every
+/// other runner (codex, aider, …) has no such surface, so the workspace
+/// prompt must instruct it to tail `.shelbi/messages/<task-id>.log` on a
+/// concrete cadence and ack each line itself (Phase 8).
+pub fn polls_for_messages(spec: &AgentRunnerSpec) -> bool {
+    !is_claude_runner(&spec.command)
 }
 
 /// Conservative POSIX-shell quoting: wrap in single quotes, escape internal
@@ -192,5 +210,26 @@ mod tests {
         };
         let out = with_permission_mode(&spec, "auto");
         assert_eq!(out.flags, vec!["--permission-mode", "plan"]);
+    }
+
+    fn runner(command: &str) -> AgentRunnerSpec {
+        AgentRunnerSpec { command: command.into(), flags: vec![] }
+    }
+
+    #[test]
+    fn claude_does_not_poll_for_messages() {
+        assert!(!polls_for_messages(&runner("claude")));
+        assert!(!polls_for_messages(&runner("/usr/local/bin/claude")));
+    }
+
+    #[test]
+    fn codex_and_other_runners_poll_for_messages() {
+        assert!(polls_for_messages(&runner("codex")));
+        assert!(polls_for_messages(&runner("/opt/bin/codex")));
+        assert!(polls_for_messages(&runner("aider")));
+        // No `.exe` special-casing: a Windows-style basename isn't "claude",
+        // so it classifies as a polling runner — consistent with how
+        // `with_permission_mode` keys off the exact basename.
+        assert!(polls_for_messages(&runner("claude.exe")));
     }
 }
