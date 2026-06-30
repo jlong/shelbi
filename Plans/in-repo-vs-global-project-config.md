@@ -117,9 +117,9 @@ workspace\_settings\_template: workspace-settings.json.template
 ```yaml
 machines:
 
-name: hub
-kind: local
-work_dir: /Users/jlong/Workspaces/shelbi
+- name: hub
+  kind: local
+  work_dir: /Users/jlong/Workspaces/shelbi
 
 name: devbox
 kind: ssh
