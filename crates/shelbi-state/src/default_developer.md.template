@@ -21,6 +21,59 @@ and moves your task into the review column.
 Follow project conventions in `agents/_shared/preamble.md` (if present)
 and any agent-level skills under your `skills/` directory.
 
+## Sending events back to the orchestrator
+
+The hub daemon listens on a Unix-domain socket at `$SHELBI_HUB_SOCK`
+(`~/.shelbi/hub.sock` by default — the pane wrapper pins it in your env
+so you don't have to derive it). To emit an event, write one
+newline-terminated JSON object to that socket. The verb is `event`; the
+body line goes in `line` and lands in `events.log` with a hub-side
+timestamp prepended.
+
+```sh
+# Pick whichever is on PATH. nc -U is the smallest and most common.
+echo '{"verb":"event","project":"<project>","line":"workspace=<your-workspace> note=<short>"}' \
+  | nc -U "$SHELBI_HUB_SOCK"
+
+# socat is a fine substitute on hosts that only ship -E nc (no -U).
+echo '{"verb":"event","project":"<project>","line":"workspace=<your-workspace> note=<short>"}' \
+  | socat - UNIX-CONNECT:"$SHELBI_HUB_SOCK"
+
+# python3 is always present on macOS and most Linux. Use this if neither
+# of the above is available.
+python3 -c 'import socket,sys; s=socket.socket(socket.AF_UNIX); s.connect(sys.argv[1]); s.sendall(sys.stdin.buffer.read())' \
+  "$SHELBI_HUB_SOCK" <<<'{"verb":"event","project":"<project>","line":"workspace=<your-workspace> note=<short>"}'
+```
+
+The `line` body is a single space-separated `key=value` record (same
+shape every other entry in `events.log` uses). Pick keys the
+orchestrator's reaction rules will recognize, e.g. `workspace=<name>
+pane_alive=false reason=<short>` or a domain-specific status the
+orchestrator's instructions cover.
+
+**Retry policy.** If the write fails, wait 500ms and try once more. If
+it still fails, you have two options:
+
+- **Continue your work without retrying further.** The orchestrator
+  reconciles missed events from hub-side state (pane death, missed
+  markers) — best-effort delivery is the design.
+- **Degraded-mode fallback (hub workers only).** If the event is
+  high-value and you're on the hub, append the line directly to
+  `~/.shelbi/events.log` with a leading RFC3339 timestamp:
+
+  ```sh
+  printf '%s workspace=<your-workspace> note=<short>\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+    >> ~/.shelbi/events.log
+  ```
+
+  POSIX guarantees writes ≤ 4096 bytes under `O_APPEND` are atomic, and
+  event lines are well under that, so the line lands cleanly even with
+  concurrent appenders. You lose the single-writer property the daemon
+  normally provides; that's the documented degraded-mode tradeoff.
+
+Embedded newlines tear records across multiple log lines. Keep the
+`line` body to a single line of `key=value` tokens.
+
 ## What you don't do
 
 - Don't start a new task on your own — wait for one to be dispatched.

@@ -90,9 +90,20 @@ pub fn run(project: &Project, workspace: &WorkspaceSpec, machine: &Machine) -> R
     let received_signal: Arc<Mutex<Option<i32>>> = Arc::new(Mutex::new(None));
     let signaled_flag = Arc::new(AtomicBool::new(false));
 
+    // Phase 3 of the Worker → Orchestrator Communication feature: hub
+    // workers emit events back to the hub by writing JSON to the daemon's
+    // Unix socket. Pin `SHELBI_HUB_SOCK` in the agent's env so the
+    // agent's `nc -U $SHELBI_HUB_SOCK` (or socat / python) one-liner
+    // resolves to the same path the daemon is listening on, even when
+    // the user has customized `SHELBI_HOME` or set their own override.
+    // `hub_socket_path()` already honors the env var if it's set in the
+    // wrapper's own env, so the agent inherits the same resolution.
+    let hub_sock = shelbi_state::hub_socket_path()
+        .map_err(|e| anyhow!("resolving hub socket path: {e}"))?;
     let mut child = Command::new("sh")
         .arg("-c")
         .arg(&shell_cmd)
+        .env("SHELBI_HUB_SOCK", &hub_sock)
         .stdin(Stdio::inherit())
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit())
@@ -323,6 +334,57 @@ mod tests {
         assert!(line.contains(" workspace=alpha "), "line: {line}");
         assert!(line.contains(" pane_alive=false "), "line: {line}");
         assert!(line.ends_with(" reason=exit:0"), "line: {line}");
+
+        std::env::remove_var("SHELBI_HOME");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// Phase 3 of Worker → Orchestrator Communication: the pane wrapper
+    /// must pass `SHELBI_HUB_SOCK` into the agent's environment so the
+    /// agent's `nc -U $SHELBI_HUB_SOCK` (or socat / python) one-liner can
+    /// resolve the socket without re-deriving the path. Exercise the
+    /// spawn path with a stub runner that records its env into a file
+    /// and verify the variable lands.
+    #[test]
+    fn run_passes_shelbi_hub_sock_into_agent_env() {
+        let _g = ENV_LOCK.lock().unwrap();
+        let home = fresh_test_home("pane-env-hub-sock");
+        std::env::set_var("SHELBI_HOME", &home);
+        // Clear any caller-supplied override so we test the default
+        // resolution path (`hub_socket_path()` falls back to
+        // `<SHELBI_HOME>/hub.sock` when `SHELBI_HUB_SOCK` is unset).
+        std::env::remove_var("SHELBI_HUB_SOCK");
+
+        let env_out = home.join("captured-env");
+        let machine = local_machine(&home);
+        let workspace = WorkspaceSpec {
+            name: "alpha".into(),
+            machine: "hub".into(),
+            runner: "stub".into(),
+        };
+        // Runner writes the value the wrapper pinned into its env into a
+        // file the test reads back below. `printenv VAR` exits 1 if the
+        // var is absent, which would also show up in events.log.
+        let cmd = format!(
+            "printenv SHELBI_HUB_SOCK > {} ; exit 0",
+            env_out.display()
+        );
+        let runner = AgentRunnerSpec {
+            command: "/bin/sh".into(),
+            flags: vec!["-c".into(), cmd],
+        };
+        let project = fixture_project("demo", machine.clone(), workspace.clone(), runner);
+
+        run(&project, &workspace, &machine).unwrap();
+
+        let observed = std::fs::read_to_string(&env_out)
+            .expect("agent should have written its SHELBI_HUB_SOCK env to disk");
+        let observed = observed.trim_end_matches('\n');
+        // The pinned value matches `hub_socket_path()` under the test
+        // home — that's the same resolution the daemon uses to pick its
+        // listen path, so the agent's writes land at the right place.
+        let expected = home.join("hub.sock");
+        assert_eq!(observed, expected.to_string_lossy());
 
         std::env::remove_var("SHELBI_HOME");
         let _ = std::fs::remove_dir_all(&home);

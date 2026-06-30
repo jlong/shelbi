@@ -16,7 +16,9 @@
 
 use std::fs;
 use std::io::Write;
+use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
+use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -375,16 +377,25 @@ pub fn append_dispatch_event(
 ///
 /// `reason` is folded to a single short token (whitespace → underscores) so
 /// the line stays parseable.
+///
+/// Phase 3 of the Worker → Orchestrator Communication feature: hub workers
+/// emit pane_alive lines through the daemon socket so a single writer
+/// (the daemon) owns the events.log file. The socket write is tried first
+/// with one 500ms retry; on persistent failure (daemon down, socket gone)
+/// the call falls back to a direct `O_APPEND` write to events.log —
+/// POSIX guarantees atomicity for writes ≤ PIPE_BUF and the line is well
+/// under that, so the degraded path is correct even with concurrent
+/// appenders. The loss of single-writer property is the documented
+/// degraded-mode tradeoff (see `Plans/worker-orchestrator-communication.md`
+/// §3).
 pub fn append_workspace_pane_event(
     workspace: &str,
     alive: bool,
     reason: &str,
 ) -> Result<()> {
-    let ts = Utc::now().to_rfc3339();
     let reason = sanitize_reason(reason);
-    append_event_line(&format!(
-        "{ts} workspace={workspace} pane_alive={alive} reason={reason}"
-    ))
+    let body = format!("workspace={workspace} pane_alive={alive} reason={reason}");
+    emit_event_body(&body)
 }
 
 /// Append `<rfc3339> rebase task=<id> workspace=<name> branch=<branch> status=<status> detail=<detail>`
@@ -426,6 +437,94 @@ pub fn append_rebase_event(
 pub fn append_external_event(body: &str) -> Result<()> {
     let ts = Utc::now().to_rfc3339();
     append_event_line(&format!("{ts} {body}"))
+}
+
+/// How long to wait for the daemon to read our line before giving up on
+/// a single send attempt. The daemon's `handle_client` is one-line-per-
+/// connection in steady state and the writes are tiny — this is generous
+/// for a healthy daemon and short enough that a wedged one doesn't stall
+/// pane teardown.
+const SOCKET_EMIT_WRITE_TIMEOUT: Duration = Duration::from_millis(500);
+
+/// Single retry delay between the first and second socket attempt. Matches
+/// the agent-instructions guidance (one retry after 500ms) so the hub-side
+/// emit path behaves the same as the agent's shell-out — keeps debugging
+/// across emit sites uniform.
+const SOCKET_EMIT_RETRY_DELAY: Duration = Duration::from_millis(500);
+
+/// Emit a pre-formatted event body, preferring the hub daemon socket and
+/// falling back to a direct `O_APPEND` write of the timestamped line to
+/// `events.log` if the socket is unreachable.
+///
+/// **Preferred path:** open `hub_socket_path()`, send one
+/// `{"verb":"event","line":"<body>"}` line, close. The daemon prepends
+/// the timestamp and appends the line — same shape we'd produce locally.
+/// On `ConnectionRefused` / `NotFound` (or any other write error) we wait
+/// 500ms and retry once. If both attempts fail the **degraded-mode
+/// fallback** writes the timestamped line directly to events.log; we
+/// lose the single-writer property but the line still lands and any
+/// downstream tail keeps working. This is the hub-side mirror of the
+/// fallback paragraph in the developer agent instructions.
+///
+/// `body` is the trailing portion that lands after `<rfc3339> `; callers
+/// have already sanitized whitespace. Embedded newlines would tear the
+/// record, so we reject them up front — the daemon rejects them too.
+pub fn emit_event_body(body: &str) -> Result<()> {
+    if body.contains('\n') || body.contains('\r') {
+        return Err(shelbi_core::Error::Other(
+            "emit_event_body: body may not contain newlines".into(),
+        ));
+    }
+    let sock = hub_socket_path()?;
+    match try_emit_via_socket(&sock, body) {
+        Ok(()) => return Ok(()),
+        Err(e) if !should_retry(&e) => {
+            // No socket file at all (NotFound) — daemon isn't installed
+            // or hasn't been started yet. Skip the retry sleep entirely;
+            // 500ms isn't going to summon a daemon and the pane teardown
+            // path doesn't want to wait on it.
+        }
+        Err(_) => {
+            std::thread::sleep(SOCKET_EMIT_RETRY_DELAY);
+            if try_emit_via_socket(&sock, body).is_ok() {
+                return Ok(());
+            }
+        }
+    }
+    // Degraded-mode fallback: the daemon is down or the socket is gone.
+    // POSIX guarantees writes ≤ PIPE_BUF are atomic under O_APPEND, so
+    // concurrent appenders still interleave whole lines.
+    append_external_event(body)
+}
+
+/// True for socket errors that might be transient (daemon momentarily not
+/// reading, accept-queue full, etc.) — worth one 500ms retry. `NotFound`
+/// is excluded: if the socket file doesn't exist, no daemon will be
+/// listening to it in 500ms either.
+fn should_retry(err: &std::io::Error) -> bool {
+    !matches!(err.kind(), std::io::ErrorKind::NotFound)
+}
+
+/// One socket attempt: connect → send one JSON line → close. Returns the
+/// underlying IO error on any step so the caller can decide whether to
+/// retry, fall back, or surface. Write timeout is short on purpose — the
+/// daemon's hot path is tiny.
+fn try_emit_via_socket(sock: &std::path::Path, body: &str) -> std::io::Result<()> {
+    let mut stream = UnixStream::connect(sock)?;
+    let _ = stream.set_write_timeout(Some(SOCKET_EMIT_WRITE_TIMEOUT));
+    let msg = serde_json::json!({
+        "verb": "event",
+        "line": body,
+    });
+    let mut payload = serde_json::to_vec(&msg)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+    payload.push(b'\n');
+    stream.write_all(&payload)?;
+    // Half-close on our side so the daemon sees EOF on the read loop —
+    // it's done with this connection after one line. The stream drops at
+    // end of scope and finishes the close.
+    let _ = stream.shutdown(std::net::Shutdown::Write);
+    Ok(())
 }
 
 /// Open `events.log` with O_APPEND and write one terminated line in a
@@ -651,6 +750,135 @@ mod tests {
         assert!(lines[0].contains("workspace=alpha"));
         assert!(lines[0].contains("none -> working"));
         assert!(lines[1].contains("working -> awaiting_input"));
+
+        std::env::remove_var("SHELBI_HOME");
+    }
+
+    /// Phase 3 of Worker → Orchestrator Communication: emit_event_body
+    /// is the hub-side mirror of the agent's `nc -U $SHELBI_HUB_SOCK`
+    /// path. When the daemon is up, it must hit the socket and the
+    /// daemon's append (timestamp + body) lands the line — same shape we
+    /// produce when we write directly. Stand up a minimal in-test
+    /// listener that mimics `shelbi daemon`'s `event`-verb handler and
+    /// confirm the line lands via that path, not via the fallback.
+    #[test]
+    fn emit_event_body_prefers_socket_when_daemon_is_up() {
+        use std::io::BufRead;
+        use std::os::unix::net::UnixListener;
+        let _g = TEST_LOCK.lock().unwrap();
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+        // macOS limits Unix-socket paths to ~104 bytes (SUN_LEN). The
+        // `/var/folders/..` temp dir under fresh_home() can blow past
+        // that with the test-name suffix, so we pin a short
+        // `/tmp/shelbi-tN.sock`-style path via the env override. The
+        // production path (`~/.shelbi/hub.sock`) is well under the
+        // limit; this is purely a test-environment concession.
+        let sock = short_test_socket("dn-up");
+        std::env::set_var("SHELBI_HUB_SOCK", &sock);
+
+        // The minimal daemon: accept one connection, read one JSON line,
+        // append `<rfc3339> <line>` to events.log, exit. Mirrors
+        // `shelbi-cli::commands::daemon::handle_event` without pulling
+        // the whole binary into this crate.
+        let _ = std::fs::remove_file(&sock);
+        let listener = UnixListener::bind(&sock).unwrap();
+        let log_path = events_log_path().unwrap();
+        let daemon = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let mut reader = std::io::BufReader::new(stream);
+            let mut line = String::new();
+            reader.read_line(&mut line).unwrap();
+            let msg: serde_json::Value = serde_json::from_str(line.trim()).unwrap();
+            let body = msg["line"].as_str().unwrap().to_string();
+            append_external_event(&body).unwrap();
+        });
+
+        emit_event_body("workspace=alpha pane_alive=false reason=signal:SIGTERM").unwrap();
+        daemon.join().unwrap();
+
+        let log = std::fs::read_to_string(&log_path).unwrap();
+        let line = log.lines().next().expect("daemon should have appended");
+        assert!(
+            line.ends_with(" workspace=alpha pane_alive=false reason=signal:SIGTERM"),
+            "line: {line}"
+        );
+        // Exactly one line — the fallback must NOT have fired alongside
+        // the daemon append (that would duplicate the event).
+        assert_eq!(log.lines().count(), 1, "log: {log}");
+
+        let _ = std::fs::remove_file(&sock);
+        std::env::remove_var("SHELBI_HUB_SOCK");
+        std::env::remove_var("SHELBI_HOME");
+    }
+
+    /// Build a short Unix-socket path under `/tmp`. macOS' SUN_LEN is
+    /// ~104 bytes; the deep `/var/folders/.../shelbi-workspace-status-
+    /// test-…` paths fresh_home() returns can overflow that. `/tmp/`
+    /// keeps us well under, and the PID + tag still gives parallel
+    /// isolation across test binaries.
+    fn short_test_socket(tag: &str) -> PathBuf {
+        let p = PathBuf::from(format!("/tmp/shb-{}-{tag}.sock", std::process::id()));
+        let _ = std::fs::remove_file(&p);
+        p
+    }
+
+    /// Phase 3 fallback: when no daemon is listening on the configured
+    /// socket, `emit_event_body` falls through to a direct timestamped
+    /// append to events.log. Same line shape as the socket path so a
+    /// downstream tail can't tell which path produced the line — that's
+    /// the whole point of the degraded mode.
+    #[test]
+    fn emit_event_body_falls_back_to_file_when_daemon_is_down() {
+        let _g = TEST_LOCK.lock().unwrap();
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+        // Pin a short, definitely-absent socket path so we hit
+        // NotFound deterministically (and dodge the SUN_LEN trap that
+        // would otherwise hide the fast-path assertion below).
+        let sock = short_test_socket("dn-down");
+        std::env::set_var("SHELBI_HUB_SOCK", &sock);
+        // No listener, no file at hub_socket_path — the connect should
+        // fail with NotFound and we skip the retry sleep entirely.
+        let started = std::time::Instant::now();
+        emit_event_body("workspace=delta pane_alive=false reason=exit:0").unwrap();
+        // The NotFound fast-path must skip the 500ms retry; if it
+        // didn't, this assertion would catch the regression. Tight bound
+        // (< 400ms) leaves headroom for CI scheduling jitter without
+        // letting an accidental sleep slip past.
+        assert!(
+            started.elapsed() < std::time::Duration::from_millis(400),
+            "fallback took too long; retry sleep probably wasn't skipped: {:?}",
+            started.elapsed(),
+        );
+
+        let log = std::fs::read_to_string(events_log_path().unwrap()).unwrap();
+        let line = log.lines().next().unwrap();
+        assert!(
+            line.ends_with(" workspace=delta pane_alive=false reason=exit:0"),
+            "line: {line}"
+        );
+
+        std::env::remove_var("SHELBI_HUB_SOCK");
+        std::env::remove_var("SHELBI_HOME");
+    }
+
+    /// Embedded newlines in the body would tear the event line across
+    /// two records (and the daemon would reject it server-side too).
+    /// Reject up front so callers see the error at the emit site, not
+    /// downstream in some unrelated parser.
+    #[test]
+    fn emit_event_body_rejects_embedded_newlines() {
+        let _g = TEST_LOCK.lock().unwrap();
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+        std::env::remove_var("SHELBI_HUB_SOCK");
+
+        let err = emit_event_body("workspace=alpha\nfoo=bar").unwrap_err();
+        assert!(err.to_string().contains("newlines"), "{err}");
+        // Nothing landed in the log — the rejection happens before any
+        // socket/file IO.
+        assert!(!events_log_path().unwrap().exists());
 
         std::env::remove_var("SHELBI_HOME");
     }
