@@ -154,6 +154,12 @@ enum Cmd {
         #[command(subcommand)]
         cmd: commands::events::EventsCmd,
     },
+    /// Run the hub-side daemon that listens on `~/.shelbi/hub.sock`
+    /// (overridable via `$SHELBI_HUB_SOCK`) for worker messages and
+    /// appends `event`-verb payloads to `~/.shelbi/events.log`.
+    /// Foreground entry point — meant to be supervised by launchd /
+    /// systemd, but runnable directly for development and smoke tests.
+    Daemon,
     /// Check a task's branch into the machine's review work_dir and
     /// (re)launch a fresh review-claude pane there.
     Review(commands::review::Args),
@@ -268,6 +274,7 @@ fn main() -> Result<()> {
         Some(Cmd::Project { cmd }) => commands::project::run(cmd),
         Some(Cmd::Config { cmd }) => commands::config::run(cli.project, cmd),
         Some(Cmd::Events { cmd }) => commands::events::run(cmd),
+        Some(Cmd::Daemon) => commands::daemon::run(),
         Some(Cmd::Zen { cmd }) => commands::zen::run(cli.project, cmd),
         Some(Cmd::Action { cmd }) => commands::action::run(cli.project, cmd),
         Some(Cmd::Review(args)) => commands::review::run(cli.project, args),

@@ -3,6 +3,7 @@ pub mod agent;
 pub mod archive;
 pub mod attach;
 pub mod config;
+pub mod daemon;
 pub mod diff;
 pub mod events;
 pub mod init;

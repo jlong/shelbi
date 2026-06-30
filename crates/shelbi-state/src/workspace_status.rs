@@ -136,6 +136,17 @@ pub fn events_log_path() -> Result<PathBuf> {
     Ok(shelbi_home()?.join("events.log"))
 }
 
+/// Local Unix-domain socket the hub daemon (`shelbi daemon`) listens on.
+/// `$SHELBI_HUB_SOCK` wins when set so tests, alternate users, or
+/// XDG_RUNTIME_DIR layouts can re-home it without touching `SHELBI_HOME`.
+/// Default is `~/.shelbi/hub.sock`.
+pub fn hub_socket_path() -> Result<PathBuf> {
+    if let Some(p) = std::env::var_os("SHELBI_HUB_SOCK") {
+        return Ok(PathBuf::from(p));
+    }
+    Ok(shelbi_home()?.join("hub.sock"))
+}
+
 /// Last observed state for a workspace — persisted to disk so a fresh hub
 /// process can see the prior state without re-deriving it from the pane
 /// title (which may have rolled past the marker).
@@ -391,6 +402,21 @@ pub fn append_rebase_event(
     ))
 }
 
+/// Append `<rfc3339> <body>` to `~/.shelbi/events.log`. Used by the hub
+/// daemon (`shelbi daemon`) for `event`-verb messages received over the
+/// Unix socket — the worker hands us a pre-formatted body line (e.g.
+/// `workspace=delta pane_alive=false reason=signal:SIGHUP`) and the daemon
+/// is the single authority on the timestamp prefix so ordering matches the
+/// arrival order, not the worker's clock.
+///
+/// `body` must not contain a newline — the line shape is one event per
+/// line and an embedded `\n` would inject a second (likely malformed)
+/// record. Callers should reject newlines before calling this.
+pub fn append_external_event(body: &str) -> Result<()> {
+    let ts = Utc::now().to_rfc3339();
+    append_event_line(&format!("{ts} {body}"))
+}
+
 /// Open `events.log` with O_APPEND and write one terminated line in a
 /// single `write_all` call. POSIX guarantees that writes <= PIPE_BUF
 /// (4096B) under O_APPEND are atomic relative to other appenders, so
@@ -547,6 +573,55 @@ mod tests {
         // this to bootstrap fresh on first observation.
         assert!(load_workspace_status("ghost").unwrap().is_none());
 
+        std::env::remove_var("SHELBI_HOME");
+    }
+
+    #[test]
+    fn append_external_event_prepends_timestamp() {
+        // Round-trip a daemon-supplied body and confirm the file picks up
+        // the RFC3339 timestamp prefix the daemon contract guarantees,
+        // followed by the verbatim body. The body is preserved exactly —
+        // sanitization is the caller's job, not the storage layer's.
+        let _g = TEST_LOCK.lock().unwrap();
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+
+        append_external_event("workspace=delta pane_alive=false reason=signal:SIGHUP").unwrap();
+        let log = std::fs::read_to_string(events_log_path().unwrap()).unwrap();
+        let line = log.lines().next().unwrap();
+
+        // Leading token is a parseable RFC3339 timestamp.
+        let ts_str = line.split_whitespace().next().unwrap();
+        DateTime::parse_from_rfc3339(ts_str)
+            .unwrap_or_else(|e| panic!("expected RFC3339 prefix in `{line}`: {e}"));
+        // Body is preserved verbatim after the timestamp + single space.
+        assert!(
+            line.ends_with(" workspace=delta pane_alive=false reason=signal:SIGHUP"),
+            "line: {line}",
+        );
+
+        std::env::remove_var("SHELBI_HOME");
+    }
+
+    #[test]
+    fn hub_socket_path_defaults_under_home() {
+        let _g = TEST_LOCK.lock().unwrap();
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+        std::env::remove_var("SHELBI_HUB_SOCK");
+        assert_eq!(hub_socket_path().unwrap(), home.join("hub.sock"));
+        std::env::remove_var("SHELBI_HOME");
+    }
+
+    #[test]
+    fn hub_socket_path_env_override_wins() {
+        let _g = TEST_LOCK.lock().unwrap();
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+        let override_path = std::env::temp_dir().join("shelbi-hub-override.sock");
+        std::env::set_var("SHELBI_HUB_SOCK", &override_path);
+        assert_eq!(hub_socket_path().unwrap(), override_path);
+        std::env::remove_var("SHELBI_HUB_SOCK");
         std::env::remove_var("SHELBI_HOME");
     }
 
