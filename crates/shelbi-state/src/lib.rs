@@ -34,11 +34,12 @@ pub use root::{
 };
 
 pub use agent_workspaces::{
-    agent_instructions_path, agent_shared_preamble_path, agent_skills_dir, agent_workspace_dir,
-    compose_agent_prompt, count_agent_skills, default_agent_body, is_default_agent,
-    legacy_claude_md_path, list_agents, load_shared_preamble, materialize_default_agents,
+    agent_instructions_path, agent_settings_path, agent_shared_preamble_path, agent_skills_dir,
+    agent_workspace_dir, compose_agent_prompt, count_agent_skills, default_agent_body,
+    default_agent_settings, is_default_agent, legacy_claude_md_path, list_agents,
+    load_agent_settings, load_shared_preamble, materialize_default_agents,
     maybe_emit_claude_md_migration_hint, reset_claude_md_migration_hint, self_heal_default_agents,
-    AgentMaterializeOutcome, DEFAULT_AGENTS, DEFAULT_DEVELOPER_INSTRUCTIONS,
+    AgentMaterializeOutcome, BundledAgent, DEFAULT_AGENTS, DEFAULT_DEVELOPER_INSTRUCTIONS,
     DEFAULT_ORCHESTRATOR_INSTRUCTIONS, DEVELOPER_AGENT, ORCHESTRATOR_AGENT, SHARED_AGENT_DIR,
     SHARED_PREAMBLE_FILE,
 };

@@ -489,10 +489,15 @@ pub fn start_workspace_on_task(spec: StartSpec<'_>) -> Result<TmuxAddr> {
     )?;
 
     // 2. Drop a rendered .claude/settings.json into the worktree so the
-    //    runner picks up shelbi's window-title hooks (idle/working/blocked).
-    //    Overwrite is fine — this is the entire on-workspace footprint and we
-    //    re-render it on every task start.
-    let rendered = shelbi_state::render_workspace_settings(spec.project)?;
+    //    runner picks up shelbi's window-title hooks (idle/working/blocked)
+    //    and the per-task message-tail hooks (Phase 7 push delivery).
+    //    Prefer the dispatched agent's `agents/<role>/settings.json` when
+    //    present so role-specific hook customization actually takes effect
+    //    on the worktree's Claude Code session; fall back to the
+    //    project-wide template otherwise. Overwrite is fine — this is the
+    //    entire on-workspace footprint and we re-render it on every task
+    //    start.
+    let rendered = render_workspace_settings_preferring_agent(spec.project, spec.agent)?;
     deploy_workspace_settings(&host, &worktree, &rendered)?;
 
     // 2b. Deploy the dispatched agent's `instructions.md` + skills into the
@@ -921,6 +926,38 @@ fn is_input_ready(screen: &str) -> bool {
 fn is_trust_dialog(screen: &str) -> bool {
     let s = screen.to_ascii_lowercase();
     s.contains("trust this folder") || s.contains("do you trust")
+}
+
+/// Render the workspace `settings.json` for `project`, preferring the
+/// dispatched agent's per-role `agents/<role>/settings.json` over the
+/// project-wide `workspace-settings.json.template` when one is present.
+///
+/// Per-role precedence matters because the Phase 7 message-tail hooks
+/// live in the role's settings file — a user editing
+/// `agents/developer/settings.json` to add a project-specific hook
+/// should see that change on the next dispatch, not silently lose it to
+/// the project-wide fallback. Substitutes the legacy
+/// `{{workspace_permissions_mode}}` placeholder for backwards-compat
+/// with user-authored templates that still reference it.
+///
+/// Falls back to the project-wide template when `agent` is `None` (e.g.
+/// embed tests) or when the role doesn't ship a settings.json (e.g.
+/// a future codex-only role).
+pub fn render_workspace_settings_preferring_agent(
+    project: &shelbi_core::Project,
+    agent: Option<&str>,
+) -> Result<String> {
+    let body = match agent {
+        Some(name) => shelbi_state::load_agent_settings(&project.name, name)
+            .map_err(|e| Error::Other(format!("{e}")))?,
+        None => None,
+    };
+    let template = match body {
+        Some(b) => b,
+        None => shelbi_state::render_workspace_settings(project)
+            .map_err(|e| Error::Other(format!("{e}")))?,
+    };
+    Ok(template.replace("{{workspace_permissions_mode}}", &project.workspace_permissions_mode))
 }
 
 /// Write the rendered workspace `settings.json` to `<worktree>/.claude/` on
@@ -2187,6 +2224,82 @@ mod tests {
         std::fs::write(orch.join("instructions.md"), "# orchestrator\ncoordinate\n").unwrap();
         // One skill on the developer to prove mounting carries content.
         std::fs::write(dev.join("skills/debug.md"), "# skill: debug\n").unwrap();
+    }
+
+    /// Phase 7: when the dispatch resolves to an agent that ships a
+    /// per-role `agents/<role>/settings.json`, that file's content is
+    /// preferred over the project-wide workspace-settings template.
+    /// This is what carries the SessionStart + Stop message-tail hooks
+    /// onto the worktree's Claude Code session.
+    #[test]
+    fn render_workspace_settings_prefers_per_role_when_present() {
+        let _g = crate::test_lock::acquire();
+        let tmp = agent_test_tmpdir("render-prefer-role");
+        let home = tmp.join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        std::env::set_var("SHELBI_HOME", &home);
+        install_default_agents_under_home(&home, "myapp");
+
+        // Per-role settings.json with a unique marker.
+        let role_settings = home.join("projects/myapp/agents/developer/settings.json");
+        std::fs::write(&role_settings, r#"{"_marker":"from-developer-role"}"#).unwrap();
+
+        let project = fixture_project();
+        let rendered =
+            render_workspace_settings_preferring_agent(&project, Some("developer")).unwrap();
+        assert!(
+            rendered.contains("from-developer-role"),
+            "per-role settings should win: {rendered}",
+        );
+
+        // Without an agent name → project-wide template fallback. The
+        // shipped default contains the Phase 7 SessionStart hook string.
+        let rendered_fallback =
+            render_workspace_settings_preferring_agent(&project, None).unwrap();
+        assert!(
+            rendered_fallback.contains("SessionStart"),
+            "project-wide default must include SessionStart hook: {rendered_fallback}",
+        );
+        assert!(
+            !rendered_fallback.contains("from-developer-role"),
+            "fallback must not see the per-role marker: {rendered_fallback}",
+        );
+
+        std::env::remove_var("SHELBI_HOME");
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// `{{workspace_permissions_mode}}` substitution still works for
+    /// the per-role file (so a user-authored template with the legacy
+    /// placeholder doesn't ship an unsubstituted literal into the
+    /// deployed `.claude/settings.json`).
+    #[test]
+    fn render_workspace_settings_substitutes_placeholder_in_per_role_file() {
+        let _g = crate::test_lock::acquire();
+        let tmp = agent_test_tmpdir("render-prefer-role-subst");
+        let home = tmp.join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        std::env::set_var("SHELBI_HOME", &home);
+        install_default_agents_under_home(&home, "myapp");
+
+        let role_settings = home.join("projects/myapp/agents/developer/settings.json");
+        std::fs::write(
+            &role_settings,
+            r#"{"permissions":{"defaultMode":"{{workspace_permissions_mode}}"}}"#,
+        )
+        .unwrap();
+
+        let mut project = fixture_project();
+        project.workspace_permissions_mode = "acceptEdits".into();
+        let rendered =
+            render_workspace_settings_preferring_agent(&project, Some("developer")).unwrap();
+        assert!(
+            rendered.contains(r#""defaultMode":"acceptEdits""#),
+            "placeholder must be substituted: {rendered}",
+        );
+
+        std::env::remove_var("SHELBI_HOME");
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     #[test]

@@ -26,7 +26,10 @@ use std::path::PathBuf;
 
 use shelbi_core::{Error, Result};
 
-use crate::{agents_dir, ensure_dir, load_shelbi_config, project_dir, read_state, write_state};
+use crate::{
+    agents_dir, ensure_dir, load_shelbi_config, project_dir, read_state, write_state,
+    DEFAULT_WORKSPACE_SETTINGS_TEMPLATE,
+};
 
 /// Stable identifier of the default orchestrator agent.
 pub const ORCHESTRATOR_AGENT: &str = "orchestrator";
@@ -56,12 +59,39 @@ pub const DEFAULT_ORCHESTRATOR_INSTRUCTIONS: &str =
 pub const DEFAULT_DEVELOPER_INSTRUCTIONS: &str =
     include_str!("default_developer.md.template");
 
+/// One entry in [`DEFAULT_AGENTS`]: the agent name, its bundled
+/// `instructions.md`, and — for Claude-Code-based roles — the bundled
+/// `settings.json` template that ships the message-tail hooks plus the
+/// pane-title hooks. `settings_template = None` means the role doesn't
+/// scaffold a per-role settings.json (e.g. a future codex role).
+pub struct BundledAgent {
+    pub name: &'static str,
+    pub instructions: &'static str,
+    pub settings_template: Option<&'static str>,
+}
+
 /// Defaults shipped with the binary, in declaration order. Iteration
 /// order matches the order outcomes appear in
 /// [`materialize_default_agents`] / [`self_heal_default_agents`] reports.
-pub const DEFAULT_AGENTS: &[(&str, &str)] = &[
-    (ORCHESTRATOR_AGENT, DEFAULT_ORCHESTRATOR_INSTRUCTIONS),
-    (DEVELOPER_AGENT, DEFAULT_DEVELOPER_INSTRUCTIONS),
+///
+/// Both default agents currently run on Claude Code, so both scaffold an
+/// `agents/<role>/settings.json` from the shared workspace-settings
+/// template. The settings file is what Claude Code reads on session
+/// start — its hooks tail the per-task message log
+/// (`.shelbi/messages/<task>.log`) and inject any unread lines as a
+/// system reminder on the agent's next turn (Phase 7 of the
+/// worker↔orchestrator communication design).
+pub const DEFAULT_AGENTS: &[BundledAgent] = &[
+    BundledAgent {
+        name: ORCHESTRATOR_AGENT,
+        instructions: DEFAULT_ORCHESTRATOR_INSTRUCTIONS,
+        settings_template: Some(DEFAULT_WORKSPACE_SETTINGS_TEMPLATE),
+    },
+    BundledAgent {
+        name: DEVELOPER_AGENT,
+        instructions: DEFAULT_DEVELOPER_INSTRUCTIONS,
+        settings_template: Some(DEFAULT_WORKSPACE_SETTINGS_TEMPLATE),
+    },
 ];
 
 /// `~/.shelbi/projects/<project>/agents/<agent>/`. The directory name
@@ -80,6 +110,28 @@ pub fn agent_instructions_path(project: &str, agent: &str) -> Result<PathBuf> {
 /// task-dispatch path (landed in a later subtask). Ships empty in v1.
 pub fn agent_skills_dir(project: &str, agent: &str) -> Result<PathBuf> {
     Ok(agent_workspace_dir(project, agent)?.join("skills"))
+}
+
+/// `<workspace>/settings.json` — the Claude-Code settings template that
+/// gets deployed to `<worktree>/.claude/settings.json` on each task
+/// dispatch when an agent name is provided. Optional: roles that don't
+/// ship a settings.json (e.g. future codex/aider roles) fall back to the
+/// project-wide template.
+pub fn agent_settings_path(project: &str, agent: &str) -> Result<PathBuf> {
+    Ok(agent_workspace_dir(project, agent)?.join("settings.json"))
+}
+
+/// Read the per-role `agents/<role>/settings.json` if it exists. Returns
+/// `None` for roles that don't ship a settings file (codex, aider) or
+/// when a user has deleted the file — the caller falls back to the
+/// project-wide workspace-settings template in that case.
+pub fn load_agent_settings(project: &str, agent: &str) -> Result<Option<String>> {
+    let path = agent_settings_path(project, agent)?;
+    match fs::read_to_string(&path) {
+        Ok(s) => Ok(Some(s)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(Error::Io(e)),
+    }
 }
 
 /// `~/.shelbi/projects/<project>/agents/_shared/preamble.md` — the
@@ -246,8 +298,19 @@ pub fn list_agents(project: &str) -> Result<Vec<String>> {
 pub fn default_agent_body(name: &str) -> Option<&'static str> {
     DEFAULT_AGENTS
         .iter()
-        .find(|(n, _)| *n == name)
-        .map(|(_, body)| *body)
+        .find(|a| a.name == name)
+        .map(|a| a.instructions)
+}
+
+/// Bundled `settings.json` template for the named default agent, or
+/// `None` if the role doesn't ship a settings file (or `name` isn't a
+/// shipped default). Used by the deploy path's per-role-prefers-then-
+/// project-wide fallback chain.
+pub fn default_agent_settings(name: &str) -> Option<&'static str> {
+    DEFAULT_AGENTS
+        .iter()
+        .find(|a| a.name == name)
+        .and_then(|a| a.settings_template)
 }
 
 /// True iff `name` is a shipped default agent (currently `orchestrator`
@@ -324,17 +387,17 @@ impl AgentMaterializeOutcome {
 /// Returns one outcome per default agent, in [`DEFAULT_AGENTS`] order.
 pub fn materialize_default_agents(project: &str) -> Result<Vec<AgentMaterializeOutcome>> {
     let mut outcomes = Vec::with_capacity(DEFAULT_AGENTS.len());
-    for (name, default_body) in DEFAULT_AGENTS {
-        let workspace = agent_workspace_dir(project, name)?;
+    for agent in DEFAULT_AGENTS {
+        let workspace = agent_workspace_dir(project, agent.name)?;
         if workspace.exists() {
             outcomes.push(AgentMaterializeOutcome::Unchanged {
-                agent: (*name).to_string(),
+                agent: agent.name.to_string(),
             });
             continue;
         }
-        write_bundled_agent(project, name, default_body)?;
+        write_bundled_agent(project, agent)?;
         outcomes.push(AgentMaterializeOutcome::Created {
-            agent: (*name).to_string(),
+            agent: agent.name.to_string(),
         });
     }
     Ok(outcomes)
@@ -357,15 +420,15 @@ pub fn self_heal_default_agents(project: &str) -> Result<Vec<AgentMaterializeOut
     let mut state_dirty = false;
     let mut outcomes = Vec::with_capacity(DEFAULT_AGENTS.len());
 
-    for (name, default_body) in DEFAULT_AGENTS {
-        let workspace = agent_workspace_dir(project, name)?;
+    for agent in DEFAULT_AGENTS {
+        let workspace = agent_workspace_dir(project, agent.name)?;
         if !workspace.exists() {
-            write_bundled_agent(project, name, default_body)?;
-            if state.notified_diverged_agents.remove(*name) {
+            write_bundled_agent(project, agent)?;
+            if state.notified_diverged_agents.remove(agent.name) {
                 state_dirty = true;
             }
             outcomes.push(AgentMaterializeOutcome::Created {
-                agent: (*name).to_string(),
+                agent: agent.name.to_string(),
             });
             continue;
         }
@@ -373,38 +436,46 @@ pub fn self_heal_default_agents(project: &str) -> Result<Vec<AgentMaterializeOut
         // Workspace exists. Ensure `skills/` is there before we judge
         // `instructions.md` — a half-materialized workspace from an
         // older shelbi version shouldn't be left without it.
-        ensure_dir(&agent_skills_dir(project, name)?)?;
+        ensure_dir(&agent_skills_dir(project, agent.name)?)?;
 
-        let path = agent_instructions_path(project, name)?;
+        // Make sure the per-role `settings.json` is on disk before we
+        // judge `instructions.md` divergence — a half-materialized
+        // workspace from an older shelbi version (no settings file)
+        // shouldn't be left without the message-tail hooks.
+        ensure_agent_settings_present(project, agent)?;
+
+        let path = agent_instructions_path(project, agent.name)?;
         let current = match fs::read_to_string(&path) {
             Ok(s) => s,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                fs::write(&path, default_body).map_err(Error::Io)?;
-                if state.notified_diverged_agents.remove(*name) {
+                fs::write(&path, agent.instructions).map_err(Error::Io)?;
+                if state.notified_diverged_agents.remove(agent.name) {
                     state_dirty = true;
                 }
                 outcomes.push(AgentMaterializeOutcome::Created {
-                    agent: (*name).to_string(),
+                    agent: agent.name.to_string(),
                 });
                 continue;
             }
             Err(e) => return Err(Error::Io(e)),
         };
 
-        if current == *default_body {
-            if state.notified_diverged_agents.remove(*name) {
+        if current == agent.instructions {
+            if state.notified_diverged_agents.remove(agent.name) {
                 state_dirty = true;
             }
             outcomes.push(AgentMaterializeOutcome::Unchanged {
-                agent: (*name).to_string(),
+                agent: agent.name.to_string(),
             });
         } else {
-            let first_notice = state.notified_diverged_agents.insert((*name).to_string());
+            let first_notice = state
+                .notified_diverged_agents
+                .insert(agent.name.to_string());
             if first_notice {
                 state_dirty = true;
             }
             outcomes.push(AgentMaterializeOutcome::Preserved {
-                agent: (*name).to_string(),
+                agent: agent.name.to_string(),
                 first_notice,
             });
         }
@@ -417,15 +488,40 @@ pub fn self_heal_default_agents(project: &str) -> Result<Vec<AgentMaterializeOut
 }
 
 /// Create `<workspace>/` and `<workspace>/skills/`, then write
-/// `<workspace>/instructions.md` with `body`. Used by both materialize
-/// and self-heal whenever a default agent needs to be (re)dropped onto
-/// disk in full.
-fn write_bundled_agent(project: &str, agent: &str, body: &str) -> Result<()> {
-    let workspace = agent_workspace_dir(project, agent)?;
+/// `<workspace>/instructions.md` (and `<workspace>/settings.json` for
+/// Claude-Code-based roles) from the bundled defaults. Used by both
+/// materialize and self-heal whenever a default agent needs to be
+/// (re)dropped onto disk in full.
+fn write_bundled_agent(project: &str, agent: &BundledAgent) -> Result<()> {
+    let workspace = agent_workspace_dir(project, agent.name)?;
     ensure_dir(&workspace)?;
-    ensure_dir(&agent_skills_dir(project, agent)?)?;
-    fs::write(agent_instructions_path(project, agent)?, body).map_err(Error::Io)?;
+    ensure_dir(&agent_skills_dir(project, agent.name)?)?;
+    fs::write(
+        agent_instructions_path(project, agent.name)?,
+        agent.instructions,
+    )
+    .map_err(Error::Io)?;
+    if let Some(settings) = agent.settings_template {
+        fs::write(agent_settings_path(project, agent.name)?, settings).map_err(Error::Io)?;
+    }
     Ok(())
+}
+
+/// Self-heal seam for the per-role `settings.json` — Claude Code reads
+/// this file's hooks on every session start, so a stale shipped default
+/// is a silent regression. Treat it the same way the project-wide
+/// workspace-settings template is treated: missing → drop the bundled
+/// default; present-and-divergent → leave the user's customization
+/// alone. Returns silently for roles that don't ship a settings file.
+fn ensure_agent_settings_present(project: &str, agent: &BundledAgent) -> Result<()> {
+    let Some(default) = agent.settings_template else {
+        return Ok(());
+    };
+    let path = agent_settings_path(project, agent.name)?;
+    if path.exists() {
+        return Ok(());
+    }
+    fs::write(&path, default).map_err(Error::Io)
 }
 
 #[cfg(test)]
@@ -772,6 +868,104 @@ mod tests {
             Some(DEFAULT_DEVELOPER_INSTRUCTIONS),
         );
         assert_eq!(default_agent_body("qa"), None);
+    }
+
+    /// Both default agents currently run on Claude Code, so both ship a
+    /// settings template. The deploy path reads this via
+    /// [`default_agent_settings`] to decide whether to use the per-role
+    /// file or fall back to the project-wide workspace-settings.
+    #[test]
+    fn default_agent_settings_returns_shared_template_for_claude_roles() {
+        assert_eq!(
+            default_agent_settings(ORCHESTRATOR_AGENT),
+            Some(DEFAULT_WORKSPACE_SETTINGS_TEMPLATE),
+        );
+        assert_eq!(
+            default_agent_settings(DEVELOPER_AGENT),
+            Some(DEFAULT_WORKSPACE_SETTINGS_TEMPLATE),
+        );
+        assert_eq!(default_agent_settings("ghost"), None);
+    }
+
+    /// `shelbi init` happy path for per-role settings.json: both default
+    /// Claude-Code agents land with their `settings.json` containing the
+    /// SessionStart + Stop message-tail hook scripts. This is the file
+    /// the deploy path prefers over the project-wide workspace-settings
+    /// template on each task dispatch (Phase 7).
+    #[test]
+    fn materialize_writes_per_role_settings_json_with_message_hooks() {
+        let _g = LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+
+        materialize_default_agents("p").unwrap();
+        for name in [ORCHESTRATOR_AGENT, DEVELOPER_AGENT] {
+            let settings = agent_settings_path("p", name).unwrap();
+            assert!(settings.is_file(), "{name}: settings.json missing");
+            let body = fs::read_to_string(&settings).unwrap();
+            assert!(body.contains("SessionStart"), "{name} missing SessionStart");
+            assert!(
+                body.contains(".shelbi/messages/$TASK_ID.tail.d"),
+                "{name} missing tail-lock script"
+            );
+            assert!(
+                body.contains("UNREAD=.shelbi/messages/$TASK_ID.unread.log"),
+                "{name} missing Stop message-inject script"
+            );
+            assert!(
+                body.contains("message-ack"),
+                "{name} missing message-ack write"
+            );
+        }
+
+        std::env::remove_var("SHELBI_HOME");
+    }
+
+    /// `shelbi reload`: a workspace from a pre-Phase-7 shelbi (no
+    /// settings.json) self-heals by dropping the bundled default back
+    /// in. User edits to `instructions.md` are not what triggers this —
+    /// the settings file is a separate self-heal seam.
+    #[test]
+    fn self_heal_recreates_missing_per_role_settings_json() {
+        let _g = LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+
+        materialize_default_agents("p").unwrap();
+        // Simulate a pre-Phase-7 install: the workspace is fully
+        // materialized but no settings.json was ever written.
+        let settings = agent_settings_path("p", DEVELOPER_AGENT).unwrap();
+        fs::remove_file(&settings).unwrap();
+        assert!(!settings.exists());
+
+        self_heal_default_agents("p").unwrap();
+        assert!(settings.is_file(), "settings.json should be recreated");
+        assert_eq!(
+            fs::read_to_string(&settings).unwrap(),
+            DEFAULT_WORKSPACE_SETTINGS_TEMPLATE,
+        );
+
+        std::env::remove_var("SHELBI_HOME");
+    }
+
+    /// User-edited `settings.json` (e.g. they added a project-specific
+    /// hook) is preserved by `shelbi reload`. Self-heal only intervenes
+    /// when the file is missing.
+    #[test]
+    fn self_heal_preserves_user_edited_settings_json() {
+        let _g = LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+
+        materialize_default_agents("p").unwrap();
+        let settings = agent_settings_path("p", DEVELOPER_AGENT).unwrap();
+        let custom = "{ \"hooks\": { \"PostToolUse\": [] } }\n";
+        fs::write(&settings, custom).unwrap();
+
+        self_heal_default_agents("p").unwrap();
+        assert_eq!(fs::read_to_string(&settings).unwrap(), custom);
+
+        std::env::remove_var("SHELBI_HOME");
     }
 
     /// Acceptance criterion (b): missing `agents/_shared/preamble.md` is

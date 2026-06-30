@@ -15,6 +15,7 @@
 //! prompt anyway.
 
 use std::io::{self, BufRead, IsTerminal, Write};
+use std::path::Path;
 use std::process::{Command, Stdio};
 use std::sync::{
     atomic::{AtomicBool, Ordering},
@@ -22,8 +23,29 @@ use std::sync::{
 };
 
 use anyhow::{anyhow, Result};
-use shelbi_core::{Machine, Project, WorkspaceSpec};
+use shelbi_core::{Column, Machine, Project, WorkspaceSpec};
 use shelbi_orchestrator::workspace as orch_workspace;
+
+/// Env var the agent inherits naming the project the worker belongs to.
+/// Read by the Phase 7 SessionStart / Stop hooks that emit `message-ack`
+/// JSON over the hub socket — the ack carries the project so the daemon
+/// can route to the right `events.log`.
+const ENV_PROJECT: &str = "PROJECT";
+
+/// Env var the agent inherits naming the task currently assigned to
+/// this workspace, used by the Phase 7 hooks to scope per-task message
+/// paths (`.shelbi/messages/$TASK_ID.log`). Empty when no task is
+/// in-flight — the hooks `[ -n "$TASK_ID" ] || exit 0`-guard so a
+/// "bare" pane (sidebar-clicked, no task running) is a clean no-op.
+const ENV_TASK_ID: &str = "TASK_ID";
+
+/// Env var pointing at the hub socket the worker writes JSON-line
+/// messages to (events, clarification requests, message-acks). Phase 3
+/// of the worker↔hub design pins this to `~/.shelbi/hub.sock` on the
+/// hub, `/tmp/shelbi-hub.sock` on remote panes; here we default to the
+/// hub path but honor an existing value so tests / remote panes can
+/// override.
+const ENV_HUB_SOCK: &str = "SHELBI_HUB_SOCK";
 
 /// Build the `sh -c …`-suitable command string that re-enters this
 /// binary under `--as-pane`. Exposed so `focus_or_create` and
@@ -81,6 +103,14 @@ pub fn run(project: &Project, workspace: &WorkspaceSpec, machine: &Machine) -> R
         wd = shelbi_agent::shell_escape(&worktree_str),
     );
 
+    // Look up the task currently assigned to this workspace so the
+    // Phase 7 hooks (SessionStart tail + Stop message-inject) have a
+    // concrete `$TASK_ID` to anchor their per-task paths on. Best-effort
+    // — a workspace with no in-progress task assigned still gets a pane
+    // (and the hooks no-op on empty TASK_ID), so the lookup never blocks
+    // the spawn.
+    let task_id = current_task_for_workspace(&project.name, &workspace.name).unwrap_or_default();
+
     // Signal handling: arrange for SIGHUP / SIGTERM / SIGINT to be
     // captured in a background thread that records which one fired and
     // proactively forwards it to the child. The wait() below returns
@@ -90,20 +120,23 @@ pub fn run(project: &Project, workspace: &WorkspaceSpec, machine: &Machine) -> R
     let received_signal: Arc<Mutex<Option<i32>>> = Arc::new(Mutex::new(None));
     let signaled_flag = Arc::new(AtomicBool::new(false));
 
-    // Phase 3 of the Worker → Orchestrator Communication feature: hub
-    // workers emit events back to the hub by writing JSON to the daemon's
-    // Unix socket. Pin `SHELBI_HUB_SOCK` in the agent's env so the
-    // agent's `nc -U $SHELBI_HUB_SOCK` (or socat / python) one-liner
-    // resolves to the same path the daemon is listening on, even when
-    // the user has customized `SHELBI_HOME` or set their own override.
-    // `hub_socket_path()` already honors the env var if it's set in the
-    // wrapper's own env, so the agent inherits the same resolution.
+    // Phase 3: pin `SHELBI_HUB_SOCK` so the agent's `nc -U` / socat /
+    // python socket-write one-liners resolve to the same path the daemon
+    // is listening on. `hub_socket_path()` already honors the env var if
+    // set (e.g. remote panes whose value points at the SSH reverse-forward
+    // landing path), so the agent inherits the same resolution.
+    //
+    // Phase 7: also export `$PROJECT` and `$TASK_ID` so the Claude Code
+    // SessionStart + Stop hooks can write to and tail the per-task
+    // message log at `.shelbi/messages/$TASK_ID.log`.
     let hub_sock = shelbi_state::hub_socket_path()
         .map_err(|e| anyhow!("resolving hub socket path: {e}"))?;
     let mut child = Command::new("sh")
         .arg("-c")
         .arg(&shell_cmd)
-        .env("SHELBI_HUB_SOCK", &hub_sock)
+        .env(ENV_PROJECT, &project.name)
+        .env(ENV_TASK_ID, &task_id)
+        .env(ENV_HUB_SOCK, &hub_sock)
         .stdin(Stdio::inherit())
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit())
@@ -124,6 +157,17 @@ pub fn run(project: &Project, workspace: &WorkspaceSpec, machine: &Machine) -> R
     // Tear down the signal listener thread so a stray late signal
     // doesn't leak into an unrelated shell.
     signal_handle.close();
+
+    // Phase 7: when the worker pane is destroyed, kill any tail process
+    // whose PID file is recorded in the worktree. Otherwise a tail spun
+    // up by the SessionStart hook outlives the pane and accumulates
+    // across worker restarts. Best-effort — failure to clean up is logged
+    // but doesn't block the pane from closing.
+    if !task_id.is_empty() {
+        if let Err(e) = kill_task_tail(&worktree, &task_id) {
+            eprintln!("shelbi: warning: couldn't clean up message-tail for task `{task_id}`: {e}",);
+        }
+    }
 
     let signaled = *received_signal.lock().unwrap();
     let reason = exit_reason(&status, signaled);
@@ -225,6 +269,61 @@ fn signal_name(sig: i32) -> String {
         signal_hook::consts::SIGTERM => "SIGTERM".into(),
         signal_hook::consts::SIGKILL => "SIGKILL".into(),
         other => format!("{other}"),
+    }
+}
+
+/// Look up the in-progress task assigned to `workspace`, if any. Used
+/// by the pane wrapper to seed `$TASK_ID` for the Phase 7 hooks. The
+/// poller's invariant guarantees at most one in-progress task per
+/// workspace (it dispatches sequentially), so `find` is correct — if
+/// the invariant ever breaks we want the first match, not a silent
+/// collapse to None.
+///
+/// Best-effort: returns `None` on read errors (missing project state,
+/// permissions glitch, transient FS) because a missing `TASK_ID` makes
+/// the hooks no-op but doesn't break the pane.
+fn current_task_for_workspace(project: &str, workspace: &str) -> Option<String> {
+    let in_progress = shelbi_state::list_column(project, Column::InProgress).ok()?;
+    in_progress.into_iter().find_map(|tf| {
+        if tf.task.assigned_to.as_deref() == Some(workspace) {
+            Some(tf.task.id)
+        } else {
+            None
+        }
+    })
+}
+
+/// Reasoned cleanup of the SessionStart tail on pane exit. Reads the
+/// pid file the hook recorded, sends SIGTERM to it, and removes the
+/// lock directory. Idempotent: missing pid file or missing dir is a
+/// no-op (the hook may never have run, or another pass already cleaned
+/// up). Failure to kill (process already gone, EPERM) is benign.
+fn kill_task_tail(worktree: &Path, task_id: &str) -> std::io::Result<()> {
+    let lock_dir = worktree
+        .join(".shelbi")
+        .join("messages")
+        .join(format!("{task_id}.tail.d"));
+    let pid_file = lock_dir.join("pid");
+    let pid_text = match std::fs::read_to_string(&pid_file) {
+        Ok(s) => s,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e),
+    };
+    if let Ok(pid) = pid_text.trim().parse::<libc::pid_t>() {
+        // SAFETY: libc::kill is unsafe only because it takes a raw pid;
+        // we're not dereferencing memory. ESRCH (process gone) is the
+        // expected case when the tail has already been reaped.
+        unsafe {
+            libc::kill(pid, libc::SIGTERM);
+        }
+    }
+    // rm -rf the lock dir so a stale pid file from a crashed tail
+    // doesn't confuse the next SessionStart hook into trying to kill a
+    // recycled pid.
+    match std::fs::remove_dir_all(&lock_dir) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e),
     }
 }
 
@@ -478,6 +577,256 @@ mod tests {
             git: GitConfig::default(),
             contextstore_sync: Vec::new(),
             detected_shapes: Vec::new(),
+        }
+    }
+
+    /// `current_task_for_workspace` finds the in-progress task whose
+    /// `assigned_to` matches the workspace. The wrapper uses this to
+    /// seed `$TASK_ID` for the Phase 7 hooks.
+    #[test]
+    fn current_task_for_workspace_returns_in_progress_assignment() {
+        let _g = ENV_LOCK.lock().unwrap();
+        let home = fresh_test_home("current-task-lookup");
+        std::env::set_var("SHELBI_HOME", &home);
+
+        // Task in InProgress assigned to alpha → that's what the
+        // wrapper should pick up.
+        let mut task = make_task("feat-x", shelbi_core::Column::InProgress);
+        task.assigned_to = Some("alpha".into());
+        shelbi_state::save_task("demo", &task, "").unwrap();
+        // Decoy: a Todo task assigned to alpha must NOT be returned.
+        let mut decoy = make_task("backlog-y", shelbi_core::Column::Todo);
+        decoy.assigned_to = Some("alpha".into());
+        shelbi_state::save_task("demo", &decoy, "").unwrap();
+
+        assert_eq!(
+            current_task_for_workspace("demo", "alpha").as_deref(),
+            Some("feat-x"),
+        );
+        // Workspace with nothing assigned → None.
+        assert_eq!(current_task_for_workspace("demo", "bravo"), None);
+
+        std::env::remove_var("SHELBI_HOME");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// `kill_task_tail` is idempotent: no pid file (the SessionStart
+    /// hook never ran) is a clean no-op, not an error.
+    #[test]
+    fn kill_task_tail_is_noop_when_pid_file_missing() {
+        let worktree = fresh_test_home("kill-tail-noop");
+        // No `.shelbi/messages/...` dirs exist.
+        kill_task_tail(&worktree, "feat-x").expect("must be a no-op");
+        let _ = std::fs::remove_dir_all(&worktree);
+    }
+
+    /// `kill_task_tail` reads the pid file, sends SIGTERM, and removes
+    /// the lock dir. Use a `sleep` child as a stand-in for the tail
+    /// process — `kill` is observable via `wait()` returning a signaled
+    /// status.
+    #[test]
+    fn kill_task_tail_kills_recorded_pid_and_removes_lock_dir() {
+        let worktree = fresh_test_home("kill-tail-happy");
+        let lock_dir = worktree
+            .join(".shelbi")
+            .join("messages")
+            .join("feat-x.tail.d");
+        std::fs::create_dir_all(&lock_dir).unwrap();
+
+        // Long-sleeping child stands in for the tail. SIGTERM should
+        // reap it well before the natural timeout fires.
+        let mut child = std::process::Command::new("sleep")
+            .arg("60")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn sleep");
+        std::fs::write(lock_dir.join("pid"), child.id().to_string()).unwrap();
+
+        kill_task_tail(&worktree, "feat-x").expect("kill must succeed");
+
+        // Lock dir is gone.
+        assert!(
+            !lock_dir.exists(),
+            "lock dir should be cleaned up: {}",
+            lock_dir.display()
+        );
+        // Child got the signal — wait reaps it within a tiny window.
+        let status = child.wait().expect("wait sleep");
+        assert!(
+            !status.success(),
+            "killed sleep should not report success: {status:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&worktree);
+    }
+
+    /// End-to-end: the agent subprocess sees `$PROJECT`, `$TASK_ID`,
+    /// and `$SHELBI_HUB_SOCK` in its env. Stub runner dumps the three
+    /// vars to a file we then assert on, so we exercise the actual
+    /// `Command::env(...)` plumbing, not just the lookup helper.
+    #[test]
+    fn run_exports_phase7_env_vars_to_agent_subprocess() {
+        let _g = ENV_LOCK.lock().unwrap();
+        let home = fresh_test_home("pane-env-exports");
+        std::env::set_var("SHELBI_HOME", &home);
+        // Honor explicit override — verifies the wrapper doesn't stomp
+        // a remote-pane SHELBI_HUB_SOCK that was set by the SSH layer.
+        let sock_override = home.join("custom-hub.sock");
+        std::env::set_var("SHELBI_HUB_SOCK", &sock_override);
+
+        // Seed an in-progress task assigned to the workspace so the
+        // wrapper's task lookup returns a non-empty TASK_ID.
+        let mut task = make_task("feat-env", shelbi_core::Column::InProgress);
+        task.assigned_to = Some("alpha".into());
+        shelbi_state::save_task("demo", &task, "").unwrap();
+
+        let dump_path = home.join("agent-env.dump");
+        let dump_str = dump_path.to_string_lossy().into_owned();
+        let machine = local_machine(&home);
+        let workspace = WorkspaceSpec {
+            name: "alpha".into(),
+            machine: "hub".into(),
+            runner: "stub".into(),
+        };
+        // Runner prints the three vars (newline-separated, stable
+        // order) into a file we then read back.
+        let runner = AgentRunnerSpec {
+            command: "/bin/sh".into(),
+            flags: vec![
+                "-c".into(),
+                format!(
+                    "printf '%s\\n%s\\n%s\\n' \"$PROJECT\" \"$TASK_ID\" \"$SHELBI_HUB_SOCK\" > {}",
+                    dump_str
+                ),
+            ],
+        };
+        let project = fixture_project("demo", machine.clone(), workspace.clone(), runner);
+
+        run(&project, &workspace, &machine).unwrap();
+
+        let body = std::fs::read_to_string(&dump_path).unwrap();
+        let lines: Vec<&str> = body.lines().collect();
+        assert_eq!(lines.len(), 3, "expected 3 env-var lines, got: {body:?}");
+        assert_eq!(lines[0], "demo", "PROJECT line: {body:?}");
+        assert_eq!(lines[1], "feat-env", "TASK_ID line: {body:?}");
+        assert_eq!(
+            lines[2],
+            sock_override.to_string_lossy(),
+            "SHELBI_HUB_SOCK line: {body:?}",
+        );
+
+        std::env::remove_var("SHELBI_HOME");
+        std::env::remove_var("SHELBI_HUB_SOCK");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// End-to-end: when the agent exits, any tail process the
+    /// SessionStart hook spawned is reaped — no orphan tails leak
+    /// across worker restarts. Stub runner spawns a `sleep` standing in
+    /// for `tail -f`, records its pid in the lock file the way the hook
+    /// would, then exits 0. After `run()` returns, the tail must be
+    /// gone and the lock dir cleaned up.
+    #[test]
+    fn run_kills_session_tail_on_agent_exit() {
+        let _g = ENV_LOCK.lock().unwrap();
+        let home = fresh_test_home("pane-tail-cleanup");
+        std::env::set_var("SHELBI_HOME", &home);
+
+        let mut task = make_task("feat-tail", shelbi_core::Column::InProgress);
+        task.assigned_to = Some("alpha".into());
+        shelbi_state::save_task("demo", &task, "").unwrap();
+
+        let machine = local_machine(&home);
+        let workspace = WorkspaceSpec {
+            name: "alpha".into(),
+            machine: "hub".into(),
+            runner: "stub".into(),
+        };
+        // worktree path the spawn path will compute for this workspace
+        // — needs to exist so the stub runner's `cd` doesn't fall back
+        // to $HOME (which would put the lock dir under the test's
+        // SHELBI_HOME, not under the worktree the cleanup helper looks
+        // at).
+        let worktree = orch_workspace::workspace_worktree(&machine, &workspace);
+        std::fs::create_dir_all(&worktree).unwrap();
+
+        // Mirror of the file the SessionStart hook records so we can
+        // verify the cleanup helper actually reaped the tail. Sequence
+        // the runner script with `;` not `&&` so the mkdir doesn't get
+        // accidentally backgrounded along with the sleep.
+        let pid_mirror = worktree.join("tail-pid-mirror");
+        let pid_mirror_str = pid_mirror.to_string_lossy().into_owned();
+        let runner = AgentRunnerSpec {
+            command: "/bin/sh".into(),
+            flags: vec![
+                "-c".into(),
+                format!(
+                    "mkdir -p .shelbi/messages/$TASK_ID.tail.d; \
+                     sleep 60 & \
+                     echo $! > .shelbi/messages/$TASK_ID.tail.d/pid; \
+                     cp .shelbi/messages/$TASK_ID.tail.d/pid {pid_mirror_str}; \
+                     exit 0"
+                ),
+            ],
+        };
+        let project = fixture_project("demo", machine.clone(), workspace.clone(), runner);
+
+        run(&project, &workspace, &machine).unwrap();
+
+        // The lock dir must be cleaned up by the wrapper.
+        let lock_dir = worktree
+            .join(".shelbi")
+            .join("messages")
+            .join("feat-tail.tail.d");
+        assert!(
+            !lock_dir.exists(),
+            "lock dir should be removed on exit, but exists at {}",
+            lock_dir.display()
+        );
+
+        // And the recorded tail pid must no longer be alive — kill(0)
+        // returns ESRCH (so kill returns -1) when the process is gone.
+        let mirrored =
+            std::fs::read_to_string(&pid_mirror).expect("runner must have written the pid mirror");
+        let pid: libc::pid_t = mirrored.trim().parse().expect("pid mirror parses");
+        // Give the OS a tick to actually reap the SIGTERM'd child.
+        for _ in 0..20 {
+            // SAFETY: kill with sig=0 only checks existence.
+            let alive = unsafe { libc::kill(pid, 0) } == 0;
+            if !alive {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        let alive = unsafe { libc::kill(pid, 0) } == 0;
+        assert!(!alive, "tail pid {pid} should have been killed");
+
+        std::env::remove_var("SHELBI_HOME");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// Tiny Task fixture for in-test seeding. Mirrors the larger
+    /// `make_task` in shelbi-state — we don't import it because that
+    /// helper lives behind `#[cfg(test)]` and isn't reachable across
+    /// crates.
+    fn make_task(id: &str, column: shelbi_core::Column) -> shelbi_core::Task {
+        let now = chrono::Utc::now();
+        shelbi_core::Task {
+            id: id.to_string(),
+            title: id.replace('-', " "),
+            column,
+            priority: 0,
+            assigned_to: None,
+            workflow: None,
+            branch: None,
+            depends_on: Vec::new(),
+            prefers_machine: None,
+            zen: None,
+            created_at: now,
+            updated_at: now,
+            params: std::collections::BTreeMap::new(),
         }
     }
 
