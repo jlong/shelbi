@@ -1663,8 +1663,9 @@ fn compute_column_widths(
 /// Render a column in its collapsed (rotated-label) form. The label
 /// fills one cell per character, with a blank row preserved for each
 /// space in the status name; `(<count>)` sits below the label after a
-/// one-row gap. The whole label-plus-count block is centred vertically
-/// in `area` so very tall terminals don't strand the strip at the top.
+/// one-row gap. The label starts on the top row of `area` so a
+/// collapsed column's first glyph lines up with the header row of its
+/// expanded neighbours.
 ///
 /// The full `area` (header band + the cells below it) is registered as
 /// the column's header hit-rect so clicking anywhere on the strip
@@ -1702,14 +1703,12 @@ fn render_collapsed_column(
     let count_text = format!("({count})");
     let count_w = count_text.chars().count() as u16;
 
-    // Total height occupied by the label rows + a 1-row gap +
-    // count row. Clamp to area.height so a tiny terminal still
-    // paints something.
     let label_rows = label_chars.len() as u16;
-    let block_h = label_rows.saturating_add(1).saturating_add(1).min(area.height);
-    let top = area
-        .y
-        .saturating_add(area.height.saturating_sub(block_h) / 2);
+    // Anchor the label to the top row of the column so the first
+    // glyph lines up with the header row of expanded columns. Rows
+    // that fall past `area.height` get clipped by the per-cell guard
+    // below.
+    let top = area.y;
     // Horizontal center inside the column slot.
     let glyph_x = area.x.saturating_add(area.width / 2);
 
@@ -4333,9 +4332,9 @@ mod tests {
 
     /// Full-frame render confirms a collapsed column paints its label
     /// one character per row, preserves the space in `IN PROGRESS` as
-    /// a blank row, and writes the `(N)` count at the bottom of the
-    /// strip. Acceptance: zero-task columns render in the rotated form
-    /// and the count surfaces.
+    /// a blank row, and writes the `(N)` count below the strip. The
+    /// label's first glyph must land on the column's top row so it
+    /// lines up with the header row of expanded neighbours.
     #[test]
     fn rendering_empty_column_uses_rotated_label_with_count() {
         use ratatui::{backend::TestBackend, Terminal};
@@ -4366,25 +4365,92 @@ mod tests {
         let col_area = header_hit.area;
         let glyph_x = col_area.x + col_area.width / 2;
 
-        let mut glyphs: Vec<String> = (col_area.y..col_area.y + col_area.height)
+        let glyphs: Vec<String> = (col_area.y..col_area.y + col_area.height)
             .map(|y| buf[(glyph_x, y)].symbol().to_string())
             .collect();
-        // Trim leading / trailing empty cells from the centre of the
-        // strip so the assertion is order-insensitive to where the
-        // block centres vertically.
-        while glyphs.first().is_some_and(|s| s.trim().is_empty()) {
-            glyphs.remove(0);
-        }
-        while glyphs.last().is_some_and(|s| s.trim().is_empty()) {
-            glyphs.pop();
-        }
-        let stripped: String = glyphs.join("");
+        let joined: String = glyphs.join("");
+        // Label is anchored to the top — the first row must hold the
+        // leading glyph of the label, not a blank.
+        assert_eq!(
+            glyphs[0], "I",
+            "collapsed label must start on the column's top row, got {glyphs:?}"
+        );
         // The count `(N)` paints horizontally, so only the leading
         // `(` falls on the centre column. Expect the rotated label
         // followed by the count line's leading paren.
+        let trimmed = joined.trim_end_matches(|c: char| c.is_whitespace());
         assert!(
-            stripped.starts_with("IN PROGRESS"),
-            "expected leading rotated label, got centre column: {stripped:?}"
+            trimmed.starts_with("IN PROGRESS"),
+            "expected leading rotated label, got centre column: {trimmed:?}"
+        );
+    }
+
+    /// Collapsed and expanded columns must share the same header row:
+    /// the rotated label's first glyph and the expanded column's
+    /// header text both paint at `area.y` of the columns band, so the
+    /// board reads as a single aligned row of headers.
+    #[test]
+    fn collapsed_and_expanded_columns_share_header_row() {
+        use ratatui::{backend::TestBackend, Terminal};
+        let mut app = KanbanApp::new("demo");
+        // One Backlog task → Backlog expands. Every other status is
+        // empty → auto-collapses to a strip.
+        app.tasks = vec![task_file("seed", Column::Backlog, 0, "2026-06-20T10:00:00Z")];
+
+        let backend = TestBackend::new(120, 20);
+        let mut term = Terminal::new(backend).unwrap();
+        term.draw(|f| render_full(f, &mut app, f.area())).unwrap();
+
+        // Every header hit's first row should agree — collapsed strips
+        // and expanded banners both anchor at the top of their slot.
+        let header_top_rows: Vec<u16> =
+            app.header_hits.iter().map(|h| h.area.y).collect();
+        assert!(
+            header_top_rows.windows(2).all(|w| w[0] == w[1]),
+            "header hit rects sit on different top rows: {header_top_rows:?}"
+        );
+        let header_y = header_top_rows[0];
+
+        let buf = term.backend().buffer().clone();
+        // Backlog column (expanded) — its first non-blank glyph on the
+        // header row should be the `B` in `BACKLOG`.
+        let backlog_idx = app
+            .all_columns
+            .iter()
+            .position(|c| c.status_id == "backlog")
+            .expect("default catalogue declares backlog");
+        let backlog_hit = app
+            .header_hits
+            .iter()
+            .find(|h| h.col_idx == backlog_idx)
+            .expect("backlog header registered a hit");
+        let backlog_row: String = (backlog_hit.area.x
+            ..backlog_hit.area.x + backlog_hit.area.width)
+            .map(|x| buf[(x, header_y)].symbol().to_string())
+            .collect();
+        assert!(
+            backlog_row.trim_start().starts_with("BACKLOG"),
+            "expanded header row should hold 'BACKLOG': {backlog_row:?}"
+        );
+
+        // A collapsed column — pick `in-progress`, whose rotated label
+        // starts with `I`. The first row of its strip must hold that
+        // glyph (no leading blank from centering).
+        let collapsed_idx = app
+            .all_columns
+            .iter()
+            .position(|c| c.status_id == "in-progress")
+            .expect("default catalogue declares in-progress");
+        let collapsed_hit = app
+            .header_hits
+            .iter()
+            .find(|h| h.col_idx == collapsed_idx)
+            .expect("in-progress header registered a hit");
+        let glyph_x = collapsed_hit.area.x + collapsed_hit.area.width / 2;
+        assert_eq!(
+            buf[(glyph_x, header_y)].symbol(),
+            "I",
+            "collapsed label's first glyph must sit on the shared header row",
         );
     }
 
