@@ -194,17 +194,28 @@ fn sync_one(host: &Host, spec: &ContextStoreSyncSpec) -> SyncStatus {
 ///   ControlMaster the hub already opens for `shelbi-ssh`, so this
 ///   sync doesn't trigger a separate auth handshake.
 ///
+/// The `--rsh` string mirrors `shelbi-ssh`'s control opts (ControlPath
+/// under `$SHELBI_HOME/ssh/`) so this rsync attaches to the same
+/// long-lived master rather than opening a fresh one — important for
+/// hosts where the daemon's reverse forward is already pinned.
+///
 /// No `--delete`: hub-only files (e.g. notes the user wrote locally
 /// between the workspace's start and finish) must survive. We're catching
 /// up, not mirroring. No `--mkpath` either — macOS's bundled openrsync
 /// rejects the flag; the caller `mkdir -p`s the destination instead.
 fn rsync_argv(src: &str, dst: &str) -> Vec<String> {
+    let control_path = shelbi_state::ssh_control_path_template()
+        .unwrap_or_else(|_| "~/.shelbi/ssh/%r@%h".to_string());
+    let rsh = format!(
+        "ssh -o ControlMaster=auto -o ControlPath={control_path} \
+         -o ControlPersist=600 -o ConnectTimeout=5 -o BatchMode=yes \
+         -o LogLevel=ERROR"
+    );
     vec![
         "rsync".to_string(),
         "-az".to_string(),
         "--rsh".to_string(),
-        "ssh -o ControlMaster=auto -o ControlPath=~/.ssh/shelbi-cm-%C -o ControlPersist=600 -o ConnectTimeout=5 -o BatchMode=yes"
-            .to_string(),
+        rsh,
         src.to_string(),
         dst.to_string(),
     ]

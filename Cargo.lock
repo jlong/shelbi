@@ -1047,6 +1047,7 @@ name = "shelbi-ssh"
 version = "0.1.0"
 dependencies = [
  "shelbi-core",
+ "shelbi-state",
  "thiserror",
  "tracing",
  "which",
@@ -1059,6 +1060,7 @@ dependencies = [
  "chrono",
  "crossterm 0.28.1",
  "dirs",
+ "libc",
  "serde",
  "serde_json",
  "serde_yaml",

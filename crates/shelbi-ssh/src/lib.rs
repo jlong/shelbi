@@ -11,17 +11,18 @@ use std::process::{Command, Output, Stdio};
 
 use shelbi_core::Host;
 
-/// SSH connection-multiplexing options injected into every SSH-routed
-/// command. With these set, the first invocation opens a master socket and
-/// subsequent invocations reuse it — turning what would be a ~1s TCP +
-/// TLS + auth handshake into a ~10ms write to a local Unix socket. The
-/// sidebar polls workspaces every few seconds, so this is the difference
-/// between "noticeable lag" and "imperceptible."
+/// Static fragment of the SSH connection-multiplexing options injected
+/// into every SSH-routed command. With these set (combined with the
+/// per-invocation ControlPath and reverse forward from
+/// [`build_ssh_control_opts`]), the first invocation opens a master
+/// socket and subsequent invocations reuse it — turning what would be
+/// a ~1s TCP + TLS + auth handshake into a ~10ms write to a local Unix
+/// socket. The sidebar polls workspaces every few seconds, so this is
+/// the difference between "noticeable lag" and "imperceptible."
 ///
-/// `ControlPath` uses `%C` (a hash of host+user+port) so distinct
-/// destinations don't collide on the same socket. `ControlPersist=600`
-/// keeps the master alive for 10 minutes after the last client closes,
-/// which spans most idle gaps in a normal session.
+/// `ControlPersist=600` keeps the master alive for 10 minutes after
+/// the last client closes, which spans most idle gaps in a normal
+/// session.
 ///
 /// `ConnectTimeout=5` bounds the worst case when a workspace host is dead
 /// or routed through a slow proxy — the poller spawns one thread per
@@ -41,21 +42,68 @@ use shelbi_core::Host;
 /// see our `-o` flags take precedence (command-line `-o` overrides config),
 /// which is the right call — we know our access pattern (many short
 /// commands) better than a generic per-host config does.
-const SSH_CONTROL_OPTS: &[&str] = &[
+const SSH_CONTROL_OPTS_STATIC: &[&str] = &[
     "-o",
     "ControlMaster=auto",
-    "-o",
-    "ControlPath=~/.ssh/shelbi-cm-%C",
     "-o",
     "ControlPersist=600",
     "-o",
     "ConnectTimeout=5",
     "-o",
     "BatchMode=yes",
+    // The ControlMaster opened on the first call inherits the `-R`
+    // reverse forward; subsequent slave connections inherit the
+    // multiplexed channel without re-requesting it. ExitOnForwardFailure=no
+    // (the default) and LogLevel=ERROR keep duplicate-forward warnings
+    // on slave reconnects from blocking the connection or polluting
+    // the user's terminal — the only real "forwarding failed" case
+    // worth surfacing is the master open, which falls through to the
+    // command's regular stderr.
+    "-o",
+    "ExitOnForwardFailure=no",
+    "-o",
+    "LogLevel=ERROR",
 ];
 
+/// The full set of `-o` options + the `-R` reverse forward for a
+/// shelbi-routed `ssh` invocation. Built fresh per call so a SHELBI_HOME
+/// or SHELBI_HUB_SOCK override picked up at process start lands in the
+/// args without baking it into a const.
+///
+/// The reverse forward exposes the hub daemon's `~/.shelbi/hub.sock` to
+/// the remote side as `/tmp/shelbi-hub.sock` (overridable via
+/// `SHELBI_REMOTE_HUB_SOCK`). Remote workers — Phase 5 — write to that
+/// path and the messages land in hub's events.log without an extra
+/// outbound channel.
+fn build_ssh_control_opts() -> Vec<String> {
+    let mut opts: Vec<String> = SSH_CONTROL_OPTS_STATIC
+        .iter()
+        .map(|s| (*s).to_string())
+        .collect();
+    // ControlPath under SHELBI_HOME so the hub's startup cleanup can
+    // find these sockets without risking the user's hand-rolled CMs
+    // under ~/.ssh/. Fall back to a sensible default if the helper
+    // errors out (no $HOME, etc.) — better to start a fresh master per
+    // call than to wedge the SSH path entirely.
+    let cp = shelbi_state::ssh_control_path_template()
+        .unwrap_or_else(|_| "~/.shelbi/ssh/%r@%h".to_string());
+    opts.push("-o".into());
+    opts.push(format!("ControlPath={cp}"));
+    // Reverse forward: <remote>:<local>. Fall back to the in-spec
+    // default pair on resolution failure so the connection still works
+    // — the master just won't carry the forward this round.
+    let rev = shelbi_state::reverse_forward_spec()
+        .map(|os| os.to_string_lossy().into_owned())
+        .ok();
+    if let Some(spec) = rev {
+        opts.push("-R".into());
+        opts.push(spec);
+    }
+    opts
+}
+
 fn apply_ssh_control_opts(cmd: &mut Command) {
-    for opt in SSH_CONTROL_OPTS {
+    for opt in build_ssh_control_opts() {
         cmd.arg(opt);
     }
 }
@@ -230,7 +278,7 @@ mod tests {
             .collect();
         // Control-master opts ride in front of every SSH invocation so
         // back-to-back hub→workspace commands reuse a single socket.
-        let mut expected: Vec<String> = SSH_CONTROL_OPTS.iter().map(|s| s.to_string()).collect();
+        let mut expected: Vec<String> = build_ssh_control_opts();
         expected.extend(["m2.local", "--", "tmux", "new-session"].map(String::from));
         assert_eq!(args, expected);
     }
@@ -247,9 +295,46 @@ mod tests {
             .get_args()
             .map(|a| a.to_string_lossy().into_owned())
             .collect();
-        let mut expected: Vec<String> = SSH_CONTROL_OPTS.iter().map(|s| s.to_string()).collect();
+        let mut expected: Vec<String> = build_ssh_control_opts();
         expected.extend(["-t", "m2.local", "--", "vi", "foo.txt"].map(String::from));
         assert_eq!(args, expected);
+    }
+
+    #[test]
+    fn ssh_command_args_include_reverse_forward() {
+        // Belt-and-suspenders pin on the Phase 4 behavior the hub
+        // depends on: every outbound ssh command carries a `-R` flag
+        // mapping the remote landing socket onto the hub's local
+        // `hub.sock`. The master opened on the first call inherits the
+        // forward; subsequent slaves multiplex over it.
+        let cmd = build_command(
+            &Host::Ssh {
+                host: "m2.local".into(),
+            },
+            ["true"],
+        );
+        let args: Vec<String> = cmd
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        let r_pos = args.iter().position(|a| a == "-R").expect("missing -R");
+        let spec = &args[r_pos + 1];
+        assert!(
+            spec.starts_with("/tmp/shelbi-hub.sock:")
+                || spec.starts_with(&format!("{}:", shelbi_state::remote_hub_socket_path().display())),
+            "forward spec didn't start with remote socket path: {spec}",
+        );
+        // ControlPath lands under SHELBI_HOME so the hub's startup
+        // cleanup can find these sockets.
+        let cp_idx = args
+            .iter()
+            .position(|a| a.starts_with("ControlPath="))
+            .expect("missing ControlPath");
+        assert!(
+            args[cp_idx].contains("/ssh/%r@%h"),
+            "ControlPath didn't carry the %r@%h template: {}",
+            args[cp_idx],
+        );
     }
 
     #[test]

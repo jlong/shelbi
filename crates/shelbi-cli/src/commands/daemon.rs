@@ -14,6 +14,15 @@
 //! daemon keeps running — a single bad client must not be able to take
 //! the listener down.
 //!
+//! Phase 4 additions:
+//!   - On startup, walks `~/.shelbi/ssh/` and removes orphaned SSH
+//!     ControlMaster socket files (master process died, socket file
+//!     leaked). Skips entirely when `~/.shelbi/shelbi.pid` names a
+//!     still-running shelbi process — those sockets belong to that
+//!     daemon and we don't touch them.
+//!   - Records its own PID at `~/.shelbi/shelbi.pid` so the next
+//!     start's cleanup can make the same decision.
+//!
 //! The daemon is stateless across restarts: `events.log` is the durable
 //! record, and in-flight bytes live in the kernel's socket buffers. A
 //! crash + restart resumes accepting messages.
@@ -96,11 +105,21 @@ pub fn run(cmd: Option<DaemonCmd>) -> Result<()> {
 fn run_foreground() -> Result<()> {
     let sock = shelbi_state::hub_socket_path().map_err(|e| anyhow!(e))?;
     prepare_socket(&sock)?;
+    prune_stale_control_masters();
 
     let listener = UnixListener::bind(&sock)
         .with_context(|| format!("binding hub socket at {}", sock.display()))?;
     fs::set_permissions(&sock, fs::Permissions::from_mode(0o600))
         .with_context(|| format!("chmod 600 {}", sock.display()))?;
+
+    // Record our PID for the next startup's cleanup decision. Written
+    // AFTER prepare_socket succeeds and BEFORE the accept loop so a
+    // crash mid-startup doesn't leave behind a PID file that points to
+    // a process that never actually held the socket.
+    let self_pid = std::process::id() as libc::pid_t;
+    if let Err(e) = shelbi_state::write_daemon_pid(self_pid) {
+        eprintln!("shelbi daemon: failed to write PID file: {e}");
+    }
 
     eprintln!("shelbi daemon: listening at {}", sock.display());
 
@@ -125,8 +144,43 @@ fn run_foreground() -> Result<()> {
     }
 
     let _ = fs::remove_file(&sock);
+    // Best-effort: drop the PID file so the next start's cleanup
+    // doesn't see us as a (now-dead) live daemon. The read path is
+    // resilient to a stale PID anyway — this is just hygiene.
+    if let Err(e) = shelbi_state::remove_daemon_pid_file() {
+        eprintln!("shelbi daemon: failed to remove PID file: {e}");
+    }
     eprintln!("shelbi daemon: stopped");
     Ok(())
+}
+
+/// Walk `$SHELBI_HOME/ssh/` and unlink orphaned ControlMaster sockets
+/// before the new daemon comes up. Skips entirely when the PID file
+/// names a live shelbi process — that's another daemon's CMs and they
+/// belong to it. Logs the outcome but never fails the daemon start:
+/// the cleanup is best-effort hygiene, and a fresh `ssh` call will
+/// still rebind a master even if a stale socket lingers.
+fn prune_stale_control_masters() {
+    let self_pid = std::process::id() as libc::pid_t;
+    match shelbi_state::cleanup_stale_control_masters(self_pid) {
+        Ok(shelbi_state::CmCleanupOutcome::SkippedAnotherDaemon { pid }) => {
+            eprintln!(
+                "shelbi daemon: another shelbi process (pid={pid}) holds the CMs; \
+                 skipping ControlMaster cleanup"
+            );
+        }
+        Ok(shelbi_state::CmCleanupOutcome::Scanned { removed, kept }) => {
+            if removed > 0 || kept > 0 {
+                eprintln!(
+                    "shelbi daemon: ControlMaster cleanup — removed {removed} orphaned \
+                     socket(s), kept {kept} live"
+                );
+            }
+        }
+        Err(e) => {
+            eprintln!("shelbi daemon: ControlMaster cleanup failed: {e}");
+        }
+    }
 }
 
 /// Make sure the socket parent directory exists with `0700` perms and

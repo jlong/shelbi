@@ -10,6 +10,7 @@ description = "Local/SSH command execution wrapper for shelbi"
 
 [dependencies]
 shelbi-core = { workspace = true }
+shelbi-state = { workspace = true }
 thiserror = { workspace = true }
 which = { workspace = true }
 tracing = { workspace = true }

@@ -208,11 +208,12 @@ mod tests {
             )
             .collect();
         // For SSH-routed commands, strip the connection-multiplexing
-        // options that shelbi-ssh prepends to every invocation. They're
-        // an orthogonal concern (covered by shelbi-ssh's own tests) and
-        // would otherwise force every structural test below to enumerate
-        // them. Recognized by the leading `ssh` program; for local
-        // commands we pass through unchanged.
+        // options and the hub-side reverse forward that shelbi-ssh
+        // prepends to every invocation. They're an orthogonal concern
+        // (covered by shelbi-ssh's own tests) and would otherwise
+        // force every structural test below to enumerate them.
+        // Recognized by the leading `ssh` program; for local commands
+        // we pass through unchanged.
         if raw.first().map(|s| s.as_str()) != Some("ssh") {
             return raw;
         }
@@ -227,10 +228,19 @@ mod tests {
                     || v.starts_with("ControlPersist=")
                     || v.starts_with("ConnectTimeout=")
                     || v.starts_with("BatchMode=")
+                    || v.starts_with("ExitOnForwardFailure=")
+                    || v.starts_with("LogLevel=")
                 {
                     i += 2;
                     continue;
                 }
+            }
+            // `-R remote:local` is the reverse-forward that exposes
+            // hub.sock to remote workers. Skip the flag plus its
+            // single argument.
+            if raw[i] == "-R" && i + 1 < raw.len() {
+                i += 2;
+                continue;
             }
             out.push(raw[i].clone());
             i += 1;
