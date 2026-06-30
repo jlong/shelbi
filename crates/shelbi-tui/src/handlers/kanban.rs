@@ -163,8 +163,16 @@ pub fn handle_kanban_mouse(app: &mut KanbanApp, mouse: MouseEvent) {
             app.open_workspace_dropdown();
             return;
         }
+        // Card hits take precedence over header hits: a clicked card
+        // sits inside the column's body band, never inside the header
+        // band, so the two regions are disjoint — but checking cards
+        // first keeps the routing obvious if that ever drifts.
         if let Some((col, row)) = app.card_at(mouse.column, mouse.row) {
             app.open_popover_at(col, row);
+            return;
+        }
+        if let Some(col_idx) = app.header_at(mouse.column, mouse.row) {
+            app.toggle_column(col_idx);
         }
     }
 }
