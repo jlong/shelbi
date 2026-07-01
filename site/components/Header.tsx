@@ -189,10 +189,10 @@ export function Header({ docsSections = [] }: HeaderProps) {
             ))}
           </nav>
 
-          {/* Wrapped so the desktop `order` + `ml-auto` classes can sit
-              on a real flex item — ThemeToggle's own root isn't a
-              single element we can style. */}
-          <div className="flex items-center md:order-4 md:ml-auto">
+          {/* Wrapped so the desktop `order` class can sit on a real
+              flex item — ThemeToggle's own root isn't a single element
+              we can style. */}
+          <div className="flex items-center md:order-4">
             <ThemeToggle />
           </div>
 
