@@ -39,14 +39,15 @@ export function Hero() {
         </h1>
 
         <p className="font-mono text-xs uppercase tracking-[0.25em] text-gray-7 sm:text-sm">
-          Manage a team of coding agents from your terminal
+          A Kanban board for your coding agents
         </p>
 
         <p className="max-w-2xl text-balance text-base leading-relaxed text-gray-7 sm:text-lg">
-          Drop tasks into a backlog and a fixed pool of workers picks them
-          up in parallel — each one in its own persistent git worktree, on
-          the machine you assigned. Finished work lands in a review column
-          where you inspect the diff and merge on your terms.
+          An open-source agent orchestrator for the terminal. Drop tasks
+          in the backlog and a named pool of workspaces picks them up in
+          parallel — locally, or on any SSH-reachable machine. Finished
+          work lands in a review column for you to inspect, or flip on
+          Zen Mode and let cleared branches auto-merge.
         </p>
 
         <div className="mt-2 flex w-full flex-col gap-2 sm:w-auto sm:flex-row sm:gap-3">
@@ -54,7 +55,7 @@ export function Hero() {
             href="/docs/getting-started/install"
             className={`${CTA_BASE} bg-fg text-bg hover:bg-gray-7`}
           >
-            Install now
+            Install shelbi
             <ArrowRightIcon className="h-2 w-2" aria-hidden="true" />
           </Link>
           <Link

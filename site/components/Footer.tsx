@@ -92,7 +92,7 @@ export function Footer() {
               <Wordmark size="sm" />
             </Link>
             <p className="max-w-xs text-sm leading-relaxed text-gray-7">
-              Manage a team of coding agents from your terminal.
+              An open-source agent orchestrator for the terminal.
             </p>
             <Link
               href={REPO_URL}
