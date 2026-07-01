@@ -440,6 +440,8 @@ fn run_wizard_then_dispatch(first_run: bool) -> Result<()> {
     let resolved = match commands::init::scaffold_with_prompt(commands::init::Args {
         project: None,
         root: None,
+        mode: None,
+        pick_up: false,
     }) {
         Ok(r) => r,
         Err(e) if is_inquire_cancel(&e) => return Ok(()),

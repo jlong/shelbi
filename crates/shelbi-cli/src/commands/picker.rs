@@ -159,6 +159,8 @@ fn add_new_project() -> Result<PickerOutcome> {
             crate::commands::init::run(crate::commands::init::Args {
                 project: Some(name.clone()),
                 root: None,
+                mode: None,
+                pick_up: false,
             })
             .context("running init for new project")?;
             Ok(PickerOutcome::Created(name))
