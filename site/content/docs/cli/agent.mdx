@@ -14,7 +14,10 @@ with — the roles, each a system prompt plus an optional skill set, that a
 project starts with four (`orchestrator`, `developer`, `qa`,
 `security-review`); these subcommands surface them and let you author more.
 
-Agents live under `~/.shelbi/projects/<project>/agents/<name>/`, each with an
+Agents live under the project's `agents/` directory —
+`~/.shelbi/projects/<project>/agents/<name>/` in the default
+[global mode](/docs/concepts/config-modes) or
+`<repo>/.shelbi/agents/<name>/` in in-repo mode. Each has an
 `instructions.md` (its prompt) and an optional `skills/` directory. The
 shared `agents/_shared/preamble.md` is prepended to every agent's prompt at
 launch time. The defaults are seeded on first load and never clobbered on

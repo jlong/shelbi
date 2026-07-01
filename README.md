@@ -86,6 +86,19 @@ Two phases: name your assistant, then walk one or more projects through
 setup. Each phase is idempotent — re-running the wizard skips anything
 already on disk.
 
+The wizard asks up front where the project's config should live:
+
+- **`global`** — everything stays under `~/.shelbi/projects/<name>.yaml`
+  on your machine. Nothing lands in the repo. Right for solo work.
+- **`in-repo`** — the shared half of the config (workflows, agent
+  prompts, runner settings) is committed at `<repo>/.shelbi/project.yaml`
+  so teammates get it on `git clone`; only per-machine bits (your
+  machines and workspace pool) stay under `~/.shelbi/`. Right for teams.
+
+Global is the default; you can migrate to in-repo later with
+`shelbi project migrate-to-in-repo`. Full details in
+[docs — Config modes](site/content/docs/concepts/config-modes.mdx).
+
 ```
 $ shelbi
 ? What should we call your assistant? Orchestrator

@@ -15,13 +15,15 @@ canonical five-status flow (`Backlog → Todo → InProgress → Review → Done
 and these subcommands surface it and any custom workflows the project has
 authored.
 
-Workflow files live at
-`~/.shelbi/projects/<project>/workflows/<name>.yaml`. A file's basename is
-its name; the in-file `name:` field must match. The loader auto-creates
-`default.yaml` on first load when the directory is empty, so most projects
-never need to touch this command — it's there when you want a second
-pipeline (a docs-only flow, a research track that never opens PRs, a
-feature-stacking flow off a long-lived branch).
+Workflow files live at `<config-root>/workflows/<name>.yaml`, where
+`<config-root>` is `~/.shelbi/projects/<project>/` in the default
+[global mode](/docs/concepts/config-modes) and `<repo>/.shelbi/` in
+in-repo mode. A file's basename is its name; the in-file `name:` field
+must match. The loader auto-creates `default.yaml` on first load when
+the directory is empty, so most projects never need to touch this
+command — it's there when you want a second pipeline (a docs-only flow,
+a research track that never opens PRs, a feature-stacking flow off a
+long-lived branch).
 
 Every subcommand accepts the global `-p / --project <PROJECT>` flag to
 target a specific project (otherwise the active `$SHELBI_PROJECT` or the
@@ -34,11 +36,12 @@ It's omitted from the per-subcommand tables below to keep them readable.
 shelbi workflow list
 ```
 
-Print every workflow under
-`~/.shelbi/projects/<project>/workflows/`, one per line, with a count of
-statuses and the YAML description. A `·` marker in the first column means
-the workflow is the built-in fallback — no file has been written yet. A
-blank marker means a file exists on disk.
+Print every workflow under the project's `workflows/` directory
+(`~/.shelbi/projects/<project>/workflows/` in global mode,
+`<repo>/.shelbi/workflows/` in in-repo mode), one per line, with a
+count of statuses and the YAML description. A `·` marker in the first
+column means the workflow is the built-in fallback — no file has been
+written yet. A blank marker means a file exists on disk.
 
 When the workflows directory is empty, the only entry is the built-in
 `default` workflow.

@@ -24,10 +24,12 @@ this project. The minimum useful config is a list of local checks
 the orchestrator runs against every Zen-eligible review before it
 opens a PR.
 
-Open `~/.shelbi/projects/<name>.yaml` and add a `zen` block:
+Open the project's shared YAML — `~/.shelbi/projects/<name>.yaml` in
+[global mode](/docs/concepts/config-modes) or `<repo>/.shelbi/project.yaml`
+in in-repo mode — and add a `zen` block:
 
 ```yaml
-# ~/.shelbi/projects/<name>.yaml
+# ~/.shelbi/projects/<name>.yaml (global mode)
 name: myapp
 repo: /Users/you/Workspaces/myapp
 # … the rest of the wizard's output …

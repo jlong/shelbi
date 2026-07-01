@@ -82,7 +82,9 @@ pub struct Args {
     /// by virtue of the committed file existing) and prompts only for
     /// the user-local fields. If the canonical name collides with an
     /// existing local project, the local alias is auto-suffixed
-    /// (`-2`, `-3`, …) — the committed YAML is never touched.
+    /// (`-2`, `-3`, …) — the committed YAML is never touched. See
+    /// `site/content/docs/concepts/config-modes.mdx` for the full
+    /// pick-up walkthrough.
     #[arg(long)]
     pub pick_up: bool,
 }
