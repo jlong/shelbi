@@ -59,6 +59,14 @@ pub fn run(project_opt: Option<String>, cmd: WorkspaceCmd) -> Result<()> {
 }
 
 fn list(project: &str) -> Result<()> {
+    print_workspaces(project)
+}
+
+/// The workspace-pool rendering used by both `shelbi workspace list` and
+/// the `## Workspaces` section of `shelbi status --full`. Extracted so
+/// the bootstrap snapshot reuses the exact table shape callers already
+/// depend on.
+pub(crate) fn print_workspaces(project: &str) -> Result<()> {
     let p = shelbi_state::load_project(project).map_err(|e| anyhow!(e))?;
     if p.workspaces.is_empty() {
         println!("(no workspaces declared in {project} — add a `workspaces:` block to the project YAML)");

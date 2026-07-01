@@ -86,28 +86,34 @@ custom workflows.
 First reply of the session — or right after a `shelbi reload` — do this
 before answering the user:
 
-1. `shelbi task list` for the board snapshot. Note column membership (each
-   column belongs to one of the five categories), priorities,
-   `assigned_to`, and any `prefers_machine` hints.
-2. `shelbi workspace list` for the workspace pool snapshot. Note which workspaces
-   are free (no `active`-category task assigned) and which machine each
-   is on.
-3. Start `shelbi events tail --follow` in the background using the Bash
+1. `shelbi status --full --handoff` for the single bootstrap snapshot.
+   Sections you'll see:
+   - **Board** — same content as `shelbi task list`: every column with
+     priorities, `assigned_to`, and `prefers_machine` hints. Note
+     column membership (each column belongs to one of the five
+     categories).
+   - **Workspaces** — same content as `shelbi workspace list`: which
+     workspaces are free (no `active`-category task assigned) and
+     which machine each is on.
+   - **Zen** — current Zen Mode (`on` / `off` / `paused`) plus a
+     `crash-recovery` flag when the most recent `zen=off` line was a
+     crash recovery. Seed `zen_active` from the mode; if the crash-
+     recovery flag is set, call it out in your first reply so the
+     user knows to review in-flight work before re-enabling Zen with
+     `shelbi zen on`. Thereafter track the mode from `mode=zen
+     <prev> -> <new>` lines in the event stream (see `## Zen Mode`
+     below) — no need to re-read `state.json`.
+   - **Handoff** — either "no HANDOFF.md present" or the deleted
+     contents of the file, printed inline. `--handoff` is destructive
+     (write-then-delete), so re-running the same command later will
+     not re-surface the note; treat any handoff block you see as
+     one-shot guidance from a previous session or from the user.
+2. Start `shelbi events tail --follow` in the background using the Bash
    tool's `run_in_background: true`. Watch it with `Monitor` — every
    emitted line is a trigger you must consider. `project=<name>
    heartbeat` lines are emitted by the hub poller on a fixed cadence
    (not user input); they fire the bounded sweep in the reaction rule
    below and otherwise produce no output.
-4. `shelbi zen status` to read the current Zen Mode (`on` / `off` /
-   `paused`). That value seeds `zen_active`; thereafter you track it
-   from `mode=zen <prev> -> <new>` lines in the event stream (see
-   `## Zen Mode` below). No need to re-read `state.json` after this.
-5. Scan the most recent few lines of `~/.shelbi/events.log` for a
-   `project=<name> zen=off reason=crash-recovery` entry. If one is
-   present, Zen Mode was auto-disabled because the prior orchestrator
-   pane died without a graceful exit — call it out in your first reply
-   so the user knows to review in-flight work before re-enabling Zen
-   with `shelbi zen on`.
 
 Keep the snapshot in your head and update it as events arrive. If the tail
 process dies (Monitor reports the task ended), restart it on your next

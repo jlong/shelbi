@@ -247,6 +247,14 @@ fn dedup_preserving_order(items: Vec<String>) -> Vec<String> {
     out
 }
 
+/// The full board rendering used by both `shelbi task list` (no flags)
+/// and the `## Board` section of `shelbi status --full`. Emits every
+/// column with counts and owner badges. Extracted so the bootstrap
+/// snapshot doesn't fork a second copy of the render code.
+pub(crate) fn print_board(project: &str) -> Result<()> {
+    list(project, None, false, None)
+}
+
 fn list(
     project: &str,
     status_filter: Option<&str>,

@@ -45,12 +45,25 @@ enum Cmd {
     /// `shelbi workspace list` is the canonical view of the workspace pool
     /// and what `shelbi send`/`task start` operate against.
     List,
-    /// Inspect the project-wide status catalogue declared in
-    /// `workflows/statuses.yml`. Use `shelbi workspace status <id>` for
-    /// per-workspace observability.
+    /// Print the orchestrator's bootstrap snapshot. Bare `shelbi status`
+    /// emits a concise human summary; `--full` emits the LLM-consumable
+    /// payload (board + workspaces + zen + handoff-presence);
+    /// `--handoff` prints `HANDOFF.md` from the project's work_dir and
+    /// deletes it. Both flags compose. The legacy `list` subcommand
+    /// still prints the project-wide status catalogue.
     Status {
         #[command(subcommand)]
-        cmd: commands::status::StatusCmd,
+        cmd: Option<commands::status::StatusCmd>,
+        /// Emit the full sectioned bootstrap payload (board, workspaces,
+        /// zen, handoff-presence). Idempotent — safe to re-run.
+        #[arg(long)]
+        full: bool,
+        /// Print the contents of `HANDOFF.md` from the project's local
+        /// `work_dir` and delete the file. No-op when absent.
+        /// Destructive; separated from `--full` so bootstrap snapshots
+        /// stay safe to re-run.
+        #[arg(long)]
+        handoff: bool,
     },
     /// Send a follow-up message to a running workspace (or legacy spawn
     /// agent). Resolves NAME against the project YAML's `workspaces:`
@@ -284,7 +297,9 @@ fn main() -> Result<()> {
         None => default_entry(cli.project.clone()),
         Some(Cmd::Spawn(args)) => commands::spawn::run(cli.project, args),
         Some(Cmd::List) => commands::list::run(cli.project),
-        Some(Cmd::Status { cmd }) => commands::status::run(cli.project, cmd),
+        Some(Cmd::Status { cmd, full, handoff }) => {
+            commands::status::run(cli.project, cmd, full, handoff)
+        }
         Some(Cmd::Send { id, message }) => commands::send::run(cli.project, id, message),
         Some(Cmd::Message {
             id,
