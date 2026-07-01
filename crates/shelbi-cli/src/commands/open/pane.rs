@@ -113,13 +113,20 @@ pub fn run(project: &Project, workspace: &WorkspaceSpec, machine: &Machine) -> R
         wd = shelbi_agent::shell_escape(&worktree_str),
     );
 
-    // Look up the task currently assigned to this workspace so the
+    // Resolve the task currently assigned to this workspace so the
     // Phase 7 hooks (SessionStart tail + Stop message-inject) have a
-    // concrete `$TASK_ID` to anchor their per-task paths on. Best-effort
-    // — a workspace with no in-progress task assigned still gets a pane
-    // (and the hooks no-op on empty TASK_ID), so the lookup never blocks
-    // the spawn.
-    let task_id = current_task_for_workspace(&project.name, &workspace.name).unwrap_or_default();
+    // concrete `$TASK_ID` to anchor their per-task paths on. Prefer an
+    // inherited `TASK_ID` env var when the caller injected one via tmux
+    // `-e`: the dispatch path spawns this wrapper BEFORE writing the
+    // task's `assigned_to`/`column=in_progress` to disk, so the state
+    // lookup would race the state save and return None. Fall back to
+    // the state lookup for the sidebar-click path (no env, no task in
+    // progress → empty TASK_ID, hooks no-op cleanly).
+    let task_id = std::env::var(ENV_TASK_ID)
+        .ok()
+        .filter(|s| !s.is_empty())
+        .or_else(|| current_task_for_workspace(&project.name, &workspace.name))
+        .unwrap_or_default();
 
     // Signal handling: arrange for SIGHUP / SIGTERM / SIGINT to be
     // captured in a background thread that records which one fired and
@@ -1029,6 +1036,61 @@ mod tests {
         );
 
         std::env::remove_var("SHELBI_HOME");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// Regression: the pane wrapper must honor an inherited `TASK_ID`
+    /// env even when the on-disk state doesn't have the task in
+    /// `in_progress` yet. This is the exact race the dispatch path
+    /// hits: `start_workspace_on_task` fires the tmux window (which
+    /// runs this wrapper) BEFORE writing the task's assignment/column,
+    /// so a wrapper that only consulted the state store would see
+    /// TASK_ID="" and the SessionStart hook would silently no-op.
+    #[test]
+    fn run_prefers_inherited_task_id_over_state_lookup() {
+        let _g = ENV_LOCK.lock().unwrap();
+        let home = fresh_test_home("pane-inherited-task-id");
+        std::env::set_var("SHELBI_HOME", &home);
+        // No task in state → the state-lookup fallback would resolve
+        // TASK_ID="". The tmux -e injection is simulated by setting
+        // TASK_ID directly in the process env before `run()`.
+        std::env::set_var("TASK_ID", "feat-race");
+        // Same override treatment for PROJECT / SHELBI_HUB_SOCK, since
+        // the wrapper pins all three on the child.
+        std::env::set_var("PROJECT", "demo");
+        let sock_override = home.join("custom-hub.sock");
+        std::env::set_var("SHELBI_HUB_SOCK", &sock_override);
+
+        let dump_path = home.join("agent-env.dump");
+        let dump_str = dump_path.to_string_lossy().into_owned();
+        let machine = local_machine(&home);
+        let workspace = WorkspaceSpec {
+            name: "alpha".into(),
+            machine: "hub".into(),
+            runner: "stub".into(),
+        };
+        let runner = AgentRunnerSpec {
+            command: "/bin/sh".into(),
+            flags: vec![
+                "-c".into(),
+                format!(
+                    "printf '%s\\n%s\\n%s\\n' \"$PROJECT\" \"$TASK_ID\" \"$SHELBI_HUB_SOCK\" > {}",
+                    dump_str
+                ),
+            ],
+        };
+        let project = fixture_project("demo", machine.clone(), workspace.clone(), runner);
+
+        run(&project, &workspace, &machine).unwrap();
+
+        let body = std::fs::read_to_string(&dump_path).unwrap();
+        let lines: Vec<&str> = body.lines().collect();
+        assert_eq!(lines[1], "feat-race", "inherited TASK_ID must win: {body:?}");
+
+        std::env::remove_var("SHELBI_HOME");
+        std::env::remove_var("TASK_ID");
+        std::env::remove_var("PROJECT");
+        std::env::remove_var("SHELBI_HUB_SOCK");
         let _ = std::fs::remove_dir_all(&home);
     }
 
