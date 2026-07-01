@@ -320,7 +320,7 @@ fn main() -> Result<()> {
         }
         Some(Cmd::Agent { cmd }) => commands::agent::run(cli.project, cmd),
         Some(Cmd::Workflow { cmd }) => commands::workflow::run(cli.project, cmd),
-        Some(Cmd::Project { cmd }) => commands::project::run(cmd),
+        Some(Cmd::Project { cmd }) => commands::project::run(cli.project, cmd),
         Some(Cmd::Config { cmd }) => commands::config::run(cli.project, cmd),
         Some(Cmd::Events { cmd }) => commands::events::run(cmd),
         Some(Cmd::Daemon { cmd }) => commands::daemon::run(cmd),

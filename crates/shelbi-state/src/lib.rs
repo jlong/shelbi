@@ -21,6 +21,7 @@ use shelbi_core::{
 mod agent_workspaces;
 mod hub_config;
 pub mod keymap;
+mod migrate;
 mod project_paths;
 mod resolve;
 mod root;
@@ -29,6 +30,11 @@ mod user_config;
 mod workspace_status;
 mod workflows;
 
+pub use migrate::{
+    append_gitignore_snippet, apply_migration_plan, gitignore_already_has_snippet,
+    plan_in_repo_migration, MigrationAction, MigrationPlan, IN_REPO_CONFIG_DIRS,
+    IN_REPO_CONFIG_FILES, IN_REPO_GITIGNORE_SNIPPET,
+};
 pub use project_paths::ProjectPaths;
 pub use root::{
     ensure_root_subdirs, expand_tilde_path, expand_tilde_str, resolve as resolve_root, root,
