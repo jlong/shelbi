@@ -216,13 +216,21 @@ The repo's \`.gitignore\` should exclude anything that could leak per-user state
 The committed files are exactly what's NOT in this list: \`.shelbi/project.yaml\`, \`.shelbi/workflows/\`, \`.shelbi/agents/\`, \`.shelbi/workspace-settings.json.template\`.
 
 ## Open questions
+## Resolved decisions
 
-1. **Default mode.** Global (current behavior, safe) vs. in-repo (the new "right" answer for teams). Lean global as default since it's the existing behavior and we shouldn't auto-commit anything to people's repos. The wizard nudges toward in-repo when team-contributor heuristic triggers.
-2. **Project-name collisions across machines.** Two devs each have a \`shelbi\` project at different paths — currently the project name is the user-facing handle. With in-repo, the canonical name is set in the committed \`project.yaml\` so it's the same across team members. Fine for the shared case; the global-mode collision rules are unchanged.
-3. **Hybrid migration.** A project that starts global and adds a teammate later — do we offer a one-way migration only, or also a partial / per-machine mode? Probably one-way only; partial is a footgun.
-4. **Where does the \`config\_mode\` field actually live?** It has to be in the YAML that the discovery code finds first, which is itself mode-dependent. Probably both YAMLs declare it for safety.
-5. **\`shelbi reload\` semantics.** When the in-repo \`project.yaml\` changes (via \`git pull\`), should \`shelbi reload\` re-read it? Yes; but should running workspaces inherit the new prompt? Probably no — let them finish their current task with the old prompt.
+1. **Default mode: heuristic-driven, no fixed default.** Interactive \`shelbi init\` always asks, prefilling the answer from the team-contributor heuristic (remote origin exists AND ≥2 committer emails → in-repo; else global). Non-interactive \`shelbi init\` requires \`--mode in-repo\` or \`--mode global\` explicitly — no silent default. Rationale: eliminates the "I just ran init and now my repo has an untracked .shelbi/ dir" surprise for solo users, and avoids picking wrong for teams that don't match the heuristic exactly.
 
+2. **Name collisions: auto-suffix on collision.** When \`shelbi init --pick-up\` sees a canonical name already registered globally on the user's machine, it registers the newly-picked-up project with a numeric suffix (\`shelbi-2\`, then \`shelbi-3\`, etc.). The committed \`project.yaml\` still carries the canonical name; only the local registry entry is suffixed. Follow-up worth confirming during implementation: does the CLI surface the suffixed name in prompts / errors, and can the user \`shelbi project rename\` to a friendlier local alias? First-cut: yes to both.
+
+3. **Migration direction: one-way only.** Ship \`shelbi project migrate-to-in-repo\` and no reverse command. Going back to global is a \`git revert\` on the migration commit plus a state cleanup the user does by hand. Full-fidelity round-trip isn't worth building for a rare direction; if it turns out to be common, add \`migrate-to-global\` then.
+
+4. **\`config_mode\` field lives in whichever YAML the discovery code finds first.** In-repo mode: declared in \`<repo>/.shelbi/project.yaml\`. Global mode: declared in \`~/.shelbi/projects/<name>.yaml\`. Not both — single source of truth per mode. Discovery walk-up finds the in-repo YAML first and reads its \`config_mode\`; if it walks off the top without finding one, it falls back to the global registry and reads \`config_mode\` from there. Rationale: duplicating the field in both YAMLs creates a two-source-of-truth problem where they can disagree; the mode is implied by *where* the file was found anyway, so the field is defensive documentation rather than the discriminator.
+
+5. **\`shelbi reload\` semantics: re-read config, let in-flight workspaces finish with their existing prompt.** New dispatches after the reload get the fresh prompt; workspaces already working on a task keep the prompt they were dispatched with until they hand off. Rationale: predictable behavior, no context yanked out from under a worker mid-task, immediate effect for anything new.
+
+## Open questions
+
+_All resolved for v1. Anything that surfaces during implementation goes here._
 ## Phasing
 
 1. **Phase 1 — Schema split.** Land the \`Project\` struct's split into "shared" and "user-local" halves in \`shelbi-core\`. Both halves load from a single YAML in global mode; from two YAMLs in in-repo mode. Tests cover both.
