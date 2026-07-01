@@ -1,16 +1,28 @@
-//! Project resolution by reverse-lookup against the registered project
-//! YAMLs. Instead of dropping a `.shelbi/project` sentinel into every repo
-//! and walking up to find it, we scan `~/.shelbi/projects/*.yaml` once,
-//! collect each project's local `work_dir`(s), and match the current
-//! directory (or one of its ancestors) against them — deepest match wins.
+//! Project resolution — first by walking up from cwd looking for an
+//! in-repo `<dir>/.shelbi/project.yaml` (like git's `.git` walk), then
+//! falling back to a reverse-lookup against the global registry of
+//! `~/.shelbi/projects/*.yaml`.
 //!
-//! The marker file is gone; the project metadata on disk is the single
-//! source of truth for "which project does this directory belong to".
+//! **Walk-up (in-repo mode).** When a project's config is committed to
+//! its own repo, the shared half lives at `<repo>/.shelbi/project.yaml`
+//! and the per-user half at `~/.shelbi/projects/<name>/local.yaml`.
+//! Walking up from cwd looking for the shared half lets in-repo mode
+//! "just work" without env vars once the user cds into the repo.
+//! Walk-up matches take precedence over global-registry matches for the
+//! same project name.
+//!
+//! **Global fallback.** For projects that keep their config at
+//! `~/.shelbi/projects/<name>.yaml` (the pre-split layout), we scan
+//! those YAMLs once, collect each project's local `work_dir`(s), and
+//! match cwd (or an ancestor) against them — deepest match wins. No
+//! `.shelbi/project` sentinel is needed; the project metadata on disk
+//! is the single source of truth.
 
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use shelbi_core::{MachineKind, Project, Result};
+use serde::Deserialize;
+use shelbi_core::{Error, MachineKind, Project, Result};
 
 use crate::projects_dir;
 
@@ -70,13 +82,95 @@ pub fn project_roots() -> Result<Vec<ProjectRoot>> {
     Ok(out)
 }
 
-/// Resolve the project owning `cwd` (or one of its ancestors) by matching
-/// against registered project work_dirs. Returns the deepest match — when
-/// two projects nest (`~/foo` and `~/foo/sub`), a cwd inside `sub` resolves
-/// to the sub-project. Projects whose `work_dir` no longer exists are
-/// excluded. Returns `None` when nothing matches.
+/// Resolve the project owning `cwd`.
+///
+/// 1. **Walk up** from `cwd` (canonicalized so symlinks resolve) looking
+///    for `<dir>/.shelbi/project.yaml`. If found, the project name comes
+///    from that file and its per-user companion `local.yaml` under
+///    `~/.shelbi/projects/<name>/` must also be present — otherwise this
+///    is a freshly-cloned repo and we return
+///    [`Error::ProjectNotPickedUp`] so the caller can prompt for
+///    `shelbi init --pick-up`. Corrupt in-repo YAML surfaces as
+///    [`Error::InRepoProjectParse`] carrying the exact file path.
+/// 2. **Fall back** to reverse-lookup against the global registry: match
+///    `cwd` (or an ancestor) against each registered project's local
+///    `work_dir`. When two registrations nest (`~/foo` and `~/foo/sub`),
+///    a cwd inside `sub` resolves to the sub-project. Projects whose
+///    `work_dir` no longer exists are excluded.
+/// 3. Both miss → `Ok(None)`. The caller renders the "no project
+///    specified" message.
+///
+/// Walk-up takes precedence: if `<repo>/.shelbi/project.yaml` names
+/// project `X` *and* `~/.shelbi/projects/X.yaml` also exists, the walk-up
+/// wins. Same for name collisions where both point at overlapping trees.
 pub fn resolve_project_for_cwd(cwd: &Path) -> Result<Option<String>> {
+    if let Some(hit) = walk_up_for_in_repo(cwd)? {
+        let expected_local = projects_dir()?.join(&hit.name).join("local.yaml");
+        if !expected_local.is_file() {
+            return Err(Error::ProjectNotPickedUp {
+                name: hit.name,
+                config_path: hit.config_path,
+                expected_local,
+            });
+        }
+        return Ok(Some(hit.name));
+    }
     Ok(match_root(cwd, &project_roots()?))
+}
+
+/// Minimal projection of `<repo>/.shelbi/project.yaml` used by discovery:
+/// we only need the project `name` to reach the per-user `local.yaml`.
+/// Extra fields (workflows, danger paths, etc.) are ignored here — the
+/// two-file merge parser handles the full load once discovery has picked
+/// the config path.
+#[derive(Deserialize)]
+struct InRepoProjectHeader {
+    name: String,
+}
+
+/// What the walk-up found: the exact path of the discovered
+/// `.shelbi/project.yaml` and the project name inside it. The path is
+/// carried through so error messages can point the user at the specific
+/// file that was inspected (there may be more than one in a nested
+/// checkout).
+struct InRepoHit {
+    name: String,
+    config_path: PathBuf,
+}
+
+/// Walk from `cwd` up to filesystem root looking for `<dir>/.shelbi/project.yaml`.
+///
+/// The starting cwd is canonicalized so symlinked working directories
+/// resolve to their real path before the walk — matching git's `.git`
+/// discovery behavior. If canonicalization fails (cwd was deleted from
+/// under us, permission denied, etc.), we walk the literal path so we
+/// still degrade gracefully.
+///
+/// A found file is read and parsed for its `name` field; a parse failure
+/// surfaces as [`Error::InRepoProjectParse`] tagged with the exact path,
+/// rather than the raw serde error the user would otherwise see with no
+/// hint of which YAML broke.
+fn walk_up_for_in_repo(cwd: &Path) -> Result<Option<InRepoHit>> {
+    let start = fs::canonicalize(cwd).unwrap_or_else(|_| cwd.to_path_buf());
+    let mut cur: Option<&Path> = Some(&start);
+    while let Some(dir) = cur {
+        let candidate = dir.join(".shelbi").join("project.yaml");
+        if candidate.is_file() {
+            let text = fs::read_to_string(&candidate)?;
+            let header: InRepoProjectHeader = serde_yaml::from_str(&text).map_err(|source| {
+                Error::InRepoProjectParse {
+                    path: candidate.clone(),
+                    source,
+                }
+            })?;
+            return Ok(Some(InRepoHit {
+                name: header.name,
+                config_path: candidate,
+            }));
+        }
+        cur = dir.parent();
+    }
+    Ok(None)
 }
 
 /// Pure matching core, factored out for tests: canonicalize `cwd`, walk up
@@ -320,6 +414,197 @@ mod tests {
         // Idempotent: a second sweep finds nothing to remove.
         let report2 = cleanup_legacy_markers().unwrap();
         assert!(!report2.iter().any(|c| c.marker_removed));
+        std::env::remove_var("SHELBI_HOME");
+    }
+
+    // ---------------------------------------------------------------
+    // In-repo discovery walk-up (Phase 2 of in-repo vs global config).
+
+    /// Drop an in-repo shared-half YAML at `<repo>/.shelbi/project.yaml`
+    /// containing just enough for discovery — the walk-up parser only
+    /// reads `name`.
+    fn write_in_repo_config(repo: &Path, name: &str) {
+        let dir = repo.join(".shelbi");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("project.yaml"), format!("name: {name}\n")).unwrap();
+    }
+
+    /// Create the per-user `local.yaml` companion under
+    /// `<home>/projects/<name>/`. Contents don't matter for the walk-up
+    /// (it only checks existence); Phase 3's merge parser will read
+    /// them.
+    fn touch_local_half(home: &Path, name: &str) {
+        let dir = home.join("projects").join(name);
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("local.yaml"), "machines: []\n").unwrap();
+    }
+
+    #[test]
+    fn walkup_finds_in_repo_project_when_local_half_present() {
+        let _g = TEST_LOCK.lock().unwrap();
+        let home = fresh_dir("home");
+        let repo = fresh_dir("in-repo");
+        std::env::set_var("SHELBI_HOME", &home);
+        write_in_repo_config(&repo, "shelbi");
+        touch_local_half(&home, "shelbi");
+
+        // At the repo root and from a subdir the walk-up hits the same
+        // config file.
+        let deep = repo.join("crates/shelbi-state");
+        fs::create_dir_all(&deep).unwrap();
+        assert_eq!(
+            resolve_project_for_cwd(&repo).unwrap().as_deref(),
+            Some("shelbi")
+        );
+        assert_eq!(
+            resolve_project_for_cwd(&deep).unwrap().as_deref(),
+            Some("shelbi")
+        );
+        std::env::remove_var("SHELBI_HOME");
+    }
+
+    #[test]
+    fn walkup_missing_local_half_returns_project_not_picked_up() {
+        let _g = TEST_LOCK.lock().unwrap();
+        let home = fresh_dir("home");
+        let repo = fresh_dir("fresh-clone");
+        std::env::set_var("SHELBI_HOME", &home);
+        // In-repo config exists, but this machine has never registered
+        // a `local.yaml` for it — a freshly-cloned repo the user hasn't
+        // yet run `shelbi init --pick-up` against.
+        write_in_repo_config(&repo, "shelbi");
+
+        let err = resolve_project_for_cwd(&repo).unwrap_err();
+        match err {
+            shelbi_core::Error::ProjectNotPickedUp {
+                name,
+                config_path,
+                expected_local,
+            } => {
+                assert_eq!(name, "shelbi");
+                assert_eq!(
+                    config_path,
+                    fs::canonicalize(&repo).unwrap().join(".shelbi/project.yaml"),
+                );
+                assert_eq!(
+                    expected_local,
+                    home.join("projects/shelbi/local.yaml"),
+                );
+            }
+            other => panic!("expected ProjectNotPickedUp, got {other:?}"),
+        }
+        std::env::remove_var("SHELBI_HOME");
+    }
+
+    #[test]
+    fn walkup_takes_precedence_over_global_registry_for_same_name() {
+        let _g = TEST_LOCK.lock().unwrap();
+        let home = fresh_dir("home");
+        let in_repo = fresh_dir("in-repo");
+        let global_root = fresh_dir("global-root");
+        std::env::set_var("SHELBI_HOME", &home);
+
+        // Same project name registered in two places: an in-repo
+        // config at `<in_repo>/.shelbi/project.yaml` and a global YAML
+        // pointing at an entirely different work_dir.
+        write_in_repo_config(&in_repo, "shared");
+        touch_local_half(&home, "shared");
+        write_project(&home, "shared", &global_root);
+
+        // Query from inside the in-repo tree — walk-up wins.
+        let deep = in_repo.join("sub/dir");
+        fs::create_dir_all(&deep).unwrap();
+        assert_eq!(
+            resolve_project_for_cwd(&deep).unwrap().as_deref(),
+            Some("shared")
+        );
+
+        // Query from inside the global-registered tree — no walk-up
+        // hit (no `.shelbi/project.yaml` there), fallback resolves via
+        // work_dir.
+        assert_eq!(
+            resolve_project_for_cwd(&global_root).unwrap().as_deref(),
+            Some("shared")
+        );
+        std::env::remove_var("SHELBI_HOME");
+    }
+
+    #[test]
+    fn walkup_misses_falls_back_to_global_registry() {
+        let _g = TEST_LOCK.lock().unwrap();
+        let home = fresh_dir("home");
+        let root = fresh_dir("plain-global");
+        std::env::set_var("SHELBI_HOME", &home);
+        // Global-mode project only: no `.shelbi/project.yaml` under
+        // the work_dir, so the walk-up walks off the top and we land
+        // in the reverse-lookup path.
+        write_project(&home, "plain", &root);
+
+        assert_eq!(
+            resolve_project_for_cwd(&root).unwrap().as_deref(),
+            Some("plain")
+        );
+        std::env::remove_var("SHELBI_HOME");
+    }
+
+    #[test]
+    fn walkup_returns_none_when_nothing_matches() {
+        let _g = TEST_LOCK.lock().unwrap();
+        let home = fresh_dir("home");
+        let stray = fresh_dir("stray");
+        std::env::set_var("SHELBI_HOME", &home);
+        // No global registrations, no in-repo config — pure miss.
+        assert!(resolve_project_for_cwd(&stray).unwrap().is_none());
+        std::env::remove_var("SHELBI_HOME");
+    }
+
+    #[test]
+    fn walkup_through_symlink_resolves_to_in_repo_project() {
+        let _g = TEST_LOCK.lock().unwrap();
+        let home = fresh_dir("home");
+        let real = fresh_dir("real-repo");
+        let link_parent = fresh_dir("links");
+        let link = link_parent.join("link-to-real");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+
+        std::env::set_var("SHELBI_HOME", &home);
+        write_in_repo_config(&real, "shelbi");
+        touch_local_half(&home, "shelbi");
+
+        // Query through the symlink — canonicalization makes the
+        // walk-up see the real path and find the config.
+        assert_eq!(
+            resolve_project_for_cwd(&link).unwrap().as_deref(),
+            Some("shelbi")
+        );
+        // Nested query through the symlink resolves identically.
+        let via_link_deep = link.join("crates");
+        fs::create_dir_all(real.join("crates")).unwrap();
+        assert_eq!(
+            resolve_project_for_cwd(&via_link_deep).unwrap().as_deref(),
+            Some("shelbi")
+        );
+        std::env::remove_var("SHELBI_HOME");
+    }
+
+    #[test]
+    fn walkup_corrupt_yaml_reports_exact_path() {
+        let _g = TEST_LOCK.lock().unwrap();
+        let home = fresh_dir("home");
+        let repo = fresh_dir("broken-repo");
+        std::env::set_var("SHELBI_HOME", &home);
+        let cfg_dir = repo.join(".shelbi");
+        fs::create_dir_all(&cfg_dir).unwrap();
+        let cfg = cfg_dir.join("project.yaml");
+        fs::write(&cfg, "name: [this is not a scalar\n").unwrap();
+
+        let err = resolve_project_for_cwd(&repo).unwrap_err();
+        match err {
+            shelbi_core::Error::InRepoProjectParse { path, .. } => {
+                assert_eq!(path, fs::canonicalize(&repo).unwrap().join(".shelbi/project.yaml"));
+            }
+            other => panic!("expected InRepoProjectParse, got {other:?}"),
+        }
         std::env::remove_var("SHELBI_HOME");
     }
 }
