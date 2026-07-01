@@ -82,9 +82,9 @@ use serde::Deserialize;
 use signal_hook::consts::{SIGHUP, SIGINT, SIGTERM};
 use signal_hook::iterator::Signals;
 
-/// launchd `Label` and systemd unit base name. We use a single string for
-/// both so the user sees one stable identifier in `launchctl print`,
-/// `systemctl --user status`, and any log lines that mention the unit.
+/// launchd `Label`. macOS-only: the Linux build compiles the systemd
+/// branch instead and uses [`SYSTEMD_SERVICE_NAME`] for its identifier.
+#[cfg(target_os = "macos")]
 const SERVICE_LABEL: &str = "co.32pixels.shelbi";
 /// systemd needs the `.service` suffix on most commands. Centralized so a
 /// future rename touches one place. `dead_code` allowed because the
@@ -814,7 +814,9 @@ fn launch_agent_plist_path() -> Result<PathBuf> {
 }
 
 /// Inputs that go into the rendered plist. Bundled into a struct so the
-/// renderer is pure (testable without touching the filesystem).
+/// renderer is pure (testable without touching the filesystem). macOS-only:
+/// the Linux build supervises via systemd and never renders a plist.
+#[cfg(target_os = "macos")]
 struct LaunchdInputs {
     binary: PathBuf,
     state_root: PathBuf,
@@ -822,6 +824,7 @@ struct LaunchdInputs {
     stderr_path: PathBuf,
 }
 
+#[cfg(target_os = "macos")]
 impl LaunchdInputs {
     fn resolve() -> Result<Self> {
         let state_root = baked_state_root()?;
@@ -835,6 +838,8 @@ impl LaunchdInputs {
     }
 }
 
+/// macOS-only: Linux builds compile the systemd unit renderer instead.
+#[cfg(target_os = "macos")]
 fn render_launchd_plist(inputs: &LaunchdInputs) -> String {
     let exe = xml_escape(&inputs.binary.to_string_lossy());
     let root = xml_escape(&inputs.state_root.to_string_lossy());
@@ -890,6 +895,9 @@ fn parse_launchctl_field(text: &str, key: &str) -> Option<String> {
     None
 }
 
+/// macOS-only: only the plist renderer needs XML escaping; systemd unit
+/// files are line-oriented plain text.
+#[cfg(target_os = "macos")]
 fn xml_escape(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for ch in s.chars() {
@@ -1278,6 +1286,7 @@ mod tests {
         assert!(!map.contains_key(&("t-old".to_string(), "m-old".to_string())));
     }
 
+    #[cfg(target_os = "macos")]
     #[test]
     fn launchd_plist_contains_required_keys_and_paths() {
         let inputs = LaunchdInputs {
@@ -1309,6 +1318,7 @@ mod tests {
         );
     }
 
+    #[cfg(target_os = "macos")]
     #[test]
     fn launchd_plist_xml_escapes_path_with_specials() {
         let inputs = LaunchdInputs {
@@ -1375,6 +1385,7 @@ mod tests {
         assert_eq!(parse_launchctl_field(sample, "missing"), None);
     }
 
+    #[cfg(target_os = "macos")]
     #[test]
     fn xml_escape_handles_all_specials() {
         assert_eq!(xml_escape("a&b<c>d\"e'f"), "a&amp;b&lt;c&gt;d&quot;e&apos;f");
