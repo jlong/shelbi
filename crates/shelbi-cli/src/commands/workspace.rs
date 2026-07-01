@@ -158,7 +158,7 @@ fn stop(project: &str, name: &str, keep_task: bool) -> Result<()> {
         .ok_or_else(|| anyhow!("workspace references unknown machine `{}`", workspace.machine))?;
     let host = machine.host();
     let addr = orch_workspace::workspace_tmux_addr(&p, workspace).map_err(|e| anyhow!(e))?;
-    orch_workspace::kill_workspace_pane(&host, &addr).map_err(|e| anyhow!(e))?;
+    orch_workspace::kill_workspace_pane(&host, &addr, &workspace.name).map_err(|e| anyhow!(e))?;
     println!("✓ {name} pane stopped");
 
     if keep_task {

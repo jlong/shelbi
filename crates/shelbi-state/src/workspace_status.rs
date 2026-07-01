@@ -18,7 +18,7 @@ use std::fs;
 use std::io::Write;
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -131,6 +131,81 @@ pub fn workspaces_dir() -> Result<PathBuf> {
 /// `~/.shelbi/workspaces/<name>/status.yaml`.
 pub fn workspace_status_path(workspace: &str) -> Result<PathBuf> {
     Ok(workspaces_dir()?.join(workspace).join("status.yaml"))
+}
+
+/// `~/.shelbi/workspaces/<name>/.expected-teardown` — presence signals that
+/// a shelbi-initiated caller (`shelbi task start`, `shelbi workspace stop`,
+/// `shelbi quit`, project quit) is about to kill the workspace's pane, so
+/// the pane's lifecycle wrapper should suppress its `pane_alive=false`
+/// event on exit. Otherwise every dispatch would fire a spurious
+/// `pane_alive=false reason=signal:SIGHUP` right before the new pane comes
+/// up (bug-workspace-pane-alive-false-sighup-fires-spuriously-right-after-dispatch).
+pub fn expected_teardown_marker_path(workspace: &str) -> Result<PathBuf> {
+    Ok(workspaces_dir()?.join(workspace).join(".expected-teardown"))
+}
+
+/// Freshness window on the expected-teardown marker. The wrapper's exit
+/// path runs between the mark and the check: mark → tmux kill-window →
+/// SIGHUP → forward to child → child.wait() → cleanup → consume. That
+/// chain is usually under a second, but claude has its own shutdown flow
+/// and could dawdle. 30 s is more than any observed teardown and still
+/// short enough that a stale marker (e.g. mark→SIGKILL race that never
+/// ran the consume) can't leak past the very next pane's real exit.
+pub const EXPECTED_TEARDOWN_MAX_AGE: Duration = Duration::from_secs(30);
+
+/// Write the expected-teardown marker for `workspace`. Best-effort:
+/// callers use this before `tmux kill-window` (or equivalent), so a
+/// failure to write just means the pane_alive event fires with its
+/// historical `signal:SIGHUP` reason — degraded but not broken.
+pub fn mark_expected_teardown(workspace: &str) -> Result<()> {
+    let path = expected_teardown_marker_path(workspace)?;
+    if let Some(parent) = path.parent() {
+        ensure_dir(parent)?;
+    }
+    // Empty body — the marker's presence + kernel-recorded mtime are the
+    // signal. No timestamp in the body means we don't have to parse
+    // anything on the consume side.
+    atomic_write(&path, b"")
+}
+
+/// If a fresh (< [`EXPECTED_TEARDOWN_MAX_AGE`]) marker exists, remove it
+/// and return `true` — the current pane teardown was intentional and the
+/// caller should suppress the `pane_alive=false` event. If the marker is
+/// older than the window, remove it and return `false` (the recorded
+/// intent is stale — an SIGKILL race or a caller that never got as far
+/// as the actual kill). If no marker exists → `false`.
+///
+/// Always deleting on read keeps a stale marker from leaking into a
+/// later, unrelated exit event.
+pub fn consume_expected_teardown(workspace: &str) -> Result<bool> {
+    let path = expected_teardown_marker_path(workspace)?;
+    let mtime = match fs::metadata(&path).and_then(|m| m.modified()) {
+        Ok(t) => t,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(e) => return Err(shelbi_core::Error::Io(e)),
+    };
+    let fresh = SystemTime::now()
+        .duration_since(mtime)
+        .map(|elapsed| elapsed < EXPECTED_TEARDOWN_MAX_AGE)
+        // Clock skew (mtime in the future): treat as fresh. That's the
+        // conservative call — we'd rather miss one true pane-death event
+        // than spam the log with a spurious one every dispatch.
+        .unwrap_or(true);
+    let _ = fs::remove_file(&path);
+    Ok(fresh)
+}
+
+/// Unconditionally remove the expected-teardown marker for `workspace`.
+/// Called by the pane wrapper at startup so a marker left behind by a
+/// crashed prior lifecycle (mark → SIGKILL → no consume) can't survive
+/// long enough to accidentally suppress a real exit event later.
+pub fn clear_expected_teardown(workspace: &str) -> Result<()> {
+    let path = expected_teardown_marker_path(workspace)?;
+    match fs::remove_file(&path) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(shelbi_core::Error::Io(e)),
+    }
 }
 
 /// `~/.shelbi/events.log`.
@@ -1377,6 +1452,121 @@ mod tests {
         }
         assert_eq!(task_lines, N);
         assert_eq!(workspace_lines, N);
+
+        std::env::remove_var("SHELBI_HOME");
+    }
+
+    /// Round-trip: `mark_expected_teardown` writes the marker,
+    /// `consume_expected_teardown` finds it fresh, returns true, and
+    /// removes the file. Second consume finds nothing → false.
+    #[test]
+    fn expected_teardown_marker_round_trips() {
+        let _g = TEST_LOCK.lock().unwrap();
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+
+        mark_expected_teardown("alpha").unwrap();
+        let marker = expected_teardown_marker_path("alpha").unwrap();
+        assert!(marker.exists(), "mark must create the marker file");
+
+        assert!(
+            consume_expected_teardown("alpha").unwrap(),
+            "fresh marker must consume as true"
+        );
+        assert!(
+            !marker.exists(),
+            "consume must remove the marker (one-shot signal)"
+        );
+
+        assert!(
+            !consume_expected_teardown("alpha").unwrap(),
+            "second consume with no marker returns false"
+        );
+
+        std::env::remove_var("SHELBI_HOME");
+    }
+
+    /// A stale marker (mtime older than [`EXPECTED_TEARDOWN_MAX_AGE`])
+    /// must not suppress: it means an intent was recorded but never
+    /// consumed (a mark→SIGKILL race), and this exit is not the one that
+    /// intent was talking about. Consume still deletes the stale marker
+    /// so it can't leak further forward.
+    #[test]
+    fn expected_teardown_marker_expires() {
+        let _g = TEST_LOCK.lock().unwrap();
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+
+        mark_expected_teardown("alpha").unwrap();
+        let marker = expected_teardown_marker_path("alpha").unwrap();
+        // Rewind mtime past the freshness window via `libc::utimes` —
+        // avoids pulling in the `filetime` crate just for one test.
+        set_mtime_to(&marker, SystemTime::now() - Duration::from_secs(3600));
+
+        assert!(
+            !consume_expected_teardown("alpha").unwrap(),
+            "stale marker must not suppress"
+        );
+        assert!(
+            !marker.exists(),
+            "stale marker must still be removed on consume so it can't linger"
+        );
+
+        std::env::remove_var("SHELBI_HOME");
+    }
+
+    /// Set `path`'s access and modification times to `when`. Test-only —
+    /// stdlib doesn't expose a stable mtime setter without opening the
+    /// file (`File::set_modified`), which changes size behavior on some
+    /// FSes; `utimes(2)` is the historical POSIX path and does exactly
+    /// what we need.
+    fn set_mtime_to(path: &std::path::Path, when: SystemTime) {
+        use std::ffi::CString;
+        use std::os::unix::ffi::OsStrExt;
+
+        let secs = when
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .expect("test uses recent-enough times")
+            .as_secs() as libc::time_t;
+        let times = [
+            libc::timeval {
+                tv_sec: secs,
+                tv_usec: 0,
+            },
+            libc::timeval {
+                tv_sec: secs,
+                tv_usec: 0,
+            },
+        ];
+        let cpath = CString::new(path.as_os_str().as_bytes()).unwrap();
+        // SAFETY: cpath owns the null-terminated bytes for the duration
+        // of the call; `times` is a valid array of two timevals.
+        let rc = unsafe { libc::utimes(cpath.as_ptr(), times.as_ptr()) };
+        assert_eq!(rc, 0, "utimes failed: errno={}", std::io::Error::last_os_error());
+    }
+
+    /// `clear_expected_teardown` is idempotent: no marker on disk → OK.
+    /// With a marker on disk → file is removed → returns OK. Second call
+    /// after remove is also OK. Used by the pane wrapper's startup so a
+    /// crashed prior lifecycle can't leak its marker into the new run.
+    #[test]
+    fn clear_expected_teardown_is_idempotent() {
+        let _g = TEST_LOCK.lock().unwrap();
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+
+        // No marker yet → noop OK.
+        clear_expected_teardown("alpha").unwrap();
+
+        // Plant a marker, clear it, verify removal.
+        mark_expected_teardown("alpha").unwrap();
+        let marker = expected_teardown_marker_path("alpha").unwrap();
+        assert!(marker.exists());
+        clear_expected_teardown("alpha").unwrap();
+        assert!(!marker.exists());
+
+        // Second clear on the now-absent marker also OK.
+        clear_expected_teardown("alpha").unwrap();
 
         std::env::remove_var("SHELBI_HOME");
     }

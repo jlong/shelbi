@@ -202,7 +202,7 @@ pub fn run() -> Result<()> {
                 // Remote workspace kills happen over SSH; an unreachable
                 // host returns Err here. Swallow so one unreachable
                 // machine doesn't block the rest of the teardown.
-                let _ = orch_workspace::kill_workspace_pane(&host, &addr);
+                let _ = orch_workspace::kill_workspace_pane(&host, &addr, &workspace.name);
             }
         }
         let _ = shelbi_state::append_project_event(name, "closed", "user:quit-shelbi");

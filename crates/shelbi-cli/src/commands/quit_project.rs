@@ -80,7 +80,7 @@ pub fn run(project: &str) -> Result<()> {
         let Ok(addr) = orch_workspace::workspace_tmux_addr(&p, workspace) else {
             continue;
         };
-        let _ = orch_workspace::kill_workspace_pane(&host, &addr);
+        let _ = orch_workspace::kill_workspace_pane(&host, &addr, &workspace.name);
     }
 
     let current = format!("shelbi-{project}");
