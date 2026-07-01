@@ -22,20 +22,26 @@ this is the practical version.
 The orchestrator is a [project-local agent with shipped defaults](/docs/concepts/agents).
 Its prompt is composed from two files:
 
-- **`~/.shelbi/projects/<name>/agents/orchestrator/instructions.md`** —
-  the orchestrator-specific system prompt. Seeded with the shipped
-  default on first load; your edits stay put on upgrade.
-  `{{assistant_name}}` is substituted from `~/.shelbi/shelbi.yaml`.
-- **`~/.shelbi/projects/<name>/agents/_shared/preamble.md`** —
-  project-wide context prepended to every agent (developer, qa,
-  orchestrator…). Put the repo layout, house style, and test command
-  here so you write it once instead of pasting it into four prompts.
+Both files live under the project's `agents/` directory —
+`~/.shelbi/projects/<name>/agents/` in the default
+[global mode](/docs/concepts/config-modes) or `<repo>/.shelbi/agents/`
+in in-repo mode:
+
+- **`agents/orchestrator/instructions.md`** — the orchestrator-specific
+  system prompt. Seeded with the shipped default on first load; your
+  edits stay put on upgrade. `{{assistant_name}}` is substituted from
+  `~/.shelbi/shelbi.yaml`.
+- **`agents/_shared/preamble.md`** — project-wide context prepended to
+  every agent (developer, qa, orchestrator…). Put the repo layout,
+  house style, and test command here so you write it once instead of
+  pasting it into four prompts.
 
 On every `shelbi reload` (and at session start) Shelbi composes
 `preamble.md + instructions.md`, substitutes the assistant name, and
-writes the rendered output to `~/.shelbi/projects/<name>/CLAUDE.md`.
-The orchestrator launches in that directory and auto-loads the
-rendered prompt — no flags, no env vars, no MCP.
+writes the rendered output to `~/.shelbi/projects/<name>/CLAUDE.md` —
+which is state, so it lives under `~/.shelbi/` in both modes. The
+orchestrator launches in that directory and auto-loads the rendered
+prompt — no flags, no env vars, no MCP.
 
 > The legacy `ORCHESTRATOR.md` override file is deprecated. If you
 > have content there from an earlier version, move project-wide bits

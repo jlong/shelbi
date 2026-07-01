@@ -1,0 +1,333 @@
+---
+title: Config modes — global and in-repo
+order: 16
+summary: Two places Shelbi will look for a project's config — under ~/.shelbi/ or committed at <repo>/.shelbi/ — and how to move between them.
+---
+
+Shelbi splits everything it writes to disk into two categories:
+
+- **Config** — declarative decisions about the project: its name, the
+  default branch, workflows, agent prompts, runner settings. These are
+  the same for every teammate.
+- **State** — per-user, per-machine, mutable data: task cards, the
+  events log, workspace status files, the orchestrator's dashboard
+  worktree. Two teammates on the same project have different state.
+
+**Config can live in two places** — under your `$HOME` (the historical
+default, *global mode*), or committed to the repo itself (*in-repo mode*).
+State always lives under `~/.shelbi/`, regardless of mode.
+
+You pick a mode once, at `shelbi init` time; you can move a project from
+global to in-repo later with a one-shot command.
+
+> Solo repos and quick experiments belong in **global mode** — it's the
+> default and needs zero repo-side changes. Reach for **in-repo mode**
+> when you want teammates to clone your workflows, agent prompts, and
+> runner settings without each of them having to redo the setup wizard.
+
+## The two modes at a glance
+
+| Piece | Global mode | In-repo mode |
+| --- | --- | --- |
+| Shared config (name, default_branch, orchestrator, agent_runners, zen, heartbeat, git, workflows/, agents/, workspace-settings.json.template) | `~/.shelbi/projects/<name>.yaml` and `~/.shelbi/projects/<name>/` | `<repo>/.shelbi/project.yaml` and `<repo>/.shelbi/` |
+| User-local config (repo path, machines, workspaces, editor, contextstore_sync) | Same YAML — `~/.shelbi/projects/<name>.yaml` | `~/.shelbi/projects/<name>/local.yaml` |
+| State (state.json, tasks/, HANDOFF.md, .claude/, workspaces/, events.log) | `~/.shelbi/projects/<name>/` (+ `~/.shelbi/events.log`) | `~/.shelbi/projects/<name>/` (+ `~/.shelbi/events.log`) |
+| Discovery | Reverse-lookup: cwd matched against every registered project's local `work_dir` | Walk up from cwd for `<dir>/.shelbi/project.yaml`, then require a matching `local.yaml` |
+| Shared with clones? | No — every teammate reruns `shelbi init` | Yes — everything under `<repo>/.shelbi/` (minus the gitignored state pieces) travels with `git clone` |
+
+The full field-by-field bucket lists are in
+[`shelbi_core::model`](https://github.com/jlong/shelbi/blob/main/crates/shelbi-core/src/model.rs)
+under `SHARED_PROJECT_FIELDS` and `LOCAL_PROJECT_FIELDS`; a shared YAML
+that carries a user-local field (or vice versa) errors on load rather
+than silently letting one side win.
+
+## Global mode
+
+The default. `shelbi init` (or the interactive wizard) writes
+`~/.shelbi/projects/<name>.yaml` with everything — shared and
+user-local — in one flat file. Nothing is added to your repo. The
+project only exists on your machine.
+
+Resolution is by reverse-lookup: shelbi scans `~/.shelbi/projects/*.yaml`
+once, collects each project's `machines[].work_dir` (local machines only
+— an SSH host's work_dir is a path on another box), and matches cwd (or
+an ancestor) against them. The deepest match wins, so nested checkouts
+resolve to the sub-project. `shelbi -p <name>` short-circuits the walk
+entirely.
+
+Global mode is the right choice for:
+
+- Solo projects nobody else clones.
+- Scratch experiments where committing anything to the repo would be noise.
+- Repos you don't own the write-access story for.
+
+If you want to try in-repo mode later, [migrate](#migrating-a-project-to-in-repo-mode) —
+one command.
+
+## In-repo mode
+
+The project's shared config is committed at `<repo>/.shelbi/project.yaml`
+and everyone who clones the repo gets the same workflows, agent prompts,
+and runner settings. Each teammate still has their own machines and
+workspace pool — those live in a per-user `local.yaml` that never gets
+committed.
+
+### On-disk layout
+
+```
+<repo>/
+  .shelbi/
+    project.yaml              # ← shared: name, default_branch, orchestrator,
+                              #   agent_runners, zen, heartbeat, git, github_url,
+                              #   workspace_permissions_mode, config_mode: in-repo
+    workflows/
+      default.yaml
+      statuses.yml
+    agents/
+      orchestrator/
+      developer/
+      _shared/                # optional shared preamble
+    workspace-settings.json.template
+  .gitignore                  # ← carries the state entries; see below
+```
+
+```
+~/.shelbi/
+  projects/
+    <name>/
+      local.yaml              # ← user-local: repo, machines, workspaces,
+                              #   editor, contextstore_sync
+      state.json              # ← state — never committed
+      tasks/
+      HANDOFF.md
+      .claude/
+      workspaces/
+  events.log                  # ← state — cross-project
+```
+
+The shared/local split is enforced at parse time: a `machines:` block
+inside `<repo>/.shelbi/project.yaml`, or a `zen:` block inside
+`local.yaml`, raises an error identifying the misplaced field and
+naming the file it belongs in.
+
+### Discovery walk-up
+
+From anywhere inside the repo — the root, a nested directory, wherever
+you happen to `cd` — shelbi walks up looking for the first ancestor
+containing `.shelbi/project.yaml`. This mirrors how `git` finds its
+`.git` directory: no env var, no marker file to place by hand.
+
+Once the walk-up finds a shared config, shelbi reads the `name:` field
+out of it and checks that a matching
+`~/.shelbi/projects/<name>/local.yaml` exists on your machine. If it
+doesn't, the resolver returns `ProjectNotPickedUp` and points at
+`shelbi init --pick-up` — the flow for a fresh clone that hasn't been
+registered locally yet ([see below](#picking-up-a-teammates-project)).
+
+Walk-up wins over reverse-lookup: if a repo happens to sit inside another
+registered project's `work_dir`, the walk-up match takes precedence.
+
+### The `.gitignore` list
+
+State that lives at `<repo>/.shelbi/` — bind-mounted or symlinked in
+from `~/.shelbi/` — must never land in a commit. `shelbi project
+migrate-to-in-repo` prints (and optionally appends) this snippet at
+`<repo>/.gitignore`:
+
+```
+.shelbi/state.json
+.shelbi/tasks/
+.shelbi/HANDOFF.md
+.shelbi/.claude/
+.shelbi/workspaces/
+.shelbi/events.log
+.shelbi/local.yaml
+```
+
+Every line names one state footprint. If you're using in-repo mode
+without running migration, add the snippet by hand — the goal is that a
+`git grep -F 'shelbi' .gitignore` at the repo root turns up the full
+list without you having to know the layout.
+
+The `local.yaml` line is defensive: `local.yaml` lives under
+`~/.shelbi/` today, so it doesn't need ignoring. But if you ever move it
+into the repo (a legitimate reason: symlinking from `~/.shelbi/projects/<name>/local.yaml`
+into `<repo>/.shelbi/local.yaml` so an editor picks it up), the ignore
+line prevents the mistake.
+
+### Local-alias collisions
+
+The `name:` in `<repo>/.shelbi/project.yaml` is a shared contract with
+every future clone — it stays stable. But two teammates can each clone
+into `~/work/shelbi/` and end up with a local registry collision on the
+name. `shelbi init --pick-up` handles this by auto-suffixing the local
+alias:
+
+- First clone: registered as `shelbi`.
+- Second clone on the same machine: registered as `shelbi-2` (`-3`, `-4`,
+  …). The committed name is unchanged; the alias is only how *you* refer
+  to that clone locally.
+
+You reach the suffixed clone with `shelbi -p shelbi-2`. Rename the
+alias later with `shelbi project rename` if you want something friendlier.
+
+## Migrating a project to in-repo mode
+
+`shelbi project migrate-to-in-repo` is a one-way command that splits an
+existing global-mode project into the in-repo layout:
+
+1. Splits `~/.shelbi/projects/<name>.yaml` into a committed
+   `<repo>/.shelbi/project.yaml` (shared half, with
+   `config_mode: in-repo`) and a per-machine
+   `~/.shelbi/projects/<name>/local.yaml`.
+2. Moves `workflows/`, `agents/`, and `workspace-settings.json.template`
+   from `~/.shelbi/projects/<name>/` into `<repo>/.shelbi/`. The mover
+   prefers `fs::rename`; on cross-filesystem failure it copies then
+   removes.
+3. Prints the `.gitignore` snippet above and offers to auto-append it
+   (interactively) — or applies it non-interactively with `--yes`.
+4. Deletes the now-superseded `~/.shelbi/projects/<name>.yaml`.
+
+State (`state.json`, `tasks/`, `HANDOFF.md`, `.claude/`, `workspaces/`,
+`events.log`) stays put under `~/.shelbi/`.
+
+### Try it dry first
+
+```bash
+shelbi project migrate-to-in-repo --project myapp --dry-run
+```
+
+Prints the ordered plan (every write, move, delete) without touching
+disk. Diff-oriented — a reviewer can vet the migration before it runs.
+
+### Apply it
+
+```bash
+shelbi project migrate-to-in-repo --project myapp
+```
+
+Interactive: prompts for the `.gitignore` append. Pass `--yes` to skip
+the prompt (useful in scripts). `--project` is optional — a bare
+`shelbi project migrate-to-in-repo` resolves the project from `$SHELBI_PROJECT`
+or the current directory the same way any other subcommand does.
+
+The migration is **idempotent**: rerunning on an already-migrated
+project is a no-op, and rerunning on a half-migrated one completes the
+outstanding steps. Safe to retry.
+
+### What to commit
+
+After a successful migration, commit:
+
+```
+.shelbi/project.yaml
+.shelbi/workflows/
+.shelbi/agents/
+.shelbi/workspace-settings.json.template
+.gitignore    # updated with the state snippet
+```
+
+Everything else is either state (already ignored) or lives outside the
+repo entirely.
+
+### It's one-way
+
+There is no `migrate-to-global` command. Reverting is:
+
+1. `git revert` the migration commit — this restores `<repo>/.shelbi/`
+   to its pre-migration state.
+2. Move `~/.shelbi/projects/<name>/local.yaml` back to
+   `~/.shelbi/projects/<name>.yaml` (the global-mode YAML shape).
+
+A merged migration commit is expensive to undo. `--dry-run` first.
+
+## Picking up a teammate's project
+
+When a teammate has committed `<repo>/.shelbi/` and you clone the repo,
+you need a local registry entry — the `local.yaml` with your machines
+and workspace pool — before the walk-up will resolve. `shelbi init
+--pick-up` walks you through it:
+
+```
+$ git clone git@github.com:acme/shelbi.git
+$ cd shelbi
+$ ls .shelbi/
+agents/  project.yaml  workflows/  workspace-settings.json.template
+
+$ shelbi init --pick-up
+✓ scaffolded /Users/you/.shelbi
+✓ registered project: /Users/you/.shelbi/projects/shelbi.yaml
+✓ wrote workspace settings template: /Users/you/.shelbi/projects/shelbi/workspace-settings.json.template
+✓ created agent workspace: agents/orchestrator/
+✓ created agent workspace: agents/developer/
+✓ wrote project statuses: /Users/you/.shelbi/projects/shelbi/workflows/statuses.yml
+
+✓ picked up `shelbi` from /Users/you/work/shelbi/.shelbi/project.yaml.
+
+next:
+  1. add machines/workspaces to ~/.shelbi/projects/shelbi.yaml if needed
+  2. spawn your first agent: shelbi spawn TASK --on hub --runner claude "…"
+```
+
+`--pick-up` walks up from cwd to find the committed
+`<repo>/.shelbi/project.yaml`, reads the canonical name, and registers a
+matching entry in your local `~/.shelbi/projects/`. From here, `shelbi`
+inside the repo just works.
+
+If the canonical name is already taken locally — you already have another
+clone, or another project named the same — the alias is auto-suffixed:
+
+```
+$ shelbi init --pick-up
+✓ scaffolded /Users/you/.shelbi
+note: local alias `shelbi` was already taken — using `shelbi-2` on this machine instead (the committed name is unchanged)
+✓ registered project: /Users/you/.shelbi/projects/shelbi-2.yaml
+…
+✓ picked up `shelbi` from /Users/you/work/shelbi/.shelbi/project.yaml as local alias `shelbi-2`.
+  Tip: `shelbi project rename` can retitle the local alias to something friendlier.
+
+next:
+  1. add machines/workspaces to ~/.shelbi/projects/shelbi-2.yaml if needed
+  2. pass `-p shelbi-2` on the command line to target this project
+     (the committed name `shelbi` was already taken locally — the alias only affects your machine)
+```
+
+### Safety net: bare `shelbi init` on an unregistered clone
+
+If you forget the `--pick-up` and run a plain `shelbi init` in a cloned
+repo that already carries `<repo>/.shelbi/project.yaml`, shelbi refuses
+to scaffold over the top:
+
+```
+$ shelbi init
+Error: found /Users/you/work/shelbi/.shelbi/project.yaml (committed) but no local registry entry for `shelbi` — this repo looks like a teammate's shelbi project. Run `shelbi init --pick-up` to register it locally.
+```
+
+## `shelbi reload` semantics
+
+`shelbi reload` respawns the Shelbi-owned panes (sidebar, tasks, review,
+machines) and self-heals default agent workspaces and the workspace
+settings template. As part of that, it re-reads the project's YAML — so
+edits to `<repo>/.shelbi/project.yaml` or `local.yaml` (in-repo mode) or
+`~/.shelbi/projects/<name>.yaml` (global mode) take effect on the next
+reload.
+
+The one important nuance: **in-flight workspaces keep their existing
+prompt until they hand off**. A running task doesn't get a mid-flight
+prompt update, even after a reload. Prompt changes reach a workspace on
+its *next* task dispatch, once it's picked up a fresh card from the
+board. This is deliberate — mid-turn prompt swaps would surprise the
+agent inside a workspace and make debugging much harder.
+
+If you need a running workspace to pick up new instructions immediately,
+kill its task, reload, then re-dispatch.
+
+## See also
+
+- [Set up your first project](/docs/getting-started/first-project) —
+  the wizard walkthrough (defaults to global mode; the `--mode` picker
+  chooses in-repo).
+- [`shelbi reload`](/docs/cli/reload) — respawn the TUI panes after
+  editing the YAML or installing a new binary.
+- `shelbi init --help` and `shelbi project migrate-to-in-repo --help` —
+  the full flag reference for the two commands this page covers.

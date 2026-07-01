@@ -44,6 +44,9 @@ pub enum ProjectCmd {
     /// plus manually moving `local.yaml` back to
     /// `~/.shelbi/projects/<name>.yaml`. Bail out here if you're not
     /// sure — a merged migration commit is expensive to undo.
+    ///
+    /// Docs: `site/content/docs/concepts/config-modes.mdx` — full
+    /// on-disk layout, `.gitignore` list, and worked pick-up example.
     #[command(name = "migrate-to-in-repo")]
     MigrateToInRepo {
         /// Project to migrate. Defaults to the project resolved from

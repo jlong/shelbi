@@ -163,14 +163,16 @@ The orchestrator is a [project-local agent with shipped defaults](/docs/concepts
 so customizing it is the same as customizing any other agent — edit a file:
 
 - **Per-project prompt:** edit
-  `~/.shelbi/projects/<name>/agents/orchestrator/instructions.md`. This is
-  the orchestrator's system prompt; Shelbi seeds it with the shipped default
-  on first load and never clobbers your edits on upgrade.
-  `{{assistant_name}}` is substituted anywhere you use it. Or run
-  `shelbi agent edit orchestrator`.
+  `<config-root>/agents/orchestrator/instructions.md` — where
+  `<config-root>` is `~/.shelbi/projects/<name>/` in
+  [global mode](/docs/concepts/config-modes) or `<repo>/.shelbi/` in
+  in-repo mode. This is the orchestrator's system prompt; Shelbi seeds
+  it with the shipped default on first load and never clobbers your
+  edits on upgrade. `{{assistant_name}}` is substituted anywhere you
+  use it. Or run `shelbi agent edit orchestrator`.
 - **Project-wide context:** put anything that should apply to *every* agent
   — repo layout, house style, the test command — in
-  `~/.shelbi/projects/<name>/agents/_shared/preamble.md`. It's prepended to
+  `<config-root>/agents/_shared/preamble.md`. It's prepended to
   the orchestrator's prompt (and every other agent's), so you write it once
   instead of pasting it into four `instructions.md` files.
 - **Shipped default:** the bundled orchestrator prompt lives in the

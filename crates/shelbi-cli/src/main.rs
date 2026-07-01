@@ -201,6 +201,13 @@ enum Cmd {
     /// Attach the terminal to a workspace's tmux pane.
     Attach { id: String },
     /// Scaffold ~/.shelbi/ and (optionally) a starter project YAML.
+    /// Offers a choice of *global* mode (config lives at
+    /// ~/.shelbi/projects/<name>.yaml) or *in-repo* mode (shared config
+    /// committed at <repo>/.shelbi/project.yaml so teammates get it on
+    /// clone). Pass `--pick-up` on a cloned repo carrying an existing
+    /// in-repo config to register it into your local registry. See
+    /// `site/content/docs/concepts/config-modes.mdx` for the full
+    /// on-disk layout, migration, and pick-up worked example.
     Init(commands::init::Args),
     /// Run the onboarding wizard. Phase 1 names the assistant; Phase 2
     /// walks through project setup (auto-filled from the current git

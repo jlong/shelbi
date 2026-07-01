@@ -7,7 +7,15 @@ summary: Walk through the wizard, declare your workspaces, and write the project
 A Shelbi *project* is a git repo plus the machines it can run on, the
 agent runners those machines have, and the named pool of workspaces that
 pick up tasks. All of that lives in a single YAML file at
-`~/.shelbi/projects/<name>.yaml`. The wizard writes it for you.
+`~/.shelbi/projects/<name>.yaml` in the default **global mode**. If you
+want teammates to share your workflows and agent prompts across clones
+instead, [in-repo mode](/docs/concepts/config-modes) commits the shared
+half of the config to the repo itself — the wizard offers the choice
+during setup.
+
+The rest of this page walks through global-mode setup. In-repo setup
+follows the same prompts; only the shared file's on-disk location
+differs, and the wizard makes that choice explicit.
 
 ## Start the wizard
 
@@ -289,3 +297,10 @@ config without restarting the orchestrator or losing your chat history.
 
 You have a project on disk and a workspace pool waiting on work. Time to
 [run your first task](/docs/getting-started/first-task).
+
+Want teammates to clone this project's workflows, agent prompts, and
+runner settings? See [Config modes](/docs/concepts/config-modes) — the
+`shelbi project migrate-to-in-repo` command splits the shared half of
+this file into `<repo>/.shelbi/project.yaml` (committed) and moves
+`workflows/`, `agents/`, and the workspace-settings template into the
+repo alongside it.
