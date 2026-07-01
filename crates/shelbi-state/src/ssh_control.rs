@@ -15,6 +15,7 @@
 use std::ffi::OsString;
 use std::fs;
 use std::io;
+use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
 
@@ -30,6 +31,25 @@ use crate::shelbi_home;
 /// scan and prune without risking the user's own ControlMasters.
 pub fn ssh_control_dir() -> Result<PathBuf> {
     Ok(shelbi_home()?.join("ssh"))
+}
+
+/// Ensure [`ssh_control_dir`] exists with `0700` permissions. Idempotent —
+/// creates the directory on first call and re-applies perms if they've
+/// drifted.
+///
+/// Called from [`shelbi-ssh`](../../../shelbi-ssh/index.html) before every
+/// outbound SSH invocation and from `ensure_root_subdirs` so a fresh
+/// install ships with the directory in place. Without this, the first
+/// hub→remote `ssh -o ControlPath=…` fails with
+/// `unix_listener: cannot bind to path …: No such file or directory`
+/// because OpenSSH won't create the ControlPath's parent for us.
+pub fn ensure_ssh_control_dir() -> Result<()> {
+    let dir = ssh_control_dir()?;
+    fs::create_dir_all(&dir)?;
+    // 0700: the sockets are only meaningful to the local user; opening
+    // the directory up would let another local user hijack the master.
+    fs::set_permissions(&dir, fs::Permissions::from_mode(0o700))?;
+    Ok(())
 }
 
 /// String passed to OpenSSH's `-o ControlPath=…`. Includes the `%r@%h`
@@ -262,6 +282,48 @@ mod tests {
         let home = fresh_home();
         std::env::set_var("SHELBI_HOME", &home);
         assert_eq!(ssh_control_dir().unwrap(), home.join("ssh"));
+        std::env::remove_var("SHELBI_HOME");
+    }
+
+    #[test]
+    fn ensure_ssh_control_dir_creates_missing_dir_with_0700() {
+        let _g = lock_test();
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+        let dir = ssh_control_dir().unwrap();
+        // Precondition: fresh home, no ssh/ subdir yet — mirrors the
+        // fresh-install case that motivated this helper.
+        assert!(!dir.exists(), "test setup: ssh/ dir should not exist yet");
+
+        ensure_ssh_control_dir().unwrap();
+
+        assert!(dir.is_dir(), "ssh/ dir should have been created");
+        let mode = fs::metadata(&dir).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o700, "ssh/ dir should be 0700, got {mode:o}");
+        std::env::remove_var("SHELBI_HOME");
+    }
+
+    #[test]
+    fn ensure_ssh_control_dir_is_idempotent_and_reasserts_perms() {
+        let _g = lock_test();
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+        let dir = ssh_control_dir().unwrap();
+
+        // First call creates. Second call is a no-op on already-correct
+        // state. Both must succeed — daemon startup and every SSH
+        // invocation call this, so a spurious failure would wedge us.
+        ensure_ssh_control_dir().unwrap();
+        ensure_ssh_control_dir().unwrap();
+        assert!(dir.is_dir());
+
+        // Drift perms open (0755 — what create_dir_all defaults to) and
+        // confirm the helper snaps them back to 0700. Guards against a
+        // future refactor that removes the set_permissions call.
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o755)).unwrap();
+        ensure_ssh_control_dir().unwrap();
+        let mode = fs::metadata(&dir).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o700, "ssh/ dir perms should have been reset to 0700");
         std::env::remove_var("SHELBI_HOME");
     }
 
