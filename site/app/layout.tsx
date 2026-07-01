@@ -8,7 +8,8 @@ import { getSections, humanizeSection } from "@/lib/docs"
 import "./globals.css"
 
 const SITE_URL = "https://shelbi.dev"
-const SITE_DESCRIPTION = "Manage a team of coding agents from your terminal."
+const SITE_DESCRIPTION =
+  "Open-source agent orchestrator for the terminal — a Kanban board that dispatches coding tasks to a named pool of workspaces, locally or over SSH."
 
 export const metadata: Metadata = {
   metadataBase: new URL(SITE_URL),

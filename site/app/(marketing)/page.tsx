@@ -6,7 +6,7 @@ import {
   CommandLineIcon,
   CpuChipIcon,
   EyeIcon,
-  ListBulletIcon,
+  MoonIcon,
   ServerStackIcon,
   ViewColumnsIcon,
 } from '@heroicons/react/24/outline'
@@ -18,54 +18,54 @@ import { KanbanMockup } from '@/components/KanbanMockup'
 const pitch = [
   {
     icon: ClipboardDocumentListIcon,
-    title: 'Plan tasks',
-    body: 'Add work as cards in a backlog. Promote what is ready into todo, set priorities, and pin tasks to a specific machine or workspace when it matters.',
+    title: 'Plan on the board',
+    body: 'Tell the orchestrator what you want in plain English. It drops cards into the backlog. Promote what is ready into todo, set priorities, and pin a task to a specific workspace or machine when it matters.',
     href: '/docs/getting-started/first-task',
   },
   {
     icon: CpuChipIcon,
-    title: 'Workspaces do them',
-    body: 'An orchestrator agent watches the board and hands ready tasks to free workspaces. Each workspace holds one task at a time, in its own persistent git worktree, on the machine you assigned.',
+    title: 'Workspaces run them in parallel',
+    body: 'The orchestrator watches the board and hands ready tasks to free workspaces. Each holds one task at a time, in its own persistent git worktree, on the machine you assigned.',
     href: '/docs/concepts/workspaces',
   },
   {
     icon: CheckCircleIcon,
-    title: 'You review and merge',
-    body: 'Finished work lands in the review column. Open the branch in the review pane, accept or send it back for changes, then squash-merge into main when you are ready.',
-    href: '/docs/concepts/columns',
+    title: 'Review — or Zen Mode auto-merges',
+    body: 'Finished work lands in the review column. Inspect the diff, send it back, or squash-merge on your terms — or flip on Zen Mode and the orchestrator lands anything that clears your bar.',
+    href: '/docs/concepts/zen-mode',
   },
 ]
 
 const features = [
   {
     icon: ViewColumnsIcon,
-    label: 'Kanban board',
-    body: 'Five columns — backlog, todo, in_progress, review, done — driven from a built-in TUI or the CLI.',
+    label: 'Kanban task board',
+    body: 'Backlog → Todo → In Progress → Review → Done ships as the default workflow. Add more workflows — QA, research, security review — with their own statuses and gates.',
   },
   {
     icon: ServerStackIcon,
-    label: 'Multi-machine workers',
-    body: 'Declare workers across as many machines as you have; each one runs in its own persistent git worktree.',
+    label: 'Workspace pool',
+    body: 'A named pool declared once in project YAML — hub-local, remote over SSH, or both. Each workspace is one persistent git worktree pinned to a machine.',
   },
   {
     icon: BoltIcon,
-    label: 'Orchestrator auto-dispatch',
-    body: 'An orchestrator agent tails the events log and hands ready tasks to free workers without prompting.',
+    label: 'Orchestrator agent',
+    body: 'The scheduler is a prompt you edit — a plain markdown file per project. Retune dispatch rules, add per-project policy, or swap the whole agent without touching Rust.',
+  },
+  {
+    icon: MoonIcon,
+    label: 'Zen Mode',
+    body: 'Turn on hands-off auto-merge. Cleared branches land without you — local checks pass, CI green, no danger paths matched. Anything ambiguous still lands in review.',
   },
   {
     icon: EyeIcon,
-    label: 'Review flow',
-    body: 'Finished work lands in a review card — open the branch, accept, send it back, or squash-merge into main.',
-  },
-  {
-    icon: ListBulletIcon,
-    label: 'Events log',
-    body: 'Every state change appends one line to ~/.shelbi/events.log. Tail it, grep it, audit it later.',
+    label: 'Review column',
+    body: 'A finished task checks its branch out into a dedicated review pane with a fresh agent pointed at the diff. Approve, send back, or squash-merge into main.',
   },
   {
     icon: CommandLineIcon,
-    label: 'tmux-native',
-    body: 'Workers live in tmux panes — sessions persist across SSH drops and survive client restarts.',
+    label: 'tmux-based TUI',
+    body: 'Sidebar, task board, orchestrator chat, and workspace panes all live in one tmux session. Sessions survive SSH drops and client restarts.',
   },
 ]
 
