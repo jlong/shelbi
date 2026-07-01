@@ -80,6 +80,15 @@ fn build_ssh_control_opts() -> Vec<String> {
         .iter()
         .map(|s| (*s).to_string())
         .collect();
+    // OpenSSH refuses to create the ControlPath's parent for us — a
+    // missing `~/.shelbi/ssh/` surfaces as `unix_listener: cannot bind
+    // to path …: No such file or directory` and the connection dies
+    // before argv is transmitted. Materialize the directory (with 0700)
+    // on every invocation; the call is cheap and idempotent, and it
+    // rescues fresh installs and anyone who hand-cleaned `~/.shelbi/`.
+    // Best-effort — if the helper errors out we still hand ssh the
+    // ControlPath and let it surface its own diagnostic.
+    let _ = shelbi_state::ensure_ssh_control_dir();
     // ControlPath under SHELBI_HOME so the hub's startup cleanup can
     // find these sockets without risking the user's hand-rolled CMs
     // under ~/.ssh/. Fall back to a sensible default if the helper

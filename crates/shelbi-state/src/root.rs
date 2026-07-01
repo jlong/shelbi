@@ -165,6 +165,19 @@ pub fn ensure_root_subdirs() -> Result<PathBuf> {
             )));
         }
     }
+    // The `ssh/` ControlMaster dir needs `0700` perms (not the default
+    // 0755 the other subdirs get), so it doesn't live in STANDARD_SUBDIRS
+    // — this handles it with its own helper. Failing here is a hard
+    // error for the same reason the loop above is: a fresh `shelbi init`
+    // must leave a working layout behind, and hub→devbox SSH dispatch is
+    // broken without this dir.
+    if let Err(e) = crate::ssh_control::ensure_ssh_control_dir() {
+        return Err(Error::Other(format!(
+            "could not create ssh/ under shelbi root {} (from {}): {e}",
+            root.display(),
+            source.describe(),
+        )));
+    }
     Ok(root)
 }
 
@@ -309,6 +322,7 @@ mod tests {
 
     #[test]
     fn ensure_root_subdirs_materializes_standard_layout() {
+        use std::os::unix::fs::PermissionsExt;
         let _g = LOCK.lock().unwrap();
         clear_env();
         let tmp = std::env::temp_dir().join(format!(
@@ -329,6 +343,13 @@ mod tests {
                 tmp.display(),
             );
         }
+        // `ssh/` is intentionally NOT in STANDARD_SUBDIRS (different mode
+        // than the others) but ensure_root_subdirs must still create it,
+        // otherwise a fresh install can't dispatch to any remote host.
+        let ssh_dir = tmp.join("ssh");
+        assert!(ssh_dir.is_dir(), "expected ssh/ to exist");
+        let mode = std::fs::metadata(&ssh_dir).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o700, "expected ssh/ to be 0700, got {mode:o}");
         // Second call is a no-op.
         ensure_root_subdirs().unwrap();
         clear_env();

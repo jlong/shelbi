@@ -52,9 +52,9 @@ pub use resolve::{
     cleanup_legacy_markers, project_roots, resolve_project_for_cwd, MarkerCleanup, ProjectRoot,
 };
 pub use ssh_control::{
-    cleanup_stale_control_masters, daemon_pid_file_path, is_process_alive, read_daemon_pid,
-    remote_hub_socket_path, remove_daemon_pid_file, reverse_forward_spec, ssh_control_dir,
-    ssh_control_path_template, write_daemon_pid, CmCleanupOutcome,
+    cleanup_stale_control_masters, daemon_pid_file_path, ensure_ssh_control_dir, is_process_alive,
+    read_daemon_pid, remote_hub_socket_path, remove_daemon_pid_file, reverse_forward_spec,
+    ssh_control_dir, ssh_control_path_template, write_daemon_pid, CmCleanupOutcome,
 };
 pub use user_config::{
     load_user_config, save_user_config, user_config_path, Keymap, UserConfig, ZenToggleChord,
