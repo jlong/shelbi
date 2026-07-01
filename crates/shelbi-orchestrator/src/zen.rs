@@ -39,7 +39,23 @@ use crate::workspace::{rebase_workspace_branch_onto_default, workspace_worktree,
 /// pending bucket to clear. Matches gh's own `--watch` default.
 const CI_POLL_INTERVAL: Duration = Duration::from_secs(10);
 
-/// Outcome of a `gh pr checks --required` poll loop.
+/// Which set of checks [`ci_watch`] is watching on this poll loop.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WatchMode {
+    /// Poll `gh pr checks --required` — the strict path used when the
+    /// target repo *does* configure branch-protection required status
+    /// checks. Only the required set counts.
+    Required,
+    /// Poll `gh pr checks` (no `--required`) — the fallback used when
+    /// the target repo has no required checks configured (unprotected
+    /// branch or protected-but-no-required-set). Every check reported
+    /// on the PR counts.
+    AllReported,
+}
+
+/// Outcome of a `gh pr checks` poll loop. In required-checks mode the
+/// verdict reflects only the required set; in all-reported mode it
+/// reflects every check reported on the PR.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CiVerdict {
     /// All required checks finished in a passing bucket.
@@ -72,6 +88,16 @@ impl CiVerdict {
             CiVerdict::Timeout => "timeout".to_string(),
         }
     }
+}
+
+/// Detect the "no required checks reported" message gh emits when the
+/// target branch has no branch-protection required status checks
+/// configured. Matched on message text — gh conflates this case with a
+/// real failure by returning exit 1 in both, so the wire text is the
+/// only disambiguator.
+pub fn is_no_required_checks_message(stdout: &str, stderr: &str) -> bool {
+    let needle = "no required checks reported";
+    stdout.contains(needle) || stderr.contains(needle)
 }
 
 /// Push the task's branch and open a PR. Idempotent — if an open PR for
@@ -144,30 +170,67 @@ pub fn pr_create(
     })
 }
 
-/// Poll `gh pr checks --required` on `pr` until every required check
-/// settles (pass or fail) or `timeout` elapses.
+/// Poll `gh pr checks` on `pr` until every watched check settles (pass
+/// or fail) or `timeout` elapses.
+///
+/// Two modes, selected at runtime:
+///
+/// - **Required-checks mode** (`gh pr checks --required`) — the strict
+///   path. Only branch-protection required status checks count; every
+///   other reported check is ignored.
+/// - **All-reported fallback** (`gh pr checks` with no `--required`) —
+///   auto-selected when the target repo has no required checks
+///   configured (unprotected branch, or protected-but-no-required-set).
+///   Every check reported on the PR counts.
+///
+/// Rationale for the fallback: many repos never configure
+/// branch-protection required status checks. Without the fallback,
+/// `gh pr checks --required` on such a PR exits non-zero with `no
+/// required checks reported on the '<branch>' branch`, and `ci-watch`
+/// would surface that as `red:unknown:...` within a second — never
+/// observing the actual `app-ci` / `Vercel` / etc. checks that were
+/// queued or running (see issue #102 for the failure story that
+/// motivated this fix). The strict path is preserved when required
+/// checks *are* configured.
 pub fn ci_watch(project: &Project, pr: u64, timeout: Duration) -> Result<CiVerdict> {
     let (host, dir) = locate_hub_workdir(project)?;
     let wt = dir.to_string_lossy().into_owned();
     let pr_str = pr.to_string();
 
     let deadline = Instant::now() + timeout;
+    // Start in the strict required-checks mode. On the first poll that
+    // returns "no required checks reported" we switch to the fallback
+    // for the remainder of the run. The mode never flips back — a repo
+    // doesn't gain required checks mid-poll.
+    let mut mode = WatchMode::Required;
     loop {
-        let out = run_in_dir(
-            &host,
-            &wt,
-            &["gh", "pr", "checks", &pr_str, "--required"],
-        )?;
+        let args: &[&str] = match mode {
+            WatchMode::Required => &["gh", "pr", "checks", &pr_str, "--required"],
+            WatchMode::AllReported => &["gh", "pr", "checks", &pr_str],
+        };
+        let out = run_in_dir(&host, &wt, args)?;
         let code = out.status.code();
         match code {
-            // 0 — all required checks passed.
+            // 0 — all watched checks passed.
             Some(0) => return Ok(CiVerdict::Green),
-            // 8 — at least one required check is still pending.
+            // 8 — at least one watched check is still pending.
             Some(8) => { /* fall through to sleep + retry */ }
-            // Any other non-zero — at least one required check failed.
+            // Any other non-zero — at least one watched check failed,
+            // OR (only in required mode) the branch has no required
+            // checks configured. Disambiguate on the message text.
             Some(_) => {
                 let stdout = String::from_utf8_lossy(&out.stdout);
                 let stderr = String::from_utf8_lossy(&out.stderr);
+                if mode == WatchMode::Required
+                    && is_no_required_checks_message(&stdout, &stderr)
+                {
+                    // No required checks configured on the target
+                    // branch — flip to the all-reported fallback and
+                    // re-poll immediately so we don't burn a sleep
+                    // interval on a mode we've already ruled out.
+                    mode = WatchMode::AllReported;
+                    continue;
+                }
                 let (check, summary) = first_failing_check(&stdout).unwrap_or_else(|| {
                     let fallback = stdout
                         .lines()
@@ -338,6 +401,33 @@ mod tests {
         // the orchestrator's prompt can split on `:` without ambiguity.
         assert_eq!(line.matches(':').count(), 2);
         assert!(line.starts_with("red:lint_strict:"));
+    }
+
+    #[test]
+    fn detects_no_required_checks_message_in_stdout() {
+        // gh's "no required checks" wire text — exact match on the
+        // needle is what triggers the fallback to all-reported mode.
+        let stdout = "no required checks reported on the 'main' branch\n";
+        assert!(is_no_required_checks_message(stdout, ""));
+    }
+
+    #[test]
+    fn detects_no_required_checks_message_in_stderr() {
+        // gh has flipped between stdout and stderr for this message
+        // across versions; both surfaces need to trigger the fallback.
+        let stderr = "no required checks reported on the 'develop' branch\n";
+        assert!(is_no_required_checks_message("", stderr));
+    }
+
+    #[test]
+    fn does_not_confuse_real_failures_with_no_required_checks() {
+        // A real failing required check must not trip the fallback —
+        // an unrelated check output that happens to mention "required"
+        // shouldn't either.
+        let stdout = "build\tfail\t2m0s\thttps://example/build\tcompilation error\n";
+        assert!(!is_no_required_checks_message(stdout, ""));
+        let stdout = "no checks reported on the 'feature' branch\n"; // gh's "no checks at all" variant
+        assert!(!is_no_required_checks_message(stdout, ""));
     }
 }
 

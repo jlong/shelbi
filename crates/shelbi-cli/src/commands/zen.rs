@@ -68,9 +68,20 @@ pub enum ZenCmd {
     /// returns the existing PR number if one is already open for the
     /// branch. Prints the PR number on stdout.
     PrCreate { task_id: String },
-    /// Watch the PR's required checks until they settle or the timeout
-    /// fires. Prints `green` / `red:<check>:<summary>` / `timeout` on
-    /// stdout. Exit code is 0 only for `green`.
+    /// Watch the PR's checks until they settle or the timeout fires.
+    /// Prints `green` / `red:<check>:<summary>` / `timeout` on stdout.
+    /// Exit code is 0 only for `green`.
+    ///
+    /// Two modes, auto-selected from the target branch's configuration:
+    ///
+    /// - Required-checks mode (default): watches only the branch's
+    ///   required status checks. Used when the target branch has
+    ///   branch-protection required checks configured.
+    /// - All-reported fallback: watches every check reported on the PR.
+    ///   Auto-selected when the target branch has no required checks
+    ///   configured (unprotected branch, or protected-but-no-required-
+    ///   set) — equivalent to `gh pr checks <pr>` waiting for every
+    ///   check to leave the pending state.
     CiWatch {
         pr_number: u64,
         /// Override the project-level (and per-workflow, if `--task` is
