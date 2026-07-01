@@ -13,6 +13,7 @@ import {
 import Link from 'next/link'
 import { Hero } from '@/components/Hero'
 import { InstallCloser } from '@/components/InstallCloser'
+import { KanbanMockup } from '@/components/KanbanMockup'
 
 const pitch = [
   {
@@ -73,6 +74,8 @@ export default function HomePage() {
     <div className="flex min-h-screen flex-col">
       <main className="flex flex-1 flex-col">
         <Hero />
+
+        <KanbanMockup />
 
         <section>
           <div className="grid grid-cols-1 md:grid-cols-3 gap-px bg-gray-4">
