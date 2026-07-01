@@ -1,22 +1,25 @@
 /**
  * A macOS-Terminal-window frame around an ASCII-art capture of the Shelbi
- * TUI's kanban view. The frame (traffic lights, rounded corners, drop
- * shadow, title bar) is DOM; the board body inside is a single `<pre>`
- * with character-perfect alignment — the point is that it reads as text
- * captured from a real terminal, not a re-implementation of the TUI in
- * HTML.
+ * TUI's full dashboard — sidebar on the left, kanban body on the right.
+ * The frame (traffic lights, rounded corners, drop shadow, title bar) is
+ * DOM; both inner panels are `<pre>` blocks with character-perfect
+ * alignment — the point is that they read as text captured from a real
+ * terminal, not a re-implementation of the TUI in HTML.
  *
- * Colors match what `crates/shelbi-tui/src/kanban.rs` emits via ratatui's
- * named `Color::Gray | Blue | Yellow | Magenta | Green | DarkGray`
+ * Colors match what `crates/shelbi-tui/src/sidebar.rs` and
+ * `crates/shelbi-tui/src/kanban.rs` emit via ratatui's named
+ * `Color::Gray | DarkGray | Blue | Yellow | Magenta | Green | Cyan`
  * palette, resolved to the hex values a modern dark terminal (macOS
- * Terminal / iTerm2 defaults) renders them as. Column-header hue is
- * driven by `StatusCategory` in the crate — Backlog=Gray, Ready=Blue,
- * Active=Yellow, Handoff=Magenta, Done=Green — the same rule used in
- * `category_color()` (crates/shelbi-tui/src/kanban.rs:2230).
+ * Terminal / iTerm2 defaults) renders them as. Kanban column-header hue
+ * is driven by `StatusCategory` in the crate — Backlog=Gray, Ready=Blue,
+ * Active=Yellow, Handoff=Magenta, Done=Green (`category_color()` in
+ * `crates/shelbi-tui/src/kanban.rs`). Sidebar decorations mirror
+ * `WorkspaceBadge::decoration_color()` and `Row::decoration()` in
+ * `crates/shelbi-tui/src/app.rs` — the same rules the palette / sidebar
+ * / kanban share so this mockup can't drift from the running TUI.
  *
  * The mockup stays static — no interaction — and on small viewports the
- * body overflows horizontally under a fixed terminal frame, mirroring
- * the horizontal-scroll fallback PR #110 shipped for the DOM version.
+ * sidebar hides so the board doesn't force horizontal scroll on phones.
  */
 
 // ── Palette ───────────────────────────────────────────────────────────
@@ -33,22 +36,29 @@ const TRAFFIC_GREEN = "#28c840"
 
 const TUI_BG = "#1e1e1e"
 const TUI_FG = "#e5e5e5"
-const TUI_GRAY = "#b8b8b8" // ANSI 7 — column header for `Backlog`
+const TUI_GRAY = "#b8b8b8" // ANSI 7 — column header for `Backlog`, nav labels
 const TUI_DARK_GRAY = "#7c7c7c" // ANSI 8 — chrome text (`Tasks · `, ids, footer)
 const TUI_BLUE = "#4a8fd7" // ANSI 4 — `Ready` category (todo)
 const TUI_YELLOW = "#dcb767" // ANSI 3 — `Active` category (in_progress)
 const TUI_MAGENTA = "#c586c0" // ANSI 5 — `Handoff` (review) + `@workspace`
-const TUI_GREEN = "#5fb56d" // ANSI 2 — `Done` category
-const TUI_CYAN = "#4ec9b0" // ANSI 6 — project name in title bar
-const SEL_BG = "#264f78" // ratatui `bg(Blue)` for the focused card
-const SEL_FG = "#ffffff" // ratatui `fg(White)` for the focused card
+const TUI_GREEN = "#5fb56d" // ANSI 2 — `Done` category + Working badge
+const TUI_CYAN = "#4ec9b0" // ANSI 6 — project name in title bar + ✓ review badge
+const SEL_BG = "#264f78" // ratatui `bg(Blue)` for a focused card
+const SEL_FG = "#ffffff" // ratatui `fg(White)` for a focused card
+// Sidebar's per-row selection fill: `Color::Rgb(63,63,63)` in
+// `sidebar.rs::render_list` — a dark gray band, softer than the kanban
+// card's blue highlight.
+const SIDEBAR_SEL_BG = "#3f3f3f"
 
 // ── Layout constants ─────────────────────────────────────────────────
-// Column widths are fixed at 22 monospace cells (20 for card text + a
+// Kanban columns are fixed at 22 monospace cells (20 for card text + a
 // 2-cell right gutter) — the same shape the TUI uses at 5-column
 // widths. Total board width = 1 leading pad + 5 × 22 = 111 cells.
+// Sidebar content width is 28 (matches the TUI's 30-col sidebar minus
+// its 1-col horizontal padding on each side).
 const COL_W = 22
 const TEXT_W = 20
+const SIDEBAR_W = 30
 
 type Card = {
   title: string
@@ -81,6 +91,11 @@ const COLUMNS: Column[] = [
       { title: "Rework onboarding copy", id: "t-004" },
       { title: "Audit third-party licenses", id: "t-005" },
       { title: "Draft Q3 roadmap", id: "t-006" },
+      { title: "Migrate CI to arm64", id: "t-014" },
+      { title: "Sunset legacy /v1 API", id: "t-020" },
+      { title: "Rotate signing keys", id: "t-023" },
+      { title: "Add SBOM to release", id: "t-025" },
+      { title: "Bump Node runtime to 22", id: "t-028" },
     ],
   },
   {
@@ -89,6 +104,9 @@ const COLUMNS: Column[] = [
     cards: [
       { title: "Add ratelimit to API", id: "t-007" },
       { title: "Fix mobile nav overlap", id: "t-008" },
+      { title: "Wire webhook retries", id: "t-016" },
+      { title: "Split OTel spans by tenant", id: "t-021" },
+      { title: "Sync i18n strings", id: "t-026" },
     ],
   },
   {
@@ -97,6 +115,8 @@ const COLUMNS: Column[] = [
     cards: [
       { title: "Deploy staging env", id: "t-009", workspace: "alpha" },
       { title: "Wire up OAuth flow", id: "t-010", workspace: "bravo" },
+      { title: "Backfill order_state index", id: "t-017", workspace: "delta" },
+      { title: "Trim vendor bundle size", id: "t-022", workspace: "foxtrot" },
     ],
   },
   {
@@ -109,6 +129,8 @@ const COLUMNS: Column[] = [
         workspace: "charlie",
         selected: true,
       },
+      { title: "Import CSV idempotency", id: "t-018", workspace: "echo" },
+      { title: "Nightly report email fix", id: "t-024", workspace: "foxtrot" },
     ],
   },
   {
@@ -117,6 +139,8 @@ const COLUMNS: Column[] = [
     cards: [
       { title: "Migrate to Postgres 16", id: "t-012" },
       { title: "Ship dark-mode toggle", id: "t-013" },
+      { title: "Retry webhook dead-letters", id: "t-019" },
+      { title: "Redis cache for /profile", id: "t-027" },
     ],
   },
 ]
@@ -131,7 +155,8 @@ type Segment = {
   bold?: boolean
 }
 
-const BLANK_ROW: Segment[] = [{ text: " ".repeat(1 + 5 * COL_W) }]
+const BOARD_BLANK_ROW: Segment[] = [{ text: " ".repeat(1 + 5 * COL_W) }]
+const SIDEBAR_BLANK_ROW: Segment[] = [{ text: " ".repeat(SIDEBAR_W) }]
 
 /**
  * Truncate `text` to fit inside `width` monospace cells, using the same
@@ -294,52 +319,257 @@ function footerRow(): Segment[] {
   return segs
 }
 
+// ── Sidebar ───────────────────────────────────────────────────────────
+// Mirrors `crates/shelbi-tui/src/sidebar.rs::render_list` + the row
+// composition in `app.rs::rows()`. One row = one line; each row is a
+// list of segments the pre element joins into a monospace grid, same as
+// the board.
+
+/** Pad segments to the sidebar's fixed row width so background fills reach the edge. */
+function padSidebarRow(segs: Segment[]): Segment[] {
+  const used = segs.reduce((acc, s) => acc + [...s.text].length, 0)
+  if (used >= SIDEBAR_W) return segs
+  return [...segs, { text: " ".repeat(SIDEBAR_W - used) }]
+}
+
+/**
+ * Right-align a `right` label at column `SIDEBAR_W - 1` (1-col trailing
+ * pad matches `sidebar.rs`'s `Margin::horizontal: 1`). Returns a full
+ * SIDEBAR_W-wide row. If the two runs together exceed the row's width,
+ * the right label is dropped rather than pushing the left off-screen —
+ * same fallback `right_align` uses in `sidebar.rs`.
+ */
+function sidebarRightAlignRow(
+  left: Segment[],
+  right: string,
+  rightColor: string,
+  bg?: string,
+): Segment[] {
+  const leftW = left.reduce((acc, s) => acc + [...s.text].length, 0)
+  const rightW = [...right].length
+  const trailing = 1 // matches sidebar's 1-col horizontal margin
+  if (right && leftW + rightW + 1 + trailing <= SIDEBAR_W) {
+    const pad = SIDEBAR_W - leftW - rightW - trailing
+    const row = [
+      ...left,
+      { text: " ".repeat(pad), bg },
+      { text: right, color: rightColor, bg },
+      { text: " ".repeat(trailing), bg },
+    ]
+    return row
+  }
+  return padSidebarRow(left)
+}
+
+type Machine = {
+  name: string
+  workspaces: { name: string; state: "idle" | "working"; agent?: string }[]
+}
+
+const MACHINES: Machine[] = [
+  {
+    name: "hub",
+    workspaces: [
+      { name: "alpha", state: "idle" },
+      { name: "bravo", state: "working", agent: "Developer" },
+      { name: "charlie", state: "idle" },
+    ],
+  },
+  {
+    name: "devbox",
+    workspaces: [
+      { name: "delta", state: "idle" },
+      { name: "echo", state: "idle" },
+      { name: "foxtrot", state: "idle" },
+    ],
+  },
+]
+
+/** One review-ready task surfaced in the sidebar's "Ready for Review" section. */
+const REVIEW_TASK = {
+  title: "Cache warm-up on cold start",
+  workspace: "charlie",
+}
+
+function buildSidebarRows(): Segment[][] {
+  const rows: Segment[][] = []
+
+  // Project header — same Cyan Bold `app.project_name` renders at.
+  rows.push(
+    padSidebarRow([
+      { text: " " },
+      { text: "shelbi", color: TUI_CYAN, bold: true },
+    ]),
+  )
+  rows.push(SIDEBAR_BLANK_ROW)
+
+  // Nav rows — 💬 Chat / 📋 Tasks / ⚡ Activity. Tasks is the selected
+  // row here (the main panel is the kanban), so it gets the full-row
+  // dark-gray fill + white-bold text `sidebar.rs::render_list` applies.
+  const navRow = (glyph: string, label: string, selected = false): Segment[] => {
+    const inner: Segment[] = [
+      { text: " ", bg: selected ? SIDEBAR_SEL_BG : undefined },
+      {
+        text: `${glyph} ${label}`,
+        color: selected ? SEL_FG : TUI_GRAY,
+        bg: selected ? SIDEBAR_SEL_BG : undefined,
+        bold: selected,
+      },
+    ]
+    const used = inner.reduce((acc, s) => acc + [...s.text].length, 0)
+    if (used < SIDEBAR_W) {
+      inner.push({
+        text: " ".repeat(SIDEBAR_W - used),
+        bg: selected ? SIDEBAR_SEL_BG : undefined,
+      })
+    }
+    return inner
+  }
+  rows.push(navRow("💬", "Chat"))
+  rows.push(navRow("📋", "Tasks", true))
+  rows.push(navRow("⚡", "Activity"))
+  rows.push(SIDEBAR_BLANK_ROW)
+
+  // — Workspaces — section header (DarkGray).
+  rows.push(
+    padSidebarRow([
+      { text: " " },
+      { text: "— Workspaces —", color: TUI_DARK_GRAY },
+    ]),
+  )
+
+  // Per-machine group header + indented workspace rows, matching the
+  // `▾ <machine>` / `  <badge> <name>   <right-label>` shape from
+  // `sidebar.rs`.
+  for (const m of MACHINES) {
+    rows.push(
+      padSidebarRow([
+        { text: " " },
+        { text: `▾ ${m.name}`, color: TUI_DARK_GRAY },
+      ]),
+    )
+    for (const w of m.workspaces) {
+      const badgeGlyph = w.state === "working" ? "⏵" : "·"
+      const badgeColor = w.state === "working" ? TUI_GREEN : TUI_DARK_GRAY
+      const rightLabel = w.agent ?? "idle"
+      rows.push(
+        sidebarRightAlignRow(
+          [
+            { text: " " },
+            { text: "  " }, // machine-group indent
+            { text: `${badgeGlyph} `, color: badgeColor },
+            { text: w.name, color: TUI_GRAY },
+          ],
+          rightLabel,
+          TUI_DARK_GRAY,
+        ),
+      )
+    }
+  }
+
+  // — Ready for Review — section: one entry with Cyan ✓, title, and the
+  // workspace right-aligned in DarkGray — same shape `Row::Review`
+  // renders via `right_align`.
+  rows.push(SIDEBAR_BLANK_ROW)
+  rows.push(
+    padSidebarRow([
+      { text: " " },
+      { text: "— Ready for Review —", color: TUI_DARK_GRAY },
+    ]),
+  )
+  rows.push(
+    sidebarRightAlignRow(
+      [
+        { text: " " },
+        { text: "✓ ", color: TUI_CYAN },
+        { text: truncate(REVIEW_TASK.title, SIDEBAR_W - 4 - REVIEW_TASK.workspace.length), color: TUI_GRAY },
+      ],
+      REVIEW_TASK.workspace,
+      TUI_DARK_GRAY,
+    ),
+  )
+
+  return rows
+}
+
+// ── Panels ────────────────────────────────────────────────────────────
+
+function Row({ segs }: { segs: Segment[] }) {
+  return (
+    <>
+      {segs.map((seg, j) => {
+        const style: React.CSSProperties = {}
+        if (seg.color) style.color = seg.color
+        if (seg.bg) style.background = seg.bg
+        if (seg.bold) style.fontWeight = 700
+        return (
+          <span key={j} style={style}>
+            {seg.text}
+          </span>
+        )
+      })}
+      {"\n"}
+    </>
+  )
+}
+
+const PRE_STYLE: React.CSSProperties = {
+  background: TUI_BG,
+  color: TUI_FG,
+  fontSize: 12,
+  lineHeight: "18px",
+  minWidth: "max-content",
+}
+
 function TerminalBody() {
   const rows: Segment[][] = [
     titleRow(),
-    BLANK_ROW,
+    BOARD_BLANK_ROW,
     ...buildBoardRows(),
-    BLANK_ROW,
+    BOARD_BLANK_ROW,
     footerRow(),
   ]
 
   return (
     <pre
       className="m-0 whitespace-pre px-4 py-3 font-mono"
+      style={PRE_STYLE}
+    >
+      {rows.map((row, i) => (
+        <Row key={i} segs={row} />
+      ))}
+    </pre>
+  )
+}
+
+function Sidebar() {
+  const rows = buildSidebarRows()
+  return (
+    <pre
+      className="m-0 hidden whitespace-pre border-r py-3 font-mono md:block"
       style={{
-        background: TUI_BG,
-        color: TUI_FG,
-        fontSize: 12,
-        lineHeight: "18px",
-        minWidth: "max-content",
+        ...PRE_STYLE,
+        borderColor: CHROME_BAR_BORDER,
       }}
     >
       {rows.map((row, i) => (
-        <span key={i}>
-          {row.map((seg, j) => {
-            const style: React.CSSProperties = {}
-            if (seg.color) style.color = seg.color
-            if (seg.bg) style.background = seg.bg
-            if (seg.bold) style.fontWeight = 700
-            return (
-              <span key={j} style={style}>
-                {seg.text}
-              </span>
-            )
-          })}
-          {"\n"}
-        </span>
+        <Row key={i} segs={row} />
       ))}
     </pre>
   )
 }
 
 function TrafficLight({ color }: { color: string }) {
+  // Real macOS traffic lights are ~12px diameter with ~8px spacing at
+  // 1× scale; sized inline so the site's 8px-based Tailwind spacing
+  // scale can't push these to 24px+ like the old `h-3 w-3` did.
   return (
     <span
       aria-hidden="true"
-      className="inline-block h-3 w-3 rounded-full"
+      className="inline-block rounded-full"
       style={{
+        width: 12,
+        height: 12,
         background: color,
         boxShadow: "inset 0 0 0 0.5px rgba(0,0,0,0.25)",
       }}
@@ -350,7 +580,7 @@ function TrafficLight({ color }: { color: string }) {
 export function KanbanMockup() {
   return (
     <section className="border-b border-gray-4 px-3 py-6 sm:py-10">
-      <div className="mx-auto w-full max-w-5xl">
+      <div className="mx-auto w-full max-w-6xl">
         <div
           className="overflow-hidden rounded-lg shadow-2xl"
           style={{ boxShadow: "0 24px 48px rgba(0,0,0,0.35), 0 0 0 1px rgba(0,0,0,0.4)" }}
@@ -364,7 +594,10 @@ export function KanbanMockup() {
               height: 28,
             }}
           >
-            <div className="absolute left-3 top-1/2 flex -translate-y-1/2 items-center gap-1.5">
+            <div
+              className="absolute left-3 top-1/2 flex -translate-y-1/2 items-center"
+              style={{ gap: 8 }}
+            >
               <TrafficLight color={TRAFFIC_RED} />
               <TrafficLight color={TRAFFIC_YELLOW} />
               <TrafficLight color={TRAFFIC_GREEN} />
@@ -377,11 +610,17 @@ export function KanbanMockup() {
             </span>
           </div>
 
-          {/* Terminal body — a real `<pre>` so the ASCII art reads as
-              captured text and every cell aligns to the monospace grid.
-              Horizontal overflow scrolls on narrow viewports; the frame
-              stays put. */}
-          <div className="overflow-x-auto" style={{ background: TUI_BG }}>
+          {/* Terminal body — two `<pre>` blocks (sidebar + board) sit
+              side-by-side inside one dark surface, so the whole panel
+              reads as a single captured terminal frame. The board `<pre>`
+              overflows horizontally on narrow viewports; the sidebar
+              hides below `md` so phones don't get a cramped strip beside
+              a cropped board. */}
+          <div
+            className="flex overflow-x-auto"
+            style={{ background: TUI_BG }}
+          >
+            <Sidebar />
             <TerminalBody />
           </div>
         </div>
