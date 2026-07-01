@@ -21,6 +21,7 @@ use shelbi_core::{
 mod agent_workspaces;
 mod hub_config;
 pub mod keymap;
+mod project_paths;
 mod resolve;
 mod root;
 mod ssh_control;
@@ -28,6 +29,7 @@ mod user_config;
 mod workspace_status;
 mod workflows;
 
+pub use project_paths::ProjectPaths;
 pub use root::{
     ensure_root_subdirs, expand_tilde_path, expand_tilde_str, resolve as resolve_root, root,
     set_root_override, RootSource, STANDARD_SUBDIRS,
@@ -170,19 +172,22 @@ pub fn project_dir(project: &str) -> Result<PathBuf> {
 
 /// Resolve the workspace settings template path for a project: the override
 /// in [`Project::workspace_settings_template`] (with `~` expansion) if set,
-/// otherwise the default at
-/// `~/.shelbi/projects/<name>/workspace-settings.json.template`.
+/// otherwise the mode-aware default resolved through [`ProjectPaths`].
 ///
 /// As a one-shot migration, if the legacy `workspace-settings.json` (no
 /// `.template` suffix) exists in the project dir and the new path doesn't,
 /// the legacy file is renamed in place — see [`migrate_workspace_settings_template`].
 pub fn workspace_settings_template_path(project: &Project) -> Result<PathBuf> {
-    if let Some(p) = &project.workspace_settings_template {
-        return Ok(expand_tilde(p));
+    let resolved = <Project as ProjectPaths>::workspace_settings_template_path(project)?;
+    // Legacy-file migration only makes sense when we're pointing at the
+    // per-project directory: if `workspace_settings_template` overrides
+    // the path entirely, the caller owns the file.
+    if project.workspace_settings_template.is_none() {
+        if let Some(parent) = resolved.parent() {
+            migrate_workspace_settings_template(parent);
+        }
     }
-    let dir = project_dir(&project.name)?;
-    migrate_workspace_settings_template(&dir);
-    Ok(dir.join("workspace-settings.json.template"))
+    Ok(resolved)
 }
 
 /// One-shot rename of a legacy `workspace-settings.json` to the new
@@ -343,10 +348,6 @@ pub fn self_heal_workspace_settings_template(
         }
         Err(e) => Err(shelbi_core::Error::Io(e)),
     }
-}
-
-fn expand_tilde(p: &Path) -> PathBuf {
-    root::expand_tilde_path(p)
 }
 
 pub fn agents_dir(project: &str) -> Result<PathBuf> {
