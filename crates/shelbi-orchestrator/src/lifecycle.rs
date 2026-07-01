@@ -2,12 +2,23 @@
 //!
 //! When a task moves into `InProgress` we cut its feature branch on the
 //! hub workdir, idempotently, and persist the branch name back onto the
-//! task. The base of the cut is **dependency-aware**: if the task has
-//! `depends_on` entries, the first dep that already carries a `branch:`
-//! is used as the base — that's what makes a chain `A -> B -> C` build
-//! one branch on top of the other instead of all of them re-rooting at
-//! `main`. With no usable dep branch, the cut falls back to the
-//! project-level base from [`Project::base_branch`].
+//! task. The base of the cut is **dependency-aware** and resolves by the
+//! dep's status:
+//!
+//! - `Done` deps: their work is already on `main`, so we skip them and
+//!   fall back to the project base. Preserving the historical branch
+//!   relationship would fail as soon as the merged branch is deleted on
+//!   the hub.
+//! - `InProgress` / `Review` deps with a live branch: stack on top of
+//!   that branch, so a chain `A -> B -> C` builds one branch on top of
+//!   the other.
+//! - `Backlog` / `Todo` deps: refuse the cut and name the blocking
+//!   deps. The dep hasn't been started, so there's no branch to stack
+//!   on and silently falling back to `main` would strip the depends_on
+//!   intent.
+//!
+//! With no active dep branch (all deps done, or no deps at all) the cut
+//! falls back to the project-level base from [`Project::base_branch`].
 //!
 //! This module wraps `shelbi_state::move_task` for both the CLI
 //! (`shelbi task move`) and the TUI (kanban left/right). `shelbi task
@@ -21,7 +32,7 @@
 //! the remote machine) when the resolved base isn't visible there — a
 //! depends_on chain across machines is out of scope for this pass.
 
-use shelbi_core::{Error, Host, Project, Result, Task};
+use shelbi_core::{Column, Error, Host, Project, Result, Task};
 use shelbi_state::TaskFile;
 
 use crate::git::{locate_hub_workdir, run_in_dir};
@@ -39,36 +50,60 @@ pub fn branch_name_for_task(task: &Task) -> String {
 
 /// Resolve the base branch a task's feature branch should be cut from.
 ///
-/// The contract:
+/// The contract walks `task.depends_on` in declaration order and
+/// dispatches by each dep's column:
 ///
-/// 1. If `task.depends_on` has any entries, walk them in declaration
-///    order. The first dep that exists in `all_tasks` *and* carries a
-///    `branch:` value wins — that branch becomes the base.
-/// 2. Otherwise (no deps, or none of them have a branch yet) fall back
-///    to [`Project::base_branch`].
+/// - `Done`: skip. The dep's work is already on the project base
+///   branch, and its feature branch has likely been merged and deleted
+///   on the hub — treating it as a base would produce the "base does
+///   not exist" error described in the bug report.
+/// - `InProgress` / `Review` with a non-empty `branch:` field: the
+///   first such dep wins and its branch becomes the base, so a chain
+///   stacks correctly.
+/// - `Backlog` / `Todo`: collected as blockers. If any dep is in this
+///   state we return [`Error::Other`] naming every blocking dep, so the
+///   caller can tell the user which dep to start first. Silently
+///   falling back to the project base would strip the depends_on
+///   intent.
 ///
-/// Notes on the dep selection:
-///
-/// - We accept any column for the chosen dep — a dep can be
-///   `InProgress`, `Review`, or even `Done` and still hand us a valid
-///   base. Validating that the dep's branch still exists on the host is
-///   the cut step's job ([`cut_branch_on_hub`]).
-/// - We deliberately **don't** skip `Done` deps. After a merge their
-///   branch may or may not still exist locally; if it does, treating it
-///   as the base lets the user opt into stacked chains by keeping
-///   merged branches around. The cut step degrades gracefully when the
-///   branch isn't there.
-pub fn resolve_base_branch(project: &Project, task: &Task, all_tasks: &[TaskFile]) -> String {
+/// If nothing blocks and no active dep hands us a branch, fall back to
+/// [`Project::base_branch`]. Unknown dep ids (a task file deleted
+/// mid-flight) are treated defensively as skips — `validate_depends_on`
+/// rejects unknown ids at save time, so this only kicks in for corrupt
+/// state.
+pub fn resolve_base_branch(project: &Project, task: &Task, all_tasks: &[TaskFile]) -> Result<String> {
+    let mut active_base: Option<String> = None;
+    let mut blocking: Vec<String> = Vec::new();
     for dep_id in &task.depends_on {
-        if let Some(dep) = all_tasks.iter().find(|tf| tf.task.id == *dep_id) {
-            if let Some(b) = dep.task.branch.as_deref() {
-                if !b.trim().is_empty() {
-                    return b.to_string();
+        let Some(dep) = all_tasks.iter().find(|tf| tf.task.id == *dep_id) else {
+            continue;
+        };
+        match dep.task.column {
+            Column::Done => {}
+            Column::InProgress | Column::Review => {
+                if active_base.is_none() {
+                    if let Some(b) = dep.task.branch.as_deref() {
+                        let b = b.trim();
+                        if !b.is_empty() {
+                            active_base = Some(b.to_string());
+                        }
+                    }
                 }
+            }
+            Column::Backlog | Column::Todo => {
+                blocking.push(dep_id.clone());
             }
         }
     }
-    project.base_branch().to_string()
+    if !blocking.is_empty() {
+        return Err(Error::Other(format!(
+            "branch-cut: cannot cut branch for `{task_id}` because dep(s) not yet started: \
+             {list} (start the dep(s) first, or remove them from `depends_on`)",
+            task_id = task.id,
+            list = blocking.join(", "),
+        )));
+    }
+    Ok(active_base.unwrap_or_else(|| project.base_branch().to_string()))
 }
 
 /// Idempotently cut `branch` off `base` in the project's hub workdir.
@@ -123,7 +158,7 @@ pub fn ensure_branch_for_in_progress(project: &Project, task_id: &str) -> Result
     let mut tf = shelbi_state::load_task(&project.name, task_id)?;
     let all_tasks = shelbi_state::list_tasks(&project.name)?;
     let branch = branch_name_for_task(&tf.task);
-    let base = resolve_base_branch(project, &tf.task, &all_tasks);
+    let base = resolve_base_branch(project, &tf.task, &all_tasks)?;
     cut_branch_on_hub(project, &branch, &base)?;
     if tf.task.branch.as_deref() != Some(branch.as_str()) {
         tf.task.branch = Some(branch);
@@ -289,11 +324,11 @@ mod tests {
         let (_tmp, repo) = fixture_repo();
         let p = project_at(&repo, None);
         let t = task_with("a", Column::Todo, None, &[]);
-        assert_eq!(resolve_base_branch(&p, &t, &[]), "main");
+        assert_eq!(resolve_base_branch(&p, &t, &[]).unwrap(), "main");
     }
 
     #[test]
-    fn resolve_base_uses_first_dep_with_branch() {
+    fn resolve_base_uses_first_active_dep_branch() {
         // Chain shape: A is in progress with branch `shelbi/a`; B depends
         // on A. B's base should be `shelbi/a`, not main.
         let (_tmp, repo) = fixture_repo();
@@ -301,22 +336,79 @@ mod tests {
         let dep_a = task_with("a", Column::InProgress, Some("shelbi/a"), &[]);
         let candidate = task_with("b", Column::Todo, None, &["a"]);
         let all = vec![tf_with(dep_a)];
-        assert_eq!(resolve_base_branch(&p, &candidate, &all), "shelbi/a");
+        assert_eq!(resolve_base_branch(&p, &candidate, &all).unwrap(), "shelbi/a");
     }
 
     #[test]
-    fn resolve_base_skips_deps_without_branch() {
-        // dep `a` exists but has no branch yet (still in Backlog) — keep
-        // walking and pick the next dep that does. A real shape: the user
-        // declared two deps to mean "any of these"; the first to be cut
-        // wins.
+    fn resolve_base_uses_review_dep_branch() {
+        // A review-column dep still owns a live branch that hasn't
+        // landed on main yet — stack B on top of it, same as InProgress.
         let (_tmp, repo) = fixture_repo();
         let p = project_at(&repo, None);
-        let dep_a = task_with("a", Column::Backlog, None, &[]);
+        let dep_a = task_with("a", Column::Review, Some("shelbi/a"), &[]);
+        let candidate = task_with("b", Column::Todo, None, &["a"]);
+        let all = vec![tf_with(dep_a)];
+        assert_eq!(resolve_base_branch(&p, &candidate, &all).unwrap(), "shelbi/a");
+    }
+
+    #[test]
+    fn resolve_base_skips_done_deps_even_when_branch_still_set() {
+        // Bug repro: A merged and its branch was deleted on the hub, but
+        // the task file's `branch:` field is still populated. Old
+        // behavior used it as the base and blew up in `cut_branch_on_hub`
+        // when the ref was missing. New behavior treats Done as "work is
+        // on main" and falls back to project base regardless of `branch:`.
+        let (_tmp, repo) = fixture_repo();
+        let p = project_at(&repo, None);
+        let dep_a = task_with("a", Column::Done, Some("shelbi/a"), &[]);
+        let candidate = task_with("b", Column::Todo, None, &["a"]);
+        let all = vec![tf_with(dep_a)];
+        assert_eq!(resolve_base_branch(&p, &candidate, &all).unwrap(), "main");
+    }
+
+    #[test]
+    fn resolve_base_prefers_active_dep_when_mixed_with_done() {
+        // `depends_on: [done-a, in-progress-b]` — done-a is on main,
+        // in-progress-b has a live branch. Pick b's branch so the child
+        // stacks correctly.
+        let (_tmp, repo) = fixture_repo();
+        let p = project_at(&repo, None);
+        let dep_a = task_with("a", Column::Done, Some("shelbi/a"), &[]);
         let dep_b = task_with("b", Column::InProgress, Some("shelbi/b"), &[]);
         let candidate = task_with("c", Column::Todo, None, &["a", "b"]);
         let all = vec![tf_with(dep_a), tf_with(dep_b)];
-        assert_eq!(resolve_base_branch(&p, &candidate, &all), "shelbi/b");
+        assert_eq!(resolve_base_branch(&p, &candidate, &all).unwrap(), "shelbi/b");
+    }
+
+    #[test]
+    fn resolve_base_refuses_when_any_dep_is_in_backlog() {
+        // Dep in Backlog has no branch yet. Silently falling back to
+        // main would strip the depends_on intent, so refuse.
+        let (_tmp, repo) = fixture_repo();
+        let p = project_at(&repo, None);
+        let dep_a = task_with("a", Column::Backlog, None, &[]);
+        let candidate = task_with("b", Column::Todo, None, &["a"]);
+        let all = vec![tf_with(dep_a)];
+        let err = resolve_base_branch(&p, &candidate, &all).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("`b`"), "msg: {msg}");
+        assert!(msg.contains("not yet started: a"), "msg: {msg}");
+    }
+
+    #[test]
+    fn resolve_base_refuses_when_any_dep_is_in_todo() {
+        // Same guard as backlog — a Todo dep hasn't been started, so no
+        // branch to stack on. Even if another dep is InProgress with a
+        // usable branch, the Todo dep is a hard blocker.
+        let (_tmp, repo) = fixture_repo();
+        let p = project_at(&repo, None);
+        let dep_a = task_with("todo-dep", Column::Todo, None, &[]);
+        let dep_b = task_with("b", Column::InProgress, Some("shelbi/b"), &[]);
+        let candidate = task_with("c", Column::Todo, None, &["todo-dep", "b"]);
+        let all = vec![tf_with(dep_a), tf_with(dep_b)];
+        let err = resolve_base_branch(&p, &candidate, &all).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("not yet started: todo-dep"), "msg: {msg}");
     }
 
     #[test]
@@ -329,7 +421,7 @@ mod tests {
         let (_tmp, repo) = fixture_repo();
         let p = project_at(&repo, None);
         let candidate = task_with("orphan", Column::Todo, None, &["ghost"]);
-        assert_eq!(resolve_base_branch(&p, &candidate, &[]), "main");
+        assert_eq!(resolve_base_branch(&p, &candidate, &[]).unwrap(), "main");
     }
 
     #[test]
@@ -340,18 +432,20 @@ mod tests {
         let (_tmp, repo) = fixture_repo();
         let p = project_at(&repo, Some("develop"));
         let t = task_with("a", Column::Todo, None, &[]);
-        assert_eq!(resolve_base_branch(&p, &t, &[]), "develop");
+        assert_eq!(resolve_base_branch(&p, &t, &[]).unwrap(), "develop");
     }
 
     #[test]
     fn resolve_base_treats_blank_dep_branch_as_unset() {
-        // A whitespace-only `branch:` is meaningless — skip it.
+        // A whitespace-only `branch:` on an active dep is meaningless.
+        // Nothing else in depends_on means no blocker either — fall back
+        // to project base rather than using whitespace as a ref name.
         let (_tmp, repo) = fixture_repo();
         let p = project_at(&repo, None);
         let dep_a = task_with("a", Column::InProgress, Some("   "), &[]);
         let candidate = task_with("b", Column::Todo, None, &["a"]);
         let all = vec![tf_with(dep_a)];
-        assert_eq!(resolve_base_branch(&p, &candidate, &all), "main");
+        assert_eq!(resolve_base_branch(&p, &candidate, &all).unwrap(), "main");
     }
 
     // ----- cut_branch_on_hub -------------------------------------------
@@ -570,6 +664,95 @@ mod tests {
         };
         let msg = err.to_string();
         assert!(msg.contains("shelbi/a"), "msg: {msg}");
+        assert!(!branch_exists(&repo, "shelbi/b"));
+
+        std::env::remove_var("SHELBI_HOME");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn ensure_cuts_from_main_when_done_dep_branch_was_deleted() {
+        // Bug repro: dep A is `done` (its PR merged and the hub deleted
+        // the branch). Dep A's task file still has `branch: shelbi/a`.
+        // Starting B (which depends on A) must succeed by cutting off
+        // the project base, not blow up because `shelbi/a` is gone.
+        let _g = test_lock::acquire();
+        let home = fresh_home("ensure-done-dep");
+        let (_tmp, repo) = fixture_repo();
+        let p = project_at(&repo, None);
+
+        std::env::set_var("SHELBI_HOME", &home);
+        shelbi_state::save_task(
+            &p.name,
+            &task_with("a", Column::Done, Some("shelbi/a"), &[]),
+            "",
+        )
+        .unwrap();
+        shelbi_state::save_task(
+            &p.name,
+            &task_with("b", Column::Todo, None, &["a"]),
+            "",
+        )
+        .unwrap();
+        // Deliberately: no `shelbi/a` branch in the repo. Simulates the
+        // post-merge state where the dep's branch was deleted from the
+        // hub.
+        assert!(!branch_exists(&repo, "shelbi/a"));
+
+        let tf = ensure_branch_for_in_progress(&p, "b").unwrap();
+        assert_eq!(tf.task.branch.as_deref(), Some("shelbi/b"));
+        assert!(branch_exists(&repo, "shelbi/b"));
+
+        // And confirm shelbi/b's HEAD is at main's HEAD — proving the
+        // cut base was main, not some ghost of the deleted branch.
+        let main_sha = Command::new("git")
+            .current_dir(&repo)
+            .args(["rev-parse", "main"])
+            .output()
+            .unwrap()
+            .stdout;
+        let b_sha = Command::new("git")
+            .current_dir(&repo)
+            .args(["rev-parse", "shelbi/b"])
+            .output()
+            .unwrap()
+            .stdout;
+        assert_eq!(main_sha, b_sha, "shelbi/b must be cut at main's HEAD");
+
+        std::env::remove_var("SHELBI_HOME");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn ensure_refuses_when_dep_is_still_in_todo() {
+        // Dep A hasn't been started; B depends on A. The cut must refuse
+        // and name A rather than silently falling back to main.
+        let _g = test_lock::acquire();
+        let home = fresh_home("ensure-todo-dep");
+        let (_tmp, repo) = fixture_repo();
+        let p = project_at(&repo, None);
+
+        std::env::set_var("SHELBI_HOME", &home);
+        shelbi_state::save_task(
+            &p.name,
+            &task_with("a", Column::Todo, None, &[]),
+            "",
+        )
+        .unwrap();
+        shelbi_state::save_task(
+            &p.name,
+            &task_with("b", Column::Todo, None, &["a"]),
+            "",
+        )
+        .unwrap();
+
+        let err = match ensure_branch_for_in_progress(&p, "b") {
+            Ok(_) => panic!("expected error when dep is still in todo"),
+            Err(e) => e,
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("`b`"), "msg: {msg}");
+        assert!(msg.contains("not yet started: a"), "msg: {msg}");
         assert!(!branch_exists(&repo, "shelbi/b"));
 
         std::env::remove_var("SHELBI_HOME");
