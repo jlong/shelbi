@@ -79,6 +79,16 @@ pub fn run(project: &Project, workspace: &WorkspaceSpec, machine: &Machine) -> R
     let worktree = orch_workspace::workspace_worktree(machine, workspace);
     let worktree_str = worktree.to_string_lossy().into_owned();
 
+    // A crashed prior wrapper (mark_expected_teardown → tmux kill-window →
+    // wrapper SIGKILLed before it could consume) can leave a stale
+    // `.expected-teardown` marker for this workspace. Clear it up front so
+    // it can't silently suppress the pane_alive event on our real, natural
+    // exit later. `consume_expected_teardown` also enforces a max-age
+    // freshness window as a belt-and-suspenders check, but clearing here
+    // means the wrapper's lifetime is a hard boundary on the marker's
+    // scope.
+    let _ = shelbi_state::clear_expected_teardown(&workspace.name);
+
     // Conditional --append-system-prompt: only when the agent context has
     // been deployed (which task start does) and we're launching claude.
     // Bare `shelbi open` from sidebar click on a workspace that's
@@ -172,12 +182,27 @@ pub fn run(project: &Project, workspace: &WorkspaceSpec, machine: &Machine) -> R
     let signaled = *received_signal.lock().unwrap();
     let reason = exit_reason(&status, signaled);
 
-    // Best-effort: a failure here shouldn't keep the pane from closing.
-    if let Err(e) = shelbi_state::append_workspace_pane_event(&workspace.name, false, &reason) {
-        eprintln!(
-            "shelbi: warning: couldn't write workspace pane-death event for `{}`: {e}",
-            workspace.name
-        );
+    // Suppress the `pane_alive=false` event when a shelbi-initiated caller
+    // (dispatch, quit-project, quit-shelbi, `shelbi workspace stop`)
+    // dropped the expected-teardown marker before killing our tmux window.
+    // Otherwise every dispatch would emit
+    // `workspace=<name> pane_alive=false reason=signal:SIGHUP` right
+    // before the replacement pane comes up — the orchestrator's reaction
+    // rule ("don't auto-restart, flag it") assumes the event means real
+    // pane death, so a spurious signal on every dispatch is genuinely
+    // harmful. A manual `tmux kill-pane` from the user still fires the
+    // event: nobody marked it as expected. See
+    // bug-workspace-pane-alive-false-sighup-fires-spuriously-right-after-dispatch.
+    let intentional_teardown =
+        shelbi_state::consume_expected_teardown(&workspace.name).unwrap_or(false);
+    if !intentional_teardown {
+        // Best-effort: a failure here shouldn't keep the pane from closing.
+        if let Err(e) = shelbi_state::append_workspace_pane_event(&workspace.name, false, &reason) {
+            eprintln!(
+                "shelbi: warning: couldn't write workspace pane-death event for `{}`: {e}",
+                workspace.name
+            );
+        }
     }
 
     // Natural exit (clean code or agent-side signal that wasn't routed
@@ -829,6 +854,182 @@ mod tests {
             updated_at: now,
             params: std::collections::BTreeMap::new(),
         }
+    }
+
+    /// Bug regression: a shelbi-initiated pane teardown (dispatch,
+    /// quit-project, quit-shelbi, `workspace stop`) marks the workspace's
+    /// `.expected-teardown` file just before killing tmux. The wrapper's
+    /// exit path must then suppress the `pane_alive=false` event —
+    /// otherwise every dispatch fires a spurious pane-death line and
+    /// trips the orchestrator's "flag it to the user" reaction rule for
+    /// panes that are actually about to come back up.
+    /// (bug-workspace-pane-alive-false-sighup-fires-spuriously-right-after-dispatch)
+    #[test]
+    fn run_suppresses_pane_event_when_expected_teardown_marker_is_set() {
+        let _g = ENV_LOCK.lock().unwrap();
+        let home = fresh_test_home("pane-expected-teardown-suppress");
+        std::env::set_var("SHELBI_HOME", &home);
+        // A caller-set SHELBI_HUB_SOCK would route the wrapper's event
+        // emit to a real daemon (writing to that daemon's events.log,
+        // not this test's home) — clear it so we stay on the fallback
+        // path that appends directly to `<SHELBI_HOME>/events.log`.
+        std::env::remove_var("SHELBI_HUB_SOCK");
+
+        let machine = local_machine(&home);
+        let workspace = WorkspaceSpec {
+            name: "alpha".into(),
+            machine: "hub".into(),
+            runner: "stub".into(),
+        };
+        // Runner writes the marker mid-run (simulates a concurrent
+        // `shelbi task start` marking the teardown while the wrapper is
+        // still alive), then exits 0. Real dispatch does the mark BEFORE
+        // sending kill-window; from the wrapper's point of view the
+        // ordering that matters is "marker present when the exit path
+        // reads it", which either sequence satisfies.
+        let mark_cmd = format!(
+            "mkdir -p {home}/workspaces/alpha && \
+             : > {home}/workspaces/alpha/.expected-teardown && \
+             exit 0",
+            home = home.display(),
+        );
+        let runner = AgentRunnerSpec {
+            command: "/bin/sh".into(),
+            flags: vec!["-c".into(), mark_cmd],
+        };
+        let project = fixture_project("demo", machine.clone(), workspace.clone(), runner);
+
+        run(&project, &workspace, &machine).unwrap();
+
+        // No pane_alive=false event landed — the intentional-teardown
+        // marker consumed the emission.
+        let log_path = shelbi_state::events_log_path().unwrap();
+        let body = if log_path.exists() {
+            std::fs::read_to_string(&log_path).unwrap()
+        } else {
+            String::new()
+        };
+        assert!(
+            !body.contains(" pane_alive=false "),
+            "expected teardown must not emit a pane-death event; log: {body:?}"
+        );
+
+        // And the marker was consumed (removed) so a subsequent unrelated
+        // exit can't accidentally pick it up.
+        let marker = shelbi_state::expected_teardown_marker_path("alpha").unwrap();
+        assert!(
+            !marker.exists(),
+            "marker should be removed on consume, but exists at {}",
+            marker.display()
+        );
+
+        std::env::remove_var("SHELBI_HOME");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// A stale `.expected-teardown` marker (older than the freshness
+    /// window) must NOT suppress a real pane_alive event — it represents
+    /// a shelbi kill that never actually completed, so this exit is
+    /// unrelated to that intent. The consume path deletes the stale
+    /// marker either way so it can't leak further forward.
+    #[test]
+    fn run_ignores_stale_expected_teardown_marker() {
+        let _g = ENV_LOCK.lock().unwrap();
+        let home = fresh_test_home("pane-expected-teardown-stale");
+        std::env::set_var("SHELBI_HOME", &home);
+        std::env::remove_var("SHELBI_HUB_SOCK");
+
+        let machine = local_machine(&home);
+        let workspace = WorkspaceSpec {
+            name: "alpha".into(),
+            machine: "hub".into(),
+            runner: "stub".into(),
+        };
+        // The runner re-plants the marker AFTER the wrapper's startup
+        // `clear_expected_teardown` has already run, then rewinds its
+        // mtime past the freshness window. On exit the consume side sees
+        // "marker present but stale" → doesn't suppress. `touch -t`'s
+        // `[[CC]YY]MMDDhhmm` format is the intersection of BSD and GNU
+        // touch, so this works on both macOS and Linux CI runners.
+        let stale_plant = format!(
+            "mkdir -p {home}/workspaces/alpha && \
+             : > {home}/workspaces/alpha/.expected-teardown && \
+             touch -t 202001010000 {home}/workspaces/alpha/.expected-teardown && \
+             exit 0",
+            home = home.display(),
+        );
+        let runner = AgentRunnerSpec {
+            command: "/bin/sh".into(),
+            flags: vec!["-c".into(), stale_plant],
+        };
+        let project = fixture_project("demo", machine.clone(), workspace.clone(), runner);
+
+        run(&project, &workspace, &machine).unwrap();
+
+        // A stale marker must not suppress: the real exit event fires.
+        let log_path = shelbi_state::events_log_path().unwrap();
+        let body = std::fs::read_to_string(&log_path).unwrap();
+        assert!(
+            body.contains(" pane_alive=false "),
+            "stale marker must not suppress pane-death event; log: {body:?}"
+        );
+
+        // Marker was still cleared so it can't linger.
+        let marker = shelbi_state::expected_teardown_marker_path("alpha").unwrap();
+        assert!(
+            !marker.exists(),
+            "stale marker should be consumed (deleted) even when not honored"
+        );
+
+        std::env::remove_var("SHELBI_HOME");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// A stale marker left over from a mark-then-SIGKILL race must not
+    /// survive across wrapper lifecycles: the wrapper clears the marker
+    /// at startup so it can't accidentally suppress a later, unrelated
+    /// exit that happens to fall inside the freshness window. Exercises
+    /// the `clear_expected_teardown` call at the top of `run()`.
+    #[test]
+    fn run_clears_expected_teardown_at_startup_before_natural_exit() {
+        let _g = ENV_LOCK.lock().unwrap();
+        let home = fresh_test_home("pane-expected-teardown-startup-clear");
+        std::env::set_var("SHELBI_HOME", &home);
+        std::env::remove_var("SHELBI_HUB_SOCK");
+
+        // Plant a FRESH marker directly, then run the wrapper with a
+        // runner that does NOT write a marker of its own. If the startup
+        // clear works, this marker is gone by the time the exit path
+        // runs, so the exit fires the pane_alive event normally.
+        let ws_dir = home.join("workspaces").join("alpha");
+        std::fs::create_dir_all(&ws_dir).unwrap();
+        std::fs::write(ws_dir.join(".expected-teardown"), b"").unwrap();
+
+        let machine = local_machine(&home);
+        let workspace = WorkspaceSpec {
+            name: "alpha".into(),
+            machine: "hub".into(),
+            runner: "stub".into(),
+        };
+        let runner = AgentRunnerSpec {
+            command: "/bin/sh".into(),
+            flags: vec!["-c".into(), "exit 0".into()],
+        };
+        let project = fixture_project("demo", machine.clone(), workspace.clone(), runner);
+
+        run(&project, &workspace, &machine).unwrap();
+
+        // Startup cleared the marker → exit path saw no marker → event
+        // fired. This is the belt in the belt-and-suspenders defense.
+        let log_path = shelbi_state::events_log_path().unwrap();
+        let body = std::fs::read_to_string(&log_path).unwrap();
+        assert!(
+            body.contains(" pane_alive=false "),
+            "startup-clear must remove leftover marker so the natural exit still emits; log: {body:?}"
+        );
+
+        std::env::remove_var("SHELBI_HOME");
+        let _ = std::fs::remove_dir_all(&home);
     }
 
     #[test]

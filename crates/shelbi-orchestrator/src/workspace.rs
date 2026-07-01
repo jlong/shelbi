@@ -394,7 +394,17 @@ pub fn workspace_pane_alive(host: &Host, addr: &TmuxAddr) -> Result<bool> {
 }
 
 /// Kill the workspace's pane (idempotent — silently OK if already gone).
-pub fn kill_workspace_pane(host: &Host, addr: &TmuxAddr) -> Result<()> {
+///
+/// Marks an "expected teardown" for `workspace_name` before touching tmux
+/// so the local pane's lifecycle wrapper (`shelbi open <name> --as-pane`)
+/// can distinguish shelbi-initiated shutdowns from real pane deaths.
+/// Without the mark, `tmux kill-window` delivers SIGHUP to the wrapper,
+/// which would emit `workspace=<name> pane_alive=false reason=signal:SIGHUP`
+/// to events.log even when the caller is a normal dispatch — spuriously
+/// tripping the orchestrator's "pane died, surface to user" reaction rule
+/// right before the replacement pane comes up. See
+/// bug-workspace-pane-alive-false-sighup-fires-spuriously-right-after-dispatch.
+pub fn kill_workspace_pane(host: &Host, addr: &TmuxAddr, workspace_name: &str) -> Result<()> {
     // Local: `kill-window -t session:window` (the dashboard session
     // must stay alive). Remote: `kill-session -t session` (the session
     // IS the workspace).
@@ -411,6 +421,10 @@ pub fn kill_workspace_pane(host: &Host, addr: &TmuxAddr) -> Result<()> {
             if !workspace_pane_alive(host, addr)? {
                 return Ok(());
             }
+            // Best-effort — the wrapper's fallback (fire the event with
+            // its historical reason) is the pre-fix behavior, so a mark
+            // failure just degrades to that.
+            let _ = shelbi_state::mark_expected_teardown(workspace_name);
             let _ = shelbi_ssh::run(host, ["tmux", "kill-window", "-t", &addr.target()])
                 .map_err(Error::Io)?;
         }
@@ -418,6 +432,11 @@ pub fn kill_workspace_pane(host: &Host, addr: &TmuxAddr) -> Result<()> {
             if !shelbi_tmux::has_session(host, &addr.session)? {
                 return Ok(());
             }
+            // Remote workspaces don't run the lifecycle wrapper (no
+            // shelbi binary on the workspace host), so there's nothing
+            // to suppress on that side — but writing the marker is
+            // still safe and keeps the API symmetric.
+            let _ = shelbi_state::mark_expected_teardown(workspace_name);
             let _ = shelbi_ssh::run(host, ["tmux", "kill-session", "-t", &addr.session])
                 .map_err(Error::Io)?;
         }
@@ -514,7 +533,7 @@ pub fn start_workspace_on_task(spec: StartSpec<'_>) -> Result<TmuxAddr> {
 
     // 3. Reset the tmux pane — that's how we clear context. If it doesn't
     //    exist yet, this is a no-op; otherwise the next step recreates it.
-    kill_workspace_pane(&host, &addr)?;
+    kill_workspace_pane(&host, &addr, &spec.workspace.name)?;
 
     // Inject `--permission-mode <mode>` directly on the claude command line
     // rather than trusting the rendered `.claude/settings.json` to take effect.
