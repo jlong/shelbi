@@ -1510,6 +1510,7 @@ mod probe_tests {
             name: "probe-test".into(),
             repo: work_dir.to_string_lossy().into(),
             default_branch: "main".into(),
+            config_mode: None,
             machines: vec![Machine {
                 name: "hub".into(),
                 kind: MachineKind::Local,

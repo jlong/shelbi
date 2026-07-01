@@ -249,6 +249,7 @@ pub fn setup_one_project() -> Result<()> {
         name: name.clone(),
         repo: repo_path.clone(),
         default_branch,
+        config_mode: None,
         machines,
         orchestrator: OrchestratorSpec {
             runner: orch_runner.id().to_string(),

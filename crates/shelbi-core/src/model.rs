@@ -26,33 +26,43 @@ pub struct SessionProject {
 
 // ---------------------------------------------------------------------------
 // Project
+//
+// Fields are grouped into three buckets that determine which YAML file they
+// belong to under [`ConfigMode::InRepo`]:
+//
+// * **Shared** — safe to commit to the project repo. In global mode these
+//   sit alongside everything else in `~/.shelbi/projects/<name>.yaml`; in
+//   in-repo mode they live in `<repo>/.shelbi/project.yaml`.
+// * **User-local** — per-machine or per-developer state that must never be
+//   committed. In global mode they share the same YAML as the shared
+//   fields; in in-repo mode they move to `~/.shelbi/projects/<name>/local.yaml`.
+// * **Runtime** — populated after the YAML is loaded (never serialized).
+//
+// The bucket lists in [`SHARED_PROJECT_FIELDS`] and [`LOCAL_PROJECT_FIELDS`]
+// (below) drive the split-mode parse/serialize helpers on `Project`. Keep
+// them in sync with the field order here.
+//
+// See `Plans/in-repo-vs-global-project-config.md`.
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Project {
+    // --- shared -----------------------------------------------------------
     pub name: String,
-    pub repo: String,
     #[serde(default = "default_branch")]
     pub default_branch: String,
-    pub machines: Vec<Machine>,
+    /// Which YAML layout this project uses on disk. See [`ConfigMode`].
+    /// `None` (the default) means [`ConfigMode::Global`] — the historical
+    /// single-YAML shape — and is elided from the wire form so existing
+    /// projects don't grow an extra key.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub config_mode: Option<ConfigMode>,
     pub orchestrator: OrchestratorSpec,
     pub agent_runners: std::collections::BTreeMap<String, AgentRunnerSpec>,
-    #[serde(default)]
-    pub editor: Option<String>,
     /// Optional GitHub repo URL (e.g. `git@github.com:owner/repo.git`)
     /// recorded by the project-setup wizard. Informational for now — the
     /// merge `--pr` flow still resolves the remote via local git config.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub github_url: Option<String>,
-    /// Fixed pool of workspace agents available to this project. Each owns a
-    /// stable worktree on its machine; the orchestrator routes tasks to
-    /// workspaces by name. See [`WorkspaceSpec`].
-    ///
-    /// Accepts the legacy `workers:` key as an alias for one release; new
-    /// projects materialized by the wizard / `shelbi init` emit
-    /// `workspaces:`. See `shelbi_state::load_project` for the
-    /// one-shot deprecation warning that fires when the legacy key is read.
-    #[serde(default, alias = "workers")]
-    pub workspaces: Vec<WorkspaceSpec>,
     /// How often the orchestrator polls each workspace pane for state changes.
     #[serde(default = "default_workspace_poll_interval_secs")]
     pub workspace_poll_interval_secs: u64,
@@ -84,6 +94,22 @@ pub struct Project {
     /// [`Project::merge_strategy`].
     #[serde(default)]
     pub git: GitConfig,
+
+    // --- user-local -------------------------------------------------------
+    pub repo: String,
+    pub machines: Vec<Machine>,
+    #[serde(default)]
+    pub editor: Option<String>,
+    /// Fixed pool of workspace agents available to this project. Each owns a
+    /// stable worktree on its machine; the orchestrator routes tasks to
+    /// workspaces by name. See [`WorkspaceSpec`].
+    ///
+    /// Accepts the legacy `workers:` key as an alias for one release; new
+    /// projects materialized by the wizard / `shelbi init` emit
+    /// `workspaces:`. See `shelbi_state::load_project` for the
+    /// one-shot deprecation warning that fires when the legacy key is read.
+    #[serde(default, alias = "workers")]
+    pub workspaces: Vec<WorkspaceSpec>,
     /// ContextStore spaces that should be rsynced from a remote workspace's
     /// machine back to hub after the workspace hands off for review. Each
     /// space's path is interpreted on both hub and remote — leading `~`
@@ -92,6 +118,8 @@ pub struct Project {
     /// empty: no sync runs unless the project opts in.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub contextstore_sync: Vec<ContextStoreSyncSpec>,
+
+    // --- runtime ----------------------------------------------------------
     /// Project-shape signals discovered at load time (Cargo workspace,
     /// Next.js, Docker, …). Populated by [`Project::detect_shapes`] when
     /// the project YAML is loaded; serialization is skipped so the on-disk
@@ -100,6 +128,56 @@ pub struct Project {
     #[serde(skip)]
     pub detected_shapes: Vec<ProjectShape>,
 }
+
+/// How this project's configuration is laid out on disk.
+///
+/// * [`ConfigMode::Global`] (the default and current behavior): everything
+///   lives under `~/.shelbi/projects/<name>/`, with the project YAML at
+///   `~/.shelbi/projects/<name>.yaml`.
+/// * [`ConfigMode::InRepo`]: shared fields live in
+///   `<repo>/.shelbi/project.yaml` (committed to git); user-local fields
+///   live in `~/.shelbi/projects/<name>/local.yaml` (never committed).
+///
+/// The variant lives in whichever YAML the discovery code finds first, so
+/// the value on `Project::config_mode` is really "the mode implied by the
+/// file we loaded from" — see `Plans/in-repo-vs-global-project-config.md`
+/// §Resolved decisions.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ConfigMode {
+    #[default]
+    Global,
+    InRepo,
+}
+
+/// YAML keys that belong in the *shared* half of a split project config.
+/// Matches the order of the shared fields on [`Project`].
+pub const SHARED_PROJECT_FIELDS: &[&str] = &[
+    "name",
+    "default_branch",
+    "config_mode",
+    "orchestrator",
+    "agent_runners",
+    "github_url",
+    "workspace_poll_interval_secs",
+    "workspace_permissions_mode",
+    "workspace_settings_template",
+    "zen",
+    "heartbeat",
+    "git",
+];
+
+/// YAML keys that belong in the *user-local* half of a split project
+/// config. Includes the legacy `workers` alias so a misplaced legacy key
+/// still routes to the right side of the split.
+pub const LOCAL_PROJECT_FIELDS: &[&str] = &[
+    "repo",
+    "machines",
+    "editor",
+    "workspaces",
+    "workers",
+    "contextstore_sync",
+];
 
 /// One ContextStore space that shelbi keeps in sync between hub and
 /// remote workspaces. The `space` field is matched against the body
@@ -355,6 +433,128 @@ impl Project {
             }
         }
         Ok(())
+    }
+
+    /// Parse a `Project` from a single YAML — the [`ConfigMode::Global`]
+    /// on-disk shape, matching the historical behavior of
+    /// `serde_yaml::from_str::<Project>`.
+    ///
+    /// The split-mode counterpart is [`Project::from_split_yaml_str`].
+    pub fn from_yaml_str(text: &str) -> crate::Result<Self> {
+        Ok(serde_yaml::from_str(text)?)
+    }
+
+    /// Parse a `Project` from the two YAML halves of
+    /// [`ConfigMode::InRepo`]: `shared_yaml` is the committed
+    /// `<repo>/.shelbi/project.yaml`, `local_yaml` is the user-local
+    /// `~/.shelbi/projects/<name>/local.yaml`. The halves are validated
+    /// for correct key placement (a misplaced field produces
+    /// [`crate::Error::MisplacedProjectField`]) and then merged into the
+    /// same flat wire form the global-mode parser consumes.
+    ///
+    /// Duplicate keys — the same field name appearing in both halves —
+    /// are rejected: which side wins is not a decision this layer should
+    /// make, so the merge refuses instead of silently dropping one.
+    pub fn from_split_yaml_str(
+        shared_yaml: &str,
+        local_yaml: &str,
+    ) -> crate::Result<Self> {
+        let shared_val: serde_yaml::Value = serde_yaml::from_str(shared_yaml)?;
+        let local_val: serde_yaml::Value = serde_yaml::from_str(local_yaml)?;
+
+        let shared_map = require_mapping(&shared_val, "shared")?;
+        let local_map = require_mapping(&local_val, "user-local")?;
+
+        check_field_placement(
+            shared_map,
+            "shared",
+            SHARED_PROJECT_FIELDS,
+            LOCAL_PROJECT_FIELDS,
+            "user-local",
+        )?;
+        check_field_placement(
+            local_map,
+            "user-local",
+            LOCAL_PROJECT_FIELDS,
+            SHARED_PROJECT_FIELDS,
+            "shared",
+        )?;
+
+        let mut merged = serde_yaml::Mapping::new();
+        for (k, v) in shared_map {
+            merged.insert(k.clone(), v.clone());
+        }
+        for (k, v) in local_map {
+            if merged.contains_key(k) {
+                let name = k.as_str().unwrap_or("<non-string key>").to_string();
+                return Err(crate::Error::Other(format!(
+                    "project YAML key `{name}` appears in both the shared \
+                     and user-local files; each key must live in exactly one"
+                )));
+            }
+            merged.insert(k.clone(), v.clone());
+        }
+        Ok(serde_yaml::from_value(serde_yaml::Value::Mapping(merged))?)
+    }
+
+    /// Serialize the shared half of this project — the committed
+    /// `<repo>/.shelbi/project.yaml` under [`ConfigMode::InRepo`].
+    /// User-local and runtime fields are omitted.
+    pub fn to_shared_yaml_string(&self) -> crate::Result<String> {
+        let mut value = serde_yaml::to_value(self)?;
+        retain_fields(&mut value, SHARED_PROJECT_FIELDS);
+        Ok(serde_yaml::to_string(&value)?)
+    }
+
+    /// Serialize the user-local half of this project — the gitignored
+    /// `~/.shelbi/projects/<name>/local.yaml` under
+    /// [`ConfigMode::InRepo`]. Shared and runtime fields are omitted.
+    pub fn to_local_yaml_string(&self) -> crate::Result<String> {
+        let mut value = serde_yaml::to_value(self)?;
+        retain_fields(&mut value, LOCAL_PROJECT_FIELDS);
+        Ok(serde_yaml::to_string(&value)?)
+    }
+}
+
+fn require_mapping<'a>(
+    value: &'a serde_yaml::Value,
+    file_kind: &'static str,
+) -> crate::Result<&'a serde_yaml::Mapping> {
+    value.as_mapping().ok_or_else(|| {
+        crate::Error::Other(format!(
+            "{file_kind} project YAML must be a mapping at the top level"
+        ))
+    })
+}
+
+fn check_field_placement(
+    map: &serde_yaml::Mapping,
+    found_in: &'static str,
+    valid_here: &[&str],
+    valid_elsewhere: &[&str],
+    other_file: &'static str,
+) -> crate::Result<()> {
+    for (k, _) in map {
+        let Some(name) = k.as_str() else { continue };
+        if valid_here.contains(&name) {
+            continue;
+        }
+        if valid_elsewhere.contains(&name) {
+            return Err(crate::Error::MisplacedProjectField {
+                field: name.to_string(),
+                found_in,
+                expected_in: other_file,
+            });
+        }
+        // Not recognized in either bucket — leave it to the flat Project
+        // Deserialize to accept or reject, matching global-mode behavior.
+    }
+    Ok(())
+}
+
+fn retain_fields(value: &mut serde_yaml::Value, keep: &[&str]) {
+    if let Some(map) = value.as_mapping_mut() {
+        map.retain(|k, _| k.as_str().map(|s| keep.contains(&s)).unwrap_or(false));
     }
 }
 
@@ -1545,6 +1745,7 @@ workspace_settings_template: /etc/shelbi/p.json
             name: "p".into(),
             repo: "r".into(),
             default_branch: "main".into(),
+            config_mode: None,
             machines: vec![Machine {
                 name: "hub".into(),
                 kind: MachineKind::Local,
@@ -1590,6 +1791,7 @@ workspace_settings_template: /etc/shelbi/p.json
             name: "p".into(),
             repo: "r".into(),
             default_branch: "main".into(),
+            config_mode: None,
             machines: vec![Machine {
                 name: "hub".into(),
                 kind: MachineKind::Local,
@@ -2482,5 +2684,364 @@ git:
             checks_for_task_in_workflow(&project, None, &task),
             checks_for_task(&project, &task),
         );
+    }
+
+    // ---- Shared / user-local YAML split (in-repo config mode) -------------
+    //
+    // These tests pin down the contract for Phase 1 of the in-repo config
+    // work: `Project` gains a set of parse/serialize helpers that split its
+    // fields into a shared half (safe to commit) and a user-local half
+    // (never committed), while the historical single-YAML shape used by
+    // global mode keeps parsing unchanged. See
+    // `Plans/in-repo-vs-global-project-config.md`.
+
+    /// Fully-populated project fixture with something in every non-runtime
+    /// field, so round-trip tests notice if a bucket loses a field.
+    fn fully_populated_project() -> Project {
+        let mut runners = std::collections::BTreeMap::new();
+        runners.insert(
+            "claude".to_string(),
+            AgentRunnerSpec {
+                command: "claude".into(),
+                flags: vec!["--verbose".into()],
+            },
+        );
+        Project {
+            name: "shelbi".into(),
+            default_branch: "main".into(),
+            config_mode: Some(ConfigMode::InRepo),
+            orchestrator: OrchestratorSpec {
+                runner: "claude".into(),
+            },
+            agent_runners: runners,
+            github_url: Some("git@github.com:example/shelbi.git".into()),
+            workspace_poll_interval_secs: 7,
+            workspace_permissions_mode: "acceptEdits".into(),
+            workspace_settings_template: Some(PathBuf::from(
+                "workspace-settings.json.template",
+            )),
+            zen: ZenConfig {
+                checks: ZenChecks {
+                    local: vec!["cargo test".into()],
+                },
+                ci_timeout: Duration::from_secs(900),
+                danger_paths: ZenDangerPaths::Extend(vec!["secrets/**".into()]),
+            },
+            heartbeat: HeartbeatConfig::Every(Duration::from_secs(120)),
+            git: GitConfig {
+                base_branch: Some("trunk".into()),
+                merge_strategy: MergeStrategy::Rebase,
+            },
+            repo: "/home/dev/shelbi".into(),
+            machines: vec![Machine {
+                name: "hub".into(),
+                kind: MachineKind::Local,
+                work_dir: "/home/dev/shelbi".into(),
+                host: None,
+            }],
+            editor: Some("nvim".into()),
+            workspaces: vec![WorkspaceSpec {
+                name: "alpha".into(),
+                machine: "hub".into(),
+                runner: "claude".into(),
+            }],
+            contextstore_sync: vec![ContextStoreSyncSpec {
+                space: "Shelbi".into(),
+                path: PathBuf::from("~/Documents/ContextStore/shelbi"),
+            }],
+            detected_shapes: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn config_mode_defaults_to_none_and_omits_in_serialization() {
+        // Pre-split project YAMLs don't carry `config_mode:` — the flat
+        // parser must accept them and re-serialize without leaking a
+        // synthetic key. `None` is the on-disk shape for
+        // [`ConfigMode::Global`].
+        let yaml = r#"
+name: p
+repo: r
+machines:
+  - { name: hub, kind: local, work_dir: /tmp }
+orchestrator: { runner: claude }
+agent_runners:
+  claude: { command: claude, flags: [] }
+"#;
+        let p: Project = serde_yaml::from_str(yaml).unwrap();
+        assert!(p.config_mode.is_none());
+        let back = serde_yaml::to_string(&p).unwrap();
+        assert!(!back.contains("config_mode"), "got: {back}");
+    }
+
+    #[test]
+    fn config_mode_parses_kebab_case_variants() {
+        let yaml = r#"
+name: p
+repo: r
+config_mode: in-repo
+machines:
+  - { name: hub, kind: local, work_dir: /tmp }
+orchestrator: { runner: claude }
+agent_runners:
+  claude: { command: claude, flags: [] }
+"#;
+        let p: Project = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(p.config_mode, Some(ConfigMode::InRepo));
+        // Round-trip re-serializes back to the kebab-case form.
+        let back = serde_yaml::to_string(&p).unwrap();
+        assert!(back.contains("config_mode: in-repo"), "got: {back}");
+
+        // `global` is the other explicit variant; the parser accepts it
+        // even though it matches the default.
+        let yaml_global = yaml.replace("in-repo", "global");
+        let p: Project = serde_yaml::from_str(&yaml_global).unwrap();
+        assert_eq!(p.config_mode, Some(ConfigMode::Global));
+    }
+
+    #[test]
+    fn shared_and_local_field_lists_cover_every_non_runtime_field() {
+        // If someone adds a field to `Project` and forgets to place it in
+        // one of the two buckets, the split helpers will silently drop it
+        // from the emitted YAML. Guard against that by serializing a
+        // populated project and asserting every top-level key is either
+        // shared, user-local, or the legacy `workers` alias (which is a
+        // deserialization alias only — no serialize path emits it).
+        let p = fully_populated_project();
+        let value = serde_yaml::to_value(&p).unwrap();
+        let map = value.as_mapping().expect("Project serializes as a map");
+        for (k, _) in map {
+            let key = k.as_str().expect("all Project keys are strings");
+            let in_shared = SHARED_PROJECT_FIELDS.contains(&key);
+            let in_local = LOCAL_PROJECT_FIELDS.contains(&key);
+            assert!(
+                in_shared || in_local,
+                "field `{key}` is in `Project` but not in either bucket list"
+            );
+            assert!(
+                !(in_shared && in_local),
+                "field `{key}` is in BOTH bucket lists — pick one"
+            );
+        }
+    }
+
+    #[test]
+    fn from_yaml_str_matches_direct_serde_deserialize() {
+        // `Project::from_yaml_str` is the global-mode entry point and must
+        // stay behavior-identical to the historical
+        // `serde_yaml::from_str::<Project>` path.
+        let yaml = r#"
+name: p
+repo: r
+machines:
+  - { name: hub, kind: local, work_dir: /tmp }
+orchestrator: { runner: claude }
+agent_runners:
+  claude: { command: claude, flags: [] }
+"#;
+        let via_helper = Project::from_yaml_str(yaml).unwrap();
+        let via_serde: Project = serde_yaml::from_str(yaml).unwrap();
+        // No PartialEq on Project — compare via a stable re-serialization.
+        assert_eq!(
+            serde_yaml::to_string(&via_helper).unwrap(),
+            serde_yaml::to_string(&via_serde).unwrap()
+        );
+    }
+
+    #[test]
+    fn split_yaml_round_trips_populated_project() {
+        // A populated Project → split YAMLs → re-merged Project must
+        // stably re-emit the same split YAMLs (no field drift, no key
+        // migration between halves).
+        let p = fully_populated_project();
+        let shared_1 = p.to_shared_yaml_string().unwrap();
+        let local_1 = p.to_local_yaml_string().unwrap();
+
+        let reparsed = Project::from_split_yaml_str(&shared_1, &local_1).unwrap();
+        let shared_2 = reparsed.to_shared_yaml_string().unwrap();
+        let local_2 = reparsed.to_local_yaml_string().unwrap();
+
+        assert_eq!(shared_1, shared_2);
+        assert_eq!(local_1, local_2);
+    }
+
+    #[test]
+    fn split_yaml_shared_half_contains_only_shared_keys() {
+        let p = fully_populated_project();
+        let shared_yaml = p.to_shared_yaml_string().unwrap();
+        let value: serde_yaml::Value = serde_yaml::from_str(&shared_yaml).unwrap();
+        let map = value.as_mapping().unwrap();
+        for (k, _) in map {
+            let name = k.as_str().unwrap();
+            assert!(
+                SHARED_PROJECT_FIELDS.contains(&name),
+                "shared YAML leaked `{name}` — should be user-local"
+            );
+        }
+        // Sample assertions: the shared half must carry the fields the
+        // task description explicitly enumerates.
+        for expected in ["name", "default_branch", "orchestrator", "agent_runners", "zen", "git", "heartbeat", "config_mode"] {
+            assert!(
+                map.contains_key(serde_yaml::Value::String(expected.into())),
+                "shared YAML missing `{expected}`"
+            );
+        }
+    }
+
+    #[test]
+    fn split_yaml_local_half_contains_only_user_local_keys() {
+        let p = fully_populated_project();
+        let local_yaml = p.to_local_yaml_string().unwrap();
+        let value: serde_yaml::Value = serde_yaml::from_str(&local_yaml).unwrap();
+        let map = value.as_mapping().unwrap();
+        for (k, _) in map {
+            let name = k.as_str().unwrap();
+            assert!(
+                LOCAL_PROJECT_FIELDS.contains(&name),
+                "user-local YAML leaked `{name}` — should be shared"
+            );
+        }
+        for expected in ["repo", "machines", "workspaces", "contextstore_sync"] {
+            assert!(
+                map.contains_key(serde_yaml::Value::String(expected.into())),
+                "user-local YAML missing `{expected}`"
+            );
+        }
+    }
+
+    #[test]
+    fn split_yaml_matches_global_yaml_after_merge() {
+        // Merging the two split halves must produce the same in-memory
+        // Project as the equivalent single YAML would in global mode.
+        let p = fully_populated_project();
+        let global_yaml = serde_yaml::to_string(&p).unwrap();
+        let shared_yaml = p.to_shared_yaml_string().unwrap();
+        let local_yaml = p.to_local_yaml_string().unwrap();
+
+        let from_global = Project::from_yaml_str(&global_yaml).unwrap();
+        let from_split = Project::from_split_yaml_str(&shared_yaml, &local_yaml).unwrap();
+
+        // Compare via a stable re-serialization to sidestep PartialEq.
+        assert_eq!(
+            serde_yaml::to_string(&from_global).unwrap(),
+            serde_yaml::to_string(&from_split).unwrap()
+        );
+    }
+
+    #[test]
+    fn split_yaml_rejects_user_local_field_in_shared_file() {
+        // A shared YAML that includes `machines:` (a user-local field)
+        // must produce a targeted error pointing at the correct file —
+        // not a silent misparse and not the generic "unknown field"
+        // message from `deny_unknown_fields`.
+        let shared = r#"
+name: p
+default_branch: main
+orchestrator: { runner: claude }
+agent_runners:
+  claude: { command: claude, flags: [] }
+machines:
+  - { name: hub, kind: local, work_dir: /tmp }
+"#;
+        let local = r#"
+repo: /tmp
+"#;
+        match Project::from_split_yaml_str(shared, local) {
+            Err(crate::Error::MisplacedProjectField {
+                field,
+                found_in,
+                expected_in,
+            }) => {
+                assert_eq!(field, "machines");
+                assert_eq!(found_in, "shared");
+                assert_eq!(expected_in, "user-local");
+            }
+            other => panic!("expected MisplacedProjectField, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn split_yaml_rejects_shared_field_in_user_local_file() {
+        let shared = r#"
+name: p
+default_branch: main
+orchestrator: { runner: claude }
+agent_runners:
+  claude: { command: claude, flags: [] }
+"#;
+        // `zen:` is a shared field — declaring it in the user-local half
+        // must fail with the pointer to the shared file.
+        let local = r#"
+repo: /tmp
+machines:
+  - { name: hub, kind: local, work_dir: /tmp }
+zen:
+  ci_timeout: 60
+"#;
+        match Project::from_split_yaml_str(shared, local) {
+            Err(crate::Error::MisplacedProjectField {
+                field,
+                found_in,
+                expected_in,
+            }) => {
+                assert_eq!(field, "zen");
+                assert_eq!(found_in, "user-local");
+                assert_eq!(expected_in, "shared");
+            }
+            other => panic!("expected MisplacedProjectField, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn split_yaml_rejects_duplicate_unknown_key_across_files() {
+        // A key that appears on both sides is ambiguous — the merge
+        // refuses rather than silently letting one side win. Bucket-known
+        // fields can't collide (a shared field on the local side is
+        // caught by the misplacement check first) so this defensive path
+        // fires for unknown keys appearing in both files.
+        let shared = r#"
+name: p
+default_branch: main
+orchestrator: { runner: claude }
+agent_runners:
+  claude: { command: claude, flags: [] }
+custom_ext: shared-side
+"#;
+        let local = r#"
+repo: /tmp
+machines:
+  - { name: hub, kind: local, work_dir: /tmp }
+custom_ext: local-side
+"#;
+        match Project::from_split_yaml_str(shared, local) {
+            Err(crate::Error::Other(msg)) => {
+                assert!(msg.contains("custom_ext"), "msg was: {msg}");
+                assert!(msg.contains("both"), "msg was: {msg}");
+            }
+            other => panic!("expected the duplicate-key `Other` error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn split_yaml_shared_missing_name_bubbles_up_deserialize_error() {
+        // Merging still delegates to the flat Project deserializer for
+        // the final assembly, so a required field missing from both
+        // halves surfaces as the usual yaml error (not a placement
+        // error). This just documents the seam.
+        let shared = r#"
+default_branch: main
+orchestrator: { runner: claude }
+agent_runners:
+  claude: { command: claude, flags: [] }
+"#;
+        let local = r#"
+repo: /tmp
+machines:
+  - { name: hub, kind: local, work_dir: /tmp }
+"#;
+        let err = Project::from_split_yaml_str(shared, local)
+            .expect_err("`name` is required — merge must fail");
+        let msg = err.to_string();
+        assert!(msg.contains("name"), "err was: {msg}");
     }
 }

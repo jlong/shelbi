@@ -1519,6 +1519,7 @@ mod tests {
             name: name.into(),
             repo: "r".into(),
             default_branch: "main".into(),
+            config_mode: None,
             machines: vec![Machine {
                 name: "hub".into(),
                 kind: MachineKind::Local,

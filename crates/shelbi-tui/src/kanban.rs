@@ -2909,6 +2909,7 @@ mod tests {
             name: "demo".into(),
             repo: "git@example:demo.git".into(),
             default_branch: "main".into(),
+            config_mode: None,
             git: shelbi_core::GitConfig::default(),
             machines: vec![shelbi_core::Machine {
                 name: "hub".into(),

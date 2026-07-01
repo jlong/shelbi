@@ -807,6 +807,7 @@ mod tests {
             name: "demo".into(),
             repo: "git@example:demo.git".into(),
             default_branch: "main".into(),
+            config_mode: None,
             machines: vec![
                 Machine {
                     name: "hub".into(),
