@@ -52,6 +52,21 @@ pub enum Error {
     #[error("{}", missing_task_params_message(.workflow, .params))]
     MissingTaskParams { workflow: String, params: Vec<String> },
 
+    /// A split project YAML (in-repo mode) has a key that belongs on the
+    /// other side of the split — e.g. `machines:` in the shared file, or
+    /// `zen:` in the user-local file. The message names the field and
+    /// points at the correct file so the fix is obvious. See
+    /// `Plans/in-repo-vs-global-project-config.md` §3.
+    #[error(
+        "project YAML field `{field}` is in the {found_in} file but belongs \
+         in the {expected_in} file; move it to the {expected_in} YAML"
+    )]
+    MisplacedProjectField {
+        field: String,
+        found_in: &'static str,
+        expected_in: &'static str,
+    },
+
     #[error("{0}")]
     Other(String),
 }

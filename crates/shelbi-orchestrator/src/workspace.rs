@@ -1579,6 +1579,7 @@ mod tests {
             name: "myapp".into(),
             repo: "git@example:repo.git".into(),
             default_branch: "main".into(),
+            config_mode: None,
             machines: vec![
                 Machine {
                     name: "hub".into(),

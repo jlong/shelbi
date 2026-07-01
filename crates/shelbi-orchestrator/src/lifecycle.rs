@@ -208,6 +208,7 @@ mod tests {
             name: "lifecycle-test".into(),
             repo: repo.to_string_lossy().into(),
             default_branch: "main".into(),
+            config_mode: None,
             machines: vec![Machine {
                 name: "hub".into(),
                 kind: MachineKind::Local,
