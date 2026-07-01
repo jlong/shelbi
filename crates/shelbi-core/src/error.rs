@@ -1,3 +1,5 @@
+use std::path::PathBuf;
+
 use thiserror::Error;
 
 pub type Result<T> = std::result::Result<T, Error>;
@@ -9,6 +11,36 @@ pub enum Error {
 
     #[error("yaml: {0}")]
     Yaml(#[from] serde_yaml::Error),
+
+    /// Discovery walked up from cwd, found an in-repo `.shelbi/project.yaml`
+    /// naming project `name`, but the per-user companion `local.yaml`
+    /// (which pins this user's machines and workspace pool) is absent.
+    /// Fresh-clone case: the caller should prompt for
+    /// `shelbi init --pick-up`. Distinct from [`Error::Yaml`] so callers
+    /// can tell "config exists but not registered locally" apart from
+    /// "config is broken".
+    #[error(
+        "project `{name}` is registered in-repo at {} but has not been picked up \
+         on this machine (missing {}); run `shelbi init --pick-up` to register \
+         your local machines and workspaces",
+        config_path.display(),
+        expected_local.display()
+    )]
+    ProjectNotPickedUp {
+        name: String,
+        config_path: PathBuf,
+        expected_local: PathBuf,
+    },
+
+    /// The in-repo `.shelbi/project.yaml` located by the discovery walk-up
+    /// exists but does not parse. Surfaces the exact file path so the user
+    /// isn't left guessing which of the many project YAMLs was corrupt.
+    #[error("failed to parse in-repo project config at {}: {source}", path.display())]
+    InRepoProjectParse {
+        path: PathBuf,
+        #[source]
+        source: serde_yaml::Error,
+    },
 
     #[error("invalid agent id: {0}")]
     InvalidAgentId(String),
