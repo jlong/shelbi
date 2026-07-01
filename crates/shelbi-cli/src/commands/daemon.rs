@@ -1074,6 +1074,55 @@ mod tests {
         Daemon::new(DEFAULT_ACK_TIMEOUT)
     }
 
+    /// RAII guard: point `$SHELBI_HOME` at a fresh temp dir for the
+    /// duration of a test that calls `dispatch()` (or `reap_expired`,
+    /// or any other daemon path that eventually writes to
+    /// `events.log`). Historically these tests ran without isolation
+    /// and their fixture ids (`t-1`, `m-1`, `t-ghost`, `m-ghost`,
+    /// `t-old`, `m-old`) polluted the developer's real
+    /// `~/.shelbi/events.log` on every `cargo test` — the exact
+    /// "ghost keepalive ack" pattern the messaging-drop bug report
+    /// called out. Any test that names test-shape ids MUST use this
+    /// guard.
+    ///
+    /// Because `env::set_var` is process-global and Rust runs tests in
+    /// parallel, the guard also holds the shared `ENV_LOCK` so two
+    /// polluting tests can't race on `SHELBI_HOME` and clobber each
+    /// other's isolated log.
+    struct IsolatedShelbiHome {
+        _lock: std::sync::MutexGuard<'static, ()>,
+        prev: Option<String>,
+        home: PathBuf,
+    }
+    impl IsolatedShelbiHome {
+        fn new(tag: &str) -> Self {
+            let lock = crate::commands::test_support::ENV_LOCK
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            let home = std::env::temp_dir().join(format!(
+                "shelbi-daemon-test-{tag}-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+            std::fs::create_dir_all(&home).unwrap();
+            let prev = std::env::var("SHELBI_HOME").ok();
+            std::env::set_var("SHELBI_HOME", &home);
+            Self { _lock: lock, prev, home }
+        }
+    }
+    impl Drop for IsolatedShelbiHome {
+        fn drop(&mut self) {
+            match self.prev.take() {
+                Some(v) => std::env::set_var("SHELBI_HOME", v),
+                None => std::env::remove_var("SHELBI_HOME"),
+            }
+            let _ = std::fs::remove_dir_all(&self.home);
+        }
+    }
+
     #[test]
     fn dispatch_rejects_malformed_json() {
         let err = dispatch("not json", &test_daemon()).unwrap_err();
@@ -1175,6 +1224,13 @@ mod tests {
 
     #[test]
     fn message_pushed_then_ack_clears_pending_map() {
+        // The ack path calls `append_message_ack_event` which writes to
+        // `~/.shelbi/events.log`. Isolate SHELBI_HOME so this test's
+        // fixture ids (`t-1`, `m-1`) don't leak into the developer's
+        // real events log as fake "ack=worker" lines on every `cargo
+        // test` — the exact ghost-keepalive pattern the message-drop
+        // bug report flagged.
+        let _iso = IsolatedShelbiHome::new("push-then-ack");
         let d = test_daemon();
         // Push: pending map gains the entry.
         dispatch(
@@ -1232,12 +1288,58 @@ mod tests {
         assert!(second > first, "expected timer refresh");
     }
 
+    /// Happy path for the worker → hub `request-clarification` handshake:
+    /// the daemon must persist the question as a
+    /// `question=<q-id> task=<t-id> kind=clarification text=<snippet>`
+    /// line so the orchestrator's `events tail` surfaces it, and the
+    /// orchestrator can then answer with
+    /// `shelbi message <task> reply --in-response-to <q-id> "…"`. This
+    /// closes the loop the `--in-response-to` flag on `shelbi message`
+    /// exists to serve — without a real e2e test, the flag drifts into
+    /// dead code.
+    #[test]
+    fn request_clarification_dispatch_writes_events_log_line() {
+        let _iso = IsolatedShelbiHome::new("clarify-happy");
+        let d = test_daemon();
+        let payload = r#"{"verb":"request-clarification","project":"shelbi","task_id":"feat-y","question_id":"q-42","question":"Should the dropdown use ARIA combobox roles?","context":"components/Menu.tsx line 88"}"#;
+        dispatch(payload, &d).expect("clarification dispatch");
+
+        // Confirm the line landed in the isolated events.log.
+        let log = shelbi_state::events_log_path().unwrap();
+        let body = std::fs::read_to_string(&log).expect("events log missing");
+        let lines: Vec<&str> = body.lines().collect();
+        assert_eq!(lines.len(), 1, "expected one event line, got: {body}");
+        let line = lines[0];
+        assert!(
+            line.contains(" question=q-42 "),
+            "line missing question id: {line}"
+        );
+        assert!(line.contains(" task=feat-y "), "line missing task: {line}");
+        assert!(
+            line.contains(" kind=clarification "),
+            "line missing kind marker: {line}"
+        );
+        // The question text must be represented (folded/truncated is
+        // fine — the acceptance bar is that the operator sees a
+        // human-readable snippet on the events stream).
+        assert!(
+            line.contains("dropdown") || line.contains("ARIA"),
+            "line dropped the question text: {line}"
+        );
+    }
+
     #[test]
     fn message_ack_for_unknown_pair_is_a_noop_not_an_error() {
         // The reaper may have claimed the entry first, or the daemon
         // restarted between push and ack — either way the worker's ack
         // is still meaningful for `events.log` and must not bounce off
         // a "no such pending message" error.
+        //
+        // Isolate SHELBI_HOME so this test's `t-ghost` / `m-ghost`
+        // fixture ids don't pollute the developer's real events log —
+        // exactly the source of the "keepalive-shaped ghost acks" the
+        // message-drop bug report saw drifting through events.log.
+        let _iso = IsolatedShelbiHome::new("ack-ghost");
         let d = test_daemon();
         dispatch(
             r#"{"verb":"message-ack","project":"shelbi","task_id":"t-ghost","msg_id":"m-ghost"}"#,
@@ -1265,6 +1367,10 @@ mod tests {
 
     #[test]
     fn reap_expired_drains_entries_past_threshold_and_keeps_fresh_ones() {
+        // `reap_expired` synthesizes `message=<id> task=<id>
+        // ack=timeout` lines; without isolation this test's `t-old` /
+        // `m-old` fixtures land in the developer's real events log.
+        let _iso = IsolatedShelbiHome::new("reap-expired");
         let mut d = test_daemon();
         d.ack_timeout = Duration::from_millis(50);
         // Backdate one entry so it's already expired, and leave the

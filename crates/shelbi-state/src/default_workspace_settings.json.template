@@ -5,7 +5,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "[ -n \"$TASK_ID\" ] || exit 0\nLOCKDIR=.shelbi/messages/$TASK_ID.tail.d\nmkdir -p .shelbi/messages\nif [ -f \"$LOCKDIR/pid\" ]; then\n  kill \"$(cat $LOCKDIR/pid)\" 2>/dev/null || true\n  rm -rf \"$LOCKDIR\"\nfi\nmkdir -p \"$LOCKDIR\"\ntouch .shelbi/messages/$TASK_ID.log\ntail -f -n 0 .shelbi/messages/$TASK_ID.log > .shelbi/messages/$TASK_ID.unread.log 2>/dev/null &\necho $! > \"$LOCKDIR/pid\""
+            "command": "mkdir -p .shelbi/messages\nif [ -z \"$TASK_ID\" ]; then\n  printf '%s no TASK_ID in env; message-tail not started (sidebar-click pane, or dispatch env leak)\\n' \"$(date -u +%Y-%m-%dT%H:%M:%SZ)\" >> .shelbi/messages/.no-task-id.log\n  echo 'shelbi: SessionStart hook: TASK_ID unset — message channel disabled for this session' >&2\n  exit 0\nfi\nLOCKDIR=.shelbi/messages/$TASK_ID.tail.d\nif [ -f \"$LOCKDIR/pid\" ]; then\n  kill \"$(cat $LOCKDIR/pid)\" 2>/dev/null || true\n  rm -rf \"$LOCKDIR\"\nfi\nmkdir -p \"$LOCKDIR\"\ntouch .shelbi/messages/$TASK_ID.log\ntail -f -n 0 .shelbi/messages/$TASK_ID.log > .shelbi/messages/$TASK_ID.unread.log 2>/dev/null &\necho $! > \"$LOCKDIR/pid\""
           }
         ]
       }

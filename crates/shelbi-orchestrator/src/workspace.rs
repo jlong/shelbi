@@ -585,44 +585,19 @@ pub fn start_workspace_on_task(spec: StartSpec<'_>) -> Result<TmuxAddr> {
                 proj = shelbi_agent::shell_escape(&spec.project.name),
                 ws = shelbi_agent::shell_escape(&spec.workspace.name),
             );
-            // Mirror the orchestrator pane's bootstrap shape (lib.rs):
-            // pass `sh`, `-c`, `<cmd>` as three positionals so tmux runs
-            // the wrapper through a shell, picking up the user's PATH
-            // from the local tmux server's existing env.
-            let target = format!("{}:", addr.session);
-            if !shelbi_tmux::has_session(&host, &addr.session)? {
-                shelbi_ssh::run_capture(
-                    &host,
-                    [
-                        "tmux",
-                        "new-session",
-                        "-d",
-                        "-s",
-                        &addr.session,
-                        "-n",
-                        &addr.window,
-                        "sh",
-                        "-c",
-                        &pane_cmd,
-                    ],
-                )?;
-            } else {
-                shelbi_ssh::run_capture(
-                    &host,
-                    [
-                        "tmux",
-                        "new-window",
-                        "-d",
-                        "-t",
-                        &target,
-                        "-n",
-                        &addr.window,
-                        "sh",
-                        "-c",
-                        &pane_cmd,
-                    ],
-                )?;
-            }
+            let hub_sock = shelbi_state::hub_socket_path()
+                .map_err(|e| Error::Other(format!("resolving hub socket path: {e}")))?;
+            let create_new_session = !shelbi_tmux::has_session(&host, &addr.session)?;
+            let argv = local_pane_tmux_argv(LocalPaneTmuxArgs {
+                create_new_session,
+                session: &addr.session,
+                window: &addr.window,
+                task_id: spec.task_id,
+                project: &spec.project.name,
+                hub_sock: &hub_sock.to_string_lossy(),
+                pane_cmd: &pane_cmd,
+            });
+            shelbi_ssh::run_capture(&host, &argv)?;
         }
         Host::Ssh { .. } => {
             shelbi_tmux::new_session(&host, &addr.session, &addr.window, None)?;
@@ -1260,6 +1235,70 @@ fn copy_dir_contents_to_remote(ssh_host: &str, src: &Path, dest: &Path) -> Resul
 /// the agent's instructions paragraph falls through to a no-op and loss
 /// is accepted (the spec calls this "best-effort + hub-side detection").
 ///
+/// Inputs to [`local_pane_tmux_argv`] — mirrors the local dispatch
+/// path's tmux invocation exactly so tests can assert on the argv shape
+/// without spinning up a tmux server.
+struct LocalPaneTmuxArgs<'a> {
+    /// `true` → `tmux new-session -d -s <session> -n <window> …`.
+    /// `false` → `tmux new-window -d -t <session>: -n <window> …` inside
+    /// the already-live project session.
+    create_new_session: bool,
+    session: &'a str,
+    window: &'a str,
+    task_id: &'a str,
+    project: &'a str,
+    hub_sock: &'a str,
+    pane_cmd: &'a str,
+}
+
+/// Build the tmux argv for the local dispatch path. Injects
+/// `TASK_ID` / `PROJECT` / `SHELBI_HUB_SOCK` via tmux `-e` so the pane
+/// wrapper inherits them regardless of when the caller's state save
+/// lands — the caller writes `assigned_to` / `column=in_progress`
+/// AFTER `start_workspace_on_task` returns, so a state lookup at
+/// wrapper startup would come up empty and the Phase 7 message-tail
+/// hooks would silently no-op (the exact bug the outer function is
+/// wired to prevent). See `open/pane.rs` where the wrapper prefers
+/// inherited env over the state lookup.
+fn local_pane_tmux_argv(a: LocalPaneTmuxArgs<'_>) -> Vec<String> {
+    let task_env = format!("TASK_ID={}", a.task_id);
+    let project_env = format!("PROJECT={}", a.project);
+    let hub_env = format!("SHELBI_HUB_SOCK={}", a.hub_sock);
+    let mut argv: Vec<String> = if a.create_new_session {
+        vec![
+            "tmux".into(),
+            "new-session".into(),
+            "-d".into(),
+            "-s".into(),
+            a.session.into(),
+            "-n".into(),
+            a.window.into(),
+        ]
+    } else {
+        vec![
+            "tmux".into(),
+            "new-window".into(),
+            "-d".into(),
+            "-t".into(),
+            format!("{}:", a.session),
+            "-n".into(),
+            a.window.into(),
+        ]
+    };
+    argv.push("-e".into());
+    argv.push(task_env);
+    argv.push("-e".into());
+    argv.push(project_env);
+    argv.push("-e".into());
+    argv.push(hub_env);
+    // The pane command runs through `sh -c` so tmux picks up the user's
+    // PATH from the tmux server's existing env (Homebrew, asdf, etc).
+    argv.push("sh".into());
+    argv.push("-c".into());
+    argv.push(a.pane_cmd.into());
+    argv
+}
+
 /// We park the assignment immediately before `exec` so it scopes to the
 /// agent process (the surrounding `$SHELL -lc` strips its own
 /// environment otherwise — env-prefix-before-exec is the POSIX idiom
@@ -2962,5 +3001,85 @@ mod rebase_git_tests {
             default_sha: "abcdef0123456789".into(),
         };
         assert_eq!(outcome.detail(), "default=abcdef0");
+    }
+
+    /// The dispatch-path tmux invocation MUST inject `TASK_ID`,
+    /// `PROJECT`, and `SHELBI_HUB_SOCK` via tmux `-e` so the pane
+    /// wrapper sees them before the caller's state save lands. Without
+    /// these `-e` flags the pane wrapper's state lookup races the save
+    /// and the Phase 7 message-tail hooks silently no-op — the exact
+    /// bug this refactor exists to prevent. See open/pane.rs for the
+    /// receiving side.
+    #[test]
+    fn local_pane_tmux_argv_injects_task_project_and_hub_sock_env_new_session() {
+        let argv = local_pane_tmux_argv(LocalPaneTmuxArgs {
+            create_new_session: true,
+            session: "shelbi-demo",
+            window: "alpha",
+            task_id: "feat-race",
+            project: "demo",
+            hub_sock: "/tmp/shelbi-hub.sock",
+            pane_cmd: "shelbi --project demo open alpha --as-pane",
+        });
+        assert_eq!(argv[0], "tmux");
+        assert_eq!(argv[1], "new-session");
+        // `-e KEY=VAL` triplets must appear before the final `sh -c
+        // <pane_cmd>` positional; tmux's option parser stops at the
+        // first non-flag positional.
+        assert!(
+            argv.iter().any(|s| s == "TASK_ID=feat-race"),
+            "TASK_ID -e missing: {argv:?}"
+        );
+        assert!(
+            argv.iter().any(|s| s == "PROJECT=demo"),
+            "PROJECT -e missing: {argv:?}"
+        );
+        assert!(
+            argv.iter().any(|s| s == "SHELBI_HUB_SOCK=/tmp/shelbi-hub.sock"),
+            "SHELBI_HUB_SOCK -e missing: {argv:?}"
+        );
+        // Every `-e` sits directly before its KEY=VAL payload — tmux
+        // won't parse `-e` as a flag if the two are split by an
+        // unrelated positional.
+        for (i, s) in argv.iter().enumerate() {
+            if s == "-e" {
+                let payload = &argv[i + 1];
+                assert!(
+                    payload.contains('='),
+                    "-e followed by non-KEY=VAL token {payload:?}: {argv:?}"
+                );
+            }
+        }
+        // Final positionals are `sh -c <pane_cmd>` — no extra
+        // trailing flags that would confuse tmux.
+        let last3 = &argv[argv.len() - 3..];
+        assert_eq!(last3[0], "sh");
+        assert_eq!(last3[1], "-c");
+        assert_eq!(last3[2], "shelbi --project demo open alpha --as-pane");
+    }
+
+    /// Same env-injection contract for the `new-window` path (project
+    /// session already exists — a workspace pane inside an established
+    /// dashboard). The KEY=VAL payloads must ride the same `-e` flags.
+    #[test]
+    fn local_pane_tmux_argv_injects_env_new_window_path() {
+        let argv = local_pane_tmux_argv(LocalPaneTmuxArgs {
+            create_new_session: false,
+            session: "shelbi-demo",
+            window: "bravo",
+            task_id: "bug-x",
+            project: "demo",
+            hub_sock: "/Users/dev/.shelbi/hub.sock",
+            pane_cmd: "shelbi --project demo open bravo --as-pane",
+        });
+        assert_eq!(argv[0], "tmux");
+        assert_eq!(argv[1], "new-window");
+        assert!(argv.iter().any(|s| s == "-t"));
+        assert!(argv.iter().any(|s| s == "shelbi-demo:"));
+        assert!(argv.iter().any(|s| s == "TASK_ID=bug-x"));
+        assert!(argv.iter().any(|s| s == "PROJECT=demo"));
+        assert!(argv
+            .iter()
+            .any(|s| s == "SHELBI_HUB_SOCK=/Users/dev/.shelbi/hub.sock"));
     }
 }

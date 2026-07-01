@@ -144,8 +144,67 @@ pub fn run(
     // the missing ack themselves.
     notify_daemon_message_pushed(&project_name, &id, &msg_id);
 
+    // Verify a worker tail is actually running for this task: the
+    // SessionStart hook writes its pid to `<msgs>/<id>.tail.d/pid` and
+    // clears the dir on exit. If it's missing after our write, the
+    // message is durable but nobody is reading it — surface that loudly
+    // with a non-zero exit so callers (orchestrator scripts, humans)
+    // don't silently trust an undelivered push. The file itself has
+    // already been written, so a follow-up SessionStart will still find
+    // and drain it on the next worker restart.
+    if !tail_pid_alive(&host, &messages_dir, &id)? {
+        bail!(
+            "message written to {} but worker tail is not running for task `{id}` \
+             (no live pid at .shelbi/messages/{id}.tail.d/pid) — \
+             the record is durable and will be picked up when the worker's \
+             SessionStart hook next fires, but nothing is reading right now",
+            log_path.display(),
+        );
+    }
+
     println!("✓ {msg_id} → {id} ({})", kind.as_str());
     Ok(())
+}
+
+/// Check whether the SessionStart hook's `tail -f` pid file exists and
+/// names a live process on `host`. `.tail.d/pid` is the durable
+/// beacon the hook drops when it starts and clears when the pane exits
+/// (see `crates/shelbi-cli/src/commands/open/pane.rs::kill_task_tail`).
+/// Absence means no live worker tailing the log — the caller treats that
+/// as a delivery failure so the message doesn't silently vanish.
+fn tail_pid_alive(host: &Host, messages_dir: &std::path::Path, task_id: &str) -> Result<bool> {
+    let pid_path = messages_dir
+        .join(format!("{task_id}.tail.d"))
+        .join("pid");
+    match host {
+        Host::Local => {
+            let pid_text = match std::fs::read_to_string(&pid_path) {
+                Ok(s) => s,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+                Err(e) => return Err(anyhow!("reading {}: {e}", pid_path.display())),
+            };
+            let pid: libc::pid_t = match pid_text.trim().parse() {
+                Ok(p) => p,
+                Err(_) => return Ok(false),
+            };
+            // `kill(pid, 0)` is the standard "is this pid alive?" probe on
+            // POSIX. Returns 0 when the process exists; ESRCH otherwise.
+            // SAFETY: no memory dereference, just a syscall.
+            let alive = unsafe { libc::kill(pid, 0) } == 0;
+            Ok(alive)
+        }
+        Host::Ssh { .. } => {
+            // Remote: `test -f pid && kill -0 $(cat pid)` collapses both
+            // presence and liveness into one probe. Any failure (missing
+            // file, dead pid, unreadable pid text) => absent.
+            let script = format!(
+                "test -f '{p}' && kill -0 \"$(cat '{p}')\" 2>/dev/null",
+                p = pid_path.to_string_lossy(),
+            );
+            let out = shelbi_ssh::run(host, ["sh", "-c", &script]).map_err(|e| anyhow!(e))?;
+            Ok(out.status.success())
+        }
+    }
 }
 
 /// Send a `message-pushed` verb to the hub daemon over the Unix socket.
@@ -318,5 +377,88 @@ mod tests {
         let body = std::fs::read_to_string(&log).unwrap();
         assert_eq!(body, "{\"a\":1}\n{\"b\":2}\n");
         std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    /// The tail-liveness probe returns false when no pid file exists —
+    /// that's the "worker's SessionStart hook never ran" case. `shelbi
+    /// message` uses this signal to fail loudly instead of silently
+    /// writing to a log nobody is reading.
+    #[test]
+    fn tail_pid_alive_false_when_no_pid_file() {
+        let tmp = std::env::temp_dir().join(format!(
+            "shelbi-tail-probe-none-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&tmp).unwrap();
+        assert!(!tail_pid_alive(&Host::Local, &tmp, "feat-x").unwrap());
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// The tail-liveness probe returns false when the pid file names a
+    /// process that no longer exists — worker crashed or was killed
+    /// after the previous pane exit didn't clean up. Uses a
+    /// short-lived child so we get a definitely-dead pid without racing
+    /// the OS reaper.
+    #[test]
+    fn tail_pid_alive_false_when_recorded_pid_is_dead() {
+        let tmp = std::env::temp_dir().join(format!(
+            "shelbi-tail-probe-dead-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let lock_dir = tmp.join("feat-x.tail.d");
+        std::fs::create_dir_all(&lock_dir).unwrap();
+
+        // Spawn a short-lived child, wait for it, then reuse its pid.
+        // On POSIX the pid may get recycled — probability is negligible
+        // in a test that lasts milliseconds and doesn't fork thousands
+        // of processes. `sh -c :` is portable across macOS (no /bin/true)
+        // and Linux.
+        let child = std::process::Command::new("sh").arg("-c").arg(":").spawn().unwrap();
+        let pid = child.id();
+        let _ = child.wait_with_output();
+        std::fs::write(lock_dir.join("pid"), pid.to_string()).unwrap();
+
+        assert!(!tail_pid_alive(&Host::Local, &tmp, "feat-x").unwrap());
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// The tail-liveness probe returns true when the pid file names a
+    /// running process — that's the healthy "worker is tailing" state.
+    #[test]
+    fn tail_pid_alive_true_for_running_pid() {
+        let tmp = std::env::temp_dir().join(format!(
+            "shelbi-tail-probe-live-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let lock_dir = tmp.join("feat-x.tail.d");
+        std::fs::create_dir_all(&lock_dir).unwrap();
+
+        // Sleep child stands in for the SessionStart hook's `tail -f`.
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        std::fs::write(lock_dir.join("pid"), child.id().to_string()).unwrap();
+
+        assert!(tail_pid_alive(&Host::Local, &tmp, "feat-x").unwrap());
+
+        let _ = child.kill();
+        let _ = child.wait();
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 }
