@@ -31,6 +31,45 @@ fn current_exe_string() -> Result<String> {
         .into_owned())
 }
 
+/// Filter `git status --porcelain` output down to the lines that represent
+/// *user-authored* changes — i.e. drop shelbi's own footprint in the worktree.
+///
+/// Two families of paths are shelbi's, not the user's, and must never block a
+/// dispatch or rebase:
+///
+/// - `.claude/` — shelbi's deploy footprint (`settings.json`, the
+///   `shelbi-review-ready` marker). Normally gitignored, but a repo that
+///   hasn't ignored it yet still shouldn't wedge on it.
+/// - `.shelbi/` — shelbi's own runtime scratch (`.shelbi/messages/` inter-agent
+///   mail and other daemon state) written into the worktree root. It is
+///   never user work, so an otherwise-idle worktree whose only untracked entry
+///   is `.shelbi/` must read as clean and dispatchable.
+///
+/// A line reads `XY <path>`; `line.get(3..)` skips the two status columns and
+/// the separating space. Rename entries (`orig -> new`) fall through to being
+/// treated as user-dirty, which is the safe default (we only ever carve out
+/// paths we are certain are ours).
+fn user_dirty_porcelain_lines(porcelain: &str) -> Vec<&str> {
+    porcelain
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .filter(|line| {
+            let path = line.get(3..).unwrap_or("");
+            !is_shelbi_scratch_path(path)
+        })
+        .collect()
+}
+
+/// True when `path` (as it appears in porcelain output) is one of shelbi's
+/// own worktree paths — `.claude/` deploy footprint or `.shelbi/` runtime
+/// scratch — rather than user work. See [`user_dirty_porcelain_lines`].
+fn is_shelbi_scratch_path(path: &str) -> bool {
+    path.starts_with(".claude/")
+        || path == ".claude"
+        || path.starts_with(".shelbi/")
+        || path == ".shelbi"
+}
+
 /// Where a workspace's pane lives in tmux. Local workspaces get a window in the
 /// project session; remote workspaces get their own session (so they survive
 /// SSH drops).
@@ -241,11 +280,13 @@ pub fn rebase_workspace_branch_onto_default(
 ) -> RebaseOutcome {
     let wt_str = worktree.to_string_lossy().into_owned();
 
-    // 1. Bail on a dirty worktree. `.claude/` is shelbi's deploy footprint
-    //    (settings.json, the review marker itself); it's gitignored so it
-    //    never trips `status --porcelain`, but if a user-authored
-    //    `.gitignore` doesn't yet exclude it we still don't want a rebase
-    //    aborted by our own files. Mirror the carve-out in `preflight_workdir`.
+    // 1. Bail on a dirty worktree, but ignore shelbi's own footprint:
+    //    `.claude/` (deploy: settings.json, the review marker) and `.shelbi/`
+    //    (runtime scratch: `.shelbi/messages/` inter-agent mail). Both are
+    //    normally gitignored, but a repo that hasn't ignored them yet still
+    //    shouldn't have its post-task rebase skipped by our own files — the
+    //    real bug this guards against was a rebase reporting
+    //    `dirty_worktree(3_entries)` where all 3 were `.shelbi/messages/*`.
     let dirty = match shelbi_ssh::run_capture(
         host,
         ["git", "-C", &wt_str, "status", "--porcelain"],
@@ -257,13 +298,7 @@ pub fn rebase_workspace_branch_onto_default(
             };
         }
     };
-    let user_dirty: Vec<&str> = dirty
-        .lines()
-        .filter(|l| {
-            let path = l.get(3..).unwrap_or("");
-            !(path.starts_with(".claude/") || path == ".claude")
-        })
-        .collect();
+    let user_dirty = user_dirty_porcelain_lines(&dirty);
     if !user_dirty.is_empty() {
         return RebaseOutcome::Skipped {
             reason: format!("dirty_worktree({}_entries)", user_dirty.len()),
@@ -1693,25 +1728,17 @@ fn sync_worktree(
         return Ok(());
     }
 
-    // Already exists — make sure it's clean and on the right branch.
-    // Carve out shelbi's own footprint: `.shelbi/` metadata and the
-    // `.claude/` deploy files (settings.json, agent-instructions.md,
-    // skills/, the review marker) we rewrite on every dispatch. A repo that
-    // commits `.claude/` would otherwise be permanently "dirty" after the
-    // first dispatch, so the second `task start` would bail here. (Mirrors
-    // the carve-out in `rebase_workspace_branch_onto_default` and
-    // review.rs's `preflight_workdir`.)
+    // Already exists — make sure it's clean and on the right branch. Ignore
+    // shelbi's own footprint: `.claude/` deploy files (settings.json,
+    // agent-instructions.md, skills/, the review marker) we rewrite on every
+    // dispatch, and `.shelbi/` runtime scratch (`.shelbi/messages/` inter-agent
+    // mail). Without the carve-out a repo that commits `.claude/` would be
+    // permanently "dirty" after the first dispatch, and an idle worktree whose
+    // only untracked entry is our own scratch would be wrongly rejected as
+    // "uncommitted user work". Mirrors `rebase_workspace_branch_onto_default`
+    // and review.rs's `preflight_workdir`.
     let dirty = shelbi_ssh::run_capture(host, ["git", "-C", &wt_str, "status", "--porcelain"])?;
-    let user_dirty: Vec<&str> = dirty
-        .lines()
-        .filter(|l| {
-            let path = l.get(3..).unwrap_or("");
-            !(path.starts_with(".shelbi/")
-                || path == ".shelbi"
-                || path.starts_with(".claude/")
-                || path == ".claude")
-        })
-        .collect();
+    let user_dirty = user_dirty_porcelain_lines(&dirty);
     if !user_dirty.is_empty() {
         return Err(Error::Other(format!(
             "workspace worktree at {wt_str} has uncommitted changes — \
@@ -3179,6 +3206,57 @@ mod rebase_git_tests {
         );
 
         let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    #[test]
+    fn dirty_only_in_dot_shelbi_scratch_is_ignored() {
+        // shelbi's own runtime scratch (`.shelbi/messages/` inter-agent mail)
+        // is written into the worktree root. It is never user work, so a
+        // rebase must not skip on it — this is the false positive that logged
+        // `dirty_worktree(3_entries)` for `.shelbi/messages/*`.
+        if !git_available() {
+            eprintln!("skipping: git not on PATH");
+            return;
+        }
+        let repo = init_repo("dotshelbi");
+        run_git_in(&repo, &["checkout", "-q", "-b", "feature"]);
+        commit_file(&repo, "feature.txt", "v0\n", "feature work");
+
+        run_git_in(&repo, &["checkout", "-q", "main"]);
+        commit_file(&repo, "prereq.txt", "prereq\n", "prereq");
+        run_git_in(&repo, &["checkout", "-q", "feature"]);
+
+        // Drop runtime scratch under .shelbi/messages/. Untracked, but ours.
+        std::fs::create_dir_all(repo.join(".shelbi/messages")).unwrap();
+        std::fs::write(repo.join(".shelbi/messages/a.json"), "{}\n").unwrap();
+        std::fs::write(repo.join(".shelbi/messages/b.json"), "{}\n").unwrap();
+
+        let outcome = rebase_workspace_branch_onto_default(&Host::Local, &repo, "main");
+        assert!(
+            matches!(outcome, RebaseOutcome::Rebased { .. }),
+            "expected Rebased despite .shelbi/ scratch, got {outcome:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    #[test]
+    fn user_dirty_carves_out_shelbi_footprint_but_keeps_real_work() {
+        // Only shelbi's own paths → clean.
+        let scratch = "?? .shelbi/\n?? .shelbi/messages/a.json\n M .claude/settings.json\n";
+        assert!(user_dirty_porcelain_lines(scratch).is_empty());
+
+        // A real edit beside our scratch still counts as dirty.
+        let mixed = " M src/lib.rs\n?? .shelbi/messages/a.json\n";
+        assert_eq!(user_dirty_porcelain_lines(mixed), vec![" M src/lib.rs"]);
+
+        // A top-level file literally named `.shelbimeta` must NOT be carved
+        // out — the prefix guard is `.shelbi/`, not `.shelbi`.
+        let lookalike = "?? .shelbimeta\n";
+        assert_eq!(user_dirty_porcelain_lines(lookalike), vec!["?? .shelbimeta"]);
+
+        // A clean tree is clean.
+        assert!(user_dirty_porcelain_lines("").is_empty());
     }
 
     #[test]
