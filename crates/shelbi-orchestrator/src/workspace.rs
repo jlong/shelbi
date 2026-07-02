@@ -825,7 +825,7 @@ fn require_auto_mode_supported(
     // Only the `claude` CLI accepts `--permission-mode`; other runners
     // (codex etc.) reject the flag, so the version probe is meaningless
     // for them.
-    if std::path::Path::new(&runner.command).file_name().and_then(|s| s.to_str()) != Some("claude") {
+    if !shelbi_agent::is_claude_runner(&runner.command) {
         return Ok(());
     }
     let Some(version) = probe_claude_version(host) else {

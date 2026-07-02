@@ -3,9 +3,11 @@
 //! Pure data + matching. Rendering lives in `shelbi-tui`.
 
 use nucleo_matcher::{
-    pattern::{CaseMatching, Normalization, Pattern},
+    pattern::{CaseMatching, Normalization},
     Matcher,
 };
+// Part of the `parse_pattern` / `score_pattern` API surface.
+pub use nucleo_matcher::pattern::Pattern;
 
 /// A single thing the palette can find — a view, an agent, or an action.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -69,26 +71,38 @@ impl EntryKind {
     }
 }
 
-/// Score an entry's `label` against `pattern`. Higher = better. None = no match.
-pub fn score(matcher: &mut Matcher, pattern: &str, label: &str) -> Option<u16> {
-    if pattern.is_empty() {
-        return Some(0);
-    }
-    let needle = Pattern::parse(pattern, CaseMatching::Smart, Normalization::Smart);
+/// Parse `query` into a reusable fuzzy pattern. Parse once per query,
+/// then score every candidate label against the result with
+/// [`score_pattern`] — parsing is the expensive half of a match.
+pub fn parse_pattern(query: &str) -> Pattern {
+    Pattern::parse(query, CaseMatching::Smart, Normalization::Smart)
+}
+
+/// Score `label` against a pre-parsed `pattern`. Higher = better.
+/// None = no match. An empty pattern matches everything at score 0.
+pub fn score_pattern(matcher: &mut Matcher, pattern: &Pattern, label: &str) -> Option<u16> {
     let mut buf = Vec::new();
     let haystack = nucleo_matcher::Utf32Str::new(label, &mut buf);
-    let scored = needle.atoms.iter().try_fold(0u16, |acc, atom| {
-        atom.score(haystack, matcher).map(|s| acc.saturating_add(s))
-    });
-    scored
+    pattern
+        .score(haystack, matcher)
+        .map(|s| s.min(u32::from(u16::MAX)) as u16)
+}
+
+/// Score an entry's `label` against `pattern`. Higher = better. None = no match.
+///
+/// Convenience for one-off matches; when scoring many labels against the
+/// same query, use [`parse_pattern`] + [`score_pattern`] to parse once.
+pub fn score(matcher: &mut Matcher, pattern: &str, label: &str) -> Option<u16> {
+    score_pattern(matcher, &parse_pattern(pattern), label)
 }
 
 /// Filter + sort `entries` against `query`. Best match first.
 pub fn search(entries: &[Entry], query: &str) -> Vec<(Entry, u16)> {
     let mut matcher = Matcher::new(nucleo_matcher::Config::DEFAULT);
+    let pattern = parse_pattern(query);
     let mut hits: Vec<(Entry, u16)> = entries
         .iter()
-        .filter_map(|e| score(&mut matcher, query, &e.label).map(|s| (e.clone(), s)))
+        .filter_map(|e| score_pattern(&mut matcher, &pattern, &e.label).map(|s| (e.clone(), s)))
         .collect();
     hits.sort_by_key(|h| std::cmp::Reverse(h.1));
     hits
