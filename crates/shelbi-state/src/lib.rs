@@ -15,7 +15,8 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use shelbi_core::{
-    default_project_statuses, default_workflow, Agent, Column, Project, Result, Session, Task,
+    default_project_statuses, default_workflow, validate_agent_id, validate_project_name,
+    validate_task_id, Agent, Column, Project, Result, Session, Task,
 };
 
 mod agent_workspaces;
@@ -173,6 +174,10 @@ pub fn sessions_dir() -> Result<PathBuf> {
 }
 
 pub fn project_dir(project: &str) -> Result<PathBuf> {
+    // Storage-layer chokepoint: every per-project path (tasks/, agents/,
+    // workflows/, state.json) derives from here, so validating the name
+    // once keeps a `../`-style project from escaping the projects dir.
+    validate_project_name(project)?;
     Ok(projects_dir()?.join(project))
 }
 
@@ -1154,10 +1159,12 @@ pub fn toggle_zen_mode(project: &str, source: &str) -> Result<ZenModeState> {
 // Agent markdown files
 
 pub fn agent_path(project: &str, id: &str) -> Result<PathBuf> {
+    validate_agent_id(id)?;
     Ok(agents_dir(project)?.join(format!("{id}.md")))
 }
 
 pub fn agent_log_path(project: &str, id: &str) -> Result<PathBuf> {
+    validate_agent_id(id)?;
     Ok(agents_dir(project)?.join(format!("{id}.log.md")))
 }
 
@@ -1223,6 +1230,7 @@ pub fn append_log(project: &str, id: &str, line: &str) -> Result<()> {
 // Task markdown files
 
 pub fn task_path(project: &str, id: &str) -> Result<PathBuf> {
+    validate_task_id(id)?;
     Ok(tasks_dir(project)?.join(format!("{id}.md")))
 }
 
@@ -1276,7 +1284,19 @@ pub fn create_task(project: &str, task: &Task, body_md: &str) -> Result<()> {
 pub fn load_task(project: &str, id: &str) -> Result<TaskFile> {
     let path = task_path(project, id)?;
     let text = fs::read_to_string(&path)?;
-    parse_task_file(&text)
+    let tf = parse_task_file(&text)?;
+    // Reads address the file by its `<id>.md` name; writes address it by
+    // the parsed frontmatter id (`save_task`). If a hand-edit lets those
+    // diverge, a subsequent load→save (e.g. `move_task`) would write a
+    // *second* file and fork the card onto the board. Reject the mismatch
+    // loudly instead so the task can never split in two.
+    if tf.task.id != id {
+        return Err(shelbi_core::Error::TaskIdMismatch {
+            requested: id.to_string(),
+            found: tf.task.id.clone(),
+        });
+    }
+    Ok(tf)
 }
 
 pub fn parse_task_file(text: &str) -> Result<TaskFile> {
@@ -2336,6 +2356,91 @@ mod tests {
         assert_eq!(wip.len(), 1);
         assert_eq!(wip[0].task.id, "b");
         assert_eq!(wip[0].task.priority, 0);
+        std::env::remove_var("SHELBI_HOME");
+    }
+
+    #[test]
+    fn traversal_task_ids_are_rejected_and_touch_nothing_outside_tasks_dir() {
+        let _g = TEST_LOCK.lock().unwrap();
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+
+        // A real task (so the tasks dir exists) plus a sentinel one level up
+        // in the project dir — exactly what `../HANDOFF` would resolve onto.
+        save_task("p", &make_task("keep", Column::Todo, 0), "").unwrap();
+        let sentinel = project_dir("p").unwrap().join("HANDOFF.md");
+        std::fs::write(&sentinel, "precious").unwrap();
+
+        for bad in ["../HANDOFF", "../../other/tasks/foo", "a/b", "..", "x/../y"] {
+            // The chokepoint itself refuses to build the path.
+            assert!(
+                matches!(task_path("p", bad), Err(shelbi_core::Error::InvalidAgentId(_))),
+                "task_path should reject `{bad}`"
+            );
+            // Every read/move/delete handler inherits the rejection.
+            assert!(load_task("p", bad).is_err(), "load_task should reject `{bad}`");
+            assert!(delete_task("p", bad).is_err(), "delete_task should reject `{bad}`");
+            assert!(
+                move_task("p", bad, Column::InProgress).is_err(),
+                "move_task should reject `{bad}`"
+            );
+        }
+
+        // Nothing outside the tasks dir was read, moved, or removed.
+        assert_eq!(std::fs::read_to_string(&sentinel).unwrap(), "precious");
+        assert!(task_path("p", "keep").unwrap().exists());
+        std::env::remove_var("SHELBI_HOME");
+    }
+
+    #[test]
+    fn traversal_project_names_are_rejected_at_chokepoint() {
+        let _g = TEST_LOCK.lock().unwrap();
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+        for bad in ["../evil", "..", "a/b", ""] {
+            assert!(
+                matches!(project_dir(bad), Err(shelbi_core::Error::InvalidProjectName(_))),
+                "project_dir should reject `{bad}`"
+            );
+            assert!(tasks_dir(bad).is_err(), "tasks_dir should reject `{bad}`");
+            assert!(state_path(bad).is_err(), "state_path should reject `{bad}`");
+        }
+        std::env::remove_var("SHELBI_HOME");
+    }
+
+    #[test]
+    fn frontmatter_id_mismatch_cannot_fork_into_two_cards() {
+        let _g = TEST_LOCK.lock().unwrap();
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+
+        // Hand-edit the frontmatter id so it no longer matches the filename
+        // (`fix-login.md`) — the F8 fork trigger.
+        save_task("p", &make_task("fix-login", Column::Todo, 0), "").unwrap();
+        let path = task_path("p", "fix-login").unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        let forged = text.replace("id: fix-login", "id: fix-auth");
+        assert!(forged.contains("id: fix-auth"), "sanity: id line was rewritten");
+        std::fs::write(&path, &forged).unwrap();
+
+        // Loading by the filename stem is rejected rather than silently
+        // accepted, so a following save can't write a second `fix-auth.md`.
+        assert!(matches!(
+            load_task("p", "fix-login"),
+            Err(shelbi_core::Error::TaskIdMismatch { .. })
+        ));
+        assert!(
+            move_task("p", "fix-login", Column::InProgress).is_err(),
+            "move must not fork the card"
+        );
+
+        // Exactly one task file remains — the board can't show two cards.
+        let md_count = std::fs::read_dir(tasks_dir("p").unwrap())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.path().extension().and_then(|x| x.to_str()) == Some("md"))
+            .count();
+        assert_eq!(md_count, 1, "no fork: still one task file on disk");
         std::env::remove_var("SHELBI_HOME");
     }
 
