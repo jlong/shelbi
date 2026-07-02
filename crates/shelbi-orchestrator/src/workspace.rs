@@ -609,16 +609,32 @@ pub fn start_workspace_on_task(spec: StartSpec<'_>) -> Result<TmuxAddr> {
     // 6. Wait until claude has drawn its input box before typing the prompt.
     //    A fixed sleep is fragile: claude's boot time varies with load, and
     //    on a freshly-created worktree it may interpose a "trust this folder"
-    //    dialog first (which `wait_for_claude_ready` auto-confirms). If the
-    //    probe times out we still send — best effort beats aborting the task.
-    let ready = wait_for_claude_ready(&host, &addr, READY_TIMEOUT)?;
-    if !ready {
-        eprintln!(
-            "shelbi: claude readiness probe timed out after {}s on {}; \
-             sending the prompt anyway",
+    //    dialog first (which `wait_for_claude_ready` auto-confirms).
+    //
+    //    If the probe times out we do NOT fire-and-forget. Typing into a
+    //    not-yet-ready UI silently drops the whole prompt: the keystrokes land
+    //    nowhere and claude sits at a fresh idle box, yet the old code sent
+    //    anyway and the caller then marked the task `in_progress` — stranding a
+    //    dead workspace "active" forever with no prompt (observed 2026-07-02 on
+    //    alpha). Instead we abort the dispatch cleanly: record an actionable
+    //    event and return an error so the caller leaves the task in its
+    //    ready-category column for a clean retry.
+    if !wait_for_claude_ready(&host, &addr, READY_TIMEOUT)? {
+        if let Err(e) = shelbi_state::append_dispatch_event(
+            spec.task_id,
+            &spec.workspace.name,
+            "readiness-timeout",
+            "input box not ready",
+        ) {
+            eprintln!("shelbi: failed to record dispatch readiness-timeout in events.log: {e}");
+        }
+        return Err(Error::Other(format!(
+            "claude readiness probe timed out after {}s on {} — dispatch aborted, \
+             prompt NOT sent so the task stays put for retry. Check the workspace \
+             pane, then re-run `shelbi task start`.",
             READY_TIMEOUT.as_secs(),
             addr.target(),
-        );
+        )));
     }
     let prompt = compose_prompt(
         spec.task_id,
@@ -635,34 +651,56 @@ pub fn start_workspace_on_task(spec: StartSpec<'_>) -> Result<TmuxAddr> {
     //    input box. claude's `UserPromptSubmit` hook (see workspace settings
     //    template) writes `\033]2;shelbi:working\007` to the pane title on
     //    every submit — so once any `shelbi:` marker appears in the title,
-    //    we know Enter landed. If it doesn't within a short window, the
-    //    most common cause is that the trailing Enter raced claude's input
-    //    focus and was dropped; resend it once and try again. If still no
-    //    marker, surface a dispatch=stalled line in events.log so the
-    //    orchestrator (and `shelbi events tail`) sees it instead of the
-    //    workspace silently sitting on the prompt.
-    confirm_prompt_submitted(&host, &addr, spec.task_id, &spec.workspace.name);
+    //    we know Enter landed. If it doesn't within the window, the most
+    //    common cause is that the trailing Enter raced claude's input focus
+    //    and was dropped; resend it once and try again.
+    //
+    //    If it STILL never lands, the prompt is lost — do not mark the task
+    //    active. `confirm_prompt_submitted` records a `status=prompt-lost`
+    //    dispatch event; we then return an error so the caller leaves the task
+    //    in its ready-category column, exactly like a readiness timeout,
+    //    instead of moving it to `in_progress` on a workspace that never got
+    //    the prompt.
+    if !confirm_prompt_submitted(&host, &addr, spec.task_id, &spec.workspace.name) {
+        return Err(Error::Other(format!(
+            "prompt was not accepted on {} — no submission signal after a retry \
+             Enter. Dispatch aborted so the task stays put for retry; check the \
+             workspace pane.",
+            addr.target(),
+        )));
+    }
 
     Ok(addr)
 }
 
-/// How long to wait for proof the prompt got submitted (pane title flips
-/// to a `shelbi:*` marker OR the pane content shows claude is busy
-/// processing). Submit lands almost immediately when the hook fires; this
-/// just covers the slow path (busy SSH, sluggish tmux server).
-const PROMPT_SUBMIT_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
+/// How long to wait, per attempt, for proof the prompt got submitted (pane
+/// title flips to a `shelbi:*` marker OR the pane content shows claude is busy
+/// processing). Submit lands almost immediately when the hook fires; the window
+/// covers the slow path (busy SSH, sluggish tmux server, a model that takes a
+/// few seconds to start streaming). Deliberately longer than the old 5s: a
+/// genuine submission whose busy footer was slow to render read as a stall and
+/// produced a false `enter-stalled` (observed 2026-07-02 on charlie, whose
+/// prompt had submitted fine). With the dispatch now *aborting* on an
+/// unconfirmed submit, a false negative is worse than before — so we give a
+/// real submission ample room to prove itself.
+const PROMPT_SUBMIT_WAIT: std::time::Duration = std::time::Duration::from_secs(15);
 
 /// How often to re-check the pane while waiting for the submit signal.
 const PROMPT_SUBMIT_POLL: std::time::Duration = std::time::Duration::from_millis(200);
 
+/// Scrollback depth captured when checking for the busy signal — enough that a
+/// captured pane whose spinner/footer has scrolled a little still shows it.
+const PROMPT_SUBMIT_SCROLLBACK: usize = 200;
+
 /// Wait for the prompt-submitted signal; if it doesn't arrive, resend Enter
-/// once and wait again; if it still doesn't arrive, log a dispatch=stalled
-/// event and warn on stderr. Best-effort — failures here don't abort the
-/// task start (the workspace may still recover), they just surface the stall
-/// so the orchestrator stops assuming the dispatch succeeded.
-fn confirm_prompt_submitted(host: &Host, addr: &TmuxAddr, task_id: &str, workspace: &str) {
+/// once and wait again. Returns `true` once submission is confirmed. If it is
+/// still unconfirmed after the retry, record an actionable `status=prompt-lost`
+/// dispatch event (so `shelbi events tail` and the orchestrator see it) and
+/// return `false` — the caller aborts the dispatch rather than marking the
+/// task active on a workspace sitting on an unsubmitted (or swallowed) prompt.
+fn confirm_prompt_submitted(host: &Host, addr: &TmuxAddr, task_id: &str, workspace: &str) -> bool {
     if wait_for_prompt_submitted(host, addr, PROMPT_SUBMIT_WAIT) {
-        return;
+        return true;
     }
     // First Enter likely raced claude's focus — resend a bare Enter and give
     // the hook one more window to fire. Avoid spamming Enters: a second one
@@ -675,22 +713,22 @@ fn confirm_prompt_submitted(host: &Host, addr: &TmuxAddr, task_id: &str, workspa
         );
     }
     if wait_for_prompt_submitted(host, addr, PROMPT_SUBMIT_WAIT) {
-        return;
+        return true;
     }
     eprintln!(
         "shelbi: dispatched prompt to {} but no submission signal appeared \
-         after a retry Enter — workspace may be sitting on an unsubmitted prompt; \
-         check the pane",
+         after a retry Enter — the prompt was lost; leaving the task unmoved",
         addr.target(),
     );
     if let Err(e) = shelbi_state::append_dispatch_event(
         task_id,
         workspace,
-        "enter-stalled",
+        "prompt-lost",
         "no submit signal after retry",
     ) {
-        eprintln!("shelbi: failed to record dispatch stall in events.log: {e}");
+        eprintln!("shelbi: failed to record dispatch prompt-lost in events.log: {e}");
     }
+    false
 }
 
 /// Poll the workspace's pane until we have proof the prompt got submitted, or
@@ -722,9 +760,12 @@ fn wait_for_prompt_submitted(host: &Host, addr: &TmuxAddr, timeout: std::time::D
             return true;
         }
         // Title-marker missed (probably clobbered by claude's own OSC).
-        // Fall back to the pane body — claude's busy spinner / "esc to
-        // interrupt" line is a much more durable signal that Enter landed.
-        let screen = shelbi_tmux::capture(host, addr).unwrap_or_default();
+        // Fall back to the pane body + a little scrollback — claude's busy
+        // spinner / "esc to interrupt" line is a much more durable signal that
+        // Enter landed, and the scrollback keeps it visible even if a burst of
+        // output has scrolled the footer.
+        let screen =
+            shelbi_tmux::capture_history(host, addr, PROMPT_SUBMIT_SCROLLBACK).unwrap_or_default();
         if claude_is_processing(&screen) {
             return true;
         }
@@ -1907,8 +1948,8 @@ mod tests {
         // Both fixtures are post-submit screens where claude is mid-turn.
         // Neither has a `shelbi:` title marker (claude's own OSC 2 writes
         // have already overwritten it), so the title-based probe alone
-        // would mis-fire `enter-stalled`. The content fallback catches
-        // both.
+        // would mis-fire a `prompt-lost` abort on a prompt that actually
+        // landed. The content fallback catches both.
         assert!(claude_is_processing(BUSY_SCREEN_SPINNER));
         assert!(claude_is_processing(BUSY_SCREEN_ESC_FOOTER));
     }
