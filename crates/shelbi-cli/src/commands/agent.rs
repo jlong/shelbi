@@ -207,33 +207,7 @@ fn edit(project: &str, name: &str) -> Result<()> {
     }
     let instructions_path =
         shelbi_state::agent_instructions_path(project, name).map_err(|e| anyhow!(e))?;
-    let editor = resolve_editor()?;
-    let status = std::process::Command::new(&editor)
-        .arg(&instructions_path)
-        .status()?;
-    if !status.success() {
-        bail!("{editor} exited with {status}");
-    }
-    Ok(())
-}
-
-/// `$EDITOR` → `$VISUAL` → `vim`. Returns a clear error when none of
-/// the three are usable so the user knows which env var to set.
-fn resolve_editor() -> Result<String> {
-    if let Ok(e) = std::env::var("EDITOR") {
-        if !e.trim().is_empty() {
-            return Ok(e);
-        }
-    }
-    if let Ok(e) = std::env::var("VISUAL") {
-        if !e.trim().is_empty() {
-            return Ok(e);
-        }
-    }
-    // Fall back to `vim`. We don't probe $PATH up front — `Command::status`
-    // will surface a clear "No such file or directory" if vim is missing,
-    // and we annotate it below.
-    Ok("vim".to_string())
+    super::launch_editor(&instructions_path)
 }
 
 /// One skill's parsed frontmatter — just the bits the `show` listing
@@ -634,6 +608,9 @@ statuses:
         let _g = TEST_LOCK.lock().unwrap();
         let home = fresh_home();
         std::env::set_var("SHELBI_HOME", &home);
+        // VISUAL takes precedence over EDITOR in the shared resolver, so
+        // clear it to keep this test pinned to the EDITOR we set.
+        std::env::remove_var("VISUAL");
         std::env::set_var("EDITOR", "/usr/bin/true");
         new("p", "qa").unwrap();
         edit("p", "qa").unwrap();
@@ -642,22 +619,4 @@ statuses:
         let _ = std::fs::remove_dir_all(&home);
     }
 
-    #[test]
-    fn resolve_editor_prefers_editor_over_visual_and_falls_back_to_vim() {
-        // The function reads env directly; sequence the cases under the
-        // shared lock so we don't race other test threads on these vars.
-        let _g = TEST_LOCK.lock().unwrap();
-        std::env::remove_var("EDITOR");
-        std::env::remove_var("VISUAL");
-        assert_eq!(resolve_editor().unwrap(), "vim");
-        std::env::set_var("VISUAL", "nano");
-        assert_eq!(resolve_editor().unwrap(), "nano");
-        std::env::set_var("EDITOR", "emacs");
-        assert_eq!(resolve_editor().unwrap(), "emacs");
-        // Empty EDITOR falls through to VISUAL.
-        std::env::set_var("EDITOR", "");
-        assert_eq!(resolve_editor().unwrap(), "nano");
-        std::env::remove_var("EDITOR");
-        std::env::remove_var("VISUAL");
-    }
 }

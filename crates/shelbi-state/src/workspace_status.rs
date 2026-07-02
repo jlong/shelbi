@@ -702,6 +702,7 @@ fn append_event_line(line: &str) -> Result<()> {
     if let Some(parent) = path.parent() {
         ensure_dir(parent)?;
     }
+    maybe_rotate_events_log(&path, EVENTS_LOG_MAX_BYTES);
     let mut buf = String::with_capacity(line.len() + 1);
     buf.push_str(line);
     buf.push('\n');
@@ -711,6 +712,30 @@ fn append_event_line(line: &str) -> Result<()> {
         .open(&path)?;
     f.write_all(buf.as_bytes())?;
     Ok(())
+}
+
+/// Size ceiling for `events.log` before an append rotates it. The log is
+/// append-only and otherwise grows without bound; rotating at ~8 MiB
+/// bounds disk use and keeps the tail-scan readers cheap (the CLI's
+/// crash-recovery check reads only the last 64 KiB — see
+/// `commands::status`). One `.1` generation is kept; older history is
+/// dropped on the next rotation.
+const EVENTS_LOG_MAX_BYTES: u64 = 8 * 1024 * 1024;
+
+/// Best-effort size-based rotation: if `path` (the current `events.log`)
+/// is at least `max_bytes`, rename it to `events.log.1` — replacing any
+/// prior generation — so the next append starts a fresh file. Racy by
+/// design under concurrent appenders: whichever writer wins the rename
+/// rotates, and a loser that then stats the fresh small file simply skips
+/// (which is correct). Every error is swallowed — a rotation hiccup must
+/// never block an event write, which is the caller's actual job.
+fn maybe_rotate_events_log(path: &std::path::Path, max_bytes: u64) {
+    match fs::metadata(path) {
+        Ok(m) if m.len() >= max_bytes => {}
+        _ => return,
+    }
+    let rotated = path.with_extension("log.1");
+    let _ = fs::rename(path, &rotated);
 }
 
 fn sanitize_reason(s: &str) -> String {
@@ -736,6 +761,39 @@ mod tests {
         ));
         std::fs::create_dir_all(&p).unwrap();
         p
+    }
+
+    #[test]
+    fn events_log_rotates_when_over_size() {
+        let _g = TEST_LOCK.lock().unwrap();
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+
+        let path = events_log_path().unwrap();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let rotated = path.with_extension("log.1");
+
+        // Under the (test) threshold: no rotation, file untouched.
+        std::fs::write(&path, "small\n").unwrap();
+        maybe_rotate_events_log(&path, 1024);
+        assert!(path.exists());
+        assert!(!rotated.exists());
+
+        // At/over the threshold: current log renames to `.1`, leaving room
+        // for a fresh file on the next append.
+        std::fs::write(&path, "x".repeat(2048)).unwrap();
+        maybe_rotate_events_log(&path, 1024);
+        assert!(!path.exists(), "over-size log should be rotated away");
+        assert!(rotated.exists(), "rotated generation should exist");
+
+        // A second rotation replaces the prior `.1` rather than erroring.
+        std::fs::write(&path, "y".repeat(2048)).unwrap();
+        maybe_rotate_events_log(&path, 1024);
+        assert!(rotated.exists());
+        assert_eq!(std::fs::read(&rotated).unwrap(), b"y".repeat(2048));
+
+        std::env::remove_var("SHELBI_HOME");
+        let _ = std::fs::remove_dir_all(&home);
     }
 
     #[test]
