@@ -89,6 +89,9 @@ pub fn run(cli_project: Option<String>, cmd: ProjectCmd) -> Result<()> {
 fn run_migrate_to_in_repo(project_name: &str, dry_run: bool, yes: bool) -> Result<()> {
     let plan = plan_in_repo_migration(project_name).map_err(|e| anyhow!(e))?;
     print_plan_header(&plan, dry_run);
+    for warning in &plan.warnings {
+        println!("  ⚠ {warning}");
+    }
 
     if plan.is_noop() {
         if plan.already_in_repo {
