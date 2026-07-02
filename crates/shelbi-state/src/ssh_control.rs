@@ -24,8 +24,10 @@ use shelbi_core::Result;
 use crate::shelbi_home;
 
 /// Directory holding the per-host SSH ControlMaster sockets:
-/// `$SHELBI_HOME/ssh/`. Each file inside is named `<user>@<host>` per
-/// the `%r@%h` template handed to OpenSSH's `ControlPath` option.
+/// `$SHELBI_HOME/ssh/`. Each file inside is named by OpenSSH's `%C`
+/// connection hash (see [`ssh_control_path_template`]) — a fixed-length
+/// digest that keeps the socket path under the `sun_path` cap even for
+/// long home/user/host combinations.
 ///
 /// Lives under SHELBI_HOME (not `~/.ssh/`) so the startup cleanup can
 /// scan and prune without risking the user's own ControlMasters.
@@ -52,13 +54,19 @@ pub fn ensure_ssh_control_dir() -> Result<()> {
     Ok(())
 }
 
-/// String passed to OpenSSH's `-o ControlPath=…`. Includes the `%r@%h`
-/// tokens that ssh expands per-connection. The directory matches
-/// [`ssh_control_dir`] so this module's cleanup logic and ssh's
-/// runtime agree on the path.
+/// String passed to OpenSSH's `-o ControlPath=…`. Uses the `%C` token —
+/// OpenSSH's hash of `%l%h%p%r` (local host, remote host, port, remote
+/// user) — rather than the human-readable `%r@%h`, so the expanded path
+/// is a fixed short length regardless of how long `$SHELBI_HOME`, the
+/// username, or the FQDN are. `%r@%h` could push the path past macOS's
+/// ~104-byte `sun_path` cap (adversarial review F12), which fails every
+/// SSH invocation with `ControlPath too long`. The directory matches
+/// [`ssh_control_dir`] so this module's cleanup logic and ssh's runtime
+/// agree on the path; the cleanup probes sockets by `connect()`, not by
+/// filename, so the opaque `%C` digest doesn't affect it.
 pub fn ssh_control_path_template() -> Result<String> {
     let dir = ssh_control_dir()?;
-    Ok(format!("{}/%r@%h", dir.display()))
+    Ok(format!("{}/%C", dir.display()))
 }
 
 /// Remote-side landing path for the hub socket's reverse forward.
@@ -328,12 +336,12 @@ mod tests {
     }
 
     #[test]
-    fn control_path_template_carries_user_at_host_tokens() {
+    fn control_path_template_uses_connection_hash_token() {
         let _g = lock_test();
         let home = fresh_home();
         std::env::set_var("SHELBI_HOME", &home);
         let tpl = ssh_control_path_template().unwrap();
-        assert!(tpl.ends_with("/ssh/%r@%h"), "got: {tpl}");
+        assert!(tpl.ends_with("/ssh/%C"), "got: {tpl}");
         std::env::remove_var("SHELBI_HOME");
     }
 

@@ -56,9 +56,12 @@ const SSH_CONTROL_OPTS_STATIC: &[&str] = &[
     // multiplexed channel without re-requesting it. ExitOnForwardFailure=no
     // (the default) and LogLevel=ERROR keep duplicate-forward warnings
     // on slave reconnects from blocking the connection or polluting
-    // the user's terminal — the only real "forwarding failed" case
-    // worth surfacing is the master open, which falls through to the
-    // command's regular stderr.
+    // the user's terminal. NB: these options silence the forward-failed
+    // warning on the *master open* too — a stale remote socket that
+    // blocks the `-R` bind fails silently here. That gap is closed out
+    // of band by [`ensure_reverse_forward`], which cleans the stale
+    // socket and verifies the forward instead of relying on ssh's
+    // (suppressed) stderr.
     "-o",
     "ExitOnForwardFailure=no",
     "-o",
@@ -95,7 +98,7 @@ fn build_ssh_control_opts() -> Vec<String> {
     // errors out (no $HOME, etc.) — better to start a fresh master per
     // call than to wedge the SSH path entirely.
     let cp = shelbi_state::ssh_control_path_template()
-        .unwrap_or_else(|_| "~/.shelbi/ssh/%r@%h".to_string());
+        .unwrap_or_else(|_| "~/.shelbi/ssh/%C".to_string());
     opts.push("-o".into());
     opts.push(format!("ControlPath={cp}"));
     // Reverse forward: <remote>:<local>. Fall back to the in-spec
@@ -261,16 +264,37 @@ where
     tracing::debug!(?cmd, host = ?host, bytes = stdin.len(), "ssh::run_with_stdin");
 
     let mut child = cmd.spawn().map_err(shelbi_core::Error::Io)?;
-    {
-        let mut child_stdin = child
-            .stdin
-            .take()
-            .expect("stdin was piped");
-        child_stdin
-            .write_all(stdin)
-            .map_err(shelbi_core::Error::Io)?;
-    }
+    // Capture (don't `?`) the write error. If the child died early — an
+    // unreachable host or refused auth exits within milliseconds — a
+    // payload larger than the pipe buffer hits EPIPE here. Returning on the
+    // `?` would (a) leave the child unreaped: `Child`'s `Drop` doesn't
+    // `wait`, so the long-lived hub daemon would accumulate `<defunct>` ssh
+    // processes, and (b) surface a bare `BrokenPipe` while the real
+    // diagnostic ("Connection refused", "Permission denied") sits unread in
+    // the child's stderr (adversarial review F8). Instead we record the
+    // error, always drain to `wait_with_output` below (which reaps the
+    // child), and fold its stderr into the returned error.
+    let write_err = {
+        let mut child_stdin = child.stdin.take().expect("stdin was piped");
+        child_stdin.write_all(stdin).err()
+        // child_stdin drops here, closing the pipe so a healthy child sees
+        // EOF on stdin and can finish.
+    };
     let output = child.wait_with_output().map_err(shelbi_core::Error::Io)?;
+    if let Some(werr) = write_err {
+        let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+        // Prefer the child's own diagnostic when it left one; fall back to
+        // the raw IO error only when stderr is empty (e.g. the write failed
+        // for a reason unrelated to the child dying).
+        if stderr.trim().is_empty() {
+            return Err(shelbi_core::Error::Io(werr));
+        }
+        return Err(shelbi_core::Error::Command {
+            cmd: cmd_str,
+            status: output.status.to_string(),
+            stderr,
+        });
+    }
     if !output.status.success() {
         return Err(shelbi_core::Error::Command {
             cmd: cmd_str,
@@ -279,6 +303,132 @@ where
         });
     }
     Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
+/// The minimal `-o ControlPath=…` pair used by master *control* commands
+/// (`ssh -O check` / `ssh -O exit`). These don't open a new connection —
+/// they locate an existing master by its ControlPath — so they carry
+/// neither the full connect-tuning options nor the `-R` reverse forward.
+fn control_path_opt() -> Vec<String> {
+    // Materialize the dir for parity with `build_ssh_control_opts`; a `-O`
+    // command against a missing dir just reports "no control path" which is
+    // exactly the "no master" answer we want anyway.
+    let _ = shelbi_state::ensure_ssh_control_dir();
+    let cp = shelbi_state::ssh_control_path_template()
+        .unwrap_or_else(|_| "~/.shelbi/ssh/%C".to_string());
+    vec!["-o".to_string(), format!("ControlPath={cp}")]
+}
+
+/// Is a ControlMaster currently alive for `hostname`? `ssh -O check`
+/// queries the existing master via its ControlPath and exits 0 when one is
+/// running — without opening a new connection.
+fn master_is_alive(hostname: &str) -> bool {
+    let mut cmd = Command::new("ssh");
+    for o in control_path_opt() {
+        cmd.arg(o);
+    }
+    cmd.arg("-O").arg("check").arg(hostname);
+    matches!(cmd.output(), Ok(o) if o.status.success())
+}
+
+/// Tear down any ControlMaster for `hostname` (`ssh -O exit`). Best-effort:
+/// a nonzero exit just means there was no master to close. We drop the
+/// master before reopening so `ControlMaster=auto` opens a *fresh* one that
+/// rebinds the `-R` forward, rather than silently reusing a master whose
+/// forward failed to bind.
+fn drop_master(hostname: &str) {
+    let mut cmd = Command::new("ssh");
+    for o in control_path_opt() {
+        cmd.arg(o);
+    }
+    cmd.arg("-O").arg("exit").arg(hostname);
+    let _ = cmd.output();
+}
+
+/// Does the reverse-forward landing socket exist on the remote? `test -S`
+/// is true only for an existing socket node. Routed through `run` so it
+/// reuses (or, as a side effect, opens) the multiplexed master rather than
+/// paying a fresh handshake.
+fn remote_socket_present(host: &Host, remote_sock: &str) -> bool {
+    matches!(run(host, ["test", "-S", remote_sock]), Ok(o) if o.status.success())
+}
+
+/// Ensure the hub's reverse forward to `host` is bound and healthy,
+/// repairing a stale-remote-socket wedge if one is present.
+///
+/// Every shelbi-routed `ssh` invocation carries
+/// `-R <remote>:<local hub.sock>` so remote workers can write to the hub's
+/// `events.log` over the multiplexed channel. But `-R` to a Unix socket
+/// binds successfully only when the landing path is free: sshd unlinks a
+/// pre-existing remote socket only with `StreamLocalBindUnlink yes`
+/// (default `no`, and the client can't force it). When a master dies
+/// abnormally it leaves its socket file behind, so the next master's `-R`
+/// bind collides with the leak — and `ExitOnForwardFailure=no` +
+/// `LogLevel=ERROR` (which keep slave reconnects quiet) swallow the
+/// warning. The result: every worker→hub message silently drops into a
+/// dead file until someone cleans it by hand (adversarial review F7).
+///
+/// This is a no-op for [`Host::Local`]. For SSH hosts it:
+///  1. Fast-paths out when a live master already backs an existing landing
+///     socket (the healthy steady state — two cheap probe round-trips).
+///  2. Otherwise drops any half-broken master, removes the stale remote
+///     socket (safe: we only get here when no live master owns the
+///     forward), and reopens the master so `-R` rebinds against a clean
+///     path.
+///  3. Verifies the landing socket now exists and, on failure, records a
+///     line to `events.log` so a dead channel is diagnosable instead of
+///     invisible — then returns an error the caller can log.
+pub fn ensure_reverse_forward(host: &Host) -> shelbi_core::Result<()> {
+    let hostname = match host {
+        Host::Local => return Ok(()),
+        Host::Ssh { host } => host.clone(),
+    };
+    let remote_sock = shelbi_state::remote_hub_socket_path()
+        .to_string_lossy()
+        .into_owned();
+
+    // Fast path: a live master carries the `-R` forward it opened with, so
+    // "master alive AND landing socket present" means the forward is
+    // healthy. Leave everything untouched.
+    if master_is_alive(&hostname) && remote_socket_present(host, &remote_sock) {
+        return Ok(());
+    }
+
+    // Repair. Drop any existing master first: it may be a master whose
+    // forward never bound (stale socket collided with the `-R`), and
+    // `ControlMaster=auto` would otherwise reuse it and skip the rebind.
+    drop_master(&hostname);
+    // Remove the stale landing socket. We only reach here when no live
+    // master owns the forward, so any leftover socket file is a leak from a
+    // dead master — safe to unlink. This one-shot `rm` opens a transient
+    // master (whose own `-R` still collides with the not-yet-removed
+    // socket); drop that too so the reopen below starts genuinely clean.
+    let _ = run(host, ["rm", "-f", remote_sock.as_str()]);
+    drop_master(&hostname);
+
+    // Reopen the master, rebinding `-R` against the now-clean path. `true`
+    // is the cheapest remote command; the master opens (and ControlPersist
+    // keeps it) as a side effect.
+    let opened = run(host, ["true"]).map_err(shelbi_core::Error::Io)?;
+
+    if opened.status.success() && remote_socket_present(host, &remote_sock) {
+        return Ok(());
+    }
+
+    let detail = if opened.status.success() {
+        "landing_socket_missing"
+    } else {
+        "master_open_failed"
+    };
+    // Surface to events.log (best-effort — a wedged forward shouldn't also
+    // hard-fail on a logging hiccup).
+    let _ = shelbi_state::emit_event_body(&format!(
+        "ssh reverse-forward host={hostname} remote_sock={remote_sock} status=failed detail={detail}"
+    ));
+    Err(shelbi_core::Error::Other(format!(
+        "ssh reverse forward to {hostname} could not be verified ({detail}); \
+         worker→hub messages via {remote_sock} will not be delivered"
+    )))
 }
 
 #[cfg(test)]
@@ -361,8 +511,8 @@ mod tests {
             .position(|a| a.starts_with("ControlPath="))
             .expect("missing ControlPath");
         assert!(
-            args[cp_idx].contains("/ssh/%r@%h"),
-            "ControlPath didn't carry the %r@%h template: {}",
+            args[cp_idx].contains("/ssh/%C"),
+            "ControlPath didn't carry the %C connection-hash template: {}",
             args[cp_idx],
         );
     }
@@ -424,5 +574,34 @@ mod tests {
         let out = run_with_stdin(&Host::Local, ["cat"], payload.as_bytes())
             .expect("cat failed");
         assert_eq!(out, payload);
+    }
+
+    #[test]
+    fn run_with_stdin_surfaces_child_stderr_on_broken_pipe() {
+        // F8: a child that exits immediately without draining stdin models
+        // an unreachable host / refused auth. A payload larger than the
+        // pipe buffer (64 KiB on Linux, less on macOS) forces `write_all`
+        // to hit EPIPE. We must reap the child (no zombie) and surface its
+        // own stderr ("boom") rather than a bare BrokenPipe.
+        let payload = vec![b'x'; 1 << 20]; // 1 MiB, well over any pipe buffer
+        let err = run_with_stdin(
+            &Host::Local,
+            ["sh", "-c", "echo boom >&2; exit 7"],
+            &payload,
+        )
+        .expect_err("expected failure from instantly-dying child");
+        match err {
+            shelbi_core::Error::Command { stderr, .. } => {
+                assert!(stderr.contains("boom"), "stderr was: {stderr}");
+            }
+            other => panic!("expected Command error carrying child stderr, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn ensure_reverse_forward_is_noop_for_local() {
+        // Local hosts have no reverse forward to establish — the call must
+        // short-circuit without shelling out to ssh.
+        ensure_reverse_forward(&Host::Local).expect("local ensure should be Ok");
     }
 }

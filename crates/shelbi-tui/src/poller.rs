@@ -48,6 +48,15 @@ use shelbi_state::{
     WorkspaceState, WorkspaceStatus,
 };
 
+/// How often each per-workspace thread re-verifies its host's reverse
+/// forward. Kept well under `ControlPersist=600` (10 min) so a master that
+/// lapses and reopens — the moment a stale remote socket would wedge the
+/// `-R` rebind — gets its forward re-checked and repaired within a couple
+/// of minutes rather than staying silently broken until the thread
+/// restarts. Local workspaces short-circuit the check, so the only cost
+/// this cadence imposes is on SSH hosts.
+const FORWARD_RECHECK_INTERVAL: Duration = Duration::from_secs(120);
+
 /// Spawned poller handle. Dropping it asks the thread to exit and joins it.
 pub struct WorkspacePoller {
     shutdown: Arc<AtomicBool>,
@@ -176,6 +185,15 @@ fn run_workspace_poll_loop(
     // status.yaml on first observation (handled inside `poll_one`).
     let mut last_known: Option<WorkspaceState> = None;
 
+    // Reverse-forward health schedule. For SSH workspaces we (re)establish
+    // and verify the hub's `-R` forward at thread start and on a slow
+    // cadence after, so a ControlMaster that died and left a stale remote
+    // socket behind gets repaired instead of silently swallowing every
+    // worker→hub message (adversarial review F7). `None` means "due now";
+    // the check is a cheap no-op for local hosts and two probe round-trips
+    // when the forward is already healthy.
+    let mut next_forward_check: Option<Instant> = None;
+
     loop {
         if shutdown.load(Ordering::SeqCst) {
             break;
@@ -194,6 +212,24 @@ fn run_workspace_poll_loop(
             break;
         };
         let interval = Duration::from_secs(project.workspace_poll_interval_secs.max(1));
+
+        // Keep the reverse forward healthy before polling over it. Runs on
+        // its own slow cadence (independent of the poll interval) so the
+        // common case adds no per-poll cost. Failures are logged, not fatal
+        // — a wedged forward shouldn't stop us observing pane state.
+        if next_forward_check.map_or(true, |t| Instant::now() >= t) {
+            if let Some(machine) = project.machine(&workspace.machine) {
+                let host = machine.host();
+                if let Err(e) = shelbi_ssh::ensure_reverse_forward(&host) {
+                    tracing::warn!(
+                        workspace = %workspace_name,
+                        error = %e,
+                        "reverse-forward health check failed",
+                    );
+                }
+            }
+            next_forward_check = Some(Instant::now() + FORWARD_RECHECK_INTERVAL);
+        }
 
         poll_one(&project, workspace, &mut last_known);
 

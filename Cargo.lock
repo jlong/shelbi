@@ -1091,6 +1091,7 @@ dependencies = [
  "shelbi-core",
  "shelbi-orchestrator",
  "shelbi-palette",
+ "shelbi-ssh",
  "shelbi-state",
  "shelbi-tmux",
  "tracing",
