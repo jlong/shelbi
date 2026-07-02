@@ -1301,25 +1301,32 @@ mod tests {
         let home = fresh_home();
         std::env::set_var("SHELBI_HOME", &home);
 
+        // `prompt-lost` and `readiness-timeout` are the two dispatch-failure
+        // statuses the workspace dispatch path emits (see
+        // `shelbi_orchestrator::workspace`); the orchestrator greps for them to
+        // recover a dispatch that never reached its workspace.
         append_dispatch_event(
             "fix-login",
             "alpha",
-            "enter-stalled",
-            "no shelbi marker after retry",
+            "prompt-lost",
+            "no submit signal after retry",
         )
         .unwrap();
+        append_dispatch_event("build-thing", "charlie", "readiness-timeout", "input box not ready")
+            .unwrap();
         let log = std::fs::read_to_string(events_log_path().unwrap()).unwrap();
         let lines: Vec<&str> = log.lines().collect();
-        assert_eq!(lines.len(), 1);
+        assert_eq!(lines.len(), 2);
         // Shape: `<ts> dispatch task=<id> workspace=<name> status=<s> detail=<d>`.
         // The `dispatch` prefix lets `shelbi events tail` show it without
         // colliding with task=... or workspace=... lines.
         let line = lines[0];
         assert!(line.contains(" dispatch task=fix-login "), "line: {line}");
         assert!(line.contains(" workspace=alpha "), "line: {line}");
-        assert!(line.contains(" status=enter-stalled "), "line: {line}");
+        assert!(line.contains(" status=prompt-lost "), "line: {line}");
         // Whitespace in detail folds to underscores so the line stays parseable.
-        assert!(line.ends_with(" detail=no_shelbi_marker_after_retry"), "line: {line}");
+        assert!(line.ends_with(" detail=no_submit_signal_after_retry"), "line: {line}");
+        assert!(lines[1].contains(" status=readiness-timeout "), "line: {}", lines[1]);
 
         std::env::remove_var("SHELBI_HOME");
     }
