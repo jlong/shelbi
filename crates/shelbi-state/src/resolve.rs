@@ -43,10 +43,12 @@ pub struct ProjectRoot {
 
 /// Scan `<shelbi-root>/projects/*.yaml` and collect every local machine's
 /// `work_dir` as a [`ProjectRoot`]. Files that fail to read or parse are
-/// skipped silently — a single malformed YAML shouldn't break resolution
-/// for every other project. Only `kind: local` machines contribute: a
-/// remote `work_dir` is a path on another host and matching it against the
-/// local cwd would be a false positive.
+/// skipped with a once-per-process warning — a single malformed YAML
+/// shouldn't break resolution for every other project, but a hand-broken
+/// registration silently vanishing from cwd resolution is undebuggable.
+/// Only `kind: local` machines contribute: a remote `work_dir` is a path
+/// on another host and matching it against the local cwd would be a
+/// false positive.
 pub fn project_roots() -> Result<Vec<ProjectRoot>> {
     let dir = projects_dir()?;
     if !dir.exists() {
@@ -61,11 +63,17 @@ pub fn project_roots() -> Result<Vec<ProjectRoot>> {
         }
         let text = match fs::read_to_string(&path) {
             Ok(t) => t,
-            Err(_) => continue,
+            Err(e) => {
+                warn_skipped_project_yaml_once(&path, &e.to_string());
+                continue;
+            }
         };
         let project: Project = match serde_yaml::from_str(&text) {
             Ok(p) => p,
-            Err(_) => continue,
+            Err(e) => {
+                warn_skipped_project_yaml_once(&path, &e.to_string());
+                continue;
+            }
         };
         for machine in &project.machines {
             if machine.kind != MachineKind::Local {
@@ -80,6 +88,33 @@ pub fn project_roots() -> Result<Vec<ProjectRoot>> {
         }
     }
     Ok(out)
+}
+
+/// One-time-per-process warning (keyed by file path) when a registered
+/// project YAML can't be read or parsed during root collection. Routed
+/// through `tracing::warn!` — not `eprintln!` — for the same reason as
+/// `warn_legacy_workers_key`: TUI subcommands log to a file and must not
+/// paint onto the alt-screen pane.
+fn warn_skipped_project_yaml_once(path: &Path, err: &str) {
+    use std::collections::HashSet;
+    use std::sync::Mutex;
+    static WARNED: Mutex<Option<HashSet<PathBuf>>> = Mutex::new(None);
+
+    let mut guard = match WARNED.lock() {
+        Ok(g) => g,
+        Err(p) => p.into_inner(),
+    };
+    let seen = guard.get_or_insert_with(HashSet::new);
+    if !seen.insert(path.to_path_buf()) {
+        return;
+    }
+    drop(guard);
+    tracing::warn!(
+        file = %path.display(),
+        "shelbi: skipping unreadable project registration {}: {err} — \
+         this project is excluded from cwd resolution until the file is fixed",
+        path.display(),
+    );
 }
 
 /// Resolve the project owning `cwd`.
@@ -324,6 +359,29 @@ mod tests {
             resolve_project_for_cwd(&outer).unwrap().as_deref(),
             Some("outer")
         );
+        std::env::remove_var("SHELBI_HOME");
+    }
+
+    #[test]
+    fn corrupt_registration_is_skipped_but_others_still_resolve() {
+        let _g = TEST_LOCK.lock().unwrap();
+        let home = fresh_dir("home");
+        let root = fresh_dir("foo");
+        std::env::set_var("SHELBI_HOME", &home);
+        write_project(&home, "foo", &root);
+        // A hand-broken registration alongside it must not take down
+        // resolution for the healthy project (it's skipped with a
+        // warning — see `warn_skipped_project_yaml_once`).
+        fs::write(
+            home.join("projects/broken.yaml"),
+            "name: [this is not a scalar\n",
+        )
+        .unwrap();
+
+        let roots = project_roots().unwrap();
+        assert_eq!(roots.len(), 1);
+        assert_eq!(roots[0].name, "foo");
+        assert_eq!(resolve_project_for_cwd(&root).unwrap().as_deref(), Some("foo"));
         std::env::remove_var("SHELBI_HOME");
     }
 

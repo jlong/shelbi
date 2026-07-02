@@ -120,10 +120,17 @@ pub fn shelbi_config_path() -> Result<PathBuf> {
 /// not an error because every consumer has a sensible fallback.
 pub fn load_shelbi_config() -> Result<ShelbiConfig> {
     let path = shelbi_config_path()?;
-    if !path.exists() {
-        return Ok(ShelbiConfig::default());
-    }
-    let text = fs::read_to_string(&path)?;
+    // Read unconditionally and map only NotFound to the default: probing
+    // with `exists()` first would also report false on EACCES/ELOOP, and
+    // a transiently unreadable config must surface as an error rather
+    // than silently reading as "missing".
+    let text = match fs::read_to_string(&path) {
+        Ok(t) => t,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(ShelbiConfig::default());
+        }
+        Err(e) => return Err(shelbi_core::Error::Io(e)),
+    };
     Ok(serde_yaml::from_str(&text)?)
 }
 
@@ -719,12 +726,18 @@ pub fn global_state_path() -> Result<PathBuf> {
 }
 
 /// Read `~/.shelbi/state.json`. Missing file → `GlobalState::default()`.
+/// Only `NotFound` maps to the default — any other read error (EACCES,
+/// ELOOP, …) propagates, so a transiently unreadable file can't be
+/// mistaken for a missing one and clobbered by the next mutator write.
 pub fn read_global_state() -> Result<GlobalState> {
     let path = global_state_path()?;
-    if !path.exists() {
-        return Ok(GlobalState::default());
-    }
-    let text = fs::read_to_string(&path)?;
+    let text = match fs::read_to_string(&path) {
+        Ok(t) => t,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(GlobalState::default());
+        }
+        Err(e) => return Err(shelbi_core::Error::Io(e)),
+    };
     serde_json::from_str(&text)
         .map_err(|e| shelbi_core::Error::Other(format!("state.json: {e}")))
 }
@@ -804,6 +817,20 @@ mod global_state_tests {
         let s = read_global_state().unwrap();
         assert_eq!(s, GlobalState::default());
         assert!(s.tmux_palette_key.is_none());
+        std::env::remove_var("SHELBI_HOME");
+    }
+
+    #[test]
+    fn unreadable_state_file_is_an_error_not_default() {
+        // F13: only NotFound maps to the default. Any other read error
+        // (here: EISDIR via a directory squatting on the path) must
+        // propagate, or a transiently unreadable state.json would be
+        // silently replaced with defaults by the next mutator write.
+        let _g = LOCK.lock().unwrap();
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+        fs::create_dir_all(global_state_path().unwrap()).unwrap();
+        assert!(read_global_state().is_err());
         std::env::remove_var("SHELBI_HOME");
     }
 
@@ -1008,13 +1035,18 @@ pub fn zen_check_crash_recovery(project: &str) -> Result<ZenCrashRecovery> {
 
 /// Read `state.json` for `project`. Returns `State::default()` when the
 /// file is missing — the first call after creating a project shouldn't
-/// require a separate seeding step.
+/// require a separate seeding step. Only `NotFound` maps to the default;
+/// other read errors (EACCES, ELOOP, …) propagate so a transiently
+/// unreadable file isn't replaced with defaults by the next write.
 pub fn read_state(project: &str) -> Result<State> {
     let path = state_path(project)?;
-    if !path.exists() {
-        return Ok(State::default());
-    }
-    let text = fs::read_to_string(&path)?;
+    let text = match fs::read_to_string(&path) {
+        Ok(t) => t,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(State::default());
+        }
+        Err(e) => return Err(shelbi_core::Error::Io(e)),
+    };
     serde_json::from_str(&text)
         .map_err(|e| shelbi_core::Error::Other(format!("state.json: {e}")))
 }
@@ -1437,12 +1469,18 @@ pub fn task_columns(project: &str) -> Result<HashMap<String, Column>> {
 }
 
 /// Tasks ready to start: in [`Column::Todo`], not blocked by any unfinished
-/// dependency. Returned in priority order.
+/// dependency. Returned in priority order. Both views — the id→column map
+/// and the Todo subset — derive from a single [`list_tasks`] pass, so a
+/// concurrent task move can't make them disagree mid-call.
 pub fn list_ready(project: &str) -> Result<Vec<TaskFile>> {
-    let columns = task_columns(project)?;
-    Ok(list_column(project, Column::Todo)?
+    let tasks = list_tasks(project)?;
+    let columns: HashMap<String, Column> = tasks
+        .iter()
+        .map(|tf| (tf.task.id.clone(), tf.task.column))
+        .collect();
+    Ok(tasks
         .into_iter()
-        .filter(|tf| !tf.task.is_blocked(&columns))
+        .filter(|tf| tf.task.column == Column::Todo && !tf.task.is_blocked(&columns))
         .collect())
 }
 

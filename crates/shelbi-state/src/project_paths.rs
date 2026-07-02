@@ -22,7 +22,7 @@ use std::path::PathBuf;
 
 use shelbi_core::{ConfigMode, Project, Result};
 
-use crate::{expand_tilde_path, expand_tilde_str, project_dir, projects_dir, shelbi_home};
+use crate::{expand_tilde_path, expand_tilde_str, project_dir, shelbi_home};
 
 /// Path resolution helpers for a [`Project`].
 ///
@@ -157,15 +157,6 @@ impl ProjectPaths for Project {
     fn claude_dir(&self) -> Result<PathBuf> {
         Ok(self.state_root()?.join(".claude"))
     }
-}
-
-/// Silence unused-import lint for [`projects_dir`] — the trait impl
-/// only reaches [`project_dir`], but re-exporting `projects_dir` in the
-/// crate root means this module doesn't need to touch it. Kept here in
-/// case a future config-path helper needs it.
-#[allow(dead_code)]
-fn _projects_dir_still_reachable() -> Result<PathBuf> {
-    projects_dir()
 }
 
 /// Assert at compile time that the trait is object-safe / callable in

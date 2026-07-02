@@ -85,10 +85,16 @@ pub fn statuses_path(project: &str) -> Result<PathBuf> {
 /// [`statuses_path`] themselves before calling.
 pub fn load_project_statuses(project: &str) -> Result<ProjectStatuses> {
     let path = statuses_path(project)?;
-    if !path.exists() {
-        return Ok(default_project_statuses());
-    }
-    let text = fs::read_to_string(&path)?;
+    // Read unconditionally and map only NotFound to the default — an
+    // `exists()` probe also reports false on EACCES/ELOOP, which would
+    // make a transiently unreadable file look missing.
+    let text = match fs::read_to_string(&path) {
+        Ok(t) => t,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(default_project_statuses());
+        }
+        Err(e) => return Err(Error::Io(e)),
+    };
     ProjectStatuses::from_yaml_str(&text).map_err(|e| annotate(&path, e))
 }
 
@@ -175,6 +181,8 @@ pub fn list_workflows(project: &str) -> Result<Vec<Workflow>> {
     let statuses = ProjectStatuses::from_yaml_str(&st_text).map_err(|e| annotate(&st_path, e))?;
 
     let mut out = Vec::new();
+    let mut seen_names: std::collections::HashMap<String, PathBuf> =
+        std::collections::HashMap::new();
     for raw in raw_files {
         let inline =
             Workflow::inline_identity_fields(&raw.text).map_err(|e| annotate(&raw.path, e))?;
@@ -184,6 +192,20 @@ pub fn list_workflows(project: &str) -> Result<Vec<Workflow>> {
         let (wf, diags) = Workflow::from_yaml_str_with_diagnostics(&raw.text)
             .map_err(|e| annotate(&raw.path, e))?;
         emit_deprecation_warnings_once(&raw.path, &diags);
+        // `load_workflow` resolves by *filename*, so a duplicated `name:`
+        // or a name/stem mismatch means a picker-visible name that fails
+        // to load with a raw NotFound. Reject the former, warn on the
+        // latter.
+        if let Some(prev) = seen_names.insert(wf.name.clone(), raw.path.clone()) {
+            return Err(Error::InvalidWorkflow(format!(
+                "workflow name `{}` is declared by both {} and {} — \
+                 workflow names must be unique within a project",
+                wf.name,
+                prev.display(),
+                raw.path.display(),
+            )));
+        }
+        warn_name_stem_mismatch_once(&raw.path, &wf.name);
         let resolved = wf
             .resolve_against(&statuses)
             .map_err(|e| annotate(&raw.path, e))?;
@@ -336,6 +358,37 @@ fn emit_deprecation_warnings_once(path: &Path, diags: &[String]) {
     for d in diags {
         tracing::warn!(workflow = %path.display(), "shelbi: {} — {d}", path.display());
     }
+}
+
+/// Process-local memo of workflow paths whose name/file-stem mismatch
+/// warning has already been emitted — same once-per-process dedupe as
+/// [`EMITTED_DEPRECATIONS`], so a polling TUI doesn't spam the log.
+static EMITTED_NAME_MISMATCHES: Mutex<Option<HashSet<PathBuf>>> = Mutex::new(None);
+
+/// Warn (once per path per process) when a workflow file's declared
+/// `name:` differs from its file stem. [`load_workflow`] resolves by
+/// filename, so the name shown in pickers wouldn't load.
+fn warn_name_stem_mismatch_once(path: &Path, declared: &str) {
+    let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or_default();
+    if stem == declared {
+        return;
+    }
+    let mut guard = match EMITTED_NAME_MISMATCHES.lock() {
+        Ok(g) => g,
+        Err(p) => p.into_inner(),
+    };
+    let seen = guard.get_or_insert_with(HashSet::new);
+    if !seen.insert(path.to_path_buf()) {
+        return;
+    }
+    drop(guard);
+    tracing::warn!(
+        workflow = %path.display(),
+        "shelbi: {} declares `name: {declared}` but workflows load by file stem \
+         (`{stem}`) — rename the file to `{declared}.yaml` or fix `name:` so the \
+         two agree",
+        path.display(),
+    );
 }
 
 /// Wrap a parse/validate error with the offending file's path so a
@@ -495,6 +548,85 @@ statuses:
         assert_eq!(out.len(), 2);
         assert_eq!(out[0].name, "default");
         assert_eq!(out[1].name, "design-review");
+        std::env::remove_var("SHELBI_HOME");
+    }
+
+    #[test]
+    fn list_workflows_rejects_duplicate_declared_names() {
+        let _g = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+        materialize_default_agents("p").unwrap();
+        write_default_statuses("p");
+        let dir = workflows_dir("p").unwrap();
+        // Two files, same declared `name:` — only one can win filename
+        // resolution, so the loader must refuse rather than let a
+        // picker-visible name fail to load.
+        write_workflow(&dir, "design-review", SIMPLE_WORKFLOW);
+        write_workflow(&dir, "design-review-copy", SIMPLE_WORKFLOW);
+        let err = list_workflows("p").unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("design-review"), "msg: {msg}");
+        assert!(msg.contains("design-review-copy.yaml"), "msg: {msg}");
+        assert!(msg.contains("unique"), "msg: {msg}");
+        std::env::remove_var("SHELBI_HOME");
+    }
+
+    #[test]
+    fn list_workflows_warns_once_when_name_differs_from_file_stem() {
+        let _g = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+        materialize_default_agents("p").unwrap();
+        write_default_statuses("p");
+        let dir = workflows_dir("p").unwrap();
+        // File stem `renamed` vs declared `name: design-review`.
+        write_workflow(&dir, "renamed", SIMPLE_WORKFLOW);
+        let out = list_workflows("p").unwrap();
+        assert_eq!(out.len(), 1);
+
+        let path = workflow_path("p", "renamed").unwrap();
+        let guard = EMITTED_NAME_MISMATCHES.lock().unwrap_or_else(|p| p.into_inner());
+        assert!(guard.as_ref().unwrap().contains(&path));
+        drop(guard);
+
+        // Second listing doesn't re-insert (dedupe holds).
+        let _ = list_workflows("p").unwrap();
+        let guard = EMITTED_NAME_MISMATCHES.lock().unwrap_or_else(|p| p.into_inner());
+        assert_eq!(
+            guard.as_ref().unwrap().iter().filter(|p| **p == path).count(),
+            1
+        );
+        drop(guard);
+        std::env::remove_var("SHELBI_HOME");
+    }
+
+    #[test]
+    fn list_workflows_does_not_warn_when_name_matches_file_stem() {
+        let _g = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+        materialize_default_agents("p").unwrap();
+        write_default_statuses("p");
+        let dir = workflows_dir("p").unwrap();
+        write_workflow(&dir, "design-review", SIMPLE_WORKFLOW);
+        let _ = list_workflows("p").unwrap();
+        let path = workflow_path("p", "design-review").unwrap();
+        let guard = EMITTED_NAME_MISMATCHES.lock().unwrap_or_else(|p| p.into_inner());
+        assert!(!guard.as_ref().map(|s| s.contains(&path)).unwrap_or(false));
+        drop(guard);
+        std::env::remove_var("SHELBI_HOME");
+    }
+
+    #[test]
+    fn load_project_statuses_propagates_non_notfound_read_errors() {
+        // F13: a directory squatting on statuses.yml (EISDIR) must be an
+        // error, not silently mapped to the shipped defaults.
+        let _g = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+        std::fs::create_dir_all(statuses_path("p").unwrap()).unwrap();
+        assert!(load_project_statuses("p").is_err());
         std::env::remove_var("SHELBI_HOME");
     }
 
