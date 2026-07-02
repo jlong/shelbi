@@ -833,11 +833,13 @@ mod tests {
                     name: "alpha".into(),
                     machine: "hub".into(),
                     runner: "claude".into(),
+                    role: Default::default(),
                 },
                 WorkspaceSpec {
                     name: "delta".into(),
                     machine: "devbox".into(),
                     runner: "claude".into(),
+                    role: Default::default(),
                 },
             ],
             workspace_poll_interval_secs: 5,
@@ -846,6 +848,7 @@ mod tests {
             zen: shelbi_core::ZenConfig::default(),
             heartbeat: shelbi_core::HeartbeatConfig::default(),
             git: shelbi_core::GitConfig::default(),
+            review: Default::default(),
             contextstore_sync: Vec::new(),
             detected_shapes: Vec::new(),
         }
@@ -1150,21 +1153,25 @@ mod tests {
                 name: "alpha".into(),
                 machine: "hub".into(),
                 runner: "claude".into(),
+                role: Default::default(),
             },
             shelbi_core::WorkspaceSpec {
                 name: "bravo".into(),
                 machine: "hub".into(),
                 runner: "claude".into(),
+                role: Default::default(),
             },
             shelbi_core::WorkspaceSpec {
                 name: "charlie".into(),
                 machine: "hub".into(),
                 runner: "claude".into(),
+                role: Default::default(),
             },
             shelbi_core::WorkspaceSpec {
                 name: "delta".into(),
                 machine: "devbox".into(),
                 runner: "claude".into(),
+                role: Default::default(),
             },
         ];
         shelbi_state::save_project(&project).unwrap();

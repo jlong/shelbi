@@ -215,6 +215,7 @@ mod tests {
             contextstore_sync: Vec::new(),
             detected_shapes: Vec::new(),
             git: GitConfig::default(),
+            review: Default::default(),
         }
     }
 
@@ -229,6 +230,7 @@ mod tests {
                 name: "alpha".into(),
                 machine: "hub".into(),
                 runner: "claude".into(),
+                role: Default::default(),
             }],
         );
         match resolve_target(&project, "alpha").unwrap() {
@@ -254,6 +256,7 @@ mod tests {
                 name: "delta".into(),
                 machine: "devbox".into(),
                 runner: "claude".into(),
+                role: Default::default(),
             }],
         );
         match resolve_target(&project, "delta").unwrap() {
@@ -279,11 +282,13 @@ mod tests {
                     name: "alpha".into(),
                     machine: "hub".into(),
                     runner: "claude".into(),
+                    role: Default::default(),
                 },
                 WorkspaceSpec {
                     name: "bravo".into(),
                     machine: "hub".into(),
                     runner: "claude".into(),
+                    role: Default::default(),
                 },
             ],
         );

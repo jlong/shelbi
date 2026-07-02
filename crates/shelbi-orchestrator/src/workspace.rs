@@ -1807,11 +1807,13 @@ mod tests {
                     name: "alice".into(),
                     machine: "hub".into(),
                     runner: "claude".into(),
+                    role: Default::default(),
                 },
                 WorkspaceSpec {
                     name: "bob".into(),
                     machine: "m2".into(),
                     runner: "claude".into(),
+                    role: Default::default(),
                 },
             ],
             workspace_poll_interval_secs: 5,
@@ -1820,6 +1822,7 @@ mod tests {
             zen: shelbi_core::ZenConfig::default(),
             heartbeat: shelbi_core::HeartbeatConfig::default(),
             git: shelbi_core::GitConfig::default(),
+            review: Default::default(),
             contextstore_sync: Vec::new(),
             detected_shapes: Vec::new(),
         }
@@ -3425,8 +3428,8 @@ mod sync_worktree_git_tests {
             editor: None,
             github_url: None,
             workspaces: vec![
-                WorkspaceSpec { name: "alice".into(), machine: "hub".into(), runner: "claude".into() },
-                WorkspaceSpec { name: "bob".into(), machine: "hub".into(), runner: "claude".into() },
+                WorkspaceSpec { name: "alice".into(), machine: "hub".into(), runner: "claude".into(), role: Default::default() },
+                WorkspaceSpec { name: "bob".into(), machine: "hub".into(), runner: "claude".into(), role: Default::default() },
             ],
             workspace_poll_interval_secs: 5,
             workspace_permissions_mode: "auto".into(),
@@ -3434,6 +3437,7 @@ mod sync_worktree_git_tests {
             zen: shelbi_core::ZenConfig::default(),
             heartbeat: shelbi_core::HeartbeatConfig::default(),
             git: shelbi_core::GitConfig::default(),
+            review: Default::default(),
             contextstore_sync: Vec::new(),
             detected_shapes: Vec::new(),
         }
@@ -3649,6 +3653,7 @@ mod sync_worktree_freshcut_tests {
             zen: shelbi_core::ZenConfig::default(),
             heartbeat: shelbi_core::HeartbeatConfig::default(),
             git: shelbi_core::GitConfig::default(),
+            review: Default::default(),
             contextstore_sync: Vec::new(),
             detected_shapes: Vec::new(),
         }
@@ -3915,6 +3920,7 @@ mod sync_worktree_freshcut_tests {
                 name: "alice".into(),
                 machine: "hub".into(),
                 runner: "claude".into(),
+                role: Default::default(),
             }],
             workspace_poll_interval_secs: 5,
             // NOT "auto": keeps `require_auto_mode_supported` from probing
@@ -3924,6 +3930,7 @@ mod sync_worktree_freshcut_tests {
             zen: shelbi_core::ZenConfig::default(),
             heartbeat: shelbi_core::HeartbeatConfig::default(),
             git: shelbi_core::GitConfig::default(),
+            review: Default::default(),
             contextstore_sync: Vec::new(),
             detected_shapes: Vec::new(),
         };

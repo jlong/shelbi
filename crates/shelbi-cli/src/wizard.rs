@@ -264,6 +264,7 @@ pub fn setup_one_project() -> Result<()> {
         zen: shelbi_core::ZenConfig::default(),
         heartbeat: shelbi_core::HeartbeatConfig::default(),
         git: shelbi_core::GitConfig::default(),
+        review: Default::default(),
         contextstore_sync: Vec::new(),
         detected_shapes: Vec::new(),
     };
@@ -461,6 +462,7 @@ fn assign_workspace_names(
                 name,
                 machine: machine.name.clone(),
                 runner: Runner::Claude.id().to_string(),
+                role: Default::default(),
             });
         }
     }

@@ -1382,6 +1382,7 @@ mod tests {
                 name: workspace.into(),
                 machine: "hub".into(),
                 runner: "claude".into(),
+                role: Default::default(),
             }],
             workspace_poll_interval_secs: 5,
             workspace_permissions_mode: "auto".into(),
@@ -1391,6 +1392,7 @@ mod tests {
             contextstore_sync: Vec::new(),
             detected_shapes: Vec::new(),
             git: shelbi_core::GitConfig::default(),
+            review: Default::default(),
         }
     }
 
@@ -1436,6 +1438,7 @@ mod tests {
                 name: "never-spawned".into(),
                 machine: "hub".into(),
                 runner: "claude".into(),
+                role: Default::default(),
             }],
             workspace_poll_interval_secs: 5,
             workspace_permissions_mode: "auto".into(),
@@ -1445,6 +1448,7 @@ mod tests {
             contextstore_sync: Vec::new(),
             detected_shapes: Vec::new(),
             git: shelbi_core::GitConfig::default(),
+            review: Default::default(),
         };
         assert!(workspace_holding_branch(&project, "feature").unwrap().is_none());
     }
@@ -1510,6 +1514,7 @@ mod tests {
             contextstore_sync: Vec::new(),
             detected_shapes: Vec::new(),
             git: shelbi_core::GitConfig::default(),
+            review: Default::default(),
         };
         let out = delete_branch(&project, &task_on_branch("t", "feature")).unwrap();
         assert!(matches!(out, DeleteOutcome::NotPresent), "{out:?}");
@@ -1572,6 +1577,7 @@ mod tests {
             contextstore_sync: Vec::new(),
             detected_shapes: Vec::new(),
             git: shelbi_core::GitConfig::default(),
+            review: Default::default(),
         };
 
         let wt = local.to_string_lossy().into_owned();
@@ -1812,6 +1818,7 @@ mod tests {
                 base_branch: None,
                 merge_strategy: strategy,
             },
+            review: Default::default(),
         }
     }
 
