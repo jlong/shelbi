@@ -88,14 +88,15 @@ const COLUMNS: Column[] = [
     label: "BACKLOG",
     category: "gray",
     cards: [
+      // Capped at 5 so BACKLOG stays within a card of the other
+      // columns — the tallest column sets the window height, and a
+      // deep backlog leaves the rest of the board trailing empty
+      // space at the bottom.
       { title: "Rework onboarding copy", id: "t-004" },
       { title: "Audit third-party licenses", id: "t-005" },
       { title: "Draft Q3 roadmap", id: "t-006" },
       { title: "Migrate CI to arm64", id: "t-014" },
       { title: "Sunset legacy /v1 API", id: "t-020" },
-      { title: "Rotate signing keys", id: "t-023" },
-      { title: "Add SBOM to release", id: "t-025" },
-      { title: "Bump Node runtime to 22", id: "t-028" },
     ],
   },
   {
@@ -549,7 +550,10 @@ function Sidebar() {
       className="m-0 hidden whitespace-pre border-r py-3 font-mono md:block"
       style={{
         ...PRE_STYLE,
-        borderColor: CHROME_BAR_BORDER,
+        // CHROME_BAR_BORDER is darker than the terminal body, so against
+        // TUI_BG it disappears — the bar bg tone is the one that reads as
+        // a line here.
+        borderColor: CHROME_BAR_BG,
       }}
     >
       {rows.map((row, i) => (
@@ -580,7 +584,10 @@ function TrafficLight({ color }: { color: string }) {
 export function KanbanMockup() {
   return (
     <section className="border-b border-gray-4 px-3 py-6 sm:py-10">
-      <div className="mx-auto w-full max-w-6xl">
+      {/* w-fit hugs the board's natural width; max-w-full keeps the
+          inner overflow-x-auto in charge on viewports narrower than
+          the board. */}
+      <div className="mx-auto w-fit max-w-full">
         <div
           className="overflow-hidden rounded-lg shadow-2xl"
           style={{ boxShadow: "0 24px 48px rgba(0,0,0,0.35), 0 0 0 1px rgba(0,0,0,0.4)" }}
