@@ -22,7 +22,7 @@
 //! `projects.shelbi.sidebar.nav_up: [w]` over a `defaults.sidebar.nav_up:
 //! [k, up]` yields `[w]`, not `[k, up, w]`.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::hash::Hash;
 use std::path::Path;
@@ -180,6 +180,11 @@ pub enum WarningKind {
     /// reset to its default. Emitted once on the migrating startup; the
     /// next load sees the legacy field at its default and stays silent.
     LegacyZenToggleMigrated,
+    /// A chord bound in a mode that consults `global` first (sidebar,
+    /// kanban, review, activity) also matches a global binding, so the
+    /// per-mode binding can never fire — global dispatch wins. Emitted
+    /// only when a user override introduced the shadow (F12).
+    ShadowedByGlobal,
 }
 
 impl KeymapDiagnostic {
@@ -202,8 +207,14 @@ impl KeymapDiagnostic {
 // ---------------------------------------------------------------------------
 // On-disk schema (lenient — every field optional, scalar shorthand allowed).
 
-/// `mode -> action -> chords` — one layer of the merge.
-type ModeMap = HashMap<String, HashMap<String, ChordSpec>>;
+/// `mode -> action -> raw value` — one layer of the merge.
+///
+/// The leaf is an untyped [`Value`] rather than a typed `ChordSpec` so a
+/// single mistyped scalar (`nav_up: 5`, `zen_toggle: true`) fails only
+/// that one entry — with a located diagnostic — instead of poisoning the
+/// whole-file deserialize and reverting every override (F13). The
+/// value → chord conversion happens per entry in [`value_to_chords`].
+type ModeMap = HashMap<String, HashMap<String, Value>>;
 
 /// Top-level structure of `keys.yml`. Both blocks are optional so a file
 /// with just `defaults` or just `projects` still parses.
@@ -215,28 +226,53 @@ struct KeysFile {
     projects: Option<HashMap<String, ModeMap>>,
 }
 
-/// One action's chord override. The on-disk form can be:
+/// Convert one raw `keys.yml` value into a chord override. The on-disk
+/// form can be:
 ///
-/// - a scalar string (`alt-z`) → single chord
-/// - a list (`[k, up]`) → multiple chords for the same action
-/// - YAML null → fall back to the layer below (no override)
-#[derive(Debug, Deserialize)]
-#[serde(untagged)]
-enum ChordSpec {
-    None,
-    One(String),
-    Many(Vec<String>),
+/// - YAML null → `Ok(None)`: fall back to the layer below (no override).
+/// - a scalar string (`alt-z`) → one chord.
+/// - a list (`[k, up]`) → several chords for the same action; an empty
+///   list is a deliberate unbind (`Ok(Some(vec![]))`).
+/// - anything else (a number, bool, mapping, or a non-string list item) →
+///   `Err(message)`, so the caller can emit a located diagnostic for just
+///   this entry instead of failing the whole file (F13).
+fn value_to_chords(value: &Value) -> Result<Option<Vec<String>>, String> {
+    match value {
+        Value::Null => Ok(None),
+        Value::String(s) => Ok(Some(vec![s.clone()])),
+        Value::Sequence(seq) => {
+            let mut out = Vec::with_capacity(seq.len());
+            for item in seq {
+                match item {
+                    Value::String(s) => out.push(s.clone()),
+                    other => {
+                        return Err(format!(
+                            "expected a chord string in the list, found {}",
+                            value_type_name(other)
+                        ));
+                    }
+                }
+            }
+            Ok(Some(out))
+        }
+        other => Err(format!(
+            "expected a chord string or a list of chord strings, found {}",
+            value_type_name(other)
+        )),
+    }
 }
 
-impl ChordSpec {
-    /// `None` for "fall through to the lower layer", `Some(vec)` for an
-    /// explicit override (which may be empty — meaning "unbind").
-    fn to_chords(&self) -> Option<Vec<String>> {
-        match self {
-            ChordSpec::None => None,
-            ChordSpec::One(s) => Some(vec![s.clone()]),
-            ChordSpec::Many(v) => Some(v.clone()),
-        }
+/// Human-readable name for a `serde_yaml::Value` variant, used in the
+/// mistyped-entry diagnostics from [`value_to_chords`].
+fn value_type_name(v: &Value) -> &'static str {
+    match v {
+        Value::Null => "null",
+        Value::Bool(_) => "a boolean",
+        Value::Number(_) => "a number",
+        Value::String(_) => "a string",
+        Value::Sequence(_) => "a list",
+        Value::Mapping(_) => "a mapping",
+        Value::Tagged(_) => "a tagged value",
     }
 }
 
@@ -336,6 +372,10 @@ pub fn load_keymaps(project_name: Option<&str>) -> (Keymaps, Vec<KeymapDiagnosti
         let mut ok = Vec::with_capacity(chords.len());
         for raw in chords {
             match KeyChord::parse(raw) {
+                // F10: dedupe within one action's list so `[k, up, k]`
+                // doesn't self-collide (two occurrences of the same chord
+                // for the *same* action isn't a real collision).
+                Ok(c) if ok.contains(&c) => {}
                 Ok(c) => ok.push(c),
                 Err(e) => {
                     let location = Some(format!("{}.{}", action.mode(), action.key_name()));
@@ -347,9 +387,14 @@ pub fn load_keymaps(project_name: Option<&str>) -> (Keymaps, Vec<KeymapDiagnosti
                 }
             }
         }
-        if ok.is_empty() {
-            // All overrides failed — fall back to built-ins. Built-ins
-            // are author-controlled, so this can't fail in production.
+        // F3: distinguish "explicit unbind" from "everything failed to
+        // parse". An empty on-disk list (`action: []`) is a deliberate
+        // unbind and stays empty. A non-empty list that produced no valid
+        // chords means every entry was a typo — fall back to built-ins so
+        // the action isn't left dead by accident (the per-chord
+        // ParseError diagnostics above are the signal distinguishing the
+        // two: a real unbind emits none).
+        if ok.is_empty() && !chords.is_empty() {
             ok = action
                 .default_chords()
                 .iter()
@@ -359,42 +404,70 @@ pub fn load_keymaps(project_name: Option<&str>) -> (Keymaps, Vec<KeymapDiagnosti
         parsed.insert(*action, ok);
     }
 
-    // Collision detection per mode. Two actions in the same mode bound
-    // to the same chord → revert both to their defaults and emit an Error.
+    // Collision detection per mode. Two *different* actions in the same
+    // mode bound to the same chord → revert both to their defaults and
+    // emit an Error.
+    //
+    // F4: reverting a colliding action to its defaults can itself create a
+    // fresh collision (the reverted default now equal to a third action's
+    // surviving override). A single pass would miss that, and because
+    // `build_keymaps` used to iterate a HashMap the survivor was picked by
+    // random order. So iterate to a fixed point: keep re-scanning until a
+    // full pass reverts nothing. Each revert strictly moves an action from
+    // an override to its (fixed) built-in default, so this converges in at
+    // most one revert per action. `reported` dedupes the diagnostic per
+    // (mode, chord) so an unresolvable defaults-level clash is surfaced
+    // once rather than every pass.
     let modes = ["global", "sidebar", "kanban", "popover", "review", "activity", "palette"];
-    for mode in modes {
-        let mut by_chord: HashMap<KeyChord, Vec<Action>> = HashMap::new();
-        for (action, chords) in &parsed {
-            if action.mode() != mode {
-                continue;
+    let mut reported: HashSet<(String, String)> = HashSet::new();
+    loop {
+        let mut changed = false;
+        for mode in modes {
+            let mut by_chord: HashMap<KeyChord, Vec<Action>> = HashMap::new();
+            for (action, chords) in &parsed {
+                if action.mode() != mode {
+                    continue;
+                }
+                for c in chords {
+                    by_chord.entry(*c).or_default().push(*action);
+                }
             }
-            for c in chords {
-                by_chord.entry(*c).or_default().push(*action);
+            for (chord, actions) in by_chord {
+                if actions.len() < 2 {
+                    continue;
+                }
+                if reported.insert((mode.to_string(), chord.canonical())) {
+                    // Sort so the message is deterministic regardless of
+                    // HashMap iteration order.
+                    let mut names: Vec<String> =
+                        actions.iter().map(|a| a.key_name().to_string()).collect();
+                    names.sort();
+                    diags.push(KeymapDiagnostic::err(
+                        ErrorKind::Collision,
+                        format!(
+                            "chord `{}` is bound to multiple actions ({}) in `{mode}`; \
+                             reverting them to defaults",
+                            chord.canonical(),
+                            names.join(", ")
+                        ),
+                        Some(mode.to_string()),
+                    ));
+                }
+                for a in &actions {
+                    let defaults: Vec<KeyChord> = a
+                        .default_chords()
+                        .iter()
+                        .filter_map(|s| KeyChord::parse(s).ok())
+                        .collect();
+                    if parsed.get(a) != Some(&defaults) {
+                        parsed.insert(*a, defaults);
+                        changed = true;
+                    }
+                }
             }
         }
-        for (chord, actions) in by_chord {
-            if actions.len() < 2 {
-                continue;
-            }
-            let names: Vec<String> = actions.iter().map(|a| a.key_name().to_string()).collect();
-            diags.push(KeymapDiagnostic::err(
-                ErrorKind::Collision,
-                format!(
-                    "chord `{}` is bound to multiple actions ({}) in `{mode}`; \
-                     reverting them to defaults",
-                    chord.canonical(),
-                    names.join(", ")
-                ),
-                Some(mode.to_string()),
-            ));
-            for a in &actions {
-                let defaults: Vec<KeyChord> = a
-                    .default_chords()
-                    .iter()
-                    .filter_map(|s| KeyChord::parse(s).ok())
-                    .collect();
-                parsed.insert(*a, defaults);
-            }
+        if !changed {
+            break;
         }
     }
 
@@ -415,6 +488,40 @@ pub fn load_keymaps(project_name: Option<&str>) -> (Keymaps, Vec<KeymapDiagnosti
                 Some("defaults.global.quit".into()),
             ));
         }
+    }
+
+    // F12: a chord bound in a mode that consults `global` first is dead if
+    // it also matches a global binding — global dispatch wins before the
+    // per-mode lookup runs. (Popover and palette are modal and skip global
+    // entirely, so they're exempt.) Warn, same shape as the reserved-chord
+    // warning above.
+    //
+    // Subtract the shadows already present in the pure-default baseline:
+    // the built-in `sidebar.quit` deliberately shares `ctrl-c` with
+    // `global.quit`, and that overlap is benign (both quit). Reporting only
+    // shadows the *user* introduced keeps a fresh install — and a
+    // full-config dump/round-trip — silent while still flagging a genuine
+    // dead binding like `sidebar.refresh: ctrl-p`.
+    let baseline_shadows = global_shadows(&default_keymap_chords());
+    for (action, chord, global_action) in global_shadows(&parsed) {
+        if baseline_shadows
+            .iter()
+            .any(|(a, c, _)| *a == action && *c == chord)
+        {
+            continue;
+        }
+        diags.push(KeymapDiagnostic::warn(
+            WarningKind::ShadowedByGlobal,
+            format!(
+                "chord `{}` for `{}.{}` is also bound to global `{}`; the \
+                 global binding fires first, so this per-mode binding is dead",
+                chord.canonical(),
+                action.mode(),
+                action.key_name(),
+                global_action.key_name(),
+            ),
+            Some(format!("{}.{}", action.mode(), action.key_name())),
+        ));
     }
 
     let keymaps = build_keymaps(&parsed);
@@ -442,7 +549,7 @@ fn apply_overrides(
             ));
             continue;
         }
-        for (key_name, spec) in entries {
+        for (key_name, value) in entries {
             let Some(action) = actions_in_mode.iter().find(|a| a.key_name() == key_name) else {
                 diags.push(KeymapDiagnostic::err(
                     ErrorKind::UnknownAction,
@@ -451,13 +558,23 @@ fn apply_overrides(
                 ));
                 continue;
             };
-            match spec.to_chords() {
-                Some(list) => {
+            match value_to_chords(value) {
+                Ok(Some(list)) => {
                     staged.insert(*action, list);
                 }
-                None => {
+                Ok(None) => {
                     // Explicit YAML null — fall back to the layer below.
                     // No-op for staged; nothing to insert.
+                }
+                Err(msg) => {
+                    // F13: a single mistyped entry (`nav_up: 5`,
+                    // `zen_toggle: true`) is reported here and skipped;
+                    // every other override in the file still applies.
+                    diags.push(KeymapDiagnostic::err(
+                        ErrorKind::ParseError,
+                        format!("invalid override `{mode_name}.{key_name}`: {msg}"),
+                        Some(format!("{scope}.{mode_name}.{key_name}")),
+                    ));
                 }
             }
         }
@@ -466,8 +583,16 @@ fn apply_overrides(
 
 fn build_keymaps(parsed: &HashMap<Action, Vec<KeyChord>>) -> Keymaps {
     let mut km = Keymaps::default();
-    for (action, chords) in parsed {
-        match *action {
+    // Iterate in `Action::all()` order rather than the HashMap's random
+    // order so that, should any residual same-mode conflict survive the
+    // collision pass, the chord binds to the same action on every load
+    // (combined with `insert_into`'s refuse-to-overwrite guard). No
+    // HashMap-iteration-order-dependent bindings.
+    for action in Action::all() {
+        let Some(chords) = parsed.get(&action) else {
+            continue;
+        };
+        match action {
             Action::Global(a) => insert_into(&mut km.global, a, chords),
             Action::Sidebar(a) => insert_into(&mut km.sidebar, a, chords),
             Action::Kanban(a) => insert_into(&mut km.kanban, a, chords),
@@ -486,9 +611,69 @@ fn insert_into<A: Copy + Eq + Hash>(
     chords: &[KeyChord],
 ) {
     for c in chords {
-        map.bindings.insert(*c, action);
+        match map.bindings.get(c) {
+            // Another action already claimed this chord. The collision
+            // pass should have prevented this, but refuse to clobber so a
+            // residual conflict resolves deterministically (first action
+            // in `Action::all()` order wins) rather than by HashMap order.
+            Some(existing) if *existing != action => continue,
+            _ => {
+                map.bindings.insert(*c, action);
+            }
+        }
     }
     map.by_action.insert(action, chords.to_vec());
+}
+
+/// Modes whose key handlers consult `global` before their own bindings, so
+/// a chord shared with a global binding never reaches the mode. Popover and
+/// palette are modal and skip `global`, so they're deliberately excluded.
+const GLOBAL_CONSULTING_MODES: &[&str] = &["sidebar", "kanban", "review", "activity"];
+
+/// Every action's built-in chord list, parsed. The baseline the F12 shadow
+/// check subtracts so intentional default overlaps (e.g. `sidebar.quit`
+/// sharing `ctrl-c` with `global.quit`) don't warn.
+fn default_keymap_chords() -> HashMap<Action, Vec<KeyChord>> {
+    let mut map = HashMap::new();
+    for action in Action::all() {
+        let chords: Vec<KeyChord> = action
+            .default_chords()
+            .iter()
+            .filter_map(|s| KeyChord::parse(s).ok())
+            .collect();
+        map.insert(action, chords);
+    }
+    map
+}
+
+/// Find `(mode_action, chord, global_action)` triples where a chord bound
+/// in a global-consulting mode also matches a `global` binding — i.e. dead
+/// bindings shadowed by global dispatch. Iterates in `Action::all()` order
+/// for a stable diagnostic sequence.
+fn global_shadows(chords: &HashMap<Action, Vec<KeyChord>>) -> Vec<(Action, KeyChord, Action)> {
+    let mut global_chords: HashMap<KeyChord, Action> = HashMap::new();
+    for (action, cs) in chords {
+        if action.mode() == "global" {
+            for c in cs {
+                global_chords.insert(*c, *action);
+            }
+        }
+    }
+    let mut out = Vec::new();
+    for action in Action::all() {
+        if !GLOBAL_CONSULTING_MODES.contains(&action.mode()) {
+            continue;
+        }
+        let Some(cs) = chords.get(&action) else {
+            continue;
+        };
+        for c in cs {
+            if let Some(global_action) = global_chords.get(c) {
+                out.push((action, *c, *global_action));
+            }
+        }
+    }
+    out
 }
 
 /// Read `~/.shelbi/keys.yml` if it exists. Parse errors get reported as
@@ -1328,6 +1513,328 @@ projects:
         assert_eq!(
             km.kanban.dispatch(KeyEvent::new(KeyCode::Char('J'), KeyModifiers::NONE)),
             Some(KanbanAction::ReorderDown)
+        );
+        std::env::remove_var("SHELBI_HOME");
+    }
+
+    #[test]
+    fn empty_list_unbinds_without_reverting_to_default() {
+        // F3: `action: []` is a deliberate unbind. It must NOT fall back to
+        // the built-in chords, and it must emit no diagnostic (the empty
+        // list is intentional, not a failed parse).
+        let _g = LOCK.lock().unwrap();
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+        ensure_dir(&home).unwrap();
+        std::fs::write(
+            home.join("keys.yml"),
+            "defaults:\n  sidebar:\n    nav_up: []\n",
+        )
+        .unwrap();
+
+        let (km, diags) = load_keymaps(None);
+        assert!(diags.is_empty(), "unbind should be silent, got {diags:?}");
+        // Both former defaults are gone — nav_up is unbound.
+        assert_eq!(
+            km.sidebar.dispatch(KeyEvent::new(KeyCode::Char('k'), KeyModifiers::NONE)),
+            None
+        );
+        assert_eq!(
+            km.sidebar.dispatch(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE)),
+            None
+        );
+        assert!(km.sidebar.first_chord_for(SidebarAction::NavUp).is_none());
+        // A sibling action still keeps its default.
+        assert_eq!(
+            km.sidebar.dispatch(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE)),
+            Some(SidebarAction::NavDown)
+        );
+        std::env::remove_var("SHELBI_HOME");
+    }
+
+    #[test]
+    fn all_chords_failing_to_parse_reverts_to_default_with_diagnostic() {
+        // F3: the other side of the coin — a non-empty list where every
+        // entry is a typo falls back to built-ins (so the action isn't left
+        // dead), and emits a ParseError distinguishing it from an unbind.
+        let _g = LOCK.lock().unwrap();
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+        ensure_dir(&home).unwrap();
+        std::fs::write(
+            home.join("keys.yml"),
+            "defaults:\n  sidebar:\n    nav_up: [Up, gg]\n",
+        )
+        .unwrap();
+
+        let (km, diags) = load_keymaps(None);
+        assert!(
+            diags.iter().any(|d| matches!(
+                d,
+                KeymapDiagnostic::Error { kind: ErrorKind::ParseError, .. }
+            )),
+            "expected ParseError, got {diags:?}"
+        );
+        // Fell back to the built-in `k` / `up`.
+        assert_eq!(
+            km.sidebar.dispatch(KeyEvent::new(KeyCode::Char('k'), KeyModifiers::NONE)),
+            Some(SidebarAction::NavUp)
+        );
+        assert_eq!(
+            km.sidebar.dispatch(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE)),
+            Some(SidebarAction::NavUp)
+        );
+        std::env::remove_var("SHELBI_HOME");
+    }
+
+    #[test]
+    fn duplicate_chord_in_one_list_does_not_self_collide() {
+        // F10: `[k, up, k]` names the same chord twice for one action. That
+        // is a dedupe case, not a collision — no Collision diagnostic, and
+        // the override sticks (isn't discarded back to defaults).
+        let _g = LOCK.lock().unwrap();
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+        ensure_dir(&home).unwrap();
+        std::fs::write(
+            home.join("keys.yml"),
+            "defaults:\n  sidebar:\n    nav_up: [k, up, k]\n",
+        )
+        .unwrap();
+
+        let (km, diags) = load_keymaps(None);
+        assert!(
+            !diags.iter().any(|d| matches!(
+                d,
+                KeymapDiagnostic::Error { kind: ErrorKind::Collision, .. }
+            )),
+            "duplicate chord in one list must not self-collide, got {diags:?}"
+        );
+        assert_eq!(
+            km.sidebar.dispatch(KeyEvent::new(KeyCode::Char('k'), KeyModifiers::NONE)),
+            Some(SidebarAction::NavUp)
+        );
+        assert_eq!(
+            km.sidebar.dispatch(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE)),
+            Some(SidebarAction::NavUp)
+        );
+        // The reverse index is deduped too.
+        assert_eq!(km.sidebar.chords_for(SidebarAction::NavUp).len(), 2);
+        std::env::remove_var("SHELBI_HOME");
+    }
+
+    #[test]
+    fn mistyped_scalar_affects_only_that_entry_not_whole_file() {
+        // F13: a wrong-typed scalar (`nav_up: 5`) used to fail the whole
+        // KeysFile deserialize and revert every override. Now it's a
+        // per-entry located diagnostic; sibling overrides still apply.
+        let _g = LOCK.lock().unwrap();
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+        ensure_dir(&home).unwrap();
+        std::fs::write(
+            home.join("keys.yml"),
+            "\
+defaults:
+  sidebar:
+    nav_up: 5
+    nav_down: s
+  global:
+    zen_toggle: true
+",
+        )
+        .unwrap();
+
+        let (km, diags) = load_keymaps(None);
+        // The two bad entries are reported…
+        let parse_errs = diags
+            .iter()
+            .filter(|d| matches!(
+                d,
+                KeymapDiagnostic::Error { kind: ErrorKind::ParseError, .. }
+            ))
+            .count();
+        assert_eq!(parse_errs, 2, "expected two per-entry errors, got {diags:?}");
+        // …the bad entries revert to their defaults…
+        assert_eq!(
+            km.sidebar.dispatch(KeyEvent::new(KeyCode::Char('k'), KeyModifiers::NONE)),
+            Some(SidebarAction::NavUp)
+        );
+        assert_eq!(
+            km.global.dispatch(KeyEvent::new(KeyCode::Char('z'), KeyModifiers::ALT)),
+            Some(GlobalAction::ZenToggle)
+        );
+        // …and the sibling override on the same file still took effect.
+        assert_eq!(
+            km.sidebar.dispatch(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::NONE)),
+            Some(SidebarAction::NavDown)
+        );
+        std::env::remove_var("SHELBI_HOME");
+    }
+
+    #[test]
+    fn mistyped_list_item_reports_and_skips_that_entry() {
+        // F13: a non-string item inside the list is also a per-entry error.
+        let _g = LOCK.lock().unwrap();
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+        ensure_dir(&home).unwrap();
+        std::fs::write(
+            home.join("keys.yml"),
+            "defaults:\n  sidebar:\n    nav_up: [w, 3]\n",
+        )
+        .unwrap();
+        let (km, diags) = load_keymaps(None);
+        assert!(
+            diags.iter().any(|d| matches!(
+                d,
+                KeymapDiagnostic::Error { kind: ErrorKind::ParseError, .. }
+            )),
+            "expected ParseError, got {diags:?}"
+        );
+        // Whole entry skipped → reverts to default (not partially applied).
+        assert_eq!(
+            km.sidebar.dispatch(KeyEvent::new(KeyCode::Char('k'), KeyModifiers::NONE)),
+            Some(SidebarAction::NavUp)
+        );
+        std::env::remove_var("SHELBI_HOME");
+    }
+
+    #[test]
+    fn cascading_collision_revert_converges_deterministically() {
+        // F4: nav_up and nav_down both override to `x` (collide → both
+        // revert to defaults). nav_down's default is `j`/`down`; a third
+        // action, activate, is overridden to `j` — which now collides with
+        // the reverted nav_down default. A single pass would miss it and
+        // `j` would bind to whichever action HashMap iteration reached
+        // last. The fixed-point loop must revert activate too and land on a
+        // stable result every load.
+        let _g = LOCK.lock().unwrap();
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+        ensure_dir(&home).unwrap();
+        std::fs::write(
+            home.join("keys.yml"),
+            "\
+defaults:
+  sidebar:
+    nav_up: x
+    nav_down: x
+    activate: j
+",
+        )
+        .unwrap();
+
+        // Load repeatedly; the resolved binding for `j` must be identical
+        // every time (no HashMap-order dependence).
+        let mut seen = None;
+        for _ in 0..20 {
+            let (km, _diags) = load_keymaps(None);
+            let j = km
+                .sidebar
+                .dispatch(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE));
+            match seen {
+                None => seen = Some(j),
+                Some(prev) => assert_eq!(prev, j, "binding for `j` is nondeterministic"),
+            }
+        }
+        // After both collision rounds, nav_down and activate are back at
+        // their defaults, so `j` maps to nav_down (activate's default is
+        // enter/space).
+        let (km, diags) = load_keymaps(None);
+        assert_eq!(
+            km.sidebar.dispatch(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE)),
+            Some(SidebarAction::NavDown)
+        );
+        assert_eq!(
+            km.sidebar.dispatch(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            Some(SidebarAction::Activate)
+        );
+        // `x` is unbound (both original colliders reverted away from it).
+        assert_eq!(
+            km.sidebar.dispatch(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE)),
+            None
+        );
+        // Two distinct collisions were reported (x, and j).
+        let collisions = diags
+            .iter()
+            .filter(|d| matches!(
+                d,
+                KeymapDiagnostic::Error { kind: ErrorKind::Collision, .. }
+            ))
+            .count();
+        assert_eq!(collisions, 2, "expected two collision reports, got {diags:?}");
+        std::env::remove_var("SHELBI_HOME");
+    }
+
+    #[test]
+    fn mode_chord_shadowed_by_global_warns() {
+        // F12: sidebar consults `global` first, so binding `sidebar.refresh`
+        // to `ctrl-p` (global.open_palette) makes the sidebar binding dead.
+        // Warn.
+        let _g = LOCK.lock().unwrap();
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+        ensure_dir(&home).unwrap();
+        std::fs::write(
+            home.join("keys.yml"),
+            "defaults:\n  sidebar:\n    refresh: ctrl-p\n",
+        )
+        .unwrap();
+
+        let (_km, diags) = load_keymaps(None);
+        assert!(
+            diags.iter().any(|d| matches!(
+                d,
+                KeymapDiagnostic::Warning { kind: WarningKind::ShadowedByGlobal, .. }
+            )),
+            "expected ShadowedByGlobal warning, got {diags:?}"
+        );
+        std::env::remove_var("SHELBI_HOME");
+    }
+
+    #[test]
+    fn modal_mode_chord_matching_global_does_not_warn() {
+        // F12: popover and palette are modal — they never consult `global`,
+        // so a chord they share with a global binding is NOT dead and must
+        // not warn. palette.close defaults already include `ctrl-p`; make
+        // the overlap explicit via an override to exercise the gate.
+        let _g = LOCK.lock().unwrap();
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+        ensure_dir(&home).unwrap();
+        std::fs::write(
+            home.join("keys.yml"),
+            "defaults:\n  palette:\n    activate: ctrl-p\n",
+        )
+        .unwrap();
+
+        let (_km, diags) = load_keymaps(None);
+        assert!(
+            !diags.iter().any(|d| matches!(
+                d,
+                KeymapDiagnostic::Warning { kind: WarningKind::ShadowedByGlobal, .. }
+            )),
+            "modal mode must not warn on global overlap, got {diags:?}"
+        );
+        std::env::remove_var("SHELBI_HOME");
+    }
+
+    #[test]
+    fn default_config_does_not_warn_on_shared_ctrl_c() {
+        // F12 gate: the built-in `sidebar.quit` deliberately shares
+        // `ctrl-c` with `global.quit`. An untouched config must stay silent
+        // — the warning only fires for user-introduced shadows.
+        let _g = LOCK.lock().unwrap();
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+        let (_km, diags) = load_keymaps(None);
+        assert!(
+            !diags.iter().any(|d| matches!(
+                d,
+                KeymapDiagnostic::Warning { kind: WarningKind::ShadowedByGlobal, .. }
+            )),
+            "default config must not warn on shared ctrl-c, got {diags:?}"
         );
         std::env::remove_var("SHELBI_HOME");
     }
