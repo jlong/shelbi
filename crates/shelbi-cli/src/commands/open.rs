@@ -85,7 +85,10 @@ fn focus_or_create(
     host: &Host,
 ) -> Result<()> {
     let project_session = format!("shelbi-{}", project.name);
-    let target = format!("{project_session}:{}", workspace.name);
+    // `=` anchors the window-name half so tmux matches it EXACTLY rather
+    // than by prefix: without it, `shelbi open web` would resolve (and
+    // focus) an existing `web-api` window and never create `web`.
+    let target = format!("{project_session}:={}", workspace.name);
 
     // A window in the project session — either a local workspace pane or
     // a remote proxy we created on an earlier open. Either way, focus
@@ -98,8 +101,13 @@ fn focus_or_create(
         Host::Local => {
             let shelbi_bin = current_exe_string()?;
             let pane_cmd = pane::wrapper_invocation(&shelbi_bin, &project.name, &workspace.name);
+            // `-S`: if a window with this name already raced into existence
+            // between the select-window check above and here, select it
+            // instead of creating a duplicate pane (and a duplicate agent)
+            // on the same worktree. Closes the TOCTOU two rapid opens hit.
             if !run_local_tmux([
                 "new-window",
+                "-S",
                 "-t",
                 &format!("{project_session}:"),
                 "-n",
@@ -129,8 +137,11 @@ fn focus_or_create(
                 host = shelbi_agent::shell_escape(ssh_host),
                 remote_session = shelbi_agent::shell_escape(&remote_session),
             );
+            // `-S`: same duplicate-guard as the local arm — select an
+            // existing proxy window rather than stacking a second one.
             if !run_local_tmux([
                 "new-window",
+                "-S",
                 "-t",
                 &format!("{project_session}:"),
                 "-n",
