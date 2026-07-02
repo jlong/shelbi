@@ -100,6 +100,119 @@ pub fn is_no_required_checks_message(stdout: &str, stderr: &str) -> bool {
     stdout.contains(needle) || stderr.contains(needle)
 }
 
+/// Detect gh's "no checks reported on the '<branch>' branch" message —
+/// the zero-checks-at-all case. This is what `gh pr checks` (no
+/// `--required`) prints when the PR has no checks whatsoever: e.g. a
+/// docs-only diff whose path filters skip every CI workflow. Distinct
+/// from [`is_no_required_checks_message`], which only appears under
+/// `--required` and whose text ("no *required* checks reported") does
+/// not contain this needle. When this fires in the all-reported
+/// fallback there are no checks to grade, so `ci_watch` falls back to
+/// the PR's merge state to decide green.
+pub fn is_no_checks_reported_message(stdout: &str, stderr: &str) -> bool {
+    let needle = "no checks reported";
+    stdout.contains(needle) || stderr.contains(needle)
+}
+
+/// gh's `mergeStateStatus`, distilled to the three outcomes `ci_watch`'s
+/// no-checks fallback cares about.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MergeReadiness {
+    /// `CLEAN` — GitHub considers the PR mergeable with nothing pending.
+    /// This is the only value the fallback treats as green.
+    Clean,
+    /// `UNKNOWN` / empty — GitHub hasn't finished computing mergeability.
+    /// Transient; keep polling until it resolves or the deadline fires.
+    Pending,
+    /// Anything else (`BLOCKED`, `DIRTY`, `BEHIND`, `UNSTABLE`, `DRAFT`,
+    /// `HAS_HOOKS`, ...) — not mergeable-and-green right now. Keep polling
+    /// too: some of these clear on their own (a required review lands, the
+    /// base updates) and the caller's deadline bounds the wait.
+    Blocked,
+}
+
+/// Map a raw gh `mergeStateStatus` string to a [`MergeReadiness`].
+fn classify_merge_state(status: &str) -> MergeReadiness {
+    match status.trim().to_ascii_uppercase().as_str() {
+        "CLEAN" => MergeReadiness::Clean,
+        "" | "UNKNOWN" => MergeReadiness::Pending,
+        _ => MergeReadiness::Blocked,
+    }
+}
+
+/// What a single `gh pr checks` poll tells `ci_watch` to do next. Pure
+/// function of the poll's exit code and output plus the current
+/// [`WatchMode`], so the branchy verdict logic is unit-testable without
+/// spawning gh.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum PollOutcome {
+    /// Required-checks mode, exit 0 — every required check passed. Green
+    /// outright; the strict path never consults merge state.
+    Green,
+    /// A watched check landed in a failing bucket. Surfaced verbatim.
+    Red { check: String, summary: String },
+    /// A watched check is still pending (gh exit 8). Sleep and re-poll.
+    Pending,
+    /// Required mode saw "no required checks reported" — switch to the
+    /// all-reported fallback and re-poll immediately.
+    FlipToAllReported,
+    /// All-reported fallback: either every reported check passed, or the
+    /// PR has no checks at all. Neither settles the verdict on its own —
+    /// consult the PR's merge state and go green only when it's CLEAN.
+    ConfirmMergeState,
+}
+
+/// Interpret one `gh pr checks` poll. `code` is the process exit code.
+fn classify_poll(mode: WatchMode, code: i32, stdout: &str, stderr: &str) -> PollOutcome {
+    match code {
+        // 0 — every watched check passed.
+        0 => match mode {
+            WatchMode::Required => PollOutcome::Green,
+            // In the fallback, all-green checks are necessary but not
+            // sufficient: gate on merge state so a repo with only
+            // non-required checks still lands on CLEAN before we call it.
+            WatchMode::AllReported => PollOutcome::ConfirmMergeState,
+        },
+        // 8 — at least one watched check is still pending.
+        8 => PollOutcome::Pending,
+        // Any other non-zero — a failure, OR a "no (required) checks"
+        // sentinel that gh conflates with failure via the same exit code.
+        _ => match mode {
+            WatchMode::Required => {
+                if is_no_required_checks_message(stdout, stderr) {
+                    PollOutcome::FlipToAllReported
+                } else {
+                    red_from_output(stdout, stderr)
+                }
+            }
+            WatchMode::AllReported => {
+                if is_no_checks_reported_message(stdout, stderr) {
+                    // No checks exist at all — defer to merge state.
+                    PollOutcome::ConfirmMergeState
+                } else {
+                    red_from_output(stdout, stderr)
+                }
+            }
+        },
+    }
+}
+
+/// Build a [`PollOutcome::Red`] from failing `gh pr checks` output,
+/// falling back to the last output line when no row parses as a failure.
+fn red_from_output(stdout: &str, stderr: &str) -> PollOutcome {
+    let (check, summary) = first_failing_check(stdout).unwrap_or_else(|| {
+        let fallback = stdout
+            .lines()
+            .last()
+            .or_else(|| stderr.lines().last())
+            .unwrap_or("")
+            .trim()
+            .to_string();
+        ("unknown".to_string(), fallback)
+    });
+    PollOutcome::Red { check, summary }
+}
+
 /// Push the task's branch and open a PR. Idempotent — if an open PR for
 /// the branch already exists, returns its number instead of opening a
 /// second one.
@@ -181,7 +294,11 @@ pub fn pr_create(
 /// - **All-reported fallback** (`gh pr checks` with no `--required`) —
 ///   auto-selected when the target repo has no required checks
 ///   configured (unprotected branch, or protected-but-no-required-set).
-///   Every check reported on the PR counts.
+///   Every check reported on the PR counts. In this mode a green
+///   verdict is confirmed against the PR's `mergeStateStatus`: all
+///   reported checks passing (or *no checks at all* — e.g. a docs-only
+///   diff that skips every CI path filter) yields `green` only once gh
+///   reports the PR `CLEAN`. Until then we keep polling.
 ///
 /// Rationale for the fallback: many repos never configure
 /// branch-protection required status checks. Without the fallback,
@@ -191,7 +308,10 @@ pub fn pr_create(
 /// observing the actual `app-ci` / `Vercel` / etc. checks that were
 /// queued or running (see issue #102 for the failure story that
 /// motivated this fix). The strict path is preserved when required
-/// checks *are* configured.
+/// checks *are* configured. The merge-state confirmation additionally
+/// closes the zero-checks hole: a PR with no checks whatsoever used to
+/// fall through to `red:unknown:no checks reported`; now a CLEAN such
+/// PR reports `green`.
 pub fn ci_watch(project: &Project, pr: u64, timeout: Duration) -> Result<CiVerdict> {
     let (host, dir) = locate_hub_workdir(project)?;
     let wt = dir.to_string_lossy().into_owned();
@@ -209,45 +329,39 @@ pub fn ci_watch(project: &Project, pr: u64, timeout: Duration) -> Result<CiVerdi
             WatchMode::AllReported => &["gh", "pr", "checks", &pr_str],
         };
         let out = run_in_dir(&host, &wt, args)?;
-        let code = out.status.code();
-        match code {
-            // 0 — all watched checks passed.
-            Some(0) => return Ok(CiVerdict::Green),
-            // 8 — at least one watched check is still pending.
-            Some(8) => { /* fall through to sleep + retry */ }
-            // Any other non-zero — at least one watched check failed,
-            // OR (only in required mode) the branch has no required
-            // checks configured. Disambiguate on the message text.
-            Some(_) => {
-                let stdout = String::from_utf8_lossy(&out.stdout);
-                let stderr = String::from_utf8_lossy(&out.stderr);
-                if mode == WatchMode::Required
-                    && is_no_required_checks_message(&stdout, &stderr)
+        let Some(code) = out.status.code() else {
+            return Err(Error::Other(format!(
+                "gh pr checks {pr_str} terminated without an exit code"
+            )));
+        };
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        match classify_poll(mode, code, &stdout, &stderr) {
+            PollOutcome::Green => return Ok(CiVerdict::Green),
+            PollOutcome::Red { check, summary } => {
+                return Ok(CiVerdict::Red { check, summary })
+            }
+            PollOutcome::FlipToAllReported => {
+                // No required checks configured on the target branch —
+                // flip to the all-reported fallback and re-poll
+                // immediately so we don't burn a sleep interval on a mode
+                // we've already ruled out.
+                mode = WatchMode::AllReported;
+                continue;
+            }
+            PollOutcome::ConfirmMergeState => {
+                // Checks are green or absent. The all-reported rollup
+                // can't distinguish "mergeable" from "blocked on
+                // something else", so borrow gh's own mergeability
+                // verdict: CLEAN is green, everything else keeps polling.
+                if let MergeReadiness::Clean =
+                    classify_merge_state(&merge_state_status(&host, &wt, &pr_str)?)
                 {
-                    // No required checks configured on the target
-                    // branch — flip to the all-reported fallback and
-                    // re-poll immediately so we don't burn a sleep
-                    // interval on a mode we've already ruled out.
-                    mode = WatchMode::AllReported;
-                    continue;
+                    return Ok(CiVerdict::Green);
                 }
-                let (check, summary) = first_failing_check(&stdout).unwrap_or_else(|| {
-                    let fallback = stdout
-                        .lines()
-                        .last()
-                        .or_else(|| stderr.lines().last())
-                        .unwrap_or("")
-                        .trim()
-                        .to_string();
-                    ("unknown".to_string(), fallback)
-                });
-                return Ok(CiVerdict::Red { check, summary });
+                // Not CLEAN yet — fall through to sleep + retry.
             }
-            None => {
-                return Err(Error::Other(format!(
-                    "gh pr checks {pr_str} terminated without an exit code"
-                )));
-            }
+            PollOutcome::Pending => { /* fall through to sleep + retry */ }
         }
 
         let now = Instant::now();
@@ -259,6 +373,36 @@ pub fn ci_watch(project: &Project, pr: u64, timeout: Duration) -> Result<CiVerdi
         let remaining = deadline.saturating_duration_since(now);
         std::thread::sleep(remaining.min(CI_POLL_INTERVAL));
     }
+}
+
+/// Ask gh for the PR's `mergeStateStatus`. Used by [`ci_watch`]'s
+/// no-required-checks fallback to decide green when the check rollup
+/// can't (all-passing-but-non-required, or no checks at all).
+///
+/// A gh call that runs but reports a non-zero exit (or empty output) is
+/// treated as "not yet known" — we return an empty string, which
+/// [`classify_merge_state`] maps to `Pending` so the caller keeps
+/// polling rather than hard-failing the watch on a transient hiccup. A
+/// gh process that can't launch at all still propagates as an error.
+fn merge_state_status(host: &Host, wt: &str, pr_str: &str) -> Result<String> {
+    let out = run_in_dir(
+        host,
+        wt,
+        &[
+            "gh",
+            "pr",
+            "view",
+            pr_str,
+            "--json",
+            "mergeStateStatus",
+            "--jq",
+            ".mergeStateStatus // empty",
+        ],
+    )?;
+    if !out.status.success() {
+        return Ok(String::new());
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
 }
 
 /// Integrate `pr` and delete its source branch using the project's
@@ -428,6 +572,111 @@ mod tests {
         assert!(!is_no_required_checks_message(stdout, ""));
         let stdout = "no checks reported on the 'feature' branch\n"; // gh's "no checks at all" variant
         assert!(!is_no_required_checks_message(stdout, ""));
+    }
+
+    #[test]
+    fn detects_no_checks_reported_message() {
+        // gh's zero-checks-at-all wire text (no `--required`).
+        let stdout = "no checks reported on the 'feature' branch\n";
+        assert!(is_no_checks_reported_message(stdout, ""));
+        assert!(is_no_checks_reported_message("", stdout));
+    }
+
+    #[test]
+    fn no_required_message_is_not_a_no_checks_message() {
+        // The "no *required* checks reported" text (required mode only)
+        // must not be mistaken for the zero-checks case — its substring
+        // is "required checks reported", never "no checks reported".
+        let stdout = "no required checks reported on the 'main' branch\n";
+        assert!(!is_no_checks_reported_message(stdout, ""));
+    }
+
+    #[test]
+    fn classify_merge_state_maps_gh_statuses() {
+        assert_eq!(classify_merge_state("CLEAN"), MergeReadiness::Clean);
+        assert_eq!(classify_merge_state("clean"), MergeReadiness::Clean);
+        assert_eq!(classify_merge_state(" CLEAN \n"), MergeReadiness::Clean);
+        assert_eq!(classify_merge_state("UNKNOWN"), MergeReadiness::Pending);
+        assert_eq!(classify_merge_state(""), MergeReadiness::Pending);
+        for blocked in ["BLOCKED", "DIRTY", "BEHIND", "UNSTABLE", "DRAFT"] {
+            assert_eq!(
+                classify_merge_state(blocked),
+                MergeReadiness::Blocked,
+                "{blocked} should be Blocked"
+            );
+        }
+    }
+
+    #[test]
+    fn classify_poll_required_mode() {
+        // Exit 0 in the strict path is green outright — no merge-state
+        // detour.
+        assert_eq!(classify_poll(WatchMode::Required, 0, "", ""), PollOutcome::Green);
+        // Exit 8 is pending.
+        assert_eq!(classify_poll(WatchMode::Required, 8, "", ""), PollOutcome::Pending);
+        // "no required checks" flips to the fallback.
+        assert_eq!(
+            classify_poll(
+                WatchMode::Required,
+                1,
+                "no required checks reported on the 'main' branch\n",
+                "",
+            ),
+            PollOutcome::FlipToAllReported
+        );
+        // A genuine required-check failure stays red with the check named.
+        let red = classify_poll(
+            WatchMode::Required,
+            1,
+            "build\tfail\t2m0s\thttps://example/build\tcompilation error\n",
+            "",
+        );
+        assert_eq!(
+            red,
+            PollOutcome::Red {
+                check: "build".into(),
+                summary: "compilation error".into(),
+            }
+        );
+    }
+
+    #[test]
+    fn classify_poll_all_reported_mode() {
+        // All reported checks passing → confirm merge state, don't go
+        // green blind.
+        assert_eq!(
+            classify_poll(WatchMode::AllReported, 0, "", ""),
+            PollOutcome::ConfirmMergeState
+        );
+        // Exit 8 is still pending.
+        assert_eq!(
+            classify_poll(WatchMode::AllReported, 8, "", ""),
+            PollOutcome::Pending
+        );
+        // No checks at all → confirm merge state (the zero-checks fix).
+        assert_eq!(
+            classify_poll(
+                WatchMode::AllReported,
+                1,
+                "no checks reported on the 'docs-only' branch\n",
+                "",
+            ),
+            PollOutcome::ConfirmMergeState
+        );
+        // A non-required check that actually failed still goes red.
+        let red = classify_poll(
+            WatchMode::AllReported,
+            1,
+            "Vercel\tfail\t30s\thttps://example/vercel\tbuild error\n",
+            "",
+        );
+        assert_eq!(
+            red,
+            PollOutcome::Red {
+                check: "Vercel".into(),
+                summary: "build error".into(),
+            }
+        );
     }
 }
 
@@ -928,7 +1177,14 @@ fn probe_diff_size(
     main: &str,
 ) -> Result<DiffSize> {
     let wt = worktree.to_string_lossy().into_owned();
-    let range = format!("{main}..{branch}");
+    // Three-dot (merge-base) diff, not two-dot. Two-dot `main..branch`
+    // diffs the two tips, so anything that landed on `main` after this
+    // branch was cut leaks into the count as spurious removals (or masks
+    // real additions) — the -402 phantom in the task report was another
+    // branch's churn that had just merged into main. Three-dot
+    // `main...branch` diffs against the *merge base*, which is exactly
+    // what a squash-merge of this branch will apply.
+    let range = format!("{main}...{branch}");
     let stdout = shelbi_ssh::run_capture(
         host,
         ["git", "-C", wt.as_str(), "diff", "--shortstat", range.as_str()],
@@ -992,7 +1248,10 @@ fn probe_danger_paths(
         return Ok(DangerPaths::default());
     }
     let wt = worktree.to_string_lossy().into_owned();
-    let range = format!("{base}..{branch}");
+    // Three-dot (merge-base) diff — same rationale as `probe_diff_size`.
+    // Two-dot would surface files touched on `base` after the branch was
+    // cut and wrongly flag the branch for danger paths it never touched.
+    let range = format!("{base}...{branch}");
     let stdout = shelbi_ssh::run_capture(
         host,
         ["git", "-C", wt.as_str(), "diff", "--name-only", range.as_str()],
@@ -1258,6 +1517,43 @@ mod probe_tests {
         run_git(repo, &["branch", "feature"]);
         let size = probe_diff_size(&Host::Local, repo, "feature", "main").unwrap();
         assert_eq!(size, DiffSize::default());
+    }
+
+    #[test]
+    fn diff_size_ignores_main_side_churn_after_branch_cut() {
+        // Reproduces the phantom -402 from the task report: an unrelated
+        // branch merges into `main` *after* `feature` was cut. Two-dot
+        // `main..feature` would subtract main's post-cut lines (and count
+        // its new files); three-dot `main...feature` diffs against the
+        // merge base, so `feature`'s size is exactly the one file it added
+        // regardless of what landed on main in the meantime.
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path();
+        run_git(repo, &["init", "-q", "-b", "main", "."]);
+        run_git(repo, &["config", "user.email", "test@example.com"]);
+        run_git(repo, &["config", "user.name", "Test"]);
+        std::fs::write(repo.join("README.md"), "hello\n").unwrap();
+        run_git(repo, &["add", "README.md"]);
+        run_git(repo, &["commit", "-q", "-m", "init"]);
+
+        // Cut feature and add ONE new file (analog of the 304-line file).
+        run_git(repo, &["checkout", "-q", "-b", "feature"]);
+        std::fs::write(repo.join("new.txt"), "a\nb\nc\n").unwrap();
+        run_git(repo, &["add", "new.txt"]);
+        run_git(repo, &["commit", "-q", "-m", "feature: one new file"]);
+
+        // Meanwhile main advances with unrelated churn (the "other branch
+        // merged" case). Two-dot would fold `other.txt` into feature's diff
+        // as a spurious removal.
+        run_git(repo, &["checkout", "-q", "main"]);
+        std::fs::write(repo.join("other.txt"), "x\ny\nz\n").unwrap();
+        run_git(repo, &["add", "other.txt"]);
+        run_git(repo, &["commit", "-q", "-m", "unrelated merge into main"]);
+
+        let size = probe_diff_size(&Host::Local, repo, "feature", "main").unwrap();
+        assert_eq!(size.files, 1, "only feature's own file should count");
+        assert_eq!(size.lines_added, 3);
+        assert_eq!(size.lines_removed, 0, "no main-side churn should leak in");
     }
 
     #[test]
