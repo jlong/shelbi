@@ -56,7 +56,8 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 use shelbi_core::{
-    default_project_statuses, default_workflow, Error, ProjectStatuses, Result, Workflow,
+    default_project_statuses, default_workflow, validate_workflow_name, Error, ProjectStatuses,
+    Result, Workflow,
 };
 
 use crate::{agents_dir, atomic_write, project_dir};
@@ -70,6 +71,7 @@ pub fn workflows_dir(project: &str) -> Result<PathBuf> {
 /// On-disk path of a single workflow by name:
 /// `~/.shelbi/projects/<project>/workflows/<name>.yaml`.
 pub fn workflow_path(project: &str, name: &str) -> Result<PathBuf> {
+    validate_workflow_name(name)?;
     Ok(workflows_dir(project)?.join(format!("{name}.yaml")))
 }
 

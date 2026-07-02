@@ -45,6 +45,26 @@ pub enum Error {
     #[error("invalid agent id: {0}")]
     InvalidAgentId(String),
 
+    /// A project name would resolve to something other than a single safe
+    /// path component (empty, contains a path separator, or is `.`/`..`).
+    /// Rejected at the storage-layer chokepoint ([`crate::validate_project_name`])
+    /// so a `../`-style name can't escape `~/.shelbi/projects/`.
+    #[error(
+        "invalid project name `{0}`: must be a single path component with no \
+         `/`, `\\`, or `..`"
+    )]
+    InvalidProjectName(String),
+
+    /// A task file's frontmatter `id:` doesn't match the filename it was
+    /// loaded from. Left unchecked this forks the card into two files on the
+    /// next write (read by filename, write by frontmatter id). Surfaces both
+    /// values so the user can reconcile the hand-edited file.
+    #[error(
+        "task file `{requested}.md` declares mismatched frontmatter id \
+         `{found}`; rename the file or fix the `id:` field so they match"
+    )]
+    TaskIdMismatch { requested: String, found: String },
+
     #[error(
         "task id `{id}` is too long: {len} bytes (max {max}); git ref names \
          (`shelbi/<id>`) must stay under GitHub's 255-byte limit"

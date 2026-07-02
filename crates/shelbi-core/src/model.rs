@@ -918,6 +918,23 @@ pub fn validate_workflow_name(s: &str) -> crate::Result<()> {
     validate_agent_id(s)
 }
 
+/// Validate a project name used as a directory component under
+/// `~/.shelbi/projects/<name>/`. Unlike task/agent ids, project names
+/// default to a repo basename and historically carry a looser character
+/// set (dots, mixed case), so this only enforces the security-critical
+/// invariant: the name must resolve to exactly one *normal* path
+/// component — never empty, never containing a separator, never `.`/`..`.
+/// That closes the `../`-traversal hole at the storage chokepoint
+/// (`shelbi_state::project_dir`) without rejecting existing names.
+pub fn validate_project_name(s: &str) -> crate::Result<()> {
+    use std::path::{Component, Path};
+    let mut comps = Path::new(s).components();
+    match (comps.next(), comps.next()) {
+        (Some(Component::Normal(c)), None) if c.to_str() == Some(s) => Ok(()),
+        _ => Err(crate::Error::InvalidProjectName(s.to_string())),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Zen Mode
 
@@ -1495,6 +1512,26 @@ updated_at: 2026-06-19T00:00:00Z
         assert!(validate_workflow_name("has spaces").is_err());
         assert!(validate_workflow_name("slash/in/name").is_err());
         assert!(validate_workflow_name("-leading-hyphen").is_err());
+    }
+
+    #[test]
+    fn project_name_rejects_path_traversal_but_allows_looser_names() {
+        // Security-critical: a name must be exactly one *normal* path
+        // component so it can't escape `~/.shelbi/projects/`.
+        assert!(validate_project_name("shelbi").is_ok());
+        assert!(validate_project_name("my-app").is_ok());
+        assert!(validate_project_name("my_app").is_ok());
+        // Looser than task/agent ids on purpose (repo-basename defaults):
+        assert!(validate_project_name("My.App").is_ok());
+        assert!(validate_project_name("app2").is_ok());
+        // Traversal / separators / specials are rejected.
+        assert!(validate_project_name("").is_err());
+        assert!(validate_project_name(".").is_err());
+        assert!(validate_project_name("..").is_err());
+        assert!(validate_project_name("../other").is_err());
+        assert!(validate_project_name("a/b").is_err());
+        assert!(validate_project_name("/abs").is_err());
+        assert!(validate_project_name("nested/../escape").is_err());
     }
 
     #[test]
