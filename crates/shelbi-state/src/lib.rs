@@ -446,11 +446,30 @@ fn sibling_lock_path(path: &Path) -> PathBuf {
 // ---------------------------------------------------------------------------
 // Project / Session YAML
 
+/// Load a project's config, mode-aware.
+///
+/// * **Global mode** (the pre-split layout): a single flat YAML at
+///   `~/.shelbi/projects/<name>.yaml`. Loaded directly.
+/// * **In-repo mode** (post `migrate-to-in-repo`): the global YAML is
+///   gone, so we fall back to the two-file split —
+///   `~/.shelbi/projects/<name>/local.yaml` (the per-user half, which
+///   carries `repo:`) plus `<repo>/.shelbi/project.yaml` (the committed
+///   shared half) — merged via [`Project::from_split_yaml_str`]. This is
+///   the loader half of the in-repo chain: the migration writes both
+///   halves and retires the global YAML, so every runtime caller reaches
+///   the migrated config through here without a mode flag.
 pub fn load_project(project: &str) -> Result<Project> {
-    let p = projects_dir()?.join(format!("{project}.yaml"));
-    let text = fs::read_to_string(&p)?;
-    warn_legacy_workers_key(project, &text);
-    let mut p: Project = serde_yaml::from_str(&text)?;
+    let global_path = projects_dir()?.join(format!("{project}.yaml"));
+    let mut p = match fs::read_to_string(&global_path) {
+        Ok(text) => {
+            warn_legacy_workers_key(project, &text);
+            Project::from_yaml_str(&text)?
+        }
+        // No global YAML — this is either an in-repo project (migrated)
+        // or a genuinely missing one. `load_project_split` disambiguates.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => load_project_split(project)?,
+        Err(e) => return Err(shelbi_core::Error::Io(e)),
+    };
     p.validate_workspaces()?;
     let repo = p.repo.clone();
     p.detect_shapes(repo);
@@ -464,6 +483,49 @@ pub fn load_project(project: &str) -> Result<Project> {
         migrate_default_statuses(&dir);
     }
     Ok(p)
+}
+
+/// In-repo fallback for [`load_project`]: read
+/// `~/.shelbi/projects/<name>/local.yaml`, recover `repo:` from it, open
+/// `<repo>/.shelbi/project.yaml`, and merge the two halves. Mirrors the
+/// resolution `migrate.rs` performs, so a migrated project loads
+/// identically to how it was written.
+///
+/// A missing `local.yaml` means the project simply doesn't exist (neither
+/// layout is present) — reported with both candidate paths so the error
+/// is actionable. A present `local.yaml` whose shared half is missing is a
+/// half-broken state we surface distinctly rather than as a bare
+/// file-not-found.
+fn load_project_split(project: &str) -> Result<Project> {
+    let global_path = projects_dir()?.join(format!("{project}.yaml"));
+    let local_path = project_dir(project)?.join("local.yaml");
+    let local_text = match fs::read_to_string(&local_path) {
+        Ok(t) => t,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Err(shelbi_core::Error::Other(format!(
+                "project `{project}` not found — no {} and no {}",
+                global_path.display(),
+                local_path.display(),
+            )));
+        }
+        Err(e) => return Err(shelbi_core::Error::Io(e)),
+    };
+    let repo = migrate::extract_repo_from_local_yaml(&local_text, &local_path)?;
+    let shared_path = expand_tilde_str(&repo).join(".shelbi").join("project.yaml");
+    let shared_text = match fs::read_to_string(&shared_path) {
+        Ok(t) => t,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Err(shelbi_core::Error::Other(format!(
+                "project `{project}` has a local.yaml at {} pointing at repo `{repo}`, \
+                 but no shared config at {} — restore the repo's `.shelbi/project.yaml` \
+                 (e.g. from git) to open it",
+                local_path.display(),
+                shared_path.display(),
+            )));
+        }
+        Err(e) => return Err(shelbi_core::Error::Io(e)),
+    };
+    Project::from_split_yaml_str(&shared_text, &local_text)
 }
 
 /// One-time-per-process nag when a legacy `workers:` top-level key is
@@ -3552,6 +3614,121 @@ mod tests {
         assert!(err.to_string().contains("boom"));
         assert_eq!(read_state("p").unwrap().zen_mode, ZenModeState::On);
 
+        std::env::remove_var("SHELBI_HOME");
+    }
+
+    // -----------------------------------------------------------------
+    // Mode-aware `load_project` (F1: migrated projects must stay loadable)
+
+    /// A distinct temp dir to stand in for a project's repo root.
+    fn fresh_repo() -> PathBuf {
+        let p = std::env::temp_dir().join(format!(
+            "shelbi-state-repo-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&p).unwrap();
+        p
+    }
+
+    /// A pre-split project registered at `~/.shelbi/projects/<name>.yaml`
+    /// loads through the flat parser exactly as before — the global-mode
+    /// path is untouched by the split fallback.
+    #[test]
+    fn load_project_reads_global_yaml() {
+        let _g = TEST_LOCK.lock().unwrap();
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+
+        save_project(&fixture_project("myapp", None)).unwrap();
+
+        let loaded = load_project("myapp").unwrap();
+        assert_eq!(loaded.name, "myapp");
+        // Pre-split YAMLs carry no `config_mode:` → global mode.
+        assert_eq!(loaded.config_mode, None);
+        std::env::remove_var("SHELBI_HOME");
+    }
+
+    /// F1: once `migrate-to-in-repo` retires the global YAML,
+    /// `load_project` must fall back to the split layout
+    /// (`<name>/local.yaml` + `<repo>/.shelbi/project.yaml`) and return
+    /// the same project in in-repo mode. This is the loader half every
+    /// runtime caller (board, workspaces, review pane) depends on — a
+    /// migrated project that this can't open is bricked.
+    #[test]
+    fn load_project_falls_back_to_split_after_migration() {
+        let _g = TEST_LOCK.lock().unwrap();
+        let home = fresh_home();
+        let repo = fresh_repo();
+        std::env::set_var("SHELBI_HOME", &home);
+
+        let mut p = fixture_project("myapp", None);
+        p.repo = repo.to_string_lossy().into_owned();
+        p.machines[0].work_dir = repo.clone();
+        save_project(&p).unwrap();
+
+        // Migrate: writes both halves, retires (renames) the global YAML.
+        apply_migration_plan(&plan_in_repo_migration("myapp").unwrap()).unwrap();
+        assert!(
+            !home.join("projects/myapp.yaml").exists(),
+            "global YAML should be retired after migration"
+        );
+        assert!(
+            home.join("projects/myapp.yaml.migrated").is_file(),
+            "retired copy should remain as a rollback path"
+        );
+
+        // With the global YAML gone, the loader resolves the config
+        // through the two-file split.
+        let loaded = load_project("myapp").unwrap();
+        assert_eq!(loaded.name, "myapp");
+        assert_eq!(loaded.config_mode, Some(shelbi_core::ConfigMode::InRepo));
+        assert_eq!(loaded.repo, repo.to_string_lossy());
+        std::env::remove_var("SHELBI_HOME");
+    }
+
+    /// Neither layout present → an error that names both candidate paths
+    /// so the failure is debuggable (not a bare file-not-found on just
+    /// the global YAML).
+    #[test]
+    fn load_project_missing_reports_both_candidate_paths() {
+        let _g = TEST_LOCK.lock().unwrap();
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+
+        let err = load_project("ghost").unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("ghost.yaml"), "missing global path: {msg}");
+        assert!(msg.contains("local.yaml"), "missing local path: {msg}");
+        std::env::remove_var("SHELBI_HOME");
+    }
+
+    /// A `local.yaml` whose referenced shared half is absent is a
+    /// half-broken state — surfaced with both paths rather than a raw
+    /// NotFound, so the user knows to restore `<repo>/.shelbi/project.yaml`.
+    #[test]
+    fn load_project_split_missing_shared_half_errors_clearly() {
+        let _g = TEST_LOCK.lock().unwrap();
+        let home = fresh_home();
+        let repo = fresh_repo();
+        std::env::set_var("SHELBI_HOME", &home);
+
+        let state = home.join("projects/myapp");
+        std::fs::create_dir_all(&state).unwrap();
+        std::fs::write(
+            state.join("local.yaml"),
+            format!("repo: {}\nmachines: []\n", repo.display()),
+        )
+        .unwrap();
+        // Note: no <repo>/.shelbi/project.yaml, and no global YAML.
+
+        let err = load_project("myapp").unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("no shared config"), "unexpected err: {msg}");
+        assert!(msg.contains("project.yaml"), "should name shared path: {msg}");
         std::env::remove_var("SHELBI_HOME");
     }
 }
