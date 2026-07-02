@@ -32,16 +32,6 @@ pub enum Error {
         expected_local: PathBuf,
     },
 
-    /// The in-repo `.shelbi/project.yaml` located by the discovery walk-up
-    /// exists but does not parse. Surfaces the exact file path so the user
-    /// isn't left guessing which of the many project YAMLs was corrupt.
-    #[error("failed to parse in-repo project config at {}: {source}", path.display())]
-    InRepoProjectParse {
-        path: PathBuf,
-        #[source]
-        source: serde_yaml::Error,
-    },
-
     #[error("invalid agent id: {0}")]
     InvalidAgentId(String),
 
