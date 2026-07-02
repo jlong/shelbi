@@ -229,7 +229,10 @@ fn add(project: &str, args: AddArgs) -> Result<()> {
         .description
         .map(|d| format!("# Task\n\n{d}\n"))
         .unwrap_or_else(|| format!("# Task\n\n{}\n", args.title));
-    shelbi_state::save_task(project, &task, &body).map_err(|e| anyhow!(e))?;
+    // Create-exclusive: the up-front existence checks above are advisory
+    // (they race against concurrent creators); this is the authoritative
+    // no-overwrite guarantee.
+    shelbi_state::create_task(project, &task, &body).map_err(|e| anyhow!(e))?;
     println!("✓ {} created in {column} (priority {priority})", task.id);
     Ok(())
 }

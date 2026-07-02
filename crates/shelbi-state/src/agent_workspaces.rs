@@ -27,7 +27,7 @@ use std::path::PathBuf;
 use shelbi_core::{Error, Result};
 
 use crate::{
-    agents_dir, ensure_dir, load_shelbi_config, project_dir, read_state, write_state,
+    agents_dir, ensure_dir, load_shelbi_config, project_dir, update_state,
     DEFAULT_WORKSPACE_SETTINGS_TEMPLATE,
 };
 
@@ -274,30 +274,31 @@ pub fn legacy_claude_md_path(project: &str) -> Result<PathBuf> {
 /// — keep the hint off the alt-screen pane. CLI invocations from a
 /// real shell still surface it on stderr via the default writer.
 ///
-/// Best-effort — IO failures from `read_state`/`write_state` are
-/// returned to the caller so the spawn path can decide whether to bail
-/// or proceed. In practice every caller treats the hint as advisory and
-/// uses `let _ = …` to ignore the result.
+/// Best-effort — IO failures from the state update are returned to the
+/// caller so the spawn path can decide whether to bail or proceed. In
+/// practice every caller treats the hint as advisory and uses `let _ = …`
+/// to ignore the result.
 pub fn maybe_emit_claude_md_migration_hint(project: &str) -> Result<()> {
-    let mut state = read_state(project)?;
-    if state.claude_md_migration_hinted {
-        return Ok(());
-    }
     let path = legacy_claude_md_path(project)?;
-    if !path.exists() {
-        return Ok(());
-    }
-    tracing::warn!(
-        project,
-        claude_md = %path.display(),
-        "shelbi: CLAUDE.md detected at {} but no longer read.\n  \
-         → project-wide context belongs in agents/_shared/preamble.md\n  \
-         → orchestrator-specific overrides belong in agents/orchestrator/instructions.md\n  \
-         → remove CLAUDE.md when migration is complete.",
-        path.display(),
-    );
-    state.claude_md_migration_hinted = true;
-    write_state(project, &state)
+    update_state(project, |state| {
+        if state.claude_md_migration_hinted {
+            return Ok(());
+        }
+        if !path.exists() {
+            return Ok(());
+        }
+        tracing::warn!(
+            project,
+            claude_md = %path.display(),
+            "shelbi: CLAUDE.md detected at {} but no longer read.\n  \
+             → project-wide context belongs in agents/_shared/preamble.md\n  \
+             → orchestrator-specific overrides belong in agents/orchestrator/instructions.md\n  \
+             → remove CLAUDE.md when migration is complete.",
+            path.display(),
+        );
+        state.claude_md_migration_hinted = true;
+        Ok(())
+    })
 }
 
 /// Clear the per-project "migration hint already fired" flag so the
@@ -308,12 +309,10 @@ pub fn maybe_emit_claude_md_migration_hint(project: &str) -> Result<()> {
 /// surface once per session regardless of where the first dispatch
 /// originates.
 pub fn reset_claude_md_migration_hint(project: &str) -> Result<()> {
-    let mut state = read_state(project)?;
-    if !state.claude_md_migration_hinted {
-        return Ok(());
-    }
-    state.claude_md_migration_hinted = false;
-    write_state(project, &state)
+    update_state(project, |state| {
+        state.claude_md_migration_hinted = false;
+        Ok(())
+    })
 }
 
 /// Names of every agent under `~/.shelbi/projects/<project>/agents/`,
@@ -474,75 +473,67 @@ pub fn materialize_default_agents(project: &str) -> Result<Vec<AgentMaterializeO
 ///
 /// Also ensures the `skills/` subdir exists for every default agent.
 pub fn self_heal_default_agents(project: &str) -> Result<Vec<AgentMaterializeOutcome>> {
-    let mut state = read_state(project)?;
-    let mut state_dirty = false;
-    let mut outcomes = Vec::with_capacity(DEFAULT_AGENTS.len());
+    // The whole pass runs inside one locked `update_state` so the
+    // divergence bookkeeping can't lose a concurrent mutator's fields
+    // (or vice versa). Self-heal runs once per `shelbi reload`, so
+    // holding the lock across the file IO is fine.
+    update_state(project, |state| {
+        let mut outcomes = Vec::with_capacity(DEFAULT_AGENTS.len());
 
-    for agent in DEFAULT_AGENTS {
-        let workspace = agent_workspace_dir(project, agent.name)?;
-        if !workspace.exists() {
-            write_bundled_agent(project, agent)?;
-            if state.notified_diverged_agents.remove(agent.name) {
-                state_dirty = true;
-            }
-            outcomes.push(AgentMaterializeOutcome::Created {
-                agent: agent.name.to_string(),
-            });
-            continue;
-        }
-
-        // Workspace exists. Ensure `skills/` is there before we judge
-        // `instructions.md` — a half-materialized workspace from an
-        // older shelbi version shouldn't be left without it.
-        ensure_dir(&agent_skills_dir(project, agent.name)?)?;
-
-        // Make sure the per-role `settings.json` is on disk before we
-        // judge `instructions.md` divergence — a half-materialized
-        // workspace from an older shelbi version (no settings file)
-        // shouldn't be left without the message-tail hooks.
-        ensure_agent_settings_present(project, agent)?;
-
-        let path = agent_instructions_path(project, agent.name)?;
-        let current = match fs::read_to_string(&path) {
-            Ok(s) => s,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                fs::write(&path, agent.instructions).map_err(Error::Io)?;
-                if state.notified_diverged_agents.remove(agent.name) {
-                    state_dirty = true;
-                }
+        for agent in DEFAULT_AGENTS {
+            let workspace = agent_workspace_dir(project, agent.name)?;
+            if !workspace.exists() {
+                write_bundled_agent(project, agent)?;
+                state.notified_diverged_agents.remove(agent.name);
                 outcomes.push(AgentMaterializeOutcome::Created {
                     agent: agent.name.to_string(),
                 });
                 continue;
             }
-            Err(e) => return Err(Error::Io(e)),
-        };
 
-        if current == agent.instructions {
-            if state.notified_diverged_agents.remove(agent.name) {
-                state_dirty = true;
+            // Workspace exists. Ensure `skills/` is there before we judge
+            // `instructions.md` — a half-materialized workspace from an
+            // older shelbi version shouldn't be left without it.
+            ensure_dir(&agent_skills_dir(project, agent.name)?)?;
+
+            // Make sure the per-role `settings.json` is on disk before we
+            // judge `instructions.md` divergence — a half-materialized
+            // workspace from an older shelbi version (no settings file)
+            // shouldn't be left without the message-tail hooks.
+            ensure_agent_settings_present(project, agent)?;
+
+            let path = agent_instructions_path(project, agent.name)?;
+            let current = match fs::read_to_string(&path) {
+                Ok(s) => s,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    fs::write(&path, agent.instructions).map_err(Error::Io)?;
+                    state.notified_diverged_agents.remove(agent.name);
+                    outcomes.push(AgentMaterializeOutcome::Created {
+                        agent: agent.name.to_string(),
+                    });
+                    continue;
+                }
+                Err(e) => return Err(Error::Io(e)),
+            };
+
+            if current == agent.instructions {
+                state.notified_diverged_agents.remove(agent.name);
+                outcomes.push(AgentMaterializeOutcome::Unchanged {
+                    agent: agent.name.to_string(),
+                });
+            } else {
+                let first_notice = state
+                    .notified_diverged_agents
+                    .insert(agent.name.to_string());
+                outcomes.push(AgentMaterializeOutcome::Preserved {
+                    agent: agent.name.to_string(),
+                    first_notice,
+                });
             }
-            outcomes.push(AgentMaterializeOutcome::Unchanged {
-                agent: agent.name.to_string(),
-            });
-        } else {
-            let first_notice = state
-                .notified_diverged_agents
-                .insert(agent.name.to_string());
-            if first_notice {
-                state_dirty = true;
-            }
-            outcomes.push(AgentMaterializeOutcome::Preserved {
-                agent: agent.name.to_string(),
-                first_notice,
-            });
         }
-    }
 
-    if state_dirty {
-        write_state(project, &state)?;
-    }
-    Ok(outcomes)
+        Ok(outcomes)
+    })
 }
 
 /// Create `<workspace>/` and `<workspace>/skills/`, then write
@@ -585,6 +576,7 @@ fn ensure_agent_settings_present(project: &str, agent: &BundledAgent) -> Result<
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::read_state;
     use crate::test_lock::LOCK;
 
     fn fresh_home() -> PathBuf {

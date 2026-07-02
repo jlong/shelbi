@@ -473,12 +473,10 @@ fn apply_palette_binding(
     // Persist the new key so the next bootstrap / project switch knows
     // what to unbind. Best-effort: a missing $SHELBI_HOME (already
     // surfaced elsewhere) shouldn't block the rest of bootstrap.
-    if let Ok(mut state) = shelbi_state::read_global_state() {
-        if state.tmux_palette_key.as_deref() != Some(tmux_key.as_str()) {
-            state.tmux_palette_key = Some(tmux_key.clone());
-            let _ = shelbi_state::write_global_state(&state);
-        }
-    }
+    let _ = shelbi_state::update_global_state(|state| {
+        state.tmux_palette_key = Some(tmux_key.clone());
+        Ok(())
+    });
 
     Ok(tmux_key)
 }
