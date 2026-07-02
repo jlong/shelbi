@@ -112,6 +112,7 @@ pub(crate) mod test_support {
             contextstore_sync: Vec::new(),
             detected_shapes: Vec::new(),
             git: GitConfig::default(),
+            review: Default::default(),
         };
         shelbi_state::save_project(&project).unwrap();
         repo

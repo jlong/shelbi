@@ -819,6 +819,7 @@ mod tests {
                 name: "alpha".into(),
                 machine: "hub".into(),
                 runner: "claude".into(),
+                role: Default::default(),
             }],
             workspace_poll_interval_secs: 5,
             workspace_permissions_mode: "auto".into(),
@@ -826,6 +827,7 @@ mod tests {
             zen: shelbi_core::ZenConfig::default(),
             heartbeat: shelbi_core::HeartbeatConfig::default(),
             git: shelbi_core::GitConfig::default(),
+            review: Default::default(),
             contextstore_sync: Vec::new(),
             detected_shapes: Vec::new(),
         }

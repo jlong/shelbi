@@ -1947,6 +1947,7 @@ mod tests {
             zen: ZenConfig::default(),
             heartbeat: HeartbeatConfig::default(),
             git: GitConfig::default(),
+            review: Default::default(),
             contextstore_sync: Vec::new(),
             detected_shapes: Vec::new(),
         }
@@ -2448,6 +2449,7 @@ mod tests {
             name: name.to_string(),
             machine: "local".to_string(),
             runner: "claude".to_string(),
+            role: Default::default(),
         }
     }
 

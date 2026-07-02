@@ -94,6 +94,16 @@ pub struct Project {
     /// [`Project::merge_strategy`].
     #[serde(default)]
     pub git: GitConfig,
+    /// Optional `review:` block configuring how *review workspaces* load and
+    /// serve a task's branch for human inspection (ports, setup/serve
+    /// commands, ready probe). Absent block ⇒ all defaults (base port 3000,
+    /// stride 10, auto-detected setup/serve). Rides the shared/repo config
+    /// half — it describes the project, not the machine. See
+    /// [`ReviewConfig`] and `Plans/review-workspaces.md` §5.2. Elided from
+    /// the wire form when fully default so existing project YAMLs — which
+    /// carry no `review:` key — round-trip unchanged.
+    #[serde(default, skip_serializing_if = "is_default")]
+    pub review: ReviewConfig,
 
     // --- user-local -------------------------------------------------------
     pub repo: String,
@@ -165,6 +175,7 @@ pub const SHARED_PROJECT_FIELDS: &[&str] = &[
     "zen",
     "heartbeat",
     "git",
+    "review",
 ];
 
 /// YAML keys that belong in the *user-local* half of a split project
@@ -377,6 +388,91 @@ impl std::fmt::Display for MergeStrategy {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Review config (how review workspaces load & serve a branch)
+
+/// Per-project configuration for *review workspaces* — the pool slots that
+/// load a task's branch and serve it for human inspection. Stored under the
+/// `review:` key in the project YAML; an absent block means "auto-detect
+/// everything, base port 3000, stride 10" — every field falls back to its
+/// default. Belongs in the shared (repo) config half. See
+/// `Plans/review-workspaces.md` §5.2.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ReviewConfig {
+    /// Base TCP port for the first review workspace's dev server. Each
+    /// review workspace gets a deterministic slot `base_port + n *
+    /// port_stride` (see [`Project::review_workspaces`]). Default 3000.
+    #[serde(default = "default_base_port")]
+    pub base_port: u16,
+    /// Port spacing between consecutive review workspaces on a machine, so
+    /// concurrent servers never collide. Default 10 (review-1→3000,
+    /// review-2→3010).
+    #[serde(default = "default_port_stride")]
+    pub port_stride: u16,
+    /// Explicit setup commands run before the server starts (e.g. `npm
+    /// install`). Empty ⇒ the Review agent auto-detects from the project
+    /// shape. Declared commands always win over auto-detection.
+    #[serde(default)]
+    pub setup: Vec<String>,
+    /// Explicit command that starts the dev server (e.g. `npm run dev --
+    /// --port $PORT`). `None` ⇒ auto-detected.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub serve: Option<String>,
+    /// How the Review agent decides the server is up and ready for a human.
+    /// `None` ⇒ a default settle/probe chosen by the agent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ready_probe: Option<ReadyProbe>,
+}
+
+impl Default for ReviewConfig {
+    fn default() -> Self {
+        Self {
+            base_port: default_base_port(),
+            port_stride: default_port_stride(),
+            setup: Vec::new(),
+            serve: None,
+            ready_probe: None,
+        }
+    }
+}
+
+/// Default base port for review dev servers: 3000.
+fn default_base_port() -> u16 {
+    3000
+}
+
+/// Default port stride between review workspaces: 10.
+fn default_port_stride() -> u16 {
+    10
+}
+
+/// How the Review agent probes a freshly-started dev server for readiness
+/// before handing off to the human. Both fields are optional; a bare
+/// `ready_probe:` with neither set just means "wait `timeout`, then assume
+/// ready."
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ReadyProbe {
+    /// URL to poll for an HTTP 200 (e.g. `http://localhost:$PORT`). `None`
+    /// ⇒ no HTTP probe; the agent falls back to a fixed settle.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub http: Option<String>,
+    /// How long to wait for the probe to succeed before giving up.
+    /// Serialized as a number of seconds. Default 90s.
+    #[serde(default = "default_ready_probe_timeout", with = "duration_secs")]
+    pub timeout: Duration,
+}
+
+impl Default for ReadyProbe {
+    fn default() -> Self {
+        Self { http: None, timeout: default_ready_probe_timeout() }
+    }
+}
+
+/// Default ready-probe timeout: 90 seconds.
+fn default_ready_probe_timeout() -> Duration {
+    Duration::from_secs(90)
+}
+
 fn default_workspace_poll_interval_secs() -> u64 {
     5
 }
@@ -414,6 +510,23 @@ impl Project {
         self.workspaces.iter().find(|w| w.name == name)
     }
 
+    /// Review-role workspaces declared on `machine`, in declaration order.
+    /// The slot index into this list drives the deterministic port
+    /// assignment (`review.base_port + i * review.port_stride`). See
+    /// [`ReviewConfig`].
+    pub fn review_workspaces(&self, machine: &str) -> Vec<&WorkspaceSpec> {
+        self.workspaces
+            .iter()
+            .filter(|w| w.machine == machine && w.is_review())
+            .collect()
+    }
+
+    /// All dev-role workspaces across every machine, in declaration order.
+    /// These are the slots that pick up tasks for autonomous development.
+    pub fn dev_workspaces(&self) -> Vec<&WorkspaceSpec> {
+        self.workspaces.iter().filter(|w| !w.is_review()).collect()
+    }
+
     /// Inspect the filesystem at `root` (typically `self.repo`) and cache
     /// the recognized [`ProjectShape`]s on `self.detected_shapes`. Safe
     /// to call from `load_project`: any I/O error is treated as "no
@@ -422,14 +535,36 @@ impl Project {
         self.detected_shapes = detect_project_shapes(root.as_ref());
     }
 
-    /// Cross-check workspaces reference declared machines and runners.
+    /// Cross-check workspaces reference declared machines and runners, and
+    /// enforce the review-workspace scarcity invariant.
+    ///
+    /// Hard errors: an unknown machine or runner, or **more than
+    /// [`MAX_REVIEW_WORKSPACES_PER_MACHINE`] review workspaces on a single
+    /// machine** — review slots may each pin a running server and a port, so
+    /// over-provisioning them is almost always a config mistake worth
+    /// surfacing loudly. Other conditions (e.g. a machine with zero review
+    /// workspaces) are soft and left to callers to warn about rather than
+    /// fail the load. See `Plans/review-workspaces.md` §5.1.
     pub fn validate_workspaces(&self) -> crate::Result<()> {
+        let mut review_per_machine: BTreeMap<&str, usize> = BTreeMap::new();
         for w in &self.workspaces {
             if self.machine(&w.machine).is_none() {
                 return Err(crate::Error::UnknownMachine(w.machine.clone()));
             }
             if self.runner(&w.runner).is_none() {
                 return Err(crate::Error::UnknownRunner(w.runner.clone()));
+            }
+            if w.is_review() {
+                *review_per_machine.entry(w.machine.as_str()).or_default() += 1;
+            }
+        }
+        for (machine, count) in review_per_machine {
+            if count > MAX_REVIEW_WORKSPACES_PER_MACHINE {
+                return Err(crate::Error::Other(format!(
+                    "machine `{machine}` declares {count} review workspaces, but at \
+                     most {MAX_REVIEW_WORKSPACES_PER_MACHINE} are allowed per machine \
+                     (each review workspace may hold a running server and a port)"
+                )));
             }
         }
         Ok(())
@@ -561,6 +696,27 @@ fn retain_fields(value: &mut serde_yaml::Value, keep: &[&str]) {
 // ---------------------------------------------------------------------------
 // Workspace (declared agent in project YAML)
 
+/// Scarcity invariant for review workspaces: at most this many per machine.
+/// A review workspace may pin a long-running dev server and a port, so
+/// declaring more than this on one machine is treated as a config error by
+/// [`Project::validate_workspaces`]. See `Plans/review-workspaces.md` §5.1.
+pub const MAX_REVIEW_WORKSPACES_PER_MACHINE: usize = 2;
+
+/// Whether a workspace is an autonomous development slot or a slot
+/// designated for human review. See `Plans/review-workspaces.md` §5.
+///
+/// The wire form is `dev` / `review` (lowercase). `Dev` is the default so
+/// existing project YAMLs — which carry no `role:` key — deserialize
+/// unchanged, and the field is elided on serialize (see
+/// [`WorkspaceSpec::role`]) so they round-trip byte-identically.
+#[derive(Debug, Default, PartialEq, Eq, Clone, Copy, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum WorkspaceRole {
+    #[default]
+    Dev,
+    Review,
+}
+
 /// A workspace is a long-lived slot on a machine: one stable worktree, one
 /// runner. Workspaces pick up tasks from the board and switch branches between
 /// assignments (with cleared context). The worktree path is derived as
@@ -570,6 +726,28 @@ pub struct WorkspaceSpec {
     pub name: String,
     pub machine: String,
     pub runner: String,
+    /// Whether this slot does autonomous development ([`WorkspaceRole::Dev`],
+    /// the default) or is reserved for loading & serving a task's branch for
+    /// human review ([`WorkspaceRole::Review`]). Rides the user-local config
+    /// half along with the rest of `workspaces:`. Elided from the wire form
+    /// when `Dev` so existing YAMLs round-trip unchanged.
+    #[serde(default, skip_serializing_if = "is_default")]
+    pub role: WorkspaceRole,
+}
+
+/// `skip_serializing_if` helper: true when a value equals its `Default`.
+/// Used to keep default-valued optional fields off the wire so existing
+/// configs round-trip byte-identically.
+fn is_default<T: Default + PartialEq>(t: &T) -> bool {
+    *t == T::default()
+}
+
+impl WorkspaceSpec {
+    /// Whether this workspace is reserved for human review (as opposed to
+    /// autonomous development). See [`WorkspaceRole`].
+    pub fn is_review(&self) -> bool {
+        self.role == WorkspaceRole::Review
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1851,7 +2029,7 @@ workspace_settings_template: /etc/shelbi/p.json
             editor: None,
             github_url: None,
             workspaces: vec![
-                WorkspaceSpec { name: "alice".into(), machine: "hub".into(), runner: "claude".into() },
+                WorkspaceSpec { name: "alice".into(), machine: "hub".into(), runner: "claude".into(), role: Default::default() },
             ],
             workspace_poll_interval_secs: default_workspace_poll_interval_secs(),
             workspace_permissions_mode: default_workspace_permissions_mode(),
@@ -1859,18 +2037,199 @@ workspace_settings_template: /etc/shelbi/p.json
             zen: ZenConfig::default(),
             heartbeat: HeartbeatConfig::default(),
             git: GitConfig::default(),
+            review: ReviewConfig::default(),
             contextstore_sync: Vec::new(),
             detected_shapes: Vec::new(),
         };
         assert!(project.validate_workspaces().is_ok());
 
         let mut bad = project.clone();
-        bad.workspaces.push(WorkspaceSpec { name: "bob".into(), machine: "ghost".into(), runner: "claude".into() });
+        bad.workspaces.push(WorkspaceSpec { name: "bob".into(), machine: "ghost".into(), runner: "claude".into(), role: Default::default() });
         assert!(matches!(bad.validate_workspaces(), Err(crate::Error::UnknownMachine(_))));
 
         let mut bad2 = project.clone();
-        bad2.workspaces.push(WorkspaceSpec { name: "bob".into(), machine: "hub".into(), runner: "ghost".into() });
+        bad2.workspaces.push(WorkspaceSpec { name: "bob".into(), machine: "hub".into(), runner: "ghost".into(), role: Default::default() });
         assert!(matches!(bad2.validate_workspaces(), Err(crate::Error::UnknownRunner(_))));
+    }
+
+    // ---- Review workspaces -------------------------------------------------
+
+    /// Build a project with two machines (`hub`, `devbox`) and the given
+    /// workspaces, so review-workspace behavior can be exercised without
+    /// spelling out every unrelated field at each call site.
+    fn project_with_workspaces(workspaces: Vec<WorkspaceSpec>) -> Project {
+        let mut runners = std::collections::BTreeMap::new();
+        runners.insert(
+            "claude".to_string(),
+            AgentRunnerSpec {
+                command: "claude".into(),
+                flags: vec![],
+            },
+        );
+        let machine = |name: &str| Machine {
+            name: name.into(),
+            kind: MachineKind::Local,
+            work_dir: "/tmp".into(),
+            host: None,
+        };
+        Project {
+            name: "p".into(),
+            repo: "r".into(),
+            default_branch: "main".into(),
+            config_mode: None,
+            machines: vec![machine("hub"), machine("devbox")],
+            orchestrator: OrchestratorSpec {
+                runner: "claude".into(),
+            },
+            agent_runners: runners,
+            editor: None,
+            github_url: None,
+            workspaces,
+            workspace_poll_interval_secs: default_workspace_poll_interval_secs(),
+            workspace_permissions_mode: default_workspace_permissions_mode(),
+            workspace_settings_template: None,
+            zen: ZenConfig::default(),
+            heartbeat: HeartbeatConfig::default(),
+            git: GitConfig::default(),
+            review: ReviewConfig::default(),
+            contextstore_sync: Vec::new(),
+            detected_shapes: Vec::new(),
+        }
+    }
+
+    fn ws(name: &str, machine: &str, role: WorkspaceRole) -> WorkspaceSpec {
+        WorkspaceSpec {
+            name: name.into(),
+            machine: machine.into(),
+            runner: "claude".into(),
+            role,
+        }
+    }
+
+    #[test]
+    fn workspace_role_parses_and_defaults_to_dev() {
+        // No `role:` key → Dev.
+        let dev: WorkspaceSpec =
+            serde_yaml::from_str("{ name: alpha, machine: hub, runner: claude }").unwrap();
+        assert_eq!(dev.role, WorkspaceRole::Dev);
+        assert!(!dev.is_review());
+
+        // Explicit `role: review` (lowercase wire form) → Review.
+        let rev: WorkspaceSpec =
+            serde_yaml::from_str("{ name: review-1, machine: hub, runner: claude, role: review }")
+                .unwrap();
+        assert_eq!(rev.role, WorkspaceRole::Review);
+        assert!(rev.is_review());
+    }
+
+    #[test]
+    fn default_role_is_elided_on_the_wire() {
+        // A Dev workspace must not grow a `role:` key, so existing YAMLs
+        // round-trip byte-identically.
+        let dev = ws("alpha", "hub", WorkspaceRole::Dev);
+        let y = serde_yaml::to_string(&dev).unwrap();
+        assert!(!y.contains("role"), "unexpected role key on the wire: {y}");
+
+        // A Review workspace does serialize its role.
+        let rev = ws("review-1", "hub", WorkspaceRole::Review);
+        let y = serde_yaml::to_string(&rev).unwrap();
+        assert!(y.contains("role: review"), "missing role key: {y}");
+    }
+
+    #[test]
+    fn review_and_dev_workspace_partitioning() {
+        let project = project_with_workspaces(vec![
+            ws("alpha", "hub", WorkspaceRole::Dev),
+            ws("review-1", "hub", WorkspaceRole::Review),
+            ws("beta", "devbox", WorkspaceRole::Dev),
+            ws("review-1", "devbox", WorkspaceRole::Review),
+        ]);
+
+        let hub_review = project.review_workspaces("hub");
+        assert_eq!(hub_review.len(), 1);
+        assert_eq!(hub_review[0].name, "review-1");
+        assert_eq!(hub_review[0].machine, "hub");
+
+        // Machine scoping: a machine with no review workspaces yields none.
+        assert!(project.review_workspaces("nonexistent").is_empty());
+
+        let dev = project.dev_workspaces();
+        let dev_names: Vec<&str> = dev.iter().map(|w| w.name.as_str()).collect();
+        assert_eq!(dev_names, vec!["alpha", "beta"]);
+    }
+
+    #[test]
+    fn at_most_two_review_workspaces_per_machine() {
+        // Exactly two on one machine is fine.
+        let ok = project_with_workspaces(vec![
+            ws("review-1", "hub", WorkspaceRole::Review),
+            ws("review-2", "hub", WorkspaceRole::Review),
+        ]);
+        assert!(ok.validate_workspaces().is_ok());
+
+        // A third on the same machine is a hard error with a clear message.
+        let over = project_with_workspaces(vec![
+            ws("review-1", "hub", WorkspaceRole::Review),
+            ws("review-2", "hub", WorkspaceRole::Review),
+            ws("review-3", "hub", WorkspaceRole::Review),
+        ]);
+        match over.validate_workspaces() {
+            Err(crate::Error::Other(msg)) => {
+                assert!(msg.contains("hub"), "message should name the machine: {msg}");
+                assert!(
+                    msg.contains("review workspaces"),
+                    "message should explain the invariant: {msg}"
+                );
+            }
+            other => panic!("expected a hard error, got {other:?}"),
+        }
+
+        // The cap is per-machine: two on hub + two on devbox is fine.
+        let split = project_with_workspaces(vec![
+            ws("review-1", "hub", WorkspaceRole::Review),
+            ws("review-2", "hub", WorkspaceRole::Review),
+            ws("review-1", "devbox", WorkspaceRole::Review),
+            ws("review-2", "devbox", WorkspaceRole::Review),
+        ]);
+        assert!(split.validate_workspaces().is_ok());
+    }
+
+    #[test]
+    fn review_config_defaults_apply_when_block_absent() {
+        // A project YAML with no `review:` block gets the documented
+        // defaults: base port 3000, stride 10, no setup/serve/probe.
+        let rc = ReviewConfig::default();
+        assert_eq!(rc.base_port, 3000);
+        assert_eq!(rc.port_stride, 10);
+        assert!(rc.setup.is_empty());
+        assert!(rc.serve.is_none());
+        assert!(rc.ready_probe.is_none());
+
+        // Parsing an empty mapping fills every field from its default.
+        let parsed: ReviewConfig = serde_yaml::from_str("{}").unwrap();
+        assert_eq!(parsed, rc);
+
+        // Partial blocks override only the named fields.
+        let partial: ReviewConfig = serde_yaml::from_str(
+            "base_port: 4000\nsetup: [npm install]\nready_probe: { http: http://localhost:4000, timeout: 45 }",
+        )
+        .unwrap();
+        assert_eq!(partial.base_port, 4000);
+        assert_eq!(partial.port_stride, 10); // still the default
+        assert_eq!(partial.setup, vec!["npm install".to_string()]);
+        let probe = partial.ready_probe.expect("probe parsed");
+        assert_eq!(probe.http.as_deref(), Some("http://localhost:4000"));
+        assert_eq!(probe.timeout, Duration::from_secs(45));
+    }
+
+    #[test]
+    fn absent_review_block_is_elided_on_the_wire() {
+        // A default ReviewConfig on a project must not emit a `review:`
+        // key, so existing project YAMLs round-trip byte-identically.
+        let project = project_with_workspaces(vec![ws("alpha", "hub", WorkspaceRole::Dev)]);
+        let y = serde_yaml::to_string(&project).unwrap();
+        assert!(!y.contains("review:"), "unexpected review block: {y}");
+        assert!(!y.contains("role:"), "unexpected role key: {y}");
     }
 
     // ---- Zen Mode ----------------------------------------------------------
@@ -1903,6 +2262,7 @@ workspace_settings_template: /etc/shelbi/p.json
             zen,
             heartbeat: HeartbeatConfig::default(),
             git: GitConfig::default(),
+            review: ReviewConfig::default(),
             contextstore_sync: Vec::new(),
             detected_shapes: Vec::new(),
         }
@@ -2826,6 +3186,16 @@ git:
                 base_branch: Some("trunk".into()),
                 merge_strategy: MergeStrategy::Rebase,
             },
+            review: ReviewConfig {
+                base_port: 4000,
+                port_stride: 20,
+                setup: vec!["npm install".into()],
+                serve: Some("npm run dev -- --port $PORT".into()),
+                ready_probe: Some(ReadyProbe {
+                    http: Some("http://localhost:$PORT".into()),
+                    timeout: Duration::from_secs(45),
+                }),
+            },
             repo: "/home/dev/shelbi".into(),
             machines: vec![Machine {
                 name: "hub".into(),
@@ -2838,6 +3208,7 @@ git:
                 name: "alpha".into(),
                 machine: "hub".into(),
                 runner: "claude".into(),
+                role: WorkspaceRole::Review,
             }],
             contextstore_sync: vec![ContextStoreSyncSpec {
                 space: "Shelbi".into(),

@@ -1978,6 +1978,7 @@ mod probe_tests {
                 name: "ws1".into(),
                 machine: "hub".into(),
                 runner: "claude".into(),
+                role: Default::default(),
             }],
             workspace_poll_interval_secs: 5,
             workspace_permissions_mode: "auto".into(),
@@ -1992,6 +1993,7 @@ mod probe_tests {
             contextstore_sync: Vec::new(),
             detected_shapes: Vec::new(),
             git: GitConfig::default(),
+            review: Default::default(),
         }
     }
 

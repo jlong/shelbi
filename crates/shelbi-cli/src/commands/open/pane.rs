@@ -447,6 +447,7 @@ mod tests {
             name: "alpha".into(),
             machine: "hub".into(),
             runner: "stub".into(),
+            role: Default::default(),
         };
         // Runner is `/bin/sh -c 'exit 0'` — fast, deterministic, no
         // dependency on claude being installed for the test to run.
@@ -492,6 +493,7 @@ mod tests {
             name: "alpha".into(),
             machine: "hub".into(),
             runner: "stub".into(),
+            role: Default::default(),
         };
         // Runner writes the value the wrapper pinned into its env into a
         // file the test reads back below. `printenv VAR` exits 1 if the
@@ -537,6 +539,7 @@ mod tests {
             name: "bravo".into(),
             machine: "hub".into(),
             runner: "stub".into(),
+            role: Default::default(),
         };
         let runner = AgentRunnerSpec {
             command: "/bin/sh".into(),
@@ -608,6 +611,7 @@ mod tests {
             zen: ZenConfig::default(),
             heartbeat: HeartbeatConfig::default(),
             git: GitConfig::default(),
+            review: Default::default(),
             contextstore_sync: Vec::new(),
             detected_shapes: Vec::new(),
         }
@@ -722,6 +726,7 @@ mod tests {
             name: "alpha".into(),
             machine: "hub".into(),
             runner: "stub".into(),
+            role: Default::default(),
         };
         // Runner prints the three vars (newline-separated, stable
         // order) into a file we then read back.
@@ -776,6 +781,7 @@ mod tests {
             name: "alpha".into(),
             machine: "hub".into(),
             runner: "stub".into(),
+            role: Default::default(),
         };
         // worktree path the spawn path will compute for this workspace
         // — needs to exist so the stub runner's `cd` doesn't fall back
@@ -887,6 +893,7 @@ mod tests {
             name: "alpha".into(),
             machine: "hub".into(),
             runner: "stub".into(),
+            role: Default::default(),
         };
         // Runner writes the marker mid-run (simulates a concurrent
         // `shelbi task start` marking the teardown while the wrapper is
@@ -951,6 +958,7 @@ mod tests {
             name: "alpha".into(),
             machine: "hub".into(),
             runner: "stub".into(),
+            role: Default::default(),
         };
         // The runner re-plants the marker AFTER the wrapper's startup
         // `clear_expected_teardown` has already run, then rewinds its
@@ -1017,6 +1025,7 @@ mod tests {
             name: "alpha".into(),
             machine: "hub".into(),
             runner: "stub".into(),
+            role: Default::default(),
         };
         let runner = AgentRunnerSpec {
             command: "/bin/sh".into(),
@@ -1068,6 +1077,7 @@ mod tests {
             name: "alpha".into(),
             machine: "hub".into(),
             runner: "stub".into(),
+            role: Default::default(),
         };
         let runner = AgentRunnerSpec {
             command: "/bin/sh".into(),

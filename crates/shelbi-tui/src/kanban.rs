@@ -2911,6 +2911,7 @@ mod tests {
             default_branch: "main".into(),
             config_mode: None,
             git: shelbi_core::GitConfig::default(),
+            review: Default::default(),
             machines: vec![shelbi_core::Machine {
                 name: "hub".into(),
                 kind: shelbi_core::MachineKind::Local,
@@ -2938,11 +2939,13 @@ mod tests {
                     name: "alpha".into(),
                     machine: "hub".into(),
                     runner: "claude".into(),
+                    role: Default::default(),
                 },
                 shelbi_core::WorkspaceSpec {
                     name: "bravo".into(),
                     machine: "hub".into(),
                     runner: "claude".into(),
+                    role: Default::default(),
                 },
             ],
             workspace_poll_interval_secs: 5,

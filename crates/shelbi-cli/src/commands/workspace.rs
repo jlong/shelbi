@@ -339,6 +339,7 @@ mod tests {
             name: name.to_string(),
             machine: machine.to_string(),
             runner: runner.to_string(),
+            role: Default::default(),
         }
     }
 

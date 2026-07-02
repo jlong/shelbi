@@ -265,6 +265,7 @@ mod tests {
                 name: "alice".into(),
                 machine: "hub".into(),
                 runner: "claude".into(),
+                role: Default::default(),
             }],
             workspace_poll_interval_secs: 5,
             workspace_permissions_mode: "auto".into(),
@@ -277,6 +278,7 @@ mod tests {
                 base_branch: base_branch.map(String::from),
                 ..Default::default()
             },
+            review: Default::default(),
         }
     }
 
