@@ -44,7 +44,7 @@ use chrono::{DateTime, Utc};
 use shelbi_core::{Column, Project};
 use shelbi_state::{
     append_contextstore_event, append_heartbeat_event, append_rebase_event, append_workspace_event,
-    events_log_path, load_workspace_status, parse_pane_title_marker, save_workspace_status, PaneMarker,
+    events_log_path, load_workspace_status, parse_pane_title_marker, save_workspace_status,
     WorkspaceState, WorkspaceStatus,
 };
 
@@ -424,45 +424,14 @@ fn poll_one(
         }
     }
 
-    // `shelbi:review` is the workspace's explicit "ready for review" handoff
-    // (distinct from `shelbi:idle`, which fires on every claude turn
-    // end). When we see it, move the workspace's in-progress task into the
-    // review column — the same effect `shelbi task move <id> --to review`
-    // would have had, except shelbi isn't installed on remote workspaces.
-    //
-    // Idempotent: `current_task_for` only finds tasks still in
-    // InProgress, so once the move happens, subsequent observations of
-    // `shelbi:review` produce no task and we no-op. `move_task` is also
-    // itself a no-op when the column is unchanged.
-    if marker == PaneMarker::Review {
-        if let Some(task_id) = &current_task {
-            match shelbi_state::move_task(&project.name, task_id, Column::Review) {
-                Ok(Some((from, to, workflow))) => {
-                    if let Err(e) = shelbi_state::append_task_event(
-                        task_id,
-                        &workflow,
-                        from,
-                        to,
-                        "workspace:review-pane",
-                    ) {
-                        tracing::warn!(
-                            workspace = %workspace.name,
-                            task = %task_id,
-                            error = %e,
-                            "review handoff: append_task_event failed",
-                        );
-                    }
-                }
-                Ok(None) => {}
-                Err(e) => tracing::warn!(
-                    workspace = %workspace.name,
-                    task = %task_id,
-                    error = %e,
-                    "review handoff: move_task failed",
-                ),
-            }
-        }
-    }
+    // A `shelbi:review` pane title is treated as a *state hint* only, never
+    // as a board-move trigger. Any program the agent runs (a build script,
+    // `cat` of a hostile file, test output) can emit an OSC title sequence
+    // ending in `shelbi:review` and drive the pane title, so acting on it
+    // here would let untrusted checked-out code promote a task mid-work. The
+    // sole trigger for the review column move is the independent file-based
+    // review marker, consumed by `maybe_promote_to_review` above — a file
+    // the agent's UI can't clobber.
 
     *last_known = Some(outcome.status.state);
 }

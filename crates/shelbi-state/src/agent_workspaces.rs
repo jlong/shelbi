@@ -27,7 +27,7 @@ use std::path::PathBuf;
 use shelbi_core::{Error, Result};
 
 use crate::{
-    agents_dir, ensure_dir, load_shelbi_config, project_dir, update_state,
+    agents_dir, atomic_write, ensure_dir, load_shelbi_config, project_dir, update_state,
     DEFAULT_WORKSPACE_SETTINGS_TEMPLATE,
 };
 
@@ -506,7 +506,11 @@ pub fn self_heal_default_agents(project: &str) -> Result<Vec<AgentMaterializeOut
             let current = match fs::read_to_string(&path) {
                 Ok(s) => s,
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                    fs::write(&path, agent.instructions).map_err(Error::Io)?;
+                    // Atomic (tmp + rename): a crash mid-write must never
+                    // leave a truncated `instructions.md`, which the next
+                    // self-heal pass would misclassify as a user
+                    // customization and preserve forever (F8).
+                    atomic_write(&path, agent.instructions.as_bytes())?;
                     state.notified_diverged_agents.remove(agent.name);
                     outcomes.push(AgentMaterializeOutcome::Created {
                         agent: agent.name.to_string(),
@@ -545,13 +549,16 @@ fn write_bundled_agent(project: &str, agent: &BundledAgent) -> Result<()> {
     let workspace = agent_workspace_dir(project, agent.name)?;
     ensure_dir(&workspace)?;
     ensure_dir(&agent_skills_dir(project, agent.name)?)?;
-    fs::write(
-        agent_instructions_path(project, agent.name)?,
-        agent.instructions,
-    )
-    .map_err(Error::Io)?;
+    // Atomic (tmp + rename) so a crash mid-`shelbi init` can't leave a
+    // truncated `instructions.md` that self-heal later preserves as a
+    // "customization" (F8) — the agent would then dispatch with half a
+    // prompt. `atomic_write` is the same sink `status.yaml`/`keys.yml` use.
+    atomic_write(
+        &agent_instructions_path(project, agent.name)?,
+        agent.instructions.as_bytes(),
+    )?;
     if let Some(settings) = agent.settings_template {
-        fs::write(agent_settings_path(project, agent.name)?, settings).map_err(Error::Io)?;
+        atomic_write(&agent_settings_path(project, agent.name)?, settings.as_bytes())?;
     }
     Ok(())
 }
@@ -570,7 +577,9 @@ fn ensure_agent_settings_present(project: &str, agent: &BundledAgent) -> Result<
     if path.exists() {
         return Ok(());
     }
-    fs::write(&path, default).map_err(Error::Io)
+    // Atomic write — a torn `settings.json` from a mid-write crash would
+    // drop the message-tail hooks silently (F8).
+    atomic_write(&path, default.as_bytes())
 }
 
 #[cfg(test)]
