@@ -15,7 +15,9 @@
 
 use std::path::{Path, PathBuf};
 
-use shelbi_core::{Error, Host, Machine, Project, Result, TmuxAddr, WorkspaceSpec};
+use shelbi_core::{
+    validate_task_id, Error, Host, Machine, Project, Result, TmuxAddr, WorkspaceSpec,
+};
 
 /// Absolute path to the currently-running `shelbi` binary, so the
 /// wrapper invocation we hand to tmux is anchored to *this* build
@@ -80,6 +82,15 @@ pub fn workspace_review_marker(machine: &Machine, workspace: &WorkspaceSpec) -> 
 /// it (trimmed) or `None` if the marker is absent or empty. Works for both
 /// local and remote workspaces — `cat` is routed through `shelbi-ssh`, which is
 /// a no-op wrapper for [`Host::Local`].
+///
+/// The marker body is a plain task id, so we validate it against
+/// [`validate_task_id`] — the same allowlist task ids pass everywhere else —
+/// before returning it. That rejects two failure modes as an `Err` (which the
+/// poller logs and, crucially, does *not* clear the marker on, so the signal
+/// survives to the next tick): a torn write (a half-flushed id from a
+/// non-atomic writer, though workers now write atomically) and a hostile body
+/// (e.g. anything but a bare id that a stray program dropped into the file).
+/// An invalid body never drives a board move.
 pub fn read_review_marker(host: &Host, marker: &Path) -> Result<Option<String>> {
     let path = marker.to_string_lossy().into_owned();
     let out = shelbi_ssh::run(host, ["cat", path.as_str()]).map_err(Error::Io)?;
@@ -89,7 +100,15 @@ pub fn read_review_marker(host: &Host, marker: &Path) -> Result<Option<String>> 
         return Ok(None);
     }
     let content = String::from_utf8_lossy(&out.stdout).trim().to_string();
-    Ok((!content.is_empty()).then_some(content))
+    if content.is_empty() {
+        return Ok(None);
+    }
+    validate_task_id(&content).map_err(|_| {
+        Error::Other(format!(
+            "review marker at {path} holds an invalid task id ({content:?}); leaving it in place"
+        ))
+    })?;
+    Ok(Some(content))
 }
 
 /// Remove the review-ready marker (idempotent — `rm -f` succeeds if absent).
@@ -1502,6 +1521,16 @@ fn compose_prompt(
     };
     let id_esc = shelbi_agent::shell_escape(task_id);
     let marker_esc = shelbi_agent::shell_escape(&marker.to_string_lossy());
+    // Write to a sibling temp file and `mv` it into place so the poller
+    // never `cat`s a half-written marker (a torn body would fail
+    // `validate_task_id` in `read_review_marker` and stall the handoff).
+    // `mv` within one directory is an atomic rename.
+    let marker_tmp = {
+        let mut s = marker.as_os_str().to_owned();
+        s.push(".tmp");
+        PathBuf::from(s)
+    };
+    let marker_tmp_esc = shelbi_agent::shell_escape(&marker_tmp.to_string_lossy());
     let polling_section = if polls_messages {
         message_polling_section(task_id, project, &id_esc)
     } else {
@@ -1528,7 +1557,7 @@ fn compose_prompt(
          2. Signal that it's ready for review by writing the task id to the \
          review marker file:\n\
          \n\
-         printf '%s\\n' {id_esc} > {marker_esc}\n\
+         printf '%s\\n' {id_esc} > {marker_tmp_esc} && mv {marker_tmp_esc} {marker_esc}\n\
          \n\
          The hub watches for this file and moves your task to the review \
          column on its next poll. Write the marker once; you can keep \
@@ -2018,6 +2047,78 @@ mod tests {
         assert_eq!(
             marker,
             PathBuf::from("/tmp/myapp/.shelbi/wt/alice/.claude/shelbi-review-ready")
+        );
+    }
+
+    #[test]
+    fn read_review_marker_returns_valid_task_id_and_rejects_garbage() {
+        // Local host `cat`s the marker file directly. A well-formed task id
+        // round-trips (trimmed); an empty/absent marker is `None`; a body
+        // that isn't a valid task id (torn write or hostile content) is an
+        // `Err` so the poller leaves the marker in place instead of clearing
+        // it on a parse failure.
+        let dir = std::env::temp_dir().join(format!(
+            "shelbi-review-marker-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let marker = dir.join("shelbi-review-ready");
+
+        // Absent → None.
+        assert!(read_review_marker(&Host::Local, &marker).unwrap().is_none());
+
+        // Valid id, with the trailing newline the worker writes → trimmed id.
+        std::fs::write(&marker, "fix-state-runtime-hardening\n").unwrap();
+        assert_eq!(
+            read_review_marker(&Host::Local, &marker).unwrap().as_deref(),
+            Some("fix-state-runtime-hardening")
+        );
+
+        // Empty (or whitespace-only) → None, not an error.
+        std::fs::write(&marker, "\n").unwrap();
+        assert!(read_review_marker(&Host::Local, &marker).unwrap().is_none());
+
+        // A body carrying spaces (a torn write, or an injected value) is not
+        // a valid task id → Err, so the caller doesn't clear it.
+        std::fs::write(&marker, "fix login now").unwrap();
+        assert!(read_review_marker(&Host::Local, &marker).is_err());
+
+        // A multi-line body (e.g. an OSC-injected second record) also fails
+        // validation on the first line's stray content.
+        std::fs::write(&marker, "evil id\nsecond line").unwrap();
+        assert!(read_review_marker(&Host::Local, &marker).is_err());
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn prompt_writes_marker_atomically_via_tmp_and_mv() {
+        // The worker must write the marker to a sibling temp file and `mv`
+        // it into place — a rename within one directory is atomic, so the
+        // poller never `cat`s a half-written body (which would fail
+        // `validate_task_id` and stall the handoff).
+        let marker = PathBuf::from("/work/myapp/.shelbi/wt/alice/.claude/shelbi-review-ready");
+        let prompt = compose_prompt(
+            "fix-login",
+            "shelbi/fix-login",
+            "Fix it.",
+            &marker,
+            "main",
+            "myapp",
+            false,
+        );
+        assert!(
+            prompt.contains(
+                "printf '%s\\n' fix-login > \
+                 /work/myapp/.shelbi/wt/alice/.claude/shelbi-review-ready.tmp && \
+                 mv /work/myapp/.shelbi/wt/alice/.claude/shelbi-review-ready.tmp \
+                 /work/myapp/.shelbi/wt/alice/.claude/shelbi-review-ready"
+            ),
+            "marker write is not atomic (tmp + mv): {prompt}"
         );
     }
 

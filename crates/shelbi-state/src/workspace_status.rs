@@ -89,9 +89,17 @@ impl PaneMarker {
 /// `None` if the marker is missing or unrecognized — the pane is either
 /// pre-hook-emit or running something other than a shelbi-deployed workspace.
 pub fn parse_pane_title_marker(title: &str) -> Option<PaneMarker> {
-    let idx = title.rfind("shelbi:")?;
-    let tail = &title[idx + "shelbi:".len()..];
-    let marker = tail.split(|c: char| c.is_whitespace()).next()?;
+    // Anchor to the *last whitespace-delimited token* and require it to
+    // *start* with `shelbi:`. A substring match (the old `rfind`) let
+    // `myshelbi:working`, or a task name like `fix shelbi:review parser`
+    // sitting mid-title, parse as a live marker. Our hooks always emit the
+    // marker as the trailing token of the OSC pane title, so the token
+    // boundary is the right anchor. This is a *state hint* only — board
+    // moves are driven solely by the independent file-based review marker
+    // (`maybe_promote_to_review`), never by this title, because any program
+    // the agent runs can print an OSC title sequence into the pane.
+    let last = title.split_whitespace().next_back()?;
+    let marker = last.strip_prefix("shelbi:")?;
     // Trim trailing control chars (BEL, ST) some terminals leave behind.
     let marker = marker.trim_end_matches(|c: char| c.is_control() || c == '\u{0007}');
     match marker {
@@ -271,6 +279,7 @@ pub fn append_workspace_event(
     new: WorkspaceState,
 ) -> Result<()> {
     let ts = Utc::now().to_rfc3339();
+    let workspace = sanitize_field(workspace);
     let prev_str = prev.map(|s| s.as_str()).unwrap_or("none");
     append_event_line(&format!("{ts} workspace={workspace} {prev_str} -> {new}"))
 }
@@ -283,6 +292,8 @@ pub fn append_workspace_event(
 /// and `shelbi events tail`.
 pub fn append_message_event(msg_id: &str, task_id: &str) -> Result<()> {
     let ts = Utc::now().to_rfc3339();
+    let msg_id = sanitize_field(msg_id);
+    let task_id = sanitize_field(task_id);
     append_event_line(&format!("{ts} message={msg_id} task={task_id} push=ok"))
 }
 
@@ -295,6 +306,8 @@ pub fn append_message_event(msg_id: &str, task_id: &str) -> Result<()> {
 /// pending map.
 pub fn append_message_ack_event(msg_id: &str, task_id: &str, kind: &str) -> Result<()> {
     let ts = Utc::now().to_rfc3339();
+    let msg_id = sanitize_field(msg_id);
+    let task_id = sanitize_field(task_id);
     let kind = sanitize_reason(kind);
     append_event_line(&format!("{ts} message={msg_id} task={task_id} ack={kind}"))
 }
@@ -311,6 +324,8 @@ pub fn append_message_ack_event(msg_id: &str, task_id: &str, kind: &str) -> Resu
 /// orchestration metadata).
 pub fn append_clarification_event(question_id: &str, task_id: &str, text: &str) -> Result<()> {
     let ts = Utc::now().to_rfc3339();
+    let question_id = sanitize_field(question_id);
+    let task_id = sanitize_field(task_id);
     let truncated = sanitize_reason(&truncate_with_ellipsis(text, CLARIFICATION_TEXT_BUDGET));
     append_event_line(&format!(
         "{ts} question={question_id} task={task_id} kind=clarification text={truncated}"
@@ -368,11 +383,12 @@ pub fn append_task_event(
     reason: &str,
 ) -> Result<()> {
     let ts = Utc::now().to_rfc3339();
+    let task_id = sanitize_field(task_id);
     let reason = sanitize_reason(reason);
     let workflow_name = if workflow.trim().is_empty() {
-        DEFAULT_WORKFLOW_NAME
+        DEFAULT_WORKFLOW_NAME.to_string()
     } else {
-        workflow
+        sanitize_field(workflow)
     };
     let from_category = from.category();
     let to_category = to.category();
@@ -389,6 +405,7 @@ pub fn append_task_event(
 /// activity feed.
 pub fn append_project_event(project: &str, action: &str, reason: &str) -> Result<()> {
     let ts = Utc::now().to_rfc3339();
+    let project = sanitize_field(project);
     let action = sanitize_reason(action);
     let reason = sanitize_reason(reason);
     append_event_line(&format!("{ts} project={project} {action} reason={reason}"))
@@ -409,6 +426,8 @@ pub fn append_contextstore_event(
     detail: &str,
 ) -> Result<()> {
     let ts = Utc::now().to_rfc3339();
+    let space = sanitize_field(space);
+    let machine = sanitize_field(machine);
     let status = sanitize_reason(status);
     let detail = sanitize_reason(detail);
     append_event_line(&format!(
@@ -440,6 +459,7 @@ pub fn append_zen_mode_event(prev: &str, new: &str, source: &str) -> Result<()> 
 /// stays a single parseable record (same convention as `append_task_event`).
 pub fn append_zen_dryrun_event(task_id: &str, action: &str, detail: &str) -> Result<()> {
     let ts = Utc::now().to_rfc3339();
+    let task_id = sanitize_field(task_id);
     let action = sanitize_reason(action);
     let detail = sanitize_reason(detail);
     append_event_line(&format!(
@@ -471,6 +491,7 @@ pub fn append_heartbeat_event(
     idle_workspaces: usize,
 ) -> Result<()> {
     let ts = Utc::now().to_rfc3339();
+    let project = sanitize_field(project);
     append_event_line(&format!(
         "{ts} project={project} heartbeat zen_eligible={zen_eligible} idle_workspaces={idle_workspaces}"
     ))
@@ -491,6 +512,8 @@ pub fn append_dispatch_event(
     detail: &str,
 ) -> Result<()> {
     let ts = Utc::now().to_rfc3339();
+    let task_id = sanitize_field(task_id);
+    let workspace = sanitize_field(workspace);
     let status = sanitize_reason(status);
     let detail = sanitize_reason(detail);
     append_event_line(&format!(
@@ -522,6 +545,7 @@ pub fn append_workspace_pane_event(
     alive: bool,
     reason: &str,
 ) -> Result<()> {
+    let workspace = sanitize_field(workspace);
     let reason = sanitize_reason(reason);
     let body = format!("workspace={workspace} pane_alive={alive} reason={reason}");
     emit_event_body(&body)
@@ -545,6 +569,8 @@ pub fn append_rebase_event(
     detail: &str,
 ) -> Result<()> {
     let ts = Utc::now().to_rfc3339();
+    let task_id = sanitize_field(task_id);
+    let workspace = sanitize_field(workspace);
     let branch = sanitize_reason(branch);
     let status = sanitize_reason(status);
     let detail = sanitize_reason(detail);
@@ -698,6 +724,17 @@ fn try_emit_via_socket(sock: &std::path::Path, body: &str) -> std::io::Result<()
 /// `writeln!(f, …)` would split the line into separate `write` syscalls
 /// per format fragment, which the OS is free to interleave.
 fn append_event_line(line: &str) -> Result<()> {
+    // Last-line defense against record injection: an embedded newline (from
+    // an unsanitized interpolated field) would split one logical event into
+    // two physical lines, the second of which a downstream parser reads as a
+    // forged record. Every `append_*` helper sanitizes its fields, but this
+    // shared sink rejects the tear outright so a future caller that forgets
+    // can't punch a hole. Mirrors the guard `emit_event_body` already applies.
+    if line.contains('\n') || line.contains('\r') {
+        return Err(shelbi_core::Error::Other(
+            "append_event_line: line may not contain newlines".into(),
+        ));
+    }
     let path = events_log_path()?;
     if let Some(parent) = path.parent() {
         ensure_dir(parent)?;
@@ -716,6 +753,30 @@ fn append_event_line(line: &str) -> Result<()> {
 fn sanitize_reason(s: &str) -> String {
     s.chars()
         .map(|c| if c.is_whitespace() { '_' } else { c })
+        .collect()
+}
+
+/// Sanitize an *identifier* field before interpolating it into an events.log
+/// line. Unlike [`sanitize_reason`] (which only folds whitespace, keeping
+/// free-text readable), identifiers — task ids from filenames, workflow
+/// names from user-editable YAML frontmatter, workspace/project/space/machine
+/// names from config that may be synced from a checked-out repo — are pinned
+/// to a strict `[A-Za-z0-9._:-]` allowlist. Every other byte, including
+/// whitespace, `\n`/`\r`, and `=`, folds to `_`.
+///
+/// This closes the record-injection gap: a raw newline in an id would
+/// otherwise write a second, attacker-shaped line the orchestrator's reaction
+/// rules act on, and stray whitespace would shift the space-delimited token
+/// positions every prefix/position-keyed parser depends on.
+fn sanitize_field(s: &str) -> String {
+    s.chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | ':' | '-') {
+                c
+            } else {
+                '_'
+            }
+        })
         .collect()
 }
 
@@ -790,6 +851,32 @@ mod tests {
         assert!(parse_pane_title_state("zsh").is_none());
         assert!(parse_pane_title_state("shelbi:bogus").is_none());
         assert!(parse_pane_title_state("").is_none());
+    }
+
+    #[test]
+    fn marker_match_is_anchored_to_a_token_boundary() {
+        // `rfind("shelbi:")` used to match a substring — `myshelbi:working`
+        // or a `shelbi:review` embedded mid-title (e.g. inside a task name
+        // the agent prints) parsed as a live marker. The parser now anchors
+        // on the trailing whitespace-delimited token starting with
+        // `shelbi:`, so a non-boundary occurrence is ignored.
+        assert!(
+            parse_pane_title_marker("myshelbi:working").is_none(),
+            "longer word ending in shelbi:… must not match"
+        );
+        assert!(
+            parse_pane_title_marker("fix shelbi:review parser").is_none(),
+            "a shelbi:… token that isn't the trailing token must not match"
+        );
+        // The legitimate trailing-token forms still parse.
+        assert_eq!(
+            parse_pane_title_marker("claude · shelbi:working"),
+            Some(PaneMarker::Working)
+        );
+        assert_eq!(
+            parse_pane_title_marker("shelbi:review"),
+            Some(PaneMarker::Review)
+        );
     }
 
     #[test]
@@ -1480,6 +1567,77 @@ mod tests {
             lines[0]
         );
         assert!(lines[0].ends_with(" to_category=done"), "line: {}", lines[0]);
+
+        std::env::remove_var("SHELBI_HOME");
+    }
+
+    #[test]
+    fn identifier_fields_cannot_inject_a_second_record() {
+        // A task id or workflow name carrying a newline used to write a
+        // second, attacker-shaped events.log line (task ids come from
+        // filenames, workflow names from user-editable YAML frontmatter).
+        // Every identifier field is now allowlist-sanitized, so the whole
+        // event stays a single physical line and the injected token folds
+        // to underscores.
+        let _g = TEST_LOCK.lock().unwrap();
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+
+        // The injection payload: a newline followed by a forged
+        // `workspace=... pane_alive=false` record the orchestrator would act
+        // on. The trailing spaces would also shift token positions.
+        let hostile_id = "evil\nworkspace=x pane_alive=false reason=pwned";
+        let hostile_workflow = "wf\r\nmode=zen off -> on reason=user:hotkey";
+        append_task_event(
+            hostile_id,
+            hostile_workflow,
+            Column::Todo,
+            Column::InProgress,
+            "assigned",
+        )
+        .unwrap();
+
+        let log = std::fs::read_to_string(events_log_path().unwrap()).unwrap();
+        let lines: Vec<&str> = log.lines().collect();
+        // Exactly one record — the newline never tore the line in two.
+        assert_eq!(lines.len(), 1, "log: {log:?}");
+        let line = lines[0];
+        // No raw injected key survives as its own token.
+        assert!(
+            !line.contains("pane_alive="),
+            "forged record leaked into the line: {line}"
+        );
+        // The id and workflow appear folded to the allowlist.
+        assert!(
+            line.contains(" task=evil_workspace_x_pane_alive_false_reason_pwned "),
+            "task id not sanitized: {line}"
+        );
+        assert!(
+            line.contains(" workflow=wf__mode_zen_off_-__on_reason_user:hotkey "),
+            "workflow not sanitized: {line}"
+        );
+        // The record still ends with the well-formed category annotations —
+        // token positions weren't shifted.
+        assert!(line.ends_with(" to_category=active"), "line: {line}");
+
+        std::env::remove_var("SHELBI_HOME");
+    }
+
+    #[test]
+    fn append_event_line_rejects_embedded_newlines() {
+        // Last-line defense: even if a future caller forgets to sanitize a
+        // field, the shared sink refuses a line carrying a newline rather
+        // than writing a torn/forged second record.
+        let _g = TEST_LOCK.lock().unwrap();
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+
+        let err = append_event_line("task=a\nworkspace=x pane_alive=false").unwrap_err();
+        assert!(err.to_string().contains("newlines"), "{err}");
+        assert!(!events_log_path().unwrap().exists());
+
+        let err = append_event_line("task=a\rworkspace=x").unwrap_err();
+        assert!(err.to_string().contains("newlines"), "{err}");
 
         std::env::remove_var("SHELBI_HOME");
     }
