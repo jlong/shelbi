@@ -31,7 +31,7 @@ use shelbi_core::{
 use crate::git::{
     compose_pr_body, head_commit_subject, locate_hub_workdir, locate_workspace_worktree,
     login_shell_prefix, lookup_open_pr, parse_pr_number_from_url, run_in_dir,
-    run_login_shell_script,
+    run_login_shell_script, wait_for_merge_commit_sha,
 };
 use crate::workspace::{rebase_workspace_branch_onto_default, workspace_worktree, RebaseOutcome};
 
@@ -406,7 +406,10 @@ fn merge_state_status(host: &Host, wt: &str, pr_str: &str) -> Result<String> {
 }
 
 /// Integrate `pr` and delete its source branch using the project's
-/// configured [`shelbi_core::MergeStrategy`]. Returns the merge SHA.
+/// configured [`shelbi_core::MergeStrategy`]. Returns the merge SHA, or
+/// `None` when GitHub reported the PR merged but hadn't recorded the
+/// merge commit yet after the polling window (merge queues, busy repos)
+/// — the merge itself succeeded.
 ///
 /// `expected_head` pins the merge to the exact commit the probe and
 /// ci-watch evaluated: when `Some`, gh receives `--match-head-commit
@@ -414,7 +417,11 @@ fn merge_state_status(host: &Host, wt: &str, pr_str: &str) -> Result<String> {
 /// TOCTOU window between "checks were green on X" and "merge whatever
 /// the head is now" is closed at the source. `None` preserves the
 /// unpinned behavior for manual invocations that never probed.
-pub fn pr_merge(project: &Project, pr: u64, expected_head: Option<&str>) -> Result<String> {
+pub fn pr_merge(
+    project: &Project,
+    pr: u64,
+    expected_head: Option<&str>,
+) -> Result<Option<String>> {
     let (host, dir) = locate_hub_workdir(project)?;
     let wt = dir.to_string_lossy().into_owned();
     let pr_str = pr.to_string();
@@ -444,35 +451,9 @@ pub fn pr_merge(project: &Project, pr: u64, expected_head: Option<&str>) -> Resu
         });
     }
 
-    // gh pr merge doesn't print the merge SHA. Ask gh for it separately.
-    let view = run_in_dir(
-        &host,
-        &wt,
-        &[
-            "gh",
-            "pr",
-            "view",
-            &pr_str,
-            "--json",
-            "mergeCommit",
-            "--jq",
-            ".mergeCommit.oid // empty",
-        ],
-    )?;
-    if !view.status.success() {
-        return Err(Error::Command {
-            cmd: format!("gh pr view {pr_str} --json mergeCommit"),
-            status: view.status.to_string(),
-            stderr: String::from_utf8_lossy(&view.stderr).into_owned(),
-        });
-    }
-    let sha = String::from_utf8_lossy(&view.stdout).trim().to_string();
-    if sha.is_empty() {
-        return Err(Error::Other(format!(
-            "gh pr view {pr_str}: merge reported success but mergeCommit.oid is empty"
-        )));
-    }
-    Ok(sha)
+    // gh pr merge doesn't print the merge SHA. Ask gh for it separately,
+    // polling — GitHub records the merge commit asynchronously.
+    wait_for_merge_commit_sha(&host, &wt, pr)
 }
 
 // ---------------------------------------------------------------------------

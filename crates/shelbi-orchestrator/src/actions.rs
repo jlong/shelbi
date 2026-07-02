@@ -42,11 +42,12 @@
 //! cleaning up a branch the branch is on origin, so gh / git from any
 //! hub checkout work fine.
 
-use shelbi_core::{Column, Error, Host, MergeStrategy, Project, Result, Task};
+use shelbi_core::{validate_branch, Column, Error, Host, MergeStrategy, Project, Result, Task};
 
 use crate::git::{
     compose_pr_body, head_commit_subject, locate_hub_workdir, locate_workspace_worktree,
-    lookup_open_pr, parse_pr_number_from_url, run_in_dir,
+    lookup_open_pr, lookup_pr_base, parse_pr_number_from_url, run_in_dir,
+    wait_for_merge_commit_sha,
 };
 use crate::workspace::workspace_worktree;
 
@@ -86,7 +87,10 @@ impl DeleteOutcome {
 pub enum MergeOutcome {
     /// An open PR for the task's branch was found and merged via
     /// `gh pr merge --<strategy>`. GitHub picked the merge commit SHA.
-    ViaPr { pr: u64, sha: String },
+    /// `sha` is `None` when GitHub reported the PR merged but hadn't
+    /// recorded the merge commit yet after our polling window (merge
+    /// queues, busy repos) — the merge itself succeeded.
+    ViaPr { pr: u64, sha: Option<String> },
     /// No PR was open. The hub fetched the branch from origin, ran
     /// `git merge --<strategy>` against `origin/<target>` in a throwaway
     /// temp worktree, and pushed the result to `origin/<target>`. The
@@ -98,20 +102,26 @@ pub enum MergeOutcome {
 impl MergeOutcome {
     /// Single-line wire format printed on stdout by `shelbi action merge`.
     /// Prefix-keyed (`pr:` / `hub:`) so a caller can tell the two paths
-    /// apart without parsing JSON.
+    /// apart without parsing JSON. A ViaPr merge whose SHA GitHub hasn't
+    /// recorded yet prints the literal token `sha-pending` in the SHA
+    /// slot.
     pub fn as_line(&self) -> String {
         match self {
-            MergeOutcome::ViaPr { pr, sha } => format!("pr:{pr}:{sha}"),
+            MergeOutcome::ViaPr { pr, sha } => {
+                format!("pr:{pr}:{}", sha.as_deref().unwrap_or("sha-pending"))
+            }
             MergeOutcome::HubSide { sha, target } => format!("hub:{target}:{sha}"),
         }
     }
 
     /// SHA of the integration commit, regardless of which path took it
     /// there. The caller usually wants this to log the merge or to feed
-    /// a follow-on `delete_branch` / restack pass.
-    pub fn sha(&self) -> &str {
+    /// a follow-on `delete_branch` / restack pass. `None` only for a
+    /// ViaPr merge whose SHA GitHub hadn't recorded yet.
+    pub fn sha(&self) -> Option<&str> {
         match self {
-            MergeOutcome::ViaPr { sha, .. } | MergeOutcome::HubSide { sha, .. } => sha,
+            MergeOutcome::ViaPr { sha, .. } => sha.as_deref(),
+            MergeOutcome::HubSide { sha, .. } => Some(sha),
         }
     }
 }
@@ -187,10 +197,10 @@ pub fn push_branch(project: &Project, task: &Task) -> Result<()> {
     let (host, worktree) = locate_workspace_worktree(project, task)?;
     let wt = worktree.to_string_lossy().into_owned();
 
-    let out = run_in_dir(&host, &wt, &["git", "push", "-u", "origin", &branch])?;
+    let out = run_in_dir(&host, &wt, &["git", "push", "-u", "origin", "--", &branch])?;
     if !out.status.success() {
         return Err(Error::Command {
-            cmd: format!("git -C {wt} push -u origin {branch}"),
+            cmd: format!("git -C {wt} push -u origin -- {branch}"),
             status: out.status.to_string(),
             stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
         });
@@ -338,9 +348,11 @@ where
 ///
 /// - **`gh pr merge` path** — when an open PR exists, the hub runs
 ///   `gh pr merge <pr> --<strategy>`. GitHub picks the merge commit and
-///   we read the SHA back via `gh pr view --json mergeCommit`. The PR's
-///   own base wins; we don't re-target it from `target_override` because
-///   `open_pr` was already responsible for picking the right base.
+///   we read the SHA back via `gh pr view --json mergeCommit` (polling —
+///   GitHub records it asynchronously). The PR's own base wins; we don't
+///   re-target it from `target_override` because `open_pr` was already
+///   responsible for picking the right base, and the child restack
+///   cascade uses that stored base (`baseRefName`) as its target.
 /// - **Hub-side fetch path** — when no PR is open, the hub fetches the
 ///   branch (and `target`) from origin, fast-forwards `target` to
 ///   `origin/target`, runs `git merge --<strategy>` against `target`,
@@ -386,24 +398,24 @@ pub fn merge(
     let (host, dir) = locate_hub_workdir(project)?;
     let wt = dir.to_string_lossy().into_owned();
 
-    let outcome = if let Some(pr) = lookup_open_pr(&host, &wt, &branch)? {
+    let (outcome, merged_target) = if let Some(pr) = lookup_open_pr(&host, &wt, &branch)? {
+        // gh pr merge respects the PR's *stored* base, which can differ
+        // from `target_override`/`project.base_branch()` — in a stacked
+        // workflow the PR merges into a parent branch, not the project
+        // base. Read `baseRefName` before merging so the children we
+        // restack land on the ref GitHub actually merged into.
+        let pr_base = lookup_pr_base(&host, &wt, pr)?;
         let sha = merge_via_pr(&host, &wt, pr, strategy)?;
-        MergeOutcome::ViaPr { pr, sha }
+        (MergeOutcome::ViaPr { pr, sha }, pr_base)
     } else {
         let sha = merge_hub_side(&host, &wt, &branch, &target, strategy, &task.id)?;
-        MergeOutcome::HubSide {
-            sha,
-            target: target.clone(),
-        }
-    };
-
-    let merged_target = match &outcome {
-        MergeOutcome::HubSide { target, .. } => target.clone(),
-        // gh pr merge respects the PR's stored base — that base was picked
-        // by `open_pr` (or the user), which is also where `target_override`
-        // would have applied. Mirror the same fallback chain here so the
-        // children we restack land on the right ref.
-        MergeOutcome::ViaPr { .. } => target.clone(),
+        (
+            MergeOutcome::HubSide {
+                sha,
+                target: target.clone(),
+            },
+            target,
+        )
     };
 
     let restacks = restack_children(project, project_name, task, &branch, &merged_target);
@@ -512,6 +524,11 @@ pub fn restack(
             reason: "no-branch".into(),
         });
     };
+    // The child branch doesn't come through `require_branch`, so guard it
+    // here — it's spliced into `--force-with-lease={branch}` and
+    // `HEAD:{branch}`, where a crafted value becomes a git option.
+    validate_branch(&child_branch)
+        .map_err(|e| Error::Other(format!("task `{task_id}`: {e}")))?;
 
     if let Some(workspace_name) = workspace_holding_branch(project, &child_branch)? {
         return Ok(RestackOutcome::Skipped {
@@ -552,8 +569,8 @@ pub fn restack(
     run_or_command_err(
         &host,
         &wt,
-        &["git", "fetch", "origin", &child_branch, from_base, &onto],
-        || format!("git -C {wt} fetch origin {child_branch} {from_base} {onto}"),
+        &["git", "fetch", "origin", "--", &child_branch, from_base, &onto],
+        || format!("git -C {wt} fetch origin -- {child_branch} {from_base} {onto}"),
     )?;
 
     let onto_ref = format!("origin/{onto}");
@@ -657,6 +674,7 @@ pub fn restack(
             "push",
             &format!("--force-with-lease={child_branch}"),
             "origin",
+            "--",
             &format!("HEAD:{child_branch}"),
         ],
     )?;
@@ -769,7 +787,16 @@ fn sanitize_path_segment(s: &str) -> String {
 /// merge commit SHA back with `gh pr view`. Mirrors the shape of
 /// [`crate::zen::pr_merge`] but stops short of `--delete-branch` — the
 /// workflow's `delete_branch` action is responsible for that.
-fn merge_via_pr(host: &Host, wt: &str, pr: u64, strategy: MergeStrategy) -> Result<String> {
+///
+/// Returns `None` when the PR reports `MERGED` but GitHub hadn't recorded
+/// the merge commit yet after the polling window — see
+/// [`wait_for_merge_commit_sha`].
+fn merge_via_pr(
+    host: &Host,
+    wt: &str,
+    pr: u64,
+    strategy: MergeStrategy,
+) -> Result<Option<String>> {
     let pr_str = pr.to_string();
     let strategy_flag = strategy.gh_flag();
     let out = run_in_dir(host, wt, &["gh", "pr", "merge", &pr_str, strategy_flag])?;
@@ -781,35 +808,9 @@ fn merge_via_pr(host: &Host, wt: &str, pr: u64, strategy: MergeStrategy) -> Resu
         });
     }
 
-    // gh pr merge doesn't print the merge SHA. Ask gh for it separately.
-    let view = run_in_dir(
-        host,
-        wt,
-        &[
-            "gh",
-            "pr",
-            "view",
-            &pr_str,
-            "--json",
-            "mergeCommit",
-            "--jq",
-            ".mergeCommit.oid // empty",
-        ],
-    )?;
-    if !view.status.success() {
-        return Err(Error::Command {
-            cmd: format!("gh pr view {pr_str} --json mergeCommit"),
-            status: view.status.to_string(),
-            stderr: String::from_utf8_lossy(&view.stderr).into_owned(),
-        });
-    }
-    let sha = String::from_utf8_lossy(&view.stdout).trim().to_string();
-    if sha.is_empty() {
-        return Err(Error::Other(format!(
-            "gh pr view {pr_str}: merge reported success but mergeCommit.oid is empty"
-        )));
-    }
-    Ok(sha)
+    // gh pr merge doesn't print the merge SHA. Ask gh for it separately,
+    // polling — GitHub records the merge commit asynchronously.
+    wait_for_merge_commit_sha(host, wt, pr)
 }
 
 /// Hub-side fetch + local merge — used when no PR exists for the branch.
@@ -860,8 +861,8 @@ fn merge_hub_side(
     run_or_command_err(
         host,
         wt,
-        &["git", "fetch", "origin", target, branch],
-        || format!("git -C {wt} fetch origin {target} {branch}"),
+        &["git", "fetch", "origin", "--", target, branch],
+        || format!("git -C {wt} fetch origin -- {target} {branch}"),
     )?;
 
     // Guard against "no commits beyond target." A no-op merge is not what
@@ -1077,7 +1078,11 @@ pub fn delete_branch(project: &Project, task: &Task) -> Result<DeleteOutcome> {
     }
 
     if remote_present {
-        let out = run_in_dir(&host, &wt, &["git", "push", "origin", "--delete", &branch])?;
+        let out = run_in_dir(
+            &host,
+            &wt,
+            &["git", "push", "origin", "--delete", "--", &branch],
+        )?;
         if !out.status.success() {
             // Race: the remote branch was removed between our probe and
             // the push (e.g. by a concurrent `gh pr merge --delete-branch`).
@@ -1086,7 +1091,7 @@ pub fn delete_branch(project: &Project, task: &Task) -> Result<DeleteOutcome> {
             let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
             if !stderr.contains("remote ref does not exist") {
                 return Err(Error::Command {
-                    cmd: format!("git -C {wt} push origin --delete {branch}"),
+                    cmd: format!("git -C {wt} push origin --delete -- {branch}"),
                     status: out.status.to_string(),
                     stderr,
                 });
@@ -1095,10 +1100,10 @@ pub fn delete_branch(project: &Project, task: &Task) -> Result<DeleteOutcome> {
     }
 
     if local_present {
-        let out = run_in_dir(&host, &wt, &["git", "branch", "-D", &branch])?;
+        let out = run_in_dir(&host, &wt, &["git", "branch", "-D", "--", &branch])?;
         if !out.status.success() {
             return Err(Error::Command {
-                cmd: format!("git -C {wt} branch -D {branch}"),
+                cmd: format!("git -C {wt} branch -D -- {branch}"),
                 status: out.status.to_string(),
                 stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
             });
@@ -1112,13 +1117,18 @@ pub fn delete_branch(project: &Project, task: &Task) -> Result<DeleteOutcome> {
 // helpers
 
 fn require_branch(task: &Task) -> Result<String> {
-    task.branch.clone().ok_or_else(|| {
+    let branch = task.branch.clone().ok_or_else(|| {
         Error::Other(format!(
             "task `{}` has no branch — populate `branch:` in its frontmatter \
              before running this action",
             task.id
         ))
-    })
+    })?;
+    // `save_task` validates `branch:` at write time, but frontmatter can
+    // be edited out of band — re-check before the value reaches git argv,
+    // where a dashed name would be parsed as an option.
+    validate_branch(&branch).map_err(|e| Error::Other(format!("task `{}`: {e}", task.id)))?;
+    Ok(branch)
 }
 
 /// Return the name of the first workspace whose worktree has `branch` checked
@@ -1256,6 +1266,22 @@ mod tests {
         let mut t = bare_task("ok");
         t.branch = Some("shelbi/ok".into());
         assert_eq!(require_branch(&t).unwrap(), "shelbi/ok");
+    }
+
+    #[test]
+    fn require_branch_rejects_git_option_shaped_values() {
+        // `save_task` already rejects these at write time, but frontmatter
+        // can be edited out of band — the action layer is the last stop
+        // before git argv.
+        for bad in ["--delete", "-f", "HEAD:other", "a b"] {
+            let mut t = bare_task("evil");
+            t.branch = Some(bad.into());
+            let err = require_branch(&t).unwrap_err();
+            assert!(
+                err.to_string().contains("invalid branch"),
+                "{bad}: {err}"
+            );
+        }
     }
 
     // --- git-backed primitives against fixture repos ----------------------
@@ -1692,17 +1718,23 @@ mod tests {
     fn merge_outcome_as_line_is_prefix_keyed() {
         let pr = MergeOutcome::ViaPr {
             pr: 42,
-            sha: "deadbeefcafef00d".into(),
+            sha: Some("deadbeefcafef00d".into()),
         };
         assert_eq!(pr.as_line(), "pr:42:deadbeefcafef00d");
-        assert_eq!(pr.sha(), "deadbeefcafef00d");
+        assert_eq!(pr.sha(), Some("deadbeefcafef00d"));
+
+        // Merged but GitHub hadn't recorded the SHA yet — success line
+        // with a stable placeholder token in the SHA slot.
+        let pending = MergeOutcome::ViaPr { pr: 42, sha: None };
+        assert_eq!(pending.as_line(), "pr:42:sha-pending");
+        assert_eq!(pending.sha(), None);
 
         let hub = MergeOutcome::HubSide {
             sha: "beadc0de".into(),
             target: "main".into(),
         };
         assert_eq!(hub.as_line(), "hub:main:beadc0de");
-        assert_eq!(hub.sha(), "beadc0de");
+        assert_eq!(hub.sha(), Some("beadc0de"));
     }
 
     #[test]
@@ -2685,6 +2717,138 @@ mod tests {
         assert!(outcomes.is_empty(), "{outcomes:?}");
 
         std::env::remove_var("SHELBI_HOME");
+    }
+
+    // --- merge via PR: restack target is the PR's stored base -------------
+    //
+    // The gh path is normally integration-only, but the F9 regression
+    // (children restacked onto the recomputed project base instead of the
+    // branch the PR actually merged into) needs pinning. We drive the
+    // public `merge()` end-to-end with a stub `gh` on PATH: `run_in_dir`
+    // launches every command through a login shell that sources
+    // `~/.profile` (see `git.rs::run_in_dir_runs_in_login_shell_that_sources_rc`),
+    // so pointing HOME at a tempdir whose `.profile` prepends our stub-bin
+    // dir makes `gh` resolve to the stub while `git` stays real.
+
+    #[test]
+    fn merge_via_pr_restacks_children_onto_the_prs_stored_base() {
+        let _g = auto_fire_lock();
+
+        // Stacked fixture, plus a `develop` branch simulating where PR #7
+        // for `parent` really merged: develop = main + squashed parent.
+        // The project base stays `main` — if merge() recomputes the
+        // restack target instead of reading the PR's baseRefName, the
+        // child lands on `main` and the assertion below catches it.
+        let (_tmp, _remote, local) = fixture_repo_with_stacked_branches();
+        run_git(&local, &["checkout", "-b", "develop", "main"]);
+        run_git(&local, &["merge", "--squash", "parent"]);
+        run_git(&local, &["commit", "-q", "-m", "squash parent into develop"]);
+        run_git(&local, &["push", "-u", "origin", "develop"]);
+        run_git(&local, &["checkout", "main"]);
+
+        let stub = tempfile::tempdir().unwrap();
+        let bin = stub.path().join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        std::fs::write(
+            bin.join("gh"),
+            r#"#!/bin/sh
+case "$*" in
+  *"pr list"*"--head parent"*) echo 7 ;;
+  *"pr list"*) : ;;
+  *"baseRefName"*) echo develop ;;
+  *"pr merge"*) : ;;
+  *"state,mergeCommit"*) echo "MERGED feedfacecafebeef" ;;
+esac
+exit 0
+"#,
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(
+                bin.join("gh"),
+                std::fs::Permissions::from_mode(0o755),
+            )
+            .unwrap();
+        }
+        std::fs::write(
+            stub.path().join(".profile"),
+            format!("export PATH=\"{}:$PATH\"\n", bin.display()),
+        )
+        .unwrap();
+
+        let prev_shell = std::env::var_os("SHELL");
+        let prev_home = std::env::var_os("HOME");
+        std::env::set_var("SHELL", "/bin/sh");
+        std::env::set_var("HOME", stub.path());
+        let home = fresh_shelbi_home("via-pr-base");
+        std::env::set_var("SHELBI_HOME", &home);
+
+        let mut parent_task = bare_task("par");
+        parent_task.branch = Some("parent".into());
+        write_task_file("fixture", &parent_task);
+        let mut child_task = bare_task("ch");
+        child_task.branch = Some("child".into());
+        child_task.depends_on = vec!["par".into()];
+        write_task_file("fixture", &child_task);
+
+        let project = project_with_no_workspaces(&local);
+        let result = merge(&project, "fixture", &parent_task, None);
+
+        // Restore the env before asserting so a failure doesn't leave the
+        // process-global vars pointing at dead tempdirs for later tests.
+        match prev_shell {
+            Some(v) => std::env::set_var("SHELL", v),
+            None => std::env::remove_var("SHELL"),
+        }
+        match prev_home {
+            Some(v) => std::env::set_var("HOME", v),
+            None => std::env::remove_var("HOME"),
+        }
+        std::env::remove_var("SHELBI_HOME");
+
+        let result = result.unwrap();
+        match &result.merge {
+            MergeOutcome::ViaPr { pr, sha } => {
+                assert_eq!(*pr, 7);
+                assert_eq!(sha.as_deref(), Some("feedfacecafebeef"));
+            }
+            other => panic!("expected ViaPr, got {other:?}"),
+        }
+        assert_eq!(result.restacks.len(), 1, "{:?}", result.restacks);
+        match &result.restacks[0] {
+            RestackOutcome::Restacked {
+                task_id, new_base, ..
+            } => {
+                assert_eq!(task_id, "ch");
+                // The F9 point: the child restacks onto the PR's stored
+                // base (`develop`), not the project base (`main`).
+                assert_eq!(new_base, "develop");
+            }
+            other => panic!("expected Restacked, got {other:?}"),
+        }
+
+        // And the git state agrees: origin/develop is now an ancestor of
+        // origin/child — the child's new history contains the squashed
+        // parent content that only exists on develop.
+        let wt = local.to_string_lossy().into_owned();
+        run_or_command_err(&Host::Local, &wt, &["git", "fetch", "origin"], || {
+            "git fetch origin".into()
+        })
+        .unwrap();
+        let is_ancestor = run_capture_stdout(
+            &Host::Local,
+            &wt,
+            &[
+                "git",
+                "merge-base",
+                "--is-ancestor",
+                "origin/develop",
+                "origin/child",
+            ],
+        );
+        assert!(is_ancestor.is_ok(), "{is_ancestor:?}");
     }
 
     #[test]
