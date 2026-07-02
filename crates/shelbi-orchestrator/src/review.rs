@@ -198,15 +198,34 @@ pub fn start_review(spec: ReviewSpec<'_>) -> Result<TmuxAddr> {
             wd = shelbi_agent::shell_escape(&spec.machine.work_dir.to_string_lossy()),
         )
     } else {
+        // `LANG=C.UTF-8` mirrors the workspace dispatch path: a
+        // non-interactive SSH launch can leave the tmux server in the C
+        // locale, and forcing UTF-8 keeps box-drawing/glyph rendering
+        // well-defined regardless of host config.
         format!(
-            "cd {wd} && exec \"${{SHELL:-/bin/bash}}\" -lc {launch}",
+            "cd {wd} && LANG=C.UTF-8 exec \"${{SHELL:-/bin/bash}}\" -lc {launch}",
             wd = shelbi_agent::shell_escape(&spec.machine.work_dir.to_string_lossy()),
             launch = shelbi_agent::shell_escape(&launch),
         )
     };
     shelbi_tmux::send_line(&host, &addr, &cd_launch)?;
 
-    std::thread::sleep(std::time::Duration::from_millis(1500));
+    // Wait until claude has drawn its input box before typing the prompt.
+    // A fixed sleep is fragile: on a slow/fresh/remote review pane claude
+    // may still be booting (prompt typed into scrollback) or showing a
+    // "trust this folder" dialog (prompt typed into the dialog, lost on the
+    // confirming Enter). `wait_for_claude_ready` auto-confirms the trust
+    // dialog and keys off the input-box footer. If the probe times out we
+    // still send — best effort beats aborting the review.
+    let ready = crate::ready::wait_for_claude_ready(&host, &addr, crate::ready::READY_TIMEOUT)?;
+    if !ready {
+        eprintln!(
+            "shelbi: claude readiness probe timed out after {}s on {}; \
+             sending the review prompt anyway",
+            crate::ready::READY_TIMEOUT.as_secs(),
+            addr.target(),
+        );
+    }
     let prompt = compose_review_prompt(&spec.task.id, &branch, spec.task_body);
     shelbi_tmux::send_line(&host, &addr, &prompt)?;
 

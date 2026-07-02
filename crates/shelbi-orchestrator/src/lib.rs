@@ -23,6 +23,7 @@ pub mod dispatch;
 mod git;
 pub mod handoff;
 pub mod lifecycle;
+pub mod ready;
 pub mod review;
 pub mod workspace;
 pub mod zen;
@@ -782,11 +783,15 @@ fn activity_cmd(shelbi_bin: &str, project_name: &str) -> String {
 // the SSH probe per remote workspace keeps this cheap-but-not-free, hence
 // the slower cadence than the kanban view.
 fn machines_cmd(shelbi_bin: &str, project_name: &str) -> String {
+    // The label must be shell-escaped like every other value: a raw
+    // project name interpolated into the single-quoted `echo` broke the
+    // render loop on a name containing `'` and let `x'; rm -rf ~; echo '`
+    // execute. Pass the escaped name as a separate `echo` argument so it's
+    // printed literally, never re-parsed by the shell.
     format!(
-        "while true; do printf '\\033c'; echo 'workspaces · {label}'; echo; {bin} --project {proj} workspace list 2>&1; sleep 5; done",
+        "while true; do printf '\\033c'; echo 'workspaces ·' {proj}; echo; {bin} --project {proj} workspace list 2>&1; sleep 5; done",
         bin = shelbi_agent::shell_escape(shelbi_bin),
         proj = shelbi_agent::shell_escape(project_name),
-        label = project_name,
     )
 }
 
@@ -1172,6 +1177,17 @@ mod pane_cmd_tests {
         assert!(out.contains("printf '\\033c'"));
         assert!(out.contains("/usr/local/bin/shelbi --project myapp workspace list"));
         assert!(out.contains("sleep 5"));
+    }
+
+    #[test]
+    fn machines_cmd_neutralizes_a_quote_injection_in_the_project_name() {
+        // A hostile/typo'd project name must not break out of the label or
+        // inject a command. shell_escape wraps the single quote as
+        // `'\''`, so the payload is printed literally, never executed.
+        let out = machines_cmd("/usr/local/bin/shelbi", "x'; rm -rf ~; echo '");
+        // The payload survives only inside the escaped single-quoted form —
+        // there is no unquoted `; rm -rf` that a shell would execute.
+        assert!(out.contains(r"'x'\''; rm -rf ~; echo '\'''"));
     }
 
     #[test]
