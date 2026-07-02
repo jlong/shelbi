@@ -22,9 +22,10 @@
 //! - `merge` integrates the task's branch into the target branch using the
 //!   project's configured merge strategy. Two paths: if a PR is open, runs
 //!   `gh pr merge --<strategy>`; otherwise the hub fetches from origin and
-//!   performs a local `git merge --<strategy>` on the target. After the
-//!   integration commit lands, fires `restack` on every not-`Done` child
-//!   that depends on this task. See [`merge`].
+//!   performs `git merge --<strategy>` in a throwaway temp worktree, then
+//!   pushes the result to `origin/<target>` — the hub's own checkout never
+//!   moves. After the integration commit lands, fires `restack` on every
+//!   not-`Done` child that depends on this task. See [`merge`].
 //! - `close_pr` closes any *open* PR for the task's branch; with no open
 //!   PR it returns `None` instead of erroring.
 //! - `delete_branch` removes the branch from origin and from the hub's
@@ -86,10 +87,11 @@ pub enum MergeOutcome {
     /// An open PR for the task's branch was found and merged via
     /// `gh pr merge --<strategy>`. GitHub picked the merge commit SHA.
     ViaPr { pr: u64, sha: String },
-    /// No PR was open. The hub fetched the branch from origin and ran
-    /// `git merge --<strategy>` against `target` locally, then pushed
-    /// `target` back to origin. The SHA is the resulting tip of
-    /// `target`.
+    /// No PR was open. The hub fetched the branch from origin, ran
+    /// `git merge --<strategy>` against `origin/<target>` in a throwaway
+    /// temp worktree, and pushed the result to `origin/<target>`. The
+    /// SHA is the resulting remote tip of `target`; the hub work_dir's
+    /// own checkout is never touched.
     HubSide { sha: String, target: String },
 }
 
@@ -603,18 +605,7 @@ pub fn restack(
         });
     }
 
-    // Make the path unique per call so concurrent restacks (and parallel
-    // test runs) don't collide on a shared `$TMPDIR/shelbi-restack-<id>/`
-    // — git worktree add refuses to overwrite an existing path.
-    static RESTACK_COUNTER: std::sync::atomic::AtomicU64 =
-        std::sync::atomic::AtomicU64::new(0);
-    let seq = RESTACK_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let tmp_path = std::env::temp_dir().join(format!(
-        "shelbi-restack-{}-{}-{}",
-        std::process::id(),
-        sanitize_path_segment(&task_id),
-        seq,
-    ));
+    let tmp_path = unique_temp_worktree_path("restack", &task_id);
     // git worktree add refuses to overwrite an existing path. Clean up
     // any stale dir from a previous crashed restack before we re-add.
     let _ = std::fs::remove_dir_all(&tmp_path);
@@ -748,6 +739,21 @@ fn lookup_open_pr_tolerant(host: &Host, wt: &str, branch: &str) -> Result<Option
     }
 }
 
+/// Unique-per-call `$TMPDIR` path for a throwaway git worktree. The
+/// process id + a process-wide counter keep concurrent calls (and
+/// parallel test runs) from colliding on the same path — `git worktree
+/// add` refuses to overwrite an existing one.
+fn unique_temp_worktree_path(kind: &str, id: &str) -> std::path::PathBuf {
+    static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let seq = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    std::env::temp_dir().join(format!(
+        "shelbi-{kind}-{}-{}-{}",
+        std::process::id(),
+        sanitize_path_segment(id),
+        seq,
+    ))
+}
+
 /// Map a task id (already validated to be kebab/snake alphanumeric) to a
 /// safe filesystem segment for the temp worktree path. Belt-and-suspenders
 /// against an out-of-band frontmatter edit that snuck a `/` past
@@ -808,20 +814,29 @@ fn merge_via_pr(host: &Host, wt: &str, pr: u64, strategy: MergeStrategy) -> Resu
 
 /// Hub-side fetch + local merge — used when no PR exists for the branch.
 /// Steps:
-/// 1. Refuse if the hub work_dir has uncommitted user changes (`.shelbi/`
-///    is exempt; the orchestrator scribbles there during normal operation).
-/// 2. `git fetch origin <target> <branch>` so we have the latest tips.
-/// 3. Refuse if the branch never made it to origin — that's a workflow
+/// 1. Refuse if the branch never made it to origin — that's a workflow
 ///    contract violation: `merge` runs after `push_branch` (or after the
 ///    user pushed the branch some other way). The error names the missing
 ///    ref so the operator can fix it.
-/// 4. Check out `target` and fast-forward to `origin/target` so the hub's
-///    target tracks the remote. A non-FF target means the hub diverged
-///    from origin — surface the failure rather than papering over it with
-///    a destructive reset.
-/// 5. Run `git merge --<strategy>` against `origin/<branch>` and, for
-///    `--squash`, follow with a commit since `--squash` only stages.
-/// 6. Push the resulting `target` tip to origin and return its SHA.
+/// 2. `git fetch origin <target> <branch>` so we have the latest tips.
+/// 3. Refuse if the branch has no commits beyond `origin/<target>` — a
+///    no-op merge would record yesterday's HEAD as a "merge SHA."
+/// 4. Run `git merge --<strategy>` against `origin/<branch>` in a
+///    throwaway temp worktree detached at `origin/<target>` — the same
+///    isolation [`restack`] uses. Each concurrent merge gets its own
+///    index and working tree, so two tasks merging at once can't
+///    interleave git state in the shared work_dir, and the hub's
+///    checked-out branch never moves (matching the ViaPr path, which
+///    doesn't touch the local checkout either). For `--squash`, follow
+///    with a commit since `--squash` only stages.
+/// 5. Push the resulting tip to `origin/<target>` and return its SHA.
+///
+/// The hub's local `<target>` branch ref is deliberately left alone:
+/// integration is a remote-side fact, and every consumer (probe,
+/// restack, the next merge) re-fetches `origin/<target>` before acting.
+/// If a concurrent merge lands on the target between our fetch and our
+/// push, the push is rejected as a non-fast-forward — re-running the
+/// action re-fetches and re-merges on top of the freshly landed tip.
 fn merge_hub_side(
     host: &Host,
     wt: &str,
@@ -830,21 +845,6 @@ fn merge_hub_side(
     strategy: MergeStrategy,
     task_id: &str,
 ) -> Result<String> {
-    let dirty = run_capture_stdout(host, wt, &["git", "status", "--porcelain"])?;
-    let user_dirty: Vec<&str> = dirty
-        .lines()
-        .filter(|l| {
-            let path = l.get(3..).unwrap_or("");
-            !(path.starts_with(".shelbi/") || path == ".shelbi" || path == ".gitignore")
-        })
-        .collect();
-    if !user_dirty.is_empty() {
-        return Err(Error::Other(format!(
-            "hub work_dir at {wt} has uncommitted changes — commit or stash before merging:\n{}",
-            user_dirty.join("\n")
-        )));
-    }
-
     // Probe `origin` for the branch *before* fetching so we can surface
     // the workflow-contract violation directly. A bare `git fetch
     // origin <branch>` against a missing ref dies with `couldn't find
@@ -864,16 +864,6 @@ fn merge_hub_side(
         || format!("git -C {wt} fetch origin {target} {branch}"),
     )?;
 
-    run_or_command_err(host, wt, &["git", "checkout", target], || {
-        format!("git -C {wt} checkout {target}")
-    })?;
-    run_or_command_err(
-        host,
-        wt,
-        &["git", "merge", "--ff-only", &format!("origin/{target}")],
-        || format!("git -C {wt} merge --ff-only origin/{target}"),
-    )?;
-
     // Guard against "no commits beyond target." A no-op merge is not what
     // any caller wants; bailing here surfaces the misconfiguration loudly
     // instead of returning yesterday's HEAD as the "merge SHA."
@@ -884,7 +874,7 @@ fn merge_hub_side(
             "git",
             "rev-list",
             "--count",
-            &format!("{target}..origin/{branch}"),
+            &format!("origin/{target}..origin/{branch}"),
         ],
     )?;
     if ahead.trim() == "0" {
@@ -893,22 +883,59 @@ fn merge_hub_side(
         )));
     }
 
+    let tmp_path = unique_temp_worktree_path("merge", task_id);
+    // git worktree add refuses to overwrite an existing path. Clean up
+    // any stale dir from a previous crashed merge before we re-add.
+    let _ = std::fs::remove_dir_all(&tmp_path);
+    let tmp = tmp_path.to_string_lossy().into_owned();
+    let origin_target = format!("origin/{target}");
+    run_or_command_err(
+        host,
+        wt,
+        &["git", "worktree", "add", "--detach", &tmp, &origin_target],
+        || format!("git -C {wt} worktree add --detach {tmp} {origin_target}"),
+    )?;
+
+    let merged = merge_and_push_in_worktree(host, &tmp, branch, target, strategy, task_id);
+
+    // Tear the worktree down regardless of outcome — a conflicted merge
+    // must not leak a half-merged tree into $TMPDIR. Best-effort, same
+    // as restack: the merge result (or its error) is what the caller
+    // gets either way.
+    let _ = run_in_dir(host, wt, &["git", "worktree", "remove", "--force", &tmp]);
+    let _ = std::fs::remove_dir_all(&tmp_path);
+
+    merged
+}
+
+/// The mutating half of [`merge_hub_side`], run entirely inside the
+/// throwaway worktree at `tmp` (detached at `origin/<target>`). Split
+/// out so the caller can tear the worktree down on every exit path
+/// without repeating the cleanup before each `?`.
+fn merge_and_push_in_worktree(
+    host: &Host,
+    tmp: &str,
+    branch: &str,
+    target: &str,
+    strategy: MergeStrategy,
+    task_id: &str,
+) -> Result<String> {
     let origin_branch = format!("origin/{branch}");
     match strategy {
         MergeStrategy::Squash => {
             run_or_command_err(
                 host,
-                wt,
+                tmp,
                 &["git", "merge", "--squash", &origin_branch],
-                || format!("git -C {wt} merge --squash origin/{branch}"),
+                || format!("git -C {tmp} merge --squash origin/{branch}"),
             )?;
             // `--squash` only stages; we still owe a commit. The message
             // matches the legacy `shelbi merge` shape so log readers see
             // the same prefix regardless of which path produced the
             // commit.
             let msg = format!("shelbi: merge {task_id} from {branch}");
-            run_or_command_err(host, wt, &["git", "commit", "-m", &msg], || {
-                format!("git -C {wt} commit -m \"{msg}\"")
+            run_or_command_err(host, tmp, &["git", "commit", "-m", &msg], || {
+                format!("git -C {tmp} commit -m \"{msg}\"")
             })?;
         }
         MergeStrategy::Merge => {
@@ -920,7 +947,7 @@ fn merge_hub_side(
             // default `Merge branch '…'` message stays.
             run_or_command_err(
                 host,
-                wt,
+                tmp,
                 &[
                     "git",
                     "merge",
@@ -928,22 +955,25 @@ fn merge_hub_side(
                     "--no-edit",
                     &origin_branch,
                 ],
-                || format!("git -C {wt} merge --no-ff origin/{branch}"),
+                || format!("git -C {tmp} merge --no-ff origin/{branch}"),
             )?;
         }
         MergeStrategy::Rebase => unreachable!("rejected upstream by require_supported_strategy"),
     }
 
-    run_or_command_err(host, wt, &["git", "push", "origin", target], || {
-        format!("git -C {wt} push origin {target}")
-    })?;
+    run_or_command_err(
+        host,
+        tmp,
+        &["git", "push", "origin", &format!("HEAD:{target}")],
+        || format!("git -C {tmp} push origin HEAD:{target}"),
+    )?;
 
-    let sha = run_capture_stdout(host, wt, &["git", "rev-parse", "HEAD"])?
+    let sha = run_capture_stdout(host, tmp, &["git", "rev-parse", "HEAD"])?
         .trim()
         .to_string();
     if sha.is_empty() {
         return Err(Error::Other(format!(
-            "post-merge `git rev-parse HEAD` returned empty output in {wt}"
+            "post-merge `git rev-parse HEAD` returned empty output in {tmp}"
         )));
     }
     Ok(sha)
@@ -1770,6 +1800,11 @@ mod tests {
         advance_feature_with_origin(&local);
         let wt = local.to_string_lossy().into_owned();
 
+        let head_before = run_capture_stdout(&Host::Local, &wt, &["git", "rev-parse", "HEAD"])
+            .unwrap()
+            .trim()
+            .to_string();
+
         let sha = merge_hub_side(
             &Host::Local,
             &wt,
@@ -1781,28 +1816,8 @@ mod tests {
         .unwrap();
         assert!(!sha.is_empty());
 
-        // The squashed change made it onto main locally.
-        let head_sha = run_capture_stdout(&Host::Local, &wt, &["git", "rev-parse", "HEAD"])
-            .unwrap()
-            .trim()
-            .to_string();
-        assert_eq!(head_sha, sha);
-        assert!(local.join("feature.txt").exists());
-
-        // The squash commit is a single new commit on main (the message
-        // is shelbi's, not the workspace's), so log shape: init, then merge.
-        let log = run_capture_stdout(
-            &Host::Local,
-            &wt,
-            &["git", "log", "main", "--format=%s"],
-        )
-        .unwrap();
-        let lines: Vec<&str> = log.lines().collect();
-        assert_eq!(lines.len(), 2, "{log}");
-        assert_eq!(lines[0], "shelbi: merge t from feature");
-        assert_eq!(lines[1], "init");
-
-        // And the merge made it to origin too.
+        // The squashed change landed on origin/main — integration is a
+        // remote-side fact now that the merge runs in a temp worktree.
         let remote_sha = run_capture_stdout(
             &Host::Local,
             &wt,
@@ -1812,6 +1827,27 @@ mod tests {
         .trim()
         .to_string();
         assert_eq!(remote_sha, sha);
+
+        // The squash commit is a single new commit on origin/main (the
+        // message is shelbi's, not the workspace's), so log shape: init,
+        // then merge.
+        let log = run_capture_stdout(
+            &Host::Local,
+            &wt,
+            &["git", "log", "origin/main", "--format=%s"],
+        )
+        .unwrap();
+        let lines: Vec<&str> = log.lines().collect();
+        assert_eq!(lines.len(), 2, "{log}");
+        assert_eq!(lines[0], "shelbi: merge t from feature");
+        assert_eq!(lines[1], "init");
+
+        // The hub work_dir's checkout never moved — like the ViaPr path.
+        let head_after = run_capture_stdout(&Host::Local, &wt, &["git", "rev-parse", "HEAD"])
+            .unwrap()
+            .trim()
+            .to_string();
+        assert_eq!(head_after, head_before, "hub checkout must not move");
     }
 
     #[test]
@@ -1831,16 +1867,16 @@ mod tests {
         .unwrap();
 
         // `--merge` strategy preserves the feature commit AND adds a
-        // merge commit on top, so three subjects show up in main's log:
-        // the merge commit, the feature commit, and the initial commit.
-        // We don't pin their interleaving — git log's default ordering
-        // for merges is topology-driven and can differ between git
-        // versions — but all three must be present and exactly one of
-        // them must be the merge commit.
+        // merge commit on top, so three subjects show up in the remote
+        // target's log: the merge commit, the feature commit, and the
+        // initial commit. We don't pin their interleaving — git log's
+        // default ordering for merges is topology-driven and can differ
+        // between git versions — but all three must be present and
+        // exactly one of them must be the merge commit.
         let log = run_capture_stdout(
             &Host::Local,
             &wt,
-            &["git", "log", "main", "--format=%s"],
+            &["git", "log", "origin/main", "--format=%s"],
         )
         .unwrap();
         let subjects: std::collections::HashSet<&str> = log.lines().collect();
@@ -1875,18 +1911,18 @@ mod tests {
         )
         .unwrap();
 
-        // main untouched; develop got the squash commit.
+        // origin/main untouched; origin/develop got the squash commit.
         let main_log = run_capture_stdout(
             &Host::Local,
             &wt,
-            &["git", "log", "main", "--format=%s"],
+            &["git", "log", "origin/main", "--format=%s"],
         )
         .unwrap();
         assert_eq!(main_log.trim(), "init");
         let dev_log = run_capture_stdout(
             &Host::Local,
             &wt,
-            &["git", "log", "develop", "--format=%s"],
+            &["git", "log", "origin/develop", "--format=%s"],
         )
         .unwrap();
         let dev_lines: Vec<&str> = dev_log.lines().collect();
@@ -1976,51 +2012,21 @@ mod tests {
     }
 
     #[test]
-    fn dirty_hub_work_dir_errors_before_touching_anything() {
+    fn dirty_hub_work_dir_neither_blocks_nor_leaks_into_the_merge() {
+        // The merge runs in a throwaway temp worktree, so the state of
+        // the hub work_dir — untracked scratch files, staged user edits,
+        // `.shelbi/` scribbles — is irrelevant: it can't block the merge
+        // and, more importantly, can't be swept into the integration
+        // commit. (The old in-place implementation had to refuse on a
+        // dirty tree precisely because a staged user change *would* have
+        // ridden along with a `--squash` commit.)
         let (_tmp, _remote, local) = fixture_repo_with_origin();
         advance_feature_with_origin(&local);
 
-        // Plant an unstaged user change in the hub work_dir.
+        // Untracked scratch file + a staged (but uncommitted) user edit.
         std::fs::write(local.join("user-wip.txt"), "scratch\n").unwrap();
-        let wt = local.to_string_lossy().into_owned();
-
-        let err = merge_hub_side(
-            &Host::Local,
-            &wt,
-            "feature",
-            "main",
-            MergeStrategy::Squash,
-            "t",
-        )
-        .unwrap_err();
-        let msg = err.to_string();
-        assert!(
-            msg.contains("uncommitted changes"),
-            "expected dirty-tree error, got {msg}",
-        );
-        assert!(msg.contains("user-wip.txt"), "error should name the dirty file: {msg}");
-
-        // Main untouched.
-        let log = run_capture_stdout(
-            &Host::Local,
-            &wt,
-            &["git", "log", "main", "--format=%s"],
-        )
-        .unwrap();
-        assert_eq!(log.trim(), "init");
-    }
-
-    #[test]
-    fn dirty_shelbi_subdir_does_not_block_merge() {
-        // `.shelbi/` is the orchestrator's scratch space — it's always
-        // dirty during normal operation (state.json, logs/, …) and the
-        // user never edits it directly. Mirroring `shelbi merge`'s
-        // preflight, ignore changes under that path.
-        let (_tmp, _remote, local) = fixture_repo_with_origin();
-        advance_feature_with_origin(&local);
-
-        std::fs::create_dir_all(local.join(".shelbi")).unwrap();
-        std::fs::write(local.join(".shelbi/state.json"), "{}\n").unwrap();
+        std::fs::write(local.join("README.md"), "staged user edit\n").unwrap();
+        run_git(&local, &["add", "README.md"]);
         let wt = local.to_string_lossy().into_owned();
 
         let sha = merge_hub_side(
@@ -2032,7 +2038,177 @@ mod tests {
             "t",
         )
         .unwrap();
-        assert!(!sha.is_empty());
+
+        // The squash commit contains exactly the feature's file — none of
+        // the hub work_dir's dirt.
+        let touched = run_capture_stdout(
+            &Host::Local,
+            &wt,
+            &["git", "show", "--name-only", "--format=", &sha],
+        )
+        .unwrap();
+        let files: Vec<&str> = touched.lines().filter(|l| !l.trim().is_empty()).collect();
+        assert_eq!(files, vec!["feature.txt"], "{touched}");
+
+        // And the user's in-flight state survived untouched.
+        assert!(local.join("user-wip.txt").exists());
+        let staged = run_capture_stdout(
+            &Host::Local,
+            &wt,
+            &["git", "diff", "--cached", "--name-only"],
+        )
+        .unwrap();
+        assert_eq!(staged.trim(), "README.md", "staged user edit must survive");
+    }
+
+    #[test]
+    fn hub_side_merge_leaves_hub_checkout_untouched() {
+        // F11: the old implementation checked `target` out in the shared
+        // work_dir and left it there. The temp-worktree implementation
+        // must leave the hub's checked-out branch and HEAD exactly where
+        // they were, and clean up its worktree.
+        let (_tmp, _remote, local) = fixture_repo_with_origin();
+        advance_feature_with_origin(&local);
+        let wt = local.to_string_lossy().into_owned();
+
+        // Park the hub on a branch that is *not* the merge target so a
+        // regression to "checkout target" is visible.
+        run_git(&local, &["checkout", "-q", "-b", "parked"]);
+        let head_before =
+            run_capture_stdout(&Host::Local, &wt, &["git", "rev-parse", "HEAD"]).unwrap();
+
+        let _sha = merge_hub_side(
+            &Host::Local,
+            &wt,
+            "feature",
+            "main",
+            MergeStrategy::Squash,
+            "t",
+        )
+        .unwrap();
+
+        let branch_after = run_capture_stdout(
+            &Host::Local,
+            &wt,
+            &["git", "rev-parse", "--abbrev-ref", "HEAD"],
+        )
+        .unwrap();
+        assert_eq!(branch_after.trim(), "parked", "checked-out branch must not change");
+        let head_after =
+            run_capture_stdout(&Host::Local, &wt, &["git", "rev-parse", "HEAD"]).unwrap();
+        assert_eq!(head_after, head_before, "HEAD must not move");
+
+        // No leaked temp worktree — only the main working tree remains.
+        let worktrees = run_capture_stdout(
+            &Host::Local,
+            &wt,
+            &["git", "worktree", "list", "--porcelain"],
+        )
+        .unwrap();
+        let count = worktrees
+            .lines()
+            .filter(|l| l.starts_with("worktree "))
+            .count();
+        assert_eq!(count, 1, "temp worktree must be removed:\n{worktrees}");
+    }
+
+    #[test]
+    fn concurrent_hub_side_merges_do_not_interleave_shared_state() {
+        // F2: two tasks merging at once used to run checkout/merge/commit
+        // in the same shared work_dir. With per-merge temp worktrees each
+        // merge owns its index, so concurrent merges can't cross-
+        // contaminate — the only allowed interference is a loud, clean
+        // failure (a non-fast-forward push or a transient ref lock),
+        // which a retry resolves.
+        let (_tmp, _remote, local) = fixture_repo_with_origin();
+
+        // Two independent branches, each adding its own file.
+        for (branch, file) in [("task-a", "a.txt"), ("task-b", "b.txt")] {
+            run_git(&local, &["checkout", "-q", "-b", branch, "main"]);
+            std::fs::write(local.join(file), format!("{branch}\n")).unwrap();
+            run_git(&local, &["add", file]);
+            run_git(&local, &["commit", "-q", "-m", &format!("{branch} work")]);
+            run_git(&local, &["push", "-q", "origin", branch]);
+        }
+        run_git(&local, &["checkout", "-q", "main"]);
+        let wt = local.to_string_lossy().into_owned();
+        let head_before =
+            run_capture_stdout(&Host::Local, &wt, &["git", "rev-parse", "HEAD"]).unwrap();
+
+        std::thread::scope(|s| {
+            let handles: Vec<_> = ["task-a", "task-b"]
+                .into_iter()
+                .map(|branch| {
+                    let wt = wt.clone();
+                    s.spawn(move || {
+                        // Retry: losing the push race (or a fetch ref-lock
+                        // collision) is the sanctioned loud failure; the
+                        // orchestrator would re-run the action the same way.
+                        for attempt in 0.. {
+                            match merge_hub_side(
+                                &Host::Local,
+                                &wt,
+                                branch,
+                                "main",
+                                MergeStrategy::Squash,
+                                branch,
+                            ) {
+                                Ok(sha) => return sha,
+                                Err(e) if attempt < 5 => {
+                                    eprintln!("{branch} attempt {attempt} retrying: {e}");
+                                    std::thread::sleep(std::time::Duration::from_millis(50));
+                                }
+                                Err(e) => panic!("{branch} failed after retries: {e}"),
+                            }
+                        }
+                        unreachable!()
+                    })
+                })
+                .collect();
+            for h in handles {
+                h.join().unwrap();
+            }
+        });
+
+        // Both squash commits landed on origin/main, and each touches
+        // exactly its own file — no cross-contamination between the two
+        // concurrent merges.
+        run_git(&local, &["fetch", "-q", "origin", "main"]);
+        let log = run_capture_stdout(
+            &Host::Local,
+            &wt,
+            &["git", "log", "origin/main", "--format=%H %s"],
+        )
+        .unwrap();
+        let lines: Vec<&str> = log.lines().collect();
+        assert_eq!(lines.len(), 3, "init + two squash commits expected:\n{log}");
+        for line in &lines[..2] {
+            let (sha, subject) = line.split_once(' ').unwrap();
+            let expected_file = if subject.contains("task-a") {
+                "a.txt"
+            } else if subject.contains("task-b") {
+                "b.txt"
+            } else {
+                panic!("unexpected commit subject: {subject}");
+            };
+            let touched = run_capture_stdout(
+                &Host::Local,
+                &wt,
+                &["git", "show", "--name-only", "--format=", sha],
+            )
+            .unwrap();
+            let files: Vec<&str> =
+                touched.lines().filter(|l| !l.trim().is_empty()).collect();
+            assert_eq!(files, vec![expected_file], "commit {subject} must touch only its own file");
+        }
+
+        // The shared work_dir came through clean and unmoved.
+        let head_after =
+            run_capture_stdout(&Host::Local, &wt, &["git", "rev-parse", "HEAD"]).unwrap();
+        assert_eq!(head_after, head_before, "hub HEAD must not move");
+        let status =
+            run_capture_stdout(&Host::Local, &wt, &["git", "status", "--porcelain"]).unwrap();
+        assert_eq!(status.trim(), "", "hub work_dir must stay clean");
     }
 
     // --- restack: wire format ---------------------------------------------

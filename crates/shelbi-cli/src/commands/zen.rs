@@ -99,7 +99,21 @@ pub enum ZenCmd {
     },
     /// Squash-merge the PR and delete the source branch. Prints the
     /// merge SHA on stdout.
-    PrMerge { pr_number: u64 },
+    ///
+    /// Always pass `--match-head-commit` with the `head_sha` from the
+    /// probe report: the merge is then pinned to exactly the commit the
+    /// probe and ci-watch evaluated, and GitHub refuses if the branch
+    /// gained commits since. Omitting it merges whatever the PR head is
+    /// *now* — only acceptable for manual invocations that never probed.
+    PrMerge {
+        pr_number: u64,
+        /// Head SHA the PR must still be at for the merge to proceed
+        /// (the `head_sha` field of the probe report). On mismatch the
+        /// merge fails loudly — re-run `shelbi zen probe` and retry
+        /// with the fresh SHA.
+        #[arg(long, value_name = "SHA")]
+        match_head_commit: Option<String>,
+    },
     /// Print backlog task ids that are mechanically eligible for Zen
     /// auto-promotion, one per line, in priority order. Mechanical only —
     /// the orchestrator's prompt applies the judgment categories on top.
@@ -204,9 +218,13 @@ pub fn run(project_opt: Option<String>, cmd: ZenCmd) -> Result<()> {
                 }
             }
         }
-        ZenCmd::PrMerge { pr_number } => {
+        ZenCmd::PrMerge {
+            pr_number,
+            match_head_commit,
+        } => {
             let project = load_project(&project_name).map_err(|e| anyhow!(e))?;
-            let sha = zen::pr_merge(&project, pr_number).map_err(|e| anyhow!(e))?;
+            let sha = zen::pr_merge(&project, pr_number, match_head_commit.as_deref())
+                .map_err(|e| anyhow!(e))?;
             println!("{sha}");
             // Forcing function: append the post-merge eligibility scan to the
             // command's own stdout so the orchestrator can't drop the scan it's
