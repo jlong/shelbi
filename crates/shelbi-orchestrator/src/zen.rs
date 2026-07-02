@@ -407,22 +407,40 @@ fn merge_state_status(host: &Host, wt: &str, pr_str: &str) -> Result<String> {
 
 /// Integrate `pr` and delete its source branch using the project's
 /// configured [`shelbi_core::MergeStrategy`]. Returns the merge SHA.
-pub fn pr_merge(project: &Project, pr: u64) -> Result<String> {
+///
+/// `expected_head` pins the merge to the exact commit the probe and
+/// ci-watch evaluated: when `Some`, gh receives `--match-head-commit
+/// <sha>` and refuses server-side if the PR head has moved since — the
+/// TOCTOU window between "checks were green on X" and "merge whatever
+/// the head is now" is closed at the source. `None` preserves the
+/// unpinned behavior for manual invocations that never probed.
+pub fn pr_merge(project: &Project, pr: u64, expected_head: Option<&str>) -> Result<String> {
     let (host, dir) = locate_hub_workdir(project)?;
     let wt = dir.to_string_lossy().into_owned();
     let pr_str = pr.to_string();
     let strategy_flag = project.merge_strategy().gh_flag();
 
-    let out = run_in_dir(
-        &host,
-        &wt,
-        &["gh", "pr", "merge", &pr_str, strategy_flag, "--delete-branch"],
-    )?;
+    let args = pr_merge_args(&pr_str, strategy_flag, expected_head);
+    let argv: Vec<&str> = args.iter().map(String::as_str).collect();
+    let out = run_in_dir(&host, &wt, &argv)?;
     if !out.status.success() {
+        let mut stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+        if let Some(sha) = expected_head {
+            // gh's own message names the mismatched SHAs but not the fix;
+            // tell the orchestrator what to do about it.
+            if !stderr.is_empty() && !stderr.ends_with('\n') {
+                stderr.push('\n');
+            }
+            stderr.push_str(&format!(
+                "shelbi: merge was pinned to head {sha} — if the branch \
+                 gained commits since the probe, re-run `shelbi zen probe` \
+                 (and ci-watch) and retry with the new head_sha"
+            ));
+        }
         return Err(Error::Command {
-            cmd: format!("gh pr merge {pr_str} {strategy_flag} --delete-branch"),
+            cmd: args.join(" "),
             status: out.status.to_string(),
-            stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
+            stderr,
         });
     }
 
@@ -459,6 +477,23 @@ pub fn pr_merge(project: &Project, pr: u64) -> Result<String> {
 
 // ---------------------------------------------------------------------------
 // helpers (kept `pub` where they're worth unit-testing on their own)
+
+/// Argv for the `gh pr merge` invocation [`pr_merge`] runs. Pinning to
+/// `expected_head` appends `--match-head-commit <sha>`, which makes GitHub
+/// itself reject the merge if the PR head is no longer the probed commit —
+/// the check-and-merge is atomic on the server, so there is no window for
+/// a sneaked-in commit between our poll and the merge.
+pub fn pr_merge_args(pr: &str, strategy_flag: &str, expected_head: Option<&str>) -> Vec<String> {
+    let mut args: Vec<String> = ["gh", "pr", "merge", pr, strategy_flag, "--delete-branch"]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+    if let Some(sha) = expected_head {
+        args.push("--match-head-commit".to_string());
+        args.push(sha.to_string());
+    }
+    args
+}
 
 /// Best-effort extraction of the first failing required check from the
 /// `gh pr checks` output. Rows are tab-separated:
@@ -545,6 +580,36 @@ mod tests {
         // the orchestrator's prompt can split on `:` without ambiguity.
         assert_eq!(line.matches(':').count(), 2);
         assert!(line.starts_with("red:lint_strict:"));
+    }
+
+    #[test]
+    fn pr_merge_args_pins_to_expected_head_when_given() {
+        let args = pr_merge_args("42", "--squash", Some("abc123"));
+        assert_eq!(
+            args,
+            vec![
+                "gh",
+                "pr",
+                "merge",
+                "42",
+                "--squash",
+                "--delete-branch",
+                "--match-head-commit",
+                "abc123",
+            ]
+        );
+    }
+
+    #[test]
+    fn pr_merge_args_stays_unpinned_without_expected_head() {
+        // Manual invocations that never probed keep the legacy shape —
+        // no stray `--match-head-commit` flag with nothing to match.
+        let args = pr_merge_args("7", "--merge", None);
+        assert_eq!(
+            args,
+            vec!["gh", "pr", "merge", "7", "--merge", "--delete-branch"]
+        );
+        assert!(!args.iter().any(|a| a == "--match-head-commit"));
     }
 
     #[test]
@@ -737,6 +802,13 @@ pub struct DangerPaths {
 /// field gates the rest.
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct ProbeReport {
+    /// The branch tip every fact in this report was computed against,
+    /// captured *after* the optional rebase. The orchestrator hands it
+    /// back to `shelbi zen pr-merge --match-head-commit <sha>` so the
+    /// merge is pinned to exactly the commit that was probed — a commit
+    /// pushed after the probe makes the merge refuse instead of landing
+    /// unchecked.
+    pub head_sha: String,
     pub local_checks: Vec<LocalCheck>,
     pub merge_conflict: ConflictProbe,
     /// Outcome of rebasing the branch onto the *current* default before the
@@ -829,6 +901,11 @@ pub fn probe_in_workflow(
         }
     };
 
+    // Capture the branch tip *after* the rebase settled — this is the
+    // commit every fact below describes, and the SHA the orchestrator
+    // must pin the eventual `pr-merge` to.
+    let head_sha = probe_head_sha(&host, &worktree, branch)?;
+
     let merge_conflict = probe_merge_conflict(&host, &worktree, branch, &base)?;
     let diff_size = probe_diff_size(&host, &worktree, branch, &base)?;
     let danger_paths = probe_danger_paths(project, workflow, &host, &worktree, branch, &base)?;
@@ -843,12 +920,21 @@ pub fn probe_in_workflow(
     };
 
     Ok(ProbeReport {
+        head_sha,
         local_checks,
         merge_conflict,
         rebase_conflict,
         diff_size,
         danger_paths,
     })
+}
+
+/// Resolve `branch`'s tip SHA in the workspace worktree. Read-only —
+/// safe under both rebase policies.
+fn probe_head_sha(host: &Host, worktree: &std::path::Path, branch: &str) -> Result<String> {
+    let wt = worktree.to_string_lossy().into_owned();
+    let stdout = shelbi_ssh::run_capture(host, ["git", "-C", wt.as_str(), "rev-parse", branch])?;
+    Ok(stdout.trim().to_string())
 }
 
 /// Fetch `base` from `origin` into the workspace worktree and return the
@@ -1992,6 +2078,13 @@ mod probe_tests {
         // The branch was actually rewritten onto the advanced default.
         assert_ne!(head_sha(&wt), before, "HEAD must move after the rebase");
         assert!(wt.join("fix.txt").exists(), "worktree must contain the fix after rebase");
+        // The report pins the *post-rebase* tip — the SHA pr-merge must be
+        // matched against, not the stale handoff commit.
+        assert_eq!(
+            report.head_sha,
+            head_sha(&wt),
+            "head_sha must be the rebased branch tip"
+        );
     }
 
     #[test]
@@ -2067,6 +2160,7 @@ mod probe_tests {
         assert_eq!(report.local_checks.len(), 1, "the check runs when up to date");
         assert_eq!(report.local_checks[0].exit_code, 0);
         assert_eq!(head_sha(&wt), before, "an up-to-date branch must not be rewritten");
+        assert_eq!(report.head_sha, before, "head_sha must be the (unmoved) branch tip");
     }
 }
 
@@ -2790,6 +2884,7 @@ mod dry_run_tests {
 
     fn ok_report() -> ProbeReport {
         ProbeReport {
+            head_sha: "deadbeef".into(),
             local_checks: vec![LocalCheck {
                 command: "cargo test".into(),
                 exit_code: 0,
