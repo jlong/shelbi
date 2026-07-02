@@ -12,3 +12,6 @@ description = "tmux send-keys / capture-pane abstractions for shelbi"
 shelbi-core = { workspace = true }
 shelbi-ssh = { workspace = true }
 tracing = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"
