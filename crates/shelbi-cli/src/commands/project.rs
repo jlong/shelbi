@@ -157,8 +157,8 @@ fn format_action(action: &MigrationAction) -> String {
         MigrationAction::MoveConfigFile { src, dst } => {
             format!("move file {} → {}", src.display(), dst.display())
         }
-        MigrationAction::DeleteGlobalYaml { path } => {
-            format!("delete    {}", path.display())
+        MigrationAction::RetireGlobalYaml { path, retired_path } => {
+            format!("retire    {} → {}", path.display(), retired_path.display())
         }
     }
 }
@@ -348,10 +348,11 @@ mod tests {
                 "move file",
             ),
             (
-                MigrationAction::DeleteGlobalYaml {
+                MigrationAction::RetireGlobalYaml {
                     path: PathBuf::from("/a"),
+                    retired_path: PathBuf::from("/a.migrated"),
                 },
-                "delete",
+                "retire",
             ),
         ];
         for (action, expected_prefix) in cases {

@@ -21,8 +21,10 @@
 //!   already-migrated pieces.
 //! * A YAML half left unparseable by an interrupted run (or by hand) is
 //!   re-queued for writing rather than treated as done, so the trailing
-//!   [`MigrationAction::DeleteGlobalYaml`] can never remove the last
-//!   loadable copy of the config.
+//!   [`MigrationAction::RetireGlobalYaml`] can never leave the project
+//!   without a loadable copy of the config. That step also *renames*
+//!   `<name>.yaml` to `<name>.yaml.migrated` rather than deleting it, so
+//!   even a fully-migrated project keeps a hand-rollback copy.
 //!
 //! Reversal is deliberately not offered here. See the command's `--help`
 //! for the git-revert-based rollback recipe.
@@ -84,10 +86,21 @@ pub enum MigrationAction {
     /// Move a top-level config file (currently just the workspace
     /// settings template) from the state dir to the in-repo dir.
     MoveConfigFile { src: PathBuf, dst: PathBuf },
-    /// Delete the now-superseded global project YAML at
-    /// `~/.shelbi/projects/<name>.yaml`. Only present in the plan when
-    /// that file still exists.
-    DeleteGlobalYaml { path: PathBuf },
+    /// Retire the now-superseded global project YAML at
+    /// `~/.shelbi/projects/<name>.yaml` by renaming it to `retired_path`
+    /// (`<name>.yaml.migrated`) rather than deleting it. The split loader
+    /// ([`crate::load_project`]) reaches the migrated config through the
+    /// two-file layout, so the global YAML is no longer read — but keeping
+    /// a renamed copy leaves a hand-rollback path and guarantees the
+    /// migration never destroys the last loadable copy of the config
+    /// (e.g. if an interrupted earlier run left a corrupt shared half).
+    /// The `.migrated` suffix keeps it out of `project_roots`' `*.yaml`
+    /// scan, so the retired file never re-registers the project. Only
+    /// present in the plan when the live `<name>.yaml` still exists.
+    RetireGlobalYaml {
+        path: PathBuf,
+        retired_path: PathBuf,
+    },
 }
 
 /// The full migration recipe for one project — a rendered plan plus the
@@ -112,9 +125,10 @@ pub struct MigrationPlan {
     pub shared_yaml_path: PathBuf,
     /// `~/.shelbi/projects/<name>/local.yaml`.
     pub local_yaml_path: PathBuf,
-    /// `~/.shelbi/projects/<name>.yaml` — the file the migration
-    /// deletes as its last step. Recorded even when it's already gone
-    /// so callers can render the intended layout consistently.
+    /// `~/.shelbi/projects/<name>.yaml` — the file the migration retires
+    /// (renames to `<name>.yaml.migrated`) as its last step. Recorded
+    /// even when it's already gone so callers can render the intended
+    /// layout consistently.
     pub global_yaml_path: PathBuf,
     /// `<repo>/.gitignore`.
     pub gitignore_path: PathBuf,
@@ -194,8 +208,8 @@ pub fn plan_in_repo_migration(project_name: &str) -> Result<MigrationPlan> {
 
     // An existing YAML half only counts as "done" if it actually loads.
     // A truncated/corrupt file left by an interrupted run must be
-    // rewritten — otherwise the DeleteGlobalYaml step below would remove
-    // the last parseable copy of the config. Each half is validated by
+    // rewritten — otherwise the RetireGlobalYaml step below would rename
+    // away the last parseable copy of the config. Each half is validated by
     // merging it with the freshly-synthesized other half, mirroring what
     // the split loader will do on the next open.
     if !existing_half_is_loadable(&shared_yaml_path, |text| {
@@ -233,7 +247,8 @@ pub fn plan_in_repo_migration(project_name: &str) -> Result<MigrationPlan> {
         }
     }
     if global_yaml_path.is_file() {
-        actions.push(MigrationAction::DeleteGlobalYaml {
+        actions.push(MigrationAction::RetireGlobalYaml {
+            retired_path: retired_global_yaml_path(&global_yaml_path),
             path: global_yaml_path.clone(),
         });
     }
@@ -300,16 +315,27 @@ fn apply_action(action: &MigrationAction) -> Result<()> {
         | MigrationAction::WriteLocalYaml { path, body } => write_yaml_file(path, body),
         MigrationAction::MoveConfigDir { src, dst } => move_dir(src, dst),
         MigrationAction::MoveConfigFile { src, dst } => move_file(src, dst),
-        MigrationAction::DeleteGlobalYaml { path } => {
-            match fs::remove_file(path) {
+        MigrationAction::RetireGlobalYaml { path, retired_path } => {
+            match fs::rename(path, retired_path) {
                 Ok(()) => Ok(()),
                 // Already gone — treat as success so a partial re-run
-                // that already deleted it can still complete.
+                // that already retired it can still complete.
                 Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
                 Err(e) => Err(Error::Io(e)),
             }
         }
     }
+}
+
+/// Path the global YAML is renamed to when a project migrates: the same
+/// file with `.migrated` appended to its name
+/// (`myapp.yaml` → `myapp.yaml.migrated`). The suffix is appended to the
+/// whole file name — never `with_extension`, which would turn
+/// `myapp.yaml` into `myapp.migrated` and collide distinct projects.
+fn retired_global_yaml_path(path: &Path) -> PathBuf {
+    let mut name = path.file_name().unwrap_or_default().to_os_string();
+    name.push(".migrated");
+    path.with_file_name(name)
 }
 
 fn write_yaml_file(path: &Path, body: &str) -> Result<()> {
@@ -458,7 +484,7 @@ struct LocalHeader {
     repo: String,
 }
 
-fn extract_repo_from_local_yaml(text: &str, path: &Path) -> Result<String> {
+pub(crate) fn extract_repo_from_local_yaml(text: &str, path: &Path) -> Result<String> {
     let hdr: LocalHeader = serde_yaml::from_str(text).map_err(|e| {
         Error::Other(format!(
             "failed to read `repo:` from local.yaml at {}: {e}",
@@ -625,12 +651,12 @@ mod tests {
                 MigrationAction::WriteLocalYaml { .. } => "local",
                 MigrationAction::MoveConfigDir { .. } => "dir",
                 MigrationAction::MoveConfigFile { .. } => "file",
-                MigrationAction::DeleteGlobalYaml { .. } => "delete",
+                MigrationAction::RetireGlobalYaml { .. } => "retire",
             })
             .collect();
         assert_eq!(
             kinds,
-            vec!["shared", "local", "dir", "dir", "file", "delete"]
+            vec!["shared", "local", "dir", "dir", "file", "retire"]
         );
         std::env::remove_var("SHELBI_HOME");
     }
@@ -665,7 +691,10 @@ mod tests {
             .is_file());
         assert!(!state.join("workflows").exists());
         assert!(!state.join("agents").exists());
+        // The global YAML is retired (renamed), not deleted: the live
+        // `<name>.yaml` is gone but a `.migrated` rollback copy remains.
         assert!(!home.join("projects/myapp.yaml").exists());
+        assert!(home.join("projects/myapp.yaml.migrated").is_file());
 
         // The shared YAML must carry `config_mode: in-repo` — that's
         // what tells the loader to route through the in-repo layout on
@@ -709,7 +738,7 @@ mod tests {
 
         let plan = plan_in_repo_migration("myapp").unwrap();
         // Shared write should NOT be in the plan (already exists);
-        // local write and global delete should.
+        // local write and global retire should.
         let kinds: Vec<&str> = plan
             .actions
             .iter()
@@ -718,7 +747,7 @@ mod tests {
                 MigrationAction::WriteLocalYaml { .. } => "local",
                 MigrationAction::MoveConfigDir { .. } => "dir",
                 MigrationAction::MoveConfigFile { .. } => "file",
-                MigrationAction::DeleteGlobalYaml { .. } => "delete",
+                MigrationAction::RetireGlobalYaml { .. } => "retire",
             })
             .collect();
         assert!(
@@ -727,8 +756,8 @@ mod tests {
         );
         assert!(kinds.contains(&"local"), "missing local write in {kinds:?}");
         assert!(
-            kinds.contains(&"delete"),
-            "missing global delete in {kinds:?}"
+            kinds.contains(&"retire"),
+            "missing global retire in {kinds:?}"
         );
 
         apply_migration_plan(&plan).unwrap();
@@ -765,7 +794,7 @@ mod tests {
                 MigrationAction::WriteLocalYaml { .. } => "local",
                 MigrationAction::MoveConfigDir { .. } => "dir",
                 MigrationAction::MoveConfigFile { .. } => "file",
-                MigrationAction::DeleteGlobalYaml { .. } => "delete",
+                MigrationAction::RetireGlobalYaml { .. } => "retire",
             })
             .collect()
     }
@@ -797,11 +826,11 @@ mod tests {
             .expect("corrupt shared yaml must be re-queued for writing");
         let delete_pos = kinds
             .iter()
-            .position(|k| *k == "delete")
-            .expect("global delete expected while the global yaml exists");
+            .position(|k| *k == "retire")
+            .expect("global retire expected while the global yaml exists");
         assert!(
             shared_pos < delete_pos,
-            "shared rewrite must precede the global delete: {kinds:?}"
+            "shared rewrite must precede the global retire: {kinds:?}"
         );
 
         apply_migration_plan(&plan).unwrap();
