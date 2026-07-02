@@ -34,27 +34,43 @@ pub(crate) fn run_in_dir(host: &Host, dir: &str, argv: &[&str]) -> Result<Output
     run_login_shell_script(host, &line).map_err(Error::Io)
 }
 
-/// Hand `script` to a login shell on `host`. Local just spawns
-/// `$SHELL -lc <script>` through `std::process`, which passes `script`
-/// as a single argv element — so the shell sees exactly the string we
-/// built. SSH is the trap: `shelbi_ssh::run` joins our argv with literal
-/// spaces and the remote default shell re-parses the result, so a script
-/// like `cd /worktree && cargo build` arrives at the remote as
-/// `$SHELL -lc cd /worktree && cargo build`. The remote shell then runs
-/// `$SHELL -lc cd /worktree` (the `cd` becomes the inner shell's
-/// command with `/worktree` as `$0` — a no-op) and `&& cargo build`
-/// falls out into the *outer* remote shell, executing from its cwd of
-/// `$HOME`. Single-quoting the script collapses it back to one token,
-/// which the remote shell unquotes before handing it to `$SHELL -lc`.
-/// `$SHELL` itself stays unquoted so the remote shell expands it to
-/// whichever shell that account uses.
+/// Hand `script` to a login shell on `host`.
+///
+/// Local just spawns `$SHELL -lc <script>` through `std::process`, which
+/// passes `script` as a single argv element — so the shell sees exactly
+/// the string we built.
+///
+/// SSH is the historical trap. `shelbi_ssh::build_command` now shell-
+/// escapes every argv element at the wire (F2), so we can no longer smuggle
+/// a bare `$SHELL` token across for the remote account shell to expand — it
+/// would arrive single-quoted and the remote shell would try to `exec` a
+/// file literally named `$SHELL`. Instead we hand the remote a fixed `sh -c`
+/// bootstrap that reintroduces exactly one controlled layer of
+/// interpretation: it expands `$SHELL` and re-execs the user's login shell
+/// in login mode (`-lc`) so their rc files rebuild `PATH`. The real script
+/// rides in as the positional parameter `$0` (not spliced into the code
+/// string), so `build_command`'s escaping is the *only* quoting applied —
+/// no caller-side pre-escape, nothing to double-escape.
 pub(crate) fn run_login_shell_script(host: &Host, script: &str) -> std::io::Result<Output> {
+    shelbi_ssh::run(host, login_shell_argv(host, script))
+}
+
+/// The argv `run_login_shell_script` hands to `shelbi_ssh::run` for `host`.
+/// Split out so tests can inspect / round-trip the wire without spawning a
+/// real command.
+fn login_shell_argv(host: &Host, script: &str) -> Vec<String> {
     let (shell, flag) = login_shell_prefix(host);
-    let arg = match host {
-        Host::Local => script.to_string(),
-        Host::Ssh { .. } => shelbi_agent::shell_escape(script),
-    };
-    shelbi_ssh::run(host, [shell.as_str(), flag, arg.as_str()])
+    match host {
+        Host::Local => vec![shell, flag.to_string(), script.to_string()],
+        Host::Ssh { .. } => vec![
+            "sh".to_string(),
+            "-c".to_string(),
+            // `sh -c CODE ARG0` binds ARG0 to `$0`; CODE expands $SHELL and
+            // re-execs it in login mode with the script as its `-c` arg.
+            format!("exec \"{shell}\" {flag} \"$0\""),
+            script.to_string(),
+        ],
+    }
 }
 
 /// `(shell, "-lc")` — the pair shelbi prepends to a shell script so it
@@ -310,63 +326,95 @@ mod tests {
         );
     }
 
-    /// Regression test for the `shelbi zen probe` devbox bug: when a
-    /// workspace is on a remote host, the script passed to the login
-    /// shell has to survive OpenSSH's "join argv with literal spaces"
-    /// behavior as a single token, or the `&&` in `cd <wt> && <cmd>`
-    /// leaks out to the *outer* remote shell and the command runs from
-    /// `$HOME`. We can't exercise a real ssh round-trip in unit tests, so
-    /// we inspect the argv that `shelbi_ssh::build_command` would hand to
-    /// the local `ssh` binary and assert the script is single-quoted.
-    #[test]
-    fn ssh_login_shell_script_is_single_quoted_on_the_wire() {
-        let host = Host::Ssh {
-            host: "devbox".into(),
-        };
-        let (shell, flag) = login_shell_prefix(&host);
-        // Same shape `run_one_check` builds: `cd <wt> && <cmd>`.
-        let script = "cd '/home/jlong/Workspaces/shelbi/.shelbi/wt/foxtrot' && cargo build --workspace";
-        let arg = match &host {
-            Host::Local => script.to_string(),
-            Host::Ssh { .. } => shelbi_agent::shell_escape(script),
-        };
-        let cmd = shelbi_ssh::build_command(&host, [shell.as_str(), flag, arg.as_str()]);
-        let argv: Vec<String> = cmd
+    /// The `run_login_shell_script` SSH argv, replayed through the local
+    /// `ssh` argv builder and then a local `sh -c` standing in for the
+    /// remote login shell. Returns the words after `--` joined the way ssh
+    /// would send them to the remote.
+    fn ssh_login_shell_wire(host: &Host, script: &str) -> String {
+        let cmd = shelbi_ssh::build_command(host, login_shell_argv(host, script));
+        let parts: Vec<String> = cmd
             .get_args()
             .map(|a| a.to_string_lossy().into_owned())
             .collect();
-        // The script must appear as a single quoted argv element so the
-        // remote shell hands it whole to `$SHELL -lc`. If this regresses
-        // to the raw script, `&&` would re-anchor to the remote shell
-        // and the cd would silently no-op (the original bug).
-        let script_arg = argv
-            .iter()
-            .find(|a| a.contains("cargo build --workspace"))
-            .expect("script arg missing from ssh argv");
-        assert!(
-            script_arg.starts_with('\'') && script_arg.ends_with('\''),
-            "expected script wrapped in single quotes for SSH, got: {script_arg}"
+        let dd = parts.iter().position(|a| a == "--").expect("missing --");
+        parts[dd + 1..].join(" ")
+    }
+
+    /// Regression test for the `shelbi zen probe` devbox bug (and its F2
+    /// evolution): the `cd <wt> && <cmd>` script has to survive OpenSSH's
+    /// "join argv with literal spaces" join AND the remote login-shell
+    /// bootstrap, or the `&&` leaks out to the outer remote shell and the
+    /// `cd` silently no-ops. We can't reach a real remote, so we replay the
+    /// exact wire through a local `sh -c` (with `$SHELL` forced to `/bin/sh`
+    /// for hermeticity) and assert both the `$SHELL` expansion and the `&&`
+    /// survive: only if the whole chain holds does the second clause run.
+    #[test]
+    fn ssh_login_shell_script_round_trips_through_remote_shell() {
+        let host = Host::Ssh {
+            host: "devbox".into(),
+        };
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().to_string_lossy();
+        // `cd <dir> && printf` — dir is shell_escaped into the script the
+        // way `run_in_dir` builds it. If `$SHELL` fails to expand, exec dies;
+        // if `&&` leaks, the printf runs from the wrong cwd or not at all.
+        let script = format!(
+            "cd {} && printf ran-in:%s \"$PWD\"",
+            shelbi_agent::shell_escape(&dir)
         );
-        // `$SHELL` itself must stay unquoted so the remote shell expands
-        // it to the user's actual login shell.
+        let wire = ssh_login_shell_wire(&host, &script);
+        let out = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(&wire)
+            .env("SHELL", "/bin/sh")
+            .output()
+            .expect("sh -c failed to run");
+        assert!(out.status.success(), "sh exited nonzero (wire: {wire})");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        // Canonicalize: macOS /var symlinks to /private/var, and login sh
+        // may resolve $PWD differently — compare on the trailing component.
         assert!(
-            argv.iter().any(|a| a == "$SHELL"),
-            "expected unquoted $SHELL token in ssh argv, got: {argv:?}"
+            stdout.starts_with("ran-in:") && stdout.trim().ends_with(tmp.path().file_name().unwrap().to_str().unwrap()),
+            "expected the cd+printf chain to run in {}, got: {stdout} (wire: {wire})",
+            dir,
+        );
+    }
+
+    /// Double-escape guard: the caller passes a *raw* script — no
+    /// `shell_escape` before `run_login_shell_script`. If a future edit
+    /// reintroduced a pre-escape, the script would arrive at the remote
+    /// wrapped in an extra layer of quotes and `sh -c` would echo the quote
+    /// characters back. Assert the payload comes through byte-for-byte.
+    #[test]
+    fn ssh_login_shell_script_is_not_double_escaped() {
+        let host = Host::Ssh {
+            host: "devbox".into(),
+        };
+        let script = "printf %s hello-world";
+        let wire = ssh_login_shell_wire(&host, script);
+        let out = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(&wire)
+            .env("SHELL", "/bin/sh")
+            .output()
+            .expect("sh -c failed to run");
+        assert!(out.status.success(), "sh exited nonzero (wire: {wire})");
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout),
+            "hello-world",
+            "payload was mangled — likely double-escaped (wire: {wire})",
         );
     }
 
     #[test]
-    fn local_login_shell_script_is_passed_verbatim() {
+    fn local_login_shell_argv_passes_script_verbatim() {
         // The local path goes through `std::process::Command`, which hands
         // each argv element to exec without a shell in between, so the
-        // script must NOT be wrapped in single quotes — bash -lc would
-        // then try to run a command literally named `'cd ... && cargo
-        // build'`.
+        // script must NOT be wrapped in single quotes — `$SHELL -lc` would
+        // then try to run a command literally named `'cd ... && echo hi'`.
         let script = "cd '/tmp' && echo hi";
-        let arg = match Host::Local {
-            Host::Local => script.to_string(),
-            Host::Ssh { .. } => shelbi_agent::shell_escape(script),
-        };
-        assert_eq!(arg, script);
+        let argv = login_shell_argv(&Host::Local, script);
+        assert_eq!(argv.last().map(String::as_str), Some(script));
+        assert_eq!(argv.get(1).map(String::as_str), Some("-lc"));
     }
 }

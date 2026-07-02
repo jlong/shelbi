@@ -455,7 +455,11 @@ mod tests {
                 "shelbi-w-fix-login",
                 "-n",
                 "agent",
-                "cd /work/myapp/.shelbi/wt/fix-login && claude",
+                // The command string is a single argv element and now rides
+                // the wire single-quoted, so the remote shell hands it whole
+                // to tmux instead of splitting at `&&` and launching claude
+                // outside tmux (the F2 loaded gun).
+                "'cd /work/myapp/.shelbi/wt/fix-login && claude'",
             ]
         );
     }
@@ -580,9 +584,72 @@ mod tests {
                 "display-message",
                 "-p",
                 "-t",
+                // Exact-match `=` target (tmux sweep F3) passes through the
+                // escaper unquoted — `=`, `:`, `-` are all in the safe set.
                 "=shelbi-w-fix-login:agent",
-                "#{pane_title}",
+                // Single-quoted on the wire so the remote shell doesn't eat
+                // `#{pane_title}` as a comment (F1). Without the quotes tmux
+                // never receives the format string and returns its default
+                // status line, so no `shelbi:*` marker ever parses.
+                "'#{pane_title}'",
             ]
+        );
+    }
+
+    #[test]
+    fn remote_pane_title_format_survives_the_remote_shell() {
+        // F1 round-trip: replay the exact wire ssh would emit for the
+        // pane_title probe through a local `sh -c` (the moral equivalent of
+        // the remote login shell), with a `tmux` shim on PATH that echoes
+        // the args it actually received. The format string must arrive as a
+        // distinct, intact argument — not stripped as a `#` comment.
+        let tmp = tempfile::tempdir().unwrap();
+        let shim = tmp.path().join("tmux");
+        std::fs::write(&shim, "#!/bin/sh\nfor a in \"$@\"; do printf '<%s>' \"$a\"; done\n")
+            .unwrap();
+        let mut perms = std::fs::metadata(&shim).unwrap().permissions();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            perms.set_mode(0o755);
+        }
+        std::fs::set_permissions(&shim, perms).unwrap();
+
+        let cmd = shelbi_ssh::build_command(
+            &Host::Ssh {
+                host: "m2.local".into(),
+            },
+            [
+                "tmux",
+                "display-message",
+                "-p",
+                "-t",
+                "shelbi-w-fix-login:agent",
+                "#{pane_title}",
+            ],
+        );
+        let parts: Vec<String> = cmd
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        let dd = parts.iter().position(|a| a == "--").expect("missing --");
+        let wire = parts[dd + 1..].join(" ");
+
+        let path = format!(
+            "{}:{}",
+            tmp.path().display(),
+            std::env::var("PATH").unwrap_or_default()
+        );
+        let out = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(&wire)
+            .env("PATH", path)
+            .output()
+            .expect("sh -c failed to run");
+        assert!(out.status.success(), "sh exited nonzero (wire: {wire})");
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout),
+            "<display-message><-p><-t><shelbi-w-fix-login:agent><#{pane_title}>",
+            "the #{{pane_title}} format was mangled crossing the remote shell (wire: {wire})",
         );
     }
 

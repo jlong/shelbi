@@ -860,9 +860,12 @@ fn require_auto_mode_supported(
 fn probe_claude_version(host: &Host) -> Option<(u32, u32, u32)> {
     let out = match host {
         Host::Local => shelbi_ssh::run(host, ["claude", "--version"]).ok()?,
-        Host::Ssh { .. } => {
-            shelbi_ssh::run(host, ["$SHELL", "-lc", "'claude --version'"]).ok()?
-        }
+        // Remote: reuse the canonical login-shell bootstrap. Passing a bare
+        // `$SHELL` / pre-quoted `'claude --version'` argv used to work only
+        // because the SSH boundary did no escaping; now that it escapes
+        // (F2), route through `run_login_shell_script` so `$SHELL` still
+        // expands and the raw script isn't double-quoted.
+        Host::Ssh { .. } => crate::git::run_login_shell_script(host, "claude --version").ok()?,
     };
     if !out.status.success() {
         return None;

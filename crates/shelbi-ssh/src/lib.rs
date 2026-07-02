@@ -118,9 +118,22 @@ fn apply_ssh_control_opts(cmd: &mut Command) {
 }
 
 /// Build (but do not execute) a `Command` that will run the given argv on
-/// `host`. The argv is treated as a single command line for SSH (joined with
-/// spaces, no shell escaping yet — callers are expected to pass pre-escaped
-/// arguments for now).
+/// `host`.
+///
+/// Local dispatch hands each argv element straight to `exec` via
+/// `std::process`, so no shell ever re-parses them. For `Host::Ssh` the
+/// story is different: `ssh host -- a b c` joins the words after `--` with
+/// single spaces into one command line and the *remote* login shell
+/// re-tokenizes the result. So every SSH-routed argv element is passed
+/// through [`shelbi_core::shell_escape`] first — that makes each element
+/// survive the remote shell as exactly one literal word, giving the SSH
+/// arm the same "argv is argv" semantics the local arm already has.
+///
+/// This closes F1/F2 from the process-boundaries review: an unquoted
+/// `#{pane_title}` (comment-stripped by the remote shell) or a command
+/// string containing `&&` / `;` / `$` / spaces no longer silently
+/// re-parses on the far side. Callers must therefore pass *raw* argv and
+/// must NOT pre-escape for the wire (see `orchestrator::git`).
 pub fn build_command<I, S>(host: &Host, argv: I) -> Command
 where
     I: IntoIterator<Item = S>,
@@ -142,11 +155,19 @@ where
             cmd.arg(host);
             cmd.arg("--");
             for a in &argv {
-                cmd.arg(a.as_ref());
+                cmd.arg(escape_for_wire(a.as_ref()));
             }
             cmd
         }
     }
+}
+
+/// Shell-escape a single argv element for the SSH wire. Non-UTF-8 bytes are
+/// carried through lossily — every argv shelbi builds is UTF-8 (tmux
+/// targets, git refs, paths), and the alternative (refusing the byte) would
+/// be worse than a replacement char in the rare pathological case.
+fn escape_for_wire(a: &OsStr) -> String {
+    shelbi_core::shell_escape(&a.to_string_lossy())
 }
 
 /// Build a command intended to run a *PTY-bound* program (e.g. `$EDITOR`,
@@ -173,7 +194,7 @@ where
             cmd.arg(host);
             cmd.arg("--");
             for a in &argv {
-                cmd.arg(a.as_ref());
+                cmd.arg(escape_for_wire(a.as_ref()));
             }
             cmd
         }
@@ -351,6 +372,48 @@ mod tests {
         let out = run(&Host::Local, ["echo", "shelbi"]).expect("echo failed");
         assert!(out.status.success());
         assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "shelbi");
+    }
+
+    /// Extract the words `ssh` would join with spaces and send to the
+    /// remote login shell: everything after the `--` separator in the argv
+    /// `build_command` hands to the local `ssh` binary.
+    fn remote_wire(host: &Host, argv: &[&str]) -> String {
+        let cmd = build_command(host, argv);
+        let parts: Vec<String> = cmd
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        let dd = parts
+            .iter()
+            .position(|a| a == "--")
+            .expect("ssh argv is missing its `--` separator");
+        parts[dd + 1..].join(" ")
+    }
+
+    #[test]
+    fn ssh_argv_survives_remote_shell_byte_for_byte() {
+        // F1/F2: args with spaces, comment markers, expansions, and command
+        // separators must reach the remote program as distinct literal
+        // words. We replay the exact wire ssh would emit through a local
+        // `sh -c` (standing in for the remote login shell) and use
+        // `printf '[%s]\n'` to bracket each received arg — proving both the
+        // count and the bytes survive.
+        let host = Host::Ssh {
+            host: "devbox".into(),
+        };
+        let args = ["printf", "[%s]\n", "a b", "#{pane_title}", "x && y", "p;q", "$HOME"];
+        let wire = remote_wire(&host, &args);
+        let out = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(&wire)
+            .output()
+            .expect("sh -c failed to run");
+        assert!(out.status.success(), "sh exited nonzero (wire: {wire})");
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout),
+            "[a b]\n[#{pane_title}]\n[x && y]\n[p;q]\n[$HOME]\n",
+            "wire: {wire}",
+        );
     }
 
     #[test]

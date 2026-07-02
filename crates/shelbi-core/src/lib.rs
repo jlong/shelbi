@@ -1,6 +1,7 @@
 pub mod error;
 pub mod model;
 pub mod placeholders;
+pub mod shell;
 pub mod statuses;
 pub mod system_memory;
 pub mod workspace_names;
@@ -19,6 +20,7 @@ pub use model::{
     SHARED_PROJECT_FIELDS,
 };
 pub use placeholders::substitute_placeholders;
+pub use shell::shell_escape;
 pub use system_memory::{format_bytes_short, recommended_workspace_count, total_memory_bytes};
 pub use workspace_names::WorkspaceNamePreset;
 pub use workflow::{

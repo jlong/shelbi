@@ -9,6 +9,13 @@
 
 use shelbi_core::AgentRunnerSpec;
 
+/// POSIX shell-quoting, re-exported from `shelbi-core` so the historical
+/// `shelbi_agent::shell_escape` path keeps working for the command-string
+/// builders across the orchestrator and CLI. The canonical definition (and
+/// its tests) live in [`shelbi_core::shell`]; the SSH-boundary escaper in
+/// `shelbi-ssh` reaches the same function without depending on this crate.
+pub use shelbi_core::shell_escape;
+
 /// Construct the shell command to launch the agent CLI inside a tmux pane.
 /// Returns a single string suitable for `tmux new-window -- <command>`.
 pub fn launch_command(spec: &AgentRunnerSpec) -> String {
@@ -67,48 +74,9 @@ pub fn polls_for_messages(spec: &AgentRunnerSpec) -> bool {
     !is_claude_runner(&spec.command)
 }
 
-/// Conservative POSIX-shell quoting: wrap in single quotes, escape internal
-/// single quotes by closing-and-reopening.
-pub fn shell_escape(s: &str) -> String {
-    if !s.is_empty()
-        && s.chars()
-            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '/' | ':' | '='))
-    {
-        return s.to_string();
-    }
-    let mut out = String::with_capacity(s.len() + 2);
-    out.push('\'');
-    for c in s.chars() {
-        if c == '\'' {
-            out.push_str("'\\''");
-        } else {
-            out.push(c);
-        }
-    }
-    out.push('\'');
-    out
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn escape_simple() {
-        assert_eq!(shell_escape("claude"), "claude");
-        assert_eq!(shell_escape("--print"), "--print");
-        assert_eq!(shell_escape("path/to/thing"), "path/to/thing");
-    }
-
-    #[test]
-    fn escape_with_spaces() {
-        assert_eq!(shell_escape("hello world"), "'hello world'");
-    }
-
-    #[test]
-    fn escape_with_quote() {
-        assert_eq!(shell_escape("can't"), "'can'\\''t'");
-    }
 
     #[test]
     fn launch_command_minimal() {
