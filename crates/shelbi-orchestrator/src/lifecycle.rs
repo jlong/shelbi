@@ -28,8 +28,9 @@
 //! (`crate::git::locate_hub_workdir`); for a hub-local workspace that's
 //! the same repo `sync_worktree` later reads, so the next `git worktree
 //! add` sees the branch already in place. SSH workspaces still inherit the
-//! pre-existing `sync_worktree` fallback (cut off `default_branch` on
-//! the remote machine) when the resolved base isn't visible there — a
+//! `sync_worktree` fallback when the resolved base isn't visible there —
+//! that path fetches `origin/<default>` on the remote machine and cuts
+//! from the freshly-fetched ref (never a possibly-stale local one). A
 //! depends_on chain across machines is out of scope for this pass.
 
 use shelbi_core::{Column, Error, Host, Project, Result, Task};
