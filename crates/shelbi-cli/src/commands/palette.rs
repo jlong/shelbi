@@ -531,11 +531,11 @@ fn dispatch(project: &str, entry: &Entry) -> Result<()> {
     if let Some(task_id) = entry.id.strip_prefix("review:") {
         let target = shelbi_orchestrator::review::start_review_by_id(project, task_id)
             .map_err(|e| anyhow::anyhow!(e))?;
-        run_tmux(["select-window", "-t", &target]);
+        run_tmux(["select-window", "-t", &exact_window_target(&target)]);
         return Ok(());
     }
     if let Some(id) = entry.id.strip_prefix("agent:") {
-        run_tmux(["select-window", "-t", &format!("shelbi-{project}:{id}")]);
+        run_tmux(["select-window", "-t", &format!("shelbi-{project}:={id}")]);
         return Ok(());
     }
     if entry.id == "action:toggle-zen" {
@@ -552,6 +552,18 @@ fn dispatch(project: &str, entry: &Entry) -> Result<()> {
     // invokes `super::quit_project::run` directly on confirm. Routing
     // it through `dispatch` would bypass the popover.
     Ok(())
+}
+
+/// Anchor the window-name half of a `session:window` tmux target with `=`
+/// so `select-window` matches it exactly rather than by prefix (a bare
+/// `w-foo` would otherwise also match `w-foobar`). Session part is left
+/// untouched. Leaves a target with no `:` (shouldn't happen for the
+/// review addr, but be defensive) as-is.
+fn exact_window_target(target: &str) -> String {
+    match target.split_once(':') {
+        Some((session, window)) => format!("{session}:={window}"),
+        None => target.to_string(),
+    }
 }
 
 fn run_tmux<I, S>(args: I) -> bool
@@ -1184,6 +1196,17 @@ fn format_active_workspaces(n: usize) -> String {
 #[allow(clippy::items_after_test_module)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn exact_window_target_anchors_only_the_window_half() {
+        assert_eq!(
+            exact_window_target("shelbi-proj:w-fix-login"),
+            "shelbi-proj:=w-fix-login"
+        );
+        assert_eq!(exact_window_target("shelbi-proj:agent-1"), "shelbi-proj:=agent-1");
+        // Defensive: a target without a `:` is passed through untouched.
+        assert_eq!(exact_window_target("no-colon"), "no-colon");
+    }
 
     #[test]
     fn zen_toggle_entry_label_and_subtitle_flip_with_current_state() {

@@ -71,6 +71,45 @@ fn is_git_repo(path: &Path) -> bool {
         .unwrap_or(false)
 }
 
+/// Validate a project name before it's used as a filesystem path
+/// component (`~/.shelbi/projects/<name>.yaml`, `~/.shelbi/projects/<name>/`)
+/// and interpolated into on-disk config.
+///
+/// The name reaches this function from three untrusted-ish sources: a
+/// `--project` override, the basename of a chosen root, and — most
+/// importantly — the `name:` key of a teammate's *committed*
+/// `<repo>/.shelbi/project.yaml` read by `--pick-up`. That last one is
+/// attacker-influenced by design (pick-up runs on someone else's repo),
+/// so an unvalidated `name: ../../.config/foo` would have `PathBuf::join`
+/// traverse out of the projects dir, and an embedded newline would inject
+/// keys into the local registry.
+///
+/// Rules: non-empty, no leading `.` (would hide the file or start a `..`
+/// traversal), and only ASCII alphanumerics, `_`, and `-`. The charset
+/// also guarantees the name round-trips through YAML unquoted, which is
+/// why the same check backstops the serde-rendered project YAML.
+pub fn validate_project_name(name: &str) -> Result<()> {
+    if name.is_empty() {
+        bail!("project name is empty — pass --project NAME (allowed: [A-Za-z0-9_-], no leading `.`)");
+    }
+    if name.starts_with('.') {
+        bail!(
+            "project name `{name}` starts with `.` — not allowed (it would hide the config or \
+             escape ~/.shelbi/projects/). Pass --project NAME to choose a safe name."
+        );
+    }
+    if let Some(bad) = name
+        .chars()
+        .find(|c| !(c.is_ascii_alphanumeric() || *c == '_' || *c == '-'))
+    {
+        bail!(
+            "project name `{name}` contains an invalid character {bad:?} — only [A-Za-z0-9_-] \
+             are allowed. Pass --project NAME to choose a safe name."
+        );
+    }
+    Ok(())
+}
+
 /// Project name derived from a chosen root: the basename of the path,
 /// unchanged. Returns `None` if the path has no usable file component
 /// (e.g. `/`).
@@ -230,15 +269,17 @@ fn prompt_loop(cwd: &Path, force_name: Option<&str>) -> Result<ResolvedProjectRo
 }
 
 fn pick_name(path: &Path, force_name: Option<&str>) -> Result<String> {
-    if let Some(n) = force_name {
-        return Ok(n.to_string());
-    }
-    project_name_from_root(path).ok_or_else(|| {
-        anyhow!(
-            "can't derive a project name from {} — pass --project NAME on the command line",
-            path.display()
-        )
-    })
+    let name = match force_name {
+        Some(n) => n.to_string(),
+        None => project_name_from_root(path).ok_or_else(|| {
+            anyhow!(
+                "can't derive a project name from {} — pass --project NAME on the command line",
+                path.display()
+            )
+        })?,
+    };
+    validate_project_name(&name)?;
+    Ok(name)
 }
 
 /// Expand `~` / `~/...` against `$HOME` and resolve relative paths
@@ -325,6 +366,37 @@ mod tests {
         std::fs::create_dir_all(&repo).unwrap();
         std::fs::write(repo.join(".git"), "gitdir: /tmp/elsewhere\n").unwrap();
         assert_eq!(validate_root(&repo), RootValidation::Ok);
+    }
+
+    #[test]
+    fn validate_project_name_accepts_ordinary_names() {
+        for ok in ["shelbi", "my-app", "app_2", "Web3", "a"] {
+            assert!(validate_project_name(ok).is_ok(), "expected `{ok}` to pass");
+        }
+    }
+
+    #[test]
+    fn validate_project_name_rejects_traversal_and_injection() {
+        // `..` and leading-dot: PathBuf::join traversal / hidden file.
+        assert!(validate_project_name("..").is_err());
+        assert!(validate_project_name("../../.config/foo").is_err());
+        assert!(validate_project_name(".hidden").is_err());
+        // Path separators would escape ~/.shelbi/projects/.
+        assert!(validate_project_name("a/b").is_err());
+        // Embedded newline would inject keys into the registry YAML.
+        assert!(validate_project_name("foo\nname: evil").is_err());
+        // Spaces / colons / other punctuation break the unquoted YAML round-trip.
+        assert!(validate_project_name("has space").is_err());
+        assert!(validate_project_name("a: b").is_err());
+        // Empty.
+        assert!(validate_project_name("").is_err());
+    }
+
+    #[test]
+    fn pick_name_rejects_unsafe_force_name() {
+        let cwd = PathBuf::from("/tmp/cwd");
+        assert!(pick_name(&cwd, Some("../evil")).is_err());
+        assert!(pick_name(&cwd, Some("ok-name")).is_ok());
     }
 
     #[test]

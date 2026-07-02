@@ -7,8 +7,8 @@ use inquire::Select;
 use shelbi_state::AgentMaterializeOutcome;
 
 use crate::project_root::{
-    project_name_collides, resolve_root_for_init, validate_root, ResolvedProjectRoot,
-    RootValidation,
+    project_name_collides, resolve_root_for_init, validate_project_name, validate_root,
+    ResolvedProjectRoot, RootValidation,
 };
 
 pub mod heuristic;
@@ -157,7 +157,12 @@ pub fn scaffold_with_prompt(args: Args) -> Result<ResolvedProjectRoot> {
 
     println!("✓ scaffolded {}", home.display());
 
-    let interactive = std::io::stdin().is_terminal() && args.root.is_none();
+    // Interactivity is purely a function of the TTY. `--root` only skips
+    // the "Project root?" prompt (that's all its help promises); it must
+    // NOT flip us to non-interactive and thereby hard-error on a missing
+    // `--mode` when the user is sitting at a terminal ready to answer the
+    // mode picker.
+    let interactive = std::io::stdin().is_terminal();
     if interactive {
         println!();
         println!("shelbi setup — let's get your project configured.");
@@ -264,15 +269,92 @@ impl std::fmt::Display for ModeChoice {
     }
 }
 
+/// Minimal serialization shape for the user-local project YAML. Kept
+/// separate from [`shelbi_core::Project`] on purpose: that struct has
+/// grown a dozen optional fields, and `shelbi init` wants to emit only
+/// the small, stable starter surface (the loader fills the rest from
+/// serde defaults). Building it with `serde_yaml` instead of `format!`
+/// means a `work_dir` containing ` #` (would truncate as a comment) or a
+/// name containing `: ` (would break parsing) is quoted/escaped by the
+/// serializer rather than silently corrupting the file.
+#[derive(serde::Serialize)]
+struct ProjectYaml<'a> {
+    name: &'a str,
+    repo: &'a str,
+    default_branch: &'a str,
+    machines: Vec<MachineYaml<'a>>,
+    orchestrator: OrchestratorYaml<'a>,
+    agent_runners: std::collections::BTreeMap<&'a str, RunnerYaml<'a>>,
+}
+
+#[derive(serde::Serialize)]
+struct MachineYaml<'a> {
+    name: &'a str,
+    kind: &'a str,
+    work_dir: &'a str,
+}
+
+#[derive(serde::Serialize)]
+struct OrchestratorYaml<'a> {
+    runner: &'a str,
+}
+
+#[derive(serde::Serialize)]
+struct RunnerYaml<'a> {
+    command: &'a str,
+    flags: Vec<&'a str>,
+}
+
+/// Render the starter project YAML via serde (never string
+/// interpolation). Validates `name` first so a value that can't
+/// round-trip through the filesystem path or YAML — the F1 charset gate —
+/// can never reach disk.
+fn render_project_yaml(name: &str, repo: &str, work_dir: &Path) -> Result<String> {
+    validate_project_name(name)?;
+    let work_dir = work_dir.to_string_lossy();
+    let mut agent_runners = std::collections::BTreeMap::new();
+    agent_runners.insert(
+        "claude",
+        RunnerYaml {
+            command: "claude",
+            flags: vec![],
+        },
+    );
+    agent_runners.insert(
+        "codex",
+        RunnerYaml {
+            command: "codex",
+            flags: vec![],
+        },
+    );
+    let doc = ProjectYaml {
+        name,
+        repo,
+        default_branch: "main",
+        machines: vec![MachineYaml {
+            name: "hub",
+            kind: "local",
+            work_dir: &work_dir,
+        }],
+        orchestrator: OrchestratorYaml { runner: "claude" },
+        agent_runners,
+    };
+    serde_yaml::to_string(&doc).context("serializing project YAML")
+}
+
 /// Write the project YAML, the workspace-settings template, materialize
 /// the default agents, and write the project-wide statuses catalogue.
 /// Deliberately does **not** drop a `.shelbi/project` marker: the project
 /// tree stays clean and resolution reads the registered YAMLs instead.
 ///
-/// The collision check in [`resolve_root_for_init`] guarantees the YAML
-/// path is free at the time we're called. We still guard the write
-/// with `exists()` so a race against a concurrent `shelbi init` doesn't
-/// blow away another invocation's freshly-written YAML.
+/// Every step is individually idempotent (each guards its own target
+/// with `exists()` / preserves user edits), and there is deliberately
+/// **no** whole-function early return: a run that crashed part-way
+/// through — YAML written but agents not yet materialized — must be able
+/// to complete its remaining steps on re-invocation rather than report a
+/// bogus "already exists" success on a half-initialized project. The
+/// per-step guards also keep a race against a concurrent `shelbi init`
+/// from blowing away another invocation's freshly-written files.
 ///
 /// When `mode == InRepo`, also writes a minimal committed
 /// `<repo>/.shelbi/project.yaml` carrying just the canonical name.
@@ -283,27 +365,14 @@ fn scaffold_project(resolved: &ResolvedProjectRoot, mode: InitMode) -> Result<()
 
     if yaml_path.exists() {
         println!("(project YAML already exists at {})", yaml_path.display());
-        return Ok(());
+    } else {
+        // Fresh init leaves `repo` empty — the local registry entry is
+        // anchored on `work_dir`, and the GitHub URL (if any) is filled in
+        // later by the setup wizard.
+        let yaml = render_project_yaml(&resolved.name, "", &resolved.path)?;
+        std::fs::write(&yaml_path, yaml)?;
+        println!("✓ wrote project: {}", yaml_path.display());
     }
-
-    let yaml = format!(
-        "name: {name}\n\
-         repo: \n\
-         default_branch: main\n\
-         machines:\n\
-         \x20\x20- name: hub\n\
-         \x20\x20\x20\x20kind: local\n\
-         \x20\x20\x20\x20work_dir: {root}\n\
-         orchestrator:\n\
-         \x20\x20runner: claude\n\
-         agent_runners:\n\
-         \x20\x20claude: {{ command: claude, flags: [] }}\n\
-         \x20\x20codex:  {{ command: codex,  flags: [] }}\n",
-        name = resolved.name,
-        root = resolved.path.display(),
-    );
-    std::fs::write(&yaml_path, yaml)?;
-    println!("✓ wrote project: {}", yaml_path.display());
 
     if mode == InitMode::InRepo {
         write_in_repo_config(&resolved.path, &resolved.name)?;
@@ -425,11 +494,23 @@ fn run_pick_up(args: Args) -> Result<PickUpOutcome> {
             config_path.display()
         )
     })?;
+    // The committed name is attacker-influenced by design — `--pick-up`
+    // runs on a repo we didn't create — so it must clear the same charset
+    // gate as any other project name BEFORE it's joined into
+    // `~/.shelbi/projects/<name>.yaml`. Rejects `../…` traversal and
+    // newline-injected registry keys.
+    validate_project_name(&canonical_name).with_context(|| {
+        format!(
+            "the committed {} carries an unusable project name",
+            config_path.display()
+        )
+    })?;
 
     // Honor `--project` as an explicit override (the user picking their
     // own local alias up front); otherwise walk the collision ladder
     // starting from the canonical name.
     let (local_alias, suffixed_from) = if let Some(override_name) = args.project.clone() {
+        validate_project_name(&override_name)?;
         if project_name_collides(&override_name)? {
             bail!(
                 "a shelbi project named `{override_name}` already exists locally — pick a \
@@ -456,22 +537,7 @@ fn run_pick_up(args: Args) -> Result<PickUpOutcome> {
     // both alike.
     let projects_dir = shelbi_state::projects_dir().map_err(|e| anyhow!(e))?;
     let yaml_path = projects_dir.join(format!("{}.yaml", local_alias));
-    let yaml = format!(
-        "name: {name}\n\
-         repo: {root}\n\
-         default_branch: main\n\
-         machines:\n\
-         \x20\x20- name: hub\n\
-         \x20\x20\x20\x20kind: local\n\
-         \x20\x20\x20\x20work_dir: {root}\n\
-         orchestrator:\n\
-         \x20\x20runner: claude\n\
-         agent_runners:\n\
-         \x20\x20claude: {{ command: claude, flags: [] }}\n\
-         \x20\x20codex:  {{ command: codex,  flags: [] }}\n",
-        name = local_alias,
-        root = repo_root.display(),
-    );
+    let yaml = render_project_yaml(&local_alias, &repo_root.to_string_lossy(), &repo_root)?;
     std::fs::write(&yaml_path, yaml)?;
     println!("✓ registered project: {}", yaml_path.display());
 
@@ -660,6 +726,81 @@ mod tests {
         ));
         std::fs::create_dir_all(&p).unwrap();
         p
+    }
+
+    /// The serde-rendered YAML must parse back into a real
+    /// `shelbi_core::Project` — the whole point of F8 is that the file we
+    /// write is the file the loader reads.
+    #[test]
+    fn render_project_yaml_round_trips_through_the_loader() {
+        let yaml = render_project_yaml("my-app", "", Path::new("/tmp/my-app")).unwrap();
+        let project: shelbi_core::Project = serde_yaml::from_str(&yaml).unwrap();
+        assert_eq!(project.name, "my-app");
+        assert_eq!(project.default_branch, "main");
+        assert_eq!(project.machines.len(), 1);
+        assert_eq!(project.machines[0].name, "hub");
+        assert_eq!(project.machines[0].work_dir, PathBuf::from("/tmp/my-app"));
+        assert_eq!(project.orchestrator.runner, "claude");
+        assert!(project.agent_runners.contains_key("claude"));
+        assert!(project.agent_runners.contains_key("codex"));
+    }
+
+    /// A `work_dir` that would truncate as a YAML comment under the old
+    /// `format!` builder (` #…`) must survive intact through serde, and a
+    /// name that can't round-trip is rejected before anything is written.
+    #[test]
+    fn render_project_yaml_escapes_hostile_work_dir_and_rejects_bad_names() {
+        let tricky = Path::new("/tmp/weird #dir: value");
+        let yaml = render_project_yaml("safe", "", tricky).unwrap();
+        let project: shelbi_core::Project = serde_yaml::from_str(&yaml).unwrap();
+        assert_eq!(project.machines[0].work_dir, tricky.to_path_buf());
+
+        assert!(render_project_yaml("../../evil", "", Path::new("/tmp")).is_err());
+        assert!(render_project_yaml("has\nnewline", "", Path::new("/tmp")).is_err());
+    }
+
+    /// F4: a scaffold that crashed after writing the YAML but before
+    /// materializing agents must be completable on re-run — the function
+    /// no longer short-circuits on a pre-existing YAML.
+    #[test]
+    fn scaffold_project_is_idempotent_and_completes_half_init() {
+        let _g = ENV_LOCK.lock().unwrap();
+        let home = fresh_dir("half-home");
+        let project_root = fresh_dir("half-repo");
+        std::env::set_var("SHELBI_HOME", &home);
+        shelbi_state::ensure_root_subdirs().unwrap();
+
+        let resolved = ResolvedProjectRoot {
+            path: project_root.clone(),
+            name: "halfapp".to_string(),
+        };
+
+        // Simulate a crash right after the YAML was written: the project
+        // YAML exists, but the agents/ workspaces and statuses do not.
+        let yaml_path = home.join("projects/halfapp.yaml");
+        std::fs::write(&yaml_path, "name: halfapp\nrepo: \n").unwrap();
+        let statuses_path = shelbi_state::statuses_path("halfapp").unwrap();
+        assert!(!statuses_path.exists());
+
+        // Re-running scaffold must NOT bail with a bogus "already exists"
+        // success — it must finish the remaining steps.
+        scaffold_project(&resolved, InitMode::Global).unwrap();
+        assert!(
+            statuses_path.is_file(),
+            "re-run should have written the statuses catalogue"
+        );
+        assert!(
+            shelbi_state::project_dir("halfapp")
+                .unwrap()
+                .join("agents")
+                .exists(),
+            "re-run should have materialized default agents"
+        );
+
+        // And a second re-run is a clean no-op (still idempotent).
+        scaffold_project(&resolved, InitMode::Global).unwrap();
+
+        std::env::remove_var("SHELBI_HOME");
     }
 
     #[test]
