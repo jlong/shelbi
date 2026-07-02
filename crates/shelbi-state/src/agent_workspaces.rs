@@ -7,13 +7,17 @@
 //! the agent's `instructions.md` system prompt plus a `skills/` subdir
 //! that the task-dispatch path mounts into `.claude/skills/`.
 //!
-//! Two agents ship with the binary:
+//! Three agents ship with the binary:
 //!
 //! - **orchestrator** — the coordinator agent that runs in the
 //!   dashboard's right pane. Its bundled prompt is the content
 //!   previously embedded as `default_orchestrator.md.template`.
 //! - **developer** — the worker agent handed individual tasks. Bundled
 //!   prompt lives in `default_developer.md.template`.
+//! - **review** — the loader agent for a review workspace: it installs,
+//!   builds, and serves a branch so a human can run it, and does not
+//!   modify code. Bundled prompt lives in `default_review.md.template`
+//!   and it ships a `load-run-detection` skill.
 //!
 //! Both are materialized on first [`materialize_default_agents`] (called
 //! from `shelbi init`) and self-healed by [`self_heal_default_agents`]
@@ -36,6 +40,11 @@ pub const ORCHESTRATOR_AGENT: &str = "orchestrator";
 
 /// Stable identifier of the default developer agent.
 pub const DEVELOPER_AGENT: &str = "developer";
+
+/// Stable identifier of the default review agent — the loader that
+/// prepares a branch on a review workspace so a human can run it. Unlike
+/// the developer, it loads-and-serves and does not modify code.
+pub const REVIEW_AGENT: &str = "review";
 
 /// Reserved subdirectory name under `agents/` that holds the per-project
 /// shared preamble — project-wide context prepended to every agent's
@@ -73,15 +82,45 @@ pub const DEFAULT_ORCHESTRATOR_INSTRUCTIONS: &str =
 pub const DEFAULT_DEVELOPER_INSTRUCTIONS: &str =
     include_str!("default_developer.md.template");
 
+/// Bundled review `instructions.md` content — the loader charter.
+pub const DEFAULT_REVIEW_INSTRUCTIONS: &str = include_str!("default_review.md.template");
+
+/// Bundled body of the review agent's `load-run-detection` skill: the
+/// auto-detect heuristics for booting an unknown project on `$PORT`.
+/// Kept in the agent (Decision A in the review-workspaces plan) rather
+/// than in Rust so per-repo detection stays flexible without schema churn.
+pub const DEFAULT_REVIEW_LOAD_RUN_SKILL: &str =
+    include_str!("skills/load_run_detection.SKILL.md");
+
+/// One bundled file under a default agent's `skills/` directory. `rel_path`
+/// is relative to `<workspace>/skills/` and may include subdirectories
+/// (Claude Code skills live in `<skill-name>/SKILL.md`); intermediate
+/// directories are created on write.
+pub struct BundledSkill {
+    pub rel_path: &'static str,
+    pub content: &'static str,
+}
+
+/// Skills shipped with the review agent. The load/run detection heuristics
+/// live here (Decision A) so the auto-detect logic is the agent's, not
+/// Rust's.
+const REVIEW_SKILLS: &[BundledSkill] = &[BundledSkill {
+    rel_path: "load-run-detection/SKILL.md",
+    content: DEFAULT_REVIEW_LOAD_RUN_SKILL,
+}];
+
 /// One entry in [`DEFAULT_AGENTS`]: the agent name, its bundled
-/// `instructions.md`, and — for Claude-Code-based roles — the bundled
+/// `instructions.md`, — for Claude-Code-based roles — the bundled
 /// `settings.json` template that ships the message-tail hooks plus the
-/// pane-title hooks. `settings_template = None` means the role doesn't
-/// scaffold a per-role settings.json (e.g. a future codex role).
+/// pane-title hooks, and any bundled `skills/` files the role ships with.
+/// `settings_template = None` means the role doesn't scaffold a per-role
+/// settings.json (e.g. a future codex role); `skills = &[]` (the common
+/// case) means the role ships an empty `skills/` directory.
 pub struct BundledAgent {
     pub name: &'static str,
     pub instructions: &'static str,
     pub settings_template: Option<&'static str>,
+    pub skills: &'static [BundledSkill],
 }
 
 /// Defaults shipped with the binary, in declaration order. Iteration
@@ -100,11 +139,19 @@ pub const DEFAULT_AGENTS: &[BundledAgent] = &[
         name: ORCHESTRATOR_AGENT,
         instructions: DEFAULT_ORCHESTRATOR_INSTRUCTIONS,
         settings_template: Some(DEFAULT_WORKSPACE_SETTINGS_TEMPLATE),
+        skills: &[],
     },
     BundledAgent {
         name: DEVELOPER_AGENT,
         instructions: DEFAULT_DEVELOPER_INSTRUCTIONS,
         settings_template: Some(DEFAULT_WORKSPACE_SETTINGS_TEMPLATE),
+        skills: &[],
+    },
+    BundledAgent {
+        name: REVIEW_AGENT,
+        instructions: DEFAULT_REVIEW_INSTRUCTIONS,
+        settings_template: Some(DEFAULT_WORKSPACE_SETTINGS_TEMPLATE),
+        skills: REVIEW_SKILLS,
     },
 ];
 
@@ -436,8 +483,8 @@ impl AgentMaterializeOutcome {
     }
 }
 
-/// Create `agents/{orchestrator,developer}/` from the bundled defaults
-/// for `project`. Each agent's directory is created only if missing —
+/// Create `agents/{orchestrator,developer,review}/` from the bundled
+/// defaults for `project`. Each agent's directory is created only if missing —
 /// existing directories are left untouched and reported as `Unchanged`
 /// (init is conservative; self-heal does the SHA-compare).
 ///
@@ -502,6 +549,12 @@ pub fn self_heal_default_agents(project: &str) -> Result<Vec<AgentMaterializeOut
             // shouldn't be left without the message-tail hooks.
             ensure_agent_settings_present(project, agent)?;
 
+            // Same seam for bundled skills: a workspace materialized before
+            // this role shipped a skill (or one the user deleted) shouldn't
+            // be left without it. Missing → drop the default back in;
+            // present-and-edited → left alone (existence-guarded).
+            ensure_agent_skills_present(project, agent)?;
+
             let path = agent_instructions_path(project, agent.name)?;
             let current = match fs::read_to_string(&path) {
                 Ok(s) => s,
@@ -560,7 +613,26 @@ fn write_bundled_agent(project: &str, agent: &BundledAgent) -> Result<()> {
     if let Some(settings) = agent.settings_template {
         atomic_write(&agent_settings_path(project, agent.name)?, settings.as_bytes())?;
     }
+    for skill in agent.skills {
+        write_bundled_skill(project, agent.name, skill)?;
+    }
     Ok(())
+}
+
+/// Write one bundled skill file under `<workspace>/skills/`, creating any
+/// intermediate directories (`<skill-name>/SKILL.md` needs `<skill-name>/`).
+/// Overwrites unconditionally — used by [`write_bundled_agent`] when the
+/// whole workspace is being (re)dropped; the self-heal path guards on
+/// existence before calling this via [`ensure_agent_skills_present`].
+fn write_bundled_skill(project: &str, agent: &str, skill: &BundledSkill) -> Result<()> {
+    let path = agent_skills_dir(project, agent)?.join(skill.rel_path);
+    if let Some(parent) = path.parent() {
+        ensure_dir(parent)?;
+    }
+    // Atomic (tmp + rename) for the same F8 reason as `instructions.md`: a
+    // crash mid-write must not leave a truncated skill that self-heal later
+    // preserves as a "customization" — the same sink used elsewhere here.
+    atomic_write(&path, skill.content.as_bytes())
 }
 
 /// Self-heal seam for the per-role `settings.json` — Claude Code reads
@@ -580,6 +652,23 @@ fn ensure_agent_settings_present(project: &str, agent: &BundledAgent) -> Result<
     // Atomic write — a torn `settings.json` from a mid-write crash would
     // drop the message-tail hooks silently (F8).
     atomic_write(&path, default.as_bytes())
+}
+
+/// Self-heal seam for bundled `skills/` files. Claude Code loads whatever
+/// is under `.claude/skills/` at session start, so a shipped skill that
+/// went missing (older materialize, user deletion) is a silent capability
+/// regression for that role. Treat each bundled skill like the settings
+/// file: missing → drop the bundled default in; present → leave the user's
+/// copy alone. Returns silently for roles that ship no skills.
+fn ensure_agent_skills_present(project: &str, agent: &BundledAgent) -> Result<()> {
+    for skill in agent.skills {
+        let path = agent_skills_dir(project, agent.name)?.join(skill.rel_path);
+        if path.exists() {
+            continue;
+        }
+        write_bundled_skill(project, agent.name, skill)?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -610,8 +699,11 @@ mod tests {
         std::env::set_var("SHELBI_HOME", &home);
 
         let outcomes = materialize_default_agents("p").unwrap();
-        assert_eq!(outcomes.len(), 2);
-        for (i, name) in [ORCHESTRATOR_AGENT, DEVELOPER_AGENT].iter().enumerate() {
+        assert_eq!(outcomes.len(), 3);
+        for (i, name) in [ORCHESTRATOR_AGENT, DEVELOPER_AGENT, REVIEW_AGENT]
+            .iter()
+            .enumerate()
+        {
             assert_eq!(
                 outcomes[i],
                 AgentMaterializeOutcome::Created {
@@ -622,13 +714,24 @@ mod tests {
             let skills = agent_skills_dir("p", name).unwrap();
             assert!(instructions.exists(), "{name}: instructions.md missing");
             assert!(skills.is_dir(), "{name}: skills/ missing");
-            // Skills dir ships empty.
+        }
+        // Orchestrator + developer ship an empty skills/ dir; review ships
+        // its load-run-detection skill.
+        for name in [ORCHESTRATOR_AGENT, DEVELOPER_AGENT] {
+            let skills = agent_skills_dir("p", name).unwrap();
             assert_eq!(
                 fs::read_dir(&skills).unwrap().count(),
                 0,
                 "{name}: skills/ should ship empty"
             );
         }
+        assert!(
+            agent_skills_dir("p", REVIEW_AGENT)
+                .unwrap()
+                .join("load-run-detection/SKILL.md")
+                .is_file(),
+            "review: load-run-detection skill should ship"
+        );
         assert_eq!(
             fs::read_to_string(agent_instructions_path("p", ORCHESTRATOR_AGENT).unwrap()).unwrap(),
             DEFAULT_ORCHESTRATOR_INSTRUCTIONS
@@ -636,6 +739,10 @@ mod tests {
         assert_eq!(
             fs::read_to_string(agent_instructions_path("p", DEVELOPER_AGENT).unwrap()).unwrap(),
             DEFAULT_DEVELOPER_INSTRUCTIONS
+        );
+        assert_eq!(
+            fs::read_to_string(agent_instructions_path("p", REVIEW_AGENT).unwrap()).unwrap(),
+            DEFAULT_REVIEW_INSTRUCTIONS
         );
 
         std::env::remove_var("SHELBI_HOME");
@@ -666,6 +773,9 @@ mod tests {
                 },
                 AgentMaterializeOutcome::Unchanged {
                     agent: DEVELOPER_AGENT.to_string()
+                },
+                AgentMaterializeOutcome::Unchanged {
+                    agent: REVIEW_AGENT.to_string()
                 },
             ]
         );
@@ -849,6 +959,151 @@ mod tests {
         assert!(DEFAULT_DEVELOPER_INSTRUCTIONS.contains("retry once"));
     }
 
+    /// The review charter (§6) must be explicit that the agent loads and
+    /// serves and does NOT modify code — plus carry the load/serve
+    /// mechanics (setup/serve, $PORT, ready probe, the ready signal) so a
+    /// copy edit can't quietly gut the role's contract.
+    #[test]
+    fn review_template_contains_required_charter_language() {
+        // Load-and-serve, not keep-coding — the whole point of the role.
+        assert!(DEFAULT_REVIEW_INSTRUCTIONS.contains("do not modify code"));
+        assert!(DEFAULT_REVIEW_INSTRUCTIONS.contains("runnable for a human"));
+        // The human-requested-tweak carve-out must survive edits — it's the
+        // sole case the review agent touches code.
+        assert!(DEFAULT_REVIEW_INSTRUCTIONS.contains("tweak"));
+        // Load/serve mechanics.
+        assert!(DEFAULT_REVIEW_INSTRUCTIONS.contains("review.setup"));
+        assert!(DEFAULT_REVIEW_INSTRUCTIONS.contains("review.serve"));
+        assert!(DEFAULT_REVIEW_INSTRUCTIONS.contains("$PORT"));
+        assert!(DEFAULT_REVIEW_INSTRUCTIONS.contains("diff-only"));
+        // The ready signal + its verbs the board/orchestrator watch for.
+        assert!(DEFAULT_REVIEW_INSTRUCTIONS.contains("$SHELBI_HUB_SOCK"));
+        assert!(DEFAULT_REVIEW_INSTRUCTIONS.contains("review_ready"));
+        assert!(DEFAULT_REVIEW_INSTRUCTIONS.contains("review_loaded"));
+        // Points the agent at its detection skill.
+        assert!(DEFAULT_REVIEW_INSTRUCTIONS.contains("skills"));
+    }
+
+    /// The bundled load/run detection skill ships with valid frontmatter
+    /// (Claude Code needs `name:` + `description:` to load it) and the
+    /// auto-detect precedence the plan (§7) calls out.
+    #[test]
+    fn review_load_run_skill_has_frontmatter_and_precedence() {
+        assert!(DEFAULT_REVIEW_LOAD_RUN_SKILL.starts_with("---"));
+        assert!(DEFAULT_REVIEW_LOAD_RUN_SKILL.contains("name: load-run-detection"));
+        assert!(DEFAULT_REVIEW_LOAD_RUN_SKILL.contains("description:"));
+        // Precedence: declared > framework > generic > diff-only.
+        assert!(DEFAULT_REVIEW_LOAD_RUN_SKILL.contains("package.json"));
+        assert!(DEFAULT_REVIEW_LOAD_RUN_SKILL.contains("Cargo.toml"));
+        assert!(DEFAULT_REVIEW_LOAD_RUN_SKILL.contains("Makefile"));
+        assert!(DEFAULT_REVIEW_LOAD_RUN_SKILL.contains("Procfile"));
+        assert!(DEFAULT_REVIEW_LOAD_RUN_SKILL.contains("diff-only"));
+    }
+
+    /// `shelbi init` materializes the review agent alongside the others,
+    /// including its bundled `load-run-detection` skill (mirrors the
+    /// developer materialize test).
+    #[test]
+    fn materialize_ships_review_agent_with_load_run_skill() {
+        let _g = LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+
+        materialize_default_agents("p").unwrap();
+        assert_eq!(
+            fs::read_to_string(agent_instructions_path("p", REVIEW_AGENT).unwrap()).unwrap(),
+            DEFAULT_REVIEW_INSTRUCTIONS
+        );
+        let skill = agent_skills_dir("p", REVIEW_AGENT)
+            .unwrap()
+            .join("load-run-detection/SKILL.md");
+        assert!(skill.is_file(), "review skill missing");
+        assert_eq!(
+            fs::read_to_string(&skill).unwrap(),
+            DEFAULT_REVIEW_LOAD_RUN_SKILL
+        );
+        // Review is a Claude-Code role → ships the shared settings.json.
+        assert!(agent_settings_path("p", REVIEW_AGENT).unwrap().is_file());
+
+        std::env::remove_var("SHELBI_HOME");
+    }
+
+    /// `shelbi reload`: a review workspace from a shelbi that predates the
+    /// bundled skill (or whose user deleted it) self-heals by dropping the
+    /// skill back in. Mirrors the settings-file self-heal seam.
+    #[test]
+    fn self_heal_recreates_missing_review_skill() {
+        let _g = LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+
+        materialize_default_agents("p").unwrap();
+        let skill = agent_skills_dir("p", REVIEW_AGENT)
+            .unwrap()
+            .join("load-run-detection/SKILL.md");
+        fs::remove_file(&skill).unwrap();
+        assert!(!skill.exists());
+
+        self_heal_default_agents("p").unwrap();
+        assert!(skill.is_file(), "review skill should be recreated");
+        assert_eq!(
+            fs::read_to_string(&skill).unwrap(),
+            DEFAULT_REVIEW_LOAD_RUN_SKILL
+        );
+
+        std::env::remove_var("SHELBI_HOME");
+    }
+
+    /// `shelbi reload`: a user-edited review skill is preserved — self-heal
+    /// only intervenes when the file is missing (same contract as the
+    /// per-role settings.json).
+    #[test]
+    fn self_heal_preserves_user_edited_review_skill() {
+        let _g = LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+
+        materialize_default_agents("p").unwrap();
+        let skill = agent_skills_dir("p", REVIEW_AGENT)
+            .unwrap()
+            .join("load-run-detection/SKILL.md");
+        let custom = "---\nname: load-run-detection\n---\nmy local heuristics\n";
+        fs::write(&skill, custom).unwrap();
+
+        self_heal_default_agents("p").unwrap();
+        assert_eq!(fs::read_to_string(&skill).unwrap(), custom);
+
+        std::env::remove_var("SHELBI_HOME");
+    }
+
+    /// `shelbi reload`: user-edited review `instructions.md` is preserved
+    /// byte-for-byte and the divergence notice fires once — same contract
+    /// as the orchestrator/developer agents.
+    #[test]
+    fn self_heal_preserves_user_edited_review_instructions() {
+        let _g = LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+
+        materialize_default_agents("p").unwrap();
+        let custom = "# my review agent\nlocal serve rules\n";
+        let path = agent_instructions_path("p", REVIEW_AGENT).unwrap();
+        fs::write(&path, custom).unwrap();
+
+        let outcomes = self_heal_default_agents("p").unwrap();
+        let preserved = outcomes.iter().find(|o| o.agent() == REVIEW_AGENT).unwrap();
+        assert_eq!(
+            preserved,
+            &AgentMaterializeOutcome::Preserved {
+                agent: REVIEW_AGENT.to_string(),
+                first_notice: true,
+            }
+        );
+        assert_eq!(fs::read_to_string(&path).unwrap(), custom);
+
+        std::env::remove_var("SHELBI_HOME");
+    }
+
     #[test]
     fn orchestrator_handoff_path_lives_inside_orchestrator_workspace() {
         // The path must land at `agents/orchestrator/handoff.md` so the
@@ -977,6 +1232,7 @@ mod tests {
     fn is_default_agent_only_recognizes_bundled_names() {
         assert!(is_default_agent(ORCHESTRATOR_AGENT));
         assert!(is_default_agent(DEVELOPER_AGENT));
+        assert!(is_default_agent(REVIEW_AGENT));
         assert!(!is_default_agent("qa"));
         assert!(!is_default_agent(""));
     }
@@ -990,6 +1246,10 @@ mod tests {
         assert_eq!(
             default_agent_body(DEVELOPER_AGENT),
             Some(DEFAULT_DEVELOPER_INSTRUCTIONS),
+        );
+        assert_eq!(
+            default_agent_body(REVIEW_AGENT),
+            Some(DEFAULT_REVIEW_INSTRUCTIONS),
         );
         assert_eq!(default_agent_body("qa"), None);
     }
@@ -1006,6 +1266,10 @@ mod tests {
         );
         assert_eq!(
             default_agent_settings(DEVELOPER_AGENT),
+            Some(DEFAULT_WORKSPACE_SETTINGS_TEMPLATE),
+        );
+        assert_eq!(
+            default_agent_settings(REVIEW_AGENT),
             Some(DEFAULT_WORKSPACE_SETTINGS_TEMPLATE),
         );
         assert_eq!(default_agent_settings("ghost"), None);
