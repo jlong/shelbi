@@ -918,6 +918,32 @@ pub fn validate_workflow_name(s: &str) -> crate::Result<()> {
     validate_agent_id(s)
 }
 
+/// Validate a task's `branch:` override. The value flows into `git checkout`
+/// / `git worktree add` on a possibly-remote worker; the SSH transport
+/// shell-escapes it (so it survives as one word), but escaping alone doesn't
+/// stop git from reading a leading `-` as a flag (argument injection). So we
+/// pin the value to the task-id character set plus `/` (branch names are
+/// conventionally slash-namespaced, e.g. `shelbi/<id>` or `feature/foo`):
+/// ASCII alphanumerics, `-`, `_`, `/`, and a required alphanumeric first
+/// character. That rejects `-`-leading flags, `..`, and every shell/dash
+/// metacharacter before the value can reach git. Length is bounded by
+/// [`MAX_TASK_ID_LEN`] plus a small slack for the namespace prefix so the
+/// derived ref stays under GitHub's 255-byte cap.
+pub fn validate_branch(s: &str) -> crate::Result<()> {
+    let first_ok = s
+        .chars()
+        .next()
+        .map(|c| c.is_ascii_alphanumeric())
+        .unwrap_or(false);
+    let chars_ok = s
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '/'));
+    if !first_ok || !chars_ok || s.len() > 255 {
+        return Err(crate::Error::InvalidBranch(s.to_string()));
+    }
+    Ok(())
+}
+
 /// Validate a project name used as a directory component under
 /// `~/.shelbi/projects/<name>/`. Unlike task/agent ids, project names
 /// default to a repo basename and historically carry a looser character
@@ -1349,6 +1375,37 @@ mod tests {
         assert!(validate_agent_id("-leading-hyphen").is_err());
         assert!(validate_agent_id("has spaces").is_err());
         assert!(validate_agent_id("slash/in/id").is_err());
+    }
+
+    #[test]
+    fn branch_validation() {
+        // Namespaced branches — the common shape — pass.
+        assert!(validate_branch("shelbi/fix-login-bug").is_ok());
+        assert!(validate_branch("feature/auth-rewrite").is_ok());
+        assert!(validate_branch("main").is_ok());
+        assert!(validate_branch("release_2").is_ok());
+
+        // Empty and leading-`-` (git flag injection) are rejected.
+        assert!(validate_branch("").is_err());
+        assert!(validate_branch("-b").is_err());
+        assert!(validate_branch("--upload-pack=touch /tmp/x").is_err());
+        assert!(validate_branch("-leading").is_err());
+
+        // A leading slash (no alphanumeric first char) is rejected too.
+        assert!(validate_branch("/etc/passwd").is_err());
+
+        // Shell metacharacters that would re-tokenize on the SSH wire.
+        assert!(validate_branch("a b").is_err());
+        assert!(validate_branch("a;rm -rf /").is_err());
+        assert!(validate_branch("$(touch x)").is_err());
+        assert!(validate_branch("a`id`").is_err());
+        assert!(validate_branch("a&&b").is_err());
+        // `.` is outside the charset, so `..` traversal-style refs are out.
+        assert!(validate_branch("a..b").is_err());
+
+        // Over the 255-byte ref cap.
+        assert!(validate_branch(&"a".repeat(256)).is_err());
+        assert!(validate_branch(&"a".repeat(255)).is_ok());
     }
 
     #[test]

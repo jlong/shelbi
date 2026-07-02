@@ -12,7 +12,8 @@ pub use statuses::{default_project_statuses, ProjectStatus, ProjectStatuses};
 pub use model::{
     checks_for_task, checks_for_task_in_workflow, ci_timeout_for_workflow,
     danger_paths_for_project, danger_paths_for_workflow, detect_project_shapes, validate_agent_id,
-    validate_project_name, validate_task_id, validate_workflow_name, Agent, AgentRunnerSpec, Column,
+    validate_branch, validate_project_name, validate_task_id, validate_workflow_name, Agent,
+    AgentRunnerSpec, Column,
     ConfigMode,
     ContextStoreSyncSpec, GitConfig, HeartbeatConfig, Host, Machine, MachineKind, MergeStrategy,
     OrchestratorSpec, Project, ProjectShape, Session, SessionProject, Status, Task, TaskZenConfig,

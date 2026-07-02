@@ -71,6 +71,18 @@ pub enum Error {
     )]
     TaskIdTooLong { id: String, len: usize, max: usize },
 
+    /// A task's `branch:` override carries characters outside the safe set
+    /// (task-id charset plus `/`). Left unchecked the value reaches
+    /// `git checkout` / `git worktree add` on a possibly-remote worker, where
+    /// a leading `-` is parsed as a git flag (argument injection) and shell
+    /// metacharacters would re-tokenize on the SSH wire. Rejected at the
+    /// save chokepoint ([`crate::validate_branch`]).
+    #[error(
+        "invalid branch `{0}`: only ASCII letters, digits, `-`, `_`, and `/` are \
+         allowed and it must start with a letter or digit"
+    )]
+    InvalidBranch(String),
+
     #[error("machine `{0}` not found in project")]
     UnknownMachine(String),
 

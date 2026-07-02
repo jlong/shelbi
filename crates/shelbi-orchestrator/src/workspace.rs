@@ -1254,7 +1254,7 @@ fn copy_dir_contents_to_remote(ssh_host: &str, src: &Path, dest: &Path) -> Resul
             }
             copy_dir_contents_to_remote(ssh_host, &entry_path, &target)?;
         } else {
-            let dest_uri = format!("{ssh_host}:{target_str}");
+            let dest_uri = scp_remote_target(ssh_host, &target_str);
             let mut cmd = std::process::Command::new("scp");
             cmd.arg("-q").arg("-B").arg(&entry_path).arg(&dest_uri);
             let out = cmd.output().map_err(Error::Io)?;
@@ -1391,6 +1391,16 @@ fn with_agent_system_prompt(
     )
 }
 
+/// Build the `host:path` target scp expects, shell-escaping the *path*
+/// half. scp splits its target on the first `:` and hands everything after
+/// it to the remote login shell, which re-tokenizes it — so a spaced or
+/// metacharacter path word-splits there exactly like an unescaped SSH argv
+/// would. This is the one remote path shelbi drives that doesn't ride
+/// through `shelbi_ssh` (and its per-arg escaping), so it escapes here.
+fn scp_remote_target(ssh_host: &str, remote_path: &str) -> String {
+    format!("{ssh_host}:{}", shelbi_agent::shell_escape(remote_path))
+}
+
 fn scp_settings_to_remote(
     ssh_host: &str,
     remote_dir: &str,
@@ -1439,7 +1449,10 @@ fn scp_text_to_remote(
     ));
     std::fs::write(&tmp_path, body).map_err(Error::Io)?;
 
-    let dest = format!("{ssh_host}:{remote_path}");
+    // The local `tmp_path` is a real argv element to the local scp binary and
+    // needs no escaping; the remote `remote_path` half does — see
+    // [`scp_remote_target`].
+    let dest = scp_remote_target(ssh_host, remote_path);
     let mut cmd = std::process::Command::new("scp");
     // -q quiets scp's progress chatter; -B disables interactive prompts
     // (we expect keys via ssh-agent).
@@ -3125,5 +3138,78 @@ mod rebase_git_tests {
         assert!(argv
             .iter()
             .any(|s| s == "SHELBI_HUB_SOCK=/Users/dev/.shelbi/hub.sock"));
+    }
+
+    /// The path half of scp's `host:path` target is re-parsed by the remote
+    /// login shell. Replay it through a local `sh -c` (standing in for that
+    /// shell) and prove a spaced/metacharacter path lands as one argument
+    /// rather than word-splitting.
+    #[test]
+    fn scp_remote_target_path_survives_remote_shell_as_one_word() {
+        let target = scp_remote_target("devbox", "/work/my app/$X/.claude");
+        // scp splits on the first `:`; the remote side sees only what follows.
+        let (host, path_half) = target.split_once(':').expect("missing host:path split");
+        assert_eq!(host, "devbox");
+        // `printf '[%s]\n' <path_half>` prints one bracketed line per argument
+        // the remote shell tokenized the path into.
+        let out = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(format!("printf '[%s]\\n' {path_half}"))
+            .output()
+            .expect("sh -c failed");
+        assert!(out.status.success());
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout),
+            "[/work/my app/$X/.claude]\n",
+            "path word-split or expanded: {path_half}",
+        );
+    }
+
+    /// Acceptance: `refresh_agent_skills` runs `rm -rf <worktree>/.claude/skills`
+    /// over SSH. With a spaced `work_dir` the old (unescaped) wire word-split
+    /// into `rm -rf <first> <rest>` and recursively deleted the wrong
+    /// directory. Replay the exact wire `shelbi_ssh` now emits through a local
+    /// `sh -c` (the stand-in remote shell) against real temp dirs and prove
+    /// the sibling that used to be destroyed survives.
+    #[test]
+    fn refresh_skills_rm_cannot_escape_spaced_worktree() {
+        let root = std::env::temp_dir().join(format!("shelbi-rm-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        // Sibling that the buggy word-split (`rm -rf <root>/my`) would nuke.
+        let sibling = root.join("my");
+        std::fs::create_dir_all(&sibling).unwrap();
+        let sentinel = sibling.join("KEEP");
+        std::fs::write(&sentinel, b"do not delete").unwrap();
+        // The real target: `<root>/my app/.claude/skills`.
+        let worktree = root.join("my app");
+        let skills = worktree.join(".claude").join("skills");
+        std::fs::create_dir_all(&skills).unwrap();
+        std::fs::write(skills.join("s.md"), b"x").unwrap();
+
+        // Build the exact argv refresh_agent_skills uses, routed through the
+        // SSH transport, then extract the words ssh joins for the remote shell.
+        let skills_str = skills.to_string_lossy().into_owned();
+        let host = Host::Ssh { host: "devbox".into() };
+        let cmd = shelbi_ssh::build_command(&host, ["rm", "-rf", skills_str.as_str()]);
+        let parts: Vec<String> = cmd
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        let dd = parts.iter().position(|a| a == "--").expect("no `--`");
+        let wire = parts[dd + 1..].join(" ");
+
+        let out = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(&wire)
+            .output()
+            .expect("sh -c failed");
+        assert!(out.status.success(), "wire: {wire}");
+
+        assert!(
+            sentinel.exists(),
+            "sibling dir was destroyed by word-split — wire: {wire}",
+        );
+        assert!(!skills.exists(), "intended skills dir not removed — wire: {wire}");
+        let _ = std::fs::remove_dir_all(&root);
     }
 }
