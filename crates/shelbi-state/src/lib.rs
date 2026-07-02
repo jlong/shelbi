@@ -15,8 +15,8 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use shelbi_core::{
-    default_project_statuses, default_workflow, validate_agent_id, validate_project_name,
-    validate_task_id, Agent, Column, Project, Result, Session, Task,
+    default_project_statuses, default_workflow, validate_agent_id, validate_branch,
+    validate_project_name, validate_task_id, Agent, Column, Project, Result, Session, Task,
 };
 
 mod agent_workspaces;
@@ -1356,6 +1356,13 @@ pub fn save_task(project: &str, task: &Task, body_md: &str) -> Result<()> {
 fn save_task_unlocked(project: &str, task: &Task, body_md: &str) -> Result<()> {
     ensure_dir(&tasks_dir(project)?)?;
     let path = task_path(project, &task.id)?;
+    // Gate the `branch:` override at the write chokepoint so a value with a
+    // leading `-` (git flag injection) or shell metacharacters can never be
+    // persisted and later handed to `git checkout` / `git worktree add` on a
+    // (possibly remote) worker. `task_path` already validated the id above.
+    if let Some(branch) = &task.branch {
+        validate_branch(branch)?;
+    }
     write_frontmatter_file(&path, task, body_md)
 }
 
@@ -2433,6 +2440,35 @@ mod tests {
         assert_eq!(back.task.column, Column::Todo);
         assert_eq!(back.task.priority, 3);
         assert!(back.body.contains("Description"));
+        std::env::remove_var("SHELBI_HOME");
+    }
+
+    #[test]
+    fn save_task_rejects_dangerous_branch_override() {
+        let _g = TEST_LOCK.lock().unwrap();
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+
+        // A `branch:` that would inject a git flag or shell metacharacters
+        // must be rejected at the write chokepoint — never persisted, so it
+        // can never reach `git checkout` / `git worktree add` on a worker.
+        let mut task = make_task("evil", Column::Todo, 0);
+        task.branch = Some("--upload-pack=touch /tmp/pwn".into());
+        assert!(matches!(
+            save_task("proj", &task, ""),
+            Err(shelbi_core::Error::InvalidBranch(_))
+        ));
+        // And it truly didn't land on disk.
+        assert!(load_task("proj", "evil").is_err());
+
+        // A well-formed namespaced branch still saves fine.
+        let mut ok = make_task("good", Column::Todo, 0);
+        ok.branch = Some("shelbi/good".into());
+        save_task("proj", &ok, "").unwrap();
+        assert_eq!(
+            load_task("proj", "good").unwrap().task.branch.as_deref(),
+            Some("shelbi/good")
+        );
         std::env::remove_var("SHELBI_HOME");
     }
 
