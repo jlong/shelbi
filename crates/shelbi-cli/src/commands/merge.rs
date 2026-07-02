@@ -327,8 +327,18 @@ fn cleanup(
     let repo = machine.work_dir.to_string_lossy().into_owned();
     let wt = worktree.to_string_lossy().into_owned();
 
-    // Best-effort; don't fail the whole merge if cleanup hiccups.
-    let _ = shelbi_tmux::kill_window(host, tmux);
+    // The merge already landed, so cleanup failures don't roll it back —
+    // but a kill_window that couldn't reach the host means the agent is
+    // still running (kill_window returns Ok for an already-gone window),
+    // so warn loudly instead of swallowing it.
+    if let Err(e) = shelbi_tmux::kill_window(host, tmux) {
+        eprintln!(
+            "warning: couldn't kill agent tmux window {}: {e}\n  \
+             the remote agent may still be running — check `tmux ls` on {}",
+            tmux.target(),
+            machine.name,
+        );
+    }
     let _ = shelbi_ssh::run_capture(
         host,
         ["git", "-C", &repo, "worktree", "remove", "--force", &wt],
