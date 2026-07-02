@@ -32,6 +32,8 @@ pub mod zen;
 pub mod zen_intro;
 pub mod zen_lifecycle;
 
+use std::path::Path;
+
 use anyhow::{anyhow, Result};
 
 /// Resolve the active project name. Precedence:
@@ -58,12 +60,83 @@ pub fn require_project(explicit: Option<String>) -> Result<String> {
     ))
 }
 
-/// Resolve the working session (workspace) name. Precedence: explicit > env >
-/// "default".
-pub fn _resolve_session(explicit: Option<String>) -> String {
-    explicit
-        .or_else(|| std::env::var("SHELBI_SESSION").ok())
-        .unwrap_or_else(|| "default".to_string())
+/// Open `path` in the user's editor, honoring the conventional
+/// `$VISUAL` → `$EDITOR` → `vi` precedence and splitting an editor value
+/// that carries arguments (`VISUAL="code --wait"`,
+/// `EDITOR="emacsclient -t"`) into program + args before the file is
+/// appended. The split is whitespace-based (matching the git/less
+/// convention); no shell is spawned, so the file path is never re-parsed
+/// for metacharacters. Shared by `task edit` and `agent edit` so the
+/// argument-handling and precedence rules stay in one place (F14).
+pub fn launch_editor(path: &Path) -> Result<()> {
+    let (program, args) = resolve_editor_command();
+    let status = std::process::Command::new(&program)
+        .args(&args)
+        .arg(path)
+        .status()
+        .map_err(|e| anyhow!("launching editor `{program}`: {e}"))?;
+    if !status.success() {
+        return Err(anyhow!("editor `{program}` exited with {status}"));
+    }
+    Ok(())
+}
+
+/// Resolve the editor command as `(program, leading-args)`, honoring
+/// `$VISUAL` before `$EDITOR` (the traditional Unix precedence) and
+/// falling back to `vi`. A blank or whitespace-only value is skipped so
+/// `EDITOR=` falls through to the next candidate. Split out from
+/// [`launch_editor`] so the parsing can be unit-tested without spawning a
+/// process.
+pub fn resolve_editor_command() -> (String, Vec<String>) {
+    for var in ["VISUAL", "EDITOR"] {
+        if let Ok(val) = std::env::var(var) {
+            let mut parts = val.split_whitespace();
+            if let Some(program) = parts.next() {
+                let args = parts.map(str::to_string).collect();
+                return (program.to_string(), args);
+            }
+        }
+    }
+    ("vi".to_string(), Vec::new())
+}
+
+#[cfg(test)]
+mod editor_tests {
+    use super::resolve_editor_command;
+    use crate::commands::test_support::ENV_LOCK;
+
+    #[test]
+    fn splits_args_and_honors_visual_before_editor() {
+        let _g = ENV_LOCK.lock().unwrap();
+        std::env::remove_var("EDITOR");
+        std::env::remove_var("VISUAL");
+        // Nothing set → POSIX `vi`, no args.
+        assert_eq!(resolve_editor_command(), ("vi".to_string(), vec![]));
+
+        // Multi-word EDITOR splits into program + args.
+        std::env::set_var("EDITOR", "code --wait");
+        assert_eq!(
+            resolve_editor_command(),
+            ("code".to_string(), vec!["--wait".to_string()]),
+        );
+
+        // VISUAL wins over EDITOR when both are set.
+        std::env::set_var("VISUAL", "emacsclient -t");
+        assert_eq!(
+            resolve_editor_command(),
+            ("emacsclient".to_string(), vec!["-t".to_string()]),
+        );
+
+        // Blank VISUAL falls through to EDITOR.
+        std::env::set_var("VISUAL", "   ");
+        assert_eq!(
+            resolve_editor_command(),
+            ("code".to_string(), vec!["--wait".to_string()]),
+        );
+
+        std::env::remove_var("EDITOR");
+        std::env::remove_var("VISUAL");
+    }
 }
 
 #[cfg(test)]

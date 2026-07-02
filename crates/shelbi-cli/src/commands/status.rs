@@ -24,10 +24,10 @@
 //! snapshot path.
 
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::{anyhow, Result};
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Duration, Utc};
 use clap::Subcommand;
 use shelbi_core::{Column, MachineKind, Project, StatusCategory};
 use shelbi_state::{read_state, ZenModeState};
@@ -39,11 +39,23 @@ use super::require_project;
 /// task convention is uppercase.
 const HANDOFF_FILE_NAME: &str = "HANDOFF.md";
 
-/// How far back in `~/.shelbi/events.log` to look for a
-/// `project=<name> zen=off reason=crash-recovery` line. 200 lines is
-/// enough to catch the crash line even after a busy heartbeat/task
-/// churn cycle, and small enough that scanning is instant.
-const CRASH_EVENT_SCAN_LINES: usize = 200;
+/// How many bytes off the tail of `~/.shelbi/events.log` to scan for a
+/// `project=<name> zen=off reason=crash-recovery` line. The log is
+/// append-only and grows without bound between rotations, so we seek to
+/// the last chunk rather than reading the whole file on every `status`
+/// bootstrap (F9). 64 KiB is hundreds of event lines — far more than a
+/// single crash-to-`status` window — and a crash line older than that is
+/// also older than [`CRASH_EVENT_MAX_AGE_SECS`] and wouldn't be flagged
+/// anyway.
+const CRASH_EVENT_TAIL_BYTES: u64 = 64 * 1024;
+
+/// Wall-clock window (seconds) a crash-recovery line must fall within to
+/// be flagged (F20). A line-count heuristic alone re-fires a three-week-
+/// old crash forever on a quiet hub and scrolls a real one out of view on
+/// a busy one; keying off the line's own RFC3339 timestamp makes "recent"
+/// mean recent. Six hours comfortably spans a work session's bootstraps
+/// without resurfacing yesterday's already-dismissed recovery.
+const CRASH_EVENT_MAX_AGE_SECS: i64 = 6 * 60 * 60;
 
 #[derive(Debug, Subcommand)]
 pub enum StatusCmd {
@@ -331,35 +343,75 @@ fn zen_snapshot(project: &str) -> Result<ZenSnapshot> {
     })
 }
 
-/// Scan the tail of `~/.shelbi/events.log` for a
-/// `project=<name> zen=off reason=crash-recovery` line. Returns `false`
-/// on any I/O error or when the log is absent — the summary already
-/// prints the mode, so a missing signal degrades to "no crash flag" and
-/// the orchestrator's first reply is unaffected.
+/// Scan the tail of `~/.shelbi/events.log` for a *recent*
+/// `project=<name> zen=off reason=crash-recovery` line. "Recent" is a
+/// wall-clock window ([`CRASH_EVENT_MAX_AGE_SECS`]) measured off the
+/// line's own leading RFC3339 timestamp, not a line count (F20). Only the
+/// last [`CRASH_EVENT_TAIL_BYTES`] of the log are read, seeking rather
+/// than slurping the whole (unbounded) file (F9).
+///
+/// Returns `false` on any I/O error or when the log is absent — the
+/// summary already prints the mode, so a missing signal degrades to "no
+/// crash flag" and the orchestrator's first reply is unaffected.
 fn has_recent_crash_event(project: &str) -> Result<bool> {
     let path = match shelbi_state::events_log_path() {
         Ok(p) => p,
         Err(_) => return Ok(false),
     };
-    let text = match fs::read_to_string(&path) {
+    let tail = match read_tail(&path, CRASH_EVENT_TAIL_BYTES) {
         Ok(t) => t,
         Err(_) => return Ok(false),
     };
     let needle_project = format!(" project={project} ");
-    let needle_zen = "zen=off";
-    let needle_reason = "reason=crash-recovery";
-    // Walk the trailing N lines newest-first — we only care about the
-    // most recent crash line, and a leading scan of a large log would
-    // also flag ancient recoveries the user already dismissed.
-    for line in text.lines().rev().take(CRASH_EVENT_SCAN_LINES) {
+    let cutoff = Utc::now() - Duration::seconds(CRASH_EVENT_MAX_AGE_SECS);
+    // Newest-first. The first crash line whose timestamp is inside the
+    // window wins; a line whose timestamp doesn't parse (or the partial
+    // leading line left by a mid-line seek) is skipped rather than
+    // trusted. Because we seek to a byte offset, an ancient crash beyond
+    // the tail chunk is simply not seen — which is also beyond the age
+    // window, so the answer is the same.
+    for line in tail.lines().rev() {
         if line.contains(&needle_project)
-            && line.contains(needle_zen)
-            && line.contains(needle_reason)
+            && line.contains("zen=off")
+            && line.contains("reason=crash-recovery")
         {
-            return Ok(true);
+            if let Some(ts) = event_line_timestamp(line) {
+                if ts >= cutoff {
+                    return Ok(true);
+                }
+            }
         }
     }
     Ok(false)
+}
+
+/// Read at most the last `max_bytes` of `path` as (lossy) UTF-8, seeking
+/// to the tail rather than reading the whole file. A file shorter than
+/// `max_bytes` is returned whole. When the seek lands mid-line the
+/// caller's per-line scan drops the partial leading fragment (it can't
+/// match a full crash-recovery line, and its timestamp won't parse).
+fn read_tail(path: &Path, max_bytes: u64) -> std::io::Result<String> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut f = fs::File::open(path)?;
+    let len = f.metadata()?.len();
+    let start = len.saturating_sub(max_bytes);
+    if start > 0 {
+        f.seek(SeekFrom::Start(start))?;
+    }
+    let mut buf = Vec::with_capacity((len - start) as usize);
+    f.read_to_end(&mut buf)?;
+    Ok(String::from_utf8_lossy(&buf).into_owned())
+}
+
+/// Parse the leading RFC3339 timestamp off an `events.log` line. Every
+/// writer prefixes `<rfc3339> ` (see the `append_*` family in
+/// `shelbi_state`), so the timestamp is the whitespace-delimited first
+/// token. Returns `None` when it doesn't parse.
+fn event_line_timestamp(line: &str) -> Option<DateTime<Utc>> {
+    let token = line.split_whitespace().next()?;
+    DateTime::parse_from_rfc3339(token)
+        .ok()
+        .map(|dt| dt.with_timezone(&Utc))
 }
 
 #[cfg(test)]
@@ -542,6 +594,62 @@ mod tests {
         // the project name in the token.
         shelbi_state::append_project_event("p", "zen=off", "crash-recovery").unwrap();
         assert!(zen_snapshot("p").unwrap().crash_recovery_event);
+
+        std::env::remove_var("SHELBI_HOME");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn stale_crash_recovery_event_is_not_flagged() {
+        let _g = TEST_LOCK.lock().unwrap();
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+
+        let path = shelbi_state::events_log_path().unwrap();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+
+        // A crash-recovery line dated well outside the wall-clock window.
+        // The old line-count heuristic would flag this forever; the
+        // timestamp check must not (F20).
+        let old = (Utc::now() - Duration::days(3)).to_rfc3339();
+        std::fs::write(&path, format!("{old} project=p zen=off reason=crash-recovery\n"))
+            .unwrap();
+        assert!(!has_recent_crash_event("p").unwrap());
+
+        // A fresh line for the same project IS flagged.
+        let fresh = Utc::now().to_rfc3339();
+        std::fs::write(&path, format!("{fresh} project=p zen=off reason=crash-recovery\n"))
+            .unwrap();
+        assert!(has_recent_crash_event("p").unwrap());
+
+        std::env::remove_var("SHELBI_HOME");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn crash_scan_reads_only_the_tail_not_the_whole_log() {
+        let _g = TEST_LOCK.lock().unwrap();
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+
+        let path = shelbi_state::events_log_path().unwrap();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+
+        // A recent crash line at the very START of the log, followed by
+        // more than CRASH_EVENT_TAIL_BYTES of unrelated churn. Because the
+        // scan seeks to the tail, the leading crash line is never read —
+        // proving `status` no longer slurps the whole file (F9).
+        let recent = Utc::now().to_rfc3339();
+        let mut log = format!("{recent} project=p zen=off reason=crash-recovery\n");
+        let filler_line = format!("{recent} workspace=alpha status=idle\n");
+        while (log.len() as u64) < CRASH_EVENT_TAIL_BYTES + 8192 {
+            log.push_str(&filler_line);
+        }
+        std::fs::write(&path, &log).unwrap();
+        assert!(
+            !has_recent_crash_event("p").unwrap(),
+            "a crash line beyond the tail window must not be seen",
+        );
 
         std::env::remove_var("SHELBI_HOME");
         let _ = std::fs::remove_dir_all(&home);

@@ -25,11 +25,6 @@ struct Cli {
     #[arg(long, short = 'p', global = true, env = "SHELBI_PROJECT")]
     project: Option<String>,
 
-    /// Session (workspace) to load — only used when no subcommand is given.
-    /// Defaults to $SHELBI_SESSION or "default".
-    #[arg(env = "SHELBI_SESSION")]
-    session: Option<String>,
-
     #[command(subcommand)]
     cmd: Option<Cmd>,
 }
@@ -606,6 +601,27 @@ mod cli_tests {
         assert!(project_yaml_exists("live"), "present YAML should be live");
 
         std::env::remove_var("SHELBI_HOME");
+    }
+
+    /// A mistyped subcommand must be a parse *error*, not silently
+    /// absorbed. Before F8 a bare `session` positional swallowed the typo
+    /// (`shelbi statsu` parsed as `session = "statsu"`, `cmd = None`) and
+    /// `default_entry` booted the TUI instead of erroring. With the dead
+    /// positional gone, clap rejects the unknown token.
+    #[test]
+    fn mistyped_subcommand_is_a_parse_error() {
+        for argv in [
+            vec!["shelbi", "statsu"],
+            vec!["shelbi", "tsk", "list"],
+        ] {
+            assert!(
+                Cli::try_parse_from(&argv).is_err(),
+                "expected `{argv:?}` to be rejected, not parsed",
+            );
+        }
+        // Bare `shelbi` (no subcommand) is still valid — it drives the
+        // default TUI/first-run entry.
+        assert!(Cli::try_parse_from(["shelbi"]).is_ok());
     }
 
     /// `--root <path>` is a top-level global flag — accepted before *or*
