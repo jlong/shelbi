@@ -237,14 +237,21 @@ fn compose_review_prompt(task_id: &str, branch: &str, body: &str) -> String {
 fn preflight_workdir(host: &Host, machine: &Machine) -> Result<()> {
     let repo = machine.work_dir.to_string_lossy().into_owned();
     let dirty = shelbi_ssh::run_capture(host, ["git", "-C", &repo, "status", "--porcelain"])?;
-    // .shelbi/ is shelbi's metadata — ignore it from the cleanliness check
-    // even if the user hasn't gitignored it yet. (Same carve-out merge.rs
-    // applies for the same reason.)
+    // .shelbi/ and .claude/ are shelbi's metadata / deploy footprint —
+    // ignore them from the cleanliness check even if the user hasn't
+    // gitignored them yet. (Same carve-out merge.rs applies, and the same
+    // .claude/ carve-out sync_worktree uses on the dispatch side — a repo
+    // that commits .claude/ would otherwise be permanently dirtied by the
+    // settings.json / agent-instructions.md we deploy.)
     let user_dirty: Vec<&str> = dirty
         .lines()
         .filter(|l| {
             let path = l.get(3..).unwrap_or("");
-            !(path.starts_with(".shelbi/") || path == ".shelbi" || path == ".gitignore")
+            !(path.starts_with(".shelbi/")
+                || path == ".shelbi"
+                || path.starts_with(".claude/")
+                || path == ".claude"
+                || path == ".gitignore")
         })
         .collect();
     if !user_dirty.is_empty() {
@@ -260,7 +267,14 @@ fn preflight_workdir(host: &Host, machine: &Machine) -> Result<()> {
 /// If a workspace worktree on this machine is currently on `branch`, switch
 /// it to `default_branch` so the main work_dir is free to check out
 /// `branch`. Bails on a dirty workspace worktree (we'd silently lose work).
-fn release_branch_from_workspace_worktrees(
+///
+/// `sync_worktree` reuses this on the dispatch path (F14): re-dispatching a
+/// task whose branch is live in another workspace's worktree would otherwise
+/// die on `fatal: '<branch>' is already checked out`. It's safe to call from
+/// there because the dispatch only reaches its checkout when the *target*
+/// worktree's HEAD is already off `branch`, so this never detaches the
+/// worktree it's about to check the branch back out into.
+pub(crate) fn release_branch_from_workspace_worktrees(
     host: &Host,
     project: &Project,
     machine: &Machine,

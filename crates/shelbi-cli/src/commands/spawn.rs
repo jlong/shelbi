@@ -208,30 +208,57 @@ fn expand_tilde(p: &std::path::Path) -> PathBuf {
     p.to_path_buf()
 }
 
-/// Add `.shelbi/` to the repo's `.gitignore` if it isn't already covered.
-/// Writes to the file on the workspace's filesystem via `sh -c`; never commits.
+/// Add shelbi's footprint to the repo's `.gitignore` if it isn't already
+/// covered: `.shelbi/` (metadata) plus the `.claude/` files shelbi deploys
+/// into the worktree on every dispatch (settings.json, agent-instructions.md,
+/// skills/, the review marker). Without the `.claude/` entries a repo that
+/// doesn't already ignore that dir shows those files as untracked and the
+/// worktree reads as dirty. Writes to the file on the workspace's filesystem
+/// via `sh -c`; never commits.
 fn ensure_gitignored(host: &Host, machine: &Machine) -> Result<()> {
     let repo = machine.work_dir.to_string_lossy().into_owned();
-    // `git check-ignore` exits 0 if the path is ignored, 1 if not, 128 on error.
-    let probe = shelbi_ssh::run(
-        host,
-        ["git", "-C", &repo, "check-ignore", "-q", ".shelbi/"],
-    )
-    .map_err(|e| anyhow!(e))?;
-    if probe.status.success() {
+    // Probe each footprint independently so a repo that already ignores
+    // `.shelbi/` (but not the shelbi-written `.claude/` files) still gets the
+    // `.claude/` block appended. `git check-ignore` exits 0 if the path is
+    // ignored, 1 if not, 128 on error.
+    let mut snippet = String::new();
+    if !check_ignored(host, &repo, ".shelbi/")? {
+        snippet.push_str(
+            "\n# shelbi worktrees + metadata (https://github.com/jlong/shelbi)\n.shelbi/\n",
+        );
+    }
+    // Representative probe: if the review marker isn't ignored, none of the
+    // shelbi-written `.claude/` files are, so append the whole block.
+    if !check_ignored(host, &repo, ".claude/shelbi-review-ready")? {
+        snippet.push_str(
+            "\n# shelbi deploy footprint written into the worktree on dispatch\n\
+             .claude/settings.json\n\
+             .claude/agent-instructions.md\n\
+             .claude/skills/\n\
+             .claude/shelbi-review-ready\n",
+        );
+    }
+    if snippet.is_empty() {
         return Ok(());
     }
     let gitignore = format!("{repo}/.gitignore");
-    let snippet =
-        "\n# shelbi worktrees + metadata (https://github.com/jlong/shelbi)\n.shelbi/\n";
     // Append via `sh -c` so the redirect works locally and over SSH.
     let cmd = format!(
         "printf '%s' {} >> {}",
-        shelbi_agent::shell_escape(snippet),
+        shelbi_agent::shell_escape(&snippet),
         shelbi_agent::shell_escape(&gitignore),
     );
     shelbi_ssh::run_capture(host, ["sh", "-c", &cmd]).map_err(|e| anyhow!(e))?;
     Ok(())
+}
+
+/// `git check-ignore -q <path>` → true when the path is ignored. Exit 0 =
+/// ignored, 1 = not ignored, 128 = error (treated as "not ignored" so a
+/// probe failure just appends the snippet rather than blocking the spawn).
+fn check_ignored(host: &Host, repo: &str, path: &str) -> Result<bool> {
+    let probe = shelbi_ssh::run(host, ["git", "-C", repo, "check-ignore", "-q", path])
+        .map_err(|e| anyhow!(e))?;
+    Ok(probe.status.success())
 }
 
 fn create_worktree(

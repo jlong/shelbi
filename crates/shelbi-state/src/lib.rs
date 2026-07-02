@@ -434,6 +434,35 @@ pub(crate) fn acquire_file_lock(lock_path: &Path) -> Result<FileLockGuard> {
     Ok(FileLockGuard { _file: file })
 }
 
+/// Public RAII handle for the per-workspace dispatch lock. Wraps a
+/// [`FileLockGuard`] so callers outside this crate can serialize the
+/// sync-worktree + spawn sequence without gaining access to the internal
+/// lock primitive. Released when dropped.
+#[must_use = "the workspace lock is released as soon as the guard is dropped"]
+pub struct WorkspaceLock(#[allow(dead_code)] FileLockGuard);
+
+/// Block until the exclusive per-workspace dispatch lock is held.
+///
+/// Two concurrent `task start`s targeting the same workspace would
+/// otherwise interleave their sync-worktree / checkout / pane-recreate
+/// steps and leave the pane running one branch while the worktree sits on
+/// another. Holding this guard across the whole dispatch serializes them:
+/// the second start blocks here until the first finishes and drops it.
+/// The lock file is a sibling of the project's other locks under
+/// `<project_dir>/`.
+pub fn lock_workspace(project: &str, workspace: &str) -> Result<WorkspaceLock> {
+    // `validate_project_name` runs inside `project_dir`; the workspace name
+    // comes from trusted project config, but keep the lock file name flat by
+    // rejecting a name that would introduce a path separator.
+    if workspace.contains('/') || workspace.contains('\\') || workspace.is_empty() {
+        return Err(shelbi_core::Error::Other(format!(
+            "invalid workspace name for lock: {workspace:?}"
+        )));
+    }
+    let path = project_dir(project)?.join(format!("workspace-{workspace}.lock"));
+    Ok(WorkspaceLock(acquire_file_lock(&path)?))
+}
+
 /// Sibling lock-file path for `path` (`state.json` → `state.json.lock`).
 /// The suffix is appended to the full file name — never `with_extension`,
 /// which would collide `a.json` and `a.yaml` onto the same lock.
@@ -1754,6 +1783,26 @@ pub fn set_task_priority(project: &str, id: &str, new_priority: u32) -> Result<(
     write_column_order(project, &col)
 }
 
+/// Persist only the `branch:` field on task `id`, under the per-project
+/// task lock.
+///
+/// The lock spans the load→mutate→save so a concurrent writer touching a
+/// *different* field on the same task can't be clobbered by a stale
+/// whole-task write — the lost-update the caller's unlocked
+/// `load_task` → mutate → `save_task` would otherwise cause. No-op (and no
+/// mtime bump) when the branch already matches, so re-running a dispatch on
+/// an already-branched task doesn't churn `updated_at`.
+pub fn set_task_branch(project: &str, id: &str, branch: &str) -> Result<()> {
+    let _lock = lock_tasks(project)?;
+    let mut tf = load_task(project, id)?;
+    if tf.task.branch.as_deref() == Some(branch) {
+        return Ok(());
+    }
+    tf.task.branch = Some(branch.to_string());
+    tf.task.updated_at = chrono::Utc::now();
+    save_task_unlocked(project, &tf.task, &tf.body)
+}
+
 /// Stamp 0..N priorities onto the ordered slice and persist only the
 /// tasks whose priority actually changed. Callers must hold the task
 /// lock — the slice is a snapshot, and an unserialized concurrent writer
@@ -2593,6 +2642,85 @@ mod tests {
         let col = list_column("p", Column::Backlog).unwrap();
         let ids: Vec<_> = col.iter().map(|tf| tf.task.id.as_str()).collect();
         assert_eq!(ids, vec!["a", "d", "b", "c"]);
+        std::env::remove_var("SHELBI_HOME");
+    }
+
+    #[test]
+    fn set_task_branch_persists_only_the_branch_field() {
+        let _g = TEST_LOCK.lock().unwrap();
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+        save_task("p", &make_task("t", Column::Todo, 0), "# body\n").unwrap();
+
+        set_task_branch("p", "t", "shelbi/t").unwrap();
+        let back = load_task("p", "t").unwrap();
+        assert_eq!(back.task.branch.as_deref(), Some("shelbi/t"));
+        // Body and other fields survive the targeted write.
+        assert_eq!(back.body, "# body\n");
+        assert_eq!(back.task.column, Column::Todo);
+        std::env::remove_var("SHELBI_HOME");
+    }
+
+    #[test]
+    fn set_task_branch_is_a_noop_when_unchanged() {
+        let _g = TEST_LOCK.lock().unwrap();
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+        let mut task = make_task("t", Column::Todo, 0);
+        task.branch = Some("shelbi/t".into());
+        save_task("p", &task, "").unwrap();
+
+        let before = std::fs::metadata(task_path("p", "t").unwrap())
+            .unwrap()
+            .modified()
+            .unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        set_task_branch("p", "t", "shelbi/t").unwrap();
+        let after = std::fs::metadata(task_path("p", "t").unwrap())
+            .unwrap()
+            .modified()
+            .unwrap();
+        assert_eq!(before, after, "no-op set-branch must not rewrite the file");
+        std::env::remove_var("SHELBI_HOME");
+    }
+
+    #[test]
+    fn set_task_branch_does_not_clobber_a_concurrent_field_change() {
+        // Models the lost-update F6 fixes: another writer moved the task to
+        // a new column *after* a caller loaded it. A targeted set-branch
+        // must re-read under the lock and preserve that column rather than
+        // writing back a stale whole-task snapshot.
+        let _g = TEST_LOCK.lock().unwrap();
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+        save_task("p", &make_task("t", Column::Todo, 0), "").unwrap();
+
+        // Concurrent writer flips the column.
+        move_task("p", "t", Column::InProgress).unwrap();
+
+        // Targeted set-branch (as if from a caller holding a pre-move read).
+        set_task_branch("p", "t", "shelbi/t").unwrap();
+
+        let back = load_task("p", "t").unwrap();
+        assert_eq!(back.task.branch.as_deref(), Some("shelbi/t"));
+        assert_eq!(
+            back.task.column,
+            Column::InProgress,
+            "the concurrent column change must survive the set-branch"
+        );
+        std::env::remove_var("SHELBI_HOME");
+    }
+
+    #[test]
+    fn lock_workspace_rejects_names_with_separators() {
+        let _g = TEST_LOCK.lock().unwrap();
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+        assert!(lock_workspace("p", "../evil").is_err());
+        assert!(lock_workspace("p", "a/b").is_err());
+        assert!(lock_workspace("p", "").is_err());
+        // A well-formed name yields a guard (dropped immediately here).
+        assert!(lock_workspace("p", "alice").is_ok());
         std::env::remove_var("SHELBI_HOME");
     }
 
