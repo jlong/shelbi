@@ -15,6 +15,7 @@ shelbi-orchestrator = { workspace = true }
 shelbi-agent = { workspace = true }
 shelbi-palette = { workspace = true }
 shelbi-tmux = { workspace = true }
+shelbi-ssh = { workspace = true }
 ratatui = { workspace = true }
 crossterm = { workspace = true }
 anyhow = { workspace = true }

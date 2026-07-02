@@ -205,7 +205,7 @@ fn sync_one(host: &Host, spec: &ContextStoreSyncSpec) -> SyncStatus {
 /// rejects the flag; the caller `mkdir -p`s the destination instead.
 fn rsync_argv(src: &str, dst: &str) -> Vec<String> {
     let control_path = shelbi_state::ssh_control_path_template()
-        .unwrap_or_else(|_| "~/.shelbi/ssh/%r@%h".to_string());
+        .unwrap_or_else(|_| "~/.shelbi/ssh/%C".to_string());
     let rsh = format!(
         "ssh -o ControlMaster=auto -o ControlPath={control_path} \
          -o ControlPersist=600 -o ConnectTimeout=5 -o BatchMode=yes \
