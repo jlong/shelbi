@@ -378,6 +378,60 @@ pub fn ensure_dir(p: &Path) -> Result<()> {
 }
 
 // ---------------------------------------------------------------------------
+// Advisory file locking
+
+/// RAII guard for an exclusive advisory `flock` on a lock file. The lock
+/// is released when the guard drops (closing the descriptor releases the
+/// flock), so holding a guard across a read-modify-write serializes that
+/// whole sequence against every other process — and every other thread of
+/// this process — that locks the same path.
+#[must_use = "the lock is released as soon as the guard is dropped"]
+pub(crate) struct FileLockGuard {
+    _file: fs::File,
+}
+
+/// Block until an exclusive advisory lock on `lock_path` is acquired. The
+/// lock file is created (empty) when missing; it carries no data — its only
+/// job is to be a stable inode for `flock`. Each caller opens its own
+/// descriptor, so two threads of one process exclude each other just like
+/// two processes do.
+pub(crate) fn acquire_file_lock(lock_path: &Path) -> Result<FileLockGuard> {
+    if let Some(parent) = lock_path.parent() {
+        ensure_dir(parent)?;
+    }
+    let file = fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(lock_path)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::io::AsRawFd;
+        loop {
+            let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) };
+            if rc == 0 {
+                break;
+            }
+            let err = std::io::Error::last_os_error();
+            if err.kind() != std::io::ErrorKind::Interrupted {
+                return Err(shelbi_core::Error::Io(err));
+            }
+        }
+    }
+    Ok(FileLockGuard { _file: file })
+}
+
+/// Sibling lock-file path for `path` (`state.json` → `state.json.lock`).
+/// The suffix is appended to the full file name — never `with_extension`,
+/// which would collide `a.json` and `a.yaml` onto the same lock.
+fn sibling_lock_path(path: &Path) -> PathBuf {
+    let mut name = path.file_name().unwrap_or_default().to_os_string();
+    name.push(".lock");
+    path.with_file_name(name)
+}
+
+// ---------------------------------------------------------------------------
 // Project / Session YAML
 
 pub fn load_project(project: &str) -> Result<Project> {
@@ -640,16 +694,15 @@ impl SidebarPrefs {
 /// `zen_intro_seen`). Used by the sidebar's Space/Enter handler when
 /// focus is on a `MachineGroup` row.
 pub fn toggle_sidebar_machine_collapsed(machine: &str) -> Result<bool> {
-    let mut state = read_global_state()?;
-    let now_collapsed = if state.sidebar.collapsed_machines.contains(machine) {
-        state.sidebar.collapsed_machines.remove(machine);
-        false
-    } else {
-        state.sidebar.collapsed_machines.insert(machine.to_string());
-        true
-    };
-    write_global_state(&state)?;
-    Ok(now_collapsed)
+    update_global_state(|state| {
+        Ok(if state.sidebar.collapsed_machines.contains(machine) {
+            state.sidebar.collapsed_machines.remove(machine);
+            false
+        } else {
+            state.sidebar.collapsed_machines.insert(machine.to_string());
+            true
+        })
+    })
 }
 
 /// Snapshot of the user's currently-collapsed machine names. The TUI
@@ -676,24 +729,53 @@ pub fn read_global_state() -> Result<GlobalState> {
         .map_err(|e| shelbi_core::Error::Other(format!("state.json: {e}")))
 }
 
-/// Atomically write `state` to `~/.shelbi/state.json`.
+/// Atomically write `state` to `~/.shelbi/state.json`, holding the state
+/// lock for the duration of the write.
+///
+/// This is a full-snapshot, last-writer-wins write: any field another
+/// process changed since `state` was read is silently reverted. Mutators
+/// must go through [`update_global_state`] instead — reserve this for
+/// writing a state you constructed from scratch (tests, seeding).
 pub fn write_global_state(state: &GlobalState) -> Result<()> {
     let path = global_state_path()?;
-    let body = serde_json::to_vec_pretty(state)
-        .map_err(|e| shelbi_core::Error::Other(format!("state.json: {e}")))?;
-    atomic_write(&path, &body)
+    let _lock = acquire_file_lock(&sibling_lock_path(&path))?;
+    write_global_state_to(&path, state)
 }
 
-/// Mark the Zen Mode intro popover as acknowledged. Reads, mutates, and
-/// re-writes `~/.shelbi/state.json` so the other fields are preserved.
-/// Idempotent — a no-op when already set.
-pub fn mark_zen_intro_seen() -> Result<()> {
+/// Serialize and atomically write `state` at `path`. Callers must hold the
+/// global-state lock.
+fn write_global_state_to(path: &Path, state: &GlobalState) -> Result<()> {
+    let body = serde_json::to_vec_pretty(state)
+        .map_err(|e| shelbi_core::Error::Other(format!("state.json: {e}")))?;
+    atomic_write(path, &body)
+}
+
+/// Locked read-modify-write on `~/.shelbi/state.json`. Takes an exclusive
+/// advisory lock on the sibling `state.json.lock`, reads the current
+/// [`GlobalState`], applies `f`, and writes the result back — so two
+/// concurrent mutators can never lose each other's field updates. The
+/// write is skipped when `f` leaves the state unchanged (idempotent
+/// callers stay no-ops), and an `Err` from `f` aborts without writing.
+pub fn update_global_state<R>(f: impl FnOnce(&mut GlobalState) -> Result<R>) -> Result<R> {
+    let path = global_state_path()?;
+    let _lock = acquire_file_lock(&sibling_lock_path(&path))?;
     let mut state = read_global_state()?;
-    if state.zen_intro_seen {
-        return Ok(());
+    let before = state.clone();
+    let out = f(&mut state)?;
+    if state != before {
+        write_global_state_to(&path, &state)?;
     }
-    state.zen_intro_seen = true;
-    write_global_state(&state)
+    Ok(out)
+}
+
+/// Mark the Zen Mode intro popover as acknowledged. Routed through
+/// [`update_global_state`] so the other fields are preserved even against
+/// concurrent writers. Idempotent — a no-op when already set.
+pub fn mark_zen_intro_seen() -> Result<()> {
+    update_global_state(|state| {
+        state.zen_intro_seen = true;
+        Ok(())
+    })
 }
 
 #[cfg(test)]
@@ -883,9 +965,10 @@ pub enum ZenCrashRecovery {
 /// [`zen_check_crash_recovery`] detect the crash. Writes only to
 /// `state.json` — keeps the events log clean.
 pub fn zen_heartbeat(project: &str) -> Result<()> {
-    let mut state = read_state(project)?;
-    state.zen_last_crashed_at = Some(Utc::now());
-    write_state(project, &state)
+    update_state(project, |state| {
+        state.zen_last_crashed_at = Some(Utc::now());
+        Ok(())
+    })
 }
 
 /// Clear `zen_last_crashed_at`. Called from the orchestrator's graceful
@@ -893,12 +976,10 @@ pub fn zen_heartbeat(project: &str) -> Result<()> {
 /// a stale timestamp on disk that the next start would misread as a
 /// crash. Idempotent — a no-op when nothing is set.
 pub fn zen_clear_crash(project: &str) -> Result<()> {
-    let mut state = read_state(project)?;
-    if state.zen_last_crashed_at.is_none() {
-        return Ok(());
-    }
-    state.zen_last_crashed_at = None;
-    write_state(project, &state)
+    update_state(project, |state| {
+        state.zen_last_crashed_at = None;
+        Ok(())
+    })
 }
 
 /// Run at orchestrator start. If `zen_last_crashed_at` is within the
@@ -908,23 +989,21 @@ pub fn zen_clear_crash(project: &str) -> Result<()> {
 /// consumed once read — calling this a second time on the same disk
 /// state returns `NoCrash`.
 pub fn zen_check_crash_recovery(project: &str) -> Result<ZenCrashRecovery> {
-    let mut state = read_state(project)?;
-    let Some(crashed_at) = state.zen_last_crashed_at else {
-        return Ok(ZenCrashRecovery::NoCrash);
-    };
-    let age = Utc::now() - crashed_at;
-    let recent = age <= chrono::Duration::seconds(ZEN_CRASH_RECOVERY_WINDOW_SECS);
-    let should_disable = recent && state.zen_mode == ZenModeState::On;
-    state.zen_last_crashed_at = None;
-    if should_disable {
-        state.zen_mode = ZenModeState::Off;
-    }
-    write_state(project, &state)?;
-    if should_disable {
-        Ok(ZenCrashRecovery::AutoDisabled { crashed_at })
-    } else {
-        Ok(ZenCrashRecovery::NoCrash)
-    }
+    update_state(project, |state| {
+        let Some(crashed_at) = state.zen_last_crashed_at else {
+            return Ok(ZenCrashRecovery::NoCrash);
+        };
+        let age = Utc::now() - crashed_at;
+        let recent = age <= chrono::Duration::seconds(ZEN_CRASH_RECOVERY_WINDOW_SECS);
+        let should_disable = recent && state.zen_mode == ZenModeState::On;
+        state.zen_last_crashed_at = None;
+        if should_disable {
+            state.zen_mode = ZenModeState::Off;
+            Ok(ZenCrashRecovery::AutoDisabled { crashed_at })
+        } else {
+            Ok(ZenCrashRecovery::NoCrash)
+        }
+    })
 }
 
 /// Read `state.json` for `project`. Returns `State::default()` when the
@@ -940,12 +1019,50 @@ pub fn read_state(project: &str) -> Result<State> {
         .map_err(|e| shelbi_core::Error::Other(format!("state.json: {e}")))
 }
 
-/// Atomically write `state` to `~/.shelbi/projects/<project>/state.json`.
+/// Atomically write `state` to `~/.shelbi/projects/<project>/state.json`,
+/// holding the state lock for the duration of the write.
+///
+/// This is a full-snapshot, last-writer-wins write: any field another
+/// process changed since `state` was read is silently reverted. Mutators
+/// must go through [`update_state`] instead — reserve this for writing a
+/// state you constructed from scratch (tests, seeding).
 pub fn write_state(project: &str, state: &State) -> Result<()> {
     let path = state_path(project)?;
+    let _lock = acquire_file_lock(&sibling_lock_path(&path))?;
+    write_state_to(&path, state)
+}
+
+/// Serialize and atomically write `state` at `path`. Callers must hold the
+/// project's state lock.
+fn write_state_to(path: &Path, state: &State) -> Result<()> {
     let body = serde_json::to_vec_pretty(state)
         .map_err(|e| shelbi_core::Error::Other(format!("state.json: {e}")))?;
-    atomic_write(&path, &body)
+    atomic_write(path, &body)
+}
+
+/// Locked read-modify-write on a project's `state.json`. Takes an
+/// exclusive advisory lock on the sibling `state.json.lock`, reads the
+/// current [`State`], applies `f`, and writes the result back — so two
+/// concurrent mutators (a heartbeat tick vs `shelbi zen off`, a filter
+/// change vs a toggle, …) can never lose each other's field updates. The
+/// write is skipped when `f` leaves the state unchanged (idempotent
+/// callers stay no-ops), and an `Err` from `f` aborts without writing.
+///
+/// Every `State` mutator must route through here; an ad-hoc `read_state` →
+/// mutate → `write_state` sequence reintroduces the lost-update race this
+/// exists to prevent. `f` must not call another state mutator for the same
+/// project — the flock is not reentrant and the nested acquire would
+/// deadlock.
+pub fn update_state<R>(project: &str, f: impl FnOnce(&mut State) -> Result<R>) -> Result<R> {
+    let path = state_path(project)?;
+    let _lock = acquire_file_lock(&sibling_lock_path(&path))?;
+    let mut state = read_state(project)?;
+    let before = state.clone();
+    let out = f(&mut state)?;
+    if state != before {
+        write_state_to(&path, &state)?;
+    }
+    Ok(out)
 }
 
 /// Persist `target` as the project's `zen_mode` and append a
@@ -957,10 +1074,11 @@ pub fn write_state(project: &str, state: &State) -> Result<()> {
 /// the prior mode for callers that want to render a diff without a
 /// follow-up read.
 pub fn set_zen_mode(project: &str, target: ZenModeState, source: &str) -> Result<ZenModeState> {
-    let mut state = read_state(project)?;
-    let prev = state.zen_mode;
-    state.zen_mode = target;
-    write_state(project, &state)?;
+    let prev = update_state(project, |state| {
+        let prev = state.zen_mode;
+        state.zen_mode = target;
+        Ok(prev)
+    })?;
     let _ = append_zen_mode_event(prev.as_str(), target.as_str(), source);
     Ok(prev)
 }
@@ -970,9 +1088,10 @@ pub fn set_zen_mode(project: &str, target: ZenModeState, source: &str) -> Result
 /// the other fields (Zen mode, crash timestamp) are preserved. No event
 /// log entry — view-state changes are noise in the activity feed.
 pub fn set_workspace_filter(project: &str, filter: Option<&str>) -> Result<()> {
-    let mut state = read_state(project)?;
-    state.workspace_filter = filter.map(|s| s.to_string());
-    write_state(project, &state)
+    update_state(project, |state| {
+        state.workspace_filter = filter.map(|s| s.to_string());
+        Ok(())
+    })
 }
 
 /// Compose the persistence key for a Kanban column override. The key
@@ -994,31 +1113,40 @@ pub fn set_kanban_column_override(
     status_id: &str,
     override_state: Option<KanbanColumnOverride>,
 ) -> Result<()> {
-    let mut state = read_state(project)?;
-    let key = kanban_column_override_key(workflow, status_id);
-    match override_state {
-        Some(v) => {
-            state.kanban_column_overrides.insert(key, v);
+    update_state(project, |state| {
+        let key = kanban_column_override_key(workflow, status_id);
+        match override_state {
+            Some(v) => {
+                state.kanban_column_overrides.insert(key, v);
+            }
+            None => {
+                state.kanban_column_overrides.remove(&key);
+            }
         }
-        None => {
-            state.kanban_column_overrides.remove(&key);
-        }
-    }
-    write_state(project, &state)
+        Ok(())
+    })
 }
 
-/// Binary toggle on top of [`set_zen_mode`]: On flips to Off, anything
-/// else (Off, Paused) flips to On. Paused collapses to On here because
-/// the toggle is intentionally a two-state hop — the CLI is still the
-/// path that can land on Paused. Returns the new mode so callers can
+/// Binary toggle with [`set_zen_mode`]'s semantics: On flips to Off,
+/// anything else (Off, Paused) flips to On. Paused collapses to On here
+/// because the toggle is intentionally a two-state hop — the CLI is still
+/// the path that can land on Paused. Returns the new mode so callers can
 /// update their cached state without a re-read.
+///
+/// The read and the flip happen inside one [`update_state`] critical
+/// section (not read-then-`set_zen_mode`) so a concurrent mutator can't
+/// slip between the two and get its write flipped on a stale snapshot.
 pub fn toggle_zen_mode(project: &str, source: &str) -> Result<ZenModeState> {
-    let current = read_state(project)?.zen_mode;
-    let target = match current {
-        ZenModeState::On => ZenModeState::Off,
-        ZenModeState::Off | ZenModeState::Paused => ZenModeState::On,
-    };
-    set_zen_mode(project, target, source)?;
+    let (prev, target) = update_state(project, |state| {
+        let prev = state.zen_mode;
+        let target = match prev {
+            ZenModeState::On => ZenModeState::Off,
+            ZenModeState::Off | ZenModeState::Paused => ZenModeState::On,
+        };
+        state.zen_mode = target;
+        Ok((prev, target))
+    })?;
+    let _ = append_zen_mode_event(prev.as_str(), target.as_str(), source);
     Ok(target)
 }
 
@@ -1103,10 +1231,46 @@ pub struct TaskFile {
     pub body: String,
 }
 
+/// Path of the per-project task lock: `<project_dir>/tasks.lock`, a
+/// sibling of the `tasks/` directory (so `list_tasks`' `*.md` scan never
+/// sees it). Serializes multi-file column mutations — move, reprioritize,
+/// renumber, create — so two concurrent moves can't both compute the same
+/// destination priority, and a renumber can't interleave with a save.
+fn tasks_lock_path(project: &str) -> Result<PathBuf> {
+    Ok(project_dir(project)?.join("tasks.lock"))
+}
+
+fn lock_tasks(project: &str) -> Result<FileLockGuard> {
+    acquire_file_lock(&tasks_lock_path(project)?)
+}
+
 pub fn save_task(project: &str, task: &Task, body_md: &str) -> Result<()> {
+    let _lock = lock_tasks(project)?;
+    save_task_unlocked(project, task, body_md)
+}
+
+/// [`save_task`] body without the task lock — for callers that already
+/// hold it (nested `flock` acquisition would deadlock).
+fn save_task_unlocked(project: &str, task: &Task, body_md: &str) -> Result<()> {
     ensure_dir(&tasks_dir(project)?)?;
     let path = task_path(project, &task.id)?;
     write_frontmatter_file(&path, task, body_md)
+}
+
+/// Create-exclusive variant of [`save_task`]: fails when a task with the
+/// same id already exists instead of silently overwriting it. The
+/// existence check and the write happen under the per-project task lock,
+/// closing the check-then-save TOCTOU in id generation.
+pub fn create_task(project: &str, task: &Task, body_md: &str) -> Result<()> {
+    let _lock = lock_tasks(project)?;
+    let path = task_path(project, &task.id)?;
+    if path.exists() {
+        return Err(shelbi_core::Error::Other(format!(
+            "task `{}` already exists",
+            task.id
+        )));
+    }
+    save_task_unlocked(project, task, body_md)
 }
 
 pub fn load_task(project: &str, id: &str) -> Result<TaskFile> {
@@ -1236,9 +1400,21 @@ pub fn list_tasks(project: &str) -> Result<Vec<TaskFile>> {
         }
     }
     prune_parse_warn(&dir, &seen);
-    out.sort_by_key(|tf| {
-        let col_idx = Column::ALL.iter().position(|c| *c == tf.task.column).unwrap_or(0);
-        (col_idx, tf.task.priority)
+    // The id tiebreak keeps board order deterministic when priorities
+    // collide — without it, ties resolve by `read_dir` order, which the
+    // filesystem is free to flap between scans.
+    out.sort_by(|a, b| {
+        let col_idx = |tf: &TaskFile| {
+            Column::ALL
+                .iter()
+                .position(|c| *c == tf.task.column)
+                .unwrap_or(0)
+        };
+        (col_idx(a), a.task.priority, a.task.id.as_str()).cmp(&(
+            col_idx(b),
+            b.task.priority,
+            b.task.id.as_str(),
+        ))
     });
     Ok(out)
 }
@@ -1408,6 +1584,10 @@ pub fn move_task(
     id: &str,
     new_column: Column,
 ) -> Result<Option<(Column, Column, String)>> {
+    // The whole load → count → save → renumber sequence runs under the
+    // task lock: two concurrent moves into one column would otherwise
+    // both read the same `len()` and land on duplicate priorities.
+    let _lock = lock_tasks(project)?;
     let TaskFile { mut task, body } = load_task(project, id)?;
     if task.column == new_column {
         return Ok(None);
@@ -1418,14 +1598,19 @@ pub fn move_task(
     task.column = new_column;
     task.priority = new_priority;
     task.updated_at = chrono::Utc::now();
-    save_task(project, &task, &body)?;
-    renumber_column(project, old_column)?;
+    save_task_unlocked(project, &task, &body)?;
+    renumber_column_unlocked(project, old_column)?;
+    // Renumber the destination too — it repairs duplicate priorities or
+    // gaps left behind by older builds (or a crash between the save and
+    // the renumber) instead of letting them skew the column forever.
+    renumber_column_unlocked(project, new_column)?;
     Ok(Some((old_column, new_column, workflow)))
 }
 
 /// Re-position `id` to slot `new_priority` within its current column. Other
 /// tasks shift to keep the column contiguous from 0.
 pub fn set_task_priority(project: &str, id: &str, new_priority: u32) -> Result<()> {
+    let _lock = lock_tasks(project)?;
     let target = load_task(project, id)?;
     let column = target.task.column;
     let mut col = list_column(project, column)?;
@@ -1443,7 +1628,9 @@ pub fn set_task_priority(project: &str, id: &str, new_priority: u32) -> Result<(
 }
 
 /// Stamp 0..N priorities onto the ordered slice and persist only the
-/// tasks whose priority actually changed.
+/// tasks whose priority actually changed. Callers must hold the task
+/// lock — the slice is a snapshot, and an unserialized concurrent writer
+/// would be clobbered by these saves.
 fn write_column_order(project: &str, ordered: &[TaskFile]) -> Result<()> {
     let now = chrono::Utc::now();
     for (i, tf) in ordered.iter().enumerate() {
@@ -1454,13 +1641,20 @@ fn write_column_order(project: &str, ordered: &[TaskFile]) -> Result<()> {
         let mut task = tf.task.clone();
         task.priority = want;
         task.updated_at = now;
-        save_task(project, &task, &tf.body)?;
+        save_task_unlocked(project, &task, &tf.body)?;
     }
     Ok(())
 }
 
 /// Reload `column`'s tasks, sort by current priority, and renumber 0..N.
 pub fn renumber_column(project: &str, column: Column) -> Result<()> {
+    let _lock = lock_tasks(project)?;
+    renumber_column_unlocked(project, column)
+}
+
+/// [`renumber_column`] body without the task lock — for callers that
+/// already hold it.
+fn renumber_column_unlocked(project: &str, column: Column) -> Result<()> {
     let col = list_column(project, column)?;
     write_column_order(project, &col)
 }
@@ -1494,23 +1688,46 @@ fn split_frontmatter(s: &str) -> Option<(&str, &str)> {
     None
 }
 
-/// Atomic write: write to a temp file in the same dir, then rename.
+/// Atomic write: write to a uniquely named temp file in the same dir,
+/// then rename over `path`.
+///
+/// The temp suffix is appended to the full file name — never
+/// `with_extension`, which replaces the final extension and collides
+/// same-stem files (`a.json` and `a.yaml` would share one temp path). It
+/// carries the pid AND a per-process counter so two threads of one
+/// process writing the same target (TUI input thread + poller) can't
+/// scribble on each other's temp file. A failed write or rename removes
+/// its temp file instead of leaving litter.
 pub(crate) fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+
     let dir = path
         .parent()
         .ok_or_else(|| shelbi_core::Error::Other(format!("no parent dir for {path:?}")))?;
     ensure_dir(dir)?;
-    let tmp = path.with_extension(format!(
-        "tmp.{}",
-        std::process::id()
+    let mut tmp_name = path
+        .file_name()
+        .ok_or_else(|| shelbi_core::Error::Other(format!("no file name in {path:?}")))?
+        .to_os_string();
+    tmp_name.push(format!(
+        ".tmp.{}.{}",
+        std::process::id(),
+        SEQ.fetch_add(1, Ordering::Relaxed)
     ));
-    {
+    let tmp = dir.join(tmp_name);
+    let write_and_rename = || -> Result<()> {
         let mut f = fs::File::create(&tmp)?;
         f.write_all(bytes)?;
         f.sync_all()?;
+        fs::rename(&tmp, path)?;
+        Ok(())
+    };
+    let result = write_and_rename();
+    if result.is_err() {
+        let _ = fs::remove_file(&tmp);
     }
-    fs::rename(&tmp, path)?;
-    Ok(())
+    result
 }
 
 #[cfg(test)]
@@ -2954,6 +3171,244 @@ mod tests {
         let loaded = load_project("modern").unwrap();
         assert_eq!(loaded.workspaces.len(), 1);
         assert_eq!(loaded.workspaces[0].name, "alpha");
+        std::env::remove_var("SHELBI_HOME");
+    }
+
+    // ---- write serialization (F3/F7/F9) -----------------------------------
+
+    /// The F3 lost-update scenario: one thread heartbeats (touches only
+    /// `zen_last_crashed_at`) while another sets the workspace filter and
+    /// zen mode. Pre-locking, whichever write landed last reverted the
+    /// other's fields from its stale snapshot — a heartbeat could silently
+    /// re-arm Zen Mode after the user opted out. With `update_state`, every
+    /// field update survives.
+    #[test]
+    fn concurrent_state_mutators_preserve_both_updates() {
+        let _g = TEST_LOCK.lock().unwrap();
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+
+        write_state("p", &State::default()).unwrap();
+
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let b1 = barrier.clone();
+        let heartbeats = std::thread::spawn(move || {
+            b1.wait();
+            for _ in 0..25 {
+                zen_heartbeat("p").unwrap();
+            }
+        });
+        let b2 = barrier.clone();
+        let toggles = std::thread::spawn(move || {
+            b2.wait();
+            for _ in 0..25 {
+                set_workspace_filter("p", Some("alpha")).unwrap();
+                set_zen_mode("p", ZenModeState::On, "test").unwrap();
+            }
+        });
+        heartbeats.join().unwrap();
+        toggles.join().unwrap();
+
+        let s = read_state("p").unwrap();
+        assert_eq!(
+            s.zen_mode,
+            ZenModeState::On,
+            "zen mode reverted by a concurrent heartbeat's stale snapshot"
+        );
+        assert_eq!(
+            s.workspace_filter.as_deref(),
+            Some("alpha"),
+            "workspace filter lost to a concurrent mutator"
+        );
+        assert!(
+            s.zen_last_crashed_at.is_some(),
+            "heartbeat timestamp lost to a concurrent mutator"
+        );
+        std::env::remove_var("SHELBI_HOME");
+    }
+
+    /// F7: two concurrent moves into the same column must not both compute
+    /// `len()` before either saves — the destination ends up with
+    /// contiguous, duplicate-free priorities.
+    #[test]
+    fn concurrent_moves_into_one_column_never_duplicate_priorities() {
+        let _g = TEST_LOCK.lock().unwrap();
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+        save_task("p", &make_task("a", Column::Todo, 0), "").unwrap();
+        save_task("p", &make_task("b", Column::Todo, 1), "").unwrap();
+
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let b1 = barrier.clone();
+        let t1 = std::thread::spawn(move || {
+            b1.wait();
+            move_task("p", "a", Column::InProgress).unwrap();
+        });
+        let b2 = barrier.clone();
+        let t2 = std::thread::spawn(move || {
+            b2.wait();
+            move_task("p", "b", Column::InProgress).unwrap();
+        });
+        t1.join().unwrap();
+        t2.join().unwrap();
+
+        let col = list_column("p", Column::InProgress).unwrap();
+        let mut prios: Vec<_> = col.iter().map(|tf| tf.task.priority).collect();
+        prios.sort_unstable();
+        assert_eq!(prios, vec![0, 1], "destination priorities must be contiguous 0..N");
+        std::env::remove_var("SHELBI_HOME");
+    }
+
+    /// Moving into a column that already carries duplicate priorities
+    /// (older builds could produce them) repairs the destination instead
+    /// of preserving the skew forever.
+    #[test]
+    fn move_task_renumbers_destination_and_repairs_duplicates() {
+        let _g = TEST_LOCK.lock().unwrap();
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+        save_task("p", &make_task("a", Column::InProgress, 0), "").unwrap();
+        save_task("p", &make_task("b", Column::InProgress, 0), "").unwrap(); // duplicate
+        save_task("p", &make_task("c", Column::Todo, 0), "").unwrap();
+
+        move_task("p", "c", Column::InProgress).unwrap();
+
+        let col = list_column("p", Column::InProgress).unwrap();
+        let prios: Vec<_> = col.iter().map(|tf| tf.task.priority).collect();
+        assert_eq!(prios, vec![0, 1, 2], "destination must be renumbered contiguous");
+        std::env::remove_var("SHELBI_HOME");
+    }
+
+    /// Priority ties order by id, not by whatever order `read_dir`
+    /// happened to return — the board must render the same way on every
+    /// scan.
+    #[test]
+    fn list_tasks_breaks_priority_ties_by_id() {
+        let _g = TEST_LOCK.lock().unwrap();
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+        // Created in reverse-alphabetical order so read_dir order (often
+        // creation order) disagrees with the id tiebreak.
+        save_task("p", &make_task("zeta", Column::Todo, 0), "").unwrap();
+        save_task("p", &make_task("alpha", Column::Todo, 0), "").unwrap();
+        let col = list_column("p", Column::Todo).unwrap();
+        let ids: Vec<_> = col.iter().map(|tf| tf.task.id.as_str()).collect();
+        assert_eq!(ids, vec!["alpha", "zeta"]);
+        std::env::remove_var("SHELBI_HOME");
+    }
+
+    #[test]
+    fn create_task_refuses_to_overwrite_existing() {
+        let _g = TEST_LOCK.lock().unwrap();
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+        create_task("p", &make_task("dup", Column::Todo, 0), "original\n").unwrap();
+        let err = create_task("p", &make_task("dup", Column::Todo, 1), "clobber\n").unwrap_err();
+        assert!(err.to_string().contains("already exists"), "got: {err}");
+        // Original body untouched.
+        assert!(load_task("p", "dup").unwrap().body.contains("original"));
+        std::env::remove_var("SHELBI_HOME");
+    }
+
+    /// F9(a): two threads of one process writing the same target used to
+    /// share a pid-only temp path and corrupt each other. Every surviving
+    /// file content must be one writer's bytes, intact.
+    #[test]
+    fn atomic_write_same_path_from_two_threads_stays_intact() {
+        let dir = fresh_home();
+        let path = dir.join("contended.json");
+        let a = vec![b'A'; 64 * 1024];
+        let b = vec![b'B'; 64 * 1024];
+
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let mk = |bytes: Vec<u8>, barrier: std::sync::Arc<std::sync::Barrier>, path: PathBuf| {
+            std::thread::spawn(move || {
+                barrier.wait();
+                for _ in 0..50 {
+                    atomic_write(&path, &bytes).unwrap();
+                }
+            })
+        };
+        let t1 = mk(a, barrier.clone(), path.clone());
+        let t2 = mk(b, barrier.clone(), path.clone());
+        t1.join().unwrap();
+        t2.join().unwrap();
+
+        let got = std::fs::read(&path).unwrap();
+        assert_eq!(got.len(), 64 * 1024);
+        assert!(
+            got.iter().all(|&c| c == got[0]),
+            "file is a mix of two writers' bytes"
+        );
+    }
+
+    /// F9(b): the temp suffix must append to the file name, not replace
+    /// the extension — `x.json` and `x.yaml` written concurrently used to
+    /// collide on one `x.tmp.<pid>` path.
+    #[test]
+    fn atomic_write_same_stem_different_extension_do_not_collide() {
+        let dir = fresh_home();
+        let json = dir.join("x.json");
+        let yaml = dir.join("x.yaml");
+
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let mk = |path: PathBuf, byte: u8, barrier: std::sync::Arc<std::sync::Barrier>| {
+            std::thread::spawn(move || {
+                barrier.wait();
+                for _ in 0..50 {
+                    atomic_write(&path, &vec![byte; 4096]).unwrap();
+                }
+            })
+        };
+        let t1 = mk(json.clone(), b'J', barrier.clone());
+        let t2 = mk(yaml.clone(), b'Y', barrier.clone());
+        t1.join().unwrap();
+        t2.join().unwrap();
+
+        assert_eq!(std::fs::read(&json).unwrap(), vec![b'J'; 4096]);
+        assert_eq!(std::fs::read(&yaml).unwrap(), vec![b'Y'; 4096]);
+        // No temp litter left behind on the happy path.
+        let leftovers: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.contains(".tmp."))
+            .collect();
+        assert!(leftovers.is_empty(), "temp files left behind: {leftovers:?}");
+    }
+
+    /// `update_state` skips the disk write when the closure leaves the
+    /// state unchanged, and propagates the closure's error without
+    /// writing a partially mutated state.
+    #[test]
+    fn update_state_skips_noop_writes_and_aborts_on_closure_error() {
+        let _g = TEST_LOCK.lock().unwrap();
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+
+        write_state("p", &State { zen_mode: ZenModeState::On, ..State::default() }).unwrap();
+        let mtime_before = std::fs::metadata(state_path("p").unwrap())
+            .unwrap()
+            .modified()
+            .unwrap();
+
+        // No-op closure → file untouched.
+        update_state("p", |_state| Ok(())).unwrap();
+        let mtime_after = std::fs::metadata(state_path("p").unwrap())
+            .unwrap()
+            .modified()
+            .unwrap();
+        assert_eq!(mtime_before, mtime_after, "no-op update must not rewrite the file");
+
+        // Failing closure → mutation not persisted.
+        let err = update_state("p", |state| {
+            state.zen_mode = ZenModeState::Off;
+            Err::<(), _>(shelbi_core::Error::Other("boom".into()))
+        })
+        .unwrap_err();
+        assert!(err.to_string().contains("boom"));
+        assert_eq!(read_state("p").unwrap().zen_mode, ZenModeState::On);
+
         std::env::remove_var("SHELBI_HOME");
     }
 }
