@@ -53,6 +53,11 @@ orchestrator's reaction rules will recognize, e.g. `workspace=<name>
 pane_alive=false reason=<short>` or a domain-specific status the
 orchestrator's instructions cover.
 
+**Delivery confirmation.** The daemon replies `ok` on the same
+connection once your line is recorded (`nc` prints it to stdout).
+No `ok` back means the send didn't land — treat it like a failed
+write and apply the retry policy below.
+
 **Retry policy.** If the write fails, wait 500ms and retry once. If
 it still fails, you have two options:
 

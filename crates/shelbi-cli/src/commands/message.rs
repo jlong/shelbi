@@ -213,7 +213,7 @@ fn tail_pid_alive(host: &Host, messages_dir: &std::path::Path, task_id: &str) ->
 /// every other inbound message. Best-effort: any error is swallowed —
 /// the push is durable on disk regardless of whether the timer arms.
 fn notify_daemon_message_pushed(project: &str, task_id: &str, msg_id: &str) {
-    use std::io::Write;
+    use std::io::{Read, Write};
     use std::os::unix::net::UnixStream;
     use std::time::Duration;
 
@@ -237,6 +237,13 @@ fn notify_daemon_message_pushed(project: &str, task_id: &str, msg_id: &str) {
     bytes.push(b'\n');
     let _ = stream.write_all(&bytes);
     let _ = stream.shutdown(std::net::Shutdown::Write);
+    // Wait (briefly) for the daemon's ack so the connection isn't torn
+    // down while the daemon is still dispatching. Still best-effort: a
+    // missing ack just means the timeout timer may not be armed, and the
+    // push itself is already durable on disk.
+    let _ = stream.set_read_timeout(Some(Duration::from_millis(500)));
+    let mut ack = [0u8; shelbi_state::DAEMON_ACK.len()];
+    let _ = stream.read(&mut ack);
 }
 
 /// Is `path` a directory on `host`? `test -d` is a real binary on both Linux

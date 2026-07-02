@@ -15,7 +15,7 @@
 //! markers; they don't own these files.
 
 use std::fs;
-use std::io::Write;
+use std::io::{Read, Write};
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
 use std::time::{Duration, SystemTime};
@@ -581,12 +581,28 @@ const SOCKET_EMIT_WRITE_TIMEOUT: Duration = Duration::from_millis(500);
 /// across emit sites uniform.
 const SOCKET_EMIT_RETRY_DELAY: Duration = Duration::from_millis(500);
 
+/// The ack line the daemon writes back on the same connection after it
+/// has successfully processed one inbound frame. Shared between the
+/// daemon (writer) and every socket client (reader): a client that reads
+/// this before reporting success gets a real delivery guarantee — a
+/// daemon killed between `accept()` and dispatch never acks, so the
+/// client-side file fallback fires instead of the event silently
+/// vanishing. Shell clients see a literal `ok` echoed by `nc`.
+pub const DAEMON_ACK: &[u8] = b"ok\n";
+
+/// How long to wait for the daemon's [`DAEMON_ACK`] after our write.
+/// Longer than the write timeout because the daemon does real IO
+/// (events.log append) before acking; still short enough that a wedged
+/// daemon doesn't stall pane teardown beyond the retry budget.
+const SOCKET_EMIT_ACK_TIMEOUT: Duration = Duration::from_secs(2);
+
 /// Emit a pre-formatted event body, preferring the hub daemon socket and
 /// falling back to a direct `O_APPEND` write of the timestamped line to
 /// `events.log` if the socket is unreachable.
 ///
 /// **Preferred path:** open `hub_socket_path()`, send one
-/// `{"verb":"event","line":"<body>"}` line, close. The daemon prepends
+/// `{"verb":"event","line":"<body>"}` line, then wait for the daemon's
+/// [`DAEMON_ACK`] confirming the append happened. The daemon prepends
 /// the timestamp and appends the line — same shape we'd produce locally.
 /// On `ConnectionRefused` / `NotFound` (or any other write error) we wait
 /// 500ms and retry once. If both attempts fail the **degraded-mode
@@ -634,10 +650,19 @@ fn should_retry(err: &std::io::Error) -> bool {
     !matches!(err.kind(), std::io::ErrorKind::NotFound)
 }
 
-/// One socket attempt: connect → send one JSON line → close. Returns the
-/// underlying IO error on any step so the caller can decide whether to
-/// retry, fall back, or surface. Write timeout is short on purpose — the
-/// daemon's hot path is tiny.
+/// One socket attempt: connect → send one JSON line → half-close → read
+/// the daemon's [`DAEMON_ACK`]. Returns the underlying IO error on any
+/// step so the caller can decide whether to retry, fall back, or
+/// surface. Write timeout is short on purpose — the daemon's hot path
+/// is tiny.
+///
+/// The ack read is what makes this a delivery guarantee rather than a
+/// hope: a kernel-buffered `write_all` succeeds even against a daemon
+/// that's already exiting, so before the ack existed a SIGTERM'd daemon
+/// could eat the event *and* convince us not to fall back. No ack (EOF,
+/// timeout, wrong bytes) → error → the caller's file fallback fires.
+/// Worst case is a duplicated event (daemon appended, then died before
+/// acking) — strictly better than a lost one.
 fn try_emit_via_socket(sock: &std::path::Path, body: &str) -> std::io::Result<()> {
     let mut stream = UnixStream::connect(sock)?;
     let _ = stream.set_write_timeout(Some(SOCKET_EMIT_WRITE_TIMEOUT));
@@ -650,9 +675,18 @@ fn try_emit_via_socket(sock: &std::path::Path, body: &str) -> std::io::Result<()
     payload.push(b'\n');
     stream.write_all(&payload)?;
     // Half-close on our side so the daemon sees EOF on the read loop —
-    // it's done with this connection after one line. The stream drops at
-    // end of scope and finishes the close.
+    // it's done with this connection after one line. The read side stays
+    // open for the ack.
     let _ = stream.shutdown(std::net::Shutdown::Write);
+    let _ = stream.set_read_timeout(Some(SOCKET_EMIT_ACK_TIMEOUT));
+    let mut ack = [0u8; DAEMON_ACK.len()];
+    stream.read_exact(&mut ack)?;
+    if ack != *DAEMON_ACK {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "unexpected daemon ack",
+        ));
+    }
     Ok(())
 }
 
@@ -907,20 +941,21 @@ mod tests {
         std::env::set_var("SHELBI_HUB_SOCK", &sock);
 
         // The minimal daemon: accept one connection, read one JSON line,
-        // append `<rfc3339> <line>` to events.log, exit. Mirrors
-        // `shelbi-cli::commands::daemon::handle_event` without pulling
-        // the whole binary into this crate.
+        // append `<rfc3339> <line>` to events.log, ack, exit. Mirrors
+        // `shelbi-cli::commands::daemon::handle_client`/`handle_event`
+        // without pulling the whole binary into this crate.
         let _ = std::fs::remove_file(&sock);
         let listener = UnixListener::bind(&sock).unwrap();
         let log_path = events_log_path().unwrap();
         let daemon = std::thread::spawn(move || {
-            let (stream, _) = listener.accept().unwrap();
-            let mut reader = std::io::BufReader::new(stream);
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut reader = std::io::BufReader::new(stream.try_clone().unwrap());
             let mut line = String::new();
             reader.read_line(&mut line).unwrap();
             let msg: serde_json::Value = serde_json::from_str(line.trim()).unwrap();
             let body = msg["line"].as_str().unwrap().to_string();
             append_external_event(&body).unwrap();
+            stream.write_all(DAEMON_ACK).unwrap();
         });
 
         emit_event_body("workspace=alpha pane_alive=false reason=signal:SIGTERM").unwrap();
@@ -934,6 +969,53 @@ mod tests {
         );
         // Exactly one line — the fallback must NOT have fired alongside
         // the daemon append (that would duplicate the event).
+        assert_eq!(log.lines().count(), 1, "log: {log}");
+
+        let _ = std::fs::remove_file(&sock);
+        std::env::remove_var("SHELBI_HUB_SOCK");
+        std::env::remove_var("SHELBI_HOME");
+    }
+
+    /// A daemon that accepts and reads the frame but dies before acking
+    /// must NOT count as delivery — that's the restart window where
+    /// `write_all` succeeds against a kernel buffer nobody will ever
+    /// dispatch. The client has to notice the missing ack and fire the
+    /// file fallback so the event still lands (exactly once).
+    #[test]
+    fn emit_event_body_falls_back_when_daemon_never_acks() {
+        use std::io::BufRead;
+        use std::os::unix::net::UnixListener;
+        let _g = TEST_LOCK.lock().unwrap();
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+        let sock = short_test_socket("dn-noack");
+        std::env::set_var("SHELBI_HUB_SOCK", &sock);
+
+        // Malicious-restart stand-in: read the client's line, then close
+        // without acking (and without appending). Serve both the first
+        // attempt and the 500ms retry so each fails fast on EOF.
+        let listener = UnixListener::bind(&sock).unwrap();
+        let daemon = std::thread::spawn(move || {
+            for _ in 0..2 {
+                let Ok((stream, _)) = listener.accept() else {
+                    return;
+                };
+                let mut reader = std::io::BufReader::new(stream);
+                let mut line = String::new();
+                let _ = reader.read_line(&mut line);
+                // Drop: connection closes with no ack written.
+            }
+        });
+
+        emit_event_body("workspace=echo pane_alive=false reason=exit:1").unwrap();
+        daemon.join().unwrap();
+
+        let log = std::fs::read_to_string(events_log_path().unwrap()).unwrap();
+        let line = log.lines().next().expect("fallback should have appended");
+        assert!(
+            line.ends_with(" workspace=echo pane_alive=false reason=exit:1"),
+            "line: {line}"
+        );
         assert_eq!(log.lines().count(), 1, "log: {log}");
 
         let _ = std::fs::remove_file(&sock);
