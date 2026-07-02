@@ -8,8 +8,9 @@
 //! in-repo, or half-migrated on-disk states) and returns a
 //! [`MigrationPlan`] listing the concrete actions needed to reach a fully
 //! in-repo layout. [`apply_migration_plan`] then executes those actions
-//! atomically-ish (write-then-swap for YAMLs, copy-then-remove for
-//! directories so a cross-device migration still succeeds).
+//! atomically-ish (write-then-swap for YAMLs; for directories that must
+//! cross a filesystem boundary, copy to a temp sibling then rename into
+//! place so the destination is never observable half-copied).
 //!
 //! The command is intentionally idempotent:
 //!
@@ -18,6 +19,10 @@
 //!   missing, or `workflows/` moved but `agents/` not) → plan lists only
 //!   the outstanding steps; apply completes them without touching
 //!   already-migrated pieces.
+//! * A YAML half left unparseable by an interrupted run (or by hand) is
+//!   re-queued for writing rather than treated as done, so the trailing
+//!   [`MigrationAction::DeleteGlobalYaml`] can never remove the last
+//!   loadable copy of the config.
 //!
 //! Reversal is deliberately not offered here. See the command's `--help`
 //! for the git-revert-based rollback recipe.
@@ -72,8 +77,9 @@ pub enum MigrationAction {
     WriteLocalYaml { path: PathBuf, body: String },
     /// Move a config directory (`workflows/` or `agents/`) from
     /// `~/.shelbi/projects/<name>/…` to `<repo>/.shelbi/…`. The mover
-    /// prefers `fs::rename`; on failure (cross-filesystem, EXDEV) it
-    /// copies then removes.
+    /// prefers `fs::rename`; on EXDEV (cross-filesystem) it copies to a
+    /// temp sibling of the destination, renames it into place, then
+    /// removes the source. Any other rename error is surfaced as-is.
     MoveConfigDir { src: PathBuf, dst: PathBuf },
     /// Move a top-level config file (currently just the workspace
     /// settings template) from the state dir to the in-repo dir.
@@ -119,6 +125,13 @@ pub struct MigrationPlan {
     /// Ordered list of mutations. Empty when the project is already
     /// fully migrated.
     pub actions: Vec<MigrationAction>,
+    /// Human-readable conditions the planner noticed but won't act on
+    /// — today, a config dir/file that exists at BOTH its source and
+    /// destination (e.g. a move interrupted between the rename and the
+    /// source cleanup, or a hand-created destination). The migration
+    /// leaves both in place; the caller should surface these so the
+    /// state is reported rather than silently accepted.
+    pub warnings: Vec<String>,
     /// `true` iff the project was already in in-repo mode when the
     /// plan was computed AND every expected in-repo file/dir was
     /// present. Empty `actions` with `already_in_repo == false` means a
@@ -177,14 +190,25 @@ pub fn plan_in_repo_migration(project_name: &str) -> Result<MigrationPlan> {
     let local_body = project.to_local_yaml_string()?;
 
     let mut actions: Vec<MigrationAction> = Vec::new();
+    let mut warnings: Vec<String> = Vec::new();
 
-    if !shared_yaml_path.is_file() {
+    // An existing YAML half only counts as "done" if it actually loads.
+    // A truncated/corrupt file left by an interrupted run must be
+    // rewritten — otherwise the DeleteGlobalYaml step below would remove
+    // the last parseable copy of the config. Each half is validated by
+    // merging it with the freshly-synthesized other half, mirroring what
+    // the split loader will do on the next open.
+    if !existing_half_is_loadable(&shared_yaml_path, |text| {
+        Project::from_split_yaml_str(text, &local_body)
+    }) {
         actions.push(MigrationAction::WriteSharedYaml {
             path: shared_yaml_path.clone(),
-            body: shared_body,
+            body: shared_body.clone(),
         });
     }
-    if !local_yaml_path.is_file() {
+    if !existing_half_is_loadable(&local_yaml_path, |text| {
+        Project::from_split_yaml_str(&shared_body, text)
+    }) {
         actions.push(MigrationAction::WriteLocalYaml {
             path: local_yaml_path.clone(),
             body: local_body,
@@ -195,6 +219,8 @@ pub fn plan_in_repo_migration(project_name: &str) -> Result<MigrationPlan> {
         let dst = in_repo_config_root.join(dir);
         if src.is_dir() && !dst.exists() {
             actions.push(MigrationAction::MoveConfigDir { src, dst });
+        } else if src.is_dir() && dst.exists() {
+            warnings.push(both_exist_warning(&src, &dst));
         }
     }
     for file in IN_REPO_CONFIG_FILES {
@@ -202,6 +228,8 @@ pub fn plan_in_repo_migration(project_name: &str) -> Result<MigrationPlan> {
         let dst = in_repo_config_root.join(file);
         if src.is_file() && !dst.exists() {
             actions.push(MigrationAction::MoveConfigFile { src, dst });
+        } else if src.is_file() && dst.exists() {
+            warnings.push(both_exist_warning(&src, &dst));
         }
     }
     if global_yaml_path.is_file() {
@@ -226,8 +254,34 @@ pub fn plan_in_repo_migration(project_name: &str) -> Result<MigrationPlan> {
         gitignore_path,
         gitignore_snippet: IN_REPO_GITIGNORE_SNIPPET,
         actions,
+        warnings,
         already_in_repo,
     })
+}
+
+/// `true` iff `path` exists and its content passes `validate` — i.e.
+/// the half can actually be loaded, not merely stat'd. A missing file,
+/// an unreadable file, or a file that fails to merge into a `Project`
+/// all report `false` so the planner re-queues the write.
+fn existing_half_is_loadable(
+    path: &Path,
+    validate: impl FnOnce(&str) -> Result<Project>,
+) -> bool {
+    match fs::read_to_string(path) {
+        Ok(text) => validate(&text).is_ok(),
+        Err(_) => false,
+    }
+}
+
+fn both_exist_warning(src: &Path, dst: &Path) -> String {
+    format!(
+        "both {} and {} exist — leaving both in place (an interrupted \
+         move, or a hand-created destination); reconcile their contents \
+         and remove {} to silence this",
+        src.display(),
+        dst.display(),
+        src.display(),
+    )
 }
 
 /// Execute each action in `plan.actions` in order. Returns the number
@@ -259,28 +313,65 @@ fn apply_action(action: &MigrationAction) -> Result<()> {
 }
 
 fn write_yaml_file(path: &Path, body: &str) -> Result<()> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).map_err(Error::Io)?;
-    }
-    fs::write(path, body).map_err(Error::Io)
+    crate::atomic_write(path, body.as_bytes())
 }
 
-/// Move a directory from `src` to `dst`. Tries `fs::rename` first, then
-/// falls back to a recursive copy + `remove_dir_all` when rename fails
-/// (typically EXDEV — the repo and shelbi state live on different
-/// filesystems, common on Linux with `/home` and `/repos` mounts).
+/// Suffix for the temp sibling the cross-device fallback stages into
+/// before renaming to the real destination. Deterministic (no PID) so a
+/// stale temp left by an interrupted run is found and removed on re-run.
+const MOVE_TMP_SUFFIX: &str = "shelbi-migrate-tmp";
+
+/// `true` iff `err` is EXDEV — rename refused because source and
+/// destination live on different filesystems. Only this error may
+/// trigger the copy fallback in [`move_dir`]/[`move_file`]; anything
+/// else (permissions, missing source) must surface to the caller.
+fn is_cross_device(err: &io::Error) -> bool {
+    #[cfg(unix)]
+    {
+        err.raw_os_error() == Some(libc::EXDEV)
+    }
+    #[cfg(windows)]
+    {
+        // ERROR_NOT_SAME_DEVICE
+        err.raw_os_error() == Some(17)
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = err;
+        false
+    }
+}
+
+/// Move a directory from `src` to `dst`. Tries `fs::rename` first; on
+/// EXDEV (the repo and shelbi state live on different filesystems,
+/// common on Linux with `/home` and `/repos` mounts) it copies `src`
+/// into a temp sibling of `dst` and renames that into place, so `dst`
+/// either doesn't exist or is complete — a crash mid-copy leaves only
+/// the temp, which the next run discards and redoes.
 fn move_dir(src: &Path, dst: &Path) -> Result<()> {
     if let Some(parent) = dst.parent() {
         fs::create_dir_all(parent).map_err(Error::Io)?;
     }
     match fs::rename(src, dst) {
         Ok(()) => Ok(()),
-        Err(_) => {
-            copy_dir_recursive(src, dst)?;
-            fs::remove_dir_all(src).map_err(Error::Io)?;
-            Ok(())
-        }
+        Err(e) if is_cross_device(&e) => move_dir_via_copy(src, dst),
+        Err(e) => Err(Error::Io(e)),
     }
+}
+
+/// The cross-device fallback for [`move_dir`]: copy `src` into a temp
+/// sibling of `dst`, rename it into place, then remove `src`. A temp
+/// left over from a previously interrupted copy is discarded first —
+/// its contents can't be trusted to be complete.
+fn move_dir_via_copy(src: &Path, dst: &Path) -> Result<()> {
+    let tmp = dst.with_extension(MOVE_TMP_SUFFIX);
+    if tmp.exists() {
+        fs::remove_dir_all(&tmp).map_err(Error::Io)?;
+    }
+    copy_dir_recursive(src, &tmp)?;
+    fs::rename(&tmp, dst).map_err(Error::Io)?;
+    fs::remove_dir_all(src).map_err(Error::Io)?;
+    Ok(())
 }
 
 fn move_file(src: &Path, dst: &Path) -> Result<()> {
@@ -289,11 +380,14 @@ fn move_file(src: &Path, dst: &Path) -> Result<()> {
     }
     match fs::rename(src, dst) {
         Ok(()) => Ok(()),
-        Err(_) => {
-            fs::copy(src, dst).map_err(Error::Io)?;
+        Err(e) if is_cross_device(&e) => {
+            let tmp = dst.with_extension(MOVE_TMP_SUFFIX);
+            fs::copy(src, &tmp).map_err(Error::Io)?;
+            fs::rename(&tmp, dst).map_err(Error::Io)?;
             fs::remove_file(src).map_err(Error::Io)?;
             Ok(())
         }
+        Err(e) => Err(Error::Io(e)),
     }
 }
 
@@ -609,7 +703,7 @@ mod tests {
             "name: myapp\nconfig_mode: in-repo\ndefault_branch: main\n\
              orchestrator: {runner: claude}\nagent_runners: {claude: {command: claude, flags: []}}\n\
              workspace_poll_interval_secs: 5\nworkspace_permissions_mode: auto\n\
-             zen: {}\nheartbeat: {}\ngit: {}\n",
+             heartbeat: 3m\n",
         )
         .unwrap();
 
@@ -663,11 +757,170 @@ mod tests {
         std::env::remove_var("SHELBI_HOME");
     }
 
+    fn action_kinds(plan: &MigrationPlan) -> Vec<&'static str> {
+        plan.actions
+            .iter()
+            .map(|a| match a {
+                MigrationAction::WriteSharedYaml { .. } => "shared",
+                MigrationAction::WriteLocalYaml { .. } => "local",
+                MigrationAction::MoveConfigDir { .. } => "dir",
+                MigrationAction::MoveConfigFile { .. } => "file",
+                MigrationAction::DeleteGlobalYaml { .. } => "delete",
+            })
+            .collect()
+    }
+
+    /// F2 recovery: a truncated shared `project.yaml` — what a crash
+    /// mid-write of a non-atomic writer leaves behind — must be
+    /// detected and re-queued for writing, ordered before the
+    /// global-YAML delete. Trusting it as complete would let the
+    /// delete remove the last loadable copy of the config.
+    #[test]
+    fn rewrites_corrupt_shared_yaml_before_deleting_global() {
+        let _g = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let (home, repo) = fresh_home_and_repo("corrupt-shared");
+        std::env::set_var("SHELBI_HOME", &home);
+
+        save_project(&fixture_project("myapp", &repo)).unwrap();
+        fs::create_dir_all(repo.join(".shelbi")).unwrap();
+        fs::write(
+            repo.join(".shelbi/project.yaml"),
+            "name: myapp\nconfig_mode: in-repo\norchestrator: {runner: cla",
+        )
+        .unwrap();
+
+        let plan = plan_in_repo_migration("myapp").unwrap();
+        let kinds = action_kinds(&plan);
+        let shared_pos = kinds
+            .iter()
+            .position(|k| *k == "shared")
+            .expect("corrupt shared yaml must be re-queued for writing");
+        let delete_pos = kinds
+            .iter()
+            .position(|k| *k == "delete")
+            .expect("global delete expected while the global yaml exists");
+        assert!(
+            shared_pos < delete_pos,
+            "shared rewrite must precede the global delete: {kinds:?}"
+        );
+
+        apply_migration_plan(&plan).unwrap();
+        let shared = fs::read_to_string(repo.join(".shelbi/project.yaml")).unwrap();
+        let local = fs::read_to_string(home.join("projects/myapp/local.yaml")).unwrap();
+        Project::from_split_yaml_str(&shared, &local).expect("healed shared yaml must load");
+        assert!(!home.join("projects/myapp.yaml").exists());
+        std::env::remove_var("SHELBI_HOME");
+    }
+
+    /// Same recovery for the user-local half: an unparseable
+    /// `local.yaml` is rewritten, not accepted because the file exists.
+    #[test]
+    fn rewrites_corrupt_local_yaml() {
+        let _g = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let (home, repo) = fresh_home_and_repo("corrupt-local");
+        std::env::set_var("SHELBI_HOME", &home);
+
+        save_project(&fixture_project("myapp", &repo)).unwrap();
+        let state = home.join("projects/myapp");
+        fs::create_dir_all(&state).unwrap();
+        fs::write(state.join("local.yaml"), "repo: [").unwrap();
+
+        let plan = plan_in_repo_migration("myapp").unwrap();
+        assert!(
+            action_kinds(&plan).contains(&"local"),
+            "corrupt local yaml must be re-queued: {:?}",
+            action_kinds(&plan)
+        );
+
+        apply_migration_plan(&plan).unwrap();
+        let shared = fs::read_to_string(repo.join(".shelbi/project.yaml")).unwrap();
+        let local = fs::read_to_string(state.join("local.yaml")).unwrap();
+        Project::from_split_yaml_str(&shared, &local).expect("healed local yaml must load");
+        std::env::remove_var("SHELBI_HOME");
+    }
+
+    /// A valid shared yaml is still trusted — the parse-validation must
+    /// not turn the idempotent skip into a rewrite (which would clobber
+    /// user edits made after a partial run).
+    #[test]
+    fn keeps_valid_existing_shared_yaml() {
+        let _g = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let (home, repo) = fresh_home_and_repo("valid-shared");
+        std::env::set_var("SHELBI_HOME", &home);
+
+        save_project(&fixture_project("myapp", &repo)).unwrap();
+        // Migrate fully, then re-plan: the (valid) shared yaml written
+        // by the first run must not be queued again.
+        apply_migration_plan(&plan_in_repo_migration("myapp").unwrap()).unwrap();
+        let plan = plan_in_repo_migration("myapp").unwrap();
+        assert!(plan.actions.is_empty(), "got: {:?}", action_kinds(&plan));
+        std::env::remove_var("SHELBI_HOME");
+    }
+
+    /// F4 recovery: a temp sibling left by a copy that was interrupted
+    /// mid-way is discarded and the copy redone from the source — the
+    /// partial contents never reach the destination, and the
+    /// destination appears only via the final rename.
+    #[test]
+    fn interrupted_copy_fallback_is_redone_from_scratch() {
+        let base = std::env::temp_dir().join(format!(
+            "shelbi-migrate-stale-tmp-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos(),
+        ));
+        let src = base.join("state/agents");
+        fs::create_dir_all(src.join("developer")).unwrap();
+        fs::write(src.join("developer/instructions.md"), "full contents\n").unwrap();
+        let dst = base.join("repo/.shelbi/agents");
+        fs::create_dir_all(dst.parent().unwrap()).unwrap();
+        // Simulate the crash: a half-copied temp, no destination.
+        let stale = dst.with_extension(MOVE_TMP_SUFFIX);
+        fs::create_dir_all(&stale).unwrap();
+        fs::write(stale.join("partial.md"), "half\n").unwrap();
+
+        move_dir_via_copy(&src, &dst).unwrap();
+
+        assert!(dst.join("developer/instructions.md").is_file());
+        assert!(
+            !dst.join("partial.md").exists(),
+            "stale partial copy leaked into the destination"
+        );
+        assert!(!dst.with_extension(MOVE_TMP_SUFFIX).exists());
+        assert!(!src.exists());
+    }
+
+    /// Rename failures other than EXDEV surface as errors — the copy
+    /// fallback must not swallow them, and no destination may be
+    /// fabricated along the way (the old fallback's `create_dir_all`
+    /// created an empty `dst` even when the copy then failed).
+    #[test]
+    fn move_dir_surfaces_non_exdev_rename_errors() {
+        let base = std::env::temp_dir().join(format!(
+            "shelbi-migrate-badmove-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos(),
+        ));
+        let src = base.join("does-not-exist");
+        let dst = base.join("repo/.shelbi/agents");
+        move_dir(&src, &dst).expect_err("missing source must be an error");
+        assert!(
+            !dst.exists(),
+            "failed move must not fabricate a destination"
+        );
+    }
+
     /// Config dirs that *already* exist at the destination (e.g. the
     /// user hand-created `<repo>/.shelbi/workflows/` before running
-    /// migrate) are left alone — we don't merge, we don't overwrite,
-    /// we just skip. The source is also left in place; the user can
-    /// reconcile.
+    /// migrate, or a move interrupted between rename and source
+    /// cleanup) are left alone — we don't merge, we don't overwrite,
+    /// we just skip — but the state is reported via plan warnings so
+    /// it's never silently accepted as done.
     #[test]
     fn skips_dirs_already_present_at_destination() {
         let _g = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
@@ -691,6 +944,13 @@ mod tests {
                 );
             }
         }
+        assert!(
+            plan.warnings
+                .iter()
+                .any(|w| w.contains("workflows") && w.contains("exist")),
+            "both-exist state must be reported, got: {:?}",
+            plan.warnings
+        );
         apply_migration_plan(&plan).unwrap();
         // Source workflows still exists (we didn't touch it), and the
         // destination `from_repo.yaml` was untouched.
