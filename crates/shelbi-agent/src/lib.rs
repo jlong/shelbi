@@ -30,7 +30,7 @@ pub fn launch_command(spec: &AgentRunnerSpec) -> String {
 /// runner declared as `/usr/local/bin/claude` classifies the same as a bare
 /// `claude`. The one runtime shelbi knows to have a hook surface is claude;
 /// every other runner is treated as a non-claude (polling) runner.
-fn is_claude_runner(command: &str) -> bool {
+pub fn is_claude_runner(command: &str) -> bool {
     std::path::Path::new(command)
         .file_name()
         .and_then(|s| s.to_str())
@@ -54,7 +54,11 @@ pub fn with_permission_mode(spec: &AgentRunnerSpec, mode: &str) -> AgentRunnerSp
     if !is_claude_runner(&spec.command) || mode == "default" {
         return spec.clone();
     }
-    if spec.flags.iter().any(|f| f == "--permission-mode") {
+    if spec
+        .flags
+        .iter()
+        .any(|f| f == "--permission-mode" || f.starts_with("--permission-mode="))
+    {
         return spec.clone();
     }
     let mut out = spec.clone();
@@ -164,6 +168,20 @@ mod tests {
         let out = with_permission_mode(&spec, "auto");
         assert_eq!(out.flags, vec!["--permission-mode", "auto"]);
         assert_eq!(launch_command(&out), "claude --permission-mode auto");
+    }
+
+    #[test]
+    fn with_permission_mode_idempotent_for_equals_form() {
+        // YAML may pin the single-token spelling (`--permission-mode=plan`).
+        // The helper must recognize it too; otherwise it appends the
+        // two-token form, the rightmost copy wins, and the workspace runs
+        // in a mode the user explicitly configured away from.
+        let spec = AgentRunnerSpec {
+            command: "claude".into(),
+            flags: vec!["--permission-mode=plan".into()],
+        };
+        let out = with_permission_mode(&spec, "auto");
+        assert_eq!(out.flags, vec!["--permission-mode=plan"]);
     }
 
     #[test]

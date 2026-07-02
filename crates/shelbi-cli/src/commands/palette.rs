@@ -767,10 +767,11 @@ fn filter_projects(projects: &[ProjectSummary], query: &str) -> Vec<ProjectSumma
         return projects.to_vec();
     }
     let mut matcher = nucleo_matcher::Matcher::new(nucleo_matcher::Config::DEFAULT);
+    let pattern = shelbi_palette::parse_pattern(query);
     let mut hits: Vec<(ProjectSummary, u16)> = projects
         .iter()
         .filter_map(|p| {
-            shelbi_palette::score(&mut matcher, query, &p.name).and_then(|s| {
+            shelbi_palette::score_pattern(&mut matcher, &pattern, &p.name).and_then(|s| {
                 if s == 0 {
                     None
                 } else {
