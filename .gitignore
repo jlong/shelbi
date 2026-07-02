@@ -15,3 +15,6 @@ target
 
 # Claude harness state
 .claude/
+
+# Shelbi worktrees
+.shelbi/wt
