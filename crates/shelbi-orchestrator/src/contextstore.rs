@@ -82,14 +82,19 @@ impl SyncStatus {
 /// Decide which configured spaces a task's body claims to have touched.
 ///
 /// Heuristic:
-/// - The literal token `cstore` anywhere in the body → ALL configured
-///   spaces are candidates (the agent invoked the CLI; we don't know
-///   which space, so sync them all to be safe).
+/// - A `cstore` *invocation* (`cstore <args>`) anywhere in the body → ALL
+///   configured spaces are candidates (the agent ran the CLI; we don't
+///   know which space, so sync them all to be safe).
 /// - `<SpaceName>/` substring (e.g. `Shelbi/`) → that specific space.
 ///
 /// We're deliberately generous: the cost of a false positive (one
 /// extra rsync that finds no changes) is much smaller than the cost
-/// of a false negative (workspace write stranded on the remote).
+/// of a false negative (workspace write stranded on the remote). But a
+/// bare `body.contains("cstore")` was TOO generous — it fired on any task
+/// that merely names the substring in prose (this very review task, or a
+/// `"cstore"` string literal in a diff), triggering a full-space rsync for
+/// work that never touched ContextStore. So we require an actual
+/// invocation: `cstore` on a word boundary, followed by whitespace + args.
 pub fn body_matches<'a>(
     body: &str,
     specs: &'a [ContextStoreSyncSpec],
@@ -97,11 +102,40 @@ pub fn body_matches<'a>(
     if specs.is_empty() {
         return Vec::new();
     }
-    let mentions_cstore = body.contains("cstore");
+    let invokes_cstore = mentions_cstore_invocation(body);
     specs
         .iter()
-        .filter(|s| mentions_cstore || body.contains(&format!("{}/", s.space)))
+        .filter(|s| invokes_cstore || body.contains(&format!("{}/", s.space)))
         .collect()
+}
+
+/// True when `body` contains a `cstore` command invocation — the token
+/// `cstore` at a word boundary (preceded by start-of-input or a non-word
+/// char) and followed by whitespace and at least one argument character.
+///
+/// This distinguishes `cstore new --space …` (a real invocation) from
+/// prose or code that merely names the tool: `"cstore"` in a string
+/// literal, `cstore.rs`, `contextstore`, or `the cstore CLI helps` — none
+/// of which imply the agent actually wrote to a space.
+fn mentions_cstore_invocation(body: &str) -> bool {
+    const TOK: &str = "cstore";
+    let bytes = body.as_bytes();
+    let mut search_from = 0;
+    while let Some(rel) = body[search_from..].find(TOK) {
+        let start = search_from + rel;
+        let end = start + TOK.len();
+        // Word boundary before: start-of-input or a non-word char.
+        let boundary_before = start == 0
+            || !matches!(bytes[start - 1], b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'_');
+        // Followed by whitespace, then a non-whitespace argument char.
+        let followed_by_args = matches!(bytes.get(end), Some(b) if b.is_ascii_whitespace())
+            && body[end..].trim_start().chars().next().is_some();
+        if boundary_before && followed_by_args {
+            return true;
+        }
+        search_from = start + 1;
+    }
+    false
 }
 
 /// Pull every matched ContextStore space from `machine` back to hub.
@@ -147,7 +181,13 @@ fn sync_one(host: &Host, spec: &ContextStoreSyncSpec) -> SyncStatus {
     // sides — we want the contents to overlay). Without it rsync
     // creates `<dst>/<basename(src)>` and the layout drifts.
     let src = format!("{ssh_host}:{path_str}/");
-    let dst = format!("{path_str}/");
+    // The remote side of `src` is expanded by the remote login shell that
+    // rsync spawns, so a leading `~` resolves there. The local `dst`,
+    // however, is handed to rsync via `Command` with NO shell — a literal
+    // `~` would create a stray `./~/Documents/...` dir (or fail). Expand it
+    // ourselves so the default `~/Documents/ContextStore/<slug>` config
+    // lands in the real `$HOME`, matching what `ensure_local_dir` creates.
+    let dst = format!("{}/", expand_tilde(&path_str).to_string_lossy());
 
     // Make sure the destination directory exists. The mac default
     // `rsync` is openrsync, which doesn't support `--mkpath`, so we
@@ -272,13 +312,24 @@ mod tests {
     }
 
     #[test]
-    fn cstore_mention_matches_every_configured_space() {
-        // The agent invoked the CLI — we don't know which space, so be
+    fn cstore_invocation_matches_every_configured_space() {
+        // The agent ran the CLI — we don't know which space, so be
         // generous. Both Shelbi and Memories get a sync attempt.
         let s = specs();
-        let m = body_matches("# Task\n\nFinish writing to ContextStore via cstore.\n", &s);
+        let m = body_matches("# Task\n\nRun `cstore new --space Shelbi Research/foo.md`.\n", &s);
         let names: Vec<&str> = m.iter().map(|s| s.space.as_str()).collect();
         assert_eq!(names, vec!["Shelbi", "Memories"]);
+    }
+
+    #[test]
+    fn cstore_named_in_prose_without_invocation_matches_nothing() {
+        // A task that merely names `cstore` (or quotes it, like this very
+        // review task) must NOT trigger a full-space rsync — only a real
+        // invocation (`cstore <args>`) does.
+        let s = specs();
+        assert!(body_matches("Fix `body.contains(\"cstore\")` to be tighter.", &s).is_empty());
+        assert!(body_matches("The cstore.rs module is over-broad.", &s).is_empty());
+        assert!(body_matches("Finish writing to ContextStore via cstore.", &s).is_empty());
     }
 
     #[test]

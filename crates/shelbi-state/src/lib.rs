@@ -499,6 +499,13 @@ pub fn load_project(project: &str) -> Result<Project> {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => load_project_split(project)?,
         Err(e) => return Err(shelbi_core::Error::Io(e)),
     };
+    // Defense-in-depth: the project name is interpolated into shell command
+    // strings (tmux pane loops, `--project` args) all over the orchestrator.
+    // Creation already enforces a kebab/snake slug via `validate_agent_id`,
+    // but a hand-edited YAML could smuggle in quotes/metacharacters. Reject
+    // them here so a name like `x'; rm -rf ~; echo '` can never reach a
+    // shell, independent of any single call site's escaping.
+    shelbi_core::validate_agent_id(&p.name)?;
     p.validate_workspaces()?;
     let repo = p.repo.clone();
     p.detect_shapes(repo);
