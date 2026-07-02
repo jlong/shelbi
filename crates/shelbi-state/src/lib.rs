@@ -77,7 +77,7 @@ pub use workspace_status::{
     expected_teardown_marker_path, hub_socket_path, load_workspace_status, mark_expected_teardown,
     parse_pane_title_marker, parse_pane_title_state, save_workspace_status,
     workspace_status_path, workspaces_dir, PaneMarker, WorkspaceState, WorkspaceStatus,
-    EXPECTED_TEARDOWN_MAX_AGE,
+    DAEMON_ACK, EXPECTED_TEARDOWN_MAX_AGE,
 };
 pub use workflows::{
     list_workflows, load_project_statuses, load_workflow, save_project_statuses, statuses_path,

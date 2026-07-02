@@ -24,9 +24,26 @@
 //! - `message-ack` (Phase 9) — emitted by the worker after it processes a
 //!   message; appends an `ack=worker` event and clears the pending entry.
 //!
-//! Unknown verbs and malformed payloads are logged to stderr and the
-//! daemon keeps running — a single bad client must not be able to take
-//! the listener down.
+//! Unknown verbs and malformed payloads are logged to stderr
+//! (debug-escaped, so client-controlled bytes can't smuggle ANSI
+//! sequences into the operator's terminal) and the daemon keeps running
+//! — a single bad client must not be able to take the listener down.
+//!
+//! ## Hardening
+//!
+//! - Frames are capped at [`MAX_FRAME_BYTES`]; an over-limit or
+//!   newline-free stream is rejected and its connection closed, so no
+//!   client can grow the read buffer without bound.
+//! - Each successfully dispatched line is answered with
+//!   [`shelbi_state::DAEMON_ACK`] (`ok\n`) on the same connection.
+//!   Clients that wait for it before reporting success get a real
+//!   delivery guarantee; no ack → their file fallback fires.
+//! - Startup takes an exclusive `flock` on `hub.sock.lock` for the
+//!   daemon's lifetime — only the holder ever unlinks/binds/removes the
+//!   socket, so two racing daemons can't clobber each other.
+//! - On the first SIGTERM/SIGINT/SIGHUP the accept loop drains the
+//!   already-accepted backlog and waits (bounded) for in-flight
+//!   handlers before exiting; a second signal force-exits.
 //!
 //! ## Unacked-message reaper (Phase 9)
 //!
@@ -67,13 +84,14 @@
 
 use std::collections::HashMap;
 use std::fs;
-use std::io::{BufRead, BufReader};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::fs::PermissionsExt;
+use std::os::unix::io::AsRawFd;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -111,6 +129,26 @@ const DEFAULT_ACK_TIMEOUT: Duration = Duration::from_secs(60);
 /// short enough that an `ack=timeout` lands within ~1s of crossing the
 /// threshold, long enough that an idle daemon spends near-zero CPU.
 const REAPER_TICK: Duration = Duration::from_secs(1);
+
+/// Hard cap on one newline-delimited frame from a client. A newline-free
+/// stream would otherwise grow the read buffer without bound (OOM), and
+/// a multi-megabyte `line` would blow past the ≤PIPE_BUF atomicity the
+/// events.log append path relies on. 64KB is orders of magnitude above
+/// any legitimate message; anything bigger is a bug or an abuse and the
+/// connection is closed on the spot.
+const MAX_FRAME_BYTES: u64 = 64 * 1024;
+
+/// Cap on the `line` body of an `event` message. The append path's
+/// tear-free guarantee only holds for writes ≤ PIPE_BUF (4096B); 4000
+/// leaves headroom for the RFC3339 timestamp prefix and the trailing
+/// newline the daemon prepends/appends.
+const MAX_EVENT_BODY_BYTES: usize = 4000;
+
+/// How long the shutdown path waits for in-flight client handlers to
+/// finish before exiting anyway. Handlers process one tiny line each —
+/// 3s is generous for a healthy box and short enough that a wedged
+/// client can't hold up a supervisor-initiated restart indefinitely.
+const SHUTDOWN_DRAIN_TIMEOUT: Duration = Duration::from_secs(3);
 
 /// In-memory map of pushed-but-unacked messages, keyed by `(task_id,
 /// msg_id)` with the push time recorded against [`Instant::now`] at
@@ -206,6 +244,12 @@ pub fn run(cmd: Option<DaemonCmd>) -> Result<()> {
 /// keeps serving the rest of the fleet.
 fn run_foreground() -> Result<()> {
     let sock = shelbi_state::hub_socket_path().map_err(|e| anyhow!(e))?;
+    ensure_socket_dir(&sock)?;
+    // Exclusive advisory lock held for the daemon's whole lifetime. Two
+    // daemons racing through startup can't both hold it, so only the
+    // winner ever probes/unlinks/binds/removes the socket — the loser
+    // errors out here without touching the winner's live socket.
+    let _bind_lock = acquire_bind_lock(&sock)?;
     prepare_socket(&sock)?;
     prune_stale_control_masters();
 
@@ -234,23 +278,7 @@ fn run_foreground() -> Result<()> {
     install_shutdown_listener(stop.clone(), sock.clone())?;
     spawn_reaper(daemon.clone(), stop.clone());
 
-    for incoming in listener.incoming() {
-        // Shutdown wakes us via a self-connect; the resulting accept
-        // returns Ok with a stream we never read. Check the flag first
-        // and bail before spawning a handler that will see EOF anyway.
-        if stop.load(Ordering::SeqCst) {
-            break;
-        }
-        match incoming {
-            Ok(stream) => {
-                let daemon = daemon.clone();
-                thread::spawn(move || handle_client(stream, &daemon));
-            }
-            Err(e) => {
-                eprintln!("shelbi daemon: accept error: {e}");
-            }
-        }
-    }
+    serve(&listener, &daemon, &stop);
 
     let _ = fs::remove_file(&sock);
     // Best-effort: drop the PID file so the next start's cleanup
@@ -261,6 +289,74 @@ fn run_foreground() -> Result<()> {
     }
     eprintln!("shelbi daemon: stopped");
     Ok(())
+}
+
+/// Decrements the live-connection counter when a handler thread exits —
+/// Drop-based so a panicking handler still releases its slot and the
+/// shutdown drain doesn't wait the full deadline for a thread that's
+/// already gone.
+struct LiveGuard(Arc<AtomicUsize>);
+impl Drop for LiveGuard {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+/// Accept loop + shutdown drain. Runs until the stop flag is set (the
+/// signal listener flips it and wakes the blocking `accept()` with a
+/// self-connect), then:
+///
+/// 1. keeps accepting in non-blocking mode until the listen backlog is
+///    empty — a client whose `connect()` succeeded before the flag
+///    flipped already considers its write in flight, so we must read it
+///    rather than exit with it queued, and
+/// 2. waits (up to [`SHUTDOWN_DRAIN_TIMEOUT`]) for every spawned handler
+///    to finish, so an accepted connection is never dropped mid-dispatch
+///    by process exit.
+///
+/// Combined with the ack byte `handle_client` writes per processed line,
+/// a daemon restart can't silently eat an event: either the handler
+/// finishes (event lands, client sees the ack) or the client never gets
+/// the ack and its file fallback fires.
+fn serve(listener: &UnixListener, daemon: &Daemon, stop: &Arc<AtomicBool>) {
+    let live = Arc::new(AtomicUsize::new(0));
+    for incoming in listener.incoming() {
+        match incoming {
+            Ok(stream) => {
+                let daemon = daemon.clone();
+                live.fetch_add(1, Ordering::SeqCst);
+                let guard = LiveGuard(live.clone());
+                thread::spawn(move || {
+                    let _guard = guard;
+                    handle_client(stream, &daemon);
+                });
+            }
+            // Non-blocking mode (entered below once stop is set) reports
+            // an empty backlog as WouldBlock — that's the drained-clean
+            // exit path.
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+            Err(e) => {
+                eprintln!("shelbi daemon: accept error: {e}");
+            }
+        }
+        if stop.load(Ordering::SeqCst) {
+            // Drain whatever the kernel already queued without blocking
+            // for new clients. If the mode switch fails we can't drain
+            // safely — bail and rely on the handler wait below.
+            if listener.set_nonblocking(true).is_err() {
+                break;
+            }
+        }
+    }
+
+    let deadline = Instant::now() + SHUTDOWN_DRAIN_TIMEOUT;
+    while live.load(Ordering::SeqCst) > 0 && Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(10));
+    }
+    let leftover = live.load(Ordering::SeqCst);
+    if leftover > 0 {
+        eprintln!("shelbi daemon: exiting with {leftover} client connection(s) still open");
+    }
 }
 
 /// Spawn the unacked-message reaper thread. Wakes every [`REAPER_TICK`],
@@ -292,14 +388,20 @@ fn spawn_reaper(daemon: Daemon, stop: Arc<AtomicBool>) {
 /// while collecting the expired keys — the event-append IO happens
 /// after the lock is released so a slow events.log write never blocks
 /// new pushes or acks on the listener side.
+/// Lock the pending map, recovering from poison. A poisoned mutex means
+/// some handler panicked while holding the lock — the map itself is
+/// still a structurally sound `HashMap`, and bailing instead would wedge
+/// every future push/ack into "timed out" forever. One policy for every
+/// lock site: recover and keep serving.
+fn lock_pending(pending: &Mutex<PendingMap>) -> MutexGuard<'_, PendingMap> {
+    pending.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
 fn reap_expired(daemon: &Daemon) {
     let timeout = daemon.ack_timeout;
     let now = Instant::now();
     let expired: Vec<(String, String)> = {
-        let mut map = match daemon.pending.lock() {
-            Ok(g) => g,
-            Err(poisoned) => poisoned.into_inner(),
-        };
+        let mut map = lock_pending(&daemon.pending);
         let keys: Vec<(String, String)> = map
             .iter()
             .filter_map(|(k, t)| {
@@ -351,12 +453,11 @@ fn prune_stale_control_masters() {
     }
 }
 
-/// Make sure the socket parent directory exists with `0700` perms and
-/// the socket file itself is free for `bind()`. A leftover socket from a
-/// previous run is reclaimed only if no one is currently listening on it;
-/// a live daemon at the same path is a hard error so two of us never
-/// race on the same file descriptor.
-fn prepare_socket(sock: &Path) -> Result<()> {
+/// Make sure the socket parent directory exists with `0700` perms.
+/// Split out of [`prepare_socket`] because the bind lock file lives in
+/// the same directory and must be acquirable *before* we touch the
+/// socket itself.
+fn ensure_socket_dir(sock: &Path) -> Result<()> {
     if let Some(parent) = sock.parent() {
         if !parent.as_os_str().is_empty() {
             fs::create_dir_all(parent)
@@ -365,7 +466,53 @@ fn prepare_socket(sock: &Path) -> Result<()> {
                 .with_context(|| format!("chmod 700 {}", parent.display()))?;
         }
     }
+    Ok(())
+}
 
+/// Take an exclusive advisory `flock` on `<sock>.lock` (e.g.
+/// `hub.sock.lock`) and return the open file. The caller holds the file
+/// — and therefore the lock — for the daemon's entire lifetime, which
+/// makes the probe → unlink → bind sequence in [`prepare_socket`] and
+/// the exit-path `remove_file` single-daemon by construction: the old
+/// connect-probe alone was a TOCTOU where two racing daemons could each
+/// see the other's socket as stale and unlink it.
+///
+/// The lock file itself is never removed — deleting it would let a
+/// third daemon lock a *fresh* inode while the second still holds the
+/// old one, recreating the race the lock exists to close. An orphaned
+/// `hub.sock.lock` is inert: `flock` locks die with the holder.
+fn acquire_bind_lock(sock: &Path) -> Result<fs::File> {
+    let mut lock_os = sock.as_os_str().to_os_string();
+    lock_os.push(".lock");
+    let lock_path = PathBuf::from(lock_os);
+    let file = fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(&lock_path)
+        .with_context(|| format!("opening daemon lock file {}", lock_path.display()))?;
+    // SAFETY: `flock` on a valid fd we own; no memory is dereferenced.
+    let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+    if rc != 0 {
+        let err = std::io::Error::last_os_error();
+        return Err(anyhow!(
+            "another shelbi daemon holds {} ({err}) — refusing to start \
+             (stop the other daemon, or check `shelbi daemon status`)",
+            lock_path.display()
+        ));
+    }
+    Ok(file)
+}
+
+/// Make sure the socket file itself is free for `bind()`. A leftover
+/// socket from a previous run is reclaimed only if no one is currently
+/// listening on it; a live daemon at the same path is a hard error.
+/// Callers must already hold the bind lock ([`acquire_bind_lock`]) so
+/// the probe-then-unlink below can't race another daemon's startup —
+/// the connect probe is kept as defense in depth against a daemon
+/// started by an older binary that predates the lock.
+fn prepare_socket(sock: &Path) -> Result<()> {
     if sock.exists() {
         // A live peer means another daemon owns this socket — refuse to
         // clobber it. A stale file (ECONNREFUSED / ENOENT on connect)
@@ -388,20 +535,31 @@ fn prepare_socket(sock: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Catch SIGTERM/SIGINT/SIGHUP on a background thread, flip the stop
-/// flag, and wake the blocking `accept()` with a single self-connection
-/// so the main loop notices and breaks out.
+/// Catch SIGTERM/SIGINT/SIGHUP on a background thread. The first signal
+/// flips the stop flag and wakes the blocking `accept()` with a single
+/// self-connection so the main loop notices and drains gracefully. Any
+/// further signal force-exits: if the wake-up self-connect failed to
+/// unblock the accept loop for whatever reason, the operator's second
+/// Ctrl-C / SIGTERM must still work without resorting to SIGKILL (which
+/// would skip socket/PID cleanup entirely).
 fn install_shutdown_listener(stop: Arc<AtomicBool>, sock: PathBuf) -> Result<()> {
     let mut signals = Signals::new([SIGTERM, SIGINT, SIGHUP])
         .context("installing daemon signal handlers")?;
     thread::spawn(move || {
-        if let Some(sig) = signals.forever().next() {
-            eprintln!("shelbi daemon: received signal {sig}, shutting down");
-            stop.store(true, Ordering::SeqCst);
-            // Wake the accept loop. The connection itself is unused —
-            // it's just a syscall poke so accept() returns instead of
-            // blocking on the next client.
-            let _ = UnixStream::connect(&sock);
+        let mut seen_first = false;
+        for sig in signals.forever() {
+            if !seen_first {
+                seen_first = true;
+                eprintln!("shelbi daemon: received signal {sig}, shutting down");
+                stop.store(true, Ordering::SeqCst);
+                // Wake the accept loop. The connection itself is unused —
+                // it's just a syscall poke so accept() returns instead of
+                // blocking on the next client.
+                let _ = UnixStream::connect(&sock);
+            } else {
+                eprintln!("shelbi daemon: received signal {sig} during shutdown, forcing exit");
+                std::process::exit(1);
+            }
         }
     });
     Ok(())
@@ -410,23 +568,77 @@ fn install_shutdown_listener(stop: Arc<AtomicBool>, sock: PathBuf) -> Result<()>
 /// One client → one BufReader → newline-delimited JSON. Each line is
 /// dispatched independently so a bad line in the middle of a batch
 /// doesn't kill the rest. EOF closes the handler cleanly.
+///
+/// Two hardening properties on top of the dispatch loop:
+///
+/// - **Frame cap.** Each line is read through a [`MAX_FRAME_BYTES`]
+///   `take`, so a newline-free (or absurdly long) stream can't grow the
+///   buffer without bound. An over-limit frame closes the connection —
+///   no ack, so a well-behaved client falls back to its degraded path.
+/// - **Ack per processed line.** After a successful dispatch the daemon
+///   writes [`shelbi_state::DAEMON_ACK`] back on the stream. Clients
+///   that read it before reporting success get a real delivery
+///   guarantee: a daemon killed mid-dispatch never acks, so the
+///   client-side file fallback fires instead of the event vanishing.
+///   Write errors are ignored — fire-and-forget clients (`nc` scripts
+///   that exit early) may close their read side first, and Rust ignores
+///   SIGPIPE so the failed write is just an `Err` we drop.
+///
+/// Rejected lines are logged debug-escaped (`{:?}`) so ANSI/control
+/// bytes from a hostile or confused client can't reach the operator's
+/// terminal through `tail -f` on the daemon log.
 fn handle_client(stream: UnixStream, daemon: &Daemon) {
-    let reader = BufReader::new(stream);
-    for line in reader.lines() {
-        let line = match line {
-            Ok(l) => l,
+    let mut reader = BufReader::new(&stream);
+    let mut buf: Vec<u8> = Vec::with_capacity(256);
+    loop {
+        buf.clear();
+        // `take` bounds this read: read_until returns at the newline,
+        // at EOF, or after MAX_FRAME_BYTES + 1 bytes — whichever comes
+        // first. The +1 lets us tell "exactly at the cap with a
+        // newline" (fine) from "past the cap" (rejected).
+        let n = match (&mut reader)
+            .take(MAX_FRAME_BYTES + 1)
+            .read_until(b'\n', &mut buf)
+        {
+            Ok(n) => n,
             Err(e) => {
                 eprintln!("shelbi daemon: client read error: {e}");
                 return;
             }
         };
+        if n == 0 {
+            break; // EOF
+        }
+        let terminated = buf.last() == Some(&b'\n');
+        if !terminated && n as u64 > MAX_FRAME_BYTES {
+            eprintln!(
+                "shelbi daemon: frame exceeds {MAX_FRAME_BYTES} bytes; closing connection"
+            );
+            return;
+        }
+        while matches!(buf.last(), Some(b'\n') | Some(b'\r')) {
+            buf.pop();
+        }
+        let line = match std::str::from_utf8(&buf) {
+            Ok(l) => l,
+            Err(e) => {
+                eprintln!("shelbi daemon: rejected non-UTF-8 frame: {e}");
+                continue;
+            }
+        };
         if line.trim().is_empty() {
             continue;
         }
-        if let Err(e) = dispatch(&line, daemon) {
-            // Log + continue; one bad message must not take down a
-            // multi-message client connection.
-            eprintln!("shelbi daemon: rejected message: {e}: {line}");
+        match dispatch(line, daemon) {
+            Ok(()) => {
+                let _ = (&stream).write_all(shelbi_state::DAEMON_ACK);
+            }
+            Err(e) => {
+                // Log + continue; one bad message must not take down a
+                // multi-message client connection. No ack — the sender
+                // must not mistake a rejection for delivery.
+                eprintln!("shelbi daemon: rejected message: {e}: {line:?}");
+            }
         }
     }
 }
@@ -479,7 +691,9 @@ fn dispatch(raw: &str, daemon: &Daemon) -> Result<()> {
         "request-clarification" => handle_request_clarification(&msg),
         "message-pushed" => handle_message_pushed(&msg, daemon),
         "message-ack" => handle_message_ack(&msg, daemon),
-        other => Err(anyhow!("unknown verb `{other}`")),
+        // Debug-escaped so a control-byte-laden verb can't smuggle ANSI
+        // sequences into the daemon log.
+        other => Err(anyhow!("unknown verb {other:?}")),
     }
 }
 
@@ -496,6 +710,15 @@ fn handle_event(msg: &Message) -> Result<()> {
     // reject them outright rather than silently mangling the payload.
     if body.contains('\n') || body.contains('\r') {
         return Err(anyhow!("event `line` may not contain newlines"));
+    }
+    // The O_APPEND write is only tear-free while the whole record stays
+    // ≤ PIPE_BUF; an oversized body would silently forfeit that, so it's
+    // rejected here rather than mangled downstream.
+    if body.len() > MAX_EVENT_BODY_BYTES {
+        return Err(anyhow!(
+            "event `line` exceeds {MAX_EVENT_BODY_BYTES} bytes ({} bytes)",
+            body.len()
+        ));
     }
     shelbi_state::append_external_event(body).map_err(|e| anyhow!(e))?;
     if let Some(project) = msg.project.as_deref() {
@@ -542,10 +765,7 @@ fn handle_request_clarification(msg: &Message) -> Result<()> {
 fn handle_message_pushed(msg: &Message, daemon: &Daemon) -> Result<()> {
     let task_id = required(msg.task_id.as_deref(), "message-pushed", "task_id")?;
     let msg_id = required(msg.msg_id.as_deref(), "message-pushed", "msg_id")?;
-    let mut map = daemon
-        .pending
-        .lock()
-        .map_err(|_| anyhow!("pending map poisoned"))?;
+    let mut map = lock_pending(&daemon.pending);
     map.insert((task_id.to_string(), msg_id.to_string()), Instant::now());
     Ok(())
 }
@@ -559,10 +779,7 @@ fn handle_message_ack(msg: &Message, daemon: &Daemon) -> Result<()> {
     let task_id = required(msg.task_id.as_deref(), "message-ack", "task_id")?;
     let msg_id = required(msg.msg_id.as_deref(), "message-ack", "msg_id")?;
     {
-        let mut map = daemon
-            .pending
-            .lock()
-            .map_err(|_| anyhow!("pending map poisoned"))?;
+        let mut map = lock_pending(&daemon.pending);
         map.remove(&(task_id.to_string(), msg_id.to_string()));
     }
     shelbi_state::append_message_ack_event(msg_id, task_id, "worker").map_err(|e| anyhow!(e))?;
@@ -1496,5 +1713,177 @@ mod tests {
     fn xml_escape_handles_all_specials() {
         assert_eq!(xml_escape("a&b<c>d\"e'f"), "a&amp;b&lt;c&gt;d&quot;e&apos;f");
         assert_eq!(xml_escape("plain/path/to/binary"), "plain/path/to/binary");
+    }
+
+    #[test]
+    fn dispatch_event_rejects_over_length_line() {
+        let body = "x".repeat(MAX_EVENT_BODY_BYTES + 1);
+        let payload = serde_json::json!({"verb": "event", "line": body}).to_string();
+        let err = dispatch(&payload, &test_daemon()).unwrap_err();
+        assert!(err.to_string().contains("exceeds"), "{err}");
+    }
+
+    /// F12: a handler that panicked while holding the pending-map lock
+    /// must not wedge every later push/ack into a permanent error (which
+    /// the reaper would then surface as bogus `ack=timeout` lines for
+    /// every message forever). All lock sites recover from poison.
+    #[test]
+    fn pending_map_poison_is_recovered_not_fatal() {
+        let _iso = IsolatedShelbiHome::new("poison");
+        let d = test_daemon();
+        let pending = d.pending.clone();
+        let _ = std::thread::spawn(move || {
+            let _guard = pending.lock().unwrap();
+            panic!("poison the pending map on purpose");
+        })
+        .join();
+        dispatch(
+            r#"{"verb":"message-pushed","project":"shelbi","task_id":"t-p","msg_id":"m-p"}"#,
+            &d,
+        )
+        .expect("push must survive a poisoned lock");
+        assert_eq!(lock_pending(&d.pending).len(), 1);
+        dispatch(
+            r#"{"verb":"message-ack","project":"shelbi","task_id":"t-p","msg_id":"m-p"}"#,
+            &d,
+        )
+        .expect("ack must survive a poisoned lock");
+        assert!(lock_pending(&d.pending).is_empty());
+    }
+
+    /// F4: the bind lock is exclusive for its lifetime and reacquirable
+    /// after release — two daemons racing through startup can't both
+    /// hold it, so only one ever unlinks/binds the socket.
+    #[test]
+    fn acquire_bind_lock_is_exclusive_and_releases_on_drop() {
+        let dir = std::env::temp_dir().join(format!(
+            "shelbi-daemon-lock-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let sock = dir.join("hub.sock");
+
+        let first = acquire_bind_lock(&sock).expect("first lock");
+        let second = acquire_bind_lock(&sock);
+        assert!(second.is_err(), "second lock must be refused while held");
+        assert!(
+            second.unwrap_err().to_string().contains("another shelbi daemon"),
+            "error should name the culprit"
+        );
+        drop(first);
+        acquire_bind_lock(&sock).expect("relock after release");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// F3 (ack half): a successfully dispatched event is acknowledged on
+    /// the same connection, and the event actually lands in events.log.
+    #[test]
+    fn handle_client_acks_processed_event() {
+        use std::net::Shutdown;
+        let _iso = IsolatedShelbiHome::new("hc-ack");
+        let d = test_daemon();
+        let (client, server) = UnixStream::pair().unwrap();
+        let handler = thread::spawn(move || handle_client(server, &d));
+
+        (&client)
+            .write_all(b"{\"verb\":\"event\",\"project\":\"shelbi\",\"line\":\"note=ack-me\"}\n")
+            .unwrap();
+        client.shutdown(Shutdown::Write).unwrap();
+        let mut ack = Vec::new();
+        (&client).read_to_end(&mut ack).unwrap();
+        assert_eq!(ack, shelbi_state::DAEMON_ACK, "ack: {ack:?}");
+        handler.join().unwrap();
+
+        let log = std::fs::read_to_string(shelbi_state::events_log_path().unwrap()).unwrap();
+        assert!(log.contains("note=ack-me"), "log: {log}");
+    }
+
+    /// F2: an over-limit (newline-free) frame is rejected, the buffer
+    /// never grows past the cap, and the connection is closed without an
+    /// ack — so a well-behaved client falls back instead of assuming
+    /// delivery.
+    #[test]
+    fn handle_client_rejects_oversized_frame_without_ack() {
+        use std::net::Shutdown;
+        let d = test_daemon();
+        let (client, server) = UnixStream::pair().unwrap();
+        let handler = thread::spawn(move || handle_client(server, &d));
+
+        let big = vec![b'x'; MAX_FRAME_BYTES as usize + 2]; // no newline anywhere
+        // The daemon may close mid-write once it sees the cap blown;
+        // a BrokenPipe here is part of the expected behavior.
+        let _ = (&client).write_all(&big);
+        let _ = client.shutdown(Shutdown::Write);
+        let mut ack = Vec::new();
+        let n = (&client).read_to_end(&mut ack).unwrap_or(0);
+        assert_eq!(n, 0, "no ack for an oversized frame, got: {ack:?}");
+        handler.join().unwrap();
+    }
+
+    /// A rejected line gets no ack but keeps the connection alive; the
+    /// next valid line on the same connection is processed and acked.
+    #[test]
+    fn handle_client_skips_bad_line_and_acks_next() {
+        use std::net::Shutdown;
+        let _iso = IsolatedShelbiHome::new("hc-mixed");
+        let d = test_daemon();
+        let (client, server) = UnixStream::pair().unwrap();
+        let handler = thread::spawn(move || handle_client(server, &d));
+
+        (&client)
+            .write_all(
+                b"not json at all\n{\"verb\":\"event\",\"project\":\"shelbi\",\"line\":\"note=second\"}\n",
+            )
+            .unwrap();
+        client.shutdown(Shutdown::Write).unwrap();
+        let mut acks = Vec::new();
+        (&client).read_to_end(&mut acks).unwrap();
+        assert_eq!(acks, shelbi_state::DAEMON_ACK, "exactly one ack: {acks:?}");
+        handler.join().unwrap();
+
+        let log = std::fs::read_to_string(shelbi_state::events_log_path().unwrap()).unwrap();
+        assert!(log.contains("note=second"), "log: {log}");
+    }
+
+    /// F3 (drain half): a client whose connection was accepted just as
+    /// shutdown began still gets read, dispatched, and acked before
+    /// `serve` returns — the restart window can't silently drop it.
+    #[test]
+    fn serve_drains_accepted_connection_on_shutdown() {
+        use std::net::Shutdown;
+        let _iso = IsolatedShelbiHome::new("drain");
+        // macOS caps Unix-socket paths at ~104 bytes; keep it short.
+        let sock = PathBuf::from(format!("/tmp/shb-drain-{}.sock", std::process::id()));
+        let _ = std::fs::remove_file(&sock);
+        let listener = UnixListener::bind(&sock).unwrap();
+        let daemon = test_daemon();
+        let stop = Arc::new(AtomicBool::new(false));
+        let (stop2, daemon2) = (stop.clone(), daemon.clone());
+        let server = thread::spawn(move || serve(&listener, &daemon2, &stop2));
+
+        // Connect (so the accept happens) but hold the write back until
+        // after shutdown starts — this is exactly the window the old
+        // code lost: stream accepted, stop flag set, process exits with
+        // the line unread.
+        let client = UnixStream::connect(&sock).unwrap();
+        stop.store(true, Ordering::SeqCst);
+        let _ = UnixStream::connect(&sock); // the shutdown wake-up poke
+
+        (&client)
+            .write_all(b"{\"verb\":\"event\",\"project\":\"shelbi\",\"line\":\"note=drained\"}\n")
+            .unwrap();
+        client.shutdown(Shutdown::Write).unwrap();
+        let mut ack = Vec::new();
+        (&client).read_to_end(&mut ack).unwrap();
+        assert_eq!(ack, shelbi_state::DAEMON_ACK, "ack: {ack:?}");
+        server.join().unwrap();
+
+        let log = std::fs::read_to_string(shelbi_state::events_log_path().unwrap()).unwrap();
+        assert!(log.contains("note=drained"), "log: {log}");
+        let _ = std::fs::remove_file(&sock);
     }
 }
