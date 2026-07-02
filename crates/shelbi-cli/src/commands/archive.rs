@@ -13,9 +13,12 @@ pub fn run(project: Option<String>, id: String) -> Result<()> {
         .ok_or_else(|| anyhow!("machine `{}` no longer in project", file.agent.machine))?;
     let host = machine.host();
 
-    // Best-effort: kill the tmux window and remove the worktree. Don't fail
-    // the whole archive if these are already gone.
-    let _ = shelbi_tmux::kill_window(&host, &file.agent.tmux);
+    // Kill the tmux window. An already-gone window is fine (kill_window
+    // treats it as success), but a failure to reach the host is a real
+    // error we surface rather than silently orphaning a remote agent.
+    shelbi_tmux::kill_window(&host, &file.agent.tmux).map_err(|e| anyhow!(e))?;
+    // Best-effort: remove the worktree. Don't fail the archive if it's
+    // already gone.
     let repo_dir = machine.work_dir.to_string_lossy().into_owned();
     let _ = shelbi_ssh::run_capture(
         &host,
