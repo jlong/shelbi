@@ -153,7 +153,7 @@ export function Header({ docsSections = [] }: HeaderProps) {
         transparent ? "border-transparent" : "border-gray-4"
       }`}
     >
-      <div className="mx-auto flex h-6 w-full max-w-[88rem] items-center gap-2 px-3 lg:px-4 sm:gap-3">
+      <div className="flex h-6 w-full items-center gap-2 px-3 lg:px-4 sm:gap-3">
         <Link
           href="/"
           aria-label="Shelbi home"
