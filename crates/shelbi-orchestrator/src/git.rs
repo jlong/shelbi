@@ -140,6 +140,12 @@ pub(crate) fn locate_hub_workdir(project: &Project) -> Result<(Host, PathBuf)> {
 /// `gh pr list --head <branch> --state open`; a closed/merged PR for the
 /// same branch is intentionally ignored — a fresh push warrants a fresh
 /// PR.
+///
+/// Errors when the branch has *more than one* open PR (same head, two
+/// different bases — GitHub allows it). Every downstream action (merge,
+/// close, retarget) assumes "the PR for this branch" is well-defined;
+/// silently picking the first listing would merge or close an arbitrary
+/// one.
 pub(crate) fn lookup_open_pr(host: &Host, wt: &str, branch: &str) -> Result<Option<u64>> {
     let out = run_in_dir(
         host,
@@ -155,7 +161,7 @@ pub(crate) fn lookup_open_pr(host: &Host, wt: &str, branch: &str) -> Result<Opti
             "--json",
             "number",
             "--jq",
-            ".[0].number // empty",
+            ".[].number",
         ],
     )?;
     if !out.status.success() {
@@ -165,16 +171,145 @@ pub(crate) fn lookup_open_pr(host: &Host, wt: &str, branch: &str) -> Result<Opti
             stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
         });
     }
-    let s = String::from_utf8_lossy(&out.stdout);
-    let trimmed = s.trim();
-    if trimmed.is_empty() {
-        return Ok(None);
+    parse_open_pr_list(&String::from_utf8_lossy(&out.stdout), branch)
+}
+
+/// Parse `gh pr list`'s one-number-per-line `--jq .[].number` output.
+/// Split out of [`lookup_open_pr`] so the zero/one/many rules are
+/// unit-testable without gh.
+fn parse_open_pr_list(stdout: &str, branch: &str) -> Result<Option<u64>> {
+    let mut numbers = Vec::new();
+    for line in stdout.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let n = trimmed.parse::<u64>().map_err(|_| {
+            Error::Other(format!(
+                "gh pr list returned non-numeric value `{trimmed}` for branch `{branch}`"
+            ))
+        })?;
+        numbers.push(n);
     }
-    trimmed.parse::<u64>().map(Some).map_err(|_| {
-        Error::Other(format!(
-            "gh pr list returned non-numeric value `{trimmed}` for branch `{branch}`"
-        ))
-    })
+    match numbers.as_slice() {
+        [] => Ok(None),
+        [one] => Ok(Some(*one)),
+        many => {
+            let list = many
+                .iter()
+                .map(|n| format!("#{n}"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            Err(Error::Other(format!(
+                "branch `{branch}` has {} open PRs ({list}) — close or retarget \
+                 the extras so shelbi knows which one to operate on",
+                many.len()
+            )))
+        }
+    }
+}
+
+/// The stored base branch (`baseRefName`) of a PR. Read by [`crate::actions::merge`]
+/// *before* merging so restack cascades land children on the branch
+/// GitHub actually merged into — not a recomputation of what the base
+/// "should" be.
+pub(crate) fn lookup_pr_base(host: &Host, wt: &str, pr: u64) -> Result<String> {
+    let pr_str = pr.to_string();
+    let out = run_in_dir(
+        host,
+        wt,
+        &[
+            "gh",
+            "pr",
+            "view",
+            &pr_str,
+            "--json",
+            "baseRefName",
+            "--jq",
+            ".baseRefName",
+        ],
+    )?;
+    if !out.status.success() {
+        return Err(Error::Command {
+            cmd: format!("gh pr view {pr_str} --json baseRefName"),
+            status: out.status.to_string(),
+            stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
+        });
+    }
+    let base = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if base.is_empty() {
+        return Err(Error::Other(format!(
+            "gh pr view {pr_str}: baseRefName is empty"
+        )));
+    }
+    Ok(base)
+}
+
+/// Backoff schedule for [`wait_for_merge_commit_sha`] — ~15s total, enough
+/// to cover GitHub's usual post-merge bookkeeping lag without stalling a
+/// genuinely stuck merge for long.
+const MERGE_SHA_BACKOFF_SECS: [u64; 4] = [1, 2, 4, 8];
+
+/// Read the merge commit SHA of a just-merged PR, polling with backoff.
+///
+/// GitHub finalizes merges asynchronously (merge queues, busy repos), so
+/// `mergeCommit` can be null for a window after `gh pr merge` exits 0.
+/// Returns:
+///
+/// - `Ok(Some(sha))` once the SHA materializes;
+/// - `Ok(None)` when the PR reports `MERGED` but the SHA still isn't
+///   recorded after all retries — the merge *succeeded*, callers must
+///   treat this as "merged, SHA pending", not a failure;
+/// - `Err` when the PR never reaches `MERGED` (e.g. it's still queued)
+///   or gh itself fails.
+pub(crate) fn wait_for_merge_commit_sha(host: &Host, wt: &str, pr: u64) -> Result<Option<String>> {
+    let pr_str = pr.to_string();
+    let mut attempt = 0;
+    loop {
+        let out = run_in_dir(
+            host,
+            wt,
+            &[
+                "gh",
+                "pr",
+                "view",
+                &pr_str,
+                "--json",
+                "state,mergeCommit",
+                "--jq",
+                r#".state + " " + (.mergeCommit.oid // "")"#,
+            ],
+        )?;
+        if !out.status.success() {
+            return Err(Error::Command {
+                cmd: format!("gh pr view {pr_str} --json state,mergeCommit"),
+                status: out.status.to_string(),
+                stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
+            });
+        }
+        let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+        let mut parts = stdout.split_whitespace();
+        let state = parts.next().unwrap_or("").to_string();
+        let oid = parts.next().unwrap_or("").to_string();
+        if !oid.is_empty() {
+            return Ok(Some(oid));
+        }
+        if attempt >= MERGE_SHA_BACKOFF_SECS.len() {
+            if state == "MERGED" {
+                return Ok(None);
+            }
+            return Err(Error::Other(format!(
+                "gh pr view {pr_str}: merge reported success but the PR is \
+                 `{state}` and mergeCommit.oid is still empty after retries — \
+                 if the repo uses a merge queue the merge may land later; \
+                 check the PR on GitHub"
+            )));
+        }
+        std::thread::sleep(std::time::Duration::from_secs(
+            MERGE_SHA_BACKOFF_SECS[attempt],
+        ));
+        attempt += 1;
+    }
 }
 
 /// `git log -1 --format=%s` in `wt` — used as the default PR title when
@@ -250,6 +385,32 @@ mod tests {
     fn parse_pr_number_rejects_garbage() {
         assert_eq!(parse_pr_number_from_url(""), None);
         assert_eq!(parse_pr_number_from_url("not a url"), None);
+    }
+
+    #[test]
+    fn open_pr_list_zero_and_one_are_clean() {
+        assert_eq!(parse_open_pr_list("", "b").unwrap(), None);
+        assert_eq!(parse_open_pr_list("\n", "b").unwrap(), None);
+        assert_eq!(parse_open_pr_list("42\n", "b").unwrap(), Some(42));
+    }
+
+    #[test]
+    fn open_pr_list_with_multiple_prs_errors_naming_them_all() {
+        // GitHub allows two open PRs with the same head and different
+        // bases. Downstream actions must not silently operate on `.[0]`;
+        // the error names every candidate so the operator can pick.
+        let err = parse_open_pr_list("42\n77\n", "shelbi/x").unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("2 open PRs"), "{msg}");
+        assert!(msg.contains("#42"), "{msg}");
+        assert!(msg.contains("#77"), "{msg}");
+        assert!(msg.contains("shelbi/x"), "{msg}");
+    }
+
+    #[test]
+    fn open_pr_list_rejects_non_numeric_rows() {
+        let err = parse_open_pr_list("nope\n", "b").unwrap_err();
+        assert!(err.to_string().contains("non-numeric"), "{err}");
     }
 
     #[test]

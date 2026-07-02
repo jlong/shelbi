@@ -223,9 +223,14 @@ pub fn run(project_opt: Option<String>, cmd: ZenCmd) -> Result<()> {
             match_head_commit,
         } => {
             let project = load_project(&project_name).map_err(|e| anyhow!(e))?;
-            let sha = zen::pr_merge(&project, pr_number, match_head_commit.as_deref())
-                .map_err(|e| anyhow!(e))?;
-            println!("{sha}");
+            match zen::pr_merge(&project, pr_number, match_head_commit.as_deref())
+                .map_err(|e| anyhow!(e))?
+            {
+                Some(sha) => println!("{sha}"),
+                // Merged, but GitHub hadn't recorded the merge commit yet
+                // when polling gave up — success, just without a SHA.
+                None => println!("sha-pending"),
+            }
             // Forcing function: append the post-merge eligibility scan to the
             // command's own stdout so the orchestrator can't drop the scan it's
             // supposed to run on every worker-free signal. Best-effort — the
