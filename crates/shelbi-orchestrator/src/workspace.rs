@@ -525,14 +525,28 @@ pub fn start_workspace_on_task(spec: StartSpec<'_>) -> Result<TmuxAddr> {
     let _ = clear_review_marker(&host, &marker);
 
     // 1. Make sure the worktree exists + is on the right branch, clean.
-    sync_worktree(
+    //    A failure here (dirty worktree, unreachable origin during the
+    //    fresh-cut fetch, git error) aborts the dispatch before any pane
+    //    is touched — surface it in events.log so `shelbi events tail`
+    //    and the orchestrator see the stall, not just the CLI caller.
+    if let Err(e) = sync_worktree(
         spec.project,
         &host,
         &machine,
         &worktree,
         spec.branch,
         spec.project.base_branch(),
-    )?;
+    ) {
+        if let Err(log_err) = shelbi_state::append_dispatch_event(
+            spec.task_id,
+            &spec.workspace.name,
+            "sync-failed",
+            &e.to_string(),
+        ) {
+            eprintln!("shelbi: failed to record dispatch sync failure in events.log: {log_err}");
+        }
+        return Err(e);
+    }
 
     // 2. Drop a rendered .claude/settings.json into the worktree so the
     //    runner picks up shelbi's window-title hooks (idle/working/blocked)
@@ -1532,10 +1546,55 @@ fn message_polling_section(task_id: &str, project: &str, id_esc: &str) -> String
     )
 }
 
+/// Resolve the ref a brand-new task branch should be cut from.
+///
+/// The machine's local `default_branch` ref can be arbitrarily stale: on a
+/// remote workspace clone nothing advances it between dispatches (merges
+/// land on GitHub via `gh pr merge`, and no fetch ran here), so cutting from
+/// it silently bases the task on day-old code — reviews analyze superseded
+/// sources, fixes edit files reworked upstream, and `zen probe` diffs
+/// explode because the branch root predates the current default. See
+/// task `dispatch-stale-base-branch-cut` for the observed fallout.
+///
+/// So: when the repo has an `origin` remote, fetch the default branch and
+/// cut from the freshly-updated remote-tracking ref (`origin/<default>`).
+/// A repo with no `origin` (local-only project, test fixture) falls back to
+/// the local ref — with no remote there is no fresher truth to fetch.
+///
+/// A failing fetch when `origin` exists is a HARD error, not a silent
+/// fallback — same principle as the `fetch_probe_base` silent-fallback
+/// finding (orchestrator-zen review F7): the caller must abort the dispatch
+/// (task stays put, event emitted) rather than cut from a possibly-stale
+/// ref.
+fn resolve_fresh_cut_base(host: &Host, repo: &str, default_branch: &str) -> Result<String> {
+    let has_origin = shelbi_ssh::run(
+        host,
+        ["git", "-C", repo, "config", "--get", "remote.origin.url"],
+    )
+    .map_err(Error::Io)?
+    .status
+    .success();
+    if !has_origin {
+        return Ok(default_branch.to_string());
+    }
+    let fetch = shelbi_ssh::run(host, ["git", "-C", repo, "fetch", "origin", default_branch])
+        .map_err(Error::Io)?;
+    if !fetch.status.success() {
+        return Err(Error::Other(format!(
+            "refusing to cut a task branch from a possibly-stale `{default_branch}`: \
+             `git fetch origin {default_branch}` failed in {repo}: {}",
+            String::from_utf8_lossy(&fetch.stderr).trim(),
+        )));
+    }
+    Ok(format!("origin/{default_branch}"))
+}
+
 /// Ensure the worktree exists and is checked out on `branch`. Creates the
 /// worktree off the project's default branch if absent, creates the branch
-/// off the default if it doesn't exist yet, and bails if the worktree has
-/// uncommitted changes (otherwise switching branches would lose work).
+/// off the default if it doesn't exist yet (fetching `origin/<default>`
+/// first so the cut base is current — see [`resolve_fresh_cut_base`]), and
+/// bails if the worktree has uncommitted changes (otherwise switching
+/// branches would lose work).
 fn sync_worktree(
     project: &Project,
     host: &Host,
@@ -1590,6 +1649,15 @@ fn sync_worktree(
     .status
     .success();
 
+    // Every `!branch_exists` path below cuts a fresh branch, so resolve
+    // (and fetch) the base up front — and abort the whole sync if the
+    // fetch fails, before any worktree/branch state is touched.
+    let cut_base = if branch_exists {
+        None
+    } else {
+        Some(resolve_fresh_cut_base(host, &repo, default_branch)?)
+    };
+
     if !worktree_exists {
         // Fresh worktree off the requested branch (or off the default if
         // the branch is also new).
@@ -1600,14 +1668,19 @@ fn sync_worktree(
             "worktree".into(),
             "add".into(),
         ];
-        if branch_exists {
-            argv.push(wt_str.clone());
-            argv.push(branch.into());
-        } else {
+        if let Some(base) = &cut_base {
+            // `--no-track`: the base is usually `origin/<default>`, and a
+            // task branch must not adopt it as upstream — `git push` /
+            // `git status` on the workspace should never point at the
+            // default branch.
+            argv.push("--no-track".into());
             argv.push("-b".into());
             argv.push(branch.into());
             argv.push(wt_str.clone());
-            argv.push(default_branch.into());
+            argv.push(base.clone());
+        } else {
+            argv.push(wt_str.clone());
+            argv.push(branch.into());
         }
         let out = shelbi_ssh::run(host, &argv).map_err(Error::Io)?;
         if !out.status.success() {
@@ -1667,12 +1740,14 @@ fn sync_worktree(
         crate::review::release_branch_from_workspace_worktrees(host, project, machine, branch)?;
     }
 
-    // Switch (and create the branch off default if it doesn't exist).
+    // Switch (and create the branch off the freshly-resolved base if it
+    // doesn't exist).
     let mut argv: Vec<String> = vec!["git".into(), "-C".into(), wt_str.clone(), "checkout".into()];
-    if !branch_exists {
+    if let Some(base) = &cut_base {
+        argv.push("--no-track".into());
         argv.push("-b".into());
         argv.push(branch.into());
-        argv.push(default_branch.into());
+        argv.push(base.clone());
     } else {
         argv.push(branch.into());
     }
@@ -3457,5 +3532,430 @@ mod sync_worktree_git_tests {
         let err = sync_worktree(&project, &Host::Local, &machine, &wt, "shelbi/x", "main");
         assert!(err.is_err(), "user-authored change must still block the switch");
         let _ = std::fs::remove_dir_all(&repo);
+    }
+}
+
+#[cfg(test)]
+mod sync_worktree_freshcut_tests {
+    //! Real-git tests for [`sync_worktree`]'s fresh-cut base resolution
+    //! (the `dispatch-stale-base-branch-cut` fix). Each test provisions a
+    //! bare "origin" repo plus a machine clone whose local `main` /
+    //! `origin/main` are deliberately N commits behind the bare repo —
+    //! exactly the devbox state the bug was observed in — then exercises
+    //! one path through `sync_worktree`. Skipped silently if `git` isn't
+    //! on PATH so the suite still runs on a git-less sandbox.
+    use super::*;
+    use shelbi_core::MachineKind;
+    use std::path::PathBuf;
+
+    fn git_available() -> bool {
+        std::process::Command::new("git")
+            .arg("--version")
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false)
+    }
+
+    fn run_git_in(repo: &std::path::Path, args: &[&str]) -> std::process::Output {
+        let mut cmd = std::process::Command::new("git");
+        cmd.arg("-C").arg(repo);
+        for a in args {
+            cmd.arg(a);
+        }
+        cmd.env("GIT_AUTHOR_NAME", "Shelbi Test");
+        cmd.env("GIT_AUTHOR_EMAIL", "test@shelbi.local");
+        cmd.env("GIT_COMMITTER_NAME", "Shelbi Test");
+        cmd.env("GIT_COMMITTER_EMAIL", "test@shelbi.local");
+        cmd.output().expect("git command failed to spawn")
+    }
+
+    fn assert_git_ok(out: &std::process::Output, what: &str) {
+        assert!(
+            out.status.success(),
+            "{what} failed: {}",
+            String::from_utf8_lossy(&out.stderr),
+        );
+    }
+
+    fn fresh_root(label: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "shelbi-synccut-{label}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos(),
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn commit_file(repo: &std::path::Path, name: &str, contents: &str, message: &str) {
+        std::fs::write(repo.join(name), contents).unwrap();
+        assert_git_ok(&run_git_in(repo, &["add", name]), "git add");
+        assert_git_ok(&run_git_in(repo, &["commit", "-q", "-m", message]), "git commit");
+    }
+
+    fn rev_parse(repo: &std::path::Path, r: &str) -> String {
+        let out = run_git_in(repo, &["rev-parse", "--verify", r]);
+        assert_git_ok(&out, "git rev-parse");
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
+    fn ref_exists(repo: &std::path::Path, r: &str) -> bool {
+        run_git_in(repo, &["rev-parse", "--verify", "--quiet", r])
+            .status
+            .success()
+    }
+
+    fn machine_at(repo: &std::path::Path) -> Machine {
+        Machine {
+            name: "m".into(),
+            kind: MachineKind::Local,
+            work_dir: repo.to_path_buf(),
+            host: None,
+        }
+    }
+
+    /// A minimal `Project` wrapping [`machine_at`]. `sync_worktree` only
+    /// touches `project` to release the branch from *other* workspace
+    /// worktrees (F14); with no workspaces declared that release is a no-op,
+    /// so these fresh-cut tests can stay focused on the base-ref resolution.
+    fn project_at(repo: &std::path::Path) -> Project {
+        let mut runners = std::collections::BTreeMap::new();
+        runners.insert(
+            "claude".to_string(),
+            shelbi_core::AgentRunnerSpec {
+                command: "claude".into(),
+                flags: vec![],
+            },
+        );
+        Project {
+            name: "synccut".into(),
+            repo: repo.to_string_lossy().into(),
+            default_branch: "main".into(),
+            config_mode: None,
+            machines: vec![machine_at(repo)],
+            orchestrator: shelbi_core::OrchestratorSpec {
+                runner: "claude".into(),
+            },
+            agent_runners: runners,
+            editor: None,
+            github_url: None,
+            workspaces: vec![],
+            workspace_poll_interval_secs: 5,
+            workspace_permissions_mode: "acceptEdits".into(),
+            workspace_settings_template: None,
+            zen: shelbi_core::ZenConfig::default(),
+            heartbeat: shelbi_core::HeartbeatConfig::default(),
+            git: shelbi_core::GitConfig::default(),
+            contextstore_sync: Vec::new(),
+            detected_shapes: Vec::new(),
+        }
+    }
+
+    /// Provision the observed devbox shape: a bare `origin.git`, a machine
+    /// clone taken at commit 1, and a writer clone that then pushed commit 2
+    /// to the bare repo. The machine clone's local `main` AND `origin/main`
+    /// both point at the stale commit — no fetch has run since the clone.
+    /// Returns `(root, machine_repo, fresh_sha, stale_sha)`.
+    fn stale_clone_fixture(label: &str) -> (PathBuf, PathBuf, String, String) {
+        let root = fresh_root(label);
+        let seed = root.join("seed");
+        std::fs::create_dir_all(&seed).unwrap();
+        assert_git_ok(&run_git_in(&seed, &["init", "-q", "-b", "main"]), "git init");
+        commit_file(&seed, "README.md", "# repo\n", "initial");
+
+        let bare = root.join("origin.git");
+        assert_git_ok(
+            &run_git_in(
+                &root,
+                &["clone", "-q", "--bare", seed.to_str().unwrap(), bare.to_str().unwrap()],
+            ),
+            "bare clone",
+        );
+
+        let machine = root.join("machine");
+        assert_git_ok(
+            &run_git_in(
+                &root,
+                &["clone", "-q", bare.to_str().unwrap(), machine.to_str().unwrap()],
+            ),
+            "machine clone",
+        );
+        let stale = rev_parse(&machine, "main");
+
+        // Advance origin's main behind the machine clone's back.
+        let writer = root.join("writer");
+        assert_git_ok(
+            &run_git_in(
+                &root,
+                &["clone", "-q", bare.to_str().unwrap(), writer.to_str().unwrap()],
+            ),
+            "writer clone",
+        );
+        commit_file(&writer, "upstream.txt", "merged upstream\n", "upstream landed");
+        assert_git_ok(
+            &run_git_in(&writer, &["push", "-q", "origin", "main"]),
+            "writer push",
+        );
+        let fresh = rev_parse(&writer, "main");
+        assert_ne!(fresh, stale, "fixture must advance origin past the clone");
+
+        (root, machine, fresh, stale)
+    }
+
+    #[test]
+    fn fresh_worktree_cut_uses_current_origin_default_not_stale_local() {
+        // Acceptance criterion: dispatch to a workspace whose clone is N
+        // commits behind cuts the branch from current origin/<default>.
+        if !git_available() {
+            eprintln!("skipping: git not on PATH");
+            return;
+        }
+        let (root, machine, fresh, stale) = stale_clone_fixture("fresh-wt");
+        let wt = root.join("wt-alpha");
+
+        sync_worktree(&project_at(&machine), &Host::Local, &machine_at(&machine), &wt, "shelbi/task-x", "main")
+            .expect("sync_worktree should succeed with a reachable origin");
+
+        assert_eq!(
+            rev_parse(&machine, "shelbi/task-x"),
+            fresh,
+            "branch must be cut from freshly-fetched origin/main"
+        );
+        assert_ne!(rev_parse(&machine, "shelbi/task-x"), stale);
+        let out = run_git_in(&wt, &["rev-parse", "--abbrev-ref", "HEAD"]);
+        assert_git_ok(&out, "worktree HEAD");
+        assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "shelbi/task-x");
+        // --no-track: a task branch must not adopt origin/main as upstream.
+        assert!(
+            !run_git_in(&wt, &["rev-parse", "--abbrev-ref", "shelbi/task-x@{upstream}"])
+                .status
+                .success(),
+            "task branch must not track origin/main"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn existing_worktree_new_branch_cut_uses_current_origin_default() {
+        // Same staleness, but through the `checkout -b` path: the
+        // worktree already exists from a previous task and just switches.
+        if !git_available() {
+            eprintln!("skipping: git not on PATH");
+            return;
+        }
+        let (root, machine, fresh, _stale) = stale_clone_fixture("existing-wt");
+        let wt = root.join("wt-bravo");
+        assert_git_ok(
+            &run_git_in(
+                &machine,
+                &["worktree", "add", "-q", "-b", "shelbi/prev-task", wt.to_str().unwrap(), "main"],
+            ),
+            "pre-existing worktree",
+        );
+
+        sync_worktree(&project_at(&machine), &Host::Local, &machine_at(&machine), &wt, "shelbi/task-y", "main")
+            .expect("sync_worktree should succeed with a reachable origin");
+
+        assert_eq!(
+            rev_parse(&machine, "shelbi/task-y"),
+            fresh,
+            "checkout -b path must also cut from freshly-fetched origin/main"
+        );
+        let out = run_git_in(&wt, &["rev-parse", "--abbrev-ref", "HEAD"]);
+        assert_git_ok(&out, "worktree HEAD");
+        assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "shelbi/task-y");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn failing_fetch_aborts_without_cutting() {
+        // Acceptance criterion: a failing fetch aborts the dispatch — no
+        // branch is cut from the stale ref, no worktree materializes.
+        if !git_available() {
+            eprintln!("skipping: git not on PATH");
+            return;
+        }
+        let (root, machine, _fresh, _stale) = stale_clone_fixture("fetch-fail");
+        // Simulate offline/auth failure: origin exists but is unreachable.
+        assert_git_ok(
+            &run_git_in(
+                &machine,
+                &["remote", "set-url", "origin", "/nonexistent/shelbi-gone.git"],
+            ),
+            "break origin",
+        );
+        let wt = root.join("wt-charlie");
+
+        let err = sync_worktree(&project_at(&machine), &Host::Local, &machine_at(&machine), &wt, "shelbi/task-z", "main")
+            .expect_err("unreachable origin must abort the sync");
+        let msg = err.to_string();
+        assert!(msg.contains("fetch"), "error must name the failing fetch: {msg}");
+        assert!(msg.contains("main"), "error must name the base branch: {msg}");
+        assert!(
+            !ref_exists(&machine, "refs/heads/shelbi/task-z"),
+            "no branch may be cut from the stale ref"
+        );
+        assert!(!wt.exists(), "no worktree may be created on a failed fetch");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn no_origin_repo_falls_back_to_local_default() {
+        // Local-only project (or test fixture) with no `origin` remote:
+        // the local default IS the source of truth, so the cut proceeds
+        // from it — no fetch, no error.
+        if !git_available() {
+            eprintln!("skipping: git not on PATH");
+            return;
+        }
+        let root = fresh_root("no-origin");
+        let repo = root.join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        assert_git_ok(&run_git_in(&repo, &["init", "-q", "-b", "main"]), "git init");
+        commit_file(&repo, "README.md", "# repo\n", "initial");
+        let local_main = rev_parse(&repo, "main");
+        let wt = root.join("wt-delta");
+
+        sync_worktree(&project_at(&repo), &Host::Local, &machine_at(&repo), &wt, "shelbi/task-l", "main")
+            .expect("no-origin repo must fall back to the local default");
+        assert_eq!(rev_parse(&repo, "shelbi/task-l"), local_main);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn existing_branch_needs_no_fetch() {
+        // The hub-cut flow: `ensure_branch_for_in_progress` already cut
+        // the branch in this repo, so sync just checks it out — even when
+        // origin is unreachable, because no fresh cut happens.
+        if !git_available() {
+            eprintln!("skipping: git not on PATH");
+            return;
+        }
+        let (root, machine, _fresh, stale) = stale_clone_fixture("branch-exists");
+        assert_git_ok(
+            &run_git_in(&machine, &["branch", "shelbi/pre-cut", "main"]),
+            "pre-cut branch",
+        );
+        assert_git_ok(
+            &run_git_in(
+                &machine,
+                &["remote", "set-url", "origin", "/nonexistent/shelbi-gone.git"],
+            ),
+            "break origin",
+        );
+        let wt = root.join("wt-echo");
+
+        sync_worktree(&project_at(&machine), &Host::Local, &machine_at(&machine), &wt, "shelbi/pre-cut", "main")
+            .expect("existing branch must check out without fetching");
+        assert_eq!(rev_parse(&machine, "shelbi/pre-cut"), stale);
+        let out = run_git_in(&wt, &["rev-parse", "--abbrev-ref", "HEAD"]);
+        assert_git_ok(&out, "worktree HEAD");
+        assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "shelbi/pre-cut");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn sync_failure_emits_dispatch_event_and_aborts_start() {
+        // Acceptance criterion: the aborted dispatch is VISIBLE — a
+        // `dispatch … status=sync-failed` line lands in events.log, so
+        // `shelbi events tail` / the orchestrator see the stall instead of
+        // silently getting a stale-based branch.
+        if !git_available() {
+            eprintln!("skipping: git not on PATH");
+            return;
+        }
+        let _g = crate::test_lock::acquire();
+        let (root, machine_repo, _fresh, _stale) = stale_clone_fixture("event");
+        assert_git_ok(
+            &run_git_in(
+                &machine_repo,
+                &["remote", "set-url", "origin", "/nonexistent/shelbi-gone.git"],
+            ),
+            "break origin",
+        );
+        let home = root.join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        let prev_home = std::env::var_os("SHELBI_HOME");
+        std::env::set_var("SHELBI_HOME", &home);
+
+        let mut runners = std::collections::BTreeMap::new();
+        runners.insert(
+            "claude".to_string(),
+            shelbi_core::AgentRunnerSpec {
+                command: "claude".into(),
+                flags: vec![],
+            },
+        );
+        let project = Project {
+            name: "synccut".into(),
+            repo: machine_repo.to_string_lossy().into(),
+            default_branch: "main".into(),
+            config_mode: None,
+            machines: vec![Machine {
+                name: "hub".into(),
+                kind: MachineKind::Local,
+                work_dir: machine_repo.clone(),
+                host: None,
+            }],
+            orchestrator: shelbi_core::OrchestratorSpec {
+                runner: "claude".into(),
+            },
+            agent_runners: runners,
+            editor: None,
+            github_url: None,
+            workspaces: vec![WorkspaceSpec {
+                name: "alice".into(),
+                machine: "hub".into(),
+                runner: "claude".into(),
+            }],
+            workspace_poll_interval_secs: 5,
+            // NOT "auto": keeps `require_auto_mode_supported` from probing
+            // the host's claude binary — this test is about the sync step.
+            workspace_permissions_mode: "acceptEdits".into(),
+            workspace_settings_template: None,
+            zen: shelbi_core::ZenConfig::default(),
+            heartbeat: shelbi_core::HeartbeatConfig::default(),
+            git: shelbi_core::GitConfig::default(),
+            contextstore_sync: Vec::new(),
+            detected_shapes: Vec::new(),
+        };
+
+        let result = start_workspace_on_task(StartSpec {
+            project: &project,
+            workspace: &project.workspaces[0],
+            task_id: "task-ev",
+            branch: "shelbi/task-ev",
+            task_body: "",
+            agent: None,
+        });
+
+        let events = std::fs::read_to_string(home.join("events.log")).unwrap_or_default();
+
+        match prev_home {
+            Some(v) => std::env::set_var("SHELBI_HOME", v),
+            None => std::env::remove_var("SHELBI_HOME"),
+        }
+
+        assert!(result.is_err(), "start must abort when the sync fetch fails");
+        let line = events
+            .lines()
+            .find(|l| l.contains("dispatch task=task-ev"))
+            .unwrap_or_else(|| panic!("expected a dispatch event line, got: {events}"));
+        assert!(line.contains("workspace=alice"), "line: {line}");
+        assert!(line.contains("status=sync-failed"), "line: {line}");
+        assert!(
+            !ref_exists(&machine_repo, "refs/heads/shelbi/task-ev"),
+            "no branch may be cut when the dispatch aborts"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 }
