@@ -49,8 +49,9 @@ pub use agent_workspaces::{
     load_agent_settings, load_shared_preamble, materialize_default_agents,
     maybe_emit_claude_md_migration_hint, orchestrator_handoff_path, reset_claude_md_migration_hint,
     self_heal_default_agents, take_orchestrator_handoff, AgentMaterializeOutcome, BundledAgent,
-    DEFAULT_AGENTS, DEFAULT_DEVELOPER_INSTRUCTIONS, DEFAULT_ORCHESTRATOR_INSTRUCTIONS,
-    DEVELOPER_AGENT, HANDOFF_FILE, ORCHESTRATOR_AGENT, ORCHESTRATOR_HANDOFF_REL, SHARED_AGENT_DIR,
+    BundledSkill, DEFAULT_AGENTS, DEFAULT_DEVELOPER_INSTRUCTIONS, DEFAULT_ORCHESTRATOR_INSTRUCTIONS,
+    DEFAULT_REVIEW_INSTRUCTIONS, DEFAULT_REVIEW_LOAD_RUN_SKILL, DEVELOPER_AGENT, HANDOFF_FILE,
+    ORCHESTRATOR_AGENT, ORCHESTRATOR_HANDOFF_REL, REVIEW_AGENT, SHARED_AGENT_DIR,
     SHARED_PREAMBLE_FILE,
 };
 pub use hub_config::{
