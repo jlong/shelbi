@@ -503,6 +503,13 @@ pub fn start_workspace_on_task(spec: StartSpec<'_>) -> Result<TmuxAddr> {
     let worktree = workspace_worktree(&machine, spec.workspace);
     let addr = workspace_tmux_addr(spec.project, spec.workspace)?;
 
+    // 0. Serialize the whole dispatch against any concurrent start for the
+    //    same workspace. Without this, two `task start`s racing one
+    //    workspace interleave sync-worktree / checkout / pane-recreate and
+    //    leave the pane running one branch while the worktree sits on
+    //    another. The guard is held until this function returns.
+    let _dispatch_lock = shelbi_state::lock_workspace(&spec.project.name, &spec.workspace.name)?;
+
     // 0a. If the project asks for auto-mode, claude must be v2.1.83+. Older
     //     versions silently fall back to `default` and the user gets a Bash
     //     prompt on every command — exactly the bug we're trying to avoid.
@@ -519,6 +526,7 @@ pub fn start_workspace_on_task(spec: StartSpec<'_>) -> Result<TmuxAddr> {
 
     // 1. Make sure the worktree exists + is on the right branch, clean.
     sync_worktree(
+        spec.project,
         &host,
         &machine,
         &worktree,
@@ -1608,6 +1616,7 @@ fn message_polling_section(task_id: &str, project: &str, id_esc: &str) -> String
 /// off the default if it doesn't exist yet, and bails if the worktree has
 /// uncommitted changes (otherwise switching branches would lose work).
 fn sync_worktree(
+    project: &Project,
     host: &Host,
     machine: &Machine,
     worktree: &std::path::Path,
@@ -1617,17 +1626,40 @@ fn sync_worktree(
     let repo = machine.work_dir.to_string_lossy().into_owned();
     let wt_str = worktree.to_string_lossy().into_owned();
 
-    let worktree_exists = shelbi_ssh::run(
-        host,
-        ["test", "-d", &format!("{wt_str}/.git")],
-    )
-    .map_err(Error::Io)?
-    .status
-    .success()
+    // F5: a dispatch killed after the worktree *dir* was created but before
+    // its `.git` gitlink was written leaves `<wt>` present-but-invalid.
+    // Every later `git worktree add <wt>` then aborts with "already exists"
+    // and wedges the workspace forever. Prune stale bookkeeping first, then
+    // — if the dir is present without a valid `.git` — force-remove any
+    // lingering registration and delete the dir so the `add` below starts
+    // from a clean slate. Both cleanups are best-effort: a `remove` that
+    // finds nothing registered is a harmless non-zero exit.
+    let _ = shelbi_ssh::run(host, ["git", "-C", &repo, "worktree", "prune"]);
+
+    let has_git = shelbi_ssh::run(host, ["test", "-d", &format!("{wt_str}/.git")])
+        .map_err(Error::Io)?
+        .status
+        .success()
         || shelbi_ssh::run(host, ["test", "-f", &format!("{wt_str}/.git")])
             .map_err(Error::Io)?
             .status
             .success();
+
+    if !has_git {
+        let dir_present = shelbi_ssh::run(host, ["test", "-d", &wt_str])
+            .map_err(Error::Io)?
+            .status
+            .success();
+        if dir_present {
+            let _ = shelbi_ssh::run(
+                host,
+                ["git", "-C", &repo, "worktree", "remove", "--force", &wt_str],
+            );
+            let _ = shelbi_ssh::run(host, ["rm", "-rf", &wt_str]);
+        }
+    }
+
+    let worktree_exists = has_git;
 
     let branch_exists = shelbi_ssh::run(
         host,
@@ -1668,11 +1700,29 @@ fn sync_worktree(
     }
 
     // Already exists — make sure it's clean and on the right branch.
+    // Carve out shelbi's own footprint: `.shelbi/` metadata and the
+    // `.claude/` deploy files (settings.json, agent-instructions.md,
+    // skills/, the review marker) we rewrite on every dispatch. A repo that
+    // commits `.claude/` would otherwise be permanently "dirty" after the
+    // first dispatch, so the second `task start` would bail here. (Mirrors
+    // the carve-out in `rebase_workspace_branch_onto_default` and
+    // review.rs's `preflight_workdir`.)
     let dirty = shelbi_ssh::run_capture(host, ["git", "-C", &wt_str, "status", "--porcelain"])?;
-    if !dirty.trim().is_empty() {
+    let user_dirty: Vec<&str> = dirty
+        .lines()
+        .filter(|l| {
+            let path = l.get(3..).unwrap_or("");
+            !(path.starts_with(".shelbi/")
+                || path == ".shelbi"
+                || path.starts_with(".claude/")
+                || path == ".claude")
+        })
+        .collect();
+    if !user_dirty.is_empty() {
         return Err(Error::Other(format!(
             "workspace worktree at {wt_str} has uncommitted changes — \
-             commit, stash, or discard before assigning a new task:\n{dirty}"
+             commit, stash, or discard before assigning a new task:\n{}",
+            user_dirty.join("\n")
         )));
     }
 
@@ -1682,6 +1732,18 @@ fn sync_worktree(
     )?;
     if current.trim() == branch {
         return Ok(());
+    }
+
+    // F14: the task's branch may still be checked out in *another*
+    // workspace's worktree on this machine (e.g. the task was re-dispatched
+    // to a different workspace). Git refuses to check out a branch that's
+    // live in another worktree, so `git checkout <branch>` below would die
+    // with `fatal: '<branch>' is already checked out`. Detach the branch
+    // from any other worktree first — the same release the review path runs.
+    // Safe here because we only reach this point when *this* worktree's HEAD
+    // is already off `branch`, so the release never touches it.
+    if branch_exists {
+        crate::review::release_branch_from_workspace_worktrees(host, project, machine, branch)?;
     }
 
     // Switch (and create the branch off default if it doesn't exist).
@@ -3312,5 +3374,190 @@ mod rebase_git_tests {
         );
         assert!(!skills.exists(), "intended skills dir not removed — wire: {wire}");
         let _ = std::fs::remove_dir_all(&root);
+    }
+}
+
+#[cfg(test)]
+mod sync_worktree_git_tests {
+    //! Real-git tests for [`sync_worktree`]'s recovery paths (F5 partial
+    //! worktree, F14 branch-checked-out-elsewhere). Each provisions a tiny
+    //! on-disk repo whose `work_dir` doubles as the main clone, then drives
+    //! `sync_worktree` against `Host::Local`. Skipped when `git` isn't on
+    //! PATH so a git-less sandbox still passes.
+    use super::*;
+    use shelbi_core::{
+        AgentRunnerSpec, MachineKind, OrchestratorSpec, WorkspaceSpec,
+    };
+    use std::collections::BTreeMap;
+
+    fn git_available() -> bool {
+        std::process::Command::new("git")
+            .arg("--version")
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false)
+    }
+
+    fn run_git_in(repo: &std::path::Path, args: &[&str]) -> std::process::Output {
+        let mut cmd = std::process::Command::new("git");
+        cmd.arg("-C").arg(repo);
+        for a in args {
+            cmd.arg(a);
+        }
+        cmd.env("GIT_AUTHOR_NAME", "Shelbi Test");
+        cmd.env("GIT_AUTHOR_EMAIL", "test@shelbi.local");
+        cmd.env("GIT_COMMITTER_NAME", "Shelbi Test");
+        cmd.env("GIT_COMMITTER_EMAIL", "test@shelbi.local");
+        cmd.output().expect("git command failed to spawn")
+    }
+
+    fn init_repo(label: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "shelbi-sync-{label}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos(),
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        assert!(run_git_in(&dir, &["init", "-q", "-b", "main"]).status.success());
+        std::fs::write(dir.join("README.md"), "# repo\n").unwrap();
+        assert!(run_git_in(&dir, &["add", "README.md"]).status.success());
+        assert!(run_git_in(&dir, &["commit", "-q", "-m", "initial"]).status.success());
+        dir
+    }
+
+    /// Project with two hub-local workspaces (`alice`, `bob`) whose worktrees
+    /// live under `<repo>/.shelbi/wt/`. `work_dir` is the repo itself.
+    fn project_at(repo: &std::path::Path) -> Project {
+        let mut runners = BTreeMap::new();
+        runners.insert(
+            "claude".to_string(),
+            AgentRunnerSpec { command: "claude".into(), flags: vec![] },
+        );
+        Project {
+            name: "sync-test".into(),
+            repo: repo.to_string_lossy().into(),
+            default_branch: "main".into(),
+            config_mode: None,
+            machines: vec![Machine {
+                name: "hub".into(),
+                kind: MachineKind::Local,
+                work_dir: repo.to_path_buf(),
+                host: None,
+            }],
+            orchestrator: OrchestratorSpec { runner: "claude".into() },
+            agent_runners: runners,
+            editor: None,
+            github_url: None,
+            workspaces: vec![
+                WorkspaceSpec { name: "alice".into(), machine: "hub".into(), runner: "claude".into() },
+                WorkspaceSpec { name: "bob".into(), machine: "hub".into(), runner: "claude".into() },
+            ],
+            workspace_poll_interval_secs: 5,
+            workspace_permissions_mode: "auto".into(),
+            workspace_settings_template: None,
+            zen: shelbi_core::ZenConfig::default(),
+            heartbeat: shelbi_core::HeartbeatConfig::default(),
+            git: shelbi_core::GitConfig::default(),
+            contextstore_sync: Vec::new(),
+            detected_shapes: Vec::new(),
+        }
+    }
+
+    fn head_of(wt: &std::path::Path) -> String {
+        let out = run_git_in(wt, &["rev-parse", "--abbrev-ref", "HEAD"]);
+        assert!(out.status.success());
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
+    #[test]
+    fn recovers_from_a_partial_worktree_dir() {
+        // F5: dir exists without a valid `.git` (dispatch killed mid-add).
+        // sync_worktree must prune/remove it and add a fresh worktree rather
+        // than aborting with "already exists".
+        if !git_available() {
+            eprintln!("skipping: git not on PATH");
+            return;
+        }
+        let repo = init_repo("partial");
+        let project = project_at(&repo);
+        let machine = project.machines[0].clone();
+        let wt = workspace_worktree(&machine, &project.workspaces[0]);
+
+        // Leave a half-created worktree dir behind (present, no `.git`).
+        std::fs::create_dir_all(&wt).unwrap();
+        std::fs::write(wt.join("stray.txt"), "leftover\n").unwrap();
+        assert!(!wt.join(".git").exists());
+
+        sync_worktree(&project, &Host::Local, &machine, &wt, "shelbi/x", "main").unwrap();
+
+        assert!(wt.join(".git").exists(), "a valid worktree must now exist");
+        assert_eq!(head_of(&wt), "shelbi/x");
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    #[test]
+    fn releases_branch_checked_out_in_another_worktree() {
+        // F14: the requested branch is already checked out in `alice`'s
+        // worktree. Dispatching it to `bob` must detach it from `alice`
+        // first instead of dying on "already checked out".
+        if !git_available() {
+            eprintln!("skipping: git not on PATH");
+            return;
+        }
+        let repo = init_repo("release");
+        let project = project_at(&repo);
+        let machine = project.machines[0].clone();
+        assert!(run_git_in(&repo, &["branch", "shelbi/x", "main"]).status.success());
+
+        // alice takes shelbi/x first.
+        let alice_wt = workspace_worktree(&machine, &project.workspaces[0]);
+        sync_worktree(&project, &Host::Local, &machine, &alice_wt, "shelbi/x", "main").unwrap();
+        assert_eq!(head_of(&alice_wt), "shelbi/x");
+
+        // bob is created on its own branch, then re-dispatched onto shelbi/x
+        // (which is still live in alice's worktree).
+        let bob_wt = workspace_worktree(&machine, &project.workspaces[1]);
+        sync_worktree(&project, &Host::Local, &machine, &bob_wt, "shelbi/bobinit", "main").unwrap();
+        sync_worktree(&project, &Host::Local, &machine, &bob_wt, "shelbi/x", "main").unwrap();
+
+        assert_eq!(head_of(&bob_wt), "shelbi/x", "bob must claim the branch");
+        // alice was released (detached) so the branch was free to move.
+        assert_ne!(head_of(&alice_wt), "shelbi/x", "alice must have been detached");
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    #[test]
+    fn dirty_check_carves_out_shelbi_and_claude_footprint() {
+        // F7: shelbi's own `.claude/` (and `.shelbi/`) deploy footprint must
+        // not trip the uncommitted-changes gate on the second dispatch.
+        if !git_available() {
+            eprintln!("skipping: git not on PATH");
+            return;
+        }
+        let repo = init_repo("carveout");
+        let project = project_at(&repo);
+        let machine = project.machines[0].clone();
+        let wt = workspace_worktree(&machine, &project.workspaces[0]);
+
+        sync_worktree(&project, &Host::Local, &machine, &wt, "shelbi/x", "main").unwrap();
+
+        // Simulate shelbi's deploy footprint dirtying the worktree.
+        std::fs::create_dir_all(wt.join(".claude/skills")).unwrap();
+        std::fs::write(wt.join(".claude/settings.json"), "{}\n").unwrap();
+        std::fs::create_dir_all(wt.join(".shelbi")).unwrap();
+        std::fs::write(wt.join(".shelbi/note"), "x\n").unwrap();
+
+        // A second dispatch (switching branch) must not bail on the footprint.
+        sync_worktree(&project, &Host::Local, &machine, &wt, "shelbi/y", "main").unwrap();
+        assert_eq!(head_of(&wt), "shelbi/y");
+
+        // But a genuine user change still blocks.
+        std::fs::write(wt.join("user.txt"), "real work\n").unwrap();
+        let err = sync_worktree(&project, &Host::Local, &machine, &wt, "shelbi/x", "main");
+        assert!(err.is_err(), "user-authored change must still block the switch");
+        let _ = std::fs::remove_dir_all(&repo);
     }
 }

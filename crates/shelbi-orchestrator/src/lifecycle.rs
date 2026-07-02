@@ -161,9 +161,13 @@ pub fn ensure_branch_for_in_progress(project: &Project, task_id: &str) -> Result
     let base = resolve_base_branch(project, &tf.task, &all_tasks)?;
     cut_branch_on_hub(project, &branch, &base)?;
     if tf.task.branch.as_deref() != Some(branch.as_str()) {
-        tf.task.branch = Some(branch);
-        tf.task.updated_at = chrono::Utc::now();
-        shelbi_state::save_task(&project.name, &tf.task, &tf.body)?;
+        // Targeted, locked set-branch instead of writing the whole task back
+        // from a stale read: a concurrent writer that touched another field
+        // between our `load_task` and here would otherwise be clobbered
+        // (lost update on `updated_at`/column/priority). Reload afterward so
+        // the returned `TaskFile` reflects what actually landed on disk.
+        shelbi_state::set_task_branch(&project.name, task_id, &branch)?;
+        tf = shelbi_state::load_task(&project.name, task_id)?;
     }
     Ok(tf)
 }
