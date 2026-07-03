@@ -31,21 +31,40 @@ Workflow files live at
 
 ## Schema
 
+A workflow is split across **two files**. Status *identity* — the stable
+`id`, the display `name`, and the `category` — is declared once in
+`workflows/statuses.yml`, the project-wide status catalog. Each workflow
+file then **references** statuses by `id` and adds only what's
+workflow-specific: the `owner`, and an optional `agent:`.
+
+```yaml
+# ~/.shelbi/projects/<project>/workflows/statuses.yml
+# The status catalog: identity lives here, once, shared by every workflow.
+statuses:
+  - { id: backlog,     name: Backlog,     category: backlog }
+  - { id: todo,        name: Todo,        category: ready }
+  - { id: in-progress, name: In Progress, category: active }
+  - { id: review,      name: Review,      category: handoff }
+  - { id: done,        name: Done,        category: done }
+```
+
 ```yaml
 # ~/.shelbi/projects/<project>/workflows/default.yaml
 name: default
 description: The standard one-track flow shipped with every project.
 
+# Reference statuses by id. name/category come from statuses.yml and are
+# never repeated here — a workflow file adds only owner (+ optional agent).
 statuses:
-  - { name: Backlog,    category: backlog, owner: user  }
-  - { name: Todo,       category: ready,   owner: agent }
-  - { name: InProgress, category: active,  owner: agent }
-  - { name: Review,     category: handoff, owner: user  }
-  - { name: Done,       category: done,    owner: user  }
+  - { id: backlog,     owner: user,  agent: orchestrator }
+  - { id: todo,        owner: agent, agent: orchestrator }
+  - { id: in-progress, owner: agent, agent: developer }
+  - { id: review,      owner: user,  agent: orchestrator }
+  - { id: done,        owner: user }
 
 # Optional. Which status a new task lands in. Defaults to the first
 # entry in `statuses:` above.
-# initial_status: Backlog
+# initial_status: backlog
 
 # Optional. Per-workflow override of the project-level `git:` block in
 # project.yaml. Most workflows omit it and inherit base_branch/merge_strategy
@@ -59,22 +78,30 @@ statuses:
 # actions — pure status moves. Transitions are any-to-any: this block
 # does NOT restrict which moves are legal.
 # transitions:
-#   - from: InProgress
-#     to: Review
+#   - from: in-progress
+#     to: review
 #     actions: [push_branch, open_pr]
-#   - from: Review
-#     to: Done
+#   - from: review
+#     to: done
 #     actions: [merge, delete_branch]
 ```
+
+Why two files? A status's identity is project-wide, but its automation
+differs per workflow — the same `review` status can be owned by a human in
+one workflow and handled by a `qa` agent in another. Declaring `name` and
+`category` once in `statuses.yml` keeps those facts from drifting between
+workflow files; the loader **rejects** a workflow that repeats `name:` or
+`category:` inline, or that references an `id` the catalog doesn't declare.
 
 The required fields are `name` and `statuses` (at least one). Everything
 else is optional. A workflow without `transitions:` is a pure
 bookkeeping workflow — no git side-effects fire on any move.
 
-Validation runs at load time and catches duplicate status names,
-`initial_status` pointing at nothing, transition edges referencing
-undeclared statuses, and the [`owner`/`agent` rules](#validation-rules)
-covered below. The error message names the workflow and the bad field.
+Validation runs at load time and catches status ids not declared in
+`statuses.yml`, duplicate status ids, `initial_status` pointing at
+nothing, transition edges referencing undeclared statuses, and the
+[`owner`/`agent` rules](#validation-rules) covered below. The error
+message names the workflow and the bad field.
 
 ## Status categories
 
@@ -116,12 +143,13 @@ Each status declares two things about who handles it — one required, one
 optional:
 
 ```yaml
+# workflow file — reference-only; name/category come from statuses.yml
 statuses:
-  - { name: Todo,       category: ready,   owner: agent                   }
-  - { name: InProgress, category: active,  owner: agent                   }
-  - { name: Review,     category: handoff, owner: agent, agent: qa        }
-  - { name: Signoff,    category: handoff, owner: user                    }
-  - { name: Done,       category: done,    owner: user                    }
+  - { id: todo,        owner: agent, agent: orchestrator }
+  - { id: in-progress, owner: agent, agent: developer }
+  - { id: review,      owner: agent, agent: qa }
+  - { id: signoff,     owner: user }
+  - { id: done,        owner: user }
 ```
 
 **`owner: user | agent`** — *who* the next mover is:
@@ -139,7 +167,8 @@ task by hand, reassign it through the normal CLI/TUI; that's an action, not
 a schema field.
 
 **`agent: <agent-name>`** — *which* [agent](/docs/concepts/agents) role does
-the work, when `owner: agent`. Omit it and the `developer` agent runs. Name
+the work, when `owner: agent`. Omit it and Shelbi derives a default from the
+category (`developer` for `active`, `orchestrator` for `ready`). Name
 one — `qa`, `security-review`, or any agent you've authored — and the
 orchestrator loads *that* role into the workspace it dispatches to. The
 `Review` status above is auto-handled by the `qa` agent before any human is
@@ -148,22 +177,26 @@ instead of a paragraph of orchestrator prompt.
 
 ### Validation rules
 
-The loader enforces four rules on the `owner`/`agent` pair, failing the
-load with a message that names the workflow and status:
+The loader enforces these rules, failing the load with a message that
+names the workflow and status:
 
-1. **`owner` is `user` or `agent`.** No other value parses, and a missing
+1. **Every `id` must be declared in `statuses.yml`.** A workflow
+   references statuses by id; an id the catalog doesn't know about (a typo,
+   a status you forgot to add) fails the load, and the error lists the
+   available ids. Repeating an inline `name:` or `category:` in a workflow
+   file is rejected too — identity lives in the catalog, so the two files
+   can't drift.
+2. **`owner` is `user` or `agent`.** No other value parses, and a missing
    `owner` is an error too — there's no implicit default.
-2. **`agent:` requires `owner: agent`.** Naming an agent on a
-   `user`-owned status is a contradiction (a human is the mover, not an
-   agent) and is rejected.
-3. **A named `agent:` must exist.** The value has to match an agent
-   directory under `agents/` (see
-   [Agents](/docs/concepts/agents#where-agents-live-on-disk)). A typo fails
-   the load and the error lists the known agent names.
-4. **`agent: orchestrator` is not allowed**, and an `agent`-owned status
-   with `agent:` omitted defaults to `developer`. The orchestrator runs in
-   window 1, never inside a workspace, so it can't be the agent for a
-   workspace-dispatched status; the default workspace agent is `developer`.
+3. **An `agent`-owned status must name its `agent:`.** For the `ready` and
+   `active` categories a bare `owner: agent` is accepted and defaults to
+   `orchestrator` / `developer` (with a deprecation warning); any other
+   category with `owner: agent` and no `agent:` fails the load.
+4. **A `user`-owned status may still name an `agent:`.** That declares
+   "under [Zen Mode](/docs/concepts/zen-mode) this agent may act without
+   me" — it's how the shipped default lets the orchestrator handle
+   `Backlog` and `Review` under automation. Terminal statuses (`Done`,
+   `Canceled`) simply omit it — no automation path at all.
 
 ### Zen as declarative data
 
@@ -217,12 +250,12 @@ The canonical default workflow's transitions, written out:
 
 ```yaml
 transitions:
-  - from: InProgress
-    to: Review
+  - from: in-progress
+    to: review
     actions: [push_branch, open_pr]
 
-  - from: Review
-    to: Done
+  - from: review
+    to: done
     actions: [merge, delete_branch]
 ```
 
@@ -233,13 +266,13 @@ Each transition may declare a `target:` field that overrides where
 
 ```yaml
 transitions:
-  - from: InProgress
-    to: Review
+  - from: in-progress
+    to: review
     target: develop                # merge feature work into develop here
     actions: [push_branch, merge]
 
-  - from: Review
-    to: Done
+  - from: review
+    to: done
     # no target → uses the workflow's base_branch (e.g., main)
     actions: [open_pr, merge]
 ```
@@ -311,17 +344,17 @@ git:
   merge_strategy: squash
 
 statuses:
-  - { name: Todo,       category: ready,   owner: agent }
-  - { name: InProgress, category: active,  owner: agent }
-  - { name: Review,     category: handoff, owner: user  }
-  - { name: Done,       category: done,    owner: user  }
+  - { id: todo,        owner: agent, agent: orchestrator }
+  - { id: in-progress, owner: agent, agent: developer }
+  - { id: review,      owner: user }
+  - { id: done,        owner: user }
 
 transitions:
-  - from: InProgress
-    to: Review
+  - from: in-progress
+    to: review
     actions: [push_branch]             # push so reviewers can see; no PR
-  - from: Review
-    to: Done
+  - from: review
+    to: done
     actions: [merge, delete_branch]    # merge into feature/{{feature}}
 ```
 
@@ -442,20 +475,21 @@ want).
 Every new project ships with `workflows/default.yaml`:
 
 ```yaml
+# workflows/default.yaml — references statuses.yml (see Schema above)
 name: default
 description: The standard one-track flow shipped with every project.
 
 statuses:
-  - { name: Backlog,    category: backlog, owner: user  }
-  - { name: Todo,       category: ready,   owner: agent }
-  - { name: InProgress, category: active,  owner: agent }
-  - { name: Review,     category: handoff, owner: user  }
-  - { name: Done,       category: done,    owner: user  }
+  - { id: backlog,     owner: user,  agent: orchestrator }
+  - { id: todo,        owner: agent, agent: orchestrator }
+  - { id: in-progress, owner: agent, agent: developer }
+  - { id: review,      owner: user,  agent: orchestrator }
+  - { id: done,        owner: user }
 ```
 
 This makes the default an editable file rather than implicit behavior
-— you can rename `Todo` to `Ready` without breaking anything, since
-the rest of the system reasons in categories.
+— you can rename `Todo` to `Ready` in `statuses.yml` without breaking
+anything, since the rest of the system reasons in categories.
 
 If a project has no `workflows/` directory at all (legacy state),
 shelbi auto-generates `default.yaml` on first load. Existing task files
@@ -551,17 +585,17 @@ git:
   base_branch: feature/{{feature}}     # supplied per task
 
 statuses:
-  - { name: Todo,       category: ready,   owner: agent }
-  - { name: InProgress, category: active,  owner: agent }
-  - { name: Review,     category: handoff, owner: user  }
-  - { name: Done,       category: done,    owner: user  }
+  - { id: todo,        owner: agent, agent: orchestrator }
+  - { id: in-progress, owner: agent, agent: developer }
+  - { id: review,      owner: user }
+  - { id: done,        owner: user }
 
 transitions:
-  - from: InProgress
-    to: Review
+  - from: in-progress
+    to: review
     actions: [push_branch]             # push so reviewers see it; no PR
-  - from: Review
-    to: Done
+  - from: review
+    to: done
     actions: [merge, delete_branch]    # squash into feature/{{feature}}
 ```
 
@@ -575,17 +609,17 @@ description: Ship a long-lived feature branch into main.
 # no git: block needed.
 
 statuses:
-  - { name: Todo,       category: ready,   owner: agent }
-  - { name: InProgress, category: active,  owner: agent }
-  - { name: Review,     category: handoff, owner: user  }
-  - { name: Done,       category: done,    owner: user  }
+  - { id: todo,        owner: agent, agent: orchestrator }
+  - { id: in-progress, owner: agent, agent: developer }
+  - { id: review,      owner: user }
+  - { id: done,        owner: user }
 
 transitions:
-  - from: InProgress
-    to: Review
+  - from: in-progress
+    to: review
     actions: [push_branch, open_pr]    # PR the existing feature branch
-  - from: Review
-    to: Done
+  - from: review
+    to: done
     actions: [merge, delete_branch]    # squash into main, delete branch
 ```
 

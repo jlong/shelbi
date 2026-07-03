@@ -20,10 +20,13 @@ needs to route and merge the way the model expects.
 
 Three layers do the work, and every guide fills in the same three:
 
-- **Statuses** — the columns on the board. Each declares a
-  [category](/docs/concepts/workflows#status-categories) (`backlog`,
-  `ready`, `active`, `handoff`, `done`) that generic code reasons in, an
-  `owner` (`user` or `agent`), and an optional `agent:` role.
+- **Statuses** — the columns on the board. Their identity (`id`, `name`,
+  and [`category`](/docs/concepts/workflows#status-categories) — one of
+  `backlog`, `ready`, `active`, `handoff`, `done`, `archived`) is declared
+  once in the project's status catalog, `workflows/statuses.yml`. A
+  workflow file then **references** each status by `id` and adds only what's
+  workflow-specific: an `owner` (`user` or `agent`) and an optional
+  `agent:` role.
 - **Transitions** — the git side-effects (`push_branch`, `open_pr`,
   `merge`, `close_pr`, `delete_branch`, `restack`) that fire when a task
   crosses an edge. This is where a branching model actually lives: *what*
@@ -31,6 +34,19 @@ Three layers do the work, and every guide fills in the same three:
 - **Orchestrator prompt** — the [routing and merge judgment](/docs/getting-started/custom-workflow)
   that isn't structural enough to be YAML. Which branch a task targets,
   when auto-merge is allowed, how contributions get triaged.
+
+<Callout type="note" title="Statuses are defined once, referenced by id">
+
+Every guide below shows two YAML shapes. Status *identity* — `id`, `name`,
+and `category` — is declared once in `workflows/statuses.yml`, the
+project-wide status catalog. Each workflow file **references** statuses by
+`id` and adds only its `owner` and optional `agent:`; it never repeats
+`name:` or `category:` (the loader rejects a workflow that does). See
+[Workflows → Schema](/docs/concepts/workflows#schema) for the full rule.
+When a guide introduces a status the shipped defaults don't have, it adds
+that status to `statuses.yml` first, then references it.
+
+</Callout>
 
 ## The models
 

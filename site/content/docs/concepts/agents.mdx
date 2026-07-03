@@ -129,16 +129,17 @@ You rarely assign an agent to a task directly. Instead, a
 [workflow](/docs/concepts/workflows#owners-and-agents) status declares who owns it:
 
 ```yaml
+# workflow file — reference-only; name/category live in statuses.yml
 statuses:
-  - { name: Todo,       category: ready,   owner: agent                  }
-  - { name: InProgress, category: active,  owner: agent                  }
-  - { name: Review,     category: handoff, owner: agent, agent: qa       }
-  - { name: Done,       category: done,    owner: user                   }
+  - { id: todo,        owner: agent, agent: orchestrator }
+  - { id: in-progress, owner: agent, agent: developer }
+  - { id: review,      owner: agent, agent: qa }
+  - { id: done,        owner: user }
 ```
 
 `owner: agent` makes a status the orchestrator's to act on; the optional
 `agent:` field names *which* agent does it. Omit `agent:` and the
-`developer` agent is used. The `Review` status above is auto-reviewed by a
+`developer` agent is used. The `review` status above is auto-reviewed by a
 `qa` agent you've authored before a human ever sees it — that's the whole "a
 reviewer is a role you can drop on a status" idea, expressed declaratively. See
 [owners](/docs/concepts/workflows#owners-and-agents) for the rules.
