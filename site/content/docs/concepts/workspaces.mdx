@@ -71,6 +71,12 @@ The wizard sizes the pool from total RAM (~10 GB per local workspace, ~12 GB
 when spread across machines, clamped to `[1, 16]`). Add or remove workspaces
 later by editing the YAML and running `shelbi reload`.
 
+A slot can also be marked `role: review` — a scarce
+[review workspace](/docs/concepts/review-workspaces) that loads a finished
+branch and boots its dev server for a human to click through, rather than
+picking up development work. Everything on this page applies to it too; the
+role just changes what gets dispatched there.
+
 ## The sidebar: grouped by machine
 
 Workspaces render in the sidebar grouped under the machine they're pinned to,
@@ -122,8 +128,14 @@ The hub polls each workspace's tmux pane title every few seconds (see
 | `⏵`   | `working`          | agent is mid-turn — actively typing, calling tools, running shells.      |
 | `💬`  | `awaiting_input`   | agent finished a turn and is sitting at the prompt.                      |
 | `⚠`   | `blocked`          | agent paused on a permission dialog or other interactive gate.           |
-| `✓`   | `awaiting_review`  | workspace wrote the review-ready marker; its task moved to review.       |
 | `·`   | (no in-flight task) | the slot is idle and ready to be assigned.                              |
+
+A workspace that *finishes* a task doesn't get its own "done" badge. The
+moment it writes the review-ready marker and the poller promotes the task,
+the workspace **closes its session and returns to idle** (see
+[How a task completes](#how-a-task-completes)). Completion shows up in the
+sidebar's *Ready for Review* section — never as a lingering check on the
+workspace row.
 
 `awaiting_input` is the right state for "agent done with this turn, waiting
 for the next prompt" — it's what fires when claude's Stop hook runs at end of
@@ -188,6 +200,12 @@ The workspace never runs `shelbi` itself. The marker file is the *entire*
 on-workspace protocol. This is what makes a remote workspace possible with
 nothing installed but `tmux`, `git`, and the agent CLI.
 
+Once the task is safely promoted, the finishing dev workspace **closes its
+own session** and frees its slot for the next task — no lingering "done"
+pane. If the project declares [review workspaces](/docs/concepts/review-workspaces),
+the orchestrator then loads the promoted branch onto one so a human can *run*
+the change, not just read the diff.
+
 ## Local vs. remote workspaces
 
 A workspace's pane lives in different places depending on its machine:
@@ -210,6 +228,8 @@ you can `tmux ls` on the remote to inspect.
 
 ## See also
 
+- [Review workspaces](/docs/concepts/review-workspaces) — the `role: review`
+  variant that loads and *serves* a finished branch for human review.
 - [Agents](/docs/concepts/agents) — the role that runs *inside* a
   workspace, and the role/slot split.
 - [Workflows](/docs/concepts/workflows#lifecycle-who-moves-a-task-between-the-default-statuses)

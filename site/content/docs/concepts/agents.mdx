@@ -1,7 +1,7 @@
 ---
 title: Agents
 order: 11
-summary: An agent is a role — a system prompt plus a skill set — not the task it's handed or the slot it runs in. Shelbi ships four (orchestrator, developer, QA, security review); each is a directory you can edit per project.
+summary: An agent is a role — a system prompt plus a skill set — not the task it's handed or the slot it runs in. Shelbi ships five (orchestrator, developer, QA, security review, review); each is a directory you can edit per project.
 ---
 
 An **agent** is a *role*: a system prompt plus a set of skills. It is the
@@ -21,11 +21,11 @@ on one task and a QA agent on the next, and what lets a
 [workflow](/docs/concepts/workflows#owners-and-agents) say "this status is reviewed by
 the security agent" as a line of YAML rather than a paragraph of prompt prose.
 
-## The four shipped agents
+## The five shipped agents
 
-Every project ships with four agents out of the box. They cover the full
-loop — schedule, build, check, sign off — and they're the defaults the
-generic machinery wires up unless you say otherwise.
+Every project ships with five agents out of the box. They cover the full
+loop — schedule, build, check, sign off, serve for a human — and they're the
+defaults the generic machinery wires up unless you say otherwise.
 
 | Agent | Role |
 | --- | --- |
@@ -33,9 +33,11 @@ generic machinery wires up unless you say otherwise.
 | `developer` | The default workspace agent. Implements a task on its branch, runs the project's checks, writes the review-ready marker. This is the agent an `agent`-owned status uses when no other is named. |
 | `qa` | A reviewer role. Exercises a finished branch against acceptance criteria before it reaches a human — useful as the agent on a `handoff`-category status. |
 | `security-review` | A focused reviewer for sensitive diffs — auth, migrations, install scripts. Pair it with a status (or a danger-path-heavy workflow) where an extra adversarial pass is worth the latency. |
+| `review` | The agent that runs on a [review workspace](/docs/concepts/review-workspaces). It loads a finished branch and *serves* it — installs deps, builds, boots the dev server — then hands a human a working URL. It doesn't write code (bar an explicitly requested tweak). |
 
-`developer` is the one that runs most often. The other three are the seams
-where you customize the loop: who schedules, who reviews, who signs off.
+`developer` is the one that runs most often. The others are the seams where
+you customize the loop: who schedules, who reviews, who signs off, and who
+serves the change for a human to click through.
 
 ## Where agents live on disk
 
@@ -52,8 +54,11 @@ An agent is a directory under the project's Shelbi config:
 │   └── skills/              # agent-scoped skills (optional)
 ├── qa/
 │   └── instructions.md
-└── security-review/
-    └── instructions.md
+├── security-review/
+│   └── instructions.md
+└── review/
+    ├── instructions.md      # the Review agent's system prompt
+    └── skills/              # ships a `load-run-detection` skill
 ```
 
 Each agent has at minimum an `instructions.md` — its system prompt. It may
