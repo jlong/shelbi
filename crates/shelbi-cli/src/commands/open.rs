@@ -26,9 +26,10 @@ pub fn run(
     name: String,
     as_pane: bool,
     as_server_pane: bool,
+    resume: bool,
 ) -> Result<()> {
     let project = require_project(project_opt)?;
-    open(&project, &name, as_pane, as_server_pane)
+    open(&project, &name, as_pane, as_server_pane, resume)
 }
 
 /// Top-level dispatcher for `shelbi open <name> [--as-pane]`.
@@ -42,7 +43,13 @@ pub fn run(
 /// install signal handlers, and stay alive until the agent exits or a
 /// signal arrives, then write the lifecycle event and (on clean exit)
 /// prompt the user before tearing down so final output stays visible.
-fn open(project: &str, name: &str, as_pane: bool, as_server_pane: bool) -> Result<()> {
+fn open(
+    project: &str,
+    name: &str,
+    as_pane: bool,
+    as_server_pane: bool,
+    resume: bool,
+) -> Result<()> {
     let p = shelbi_state::load_project(project).map_err(|e| anyhow!(e))?;
     let workspace = p
         .workspace(name)
@@ -89,8 +96,10 @@ fn open(project: &str, name: &str, as_pane: bool, as_server_pane: bool) -> Resul
                  (workspace `{name}` lives on a remote machine)"
             );
         }
-        return pane::run(&p, &workspace, &machine);
+        return pane::run(&p, &workspace, &machine, resume);
     }
+    // `resume` only applies to the pane-wrapper path (it selects `--continue`);
+    // a plain focus-or-create is the sidebar click and never resumes.
     focus_or_create(&p, &workspace, &host)
 }
 

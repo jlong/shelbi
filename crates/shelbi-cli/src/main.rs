@@ -138,6 +138,12 @@ enum Cmd {
         /// `server_alive=false` event on any exit path. Not for direct use.
         #[arg(long, hide = true, conflicts_with = "as_pane")]
         as_server_pane: bool,
+        /// Internal re-entry flag set by `shelbi task resume`. When set
+        /// alongside `--as-pane`, the wrapper launches a claude runner with
+        /// `--continue` so the pane reloads its prior conversation instead of
+        /// starting cold. Not for direct use.
+        #[arg(long, hide = true)]
+        resume: bool,
     },
     /// Manage the project's Kanban task board.
     Task {
@@ -323,7 +329,8 @@ fn main() -> Result<()> {
             name,
             as_pane,
             as_server_pane,
-        }) => commands::open::run(cli.project, name, as_pane, as_server_pane),
+            resume,
+        }) => commands::open::run(cli.project, name, as_pane, as_server_pane, resume),
         Some(Cmd::Task { cmd }) => commands::task::run(cli.project, cmd),
         Some(Cmd::Workspace { cmd }) => commands::workspace::run(cli.project, cmd),
         Some(Cmd::Worker { cmd }) => {
@@ -579,6 +586,7 @@ mod cli_tests {
                 ref name,
                 as_pane,
                 as_server_pane,
+                ..
             }) if name == "alpha" && !as_pane && !as_server_pane => {}
             other => panic!("expected Open {{ alpha, as_pane=false }}, got {other:?}"),
         }
@@ -589,6 +597,7 @@ mod cli_tests {
                 ref name,
                 as_pane,
                 as_server_pane,
+                ..
             }) if name == "delta" && as_pane && !as_server_pane => {}
             other => panic!("expected Open {{ delta, as_pane=true }}, got {other:?}"),
         }
@@ -601,8 +610,22 @@ mod cli_tests {
                 ref name,
                 as_pane,
                 as_server_pane,
+                ..
             }) if name == "review-1" && !as_pane && as_server_pane => {}
             other => panic!("expected Open {{ review-1, as_server_pane=true }}, got {other:?}"),
+        }
+
+        // `shelbi task resume` re-enters the wrapper with `--as-pane --resume`;
+        // both flags parse together so the wrapper can select `--continue`.
+        let resumed = Cli::parse_from(["shelbi", "open", "alpha", "--as-pane", "--resume"]);
+        match resumed.cmd {
+            Some(Cmd::Open {
+                ref name,
+                as_pane,
+                resume,
+                ..
+            }) if name == "alpha" && as_pane && resume => {}
+            other => panic!("expected Open {{ alpha, as_pane, resume }}, got {other:?}"),
         }
     }
 

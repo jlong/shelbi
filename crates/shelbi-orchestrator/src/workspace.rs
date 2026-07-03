@@ -731,6 +731,116 @@ pub fn start_workspace_on_task(spec: StartSpec<'_>) -> Result<TmuxAddr> {
         task_id: spec.task_id,
         agent: spec.agent,
         port: None,
+        resume: false,
+        prompt: &prompt,
+    })?;
+
+    Ok(addr)
+}
+
+/// Relaunch a workspace on the task it is ALREADY working, without discarding
+/// the in-flight worktree — the recovery sibling of [`start_workspace_on_task`]
+/// (`shelbi task resume`). Where `start` clears context (kills the pane and
+/// re-checks-out a clean branch, right for a fresh dispatch), `resume` is for a
+/// stalled or killed worker: the tmux session was killed, the pane wedged, or
+/// the agent stopped mid-task, and we want it going again on the SAME task with
+/// its work intact.
+///
+/// The differences from the dev-start path, all in service of "don't lose the
+/// in-flight state":
+///
+/// - **Worktree preserved as-is.** [`sync_worktree_for_resume`] never bails on
+///   a dirty worktree and never resets or re-checks-out the branch — the
+///   branch, its commits, and any uncommitted changes stay exactly where the
+///   worker left them. It only *recreates* the worktree when it's missing
+///   entirely (e.g. a prior teardown removed it), checking out the existing
+///   task branch.
+/// - **Conversation resumed when the runner supports it.** For a claude runner
+///   the pane relaunches with `--continue` (`resume: true` below → the pane
+///   wrapper / remote launch add the flag), so the worker picks up its prior
+///   conversation with full context rather than reading its own code cold. For
+///   every other runner we fall back to re-injecting the task prompt — the
+///   agent continues by reading the work already in its worktree.
+///
+/// The pane is still recreated (that's how a killed/wedged session is
+/// reclaimed — the `duplicate session` case is handled by
+/// [`kill_workspace_pane`] inside `deploy_and_spawn`, which tears down any
+/// stale pane before the fresh one comes up), and the dispatch is still
+/// serialized against concurrent starts for the same workspace.
+pub fn resume_workspace_on_task(spec: StartSpec<'_>) -> Result<TmuxAddr> {
+    let machine = spec
+        .project
+        .machine(&spec.workspace.machine)
+        .ok_or_else(|| Error::UnknownMachine(spec.workspace.machine.clone()))?
+        .clone();
+    let runner = spec
+        .project
+        .runner(&spec.workspace.runner)
+        .ok_or_else(|| Error::UnknownRunner(spec.workspace.runner.clone()))?
+        .clone();
+
+    let host = machine.host();
+    let worktree = workspace_worktree(&machine, spec.workspace);
+    let addr = workspace_tmux_addr(spec.project, spec.workspace)?;
+
+    // Serialize against any concurrent start/resume for the same workspace —
+    // same rationale as the dev path. Held until this function returns.
+    let _dispatch_lock = shelbi_state::lock_workspace(&spec.project.name, &spec.workspace.name)?;
+
+    require_auto_mode_supported(&host, &runner, &spec.project.workspace_permissions_mode)?;
+
+    // Clear any stale review marker before we relaunch so the poller can't read
+    // an old task id and misfire. A task being resumed is in `in_progress`, so
+    // any marker present is stale. Best-effort.
+    let marker = workspace_review_marker(&machine, spec.workspace);
+    let _ = clear_review_marker(&host, &marker);
+
+    // Preserve the worktree: don't reset the branch, don't bail on a dirty
+    // tree. Only recreate the worktree if it's gone entirely. A failure here
+    // aborts before any pane is touched — surface it in events.log so the stall
+    // is visible to `shelbi events tail` and the orchestrator, not just the CLI.
+    if let Err(e) = sync_worktree_for_resume(
+        &host,
+        &machine,
+        &worktree,
+        spec.branch,
+        spec.project.base_branch(),
+    ) {
+        if let Err(log_err) = shelbi_state::append_dispatch_event(
+            spec.task_id,
+            &spec.workspace.name,
+            "resume-sync-failed",
+            &e.to_string(),
+        ) {
+            eprintln!("shelbi: failed to record resume sync failure in events.log: {log_err}");
+        }
+        return Err(e);
+    }
+
+    // Prefer true conversation-resume for claude; every other runner falls back
+    // to plain prompt re-injection (the agent reads its own prior work).
+    let resume = shelbi_agent::is_claude_runner(&runner.command);
+    let prompt = compose_resume_prompt(
+        spec.task_id,
+        spec.branch,
+        spec.task_body,
+        &marker,
+        &spec.project.default_branch,
+        &spec.project.name,
+        shelbi_agent::polls_for_messages(&runner),
+        resume,
+    );
+    deploy_and_spawn(SpawnArgs {
+        project: spec.project,
+        workspace: spec.workspace,
+        runner: &runner,
+        host: &host,
+        worktree: &worktree,
+        addr: &addr,
+        task_id: spec.task_id,
+        agent: spec.agent,
+        port: None,
+        resume,
         prompt: &prompt,
     })?;
 
@@ -828,6 +938,7 @@ pub fn load_review_workspace(spec: StartSpec<'_>) -> Result<TmuxAddr> {
         task_id: spec.task_id,
         agent,
         port,
+        resume: false,
         prompt: &prompt,
     })?;
 
@@ -852,6 +963,11 @@ struct SpawnArgs<'a> {
     agent: Option<&'a str>,
     /// Injected as `PORT` into the pane env when `Some` (review workspaces).
     port: Option<u16>,
+    /// `true` for a `shelbi task resume`: the pane is relaunched WITHOUT
+    /// clearing the worktree, and a claude runner reloads its prior
+    /// conversation via `--continue`. `false` for a normal (context-clearing)
+    /// dispatch.
+    resume: bool,
     prompt: &'a str,
 }
 
@@ -920,8 +1036,14 @@ fn deploy_and_spawn(a: SpawnArgs<'_>) -> Result<()> {
     match a.host {
         Host::Local => {
             let shelbi_bin = current_exe_string()?;
+            // A resume re-enters the wrapper with `--resume` so it launches the
+            // runner with `--continue` (claude) instead of a cold start — the
+            // wrapper builds its launch command through the same
+            // `workspace_launch_command` this path's remote arm calls, so the
+            // resume flag has to reach it there too.
+            let resume_flag = if a.resume { " --resume" } else { "" };
             let pane_cmd = format!(
-                "{bin} --project {proj} open {ws} --as-pane",
+                "{bin} --project {proj} open {ws} --as-pane{resume_flag}",
                 bin = shelbi_agent::shell_escape(&shelbi_bin),
                 proj = shelbi_agent::shell_escape(&a.project.name),
                 ws = shelbi_agent::shell_escape(&a.workspace.name),
@@ -953,6 +1075,7 @@ fn deploy_and_spawn(a: SpawnArgs<'_>) -> Result<()> {
                 a.runner,
                 &a.project.workspace_permissions_mode,
                 a.agent.is_some(),
+                a.resume,
             );
             let cd_launch =
                 remote_cd_launch(a.worktree, &launch, a.port, &a.workspace.name);
@@ -1853,10 +1976,16 @@ pub fn workspace_launch_command(
     runner: &shelbi_core::AgentRunnerSpec,
     permissions_mode: &str,
     include_agent_instructions: bool,
+    resume: bool,
 ) -> String {
+    // `resume` (a `shelbi task resume`) adds `--continue` for a claude runner
+    // so the pane reloads its prior conversation instead of starting cold —
+    // see [`shelbi_agent::with_continue`]. It's a no-op for a normal dispatch
+    // and for non-claude runners.
     let runner_with_mode = shelbi_agent::with_permission_mode(runner, permissions_mode);
+    let runner_resolved = shelbi_agent::with_continue(&runner_with_mode, resume);
     with_agent_system_prompt(
-        &shelbi_agent::launch_command(&runner_with_mode),
+        &shelbi_agent::launch_command(&runner_resolved),
         include_agent_instructions.then_some(WORKTREE_AGENT_INSTRUCTIONS_REL),
         runner,
     )
@@ -2050,6 +2179,67 @@ fn compose_prompt(
          working in this pane and talk to the user afterward without \
          affecting the handoff.{polling_section}"
     )
+}
+
+/// Build the prompt sent into a **resumed** pane (`shelbi task resume`). It's
+/// [`compose_prompt`]'s output — the task body plus the identical rebase +
+/// review-marker handoff — with a short resume banner prepended so the worker
+/// knows it's being picked back up rather than freshly dispatched.
+///
+/// The banner's wording depends on `conversation_resumed`:
+///
+/// - `true` (a claude runner launched with `--continue`): the pane already
+///   holds the prior conversation, so the banner just tells the worker it was
+///   resumed and to continue where it left off. Its own committed + uncommitted
+///   work is still in the worktree.
+/// - `false` (any other runner, launched cold): the conversation is gone, so
+///   the banner points the worker at the work already in its worktree —
+///   commits and uncommitted changes preserved — and tells it to read that to
+///   re-establish context before continuing.
+///
+/// Reusing `compose_prompt` for the body + handoff keeps the resume path from
+/// drifting from the dev-start path on the load-bearing bits (the atomic marker
+/// write, the rebase-before-marker ordering, the message-polling section for
+/// non-hook runners).
+#[allow(clippy::too_many_arguments)]
+fn compose_resume_prompt(
+    task_id: &str,
+    branch: &str,
+    body: &str,
+    marker: &Path,
+    default_branch: &str,
+    project: &str,
+    polls_messages: bool,
+    conversation_resumed: bool,
+) -> String {
+    let banner = if conversation_resumed {
+        format!(
+            "**Resumed.** You are being resumed on task `{task_id}` (branch \
+             `{branch}`) — the conversation above is your own prior work on it. \
+             Your commits and any uncommitted changes are still in this worktree, \
+             exactly where you left them. Pick up where you left off and finish \
+             the task; the original instructions follow for reference.\n\n"
+        )
+    } else {
+        format!(
+            "**Resumed.** You are being resumed on task `{task_id}` (branch \
+             `{branch}`). Your earlier work on this task — commits and any \
+             uncommitted changes — is preserved in this worktree. Start by \
+             reviewing what's already there (`git log`, `git status`, `git diff`) \
+             to re-establish context, then continue and finish the task. The \
+             original instructions follow.\n\n"
+        )
+    };
+    let base = compose_prompt(
+        task_id,
+        branch,
+        body,
+        marker,
+        default_branch,
+        project,
+        polls_messages,
+    );
+    format!("{banner}{base}")
 }
 
 /// The pull-style message-delivery paragraph appended to the prompt for
@@ -2355,6 +2545,110 @@ fn sync_worktree(
         argv.push(base.clone());
     } else {
         argv.push(branch.into());
+    }
+    let out = shelbi_ssh::run(host, &argv).map_err(Error::Io)?;
+    if !out.status.success() {
+        return Err(Error::Command {
+            cmd: argv.join(" "),
+            status: out.status.to_string(),
+            stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
+        });
+    }
+    Ok(())
+}
+
+/// Prepare a workspace's worktree for a **resume** ([`resume_workspace_on_task`])
+/// — the preserve-in-flight-work counterpart to [`sync_worktree`].
+///
+/// The whole point of resume is that the worker's in-flight state survives, so
+/// this deliberately does the opposite of `sync_worktree` in two places:
+///
+/// - It **never bails on a dirty worktree** and **never resets or
+///   re-checks-out the branch**. When the worktree already exists (the common
+///   case — the tmux session was killed but the worktree is intact), it is left
+///   exactly as the worker left it: same branch, same commits, same uncommitted
+///   changes. We don't even verify which branch is checked out — forcing it
+///   back onto `branch` could stash/lose work, and a resume trusts the tree.
+/// - It only touches git when the worktree is **missing entirely** (e.g. a
+///   prior teardown removed it, or a dispatch died mid-`worktree add`). Then it
+///   recreates the worktree checked out on the task's existing `branch`; if the
+///   branch somehow doesn't exist either, it cuts one off a fresh base (same
+///   [`resolve_fresh_cut_base`] the dev path uses) so the recreate still
+///   succeeds rather than wedging the resume.
+///
+/// The stale-`.git`-gitlink healing (F5) is shared with `sync_worktree`: a dir
+/// present without a valid `.git` is force-removed and recreated so a later
+/// `worktree add` doesn't abort with "already exists".
+fn sync_worktree_for_resume(
+    host: &Host,
+    machine: &Machine,
+    worktree: &std::path::Path,
+    branch: &str,
+    default_branch: &str,
+) -> Result<()> {
+    let repo = machine.work_dir.to_string_lossy().into_owned();
+    let wt_str = worktree.to_string_lossy().into_owned();
+
+    // Prune stale bookkeeping, then heal a present-but-invalid worktree dir
+    // (F5) exactly as `sync_worktree` does. Best-effort.
+    let _ = shelbi_ssh::run(host, ["git", "-C", &repo, "worktree", "prune"]);
+
+    let has_git = shelbi_ssh::run(host, ["test", "-d", &format!("{wt_str}/.git")])
+        .map_err(Error::Io)?
+        .status
+        .success()
+        || shelbi_ssh::run(host, ["test", "-f", &format!("{wt_str}/.git")])
+            .map_err(Error::Io)?
+            .status
+            .success();
+
+    if has_git {
+        // Worktree is intact — preserve it verbatim. This is the whole
+        // contract of resume: don't touch the branch, the commits, or the
+        // uncommitted changes.
+        return Ok(());
+    }
+
+    // No valid worktree. If a dir is lingering (created but never got its
+    // `.git`), force-remove it so the `worktree add` below starts clean.
+    let dir_present = shelbi_ssh::run(host, ["test", "-d", &wt_str])
+        .map_err(Error::Io)?
+        .status
+        .success();
+    if dir_present {
+        let _ = shelbi_ssh::run(
+            host,
+            ["git", "-C", &repo, "worktree", "remove", "--force", &wt_str],
+        );
+        let _ = shelbi_ssh::run(host, ["rm", "-rf", &wt_str]);
+    }
+
+    // Recreate the worktree on the task's existing branch. A resume always
+    // follows a task that was already in progress, so the branch should exist;
+    // fall back to cutting a fresh one off a current base if it somehow
+    // doesn't, rather than failing the recreate.
+    let branch_exists = shelbi_ssh::run(host, ["git", "-C", &repo, "rev-parse", "--verify", branch])
+        .map_err(Error::Io)?
+        .status
+        .success();
+
+    let mut argv: Vec<String> = vec![
+        "git".into(),
+        "-C".into(),
+        repo.clone(),
+        "worktree".into(),
+        "add".into(),
+    ];
+    if branch_exists {
+        argv.push(wt_str.clone());
+        argv.push(branch.into());
+    } else {
+        let base = resolve_fresh_cut_base(host, &repo, default_branch)?;
+        argv.push("--no-track".into());
+        argv.push("-b".into());
+        argv.push(branch.into());
+        argv.push(wt_str.clone());
+        argv.push(base);
     }
     let out = shelbi_ssh::run(host, &argv).map_err(Error::Io)?;
     if !out.status.success() {
@@ -2710,6 +3004,88 @@ mod tests {
             !prompt.contains("origin/main"),
             "stale `main` reference leaked into prompt: {prompt}"
         );
+    }
+
+    #[test]
+    fn resume_prompt_carries_banner_body_and_handoff() {
+        // The resume prompt must (a) announce a resume, (b) keep the task body,
+        // and (c) keep the identical rebase + review-marker handoff so the
+        // resume path can't drift from the dev-start path on the load-bearing
+        // bits.
+        let marker = PathBuf::from("/work/myapp/.shelbi/wt/alice/.claude/shelbi-review-ready");
+        let prompt = compose_resume_prompt(
+            "fix-login",
+            "shelbi/fix-login",
+            "Fix the Safari SSO bug.",
+            &marker,
+            "main",
+            "myapp",
+            false,
+            true,
+        );
+        assert!(prompt.contains("Resumed."), "missing resume banner: {prompt}");
+        assert!(prompt.contains("Fix the Safari SSO bug."), "body dropped: {prompt}");
+        assert!(
+            prompt.contains("git fetch origin main && git rebase origin/main"),
+            "handoff rebase missing: {prompt}"
+        );
+        assert!(prompt.contains(".claude/shelbi-review-ready"), "marker missing: {prompt}");
+        // The banner is a preamble — it precedes the body + handoff.
+        let banner_at = prompt.find("Resumed.").unwrap();
+        let body_at = prompt.find("Fix the Safari SSO bug.").unwrap();
+        assert!(banner_at < body_at, "banner must precede the body: {prompt}");
+    }
+
+    #[test]
+    fn resume_prompt_banner_wording_depends_on_conversation_resume() {
+        let marker = PathBuf::from("/work/myapp/.shelbi/wt/alice/.claude/shelbi-review-ready");
+        // conversation_resumed = true (claude --continue): point at the
+        // conversation above.
+        let resumed = compose_resume_prompt(
+            "t", "shelbi/t", "body", &marker, "main", "myapp", false, true,
+        );
+        assert!(
+            resumed.contains("conversation above"),
+            "claude-resume banner should reference the reloaded conversation: {resumed}"
+        );
+        // conversation_resumed = false (cold relaunch): point at the worktree.
+        let cold = compose_resume_prompt(
+            "t", "shelbi/t", "body", &marker, "main", "myapp", false, false,
+        );
+        assert!(
+            cold.contains("git log") && cold.contains("git status"),
+            "cold-resume banner should tell the worker to inspect its worktree: {cold}"
+        );
+        assert!(
+            !cold.contains("conversation above"),
+            "cold resume has no prior conversation to reference: {cold}"
+        );
+    }
+
+    #[test]
+    fn resume_adds_continue_flag_only_for_claude() {
+        // `shelbi task resume` builds the launch with resume=true. A claude
+        // runner gains `--continue` so it reloads its prior conversation; a
+        // non-claude runner has no such flag shelbi drives, so it's untouched.
+        let p = fixture_project();
+        let claude = p.runner("claude").unwrap();
+        let launch = workspace_launch_command(claude, &p.workspace_permissions_mode, false, true);
+        assert!(launch.contains("--continue"), "claude resume must add --continue: {launch}");
+
+        let codex = AgentRunnerSpec {
+            command: "codex".into(),
+            flags: vec!["--print".into()],
+            dialog_signatures: vec![],
+        };
+        let launch = workspace_launch_command(&codex, &p.workspace_permissions_mode, false, true);
+        assert!(
+            !launch.contains("--continue"),
+            "non-claude runner must not get --continue: {launch}"
+        );
+
+        // A normal (non-resume) dispatch never adds --continue, even for claude.
+        let launch = workspace_launch_command(claude, &p.workspace_permissions_mode, false, false);
+        assert!(!launch.contains("--continue"), "non-resume must not add --continue: {launch}");
     }
 
     // Captured from a workspace pane that had just submitted its prompt and
@@ -3318,9 +3694,9 @@ mod tests {
         // With an agent deployed: claude gets --permission-mode + the
         // instructions system-prompt. Both hosts produce the same shape.
         let local_launch =
-            workspace_launch_command(local_runner, &p.workspace_permissions_mode, true);
+            workspace_launch_command(local_runner, &p.workspace_permissions_mode, true, false);
         let remote_launch =
-            workspace_launch_command(remote_runner, &p.workspace_permissions_mode, true);
+            workspace_launch_command(remote_runner, &p.workspace_permissions_mode, true, false);
         assert_eq!(local_launch, remote_launch);
         assert_eq!(
             local_launch,
@@ -3344,9 +3720,9 @@ mod tests {
         // Bare pane (no agent): both hosts still agree — no
         // --append-system-prompt on either.
         let local_bare =
-            workspace_launch_command(local_runner, &p.workspace_permissions_mode, false);
+            workspace_launch_command(local_runner, &p.workspace_permissions_mode, false, false);
         let remote_bare =
-            workspace_launch_command(remote_runner, &p.workspace_permissions_mode, false);
+            workspace_launch_command(remote_runner, &p.workspace_permissions_mode, false, false);
         assert_eq!(local_bare, remote_bare);
         assert_eq!(local_bare, "claude --permission-mode auto");
     }
@@ -4740,6 +5116,88 @@ mod sync_worktree_git_tests {
         std::fs::write(wt.join("user.txt"), "real work\n").unwrap();
         let err = sync_worktree(&project, &Host::Local, &machine, &wt, "shelbi/x", "main");
         assert!(err.is_err(), "user-authored change must still block the switch");
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    #[test]
+    fn resume_preserves_uncommitted_changes_and_branch() {
+        // The core resume acceptance: an existing worktree with a committed
+        // task branch AND uncommitted changes must be left untouched — no
+        // reset, no branch switch, no bail on the dirty tree.
+        if !git_available() {
+            eprintln!("skipping: git not on PATH");
+            return;
+        }
+        let repo = init_repo("resume-preserve");
+        let project = project_at(&repo);
+        let machine = project.machines[0].clone();
+        let wt = workspace_worktree(&machine, &project.workspaces[0]);
+
+        // Stand up the worktree on the task branch and leave in-flight work:
+        // one commit plus an uncommitted change.
+        sync_worktree(&project, &Host::Local, &machine, &wt, "shelbi/x", "main").unwrap();
+        std::fs::write(wt.join("committed.txt"), "done\n").unwrap();
+        assert!(run_git_in(&wt, &["add", "committed.txt"]).status.success());
+        assert!(run_git_in(&wt, &["commit", "-q", "-m", "wip"]).status.success());
+        let committed_sha = String::from_utf8_lossy(
+            &run_git_in(&wt, &["rev-parse", "HEAD"]).stdout,
+        )
+        .trim()
+        .to_string();
+        // Uncommitted change that a `start`-style clean checkout would reject.
+        std::fs::write(wt.join("scratch.txt"), "half-finished\n").unwrap();
+
+        // Resume-sync must be a no-op against the tree.
+        sync_worktree_for_resume(&Host::Local, &machine, &wt, "shelbi/x", "main").unwrap();
+
+        assert_eq!(head_of(&wt), "shelbi/x", "branch must be preserved");
+        assert_eq!(
+            String::from_utf8_lossy(&run_git_in(&wt, &["rev-parse", "HEAD"]).stdout)
+                .trim(),
+            committed_sha,
+            "commit must be preserved",
+        );
+        assert!(
+            wt.join("scratch.txt").exists(),
+            "uncommitted change must survive a resume",
+        );
+        assert_eq!(
+            std::fs::read_to_string(wt.join("scratch.txt")).unwrap(),
+            "half-finished\n",
+        );
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    #[test]
+    fn resume_recreates_a_missing_worktree_on_the_existing_branch() {
+        // Killed/torn-down worktree: the dir is gone but the branch still
+        // exists in the repo. Resume-sync must recreate the worktree checked
+        // out on that branch (reclaiming the in-flight commits) rather than
+        // failing.
+        if !git_available() {
+            eprintln!("skipping: git not on PATH");
+            return;
+        }
+        let repo = init_repo("resume-recreate");
+        let project = project_at(&repo);
+        let machine = project.machines[0].clone();
+        let wt = workspace_worktree(&machine, &project.workspaces[0]);
+
+        // Create the branch with a commit, then remove the worktree entirely.
+        sync_worktree(&project, &Host::Local, &machine, &wt, "shelbi/x", "main").unwrap();
+        std::fs::write(wt.join("work.txt"), "landed\n").unwrap();
+        assert!(run_git_in(&wt, &["add", "work.txt"]).status.success());
+        assert!(run_git_in(&wt, &["commit", "-q", "-m", "landed"]).status.success());
+        assert!(run_git_in(&repo, &["worktree", "remove", "--force", &wt.to_string_lossy()])
+            .status
+            .success());
+        assert!(!wt.join(".git").exists(), "worktree should be gone");
+
+        sync_worktree_for_resume(&Host::Local, &machine, &wt, "shelbi/x", "main").unwrap();
+
+        assert!(wt.join(".git").exists(), "worktree must be recreated");
+        assert_eq!(head_of(&wt), "shelbi/x", "must reclaim the existing branch");
+        assert!(wt.join("work.txt").exists(), "prior commit's file must be present");
         let _ = std::fs::remove_dir_all(&repo);
     }
 }

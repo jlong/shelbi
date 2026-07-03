@@ -67,6 +67,35 @@ pub fn with_permission_mode(spec: &AgentRunnerSpec, mode: &str) -> AgentRunnerSp
     out
 }
 
+/// Return a copy of `spec` with `--continue` appended when the runner is
+/// `claude` and `resume` is set. `claude --continue` reloads the most recent
+/// conversation in the pane's working directory, so a resumed workspace picks
+/// up mid-thought with its full prior context — the session transcript lives
+/// under the user's `~/.claude/` and survives a killed tmux pane or a
+/// recreated worktree (the cwd path is stable). This is the strongest resume
+/// semantics shelbi can offer, so `shelbi task resume` prefers it for claude
+/// and falls back to plain prompt re-injection for every other runner (which
+/// has no equivalent transcript-resume flag shelbi knows how to drive).
+///
+/// Non-claude runners and `resume == false` return the spec unchanged.
+/// Idempotent: a YAML that already carries `--continue` / `-c` / `--resume`
+/// in `flags` isn't given a second copy.
+pub fn with_continue(spec: &AgentRunnerSpec, resume: bool) -> AgentRunnerSpec {
+    if !resume || !is_claude_runner(&spec.command) {
+        return spec.clone();
+    }
+    if spec
+        .flags
+        .iter()
+        .any(|f| f == "--continue" || f == "-c" || f == "--resume")
+    {
+        return spec.clone();
+    }
+    let mut out = spec.clone();
+    out.flags.push("--continue".into());
+    out
+}
+
 /// Does this runner pull hub→workspace messages by polling the log itself?
 ///
 /// Claude Code receives messages through its hook surface (a PostToolUse /
@@ -225,5 +254,51 @@ mod tests {
         // so it classifies as a polling runner — consistent with how
         // `with_permission_mode` keys off the exact basename.
         assert!(polls_for_messages(&runner("claude.exe")));
+    }
+
+    #[test]
+    fn with_continue_appends_for_claude_when_resuming() {
+        let out = with_continue(&runner("claude"), true);
+        assert_eq!(out.flags, vec!["--continue"]);
+        // Absolute claude path classifies the same.
+        let out = with_continue(&runner("/usr/local/bin/claude"), true);
+        assert_eq!(out.flags, vec!["--continue"]);
+    }
+
+    #[test]
+    fn with_continue_is_noop_when_not_resuming() {
+        let out = with_continue(&runner("claude"), false);
+        assert!(out.flags.is_empty());
+    }
+
+    #[test]
+    fn with_continue_skips_non_claude_runners() {
+        // codex has no `--continue` shelbi knows how to drive; leave it alone.
+        let out = with_continue(&runner("codex"), true);
+        assert!(out.flags.is_empty());
+    }
+
+    #[test]
+    fn with_continue_is_idempotent_when_flag_already_present() {
+        for existing in ["--continue", "-c", "--resume"] {
+            let spec = AgentRunnerSpec {
+                command: "claude".into(),
+                flags: vec![existing.into()],
+                dialog_signatures: vec![],
+            };
+            let out = with_continue(&spec, true);
+            assert_eq!(out.flags, vec![existing], "should not double-add for {existing}");
+        }
+    }
+
+    #[test]
+    fn with_continue_preserves_existing_flags() {
+        let spec = AgentRunnerSpec {
+            command: "claude".into(),
+            flags: vec!["--permission-mode".into(), "auto".into()],
+            dialog_signatures: vec![],
+        };
+        let out = with_continue(&spec, true);
+        assert_eq!(out.flags, vec!["--permission-mode", "auto", "--continue"]);
     }
 }

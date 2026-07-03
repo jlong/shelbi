@@ -89,6 +89,24 @@ pub enum TaskCmd {
         #[arg(long, value_name = "REASON")]
         reason: Option<String>,
     },
+    /// Relaunch the assigned workspace on the task it is ALREADY working,
+    /// WITHOUT discarding progress. For a stalled or killed worker: recreates
+    /// or reclaims the tmux pane and (for a claude runner) resumes the prior
+    /// conversation via `--continue`, while preserving the worktree as-is —
+    /// its branch, commits, and uncommitted changes stay put. Contrast with
+    /// `start`, which wipes context and re-checks-out a clean branch. Restores
+    /// the task to `in_progress` if it drifted. Pass `--workspace` to target a
+    /// specific workspace (defaults to the task's `assigned_to`).
+    Resume {
+        id: String,
+        #[arg(long, value_name = "WORKSPACE")]
+        workspace: Option<String>,
+        /// Reason string recorded in `~/.shelbi/events.log` if the resume has
+        /// to move the card back into `in_progress`. Defaults to
+        /// `user:cli:resume`.
+        #[arg(long, value_name = "REASON")]
+        reason: Option<String>,
+    },
     /// Re-order a task within its column.
     Prio(PrioArgs),
     /// Open the task file in `$EDITOR`.
@@ -181,6 +199,9 @@ pub fn run(project_opt: Option<String>, cmd: TaskCmd) -> Result<()> {
         TaskCmd::Unassign { id } => unassign(&project, &id),
         TaskCmd::Start { id, workspace, branch, reason } => {
             start(&project, &id, workspace.as_deref(), branch.as_deref(), reason.as_deref())
+        }
+        TaskCmd::Resume { id, workspace, reason } => {
+            resume(&project, &id, workspace.as_deref(), reason.as_deref())
         }
         TaskCmd::Prio(args) => prio(&project, args),
         TaskCmd::Edit { id } => edit(&project, &id),
@@ -871,6 +892,156 @@ fn dispatch_reason_with_agent(base: &str, agent: &str) -> String {
     format!("{base} agent={agent}")
 }
 
+/// `shelbi task resume` — relaunch the assigned workspace on the task it is
+/// already working, WITHOUT discarding the in-flight worktree. The recovery
+/// counterpart to [`start`]: where `start` wipes context (kills the pane,
+/// re-checks-out a clean branch) for a fresh dispatch, `resume` is for a
+/// stalled or killed worker — the tmux session died, the pane wedged, or the
+/// agent stopped mid-task — and gets it going again on the SAME task with its
+/// commits and uncommitted changes intact.
+///
+/// The worktree is preserved as-is (see
+/// [`shelbi_orchestrator::workspace::resume_workspace_on_task`]); we never cut
+/// or reset the branch here. We only touch the board when the card has drifted
+/// out of `in_progress` (a killed worker whose card someone moved back), in
+/// which case we restore it — mirroring `start`'s persist-before-spawn ordering
+/// and rollback-on-failure so a failed relaunch never strands the card.
+fn resume(
+    project: &str,
+    id: &str,
+    workspace_arg: Option<&str>,
+    reason: Option<&str>,
+) -> Result<()> {
+    let project_yaml = shelbi_state::load_project(project).map_err(|e| anyhow!(e))?;
+    let mut tf = shelbi_state::load_task(project, id).map_err(|e| anyhow!(e))?;
+
+    // Resolve workspace: explicit --workspace wins; otherwise reuse the task's
+    // existing assignment. A resume without either has nothing to relaunch.
+    let workspace_name = workspace_arg
+        .map(str::to_string)
+        .or_else(|| tf.task.assigned_to.clone())
+        .ok_or_else(|| {
+            anyhow!(
+                "task `{id}` has no assigned workspace — pass `--workspace NAME` (the \
+                 workspace whose worktree holds the in-flight work)"
+            )
+        })?;
+    let workspace = project_yaml.workspace(&workspace_name).ok_or_else(|| {
+        anyhow!(
+            "workspace `{workspace_name}` not declared in project `{project}` (known: {})",
+            project_yaml
+                .workspaces
+                .iter()
+                .map(|w| w.name.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        )
+    })?;
+
+    // Refuse to clobber a DIFFERENT in-flight task on the same workspace —
+    // same guard as `start`. Resuming this task onto a workspace busy with
+    // another would leave two agents racing one worktree.
+    let conflict = shelbi_state::list_column(project, Column::InProgress)
+        .map_err(|e| anyhow!(e))?
+        .into_iter()
+        .find(|other| {
+            other.task.assigned_to.as_deref() == Some(workspace_name.as_str())
+                && other.task.id != id
+        });
+    if let Some(other) = conflict {
+        bail!(
+            "workspace `{workspace_name}` is already on task `{}` (in_progress) — \
+             move it to another column first",
+            other.task.id
+        );
+    }
+
+    // Resolve the branch WITHOUT cutting or resetting it: the branch already
+    // exists (the worker created + committed on it). Prefer the task's recorded
+    // branch, falling back to the conventional `shelbi/<id>`.
+    let branch = tf
+        .task
+        .branch
+        .clone()
+        .unwrap_or_else(|| format!("shelbi/{id}"));
+
+    // Same agent-resolution as `start` — the active status's agent under the
+    // project's Zen state, developer as the fallback.
+    let agent_name = resolve_active_agent_for_dispatch(project, &tf.task)
+        .map_err(|e| anyhow!(e))?;
+
+    // Restore `in_progress` if the card drifted out of it. Persist BEFORE the
+    // relaunch (same ordering rationale as `start`): the board should reflect
+    // the in-flight work the instant the agent can exist. `original` snapshots
+    // the pre-move frontmatter so a spawn failure rolls the card back.
+    let original = tf.task.clone();
+    let prev_column = tf.task.column;
+    let moved_into_progress = prev_column != Column::InProgress;
+    tf.task.assigned_to = Some(workspace_name.clone());
+    tf.task.branch = Some(branch.clone());
+    tf.task.updated_at = Utc::now();
+    if moved_into_progress {
+        let new_priority = shelbi_state::list_column(project, Column::InProgress)
+            .map_err(|e| anyhow!(e))?
+            .len() as u32;
+        tf.task.column = Column::InProgress;
+        tf.task.priority = new_priority;
+    }
+    shelbi_state::save_task(project, &tf.task, &tf.body).map_err(|e| anyhow!(e))?;
+    if moved_into_progress {
+        shelbi_state::renumber_column(project, prev_column).map_err(|e| anyhow!(e))?;
+    }
+
+    println!("→ resuming {workspace_name} on {id} (branch: {branch}, agent: {agent_name})");
+    let addr = match shelbi_orchestrator::workspace::resume_workspace_on_task(
+        shelbi_orchestrator::workspace::StartSpec {
+            project: &project_yaml,
+            workspace,
+            task_id: id,
+            branch: &branch,
+            task_body: &tf.body,
+            agent: Some(agent_name.as_str()),
+        },
+    ) {
+        Ok(addr) => addr,
+        Err(e) => {
+            // Roll the card back only if we moved it — a resume of an
+            // already-in-progress task left the board untouched, so there's
+            // nothing to undo.
+            if moved_into_progress {
+                if let Err(re) = rollback_start(project, &original, &tf.body, prev_column) {
+                    eprintln!(
+                        "warning: `{id}` was restored to in_progress but the resume failed and \
+                         the rollback also failed ({re}); run `shelbi task move {id} --to \
+                         {prev_column}` to recover"
+                    );
+                }
+            }
+            return Err(anyhow!(e).context("resuming workspace"));
+        }
+    };
+
+    // Only a card we actually moved records a dispatch event — a resume of an
+    // already-in-progress task leaves no misleading transition line.
+    if moved_into_progress {
+        let base_reason = reason.unwrap_or("user:cli:resume");
+        let dispatched_reason = dispatch_reason_with_agent(base_reason, &agent_name);
+        let workflow = tf.task.workflow_or_default();
+        if let Err(e) = shelbi_state::append_task_event(
+            id,
+            workflow,
+            prev_column,
+            Column::InProgress,
+            &dispatched_reason,
+        ) {
+            eprintln!("warning: append_task_event failed: {e}");
+        }
+    }
+
+    println!("✓ {id} resumed on {workspace_name} ({})", addr.target());
+    Ok(())
+}
+
 fn edit(project: &str, id: &str) -> Result<()> {
     let path = shelbi_state::task_path(project, id).map_err(|e| anyhow!(e))?;
     if !path.exists() {
@@ -1420,6 +1591,43 @@ statuses:
         let task = task_in(Column::Todo, "t2");
         let agent = resolve_active_agent_for_dispatch("p", &task).unwrap();
         assert_eq!(agent, shelbi_state::DEVELOPER_AGENT);
+
+        std::env::remove_var("SHELBI_HOME");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn resume_without_assignment_or_workspace_flag_errors() {
+        // A resume needs to know which workspace holds the in-flight work.
+        // With no `assigned_to` and no `--workspace`, it must fail cleanly
+        // (before touching any pane) rather than guessing.
+        let _g = TEST_LOCK.lock().unwrap();
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+        crate::commands::test_support::provision_hub_repo_for_project(&home, "p");
+
+        shelbi_state::save_task("p", &task_in(Column::InProgress, "orphan"), "").unwrap();
+        let err = resume("p", "orphan", None, None).unwrap_err().to_string();
+        assert!(err.contains("no assigned workspace"), "err: {err}");
+
+        std::env::remove_var("SHELBI_HOME");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn resume_rejects_unknown_workspace() {
+        // An explicit `--workspace` that isn't declared in the project must
+        // be rejected with the known-workspaces list, same as `start`/`assign`.
+        let _g = TEST_LOCK.lock().unwrap();
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+        // provision_hub_repo_for_project declares no workspaces, so any name
+        // is "unknown" — exactly the case under test.
+        crate::commands::test_support::provision_hub_repo_for_project(&home, "p");
+
+        shelbi_state::save_task("p", &task_in(Column::InProgress, "t"), "").unwrap();
+        let err = resume("p", "t", Some("ghost"), None).unwrap_err().to_string();
+        assert!(err.contains("workspace `ghost` not declared"), "err: {err}");
 
         std::env::remove_var("SHELBI_HOME");
         let _ = std::fs::remove_dir_all(&home);

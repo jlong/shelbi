@@ -63,7 +63,17 @@ pub fn wrapper_invocation(shelbi_bin: &str, project: &str, workspace: &str) -> S
 
 /// Run the wrapper: spawn the agent, wait, emit the lifecycle event,
 /// optionally hold the pane open for a final keypress.
-pub fn run(project: &Project, workspace: &WorkspaceSpec, machine: &Machine) -> Result<()> {
+///
+/// `resume` is set when this pane was launched by `shelbi task resume`: for a
+/// claude runner it adds `--continue` to the launch command so the pane reloads
+/// its prior conversation instead of starting cold. It's a no-op for a normal
+/// dispatch, a sidebar click, or a non-claude runner.
+pub fn run(
+    project: &Project,
+    workspace: &WorkspaceSpec,
+    machine: &Machine,
+    resume: bool,
+) -> Result<()> {
     let runner = project
         .runner(&workspace.runner)
         .ok_or_else(|| {
@@ -102,6 +112,7 @@ pub fn run(project: &Project, workspace: &WorkspaceSpec, machine: &Machine) -> R
         &runner,
         &project.workspace_permissions_mode,
         has_agent_instructions,
+        resume,
     );
 
     // `cd` falls back to $HOME if the worktree doesn't exist — that keeps
@@ -718,7 +729,7 @@ mod tests {
         };
         let project = fixture_project("demo", machine.clone(), workspace.clone(), runner);
 
-        run(&project, &workspace, &machine).unwrap();
+        run(&project, &workspace, &machine, false).unwrap();
 
         let log = std::fs::read_to_string(shelbi_state::events_log_path().unwrap()).unwrap();
         let lines: Vec<&str> = log.lines().collect();
@@ -770,7 +781,7 @@ mod tests {
         };
         let project = fixture_project("demo", machine.clone(), workspace.clone(), runner);
 
-        run(&project, &workspace, &machine).unwrap();
+        run(&project, &workspace, &machine, false).unwrap();
 
         let observed = std::fs::read_to_string(&env_out)
             .expect("agent should have written its SHELBI_HUB_SOCK env to disk");
@@ -810,7 +821,7 @@ mod tests {
         };
         let project = fixture_project("demo", machine.clone(), workspace.clone(), runner);
 
-        run(&project, &workspace, &machine).unwrap();
+        run(&project, &workspace, &machine, false).unwrap();
 
         let log = std::fs::read_to_string(shelbi_state::events_log_path().unwrap()).unwrap();
         let lines: Vec<&str> = log.lines().collect();
@@ -1079,7 +1090,7 @@ mod tests {
         };
         let project = fixture_project("demo", machine.clone(), workspace.clone(), runner);
 
-        run(&project, &workspace, &machine).unwrap();
+        run(&project, &workspace, &machine, false).unwrap();
 
         let body = std::fs::read_to_string(&dump_path).unwrap();
         let lines: Vec<&str> = body.lines().collect();
@@ -1153,7 +1164,7 @@ mod tests {
         };
         let project = fixture_project("demo", machine.clone(), workspace.clone(), runner);
 
-        run(&project, &workspace, &machine).unwrap();
+        run(&project, &workspace, &machine, false).unwrap();
 
         // The lock dir must be cleaned up by the wrapper.
         let lock_dir = worktree
@@ -1255,7 +1266,7 @@ mod tests {
         };
         let project = fixture_project("demo", machine.clone(), workspace.clone(), runner);
 
-        run(&project, &workspace, &machine).unwrap();
+        run(&project, &workspace, &machine, false).unwrap();
 
         // No pane_alive=false event landed — the intentional-teardown
         // marker consumed the emission.
@@ -1322,7 +1333,7 @@ mod tests {
         };
         let project = fixture_project("demo", machine.clone(), workspace.clone(), runner);
 
-        run(&project, &workspace, &machine).unwrap();
+        run(&project, &workspace, &machine, false).unwrap();
 
         // A stale marker must not suppress: the real exit event fires.
         let log_path = shelbi_state::events_log_path().unwrap();
@@ -1377,7 +1388,7 @@ mod tests {
         };
         let project = fixture_project("demo", machine.clone(), workspace.clone(), runner);
 
-        run(&project, &workspace, &machine).unwrap();
+        run(&project, &workspace, &machine, false).unwrap();
 
         // Startup cleared the marker → exit path saw no marker → event
         // fired. This is the belt in the belt-and-suspenders defense.
@@ -1436,7 +1447,7 @@ mod tests {
         };
         let project = fixture_project("demo", machine.clone(), workspace.clone(), runner);
 
-        run(&project, &workspace, &machine).unwrap();
+        run(&project, &workspace, &machine, false).unwrap();
 
         let body = std::fs::read_to_string(&dump_path).unwrap();
         let lines: Vec<&str> = body.lines().collect();

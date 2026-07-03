@@ -1,7 +1,7 @@
 ---
 title: shelbi task
 order: 20
-summary: Manage the project's Kanban task board — add, list, move, assign, and start tasks from the CLI.
+summary: Manage the project's Kanban task board — add, list, move, assign, start, and resume tasks from the CLI.
 ---
 
 ```text
@@ -179,6 +179,43 @@ the orchestrator runs when a task hits `todo`.
 | `--branch <BRANCH>` | string | `shelbi/<task-id>` | Override the default branch name. |
 | `--reason <REASON>` | string | `user:cli:start` | Reason tag recorded in `~/.shelbi/events.log` when the column transitions to `in_progress`. |
 
+## resume
+
+```text
+shelbi task resume [OPTIONS] <ID>
+```
+
+Relaunch the assigned workspace on the task it is **already** working, without
+throwing away progress. Use it when a worker stalls or its session dies —
+a killed tmux session, a wedged pane, an agent that stopped mid-task — and you
+want it going again on the same task with its work intact.
+
+`resume` is the recovery counterpart to [`start`](#start). Where `start` wipes
+the agent's context (kills the pane and re-checks-out a clean branch) — right
+for a fresh dispatch, wrong for recovery — `resume` preserves the in-flight
+state:
+
+1. The workspace's worktree is left **as-is** — its branch, commits, and
+   uncommitted changes stay exactly where the worker left them. The branch is
+   never reset or re-checked-out. (If the worktree was torn down entirely, it's
+   recreated on the task's existing branch.)
+2. The runner pane is recreated or reclaimed — a killed session is stood back
+   up, and a stale or wedged one (the duplicate-session case) is torn down
+   before the fresh pane comes up.
+3. For a **claude** runner the pane relaunches with `--continue`, so the worker
+   reloads its prior conversation and picks up mid-thought with full context.
+   Other runners fall back to re-injecting the task prompt — the agent continues
+   by reading its own prior work in the worktree. Either way the prompt is
+   auto-submitted.
+
+If the card has drifted out of `in_progress` (a killed worker whose task
+someone moved back), `resume` restores it.
+
+| Flag | Type | Default | Description |
+| --- | --- | --- | --- |
+| `--workspace <WORKSPACE>` | string | task's `assigned_to` | Workspace whose worktree holds the in-flight work. |
+| `--reason <REASON>` | string | `user:cli:resume` | Reason tag recorded in `~/.shelbi/events.log` if the resume has to move the card back into `in_progress`. |
+
 ## prio
 
 ```text
@@ -246,6 +283,13 @@ Manually dispatch an explicit workspace (overrides the orchestrator's routing):
 
 ```bash
 shelbi task start docs-write-changelog-page --workspace delta
+```
+
+Recover a stalled worker without losing its in-flight work — relaunch the pane
+and resume the conversation on the same task:
+
+```bash
+shelbi task resume docs-write-changelog-page
 ```
 
 ## See also
