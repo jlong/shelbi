@@ -4,7 +4,7 @@ import { join } from "node:path"
 import { OG_CARD_SIZE, OgCard } from "@/components/OgCard"
 
 export const alt =
-  "Shelbi — a multi-machine orchestrator for your agents, built on tmux"
+  "Do more with your agents — an open source, multi-machine orchestrator built on tmux"
 export const size = OG_CARD_SIZE
 export const contentType = "image/png"
 
