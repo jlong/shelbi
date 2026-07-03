@@ -12,7 +12,7 @@
 //! values, what do I do?" Splitting it out keeps the rule table unit-
 //! testable without spinning up a SHELBI_HOME fixture.
 
-use shelbi_core::{Owner, WorkflowStatus};
+use shelbi_core::{Owner, StatusCategory, Task, WorkflowStatus};
 
 /// The outcome of resolving a status against the current automation
 /// state. Either spawn this agent, or skip with a structured reason.
@@ -96,10 +96,40 @@ pub fn resolve_dispatch_agent(status: &WorkflowStatus, zen_on: bool) -> Dispatch
     }
 }
 
+/// Resolve which agent should drive `task` in its active (in-progress)
+/// status, for a re-dispatch that isn't an explicit CLI invocation (the
+/// supervisor's automatic pane relaunch). Infallible: any failure to load
+/// the workflow, a workflow with no active-category status, or a status the
+/// resolver would `Skip` all fall back to the bundled `developer` agent so
+/// the relaunch still deploys *some* agent context into the worktree.
+///
+/// Mirrors the CLI's `resolve_active_agent_for_dispatch` but stays quiet
+/// (no stderr diagnostics — there's no human at a prompt) and reads the
+/// project's live Zen state so an `owner: user` active status only pulls in
+/// its agent when Zen is on, matching the declarative dispatch rules.
+pub fn resolve_active_agent(project_name: &str, task: &Task) -> String {
+    let workflow = shelbi_state::load_workflow(project_name, task.workflow_or_default())
+        .unwrap_or_else(|_| shelbi_core::default_workflow());
+    let zen_on = matches!(
+        shelbi_state::read_state(project_name).map(|s| s.zen_mode),
+        Ok(shelbi_state::ZenModeState::On),
+    );
+    let active = workflow
+        .statuses
+        .iter()
+        .find(|s| s.category == StatusCategory::Active);
+    match active {
+        Some(status) => match resolve_dispatch_agent(status, zen_on) {
+            DispatchDecision::Dispatch { agent } => agent,
+            DispatchDecision::Skip(_) => shelbi_state::DEVELOPER_AGENT.to_string(),
+        },
+        None => shelbi_state::DEVELOPER_AGENT.to_string(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use shelbi_core::StatusCategory;
 
     fn status(id: &str, owner: Owner, agent: Option<&str>) -> WorkflowStatus {
         WorkflowStatus {
@@ -215,6 +245,40 @@ statuses:
             resolve_dispatch_agent(review, true),
             DispatchDecision::Dispatch { agent: "orchestrator".into() },
         );
+    }
+
+    #[test]
+    fn resolve_active_agent_falls_back_to_developer_without_fixtures() {
+        // No project on disk → `load_workflow` errors and we fall back to the
+        // built-in default workflow, whose active status is
+        // owner=agent/agent=developer, so a supervised re-dispatch still
+        // resolves a concrete agent to deploy into the worktree.
+        let _guard = crate::test_lock::acquire();
+        let tmp = tempfile::tempdir().unwrap();
+        let prev_home = std::env::var_os("SHELBI_HOME");
+        std::env::set_var("SHELBI_HOME", tmp.path());
+
+        let task = Task {
+            id: "fix-login".into(),
+            title: "fix-login".into(),
+            column: shelbi_core::Column::InProgress,
+            priority: 0,
+            assigned_to: Some("alpha".into()),
+            workflow: None,
+            branch: None,
+            depends_on: Vec::new(),
+            prefers_machine: None,
+            zen: None,
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+            params: std::collections::BTreeMap::new(),
+        };
+        assert_eq!(resolve_active_agent("no-such-project", &task), "developer");
+
+        match prev_home {
+            Some(v) => std::env::set_var("SHELBI_HOME", v),
+            None => std::env::remove_var("SHELBI_HOME"),
+        }
     }
 
     #[test]

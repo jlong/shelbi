@@ -26,6 +26,7 @@ pub mod lifecycle;
 pub mod ready;
 pub mod review;
 pub mod server_pane;
+pub mod supervision;
 pub mod transition;
 pub mod workspace;
 pub mod zen;
@@ -133,6 +134,59 @@ pub fn dashboard_addr(project_name: &str) -> TmuxAddr {
         session: format!("shelbi-{project_name}"),
         window: "dashboard".into(),
     }
+}
+
+/// Is the project's orchestrator pane currently alive?
+///
+/// Reads the stashed `SHELBI_PANE_orch` pane id from the dashboard session
+/// and checks it against tmux's live pane set. Deliberately conservative:
+/// it returns `Ok(true)` — "assume alive, don't relaunch" — for every case
+/// where we *can't* prove a real death (no local hub, the session is gone
+/// because the user quit, or the pane id was never stashed on a pre-pin
+/// session). It returns `Ok(false)` only when the session exists, a pane id
+/// is stashed, and that pane is not among the live panes — an actual
+/// orchestrator crash. This is what [`crate::supervision`] keys off to
+/// relaunch the orchestrator (via [`ensure_dashboard`], whose
+/// `__zen-orch-start` step keeps the Zen crash-recovery downgrade intact).
+pub fn orchestrator_pane_alive(project_name: &str) -> Result<bool> {
+    let project = shelbi_state::load_project(project_name)?;
+    let Some(hub) = project
+        .machines
+        .iter()
+        .find(|m| matches!(m.kind, MachineKind::Local))
+    else {
+        // No local hub → the orchestrator pane doesn't live on a box we
+        // watch; nothing to supervise.
+        return Ok(true);
+    };
+    let host = hub.host();
+    let session = dashboard_addr(project_name).session;
+    if !shelbi_tmux::has_session(&host, &session)? {
+        // Session gone (the user quit the project / shelbi) — the whole
+        // dashboard is down by design, not a crash to paper over.
+        return Ok(true);
+    }
+    let Some(pane_id) = read_session_env_var(&host, &session, "SHELBI_PANE_orch")? else {
+        // Never stashed (a session that pre-dates the pin, or one still
+        // bootstrapping) — don't second-guess it.
+        return Ok(true);
+    };
+    pane_id_alive(&host, &pane_id)
+}
+
+/// Is `pane_id` (a stable tmux `%N`) among the server's live panes? Mirrors
+/// [`crate::server_pane::server_pane_alive`] but is spelled out here so the
+/// orchestrator-liveness path doesn't read as if it were checking a review
+/// *server* pane. A failed tmux call reports `Ok(false)` — treated as dead,
+/// matching the rest of the liveness probes.
+fn pane_id_alive(host: &Host, pane_id: &str) -> Result<bool> {
+    let out = shelbi_ssh::run(host, ["tmux", "list-panes", "-a", "-F", "#{pane_id}"])
+        .map_err(Error::Io)?;
+    if !out.status.success() {
+        return Ok(false);
+    }
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    Ok(stdout.lines().any(|p| p.trim() == pane_id))
 }
 
 /// Swap the named view's pane into the dashboard's right slot. `view` is

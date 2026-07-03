@@ -465,6 +465,44 @@ pub fn append_project_event(project: &str, action: &str, reason: &str) -> Result
     append_event_line(&format!("{ts} project={project} {action} reason={reason}"))
 }
 
+/// Append a supervision line recording an automatic pane relaunch or a
+/// crash-loop give-up to `~/.shelbi/events.log`.
+///
+/// - workspace pane (`Some(name)`):
+///   `<rfc3339> project=<p> workspace=<name> supervision=<action> reason=<reason>`
+/// - orchestrator pane (`None`):
+///   `<rfc3339> project=<p> supervision=<action> target=orchestrator reason=<reason>`
+///
+/// Emitted by the sidebar supervisor when it relaunches a shelbi-managed
+/// pane that died unexpectedly (`action=restart`), when a relaunch attempt
+/// itself failed (`action=restart-failed`), or when it stops trying after
+/// the crash-loop cap (`action=gave-up reason=crash-loop`). Every line
+/// carries the leading `project=<name>` scope — same rationale as
+/// [`append_workspace_pane_event`] — so a hub-global tail can tell two
+/// projects' same-named workspaces apart. `action`/`reason` fold whitespace
+/// to underscores so the line stays a single parseable record.
+pub fn append_supervision_event(
+    project: &str,
+    workspace: Option<&str>,
+    action: &str,
+    reason: &str,
+) -> Result<()> {
+    let ts = Utc::now().to_rfc3339();
+    let project = sanitize_field(project);
+    let action = sanitize_reason(action);
+    let reason = sanitize_reason(reason);
+    let line = match workspace {
+        Some(w) => {
+            let w = sanitize_field(w);
+            format!("{ts} project={project} workspace={w} supervision={action} reason={reason}")
+        }
+        None => {
+            format!("{ts} project={project} supervision={action} target=orchestrator reason={reason}")
+        }
+    };
+    append_event_line(&line)
+}
+
 /// Append `<rfc3339> contextstore space=<space> machine=<machine> status=<status> detail=<detail>`
 /// to `~/.shelbi/events.log`. Use this to record cross-machine ContextStore
 /// sync attempts run after a remote workspace hands off for review, so the user
@@ -657,6 +695,24 @@ pub fn append_workspace_server_event(
     let body =
         format!("project={project} workspace={workspace} server_alive={alive} reason={reason}");
     emit_event_body(&body)
+}
+
+/// The no-restart key the supervisor consumes to tell a crash from a
+/// deliberate shutdown.
+///
+/// The plain [`expected_teardown_marker_path`] marker is consumed by the
+/// pane's lifecycle wrapper on exit (to suppress its `pane_alive=false`
+/// event), so by the time the sidebar supervisor observes the dead pane
+/// that marker is already gone — the two processes would race over one
+/// file. We derive an independent key by suffixing `.supervision` so it
+/// lands in its own `workspaces/<name>.supervision/.expected-teardown`
+/// file and reuses the exact [`mark_expected_teardown`] /
+/// [`consume_expected_teardown`] machinery. The lifecycle wrapper marks it
+/// whenever a death is *not* a crash to restart (a fresh expected-teardown
+/// was present, or the agent exited cleanly with `exit:0`); the supervisor
+/// consumes it on the death edge and treats a fresh hit as "stay down."
+pub fn supervision_shutdown_key(workspace: &str) -> String {
+    format!("{workspace}.supervision")
 }
 
 /// The expected-teardown key for a review workspace's *server* pane.
@@ -1040,6 +1096,56 @@ mod tests {
 
         std::env::remove_var("SHELBI_HOME");
         let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn supervision_events_are_project_scoped_for_both_pane_kinds() {
+        let _g = TEST_LOCK.lock().unwrap();
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+
+        // A workspace pane relaunch carries the workspace scope.
+        append_supervision_event("demo", Some("alpha"), "restart", "crash").unwrap();
+        // A crash-loop give-up on the same workspace.
+        append_supervision_event("demo", Some("alpha"), "gave-up", "crash-loop").unwrap();
+        // The orchestrator pane has no workspace — it gets `target=orchestrator`.
+        append_supervision_event("demo", None, "restart", "crash").unwrap();
+
+        let log = std::fs::read_to_string(events_log_path().unwrap()).unwrap();
+        let lines: Vec<&str> = log.lines().collect();
+        assert!(
+            lines[0].contains(" project=demo workspace=alpha supervision=restart reason=crash"),
+            "line: {}",
+            lines[0]
+        );
+        assert!(
+            lines[1].contains(" project=demo workspace=alpha supervision=gave-up reason=crash-loop"),
+            "line: {}",
+            lines[1]
+        );
+        assert!(
+            lines[2]
+                .contains(" project=demo supervision=restart target=orchestrator reason=crash"),
+            "line: {}",
+            lines[2]
+        );
+        // Every supervision line is project-scoped so a hub-global tail can
+        // tell two projects' same-named workspaces apart (acceptance §5).
+        assert!(lines.iter().all(|l| l.contains("project=demo")), "log: {log}");
+
+        std::env::remove_var("SHELBI_HOME");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn supervision_marker_uses_an_independent_key_from_the_wrapper_teardown() {
+        // The supervisor's no-restart marker must land in its own file so it
+        // never races the pane wrapper's expected-teardown consume.
+        assert_eq!(supervision_shutdown_key("alpha"), "alpha.supervision");
+        assert_ne!(
+            expected_teardown_marker_path("alpha").unwrap(),
+            expected_teardown_marker_path(&supervision_shutdown_key("alpha")).unwrap(),
+        );
     }
 
     #[test]
