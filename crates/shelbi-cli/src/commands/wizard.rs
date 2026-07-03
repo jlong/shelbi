@@ -22,16 +22,7 @@ pub fn run(first_run: bool) -> Result<WizardOutcome> {
     if first_run {
         wizard::print_banner();
     }
-    match wizard::phase_1_assistant_name() {
-        Ok(()) => {}
-        Err(e) if is_cancel(&e) => return Ok(WizardOutcome::Cancelled),
-        Err(e) => return Err(e),
-    }
-    let cfg = shelbi_state::load_shelbi_config()
-        .map_err(|e| anyhow::anyhow!(e))?;
-    println!("✓ assistant: {}", cfg.assistant_name());
-
-    match wizard::phase_2_project_setup() {
+    match wizard::phase_project_setup() {
         Ok(()) => {}
         Err(e) if is_cancel(&e) => return Ok(WizardOutcome::Cancelled),
         Err(e) => return Err(e),

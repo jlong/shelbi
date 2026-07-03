@@ -90,64 +90,6 @@ pub use workflows::{
     scaffold_project_statuses, statuses_path, workflow_path, workflows_dir,
 };
 
-/// Default assistant name surfaced in the sidebar header and the
-/// orchestrator system prompt when the user hasn't picked one yet.
-pub const DEFAULT_ASSISTANT_NAME: &str = "Orchestrator";
-
-/// Global shelbi config, persisted at `~/.shelbi/shelbi.yaml`. Created and
-/// populated by the onboarding wizard; everything is `Option` so that
-/// loading an older or partial file still succeeds.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct ShelbiConfig {
-    /// What the user wants to call their assistant — shown above the
-    /// orchestrator pane and substituted into the orchestrator system
-    /// prompt. `None` means the user hasn't been through Phase 1 of the
-    /// wizard yet; callers should fall back to [`DEFAULT_ASSISTANT_NAME`]
-    /// via [`ShelbiConfig::assistant_name`].
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub assistant_name: Option<String>,
-}
-
-impl ShelbiConfig {
-    /// The configured assistant name, or [`DEFAULT_ASSISTANT_NAME`] if
-    /// the wizard hasn't set one yet.
-    pub fn assistant_name(&self) -> &str {
-        self.assistant_name
-            .as_deref()
-            .unwrap_or(DEFAULT_ASSISTANT_NAME)
-    }
-}
-
-/// Path to the global config file: `$SHELBI_HOME/shelbi.yaml`.
-pub fn shelbi_config_path() -> Result<PathBuf> {
-    Ok(shelbi_home()?.join("shelbi.yaml"))
-}
-
-/// Load the global config. Missing file → default (empty) config; that's
-/// not an error because every consumer has a sensible fallback.
-pub fn load_shelbi_config() -> Result<ShelbiConfig> {
-    let path = shelbi_config_path()?;
-    // Read unconditionally and map only NotFound to the default: probing
-    // with `exists()` first would also report false on EACCES/ELOOP, and
-    // a transiently unreadable config must surface as an error rather
-    // than silently reading as "missing".
-    let text = match fs::read_to_string(&path) {
-        Ok(t) => t,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            return Ok(ShelbiConfig::default());
-        }
-        Err(e) => return Err(shelbi_core::Error::Io(e)),
-    };
-    Ok(serde_yaml::from_str(&text)?)
-}
-
-/// Atomically write the global config.
-pub fn save_shelbi_config(cfg: &ShelbiConfig) -> Result<()> {
-    ensure_dir(&shelbi_home()?)?;
-    let path = shelbi_config_path()?;
-    atomic_write(&path, serde_yaml::to_string(cfg)?.as_bytes())
-}
-
 #[cfg(test)]
 pub(crate) mod test_lock {
     //! Shared mutex for all tests that mutate the process-wide

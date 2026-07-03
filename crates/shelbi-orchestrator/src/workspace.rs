@@ -1625,9 +1625,9 @@ pub fn deploy_agent_context(
 ) -> Result<()> {
     // Compose preamble (`agents/_shared/preamble.md`, if present) + the
     // agent's `instructions.md` into one body. `compose_agent_prompt`
-    // handles the missing-preamble case (just the agent's prompt) and
-    // the `{{assistant_name}}` substitution. Any file-read failure
-    // surfaces from there with the same shape the old direct-read used.
+    // handles the missing-preamble case (just the agent's prompt). Any
+    // file-read failure surfaces from there with the same shape the old
+    // direct-read used.
     let mut composed = shelbi_state::compose_agent_prompt(project_name, agent)
         .map_err(|e| Error::Other(format!("{e}")))?;
     // Orchestrator-only: if a `handoff.md` was left by the previous

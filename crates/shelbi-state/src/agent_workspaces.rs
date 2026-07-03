@@ -31,7 +31,7 @@ use std::path::PathBuf;
 use shelbi_core::{Error, Result};
 
 use crate::{
-    agents_dir, atomic_write, ensure_dir, load_shelbi_config, project_dir, read_state,
+    agents_dir, atomic_write, ensure_dir, project_dir, read_state,
     update_state, DEFAULT_WORKSPACE_SETTINGS_TEMPLATE,
 };
 
@@ -268,12 +268,6 @@ pub fn load_shared_preamble(project: &str) -> Result<Option<String>> {
 /// `agents/_shared/preamble.md` (if present) with the agent's own
 /// `instructions.md`. The two halves are joined with a single blank line
 /// so the agent's first H1 doesn't collide with the preamble's tail.
-///
-/// `{{assistant_name}}` is substituted in the composed body using the
-/// user's chosen assistant name from `~/.shelbi/shelbi.yaml` (falling
-/// back to [`crate::DEFAULT_ASSISTANT_NAME`] when the wizard hasn't
-/// run). Agent prompts that don't reference the placeholder are
-/// unaffected — `String::replace` on a no-match is free.
 pub fn compose_agent_prompt(project: &str, agent: &str) -> Result<String> {
     let instructions_path = agent_instructions_path(project, agent)?;
     let instructions = fs::read_to_string(&instructions_path).map_err(|e| {
@@ -296,8 +290,7 @@ pub fn compose_agent_prompt(project: &str, agent: &str) -> Result<String> {
         }
         None => instructions,
     };
-    let cfg = load_shelbi_config()?;
-    Ok(composed.replace("{{assistant_name}}", cfg.assistant_name()))
+    Ok(composed)
 }
 
 /// Path to the legacy orchestrator `CLAUDE.md` file that pre-shelbi
@@ -1307,7 +1300,7 @@ mod tests {
     #[test]
     fn orchestrator_template_byte_matches_default_instructions_const() {
         assert!(!DEFAULT_ORCHESTRATOR_INSTRUCTIONS.is_empty());
-        assert!(DEFAULT_ORCHESTRATOR_INSTRUCTIONS.contains("{{assistant_name}}"));
+        assert!(DEFAULT_ORCHESTRATOR_INSTRUCTIONS.contains("# You are the Orchestrator"));
     }
 
     /// Phase 5 (review-workspaces §8/§9/§15/§16): the orchestrator prompt must
@@ -1766,7 +1759,7 @@ mod tests {
 
     /// Acceptance criterion (b): missing `agents/_shared/preamble.md` is
     /// a no-op — the agent's own `instructions.md` flows through
-    /// verbatim (modulo `{{assistant_name}}` substitution).
+    /// verbatim.
     #[test]
     fn compose_agent_prompt_returns_just_instructions_when_preamble_absent() {
         let _g = LOCK.lock().unwrap_or_else(|p| p.into_inner());
@@ -1841,35 +1834,6 @@ mod tests {
 
         let composed = compose_agent_prompt("p", "developer").unwrap();
         assert_eq!(composed, "preamble\n\n# Developer\n");
-        std::env::remove_var("SHELBI_HOME");
-    }
-
-    /// The `{{assistant_name}}` placeholder used by the orchestrator
-    /// template still gets substituted when the prompt flows through
-    /// the compose pipeline (formerly `system_prompt()` did it).
-    #[test]
-    fn compose_agent_prompt_substitutes_assistant_name_placeholder() {
-        let _g = LOCK.lock().unwrap_or_else(|p| p.into_inner());
-        let home = fresh_home();
-        std::env::set_var("SHELBI_HOME", &home);
-
-        let workspace = agent_workspace_dir("p", ORCHESTRATOR_AGENT).unwrap();
-        ensure_dir(&workspace).unwrap();
-        fs::write(
-            agent_instructions_path("p", ORCHESTRATOR_AGENT).unwrap(),
-            "# You are {{assistant_name}}\nbody\n",
-        )
-        .unwrap();
-        // No custom config — falls back to DEFAULT_ASSISTANT_NAME.
-        let composed = compose_agent_prompt("p", ORCHESTRATOR_AGENT).unwrap();
-        assert!(
-            composed.contains(&format!("# You are {}", crate::DEFAULT_ASSISTANT_NAME)),
-            "placeholder should be substituted: {composed}",
-        );
-        assert!(
-            !composed.contains("{{assistant_name}}"),
-            "no raw placeholder should survive: {composed}",
-        );
         std::env::remove_var("SHELBI_HOME");
     }
 
