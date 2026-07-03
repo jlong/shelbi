@@ -52,12 +52,16 @@ const TUI_YELLOW = "#dcb767" // ANSI 3 — `Active` category (in_progress)
 const TUI_MAGENTA = "#c586c0" // ANSI 5 — `Handoff` (review) + `@workspace`
 const TUI_GREEN = "#5fb56d" // ANSI 2 — `Done` category + Working badge
 const TUI_CYAN = "#4ec9b0" // ANSI 6 — project name in title bar + ✓ review badge
-const SEL_BG = "#264f78" // ratatui `bg(Blue)` for a focused card
+// Focused-card highlight: the shared selection gray `theme::SELECTION_BG`
+// (`Color::Rgb(63,63,63)`) the TUI paints every selection background with —
+// nav, kanban card, review queue, and filter dropdowns all use this one
+// value so they can't drift. Selected text keeps an explicit `fg(White)` +
+// bold so it stays readable on the gray.
+const SEL_BG = "#3f3f3f" // ratatui `bg(theme::SELECTION_BG)` for a focused card
 const SEL_FG = "#ffffff" // ratatui `fg(White)` for a focused card
-// Sidebar's per-row selection fill: `Color::Rgb(63,63,63)` in
-// `sidebar.rs::render_list` — a dark gray band, softer than the kanban
-// card's blue highlight.
-const SIDEBAR_SEL_BG = "#3f3f3f"
+// Sidebar's per-row selection fill uses the same `theme::SELECTION_BG` gray
+// as the focused card above — one selection color across every surface.
+const SIDEBAR_SEL_BG = SEL_BG
 
 // ── Layout constants ─────────────────────────────────────────────────
 // Kanban columns are fixed at 22 monospace cells (20 for card text + a
@@ -80,7 +84,7 @@ const BOARD_W = 1 + 5 * COL_W
 
 export type Category = "gray" | "blue" | "yellow" | "magenta" | "green"
 
-/** One kanban card. `selected` draws the focused-card blue highlight. */
+/** One kanban card. `selected` draws the focused-card gray highlight. */
 export type Card = {
   title: string
   id: string
@@ -255,7 +259,7 @@ function columnRows(col: Column): Segment[][] {
     const metaPad = COL_W - metaBaseLen
     if (card.selected) {
       // Selected card: the highlight bg spans the full cell — id and
-      // workspace both render as white-on-blue instead of their normal
+      // workspace both render as white-on-gray instead of their normal
       // hues, matching how ratatui applies `List::highlight_style` to
       // the entire row.
       rows.push([
