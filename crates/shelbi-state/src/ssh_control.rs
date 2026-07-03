@@ -11,6 +11,10 @@
 //! aliveness beacon. The cleanup pass refuses to touch the directory
 //! when the PID file points at a still-running shelbi process other
 //! than us — that's another live daemon's CMs and they belong to it.
+//! To survive PID reuse the file records a process *identity* token (the
+//! recorded process's start-time) alongside the bare PID: a recycled PID
+//! whose start-time no longer matches is recognized as NOT the daemon,
+//! so cleanup isn't skipped forever (adversarial review state-runtime F5).
 
 use std::ffi::OsString;
 use std::fs;
@@ -95,24 +99,61 @@ pub fn daemon_pid_file_path() -> Result<PathBuf> {
     Ok(shelbi_home()?.join("shelbi.pid"))
 }
 
-/// Read the PID stored in `$SHELBI_HOME/shelbi.pid`. Returns `Ok(None)`
-/// when the file is missing OR contains an unparseable value — a torn
-/// or empty file from a crashed write is treated the same as "no
-/// previous daemon recorded itself."
-pub fn read_daemon_pid() -> Result<Option<libc::pid_t>> {
+/// A parsed daemon PID file: the recorded PID plus the process
+/// start-time token captured when the daemon wrote it.
+///
+/// `start_time` is `None` for a legacy single-field file (written before
+/// this crate recorded identity) or when the writing daemon's start-time
+/// couldn't be read. In that case identity can't be verified and callers
+/// fall back to a bare liveness probe.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DaemonPidRecord {
+    pub pid: libc::pid_t,
+    pub start_time: Option<u64>,
+}
+
+/// Read and parse `$SHELBI_HOME/shelbi.pid`. Returns `Ok(None)` when the
+/// file is missing OR its first field is an unparseable PID — a torn or
+/// empty file from a crashed write is treated the same as "no previous
+/// daemon recorded itself."
+///
+/// File layout is `<pid>` or `<pid> <start_time>` (whitespace-separated,
+/// one line). A missing or unparseable second field yields
+/// `start_time: None`, keeping the reader compatible with legacy files.
+pub fn read_daemon_pid_record() -> Result<Option<DaemonPidRecord>> {
     let path = daemon_pid_file_path()?;
     let text = match fs::read_to_string(&path) {
         Ok(t) => t,
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
         Err(e) => return Err(shelbi_core::Error::Io(e)),
     };
-    Ok(text.trim().parse::<libc::pid_t>().ok())
+    let mut fields = text.split_whitespace();
+    let pid = match fields.next().and_then(|f| f.parse::<libc::pid_t>().ok()) {
+        Some(p) => p,
+        None => return Ok(None),
+    };
+    let start_time = fields.next().and_then(|f| f.parse::<u64>().ok());
+    Ok(Some(DaemonPidRecord { pid, start_time }))
 }
 
-/// Atomically write our PID to `$SHELBI_HOME/shelbi.pid`.
+/// Read just the PID stored in `$SHELBI_HOME/shelbi.pid`. Thin wrapper
+/// over [`read_daemon_pid_record`] for callers that don't need the
+/// identity token. Returns `Ok(None)` on a missing or torn file.
+pub fn read_daemon_pid() -> Result<Option<libc::pid_t>> {
+    Ok(read_daemon_pid_record()?.map(|r| r.pid))
+}
+
+/// Atomically write our PID — and, when we can read it, our start-time
+/// identity token — to `$SHELBI_HOME/shelbi.pid`. Recording the
+/// start-time lets the next startup's cleanup tell a genuine live daemon
+/// apart from an unrelated process that recycled the same PID.
 pub fn write_daemon_pid(pid: libc::pid_t) -> Result<()> {
     let path = daemon_pid_file_path()?;
-    crate::atomic_write(&path, format!("{pid}\n").as_bytes())
+    let body = match process_start_time(pid) {
+        Some(start) => format!("{pid} {start}\n"),
+        None => format!("{pid}\n"),
+    };
+    crate::atomic_write(&path, body.as_bytes())
 }
 
 /// Best-effort unlink of the daemon PID file. Missing file is not an
@@ -145,6 +186,91 @@ pub fn is_process_alive(pid: libc::pid_t) -> bool {
     io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
 }
 
+/// A per-process start-time token, used to distinguish a genuine live
+/// process from an unrelated one that later recycled the same PID.
+/// Encoded as start-seconds×10⁶ + start-microseconds on macOS and as the
+/// kernel's `starttime` clock-tick field on Linux — the absolute unit
+/// doesn't matter, only that the value is stable for a process's lifetime
+/// and (practically) never collides across a PID's reuse.
+///
+/// Returns `None` when the process doesn't exist or its start-time can't
+/// be read; callers treat that as "identity unknown" and fall back to a
+/// bare liveness probe rather than guessing.
+#[cfg(target_os = "macos")]
+fn process_start_time(pid: libc::pid_t) -> Option<u64> {
+    if pid <= 0 {
+        return None;
+    }
+    let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
+    let size = std::mem::size_of::<libc::proc_bsdinfo>() as libc::c_int;
+    // SAFETY: proc_pidinfo writes at most `size` bytes into `info`, which
+    // is exactly `size` bytes of owned, zeroed storage.
+    let n = unsafe {
+        libc::proc_pidinfo(
+            pid,
+            libc::PROC_PIDTBSDINFO,
+            0,
+            &mut info as *mut _ as *mut libc::c_void,
+            size,
+        )
+    };
+    // proc_pidinfo returns the number of bytes filled; a short/zero/error
+    // return means we couldn't read the record.
+    if n != size {
+        return None;
+    }
+    Some(
+        info.pbi_start_tvsec
+            .wrapping_mul(1_000_000)
+            .wrapping_add(info.pbi_start_tvusec),
+    )
+}
+
+/// Linux: field 22 (`starttime`) of `/proc/<pid>/stat`, in clock ticks
+/// since boot. The `comm` field (2) is parenthesised and may itself
+/// contain spaces or `)`, so we split on the *last* `)` before tokenising
+/// the remaining, space-clean fields — `starttime` is the 20th of those.
+#[cfg(target_os = "linux")]
+fn process_start_time(pid: libc::pid_t) -> Option<u64> {
+    if pid <= 0 {
+        return None;
+    }
+    let stat = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    let after_comm = &stat[stat.rfind(')')? + 1..];
+    // After comm the fields are state(3) ppid(4) … starttime(22); the
+    // slice starts at field 3, so starttime is index 22-3 = 19.
+    after_comm.split_whitespace().nth(19)?.parse::<u64>().ok()
+}
+
+/// Fallback for platforms where we don't have a start-time probe: report
+/// identity as unknown so callers degrade to a bare liveness check.
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+fn process_start_time(_pid: libc::pid_t) -> Option<u64> {
+    None
+}
+
+/// Is the daemon recorded in the PID file still the *same* running
+/// process? A bare [`is_process_alive`] probe isn't enough: after PID
+/// reuse the recorded PID may belong to an unrelated process, and
+/// treating that as "another daemon" would skip ControlMaster cleanup
+/// forever (adversarial review state-runtime F5).
+///
+/// When the record carries a start-time and we can read the current
+/// process's start-time, they must match — a mismatch means the PID was
+/// recycled to something that isn't our daemon. If either start-time is
+/// unavailable (a legacy file, or a live process we can't introspect) we
+/// conservatively fall back to liveness so we never nuke a real daemon's
+/// ControlMasters on a probe we couldn't complete.
+fn is_recorded_daemon_alive(rec: DaemonPidRecord) -> bool {
+    if !is_process_alive(rec.pid) {
+        return false;
+    }
+    match (rec.start_time, process_start_time(rec.pid)) {
+        (Some(recorded), Some(current)) => recorded == current,
+        _ => true,
+    }
+}
+
 /// Outcome of [`cleanup_stale_control_masters`] — surfaced so the
 /// daemon can log a one-liner instead of guessing.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -169,9 +295,9 @@ pub enum CmCleanupOutcome {
 /// files in the directory are skipped silently — a stray text file
 /// shouldn't keep the daemon from starting.
 pub fn cleanup_stale_control_masters(self_pid: libc::pid_t) -> Result<CmCleanupOutcome> {
-    if let Some(prev) = read_daemon_pid()? {
-        if prev != self_pid && is_process_alive(prev) {
-            return Ok(CmCleanupOutcome::SkippedAnotherDaemon { pid: prev });
+    if let Some(rec) = read_daemon_pid_record()? {
+        if rec.pid != self_pid && is_recorded_daemon_alive(rec) {
+            return Ok(CmCleanupOutcome::SkippedAnotherDaemon { pid: rec.pid });
         }
     }
 
@@ -406,6 +532,116 @@ mod tests {
         // Sentinel: 0 and negatives never refer to a real process.
         assert!(!is_process_alive(0));
         assert!(!is_process_alive(-1));
+    }
+
+    #[test]
+    fn process_start_time_is_readable_and_stable_for_self() {
+        // On the platforms we support (macOS/Linux) our own start-time
+        // must be readable — the identity check depends on it. A second
+        // read is stable (the value doesn't drift for a live process).
+        let self_pid = std::process::id() as libc::pid_t;
+        let a = process_start_time(self_pid);
+        assert!(a.is_some(), "own start-time should be readable");
+        assert_eq!(a, process_start_time(self_pid), "start-time must be stable");
+        // Sentinels never name a real process.
+        assert_eq!(process_start_time(0), None);
+        assert_eq!(process_start_time(-1), None);
+    }
+
+    #[test]
+    fn write_daemon_pid_records_start_time_for_a_live_process() {
+        let _g = lock_test();
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+        // Writing OUR pid captures a start-time token (we're alive), so
+        // the record round-trips with identity present.
+        let self_pid = std::process::id() as libc::pid_t;
+        write_daemon_pid(self_pid).unwrap();
+        let rec = read_daemon_pid_record().unwrap().unwrap();
+        assert_eq!(rec.pid, self_pid);
+        assert_eq!(rec.start_time, process_start_time(self_pid));
+        assert!(rec.start_time.is_some());
+        std::env::remove_var("SHELBI_HOME");
+    }
+
+    #[test]
+    fn legacy_pid_only_file_parses_with_no_identity() {
+        let _g = lock_test();
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+        // A single-field file (the pre-identity format) still parses; the
+        // identity token is simply absent.
+        fs::write(home.join("shelbi.pid"), "4242\n").unwrap();
+        let rec = read_daemon_pid_record().unwrap().unwrap();
+        assert_eq!(rec.pid, 4242);
+        assert_eq!(rec.start_time, None);
+        // The pid-only accessor still works too.
+        assert_eq!(read_daemon_pid().unwrap(), Some(4242));
+        std::env::remove_var("SHELBI_HOME");
+    }
+
+    #[test]
+    fn recycled_pid_with_wrong_identity_is_treated_as_stale() {
+        let _g = lock_test();
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+        let ssh_dir = ssh_control_dir().unwrap();
+        fs::create_dir_all(&ssh_dir).unwrap();
+
+        // An orphan socket that a correct cleanup pass must unlink.
+        let orphan = ssh_dir.join("user@orphan");
+        {
+            let _l = UnixListener::bind(&orphan).unwrap();
+        }
+        assert!(!is_socket_alive(&orphan));
+
+        // Fixture: the PID file names a *live* process (this test), but
+        // pairs it with a start-time that can't match — the hallmark of a
+        // recycled PID that now belongs to an unrelated process. The old
+        // bare kill-0 check would treat this as "another daemon" and skip
+        // cleanup forever (state-runtime F5).
+        let self_pid = std::process::id() as libc::pid_t;
+        let real = process_start_time(self_pid).expect("own start-time readable");
+        let bogus = real ^ 0xDEAD_BEEF;
+        assert_ne!(bogus, real);
+        fs::write(home.join("shelbi.pid"), format!("{self_pid} {bogus}\n")).unwrap();
+
+        // Pass a *different* self_pid so we exercise the identity path
+        // rather than the "that PID is us" short-circuit. Identity
+        // mismatch → recycled → cleanup proceeds and the orphan is gone.
+        let outcome = cleanup_stale_control_masters(self_pid + 1).unwrap();
+        assert_eq!(outcome, CmCleanupOutcome::Scanned { removed: 1, kept: 0 });
+        assert!(!orphan.exists());
+
+        std::env::remove_var("SHELBI_HOME");
+    }
+
+    #[test]
+    fn genuine_live_daemon_with_matching_identity_is_detected() {
+        let _g = lock_test();
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+        let ssh_dir = ssh_control_dir().unwrap();
+        fs::create_dir_all(&ssh_dir).unwrap();
+
+        // Orphan that must be LEFT ALONE while another daemon owns the dir.
+        let orphan = ssh_dir.join("user@orphan");
+        {
+            let _l = UnixListener::bind(&orphan).unwrap();
+        }
+
+        // Record this process with its true start-time — a genuine live
+        // daemon. write_daemon_pid captures the matching identity token.
+        let self_pid = std::process::id() as libc::pid_t;
+        write_daemon_pid(self_pid).unwrap();
+
+        // A different caller PID → identity check fires, start-times match,
+        // so we recognise a live daemon and skip cleanup.
+        let outcome = cleanup_stale_control_masters(self_pid + 1).unwrap();
+        assert_eq!(outcome, CmCleanupOutcome::SkippedAnotherDaemon { pid: self_pid });
+        assert!(orphan.exists(), "another daemon's socket must be untouched");
+
+        std::env::remove_var("SHELBI_HOME");
     }
 
     #[test]
