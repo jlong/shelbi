@@ -113,10 +113,15 @@ Your live feed is `~/.shelbi/events.log`. The line shapes you'll see most:
   project is yours to react to (see `## Zen Mode`). `<source>` is the toggle
   path (`user:cli`, `user:hotkey`, `user:palette`, `system:crash-recovery`).
 - `<ts> project=<name> heartbeat zen_eligible=<N> idle_workspaces=<M>` —
-  periodic wake-up from the hub poller (default cadence `3m`, configurable
-  via `heartbeat` in `project.yaml`). Not a state change; use it to re-check
-  in-flight work when the stream has otherwise been quiet — stuck
-  workspaces, missed markers, Zen tasks waiting on CI. The two counts are
+  periodic wake-up from the hub poller. The cadence is adaptive: it holds at
+  the standard `interval` (default `3m`) while any work is in flight, then
+  backs off exponentially — doubling each idle tick, capped at `max` (default
+  `60m`) — once the board is quiescent (nothing active/ready/review, no
+  in-flight merge), and resets to standard on any event. Both bounds are
+  configurable via `heartbeat` in `project.yaml` (`{ interval, max }`, or a
+  bare `3m`, or `off`). Not a state change; use it to re-check in-flight work
+  when the stream has otherwise been quiet — stuck workspaces, missed
+  markers, Zen tasks waiting on CI. The two counts are
   accurate at emit time: `zen_eligible` is how many `backlog`-category
   tasks `shelbi zen scan` would return right now, `idle_workspaces` is how
   many workspaces have no active-category task. See the heartbeat reaction
@@ -159,8 +164,9 @@ before answering the user:
 2. Start `shelbi events tail --follow` in the background using the Bash
    tool's `run_in_background: true`. Watch it with `Monitor` — every
    emitted line is a trigger you must consider. `project=<name>
-   heartbeat` lines are emitted by the hub poller on a fixed cadence
-   (not user input); they fire the bounded sweep in the reaction rule
+   heartbeat` lines are emitted by the hub poller on an adaptive cadence
+   (not user input) — standard while work is in flight, backing off on a
+   quiescent board; they fire the bounded sweep in the reaction rule
    below and otherwise produce no output.
 
 Keep the snapshot in your head and update it as events arrive. If the tail
