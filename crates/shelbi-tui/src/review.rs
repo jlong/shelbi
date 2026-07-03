@@ -20,7 +20,7 @@ use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Wrap},
+    widgets::{Block, Borders, List, ListItem, ListState, Paragraph},
     Frame,
 };
 use shelbi_core::{Column, Project, Task};
@@ -334,9 +334,11 @@ fn render_detail(f: &mut Frame, app: &ReviewApp, area: Rect) {
         chunks[1],
     );
 
-    let body = Paragraph::new(tf.body.clone())
-        .wrap(Wrap { trim: false })
-        .scroll((app.body_scroll, 0));
+    // Pre-wrap here (rather than `Paragraph`'s `Wrap`) so inline-code
+    // highlights stay clamped to the content width and can't bleed past
+    // the pane's right edge at a wrap boundary.
+    let lines = crate::markdown::render_note(&tf.body, chunks[2].width as usize);
+    let body = Paragraph::new(lines).scroll((app.body_scroll, 0));
     f.render_widget(body, chunks[2]);
 }
 

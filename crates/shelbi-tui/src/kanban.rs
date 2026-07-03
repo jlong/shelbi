@@ -24,7 +24,7 @@ use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap},
+    widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph},
     Frame,
 };
 use shelbi_core::{
@@ -2448,9 +2448,10 @@ fn render_popover(f: &mut Frame, app: &KanbanApp, area: Rect) {
     );
 
     let scroll = app.popover.as_ref().map(|p| p.scroll).unwrap_or(0);
-    let body = Paragraph::new(body_text)
-        .wrap(Wrap { trim: false })
-        .scroll((scroll, 0));
+    // Pre-wrap so inline-code highlights stay within the popover's inner
+    // width — see `markdown::render_note`.
+    let lines = crate::markdown::render_note(&body_text, chunks[2].width as usize);
+    let body = Paragraph::new(lines).scroll((scroll, 0));
     f.render_widget(body, chunks[2]);
 
     // First-chord-only: the popover's `close` and `scroll` actions each

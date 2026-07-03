@@ -24,6 +24,7 @@ mod app;
 mod handlers;
 mod kanban;
 mod keymap;
+mod markdown;
 mod poller;
 mod review;
 mod sidebar;
