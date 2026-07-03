@@ -224,6 +224,14 @@ pub fn focus_workspace(project_name: &str, workspace_name: &str) -> Result<()> {
 pub fn ensure_dashboard(project_name: &str) -> Result<BootstrapStatus> {
     let project = shelbi_state::load_project(project_name)?;
 
+    // Serialize the whole bootstrap. `ensure_dashboard` is check-then-act
+    // (count panes, split if <2); two callers racing it (CLI + TUI launcher)
+    // would each split and double-split the dashboard or orphan the
+    // orchestrator pane (F11). The loser blocks here, then finds the layout
+    // already present and heals it below. Held until the guard drops at end
+    // of scope.
+    let _bootstrap_lock = shelbi_state::lock_dashboard(project_name)?;
+
     let hub = project
         .machines
         .iter()
@@ -347,13 +355,19 @@ pub fn ensure_dashboard(project_name: &str) -> Result<BootstrapStatus> {
     // changes the chord rebinds tmux without manual fiddling.
     let _ = apply_palette_binding(&host, project_name, &shelbi_bin);
 
-    // 2. If the dashboard already has 2+ panes, layout is set up.
+    // 2. If the dashboard already has 2+ panes, the split layout is set up.
+    //    Don't return yet: the hidden-view stash may be missing or only
+    //    partially built — a crash between the split and step 4, or a shelbi
+    //    upgrade that added a view. The old early-return here (before step 4)
+    //    meant that half-created stash never healed (F9). Run the idempotent
+    //    view heal, then report AlreadyRunning.
     let panes = shelbi_ssh::run_capture(
         &host,
         ["tmux", "list-panes", "-t", &dashboard, "-F", "#P"],
     )?;
     let pane_count = panes.lines().filter(|l| !l.trim().is_empty()).count();
     if pane_count >= 2 {
+        ensure_hidden_views(&host, session, project_name, &shelbi_bin)?;
         return Ok(BootstrapStatus::AlreadyRunning);
     }
 
@@ -400,7 +414,7 @@ pub fn ensure_dashboard(project_name: &str) -> Result<BootstrapStatus> {
     // 4. Materialize the hidden `__views` window with tasks/review/machines
     //    panes. Each runs a tiny watch loop or one-shot script. Sidebar
     //    swaps them into the dashboard's right pane via `tmux swap-pane`.
-    create_hidden_views(&host, session, project_name, &shelbi_bin)?;
+    ensure_hidden_views(&host, session, project_name, &shelbi_bin)?;
 
     Ok(BootstrapStatus::Started)
 }
@@ -484,6 +498,125 @@ fn apply_palette_binding(
     Ok(tmux_key)
 }
 
+/// The four hidden views, in creation order, paired with the pane command
+/// each runs. Order matters only for the fresh-build path (`tasks` seeds the
+/// stash session; the rest split off it), but a single source of truth keeps
+/// the fresh build and the heal pass from drifting apart.
+fn hidden_view_cmds(shelbi_bin: &str, project_name: &str) -> [(&'static str, String); 4] {
+    [
+        ("tasks", tasks_cmd(shelbi_bin, project_name)),
+        ("review", review_cmd(shelbi_bin, project_name)),
+        ("machines", machines_cmd(shelbi_bin, project_name)),
+        ("activity", activity_cmd(shelbi_bin, project_name)),
+    ]
+}
+
+/// Idempotently ensure the hidden `__views` stash exists with a live pane for
+/// every view. On a fresh session this builds the whole stash; on an existing
+/// one it heals only the panes that are missing or dead — the state a crash
+/// mid-bootstrap or a shelbi upgrade (new view added) leaves behind, which the
+/// coarse `has_session` skip in `create_hidden_views` never repaired (F9).
+///
+/// Safe to call whether or not the visible dashboard already looks complete;
+/// `ensure_dashboard` runs it on both the fresh-split and already-running
+/// paths so a partially-built stash always converges to four live panes.
+fn ensure_hidden_views(
+    host: &shelbi_core::Host,
+    session: &str,
+    project_name: &str,
+    shelbi_bin: &str,
+) -> Result<()> {
+    let stash = format!("_{session}");
+
+    // No stash yet — build it whole (the `tasks` pane seeds the session, the
+    // rest split off it). This is the original first-time bootstrap path.
+    if !shelbi_tmux::has_session(host, &stash)? {
+        return create_hidden_views(host, session, project_name, shelbi_bin);
+    }
+
+    // Stash exists: heal per view. A view is healthy iff `SHELBI_PANE_<view>`
+    // is set on the visible session AND names a pane still alive in the stash.
+    // Anything else gets a fresh pane spliced into the `views` window and its
+    // id pinned back into the session env so `show_view` can swap it in.
+    let stash_win = format!("{stash}:views");
+    // A partial stash (seed pane + up to four heals) can exceed the four-pane
+    // budget of the detached default 80x24 window and trip `no space for new
+    // pane`. Grow it first; the panes render at the visible dashboard's size
+    // once swapped in, so the stash geometry is immaterial.
+    resize_stash_window(host, &stash_win);
+    let live = live_stash_pane_ids(host, &stash)?;
+    for (view, cmd) in hidden_view_cmds(shelbi_bin, project_name) {
+        let env_key = format!("SHELBI_PANE_{view}");
+        let healthy = read_session_env_var(host, session, &env_key)?
+            .map(|id| live.contains(&id))
+            .unwrap_or(false);
+        if healthy {
+            continue;
+        }
+        let pane_id = shelbi_ssh::run_capture(
+            host,
+            [
+                "tmux", "split-window", "-v", "-t", &stash_win,
+                "-P", "-F", "#{pane_id}",
+                "sh", "-c", &cmd,
+            ],
+        )?;
+        set_session_env(host, session, &env_key, pane_id.trim())?;
+    }
+    Ok(())
+}
+
+/// Grow the detached stash window so vertical splits always have room. The
+/// default 80x24 detached window fits only ~4 stacked panes; a partial-heal
+/// pass can need more transiently. Best-effort — a failure just risks the
+/// original `no space` error on the next split, which surfaces there.
+fn resize_stash_window(host: &shelbi_core::Host, stash_win: &str) {
+    let _ = shelbi_ssh::run(
+        host,
+        ["tmux", "resize-window", "-t", stash_win, "-x", "220", "-y", "200"],
+    );
+}
+
+/// Pane ids currently alive in the stash's `views` window.
+fn live_stash_pane_ids(host: &shelbi_core::Host, stash: &str) -> Result<Vec<String>> {
+    let out = shelbi_ssh::run_capture(
+        host,
+        ["tmux", "list-panes", "-t", &format!("{stash}:views"), "-F", "#{pane_id}"],
+    )?;
+    Ok(out
+        .lines()
+        .map(|l| l.trim().to_string())
+        .filter(|l| !l.is_empty())
+        .collect())
+}
+
+/// Read `key` from `session`'s tmux environment over `host`. Returns `None`
+/// when the variable is unset or explicitly cleared (`-KEY`). Mirrors the
+/// local-only `read_pane_id`, but routes through `host` so it also works on
+/// the remote-hub path. Uses `run` (not `run_capture`) because tmux exits
+/// non-zero for an unknown variable — a legitimate "unset", not an error.
+fn read_session_env_var(
+    host: &shelbi_core::Host,
+    session: &str,
+    key: &str,
+) -> Result<Option<String>> {
+    let out = shelbi_ssh::run(host, ["tmux", "show-environment", "-t", session, key])
+        .map_err(Error::Io)?;
+    if !out.status.success() {
+        return Ok(None);
+    }
+    let line = String::from_utf8_lossy(&out.stdout);
+    let line = line.trim();
+    // `-KEY` form means the variable is explicitly unset on this session.
+    if line.starts_with('-') {
+        return Ok(None);
+    }
+    match line.split_once('=') {
+        Some((_, value)) if !value.is_empty() => Ok(Some(value.to_string())),
+        _ => Ok(None),
+    }
+}
+
 fn create_hidden_views(
     host: &shelbi_core::Host,
     session: &str,
@@ -496,65 +629,49 @@ fn create_hidden_views(
     // sessions works just like within one.
     let stash = format!("_{session}");
 
-    // Already exists? Skip (idempotent).
+    // Already exists? Skip (idempotent). Per-pane healing of an existing
+    // stash is `ensure_hidden_views`' job — this builds the whole thing.
     if shelbi_tmux::has_session(host, &stash)? {
         return Ok(());
     }
 
-    let tasks_cmd_str = tasks_cmd(shelbi_bin, project_name);
-    let review_cmd_str = review_cmd(shelbi_bin, project_name);
-    let machines_cmd_str = machines_cmd(shelbi_bin, project_name);
-    let activity_cmd_str = activity_cmd(shelbi_bin, project_name);
-
-    // Create the stash session detached, with tasks pane.
-    let tasks_id = shelbi_ssh::run_capture(
-        host,
-        [
-            "tmux", "new-session", "-d", "-s", &stash, "-n", "views",
-            "-P", "-F", "#{pane_id}",
-            "sh", "-c", &tasks_cmd_str,
-        ],
-    )?;
-    let tasks_id = tasks_id.trim().to_string();
-
     let stash_win = format!("{stash}:views");
 
-    let review_id = shelbi_ssh::run_capture(
-        host,
-        [
-            "tmux", "split-window", "-v", "-t", &stash_win,
-            "-P", "-F", "#{pane_id}",
-            "sh", "-c", &review_cmd_str,
-        ],
-    )?;
-    let review_id = review_id.trim().to_string();
-
-    let machines_id = shelbi_ssh::run_capture(
-        host,
-        [
-            "tmux", "split-window", "-v", "-t", &stash_win,
-            "-P", "-F", "#{pane_id}",
-            "sh", "-c", &machines_cmd_str,
-        ],
-    )?;
-    let machines_id = machines_id.trim().to_string();
-
-    let activity_id = shelbi_ssh::run_capture(
-        host,
-        [
-            "tmux", "split-window", "-v", "-t", &stash_win,
-            "-P", "-F", "#{pane_id}",
-            "sh", "-c", &activity_cmd_str,
-        ],
-    )?;
-    let activity_id = activity_id.trim().to_string();
-
-    // Env vars live on the *visible* session — that's where show_view reads
-    // them from. swap-pane finds the target pane by global pane id anyway.
-    set_session_env(host, session, "SHELBI_PANE_tasks", &tasks_id)?;
-    set_session_env(host, session, "SHELBI_PANE_review", &review_id)?;
-    set_session_env(host, session, "SHELBI_PANE_machines", &machines_id)?;
-    set_session_env(host, session, "SHELBI_PANE_activity", &activity_id)?;
+    // Build all four panes from the single source of truth. The first pane
+    // seeds the detached stash session; the rest split off it. Each pane's
+    // id is pinned into the *visible* session env as soon as it's created —
+    // that's where `show_view` reads them from, and setting them
+    // incrementally means a crash partway through leaves valid env entries
+    // for whatever was created (the rest heal on the next bootstrap).
+    for (i, (view, cmd)) in hidden_view_cmds(shelbi_bin, project_name)
+        .iter()
+        .enumerate()
+    {
+        let pane_id = if i == 0 {
+            let id = shelbi_ssh::run_capture(
+                host,
+                [
+                    "tmux", "new-session", "-d", "-s", &stash, "-n", "views",
+                    "-P", "-F", "#{pane_id}",
+                    "sh", "-c", cmd,
+                ],
+            )?;
+            // Grow the detached window before stacking the rest so the splits
+            // don't run out of rows (default detached size is only 80x24).
+            resize_stash_window(host, &stash_win);
+            id
+        } else {
+            shelbi_ssh::run_capture(
+                host,
+                [
+                    "tmux", "split-window", "-v", "-t", &stash_win,
+                    "-P", "-F", "#{pane_id}",
+                    "sh", "-c", cmd,
+                ],
+            )?
+        };
+        set_session_env(host, session, &format!("SHELBI_PANE_{view}"), pane_id.trim())?;
+    }
     Ok(())
 }
 
@@ -1446,5 +1563,164 @@ mod create_stash_pane_tmux_tests {
 
         kill_session(&vis);
         kill_session(&format!("_{vis}"));
+    }
+}
+
+#[cfg(test)]
+mod ensure_hidden_views_tmux_tests {
+    //! Tmux-touching tests for the F9 hidden-view heal pass. Each spins up a
+    //! visible session (so `set_session_env` has a target), exercises
+    //! `ensure_hidden_views` against the local tmux server, and asserts the
+    //! stash converges to one live pane per view with env pinned. Skipped
+    //! silently when `tmux` isn't on PATH.
+    use super::*;
+    use shelbi_core::Host;
+
+    fn tmux_available() -> bool {
+        std::process::Command::new("tmux")
+            .arg("-V")
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false)
+    }
+
+    fn kill_session(name: &str) {
+        let _ = std::process::Command::new("tmux")
+            .args(["kill-session", "-t", name])
+            .output();
+    }
+
+    fn pane_count(session_win: &str) -> usize {
+        let out = std::process::Command::new("tmux")
+            .args(["list-panes", "-t", session_win, "-F", "#{pane_id}"])
+            .output()
+            .expect("tmux list-panes");
+        if !out.status.success() {
+            return 0;
+        }
+        String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .count()
+    }
+
+    fn env_var(session: &str, key: &str) -> Option<String> {
+        read_session_env_var(&Host::Local, session, key).unwrap()
+    }
+
+    /// Fresh path: no stash session yet. `ensure_hidden_views` must build the
+    /// whole stash — four panes, one env var each on the visible session.
+    #[test]
+    fn builds_stash_from_scratch_when_missing() {
+        if !tmux_available() {
+            eprintln!("skipping: tmux not on PATH");
+            return;
+        }
+        let vis = format!("shelbi-test-ehv-fresh-{}", std::process::id());
+        let stash = format!("_{vis}");
+        kill_session(&vis);
+        kill_session(&stash);
+        std::process::Command::new("tmux")
+            .args(["new-session", "-d", "-s", &vis, "-n", "dashboard", "sh", "-c", "sleep 30"])
+            .status()
+            .unwrap();
+
+        ensure_hidden_views(&Host::Local, &vis, "proj", "shelbi").unwrap();
+
+        assert_eq!(pane_count(&format!("{stash}:views")), 4, "expected 4 view panes");
+        for view in ["tasks", "review", "machines", "activity"] {
+            let id = env_var(&vis, &format!("SHELBI_PANE_{view}"));
+            assert!(id.is_some(), "SHELBI_PANE_{view} should be pinned on the visible session");
+            assert!(id.unwrap().starts_with('%'), "env should hold a tmux pane id");
+        }
+
+        kill_session(&vis);
+        kill_session(&stash);
+    }
+
+    /// Heal path — the F9 core: a dashboard whose panes are present but whose
+    /// view stash is only partially built (session exists, no env pinned) is
+    /// completed on the next call. Simulates a crash between the split and
+    /// stash creation. Also asserts idempotency: a second call is a no-op.
+    #[test]
+    fn heals_partial_stash_and_is_idempotent() {
+        if !tmux_available() {
+            eprintln!("skipping: tmux not on PATH");
+            return;
+        }
+        let vis = format!("shelbi-test-ehv-heal-{}", std::process::id());
+        let stash = format!("_{vis}");
+        kill_session(&vis);
+        kill_session(&stash);
+        std::process::Command::new("tmux")
+            .args(["new-session", "-d", "-s", &vis, "-n", "dashboard", "sh", "-c", "sleep 30"])
+            .status()
+            .unwrap();
+        // Stash exists with a lone seed pane and NO env pinned — the
+        // "half-created view stash" the old early-return never healed.
+        std::process::Command::new("tmux")
+            .args(["new-session", "-d", "-s", &stash, "-n", "views", "sh", "-c", "sleep 30"])
+            .status()
+            .unwrap();
+        assert_eq!(pane_count(&format!("{stash}:views")), 1);
+
+        ensure_hidden_views(&Host::Local, &vis, "proj", "shelbi").unwrap();
+
+        // Seed pane + one fresh pane per view = 5, all four views pinned to a
+        // pane that's actually alive in the stash.
+        assert_eq!(pane_count(&format!("{stash}:views")), 5, "one pane spliced per missing view");
+        let live = live_stash_pane_ids(&Host::Local, &stash).unwrap();
+        for view in ["tasks", "review", "machines", "activity"] {
+            let id = env_var(&vis, &format!("SHELBI_PANE_{view}"))
+                .unwrap_or_else(|| panic!("SHELBI_PANE_{view} unset after heal"));
+            assert!(live.contains(&id), "pinned {view} pane {id} must be alive in the stash");
+        }
+
+        // Second call: every view is now healthy, so nothing new is spliced.
+        ensure_hidden_views(&Host::Local, &vis, "proj", "shelbi").unwrap();
+        assert_eq!(pane_count(&format!("{stash}:views")), 5, "heal must be idempotent");
+
+        kill_session(&vis);
+        kill_session(&stash);
+    }
+
+    /// A dead env reference (view pinned to a pane that no longer exists) is
+    /// re-created, not left dangling.
+    #[test]
+    fn heals_view_pinned_to_a_dead_pane() {
+        if !tmux_available() {
+            eprintln!("skipping: tmux not on PATH");
+            return;
+        }
+        let vis = format!("shelbi-test-ehv-dead-{}", std::process::id());
+        let stash = format!("_{vis}");
+        kill_session(&vis);
+        kill_session(&stash);
+        std::process::Command::new("tmux")
+            .args(["new-session", "-d", "-s", &vis, "-n", "dashboard", "sh", "-c", "sleep 30"])
+            .status()
+            .unwrap();
+
+        // Build a full stash first.
+        ensure_hidden_views(&Host::Local, &vis, "proj", "shelbi").unwrap();
+        assert_eq!(pane_count(&format!("{stash}:views")), 4);
+
+        // Point `tasks` at a bogus, non-existent pane id.
+        std::process::Command::new("tmux")
+            .args(["set-environment", "-t", &vis, "SHELBI_PANE_tasks", "%99999"])
+            .status()
+            .unwrap();
+
+        ensure_hidden_views(&Host::Local, &vis, "proj", "shelbi").unwrap();
+
+        // `tasks` was re-created (5 panes now), the other three untouched.
+        assert_eq!(pane_count(&format!("{stash}:views")), 5, "dead tasks pane re-created");
+        let live = live_stash_pane_ids(&Host::Local, &stash).unwrap();
+        let tasks_id = env_var(&vis, "SHELBI_PANE_tasks").unwrap();
+        assert_ne!(tasks_id, "%99999", "stale id must be replaced");
+        assert!(live.contains(&tasks_id), "healed tasks pane must be alive");
+
+        kill_session(&vis);
+        kill_session(&stash);
     }
 }
