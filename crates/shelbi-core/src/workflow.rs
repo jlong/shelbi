@@ -449,6 +449,38 @@ impl Workflow {
             merge_strategy: git.merge_strategy,
         }))
     }
+
+    /// Resolve the `target:` override on the `from -> to` transition,
+    /// substituting `{{key}}` placeholders from the task's frontmatter
+    /// params — the branch a `merge` / `open_pr` action on this edge
+    /// should land on.
+    ///
+    /// Returns `Ok(None)` when the edge is undeclared or declares no
+    /// `target:`; the caller then falls back to the merge/open_pr default
+    /// (the workflow's resolved `git.base_branch`, or the project base).
+    /// Returns `Err(Error::MissingTaskParams)` listing every unresolved
+    /// `{{key}}` when the target names a param the task doesn't provide,
+    /// mirroring [`Workflow::resolve_git`] so a caller can report the git
+    /// block and the transition target with one error shape.
+    pub fn resolve_transition_target(
+        &self,
+        from: &str,
+        to: &str,
+        params: &BTreeMap<String, String>,
+    ) -> crate::Result<Option<String>> {
+        let Some(target) = self.transition(from, to).and_then(|t| t.target.as_deref()) else {
+            return Ok(None);
+        };
+        let mut missing: Vec<String> = Vec::new();
+        let resolved = substitute_placeholders(target, params, &mut missing);
+        if !missing.is_empty() {
+            return Err(Error::MissingTaskParams {
+                workflow: self.name.clone(),
+                params: missing,
+            });
+        }
+        Ok(Some(resolved))
+    }
 }
 
 impl<'de> Deserialize<'de> for Workflow {
@@ -763,16 +795,15 @@ pub struct InlineIdentityField {
 /// other than the workflow's resolved `git.base_branch`. See
 /// `Plans/workflows.md` §12.
 ///
-/// **Declarative only.** As of now this block is parsed, validated (every
-/// `from`/`to` must name a declared status), and round-tripped, but there
-/// is no engine that walks a transition's [`actions`](Self::actions) and
-/// fires the matching [`crate::TransitionAction`] primitives, and the
-/// [`target`](Self::target) override is not substituted for `{{var}}`
-/// placeholders. The primitives are invoked manually today via the
-/// `shelbi action` subcommands (each taking an explicit `--target`);
-/// wiring an automatic executor is tracked separately. Consumers that
-/// read this block (e.g. [`Workflow::is_merge_transition`]) treat it as a
-/// static description of intent, not something that has already run.
+/// The executor that walks a transition's [`actions`](Self::actions) and
+/// fires the matching [`crate::TransitionAction`] primitives lives in
+/// `shelbi-orchestrator` (`transition::execute_transition`, surfaced as
+/// `shelbi action apply-transition`); the [`target`](Self::target)
+/// override is substituted for `{{var}}` placeholders by
+/// [`Workflow::resolve_transition_target`] before it reaches the
+/// `merge` / `open_pr` primitives. Consumers that only read this block
+/// (e.g. [`Workflow::is_merge_transition`]) still treat it as a static
+/// description of intent, not something that has already run.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Transition {
     /// Stable id ([`Status::id`]) a task moves out of. Must match a
@@ -796,10 +827,11 @@ pub struct Transition {
     /// workflow that merges intermediate work into `develop` here but
     /// ships to `main` on a later transition.
     ///
-    /// Stored verbatim — no `{{var}}` interpolation is performed. It is
-    /// currently surfaced to humans / passed to `shelbi action --target`
-    /// by hand rather than consumed by an automatic executor (see the
-    /// struct-level note).
+    /// Stored verbatim; `{{var}}` placeholders are resolved against the
+    /// task's frontmatter params by
+    /// [`Workflow::resolve_transition_target`] when the executor fires
+    /// this edge's `merge` / `open_pr` actions (see the struct-level
+    /// note).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub target: Option<String>,
 }
@@ -2064,6 +2096,80 @@ git:
         let resolved = wf.resolve_git(&params(&[])).unwrap().unwrap();
         assert_eq!(resolved.base_branch.as_deref(), Some("main"));
         assert_eq!(resolved.merge_strategy, MergeStrategy::Squash);
+    }
+
+    fn transition_target_workflow(target: &str) -> Workflow {
+        let yaml = format!(
+            r#"
+name: feature-release
+statuses:
+  - {{ id: review, name: Review, category: handoff, owner: user, agent: orchestrator }}
+  - {{ id: done,   name: Done,   category: done,    owner: user                       }}
+transitions:
+  - {{ from: review, to: done, actions: [merge], target: "{target}" }}
+"#
+        );
+        Workflow::from_yaml_str(&yaml).unwrap()
+    }
+
+    #[test]
+    fn resolve_transition_target_returns_none_for_undeclared_edge() {
+        // No `target:` on the edge → None (caller falls back to base).
+        let wf = Workflow::from_yaml_str(
+            r#"
+name: default
+statuses:
+  - { id: review, name: Review, category: handoff, owner: user, agent: orchestrator }
+  - { id: done,   name: Done,   category: done,    owner: user                       }
+transitions:
+  - { from: review, to: done, actions: [merge] }
+"#,
+        )
+        .unwrap();
+        assert_eq!(
+            wf.resolve_transition_target("review", "done", &params(&[]))
+                .unwrap(),
+            None
+        );
+        // A completely undeclared edge is also None, not an error.
+        assert_eq!(
+            wf.resolve_transition_target("review", "nowhere", &params(&[]))
+                .unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn resolve_transition_target_substitutes_placeholders() {
+        let wf = transition_target_workflow("release/{{version}}");
+        let resolved = wf
+            .resolve_transition_target("review", "done", &params(&[("version", "2.1")]))
+            .unwrap();
+        assert_eq!(resolved.as_deref(), Some("release/2.1"));
+    }
+
+    #[test]
+    fn resolve_transition_target_preserves_plain_target() {
+        let wf = transition_target_workflow("develop");
+        let resolved = wf
+            .resolve_transition_target("review", "done", &params(&[]))
+            .unwrap();
+        assert_eq!(resolved.as_deref(), Some("develop"));
+    }
+
+    #[test]
+    fn resolve_transition_target_errors_on_missing_param() {
+        let wf = transition_target_workflow("release/{{version}}");
+        let err = wf
+            .resolve_transition_target("review", "done", &params(&[]))
+            .unwrap_err();
+        match err {
+            Error::MissingTaskParams { workflow, params } => {
+                assert_eq!(workflow, "feature-release");
+                assert_eq!(params, vec!["version".to_string()]);
+            }
+            other => panic!("expected MissingTaskParams, got {other:?}"),
+        }
     }
 
     #[test]
