@@ -649,8 +649,8 @@ export function AppMockup({
  * verbatim, so the landing page is unchanged.
  */
 export const defaultAppState: AppState = {
-  terminalTitle: "jlong@hub — shelbi",
-  project: "shelbi",
+  terminalTitle: "jlong@hub — my-project",
+  project: "my-project",
   activeView: "tasks",
   columns: [
     {
