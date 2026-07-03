@@ -134,11 +134,12 @@ shelbi agent new perf-review
 shelbi agent edit perf-review
 ```
 
-Then wire it into a workflow status:
+Then wire it into a workflow status — reference the status by `id` (its
+`name` and `category` live in `statuses.yml`) and name the agent:
 
 ```yaml
 statuses:
-  - { name: Perf, category: handoff, owner: agent, agent: perf-review }
+  - { id: perf, owner: agent, agent: perf-review }
 ```
 
 ## See also

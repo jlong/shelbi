@@ -80,10 +80,28 @@ A fork PR lands in **Incoming**, the orchestrator triages it into scope,
 the `reviewer` agent runs it through checks in **In Review**, and it waits
 in **Sign-off** for a maintainer to accept before it's **Merged**.
 
+## The statuses
+
+The forking flow relabels the whole board, so declare its statuses (`id`
++ `name` + `category`) in the project's
+[status catalog](/docs/concepts/workflows#schema) first —
+`workflows/statuses.yml` — then reference them by `id` from the workflow:
+
+```yaml
+# workflows/statuses.yml — the forking project's status catalog.
+statuses:
+  - { id: incoming,  name: Incoming,  category: backlog }
+  - { id: triage,    name: Triage,    category: ready }
+  - { id: in-review, name: In Review, category: active }
+  - { id: sign-off,  name: Sign-off,  category: handoff }
+  - { id: merged,    name: Merged,    category: done }
+  - { id: declined,  name: Declined,  category: archived }
+```
+
 ## The workflow
 
 ```yaml
-# workflows/contribution.yaml
+# workflows/contribution.yaml — reference-only; identity lives in statuses.yml
 name: contribution
 description: Forking flow — review gate for pull requests from forks.
 
@@ -92,26 +110,26 @@ git:
   merge_strategy: squash               # squash external contributions into one commit
 
 statuses:
-  - { name: Incoming, category: backlog, owner: user                     }
-  - { name: Triage,   category: ready,   owner: agent, agent: orchestrator }
-  - { name: InReview, category: active,  owner: agent, agent: reviewer     }
-  - { name: SignOff,  category: handoff, owner: user                      }
-  - { name: Merged,   category: done,    owner: user                      }
-  - { name: Declined, category: archived, owner: user                     }
+  - { id: incoming,  owner: user }
+  - { id: triage,    owner: agent, agent: orchestrator }
+  - { id: in-review, owner: agent, agent: reviewer }
+  - { id: sign-off,  owner: user }
+  - { id: merged,    owner: user }
+  - { id: declined,  owner: user }
 
-initial_status: Incoming
+initial_status: incoming
 
 transitions:
-  - from: InReview
-    to: SignOff
+  - from: in-review
+    to: sign-off
     actions: [push_branch]               # push the fork branch to a review ref; no PR to open
 
-  - from: SignOff
-    to: Merged
+  - from: sign-off
+    to: merged
     actions: [merge]                     # squash-merge the existing fork PR into main
 
-  - from: InReview
-    to: Declined
+  - from: in-review
+    to: declined
     actions: [close_pr]                  # close the PR without merging; the fork keeps its branch
 ```
 
@@ -124,10 +142,10 @@ model uses are deliberately *absent* here:
 - **No `delete_branch`.** Shelbi can't delete a branch it doesn't own. The
   fork keeps its branch whether the PR merges or is declined.
 
-The `InReview` status names an [`agent: reviewer`](/docs/concepts/agents)
+The `in-review` status names an [`agent: reviewer`](/docs/concepts/agents)
 role — an agent you author to run the untrusted contribution through the
 project's checks and summarize risk before a human ever looks. The
-`SignOff` status stays `owner: user`: the gate is the whole point.
+`sign-off` status stays `owner: user`: the gate is the whole point.
 
 ## Orchestrator adjustments
 

@@ -81,6 +81,27 @@ pushed and PR'd on the way to **Review**, and squash-merged back into
 
 ## The workflow
 
+Status identity — the stable `id`, the display `name`, and the
+`category` — lives once in `workflows/statuses.yml`, the project-wide
+[status catalog](/docs/concepts/workflows#schema). Every workflow file
+then references those statuses by `id` and adds only what's
+workflow-specific (`owner`, and an optional `agent:`). The shipped
+catalog is the canonical six:
+
+```yaml
+# workflows/statuses.yml — the status catalog, shared by every workflow.
+statuses:
+  - { id: backlog,     name: Backlog,     category: backlog }
+  - { id: todo,        name: Todo,        category: ready }
+  - { id: in-progress, name: In Progress, category: active }
+  - { id: review,      name: Review,      category: handoff }
+  - { id: done,        name: Done,        category: done }
+  - { id: canceled,    name: Canceled,    category: archived }
+```
+
+The default workflow references them by `id` — no `name:` or `category:`
+is repeated here (the loader rejects a workflow file that does):
+
 ```yaml
 # workflows/default.yaml
 name: default
@@ -90,37 +111,39 @@ description: Feature-branch flow — branch per task off main, PR, merge.
 # project.yaml. A git: block here would only be needed to override them.
 
 statuses:
-  - { name: Backlog,    category: backlog, owner: user                    }
-  - { name: Todo,       category: ready,   owner: agent                   }
-  - { name: InProgress, category: active,  owner: agent                   }
-  - { name: Review,     category: handoff, owner: user, agent: orchestrator }
-  - { name: Done,       category: done,    owner: user                    }
-  - { name: Canceled,   category: archived, owner: user                   }
+  - { id: backlog,     owner: user,  agent: orchestrator }
+  - { id: todo,        owner: agent, agent: orchestrator }
+  - { id: in-progress, owner: agent, agent: developer }
+  - { id: review,      owner: user,  agent: orchestrator }
+  - { id: done,        owner: user }
+  - { id: canceled,    owner: user }
 
-initial_status: Backlog
+initial_status: backlog
 
 transitions:
-  - from: InProgress
-    to: Review
+  - from: in-progress
+    to: review
     actions: [push_branch, open_pr]      # push the task branch, open a PR into main
 
-  - from: Review
-    to: Done
+  - from: review
+    to: done
     actions: [merge, delete_branch]      # squash-merge the PR, delete the branch
 
-  - from: InProgress
-    to: Canceled
+  - from: in-progress
+    to: canceled
     actions: [close_pr, delete_branch]
 
-  - from: Review
-    to: Canceled
+  - from: review
+    to: canceled
     actions: [close_pr, delete_branch]
 ```
 
 Nothing here overrides the project git defaults, so branches cut off
 `main` and merges land back on `main`. The `open_pr` action opens the PR
 with `main` as its base because no transition declares a
-[`target:`](/docs/concepts/workflows#per-transition-target).
+[`target:`](/docs/concepts/workflows#per-transition-target). The
+`user`-owned `review` status still names `agent: orchestrator` — that's
+what lets [Zen Mode](/docs/concepts/zen-mode) land the merge without you.
 
 ## Orchestrator adjustments
 

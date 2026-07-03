@@ -81,8 +81,13 @@ the moment checks pass and Zen clears the bar.
 
 ## The workflow
 
+Trunk-based reuses the shipped [status catalog](/docs/concepts/workflows#schema)
+(`workflows/statuses.yml`) — it just leaves the `review` status out of the
+flow. Identity (`name`, `category`) stays in the catalog; the workflow
+references statuses by `id` and adds only `owner` and `agent:`:
+
 ```yaml
-# workflows/trunk.yaml
+# workflows/trunk.yaml — reference-only (identity lives in statuses.yml)
 name: trunk
 description: Trunk-based — short-lived branches, merge to main on green.
 
@@ -91,21 +96,21 @@ git:
   merge_strategy: squash               # one squashed commit per task on trunk
 
 statuses:
-  - { name: Backlog,    category: backlog, owner: user  }
-  - { name: Todo,       category: ready,   owner: agent }
-  - { name: InProgress, category: active,  owner: agent }
-  - { name: Done,       category: done,    owner: user  }
-  - { name: Canceled,   category: archived, owner: user }
+  - { id: backlog,     owner: user,  agent: orchestrator }
+  - { id: todo,        owner: agent, agent: orchestrator }
+  - { id: in-progress, owner: agent, agent: developer }
+  - { id: done,        owner: user }
+  - { id: canceled,    owner: user }
 
-initial_status: Backlog
+initial_status: backlog
 
 transitions:
-  - from: InProgress
-    to: Done
+  - from: in-progress
+    to: done
     actions: [push_branch, open_pr, merge, delete_branch]
 
-  - from: InProgress
-    to: Canceled
+  - from: in-progress
+    to: canceled
     actions: [close_pr, delete_branch]
 
 zen:
@@ -115,7 +120,7 @@ zen:
       - cargo test --workspace
 ```
 
-The single `InProgress → Done` transition does the whole cycle: push the
+The single `in-progress → done` transition does the whole cycle: push the
 short branch, open a PR into `main`, squash-merge it, and delete the
 branch. There is no `handoff`-category status because there's no separate
 review stage — the [`zen.checks`](/docs/concepts/zen-mode) that run before

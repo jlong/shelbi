@@ -82,10 +82,35 @@ squash-merges back into `develop` — the **On Develop** column is "landed
 on the integration branch," not "released." Shipping to `main` is a
 separate `release` task.
 
+## The statuses
+
+Status identity lives once in the project's
+[status catalog](/docs/concepts/workflows#schema),
+`workflows/statuses.yml`. Git-flow adds one status the shipped defaults
+don't have — `on-develop`, the done-category landing for feature work
+that's merged into `develop` but not yet released — plus `staging` and
+`released` for the release workflow below. Declare them (`id` + `name` +
+`category`) in the catalog first, then reference them by `id`:
+
+```yaml
+# workflows/statuses.yml — git-flow statuses alongside the defaults.
+statuses:
+  # shipped defaults
+  - { id: backlog,     name: Backlog,     category: backlog }
+  - { id: todo,        name: Todo,        category: ready }
+  - { id: in-progress, name: In Progress, category: active }
+  - { id: review,      name: Review,      category: handoff }
+  - { id: canceled,    name: Canceled,    category: archived }
+  # git-flow additions
+  - { id: on-develop,  name: On Develop,  category: done }
+  - { id: staging,     name: Staging,     category: active }
+  - { id: released,    name: Released,    category: done }
+```
+
 ## The feature workflow
 
 ```yaml
-# workflows/feature.yaml
+# workflows/feature.yaml — reference-only; identity lives in statuses.yml
 name: feature
 description: Git-flow feature — branch off develop, merge back into develop.
 
@@ -94,26 +119,26 @@ git:
   merge_strategy: squash
 
 statuses:
-  - { name: Backlog,    category: backlog, owner: user  }
-  - { name: Todo,       category: ready,   owner: agent }
-  - { name: InProgress, category: active,  owner: agent }
-  - { name: Review,     category: handoff, owner: user  }
-  - { name: OnDevelop,  category: done,    owner: user  }
-  - { name: Canceled,   category: archived, owner: user }
+  - { id: backlog,     owner: user,  agent: orchestrator }
+  - { id: todo,        owner: agent, agent: orchestrator }
+  - { id: in-progress, owner: agent, agent: developer }
+  - { id: review,      owner: user,  agent: orchestrator }
+  - { id: on-develop,  owner: user }
+  - { id: canceled,    owner: user }
 
-initial_status: Backlog
+initial_status: backlog
 
 transitions:
-  - from: InProgress
-    to: Review
+  - from: in-progress
+    to: review
     actions: [push_branch, open_pr]      # PR base is develop (the workflow base_branch)
 
-  - from: Review
-    to: OnDevelop
+  - from: review
+    to: on-develop
     actions: [merge, delete_branch]      # squash into develop
 
-  - from: InProgress
-    to: Canceled
+  - from: in-progress
+    to: canceled
     actions: [close_pr, delete_branch]
 ```
 
@@ -128,7 +153,7 @@ A release task PRs the accumulated `develop` into `main`. Pre-fill its
 [directly instead of cutting a new branch](/docs/concepts/workflows#the-branch-task-field):
 
 ```yaml
-# workflows/release.yaml
+# workflows/release.yaml — reference-only; identity lives in statuses.yml
 name: release
 description: Git-flow release — PR develop into main and tag.
 
@@ -137,19 +162,19 @@ git:
   merge_strategy: merge                # a true merge preserves develop's history
 
 statuses:
-  - { name: Staging,  category: active,  owner: agent }
-  - { name: Review,   category: handoff, owner: user  }
-  - { name: Released, category: done,    owner: user  }
+  - { id: staging,  owner: agent, agent: developer }
+  - { id: review,   owner: user,  agent: orchestrator }
+  - { id: released, owner: user }
 
-initial_status: Staging
+initial_status: staging
 
 transitions:
-  - from: Staging
-    to: Review
+  - from: staging
+    to: review
     actions: [push_branch, open_pr]      # open PR: base main, head develop
 
-  - from: Review
-    to: Released
+  - from: review
+    to: released
     actions: [merge]                     # merge develop into main; keep develop
 ```
 
