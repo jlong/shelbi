@@ -657,26 +657,35 @@ export const defaultAppState: AppState = {
       label: "BACKLOG",
       category: "gray",
       cards: [
-        // Capped at 5 so BACKLOG stays within a card of the other
-        // columns — the tallest column sets the window height, and a
-        // deep backlog leaves the rest of the board trailing empty
-        // space at the bottom.
-        { title: "Rework onboarding copy", id: "t-004" },
-        { title: "Audit third-party licenses", id: "t-005" },
+        // The queued columns (BACKLOG / TO DO) run deep on purpose — a
+        // full backlog is what a working system looks like, and the
+        // tallest column sets the window height, giving the framed
+        // terminal its ~1.6:1 aspect ratio instead of a flat strip.
+        { title: "Rework onboarding UX", id: "t-004" },
+        { title: "Audit OSS licenses", id: "t-005" },
         { title: "Draft Q3 roadmap", id: "t-006" },
         { title: "Migrate CI to arm64", id: "t-014" },
-        { title: "Sunset legacy /v1 API", id: "t-020" },
+        { title: "Sunset legacy v1 API", id: "t-020" },
+        { title: "Add SSO for admins", id: "t-028" },
+        { title: "Prune stale flags", id: "t-030" },
+        { title: "Dedupe error reports", id: "t-031" },
+        { title: "Archive S3 buckets", id: "t-033" },
+        { title: "Refresh brand assets", id: "t-036" },
       ],
     },
     {
       label: "TO DO",
       category: "blue",
       cards: [
-        { title: "Add ratelimit to API", id: "t-007" },
-        { title: "Fix mobile nav overlap", id: "t-008" },
+        { title: "Add API ratelimit", id: "t-007" },
+        { title: "Fix mobile nav", id: "t-008" },
         { title: "Wire webhook retries", id: "t-016" },
-        { title: "Split OTel spans by tenant", id: "t-021" },
+        { title: "Split OTel spans", id: "t-021" },
         { title: "Sync i18n strings", id: "t-026" },
+        { title: "Paginate search API", id: "t-038" },
+        { title: "Cache user sessions", id: "t-040" },
+        { title: "Add health probes", id: "t-042" },
+        { title: "Debounce autosave", id: "t-045" },
       ],
     },
     {
@@ -685,8 +694,8 @@ export const defaultAppState: AppState = {
       cards: [
         { title: "Deploy staging env", id: "t-009", workspace: "alpha" },
         { title: "Wire up OAuth flow", id: "t-010", workspace: "bravo" },
-        { title: "Backfill order_state index", id: "t-017", workspace: "delta" },
-        { title: "Trim vendor bundle size", id: "t-022", workspace: "foxtrot" },
+        { title: "Backfill order index", id: "t-017", workspace: "echo" },
+        { title: "Trim vendor bundle", id: "t-022", workspace: "foxtrot" },
       ],
     },
     {
@@ -699,40 +708,52 @@ export const defaultAppState: AppState = {
           workspace: "charlie",
           selected: true,
         },
-        { title: "Import CSV idempotency", id: "t-018", workspace: "echo" },
-        { title: "Nightly report email fix", id: "t-024", workspace: "foxtrot" },
+        { title: "CSV idempotency", id: "t-018", workspace: "golf" },
+        { title: "Nightly report fix", id: "t-024", workspace: "hotel" },
       ],
     },
     {
       label: "DONE",
       category: "green",
       cards: [
-        { title: "Migrate to Postgres 16", id: "t-012" },
-        { title: "Ship dark-mode toggle", id: "t-013" },
-        { title: "Retry webhook dead-letters", id: "t-019" },
-        { title: "Redis cache for /profile", id: "t-027" },
+        { title: "Migrate to PG 16", id: "t-012" },
+        { title: "Ship dark mode", id: "t-013" },
+        { title: "Retry dead-letters", id: "t-019" },
+        { title: "Redis cache /profile", id: "t-027" },
+        { title: "Add audit logging", id: "t-046" },
+        { title: "Fix flaky CI tests", id: "t-048" },
       ],
     },
   ],
+  // Sidebar mirrors the board: every workspace shown on an IN PROGRESS or
+  // REVIEW card is `working` here (in-progress → Developer, review →
+  // Reviewer), leaving only two idle workspaces so the system reads busy.
   machines: [
     {
       name: "hub",
       workspaces: [
-        { name: "alpha", state: "idle" },
+        { name: "alpha", state: "working", agent: "Developer" },
         { name: "bravo", state: "working", agent: "Developer" },
-        { name: "charlie", state: "idle" },
+        { name: "charlie", state: "working", agent: "Reviewer" },
+        { name: "delta", state: "idle" },
       ],
     },
     {
       name: "devbox",
       workspaces: [
-        { name: "delta", state: "idle" },
-        { name: "echo", state: "idle" },
-        { name: "foxtrot", state: "idle" },
+        { name: "echo", state: "working", agent: "Developer" },
+        { name: "foxtrot", state: "working", agent: "Developer" },
+        { name: "golf", state: "working", agent: "Reviewer" },
+        { name: "hotel", state: "working", agent: "Reviewer" },
+        { name: "india", state: "idle" },
       ],
     },
   ],
-  review: [{ title: "Cache warm-up on cold start", workspace: "charlie" }],
+  review: [
+    { title: "Cache warm-up on cold start", workspace: "charlie" },
+    { title: "CSV idempotency", workspace: "golf" },
+    { title: "Nightly report fix", workspace: "hotel" },
+  ],
 }
 
 /**
