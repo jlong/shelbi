@@ -155,6 +155,14 @@ pub fn scaffold_with_prompt(args: Args) -> Result<ResolvedProjectRoot> {
         )?;
     }
 
+    // Drop a self-documenting hub-wide `config.yaml` if one isn't present yet,
+    // so the UI preferences (and the pointer to keys.yml) are discoverable
+    // inline. Idempotent — never clobbers an existing config.
+    if shelbi_state::scaffold_user_config_if_missing().map_err(|e| anyhow!(e))? {
+        let cfg_path = shelbi_state::user_config_path().map_err(|e| anyhow!(e))?;
+        println!("✓ wrote global config: {}", cfg_path.display());
+    }
+
     println!("✓ scaffolded {}", home.display());
 
     // Interactivity is purely a function of the TTY. `--root` only skips
@@ -339,7 +347,12 @@ fn render_project_yaml(name: &str, repo: &str, work_dir: &Path) -> Result<String
         orchestrator: OrchestratorYaml { runner: "claude" },
         agent_runners,
     };
-    serde_yaml::to_string(&doc).context("serializing project YAML")
+    let active = serde_yaml::to_string(&doc).context("serializing project YAML")?;
+    // Wrap the serde-rendered required fields with the docs-linked header and
+    // commented-out examples for every optional feature. The dynamic values
+    // (name/repo/work_dir) still go through serde above — the decoration only
+    // appends static, struct-grounded comment blocks.
+    Ok(shelbi_core::scaffold::decorate_project_yaml(&active))
 }
 
 /// Write the project YAML, the workspace-settings template, materialize
@@ -409,11 +422,7 @@ fn scaffold_project(resolved: &ResolvedProjectRoot, mode: InitMode) -> Result<()
     let statuses_path =
         shelbi_state::statuses_path(&resolved.name).map_err(|e| anyhow!(e))?;
     if !statuses_path.exists() {
-        shelbi_state::save_project_statuses(
-            &resolved.name,
-            &shelbi_core::default_project_statuses(),
-        )
-        .map_err(|e| anyhow!(e))?;
+        shelbi_state::scaffold_project_statuses(&resolved.name).map_err(|e| anyhow!(e))?;
         println!("✓ wrote project statuses: {}", statuses_path.display());
     }
     Ok(())
@@ -566,11 +575,7 @@ fn run_pick_up(args: Args) -> Result<PickUpOutcome> {
     let statuses_path =
         shelbi_state::statuses_path(&local_alias).map_err(|e| anyhow!(e))?;
     if !statuses_path.exists() {
-        shelbi_state::save_project_statuses(
-            &local_alias,
-            &shelbi_core::default_project_statuses(),
-        )
-        .map_err(|e| anyhow!(e))?;
+        shelbi_state::scaffold_project_statuses(&local_alias).map_err(|e| anyhow!(e))?;
         println!("✓ wrote project statuses: {}", statuses_path.display());
     }
 
@@ -764,6 +769,28 @@ mod tests {
         assert_eq!(project.orchestrator.runner, "claude");
         assert!(project.agent_runners.contains_key("claude"));
         assert!(project.agent_runners.contains_key("codex"));
+    }
+
+    /// The scaffolded project YAML is self-documenting: a docs-linked header
+    /// plus commented-out examples for optional features. As written those
+    /// blocks are inert (only the required fields are active), and the docs
+    /// pointer matches the Configuration section's route.
+    #[test]
+    fn render_project_yaml_is_self_documenting() {
+        let yaml = render_project_yaml("my-app", "", Path::new("/tmp/my-app")).unwrap();
+        assert!(
+            yaml.contains("https://shelbi.dev/docs/configuration/project"),
+            "missing docs header: {yaml}"
+        );
+        // Representative optional features appear as commented examples.
+        for needle in ["#zen:", "#git:", "#workspaces:", "#review:", "#contextstore_sync:"] {
+            assert!(yaml.contains(needle), "missing commented section {needle}");
+        }
+        // But they stay commented — the parsed project carries only the
+        // required fields until the user opts in.
+        let project: shelbi_core::Project = serde_yaml::from_str(&yaml).unwrap();
+        assert!(project.workspaces.is_empty());
+        assert_eq!(project.machines.len(), 1);
     }
 
     /// A `work_dir` that would truncate as a YAML comment under the old

@@ -15,8 +15,8 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use shelbi_core::{
-    default_project_statuses, default_workflow, validate_agent_id, validate_branch,
-    validate_project_name, validate_task_id, Agent, Column, Project, Result, Session, Task,
+    validate_agent_id, validate_branch, validate_project_name, validate_task_id, Agent, Column,
+    Project, Result, Session, Task,
 };
 
 mod agent_workspaces;
@@ -69,7 +69,8 @@ pub use ssh_control::{
     CmCleanupOutcome, DaemonPidRecord,
 };
 pub use user_config::{
-    load_user_config, save_user_config, user_config_path, Keymap, UserConfig, ZenToggleChord,
+    load_user_config, save_user_config, scaffold_user_config_if_missing, user_config_path, Keymap,
+    UserConfig, ZenToggleChord,
 };
 pub use workspace_status::{
     append_clarification_event, append_contextstore_event, append_dispatch_event,
@@ -85,8 +86,8 @@ pub use workspace_status::{
     ServerPaneRecord, WorkspaceState, WorkspaceStatus, DAEMON_ACK, EXPECTED_TEARDOWN_MAX_AGE,
 };
 pub use workflows::{
-    list_workflows, load_project_statuses, load_workflow, save_project_statuses, statuses_path,
-    workflow_path, workflows_dir,
+    list_workflows, load_project_statuses, load_workflow, save_project_statuses,
+    scaffold_project_statuses, statuses_path, workflow_path, workflows_dir,
 };
 
 /// Default assistant name surfaced in the sidebar header and the
@@ -278,7 +279,7 @@ fn migrate_default_workflow(project_dir: &Path) {
     if path.exists() {
         return;
     }
-    let Ok(yaml) = serde_yaml::to_string(&default_workflow()) else {
+    let Ok(yaml) = shelbi_core::scaffold::default_workflow_yaml() else {
         return;
     };
     let _ = atomic_write(&path, yaml.as_bytes());
@@ -300,7 +301,7 @@ fn migrate_default_statuses(project_dir: &Path) {
     if path.exists() {
         return;
     }
-    let Ok(yaml) = serde_yaml::to_string(&default_project_statuses()) else {
+    let Ok(yaml) = shelbi_core::scaffold::default_statuses_yaml() else {
         return;
     };
     let _ = atomic_write(&path, yaml.as_bytes());
@@ -2113,6 +2114,7 @@ pub(crate) fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use shelbi_core::{default_project_statuses, default_workflow};
 
     fn fixture_project(name: &str, override_template: Option<PathBuf>) -> shelbi_core::Project {
         use shelbi_core::*;

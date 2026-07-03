@@ -1,6 +1,7 @@
 pub mod error;
 pub mod model;
 pub mod placeholders;
+pub mod scaffold;
 pub mod shell;
 pub mod statuses;
 pub mod system_memory;

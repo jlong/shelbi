@@ -127,6 +127,21 @@ pub fn save_user_config(cfg: &UserConfig) -> Result<()> {
     atomic_write(&path, serde_yaml::to_string(cfg)?.as_bytes())
 }
 
+/// Write a self-documenting `~/.shelbi/config.yaml` when one doesn't already
+/// exist — the scaffold `shelbi init` drops so the hub-wide UI preferences are
+/// discoverable inline (see [`shelbi_core::scaffold::CONFIG_YAML`]). Idempotent:
+/// an existing file (a real config, or one the first-run Zen probe already
+/// wrote) is left untouched. Returns `true` when a file was written.
+pub fn scaffold_user_config_if_missing() -> Result<bool> {
+    let path = user_config_path()?;
+    if path.exists() {
+        return Ok(false);
+    }
+    ensure_dir(&shelbi_home()?)?;
+    atomic_write(&path, shelbi_core::scaffold::CONFIG_YAML.as_bytes())?;
+    Ok(true)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -188,6 +203,33 @@ mod tests {
         assert_eq!(ZenToggleChord::CtrlG.hint(), "⌃G");
         assert_eq!(ZenToggleChord::CtrlShiftZ.hint(), "⇧⌃Z");
         assert_eq!(ZenToggleChord::None.hint(), "");
+    }
+
+    #[test]
+    fn scaffolded_config_writes_once_parses_and_never_clobbers() {
+        let _g = LOCK.lock().unwrap();
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+
+        // First call writes the self-documenting scaffold and it loads as a
+        // real UserConfig at its default chord (comments are inert).
+        assert!(scaffold_user_config_if_missing().unwrap());
+        let path = home.join("config.yaml");
+        assert!(path.is_file());
+        let body = std::fs::read_to_string(&path).unwrap();
+        assert!(body.contains("https://shelbi.dev/docs/configuration/global"));
+        let cfg = load_user_config().unwrap();
+        assert_eq!(cfg.keymap.zen_toggle, ZenToggleChord::AltZ);
+
+        // Second call is a no-op that preserves whatever is on disk (e.g. a
+        // value the first-run probe wrote).
+        std::fs::write(&path, "keymap:\n  zen_toggle: ctrl-g\n").unwrap();
+        assert!(!scaffold_user_config_if_missing().unwrap());
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "keymap:\n  zen_toggle: ctrl-g\n"
+        );
+        std::env::remove_var("SHELBI_HOME");
     }
 
     #[test]
