@@ -13,7 +13,7 @@ It is a [**named agent**](/docs/concepts/agents) like any other —
 `agents/orchestrator/` — with an editable `instructions.md` for its system
 prompt. What makes it special is only *where* it runs: window 1, talking to
 you, rather than in a [workspace](/docs/concepts/workspaces) picking up
-tasks. The `developer`, `qa`, and `security-review` agents run inside
+tasks. The `developer` agent (and any reviewer roles you author) run inside
 workspaces; the orchestrator runs the board.
 
 The mental model is: **you are the priority-setter and reviewer. It is
@@ -21,6 +21,11 @@ the scheduler.** It does not edit code, it does not accept reviews, it
 does not promote backlog items on its own. It turns natural-language
 requests into Kanban cards, picks free workspaces, and reports progress
 back.
+
+The board it runs is the whole dashboard — the columns cards move through and
+the workspaces it dispatches them to:
+
+<AppMockup terminalTitle="jlong@hub — shelbi" />
 
 ## You-are-the-scheduler
 

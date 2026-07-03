@@ -99,6 +99,11 @@ The TUI activity feed filters heartbeats out by design — they'd
 produce one "nothing happened" row every few minutes. Use
 `shelbi events tail` if you want to see them.
 
+The feed lives behind the **Activity** view in the dashboard — the same events
+this log records, rendered for a human instead of grepped:
+
+<AppMockup terminalTitle="jlong@hub — shelbi" activeView="activity" />
+
 The orchestrator distinguishes the line kinds by the second token
 (`task=`, `worker=`, `project=`, `dispatch`, `mode=zen`,
 `contextstore`, `zen-dryrun`). New line shapes get added over time;

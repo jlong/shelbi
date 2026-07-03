@@ -119,9 +119,9 @@ on the same machine never collide and the URL is predictable.
 
 ## The Review agent
 
-Loading a review workspace runs a fifth built-in [agent](/docs/concepts/agents)
-— `review` — alongside `orchestrator`, `developer`, `qa`, and
-`security-review`. It self-heals in on `shelbi reload` like the others, and it
+Loading a review workspace runs the built-in [agent](/docs/concepts/agents)
+`review` — one of the three Shelbi ships, alongside `orchestrator` and
+`developer`. It self-heals in on `shelbi reload` like the others, and it
 ships with a `load-run-detection` skill holding the auto-detect heuristics.
 
 Its charter is narrow and deliberately **not** a developer's:
@@ -225,20 +225,24 @@ Review workspaces show up in **two** places in the sidebar:
   on, right-aligned. Selecting one focuses that review workspace's window
   (server pane visible) so you can inspect the running app.
 
-```text
- — Workspaces —
- ▾ hub
-   ⏵ alpha        developer
-   · bravo
-   ⏵ review-1     review
- ▾ devbox
-   ⏵ charlie      developer
-   · review-1
-
- — Ready for Review —
- ✓ Palette fuzzy-match fix       review-1
- ✓ Dark-mode toggle polish       review-1
-```
+<AppMockup
+  terminalTitle="jlong@hub — shelbi"
+  machines={[
+    { name: "hub", workspaces: [
+      { name: "alpha", state: "working", agent: "developer" },
+      { name: "bravo", state: "idle" },
+      { name: "review-1", state: "working", agent: "review" },
+    ]},
+    { name: "devbox", workspaces: [
+      { name: "charlie", state: "working", agent: "developer" },
+      { name: "review-1", state: "idle" },
+    ]},
+  ]}
+  review={[
+    { title: "Palette fuzzy-match fix", workspace: "review-1" },
+    { title: "Dark-mode toggle polish", workspace: "review-1" },
+  ]}
+/>
 
 A finished **dev** workspace no longer lingers with a "done" check — it closes
 its session the moment its task is promoted and reads `idle`. Completion lives
@@ -281,7 +285,7 @@ its own.
 - [Workspaces](/docs/concepts/workspaces) — the pool model these slots extend,
   and the dev-session-close-on-completion handoff.
 - [Agents](/docs/concepts/agents) — the role/slot split; the Review agent is
-  the fifth built-in role.
+  one of the three built-in roles.
 - [Orchestrator](/docs/concepts/orchestrator) — the `to_category=handoff`
   auto-load rule, the pending-load queue, and the reaper.
 - [`shelbi review`](/docs/cli/review) — load a task onto a review workspace or

@@ -144,16 +144,15 @@ migrate-to-in-repo` prints (and optionally appends) this snippet at
 .shelbi/local.yaml
 ```
 
-Every line names one state footprint. If you're using in-repo mode
-without running migration, add the snippet by hand — the goal is that a
-`git grep -F 'shelbi' .gitignore` at the repo root turns up the full
-list without you having to know the layout.
+Every line names one state footprint. Using in-repo mode without running
+the migration? Add the snippet by hand — the point is that
+`git grep -F 'shelbi' .gitignore` at the repo root surfaces the full
+list, so you never have to memorize the layout.
 
-The `local.yaml` line is defensive: `local.yaml` lives under
-`~/.shelbi/` today, so it doesn't need ignoring. But if you ever move it
-into the repo (a legitimate reason: symlinking from `~/.shelbi/projects/<name>/local.yaml`
-into `<repo>/.shelbi/local.yaml` so an editor picks it up), the ignore
-line prevents the mistake.
+The `local.yaml` line is defensive. Today `local.yaml` lives under
+`~/.shelbi/` and needs no ignoring — but if you ever symlink it into the
+repo (say, so an editor picks it up), the ignore line prevents an
+accidental commit.
 
 ### Local-alias collisions
 
@@ -312,12 +311,11 @@ edits to `<repo>/.shelbi/project.yaml` or `local.yaml` (in-repo mode) or
 `~/.shelbi/projects/<name>.yaml` (global mode) take effect on the next
 reload.
 
-The one important nuance: **in-flight workspaces keep their existing
-prompt until they hand off**. A running task doesn't get a mid-flight
-prompt update, even after a reload. Prompt changes reach a workspace on
-its *next* task dispatch, once it's picked up a fresh card from the
-board. This is deliberate — mid-turn prompt swaps would surprise the
-agent inside a workspace and make debugging much harder.
+The one important nuance: **a running workspace keeps its current prompt
+until it hands off.** A reload never swaps the prompt mid-task; changes
+reach a workspace on its *next* dispatch, once it picks up a fresh card.
+This is deliberate — a mid-turn prompt swap would surprise the agent and
+make debugging much harder.
 
 If you need a running workspace to pick up new instructions immediately,
 kill its task, reload, then re-dispatch.
