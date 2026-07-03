@@ -16,5 +16,5 @@ target
 # Claude harness state
 .claude/
 
-# Shelbi worktrees
-.shelbi/wt
+# Shelbi runtime scratch (worktrees, inter-agent message logs, etc.)
+/.shelbi/
