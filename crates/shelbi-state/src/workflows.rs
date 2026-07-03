@@ -54,6 +54,7 @@ use std::collections::{BTreeSet, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
+use std::time::SystemTime;
 
 use shelbi_core::{
     default_project_statuses, default_workflow, validate_workflow_name, Error, ProjectStatuses,
@@ -159,10 +160,21 @@ pub fn load_workflow(project: &str, name: &str) -> Result<Workflow> {
 /// `statuses:` is rejected at parse time with a pointer to move
 /// identity into `statuses.yml`.
 ///
-/// Bad workflow files surface as errors (with the file path quoted in
-/// the message) rather than being silently skipped — a malformed
-/// `default.yaml` would otherwise leave callers thinking they had no
-/// workflows when in fact the user's customization is broken.
+/// **Per-file isolation.** A malformed individual workflow file is
+/// *skipped* with a loud, deduped warning (via the shared parse-warn
+/// cache [`crate::should_warn_about_parse`], keyed by path + mtime) —
+/// the valid workflows around it keep loading. This mirrors how
+/// [`list_tasks`](crate::list_tasks) tolerates a single corrupt TASK
+/// file: one fat-fingered `custom.yaml` no longer takes down every
+/// caller's board. Callers that need the strict "reject the whole file"
+/// contract for a *named* workflow use [`load_workflow`], which still
+/// hard-errors.
+///
+/// Project-wide faults — a missing or unparseable `statuses.yml` —
+/// remain hard errors, because they invalidate *every* workflow, not
+/// just one file. When every workflow file on disk is broken the loader
+/// degrades to [`default_workflow()`] (after warning on each) so the
+/// board still paints rather than going blank.
 pub fn list_workflows(project: &str) -> Result<Vec<Workflow>> {
     let dir = workflows_dir(project)?;
     if !dir.exists() {
@@ -183,47 +195,93 @@ pub fn list_workflows(project: &str) -> Result<Vec<Workflow>> {
     let statuses = ProjectStatuses::from_yaml_str(&st_text).map_err(|e| annotate(&st_path, e))?;
 
     let mut out = Vec::new();
+    let mut seen: HashSet<PathBuf> = HashSet::new();
     let mut seen_names: std::collections::HashMap<String, PathBuf> =
         std::collections::HashMap::new();
     for raw in raw_files {
-        let inline =
-            Workflow::inline_identity_fields(&raw.text).map_err(|e| annotate(&raw.path, e))?;
-        if !inline.is_empty() {
-            return Err(mixed_form_error(&raw.path, &inline));
-        }
-        let (wf, diags) = Workflow::from_yaml_str_with_diagnostics(&raw.text)
-            .map_err(|e| annotate(&raw.path, e))?;
-        emit_deprecation_warnings_once(&raw.path, &diags);
+        seen.insert(raw.path.clone());
+        let resolved = match resolve_raw_workflow(project, &raw, &statuses) {
+            Ok(resolved) => {
+                crate::forget_parse_warn(&raw.path);
+                resolved
+            }
+            Err(e) => {
+                let msg = format!(
+                    "shelbi: skipping malformed workflow file {}: {e}",
+                    raw.path.display()
+                );
+                // Route through `tracing::warn!` (not `eprintln!`) so the
+                // sidebar / tasks / review TUIs don't get the message
+                // painted onto their alt-screen — same rationale as the
+                // deprecation warnings above.
+                if crate::should_warn_about_parse(&raw.path, raw.mtime, &msg) {
+                    tracing::warn!("{msg}");
+                }
+                continue;
+            }
+        };
         // `load_workflow` resolves by *filename*, so a duplicated `name:`
         // or a name/stem mismatch means a picker-visible name that fails
-        // to load with a raw NotFound. Reject the former, warn on the
-        // latter.
-        if let Some(prev) = seen_names.insert(wf.name.clone(), raw.path.clone()) {
+        // to load with a raw NotFound. A duplicate is a cross-file
+        // ambiguity — which file wins? — so it stays a hard error even
+        // under per-file isolation; a stem mismatch only warns.
+        if let Some(prev) = seen_names.insert(resolved.name.clone(), raw.path.clone()) {
             return Err(Error::InvalidWorkflow(format!(
                 "workflow name `{}` is declared by both {} and {} — \
                  workflow names must be unique within a project",
-                wf.name,
+                resolved.name,
                 prev.display(),
                 raw.path.display(),
             )));
         }
-        warn_name_stem_mismatch_once(&raw.path, &wf.name);
-        let resolved = wf
-            .resolve_against(&statuses)
-            .map_err(|e| annotate(&raw.path, e))?;
-        validate_agent_references(project, &resolved).map_err(|e| annotate(&raw.path, e))?;
+        warn_name_stem_mismatch_once(&raw.path, &resolved.name);
         out.push(resolved);
+    }
+    crate::prune_parse_warn(&dir, &seen);
+
+    if out.is_empty() {
+        // Every workflow file on disk failed to load; each surfaced its
+        // own warning above. Degrade to the canonical default so callers
+        // that assume at least one workflow keep working.
+        return Ok(vec![default_workflow()]);
     }
     out.sort_by(|a, b| a.name.cmp(&b.name));
     Ok(out)
 }
 
-/// One unparsed workflow file on disk — path + raw text. Buffered so
-/// the inline-form probe, parse, and resolve steps all run off the
-/// same in-memory copy without hitting disk three times per file.
+/// Parse, resolve, and validate a single buffered workflow file against
+/// the project's already-loaded `statuses`. Shared by [`list_workflows`]
+/// (which skips on error) — the returned error carries the file path via
+/// [`annotate`] / [`mixed_form_error`] so the skip warning names the
+/// offending file.
+fn resolve_raw_workflow(
+    project: &str,
+    raw: &RawWorkflowFile,
+    statuses: &ProjectStatuses,
+) -> Result<Workflow> {
+    let inline = Workflow::inline_identity_fields(&raw.text).map_err(|e| annotate(&raw.path, e))?;
+    if !inline.is_empty() {
+        return Err(mixed_form_error(&raw.path, &inline));
+    }
+    let (wf, diags) =
+        Workflow::from_yaml_str_with_diagnostics(&raw.text).map_err(|e| annotate(&raw.path, e))?;
+    emit_deprecation_warnings_once(&raw.path, &diags);
+    let resolved = wf
+        .resolve_against(statuses)
+        .map_err(|e| annotate(&raw.path, e))?;
+    validate_agent_references(project, &resolved).map_err(|e| annotate(&raw.path, e))?;
+    Ok(resolved)
+}
+
+/// One unparsed workflow file on disk — path + raw text + mtime.
+/// Buffered so the inline-form probe, parse, and resolve steps all run
+/// off the same in-memory copy without hitting disk three times per
+/// file. `mtime` feeds the per-file skip-warning dedupe so a broken
+/// file re-warns only after the user edits it.
 struct RawWorkflowFile {
     path: PathBuf,
     text: String,
+    mtime: Option<SystemTime>,
 }
 
 fn read_raw_workflow_files(dir: &Path) -> Result<Vec<RawWorkflowFile>> {
@@ -239,8 +297,9 @@ fn read_raw_workflow_files(dir: &Path) -> Result<Vec<RawWorkflowFile>> {
         if path.file_name().and_then(|s| s.to_str()) == Some("statuses.yaml") {
             continue;
         }
+        let mtime = entry.metadata().and_then(|m| m.modified()).ok();
         let text = fs::read_to_string(&path)?;
-        out.push(RawWorkflowFile { path, text });
+        out.push(RawWorkflowFile { path, text, mtime });
     }
     out.sort_by(|a, b| a.path.cmp(&b.path));
     Ok(out)
@@ -633,14 +692,51 @@ statuses:
     }
 
     #[test]
-    fn list_workflows_surfaces_parse_errors_with_path_context() {
+    fn list_workflows_skips_malformed_file_and_keeps_valid_ones() {
+        // Per-file isolation: one broken workflow no longer takes down
+        // the whole listing. The valid workflow beside it still loads.
+        let _g = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+        materialize_default_agents("p").unwrap();
+        write_default_statuses("p");
+        let dir = workflows_dir("p").unwrap();
+        write_workflow(&dir, "design-review", SIMPLE_WORKFLOW);
+        // `name: broken` is missing the required `statuses:` list.
+        std::fs::write(dir.join("broken.yaml"), "name: broken\n").unwrap();
+        let out = list_workflows("p").unwrap();
+        assert_eq!(out.len(), 1, "broken file should be skipped, valid kept");
+        assert_eq!(out[0].name, "design-review");
+        std::env::remove_var("SHELBI_HOME");
+    }
+
+    #[test]
+    fn list_workflows_degrades_to_default_when_every_file_is_broken() {
+        // When no workflow file survives loading the loader still hands
+        // callers the canonical default so the board keeps painting.
         let _g = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let home = fresh_home();
         std::env::set_var("SHELBI_HOME", &home);
         write_default_statuses("p");
         let dir = workflows_dir("p").unwrap();
         std::fs::write(dir.join("broken.yaml"), "name: broken\n").unwrap();
-        let err = list_workflows("p").unwrap_err();
+        std::fs::write(dir.join("also-broken.yaml"), ": not valid yaml").unwrap();
+        let out = list_workflows("p").unwrap();
+        assert_eq!(out, vec![default_workflow()]);
+        std::env::remove_var("SHELBI_HOME");
+    }
+
+    #[test]
+    fn load_workflow_surfaces_parse_errors_with_path_context() {
+        // The named single-file loader keeps the strict contract: a
+        // malformed file is a hard error naming the offending path.
+        let _g = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+        write_default_statuses("p");
+        let dir = workflows_dir("p").unwrap();
+        std::fs::write(dir.join("broken.yaml"), "name: broken\n").unwrap();
+        let err = load_workflow("p", "broken").unwrap_err();
         let msg = err.to_string();
         assert!(
             msg.contains("broken.yaml"),
@@ -913,7 +1009,9 @@ statuses:
   - { id: done, owner: user }
 "#,
         );
-        let err = list_workflows("p").unwrap_err();
+        // `list_workflows` now skips a bad file; the strict rejection is
+        // exercised through the named single-file loader.
+        let err = load_workflow("p", "bad").unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("status id `done`"), "msg: {msg}");
         assert!(msg.contains("`todo`"), "msg: {msg}");
@@ -937,7 +1035,9 @@ statuses:
   - { id: review,  owner: user }
 "#,
         );
-        let err = list_workflows("p").unwrap_err();
+        // `list_workflows` skips the mixed-form file; the strict
+        // rejection is exercised through the named single-file loader.
+        let err = load_workflow("p", "mixed").unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("mixed.yaml"), "msg: {msg}");
         assert!(msg.contains("inline status identity"), "msg: {msg}");
