@@ -1546,7 +1546,7 @@ mod tests {
         let log = std::fs::read_to_string(shelbi_state::events_log_path().unwrap()).unwrap();
         assert!(
             log.lines()
-                .any(|l| l.contains("mode=zen off -> on reason=user:palette")),
+                .any(|l| l.contains("project=demo mode=zen off -> on reason=user:palette")),
             "missing canonical palette-toggle event in: {log}"
         );
 
