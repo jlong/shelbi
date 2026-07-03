@@ -1,10 +1,10 @@
 ---
 title: Statuses
 order: 32
-summary: Field-by-field reference for statuses.yml — the project-wide status catalog that gives every status its id, display name, and category.
+summary: Field-by-field reference for statuses.yaml — the project-wide status catalog that gives every status its id, display name, and category.
 ---
 
-`statuses.yml` is the single source of truth for **status identity** in a
+`statuses.yaml` is the single source of truth for **status identity** in a
 project. Every [workflow](/docs/configuration/workflow) references these
 entries by `id` and inherits their `name` and `category`; workflows may
 pick a subset but cannot reorder or rename them. Declaration order here
@@ -13,17 +13,26 @@ is the canonical left-to-right column order in the TUI's all-view.
 ## Where it lives
 
 ```
-<config-root>/workflows/statuses.yml
+<config-root>/workflows/statuses.yaml
 ```
 
 `<config-root>` is `~/.shelbi/projects/<name>/` in the default
 [global mode](/docs/concepts/config-modes) and `<repo>/.shelbi/` in
 in-repo mode — the same directory as the workflow files.
 
+<Callout type="note" title="Migrated from statuses.yml">
+
+Older versions wrote this catalog as `statuses.yml`. Shelbi now
+standardizes on `.yaml` and migrates automatically on load: a legacy
+`statuses.yml` is renamed to `statuses.yaml` the next time the project
+loads (only when no `statuses.yaml` already exists). No action needed.
+
+</Callout>
+
 ## Example
 
 ```yaml
-# ~/.shelbi/projects/myapp/workflows/statuses.yml
+# ~/.shelbi/projects/myapp/workflows/statuses.yaml
 statuses:
   - { id: backlog,     name: Backlog,     category: backlog }
   - { id: todo,        name: Todo,        category: ready }

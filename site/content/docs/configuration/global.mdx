@@ -1,13 +1,13 @@
 ---
 title: Global config
 order: 33
-summary: Field-by-field reference for the hub-wide files — ~/.shelbi/config.yaml (UI preferences) and ~/.shelbi/keys.yml (keybindings).
+summary: Field-by-field reference for the hub-wide files — ~/.shelbi/config.yaml (UI preferences) and ~/.shelbi/keys.yaml (keybindings).
 ---
 
 Two files under `~/.shelbi/` hold hub-wide settings that apply across
 every project on your machine, independent of any single project's
 [config mode](/docs/concepts/config-modes): `config.yaml` (UI
-preferences) and `keys.yml` (keybindings). Both are optional — absent or
+preferences) and `keys.yaml` (keybindings). Both are optional — absent or
 partial files fall back to built-in defaults, never an error.
 
 <Callout type="note" title="Home resolution">
@@ -29,7 +29,7 @@ omits a block — resolves to defaults.
 
 | Field | Type | Required | Default | Description |
 | --- | --- | --- | --- | --- |
-| `keymap.zen_toggle` | [chord](#zen_toggle-chords) | no | `alt-z` | Chord that toggles Zen Mode on and off. **Legacy** — a one-shot migration moves a non-default value into `keys.yml` (`defaults.global.zen_toggle`) and resets this field. Prefer setting it in `keys.yml`. |
+| `keymap.zen_toggle` | [chord](#zen_toggle-chords) | no | `alt-z` | Chord that toggles Zen Mode on and off. **Legacy** — a one-shot migration moves a non-default value into `keys.yaml` (`defaults.global.zen_toggle`) and resets this field. Prefer setting it in `keys.yaml`. |
 
 ```yaml
 # ~/.shelbi/config.yaml
@@ -49,19 +49,28 @@ The accepted values for the Zen toggle chord:
 | `ctrl-shift-z` | Ctrl+Shift+Z |
 | `none` | disabled — no chord toggles Zen Mode |
 
-## `keys.yml`
+## `keys.yaml`
 
 Overrides for the TUI keybindings. Built-in chords apply out of the box;
 this file layers on top of them, either globally (`defaults`) or per
 project (`projects.<name>`). Parse errors never fail the load — a
 mistyped entry is skipped and that action keeps its built-in chord.
 
-**Path:** `~/.shelbi/keys.yml`
+**Path:** `~/.shelbi/keys.yaml`
+
+<Callout type="note" title="Migrated from keys.yml">
+
+Older versions named this file `keys.yml`. Shelbi now standardizes on
+`.yaml` and migrates automatically on load: a legacy `keys.yml` is
+renamed to `keys.yaml` on the next launch (only when no `keys.yaml`
+already exists). No action needed.
+
+</Callout>
 
 ### Shape
 
 ```yaml
-# ~/.shelbi/keys.yml
+# ~/.shelbi/keys.yaml
 defaults:                 # applies to every project
   <mode>:
     <action>: <chord | [chords] | null>

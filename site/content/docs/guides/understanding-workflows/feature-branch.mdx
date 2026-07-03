@@ -82,14 +82,14 @@ pushed and PR'd on the way to **Review**, and squash-merged back into
 ## The workflow
 
 Status identity — the stable `id`, the display `name`, and the
-`category` — lives once in `workflows/statuses.yml`, the project-wide
+`category` — lives once in `workflows/statuses.yaml`, the project-wide
 [status catalog](/docs/guides/getting-started/workflows#schema). Every workflow file
 then references those statuses by `id` and adds only what's
 workflow-specific (`owner`, and an optional `agent:`). The shipped
 catalog is the canonical six:
 
 ```yaml
-# workflows/statuses.yml — the status catalog, shared by every workflow.
+# workflows/statuses.yaml — the status catalog, shared by every workflow.
 statuses:
   - { id: backlog,     name: Backlog,     category: backlog }
   - { id: todo,        name: Todo,        category: ready }
