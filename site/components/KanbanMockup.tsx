@@ -565,7 +565,7 @@ function TerminalBody({ state }: { state: AppState }) {
 
   return (
     <pre
-      className="m-0 whitespace-pre px-4 py-3 font-mono"
+      className="m-0 whitespace-pre font-mono"
       style={PRE_STYLE}
     >
       {rows.map((row, i) => (
@@ -579,7 +579,7 @@ function Sidebar({ state }: { state: AppState }) {
   const rows = buildSidebarRows(state)
   return (
     <pre
-      className="m-0 hidden whitespace-pre border-r py-3 font-mono md:block"
+      className="m-0 hidden whitespace-pre border-r font-mono md:block"
       style={{
         ...PRE_STYLE,
         // CHROME_BAR_BG/BORDER sit too close to TUI_BG to read as a rule;
