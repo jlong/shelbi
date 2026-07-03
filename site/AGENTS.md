@@ -40,10 +40,18 @@ intentional departures — keep them; do not revert to strict-mono here:
   (`components/Callout.tsx`) tints by admonition flavor — note/info → blue,
   warning → yellow, danger/error → red, tip → green — with a soft background,
   saturated border, and readable title/body text in both themes.
+- **Copy-prompt banner uses a violet accent.** The `CopyPromptBanner`
+  component (`components/CopyPromptBanner.tsx`) — the "set this up with an AI
+  agent" affordance — carries a purple/violet tint: a soft tinted background,
+  a saturated violet border, and a violet sparkle icon, so it stands out as
+  the "do this with an agent" call to action. Title/body text stay on the
+  monochrome ramp for legibility. Keep the violet here; do not revert it to
+  strict-mono.
 
-Both are driven by `--color-prose` and the `--color-callout-*` tokens in
-`app/globals.css` (defined per theme). This hue is scoped to docs callouts only
-— do not spread accent color into the rest of the monochrome brand.
+These are driven by `--color-prose`, the `--color-callout-*` tokens, and the
+`--color-copy-prompt-*` tokens in `app/globals.css` (defined per theme). This
+hue is scoped to docs callouts and the copy-prompt banner only — do not spread
+accent color into the rest of the monochrome brand.
 
 # Typography
 

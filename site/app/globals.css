@@ -64,6 +64,18 @@
   --color-callout-tip-title: #14532D;
   --color-callout-tip-body: #15803D;
 
+  /* ----- Copy-prompt banner accent (violet — light) -----
+     A deliberate exception to strict-monochrome, scoped to the
+     `CopyPromptBanner` component: a purple/violet tint marks the
+     "set this up with an AI agent" affordance so it stands apart from
+     the surrounding chrome. Soft tinted background, saturated border,
+     and a violet icon; title/body text stay on the monochrome ramp so
+     they read clearly on the tint. Tuned for both themes (see the
+     `.dark` overrides). Documented in `AGENTS.md`. */
+  --color-copy-prompt-bg: #F5F3FF;
+  --color-copy-prompt-border: #C4B5FD;
+  --color-copy-prompt-icon: #7C3AED;
+
   /* ----- Spacing (8px base) ----- */
   --spacing: 8px;
 }
@@ -107,6 +119,13 @@
   --color-callout-tip-border: #2E6B45;
   --color-callout-tip-title: #BBF7D0;
   --color-callout-tip-body: #C0E9CE;
+
+  /* Copy-prompt banner accent — dark. Deep, low-luminance violet
+     background with a brighter border and a light violet icon so the
+     accent stays legible on the black canvas without glowing. */
+  --color-copy-prompt-bg: #17112E;
+  --color-copy-prompt-border: #4A3A82;
+  --color-copy-prompt-icon: #A78BFA;
 }
 
 /* ============================================================

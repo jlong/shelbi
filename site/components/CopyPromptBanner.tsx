@@ -19,6 +19,14 @@ const DEFAULT_DESCRIPTION =
  * guide. Mirrors Clerk's quickstart affordance: one click copies the raw
  * prompt so it can be pasted into an AI coding tool. Renders at the top of a
  * doc page; the clipboard state is owned by the reused {@link CopyButton}.
+ *
+ * Deliberate exception to the strict-monochrome rule in `site/AGENTS.md`
+ * (same spirit as the colored callouts): the banner carries a violet accent
+ * — tinted background, saturated border, and violet sparkle icon — so the
+ * "set this up with an AI agent" affordance stands out. Title/body text stay
+ * on the monochrome ramp for legibility. Colors resolve through the
+ * `--color-copy-prompt-*` tokens in `app/globals.css`, so light and dark mode
+ * follow automatically.
  */
 export function CopyPromptBanner({
   prompt,
@@ -26,10 +34,10 @@ export function CopyPromptBanner({
   description = DEFAULT_DESCRIPTION,
 }: CopyPromptBannerProps) {
   return (
-    <div className="my-3 flex flex-col gap-2 rounded-md border border-gray-4 bg-gray-1 p-3 sm:flex-row sm:items-center sm:justify-between">
+    <div className="my-3 flex flex-col gap-2 rounded-md border border-copy-prompt-border bg-copy-prompt-bg p-3 sm:flex-row sm:items-center sm:justify-between">
       <div className="flex items-start gap-2">
         <SparklesIcon
-          className="mt-0.5 h-3 w-3 shrink-0 text-gray-7"
+          className="mt-0.5 h-3 w-3 shrink-0 text-copy-prompt-icon"
           aria-hidden="true"
         />
         <div className="space-y-1">
