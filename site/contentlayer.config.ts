@@ -29,15 +29,19 @@ export const Doc = defineDocumentType(() => ({
     section: {
       type: "string",
       resolve: (doc) => {
-        // Group by directory, not by the flattened slug: an `index.mdx`
-        // flattens to `docs/<section>` (the `/index` is dropped), so
-        // deriving the section from `flattenedPath` would strand section
-        // index pages in the top-level group. `sourceFileDir` keeps the
-        // real directory — `docs/guides` for both `guides/index.mdx` and
-        // `guides/forking.mdx`, plain `docs` for a top-level doc.
+        // Group by the top-level directory under `docs/`, not the flattened
+        // slug: an `index.mdx` flattens to `docs/<section>` (the `/index` is
+        // dropped), so deriving the section from `flattenedPath` would strand
+        // section index pages in the top-level group. `sourceFileDir` keeps the
+        // real directory. We take the *first* segment under `docs/` so a nested
+        // guide's sub-pages (e.g. `guides/understanding-workflows/forking.mdx`)
+        // still belong to the `guides` section rather than splintering into a
+        // group of their own — the flat views (mobile drawer, docs index,
+        // prev/next, llms.txt) then stay aligned with the sidebar tree, which
+        // groups by the same top-level directory.
         const parts = doc._raw.sourceFileDir.split("/")
-        // ["docs", "<section>"] → section; a top-level doc is just ["docs"].
-        return parts.length > 1 ? parts[parts.length - 1] : ""
+        // ["docs", "<section>", ...] → section; a top-level doc is just ["docs"].
+        return parts.length > 1 ? parts[1] : ""
       },
     },
   },

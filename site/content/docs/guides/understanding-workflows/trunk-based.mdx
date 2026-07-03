@@ -1,6 +1,6 @@
 ---
 title: Trunk-based
-order: 32
+order: 31
 summary: Short-lived branches that merge to main fast, with no separate review column. The merge is action-based, so it pairs naturally with Zen Mode auto-merge.
 ---
 
@@ -9,7 +9,7 @@ summary: Short-lived branches that merge to main fast, with no separate review c
 green. There's no long-lived integration branch and no drawn-out review
 column — work goes from *in progress* to *merged* the moment checks pass.
 
-In Shelbi this is the [feature-branch model](/docs/guides/feature-branch)
+In Shelbi this is the [feature-branch model](/docs/guides/understanding-workflows/feature-branch)
 with the `Review` handoff collapsed: the `merge` action moves onto the
 `InProgress → Done` edge. Because
 [Zen Mode's confidence bar is action-based](/docs/concepts/workflows#what-fires-zen-modes-high-confidence-bar)
@@ -155,7 +155,7 @@ from `main`, prefer restacking or re-cutting it over a big catch-up merge
 
 ## See also
 
-- [Feature-branch](/docs/guides/feature-branch) — the review-gated
+- [Feature-branch](/docs/guides/understanding-workflows/feature-branch) — the review-gated
   version of the same branch-per-task shape.
 - [Zen Mode](/docs/concepts/zen-mode) — the confidence bar and the
   `zen.checks` that stand in for a review column here.
