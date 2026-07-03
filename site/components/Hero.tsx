@@ -36,15 +36,15 @@ export function Hero() {
         </h1>
 
         <p className="font-mono text-xs uppercase tracking-[0.25em] text-gray-7 sm:text-sm">
-          A Kanban board for your coding agents
+          Do more with your agents
         </p>
 
         <p className="max-w-2xl text-balance text-base leading-relaxed text-gray-7 sm:text-lg">
-          An open-source agent orchestrator for the terminal. Drop tasks
-          in the backlog and a named pool of workspaces picks them up in
-          parallel — locally, or on any SSH-reachable machine. Finished
-          work lands in a review column for you to inspect, or flip on
-          Zen Mode and let cleared branches auto-merge.
+          A multi-machine orchestrator for your agents, built on tmux. Drop
+          tasks in the backlog and a named pool of workspaces picks them up
+          in parallel — locally, or on any SSH-reachable machine. Finished
+          work lands in a review column for you to inspect, or flip on Zen
+          Mode and let cleared branches auto-merge.
         </p>
 
         <div className="mt-2 flex w-full flex-col gap-2 sm:w-auto sm:flex-row sm:gap-3">

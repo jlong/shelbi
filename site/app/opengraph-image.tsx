@@ -3,11 +3,12 @@ import { readFile } from "node:fs/promises"
 import { join } from "node:path"
 import { OG_CARD_SIZE, OgCard } from "@/components/OgCard"
 
-export const alt = "Shelbi — a Kanban board for your coding agents"
+export const alt =
+  "Shelbi — a multi-machine orchestrator for your agents, built on tmux"
 export const size = OG_CARD_SIZE
 export const contentType = "image/png"
 
-const TITLE = "A Kanban board for your coding agents"
+const TITLE = "Do more with your agents"
 
 export default async function Image() {
   const [geistRegular, geistSemiBold, geistMonoRegular] = await Promise.all([
