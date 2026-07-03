@@ -134,7 +134,14 @@ pub struct App {
     pub project_name: String,
     pub agents: Vec<Agent>,
     pub workspaces: Vec<WorkspaceOverview>,
-    pub review_queue: Vec<TaskFile>,
+    /// Tasks in the Review column that are **loaded on a review worktree** —
+    /// the "Ready for Review" section (✓). Built each refresh by
+    /// [`split_review_sections`]; each entry carries the `machine:port` URL
+    /// the human can open.
+    pub ready_review: Vec<ReviewEntry>,
+    /// Tasks in the Review column **waiting for a free review workspace** —
+    /// the "Queued for Review" section (·). No location yet (nothing serving).
+    pub queued_review: Vec<ReviewEntry>,
     pub sidebar_index: usize,
     pub last_refresh: Instant,
     pub status_line: String,
@@ -181,7 +188,8 @@ impl App {
             project_name: project_name.into(),
             agents: Vec::new(),
             workspaces: Vec::new(),
-            review_queue: Vec::new(),
+            ready_review: Vec::new(),
+            queued_review: Vec::new(),
             sidebar_index: 0,
             last_refresh: Instant::now() - Duration::from_secs(60),
             status_line: String::new(),
@@ -222,15 +230,29 @@ impl App {
         if row < area.y || row >= area.y.saturating_add(area.height) {
             return None;
         }
-        let idx = (row - area.y) as usize;
-        let rows = self.rows();
-        rows.get(idx).filter(|r| r.is_selectable()).map(|_| idx)
+        // Map the clicked line back to a row index. Rows are variable-height
+        // now — a review entry is two lines (title + branch) while every
+        // other row is one — so we walk cumulative heights rather than
+        // assuming line == index. (Matches the renderer's no-scroll case; the
+        // list scrolls only when it overflows, which the click map doesn't
+        // model, same as before.)
+        let target = (row - area.y) as usize;
+        let mut line = 0usize;
+        for (idx, r) in self.rows().iter().enumerate() {
+            let h = row_height(r);
+            if target < line + h {
+                return r.is_selectable().then_some(idx);
+            }
+            line += h;
+        }
+        None
     }
 
     /// Sidebar rows: a fixed 3-item nav (Chat / Tasks / Activity), then
-    /// declared workspaces under an `— agents —` separator, then the review
-    /// queue under `— Ready for Review —`, then any legacy `shelbi spawn`
-    /// agents under `— spawned —`. Each section header and its rows are
+    /// declared workspaces under an `— Workspaces —` separator, then review
+    /// tasks split across `— Ready for Review —` (loaded on a review worktree)
+    /// and `— Queued for Review —` (waiting for a slot), then any legacy
+    /// `shelbi spawn` agents under `— spawned —`. Each section header and its rows are
     /// dropped together when that group is empty — Review is intentionally
     /// not a destination view, only an inline live list. The Ctrl+P
     /// palette mirrors this same set of rows for fuzzy access.
@@ -329,16 +351,37 @@ impl App {
                 }
             }
         }
-        if !self.review_queue.is_empty() {
+        // Ready for Review — tasks loaded on a review worktree (✓). Line 1
+        // carries the `machine:port` URL badge; line 2 the branch.
+        if !self.ready_review.is_empty() {
             rows.push(Row::Blank);
             rows.push(Row::Section {
                 label: "Ready for Review".into(),
             });
-            for tf in &self.review_queue {
+            for e in &self.ready_review {
                 rows.push(Row::Review {
-                    title: tf.task.title.clone(),
-                    workspace: tf.task.assigned_to.clone(),
-                    view: View::ReviewTask(tf.task.id.clone()),
+                    title: e.title.clone(),
+                    branch: e.branch.clone(),
+                    location: e.location.clone(),
+                    ready: true,
+                    view: View::ReviewTask(e.task_id.clone()),
+                });
+            }
+        }
+        // Queued for Review — Review-status tasks waiting for a free review
+        // workspace (·). No location yet (nothing serving); branch on line 2.
+        if !self.queued_review.is_empty() {
+            rows.push(Row::Blank);
+            rows.push(Row::Section {
+                label: "Queued for Review".into(),
+            });
+            for e in &self.queued_review {
+                rows.push(Row::Review {
+                    title: e.title.clone(),
+                    branch: e.branch.clone(),
+                    location: None,
+                    ready: false,
+                    view: View::ReviewTask(e.task_id.clone()),
                 });
             }
         }
@@ -361,8 +404,11 @@ impl App {
 
     pub fn refresh(&mut self) -> Result<()> {
         self.agents = load_agents(&self.project_name).unwrap_or_default();
-        self.review_queue =
+        let review =
             shelbi_state::list_column(&self.project_name, Column::Review).unwrap_or_default();
+        let (ready, queued) = split_review_sections(&self.project_name, review);
+        self.ready_review = ready;
+        self.queued_review = queued;
         self.workspaces = load_workspaces(&self.project_name).unwrap_or_default();
         // A missing state.json is normal (fresh project): default to Off so
         // the pill stays hidden rather than flashing then disappearing.
@@ -575,11 +621,22 @@ pub enum Row {
         indent: bool,
         view: View,
     },
-    /// A task sitting in the review column — title + the workspace who
-    /// finished it.
+    /// A task sitting in the Review column, rendered as a two-line entry:
+    /// line 1 = title (+ a right-aligned `machine:port` URL badge when
+    /// loaded); line 2 = branch, dim. Appears in one of two sidebar
+    /// sections keyed by [`Row::Review::ready`]:
+    /// **Ready for Review** (`ready: true`, ✓ — loaded on a review worktree,
+    /// serving) or **Queued for Review** (`ready: false`, · — waiting for a
+    /// free review workspace). See spec §16.
     Review {
         title: String,
-        workspace: Option<String>,
+        /// Branch name shown dim on line 2 (`shelbi/<id>` fallback).
+        branch: String,
+        /// `machine:port` URL the human can open — `Some` only for a Ready
+        /// (loaded) task; `None` for a Queued one (nothing serving yet).
+        location: Option<String>,
+        /// Loaded on a review worktree (Ready, ✓) vs waiting (Queued, ·).
+        ready: bool,
         view: View,
     },
     /// Legacy `shelbi spawn` agent row — pre-task-board flow.
@@ -620,9 +677,19 @@ impl Row {
                 color: DecorationColor::Default,
             }),
             Row::Workspace { badge, .. } => Some(badge.decoration()),
-            Row::Review { .. } => Some(Decoration {
-                glyph: "✓".into(),
-                color: DecorationColor::Cyan,
+            // Ready → cyan ✓ (loaded, human can look); Queued → dim ·
+            // (waiting for a review workspace). Single source of truth for
+            // both the sidebar renderer and the palette.
+            Row::Review { ready, .. } => Some(if *ready {
+                Decoration {
+                    glyph: "✓".into(),
+                    color: DecorationColor::Cyan,
+                }
+            } else {
+                Decoration {
+                    glyph: "·".into(),
+                    color: DecorationColor::DarkGray,
+                }
             }),
             Row::LegacyAgent { status, .. } => Some(status_decoration(*status)),
             Row::Section { .. } | Row::Blank | Row::MachineGroup { .. } => None,
@@ -630,11 +697,89 @@ impl Row {
     }
 }
 
+/// A rendered review-section entry: the data the sidebar needs to draw one
+/// two-line review row. Built each refresh by [`split_review_sections`] from
+/// the Review column + project config. `location` is `Some("machine:port")`
+/// only for a Ready (loaded) task; a Queued one has none.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReviewEntry {
+    pub task_id: String,
+    pub title: String,
+    /// Branch shown dim on line 2 — `shelbi/<id>` when the task pins none.
+    pub branch: String,
+    /// `machine:port` URL badge (Ready only); `None` when queued.
+    pub location: Option<String>,
+}
+
+/// Height in list lines a row occupies. Review rows are two-line (title +
+/// branch); everything else is one. Used by [`App::row_at`] to map a click
+/// back to a row index now that rows are variable-height.
+fn row_height(row: &Row) -> usize {
+    match row {
+        Row::Review { .. } => 2,
+        _ => 1,
+    }
+}
+
+/// Split the Review column into the two sidebar sections (spec §16):
+///
+/// - **Ready** — the task's `assigned_to` names a `role: review` workspace, so
+///   the Review agent has the branch loaded and (usually) serving. Its
+///   `machine:port` URL is the deterministic review port
+///   ([`review_workspace_port`](shelbi_orchestrator::workspace::review_workspace_port)).
+/// - **Queued** — every other Review-status task (unassigned, or still pinned
+///   to the dev workspace that produced it): waiting for a free review slot.
+///
+/// If the project can't be loaded we can't classify by role, so everything
+/// falls back to Queued (no location) rather than mislabelling a task Ready.
+fn split_review_sections(
+    project_name: &str,
+    queue: Vec<TaskFile>,
+) -> (Vec<ReviewEntry>, Vec<ReviewEntry>) {
+    let entry = |task: &shelbi_core::Task, location: Option<String>| ReviewEntry {
+        task_id: task.id.clone(),
+        title: task.title.clone(),
+        branch: task
+            .branch
+            .clone()
+            .unwrap_or_else(|| format!("shelbi/{}", task.id)),
+        location,
+    };
+
+    let project = match shelbi_state::load_project(project_name) {
+        Ok(p) => p,
+        Err(_) => {
+            let queued = queue.iter().map(|tf| entry(&tf.task, None)).collect();
+            return (Vec::new(), queued);
+        }
+    };
+
+    let mut ready = Vec::new();
+    let mut queued = Vec::new();
+    for tf in &queue {
+        let loaded_on = tf
+            .task
+            .assigned_to
+            .as_deref()
+            .and_then(|name| project.workspace(name))
+            .filter(|w| w.is_review());
+        match loaded_on {
+            Some(ws) => {
+                let location = shelbi_orchestrator::workspace::review_workspace_port(&project, ws)
+                    .map(|port| format!("{}:{port}", ws.machine));
+                ready.push(entry(&tf.task, location));
+            }
+            None => queued.push(entry(&tf.task, None)),
+        }
+    }
+    (ready, queued)
+}
+
 /// Build the sidebar's view of declared workspaces from the project YAML, the
-/// in-progress task column, and the review queue (passed in so we don't
-/// scan tasks twice per refresh). One disk read per workspace for the
-/// `status.yaml` lookup. Returns an empty vec if the project YAML or task
-/// dir is missing.
+/// in-progress task column, and the review column (the latter only so a review
+/// slot serving a loaded task reads active rather than idle — §16). One disk
+/// read per workspace for the `status.yaml` lookup. Returns an empty vec if the
+/// project YAML or task dir is missing.
 fn load_workspaces(project: &str) -> Result<Vec<WorkspaceOverview>> {
     let p = match shelbi_state::load_project(project) {
         Ok(p) => p,
@@ -642,6 +787,12 @@ fn load_workspaces(project: &str) -> Result<Vec<WorkspaceOverview>> {
     };
     let in_progress =
         shelbi_state::list_column(project, Column::InProgress).unwrap_or_default();
+    // A review workspace's loaded task sits in the Review column (it's *loaded*
+    // onto the slot, never promoted from in-progress), so its "serving" state
+    // isn't visible in the in-progress scan. Read the Review column too and use
+    // it for review workspaces so a serving slot reads `Review` / active rather
+    // than `idle` — the §16 mockup's `▸ review-1  Review`.
+    let review_col = shelbi_state::list_column(project, Column::Review).unwrap_or_default();
     let mut out = Vec::with_capacity(p.workspaces.len());
     for workspace in &p.workspaces {
         let machine = match p.machine(&workspace.machine) {
@@ -651,19 +802,35 @@ fn load_workspaces(project: &str) -> Result<Vec<WorkspaceOverview>> {
         let is_remote = !machine.host().is_local();
         let assigned_task = in_progress
             .iter()
-            .find(|tf| tf.task.assigned_to.as_deref() == Some(workspace.name.as_str()));
+            .find(|tf| tf.task.assigned_to.as_deref() == Some(workspace.name.as_str()))
+            .or_else(|| {
+                // Only review slots pick up a Review-column task as their
+                // active work; a dev workspace pinned to a queued Review task
+                // has already closed its session (spec §16) and reads idle.
+                if !workspace.is_review() {
+                    return None;
+                }
+                review_col
+                    .iter()
+                    .find(|tf| tf.task.assigned_to.as_deref() == Some(workspace.name.as_str()))
+            });
         let current_task = assigned_task.map(|tf| tf.task.id.clone());
         // Mirror `shelbi workspace list`'s AGENT column: take the task's
         // frontmatter `agent:` when present (matching the lookup the
         // task-start path uses to load agent instructions/skills), and
-        // fall back to the project's default task agent. Idle workspaces
-        // get `None` — the renderer surfaces "idle" in that case rather
-        // than the default agent name.
+        // fall back to the project's default task agent. A review workspace
+        // always loads the `review` agent, whatever the task pinned for dev.
+        // Idle workspaces get `None` — the renderer surfaces "idle" in that
+        // case rather than the default agent name.
         let agent = assigned_task.map(|tf| {
-            tf.task
-                .param_str("agent")
-                .map(str::to_string)
-                .unwrap_or_else(|| DEFAULT_TASK_AGENT.to_string())
+            if workspace.is_review() {
+                shelbi_state::REVIEW_AGENT.to_string()
+            } else {
+                tf.task
+                    .param_str("agent")
+                    .map(str::to_string)
+                    .unwrap_or_else(|| DEFAULT_TASK_AGENT.to_string())
+            }
         });
         let badge = derive_workspace_badge(&workspace.name, current_task.is_some());
         out.push(WorkspaceOverview {
@@ -974,6 +1141,238 @@ mod tests {
         p.machines.retain(|m| m.name == "hub");
         p.workspaces.retain(|w| w.machine == "hub");
         p
+    }
+
+    /// [`fixture_project`] plus a `role: review` workspace (`review-1`) on hub,
+    /// so tests can exercise the Ready-for-Review path (a task loaded onto a
+    /// review worktree). review-1 is index 0 among hub's review workspaces, so
+    /// its deterministic port is the default base (3000) → URL `hub:3000`.
+    fn review_fixture_project() -> Project {
+        let mut p = fixture_project();
+        p.workspaces.push(shelbi_core::WorkspaceSpec {
+            name: "review-1".into(),
+            machine: "hub".into(),
+            runner: "claude".into(),
+            role: shelbi_core::model::WorkspaceRole::Review,
+        });
+        p
+    }
+
+    #[test]
+    fn review_tasks_split_into_ready_and_queued_sections() {
+        // Spec §16: a Review-status task loaded on a review workspace lands in
+        // "Ready for Review" (✓) with its `machine:port` URL; a Review-status
+        // task still pinned to a dev workspace (or unassigned) lands in
+        // "Queued for Review" (·) with no URL. Both are two-line rows carrying
+        // the branch.
+        let _g = TEST_LOCK.lock().unwrap();
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+
+        let project = review_fixture_project();
+        shelbi_state::save_project(&project).unwrap();
+
+        let now = Utc::now();
+        // Loaded: assigned to the review workspace → Ready, URL hub:3000.
+        shelbi_state::save_task(
+            "demo",
+            &Task {
+                id: "loaded".into(),
+                title: "Palette fuzzy-match fix".into(),
+                column: Column::Review,
+                priority: 0,
+                assigned_to: Some("review-1".into()),
+                workflow: None,
+                branch: Some("shelbi/palette-fix".into()),
+                depends_on: Vec::new(),
+                prefers_machine: None,
+                zen: None,
+                created_at: now,
+                updated_at: now,
+                params: std::collections::BTreeMap::new(),
+            },
+            "",
+        )
+        .unwrap();
+        // Waiting: still on a dev workspace → Queued, no URL, branch fallback.
+        shelbi_state::save_task(
+            "demo",
+            &Task {
+                id: "waiting".into(),
+                title: "Rework onboarding copy".into(),
+                column: Column::Review,
+                priority: 0,
+                assigned_to: Some("alpha".into()),
+                workflow: None,
+                branch: None,
+                depends_on: Vec::new(),
+                prefers_machine: None,
+                zen: None,
+                created_at: now,
+                updated_at: now,
+                params: std::collections::BTreeMap::new(),
+            },
+            "",
+        )
+        .unwrap();
+
+        let mut app = App::new_sidebar("demo");
+        app.refresh().unwrap();
+
+        assert_eq!(app.ready_review.len(), 1, "one task loaded on a review worktree");
+        let ready = &app.ready_review[0];
+        assert_eq!(ready.task_id, "loaded");
+        assert_eq!(ready.branch, "shelbi/palette-fix");
+        assert_eq!(ready.location.as_deref(), Some("hub:3000"));
+
+        assert_eq!(app.queued_review.len(), 1, "one task still waiting for a slot");
+        let queued = &app.queued_review[0];
+        assert_eq!(queued.task_id, "waiting");
+        assert_eq!(queued.branch, "shelbi/waiting", "branch falls back to shelbi/<id>");
+        assert!(queued.location.is_none(), "queued tasks have no URL yet");
+
+        // Row layout: a Ready section (✓, loaded row) precedes a Queued
+        // section (·, waiting row); each review row carries its branch + flag.
+        let rows = app.rows();
+        let ready_hdr = rows
+            .iter()
+            .position(|r| matches!(r, Row::Section { label } if label == "Ready for Review"))
+            .expect("Ready section renders");
+        let queued_hdr = rows
+            .iter()
+            .position(|r| matches!(r, Row::Section { label } if label == "Queued for Review"))
+            .expect("Queued section renders");
+        assert!(ready_hdr < queued_hdr, "Ready section sits above Queued");
+        assert!(matches!(
+            &rows[ready_hdr + 1],
+            Row::Review { ready: true, location: Some(loc), branch, .. }
+                if loc == "hub:3000" && branch == "shelbi/palette-fix"
+        ));
+        assert!(matches!(
+            &rows[queued_hdr + 1],
+            Row::Review { ready: false, location: None, branch, .. }
+                if branch == "shelbi/waiting"
+        ));
+
+        std::env::remove_var("SHELBI_HOME");
+    }
+
+    #[test]
+    fn review_workspace_row_shows_review_agent_when_serving_a_loaded_task() {
+        // Spec §16 mockup: a review slot with a task loaded onto it reads
+        // `Review` / active on its Workspaces-section row, not `idle` — even
+        // though the loaded task lives in the Review column (never
+        // in-progress). A dev workspace pinned to a Review task, by contrast,
+        // has closed its session and reads idle.
+        let _g = TEST_LOCK.lock().unwrap();
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+
+        let project = review_fixture_project();
+        shelbi_state::save_project(&project).unwrap();
+
+        let now = Utc::now();
+        shelbi_state::save_task(
+            "demo",
+            &Task {
+                id: "loaded".into(),
+                title: "loaded".into(),
+                column: Column::Review,
+                priority: 0,
+                assigned_to: Some("review-1".into()),
+                workflow: None,
+                branch: None,
+                depends_on: Vec::new(),
+                prefers_machine: None,
+                zen: None,
+                created_at: now,
+                updated_at: now,
+                params: std::collections::BTreeMap::new(),
+            },
+            "",
+        )
+        .unwrap();
+
+        let workspaces = load_workspaces("demo").unwrap();
+        let review = workspaces.iter().find(|w| w.name == "review-1").unwrap();
+        assert_eq!(
+            review.agent.as_deref(),
+            Some("review"),
+            "a serving review slot surfaces the `review` agent, not a dev default"
+        );
+        assert_eq!(review.current_task.as_deref(), Some("loaded"));
+        assert_ne!(
+            review.badge,
+            WorkspaceBadge::Idle,
+            "a serving review slot is active, not idle"
+        );
+
+        std::env::remove_var("SHELBI_HOME");
+    }
+
+    #[test]
+    fn row_at_maps_clicks_across_two_line_review_rows() {
+        // Review rows are two lines tall; every other row is one. `row_at`
+        // must walk cumulative heights so a click on a review row's *branch*
+        // line resolves to the same row index as its title line, and rows
+        // below a review entry don't drift by the extra line.
+        let mut app = App::new_sidebar("demo");
+        app.ready_review = vec![ReviewEntry {
+            task_id: "r".into(),
+            title: "Ready task".into(),
+            branch: "shelbi/r".into(),
+            location: Some("hub:3000".into()),
+        }];
+        app.queued_review = vec![ReviewEntry {
+            task_id: "q".into(),
+            title: "Queued task".into(),
+            branch: "shelbi/q".into(),
+            location: None,
+        }];
+        // No workspaces/agents so the row layout is exactly: 3 nav, blank,
+        // Ready header, Ready review (h2), blank, Queued header, Queued
+        // review (h2). Anchor the list at the buffer origin so a clicked line
+        // maps directly to a cumulative-height offset.
+        app.list_area = Rect::new(0, 0, 40, 20);
+
+        let rows = app.rows();
+        let ready_idx = rows
+            .iter()
+            .position(|r| matches!(r, Row::Review { ready: true, .. }))
+            .unwrap();
+        let queued_idx = rows
+            .iter()
+            .position(|r| matches!(r, Row::Review { ready: false, .. }))
+            .unwrap();
+
+        // Cumulative line of the Ready review row's first line = its index
+        // (all rows above it are height 1). Both its lines map to it.
+        let ready_line = ready_idx as u16;
+        assert_eq!(app.row_at(1, ready_line), Some(ready_idx), "title line");
+        assert_eq!(
+            app.row_at(1, ready_line + 1),
+            Some(ready_idx),
+            "branch line maps to the same review row"
+        );
+
+        // The Queued review row sits one line lower than a naive
+        // one-line-per-row map would place it (the Ready row ate two lines).
+        let queued_line = ready_line + 2 /* ready row height */ + 1 /* blank */ + 1 /* header */;
+        assert_eq!(app.row_at(1, queued_line), Some(queued_idx), "queued title line");
+        assert_eq!(
+            app.row_at(1, queued_line + 1),
+            Some(queued_idx),
+            "queued branch line maps to the same review row"
+        );
+
+        // A section header line is inert.
+        let ready_hdr = rows
+            .iter()
+            .position(|r| matches!(r, Row::Section { label } if label == "Ready for Review"))
+            .unwrap() as u16;
+        assert_eq!(app.row_at(1, ready_hdr), None, "section headers aren't clickable");
+        // First nav row still maps to index 0.
+        assert_eq!(app.row_at(1, 0), Some(0));
     }
 
     #[test]
@@ -1671,6 +2070,11 @@ mod tests {
 
     #[test]
     fn review_section_hides_when_queue_empty_and_appears_when_populated() {
+        // The fixture declares no `role: review` workspace, so a Review-status
+        // task (assigned to a dev workspace) lands in the **Queued for Review**
+        // section — nothing is loaded onto a review worktree, so there's no
+        // Ready section. The row is two-line: title on line 1, branch on
+        // line 2 (the `shelbi/<id>` fallback since the task pins none).
         let _g = TEST_LOCK.lock().unwrap();
         let home = fresh_home();
         std::env::set_var("SHELBI_HOME", &home);
@@ -1681,7 +2085,7 @@ mod tests {
         let mut app = App::new_sidebar("demo");
         app.refresh().unwrap();
         assert!(
-            !app.rows().iter().any(|r| matches!(r, Row::Section { label } if label == "Ready for Review")),
+            !app.rows().iter().any(|r| matches!(r, Row::Section { label } if label == "Queued for Review")),
             "empty review queue must not render the section header"
         );
 
@@ -1710,13 +2114,22 @@ mod tests {
         let rows = app.rows();
         let section_idx = rows
             .iter()
-            .position(|r| matches!(r, Row::Section { label } if label == "Ready for Review"))
+            .position(|r| matches!(r, Row::Section { label } if label == "Queued for Review"))
             .expect("populated review queue must render the section header");
         assert!(matches!(
             &rows[section_idx + 1],
-            Row::Review { title, workspace, .. } if title == "Fix login" && workspace.as_deref() == Some("delta")
+            Row::Review { title, branch, location, ready, .. }
+                if title == "Fix login"
+                    && branch == "shelbi/ready"
+                    && location.is_none()
+                    && !*ready
         ));
-        // Exactly one blank row separates the agents list from the Ready
+        // No Ready section — the task is queued, not loaded on a review slot.
+        assert!(
+            !rows.iter().any(|r| matches!(r, Row::Section { label } if label == "Ready for Review")),
+            "a task on a dev workspace is queued, never Ready"
+        );
+        // Exactly one blank row separates the preceding list from the Queued
         // for Review header — every section header gets the same uniform
         // single-blank gap.
         assert!(section_idx >= 1);
@@ -1810,14 +2223,29 @@ mod tests {
         assert_eq!(d.glyph, WorkspaceBadge::AwaitingPermission.glyph());
         assert_eq!(d.color, DecorationColor::Red);
 
+        // Ready (loaded) → cyan ✓.
         let review = Row::Review {
             title: "Fix login".into(),
-            workspace: Some("delta".into()),
+            branch: "shelbi/ready".into(),
+            location: Some("hub:3000".into()),
+            ready: true,
             view: View::ReviewTask("ready".into()),
         };
         let d = review.decoration().unwrap();
         assert_eq!(d.glyph, "✓");
         assert_eq!(d.color, DecorationColor::Cyan);
+
+        // Queued (waiting) → dim ·.
+        let queued = Row::Review {
+            title: "Rework onboarding".into(),
+            branch: "shelbi/rework".into(),
+            location: None,
+            ready: false,
+            view: View::ReviewTask("rework".into()),
+        };
+        let d = queued.decoration().unwrap();
+        assert_eq!(d.glyph, "·");
+        assert_eq!(d.color, DecorationColor::DarkGray);
 
         let agent = Row::LegacyAgent {
             id: "spawn-1".into(),

@@ -23,7 +23,7 @@ use ratatui::{
     widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Wrap},
     Frame,
 };
-use shelbi_core::Column;
+use shelbi_core::{Column, Project, Task};
 use shelbi_state::keymap::{DisplayStyle, Keymaps, ReviewAction};
 use shelbi_state::TaskFile;
 
@@ -32,6 +32,10 @@ use crate::keymap::format_chord_or_unbound;
 pub struct ReviewApp {
     pub project_name: String,
     pub queue: Vec<TaskFile>,
+    /// Project config, reloaded each refresh — needed to resolve which review
+    /// workspace a task is loaded on and compute its `machine:port` URL. `None`
+    /// until the first successful load (or if the project can't be read).
+    pub project: Option<Project>,
     pub selected: usize,
     pub last_refresh: Instant,
     pub status_line: String,
@@ -51,6 +55,7 @@ impl ReviewApp {
         Self {
             project_name: project_name.into(),
             queue: Vec::new(),
+            project: None,
             selected: 0,
             last_refresh: Instant::now() - Duration::from_secs(60),
             status_line: String::new(),
@@ -72,6 +77,9 @@ impl ReviewApp {
     }
 
     pub fn refresh(&mut self) {
+        // Reload project config so `machine:port` URLs track workspace/role
+        // edits. A missing project just means no URL column — not fatal.
+        self.project = shelbi_state::load_project(&self.project_name).ok();
         match shelbi_state::list_column(&self.project_name, Column::Review) {
             Ok(tasks) => {
                 let prev_id = self.selected_task().map(|tf| tf.task.id.clone());
@@ -104,6 +112,18 @@ impl ReviewApp {
 
     pub fn selected_task(&self) -> Option<&TaskFile> {
         self.queue.get(self.selected)
+    }
+
+    /// The `machine:port` URL a task is loaded on, when it's assigned to a
+    /// review workspace (spec §16 — same deterministic port the sidebar
+    /// badge shows). `None` for a queued task, a task on a dev workspace, or
+    /// when the project config isn't available.
+    pub fn location_for(&self, task: &Task) -> Option<String> {
+        let project = self.project.as_ref()?;
+        let name = task.assigned_to.as_deref()?;
+        let ws = project.workspace(name).filter(|w| w.is_review())?;
+        shelbi_orchestrator::workspace::review_workspace_port(project, ws)
+            .map(|port| format!("{}:{port}", ws.machine))
     }
 
     fn clamp_selection(&mut self) {
@@ -253,6 +273,12 @@ fn render_list(f: &mut Frame, app: &ReviewApp, area: Rect) {
                 Style::default().fg(Color::Magenta),
             ));
         }
+        // Loaded tasks show the review workspace's serving URL so the queue
+        // reads which slot + port each is on at a glance.
+        if let Some(loc) = app.location_for(&tf.task) {
+            spans.push(Span::raw("  "));
+            spans.push(Span::styled(loc, Style::default().fg(Color::Cyan)));
+        }
         items.push(ListItem::new(Line::from(spans)));
     }
     if items.is_empty() {
@@ -288,7 +314,7 @@ fn render_detail(f: &mut Frame, app: &ReviewApp, area: Rect) {
         return;
     };
 
-    let header = detail_header(tf);
+    let header = detail_header(tf, app.location_for(&tf.task).as_deref());
     let header_h = header.len() as u16;
     let chunks = Layout::default()
         .direction(Direction::Vertical)
@@ -314,7 +340,7 @@ fn render_detail(f: &mut Frame, app: &ReviewApp, area: Rect) {
     f.render_widget(body, chunks[2]);
 }
 
-fn detail_header(tf: &TaskFile) -> Vec<Line<'static>> {
+fn detail_header(tf: &TaskFile, location: Option<&str>) -> Vec<Line<'static>> {
     let task = &tf.task;
     let mut lines: Vec<Line<'static>> = Vec::new();
 
@@ -327,6 +353,14 @@ fn detail_header(tf: &TaskFile) -> Vec<Line<'static>> {
         lines.push(Line::from(vec![
             meta_label("workspace"),
             Span::styled(format!("@{w}"), Style::default().fg(Color::Magenta)),
+        ]));
+    }
+    // The serving URL (`machine:port`) when the task is loaded on a review
+    // workspace — the address a human opens to look at the running change.
+    if let Some(loc) = location {
+        lines.push(Line::from(vec![
+            meta_label("url"),
+            Span::styled(loc.to_string(), Style::default().fg(Color::Cyan)),
         ]));
     }
     if let Some(branch) = &task.branch {
@@ -375,4 +409,106 @@ fn render_footer(f: &mut Frame, app: &ReviewApp, area: Rect) {
         ))
     };
     f.render_widget(Paragraph::new(vec![keys, status]), area);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ratatui::{backend::TestBackend, Terminal};
+
+    use crate::test_support::{provision_hub_repo_for_project, ENV_LOCK};
+
+    fn fresh_home() -> std::path::PathBuf {
+        let p = std::env::temp_dir().join(format!(
+            "shelbi-review-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&p).unwrap();
+        p
+    }
+
+    fn save_review_task(project: &str, id: &str, title: &str, assigned_to: Option<&str>) {
+        let now = chrono::Utc::now();
+        let task = shelbi_core::Task {
+            id: id.into(),
+            title: title.into(),
+            column: Column::Review,
+            priority: 0,
+            assigned_to: assigned_to.map(str::to_string),
+            workflow: None,
+            branch: Some(format!("shelbi/{id}")),
+            depends_on: Vec::new(),
+            prefers_machine: None,
+            zen: None,
+            created_at: now,
+            updated_at: now,
+            params: std::collections::BTreeMap::new(),
+        };
+        shelbi_state::save_task(project, &task, "# body").unwrap();
+    }
+
+    fn dump(term: &Terminal<TestBackend>) -> String {
+        let buf = term.backend().buffer().clone();
+        (0..buf.area.height)
+            .map(|y| {
+                (0..buf.area.width)
+                    .map(|x| buf[(x, y)].symbol().to_string())
+                    .collect::<Vec<_>>()
+                    .join("")
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// The `__review` queue surfaces which review workspace + URL each loaded
+    /// task is on (spec §8/§16): a task assigned to a `role: review` workspace
+    /// shows its deterministic `machine:port` in both the list and the detail
+    /// header; a task not on a review slot shows neither.
+    #[test]
+    fn review_view_surfaces_workspace_and_url_for_loaded_task() {
+        let _g = ENV_LOCK.lock().unwrap();
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+
+        provision_hub_repo_for_project(&home, "demo");
+        // Add a review workspace so a loaded task resolves to a port.
+        let mut project = shelbi_state::load_project("demo").unwrap();
+        project.workspaces.push(shelbi_core::WorkspaceSpec {
+            name: "review-1".into(),
+            machine: "hub".into(),
+            runner: "claude".into(),
+            role: shelbi_core::model::WorkspaceRole::Review,
+        });
+        shelbi_state::save_project(&project).unwrap();
+
+        save_review_task("demo", "loaded", "Palette fix", Some("review-1"));
+        save_review_task("demo", "waiting", "Onboarding copy", None);
+
+        let mut app = ReviewApp::new("demo");
+        app.refresh();
+
+        // location_for resolves the deterministic port for the loaded task,
+        // and nothing for the queued one.
+        let loaded = app.queue.iter().find(|tf| tf.task.id == "loaded").unwrap();
+        let waiting = app.queue.iter().find(|tf| tf.task.id == "waiting").unwrap();
+        assert_eq!(app.location_for(&loaded.task).as_deref(), Some("hub:3000"));
+        assert!(app.location_for(&waiting.task).is_none());
+
+        // The URL shows up in the rendered list. Select the loaded task so
+        // the detail header carries the `url:` row too.
+        app.selected = app.queue.iter().position(|tf| tf.task.id == "loaded").unwrap();
+        let backend = TestBackend::new(90, 20);
+        let mut term = Terminal::new(backend).unwrap();
+        term.draw(|f| render_full(f, &app, f.area())).unwrap();
+        let screen = dump(&term);
+        assert!(screen.contains("hub:3000"), "URL must render, got:\n{screen}");
+        assert!(screen.contains("@review-1"), "workspace must render, got:\n{screen}");
+        assert!(screen.contains("url:"), "detail header carries a url row, got:\n{screen}");
+
+        std::env::remove_var("SHELBI_HOME");
+    }
 }
