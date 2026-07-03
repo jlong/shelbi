@@ -603,8 +603,11 @@ export function AppMockup({
             }}
           >
             <div
-              className="absolute left-3 top-1/2 flex -translate-y-1/2 items-center"
-              style={{ gap: 8 }}
+              className="absolute flex items-center"
+              // Equal top/left inset so the red light is equidistant from the
+              // top and left edges — tucked into the corner. 8px keeps it
+              // inside the 28px bar (8 + 12 + 8 = 28) with no height change.
+              style={{ top: 8, left: 8, gap: 8 }}
             >
               <TrafficLight color={TRAFFIC_RED} />
               <TrafficLight color={TRAFFIC_YELLOW} />
