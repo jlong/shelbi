@@ -5,25 +5,21 @@ summary: Edit the orchestrator agent's instructions to encode routing rules, pro
 ---
 
 The orchestrator is your runner (`claude`, `codex`, …) booted with a
-system prompt that explains the board, the workspaces, and the loop.
-That prompt is the **workflow** — the contract between you and the
-agent for who initiates what, how dispatch is decided, and how the
-agent reports back. Shelbi ships a sensible default and seeds it into
-every project as an editable file.
+system prompt that explains the board, the workspaces, and the loop. That
+prompt is the **workflow** — the contract for who initiates what, how
+dispatch is decided, and how the agent reports back. Shelbi ships a
+sensible default and seeds it into every project as an editable file.
 
-This page walks through customizing the orchestrator's prompt,
-encoding three concrete tweaks, and applying them. The underlying
-machinery is covered in
+This page customizes the orchestrator's prompt, encodes three concrete
+tweaks, and applies them. The underlying machinery lives in
 [the orchestrator concept page](/docs/concepts/orchestrator#customizing-the-prompt-per-project);
 this is the practical version.
 
 ## Where the prompt lives
 
 The orchestrator is a [project-local agent with shipped defaults](/docs/concepts/agents).
-Its prompt is composed from two files:
-
-Both files live under the project's `agents/` directory —
-`~/.shelbi/projects/<name>/agents/` in the default
+Its prompt is composed from two files, both under the project's `agents/`
+directory — `~/.shelbi/projects/<name>/agents/` in the default
 [global mode](/docs/concepts/config-modes) or `<repo>/.shelbi/agents/`
 in in-repo mode:
 
@@ -230,11 +226,11 @@ substituted) is written to `~/.shelbi/projects/<name>/CLAUDE.md` on
 every `shelbi reload` — read that file to see exactly what the runner
 loads.
 
-`shelbi reload` respawns the sidebar, Tasks, and Review panes
-against the new config without restarting workspaces or losing chat
-history. The orchestrator pane is recycled, which means its
-conversation context resets — that's the cost of changing the
-system prompt mid-session. Heads up before the next turn.
+`shelbi reload` respawns the sidebar, Tasks, and Review panes against the
+new config without restarting workspaces or losing chat history. It does
+recycle the orchestrator pane, so its conversation context resets — the
+cost of changing the system prompt mid-session. Heads up before the next
+turn.
 
 ## Iterate from prose, not code
 

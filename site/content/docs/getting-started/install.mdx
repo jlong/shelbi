@@ -4,43 +4,42 @@ order: 1
 summary: Hosted install script and manual source install, both build with cargo, plus verifying the binary on your PATH.
 ---
 
+<CopyPromptBanner prompt="Install Shelbi on my machine. It builds from source with cargo — there's no prebuilt binary. First make sure I have a Rust toolchain (rustup), tmux 3.2 or later, and at least one authenticated agent CLI (claude or codex). Then run the hosted install script: curl -fsSL https://shelbi.dev/install.sh | sh. Finally verify with `shelbi --version` and make sure the install path (~/bin by default) is on my PATH." />
+
 Shelbi builds from source with `cargo` — there's no prebuilt binary
-today. The hosted install script handles the clone-and-build for you:
+today. The hosted install script does the clone-and-build for you:
 
 <InstallCommand />
 
 It clones into a temp dir, runs `cargo build --release`, and drops the
-resulting binary at `~/bin/shelbi` (override with `SHELBI_INSTALL_PATH`).
-Prefer to clone the repo to a permanent path so you can rebuild in place
-later? Skip to [Install from source manually](#install-from-source-manually).
+binary at `~/bin/shelbi` (override with `SHELBI_INSTALL_PATH`). To keep
+the checkout around and rebuild in place later, [install from source
+manually](#install-from-source-manually) instead.
 
 ## Prerequisites
 
-You need three things before you start. The first one is required for
-both the hosted script and the manual path — both build from source.
+You need three things before you start:
 
-- **A Rust toolchain.** Required for every install path. The workspace
-  builds against the stable channel; install with [rustup](https://rustup.rs)
-  if you don't already have it. Anything recent enough to compile the
-  workspace works.
-- **`tmux` 3.2 or later.** Shelbi runs every workspace inside a tmux pane and
-  drives them with `send-keys` / `capture-pane`. Older tmux releases miss
+- **A Rust toolchain.** Every install path builds from source. The
+  workspace targets the stable channel — install it with
+  [rustup](https://rustup.rs) if you don't already have it.
+- **`tmux` 3.2 or later.** Shelbi runs every workspace inside a tmux pane
+  and drives it with `send-keys` / `capture-pane`; older releases miss
   features the TUI relies on. Install via Homebrew (`brew install tmux`),
-  apt (`sudo apt install tmux`), or your package manager of choice.
+  apt (`sudo apt install tmux`), or your package manager.
 - **An agent CLI.** At least one of `claude`
-  ([Claude Code](https://docs.claude.com/en/docs/claude-code)) or `codex`
-  needs to be installed and authenticated. You can declare more than one
-  later — the project YAML picks per workspace.
+  ([Claude Code](https://docs.claude.com/en/docs/claude-code)) or `codex`,
+  installed and authenticated. Declare more than one later — the project
+  YAML picks per workspace.
 
-Remote workspaces need the same `tmux` and agent CLI on the machine they run
-on, plus an `ssh` host you can already reach without a password prompt.
+Remote workspaces need the same `tmux` and agent CLI on the machine they
+run on, plus an `ssh` host you can reach without a password prompt.
 
 ## Install from source manually
 
-The hosted script clones into a temp dir and throws the clone away after
-the build. If you'd rather keep the checkout around — to rebuild after
-pulling updates, or to hack on Shelbi itself — clone it to a permanent
-path and run the same install script directly:
+The hosted script discards its temp clone after the build. To keep the
+checkout around — to rebuild after pulling updates, or to hack on Shelbi
+itself — clone it to a permanent path and run the same script directly:
 
 ```bash
 git clone https://github.com/jlong/shelbi.git
@@ -55,11 +54,10 @@ The script runs `cargo build --release` and copies the binary to
 SHELBI_INSTALL_PATH=/usr/local/bin/shelbi ./scripts/install.sh
 ```
 
-Re-run the script any time you pull updates — it rebuilds and reinstalls in
-one step. The orchestrator and workspace panes re-shell into `shelbi` on every
-call, so they pick up the new binary automatically; only the sidebar,
-Tasks, and Review views need a manual `shelbi reload` to respawn against
-the new build.
+Re-run it any time you pull updates — one step rebuilds and reinstalls.
+The orchestrator and workspace panes re-shell into `shelbi` on every call,
+so they pick up the new binary automatically; only the sidebar, Tasks, and
+Review views need a manual `shelbi reload` to respawn against the new build.
 
 ### macOS: the codesign step
 
@@ -70,11 +68,10 @@ codesign --remove-signature "$INSTALL_PATH"
 codesign --sign - "$INSTALL_PATH"
 ```
 
-`cargo build` produces a binary with an embedded ad-hoc signature. `cp`
-modifies the file enough to invalidate it, and on the next exec the kernel
-SIGKILLs the process with `Killed: 9` and no useful error. Re-signing
-after the copy restores it. Linux and Windows don't need this step and
-the script skips it on those platforms.
+`cargo build` embeds an ad-hoc signature; `cp` invalidates it, and the
+next exec dies with `Killed: 9` and no useful error. Re-signing after the
+copy restores it. Linux and Windows don't need this, and the script skips
+it there.
 
 ## Verify
 
@@ -82,8 +79,8 @@ the script skips it on those platforms.
 shelbi --version
 ```
 
-You should see the installed version printed back. If the shell can't
-find the binary, the install path isn't on your `PATH` — see below.
+You should see the installed version. If the shell can't find the binary,
+the install path isn't on your `PATH` — see below.
 
 ## Troubleshooting
 

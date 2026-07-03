@@ -4,11 +4,12 @@ order: 3
 summary: Open the TUI, add a task, watch a workspace pick it up, and review the diff.
 ---
 
+<CopyPromptBanner prompt="Walk me through running my first Shelbi task. Open the TUI with `shelbi`, add a task to the backlog (through the orchestrator chat or `shelbi task add`), promote it to todo so the orchestrator dispatches it to a free workspace, then review the resulting branch and merge it. Explain the five columns — Backlog → Todo → In Progress → Review → Done — and the workspace badges as we go." />
+
 A task moves through five columns: **Backlog → Todo → In Progress →
-Review → Done**. You drive the ends — what lands in the backlog and
-what gets accepted out of review. The orchestrator drives the middle —
-as soon as a card hits todo it picks a free workspace and starts them on
-it.
+Review → Done**. You drive the ends — what lands in the backlog and what
+gets accepted out of review. The orchestrator drives the middle: the
+moment a card hits todo, it picks a free workspace and starts it.
 
 ## Open the TUI
 
@@ -18,11 +19,10 @@ From inside a project, or from anywhere with the project on disk:
 shelbi
 ```
 
-With a single project configured, `shelbi` launches its TUI
-directly. With more than one, you get a fuzzy picker — type to filter,
-Enter to launch. Inside a registered project's `work_dir`, that
-project always wins (Shelbi resolves by reverse-lookup against
-`~/.shelbi/projects/*.yaml`).
+With one project configured, `shelbi` launches its TUI directly. With
+more than one, you get a fuzzy picker — type to filter, Enter to launch.
+Inside a registered project's `work_dir`, that project always wins (Shelbi
+resolves by reverse-lookup against `~/.shelbi/projects/*.yaml`).
 
 You can also target a project by name:
 
@@ -137,6 +137,49 @@ the task prompt into the workspace's agent CLI. The sidebar badge next to
 
 Jump in any time. `Enter` on the workspace's sidebar row drops you straight
 into its pane to watch the run live.
+
+<AppMockup
+  terminalTitle="you@hub — myapp"
+  project="myapp"
+  activeView="tasks"
+  columns={[
+    {
+      label: "BACKLOG",
+      category: "gray",
+      cards: [
+        { title: "Add CSV export", id: "add-csv-export" },
+        { title: "Tighten rate-limit copy", id: "tighten-rate-limit" },
+      ],
+    },
+    { label: "TO DO", category: "blue", cards: [] },
+    {
+      label: "IN PROGRESS",
+      category: "yellow",
+      cards: [
+        {
+          title: "Fix login bug on Safari",
+          id: "fix-login",
+          workspace: "delta",
+          selected: true,
+        },
+      ],
+    },
+    { label: "REVIEW", category: "magenta", cards: [] },
+    { label: "DONE", category: "green", cards: [] },
+  ]}
+  machines={[
+    {
+      name: "hub",
+      workspaces: [
+        { name: "alpha", state: "idle" },
+        { name: "bravo", state: "idle" },
+        { name: "charlie", state: "idle" },
+        { name: "delta", state: "working", agent: "Developer" },
+      ],
+    },
+  ]}
+  review={[]}
+/>
 
 | Badge | Workspace state |
 |---|---|
