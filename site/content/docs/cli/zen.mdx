@@ -21,11 +21,8 @@ stdout. The same primitives are available to you at the shell when
 you want to probe a branch or open a PR by hand without flipping the
 global mode.
 
-Every subcommand accepts the global `-p / --project <PROJECT>` flag
-to target a specific project (otherwise the active `$SHELBI_PROJECT`
-or the registered project whose `work_dir` contains the current
-directory wins). It's omitted from the per-subcommand tables to keep
-them readable.
+Every subcommand accepts the global `-p / --project <PROJECT>` flag, omitted
+from the per-subcommand tables.
 
 ## on
 
@@ -138,18 +135,22 @@ instead of opening a second one. Prints the PR number on stdout.
 shelbi zen ci-watch [OPTIONS] <PR_NUMBER>
 ```
 
-Poll `gh pr checks --required <PR_NUMBER>` until every required
-check settles or the timeout fires. Prints one of:
+Watch the PR's checks until they settle or the timeout fires. Prints one of:
 
-- `green` — all required checks passed; exit 0.
-- `red:<check>:<summary>` — at least one required check failed;
-  exit 1.
+- `green` — every watched check passed; exit 0.
+- `red:<check>:<summary>` — at least one check failed; exit 1.
 - `timeout` — checks still pending when the deadline hit; exit 2.
+
+Which checks it watches is auto-selected from the target branch: with
+branch-protection required checks configured, it watches only those; on an
+unprotected branch (or one with no required set) it falls back to every check
+reported on the PR, like `gh pr checks <pr>`.
 
 | Flag | Type | Default | Description |
 | --- | --- | --- | --- |
 | `<PR_NUMBER>` | integer | — | The PR number returned by `pr-create` (required). |
 | `--timeout <DURATION>` | duration | project's `zen.ci_timeout` (default `15m`) | Override the wait. Accepts `30s`, `5m`, `2h`, `1d`, or a bare integer of seconds. |
+| `--task <TASK_ID>` | string | — | Resolve the default timeout against the task's workflow's `zen.ci_timeout` (falling back to the project value). Without it, the project default is used directly. |
 
 ## pr-merge
 

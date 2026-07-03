@@ -8,18 +8,52 @@ summary: Inspect and control the project's declared workspace pool — list slot
 shelbi workspace <SUBCOMMAND> [OPTIONS]
 ```
 
-`shelbi workspace` is read-mostly. The pool itself is declared in the project
-YAML and doesn't change at runtime — there's no `workspace add` or
-`workspace rm` on the CLI. What you do here is observe (what's idle, what's
-working, which agent is loaded where) and intervene (stop a pane to release a
-stuck task).
+`shelbi workspace` is read-mostly: the pool is declared in the project YAML and
+doesn't change at runtime — there's no `workspace add` or `workspace rm`. You
+use it to observe (what's idle or working, which agent is loaded where) and to
+intervene (stop a pane to release a stuck task).
 
-A [workspace](/docs/concepts/workspaces) is capacity — a machine, a tmux
-pane, and a worktree. The [agent](/docs/concepts/agents) running inside it is
-chosen per task by the workflow, which is why `list` reports both.
+A [workspace](/docs/concepts/workspaces) is capacity — a machine, a tmux pane,
+and a worktree; the [agent](/docs/concepts/agents) inside it is chosen per task
+by the workflow, which is why `list` reports both. The sidebar shows the same
+pool, grouped by machine, with a badge marking each state — `⏵` working, `·`
+idle:
 
-Every subcommand accepts the global `-p / --project <PROJECT>` flag. Omitted
-from the per-subcommand tables for readability.
+<AppMockup
+  project="shelbi"
+  columns={[
+    { label: "BACKLOG", category: "gray", cards: [
+      { title: "Draft Q3 roadmap", id: "t-006" },
+    ] },
+    { label: "TO DO", category: "blue", cards: [
+      { title: "Add ratelimit to API", id: "t-007" },
+    ] },
+    { label: "IN PROGRESS", category: "yellow", cards: [
+      { title: "Deploy staging env", id: "t-009", workspace: "alpha" },
+      { title: "Backfill order index", id: "t-017", workspace: "delta" },
+    ] },
+    { label: "REVIEW", category: "magenta", cards: [] },
+    { label: "DONE", category: "green", cards: [
+      { title: "Ship dark-mode toggle", id: "t-013" },
+    ] },
+  ]}
+  machines={[
+    { name: "hub", workspaces: [
+      { name: "alpha", state: "working", agent: "Developer" },
+      { name: "bravo", state: "idle" },
+      { name: "charlie", state: "idle" },
+    ] },
+    { name: "devbox", workspaces: [
+      { name: "delta", state: "working", agent: "Qa" },
+      { name: "echo", state: "idle" },
+      { name: "foxtrot", state: "idle" },
+    ] },
+  ]}
+  review={[]}
+/>
+
+Every subcommand accepts the global `-p / --project <PROJECT>` flag, omitted
+from the per-subcommand tables.
 
 ## list
 
@@ -33,23 +67,24 @@ Print every declared workspace as a row. The columns:
 | ------- | ----------------------------------------------------------------------------- |
 | `NAME`  | The workspace's stable name (`alpha`, `bravo`, …).                            |
 | `HOST`  | The machine it's pinned to — `hub` or a declared remote.                      |
-| `MODEL` | The model the running agent is configured to use (e.g. `opus`, `sonnet`). Blank when idle. |
-| `AGENT` | The [agent](/docs/concepts/agents) role currently loaded (`developer`, `qa`, …). Blank when idle. |
-| `STATE` | The observed state from the poller — `working`, `awaiting_input`, `blocked`, or `idle`. |
+| `MODEL` | The workspace's runner name — the model the agent runs under (`opus`, `sonnet`, …). |
+| `AGENT` | The [agent](/docs/concepts/agents) role the in-flight task loaded (`developer`, `qa`, …), or `-` when idle. |
+| `STATE` | `idle`, or `in_progress: <task-id>` when a task is running here. |
 
 ```text
-NAME      HOST      MODEL    AGENT            STATE
-alpha     hub       opus     developer        working
-bravo     hub       opus     developer        awaiting_input
-charlie   hub                                 idle
-delta     devbox    sonnet   qa               working
-echo      devbox                              idle
+NAME         HOST     MODEL          AGENT          STATE
+alpha        hub      opus           developer      in_progress: t-009
+bravo        hub      opus           -              idle
+charlie      hub      opus           -              idle
+delta        devbox   sonnet         qa             in_progress: t-017
+echo         devbox   sonnet         -              idle
 ```
 
 This is the first command the orchestrator runs at session start to snapshot
-the pool; it's the same snapshot you want when answering "who's free right
-now, and what are they running?" An empty `AGENT`/`MODEL` with `idle` state
-is a free slot.
+the pool, and the same snapshot you want when answering "who's free, and what
+are they running?" An `AGENT` of `-` with `idle` state is a free slot. `STATE`
+here is board-derived — for the poller's live read (`working`,
+`awaiting_input`, `blocked`), use [`status`](#status).
 
 ## stop
 
@@ -69,7 +104,7 @@ detached agent process lingers on the other machine.
 | Flag | Type | Default | Description |
 | --- | --- | --- | --- |
 | `<NAME>` | string | — | Workspace name (positional, required). |
-| `--keep-task` | flag | off | Leave the in-flight task in its `active` status with `assigned_to` pointing at this workspace. |
+| `--keep-task` | flag | off | Leave the in-flight task in `in_progress` with `assigned_to` pointing at this workspace. Use when you're about to restart on the same task and don't want the card to move. |
 
 ## status
 

@@ -9,10 +9,10 @@ shelbi agent <SUBCOMMAND> [OPTIONS]
 ```
 
 `shelbi agent` manages the [agents](/docs/concepts/agents) a project ships
-with — the roles, each a system prompt plus an optional skill set, that a
+with — the roles (a system prompt plus an optional skill set) a
 [workspace](/docs/concepts/workspaces) loads when it picks up a task. Every
-project starts with four (`orchestrator`, `developer`, `qa`,
-`security-review`); these subcommands surface them and let you author more.
+project starts with four — `orchestrator`, `developer`, `qa`,
+`security-review` — and these subcommands surface them and let you author more.
 
 Agents live under the project's `agents/` directory —
 `~/.shelbi/projects/<project>/agents/<name>/` in the default
@@ -23,8 +23,8 @@ shared `agents/_shared/preamble.md` is prepended to every agent's prompt at
 launch time. The defaults are seeded on first load and never clobbered on
 upgrade — see [customizing an agent](/docs/concepts/agents#customizing-an-agent).
 
-Every subcommand accepts the global `-p / --project <PROJECT>` flag. It's
-omitted from the per-subcommand tables below to keep them readable.
+Every subcommand accepts the global `-p / --project <PROJECT>` flag, omitted
+from the per-subcommand tables below.
 
 ## list
 
