@@ -207,7 +207,7 @@ export function Header({ docsSections = [] }: HeaderProps) {
             href={GITHUB_HREF}
             target="_blank"
             rel="noopener noreferrer"
-            aria-label="shelbi on GitHub"
+            aria-label="Shelbi on GitHub"
             className="inline-flex h-3 w-3 items-center justify-center text-gray-7 transition-colors hover:text-fg md:order-4"
           >
             <GitHubIcon className="h-2.5 w-2.5" aria-hidden="true" />

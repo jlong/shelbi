@@ -33,7 +33,7 @@
 // ── Palette ───────────────────────────────────────────────────────────
 // Terminal chrome (window frame) and terminal-body ANSI equivalents.
 // Chosen to match how ratatui's named colors render in macOS Terminal
-// with a Solarized-adjacent dark scheme — the setup a shelbi user is
+// with a Solarized-adjacent dark scheme — the setup a Shelbi user is
 // most likely to see when they run the TUI locally.
 const CHROME_BAR_BG = "#2d2d2d"
 const CHROME_BAR_BORDER = "#1a1a1a"
