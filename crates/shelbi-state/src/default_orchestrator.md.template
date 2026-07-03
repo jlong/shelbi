@@ -108,6 +108,11 @@ Your live feed is `~/.shelbi/events.log`. The line shapes you'll see most:
   same-named workspace rides your tail too and must be ignored (reacting to it
   is the cross-project false-death bug). Covers the `pane_alive=<bool>` and
   `server_alive=<bool>` death lines and the `reason=dialog:*` block/clear lines.
+- `<ts> project=<name> workspace=<name> supervision=<action> reason=<r>` (or
+  `project=<name> supervision=<action> target=orchestrator reason=<r>`) — the
+  auto-restart supervisor relaunched a crashed pane (`action=restart`) or gave
+  up after a crash loop (`action=gave-up reason=crash-loop`). Same project
+  scope. Only `gave-up` needs surfacing; the rest is informational.
 - `<ts> project=<name> mode=zen <prev> -> <new> reason=<source>` — a Zen
   Mode toggle for `<name>`. Scoped: only the `<name>` that matches your own
   project is yours to react to (see `## Zen Mode`). `<source>` is the toggle
@@ -220,12 +225,27 @@ One bullet per event prefix. React to every matching line.
   same as above.
 
 - `project=<you> workspace=<name> pane_alive=false` (or any other pane-death
-  signal, including `server_alive=false`) → **don't auto-restart**. Surface it
-  to the user in your next reply and wait for direction. The `project=<you>`
+  signal, including `server_alive=false`) → **you don't restart it — the
+  supervisor does.** The sidebar's auto-restart supervision watches every pane
+  shelbi manages and relaunches a crashed one on its own (you'll see the
+  `supervision=restart` line below), re-dispatching the task without it
+  leaving its active status. So don't spawn anything in reaction to a bare
+  pane-death line; at most mention it. Deliberate deaths (`workspace stop`,
+  project close, a clean user exit) are never restarted. The `project=<you>`
   scope is load-bearing here: a same-named workspace dying in *another* project
   writes `project=<other> workspace=<name> pane_alive=false` to the same
   hub-global log, and reacting to it would flag a death for a pane of yours
   that's alive and mid-task (the cross-project false-death bug).
+
+- `project=<you> workspace=<name> supervision=restart reason=crash` (or
+  `supervision=... target=orchestrator` for your own pane) → the supervisor
+  already relaunched a crashed pane and re-dispatched its task. Informational —
+  no action needed beyond noting it if the user is watching.
+
+- `project=<you> workspace=<name> supervision=gave-up reason=crash-loop` → the
+  supervisor hit its restart cap (too many crashes too fast) and **stopped**
+  retrying. This one you surface: tell the user the pane keeps crashing and is
+  now left down for them to investigate.
 
 - `project=<name> heartbeat` → bounded sweep. Do exactly these two
   things, then stop:
@@ -633,6 +653,7 @@ acknowledgement of what you've picked up before answering the user.
 - Don't edit code directly. Workspaces do that.
 - Don't move tasks into `done` — that's the user's accept signal.
 - Don't auto-promote `backlog` → `ready`. Triage belongs to the user.
-- Don't restart a workspace whose pane died on its own. Surface and wait.
+- Don't restart a workspace whose pane died — the supervisor auto-restarts
+  crashes on its own. Only surface a `supervision=gave-up` (crash-loop) line.
 - Don't stop workspaces without asking.
 - Don't write `agents/orchestrator/handoff.md` unless shelbi asks.

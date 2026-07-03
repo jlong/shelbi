@@ -52,6 +52,7 @@ use std::time::{Duration, Instant, SystemTime};
 use chrono::{DateTime, Utc};
 
 use shelbi_core::{Column, Project};
+use shelbi_orchestrator::supervision::{SupervisionAction, SupervisionInputs, SupervisionState};
 use shelbi_state::{
     append_contextstore_event, append_heartbeat_event, append_rebase_event,
     append_workspace_dialog_event, append_workspace_event, events_log_path, load_workspace_status,
@@ -114,6 +115,11 @@ fn run_poller_loop(project_name: String, shutdown: Arc<AtomicBool>) {
     // from poller start, not from the missed slot.
     let mut next_heartbeat_attempt: Option<Instant> = None;
 
+    // Auto-restart supervision for the orchestrator pane is project-wide (one
+    // pane per project, not per workspace), so it lives on the supervisor tick
+    // alongside the heartbeat rather than inside any per-workspace thread.
+    let mut orch_supervision = SupervisionState::default();
+
     loop {
         if shutdown.load(Ordering::SeqCst) {
             break;
@@ -162,6 +168,10 @@ fn run_poller_loop(project_name: String, shutdown: Arc<AtomicBool>) {
         // offline the heartbeat skips silently so the feed doesn't fill
         // with no-op lines during a network drop.
         maybe_emit_heartbeat(&project, &mut next_heartbeat_attempt, online_probe);
+
+        // Relaunch the orchestrator pane if it crashed (Zen stays off after
+        // the restart via its own `__zen-orch-start` crash-recovery step).
+        maybe_supervise_orchestrator(&project, &mut orch_supervision);
 
         // Supervisor cadence is fixed at 5s — independent of
         // `workspace_poll_interval_secs`, which governs each per-workspace
@@ -212,6 +222,12 @@ fn run_workspace_poll_loop(
     // restart — acceptable for an advisory heads-up.
     let mut last_dialog: Option<String> = None;
 
+    // Auto-restart supervision bookkeeping for this workspace's pane. Same
+    // per-thread lifetime as `last_dialog` / `last_known`: a poller restart
+    // re-seeds it, which at worst re-arms one restart for a pane that was
+    // already mid-crash-loop. See `shelbi_orchestrator::supervision`.
+    let mut supervision = SupervisionState::default();
+
     loop {
         if shutdown.load(Ordering::SeqCst) {
             break;
@@ -249,7 +265,13 @@ fn run_workspace_poll_loop(
             next_forward_check = Some(Instant::now() + FORWARD_RECHECK_INTERVAL);
         }
 
-        poll_one(&project, workspace, &mut last_known, &mut last_dialog);
+        poll_one(
+            &project,
+            workspace,
+            &mut last_known,
+            &mut last_dialog,
+            &mut supervision,
+        );
 
         sleep_interruptible(interval, &shutdown);
     }
@@ -370,6 +392,7 @@ fn poll_one(
     workspace: &shelbi_core::WorkspaceSpec,
     last_known: &mut Option<WorkspaceState>,
     last_dialog: &mut Option<String>,
+    supervision: &mut SupervisionState,
 ) {
     let Some(machine) = project.machine(&workspace.machine) else {
         return;
@@ -396,7 +419,14 @@ fn poll_one(
 
     // No pane → no marker. The display-message call would fail anyway,
     // but checking up-front keeps stderr noise out of the log.
-    if !shelbi_orchestrator::workspace::workspace_pane_alive(&host, &addr).unwrap_or(false) {
+    let alive = shelbi_orchestrator::workspace::workspace_pane_alive(&host, &addr).unwrap_or(false);
+
+    // Auto-restart supervision runs off this same liveness read (it's the
+    // backstop for a lost `pane_alive=false` event): a pane that crashed with
+    // a task still assigned gets relaunched and re-dispatched here.
+    maybe_supervise_workspace(project, workspace, &host, alive, supervision);
+
+    if !alive {
         // The pane is gone (dispatch teardown, crash, or normal exit). Any
         // dialog we were tracking can't be "cleared" in a meaningful way —
         // pane death has its own `pane_alive=false` event — so just drop the
@@ -924,6 +954,178 @@ fn maybe_reap_server_pane(project: &Project, workspace: &shelbi_core::WorkspaceS
                 error = %e,
                 "reap_server_pane_if_leaked failed",
             );
+        }
+    }
+}
+
+/// Auto-restart supervision for one workspace's agent pane, run every poll
+/// tick off the same `alive` read the poll loop already took.
+///
+/// Local panes only: a remote workspace has no lifecycle wrapper to drop the
+/// no-restart marker, so we couldn't tell a crash from a clean exit there and
+/// would risk relaunching a pane the user deliberately closed. When the pane
+/// is dead we gather the two discriminators the pure state machine needs —
+/// was the shutdown deliberate (a fresh no-restart marker), and is there
+/// still an active task to keep it up for — then act on its verdict:
+/// relaunch + re-dispatch the same task (the card never leaves its active
+/// status), emit a `supervision=gave-up reason=crash-loop` line when the
+/// crash-loop cap trips, or do nothing.
+fn maybe_supervise_workspace(
+    project: &Project,
+    workspace: &shelbi_core::WorkspaceSpec,
+    host: &shelbi_core::Host,
+    alive: bool,
+    state: &mut SupervisionState,
+) {
+    if !matches!(host, shelbi_core::Host::Local) {
+        return;
+    }
+
+    let (intentional_shutdown, task_id) = if alive {
+        (false, None)
+    } else {
+        // Consume the supervisor's dedicated no-restart marker (distinct from
+        // the wrapper's expected-teardown, which the wrapper already ate).
+        let intentional = shelbi_state::consume_expected_teardown(
+            &shelbi_state::supervision_shutdown_key(&workspace.name),
+        )
+        .unwrap_or(false);
+        (intentional, current_task_for(project, &workspace.name))
+    };
+
+    let inputs = SupervisionInputs {
+        alive,
+        intentional_shutdown,
+        has_work: task_id.is_some(),
+    };
+    match state.decide(&inputs, Instant::now()) {
+        SupervisionAction::None => {}
+        SupervisionAction::Restart => {
+            // `Restart` is only returned for a dead pane with work, so a task
+            // id is present here; the guard is defensive.
+            let Some(task_id) = task_id else { return };
+            match redispatch_workspace(project, workspace, &task_id) {
+                Ok(()) => {
+                    if let Err(e) = shelbi_state::append_supervision_event(
+                        &project.name,
+                        Some(&workspace.name),
+                        "restart",
+                        "crash",
+                    ) {
+                        tracing::warn!(workspace = %workspace.name, error = %e, "append_supervision_event failed");
+                    }
+                    tracing::info!(
+                        workspace = %workspace.name,
+                        task = %task_id,
+                        "supervisor relaunched crashed workspace pane and re-dispatched task",
+                    );
+                }
+                Err(e) => {
+                    if let Err(le) = shelbi_state::append_supervision_event(
+                        &project.name,
+                        Some(&workspace.name),
+                        "restart-failed",
+                        &e,
+                    ) {
+                        tracing::warn!(workspace = %workspace.name, error = %le, "append_supervision_event failed");
+                    }
+                    tracing::warn!(workspace = %workspace.name, task = %task_id, error = %e, "supervisor relaunch failed");
+                }
+            }
+        }
+        SupervisionAction::GiveUp => {
+            if let Err(e) = shelbi_state::append_supervision_event(
+                &project.name,
+                Some(&workspace.name),
+                "gave-up",
+                "crash-loop",
+            ) {
+                tracing::warn!(workspace = %workspace.name, error = %e, "append_supervision_event failed");
+            }
+            tracing::warn!(
+                workspace = %workspace.name,
+                "supervisor gave up restarting workspace pane after the crash-loop cap; left for the user",
+            );
+        }
+    }
+}
+
+/// Relaunch `workspace` on `task_id`, re-sending the task prompt. Reuses the
+/// normal dispatch primitive ([`start_workspace_on_task`], which itself
+/// kill-then-respawns the pane and re-pastes the prompt), so a supervised
+/// restart is byte-for-byte the same as a fresh `task start` minus the board
+/// move — the card is already in its active status and stays there.
+fn redispatch_workspace(
+    project: &Project,
+    workspace: &shelbi_core::WorkspaceSpec,
+    task_id: &str,
+) -> std::result::Result<(), String> {
+    let tf = shelbi_state::load_task(&project.name, task_id).map_err(|e| e.to_string())?;
+    let branch = tf
+        .task
+        .branch
+        .clone()
+        .unwrap_or_else(|| format!("shelbi/{task_id}"));
+    let agent = shelbi_orchestrator::dispatch::resolve_active_agent(&project.name, &tf.task);
+    shelbi_orchestrator::workspace::start_workspace_on_task(
+        shelbi_orchestrator::workspace::StartSpec {
+            project,
+            workspace,
+            task_id,
+            branch: &branch,
+            task_body: &tf.body,
+            agent: Some(&agent),
+        },
+    )
+    .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+/// Auto-restart supervision for the project's orchestrator pane, run once
+/// per supervisor tick. Unlike a workspace it has no idle state and no
+/// deliberate-shutdown marker: while its session is alive it should always be
+/// running, and a real quit tears down the whole session (killing this poller
+/// with it), so any orchestrator death this can observe is a crash. Relaunch
+/// is [`ensure_dashboard`], whose `__zen-orch-start` step keeps the Zen
+/// crash-recovery downgrade intact — a restarted orchestrator still comes up
+/// with Zen off.
+fn maybe_supervise_orchestrator(project: &Project, state: &mut SupervisionState) {
+    let alive = shelbi_orchestrator::orchestrator_pane_alive(&project.name).unwrap_or(true);
+    let inputs = SupervisionInputs {
+        alive,
+        intentional_shutdown: false,
+        has_work: true,
+    };
+    match state.decide(&inputs, Instant::now()) {
+        SupervisionAction::None => {}
+        SupervisionAction::Restart => match shelbi_orchestrator::ensure_dashboard(&project.name) {
+            Ok(_) => {
+                if let Err(e) =
+                    shelbi_state::append_supervision_event(&project.name, None, "restart", "crash")
+                {
+                    tracing::warn!(project = %project.name, error = %e, "append_supervision_event failed");
+                }
+                tracing::info!(project = %project.name, "supervisor relaunched crashed orchestrator pane");
+            }
+            Err(e) => {
+                if let Err(le) = shelbi_state::append_supervision_event(
+                    &project.name,
+                    None,
+                    "restart-failed",
+                    &e.to_string(),
+                ) {
+                    tracing::warn!(project = %project.name, error = %le, "append_supervision_event failed");
+                }
+                tracing::warn!(project = %project.name, error = %e, "supervisor orchestrator relaunch failed");
+            }
+        },
+        SupervisionAction::GiveUp => {
+            if let Err(e) =
+                shelbi_state::append_supervision_event(&project.name, None, "gave-up", "crash-loop")
+            {
+                tracing::warn!(project = %project.name, error = %e, "append_supervision_event failed");
+            }
+            tracing::warn!(project = %project.name, "supervisor gave up relaunching orchestrator pane after the crash-loop cap");
         }
     }
 }

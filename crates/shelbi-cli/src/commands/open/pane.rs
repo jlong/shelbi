@@ -234,6 +234,28 @@ pub fn run(project: &Project, workspace: &WorkspaceSpec, machine: &Machine) -> R
         }
     }
 
+    // Tell the sidebar supervisor whether this death should be auto-restarted.
+    // It can't see the exit reason (it only polls tmux liveness), so we hand
+    // it a dedicated no-restart marker on the two deaths it must NOT relaunch:
+    // a shelbi-initiated teardown (dispatch / `workspace stop` / project close),
+    // and a clean `exit:0` (the user quit with Ctrl-D, or the agent finished
+    // and exited on its own). A crash — a signal, or a non-zero exit — leaves
+    // no marker, so the supervisor relaunches the pane and re-dispatches the
+    // task. Separate key from the wrapper's own expected-teardown marker above
+    // so the two consumers don't race over one file. Best-effort: on failure
+    // the supervisor sees no marker and at worst relaunches a pane that exited
+    // cleanly, which the next expected-teardown on its own teardown corrects.
+    if intentional_teardown || reason == "exit:0" {
+        if let Err(e) = shelbi_state::mark_expected_teardown(&shelbi_state::supervision_shutdown_key(
+            &workspace.name,
+        )) {
+            eprintln!(
+                "shelbi: warning: couldn't write supervision no-restart marker for `{}`: {e}",
+                workspace.name
+            );
+        }
+    }
+
     // Natural exit (clean code or agent-side signal that wasn't routed
     // to us): the user is here, give them a chance to read final output
     // before the pane vanishes. Skip the prompt on a forced teardown
