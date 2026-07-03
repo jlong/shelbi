@@ -1063,10 +1063,13 @@ fn confirm_prompt_submitted(
         return true;
     }
     // No positive signal in the first window. Nudge with one retry Enter only
-    // if the prompt is genuinely still parked in the input box — if it's
-    // cleared (submitted; busy signal just missed) or we can't see the box,
-    // there's nothing a retry would fix.
-    if input_holds_prompt(&shelbi_tmux::capture(host, addr).unwrap_or_default(), prompt) {
+    // if the prompt is genuinely still parked in the input box — either echoed
+    // verbatim or collapsed into a `[Pasted text …]` chip (the auto-restart
+    // case, where the first Enter after the paste was dropped). If it's cleared
+    // (submitted; busy signal just missed) or we can't see the box, there's
+    // nothing a retry would fix.
+    if input_holds_unsubmitted_prompt(&shelbi_tmux::capture(host, addr).unwrap_or_default(), prompt)
+    {
         // First Enter likely raced claude's focus — resend a bare Enter and
         // give the hook one more window to fire. Avoid spamming Enters: a
         // second one after the prompt is already processed would submit an
@@ -1127,7 +1130,11 @@ fn confirm_prompt_submitted(
 ///    none of the busy markers in (2), so a prompt that submitted and
 ///    started working could otherwise slip past both (1) and (2) and get a
 ///    spurious `enter-stalled`. Reading the box directly doesn't depend on
-///    catching the spinner at the right instant.
+///    catching the spinner at the right instant. "Cleared" here excludes a
+///    collapsed `[Pasted text …]` paste chip ([`input_box_cleared`] /
+///    [`input_holds_unsubmitted_prompt`]): a chip is an un-submitted prompt
+///    whose body claude never echoes, so counting it as cleared is precisely
+///    the auto-restart false positive this guards against.
 fn wait_for_prompt_submitted(
     host: &Host,
     addr: &TmuxAddr,
@@ -1249,13 +1256,48 @@ fn input_holds_prompt(screen: &str, prompt: &str) -> bool {
     })
 }
 
+/// True when the input box holds a *collapsed paste chip* — claude renders a
+/// large multi-line paste (like the re-injected task prompt: dozens of lines)
+/// not by echoing its body but as a single `[Pasted text #1 +45 lines]`
+/// placeholder. The pasted prompt is sitting un-submitted in the box, but none
+/// of its text is on screen for [`input_holds_prompt`]'s per-line match to
+/// catch — so without this the chip reads as a *cleared* box and the dispatch
+/// false-confirms a prompt that never went in. This is exactly the auto-restart
+/// failure: the pane came up as `❯ [Pasted text #1 +45 lines]`, the Enter that
+/// should have submitted it was dropped, and the confirmation could not tell
+/// the un-submitted chip apart from a cleared box.
+fn input_holds_pasted_chip(screen: &str) -> bool {
+    input_box_lines(screen)
+        .map(|lines| lines.iter().any(|l| is_pasted_chip(l)))
+        .unwrap_or(false)
+}
+
+/// True for claude's collapsed-paste placeholder line, e.g.
+/// `[Pasted text #1 +45 lines]`. Matched structurally (bracketed, "Pasted
+/// text" prefix) rather than by exact wording so a minor label drift across
+/// claude versions still registers as "a paste is parked here."
+fn is_pasted_chip(line: &str) -> bool {
+    let t = line.trim();
+    t.starts_with("[Pasted text") && t.ends_with(']')
+}
+
+/// True when the input box still holds an un-submitted prompt — either the
+/// prompt text is echoed verbatim ([`input_holds_prompt`]) OR claude collapsed
+/// a large multi-line paste into a `[Pasted text …]` chip
+/// ([`input_holds_pasted_chip`]). Both mean Enter has not landed; the chip case
+/// is the one the auto-restart bug hit.
+fn input_holds_unsubmitted_prompt(screen: &str, prompt: &str) -> bool {
+    input_holds_prompt(screen, prompt) || input_holds_pasted_chip(screen)
+}
+
 /// True when claude's input box is on screen but *not* holding the prompt —
 /// empty, or showing only its dim placeholder. After we've typed and Enter'd
 /// a prompt, a cleared box is direct proof it was consumed (submitted). The
 /// `input_box_lines(..).is_some()` guard keeps a capture that missed the box
-/// entirely from reading as "cleared."
+/// entirely from reading as "cleared." A collapsed paste chip is NOT cleared —
+/// it's an un-submitted prompt ([`input_holds_unsubmitted_prompt`]).
 fn input_box_cleared(screen: &str, prompt: &str) -> bool {
-    input_box_lines(screen).is_some() && !input_holds_prompt(screen, prompt)
+    input_box_lines(screen).is_some() && !input_holds_unsubmitted_prompt(screen, prompt)
 }
 
 /// True when the captured pane shows claude is actively processing a
@@ -2841,6 +2883,59 @@ mod tests {
 ────────────────────────────────────────────────────
   ? for shortcuts";
         assert!(!input_holds_prompt(screen, &stalled_prompt()));
+    }
+
+    // The exact state the auto-restart bug left the pane in: claude relaunched,
+    // the multi-line task prompt was pasted, but the trailing Enter was dropped
+    // — so the prompt sits un-submitted, collapsed into a paste chip. Its body
+    // is never echoed, so `input_holds_prompt`'s text match sees nothing and
+    // (before the fix) the box read as "cleared" → false submit confirmation.
+    const PASTED_CHIP_SCREEN: &str = "\
+╭─── Claude Code v2.1.183 ──────────────────────────╮
+│            Welcome back John!                      │
+╰───────────────────────────────────────────────────╯
+
+────────────────────────────────────────────────────
+❯ [Pasted text #1 +45 lines]
+────────────────────────────────────────────────────
+  Ctx Used: 0.0% · Cost: $0.00";
+
+    #[test]
+    fn is_pasted_chip_matches_collapsed_paste_placeholder() {
+        assert!(is_pasted_chip("[Pasted text #1 +45 lines]"));
+        assert!(is_pasted_chip("  [Pasted text #12 +3 lines]  "));
+        // Not a chip: the dim placeholder, an echoed prompt line, empty.
+        assert!(!is_pasted_chip("Try \"edit <filepath> to...\""));
+        assert!(!is_pasted_chip("# dispatch: enter-stalled false positive"));
+        assert!(!is_pasted_chip(""));
+    }
+
+    #[test]
+    fn pasted_chip_reads_as_unsubmitted_not_cleared() {
+        // The fix: a collapsed paste chip is an UN-submitted prompt. It must
+        // NOT read as a cleared box (that was the false submit signal that let
+        // the restarted worker sit idle at `❯ [Pasted text #1 +45 lines]`).
+        let prompt = stalled_prompt();
+        assert!(input_holds_pasted_chip(PASTED_CHIP_SCREEN));
+        assert!(input_holds_unsubmitted_prompt(PASTED_CHIP_SCREEN, &prompt));
+        assert!(!input_box_cleared(PASTED_CHIP_SCREEN, &prompt));
+        // The chip body is never echoed, so the plain text match still misses
+        // it — which is exactly why the dedicated chip detector is needed.
+        assert!(!input_holds_prompt(PASTED_CHIP_SCREEN, &prompt));
+    }
+
+    #[test]
+    fn dim_placeholder_is_not_mistaken_for_a_paste_chip() {
+        // Regression guard: claude's dim "Try …" placeholder on a genuinely
+        // empty box must stay a *cleared* box (a real submit signal). Only the
+        // bracketed paste chip flips a box to un-submitted.
+        let prompt = stalled_prompt();
+        assert!(!input_holds_pasted_chip(INPUT_BOX_SCREEN));
+        assert!(!input_holds_unsubmitted_prompt(INPUT_BOX_SCREEN, &prompt));
+        assert!(input_box_cleared(INPUT_BOX_SCREEN, &prompt));
+        // A busy/mid-turn pane has no chip either — still cleared.
+        assert!(!input_holds_pasted_chip(BUSY_SCREEN_SPINNER));
+        assert!(input_box_cleared(BUSY_SCREEN_SPINNER, &prompt));
     }
 
     #[test]
