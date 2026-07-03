@@ -258,70 +258,148 @@ pub fn default_dialog_signatures(command: &str) -> Vec<DialogSignature> {
 /// board, and a recurring line guarantees the watch wakes up to check
 /// active tasks even when no real transition has fired.
 ///
-/// On disk the value is a duration string (`45s`, `3m`, `1h`) or the
-/// literal `off`. Bare integers are rejected — there's no implicit unit.
-/// See `HEARTBEAT_DEFAULT` for the default interval.
+/// The cadence is **adaptive** (see the poller's `maybe_emit_heartbeat`):
+/// [`interval`](HeartbeatConfig::interval) is the standard cadence used
+/// whenever there's supervisable work in flight, and while the board is
+/// quiescent the poller doubles the interval each idle tick up to
+/// [`max`](HeartbeatConfig::max). This type just carries the two bounds; the
+/// back-off state machine lives in the poller.
+///
+/// On disk the value is either a bare duration scalar (`heartbeat: 3m`,
+/// interval-only with the default cap), the literal `off`, or a map that
+/// sets both bounds (`heartbeat: { interval: 3m, max: 60m }`). Durations are
+/// `45s` / `3m` / `1h`; bare integers are rejected — there's no implicit
+/// unit. See `HEARTBEAT_DEFAULT` / `HEARTBEAT_MAX_DEFAULT` for the defaults.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[derive(Serialize, Deserialize)]
-#[serde(try_from = "String", into = "String")]
 pub enum HeartbeatConfig {
+    /// Heartbeats disabled entirely.
     Off,
-    Every(Duration),
+    /// Heartbeats enabled. `interval` is the standard cadence; `max` is the
+    /// cap the interval backs off to (doubling each idle tick) while the
+    /// board is quiescent. A `max <= interval` effectively pins the cadence
+    /// at `interval` — no back-off.
+    On { interval: Duration, max: Duration },
 }
 
-/// Default heartbeat cadence: 3 minutes. Tuned to be frequent enough that
-/// a stuck orchestrator wakes up within a couple of intervals, but rare
-/// enough that an idle hub doesn't bloat `events.log` with thousands of
-/// lines a day.
+/// Default standard heartbeat cadence: 3 minutes. Tuned to be frequent enough
+/// that a stuck orchestrator wakes up within a couple of intervals, but rare
+/// enough that an idle hub doesn't bloat `events.log` with thousands of lines
+/// a day.
 pub const HEARTBEAT_DEFAULT: Duration = Duration::from_secs(180);
+
+/// Default back-off cap: 60 minutes. On a fully quiescent board the interval
+/// doubles each idle tick (3m → 6m → 12m → …) but never exceeds this, so even
+/// a long-idle hub still sweeps for a silently-stuck task about once an hour.
+pub const HEARTBEAT_MAX_DEFAULT: Duration = Duration::from_secs(3_600);
 
 impl Default for HeartbeatConfig {
     fn default() -> Self {
-        HeartbeatConfig::Every(HEARTBEAT_DEFAULT)
+        HeartbeatConfig::On {
+            interval: HEARTBEAT_DEFAULT,
+            max: HEARTBEAT_MAX_DEFAULT,
+        }
     }
 }
 
 impl HeartbeatConfig {
-    /// The cadence, or `None` if heartbeats are turned off.
+    /// Interval-only constructor: the standard cadence with the default
+    /// back-off cap. The bare-scalar config form (`heartbeat: 3m`) and every
+    /// call site that only cares about the base cadence build through here.
+    pub fn every(interval: Duration) -> Self {
+        HeartbeatConfig::On {
+            interval,
+            max: HEARTBEAT_MAX_DEFAULT,
+        }
+    }
+
+    /// The standard cadence, or `None` if heartbeats are off.
     pub fn interval(&self) -> Option<Duration> {
         match self {
             HeartbeatConfig::Off => None,
-            HeartbeatConfig::Every(d) => Some(*d),
+            HeartbeatConfig::On { interval, .. } => Some(*interval),
         }
     }
+
+    /// The back-off cap, or `None` if heartbeats are off. Clamped to be at
+    /// least the standard interval, so a misconfigured `max < interval` can't
+    /// make the poller's "double, capped at max" step hand back a cadence
+    /// shorter than standard.
+    pub fn max(&self) -> Option<Duration> {
+        match self {
+            HeartbeatConfig::Off => None,
+            HeartbeatConfig::On { interval, max } => Some((*max).max(*interval)),
+        }
+    }
+}
+
+/// Render a duration in the compact `45s` / `3m` / `1h` form the config uses.
+fn format_heartbeat_duration(d: Duration) -> String {
+    let secs = d.as_secs();
+    if secs == 0 {
+        return "0s".to_string();
+    }
+    if secs % 3600 == 0 {
+        format!("{}h", secs / 3600)
+    } else if secs % 60 == 0 {
+        format!("{}m", secs / 60)
+    } else {
+        format!("{secs}s")
+    }
+}
+
+/// Parse a bare duration token (`45s`, `3m`, `1h`). Rejects bare integers,
+/// unknown units, and zero. Shared by the scalar and map config forms.
+fn parse_heartbeat_duration(s: &str) -> std::result::Result<Duration, String> {
+    let trimmed = s.trim();
+    if trimmed.is_empty() {
+        return Err("heartbeat: empty duration — use `45s`, `3m`, or `1h`".to_string());
+    }
+    // Require an explicit unit suffix. Without one we'd have to guess
+    // (seconds? minutes?) and a bug like `heartbeat: 3` silently becoming
+    // three-of-the-wrong-unit is exactly the foot-gun this type avoids.
+    let last = trimmed.chars().last().unwrap();
+    let (num_part, mult) = match last {
+        's' | 'S' => (&trimmed[..trimmed.len() - last.len_utf8()], 1u64),
+        'm' | 'M' => (&trimmed[..trimmed.len() - last.len_utf8()], 60u64),
+        'h' | 'H' => (&trimmed[..trimmed.len() - last.len_utf8()], 3_600u64),
+        _ => {
+            return Err(format!(
+                "heartbeat `{s}`: missing unit — use `s`, `m`, `h` (e.g. `45s`, `3m`, `1h`) or `off`"
+            ));
+        }
+    };
+    let n: u64 = num_part
+        .trim()
+        .parse()
+        .map_err(|_| format!("heartbeat `{s}`: not a number followed by `s`/`m`/`h`"))?;
+    if n == 0 {
+        return Err(format!("heartbeat `{s}`: zero interval — use `off` to disable"));
+    }
+    let secs = n
+        .checked_mul(mult)
+        .ok_or_else(|| format!("heartbeat `{s}`: duration overflows"))?;
+    Ok(Duration::from_secs(secs))
 }
 
 impl std::fmt::Display for HeartbeatConfig {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             HeartbeatConfig::Off => f.write_str("off"),
-            HeartbeatConfig::Every(d) => {
-                let secs = d.as_secs();
-                if secs == 0 {
-                    return f.write_str("0s");
-                }
-                if secs % 3600 == 0 {
-                    write!(f, "{}h", secs / 3600)
-                } else if secs % 60 == 0 {
-                    write!(f, "{}m", secs / 60)
+            HeartbeatConfig::On { interval, max } => {
+                // Compact scalar when the cap is the default; otherwise show
+                // both bounds so a log/CLI reader can see the back-off cap.
+                if *max == HEARTBEAT_MAX_DEFAULT {
+                    f.write_str(&format_heartbeat_duration(*interval))
                 } else {
-                    write!(f, "{secs}s")
+                    write!(
+                        f,
+                        "{} (max {})",
+                        format_heartbeat_duration(*interval),
+                        format_heartbeat_duration(*max)
+                    )
                 }
             }
         }
-    }
-}
-
-impl From<HeartbeatConfig> for String {
-    fn from(h: HeartbeatConfig) -> Self {
-        h.to_string()
-    }
-}
-
-impl TryFrom<String> for HeartbeatConfig {
-    type Error = String;
-    fn try_from(s: String) -> std::result::Result<Self, Self::Error> {
-        s.parse()
     }
 }
 
@@ -337,31 +415,71 @@ impl std::str::FromStr for HeartbeatConfig {
         if trimmed.eq_ignore_ascii_case("off") {
             return Ok(HeartbeatConfig::Off);
         }
-        // Require an explicit unit suffix. Without one we'd have to guess
-        // (seconds? minutes?) and a bug like `heartbeat: 3` silently
-        // becoming three-of-the-wrong-unit is exactly the foot-gun this
-        // type is meant to avoid.
-        let last = trimmed.chars().last().unwrap();
-        let (num_part, mult) = match last {
-            's' | 'S' => (&trimmed[..trimmed.len() - last.len_utf8()], 1u64),
-            'm' | 'M' => (&trimmed[..trimmed.len() - last.len_utf8()], 60u64),
-            'h' | 'H' => (&trimmed[..trimmed.len() - last.len_utf8()], 3_600u64),
-            _ => {
-                return Err(format!(
-                    "heartbeat `{s}`: missing unit — use `s`, `m`, `h` (e.g. `45s`, `3m`, `1h`) or `off`"
-                ));
+        Ok(HeartbeatConfig::every(parse_heartbeat_duration(trimmed)?))
+    }
+}
+
+impl Serialize for HeartbeatConfig {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> std::result::Result<S::Ok, S::Error> {
+        match self {
+            HeartbeatConfig::Off => s.serialize_str("off"),
+            HeartbeatConfig::On { interval, max } => {
+                // Collapse to the bare-scalar form when the cap is the default
+                // so existing `heartbeat: 3m` configs round-trip unchanged and
+                // the common case stays a one-liner. A non-default cap forces
+                // the explicit `{ interval, max }` map.
+                if *max == HEARTBEAT_MAX_DEFAULT {
+                    s.serialize_str(&format_heartbeat_duration(*interval))
+                } else {
+                    use serde::ser::SerializeMap;
+                    let mut m = s.serialize_map(Some(2))?;
+                    m.serialize_entry("interval", &format_heartbeat_duration(*interval))?;
+                    m.serialize_entry("max", &format_heartbeat_duration(*max))?;
+                    m.end()
+                }
             }
-        };
-        let n: u64 = num_part.trim().parse().map_err(|_| {
-            format!("heartbeat `{s}`: not a number followed by `s`/`m`/`h`")
-        })?;
-        if n == 0 {
-            return Err(format!("heartbeat `{s}`: zero interval — use `off` to disable"));
         }
-        let secs = n
-            .checked_mul(mult)
-            .ok_or_else(|| format!("heartbeat `{s}`: duration overflows"))?;
-        Ok(HeartbeatConfig::Every(Duration::from_secs(secs)))
+    }
+}
+
+impl<'de> Deserialize<'de> for HeartbeatConfig {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> std::result::Result<Self, D::Error> {
+        // Accept both the bare scalar (`3m` / `off`) and the map form
+        // (`{ interval: 3m, max: 60m }`). Every field of the map is optional
+        // so a partial map fills the rest from defaults.
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Wire {
+            Scalar(String),
+            Map {
+                #[serde(default)]
+                interval: Option<String>,
+                #[serde(default)]
+                max: Option<String>,
+            },
+        }
+        use serde::de::Error as _;
+        match Wire::deserialize(d)? {
+            Wire::Scalar(s) => s.parse().map_err(D::Error::custom),
+            Wire::Map { interval, max } => {
+                // `interval: off` disables the heartbeat regardless of `max`.
+                if interval
+                    .as_deref()
+                    .is_some_and(|iv| iv.trim().eq_ignore_ascii_case("off"))
+                {
+                    return Ok(HeartbeatConfig::Off);
+                }
+                let interval = match interval {
+                    Some(iv) => parse_heartbeat_duration(&iv).map_err(D::Error::custom)?,
+                    None => HEARTBEAT_DEFAULT,
+                };
+                let max = match max {
+                    Some(mx) => parse_heartbeat_duration(&mx).map_err(D::Error::custom)?,
+                    None => HEARTBEAT_MAX_DEFAULT,
+                };
+                Ok(HeartbeatConfig::On { interval, max })
+            }
+        }
     }
 }
 
@@ -3142,37 +3260,56 @@ updated_at: 2026-06-19T00:00:00Z
     // ---- HeartbeatConfig --------------------------------------------------
 
     #[test]
-    fn heartbeat_config_default_is_three_minutes() {
+    fn heartbeat_config_default_is_three_minutes_with_hour_cap() {
         assert_eq!(
             HeartbeatConfig::default(),
-            HeartbeatConfig::Every(Duration::from_secs(180))
+            HeartbeatConfig::On {
+                interval: Duration::from_secs(180),
+                max: Duration::from_secs(3_600),
+            }
         );
         assert_eq!(
             HeartbeatConfig::default().interval(),
             Some(Duration::from_secs(180))
         );
+        assert_eq!(
+            HeartbeatConfig::default().max(),
+            Some(Duration::from_secs(3_600))
+        );
+    }
+
+    #[test]
+    fn heartbeat_config_max_clamps_below_interval_up_to_interval() {
+        // A misconfigured cap shorter than the standard interval must never
+        // hand the poller a back-off target below standard.
+        let cfg = HeartbeatConfig::On {
+            interval: Duration::from_secs(180),
+            max: Duration::from_secs(60),
+        };
+        assert_eq!(cfg.max(), Some(Duration::from_secs(180)));
     }
 
     #[test]
     fn heartbeat_config_parses_seconds_minutes_hours() {
         use std::str::FromStr;
+        // The scalar form yields the default back-off cap.
         assert_eq!(
             HeartbeatConfig::from_str("45s").unwrap(),
-            HeartbeatConfig::Every(Duration::from_secs(45))
+            HeartbeatConfig::every(Duration::from_secs(45))
         );
         assert_eq!(
             HeartbeatConfig::from_str("3m").unwrap(),
-            HeartbeatConfig::Every(Duration::from_secs(180))
+            HeartbeatConfig::every(Duration::from_secs(180))
         );
         assert_eq!(
             HeartbeatConfig::from_str("1h").unwrap(),
-            HeartbeatConfig::Every(Duration::from_secs(3_600))
+            HeartbeatConfig::every(Duration::from_secs(3_600))
         );
         // Case-insensitive on both the unit and the `off` keyword so
         // hand-edited YAML doesn't surprise on capitalization.
         assert_eq!(
             HeartbeatConfig::from_str("2H").unwrap(),
-            HeartbeatConfig::Every(Duration::from_secs(7_200))
+            HeartbeatConfig::every(Duration::from_secs(7_200))
         );
         assert_eq!(HeartbeatConfig::from_str("OFF").unwrap(), HeartbeatConfig::Off);
         assert_eq!(HeartbeatConfig::from_str("off").unwrap(), HeartbeatConfig::Off);
@@ -3198,10 +3335,11 @@ updated_at: 2026-06-19T00:00:00Z
 
     #[test]
     fn heartbeat_config_serializes_as_compact_string() {
-        // Round-trips through serde_yaml as a plain string.
-        let cfg = HeartbeatConfig::Every(Duration::from_secs(180));
+        // Default cap → collapses to the bare-scalar form (back-compat).
+        let cfg = HeartbeatConfig::every(Duration::from_secs(180));
         let y = serde_yaml::to_string(&cfg).unwrap();
         assert!(y.contains("3m"), "got {y:?}");
+        assert!(!y.contains("interval"), "default cap must stay a scalar: {y:?}");
         let back: HeartbeatConfig = serde_yaml::from_str(&y).unwrap();
         assert_eq!(back, cfg);
 
@@ -3212,9 +3350,61 @@ updated_at: 2026-06-19T00:00:00Z
         assert_eq!(back, cfg);
 
         // Non-round-number seconds stay in seconds.
-        let cfg = HeartbeatConfig::Every(Duration::from_secs(45));
+        let cfg = HeartbeatConfig::every(Duration::from_secs(45));
         let y = serde_yaml::to_string(&cfg).unwrap();
         assert!(y.contains("45s"), "got {y:?}");
+    }
+
+    #[test]
+    fn heartbeat_config_map_form_round_trips_both_bounds() {
+        // A non-default cap forces the explicit map form on the wire and
+        // round-trips both bounds.
+        let cfg = HeartbeatConfig::On {
+            interval: Duration::from_secs(120),
+            max: Duration::from_secs(1_800),
+        };
+        let y = serde_yaml::to_string(&cfg).unwrap();
+        assert!(y.contains("interval"), "non-default cap must emit a map: {y:?}");
+        assert!(y.contains("2m"), "got {y:?}");
+        assert!(y.contains("30m"), "got {y:?}");
+        let back: HeartbeatConfig = serde_yaml::from_str(&y).unwrap();
+        assert_eq!(back, cfg);
+    }
+
+    #[test]
+    fn heartbeat_config_map_form_fills_missing_fields_from_defaults() {
+        // interval-only map → default cap.
+        let cfg: HeartbeatConfig = serde_yaml::from_str("interval: 2m\n").unwrap();
+        assert_eq!(
+            cfg,
+            HeartbeatConfig::On {
+                interval: Duration::from_secs(120),
+                max: HEARTBEAT_MAX_DEFAULT,
+            }
+        );
+        // max-only map → default interval.
+        let cfg: HeartbeatConfig = serde_yaml::from_str("max: 30m\n").unwrap();
+        assert_eq!(
+            cfg,
+            HeartbeatConfig::On {
+                interval: HEARTBEAT_DEFAULT,
+                max: Duration::from_secs(1_800),
+            }
+        );
+        // Both set.
+        let cfg: HeartbeatConfig =
+            serde_yaml::from_str("interval: 1m\nmax: 10m\n").unwrap();
+        assert_eq!(
+            cfg,
+            HeartbeatConfig::On {
+                interval: Duration::from_secs(60),
+                max: Duration::from_secs(600),
+            }
+        );
+        // `interval: off` inside the map disables regardless of `max`.
+        let cfg: HeartbeatConfig =
+            serde_yaml::from_str("interval: \"off\"\nmax: 30m\n").unwrap();
+        assert_eq!(cfg, HeartbeatConfig::Off);
     }
 
     #[test]
@@ -3333,7 +3523,27 @@ heartbeat: 90s
         let p: Project = serde_yaml::from_str(yaml).unwrap();
         assert_eq!(
             p.heartbeat,
-            HeartbeatConfig::Every(Duration::from_secs(90))
+            HeartbeatConfig::every(Duration::from_secs(90))
+        );
+
+        // Map form: both bounds set explicitly.
+        let yaml = r#"
+name: p
+repo: r
+machines:
+  - { name: hub, kind: local, work_dir: /tmp }
+orchestrator: { runner: claude }
+agent_runners:
+  claude: { command: claude, flags: [] }
+heartbeat: { interval: 5m, max: 30m }
+"#;
+        let p: Project = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(
+            p.heartbeat,
+            HeartbeatConfig::On {
+                interval: Duration::from_secs(300),
+                max: Duration::from_secs(1_800),
+            }
         );
     }
 
@@ -3744,7 +3954,7 @@ git:
                 ci_timeout: Duration::from_secs(900),
                 danger_paths: ZenDangerPaths::Extend(vec!["secrets/**".into()]),
             },
-            heartbeat: HeartbeatConfig::Every(Duration::from_secs(120)),
+            heartbeat: HeartbeatConfig::every(Duration::from_secs(120)),
             git: GitConfig {
                 base_branch: Some("trunk".into()),
                 merge_strategy: MergeStrategy::Rebase,

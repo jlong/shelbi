@@ -108,12 +108,13 @@ impl Drop for WorkspacePoller {
 fn run_poller_loop(project_name: String, shutdown: Arc<AtomicBool>) {
     let mut spawned: HashMap<String, JoinHandle<()>> = HashMap::new();
 
-    // Heartbeat schedule. We seed `next_heartbeat_attempt` from "now"
-    // rather than from the last events.log mtime so a poller restart
-    // mid-interval doesn't immediately fire a heartbeat that was
-    // technically "due" before the crash — the spec is one interval
-    // from poller start, not from the missed slot.
-    let mut next_heartbeat_attempt: Option<Instant> = None;
+    // Heartbeat schedule. We seed the first attempt from "now" rather than
+    // from the last events.log mtime so a poller restart mid-interval doesn't
+    // immediately fire a heartbeat that was technically "due" before the
+    // crash — the spec is one interval from poller start, not from the missed
+    // slot. Also carries the adaptive back-off state (current interval + the
+    // mtime of our last emission) so a quiescent board slows the cadence.
+    let mut heartbeat = HeartbeatSchedule::default();
 
     // Auto-restart supervision for the orchestrator pane is project-wide (one
     // pane per project, not per workspace), so it lives on the supervisor tick
@@ -167,7 +168,7 @@ fn run_poller_loop(project_name: String, shutdown: Arc<AtomicBool>) {
         // `online_probe` is the connectivity gate: while the box is
         // offline the heartbeat skips silently so the feed doesn't fill
         // with no-op lines during a network drop.
-        maybe_emit_heartbeat(&project, &mut next_heartbeat_attempt, online_probe);
+        maybe_emit_heartbeat(&project, &mut heartbeat, online_probe);
 
         // Relaunch the orchestrator pane if it crashed (Zen stays off after
         // the restart via its own `__zen-orch-start` crash-recovery step).
@@ -277,46 +278,80 @@ fn run_workspace_poll_loop(
     }
 }
 
-/// Consider emitting one heartbeat for `project`. Called once per poller
-/// tick. Four rules from the spec land here:
+/// Adaptive heartbeat cadence state, threaded across supervisor ticks.
 ///
-/// 1. **Off** — `HeartbeatConfig::Off` skips every tick and also clears
-///    any pending schedule so a project that toggles `heartbeat: off`
-///    while the poller is running stops emitting immediately.
-/// 2. **Crash-safe cadence** — the first attempt fires one
-///    `heartbeat` interval after the poller observed the config (not
-///    from the wall clock or the previous run's last write), so a
-///    restart mid-interval doesn't catch up missed slots.
-/// 3. **Debounced against other writes** — if any line was appended to
-///    `events.log` within the last `interval`, skip this attempt.
-///    Otherwise emit. Our own heartbeat counts as activity, so on a
-///    fully quiet board the next emission lands exactly one interval
-///    after the previous one.
-/// 4. **Paused while offline** — if `is_online()` returns false at the
-///    moment of emission, skip silently. The schedule still advances by
-///    one interval so we don't probe (and pay its timeout) every
-///    supervisor tick, and emission resumes naturally on the first
-///    interval after connectivity is back. The "avoid noise" framing
-///    is deliberate: a heartbeat during an offline window communicates
-///    nothing — the only consumer (the orchestrator) can't act on it.
+/// The cadence is `standard` (from config) whenever there's supervisable work
+/// in flight, and backs off exponentially — doubling each idle tick, capped at
+/// the configured `max` — while the board is quiescent. Any real event resets
+/// it to `standard`. This struct carries the three things that survive between
+/// ticks; the state machine lives in [`maybe_emit_heartbeat`].
+#[derive(Default)]
+struct HeartbeatSchedule {
+    /// When the next emission attempt is due. `None` means "not yet seeded"
+    /// (first tick after start / after `off → on`).
+    next_attempt: Option<Instant>,
+    /// The interval currently in effect. Grows (doubles, capped at `max`) each
+    /// idle tick while quiescent; snaps back to `standard` on any real event or
+    /// whenever work is in flight. `None` until the first emission fixes it.
+    interval: Option<Duration>,
+    /// The `events.log` mtime as of our last action — seed, emit, or an
+    /// observed event. A genuine external event is one whose write advances
+    /// the mtime past this baseline; comparing against it (rather than a fixed
+    /// window) is what tells a real event apart from our own heartbeat write.
+    /// Advanced on seed / emit / reset so pre-existing history and an already-
+    /// consumed event can't be mistaken for fresh activity.
+    last_log_mtime: Option<SystemTime>,
+}
+
+/// Consider emitting one heartbeat for `project`. Called once per poller
+/// tick. The rules from the spec land here:
+///
+/// 1. **Off** — `HeartbeatConfig::Off` skips every tick and also clears the
+///    schedule so a project that toggles `heartbeat: off` while the poller is
+///    running stops emitting immediately.
+/// 2. **Crash-safe cadence** — the first attempt fires one standard interval
+///    after the poller observed the config (not from the wall clock or the
+///    previous run's last write), so a restart mid-interval doesn't catch up
+///    missed slots.
+/// 3. **Reset on any real event** — if `events.log` advanced past our own last
+///    heartbeat write, a real event (task transition, workspace state change,
+///    dispatch, user action) already woke the orchestrator: skip this emission
+///    *and* reset the back-off to standard so the sweep is prompt again.
+/// 4. **Adaptive back-off** — otherwise emit, then choose the next interval:
+///    `standard` while any supervisable work is in flight (an active/ready/
+///    review task — even one emitting no events, which is exactly when the
+///    sweep earns its keep), or `min(interval * 2, max)` while the board is
+///    quiescent. So a fully idle board relaxes `standard → 2× → 4× → … → max`.
+/// 5. **Paused while offline** — if `is_online()` returns false at emit time,
+///    skip silently. The schedule still advances (by the current interval, no
+///    back-off change) so we don't probe every tick, and emission resumes on
+///    the first due tick after connectivity is back.
 fn maybe_emit_heartbeat(
     project: &Project,
-    next_attempt: &mut Option<Instant>,
+    schedule: &mut HeartbeatSchedule,
     is_online: impl Fn() -> bool,
 ) {
-    let Some(interval) = project.heartbeat.interval() else {
-        // Heartbeat off — clear the schedule so flipping it back on
-        // re-seeds from the next tick rather than firing a stale due.
-        *next_attempt = None;
+    // `interval()` / `max()` both yield `Some` iff heartbeats are on, so this
+    // one destructure gates the whole function on the config being enabled.
+    let (Some(standard), Some(max)) = (project.heartbeat.interval(), project.heartbeat.max())
+    else {
+        // Heartbeat off — clear the schedule so flipping it back on re-seeds
+        // from the next tick rather than firing a stale due.
+        *schedule = HeartbeatSchedule::default();
         return;
     };
 
     let now = Instant::now();
-    let due = match *next_attempt {
+    let current_interval = schedule.interval.unwrap_or(standard);
+    let due = match schedule.next_attempt {
         None => {
             // First tick after start (or after the config flipped from
-            // off → on): schedule the first attempt one interval out.
-            *next_attempt = Some(now + interval);
+            // off → on): schedule the first attempt one standard interval out.
+            // Record the current log mtime as the baseline so pre-existing
+            // history isn't later mistaken for a fresh event.
+            schedule.next_attempt = Some(now + standard);
+            schedule.interval = Some(standard);
+            schedule.last_log_mtime = events_log_mtime();
             return;
         }
         Some(t) => now >= t,
@@ -325,30 +360,98 @@ fn maybe_emit_heartbeat(
         return;
     }
 
-    // Debounce: skip if anything (us or anyone else) wrote to
-    // events.log within the last interval. We read mtime fresh on each
-    // attempt — cheap (one stat) and avoids tracking writes ourselves.
-    let recent_activity = events_log_modified_within(interval);
-    if !recent_activity && is_online() {
-        // Both counts are cheap on-disk reads (task YAMLs + the events log,
-        // same files the tick already touches) and are computed fresh so the
-        // heartbeat is accurate at emit time. A read failure shouldn't sink
-        // the heartbeat — fall back to 0, which the orchestrator treats as
-        // "nothing to do" (a silent ack), the same as a genuinely quiet board.
-        let zen_eligible = shelbi_orchestrator::zen::mechanically_eligible(project)
-            .map(|ids| ids.len())
-            .unwrap_or(0);
-        let idle_workspaces = shelbi_state::idle_workspace_count(project).unwrap_or(0);
-        if let Err(e) = append_heartbeat_event(&project.name, zen_eligible, idle_workspaces) {
-            tracing::warn!(
-                project = %project.name,
-                error = %e,
-                "append_heartbeat_event failed",
-            );
-        }
+    // Reset on any real event: if events.log advanced past our baseline,
+    // something real happened since our last action. That event already serves
+    // as the orchestrator's trigger, so we skip this emission (debounce) and
+    // reset the cadence to standard. Advance the baseline to the event's mtime
+    // so the same event doesn't re-trigger a reset next tick.
+    if external_event_since(schedule.last_log_mtime) {
+        schedule.interval = Some(standard);
+        schedule.next_attempt = Some(now + standard);
+        schedule.last_log_mtime = events_log_mtime();
+        return;
     }
 
-    *next_attempt = Some(now + interval);
+    if !is_online() {
+        // Offline: emit nothing (a heartbeat the orchestrator can't act on is
+        // pure noise) but keep the schedule advancing so we don't probe every
+        // supervisor tick. Leave the back-off level untouched.
+        schedule.next_attempt = Some(now + current_interval);
+        return;
+    }
+
+    // Both counts are cheap on-disk reads (task YAMLs + the events log, same
+    // files the tick already touches) and are computed fresh so the heartbeat
+    // is accurate at emit time. A read failure shouldn't sink the heartbeat —
+    // fall back to 0, which the orchestrator treats as "nothing to do" (a
+    // silent ack), the same as a genuinely quiet board.
+    let zen_eligible = shelbi_orchestrator::zen::mechanically_eligible(project)
+        .map(|ids| ids.len())
+        .unwrap_or(0);
+    let idle_workspaces = shelbi_state::idle_workspace_count(project).unwrap_or(0);
+    if let Err(e) = append_heartbeat_event(&project.name, zen_eligible, idle_workspaces) {
+        tracing::warn!(
+            project = %project.name,
+            error = %e,
+            "append_heartbeat_event failed",
+        );
+    }
+    // Advance the baseline to our own write's mtime so the next tick can tell
+    // it apart from a real event.
+    schedule.last_log_mtime = events_log_mtime();
+
+    // Choose the next cadence: hold at standard while there's supervisable
+    // work in flight, back off (double, capped at max) while quiescent.
+    let next_interval = if board_is_quiescent(project) {
+        current_interval.saturating_mul(2).min(max).max(standard)
+    } else {
+        standard
+    };
+    schedule.interval = Some(next_interval);
+    schedule.next_attempt = Some(now + next_interval);
+}
+
+/// True iff `events.log` advanced past `baseline` — i.e. a real event landed
+/// since our last action (seed / emit / reset). `baseline` is the mtime
+/// recorded at that action; the seed records it up front so pre-existing
+/// history never counts as fresh activity. A `None` baseline paired with an
+/// existing log means the log appeared *after* the seed observed none — that's
+/// a genuine new event (this is the debounce-after-a-transition case).
+fn external_event_since(baseline: Option<SystemTime>) -> bool {
+    match (baseline, events_log_mtime()) {
+        // Log advanced strictly past the baseline → a real event.
+        (Some(prev), Some(cur)) => cur > prev,
+        // Baseline saw no log, but one exists now → it was created since → new.
+        (None, Some(_)) => true,
+        // No log on disk → nothing has happened.
+        (_, None) => false,
+    }
+}
+
+/// True iff the board has no supervisable work in flight. "In flight" is any
+/// task in an active (`in_progress`), ready/queued (`todo`), or handoff
+/// (`review`) column — the positions a silently-stuck task can hide in, and
+/// which cover a pending-load review and an in-flight Zen merge (both operate
+/// on a `review` task). Backlog and done don't count: backlog is waiting, not
+/// in flight, and done is terminal. A read error is treated as *not*
+/// quiescent, so a transient failure never accelerates the back-off past the
+/// standard cadence. Derived from the same `list_tasks` pass the payload makes.
+fn board_is_quiescent(project: &Project) -> bool {
+    let Ok(tasks) = shelbi_state::list_tasks(&project.name) else {
+        return false;
+    };
+    tasks_are_quiescent(&tasks)
+}
+
+/// Pure core of [`board_is_quiescent`]. Split out so unit tests can drive it
+/// with in-memory fixtures without touching disk or `SHELBI_HOME`.
+fn tasks_are_quiescent(tasks: &[shelbi_state::TaskFile]) -> bool {
+    !tasks.iter().any(|tf| {
+        matches!(
+            tf.task.column,
+            Column::InProgress | Column::Todo | Column::Review
+        )
+    })
 }
 
 /// Default connectivity probe used by the poller. TCP-connects to
@@ -366,25 +469,13 @@ fn online_probe() -> bool {
     TcpStream::connect_timeout(&addr, Duration::from_secs(1)).is_ok()
 }
 
-/// True iff `events.log` exists and was modified within the last
-/// `window`. Missing log file → no activity. Any I/O hiccup → assume
-/// active (safer to under-emit than spam the log on a transient stat
-/// failure).
-fn events_log_modified_within(window: Duration) -> bool {
-    let path = match events_log_path() {
-        Ok(p) => p,
-        Err(_) => return true,
-    };
-    let mtime = match std::fs::metadata(&path).and_then(|m| m.modified()) {
-        Ok(t) => t,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return false,
-        Err(_) => return true,
-    };
-    match SystemTime::now().duration_since(mtime) {
-        Ok(elapsed) => elapsed < window,
-        // mtime is in the future (clock skew); treat as recent.
-        Err(_) => true,
-    }
+/// Last-modified time of `events.log`, or `None` if the file doesn't exist
+/// yet. Any other I/O hiccup also maps to `None` — the caller treats "unknown
+/// mtime" conservatively (see [`external_event_since`]), and a transient stat
+/// failure shouldn't be read as a real event.
+fn events_log_mtime() -> Option<SystemTime> {
+    let path = events_log_path().ok()?;
+    std::fs::metadata(&path).and_then(|m| m.modified()).ok()
 }
 
 fn poll_one(
@@ -1633,13 +1724,12 @@ mod tests {
         let mut project = local_project(&work_dir);
         // Tight 1ms interval so the test doesn't have to sleep for the
         // real 3-minute default.
-        project.heartbeat =
-            shelbi_core::HeartbeatConfig::Every(Duration::from_millis(1));
+        project.heartbeat = shelbi_core::HeartbeatConfig::every(Duration::from_millis(1));
 
-        let mut next: Option<Instant> = None;
+        let mut hb = HeartbeatSchedule::default();
         // First call seeds the schedule and returns without writing.
-        maybe_emit_heartbeat(&project, &mut next, || true);
-        assert!(next.is_some(), "first tick must seed the schedule");
+        maybe_emit_heartbeat(&project, &mut hb, || true);
+        assert!(hb.next_attempt.is_some(), "first tick must seed the schedule");
         let log = shelbi_state::events_log_path().unwrap();
         assert!(
             !log.exists() || std::fs::read_to_string(&log).unwrap().is_empty(),
@@ -1649,7 +1739,7 @@ mod tests {
         // Wait past the interval, with no other writer touching the
         // log, and the next attempt emits one line.
         std::thread::sleep(Duration::from_millis(20));
-        maybe_emit_heartbeat(&project, &mut next, || true);
+        maybe_emit_heartbeat(&project, &mut hb, || true);
         let body = std::fs::read_to_string(&log).unwrap();
         let lines: Vec<&str> = body.lines().filter(|l| l.contains("heartbeat")).collect();
         assert_eq!(lines.len(), 1, "expected one heartbeat line, got: {body:?}");
@@ -1687,20 +1777,19 @@ mod tests {
         let work_dir = home.join("repo");
         std::fs::create_dir_all(&work_dir).unwrap();
         let mut project = local_project(&work_dir);
-        // Use a 1-second window so the events.log mtime test ("written
-        // in the last interval") sees the workspace event as recent.
-        project.heartbeat = shelbi_core::HeartbeatConfig::Every(Duration::from_secs(1));
+        project.heartbeat = shelbi_core::HeartbeatConfig::every(Duration::from_secs(1));
 
-        let mut next: Option<Instant> = None;
+        let mut hb = HeartbeatSchedule::default();
         // Seed.
-        maybe_emit_heartbeat(&project, &mut next, || true);
-        // Force the next attempt to be due immediately, but write
-        // unrelated activity first so the debounce trips.
+        maybe_emit_heartbeat(&project, &mut hb, || true);
+        // Force the next attempt to be due immediately, but write a real
+        // event first so the reset-on-event debounce trips (events.log
+        // advanced past our last — here, never-emitted — heartbeat).
         shelbi_state::append_workspace_event("demo", "alpha", None, WorkspaceState::Working)
             .unwrap();
-        next = Some(Instant::now());
+        hb.next_attempt = Some(Instant::now());
 
-        maybe_emit_heartbeat(&project, &mut next, || true);
+        maybe_emit_heartbeat(&project, &mut hb, || true);
 
         let log = shelbi_state::events_log_path().unwrap();
         let body = std::fs::read_to_string(&log).unwrap();
@@ -1737,9 +1826,14 @@ mod tests {
         let mut project = local_project(&work_dir);
         project.heartbeat = shelbi_core::HeartbeatConfig::Off;
 
-        let mut next = Some(Instant::now() - Duration::from_secs(60));
-        maybe_emit_heartbeat(&project, &mut next, || true);
-        assert!(next.is_none(), "off must clear the pending schedule");
+        let mut hb = HeartbeatSchedule {
+            next_attempt: Some(Instant::now() - Duration::from_secs(60)),
+            interval: Some(Duration::from_secs(180)),
+            last_log_mtime: None,
+        };
+        maybe_emit_heartbeat(&project, &mut hb, || true);
+        assert!(hb.next_attempt.is_none(), "off must clear the pending schedule");
+        assert!(hb.interval.is_none(), "off must clear the back-off level");
 
         let log = shelbi_state::events_log_path().unwrap();
         assert!(!log.exists() || std::fs::read_to_string(&log).unwrap().is_empty());
@@ -1769,14 +1863,14 @@ mod tests {
         let work_dir = home.join("repo");
         std::fs::create_dir_all(&work_dir).unwrap();
         let mut project = local_project(&work_dir);
-        project.heartbeat = shelbi_core::HeartbeatConfig::Every(Duration::from_millis(1));
+        project.heartbeat = shelbi_core::HeartbeatConfig::every(Duration::from_millis(1));
 
-        let mut next: Option<Instant> = None;
+        let mut hb = HeartbeatSchedule::default();
         // Seed, then drive several "due" attempts while offline.
-        maybe_emit_heartbeat(&project, &mut next, || false);
+        maybe_emit_heartbeat(&project, &mut hb, || false);
         for _ in 0..3 {
             std::thread::sleep(Duration::from_millis(5));
-            maybe_emit_heartbeat(&project, &mut next, || false);
+            maybe_emit_heartbeat(&project, &mut hb, || false);
         }
         let log = shelbi_state::events_log_path().unwrap();
         let body = if log.exists() {
@@ -1794,7 +1888,7 @@ mod tests {
         // Internet returns. The next due tick (past the interval and
         // with no recent activity) emits one heartbeat line.
         std::thread::sleep(Duration::from_millis(5));
-        maybe_emit_heartbeat(&project, &mut next, || true);
+        maybe_emit_heartbeat(&project, &mut hb, || true);
         let body = std::fs::read_to_string(&log).unwrap();
         let online_hb_lines: Vec<&str> =
             body.lines().filter(|l| l.contains("heartbeat")).collect();
@@ -1802,6 +1896,262 @@ mod tests {
             online_hb_lines.len(),
             1,
             "exactly one heartbeat after reconnect, got: {body:?}"
+        );
+
+        std::env::remove_var("SHELBI_HOME");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    fn todo_task(id: &str) -> Task {
+        let mut t = in_progress_task(id, "alpha");
+        t.column = Column::Todo;
+        t.assigned_to = None;
+        t
+    }
+
+    fn review_task(id: &str) -> Task {
+        let mut t = in_progress_task(id, "alpha");
+        t.column = Column::Review;
+        t.assigned_to = None;
+        t
+    }
+
+    fn tf(task: Task) -> shelbi_state::TaskFile {
+        shelbi_state::TaskFile {
+            task,
+            body: String::new(),
+        }
+    }
+
+    #[test]
+    fn tasks_are_quiescent_only_when_no_active_ready_or_review_work() {
+        // Empty board → quiescent.
+        assert!(tasks_are_quiescent(&[]));
+        // Backlog-only and done-only boards are quiescent: neither is
+        // supervisable work in flight.
+        assert!(tasks_are_quiescent(&[
+            tf({
+                let mut t = todo_task("b");
+                t.column = Column::Backlog;
+                t
+            }),
+            tf({
+                let mut t = todo_task("d");
+                t.column = Column::Done;
+                t
+            }),
+        ]));
+        // Any active / ready / review task breaks quiescence.
+        assert!(!tasks_are_quiescent(&[tf(in_progress_task("a", "alpha"))]));
+        assert!(!tasks_are_quiescent(&[tf(todo_task("r"))]));
+        assert!(!tasks_are_quiescent(&[tf(review_task("v"))]));
+        // Mixed backlog + one review task → still not quiescent.
+        assert!(!tasks_are_quiescent(&[
+            tf({
+                let mut t = todo_task("b");
+                t.column = Column::Backlog;
+                t
+            }),
+            tf(review_task("v")),
+        ]));
+    }
+
+    /// Force `hb` due and run one consideration. Returns the interval that is
+    /// now in effect after the call (the back-off level for the *next* gap).
+    fn force_tick(project: &Project, hb: &mut HeartbeatSchedule) -> Option<Duration> {
+        hb.next_attempt = Some(Instant::now());
+        maybe_emit_heartbeat(project, hb, || true);
+        hb.interval
+    }
+
+    fn hb_line_count() -> usize {
+        let log = shelbi_state::events_log_path().unwrap();
+        std::fs::read_to_string(&log)
+            .map(|b| b.lines().filter(|l| l.contains("heartbeat")).count())
+            .unwrap_or(0)
+    }
+
+    #[test]
+    fn maybe_emit_heartbeat_backs_off_exponentially_while_quiescent() {
+        let _g = crate::test_support::ENV_LOCK.lock().unwrap();
+        let home = std::env::temp_dir().join(format!(
+            "shelbi-poller-hb-backoff-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&home).unwrap();
+        std::env::set_var("SHELBI_HOME", &home);
+
+        let work_dir = home.join("repo");
+        std::fs::create_dir_all(&work_dir).unwrap();
+        let mut project = local_project(&work_dir);
+        // Standard 1s, cap 8s → the interval should climb 1→2→4→8 and pin.
+        project.heartbeat = shelbi_core::HeartbeatConfig::On {
+            interval: Duration::from_secs(1),
+            max: Duration::from_secs(8),
+        };
+        // Empty board → quiescent every tick.
+
+        let mut hb = HeartbeatSchedule::default();
+        maybe_emit_heartbeat(&project, &mut hb, || true); // seed
+        assert_eq!(hb.interval, Some(Duration::from_secs(1)), "seeded at standard");
+
+        // Each forced tick emits once (quiescent) and doubles the cadence,
+        // capped at max.
+        assert_eq!(force_tick(&project, &mut hb), Some(Duration::from_secs(2)));
+        assert_eq!(force_tick(&project, &mut hb), Some(Duration::from_secs(4)));
+        assert_eq!(force_tick(&project, &mut hb), Some(Duration::from_secs(8)));
+        assert_eq!(force_tick(&project, &mut hb), Some(Duration::from_secs(8)));
+        assert_eq!(
+            force_tick(&project, &mut hb),
+            Some(Duration::from_secs(8)),
+            "interval pins at the cap"
+        );
+        // Five quiescent emissions, one per forced tick.
+        assert_eq!(hb_line_count(), 5, "one heartbeat per quiescent tick");
+
+        std::env::remove_var("SHELBI_HOME");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn maybe_emit_heartbeat_holds_standard_while_work_in_flight() {
+        let _g = crate::test_support::ENV_LOCK.lock().unwrap();
+        let home = std::env::temp_dir().join(format!(
+            "shelbi-poller-hb-inflight-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&home).unwrap();
+        std::env::set_var("SHELBI_HOME", &home);
+
+        let work_dir = home.join("repo");
+        std::fs::create_dir_all(&work_dir).unwrap();
+        let mut project = local_project(&work_dir);
+        project.heartbeat = shelbi_core::HeartbeatConfig::On {
+            interval: Duration::from_secs(1),
+            max: Duration::from_secs(8),
+        };
+        // An in-progress task assigned to alpha → never quiescent, even though
+        // it emits no events of its own. This is exactly the case the sweep
+        // exists for.
+        shelbi_state::save_task("demo", &in_progress_task("fix-login", "alpha"), "body").unwrap();
+
+        let mut hb = HeartbeatSchedule::default();
+        maybe_emit_heartbeat(&project, &mut hb, || true); // seed
+
+        // The cadence must never leave standard while work is in flight.
+        for _ in 0..4 {
+            assert_eq!(
+                force_tick(&project, &mut hb),
+                Some(Duration::from_secs(1)),
+                "cadence must stay at standard while a task is in flight"
+            );
+        }
+
+        std::env::remove_var("SHELBI_HOME");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn maybe_emit_heartbeat_emits_despite_preexisting_log_history() {
+        // A poller that starts on a board whose events.log already carries old
+        // history must still emit its first heartbeat — the seed captures the
+        // existing mtime as the baseline, so stale history isn't mistaken for a
+        // fresh event and the sweep isn't permanently debounced.
+        let _g = crate::test_support::ENV_LOCK.lock().unwrap();
+        let home = std::env::temp_dir().join(format!(
+            "shelbi-poller-hb-history-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&home).unwrap();
+        std::env::set_var("SHELBI_HOME", &home);
+
+        let work_dir = home.join("repo");
+        std::fs::create_dir_all(&work_dir).unwrap();
+        let mut project = local_project(&work_dir);
+        project.heartbeat = shelbi_core::HeartbeatConfig::every(Duration::from_millis(1));
+
+        // Pre-existing history, then a beat so its mtime is safely in the past.
+        shelbi_state::append_workspace_event("demo", "alpha", None, WorkspaceState::Working)
+            .unwrap();
+        std::thread::sleep(Duration::from_millis(10));
+
+        let mut hb = HeartbeatSchedule::default();
+        maybe_emit_heartbeat(&project, &mut hb, || true); // seed captures baseline
+        let before = hb_line_count();
+
+        // Force a due tick with no new writes: must emit, not debounce forever.
+        hb.next_attempt = Some(Instant::now());
+        maybe_emit_heartbeat(&project, &mut hb, || true);
+        assert_eq!(
+            hb_line_count(),
+            before + 1,
+            "first heartbeat must fire despite pre-existing events.log history"
+        );
+
+        std::env::remove_var("SHELBI_HOME");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn maybe_emit_heartbeat_resets_to_standard_on_event_mid_backoff() {
+        let _g = crate::test_support::ENV_LOCK.lock().unwrap();
+        let home = std::env::temp_dir().join(format!(
+            "shelbi-poller-hb-reset-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&home).unwrap();
+        std::env::set_var("SHELBI_HOME", &home);
+
+        let work_dir = home.join("repo");
+        std::fs::create_dir_all(&work_dir).unwrap();
+        let mut project = local_project(&work_dir);
+        project.heartbeat = shelbi_core::HeartbeatConfig::On {
+            interval: Duration::from_secs(1),
+            max: Duration::from_secs(8),
+        };
+
+        let mut hb = HeartbeatSchedule::default();
+        maybe_emit_heartbeat(&project, &mut hb, || true); // seed
+
+        // Climb into the back-off on a quiescent board.
+        force_tick(&project, &mut hb);
+        assert_eq!(force_tick(&project, &mut hb), Some(Duration::from_secs(4)));
+        let before = hb_line_count();
+
+        // A real event lands mid-backoff (a workspace transition). It advances
+        // events.log past our last heartbeat write. Sleep briefly first so the
+        // mtime is strictly newer even on a coarse-resolution filesystem.
+        std::thread::sleep(Duration::from_millis(10));
+        shelbi_state::append_workspace_event("demo", "alpha", None, WorkspaceState::Working)
+            .unwrap();
+
+        // Next consideration: the event already woke the orchestrator, so we
+        // skip the emission AND snap the cadence back to standard.
+        assert_eq!(
+            force_tick(&project, &mut hb),
+            Some(Duration::from_secs(1)),
+            "a real event must reset the cadence to standard"
+        );
+        assert_eq!(
+            hb_line_count(),
+            before,
+            "reset tick must not emit its own heartbeat (debounced by the event)"
         );
 
         std::env::remove_var("SHELBI_HOME");
