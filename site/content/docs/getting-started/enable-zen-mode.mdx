@@ -23,6 +23,9 @@ this project. The minimum useful config is a list of local checks
 the orchestrator runs against every Zen-eligible review before it
 opens a PR.
 
+<Steps>
+<Step title="Add a zen block to the project YAML">
+
 Open the project's shared YAML — `~/.shelbi/projects/<name>.yaml` in
 [global mode](/docs/concepts/config-modes) or `<repo>/.shelbi/project.yaml`
 in in-repo mode — and add a `zen` block:
@@ -59,13 +62,15 @@ Three things to know about that block:
   next.js app, `.github/`, etc.); `extend` adds yours on top.
   `override` replaces everything if you want the explicit list.
 
-Apply the change:
+</Step>
+<Step title="Apply the change">
 
 ```bash
 shelbi reload
 ```
 
-Verify Shelbi sees the config:
+</Step>
+<Step title="Verify Shelbi sees the config">
 
 ```bash
 shelbi zen status
@@ -88,6 +93,9 @@ in-flight zen tasks: 0
 The resolved danger-path list labels every contribution so you can see
 which globs came from where. If something you expected to be guarded
 isn't on the list, add it under `extend`.
+
+</Step>
+</Steps>
 
 ## Flip the switch
 
@@ -242,6 +250,8 @@ Three flavors of "stop", in increasing severity:
 
 ### Crash recovery
 
+<Callout type="warning" title="A crash disables Zen — on purpose">
+
 If the orchestrator pane dies mid-session (kill signal, machine
 power loss, SIGHUP), Zen auto-disables on the next orchestrator
 start. The wrapper writes a heartbeat every 60s; an ungraceful exit
@@ -249,6 +259,8 @@ flips Zen off, writes a `zen=off reason=crash-recovery` event line,
 and prints a stderr warning. The orchestrator's bootstrap also calls
 this out in its first reply so you don't miss it. Re-enable with
 `shelbi zen on` once you've reviewed any work that was in flight.
+
+</Callout>
 
 ## Tune the bar over time
 

@@ -67,7 +67,8 @@ This prompt fires once per install; later project setups skip it.
 Each prompt has a sensible default, shown in brackets. Press Enter to
 accept; type to override.
 
-### Repo basics
+<Steps>
+<Step title="Repo basics">
 
 ```
 ? Project name: myapp
@@ -87,7 +88,8 @@ The project name has to be a kebab/snake-case identifier (letters, digits,
 `-`, `_`). It's the slug used in `~/.shelbi/projects/<name>.yaml`, in the
 tmux session name (`shelbi-<name>`), and on the CLI (`shelbi -p <name>`).
 
-### The hub
+</Step>
+<Step title="The hub">
 
 ```
 ? Hub machine name: hub
@@ -98,7 +100,8 @@ The **hub** is the machine you're sitting at. It owns the tmux session,
 runs the orchestrator pane, and holds any local workspaces. The work
 directory is where local worktrees get created — usually the repo path.
 
-### Remote machines (optional)
+</Step>
+<Step title="Remote machines (optional)">
 
 ```
 ? Add a remote machine? Yes
@@ -121,7 +124,8 @@ live.
 You can add more machines later by editing the YAML directly and running
 `shelbi reload`.
 
-### Workspaces
+</Step>
+<Step title="Workspaces">
 
 ```
 ? Agent runner (used by every workspace): claude
@@ -145,11 +149,14 @@ You can add more machines later by editing the YAML directly and running
 | Greek letters | alpha, beta, gamma, delta, epsilon, zeta, eta, … |
 | Toy Story | woody, buzz, jessie, rex, hamm, slinky, bullseye, … |
 
-  Workspaces are laid out machine by machine — the first N names go to the
-  hub, the next N to the first remote, and so on.
+Workspaces are laid out machine by machine — the first N names go to the
+hub, the next N to the first remote, and so on.
 
 - **Orchestrator runner** — the agent CLI that runs in window 1 and
   talks to you. Usually the same as the workspace runner, but you can mix.
+
+</Step>
+</Steps>
 
 The wizard writes the YAML, creates the per-workspace directories under
 `~/.shelbi/workspaces/<name>/`, and launches the TUI. Project resolution
@@ -242,6 +249,14 @@ useful:
   heartbeat: "off"      # disable
   ```
 
+  <Callout type="warning" title="Quote the off value">
+
+  Write `heartbeat: "off"` with the quotes. Bare `heartbeat: off` is read
+  by YAML as the boolean `false`, not the string `off` — a silent way to
+  get behavior you didn't ask for.
+
+  </Callout>
+
   Emission is debounced against everything else in the log: if any
   line was written in the last `heartbeat` interval — a workspace
   transition, a task move, another heartbeat — the next tick skips
@@ -265,9 +280,15 @@ workspaces:
 ```
 
 Each workspace name has to be a unique kebab/snake-case identifier across
-the project. Renaming a workspace means the next dispatch creates a new
-worktree directory under `~/.shelbi/workspaces/<name>/` — the old one isn't
-deleted automatically.
+the project.
+
+<Callout type="note" title="Renaming leaves the old worktree behind">
+
+Renaming a workspace means the next dispatch creates a *new* worktree
+directory under `~/.shelbi/workspaces/<name>/` — the old one isn't deleted
+automatically. Remove the stale directory by hand if you want the disk back.
+
+</Callout>
 
 ### Hub vs SSH machines
 

@@ -211,7 +211,15 @@ Open the task's markdown file in `$EDITOR` for free-form edits.
 shelbi task rm <ID>
 ```
 
-Delete a task file. Irreversible.
+Delete a task file.
+
+<Callout type="warning" title="Irreversible">
+
+`shelbi task rm` deletes the task's markdown file outright — there's no
+trash and no undo. To take a card off the board without destroying its
+history, move it back to `backlog` instead.
+
+</Callout>
 
 ## Examples
 

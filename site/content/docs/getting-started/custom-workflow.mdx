@@ -39,11 +39,15 @@ which is state, so it lives under `~/.shelbi/` in both modes. The
 orchestrator launches in that directory and auto-loads the rendered
 prompt — no flags, no env vars, no MCP.
 
-> The legacy `ORCHESTRATOR.md` override file is deprecated. If you
-> have content there from an earlier version, move project-wide bits
-> into `_shared/preamble.md` and orchestrator-specific bits into
-> `agents/orchestrator/instructions.md`. `CLAUDE.md` is now a
-> rendered artifact — don't hand-edit it.
+<Callout type="warning" title="Don't hand-edit CLAUDE.md">
+
+The legacy `ORCHESTRATOR.md` override file is deprecated. If you have content
+there from an earlier version, move project-wide bits into
+`_shared/preamble.md` and orchestrator-specific bits into
+`agents/orchestrator/instructions.md`. `CLAUDE.md` is now a rendered artifact
+— every `shelbi reload` overwrites it, so hand-edits are silently lost.
+
+</Callout>
 
 ## Start from the default
 
@@ -204,24 +208,37 @@ ask for the report you actually want.
 
 ## Apply the edits
 
-Two steps:
+<Steps>
+  <Step title="Edit the orchestrator's instructions">
 
-```bash
-# Edit the orchestrator's instructions.
-shelbi agent edit orchestrator
+  ```bash
+  shelbi agent edit orchestrator
+  ```
 
-# Re-render and respawn the dashboard against the new prompt.
-shelbi reload
-```
+  Opens `agents/orchestrator/instructions.md` in `$EDITOR`.
 
-To verify what landed in your instructions file:
+  </Step>
+  <Step title="Re-render and respawn the dashboard">
 
-```bash
-shelbi agent show orchestrator
-```
+  ```bash
+  shelbi reload
+  ```
 
-That prints `instructions.md` followed by the agent's `skills/`. The
-composed prompt (preamble + instructions, `{{assistant_name}}`
+  Composes the prompt against your edits and respawns the panes.
+
+  </Step>
+  <Step title="Verify what landed">
+
+  ```bash
+  shelbi agent show orchestrator
+  ```
+
+  Prints `instructions.md` followed by the agent's `skills/`.
+
+  </Step>
+</Steps>
+
+The composed prompt (preamble + instructions, `{{assistant_name}}`
 substituted) is written to `~/.shelbi/projects/<name>/CLAUDE.md` on
 every `shelbi reload` — read that file to see exactly what the runner
 loads.

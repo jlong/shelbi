@@ -121,10 +121,14 @@ merge-transition -> probe -> local checks -> merge conflict -> diff size
                  -> danger paths -> pr-create -> ci-watch -> pr-merge
 ```
 
-**Back-compat fallback** — a workflow with no `transitions:` block at
-all (every existing `default.yaml` on disk) still fires the bar on the
-legacy `Review` status. New workflows that declare a `transitions:`
-block get the action-based semantic exclusively.
+<Callout type="note" title="Back-compat fallback">
+
+A workflow with no `transitions:` block at all (every existing
+`default.yaml` on disk) still fires the bar on the legacy `Review` status.
+New workflows that declare a `transitions:` block get the action-based
+semantic exclusively.
+
+</Callout>
 
 The conditions, in order:
 
@@ -457,6 +461,8 @@ Three levels of "stop":
 
 ### Crash recovery
 
+<Callout type="warning" title="A crash disables Zen — on purpose">
+
 If the orchestrator pane dies mid-session (kill signal, SIGHUP,
 machine power loss), Zen Mode auto-disables on the next orchestrator
 start. The wrapper script around the orchestrator runner writes a
@@ -464,6 +470,8 @@ heartbeat every 60s; if the previous run ended without a graceful
 exit and Zen was on, the next start flips it off, writes a
 `zen=off reason=crash-recovery` event line, and prints a stderr
 warning so you see it immediately.
+
+</Callout>
 
 Re-enable manually with `shelbi zen on` once you've reviewed any
 in-flight work. The orchestrator's bootstrap also scans recent event

@@ -43,10 +43,14 @@ a `qa` agent on the next, and it's why a workflow can say "review this status
 with the security agent" without caring which workspace is free to do it.
 The workspace supplies the compute; the task's status supplies the agent.
 
-> Earlier versions of Shelbi called this slot a *worker* and conflated it
-> with the agent running inside. The CLI keeps `shelbi worker` as a
-> [deprecated alias](/docs/cli/workspace#deprecation-shelbi-worker), and the
-> events log still uses the `worker=<name>` token for backward compatibility.
+<Callout type="note" title="Legacy naming: worker">
+
+Earlier versions of Shelbi called this slot a *worker* and conflated it
+with the agent running inside. The CLI keeps `shelbi worker` as a
+[deprecated alias](/docs/cli/workspace#deprecation-shelbi-worker), and the
+events log still uses the `worker=<name>` token for backward compatibility.
+
+</Callout>
 
 ## The pool model
 
@@ -176,6 +180,15 @@ from scratch:
 This is *intentional*. The previous task's conversation history, scratchpad
 files, and any agent-local state are gone. Each task starts the agent with a
 clean context — no leakage between tasks on the same workspace.
+
+<Callout type="warning" title="Uncommitted work blocks the switch">
+
+Step 2 refuses to switch branches if the worktree has uncommitted changes.
+An agent that leaves work uncommitted will stall its own next dispatch — the
+completion protocol is a commit plus the review-ready marker, never a dirty
+tree.
+
+</Callout>
 
 The worktree itself persists. Files committed on the previous task's branch
 are still there on disk; only the branch checkout changes. This keeps the
