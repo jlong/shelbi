@@ -26,7 +26,7 @@ export interface OgCardProps {
  * Tailwind) and `display: flex` on every parent with multiple
  * children, per Satori's requirements.
  *
- * Fonts named "Geist" and "Geist Mono" must be loaded into the
+ * Fonts named "Geist" and "Source Code Pro" must be loaded into the
  * `ImageResponse` `fonts` option by the route that uses this
  * component.
  */
@@ -79,7 +79,7 @@ export function OgCard({ title, section }: OgCardProps) {
         {section ? (
           <div
             style={{
-              fontFamily: "Geist Mono",
+              fontFamily: "Source Code Pro",
               fontSize: 22,
               color: DIM,
               textTransform: "uppercase",
@@ -102,7 +102,7 @@ export function OgCard({ title, section }: OgCardProps) {
         </div>
         <div
           style={{
-            fontFamily: "Geist Mono",
+            fontFamily: "Source Code Pro",
             fontSize: 26,
             color: DIM,
             marginTop: 8,

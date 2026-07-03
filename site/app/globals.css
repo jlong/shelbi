@@ -13,9 +13,9 @@
    `.dark` class on `<html>` swaps both modes at the cascade.
    ============================================================ */
 @theme {
-  /* ----- Fonts (Geist Sans + Geist Mono via the `geist` package) ----- */
+  /* ----- Fonts (Geist Sans via `geist`; Source Code Pro via next/font) ----- */
   --font-sans: var(--font-geist-sans), system-ui, sans-serif;
-  --font-mono: var(--font-geist-mono), ui-monospace, monospace;
+  --font-mono: var(--font-source-code-pro), ui-monospace, monospace;
 
   /* ----- Palette (strict monochrome — light) ----- */
   --color-bg: #FFFFFF;

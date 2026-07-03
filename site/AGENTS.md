@@ -56,7 +56,7 @@ accent color into the rest of the monochrome brand.
 # Typography
 
 - **Sans (everything UI):** Geist Sans, via `geist/font/sans`. Weights in use: 400, 500, 600.
-- **Mono (code, CLI, wordmark text mode):** Geist Mono, via `geist/font/mono`. Weights in use: 400, 500.
+- **Mono (code, CLI, wordmark text mode):** Source Code Pro, via `next/font/google`. Weights in use: 400, 500, 600.
 
 Both fonts are loaded as Next.js font variables in `app/layout.tsx` and exposed as `--font-sans` / `--font-mono` Tailwind tokens.
 
