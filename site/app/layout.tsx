@@ -1,5 +1,5 @@
 import type { Metadata } from "next"
-import { Analytics } from "@vercel/analytics/react"
+import { Analytics } from "@vercel/analytics/next"
 import { GeistSans } from "geist/font/sans"
 import { GeistMono } from "geist/font/mono"
 import { Header } from "@/components/Header"
