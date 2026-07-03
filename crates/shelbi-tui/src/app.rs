@@ -69,9 +69,11 @@ pub enum WorkspaceBadge {
     AwaitingInput,
     /// ⚠ — claude is showing a permission dialog.
     AwaitingPermission,
-    /// ✓ — the workspace's task has been moved to the review column.
-    ReviewReady,
-    /// · — no in-flight task assigned.
+    /// · — no in-flight task assigned. A dev workspace that just finished a
+    /// task reads Idle immediately: on promotion the poller closes its
+    /// session (spec §16), so there is no lingering completion glyph — the
+    /// review sections own the "done, awaiting human" state, never the
+    /// workspace row.
     Idle,
 }
 
@@ -83,7 +85,6 @@ impl WorkspaceBadge {
             WorkspaceBadge::Working => "⏵",
             WorkspaceBadge::AwaitingInput => "💬",
             WorkspaceBadge::AwaitingPermission => "⚠",
-            WorkspaceBadge::ReviewReady => "✓",
             WorkspaceBadge::Idle => "·",
         }
     }
@@ -95,7 +96,6 @@ impl WorkspaceBadge {
             WorkspaceBadge::Working => DecorationColor::Green,
             WorkspaceBadge::AwaitingInput => DecorationColor::Yellow,
             WorkspaceBadge::AwaitingPermission => DecorationColor::Red,
-            WorkspaceBadge::ReviewReady => DecorationColor::Cyan,
             WorkspaceBadge::Idle => DecorationColor::DarkGray,
         }
     }
@@ -363,8 +363,7 @@ impl App {
         self.agents = load_agents(&self.project_name).unwrap_or_default();
         self.review_queue =
             shelbi_state::list_column(&self.project_name, Column::Review).unwrap_or_default();
-        self.workspaces =
-            load_workspaces(&self.project_name, &self.review_queue).unwrap_or_default();
+        self.workspaces = load_workspaces(&self.project_name).unwrap_or_default();
         // A missing state.json is normal (fresh project): default to Off so
         // the pill stays hidden rather than flashing then disappearing.
         self.zen_mode = read_state(&self.project_name)
@@ -636,7 +635,7 @@ impl Row {
 /// scan tasks twice per refresh). One disk read per workspace for the
 /// `status.yaml` lookup. Returns an empty vec if the project YAML or task
 /// dir is missing.
-fn load_workspaces(project: &str, review_queue: &[TaskFile]) -> Result<Vec<WorkspaceOverview>> {
+fn load_workspaces(project: &str) -> Result<Vec<WorkspaceOverview>> {
     let p = match shelbi_state::load_project(project) {
         Ok(p) => p,
         Err(_) => return Ok(Vec::new()),
@@ -666,10 +665,7 @@ fn load_workspaces(project: &str, review_queue: &[TaskFile]) -> Result<Vec<Works
                 .map(str::to_string)
                 .unwrap_or_else(|| DEFAULT_TASK_AGENT.to_string())
         });
-        let has_review = review_queue
-            .iter()
-            .any(|tf| tf.task.assigned_to.as_deref() == Some(workspace.name.as_str()));
-        let badge = derive_workspace_badge(&workspace.name, current_task.is_some(), has_review);
+        let badge = derive_workspace_badge(&workspace.name, current_task.is_some());
         out.push(WorkspaceOverview {
             name: workspace.name.clone(),
             machine: workspace.machine.clone(),
@@ -688,19 +684,16 @@ fn load_workspaces(project: &str, review_queue: &[TaskFile]) -> Result<Vec<Works
 const DEFAULT_TASK_AGENT: &str = "developer";
 
 /// Pick the badge for a workspace given the task-board signals + an on-disk
-/// state read. Review-ready wins over claude state — once a task is sent
-/// for review the workspace is conceptually done with it even if claude is
-/// still mid-turn. Idle wins when there's no in-progress task at all, so
-/// a stale `status.yaml` from a previous run doesn't show "working" for a
-/// workspace that has nothing to do.
-fn derive_workspace_badge(
-    workspace_name: &str,
-    has_in_progress: bool,
-    has_review: bool,
-) -> WorkspaceBadge {
-    if has_review {
-        return WorkspaceBadge::ReviewReady;
-    }
+/// state read. Idle wins when there's no in-progress task at all, so a stale
+/// `status.yaml` from a previous run doesn't show "working" for a workspace
+/// that has nothing to do.
+///
+/// A workspace never shows a "review-ready"/completion glyph (spec §16): when
+/// a dev workspace's task is promoted to Review the poller closes its session,
+/// so a finished slot simply reads Idle. Completion lives in the sidebar's
+/// review sections, keyed to the review workspace the task is loaded on —
+/// never on the dev workspace that produced it.
+fn derive_workspace_badge(workspace_name: &str, has_in_progress: bool) -> WorkspaceBadge {
     if !has_in_progress {
         return WorkspaceBadge::Idle;
     }
@@ -881,7 +874,7 @@ mod tests {
         };
         shelbi_state::save_task("demo", &assigned, "# task").unwrap();
 
-        let workspaces = load_workspaces("demo", &[]).unwrap();
+        let workspaces = load_workspaces("demo").unwrap();
         assert_eq!(workspaces.len(), 2);
 
         let alpha = &workspaces[0];
@@ -1390,7 +1383,7 @@ mod tests {
         )
         .unwrap();
 
-        let workspaces = load_workspaces("demo", &[]).unwrap();
+        let workspaces = load_workspaces("demo").unwrap();
         let alpha = workspaces.iter().find(|w| w.name == "alpha").unwrap();
         let delta = workspaces.iter().find(|w| w.name == "delta").unwrap();
         assert_eq!(alpha.agent.as_deref(), Some("qa"));
@@ -1561,7 +1554,12 @@ mod tests {
     }
 
     #[test]
-    fn workspace_badge_shows_review_ready_when_task_in_review_column() {
+    fn workspace_row_shows_no_completion_check_when_task_in_review_column() {
+        // Spec §16: a dev workspace never carries a review-ready/completion
+        // glyph. Once its task is promoted to Review the poller closes the
+        // session, so even a still-assigned Review task (before the
+        // orchestrator loads it onto a review workspace) reads Idle on the
+        // workspace row — completion lives in the review sections instead.
         let _g = TEST_LOCK.lock().unwrap();
         let home = fresh_home();
         std::env::set_var("SHELBI_HOME", &home);
@@ -1590,8 +1588,8 @@ mod tests {
             "",
         )
         .unwrap();
-        // Even an active "working" status.yaml shouldn't beat review-ready —
-        // once the task moves to review, the workspace is conceptually done.
+        // A stale "working" status.yaml must not resurrect a badge either —
+        // the task is out of the in-progress column, so the row is Idle.
         shelbi_state::save_workspace_status(&shelbi_state::WorkspaceStatus {
             workspace: "alpha".into(),
             current_task: None,
@@ -1606,7 +1604,7 @@ mod tests {
         let rows = app.rows();
         assert_eq!(
             find_workspace_badge(&rows, "alpha").unwrap(),
-            WorkspaceBadge::ReviewReady
+            WorkspaceBadge::Idle
         );
 
         std::env::remove_var("SHELBI_HOME");
@@ -1772,7 +1770,6 @@ mod tests {
             WorkspaceBadge::Working,
             WorkspaceBadge::AwaitingInput,
             WorkspaceBadge::AwaitingPermission,
-            WorkspaceBadge::ReviewReady,
             WorkspaceBadge::Idle,
         ] {
             assert_eq!(

@@ -383,8 +383,9 @@ fn poll_one(
     // independently of the pane title. We check it *before* the pane-title
     // state below (and unconditionally, even if the pane has since died or
     // Claude has overwritten its title) so nothing the agent's UI does can
-    // hide the signal.
-    maybe_promote_to_review(project, workspace, machine, &host);
+    // hide the signal. `addr` is threaded in so a dev workspace whose task we
+    // just promoted can close its own session immediately (spec §16).
+    maybe_promote_to_review(project, workspace, machine, &host, &addr);
 
     // Reaper sweep (spec §10): a review workspace with a live server pane but
     // no active task has leaked its bound port, which blocks the next
@@ -586,11 +587,20 @@ fn maybe_emit_dialog_event(
 /// never gets pulled back out. A stale marker (worktree reused before the
 /// previous one was cleared) names a task that's no longer in-progress for
 /// this workspace, so we clear it without moving anything.
+///
+/// On a real promotion this also **closes the dev workspace's session**
+/// immediately (spec §16): the branch is safely handed off, so the finished
+/// pane has no reason to linger and surface a completion glyph. Ordering is
+/// load-bearing — the close happens only AFTER the rebase + column move, never
+/// before, so work can't be stranded. Loading the promoted task onto a review
+/// workspace (or queueing it) is the orchestrator's job, reacting to the
+/// `to_category=handoff` event this move emits.
 fn maybe_promote_to_review(
     project: &Project,
     workspace: &shelbi_core::WorkspaceSpec,
     machine: &shelbi_core::Machine,
     host: &shelbi_core::Host,
+    addr: &shelbi_core::TmuxAddr,
 ) {
     let marker = shelbi_orchestrator::workspace::workspace_review_marker(machine, workspace);
     let task_id = match shelbi_orchestrator::workspace::read_review_marker(host, &marker) {
@@ -654,6 +664,38 @@ fn maybe_promote_to_review(
             // local. Failures log to events.log but never block the
             // promotion — that's the contract on this path.
             sync_contextstore_from_workspace(project, machine, &tf.body);
+
+            // Close the dev session on completion (spec §16). The branch is
+            // now safely promoted, so the finished pane has no reason to
+            // linger — killing it here frees the slot immediately and keeps a
+            // "done" glyph from lingering on the workspace row (the sidebar
+            // represents completion entirely in the review sections). We only
+            // do this for dev workspaces: a review workspace reaches Review by
+            // being *loaded* onto, not by promoting an in-progress task, so it
+            // never lands in this arm — the `!is_review()` guard is defensive.
+            // Best-effort — a stuck kill must not block the marker clear below,
+            // and `kill_workspace_pane` is idempotent, so a pane already gone
+            // is a silent no-op.
+            if !workspace.is_review() {
+                if let Err(e) = shelbi_orchestrator::workspace::kill_workspace_pane(
+                    host,
+                    addr,
+                    &workspace.name,
+                ) {
+                    tracing::warn!(
+                        workspace = %workspace.name,
+                        task = %task_id,
+                        error = %e,
+                        "close dev session on completion failed",
+                    );
+                } else {
+                    tracing::info!(
+                        workspace = %workspace.name,
+                        task = %task_id,
+                        "closed dev session on completion; workspace idle",
+                    );
+                }
+            }
         }
         Ok(_) => {
             tracing::debug!(workspace = %workspace.name, task = %task_id, "stale review marker (task not in-progress for this workspace); clearing");
@@ -989,7 +1031,8 @@ mod tests {
     }
 
     use shelbi_core::{
-        AgentRunnerSpec, Host, Machine, MachineKind, OrchestratorSpec, Task, WorkspaceSpec,
+        AgentRunnerSpec, Host, Machine, MachineKind, OrchestratorSpec, Task, TmuxAddr,
+        WorkspaceSpec,
     };
     use std::collections::BTreeMap;
 
@@ -1091,7 +1134,13 @@ mod tests {
         // Workspace signals review by writing its task id into the marker.
         let marker = write_marker(&project, "fix-login\n");
 
-        maybe_promote_to_review(&project, &project.workspaces[0], &project.machines[0], &Host::Local);
+        maybe_promote_to_review(
+            &project,
+            &project.workspaces[0],
+            &project.machines[0],
+            &Host::Local,
+            &TmuxAddr { session: "s".into(), window: "w".into() },
+        );
 
         assert_eq!(
             shelbi_state::load_task("demo", "fix-login")
@@ -1176,7 +1225,13 @@ mod tests {
         // A leftover/stale marker naming a task that's no longer in-progress
         // for this workspace is cleared without moving anything back out.
         let marker = write_marker(&project, "fix-login\n");
-        maybe_promote_to_review(&project, &project.workspaces[0], &project.machines[0], &Host::Local);
+        maybe_promote_to_review(
+            &project,
+            &project.workspaces[0],
+            &project.machines[0],
+            &Host::Local,
+            &TmuxAddr { session: "s".into(), window: "w".into() },
+        );
         assert_eq!(
             shelbi_state::load_task("demo", "fix-login")
                 .unwrap()
@@ -1227,7 +1282,13 @@ mod tests {
         .unwrap();
         let _marker = write_marker(&project, "write-notes\n");
 
-        maybe_promote_to_review(&project, &project.workspaces[0], &project.machines[0], &Host::Local);
+        maybe_promote_to_review(
+            &project,
+            &project.workspaces[0],
+            &project.machines[0],
+            &Host::Local,
+            &TmuxAddr { session: "s".into(), window: "w".into() },
+        );
 
         let log = std::fs::read_to_string(shelbi_state::events_log_path().unwrap()).unwrap();
         let cs_lines: Vec<&str> = log
@@ -1287,7 +1348,13 @@ mod tests {
         .unwrap();
         let _marker = write_marker(&project, "fix-login\n");
 
-        maybe_promote_to_review(&project, &project.workspaces[0], &project.machines[0], &Host::Local);
+        maybe_promote_to_review(
+            &project,
+            &project.workspaces[0],
+            &project.machines[0],
+            &Host::Local,
+            &TmuxAddr { session: "s".into(), window: "w".into() },
+        );
 
         let log = std::fs::read_to_string(shelbi_state::events_log_path().unwrap()).unwrap();
         assert!(
@@ -1319,7 +1386,13 @@ mod tests {
         shelbi_state::save_task("demo", &in_progress_task("fix-login", "alpha"), "body").unwrap();
 
         // No marker on disk → task stays in progress.
-        maybe_promote_to_review(&project, &project.workspaces[0], &project.machines[0], &Host::Local);
+        maybe_promote_to_review(
+            &project,
+            &project.workspaces[0],
+            &project.machines[0],
+            &Host::Local,
+            &TmuxAddr { session: "s".into(), window: "w".into() },
+        );
         assert_eq!(
             shelbi_state::load_task("demo", "fix-login")
                 .unwrap()

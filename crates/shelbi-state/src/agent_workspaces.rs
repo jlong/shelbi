@@ -936,6 +936,26 @@ mod tests {
         assert!(DEFAULT_ORCHESTRATOR_INSTRUCTIONS.contains("{{assistant_name}}"));
     }
 
+    /// Phase 5 (review-workspaces §8/§9/§15/§16): the orchestrator prompt must
+    /// carry the auto-load trigger, the pending-load queue vocabulary, and the
+    /// Zen carve-out so a copy edit can't quietly drop the flow that makes
+    /// review-routed tasks reach a human instead of auto-merging.
+    #[test]
+    fn orchestrator_template_contains_review_workspace_rules() {
+        let t = DEFAULT_ORCHESTRATOR_INSTRUCTIONS;
+        // Auto-load trigger: the handoff reaction loads onto a review slot.
+        assert!(t.contains("shelbi review <id>"));
+        // Scarcity/queue: the pending-load sub-state is the queue signal.
+        assert!(t.contains("pending-load"));
+        // Free-on-resolve: the review-workspace-free event drains the queue.
+        assert!(t.contains("review** workspace"));
+        // Dev session closes on completion (§16) — the orchestrator must know
+        // the freed dev slot needs no teardown from it.
+        assert!(t.contains("closes its own session"));
+        // Zen gate: review-routed tasks are the human path, never auto-merged.
+        assert!(t.contains("review-workspace gate"));
+    }
+
     /// Sanity-check the developer prompt has the spec-required hooks
     /// (review marker handoff, agents/_shared/preamble.md reference,
     /// the Phase 5 socket-emit paragraph) so a regression doesn't
