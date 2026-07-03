@@ -868,19 +868,6 @@ fn deploy_and_spawn(a: SpawnArgs<'_>) -> Result<()> {
     //    exist yet, this is a no-op; otherwise the next step recreates it.
     kill_workspace_pane(a.host, a.addr, &a.workspace.name)?;
 
-    // Inject `--permission-mode <mode>` directly on the claude command line
-    // rather than trusting the rendered `.claude/settings.json` to take effect.
-    // Settings-based mode is fragile (silent fallback to interactive on any
-    // I/O race or version regression) — the CLI flag is authoritative and
-    // belongs to the spawn path, where we already know the project's mode.
-    let runner_with_mode =
-        shelbi_agent::with_permission_mode(a.runner, &a.project.workspace_permissions_mode);
-    let launch = with_agent_system_prompt(
-        &shelbi_agent::launch_command(&runner_with_mode),
-        a.agent.map(|_| WORKTREE_AGENT_INSTRUCTIONS_REL),
-        a.runner,
-    );
-
     // 4 + 5. Create the pane and launch the agent.
     //
     // Local: the pane's top-level process is the `shelbi open
@@ -936,6 +923,16 @@ fn deploy_and_spawn(a: SpawnArgs<'_>) -> Result<()> {
         }
         Host::Ssh { .. } => {
             shelbi_tmux::new_session(a.host, &a.addr.session, &a.addr.window, None)?;
+            // Remote panes run the agent directly — the lifecycle wrapper isn't
+            // deployed on the workspace host — so we build the launch command
+            // here and send it into the pane. This goes through the SAME
+            // `workspace_launch_command` constructor the local wrapper
+            // (`shelbi open --as-pane`) uses, so the two host paths can't drift.
+            let launch = workspace_launch_command(
+                a.runner,
+                &a.project.workspace_permissions_mode,
+                a.agent.is_some(),
+            );
             let cd_launch =
                 remote_cd_launch(a.worktree, &launch, a.port, &a.workspace.name);
             shelbi_tmux::send_line(a.host, a.addr, &cd_launch)?;
@@ -1767,6 +1764,38 @@ fn remote_cd_launch(worktree: &Path, launch: &str, port: Option<u16>, workspace:
         wd = shelbi_agent::shell_escape(&worktree.to_string_lossy()),
         sock = shelbi_agent::shell_escape(&sock.to_string_lossy()),
         launch = shelbi_agent::shell_escape(launch),
+    )
+}
+
+/// Construct the shell command that launches the agent runner for a workspace
+/// pane — the single launch-command builder shared by BOTH host paths so the
+/// local and remote dispatch flows can't drift:
+///
+/// - **Local** panes run the `shelbi open <ws> --as-pane` lifecycle wrapper,
+///   which calls this to build the command it execs (see the wrapper in
+///   `shelbi-cli`'s `open/pane.rs`).
+/// - **Remote** panes have no shelbi binary to run the wrapper, so
+///   [`deploy_and_spawn`] calls this directly and sends the result into the
+///   pane via [`remote_cd_launch`].
+///
+/// `--permission-mode <mode>` is injected onto the runner's command line (via
+/// [`shelbi_agent::with_permission_mode`]) rather than trusted to the rendered
+/// `.claude/settings.json`: settings-based mode is fragile (silent fallback to
+/// interactive on any I/O race or version regression), so the CLI flag is
+/// authoritative and belongs to the spawn path where we already know the
+/// project's mode. When `include_agent_instructions` is set and the runner is
+/// `claude`, the deployed `instructions.md` is wired in as
+/// `--append-system-prompt "$(cat …)"` (see [`with_agent_system_prompt`]).
+pub fn workspace_launch_command(
+    runner: &shelbi_core::AgentRunnerSpec,
+    permissions_mode: &str,
+    include_agent_instructions: bool,
+) -> String {
+    let runner_with_mode = shelbi_agent::with_permission_mode(runner, permissions_mode);
+    with_agent_system_prompt(
+        &shelbi_agent::launch_command(&runner_with_mode),
+        include_agent_instructions.then_some(WORKTREE_AGENT_INSTRUCTIONS_REL),
+        runner,
     )
 }
 
@@ -3160,6 +3189,56 @@ mod tests {
             shelbi_agent::with_permission_mode(&runner, &p.workspace_permissions_mode);
         let launch = shelbi_agent::launch_command(&runner_with_mode);
         assert_eq!(launch, "codex --print");
+    }
+
+    #[test]
+    fn both_host_kinds_construct_the_same_launch_command() {
+        // F12: the local dispatch path (via the `shelbi open --as-pane`
+        // wrapper) and the remote dispatch path (`deploy_and_spawn`'s SSH
+        // branch) both build their launch through `workspace_launch_command`.
+        // Feed each host's workspace/runner through it and assert the launch
+        // string is byte-for-byte identical — one constructor, two hosts, no
+        // drift.
+        let p = fixture_project(); // permissions_mode = "auto"; both use claude
+        let local_ws = &p.workspaces[0]; // alice, Host::Local
+        let remote_ws = &p.workspaces[1]; // bob, Host::Ssh
+        let local_runner = p.runner(&local_ws.runner).unwrap();
+        let remote_runner = p.runner(&remote_ws.runner).unwrap();
+
+        // With an agent deployed: claude gets --permission-mode + the
+        // instructions system-prompt. Both hosts produce the same shape.
+        let local_launch =
+            workspace_launch_command(local_runner, &p.workspace_permissions_mode, true);
+        let remote_launch =
+            workspace_launch_command(remote_runner, &p.workspace_permissions_mode, true);
+        assert_eq!(local_launch, remote_launch);
+        assert_eq!(
+            local_launch,
+            "claude --permission-mode auto \
+             --append-system-prompt \"$(cat .claude/agent-instructions.md)\"",
+        );
+
+        // The remote wrapper embeds exactly that shared launch, so the SSH
+        // pane execs the same command the local wrapper would.
+        let cd_launch = remote_cd_launch(
+            Path::new("/work/myapp/.shelbi/wt/bob"),
+            &remote_launch,
+            None,
+            &remote_ws.name,
+        );
+        assert!(
+            cd_launch.contains(&remote_launch),
+            "remote cd-launch must carry the shared launch verbatim: {cd_launch}"
+        );
+
+        // Bare pane (no agent): both hosts still agree — no
+        // --append-system-prompt on either.
+        let local_bare =
+            workspace_launch_command(local_runner, &p.workspace_permissions_mode, false);
+        let remote_bare =
+            workspace_launch_command(remote_runner, &p.workspace_permissions_mode, false);
+        assert_eq!(local_bare, remote_bare);
+        assert_eq!(local_bare, "claude --permission-mode auto");
     }
 
     #[test]

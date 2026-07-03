@@ -72,10 +72,6 @@ pub fn run(project: &Project, workspace: &WorkspaceSpec, machine: &Machine) -> R
             )
         })?
         .clone();
-    let runner_with_mode =
-        shelbi_agent::with_permission_mode(&runner, &project.workspace_permissions_mode);
-    let launch = shelbi_agent::launch_command(&runner_with_mode);
-
     let worktree = orch_workspace::workspace_worktree(machine, workspace);
     let worktree_str = worktree.to_string_lossy().into_owned();
 
@@ -96,14 +92,15 @@ pub fn run(project: &Project, workspace: &WorkspaceSpec, machine: &Machine) -> R
     let has_agent_instructions = worktree
         .join(orch_workspace::WORKTREE_AGENT_INSTRUCTIONS_REL)
         .exists();
-    let launch_full = if is_claude_runner(&runner_with_mode) && has_agent_instructions {
-        format!(
-            "{launch} --append-system-prompt \"$(cat {rel})\"",
-            rel = shelbi_agent::shell_escape(orch_workspace::WORKTREE_AGENT_INSTRUCTIONS_REL),
-        )
-    } else {
-        launch
-    };
+    // Build the launch command through the shared constructor so this local
+    // wrapper path and the remote dispatch path (`deploy_and_spawn`) apply the
+    // same runner / permission-mode / append-system-prompt logic and can't
+    // drift.
+    let launch_full = orch_workspace::workspace_launch_command(
+        &runner,
+        &project.workspace_permissions_mode,
+        has_agent_instructions,
+    );
 
     // `cd` falls back to $HOME if the worktree doesn't exist — that keeps
     // a sidebar click on a never-used workspace from leaving the user in
@@ -357,13 +354,6 @@ fn kill_task_tail(worktree: &Path, task_id: &str) -> std::io::Result<()> {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(e) => Err(e),
     }
-}
-
-fn is_claude_runner(spec: &shelbi_core::AgentRunnerSpec) -> bool {
-    std::path::Path::new(&spec.command)
-        .file_name()
-        .and_then(|s| s.to_str())
-        == Some("claude")
 }
 
 #[cfg(test)]
@@ -1111,27 +1101,5 @@ mod tests {
         std::env::remove_var("PROJECT");
         std::env::remove_var("SHELBI_HUB_SOCK");
         let _ = std::fs::remove_dir_all(&home);
-    }
-
-    #[test]
-    fn is_claude_runner_recognizes_basename() {
-        let claude = shelbi_core::AgentRunnerSpec {
-            command: "claude".into(),
-            flags: vec![],
-            dialog_signatures: vec![],
-        };
-        let claude_abs = shelbi_core::AgentRunnerSpec {
-            command: "/opt/homebrew/bin/claude".into(),
-            flags: vec![],
-            dialog_signatures: vec![],
-        };
-        let codex = shelbi_core::AgentRunnerSpec {
-            command: "codex".into(),
-            flags: vec![],
-            dialog_signatures: vec![],
-        };
-        assert!(is_claude_runner(&claude));
-        assert!(is_claude_runner(&claude_abs));
-        assert!(!is_claude_runner(&codex));
     }
 }
