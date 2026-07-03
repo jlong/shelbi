@@ -28,6 +28,42 @@
   --color-gray-6: #666666;
   --color-gray-7: #333333;
 
+  /* ----- Docs prose (higher-contrast body text) -----
+     Docs reading experience only. Prose was rendered at `text-gray-7`,
+     which is comfortable for UI chrome but too soft for long-form body
+     copy — especially the dark-mode gray-7 (#999) on pure black. This
+     token sits nearer `fg` than the gray ramp so paragraphs, lists, and
+     table cells read clearly in both themes, while headings (pure
+     `fg`) still lead the hierarchy. Documented in `AGENTS.md`. */
+  --color-prose: #171717;
+
+  /* ----- Docs callout tints (hue by type — light) -----
+     A deliberate exception to strict-monochrome, scoped to the docs
+     `Callout` component: note/info → blue, warning → yellow,
+     danger/error → red, tip → green. Each type carries a soft tinted
+     background, a saturated border, and readable title/body text.
+     Tuned for legible contrast in both themes (see the `.dark`
+     overrides). Documented in `AGENTS.md`. */
+  --color-callout-info-bg: #EFF6FF;
+  --color-callout-info-border: #93C5FD;
+  --color-callout-info-title: #1E3A8A;
+  --color-callout-info-body: #1E40AF;
+
+  --color-callout-warning-bg: #FEFCE8;
+  --color-callout-warning-border: #FCD34D;
+  --color-callout-warning-title: #854D0E;
+  --color-callout-warning-body: #92600A;
+
+  --color-callout-danger-bg: #FEF2F2;
+  --color-callout-danger-border: #FCA5A5;
+  --color-callout-danger-title: #991B1B;
+  --color-callout-danger-body: #B91C1C;
+
+  --color-callout-tip-bg: #F0FDF4;
+  --color-callout-tip-border: #86EFAC;
+  --color-callout-tip-title: #14532D;
+  --color-callout-tip-body: #15803D;
+
   /* ----- Spacing (8px base) ----- */
   --spacing: 8px;
 }
@@ -45,6 +81,32 @@
   --color-gray-5: #444444;
   --color-gray-6: #666666;
   --color-gray-7: #999999;
+
+  /* Docs prose — lift off pure black for comfortable long-form reading. */
+  --color-prose: #C9C9C9;
+
+  /* Docs callout tints — dark. Deep, low-luminance backgrounds with
+     brighter borders and light title/body text so each hue stays legible
+     on the black canvas without glowing. */
+  --color-callout-info-bg: #0E1A2E;
+  --color-callout-info-border: #2E4E7E;
+  --color-callout-info-title: #BFDBFE;
+  --color-callout-info-body: #C7DBF5;
+
+  --color-callout-warning-bg: #2A2205;
+  --color-callout-warning-border: #7A5E12;
+  --color-callout-warning-title: #FDE68A;
+  --color-callout-warning-body: #F0DCA0;
+
+  --color-callout-danger-bg: #2C1212;
+  --color-callout-danger-border: #7F2C2C;
+  --color-callout-danger-title: #FECACA;
+  --color-callout-danger-body: #F3C4C4;
+
+  --color-callout-tip-bg: #0D2016;
+  --color-callout-tip-border: #2E6B45;
+  --color-callout-tip-title: #BBF7D0;
+  --color-callout-tip-body: #C0E9CE;
 }
 
 /* ============================================================

@@ -26,6 +26,25 @@ Strict monochrome — no accent colors. State is communicated via dot fill, weig
 
 Do not introduce additional color tokens without updating the plan in `Shelbi/Plans/shelbi-website.md` §3.
 
+## Docs reading experience — sanctioned exceptions
+
+The monochrome rule holds everywhere (landing page, header/footer, kanban
+mockup, all UI chrome). The **docs reading surface** carries two narrow,
+intentional departures — keep them; do not revert to strict-mono here:
+
+- **Higher-contrast body text.** Docs prose (paragraphs, lists, blockquotes,
+  table cells in `components/mdx-components.tsx`) renders at `text-prose`, a
+  value nearer `fg` than the gray ramp, tuned for long-form legibility in both
+  themes. Headings stay at pure `text-fg` so they still lead the hierarchy.
+- **Callouts use hue by type.** The `Callout` component
+  (`components/Callout.tsx`) tints by admonition flavor — note/info → blue,
+  warning → yellow, danger/error → red, tip → green — with a soft background,
+  saturated border, and readable title/body text in both themes.
+
+Both are driven by `--color-prose` and the `--color-callout-*` tokens in
+`app/globals.css` (defined per theme). This hue is scoped to docs callouts only
+— do not spread accent color into the rest of the monochrome brand.
+
 # Typography
 
 - **Sans (everything UI):** Geist Sans, via `geist/font/sans`. Weights in use: 400, 500, 600.
