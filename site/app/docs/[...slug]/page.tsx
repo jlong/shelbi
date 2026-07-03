@@ -79,7 +79,6 @@ export default async function DocsPage({ params }: DocsPageProps) {
               View as markdown
             </a>
           </div>
-          <p className="mt-1 text-gray-7">{doc.summary}</p>
         </header>
         <MDX components={mdxComponents} />
         <DocFooter prev={prev} next={next} editUrl={editUrl} />
