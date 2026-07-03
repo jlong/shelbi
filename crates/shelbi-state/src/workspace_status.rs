@@ -463,18 +463,29 @@ pub fn append_contextstore_event(
     ))
 }
 
-/// Append `<rfc3339> mode=zen <prev> -> <new> reason=<source>` to
-/// `~/.shelbi/events.log`. The orchestrator's tail watches this line shape
+/// Append `<rfc3339> project=<name> mode=zen <prev> -> <new> reason=<source>`
+/// to `~/.shelbi/events.log`. The orchestrator's tail watches this line shape
 /// to react to Zen Mode toggles without re-reading `state.json`. Sources
 /// are short tokens identifying the toggle path (`user:cli`, `user:hotkey`,
-/// `system:crash-recovery`); whitespace folds to underscores so the line
-/// stays parseable.
-pub fn append_zen_mode_event(prev: &str, new: &str, source: &str) -> Result<()> {
+/// `user:palette`, `system:crash-recovery`); whitespace folds to underscores
+/// so the line stays parseable.
+///
+/// The leading `project=<name>` scope is load-bearing: `events.log` is
+/// hub-global (every project's orchestrator tails the same file), so without
+/// the scope a toggle in one project would be indistinguishable from a toggle
+/// in another and every orchestrator would react to it. With the scope each
+/// orchestrator filters to `project=<its-own-name>` — matching the same
+/// convention the heartbeat (`append_heartbeat_event`) and crash-recovery
+/// lines already use.
+pub fn append_zen_mode_event(project: &str, prev: &str, new: &str, source: &str) -> Result<()> {
     let ts = Utc::now().to_rfc3339();
+    let project = sanitize_field(project);
     let prev = sanitize_reason(prev);
     let new = sanitize_reason(new);
     let source = sanitize_reason(source);
-    append_event_line(&format!("{ts} mode=zen {prev} -> {new} reason={source}"))
+    append_event_line(&format!(
+        "{ts} project={project} mode=zen {prev} -> {new} reason={source}"
+    ))
 }
 
 /// Append `<rfc3339> zen-dryrun task=<id> action=<action> detail=<detail>`
@@ -1815,19 +1826,21 @@ mod tests {
         let home = fresh_home();
         std::env::set_var("SHELBI_HOME", &home);
 
-        append_zen_mode_event("off", "on", "user:cli").unwrap();
-        append_zen_mode_event("on", "paused", "user:hotkey").unwrap();
-        append_zen_mode_event("paused", "off", "system:crash-recovery").unwrap();
+        append_zen_mode_event("alpha", "off", "on", "user:cli").unwrap();
+        append_zen_mode_event("alpha", "on", "paused", "user:hotkey").unwrap();
+        append_zen_mode_event("bravo", "paused", "off", "system:crash-recovery").unwrap();
 
         let log = std::fs::read_to_string(events_log_path().unwrap()).unwrap();
         let lines: Vec<&str> = log.lines().collect();
         assert_eq!(lines.len(), 3);
-        // No project tag — the orchestrator's tail is hub-global and the
-        // line is project-implicit. Shape: `<ts> mode=zen <prev> -> <new>
-        // reason=<source>`.
-        assert!(lines[0].contains(" mode=zen off -> on reason=user:cli"));
-        assert!(lines[1].contains(" mode=zen on -> paused reason=user:hotkey"));
-        assert!(lines[2].contains(" mode=zen paused -> off reason=system:crash-recovery"));
+        // Each line carries a `project=<name>` scope so the hub-global tail
+        // can be filtered per-orchestrator. Shape: `<ts> project=<name>
+        // mode=zen <prev> -> <new> reason=<source>`.
+        assert!(lines[0].contains(" project=alpha mode=zen off -> on reason=user:cli"));
+        assert!(lines[1].contains(" project=alpha mode=zen on -> paused reason=user:hotkey"));
+        assert!(
+            lines[2].contains(" project=bravo mode=zen paused -> off reason=system:crash-recovery")
+        );
 
         std::env::remove_var("SHELBI_HOME");
     }

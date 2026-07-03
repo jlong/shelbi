@@ -1275,7 +1275,9 @@ pub fn update_state<R>(project: &str, f: impl FnOnce(&mut State) -> Result<R>) -
 }
 
 /// Persist `target` as the project's `zen_mode` and append a
-/// `mode=zen <prev> -> <target> reason=<source>` line to `events.log`.
+/// `project=<project> mode=zen <prev> -> <target> reason=<source>` line to
+/// `events.log`. The `project=` scope keeps a toggle from broadcasting to
+/// every project's orchestrator across the hub-global log.
 /// Single source of truth shared by `shelbi zen on|off|pause` (CLI),
 /// the TUI's Alt+Z handler, and the palette's toggle entry — each
 /// caller picks its own `source` token (`user:cli`, `user:hotkey`,
@@ -1288,7 +1290,7 @@ pub fn set_zen_mode(project: &str, target: ZenModeState, source: &str) -> Result
         state.zen_mode = target;
         Ok(prev)
     })?;
-    let _ = append_zen_mode_event(prev.as_str(), target.as_str(), source);
+    let _ = append_zen_mode_event(project, prev.as_str(), target.as_str(), source);
     Ok(prev)
 }
 
@@ -1355,7 +1357,7 @@ pub fn toggle_zen_mode(project: &str, source: &str) -> Result<ZenModeState> {
         state.zen_mode = target;
         Ok((prev, target))
     })?;
-    let _ = append_zen_mode_event(prev.as_str(), target.as_str(), source);
+    let _ = append_zen_mode_event(project, prev.as_str(), target.as_str(), source);
     Ok(target)
 }
 
@@ -3276,15 +3278,54 @@ mod tests {
         let new = toggle_zen_mode("p", "user:palette").unwrap();
         assert_eq!(new, ZenModeState::Off);
 
-        // Both transitions appear in the events log under the supplied source.
+        // Both transitions appear in the events log, scoped to the project
+        // and tagged with the supplied source.
         let log = std::fs::read_to_string(events_log_path().unwrap()).unwrap();
         assert!(
-            log.contains("mode=zen off -> on reason=user:palette"),
+            log.contains("project=p mode=zen off -> on reason=user:palette"),
             "missing on transition in: {log}"
         );
         assert!(
-            log.contains("mode=zen on -> off reason=user:palette"),
+            log.contains("project=p mode=zen on -> off reason=user:palette"),
             "missing off transition in: {log}"
+        );
+        std::env::remove_var("SHELBI_HOME");
+    }
+
+    #[test]
+    fn toggling_zen_in_one_project_leaves_others_untouched() {
+        // Regression: toggling Zen in project A must not change project B's
+        // `zen_mode`, and the emitted event line must carry A's project scope
+        // so a hub-global tail can tell the two apart (the broadcast bug).
+        let _g = TEST_LOCK.lock().unwrap();
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+
+        // Both projects start from defaults (Off).
+        assert_eq!(read_state("alpha").unwrap().zen_mode, ZenModeState::Off);
+        assert_eq!(read_state("bravo").unwrap().zen_mode, ZenModeState::Off);
+
+        // Flip alpha on via the palette path.
+        let new = toggle_zen_mode("alpha", "user:palette").unwrap();
+        assert_eq!(new, ZenModeState::On);
+
+        // alpha changed; bravo did not.
+        assert_eq!(read_state("alpha").unwrap().zen_mode, ZenModeState::On);
+        assert_eq!(
+            read_state("bravo").unwrap().zen_mode,
+            ZenModeState::Off,
+            "toggling alpha must not touch bravo's zen_mode"
+        );
+
+        // The event line is scoped to alpha, and no bravo-scoped line exists.
+        let log = std::fs::read_to_string(events_log_path().unwrap()).unwrap();
+        assert!(
+            log.contains("project=alpha mode=zen off -> on reason=user:palette"),
+            "missing alpha-scoped toggle in: {log}"
+        );
+        assert!(
+            !log.contains("project=bravo mode=zen"),
+            "no bravo-scoped zen line should exist; got: {log}"
         );
         std::env::remove_var("SHELBI_HOME");
     }
@@ -3314,7 +3355,7 @@ mod tests {
         assert_eq!(read_state("p").unwrap().zen_mode, ZenModeState::Paused);
         let log = std::fs::read_to_string(events_log_path().unwrap()).unwrap();
         assert!(
-            log.contains("mode=zen off -> paused reason=user:cli"),
+            log.contains("project=p mode=zen off -> paused reason=user:cli"),
             "got: {log}"
         );
         std::env::remove_var("SHELBI_HOME");

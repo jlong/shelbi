@@ -65,6 +65,10 @@ Your live feed is `~/.shelbi/events.log`. The line shapes you'll see most:
 - `<ts> task=<id> workflow=<name> <from> -> <to> reason=<short>
   from_category=<c> to_category=<c>`
 - `<ts> workspace=<name> <prev> -> <new>`
+- `<ts> project=<name> mode=zen <prev> -> <new> reason=<source>` — a Zen
+  Mode toggle for `<name>`. Scoped: only the `<name>` that matches your own
+  project is yours to react to (see `## Zen Mode`). `<source>` is the toggle
+  path (`user:cli`, `user:hotkey`, `user:palette`, `system:crash-recovery`).
 - `<ts> project=<name> heartbeat zen_eligible=<N> idle_workspaces=<M>` —
   periodic wake-up from the hub poller (default cadence `3m`, configurable
   via `heartbeat` in `project.yaml`). Not a state change; use it to re-check
@@ -100,9 +104,10 @@ before answering the user:
      crash recovery. Seed `zen_active` from the mode; if the crash-
      recovery flag is set, call it out in your first reply so the
      user knows to review in-flight work before re-enabling Zen with
-     `shelbi zen on`. Thereafter track the mode from `mode=zen
-     <prev> -> <new>` lines in the event stream (see `## Zen Mode`
-     below) — no need to re-read `state.json`.
+     `shelbi zen on`. Thereafter track the mode from `project=<you>
+     mode=zen <prev> -> <new>` lines in the event stream — only the ones
+     scoped to your own project (see `## Zen Mode` below) — no need to
+     re-read `state.json`.
    - **Handoff** — either "no HANDOFF.md present" or the deleted
      contents of the file, printed inline. `--handoff` is destructive
      (write-then-delete), so re-running the same command later will
@@ -394,17 +399,22 @@ These extend (not replace) the default reaction rules above. When
   `reason=orchestrator:zen-promote category=<n>` for promoted,
   `reason=orchestrator:zen-decline reason-text=<short>` for the ones you
   considered but didn't promote.
-- On `mode=zen <prev> -> paused`: skip new auto-promotions but continue
-  applying the merge-conditions flow to in-flight tasks reaching
-  `handoff`.
+- On `project=<you> mode=zen <prev> -> paused`: skip new auto-promotions
+  but continue applying the merge-conditions flow to in-flight tasks
+  reaching `handoff`.
 
-Reaction rules for mode changes themselves:
+Reaction rules for mode changes themselves. Each `mode=zen` line is
+scoped — its shape is `<ts> project=<name> mode=zen <prev> -> <new>
+reason=<source>`. **Only react to lines whose `project=<name>` matches
+your own project**; the log is hub-global, so a toggle in another project
+appears in your tail too and must be ignored (reacting to it is the
+cross-project broadcast bug).
 
-- On `mode=zen * -> on`: print the current board + workspace snapshot;
-  switch into the rules above.
-- On `mode=zen * -> off` or `* -> paused`: stop initiating new Zen
-  actions; in-flight merges that have already started the conditions
-  flow complete on their current trajectory.
+- On `project=<you> mode=zen * -> on`: print the current board + workspace
+  snapshot; switch into the rules above.
+- On `project=<you> mode=zen * -> off` or `* -> paused`: stop initiating
+  new Zen actions; in-flight merges that have already started the
+  conditions flow complete on their current trajectory.
 
 ### Customization
 

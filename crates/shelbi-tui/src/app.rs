@@ -1875,10 +1875,10 @@ mod tests {
         let log = std::fs::read_to_string(shelbi_state::events_log_path().unwrap()).unwrap();
         let on_line = log
             .lines()
-            .find(|l| l.contains("mode=zen off -> on reason=user:hotkey"));
+            .find(|l| l.contains("project=demo mode=zen off -> on reason=user:hotkey"));
         let off_line = log
             .lines()
-            .find(|l| l.contains("mode=zen on -> off reason=user:hotkey"));
+            .find(|l| l.contains("project=demo mode=zen on -> off reason=user:hotkey"));
         assert!(on_line.is_some(), "missing zen-on event in: {log}");
         assert!(off_line.is_some(), "missing zen-off event in: {log}");
 

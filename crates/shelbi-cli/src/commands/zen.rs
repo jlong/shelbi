@@ -7,11 +7,14 @@
 //!   orchestrator sequences to drive a merge.
 //!
 //! Mode toggles persist in `~/.shelbi/projects/<project>/state.json::zen_mode`
-//! and write a `mode=zen <prev> -> <new> reason=user:cli` line to
-//! `~/.shelbi/events.log`. The Alt+Z hotkey and the (future) crash-recovery
-//! path emit the same shape with `reason=user:hotkey` and
+//! and write a `project=<project> mode=zen <prev> -> <new> reason=user:cli`
+//! line to `~/.shelbi/events.log`. The Alt+Z hotkey, the palette toggle, and
+//! the (future) crash-recovery path emit the same shape with
+//! `reason=user:hotkey`, `reason=user:palette`, and
 //! `reason=system:crash-recovery` respectively — the orchestrator reacts to
-//! all three the same way.
+//! all of them the same way. The leading `project=` scope keeps a toggle in
+//! one project from being read as a toggle by every other project's
+//! orchestrator tailing the hub-global log.
 //!
 //! All non-toggle commands print a single line on stdout (probe prints JSON)
 //! and use exit-code + stderr for failures. The orchestrator parses the
