@@ -71,7 +71,7 @@ fn render_list(f: &mut Frame, app: &mut App, area: Rect) {
     // Full-row dark-gray fill on the selected row. fg/bold for the
     // selected text is set per-span in render_row so the contrast against
     // the new bg is explicit.
-    let list = List::new(items).highlight_style(Style::default().bg(Color::Rgb(63,63,63)));
+    let list = List::new(items).highlight_style(Style::default().bg(crate::theme::SELECTION_BG));
     f.render_stateful_widget(list, inner, &mut state);
 }
 

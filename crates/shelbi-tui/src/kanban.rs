@@ -1863,7 +1863,7 @@ fn render_column(
         if focused && row == app.selected_row {
             item = item.style(
                 Style::default()
-                    .bg(Color::Blue)
+                    .bg(crate::theme::SELECTION_BG)
                     .fg(Color::White)
                     .add_modifier(Modifier::BOLD),
             );
@@ -2023,7 +2023,8 @@ fn render_workspace_dropdown(f: &mut Frame, app: &mut KanbanApp, area: Rect) {
         let label = dropdown_row_text(opt);
         // Active filter gets a leading bullet so the user can tell at
         // a glance which row is currently applied. The selected row
-        // (cursor) gets a Blue bg via List highlight_style below.
+        // (cursor) gets the shared selection-gray bg via List
+        // highlight_style below.
         let prefix = if active { "● " } else { "  " };
         let label_style = if active {
             Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)
@@ -2056,7 +2057,7 @@ fn render_workspace_dropdown(f: &mut Frame, app: &mut KanbanApp, area: Rect) {
     state.select(Some(cursor.min(opts.len().saturating_sub(1))));
     let list = List::new(items).highlight_style(
         Style::default()
-            .bg(Color::Blue)
+            .bg(crate::theme::SELECTION_BG)
             .fg(Color::White)
             .add_modifier(Modifier::BOLD),
     );
@@ -2178,7 +2179,7 @@ fn render_workflow_dropdown(f: &mut Frame, app: &mut KanbanApp, area: Rect) {
     state.select(Some(cursor.min(opts.len().saturating_sub(1))));
     let list = List::new(items).highlight_style(
         Style::default()
-            .bg(Color::Blue)
+            .bg(crate::theme::SELECTION_BG)
             .fg(Color::White)
             .add_modifier(Modifier::BOLD),
     );

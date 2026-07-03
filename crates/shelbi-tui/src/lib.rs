@@ -28,6 +28,7 @@ mod markdown;
 mod poller;
 mod review;
 mod sidebar;
+pub mod theme;
 mod zen_probe;
 
 #[cfg(test)]
