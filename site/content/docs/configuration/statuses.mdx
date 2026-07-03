@@ -1,0 +1,81 @@
+---
+title: Statuses
+order: 32
+summary: Field-by-field reference for statuses.yml — the project-wide status catalog that gives every status its id, display name, and category.
+---
+
+`statuses.yml` is the single source of truth for **status identity** in a
+project. Every [workflow](/docs/configuration/workflow) references these
+entries by `id` and inherits their `name` and `category`; workflows may
+pick a subset but cannot reorder or rename them. Declaration order here
+is the canonical left-to-right column order in the TUI's all-view.
+
+## Where it lives
+
+```
+<config-root>/workflows/statuses.yml
+```
+
+`<config-root>` is `~/.shelbi/projects/<name>/` in the default
+[global mode](/docs/concepts/config-modes) and `<repo>/.shelbi/` in
+in-repo mode — the same directory as the workflow files.
+
+## Example
+
+```yaml
+# ~/.shelbi/projects/myapp/workflows/statuses.yml
+statuses:
+  - { id: backlog,     name: Backlog,     category: backlog }
+  - { id: todo,        name: Todo,        category: ready }
+  - { id: in-progress, name: In Progress, category: active }
+  - { id: review,      name: Review,      category: handoff }
+  - { id: done,        name: Done,        category: done }
+```
+
+## Top-level fields
+
+| Field | Type | Required | Default | Description |
+| --- | --- | --- | --- | --- |
+| `statuses` | list of [Status](#status) | yes | — | Ordered catalog of every status in the project. Order is significant — it's the column order in the TUI all-view. |
+
+## status
+
+| Field | Type | Required | Default | Description |
+| --- | --- | --- | --- | --- |
+| `id` | string | yes | — | Stable identifier referenced from every workflow's `statuses:` list. Must be unique and non-empty. Conventionally lowercase kebab-case. |
+| `name` | string | yes | — | User-facing display label (e.g. `Backlog`, `In Progress`). Must be non-empty. |
+| `category` | [category](#categories) | yes | — | Closed semantic category. Generic code keys off this, so a renamed status keeps its behavior. |
+
+## categories
+
+The `category` field is a closed vocabulary of exactly six values —
+generic code (the orchestrator, Zen Mode, event-log reactions) keys off
+the category, not the display name, so renaming a status leaves its
+semantics intact. See [status categories](/docs/concepts/workflows#status-categories).
+
+| Category | Meaning |
+| --- | --- |
+| `backlog` | Not yet ready for work — triage stage. |
+| `ready` | Ready to be picked up by whoever owns it. |
+| `active` | Owner is working on it now. |
+| `handoff` | One owner finished their part; another's input is required next. |
+| `done` | Terminal — accepted, shipped. |
+| `archived` | Terminal — closed without shipping (cancelled, won't fix, duplicate). |
+
+<Callout type="warning" title="At least one terminal category">
+
+Loading fails if no status has category `done` or `archived` — a board
+with no terminal state is degenerate, since a task could never leave it.
+A category set is otherwise unconstrained: repeating a category is
+allowed (a long pipeline might have several `active` statuses), though a
+missing `handoff` or a duplicated single-instance category raises a
+non-fatal warning.
+
+</Callout>
+
+## See also
+
+- [Workflows](/docs/concepts/workflows) — how workflows reference these
+  statuses and the category model in depth.
+- [Workflow config](/docs/configuration/workflow) — the reference-only
+  status form that pairs with this catalog.
