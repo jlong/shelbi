@@ -30,7 +30,7 @@ lives in code until `shelbi workflow new` or `edit` writes a file — see
 name: default
 description: standard one-track flow
 
-# Reference-only statuses: name + category come from statuses.yml.
+# Reference-only statuses: name + category come from statuses.yaml.
 statuses:
   - { id: backlog,     owner: user,  agent: orchestrator }
   - { id: todo,        owner: agent, agent: orchestrator }
@@ -62,7 +62,7 @@ transitions:
 Since [#197](https://github.com/jlong/shelbi/pull/197), a workflow status
 entry carries **only** `id`, `owner`, and optional `agent`. The display
 `name` and `category` are declared once in
-[`statuses.yml`](/docs/configuration/statuses) — repeating an inline
+[`statuses.yaml`](/docs/configuration/statuses) — repeating an inline
 `name:` or `category:` here fails the load. This keeps identity from
 drifting across workflows.
 
@@ -70,7 +70,7 @@ drifting across workflows.
 
 | Field | Type | Required | Default | Description |
 | --- | --- | --- | --- | --- |
-| `id` | string | yes | — | Stable id, declared in [`statuses.yml`](/docs/configuration/statuses). Conventionally lowercase kebab-case. |
+| `id` | string | yes | — | Stable id, declared in [`statuses.yaml`](/docs/configuration/statuses). Conventionally lowercase kebab-case. |
 | `owner` | `user` \| `agent` | yes | — | Who moves the task next when automation is off. `agent` makes it eligible for auto-dispatch; `user` waits. |
 | `agent` | string | no | derived from category | Which agent runs this status under automation. Defaults to `developer` for `active` and `orchestrator` for `ready` when omitted. `None` means no automation path. |
 
@@ -151,7 +151,7 @@ zen:
 
 - [Workflows](/docs/guides/getting-started/workflows) — owners, categories, the
   transition model, and worked examples.
-- [Statuses](/docs/configuration/statuses) — the `statuses.yml` catalog
+- [Statuses](/docs/configuration/statuses) — the `statuses.yaml` catalog
   that supplies each status's `name` and `category`.
 - [`shelbi workflow`](/docs/cli/workflow) — list, show, scaffold, and
   edit workflow files.

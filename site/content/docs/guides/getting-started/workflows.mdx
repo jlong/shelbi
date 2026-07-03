@@ -33,12 +33,12 @@ Workflow files live at
 
 A workflow is split across **two files**. Status *identity* — the stable
 `id`, the display `name`, and the `category` — is declared once in
-`workflows/statuses.yml`, the project-wide status catalog. Each workflow
+`workflows/statuses.yaml`, the project-wide status catalog. Each workflow
 file then **references** statuses by `id` and adds only what's
 workflow-specific: the `owner`, and an optional `agent:`.
 
 ```yaml
-# ~/.shelbi/projects/<project>/workflows/statuses.yml
+# ~/.shelbi/projects/<project>/workflows/statuses.yaml
 # The status catalog: identity lives here, once, shared by every workflow.
 statuses:
   - { id: backlog,     name: Backlog,     category: backlog }
@@ -53,7 +53,7 @@ statuses:
 name: default
 description: The standard one-track flow shipped with every project.
 
-# Reference statuses by id. name/category come from statuses.yml and are
+# Reference statuses by id. name/category come from statuses.yaml and are
 # never repeated here — a workflow file adds only owner (+ optional agent).
 statuses:
   - { id: backlog,     owner: user,  agent: orchestrator }
@@ -89,7 +89,7 @@ statuses:
 Why two files? A status's identity is project-wide, but its automation
 differs per workflow — the same `review` status can be owned by a human in
 one workflow and handled by a `qa` agent in another. Declaring `name` and
-`category` once in `statuses.yml` keeps those facts from drifting between
+`category` once in `statuses.yaml` keeps those facts from drifting between
 workflow files; the loader **rejects** a workflow that repeats `name:` or
 `category:` inline, or that references an `id` the catalog doesn't declare.
 
@@ -98,7 +98,7 @@ else is optional. A workflow without `transitions:` is a pure
 bookkeeping workflow — no git side-effects fire on any move.
 
 Validation runs at load time and catches status ids not declared in
-`statuses.yml`, duplicate status ids, `initial_status` pointing at
+`statuses.yaml`, duplicate status ids, `initial_status` pointing at
 nothing, transition edges referencing undeclared statuses, and the
 [`owner`/`agent` rules](#validation-rules) covered below. The error
 message names the workflow and the bad field.
@@ -143,7 +143,7 @@ Each status declares two things about who handles it — one required, one
 optional:
 
 ```yaml
-# workflow file — reference-only; name/category come from statuses.yml
+# workflow file — reference-only; name/category come from statuses.yaml
 statuses:
   - { id: todo,        owner: agent, agent: orchestrator }
   - { id: in-progress, owner: agent, agent: developer }
@@ -180,7 +180,7 @@ instead of a paragraph of orchestrator prompt.
 The loader enforces these rules, failing the load with a message that
 names the workflow and status:
 
-1. **Every `id` must be declared in `statuses.yml`.** A workflow
+1. **Every `id` must be declared in `statuses.yaml`.** A workflow
    references statuses by id; an id the catalog doesn't know about (a typo,
    a status you forgot to add) fails the load, and the error lists the
    available ids. Repeating an inline `name:` or `category:` in a workflow
@@ -475,7 +475,7 @@ want).
 Every new project ships with `workflows/default.yaml`:
 
 ```yaml
-# workflows/default.yaml — references statuses.yml (see Schema above)
+# workflows/default.yaml — references statuses.yaml (see Schema above)
 name: default
 description: The standard one-track flow shipped with every project.
 
@@ -488,7 +488,7 @@ statuses:
 ```
 
 This makes the default an editable file rather than implicit behavior
-— you can rename `Todo` to `Ready` in `statuses.yml` without breaking
+— you can rename `Todo` to `Ready` in `statuses.yaml` without breaking
 anything, since the rest of the system reasons in categories.
 
 If a project has no `workflows/` directory at all (legacy state),

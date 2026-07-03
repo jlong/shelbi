@@ -34,7 +34,7 @@ the other three guides are described as deltas from it.
 <Callout type="note" title="Statuses are defined once, referenced by id">
 
 Every guide shows two YAML shapes. Status *identity* — `id`, `name`, and
-`category` — is declared once in `workflows/statuses.yml`, the
+`category` — is declared once in `workflows/statuses.yaml`, the
 project-wide status catalog. Each workflow file **references** statuses by
 `id` and adds only its `owner` and optional `agent:`; it never repeats
 `name:` or `category:` (the loader rejects a workflow that does). See

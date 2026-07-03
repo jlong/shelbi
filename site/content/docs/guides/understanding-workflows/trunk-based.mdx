@@ -82,12 +82,12 @@ the moment checks pass and Zen clears the bar.
 ## The workflow
 
 Trunk-based reuses the shipped [status catalog](/docs/guides/getting-started/workflows#schema)
-(`workflows/statuses.yml`) — it just leaves the `review` status out of the
+(`workflows/statuses.yaml`) — it just leaves the `review` status out of the
 flow. Identity (`name`, `category`) stays in the catalog; the workflow
 references statuses by `id` and adds only `owner` and `agent:`:
 
 ```yaml
-# workflows/trunk.yaml — reference-only (identity lives in statuses.yml)
+# workflows/trunk.yaml — reference-only (identity lives in statuses.yaml)
 name: trunk
 description: Trunk-based — short-lived branches, merge to main on green.
 

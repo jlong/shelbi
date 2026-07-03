@@ -85,10 +85,10 @@ in **Sign-off** for a maintainer to accept before it's **Merged**.
 The forking flow relabels the whole board, so declare its statuses (`id`
 + `name` + `category`) in the project's
 [status catalog](/docs/guides/getting-started/workflows#schema) first —
-`workflows/statuses.yml` — then reference them by `id` from the workflow:
+`workflows/statuses.yaml` — then reference them by `id` from the workflow:
 
 ```yaml
-# workflows/statuses.yml — the forking project's status catalog.
+# workflows/statuses.yaml — the forking project's status catalog.
 statuses:
   - { id: incoming,  name: Incoming,  category: backlog }
   - { id: triage,    name: Triage,    category: ready }
@@ -101,7 +101,7 @@ statuses:
 ## The workflow
 
 ```yaml
-# workflows/contribution.yaml — reference-only; identity lives in statuses.yml
+# workflows/contribution.yaml — reference-only; identity lives in statuses.yaml
 name: contribution
 description: Forking flow — review gate for pull requests from forks.
 

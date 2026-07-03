@@ -86,14 +86,14 @@ separate `release` task.
 
 Status identity lives once in the project's
 [status catalog](/docs/guides/getting-started/workflows#schema),
-`workflows/statuses.yml`. Git-flow adds one status the shipped defaults
+`workflows/statuses.yaml`. Git-flow adds one status the shipped defaults
 don't have — `on-develop`, the done-category landing for feature work
 that's merged into `develop` but not yet released — plus `staging` and
 `released` for the release workflow below. Declare them (`id` + `name` +
 `category`) in the catalog first, then reference them by `id`:
 
 ```yaml
-# workflows/statuses.yml — git-flow statuses alongside the defaults.
+# workflows/statuses.yaml — git-flow statuses alongside the defaults.
 statuses:
   # shipped defaults
   - { id: backlog,     name: Backlog,     category: backlog }
@@ -110,7 +110,7 @@ statuses:
 ## The feature workflow
 
 ```yaml
-# workflows/feature.yaml — reference-only; identity lives in statuses.yml
+# workflows/feature.yaml — reference-only; identity lives in statuses.yaml
 name: feature
 description: Git-flow feature — branch off develop, merge back into develop.
 
@@ -153,7 +153,7 @@ A release task PRs the accumulated `develop` into `main`. Pre-fill its
 [directly instead of cutting a new branch](/docs/guides/getting-started/workflows#the-branch-task-field):
 
 ```yaml
-# workflows/release.yaml — reference-only; identity lives in statuses.yml
+# workflows/release.yaml — reference-only; identity lives in statuses.yaml
 name: release
 description: Git-flow release — PR develop into main and tag.
 
