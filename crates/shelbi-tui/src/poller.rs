@@ -667,7 +667,7 @@ fn maybe_promote_to_review(
 /// blocks the calling review promotion — failures here are advisory.
 ///
 /// `branch` falls back to the conventional `shelbi/<task-id>` when the task
-/// frontmatter doesn't pin one explicitly; that mirrors `start_review`.
+/// frontmatter doesn't pin one explicitly; that mirrors the review-load path.
 fn rebase_workspace_branch_before_review(
     project: &Project,
     workspace: &shelbi_core::WorkspaceSpec,
