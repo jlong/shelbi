@@ -293,7 +293,7 @@ fn render_list(f: &mut Frame, app: &ReviewApp, area: Rect) {
         .border_style(Style::default().fg(Color::DarkGray));
     let list = List::new(items).block(block).highlight_style(
         Style::default()
-            .bg(Color::Blue)
+            .bg(crate::theme::SELECTION_BG)
             .fg(Color::White)
             .add_modifier(Modifier::BOLD),
     );

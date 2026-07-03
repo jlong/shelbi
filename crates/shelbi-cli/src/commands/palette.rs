@@ -351,7 +351,7 @@ fn render(f: &mut Frame, state: &State, results: &[(Entry, u16)]) {
 
     let list = List::new(items).highlight_style(
         Style::default()
-            .bg(Color::Blue)
+            .bg(shelbi_tui::theme::SELECTION_BG)
             .fg(Color::White)
             .add_modifier(Modifier::BOLD),
     );
@@ -876,7 +876,7 @@ fn render_project_picker(
 
     let list = List::new(items).highlight_style(
         Style::default()
-            .bg(Color::Blue)
+            .bg(shelbi_tui::theme::SELECTION_BG)
             .fg(Color::White)
             .add_modifier(Modifier::BOLD),
     );
@@ -1160,14 +1160,14 @@ fn render_quit_project_confirm(
 }
 
 // Destructive button gets the red tint when focused; the cancel
-// button gets the standard blue highlight. Unfocused buttons
+// button gets the shared selection-gray highlight. Unfocused buttons
 // render dim so the focused option is unambiguous at a glance.
 fn render_confirm_buttons(f: &mut Frame, area: Rect, quit_label: &str, focus_quit: bool) {
     let cancel_style = if focus_quit {
         Style::default().fg(Color::DarkGray)
     } else {
         Style::default()
-            .bg(Color::Blue)
+            .bg(shelbi_tui::theme::SELECTION_BG)
             .fg(Color::White)
             .add_modifier(Modifier::BOLD)
     };

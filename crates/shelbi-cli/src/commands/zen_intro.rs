@@ -165,7 +165,7 @@ pub fn render_intro(f: &mut Frame, area: Rect, state: &IntroState) {
 
     let cancel_style = if state.focus == IntroFocus::Cancel {
         Style::default()
-            .bg(Color::Blue)
+            .bg(shelbi_tui::theme::SELECTION_BG)
             .fg(Color::White)
             .add_modifier(Modifier::BOLD)
     } else {
