@@ -128,6 +128,14 @@ For a diff-only review (no server), emit the same event with
 `review_ready=true` and no `url` — the board shows the task loaded but not
 serving.
 
+**Loaded marker.** In addition to the socket event, write a file marker the
+hub watches for — the durable, UI-proof handoff signal (the socket event can
+be missed; a file can't be clobbered by an OSC title write). Your dispatch
+prompt gives you the exact path (`.claude/shelbi-review-loaded`) and the
+atomic `printf … > …tmp && mv …tmp …` write to use. Its body is the task id
+followed by the serving URL (omit the URL for a diff-only review). Write it
+once, when you're serving (or have determined the review is diff-only).
+
 **Retry policy.** If the write fails, wait 500ms and retry once. If it
 still fails, continue — the orchestrator reconciles missed signals from
 hub-side state. Keep the `line` body to a single line of space-separated

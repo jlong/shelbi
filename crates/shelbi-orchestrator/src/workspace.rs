@@ -159,6 +159,100 @@ pub fn clear_review_marker(host: &Host, marker: &Path) -> Result<()> {
     Ok(())
 }
 
+/// The review-*loaded* file marker for a review workspace:
+/// `<worktree>/.claude/shelbi-review-loaded`.
+///
+/// Distinct from [`workspace_review_marker`] (the dev workspace's
+/// review-*ready* handoff). A *review* workspace writes THIS marker once it
+/// has loaded the task's branch and booted its dev server — its body carries
+/// the task id it loaded plus the URL a human can open (the URL is absent for
+/// a diff-only review where nothing runnable was detected). The hub reads it
+/// to surface "loaded at <url>" on the board and clears it when the review
+/// workspace is reused, exactly as it does the ready marker.
+///
+/// It lives under `.claude/` for the same reason as the ready marker: that
+/// directory is shelbi's gitignored deploy footprint, so the marker never
+/// dirties the worktree between tasks and never trips a clean-worktree check.
+pub fn workspace_review_loaded_marker(machine: &Machine, workspace: &WorkspaceSpec) -> PathBuf {
+    workspace_worktree(machine, workspace)
+        .join(".claude")
+        .join("shelbi-review-loaded")
+}
+
+/// Parsed body of a review-loaded marker: the task id the review workspace
+/// loaded and the URL it is serving (`None` for a diff-only review).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReviewLoaded {
+    pub task_id: String,
+    pub url: Option<String>,
+}
+
+/// Read the review-loaded marker, returning the task id + optional serving
+/// URL the review workspace wrote, or `None` if the marker is absent or
+/// empty. Mirrors [`read_review_marker`]: routes `cat` through `shelbi-ssh`
+/// (a no-op for [`Host::Local`]) and validates the task id against
+/// [`validate_task_id`], so a torn or hostile body surfaces as an `Err`
+/// (which the poller logs and does NOT clear on — preserving the signal for
+/// the next tick) rather than driving a board update off garbage.
+///
+/// Body contract: a single line, `<task-id>` optionally followed by
+/// whitespace and the URL (`fix-login http://host:3000`). A bare `<task-id>`
+/// with no URL is a valid diff-only load. Only the first line is read so a
+/// multi-line body can't tear across downstream log records.
+pub fn read_review_loaded_marker(host: &Host, marker: &Path) -> Result<Option<ReviewLoaded>> {
+    let path = marker.to_string_lossy().into_owned();
+    let out = shelbi_ssh::run(host, ["cat", path.as_str()]).map_err(Error::Io)?;
+    if !out.status.success() {
+        // Missing file → cat exits non-zero. Not an error: the review
+        // workspace simply hasn't finished loading yet.
+        return Ok(None);
+    }
+    let content = String::from_utf8_lossy(&out.stdout);
+    let first = content.lines().next().unwrap_or("").trim();
+    if first.is_empty() {
+        return Ok(None);
+    }
+    let mut parts = first.splitn(2, char::is_whitespace);
+    let task_id = parts.next().unwrap_or("").trim();
+    validate_task_id(task_id).map_err(|_| {
+        Error::Other(format!(
+            "review-loaded marker at {path} holds an invalid task id ({task_id:?}); \
+             leaving it in place"
+        ))
+    })?;
+    let url = parts
+        .next()
+        .map(str::trim)
+        .filter(|u| !u.is_empty())
+        .map(str::to_string);
+    Ok(Some(ReviewLoaded { task_id: task_id.to_string(), url }))
+}
+
+/// Remove the review-loaded marker (idempotent). The `rm -f` is identical to
+/// [`clear_review_marker`]'s; kept as a distinct name so call sites read as
+/// loaded-vs-ready explicitly.
+pub fn clear_review_loaded_marker(host: &Host, marker: &Path) -> Result<()> {
+    clear_review_marker(host, marker)
+}
+
+/// Deterministic dev-server port for a review workspace:
+/// `review.base_port + index * review.port_stride`, where `index` is the
+/// workspace's position among its machine's review workspaces (declaration
+/// order — see [`Project::review_workspaces`]). With the defaults that's
+/// review-1→3000, review-2→3010.
+///
+/// Returns `None` when `workspace` isn't a review workspace on its machine,
+/// so a dev workspace can never be handed a review port by accident.
+/// Saturating arithmetic keeps a pathological config from panicking; the
+/// per-machine cap ([`shelbi_core::MAX_REVIEW_WORKSPACES_PER_MACHINE`]) means
+/// real indices are only 0 or 1.
+pub fn review_workspace_port(project: &Project, workspace: &WorkspaceSpec) -> Option<u16> {
+    let reviews = project.review_workspaces(&workspace.machine);
+    let index = reviews.iter().position(|w| w.name == workspace.name)?;
+    let offset = (index as u16).saturating_mul(project.review.port_stride);
+    Some(project.review.base_port.saturating_add(offset))
+}
+
 /// Outcome of [`rebase_workspace_branch_onto_default`]. Pure data — the caller
 /// decides what to log and whether to surface a warning to the user. We
 /// distinguish "rebase wasn't needed" from "rebase succeeded" so the
@@ -583,6 +677,159 @@ pub fn start_workspace_on_task(spec: StartSpec<'_>) -> Result<TmuxAddr> {
         return Err(e);
     }
 
+    // 2–7. Deploy the agent context, reset the pane, launch the runner, wait
+    //       for readiness, and send the loop-closing dev prompt. Dev
+    //       workspaces inject no `PORT` (that's a review-workspace concern).
+    let prompt = compose_prompt(
+        spec.task_id,
+        spec.branch,
+        spec.task_body,
+        &marker,
+        &spec.project.default_branch,
+        &spec.project.name,
+        shelbi_agent::polls_for_messages(&runner),
+    );
+    deploy_and_spawn(SpawnArgs {
+        project: spec.project,
+        workspace: spec.workspace,
+        runner: &runner,
+        host: &host,
+        worktree: &worktree,
+        addr: &addr,
+        task_id: spec.task_id,
+        agent: spec.agent,
+        port: None,
+        prompt: &prompt,
+    })?;
+
+    Ok(addr)
+}
+
+/// Load `spec.branch` onto a **review** workspace and start the `review`
+/// agent there to serve it for a human. The review sibling of
+/// [`start_workspace_on_task`]:
+///
+/// - the branch is *moved* onto the review worktree — released from whatever
+///   dev worktree produced it, then checked out here. It already exists (a
+///   developer cut + committed it), so there's no fresh cut; the machine's
+///   top-level clone is never touched (see
+///   [`crate::review::move_branch_to_review_worktree`]).
+/// - a deterministic `PORT` ([`review_workspace_port`]) is injected into the
+///   pane so the review agent's dev server binds a slot that won't collide
+///   with a concurrent review workspace on the same machine.
+/// - the pane runs the `review` agent (its whole job is loading a branch for
+///   a human), unless the caller pins `spec.agent` explicitly (tests).
+///
+/// The review workspace hands off by writing the *loaded* marker
+/// ([`workspace_review_loaded_marker`]) — distinct from the dev review-ready
+/// marker; we clear any stale one before reuse, mirroring the dev path.
+///
+/// Booting the server itself is Phase 4; this gets the review agent running
+/// on the review worktree with the right `PORT` and the loaded-marker
+/// contract.
+pub fn load_review_workspace(spec: StartSpec<'_>) -> Result<TmuxAddr> {
+    let machine = spec
+        .project
+        .machine(&spec.workspace.machine)
+        .ok_or_else(|| Error::UnknownMachine(spec.workspace.machine.clone()))?
+        .clone();
+    let runner = spec
+        .project
+        .runner(&spec.workspace.runner)
+        .ok_or_else(|| Error::UnknownRunner(spec.workspace.runner.clone()))?
+        .clone();
+
+    let host = machine.host();
+    let worktree = workspace_worktree(&machine, spec.workspace);
+    let addr = workspace_tmux_addr(spec.project, spec.workspace)?;
+
+    // Serialize against any concurrent start for the same workspace — same
+    // rationale as the dev path.
+    let _dispatch_lock = shelbi_state::lock_workspace(&spec.project.name, &spec.workspace.name)?;
+
+    require_auto_mode_supported(&host, &runner, &spec.project.workspace_permissions_mode)?;
+
+    // Clear any stale loaded marker from a previous task before the worktree
+    // is reused, so the hub can't read an old URL. Best-effort.
+    let loaded_marker = workspace_review_loaded_marker(&machine, spec.workspace);
+    let _ = clear_review_loaded_marker(&host, &loaded_marker);
+
+    // 1. Move the branch onto the review worktree (release it from the dev
+    //    worktree that produced it, then check it out here). A failure here
+    //    aborts before any pane is touched — surface it in events.log so the
+    //    stall is visible, not just to the CLI caller.
+    if let Err(e) = sync_review_worktree(spec.project, &host, &machine, &worktree, spec.branch) {
+        if let Err(log_err) = shelbi_state::append_dispatch_event(
+            spec.task_id,
+            &spec.workspace.name,
+            "sync-failed",
+            &e.to_string(),
+        ) {
+            eprintln!("shelbi: failed to record review-load sync failure in events.log: {log_err}");
+        }
+        return Err(e);
+    }
+
+    // Deterministic dev-server port for this review slot. `None` only if the
+    // workspace isn't actually a review workspace on its machine — in which
+    // case no PORT is injected (the pane still comes up).
+    let port = review_workspace_port(spec.project, spec.workspace);
+
+    // Loading a branch for a human is the review role's whole job, so force
+    // the `review` agent unless the caller pinned one explicitly.
+    let agent = spec.agent.or(Some(shelbi_state::REVIEW_AGENT));
+
+    let prompt = compose_review_load_prompt(
+        spec.task_id,
+        spec.branch,
+        spec.task_body,
+        &loaded_marker,
+        port,
+    );
+    deploy_and_spawn(SpawnArgs {
+        project: spec.project,
+        workspace: spec.workspace,
+        runner: &runner,
+        host: &host,
+        worktree: &worktree,
+        addr: &addr,
+        task_id: spec.task_id,
+        agent,
+        port,
+        prompt: &prompt,
+    })?;
+
+    Ok(addr)
+}
+
+/// Inputs to [`deploy_and_spawn`] — the shared spawn tail for both the dev
+/// ([`start_workspace_on_task`]) and review ([`load_review_workspace`])
+/// dispatch paths. The callers differ only in how they prepare the worktree
+/// (branch cut vs. branch move), which marker they clear, the `port` they
+/// inject, and the `prompt` they send.
+struct SpawnArgs<'a> {
+    project: &'a Project,
+    workspace: &'a WorkspaceSpec,
+    runner: &'a shelbi_core::AgentRunnerSpec,
+    host: &'a Host,
+    worktree: &'a Path,
+    addr: &'a TmuxAddr,
+    task_id: &'a str,
+    /// Agent whose context is deployed + wired as the runner's system
+    /// prompt. `None` skips the agent-context deploy (embed tests).
+    agent: Option<&'a str>,
+    /// Injected as `PORT` into the pane env when `Some` (review workspaces).
+    port: Option<u16>,
+    prompt: &'a str,
+}
+
+/// Steps 2–7 shared by both dispatch paths: deploy the agent's settings +
+/// context, reset the pane, launch the runner, wait for the input box, send
+/// `prompt`, and confirm submission. Returns `Ok(())` once submission is
+/// confirmed; a readiness timeout or lost prompt records an actionable
+/// dispatch event and returns `Err`, so the caller can leave the task put
+/// for a retry.
+fn deploy_and_spawn(a: SpawnArgs<'_>) -> Result<()> {
     // 2. Drop a rendered .claude/settings.json into the worktree so the
     //    runner picks up shelbi's window-title hooks (idle/working/blocked)
     //    and the per-task message-tail hooks (Phase 7 push delivery).
@@ -590,26 +837,25 @@ pub fn start_workspace_on_task(spec: StartSpec<'_>) -> Result<TmuxAddr> {
     //    present so role-specific hook customization actually takes effect
     //    on the worktree's Claude Code session; fall back to the
     //    project-wide template otherwise. Overwrite is fine — this is the
-    //    entire on-workspace footprint and we re-render it on every task
-    //    start.
-    let rendered = render_workspace_settings_preferring_agent(spec.project, spec.agent)?;
-    deploy_workspace_settings(&host, &worktree, &rendered)?;
+    //    entire on-workspace footprint and we re-render it on every start.
+    let rendered = render_workspace_settings_preferring_agent(a.project, a.agent)?;
+    deploy_workspace_settings(a.host, a.worktree, &rendered)?;
 
     // 2b. Deploy the dispatched agent's `instructions.md` + skills into the
     //     worktree's `.claude/` footprint. The instructions file becomes the
-    //     runner's `--append-system-prompt` source (see step 5 below); the
-    //     skills directory is wiped and re-mounted from
-    //     `agents/<agent>/skills/` so consecutive dispatches with different
-    //     agents on the same workspace don't accumulate skills from earlier
-    //     runs. Skipped entirely when `agent` is `None` (e.g. an embed test
-    //     that exercises the spawn path without resolving an agent).
-    if let Some(agent) = spec.agent {
-        deploy_agent_context(&host, &worktree, &spec.project.name, agent)?;
+    //     runner's `--append-system-prompt` source (see step 4); the skills
+    //     directory is wiped and re-mounted from `agents/<agent>/skills/` so
+    //     consecutive dispatches with different agents on the same workspace
+    //     don't accumulate skills from earlier runs. Skipped when `agent` is
+    //     `None` (e.g. an embed test that exercises the spawn path without
+    //     resolving an agent).
+    if let Some(agent) = a.agent {
+        deploy_agent_context(a.host, a.worktree, &a.project.name, agent)?;
     }
 
     // 3. Reset the tmux pane — that's how we clear context. If it doesn't
     //    exist yet, this is a no-op; otherwise the next step recreates it.
-    kill_workspace_pane(&host, &addr, &spec.workspace.name)?;
+    kill_workspace_pane(a.host, a.addr, &a.workspace.name)?;
 
     // Inject `--permission-mode <mode>` directly on the claude command line
     // rather than trusting the rendered `.claude/settings.json` to take effect.
@@ -617,11 +863,11 @@ pub fn start_workspace_on_task(spec: StartSpec<'_>) -> Result<TmuxAddr> {
     // I/O race or version regression) — the CLI flag is authoritative and
     // belongs to the spawn path, where we already know the project's mode.
     let runner_with_mode =
-        shelbi_agent::with_permission_mode(&runner, &spec.project.workspace_permissions_mode);
+        shelbi_agent::with_permission_mode(a.runner, &a.project.workspace_permissions_mode);
     let launch = with_agent_system_prompt(
         &shelbi_agent::launch_command(&runner_with_mode),
-        spec.agent.map(|_| WORKTREE_AGENT_INSTRUCTIONS_REL),
-        &runner,
+        a.agent.map(|_| WORKTREE_AGENT_INSTRUCTIONS_REL),
+        a.runner,
     );
 
     // 4 + 5. Create the pane and launch the agent.
@@ -652,33 +898,34 @@ pub fn start_workspace_on_task(spec: StartSpec<'_>) -> Result<TmuxAddr> {
     //   it spawns) inherits a stripped-down PATH missing Homebrew, asdf,
     //   nvm, etc. The login shell sources ~/.zprofile / ~/.bash_profile
     //   and picks up the same PATH the user has in their own terminal.
-    match &host {
+    match a.host {
         Host::Local => {
             let shelbi_bin = current_exe_string()?;
             let pane_cmd = format!(
                 "{bin} --project {proj} open {ws} --as-pane",
                 bin = shelbi_agent::shell_escape(&shelbi_bin),
-                proj = shelbi_agent::shell_escape(&spec.project.name),
-                ws = shelbi_agent::shell_escape(&spec.workspace.name),
+                proj = shelbi_agent::shell_escape(&a.project.name),
+                ws = shelbi_agent::shell_escape(&a.workspace.name),
             );
             let hub_sock = shelbi_state::hub_socket_path()
                 .map_err(|e| Error::Other(format!("resolving hub socket path: {e}")))?;
-            let create_new_session = !shelbi_tmux::has_session(&host, &addr.session)?;
+            let create_new_session = !shelbi_tmux::has_session(a.host, &a.addr.session)?;
             let argv = local_pane_tmux_argv(LocalPaneTmuxArgs {
                 create_new_session,
-                session: &addr.session,
-                window: &addr.window,
-                task_id: spec.task_id,
-                project: &spec.project.name,
+                session: &a.addr.session,
+                window: &a.addr.window,
+                task_id: a.task_id,
+                project: &a.project.name,
                 hub_sock: &hub_sock.to_string_lossy(),
                 pane_cmd: &pane_cmd,
+                port: a.port,
             });
-            shelbi_ssh::run_capture(&host, &argv)?;
+            shelbi_ssh::run_capture(a.host, &argv)?;
         }
         Host::Ssh { .. } => {
-            shelbi_tmux::new_session(&host, &addr.session, &addr.window, None)?;
-            let cd_launch = remote_cd_launch(&worktree, &launch);
-            shelbi_tmux::send_line(&host, &addr, &cd_launch)?;
+            shelbi_tmux::new_session(a.host, &a.addr.session, &a.addr.window, None)?;
+            let cd_launch = remote_cd_launch(a.worktree, &launch, a.port);
+            shelbi_tmux::send_line(a.host, a.addr, &cd_launch)?;
         }
     }
 
@@ -695,10 +942,10 @@ pub fn start_workspace_on_task(spec: StartSpec<'_>) -> Result<TmuxAddr> {
     //    alpha). Instead we abort the dispatch cleanly: record an actionable
     //    event and return an error so the caller leaves the task in its
     //    ready-category column for a clean retry.
-    if !crate::ready::wait_for_claude_ready(&host, &addr, crate::ready::READY_TIMEOUT)? {
+    if !crate::ready::wait_for_claude_ready(a.host, a.addr, crate::ready::READY_TIMEOUT)? {
         if let Err(e) = shelbi_state::append_dispatch_event(
-            spec.task_id,
-            &spec.workspace.name,
+            a.task_id,
+            &a.workspace.name,
             "readiness-timeout",
             "input box not ready",
         ) {
@@ -707,21 +954,12 @@ pub fn start_workspace_on_task(spec: StartSpec<'_>) -> Result<TmuxAddr> {
         return Err(Error::Other(format!(
             "claude readiness probe timed out after {}s on {} — dispatch aborted, \
              prompt NOT sent so the task stays put for retry. Check the workspace \
-             pane, then re-run `shelbi task start`.",
+             pane, then re-run the dispatch.",
             crate::ready::READY_TIMEOUT.as_secs(),
-            addr.target(),
+            a.addr.target(),
         )));
     }
-    let prompt = compose_prompt(
-        spec.task_id,
-        spec.branch,
-        spec.task_body,
-        &marker,
-        &spec.project.default_branch,
-        &spec.project.name,
-        shelbi_agent::polls_for_messages(&runner),
-    );
-    shelbi_tmux::send_line(&host, &addr, &prompt)?;
+    shelbi_tmux::send_line(a.host, a.addr, a.prompt)?;
 
     // 7. Verify the prompt actually got submitted, not just typed into the
     //    input box. claude's `UserPromptSubmit` hook (see workspace settings
@@ -737,16 +975,16 @@ pub fn start_workspace_on_task(spec: StartSpec<'_>) -> Result<TmuxAddr> {
     //    in its ready-category column, exactly like a readiness timeout,
     //    instead of moving it to `in_progress` on a workspace that never got
     //    the prompt.
-    if !confirm_prompt_submitted(&host, &addr, spec.task_id, &spec.workspace.name, &prompt) {
+    if !confirm_prompt_submitted(a.host, a.addr, a.task_id, &a.workspace.name, a.prompt) {
         return Err(Error::Other(format!(
             "prompt was not accepted on {} — no submission signal after a retry \
              Enter. Dispatch aborted so the task stays put for retry; check the \
              workspace pane.",
-            addr.target(),
+            a.addr.target(),
         )));
     }
 
-    Ok(addr)
+    Ok(())
 }
 
 /// How long to wait, per attempt, for proof the prompt got submitted (pane
@@ -1428,11 +1666,15 @@ struct LocalPaneTmuxArgs<'a> {
     task_id: &'a str,
     project: &'a str,
     hub_sock: &'a str,
+    /// Deterministic dev-server port for a review workspace, injected as
+    /// `PORT` into the pane env. `None` on the dev path (no `PORT`).
+    port: Option<u16>,
     pane_cmd: &'a str,
 }
 
 /// Build the tmux argv for the local dispatch path. Injects
-/// `TASK_ID` / `PROJECT` / `SHELBI_HUB_SOCK` via tmux `-e` so the pane
+/// `TASK_ID` / `PROJECT` / `SHELBI_HUB_SOCK` (and `PORT` for a review
+/// workspace) via tmux `-e` so the pane
 /// wrapper inherits them regardless of when the caller's state save
 /// lands — the caller writes `assigned_to` / `column=in_progress`
 /// AFTER `start_workspace_on_task` returns, so a state lookup at
@@ -1471,6 +1713,13 @@ fn local_pane_tmux_argv(a: LocalPaneTmuxArgs<'_>) -> Vec<String> {
     argv.push(project_env);
     argv.push("-e".into());
     argv.push(hub_env);
+    // Review workspaces pin a deterministic dev-server PORT so the review
+    // agent binds a slot that won't collide with a concurrent review
+    // workspace. Dev workspaces pass `None` and get no PORT.
+    if let Some(port) = a.port {
+        argv.push("-e".into());
+        argv.push(format!("PORT={port}"));
+    }
     // The pane command runs through `sh -c` so tmux picks up the user's
     // PATH from the tmux server's existing env (Homebrew, asdf, etc).
     argv.push("sh".into());
@@ -1482,11 +1731,17 @@ fn local_pane_tmux_argv(a: LocalPaneTmuxArgs<'_>) -> Vec<String> {
 /// We park the assignment immediately before `exec` so it scopes to the
 /// agent process (the surrounding `$SHELL -lc` strips its own
 /// environment otherwise — env-prefix-before-exec is the POSIX idiom
-/// for "set var for THIS command only and inherit it").
-fn remote_cd_launch(worktree: &Path, launch: &str) -> String {
+/// for "set var for THIS command only and inherit it"). `port`, when
+/// `Some`, is injected as `PORT` in the same env prefix (review
+/// workspaces); dev workspaces pass `None`.
+fn remote_cd_launch(worktree: &Path, launch: &str, port: Option<u16>) -> String {
     let sock = shelbi_state::remote_hub_socket_path();
+    let port_env = match port {
+        Some(p) => format!("PORT={p} "),
+        None => String::new(),
+    };
     format!(
-        "cd {wd} && LANG=C.UTF-8 SHELBI_HUB_SOCK={sock} exec \"${{SHELL:-/bin/bash}}\" -lc {launch}",
+        "cd {wd} && LANG=C.UTF-8 {port_env}SHELBI_HUB_SOCK={sock} exec \"${{SHELL:-/bin/bash}}\" -lc {launch}",
         wd = shelbi_agent::shell_escape(&worktree.to_string_lossy()),
         sock = shelbi_agent::shell_escape(&sock.to_string_lossy()),
         launch = shelbi_agent::shell_escape(launch),
@@ -1720,6 +1975,76 @@ fn message_polling_section(task_id: &str, project: &str, id_esc: &str) -> String
     )
 }
 
+/// Build the initial prompt for a review-*load* dispatch. The heavy "how to
+/// install / serve / auto-detect" guidance lives in the review agent's
+/// `instructions.md` (its system prompt) plus the bundled
+/// `load-run-detection` skill; this prompt carries only the per-task
+/// context: the branch under review, the `PORT` this slot must bind, and the
+/// loaded-marker contract the hub watches for.
+///
+/// Mirrors [`compose_prompt`]'s handoff mechanics — a sibling temp file +
+/// atomic `mv` so the hub never `cat`s a half-written marker — but the body
+/// carries `<task-id> <url>` (the URL absent for a diff-only review) rather
+/// than a bare task id, and there's no rebase step (the branch is loaded
+/// as-is for a human to run).
+fn compose_review_load_prompt(
+    task_id: &str,
+    branch: &str,
+    body: &str,
+    loaded_marker: &Path,
+    port: Option<u16>,
+) -> String {
+    let trimmed = body.trim();
+    let body_section = if trimmed.is_empty() {
+        format!("# Task {task_id}\n")
+    } else {
+        trimmed.to_string()
+    };
+    let id_esc = shelbi_agent::shell_escape(task_id);
+    let marker_esc = shelbi_agent::shell_escape(&loaded_marker.to_string_lossy());
+    // Sibling temp file + `mv` so the hub never reads a torn marker — same
+    // atomic-rename trick the dev review-ready handoff uses.
+    let marker_tmp = {
+        let mut s = loaded_marker.as_os_str().to_owned();
+        s.push(".tmp");
+        PathBuf::from(s)
+    };
+    let marker_tmp_esc = shelbi_agent::shell_escape(&marker_tmp.to_string_lossy());
+    let port_line = match port {
+        Some(p) => format!(
+            "Your assigned dev-server port is **{p}**, also exported as `PORT` in \
+             this pane's environment. Always bind the server to `$PORT` — never a \
+             hardcoded port — so concurrent review workspaces don't collide.\n\
+             \n"
+        ),
+        None => String::new(),
+    };
+    format!(
+        "{body_section}\n\n\
+         ---\n\
+         You are loading task `{task_id}` (branch `{branch}`) onto this review \
+         workspace for a human to run. The branch is already checked out in this \
+         worktree. Follow your review instructions — install, build, and serve \
+         it; do NOT modify code.\n\
+         \n\
+         {port_line}\
+         When the app is serving (or you've determined this is a diff-only \
+         review with nothing runnable), write the loaded marker so the hub knows \
+         you're ready. Its body is the task id followed by the URL you're serving. \
+         Write atomically, filling in the URL you booted:\n\
+         \n\
+         printf '%s %s\\n' {id_esc} \"$URL\" > {marker_tmp_esc} && mv {marker_tmp_esc} {marker_esc}\n\
+         \n\
+         For a diff-only review, write just the task id (no URL):\n\
+         \n\
+         printf '%s\\n' {id_esc} > {marker_tmp_esc} && mv {marker_tmp_esc} {marker_esc}\n\
+         \n\
+         Also emit your `review_loaded` signal to `$SHELBI_HUB_SOCK` as your \
+         instructions describe, then stop and hand off to the human — do not keep \
+         editing or start new work."
+    )
+}
+
 /// Resolve the ref a brand-new task branch should be cut from.
 ///
 /// The machine's local `default_branch` ref can be arbitrarily stale: on a
@@ -1928,9 +2253,148 @@ fn sync_worktree(
     Ok(())
 }
 
+/// Ensure a *review* workspace's worktree exists and has `branch` checked
+/// out, moving the branch off whatever dev worktree produced it. The review
+/// analogue of [`sync_worktree`], with one load-bearing difference: a review
+/// load never cuts a fresh branch. It always follows a dev task that already
+/// created + committed `branch`, so an absent branch is an error, not a cue
+/// to branch off the default.
+///
+/// The branch is *moved*, not copied: [`crate::review::move_branch_to_review_worktree`]
+/// releases (detaches) whichever dev worktree currently holds it before
+/// checking it out here, so git will let the review worktree claim the ref.
+/// The machine's top-level clone is never touched — only workspace worktrees
+/// swap the branch.
+fn sync_review_worktree(
+    project: &Project,
+    host: &Host,
+    machine: &Machine,
+    worktree: &Path,
+    branch: &str,
+) -> Result<()> {
+    let repo = machine.work_dir.to_string_lossy().into_owned();
+    let wt_str = worktree.to_string_lossy().into_owned();
+
+    // Prune stale bookkeeping and heal a present-but-invalid worktree dir,
+    // exactly as `sync_worktree` does on the dev path (F5): a dispatch killed
+    // after the dir was created but before its `.git` gitlink landed leaves
+    // `<wt>` present-but-invalid, and every later `worktree add` aborts with
+    // "already exists". Both cleanups are best-effort.
+    let _ = shelbi_ssh::run(host, ["git", "-C", &repo, "worktree", "prune"]);
+
+    let has_git = shelbi_ssh::run(host, ["test", "-d", &format!("{wt_str}/.git")])
+        .map_err(Error::Io)?
+        .status
+        .success()
+        || shelbi_ssh::run(host, ["test", "-f", &format!("{wt_str}/.git")])
+            .map_err(Error::Io)?
+            .status
+            .success();
+    if !has_git {
+        let dir_present = shelbi_ssh::run(host, ["test", "-d", &wt_str])
+            .map_err(Error::Io)?
+            .status
+            .success();
+        if dir_present {
+            let _ = shelbi_ssh::run(
+                host,
+                ["git", "-C", &repo, "worktree", "remove", "--force", &wt_str],
+            );
+            let _ = shelbi_ssh::run(host, ["rm", "-rf", &wt_str]);
+        }
+    }
+    let worktree_exists = has_git;
+
+    // A review load loads a branch a developer already produced — it must
+    // exist. If it doesn't, fail loudly rather than silently cutting one off
+    // the default (which would serve empty/wrong changes to the reviewer).
+    let branch_exists = shelbi_ssh::run(
+        host,
+        ["git", "-C", &repo, "rev-parse", "--verify", branch],
+    )
+    .map_err(Error::Io)?
+    .status
+    .success();
+    if !branch_exists {
+        return Err(Error::Other(format!(
+            "review load for branch `{branch}` found no such branch in {repo} — \
+             a review workspace loads a branch a developer already produced, so \
+             there is nothing to check out"
+        )));
+    }
+
+    if !worktree_exists {
+        // Fresh review worktree. Create it *detached* at the branch's commit
+        // so the `worktree add` never collides with the branch that may still
+        // be checked out in the dev worktree; the move below then attaches
+        // this worktree to the branch (after releasing the dev worktree).
+        let argv: Vec<String> = vec![
+            "git".into(),
+            "-C".into(),
+            repo.clone(),
+            "worktree".into(),
+            "add".into(),
+            "--detach".into(),
+            wt_str.clone(),
+            branch.into(),
+        ];
+        let out = shelbi_ssh::run(host, &argv).map_err(Error::Io)?;
+        if !out.status.success() {
+            return Err(Error::Command {
+                cmd: argv.join(" "),
+                status: out.status.to_string(),
+                stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
+            });
+        }
+    } else {
+        // Existing worktree — make sure it's clean before we switch branches.
+        // Carve out shelbi's own footprint (`.shelbi/` metadata + the
+        // `.claude/` deploy files we rewrite every dispatch), same as
+        // `sync_worktree` and `preflight_workdir`.
+        let dirty =
+            shelbi_ssh::run_capture(host, ["git", "-C", &wt_str, "status", "--porcelain"])?;
+        let user_dirty: Vec<&str> = dirty
+            .lines()
+            .filter(|l| {
+                let path = l.get(3..).unwrap_or("");
+                !(path.starts_with(".shelbi/")
+                    || path == ".shelbi"
+                    || path.starts_with(".claude/")
+                    || path == ".claude")
+            })
+            .collect();
+        if !user_dirty.is_empty() {
+            return Err(Error::Other(format!(
+                "review workspace worktree at {wt_str} has uncommitted changes — \
+                 commit, stash, or discard before loading a new task:\n{}",
+                user_dirty.join("\n")
+            )));
+        }
+
+        // Already on the requested branch (a follow-up load of the same
+        // task)? Nothing to move — the fresh pane below re-serves it.
+        let current = shelbi_ssh::run_capture(
+            host,
+            ["git", "-C", &wt_str, "rev-parse", "--abbrev-ref", "HEAD"],
+        )?;
+        if current.trim() == branch {
+            return Ok(());
+        }
+    }
+
+    // Release the branch from any dev worktree holding it, then check it out
+    // here. For the fresh-worktree case this attaches the detached HEAD onto
+    // the branch; for the existing case it's the actual switch. The review
+    // worktree is not on `branch` at this point (guarded above), so the
+    // release never detaches the worktree we're about to check it out into.
+    crate::review::move_branch_to_review_worktree(host, project, machine, worktree, branch)?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use shelbi_core::model::WorkspaceRole;
     use shelbi_core::{AgentRunnerSpec, MachineKind, OrchestratorSpec};
     use std::collections::BTreeMap;
 
@@ -2369,6 +2833,170 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    /// Build a project fixture with two review workspaces on `hub` (plus a dev
+    /// slot) so the port / partitioning helpers have something to index into.
+    fn fixture_with_review_workspaces() -> Project {
+        let mut p = fixture_project();
+        p.workspaces = vec![
+            WorkspaceSpec {
+                name: "alpha".into(),
+                machine: "hub".into(),
+                runner: "claude".into(),
+                role: WorkspaceRole::Dev,
+            },
+            WorkspaceSpec {
+                name: "review-1".into(),
+                machine: "hub".into(),
+                runner: "claude".into(),
+                role: WorkspaceRole::Review,
+            },
+            WorkspaceSpec {
+                name: "review-2".into(),
+                machine: "hub".into(),
+                runner: "claude".into(),
+                role: WorkspaceRole::Review,
+            },
+        ];
+        p
+    }
+
+    #[test]
+    fn review_workspace_port_is_deterministic_per_index() {
+        // Defaults (base 3000, stride 10): review-1 → 3000, review-2 → 3010.
+        let p = fixture_with_review_workspaces();
+        let r1 = p.workspaces.iter().find(|w| w.name == "review-1").unwrap();
+        let r2 = p.workspaces.iter().find(|w| w.name == "review-2").unwrap();
+        assert_eq!(review_workspace_port(&p, r1), Some(3000));
+        assert_eq!(review_workspace_port(&p, r2), Some(3010));
+    }
+
+    #[test]
+    fn review_workspace_port_honors_custom_base_and_stride() {
+        let mut p = fixture_with_review_workspaces();
+        p.review.base_port = 4000;
+        p.review.port_stride = 20;
+        let r1 = p.workspaces.iter().find(|w| w.name == "review-1").unwrap();
+        let r2 = p.workspaces.iter().find(|w| w.name == "review-2").unwrap();
+        assert_eq!(review_workspace_port(&p, r1), Some(4000));
+        assert_eq!(review_workspace_port(&p, r2), Some(4020));
+    }
+
+    #[test]
+    fn review_workspace_port_is_none_for_a_dev_workspace() {
+        // A dev slot must never be handed a review port.
+        let p = fixture_with_review_workspaces();
+        let dev = p.workspaces.iter().find(|w| w.name == "alpha").unwrap();
+        assert_eq!(review_workspace_port(&p, dev), None);
+    }
+
+    #[test]
+    fn loaded_marker_lives_under_gitignored_claude_dir() {
+        let p = fixture_with_review_workspaces();
+        let r1 = p.workspaces.iter().find(|w| w.name == "review-1").unwrap();
+        let marker = workspace_review_loaded_marker(&p.machines[0], r1);
+        assert_eq!(
+            marker,
+            PathBuf::from("/tmp/myapp/.shelbi/wt/review-1/.claude/shelbi-review-loaded")
+        );
+    }
+
+    #[test]
+    fn read_review_loaded_marker_parses_task_and_url() {
+        let dir = std::env::temp_dir().join(format!(
+            "shelbi-loaded-marker-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let marker = dir.join("shelbi-review-loaded");
+
+        // Absent → None.
+        assert!(read_review_loaded_marker(&Host::Local, &marker).unwrap().is_none());
+
+        // task id + URL → both parsed (URL trimmed of the trailing newline).
+        std::fs::write(&marker, "fix-login http://alpha.local:3000\n").unwrap();
+        assert_eq!(
+            read_review_loaded_marker(&Host::Local, &marker).unwrap(),
+            Some(ReviewLoaded {
+                task_id: "fix-login".into(),
+                url: Some("http://alpha.local:3000".into()),
+            })
+        );
+
+        // Bare task id (diff-only review — nothing runnable) → url None.
+        std::fs::write(&marker, "fix-login\n").unwrap();
+        assert_eq!(
+            read_review_loaded_marker(&Host::Local, &marker).unwrap(),
+            Some(ReviewLoaded { task_id: "fix-login".into(), url: None })
+        );
+
+        // Trailing whitespace with no URL is still a diff-only load.
+        std::fs::write(&marker, "fix-login   \n").unwrap();
+        assert_eq!(
+            read_review_loaded_marker(&Host::Local, &marker).unwrap(),
+            Some(ReviewLoaded { task_id: "fix-login".into(), url: None })
+        );
+
+        // Empty → None, not an error.
+        std::fs::write(&marker, "\n").unwrap();
+        assert!(read_review_loaded_marker(&Host::Local, &marker).unwrap().is_none());
+
+        // A hostile task-id token fails validation → Err (poller leaves it).
+        std::fs::write(&marker, "../etc/passwd http://x").unwrap();
+        assert!(read_review_loaded_marker(&Host::Local, &marker).is_err());
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn review_load_prompt_carries_context_port_and_loaded_marker_contract() {
+        let marker =
+            PathBuf::from("/tmp/myapp/.shelbi/wt/review-1/.claude/shelbi-review-loaded");
+        let prompt = compose_review_load_prompt(
+            "fix-login",
+            "shelbi/fix-login",
+            "Fix the Safari SSO bug.",
+            &marker,
+            Some(3000),
+        );
+        // Task context + branch.
+        assert!(prompt.contains("Fix the Safari SSO bug."));
+        assert!(prompt.contains("shelbi/fix-login"));
+        // The assigned PORT is surfaced to the agent.
+        assert!(prompt.contains("3000"));
+        assert!(prompt.contains("$PORT"));
+        // The loaded-marker path + atomic write (temp + mv), carrying the URL.
+        assert!(prompt.contains(".claude/shelbi-review-loaded"));
+        assert!(prompt.contains("shelbi-review-loaded.tmp"));
+        assert!(prompt.contains("printf '%s %s"));
+        assert!(prompt.contains("\"$URL\""));
+        assert!(prompt.contains("review_loaded"));
+        // A review load explicitly does NOT rebase (that's the dev handoff).
+        assert!(!prompt.contains("git rebase"));
+        // And it tells the agent not to modify code.
+        assert!(prompt.contains("do NOT modify code"));
+    }
+
+    #[test]
+    fn review_load_prompt_omits_port_line_when_no_port() {
+        let marker =
+            PathBuf::from("/tmp/myapp/.shelbi/wt/review-1/.claude/shelbi-review-loaded");
+        let prompt = compose_review_load_prompt(
+            "fix-login",
+            "shelbi/fix-login",
+            "context",
+            &marker,
+            None,
+        );
+        // No port → no "assigned dev-server port" paragraph, but the marker
+        // contract is still delivered (a diff-only review still hands off).
+        assert!(!prompt.contains("assigned dev-server port"));
+        assert!(prompt.contains(".claude/shelbi-review-loaded"));
+    }
+
     #[test]
     fn prompt_writes_marker_atomically_via_tmp_and_mv() {
         // The worker must write the marker to a sibling temp file and `mv`
@@ -2675,11 +3303,13 @@ mod tests {
         let _g = crate::test_lock::acquire();
         std::env::remove_var("SHELBI_REMOTE_HUB_SOCK");
         let wt = PathBuf::from("/work/myapp/.shelbi/wt/bob");
-        let line = remote_cd_launch(&wt, "claude --permission-mode auto");
+        let line = remote_cd_launch(&wt, "claude --permission-mode auto", None);
         assert!(
             line.contains("SHELBI_HUB_SOCK=/tmp/shelbi-hub.sock"),
             "expected default socket path in: {line}"
         );
+        // No PORT on the dev path.
+        assert!(!line.contains("PORT="), "dev path must not inject PORT: {line}");
         // Must scope to the exec'd shell, not the surrounding tmux
         // pane — otherwise the `$SHELL -lc` env-strip drops it before
         // claude inherits it.
@@ -2699,12 +3329,27 @@ mod tests {
         let _g = crate::test_lock::acquire();
         std::env::set_var("SHELBI_REMOTE_HUB_SOCK", "/run/user/1000/shelbi.sock");
         let wt = PathBuf::from("/work/myapp/.shelbi/wt/bob");
-        let line = remote_cd_launch(&wt, "claude");
+        let line = remote_cd_launch(&wt, "claude", None);
         assert!(
             line.contains("SHELBI_HUB_SOCK=/run/user/1000/shelbi.sock"),
             "override not honored: {line}"
         );
         std::env::remove_var("SHELBI_REMOTE_HUB_SOCK");
+    }
+
+    /// A review dispatch injects the deterministic `PORT` into the remote
+    /// pane's exec env, scoped before `exec` (so the `$SHELL -lc` env-strip
+    /// doesn't drop it), alongside the hub socket.
+    #[test]
+    fn remote_cd_launch_injects_port_for_review_workspace() {
+        let _g = crate::test_lock::acquire();
+        std::env::remove_var("SHELBI_REMOTE_HUB_SOCK");
+        let wt = PathBuf::from("/work/myapp/.shelbi/wt/review-1");
+        let line = remote_cd_launch(&wt, "claude", Some(3010));
+        assert!(line.contains("PORT=3010"), "expected PORT in: {line}");
+        let port_at = line.find("PORT=3010").unwrap();
+        let exec_at = line.find("exec ").unwrap();
+        assert!(port_at < exec_at, "PORT must come BEFORE exec: {line}");
     }
 
     #[test]
@@ -3503,10 +4148,16 @@ mod rebase_git_tests {
             task_id: "feat-race",
             project: "demo",
             hub_sock: "/tmp/shelbi-hub.sock",
+            port: None,
             pane_cmd: "shelbi --project demo open alpha --as-pane",
         });
         assert_eq!(argv[0], "tmux");
         assert_eq!(argv[1], "new-session");
+        // Dev path: no PORT injected.
+        assert!(
+            !argv.iter().any(|s| s.starts_with("PORT=")),
+            "dev path must not inject PORT: {argv:?}"
+        );
         // `-e KEY=VAL` triplets must appear before the final `sh -c
         // <pane_cmd>` positional; tmux's option parser stops at the
         // first non-flag positional.
@@ -3554,6 +4205,7 @@ mod rebase_git_tests {
             task_id: "bug-x",
             project: "demo",
             hub_sock: "/Users/dev/.shelbi/hub.sock",
+            port: None,
             pane_cmd: "shelbi --project demo open bravo --as-pane",
         });
         assert_eq!(argv[0], "tmux");
@@ -3565,6 +4217,32 @@ mod rebase_git_tests {
         assert!(argv
             .iter()
             .any(|s| s == "SHELBI_HUB_SOCK=/Users/dev/.shelbi/hub.sock"));
+    }
+
+    /// A review workspace pins a deterministic `PORT` via a `-e PORT=<n>`
+    /// triplet, riding the same before-the-`sh -c`-positional contract as
+    /// the other env vars so tmux parses it as an option, not a command word.
+    #[test]
+    fn local_pane_tmux_argv_injects_port_for_review_workspace() {
+        let argv = local_pane_tmux_argv(LocalPaneTmuxArgs {
+            create_new_session: true,
+            session: "shelbi-demo",
+            window: "review-2",
+            task_id: "fix-login",
+            project: "demo",
+            hub_sock: "/tmp/shelbi-hub.sock",
+            port: Some(3010),
+            pane_cmd: "shelbi --project demo open review-2 --as-pane",
+        });
+        // `-e PORT=3010` present, and every `-e` still sits directly before a
+        // KEY=VAL payload ahead of the final `sh -c` positional.
+        let port_at = argv
+            .iter()
+            .position(|s| s == "PORT=3010")
+            .unwrap_or_else(|| panic!("PORT -e missing: {argv:?}"));
+        assert_eq!(argv[port_at - 1], "-e", "PORT payload not preceded by -e: {argv:?}");
+        let sh_at = argv.iter().position(|s| s == "sh").unwrap();
+        assert!(port_at < sh_at, "PORT must precede the sh -c positional: {argv:?}");
     }
 
     /// The path half of scp's `host:path` target is re-parsed by the remote

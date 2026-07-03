@@ -348,6 +348,42 @@ pub(crate) fn release_branch_from_workspace_worktrees(
     Ok(())
 }
 
+/// Move `branch` off whatever workspace worktree currently holds it and check
+/// it out in `review_worktree`. Generalizes
+/// [`release_branch_from_workspace_worktrees`] for the review-*load* path:
+/// releasing (detaching) the dev worktree that produced the branch frees the
+/// ref so git will let the review worktree claim it, then we check it out
+/// there.
+///
+/// The machine's top-level clone is never touched — only workspace worktrees
+/// swap the branch. (The top-level clone is where the *interactive* `shelbi
+/// review` checkout lands; a review *workspace* is a separate persistent
+/// worktree under `.shelbi/wt/<name>`.)
+///
+/// Assumes `review_worktree` already exists and is not itself on `branch`;
+/// [`crate::workspace`]'s `sync_review_worktree` guarantees both before
+/// calling.
+pub(crate) fn move_branch_to_review_worktree(
+    host: &Host,
+    project: &Project,
+    machine: &Machine,
+    review_worktree: &std::path::Path,
+    branch: &str,
+) -> Result<()> {
+    release_branch_from_workspace_worktrees(host, project, machine, branch)?;
+    let wt_str = review_worktree.to_string_lossy().into_owned();
+    let out = shelbi_ssh::run(host, ["git", "-C", &wt_str, "checkout", branch])
+        .map_err(Error::Io)?;
+    if !out.status.success() {
+        return Err(Error::Command {
+            cmd: format!("git -C {wt_str} checkout {branch}"),
+            status: out.status.to_string(),
+            stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
+        });
+    }
+    Ok(())
+}
+
 fn checkout(host: &Host, machine: &Machine, branch: &str) -> Result<()> {
     let repo = machine.work_dir.to_string_lossy().into_owned();
     let out = shelbi_ssh::run(host, ["git", "-C", &repo, "checkout", branch])
