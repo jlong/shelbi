@@ -466,6 +466,28 @@ pub fn lock_workspace(project: &str, workspace: &str) -> Result<WorkspaceLock> {
     Ok(WorkspaceLock(acquire_file_lock(&path)?))
 }
 
+/// Public RAII handle for the per-project dashboard-bootstrap lock. Wraps a
+/// [`FileLockGuard`] so `shelbi-orchestrator` can serialize `ensure_dashboard`
+/// without reaching the internal lock primitive. Released when dropped.
+#[must_use = "the dashboard lock is released as soon as the guard is dropped"]
+pub struct DashboardLock(#[allow(dead_code)] FileLockGuard);
+
+/// Block until the exclusive per-project dashboard-bootstrap lock is held.
+///
+/// `ensure_dashboard` is a check-then-act sequence (count the dashboard's
+/// panes, then split if there are fewer than two). Two callers racing it —
+/// the `shelbi orchestrate` CLI and the TUI launcher firing at once, say —
+/// would each observe a single-pane window and each perform the split,
+/// producing a double-split or an orphaned orchestrator pane. Holding this
+/// guard across the whole bootstrap serializes them: the loser blocks here
+/// until the winner finishes and drops it, then finds the layout already
+/// present and heals rather than re-creates. The lock file is a sibling of
+/// the project's other locks under `<project_dir>/`.
+pub fn lock_dashboard(project: &str) -> Result<DashboardLock> {
+    let path = project_dir(project)?.join("dashboard.lock");
+    Ok(DashboardLock(acquire_file_lock(&path)?))
+}
+
 /// Sibling lock-file path for `path` (`state.json` → `state.json.lock`).
 /// The suffix is appended to the full file name — never `with_extension`,
 /// which would collide `a.json` and `a.yaml` onto the same lock.
@@ -2844,6 +2866,59 @@ mod tests {
             Column::InProgress,
             "the concurrent column change must survive the set-branch"
         );
+        std::env::remove_var("SHELBI_HOME");
+    }
+
+    #[test]
+    fn lock_dashboard_serializes_concurrent_holders() {
+        // A lock-contention fixture for the `ensure_dashboard` race (F11):
+        // two threads that each grab `lock_dashboard` for the same project
+        // must never hold the guard at the same instant. We detect overlap
+        // with a shared "in critical section" flag — if the flock didn't
+        // serialize, both threads would observe it set.
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        let _g = TEST_LOCK.lock().unwrap();
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+        // Materialize the project dir so both threads lock the same inode.
+        std::fs::create_dir_all(project_dir("proj").unwrap()).unwrap();
+
+        let in_cs = Arc::new(AtomicBool::new(false));
+        let overlaps = Arc::new(AtomicUsize::new(0));
+        let acquisitions = Arc::new(AtomicUsize::new(0));
+
+        let handles: Vec<_> = (0..2)
+            .map(|_| {
+                let in_cs = Arc::clone(&in_cs);
+                let overlaps = Arc::clone(&overlaps);
+                let acquisitions = Arc::clone(&acquisitions);
+                std::thread::spawn(move || {
+                    for _ in 0..20 {
+                        let _guard = lock_dashboard("proj").unwrap();
+                        acquisitions.fetch_add(1, Ordering::SeqCst);
+                        // If another holder is already inside, the lock failed.
+                        if in_cs.swap(true, Ordering::SeqCst) {
+                            overlaps.fetch_add(1, Ordering::SeqCst);
+                        }
+                        // Widen the window so an unserialized race is caught.
+                        std::thread::yield_now();
+                        in_cs.store(false, Ordering::SeqCst);
+                    }
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        assert_eq!(
+            overlaps.load(Ordering::SeqCst),
+            0,
+            "two lock_dashboard holders were inside the critical section at once"
+        );
+        assert_eq!(acquisitions.load(Ordering::SeqCst), 40);
         std::env::remove_var("SHELBI_HOME");
     }
 
