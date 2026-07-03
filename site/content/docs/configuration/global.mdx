@@ -20,10 +20,10 @@ partial files fall back to built-in defaults, never an error.
 
 ## `config.yaml`
 
-Per-user UI preferences. Distinct from `shelbi.yaml` (assistant
-identity, wizard state) so a future `shelbi config reset` can wipe UI
-tweaks without touching onboarding. A missing file — or one that omits a
-block — resolves to defaults.
+Per-user UI preferences. Distinct from `shelbi.yaml` (the per-project
+`last_launched` index) so a future `shelbi config reset` can wipe UI
+tweaks without touching hub bookkeeping. A missing file — or one that
+omits a block — resolves to defaults.
 
 **Path:** `~/.shelbi/config.yaml`
 
@@ -151,9 +151,8 @@ projects:
 Two more files live under `~/.shelbi/` but are managed by Shelbi rather
 than hand-edited:
 
-- **`shelbi.yaml`** — hub-wide bookkeeping: the assistant identity
-  (`{{assistant_name}}`, substituted into agent prompts) and a
-  per-project `last_launched` index. Written by the setup wizard.
+- **`shelbi.yaml`** — hub-wide bookkeeping: a per-project `last_launched`
+  index used by the project picker. Written when you launch a project.
 - **`events.log`** — the cross-project [events log](/docs/concepts/events-log).
   Append-only state, not config.
 

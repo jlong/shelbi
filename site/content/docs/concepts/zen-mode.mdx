@@ -278,10 +278,9 @@ so its prompt is a file you own:
 ```
 
 Edit it directly, or run `shelbi agent edit orchestrator`. The
-rendered output (preamble + instructions, with `{{assistant_name}}`
-substituted) is rewritten to `~/.shelbi/projects/<name>/CLAUDE.md`
-on every `ensure_dashboard` call, so your changes take effect on the
-next `shelbi reload`.
+composed output (preamble + instructions) is rewritten to
+`~/.shelbi/projects/<name>/CLAUDE.md` on every `ensure_dashboard` call,
+so your changes take effect on the next `shelbi reload`.
 
 A starter override that tunes Zen's judgment:
 

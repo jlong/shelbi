@@ -89,10 +89,8 @@ When you boot a project (`shelbi orchestrate` or via the TUI launcher),
 1. Resolves the orchestrator agent's prompt — `_shared/preamble.md`
    prepended to `agents/orchestrator/instructions.md` (see
    [customizing the prompt](#customizing-the-prompt-per-project) below).
-2. Substitutes `{{assistant_name}}` with the name you set in the wizard
-   (from `~/.shelbi/shelbi.yaml`, defaulting to `Orchestrator`).
-3. Writes the rendered prompt to the launch directory's `CLAUDE.md`.
-4. Launches the orchestrator runner in the right pane of the
+2. Writes the composed prompt to the launch directory's `CLAUDE.md`.
+3. Launches the orchestrator runner in the right pane of the
    `dashboard` window, with that path as its working directory.
 
 That working-directory choice is the entire wiring trick. The runner
@@ -177,8 +175,7 @@ so customizing it is the same as customizing any other agent — edit a file:
   [global mode](/docs/concepts/config-modes) or `<repo>/.shelbi/` in
   in-repo mode. This is the orchestrator's system prompt; Shelbi seeds
   it with the shipped default on first load and never clobbers your
-  edits on upgrade. `{{assistant_name}}` is substituted anywhere you
-  use it. Or run `shelbi agent edit orchestrator`.
+  edits on upgrade. Or run `shelbi agent edit orchestrator`.
 - **Project-wide context:** put anything that should apply to *every* agent
   — repo layout, house style, the test command — in
   `<config-root>/agents/_shared/preamble.md`. It's prepended to
@@ -188,10 +185,10 @@ so customizing it is the same as customizing any other agent — edit a file:
   `shelbi-orchestrator` crate. That's the right place for
   shipped-with-Shelbi changes; edit it and rebuild.
 
-The rendered output (preamble + instructions, with `{{assistant_name}}`
-substituted) is rewritten to the launch directory's `CLAUDE.md` on every
-`ensure_dashboard` call, so your edits take effect the next time the
-dashboard is bootstrapped (or `shelbi reload`d).
+The composed output (preamble + instructions) is rewritten to the launch
+directory's `CLAUDE.md` on every `ensure_dashboard` call, so your edits
+take effect the next time the dashboard is bootstrapped (or `shelbi
+reload`d).
 
 ### CLAUDE.md is now a build artifact
 
