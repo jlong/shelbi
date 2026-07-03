@@ -1941,6 +1941,7 @@ mod tests {
             AgentRunnerSpec {
                 command: "claude".into(),
                 flags: vec![],
+                dialog_signatures: vec![],
             },
         );
         Project {
@@ -2429,7 +2430,7 @@ mod tests {
     fn require_auto_mode_no_op_for_non_auto_modes() {
         // Skip the probe entirely if the user picked anything other than
         // `auto` — other modes don't depend on the classifier.
-        let runner = AgentRunnerSpec { command: "claude".into(), flags: vec![] };
+        let runner = AgentRunnerSpec { command: "claude".into(), flags: vec![], dialog_signatures: vec![] };
         for mode in ["acceptEdits", "bypassPermissions", "plan", "default"] {
             require_auto_mode_supported(&Host::Local, &runner, mode).unwrap();
         }
@@ -2486,6 +2487,7 @@ mod tests {
             AgentRunnerSpec {
                 command: "claude".into(),
                 flags: vec!["--permission-mode".into(), "auto".into()],
+                dialog_signatures: vec![],
             },
         );
         let runner = p.runner("claude").unwrap().clone();
@@ -2502,7 +2504,7 @@ mod tests {
         let mut p = fixture_project();
         p.agent_runners.insert(
             "codex".into(),
-            AgentRunnerSpec { command: "codex".into(), flags: vec!["--print".into()] },
+            AgentRunnerSpec { command: "codex".into(), flags: vec!["--print".into()], dialog_signatures: vec![] },
         );
         let runner = p.runner("codex").unwrap().clone();
         let runner_with_mode =
@@ -2516,7 +2518,7 @@ mod tests {
         // Auto mode is a claude setting; codex / other runners ignore the
         // `defaultMode` key, so probing their `--version` would be both
         // pointless and misleading.
-        let runner = AgentRunnerSpec { command: "codex".into(), flags: vec!["--print".into()] };
+        let runner = AgentRunnerSpec { command: "codex".into(), flags: vec!["--print".into()], dialog_signatures: vec![] };
         require_auto_mode_supported(&Host::Local, &runner, "auto").unwrap();
     }
 
@@ -2707,7 +2709,7 @@ mod tests {
 
     #[test]
     fn with_agent_system_prompt_appends_claude_flag_when_agent_set() {
-        let runner = AgentRunnerSpec { command: "claude".into(), flags: vec![] };
+        let runner = AgentRunnerSpec { command: "claude".into(), flags: vec![], dialog_signatures: vec![] };
         let launch = "claude --permission-mode auto";
         let out = with_agent_system_prompt(
             launch,
@@ -2730,8 +2732,8 @@ mod tests {
 
     #[test]
     fn with_agent_system_prompt_noop_when_no_agent_or_non_claude() {
-        let claude = AgentRunnerSpec { command: "claude".into(), flags: vec![] };
-        let codex = AgentRunnerSpec { command: "codex".into(), flags: vec![] };
+        let claude = AgentRunnerSpec { command: "claude".into(), flags: vec![], dialog_signatures: vec![] };
+        let codex = AgentRunnerSpec { command: "codex".into(), flags: vec![], dialog_signatures: vec![] };
         let base = "claude --permission-mode auto";
 
         // No agent → no flag injection (e.g. a test or non-CLI caller
@@ -3696,7 +3698,7 @@ mod sync_worktree_git_tests {
         let mut runners = BTreeMap::new();
         runners.insert(
             "claude".to_string(),
-            AgentRunnerSpec { command: "claude".into(), flags: vec![] },
+            AgentRunnerSpec { command: "claude".into(), flags: vec![], dialog_signatures: vec![] },
         );
         Project {
             name: "sync-test".into(),
@@ -3918,6 +3920,7 @@ mod sync_worktree_freshcut_tests {
             shelbi_core::AgentRunnerSpec {
                 command: "claude".into(),
                 flags: vec![],
+                dialog_signatures: vec![],
             },
         );
         Project {
@@ -4183,6 +4186,7 @@ mod sync_worktree_freshcut_tests {
             shelbi_core::AgentRunnerSpec {
                 command: "claude".into(),
                 flags: vec![],
+                dialog_signatures: vec![],
             },
         );
         let project = Project {

@@ -1245,6 +1245,7 @@ mod pane_cmd_tests {
         let spec = shelbi_core::AgentRunnerSpec {
             command: "claude".into(),
             flags: vec![],
+            dialog_signatures: vec![],
         };
         let out = launch_with_bootstrap(&spec);
         assert!(out.starts_with("claude "), "launch should start with `claude`, got: {out}");
@@ -1273,6 +1274,7 @@ mod pane_cmd_tests {
         let spec = shelbi_core::AgentRunnerSpec {
             command: "claude".into(),
             flags: vec!["--permission-mode".into(), "auto".into()],
+            dialog_signatures: vec![],
         };
         let out = launch_with_bootstrap(&spec);
         // The runner's own flags must land before `--append-system-prompt`
@@ -1298,6 +1300,7 @@ mod pane_cmd_tests {
         let spec = shelbi_core::AgentRunnerSpec {
             command: "codex".into(),
             flags: vec!["--print".into()],
+            dialog_signatures: vec![],
         };
         let out = launch_with_bootstrap(&spec);
         assert_eq!(out, "codex --print");
@@ -1310,6 +1313,7 @@ mod pane_cmd_tests {
         let spec = shelbi_core::AgentRunnerSpec {
             command: "/opt/homebrew/bin/claude".into(),
             flags: vec![],
+            dialog_signatures: vec![],
         };
         let out = launch_with_bootstrap(&spec);
         assert!(out.contains("'Run the \"Bootstrap on session start\""), "claude detected by basename: {out}");

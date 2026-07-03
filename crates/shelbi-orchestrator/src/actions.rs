@@ -1361,7 +1361,7 @@ mod tests {
         let mut runners = BTreeMap::new();
         runners.insert(
             "claude".to_string(),
-            AgentRunnerSpec { command: "claude".into(), flags: vec![] },
+            AgentRunnerSpec { command: "claude".into(), flags: vec![], dialog_signatures: vec![] },
         );
         Project {
             name: "fixture".into(),
@@ -1417,7 +1417,7 @@ mod tests {
         let mut runners = BTreeMap::new();
         runners.insert(
             "claude".to_string(),
-            AgentRunnerSpec { command: "claude".into(), flags: vec![] },
+            AgentRunnerSpec { command: "claude".into(), flags: vec![], dialog_signatures: vec![] },
         );
         let project = Project {
             name: "fixture".into(),
@@ -1488,7 +1488,7 @@ mod tests {
         let mut runners = BTreeMap::new();
         runners.insert(
             "claude".to_string(),
-            AgentRunnerSpec { command: "claude".into(), flags: vec![] },
+            AgentRunnerSpec { command: "claude".into(), flags: vec![], dialog_signatures: vec![] },
         );
         let project = Project {
             name: "fixture".into(),
@@ -1551,7 +1551,7 @@ mod tests {
         let mut runners = BTreeMap::new();
         runners.insert(
             "claude".to_string(),
-            AgentRunnerSpec { command: "claude".into(), flags: vec![] },
+            AgentRunnerSpec { command: "claude".into(), flags: vec![], dialog_signatures: vec![] },
         );
         let project = Project {
             name: "fixture".into(),
@@ -1789,7 +1789,7 @@ mod tests {
         let mut runners = BTreeMap::new();
         runners.insert(
             "claude".to_string(),
-            AgentRunnerSpec { command: "claude".into(), flags: vec![] },
+            AgentRunnerSpec { command: "claude".into(), flags: vec![], dialog_signatures: vec![] },
         );
         Project {
             name: "fixture".into(),

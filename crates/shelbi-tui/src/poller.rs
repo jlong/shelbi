@@ -20,6 +20,16 @@
 //! title (Claude's own OSC writes often clobber the marker before the
 //! poller sees it).
 //!
+//! Each cycle also takes a `tmux capture-pane` sample and matches it against
+//! the runner's blocking-dialog signatures (see
+//! `shelbi_core::default_dialog_signatures` / `AgentRunnerSpec::dialog_signatures`).
+//! A pane frozen on an interactive modal (usage-limit, workspace-trust,
+//! permission-confirm) keeps a stale `shelbi:working` title — no hook fires —
+//! so the title path alone can't see the stall. On a match the poller emits a
+//! `working -> blocked reason=dialog:<kind>` line (deduped per incident, with a
+//! recovery line when the modal clears) so the orchestrator can react instead
+//! of discovering a wedged board hours later.
+//!
 //! On a state change the poller writes two files:
 //! - `~/.shelbi/workspaces/<name>/status.yaml` — last observed state.
 //! - `~/.shelbi/events.log` — append-only transition history.
@@ -43,9 +53,9 @@ use chrono::{DateTime, Utc};
 
 use shelbi_core::{Column, Project};
 use shelbi_state::{
-    append_contextstore_event, append_heartbeat_event, append_rebase_event, append_workspace_event,
-    events_log_path, load_workspace_status, parse_pane_title_marker, save_workspace_status,
-    WorkspaceState, WorkspaceStatus,
+    append_contextstore_event, append_heartbeat_event, append_rebase_event,
+    append_workspace_dialog_event, append_workspace_event, events_log_path, load_workspace_status,
+    parse_pane_title_marker, save_workspace_status, WorkspaceState, WorkspaceStatus,
 };
 
 /// How often each per-workspace thread re-verifies its host's reverse
@@ -194,6 +204,14 @@ fn run_workspace_poll_loop(
     // when the forward is already healthy.
     let mut next_forward_check: Option<Instant> = None;
 
+    // Which blocking-dialog kind this workspace is currently stuck on (if
+    // any). In-memory, per-thread — the whole point is dedupe *across*
+    // consecutive polls so we emit one `blocked reason=dialog:*` line per
+    // incident and one recovery line when it clears. A hub restart re-seeds
+    // to `None`, so at worst a still-open dialog re-emits once after a
+    // restart — acceptable for an advisory heads-up.
+    let mut last_dialog: Option<String> = None;
+
     loop {
         if shutdown.load(Ordering::SeqCst) {
             break;
@@ -231,7 +249,7 @@ fn run_workspace_poll_loop(
             next_forward_check = Some(Instant::now() + FORWARD_RECHECK_INTERVAL);
         }
 
-        poll_one(&project, workspace, &mut last_known);
+        poll_one(&project, workspace, &mut last_known, &mut last_dialog);
 
         sleep_interruptible(interval, &shutdown);
     }
@@ -351,6 +369,7 @@ fn poll_one(
     project: &Project,
     workspace: &shelbi_core::WorkspaceSpec,
     last_known: &mut Option<WorkspaceState>,
+    last_dialog: &mut Option<String>,
 ) {
     let Some(machine) = project.machine(&workspace.machine) else {
         return;
@@ -370,8 +389,19 @@ fn poll_one(
     // No pane → no marker. The display-message call would fail anyway,
     // but checking up-front keeps stderr noise out of the log.
     if !shelbi_orchestrator::workspace::workspace_pane_alive(&host, &addr).unwrap_or(false) {
+        // The pane is gone (dispatch teardown, crash, or normal exit). Any
+        // dialog we were tracking can't be "cleared" in a meaningful way —
+        // pane death has its own `pane_alive=false` event — so just drop the
+        // stuck-state so a respawned pane re-detects from scratch.
+        *last_dialog = None;
         return;
     }
+
+    // Blocking-dialog detection. Runs on the same tick as the title read but
+    // via a separate `capture-pane` sample, because a pane frozen on a
+    // usage-limit / trust / permission modal keeps a stale `shelbi:working`
+    // title — no hook fires — so the title path alone can't see the stall.
+    maybe_emit_dialog_event(project, workspace, &host, &addr, last_dialog);
 
     let title = match shelbi_tmux::pane_title(&host, &addr) {
         Ok(t) => t,
@@ -434,6 +464,108 @@ fn poll_one(
     // the agent's UI can't clobber.
 
     *last_known = Some(outcome.status.state);
+}
+
+/// One dialog transition the poller should emit this tick.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DialogEvent {
+    kind: String,
+    /// `true` → `working -> blocked`; `false` → `blocked -> working` (recovery).
+    blocked: bool,
+}
+
+/// Pure dedupe decision for blocking-dialog detection. Given the dialog kind
+/// this workspace was previously stuck on (`prev`) and the kind detected on
+/// the current pane sample (`detected`), return the event(s) to emit and the
+/// new stuck-state to remember.
+///
+/// - none → some: newly blocked, emit one `blocked` line.
+/// - some → same: still stuck on the same dialog, emit nothing (dedupe).
+/// - some → none: the modal cleared, emit one recovery line.
+/// - some → other: the dialog changed kind without a clear in between (rare;
+///   e.g. trust prompt replaced by a permission confirm) — emit a recovery
+///   for the old kind then a block for the new so the stream stays balanced.
+/// - none → none: nothing happening.
+fn decide_dialog(prev: Option<&str>, detected: Option<&str>) -> (Vec<DialogEvent>, Option<String>) {
+    match (prev, detected) {
+        (None, None) => (Vec::new(), None),
+        (None, Some(kind)) => (
+            vec![DialogEvent {
+                kind: kind.to_string(),
+                blocked: true,
+            }],
+            Some(kind.to_string()),
+        ),
+        (Some(prev), None) => (
+            vec![DialogEvent {
+                kind: prev.to_string(),
+                blocked: false,
+            }],
+            None,
+        ),
+        (Some(prev), Some(kind)) if prev == kind => (Vec::new(), Some(kind.to_string())),
+        (Some(prev), Some(kind)) => (
+            vec![
+                DialogEvent {
+                    kind: prev.to_string(),
+                    blocked: false,
+                },
+                DialogEvent {
+                    kind: kind.to_string(),
+                    blocked: true,
+                },
+            ],
+            Some(kind.to_string()),
+        ),
+    }
+}
+
+/// Sample the workspace pane, match it against the runner's blocking-dialog
+/// signatures, and emit a `blocked reason=dialog:*` (or recovery) line on a
+/// change of stuck-state. Deduped via `last_dialog` so a still-open modal
+/// only produces one event per incident.
+///
+/// Best-effort: an unknown runner or a transient `capture-pane` failure just
+/// leaves the stuck-state untouched and retries next tick — we'd rather miss
+/// a beat than fabricate a recovery on a capture hiccup.
+fn maybe_emit_dialog_event(
+    project: &Project,
+    workspace: &shelbi_core::WorkspaceSpec,
+    host: &shelbi_core::Host,
+    addr: &shelbi_core::TmuxAddr,
+    last_dialog: &mut Option<String>,
+) {
+    let Some(runner) = project.runner(&workspace.runner) else {
+        return;
+    };
+    let signatures = runner.effective_dialog_signatures();
+    if signatures.is_empty() {
+        // Nothing configured for this runner (and no built-in default) —
+        // clear any prior stuck-state so a config change that removes the
+        // last signature doesn't leave us thinking the pane is still blocked.
+        *last_dialog = None;
+        return;
+    }
+
+    let screen = match shelbi_tmux::capture(host, addr) {
+        Ok(s) => s,
+        Err(_) => return,
+    };
+    let detected = shelbi_orchestrator::ready::detect_blocking_dialog(&screen, &signatures);
+
+    let (events, next) = decide_dialog(last_dialog.as_deref(), detected.as_deref());
+    for ev in events {
+        if let Err(e) = append_workspace_dialog_event(&workspace.name, &ev.kind, ev.blocked) {
+            tracing::warn!(
+                workspace = %workspace.name,
+                kind = %ev.kind,
+                blocked = ev.blocked,
+                error = %e,
+                "append_workspace_dialog_event failed",
+            );
+        }
+    }
+    *last_dialog = next;
 }
 
 /// Check the workspace's review-ready file marker and, if present, move its
@@ -736,6 +868,47 @@ mod tests {
         Utc.timestamp_opt(secs, 0).unwrap()
     }
 
+    fn ev(kind: &str, blocked: bool) -> DialogEvent {
+        DialogEvent {
+            kind: kind.to_string(),
+            blocked,
+        }
+    }
+
+    #[test]
+    fn decide_dialog_emits_block_once_and_recovery_on_clear() {
+        // Nothing → nothing: silent.
+        let (out, next) = decide_dialog(None, None);
+        assert!(out.is_empty());
+        assert_eq!(next, None);
+
+        // Newly blocked: one `blocked` line, remember the kind.
+        let (out, next) = decide_dialog(None, Some("usage-limit"));
+        assert_eq!(out, vec![ev("usage-limit", true)]);
+        assert_eq!(next.as_deref(), Some("usage-limit"));
+
+        // Still stuck on the SAME dialog: deduped — no event, kind retained.
+        // This is the "emitted once per incident" guarantee across heartbeats.
+        let (out, next) = decide_dialog(Some("usage-limit"), Some("usage-limit"));
+        assert!(out.is_empty(), "same dialog must not re-emit: {out:?}");
+        assert_eq!(next.as_deref(), Some("usage-limit"));
+
+        // Cleared: one recovery line, forget the kind.
+        let (out, next) = decide_dialog(Some("usage-limit"), None);
+        assert_eq!(out, vec![ev("usage-limit", false)]);
+        assert_eq!(next, None);
+    }
+
+    #[test]
+    fn decide_dialog_rebalances_when_kind_changes_without_clearing() {
+        // A trust prompt is replaced by a permission confirm with no
+        // in-between clear: emit a recovery for the old kind then a block for
+        // the new so the blocked/recovery stream stays balanced.
+        let (out, next) = decide_dialog(Some("trust"), Some("permission"));
+        assert_eq!(out, vec![ev("trust", false), ev("permission", true)]);
+        assert_eq!(next.as_deref(), Some("permission"));
+    }
+
     #[test]
     fn first_observation_is_a_transition_from_none() {
         let out = decide("alpha", None, None, WorkspaceState::Working, ts(100));
@@ -796,6 +969,7 @@ mod tests {
             AgentRunnerSpec {
                 command: "claude".into(),
                 flags: vec![],
+                dialog_signatures: vec![],
             },
         );
         Project {

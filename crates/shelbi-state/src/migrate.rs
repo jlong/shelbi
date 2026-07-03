@@ -588,6 +588,7 @@ mod tests {
             AgentRunnerSpec {
                 command: "claude".into(),
                 flags: vec![],
+                dialog_signatures: vec![],
             },
         );
         Project {

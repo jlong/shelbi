@@ -193,6 +193,7 @@ pub(crate) mod test_support {
             AgentRunnerSpec {
                 command: "claude".into(),
                 flags: vec![],
+                dialog_signatures: vec![],
             },
         );
         let project = Project {

@@ -72,8 +72,9 @@ pub use user_config::{
 pub use workspace_status::{
     append_clarification_event, append_contextstore_event, append_dispatch_event,
     append_external_event, append_heartbeat_event, append_message_ack_event, append_message_event,
-    append_project_event, append_rebase_event, append_task_event, append_workspace_event,
-    append_workspace_pane_event, append_zen_dryrun_event, append_zen_mode_event,
+    append_project_event, append_rebase_event, append_task_event, append_workspace_dialog_event,
+    append_workspace_event, append_workspace_pane_event, append_zen_dryrun_event,
+    append_zen_mode_event,
     clear_expected_teardown, consume_expected_teardown, emit_event_body, events_log_path,
     expected_teardown_marker_path, hub_socket_path, load_workspace_status, mark_expected_teardown,
     parse_pane_title_marker, parse_pane_title_state, save_workspace_status,
@@ -1995,7 +1996,7 @@ mod tests {
         let mut runners = std::collections::BTreeMap::new();
         runners.insert(
             "claude".to_string(),
-            AgentRunnerSpec { command: "claude".into(), flags: vec![] },
+            AgentRunnerSpec { command: "claude".into(), flags: vec![], dialog_signatures: vec![] },
         );
         Project {
             name: name.into(),
