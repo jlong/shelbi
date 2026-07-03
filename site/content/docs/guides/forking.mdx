@@ -1,0 +1,168 @@
+---
+title: Forking
+order: 34
+summary: Contributions arrive as pull requests from forks, and a review gate stands between them and main. Model the maintainer's side — triage, an automated review pass, and a human sign-off before merge.
+---
+
+In the **forking workflow** contributors don't push to the canonical
+repository at all — they fork it, work on their own copy, and open a pull
+request from the fork. The maintainer's job is a *review gate*: triage
+what comes in, run it through checks, and merge only what clears sign-off.
+It's the model most open-source projects run.
+
+Shelbi models the **maintainer's side**. Because the branch lives on
+someone else's fork, Shelbi doesn't cut branches or push here — each task
+carries the fork's PR branch in [`branch:`](/docs/concepts/workflows#the-branch-task-field)
+and the workflow is mostly about the gate: a `handoff` sign-off status
+that's `owner: user` so nothing reaches `main` without a human (or a
+[Zen](/docs/concepts/zen-mode)-authorized reviewer agent) accepting it.
+
+## The board
+
+<AppMockup
+  state={{
+    terminalTitle: "you@hub — opensource-lib",
+    project: "opensource-lib",
+    activeView: "tasks",
+    columns: [
+      {
+        label: "INCOMING",
+        category: "gray",
+        cards: [
+          { title: "PR #402: add retry backoff", id: "t-101" },
+          { title: "PR #404: fix typo in docs", id: "t-102" },
+          { title: "PR #405: Windows path bug", id: "t-103" },
+        ],
+      },
+      {
+        label: "TRIAGE",
+        category: "blue",
+        cards: [
+          { title: "PR #398: new export format", id: "t-104" },
+        ],
+      },
+      {
+        label: "IN REVIEW",
+        category: "yellow",
+        cards: [
+          { title: "PR #401: perf: cache regex", id: "t-105", workspace: "bravo", selected: true },
+        ],
+      },
+      {
+        label: "SIGN-OFF",
+        category: "magenta",
+        cards: [
+          { title: "PR #399: async file API", id: "t-106" },
+        ],
+      },
+      {
+        label: "MERGED",
+        category: "green",
+        cards: [
+          { title: "PR #395: bump deps", id: "t-107" },
+        ],
+      },
+    ],
+    machines: [
+      {
+        name: "hub",
+        workspaces: [
+          { name: "alpha", state: "idle" },
+          { name: "bravo", state: "working", agent: "reviewer" },
+        ],
+      },
+    ],
+    review: [{ title: "PR #401: perf: cache regex", workspace: "bravo" }],
+  }}
+/>
+
+A fork PR lands in **Incoming**, the orchestrator triages it into scope,
+the `reviewer` agent runs it through checks in **In Review**, and it waits
+in **Sign-off** for a maintainer to accept before it's **Merged**.
+
+## The workflow
+
+```yaml
+# workflows/contribution.yaml
+name: contribution
+description: Forking flow — review gate for pull requests from forks.
+
+git:
+  base_branch: main
+  merge_strategy: squash               # squash external contributions into one commit
+
+statuses:
+  - { name: Incoming, category: backlog, owner: user                     }
+  - { name: Triage,   category: ready,   owner: agent, agent: orchestrator }
+  - { name: InReview, category: active,  owner: agent, agent: reviewer     }
+  - { name: SignOff,  category: handoff, owner: user                      }
+  - { name: Merged,   category: done,    owner: user                      }
+  - { name: Declined, category: archived, owner: user                     }
+
+initial_status: Incoming
+
+transitions:
+  - from: InReview
+    to: SignOff
+    actions: [push_branch]               # push the fork branch to a review ref; no PR to open
+
+  - from: SignOff
+    to: Merged
+    actions: [merge]                     # squash-merge the existing fork PR into main
+
+  - from: InReview
+    to: Declined
+    actions: [close_pr]                  # close the PR without merging; the fork keeps its branch
+```
+
+Two side-effects that the [feature-branch](/docs/guides/feature-branch)
+model uses are deliberately *absent* here:
+
+- **No `open_pr`.** The contributor already opened the PR from their fork.
+  The task just tracks it — pre-fill `branch:` with the PR's head ref so
+  `merge` and `close_pr` act on the right PR.
+- **No `delete_branch`.** Shelbi can't delete a branch it doesn't own. The
+  fork keeps its branch whether the PR merges or is declined.
+
+The `InReview` status names an [`agent: reviewer`](/docs/concepts/agents)
+role — an agent you author to run the untrusted contribution through the
+project's checks and summarize risk before a human ever looks. The
+`SignOff` status stays `owner: user`: the gate is the whole point.
+
+## Orchestrator adjustments
+
+The review gate needs the orchestrator to treat incoming forks as
+untrusted and never to auto-accept. Encode a triage rule and a hard stop
+at sign-off:
+
+```markdown
+## Routing rules — forking
+
+- **Incoming fork PRs** are untrusted. Never dispatch a contribution to a
+  workspace that holds credentials or can reach production. Route `Triage`
+  cards only to sandboxed hub workspaces.
+- In `Triage`, decline anything out of scope (wrong direction, duplicate,
+  no linked issue) into `Declined` with a one-line reason. Promote the
+  rest to `InReview` for the `reviewer` agent.
+
+## Zen Mode — forking
+
+The `SignOff → Merged` edge is `owner: user` and must stay a human
+decision. Do **not** auto-merge contributions even when checks are green:
+report "`<PR>` passed review and is ready to sign off" and wait. A green
+check is necessary but not sufficient for merging someone else's code.
+```
+
+That last rule is the difference between forking and
+[trunk-based](/docs/guides/trunk-based): trunk-based leans *into*
+auto-merge for your own green work; forking deliberately keeps a human at
+the gate for code that arrived from outside.
+
+## See also
+
+- [Agents](/docs/concepts/agents) — how to author the `reviewer` role the
+  `InReview` status dispatches to.
+- [Workflows: the `branch:` task field](/docs/concepts/workflows#the-branch-task-field)
+  — pointing a task at an existing fork PR branch instead of cutting one.
+- [Trunk-based](/docs/guides/trunk-based) — the opposite end of the
+  auto-merge spectrum, for work you trust.

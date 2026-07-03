@@ -1,0 +1,201 @@
+---
+title: Git-flow
+order: 33
+summary: A long-lived develop integration branch with feature, release, and hotfix branches. Model it as two Shelbi Workflows — features land on develop, releases ship develop to main.
+---
+
+**Git-flow** keeps two long-lived branches — `main` (released) and
+`develop` (integration) — and cuts three kinds of short branches off
+them: `feature/*` off `develop`, `release/*` off `develop` toward `main`,
+and `hotfix/*` off `main`. It trades the simplicity of trunk-based for an
+explicit staging branch where work accumulates before a release.
+
+Git-flow doesn't fit one board, because a feature and a release are
+different lifecycles. Model it as **two Shelbi Workflows**: a `feature`
+workflow whose tasks branch off and merge back into `develop`, and a
+`release` workflow whose task PRs `develop` into `main`. Hotfixes reuse
+the [feature-branch](/docs/guides/feature-branch) default with `main` as
+their base.
+
+## The board
+
+<AppMockup
+  state={{
+    terminalTitle: "you@hub — platform",
+    project: "platform",
+    activeView: "tasks",
+    columns: [
+      {
+        label: "BACKLOG",
+        category: "gray",
+        cards: [
+          { title: "Draft Q3 roadmap", id: "t-081" },
+          { title: "Sync i18n strings", id: "t-082" },
+        ],
+      },
+      {
+        label: "TO DO",
+        category: "blue",
+        cards: [
+          { title: "Add SSO to admin", id: "t-083" },
+        ],
+      },
+      {
+        label: "IN PROGRESS",
+        category: "yellow",
+        cards: [
+          { title: "Build billing portal", id: "t-084", workspace: "bravo", selected: true },
+        ],
+      },
+      {
+        label: "REVIEW",
+        category: "magenta",
+        cards: [
+          { title: "Rework audit log schema", id: "t-085", workspace: "charlie" },
+        ],
+      },
+      {
+        label: "ON DEVELOP",
+        category: "green",
+        cards: [
+          { title: "New notifications service", id: "t-086" },
+          { title: "Tenant-scoped API keys", id: "t-087" },
+        ],
+      },
+    ],
+    machines: [
+      {
+        name: "hub",
+        workspaces: [
+          { name: "alpha", state: "idle" },
+          { name: "bravo", state: "working", agent: "Developer" },
+          { name: "charlie", state: "idle" },
+        ],
+      },
+    ],
+    review: [{ title: "Rework audit log schema", workspace: "charlie" }],
+  }}
+/>
+
+Every card on the `feature` workflow cuts its branch off `develop` and
+squash-merges back into `develop` — the **On Develop** column is "landed
+on the integration branch," not "released." Shipping to `main` is a
+separate `release` task.
+
+## The feature workflow
+
+```yaml
+# workflows/feature.yaml
+name: feature
+description: Git-flow feature — branch off develop, merge back into develop.
+
+git:
+  base_branch: develop                 # feature/* branches cut off develop
+  merge_strategy: squash
+
+statuses:
+  - { name: Backlog,    category: backlog, owner: user  }
+  - { name: Todo,       category: ready,   owner: agent }
+  - { name: InProgress, category: active,  owner: agent }
+  - { name: Review,     category: handoff, owner: user  }
+  - { name: OnDevelop,  category: done,    owner: user  }
+  - { name: Canceled,   category: archived, owner: user }
+
+initial_status: Backlog
+
+transitions:
+  - from: InProgress
+    to: Review
+    actions: [push_branch, open_pr]      # PR base is develop (the workflow base_branch)
+
+  - from: Review
+    to: OnDevelop
+    actions: [merge, delete_branch]      # squash into develop
+
+  - from: InProgress
+    to: Canceled
+    actions: [close_pr, delete_branch]
+```
+
+Setting `git.base_branch: develop` is the whole trick — branches are cut
+from `develop` and the `open_pr` action targets `develop` because no
+transition overrides it with a [`target:`](/docs/concepts/workflows#per-transition-target).
+
+## The release workflow
+
+A release task PRs the accumulated `develop` into `main`. Pre-fill its
+`branch:` so the orchestrator operates on `develop`
+[directly instead of cutting a new branch](/docs/concepts/workflows#the-branch-task-field):
+
+```yaml
+# workflows/release.yaml
+name: release
+description: Git-flow release — PR develop into main and tag.
+
+git:
+  base_branch: main
+  merge_strategy: merge                # a true merge preserves develop's history
+
+statuses:
+  - { name: Staging,  category: active,  owner: agent }
+  - { name: Review,   category: handoff, owner: user  }
+  - { name: Released, category: done,    owner: user  }
+
+initial_status: Staging
+
+transitions:
+  - from: Staging
+    to: Review
+    actions: [push_branch, open_pr]      # open PR: base main, head develop
+
+  - from: Review
+    to: Released
+    actions: [merge]                     # merge develop into main; keep develop
+```
+
+```markdown
+---
+id: release-2025-07
+title: Release 2025.07
+workflow: release
+branch: develop                        # operate on develop as-is; don't cut a branch
+---
+```
+
+Note `merge_strategy: merge` (not `squash`) and the absence of
+`delete_branch` — `develop` is long-lived, so the release preserves its
+history and never deletes it.
+
+## Orchestrator adjustments
+
+Two routing rules keep the three lifecycles from colliding. Encode them in
+the orchestrator prompt (see
+[Author a custom workflow](/docs/getting-started/custom-workflow#1-pin-certain-task-shapes-to-specific-workspaces)):
+
+```markdown
+## Routing rules — git-flow
+
+- **Features** default to the `feature` workflow (base `develop`). Ordinary
+  work goes here; do not route feature work at `main`.
+- **Hotfixes** — titles prefixed `hotfix:` — use the `default` workflow
+  (base `main`) so the fix branches off the released line. After a hotfix
+  merges to `main`, open a follow-up task to merge `main` back into
+  `develop` so the branches don't diverge.
+- **Releases** are created by the user on the `release` workflow with
+  `branch: develop` pre-filled. Never auto-promote a release — cutting one
+  is a human decision about what's ready to ship.
+```
+
+The develop-back-merge after a hotfix is the one bit of bookkeeping
+git-flow needs that a single workflow can't express — surface it as a
+follow-up task rather than trying to encode it as a transition.
+
+## See also
+
+- [Workflows: parameterization](/docs/concepts/workflows#parameterization)
+  — `{{var}}` in `base_branch` if you run several concurrent integration
+  branches instead of one `develop`.
+- [Workflows: the `branch:` task field](/docs/concepts/workflows#the-branch-task-field)
+  — how a release task operates on `develop` without cutting a new branch.
+- [Feature-branch](/docs/guides/feature-branch) — the simpler model
+  hotfixes fall back to.

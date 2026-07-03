@@ -1,0 +1,141 @@
+---
+title: Feature-branch (GitHub-flow)
+order: 31
+summary: Branch per task off main, open a PR, merge back. This is the default Shelbi shape — the workflow every project ships with, written out in full.
+---
+
+**Feature-branch** (a.k.a. GitHub-flow) is the simplest durable model:
+`main` is always deployable, every task cuts a short branch off it, opens
+a pull request, and merges back. There are no long-lived integration
+branches — the PR *is* the integration point.
+
+This is the model Shelbi's [`default` workflow](/docs/concepts/workflows#default-workflow)
+already implements, so this guide doubles as a full annotation of the
+shipped default. Read it first; the other guides are described as deltas
+from this one.
+
+## The board
+
+<AppMockup
+  state={{
+    terminalTitle: "you@hub — webapp",
+    project: "webapp",
+    activeView: "tasks",
+    columns: [
+      {
+        label: "BACKLOG",
+        category: "gray",
+        cards: [
+          { title: "Rework onboarding copy", id: "t-041" },
+          { title: "Audit image sizes", id: "t-042" },
+        ],
+      },
+      {
+        label: "TO DO",
+        category: "blue",
+        cards: [
+          { title: "Add ratelimit to API", id: "t-043" },
+          { title: "Fix mobile nav overlap", id: "t-044" },
+        ],
+      },
+      {
+        label: "IN PROGRESS",
+        category: "yellow",
+        cards: [
+          { title: "Wire up OAuth flow", id: "t-045", workspace: "bravo" },
+        ],
+      },
+      {
+        label: "REVIEW",
+        category: "magenta",
+        cards: [
+          { title: "Cache warm-up on cold start", id: "t-046", workspace: "charlie", selected: true },
+        ],
+      },
+      {
+        label: "DONE",
+        category: "green",
+        cards: [
+          { title: "Ship dark-mode toggle", id: "t-047" },
+          { title: "Migrate to Postgres 16", id: "t-048" },
+        ],
+      },
+    ],
+    machines: [
+      {
+        name: "hub",
+        workspaces: [
+          { name: "alpha", state: "idle" },
+          { name: "bravo", state: "working", agent: "Developer" },
+          { name: "charlie", state: "idle" },
+        ],
+      },
+    ],
+    review: [{ title: "Cache warm-up on cold start", workspace: "charlie" }],
+  }}
+/>
+
+Each card's branch is cut off `main` when it enters **In Progress**, is
+pushed and PR'd on the way to **Review**, and squash-merged back into
+`main` on the way to **Done**.
+
+## The workflow
+
+```yaml
+# workflows/default.yaml
+name: default
+description: Feature-branch flow — branch per task off main, PR, merge.
+
+# Inherits the project's base_branch: main and merge_strategy from
+# project.yaml. A git: block here would only be needed to override them.
+
+statuses:
+  - { name: Backlog,    category: backlog, owner: user                    }
+  - { name: Todo,       category: ready,   owner: agent                   }
+  - { name: InProgress, category: active,  owner: agent                   }
+  - { name: Review,     category: handoff, owner: user, agent: orchestrator }
+  - { name: Done,       category: done,    owner: user                    }
+  - { name: Canceled,   category: archived, owner: user                   }
+
+initial_status: Backlog
+
+transitions:
+  - from: InProgress
+    to: Review
+    actions: [push_branch, open_pr]      # push the task branch, open a PR into main
+
+  - from: Review
+    to: Done
+    actions: [merge, delete_branch]      # squash-merge the PR, delete the branch
+
+  - from: InProgress
+    to: Canceled
+    actions: [close_pr, delete_branch]
+
+  - from: Review
+    to: Canceled
+    actions: [close_pr, delete_branch]
+```
+
+Nothing here overrides the project git defaults, so branches cut off
+`main` and merges land back on `main`. The `open_pr` action opens the PR
+with `main` as its base because no transition declares a
+[`target:`](/docs/concepts/workflows#per-transition-target).
+
+## Orchestrator adjustments
+
+None. This is the shape the shipped orchestrator prompt already assumes —
+triage into `Backlog`, dispatch `Todo`, hand off to `Review` on the
+[review marker](/docs/concepts/workflows#review-marker-promotion), and
+leave the `Review → Done` accept to you. If you turn on
+[Zen Mode](/docs/concepts/zen-mode), the merge on `Review → Done` is what
+the confidence bar gates.
+
+## See also
+
+- [Workflows](/docs/concepts/workflows) — the full schema and the
+  lifecycle walkthrough this board follows.
+- [Trunk-based](/docs/guides/trunk-based) — the same model with the
+  `Review` gate collapsed and auto-merge turned on.
+- [Author a custom Shelbi workflow](/docs/getting-started/custom-workflow)
+  — start here when a routing or reporting tweak is worth encoding.
