@@ -46,6 +46,7 @@ const TUI_BG = "#1e1e1e"
 const TUI_FG = "#e5e5e5"
 const TUI_GRAY = "#b8b8b8" // ANSI 7 — column header for `Backlog`, nav labels
 const TUI_DARK_GRAY = "#7c7c7c" // ANSI 8 — chrome text (`Tasks · `, ids, footer)
+const TUI_DIVIDER = "#4a4a4a" // mid-gray rule — sidebar/board divider, reads on TUI_BG
 const TUI_BLUE = "#4a8fd7" // ANSI 4 — `Ready` category (todo)
 const TUI_YELLOW = "#dcb767" // ANSI 3 — `Active` category (in_progress)
 const TUI_MAGENTA = "#c586c0" // ANSI 5 — `Handoff` (review) + `@workspace`
@@ -532,10 +533,10 @@ function Sidebar({ state }: { state: AppState }) {
       className="m-0 hidden whitespace-pre border-r py-3 font-mono md:block"
       style={{
         ...PRE_STYLE,
-        // CHROME_BAR_BORDER is darker than the terminal body, so against
-        // TUI_BG it disappears — the bar bg tone is the one that reads as
-        // a line here.
-        borderColor: CHROME_BAR_BG,
+        // CHROME_BAR_BG/BORDER sit too close to TUI_BG to read as a rule;
+        // a mid-gray in the TUI gray family gives a distinct-but-tasteful
+        // divider against the dark terminal body.
+        borderColor: TUI_DIVIDER,
       }}
     >
       {rows.map((row, i) => (
