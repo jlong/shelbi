@@ -20,7 +20,7 @@ const pitch = [
     icon: ClipboardDocumentListIcon,
     title: 'Plan on the board',
     body: 'Tell the orchestrator what you want in plain English. It drops cards into the backlog. Promote what is ready into todo, set priorities, and pin a task to a specific workspace or machine when it matters.',
-    href: '/docs/getting-started/first-task',
+    href: '/docs/guides/getting-started/first-task',
   },
   {
     icon: CpuChipIcon,

@@ -72,7 +72,7 @@ Zen's *judgment* — which backlog items are in scope, where the confidence
 bar sits — is prompt prose, covered below. But the more basic question of
 **which statuses the orchestrator is allowed to act on, and which agent it
 uses**, is no longer prompt prose at all. It's the
-[`owner` and `agent` fields](/docs/concepts/workflows#owners-and-agents) on
+[`owner` and `agent` fields](/docs/guides/getting-started/workflows#owners-and-agents) on
 each workflow status.
 
 This is what changed. Behaviors that used to be paragraphs in the
@@ -93,12 +93,12 @@ autonomy at all. But once Zen is on, the workflow YAML — not the prompt —
 decides per status whether the orchestrator acts and which agent it loads.
 The prompt is left to hold only the genuinely judgment-shaped policy: scope
 and the confidence bar. See
-[owners and agents](/docs/concepts/workflows#owners-and-agents) for the
+[owners and agents](/docs/guides/getting-started/workflows#owners-and-agents) for the
 field semantics and the four validation rules.
 
 ## The high-confidence bar
 
-The bar fires on **any [workflow](/docs/concepts/workflows#transitions)
+The bar fires on **any [workflow](/docs/guides/getting-started/workflows#transitions)
 transition whose `actions:` list includes `merge`** — not on the
 `Review` column per se. The canonical default workflow happens to put
 `merge` on the `Review → Done` edge, so the practical effect is the
@@ -106,7 +106,7 @@ same as before: a task that hands off to `review` trips the bar. But a
 trunk-based workflow that skips `Review` entirely and merges straight
 from `InProgress → Done` runs through the *same* probe — gating is
 action-based, not status-pair-based. See [What fires Zen Mode's
-high-confidence bar](/docs/concepts/workflows#what-fires-zen-modes-high-confidence-bar).
+high-confidence bar](/docs/guides/getting-started/workflows#what-fires-zen-modes-high-confidence-bar).
 
 When such a transition is queued, the orchestrator runs
 `shelbi zen probe <task-id>` (which threads the task's workflow
@@ -181,7 +181,7 @@ zen:
 
 ## Per-workflow overrides
 
-Each [workflow](/docs/concepts/workflows) may carry its own `zen:`
+Each [workflow](/docs/guides/getting-started/workflows) may carry its own `zen:`
 block that overrides any subset of the three project-level Zen knobs:
 `checks`, `ci_timeout`, `danger_paths`. Anything you don't set falls
 back to the project default — so a workflow can swap *just* its
@@ -518,14 +518,14 @@ key in `project.yaml` (default `3m`).
   field reference (`checks.local`, `ci_timeout`, `danger_paths`).
 - [`shelbi zen`](/docs/cli/zen) — CLI reference for every Zen
   subcommand.
-- [Workflows](/docs/concepts/workflows) — how a workflow's
+- [Workflows](/docs/guides/getting-started/workflows) — how a workflow's
   `transitions:` declares which edges fire the merge bar, and where
   the per-workflow `zen:` override block lives.
 - [Orchestrator](/docs/concepts/orchestrator) — how the
   underlying scheduler is wired and where the prompt template lives.
 - [The events log](/docs/concepts/events-log) — the canonical
   format of the `mode=zen` and `orchestrator:zen-*` lines Zen emits.
-- [Workflows](/docs/concepts/workflows#lifecycle-who-moves-a-task-between-the-default-statuses)
+- [Workflows](/docs/guides/getting-started/workflows#lifecycle-who-moves-a-task-between-the-default-statuses)
   — what `Review` and `Done` mean in the default flow Zen accelerates,
   and how custom workflows declare their own `handoff` and `done`
   statuses.

@@ -8,7 +8,7 @@ A workflow file declares the pipeline a task moves through: which
 statuses it references, which side-effects fire on which edges, and any
 per-workflow git or Zen overrides. For the model behind these fields —
 owners, categories, the any-to-any transition policy — see
-[the workflows concept](/docs/concepts/workflows).
+[the workflows concept](/docs/guides/getting-started/workflows).
 
 ## Where it lives
 
@@ -79,7 +79,7 @@ drifting across workflows.
 Each entry declares the hub-side side-effects that fire when a task
 crosses one edge. Transitions do **not** restrict which moves are legal —
 moves are any-to-any; unlisted edges are pure status changes. See
-[transitions](/docs/concepts/workflows#transitions).
+[transitions](/docs/guides/getting-started/workflows#transitions).
 
 | Field | Type | Required | Default | Description |
 | --- | --- | --- | --- | --- |
@@ -149,7 +149,7 @@ zen:
 
 ## See also
 
-- [Workflows](/docs/concepts/workflows) — owners, categories, the
+- [Workflows](/docs/guides/getting-started/workflows) — owners, categories, the
   transition model, and worked examples.
 - [Statuses](/docs/configuration/statuses) — the `statuses.yml` catalog
   that supplies each status's `name` and `category`.

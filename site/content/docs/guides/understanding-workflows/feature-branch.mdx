@@ -9,7 +9,7 @@ summary: Branch per task off main, open a PR, merge back. This is the default Sh
 a pull request, and merges back. There are no long-lived integration
 branches — the PR *is* the integration point.
 
-This is the model Shelbi's [`default` workflow](/docs/concepts/workflows#default-workflow)
+This is the model Shelbi's [`default` workflow](/docs/guides/getting-started/workflows#default-workflow)
 already implements, so this guide doubles as a full annotation of the
 shipped default. Read it first; the other guides are described as deltas
 from this one.
@@ -83,7 +83,7 @@ pushed and PR'd on the way to **Review**, and squash-merged back into
 
 Status identity — the stable `id`, the display `name`, and the
 `category` — lives once in `workflows/statuses.yml`, the project-wide
-[status catalog](/docs/concepts/workflows#schema). Every workflow file
+[status catalog](/docs/guides/getting-started/workflows#schema). Every workflow file
 then references those statuses by `id` and adds only what's
 workflow-specific (`owner`, and an optional `agent:`). The shipped
 catalog is the canonical six:
@@ -141,7 +141,7 @@ transitions:
 Nothing here overrides the project git defaults, so branches cut off
 `main` and merges land back on `main`. The `open_pr` action opens the PR
 with `main` as its base because no transition declares a
-[`target:`](/docs/concepts/workflows#per-transition-target). The
+[`target:`](/docs/guides/getting-started/workflows#per-transition-target). The
 `user`-owned `review` status still names `agent: orchestrator` — that's
 what lets [Zen Mode](/docs/concepts/zen-mode) land the merge without you.
 
@@ -149,16 +149,16 @@ what lets [Zen Mode](/docs/concepts/zen-mode) land the merge without you.
 
 None. This is the shape the shipped orchestrator prompt already assumes —
 triage into `Backlog`, dispatch `Todo`, hand off to `Review` on the
-[review marker](/docs/concepts/workflows#review-marker-promotion), and
+[review marker](/docs/guides/getting-started/workflows#review-marker-promotion), and
 leave the `Review → Done` accept to you. If you turn on
 [Zen Mode](/docs/concepts/zen-mode), the merge on `Review → Done` is what
 the confidence bar gates.
 
 ## See also
 
-- [Workflows](/docs/concepts/workflows) — the full schema and the
+- [Workflows](/docs/guides/getting-started/workflows) — the full schema and the
   lifecycle walkthrough this board follows.
 - [Trunk-based](/docs/guides/understanding-workflows/trunk-based) — the same model with the
   `Review` gate collapsed and auto-merge turned on.
-- [Author a custom Shelbi workflow](/docs/getting-started/custom-workflow)
+- [Author a custom Shelbi workflow](/docs/guides/getting-started/custom-workflow)
   — start here when a routing or reporting tweak is worth encoding.

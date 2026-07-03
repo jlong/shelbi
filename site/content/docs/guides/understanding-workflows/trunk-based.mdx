@@ -12,7 +12,7 @@ column — work goes from *in progress* to *merged* the moment checks pass.
 In Shelbi this is the [feature-branch model](/docs/guides/understanding-workflows/feature-branch)
 with the `Review` handoff collapsed: the `merge` action moves onto the
 `InProgress → Done` edge. Because
-[Zen Mode's confidence bar is action-based](/docs/concepts/workflows#what-fires-zen-modes-high-confidence-bar)
+[Zen Mode's confidence bar is action-based](/docs/guides/getting-started/workflows#what-fires-zen-modes-high-confidence-bar)
 — it gates *any* transition whose actions include `merge`, regardless of
 which statuses sit on either side — that collapsed edge trips exactly the
 same high-confidence probe the review-gated model does. Trunk-based is
@@ -81,7 +81,7 @@ the moment checks pass and Zen clears the bar.
 
 ## The workflow
 
-Trunk-based reuses the shipped [status catalog](/docs/concepts/workflows#schema)
+Trunk-based reuses the shipped [status catalog](/docs/guides/getting-started/workflows#schema)
 (`workflows/statuses.yml`) — it just leaves the `review` status out of the
 flow. Identity (`name`, `category`) stays in the catalog; the workflow
 references statuses by `id` and adds only `owner` and `agent:`:
@@ -129,7 +129,7 @@ the merge bar *are* the gate.
 ## Orchestrator adjustments
 
 Trunk-based only pays off with auto-merge on, so the orchestrator prompt's
-[Zen judgment](/docs/getting-started/custom-workflow#2-tune-zens-judgment-categories-for-this-projects-reality)
+[Zen judgment](/docs/guides/getting-started/custom-workflow#2-tune-zens-judgment-categories-for-this-projects-reality)
 does the accepting a human would otherwise do at a `Review` column. Two
 tweaks are worth encoding:
 
@@ -159,5 +159,5 @@ from `main`, prefer restacking or re-cutting it over a big catch-up merge
   version of the same branch-per-task shape.
 - [Zen Mode](/docs/concepts/zen-mode) — the confidence bar and the
   `zen.checks` that stand in for a review column here.
-- [Workflows: what fires the high-confidence bar](/docs/concepts/workflows#what-fires-zen-modes-high-confidence-bar)
+- [Workflows: what fires the high-confidence bar](/docs/guides/getting-started/workflows#what-fires-zen-modes-high-confidence-bar)
   — why a collapsed `InProgress → Done` merge still trips the probe.

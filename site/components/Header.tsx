@@ -13,7 +13,7 @@ const NAV_LINKS = [
   { label: "Docs", href: "/docs" },
 ] as const
 
-const INSTALL_HREF = "/docs/getting-started/install"
+const INSTALL_HREF = "/docs/guides/getting-started/install"
 
 // Header bar height in px — used to shrink the IntersectionObserver
 // root so the hero is considered "off-screen" the moment its bottom

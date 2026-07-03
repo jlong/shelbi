@@ -49,7 +49,7 @@ export function Hero() {
 
         <div className="mt-2 flex w-full flex-col gap-2 sm:w-auto sm:flex-row sm:gap-3">
           <Link
-            href="/docs/getting-started/install"
+            href="/docs/guides/getting-started/install"
             className={`${CTA_BASE} bg-fg text-bg hover:bg-gray-7`}
           >
             Install shelbi

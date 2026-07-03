@@ -8,14 +8,14 @@ These are reference deep-dives for readers who already know the workflow
 basics. If a Shelbi Workflow — the per-project YAML that declares the
 statuses a task moves through and the git side-effects that fire on each
 transition — is new to you, start with
-**[Workflows](/docs/concepts/workflows)** for the fundamentals, then come
+**[Workflows](/docs/guides/getting-started/workflows)** for the fundamentals, then come
 back here.
 
 Shelbi doesn't impose a branching model. Each guide below takes one
 well-known git branching model and shows the Shelbi Workflow that
 implements it: the statuses it references, the transitions that push, PR,
 and merge branches in the right place, and any adjustment the
-[orchestrator prompt](/docs/getting-started/custom-workflow) needs to
+[orchestrator prompt](/docs/guides/getting-started/custom-workflow) needs to
 route and merge the way that model expects.
 
 ## The models
@@ -38,15 +38,15 @@ Every guide shows two YAML shapes. Status *identity* — `id`, `name`, and
 project-wide status catalog. Each workflow file **references** statuses by
 `id` and adds only its `owner` and optional `agent:`; it never repeats
 `name:` or `category:` (the loader rejects a workflow that does). See
-[Workflows → Schema](/docs/concepts/workflows#schema) for the full rule.
+[Workflows → Schema](/docs/guides/getting-started/workflows#schema) for the full rule.
 
 </Callout>
 
 ## See also
 
-- [Workflows](/docs/concepts/workflows) — the schema every guide is built
+- [Workflows](/docs/guides/getting-started/workflows) — the schema every guide is built
   on: statuses, categories, transitions, `target:`, parameterization.
-- [Author a custom Shelbi workflow](/docs/getting-started/custom-workflow)
+- [Author a custom Shelbi workflow](/docs/guides/getting-started/custom-workflow)
   — how to edit the orchestrator prompt each model's routing note asks for.
 - [Zen Mode](/docs/concepts/zen-mode) — the action-based confidence bar
   that gates any transition whose actions include `merge`.

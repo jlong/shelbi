@@ -85,7 +85,7 @@ separate `release` task.
 ## The statuses
 
 Status identity lives once in the project's
-[status catalog](/docs/concepts/workflows#schema),
+[status catalog](/docs/guides/getting-started/workflows#schema),
 `workflows/statuses.yml`. Git-flow adds one status the shipped defaults
 don't have — `on-develop`, the done-category landing for feature work
 that's merged into `develop` but not yet released — plus `staging` and
@@ -144,13 +144,13 @@ transitions:
 
 Setting `git.base_branch: develop` is the whole trick — branches are cut
 from `develop` and the `open_pr` action targets `develop` because no
-transition overrides it with a [`target:`](/docs/concepts/workflows#per-transition-target).
+transition overrides it with a [`target:`](/docs/guides/getting-started/workflows#per-transition-target).
 
 ## The release workflow
 
 A release task PRs the accumulated `develop` into `main`. Pre-fill its
 `branch:` so the orchestrator operates on `develop`
-[directly instead of cutting a new branch](/docs/concepts/workflows#the-branch-task-field):
+[directly instead of cutting a new branch](/docs/guides/getting-started/workflows#the-branch-task-field):
 
 ```yaml
 # workflows/release.yaml — reference-only; identity lives in statuses.yml
@@ -195,7 +195,7 @@ history and never deletes it.
 
 Two routing rules keep the three lifecycles from colliding. Encode them in
 the orchestrator prompt (see
-[Author a custom workflow](/docs/getting-started/custom-workflow#1-pin-certain-task-shapes-to-specific-workspaces)):
+[Author a custom workflow](/docs/guides/getting-started/custom-workflow#1-pin-certain-task-shapes-to-specific-workspaces)):
 
 ```markdown
 ## Routing rules — git-flow
@@ -217,10 +217,10 @@ follow-up task rather than trying to encode it as a transition.
 
 ## See also
 
-- [Workflows: parameterization](/docs/concepts/workflows#parameterization)
+- [Workflows: parameterization](/docs/guides/getting-started/workflows#parameterization)
   — `{{var}}` in `base_branch` if you run several concurrent integration
   branches instead of one `develop`.
-- [Workflows: the `branch:` task field](/docs/concepts/workflows#the-branch-task-field)
+- [Workflows: the `branch:` task field](/docs/guides/getting-started/workflows#the-branch-task-field)
   — how a release task operates on `develop` without cutting a new branch.
 - [Feature-branch](/docs/guides/understanding-workflows/feature-branch) — the simpler model
   hotfixes fall back to.

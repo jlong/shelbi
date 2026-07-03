@@ -44,7 +44,7 @@ re-dispatch — is the orchestrator's responsibility.
 
 ## Categories: the vocabulary the orchestrator reasons in
 
-A [workflow](/docs/concepts/workflows) can rename statuses, split a
+A [workflow](/docs/guides/getting-started/workflows) can rename statuses, split a
 category across multiple statuses, or drop columns the project doesn't
 need. To keep generic code (auto-dispatch, Zen Mode, the activity feed)
 working unchanged across every workflow, the orchestrator reasons in a
@@ -63,7 +63,7 @@ The category set is fixed; status names are user-customizable per
 workflow. A workflow that renames `Review` to `QA`, or splits `handoff`
 into `Code Review` and `QA`, still triggers the same auto-dispatch and
 auto-merge rules because the orchestrator matches on the category, not
-the name. See the [Workflows](/docs/concepts/workflows#status-categories)
+the name. See the [Workflows](/docs/guides/getting-started/workflows#status-categories)
 concept page for the full schema.
 
 The `shelbi task move --to <status>` CLI accepts the literal status name
@@ -260,7 +260,7 @@ confidence bar without waiting on a human reviewer. The policy that
 decides "in scope" lives in the orchestrator agent's `instructions.md`
 described above — you tune it by editing prose, not code. Whether a given
 status is automated and which agent handles it is separate, and lives in
-the [workflow YAML](/docs/concepts/workflows#owners-and-agents).
+the [workflow YAML](/docs/guides/getting-started/workflows#owners-and-agents).
 
 ## See also
 
@@ -271,7 +271,7 @@ the [workflow YAML](/docs/concepts/workflows#owners-and-agents).
 - [Review workspaces](/docs/concepts/review-workspaces) — the slots the
   orchestrator auto-loads a finished branch onto on handoff, and the
   pending-load queue it drains as they free.
-- [Workflows](/docs/concepts/workflows) — the schema behind the board,
+- [Workflows](/docs/guides/getting-started/workflows) — the schema behind the board,
   including the full category set and the events-log annotations the
   orchestrator pattern-matches on.
 - [The events log](/docs/concepts/events-log) — the orchestrator's

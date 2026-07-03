@@ -11,7 +11,7 @@ export function InstallCloser() {
         </h2>
         <InstallCommand />
         <Link
-          href="/docs/getting-started/install#build-from-source"
+          href="/docs/guides/getting-started/install#build-from-source"
           className="inline-flex items-center gap-1 self-start font-mono text-sm text-gray-7 transition-colors hover:text-fg"
         >
           <span>Build from source</span>

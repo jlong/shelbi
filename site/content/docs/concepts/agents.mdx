@@ -18,7 +18,7 @@ things:
 
 Splitting these apart is what lets the same workspace run a developer agent
 on one task and a reviewer agent on the next, and what lets a
-[workflow](/docs/concepts/workflows#owners-and-agents) say "this status is reviewed by
+[workflow](/docs/guides/getting-started/workflows#owners-and-agents) say "this status is reviewed by
 the security agent" as a line of YAML rather than a paragraph of prompt prose.
 
 ## The three shipped agents
@@ -126,7 +126,7 @@ See the [`shelbi agent`](/docs/cli/agent) reference for the full command set.
 ## Assigning an agent to work
 
 You rarely assign an agent to a task directly. Instead, a
-[workflow](/docs/concepts/workflows#owners-and-agents) status declares who owns it:
+[workflow](/docs/guides/getting-started/workflows#owners-and-agents) status declares who owns it:
 
 ```yaml
 # workflow file — reference-only; name/category live in statuses.yml
@@ -142,13 +142,13 @@ statuses:
 `developer` agent is used. The `review` status above is auto-reviewed by a
 `qa` agent you've authored before a human ever sees it — that's the whole "a
 reviewer is a role you can drop on a status" idea, expressed declaratively. See
-[owners](/docs/concepts/workflows#owners-and-agents) for the rules.
+[owners](/docs/guides/getting-started/workflows#owners-and-agents) for the rules.
 
 ## See also
 
 - [Workspaces](/docs/concepts/workspaces) — the capacity an agent runs in,
   and the agent/workspace split (role vs. slot).
-- [Workflows](/docs/concepts/workflows#owners-and-agents) — the `owner` + `agent`
+- [Workflows](/docs/guides/getting-started/workflows#owners-and-agents) — the `owner` + `agent`
   fields that route work to a named agent.
 - [Orchestrator](/docs/concepts/orchestrator) — the agent in window 1, and
   how its prompt is wired.

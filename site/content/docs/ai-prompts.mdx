@@ -25,19 +25,19 @@ rather than guessing.
 <CopyPromptBanner
   title="Set up my first Shelbi project"
   description="Install Shelbi and configure this repository, with the docs as the source of truth."
-  prompt={`I want to set up Shelbi on this repository. Use the official docs: the index is at https://shelbi.dev/llms.txt, and any page is available as clean markdown by appending .md to its URL (for example https://shelbi.dev/docs/getting-started/install.md). Read the Getting Started section, then walk me through it step by step — installing the binary, running the setup wizard, declaring my workspaces, and writing the project YAML. Ask me whatever you need about my machine and git host before you generate any config.`}
+  prompt={`I want to set up Shelbi on this repository. Use the official docs: the index is at https://shelbi.dev/llms.txt, and any page is available as clean markdown by appending .md to its URL (for example https://shelbi.dev/docs/guides/getting-started/install.md). Read the Getting Started section, then walk me through it step by step — installing the binary, running the setup wizard, declaring my workspaces, and writing the project YAML. Ask me whatever you need about my machine and git host before you generate any config.`}
 />
 
 <CopyPromptBanner
   title="Design a custom workflow for my team"
   description="Map your existing git branching model onto a Shelbi workflow."
-  prompt={`Read https://shelbi.dev/docs/concepts/workflows.md and the workflow guides linked from https://shelbi.dev/llms.txt. My team uses [describe your branching model — trunk-based, git-flow, feature-branch, or forking]. Design a Shelbi workflow that matches it: the statuses a task moves through, who owns each one, and the side-effects on each transition. Explain your choices, then produce the workflow YAML and the orchestrator instruction tweaks I need.`}
+  prompt={`Read https://shelbi.dev/docs/guides/getting-started/workflows.md and the workflow guides linked from https://shelbi.dev/llms.txt. My team uses [describe your branching model — trunk-based, git-flow, feature-branch, or forking]. Design a Shelbi workflow that matches it: the statuses a task moves through, who owns each one, and the side-effects on each transition. Explain your choices, then produce the workflow YAML and the orchestrator instruction tweaks I need.`}
 />
 
 <CopyPromptBanner
   title="Enable Zen Mode safely"
   description="Add the local checks Zen Mode needs, then turn it on."
-  prompt={`Read https://shelbi.dev/docs/getting-started/enable-zen-mode.md and https://shelbi.dev/docs/concepts/zen-mode.md. Zen Mode lets the Shelbi orchestrator auto-promote backlog and auto-merge finished branches that clear a confidence bar. Look at this repository's test and lint setup, recommend the local checks I should wire in before trusting auto-merge, help me add them, then tell me exactly what to flip to enable Zen Mode.`}
+  prompt={`Read https://shelbi.dev/docs/guides/getting-started/enable-zen-mode.md and https://shelbi.dev/docs/concepts/zen-mode.md. Zen Mode lets the Shelbi orchestrator auto-promote backlog and auto-merge finished branches that clear a confidence bar. Look at this repository's test and lint setup, recommend the local checks I should wire in before trusting auto-merge, help me add them, then tell me exactly what to flip to enable Zen Mode.`}
 />
 
 <CopyPromptBanner
@@ -62,7 +62,7 @@ every session. Add a pointer to Shelbi's docs so it always knows where to look:
 This project is orchestrated with Shelbi. When you need to know how Shelbi
 works, read https://shelbi.dev/llms.txt for the index, and append .md to any
 docs URL for its clean markdown source
-(e.g. https://shelbi.dev/docs/concepts/workflows.md).
+(e.g. https://shelbi.dev/docs/guides/getting-started/workflows.md).
 ```
 
 With that in place you can paste any prompt above, or just ask Claude Code to
