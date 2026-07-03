@@ -1,3 +1,7 @@
+"use client"
+
+import { useState } from "react"
+
 /**
  * A macOS-Terminal-window frame around an ASCII-art capture of the Shelbi
  * TUI's full dashboard — sidebar on the left, kanban body on the right.
@@ -26,8 +30,14 @@
  * `crates/shelbi-tui/src/app.rs` — the same rules the palette / sidebar
  * / kanban share so this mockup can't drift from the running TUI.
  *
- * The mockup stays static — no interaction — and on small viewports the
- * sidebar hides so the board doesn't force horizontal scroll on phones.
+ * The sidebar nav is interactive: clicking (or Enter/Space on) a nav row
+ * swaps the right pane between the Tasks board, the Activity feed, and the
+ * Chat transcript. `AppMockup` owns the live `activeView` in local state,
+ * seeded from the scenario so first paint matches the preset exactly; the
+ * Activity and Chat panes are built through the same Segment/Row monospace
+ * engine as the board so they read as captures of the same terminal, not an
+ * HTML re-implementation. On small viewports the sidebar hides so the board
+ * doesn't force horizontal scroll on phones.
  */
 
 // ── Palette ───────────────────────────────────────────────────────────
@@ -329,28 +339,271 @@ function titleRow(columns: Column[], project: string, activeView: NavView): Segm
   ]
 }
 
-/** Footer keybinding hints — matches `render_footer` in the crate. */
-function footerRow(): Segment[] {
-  // Match the real footer's key-in-fg / hint-in-dg pattern.
+/**
+ * Footer keybinding hints — matches `render_footer` in the crate, whose hints
+ * are per-view. Each view keeps the same key-in-fg / hint-in-dg pattern and
+ * pads to `BOARD_W` so the footer (and the frame) height is identical across
+ * views.
+ */
+function footerRow(activeView: NavView): Segment[] {
   const segs: Segment[] = []
   const push = (t: string, color = TUI_DARK_GRAY) => segs.push({ text: t, color })
   const key = (t: string) => push(t, TUI_FG)
+  // [key, hint] pairs per view.
+  const hints: [string, string][] =
+    activeView === "chat"
+      ? [["⏎", " send   "], ["↑/↓", " scroll   "], ["esc", " tasks"]]
+      : activeView === "activity"
+        ? [["j/k", " scroll   "], ["r", " refresh   "], ["esc", " tasks"]]
+        : [
+            ["h/l", " col   "],
+            ["j/k", " row   "],
+            ["⏎", " open   "],
+            ["n", " new   "],
+            ["f", " filter   "],
+            ["r", " refresh"],
+          ]
   push("  ")
-  key("h/l")
-  push(" col   ")
-  key("j/k")
-  push(" row   ")
-  key("⏎")
-  push(" open   ")
-  key("n")
-  push(" new   ")
-  key("f")
-  push(" filter   ")
-  key("r")
-  push(" refresh")
+  for (const [k, hint] of hints) {
+    key(k)
+    push(hint)
+  }
   const used = segs.reduce((acc, s) => acc + [...s.text].length, 0)
   if (used < BOARD_W) segs.push({ text: " ".repeat(BOARD_W - used) })
   return segs
+}
+
+// ── Activity & Chat panes ─────────────────────────────────────────────
+// Two alternate right-pane views, built as `Segment[][]` through the same
+// engine as the board so they read as captures of the real TUI's Activity
+// (`crates/shelbi-tui/src/activity.rs`) and Chat (Orchestrator transcript)
+// views — same palette, same monospace grid, same character alignment.
+
+/** Pad a run of segments to the full board width so a view fills the pane. */
+function bodyRow(segs: Segment[]): Segment[] {
+  const used = segs.reduce((acc, s) => acc + [...s.text].length, 0)
+  if (used >= BOARD_W) return segs
+  return [...segs, { text: " ".repeat(BOARD_W - used) }]
+}
+
+/**
+ * Left content + a right-aligned run, padded to `BOARD_W` with a 1-col
+ * trailing margin — the board's title/footer right-alignment shape, reused for
+ * Activity metrics ("took 12m", "#213").
+ */
+function bodyRightAlignRow(left: Segment[], right: Segment[]): Segment[] {
+  const leftW = left.reduce((acc, s) => acc + [...s.text].length, 0)
+  const rightW = right.reduce((acc, s) => acc + [...s.text].length, 0)
+  const pad = Math.max(1, BOARD_W - leftW - rightW - 1)
+  return [...left, { text: " ".repeat(pad) }, ...right, { text: " " }]
+}
+
+/** Greedy word-wrap to `width` monospace cells; returns one string per line. */
+function wrapText(text: string, width: number): string[] {
+  const lines: string[] = []
+  let cur = ""
+  for (const word of text.split(" ")) {
+    if (cur === "") cur = word
+    else if ([...cur].length + 1 + [...word].length <= width) cur += ` ${word}`
+    else {
+      lines.push(cur)
+      cur = word
+    }
+  }
+  if (cur) lines.push(cur)
+  return lines
+}
+
+/**
+ * Pad a view's body to `target` rows with blank board rows so the terminal
+ * frame keeps the board's height and doesn't jump when switching views.
+ */
+function padBodyTo(rows: Segment[][], target: number): Segment[][] {
+  const out = rows.slice(0, target)
+  while (out.length < target) out.push(BOARD_BLANK_ROW)
+  return out
+}
+
+// One Activity feed entry. `started`/`finished`/`idle` mirror the human-friendly
+// reformatting `activity.rs` does over `~/.shelbi/events.log`; `merged` is a
+// board-level "task shipped" line. `detail`/`metric` are the dim second line and
+// the right-aligned figure ("took 12m", "#213").
+type ActivityEvent = {
+  kind: "started" | "finished" | "idle" | "merged"
+  who: string
+  action: string
+  title?: string
+  detail?: { label: string; labelColor: string; branch: string }
+  metric?: string
+}
+
+// Representative feed for the sample project — same workspaces (alpha/bravo/
+// charlie/echo) and task titles as the board. Simplification: the real view
+// prefixes each attributed row with a multi-line avatar face; here each row
+// carries a single status glyph in its state tint (⏵ working / · idle / ✓ done)
+// instead, so the feed stays on the board's tight monospace grid without an
+// avatar column blowing the alignment budget.
+const ACTIVITY_EVENTS: ActivityEvent[] = [
+  {
+    kind: "finished",
+    who: "charlie",
+    action: "finished",
+    title: "Cold-start cache",
+    detail: { label: "review", labelColor: TUI_MAGENTA, branch: "shelbi/cold-start-cache" },
+    metric: "took 12m",
+  },
+  {
+    kind: "started",
+    who: "alpha",
+    action: "started",
+    title: "Deploy staging env",
+    detail: { label: "in progress", labelColor: TUI_YELLOW, branch: "shelbi/deploy-staging-env" },
+  },
+  { kind: "idle", who: "bravo", action: "→ idle" },
+  {
+    kind: "started",
+    who: "echo",
+    action: "started",
+    title: "Backfill order index",
+    detail: { label: "in progress", labelColor: TUI_YELLOW, branch: "shelbi/backfill-order-index" },
+  },
+  { kind: "merged", who: "merged", action: "merged", title: "Ship dark mode", metric: "#213" },
+]
+
+// Column geometry for the feed, in monospace cells.
+const ACT_INDENT = 2 // leading pad before the glyph
+const ACT_GLYPH_W = 2 // glyph + trailing space
+const ACT_WHO_W = 9 // workspace/label column
+const ACT_ACTION_W = 10 // action verb column
+const ACT_DETAIL_INDENT = ACT_INDENT + ACT_GLYPH_W + ACT_WHO_W // detail aligns under the action
+
+/** Glyph + tint for an event's status badge (green working, gray idle, green done). */
+function activityBadge(kind: ActivityEvent["kind"]): { glyph: string; color: string } {
+  switch (kind) {
+    case "idle":
+      return { glyph: "·", color: TUI_DARK_GRAY }
+    case "merged":
+      return { glyph: "✓", color: TUI_GREEN }
+    default:
+      return { glyph: "⏵", color: TUI_GREEN }
+  }
+}
+
+function buildActivityRows(state: AppState): Segment[][] {
+  const rows: Segment[][] = []
+
+  // `Today` bucket header (DarkGray), mirroring the date-bucketed feed.
+  rows.push(bodyRow([{ text: " Today", color: TUI_DARK_GRAY }]))
+  rows.push(BOARD_BLANK_ROW)
+
+  for (const ev of ACTIVITY_EVENTS) {
+    const badge = activityBadge(ev.kind)
+    // Line 1: indent · glyph · who · action · title, with an optional right metric.
+    const left: Segment[] = [
+      { text: " ".repeat(ACT_INDENT) },
+      { text: `${badge.glyph} `, color: badge.color },
+      { text: padTo(ev.who, ACT_WHO_W), color: TUI_GRAY },
+      { text: padTo(ev.action, ACT_ACTION_W), color: TUI_DARK_GRAY },
+    ]
+    if (ev.title) left.push({ text: ev.title, color: TUI_FG, bold: true })
+    rows.push(
+      ev.metric
+        ? bodyRightAlignRow(left, [{ text: ev.metric, color: TUI_DARK_GRAY }])
+        : bodyRow(left),
+    )
+
+    // Line 2 (optional): `label · branch`, the label in its state tint, dim branch.
+    if (ev.detail) {
+      rows.push(
+        bodyRow([
+          { text: " ".repeat(ACT_DETAIL_INDENT) },
+          { text: ev.detail.label, color: ev.detail.labelColor },
+          { text: " · ", color: TUI_DARK_GRAY },
+          { text: ev.detail.branch, color: TUI_DARK_GRAY },
+        ]),
+      )
+    }
+  }
+
+  return padBodyTo(rows, buildBoardRows(state.columns).length)
+}
+
+// One line of the Orchestrator transcript. `you` is the cyan human prompt;
+// `label` is the magenta "Orchestrator" speaker tag; `prose` is wrapped
+// narration; `bullet` is a dispatched-task line (• id title → workspace);
+// `blank` spaces speakers apart.
+type ChatLine =
+  | { kind: "you"; text: string }
+  | { kind: "label" }
+  | { kind: "prose"; text: string }
+  | { kind: "bullet"; id: string; title: string; workspace: string }
+  | { kind: "blank" }
+
+// A short Orchestrator conversation over the sample project — the human gives
+// natural-language direction, the Orchestrator narrates what it dispatched.
+const CHAT_LINES: ChatLine[] = [
+  { kind: "you", text: "Deploy the staging environment and wire up OAuth." },
+  { kind: "blank" },
+  { kind: "label" },
+  { kind: "prose", text: "Created two tasks and dispatched them:" },
+  { kind: "bullet", id: "t-009", title: "Deploy staging env", workspace: "alpha" },
+  { kind: "bullet", id: "t-010", title: "Wire up OAuth flow", workspace: "bravo" },
+  { kind: "prose", text: "Both running now. I'll merge as they hand off." },
+  { kind: "blank" },
+  { kind: "you", text: "How's OAuth going?" },
+  { kind: "blank" },
+  { kind: "label" },
+  {
+    kind: "prose",
+    text: "bravo → t-010, still in progress (~6m). Branch shelbi/wire-up-oauth-flow. I'll ping when it's ready for review.",
+  },
+]
+
+// Prose wraps well inside the board width; a comfortable measure keeps chat
+// readable rather than stretching lines across the full 111-cell pane.
+const CHAT_WRAP_W = 64
+
+function buildChatRows(state: AppState): Segment[][] {
+  const rows: Segment[][] = []
+
+  for (const line of CHAT_LINES) {
+    if (line.kind === "blank") {
+      rows.push(BOARD_BLANK_ROW)
+      continue
+    }
+    if (line.kind === "you") {
+      // Cyan `❯` prompt marker + the human's message in the foreground color.
+      rows.push(
+        bodyRow([
+          { text: " ❯ ", color: TUI_CYAN, bold: true },
+          { text: line.text, color: TUI_FG },
+        ]),
+      )
+      continue
+    }
+    if (line.kind === "label") {
+      rows.push(bodyRow([{ text: "  Orchestrator", color: TUI_MAGENTA, bold: true }]))
+      continue
+    }
+    if (line.kind === "bullet") {
+      rows.push(
+        bodyRow([
+          { text: "    • ", color: TUI_DARK_GRAY },
+          { text: `${line.id} `, color: TUI_DARK_GRAY },
+          { text: padTo(line.title, 20), color: TUI_FG },
+          { text: " → ", color: TUI_DARK_GRAY },
+          { text: line.workspace, color: TUI_MAGENTA },
+        ]),
+      )
+      continue
+    }
+    // Prose: wrapped, indented two cells to sit under the Orchestrator label.
+    for (const wrapped of wrapText(line.text, CHAT_WRAP_W)) {
+      rows.push(bodyRow([{ text: `  ${wrapped}`, color: TUI_FG }]))
+    }
+  }
+
+  return padBodyTo(rows, buildBoardRows(state.columns).length)
 }
 
 // ── Sidebar ───────────────────────────────────────────────────────────
@@ -395,8 +648,46 @@ function sidebarRightAlignRow(
   return padSidebarRow(left)
 }
 
-function buildSidebarRows(state: AppState): Segment[][] {
-  const rows: Segment[][] = []
+// One sidebar nav item, resolved from `NAV_ITEMS`.
+type NavItem = (typeof NAV_ITEMS)[number]
+
+/**
+ * A rendered sidebar row. Most rows are plain `Segment[]` lines; nav rows are
+ * emitted as a tagged descriptor instead so `Sidebar` can render them through
+ * the interactive `<NavRow>` (which owns hover state and the click/keyboard
+ * handlers) while every other row still flows through the static `<Row>`.
+ * Plain rows stay `Segment[]` so the many `rows.push(...)` sites are unchanged
+ * and the two kinds are told apart with `Array.isArray`.
+ */
+type SidebarRow = Segment[] | { nav: NavItem; selected: boolean }
+
+/**
+ * Segments for one nav row (💬 Chat / 📋 Tasks / ⚡ Activity). `filled` paints
+ * the full-row `SIDEBAR_SEL_BG` the TUI's `render_list` gives the selected row;
+ * we reuse it for the active row (always) and for hover (affordance). Active
+ * text is white-bold like the real selection; a hover-only fill keeps the gray
+ * label (the "subtle version") so the active row stays distinguishable.
+ */
+function navRowSegs(glyph: string, label: string, selected: boolean, filled: boolean): Segment[] {
+  const bg = filled ? SIDEBAR_SEL_BG : undefined
+  const inner: Segment[] = [
+    { text: " ", bg },
+    {
+      text: `${glyph} ${label}`,
+      color: selected ? SEL_FG : TUI_GRAY,
+      bg,
+      bold: selected,
+    },
+  ]
+  const used = inner.reduce((acc, s) => acc + [...s.text].length, 0)
+  if (used < SIDEBAR_W) {
+    inner.push({ text: " ".repeat(SIDEBAR_W - used), bg })
+  }
+  return inner
+}
+
+function buildSidebarRows(state: AppState): SidebarRow[] {
+  const rows: SidebarRow[] = []
 
   // Project header — same Cyan Bold `app.project_name` renders at.
   rows.push(
@@ -407,30 +698,12 @@ function buildSidebarRows(state: AppState): Segment[][] {
   )
   rows.push(SIDEBAR_BLANK_ROW)
 
-  // Nav rows — 💬 Chat / 📋 Tasks / ⚡ Activity. The active view's row
-  // gets the full-row dark-gray fill + white-bold text
-  // `sidebar.rs::render_list` applies to the selected row.
-  const navRow = (glyph: string, label: string, selected = false): Segment[] => {
-    const inner: Segment[] = [
-      { text: " ", bg: selected ? SIDEBAR_SEL_BG : undefined },
-      {
-        text: `${glyph} ${label}`,
-        color: selected ? SEL_FG : TUI_GRAY,
-        bg: selected ? SIDEBAR_SEL_BG : undefined,
-        bold: selected,
-      },
-    ]
-    const used = inner.reduce((acc, s) => acc + [...s.text].length, 0)
-    if (used < SIDEBAR_W) {
-      inner.push({
-        text: " ".repeat(SIDEBAR_W - used),
-        bg: selected ? SIDEBAR_SEL_BG : undefined,
-      })
-    }
-    return inner
-  }
+  // Nav rows — 💬 Chat / 📋 Tasks / ⚡ Activity. Emitted as tagged descriptors
+  // so `Sidebar` renders them through the interactive `<NavRow>`; the active
+  // view's row gets the full-row fill + white-bold text `sidebar.rs::render_list`
+  // applies to the selected row, and `<NavRow>` adds the hover fill on top.
   for (const nav of NAV_ITEMS) {
-    rows.push(navRow(nav.glyph, nav.label, nav.view === state.activeView))
+    rows.push({ nav, selected: nav.view === state.activeView })
   }
   rows.push(SIDEBAR_BLANK_ROW)
 
@@ -567,7 +840,8 @@ function reviewEntryRows(entry: ReviewEntry, ready: boolean): Segment[][] {
 
 // ── Panels ────────────────────────────────────────────────────────────
 
-function Row({ segs }: { segs: Segment[] }) {
+/** The `<span>` runs for one row's segments — shared by `Row` and `NavRow`. */
+function SegSpans({ segs }: { segs: Segment[] }) {
   return (
     <>
       {segs.map((seg, j) => {
@@ -581,6 +855,60 @@ function Row({ segs }: { segs: Segment[] }) {
           </span>
         )
       })}
+    </>
+  )
+}
+
+function Row({ segs }: { segs: Segment[] }) {
+  return (
+    <>
+      <SegSpans segs={segs} />
+      {"\n"}
+    </>
+  )
+}
+
+/**
+ * An interactive sidebar nav row. Renders through the same segment spans as a
+ * static `Row` (so the monospace grid is untouched) but wraps them in a
+ * focusable `role="button"` span: click or Enter/Space selects the view, and
+ * hover/focus paints the `SIDEBAR_SEL_BG` fill as a discoverability affordance.
+ * The trailing newline stays outside the button so the button's box hugs the
+ * row content.
+ */
+function NavRow({
+  nav,
+  selected,
+  onSelect,
+}: {
+  nav: NavItem
+  selected: boolean
+  onSelect: (view: NavView) => void
+}) {
+  const [hover, setHover] = useState(false)
+  const segs = navRowSegs(nav.glyph, nav.label, selected, selected || hover)
+  return (
+    <>
+      <span
+        role="button"
+        tabIndex={0}
+        aria-label={`${nav.label} view`}
+        aria-pressed={selected}
+        style={{ cursor: "pointer" }}
+        onClick={() => onSelect(nav.view)}
+        onKeyDown={(e) => {
+          if (e.key === "Enter" || e.key === " ") {
+            e.preventDefault()
+            onSelect(nav.view)
+          }
+        }}
+        onMouseEnter={() => setHover(true)}
+        onMouseLeave={() => setHover(false)}
+        onFocus={() => setHover(true)}
+        onBlur={() => setHover(false)}
+      >
+        <SegSpans segs={segs} />
+      </span>
       {"\n"}
     </>
   )
@@ -604,12 +932,20 @@ const PRE_STYLE: React.CSSProperties = {
 }
 
 function TerminalBody({ state }: { state: AppState }) {
+  // The right pane swaps on the active nav view. Activity and Chat are padded
+  // to the board's height so the terminal frame stays a fixed size.
+  const body: Segment[][] =
+    state.activeView === "activity"
+      ? buildActivityRows(state)
+      : state.activeView === "chat"
+        ? buildChatRows(state)
+        : buildBoardRows(state.columns)
   const rows: Segment[][] = [
     titleRow(state.columns, state.project, state.activeView),
     BOARD_BLANK_ROW,
-    ...buildBoardRows(state.columns),
+    ...body,
     BOARD_BLANK_ROW,
-    footerRow(),
+    footerRow(state.activeView),
   ]
 
   return (
@@ -624,7 +960,13 @@ function TerminalBody({ state }: { state: AppState }) {
   )
 }
 
-function Sidebar({ state }: { state: AppState }) {
+function Sidebar({
+  state,
+  onSelectView,
+}: {
+  state: AppState
+  onSelectView: (view: NavView) => void
+}) {
   const rows = buildSidebarRows(state)
   return (
     <pre
@@ -637,9 +979,13 @@ function Sidebar({ state }: { state: AppState }) {
         borderColor: TUI_DIVIDER,
       }}
     >
-      {rows.map((row, i) => (
-        <Row key={i} segs={row} />
-      ))}
+      {rows.map((row, i) =>
+        Array.isArray(row) ? (
+          <Row key={i} segs={row} />
+        ) : (
+          <NavRow key={i} nav={row.nav} selected={row.selected} onSelect={onSelectView} />
+        ),
+      )}
     </pre>
   )
 }
@@ -681,7 +1027,12 @@ export function AppMockup({
   ...overrides
 }: { state?: AppState; preset?: PresetName } & Partial<AppState>) {
   const base = state ?? PRESETS[preset]
-  const resolved: AppState = { ...base, ...overrides }
+  const merged: AppState = { ...base, ...overrides }
+  // The active nav view is live, interactive state — seeded from the scenario
+  // so first paint matches the preset exactly (the hero stays on Tasks), then
+  // driven by clicking the sidebar nav. Everything else stays static data.
+  const [activeView, setActiveView] = useState<NavView>(merged.activeView)
+  const resolved: AppState = { ...merged, activeView }
   return (
     <section className="border-b border-gray-4 px-3 py-6 sm:py-10">
       {/* w-fit hugs the board's natural width; max-w-full keeps the
@@ -730,7 +1081,7 @@ export function AppMockup({
             className="flex overflow-x-auto"
             style={{ background: TUI_BG }}
           >
-            <Sidebar state={resolved} />
+            <Sidebar state={resolved} onSelectView={setActiveView} />
             <TerminalBody state={resolved} />
           </div>
         </div>
