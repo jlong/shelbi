@@ -3,6 +3,7 @@ import Link from "next/link"
 import { AppMockup } from "./KanbanMockup"
 import { CopyPromptBanner } from "./CopyPromptBanner"
 import { InstallCommand } from "./InstallCommand"
+import { Steps, Step } from "./Steps"
 
 /**
  * Element overrides applied to rendered docs MDX. Strict-monochrome per
@@ -17,6 +18,8 @@ export const mdxComponents: MDXComponents = {
   CopyPromptBanner,
   InstallCommand,
   AppMockup,
+  Steps,
+  Step,
   h1: (props) => (
     <h1 className="mt-6 mb-3 scroll-mt-8 text-3xl font-semibold tracking-tight text-fg" {...props} />
   ),
