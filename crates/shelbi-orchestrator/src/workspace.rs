@@ -737,7 +737,7 @@ pub fn start_workspace_on_task(spec: StartSpec<'_>) -> Result<TmuxAddr> {
     //    in its ready-category column, exactly like a readiness timeout,
     //    instead of moving it to `in_progress` on a workspace that never got
     //    the prompt.
-    if !confirm_prompt_submitted(&host, &addr, spec.task_id, &spec.workspace.name) {
+    if !confirm_prompt_submitted(&host, &addr, spec.task_id, &spec.workspace.name, &prompt) {
         return Err(Error::Other(format!(
             "prompt was not accepted on {} — no submission signal after a retry \
              Enter. Dispatch aborted so the task stays put for retry; check the \
@@ -774,22 +774,44 @@ const PROMPT_SUBMIT_SCROLLBACK: usize = 200;
 /// dispatch event (so `shelbi events tail` and the orchestrator see it) and
 /// return `false` — the caller aborts the dispatch rather than marking the
 /// task active on a workspace sitting on an unsubmitted (or swallowed) prompt.
-fn confirm_prompt_submitted(host: &Host, addr: &TmuxAddr, task_id: &str, workspace: &str) -> bool {
-    if wait_for_prompt_submitted(host, addr, PROMPT_SUBMIT_WAIT) {
+///
+/// Submission is confirmed by any of the signals in `wait_for_prompt_submitted`.
+/// The newest — the prompt no longer sitting in claude's input box — is what
+/// keeps a genuine submit whose busy footer we never caught (the earliest
+/// spinner matches no busy marker) from reading as a lost prompt and aborting
+/// a healthy dispatch. The one retry Enter is gated on the prompt *still* being
+/// parked in the box: re-Entering an already-cleared box is pointless, and
+/// re-Entering a box the user has since started typing into could fire a
+/// partial message.
+fn confirm_prompt_submitted(
+    host: &Host,
+    addr: &TmuxAddr,
+    task_id: &str,
+    workspace: &str,
+    prompt: &str,
+) -> bool {
+    if wait_for_prompt_submitted(host, addr, prompt, PROMPT_SUBMIT_WAIT) {
         return true;
     }
-    // First Enter likely raced claude's focus — resend a bare Enter and give
-    // the hook one more window to fire. Avoid spamming Enters: a second one
-    // after the prompt is already processed would submit an empty message,
-    // which claude ignores, but more than that starts to look like noise.
-    if let Err(e) = shelbi_tmux::send_enter(host, addr) {
-        eprintln!(
-            "shelbi: retry Enter to {} after stalled dispatch failed: {e}",
-            addr.target(),
-        );
-    }
-    if wait_for_prompt_submitted(host, addr, PROMPT_SUBMIT_WAIT) {
-        return true;
+    // No positive signal in the first window. Nudge with one retry Enter only
+    // if the prompt is genuinely still parked in the input box — if it's
+    // cleared (submitted; busy signal just missed) or we can't see the box,
+    // there's nothing a retry would fix.
+    if input_holds_prompt(&shelbi_tmux::capture(host, addr).unwrap_or_default(), prompt) {
+        // First Enter likely raced claude's focus — resend a bare Enter and
+        // give the hook one more window to fire. Avoid spamming Enters: a
+        // second one after the prompt is already processed would submit an
+        // empty message, which claude ignores, but more than that starts to
+        // look like noise.
+        if let Err(e) = shelbi_tmux::send_enter(host, addr) {
+            eprintln!(
+                "shelbi: retry Enter to {} after stalled dispatch failed: {e}",
+                addr.target(),
+            );
+        }
+        if wait_for_prompt_submitted(host, addr, prompt, PROMPT_SUBMIT_WAIT) {
+            return true;
+        }
     }
     eprintln!(
         "shelbi: dispatched prompt to {} but no submission signal appeared \
@@ -811,7 +833,7 @@ fn confirm_prompt_submitted(host: &Host, addr: &TmuxAddr, task_id: &str, workspa
 /// `timeout` elapses. Capture failures during the poll are transient (the
 /// SSH socket can hiccup); we just ignore them and keep polling.
 ///
-/// Two independent signals — either one is sufficient:
+/// Three independent signals — any one is sufficient:
 ///
 /// 1. **Pane title carries a `shelbi:*` marker.** The workspace's
 ///    `UserPromptSubmit` hook writes `shelbi:working` via OSC, so when the
@@ -828,7 +850,21 @@ fn confirm_prompt_submitted(host: &Host, addr: &TmuxAddr, task_id: &str, workspa
 ///    the empty-input / waiting-for-user state. This signal survives
 ///    Claude's title overwrites because we read the pane *body*, not the
 ///    title.
-fn wait_for_prompt_submitted(host: &Host, addr: &TmuxAddr, timeout: std::time::Duration) -> bool {
+///
+/// 3. **The input box no longer holds our prompt.** After we type + Enter a
+///    prompt, a cleared input box is direct proof it was consumed. This is
+///    the signal that closes the false-positive gap: claude's *earliest*
+///    spinner (the first second or two, before any tokens stream) matches
+///    none of the busy markers in (2), so a prompt that submitted and
+///    started working could otherwise slip past both (1) and (2) and get a
+///    spurious `enter-stalled`. Reading the box directly doesn't depend on
+///    catching the spinner at the right instant.
+fn wait_for_prompt_submitted(
+    host: &Host,
+    addr: &TmuxAddr,
+    prompt: &str,
+    timeout: std::time::Duration,
+) -> bool {
     let start = std::time::Instant::now();
     while start.elapsed() < timeout {
         let title = shelbi_tmux::pane_title(host, addr).unwrap_or_default();
@@ -845,9 +881,112 @@ fn wait_for_prompt_submitted(host: &Host, addr: &TmuxAddr, timeout: std::time::D
         if claude_is_processing(&screen) {
             return true;
         }
+        // Most direct of all: the prompt is gone from the input box. Guard on
+        // the box actually being on screen (`input_box_cleared`) so a capture
+        // that missed the box — or one taken before claude echoed the typed
+        // prompt — doesn't read as "submitted."
+        if input_box_cleared(&screen, prompt) {
+            return true;
+        }
         std::thread::sleep(PROMPT_SUBMIT_POLL);
     }
     false
+}
+
+/// Minimum number of non-whitespace characters a captured input-box line must
+/// share with the prompt before we count it as "the prompt is still sitting
+/// in the box." Short coincidental overlaps (a lone `git`, a bare `2.`) must
+/// not qualify, or claude's dim placeholder — or an unrelated line — could
+/// read as an un-submitted prompt.
+const PROMPT_ECHO_MIN_MATCH: usize = 24;
+
+/// Extract the lines currently shown inside claude's live input box — the
+/// region between the last two horizontal-rule lines at the bottom of the
+/// pane — with the leading prompt glyph stripped. Returns `None` when no
+/// input box is on screen (a modal dialog, or a capture taken before claude
+/// drew its box).
+///
+/// tmux capture uses `-J`, so tmux's own soft-wraps are already rejoined; the
+/// lines we get back are claude's own rendered rows.
+fn input_box_lines(screen: &str) -> Option<Vec<String>> {
+    // A rule is a pure horizontal border: only box-drawing dashes/corners,
+    // and long enough not to be an accidental run. `─── text ───` (claude's
+    // titled header rule) contains letters, so it's excluded — we want the
+    // plain rules that fence the input box.
+    const BORDER: &[char] = &['─', '╭', '╮', '╰', '╯'];
+    let is_rule = |l: &&str| {
+        let t = l.trim();
+        t.chars().count() >= 3 && t.chars().all(|c| BORDER.contains(&c))
+    };
+    let lines: Vec<&str> = screen.lines().collect();
+    let rules: Vec<usize> = lines
+        .iter()
+        .enumerate()
+        .filter(|(_, l)| is_rule(l))
+        .map(|(i, _)| i)
+        .collect();
+    if rules.len() < 2 {
+        return None;
+    }
+    let top = rules[rules.len() - 2];
+    let bottom = rules[rules.len() - 1];
+    Some(
+        lines[top + 1..bottom]
+            .iter()
+            .map(|l| strip_input_glyph(l).trim().to_string())
+            .collect(),
+    )
+}
+
+/// Strip claude's leading input-prompt glyph (`❯` or a plain `>`) plus any
+/// following space from a captured input-box line.
+fn strip_input_glyph(line: &str) -> &str {
+    let t = line.trim_start();
+    for g in ['❯', '>'] {
+        if let Some(rest) = t.strip_prefix(g) {
+            return rest.trim_start();
+        }
+    }
+    t
+}
+
+/// Squeeze every whitespace character out of `s`. Comparing prompt text to a
+/// captured input box has to survive claude's own soft-wrapping and
+/// indentation, which we don't control — dropping all whitespace makes a
+/// wrapped row of the prompt a clean substring of the whitespace-free prompt.
+fn squeeze_ws(s: &str) -> String {
+    s.chars().filter(|c| !c.is_whitespace()).collect()
+}
+
+/// True when the pane shows claude's input box *still holding the dispatched
+/// prompt* — the genuine "un-submitted prompt" state that warrants an
+/// `enter-stalled` warning.
+///
+/// We look only at the live input box, never the scrollback: claude keeps a
+/// rendered copy of the prompt as the user message above the box even after a
+/// successful submit, so a whole-screen text match would false-positive. We
+/// then check whether any single box line reproduces a long-enough slice of
+/// the prompt. Matching per-line (rather than the box as a whole) tolerates
+/// claude scrolling a tall prompt so only its head or tail is visible, and a
+/// truncated middle — any one verbatim prompt line is proof enough.
+fn input_holds_prompt(screen: &str, prompt: &str) -> bool {
+    let Some(box_lines) = input_box_lines(screen) else {
+        return false;
+    };
+    let prompt_norm = squeeze_ws(prompt);
+    box_lines.iter().any(|line| {
+        let norm = squeeze_ws(line);
+        norm.chars().count() >= PROMPT_ECHO_MIN_MATCH && prompt_norm.contains(&norm)
+    })
+}
+
+/// True when claude's input box is on screen but *not* holding the prompt —
+/// empty, or showing only its dim placeholder. After we've typed and Enter'd
+/// a prompt, a cleared box is direct proof it was consumed (submitted). The
+/// `input_box_lines(..).is_some()` guard keeps a capture that missed the box
+/// entirely from reading as "cleared."
+fn input_box_cleared(screen: &str, prompt: &str) -> bool {
+    input_box_lines(screen).is_some() && !input_holds_prompt(screen, prompt)
 }
 
 /// True when the captured pane shows claude is actively processing a
@@ -2103,6 +2242,75 @@ mod tests {
         // dialog, not into claude's input. Pin that behavior so a
         // future "be more inclusive" tweak can't quietly regress it.
         assert!(!claude_is_processing("Enter to confirm · Esc to cancel"));
+    }
+
+    // A pane whose prompt is still sitting UN-submitted in the input box:
+    // claude echoed the typed text but Enter never landed, so the box (the
+    // region between the last two ──── rules) reproduces the prompt, wrapped
+    // across a couple of rows the way claude renders it.
+    const STALLED_INPUT_SCREEN: &str = "\
+╭─── Claude Code v2.1.183 ──────────────────────────╮
+│            Welcome back John!                      │
+╰───────────────────────────────────────────────────╯
+
+────────────────────────────────────────────────────
+❯ # dispatch: enter-stalled false positive — submit
+  signal detector reports a stall on submitted prompts
+────────────────────────────────────────────────────
+  ⏵⏵ auto mode on (shift+tab to cycle)";
+
+    fn stalled_prompt() -> String {
+        // Contains the two lines the box shows above, contiguously (the box
+        // wraps them, but the source prompt has them on one logical line).
+        "# dispatch: enter-stalled false positive — submit \
+         signal detector reports a stall on submitted prompts\n\n\
+         Fix the detector."
+            .to_string()
+    }
+
+    #[test]
+    fn input_holds_prompt_true_when_box_still_shows_prompt() {
+        // The genuine-stall case: the prompt is visibly parked in the input
+        // box, so we must still be willing to warn.
+        assert!(input_holds_prompt(STALLED_INPUT_SCREEN, &stalled_prompt()));
+        assert!(!input_box_cleared(STALLED_INPUT_SCREEN, &stalled_prompt()));
+    }
+
+    #[test]
+    fn input_holds_prompt_false_when_box_empty_or_placeholder() {
+        // A submitted prompt leaves the box empty (busy pane) or showing only
+        // claude's dim placeholder (idle-after-submit) — neither is the
+        // prompt, so no warning. This is the false-positive the fix closes.
+        let prompt = stalled_prompt();
+        assert!(!input_holds_prompt(BUSY_SCREEN_SPINNER, &prompt));
+        assert!(!input_holds_prompt(INPUT_BOX_SCREEN, &prompt));
+        // ...and both read as a *cleared* box, our positive submit signal.
+        assert!(input_box_cleared(BUSY_SCREEN_SPINNER, &prompt));
+        assert!(input_box_cleared(INPUT_BOX_SCREEN, &prompt));
+    }
+
+    #[test]
+    fn input_box_helpers_handle_missing_box() {
+        // No rules on screen (a modal dialog, or a pre-render capture): we
+        // can't locate the box, so we neither claim the prompt is stuck nor
+        // claim it cleared — both stay false, keeping us from crying wolf.
+        assert!(!input_holds_prompt(TRUST_DIALOG_SCREEN, &stalled_prompt()));
+        assert!(!input_box_cleared(TRUST_DIALOG_SCREEN, &stalled_prompt()));
+        assert!(!input_holds_prompt("", &stalled_prompt()));
+        assert!(!input_box_cleared("", &stalled_prompt()));
+    }
+
+    #[test]
+    fn input_holds_prompt_ignores_short_coincidental_overlap() {
+        // A one-line box that only shares a short token with the prompt must
+        // not trip the match — that's how the placeholder and unrelated
+        // half-typed lines are kept from reading as the dispatched prompt.
+        let screen = "\
+────────────────────────────────────────────────────
+❯ Fix the detector.
+────────────────────────────────────────────────────
+  ? for shortcuts";
+        assert!(!input_holds_prompt(screen, &stalled_prompt()));
     }
 
     #[test]
