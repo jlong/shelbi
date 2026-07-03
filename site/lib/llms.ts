@@ -5,7 +5,7 @@ import { getSections, humanizeSection, sortedDocs, type Doc } from "@/lib/docs"
 // step with the `SITE_URL` in `app/layout.tsx`; both point at production.
 export const SITE_URL = "https://shelbi.dev"
 const SITE_TAGLINE =
-  "Open-source agent orchestrator for the terminal — a Kanban board that dispatches coding tasks to a named pool of workspaces, locally or over SSH."
+  "Do more with your agents — a multi-machine orchestrator for your coding agents, built on tmux. Dispatch tasks to a named pool of workspaces, locally or over SSH."
 
 /**
  * Turn one contentlayer doc into clean, agent-ready markdown.
