@@ -18,7 +18,7 @@ use std::io::{self, BufRead, IsTerminal, Write};
 use std::path::Path;
 use std::process::{Command, Stdio};
 use std::sync::{
-    atomic::{AtomicBool, Ordering},
+    atomic::{AtomicBool, AtomicI32, Ordering},
     Arc, Mutex,
 };
 
@@ -131,8 +131,24 @@ pub fn run(project: &Project, workspace: &WorkspaceSpec, machine: &Machine) -> R
     // either way (Unix kernels propagate process-group signals to
     // children too); recording the signal lets us label the events.log
     // reason and skip the "press enter" prompt on a forced teardown.
+    //
+    // The listener is installed BEFORE the child is spawned (F11): a
+    // signal arriving in the spawn window would otherwise hit the
+    // wrapper's default disposition and kill it outright, orphaning a
+    // half-started pane and dropping the lifecycle event. The child's
+    // PID isn't known until spawn returns, so the listener reads it from
+    // a shared cell that we populate the instant `spawn()` succeeds; a
+    // signal caught before then is recorded and forwarded once the PID
+    // lands.
     let received_signal: Arc<Mutex<Option<i32>>> = Arc::new(Mutex::new(None));
     let signaled_flag = Arc::new(AtomicBool::new(false));
+    let child_pid_cell = Arc::new(AtomicI32::new(0));
+
+    let signal_handle = install_signal_listener(
+        Arc::clone(&received_signal),
+        Arc::clone(&signaled_flag),
+        Arc::clone(&child_pid_cell),
+    )?;
 
     // Phase 3: pin `SHELBI_HUB_SOCK` so the agent's `nc -U` / socat /
     // python socket-write one-liners resolve to the same path the daemon
@@ -156,13 +172,18 @@ pub fn run(project: &Project, workspace: &WorkspaceSpec, machine: &Machine) -> R
         .stderr(Stdio::inherit())
         .spawn()
         .map_err(|e| anyhow!("spawning agent (`sh -c {shell_cmd}`): {e}"))?;
-    let child_pid = child.id() as libc::pid_t;
-
-    let signal_handle = install_signal_listener(
-        Arc::clone(&received_signal),
-        Arc::clone(&signaled_flag),
-        child_pid,
-    )?;
+    // Publish the child PID so the already-running listener can forward
+    // signals to it. Then handle the narrow window where a signal was
+    // caught before the PID was published: forward it now so the child
+    // still tears down instead of being left running.
+    child_pid_cell.store(child.id() as i32, Ordering::SeqCst);
+    if let Some(sig) = *received_signal.lock().unwrap() {
+        // SAFETY: kill takes a raw pid; no memory is dereferenced. A
+        // benign ESRCH here just means the child already exited.
+        unsafe {
+            libc::kill(child.id() as libc::pid_t, sig);
+        }
+    }
 
     let status = child
         .wait()
@@ -234,10 +255,17 @@ pub fn run(project: &Project, workspace: &WorkspaceSpec, machine: &Machine) -> R
 /// only signal the wrapper, not the whole process group). Returns the
 /// signal handle so the caller can close the listener once `wait()`
 /// returns.
+///
+/// `child_pid_cell` is read at signal time rather than captured by value
+/// so this can be installed BEFORE the child is spawned (F11): the
+/// caller stores the real PID into the cell the moment `spawn()`
+/// succeeds. A signal that arrives while the cell is still `0` (the
+/// pre-spawn window) is recorded but not forwarded here — the caller
+/// forwards it once it publishes the PID.
 pub(super) fn install_signal_listener(
     received_signal: Arc<Mutex<Option<i32>>>,
     signaled_flag: Arc<AtomicBool>,
-    child_pid: libc::pid_t,
+    child_pid_cell: Arc<AtomicI32>,
 ) -> Result<signal_hook::iterator::Handle> {
     use signal_hook::consts::{SIGHUP, SIGINT, SIGTERM};
     use signal_hook::iterator::Signals;
@@ -254,11 +282,17 @@ pub(super) fn install_signal_listener(
                 continue;
             }
             *received_signal.lock().unwrap() = Some(sig);
-            // Forward the signal to the child. Errors here are benign:
-            // the child may have already exited (ESRCH) or the process
-            // group may have delivered the signal already.
-            unsafe {
-                libc::kill(child_pid, sig);
+            // Forward the signal to the child. A `0` cell means the child
+            // isn't spawned yet (pre-spawn signal window) — the caller
+            // handles that case after publishing the PID, so skip here.
+            // Errors from a real PID are benign: the child may have
+            // already exited (ESRCH) or the process group may have
+            // delivered the signal already.
+            let child_pid = child_pid_cell.load(Ordering::SeqCst);
+            if child_pid > 0 {
+                unsafe {
+                    libc::kill(child_pid as libc::pid_t, sig);
+                }
             }
         }
     });
@@ -339,11 +373,22 @@ fn kill_task_tail(worktree: &Path, task_id: &str) -> std::io::Result<()> {
         Err(e) => return Err(e),
     };
     if let Ok(pid) = pid_text.trim().parse::<libc::pid_t>() {
-        // SAFETY: libc::kill is unsafe only because it takes a raw pid;
-        // we're not dereferencing memory. ESRCH (process gone) is the
-        // expected case when the tail has already been reaped.
-        unsafe {
-            libc::kill(pid, libc::SIGTERM);
+        // Guard against PID reuse (F11): between the SessionStart hook
+        // recording `$!` and this cleanup running, the tail may have died
+        // and its PID been recycled to an unrelated process. Signaling
+        // that innocent process is the bug. Same principle as
+        // state-runtime F5's identity check — verify the PID still names
+        // *our* tail (a `tail` invocation referencing this task's message
+        // log) before signaling. A recycled/unidentifiable PID is left
+        // alone: leaking a stray tail is far less harmful than killing a
+        // bystander.
+        if pid_is_task_tail(pid, task_id) {
+            // SAFETY: libc::kill is unsafe only because it takes a raw
+            // pid; we're not dereferencing memory. ESRCH (process gone)
+            // is the expected case when the tail has already been reaped.
+            unsafe {
+                libc::kill(pid, libc::SIGTERM);
+            }
         }
     }
     // rm -rf the lock dir so a stale pid file from a crashed tail
@@ -354,6 +399,90 @@ fn kill_task_tail(worktree: &Path, task_id: &str) -> std::io::Result<()> {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(e) => Err(e),
     }
+}
+
+/// Identity guard for [`kill_task_tail`]: does the live process `pid`
+/// look like the message-tail the SessionStart hook spawned for
+/// `task_id`? The hook runs `tail -f -n 0 .shelbi/messages/<id>.log`, so
+/// a genuine tail's argv contains both `tail` and this task's log name.
+/// A PID recycled to an unrelated process won't. When the argv can't be
+/// read at all (process gone, EPERM, unsupported platform) we report
+/// `false` — refusing to signal a process we can't positively identify.
+fn pid_is_task_tail(pid: libc::pid_t, task_id: &str) -> bool {
+    let blob = match process_argv_blob(pid) {
+        Some(b) => b,
+        None => return false,
+    };
+    let contains = |needle: &[u8]| blob.windows(needle.len()).any(|w| w == needle);
+    contains(b"tail") && contains(format!("{task_id}.log").as_bytes())
+}
+
+/// Best-effort read of a process's raw argument blob (NUL-separated
+/// argv, plus the exec path on macOS). Used only to *identify* a process
+/// before signaling it, so callers substring-scan the blob rather than
+/// parse argv precisely. `None` means the argv couldn't be read (process
+/// gone, permission denied, or an unsupported platform).
+#[cfg(target_os = "linux")]
+fn process_argv_blob(pid: libc::pid_t) -> Option<Vec<u8>> {
+    if pid <= 0 {
+        return None;
+    }
+    std::fs::read(format!("/proc/{pid}/cmdline"))
+        .ok()
+        .filter(|b| !b.is_empty())
+}
+
+/// macOS: `sysctl(KERN_PROCARGS2)` returns `[argc:i32][exec_path\0]
+/// [pad\0…][argv0\0][argv1\0]…`. We don't parse the layout — the caller
+/// only needs to know whether a distinguishing substring is present — so
+/// we return the whole buffer.
+#[cfg(target_os = "macos")]
+fn process_argv_blob(pid: libc::pid_t) -> Option<Vec<u8>> {
+    if pid <= 0 {
+        return None;
+    }
+    let mut mib = [libc::CTL_KERN, libc::KERN_PROCARGS2, pid];
+    let mut size: libc::size_t = 0;
+    // First call sizes the buffer; a failure (e.g. process gone, or we
+    // lack permission to read its args) means "identity unknown".
+    // SAFETY: sysctl writes only into `size` when the value pointer is
+    // null; `mib` is a valid 3-element array.
+    let rc = unsafe {
+        libc::sysctl(
+            mib.as_mut_ptr(),
+            mib.len() as libc::c_uint,
+            std::ptr::null_mut(),
+            &mut size,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if rc != 0 || size == 0 {
+        return None;
+    }
+    let mut buf = vec![0u8; size];
+    // SAFETY: `buf` holds `size` writable bytes; sysctl writes at most
+    // `size` and updates `size` to the count actually written.
+    let rc = unsafe {
+        libc::sysctl(
+            mib.as_mut_ptr(),
+            mib.len() as libc::c_uint,
+            buf.as_mut_ptr() as *mut libc::c_void,
+            &mut size,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if rc != 0 {
+        return None;
+    }
+    buf.truncate(size);
+    Some(buf)
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn process_argv_blob(_pid: libc::pid_t) -> Option<Vec<u8>> {
+    None
 }
 
 #[cfg(test)]
@@ -419,6 +548,98 @@ mod tests {
         // Unknown signals fall back to a numeric string so the reason
         // remains a single token.
         assert_eq!(signal_name(99), "99");
+    }
+
+    /// F11 acceptance: the signal listener is installed BEFORE the child
+    /// is spawned, so a signal delivered in the spawn window is *captured*
+    /// (not fatal to the wrapper) and forwarded to the child once its PID
+    /// is published. This mirrors `run()`'s ordering: install with a
+    /// zero-initialized PID cell, spawn, publish the PID, then a signal
+    /// arrives. `signal-hook` has already replaced SIGTERM's default
+    /// disposition by the time we send it, so signaling our own process
+    /// is safe — it lands on the listener thread, not the default killer.
+    /// Serialized under `ENV_LOCK` so this process-wide SIGTERM can't leak
+    /// into a concurrent `run()`-based test's listener.
+    #[test]
+    fn signal_listener_installed_before_spawn_captures_and_forwards() {
+        use std::time::Duration;
+        let _g = ENV_LOCK.lock().unwrap();
+
+        let received_signal: Arc<Mutex<Option<i32>>> = Arc::new(Mutex::new(None));
+        let signaled_flag = Arc::new(AtomicBool::new(false));
+        let child_pid_cell = Arc::new(AtomicI32::new(0));
+
+        // Install with no child yet — exactly the pre-spawn ordering.
+        let handle = install_signal_listener(
+            Arc::clone(&received_signal),
+            Arc::clone(&signaled_flag),
+            Arc::clone(&child_pid_cell),
+        )
+        .expect("install listener");
+
+        // Spawn the stand-in child AFTER install, then publish its PID the
+        // way `run()` does immediately after `spawn()` returns.
+        let mut child = std::process::Command::new("sleep")
+            .arg("60")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn sleep");
+        let child_pid = child.id() as libc::pid_t;
+        child_pid_cell.store(child_pid as i32, Ordering::SeqCst);
+
+        // A signal arriving "immediately after spawn" must be caught by
+        // the listener, not kill this process.
+        // SAFETY: kill only delivers a signal; no memory is touched.
+        assert_eq!(
+            unsafe { libc::kill(std::process::id() as libc::pid_t, libc::SIGTERM) },
+            0,
+            "sending SIGTERM to self should succeed"
+        );
+
+        // The listener records the signal…
+        let mut recorded = None;
+        for _ in 0..200 {
+            if let Some(s) = *received_signal.lock().unwrap() {
+                recorded = Some(s);
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(
+            recorded,
+            Some(libc::SIGTERM),
+            "listener must capture the signal instead of the wrapper dying"
+        );
+
+        // …and forwards it to the child, which dies. Reap with
+        // `try_wait` rather than a bare `kill(pid, 0)` probe: the child is
+        // a direct child of this process, so after SIGTERM it lingers as a
+        // zombie (kill(pid, 0) would still return 0) until we wait on it.
+        let mut exited = None;
+        for _ in 0..200 {
+            match child.try_wait() {
+                Ok(Some(status)) => {
+                    exited = Some(status);
+                    break;
+                }
+                Ok(None) => {}
+                Err(_) => break,
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        handle.close();
+        let status = exited.expect("listener must forward the captured signal to the child");
+        assert!(
+            !status.success(),
+            "child should have died from the forwarded signal: {status:?}"
+        );
+
+        // `try_wait` above already reaped it on success; the guarded
+        // cleanup covers the unlikely no-exit path.
+        let _ = child.kill();
+        let _ = child.wait();
     }
 
     /// Acceptance criterion: "When the agent subprocess exits (any
@@ -651,27 +872,32 @@ mod tests {
     }
 
     /// `kill_task_tail` reads the pid file, sends SIGTERM, and removes
-    /// the lock dir. Use a `sleep` child as a stand-in for the tail
-    /// process — `kill` is observable via `wait()` returning a signaled
-    /// status.
+    /// the lock dir. Use a real `tail -f` on the task's message log — the
+    /// same command the SessionStart hook spawns — so it passes the
+    /// PID-identity guard the way a genuine tail does. `kill` is
+    /// observable via `wait()` returning a signaled status.
     #[test]
     fn kill_task_tail_kills_recorded_pid_and_removes_lock_dir() {
         let worktree = fresh_test_home("kill-tail-happy");
-        let lock_dir = worktree
-            .join(".shelbi")
-            .join("messages")
-            .join("feat-x.tail.d");
+        let msgs = worktree.join(".shelbi").join("messages");
+        let lock_dir = msgs.join("feat-x.tail.d");
         std::fs::create_dir_all(&lock_dir).unwrap();
+        // The tail follows the task's message log; its argv then contains
+        // both `tail` and `feat-x.log`, which is what the identity guard
+        // looks for.
+        let log = msgs.join("feat-x.log");
+        std::fs::write(&log, b"").unwrap();
 
-        // Long-sleeping child stands in for the tail. SIGTERM should
-        // reap it well before the natural timeout fires.
-        let mut child = std::process::Command::new("sleep")
-            .arg("60")
+        let mut child = std::process::Command::new("tail")
+            .arg("-f")
+            .arg("-n")
+            .arg("0")
+            .arg(&log)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .spawn()
-            .expect("spawn sleep");
+            .expect("spawn tail");
         std::fs::write(lock_dir.join("pid"), child.id().to_string()).unwrap();
 
         kill_task_tail(&worktree, "feat-x").expect("kill must succeed");
@@ -683,12 +909,59 @@ mod tests {
             lock_dir.display()
         );
         // Child got the signal — wait reaps it within a tiny window.
-        let status = child.wait().expect("wait sleep");
+        let status = child.wait().expect("wait tail");
         assert!(
             !status.success(),
-            "killed sleep should not report success: {status:?}"
+            "killed tail should not report success: {status:?}"
         );
 
+        let _ = std::fs::remove_dir_all(&worktree);
+    }
+
+    /// PID-reuse guard (F11): if the recorded PID no longer names *our*
+    /// tail — because the tail died and its PID was recycled to an
+    /// unrelated process — `kill_task_tail` must NOT signal it. Stand in
+    /// for the recycled process with a bare `sleep` (argv doesn't look
+    /// like a `tail` on our log), record its PID, and assert it survives.
+    /// The lock dir is still cleaned up so the stale pid file can't
+    /// mislead the next hook.
+    #[test]
+    fn kill_task_tail_refuses_to_signal_pid_with_mismatched_identity() {
+        let worktree = fresh_test_home("kill-tail-identity");
+        let lock_dir = worktree
+            .join(".shelbi")
+            .join("messages")
+            .join("feat-x.tail.d");
+        std::fs::create_dir_all(&lock_dir).unwrap();
+
+        // Bystander that recycled the tail's PID: a plain `sleep`, whose
+        // argv contains neither `tail` nor `feat-x.log`.
+        let mut bystander = std::process::Command::new("sleep")
+            .arg("60")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn sleep");
+        std::fs::write(lock_dir.join("pid"), bystander.id().to_string()).unwrap();
+
+        kill_task_tail(&worktree, "feat-x").expect("cleanup must succeed");
+
+        // The bystander must be untouched: kill(pid, 0) still succeeds.
+        let alive = unsafe { libc::kill(bystander.id() as libc::pid_t, 0) } == 0;
+        assert!(
+            alive,
+            "kill_task_tail must not signal a PID whose identity isn't our tail"
+        );
+        // But the stale lock dir was still cleaned up.
+        assert!(
+            !lock_dir.exists(),
+            "lock dir should be cleaned up even when the kill is skipped"
+        );
+
+        // Reap our bystander so it doesn't linger past the test.
+        let _ = bystander.kill();
+        let _ = bystander.wait();
         let _ = std::fs::remove_dir_all(&worktree);
     }
 
@@ -788,7 +1061,9 @@ mod tests {
         // Mirror of the file the SessionStart hook records so we can
         // verify the cleanup helper actually reaped the tail. Sequence
         // the runner script with `;` not `&&` so the mkdir doesn't get
-        // accidentally backgrounded along with the sleep.
+        // accidentally backgrounded along with the tail. The stand-in is
+        // a real `tail -f` on the task's message log (mirroring the
+        // SessionStart hook) so it passes the PID-identity guard.
         let pid_mirror = worktree.join("tail-pid-mirror");
         let pid_mirror_str = pid_mirror.to_string_lossy().into_owned();
         let runner = AgentRunnerSpec {
@@ -797,7 +1072,8 @@ mod tests {
                 "-c".into(),
                 format!(
                     "mkdir -p .shelbi/messages/$TASK_ID.tail.d; \
-                     sleep 60 & \
+                     touch .shelbi/messages/$TASK_ID.log; \
+                     tail -f -n 0 .shelbi/messages/$TASK_ID.log > .shelbi/messages/$TASK_ID.unread.log 2>/dev/null & \
                      echo $! > .shelbi/messages/$TASK_ID.tail.d/pid; \
                      cp .shelbi/messages/$TASK_ID.tail.d/pid {pid_mirror_str}; \
                      exit 0"

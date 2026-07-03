@@ -22,7 +22,7 @@
 use std::io::{self, BufRead, IsTerminal, Write};
 use std::process::{Command, Stdio};
 use std::sync::{
-    atomic::AtomicBool,
+    atomic::{AtomicBool, AtomicI32, Ordering},
     Arc, Mutex,
 };
 
@@ -65,8 +65,20 @@ pub fn run(project: &Project, workspace: &WorkspaceSpec, machine: &Machine) -> R
         wd = shelbi_agent::shell_escape(&worktree_str),
     );
 
+    // Install the signal listener BEFORE spawning the child (F11): a
+    // SIGHUP/SIGTERM/SIGINT arriving in the spawn window would otherwise
+    // kill this wrapper outright and drop the lifecycle event. The child
+    // PID isn't known until spawn returns, so the listener reads it from a
+    // shared cell we populate the instant `spawn()` succeeds.
     let received_signal: Arc<Mutex<Option<i32>>> = Arc::new(Mutex::new(None));
     let signaled_flag = Arc::new(AtomicBool::new(false));
+    let child_pid_cell = Arc::new(AtomicI32::new(0));
+
+    let signal_handle = pane::install_signal_listener(
+        Arc::clone(&received_signal),
+        Arc::clone(&signaled_flag),
+        Arc::clone(&child_pid_cell),
+    )?;
 
     let hub_sock = shelbi_state::hub_socket_path()
         .map_err(|e| anyhow!("resolving hub socket path: {e}"))?;
@@ -81,13 +93,15 @@ pub fn run(project: &Project, workspace: &WorkspaceSpec, machine: &Machine) -> R
         .stderr(Stdio::inherit())
         .spawn()
         .map_err(|e| anyhow!("spawning dev server (`sh -c {shell_cmd}`): {e}"))?;
-    let child_pid = child.id() as libc::pid_t;
-
-    let signal_handle = pane::install_signal_listener(
-        Arc::clone(&received_signal),
-        Arc::clone(&signaled_flag),
-        child_pid,
-    )?;
+    // Publish the child PID, then forward any signal caught in the narrow
+    // pre-publish window so the server still tears down.
+    child_pid_cell.store(child.id() as i32, Ordering::SeqCst);
+    if let Some(sig) = *received_signal.lock().unwrap() {
+        // SAFETY: kill takes a raw pid; no memory is dereferenced.
+        unsafe {
+            libc::kill(child.id() as libc::pid_t, sig);
+        }
+    }
 
     let status = child
         .wait()
