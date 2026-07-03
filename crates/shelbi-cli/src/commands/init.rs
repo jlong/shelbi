@@ -363,15 +363,30 @@ fn scaffold_project(resolved: &ResolvedProjectRoot, mode: InitMode) -> Result<()
     let projects_dir = shelbi_state::projects_dir().map_err(|e| anyhow!(e))?;
     let yaml_path = projects_dir.join(format!("{}.yaml", resolved.name));
 
-    if yaml_path.exists() {
-        println!("(project YAML already exists at {})", yaml_path.display());
-    } else {
-        // Fresh init leaves `repo` empty — the local registry entry is
-        // anchored on `work_dir`, and the GitHub URL (if any) is filled in
-        // later by the setup wizard.
-        let yaml = render_project_yaml(&resolved.name, "", &resolved.path)?;
-        std::fs::write(&yaml_path, yaml)?;
-        println!("✓ wrote project: {}", yaml_path.display());
+    // `create_new` (O_EXCL) instead of an `exists()`-then-`write` guard: the
+    // check-then-write pattern claimed a race-safety it didn't have (a
+    // concurrent `init` could land between the two and get clobbered). O_EXCL
+    // makes "create only if absent" a single atomic syscall; an existing file
+    // surfaces as `AlreadyExists`, which we treat as the idempotent no-op
+    // (cli-session-ux F9).
+    match std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&yaml_path)
+    {
+        Ok(mut f) => {
+            use std::io::Write;
+            // Fresh init leaves `repo` empty — the local registry entry is
+            // anchored on `work_dir`, and the GitHub URL (if any) is filled
+            // in later by the setup wizard.
+            let yaml = render_project_yaml(&resolved.name, "", &resolved.path)?;
+            f.write_all(yaml.as_bytes())?;
+            println!("✓ wrote project: {}", yaml_path.display());
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            println!("(project YAML already exists at {})", yaml_path.display());
+        }
+        Err(e) => return Err(e.into()),
     }
 
     if mode == InitMode::InRepo {

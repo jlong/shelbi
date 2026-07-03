@@ -438,15 +438,12 @@ fn release_workspace_tasks(project: &str, workspace_name: &str) -> Result<Vec<St
             continue;
         }
         let id = tf.task.id.clone();
-        let mut task = tf.task;
-        task.assigned_to = None;
-        task.updated_at = Utc::now();
-        // Persist the unassign first, then move — `move_task` re-reads the
-        // file, so writing in this order keeps both changes in the final
-        // on-disk state.
-        shelbi_state::save_task(project, &task, &tf.body).map_err(|e| anyhow!(e))?;
-        let moved = shelbi_state::move_task(project, &id, Column::Todo)
-            .map_err(|e| anyhow!(e))?;
+        // Unassign + move-to-todo in one atomic locked write. A prior
+        // unassign-then-move split could crash between the two writes and
+        // strand the card unowned-but-still-in-progress, where the
+        // owner-keyed recovery scan would never see it again (F18).
+        let moved =
+            shelbi_state::release_task_to_todo(project, &id).map_err(|e| anyhow!(e))?;
         if let Some((from, to, workflow)) = moved {
             if let Err(e) =
                 shelbi_state::append_task_event(&id, &workflow, from, to, "workspace:stop")

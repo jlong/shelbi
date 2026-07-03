@@ -159,6 +159,10 @@ pub const DEFAULT_AGENTS: &[BundledAgent] = &[
 /// IS the agent's stable identifier — that's what downstream callers
 /// (workflow YAML, CLI subcommands, event log lines) reference.
 pub fn agent_workspace_dir(project: &str, agent: &str) -> Result<PathBuf> {
+    // `agents_dir` validates the project name; guard the agent name here so a
+    // `..`/absolute/`a/b` agent can't escape the project's `agents/` dir
+    // (state-runtime F14).
+    crate::ensure_flat_path_component("agent", agent)?;
     Ok(agents_dir(project)?.join(agent))
 }
 
@@ -1293,6 +1297,20 @@ mod tests {
             Some(DEFAULT_WORKSPACE_SETTINGS_TEMPLATE),
         );
         assert_eq!(default_agent_settings("ghost"), None);
+    }
+
+    #[test]
+    fn agent_workspace_dir_rejects_traversal_names() {
+        // Residual chokepoint hardening (state-runtime F14): a `..`/absolute/
+        // separator agent name must not escape the project's `agents/` dir.
+        for bad in ["..", "../evil", "a/b", "/abs", "nested/../escape", ""] {
+            assert!(
+                agent_workspace_dir("p", bad).is_err(),
+                "agent_workspace_dir should reject `{bad}`"
+            );
+        }
+        // A normal single-component name still resolves.
+        assert!(agent_workspace_dir("p", "developer").is_ok());
     }
 
     /// `shelbi init` happy path for per-role settings.json: both default

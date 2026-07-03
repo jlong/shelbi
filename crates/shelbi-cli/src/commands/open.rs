@@ -123,7 +123,7 @@ fn focus_or_create(
             // between the select-window check above and here, select it
             // instead of creating a duplicate pane (and a duplicate agent)
             // on the same worktree. Closes the TOCTOU two rapid opens hit.
-            if !run_local_tmux([
+            if let Err(stderr) = run_local_tmux_checked([
                 "new-window",
                 "-S",
                 "-t",
@@ -135,7 +135,7 @@ fn focus_or_create(
                 &pane_cmd,
             ]) {
                 bail!(
-                    "couldn't create tmux window for workspace `{}`",
+                    "couldn't create tmux window for workspace `{}`: {stderr}",
                     workspace.name
                 );
             }
@@ -157,7 +157,7 @@ fn focus_or_create(
             );
             // `-S`: same duplicate-guard as the local arm — select an
             // existing proxy window rather than stacking a second one.
-            if !run_local_tmux([
+            if let Err(stderr) = run_local_tmux_checked([
                 "new-window",
                 "-S",
                 "-t",
@@ -169,7 +169,7 @@ fn focus_or_create(
                 &cmd,
             ]) {
                 bail!(
-                    "couldn't open proxy window for remote workspace `{}` on `{ssh_host}`",
+                    "couldn't open proxy window for remote workspace `{}` on `{ssh_host}`: {stderr}",
                     workspace.name
                 );
             }
@@ -179,6 +179,10 @@ fn focus_or_create(
     }
 }
 
+/// Silent, best-effort tmux call for *probes* (`select-window` on a window
+/// that may not exist yet) — a non-zero exit is the normal "not there,
+/// create it" signal, so its stderr is intentionally nulled to keep the
+/// terminal clean on the common create path.
 fn run_local_tmux<I, S>(args: I) -> bool
 where
     I: IntoIterator<Item = S>,
@@ -191,6 +195,31 @@ where
         .status()
         .map(|s| s.success())
         .unwrap_or(false)
+}
+
+/// Run a tmux command whose failure is a real error (not a probe),
+/// returning `Ok(())` on success or `Err(<stderr>)` so the caller can fold
+/// tmux's own reason into its message instead of collapsing to an opaque
+/// `false` (cli-session-ux F12). `<stderr>` falls back to the exit status
+/// (or the spawn error) when tmux printed nothing.
+fn run_local_tmux_checked<I, S>(args: I) -> std::result::Result<(), String>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<std::ffi::OsStr>,
+{
+    match std::process::Command::new("tmux").args(args).output() {
+        Ok(out) if out.status.success() => Ok(()),
+        Ok(out) => {
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            let stderr = stderr.trim();
+            if stderr.is_empty() {
+                Err(format!("tmux exited {}", out.status))
+            } else {
+                Err(stderr.to_string())
+            }
+        }
+        Err(e) => Err(format!("failed to run tmux: {e}")),
+    }
 }
 
 fn current_exe_string() -> Result<String> {

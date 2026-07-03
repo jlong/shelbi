@@ -210,7 +210,7 @@ pub fn run() -> Result<()> {
 
     let script = build_local_teardown_script(&names);
     if !script.is_empty() {
-        let _ = run_tmux(["run-shell", "-b", &script]);
+        let _ = super::run_tmux(["run-shell", "-b", &script]);
     }
 
     Ok(())
@@ -277,18 +277,6 @@ fn shelbi_project_session_names(listing: &str) -> impl Iterator<Item = String> +
             Some(rest.to_string())
         }
     })
-}
-
-fn run_tmux<I, S>(args: I) -> bool
-where
-    I: IntoIterator<Item = S>,
-    S: AsRef<std::ffi::OsStr>,
-{
-    std::process::Command::new("tmux")
-        .args(args)
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false)
 }
 
 #[cfg(test)]

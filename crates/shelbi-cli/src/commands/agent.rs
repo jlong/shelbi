@@ -133,6 +133,10 @@ fn agents_dir_display(project: &str) -> Result<String> {
 }
 
 fn show(project: &str, name: &str) -> Result<()> {
+    // `new` validates the name before it touches the filesystem; `show`/`edit`
+    // must too, so a traversal-shaped argument is rejected up front with the
+    // same message rather than reaching `agent_workspace_dir`'s join (F15).
+    validate_agent_name(name)?;
     let workspace =
         shelbi_state::agent_workspace_dir(project, name).map_err(|e| anyhow!(e))?;
     if !workspace.exists() {
@@ -198,6 +202,7 @@ fn new(project: &str, name: &str) -> Result<()> {
 }
 
 fn edit(project: &str, name: &str) -> Result<()> {
+    validate_agent_name(name)?;
     let workspace =
         shelbi_state::agent_workspace_dir(project, name).map_err(|e| anyhow!(e))?;
     if !workspace.exists() {
@@ -225,7 +230,13 @@ fn read_skills(skills_dir: &Path) -> Result<Vec<SkillEntry>> {
     for entry in fs::read_dir(skills_dir)? {
         let entry = entry?;
         let path = entry.path();
-        if !entry.file_type()?.is_file() {
+        // `entry.file_type()` describes the dirent itself, so a symlinked
+        // skill (`skills/foo.md -> ../shared/foo.md`) reports as a symlink and
+        // was silently skipped. Stat *through* the link with `fs::metadata` so
+        // linked skills are read; a broken link errors here and is skipped
+        // (F15).
+        let is_file = fs::metadata(&path).map(|m| m.is_file()).unwrap_or(false);
+        if !is_file {
             continue;
         }
         if path.extension().and_then(|e| e.to_str()) != Some("md") {
@@ -350,6 +361,35 @@ mod tests {
         assert!(validate_agent_name("a/b").is_err());
         assert!(validate_agent_name("foo bar").is_err());
         assert!(validate_agent_name("foo.md").is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn read_skills_follows_symlinked_skill_files() {
+        // A skill can be a symlink into a shared library dir (F15). Stating
+        // through the link (not the dirent's own type) is what surfaces it.
+        let dir = fresh_home();
+        let skills = dir.join("skills");
+        std::fs::create_dir_all(&skills).unwrap();
+
+        // A regular skill file...
+        std::fs::write(
+            skills.join("plain.md"),
+            "---\ndescription: plain one\n---\n",
+        )
+        .unwrap();
+        // ...and a symlinked one pointing at a target outside the skills dir.
+        let target = dir.join("shared-linked.md");
+        std::fs::write(&target, "---\ndescription: linked one\n---\n").unwrap();
+        std::os::unix::fs::symlink(&target, skills.join("linked.md")).unwrap();
+
+        let entries = read_skills(&skills).unwrap();
+        let names: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
+        assert_eq!(names, vec!["linked", "plain"]);
+        let linked = entries.iter().find(|e| e.name == "linked").unwrap();
+        assert_eq!(linked.description.as_deref(), Some("linked one"));
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
