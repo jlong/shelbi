@@ -161,14 +161,13 @@ pub fn ensure_zen_keymap<B>(term: &mut Terminal<B>) -> Result<ZenToggleChord>
 where
     B: Backend + io::Write,
 {
-    if user_config_path()
-        .map(|p| p.exists())
-        .unwrap_or(false)
-    {
-        // Already onboarded — trust the saved choice. A corrupt file falls
-        // through to the default so we never block the sidebar starting.
-        let cfg = load_user_config().unwrap_or_default();
-        return Ok(cfg.keymap.zen_toggle);
+    if let Ok(path) = user_config_path() {
+        if path.exists() && !is_untouched_scaffold(&path) {
+            // Already onboarded — trust the saved choice. A corrupt file falls
+            // through to the default so we never block the sidebar starting.
+            let cfg = load_user_config().unwrap_or_default();
+            return Ok(cfg.keymap.zen_toggle);
+        }
     }
 
     let chord = run_probe_and_chooser(term, &mut CrosstermEvents, PROBE_TIMEOUT)?;
@@ -177,6 +176,16 @@ where
     };
     save_user_config(&cfg).context("writing ~/.shelbi/config.yaml")?;
     Ok(chord)
+}
+
+/// True when `config.yaml` byte-matches the self-documenting scaffold that
+/// `shelbi init` seeds ([`shelbi_core::scaffold::CONFIG_YAML`]). Such a file
+/// carries no persisted choice, so the first-run Zen-keymap probe should still
+/// run rather than short-circuiting as if the user had already onboarded.
+fn is_untouched_scaffold(path: &std::path::Path) -> bool {
+    std::fs::read_to_string(path)
+        .map(|s| s == shelbi_core::scaffold::CONFIG_YAML)
+        .unwrap_or(false)
 }
 
 /// Probe + chooser flow, factored out of [`ensure_zen_keymap`] so the
@@ -324,6 +333,32 @@ mod tests {
 
     fn key(code: KeyCode, mods: KeyModifiers) -> KeyEvent {
         KeyEvent::new(code, mods)
+    }
+
+    #[test]
+    fn untouched_scaffold_is_not_treated_as_onboarded() {
+        let dir = std::env::temp_dir().join(format!(
+            "shelbi-zenprobe-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.yaml");
+
+        // The init scaffold reads as "not yet onboarded" → probe should run.
+        std::fs::write(&path, shelbi_core::scaffold::CONFIG_YAML).unwrap();
+        assert!(is_untouched_scaffold(&path));
+
+        // A real persisted choice (or any hand edit) reads as onboarded.
+        std::fs::write(&path, "keymap:\n  zen_toggle: ctrl-g\n").unwrap();
+        assert!(!is_untouched_scaffold(&path));
+
+        // Missing file is not a scaffold either.
+        std::fs::remove_file(&path).unwrap();
+        assert!(!is_untouched_scaffold(&path));
     }
 
     #[test]

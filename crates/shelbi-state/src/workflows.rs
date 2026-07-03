@@ -110,6 +110,18 @@ pub fn save_project_statuses(project: &str, statuses: &ProjectStatuses) -> Resul
     atomic_write(&path, serde_yaml::to_string(statuses)?.as_bytes())
 }
 
+/// Write the self-documenting default `statuses.yml` for a fresh project —
+/// the canonical six statuses plus a docs-linked header and a commented
+/// example for adding custom statuses (see
+/// [`shelbi_core::scaffold::default_statuses_yaml`]). Used by `shelbi init`;
+/// the load-time [`crate::migrate_default_statuses`] writes the same content
+/// for projects that pre-date the file. Creates the workflows/ dir on demand.
+pub fn scaffold_project_statuses(project: &str) -> Result<()> {
+    let path = statuses_path(project)?;
+    let yaml = shelbi_core::scaffold::default_statuses_yaml()?;
+    atomic_write(&path, yaml.as_bytes())
+}
+
 /// Load and validate a single workflow by name. Errors if the file is
 /// missing, the YAML doesn't pass [`Workflow::validate`], the file
 /// still carries pre-statuses.yml inline identity fields, the project's
