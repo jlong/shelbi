@@ -233,9 +233,19 @@ impl DialogSignature {
 /// list for unknown runners — an unrecognized runner simply gets no dialog
 /// detection until the user adds signatures in project.yaml.
 ///
-/// The `claude` set covers the dialogs seen to freeze a whole board in
-/// practice: the usage-limit modal ("Stop and wait for limit to reset"),
-/// the first-run workspace-trust prompt, and a tool-permission confirm.
+/// The `claude` set covers the interactive dialogs seen to freeze a whole
+/// board in practice: the first-run workspace-trust prompt and a
+/// tool-permission confirm.
+///
+/// The usage-limit stall is deliberately *not* a signature here. A plain
+/// substring like "usage limit reached" matches any pane that merely mentions
+/// the phrase — a worker editing usage-limit code, docs, or this very file —
+/// and would falsely pause the workspace (observed in practice). It's instead
+/// detected structurally by [`crate`]'s consumer via
+/// `shelbi_orchestrator::ready::detect_usage_limit`, which anchors on claude's
+/// actual modal chrome (the numbered `Stop and wait for limit to reset` menu
+/// option) rather than a bare substring, and drives a first-class *paused*
+/// workspace state (⏸ badge) instead of a generic `blocked` advisory.
 pub fn default_dialog_signatures(command: &str) -> Vec<DialogSignature> {
     let base = Path::new(command)
         .file_name()
@@ -243,7 +253,6 @@ pub fn default_dialog_signatures(command: &str) -> Vec<DialogSignature> {
         .unwrap_or(command);
     match base {
         "claude" => vec![
-            DialogSignature::new("usage-limit", "Stop and wait for limit to reset"),
             DialogSignature::new("trust", "Do you trust the files"),
             DialogSignature::new("trust", "trust this folder"),
             DialogSignature::new("permission", "Enter to confirm"),
@@ -3409,14 +3418,18 @@ updated_at: 2026-06-19T00:00:00Z
 
     #[test]
     fn default_dialog_signatures_covers_claude_and_ignores_unknown() {
-        // The `claude` runner ships built-in signatures for the dialogs that
-        // froze a whole board in the 2026-07-02 incident.
+        // The `claude` runner ships built-in signatures for the interactive
+        // dialogs that froze a whole board in the 2026-07-02 incident. The
+        // usage-limit stall is intentionally absent — a bare substring would
+        // false-positive on any pane that merely mentions the phrase, so it's
+        // detected structurally (see `ready::detect_usage_limit`) instead.
         let sigs = default_dialog_signatures("claude");
-        assert!(sigs.iter().any(|s| s.kind == "usage-limit"));
-        assert!(sigs
-            .iter()
-            .any(|s| s.pattern.contains("Stop and wait for limit to reset")));
         assert!(sigs.iter().any(|s| s.kind == "trust"));
+        assert!(sigs.iter().any(|s| s.kind == "permission"));
+        assert!(
+            !sigs.iter().any(|s| s.kind == "usage-limit"),
+            "usage-limit must not be a naive substring signature"
+        );
 
         // A basename is used, so an absolute path to the same binary still
         // resolves the built-ins.

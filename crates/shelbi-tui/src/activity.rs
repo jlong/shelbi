@@ -1654,6 +1654,10 @@ fn render_workspace_event(
             "is blocked on a permission prompt",
             Some("needs human approval"),
         ),
+        WorkspaceState::Paused => (
+            "is paused on a usage limit",
+            Some("waiting for the limit to reset"),
+        ),
     };
 
     let row = RowText {

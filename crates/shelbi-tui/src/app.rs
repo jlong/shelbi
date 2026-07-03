@@ -69,6 +69,11 @@ pub enum WorkspaceBadge {
     AwaitingInput,
     /// ⚠ — claude is showing a permission dialog.
     AwaitingPermission,
+    /// ⏸ — the runner stalled on a usage/session limit. Distinct from the
+    /// working/idle/awaiting badges so a paused slot reads at a glance; the
+    /// poller detects it from a pane sample and clears it when the worker
+    /// resumes (see [`WorkspaceState::Paused`]).
+    Paused,
     /// · — no in-flight task assigned. A dev workspace that just finished a
     /// task reads Idle immediately: on promotion the poller closes its
     /// session (spec §16), so there is no lingering completion glyph — the
@@ -85,6 +90,7 @@ impl WorkspaceBadge {
             WorkspaceBadge::Working => "⏵",
             WorkspaceBadge::AwaitingInput => "💬",
             WorkspaceBadge::AwaitingPermission => "⚠",
+            WorkspaceBadge::Paused => "⏸",
             WorkspaceBadge::Idle => "·",
         }
     }
@@ -96,6 +102,7 @@ impl WorkspaceBadge {
             WorkspaceBadge::Working => DecorationColor::Green,
             WorkspaceBadge::AwaitingInput => DecorationColor::Yellow,
             WorkspaceBadge::AwaitingPermission => DecorationColor::Red,
+            WorkspaceBadge::Paused => DecorationColor::Yellow,
             WorkspaceBadge::Idle => DecorationColor::DarkGray,
         }
     }
@@ -869,6 +876,7 @@ fn derive_workspace_badge(workspace_name: &str, has_in_progress: bool) -> Worksp
             WorkspaceState::Working => WorkspaceBadge::Working,
             WorkspaceState::AwaitingInput => WorkspaceBadge::AwaitingInput,
             WorkspaceState::Blocked => WorkspaceBadge::AwaitingPermission,
+            WorkspaceState::Paused => WorkspaceBadge::Paused,
         },
         // Task assigned but the poller hasn't observed a marker yet. Show
         // working as the best guess — it'll firm up within one poll tick.
@@ -1948,6 +1956,58 @@ mod tests {
             find_workspace_badge(&rows, "alpha").unwrap(),
             WorkspaceBadge::AwaitingPermission
         );
+
+        std::env::remove_var("SHELBI_HOME");
+    }
+
+    #[test]
+    fn workspace_badge_shows_pause_when_usage_limited() {
+        // A usage-limited workspace (status.yaml recorded Paused by the poller)
+        // renders the ⏸ pause badge, distinct from working/idle/awaiting, so a
+        // slot stalled on the clock is visible at a glance.
+        let _g = TEST_LOCK.lock().unwrap();
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+
+        let project = fixture_project();
+        shelbi_state::save_project(&project).unwrap();
+
+        let now = Utc::now();
+        shelbi_state::save_task(
+            "demo",
+            &Task {
+                id: "t".into(),
+                title: "t".into(),
+                column: Column::InProgress,
+                priority: 0,
+                assigned_to: Some("alpha".into()),
+                workflow: None,
+                branch: None,
+                depends_on: Vec::new(),
+                prefers_machine: None,
+                zen: None,
+                created_at: now,
+                updated_at: now,
+                params: std::collections::BTreeMap::new(),
+            },
+            "",
+        )
+        .unwrap();
+        shelbi_state::save_workspace_status(&shelbi_state::WorkspaceStatus {
+            workspace: "alpha".into(),
+            current_task: Some("t".into()),
+            state: WorkspaceState::Paused,
+            last_transition: now,
+            last_seen: now,
+        })
+        .unwrap();
+
+        let mut app = App::new_sidebar("demo");
+        app.refresh().unwrap();
+        let rows = app.rows();
+        let badge = find_workspace_badge(&rows, "alpha").unwrap();
+        assert_eq!(badge, WorkspaceBadge::Paused);
+        assert_eq!(badge.glyph(), "⏸");
 
         std::env::remove_var("SHELBI_HOME");
     }

@@ -38,6 +38,13 @@ pub enum WorkspaceState {
     Working,
     AwaitingInput,
     Blocked,
+    /// The runner stalled on a usage/session limit (e.g. Claude Code's "usage
+    /// limit reached … resets at <time>"). Unlike the other states this one is
+    /// derived from the poller's pane *sample*, not the `shelbi:<state>` title
+    /// marker — a usage-limited pane keeps a stale `shelbi:working` title — and
+    /// it reverts on the first poll after the limit lifts. Surfaced as the ⏸
+    /// pause badge so a paused slot is visible at a glance.
+    Paused,
 }
 
 impl WorkspaceState {
@@ -46,6 +53,7 @@ impl WorkspaceState {
             WorkspaceState::Working => "working",
             WorkspaceState::AwaitingInput => "awaiting_input",
             WorkspaceState::Blocked => "blocked",
+            WorkspaceState::Paused => "paused",
         }
     }
 }
@@ -335,6 +343,49 @@ pub fn append_workspace_dialog_event(
             "{ts} project={project} workspace={workspace} blocked -> working reason=dialog:{kind}:cleared"
         )
     };
+    append_event_line(&line)
+}
+
+/// Append a usage-limit *pause* transition line to `~/.shelbi/events.log`:
+///
+/// ```text
+/// <rfc3339> project=<project> workspace=<name> <prev> -> paused reason=usage-limit[ reset=<hint>]
+/// ```
+///
+/// Emitted by the hub poller when its `tmux capture-pane` sample first matches
+/// the runner's usage-limit signature — a worker whose runner stopped
+/// mid-task on a usage/session limit while its pane title still reads
+/// `shelbi:working`. Distinct from [`append_workspace_dialog_event`]: a
+/// usage-limited slot isn't waiting on a human, so it becomes a first-class
+/// [`WorkspaceState::Paused`] (⏸ badge) rather than a `blocked` advisory. The
+/// *resume* edge rides the ordinary [`append_workspace_event`] transition
+/// (`paused -> working`) once the pane's live marker reappears, so this helper
+/// only carries the into-the-stall edge and its reason/reset detail.
+///
+/// `reset` is the optional reset-time hint scraped from the pane (folded to a
+/// single token; omitted entirely when claude didn't show one). Carries the
+/// same leading `project=<name>` scope as every other workspace event so a
+/// hub-global tail can tell two projects' same-named workspaces apart.
+pub fn append_workspace_pause_event(
+    project: &str,
+    workspace: &str,
+    prev: Option<WorkspaceState>,
+    reset: Option<&str>,
+) -> Result<()> {
+    let ts = Utc::now().to_rfc3339();
+    let project = sanitize_field(project);
+    let workspace = sanitize_field(workspace);
+    // A usage-limited pane was, by definition, working — use that as the
+    // sensible default when we've no prior observation on record yet.
+    let prev_str = prev.map(|s| s.as_str()).unwrap_or("working");
+    let mut line =
+        format!("{ts} project={project} workspace={workspace} {prev_str} -> paused reason=usage-limit");
+    if let Some(reset) = reset {
+        let reset = sanitize_reason(reset);
+        if !reset.is_empty() {
+            line.push_str(&format!(" reset={reset}"));
+        }
+    }
     append_event_line(&line)
 }
 
@@ -1132,6 +1183,46 @@ mod tests {
         // Every supervision line is project-scoped so a hub-global tail can
         // tell two projects' same-named workspaces apart (acceptance §5).
         assert!(lines.iter().all(|l| l.contains("project=demo")), "log: {log}");
+
+        std::env::remove_var("SHELBI_HOME");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn pause_event_carries_usage_limit_reason_and_optional_reset() {
+        let _g = TEST_LOCK.lock().unwrap();
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+        std::fs::create_dir_all(events_log_path().unwrap().parent().unwrap()).unwrap();
+
+        // With a reset hint scraped from the pane.
+        append_workspace_pause_event(
+            "demo",
+            "alpha",
+            Some(WorkspaceState::Working),
+            Some("3pm (America/New_York)"),
+        )
+        .unwrap();
+        // Without a reset hint (claude didn't show one) — the `reset=` token is
+        // omitted entirely rather than emitted empty.
+        append_workspace_pause_event("demo", "alpha", None, None).unwrap();
+
+        let log = std::fs::read_to_string(events_log_path().unwrap()).unwrap();
+        let lines: Vec<&str> = log.lines().collect();
+        assert!(
+            lines[0].contains(
+                " project=demo workspace=alpha working -> paused reason=usage-limit \
+                 reset=3pm_(America/New_York)"
+            ),
+            "line: {}",
+            lines[0]
+        );
+        assert!(
+            lines[1].contains(" project=demo workspace=alpha working -> paused reason=usage-limit")
+                && !lines[1].contains("reset="),
+            "line: {}",
+            lines[1]
+        );
 
         std::env::remove_var("SHELBI_HOME");
         let _ = std::fs::remove_dir_all(&home);
