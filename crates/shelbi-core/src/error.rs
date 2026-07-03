@@ -32,7 +32,11 @@ pub enum Error {
         expected_local: PathBuf,
     },
 
-    #[error("invalid agent id: {0}")]
+    #[error(
+        "invalid agent id `{0}`: only lowercase ASCII letters, digits, `-`, and `_` \
+         are allowed and it must start with a lowercase letter or digit (uppercase is \
+         rejected so ids don't collide on case-insensitive filesystems)"
+    )]
     InvalidAgentId(String),
 
     /// A project name would resolve to something other than a single safe
