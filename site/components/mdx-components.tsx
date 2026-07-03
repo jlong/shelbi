@@ -8,10 +8,14 @@ import { InstallCommand } from "./InstallCommand"
 import { Steps, Step } from "./Steps"
 
 /**
- * Element overrides applied to rendered docs MDX. Strict-monochrome per
- * `site/AGENTS.md`: state via weight and the gray ramp, never hue. Fenced code
- * blocks are highlighted at build time by rehype-pretty-code (vesper theme), so
- * `pre`/`code` here only carry layout and the surrounding chrome.
+ * Element overrides applied to rendered docs MDX. Body copy (paragraphs,
+ * lists, table cells, blockquotes) renders at `text-prose` — a higher-contrast
+ * value than the gray ramp, tuned for long-form legibility in both themes (see
+ * `AGENTS.md`). Structure is still carried by weight and the gray ramp, not
+ * hue; the one sanctioned exception is the `Callout` component, which tints by
+ * type. Fenced code blocks are highlighted at build time by rehype-pretty-code
+ * (vesper theme), so `pre`/`code` here only carry layout and the surrounding
+ * chrome.
  */
 export const mdxComponents: MDXComponents = {
   // Shared marketing/docs components addressable from MDX by tag name.
@@ -36,12 +40,12 @@ export const mdxComponents: MDXComponents = {
   h3: (props) => (
     <h3 className="mt-4 mb-2 scroll-mt-8 text-lg font-semibold tracking-tight text-fg" {...props} />
   ),
-  p: (props) => <p className="my-2 leading-relaxed text-gray-7" {...props} />,
+  p: (props) => <p className="my-2 leading-relaxed text-prose" {...props} />,
   ul: (props) => (
-    <ul className="my-2 list-disc space-y-1 pl-3 text-gray-7" {...props} />
+    <ul className="my-2 list-disc space-y-1 pl-3 text-prose" {...props} />
   ),
   ol: (props) => (
-    <ol className="my-2 list-decimal space-y-1 pl-3 text-gray-7" {...props} />
+    <ol className="my-2 list-decimal space-y-1 pl-3 text-prose" {...props} />
   ),
   li: (props) => <li className="leading-relaxed" {...props} />,
   a: ({ href = "", ...props }) => (
@@ -71,7 +75,7 @@ export const mdxComponents: MDXComponents = {
   table: (props) => (
     <div className="my-3 overflow-x-auto rounded-md border border-gray-4">
       <table
-        className="w-full border-collapse text-sm text-gray-7 [&_th]:text-fg [&_tbody_td:first-child]:text-fg [&_tbody_td:first-child]:font-medium"
+        className="w-full border-collapse text-sm text-prose [&_th]:text-fg [&_tbody_td:first-child]:text-fg [&_tbody_td:first-child]:font-medium"
         {...props}
       />
     </div>
@@ -94,7 +98,7 @@ export const mdxComponents: MDXComponents = {
   hr: (props) => <hr className="my-6 border-gray-4" {...props} />,
   blockquote: (props) => (
     <blockquote
-      className="my-3 border-l-2 border-gray-5 pl-3 text-gray-7 italic"
+      className="my-3 border-l-2 border-gray-5 pl-3 text-prose italic"
       {...props}
     />
   ),
