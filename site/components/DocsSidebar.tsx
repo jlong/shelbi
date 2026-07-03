@@ -119,6 +119,13 @@ export function DocsSidebar({ nodes }: DocsSidebarProps) {
     <aside className="hidden md:sticky md:top-0 md:z-auto md:block md:h-screen md:overflow-y-auto md:py-4">
       <nav ref={navRef} aria-label="Documentation" onKeyDown={onKeyDown}>
         <ul className="flex flex-col gap-3">
+          <li>
+            <ul className="flex flex-col">
+              <li>
+                <NavLink href="/docs" label="Overview" active={pathname === "/docs"} />
+              </li>
+            </ul>
+          </li>
           {nodes.map((node) => (
             <li key={nodeKey(node)}>
               {node.kind === "section" ? (
