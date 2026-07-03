@@ -45,6 +45,11 @@ use crate::commands::require_project;
 /// shows up in the preview within one tick.
 const DRYRUN_DEFAULT_INTERVAL: Duration = Duration::from_secs(5);
 
+/// Floor on the dry-run tick interval. `--interval 0` (or any sub-second
+/// value) would otherwise spin the preview loop with a zero-length sleep,
+/// pegging a core and hammering the log. Clamp up to this instead.
+const DRYRUN_MIN_INTERVAL: Duration = Duration::from_secs(1);
+
 #[derive(Debug, Subcommand)]
 pub enum ZenCmd {
     /// Turn Zen Mode on — orchestrator may auto-merge and auto-promote
@@ -260,6 +265,18 @@ pub fn run(project_opt: Option<String>, cmd: ZenCmd) -> Result<()> {
                 Some(s) => super::events::parse_duration(&s)?,
                 None => DRYRUN_DEFAULT_INTERVAL,
             };
+            // Guard against `--interval 0` busy-looping the preview.
+            let tick = if tick < DRYRUN_MIN_INTERVAL {
+                eprintln!(
+                    "zen dry-run: interval {} is below the {} floor; using {}.",
+                    format_duration(tick),
+                    format_duration(DRYRUN_MIN_INTERVAL),
+                    format_duration(DRYRUN_MIN_INTERVAL),
+                );
+                DRYRUN_MIN_INTERVAL
+            } else {
+                tick
+            };
             dry_run(&project_name, duration, tick)
         }
     }
@@ -455,7 +472,24 @@ fn dry_run(project: &str, duration: Option<Duration>, interval: Duration) -> Res
     let mut first_tick = true;
 
     loop {
-        let decisions = zen::dry_run_tick(&project_obj).map_err(|e| anyhow!(e))?;
+        // A single tick failing (transient state read, mid-write task
+        // file, …) must not tear down the whole preview — the dry-run is
+        // a best-effort observer. Log and wait for the next tick instead
+        // of propagating and exiting.
+        let decisions = match zen::dry_run_tick(&project_obj) {
+            Ok(d) => d,
+            Err(e) => {
+                eprintln!("zen dry-run: tick failed ({e}); retrying next interval.");
+                first_tick = false;
+                let now = Instant::now();
+                match deadline {
+                    Some(end) if now >= end => break,
+                    Some(end) => std::thread::sleep(interval.min(end.saturating_duration_since(now))),
+                    None => std::thread::sleep(interval),
+                }
+                continue;
+            }
+        };
         let mut new_this_tick = 0_usize;
         for d in decisions {
             let key = d.dedup_key();
@@ -544,7 +578,12 @@ fn format_next_eligible(ids: &[String]) -> String {
 
 fn format_duration(d: Duration) -> String {
     let secs = d.as_secs();
-    if secs % 86_400 == 0 {
+    if secs == 0 {
+        // Every `secs % N == 0` branch below is also true at zero, so
+        // without this guard a zero duration renders as the nonsensical
+        // "0d" (largest unit) instead of the expected "0s".
+        "0s".to_string()
+    } else if secs % 86_400 == 0 {
         format!("{}d", secs / 86_400)
     } else if secs % 3600 == 0 {
         format!("{}h", secs / 3600)
@@ -617,6 +656,9 @@ mod tests {
         assert_eq!(format_duration(Duration::from_secs(300)), "5m");
         assert_eq!(format_duration(Duration::from_secs(7200)), "2h");
         assert_eq!(format_duration(Duration::from_secs(86_400)), "1d");
+        // Zero is not "0d" — the modulo chain matches every unit at zero,
+        // so it must short-circuit to the smallest sensible label.
+        assert_eq!(format_duration(Duration::ZERO), "0s");
     }
 
     #[test]

@@ -215,9 +215,8 @@ fn print_status_table(names: &[String]) -> Result<()> {
         "WORKSPACE", "TASK", "STATE", "LAST SEEN"
     );
     for name in names {
-        let row = shelbi_state::load_workspace_status(name).map_err(|e| anyhow!(e))?;
-        match row {
-            Some(s) => println!(
+        match shelbi_state::load_workspace_status(name) {
+            Ok(Some(s)) => println!(
                 "{:<12} {:<24} {:<14} {:<12} {}",
                 s.workspace,
                 task_cell(&s),
@@ -225,10 +224,20 @@ fn print_status_table(names: &[String]) -> Result<()> {
                 format_ago(now, s.last_seen),
                 format_ago(now, s.last_transition),
             ),
-            None => println!(
+            Ok(None) => println!(
                 "{:<12} {:<24} {:<14} {:<12} —",
                 name, "—", "?", "never"
             ),
+            // A corrupt or unreadable status.yaml for one workspace must
+            // not blank out the whole fleet table. Surface the failure on
+            // its own row (and to stderr) and keep rendering the rest.
+            Err(e) => {
+                eprintln!("workspace status: reading status for `{name}`: {e}");
+                println!(
+                    "{:<12} {:<24} {:<14} {:<12} —",
+                    name, "(unreadable)", "err", "?"
+                );
+            }
         }
     }
     Ok(())

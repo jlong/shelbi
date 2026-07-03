@@ -72,12 +72,20 @@ pub fn ssh_control_path_template() -> Result<String> {
 /// Remote-side landing path for the hub socket's reverse forward.
 /// `$SHELBI_REMOTE_HUB_SOCK` wins so remote workers (Phase 5) can be
 /// pointed at the same value via env without rebuilding the binary.
-/// Default `/tmp/shelbi-hub.sock`.
+///
+/// Default `/tmp/shelbi-hub-<uid>.sock`. The uid suffix keeps two
+/// different users who both reverse-forward to the same shared remote
+/// host from colliding on one fixed `/tmp` path (the first one to bind
+/// wins and the second silently fails, or worse, talks to the wrong
+/// daemon). The uid is the *local* caller's — computed the same way on
+/// every consumer (`spawn`, the `-R` spec builder) so both ends of a
+/// given forward always agree.
 pub fn remote_hub_socket_path() -> PathBuf {
     if let Some(p) = std::env::var_os("SHELBI_REMOTE_HUB_SOCK") {
         return PathBuf::from(p);
     }
-    PathBuf::from("/tmp/shelbi-hub.sock")
+    let uid = unsafe { libc::getuid() };
+    PathBuf::from(format!("/tmp/shelbi-hub-{uid}.sock"))
 }
 
 /// Daemon PID file: `$SHELBI_HOME/shelbi.pid`. Used by the cleanup
@@ -346,9 +354,13 @@ mod tests {
     }
 
     #[test]
-    fn remote_hub_socket_defaults_to_tmp_and_env_overrides() {
+    fn remote_hub_socket_defaults_to_per_uid_tmp_and_env_overrides() {
         std::env::remove_var("SHELBI_REMOTE_HUB_SOCK");
-        assert_eq!(remote_hub_socket_path(), PathBuf::from("/tmp/shelbi-hub.sock"));
+        let uid = unsafe { libc::getuid() };
+        assert_eq!(
+            remote_hub_socket_path(),
+            PathBuf::from(format!("/tmp/shelbi-hub-{uid}.sock"))
+        );
         std::env::set_var("SHELBI_REMOTE_HUB_SOCK", "/run/foo.sock");
         assert_eq!(remote_hub_socket_path(), PathBuf::from("/run/foo.sock"));
         std::env::remove_var("SHELBI_REMOTE_HUB_SOCK");
@@ -469,7 +481,8 @@ mod tests {
         std::env::remove_var("SHELBI_HUB_SOCK");
         let spec = reverse_forward_spec().unwrap();
         let s = spec.to_string_lossy().into_owned();
-        assert!(s.starts_with("/tmp/shelbi-hub.sock:"), "got: {s}");
+        let uid = unsafe { libc::getuid() };
+        assert!(s.starts_with(&format!("/tmp/shelbi-hub-{uid}.sock:")), "got: {s}");
         assert!(s.ends_with("/hub.sock"), "got: {s}");
         std::env::remove_var("SHELBI_HOME");
     }

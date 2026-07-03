@@ -1648,7 +1648,7 @@ fn copy_dir_contents_to_remote(ssh_host: &str, src: &Path, dest: &Path) -> Resul
 /// the remote tmux pane, prefixing the exec with `SHELBI_HUB_SOCK=<path>`
 /// so the agent picks up the SSH-reverse-forwarded hub socket
 /// ([`shelbi_state::remote_hub_socket_path`], default
-/// `/tmp/shelbi-hub.sock`). Worker→hub events (`pane_alive=false`,
+/// `/tmp/shelbi-hub-<uid>.sock`). Worker→hub events (`pane_alive=false`,
 /// future verbs) flow through that socket; with no `SHELBI_HUB_SOCK` set
 /// the agent's instructions paragraph falls through to a no-op and loss
 /// is accepted (the spec calls this "best-effort + hub-side detection").
@@ -3297,15 +3297,16 @@ mod tests {
     /// Phase 5 acceptance criterion: the line we send into a remote
     /// pane sets `SHELBI_HUB_SOCK` so the agent can write
     /// worker→hub events through the SSH-reverse-forwarded socket.
-    /// The default landing path is `/tmp/shelbi-hub.sock`.
+    /// The default landing path is `/tmp/shelbi-hub-<uid>.sock`.
     #[test]
     fn remote_cd_launch_prefixes_exec_with_hub_socket_env_var() {
         let _g = crate::test_lock::acquire();
         std::env::remove_var("SHELBI_REMOTE_HUB_SOCK");
         let wt = PathBuf::from("/work/myapp/.shelbi/wt/bob");
         let line = remote_cd_launch(&wt, "claude --permission-mode auto", None);
+        let expected = shelbi_state::remote_hub_socket_path();
         assert!(
-            line.contains("SHELBI_HUB_SOCK=/tmp/shelbi-hub.sock"),
+            line.contains(&format!("SHELBI_HUB_SOCK={}", expected.display())),
             "expected default socket path in: {line}"
         );
         // No PORT on the dev path.
