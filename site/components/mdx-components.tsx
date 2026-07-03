@@ -1,6 +1,7 @@
 import type { MDXComponents } from "mdx/types"
 import Link from "next/link"
 import { AppMockup } from "./KanbanMockup"
+import { CopyPromptBanner } from "./CopyPromptBanner"
 import { InstallCommand } from "./InstallCommand"
 
 /**
@@ -13,6 +14,7 @@ export const mdxComponents: MDXComponents = {
   // Shared marketing/docs components addressable from MDX by tag name.
   // `<AppMockup preset="starter" activeView="chat" />` renders a Shelbi TUI
   // scenario import-free; see `KanbanMockup.tsx` for `AppState`/presets.
+  CopyPromptBanner,
   InstallCommand,
   AppMockup,
   h1: (props) => (
