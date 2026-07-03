@@ -1,0 +1,157 @@
+---
+title: Workflow
+order: 31
+summary: Field-by-field reference for a workflow YAML — statuses (reference-only), initial_status, transitions and their actions, and per-workflow git/zen overrides.
+---
+
+A workflow file declares the pipeline a task moves through: which
+statuses it references, which side-effects fire on which edges, and any
+per-workflow git or Zen overrides. For the model behind these fields —
+owners, categories, the any-to-any transition policy — see
+[the workflows concept](/docs/concepts/workflows).
+
+## Where it lives
+
+```
+<config-root>/workflows/<name>.yaml
+```
+
+`<config-root>` is `~/.shelbi/projects/<name>/` in the default
+[global mode](/docs/concepts/config-modes) and `<repo>/.shelbi/` in
+in-repo mode. The file's basename is its id; the in-file `name:` field
+must match. Every project has a built-in virtual `default` workflow that
+lives in code until `shelbi workflow new` or `edit` writes a file — see
+[`shelbi workflow`](/docs/cli/workflow).
+
+## Example
+
+```yaml
+# ~/.shelbi/projects/myapp/workflows/default.yaml
+name: default
+description: standard one-track flow
+
+# Reference-only statuses: name + category come from statuses.yml.
+statuses:
+  - { id: backlog,     owner: user,  agent: orchestrator }
+  - { id: todo,        owner: agent, agent: orchestrator }
+  - { id: in-progress, owner: agent, agent: developer }
+  - { id: review,      owner: user,  agent: orchestrator }
+  - { id: done,        owner: user }
+
+transitions:
+  - { from: in-progress, to: review, actions: [push_branch, open_pr] }
+  - { from: review,      to: done,   actions: [merge, delete_branch] }
+```
+
+## Top-level fields
+
+| Field | Type | Required | Default | Description |
+| --- | --- | --- | --- | --- |
+| `name` | string | yes | — | Workflow id. Must match the filename (`<name>.yaml`); referenced from task frontmatter. |
+| `statuses` | list of [Status](#statuses) | yes | — | Ordered statuses this workflow uses. At least one required. Order is the column order in the TUI. |
+| `description` | string | no | — | Free-form description surfaced in `shelbi workflow list` and the picker. |
+| `initial_status` | string | no | first status | Stable `id` a new task lands in. Must reference a status declared here. |
+| `transitions` | list of [Transition](#transitions) | no | — | Side-effect declarations for specific edges. Omitting it means all moves are pure status changes. |
+| `git` | [Git](#git) | no | inherit project | Per-workflow override of the project's `git:` block. |
+| `zen` | [Zen](#zen) | no | inherit project | Per-workflow override of the project's Zen Mode config. |
+
+## statuses
+
+<Callout type="tip" title="Reference-only form">
+
+Since [#197](https://github.com/jlong/shelbi/pull/197), a workflow status
+entry carries **only** `id`, `owner`, and optional `agent`. The display
+`name` and `category` are declared once in
+[`statuses.yml`](/docs/configuration/statuses) — repeating an inline
+`name:` or `category:` here fails the load. This keeps identity from
+drifting across workflows.
+
+</Callout>
+
+| Field | Type | Required | Default | Description |
+| --- | --- | --- | --- | --- |
+| `id` | string | yes | — | Stable id, declared in [`statuses.yml`](/docs/configuration/statuses). Conventionally lowercase kebab-case. |
+| `owner` | `user` \| `agent` | yes | — | Who moves the task next when automation is off. `agent` makes it eligible for auto-dispatch; `user` waits. |
+| `agent` | string | no | derived from category | Which agent runs this status under automation. Defaults to `developer` for `active` and `orchestrator` for `ready` when omitted. `None` means no automation path. |
+
+## transitions
+
+Each entry declares the hub-side side-effects that fire when a task
+crosses one edge. Transitions do **not** restrict which moves are legal —
+moves are any-to-any; unlisted edges are pure status changes. See
+[transitions](/docs/concepts/workflows#transitions).
+
+| Field | Type | Required | Default | Description |
+| --- | --- | --- | --- | --- |
+| `from` | string | yes | — | Status `id` the task moves out of. Must be a declared status. |
+| `to` | string | yes | — | Status `id` the task moves into. Must be a declared status. |
+| `actions` | list of [action](#actions) | no | `[]` | Ordered side-effects to run on this edge. Failures short-circuit the rest. |
+| `target` | string | no | resolved `base_branch` | Overrides where `merge` / `open_pr` land for this edge only. Supports `{{var}}` placeholders resolved from task params. |
+
+### actions
+
+The six hub-side action primitives an edge's `actions` list may contain:
+
+| Action | Effect |
+| --- | --- |
+| `push_branch` | Push the task's branch to origin. |
+| `open_pr` | Open a PR for the task's branch. |
+| `merge` | Merge the task's branch into its target. Trips [Zen's high-confidence bar](/docs/concepts/zen-mode#the-high-confidence-bar). |
+| `close_pr` | Close any open PR without merging. |
+| `delete_branch` | Delete the local and remote branch. |
+| `restack` | Rebase the task's branch onto its parent's current branch. |
+
+```yaml
+transitions:
+  - from: in-progress
+    to: review
+    target: develop            # this edge merges into develop, not base_branch
+    actions: [push_branch, merge]
+```
+
+## git
+
+Per-workflow override of the project's [`git:`](/docs/configuration/project#git)
+block. When omitted, the workflow inherits `base_branch` and
+`merge_strategy` from the project. Field values may contain `{{var}}`
+placeholders resolved against task params at load time.
+
+| Field | Type | Required | Default | Description |
+| --- | --- | --- | --- | --- |
+| `base_branch` | string | no | project's `base_branch` | Branch this workflow's tasks are based on and merged into. |
+| `merge_strategy` | `squash` \| `merge` \| `rebase` | no | project's `merge_strategy` | How this workflow's branches integrate back. |
+
+## zen
+
+Per-workflow override of the project's
+[`zen:`](/docs/configuration/project#zen) block. Each subfield is
+independently optional — override just `checks`, just `ci_timeout`, just
+`danger_paths`, or any combination. Unset subfields fall back to the
+project. The canonical use is a `research:` workflow opting out of
+code-style checks without affecting `default`.
+
+| Field | Type | Required | Default | Description |
+| --- | --- | --- | --- | --- |
+| `checks.local` | list of string | no | project's `zen.checks.local` | Replaces the project's local check list for this workflow's tasks. |
+| `ci_timeout` | duration (seconds) | no | project's `zen.ci_timeout` | Overrides how long Zen waits on CI. |
+| `danger_paths` | `extend` / `override` / bare list | no | project's `zen.danger_paths` | Overrides the danger-path globs. Same shape as the project field. |
+
+```yaml
+# workflows/research.yaml — no code checks, no auto-merge risk
+name: research
+statuses:
+  - { id: todo, owner: agent, agent: developer }
+  - { id: done, owner: user }
+zen:
+  checks:
+    local: []            # skip the project's cargo/npm checks entirely
+```
+
+## See also
+
+- [Workflows](/docs/concepts/workflows) — owners, categories, the
+  transition model, and worked examples.
+- [Statuses](/docs/configuration/statuses) — the `statuses.yml` catalog
+  that supplies each status's `name` and `category`.
+- [`shelbi workflow`](/docs/cli/workflow) — list, show, scaffold, and
+  edit workflow files.

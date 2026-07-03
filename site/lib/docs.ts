@@ -25,14 +25,20 @@ export type DocSection = {
 
 /**
  * Canonical order of the top-level nav groups, keyed by directory name. The IA
- * puts Guides first, then Concepts and CLI Reference — an ordering the raw
- * numeric `order` frontmatter doesn't produce on its own (the guides pages
- * carry higher numbers than concepts/cli), so we pin it explicitly here rather
- * than renumbering every page and hoping the numbers stay coherent across
- * sections. Anything not listed (e.g. `getting-started`, or a sectionless doc)
- * falls in behind the explicit entries, ordered by its own `order`.
+ * puts Guides first, then Concepts, Configuration, and CLI Reference — an
+ * ordering the raw numeric `order` frontmatter doesn't produce on its own (the
+ * guides pages carry higher numbers than concepts/cli), so we pin it explicitly
+ * here rather than renumbering every page and hoping the numbers stay coherent
+ * across sections. Anything not listed (e.g. `getting-started`, or a sectionless
+ * doc) falls in behind the explicit entries, ordered by its own `order`.
  */
-export const TOP_LEVEL_ORDER = ["guides", "getting-started", "concepts", "cli"]
+export const TOP_LEVEL_ORDER = [
+  "guides",
+  "getting-started",
+  "concepts",
+  "configuration",
+  "cli",
+]
 
 /**
  * Sort key for a top-level nav group. Explicitly-ordered directories come

@@ -1,0 +1,222 @@
+---
+title: Project config
+order: 30
+summary: Field-by-field reference for a project's YAML — name, repo, machines, orchestrator, agent runners, workspaces, ContextStore sync, and Zen Mode.
+---
+
+The project YAML is the root of a Shelbi project: it declares the repo,
+the machines work runs on, the runners agents boot, the workspace pool,
+and the Zen Mode policy. This page is the authoritative field reference —
+for the *why* behind each block, follow the concept links.
+
+## Where it lives
+
+The file's location depends on the project's
+[config mode](/docs/concepts/config-modes):
+
+| Mode | Shared fields | User-local fields |
+| --- | --- | --- |
+| Global (default) | `~/.shelbi/projects/<name>.yaml` | same file |
+| In-repo | `<repo>/.shelbi/project.yaml` (committed) | `~/.shelbi/projects/<name>/local.yaml` |
+
+In global mode every field lives in one flat file. In in-repo mode the
+**shared** fields (`name`, `default_branch`, `orchestrator`,
+`agent_runners`, `zen`, …) are committed and the **user-local** fields
+(`repo`, `machines`, `workspaces`, `editor`, `contextstore_sync`) live in
+a per-machine `local.yaml`. Putting a field on the wrong side errors at
+load time. The canonical bucket lists are `SHARED_PROJECT_FIELDS` and
+`LOCAL_PROJECT_FIELDS` in
+[`shelbi_core::model`](https://github.com/jlong/shelbi/blob/main/crates/shelbi-core/src/model.rs).
+
+## Minimal example
+
+```yaml
+# ~/.shelbi/projects/myapp.yaml
+name: myapp
+repo: git@github.com:me/myapp.git
+default_branch: main
+machines:
+  - name: hub
+    kind: local
+    work_dir: ~/Workspaces/myapp
+orchestrator:
+  runner: claude
+agent_runners:
+  claude:
+    command: claude
+    flags: []
+workspaces:
+  - { name: alice, machine: hub, runner: claude }
+```
+
+## Top-level fields
+
+| Field | Type | Required | Default | Description |
+| --- | --- | --- | --- | --- |
+| `name` | string | yes | — | Project identifier. Doubles as the local registry key (`~/.shelbi/projects/<name>.yaml`). |
+| `repo` | string | yes | — | Clone URL or path to the repository. User-local. |
+| `default_branch` | string | no | `main` | Branch new work is based on and the fallback merge target when `git.base_branch` is unset. |
+| `machines` | list of [Machine](#machines) | yes | — | The hosts workspaces run on. User-local. |
+| `orchestrator` | [Orchestrator](#orchestrator) | yes | — | Which runner boots the orchestrator. |
+| `agent_runners` | map of name → [AgentRunner](#agent-runners) | yes | — | The command lines agents and the orchestrator are launched with. |
+| `workspaces` | list of [Workspace](#workspaces) | no | `[]` | Fixed pool of workspace slots. User-local. Also accepts the legacy key `workers`. |
+| `contextstore_sync` | list of [ContextStoreSync](#contextstore-sync) | no | `[]` | ContextStore spaces rsynced back from remote workspaces after review. User-local. |
+| `zen` | [Zen](#zen) | no | all defaults | Zen Mode check list, CI timeout, and danger paths. |
+| `editor` | string | no | `$EDITOR` | Editor invoked by `shelbi … edit` commands. User-local. |
+| `github_url` | string | no | — | Informational GitHub URL recorded by the setup wizard. |
+| `config_mode` | `global` \| `in-repo` | no | `global` | Which on-disk layout the project uses. Elided from the wire form when `global`. See [config modes](/docs/concepts/config-modes). |
+| `workspace_poll_interval_secs` | integer | no | `5` | How often the hub poller samples each workspace pane for state changes. |
+| `workspace_permissions_mode` | string | no | `auto` | Permissions posture rendered into the workspace settings template (`auto` → claude's `acceptEdits`). |
+| `heartbeat` | `off` \| duration | no | `3m` | Recurring hub heartbeat written to `events.log` so the orchestrator's watch fires when the board is quiet. |
+| `git` | [Git](#git) | no | all defaults | Base branch and merge strategy for `shelbi merge` and Zen's auto-merge. |
+| `review` | object | no | all defaults | How [review workspaces](/docs/concepts/review-workspaces) load and serve a branch (ports, setup/serve commands). |
+
+## machines
+
+Each entry is a host where workspaces can run. The worktree for a
+workspace lives at `<work_dir>/.shelbi/wt/<workspace-name>`.
+
+| Field | Type | Required | Default | Description |
+| --- | --- | --- | --- | --- |
+| `name` | string | yes | — | Machine identifier, referenced by `workspaces[].machine`. |
+| `kind` | `local` \| `ssh` | yes | — | Whether commands run on this box or over SSH. |
+| `work_dir` | path | yes | — | Base directory the repo checkout and worktrees live under. `~` is expanded. |
+| `host` | string | no | `name` | SSH hostname. Required when `kind: ssh`; falls back to `name` if omitted. Ignored for `local`. |
+
+```yaml
+machines:
+  - name: hub
+    kind: local
+    work_dir: ~/Workspaces/myapp
+  - name: m2
+    kind: ssh
+    host: m2.local
+    work_dir: ~/work/myapp
+```
+
+## orchestrator
+
+The orchestrator is a single agent that watches the board and dispatches
+work. See [the orchestrator concept](/docs/concepts/orchestrator).
+
+| Field | Type | Required | Default | Description |
+| --- | --- | --- | --- | --- |
+| `runner` | string | yes | — | Name of an entry in [`agent_runners`](#agent-runners) used to boot the orchestrator. |
+
+```yaml
+orchestrator:
+  runner: claude
+```
+
+## agent_runners
+
+A map from runner name to the command line agents are launched with.
+Referenced by `orchestrator.runner` and `workspaces[].runner`.
+
+| Field | Type | Required | Default | Description |
+| --- | --- | --- | --- | --- |
+| `command` | string | yes | — | Executable to invoke (e.g. `claude`, `codex`). |
+| `flags` | list of string | no | `[]` | Extra flags appended to every invocation. |
+| `dialog_signatures` | list of object | no | built-in per-runner set | Blocking-dialog text signatures the poller uses to detect a frozen pane. When empty, defaults keyed on `command` apply. |
+
+```yaml
+agent_runners:
+  claude:
+    command: claude
+    flags: []
+  codex:
+    command: codex
+    flags: ["--full-auto"]
+```
+
+## workspaces
+
+The fixed pool of workspace slots. Each owns a stable worktree on its
+machine and picks up tasks from the board, switching branches (with
+cleared context) between assignments. See
+[workspaces](/docs/concepts/workspaces).
+
+| Field | Type | Required | Default | Description |
+| --- | --- | --- | --- | --- |
+| `name` | string | yes | — | Workspace identifier. Names the worktree at `<machine.work_dir>/.shelbi/wt/<name>`. |
+| `machine` | string | yes | — | Name of a [machine](#machines) this slot runs on. |
+| `runner` | string | yes | — | Name of an [agent runner](#agent-runners) this slot boots. |
+| `role` | `dev` \| `review` | no | `dev` | `dev` does autonomous work; `review` is reserved for loading and serving a branch for human inspection. Elided when `dev`. |
+
+```yaml
+workspaces:
+  - { name: alice, machine: hub, runner: claude }
+  - { name: bob,   machine: m2,  runner: claude }
+  - { name: rev,   machine: hub, runner: claude, role: review }
+```
+
+## contextstore_sync
+
+ContextStore spaces that are rsynced from a remote workspace's machine
+back to the hub after the workspace hands off for review. Default empty —
+no sync runs unless the project opts in.
+
+| Field | Type | Required | Default | Description |
+| --- | --- | --- | --- | --- |
+| `space` | string | yes | — | ContextStore space name. Matched against the task body to decide whether a finished task touched ContextStore. |
+| `path` | path | yes | — | Directory fed to rsync on both hub and remote. A leading `~` is expanded against each side's `$HOME`. |
+
+```yaml
+contextstore_sync:
+  - { space: Memories, path: ~/.contextstore/Memories }
+```
+
+## zen
+
+Zen Mode configuration: which local checks gate a promotion, how long to
+wait on CI, and which paths always require human review. See
+[Zen Mode](/docs/concepts/zen-mode). Per-workflow overrides live in the
+[workflow file](/docs/configuration/workflow#zen); per-task overrides
+live on the task frontmatter.
+
+| Field | Type | Required | Default | Description |
+| --- | --- | --- | --- | --- |
+| `checks.local` | list of string | no | `[]` | Shell commands run in the worktree root before handoff to CI. Each entry is one command line. |
+| `ci_timeout` | duration (seconds) | no | `900` (15m) | How long Zen waits for CI to report before timing out the promotion. |
+| `danger_paths` | see below | no | extend built-ins with `[]` | Glob patterns too sensitive to auto-promote. |
+
+`danger_paths` accepts three forms. A bare sequence is shorthand for
+`extend`, which keeps the built-in danger list and adds yours;
+`override` replaces the built-ins entirely:
+
+```yaml
+zen:
+  checks:
+    local:
+      - cargo test --workspace
+      - npm --prefix site test
+  ci_timeout: 1200
+  danger_paths:
+    extend: [".env", "infra/**"]   # or: override: [...], or a bare list
+```
+
+## git
+
+Where workspace branches are based and how they integrate back. See
+[the merge command](/docs/cli/merge).
+
+| Field | Type | Required | Default | Description |
+| --- | --- | --- | --- | --- |
+| `base_branch` | string | no | `default_branch` | Branch new work is based on and merged into. Falls back to the project's `default_branch`. |
+| `merge_strategy` | `squash` \| `merge` \| `rebase` | no | `squash` | How `shelbi merge` and Zen's auto-merge integrate a workspace branch. Maps 1:1 onto `gh pr merge --{squash,merge,rebase}`. |
+
+```yaml
+git:
+  base_branch: develop
+  merge_strategy: rebase
+```
+
+## See also
+
+- [Config modes](/docs/concepts/config-modes) — global vs. in-repo layout
+  and the shared/user-local field split.
+- [Workspaces](/docs/concepts/workspaces) and
+  [the orchestrator](/docs/concepts/orchestrator) — the concepts behind
+  `workspaces:` and `orchestrator:`.
+- [Workflow config](/docs/configuration/workflow) — the per-project
+  status pipeline and its per-workflow `zen` / `git` overrides.

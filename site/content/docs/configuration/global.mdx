@@ -1,0 +1,164 @@
+---
+title: Global config
+order: 33
+summary: Field-by-field reference for the hub-wide files — ~/.shelbi/config.yaml (UI preferences) and ~/.shelbi/keys.yml (keybindings).
+---
+
+Two files under `~/.shelbi/` hold hub-wide settings that apply across
+every project on your machine, independent of any single project's
+[config mode](/docs/concepts/config-modes): `config.yaml` (UI
+preferences) and `keys.yml` (keybindings). Both are optional — absent or
+partial files fall back to built-in defaults, never an error.
+
+<Callout type="note" title="Home resolution">
+
+`~/.shelbi/` is the default base. It can be relocated via `--root`, then
+`$SHELBI_ROOT`, then the legacy `$SHELBI_HOME`, before falling back to
+`$HOME/.shelbi`. Every path below joins a filename onto that base.
+
+</Callout>
+
+## `config.yaml`
+
+Per-user UI preferences. Distinct from `shelbi.yaml` (assistant
+identity, wizard state) so a future `shelbi config reset` can wipe UI
+tweaks without touching onboarding. A missing file — or one that omits a
+block — resolves to defaults.
+
+**Path:** `~/.shelbi/config.yaml`
+
+| Field | Type | Required | Default | Description |
+| --- | --- | --- | --- | --- |
+| `keymap.zen_toggle` | [chord](#zen_toggle-chords) | no | `alt-z` | Chord that toggles Zen Mode on and off. **Legacy** — a one-shot migration moves a non-default value into `keys.yml` (`defaults.global.zen_toggle`) and resets this field. Prefer setting it in `keys.yml`. |
+
+```yaml
+# ~/.shelbi/config.yaml
+keymap:
+  zen_toggle: ctrl-g
+```
+
+### `zen_toggle` chords
+
+The accepted values for the Zen toggle chord:
+
+| Value | Key |
+| --- | --- |
+| `alt-z` | Alt+Z (default) |
+| `ctrl-backslash` | Ctrl+\ |
+| `ctrl-g` | Ctrl+G |
+| `ctrl-shift-z` | Ctrl+Shift+Z |
+| `none` | disabled — no chord toggles Zen Mode |
+
+## `keys.yml`
+
+Overrides for the TUI keybindings. Built-in chords apply out of the box;
+this file layers on top of them, either globally (`defaults`) or per
+project (`projects.<name>`). Parse errors never fail the load — a
+mistyped entry is skipped and that action keeps its built-in chord.
+
+**Path:** `~/.shelbi/keys.yml`
+
+### Shape
+
+```yaml
+# ~/.shelbi/keys.yml
+defaults:                 # applies to every project
+  <mode>:
+    <action>: <chord | [chords] | null>
+projects:                 # per-project overrides, keyed by project name
+  <project-name>:
+    <mode>:
+      <action>: <chord | [chords] | null>
+```
+
+Bindings resolve in three layers, each overriding the last: built-in
+defaults → `defaults.<mode>.<action>` → `projects.<name>.<mode>.<action>`.
+
+| Block | Type | Required | Default | Description |
+| --- | --- | --- | --- | --- |
+| `defaults` | map of mode → action → chord(s) | no | — | Overrides applied to every project. |
+| `projects` | map of project name → (mode → action → chord(s)) | no | — | Overrides scoped to one project; win over `defaults`. |
+
+### Leaf values
+
+The value under each action is untyped so one bad entry only affects
+itself:
+
+| Form | Meaning |
+| --- | --- |
+| scalar string (`alt-z`) | Bind the action to a single chord. |
+| list (`[k, up]`) | Bind the action to several chords. |
+| `[]` (empty list) | Deliberately unbind the action. |
+| `null` | No override — fall through to the layer below. |
+
+### Modes
+
+The valid top-level keys under `defaults` and each `projects.<name>`:
+
+`global`, `sidebar`, `kanban`, `popover`, `review`, `activity`, `palette`.
+
+`global` bindings apply everywhere; the rest scope to their pane.
+
+### Actions
+
+The action names accepted under each mode, with their built-in chords:
+
+| Mode | Action | Built-in |
+| --- | --- | --- |
+| `global` | `quit` | `ctrl-c` |
+| `global` | `zen_toggle` | `alt-z` |
+| `global` | `open_palette` | `ctrl-p` |
+| `sidebar` | `nav_up` / `nav_down` | `k`,`up` / `j`,`down` |
+| `sidebar` | `activate` | `enter`,`space` |
+| `sidebar` | `refresh` | `r` |
+| `kanban` | `nav_left` / `nav_right` | `h`,`left` / `l`,`right` |
+| `kanban` | `nav_up` / `nav_down` | `k`,`up` / `j`,`down` |
+| `kanban` | `move_card_left` / `move_card_right` | `H` / `L` |
+| `kanban` | `reorder_up` / `reorder_down` | `K`,`shift-up` / `J`,`shift-down` |
+| `kanban` | `open_popover` | `enter`,`space` |
+| `kanban` | `cycle_workflow_filter` | `tab` |
+| `popover` | `close` | `esc`,`enter`,`space`,`q` |
+| `popover` | `scroll_up` / `scroll_down` | `k`,`up` / `j`,`down` |
+| `popover` | `page_up` / `page_down` | `page-up`,`u` / `page-down`,`d` |
+| `review` | `nav_up` / `nav_down` | `k`,`up` / `j`,`down` |
+| `review` | `scroll_body_up` / `scroll_body_down` | `K` / `J` |
+| `review` | `activate` | `enter`,`space` |
+| `activity` | `scroll_up` / `scroll_down` | `k`,`up` / `j`,`down` |
+| `activity` | `reset_filter` | `a` |
+| `activity` | `toggle_zen_filter` | `z` |
+| `activity` | `toggle_workspaces_filter` | `w` |
+| `palette` | `close` | `esc`,`ctrl-c`,`ctrl-p` |
+| `palette` | `activate` | `enter` |
+| `palette` | `nav_up` / `nav_down` | `up` / `down` |
+
+Most modes also carry `refresh` (`r`) and scroll-navigation actions
+(`page_up`/`page_down`, `scroll_home`); the table lists the ones you're
+most likely to rebind.
+
+```yaml
+# rebind the palette opener globally, and vim-swap kanban nav in one project
+defaults:
+  global:
+    open_palette: ctrl-k
+projects:
+  myapp:
+    kanban:
+      move_card_left: [H, ctrl-h]
+```
+
+## Sibling files
+
+Two more files live under `~/.shelbi/` but are managed by Shelbi rather
+than hand-edited:
+
+- **`shelbi.yaml`** — hub-wide bookkeeping: the assistant identity
+  (`{{assistant_name}}`, substituted into agent prompts) and a
+  per-project `last_launched` index. Written by the setup wizard.
+- **`events.log`** — the cross-project [events log](/docs/concepts/events-log).
+  Append-only state, not config.
+
+## See also
+
+- [Config modes](/docs/concepts/config-modes) — per-project config, which
+  these hub-wide files sit above.
+- [Project config](/docs/configuration/project) — the per-project YAML.
