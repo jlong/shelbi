@@ -174,24 +174,50 @@ fn render_row(row: &Row, selected: bool, width: usize) -> ListItem<'static> {
                 Line::from(spans)
             })
         }
-        Row::Review { title, workspace, .. } => {
-            // Cyan ✓: the task is review-ready, awaiting human action.
-            // Same decoration the palette uses, so workspace / review / palette
-            // row share one visual vocabulary.
+        Row::Review {
+            title,
+            branch,
+            location,
+            ..
+        } => {
+            // Two-line review entry (spec §16). Line 1: decoration badge +
+            // title, with the `machine:port` URL right-aligned when the task
+            // is loaded on a review worktree (Ready — cyan ✓); a Queued task
+            // (dim ·) has no location yet. Line 2: branch, dim. The badge
+            // glyph/color come from `row.decoration()`, the single source
+            // shared with the palette.
             let dec = row.decoration().expect("review rows always have a decoration");
             let badge = Span::styled(
                 format!("{} ", dec.glyph),
                 Style::default().fg(decoration_to_color(dec.color)),
             );
             let title_span = Span::styled(title.clone(), name_style(selected));
-            let workspace_label = workspace.clone().unwrap_or_default();
-            let line = right_align(
-                vec![badge, title_span],
-                workspace_label,
-                Style::default().fg(Color::DarkGray),
-                width,
-            );
-            ListItem::new(if selected { Line::from(bold(line)) } else { Line::from(line) })
+            let line1 = match location {
+                Some(loc) => right_align(
+                    vec![badge, title_span],
+                    loc.clone(),
+                    Style::default().fg(Color::DarkGray),
+                    width,
+                ),
+                None => vec![badge, title_span],
+            };
+            let line1 = if selected {
+                Line::from(bold(line1))
+            } else {
+                Line::from(line1)
+            };
+            // Branch sits under the title (indented past the badge column),
+            // dim in both states — brightening only its weight when selected
+            // so the highlighted row still reads as one unit.
+            let branch_style = if selected {
+                Style::default()
+                    .fg(Color::Gray)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(Color::DarkGray)
+            };
+            let line2 = Line::from(Span::styled(format!("  {branch}"), branch_style));
+            ListItem::new(vec![line1, line2])
         }
         Row::LegacyAgent {
             id,
@@ -886,6 +912,69 @@ mod tests {
             rows[alpha_y].contains("Qa"),
             "agent name must title-case verbatim (no special-casing for known acronyms), got: {:?}",
             rows[alpha_y]
+        );
+    }
+
+    /// Both review sections render as two-line entries (spec §16): line 1 is
+    /// the decoration badge + title (+ a right-aligned `machine:port` URL for
+    /// a Ready item), line 2 is the branch, dim. Ready uses ✓; Queued uses ·.
+    #[test]
+    fn review_sections_render_two_line_entries_with_badge_url_and_branch() {
+        let backend = TestBackend::new(44, 24);
+        let mut term = Terminal::new(backend).unwrap();
+        let mut app = App::new_sidebar("demo");
+        app.ready_review = vec![crate::app::ReviewEntry {
+            task_id: "palette".into(),
+            title: "Palette fuzzy-match fix".into(),
+            branch: "shelbi/palette-fuzzy-match-fix".into(),
+            location: Some("hub:3000".into()),
+        }];
+        app.queued_review = vec![crate::app::ReviewEntry {
+            task_id: "onboarding".into(),
+            title: "Rework onboarding copy".into(),
+            branch: "shelbi/rework-onboarding-copy".into(),
+            location: None,
+        }];
+        term.draw(|f| render_full(f, &mut app, f.area())).unwrap();
+        let rows = dump(&term);
+        let joined = rows.join("\n");
+
+        assert!(joined.contains("Ready for Review"), "Ready header, got:\n{joined}");
+        assert!(joined.contains("Queued for Review"), "Queued header, got:\n{joined}");
+
+        // Ready item: ✓ badge, title, and the machine:port URL on line 1;
+        // branch dim on the very next line.
+        let ready_y = row_y(&rows, "Palette fuzzy-match fix");
+        assert!(rows[ready_y].contains('✓'), "Ready row carries ✓, got: {:?}", rows[ready_y]);
+        assert!(
+            rows[ready_y].contains("hub:3000"),
+            "Ready row's line 1 carries the machine:port URL, got: {:?}",
+            rows[ready_y]
+        );
+        assert!(
+            rows[ready_y + 1].contains("shelbi/palette-fuzzy-match-fix"),
+            "branch renders on the line directly below the title, got: {:?}",
+            rows[ready_y + 1]
+        );
+
+        // Queued item: · badge, no URL; branch on the next line.
+        let queued_y = row_y(&rows, "Rework onboarding copy");
+        assert!(rows[queued_y].contains('·'), "Queued row carries ·, got: {:?}", rows[queued_y]);
+        assert!(
+            !rows[queued_y].contains(':'),
+            "a queued item has no location badge, got: {:?}",
+            rows[queued_y]
+        );
+        assert!(
+            rows[queued_y + 1].contains("shelbi/rework-onboarding-copy"),
+            "queued branch renders directly below its title, got: {:?}",
+            rows[queued_y + 1]
+        );
+
+        // Ready section sits above Queued.
+        assert!(
+            row_y(&rows, "Ready for Review") < row_y(&rows, "Queued for Review"),
+            "Ready section must render above Queued, got:\n{joined}"
         );
     }
 }

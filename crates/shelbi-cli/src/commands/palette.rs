@@ -470,7 +470,7 @@ fn entry_from_row(row: &Row, workspaces: &[WorkspaceOverview]) -> Option<Entry> 
                 decoration,
             })
         }
-        Row::Review { title, workspace, view } => {
+        Row::Review { title, location, view, .. } => {
             let id = match view {
                 View::ReviewTask(task_id) => format!("review:{task_id}"),
                 _ => return None,
@@ -479,9 +479,11 @@ fn entry_from_row(row: &Row, workspaces: &[WorkspaceOverview]) -> Option<Entry> 
                 id,
                 label: title.clone(),
                 kind: EntryKind::Action,
-                subtitle: Some(match workspace.as_deref() {
-                    Some(w) => format!("review · {w}"),
-                    None => "review".into(),
+                // Loaded tasks carry their `machine:port` URL; queued ones
+                // have no location yet.
+                subtitle: Some(match location.as_deref() {
+                    Some(loc) => format!("review · {loc}"),
+                    None => "review · queued".into(),
                 }),
                 shortcut: None,
                 decoration,
