@@ -1,6 +1,6 @@
 ---
 title: Git-flow
-order: 33
+order: 32
 summary: A long-lived develop integration branch with feature, release, and hotfix branches. Model it as two Shelbi Workflows — features land on develop, releases ship develop to main.
 ---
 
@@ -14,7 +14,7 @@ Git-flow doesn't fit one board, because a feature and a release are
 different lifecycles. Model it as **two Shelbi Workflows**: a `feature`
 workflow whose tasks branch off and merge back into `develop`, and a
 `release` workflow whose task PRs `develop` into `main`. Hotfixes reuse
-the [feature-branch](/docs/guides/feature-branch) default with `main` as
+the [feature-branch](/docs/guides/understanding-workflows/feature-branch) default with `main` as
 their base.
 
 ## The board
@@ -222,5 +222,5 @@ follow-up task rather than trying to encode it as a transition.
   branches instead of one `develop`.
 - [Workflows: the `branch:` task field](/docs/concepts/workflows#the-branch-task-field)
   — how a release task operates on `develop` without cutting a new branch.
-- [Feature-branch](/docs/guides/feature-branch) — the simpler model
+- [Feature-branch](/docs/guides/understanding-workflows/feature-branch) — the simpler model
   hotfixes fall back to.

@@ -133,7 +133,7 @@ transitions:
     actions: [close_pr]                  # close the PR without merging; the fork keeps its branch
 ```
 
-Two side-effects that the [feature-branch](/docs/guides/feature-branch)
+Two side-effects that the [feature-branch](/docs/guides/understanding-workflows/feature-branch)
 model uses are deliberately *absent* here:
 
 - **No `open_pr`.** The contributor already opened the PR from their fork.
@@ -172,7 +172,7 @@ check is necessary but not sufficient for merging someone else's code.
 ```
 
 That last rule is the difference between forking and
-[trunk-based](/docs/guides/trunk-based): trunk-based leans *into*
+[trunk-based](/docs/guides/understanding-workflows/trunk-based): trunk-based leans *into*
 auto-merge for your own green work; forking deliberately keeps a human at
 the gate for code that arrived from outside.
 
@@ -182,5 +182,5 @@ the gate for code that arrived from outside.
   `InReview` status dispatches to.
 - [Workflows: the `branch:` task field](/docs/concepts/workflows#the-branch-task-field)
   — pointing a task at an existing fork PR branch instead of cutting one.
-- [Trunk-based](/docs/guides/trunk-based) — the opposite end of the
+- [Trunk-based](/docs/guides/understanding-workflows/trunk-based) — the opposite end of the
   auto-merge spectrum, for work you trust.
