@@ -762,6 +762,17 @@ pub struct InlineIdentityField {
 /// override for `merge` and `open_pr` actions that should land somewhere
 /// other than the workflow's resolved `git.base_branch`. See
 /// `Plans/workflows.md` §12.
+///
+/// **Declarative only.** As of now this block is parsed, validated (every
+/// `from`/`to` must name a declared status), and round-tripped, but there
+/// is no engine that walks a transition's [`actions`](Self::actions) and
+/// fires the matching [`crate::TransitionAction`] primitives, and the
+/// [`target`](Self::target) override is not substituted for `{{var}}`
+/// placeholders. The primitives are invoked manually today via the
+/// `shelbi action` subcommands (each taking an explicit `--target`);
+/// wiring an automatic executor is tracked separately. Consumers that
+/// read this block (e.g. [`Workflow::is_merge_transition`]) treat it as a
+/// static description of intent, not something that has already run.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Transition {
     /// Stable id ([`Status::id`]) a task moves out of. Must match a
@@ -784,6 +795,11 @@ pub struct Transition {
     /// fallback) wins. Useful for multi-hop pipelines: a feature
     /// workflow that merges intermediate work into `develop` here but
     /// ships to `main` on a later transition.
+    ///
+    /// Stored verbatim — no `{{var}}` interpolation is performed. It is
+    /// currently surfaced to humans / passed to `shelbi action --target`
+    /// by hand rather than consumed by an automatic executor (see the
+    /// struct-level note).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub target: Option<String>,
 }
@@ -985,8 +1001,13 @@ fn convert_raw_workflow(raw: RawWorkflow) -> crate::Result<(Workflow, Vec<Status
         // fills it in from `workflows/statuses.yml` via
         // [`Workflow::resolve_against`] before any validation that
         // depends on the real value runs.
+        // Pass the *wire* category (which may be absent) to the owner
+        // migration so it can tell "no default for this real category"
+        // apart from "category not yet resolved" — see below. The Status
+        // struct still gets the sentinel-filled value.
+        let (owner, agent, migration) =
+            resolve_owner_agent(&id, &st.owner, st.agent, st.category)?;
         let category = st.category.unwrap_or(StatusCategory::Backlog);
-        let (owner, agent, migration) = resolve_owner_agent(&id, &st.owner, st.agent, category)?;
         if let Some(m) = migration {
             migrations.push(m);
         }
@@ -1042,7 +1063,7 @@ fn resolve_owner_agent(
     status_id: &str,
     raw_owner: &str,
     raw_agent: Option<String>,
-    category: StatusCategory,
+    category: Option<StatusCategory>,
 ) -> crate::Result<(Owner, Option<String>, Option<StatusMigration>)> {
     match raw_owner {
         "user" => Ok((Owner::User, raw_agent, None)),
@@ -1054,12 +1075,22 @@ fn resolve_owner_agent(
                 // sense; everything else is an authoring bug we surface
                 // immediately.
                 let derived = match category {
-                    StatusCategory::Ready => DEFAULT_READY_AGENT,
-                    StatusCategory::Active => DEFAULT_ACTIVE_AGENT,
-                    other => {
+                    Some(StatusCategory::Ready) => DEFAULT_READY_AGENT,
+                    Some(StatusCategory::Active) => DEFAULT_ACTIVE_AGENT,
+                    Some(other) => {
                         return Err(workflow_err(format!(
                             "status `{status_id}` has owner: agent but no agent: field \
                              — which agent should run here? (no category default for `{other}`)",
+                        )));
+                    }
+                    // `category:` was absent on the wire (it gets filled in
+                    // later from `workflows/statuses.yml`), so we can't
+                    // derive a default yet and must not blame the sentinel
+                    // `backlog` category the loader uses as a placeholder.
+                    None => {
+                        return Err(workflow_err(format!(
+                            "status `{status_id}` has owner: agent but neither an `agent:` \
+                             field nor a `category:` to derive a default from — add one",
                         )));
                     }
                 };
@@ -2089,6 +2120,28 @@ zen:
         assert!(matches!(
             z.danger_paths.as_ref().unwrap(),
             ZenDangerPaths::Override(v) if v == &vec!["fixtures/**".to_string()]
+        ));
+    }
+
+    #[test]
+    fn workflow_zen_danger_paths_accepts_bare_sequence_as_extend() {
+        // The intuitive list form `danger_paths: [..]` is shorthand for
+        // `extend:` — it must not fail the whole workflow load.
+        let yaml = r#"
+name: research
+statuses:
+  - { name: Drafting, category: active, owner: agent, agent: developer }
+zen:
+  danger_paths:
+    - 'fixtures/**'
+    - '.env'
+"#;
+        let wf = Workflow::from_yaml_str(yaml).unwrap();
+        let z = wf.zen.as_ref().expect("zen block parsed");
+        assert!(matches!(
+            z.danger_paths.as_ref().unwrap(),
+            ZenDangerPaths::Extend(v)
+                if v == &vec!["fixtures/**".to_string(), ".env".to_string()]
         ));
     }
 

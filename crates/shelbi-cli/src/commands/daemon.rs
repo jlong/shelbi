@@ -150,6 +150,16 @@ const MAX_EVENT_BODY_BYTES: usize = 4000;
 /// client can't hold up a supervisor-initiated restart indefinitely.
 const SHUTDOWN_DRAIN_TIMEOUT: Duration = Duration::from_secs(3);
 
+/// Upper bound on the number of outstanding (unacked) messages the daemon
+/// tracks at once. Every entry eventually becomes either an `ack=worker`
+/// or a synthesized `ack=timeout` line in `events.log`, so an unbounded
+/// map lets a spammy or buggy worker amplify a burst of pushes into an
+/// unbounded flood of log writes. Well above any healthy fleet's in-flight
+/// count — hitting it means something is wrong, and we shed rather than
+/// grow without limit. Refreshing an already-tracked pair is always
+/// allowed; only *new* pairs past the cap are rejected.
+const MAX_PENDING: usize = 10_000;
+
 /// In-memory map of pushed-but-unacked messages, keyed by `(task_id,
 /// msg_id)` with the push time recorded against [`Instant::now`] at
 /// arrival. Shared between the listener (insert on `message-pushed`,
@@ -253,8 +263,19 @@ fn run_foreground() -> Result<()> {
     prepare_socket(&sock)?;
     prune_stale_control_masters();
 
-    let listener = UnixListener::bind(&sock)
+    // Tighten the umask around bind() so the socket inode is created
+    // 0600 from the very start. Without this there is a window between
+    // bind() and the chmod below where the socket carries the umask
+    // default (typically world/group-connectable) and a local peer could
+    // connect. Restore the previous umask immediately so nothing else the
+    // daemon creates inherits the restrictive value.
+    let prev_umask = unsafe { libc::umask(0o177) };
+    let bind_result = UnixListener::bind(&sock);
+    unsafe { libc::umask(prev_umask) };
+    let listener = bind_result
         .with_context(|| format!("binding hub socket at {}", sock.display()))?;
+    // Belt-and-suspenders in case a non-default umask still widened the
+    // inode (umask can only clear bits, not set them).
     fs::set_permissions(&sock, fs::Permissions::from_mode(0o600))
         .with_context(|| format!("chmod 600 {}", sock.display()))?;
 
@@ -460,10 +481,20 @@ fn prune_stale_control_masters() {
 fn ensure_socket_dir(sock: &Path) -> Result<()> {
     if let Some(parent) = sock.parent() {
         if !parent.as_os_str().is_empty() {
+            let existed = parent.exists();
             fs::create_dir_all(parent)
                 .with_context(|| format!("creating socket parent {}", parent.display()))?;
-            fs::set_permissions(parent, fs::Permissions::from_mode(0o700))
-                .with_context(|| format!("chmod 700 {}", parent.display()))?;
+            // Only lock down a parent directory we just created (the
+            // `~/.shelbi` home is ours to own). A pre-existing dir — most
+            // importantly a shared one like `/tmp` when `SHELBI_HUB_SOCK`
+            // points there — must keep its own permissions; chmod 700 on
+            // `/tmp` would break every other user on the box. The socket
+            // file itself gets chmod 600 after bind, which is what
+            // actually restricts access to it.
+            if !existed {
+                fs::set_permissions(parent, fs::Permissions::from_mode(0o700))
+                    .with_context(|| format!("chmod 700 {}", parent.display()))?;
+            }
         }
     }
     Ok(())
@@ -766,7 +797,16 @@ fn handle_message_pushed(msg: &Message, daemon: &Daemon) -> Result<()> {
     let task_id = required(msg.task_id.as_deref(), "message-pushed", "task_id")?;
     let msg_id = required(msg.msg_id.as_deref(), "message-pushed", "msg_id")?;
     let mut map = lock_pending(&daemon.pending);
-    map.insert((task_id.to_string(), msg_id.to_string()), Instant::now());
+    let key = (task_id.to_string(), msg_id.to_string());
+    if !map.contains_key(&key) && map.len() >= MAX_PENDING {
+        return Err(anyhow!(
+            "pending-ack map at capacity ({MAX_PENDING}); refusing message-pushed for {}/{} \
+             (a worker is likely flooding pushes without acking)",
+            key.0,
+            key.1
+        ));
+    }
+    map.insert(key, Instant::now());
     Ok(())
 }
 

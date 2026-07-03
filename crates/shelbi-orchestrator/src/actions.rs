@@ -1177,9 +1177,22 @@ fn worktree_branch(host: &Host, wt: &str) -> Result<Option<String>> {
 fn local_branch_exists(host: &Host, wt: &str, branch: &str) -> Result<bool> {
     let ref_name = format!("refs/heads/{branch}");
     let out = run_in_dir(host, wt, &["git", "rev-parse", "--verify", "--quiet", &ref_name])?;
-    // `--verify --quiet` exits 0 iff the ref resolves; any non-zero means
-    // "no such ref" (the only realistic failure mode here).
-    Ok(out.status.success())
+    match out.status.code() {
+        // Ref resolves → the branch exists.
+        Some(0) => Ok(true),
+        // `--verify --quiet` exits 1 with no output when the ref simply
+        // doesn't resolve — that's the genuine "branch absent" answer.
+        Some(1) => Ok(false),
+        // Anything else — notably 128 (not a git repo / bad worktree /
+        // corrupt refs) — is a real failure, not "no such branch".
+        // Reporting it as absent would let `delete_branch` mis-route on a
+        // broken repo; surface it instead.
+        _ => Err(Error::Command {
+            cmd: format!("git -C {wt} rev-parse --verify --quiet {ref_name}"),
+            status: out.status.to_string(),
+            stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
+        }),
+    }
 }
 
 fn remote_branch_exists(host: &Host, wt: &str, branch: &str) -> Result<bool> {

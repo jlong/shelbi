@@ -74,7 +74,7 @@ const SSH_CONTROL_OPTS_STATIC: &[&str] = &[
 /// args without baking it into a const.
 ///
 /// The reverse forward exposes the hub daemon's `~/.shelbi/hub.sock` to
-/// the remote side as `/tmp/shelbi-hub.sock` (overridable via
+/// the remote side as `/tmp/shelbi-hub-<uid>.sock` (overridable via
 /// `SHELBI_REMOTE_HUB_SOCK`). Remote workers — Phase 5 — write to that
 /// path and the messages land in hub's events.log without an extra
 /// outbound channel.

@@ -42,8 +42,8 @@ const ENV_TASK_ID: &str = "TASK_ID";
 /// Env var pointing at the hub socket the worker writes JSON-line
 /// messages to (events, clarification requests, message-acks). Phase 3
 /// of the worker↔hub design pins this to `~/.shelbi/hub.sock` on the
-/// hub, `/tmp/shelbi-hub.sock` on remote panes; here we default to the
-/// hub path but honor an existing value so tests / remote panes can
+/// hub, `/tmp/shelbi-hub-<uid>.sock` on remote panes; here we default to
+/// the hub path but honor an existing value so tests / remote panes can
 /// override.
 const ENV_HUB_SOCK: &str = "SHELBI_HUB_SOCK";
 

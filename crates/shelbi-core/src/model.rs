@@ -999,7 +999,7 @@ impl Column {
         match self {
             Column::Backlog => "Backlog",
             Column::Todo => "Todo",
-            Column::InProgress => "InProgress",
+            Column::InProgress => "In Progress",
             Column::Review => "Review",
             Column::Done => "Done",
         }
@@ -1300,9 +1300,10 @@ pub struct ZenChecks {
 /// with a single `extend:` or `override:` key — we hand-roll it via
 /// [`ZenDangerPathsRepr`] because serde_yaml's externally-tagged
 /// default uses YAML tags (`!extend`), which are awkward to write in a
-/// hand-edited project file.
+/// hand-edited project file. A bare sequence (`danger_paths: [..]`) is
+/// also accepted as shorthand for `extend:` — see [`ZenDangerPathsWire`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(try_from = "ZenDangerPathsRepr", into = "ZenDangerPathsRepr")]
+#[serde(try_from = "ZenDangerPathsWire", into = "ZenDangerPathsRepr")]
 pub enum ZenDangerPaths {
     Extend(Vec<String>),
     Override(Vec<String>),
@@ -1322,6 +1323,30 @@ struct ZenDangerPathsRepr {
     extend: Option<Vec<String>>,
     #[serde(default, skip_serializing_if = "Option::is_none", rename = "override")]
     override_: Option<Vec<String>>,
+}
+
+/// Deserialization-only wrapper that lets `danger_paths:` be written as
+/// either the map form (`{ extend: [..] }` / `{ override: [..] }`) or a
+/// bare sequence (`danger_paths: [".env"]`), the latter being shorthand
+/// for `extend:`. Without this, the intuitive list form failed the whole
+/// project load with a raw serde error.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(untagged)]
+enum ZenDangerPathsWire {
+    /// Bare sequence — treated as `extend`.
+    Bare(Vec<String>),
+    /// Map form with a single `extend:` or `override:` key.
+    Map(ZenDangerPathsRepr),
+}
+
+impl TryFrom<ZenDangerPathsWire> for ZenDangerPaths {
+    type Error = &'static str;
+    fn try_from(w: ZenDangerPathsWire) -> Result<Self, Self::Error> {
+        match w {
+            ZenDangerPathsWire::Bare(v) => Ok(ZenDangerPaths::Extend(v)),
+            ZenDangerPathsWire::Map(r) => ZenDangerPaths::try_from(r),
+        }
+    }
 }
 
 impl TryFrom<ZenDangerPathsRepr> for ZenDangerPaths {

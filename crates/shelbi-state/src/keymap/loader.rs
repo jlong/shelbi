@@ -32,7 +32,7 @@ use serde::Deserialize;
 use serde_yaml::{Mapping, Value};
 use super::actions::{
     Action, ActivityAction, GlobalAction, KanbanAction, PaletteAction, PopoverAction, ReviewAction,
-    SidebarAction,
+    SidebarAction, MODE_NAMES,
 };
 use super::chord::KeyChord;
 use crate::user_config::{load_user_config, save_user_config, ZenToggleChord};
@@ -418,11 +418,15 @@ pub fn load_keymaps(project_name: Option<&str>) -> (Keymaps, Vec<KeymapDiagnosti
     // most one revert per action. `reported` dedupes the diagnostic per
     // (mode, chord) so an unresolvable defaults-level clash is surfaced
     // once rather than every pass.
-    let modes = ["global", "sidebar", "kanban", "popover", "review", "activity", "palette"];
+    //
+    // Drive the per-mode scan off the canonical `MODE_NAMES` so a
+    // newly-added mode is covered automatically instead of silently
+    // skipping collision checks until someone remembers to extend a
+    // duplicated local list.
     let mut reported: HashSet<(String, String)> = HashSet::new();
     loop {
         let mut changed = false;
-        for mode in modes {
+        for &mode in MODE_NAMES {
             let mut by_chord: HashMap<KeyChord, Vec<Action>> = HashMap::new();
             for (action, chords) in &parsed {
                 if action.mode() != mode {

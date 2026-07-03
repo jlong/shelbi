@@ -26,9 +26,10 @@ pub struct TeamSignals {
     /// the repo has a remote origin. Missing remote → probably a scratch
     /// dir or an unpublished repo; probably solo.
     pub has_remote_origin: bool,
-    /// Distinct committer emails seen by `git log --format=%ae | sort -u`.
-    /// A count ≥ 2 is our signal that more than one person has touched
-    /// the repo (the team-contributor threshold).
+    /// Distinct committer emails seen in the recent history
+    /// (`git log -n <depth> --format=%ae`, deduped). A count ≥ 2 is our
+    /// signal that more than one person has touched the repo (the
+    /// team-contributor threshold).
     pub distinct_committer_emails: usize,
 }
 
@@ -64,9 +65,16 @@ fn has_remote_origin(cwd: &Path) -> bool {
         .unwrap_or(false)
 }
 
+/// How far back the committer scan walks. The recommendation only needs
+/// to know whether ≥ 2 distinct emails have touched the repo (see
+/// [`recommend_mode`]), so there's no reason to load an entire multi-year
+/// history into memory — a team repo shows multiple committers in its
+/// recent commits, and this bounds the cost on huge repos.
+const COMMITTER_SCAN_DEPTH: &str = "2000";
+
 fn distinct_committer_emails(cwd: &Path) -> usize {
     let out = match Command::new("git")
-        .args(["log", "--format=%ae"])
+        .args(["log", "-n", COMMITTER_SCAN_DEPTH, "--format=%ae"])
         .current_dir(cwd)
         .output()
     {

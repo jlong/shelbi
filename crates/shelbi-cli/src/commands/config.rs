@@ -15,7 +15,7 @@
 
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use clap::Subcommand;
 use shelbi_state::keymap::{
     load_keymaps, Action, KeyChord, KeymapDiagnostic, Keymaps, KEYS_FILENAME, MODE_NAMES,
@@ -33,6 +33,12 @@ pub enum ConfigCmd {
         /// Write the YAML to this path instead of stdout.
         #[arg(long, short = 'o')]
         out: Option<PathBuf>,
+        /// Overwrite the output file if it already exists. Without this,
+        /// dumping onto an existing path (e.g. your hand-maintained
+        /// `keys.yml`) is refused so a stray `-o` can't silently erase
+        /// your customizations.
+        #[arg(long)]
+        force: bool,
     },
     /// Validate `~/.shelbi/keys.yml` and print any errors / warnings.
     /// Exits 1 on errors; warnings still exit 0.
@@ -42,7 +48,7 @@ pub enum ConfigCmd {
 pub fn run(project: Option<String>, cmd: ConfigCmd) -> Result<()> {
     match cmd {
         ConfigCmd::ListActions => list_actions(project),
-        ConfigCmd::DumpKeybindings { out } => dump_keybindings(out),
+        ConfigCmd::DumpKeybindings { out, force } => dump_keybindings(out, force),
         ConfigCmd::Check => check(project),
     }
 }
@@ -154,11 +160,24 @@ const DUMP_HEADER: &str = "\
 
 ";
 
-fn dump_keybindings(out: Option<PathBuf>) -> Result<()> {
+fn dump_keybindings(out: Option<PathBuf>, force: bool) -> Result<()> {
     let yaml = render_default_keymap();
     match out {
-        Some(path) => std::fs::write(&path, &yaml)
-            .with_context(|| format!("writing {}", path.display()))?,
+        Some(path) => {
+            // Never silently clobber an existing file: `-o ~/.shelbi/keys.yml`
+            // pointed at a hand-maintained keymap would otherwise erase every
+            // customization. Require an explicit --force to replace it.
+            if path.exists() && !force {
+                bail!(
+                    "{} already exists — refusing to overwrite it (it may be your \
+                     hand-maintained keymap). Re-run with --force to replace it, or \
+                     dump to stdout and redirect to a different file.",
+                    path.display()
+                );
+            }
+            std::fs::write(&path, &yaml)
+                .with_context(|| format!("writing {}", path.display()))?
+        }
         None => print!("{yaml}"),
     }
     Ok(())
@@ -459,10 +478,30 @@ mod tests {
         let _g = ENV_LOCK.lock().unwrap();
         let home = fresh_home();
         let out = home.join("dump.yml");
-        dump_keybindings(Some(out.clone())).unwrap();
+        dump_keybindings(Some(out.clone()), false).unwrap();
         let body = std::fs::read_to_string(&out).unwrap();
         assert!(body.contains("defaults:"));
         assert!(body.contains("    quit: ctrl-c\n"));
+    }
+
+    #[test]
+    fn dump_keybindings_refuses_to_clobber_existing_file_without_force() {
+        let _g = ENV_LOCK.lock().unwrap();
+        let home = fresh_home();
+        let out = home.join("keys.yml");
+        std::fs::write(&out, "custom: keep-me\n").unwrap();
+
+        // No --force → refuse and leave the hand-maintained file untouched.
+        let err = dump_keybindings(Some(out.clone()), false).unwrap_err();
+        assert!(
+            err.to_string().contains("already exists"),
+            "expected refuse-to-overwrite error, got: {err}"
+        );
+        assert_eq!(std::fs::read_to_string(&out).unwrap(), "custom: keep-me\n");
+
+        // --force → overwrite with the dumped defaults.
+        dump_keybindings(Some(out.clone()), true).unwrap();
+        assert!(std::fs::read_to_string(&out).unwrap().contains("defaults:"));
     }
 
     // ---- check ------------------------------------------------------------
