@@ -4,6 +4,14 @@ const nextConfig: NextConfig = {
   turbopack: {
     root: import.meta.dirname,
   },
+  // The OG image routes read the Source Code Pro TTF from `public/fonts` at
+  // request time (Satori needs the raw font bytes). Trace it into each route's
+  // serverless bundle so the file is present in production.
+  outputFileTracingIncludes: {
+    "/opengraph-image": ["./public/fonts/SourceCodePro-Regular.ttf"],
+    "/og/vs/[[...slug]]": ["./public/fonts/SourceCodePro-Regular.ttf"],
+    "/og/docs/[[...slug]]": ["./public/fonts/SourceCodePro-Regular.ttf"],
+  },
   async rewrites() {
     return [
       // Per-page markdown: appending `.md` to any docs URL serves the page's

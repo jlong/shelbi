@@ -1,11 +1,21 @@
 import type { Metadata } from "next"
 import { Analytics } from "@vercel/analytics/next"
 import { GeistSans } from "geist/font/sans"
-import { GeistMono } from "geist/font/mono"
+import { Source_Code_Pro } from "next/font/google"
 import { Header } from "@/components/Header"
 import { Footer } from "@/components/Footer"
 import { getSections, humanizeSection } from "@/lib/docs"
 import "./globals.css"
+
+// Mono family for code, CLI hints, and the hero mockup. Self-hosted via
+// `next/font/google` and exposed as the `--font-source-code-pro` variable,
+// which `--font-mono` (globals.css) points at. Weights: 400 (body/code),
+// 500 (medium labels), 600 (semibold, e.g. Footer headings).
+const sourceCodePro = Source_Code_Pro({
+  subsets: ["latin"],
+  weight: ["400", "500", "600"],
+  variable: "--font-source-code-pro",
+})
 
 const SITE_URL = "https://shelbi.dev"
 const SITE_DESCRIPTION =
@@ -50,7 +60,7 @@ export default function RootLayout({
     <html
       lang="en"
       suppressHydrationWarning
-      className={`${GeistSans.variable} ${GeistMono.variable} antialiased`}
+      className={`${GeistSans.variable} ${sourceCodePro.variable} antialiased`}
     >
       <head>
         <script

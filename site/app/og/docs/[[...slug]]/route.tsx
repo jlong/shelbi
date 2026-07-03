@@ -45,16 +45,14 @@ export async function GET(_request: Request, { params }: RouteProps) {
     section = doc.section ? humanize(doc.section) : undefined
   }
 
-  const [geistRegular, geistSemiBold, geistMonoRegular] = await Promise.all([
+  const [geistRegular, geistSemiBold, sourceCodeProRegular] = await Promise.all([
     readFile(
       join(process.cwd(), "node_modules/geist/dist/fonts/geist-sans/Geist-Regular.ttf"),
     ),
     readFile(
       join(process.cwd(), "node_modules/geist/dist/fonts/geist-sans/Geist-SemiBold.ttf"),
     ),
-    readFile(
-      join(process.cwd(), "node_modules/geist/dist/fonts/geist-mono/GeistMono-Regular.ttf"),
-    ),
+    readFile(join(process.cwd(), "public/fonts/SourceCodePro-Regular.ttf")),
   ])
 
   return new ImageResponse(<OgCard title={title} section={section} />, {
@@ -62,7 +60,7 @@ export async function GET(_request: Request, { params }: RouteProps) {
     fonts: [
       { name: "Geist", data: geistRegular, style: "normal", weight: 400 },
       { name: "Geist", data: geistSemiBold, style: "normal", weight: 600 },
-      { name: "Geist Mono", data: geistMonoRegular, style: "normal", weight: 400 },
+      { name: "Source Code Pro", data: sourceCodeProRegular, style: "normal", weight: 400 },
     ],
   })
 }
