@@ -50,7 +50,7 @@ export function Hero() {
             href="/docs/guides/getting-started/install"
             className={`${CTA_BASE} bg-fg text-bg hover:bg-gray-7`}
           >
-            Install shelbi
+            Install Shelbi
             <ArrowRightIcon className="h-2 w-2" aria-hidden="true" />
           </Link>
           <Link
