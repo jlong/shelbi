@@ -21,6 +21,20 @@ they earn their keep. Newest entry goes first; never reorder older ones.
 
 ### Unreleased
 
+**Adaptive hub heartbeats.** The `heartbeat` cadence now backs off when the
+board is quiet instead of firing at a fixed interval forever. It holds at the
+standard `interval` (default `3m`) while there's supervisable work in flight,
+then doubles each idle tick — capped at a new `max` bound (default `60m`) —
+once the board goes quiescent, and snaps back to `interval` on the next real
+event. The config gains the `max` field: `heartbeat: 3m` still works (bare
+interval, default cap), as does `heartbeat: off`, and a map
+`heartbeat: { interval: 3m, max: 60m }` sets both bounds. Every existing
+project gets back-off with no YAML edit. Backing off on "nothing supervisable
+in flight" rather than "no log line" is deliberate — a silently-stuck
+`in_progress` task also emits nothing, and the heartbeat sweep is exactly what
+catches it. See the [`heartbeat` field reference](/docs/configuration/project#heartbeat)
+and [the events log](/docs/concepts/events-log#heartbeats).
+
 **Orchestrator naming removed.** The onboarding wizard no longer asks you
 to name your assistant, and the `assistant_name` config field is gone. The
 orchestrator prompt now reads *"You are the Orchestrator"* statically —

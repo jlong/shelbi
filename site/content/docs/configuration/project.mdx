@@ -67,7 +67,7 @@ workspaces:
 | `config_mode` | `global` \| `in-repo` | no | `global` | Which on-disk layout the project uses. Elided from the wire form when `global`. See [config modes](/docs/concepts/config-modes). |
 | `workspace_poll_interval_secs` | integer | no | `5` | How often the hub poller samples each workspace pane for state changes. |
 | `workspace_permissions_mode` | string | no | `auto` | Permissions posture rendered into the workspace settings template (`auto` → claude's `acceptEdits`). |
-| `heartbeat` | `off` \| duration | no | `3m` | Recurring hub heartbeat written to `events.log` so the orchestrator's watch fires when the board is quiet. |
+| `heartbeat` | [Heartbeat](#heartbeat) | no | `3m` / `60m` | Adaptive hub heartbeat written to `events.log` so the orchestrator's watch fires on a quiet board. Holds at `interval` while work is in flight, backs off toward `max` when quiescent. |
 | `git` | [Git](#git) | no | all defaults | Base branch and merge strategy for `shelbi merge` and Zen's auto-merge. |
 | `review` | object | no | all defaults | How [review workspaces](/docs/concepts/review-workspaces) load and serve a branch (ports, setup/serve commands). |
 
@@ -193,6 +193,47 @@ zen:
   ci_timeout: 1200
   danger_paths:
     extend: [".env", "infra/**"]   # or: override: [...], or a bare list
+```
+
+## heartbeat
+
+The recurring line the hub poller writes into `events.log` so the
+orchestrator's `events tail --follow` watch wakes up to sweep active
+tasks even when no real transition has fired. See
+[the events log](/docs/concepts/events-log#heartbeats) for how the
+orchestrator consumes it.
+
+The cadence is **adaptive**: it holds at `interval` whenever there's
+supervisable work in flight (any active, ready, or in-review task —
+even one emitting no events, which is exactly when the sweep earns its
+keep), and once the board is quiescent it backs off exponentially,
+doubling each idle tick up to `max`. Any real event snaps the cadence
+straight back to `interval`. So a fully idle hub relaxes
+`3m → 6m → 12m → … → 60m`, then resets to `3m` the moment something
+happens.
+
+`heartbeat` accepts three shapes:
+
+| Form | Meaning |
+| --- | --- |
+| `heartbeat: 3m` | Bare duration — sets `interval` and keeps the default `max` (`60m`). |
+| `heartbeat: off` | Disables heartbeats entirely. |
+| `heartbeat: { interval: 3m, max: 60m }` | Map — sets both bounds explicitly. |
+
+The map form's fields:
+
+| Field | Type | Required | Default | Description |
+| --- | --- | --- | --- | --- |
+| `interval` | duration | no | `3m` | Standard cadence, used whenever supervisable work is in flight. |
+| `max` | duration | no | `60m` | Back-off cap the interval doubles toward while the board is quiescent. A `max` ≤ `interval` pins the cadence at `interval` (no back-off). |
+
+Durations take an explicit unit — `45s`, `3m`, `1h`. A bare integer is
+rejected (there's no implicit unit).
+
+```yaml
+heartbeat:
+  interval: 3m    # standard cadence while work is in flight
+  max: 60m        # back-off cap once the board is quiescent
 ```
 
 ## git

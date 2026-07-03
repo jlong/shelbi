@@ -221,18 +221,26 @@ useful:
   heartbeat` line to [`~/.shelbi/events.log`](/docs/concepts/events-log)
   when the board is otherwise quiet. The orchestrator follows the log
   with `shelbi events tail --follow`; the heartbeat is its guaranteed
-  recurring wake-up when nothing else has fired. Default `3m`.
+  recurring wake-up when nothing else has fired.
 
-  Accepts a duration string with an explicit unit suffix — `45s`, `3m`,
-  `1h` — or the literal `"off"` (quote it; YAML otherwise reads bare
-  `off` as the boolean `false`). Bare integers like `heartbeat: 180`
-  are rejected — there's no implicit unit, on purpose.
+  The cadence is **adaptive**: it holds at the standard `interval`
+  (default `3m`) while there's supervisable work in flight, then backs
+  off exponentially — doubling each idle tick, capped at `max` (default
+  `60m`) — once the board goes quiescent, and snaps back to `interval`
+  on the next real event. See the
+  [`heartbeat` field reference](/docs/configuration/project#heartbeat).
+
+  Accepts a bare duration string with an explicit unit suffix — `45s`,
+  `3m`, `1h` (sets `interval`, keeps the default `max`) — a map that
+  sets both bounds, or the literal `"off"` (quote it; YAML otherwise
+  reads bare `off` as the boolean `false`). Bare integers like
+  `heartbeat: 180` are rejected — there's no implicit unit, on purpose.
 
   ```yaml
-  heartbeat: 3m         # default
-  heartbeat: 90s        # tighter cadence
-  heartbeat: 1h         # background project
-  heartbeat: "off"      # disable
+  heartbeat: 3m                     # standard interval, default 60m cap
+  heartbeat: 90s                    # tighter cadence
+  heartbeat: { interval: 3m, max: 30m }  # both bounds explicit
+  heartbeat: "off"                  # disable
   ```
 
   <Callout type="warning" title="Quote the off value">
@@ -243,9 +251,10 @@ useful:
 
   </Callout>
 
-  Emission is debounced against everything else in the log: if any
-  line was written in the last `heartbeat` interval — a workspace
-  transition, a task move, another heartbeat — the next tick skips
+  Emission also resets against everything else in the log: if a real
+  line landed since the last heartbeat — a workspace transition, a task
+  move — that event already woke the orchestrator, so the next tick
+  skips its emission and resets the cadence to the standard `interval`
   rather than padding an already-active feed.
 
   Heartbeats are intentionally absent from the TUI activity feed —
