@@ -8,8 +8,8 @@
 //! highlighted — id, branch, workspace, timestamps, and the task body the
 //! orchestrator wrote when it routed the work.
 //!
-//! Pressing Enter on a task kicks off the same review checkout flow the
-//! sidebar uses. As with the Kanban pane the parent shell wraps this in a
+//! Pressing Enter on a task loads it onto a review workspace, the same flow
+//! the sidebar uses. As with the Kanban pane the parent shell wraps this in a
 //! `while true` loop so we deliberately don't bind a quit key — switching
 //! away is the palette's job.
 
@@ -154,9 +154,9 @@ impl ReviewApp {
         self.body_scroll = 0;
     }
 
-    /// Trigger the review checkout flow for the highlighted task. Same
-    /// path the sidebar's `ReviewTask` view uses — bring the branch into
-    /// the machine's review work_dir and (re)launch the review pane.
+    /// Load the highlighted task onto a review workspace. Same path the
+    /// sidebar's `ReviewTask` view uses — move the branch onto a free review
+    /// workspace's worktree and launch its review agent.
     pub fn activate_selection(&mut self) {
         let Some(tf) = self.selected_task() else {
             self.status_line = "queue empty — nothing to review".into();
@@ -173,19 +173,11 @@ impl ReviewApp {
     }
 
     fn start_review(&self, id: &str) -> Result<String> {
-        let project = shelbi_state::load_project(&self.project_name)?;
-        let tf = shelbi_state::load_task(&self.project_name, id)?;
-        let machine =
-            shelbi_orchestrator::review::resolve_review_machine(&project, &tf.task, None)?;
-        let addr = shelbi_orchestrator::review::start_review(
-            shelbi_orchestrator::review::ReviewSpec {
-                project: &project,
-                machine,
-                task: &tf.task,
-                task_body: &tf.body,
-            },
-        )?;
-        Ok(addr.target())
+        // Shared with the sidebar's `ReviewTask` view and the palette:
+        // load the branch onto a review workspace and return its pane target.
+        // A queued task surfaces as an error carrying the queue position.
+        shelbi_orchestrator::review::start_review_by_id(&self.project_name, id)
+            .map_err(|e| anyhow::anyhow!(e))
     }
 }
 

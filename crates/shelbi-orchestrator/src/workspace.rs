@@ -2199,8 +2199,7 @@ fn sync_worktree(
     // mail). Without the carve-out a repo that commits `.claude/` would be
     // permanently "dirty" after the first dispatch, and an idle worktree whose
     // only untracked entry is our own scratch would be wrongly rejected as
-    // "uncommitted user work". Mirrors `rebase_workspace_branch_onto_default`
-    // and review.rs's `preflight_workdir`.
+    // "uncommitted user work". Mirrors `rebase_workspace_branch_onto_default`.
     let dirty = shelbi_ssh::run_capture(host, ["git", "-C", &wt_str, "status", "--porcelain"])?;
     let user_dirty = user_dirty_porcelain_lines(&dirty);
     if !user_dirty.is_empty() {

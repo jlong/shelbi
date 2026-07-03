@@ -190,8 +190,8 @@ enum Cmd {
         #[command(subcommand)]
         cmd: Option<commands::daemon::DaemonCmd>,
     },
-    /// Check a task's branch into the machine's review work_dir and
-    /// (re)launch a fresh review-claude pane there.
+    /// Load a ready-for-review task onto a review workspace (or report its
+    /// queue position when every review workspace is busy).
     Review(commands::review::Args),
     /// Attach the terminal to a workspace's tmux pane.
     Attach { id: String },
