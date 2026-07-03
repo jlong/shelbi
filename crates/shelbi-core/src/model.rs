@@ -1036,12 +1036,26 @@ pub struct Task {
     /// directly alongside the structured fields, which is what the workflow
     /// docs and `feature-task` example assume.
     ///
-    /// Anything that is not a typed Task field lands here. Values are
-    /// constrained to YAML strings — workflow git fields are always strings,
-    /// and forcing string-typed params keeps `{{feature}}` substitution from
-    /// silently coercing numeric or boolean YAML values.
+    /// Anything that is not a typed Task field lands here — and the value is
+    /// kept as a raw [`serde_yaml::Value`], not narrowed to `String`. This
+    /// is the task half of the forward-compat contract (see the module docs
+    /// on `shelbi_state`): when a *newer* binary adds a typed scalar field
+    /// (say `retries: 2`) and an *older* binary reads the file, that field
+    /// flattens in here. A `String`-typed map would fail flatten-deserialize
+    /// on the non-string value and make the whole task file unparseable — the
+    /// card would silently vanish from the board and `renumber_column` would
+    /// renumber around it. Holding `serde_yaml::Value` lets any unknown field
+    /// survive a read-modify-write on the old binary untouched.
+    ///
+    /// `{{var}}` substitution is still string-only by design: [`param_str`]
+    /// and [`string_params`] expose only the string-valued entries, so a
+    /// `{{count}}` backed by `count: 3` reads as *unresolved* rather than
+    /// silently coercing the number into a branch name.
+    ///
+    /// [`param_str`]: Task::param_str
+    /// [`string_params`]: Task::string_params
     #[serde(flatten, default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub params: BTreeMap<String, String>,
+    pub params: BTreeMap<String, serde_yaml::Value>,
 }
 
 impl Task {
@@ -1062,6 +1076,28 @@ impl Task {
     /// default uniformly.
     pub fn workflow_or_default(&self) -> &str {
         self.workflow.as_deref().unwrap_or(DEFAULT_WORKFLOW_NAME)
+    }
+
+    /// A single string-valued param, or `None` when the key is absent or
+    /// its value isn't a YAML string. Use this for frontmatter fields that
+    /// are contractually strings (`agent:`, `{{var}}` sources) — a
+    /// non-string value from a newer binary reads as absent rather than
+    /// panicking a `String`-typed lookup.
+    pub fn param_str(&self, key: &str) -> Option<&str> {
+        self.params.get(key).and_then(serde_yaml::Value::as_str)
+    }
+
+    /// The string-valued subset of [`Task::params`], for `{{var}}`
+    /// substitution. Non-string params (numbers, bools, mappings — which
+    /// only arise from a newer binary's typed fields flattening in on an
+    /// older binary, or a hand-authored non-string frontmatter value) are
+    /// dropped: the substitution grammar is string-only, so those keys are
+    /// simply not substitutable rather than being coerced.
+    pub fn string_params(&self) -> BTreeMap<String, String> {
+        self.params
+            .iter()
+            .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
+            .collect()
     }
 }
 
@@ -1886,8 +1922,8 @@ created_at: 2026-06-19T00:00:00Z
 updated_at: 2026-06-19T00:00:00Z
 "#;
         let t: Task = serde_yaml::from_str(yaml).unwrap();
-        assert_eq!(t.params.get("feature").map(String::as_str), Some("auth-rewrite"));
-        assert_eq!(t.params.get("region").map(String::as_str), Some("us-east"));
+        assert_eq!(t.param_str("feature"), Some("auth-rewrite"));
+        assert_eq!(t.param_str("region"), Some("us-east"));
         // Structured fields aren't double-counted in params.
         assert!(!t.params.contains_key("id"));
         assert!(!t.params.contains_key("workflow"));
@@ -1895,6 +1931,51 @@ updated_at: 2026-06-19T00:00:00Z
         let back = serde_yaml::to_string(&t).unwrap();
         assert!(back.contains("feature: auth-rewrite"), "out: {back}");
         assert!(back.contains("region: us-east"), "out: {back}");
+    }
+
+    #[test]
+    fn non_string_params_round_trip_and_are_excluded_from_substitution() {
+        // Forward-compat (adversarial review F6): a *newer* binary adds
+        // typed scalar fields; an *older* binary must still parse the whole
+        // task (not drop the card) and preserve those fields verbatim on a
+        // read-modify-write. A `String`-typed `params` would fail
+        // flatten-deserialize on `retries: 2` and take the entire task file
+        // down with it.
+        let yaml = r#"
+id: build-login-form
+title: Build the login form
+column: todo
+priority: 0
+feature: auth-rewrite
+retries: 2
+zen_optional: true
+created_at: 2026-06-19T00:00:00Z
+updated_at: 2026-06-19T00:00:00Z
+"#;
+        let t: Task = serde_yaml::from_str(yaml).unwrap();
+        // The unknown non-string fields land in params as raw YAML values.
+        assert_eq!(t.params.get("retries"), Some(&serde_yaml::Value::from(2)));
+        assert_eq!(
+            t.params.get("zen_optional"),
+            Some(&serde_yaml::Value::from(true))
+        );
+        // Substitution stays string-only: `param_str` / `string_params`
+        // expose the string field but not the number or bool.
+        assert_eq!(t.param_str("feature"), Some("auth-rewrite"));
+        assert_eq!(t.param_str("retries"), None);
+        let sp = t.string_params();
+        assert_eq!(sp.get("feature").map(String::as_str), Some("auth-rewrite"));
+        assert!(!sp.contains_key("retries"));
+        assert!(!sp.contains_key("zen_optional"));
+        // The old binary rewrites the file: the newer fields survive with
+        // their original YAML types, not stringified.
+        let back = serde_yaml::to_string(&t).unwrap();
+        let reparsed: Task = serde_yaml::from_str(&back).unwrap();
+        assert_eq!(reparsed.params.get("retries"), Some(&serde_yaml::Value::from(2)));
+        assert_eq!(
+            reparsed.params.get("zen_optional"),
+            Some(&serde_yaml::Value::from(true))
+        );
     }
 
     #[test]
