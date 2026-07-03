@@ -1,5 +1,5 @@
 //! `~/.shelbi/config.yaml` — per-user UI preferences. Distinct from
-//! `~/.shelbi/shelbi.yaml` (assistant identity, wizard state) so a future
+//! `~/.shelbi/shelbi.yaml` (the hub config's project index) so a future
 //! `shelbi config reset` can wipe UI tweaks without nuking onboarding.
 //!
 //! Currently holds the Zen Mode toggle chord chosen by the first-run probe.

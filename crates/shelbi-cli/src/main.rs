@@ -216,10 +216,10 @@ enum Cmd {
     /// `site/content/docs/concepts/config-modes.mdx` for the full
     /// on-disk layout, migration, and pick-up worked example.
     Init(commands::init::Args),
-    /// Run the onboarding wizard. Phase 1 names the assistant; Phase 2
-    /// walks through project setup (auto-filled from the current git
-    /// checkout when present) and writes ~/.shelbi/projects/<name>.yaml.
-    /// Idempotent — phases whose answer is already on disk are skipped.
+    /// Run the onboarding wizard. Walks through project setup (auto-filled
+    /// from the current git checkout when present) and writes
+    /// ~/.shelbi/projects/<name>.yaml. Idempotent — setup is skipped when a
+    /// project is already on disk.
     Wizard,
     /// Start the orchestrator agent in the project's tmux session window 1.
     Orchestrate(commands::orchestrate::Args),
@@ -375,8 +375,8 @@ fn main() -> Result<()> {
 ///   deliberately re-derive the project name from the chosen root's
 ///   basename rather than re-using the missing name.
 /// - `~/.shelbi/` missing OR `~/.shelbi/projects/` empty → onboarding
-///   first-run flow (banner + assistant name + project-root prompt +
-///   scaffold + launch TUI).
+///   first-run flow (banner + project-root prompt + scaffold + launch
+///   TUI).
 /// - exactly one project YAML → boot it.
 /// - two or more → project picker.
 fn default_entry(explicit: Option<String>) -> Result<()> {
@@ -432,11 +432,9 @@ fn project_yaml_exists(name: &str) -> bool {
 }
 
 /// First-run dispatcher when `default_entry` finds no projects on disk.
-/// Prints the brand banner (only on a truly-fresh install), captures the
-/// assistant name once (idempotent — phase 1 is a no-op if it's already
-/// on file), then runs the same `shelbi init` prompt + scaffold the
-/// explicit command runs and finally launches the TUI against the newly-
-/// scaffolded project.
+/// Prints the brand banner (only on a truly-fresh install), then runs the
+/// same `shelbi init` prompt + scaffold the explicit command runs and
+/// finally launches the TUI against the newly-scaffolded project.
 ///
 /// `first_run` is true when `~/.shelbi/` did not exist before this
 /// invocation; the banner only prints in that case.
@@ -448,14 +446,6 @@ fn run_wizard_then_dispatch(first_run: bool) -> Result<()> {
     if first_run {
         wizard::print_banner();
     }
-    match wizard::phase_1_assistant_name() {
-        Ok(()) => {}
-        Err(e) if is_inquire_cancel(&e) => return Ok(()),
-        Err(e) => return Err(e),
-    }
-    let cfg = shelbi_state::load_shelbi_config().map_err(|e| anyhow::anyhow!(e))?;
-    println!("✓ assistant: {}", cfg.assistant_name());
-
     let resolved = match commands::init::scaffold_with_prompt(commands::init::Args {
         project: None,
         root: None,

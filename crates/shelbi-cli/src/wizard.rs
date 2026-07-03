@@ -80,36 +80,11 @@ pub fn confirm(label: &str, default: bool) -> Result<bool> {
         .with_context(|| format!("confirm prompt `{label}`"))
 }
 
-/// Phase 1: ask the user what to call their assistant and persist it to
-/// `~/.shelbi/shelbi.yaml`. Idempotent — if `assistant_name` is already
-/// set, this is a no-op.
-pub fn phase_1_assistant_name() -> Result<()> {
-    let mut cfg = shelbi_state::load_shelbi_config().map_err(|e| anyhow!(e))?;
-    if cfg.assistant_name.is_some() {
-        return Ok(());
-    }
-
-    let answer = text(
-        "What should we call your assistant?",
-        shelbi_state::DEFAULT_ASSISTANT_NAME,
-    )?;
-    let trimmed = answer.trim();
-    let name = if trimmed.is_empty() {
-        shelbi_state::DEFAULT_ASSISTANT_NAME.to_string()
-    } else {
-        trimmed.to_string()
-    };
-
-    cfg.assistant_name = Some(name);
-    shelbi_state::save_shelbi_config(&cfg).map_err(|e| anyhow!(e))?;
-    Ok(())
-}
-
-/// Phase 2: interactively set up one or more projects. Idempotent —
+/// Project setup: interactively set up one or more projects. Idempotent —
 /// skipped entirely if the user already has at least one project on
 /// disk. The `shelbi project add` command (separate task) reuses
 /// [`setup_one_project`] without the idempotence guard.
-pub fn phase_2_project_setup() -> Result<()> {
+pub fn phase_project_setup() -> Result<()> {
     let projects = shelbi_state::list_projects().map_err(|e| anyhow!(e))?;
     if !projects.is_empty() {
         return Ok(());
