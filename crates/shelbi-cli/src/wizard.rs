@@ -235,6 +235,7 @@ pub fn setup_one_project() -> Result<()> {
         AgentRunnerSpec {
             command: Runner::Claude.id().to_string(),
             flags: vec![],
+            dialog_signatures: vec![],
         },
     );
     agent_runners.insert(
@@ -242,6 +243,7 @@ pub fn setup_one_project() -> Result<()> {
         AgentRunnerSpec {
             command: Runner::Codex.id().to_string(),
             flags: vec![],
+            dialog_signatures: vec![],
         },
     );
 

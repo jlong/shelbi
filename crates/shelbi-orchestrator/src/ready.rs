@@ -93,6 +93,26 @@ pub fn is_trust_dialog(screen: &str) -> bool {
     s.contains("trust this folder") || s.contains("do you trust")
 }
 
+/// Scan a captured pane for the first matching blocking-dialog signature,
+/// returning its `kind`. Case-insensitive plain-substring match.
+///
+/// This is the heartbeat's counterpart to [`is_input_ready`]/[`is_trust_dialog`]:
+/// where those gate the *spawn* path, this runs on every hub poll to spot a
+/// workspace frozen on an interactive dialog (usage-limit, trust,
+/// permission-confirm, …) that no hook or pane-title marker will ever
+/// surface — the pane stays alive and its title keeps reading
+/// `shelbi:working` while all real progress is stuck behind the modal.
+pub fn detect_blocking_dialog(
+    screen: &str,
+    signatures: &[shelbi_core::DialogSignature],
+) -> Option<String> {
+    let lower = screen.to_ascii_lowercase();
+    signatures
+        .iter()
+        .find(|sig| lower.contains(&sig.pattern.to_ascii_lowercase()))
+        .map(|sig| sig.kind.clone())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -144,5 +164,42 @@ mod tests {
         assert!(is_trust_dialog("DO YOU TRUST the files in this folder?"));
         // The live input box is not a trust dialog.
         assert!(!is_trust_dialog(INPUT_BOX_SCREEN));
+    }
+
+    #[test]
+    fn detect_blocking_dialog_matches_first_signature_by_kind() {
+        let sigs = shelbi_core::default_dialog_signatures("claude");
+
+        // The usage-limit modal that froze the board in the incident.
+        let usage = "⏱ You've hit your usage limit.\n\
+                     ❯ 1. Stop and wait for limit to reset\n  2. Upgrade your plan";
+        assert_eq!(
+            detect_blocking_dialog(usage, &sigs).as_deref(),
+            Some("usage-limit")
+        );
+
+        // Trust prompt → trust kind (matched case-insensitively).
+        assert_eq!(
+            detect_blocking_dialog(TRUST_DIALOG_SCREEN, &sigs).as_deref(),
+            Some("trust")
+        );
+
+        // The live, ready input box is not a blocking dialog.
+        assert!(detect_blocking_dialog(INPUT_BOX_SCREEN, &sigs).is_none());
+
+        // Empty signature list never matches, even on a real dialog.
+        assert!(detect_blocking_dialog(usage, &[]).is_none());
+    }
+
+    #[test]
+    fn detect_blocking_dialog_honors_custom_signature() {
+        // The "extensible via config" path: a project-defined signature is
+        // matched just like the built-ins.
+        let sigs = vec![shelbi_core::DialogSignature::new("codex-approve", "Approve this edit?")];
+        assert_eq!(
+            detect_blocking_dialog("codex › Approve this edit? (y/n)", &sigs).as_deref(),
+            Some("codex-approve")
+        );
+        assert!(detect_blocking_dialog("nothing to see here", &sigs).is_none());
     }
 }

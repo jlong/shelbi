@@ -354,7 +354,7 @@ mod tests {
         let mut runners = std::collections::BTreeMap::new();
         runners.insert(
             "claude".to_string(),
-            AgentRunnerSpec { command: "claude".into(), flags: vec![] },
+            AgentRunnerSpec { command: "claude".into(), flags: vec![], dialog_signatures: vec![] },
         );
         Project {
             name: name.into(),

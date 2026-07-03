@@ -284,6 +284,34 @@ pub fn append_workspace_event(
     append_event_line(&format!("{ts} workspace={workspace} {prev_str} -> {new}"))
 }
 
+/// Append a blocking-dialog transition line to `~/.shelbi/events.log`:
+///
+/// - blocked: `<rfc3339> workspace=<name> working -> blocked reason=dialog:<kind>`
+/// - cleared: `<rfc3339> workspace=<name> blocked -> working reason=dialog:<kind>:cleared`
+///
+/// Emitted by the hub poller when its `tmux capture-pane` sample starts (or
+/// stops) matching a configured blocking-dialog signature — a workspace
+/// frozen on a usage-limit/trust/permission modal whose pane title still
+/// reads `shelbi:working`. Distinct from [`append_workspace_event`] (which
+/// records pane-title state transitions and takes no reason) so the two
+/// don't fight over `status.yaml`: a dialog line is an advisory heads-up,
+/// deduped in the poller so it fires once per incident with a matching
+/// recovery line when the modal clears.
+///
+/// `kind` is the signature's short token (`usage-limit`, `trust`, …);
+/// whitespace folds to underscores so the line stays a single parseable
+/// record.
+pub fn append_workspace_dialog_event(workspace: &str, kind: &str, blocked: bool) -> Result<()> {
+    let ts = Utc::now().to_rfc3339();
+    let kind = sanitize_reason(kind);
+    let line = if blocked {
+        format!("{ts} workspace={workspace} working -> blocked reason=dialog:{kind}")
+    } else {
+        format!("{ts} workspace={workspace} blocked -> working reason=dialog:{kind}:cleared")
+    };
+    append_event_line(&line)
+}
+
 /// Append `<rfc3339> message=<msg_id> task=<task-id> push=ok` to
 /// `~/.shelbi/events.log`. Records a hub → workspace push on the file-based
 /// message channel (see `shelbi message`) so the channel is auditable from
@@ -1058,6 +1086,47 @@ mod tests {
         assert!(lines[0].contains("workspace=alpha"));
         assert!(lines[0].contains("none -> working"));
         assert!(lines[1].contains("working -> awaiting_input"));
+
+        std::env::remove_var("SHELBI_HOME");
+    }
+
+    #[test]
+    fn append_workspace_dialog_event_writes_block_and_recovery_lines() {
+        let _g = TEST_LOCK.lock().unwrap();
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+
+        append_workspace_dialog_event("alpha", "usage-limit", true).unwrap();
+        append_workspace_dialog_event("alpha", "usage-limit", false).unwrap();
+        // A kind with whitespace folds to underscores so the line stays a
+        // single parseable record.
+        append_workspace_dialog_event("bravo", "trust prompt", true).unwrap();
+
+        let log = std::fs::read_to_string(events_log_path().unwrap()).unwrap();
+        let lines: Vec<&str> = log.lines().collect();
+        assert_eq!(lines.len(), 3, "log: {log}");
+
+        // Each line carries a parseable RFC3339 timestamp prefix.
+        for line in &lines {
+            let ts = line.split_whitespace().next().unwrap();
+            DateTime::parse_from_rfc3339(ts).unwrap();
+        }
+        assert!(
+            lines[0].ends_with(" workspace=alpha working -> blocked reason=dialog:usage-limit"),
+            "line: {}",
+            lines[0]
+        );
+        assert!(
+            lines[1]
+                .ends_with(" workspace=alpha blocked -> working reason=dialog:usage-limit:cleared"),
+            "line: {}",
+            lines[1]
+        );
+        assert!(
+            lines[2].ends_with(" workspace=bravo working -> blocked reason=dialog:trust_prompt"),
+            "line: {}",
+            lines[2]
+        );
 
         std::env::remove_var("SHELBI_HOME");
     }

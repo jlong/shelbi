@@ -2928,6 +2928,7 @@ mod tests {
                     shelbi_core::AgentRunnerSpec {
                         command: "claude".into(),
                         flags: vec![],
+                        dialog_signatures: vec![],
                     },
                 );
                 m

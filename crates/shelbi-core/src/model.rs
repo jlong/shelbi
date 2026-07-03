@@ -200,6 +200,58 @@ pub struct ContextStoreSyncSpec {
     pub path: PathBuf,
 }
 
+/// One blocking-dialog signature: a substring that, when present in a
+/// workspace pane's captured text, means the runner is frozen on an
+/// interactive prompt (usage-limit, workspace-trust, permission-confirm, …)
+/// that no hook or pane-title marker will ever clear on its own. The hub
+/// poller matches these against its `tmux capture-pane` sample so a stall
+/// surfaces as an event instead of sitting invisible behind a stale
+/// `shelbi:working` title.
+///
+/// `kind` is the short token that lands in the emitted event
+/// (`reason=dialog:<kind>`); `pattern` is matched case-insensitively as a
+/// plain substring. Several signatures may share a `kind` (e.g. two
+/// wordings of the same trust prompt).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DialogSignature {
+    pub kind: String,
+    pub pattern: String,
+}
+
+impl DialogSignature {
+    pub fn new(kind: impl Into<String>, pattern: impl Into<String>) -> Self {
+        Self {
+            kind: kind.into(),
+            pattern: pattern.into(),
+        }
+    }
+}
+
+/// Built-in blocking-dialog signatures for a runner, keyed on the runner's
+/// executable basename. Used when the runner declares no `dialog_signatures`
+/// of its own, so the common cases work with zero config. Returns an empty
+/// list for unknown runners — an unrecognized runner simply gets no dialog
+/// detection until the user adds signatures in project.yaml.
+///
+/// The `claude` set covers the dialogs seen to freeze a whole board in
+/// practice: the usage-limit modal ("Stop and wait for limit to reset"),
+/// the first-run workspace-trust prompt, and a tool-permission confirm.
+pub fn default_dialog_signatures(command: &str) -> Vec<DialogSignature> {
+    let base = Path::new(command)
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or(command);
+    match base {
+        "claude" => vec![
+            DialogSignature::new("usage-limit", "Stop and wait for limit to reset"),
+            DialogSignature::new("trust", "Do you trust the files"),
+            DialogSignature::new("trust", "trust this folder"),
+            DialogSignature::new("permission", "Enter to confirm"),
+        ],
+        _ => Vec::new(),
+    }
+}
+
 /// How often the hub poller emits a `project=<name> heartbeat` line into
 /// `~/.shelbi/events.log`. The heartbeat is the orchestrator's fallback
 /// trigger — `events tail --follow` may sit silent for hours on a quiet
@@ -810,6 +862,26 @@ pub struct AgentRunnerSpec {
     /// Extra flags to append to every invocation.
     #[serde(default)]
     pub flags: Vec<String>,
+    /// Blocking-dialog signatures for this runner. When empty, the poller
+    /// falls back to [`default_dialog_signatures`] keyed on `command`, so
+    /// the built-in per-runner set applies with no config. Populate this in
+    /// project.yaml to teach the heartbeat about a new runner dialog without
+    /// a rebuild.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub dialog_signatures: Vec<DialogSignature>,
+}
+
+impl AgentRunnerSpec {
+    /// The blocking-dialog signatures to match this runner's pane against:
+    /// the explicit `dialog_signatures` list when non-empty, otherwise the
+    /// built-in per-runner defaults for `command`.
+    pub fn effective_dialog_signatures(&self) -> Vec<DialogSignature> {
+        if self.dialog_signatures.is_empty() {
+            default_dialog_signatures(&self.command)
+        } else {
+            self.dialog_signatures.clone()
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -2012,7 +2084,7 @@ workspace_settings_template: /etc/shelbi/p.json
     #[test]
     fn workspaces_validate_against_machines_and_runners() {
         let mut runners = std::collections::BTreeMap::new();
-        runners.insert("claude".to_string(), AgentRunnerSpec { command: "claude".into(), flags: vec![] });
+        runners.insert("claude".to_string(), AgentRunnerSpec { command: "claude".into(), flags: vec![], dialog_signatures: vec![] });
         let project = Project {
             name: "p".into(),
             repo: "r".into(),
@@ -2064,6 +2136,7 @@ workspace_settings_template: /etc/shelbi/p.json
             AgentRunnerSpec {
                 command: "claude".into(),
                 flags: vec![],
+                dialog_signatures: vec![],
             },
         );
         let machine = |name: &str| Machine {
@@ -2238,7 +2311,7 @@ workspace_settings_template: /etc/shelbi/p.json
         let mut runners = std::collections::BTreeMap::new();
         runners.insert(
             "claude".to_string(),
-            AgentRunnerSpec { command: "claude".into(), flags: vec![] },
+            AgentRunnerSpec { command: "claude".into(), flags: vec![], dialog_signatures: vec![] },
         );
         Project {
             name: "p".into(),
@@ -2722,6 +2795,72 @@ updated_at: 2026-06-19T00:00:00Z
     }
 
     #[test]
+    fn default_dialog_signatures_covers_claude_and_ignores_unknown() {
+        // The `claude` runner ships built-in signatures for the dialogs that
+        // froze a whole board in the 2026-07-02 incident.
+        let sigs = default_dialog_signatures("claude");
+        assert!(sigs.iter().any(|s| s.kind == "usage-limit"));
+        assert!(sigs
+            .iter()
+            .any(|s| s.pattern.contains("Stop and wait for limit to reset")));
+        assert!(sigs.iter().any(|s| s.kind == "trust"));
+
+        // A basename is used, so an absolute path to the same binary still
+        // resolves the built-ins.
+        assert_eq!(
+            default_dialog_signatures("/usr/local/bin/claude").len(),
+            sigs.len()
+        );
+
+        // Unknown runner → no built-ins (opt-in via config only).
+        assert!(default_dialog_signatures("codex").is_empty());
+    }
+
+    #[test]
+    fn effective_dialog_signatures_prefers_config_over_builtins() {
+        // No explicit list → built-in claude defaults.
+        let spec = AgentRunnerSpec {
+            command: "claude".into(),
+            flags: vec![],
+            dialog_signatures: vec![],
+        };
+        assert_eq!(
+            spec.effective_dialog_signatures(),
+            default_dialog_signatures("claude")
+        );
+
+        // Explicit list wins verbatim — this is the "extensible via config"
+        // path, letting a project add a new runner dialog without a rebuild.
+        let custom = DialogSignature::new("my-modal", "Please respond");
+        let spec = AgentRunnerSpec {
+            command: "claude".into(),
+            flags: vec![],
+            dialog_signatures: vec![custom.clone()],
+        };
+        assert_eq!(spec.effective_dialog_signatures(), vec![custom]);
+    }
+
+    #[test]
+    fn dialog_signatures_round_trip_through_yaml() {
+        let spec = AgentRunnerSpec {
+            command: "claude".into(),
+            flags: vec![],
+            dialog_signatures: vec![DialogSignature::new("usage-limit", "Stop and wait")],
+        };
+        let y = serde_yaml::to_string(&spec).unwrap();
+        assert!(y.contains("dialog_signatures"), "got {y:?}");
+        let back: AgentRunnerSpec = serde_yaml::from_str(&y).unwrap();
+        assert_eq!(back.dialog_signatures, spec.dialog_signatures);
+
+        // Absent in YAML → empty (and elided on the way back out).
+        let spec2: AgentRunnerSpec =
+            serde_yaml::from_str("command: claude\nflags: []\n").unwrap();
+        assert!(spec2.dialog_signatures.is_empty());
+        let y2 = serde_yaml::to_string(&spec2).unwrap();
+        assert!(!y2.contains("dialog_signatures"), "should be elided: {y2:?}");
+    }
+
+    #[test]
     fn project_yaml_omits_heartbeat_when_default() {
         // Older project YAMLs predate the field — `#[serde(default)]`
         // means parsing fills in the default and serialization should
@@ -3158,6 +3297,7 @@ git:
             AgentRunnerSpec {
                 command: "claude".into(),
                 flags: vec!["--verbose".into()],
+                dialog_signatures: vec![],
             },
         );
         Project {

@@ -454,6 +454,7 @@ mod tests {
         let runner = AgentRunnerSpec {
             command: "/bin/sh".into(),
             flags: vec!["-c".into(), "exit 0".into()],
+            dialog_signatures: vec![],
         };
         let project = fixture_project("demo", machine.clone(), workspace.clone(), runner);
 
@@ -505,6 +506,7 @@ mod tests {
         let runner = AgentRunnerSpec {
             command: "/bin/sh".into(),
             flags: vec!["-c".into(), cmd],
+            dialog_signatures: vec![],
         };
         let project = fixture_project("demo", machine.clone(), workspace.clone(), runner);
 
@@ -544,6 +546,7 @@ mod tests {
         let runner = AgentRunnerSpec {
             command: "/bin/sh".into(),
             flags: vec!["-c".into(), "exit 42".into()],
+            dialog_signatures: vec![],
         };
         let project = fixture_project("demo", machine.clone(), workspace.clone(), runner);
 
@@ -739,6 +742,7 @@ mod tests {
                     dump_str
                 ),
             ],
+            dialog_signatures: vec![],
         };
         let project = fixture_project("demo", machine.clone(), workspace.clone(), runner);
 
@@ -809,6 +813,7 @@ mod tests {
                      exit 0"
                 ),
             ],
+            dialog_signatures: vec![],
         };
         let project = fixture_project("demo", machine.clone(), workspace.clone(), runner);
 
@@ -910,6 +915,7 @@ mod tests {
         let runner = AgentRunnerSpec {
             command: "/bin/sh".into(),
             flags: vec!["-c".into(), mark_cmd],
+            dialog_signatures: vec![],
         };
         let project = fixture_project("demo", machine.clone(), workspace.clone(), runner);
 
@@ -976,6 +982,7 @@ mod tests {
         let runner = AgentRunnerSpec {
             command: "/bin/sh".into(),
             flags: vec!["-c".into(), stale_plant],
+            dialog_signatures: vec![],
         };
         let project = fixture_project("demo", machine.clone(), workspace.clone(), runner);
 
@@ -1030,6 +1037,7 @@ mod tests {
         let runner = AgentRunnerSpec {
             command: "/bin/sh".into(),
             flags: vec!["-c".into(), "exit 0".into()],
+            dialog_signatures: vec![],
         };
         let project = fixture_project("demo", machine.clone(), workspace.clone(), runner);
 
@@ -1088,6 +1096,7 @@ mod tests {
                     dump_str
                 ),
             ],
+            dialog_signatures: vec![],
         };
         let project = fixture_project("demo", machine.clone(), workspace.clone(), runner);
 
@@ -1109,14 +1118,17 @@ mod tests {
         let claude = shelbi_core::AgentRunnerSpec {
             command: "claude".into(),
             flags: vec![],
+            dialog_signatures: vec![],
         };
         let claude_abs = shelbi_core::AgentRunnerSpec {
             command: "/opt/homebrew/bin/claude".into(),
             flags: vec![],
+            dialog_signatures: vec![],
         };
         let codex = shelbi_core::AgentRunnerSpec {
             command: "codex".into(),
             flags: vec![],
+            dialog_signatures: vec![],
         };
         assert!(is_claude_runner(&claude));
         assert!(is_claude_runner(&claude_abs));
