@@ -4,7 +4,14 @@ import { useState } from "react"
 import { CheckIcon, ClipboardIcon } from "@heroicons/react/24/outline"
 
 type CopyButtonProps = {
-  text: string
+  /** Static text copied on click. Ignored when {@link getText} is provided. */
+  text?: string
+  /**
+   * Lazily resolves the text to copy at click time — used when the source is
+   * rendered markup (e.g. rehype-pretty-code output) whose plain text is only
+   * available from the DOM. Takes precedence over {@link text}.
+   */
+  getText?: () => string
   /** Idle button label. Defaults to `copy`. */
   label?: string
   /** Label shown briefly after a successful copy. Defaults to `copied`. */
@@ -20,6 +27,7 @@ const DEFAULT_CLASSNAME =
 
 export function CopyButton({
   text,
+  getText,
   label = "copy",
   copiedLabel = "copied",
   ariaLabel,
@@ -29,7 +37,7 @@ export function CopyButton({
 
   async function handleCopy() {
     try {
-      await navigator.clipboard.writeText(text)
+      await navigator.clipboard.writeText(getText ? getText() : (text ?? ""))
       setCopied(true)
       setTimeout(() => setCopied(false), 1500)
     } catch {

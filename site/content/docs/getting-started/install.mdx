@@ -87,12 +87,32 @@ the install path isn't on your `PATH` — see below.
 **`command not found: shelbi`.** The default install path is
 `$HOME/bin/shelbi`. Make sure that directory is on your `PATH`:
 
-```bash
-# zsh / bash
-export PATH="$HOME/bin:$PATH"
-```
+<CodeTabs group="shell">
+  <CodeTab label="bash">
 
-Add the line to `~/.zshrc` or `~/.bashrc` to make it persistent. Or pass
+  ```bash
+  export PATH="$HOME/bin:$PATH"
+  ```
+
+  </CodeTab>
+  <CodeTab label="zsh">
+
+  ```zsh
+  export PATH="$HOME/bin:$PATH"
+  ```
+
+  </CodeTab>
+  <CodeTab label="fish">
+
+  ```fish
+  fish_add_path "$HOME/bin"
+  ```
+
+  </CodeTab>
+</CodeTabs>
+
+Add the line to `~/.zshrc`, `~/.bashrc`, or `~/.config/fish/config.fish` to
+make it persistent. Or pass
 `SHELBI_INSTALL_PATH=/usr/local/bin/shelbi` to the install script so the
 binary lands somewhere already on your `PATH`.
 

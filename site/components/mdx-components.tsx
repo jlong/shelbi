@@ -2,6 +2,7 @@ import type { MDXComponents } from "mdx/types"
 import Link from "next/link"
 import { AppMockup } from "./KanbanMockup"
 import { Callout } from "./Callout"
+import { CodeTab, CodeTabs } from "./CodeTabs"
 import { CopyPromptBanner } from "./CopyPromptBanner"
 import { InstallCommand } from "./InstallCommand"
 import { Steps, Step } from "./Steps"
@@ -22,6 +23,10 @@ export const mdxComponents: MDXComponents = {
   Steps,
   Step,
   Callout,
+  // Synced tabbed code blocks (package-manager / shell switcher). Selection
+  // syncs across same-`group` blocks on the page; see `CodeTabs.tsx`.
+  CodeTabs,
+  CodeTab,
   h1: (props) => (
     <h1 className="mt-6 mb-3 scroll-mt-8 text-3xl font-semibold tracking-tight text-fg" {...props} />
   ),
