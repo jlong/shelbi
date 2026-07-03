@@ -52,6 +52,11 @@ const TUI_YELLOW = "#dcb767" // ANSI 3 — `Active` category (in_progress)
 const TUI_MAGENTA = "#c586c0" // ANSI 5 — `Handoff` (review) + `@workspace`
 const TUI_GREEN = "#5fb56d" // ANSI 2 — `Done` category + Working badge
 const TUI_CYAN = "#4ec9b0" // ANSI 6 — project name in title bar + ✓ review badge
+// Zen-mode band fill: the TUI paints the "ZEN MODE ON" footer bar with an
+// explicit `bg(Color::Rgb(0,127,0))` + `fg(White)` bold (`render_zen_row`
+// in `crates/shelbi-tui/src/sidebar.rs`) — not a named ANSI color, so it
+// renders as this exact hex rather than the brighter ANSI-2 `TUI_GREEN`.
+const TUI_ZEN_GREEN = "#007f00" // Rgb(0,127,0) — full-width Zen band fill
 // Focused-card highlight: the shared selection gray `theme::SELECTION_BG`
 // (`Color::Rgb(63,63,63)`) the TUI paints every selection background with —
 // nav, kanban card, review queue, and filter dropdowns all use this one
@@ -485,7 +490,42 @@ function buildSidebarRows(state: AppState): Segment[][] {
   pushReviewSection("Ready for Review", state.readyReview, true)
   pushReviewSection("Queued for Review", state.queuedReview, false)
 
+  // Footer, anchored to the bottom of the sidebar like `render_footer` /
+  // `render_zen_row` in `sidebar.rs`: the dim `^P palette  q quit` keybind
+  // line, a blank row, then the full-width green "ZEN MODE ON" band the TUI
+  // paints when Zen Mode is on. The band bypasses the 1-col horizontal
+  // margin so its green fill reaches both sidebar edges, matching the crate.
+  rows.push(SIDEBAR_BLANK_ROW)
+  rows.push(
+    padSidebarRow([
+      { text: " " },
+      { text: "^P palette  q quit", color: TUI_DARK_GRAY },
+    ]),
+  )
+  rows.push(SIDEBAR_BLANK_ROW)
+  rows.push(zenBandRow())
+
   return rows
+}
+
+/**
+ * The full-width "ZEN MODE ON" band, mirroring `render_zen_row` in
+ * `sidebar.rs`: a single edge-to-edge green row (`bg(Rgb(0,127,0))`) with
+ * white-bold text, the label left-aligned behind one leading space and the
+ * rest of the row filled to the sidebar edge. One green segment so the fill
+ * is continuous across the whole width.
+ */
+function zenBandRow(): Segment[] {
+  const label = " ZEN MODE ON"
+  const pad = Math.max(0, SIDEBAR_W - [...label].length)
+  return [
+    {
+      text: label + " ".repeat(pad),
+      color: SEL_FG,
+      bg: TUI_ZEN_GREEN,
+      bold: true,
+    },
+  ]
 }
 
 /**
