@@ -5,6 +5,7 @@ import Link from "next/link"
 import { usePathname } from "next/navigation"
 import { useEffect, useRef, useState, type SVGProps } from "react"
 
+import { DocsSearch } from "./DocsSearch"
 import { ThemeToggle } from "./ThemeToggle"
 import { WordmarkSvg } from "./Wordmark"
 
@@ -186,9 +187,16 @@ export function Header({ docsSections = [] }: HeaderProps) {
             below split the row into the [logo][nav install][toggle]
             three-region desktop layout. */}
         <div className="ml-auto flex items-center gap-2 md:contents">
+          {/* Docs command palette trigger. On desktop it leads the right
+              cluster (carries the `ml-auto` that used to sit on the nav);
+              on mobile it collapses to a magnifier icon. */}
+          <div className="flex items-center md:order-2 md:ml-auto">
+            <DocsSearch />
+          </div>
+
           <nav
             aria-label="Primary"
-            className="hidden items-center gap-3 font-sans text-sm text-gray-7 md:flex md:order-2 md:ml-auto"
+            className="hidden items-center gap-3 font-sans text-sm text-gray-7 md:flex md:order-2"
           >
             {NAV_LINKS.map((link) => (
               <Link
