@@ -29,7 +29,7 @@ export function Hero() {
   return (
     <section data-hero className="relative isolate overflow-hidden">
       <HeroPattern />
-      <div className="relative mx-auto flex w-full max-w-4xl flex-col items-center gap-5 px-3 py-12 text-center md:py-16">
+      <div className="relative mx-auto flex w-full max-w-4xl flex-col items-center gap-5 px-3 pb-6 pt-12 text-center md:pb-8 md:pt-16">
         <h1 className="w-full max-w-[320px] text-fg md:max-w-[680px]">
           <span className="sr-only">Shelbi</span>
           <WordmarkSvg className="w-full" aria-hidden="true" />
