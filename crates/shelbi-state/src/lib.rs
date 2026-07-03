@@ -191,6 +191,25 @@ pub fn project_dir(project: &str) -> Result<PathBuf> {
     Ok(projects_dir()?.join(project))
 }
 
+/// Reject a name that isn't exactly one *normal* path component, closing
+/// `..` / absolute / separator traversal at the path chokepoints that
+/// `join` a caller-influenced name. Mirrors
+/// [`shelbi_core::validate_project_name`]'s security-critical invariant for
+/// the workspace/agent chokepoints #137's hardening didn't cover
+/// (state-runtime F14): a hostile or synced workspace/agent name could
+/// otherwise escape `~/.shelbi/workspaces/` or `~/.shelbi/projects/<p>/agents/`.
+pub(crate) fn ensure_flat_path_component(kind: &str, name: &str) -> Result<()> {
+    use std::path::{Component, Path};
+    let mut comps = Path::new(name).components();
+    match (comps.next(), comps.next()) {
+        (Some(Component::Normal(c)), None) if c.to_str() == Some(name) => Ok(()),
+        _ => Err(shelbi_core::Error::Other(format!(
+            "invalid {kind} name (must be a single path component — no `/`, `..`, \
+             or absolute path): {name:?}"
+        ))),
+    }
+}
+
 /// Resolve the workspace settings template path for a project: the override
 /// in [`Project::workspace_settings_template`] (with `~` expansion) if set,
 /// otherwise the mode-aware default resolved through [`ProjectPaths`].
@@ -1869,6 +1888,45 @@ pub fn move_task(
     Ok(Some((old_column, new_column, workflow)))
 }
 
+/// Release task `id` back to [`Column::Todo`] and clear its `assigned_to`
+/// in a **single** locked write.
+///
+/// The workspace-teardown path used to unassign (`save_task`) and then move
+/// (`move_task`) as two separate writes; a crash between them left the card
+/// unowned but still in `in_progress`, and because the recovery scan keys off
+/// `assigned_to == <workspace>`, the now-unassigned card was skipped forever
+/// (cli-daemon-board F18). Folding both mutations into one save closes that
+/// window, and clearing the owner even when the card is already in Todo makes
+/// the operation an idempotent recovery for a card wedged by the old path.
+///
+/// Returns the `(from, to, workflow)` triple (as [`move_task`] does) when the
+/// column actually changed so the caller can append a move event, or `None`
+/// when nothing needed moving.
+pub fn release_task_to_todo(project: &str, id: &str) -> Result<Option<(Column, Column, String)>> {
+    let _lock = lock_tasks(project)?;
+    let TaskFile { mut task, body } = load_task(project, id)?;
+    let old_column = task.column;
+    let workflow = task.workflow_or_default().to_string();
+    let already_todo = old_column == Column::Todo;
+    if already_todo && task.assigned_to.is_none() {
+        return Ok(None);
+    }
+    task.assigned_to = None;
+    if !already_todo {
+        task.column = Column::Todo;
+        task.priority = list_column(project, Column::Todo)?.len() as u32;
+    }
+    task.updated_at = chrono::Utc::now();
+    save_task_unlocked(project, &task, &body)?;
+    if already_todo {
+        // Only the owner was cleared — no column move to renumber or log.
+        return Ok(None);
+    }
+    renumber_column_unlocked(project, old_column)?;
+    renumber_column_unlocked(project, Column::Todo)?;
+    Ok(Some((old_column, Column::Todo, workflow)))
+}
+
 /// Re-position `id` to slot `new_priority` within its current column. Other
 /// tasks shift to keep the column contiguous from 0.
 pub fn set_task_priority(project: &str, id: &str, new_priority: u32) -> Result<()> {
@@ -2699,6 +2757,51 @@ mod tests {
         assert_eq!(wip.len(), 1);
         assert_eq!(wip[0].task.id, "b");
         assert_eq!(wip[0].task.priority, 0);
+        std::env::remove_var("SHELBI_HOME");
+    }
+
+    #[test]
+    fn release_task_to_todo_clears_owner_and_moves_in_one_write() {
+        let _g = TEST_LOCK.lock().unwrap();
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+
+        let mut task = make_task("t", Column::InProgress, 0);
+        task.assigned_to = Some("worker-1".to_string());
+        save_task("p", &task, "").unwrap();
+
+        let moved = release_task_to_todo("p", "t").unwrap();
+        assert_eq!(moved, Some((Column::InProgress, Column::Todo, "default".into())));
+
+        // Single resulting state: in Todo AND unowned. No window where one
+        // mutation landed without the other.
+        let after = load_task("p", "t").unwrap().task;
+        assert_eq!(after.column, Column::Todo);
+        assert_eq!(after.assigned_to, None);
+        assert!(list_column("p", Column::InProgress).unwrap().is_empty());
+
+        std::env::remove_var("SHELBI_HOME");
+    }
+
+    #[test]
+    fn release_task_to_todo_is_idempotent_recovery() {
+        let _g = TEST_LOCK.lock().unwrap();
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+
+        // A card already in Todo but still owned (the exact wedge the old
+        // unassign-then-move split could leave behind): clear the owner with
+        // no move event, and report `None` since the column didn't change.
+        let mut task = make_task("t", Column::Todo, 0);
+        task.assigned_to = Some("worker-1".to_string());
+        save_task("p", &task, "").unwrap();
+
+        assert_eq!(release_task_to_todo("p", "t").unwrap(), None);
+        assert_eq!(load_task("p", "t").unwrap().task.assigned_to, None);
+
+        // Fully clean (Todo + unowned) → genuine no-op.
+        assert_eq!(release_task_to_todo("p", "t").unwrap(), None);
+
         std::env::remove_var("SHELBI_HOME");
     }
 

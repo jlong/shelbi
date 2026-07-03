@@ -45,19 +45,40 @@ fn current_exe_string() -> Result<String> {
 ///   never user work, so an otherwise-idle worktree whose only untracked entry
 ///   is `.shelbi/` must read as clean and dispatchable.
 ///
-/// A line reads `XY <path>`; `line.get(3..)` skips the two status columns and
-/// the separating space. Rename entries (`orig -> new`) fall through to being
-/// treated as user-dirty, which is the safe default (we only ever carve out
-/// paths we are certain are ours).
-fn user_dirty_porcelain_lines(porcelain: &str) -> Vec<&str> {
-    porcelain
-        .lines()
-        .filter(|line| !line.trim().is_empty())
-        .filter(|line| {
-            let path = line.get(3..).unwrap_or("");
-            !is_shelbi_scratch_path(path)
-        })
-        .collect()
+/// Callers pass `git status --porcelain -z` (NUL-delimited) output. The `-z`
+/// form is load-bearing: plain porcelain quotes paths with unusual bytes
+/// (`"a\tb"`) and renders renames as `orig -> new`, both of which defeat a
+/// naive `line.get(3..)` carve-out and can mis-classify one of shelbi's own
+/// paths as user work (a spurious "uncommitted changes" block). Under `-z`
+/// paths are emitted verbatim and each record is `XY <path>`; a rename/copy
+/// (`R`/`C`) carries its origin path as the *next* NUL-separated field, which
+/// we consume so it isn't re-parsed as a status record. The carve-out is
+/// keyed on the destination path.
+///
+/// Returns the surviving records (each still `XY <path>`) so error messages
+/// keep their familiar shape.
+fn user_dirty_porcelain_lines(porcelain_z: &str) -> Vec<&str> {
+    let mut out = Vec::new();
+    let mut records = porcelain_z.split('\0');
+    while let Some(record) = records.next() {
+        if record.is_empty() {
+            continue;
+        }
+        // Index or worktree status of R/C means an origin-path field trails
+        // this record — pull it off the stream so the loop doesn't treat it
+        // as its own entry.
+        let bytes = record.as_bytes();
+        let is_rename_or_copy =
+            matches!(bytes.first(), Some(b'R' | b'C')) || matches!(bytes.get(1), Some(b'R' | b'C'));
+        if is_rename_or_copy {
+            let _ = records.next();
+        }
+        let path = record.get(3..).unwrap_or("");
+        if !is_shelbi_scratch_path(path) {
+            out.push(record);
+        }
+    }
+    out
 }
 
 /// True when `path` (as it appears in porcelain output) is one of shelbi's
@@ -383,7 +404,7 @@ pub fn rebase_workspace_branch_onto_default(
     //    `dirty_worktree(3_entries)` where all 3 were `.shelbi/messages/*`.
     let dirty = match shelbi_ssh::run_capture(
         host,
-        ["git", "-C", &wt_str, "status", "--porcelain"],
+        ["git", "-C", &wt_str, "status", "--porcelain", "-z"],
     ) {
         Ok(s) => s,
         Err(e) => {
@@ -2251,7 +2272,8 @@ fn sync_worktree(
     // permanently "dirty" after the first dispatch, and an idle worktree whose
     // only untracked entry is our own scratch would be wrongly rejected as
     // "uncommitted user work". Mirrors `rebase_workspace_branch_onto_default`.
-    let dirty = shelbi_ssh::run_capture(host, ["git", "-C", &wt_str, "status", "--porcelain"])?;
+    let dirty =
+        shelbi_ssh::run_capture(host, ["git", "-C", &wt_str, "status", "--porcelain", "-z"])?;
     let user_dirty = user_dirty_porcelain_lines(&dirty);
     if !user_dirty.is_empty() {
         return Err(Error::Other(format!(
@@ -2401,18 +2423,11 @@ fn sync_review_worktree(
         // Carve out shelbi's own footprint (`.shelbi/` metadata + the
         // `.claude/` deploy files we rewrite every dispatch), same as
         // `sync_worktree` and `preflight_workdir`.
-        let dirty =
-            shelbi_ssh::run_capture(host, ["git", "-C", &wt_str, "status", "--porcelain"])?;
-        let user_dirty: Vec<&str> = dirty
-            .lines()
-            .filter(|l| {
-                let path = l.get(3..).unwrap_or("");
-                !(path.starts_with(".shelbi/")
-                    || path == ".shelbi"
-                    || path.starts_with(".claude/")
-                    || path == ".claude")
-            })
-            .collect();
+        let dirty = shelbi_ssh::run_capture(
+            host,
+            ["git", "-C", &wt_str, "status", "--porcelain", "-z"],
+        )?;
+        let user_dirty = user_dirty_porcelain_lines(&dirty);
         if !user_dirty.is_empty() {
             return Err(Error::Other(format!(
                 "review workspace worktree at {wt_str} has uncommitted changes — \
@@ -4198,21 +4213,46 @@ mod rebase_git_tests {
 
     #[test]
     fn user_dirty_carves_out_shelbi_footprint_but_keeps_real_work() {
+        // Records are NUL-delimited (`git status --porcelain -z`).
         // Only shelbi's own paths → clean.
-        let scratch = "?? .shelbi/\n?? .shelbi/messages/a.json\n M .claude/settings.json\n";
+        let scratch = "?? .shelbi/\0?? .shelbi/messages/a.json\0 M .claude/settings.json\0";
         assert!(user_dirty_porcelain_lines(scratch).is_empty());
 
         // A real edit beside our scratch still counts as dirty.
-        let mixed = " M src/lib.rs\n?? .shelbi/messages/a.json\n";
+        let mixed = " M src/lib.rs\0?? .shelbi/messages/a.json\0";
         assert_eq!(user_dirty_porcelain_lines(mixed), vec![" M src/lib.rs"]);
 
         // A top-level file literally named `.shelbimeta` must NOT be carved
         // out — the prefix guard is `.shelbi/`, not `.shelbi`.
-        let lookalike = "?? .shelbimeta\n";
+        let lookalike = "?? .shelbimeta\0";
         assert_eq!(user_dirty_porcelain_lines(lookalike), vec!["?? .shelbimeta"]);
 
         // A clean tree is clean.
         assert!(user_dirty_porcelain_lines("").is_empty());
+    }
+
+    #[test]
+    fn user_dirty_handles_renames_and_paths_with_spaces() {
+        // Under `-z`, a rename is `R  <new>\0<orig>\0`. The origin field must
+        // be consumed, not parsed as its own status record, and the carve-out
+        // keys off the destination path.
+        //
+        // - A rename of one shelbi scratch file to another → still carved out.
+        let shelbi_rename = "R  .shelbi/b.json\0.shelbi/a.json\0";
+        assert!(user_dirty_porcelain_lines(shelbi_rename).is_empty());
+
+        // - A user rename → surfaces the destination record only (the origin
+        //   `orig name.rs` is not mis-read as a separate dirty entry).
+        let user_rename = "R  new name.rs\0orig name.rs\0";
+        assert_eq!(
+            user_dirty_porcelain_lines(user_rename),
+            vec!["R  new name.rs"]
+        );
+
+        // - `-z` never quotes, so a path with a space carves out cleanly
+        //   instead of arriving as a quoted string the prefix check misses.
+        let spaced_scratch = "?? .claude/a b.txt\0";
+        assert!(user_dirty_porcelain_lines(spaced_scratch).is_empty());
     }
 
     #[test]

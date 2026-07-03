@@ -163,12 +163,21 @@ pub fn show_view(project_name: &str, view: &str) -> Result<()> {
         return Err(Error::Other(format!("empty pane id for `{view}`")));
     }
 
-    // Swap the target pane into the dashboard's right slot.
+    // Swap the target pane into the dashboard's right slot. A non-zero exit
+    // here means the click silently no-ops (e.g. the stored pane id is stale
+    // or the dashboard layout lost its `{right}` slot) — surface it instead
+    // of discarding the status (orchestrator-lifecycle F13).
     let dashboard = format!("{session}:dashboard.{{right}}");
-    let _ = std::process::Command::new("tmux")
+    let swap = std::process::Command::new("tmux")
         .args(["swap-pane", "-s", pane_id, "-t", &dashboard])
-        .status()
+        .output()
         .map_err(Error::Io)?;
+    if !swap.status.success() {
+        return Err(Error::Other(format!(
+            "swap-pane failed for view `{view}` (pane {pane_id} → {dashboard}): {}",
+            String::from_utf8_lossy(&swap.stderr).trim()
+        )));
+    }
     // Make sure focus lands on the now-visible view.
     let _ = std::process::Command::new("tmux")
         .args(["select-window", "-t", &format!("{session}:dashboard")])

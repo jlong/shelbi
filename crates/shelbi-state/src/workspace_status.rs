@@ -138,6 +138,7 @@ pub fn workspaces_dir() -> Result<PathBuf> {
 
 /// `~/.shelbi/workspaces/<name>/status.yaml`.
 pub fn workspace_status_path(workspace: &str) -> Result<PathBuf> {
+    crate::ensure_flat_path_component("workspace", workspace)?;
     Ok(workspaces_dir()?.join(workspace).join("status.yaml"))
 }
 
@@ -1624,6 +1625,20 @@ mod tests {
         // death event.
         assert_eq!(server_teardown_key("review-1"), "review-1.server");
         assert_ne!(server_teardown_key("review-1"), "review-1");
+    }
+
+    #[test]
+    fn workspace_status_path_rejects_traversal_names() {
+        // Residual chokepoint hardening (state-runtime F14): a `..`/absolute/
+        // separator workspace name must not escape `~/.shelbi/workspaces/`.
+        for bad in ["..", "../evil", "a/b", "/abs", "nested/../escape", ""] {
+            assert!(
+                workspace_status_path(bad).is_err(),
+                "workspace_status_path should reject `{bad}`"
+            );
+        }
+        // A normal single-component name still resolves.
+        assert!(workspace_status_path("review-1").is_ok());
     }
 
     #[test]

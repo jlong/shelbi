@@ -110,6 +110,14 @@ impl KeyChord {
             return Err(ChordParseError::UnknownKey(raw.to_string()));
         }
 
+        // A trailing separator (`ctrl-`) leaves an empty keyname segment. That's
+        // a dangling modifier, not a multi-key sequence — without this guard the
+        // empty token reaches `parse_keyname`, whose `chars().all(..)` vacuously
+        // succeeds on `""` and misreports it as `MultiKeyNotSupported("")`.
+        if parts[idx].is_empty() {
+            return Err(ChordParseError::UnknownKey(raw.to_string()));
+        }
+
         // Try compound keynames first (`page-up`, `back-tab`, `page-down`)
         // so the trailing 2 segments are consumed together. If that
         // fails, fall back to a single-segment keyname.
@@ -140,8 +148,12 @@ impl KeyChord {
 
     /// Build a chord from a crossterm `KeyEvent` so the runtime can look
     /// it up in a [`super::ModeKeymap`]. Drops the `KIND` etc.; just the
-    /// code + mods are relevant for dispatch. Empty/superfluous Shift on
-    /// `Char` events is left intact — the lookup map keeps both forms.
+    /// code + mods are relevant for dispatch. The event's `code`/`mods` are
+    /// carried verbatim — no case-folding or implied-Shift normalization
+    /// happens here. Terminals that report an uppercase `Char('A')` with no
+    /// SHIFT bit are reconciled at lookup time by
+    /// [`super::ModeKeymap::dispatch`], which retries the `shift-a` form
+    /// before giving up.
     pub fn from_event(ev: KeyEvent) -> Self {
         KeyChord {
             code: ev.code,
@@ -188,6 +200,18 @@ impl KeyChord {
     /// Modifier order: ctrl, alt, shift, super. Uppercase-letter chords
     /// emit as `shift-x`, not `X`.
     pub fn canonical(&self) -> String {
+        // An event-derived chord can carry an uppercase `Char('J')` (some
+        // terminals report the shifted letter directly). Rendering it as the
+        // bare `J` breaks the round-trip — `parse("J")` yields
+        // `(Char('j'), SHIFT)`, a *different* chord. Normalize to the
+        // documented `shift-j` form: lowercase the letter and treat the
+        // uppercase as an implied Shift.
+        let (code, implied_shift) = match self.code {
+            KeyCode::Char(c) if c.is_ascii_uppercase() => {
+                (KeyCode::Char(c.to_ascii_lowercase()), true)
+            }
+            other => (other, false),
+        };
         let mut out = String::new();
         if self.mods.contains(KeyModifiers::CONTROL) {
             out.push_str("ctrl-");
@@ -195,13 +219,13 @@ impl KeyChord {
         if self.mods.contains(KeyModifiers::ALT) {
             out.push_str("alt-");
         }
-        if self.mods.contains(KeyModifiers::SHIFT) {
+        if implied_shift || self.mods.contains(KeyModifiers::SHIFT) {
             out.push_str("shift-");
         }
         if self.mods.contains(KeyModifiers::SUPER) {
             out.push_str("super-");
         }
-        out.push_str(&keyname(self.code));
+        out.push_str(&keyname(code));
         out
     }
 }
@@ -477,6 +501,33 @@ mod tests {
         let c = parse("ctrl--");
         assert_eq!(c.code, KeyCode::Char('-'));
         assert!(c.mods.contains(KeyModifiers::CONTROL));
+    }
+
+    #[test]
+    fn trailing_separator_is_a_missing_keyname_not_multi_key() {
+        // `ctrl-` is a dangling modifier — report it as an unknown/missing
+        // keyname naming the whole input, not `MultiKeyNotSupported("")`.
+        let err = KeyChord::parse("ctrl-").unwrap_err();
+        assert_eq!(err, ChordParseError::UnknownKey("ctrl-".to_string()));
+        let err = KeyChord::parse("ctrl-alt-").unwrap_err();
+        assert_eq!(err, ChordParseError::UnknownKey("ctrl-alt-".to_string()));
+    }
+
+    #[test]
+    fn canonical_round_trips_uppercase_char_from_event() {
+        // A terminal can hand us `Char('J')` with the SHIFT bit already set.
+        // `canonical()` must normalize to `shift-j` so the round-trip holds.
+        let ev = KeyEvent::new(KeyCode::Char('J'), KeyModifiers::SHIFT);
+        let c = KeyChord::from_event(ev);
+        assert_eq!(c.canonical(), "shift-j");
+        assert_eq!(parse(&c.canonical()), parse("shift-j"));
+
+        // And with no SHIFT bit (terminals that report only the glyph): the
+        // canonical form still parses back to an equal chord.
+        let ev = KeyEvent::new(KeyCode::Char('J'), KeyModifiers::NONE);
+        let c = KeyChord::from_event(ev);
+        assert_eq!(c.canonical(), "shift-j");
+        assert_eq!(parse(&c.canonical()), parse(&c.canonical()));
     }
 
     #[test]

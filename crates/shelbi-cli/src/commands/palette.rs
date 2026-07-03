@@ -41,6 +41,12 @@ pub fn run(project: String) -> Result<()> {
     }
 
     let mut term = setup_terminal()?;
+    // Backstop: any `?` bail-out (a sub-picker error, a failed `State::new`)
+    // or panic between here and the explicit `restore_terminal` below would
+    // otherwise leave the user's terminal stuck in raw mode / the alt-screen.
+    // The guard restores it on drop no matter how we leave the scope
+    // (cli-session-ux F7).
+    let _guard = TerminalGuard;
     let mut state = State::new(&project, &keymaps)?;
 
     // Sub-screens share the palette's alt-screen so the follow-up
@@ -88,8 +94,13 @@ pub fn run(project: String) -> Result<()> {
             _ => break (chosen, None, false),
         }
     };
+    // Propagate a picker/sub-picker error instead of silently discarding it in
+    // the `if let Ok(..)` below — an event-read failure would otherwise make
+    // the palette exit `Ok(())` as if nothing was chosen (cli-session-ux F7).
+    // The terminal is restored by `_guard` on this early return.
+    let chosen = chosen?;
     let quit_shelbi_confirmed = match &chosen {
-        Ok(Some(entry)) if entry.id == "action:quit-shelbi" => {
+        Some(entry) if entry.id == "action:quit-shelbi" => {
             run_quit_shelbi_confirm(&mut term, &keymaps)?
         }
         _ => false,
@@ -103,7 +114,7 @@ pub fn run(project: String) -> Result<()> {
         super::quit_project::run(&project)?;
     } else if quit_shelbi_confirmed {
         super::quit_shelbi::run()?;
-    } else if let Ok(Some(entry)) = chosen {
+    } else if let Some(entry) = chosen {
         if entry.id != "action:switch-project"
             && entry.id != "action:quit-project"
             && entry.id != "action:quit-shelbi"
@@ -167,6 +178,21 @@ fn restore_terminal<B: ratatui::backend::Backend + std::io::Write>(
     execute!(term.backend_mut(), LeaveAlternateScreen)?;
     term.show_cursor()?;
     Ok(())
+}
+
+/// RAII backstop that leaves raw mode and the alternate screen on drop, so
+/// an error/panic path in [`run`] can't strand the terminal in the palette's
+/// full-screen state. The happy path still calls [`restore_terminal`]
+/// explicitly (it also shows the cursor via the `Terminal` handle); this
+/// guard covers every other exit. Re-issuing the escapes after a clean
+/// restore is harmless.
+struct TerminalGuard;
+
+impl Drop for TerminalGuard {
+    fn drop(&mut self) {
+        let _ = disable_raw_mode();
+        let _ = execute!(io::stdout(), LeaveAlternateScreen);
+    }
 }
 
 /// Format a keymap diagnostic for stderr. The foundation crate doesn't
@@ -425,17 +451,15 @@ fn entry_from_row(row: &Row, workspaces: &[WorkspaceOverview]) -> Option<Entry> 
                 decoration,
             })
         }
-        Row::Workspace { name, view, .. } => {
+        Row::Workspace { name, .. } => {
             let machine = workspaces
                 .iter()
                 .find(|w| w.name == *name)
                 .map(|w| w.machine.clone());
-            let id = match view {
-                View::Workspace(_) => format!("workspace:{name}"),
-                _ => format!("workspace:{name}"),
-            };
+            // A workspace row's palette id is keyed purely on its name — the
+            // `view` variant doesn't change it, so there's no branch to make.
             Some(Entry {
-                id,
+                id: format!("workspace:{name}"),
                 label: name.clone(),
                 kind: EntryKind::Agent,
                 subtitle: Some(match machine {
@@ -531,11 +555,11 @@ fn dispatch(project: &str, entry: &Entry) -> Result<()> {
     if let Some(task_id) = entry.id.strip_prefix("review:") {
         let target = shelbi_orchestrator::review::start_review_by_id(project, task_id)
             .map_err(|e| anyhow::anyhow!(e))?;
-        run_tmux(["select-window", "-t", &exact_window_target(&target)]);
+        super::run_tmux(["select-window", "-t", &exact_window_target(&target)]);
         return Ok(());
     }
     if let Some(id) = entry.id.strip_prefix("agent:") {
-        run_tmux(["select-window", "-t", &format!("shelbi-{project}:={id}")]);
+        super::run_tmux(["select-window", "-t", &format!("shelbi-{project}:={id}")]);
         return Ok(());
     }
     if entry.id == "action:toggle-zen" {
@@ -564,18 +588,6 @@ fn exact_window_target(target: &str) -> String {
         Some((session, window)) => format!("{session}:={window}"),
         None => target.to_string(),
     }
-}
-
-fn run_tmux<I, S>(args: I) -> bool
-where
-    I: IntoIterator<Item = S>,
-    S: AsRef<std::ffi::OsStr>,
-{
-    std::process::Command::new("tmux")
-        .args(args)
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false)
 }
 
 // ---------------------------------------------------------------------------
@@ -1192,8 +1204,29 @@ fn format_active_workspaces(n: usize) -> String {
     }
 }
 
+/// Launch (or focus) `target`'s dashboard and move the attached client to it.
+/// The `attach`/`switch-client` call must inherit the terminal's stdio (it's
+/// interactive), so it deliberately does NOT go through the capturing
+/// [`super::run_tmux`] helper.
+fn switch_to_project(target: &str) -> Result<()> {
+    shelbi_state::touch_project_launched(target).map_err(|e| anyhow::anyhow!(e))?;
+    shelbi_orchestrator::ensure_dashboard(target).map_err(|e| anyhow::anyhow!(e))?;
+
+    let session = format!("shelbi-{target}");
+    let inside_tmux = std::env::var("TMUX").is_ok();
+    let args: &[&str] = if inside_tmux {
+        &["switch-client", "-t"]
+    } else {
+        &["attach", "-t"]
+    };
+    let _ = std::process::Command::new("tmux")
+        .args(args)
+        .arg(&session)
+        .status();
+    Ok(())
+}
+
 #[cfg(test)]
-#[allow(clippy::items_after_test_module)]
 mod tests {
     use super::*;
 
@@ -1622,22 +1655,4 @@ mod tests {
 
         std::env::remove_var("SHELBI_HOME");
     }
-}
-
-fn switch_to_project(target: &str) -> Result<()> {
-    shelbi_state::touch_project_launched(target).map_err(|e| anyhow::anyhow!(e))?;
-    shelbi_orchestrator::ensure_dashboard(target).map_err(|e| anyhow::anyhow!(e))?;
-
-    let session = format!("shelbi-{target}");
-    let inside_tmux = std::env::var("TMUX").is_ok();
-    let args: &[&str] = if inside_tmux {
-        &["switch-client", "-t"]
-    } else {
-        &["attach", "-t"]
-    };
-    let _ = std::process::Command::new("tmux")
-        .args(args)
-        .arg(&session)
-        .status();
-    Ok(())
 }

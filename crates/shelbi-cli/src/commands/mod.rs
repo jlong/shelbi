@@ -81,6 +81,47 @@ pub fn launch_editor(path: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Run a `tmux` subcommand for its side effect, returning whether it exited
+/// zero. Unlike a bare `.status()` call this captures stderr and, on failure
+/// (non-zero exit OR a spawn error), surfaces it on our own stderr so a broken
+/// tmux invocation is diagnosable instead of silently collapsing to `false`
+/// (cli-session-ux F12). Shared across the CLI's non-TUI tmux call sites
+/// (`open`, `palette`, `quit_project`, `quit_shelbi`) so the diagnostics and
+/// stderr handling live in one place (F14). Not for use inside a live ratatui
+/// screen — writing to stderr there would corrupt the alt-screen; those paths
+/// surface failures through their own status line instead.
+pub(crate) fn run_tmux<I, S>(args: I) -> bool
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<std::ffi::OsStr>,
+{
+    let args: Vec<std::ffi::OsString> =
+        args.into_iter().map(|a| a.as_ref().to_os_string()).collect();
+    let argv = || {
+        args.iter()
+            .map(|a| a.to_string_lossy())
+            .collect::<Vec<_>>()
+            .join(" ")
+    };
+    match std::process::Command::new("tmux").args(&args).output() {
+        Ok(out) if out.status.success() => true,
+        Ok(out) => {
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            let stderr = stderr.trim();
+            if stderr.is_empty() {
+                eprintln!("warning: `tmux {}` exited {}", argv(), out.status);
+            } else {
+                eprintln!("warning: `tmux {}` failed: {stderr}", argv());
+            }
+            false
+        }
+        Err(e) => {
+            eprintln!("warning: failed to run `tmux {}`: {e}", argv());
+            false
+        }
+    }
+}
+
 /// Resolve the editor command as `(program, leading-args)`, honoring
 /// `$VISUAL` before `$EDITOR` (the traditional Unix precedence) and
 /// falling back to `vi`. A blank or whitespace-only value is skipped so

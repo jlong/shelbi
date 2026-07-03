@@ -85,11 +85,11 @@ pub fn run(project: &str) -> Result<()> {
 
     let current = format!("shelbi-{project}");
     if let Some(target) = pick_next_session(&list_sessions(), &current) {
-        let _ = run_tmux(["switch-client", "-t", &target]);
+        let _ = super::run_tmux(["switch-client", "-t", &target]);
     }
 
-    let _ = run_tmux(["kill-session", "-t", &format!("_shelbi-{project}")]);
-    let _ = run_tmux(["kill-session", "-t", &current]);
+    let _ = super::run_tmux(["kill-session", "-t", &format!("_shelbi-{project}")]);
+    let _ = super::run_tmux(["kill-session", "-t", &current]);
 
     let _ = shelbi_state::append_project_event(project, "closed", "user:quit-project");
 
@@ -211,18 +211,6 @@ fn pick_next_session(listing: &str, current: &str) -> Option<String> {
         }
     }
     best.map(|(name, _)| name)
-}
-
-fn run_tmux<I, S>(args: I) -> bool
-where
-    I: IntoIterator<Item = S>,
-    S: AsRef<std::ffi::OsStr>,
-{
-    std::process::Command::new("tmux")
-        .args(args)
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false)
 }
 
 #[cfg(test)]
