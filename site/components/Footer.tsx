@@ -127,17 +127,15 @@ export function Footer() {
 
         <div className="mt-8 border-t border-gray-4 pt-4">
           <p className="font-mono text-xs text-gray-6">
-            &copy; {new Date().getFullYear()} Shelbi
-            <span className="px-2 text-gray-5">&middot;</span>
-            MIT
-            <span className="px-2 text-gray-5">&middot;</span>
-            Built by{" "}
+            &copy; {new Date().getFullYear()}{" "}
             <Link
               href="https://32pixels.co"
               className="transition-colors hover:text-fg"
             >
-              32pixels
+              32pixels, LLC
             </Link>
+            <span className="px-2 text-gray-5">&middot;</span>
+            MIT License
           </p>
         </div>
       </div>
