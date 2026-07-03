@@ -589,17 +589,17 @@ function Row({ segs }: { segs: Segment[] }) {
 const PRE_STYLE: React.CSSProperties = {
   background: TUI_BG,
   color: TUI_FG,
-  fontSize: 12,
+  fontSize: 13,
   // Line-height is kept tight so consecutive highlighted rows' backgrounds
   // connect into one continuous fill. An inline span's background only paints
   // the font's content box, and any leading above/below it is left unfilled —
   // at a looser line-height that unfilled leading shows as a gap between a
   // selection's stacked rows (the two-line focused card, the sidebar nav /
   // review selections). Geist Mono's content box is (ascent 1005 + descent
-  // 295) / 1000 em ≈ 15.6px at this 12px size, so 15px makes adjacent rows'
-  // backgrounds overlap ~0.6px — connected past sub-pixel rounding — while
-  // line-height 1.25 keeps the text readable and the character grid uncramped.
-  lineHeight: "15px",
+  // 295) / 1000 em ≈ 16.9px at this 13px size, so 17px makes adjacent rows'
+  // backgrounds overlap ~0.1px — connected past sub-pixel rounding — while
+  // line-height ~1.31 keeps the text readable and the character grid uncramped.
+  lineHeight: "17px",
   minWidth: "max-content",
 }
 
