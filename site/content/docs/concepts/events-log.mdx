@@ -76,11 +76,24 @@ carries:
 2026-06-22T14:25:11+00:00 project=myapp heartbeat
 ```
 
-- Emitted by the hub-side poller on the cadence set by the `heartbeat`
-  key in `project.yaml` (default `3m`). Set to `"off"` to disable.
-- Debounced: if any line was written to the log in the last `heartbeat`
-  interval — including a previous heartbeat — the next tick skips. An
-  active board never sees padding lines.
+- Emitted by the hub-side poller on the cadence set by the
+  [`heartbeat`](/docs/configuration/project#heartbeat) key in
+  `project.yaml`. Set to `"off"` to disable.
+- Adaptive cadence: the poller holds at the standard `interval`
+  (default `3m`) while there's supervisable work in flight, then backs
+  off exponentially — doubling each idle tick, capped at `max` (default
+  `60m`) — once the board is quiescent. A fully idle hub relaxes
+  `3m → 6m → 12m → … → 60m`, so even a long-quiet board still sweeps for
+  a silently-stuck task about once an hour. Backing off on "no
+  supervisable work" rather than "no log line" is deliberate: a stuck
+  `in_progress` task also emits nothing, and the heartbeat sweep is
+  exactly what catches it.
+- Resets on any real event: the poller compares `events.log`'s mtime
+  against a baseline it advances on each seed/emit/reset, so any genuine
+  line — a task move, a workspace transition, a dispatch — both skips
+  that tick's emission (the event already woke the orchestrator) and
+  snaps the cadence back to the standard `interval`. An active board
+  never sees padding lines.
 - Crash-safe: a poller restart waits one full interval before its first
   attempt, rather than firing the slot it missed.
 - Paused while offline: each due tick TCP-probes `1.1.1.1:443` with a
