@@ -1,5 +1,6 @@
 import type { MDXComponents } from "mdx/types"
 import Link from "next/link"
+import { AppMockup } from "./KanbanMockup"
 import { InstallCommand } from "./InstallCommand"
 
 /**
@@ -10,7 +11,10 @@ import { InstallCommand } from "./InstallCommand"
  */
 export const mdxComponents: MDXComponents = {
   // Shared marketing/docs components addressable from MDX by tag name.
+  // `<AppMockup preset="starter" activeView="chat" />` renders a Shelbi TUI
+  // scenario import-free; see `KanbanMockup.tsx` for `AppState`/presets.
   InstallCommand,
+  AppMockup,
   h1: (props) => (
     <h1 className="mt-6 mb-3 scroll-mt-8 text-3xl font-semibold tracking-tight text-fg" {...props} />
   ),
