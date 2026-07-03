@@ -1,23 +1,35 @@
 ---
 title: shelbi review
 order: 24
-summary: Check a task's branch into the review work_dir and (re)launch a fresh review-claude pane there.
+summary: Load a finished task's branch onto a review workspace and start the Review agent there to serve it for a human — or, when every review workspace is busy, report the task's queue position.
 ---
 
 ```text
 shelbi review [OPTIONS] <ID>
 ```
 
-`shelbi review` is how you (or the sidebar) sit down with a workspace's
-finished branch. It checks the task's branch into the machine's dedicated
-review work_dir, then spawns a fresh `review-claude` pane in that
-directory. The branch is isolated from the workspace's own worktree, so
-reviewing doesn't interfere if you reload the workspace onto the next
-task while the review pane stays open.
+`shelbi review` loads a task's branch onto a
+[**review workspace**](/docs/concepts/review-workspaces) — a `role: review`
+pool slot — and starts the **Review agent** there to *run* the change: install
+deps, build, boot the dev server, and hand you a working URL. It's the same
+load path the orchestrator triggers automatically when a task reaches the
+review status; run it by hand to load (or re-load) a specific task yourself.
+
+The branch is **moved** onto the review workspace's own worktree, so the
+machine's top-level clone is never checked out into or dirtied by review. When
+every review workspace on the resolved machine is already busy, the command
+doesn't fail — it prints the task's **queue position** and the task loads
+automatically once a slot frees.
 
 By default the command runs on the machine of the task's `assigned_to`
-workspace. Pass `--machine` to override — useful when reviewing on your
-laptop even though the workspace ran remotely.
+workspace (when that machine declares review workspaces), else the first
+machine that declares one. Pass `--machine` to override.
+
+> **This replaced the old review flow.** Earlier, `shelbi review` checked the
+> branch into a per-machine review `work_dir` and launched a bare
+> `review-claude` pane. That path is retired: review workspaces are the
+> canonical review surface now. See
+> [Review workspaces](/docs/concepts/review-workspaces) for the full model.
 
 ## Arguments
 
@@ -29,28 +41,73 @@ laptop even though the workspace ran remotely.
 
 | Flag | Type | Default | Description |
 | --- | --- | --- | --- |
-| `--machine <MACHINE>` | string | task's workspace's machine, else first local machine | Override the machine to review on. |
+| `--machine <MACHINE>` | string | task's workspace's machine (if it has review workspaces), else the first machine that declares one | Override the machine to review on. |
 | `-p, --project <PROJECT>` | string | env / cwd lookup | Project to operate on. |
+
+## Output
+
+When a review workspace is free, the task loads and the command focuses the
+review pane:
+
+```text
+→ loading auth-rewrite onto review workspace review-1 on hub (:3000)
+✓ review agent up at shelbi-myapp:review-1
+```
+
+When every review workspace on the machine is busy, it reports the queue
+position instead of failing — the task stays in Review, marked *pending-load*,
+and loads automatically when a slot frees:
+
+```text
+⏳ all review workspaces on hub are busy — `auth-rewrite` is queued at position 1
+   review-1 → palette-fuzzy-match-fix
+It will load automatically when a review workspace frees.
+```
+
+## Onboarding: declare a review workspace first
+
+Review workspaces are now the *only* review surface. A project that has
+declared none gets a loud, actionable error rather than a silent fallback:
+
+```text
+project `myapp` declares no `role: review` workspace — review workspaces are
+the review surface now (the old top-level-clone checkout was retired). Declare
+at least one in your project config, e.g.
+
+  workspaces:
+    - { name: review-1, machine: <machine>, runner: <runner>, role: review }
+
+then re-run `shelbi review auth-rewrite`.
+```
+
+Add a `role: review` slot to your `workspaces:` (1–2 per machine), run
+`shelbi reload`, and try again.
 
 ## Examples
 
-Review a task on the same machine its workspace ran on (most common —
-the sidebar's "Review" action runs exactly this):
+Load a task onto a review workspace on the same machine its dev workspace ran
+on (the most common form — the sidebar's "Review" action and the orchestrator's
+auto-load run exactly this):
 
 ```bash
-shelbi review docs-write-cli-reference-pages
+shelbi review auth-rewrite
 ```
 
-Pull a remote workspace's branch onto your laptop for a closer look:
+Review on your laptop even though the workspace ran remotely:
 
 ```bash
-shelbi review docs-write-cli-reference-pages --machine laptop
+shelbi review auth-rewrite --machine laptop
 ```
 
 ## See also
 
-- [Workflows](/docs/concepts/workflows#review-marker-promotion) — what
-  the `Review` status (and any `handoff`-category status) means, and
-  how a task lands in it via the review-marker poll.
+- [Review workspaces](/docs/concepts/review-workspaces) — what a review
+  workspace is, the `review:` config block, ports, the Review agent, and the
+  load → serve → inspect lifecycle.
+- [`shelbi workspace serve`](/docs/cli/workspace#serve) — how the Review agent
+  starts the managed dev-server pane once it's loaded.
+- [Workflows](/docs/concepts/workflows#review-marker-promotion) — what the
+  `Review` status (and any `handoff`-category status) means, and how a task
+  lands in it via the review-marker poll.
 - [`shelbi merge`](/docs/cli/merge) — once review accepts, this is how the
   branch gets folded back into the default branch.

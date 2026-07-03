@@ -1,6 +1,6 @@
 ---
 title: Orchestrator
-order: 13
+order: 14
 summary: One agent in window 1 you talk to — it dispatches tasks to workspaces, tails the events log, and reports back. You are the priority-setter; it is the scheduler.
 ---
 
@@ -134,7 +134,11 @@ backward compatibility):
 - `task=<id> ... to_category=ready reason=user:*` → find a free eligible
   workspace, dispatch.
 - `task=<id> ... to_category=handoff reason=worker:review-marker` →
-  that workspace is now free, find it the next ready task.
+  the finishing dev workspace has already closed its session, so it's
+  *already free* — find it the next ready task. If the project declares
+  [review workspaces](/docs/concepts/review-workspaces), also load the
+  finished branch onto one with `shelbi review <id>` (or leave it queued
+  when they're all busy) so a human can run the change.
 - `worker=<name> working -> awaiting_input` → same idea, the workspace
   just freed up.
 - `worker=<name> pane_alive=false` → surface to the user; don't
@@ -259,6 +263,9 @@ the [workflow YAML](/docs/concepts/workflows#owners-and-agents).
   its prompt, skills, and customization work.
 - [Workspaces](/docs/concepts/workspaces) — what the orchestrator
   dispatches tasks to.
+- [Review workspaces](/docs/concepts/review-workspaces) — the slots the
+  orchestrator auto-loads a finished branch onto on handoff, and the
+  pending-load queue it drains as they free.
 - [Workflows](/docs/concepts/workflows) — the schema behind the board,
   including the full category set and the events-log annotations the
   orchestrator pattern-matches on.
