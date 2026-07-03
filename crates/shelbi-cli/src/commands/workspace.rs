@@ -119,9 +119,7 @@ pub(crate) fn render_list(
             // happen but the first one's agent is the best we can render
             // in a single cell.
             let agent = mine[0]
-                .params
-                .get("agent")
-                .map(String::as_str)
+                .param_str("agent")
                 .unwrap_or(DEFAULT_TASK_AGENT)
                 .to_string();
             let ids = mine.iter().map(|t| t.id.as_str()).collect::<Vec<_>>().join(", ");

@@ -2291,7 +2291,7 @@ fn workflow_card_indicator(
         .and_then(|tmpl| {
             let mut missing = Vec::new();
             let resolved =
-                shelbi_core::substitute_placeholders(tmpl, &task.params, &mut missing);
+                shelbi_core::substitute_placeholders(tmpl, &task.string_params(), &mut missing);
             // Hide on unresolved — a half-substituted branch at the
             // per-card glance scale would mislead more than help.
             missing.is_empty().then_some(resolved)
@@ -4042,7 +4042,7 @@ mod tests {
             updated_at: chrono::Utc::now(),
             params: params
                 .iter()
-                .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+                .map(|(k, v)| ((*k).to_string(), (*v).into()))
                 .collect(),
         }
     }

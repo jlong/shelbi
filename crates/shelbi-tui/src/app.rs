@@ -662,9 +662,8 @@ fn load_workspaces(project: &str, review_queue: &[TaskFile]) -> Result<Vec<Works
         // than the default agent name.
         let agent = assigned_task.map(|tf| {
             tf.task
-                .params
-                .get("agent")
-                .cloned()
+                .param_str("agent")
+                .map(str::to_string)
                 .unwrap_or_else(|| DEFAULT_TASK_AGENT.to_string())
         });
         let has_review = review_queue

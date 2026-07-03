@@ -627,7 +627,25 @@ pub fn save_session(s: &Session) -> Result<()> {
 /// `~/.shelbi/projects/<project>/state.json`. Tracks Zen Mode toggles and
 /// the timestamp of the most recent Zen-Mode auto-promote crash so the
 /// orchestrator can keep the user from re-arming a flapping pipeline.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+/// ## Forward-compatibility contract
+///
+/// The `extra` catch-all (adversarial review F6) keeps an *older* binary
+/// from destroying fields a *newer* binary wrote. Without it, every field
+/// serde doesn't recognize is dropped on read, so any read-modify-write
+/// mutator (`zen_heartbeat`, `set_workspace_filter`, …) run by an old
+/// binary permanently deletes every field a newer schema added — the exact
+/// mixed-version deployment `ZenModeState::deserialize_lenient` exists to
+/// tolerate. `#[serde(flatten)]` routes unknown keys into `extra`, and they
+/// serialize back out verbatim on the next write.
+///
+/// The contract is *field preservation, not field understanding*: an old
+/// binary round-trips a new field untouched but never acts on it. Two
+/// consequences of holding raw [`serde_json::Value`]s: `State` can no longer
+/// derive `Eq` (JSON numbers are `f64`), only `PartialEq` — which is all the
+/// `update_state` change-detection needs; and a new field's semantics must
+/// stay back-compatible enough that a blind carry-through by an old binary
+/// is safe (the same discipline `deserialize_lenient` already assumes).
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct State {
     #[serde(default, deserialize_with = "ZenModeState::deserialize_lenient")]
     pub zen_mode: ZenModeState,
@@ -665,6 +683,15 @@ pub struct State {
     /// [`shelbi_tui::kanban::ColumnExpansion`] for the in-memory model.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub kanban_column_overrides: BTreeMap<String, KanbanColumnOverride>,
+    /// Forward-compat catch-all: any `state.json` key this binary doesn't
+    /// recognize (a field a newer binary added) is captured here and written
+    /// back verbatim, instead of being silently dropped on the next
+    /// read-modify-write. See the struct-level forward-compatibility
+    /// contract. Empty on the happy path — `#[serde(flatten)]` of an empty
+    /// map contributes no keys, so a fresh `state.json` stays byte-identical
+    /// to before this field existed.
+    #[serde(flatten)]
+    pub extra: BTreeMap<String, serde_json::Value>,
 }
 
 /// Persisted form of an explicit user override on a Kanban column's
@@ -759,7 +786,11 @@ pub fn state_path(project: &str) -> Result<PathBuf> {
 /// every project the user opens), and the sidebar's per-machine
 /// collapse state (a UI preference that follows the user across
 /// projects sharing a machine name).
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+/// See [`State`]'s forward-compatibility contract — `GlobalState` carries
+/// the same `extra` catch-all for the same reason (an older binary must not
+/// drop `~/.shelbi/state.json` fields a newer one wrote), and likewise drops
+/// `Eq` for it.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct GlobalState {
     /// The exact tmux key string passed to `tmux bind-key -n …` on the
     /// most recent install (e.g. `C-p`, `M-z`). `None` means no shelbi
@@ -778,6 +809,11 @@ pub struct GlobalState {
     /// state.json doesn't carry the empty `"sidebar":{}` block.
     #[serde(default, skip_serializing_if = "SidebarPrefs::is_default")]
     pub sidebar: SidebarPrefs,
+    /// Forward-compat catch-all for unknown `~/.shelbi/state.json` keys —
+    /// see [`State::extra`] and the forward-compatibility contract on
+    /// [`State`].
+    #[serde(flatten)]
+    pub extra: BTreeMap<String, serde_json::Value>,
 }
 
 /// User-level sidebar preferences persisted under
@@ -935,6 +971,42 @@ mod global_state_tests {
         std::env::set_var("SHELBI_HOME", &home);
         fs::create_dir_all(global_state_path().unwrap()).unwrap();
         assert!(read_global_state().is_err());
+        std::env::remove_var("SHELBI_HOME");
+    }
+
+    #[test]
+    fn global_state_read_modify_write_preserves_unknown_fields() {
+        // Forward-compat (adversarial review F6), global half: an older
+        // binary toggling a field it knows about must not drop a field a
+        // newer binary added to `~/.shelbi/state.json`.
+        let _g = LOCK.lock().unwrap();
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+
+        let path = global_state_path().unwrap();
+        fs::write(
+            &path,
+            r#"{"tmux_palette_key":"M-z","telemetry_opt_in":false,"future":[1,2]}"#,
+        )
+        .unwrap();
+
+        let state = read_global_state().unwrap();
+        assert_eq!(state.tmux_palette_key.as_deref(), Some("M-z"));
+        assert_eq!(
+            state.extra.get("telemetry_opt_in"),
+            Some(&serde_json::json!(false))
+        );
+
+        // Old binary flips a known field.
+        mark_zen_intro_seen().unwrap();
+
+        let raw = fs::read_to_string(&path).unwrap();
+        let disk: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(disk["zen_intro_seen"], serde_json::json!(true));
+        assert_eq!(disk["tmux_palette_key"], serde_json::json!("M-z"));
+        assert_eq!(disk["telemetry_opt_in"], serde_json::json!(false));
+        assert_eq!(disk["future"], serde_json::json!([1, 2]));
+
         std::env::remove_var("SHELBI_HOME");
     }
 
@@ -2002,6 +2074,56 @@ mod tests {
         assert_eq!(std::fs::read_to_string(&legacy).unwrap(), "legacy");
         assert_eq!(std::fs::read_to_string(&renamed).unwrap(), "new");
         std::env::remove_var("SHELBI_HOME");
+    }
+
+    #[test]
+    fn state_read_modify_write_preserves_unknown_fields() {
+        // Forward-compat (adversarial review F6): an *older* binary doing a
+        // read-modify-write on `state.json` must not destroy a field a
+        // *newer* binary wrote. Here the newer field is `review_rounds`; the
+        // old binary flips `workspace_filter` (a known field) and the
+        // unknown field has to survive the rewrite.
+        let _g = TEST_LOCK.lock().unwrap();
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+
+        let path = state_path("myapp").unwrap();
+        ensure_dir(path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &path,
+            r#"{"zen_mode":"on","review_rounds":3,"future":{"nested":true}}"#,
+        )
+        .unwrap();
+
+        // A known field is read back correctly, and the unknown ones are
+        // parked in `extra`.
+        let state = read_state("myapp").unwrap();
+        assert_eq!(state.zen_mode, ZenModeState::On);
+        assert_eq!(
+            state.extra.get("review_rounds"),
+            Some(&serde_json::json!(3))
+        );
+
+        // Old binary mutates a field it *does* know about.
+        set_workspace_filter("myapp", Some("backend")).unwrap();
+
+        // On disk: the mutation landed AND the unknown fields are intact.
+        let raw = std::fs::read_to_string(&path).unwrap();
+        let disk: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(disk["workspace_filter"], serde_json::json!("backend"));
+        assert_eq!(disk["review_rounds"], serde_json::json!(3));
+        assert_eq!(disk["future"], serde_json::json!({"nested": true}));
+        assert_eq!(disk["zen_mode"], serde_json::json!("on"));
+
+        std::env::remove_var("SHELBI_HOME");
+    }
+
+    #[test]
+    fn default_state_serializes_without_an_extra_block() {
+        // The empty catch-all must contribute no keys — a fresh `state.json`
+        // stays byte-compatible with the pre-`extra` schema.
+        let json = serde_json::to_string(&State::default()).unwrap();
+        assert_eq!(json, "{\"zen_mode\":\"off\"}");
     }
 
     #[test]
