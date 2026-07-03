@@ -20,15 +20,26 @@
 //! title (Claude's own OSC writes often clobber the marker before the
 //! poller sees it).
 //!
-//! Each cycle also takes a `tmux capture-pane` sample and matches it against
-//! the runner's blocking-dialog signatures (see
-//! `shelbi_core::default_dialog_signatures` / `AgentRunnerSpec::dialog_signatures`).
-//! A pane frozen on an interactive modal (usage-limit, workspace-trust,
-//! permission-confirm) keeps a stale `shelbi:working` title — no hook fires —
-//! so the title path alone can't see the stall. On a match the poller emits a
-//! `working -> blocked reason=dialog:<kind>` line (deduped per incident, with a
-//! recovery line when the modal clears) so the orchestrator can react instead
-//! of discovering a wedged board hours later.
+//! Each cycle also takes a `tmux capture-pane` sample and inspects it two ways,
+//! because a stalled pane keeps a stale `shelbi:working` title — no hook fires —
+//! so the title path alone can't see the stall:
+//!
+//! - **Usage-limit pause.** If the sample shows the runner stalled on its
+//!   usage/session limit (`shelbi_orchestrator::ready::detect_usage_limit`,
+//!   anchored on claude's actual modal chrome — *not* a bare substring, so a
+//!   pane that merely mentions the phrase doesn't trip it) the workspace is
+//!   marked [`WorkspaceState::Paused`] (⏸ badge) and a `-> paused
+//!   reason=usage-limit` line is emitted (with the reset time when shown). The
+//!   state clears — reverting to the title-derived state — on the first poll
+//!   after the limit lifts, so the orchestrator can hold new work off a limited
+//!   slot until it frees up.
+//! - **Blocking dialogs.** Otherwise the sample is matched against the runner's
+//!   blocking-dialog signatures (see `shelbi_core::default_dialog_signatures` /
+//!   `AgentRunnerSpec::dialog_signatures`) for a human-gated modal
+//!   (workspace-trust, permission-confirm). On a match the poller emits a
+//!   `working -> blocked reason=dialog:<kind>` line (deduped per incident, with
+//!   a recovery line when the modal clears) so the orchestrator can react
+//!   instead of discovering a wedged board hours later.
 //!
 //! On a state change the poller writes two files:
 //! - `~/.shelbi/workspaces/<name>/status.yaml` — last observed state.
@@ -55,8 +66,9 @@ use shelbi_core::{Column, Project};
 use shelbi_orchestrator::supervision::{SupervisionAction, SupervisionInputs, SupervisionState};
 use shelbi_state::{
     append_contextstore_event, append_heartbeat_event, append_rebase_event,
-    append_workspace_dialog_event, append_workspace_event, events_log_path, load_workspace_status,
-    parse_pane_title_marker, save_workspace_status, WorkspaceState, WorkspaceStatus,
+    append_workspace_dialog_event, append_workspace_event, append_workspace_pause_event,
+    events_log_path, load_workspace_status, parse_pane_title_marker, save_workspace_status,
+    WorkspaceState, WorkspaceStatus,
 };
 
 /// How often each per-workspace thread re-verifies its host's reverse
@@ -526,11 +538,34 @@ fn poll_one(
         return;
     }
 
-    // Blocking-dialog detection. Runs on the same tick as the title read but
-    // via a separate `capture-pane` sample, because a pane frozen on a
-    // usage-limit / trust / permission modal keeps a stale `shelbi:working`
-    // title — no hook fires — so the title path alone can't see the stall.
-    maybe_emit_dialog_event(project, workspace, &host, &addr, last_dialog);
+    // Pane-stall detection. One `capture-pane` sample feeds both detectors,
+    // run on the same tick as the title read because a stalled pane keeps a
+    // stale `shelbi:working` title — no hook fires — so the title path alone
+    // can't see it. Best-effort: a capture failure leaves both untouched and
+    // we fall through to the title path.
+    let screen = shelbi_tmux::capture(&host, &addr).ok();
+
+    // Usage-limit *pause* takes priority. Matched structurally against
+    // claude's modal chrome (see `ready::detect_usage_limit`) rather than a
+    // bare substring — so a pane that merely mentions "usage limit" (editing
+    // this code, reading docs, an agent reasoning about the feature) never
+    // trips it. A real stall drives a first-class `Paused` state whose ⏸ badge
+    // overrides the stale title, so we skip the title path this tick; the
+    // state reverts on the first poll after the limit lifts (which then rides
+    // the ordinary `paused -> working` title transition below).
+    if let Some(stall) = screen
+        .as_deref()
+        .and_then(shelbi_orchestrator::ready::detect_usage_limit)
+    {
+        record_usage_limit_pause(project, workspace, last_known, stall.reset.as_deref());
+        // Pause supersedes any tracked advisory dialog.
+        *last_dialog = None;
+        return;
+    }
+
+    // Generic blocking-dialog advisory (trust / permission), deduped via
+    // `last_dialog` so a still-open modal produces one event per incident.
+    maybe_emit_dialog_event(project, workspace, screen.as_deref(), last_dialog);
 
     let title = match shelbi_tmux::pane_title(&host, &addr) {
         Ok(t) => t,
@@ -544,22 +579,7 @@ fn poll_one(
     // Bootstrap previous state from disk on first sighting so a hub
     // restart doesn't emit a bogus `none -> X` event for state we've
     // already recorded.
-    let prior = match *last_known {
-        Some(s) => Some(PriorState {
-            state: s,
-            last_transition: load_workspace_status(&workspace.name)
-                .ok()
-                .flatten()
-                .map(|s| s.last_transition),
-        }),
-        None => load_workspace_status(&workspace.name)
-            .ok()
-            .flatten()
-            .map(|s| PriorState {
-                state: s.state,
-                last_transition: Some(s.last_transition),
-            }),
-    };
+    let prior = load_prior(&workspace.name, last_known);
 
     let current_task = current_task_for(project, &workspace.name);
     let outcome = decide(
@@ -650,19 +670,21 @@ fn decide_dialog(prev: Option<&str>, detected: Option<&str>) -> (Vec<DialogEvent
     }
 }
 
-/// Sample the workspace pane, match it against the runner's blocking-dialog
-/// signatures, and emit a `blocked reason=dialog:*` (or recovery) line on a
-/// change of stuck-state. Deduped via `last_dialog` so a still-open modal
-/// only produces one event per incident.
+/// Match a pre-captured pane sample against the runner's blocking-dialog
+/// signatures (trust / permission) and emit a `blocked reason=dialog:*` (or
+/// recovery) line on a change of stuck-state. Deduped via `last_dialog` so a
+/// still-open modal only produces one event per incident.
 ///
-/// Best-effort: an unknown runner or a transient `capture-pane` failure just
-/// leaves the stuck-state untouched and retries next tick — we'd rather miss
-/// a beat than fabricate a recovery on a capture hiccup.
+/// Usage-limit is handled separately, upstream, by the structural pause
+/// detector — this function only sees the interactive human-gated modals.
+///
+/// Best-effort: an unknown runner or a missing sample (`None`, a transient
+/// `capture-pane` failure) just leaves the stuck-state untouched and retries
+/// next tick — we'd rather miss a beat than fabricate a recovery on a hiccup.
 fn maybe_emit_dialog_event(
     project: &Project,
     workspace: &shelbi_core::WorkspaceSpec,
-    host: &shelbi_core::Host,
-    addr: &shelbi_core::TmuxAddr,
+    screen: Option<&str>,
     last_dialog: &mut Option<String>,
 ) {
     let Some(runner) = project.runner(&workspace.runner) else {
@@ -677,11 +699,12 @@ fn maybe_emit_dialog_event(
         return;
     }
 
-    let screen = match shelbi_tmux::capture(host, addr) {
-        Ok(s) => s,
-        Err(_) => return,
+    // No sample this tick (capture failed) — leave the stuck-state untouched
+    // rather than fabricating a recovery.
+    let Some(screen) = screen else {
+        return;
     };
-    let detected = shelbi_orchestrator::ready::detect_blocking_dialog(&screen, &signatures);
+    let detected = shelbi_orchestrator::ready::detect_blocking_dialog(screen, &signatures);
 
     let (events, next) = decide_dialog(last_dialog.as_deref(), detected.as_deref());
     for ev in events {
@@ -698,6 +721,79 @@ fn maybe_emit_dialog_event(
         }
     }
     *last_dialog = next;
+}
+
+/// Load the prior [`PriorState`] for a workspace, preferring the in-memory
+/// `last_known` (this thread's own last observation) and falling back to the
+/// on-disk `status.yaml` on first sighting after a hub restart. Shared by the
+/// title path and the usage-limit pause path so both bootstrap identically and
+/// a restart doesn't emit a bogus `none -> X` for state already recorded.
+fn load_prior(workspace_name: &str, last_known: &Option<WorkspaceState>) -> Option<PriorState> {
+    match *last_known {
+        Some(s) => Some(PriorState {
+            state: s,
+            last_transition: load_workspace_status(workspace_name)
+                .ok()
+                .flatten()
+                .map(|s| s.last_transition),
+        }),
+        None => load_workspace_status(workspace_name)
+            .ok()
+            .flatten()
+            .map(|s| PriorState {
+                state: s.state,
+                last_transition: Some(s.last_transition),
+            }),
+    }
+}
+
+/// Record a usage-limit stall as a first-class [`WorkspaceState::Paused`]:
+/// persist the paused status (so the sidebar renders the ⏸ badge) and, on the
+/// edge *into* the stall, emit one `... -> paused reason=usage-limit` line
+/// (carrying the reset-time hint when claude showed one) so the activity feed
+/// and the orchestrator both see the slot go quiet on the clock.
+///
+/// Dedupe rides the ordinary [`decide`] transition machinery: while the pane
+/// stays on the limit, subsequent polls observe `prev == Paused == new`, so
+/// only `last_seen` moves and no further event fires. The *resume* edge is not
+/// emitted here — once the limit lifts the poll falls through to the title
+/// path, which records the `paused -> working` transition off the live marker.
+fn record_usage_limit_pause(
+    project: &Project,
+    workspace: &shelbi_core::WorkspaceSpec,
+    last_known: &mut Option<WorkspaceState>,
+    reset: Option<&str>,
+) {
+    let prior = load_prior(&workspace.name, last_known);
+    let current_task = current_task_for(project, &workspace.name);
+    let outcome = decide(
+        &workspace.name,
+        current_task,
+        prior,
+        WorkspaceState::Paused,
+        Utc::now(),
+    );
+
+    if let Err(e) = save_workspace_status(&outcome.status) {
+        tracing::warn!(workspace = %workspace.name, error = %e, "save_workspace_status failed");
+    }
+    if outcome.transitioned {
+        if let Err(e) = append_workspace_pause_event(
+            &project.name,
+            &workspace.name,
+            outcome.prev_state,
+            reset,
+        ) {
+            tracing::warn!(workspace = %workspace.name, error = %e, "append_workspace_pause_event failed");
+        }
+        tracing::info!(
+            workspace = %workspace.name,
+            reset = ?reset,
+            "workspace paused on usage limit",
+        );
+    }
+
+    *last_known = Some(WorkspaceState::Paused);
 }
 
 /// Check the workspace's review-ready file marker and, if present, move its
@@ -1324,6 +1420,41 @@ mod tests {
         assert_eq!(out.status.state, WorkspaceState::AwaitingInput);
         assert_eq!(out.status.last_transition, ts(200));
         assert_eq!(out.status.current_task.as_deref(), Some("task-1"));
+    }
+
+    #[test]
+    fn usage_limit_pause_transitions_and_clears_via_decide() {
+        // Into the stall: Working -> Paused is a transition (the poller emits
+        // the `-> paused reason=usage-limit` line on this edge).
+        let prior = Some(PriorState {
+            state: WorkspaceState::Working,
+            last_transition: Some(ts(50)),
+        });
+        let paused = decide("alpha", Some("t".into()), prior, WorkspaceState::Paused, ts(100));
+        assert!(paused.transitioned);
+        assert_eq!(paused.prev_state, Some(WorkspaceState::Working));
+        assert_eq!(paused.status.state, WorkspaceState::Paused);
+        assert_eq!(paused.status.last_transition, ts(100));
+
+        // Still stalled: Paused -> Paused is deduped (only last_seen moves), so
+        // a long limit produces exactly one event per incident.
+        let still = Some(PriorState {
+            state: WorkspaceState::Paused,
+            last_transition: Some(ts(100)),
+        });
+        let out = decide("alpha", Some("t".into()), still, WorkspaceState::Paused, ts(160));
+        assert!(!out.transitioned);
+        assert_eq!(out.status.last_transition, ts(100));
+        assert_eq!(out.status.last_seen, ts(160));
+
+        // Resume: the limit lifts, the live marker reads working again, and
+        // Paused -> Working transitions — this is the clear-on-resume edge the
+        // title path emits (`paused -> working`) so the ⏸ badge reverts.
+        let resumed = decide("alpha", Some("t".into()), still, WorkspaceState::Working, ts(200));
+        assert!(resumed.transitioned);
+        assert_eq!(resumed.prev_state, Some(WorkspaceState::Paused));
+        assert_eq!(resumed.status.state, WorkspaceState::Working);
+        assert_eq!(resumed.status.last_transition, ts(200));
     }
 
     use shelbi_core::{
