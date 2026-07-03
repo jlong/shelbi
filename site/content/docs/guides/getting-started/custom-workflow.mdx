@@ -25,16 +25,15 @@ in in-repo mode:
 
 - **`agents/orchestrator/instructions.md`** — the orchestrator-specific
   system prompt. Seeded with the shipped default on first load; your
-  edits stay put on upgrade. `{{assistant_name}}` is substituted from
-  `~/.shelbi/shelbi.yaml`.
+  edits stay put on upgrade.
 - **`agents/_shared/preamble.md`** — project-wide context prepended to
   every agent (developer, qa, orchestrator…). Put the repo layout,
   house style, and test command here so you write it once instead of
   pasting it into four prompts.
 
 On every `shelbi reload` (and at session start) Shelbi composes
-`preamble.md + instructions.md`, substitutes the assistant name, and
-writes the rendered output to `~/.shelbi/projects/<name>/CLAUDE.md` —
+`preamble.md + instructions.md` and writes the rendered output to
+`~/.shelbi/projects/<name>/CLAUDE.md` —
 which is state, so it lives under `~/.shelbi/` in both modes. The
 orchestrator launches in that directory and auto-loads the rendered
 prompt — no flags, no env vars, no MCP.
@@ -62,9 +61,8 @@ shelbi agent edit orchestrator
 
 That opens `agents/orchestrator/instructions.md` in `$EDITOR` (and
 materializes the shipped default first if you haven't touched it
-yet). The file is plain markdown with `{{assistant_name}}`
-placeholders. Read it top to bottom before changing anything — the
-comments explain why each section exists.
+yet). The file is plain markdown. Read it top to bottom before changing
+anything — the comments explain why each section exists.
 
 ## What to keep when you fork
 
@@ -238,10 +236,9 @@ ask for the report you actually want.
   </Step>
 </Steps>
 
-The composed prompt (preamble + instructions, `{{assistant_name}}`
-substituted) is written to `~/.shelbi/projects/<name>/CLAUDE.md` on
-every `shelbi reload` — read that file to see exactly what the runner
-loads.
+The composed prompt (preamble + instructions) is written to
+`~/.shelbi/projects/<name>/CLAUDE.md` on every `shelbi reload` — read
+that file to see exactly what the runner loads.
 
 `shelbi reload` respawns the sidebar, Tasks, and Review panes against the
 new config without restarting workspaces or losing chat history. It does

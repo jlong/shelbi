@@ -21,6 +21,13 @@ they earn their keep. Newest entry goes first; never reorder older ones.
 
 ### Unreleased
 
+**Orchestrator naming removed.** The onboarding wizard no longer asks you
+to name your assistant, and the `assistant_name` config field is gone. The
+orchestrator prompt now reads *"You are the Orchestrator"* statically —
+there's no `{{assistant_name}}` substitution at render time. The wizard's
+sole phase is project setup, and `~/.shelbi/shelbi.yaml` is now just the
+per-project `last_launched` index.
+
 **Project resolution by reverse-lookup.** Shelbi no longer drops a
 `.shelbi/project` marker into each repo to identify the active project.
 Resolution now scans `~/.shelbi/projects/*.yaml`, collects each project's

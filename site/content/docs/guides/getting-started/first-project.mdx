@@ -45,24 +45,10 @@ The first thing you see is the block-character banner:
 an open-source agent orchestrator for the terminal
 ```
 
-The wizard has two phases. The first names your assistant. The second
-walks one project through setup. Both are idempotent — re-running skips
-anything already on disk.
+The wizard walks one project through setup. It's idempotent — re-running
+skips anything already on disk.
 
-## Phase 1 — Name your assistant
-
-```
-? What should we call your assistant? Orchestrator
-```
-
-The assistant name is the persona the orchestrator presents as in chat.
-Pick whatever you want — `Orchestrator`, `Hal`, your team's mascot. It's
-cosmetic: it changes the prompt header and how the agent refers to itself,
-not how dispatch works.
-
-This prompt fires once per install; later project setups skip it.
-
-## Phase 2 — Project setup
+## Project setup
 
 Each prompt has a sensible default, shown in brackets. Press Enter to
 accept; type to override.
