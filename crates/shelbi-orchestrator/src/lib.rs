@@ -413,7 +413,7 @@ pub fn ensure_dashboard(project_name: &str) -> Result<BootstrapStatus> {
     );
 
     // Install / re-install the palette popup tmux binding using the chord
-    // resolved from `keys.yml` (with this project's overrides applied).
+    // resolved from `keys.yaml` (with this project's overrides applied).
     // Runs on every bootstrap so switching to a project whose override
     // changes the chord rebinds tmux without manual fiddling.
     let _ = apply_palette_binding(&host, project_name, &shelbi_bin);
@@ -482,7 +482,7 @@ pub fn ensure_dashboard(project_name: &str) -> Result<BootstrapStatus> {
     Ok(BootstrapStatus::Started)
 }
 
-/// Resolve the palette-open chord from the user's keys.yml (with this
+/// Resolve the palette-open chord from the user's keys.yaml (with this
 /// project's overrides applied) and install it as a tmux `bind-key`. The
 /// previous binding — read from `~/.shelbi/state.json::tmux_palette_key` —
 /// is unbound first so we don't leave a stale entry behind when the chord
@@ -1048,7 +1048,7 @@ pub fn reload(project_name: &str) -> Result<ReloadReport> {
         ..Default::default()
     };
 
-    // Re-apply the palette tmux binding so reload picks up `keys.yml`
+    // Re-apply the palette tmux binding so reload picks up `keys.yaml`
     // edits without forcing the user to kill + restart the dashboard.
     let _ = apply_palette_binding(&Host::Local, project_name, &shelbi_bin);
 

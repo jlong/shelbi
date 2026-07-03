@@ -230,7 +230,7 @@ mod tests {
     use shelbi_state::keymap::load_keymaps;
 
     /// Load a default `Keymaps` from a temp `$SHELBI_HOME` so a stray
-    /// real `~/.shelbi/keys.yml` can't pollute the test. Caller holds
+    /// real `~/.shelbi/keys.yaml` can't pollute the test. Caller holds
     /// `ENV_LOCK` because we mutate the process env.
     fn fresh_keymaps() -> Keymaps {
         let home = std::env::temp_dir().join(format!(
@@ -455,7 +455,7 @@ mod tests {
         std::env::set_var("SHELBI_HOME", &home);
 
         std::fs::write(
-            home.join("keys.yml"),
+            home.join("keys.yaml"),
             "defaults:\n  kanban:\n    move_card_left: alt-h\n",
         )
         .unwrap();

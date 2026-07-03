@@ -175,7 +175,7 @@ pub fn run_main(project_name: &str) -> Result<()> {
 /// Run the minimal ratatui sidebar in the current pane.
 pub fn run_sidebar(project_name: &str) -> Result<()> {
     // Load merged keymaps once — embedded builtins, then
-    // `~/.shelbi/keys.yml::defaults`, then `projects.<project_name>`.
+    // `~/.shelbi/keys.yaml::defaults`, then `projects.<project_name>`.
     // Diagnostics route through `tracing` so they land in
     // `~/.shelbi/logs/tui.log` instead of fighting ratatui for the pane
     // TTY (eprintln! into the alt-screen pane interleaves with the
@@ -197,7 +197,7 @@ pub fn run_sidebar(project_name: &str) -> Result<()> {
     // launches with a working binding on cooperative terminals.
     let probe_chord = zen_probe::ensure_zen_keymap(&mut term)
         .unwrap_or(shelbi_state::ZenToggleChord::AltZ);
-    // Prefer the keys.yml-resolved chord (so a migrated `zen_toggle`
+    // Prefer the keys.yaml-resolved chord (so a migrated `zen_toggle`
     // shows the right glyph even though `config.yaml` is now at default)
     // and fall back to the probe's answer for chords the four-value
     // [`ZenToggleChord`] enum can't represent.
@@ -223,7 +223,7 @@ pub fn run_sidebar(project_name: &str) -> Result<()> {
 /// the palette. Parent shell wraps invocation in `while true; do …; done`
 /// so an accidental crash respawns instead of leaving an empty pane.
 pub fn run_tasks(project_name: &str) -> Result<()> {
-    // Load `keys.yml` before the alt-screen swap. Diagnostics route
+    // Load `keys.yaml` before the alt-screen swap. Diagnostics route
     // through `tracing` (→ `~/.shelbi/logs/tui.log`) so they can't
     // interleave with ratatui's redraw on the shared pane TTY. Bad
     // config never blocks launch — affected actions fall back to
@@ -250,7 +250,7 @@ pub fn run_tasks(project_name: &str) -> Result<()> {
 /// hidden stash session and swapped in by the palette / sidebar — same
 /// lifecycle as `run_tasks`.
 pub fn run_review(project_name: &str) -> Result<()> {
-    // Load `keys.yml` before the alt-screen swap. Diagnostics route
+    // Load `keys.yaml` before the alt-screen swap. Diagnostics route
     // through `tracing` (→ `~/.shelbi/logs/tui.log`) so they can't
     // interleave with ratatui's redraw on the shared pane TTY. Bad
     // config never blocks launch — affected actions fall back to
@@ -307,7 +307,7 @@ fn restore_terminal<B: ratatui::backend::Backend + std::io::Write>(
     Ok(())
 }
 
-/// Route every keys.yml load diagnostic through `tracing` so the TUI's
+/// Route every keys.yaml load diagnostic through `tracing` so the TUI's
 /// `init_tracing` writer drops them into `~/.shelbi/logs/tui.log`
 /// instead of the shared pane TTY. Direct `eprintln!` after the
 /// alt-screen swap collides with ratatui's redraw cycle and corrupts
@@ -320,12 +320,12 @@ fn log_keymap_diagnostics(diags: &[shelbi_state::keymap::KeymapDiagnostic]) -> u
     for d in diags {
         match d {
             KeymapDiagnostic::Error { message, location, .. } => match location {
-                Some(loc) => tracing::error!("keys.yml error: {message} (at {loc})"),
-                None => tracing::error!("keys.yml error: {message}"),
+                Some(loc) => tracing::error!("keys.yaml error: {message} (at {loc})"),
+                None => tracing::error!("keys.yaml error: {message}"),
             },
             KeymapDiagnostic::Warning { message, location, .. } => match location {
-                Some(loc) => tracing::warn!("keys.yml warning: {message} (at {loc})"),
-                None => tracing::warn!("keys.yml warning: {message}"),
+                Some(loc) => tracing::warn!("keys.yaml warning: {message} (at {loc})"),
+                None => tracing::warn!("keys.yaml warning: {message}"),
             },
         }
     }
@@ -389,7 +389,7 @@ mod tests {
 
     /// Regression for the startup-warnings-interleave bug. The sidebar
     /// must render its three nav labels (`💬 Chat`, `📋 Tasks`,
-    /// `⚡ Activity`) uninterrupted even when a keys.yml load produced
+    /// `⚡ Activity`) uninterrupted even when a keys.yaml load produced
     /// warnings. The pre-fix code `eprintln!`'d after the alt-screen
     /// swap and the diagnostic text landed mid-label; the new path
     /// routes diagnostics to `tracing` and surfaces a count in the
@@ -398,7 +398,7 @@ mod tests {
     fn sidebar_nav_labels_render_uninterrupted_with_startup_warnings() {
         let diags = vec![
             warning(
-                "config.yaml::keymap.zen_toggle has no keys.yml::default for zen_toggle",
+                "config.yaml::keymap.zen_toggle has no keys.yaml::default for zen_toggle",
                 Some("config.yaml"),
             ),
         ];

@@ -19,7 +19,7 @@
 //! snapshot followed by the handoff-consume block in a single call.
 //!
 //! The legacy `shelbi status list` subcommand — which prints the
-//! project's status catalogue from `workflows/statuses.yml` — is kept
+//! project's status catalogue from `workflows/statuses.yaml` — is kept
 //! for backwards compatibility. It's disjoint from the flag-driven
 //! snapshot path.
 
@@ -60,7 +60,7 @@ const CRASH_EVENT_MAX_AGE_SECS: i64 = 6 * 60 * 60;
 #[derive(Debug, Subcommand)]
 pub enum StatusCmd {
     /// Print the canonical status list — order, id, name, category —
-    /// from `workflows/statuses.yml`. Order here is the left-to-right
+    /// from `workflows/statuses.yaml`. Order here is the left-to-right
     /// column order used by every view in the project.
     List,
 }
@@ -439,7 +439,7 @@ mod tests {
         let _g = TEST_LOCK.lock().unwrap();
         let home = fresh_home();
         std::env::set_var("SHELBI_HOME", &home);
-        // No statuses.yml on disk — loader falls back to the built-in
+        // No statuses.yaml on disk — loader falls back to the built-in
         // default and `list` should still print without erroring.
         list("p").unwrap();
         std::env::remove_var("SHELBI_HOME");

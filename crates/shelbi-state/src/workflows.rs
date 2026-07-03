@@ -4,7 +4,7 @@
 //!
 //! Workflows live at `~/.shelbi/projects/<project>/workflows/<name>.yaml`.
 //! Per-project **status identity** (id, name, category, declared order)
-//! lives in a sibling `workflows/statuses.yml`; each workflow file
+//! lives in a sibling `workflows/statuses.yaml`; each workflow file
 //! references those ids and adds workflow-scoped fields (owner +
 //! optional agent). The loader joins the two on read.
 //!
@@ -24,11 +24,11 @@
 //! skip the check — the workflow loads as-is and the next `shelbi
 //! reload` materializes the defaults.
 //!
-//! ## statuses.yml requirement
+//! ## statuses.yaml requirement
 //!
-//! `workflows/statuses.yml` is the project-wide source of truth for
+//! `workflows/statuses.yaml` is the project-wide source of truth for
 //! status identity (id, name, category, ordering). Whenever at least
-//! one workflow file is on disk, the loader requires `statuses.yml`
+//! one workflow file is on disk, the loader requires `statuses.yaml`
 //! and hard-fails when it's missing — `shelbi init` and `shelbi
 //! reload` materialize the shipped default, so the user fix is "run
 //! one of those" rather than hand-editing.
@@ -37,7 +37,7 @@
 //! (`id` + `owner` + optional `agent`). An inline `name:` or
 //! `category:` under a `statuses:` entry — the pre-Phase-1 form
 //! supported in a prior release — is rejected at parse time with a
-//! pointer to move identity into `statuses.yml`.
+//! pointer to move identity into `statuses.yaml`.
 //!
 //! ## Legacy migration warnings
 //!
@@ -77,17 +77,40 @@ pub fn workflow_path(project: &str, name: &str) -> Result<PathBuf> {
 }
 
 /// On-disk path of the project-wide status catalogue:
-/// `~/.shelbi/projects/<project>/workflows/statuses.yml`.
+/// `~/.shelbi/projects/<project>/workflows/statuses.yaml`. This is the
+/// canonical write path — reads go through [`statuses_read_path`], which
+/// also accepts a legacy `.yml`.
 pub fn statuses_path(project: &str) -> Result<PathBuf> {
-    Ok(workflows_dir(project)?.join("statuses.yml"))
+    Ok(workflows_dir(project)?.join("statuses.yaml"))
 }
 
-/// Load and validate the project's `statuses.yml`. Returns
+/// Effective path to *read* the project's status catalogue. Prefers the
+/// canonical `statuses.yaml`; falls back to a legacy `statuses.yml` when
+/// only that is present — a project that predates the `.yaml`
+/// standardization and hasn't been migrated yet. The normal load path
+/// renames `.yml` → `.yaml` (via `migrate_statuses_extension` in
+/// [`crate::load_project`]), so this fallback is transient; it only
+/// matters for a reader that runs before that migration. Returns the
+/// canonical `.yaml` path when neither file exists so "missing" is
+/// reported against the extension shelbi actually writes.
+fn statuses_read_path(project: &str) -> Result<PathBuf> {
+    let canonical = statuses_path(project)?;
+    if canonical.exists() {
+        return Ok(canonical);
+    }
+    let legacy = workflows_dir(project)?.join("statuses.yml");
+    if legacy.exists() {
+        return Ok(legacy);
+    }
+    Ok(canonical)
+}
+
+/// Load and validate the project's `statuses.yaml`. Returns
 /// [`default_project_statuses`] when the file is missing — callers
 /// that need the strict "must exist" semantic should probe
 /// [`statuses_path`] themselves before calling.
 pub fn load_project_statuses(project: &str) -> Result<ProjectStatuses> {
-    let path = statuses_path(project)?;
+    let path = statuses_read_path(project)?;
     // Read unconditionally and map only NotFound to the default — an
     // `exists()` probe also reports false on EACCES/ELOOP, which would
     // make a transiently unreadable file look missing.
@@ -103,14 +126,14 @@ pub fn load_project_statuses(project: &str) -> Result<ProjectStatuses> {
     Ok(statuses)
 }
 
-/// Atomic write of `statuses.yml` for `project`. Creates the workflows/
+/// Atomic write of `statuses.yaml` for `project`. Creates the workflows/
 /// dir on demand.
 pub fn save_project_statuses(project: &str, statuses: &ProjectStatuses) -> Result<()> {
     let path = statuses_path(project)?;
     atomic_write(&path, serde_yaml::to_string(statuses)?.as_bytes())
 }
 
-/// Write the self-documenting default `statuses.yml` for a fresh project —
+/// Write the self-documenting default `statuses.yaml` for a fresh project —
 /// the canonical six statuses plus a docs-linked header and a commented
 /// example for adding custom statuses (see
 /// [`shelbi_core::scaffold::default_statuses_yaml`]). Used by `shelbi init`;
@@ -124,13 +147,13 @@ pub fn scaffold_project_statuses(project: &str) -> Result<()> {
 
 /// Load and validate a single workflow by name. Errors if the file is
 /// missing, the YAML doesn't pass [`Workflow::validate`], the file
-/// still carries pre-statuses.yml inline identity fields, the project's
-/// `workflows/statuses.yml` is missing, or any `agent:` reference fails
+/// still carries pre-statuses.yaml inline identity fields, the project's
+/// `workflows/statuses.yaml` is missing, or any `agent:` reference fails
 /// the agents-directory existence check. The file's basename is *not*
 /// substituted for the workflow's declared `name:` — callers that need
 /// that contract should compare after loading.
 ///
-/// Resolves the workflow against the project's `statuses.yml`, which
+/// Resolves the workflow against the project's `statuses.yaml`, which
 /// must exist (the post-Phase-1 contract). `shelbi init` and `shelbi
 /// reload` materialize the shipped default when missing.
 pub fn load_workflow(project: &str, name: &str) -> Result<Workflow> {
@@ -146,7 +169,7 @@ pub fn load_workflow(project: &str, name: &str) -> Result<Workflow> {
         Workflow::from_yaml_str_with_diagnostics(&text).map_err(|e| annotate(&path, e))?;
     emit_deprecation_warnings_once(&path, &diags);
 
-    let st_path = statuses_path(project)?;
+    let st_path = statuses_read_path(project)?;
     if !st_path.exists() {
         return Err(missing_statuses_error(&st_path));
     }
@@ -167,12 +190,12 @@ pub fn load_workflow(project: &str, name: &str) -> Result<Workflow> {
 /// 1. The `workflows/` directory does not exist (legacy projects), or
 /// 2. The directory exists but contains no `*.yaml` files.
 ///
-/// **`statuses.yml` required.** Once at least one workflow file is on
-/// disk, the loader requires `workflows/statuses.yml`. Missing →
+/// **`statuses.yaml` required.** Once at least one workflow file is on
+/// disk, the loader requires `workflows/statuses.yaml`. Missing →
 /// hard-fail with a pointer to `shelbi init` / `shelbi reload`. A
 /// workflow file that still carries inline `name:` / `category:` under
 /// `statuses:` is rejected at parse time with a pointer to move
-/// identity into `statuses.yml`.
+/// identity into `statuses.yaml`.
 ///
 /// **Per-file isolation.** A malformed individual workflow file is
 /// *skipped* with a loud, deduped warning (via the shared parse-warn
@@ -184,7 +207,7 @@ pub fn load_workflow(project: &str, name: &str) -> Result<Workflow> {
 /// contract for a *named* workflow use [`load_workflow`], which still
 /// hard-errors.
 ///
-/// Project-wide faults — a missing or unparseable `statuses.yml` —
+/// Project-wide faults — a missing or unparseable `statuses.yaml` —
 /// remain hard errors, because they invalidate *every* workflow, not
 /// just one file. When every workflow file on disk is broken the loader
 /// degrades to [`default_workflow()`] (after warning on each) so the
@@ -200,7 +223,7 @@ pub fn list_workflows(project: &str) -> Result<Vec<Workflow>> {
         return Ok(vec![default_workflow()]);
     }
 
-    let st_path = dir.join("statuses.yml");
+    let st_path = statuses_read_path(project)?;
     if !st_path.exists() {
         return Err(missing_statuses_error(&st_path));
     }
@@ -307,8 +330,9 @@ fn read_raw_workflow_files(dir: &Path) -> Result<Vec<RawWorkflowFile>> {
         if path.extension().and_then(|e| e.to_str()) != Some("yaml") {
             continue;
         }
-        // statuses.yml uses the `.yml` extension; defensive filter in
-        // case a project author renames it to `.yaml`.
+        // `statuses.yaml` is the project-wide status catalogue, not a
+        // workflow file — it shares the `.yaml` extension, so exclude it
+        // here by name.
         if path.file_name().and_then(|s| s.to_str()) == Some("statuses.yaml") {
             continue;
         }
@@ -338,7 +362,7 @@ fn mixed_form_error(path: &Path, inline: &[shelbi_core::InlineIdentityField]) ->
     }
     Error::InvalidWorkflow(format!(
         "{} carries inline status identity — \
-         workflows/statuses.yml is the source of truth for `name:` and `category:`. \
+         workflows/statuses.yaml is the source of truth for `name:` and `category:`. \
          Remove the following inline fields:\n{}",
         path.display(),
         diff,
@@ -347,7 +371,7 @@ fn mixed_form_error(path: &Path, inline: &[shelbi_core::InlineIdentityField]) ->
 
 fn missing_statuses_error(path: &Path) -> Error {
     Error::InvalidWorkflow(format!(
-        "{} is missing — `workflows/statuses.yml` is the project-wide source of truth \
+        "{} is missing — `workflows/statuses.yaml` is the project-wide source of truth \
          for status identity. Run `shelbi init --project <name>` or `shelbi reload` \
          to materialize the shipped default.",
         path.display(),
@@ -436,7 +460,7 @@ fn emit_deprecation_warnings_once(path: &Path, diags: &[String]) {
     }
 }
 
-/// Process-local memo of `statuses.yml` paths whose category-coherence
+/// Process-local memo of `statuses.yaml` paths whose category-coherence
 /// warnings have already been emitted — same once-per-process dedupe as
 /// [`EMITTED_DEPRECATIONS`], so a polling TUI doesn't spam the log.
 static EMITTED_STATUS_WARNINGS: Mutex<Option<HashSet<PathBuf>>> = Mutex::new(None);
@@ -530,7 +554,7 @@ mod tests {
         std::fs::write(dir.join(format!("{name}.yaml")), yaml).unwrap();
     }
 
-    /// Materialize the shipped default `statuses.yml` for `project` —
+    /// Materialize the shipped default `statuses.yaml` for `project` —
     /// every test that exercises [`list_workflows`] / [`load_workflow`]
     /// past the directory-empty fallback needs it on disk.
     fn write_default_statuses(project: &str) {
@@ -549,7 +573,7 @@ mod tests {
 
     /// Reference-form workflow that picks a subset of the default
     /// statuses. The post-Phase-3 on-disk shape — `id` + `owner` +
-    /// optional `agent`, with identity coming from `statuses.yml`.
+    /// optional `agent`, with identity coming from `statuses.yaml`.
     const SIMPLE_WORKFLOW: &str = r#"
 name: design-review
 description: A subset of the default catalogue.
@@ -586,7 +610,7 @@ statuses:
         let home = fresh_home();
         std::env::set_var("SHELBI_HOME", &home);
         let path = statuses_path("myapp").unwrap();
-        assert_eq!(path, home.join("projects/myapp/workflows/statuses.yml"));
+        assert_eq!(path, home.join("projects/myapp/workflows/statuses.yaml"));
         std::env::remove_var("SHELBI_HOME");
     }
 
@@ -723,7 +747,7 @@ statuses:
 
     #[test]
     fn load_project_statuses_propagates_non_notfound_read_errors() {
-        // F13: a directory squatting on statuses.yml (EISDIR) must be an
+        // F13: a directory squatting on statuses.yaml (EISDIR) must be an
         // error, not silently mapped to the shipped defaults.
         let _g = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let home = fresh_home();
@@ -804,7 +828,7 @@ statuses:
     #[test]
     fn list_workflows_hard_fails_when_statuses_yml_missing() {
         // Acceptance criterion: once at least one workflow file is on
-        // disk, the loader requires `statuses.yml`. The error must
+        // disk, the loader requires `statuses.yaml`. The error must
         // point the user at the init/reload escape hatch rather than
         // expecting them to hand-author the file.
         let _g = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
@@ -815,10 +839,10 @@ statuses:
         write_workflow(&dir, "default", SIMPLE_WORKFLOW);
         let err = list_workflows("p").unwrap_err();
         let msg = err.to_string();
-        assert!(msg.contains("statuses.yml"), "msg: {msg}");
+        assert!(msg.contains("statuses.yaml"), "msg: {msg}");
         assert!(msg.contains("shelbi init") || msg.contains("shelbi reload"), "msg: {msg}");
         // No file was materialized as a side effect.
-        assert!(!statuses_path("p").unwrap().exists(), "loader must not auto-create statuses.yml");
+        assert!(!statuses_path("p").unwrap().exists(), "loader must not auto-create statuses.yaml");
         std::env::remove_var("SHELBI_HOME");
     }
 
@@ -857,7 +881,7 @@ statuses:
         write_workflow(&dir, "default", SIMPLE_WORKFLOW);
         let err = load_workflow("p", "default").unwrap_err();
         let msg = err.to_string();
-        assert!(msg.contains("statuses.yml"), "msg: {msg}");
+        assert!(msg.contains("statuses.yaml"), "msg: {msg}");
         assert!(msg.contains("shelbi init") || msg.contains("shelbi reload"), "msg: {msg}");
         std::env::remove_var("SHELBI_HOME");
     }
@@ -1020,7 +1044,7 @@ statuses:
     }
 
     // ---------------------------------------------------------------------
-    // statuses.yml validation
+    // statuses.yaml validation
 
     #[test]
     fn statuses_yml_round_trips_through_parser() {
@@ -1110,9 +1134,9 @@ statuses:
     #[test]
     fn loader_rejects_inline_form_even_when_statuses_yml_missing() {
         // Acceptance criterion: an inline-form workflow file is
-        // rejected at parse time regardless of whether statuses.yml
+        // rejected at parse time regardless of whether statuses.yaml
         // exists. The error directs the user to move identity to
-        // workflows/statuses.yml — no auto-migration runs.
+        // workflows/statuses.yaml — no auto-migration runs.
         let _g = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let home = fresh_home();
         std::env::set_var("SHELBI_HOME", &home);
@@ -1129,11 +1153,11 @@ statuses:
         let err = load_workflow("p", "mixed").unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("inline status identity"), "msg: {msg}");
-        assert!(msg.contains("workflows/statuses.yml"), "msg: {msg}");
-        // No statuses.yml was generated from the inline content.
+        assert!(msg.contains("workflows/statuses.yaml"), "msg: {msg}");
+        // No statuses.yaml was generated from the inline content.
         assert!(
             !statuses_path("p").unwrap().exists(),
-            "loader must not synthesize statuses.yml from inline content"
+            "loader must not synthesize statuses.yaml from inline content"
         );
         std::env::remove_var("SHELBI_HOME");
     }

@@ -513,7 +513,7 @@ mod tests {
         let home = fresh_home();
         std::env::set_var("SHELBI_HOME", &home);
         materialize_defaults("p");
-        // The workflow loader requires `statuses.yml` to be present —
+        // The workflow loader requires `statuses.yaml` to be present —
         // stand in for the `shelbi init` / `shelbi reload` step.
         shelbi_state::save_project_statuses(
             "p",

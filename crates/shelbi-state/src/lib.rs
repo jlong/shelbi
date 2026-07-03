@@ -215,7 +215,7 @@ fn migrate_workspace_settings_template(project_dir: &Path) {
 ///
 /// Companion to [`migrate_default_statuses`] — the on-disk form is the
 /// post-split reference-only shape (id + owner + optional agent), with
-/// status identity (id, name, category) living in `statuses.yml`.
+/// status identity (id, name, category) living in `statuses.yaml`.
 fn migrate_default_workflow(project_dir: &Path) {
     let path = project_dir.join("workflows").join("default.yaml");
     if path.exists() {
@@ -227,19 +227,19 @@ fn migrate_default_workflow(project_dir: &Path) {
     let _ = atomic_write(&path, yaml.as_bytes());
 }
 
-/// One-shot migration companion: write `workflows/statuses.yml` if
+/// One-shot migration companion: write `workflows/statuses.yaml` if
 /// missing. The file is the project-wide source of truth for status
 /// identity (id, name, category, ordering); workflow YAMLs reference
 /// ids declared here and add per-workflow owner/agent.
 ///
 /// Idempotent and best-effort, same semantics as
 /// [`migrate_default_workflow`]. The workflow loader requires
-/// `statuses.yml` to be present whenever workflow files exist — this
+/// `statuses.yaml` to be present whenever workflow files exist — this
 /// helper is what `shelbi init` / `shelbi reload` (via `load_project`)
 /// call to satisfy that contract for existing projects that pre-date
 /// the file.
 fn migrate_default_statuses(project_dir: &Path) {
-    let path = project_dir.join("workflows").join("statuses.yml");
+    let path = project_dir.join("workflows").join("statuses.yaml");
     if path.exists() {
         return;
     }
@@ -247,6 +247,45 @@ fn migrate_default_statuses(project_dir: &Path) {
         return;
     };
     let _ = atomic_write(&path, yaml.as_bytes());
+}
+
+/// One-shot rename of a legacy `workflows/statuses.yml` to the canonical
+/// `workflows/statuses.yaml`. Shelbi standardized every config file on the
+/// `.yaml` extension; this converts a project written by a
+/// pre-standardization binary in place, so the loader reads and writes
+/// only `.yaml` afterward.
+///
+/// Safety: renames only when the legacy `.yml` exists **and** the
+/// canonical `.yaml` does not — it never clobbers a `.yaml` a newer binary
+/// already wrote, and `fs::rename` is atomic so user data is never dropped.
+/// When both files are present the legacy `.yml` is left untouched and a
+/// warning is logged so the user can reconcile by hand. Best-effort and
+/// idempotent, mirroring [`migrate_default_statuses`]; runs before it in
+/// [`load_project`] so a freshly renamed `.yaml` short-circuits the
+/// default-materialization step.
+fn migrate_statuses_extension(project_dir: &Path) {
+    let workflows = project_dir.join("workflows");
+    let legacy = workflows.join("statuses.yml");
+    if !legacy.exists() {
+        return;
+    }
+    let canonical = workflows.join("statuses.yaml");
+    if canonical.exists() {
+        tracing::warn!(
+            "both {} and {} exist — leaving the legacy `.yml` in place; \
+             shelbi reads `statuses.yaml`. Remove the stale `.yml` to silence this.",
+            legacy.display(),
+            canonical.display(),
+        );
+        return;
+    }
+    if let Err(e) = fs::rename(&legacy, &canonical) {
+        tracing::warn!(
+            "failed to migrate {} to {}: {e}",
+            legacy.display(),
+            canonical.display(),
+        );
+    }
 }
 
 /// Render the workspace settings JSON for `project`: read the template file
@@ -498,12 +537,16 @@ pub fn load_project(project: &str) -> Result<Project> {
     p.validate_workspaces()?;
     let repo = p.repo.clone();
     p.detect_shapes(repo);
-    // Best-effort: drop workflows/default.yaml and workflows/statuses.yml
-    // into the project directory on first load. Idempotent — see
-    // migrate_default_workflow / migrate_default_statuses. After this
-    // runs, the workflow loader's "statuses.yml must exist" contract
-    // holds for any subsequent open of this project.
+    // Best-effort, on first load: rename a legacy `workflows/statuses.yml`
+    // to the canonical `.yaml`, then drop workflows/default.yaml and
+    // workflows/statuses.yaml into the project directory. All idempotent —
+    // see migrate_statuses_extension / migrate_default_workflow /
+    // migrate_default_statuses. The rename runs first so a converted file
+    // short-circuits the default materialization. After this runs, the
+    // workflow loader's "statuses.yaml must exist" contract holds for any
+    // subsequent open of this project.
     if let Ok(dir) = project_dir(&p.name) {
+        migrate_statuses_extension(&dir);
         migrate_default_workflow(&dir);
         migrate_default_statuses(&dir);
     }
@@ -3755,16 +3798,16 @@ mod tests {
         let path = dir.join("workflows/default.yaml");
         assert!(path.exists(), "default.yaml should be created");
         // The on-disk form is post-migration (id + owner + agent only).
-        // Resolve it against the freshly written statuses.yml before
+        // Resolve it against the freshly written statuses.yaml before
         // comparing to the canonical default.
         let text = std::fs::read_to_string(&path).unwrap();
         let st_text =
-            std::fs::read_to_string(dir.join("workflows/statuses.yml")).unwrap();
+            std::fs::read_to_string(dir.join("workflows/statuses.yaml")).unwrap();
         let statuses = shelbi_core::ProjectStatuses::from_yaml_str(&st_text).unwrap();
         let parsed = shelbi_core::Workflow::from_yaml_str(&text)
             .expect("created default.yaml should round-trip through the workflow parser")
             .resolve_against(&statuses)
-            .expect("resolved workflow validates against statuses.yml");
+            .expect("resolved workflow validates against statuses.yaml");
         assert_eq!(parsed, default_workflow());
         std::env::remove_var("SHELBI_HOME");
     }
@@ -3776,11 +3819,11 @@ mod tests {
         std::env::set_var("SHELBI_HOME", &home);
         let dir = home.join("projects/myapp");
         migrate_default_statuses(&dir);
-        let path = dir.join("workflows/statuses.yml");
-        assert!(path.exists(), "statuses.yml should be created");
+        let path = dir.join("workflows/statuses.yaml");
+        assert!(path.exists(), "statuses.yaml should be created");
         let text = std::fs::read_to_string(&path).unwrap();
         let parsed = shelbi_core::ProjectStatuses::from_yaml_str(&text)
-            .expect("statuses.yml should parse");
+            .expect("statuses.yaml should parse");
         assert_eq!(parsed, default_project_statuses());
         std::env::remove_var("SHELBI_HOME");
     }
@@ -3791,11 +3834,92 @@ mod tests {
         let home = fresh_home();
         std::env::set_var("SHELBI_HOME", &home);
         let dir = home.join("projects/myapp");
-        let path = dir.join("workflows/statuses.yml");
+        let path = dir.join("workflows/statuses.yaml");
         ensure_dir(path.parent().unwrap()).unwrap();
         std::fs::write(&path, "statuses: []\n").unwrap();
         migrate_default_statuses(&dir);
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "statuses: []\n");
+        std::env::remove_var("SHELBI_HOME");
+    }
+
+    #[test]
+    fn migrate_statuses_extension_renames_legacy_yml_to_yaml() {
+        let _g = TEST_LOCK.lock().unwrap();
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+        let dir = home.join("projects/myapp");
+        let legacy = dir.join("workflows/statuses.yml");
+        ensure_dir(legacy.parent().unwrap()).unwrap();
+        std::fs::write(&legacy, "statuses: []\n").unwrap();
+
+        migrate_statuses_extension(&dir);
+
+        let canonical = dir.join("workflows/statuses.yaml");
+        assert!(!legacy.exists(), "legacy .yml should be gone after rename");
+        assert!(canonical.exists(), ".yaml should exist after rename");
+        assert_eq!(
+            std::fs::read_to_string(&canonical).unwrap(),
+            "statuses: []\n",
+            "content preserved verbatim across the rename"
+        );
+        // Idempotent: a second pass with no legacy file is a clean no-op.
+        migrate_statuses_extension(&dir);
+        assert!(canonical.exists());
+        std::env::remove_var("SHELBI_HOME");
+    }
+
+    #[test]
+    fn migrate_statuses_extension_leaves_legacy_yml_when_yaml_exists() {
+        let _g = TEST_LOCK.lock().unwrap();
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+        let dir = home.join("projects/myapp");
+        let workflows = dir.join("workflows");
+        ensure_dir(&workflows).unwrap();
+        let legacy = workflows.join("statuses.yml");
+        let canonical = workflows.join("statuses.yaml");
+        std::fs::write(&legacy, "statuses: [legacy]\n").unwrap();
+        std::fs::write(&canonical, "statuses: [canonical]\n").unwrap();
+
+        // Both present: never delete user data — leave both untouched (logged).
+        migrate_statuses_extension(&dir);
+
+        assert_eq!(
+            std::fs::read_to_string(&legacy).unwrap(),
+            "statuses: [legacy]\n",
+            "legacy .yml must be left untouched when .yaml already exists"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&canonical).unwrap(),
+            "statuses: [canonical]\n",
+            "existing .yaml must not be clobbered"
+        );
+        std::env::remove_var("SHELBI_HOME");
+    }
+
+    #[test]
+    fn load_project_migrates_legacy_statuses_yml_and_loads() {
+        let _g = TEST_LOCK.lock().unwrap();
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+        let p = fixture_project("myapp", None);
+        save_project(&p).unwrap();
+        // Seed a pre-standardization project: statuses under the legacy .yml.
+        let workflows = home.join("projects/myapp/workflows");
+        ensure_dir(&workflows).unwrap();
+        let legacy = workflows.join("statuses.yml");
+        let yaml = shelbi_core::scaffold::default_statuses_yaml().unwrap();
+        std::fs::write(&legacy, &yaml).unwrap();
+
+        load_project("myapp").unwrap();
+
+        let canonical = workflows.join("statuses.yaml");
+        assert!(!legacy.exists(), "legacy .yml should be renamed away on load");
+        assert!(canonical.exists(), "canonical .yaml should exist after load");
+        // The renamed file is the loadable status catalogue (not the
+        // default-materializer's fresh copy — same content, verified via load).
+        let statuses = load_project_statuses("myapp").unwrap();
+        assert_eq!(statuses, default_project_statuses());
         std::env::remove_var("SHELBI_HOME");
     }
 

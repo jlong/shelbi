@@ -34,7 +34,7 @@ use crate::{expand_tilde_path, expand_tilde_str, project_dir, shelbi_home};
 /// | `workflows_dir`                     | `~/.shelbi/projects/<name>/workflows/`      | `<repo>/.shelbi/workflows/`         |
 /// | `agents_dir`                        | `~/.shelbi/projects/<name>/agents/`         | `<repo>/.shelbi/agents/`            |
 /// | `workspace_settings_template_path`  | `~/.shelbi/projects/<name>/workspace-…`     | `<repo>/.shelbi/workspace-…`        |
-/// | `statuses_yml_path`                 | `~/.shelbi/projects/<name>/workflows/…`     | `<repo>/.shelbi/workflows/…`        |
+/// | `statuses_yaml_path`                | `~/.shelbi/projects/<name>/workflows/…`     | `<repo>/.shelbi/workflows/…`        |
 /// | `state_json_path`                   | `~/.shelbi/projects/<name>/state.json`      | *same*                              |
 /// | `tasks_dir`                         | `~/.shelbi/projects/<name>/tasks/`          | *same*                              |
 /// | `handoff_md_path`                   | `~/.shelbi/projects/<name>/HANDOFF.md`      | *same*                              |
@@ -67,8 +67,8 @@ pub trait ProjectPaths {
     /// `<config_root>/agents/`.
     fn agents_dir(&self) -> Result<PathBuf>;
 
-    /// `<config_root>/workflows/statuses.yml`.
-    fn statuses_yml_path(&self) -> Result<PathBuf>;
+    /// `<config_root>/workflows/statuses.yaml`.
+    fn statuses_yaml_path(&self) -> Result<PathBuf>;
 
     /// `<config_root>/workspace-settings.json.template`, unless the
     /// project's `workspace_settings_template` override is set — in
@@ -121,8 +121,8 @@ impl ProjectPaths for Project {
         Ok(self.config_root()?.join("agents"))
     }
 
-    fn statuses_yml_path(&self) -> Result<PathBuf> {
-        Ok(self.workflows_dir()?.join("statuses.yml"))
+    fn statuses_yaml_path(&self) -> Result<PathBuf> {
+        Ok(self.workflows_dir()?.join("statuses.yaml"))
     }
 
     fn workspace_settings_template_path(&self) -> Result<PathBuf> {
@@ -396,8 +396,8 @@ mod tests {
             assert_eq!(p.workflows_dir().unwrap(), home.join("projects/myapp/workflows"));
             assert_eq!(p.agents_dir().unwrap(), home.join("projects/myapp/agents"));
             assert_eq!(
-                p.statuses_yml_path().unwrap(),
-                home.join("projects/myapp/workflows/statuses.yml"),
+                p.statuses_yaml_path().unwrap(),
+                home.join("projects/myapp/workflows/statuses.yaml"),
             );
             assert_eq!(
                 p.workspace_settings_template_path().unwrap(),
@@ -419,8 +419,8 @@ mod tests {
         assert_eq!(p.workflows_dir().unwrap(), repo.join(".shelbi/workflows"));
         assert_eq!(p.agents_dir().unwrap(), repo.join(".shelbi/agents"));
         assert_eq!(
-            p.statuses_yml_path().unwrap(),
-            repo.join(".shelbi/workflows/statuses.yml"),
+            p.statuses_yaml_path().unwrap(),
+            repo.join(".shelbi/workflows/statuses.yaml"),
         );
         assert_eq!(
             p.workspace_settings_template_path().unwrap(),

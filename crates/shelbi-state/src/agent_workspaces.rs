@@ -772,7 +772,7 @@ fn write_bundled_agent(project: &str, agent: &BundledAgent) -> Result<()> {
     // Atomic (tmp + rename) so a crash mid-`shelbi init` can't leave a
     // truncated `instructions.md` that self-heal later preserves as a
     // "customization" (F8) — the agent would then dispatch with half a
-    // prompt. `atomic_write` is the same sink `status.yaml`/`keys.yml` use.
+    // prompt. `atomic_write` is the same sink `status.yaml`/`keys.yaml` use.
     atomic_write(
         &agent_instructions_path(project, agent.name)?,
         agent.instructions.as_bytes(),

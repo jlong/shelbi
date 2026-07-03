@@ -1,6 +1,6 @@
-//! Project-level status identity, declared in `workflows/statuses.yml`.
+//! Project-level status identity, declared in `workflows/statuses.yaml`.
 //!
-//! `statuses.yml` is the single source of truth for **status identity** in
+//! `statuses.yaml` is the single source of truth for **status identity** in
 //! a project — every workflow file shrinks to declaring only the per-status
 //! `owner` and optional `agent`, referencing this file by `id`. Status
 //! declaration order here is the canonical column order rendered by the
@@ -15,7 +15,7 @@ use serde::{Deserialize, Serialize};
 use crate::workflow::StatusCategory;
 use crate::Error;
 
-/// Top-level shape of `workflows/statuses.yml`.
+/// Top-level shape of `workflows/statuses.yaml`.
 ///
 /// Round-trips through serde; call [`ProjectStatuses::validate`] (or
 /// [`ProjectStatuses::from_yaml_str`]) before trusting the contents.
@@ -28,7 +28,7 @@ pub struct ProjectStatuses {
     pub statuses: Vec<ProjectStatus>,
 }
 
-/// One entry in `statuses.yml` — the project-wide identity of a status.
+/// One entry in `statuses.yaml` — the project-wide identity of a status.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ProjectStatus {
     /// Stable identifier, referenced from every workflow's `statuses:`
@@ -65,22 +65,22 @@ impl ProjectStatuses {
     /// [`ProjectStatuses::category_warnings`] rather than blocking load.
     pub fn validate(&self) -> crate::Result<()> {
         if self.statuses.is_empty() {
-            return Err(invalid("statuses.yml must declare at least one status"));
+            return Err(invalid("statuses.yaml must declare at least one status"));
         }
         let mut seen: HashSet<&str> = HashSet::with_capacity(self.statuses.len());
         for st in &self.statuses {
             if st.id.trim().is_empty() {
-                return Err(invalid("statuses.yml: status id must not be empty"));
+                return Err(invalid("statuses.yaml: status id must not be empty"));
             }
             if st.name.trim().is_empty() {
                 return Err(invalid(format!(
-                    "statuses.yml: status `{}`: name must not be empty",
+                    "statuses.yaml: status `{}`: name must not be empty",
                     st.id
                 )));
             }
             if !seen.insert(st.id.as_str()) {
                 return Err(invalid(format!(
-                    "statuses.yml: duplicate status id `{}`",
+                    "statuses.yaml: duplicate status id `{}`",
                     st.id
                 )));
             }
@@ -93,7 +93,7 @@ impl ProjectStatuses {
         });
         if !has_terminal {
             return Err(invalid(
-                "statuses.yml declares no terminal status — at least one status must \
+                "statuses.yaml declares no terminal status — at least one status must \
                  have category `done` or `archived` so tasks can reach a completed \
                  state",
             ));
@@ -118,7 +118,7 @@ impl ProjectStatuses {
 
         if self.count_category(StatusCategory::Handoff) == 0 {
             out.push(
-                "statuses.yml declares no `handoff` status — the Zen merge probe and \
+                "statuses.yaml declares no `handoff` status — the Zen merge probe and \
                  the TUI review lane will have nothing to act on"
                     .to_string(),
             );
@@ -135,7 +135,7 @@ impl ProjectStatuses {
         ] {
             if self.count_category(cat) > 1 {
                 out.push(format!(
-                    "statuses.yml declares more than one `{cat}` status — generic code \
+                    "statuses.yaml declares more than one `{cat}` status — generic code \
                      (category→column mapping, Zen probe) keys off the first, so the \
                      others are only reachable by their exact id"
                 ));
@@ -168,9 +168,9 @@ impl ProjectStatuses {
     }
 }
 
-/// The canonical six-status default written into `workflows/statuses.yml`
+/// The canonical six-status default written into `workflows/statuses.yaml`
 /// when a fresh project is materialized (or when an existing project on
-/// reload has no `statuses.yml` and no legacy inline workflows to migrate
+/// reload has no `statuses.yaml` and no legacy inline workflows to migrate
 /// from). Matches the wireframe in `Plans/shared-statuses.md` §Wireframes.
 pub fn default_project_statuses() -> ProjectStatuses {
     ProjectStatuses {

@@ -7,7 +7,7 @@
 //!
 //! The enum here is the source of truth for built-in defaults: each
 //! variant carries its display description, its default chord list, and
-//! the mode it belongs to. The `keys.yml` loader iterates [`Action::all`]
+//! the mode it belongs to. The `keys.yaml` loader iterates [`Action::all`]
 //! to seed the embedded layer of the three-layer merge.
 //!
 //! Match arms intentionally avoid macro magic — `grep` for an action name
@@ -107,7 +107,7 @@ pub enum PaletteAction {
 }
 
 /// Lowercase mode names — also the top-level YAML keys under
-/// `keys.yml::defaults` and `keys.yml::projects.<name>`.
+/// `keys.yaml::defaults` and `keys.yaml::projects.<name>`.
 pub const MODE_NAMES: &[&str] = &[
     "global", "sidebar", "kanban", "popover", "review", "activity", "palette",
 ];
@@ -185,7 +185,7 @@ impl Action {
     }
 
     /// Default chord list — what `load_keymaps` installs when the user
-    /// has no `keys.yml`. Each string must parse with [`KeyChord::parse`].
+    /// has no `keys.yaml`. Each string must parse with [`KeyChord::parse`].
     ///
     /// [`KeyChord::parse`]: crate::keymap::KeyChord::parse
     pub fn default_chords(&self) -> &'static [&'static str] {
@@ -273,7 +273,7 @@ impl Action {
         }
     }
 
-    /// snake_case key name as it appears in `keys.yml`. The inverse of
+    /// snake_case key name as it appears in `keys.yaml`. The inverse of
     /// the parser's lookup table — used by emit-side code (round-trip
     /// tests, future `shelbi keys export`).
     pub const fn key_name(&self) -> &'static str {

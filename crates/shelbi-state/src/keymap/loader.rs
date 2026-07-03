@@ -1,15 +1,15 @@
-//! `~/.shelbi/keys.yml` loader and three-layer merge.
+//! `~/.shelbi/keys.yaml` loader and three-layer merge.
 //!
 //! Layers, lowest → highest priority:
 //!
 //! 1. Embedded built-ins from each [`Action::default_chords`].
-//! 2. `keys.yml::defaults.<mode>.<action>` if present.
-//! 3. `keys.yml::projects.<project>.<mode>.<action>` if present.
+//! 2. `keys.yaml::defaults.<mode>.<action>` if present.
+//! 3. `keys.yaml::projects.<project>.<mode>.<action>` if present.
 //!
 //! Before the merge runs, [`load_keymaps`] performs a one-shot migration:
 //! if `config.yaml::keymap.zen_toggle` names a chord other than the
-//! built-in default (and `keys.yml::defaults.global.zen_toggle` isn't
-//! already set), the chord is copied into `keys.yml`, the legacy
+//! built-in default (and `keys.yaml::defaults.global.zen_toggle` isn't
+//! already set), the chord is copied into `keys.yaml`, the legacy
 //! `config.yaml` field is reset, and a one-time migration notice fires.
 //! Subsequent startups are silent because the legacy field is back at its
 //! default.
@@ -39,7 +39,7 @@ use crate::user_config::{load_user_config, save_user_config, ZenToggleChord};
 use crate::{atomic_write, shelbi_home};
 
 /// Filename under `$SHELBI_HOME` for user-authored key overrides.
-pub const KEYS_FILENAME: &str = "keys.yml";
+pub const KEYS_FILENAME: &str = "keys.yaml";
 
 /// Final, merged keymaps for every mode. Constructed by [`load_keymaps`]
 /// from the three-layer merge — callers should treat fields as read-only
@@ -76,17 +76,17 @@ impl<A: Copy + Eq + Hash> Default for ModeKeymap<A> {
 impl Keymaps {
     /// Resolve the Zen Mode toggle chord into the legacy four-value
     /// [`ZenToggleChord`] enum used by the sidebar glyph and palette
-    /// hint. Prefers the keys.yml-resolved binding (so once the legacy
-    /// `config.yaml::keymap.zen_toggle` migrates into keys.yml the glyph
+    /// hint. Prefers the keys.yaml-resolved binding (so once the legacy
+    /// `config.yaml::keymap.zen_toggle` migrates into keys.yaml the glyph
     /// matches what the user actually pressed); falls back to
     /// `legacy_fallback` when the chord doesn't match one of the four
-    /// preset variants (e.g. the user bound `f6` directly in keys.yml)
+    /// preset variants (e.g. the user bound `f6` directly in keys.yaml)
     /// or is unbound entirely.
     ///
     /// The fallback is the chord the caller already read from
     /// `~/.shelbi/config.yaml` (typically via the first-run probe). On
     /// fresh installs that's the right answer; after a successful
-    /// legacy migration the keys.yml lookup wins and the fallback is
+    /// legacy migration the keys.yaml lookup wins and the fallback is
     /// only used for non-preset bindings.
     pub fn zen_toggle_chord(&self, legacy_fallback: ZenToggleChord) -> ZenToggleChord {
         match self.global.first_chord_for(GlobalAction::ZenToggle) {
@@ -169,14 +169,14 @@ pub enum ErrorKind {
 pub enum WarningKind {
     ReservedChordRebind,
     /// Legacy `config.yaml::keymap.zen_toggle` was set but couldn't be
-    /// migrated because `keys.yml::defaults.global.zen_toggle` already
-    /// holds an explicit value. The keys.yml entry wins; the user is
+    /// migrated because `keys.yaml::defaults.global.zen_toggle` already
+    /// holds an explicit value. The keys.yaml entry wins; the user is
     /// asked to remove the legacy field by hand so the two configs stop
     /// disagreeing.
     LegacyZenToggleField,
     /// One-shot migration succeeded: the legacy
     /// `config.yaml::keymap.zen_toggle` chord was written into
-    /// `keys.yml::defaults.global.zen_toggle` and the legacy field was
+    /// `keys.yaml::defaults.global.zen_toggle` and the legacy field was
     /// reset to its default. Emitted once on the migrating startup; the
     /// next load sees the legacy field at its default and stays silent.
     LegacyZenToggleMigrated,
@@ -216,7 +216,7 @@ impl KeymapDiagnostic {
 /// value → chord conversion happens per entry in [`value_to_chords`].
 type ModeMap = HashMap<String, HashMap<String, Value>>;
 
-/// Top-level structure of `keys.yml`. Both blocks are optional so a file
+/// Top-level structure of `keys.yaml`. Both blocks are optional so a file
 /// with just `defaults` or just `projects` still parses.
 #[derive(Debug, Default, Deserialize)]
 struct KeysFile {
@@ -226,7 +226,7 @@ struct KeysFile {
     projects: Option<HashMap<String, ModeMap>>,
 }
 
-/// Convert one raw `keys.yml` value into a chord override. The on-disk
+/// Convert one raw `keys.yaml` value into a chord override. The on-disk
 /// form can be:
 ///
 /// - YAML null → `Ok(None)`: fall back to the layer below (no override).
@@ -281,24 +281,30 @@ fn value_type_name(v: &Value) -> &'static str {
 
 /// Load the merged keymaps for `project_name` (or just `defaults`+builtin
 /// if `None`). Always returns a usable [`Keymaps`]; any errors from the
-/// user's `keys.yml` are reported via the diagnostic list and the
+/// user's `keys.yaml` are reported via the diagnostic list and the
 /// affected actions silently keep their built-in defaults.
 ///
 /// As a side effect, runs the one-shot legacy-zen-toggle migration first
-/// (see [`migrate_legacy_zen_toggle`]). The migration rewrites `keys.yml`
+/// (see [`migrate_legacy_zen_toggle`]). The migration rewrites `keys.yaml`
 /// and `config.yaml` on disk, so subsequent calls observe the migrated
 /// state and stay silent.
 pub fn load_keymaps(project_name: Option<&str>) -> (Keymaps, Vec<KeymapDiagnostic>) {
     let mut diags = Vec::new();
 
-    // One-shot: migrate the legacy config.yaml field into keys.yml before
+    // One-shot: rename a legacy `~/.shelbi/keys.yml` to the canonical
+    // `keys.yaml` before any read below, so the rest of this load — and
+    // the zen-toggle migration that also rewrites the file — observes and
+    // writes only `.yaml`.
+    migrate_keys_extension();
+
+    // One-shot: migrate the legacy config.yaml field into keys.yaml before
     // the merge so the merge picks up the migrated chord on this very
     // call. Emits the migration warning on success — the next startup
     // sees the legacy field at its default and stays silent.
     if let Some(chord) = migrate_legacy_zen_toggle() {
         let msg = format!(
             "migrated config.yaml::keymap.zen_toggle (`{chord}`) into \
-             keys.yml::defaults.global.zen_toggle; the legacy field is no \
+             keys.yaml::defaults.global.zen_toggle; the legacy field is no \
              longer read"
         );
         diags.push(KeymapDiagnostic::warn(
@@ -314,7 +320,7 @@ pub fn load_keymaps(project_name: Option<&str>) -> (Keymaps, Vec<KeymapDiagnosti
         staged.insert(action, action.default_chords().iter().map(|s| s.to_string()).collect());
     }
 
-    // Layer 2/3: load keys.yml if present. Missing file is fine.
+    // Layer 2/3: load keys.yaml if present. Missing file is fine.
     let file = read_keys_file(&mut diags);
 
     if let Some(ref f) = file {
@@ -344,16 +350,16 @@ pub fn load_keymaps(project_name: Option<&str>) -> (Keymaps, Vec<KeymapDiagnosti
 
     // Legacy compat: `config.yaml::keymap.zen_toggle` -> `global.zen_toggle`.
     // Two cases:
-    //   - keys.yml already overrides `defaults.global.zen_toggle`: the
-    //     two configs disagree — keys.yml wins, but emit the deprecation
+    //   - keys.yaml already overrides `defaults.global.zen_toggle`: the
+    //     two configs disagree — keys.yaml wins, but emit the deprecation
     //     warning so the user knows to remove the dead legacy field.
-    //   - keys.yml doesn't override: forward the chord for this load.
+    //   - keys.yaml doesn't override: forward the chord for this load.
     //     (In the common path the migration above already rewrote
-    //     keys.yml so this branch becomes inert on subsequent loads.)
+    //     keys.yaml so this branch becomes inert on subsequent loads.)
     if let Some(legacy) = legacy_zen_toggle_chord() {
         if zen_overridden_in_defaults {
             let warn_msg = "config.yaml::keymap.zen_toggle is deprecated; \
-                 keys.yml::defaults.global.zen_toggle is already set — \
+                 keys.yaml::defaults.global.zen_toggle is already set — \
                  remove the legacy field from config.yaml";
             diags.push(KeymapDiagnostic::warn(
                 WarningKind::LegacyZenToggleField,
@@ -680,7 +686,47 @@ fn global_shadows(chords: &HashMap<Action, Vec<KeyChord>>) -> Vec<(Action, KeyCh
     out
 }
 
-/// Read `~/.shelbi/keys.yml` if it exists. Parse errors get reported as
+/// One-shot rename of a legacy `~/.shelbi/keys.yml` to the canonical
+/// `~/.shelbi/keys.yaml`. Shelbi standardized every config file on the
+/// `.yaml` extension; this converts a file written by a
+/// pre-standardization binary in place so the loader reads and writes
+/// only `.yaml` afterward.
+///
+/// Safety mirrors the project-scoped `migrate_statuses_extension`: rename
+/// only when the legacy `.yml` exists **and** the canonical `.yaml` does
+/// not, so a `.yaml` a newer binary already wrote is never clobbered;
+/// `fs::rename` is atomic so no data is dropped. When both exist the
+/// legacy `.yml` is left in place and a warning is logged. Best-effort and
+/// idempotent — [`load_keymaps`] runs it first so the subsequent read
+/// observes the canonical `.yaml`.
+fn migrate_keys_extension() {
+    let Ok(home) = shelbi_home() else {
+        return;
+    };
+    let legacy = home.join("keys.yml");
+    if !legacy.exists() {
+        return;
+    }
+    let canonical = home.join(KEYS_FILENAME);
+    if canonical.exists() {
+        tracing::warn!(
+            "both {} and {} exist — leaving the legacy `.yml` in place; \
+             shelbi reads `keys.yaml`. Remove the stale `.yml` to silence this.",
+            legacy.display(),
+            canonical.display(),
+        );
+        return;
+    }
+    if let Err(e) = fs::rename(&legacy, &canonical) {
+        tracing::warn!(
+            "failed to migrate {} to {}: {e}",
+            legacy.display(),
+            canonical.display(),
+        );
+    }
+}
+
+/// Read `~/.shelbi/keys.yaml` if it exists. Parse errors get reported as
 /// diagnostics and the caller falls through to built-ins.
 fn read_keys_file(diags: &mut Vec<KeymapDiagnostic>) -> Option<KeysFile> {
     let path = match shelbi_home() {
@@ -716,7 +762,7 @@ fn read_keys_file(diags: &mut Vec<KeymapDiagnostic>) -> Option<KeysFile> {
 
 /// Translate the legacy `config.yaml::keymap.zen_toggle` enum into the
 /// canonical chord string. `None` means the field was at its default
-/// (AltZ — which is also the keys.yml built-in, so the warning would
+/// (AltZ — which is also the keys.yaml built-in, so the warning would
 /// just be noise). The probe stores AltZ when the user accepts the
 /// default, so we treat "default value" as "user didn't actively pick
 /// a fallback".
@@ -733,7 +779,7 @@ fn legacy_zen_toggle_chord() -> Option<String> {
 }
 
 /// One-shot migration: copy a non-default `config.yaml::keymap.zen_toggle`
-/// into `keys.yml::defaults.global.zen_toggle`, then reset the legacy
+/// into `keys.yaml::defaults.global.zen_toggle`, then reset the legacy
 /// `config.yaml` field to its default so subsequent loads stop seeing
 /// the disagreement.
 ///
@@ -742,11 +788,11 @@ fn legacy_zen_toggle_chord() -> Option<String> {
 ///
 /// - Legacy field is at its built-in default (AltZ) or unbound (None).
 ///   Nothing to move.
-/// - `keys.yml::defaults.global.zen_toggle` is already set. The keys.yml
+/// - `keys.yaml::defaults.global.zen_toggle` is already set. The keys.yaml
 ///   value wins; leaving the legacy field to be flagged by the existing
 ///   [`WarningKind::LegacyZenToggleField`] path is the right surface for
 ///   the user to act on manually.
-/// - `keys.yml` exists but is malformed. We don't want to clobber a file
+/// - `keys.yaml` exists but is malformed. We don't want to clobber a file
 ///   we couldn't parse; the loader will report the parse error separately
 ///   and we leave the legacy field as the source of truth.
 /// - Any IO write fails. We fall back to the legacy compat shim so the
@@ -757,7 +803,7 @@ fn migrate_legacy_zen_toggle() -> Option<String> {
     // Step 1: read the legacy field. Bail early on the no-op cases.
     let chord = legacy_zen_toggle_chord()?;
 
-    // Step 2: refuse to migrate when keys.yml exists but is unreadable
+    // Step 2: refuse to migrate when keys.yaml exists but is unreadable
     // or unparseable. The user's hand-authored content matters more than
     // a clean reconciliation; the loader's separate parse-error
     // diagnostic will surface the underlying problem.
@@ -780,7 +826,7 @@ fn migrate_legacy_zen_toggle() -> Option<String> {
     }
 
     // Step 4: splice defaults.global.zen_toggle = <chord> into the
-    // existing keys.yml tree, preserving every other key.
+    // existing keys.yaml tree, preserving every other key.
     let root_map = match root.as_mapping_mut() {
         Some(m) => m,
         None => {
@@ -798,7 +844,7 @@ fn migrate_legacy_zen_toggle() -> Option<String> {
         Value::String(chord.clone()),
     );
 
-    // Step 5: write keys.yml. If serialization or IO fails, bail and
+    // Step 5: write keys.yaml. If serialization or IO fails, bail and
     // leave the legacy field as the runtime source of truth.
     let yaml = serde_yaml::to_string(&root).ok()?;
     atomic_write(&path, yaml.as_bytes()).ok()?;
@@ -808,7 +854,7 @@ fn migrate_legacy_zen_toggle() -> Option<String> {
     // missing config.yaml as "first run" and would otherwise re-prompt
     // the user with the fallback chooser they already escaped from.
     //
-    // If this write fails, keys.yml already has the chord — the next
+    // If this write fails, keys.yaml already has the chord — the next
     // load will re-trigger the migration warning (and retry), but the
     // chord still resolves correctly. Worst case is a repeat notice,
     // not a broken binding.
@@ -828,7 +874,7 @@ enum ReadKeysYml {
     Unreadable,
 }
 
-/// Read keys.yml as an untyped `serde_yaml::Value` so the migration can
+/// Read keys.yaml as an untyped `serde_yaml::Value` so the migration can
 /// mutate it without losing entries it doesn't know about. Missing or
 /// empty file is treated as an empty mapping; parse errors are caller-
 /// visible as `Unreadable` so the migration can refuse to clobber.
@@ -849,7 +895,7 @@ fn read_keys_yml_value(path: &Path) -> ReadKeysYml {
     }
 }
 
-/// Read `defaults.global.zen_toggle` from a parsed keys.yml value, if any
+/// Read `defaults.global.zen_toggle` from a parsed keys.yaml value, if any
 /// value is present (a YAML `null` counts as "explicitly cleared", which
 /// the loader treats as "fall through to a lower layer" — same semantics
 /// as the typed `ChordSpec::None` deserialize path). Returns the raw
@@ -910,7 +956,7 @@ mod tests {
         let (km, diags) = load_keymaps(None);
         assert!(
             diags.is_empty(),
-            "expected no diagnostics with no keys.yml, got {diags:?}"
+            "expected no diagnostics with no keys.yaml, got {diags:?}"
         );
 
         // Spot-check a representative chord from every mode against the
@@ -970,7 +1016,7 @@ mod tests {
         std::env::set_var("SHELBI_HOME", &home);
         ensure_dir(&home).unwrap();
         std::fs::write(
-            home.join("keys.yml"),
+            home.join("keys.yaml"),
             "defaults:\n  sidebar:\n    nav_up: w\n",
         )
         .unwrap();
@@ -1001,13 +1047,79 @@ mod tests {
     }
 
     #[test]
+    fn load_keymaps_migrates_legacy_keys_yml_and_applies_it() {
+        let _g = LOCK.lock().unwrap();
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+        ensure_dir(&home).unwrap();
+        // A pre-standardization user with overrides under the legacy .yml.
+        std::fs::write(
+            home.join("keys.yml"),
+            "defaults:\n  sidebar:\n    nav_up: w\n",
+        )
+        .unwrap();
+
+        let (km, diags) = load_keymaps(None);
+        assert!(diags.is_empty(), "{diags:?}");
+
+        // The file was renamed to the canonical .yaml...
+        assert!(
+            !home.join("keys.yml").exists(),
+            "legacy keys.yml should be renamed away"
+        );
+        assert_eq!(
+            std::fs::read_to_string(home.join("keys.yaml")).unwrap(),
+            "defaults:\n  sidebar:\n    nav_up: w\n",
+            "content preserved across the rename"
+        );
+        // ...and its override took effect on this very load.
+        assert_eq!(
+            km.sidebar.dispatch(KeyEvent::new(KeyCode::Char('w'), KeyModifiers::NONE)),
+            Some(SidebarAction::NavUp)
+        );
+
+        std::env::remove_var("SHELBI_HOME");
+    }
+
+    #[test]
+    fn load_keymaps_leaves_legacy_keys_yml_when_yaml_exists() {
+        let _g = LOCK.lock().unwrap();
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+        ensure_dir(&home).unwrap();
+        // Both present: the canonical .yaml wins and the legacy .yml is
+        // left untouched (never deleted) so no user data is lost.
+        std::fs::write(home.join("keys.yml"), "defaults:\n  sidebar:\n    nav_up: q\n").unwrap();
+        std::fs::write(home.join("keys.yaml"), "defaults:\n  sidebar:\n    nav_up: w\n").unwrap();
+
+        let (km, diags) = load_keymaps(None);
+        assert!(diags.is_empty(), "{diags:?}");
+
+        assert_eq!(
+            std::fs::read_to_string(home.join("keys.yml")).unwrap(),
+            "defaults:\n  sidebar:\n    nav_up: q\n",
+            "legacy .yml must be left untouched when .yaml already exists"
+        );
+        // The `.yaml` binds nav_up to `w`, the stale `.yml` to `q`. `w`
+        // resolving to NavUp is only possible if the `.yaml` — not the
+        // `.yml` — was the file that got read.
+        assert_eq!(
+            km.sidebar.dispatch(KeyEvent::new(KeyCode::Char('w'), KeyModifiers::NONE)),
+            Some(SidebarAction::NavUp),
+            "the canonical .yaml must be authoritative, not the stale .yml"
+        );
+
+        std::env::remove_var("SHELBI_HOME");
+    }
+
+    #[test]
     fn project_block_sparsely_overrides_defaults_and_builtin() {
         let _g = LOCK.lock().unwrap();
         let home = fresh_home();
         std::env::set_var("SHELBI_HOME", &home);
         ensure_dir(&home).unwrap();
         std::fs::write(
-            home.join("keys.yml"),
+            home.join("keys.yaml"),
             "\
 defaults:
   sidebar:
@@ -1081,18 +1193,18 @@ projects:
             "expected LegacyZenToggleMigrated warning, got {diags:?}"
         );
 
-        // keys.yml now contains the migrated entry.
-        let keys_text = std::fs::read_to_string(home.join("keys.yml")).unwrap();
+        // keys.yaml now contains the migrated entry.
+        let keys_text = std::fs::read_to_string(home.join("keys.yaml")).unwrap();
         let parsed: serde_yaml::Value = serde_yaml::from_str(&keys_text).unwrap();
         let migrated = parsed
             .get("defaults")
             .and_then(|v| v.get("global"))
             .and_then(|v| v.get("zen_toggle"))
             .and_then(|v| v.as_str());
-        assert_eq!(migrated, Some("ctrl-g"), "keys.yml content: {keys_text}");
+        assert_eq!(migrated, Some("ctrl-g"), "keys.yaml content: {keys_text}");
 
         // Legacy config field has been reset to its built-in default —
-        // so the second load is silent and the keys.yml binding still
+        // so the second load is silent and the keys.yaml binding still
         // wins.
         let cfg_after = load_user_config().unwrap();
         assert_eq!(cfg_after.keymap.zen_toggle, ZenToggleChord::AltZ);
@@ -1118,7 +1230,7 @@ projects:
 
     #[test]
     fn legacy_migration_preserves_other_keys_yml_entries() {
-        // A pre-existing keys.yml must keep its other overrides intact
+        // A pre-existing keys.yaml must keep its other overrides intact
         // after the legacy zen_toggle migration spliced into it. We're
         // not surgical-text-editing the file, so explicitly assert the
         // other-mode entry survives the round-trip.
@@ -1127,7 +1239,7 @@ projects:
         std::env::set_var("SHELBI_HOME", &home);
         ensure_dir(&home).unwrap();
         std::fs::write(
-            home.join("keys.yml"),
+            home.join("keys.yaml"),
             "defaults:\n  sidebar:\n    nav_up: w\n",
         )
         .unwrap();
@@ -1147,8 +1259,8 @@ projects:
             Some(GlobalAction::ZenToggle)
         );
 
-        // The merged keys.yml on disk reflects both overrides.
-        let keys_text = std::fs::read_to_string(home.join("keys.yml")).unwrap();
+        // The merged keys.yaml on disk reflects both overrides.
+        let keys_text = std::fs::read_to_string(home.join("keys.yaml")).unwrap();
         let parsed: serde_yaml::Value = serde_yaml::from_str(&keys_text).unwrap();
         assert_eq!(
             parsed
@@ -1182,14 +1294,14 @@ projects:
         save_user_config(&cfg).unwrap();
 
         std::fs::write(
-            home.join("keys.yml"),
+            home.join("keys.yaml"),
             "defaults:\n  global:\n    zen_toggle: ctrl-\\\n",
         )
         .unwrap();
 
         let (km, diags) = load_keymaps(None);
         // New field wins — the two configs disagree so migration must
-        // refuse to clobber the keys.yml value.
+        // refuse to clobber the keys.yaml value.
         assert_eq!(
             km.global.dispatch(KeyEvent::new(KeyCode::Char('\\'), KeyModifiers::CONTROL)),
             Some(GlobalAction::ZenToggle)
@@ -1218,7 +1330,7 @@ projects:
                     ..
                 }
             )),
-            "migration must not run when keys.yml is already set: {diags:?}"
+            "migration must not run when keys.yaml is already set: {diags:?}"
         );
         // The legacy field is preserved on disk so the user can see and
         // remove it; we don't silently clobber when there's a conflict.
@@ -1238,7 +1350,7 @@ projects:
         let home = fresh_home();
         std::env::set_var("SHELBI_HOME", &home);
 
-        // No config.yaml, no keys.yml.
+        // No config.yaml, no keys.yaml.
         let (_km, diags) = load_keymaps(None);
         assert!(
             diags.iter().all(|d| !matches!(
@@ -1272,7 +1384,7 @@ projects:
     #[test]
     fn legacy_none_chord_does_not_migrate() {
         // `ZenToggleChord::None` is the "skip the hotkey" outcome of the
-        // first-run probe — translating it into keys.yml would mean
+        // first-run probe — translating it into keys.yaml would mean
         // unbinding the chord, which the migration deliberately doesn't
         // do (the user can still toggle via `shelbi zen on/off`, so the
         // legacy field staying at None is a benign no-op).
@@ -1304,8 +1416,8 @@ projects:
     #[test]
     fn zen_toggle_chord_resolver_prefers_keys_yml_over_legacy() {
         // After migration, `cfg.keymap.zen_toggle` is reset to AltZ but
-        // the actual binding lives in keys.yml. The sidebar glyph must
-        // reflect the keys.yml binding, not the legacy default — that
+        // the actual binding lives in keys.yaml. The sidebar glyph must
+        // reflect the keys.yaml binding, not the legacy default — that
         // mismatch is the UI face of the parallel-config problem this
         // task is fixing.
         let _g = LOCK.lock().unwrap();
@@ -1313,13 +1425,13 @@ projects:
         std::env::set_var("SHELBI_HOME", &home);
         ensure_dir(&home).unwrap();
         std::fs::write(
-            home.join("keys.yml"),
+            home.join("keys.yaml"),
             "defaults:\n  global:\n    zen_toggle: ctrl-g\n",
         )
         .unwrap();
 
         let (km, _diags) = load_keymaps(None);
-        // Legacy fallback is AltZ; keys.yml resolver wins with CtrlG.
+        // Legacy fallback is AltZ; keys.yaml resolver wins with CtrlG.
         assert_eq!(
             km.zen_toggle_chord(ZenToggleChord::AltZ),
             ZenToggleChord::CtrlG
@@ -1329,7 +1441,7 @@ projects:
 
     #[test]
     fn zen_toggle_chord_resolver_falls_back_for_non_preset_chord() {
-        // When the user binds an arbitrary chord in keys.yml that the
+        // When the user binds an arbitrary chord in keys.yaml that the
         // four-value preset enum can't represent (e.g. `f6`), the
         // resolver hands back the legacy fallback so the sidebar can
         // still pick a sensible glyph.
@@ -1338,7 +1450,7 @@ projects:
         std::env::set_var("SHELBI_HOME", &home);
         ensure_dir(&home).unwrap();
         std::fs::write(
-            home.join("keys.yml"),
+            home.join("keys.yaml"),
             "defaults:\n  global:\n    zen_toggle: f6\n",
         )
         .unwrap();
@@ -1359,7 +1471,7 @@ projects:
         ensure_dir(&home).unwrap();
         // Bind both nav_up and nav_down to the same chord.
         std::fs::write(
-            home.join("keys.yml"),
+            home.join("keys.yaml"),
             "\
 defaults:
   sidebar:
@@ -1403,7 +1515,7 @@ defaults:
         std::env::set_var("SHELBI_HOME", &home);
         ensure_dir(&home).unwrap();
         std::fs::write(
-            home.join("keys.yml"),
+            home.join("keys.yaml"),
             "defaults:\n  sidebar:\n    bogus_action: w\n",
         )
         .unwrap();
@@ -1427,7 +1539,7 @@ defaults:
         std::env::set_var("SHELBI_HOME", &home);
         ensure_dir(&home).unwrap();
         std::fs::write(
-            home.join("keys.yml"),
+            home.join("keys.yaml"),
             "defaults:\n  bogus_mode:\n    nav_up: w\n",
         )
         .unwrap();
@@ -1450,7 +1562,7 @@ defaults:
         std::env::set_var("SHELBI_HOME", &home);
         ensure_dir(&home).unwrap();
         std::fs::write(
-            home.join("keys.yml"),
+            home.join("keys.yaml"),
             "\
 defaults:
   sidebar:
@@ -1531,7 +1643,7 @@ projects:
         std::env::set_var("SHELBI_HOME", &home);
         ensure_dir(&home).unwrap();
         std::fs::write(
-            home.join("keys.yml"),
+            home.join("keys.yaml"),
             "defaults:\n  sidebar:\n    nav_up: []\n",
         )
         .unwrap();
@@ -1566,7 +1678,7 @@ projects:
         std::env::set_var("SHELBI_HOME", &home);
         ensure_dir(&home).unwrap();
         std::fs::write(
-            home.join("keys.yml"),
+            home.join("keys.yaml"),
             "defaults:\n  sidebar:\n    nav_up: [Up, gg]\n",
         )
         .unwrap();
@@ -1601,7 +1713,7 @@ projects:
         std::env::set_var("SHELBI_HOME", &home);
         ensure_dir(&home).unwrap();
         std::fs::write(
-            home.join("keys.yml"),
+            home.join("keys.yaml"),
             "defaults:\n  sidebar:\n    nav_up: [k, up, k]\n",
         )
         .unwrap();
@@ -1637,7 +1749,7 @@ projects:
         std::env::set_var("SHELBI_HOME", &home);
         ensure_dir(&home).unwrap();
         std::fs::write(
-            home.join("keys.yml"),
+            home.join("keys.yaml"),
             "\
 defaults:
   sidebar:
@@ -1684,7 +1796,7 @@ defaults:
         std::env::set_var("SHELBI_HOME", &home);
         ensure_dir(&home).unwrap();
         std::fs::write(
-            home.join("keys.yml"),
+            home.join("keys.yaml"),
             "defaults:\n  sidebar:\n    nav_up: [w, 3]\n",
         )
         .unwrap();
@@ -1718,7 +1830,7 @@ defaults:
         std::env::set_var("SHELBI_HOME", &home);
         ensure_dir(&home).unwrap();
         std::fs::write(
-            home.join("keys.yml"),
+            home.join("keys.yaml"),
             "\
 defaults:
   sidebar:
@@ -1781,7 +1893,7 @@ defaults:
         std::env::set_var("SHELBI_HOME", &home);
         ensure_dir(&home).unwrap();
         std::fs::write(
-            home.join("keys.yml"),
+            home.join("keys.yaml"),
             "defaults:\n  sidebar:\n    refresh: ctrl-p\n",
         )
         .unwrap();
@@ -1808,7 +1920,7 @@ defaults:
         std::env::set_var("SHELBI_HOME", &home);
         ensure_dir(&home).unwrap();
         std::fs::write(
-            home.join("keys.yml"),
+            home.join("keys.yaml"),
             "defaults:\n  palette:\n    activate: ctrl-p\n",
         )
         .unwrap();

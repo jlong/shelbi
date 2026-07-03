@@ -42,7 +42,7 @@ pub struct ReviewApp {
     /// Vertical scroll offset for the detail panel's body (Markdown).
     pub body_scroll: u16,
     /// Merged keymaps, assigned by `run_review` at startup from the same
-    /// load that surfaces `keys.yml` diagnostics. The footer reads this to
+    /// load that surfaces `keys.yaml` diagnostics. The footer reads this to
     /// render hints in the user's configured chords. Defaults to empty —
     /// isolated render tests that don't exercise the footer leave it so.
     pub keymaps: Keymaps,

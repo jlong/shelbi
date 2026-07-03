@@ -22,7 +22,7 @@ pub enum WorkflowCmd {
     /// default with a `·` marker when no files have been written yet.
     List,
     /// Print a workflow's per-status owner / agent table. Statuses are
-    /// listed in the canonical `statuses.yml` order, filtered to the
+    /// listed in the canonical `statuses.yaml` order, filtered to the
     /// subset the workflow declares.
     Show { name: String },
     /// Create a new workflow YAML pre-populated with the default
@@ -63,7 +63,7 @@ fn list(project: &str) -> Result<()> {
 }
 
 fn show(project: &str, name: &str) -> Result<()> {
-    // Either load the workflow (and the project's statuses.yml) from
+    // Either load the workflow (and the project's statuses.yaml) from
     // disk, or fall back to the built-in default. The fallback mirrors
     // `list`: it lets users probe the canonical shape on a fresh project
     // before any files have been written.
@@ -81,17 +81,17 @@ fn show(project: &str, name: &str) -> Result<()> {
     Ok(())
 }
 
-/// Render the workflow → status table in canonical statuses.yml order.
+/// Render the workflow → status table in canonical statuses.yaml order.
 /// Columns are STATUS / OWNER / AGENT, matching the wireframe in
 /// `Plans/shared-statuses.md`. Status order follows the project-wide
-/// declaration in `statuses.yml`; statuses the workflow doesn't include
+/// declaration in `statuses.yaml`; statuses the workflow doesn't include
 /// are dropped from the listing.
 fn print_table(workflow: &Workflow, statuses: &ProjectStatuses) {
-    // Sort the workflow's statuses by their position in `statuses.yml`
+    // Sort the workflow's statuses by their position in `statuses.yaml`
     // so a workflow that lists `[done, backlog]` still renders the
     // catalogue order. Unknown ids (won't happen for a loaded workflow,
     // but defensive for the built-in fallback paired with a custom
-    // `statuses.yml`) land at the end in declaration order.
+    // `statuses.yaml`) land at the end in declaration order.
     let mut entries: Vec<&shelbi_core::WorkflowStatus> = workflow.statuses.iter().collect();
     entries.sort_by_key(|s| statuses.position(&s.id).unwrap_or(usize::MAX));
 
@@ -209,7 +209,7 @@ mod tests {
     }
 
     /// Reference-form fixture — identity (name + category) lives in
-    /// `statuses.yml`. Tests that load this must also write the default
+    /// `statuses.yaml`. Tests that load this must also write the default
     /// catalogue so the loader can resolve the ids.
     const DESIGN_YAML: &str = r#"
 name: design
@@ -317,7 +317,7 @@ statuses:
         assert!(path.exists(), "default workflow should be on disk after edit");
         let text = std::fs::read_to_string(&path).unwrap();
         // The materialized file is in post-migration form — identity
-        // lives in `statuses.yml`. Resolve before comparing.
+        // lives in `statuses.yaml`. Resolve before comparing.
         let wf = Workflow::from_yaml_str(&text)
             .unwrap()
             .resolve_against(&default_project_statuses())
@@ -382,7 +382,7 @@ statuses:
     #[test]
     fn show_renders_owner_agent_table_in_statuses_yml_order() {
         // Smoke-check the table layout against a workflow whose
-        // statuses are declared in a different order than `statuses.yml`.
+        // statuses are declared in a different order than `statuses.yaml`.
         // The renderer must re-sort by the canonical position so the
         // table reads top-to-bottom in column order.
         let _g = TEST_LOCK.lock().unwrap();
