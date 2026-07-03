@@ -22,7 +22,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
-use shelbi_core::{Error, MachineKind, Project, Result};
+use shelbi_core::{Error, Machine, MachineKind, Project, Result};
 
 use crate::projects_dir;
 
@@ -125,8 +125,19 @@ fn warn_skipped_project_yaml_once(path: &Path, err: &str) {
 ///    `~/.shelbi/projects/<name>/` must also be present — otherwise this
 ///    is a freshly-cloned repo and we return
 ///    [`Error::ProjectNotPickedUp`] so the caller can prompt for
-///    `shelbi init --pick-up`. Corrupt in-repo YAML surfaces as
-///    [`Error::InRepoProjectParse`] carrying the exact file path.
+///    `shelbi init --pick-up`. Corrupt in-repo YAML is *not* fatal: the
+///    walk-up logs a warning, skips that file, and keeps walking so the
+///    registry fallback can still resolve the subtree.
+///
+///    **Trust boundary.** The `name:` field is committed to a repo and so
+///    is attacker-controlled in any cloned third-party checkout. Before
+///    honoring it we cross-check that the discovered repo root actually
+///    belongs to the registered project — it must be the registered local
+///    `work_dir` itself or a shelbi worktree beneath it at
+///    `<work_dir>/.shelbi/wt/<name>` (git grew `safe.directory` for this
+///    same class of problem). A repo that ships `name: shelbi` but lives
+///    somewhere else on disk fails the check; we log a warning and fall
+///    through to the registry rather than hijacking the user's real board.
 /// 2. **Fall back** to reverse-lookup against the global registry: match
 ///    `cwd` (or an ancestor) against each registered project's local
 ///    `work_dir`. When two registrations nest (`~/foo` and `~/foo/sub`),
@@ -142,15 +153,103 @@ pub fn resolve_project_for_cwd(cwd: &Path) -> Result<Option<String>> {
     if let Some(hit) = walk_up_for_in_repo(cwd)? {
         let expected_local = projects_dir()?.join(&hit.name).join("local.yaml");
         if !expected_local.is_file() {
+            // The in-repo config names a project this machine has never
+            // registered. Might be a genuine fresh clone the user wants to
+            // pick up — surface the actionable error rather than silently
+            // swallowing it. (No board exists to hijack in this case.)
             return Err(Error::ProjectNotPickedUp {
                 name: hit.name,
                 config_path: hit.config_path,
                 expected_local,
             });
         }
-        return Ok(Some(hit.name));
+        // The project IS registered locally, so honoring the committed
+        // `name:` here could redirect this command at the user's real board.
+        // Only trust it when the discovered repo root is genuinely a checkout
+        // of that registered project; otherwise fall through to the registry.
+        if in_repo_root_is_trusted(&hit.repo_root, &hit.name)? {
+            return Ok(Some(hit.name));
+        }
+        tracing::warn!(
+            project = %hit.name,
+            config = %hit.config_path.display(),
+            "shelbi: ignoring in-repo project config at {} — its repo root {} is \
+             not the registered work_dir (nor a worktree beneath it) for project \
+             `{}`; resolving via the global registry instead",
+            hit.config_path.display(),
+            hit.repo_root.display(),
+            hit.name,
+        );
     }
     Ok(match_root(cwd, &project_roots()?))
+}
+
+/// True when `repo_root` (canonical) is genuinely a checkout of the registered
+/// project `name` on this machine: either the registered local `work_dir`
+/// itself or a shelbi worktree beneath it at `<work_dir>/.shelbi/wt/<name>`
+/// (see [`shelbi_orchestrator::workspace::workspace_worktree`]). This is the
+/// trust cross-check that stops a cloned third-party repo shipping a
+/// `name: <yours>` config from redirecting resolution at your board.
+fn in_repo_root_is_trusted(repo_root: &Path, name: &str) -> Result<bool> {
+    for work_dir in registered_local_work_dirs(name)? {
+        let worktrees = work_dir.join(".shelbi").join("wt");
+        if repo_root == work_dir || repo_root.strip_prefix(&worktrees).is_ok() {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// Minimal projection of the in-repo split's per-user `local.yaml`: we only
+/// need the `machines` list to recover this machine's registered `work_dir`s.
+#[derive(Deserialize)]
+struct LocalHalf {
+    #[serde(default)]
+    machines: Vec<Machine>,
+}
+
+/// Collect the canonical local `work_dir`s registered for project `name` on
+/// this machine, reading whichever registry layout is present:
+///
+/// * the global single-YAML at `~/.shelbi/projects/<name>.yaml`, and
+/// * the in-repo split's per-user half at
+///   `~/.shelbi/projects/<name>/local.yaml`.
+///
+/// Only `kind: local` machines contribute (a remote `work_dir` is a path on
+/// another host). Paths that no longer canonicalize are dropped, and read/parse
+/// failures are swallowed: a broken registration simply yields no trusted roots
+/// — the caller then falls through to the registry rather than exploding.
+fn registered_local_work_dirs(name: &str) -> Result<Vec<PathBuf>> {
+    let projects = projects_dir()?;
+    let mut out = Vec::new();
+
+    let mut push_local = |machines: &[Machine]| {
+        for m in machines {
+            if m.kind == MachineKind::Local {
+                if let Ok(canonical) = fs::canonicalize(&m.work_dir) {
+                    out.push(canonical);
+                }
+            }
+        }
+    };
+
+    // Global single-YAML layout.
+    let global = projects.join(format!("{name}.yaml"));
+    if let Ok(text) = fs::read_to_string(&global) {
+        if let Ok(project) = serde_yaml::from_str::<Project>(&text) {
+            push_local(&project.machines);
+        }
+    }
+
+    // In-repo split layout — per-user local half.
+    let local = projects.join(name).join("local.yaml");
+    if let Ok(text) = fs::read_to_string(&local) {
+        if let Ok(half) = serde_yaml::from_str::<LocalHalf>(&text) {
+            push_local(&half.machines);
+        }
+    }
+
+    Ok(out)
 }
 
 /// Minimal projection of `<repo>/.shelbi/project.yaml` used by discovery:
@@ -171,6 +270,10 @@ struct InRepoProjectHeader {
 struct InRepoHit {
     name: String,
     config_path: PathBuf,
+    /// The repo root the config was found under (the directory containing
+    /// `.shelbi/`), canonicalized by the walk. Used to cross-check the
+    /// discovered project against its registered `work_dir`.
+    repo_root: PathBuf,
 }
 
 /// Walk from `cwd` up to filesystem root looking for `<dir>/.shelbi/project.yaml`.
@@ -181,10 +284,12 @@ struct InRepoHit {
 /// under us, permission denied, etc.), we walk the literal path so we
 /// still degrade gracefully.
 ///
-/// A found file is read and parsed for its `name` field; a parse failure
-/// surfaces as [`Error::InRepoProjectParse`] tagged with the exact path,
-/// rather than the raw serde error the user would otherwise see with no
-/// hint of which YAML broke.
+/// A found file is read and parsed for its `name` field. A parse failure is
+/// *not* fatal: a single corrupt in-repo config used to hard-fail resolution
+/// for the entire subtree (even when the global registry would have matched).
+/// Instead we log a warning naming the exact file and keep walking, so a valid
+/// ancestor config — or the registry fallback in [`resolve_project_for_cwd`] —
+/// can still resolve the project.
 fn walk_up_for_in_repo(cwd: &Path) -> Result<Option<InRepoHit>> {
     let start = fs::canonicalize(cwd).unwrap_or_else(|_| cwd.to_path_buf());
     let mut cur: Option<&Path> = Some(&start);
@@ -192,16 +297,23 @@ fn walk_up_for_in_repo(cwd: &Path) -> Result<Option<InRepoHit>> {
         let candidate = dir.join(".shelbi").join("project.yaml");
         if candidate.is_file() {
             let text = fs::read_to_string(&candidate)?;
-            let header: InRepoProjectHeader = serde_yaml::from_str(&text).map_err(|source| {
-                Error::InRepoProjectParse {
-                    path: candidate.clone(),
-                    source,
+            match serde_yaml::from_str::<InRepoProjectHeader>(&text) {
+                Ok(header) => {
+                    return Ok(Some(InRepoHit {
+                        name: header.name,
+                        config_path: candidate,
+                        repo_root: dir.to_path_buf(),
+                    }));
                 }
-            })?;
-            return Ok(Some(InRepoHit {
-                name: header.name,
-                config_path: candidate,
-            }));
+                Err(source) => {
+                    tracing::warn!(
+                        config = %candidate.display(),
+                        "shelbi: ignoring unparseable in-repo project config at {}: \
+                         {source}; continuing project resolution",
+                        candidate.display(),
+                    );
+                }
+            }
         }
         cur = dir.parent();
     }
@@ -488,13 +600,19 @@ mod tests {
     }
 
     /// Create the per-user `local.yaml` companion under
-    /// `<home>/projects/<name>/`. Contents don't matter for the walk-up
-    /// (it only checks existence); Phase 3's merge parser will read
-    /// them.
-    fn touch_local_half(home: &Path, name: &str) {
+    /// `<home>/projects/<name>/`, registering a single local hub whose
+    /// `work_dir` is `work_dir`. The walk-up checks existence; the trust
+    /// cross-check reads the `machines` list to confirm the discovered repo
+    /// root belongs to the registered project.
+    fn touch_local_half(home: &Path, name: &str, work_dir: &Path) {
         let dir = home.join("projects").join(name);
         fs::create_dir_all(&dir).unwrap();
-        fs::write(dir.join("local.yaml"), "machines: []\n").unwrap();
+        let yaml = format!(
+            "machines:\n\
+             \x20\x20- {{ name: hub, kind: local, work_dir: {wd} }}\n",
+            wd = work_dir.display(),
+        );
+        fs::write(dir.join("local.yaml"), yaml).unwrap();
     }
 
     #[test]
@@ -504,7 +622,7 @@ mod tests {
         let repo = fresh_dir("in-repo");
         std::env::set_var("SHELBI_HOME", &home);
         write_in_repo_config(&repo, "shelbi");
-        touch_local_half(&home, "shelbi");
+        touch_local_half(&home, "shelbi", &repo);
 
         // At the repo root and from a subdir the walk-up hits the same
         // config file.
@@ -566,7 +684,7 @@ mod tests {
         // config at `<in_repo>/.shelbi/project.yaml` and a global YAML
         // pointing at an entirely different work_dir.
         write_in_repo_config(&in_repo, "shared");
-        touch_local_half(&home, "shared");
+        touch_local_half(&home, "shared", &in_repo);
         write_project(&home, "shared", &global_root);
 
         // Query from inside the in-repo tree — walk-up wins.
@@ -627,7 +745,7 @@ mod tests {
 
         std::env::set_var("SHELBI_HOME", &home);
         write_in_repo_config(&real, "shelbi");
-        touch_local_half(&home, "shelbi");
+        touch_local_half(&home, "shelbi", &real);
 
         // Query through the symlink — canonicalization makes the
         // walk-up see the real path and find the config.
@@ -646,23 +764,84 @@ mod tests {
     }
 
     #[test]
-    fn walkup_corrupt_yaml_reports_exact_path() {
+    fn walkup_corrupt_yaml_warns_and_falls_through_to_registry() {
         let _g = TEST_LOCK.lock().unwrap();
         let home = fresh_dir("home");
         let repo = fresh_dir("broken-repo");
         std::env::set_var("SHELBI_HOME", &home);
         let cfg_dir = repo.join(".shelbi");
         fs::create_dir_all(&cfg_dir).unwrap();
-        let cfg = cfg_dir.join("project.yaml");
-        fs::write(&cfg, "name: [this is not a scalar\n").unwrap();
+        fs::write(cfg_dir.join("project.yaml"), "name: [this is not a scalar\n").unwrap();
 
-        let err = resolve_project_for_cwd(&repo).unwrap_err();
-        match err {
-            shelbi_core::Error::InRepoProjectParse { path, .. } => {
-                assert_eq!(path, fs::canonicalize(&repo).unwrap().join(".shelbi/project.yaml"));
-            }
-            other => panic!("expected InRepoProjectParse, got {other:?}"),
-        }
+        // A corrupt in-repo config is no longer fatal: with no registry
+        // entry it's skipped (warned, not propagated) and resolution finds
+        // nothing rather than hard-erroring for the whole subtree.
+        assert!(resolve_project_for_cwd(&repo).unwrap().is_none());
+
+        // And when the global registry *would* match, the corrupt in-repo
+        // config no longer blocks it — we fall through and resolve.
+        write_project(&home, "plain", &repo);
+        assert_eq!(
+            resolve_project_for_cwd(&repo).unwrap().as_deref(),
+            Some("plain")
+        );
+        std::env::remove_var("SHELBI_HOME");
+    }
+
+    #[test]
+    fn walkup_untrusted_repo_does_not_hijack_registered_project() {
+        let _g = TEST_LOCK.lock().unwrap();
+        let home = fresh_dir("home");
+        let trusted = fresh_dir("trusted-repo");
+        let evil = fresh_dir("evil-clone");
+        std::env::set_var("SHELBI_HOME", &home);
+
+        // `shelbi` is legitimately picked up, rooted at `trusted`.
+        write_in_repo_config(&trusted, "shelbi");
+        touch_local_half(&home, "shelbi", &trusted);
+
+        // A third-party repo elsewhere on disk ships the same committed
+        // `name: shelbi`. Running inside it must NOT redirect to the real
+        // board — the repo root doesn't match the registered work_dir, so
+        // we fall through to the registry (which owns nothing here → None).
+        write_in_repo_config(&evil, "shelbi");
+        assert_eq!(resolve_project_for_cwd(&evil).unwrap(), None);
+
+        // The genuine checkout still resolves.
+        assert_eq!(
+            resolve_project_for_cwd(&trusted).unwrap().as_deref(),
+            Some("shelbi")
+        );
+        std::env::remove_var("SHELBI_HOME");
+    }
+
+    #[test]
+    fn walkup_trusts_worktree_beneath_registered_work_dir() {
+        let _g = TEST_LOCK.lock().unwrap();
+        let home = fresh_dir("home");
+        let repo = fresh_dir("hub-repo");
+        std::env::set_var("SHELBI_HOME", &home);
+
+        // Register `shelbi` with its hub work_dir at `repo`.
+        write_in_repo_config(&repo, "shelbi");
+        touch_local_half(&home, "shelbi", &repo);
+
+        // A shelbi worktree lives at `<work_dir>/.shelbi/wt/<name>` and
+        // carries the same committed in-repo config. Resolution from inside
+        // the worktree (and a subdir) is trusted via the work_dir prefix.
+        let worktree = repo.join(".shelbi/wt/bravo");
+        fs::create_dir_all(&worktree).unwrap();
+        write_in_repo_config(&worktree, "shelbi");
+        assert_eq!(
+            resolve_project_for_cwd(&worktree).unwrap().as_deref(),
+            Some("shelbi")
+        );
+        let deep = worktree.join("crates/shelbi-state");
+        fs::create_dir_all(&deep).unwrap();
+        assert_eq!(
+            resolve_project_for_cwd(&deep).unwrap().as_deref(),
+            Some("shelbi")
+        );
         std::env::remove_var("SHELBI_HOME");
     }
 }
