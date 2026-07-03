@@ -98,31 +98,32 @@ fn list(project: &str) -> Result<()> {
     Ok(())
 }
 
-/// `yes` / `no` / `-` per the spec:
+/// `yes` / `no` / `-` per the spec, routed through the shared
+/// provenance mechanism ([`shelbi_state::agent_divergence`]) so a
+/// `shelbi` upgrade — which changes the *compiled* default — doesn't flip
+/// an untouched agent to `yes`:
 ///
-/// - `yes` — shipped default whose `instructions.md` differs from the
-///   bundled body byte-for-byte.
-/// - `no`  — shipped default whose `instructions.md` matches the bundled
-///   body byte-for-byte.
+/// - `yes` — shipped default whose `instructions.md` was edited away from
+///   the default that was deployed (a genuine user customization), or is
+///   missing.
+/// - `no`  — shipped default still running a bundled default, whether the
+///   current one (pristine-current) or a now-stale one a later upgrade
+///   will auto-replace (pristine-stale). The user hasn't customized it.
 /// - `-`   — user-added agent (not in [`shelbi_state::DEFAULT_AGENTS`]);
 ///   the "customized" question doesn't apply because there's nothing to
 ///   compare against.
 fn customized_marker(project: &str, agent: &str) -> Result<&'static str> {
-    let Some(default_body) = shelbi_state::default_agent_body(agent) else {
-        return Ok("-");
-    };
-    let path =
-        shelbi_state::agent_instructions_path(project, agent).map_err(|e| anyhow!(e))?;
-    let current = match fs::read_to_string(&path) {
-        Ok(s) => s,
-        // A shipped default with no instructions.md on disk is technically
-        // divergent — `yes` is the truthful answer (the bundled body
-        // would re-materialize on the next `shelbi reload`, but right now
-        // the file is missing, not matching).
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok("yes"),
-        Err(e) => return Err(anyhow!(e)),
-    };
-    Ok(if current == default_body { "no" } else { "yes" })
+    use shelbi_state::AgentDivergence;
+    Ok(match shelbi_state::agent_divergence(project, agent).map_err(|e| anyhow!(e))? {
+        None => "-",
+        // Pristine-current and pristine-stale are both "not user-customized".
+        // Pristine-stale re-materializes to the current default on the next
+        // `shelbi reload`, but it was never edited, so `no` is truthful.
+        Some(AgentDivergence::PristineCurrent | AgentDivergence::PristineStale) => "no",
+        // A genuine edit, or a missing instructions.md (self-heal will
+        // recreate it, but right now it's divergent from the bundled body).
+        Some(AgentDivergence::Customized) => "yes",
+    })
 }
 
 fn agents_dir_display(project: &str) -> Result<String> {
@@ -451,6 +452,31 @@ mod tests {
         materialize_defaults("p");
         assert_eq!(customized_marker("p", "orchestrator").unwrap(), "no");
         assert_eq!(customized_marker("p", "developer").unwrap(), "no");
+        std::env::remove_var("SHELBI_HOME");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// A `shelbi` upgrade bumps the compiled default under an untouched
+    /// agent. The marker must stay `no` (pristine-stale), not flip to
+    /// `yes` — the byte-compare false positive this task fixes.
+    #[test]
+    fn customized_marker_reports_no_for_stale_untouched_default() {
+        let _g = TEST_LOCK.lock().unwrap();
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+        materialize_defaults("p");
+        // Simulate the previous bundled default sitting on disk with its
+        // provenance recorded, while the compiled default has since moved on.
+        let v1 = "# previous bundled default\n";
+        let path = shelbi_state::agent_instructions_path("p", "orchestrator").unwrap();
+        std::fs::write(&path, v1).unwrap();
+        shelbi_state::update_state("p", |s| {
+            s.deployed_agent_defaults
+                .insert("orchestrator".to_string(), shelbi_state::content_hash(v1));
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(customized_marker("p", "orchestrator").unwrap(), "no");
         std::env::remove_var("SHELBI_HOME");
         let _ = std::fs::remove_dir_all(&home);
     }

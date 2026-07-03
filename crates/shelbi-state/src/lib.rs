@@ -43,12 +43,13 @@ pub use root::{
 };
 
 pub use agent_workspaces::{
-    agent_instructions_path, agent_settings_path, agent_shared_preamble_path, agent_skills_dir,
-    agent_workspace_dir, compose_agent_prompt, count_agent_skills, default_agent_body,
-    default_agent_settings, is_default_agent, legacy_claude_md_path, list_agents,
-    load_agent_settings, load_shared_preamble, materialize_default_agents,
-    maybe_emit_claude_md_migration_hint, orchestrator_handoff_path, reset_claude_md_migration_hint,
-    self_heal_default_agents, take_orchestrator_handoff, AgentMaterializeOutcome, BundledAgent,
+    agent_divergence, agent_instructions_path, agent_settings_path, agent_shared_preamble_path,
+    agent_skills_dir, agent_workspace_dir, classify_agent_divergence, compose_agent_prompt,
+    content_hash, count_agent_skills, default_agent_body, default_agent_settings, is_default_agent,
+    legacy_claude_md_path, list_agents, load_agent_settings, load_shared_preamble,
+    materialize_default_agents, maybe_emit_claude_md_migration_hint, orchestrator_handoff_path,
+    reset_claude_md_migration_hint, self_heal_default_agents, take_orchestrator_handoff,
+    AgentDivergence, AgentMaterializeOutcome, BundledAgent,
     BundledSkill, DEFAULT_AGENTS, DEFAULT_DEVELOPER_INSTRUCTIONS, DEFAULT_ORCHESTRATOR_INSTRUCTIONS,
     DEFAULT_REVIEW_INSTRUCTIONS, DEFAULT_REVIEW_LOAD_RUN_SKILL, DEVELOPER_AGENT, HANDOFF_FILE,
     ORCHESTRATOR_AGENT, ORCHESTRATOR_HANDOFF_REL, REVIEW_AGENT, SHARED_AGENT_DIR,
@@ -707,6 +708,22 @@ pub struct State {
     /// re-notifies.
     #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
     pub notified_diverged_agents: BTreeSet<String>,
+    /// Provenance of each default agent's `instructions.md`: the content
+    /// hash ([`agent_workspaces::content_hash`]) of the *bundled default
+    /// that was last deployed to disk*, keyed by agent name. Recorded at
+    /// materialize / self-heal time; consulted by the divergence
+    /// classifier so a later `shelbi` upgrade — which changes the
+    /// *compiled* default — doesn't misread an untouched agent as
+    /// user-customized. An untouched file still matches its recorded
+    /// deployed hash even though it no longer matches the newer compiled
+    /// default (pristine-stale, auto-upgradable), while a genuine edit no
+    /// longer matches the recorded hash (customized). Absent entry → no
+    /// provenance yet (an agent materialized by a pre-provenance binary);
+    /// the classifier falls back to a byte-compare against the current
+    /// compiled default and backfills the entry the next time it observes
+    /// the file matching that default.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub deployed_agent_defaults: BTreeMap<String, String>,
     /// Per-orchestrator-session latch for the legacy `CLAUDE.md`
     /// migration hint. Set the first time
     /// [`maybe_emit_claude_md_migration_hint`] sees a leftover
