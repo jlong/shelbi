@@ -405,11 +405,19 @@ fn merge_state_status(host: &Host, wt: &str, pr_str: &str) -> Result<String> {
     Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
 }
 
-/// Integrate `pr` and delete its source branch using the project's
-/// configured [`shelbi_core::MergeStrategy`]. Returns the merge SHA, or
-/// `None` when GitHub reported the PR merged but hadn't recorded the
-/// merge commit yet after the polling window (merge queues, busy repos)
-/// — the merge itself succeeded.
+/// Integrate `pr` using the project's configured
+/// [`shelbi_core::MergeStrategy`] and delete its *remote* source branch.
+/// Returns the merge SHA, or `None` when GitHub reported the PR merged but
+/// hadn't recorded the merge commit yet after the polling window (merge
+/// queues, busy repos) — the merge itself succeeded.
+///
+/// The *local* branch is intentionally left alone: it's still checked out
+/// in the finishing workspace's worktree, so `gh pr merge --delete-branch`
+/// would fail to delete it and report the whole merge as a failure even
+/// though it landed (observed on PRs #154/#155). We drop that flag (see
+/// [`pr_merge_args`]) and delete only the remote branch, best-effort, after
+/// the merge succeeds; the local branch gets replaced on the workspace's
+/// next dispatch.
 ///
 /// `expected_head` pins the merge to the exact commit the probe and
 /// ci-watch evaluated: when `Some`, gh receives `--match-head-commit
@@ -453,7 +461,49 @@ pub fn pr_merge(
 
     // gh pr merge doesn't print the merge SHA. Ask gh for it separately,
     // polling — GitHub records the merge commit asynchronously.
-    wait_for_merge_commit_sha(&host, &wt, pr)
+    let sha = wait_for_merge_commit_sha(&host, &wt, pr)?;
+
+    // The merge landed (wait_for_merge_commit_sha only returns Ok once the
+    // PR reached MERGED). Clean up the remote branch ourselves since we
+    // dropped `--delete-branch`. Best-effort: a delete that fails (branch
+    // already gone via GitHub's auto-delete-on-merge, a protected branch, a
+    // transient blip) must not flip a landed merge into a reported failure.
+    delete_remote_head_branch(&host, &wt, &pr_str);
+
+    Ok(sha)
+}
+
+/// Best-effort deletion of a merged PR's *remote* head branch. Looks the
+/// branch name up with `gh pr view` (so it works from the hub checkout
+/// without needing the branch locally) and pushes a delete. Every step is
+/// swallowed: this runs only after the merge already succeeded, so a
+/// failure here is cosmetic. The local branch is left untouched on purpose
+/// — it's still checked out in the finishing workspace's worktree.
+fn delete_remote_head_branch(host: &Host, wt: &str, pr_str: &str) {
+    let view = run_in_dir(
+        host,
+        wt,
+        &[
+            "gh",
+            "pr",
+            "view",
+            pr_str,
+            "--json",
+            "headRefName",
+            "--jq",
+            ".headRefName // empty",
+        ],
+    );
+    let head_ref = match view {
+        Ok(out) if out.status.success() => {
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        }
+        _ => return,
+    };
+    if head_ref.is_empty() {
+        return;
+    }
+    let _ = run_in_dir(host, wt, &["git", "push", "origin", "--delete", &head_ref]);
 }
 
 // ---------------------------------------------------------------------------
@@ -464,8 +514,14 @@ pub fn pr_merge(
 /// itself reject the merge if the PR head is no longer the probed commit —
 /// the check-and-merge is atomic on the server, so there is no window for
 /// a sneaked-in commit between our poll and the merge.
+///
+/// Deliberately *no* `--delete-branch`: that flag also deletes the local
+/// branch, which fails when the finishing workspace's worktree still has
+/// the task branch checked out (the normal case in shelbi's flow) and gh
+/// then propagates the cleanup failure as a non-zero exit even though the
+/// merge landed. [`pr_merge`] deletes the remote branch itself afterward.
 pub fn pr_merge_args(pr: &str, strategy_flag: &str, expected_head: Option<&str>) -> Vec<String> {
-    let mut args: Vec<String> = ["gh", "pr", "merge", pr, strategy_flag, "--delete-branch"]
+    let mut args: Vec<String> = ["gh", "pr", "merge", pr, strategy_flag]
         .iter()
         .map(|s| s.to_string())
         .collect();
@@ -574,7 +630,6 @@ mod tests {
                 "merge",
                 "42",
                 "--squash",
-                "--delete-branch",
                 "--match-head-commit",
                 "abc123",
             ]
@@ -586,11 +641,19 @@ mod tests {
         // Manual invocations that never probed keep the legacy shape —
         // no stray `--match-head-commit` flag with nothing to match.
         let args = pr_merge_args("7", "--merge", None);
-        assert_eq!(
-            args,
-            vec!["gh", "pr", "merge", "7", "--merge", "--delete-branch"]
-        );
+        assert_eq!(args, vec!["gh", "pr", "merge", "7", "--merge"]);
         assert!(!args.iter().any(|a| a == "--match-head-commit"));
+    }
+
+    #[test]
+    fn pr_merge_args_never_deletes_branch() {
+        // `--delete-branch` would also delete the local branch, which fails
+        // when the finishing workspace's worktree still has it checked out;
+        // pr_merge deletes only the remote branch afterward instead.
+        let pinned = pr_merge_args("1", "--squash", Some("sha"));
+        let unpinned = pr_merge_args("1", "--squash", None);
+        assert!(!pinned.iter().any(|a| a == "--delete-branch"));
+        assert!(!unpinned.iter().any(|a| a == "--delete-branch"));
     }
 
     #[test]
