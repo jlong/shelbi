@@ -9,7 +9,7 @@ import "./globals.css"
 
 const SITE_URL = "https://shelbi.dev"
 const SITE_DESCRIPTION =
-  "Do more with your agents — a multi-machine orchestrator built on tmux. Dispatch tasks to a team of agents that run in parallel, locally or over SSH."
+  "Do more with your agents — an open source, multi-machine orchestrator built on tmux. Dispatch tasks to a team of agents locally or over SSH."
 
 export const metadata: Metadata = {
   metadataBase: new URL(SITE_URL),
