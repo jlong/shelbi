@@ -10,8 +10,8 @@
 use anyhow::{anyhow, Result};
 use clap::Subcommand;
 
-use shelbi_orchestrator::actions;
-use shelbi_state::{load_project, load_task};
+use shelbi_orchestrator::{actions, transition};
+use shelbi_state::{load_project, load_task, load_workflow};
 
 use crate::commands::require_project;
 
@@ -82,6 +82,24 @@ pub enum ActionCmd {
         #[arg(long)]
         onto: Option<String>,
     },
+    /// Fire every action a workflow transition declares for a
+    /// `from -> to` status move, in order. This is the automatic
+    /// counterpart to running the single-verb primitives by hand: it
+    /// looks up the task's workflow, resolves the transition's `target:`
+    /// (substituting `{{var}}` from the task's frontmatter params), and
+    /// runs the declared `actions:`, short-circuiting on the first
+    /// failure. Prints `<action>\t<result>` per fired action; an
+    /// undeclared edge (or one with no `actions:`) prints nothing and
+    /// exits 0.
+    ApplyTransition {
+        task_id: String,
+        /// Stable id of the status the task is moving out of.
+        #[arg(long)]
+        from: String,
+        /// Stable id of the status the task is moving into.
+        #[arg(long)]
+        to: String,
+    },
 }
 
 pub fn run(project_opt: Option<String>, cmd: ActionCmd) -> Result<()> {
@@ -139,6 +157,34 @@ pub fn run(project_opt: Option<String>, cmd: ActionCmd) -> Result<()> {
                 actions::restack(&project, &tf.task, &from, onto.as_deref())
                     .map_err(|e| anyhow!(e))?;
             println!("{}", outcome.as_line());
+            Ok(())
+        }
+        ActionCmd::ApplyTransition { task_id, from, to } => {
+            let tf = load_task(&project_name, &task_id).map_err(|e| anyhow!(e))?;
+            let workflow = load_workflow(&project_name, tf.task.workflow_or_default())
+                .map_err(|e| anyhow!(e))?;
+            let outcomes = transition::execute_transition(
+                &project,
+                &project_name,
+                &tf.task,
+                &tf.body,
+                &workflow,
+                &from,
+                &to,
+            )
+            .map_err(|e| anyhow!(e))?;
+            for outcome in &outcomes {
+                // `merge` can emit multiple lines (merge + one per
+                // restacked child); keep the action tag on the first and
+                // indent continuation lines so the grouping stays legible.
+                let mut lines = outcome.line.lines();
+                if let Some(first) = lines.next() {
+                    println!("{}\t{first}", outcome.action);
+                }
+                for cont in lines {
+                    println!("\t{cont}");
+                }
+            }
             Ok(())
         }
     }
