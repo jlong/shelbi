@@ -1171,6 +1171,167 @@ impl Task {
             .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
             .collect()
     }
+
+    /// Post-deserialize lint of [`Task::params`] — the flattened catch-all
+    /// for extra frontmatter keys. Returns one [`ParamDiagnostic`] per
+    /// suspect key (in the map's sorted-key order), or an empty vec when
+    /// every param is a plausible free-form string.
+    ///
+    /// This is a *diagnostic* layered on top of a deliberately tolerant
+    /// parse — it never mutates and never fails. [`Task::params`] holds raw
+    /// [`serde_yaml::Value`]s so a newer binary's typed field survives a
+    /// read-modify-write on an older one (see the field docs and the
+    /// `non_string_params_round_trip…` test); that tolerance is what lets a
+    /// misspelled optional field (`asigned_to:`) slip in as an anonymous
+    /// param instead of erroring, and a non-string extra ride along
+    /// silently. `validate_params` recovers the lost signal *without*
+    /// re-tightening the parse: it names the offending key so a typo or a
+    /// stray numeric field is actionable, while the card still loads.
+    ///
+    /// Two problem classes, at most one diagnostic per key (typo wins,
+    /// since the fix is more specific):
+    ///
+    /// * [`ParamDiagnostic::LikelyTypo`] — the key is within one edit of a
+    ///   known optional field ([`KNOWN_OPTIONAL_TASK_FIELDS`]). Warning:
+    ///   the value round-trips, but the field the author meant is unset.
+    /// * [`ParamDiagnostic::NonStringValue`] — the value isn't a string, so
+    ///   `{{var}}` substitution (string-only) can never use it. Error,
+    ///   naming the key.
+    pub fn validate_params(&self) -> Vec<ParamDiagnostic> {
+        let mut out = Vec::new();
+        for (key, value) in &self.params {
+            if let Some(suggestion) = closest_optional_field(key) {
+                out.push(ParamDiagnostic::LikelyTypo {
+                    field: key.clone(),
+                    suggestion,
+                });
+            } else if !value.is_string() {
+                out.push(ParamDiagnostic::NonStringValue {
+                    field: key.clone(),
+                    kind: yaml_value_kind(value),
+                });
+            }
+        }
+        out
+    }
+}
+
+/// The *optional* typed fields on [`Task`] that a hand-authored frontmatter
+/// might misspell into an anonymous [`Task::params`] entry.
+/// [`Task::validate_params`] warns when an extra key is a single edit away
+/// from one of these — the `asigned_to:`-for-`assigned_to:` slip.
+///
+/// Only optional fields are listed. Required fields (`id`, `title`,
+/// `column`, `priority`, the timestamps) are omitted on purpose: dropping
+/// or misspelling one of those already makes deserialize fail loudly, so a
+/// near-miss warning there would be redundant noise.
+pub const KNOWN_OPTIONAL_TASK_FIELDS: &[&str] =
+    &["assigned_to", "branch", "workflow", "prefers_machine", "zen"];
+
+/// A post-deserialize problem [`Task::validate_params`] found in a task's
+/// flattened [`Task::params`]. See that method for why the check is a
+/// non-fatal diagnostic layered on a tolerant parse rather than a parse
+/// error.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ParamDiagnostic {
+    /// An extra key one Levenshtein edit from a known optional field
+    /// ([`KNOWN_OPTIONAL_TASK_FIELDS`]) — almost always a misspelling of
+    /// it. Warning-severity: the value still round-trips as a free-form
+    /// param, but the typed field the author meant stays unset.
+    LikelyTypo {
+        field: String,
+        suggestion: &'static str,
+    },
+    /// An extra key whose value isn't a string. `{{var}}` substitution is
+    /// string-only, so a numeric/boolean/collection param can never resolve
+    /// a placeholder — it's either a hand-authored mistake or a
+    /// forward-compat artifact from a newer binary. Error-severity, naming
+    /// the key, without failing the whole task the way the old
+    /// `String`-typed map did.
+    NonStringValue {
+        field: String,
+        kind: &'static str,
+    },
+}
+
+impl ParamDiagnostic {
+    /// The offending param key.
+    pub fn field(&self) -> &str {
+        match self {
+            ParamDiagnostic::LikelyTypo { field, .. }
+            | ParamDiagnostic::NonStringValue { field, .. } => field,
+        }
+    }
+
+    /// Whether this is error-severity ([`ParamDiagnostic::NonStringValue`])
+    /// as opposed to a warning ([`ParamDiagnostic::LikelyTypo`]).
+    pub fn is_error(&self) -> bool {
+        matches!(self, ParamDiagnostic::NonStringValue { .. })
+    }
+}
+
+impl std::fmt::Display for ParamDiagnostic {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ParamDiagnostic::LikelyTypo { field, suggestion } => write!(
+                f,
+                "warning: unknown task field `{field}` looks like a typo of \
+                 `{suggestion}`; it was kept as a free-form param, so the \
+                 `{suggestion}:` field is unset",
+            ),
+            ParamDiagnostic::NonStringValue { field, kind } => write!(
+                f,
+                "error: task param `{field}` has a non-string ({kind}) value; \
+                 placeholder substitution is string-only, so this param is \
+                 unusable — remove it, or quote the value if it's meant to be text",
+            ),
+        }
+    }
+}
+
+/// The known optional field within Levenshtein distance 1 of `key`, if any.
+/// An exact match can't reach here — a correctly-spelled field name
+/// deserializes into its typed slot, never into `params` — so only genuine
+/// near-misses (distance exactly 1) are reported.
+fn closest_optional_field(key: &str) -> Option<&'static str> {
+    KNOWN_OPTIONAL_TASK_FIELDS
+        .iter()
+        .copied()
+        .find(|field| levenshtein(key, field) == 1)
+}
+
+/// The YAML type name of `value`, for a diagnostic that tells the user what
+/// kind of non-string value they wrote.
+fn yaml_value_kind(value: &serde_yaml::Value) -> &'static str {
+    match value {
+        serde_yaml::Value::Null => "null",
+        serde_yaml::Value::Bool(_) => "boolean",
+        serde_yaml::Value::Number(_) => "number",
+        serde_yaml::Value::String(_) => "string",
+        serde_yaml::Value::Sequence(_) => "sequence",
+        serde_yaml::Value::Mapping(_) => "mapping",
+        serde_yaml::Value::Tagged(_) => "tagged",
+    }
+}
+
+/// Classic Levenshtein edit distance, used only to spot single-character
+/// typos of the short ASCII field names in [`KNOWN_OPTIONAL_TASK_FIELDS`].
+/// Compares `char`s (not bytes) so multi-byte input can't split a codepoint;
+/// the O(m·n) table is negligible at these lengths.
+fn levenshtein(a: &str, b: &str) -> usize {
+    let a: Vec<char> = a.chars().collect();
+    let b: Vec<char> = b.chars().collect();
+    let mut prev: Vec<usize> = (0..=b.len()).collect();
+    let mut cur = vec![0usize; b.len() + 1];
+    for (i, ca) in a.iter().enumerate() {
+        cur[0] = i + 1;
+        for (j, cb) in b.iter().enumerate() {
+            let cost = usize::from(ca != cb);
+            cur[j + 1] = (prev[j + 1] + 1).min(cur[j] + 1).min(prev[j] + cost);
+        }
+        std::mem::swap(&mut prev, &mut cur);
+    }
+    prev[b.len()]
 }
 
 /// Name of the workflow used when a task's `workflow:` frontmatter field
@@ -2099,6 +2260,136 @@ updated_at: 2026-06-19T00:00:00Z
             reparsed.params.get("zen_optional"),
             Some(&serde_yaml::Value::from(true))
         );
+    }
+
+    fn task_with_params(extra_yaml: &str) -> Task {
+        let yaml = format!(
+            "id: t\ntitle: T\ncolumn: todo\npriority: 0\n\
+             created_at: 2026-06-19T00:00:00Z\nupdated_at: 2026-06-19T00:00:00Z\n{extra_yaml}"
+        );
+        serde_yaml::from_str(&yaml).unwrap()
+    }
+
+    #[test]
+    fn validate_params_flags_optional_field_typo() {
+        // `asigned_to:` is one deletion from `assigned_to:`, so it slips into
+        // params instead of setting the typed field. The lint names both the
+        // offending key and the field the author meant.
+        let t = task_with_params("asigned_to: alice\n");
+        assert_eq!(t.param_str("asigned_to"), Some("alice"));
+        assert!(t.assigned_to.is_none());
+        let diags = t.validate_params();
+        assert_eq!(
+            diags,
+            vec![ParamDiagnostic::LikelyTypo {
+                field: "asigned_to".into(),
+                suggestion: "assigned_to",
+            }]
+        );
+        assert!(!diags[0].is_error());
+        let msg = diags[0].to_string();
+        assert!(msg.contains("assigned_to"), "msg: {msg}");
+        assert!(msg.contains("asigned_to"), "msg: {msg}");
+    }
+
+    #[test]
+    fn validate_params_catches_each_known_optional_field_typo() {
+        // One representative single-edit typo per known field, so the field
+        // list and the distance-1 matcher stay in sync.
+        for (typo, field) in [
+            ("asigned_to", "assigned_to"),
+            ("branchh", "branch"),
+            ("workflw", "workflow"),
+            ("prefers_machin", "prefers_machine"),
+            ("zn", "zen"),
+        ] {
+            let t = task_with_params(&format!("{typo}: v\n"));
+            assert_eq!(
+                t.validate_params(),
+                vec![ParamDiagnostic::LikelyTypo {
+                    field: typo.into(),
+                    suggestion: field,
+                }],
+                "typo `{typo}` should suggest `{field}`"
+            );
+        }
+    }
+
+    #[test]
+    fn validate_params_errors_on_numeric_extra_naming_the_field() {
+        // A stray numeric extra can't drive `{{var}}` substitution. It still
+        // parses (forward-compat), but the lint surfaces it as an error that
+        // names the key rather than letting it vanish silently.
+        let t = task_with_params("retries: 2\n");
+        assert_eq!(t.params.get("retries"), Some(&serde_yaml::Value::from(2)));
+        let diags = t.validate_params();
+        assert_eq!(
+            diags,
+            vec![ParamDiagnostic::NonStringValue {
+                field: "retries".into(),
+                kind: "number",
+            }]
+        );
+        assert!(diags[0].is_error());
+        assert_eq!(diags[0].field(), "retries");
+        assert!(diags[0].to_string().contains("retries"));
+    }
+
+    #[test]
+    fn validate_params_reports_non_string_kinds() {
+        let t = task_with_params("flag: true\ntags: [a, b]\n");
+        let mut diags = t.validate_params();
+        diags.sort_by(|a, b| a.field().cmp(b.field()));
+        assert_eq!(
+            diags,
+            vec![
+                ParamDiagnostic::NonStringValue {
+                    field: "flag".into(),
+                    kind: "boolean",
+                },
+                ParamDiagnostic::NonStringValue {
+                    field: "tags".into(),
+                    kind: "sequence",
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn validate_params_typo_takes_priority_over_value_kind() {
+        // A key that is both a typo *and* non-string reports the typo — the
+        // more specific, more actionable fix.
+        let t = task_with_params("asigned_to: 5\n");
+        assert_eq!(
+            t.validate_params(),
+            vec![ParamDiagnostic::LikelyTypo {
+                field: "asigned_to".into(),
+                suggestion: "assigned_to",
+            }]
+        );
+    }
+
+    #[test]
+    fn validate_params_accepts_legitimate_string_params() {
+        // The worked `{{feature}}`/`{{region}}` example: real free-form
+        // string params that aren't near any field produce no diagnostics
+        // and round-trip untouched.
+        let t = task_with_params("feature: auth-rewrite\nregion: us-east\n");
+        assert!(t.validate_params().is_empty());
+        let reparsed: Task = serde_yaml::from_str(&serde_yaml::to_string(&t).unwrap()).unwrap();
+        assert_eq!(reparsed.param_str("feature"), Some("auth-rewrite"));
+        assert_eq!(reparsed.param_str("region"), Some("us-east"));
+        assert!(reparsed.validate_params().is_empty());
+    }
+
+    #[test]
+    fn levenshtein_basic_distances() {
+        assert_eq!(levenshtein("abc", "abc"), 0);
+        assert_eq!(levenshtein("abc", "abd"), 1);
+        assert_eq!(levenshtein("abc", "ac"), 1);
+        assert_eq!(levenshtein("abc", "abcd"), 1);
+        assert_eq!(levenshtein("kitten", "sitting"), 3);
+        assert_eq!(levenshtein("", "abc"), 3);
     }
 
     #[test]
