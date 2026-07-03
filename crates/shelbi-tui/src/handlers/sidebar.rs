@@ -23,7 +23,7 @@ pub enum Outcome {
 }
 
 pub fn sidebar_loop<B: Backend>(term: &mut Terminal<B>, app: &mut App) -> Result<()> {
-    // Snapshot the merged keymaps once — `keys.yml` is parsed at startup
+    // Snapshot the merged keymaps once — `keys.yaml` is parsed at startup
     // (in `run_sidebar`) and must not be re-read per keystroke.
     let keymaps = app.keymaps().clone();
     while !app.should_quit {
@@ -129,9 +129,9 @@ mod tests {
     }
 
     /// Default keymaps with `SHELBI_HOME` pointed at a fresh empty dir so
-    /// the loader never reads the developer's real `~/.shelbi/keys.yml`.
+    /// the loader never reads the developer's real `~/.shelbi/keys.yaml`.
     /// Returns the keymaps plus the temp home so the caller can write a
-    /// `keys.yml` into it for override tests.
+    /// `keys.yaml` into it for override tests.
     fn defaults_with_home() -> (Keymaps, std::path::PathBuf) {
         let home = fresh_home();
         std::env::set_var("SHELBI_HOME", &home);
@@ -225,7 +225,7 @@ mod tests {
         std::env::remove_var("SHELBI_HOME");
     }
 
-    /// User override in `keys.yml` (`defaults.sidebar.nav_up: w`) takes
+    /// User override in `keys.yaml` (`defaults.sidebar.nav_up: w`) takes
     /// effect: `w` now fires NavUp and the old defaults (`k`, `Up`) no
     /// longer match anything in the sidebar mode.
     #[test]
@@ -234,7 +234,7 @@ mod tests {
         let home = fresh_home();
         std::env::set_var("SHELBI_HOME", &home);
         std::fs::write(
-            home.join("keys.yml"),
+            home.join("keys.yaml"),
             "defaults:\n  sidebar:\n    nav_up: w\n",
         )
         .unwrap();

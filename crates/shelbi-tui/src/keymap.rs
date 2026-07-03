@@ -11,7 +11,7 @@ use shelbi_state::ZenToggleChord;
 
 /// Render a chord for a help footer, falling back to `<unbound>` when the
 /// action has no binding. Help rows reference actions by enum, so a user
-/// who unbinds a help-referenced action (via `keys.yml`) gets a visible
+/// who unbinds a help-referenced action (via `keys.yaml`) gets a visible
 /// `<unbound>` marker rather than a panic or a silently dropped hint.
 pub fn format_chord_or_unbound(chord: Option<&KeyChord>, style: DisplayStyle) -> String {
     match chord {

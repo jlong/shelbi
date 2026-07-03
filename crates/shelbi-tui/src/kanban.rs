@@ -4,14 +4,14 @@
 //! separate cache.
 //!
 //! In "All" mode the board renders the **canonical column set declared in
-//! `workflows/statuses.yml`**, in that file's declaration order. Empty
+//! `workflows/statuses.yaml`**, in that file's declaration order. Empty
 //! columns render with their headers so the layout stays stable as tasks
 //! move through. Each task is bucketed by its resolved status id (see
 //! [`resolve_task_status`]) regardless of which workflow it belongs to,
 //! so a `review` column shows tasks from every workflow whose schema
 //! includes a `review` status. With a workflow filter active the visible
 //! column set narrows to the statuses that workflow declares (still in
-//! `statuses.yml` order — workflows cannot reorder).
+//! `statuses.yaml` order — workflows cannot reorder).
 //!
 //! The pane is meant to outlive any one TUI process (the parent shell wraps
 //! it in a `while true` loop) — so we deliberately don't bind a quit key.
@@ -81,7 +81,7 @@ pub struct KanbanApp {
     /// the canonical default workflow.
     pub workflows: Vec<Workflow>,
     /// Project-wide canonical column catalogue, loaded from
-    /// `workflows/statuses.yml`. Source of truth for column identity
+    /// `workflows/statuses.yaml`. Source of truth for column identity
     /// (id, name, category) and ordering — workflows can no longer
     /// reorder columns or invent their own. Reloaded each [`refresh`].
     /// Falls back to [`default_project_statuses`] when the loader
@@ -92,7 +92,7 @@ pub struct KanbanApp {
     /// Selection indices ([`KanbanApp::selected_column`]) refer to slots
     /// in this vec, and the renderer walks it left-to-right. When a
     /// workflow filter is active the list narrows to the statuses that
-    /// workflow declares — still in `statuses.yml` order. Rebuilt each
+    /// workflow declares — still in `statuses.yaml` order. Rebuilt each
     /// refresh.
     pub all_columns: Vec<KanbanColumn>,
     /// Active workflow filter — `None` means "All workflows" (the
@@ -126,7 +126,7 @@ pub struct KanbanApp {
     /// currently visible?" without redoing the layout pass.
     pub visible_columns: std::ops::Range<usize>,
     /// Merged keymaps, assigned by `run_tasks` at startup from the same
-    /// load that surfaces `keys.yml` diagnostics. The board + popover
+    /// load that surfaces `keys.yaml` diagnostics. The board + popover
     /// footers read this to render hints in the user's configured chords.
     /// Defaults to empty — isolated render tests that don't exercise the
     /// footers leave it so.
@@ -305,7 +305,7 @@ pub struct CardHit {
     pub row_idx: usize,
 }
 
-/// One column in the kanban view — a status from `workflows/statuses.yml`.
+/// One column in the kanban view — a status from `workflows/statuses.yaml`.
 ///
 /// Columns are project-wide (not bound to any workflow): a single
 /// `review` column shows tasks from every workflow whose schema includes
@@ -345,7 +345,7 @@ impl KanbanApp {
         // Seed `all_columns` with the canonical six-status default so a
         // brand-new app pre-`refresh` already paints a board (and
         // exercises the same code path as a refresh that found exactly
-        // the default `statuses.yml` on disk). Tests that drive the app
+        // the default `statuses.yaml` on disk). Tests that drive the app
         // directly without calling `refresh` also benefit — they don't
         // have to populate `all_columns` by hand to navigate.
         let project_statuses = default_project_statuses();
@@ -675,13 +675,13 @@ impl KanbanApp {
                 vec![default_workflow()]
             }
         };
-        // `statuses.yml` is the source of truth for the column layout.
+        // `statuses.yaml` is the source of truth for the column layout.
         // A broken / missing file surfaces as a status_line warning and
         // degrades to the canonical six so the board still paints.
         self.project_statuses = match shelbi_state::load_project_statuses(&self.project_name) {
             Ok(ps) => ps,
             Err(e) => {
-                self.status_line = format!("statuses.yml load failed: {e}");
+                self.status_line = format!("statuses.yaml load failed: {e}");
                 default_project_statuses()
             }
         };
@@ -831,11 +831,11 @@ impl KanbanApp {
 
     // ----- workflow filter --------------------------------------------------
 
-    /// Build [`Self::all_columns`] from `statuses.yml`, honouring the
+    /// Build [`Self::all_columns`] from `statuses.yaml`, honouring the
     /// active workflow filter. With no filter set this is every status
-    /// declared in `statuses.yml`, in declared order. With a filter set,
+    /// declared in `statuses.yaml`, in declared order. With a filter set,
     /// only the statuses that workflow declares participate — still
-    /// rendered in `statuses.yml` order (workflows cannot reorder).
+    /// rendered in `statuses.yaml` order (workflows cannot reorder).
     /// If the filter targets a workflow that no longer exists in
     /// `self.workflows`, the columns fall back to the full list so the
     /// board doesn't go blank and the user can still see the chip to
@@ -1176,7 +1176,7 @@ impl KanbanApp {
     /// Index of the next/prev column the workflow can land on, relative
     /// to `current_status_id`. Skips columns whose status the workflow
     /// doesn't declare and wraps within the workflow's eligible set in
-    /// `statuses.yml` order. Returns `None` when:
+    /// `statuses.yaml` order. Returns `None` when:
     ///
     /// - the workflow declares fewer than two statuses that appear in
     ///   the current column set (nowhere to move), or
@@ -1470,7 +1470,7 @@ fn render_columns(f: &mut Frame, app: &mut KanbanApp, hits: &mut Vec<CardHit>, a
     //   1. **Collapse empty** — a column with zero matching cards
     //      shrinks to a fixed minimum width so cards-bearing columns
     //      get the screen real estate. Without this a board with many
-    //      empty lanes (a `statuses.yml` with eight statuses but only
+    //      empty lanes (a `statuses.yaml` with eight statuses but only
     //      two in active use) would slice the screen into lanes the
     //      eye has to scan past.
     //
@@ -1794,7 +1794,7 @@ fn render_column(
         ),
     ]);
 
-    // Columns are project-wide post-`statuses.yml` — no per-column
+    // Columns are project-wide post-`statuses.yaml` — no per-column
     // workflow subscript any more. A single header row is all we need;
     // per-card workflow names still surface via [`workflow_card_indicator`].
     let chunks = Layout::default()
@@ -2314,10 +2314,10 @@ fn workflow_card_indicator(
 // ---------------------------------------------------------------------------
 // Column builder
 
-/// Build the column list from `statuses.yml`. When `workflow` is `None`
+/// Build the column list from `statuses.yaml`. When `workflow` is `None`
 /// every status declared in the file is emitted (in declared order).
 /// When `Some`, the list narrows to the statuses that workflow declares
-/// — still in `statuses.yml` order, since the loader rejects workflow
+/// — still in `statuses.yaml` order, since the loader rejects workflow
 /// files that try to reorder relative to the project-wide catalogue.
 fn kanban_columns_from(
     statuses: &ProjectStatuses,
@@ -3273,7 +3273,7 @@ mod tests {
     /// canonical status ids. Each id must exist in
     /// [`default_project_statuses`]; the helper copies the canonical
     /// name/category for each. Used to keep these all-view tests
-    /// hermetic — no on-disk `statuses.yml` required.
+    /// hermetic — no on-disk `statuses.yaml` required.
     fn workflow_using(name: &str, status_ids: &[&str]) -> Workflow {
         let ps = default_project_statuses();
         Workflow {
@@ -3301,7 +3301,7 @@ mod tests {
         }
     }
 
-    /// With the canonical `statuses.yml` loaded, `all_columns` is
+    /// With the canonical `statuses.yaml` loaded, `all_columns` is
     /// exactly the six declared statuses in declared order — the five
     /// legacy lanes plus the `Canceled` terminal lane. Holds regardless
     /// of which workflows are loaded, since columns come from the
@@ -3389,7 +3389,7 @@ mod tests {
             task_in_workflow("orphan", Column::Todo, Some("ghost"), "2026-06-20T10:00:00Z"),
         ];
 
-        // statuses.yml order: backlog todo in-progress review done canceled
+        // statuses.yaml order: backlog todo in-progress review done canceled
         let ids = |idx: usize| -> Vec<&str> {
             app.column_tasks(idx)
                 .iter()
@@ -3408,7 +3408,7 @@ mod tests {
         assert_eq!(ids(5), Vec::<&str>::new(), "canceled stays visible but empty");
     }
 
-    /// Every status declared in `statuses.yml` gets a column even if
+    /// Every status declared in `statuses.yaml` gets a column even if
     /// no current task occupies it. The acceptance criterion behind
     /// "the layout doesn't shift when the last task leaves a column."
     #[test]
@@ -3422,7 +3422,7 @@ mod tests {
             None,
             "2026-06-20T10:00:00Z",
         )];
-        // Six columns from statuses.yml — five are empty.
+        // Six columns from statuses.yaml — five are empty.
         assert_eq!(app.all_columns.len(), 6);
         let counts: Vec<usize> = (0..app.all_columns.len())
             .map(|i| app.column_tasks(i).len())
@@ -3506,7 +3506,7 @@ mod tests {
     }
 
     /// Two workflows render side-by-side over the shared, project-wide
-    /// column set from `statuses.yml`. Headers show the canonical
+    /// column set from `statuses.yaml`. Headers show the canonical
     /// status names; per-card workflow names surface so the user can
     /// tell which workflow each card belongs to. Columns themselves no
     /// longer carry a workflow subscript — they're project-wide.
@@ -3558,7 +3558,7 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
 
-        // Canonical headers paint from statuses.yml. Canceled is empty
+        // Canonical headers paint from statuses.yaml. Canceled is empty
         // (no task) so it collapses to EMPTY_MIN_W — don't assert on it.
         assert!(rendered.contains("BACKLOG"), "BACKLOG missing:\n{rendered}");
         assert!(rendered.contains("TO DO"), "TO DO missing:\n{rendered}");
@@ -3581,7 +3581,7 @@ mod tests {
 
     /// With `workflow_filter` set, `compute_all_columns` narrows the
     /// column set to just the statuses that workflow declares — still
-    /// in `statuses.yml` declared order (workflows cannot reorder).
+    /// in `statuses.yaml` declared order (workflows cannot reorder).
     /// Clearing the filter restores the full project-wide column set.
     #[test]
     fn workflow_filter_narrows_columns_to_workflow_statuses() {
@@ -3600,7 +3600,7 @@ mod tests {
         assert_eq!(
             ids,
             vec!["backlog", "in-progress", "done"],
-            "narrowed to the workflow's statuses, in statuses.yml order"
+            "narrowed to the workflow's statuses, in statuses.yaml order"
         );
 
         app.workflow_filter = None;
@@ -3609,7 +3609,7 @@ mod tests {
     }
 
     /// A stale workflow filter (workflow no longer loaded) falls back
-    /// to the full statuses.yml column set so the board still paints.
+    /// to the full statuses.yaml column set so the board still paints.
     /// The filter itself isn't auto-cleared — the user can see the
     /// chip and dismiss it.
     #[test]
@@ -3872,7 +3872,7 @@ mod tests {
     /// When the minimum widths overflow the available area,
     /// `compute_column_widths` drops trailing columns from the visible
     /// window so the remaining ones fit. `scroll` then walks the
-    /// window forward. Synthesizes a 10-status `statuses.yml` so the
+    /// window forward. Synthesizes a 10-status `statuses.yaml` so the
     /// minimum total (10 × 14 = 140) overflows the 80-cell area.
     #[test]
     fn compute_column_widths_drops_overflow_and_scrolls() {
@@ -3902,7 +3902,7 @@ mod tests {
     }
 
     /// Full render with a workflow filter applied: only the statuses
-    /// the filtered workflow declares paint (in `statuses.yml` order),
+    /// the filtered workflow declares paint (in `statuses.yaml` order),
     /// and the workflow chip shows the active filter. The workspace
     /// chip stays in place beside it.
     #[test]
@@ -4487,7 +4487,7 @@ mod tests {
     }
 
     /// Per-task overlay reads from the **owning workflow**, not
-    /// `statuses.yml`. Two workflows declare the same status id; each
+    /// `statuses.yaml`. Two workflows declare the same status id; each
     /// resolves its task's branch template against the owning
     /// workflow's `git:` block, so two cards in the same column can
     /// render two different resolved branches. The acceptance criterion

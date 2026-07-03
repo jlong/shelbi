@@ -1,4 +1,4 @@
-//! Customizable keybindings — actions, chord parser, `keys.yml` loader,
+//! Customizable keybindings — actions, chord parser, `keys.yaml` loader,
 //! and platform-aware help-text rendering.
 
 pub mod actions;

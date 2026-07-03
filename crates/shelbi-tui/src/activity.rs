@@ -276,7 +276,7 @@ pub struct ActivityApp {
     /// [`render_pills`] and consumed by the mouse handler.
     pill_hits: Vec<PillHit>,
     /// Resolved per-mode chord → action maps used by the input handler.
-    /// Loaded once at construction from `~/.shelbi/keys.yml` (or the
+    /// Loaded once at construction from `~/.shelbi/keys.yaml` (or the
     /// embedded built-ins when no file exists) so a single key press is
     /// one HashMap lookup per layer rather than a long `match` chain.
     keymaps: Keymaps,
@@ -293,7 +293,7 @@ pub struct ActivityApp {
 impl ActivityApp {
     pub fn new(project_name: impl Into<String>) -> Self {
         let project_name = project_name.into();
-        // Diagnostics aren't surfaced here — bad/missing keys.yml falls
+        // Diagnostics aren't surfaced here — bad/missing keys.yaml falls
         // back to built-in defaults silently, same as every other handler
         // that consumes the loader. Surfacing them is the wizard's job.
         let (keymaps, _diags) = load_keymaps(Some(&project_name));
@@ -864,7 +864,7 @@ fn render_body(f: &mut Frame, app: &mut ActivityApp, area: Rect) {
 fn render_footer(f: &mut Frame, app: &ActivityApp, area: Rect) {
     // Every key glyph is sourced from the merged keymaps and rendered in
     // the host platform's convention — rebinding any of these actions in
-    // `keys.yml` updates the hint on next launch. Multi-bound actions show
+    // `keys.yaml` updates the hint on next launch. Multi-bound actions show
     // their first chord only (the full list lives in `config list-actions`).
     let km = app.keymaps();
     let style = app.display_style();

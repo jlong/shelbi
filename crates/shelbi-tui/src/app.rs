@@ -150,7 +150,7 @@ pub struct App {
     /// in the lower-left status block and the Alt+Z toggle direction.
     pub zen_mode: ZenModeState,
     /// Chord that toggles Zen Mode — resolved from
-    /// `keys.yml::defaults.global.zen_toggle` via
+    /// `keys.yaml::defaults.global.zen_toggle` via
     /// [`Keymaps::zen_toggle_chord`], falling back to the legacy
     /// `~/.shelbi/config.yaml::keymap.zen_toggle` for chords the
     /// four-value preset enum can't represent. Defaults to Alt+Z before
@@ -205,7 +205,7 @@ impl App {
 
     /// Borrow the keymaps populated at startup by `run_sidebar`. The
     /// sidebar handler reads this once per loop entry rather than
-    /// re-parsing `keys.yml` per keystroke.
+    /// re-parsing `keys.yaml` per keystroke.
     pub fn keymaps(&self) -> &Keymaps {
         &self.keymaps
     }

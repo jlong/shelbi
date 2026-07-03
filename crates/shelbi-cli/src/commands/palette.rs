@@ -140,7 +140,7 @@ impl State {
         // shows up in the palette on the next open.
         let mut app = App::new_sidebar(project);
         app.refresh().ok();
-        // Resolve the Zen toggle chord. Prefer the keys.yml binding
+        // Resolve the Zen toggle chord. Prefer the keys.yaml binding
         // (canonical source of truth after the legacy migration); fall
         // back to the legacy `config.yaml` field for non-preset chords
         // the four-value enum can't represent. Defaults to Alt+Z on a
@@ -201,12 +201,12 @@ impl Drop for TerminalGuard {
 fn format_diag(d: &KeymapDiagnostic) -> String {
     match d {
         KeymapDiagnostic::Error { message, location, .. } => match location {
-            Some(loc) => format!("keys.yml error [{loc}]: {message}"),
-            None => format!("keys.yml error: {message}"),
+            Some(loc) => format!("keys.yaml error [{loc}]: {message}"),
+            None => format!("keys.yaml error: {message}"),
         },
         KeymapDiagnostic::Warning { message, location, .. } => match location {
-            Some(loc) => format!("keys.yml warning [{loc}]: {message}"),
-            None => format!("keys.yml warning: {message}"),
+            Some(loc) => format!("keys.yaml warning [{loc}]: {message}"),
+            None => format!("keys.yaml warning: {message}"),
         },
     }
 }

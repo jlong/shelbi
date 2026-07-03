@@ -99,7 +99,7 @@ pub enum Error {
     #[error("invalid workflow: {0}")]
     InvalidWorkflow(String),
 
-    #[error("invalid statuses.yml: {0}")]
+    #[error("invalid statuses.yaml: {0}")]
     InvalidProjectStatuses(String),
 
     /// A workflow's `git:` block references one or more `{{var}}`

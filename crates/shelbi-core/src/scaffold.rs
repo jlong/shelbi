@@ -1,7 +1,7 @@
 //! Self-documenting scaffolds for the config files `shelbi init` writes.
 //!
 //! Every file shelbi materializes — the project `<name>.yaml`, a project's
-//! `workflows/default.yaml`, its `workflows/statuses.yml`, and the hub-wide
+//! `workflows/default.yaml`, its `workflows/statuses.yaml`, and the hub-wide
 //! `config.yaml` — ships with the required fields populated *and* a
 //! commented-out example for every optional feature, each explained inline,
 //! under a header comment pointing at the full reference docs. Opening the
@@ -245,7 +245,7 @@ pub fn decorate_project_yaml(active: &str) -> String {
 const WORKFLOW_HEADER: &str = "\
 ## Shelbi workflow — full reference: https://shelbi.dev/docs/configuration/workflow
 ## Statuses are reference-only (id + owner + optional agent); each status's
-## display name & category live in workflows/statuses.yml. Commented blocks
+## display name & category live in workflows/statuses.yaml. Commented blocks
 ## below are optional: uncomment to enable.
 
 ";
@@ -301,7 +301,7 @@ pub fn default_workflow_yaml() -> Result<String> {
 }
 
 // ---------------------------------------------------------------------------
-// statuses.yml
+// statuses.yaml
 
 const STATUSES_HEADER: &str = "\
 ## Shelbi statuses — full reference: https://shelbi.dev/docs/configuration/statuses
@@ -326,7 +326,7 @@ const STATUSES_SECTIONS: &[Section] = &[Section {
 ",
 }];
 
-/// The self-documenting `workflows/statuses.yml` written for a fresh project:
+/// The self-documenting `workflows/statuses.yaml` written for a fresh project:
 /// the serialized [`default_project_statuses`] plus a header and a commented
 /// example of adding custom statuses.
 pub fn default_statuses_yaml() -> Result<String> {
@@ -343,19 +343,19 @@ pub fn default_statuses_yaml() -> Result<String> {
 /// The self-documenting hub-wide `~/.shelbi/config.yaml`. Everything here is
 /// optional (absent/partial files fall back to defaults), so the file ships
 /// the one current knob at its default value with the alternatives documented
-/// inline and a pointer to the sibling `keys.yml`.
+/// inline and a pointer to the sibling `keys.yaml`.
 pub const CONFIG_YAML: &str = "\
 ## Shelbi global config — full reference: https://shelbi.dev/docs/configuration/global
 ## Per-user UI preferences, applied across every project on this machine.
 ## Absent or partial files fall back to built-in defaults.
 
 keymap:
-  ## Chord that toggles Zen Mode. Legacy — prefer setting this in keys.yml
+  ## Chord that toggles Zen Mode. Legacy — prefer setting this in keys.yaml
   ## (defaults.global.zen_toggle). One of: alt-z (default), ctrl-backslash,
   ## ctrl-g, ctrl-shift-z, none.
   zen_toggle: alt-z
 
-## Keybinding overrides live in the sibling file ~/.shelbi/keys.yml.
+## Keybinding overrides live in the sibling file ~/.shelbi/keys.yaml.
 ## See https://shelbi.dev/docs/configuration/global
 ";
 

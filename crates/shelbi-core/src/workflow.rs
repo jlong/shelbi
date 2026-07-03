@@ -342,7 +342,7 @@ impl Workflow {
     }
 
     /// Resolve a parsed-but-unfilled workflow against a [`ProjectStatuses`]
-    /// loaded from `workflows/statuses.yml`. Fills in each status's
+    /// loaded from `workflows/statuses.yaml`. Fills in each status's
     /// `name` + `category` from the project-wide source of truth, errors
     /// if a workflow declares an `id` the project doesn't know about, and
     /// runs [`Workflow::validate`] afterward.
@@ -364,7 +364,7 @@ impl Workflow {
                     .join(", ");
                 workflow_err(format!(
                     "workflow `{wf}`: status id `{id}` is not declared in \
-                     `workflows/statuses.yml` (available: {available})",
+                     `workflows/statuses.yaml` (available: {available})",
                     wf = self.name,
                     id = st.id,
                 ))
@@ -378,7 +378,7 @@ impl Workflow {
 
     /// Probe the raw YAML form of this workflow for inline `name:` or
     /// `category:` fields under any `statuses:` entry. Used by the
-    /// loader to enforce "once `statuses.yml` is in place, workflow
+    /// loader to enforce "once `statuses.yaml` is in place, workflow
     /// files must use the reference-only form."
     ///
     /// Returns the list of status ids that still carry inline identity
@@ -601,7 +601,7 @@ pub fn default_workflow() -> Workflow {
 /// the orchestrator dispatches a task in this status to a worker
 /// running that agent's prompt. The same status id can carry different
 /// `agent` values across workflows; identity (`name`, `category`,
-/// ordering) is project-wide and lives in `workflows/statuses.yml`
+/// ordering) is project-wide and lives in `workflows/statuses.yaml`
 /// (loaded via [`Workflow::resolve_against`] when the loader joins the
 /// two files).
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
@@ -621,7 +621,7 @@ impl serde::Serialize for Status {
     fn serialize<S: serde::Serializer>(&self, s: S) -> std::result::Result<S::Ok, S::Error> {
         // Post-migration on-disk shape: `id` + `owner` + optional
         // `agent` only. `name` and `category` belong to
-        // `workflows/statuses.yml`; emitting them here would duplicate
+        // `workflows/statuses.yaml`; emitting them here would duplicate
         // the source of truth and re-introduce the conflict class the
         // split was designed to eliminate. The loader's
         // [`Workflow::resolve_against`] step fills both back in on
@@ -982,7 +982,7 @@ struct RawStatus {
     /// (which carry only `id` + `owner` + optional `agent`) parse
     /// without erroring. When missing, [`convert_raw_workflow`]
     /// leaves a `Backlog` sentinel; the loader replaces it with the
-    /// real value from `workflows/statuses.yml` via
+    /// real value from `workflows/statuses.yaml` via
     /// [`Workflow::resolve_against`].
     #[serde(default)]
     category: Option<StatusCategory>,
@@ -1030,7 +1030,7 @@ fn convert_raw_workflow(raw: RawWorkflow) -> crate::Result<(Workflow, Vec<Status
     for st in raw.statuses {
         let (id, name) = resolve_id_name(st.id, st.name)?;
         // Sentinel when `category:` is absent on the wire — the loader
-        // fills it in from `workflows/statuses.yml` via
+        // fills it in from `workflows/statuses.yaml` via
         // [`Workflow::resolve_against`] before any validation that
         // depends on the real value runs.
         // Pass the *wire* category (which may be absent) to the owner
@@ -1116,7 +1116,7 @@ fn resolve_owner_agent(
                         )));
                     }
                     // `category:` was absent on the wire (it gets filled in
-                    // later from `workflows/statuses.yml`), so we can't
+                    // later from `workflows/statuses.yaml`), so we can't
                     // derive a default yet and must not blame the sentinel
                     // `backlog` category the loader uses as a placeholder.
                     None => {
@@ -1398,9 +1398,9 @@ statuses:
     #[test]
     fn round_trips_through_yaml_via_resolve_against() {
         // Post-migration round-trip: serialize the compact form, parse
-        // it back, resolve against the canonical `statuses.yml`. The
+        // it back, resolve against the canonical `statuses.yaml`. The
         // wire form drops `name:`/`category:` from each status entry —
-        // identity lives in `workflows/statuses.yml` after migration.
+        // identity lives in `workflows/statuses.yaml` after migration.
         let wf = default_workflow();
         let y = serde_yaml::to_string(&wf).unwrap();
         // Identity fields are absent on the wire — that's the contract.
@@ -1437,7 +1437,7 @@ statuses:
         // YAML deserialization (serde rename_all = "snake_case") accepts
         // `archived` as a category — a workflow with a `Canceled`/`Won't
         // Fix` terminal status needs this to land on disk via
-        // `workflows/statuses.yml`.
+        // `workflows/statuses.yaml`.
         let yaml = r#"
 statuses:
   - { id: canceled, name: Canceled, category: archived }
@@ -2175,7 +2175,7 @@ transitions:
     #[test]
     fn workflow_git_round_trips_through_yaml() {
         // Post-migration round-trip: identity fields (`name`, `category`)
-        // live in `workflows/statuses.yml`, so the workflow YAML round-trip
+        // live in `workflows/statuses.yaml`, so the workflow YAML round-trip
         // goes through `resolve_against` to refill them.
         let yaml = r#"
 name: feature-task
@@ -2328,12 +2328,12 @@ zen:
     }
 
     // ---------------------------------------------------------------------
-    // resolve_against + inline-identity probe (statuses.yml)
+    // resolve_against + inline-identity probe (statuses.yaml)
 
     #[test]
     fn resolve_against_fills_name_and_category_from_project_statuses() {
         // Workflow declares status ids only — identity comes from the
-        // canonical `statuses.yml`. The resolver fills `name` +
+        // canonical `statuses.yaml`. The resolver fills `name` +
         // `category` from there.
         let workflow_yaml = r#"
 name: app
@@ -2383,7 +2383,7 @@ statuses:
     #[test]
     fn inline_identity_fields_detects_legacy_form() {
         // The loader uses this probe to refuse a workflow that still
-        // carries inline `name:` / `category:` after `statuses.yml` is
+        // carries inline `name:` / `category:` after `statuses.yaml` is
         // already on disk — the post-migration "mixed forms" hard-fail.
         let yaml = r#"
 name: w

@@ -38,7 +38,7 @@ pub fn run(project_opt: Option<String>) -> Result<()> {
     // --root at a fresh path), this puts the layout back; if the root is
     // unwritable, it hard-fails with a source-tagged error.
     shelbi_state::ensure_root_subdirs().map_err(|e| anyhow!(e))?;
-    // Touching `load_project` runs the `workflows/statuses.yml` +
+    // Touching `load_project` runs the `workflows/statuses.yaml` +
     // `workflows/default.yaml` materialization migration as a side
     // effect. The pane respawn below already triggers `load_project`
     // indirectly, but doing it here makes the contract explicit:

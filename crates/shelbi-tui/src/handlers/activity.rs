@@ -102,7 +102,7 @@ mod tests {
     fn default_app_and_keymaps() -> (ActivityApp, Keymaps) {
         let app = ActivityApp::new("demo");
         // Match what ActivityApp::new loads, but with a deterministic
-        // call site so the tests don't depend on any keys.yml that
+        // call site so the tests don't depend on any keys.yaml that
         // happens to sit under the caller's $SHELBI_HOME.
         let (km, _diags) = load_keymaps(None);
         (app, km)
@@ -285,7 +285,7 @@ mod tests {
         assert!(app.status_line.is_empty());
     }
 
-    /// User-keys.yml override moves `toggle_zen_filter` from `z` to
+    /// User-keys.yaml override moves `toggle_zen_filter` from `z` to
     /// `Shift+Z`: the acceptance criterion's worked example. Verifies the
     /// dispatcher actually reads `Keymaps` rather than re-hardcoding the
     /// chord at the call site.

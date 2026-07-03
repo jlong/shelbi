@@ -156,7 +156,7 @@ pub fn scaffold_with_prompt(args: Args) -> Result<ResolvedProjectRoot> {
     }
 
     // Drop a self-documenting hub-wide `config.yaml` if one isn't present yet,
-    // so the UI preferences (and the pointer to keys.yml) are discoverable
+    // so the UI preferences (and the pointer to keys.yaml) are discoverable
     // inline. Idempotent — never clobbers an existing config.
     if shelbi_state::scaffold_user_config_if_missing().map_err(|e| anyhow!(e))? {
         let cfg_path = shelbi_state::user_config_path().map_err(|e| anyhow!(e))?;
@@ -414,7 +414,7 @@ fn scaffold_project(resolved: &ResolvedProjectRoot, mode: InitMode) -> Result<()
         print_agent_materialize_outcome(&outcome);
     }
 
-    // Materialize `workflows/statuses.yml` so a fresh project ships with
+    // Materialize `workflows/statuses.yaml` so a fresh project ships with
     // the project-wide status catalogue alongside its starter
     // `default.yaml`. `load_project` runs the same migration when the
     // project is opened, but writing it here keeps `shelbi init`'s

@@ -180,7 +180,7 @@ enum Cmd {
     },
     /// Inspect and validate the user's keybinding configuration.
     /// `list-actions` shows every action's current chord(s); `dump-keybindings`
-    /// writes a starter `keys.yml`; `check` validates `~/.shelbi/keys.yml`
+    /// writes a starter `keys.yaml`; `check` validates `~/.shelbi/keys.yaml`
     /// and reports any errors/warnings.
     Config {
         #[command(subcommand)]
