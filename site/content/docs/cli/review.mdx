@@ -25,6 +25,37 @@ By default the command runs on the machine of the task's `assigned_to`
 workspace (when that machine declares review workspaces), else the first
 machine that declares one. Pass `--machine` to override.
 
+A task loaded for review — its card sits in `REVIEW`, and the sidebar's
+"Ready for Review" section lists it against the review workspace serving it:
+
+<AppMockup
+  project="shelbi"
+  columns={[
+    { label: "BACKLOG", category: "gray", cards: [
+      { title: "Draft Q3 roadmap", id: "t-006" },
+    ] },
+    { label: "TO DO", category: "blue", cards: [
+      { title: "Add ratelimit to API", id: "t-007" },
+    ] },
+    { label: "IN PROGRESS", category: "yellow", cards: [
+      { title: "Deploy staging env", id: "t-009", workspace: "alpha" },
+    ] },
+    { label: "REVIEW", category: "magenta", cards: [
+      { title: "Rewrite auth flow", id: "t-011", workspace: "review-1", selected: true },
+    ] },
+    { label: "DONE", category: "green", cards: [
+      { title: "Ship dark-mode toggle", id: "t-013" },
+    ] },
+  ]}
+  machines={[
+    { name: "hub", workspaces: [
+      { name: "alpha", state: "working", agent: "Developer" },
+      { name: "review-1", state: "working", agent: "Review" },
+    ] },
+  ]}
+  review={[{ title: "Rewrite auth flow", workspace: "review-1" }]}
+/>
+
 > **This replaced the old review flow.** Earlier, `shelbi review` checked the
 > branch into a per-machine review `work_dir` and launched a bare
 > `review-claude` pane. That path is retired: review workspaces are the

@@ -8,27 +8,24 @@ summary: Manage the per-project workflow YAML files — list, show, scaffold, an
 shelbi workflow <SUBCOMMAND> [OPTIONS]
 ```
 
-`shelbi workflow` manages the YAML files that declare what statuses a task
-moves through, who owns each one, and which git side-effects fire on each
-transition. Every project ships with a built-in `default` workflow — the
-canonical five-status flow (`Backlog → Todo → InProgress → Review → Done`) —
-and these subcommands surface it and any custom workflows the project has
-authored.
+`shelbi workflow` manages the YAML files that declare the statuses a task moves
+through, who owns each one, and which git side-effects fire on each transition.
+Every project has a built-in `default` workflow — the canonical five-status
+flow (`Backlog → Todo → InProgress → Review → Done`) — and these subcommands
+surface it alongside any custom workflows the project authors.
 
-Workflow files live at `<config-root>/workflows/<name>.yaml`, where
-`<config-root>` is `~/.shelbi/projects/<project>/` in the default
-[global mode](/docs/concepts/config-modes) and `<repo>/.shelbi/` in
-in-repo mode. A file's basename is its name; the in-file `name:` field
-must match. The loader auto-creates `default.yaml` on first load when
-the directory is empty, so most projects never need to touch this
-command — it's there when you want a second pipeline (a docs-only flow,
-a research track that never opens PRs, a feature-stacking flow off a
-long-lived branch).
+The default is virtual: it lives in code, not on disk, until `workflow new` or
+`workflow edit` writes a file. Workflow files live at
+`<config-root>/workflows/<name>.yaml` — `<config-root>` is
+`~/.shelbi/projects/<project>/` in the default
+[global mode](/docs/concepts/config-modes), `<repo>/.shelbi/` in in-repo mode.
+A file's basename is its name; the in-file `name:` field must match. Most
+projects never touch this command — reach for it when you want a second
+pipeline: a docs-only flow, a research track that never opens PRs, a
+feature-stacking flow off a long-lived branch.
 
-Every subcommand accepts the global `-p / --project <PROJECT>` flag to
-target a specific project (otherwise the active `$SHELBI_PROJECT` or the
-registered project whose `work_dir` contains the current directory wins).
-It's omitted from the per-subcommand tables below to keep them readable.
+Every subcommand accepts the global `-p / --project <PROJECT>` flag, omitted
+from the per-subcommand tables below.
 
 ## list
 
@@ -52,11 +49,11 @@ When the workflows directory is empty, the only entry is the built-in
 shelbi workflow show <NAME>
 ```
 
-Print a workflow's YAML to stdout. Equivalent to `cat`-ing the file, with
-one convenience: `show default` succeeds even before any file has been
-written — the built-in default is serialized from code with a header
-comment pointing at `workflow new default` / `workflow edit default` for
-customization. Any other missing name errors with the resolved file path.
+Print the workflow's per-status table — `STATUS`, `OWNER`, and `AGENT` for
+each status, in the canonical `statuses.yml` order (statuses the workflow
+doesn't declare are dropped). `show default` works even before any file is
+written, rendering the built-in default from code; any other missing name
+errors with the resolved file path.
 
 ## new
 

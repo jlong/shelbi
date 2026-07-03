@@ -8,12 +8,11 @@ summary: Merge a workspace's branch into the project's default branch, locally o
 shelbi merge [OPTIONS] <ID>
 ```
 
-`shelbi merge` is the bridge between a task in `review` and a clean
-default branch. By default it performs a local squash-merge of the
-task's branch into the project's default branch (typically `main`)
-using the workspace's commit message. Pass `--pr` to push the branch
-and open a GitHub pull request instead — useful when your team's
-workflow requires a code-review roundtrip before anything lands.
+`shelbi merge` bridges a task in `review` and a clean default branch. By
+default it squash-merges the task's branch into the project's default branch
+(typically `main`) using the workspace's commit message. Pass `--pr` to push
+the branch and open a GitHub pull request instead — for teams that require a
+code-review roundtrip before anything lands.
 
 The command does not move the card. After a successful local merge, the
 orchestrator's "merged → done" sweep (or you, manually) moves the task to

@@ -8,17 +8,49 @@ summary: Manage the project's Kanban task board — add, list, move, assign, and
 shelbi task <SUBCOMMAND> [OPTIONS]
 ```
 
-`shelbi task` is the CLI face of the Kanban board. Every card on the board is
-a file under `~/.shelbi/projects/<project>/tasks/` and every column transition
-becomes a line in `~/.shelbi/events.log`. The TUI's tasks pane is one view on
-top of this; the CLI is another. The orchestrator drives the board through
-this command — most user-facing edits flow through the kanban view, but
-scripting, automation, and one-off fixes all live here.
+`shelbi task` is the CLI face of the Kanban board. Each card is a file under
+`~/.shelbi/projects/<project>/tasks/`; each column transition appends a line to
+`~/.shelbi/events.log`. The TUI's tasks pane and this command are two views on
+the same files. The orchestrator drives the board through it, and it's where
+scripting, automation, and one-off fixes live.
 
-Every subcommand accepts the global `-p / --project <PROJECT>` flag to target
-a specific project (otherwise the active `$SHELBI_PROJECT` or the registered
-project whose `work_dir` contains the current directory wins). It's omitted
-from the per-subcommand tables below to keep them readable.
+A board mid-flight — one task promoted to `TO DO`, one dispatched to a
+workspace, one already `DONE`:
+
+<AppMockup
+  project="shelbi"
+  columns={[
+    { label: "BACKLOG", category: "gray", cards: [
+      { title: "Audit third-party licenses", id: "t-005" },
+      { title: "Draft Q3 roadmap", id: "t-006" },
+    ] },
+    { label: "TO DO", category: "blue", cards: [
+      { title: "Write CLI reference pages", id: "t-012" },
+    ] },
+    { label: "IN PROGRESS", category: "yellow", cards: [
+      { title: "Write changelog page", id: "t-013", workspace: "delta" },
+    ] },
+    { label: "REVIEW", category: "magenta", cards: [] },
+    { label: "DONE", category: "green", cards: [
+      { title: "Getting-started section", id: "t-004" },
+    ] },
+  ]}
+  machines={[
+    { name: "hub", workspaces: [
+      { name: "alpha", state: "idle" },
+      { name: "bravo", state: "idle" },
+    ] },
+    { name: "devbox", workspaces: [
+      { name: "delta", state: "working", agent: "Developer" },
+    ] },
+  ]}
+  review={[]}
+/>
+
+Every subcommand accepts the global `-p / --project <PROJECT>` flag: it targets
+the named project, otherwise `$SHELBI_PROJECT` or the registered project whose
+`work_dir` contains the current directory. It's omitted from the per-subcommand
+tables below.
 
 ## add
 
@@ -87,17 +119,15 @@ Edit a task's dependency list without opening the file.
 shelbi task move --to <STATUS> [OPTIONS] <ID>
 ```
 
-Move a task between statuses. Promoting a task to `todo` is the start signal
-for the orchestrator — it picks a free workspace and calls `task start` on
-its own.
+Move a task between statuses. Promoting to `todo` is the orchestrator's start
+signal — it picks a free workspace and runs `task start` itself.
 
-The destination column is validated against the task's workflow — moving
-to a status the workflow doesn't declare errors with the list of valid
-statuses and the task stays put. Tasks pinned to a workflow that has no
-YAML on disk fall back to the canonical `default` workflow so legacy
-projects keep moving while the workflows directory is empty. Column ↔
-status comparison is case- and punctuation-insensitive (`InProgress` in
-the YAML matches `in_progress` on the CLI).
+The destination is validated against the task's workflow. A status the workflow
+doesn't declare — or a custom status with no backing column — errors with the
+list of reachable statuses, and the task stays put. Matching is case- and
+punctuation-insensitive (`InProgress` matches `in_progress`); a task pinned to a
+workflow with no YAML on disk falls back to the built-in `default`, so legacy
+projects keep moving while the workflows directory is empty.
 
 | Flag | Type | Default | Description |
 | --- | --- | --- | --- |
