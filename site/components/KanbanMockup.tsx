@@ -108,10 +108,19 @@ export type Machine = {
   workspaces: Workspace[]
 }
 
-/** One entry in the sidebar's "Ready for Review" section. */
-export type ReviewTask = {
+/**
+ * One entry in a sidebar review section, mirroring `ReviewEntry` /
+ * `Row::Review` in the crate. Rendered as two lines: line 1 is the badge +
+ * title (Ready adds the `machine:port` served URL right-aligned); line 2 is
+ * the `branch`, dim. `location` is set only for a Ready (serving) entry — a
+ * Queued one has no slot yet, so no URL.
+ */
+export type ReviewEntry = {
   title: string
-  workspace: string
+  /** Branch shown dim on line 2, e.g. `shelbi/<id>`. */
+  branch: string
+  /** `machine:port` served URL — present for Ready, omitted for Queued. */
+  location?: string
 }
 
 /** Which sidebar nav row is active — also drives the title-bar label. */
@@ -133,8 +142,17 @@ export type AppState = {
   columns: Column[]
   /** Sidebar machine groups and their workspaces. */
   machines: Machine[]
-  /** Sidebar "Ready for Review" entries; empty hides nothing but the rows. */
-  review: ReviewTask[]
+  /**
+   * Sidebar "Ready for Review" entries — tasks loaded on a review workspace
+   * and serving (cyan ✓, with a `machine:port` location). Empty hides the
+   * section.
+   */
+  readyReview: ReviewEntry[]
+  /**
+   * Sidebar "Queued for Review" entries — Review-status tasks waiting for a
+   * free review workspace (blue ·, no location yet). Empty hides the section.
+   */
+  queuedReview: ReviewEntry[]
 }
 
 const CATEGORY_COLOR: Record<Category, string> = {
@@ -444,36 +462,63 @@ function buildSidebarRows(state: AppState): Segment[][] {
     }
   }
 
-  // — Ready for Review — section: one row per entry with Cyan ✓, title,
-  // and the workspace right-aligned in DarkGray — same shape `Row::Review`
-  // renders via `right_align`. Omitted entirely when nothing is ready.
-  if (state.review.length > 0) {
+  // The Review state splits into two sidebar sections, matching `app.rs::rows`:
+  // "Ready for Review" (loaded on a review workspace, serving) then "Queued
+  // for Review" (waiting for a free slot). Each is omitted when empty.
+  const pushReviewSection = (label: string, entries: ReviewEntry[], ready: boolean) => {
+    if (entries.length === 0) return
     rows.push(SIDEBAR_BLANK_ROW)
     rows.push(
       padSidebarRow([
         { text: " " },
-        { text: "— Ready for Review —", color: TUI_DARK_GRAY },
+        { text: `— ${label} —`, color: TUI_DARK_GRAY },
       ]),
     )
-    for (const task of state.review) {
-      rows.push(
-        sidebarRightAlignRow(
-          [
-            { text: " " },
-            { text: "✓ ", color: TUI_CYAN },
-            {
-              text: truncate(task.title, SIDEBAR_W - 4 - task.workspace.length),
-              color: TUI_GRAY,
-            },
-          ],
-          task.workspace,
-          TUI_DARK_GRAY,
-        ),
-      )
+    for (const entry of entries) {
+      rows.push(...reviewEntryRows(entry, ready))
     }
   }
+  pushReviewSection("Ready for Review", state.readyReview, true)
+  pushReviewSection("Queued for Review", state.queuedReview, false)
 
   return rows
+}
+
+/**
+ * The two rows for one review entry, mirroring `Row::Review` in `sidebar.rs`.
+ * Line 1: the decoration badge + title, with the `machine:port` served URL
+ * right-aligned when the task is Ready (loaded on a review worktree). Line 2:
+ * the branch, dim. Ready uses a cyan `✓` and carries a location; Queued uses a
+ * blue `·` and has none yet. Titles/branches truncate the same way the TUI
+ * clips them against the pane width, so alignment stays character-perfect.
+ */
+function reviewEntryRows(entry: ReviewEntry, ready: boolean): Segment[][] {
+  const glyph = ready ? "✓" : "·"
+  const glyphColor = ready ? TUI_CYAN : TUI_BLUE
+  const location = ready ? entry.location : undefined
+
+  // Reserve columns for the 1-col sidebar pad, the 2-col badge, a 1-col gap,
+  // the 1-col trailing margin, and the right-aligned location, so the title
+  // truncates instead of forcing `sidebarRightAlignRow` to drop the URL.
+  const titleWidth = location
+    ? SIDEBAR_W - 5 - [...location].length
+    : SIDEBAR_W - 3
+  const left: Segment[] = [
+    { text: " " },
+    { text: `${glyph} `, color: glyphColor },
+    { text: truncate(entry.title, Math.max(1, titleWidth)), color: TUI_GRAY },
+  ]
+  const line1 = location
+    ? sidebarRightAlignRow(left, location, TUI_DARK_GRAY)
+    : padSidebarRow(left)
+
+  // Branch under the title, indented past the badge column, dim in both
+  // states — clipped to the sidebar width like the TUI does.
+  const line2 = padSidebarRow([
+    { text: " " },
+    { text: `  ${truncate(entry.branch, SIDEBAR_W - 3)}`, color: TUI_DARK_GRAY },
+  ])
+  return [line1, line2]
 }
 
 // ── Panels ────────────────────────────────────────────────────────────
@@ -649,8 +694,9 @@ export function AppMockup({
 /**
  * The full five-column dashboard the marketing landing page has always
  * shown: a busy board with a selected review card, two machines of
- * workspaces, and one ready-for-review entry. `KanbanMockup` renders this
- * verbatim, so the landing page is unchanged.
+ * workspaces, and both review sections populated — tasks Ready for Review
+ * (served on a review workspace) and Queued for Review (waiting for a free
+ * slot). `KanbanMockup` renders this verbatim.
  */
 export const defaultAppState: AppState = {
   terminalTitle: "jlong@hub — my-project",
@@ -706,14 +752,13 @@ export const defaultAppState: AppState = {
       label: "REVIEW",
       category: "magenta",
       cards: [
-        {
-          title: "Cache warm-up on cold start",
-          id: "t-011",
-          workspace: "charlie",
-          selected: true,
-        },
-        { title: "CSV idempotency", id: "t-018", workspace: "golf" },
-        { title: "Nightly report fix", id: "t-024", workspace: "hotel" },
+        // Served on a review workspace (→ Ready for Review in the sidebar).
+        { title: "Cold-start cache", id: "t-011", workspace: "charlie", selected: true },
+        { title: "CSV import fix", id: "t-018", workspace: "golf" },
+        { title: "Nightly report", id: "t-024", workspace: "hotel" },
+        // No review workspace free yet (→ Queued for Review in the sidebar).
+        { title: "Validate webhook payloads", id: "t-023" },
+        { title: "Harden token refresh", id: "t-025" },
       ],
     },
     {
@@ -753,10 +798,17 @@ export const defaultAppState: AppState = {
       ],
     },
   ],
-  review: [
-    { title: "Cache warm-up on cold start", workspace: "charlie" },
-    { title: "CSV idempotency", workspace: "golf" },
-    { title: "Nightly report fix", workspace: "hotel" },
+  // Ready = the three served REVIEW cards, each loaded on a review workspace
+  // and serving at its `machine:port`. Queued = the two Review-status cards
+  // still waiting, because all three review workspaces are busy.
+  readyReview: [
+    { title: "Cold-start cache", branch: "shelbi/cold-start-cache", location: "hub:3000" },
+    { title: "CSV import fix", branch: "shelbi/csv-import-fix", location: "devbox:3000" },
+    { title: "Nightly report", branch: "shelbi/nightly-report", location: "devbox:3001" },
+  ],
+  queuedReview: [
+    { title: "Validate webhook payloads", branch: "shelbi/validate-webhook-payloads" },
+    { title: "Harden token refresh", branch: "shelbi/harden-token-refresh" },
   ],
 }
 
@@ -791,7 +843,8 @@ export const starterAppState: AppState = {
       workspaces: [{ name: "alpha", state: "idle" }],
     },
   ],
-  review: [],
+  readyReview: [],
+  queuedReview: [],
 }
 
 /** Preset scenarios addressable by name from `<AppMockup preset="…" />`. */
