@@ -712,6 +712,12 @@ pub(super) fn print_agent_materialize_outcome(outcome: &AgentMaterializeOutcome)
         AgentMaterializeOutcome::Unchanged { agent } => {
             println!("(agent workspace already exists: agents/{agent}/)");
         }
+        AgentMaterializeOutcome::Upgraded { agent } => {
+            println!(
+                "✓ upgraded agents/{agent}/instructions.md to the new bundled default \
+                 (was the previous default, untouched — nothing to preserve)"
+            );
+        }
         AgentMaterializeOutcome::Preserved { agent, first_notice } => {
             if *first_notice {
                 println!(

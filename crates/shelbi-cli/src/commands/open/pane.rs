@@ -500,6 +500,29 @@ mod tests {
     use std::collections::BTreeMap;
     use std::os::unix::process::ExitStatusExt;
     use std::path::{Path, PathBuf};
+    use std::time::Duration;
+
+    /// Poll for `child` to exit, up to `timeout`; return its status if it does,
+    /// otherwise SIGKILL + reap it and return `None`. Lets a test that expects
+    /// a child to have been signaled fail fast instead of blocking the whole
+    /// test binary on an unbounded `wait()` if the signal was ever missed.
+    fn wait_or_kill(
+        child: &mut std::process::Child,
+        timeout: Duration,
+    ) -> Option<std::process::ExitStatus> {
+        let deadline = std::time::Instant::now() + timeout;
+        loop {
+            match child.try_wait().expect("try_wait on child") {
+                Some(status) => return Some(status),
+                None if std::time::Instant::now() >= deadline => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return None;
+                }
+                None => std::thread::sleep(Duration::from_millis(5)),
+            }
+        }
+    }
 
     #[test]
     fn wrapper_invocation_quotes_each_segment() {
@@ -902,6 +925,25 @@ mod tests {
             .stderr(Stdio::null())
             .spawn()
             .expect("spawn tail");
+
+        // Wait until the tail's argv is visible in /proc as *our* tail before
+        // recording its pid and signaling it. `Command::spawn` can return in
+        // the sliver between fork and the exec'd argv becoming readable in
+        // `/proc/<pid>/cmdline`; signaling in that window makes the identity
+        // guard (`pid_is_task_tail`) read an empty cmdline, skip the SIGTERM,
+        // and leave the tail alive — which used to hang the unbounded
+        // `child.wait()` below and, with it, the whole test binary. Production
+        // never sees this window: the tail lives for the entire agent session
+        // before cleanup runs.
+        let pid = child.id() as libc::pid_t;
+        let ready_deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while !pid_is_task_tail(pid, "feat-x") {
+            assert!(
+                std::time::Instant::now() < ready_deadline,
+                "tail never became identifiable in /proc within 5s",
+            );
+            std::thread::sleep(Duration::from_millis(2));
+        }
         std::fs::write(lock_dir.join("pid"), child.id().to_string()).unwrap();
 
         kill_task_tail(&worktree, "feat-x").expect("kill must succeed");
@@ -912,8 +954,10 @@ mod tests {
             "lock dir should be cleaned up: {}",
             lock_dir.display()
         );
-        // Child got the signal — wait reaps it within a tiny window.
-        let status = child.wait().expect("wait tail");
+        // Child got the signal — reap it, but bound the wait so a missed kill
+        // fails loudly instead of hanging the whole test binary.
+        let status = wait_or_kill(&mut child, Duration::from_secs(5))
+            .expect("kill_task_tail should have signaled the tail; it never exited");
         assert!(
             !status.success(),
             "killed tail should not report success: {status:?}"

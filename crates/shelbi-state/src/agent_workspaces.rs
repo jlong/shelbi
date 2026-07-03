@@ -31,8 +31,8 @@ use std::path::PathBuf;
 use shelbi_core::{Error, Result};
 
 use crate::{
-    agents_dir, atomic_write, ensure_dir, load_shelbi_config, project_dir, update_state,
-    DEFAULT_WORKSPACE_SETTINGS_TEMPLATE,
+    agents_dir, atomic_write, ensure_dir, load_shelbi_config, project_dir, read_state,
+    update_state, DEFAULT_WORKSPACE_SETTINGS_TEMPLATE,
 };
 
 /// Stable identifier of the default orchestrator agent.
@@ -428,6 +428,110 @@ pub fn is_default_agent(name: &str) -> bool {
     default_agent_body(name).is_some()
 }
 
+/// Stable content hash of a default agent body, used as the *provenance*
+/// fingerprint recorded in [`State::deployed_agent_defaults`] at deploy
+/// time and compared against on-disk content later.
+///
+/// FNV-1a, 64-bit. Dependency-free and — being pure integer arithmetic —
+/// stable across platforms and binary versions, which is all provenance
+/// needs: the same bytes always fingerprint to the same digest, so a
+/// later read can tell whether a file still equals the default that was
+/// deployed. It is *not* cryptographic; a hostile actor could craft a
+/// collision, but the failure mode (a crafted custom prompt reported as
+/// "pristine", or — in self-heal — auto-upgraded) is cosmetic, and agent
+/// prompts on a user's own machine aren't an adversarial input surface.
+pub fn content_hash(body: &str) -> String {
+    const OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+    const PRIME: u64 = 0x0000_0100_0000_01b3;
+    let mut h = OFFSET;
+    for b in body.as_bytes() {
+        h ^= u64::from(*b);
+        h = h.wrapping_mul(PRIME);
+    }
+    format!("{h:016x}")
+}
+
+/// Provenance-aware classification of a default agent's on-disk
+/// `instructions.md`, distinguishing the three states a naive
+/// byte-compare against the *currently compiled* default conflates.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AgentDivergence {
+    /// On-disk content equals the currently-compiled bundled default.
+    /// Nothing to do — the agent is running the shipped prompt.
+    PristineCurrent,
+    /// On-disk content equals the default that was *deployed* (its
+    /// recorded provenance hash) but no longer equals the current
+    /// compiled default — a newer `shelbi` shipped a new default and the
+    /// user never touched this file. Safe to auto-upgrade; must NOT be
+    /// reported as a user customization.
+    PristineStale,
+    /// On-disk content differs from the deployed default's provenance
+    /// hash — a genuine user edit. (Absent provenance, any content that
+    /// doesn't match the current compiled default also lands here, which
+    /// is the conservative pre-provenance byte-compare behavior.)
+    Customized,
+}
+
+/// Classify `on_disk` against the default that was deployed
+/// (`deployed_hash`, from [`State::deployed_agent_defaults`]) and the
+/// `current_default` compiled into this binary. This is the shared
+/// mechanism both the state-runtime self-heal path and the CLI
+/// `shelbi agent list` "customized?" marker route through, so a compiled
+/// default bump is interpreted identically on both surfaces.
+///
+/// The order matters: a file equal to the current default is
+/// [`AgentDivergence::PristineCurrent`] regardless of provenance (so a
+/// pre-provenance agent still reads correctly and gets its provenance
+/// backfilled); only then does a recorded provenance hash distinguish
+/// pristine-stale from customized.
+pub fn classify_agent_divergence(
+    deployed_hash: Option<&str>,
+    current_default: &str,
+    on_disk: &str,
+) -> AgentDivergence {
+    if on_disk == current_default {
+        return AgentDivergence::PristineCurrent;
+    }
+    if let Some(deployed) = deployed_hash {
+        if content_hash(on_disk) == deployed {
+            return AgentDivergence::PristineStale;
+        }
+    }
+    AgentDivergence::Customized
+}
+
+/// Read-only provenance classification of `agent`'s on-disk
+/// `instructions.md` for `project`. `Ok(None)` when `agent` isn't a
+/// shipped default (the "customized?" question doesn't apply). A missing
+/// `instructions.md` for a shipped default reads as
+/// [`AgentDivergence::Customized`] — it's divergent from the bundled body
+/// for reporting purposes (self-heal recreates it on the next reload).
+///
+/// Consults [`State::deployed_agent_defaults`] so a compiled-default bump
+/// doesn't misreport an untouched agent as customized. Read-only — unlike
+/// [`self_heal_default_agents`] it neither rewrites files nor backfills
+/// provenance; it's the query the CLI list marker uses.
+pub fn agent_divergence(project: &str, agent: &str) -> Result<Option<AgentDivergence>> {
+    let Some(default_body) = default_agent_body(agent) else {
+        return Ok(None);
+    };
+    let path = agent_instructions_path(project, agent)?;
+    let current = match fs::read_to_string(&path) {
+        Ok(s) => s,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(Some(AgentDivergence::Customized));
+        }
+        Err(e) => return Err(Error::Io(e)),
+    };
+    let state = read_state(project)?;
+    let deployed = state.deployed_agent_defaults.get(agent).map(String::as_str);
+    Ok(Some(classify_agent_divergence(
+        deployed,
+        default_body,
+        &current,
+    )))
+}
+
 /// Count of `*.md` files immediately under `<workspace>/skills/`. Returns
 /// 0 when the directory doesn't exist (an agent without a skills/ subdir
 /// is treated as having zero skills, not as an error). Non-recursive —
@@ -468,6 +572,12 @@ pub enum AgentMaterializeOutcome {
     /// The agent directory exists and `instructions.md` matches the
     /// bundled default byte-for-byte. Nothing changed.
     Unchanged { agent: String },
+    /// The agent directory exists and `instructions.md` matched the
+    /// *deployed* default's provenance hash but not the current compiled
+    /// default — an untouched file left stale by a `shelbi` upgrade. It
+    /// was auto-upgraded to the current bundled default in place (the
+    /// user never customized it, so there's nothing to preserve).
+    Upgraded { agent: String },
     /// The agent directory exists and `instructions.md` differs from
     /// the bundled default. Preserved as-is. `first_notice` is `true`
     /// when this is the first self-heal pass to observe the current
@@ -482,6 +592,7 @@ impl AgentMaterializeOutcome {
         match self {
             Self::Created { agent }
             | Self::Unchanged { agent }
+            | Self::Upgraded { agent }
             | Self::Preserved { agent, .. } => agent,
         }
     }
@@ -495,6 +606,7 @@ impl AgentMaterializeOutcome {
 /// Returns one outcome per default agent, in [`DEFAULT_AGENTS`] order.
 pub fn materialize_default_agents(project: &str) -> Result<Vec<AgentMaterializeOutcome>> {
     let mut outcomes = Vec::with_capacity(DEFAULT_AGENTS.len());
+    let mut created: Vec<&BundledAgent> = Vec::new();
     for agent in DEFAULT_AGENTS {
         let workspace = agent_workspace_dir(project, agent.name)?;
         if workspace.exists() {
@@ -504,9 +616,24 @@ pub fn materialize_default_agents(project: &str) -> Result<Vec<AgentMaterializeO
             continue;
         }
         write_bundled_agent(project, agent)?;
+        created.push(agent);
         outcomes.push(AgentMaterializeOutcome::Created {
             agent: agent.name.to_string(),
         });
+    }
+    // Record provenance for the agents we just deployed so a later
+    // compiled-default bump can tell an untouched file (still matching the
+    // hash recorded here) from a genuine user edit. Done in one locked
+    // state write after the file IO.
+    if !created.is_empty() {
+        update_state(project, |state| {
+            for agent in &created {
+                state
+                    .deployed_agent_defaults
+                    .insert(agent.name.to_string(), content_hash(agent.instructions));
+            }
+            Ok(())
+        })?;
     }
     Ok(outcomes)
 }
@@ -516,11 +643,22 @@ pub fn materialize_default_agents(project: &str) -> Result<Vec<AgentMaterializeO
 /// - Missing directory → recreate from the bundled default (`Created`).
 /// - `instructions.md` missing → drop the bundled default back in
 ///   (`Created`).
-/// - `instructions.md` byte-matches the bundled default → `Unchanged`.
-/// - `instructions.md` differs → leave it alone (`Preserved`). The
-///   `first_notice` field is set the first time the current divergent
-///   content is seen, tracked in [`State::notified_diverged_agents`] so
-///   the user-facing notice fires exactly once per divergence.
+/// - `instructions.md` equals the current compiled default → `Unchanged`.
+/// - `instructions.md` equals the *deployed* default's provenance hash
+///   but not the current compiled default (an untouched file left stale
+///   by a `shelbi` upgrade) → auto-upgraded in place to the current
+///   default (`Upgraded`), NOT reported as a customization.
+/// - `instructions.md` differs from the deployed provenance → a genuine
+///   user edit; left alone (`Preserved`). The `first_notice` field is set
+///   the first time the current divergent content is seen, tracked in
+///   [`State::notified_diverged_agents`] so the user-facing notice fires
+///   exactly once per divergence.
+///
+/// Every deploy / upgrade / pristine observation (re)records the agent's
+/// provenance in [`State::deployed_agent_defaults`] so a later
+/// compiled-default bump is classified against the default that was
+/// actually on disk, not the currently-compiled one. This is what stops
+/// an upgrade from flagging every untouched agent as customized.
 ///
 /// Also ensures the `skills/` subdir exists for every default agent.
 pub fn self_heal_default_agents(project: &str) -> Result<Vec<AgentMaterializeOutcome>> {
@@ -536,6 +674,9 @@ pub fn self_heal_default_agents(project: &str) -> Result<Vec<AgentMaterializeOut
             if !workspace.exists() {
                 write_bundled_agent(project, agent)?;
                 state.notified_diverged_agents.remove(agent.name);
+                state
+                    .deployed_agent_defaults
+                    .insert(agent.name.to_string(), content_hash(agent.instructions));
                 outcomes.push(AgentMaterializeOutcome::Created {
                     agent: agent.name.to_string(),
                 });
@@ -569,6 +710,9 @@ pub fn self_heal_default_agents(project: &str) -> Result<Vec<AgentMaterializeOut
                     // customization and preserve forever (F8).
                     atomic_write(&path, agent.instructions.as_bytes())?;
                     state.notified_diverged_agents.remove(agent.name);
+                    state
+                        .deployed_agent_defaults
+                        .insert(agent.name.to_string(), content_hash(agent.instructions));
                     outcomes.push(AgentMaterializeOutcome::Created {
                         agent: agent.name.to_string(),
                     });
@@ -577,19 +721,45 @@ pub fn self_heal_default_agents(project: &str) -> Result<Vec<AgentMaterializeOut
                 Err(e) => return Err(Error::Io(e)),
             };
 
-            if current == agent.instructions {
-                state.notified_diverged_agents.remove(agent.name);
-                outcomes.push(AgentMaterializeOutcome::Unchanged {
-                    agent: agent.name.to_string(),
-                });
-            } else {
-                let first_notice = state
-                    .notified_diverged_agents
-                    .insert(agent.name.to_string());
-                outcomes.push(AgentMaterializeOutcome::Preserved {
-                    agent: agent.name.to_string(),
-                    first_notice,
-                });
+            let deployed = state.deployed_agent_defaults.get(agent.name).map(String::as_str);
+            match classify_agent_divergence(deployed, agent.instructions, &current) {
+                AgentDivergence::PristineCurrent => {
+                    // Matches the current compiled default. Clear any stale
+                    // notice latch and (re)record provenance — this backfills
+                    // agents materialized by a pre-provenance binary.
+                    state.notified_diverged_agents.remove(agent.name);
+                    state
+                        .deployed_agent_defaults
+                        .insert(agent.name.to_string(), content_hash(agent.instructions));
+                    outcomes.push(AgentMaterializeOutcome::Unchanged {
+                        agent: agent.name.to_string(),
+                    });
+                }
+                AgentDivergence::PristineStale => {
+                    // Untouched since deploy, but the compiled default moved
+                    // on. The user never customized it, so auto-upgrade to
+                    // the new default in place and re-record provenance.
+                    atomic_write(&path, agent.instructions.as_bytes())?;
+                    state.notified_diverged_agents.remove(agent.name);
+                    state
+                        .deployed_agent_defaults
+                        .insert(agent.name.to_string(), content_hash(agent.instructions));
+                    outcomes.push(AgentMaterializeOutcome::Upgraded {
+                        agent: agent.name.to_string(),
+                    });
+                }
+                AgentDivergence::Customized => {
+                    // Genuine user edit — leave it untouched and keep the
+                    // recorded provenance so reverting to the deployed
+                    // default is recognized later. Fire the notice once.
+                    let first_notice = state
+                        .notified_diverged_agents
+                        .insert(agent.name.to_string());
+                    outcomes.push(AgentMaterializeOutcome::Preserved {
+                        agent: agent.name.to_string(),
+                        first_notice,
+                    });
+                }
             }
         }
 
@@ -788,6 +958,206 @@ mod tests {
             fs::read_to_string(agent_instructions_path("p", ORCHESTRATOR_AGENT).unwrap()).unwrap(),
             custom
         );
+
+        std::env::remove_var("SHELBI_HOME");
+    }
+
+    /// The shared provenance classifier is the whole fix in miniature:
+    /// against the default that was *deployed* (not the currently-compiled
+    /// one), an untouched-but-stale file reads pristine and a genuine edit
+    /// reads customized — including an edit that lands on some *other*
+    /// default's bytes.
+    #[test]
+    fn classify_distinguishes_stale_from_customized() {
+        let v1 = "# default v1\n";
+        let v2 = "# default v2\n";
+        let deployed = content_hash(v1);
+
+        // On-disk equals the current compiled default → pristine-current,
+        // regardless of what was deployed.
+        assert_eq!(
+            classify_agent_divergence(Some(&deployed), v2, v2),
+            AgentDivergence::PristineCurrent,
+        );
+        // Untouched since deploy but the compiled default bumped v1→v2 →
+        // pristine-stale (the upgrade false-positive the byte-compare hit).
+        assert_eq!(
+            classify_agent_divergence(Some(&deployed), v2, v1),
+            AgentDivergence::PristineStale,
+        );
+        // A genuine edit that differs from the deployed default → customized.
+        assert_eq!(
+            classify_agent_divergence(Some(&deployed), v2, "# my own\n"),
+            AgentDivergence::Customized,
+        );
+        // An edit that happens to match some *older* default (neither the
+        // deployed nor the current one) is still a real edit → customized
+        // (the byte-compare false-negative).
+        assert_eq!(
+            classify_agent_divergence(Some(&deployed), v2, "# default v0\n"),
+            AgentDivergence::Customized,
+        );
+        // No provenance recorded yet (pre-provenance binary) → fall back to
+        // a byte-compare against the current default.
+        assert_eq!(
+            classify_agent_divergence(None, v2, v2),
+            AgentDivergence::PristineCurrent,
+        );
+        assert_eq!(
+            classify_agent_divergence(None, v2, v1),
+            AgentDivergence::Customized,
+        );
+    }
+
+    /// Materialize records each deployed default's provenance hash so a
+    /// later compiled-default bump has a baseline to compare against.
+    #[test]
+    fn materialize_records_deployed_provenance() {
+        let _g = LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+
+        materialize_default_agents("p").unwrap();
+        let state = read_state("p").unwrap();
+        for agent in DEFAULT_AGENTS {
+            assert_eq!(
+                state.deployed_agent_defaults.get(agent.name).map(String::as_str),
+                Some(content_hash(agent.instructions).as_str()),
+                "provenance for {} should be the deployed default's hash",
+                agent.name,
+            );
+        }
+
+        std::env::remove_var("SHELBI_HOME");
+    }
+
+    /// Acceptance: bump the *compiled* default under an untouched agent and
+    /// self-heal auto-upgrades it in place — it is NOT flagged as a user
+    /// customization and fires no "you customized this" notice.
+    #[test]
+    fn self_heal_upgrades_untouched_agent_when_compiled_default_bumps() {
+        let _g = LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+
+        materialize_default_agents("p").unwrap();
+
+        // Simulate "shelbi was upgraded": the previous default (v1) is what
+        // sits on disk and what provenance was recorded for, while the
+        // current compiled default (DEFAULT_ORCHESTRATOR_INSTRUCTIONS) is v2.
+        let v1 = "# previous bundled default\nold guidance\n";
+        let path = agent_instructions_path("p", ORCHESTRATOR_AGENT).unwrap();
+        fs::write(&path, v1).unwrap();
+        update_state("p", |s| {
+            s.deployed_agent_defaults
+                .insert(ORCHESTRATOR_AGENT.to_string(), content_hash(v1));
+            Ok(())
+        })
+        .unwrap();
+
+        let outcomes = self_heal_default_agents("p").unwrap();
+        let orch = outcomes
+            .iter()
+            .find(|o| o.agent() == ORCHESTRATOR_AGENT)
+            .unwrap();
+        assert_eq!(
+            orch,
+            &AgentMaterializeOutcome::Upgraded {
+                agent: ORCHESTRATOR_AGENT.to_string(),
+            },
+            "an untouched-but-stale agent should upgrade, not flag as customized",
+        );
+        // File was rewritten to the current compiled default...
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            DEFAULT_ORCHESTRATOR_INSTRUCTIONS,
+        );
+        let state = read_state("p").unwrap();
+        // ...no customization notice fired...
+        assert!(!state.notified_diverged_agents.contains(ORCHESTRATOR_AGENT));
+        // ...and provenance was re-recorded to the new default.
+        assert_eq!(
+            state.deployed_agent_defaults.get(ORCHESTRATOR_AGENT).map(String::as_str),
+            Some(content_hash(DEFAULT_ORCHESTRATOR_INSTRUCTIONS).as_str()),
+        );
+
+        std::env::remove_var("SHELBI_HOME");
+    }
+
+    /// A genuine user edit is still preserved + flagged even when the
+    /// compiled default has since bumped away from what was deployed.
+    #[test]
+    fn self_heal_preserves_user_edit_across_a_compiled_default_bump() {
+        let _g = LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+
+        materialize_default_agents("p").unwrap();
+        // Provenance says v1 was deployed; the user then edited the file.
+        let v1 = "# previous bundled default\n";
+        let custom = "# my orchestrator\nlocal rules\n";
+        let path = agent_instructions_path("p", ORCHESTRATOR_AGENT).unwrap();
+        fs::write(&path, custom).unwrap();
+        update_state("p", |s| {
+            s.deployed_agent_defaults
+                .insert(ORCHESTRATOR_AGENT.to_string(), content_hash(v1));
+            Ok(())
+        })
+        .unwrap();
+
+        let outcomes = self_heal_default_agents("p").unwrap();
+        let orch = outcomes
+            .iter()
+            .find(|o| o.agent() == ORCHESTRATOR_AGENT)
+            .unwrap();
+        assert_eq!(
+            orch,
+            &AgentMaterializeOutcome::Preserved {
+                agent: ORCHESTRATOR_AGENT.to_string(),
+                first_notice: true,
+            },
+        );
+        // Edit untouched, and the deployed-default provenance is retained so
+        // reverting to v1 would later be recognized as pristine.
+        assert_eq!(fs::read_to_string(&path).unwrap(), custom);
+        assert_eq!(
+            read_state("p")
+                .unwrap()
+                .deployed_agent_defaults
+                .get(ORCHESTRATOR_AGENT)
+                .map(String::as_str),
+            Some(content_hash(v1).as_str()),
+        );
+
+        std::env::remove_var("SHELBI_HOME");
+    }
+
+    /// Read-only `agent_divergence` reports pristine-stale (not customized)
+    /// for an untouched agent after a compiled-default bump — the query the
+    /// CLI list marker uses.
+    #[test]
+    fn agent_divergence_reports_pristine_stale_after_bump() {
+        let _g = LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+
+        materialize_default_agents("p").unwrap();
+        let v1 = "# previous bundled default\n";
+        let path = agent_instructions_path("p", DEVELOPER_AGENT).unwrap();
+        fs::write(&path, v1).unwrap();
+        update_state("p", |s| {
+            s.deployed_agent_defaults
+                .insert(DEVELOPER_AGENT.to_string(), content_hash(v1));
+            Ok(())
+        })
+        .unwrap();
+
+        assert_eq!(
+            agent_divergence("p", DEVELOPER_AGENT).unwrap(),
+            Some(AgentDivergence::PristineStale),
+        );
+        // A non-default agent has nothing to compare against.
+        assert_eq!(agent_divergence("p", "qa").unwrap(), None);
 
         std::env::remove_var("SHELBI_HOME");
     }
