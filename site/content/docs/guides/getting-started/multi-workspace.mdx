@@ -1,6 +1,6 @@
 ---
 title: Run a multi-workspace dispatch loop
-order: 4
+order: 14
 summary: Fill the backlog, promote a stack of cards, and watch the orchestrator keep every workspace in your pool loaded with work in parallel.
 ---
 
@@ -104,7 +104,7 @@ shelbi task add "Update the OpenAPI spec for the new auth module" \
 The dependent card carries a `🔒` badge in the Kanban view and the
 orchestrator skips it during dispatch until every id in its
 `depends_on` list reaches `done`. See
-[dependent tasks](/docs/concepts/workflows#dependent-tasks-with-depends_on)
+[dependent tasks](/docs/guides/getting-started/workflows#dependent-tasks-with-depends_on)
 for the full state model.
 
 ## Promote everything to todo
@@ -257,7 +257,7 @@ Then move the card from `review` to `done` (`L` in the kanban view,
 or `shelbi task move <id> --to done`). The card is yours; the
 orchestrator only takes the `review` → `done` step when you've
 explicitly authorized it as part of [Zen
-Mode](/docs/getting-started/enable-zen-mode).
+Mode](/docs/guides/getting-started/enable-zen-mode).
 
 While you've been reviewing, the orchestrator has been working the
 backlog. By the time you finish accepting one branch, two more may be
@@ -296,7 +296,7 @@ move on.
 
 The orchestrator is now keeping every workspace fed without your
 involvement past triage and review. The next step is letting it
-initiate, too: [enable Zen Mode](/docs/getting-started/enable-zen-mode)
+initiate, too: [enable Zen Mode](/docs/guides/getting-started/enable-zen-mode)
 to have the orchestrator auto-promote eligible backlog cards and
 auto-merge finished branches that clear a project-defined confidence
 bar.

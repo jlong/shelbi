@@ -17,10 +17,36 @@ const nextConfig: NextConfig = {
     ];
   },
   async redirects() {
+    // Getting Started moved under Guides and the Workflows overview moved out
+    // of Concepts into that guide. Redirect the old public URLs so bookmarks,
+    // external links, and the `.md` variants keep resolving.
+    const gettingStartedPages = [
+      "install",
+      "first-project",
+      "first-task",
+      "multi-workspace",
+      "enable-zen-mode",
+      "custom-workflow",
+    ];
     return [
       {
         source: "/docs/concepts/columns",
-        destination: "/docs/concepts/workflows",
+        destination: "/docs/guides/getting-started/workflows",
+        permanent: true,
+      },
+      {
+        source: "/docs/concepts/workflows",
+        destination: "/docs/guides/getting-started/workflows",
+        permanent: true,
+      },
+      ...gettingStartedPages.map((page) => ({
+        source: `/docs/getting-started/${page}`,
+        destination: `/docs/guides/getting-started/${page}`,
+        permanent: true,
+      })),
+      {
+        source: "/docs/getting-started",
+        destination: "/docs/guides/getting-started",
         permanent: true,
       },
       {

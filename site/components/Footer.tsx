@@ -4,13 +4,13 @@ import { Wordmark } from "./Wordmark"
 const REPO_URL = "https://github.com/jlong/shelbi"
 
 const PRODUCT = [
-  { label: "Install", href: "/docs/getting-started/install" },
+  { label: "Install", href: "/docs/guides/getting-started/install" },
   { label: "Changelog", href: "/docs/changelog" },
 ] as const
 
 const DOCS = [
-  { label: "Getting Started", href: "/docs/getting-started/install" },
-  { label: "Concepts", href: "/docs/concepts/workflows" },
+  { label: "Getting Started", href: "/docs/guides/getting-started/install" },
+  { label: "Concepts", href: "/docs/concepts/agents" },
   { label: "CLI Reference", href: "/docs/cli/task" },
   { label: "Changelog", href: "/docs/changelog" },
 ] as const

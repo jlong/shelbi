@@ -1,0 +1,50 @@
+---
+title: Getting Started
+order: 10
+summary: The on-ramp for a brand-new Shelbi user — install the binary, set up a project, run a task, then scale to a pool of workspaces and hand the loop to the orchestrator. Ends with the workflows fundamentals every other guide builds on.
+---
+
+Shelbi is an agent orchestrator for the terminal: a board of tasks, a
+pool of git workspaces, and an orchestrator that keeps the workspaces
+loaded with work and shepherds each result back for review. This guide is
+the shortest path from an empty machine to that loop running on one of
+your own repositories.
+
+You'll work through it roughly in order — each page assumes the one before
+it — but the pages stand alone if you already have part of the setup.
+
+<Callout type="note" title="You need a repo and an agent CLI">
+
+Shelbi drives an existing agent runner (`claude`, `codex`, …) against a
+git repository you already have. [Install](/docs/guides/getting-started/install)
+lists the prerequisites; have a repo and an authenticated agent CLI ready
+before you start.
+
+</Callout>
+
+## The arc
+
+You'll start by **installing** the binary and **setting up a project** —
+the wizard writes the YAML that tells Shelbi which repo, which workspaces,
+and which agent to use. Then you'll **run your first task** end to end,
+watch a single card cross the board, and review the branch it produces.
+
+From there the guide opens up: a **multi-workspace dispatch loop** fills
+the whole pool and runs cards in parallel, **Zen Mode** hands both ends of
+that loop to the orchestrator, and **authoring a custom workflow** shows
+how to reshape the board's routing to your own conventions.
+
+The last page steps back to the model underneath all of it —
+[**Workflows**](/docs/guides/getting-started/workflows), the per-project
+YAML that declares the statuses a task moves through and the git
+side-effects that fire on each transition. Read it once here and the rest
+of the docs — every concept page and every branching-model deep-dive —
+clicks into place.
+
+## Where to go next
+
+- [Concepts](/docs/concepts/agents) — the reference pages behind the loop:
+  agents, workspaces, the orchestrator, the events log, and Zen Mode.
+- [Understanding Workflows](/docs/guides/understanding-workflows) — deep-dives
+  that map trunk-based, git-flow, feature-branch, and forking onto a Shelbi
+  Workflow, once you know the [workflow basics](/docs/guides/getting-started/workflows).

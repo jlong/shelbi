@@ -12,7 +12,7 @@ It's the model most open-source projects run.
 
 Shelbi models the **maintainer's side**. Because the branch lives on
 someone else's fork, Shelbi doesn't cut branches or push here — each task
-carries the fork's PR branch in [`branch:`](/docs/concepts/workflows#the-branch-task-field)
+carries the fork's PR branch in [`branch:`](/docs/guides/getting-started/workflows#the-branch-task-field)
 and the workflow is mostly about the gate: a `handoff` sign-off status
 that's `owner: user` so nothing reaches `main` without a human (or a
 [Zen](/docs/concepts/zen-mode)-authorized reviewer agent) accepting it.
@@ -84,7 +84,7 @@ in **Sign-off** for a maintainer to accept before it's **Merged**.
 
 The forking flow relabels the whole board, so declare its statuses (`id`
 + `name` + `category`) in the project's
-[status catalog](/docs/concepts/workflows#schema) first —
+[status catalog](/docs/guides/getting-started/workflows#schema) first —
 `workflows/statuses.yml` — then reference them by `id` from the workflow:
 
 ```yaml
@@ -180,7 +180,7 @@ the gate for code that arrived from outside.
 
 - [Agents](/docs/concepts/agents) — how to author the `reviewer` role the
   `InReview` status dispatches to.
-- [Workflows: the `branch:` task field](/docs/concepts/workflows#the-branch-task-field)
+- [Workflows: the `branch:` task field](/docs/guides/getting-started/workflows#the-branch-task-field)
   — pointing a task at an existing fork PR branch instead of cutting one.
 - [Trunk-based](/docs/guides/understanding-workflows/trunk-based) — the opposite end of the
   auto-merge spectrum, for work you trust.

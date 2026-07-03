@@ -9,8 +9,8 @@ export const sortedDocs: Doc[] = [...allDocs].sort((a, b) => a.order - b.order)
 
 /**
  * Resolve a doc from the `[[...slug]]` route segments, e.g.
- * `["getting-started", "install"]` → the doc whose flattened path is
- * `docs/getting-started/install`.
+ * `["guides", "getting-started", "install"]` → the doc whose flattened path is
+ * `docs/guides/getting-started/install`.
  */
 export function getDocBySlug(slug: string[] | undefined): Doc | undefined {
   const path = ["docs", ...(slug ?? [])].join("/")
@@ -29,16 +29,10 @@ export type DocSection = {
  * ordering the raw numeric `order` frontmatter doesn't produce on its own (the
  * guides pages carry higher numbers than concepts/cli), so we pin it explicitly
  * here rather than renumbering every page and hoping the numbers stay coherent
- * across sections. Anything not listed (e.g. `getting-started`, or a sectionless
+ * across sections. Anything not listed (e.g. the changelog, or a sectionless
  * doc) falls in behind the explicit entries, ordered by its own `order`.
  */
-export const TOP_LEVEL_ORDER = [
-  "guides",
-  "getting-started",
-  "concepts",
-  "configuration",
-  "cli",
-]
+export const TOP_LEVEL_ORDER = ["guides", "concepts", "configuration", "cli"]
 
 /**
  * Sort key for a top-level nav group. Explicitly-ordered directories come
