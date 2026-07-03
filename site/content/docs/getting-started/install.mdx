@@ -25,12 +25,37 @@ You need three things before you start:
   [rustup](https://rustup.rs) if you don't already have it.
 - **`tmux` 3.2 or later.** Shelbi runs every workspace inside a tmux pane
   and drives it with `send-keys` / `capture-pane`; older releases miss
-  features the TUI relies on. Install via Homebrew (`brew install tmux`),
-  apt (`sudo apt install tmux`), or your package manager.
+  features the TUI relies on.
 - **An agent CLI.** At least one of `claude`
   ([Claude Code](https://docs.claude.com/en/docs/claude-code)) or `codex`,
   installed and authenticated. Declare more than one later — the project
   YAML picks per workspace.
+
+Install `tmux` with your package manager:
+
+<CodeTabs group="os">
+  <CodeTab label="macOS">
+
+  ```bash
+  brew install tmux
+  ```
+
+  </CodeTab>
+  <CodeTab label="Debian/Ubuntu">
+
+  ```bash
+  sudo apt install tmux
+  ```
+
+  </CodeTab>
+  <CodeTab label="Fedora">
+
+  ```bash
+  sudo dnf install tmux
+  ```
+
+  </CodeTab>
+</CodeTabs>
 
 Remote workspaces need the same `tmux` and agent CLI on the machine they
 run on, plus an `ssh` host you can reach without a password prompt.
@@ -68,10 +93,15 @@ codesign --remove-signature "$INSTALL_PATH"
 codesign --sign - "$INSTALL_PATH"
 ```
 
+<Callout type="warning" title="macOS: skip this and you get Killed: 9">
+
 `cargo build` embeds an ad-hoc signature; `cp` invalidates it, and the
 next exec dies with `Killed: 9` and no useful error. Re-signing after the
-copy restores it. Linux and Windows don't need this, and the script skips
-it there.
+copy restores it. `scripts/install.sh` does this for you — you only hit
+the failure if you copy the binary out of `target/release/` by hand.
+Linux and Windows don't need it, and the script skips it there.
+
+</Callout>
 
 ## Verify
 

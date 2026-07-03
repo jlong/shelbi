@@ -19,13 +19,16 @@ may hold a running server bound to a port. That scarcity is a hard invariant
 (the config loader refuses more than two on a machine) and it's what makes the
 review queue below meaningful.
 
-> **The "review" collision.** Several things in Shelbi carry the word
-> *review*. The **review status** is the board column a task sits in awaiting
-> human input (`Review` in the default workflow, `handoff`-category). The
-> **review workspace** is the slot described on this page. The **Review
-> agent** is the role that loads and serves the branch. This page is about the
-> slot and the agent; the status is a [workflow](/docs/concepts/workflows)
-> concept.
+<Callout type="note" title={`The "review" collision`}>
+
+Several things in Shelbi carry the word *review*. The **review status** is
+the board column a task sits in awaiting human input (`Review` in the default
+workflow, `handoff`-category). The **review workspace** is the slot described
+on this page. The **Review agent** is the role that loads and serves the
+branch. This page is about the slot and the agent; the status is a
+[workflow](/docs/concepts/workflows) concept.
+
+</Callout>
 
 ## Declaring a review workspace
 
@@ -63,6 +66,15 @@ two review workspaces:
 machine `hub` declares 3 review workspaces, but at most 2 are allowed per
 machine (each review workspace may hold a running server and a port)
 ```
+
+<Callout type="warning" title="Two review workspaces per machine, max">
+
+This is a hard invariant, not a soft cap — the config loader refuses to start
+a project that declares a third review slot on any one machine. Each review
+workspace may hold a running server bound to a port, so over-provisioning is
+almost always a config mistake worth surfacing loudly.
+
+</Callout>
 
 There is no lower bound — a machine with zero review workspaces is fine (its
 tasks review on another machine that has one). The ceiling is the point: two
@@ -207,6 +219,16 @@ pane** beside the agent pane, and Shelbi owns its whole lifecycle:
   local machines only — `shelbi workspace serve` errors on a remote review
   workspace. A remote review workspace can still load the branch and do a
   diff-only review; booting a managed dev server across SSH is a known gap.
+
+<Callout type="note" title="Remote review is diff-only">
+
+If you want to *run* a change (boot the dev server and click through it),
+route its review to a review workspace on the hub or another local machine.
+A remote review workspace loads the branch and serves a diff-only review —
+`shelbi workspace serve` deliberately errors rather than trying to bind a
+port across SSH.
+
+</Callout>
 - **Reaped.** A [reaper](/docs/concepts/orchestrator) kills a server pane that
   has no active review task — covering a crashed agent that would otherwise
   leave a port bound and block the slot from re-dispatch. Teardown also happens

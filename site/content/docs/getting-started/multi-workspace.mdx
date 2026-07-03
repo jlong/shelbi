@@ -80,8 +80,15 @@ shelbi task add "Re-encode the marketing video assets" \
 
 The orchestrator's dispatcher honors the hint when at least one
 workspace on that machine is free. If `devbox` is fully busy when the
-task becomes ready, the card stays in `todo` — Shelbi will not silently
-re-route to the hub.
+task becomes ready, the card stays in `todo`.
+
+<Callout type="note" title="A machine preference is never overridden silently">
+
+Shelbi will not re-route a `--prefers-machine` task to the hub just because
+the preferred machine is busy — it parks the card in `todo` and waits. Free
+a workspace on that machine, or drop the preference, to get it moving.
+
+</Callout>
 
 ### Block one task on another
 
