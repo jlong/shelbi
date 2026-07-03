@@ -21,8 +21,9 @@
 //!
 //! The pane's top-level process is the `shelbi open <ws> --as-server-pane`
 //! lifecycle wrapper, mirroring the agent pane's `--as-pane` wrapper: it owns
-//! the serve subprocess and emits a `workspace=<name> server_alive=false`
-//! event on any exit so the orchestrator can react to a server death.
+//! the serve subprocess and emits a `project=<name> workspace=<name>
+//! server_alive=false` event on any exit so the orchestrator can react to a
+//! server death (project-scoped so a hub-global tail can be filtered).
 //!
 //! ## Liveness without stable titles (spec §10 / §15)
 //!
