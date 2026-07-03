@@ -132,6 +132,12 @@ enum Cmd {
         /// path (including SIGHUP/SIGTERM/SIGINT). Not for direct use.
         #[arg(long, hide = true)]
         as_pane: bool,
+        /// Internal re-entry flag for a review workspace's *server* pane.
+        /// When set, this process runs the long-lived dev server from
+        /// `$SHELBI_SERVE_CMD` on `$PORT`, waits, and emits a
+        /// `server_alive=false` event on any exit path. Not for direct use.
+        #[arg(long, hide = true, conflicts_with = "as_pane")]
+        as_server_pane: bool,
     },
     /// Manage the project's Kanban task board.
     Task {
@@ -313,7 +319,11 @@ fn main() -> Result<()> {
         Some(Cmd::Diff { id }) => commands::diff::run(cli.project, id),
         Some(Cmd::Merge { id, pr }) => commands::merge::run(cli.project, id, pr),
         Some(Cmd::Archive { id }) => commands::archive::run(cli.project, id),
-        Some(Cmd::Open { name, as_pane }) => commands::open::run(cli.project, name, as_pane),
+        Some(Cmd::Open {
+            name,
+            as_pane,
+            as_server_pane,
+        }) => commands::open::run(cli.project, name, as_pane, as_server_pane),
         Some(Cmd::Task { cmd }) => commands::task::run(cli.project, cmd),
         Some(Cmd::Workspace { cmd }) => commands::workspace::run(cli.project, cmd),
         Some(Cmd::Worker { cmd }) => {
@@ -565,15 +575,34 @@ mod cli_tests {
     fn open_parses_with_and_without_as_pane() {
         let plain = Cli::parse_from(["shelbi", "open", "alpha"]);
         match plain.cmd {
-            Some(Cmd::Open { ref name, as_pane }) if name == "alpha" && !as_pane => {}
+            Some(Cmd::Open {
+                ref name,
+                as_pane,
+                as_server_pane,
+            }) if name == "alpha" && !as_pane && !as_server_pane => {}
             other => panic!("expected Open {{ alpha, as_pane=false }}, got {other:?}"),
         }
 
-        let wrapped =
-            Cli::parse_from(["shelbi", "open", "delta", "--as-pane"]);
+        let wrapped = Cli::parse_from(["shelbi", "open", "delta", "--as-pane"]);
         match wrapped.cmd {
-            Some(Cmd::Open { ref name, as_pane }) if name == "delta" && as_pane => {}
+            Some(Cmd::Open {
+                ref name,
+                as_pane,
+                as_server_pane,
+            }) if name == "delta" && as_pane && !as_server_pane => {}
             other => panic!("expected Open {{ delta, as_pane=true }}, got {other:?}"),
+        }
+
+        // The server-pane re-entry flag parses independently and is
+        // mutually exclusive with `--as-pane` (a pane is one or the other).
+        let server = Cli::parse_from(["shelbi", "open", "review-1", "--as-server-pane"]);
+        match server.cmd {
+            Some(Cmd::Open {
+                ref name,
+                as_pane,
+                as_server_pane,
+            }) if name == "review-1" && !as_pane && as_server_pane => {}
+            other => panic!("expected Open {{ review-1, as_server_pane=true }}, got {other:?}"),
         }
     }
 

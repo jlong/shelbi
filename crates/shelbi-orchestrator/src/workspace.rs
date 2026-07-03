@@ -553,6 +553,17 @@ pub fn workspace_pane_alive(host: &Host, addr: &TmuxAddr) -> Result<bool> {
 /// right before the replacement pane comes up. See
 /// bug-workspace-pane-alive-false-sighup-fires-spuriously-right-after-dispatch.
 pub fn kill_workspace_pane(host: &Host, addr: &TmuxAddr, workspace_name: &str) -> Result<()> {
+    // Tear down any review server pane this workspace owns FIRST. For a
+    // local workspace the server pane is a split inside the same window, so
+    // the `kill-window` below would take it down anyway — but going through
+    // `kill_server_pane` first marks the server's expected-teardown (so the
+    // wrapper suppresses its `server_alive=false` event) and clears the
+    // record (so the hub stops believing the port is bound). This is what
+    // makes re-dispatch onto a review workspace never trip on a still-bound
+    // port: every teardown path routes through here. Best-effort — a stuck
+    // server teardown must not block the agent-pane kill.
+    let _ = crate::server_pane::kill_server_pane(host, workspace_name);
+
     // Local: `kill-window -t session:window` (the dashboard session
     // must stay alive). Remote: `kill-session -t session` (the session
     // IS the workspace).
@@ -916,6 +927,7 @@ fn deploy_and_spawn(a: SpawnArgs<'_>) -> Result<()> {
                 window: &a.addr.window,
                 task_id: a.task_id,
                 project: &a.project.name,
+                workspace: &a.workspace.name,
                 hub_sock: &hub_sock.to_string_lossy(),
                 pane_cmd: &pane_cmd,
                 port: a.port,
@@ -924,7 +936,8 @@ fn deploy_and_spawn(a: SpawnArgs<'_>) -> Result<()> {
         }
         Host::Ssh { .. } => {
             shelbi_tmux::new_session(a.host, &a.addr.session, &a.addr.window, None)?;
-            let cd_launch = remote_cd_launch(a.worktree, &launch, a.port);
+            let cd_launch =
+                remote_cd_launch(a.worktree, &launch, a.port, &a.workspace.name);
             shelbi_tmux::send_line(a.host, a.addr, &cd_launch)?;
         }
     }
@@ -1665,6 +1678,10 @@ struct LocalPaneTmuxArgs<'a> {
     window: &'a str,
     task_id: &'a str,
     project: &'a str,
+    /// The workspace name, injected as `SHELBI_WORKSPACE` for a review
+    /// workspace so the Review agent's `shelbi workspace serve` resolves its
+    /// own slot without guessing.
+    workspace: &'a str,
     hub_sock: &'a str,
     /// Deterministic dev-server port for a review workspace, injected as
     /// `PORT` into the pane env. `None` on the dev path (no `PORT`).
@@ -1715,10 +1732,13 @@ fn local_pane_tmux_argv(a: LocalPaneTmuxArgs<'_>) -> Vec<String> {
     argv.push(hub_env);
     // Review workspaces pin a deterministic dev-server PORT so the review
     // agent binds a slot that won't collide with a concurrent review
-    // workspace. Dev workspaces pass `None` and get no PORT.
+    // workspace, plus SHELBI_WORKSPACE so `shelbi workspace serve` resolves
+    // this slot. Dev workspaces pass `None` and get neither.
     if let Some(port) = a.port {
         argv.push("-e".into());
         argv.push(format!("PORT={port}"));
+        argv.push("-e".into());
+        argv.push(format!("SHELBI_WORKSPACE={}", a.workspace));
     }
     // The pane command runs through `sh -c` so tmux picks up the user's
     // PATH from the tmux server's existing env (Homebrew, asdf, etc).
@@ -1734,10 +1754,12 @@ fn local_pane_tmux_argv(a: LocalPaneTmuxArgs<'_>) -> Vec<String> {
 /// for "set var for THIS command only and inherit it"). `port`, when
 /// `Some`, is injected as `PORT` in the same env prefix (review
 /// workspaces); dev workspaces pass `None`.
-fn remote_cd_launch(worktree: &Path, launch: &str, port: Option<u16>) -> String {
+fn remote_cd_launch(worktree: &Path, launch: &str, port: Option<u16>, workspace: &str) -> String {
     let sock = shelbi_state::remote_hub_socket_path();
+    // Review workspaces (Some port) also get SHELBI_WORKSPACE so the Review
+    // agent's `shelbi workspace serve` resolves its slot.
     let port_env = match port {
-        Some(p) => format!("PORT={p} "),
+        Some(p) => format!("PORT={p} SHELBI_WORKSPACE={ws} ", ws = shelbi_agent::shell_escape(workspace)),
         None => String::new(),
     };
     format!(
@@ -3303,7 +3325,7 @@ mod tests {
         let _g = crate::test_lock::acquire();
         std::env::remove_var("SHELBI_REMOTE_HUB_SOCK");
         let wt = PathBuf::from("/work/myapp/.shelbi/wt/bob");
-        let line = remote_cd_launch(&wt, "claude --permission-mode auto", None);
+        let line = remote_cd_launch(&wt, "claude --permission-mode auto", None, "bob");
         let expected = shelbi_state::remote_hub_socket_path();
         assert!(
             line.contains(&format!("SHELBI_HUB_SOCK={}", expected.display())),
@@ -3330,7 +3352,7 @@ mod tests {
         let _g = crate::test_lock::acquire();
         std::env::set_var("SHELBI_REMOTE_HUB_SOCK", "/run/user/1000/shelbi.sock");
         let wt = PathBuf::from("/work/myapp/.shelbi/wt/bob");
-        let line = remote_cd_launch(&wt, "claude", None);
+        let line = remote_cd_launch(&wt, "claude", None, "bob");
         assert!(
             line.contains("SHELBI_HUB_SOCK=/run/user/1000/shelbi.sock"),
             "override not honored: {line}"
@@ -3346,7 +3368,7 @@ mod tests {
         let _g = crate::test_lock::acquire();
         std::env::remove_var("SHELBI_REMOTE_HUB_SOCK");
         let wt = PathBuf::from("/work/myapp/.shelbi/wt/review-1");
-        let line = remote_cd_launch(&wt, "claude", Some(3010));
+        let line = remote_cd_launch(&wt, "claude", Some(3010), "review-1");
         assert!(line.contains("PORT=3010"), "expected PORT in: {line}");
         let port_at = line.find("PORT=3010").unwrap();
         let exec_at = line.find("exec ").unwrap();
@@ -4148,6 +4170,7 @@ mod rebase_git_tests {
             window: "alpha",
             task_id: "feat-race",
             project: "demo",
+            workspace: "alpha",
             hub_sock: "/tmp/shelbi-hub.sock",
             port: None,
             pane_cmd: "shelbi --project demo open alpha --as-pane",
@@ -4205,6 +4228,7 @@ mod rebase_git_tests {
             window: "bravo",
             task_id: "bug-x",
             project: "demo",
+            workspace: "bravo",
             hub_sock: "/Users/dev/.shelbi/hub.sock",
             port: None,
             pane_cmd: "shelbi --project demo open bravo --as-pane",
@@ -4231,6 +4255,7 @@ mod rebase_git_tests {
             window: "review-2",
             task_id: "fix-login",
             project: "demo",
+            workspace: "review-2",
             hub_sock: "/tmp/shelbi-hub.sock",
             port: Some(3010),
             pane_cmd: "shelbi --project demo open review-2 --as-pane",

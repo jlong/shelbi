@@ -59,22 +59,33 @@ finding the human needs to see, not something you silently work around.
 
 ### 3. Start (or refresh) the server
 
-Start the dev server on `$PORT`. It is long-lived — it must keep running
-after you stop, so the human can hit it.
+Start the dev server through shelbi so it runs in a **dedicated, managed
+server pane** beside you — not as a bare background job. shelbi owns that
+pane's lifecycle (it fires an event if the server dies, tears it down when
+the task leaves review, and reaps a leaked port), so always launch it with:
 
-- If **no server is running** for this workspace, start one fresh.
-- If a server is **already running from a prior task**, tear it down and
-  start fresh for the current branch — the running process must
-  correspond to the branch+commit now checked out.
-- If the **same task** comes back for a follow-up (the human asked for a
-  tweak), restart / hot-reload in place.
+```sh
+shelbi workspace serve "$SHELBI_WORKSPACE" --serve '<your resolved serve command>'
+```
+
+- Pass the exact command you resolved in step 1 as `--serve` (declared
+  `review.serve` is used automatically if you omit `--serve`). Reference the
+  port as `$PORT` inside it — e.g. `--serve 'npm run dev -- --port $PORT'`.
+- The command tears down any server already running for this workspace and
+  starts fresh, so it's also how you **refresh** for a new branch or a
+  follow-up tweak — just run it again.
+- It waits for the HTTP ready-probe and prints the serving URL. Pass
+  `--no-wait` only if the app has no HTTP endpoint to probe.
+
+The server keeps running in its pane after you stop, so the human can hit
+it. Never start the server as a plain `&` background process — shelbi
+wouldn't know about it and couldn't reap its port.
 
 ### 4. Wait for ready, then summarize
 
-Wait until the server is actually serving before you declare victory —
-poll for an HTTP 200 on the URL, match a "listening on…" log line, or, if
-neither is available, allow a fixed settle interval. Then post a concise
-**ready summary** to the human containing:
+`shelbi workspace serve` already blocked on the ready-probe and printed the
+URL, so once it reports the server is up, post a concise **ready summary**
+to the human containing:
 
 - the URL — `http://<machine-host>:<port>` (use the reachable host for the
   machine, not bare `localhost`, when the workspace is remote);

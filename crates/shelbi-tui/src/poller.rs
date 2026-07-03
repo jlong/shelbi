@@ -386,6 +386,13 @@ fn poll_one(
     // hide the signal.
     maybe_promote_to_review(project, workspace, machine, &host);
 
+    // Reaper sweep (spec §10): a review workspace with a live server pane but
+    // no active task has leaked its bound port, which blocks the next
+    // dispatch onto that slot. Runs every poll as the heartbeat backstop for a
+    // missed teardown; a no-op for the common case (no server pane, or the
+    // server's task is still active).
+    maybe_reap_server_pane(project, workspace);
+
     // No pane → no marker. The display-message call would fail anyway,
     // but checking up-front keeps stderr noise out of the log.
     if !shelbi_orchestrator::workspace::workspace_pane_alive(&host, &addr).unwrap_or(false) {
@@ -850,6 +857,32 @@ fn decide(
 
 /// In-progress task currently assigned to `workspace`, if any. Cheap (one
 /// task-dir scan); called once per workspace per poll tick.
+/// Best-effort reaper pass over one workspace's server pane. Logs a reaped
+/// leak (a server whose task has moved on) so the action is visible in the
+/// TUI log; all other outcomes (no server, still-active, GC of a dead record)
+/// are silent. Never propagates — a reaper error must not sink the poll loop.
+fn maybe_reap_server_pane(project: &Project, workspace: &shelbi_core::WorkspaceSpec) {
+    use shelbi_orchestrator::server_pane::ReapOutcome;
+    match shelbi_orchestrator::server_pane::reap_server_pane_if_leaked(project, workspace) {
+        Ok(ReapOutcome::Reaped { task_id, port }) => {
+            tracing::info!(
+                workspace = %workspace.name,
+                task = %task_id,
+                port,
+                "reaped leaked review server pane",
+            );
+        }
+        Ok(_) => {}
+        Err(e) => {
+            tracing::warn!(
+                workspace = %workspace.name,
+                error = %e,
+                "reap_server_pane_if_leaked failed",
+            );
+        }
+    }
+}
+
 fn current_task_for(project: &Project, workspace_name: &str) -> Option<String> {
     shelbi_state::list_column(&project.name, Column::InProgress)
         .ok()?
