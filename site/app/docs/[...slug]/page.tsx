@@ -1,4 +1,5 @@
 import type { Metadata } from "next"
+import { DocumentTextIcon } from "@heroicons/react/24/outline"
 import { notFound } from "next/navigation"
 import { getMDXComponent } from "next-contentlayer2/hooks"
 import { allDocs } from "contentlayer/generated"
@@ -64,9 +65,20 @@ export default async function DocsPage({ params }: DocsPageProps) {
     <div className="lg:grid lg:grid-cols-[minmax(0,1fr)_12rem] lg:gap-6">
       <article className="min-w-0 max-w-3xl">
         <header className="mb-4 border-b border-gray-4 pb-3">
-          <h1 className="text-3xl font-semibold tracking-tight text-fg">
-            {doc.title}
-          </h1>
+          <div className="flex items-start justify-between gap-3">
+            <h1 className="text-3xl font-semibold tracking-tight text-fg">
+              {doc.title}
+            </h1>
+            {/* Plain <a>, not next/link: the target is a text/markdown route
+                handler, so client-side navigation would fetch RSC and break. */}
+            <a
+              href={`${doc.url}.md`}
+              className="mt-1 inline-flex shrink-0 items-center gap-1 whitespace-nowrap font-mono text-xs text-gray-6 transition-colors hover:text-fg"
+            >
+              <DocumentTextIcon className="h-2 w-2" aria-hidden="true" />
+              View as markdown
+            </a>
+          </div>
           <p className="mt-1 text-gray-7">{doc.summary}</p>
         </header>
         <MDX components={mdxComponents} />
