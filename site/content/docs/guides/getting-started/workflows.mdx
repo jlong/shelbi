@@ -295,7 +295,7 @@ gate is action-based, not status-pair-based.
 
 Every task carries an optional `branch:` field in its frontmatter — the
 name of the git branch the task operates on. Its presence at creation
-controls whether shelbi cuts a fresh branch or uses an existing one.
+controls whether Shelbi cuts a fresh branch or uses an existing one.
 
 ```yaml
 ---
@@ -462,7 +462,7 @@ column: Designing               # uses a status name from the assigned workflow
 ```
 
 If `workflow:` is absent, the task uses the default workflow. If
-`workflow:` references a missing definition, shelbi falls back to
+`workflow:` references a missing definition, Shelbi falls back to
 `default` and logs a warning to the events feed.
 
 A task is bound to its workflow at creation. **Cross-workflow moves are
@@ -492,7 +492,7 @@ This makes the default an editable file rather than implicit behavior
 anything, since the rest of the system reasons in categories.
 
 If a project has no `workflows/` directory at all (legacy state),
-shelbi auto-generates `default.yaml` on first load. Existing task files
+Shelbi auto-generates `default.yaml` on first load. Existing task files
 are not modified — a task with no `workflow:` field is treated as
 belonging to the default workflow, so there's nothing to backfill.
 

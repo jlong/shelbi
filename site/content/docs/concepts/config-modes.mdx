@@ -52,7 +52,7 @@ The default. `shelbi init` (or the interactive wizard) writes
 user-local — in one flat file. Nothing is added to your repo. The
 project only exists on your machine.
 
-Resolution is by reverse-lookup: shelbi scans `~/.shelbi/projects/*.yaml`
+Resolution is by reverse-lookup: Shelbi scans `~/.shelbi/projects/*.yaml`
 once, collects each project's `machines[].work_dir` (local machines only
 — an SSH host's work_dir is a path on another box), and matches cwd (or
 an ancestor) against them. The deepest match wins, so nested checkouts
@@ -117,11 +117,11 @@ naming the file it belongs in.
 ### Discovery walk-up
 
 From anywhere inside the repo — the root, a nested directory, wherever
-you happen to `cd` — shelbi walks up looking for the first ancestor
+you happen to `cd` — Shelbi walks up looking for the first ancestor
 containing `.shelbi/project.yaml`. This mirrors how `git` finds its
 `.git` directory: no env var, no marker file to place by hand.
 
-Once the walk-up finds a shared config, shelbi reads the `name:` field
+Once the walk-up finds a shared config, Shelbi reads the `name:` field
 out of it and checks that a matching
 `~/.shelbi/projects/<name>/local.yaml` exists on your machine. If it
 doesn't, the resolver returns `ProjectNotPickedUp` and points at
@@ -298,7 +298,7 @@ next:
 ### Safety net: bare `shelbi init` on an unregistered clone
 
 If you forget the `--pick-up` and run a plain `shelbi init` in a cloned
-repo that already carries `<repo>/.shelbi/project.yaml`, shelbi refuses
+repo that already carries `<repo>/.shelbi/project.yaml`, Shelbi refuses
 to scaffold over the top:
 
 ```

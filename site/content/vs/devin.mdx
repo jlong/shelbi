@@ -10,7 +10,7 @@ summary: >-
 
 ## At a glance
 
-| | shelbi | Devin (Cognition) |
+| | Shelbi | Devin (Cognition) |
 |---|---|---|
 | **What it is** | Open-source orchestrator for coding agents in the terminal | Hosted "AI software engineer" you delegate tickets to |
 | **Where it runs** | Your machines — a hub plus any box reachable over SSH | Cognition's cloud, in isolated per-session VMs (enterprise VPC optional) |
@@ -21,29 +21,29 @@ summary: >-
 | **Pricing** | Free and open source; you pay only your own compute and agent CLIs | Free → $20 Pro → $200 Max → Teams → Enterprise, metered in ACUs |
 | **License** | MIT, open source | Proprietary, hosted — no open-source edition |
 
-## Where shelbi excels
+## Where Shelbi excels
 
 **You own the machines, and there is no meter.** Devin runs work in
 Cognition's cloud VMs and bills it as Agent Compute Units, where roughly one
 ACU is fifteen minutes of active work — great until light or bursty use turns
-into an unpredictable per-task cost. shelbi runs entirely on hardware you
+into an unpredictable per-task cost. Shelbi runs entirely on hardware you
 already have: "no daemons, no servers," just `ssh`, `tmux`, `git`, and your
 agent CLI. Point it at the Mac mini in your closet and a Linux workstation,
 declare a few workers on each, and your spare compute becomes the fleet — with
 no VM clock running.
 
-**Bring your own agent — shelbi is plumbing, not a model.** Devin's
+**Bring your own agent — Shelbi is plumbing, not a model.** Devin's
 intelligence *is* the product: its own SWE-1.6 model and an Adaptive router
-that picks a frontier model per task. shelbi ships no model at all. It is
+that picks a frontier model per task. Shelbi ships no model at all. It is
 agent-agnostic by design, driving "Claude Code, Codex, aider, anything with a
 CLI," declared per project. Run Claude Code on one worker and Codex on another
 in the same project, then swap a runner by editing a single line of YAML. When
-a better CLI lands next quarter, you adopt it without leaving shelbi.
+a better CLI lands next quarter, you adopt it without leaving Shelbi.
 
 **Review is a first-class pane, not just a pull request.** Devin leans on
-autonomous PR generation that you review in GitHub or GitLab. shelbi makes the
+autonomous PR generation that you review in GitHub or GitLab. Shelbi makes the
 human-in-the-loop step the center of the product: when a worker finishes, its
-card lands in a **review** column, shelbi checks the branch out into a working
+card lands in a **review** column, Shelbi checks the branch out into a working
 directory on the machine that ran it, and spawns a fresh agent pane right there
 so you can interrogate the diff before anything merges. Press Enter on a review
 card, ask "why this approach?" in the agent's own pane, then approve and merge
@@ -51,7 +51,7 @@ into your default branch — or push and open a PR with `--pr`.
 
 **Everything is plain text you can grep.** Devin's task and run state lives in
 Cognition's platform, read back through a web app, REST endpoints, and
-consumption metrics. shelbi keeps every task, log, and worker status as a
+consumption metrics. Shelbi keeps every task, log, and worker status as a
 markdown or YAML file on your disk — "grep it, version-control it, read it from
 your editor." A task is a markdown file with frontmatter you can diff; every
 column change appends one line to `~/.shelbi/events.log`, so you can tail or
@@ -64,7 +64,7 @@ independently.
 **Genuine end-to-end autonomy from a ticket.** Among coding agents, Devin is
 one of the furthest toward "ticket in, reviewed PR out": it plans, writes,
 runs tests, and debugs its own failures in one loop inside a real VM, equipped
-with a shell, an editor, and a browser. shelbi orchestrates and supervises
+with a shell, an editor, and a browser. Shelbi orchestrates and supervises
 agents, but it does not supply that autonomous loop itself — your chosen CLI
 agent does the actual engineering.
 
@@ -72,18 +72,18 @@ agent does the actual engineering.
 model lets one human supervise many concurrent tickets — Cognition cites 10+
 implementations queued for review at once — and it pairs that with SSO, custom
 RBAC, audit logs, customer-managed keys, and dedicated or VPC deployment. That
-makes it credible inside large, regulated organizations. shelbi has none of
+makes it credible inside large, regulated organizations. Shelbi has none of
 that compliance surface; it is your machines and your responsibility.
 
 **Repo-understanding tooling.** Devin's DeepWiki (auto-generated,
 continuously updated architecture docs) and Ask Devin (semantic Q&A over an
 indexed repo) are well-regarded for onboarding both agents and humans onto an
-unfamiliar codebase. shelbi has no equivalent built in — understanding the code
+unfamiliar codebase. Shelbi has no equivalent built in — understanding the code
 is left to whichever agent you run.
 
 ## Choosing
 
-**Choose shelbi if** you live in the terminal, have spare compute to spread
+**Choose Shelbi if** you live in the terminal, have spare compute to spread
 agents across, and want your tasks, logs, and state to stay on your own disk in
 plain text. It fits when you want to drive whichever CLI agent is best this
 month and keep a hands-on review loop where you read every diff before it
