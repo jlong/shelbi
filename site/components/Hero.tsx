@@ -29,7 +29,7 @@ export function Hero() {
   return (
     <section data-hero className="relative isolate overflow-hidden">
       <HeroPattern />
-      <div className="relative mx-auto flex w-full max-w-4xl flex-col items-center gap-5 px-3 pb-6 pt-12 text-center md:pb-8 md:pt-16">
+      <div className="relative mx-auto flex w-full max-w-4xl flex-col items-center gap-5 px-3 pb-3 pt-12 text-center md:pb-2.5 md:pt-16">
         <h1 className="w-full max-w-[320px] text-fg md:max-w-[680px]">
           <span className="sr-only">Shelbi</span>
           <WordmarkSvg className="w-full" aria-hidden="true" />
@@ -40,11 +40,9 @@ export function Hero() {
         </p>
 
         <p className="max-w-2xl text-balance text-base leading-relaxed text-gray-7 sm:text-lg">
-          A multi-machine orchestrator for your agents, built on tmux. Drop
-          tasks in the backlog and a named pool of workspaces picks them up
-          in parallel — locally, or on any SSH-reachable machine. Finished
-          work lands in a review column for you to inspect, or flip on Zen
-          Mode and let cleared branches auto-merge.
+          A multi-machine orchestrator for your agents, built on tmux.
+          Dispatch tasks to a pool of workspaces that run in parallel —
+          locally or over SSH.
         </p>
 
         <div className="mt-2 flex w-full flex-col gap-2 sm:w-auto sm:flex-row sm:gap-3">
