@@ -4,18 +4,19 @@ order: 2
 summary: Walk through the wizard, declare your workspaces, and write the project YAML.
 ---
 
-A Shelbi *project* is a git repo plus the machines it can run on, the
-agent runners those machines have, and the named pool of workspaces that
-pick up tasks. All of that lives in a single YAML file at
-`~/.shelbi/projects/<name>.yaml` in the default **global mode**. If you
-want teammates to share your workflows and agent prompts across clones
-instead, [in-repo mode](/docs/concepts/config-modes) commits the shared
-half of the config to the repo itself — the wizard offers the choice
-during setup.
+<CopyPromptBanner prompt="Set up a Shelbi project for the git repo in my current directory. Run `shelbi` (or `shelbi wizard`) and walk me through it: name the project, confirm the repo path and default branch, declare the hub machine and any SSH remotes, then pick an agent runner (claude or codex), a workspace count, and a naming style. The result is a project YAML at ~/.shelbi/projects/<name>.yaml." />
 
-The rest of this page walks through global-mode setup. In-repo setup
-follows the same prompts; only the shared file's on-disk location
-differs, and the wizard makes that choice explicit.
+A Shelbi *project* is a git repo plus the machines it runs on, the agent
+runners those machines have, and the named pool of workspaces that pick up
+tasks. All of that lives in a single YAML file at
+`~/.shelbi/projects/<name>.yaml` in the default **global mode**. To let
+teammates share your workflows and agent prompts across clones instead,
+[in-repo mode](/docs/concepts/config-modes) commits the shared half of the
+config to the repo itself — the wizard offers the choice during setup.
+
+This page walks through global-mode setup. In-repo setup follows the same
+prompts; only the shared file's location differs, and the wizard makes that
+choice explicit.
 
 ## Start the wizard
 
@@ -54,13 +55,12 @@ anything already on disk.
 ? What should we call your assistant? Orchestrator
 ```
 
-The assistant name is the persona the orchestrator agent presents as in
-chat. Pick whatever you want — `Orchestrator`, `Hal`, your team's mascot.
-It's cosmetic; it changes the prompt header and the way the agent refers
-to itself, not how dispatch works.
+The assistant name is the persona the orchestrator presents as in chat.
+Pick whatever you want — `Orchestrator`, `Hal`, your team's mascot. It's
+cosmetic: it changes the prompt header and how the agent refers to itself,
+not how dispatch works.
 
-This prompt only fires once per install. Subsequent project setups skip
-it.
+This prompt fires once per install; later project setups skip it.
 
 ## Phase 2 — Project setup
 
@@ -94,10 +94,9 @@ tmux session name (`shelbi-<name>`), and on the CLI (`shelbi -p <name>`).
 ? Hub work directory: /Users/you/Workspaces/myapp
 ```
 
-The **hub** is the machine you're currently sitting at. It owns the tmux
-session, runs the orchestrator pane, and holds any local workspaces. The
-work directory is where local workspaces' worktrees get created — usually
-the same as the repo path.
+The **hub** is the machine you're sitting at. It owns the tmux session,
+runs the orchestrator pane, and holds any local workspaces. The work
+directory is where local worktrees get created — usually the repo path.
 
 ### Remote machines (optional)
 
@@ -109,10 +108,10 @@ the same as the repo path.
 ? Add another remote machine? No
 ```
 
-A remote machine is any host you can already reach over `ssh` without a
-password prompt, with `tmux` and your agent CLI installed on it. Shelbi
-prefixes every command with `ssh <host> --` and runs the workspaces there
-in tmux panes you can attach to from the hub.
+A remote machine is any host you can reach over `ssh` without a password
+prompt, with `tmux` and your agent CLI installed. Shelbi prefixes every
+command with `ssh <host> --` and runs the workspaces there in tmux panes
+you can attach to from the hub.
 
 The SSH host defaults to the machine name — convenient if your
 `~/.ssh/config` already aliases hosts (so `devbox` resolves to a full
@@ -156,6 +155,11 @@ The wizard writes the YAML, creates the per-workspace directories under
 `~/.shelbi/workspaces/<name>/`, and launches the TUI. Project resolution
 is by reverse-lookup against the registered YAMLs — no marker file is
 dropped in your repo.
+
+The dashboard opens on an empty board: your workspaces idle in the
+sidebar, nothing dispatched yet.
+
+<AppMockup preset="starter" />
 
 ## The project YAML
 
@@ -217,8 +221,8 @@ Field by field:
 
 ### Optional keys
 
-A few keys aren't written by the wizard but can be added by hand. The
-ones most worth knowing about:
+A few keys aren't written by the wizard but you can add by hand. The most
+useful:
 
 - **`heartbeat`** — how often the hub poller appends a `project=<name>
   heartbeat` line to [`~/.shelbi/events.log`](/docs/concepts/events-log)

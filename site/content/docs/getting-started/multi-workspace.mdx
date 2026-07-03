@@ -32,13 +32,12 @@ foxtrot   devbox                       idle
 ```
 
 Every row should show `idle` under `STATE`, with empty `MODEL`/`AGENT` —
-nothing is loaded into a slot yet. If a pane is dead, jump to the
-workspace (`Enter` on its sidebar row) — the session may have stalled on
-a permission dialog. Resolving it puts the workspace back in the
-rotation.
+nothing is loaded yet. If a pane is dead, jump to the workspace (`Enter`
+on its sidebar row): the session may have stalled on a permission dialog,
+and resolving it puts the workspace back in the rotation.
 
-You want at least three free slots to actually see the dispatch loop
-do its job. Two cards on a one-slot pool is a queue, not a loop.
+You want at least three free slots to see the loop do its job — two cards
+on a one-slot pool is a queue, not a loop.
 
 ## Queue up a stack of work
 
@@ -133,19 +132,51 @@ Within a second or two, the sidebar lights up. Workspace badges flip
 from `·` to `⏵` in YAML declaration order — `alpha`, then `bravo`,
 then `charlie`, until either the `todo` column is empty or every
 workspace is busy. The sidebar groups slots under the machine they're
-pinned to, and a busy row shows the agent it's running:
+pinned to, and each busy row shows the agent it's running:
 
-```
- — hub —
- ⏵ alpha    developer   add-csv-export-to-reports
- ⏵ bravo    developer   fix-cookie-domain-bug-on-safari-sso
- ⏵ charlie  developer   tighten-rate-limit-error-copy
-
- — devbox —
- · delta
- · echo
- · foxtrot
-```
+<AppMockup
+  terminalTitle="you@hub — myapp"
+  project="myapp"
+  activeView="tasks"
+  columns={[
+    { label: "BACKLOG", category: "gray", cards: [] },
+    { label: "TO DO", category: "blue", cards: [] },
+    {
+      label: "IN PROGRESS",
+      category: "yellow",
+      cards: [
+        { title: "Add CSV export", id: "add-csv-export", workspace: "alpha" },
+        { title: "Fix SSO cookie bug", id: "fix-cookie", workspace: "bravo" },
+        {
+          title: "Tighten rate-limit",
+          id: "tighten-copy",
+          workspace: "charlie",
+        },
+      ],
+    },
+    { label: "REVIEW", category: "magenta", cards: [] },
+    { label: "DONE", category: "green", cards: [] },
+  ]}
+  machines={[
+    {
+      name: "hub",
+      workspaces: [
+        { name: "alpha", state: "working", agent: "Developer" },
+        { name: "bravo", state: "working", agent: "Developer" },
+        { name: "charlie", state: "working", agent: "Developer" },
+      ],
+    },
+    {
+      name: "devbox",
+      workspaces: [
+        { name: "delta", state: "idle" },
+        { name: "echo", state: "idle" },
+        { name: "foxtrot", state: "idle" },
+      ],
+    },
+  ]}
+  review={[]}
+/>
 
 The orchestrator's chat shows the same thing in prose:
 

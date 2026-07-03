@@ -4,13 +4,12 @@ order: 5
 summary: Add local checks, flip the toggle, and watch the orchestrator take over both ends of the loop — auto-promoting backlog into todo and auto-merging finished branches that clear your confidence bar.
 ---
 
-By default the orchestrator is the scheduler and you own both ends:
-you decide what gets promoted out of backlog, and you accept what
-comes back from review. **Zen Mode flips it.** The orchestrator takes
-the lead on both ends — promoting backlog items it judges safe to run
-and landing finished branches that clear a project-defined
-confidence bar — and you stay in the loop only for the cases it
-decides it can't judge.
+By default the orchestrator is the scheduler and you own both ends: you
+decide what gets promoted out of backlog, and you accept what comes back
+from review. **Zen Mode flips that.** The orchestrator takes the lead on
+both ends — promoting backlog items it judges safe to run and landing
+finished branches that clear a project-defined confidence bar — leaving
+you in the loop only for the cases it can't judge.
 
 This page is the practical on-ramp: configure the bar, flip the
 switch, and watch one task land end-to-end without a human stop. The
@@ -161,6 +160,37 @@ hits the events log:
 ```
 2026-06-22T14:31:08+00:00 task=tighten-rate-limit-error-copy review -> done reason=orchestrator:zen-merge sha=abc1234
 ```
+
+The card lands in **Done** and the workspace frees up — all without a
+human stop:
+
+<AppMockup
+  terminalTitle="you@hub — myapp"
+  project="myapp"
+  activeView="tasks"
+  columns={[
+    { label: "BACKLOG", category: "gray", cards: [] },
+    { label: "TO DO", category: "blue", cards: [] },
+    { label: "IN PROGRESS", category: "yellow", cards: [] },
+    { label: "REVIEW", category: "magenta", cards: [] },
+    {
+      label: "DONE",
+      category: "green",
+      cards: [{ title: "Tighten rate-limit", id: "tighten-copy" }],
+    },
+  ]}
+  machines={[
+    {
+      name: "hub",
+      workspaces: [
+        { name: "alpha", state: "idle" },
+        { name: "bravo", state: "idle" },
+        { name: "charlie", state: "idle" },
+      ],
+    },
+  ]}
+  review={[]}
+/>
 
 Fail any of them — a flaky test, a too-large diff, a touch on a
 danger path, a red CI — and the card stops in `review` for you, with
