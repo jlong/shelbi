@@ -249,8 +249,8 @@ least one** is true:
 2. **It's part of fixing an issue the user recently raised.** The
    user mentioned this bug or feature in the last few turns.
 3. **It's part of a larger body of work the user explicitly kicked
-   off.** A multi-step refactor, a 13-vs-page sweep — the remaining
-   items in that batch are in scope.
+   off.** A multi-step refactor, a sweep across a dozen pages — the
+   remaining items in that batch are in scope.
 
 If nothing fits, the candidate stays in backlog and the orchestrator
 calls it out in its next reply ("I considered promoting `<task>` but
@@ -324,8 +324,8 @@ For more on how the prompt gets wired in, see
 ## Per-task overrides
 
 Sometimes a single task needs different treatment than the project
-default — sensitive enough to keep on the manual review path, or
-needs an extra check the rest of the project doesn't. Put a `zen:`
+default — kept on the manual-review path because it's sensitive, or
+given an extra check the rest of the project doesn't need. Put a `zen:`
 block in the task's frontmatter:
 
 ```yaml

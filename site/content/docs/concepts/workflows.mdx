@@ -20,6 +20,11 @@ because every status maps to a small, closed set of **categories** —
 `backlog`, `ready`, `active`, `handoff`, `done`. Categories are the
 vocabulary the rest of the system reasons in.
 
+The default workflow renders as the canonical five-column board, one column
+per category, each colored by its category:
+
+<AppMockup terminalTitle="jlong@hub — shelbi" />
+
 Schema and parser live in `crates/shelbi-core/src/workflow.rs`.
 Workflow files live at
 `~/.shelbi/projects/<project>/workflows/<name>.yaml`.

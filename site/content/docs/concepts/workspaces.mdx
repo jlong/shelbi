@@ -21,6 +21,11 @@ A workspace handles one task at a time. It does not spawn, it does not fan
 out, it does not multiplex. If the project declares five workspaces, you have
 five concurrent slots — no more, no less.
 
+The pool lives in the sidebar, grouped by machine — busy slots show the agent
+they're running, idle ones wait for work:
+
+<AppMockup terminalTitle="jlong@hub — shelbi" />
+
 ## Workspace vs. agent: capacity vs. role
 
 The single most important distinction on this page: a workspace is **where**
