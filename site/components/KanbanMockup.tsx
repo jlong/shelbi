@@ -6,6 +6,14 @@
  * alignment — the point is that they read as text captured from a real
  * terminal, not a re-implementation of the TUI in HTML.
  *
+ * `AppMockup` is the reusable, state-driven engine: hand it an `AppState`
+ * describing the board, sidebar, selection, active nav view, and window
+ * titles and it renders that scenario. The scenario is the ONLY thing that
+ * varies — the rendering (segment model, alignment, palette, frame) is
+ * fixed so every mockup reads as the same real terminal capture and can't
+ * drift from the running TUI. `KanbanMockup` is a thin preset that renders
+ * `defaultAppState`, preserving the marketing landing page verbatim.
+ *
  * Colors match what `crates/shelbi-tui/src/sidebar.rs` and
  * `crates/shelbi-tui/src/kanban.rs` emit via ratatui's named
  * `Color::Gray | DarkGray | Blue | Yellow | Magenta | Green | Cyan`
@@ -59,20 +67,73 @@ const SIDEBAR_SEL_BG = "#3f3f3f"
 const COL_W = 22
 const TEXT_W = 20
 const SIDEBAR_W = 30
+// Board width assumes a fixed 5-column layout — the same shape the TUI
+// draws at dashboard widths. `titleRow`/`footerRow` pad to this.
+const BOARD_W = 1 + 5 * COL_W
 
-type Card = {
+// ── Scenario model ────────────────────────────────────────────────────
+// The public `AppState` shape. Every field is pure data — an MDX doc
+// author declares (or spreads a preset and tweaks) one of these to show a
+// specific interface state, and `AppMockup` renders it through the fixed
+// engine below.
+
+export type Category = "gray" | "blue" | "yellow" | "magenta" | "green"
+
+/** One kanban card. `selected` draws the focused-card blue highlight. */
+export type Card = {
   title: string
   id: string
   workspace?: string
   selected?: boolean
 }
 
-type Category = "gray" | "blue" | "yellow" | "magenta" | "green"
-
-type Column = {
+/** One kanban column: a category-colored header over its stack of cards. */
+export type Column = {
   label: string
   category: Category
   cards: Card[]
+}
+
+/** A workspace row in the sidebar, grouped under its machine. */
+export type Workspace = {
+  name: string
+  state: "idle" | "working"
+  agent?: string
+}
+
+/** A machine group in the sidebar (`▾ <name>` + its workspaces). */
+export type Machine = {
+  name: string
+  workspaces: Workspace[]
+}
+
+/** One entry in the sidebar's "Ready for Review" section. */
+export type ReviewTask = {
+  title: string
+  workspace: string
+}
+
+/** Which sidebar nav row is active — also drives the title-bar label. */
+export type NavView = "chat" | "tasks" | "activity"
+
+/**
+ * The full interface state a single mockup renders. Pass one to
+ * `<AppMockup state={...} />`; start from a preset (`defaultAppState`,
+ * `starterAppState`) and override only what your scenario changes.
+ */
+export type AppState = {
+  /** macOS window-chrome title, e.g. `jlong@hub — shelbi`. */
+  terminalTitle: string
+  /** Project name — Cyan-bold in the sidebar header and the title bar. */
+  project: string
+  /** Highlighted nav row; also selects the title-bar label (Chat/Tasks/Activity). */
+  activeView: NavView
+  /** Kanban columns rendered in the main board (5-column layout). */
+  columns: Column[]
+  /** Sidebar machine groups and their workspaces. */
+  machines: Machine[]
+  /** Sidebar "Ready for Review" entries; empty hides nothing but the rows. */
+  review: ReviewTask[]
 }
 
 const CATEGORY_COLOR: Record<Category, string> = {
@@ -83,67 +144,12 @@ const CATEGORY_COLOR: Record<Category, string> = {
   green: TUI_GREEN,
 }
 
-const COLUMNS: Column[] = [
-  {
-    label: "BACKLOG",
-    category: "gray",
-    cards: [
-      // Capped at 5 so BACKLOG stays within a card of the other
-      // columns — the tallest column sets the window height, and a
-      // deep backlog leaves the rest of the board trailing empty
-      // space at the bottom.
-      { title: "Rework onboarding copy", id: "t-004" },
-      { title: "Audit third-party licenses", id: "t-005" },
-      { title: "Draft Q3 roadmap", id: "t-006" },
-      { title: "Migrate CI to arm64", id: "t-014" },
-      { title: "Sunset legacy /v1 API", id: "t-020" },
-    ],
-  },
-  {
-    label: "TO DO",
-    category: "blue",
-    cards: [
-      { title: "Add ratelimit to API", id: "t-007" },
-      { title: "Fix mobile nav overlap", id: "t-008" },
-      { title: "Wire webhook retries", id: "t-016" },
-      { title: "Split OTel spans by tenant", id: "t-021" },
-      { title: "Sync i18n strings", id: "t-026" },
-    ],
-  },
-  {
-    label: "IN PROGRESS",
-    category: "yellow",
-    cards: [
-      { title: "Deploy staging env", id: "t-009", workspace: "alpha" },
-      { title: "Wire up OAuth flow", id: "t-010", workspace: "bravo" },
-      { title: "Backfill order_state index", id: "t-017", workspace: "delta" },
-      { title: "Trim vendor bundle size", id: "t-022", workspace: "foxtrot" },
-    ],
-  },
-  {
-    label: "REVIEW",
-    category: "magenta",
-    cards: [
-      {
-        title: "Cache warm-up on cold start",
-        id: "t-011",
-        workspace: "charlie",
-        selected: true,
-      },
-      { title: "Import CSV idempotency", id: "t-018", workspace: "echo" },
-      { title: "Nightly report email fix", id: "t-024", workspace: "foxtrot" },
-    ],
-  },
-  {
-    label: "DONE",
-    category: "green",
-    cards: [
-      { title: "Migrate to Postgres 16", id: "t-012" },
-      { title: "Ship dark-mode toggle", id: "t-013" },
-      { title: "Retry webhook dead-letters", id: "t-019" },
-      { title: "Redis cache for /profile", id: "t-027" },
-    ],
-  },
+// Sidebar nav rows, in display order. `label` doubles as the title-bar
+// label for the matching `activeView`.
+const NAV_ITEMS: { view: NavView; glyph: string; label: string }[] = [
+  { view: "chat", glyph: "💬", label: "Chat" },
+  { view: "tasks", glyph: "📋", label: "Tasks" },
+  { view: "activity", glyph: "⚡", label: "Activity" },
 ]
 
 // ── Segment model ─────────────────────────────────────────────────────
@@ -156,7 +162,7 @@ type Segment = {
   bold?: boolean
 }
 
-const BOARD_BLANK_ROW: Segment[] = [{ text: " ".repeat(1 + 5 * COL_W) }]
+const BOARD_BLANK_ROW: Segment[] = [{ text: " ".repeat(BOARD_W) }]
 const SIDEBAR_BLANK_ROW: Segment[] = [{ text: " ".repeat(SIDEBAR_W) }]
 
 /**
@@ -258,8 +264,8 @@ function columnRows(col: Column): Segment[][] {
  * Zip all columns row-by-row into a single board grid. Shorter columns
  * are padded down with blank rows so the grid stays rectangular.
  */
-function buildBoardRows(): Segment[][] {
-  const perCol = COLUMNS.map(columnRows)
+function buildBoardRows(columns: Column[]): Segment[][] {
+  const perCol = columns.map(columnRows)
   const maxRows = Math.max(...perCol.map((r) => r.length))
   const grid: Segment[][] = []
 
@@ -274,19 +280,19 @@ function buildBoardRows(): Segment[][] {
   return grid
 }
 
-/** Title bar row: "Tasks · shelbi  N total" + right-aligned chips. */
-function titleRow(): Segment[] {
-  const total = COLUMNS.reduce((n, c) => n + c.cards.length, 0)
-  const leftText = ` Tasks · shelbi   ${total} total`
+/** Title bar row: "<View> · <project>  N total" + right-aligned chips. */
+function titleRow(columns: Column[], project: string, activeView: NavView): Segment[] {
+  const total = columns.reduce((n, c) => n + c.cards.length, 0)
+  const label = NAV_ITEMS.find((n) => n.view === activeView)?.label ?? "Tasks"
+  const leftText = ` ${label} · ${project}   ${total} total`
   const workflow = "Workflow: All ▾"
   const workspace = "Workspace: All ▾ "
-  const width = 1 + 5 * COL_W
   const leftLen = [...leftText].length
   const rightLen = [...workflow].length + 2 + [...workspace].length
-  const midPad = Math.max(1, width - leftLen - rightLen)
+  const midPad = Math.max(1, BOARD_W - leftLen - rightLen)
   return [
-    { text: " Tasks · ", color: TUI_DARK_GRAY },
-    { text: "shelbi", color: TUI_CYAN, bold: true },
+    { text: ` ${label} · `, color: TUI_DARK_GRAY },
+    { text: project, color: TUI_CYAN, bold: true },
     { text: `   ${total} total`, color: TUI_DARK_GRAY },
     { text: " ".repeat(midPad) },
     { text: workflow, color: TUI_DARK_GRAY },
@@ -297,7 +303,6 @@ function titleRow(): Segment[] {
 
 /** Footer keybinding hints — matches `render_footer` in the crate. */
 function footerRow(): Segment[] {
-  const width = 1 + 5 * COL_W
   // Match the real footer's key-in-fg / hint-in-dg pattern.
   const segs: Segment[] = []
   const push = (t: string, color = TUI_DARK_GRAY) => segs.push({ text: t, color })
@@ -316,7 +321,7 @@ function footerRow(): Segment[] {
   key("r")
   push(" refresh")
   const used = segs.reduce((acc, s) => acc + [...s.text].length, 0)
-  if (used < width) segs.push({ text: " ".repeat(width - used) })
+  if (used < BOARD_W) segs.push({ text: " ".repeat(BOARD_W - used) })
   return segs
 }
 
@@ -362,51 +367,21 @@ function sidebarRightAlignRow(
   return padSidebarRow(left)
 }
 
-type Machine = {
-  name: string
-  workspaces: { name: string; state: "idle" | "working"; agent?: string }[]
-}
-
-const MACHINES: Machine[] = [
-  {
-    name: "hub",
-    workspaces: [
-      { name: "alpha", state: "idle" },
-      { name: "bravo", state: "working", agent: "Developer" },
-      { name: "charlie", state: "idle" },
-    ],
-  },
-  {
-    name: "devbox",
-    workspaces: [
-      { name: "delta", state: "idle" },
-      { name: "echo", state: "idle" },
-      { name: "foxtrot", state: "idle" },
-    ],
-  },
-]
-
-/** One review-ready task surfaced in the sidebar's "Ready for Review" section. */
-const REVIEW_TASK = {
-  title: "Cache warm-up on cold start",
-  workspace: "charlie",
-}
-
-function buildSidebarRows(): Segment[][] {
+function buildSidebarRows(state: AppState): Segment[][] {
   const rows: Segment[][] = []
 
   // Project header — same Cyan Bold `app.project_name` renders at.
   rows.push(
     padSidebarRow([
       { text: " " },
-      { text: "shelbi", color: TUI_CYAN, bold: true },
+      { text: state.project, color: TUI_CYAN, bold: true },
     ]),
   )
   rows.push(SIDEBAR_BLANK_ROW)
 
-  // Nav rows — 💬 Chat / 📋 Tasks / ⚡ Activity. Tasks is the selected
-  // row here (the main panel is the kanban), so it gets the full-row
-  // dark-gray fill + white-bold text `sidebar.rs::render_list` applies.
+  // Nav rows — 💬 Chat / 📋 Tasks / ⚡ Activity. The active view's row
+  // gets the full-row dark-gray fill + white-bold text
+  // `sidebar.rs::render_list` applies to the selected row.
   const navRow = (glyph: string, label: string, selected = false): Segment[] => {
     const inner: Segment[] = [
       { text: " ", bg: selected ? SIDEBAR_SEL_BG : undefined },
@@ -426,9 +401,9 @@ function buildSidebarRows(): Segment[][] {
     }
     return inner
   }
-  rows.push(navRow("💬", "Chat"))
-  rows.push(navRow("📋", "Tasks", true))
-  rows.push(navRow("⚡", "Activity"))
+  for (const nav of NAV_ITEMS) {
+    rows.push(navRow(nav.glyph, nav.label, nav.view === state.activeView))
+  }
   rows.push(SIDEBAR_BLANK_ROW)
 
   // — Workspaces — section header (DarkGray).
@@ -442,7 +417,7 @@ function buildSidebarRows(): Segment[][] {
   // Per-machine group header + indented workspace rows, matching the
   // `▾ <machine>` / `  <badge> <name>   <right-label>` shape from
   // `sidebar.rs`.
-  for (const m of MACHINES) {
+  for (const m of state.machines) {
     rows.push(
       padSidebarRow([
         { text: " " },
@@ -468,27 +443,34 @@ function buildSidebarRows(): Segment[][] {
     }
   }
 
-  // — Ready for Review — section: one entry with Cyan ✓, title, and the
-  // workspace right-aligned in DarkGray — same shape `Row::Review`
-  // renders via `right_align`.
-  rows.push(SIDEBAR_BLANK_ROW)
-  rows.push(
-    padSidebarRow([
-      { text: " " },
-      { text: "— Ready for Review —", color: TUI_DARK_GRAY },
-    ]),
-  )
-  rows.push(
-    sidebarRightAlignRow(
-      [
+  // — Ready for Review — section: one row per entry with Cyan ✓, title,
+  // and the workspace right-aligned in DarkGray — same shape `Row::Review`
+  // renders via `right_align`. Omitted entirely when nothing is ready.
+  if (state.review.length > 0) {
+    rows.push(SIDEBAR_BLANK_ROW)
+    rows.push(
+      padSidebarRow([
         { text: " " },
-        { text: "✓ ", color: TUI_CYAN },
-        { text: truncate(REVIEW_TASK.title, SIDEBAR_W - 4 - REVIEW_TASK.workspace.length), color: TUI_GRAY },
-      ],
-      REVIEW_TASK.workspace,
-      TUI_DARK_GRAY,
-    ),
-  )
+        { text: "— Ready for Review —", color: TUI_DARK_GRAY },
+      ]),
+    )
+    for (const task of state.review) {
+      rows.push(
+        sidebarRightAlignRow(
+          [
+            { text: " " },
+            { text: "✓ ", color: TUI_CYAN },
+            {
+              text: truncate(task.title, SIDEBAR_W - 4 - task.workspace.length),
+              color: TUI_GRAY,
+            },
+          ],
+          task.workspace,
+          TUI_DARK_GRAY,
+        ),
+      )
+    }
+  }
 
   return rows
 }
@@ -522,11 +504,11 @@ const PRE_STYLE: React.CSSProperties = {
   minWidth: "max-content",
 }
 
-function TerminalBody() {
+function TerminalBody({ state }: { state: AppState }) {
   const rows: Segment[][] = [
-    titleRow(),
+    titleRow(state.columns, state.project, state.activeView),
     BOARD_BLANK_ROW,
-    ...buildBoardRows(),
+    ...buildBoardRows(state.columns),
     BOARD_BLANK_ROW,
     footerRow(),
   ]
@@ -543,8 +525,8 @@ function TerminalBody() {
   )
 }
 
-function Sidebar() {
-  const rows = buildSidebarRows()
+function Sidebar({ state }: { state: AppState }) {
+  const rows = buildSidebarRows(state)
   return (
     <pre
       className="m-0 hidden whitespace-pre border-r py-3 font-mono md:block"
@@ -581,7 +563,26 @@ function TrafficLight({ color }: { color: string }) {
   )
 }
 
-export function KanbanMockup() {
+/**
+ * Render a Shelbi TUI dashboard scenario inside a macOS-Terminal frame.
+ * The look is fixed — only the scenario varies. Three ways to drive it:
+ *
+ *   <AppMockup state={defaultAppState} />              — explicit full state
+ *   <AppMockup preset="starter" />                     — a named preset, import-free
+ *   <AppMockup preset="starter" activeView="chat" />   — preset + inline tweaks
+ *
+ * `state` wins when given; otherwise the named `preset` (default:
+ * "default") is the base. Any extra `AppState` fields passed alongside are
+ * shallow-merged on top — the ergonomic path for MDX docs, which can't
+ * import the preset objects but can drop a tag and override a field.
+ */
+export function AppMockup({
+  state,
+  preset = "default",
+  ...overrides
+}: { state?: AppState; preset?: PresetName } & Partial<AppState>) {
+  const base = state ?? PRESETS[preset]
+  const resolved: AppState = { ...base, ...overrides }
   return (
     <section className="border-b border-gray-4 px-3 py-6 sm:py-10">
       {/* w-fit hugs the board's natural width; max-w-full keeps the
@@ -613,7 +614,7 @@ export function KanbanMockup() {
               className="font-mono text-xs font-medium"
               style={{ color: CHROME_TITLE }}
             >
-              jlong@hub — shelbi
+              {resolved.terminalTitle}
             </span>
           </div>
 
@@ -627,11 +628,160 @@ export function KanbanMockup() {
             className="flex overflow-x-auto"
             style={{ background: TUI_BG }}
           >
-            <Sidebar />
-            <TerminalBody />
+            <Sidebar state={resolved} />
+            <TerminalBody state={resolved} />
           </div>
         </div>
       </div>
     </section>
   )
+}
+
+// ── Presets ───────────────────────────────────────────────────────────
+// Named starting points a doc page (or the landing page) imports and
+// tweaks with a spread, so each scenario is a diff from a full board
+// rather than a hand-built one. Add more as docs need them.
+
+/**
+ * The full five-column dashboard the marketing landing page has always
+ * shown: a busy board with a selected review card, two machines of
+ * workspaces, and one ready-for-review entry. `KanbanMockup` renders this
+ * verbatim, so the landing page is unchanged.
+ */
+export const defaultAppState: AppState = {
+  terminalTitle: "jlong@hub — shelbi",
+  project: "shelbi",
+  activeView: "tasks",
+  columns: [
+    {
+      label: "BACKLOG",
+      category: "gray",
+      cards: [
+        // Capped at 5 so BACKLOG stays within a card of the other
+        // columns — the tallest column sets the window height, and a
+        // deep backlog leaves the rest of the board trailing empty
+        // space at the bottom.
+        { title: "Rework onboarding copy", id: "t-004" },
+        { title: "Audit third-party licenses", id: "t-005" },
+        { title: "Draft Q3 roadmap", id: "t-006" },
+        { title: "Migrate CI to arm64", id: "t-014" },
+        { title: "Sunset legacy /v1 API", id: "t-020" },
+      ],
+    },
+    {
+      label: "TO DO",
+      category: "blue",
+      cards: [
+        { title: "Add ratelimit to API", id: "t-007" },
+        { title: "Fix mobile nav overlap", id: "t-008" },
+        { title: "Wire webhook retries", id: "t-016" },
+        { title: "Split OTel spans by tenant", id: "t-021" },
+        { title: "Sync i18n strings", id: "t-026" },
+      ],
+    },
+    {
+      label: "IN PROGRESS",
+      category: "yellow",
+      cards: [
+        { title: "Deploy staging env", id: "t-009", workspace: "alpha" },
+        { title: "Wire up OAuth flow", id: "t-010", workspace: "bravo" },
+        { title: "Backfill order_state index", id: "t-017", workspace: "delta" },
+        { title: "Trim vendor bundle size", id: "t-022", workspace: "foxtrot" },
+      ],
+    },
+    {
+      label: "REVIEW",
+      category: "magenta",
+      cards: [
+        {
+          title: "Cache warm-up on cold start",
+          id: "t-011",
+          workspace: "charlie",
+          selected: true,
+        },
+        { title: "Import CSV idempotency", id: "t-018", workspace: "echo" },
+        { title: "Nightly report email fix", id: "t-024", workspace: "foxtrot" },
+      ],
+    },
+    {
+      label: "DONE",
+      category: "green",
+      cards: [
+        { title: "Migrate to Postgres 16", id: "t-012" },
+        { title: "Ship dark-mode toggle", id: "t-013" },
+        { title: "Retry webhook dead-letters", id: "t-019" },
+        { title: "Redis cache for /profile", id: "t-027" },
+      ],
+    },
+  ],
+  machines: [
+    {
+      name: "hub",
+      workspaces: [
+        { name: "alpha", state: "idle" },
+        { name: "bravo", state: "working", agent: "Developer" },
+        { name: "charlie", state: "idle" },
+      ],
+    },
+    {
+      name: "devbox",
+      workspaces: [
+        { name: "delta", state: "idle" },
+        { name: "echo", state: "idle" },
+        { name: "foxtrot", state: "idle" },
+      ],
+    },
+  ],
+  review: [{ title: "Cache warm-up on cold start", workspace: "charlie" }],
+}
+
+/**
+ * A freshly-initialized project: one machine, one idle workspace, a couple
+ * of backlog cards and nothing else moving yet — the shape a
+ * getting-started doc wants when it walks through the first task. Spread
+ * and tweak it (`{ ...starterAppState, activeView: "chat" }`) to show a
+ * specific early-onboarding state.
+ */
+export const starterAppState: AppState = {
+  terminalTitle: "you@laptop — myproject",
+  project: "myproject",
+  activeView: "tasks",
+  columns: [
+    {
+      label: "BACKLOG",
+      category: "gray",
+      cards: [
+        { title: "Add a health check", id: "t-001" },
+        { title: "Write the README", id: "t-002" },
+      ],
+    },
+    { label: "TO DO", category: "blue", cards: [] },
+    { label: "IN PROGRESS", category: "yellow", cards: [] },
+    { label: "REVIEW", category: "magenta", cards: [] },
+    { label: "DONE", category: "green", cards: [] },
+  ],
+  machines: [
+    {
+      name: "local",
+      workspaces: [{ name: "alpha", state: "idle" }],
+    },
+  ],
+  review: [],
+}
+
+/** Preset scenarios addressable by name from `<AppMockup preset="…" />`. */
+export const PRESETS = {
+  default: defaultAppState,
+  starter: starterAppState,
+} satisfies Record<string, AppState>
+
+/** A key of {@link PRESETS} — the `preset` prop's accepted values. */
+export type PresetName = keyof typeof PRESETS
+
+/**
+ * Thin preset used by the marketing landing page. Renders `AppMockup` with
+ * the original hardcoded scenario so the page stays visually identical.
+ */
+export function KanbanMockup() {
+  return <AppMockup state={defaultAppState} />
 }
