@@ -237,7 +237,7 @@ pub fn run(project: &Project, workspace: &WorkspaceSpec, machine: &Machine) -> R
 /// only signal the wrapper, not the whole process group). Returns the
 /// signal handle so the caller can close the listener once `wait()`
 /// returns.
-fn install_signal_listener(
+pub(super) fn install_signal_listener(
     received_signal: Arc<Mutex<Option<i32>>>,
     signaled_flag: Arc<AtomicBool>,
     child_pid: libc::pid_t,
@@ -271,7 +271,7 @@ fn install_signal_listener(
 /// Compose a short reason token for the events.log line. Signal-driven
 /// exits get `signal:<name>`; natural exits get `exit:<code>`; the
 /// no-info path collapses to `exit:unknown`.
-fn exit_reason(status: &std::process::ExitStatus, received: Option<i32>) -> String {
+pub(super) fn exit_reason(status: &std::process::ExitStatus, received: Option<i32>) -> String {
     if let Some(sig) = received {
         return format!("signal:{}", signal_name(sig));
     }

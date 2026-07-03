@@ -82,10 +82,28 @@ If you recognize the ecosystem but not the exact serve command, read the
 project's README for the canonical "how to run locally" instructions
 before guessing.
 
+## Launching (managed pane)
+
+Once you've resolved the serve command, don't run it yourself as a
+background job — hand it to shelbi so it runs in a **managed server pane**
+that shelbi can watch and reap:
+
+```sh
+shelbi workspace serve "$SHELBI_WORKSPACE" --serve '<resolved serve command>'
+```
+
+Reference the port as `$PORT` inside the command (e.g. `--serve 'npm run
+dev -- --port $PORT'`). If the project declares `review.serve`, you may
+omit `--serve` and shelbi uses it. Running the command again tears down any
+existing server and starts fresh (that's how you refresh for a new branch
+or a tweak). shelbi runs the HTTP ready-probe for you and prints the URL.
+
 ## Readiness
 
-After starting the server, confirm it is actually serving before you
-declare ready:
+`shelbi workspace serve` blocks on the HTTP ready-probe below before it
+returns, so for a normal HTTP app you just wait for it to report the URL.
+The heuristics here are what that probe does — and your fallback when the
+app has no HTTP surface (`--no-wait`, then confirm manually):
 
 1. **HTTP probe** — poll `http://localhost:$PORT` (or the declared
    `review.ready_probe.http`) for any non-connection-refused response

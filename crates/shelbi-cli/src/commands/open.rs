@@ -19,10 +19,16 @@ use shelbi_core::{Host, Project, WorkspaceSpec};
 use super::require_project;
 
 pub mod pane;
+pub mod server_pane;
 
-pub fn run(project_opt: Option<String>, name: String, as_pane: bool) -> Result<()> {
+pub fn run(
+    project_opt: Option<String>,
+    name: String,
+    as_pane: bool,
+    as_server_pane: bool,
+) -> Result<()> {
     let project = require_project(project_opt)?;
-    open(&project, &name, as_pane)
+    open(&project, &name, as_pane, as_server_pane)
 }
 
 /// Top-level dispatcher for `shelbi open <name> [--as-pane]`.
@@ -36,7 +42,7 @@ pub fn run(project_opt: Option<String>, name: String, as_pane: bool) -> Result<(
 /// install signal handlers, and stay alive until the agent exits or a
 /// signal arrives, then write the lifecycle event and (on clean exit)
 /// prompt the user before tearing down so final output stays visible.
-fn open(project: &str, name: &str, as_pane: bool) -> Result<()> {
+fn open(project: &str, name: &str, as_pane: bool, as_server_pane: bool) -> Result<()> {
     let p = shelbi_state::load_project(project).map_err(|e| anyhow!(e))?;
     let workspace = p
         .workspace(name)
@@ -61,6 +67,18 @@ fn open(project: &str, name: &str, as_pane: bool) -> Result<()> {
         })?
         .clone();
     let host = machine.host();
+
+    if as_server_pane {
+        // The server wrapper is local-only for the same reason --as-pane is:
+        // no shelbi binary runs on a remote workspace host.
+        if !host.is_local() {
+            bail!(
+                "--as-server-pane is only valid for local workspaces \
+                 (workspace `{name}` lives on a remote machine)"
+            );
+        }
+        return server_pane::run(&p, &workspace, &machine);
+    }
 
     if as_pane {
         // The wrapper is local-only: remote workspaces don't run shelbi
