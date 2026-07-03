@@ -40,9 +40,9 @@ export function Hero() {
         </p>
 
         <p className="max-w-2xl text-balance text-base leading-relaxed text-gray-7 sm:text-lg">
-          A multi-machine orchestrator for your agents, built on tmux.
-          Dispatch tasks to a pool of workspaces that run in parallel —
-          locally or over SSH.
+          A multi-machine orchestrator built on tmux. Dispatch tasks
+          to a team of agents that run in parallel — locally or over
+          SSH.
         </p>
 
         <div className="mt-2 flex w-full flex-col gap-2 sm:w-auto sm:flex-row sm:gap-3">
