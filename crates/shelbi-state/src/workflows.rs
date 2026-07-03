@@ -98,7 +98,9 @@ pub fn load_project_statuses(project: &str) -> Result<ProjectStatuses> {
         }
         Err(e) => return Err(Error::Io(e)),
     };
-    ProjectStatuses::from_yaml_str(&text).map_err(|e| annotate(&path, e))
+    let statuses = ProjectStatuses::from_yaml_str(&text).map_err(|e| annotate(&path, e))?;
+    emit_status_warnings_once(&path, &statuses);
+    Ok(statuses)
 }
 
 /// Atomic write of `statuses.yml` for `project`. Creates the workflows/
@@ -193,6 +195,7 @@ pub fn list_workflows(project: &str) -> Result<Vec<Workflow>> {
 
     let st_text = fs::read_to_string(&st_path)?;
     let statuses = ProjectStatuses::from_yaml_str(&st_text).map_err(|e| annotate(&st_path, e))?;
+    emit_status_warnings_once(&st_path, &statuses);
 
     let mut out = Vec::new();
     let mut seen: HashSet<PathBuf> = HashSet::new();
@@ -418,6 +421,33 @@ fn emit_deprecation_warnings_once(path: &Path, diags: &[String]) {
     drop(guard);
     for d in diags {
         tracing::warn!(workflow = %path.display(), "shelbi: {} — {d}", path.display());
+    }
+}
+
+/// Process-local memo of `statuses.yml` paths whose category-coherence
+/// warnings have already been emitted — same once-per-process dedupe as
+/// [`EMITTED_DEPRECATIONS`], so a polling TUI doesn't spam the log.
+static EMITTED_STATUS_WARNINGS: Mutex<Option<HashSet<PathBuf>>> = Mutex::new(None);
+
+/// Surface [`ProjectStatuses::category_warnings`] — once per statuses
+/// path per process. Non-fatal coherence guidance (missing `handoff`,
+/// duplicated single-instance category); load still succeeds.
+fn emit_status_warnings_once(path: &Path, statuses: &ProjectStatuses) {
+    let warnings = statuses.category_warnings();
+    if warnings.is_empty() {
+        return;
+    }
+    let mut guard = match EMITTED_STATUS_WARNINGS.lock() {
+        Ok(g) => g,
+        Err(p) => p.into_inner(),
+    };
+    let seen = guard.get_or_insert_with(HashSet::new);
+    if !seen.insert(path.to_path_buf()) {
+        return;
+    }
+    drop(guard);
+    for w in warnings {
+        tracing::warn!(statuses = %path.display(), "shelbi: {} — {w}", path.display());
     }
 }
 
@@ -860,11 +890,20 @@ statuses:
         save_project_statuses(
             "p",
             &ProjectStatuses {
-                statuses: vec![ProjectStatus {
-                    id: "doing".into(),
-                    name: "Doing".into(),
-                    category: StatusCategory::Active,
-                }],
+                statuses: vec![
+                    ProjectStatus {
+                        id: "doing".into(),
+                        name: "Doing".into(),
+                        category: StatusCategory::Active,
+                    },
+                    // A terminal is required for the set to validate; the
+                    // workflow under test only references `doing`.
+                    ProjectStatus {
+                        id: "done".into(),
+                        name: "Done".into(),
+                        category: StatusCategory::Done,
+                    },
+                ],
             },
         )
         .unwrap();
@@ -992,11 +1031,20 @@ statuses:
         save_project_statuses(
             "p",
             &ProjectStatuses {
-                statuses: vec![ProjectStatus {
-                    id: "todo".into(),
-                    name: "Todo".into(),
-                    category: StatusCategory::Ready,
-                }],
+                statuses: vec![
+                    ProjectStatus {
+                        id: "todo".into(),
+                        name: "Todo".into(),
+                        category: StatusCategory::Ready,
+                    },
+                    // Terminal so the set validates; the workflow below
+                    // references `done`, which is deliberately *not* here.
+                    ProjectStatus {
+                        id: "canceled".into(),
+                        name: "Canceled".into(),
+                        category: StatusCategory::Archived,
+                    },
+                ],
             },
         )
         .unwrap();

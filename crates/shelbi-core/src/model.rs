@@ -1628,18 +1628,28 @@ mod duration_secs {
 // ---------------------------------------------------------------------------
 // Agent id validation
 
-/// Validate an agent id: kebab-case alphanumerics, hyphen-separated.
+/// Validate an agent id: lowercase kebab-case alphanumerics,
+/// hyphen/underscore-separated.
+///
+/// Uppercase is rejected — not merely conventional. Ids become
+/// case-preserving filesystem paths (`<id>.md`) and git refs
+/// (`shelbi/<id>`), and macOS's default case-insensitive APFS/HFS+ and
+/// git's `core.ignorecase=true` treat `Fix-Login` and `fix-login` as the
+/// same path. Two ids differing only in case would silently overwrite one
+/// another, so we pin the id to a single case at the validation
+/// chokepoint. Also used for task ids, workflow names, and any other
+/// identifier that maps to a path component.
 pub fn validate_agent_id(s: &str) -> crate::Result<()> {
     if s.is_empty() {
         return Err(crate::Error::InvalidAgentId(s.to_string()));
     }
     let ok = s
         .chars()
-        .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_');
+        .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-' || c == '_');
     let starts_ok = s
         .chars()
         .next()
-        .map(|c| c.is_ascii_alphanumeric())
+        .map(|c| c.is_ascii_lowercase() || c.is_ascii_digit())
         .unwrap_or(false);
     if !ok || !starts_ok {
         return Err(crate::Error::InvalidAgentId(s.to_string()));
@@ -1661,6 +1671,22 @@ mod tests {
         assert!(validate_agent_id("-leading-hyphen").is_err());
         assert!(validate_agent_id("has spaces").is_err());
         assert!(validate_agent_id("slash/in/id").is_err());
+        // Uppercase is rejected: `Fix-Login` and `fix-login` would collide
+        // on macOS's case-insensitive FS/git and silently overwrite.
+        assert!(validate_agent_id("Fix-Login").is_err());
+        assert!(validate_agent_id("fixLogin").is_err());
+        assert!(validate_agent_id("ABC").is_err());
+        // A leading digit is fine; a leading uppercase letter is not.
+        assert!(validate_agent_id("1abc").is_ok());
+        assert!(validate_agent_id("Abc").is_err());
+    }
+
+    #[test]
+    fn task_id_rejects_uppercase() {
+        // validate_task_id delegates to validate_agent_id, so the same
+        // case rule guards the `<id>.md` file and `shelbi/<id>` branch.
+        assert!(validate_task_id("fix-login").is_ok());
+        assert!(validate_task_id("Fix-Login").is_err());
     }
 
     #[test]

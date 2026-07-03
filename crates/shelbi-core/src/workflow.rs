@@ -225,16 +225,24 @@ impl Workflow {
     /// i.e., Zen Mode's confidence bar should apply.
     ///
     /// When this workflow has *no* `transitions:` block declared at all,
-    /// fall back to the legacy 5-status convention: a task in `Review`
-    /// triggers the bar. This back-compat path keeps existing projects
-    /// (whose migrated `default.yaml` carries no transitions block) on
-    /// the same trigger they had before workflows landed; new projects
-    /// that opt into the action-based bar by declaring transitions get
-    /// the action-based semantic exclusively.
+    /// fall back to the legacy convention: a task in the workflow's
+    /// **handoff** status triggers the bar. This back-compat path keeps
+    /// existing projects (whose migrated `default.yaml` carries no
+    /// transitions block) on the same trigger they had before workflows
+    /// landed; new projects that opt into the action-based bar by
+    /// declaring transitions get the action-based semantic exclusively.
+    ///
+    /// The fallback keys off the [`StatusCategory::Handoff`] category, not
+    /// the hardcoded `review` id — a project that renames its handoff
+    /// status (e.g. `qa`) still trips the bar, consistent with the
+    /// category-not-name contract every other generic consumer honors.
     pub fn fires_merge_bar(&self, from: &str) -> bool {
         match &self.transitions {
             Some(_) => !self.outgoing_merge_transitions(from).is_empty(),
-            None => from == LEGACY_REVIEW_STATUS,
+            None => self
+                .status(from)
+                .map(|s| s.category == StatusCategory::Handoff)
+                .unwrap_or(false),
         }
     }
 
@@ -713,10 +721,12 @@ pub enum Owner {
     Agent,
 }
 
-/// The legacy 5-status workflow's handoff status id. Used as the
-/// fallback merge-bar trigger for workflows without an explicit
-/// `transitions:` block — see [`Workflow::fires_merge_bar`]. Matches
-/// the `id:` of the `Review` status in [`default_workflow`].
+/// The canonical handoff status id in the shipped default workflow —
+/// the `id:` of the `Review` status in [`default_workflow`]. Retained as
+/// a named constant for callers that need the conventional spelling;
+/// [`Workflow::fires_merge_bar`] no longer keys off it (it keys off the
+/// [`StatusCategory::Handoff`] category so renamed handoff ids still
+/// trip the bar).
 pub const LEGACY_REVIEW_STATUS: &str = "review";
 
 /// Default agent name dispatched for a status whose legacy YAML used
@@ -1671,19 +1681,51 @@ transitions:
     }
 
     #[test]
-    fn fires_merge_bar_falls_back_to_legacy_review_when_no_transitions() {
+    fn fires_merge_bar_falls_back_to_handoff_category_when_no_transitions() {
         // A workflow with no `transitions:` block (the default, what
-        // existing projects have on disk) keeps the historic "Review →
+        // existing projects have on disk) keeps the historic "handoff →
         // Done" trigger. Lets existing zen users not have to edit YAML to
-        // keep the bar firing. The trigger is keyed by status `id`, so
-        // the canonical `review` id trips it — display labels (`Review`)
-        // never enter the comparison.
+        // keep the bar firing. The trigger is keyed by the *category*, so
+        // the canonical `review` id (category handoff) trips it — display
+        // labels (`Review`) and non-handoff statuses never do.
         let wf = default_workflow();
         assert!(wf.transitions.is_none(), "default ships without transitions");
         assert!(wf.fires_merge_bar("review"));
-        assert!(!wf.fires_merge_bar("Review"), "name no longer matches");
+        assert!(!wf.fires_merge_bar("Review"), "name is not an id");
         assert!(!wf.fires_merge_bar("in-progress"));
         assert!(!wf.fires_merge_bar("backlog"));
+        // Unknown ids don't trip the bar.
+        assert!(!wf.fires_merge_bar("ghost"));
+    }
+
+    #[test]
+    fn fires_merge_bar_honors_renamed_handoff_id_when_no_transitions() {
+        // A project renames its handoff status id from `review` to `qa`
+        // and keeps a default-style workflow with no `transitions:` block.
+        // The merge-bar fallback keys off the handoff *category*, not the
+        // literal `review` id, so `qa` still trips the bar — the caller's
+        // `category == Handoff` gate in the Zen dry-run probe is honored
+        // rather than silently defeated.
+        let statuses = crate::ProjectStatuses::from_yaml_str(
+            "statuses:\n  \
+             - { id: doing, name: Doing, category: active }\n  \
+             - { id: qa,    name: QA,    category: handoff }\n  \
+             - { id: done,  name: Done,  category: done }\n",
+        )
+        .unwrap();
+        let wf = Workflow::from_yaml_str(
+            "name: w\nstatuses:\n  \
+             - { id: doing, owner: agent, agent: developer }\n  \
+             - { id: qa,    owner: user }\n  \
+             - { id: done,  owner: user }\n",
+        )
+        .unwrap()
+        .resolve_against(&statuses)
+        .unwrap();
+        assert!(wf.transitions.is_none());
+        assert!(wf.fires_merge_bar("qa"), "renamed handoff id trips the bar");
+        assert!(!wf.fires_merge_bar("doing"));
+        assert!(!wf.fires_merge_bar("done"));
     }
 
     #[test]
@@ -2008,7 +2050,9 @@ git:
 "#;
         let wf = Workflow::from_yaml_str(yaml).unwrap();
         let statuses = crate::ProjectStatuses::from_yaml_str(
-            "statuses:\n  - { id: todo, name: Todo, category: ready }\n",
+            "statuses:\n  \
+             - { id: todo, name: Todo, category: ready }\n  \
+             - { id: done, name: Done, category: done }\n",
         )
         .unwrap();
         let serialized = serde_yaml::to_string(&wf).unwrap();
@@ -2106,7 +2150,9 @@ zen:
 "#;
         let wf = Workflow::from_yaml_str(yaml).unwrap();
         let statuses = crate::ProjectStatuses::from_yaml_str(
-            "statuses:\n  - { id: drafting, name: Drafting, category: active }\n",
+            "statuses:\n  \
+             - { id: drafting, name: Drafting, category: active }\n  \
+             - { id: done, name: Done, category: done }\n",
         )
         .unwrap();
         let serialized = serde_yaml::to_string(&wf).unwrap();
