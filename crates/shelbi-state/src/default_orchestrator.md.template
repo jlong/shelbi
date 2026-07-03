@@ -101,7 +101,13 @@ Your live feed is `~/.shelbi/events.log`. The line shapes you'll see most:
 
 - `<ts> task=<id> workflow=<name> <from> -> <to> reason=<short>
   from_category=<c> to_category=<c>`
-- `<ts> workspace=<name> <prev> -> <new>`
+- `<ts> project=<name> workspace=<name> <prev> -> <new>` — a workspace
+  state / dialog / pane-death line. Scoped: workspace names are only unique
+  *within* a project and `events.log` is hub-global, so **only react to lines
+  whose `project=<name>` matches your own project** — another project's
+  same-named workspace rides your tail too and must be ignored (reacting to it
+  is the cross-project false-death bug). Covers the `pane_alive=<bool>` and
+  `server_alive=<bool>` death lines and the `reason=dialog:*` block/clear lines.
 - `<ts> project=<name> mode=zen <prev> -> <new> reason=<source>` — a Zen
   Mode toggle for `<name>`. Scoped: only the `<name>` that matches your own
   project is yours to react to (see `## Zen Mode`). `<source>` is the toggle
@@ -202,17 +208,24 @@ One bullet per event prefix. React to every matching line.
      category task (top of priority, honoring `prefers_machine` if set) and
      dispatch to it per the rule above.
 
-- `workspace=<name> working -> awaiting_input` or `workspace=<name> ... -> idle`
-  → this workspace just became free. If `<name>` is a **review** workspace, a
-  human just resolved its task (moved it out of Review), so the slot is now
-  free to serve the next queued review: pick the oldest *pending-load* task —
-  a Review-category task not currently loaded on any review workspace, oldest
-  first — and run `shelbi review <id>` to load it. If `<name>` is a **dev**
-  workspace, find it the next `ready` task and dispatch, same as above.
+- `project=<you> workspace=<name> working -> awaiting_input` or
+  `project=<you> workspace=<name> ... -> idle` → this workspace just became
+  free. Match the `project=<you>` scope first — another project's same-named
+  workspace going idle is not yours to dispatch. If `<name>` is a
+  **review** workspace, a human just resolved its task (moved it out of
+  Review), so the slot is now free to serve the next queued review: pick the oldest
+  *pending-load* task — a Review-category task not currently loaded on any
+  review workspace, oldest first — and run `shelbi review <id>` to load it. If
+  `<name>` is a **dev** workspace, find it the next `ready` task and dispatch,
+  same as above.
 
-- `workspace=<name> pane_alive=false` (or any other pane-death signal) →
-  **don't auto-restart**. Surface it to the user in your next reply and
-  wait for direction.
+- `project=<you> workspace=<name> pane_alive=false` (or any other pane-death
+  signal, including `server_alive=false`) → **don't auto-restart**. Surface it
+  to the user in your next reply and wait for direction. The `project=<you>`
+  scope is load-bearing here: a same-named workspace dying in *another* project
+  writes `project=<other> workspace=<name> pane_alive=false` to the same
+  hub-global log, and reacting to it would flag a death for a pane of yours
+  that's alive and mid-task (the cross-project false-death bug).
 
 - `project=<name> heartbeat` → bounded sweep. Do exactly these two
   things, then stop:
@@ -478,9 +491,10 @@ These extend (not replace) the default reaction rules above. When
   `zen_eligible > 0` and an idle workspace will force you back into the
   scan loop anyway — reading the list now is strictly cheaper than
   re-deriving it a heartbeat later.
-- On any workspace-free signal (`workspace=<name> ... -> idle`,
-  `workspace=<name> working -> awaiting_input`, or a task transitioning
-  into `handoff`): run `shelbi zen scan` to get mechanically-eligible
+- On any workspace-free signal scoped to your project
+  (`project=<you> workspace=<name> ... -> idle`,
+  `project=<you> workspace=<name> working -> awaiting_input`, or a task
+  transitioning into `handoff`): run `shelbi zen scan` to get mechanically-eligible
   candidates. For each, apply the auto-promote judgment categories
   above. Promote + dispatch the ones that fit; emit
   `reason=orchestrator:zen-promote category=<n>` for promoted,

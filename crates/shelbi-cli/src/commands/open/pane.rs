@@ -2,9 +2,11 @@
 //! becomes a workspace pane's top-level process. It owns the agent
 //! subprocess, installs signal handlers so tmux teardown / kill-window /
 //! Ctrl-C all flow through the same exit path, and writes a
-//! `workspace=<name> pane_alive=false reason=<short>` line to
+//! `project=<name> workspace=<name> pane_alive=false reason=<short>` line to
 //! `~/.shelbi/events.log` on every termination so the orchestrator's
-//! reaction rules can fire on pane death.
+//! reaction rules can fire on pane death. The leading `project=` scope keeps
+//! a same-named workspace in another project (the log is hub-global) from
+//! being read as *this* pane dying.
 //!
 //! Single-process model: this binary IS the pane. When it exits, the
 //! pane closes. The default exit behavior prints
@@ -211,7 +213,7 @@ pub fn run(project: &Project, workspace: &WorkspaceSpec, machine: &Machine) -> R
     // (dispatch, quit-project, quit-shelbi, `shelbi workspace stop`)
     // dropped the expected-teardown marker before killing our tmux window.
     // Otherwise every dispatch would emit
-    // `workspace=<name> pane_alive=false reason=signal:SIGHUP` right
+    // `project=<name> workspace=<name> pane_alive=false reason=signal:SIGHUP` right
     // before the replacement pane comes up — the orchestrator's reaction
     // rule ("don't auto-restart, flag it") assumes the event means real
     // pane death, so a spurious signal on every dispatch is genuinely
@@ -222,7 +224,9 @@ pub fn run(project: &Project, workspace: &WorkspaceSpec, machine: &Machine) -> R
         shelbi_state::consume_expected_teardown(&workspace.name).unwrap_or(false);
     if !intentional_teardown {
         // Best-effort: a failure here shouldn't keep the pane from closing.
-        if let Err(e) = shelbi_state::append_workspace_pane_event(&workspace.name, false, &reason) {
+        if let Err(e) =
+            shelbi_state::append_workspace_pane_event(&project.name, &workspace.name, false, &reason)
+        {
             eprintln!(
                 "shelbi: warning: couldn't write workspace pane-death event for `{}`: {e}",
                 workspace.name
@@ -643,8 +647,8 @@ mod tests {
     }
 
     /// Acceptance criterion: "When the agent subprocess exits (any
-    /// reason), the wrapper emits `workspace=<name> pane_alive=false
-    /// reason=<short>` to the events log." Exercise the happy path
+    /// reason), the wrapper emits `project=<name> workspace=<name>
+    /// pane_alive=false reason=<short>` to the events log." Exercise the happy path
     /// (child exits 0) end-to-end with a stub runner so the wrapper's
     /// spawn-wait-emit dance is covered by tests, not just inspection.
     #[test]

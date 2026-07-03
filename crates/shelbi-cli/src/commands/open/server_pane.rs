@@ -4,7 +4,9 @@
 //! It's the server-side twin of [`super::pane`]: where that wrapper owns the
 //! interactive agent subprocess and emits `pane_alive=false` on exit, this one
 //! owns the `$SHELBI_SERVE_CMD` server subprocess on `$PORT` and emits
-//! `workspace=<name> server_alive=false reason=<short>` when the server dies.
+//! `project=<name> workspace=<name> server_alive=false reason=<short>` when
+//! the server dies (the `project=` scope keeps a same-named review workspace
+//! in another project from being mistaken for this one on the hub-global log).
 //! The distinct verb lets the orchestrator tell "the agent stopped" from "the
 //! served URL went down / the port freed."
 //!
@@ -118,9 +120,12 @@ pub fn run(project: &Project, workspace: &WorkspaceSpec, machine: &Machine) -> R
     let intentional_teardown =
         shelbi_state::consume_expected_teardown(&teardown_key).unwrap_or(false);
     if !intentional_teardown {
-        if let Err(e) =
-            shelbi_state::append_workspace_server_event(&workspace.name, false, &reason)
-        {
+        if let Err(e) = shelbi_state::append_workspace_server_event(
+            &project.name,
+            &workspace.name,
+            false,
+            &reason,
+        ) {
             eprintln!(
                 "shelbi: warning: couldn't write server pane-death event for `{}`: {e}",
                 workspace.name

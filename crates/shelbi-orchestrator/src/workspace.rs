@@ -547,7 +547,7 @@ pub fn workspace_pane_alive(host: &Host, addr: &TmuxAddr) -> Result<bool> {
 /// so the local pane's lifecycle wrapper (`shelbi open <name> --as-pane`)
 /// can distinguish shelbi-initiated shutdowns from real pane deaths.
 /// Without the mark, `tmux kill-window` delivers SIGHUP to the wrapper,
-/// which would emit `workspace=<name> pane_alive=false reason=signal:SIGHUP`
+/// which would emit `project=<name> workspace=<name> pane_alive=false reason=signal:SIGHUP`
 /// to events.log even when the caller is a normal dispatch — spuriously
 /// tripping the orchestrator's "pane died, surface to user" reaction rule
 /// right before the replacement pane comes up. See

@@ -271,23 +271,36 @@ pub fn load_workspace_status(workspace: &str) -> Result<Option<WorkspaceStatus>>
     Ok(Some(serde_yaml::from_str(&text)?))
 }
 
-/// Append `<rfc3339> workspace=<name> <prev> -> <new>` to
+/// Append `<rfc3339> project=<project> workspace=<name> <prev> -> <new>` to
 /// `~/.shelbi/events.log`. `prev` is `None` on the first observation.
+///
+/// The leading `project=<name>` scope is load-bearing: `events.log` is
+/// hub-global (every project's orchestrator tails the same file), and
+/// workspace names are only unique *within* a project — two projects can
+/// each own an `alpha`. Without the scope a transition (or pane death) in one
+/// project's `alpha` is indistinguishable from the other's, so every
+/// orchestrator would react to it. With the scope each orchestrator filters
+/// to `project=<its-own-name>` — matching the heartbeat / zen / crash-recovery
+/// convention already on the wire.
 pub fn append_workspace_event(
+    project: &str,
     workspace: &str,
     prev: Option<WorkspaceState>,
     new: WorkspaceState,
 ) -> Result<()> {
     let ts = Utc::now().to_rfc3339();
+    let project = sanitize_field(project);
     let workspace = sanitize_field(workspace);
     let prev_str = prev.map(|s| s.as_str()).unwrap_or("none");
-    append_event_line(&format!("{ts} workspace={workspace} {prev_str} -> {new}"))
+    append_event_line(&format!(
+        "{ts} project={project} workspace={workspace} {prev_str} -> {new}"
+    ))
 }
 
 /// Append a blocking-dialog transition line to `~/.shelbi/events.log`:
 ///
-/// - blocked: `<rfc3339> workspace=<name> working -> blocked reason=dialog:<kind>`
-/// - cleared: `<rfc3339> workspace=<name> blocked -> working reason=dialog:<kind>:cleared`
+/// - blocked: `<rfc3339> project=<project> workspace=<name> working -> blocked reason=dialog:<kind>`
+/// - cleared: `<rfc3339> project=<project> workspace=<name> blocked -> working reason=dialog:<kind>:cleared`
 ///
 /// Emitted by the hub poller when its `tmux capture-pane` sample starts (or
 /// stops) matching a configured blocking-dialog signature — a workspace
@@ -298,16 +311,28 @@ pub fn append_workspace_event(
 /// deduped in the poller so it fires once per incident with a matching
 /// recovery line when the modal clears.
 ///
+/// Carries the same leading `project=<name>` scope as [`append_workspace_event`]
+/// so a hub-global tail can tell two projects' same-named workspaces apart.
+///
 /// `kind` is the signature's short token (`usage-limit`, `trust`, …);
 /// whitespace folds to underscores so the line stays a single parseable
 /// record.
-pub fn append_workspace_dialog_event(workspace: &str, kind: &str, blocked: bool) -> Result<()> {
+pub fn append_workspace_dialog_event(
+    project: &str,
+    workspace: &str,
+    kind: &str,
+    blocked: bool,
+) -> Result<()> {
     let ts = Utc::now().to_rfc3339();
+    let project = sanitize_field(project);
+    let workspace = sanitize_field(workspace);
     let kind = sanitize_reason(kind);
     let line = if blocked {
-        format!("{ts} workspace={workspace} working -> blocked reason=dialog:{kind}")
+        format!("{ts} project={project} workspace={workspace} working -> blocked reason=dialog:{kind}")
     } else {
-        format!("{ts} workspace={workspace} blocked -> working reason=dialog:{kind}:cleared")
+        format!(
+            "{ts} project={project} workspace={workspace} blocked -> working reason=dialog:{kind}:cleared"
+        )
     };
     append_event_line(&line)
 }
@@ -560,11 +585,20 @@ pub fn append_dispatch_event(
     ))
 }
 
-/// Append `<rfc3339> workspace=<name> pane_alive=<bool> reason=<short>` to
-/// `~/.shelbi/events.log`. Emitted by the `shelbi open --as-pane`
+/// Append `<rfc3339> project=<project> workspace=<name> pane_alive=<bool> reason=<short>`
+/// to `~/.shelbi/events.log`. Emitted by the `shelbi open --as-pane`
 /// wrapper when its agent subprocess exits (any reason — clean exit,
 /// signal, tmux teardown) so the orchestrator's reaction rules can fire
 /// on a pane death.
+///
+/// The leading `project=<name>` scope is load-bearing: workspace names are
+/// only unique within a project, and `events.log` is hub-global. Without the
+/// scope, project B's `alpha` pane dying would emit `workspace=alpha
+/// pane_alive=false` — which project A (whose own `alpha` is alive and
+/// mid-task) would read off the shared tail as *its* alpha dying, spuriously
+/// tripping the "pane died, surface to user" reaction rule. With the scope,
+/// each orchestrator filters to `project=<its-own-name>` and ignores the
+/// other project's death. This is the cross-project false-death bug.
 ///
 /// `reason` is folded to a single short token (whitespace → underscores) so
 /// the line stays parseable.
@@ -580,18 +614,20 @@ pub fn append_dispatch_event(
 /// degraded-mode tradeoff (see `Plans/worker-orchestrator-communication.md`
 /// §3).
 pub fn append_workspace_pane_event(
+    project: &str,
     workspace: &str,
     alive: bool,
     reason: &str,
 ) -> Result<()> {
+    let project = sanitize_field(project);
     let workspace = sanitize_field(workspace);
     let reason = sanitize_reason(reason);
-    let body = format!("workspace={workspace} pane_alive={alive} reason={reason}");
+    let body = format!("project={project} workspace={workspace} pane_alive={alive} reason={reason}");
     emit_event_body(&body)
 }
 
-/// Append `<rfc3339> workspace=<name> server_alive=<bool> reason=<short>` to
-/// `~/.shelbi/events.log`. The review-workspace analog of
+/// Append `<rfc3339> project=<project> workspace=<name> server_alive=<bool> reason=<short>`
+/// to `~/.shelbi/events.log`. The review-workspace analog of
 /// [`append_workspace_pane_event`], emitted by the `shelbi open
 /// --as-server-pane` wrapper when the long-lived dev-server process in a
 /// review workspace's server pane exits (crash, clean stop, or tmux
@@ -601,16 +637,24 @@ pub fn append_workspace_pane_event(
 /// review workspace means the served URL is down and the port has (usually)
 /// been freed, not that the agent stopped.
 ///
+/// Carries the same leading `project=<name>` scope as
+/// [`append_workspace_pane_event`] so a same-named review workspace in another
+/// project can't be mistaken for this one across the hub-global log.
+///
 /// Rides the same socket-preferred / file-fallback emit path as every other
 /// event line (see [`emit_event_body`]); `reason` is folded to a single
 /// short token so the record stays parseable.
 pub fn append_workspace_server_event(
+    project: &str,
     workspace: &str,
     alive: bool,
     reason: &str,
 ) -> Result<()> {
+    let project = sanitize_field(project);
+    let workspace = sanitize_field(workspace);
     let reason = sanitize_reason(reason);
-    let body = format!("workspace={workspace} server_alive={alive} reason={reason}");
+    let body =
+        format!("project={project} workspace={workspace} server_alive={alive} reason={reason}");
     emit_event_body(&body)
 }
 
@@ -1189,14 +1233,22 @@ mod tests {
         let home = fresh_home();
         std::env::set_var("SHELBI_HOME", &home);
 
-        append_workspace_event("alpha", None, WorkspaceState::Working).unwrap();
-        append_workspace_event("alpha", Some(WorkspaceState::Working), WorkspaceState::AwaitingInput)
-            .unwrap();
+        append_workspace_event("demo", "alpha", None, WorkspaceState::Working).unwrap();
+        append_workspace_event(
+            "demo",
+            "alpha",
+            Some(WorkspaceState::Working),
+            WorkspaceState::AwaitingInput,
+        )
+        .unwrap();
         let log = std::fs::read_to_string(events_log_path().unwrap()).unwrap();
         let lines: Vec<&str> = log.lines().collect();
         assert_eq!(lines.len(), 2);
-        assert!(lines[0].contains("workspace=alpha"));
+        // The `project=` scope leads the workspace token so a hub-global tail
+        // can be filtered per-project.
+        assert!(lines[0].contains("project=demo workspace=alpha"));
         assert!(lines[0].contains("none -> working"));
+        assert!(lines[1].contains("project=demo workspace=alpha"));
         assert!(lines[1].contains("working -> awaiting_input"));
 
         std::env::remove_var("SHELBI_HOME");
@@ -1208,11 +1260,11 @@ mod tests {
         let home = fresh_home();
         std::env::set_var("SHELBI_HOME", &home);
 
-        append_workspace_dialog_event("alpha", "usage-limit", true).unwrap();
-        append_workspace_dialog_event("alpha", "usage-limit", false).unwrap();
+        append_workspace_dialog_event("demo", "alpha", "usage-limit", true).unwrap();
+        append_workspace_dialog_event("demo", "alpha", "usage-limit", false).unwrap();
         // A kind with whitespace folds to underscores so the line stays a
         // single parseable record.
-        append_workspace_dialog_event("bravo", "trust prompt", true).unwrap();
+        append_workspace_dialog_event("demo", "bravo", "trust prompt", true).unwrap();
 
         let log = std::fs::read_to_string(events_log_path().unwrap()).unwrap();
         let lines: Vec<&str> = log.lines().collect();
@@ -1223,19 +1275,25 @@ mod tests {
             let ts = line.split_whitespace().next().unwrap();
             DateTime::parse_from_rfc3339(ts).unwrap();
         }
+        // The `project=` scope leads the workspace token on every dialog line.
         assert!(
-            lines[0].ends_with(" workspace=alpha working -> blocked reason=dialog:usage-limit"),
+            lines[0].ends_with(
+                " project=demo workspace=alpha working -> blocked reason=dialog:usage-limit"
+            ),
             "line: {}",
             lines[0]
         );
         assert!(
-            lines[1]
-                .ends_with(" workspace=alpha blocked -> working reason=dialog:usage-limit:cleared"),
+            lines[1].ends_with(
+                " project=demo workspace=alpha blocked -> working reason=dialog:usage-limit:cleared"
+            ),
             "line: {}",
             lines[1]
         );
         assert!(
-            lines[2].ends_with(" workspace=bravo working -> blocked reason=dialog:trust_prompt"),
+            lines[2].ends_with(
+                " project=demo workspace=bravo working -> blocked reason=dialog:trust_prompt"
+            ),
             "line: {}",
             lines[2]
         );
@@ -1432,15 +1490,21 @@ mod tests {
         let home = fresh_home();
         std::env::set_var("SHELBI_HOME", &home);
 
-        append_workspace_pane_event("alpha", false, "signal:SIGTERM").unwrap();
-        append_workspace_pane_event("bravo", false, "exit:0").unwrap();
-        append_workspace_pane_event("charlie", false, "claude exited normally").unwrap();
+        append_workspace_pane_event("demo", "alpha", false, "signal:SIGTERM").unwrap();
+        append_workspace_pane_event("demo", "bravo", false, "exit:0").unwrap();
+        append_workspace_pane_event("demo", "charlie", false, "claude exited normally").unwrap();
 
         let log = std::fs::read_to_string(events_log_path().unwrap()).unwrap();
         let lines: Vec<&str> = log.lines().collect();
         assert_eq!(lines.len(), 3, "log: {log}");
 
-        assert!(lines[0].contains(" workspace=alpha "), "line: {}", lines[0]);
+        // The `project=` scope leads the `workspace=` token so a hub-global
+        // tail can tell two projects' same-named panes apart.
+        assert!(
+            lines[0].contains(" project=demo workspace=alpha "),
+            "line: {}",
+            lines[0]
+        );
         assert!(lines[0].contains(" pane_alive=false "), "line: {}", lines[0]);
         assert!(lines[0].ends_with(" reason=signal:SIGTERM"), "line: {}", lines[0]);
 
@@ -1459,6 +1523,81 @@ mod tests {
     }
 
     #[test]
+    fn same_named_workspace_in_two_projects_does_not_cross_talk() {
+        // Regression for the cross-project false-death bug: two projects each
+        // own a workspace named `alpha`. Project `beta`'s alpha pane exits
+        // (real death) while project `demo`'s alpha stays healthy. Because
+        // every line carries a `project=` scope, an orchestrator filtering the
+        // hub-global log to its own project can tell the two apart — `demo`
+        // sees no death for *its* alpha, so the "pane died, surface to user"
+        // rule never trips spuriously.
+        let _g = TEST_LOCK.lock().unwrap();
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+        std::env::remove_var("SHELBI_HUB_SOCK");
+
+        // Only beta's alpha dies. demo's alpha is alive and emits nothing.
+        append_workspace_pane_event("beta", "alpha", false, "exit:0").unwrap();
+
+        let log = std::fs::read_to_string(events_log_path().unwrap()).unwrap();
+
+        // The death is scoped to beta on the wire.
+        assert!(
+            log.contains(" project=beta workspace=alpha pane_alive=false "),
+            "beta's alpha death must be project-scoped; got: {log}"
+        );
+        // A demo-scoped orchestrator (filtering `project=demo`) sees no death
+        // for its own alpha — no cross-talk, no false burst.
+        assert!(
+            !log.contains("project=demo workspace=alpha pane_alive=false"),
+            "demo's healthy alpha must not appear dead; got: {log}"
+        );
+
+        std::env::remove_var("SHELBI_HOME");
+    }
+
+    #[test]
+    fn healthy_pane_emits_no_pane_death_on_the_wire() {
+        // The false-death burst scenario: a workspace whose pane is alive and
+        // mid-task must produce no `pane_alive=false` line for its own project.
+        // The pane-death line is only ever written by the pane wrapper on a
+        // real subprocess exit (see `append_workspace_pane_event`) — the poller
+        // never fabricates one, even when its status.yaml was reset. So for a
+        // healthy pane, the only workspace lines that can appear are state
+        // transitions, all scoped to the project. Assert the log carries no
+        // death line for the healthy project.
+        let _g = TEST_LOCK.lock().unwrap();
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+        std::env::remove_var("SHELBI_HUB_SOCK");
+
+        // A healthy pane's poller only ever emits scoped state transitions.
+        append_workspace_event("demo", "alpha", None, WorkspaceState::Working).unwrap();
+        append_workspace_event(
+            "demo",
+            "alpha",
+            Some(WorkspaceState::Working),
+            WorkspaceState::AwaitingInput,
+        )
+        .unwrap();
+
+        let log = std::fs::read_to_string(events_log_path().unwrap()).unwrap();
+        assert!(
+            !log.contains("pane_alive=false"),
+            "a healthy pane must never produce a pane-death line; got: {log}"
+        );
+        // Every workspace line it *does* produce is project-scoped.
+        for line in log.lines().filter(|l| l.contains("workspace=alpha")) {
+            assert!(
+                line.contains("project=demo workspace=alpha"),
+                "workspace line must be project-scoped: {line}"
+            );
+        }
+
+        std::env::remove_var("SHELBI_HOME");
+    }
+
+    #[test]
     fn append_workspace_server_event_writes_distinct_verb() {
         // The server pane emits `server_alive=` (not `pane_alive=`) so the
         // orchestrator can tell an agent-pane death from a server-pane death.
@@ -1467,10 +1606,10 @@ mod tests {
         std::env::set_var("SHELBI_HOME", &home);
         std::env::remove_var("SHELBI_HUB_SOCK");
 
-        append_workspace_server_event("review-1", false, "exit:0").unwrap();
+        append_workspace_server_event("demo", "review-1", false, "exit:0").unwrap();
         let log = std::fs::read_to_string(events_log_path().unwrap()).unwrap();
         let line = log.lines().next().unwrap();
-        assert!(line.contains(" workspace=review-1 "), "line: {line}");
+        assert!(line.contains(" project=demo workspace=review-1 "), "line: {line}");
         assert!(line.contains(" server_alive=false "), "line: {line}");
         assert!(!line.contains(" pane_alive="), "must not use the agent verb: {line}");
         assert!(line.ends_with(" reason=exit:0"), "line: {line}");
@@ -1964,7 +2103,8 @@ mod tests {
                 } else {
                     Some(WorkspaceState::Working)
                 };
-                append_workspace_event("alpha", prev, WorkspaceState::AwaitingInput).unwrap();
+                append_workspace_event("demo", "alpha", prev, WorkspaceState::AwaitingInput)
+                    .unwrap();
             }
         });
         task_thread.join().unwrap();

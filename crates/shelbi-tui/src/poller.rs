@@ -454,6 +454,7 @@ fn poll_one(
     }
     if outcome.transitioned {
         if let Err(e) = append_workspace_event(
+            &project.name,
             &workspace.name,
             outcome.prev_state,
             outcome.status.state,
@@ -563,7 +564,9 @@ fn maybe_emit_dialog_event(
 
     let (events, next) = decide_dialog(last_dialog.as_deref(), detected.as_deref());
     for ev in events {
-        if let Err(e) = append_workspace_dialog_event(&workspace.name, &ev.kind, ev.blocked) {
+        if let Err(e) =
+            append_workspace_dialog_event(&project.name, &workspace.name, &ev.kind, ev.blocked)
+        {
             tracing::warn!(
                 workspace = %workspace.name,
                 kind = %ev.kind,
@@ -1491,7 +1494,8 @@ mod tests {
         maybe_emit_heartbeat(&project, &mut next, || true);
         // Force the next attempt to be due immediately, but write
         // unrelated activity first so the debounce trips.
-        shelbi_state::append_workspace_event("alpha", None, WorkspaceState::Working).unwrap();
+        shelbi_state::append_workspace_event("demo", "alpha", None, WorkspaceState::Working)
+            .unwrap();
         next = Some(Instant::now());
 
         maybe_emit_heartbeat(&project, &mut next, || true);
