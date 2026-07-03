@@ -1660,7 +1660,29 @@ pub fn list_tasks(project: &str) -> Result<Vec<TaskFile>> {
         };
         match parse_task_file(&text) {
             Ok(tf) => {
-                forget_parse_warn(&path);
+                // Parse succeeded, but the flattened `params` catch-all may
+                // hold a misspelled optional field or a non-string extra that
+                // silently did nothing. Surface those by name — never drop the
+                // card (that would undo the forward-compat tolerance the raw
+                // `serde_yaml::Value` params were built for). Deduped through
+                // the same per-file cache so a refresh loop doesn't re-flood.
+                let diags = tf.task.validate_params();
+                if diags.is_empty() {
+                    forget_parse_warn(&path);
+                } else {
+                    let joined = diags
+                        .iter()
+                        .map(|d| d.to_string())
+                        .collect::<Vec<_>>()
+                        .join("; ");
+                    let msg = format!(
+                        "shelbi: task file {} has param issue(s): {joined}",
+                        path.display()
+                    );
+                    if should_warn_about_parse(&path, mtime, &msg) {
+                        eprintln!("{msg}");
+                    }
+                }
                 out.push(tf);
             }
             Err(e) => {
@@ -3073,6 +3095,46 @@ mod tests {
         let existing = list_tasks("p").unwrap();
         let candidate = make_task_with_deps("c", Column::Todo, 1, &["b"]);
         validate_depends_on(&candidate, &existing).unwrap();
+        std::env::remove_var("SHELBI_HOME");
+    }
+
+    #[test]
+    fn list_tasks_surfaces_param_issues_without_dropping_the_card() {
+        let _g = TEST_LOCK.lock().unwrap();
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+
+        // A clean task and a hand-edited one carrying a numeric extra
+        // (`retries: 2`). save_task creates the tasks dir; we then write the
+        // suspect file's frontmatter directly, the way a human edit would.
+        save_task("p", &make_task("clean", Column::Todo, 0), "").unwrap();
+        let dir = tasks_dir("p").unwrap();
+        let now = "2026-06-19T00:00:00Z";
+        let suspect = format!(
+            "---\nid: numeric\ntitle: Numeric\ncolumn: todo\npriority: 1\n\
+             created_at: {now}\nupdated_at: {now}\nretries: 2\n---\n# Task\n"
+        );
+        std::fs::write(dir.join("numeric.md"), suspect).unwrap();
+
+        // Both cards load — the numeric extra is a diagnostic, not a drop.
+        let ids: Vec<String> = list_tasks("p")
+            .unwrap()
+            .into_iter()
+            .map(|tf| tf.task.id)
+            .collect();
+        assert!(ids.contains(&"clean".to_string()));
+        assert!(
+            ids.contains(&"numeric".to_string()),
+            "the numeric-extra card must still load; forward-compat, not a drop"
+        );
+
+        // And the offending field is nameable via the public lint.
+        let tf = load_task("p", "numeric").unwrap();
+        let diags = tf.task.validate_params();
+        assert_eq!(diags.len(), 1);
+        assert_eq!(diags[0].field(), "retries");
+        assert!(diags[0].is_error());
+
         std::env::remove_var("SHELBI_HOME");
     }
 

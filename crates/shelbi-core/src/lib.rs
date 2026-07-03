@@ -16,10 +16,10 @@ pub use model::{
     validate_task_id, validate_workflow_name, Agent, AgentRunnerSpec, Column, ConfigMode,
     ContextStoreSyncSpec, DialogSignature, GitConfig, HeartbeatConfig, Host, Machine, MachineKind,
     MergeStrategy,
-    OrchestratorSpec, Project, ProjectShape, Session, SessionProject, Status, Task, TaskZenConfig,
-    TmuxAddr, WorkspaceSpec, ZenChecks, ZenConfig, ZenDangerPaths, BUILTIN_DANGER_PATHS,
-    DEFAULT_WORKFLOW_NAME, HEARTBEAT_DEFAULT, LOCAL_PROJECT_FIELDS, MAX_TASK_ID_LEN,
-    SHARED_PROJECT_FIELDS,
+    OrchestratorSpec, ParamDiagnostic, Project, ProjectShape, Session, SessionProject, Status, Task,
+    TaskZenConfig, TmuxAddr, WorkspaceSpec, ZenChecks, ZenConfig, ZenDangerPaths,
+    BUILTIN_DANGER_PATHS, DEFAULT_WORKFLOW_NAME, HEARTBEAT_DEFAULT, KNOWN_OPTIONAL_TASK_FIELDS,
+    LOCAL_PROJECT_FIELDS, MAX_TASK_ID_LEN, SHARED_PROJECT_FIELDS,
 };
 pub use placeholders::substitute_placeholders;
 pub use shell::shell_escape;
