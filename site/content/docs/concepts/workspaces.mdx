@@ -80,11 +80,12 @@ The wizard sizes the pool from total RAM (~10 GB per local workspace, ~12 GB
 when spread across machines, clamped to `[1, 16]`). Add or remove workspaces
 later by editing the YAML and running `shelbi reload`.
 
-A slot can also be marked `role: review`, a scarce
-[review workspace](/docs/concepts/review-workspaces) that loads a finished
-branch and boots its dev server for a human to click through, rather than
-picking up development work. Everything on this page applies to it too; the
-role just changes what gets dispatched there.
+A slot can also carry `tags` — capability labels a workflow status can
+require, so a task routes to a matching workspace. A
+[review workspace](/docs/concepts/review-workspaces) is just a slot tagged
+`review` that a review status routes to: it loads a finished branch and boots
+its dev server for a human to click through. Everything on this page applies to
+it too; the tag just changes what gets routed there.
 
 ## The sidebar: grouped by machine
 
@@ -248,8 +249,8 @@ you can `tmux ls` on the remote to inspect.
 
 - [Project config](/docs/configuration/project#workspaces) — the
   `workspaces:`, `machines:`, and `agent_runners:` field reference.
-- [Review workspaces](/docs/concepts/review-workspaces) — the `role: review`
-  variant that loads and *serves* a finished branch for human review.
+- [Review workspaces](/docs/concepts/review-workspaces) — the tag-routed slot
+  that loads and *serves* a finished branch for human review.
 - [Agents](/docs/concepts/agents) — the role that runs *inside* a
   workspace, and the role/slot split.
 - [Workflows](/docs/guides/getting-started/workflows#lifecycle-who-moves-a-task-between-the-default-statuses)

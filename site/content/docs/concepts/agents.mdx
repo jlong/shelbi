@@ -32,7 +32,7 @@ unless you say otherwise.
 | --- | --- |
 | `orchestrator` | The agent you talk to. Turns requests into cards, dispatches tasks to free workspaces, tails the events log, reports back. Runs in window 1, never in a workspace. See [Orchestrator](/docs/concepts/orchestrator). |
 | `developer` | The default workspace agent. Implements a task on its branch, runs the project's checks, writes the review-ready marker. This is the agent an `agent`-owned status uses when no other is named. |
-| `review` | The agent that runs on a [review workspace](/docs/concepts/review-workspaces). It loads a finished branch and *serves* it (installs deps, builds, boots the dev server), then hands a human a working URL. It doesn't write code (bar an explicitly requested tweak). |
+| `review` | The agent named by a review status, run on a [review workspace](/docs/concepts/review-workspaces). Its charter is to make the finished branch runnable for a human — the dev server itself is booted by the status's transition commands — and to hand over a working URL. It doesn't write code (bar an explicitly requested tweak). |
 
 `developer` runs most often; `orchestrator` and `review` bracket it.
 

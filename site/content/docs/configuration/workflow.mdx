@@ -73,6 +73,17 @@ drifting across workflows.
 | `id` | string | yes | — | Stable id, declared in [`statuses.yaml`](/docs/configuration/statuses). Conventionally lowercase kebab-case. |
 | `owner` | `user` \| `agent` | yes | — | Who moves the task next when automation is off. `agent` makes it eligible for auto-dispatch; `user` waits. |
 | `agent` | string | no | derived from category | Which agent runs this status under automation. Defaults to `developer` for `active` and `orchestrator` for `ready` when omitted. `None` means no automation path. |
+| `tags` | list of string | no | `[]` | Required workspace tags. The task routes to a free workspace whose [effective tags](/docs/configuration/project#workspaces) are a **superset** of this set (set-AND). Empty means any free workspace — the default. Accepts a scalar `tag:` alias and a bare string as shorthand. Elided when empty. |
+
+<Callout type="note" title="Tags route work to the right slot">
+
+A status's `tags` are how a workflow says "this step needs a workspace with
+these capabilities." Pair them with a workspace/machine that carries the same
+[`tags`](/docs/configuration/project#workspaces) so the orchestrator loads
+the task there. `tags: [review]` on a handoff status is the primitive behind
+[review workspaces](/docs/concepts/review-workspaces).
+
+</Callout>
 
 ## transitions
 
@@ -85,8 +96,11 @@ Moves are any-to-any; unlisted edges are pure status changes. See
 | --- | --- | --- | --- | --- |
 | `from` | string | yes | — | Status `id` the task moves out of. Must be a declared status. |
 | `to` | string | yes | — | Status `id` the task moves into. Must be a declared status. |
-| `actions` | list of [action](#actions) | no | `[]` | Ordered side-effects to run on this edge. Failures short-circuit the rest. |
+| `actions` | list of [action](#actions) | no | `[]` | Ordered git side-effects to run on this edge. Failures short-circuit the rest. |
 | `target` | string | no | resolved `base_branch` | Overrides where `merge` / `open_pr` land for this edge only. Supports `{{var}}` placeholders resolved from task params. |
+| `run` | list of string | no | `[]` | Ordered [shell commands](#run-ready-and-teardown) to run on this edge, in the task's worktree. Compose with — and run *after* — this edge's `actions`. |
+| `ready` | string | no | — | Shell command polled until it exits 0 (or `ready_timeout` elapses) after `run`. Confirms a launched server is up. |
+| `ready_timeout` | duration (seconds) | no | `90` | How long to poll `ready` before failing the edge. Ignored when `ready` is unset. |
 
 ### actions
 
@@ -108,6 +122,64 @@ transitions:
     target: develop            # this edge merges into develop, not base_branch
     actions: [push_branch, merge]
 ```
+
+### run, ready, and teardown
+
+Beyond the six git actions, an edge can run arbitrary shell commands. This is
+what lets a status *do* something on entry — install dependencies, boot a dev
+server, warm a cache — and undo it on exit.
+
+- **`run`** is a list of commands executed in order, in the task's worktree,
+  on the assigned workspace's machine (host-routed over SSH for remote
+  machines). They run **after** this edge's git `actions`, sharing the same
+  short-circuit contract: the first non-zero exit aborts the edge.
+- **`ready`** is a single command polled until it exits 0, after `run`
+  finishes. Use it to block until a server the `run` step launched actually
+  answers. `ready_timeout` (seconds, default `90`) caps the wait; a timeout
+  fails the edge.
+- **Teardown** is not a separate field: express it as the `run` of the *exit*
+  transition (the edge that moves the task out of the status).
+
+Each command runs synchronously, so a long-lived server must background
+itself — the edge is considered entered the moment the launcher returns, and
+`ready` is what confirms the server is up.
+
+Every command has these variables exported into its environment:
+
+| Variable | Value |
+| --- | --- |
+| `$SLOT` | The workspace's numeric [`slot`](/docs/configuration/project#workspaces) — e.g. derive a per-slot port with `$((3000 + $SLOT))`. |
+| `$SHELBI_TASK` | The task id. |
+| `$SHELBI_BRANCH` | The task's git branch. |
+| `$SHELBI_WORKTREE` | Absolute path to the worktree the commands run in. |
+| `$SHELBI_MACHINE` | The machine the workspace runs on. |
+
+```yaml
+transitions:
+  # Entering review: boot a dev server on a per-slot port, wait for it.
+  - from: in-progress
+    to: review
+    run:
+      - npm install
+      - npm run dev -- --port $((3000 + $SLOT)) &
+    ready: curl -fsS http://localhost:$((3000 + $SLOT)) > /dev/null
+    ready_timeout: 120
+  # Leaving review: tear the server down.
+  - from: review
+    to: done
+    actions: [merge, delete_branch]
+    run:
+      - pkill -f "port $((3000 + $SLOT))" || true
+```
+
+<Callout type="note" title="run needs an assigned workspace">
+
+A transition that declares `run`/`ready` must fire on a task that's assigned
+to a workspace — that's what tells Shelbi *where* to run the commands. Route
+the status to a workspace with the status's [`tags`](#statuses); an unassigned
+task on such an edge is an error, not a silent hub-side run.
+
+</Callout>
 
 ## git
 

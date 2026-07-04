@@ -1,20 +1,18 @@
 ---
 title: Set up review workspaces
 order: 15
-summary: "Declare a review workspace, hand it a finished branch, and click through the running app — the end-to-end path from `role: review` in your YAML to accepting or bouncing a change on a live dev server."
+summary: "Tag a workspace, require that tag on your review status, and boot a dev server in the status's enter transition — the end-to-end path from a `review` tag in your YAML to clicking through a change on a live server, all from generic workflow primitives."
 ---
 
 The [multi-workspace loop](/docs/guides/getting-started/multi-workspace) gets
 finished branches back to you. But reading a diff isn't the same as *running*
 the change. Most real review of an app or a site means booting the dev server,
-opening a URL, and clicking through it. A **review workspace** is the pool slot
-that does exactly that: it loads a finished task's branch, installs and builds
-it, and serves it on a port so you can inspect the running app.
+opening a URL, and clicking through it.
 
-This page walks the whole flow end to end: declare the slot, reload, get a
-task to the review status, load it, open the served URL, and accept or bounce.
-For the model underneath it (ports, the `review:` config block, the Review
-agent, the load → serve lifecycle), see the reference:
+Shelbi has no special "review mode" for this — you assemble it from three
+generic primitives: a **workspace carries a tag**, a **status requires that
+tag**, and a **transition runs commands**. This page wires them together end
+to end. For the model underneath, see the reference:
 [Review workspaces](/docs/concepts/review-workspaces).
 
 <Callout type="note" title="You need a working pool first">
@@ -22,48 +20,77 @@ agent, the load → serve lifecycle), see the reference:
 This page assumes you already have a project with a workspace pool and can
 promote a task through the board. The [first task](/docs/guides/getting-started/first-task)
 and [multi-workspace](/docs/guides/getting-started/multi-workspace) pages get
-you there. A review workspace is an *addition* to that pool, not a replacement.
+you there. A review workspace is an ordinary slot with a tag, not a new kind of
+thing.
 
 </Callout>
 
 ## Set up and use the review flow
 
 <Steps>
-<Step title="Declare a review workspace">
+<Step title="Tag a workspace for review">
 
-A review workspace is an ordinary `workspaces:` entry with one extra key:
-`role: review`. Open your project's YAML (`~/.shelbi/projects/<name>.yaml` in
-[global mode](/docs/concepts/config-modes), `<repo>/.shelbi/project.yaml`
-in-repo) and add one to the pool:
+Add a `review` tag to a slot in your project YAML
+(`~/.shelbi/projects/<name>.yaml` in [global mode](/docs/concepts/config-modes),
+`<repo>/.shelbi/project.yaml` in-repo). Tag one workspace directly, or tag the
+machine so every slot on it inherits the tag:
 
 ```yaml
 workspaces:
   - { name: alpha,    machine: hub, runner: claude }
   - { name: bravo,    machine: hub, runner: claude }
-  - { name: review-1, machine: hub, runner: claude, role: review }
+  - { name: review-0, machine: hub, runner: claude, tags: [review], slot: 0 }
 ```
 
-`role` takes `dev` (the default, elided from the wire form) or `review`. A slot
-with no `role:` is a normal development workspace, so every existing project
-YAML keeps working untouched. Because `role` rides the **user-local** config
-half alongside the rest of `workspaces:`, each person decides how many review
-slots their own machines carry.
+`tags` accepts a bare string as shorthand (`tags: review`). The `slot: 0` makes
+the numeric slot explicit so the transition commands below can derive a stable
+port from `$SLOT`; leave it out and it defaults to the slot's index among the
+machine's workspaces.
 
-<Callout type="warning" title="Two review workspaces per machine, max">
+<Callout type="tip" title="One review slot is plenty to start">
 
-Review workspaces are **scarce by design: 1–2 per machine**, because each one
-may hold a running server bound to a port. That's a hard invariant: the config
-loader refuses to start a project that declares a third review slot on any one
-machine. One is plenty to start with. See [the scarcity
-invariant](/docs/concepts/review-workspaces#the-scarcity-invariant) for why.
+Each review slot may hold a running server bound to a port, so give the port a
+per-slot offset (`$((3000 + $SLOT))`) if you add a second. One is enough for a
+first pass.
 
 </Callout>
 
-Most projects need nothing else: the Review agent auto-detects how to install,
-build, and serve from your project shape (`package.json`, `Cargo.toml`, a
-`Makefile`, a `Procfile`). If yours needs explicit commands or a non-default
-port, add a [`review:` block](/docs/concepts/review-workspaces#the-review-config-block),
-but leave it out until you find you need it.
+</Step>
+<Step title="Require the tag on your review status and boot a server">
+
+In your [workflow file](/docs/configuration/workflow), require the `review` tag
+on the review status so tasks route to the tagged slot, and add transitions
+that boot the dev server on entry and tear it down on exit:
+
+```yaml
+statuses:
+  - { id: in-progress, owner: agent, agent: developer }
+  - { id: review,      owner: user,  agent: review, tags: [review] }
+  - { id: done,        owner: user }
+
+transitions:
+  - from: in-progress
+    to: review
+    run:
+      - npm install
+      - npm run dev -- --port $((3000 + $SLOT)) &
+    ready: curl -fsS http://localhost:$((3000 + $SLOT)) > /dev/null
+    ready_timeout: 120
+  - from: review
+    to: done
+    actions: [merge, delete_branch]
+    run:
+      - pkill -f "port $((3000 + $SLOT))" || true
+  - from: review
+    to: in-progress
+    run:
+      - pkill -f "port $((3000 + $SLOT))" || true
+```
+
+The enter transition installs deps, launches the server (backgrounded, so the
+command returns), and `ready` polls the URL until it answers. Both exit edges
+tear the server back down. Swap the `npm` lines for whatever your project
+needs — `cargo run`, a `Makefile` target, a `Procfile web:` line.
 
 </Step>
 <Step title="Reload to pick it up">
@@ -72,8 +99,8 @@ but leave it out until you find you need it.
 shelbi reload
 ```
 
-The new slot appears under **Workspaces** in the sidebar, grouped under its
-machine and reading `idle` until a task loads onto it.
+The tagged slot appears under **Workspaces** in the sidebar, grouped under its
+machine and reading `idle` until a task routes onto it.
 
 </Step>
 <Step title="Get a task to the review status">
@@ -81,60 +108,24 @@ machine and reading `idle` until a task loads onto it.
 Run a task the way you normally would: promote a card and let a dev workspace
 pick it up, or dispatch one through the orchestrator. When the dev workspace
 finishes it writes its review-ready marker; the hub poller rebases the branch
-onto the base branch and moves the task into the **Review** status. (That
-`handoff`-category status is a [workflow](/docs/guides/getting-started/workflows)
-concept: the board column a task sits in awaiting human input.)
+onto the base branch and moves the task into the **Review** status.
 
-The finishing dev workspace then closes its own session and returns to `idle`.
-It doesn't linger. Its work is now waiting to be *run*, not edited.
+Because that status requires `tags: [review]`, the orchestrator routes the task
+onto a free `review`-tagged slot (preferring the one it ran on) and fires the
+enter transition: install, boot the server on the slot's port, wait for
+`ready`. If every matching slot is busy the task waits in Review until one
+frees — nothing is preempted.
 
-</Step>
-<Step title="Load it onto a review workspace">
-
-If your project declares any review workspace, the **orchestrator auto-loads**
-the task onto a free review slot the moment it reaches the review status. It's
-the same path you can trigger by hand:
-
-```bash
-shelbi review dark-mode-toggle-polish
-```
-
-Either way, the Review agent takes over on the review slot: it installs deps,
-builds, starts the dev server on the slot's assigned port, waits for the ready
-probe, and posts a "ready" note with the URL. When a slot is free you'll see:
-
-```text
-→ loading dark-mode-toggle-polish onto review workspace review-1 on hub (:3000)
-✓ review agent up at shelbi-myapp:review-1
-```
-
-If every review slot on the machine is already busy, nothing fails and nothing
-is preempted. The task waits in Review, marked *pending-load*, and the command
-reports its queue position:
-
-```text
-⏳ all review workspaces on hub are busy — `dark-mode-toggle-polish` is queued at position 1
-   review-1 → palette-fuzzy-match-fix
-It will load automatically when a review workspace frees.
-```
-
-<Callout type="note" title="Declare a slot before you review">
-
-Review workspaces are the only review surface. `shelbi review <id>` on a
-project that declares none gives a loud onboarding error telling you to add a
-`role: review` slot and reload. It never silently falls back. See
-[`shelbi review`](/docs/cli/review) for the full command reference.
-
-</Callout>
+The finishing dev workspace closes its own session and returns to `idle`. Its
+work is now waiting to be *run*, not edited.
 
 </Step>
 <Step title="Open the served URL and click through">
 
-Select the task under **Ready for Review** in the sidebar (or press `Enter` on
-its review-workspace row) to focus that workspace's window. The managed server
-pane sits beside the agent pane. Open the served URL,
-`http://localhost:3000` here, and click through the running change the way a
-user would.
+Select the task under **Review** in the sidebar (or press `Enter` on its
+workspace row) to focus that workspace's window. Open the served URL —
+`http://localhost:3000` for `slot: 0` here — and click through the running
+change the way a user would.
 
 <AppMockup
   terminalTitle="you@hub — myapp"
@@ -151,7 +142,7 @@ user would.
         {
           title: "Polish dark-mode toggle",
           id: "dark-mode-toggle-polish",
-          workspace: "review-1",
+          workspace: "review-0",
           selected: true,
         },
       ],
@@ -164,77 +155,49 @@ user would.
       workspaces: [
         { name: "alpha", state: "working", agent: "Developer" },
         { name: "bravo", state: "idle" },
-        { name: "review-1", state: "working", agent: "Review" },
+        { name: "review-0", state: "working", agent: "Review" },
       ],
     },
   ]}
-  review={[{ title: "Polish dark-mode toggle", workspace: "review-1" }]}
 />
 
-The Review agent's charter is narrow: **load and serve, don't code.** It won't
-modify the branch or move the card. The one exception is if you explicitly ask
-for a tweak ("bump the header padding"), which it makes in place and refreshes.
+If you named the built-in `review` agent on the status, its charter is narrow:
+**load and serve, don't code.** It won't modify the branch or move the card.
+Point `agent:` at an agent you've authored to change what runs there.
 
 </Step>
 <Step title="Accept or bounce">
 
-You own the decision. Moving the task out of Review is the signal:
+You own the decision. Moving the task out of Review is the signal, and each
+move fires that edge's transitions — including the teardown `run`:
 
 - **Accept** — move the card to **Done** (`L` in the kanban view, or
-  `shelbi task move dark-mode-toggle-polish --to done`). Per your
-  [workflow](/docs/guides/getting-started/workflows), that transition merges the
-  branch back into the default branch.
-- **Bounce** — send it back to **To Do** (`H`, or
-  `shelbi task move dark-mode-toggle-polish --to todo`) for another pass.
+  `shelbi task move dark-mode-toggle-polish --to done`). Per the transitions
+  above, that edge merges the branch, deletes it, and tears the server down.
+- **Bounce** — send it back to **In Progress** (or **To Do**) for another pass;
+  that edge tears the server down too.
 
-Either move tears down the server pane and returns the review workspace to
-`idle`, which immediately loads the next task queued for review, if any.
+Either move returns the workspace to `idle`, which loads the next task routed
+for review, if any.
 
 </Step>
 </Steps>
 
-## Ready vs Queued for Review
-
-The sidebar splits review-status tasks into two sections, so a glance tells you
-what's running from what's waiting:
-
-```text
- — Ready for Review —
- ✓ Polish dark-mode toggle       hub:3000
-   shelbi/dark-mode-toggle-polish
-
- — Queued for Review —
- · Palette fuzzy-match fix
-   shelbi/palette-fuzzy-match-fix
-```
-
-- **Ready for Review** (`✓`, cyan) — loaded on a review workspace and serving.
-  Line 1 carries the `machine:port` URL; line 2 the branch. Selecting one
-  focuses that review workspace's window so you can inspect the running app.
-- **Queued for Review** (`·`, dim) — a review-status task waiting for a free
-  review slot. No URL yet because nothing is serving it; it loads automatically
-  the moment a slot frees.
-
-That split is the whole payoff of the scarcity invariant: with only 1–2 review
-slots per machine, the queue is where you see review pressure build.
-
 ## Next
 
-Routing a task onto a review workspace is the *human* path: the whole point is
-human eyes on the running app. So a review-loaded task is deliberately **not**
-eligible for Zen Mode's auto-merge. When you're ready to hand the orchestrator
-the cases it *can* judge on its own,
+Routing a task to a review workspace is the *human* path: the whole point is
+human eyes on the running app. Keeping `merge` on the *accept* edge and off the
+*enter*-review edge means the orchestrator holds a review task for you rather
+than auto-merging it. When you're ready to hand the orchestrator the cases it
+*can* judge on its own,
 [enable Zen Mode](/docs/guides/getting-started/enable-zen-mode) to auto-promote
 backlog and auto-merge finished branches that clear a confidence bar you define.
 
 ## See also
 
-- [Review workspaces](/docs/concepts/review-workspaces) — the full model: the
-  `review:` config block, port assignment, the Review agent, the two markers,
-  and the load → serve → inspect lifecycle.
-- [`shelbi review`](/docs/cli/review) — load a task onto a review workspace or
-  read its queue position.
-- [`shelbi workspace serve`](/docs/cli/workspace#serve) — how the Review agent
-  starts the managed dev-server pane.
-- [Configuration → project](/docs/configuration/project) — the `role` and
-  `review` fields in the project schema.
+- [Review workspaces](/docs/concepts/review-workspaces) — the full model: tags,
+  status-tag routing, `$SLOT`, and transition `run` / `ready` / teardown.
+- [Workflow config](/docs/configuration/workflow) — status `tags` and the
+  transition command fields.
+- [Project config](/docs/configuration/project) — machine and workspace `tags`,
+  and workspace `slot`.

@@ -1,316 +1,222 @@
 ---
 title: Review workspaces
 order: 13
-summary: "A review workspace is a scarce pool slot (1–2 per machine) that loads a finished task's branch and *runs* it — boots the dev server, owns a port, and hands a human a working URL to click through. Declared with `role: review`; served by the built-in Review agent."
+summary: "Review isn't a special mode — it's an ordinary status that requires a tag, routes to a matching workspace, and boots a dev server through transition commands. Machine/workspace tags, status-tag routing, `$SLOT`, and transition `run`/`ready`/teardown are the primitives; a review column is built entirely from them."
 ---
 
 Most real review of an app or a site means **running it**: booting the dev
 server, hitting a URL, clicking through the change, not just reading a diff.
-A **review workspace** is the slot that does that. It's a normal pool
-[workspace](/docs/concepts/workspaces) with a machine, a runner, and a
-persistent worktree, but it's *designated for human review* rather than
-autonomous development: when a task reaches the review status, Shelbi loads
-that task's branch onto a review workspace and the built-in **Review agent**
-prepares the environment (installs deps, builds, starts the dev server),
-then stops and hands you a URL.
+Shelbi has no bespoke "review mode" for this. Instead it's assembled from a
+few generic primitives that any status can use: a **status requires tags**, a
+**workspace carries tags**, and a **transition runs commands**. A review
+column is just a status that requires a `review` tag, routes to a workspace
+that carries it, and boots a server in its enter transition.
 
-Review workspaces are **scarce by design: 1–2 per machine**, because each one
-may hold a running server bound to a port. That scarcity is a hard invariant
-(the config loader refuses more than two on a machine) and it's what makes the
-review queue below meaningful.
+This page walks those primitives and then shows a complete review column
+built from them.
 
-<Callout type="note" title={`The "review" collision`}>
+## Tags
 
-Several things in Shelbi carry the word *review*. The **review status** is
-the board column a task sits in awaiting human input (`Review` in the default
-workflow, `handoff`-category). The **review workspace** is the slot described
-on this page. The **Review agent** is the role that loads and serves the
-branch. This page is about the slot and the agent; the status is a
-[workflow](/docs/guides/getting-started/workflows) concept.
+Every machine and every workspace can carry a free-form `tags` list. A
+workspace's **effective tags** are its own tags **unioned** with its
+machine's tags — a tag declared once on a machine applies to all of its
+slots without repeating it per workspace.
 
-</Callout>
+```yaml
+machines:
+  - name: hub
+    kind: local
+    work_dir: ~/Workspaces/myapp
+    tags: [review]              # every slot on hub inherits `review`
 
-## Declaring a review workspace
+workspaces:
+  - { name: alpha, machine: hub, runner: claude }                 # effective: {review}
+  - { name: bravo, machine: hub, runner: claude, tags: [gpu] }    # effective: {review, gpu}
+```
 
-A review workspace is just a `workspaces:` entry with `role: review`:
+Both fields accept a scalar `tag:` alias and a bare string as shorthand for a
+one-element list (`tags: review` ≡ `tags: [review]`). Both are elided from the
+on-disk form when empty, so existing project YAMLs round-trip unchanged.
+
+## Status-tag routing
+
+A workflow [status](/docs/configuration/workflow#statuses) declares the tags a
+task needs while it sits there:
+
+```yaml
+statuses:
+  - { id: review, owner: user, agent: review, tags: [review] }
+```
+
+When a task enters that status, the orchestrator routes it to a **free
+workspace whose effective tags are a superset of the status's required set**
+(set-AND). Empty required tags — the default — match any free workspace, which
+is the historical "any idle slot" behavior. So `tags: [review]` on the status
+plus `tags: [review]` on a machine is all it takes to pin review work to
+review slots. Nothing in the routing branches on the literal word "review" —
+it's the same superset query every tag uses.
+
+If no declared workspace matches the required tags, the load fails loudly
+rather than silently running review work on a general slot.
+
+## Slots and `$SLOT`
+
+Each workspace has a numeric **slot**. Set it explicitly with `slot:`, or let
+it default to the workspace's zero-based index among its machine's slots. The
+slot is exported to transition commands as **`$SLOT`**, which is how two
+review workspaces on one machine avoid colliding on a port:
 
 ```yaml
 workspaces:
-  - { name: alpha,    machine: hub,    runner: claude }
-  - { name: bravo,    machine: hub,    runner: claude }
-  - { name: review-1, machine: hub,    runner: claude, role: review }
-  - { name: charlie,  machine: devbox, runner: claude }
-  - { name: review-1, machine: devbox, runner: claude, role: review }
+  - { name: review-0, machine: hub, runner: claude, tags: [review], slot: 0 }
+  - { name: review-1, machine: hub, runner: claude, tags: [review], slot: 1 }
 ```
 
-`role` takes `dev` (the default) or `review`. It's elided from the wire form
-when `dev`, so every existing project YAML (none of which carry a `role:`
-key) keeps working untouched and round-trips byte-identically. A slot with
-no `role:` is a normal development workspace.
+Alongside `$SLOT`, every transition command also gets `$SHELBI_TASK`,
+`$SHELBI_BRANCH`, `$SHELBI_WORKTREE`, and `$SHELBI_MACHINE`.
 
-Because `role` rides the **user-local** config half (alongside the rest of
-`workspaces:`), each person can decide how many review slots their own
-machines carry.
+## Transition commands: run, ready, teardown
 
-Two helpers back the routing: `dev_workspaces()` (every slot that picks up
-tasks for autonomous development) and `review_workspaces(machine)` (the
-review slots on one machine, in declaration order; that order drives port
-assignment, below).
+Serving comes from the status's **transitions**, not from any review-specific
+machinery. A [transition](/docs/configuration/workflow#run-ready-and-teardown)
+can carry:
 
-### The scarcity invariant
+- **`run`** — shell commands executed in order, in the task's worktree, on the
+  assigned workspace's machine. They run after the edge's git `actions` and
+  share the same short-circuit contract.
+- **`ready`** — a command polled until it exits 0 (bounded by `ready_timeout`,
+  default 90s), so a launched server can be confirmed up before the human is
+  handed the URL.
+- **teardown** — expressed as the `run` of the *exit* transition; there is no
+  separate teardown hook.
 
-`validate_workspaces` **hard-errors** when a single machine declares more than
-two review workspaces:
+Each command runs synchronously, so a long-lived server must background itself
+(`… &`, `nohup`, a detached pane). The edge is entered the moment the launcher
+returns; `ready` is what confirms the server actually answers.
 
-```text
-machine `hub` declares 3 review workspaces, but at most 2 are allowed per
-machine (each review workspace may hold a running server and a port)
+## A review column, from primitives
+
+Here is a complete review column assembled from the pieces above — a tagged
+machine, a tagged status, and enter/exit transitions that boot and tear down a
+per-slot dev server. Nothing here is review-specific; it's all generic
+workflow config.
+
+```yaml
+# project.yaml — tag the machine (or individual slots)
+machines:
+  - name: hub
+    kind: local
+    work_dir: ~/Workspaces/myapp
+    tags: [review]
+
+workspaces:
+  - { name: alpha,    machine: hub, runner: claude }                 # dev slot
+  - { name: bravo,    machine: hub, runner: claude }                 # dev slot
+  - { name: review-0, machine: hub, runner: claude, tags: [review], slot: 0 }
 ```
 
-<Callout type="warning" title="Two review workspaces per machine, max">
+```yaml
+# workflows/default.yaml — the review status requires the tag,
+# and its transitions boot + tear down the server.
+statuses:
+  - { id: in-progress, owner: agent, agent: developer }
+  - { id: review,      owner: user,  agent: review, tags: [review] }
+  - { id: done,        owner: user }
 
-This is a hard invariant, not a soft cap. The config loader refuses to start
-a project that declares a third review slot on any one machine. Each review
-workspace may hold a running server bound to a port, so over-provisioning is
-almost always a config mistake worth surfacing loudly.
+transitions:
+  # Enter review: install, boot a dev server on a per-slot port, wait for it.
+  - from: in-progress
+    to: review
+    run:
+      - npm install
+      - npm run dev -- --port $((3000 + $SLOT)) &
+    ready: curl -fsS http://localhost:$((3000 + $SLOT)) > /dev/null
+    ready_timeout: 120
+  # Accept: merge and delete the branch, then tear the server down.
+  - from: review
+    to: done
+    actions: [merge, delete_branch]
+    run:
+      - pkill -f "port $((3000 + $SLOT))" || true
+  # Bounce back for another pass: also tear the server down.
+  - from: review
+    to: in-progress
+    run:
+      - pkill -f "port $((3000 + $SLOT))" || true
+```
+
+With `review-0` on slot 0, the server binds `:3000`; a second review slot on
+slot 1 would bind `:3010` if you keyed the port off `$((3000 + $SLOT * 10))`.
+The port is deterministic and collision-free because it's derived from
+`$SLOT`.
+
+<Callout type="note" title="The status's agent still runs">
+
+Routing does two things when a task enters the status: it fires the enter
+transition's `run`/`ready` commands (booting the server) **and** it loads the
+task onto the matching workspace running the status's [`agent`](/docs/configuration/workflow#statuses).
+Shelbi still ships a built-in `review` agent whose charter is "make the change
+runnable for a human, don't code" — name it here, or point `agent:` at any
+agent you've authored. See [agents](/docs/concepts/agents).
 
 </Callout>
 
-There is no lower bound. A machine with zero review workspaces is fine (its
-tasks review on another machine that has one). The ceiling is the point: two
-per machine is enough concurrency for human review, and over-provisioning is
-almost always a config mistake worth surfacing loudly.
-
-## The `review:` config block
-
-An optional `review:` block tunes how the Review agent loads and serves a
-project. Every field has a default, so an **absent block means "auto-detect
-everything, base port 3000, stride 10."** It belongs in the **shared (repo)**
-config half. It describes the project, not the machine.
-
-```yaml
-review:
-  base_port: 3000                       # first review slot's dev-server port
-  port_stride: 10                       # spacing between slots (review-1→3000, review-2→3010)
-  setup:                                # one-shot commands, run before serve
-    - npm install
-  serve: npm run dev -- --port $PORT    # the long-lived dev-server command
-  ready_probe:
-    http: http://localhost:$PORT        # poll for HTTP 200
-    timeout: 90s                        # give up after this
-```
-
-| Key | Type | Default | What it does |
-| --- | --- | --- | --- |
-| `base_port` | number | `3000` | TCP port for the first review slot's server. |
-| `port_stride` | number | `10` | Port spacing between review slots on a machine, so concurrent servers never collide. |
-| `setup` | list | `[]` | One-shot commands run before serve (e.g. `npm install`). Empty ⇒ the Review agent auto-detects from the project shape. |
-| `serve` | string | *(auto)* | Command that starts the dev server. Reference the injected port as `$PORT`. Absent ⇒ auto-detected. |
-| `ready_probe.http` | string | *(none)* | URL polled for an HTTP 200 before handing off. Absent ⇒ no HTTP probe; the agent falls back to a fixed settle. |
-| `ready_probe.timeout` | duration | `90s` | How long to wait for the probe to succeed. |
-
-**Declared always wins.** If you set `review.setup` / `review.serve`, the
-Review agent uses them verbatim. Leave them out and it auto-detects. That's
-the *hybrid* model: an explicit escape hatch over sensible per-repo detection,
-so most projects need no `review:` block at all.
-
-### Ports: base + per-slot offset
-
-Each review workspace gets a deterministic port from its index among its
-machine's review workspaces:
-
-```text
-port = base_port + index * port_stride
-```
-
-With the defaults, `review-1` → `3000` and a second `review-2` → `3010`. The
-port is computed by Shelbi at load time and injected into the serve command's
-environment as **`PORT`** (referenced as `$PORT`). The Review agent always
-binds the server to `$PORT`, never a hardcoded port, so two review workspaces
-on the same machine never collide and the URL is predictable.
-
-## The Review agent
-
-Loading a review workspace runs the built-in [agent](/docs/concepts/agents)
-`review`, one of the three Shelbi ships, alongside `orchestrator` and
-`developer`. It self-heals in on `shelbi reload` like the others, and it
-ships with a `load-run-detection` skill holding the auto-detect heuristics.
-
-Its charter is narrow and deliberately **not** a developer's:
-
-- **Load and serve, don't code.** The branch is already checked out in the
-  worktree. The agent's one job is to make the change *runnable*: resolve the
-  setup/serve commands, run setup (one-shot, must exit 0), start the server,
-  wait for the ready probe, and post a concise "ready" summary with the URL.
-  It does **not** modify code.
-- **Resolve load steps by precedence.** Declared `review.setup`/`review.serve`
-  win. Otherwise it auto-detects: `package.json` → the install tool matching
-  the lockfile (`pnpm-lock.yaml`→pnpm, `yarn.lock`→yarn, else npm) then the
-  `dev` script with `--port $PORT`; `Cargo.toml` → `cargo build` then
-  `cargo run`; a `Makefile` `dev`/`serve` target; a `Procfile` `web:` line.
-  Nothing runnable → it reports a **diff-only** review and stops.
-- **Start the server through Shelbi.** It launches the dev server with
-  [`shelbi workspace serve`](/docs/cli/workspace#serve) so the server runs in a
-  dedicated, Shelbi-managed pane whose lifecycle Shelbi owns (see below),
-  never as a bare `&` background job.
-- **Then stop and hand to the human.** It does not auto-merge, does not move
-  the card, does not keep editing. The **one** exception: if you explicitly
-  ask for a tweak ("bump the header padding"), it makes that specific edit and
-  refreshes the server, the sole case the Review agent touches code.
-
-## The load → serve → inspect lifecycle
+## The load → serve → inspect flow
 
 End to end, a finished task reaches a human like this:
 
-1. **Dev workspace finishes.** It writes the review-ready marker; the hub
+1. **A dev workspace finishes.** It writes its review-ready marker; the hub
    poller rebases the branch onto the base branch and moves the task into the
-   review status. The finishing dev workspace then **closes its own session**
-   and returns to idle. It doesn't linger (see
-   [Workspaces](/docs/concepts/workspaces#how-a-task-completes)).
-2. **Orchestrator loads it.** On the `to_category=handoff` event, if the
-   project declares any review workspace, the orchestrator loads the task onto
-   a free review slot on the task's machine (preferring the one it ran on) with
-   the Review agent, the same path as `shelbi review <id>`. If every review
-   slot is busy, the task **waits in Review, marked pending-load**, and loads
-   when a slot frees. Nothing is preempted.
-3. **Review agent serves.** It installs/builds, starts the server on its
-   assigned port, probes ready, writes the **loaded marker** with the URL, and
-   posts a "ready at `http://…:PORT`" note.
-4. **Human inspects.** You open the review workspace's window (the server pane
-   is visible beside the agent), click through the running app, and decide:
-   **accept** (move the task to Done), **send back** (move it to Todo), or **ask
-   for a tweak** (the agent edits and refreshes in place).
-5. **Slot frees.** Moving the task out of Review tears down the server pane and
-   returns the review workspace to idle, which loads the next pending-load task.
+   review status. The finishing workspace closes its own session and returns
+   to idle (see [Workspaces](/docs/concepts/workspaces#how-a-task-completes)).
+2. **The orchestrator routes it.** The review status requires `tags: [review]`,
+   so the task loads onto a free `review`-tagged workspace (preferring the one
+   it ran on). The enter transition's `run` commands boot the server; `ready`
+   blocks until it answers. If every matching slot is busy, the task waits in
+   the review status until one frees — nothing is preempted.
+3. **A human inspects.** You open the workspace's window, click through the
+   running app at the served URL, and decide: **accept** (move to Done), or
+   **send back** (move to In Progress / To Do). Each move fires that edge's
+   `actions` and `run` — including the teardown command.
 
-A review-routed task carries a **sub-state** within the review status
-(**pending-load → loading → serving**), surfaced as workspace status detail,
-not as new board columns. The board's category vocabulary stays intact; the
-task sits in `handoff` throughout.
+The board's category vocabulary is unchanged: the task sits in the
+`handoff`-category review status throughout.
 
-### Two markers, two meanings
+## Review and Zen Mode
 
-The review flow uses two distinct marker files in the worktree's `.claude/`
-directory:
+Routing a task to a review workspace is the *human* path — the whole point is
+human eyes on the running app. Whether such a task is eligible for
+[Zen Mode](/docs/concepts/zen-mode)'s auto-merge is governed by the ordinary
+action-based rule: Zen's high-confidence bar fires on any transition whose
+`actions` include `merge`. Keep `merge` off the *enter*-review edge and on the
+*accept* edge (as above) so the orchestrator holds the task for you rather than
+crossing the accept boundary on its own.
 
-- `shelbi-review-ready`: the **dev** workspace's "I'm done, promote me"
-  signal. The poller consumes it and moves the task to the review status. This
-  is the same marker every task completion uses.
-- `shelbi-review-loaded`: the **Review agent's** "loaded and serving" signal.
-  Its body is the task id followed by the serving URL (URL omitted for a
-  diff-only review). This is the durable, UI-proof handoff the hub watches for;
-  the agent also emits a `review_ready` / `review_loaded` event over the hub
-  socket so the board can show "serving at :3000" vs "loading."
+## Legacy configs
 
-## The server pane
+Earlier releases modeled review with bespoke keys instead of the generic
+primitives above. They still load, so an old project YAML keeps working, but
+they're deprecated:
 
-A running dev server is new capability. Everything else in Shelbi runs one
-foreground process per pane. A review workspace gets a **dedicated server
-pane** beside the agent pane, and Shelbi owns its whole lifecycle:
+- **`role: review`** on a workspace (and `role: dev`) — folded into `tags` on
+  load: `role: review` becomes the `review` tag, `role: dev` becomes no tag.
+  The key is never written back; prefer `tags:` directly.
+- **The `review:` block** on the project (`base_port`, `port_stride`, `setup`,
+  `serve`, `ready_probe`, …) — no longer a field. It's silently ignored on
+  load. Its job is now done by workspace `slot` / `$SLOT` and transition
+  `run` / `ready` commands.
 
-- **Managed, not backgrounded.** `shelbi workspace serve` runs the resolved
-  serve command under a lifecycle wrapper. When the server process dies the
-  wrapper emits `workspace=<name> server_alive=false` so the death is
-  observable.
-- **Bound to localhost by default.** The server binds `localhost`, so on a
-  shared machine the port isn't reachable by other local users. The ready URL
-  is `http://localhost:<port>`.
-- **Local-only, for now.** Managed server panes are supported on the hub /
-  local machines only. `shelbi workspace serve` errors on a remote review
-  workspace. A remote review workspace can still load the branch and do a
-  diff-only review; booting a managed dev server across SSH is a known gap.
-
-<Callout type="note" title="Remote review is diff-only">
-
-If you want to *run* a change (boot the dev server and click through it),
-route its review to a review workspace on the hub or another local machine.
-A remote review workspace loads the branch and serves a diff-only review.
-`shelbi workspace serve` deliberately errors rather than trying to bind a
-port across SSH.
-
-</Callout>
-- **Reaped.** A [reaper](/docs/concepts/orchestrator) kills a server pane that
-  has no active review task, covering a crashed agent that would otherwise
-  leave a port bound and block the slot from re-dispatch. Teardown also happens
-  explicitly when the task leaves Review, the workspace is re-dispatched, or you
-  run `shelbi workspace stop`.
-
-## Where review appears in the sidebar
-
-Review workspaces show up in **two** places in the sidebar:
-
-- Under **Workspaces**, grouped by machine like any other slot. A review
-  workspace shows the `Review` agent while it's loading/serving and `idle` when
-  free, the same badge treatment as a dev slot running `developer`.
-- Under a **Ready for Review** section: the live list of tasks currently in
-  the review status, each with a cyan `✓` and the review workspace it's loaded
-  on, right-aligned. Selecting one focuses that review workspace's window
-  (server pane visible) so you can inspect the running app.
-
-<AppMockup
-  terminalTitle="jlong@hub — shelbi"
-  machines={[
-    { name: "hub", workspaces: [
-      { name: "alpha", state: "working", agent: "developer" },
-      { name: "bravo", state: "idle" },
-      { name: "review-1", state: "working", agent: "review" },
-    ]},
-    { name: "devbox", workspaces: [
-      { name: "charlie", state: "working", agent: "developer" },
-      { name: "review-1", state: "idle" },
-    ]},
-  ]}
-  review={[
-    { title: "Palette fuzzy-match fix", workspace: "review-1" },
-    { title: "Dark-mode toggle polish", workspace: "review-1" },
-  ]}
-/>
-
-A finished **dev** workspace no longer lingers with a "done" check. It closes
-its session the moment its task is promoted and reads `idle`. Completion lives
-entirely in the Ready-for-Review section, never on a workspace row.
-
-## `shelbi review` loads onto a review workspace
-
-`shelbi review <id>` is now a thin alias over the load path: it picks a free
-review workspace on the resolved machine and loads the task there, or (when
-every review workspace is busy) prints the task's **queue position** instead
-of failing. The branch lives in the review workspace's own worktree, so the
-machine's top-level clone is never checked out into or dirtied by review.
-
-A project that has declared **no** review workspace gets a loud onboarding
-error rather than a silent fallback to the retired top-level-clone checkout:
-
-```text
-project `myapp` declares no `role: review` workspace — review workspaces are
-the review surface now (the old top-level-clone checkout was retired). Declare
-at least one in your project config, e.g.
-
-  workspaces:
-    - { name: review-1, machine: <machine>, runner: <runner>, role: review }
-
-then re-run `shelbi review <id>`.
-```
-
-See [`shelbi review`](/docs/cli/review) for the full command reference.
-
-## Review workspaces and Zen Mode
-
-Routing a task onto a review workspace is the *human* path. The whole point is
-human eyes on the running app. A task loaded onto a review workspace is
-therefore **not** eligible for [Zen Mode](/docs/concepts/zen-mode)'s auto-merge;
-the orchestrator holds it for you rather than crossing the accept boundary on
-its own.
+There is no `is_review` flag or dedicated review command; review is entirely
+the tag-plus-transition model on this page.
 
 ## See also
 
-- [Workspaces](/docs/concepts/workspaces) — the pool model these slots extend,
-  and the dev-session-close-on-completion handoff.
-- [Agents](/docs/concepts/agents) — the role/slot split; the Review agent is
-  one of the three built-in roles.
-- [Orchestrator](/docs/concepts/orchestrator) — the `to_category=handoff`
-  auto-load rule, the pending-load queue, and the reaper.
-- [`shelbi review`](/docs/cli/review) — load a task onto a review workspace or
-  read its queue position.
-- [`shelbi workspace serve`](/docs/cli/workspace#serve) — how the Review agent
-  starts the managed server pane.
+- [Workflow config](/docs/configuration/workflow) — status `tags`, and
+  transition `run` / `ready` / `ready_timeout`.
+- [Project config](/docs/configuration/project) — machine and workspace
+  `tags`, and workspace `slot`.
+- [Workspaces](/docs/concepts/workspaces) — the pool model these slots extend.
+- [Agents](/docs/concepts/agents) — the role that runs inside a workspace,
+  including the built-in `review` agent.
+- [Set up review workspaces](/docs/guides/getting-started/review-workspaces) —
+  the step-by-step walkthrough.
