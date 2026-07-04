@@ -88,9 +88,17 @@ const SIDEBAR_SEL_BG = SEL_BG
 const COL_W = 22
 const TEXT_W = 20
 const SIDEBAR_W = 30
-// Board width assumes a fixed 5-column layout — the same shape the TUI
-// draws at dashboard widths. `titleRow`/`footerRow` pad to this.
-const BOARD_W = 1 + 5 * COL_W
+/**
+ * The board content width for a scenario, in monospace cells: 1 leading pad
+ * + one `COL_W` cell per column (so a 5-column board is `1 + 5 * 22 = 111`,
+ * the canonical dashboard width the TUI draws). This is the width every view
+ * within a single mockup pins to — the Chat and Activity panes size to it so
+ * switching nav rows never changes the frame width, even for boards with
+ * fewer or more than five columns (e.g. a four-column trunk-based board).
+ */
+function contentWidth(columns: Column[]): number {
+  return 1 + columns.length * COL_W
+}
 
 // ── Scenario model ────────────────────────────────────────────────────
 // The public `AppState` shape. Every field is pure data — an MDX doc
@@ -173,6 +181,13 @@ export type AppState = {
    * free review workspace (blue ·, no location yet). Empty hides the section.
    */
   queuedReview: ReviewEntry[]
+  /**
+   * Whether the sidebar shows the full-width green "ZEN MODE ON" band. Opt-in
+   * and defaults to off (undefined/false) — only the hero and docs pages that
+   * actually describe Zen Mode turn it on, so every other mockup reads as a
+   * normal (non-Zen) session.
+   */
+  zenMode?: boolean
 }
 
 const CATEGORY_COLOR: Record<Category, string> = {
@@ -201,7 +216,10 @@ type Segment = {
   bold?: boolean
 }
 
-const BOARD_BLANK_ROW: Segment[] = [{ text: " ".repeat(BOARD_W) }]
+/** A full-width blank board row, sized to a scenario's content width. */
+function blankRow(width: number): Segment[] {
+  return [{ text: " ".repeat(width) }]
+}
 const SIDEBAR_BLANK_ROW: Segment[] = [{ text: " ".repeat(SIDEBAR_W) }]
 
 /**
@@ -321,6 +339,7 @@ function buildBoardRows(columns: Column[]): Segment[][] {
 
 /** Title bar row: "<View> · <project>  N total" + right-aligned chips. */
 function titleRow(columns: Column[], project: string, activeView: NavView): Segment[] {
+  const width = contentWidth(columns)
   const total = columns.reduce((n, c) => n + c.cards.length, 0)
   const label = NAV_ITEMS.find((n) => n.view === activeView)?.label ?? "Tasks"
   const leftText = ` ${label} · ${project}   ${total} total`
@@ -328,7 +347,7 @@ function titleRow(columns: Column[], project: string, activeView: NavView): Segm
   const workspace = "Workspace: All ▾ "
   const leftLen = [...leftText].length
   const rightLen = [...workflow].length + 2 + [...workspace].length
-  const midPad = Math.max(1, BOARD_W - leftLen - rightLen)
+  const midPad = Math.max(1, width - leftLen - rightLen)
   return [
     { text: ` ${label} · `, color: TUI_DARK_GRAY },
     { text: project, color: TUI_CYAN, bold: true },
@@ -343,10 +362,10 @@ function titleRow(columns: Column[], project: string, activeView: NavView): Segm
 /**
  * Footer keybinding hints — matches `render_footer` in the crate, whose hints
  * are per-view. Each view keeps the same key-in-fg / hint-in-dg pattern and
- * pads to `BOARD_W` so the footer (and the frame) height is identical across
+ * pads to the board `width` so the footer (and the frame) is identical across
  * views.
  */
-function footerRow(activeView: NavView): Segment[] {
+function footerRow(activeView: NavView, width: number): Segment[] {
   const segs: Segment[] = []
   const push = (t: string, color = TUI_DARK_GRAY) => segs.push({ text: t, color })
   const key = (t: string) => push(t, TUI_FG)
@@ -370,7 +389,7 @@ function footerRow(activeView: NavView): Segment[] {
     push(hint)
   }
   const used = segs.reduce((acc, s) => acc + [...s.text].length, 0)
-  if (used < BOARD_W) segs.push({ text: " ".repeat(BOARD_W - used) })
+  if (used < width) segs.push({ text: " ".repeat(width - used) })
   return segs
 }
 
@@ -380,22 +399,22 @@ function footerRow(activeView: NavView): Segment[] {
 // (`crates/shelbi-tui/src/activity.rs`) and Chat (Orchestrator transcript)
 // views — same palette, same monospace grid, same character alignment.
 
-/** Pad a run of segments to the full board width so a view fills the pane. */
-function bodyRow(segs: Segment[]): Segment[] {
+/** Pad a run of segments to the board content width so a view fills the pane. */
+function bodyRow(segs: Segment[], width: number): Segment[] {
   const used = segs.reduce((acc, s) => acc + [...s.text].length, 0)
-  if (used >= BOARD_W) return segs
-  return [...segs, { text: " ".repeat(BOARD_W - used) }]
+  if (used >= width) return segs
+  return [...segs, { text: " ".repeat(width - used) }]
 }
 
 /**
- * Left content + a right-aligned run, padded to `BOARD_W` with a 1-col
+ * Left content + a right-aligned run, padded to the board `width` with a 1-col
  * trailing margin — the board's title/footer right-alignment shape, reused for
- * Activity metrics ("took 12m", "#213").
+ * Activity timestamps so they right-align at the board edge (never beyond it).
  */
-function bodyRightAlignRow(left: Segment[], right: Segment[]): Segment[] {
+function bodyRightAlignRow(left: Segment[], right: Segment[], width: number): Segment[] {
   const leftW = left.reduce((acc, s) => acc + [...s.text].length, 0)
   const rightW = right.reduce((acc, s) => acc + [...s.text].length, 0)
-  const pad = Math.max(1, BOARD_W - leftW - rightW - 1)
+  const pad = Math.max(1, width - leftW - rightW - 1)
   return [...left, { text: " ".repeat(pad) }, ...right, { text: " " }]
 }
 
@@ -419,9 +438,9 @@ function wrapText(text: string, width: number): string[] {
  * Pad a view's body to `target` rows with blank board rows so the terminal
  * frame keeps the board's height and doesn't jump when switching views.
  */
-function padBodyTo(rows: Segment[][], target: number): Segment[][] {
+function padBodyTo(rows: Segment[][], target: number, width: number): Segment[][] {
   const out = rows.slice(0, target)
-  while (out.length < target) out.push(BOARD_BLANK_ROW)
+  while (out.length < target) out.push(blankRow(width))
   return out
 }
 
@@ -497,14 +516,20 @@ const ACTIVITY_EVENTS: ActivityEvent[] = [
  * relative timestamp right-aligned, mirroring `paint_row`'s first line. The
  * avatar cell is one row of a face (4 cells) or a glyph padded to 4 cells.
  */
-function actPrimaryLine(cell: string, cellColor: string, primary: Segment[], when: string): Segment[] {
+function actPrimaryLine(
+  cell: string,
+  cellColor: string,
+  primary: Segment[],
+  when: string,
+  width: number,
+): Segment[] {
   const left: Segment[] = [
     { text: " ".repeat(ACT_LEAD) },
     { text: cell, color: cellColor },
     { text: " ".repeat(AVATAR_GAP) },
     ...primary,
   ]
-  return bodyRightAlignRow(left, [{ text: when, color: TUI_DARK_GRAY }])
+  return bodyRightAlignRow(left, [{ text: when, color: TUI_DARK_GRAY }], width)
 }
 
 /**
@@ -513,7 +538,12 @@ function actPrimaryLine(cell: string, cellColor: string, primary: Segment[], whe
  * spaces (glyph rows), `detail` the dim secondary text (omitted for the third
  * avatar row).
  */
-function actContinuationLine(cell: string, cellColor: string, detail?: string): Segment[] {
+function actContinuationLine(
+  cell: string,
+  cellColor: string,
+  width: number,
+  detail?: string,
+): Segment[] {
   const segs: Segment[] = [
     { text: " ".repeat(ACT_LEAD) },
     { text: cell, color: cellColor },
@@ -522,7 +552,7 @@ function actContinuationLine(cell: string, cellColor: string, detail?: string): 
     segs.push({ text: " ".repeat(AVATAR_GAP) })
     segs.push({ text: detail, color: TUI_DARK_GRAY })
   }
-  return bodyRow(segs)
+  return bodyRow(segs, width)
 }
 
 /** Curly-quote a title the way the crate's `title_quoted` does. */
@@ -536,14 +566,14 @@ function quoted(title: string): string {
  * avatar row (primary) + a blank-avatar secondary — matching `paint_row`'s
  * per-slot line counts.
  */
-function activityEventRows(ev: ActivityEvent): Segment[][] {
+function activityEventRows(ev: ActivityEvent, width: number): Segment[][] {
   const rows: Segment[][] = []
   const blankCell = " ".repeat(AVATAR_W)
 
   const faceRows = (av: Avatar, primary: Segment[], detail: string | undefined, when: string) => {
-    rows.push(actPrimaryLine(av.rows[0], av.color, primary, when))
-    rows.push(actContinuationLine(av.rows[1], av.color, detail))
-    rows.push(actContinuationLine(av.rows[2], av.color))
+    rows.push(actPrimaryLine(av.rows[0], av.color, primary, when, width))
+    rows.push(actContinuationLine(av.rows[1], av.color, width, detail))
+    rows.push(actContinuationLine(av.rows[2], av.color, width))
   }
   const glyphRows = (
     glyph: string,
@@ -552,8 +582,8 @@ function activityEventRows(ev: ActivityEvent): Segment[][] {
     detail: string,
     when: string,
   ) => {
-    rows.push(actPrimaryLine(padTo(glyph, AVATAR_W), glyphColor, primary, when))
-    rows.push(actContinuationLine(blankCell, TUI_DARK_GRAY, detail))
+    rows.push(actPrimaryLine(padTo(glyph, AVATAR_W), glyphColor, primary, when, width))
+    rows.push(actContinuationLine(blankCell, TUI_DARK_GRAY, width, detail))
   }
 
   switch (ev.kind) {
@@ -625,25 +655,26 @@ function activityEventRows(ev: ActivityEvent): Segment[][] {
 }
 
 /** The full-width `── Today ───…` date-bucket header, dim (activity.rs `date_header`). */
-function activityDateHeader(label: string): Segment[] {
+function activityDateHeader(label: string, width: number): Segment[] {
   const head = ` ── ${label} `
-  const trail = "─".repeat(Math.max(0, BOARD_W - [...head].length))
+  const trail = "─".repeat(Math.max(0, width - [...head].length))
   return [{ text: head + trail, color: TUI_DARK_GRAY }]
 }
 
 function buildActivityRows(state: AppState): Segment[][] {
+  const width = contentWidth(state.columns)
   const rows: Segment[][] = []
 
   // Date-bucketed, reverse-chronological feed — one `Today` bucket here.
-  rows.push(activityDateHeader("Today"))
-  rows.push(BOARD_BLANK_ROW)
+  rows.push(activityDateHeader("Today", width))
+  rows.push(blankRow(width))
 
   for (const ev of ACTIVITY_EVENTS) {
-    rows.push(...activityEventRows(ev))
-    rows.push(BOARD_BLANK_ROW)
+    rows.push(...activityEventRows(ev, width))
+    rows.push(blankRow(width))
   }
 
-  return padBodyTo(rows, buildBoardRows(state.columns).length)
+  return padBodyTo(rows, buildBoardRows(state.columns).length, width)
 }
 
 // One line of the Claude Code session the Chat pane hosts — the orchestrator
@@ -700,17 +731,19 @@ const CHAT_LINES: ChatLine[] = [
 const CHAT_WRAP_W = 76
 
 function buildChatRows(state: AppState): Segment[][] {
+  const width = contentWidth(state.columns)
+  const row = (segs: Segment[]) => bodyRow(segs, width)
   const rows: Segment[][] = []
 
   for (const line of CHAT_LINES) {
     switch (line.kind) {
       case "blank":
-        rows.push(BOARD_BLANK_ROW)
+        rows.push(blankRow(width))
         break
       case "user":
         // `❯ ` prompt (cyan) + the human's message in the foreground color.
         rows.push(
-          bodyRow([
+          row([
             { text: " ❯ ", color: TUI_CYAN, bold: true },
             { text: line.text, color: TUI_FG },
           ]),
@@ -719,13 +752,13 @@ function buildChatRows(state: AppState): Segment[][] {
       case "prose":
         // Assistant narration — indented two cells, wrapped, plain fg.
         for (const wrapped of wrapText(line.text, CHAT_WRAP_W)) {
-          rows.push(bodyRow([{ text: `  ${wrapped}`, color: TUI_FG }]))
+          rows.push(row([{ text: `  ${wrapped}`, color: TUI_FG }]))
         }
         break
       case "tool":
         // Tool-call bullet: green `⏺`, bold-ish tool name, args in fg.
         rows.push(
-          bodyRow([
+          row([
             { text: " ⏺ ", color: TUI_GREEN },
             { text: line.name, color: TUI_FG, bold: true },
             { text: `(${line.args})`, color: TUI_FG },
@@ -736,20 +769,20 @@ function buildChatRows(state: AppState): Segment[][] {
         // `⎿` result indented under the call, dim; long output collapses to
         // `… +N lines` aligned under the result text, the way Claude Code folds.
         rows.push(
-          bodyRow([
+          row([
             { text: "   ⎿ ", color: TUI_DARK_GRAY },
             { text: line.text, color: TUI_DARK_GRAY },
           ]),
         )
         if (line.more) {
-          rows.push(bodyRow([{ text: `     … +${line.more} lines`, color: TUI_DARK_GRAY }]))
+          rows.push(row([{ text: `     … +${line.more} lines`, color: TUI_DARK_GRAY }]))
         }
         break
       }
       case "working":
         // Spinner/working line in a dim magenta accent.
         rows.push(
-          bodyRow([
+          row([
             { text: " ✻ ", color: TUI_MAGENTA },
             { text: line.text, color: TUI_DARK_GRAY },
           ]),
@@ -758,7 +791,7 @@ function buildChatRows(state: AppState): Segment[][] {
       case "status":
         // Footer status: model/context/cost line, then the auto-mode hint.
         rows.push(
-          bodyRow([
+          row([
             {
               text: `  Model: ${line.model} · Ctx ${line.ctx} · Cost ${line.cost}`,
               color: TUI_DARK_GRAY,
@@ -766,7 +799,7 @@ function buildChatRows(state: AppState): Segment[][] {
           ]),
         )
         rows.push(
-          bodyRow([
+          row([
             { text: "  ⏵⏵ ", color: TUI_GREEN },
             { text: "auto mode on (shift+tab to cycle)", color: TUI_DARK_GRAY },
           ]),
@@ -775,7 +808,7 @@ function buildChatRows(state: AppState): Segment[][] {
     }
   }
 
-  return padBodyTo(rows, buildBoardRows(state.columns).length)
+  return padBodyTo(rows, buildBoardRows(state.columns).length, width)
 }
 
 // ── Sidebar ───────────────────────────────────────────────────────────
@@ -937,9 +970,11 @@ function buildSidebarRows(state: AppState): SidebarRow[] {
 
   // Footer, anchored to the bottom of the sidebar like `render_footer` /
   // `render_zen_row` in `sidebar.rs`: the dim `^P palette  q quit` keybind
-  // line, a blank row, then the full-width green "ZEN MODE ON" band the TUI
-  // paints when Zen Mode is on. The band bypasses the 1-col horizontal
-  // margin so its green fill reaches both sidebar edges, matching the crate.
+  // line, then — only when the scenario opts into Zen Mode — a blank row and
+  // the full-width green "ZEN MODE ON" band the TUI paints while Zen is on.
+  // The band bypasses the 1-col horizontal margin so its green fill reaches
+  // both sidebar edges, matching the crate. It's opt-in (default off) so it
+  // shows only on the hero and Zen-describing docs, not every mockup.
   rows.push(SIDEBAR_BLANK_ROW)
   rows.push(
     padSidebarRow([
@@ -947,8 +982,10 @@ function buildSidebarRows(state: AppState): SidebarRow[] {
       { text: "^P palette  q quit", color: TUI_DARK_GRAY },
     ]),
   )
-  rows.push(SIDEBAR_BLANK_ROW)
-  rows.push(zenBandRow())
+  if (state.zenMode) {
+    rows.push(SIDEBAR_BLANK_ROW)
+    rows.push(zenBandRow())
+  }
 
   return rows
 }
@@ -1106,6 +1143,7 @@ const PRE_STYLE: React.CSSProperties = {
 function TerminalBody({ state }: { state: AppState }) {
   // The right pane swaps on the active nav view. Activity and Chat are padded
   // to the board's height so the terminal frame stays a fixed size.
+  const width = contentWidth(state.columns)
   const body: Segment[][] =
     state.activeView === "activity"
       ? buildActivityRows(state)
@@ -1114,10 +1152,10 @@ function TerminalBody({ state }: { state: AppState }) {
         : buildBoardRows(state.columns)
   const rows: Segment[][] = [
     titleRow(state.columns, state.project, state.activeView),
-    BOARD_BLANK_ROW,
+    blankRow(width),
     ...body,
-    BOARD_BLANK_ROW,
-    footerRow(state.activeView),
+    blankRow(width),
+    footerRow(state.activeView, width),
   ]
 
   return (
@@ -1278,6 +1316,9 @@ export const defaultAppState: AppState = {
   terminalTitle: "jlong@hub — my-project",
   project: "my-project",
   activeView: "tasks",
+  // The hero showcases a busy, autonomous system — Zen Mode on, so the
+  // full-width green band is part of the landing-page capture.
+  zenMode: true,
   columns: [
     {
       label: "BACKLOG",
