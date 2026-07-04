@@ -1607,16 +1607,28 @@ function TerminalBody({ state, contentOpacity }: { state: AppState; contentOpaci
       ? buildActivityRows(state)
       : boardRows
   const body = padBodyTo(raw, bodyTarget, width)
-  const rows: Segment[][] = [
+  // Split the scrolling body (header + content) from the pinned footer so the
+  // `⏎ send  ↑/↓ scroll  esc tasks` hint bar can be pushed to the bottom edge
+  // of the pane (`mt-auto` below) — the same treatment `Sidebar` gives its
+  // `^P palette  q quit` line. This pane is the tallest element in the flex row
+  // today, so it already defines the frame height and the footer lands at the
+  // bottom; splitting it out keeps the bar anchored to the bottom edge no
+  // matter how much (or how little) content sits above it.
+  const bodyRows: Segment[][] = [
     ...(showHeader ? [titleRow(state), blankRow(width)] : []),
     ...body,
-    blankRow(width),
-    footerRow(state.activeView, width),
   ]
+  // A blank spacer above the footer keeps it off the content/chrome even when
+  // the pane isn't stretched; when it is, `mt-auto` absorbs the extra slack.
+  const footerRows: Segment[][] = [blankRow(width), footerRow(state.activeView, width)]
 
   return (
     <pre
-      className="m-0 whitespace-pre font-mono"
+      // `flex flex-col` so the footer group can be pinned to the bottom edge
+      // (`mt-auto` below), the same way `Sidebar` pins its `^P palette  q quit`
+      // line — the hint bar stays at the bottom of the pane rather than floating
+      // right under the content/chrome when the pane is taller than its content.
+      className="m-0 flex flex-col whitespace-pre font-mono"
       // Pin the pane to exactly `width` cells (`ch` == the monospace advance) so
       // the frame width is identical across every view. `minWidth: max-content`
       // would otherwise size the pane to its widest *rendered* line, and the Chat
@@ -1633,9 +1645,18 @@ function TerminalBody({ state, contentOpacity }: { state: AppState; contentOpaci
         ...contentFadeStyle(contentOpacity),
       }}
     >
-      {rows.map((row, i) => (
-        <Row key={i} segs={row} />
-      ))}
+      <div>
+        {bodyRows.map((row, i) => (
+          <Row key={i} segs={row} />
+        ))}
+      </div>
+      {/* Pinned to the bottom of the pane; the auto top margin absorbs the
+          slack when a taller sibling stretches this `<pre>` past its content. */}
+      <div className="mt-auto">
+        {footerRows.map((row, i) => (
+          <Row key={i} segs={row} />
+        ))}
+      </div>
     </pre>
   )
 }
