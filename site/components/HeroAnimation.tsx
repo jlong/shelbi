@@ -44,15 +44,17 @@ import {
 
 // ── Story dataset ─────────────────────────────────────────────────────
 // The `dashboard.md` plan → an Analytics Dashboard feature, six coherent
-// tasks. The first three are created via the chat stream and dispatched to
-// alpha/bravo/charlie; the other three fill the backlog behind them.
+// tasks. The first three are created via the chat stream; the other three fill
+// the backlog behind them. The dispatch beat then assigns the first FOUR across
+// both machines — alpha & bravo on the `hub`, echo & foxtrot on the `devbox` —
+// so the sidebar shows multi-machine orchestration; the last two wait in TO DO.
 type Task = { id: string; title: string; worker?: string }
 
 const TASKS: Task[] = [
   { id: "metrics-api-endpoint", title: "Metrics API endpoint", worker: "alpha" },
-  { id: "chart-components", title: "Chart components (line + bar)", worker: "bravo" },
-  { id: "date-range-filter", title: "Date-range filter", worker: "charlie" },
-  { id: "csv-export", title: "CSV export" },
+  { id: "chart-components", title: "Chart components (line + bar)", worker: "echo" },
+  { id: "date-range-filter", title: "Date-range filter", worker: "bravo" },
+  { id: "csv-export", title: "CSV export", worker: "foxtrot" },
   { id: "dashboard-empty-states", title: "Empty + loading states" },
   { id: "dashboard-tests", title: "Dashboard tests" },
 ]
@@ -75,19 +77,25 @@ function cols(opts: { backlog?: Card[]; todo?: Card[]; progress?: Card[] }): Col
   ]
 }
 
-/** One `hub` machine; each named workspace flips to working/<agent>, rest idle. */
+// Two machines — `hub` (alpha…delta) and `devbox` (echo…golf) — matching the
+// mockup convention in `defaultAppState`, so the hero shows multi-machine
+// orchestration. Each named workspace in `working` flips to working/<agent> on
+// its own machine; every other workspace stays idle.
+const MACHINES: { name: string; workspaces: string[] }[] = [
+  { name: "hub", workspaces: ["alpha", "bravo", "charlie", "delta"] },
+  { name: "devbox", workspaces: ["echo", "foxtrot", "golf"] },
+]
+
+/** Build both machine groups; names in `working` flip to working/<agent>, rest idle. */
 function machinesFor(working: Record<string, string>): Machine[] {
-  const names = ["alpha", "bravo", "charlie", "delta"]
-  return [
-    {
-      name: "hub",
-      workspaces: names.map((name) =>
-        working[name]
-          ? { name, state: "working" as const, agent: working[name] }
-          : { name, state: "idle" as const },
-      ),
-    },
-  ]
+  return MACHINES.map((m) => ({
+    name: m.name,
+    workspaces: m.workspaces.map((name) =>
+      working[name]
+        ? { name, state: "working" as const, agent: working[name] }
+        : { name, state: "idle" as const },
+    ),
+  }))
 }
 
 // The scenario every beat spreads from — a fresh `my-project` project on the
@@ -185,16 +193,22 @@ function frame(over: Partial<AppState>, hold: number, opacity = 1): Keyframe {
   return { state: { ...BASE, ...over }, hold, opacity }
 }
 
-// Beat 6's end state — every task dispatched: alpha/bravo/charlie each working a
-// task in IN PROGRESS, the other three waiting in TO DO. Reused as the base for
-// the worker-pane beat and as the reduced-motion static frame.
+// Beat 6's end state — the first four tasks dispatched across BOTH machines:
+// alpha & bravo (hub) and echo & foxtrot (devbox) each working a task in IN
+// PROGRESS, the last two waiting in TO DO. Reused as the base for the
+// worker-pane beat and as the reduced-motion static frame.
 const DISPATCHED: Partial<AppState> = {
   activeView: "tasks",
   columns: cols({
-    todo: TASKS.slice(3).map((t) => card(t)),
-    progress: TASKS.slice(0, 3).map((t) => card(t, true)),
+    todo: TASKS.slice(4).map((t) => card(t)),
+    progress: TASKS.slice(0, 4).map((t) => card(t, true)),
   }),
-  machines: machinesFor({ alpha: "Developer", bravo: "Developer", charlie: "Developer" }),
+  machines: machinesFor({
+    alpha: "Developer",
+    bravo: "Developer",
+    echo: "Developer",
+    foxtrot: "Developer",
+  }),
 }
 
 /** The reduced-motion representative frame: the board mid-dispatch. */
@@ -246,8 +260,10 @@ function buildKeyframes(): Keyframe[] {
     )
   }
 
-  // Beat 6 — promote + dispatch. BACKLOG → TO DO, then TO DO → IN PROGRESS one
-  // worker at a time, each pickup flipping its sidebar workspace to working.
+  // Beat 6 — promote + dispatch across BOTH machines. BACKLOG → TO DO, then
+  // TO DO → IN PROGRESS one worker at a time, each pickup flipping its sidebar
+  // workspace to working. The workers alternate hub (alpha, bravo) and devbox
+  // (echo, foxtrot), so the sidebar lights up on both machines at once.
   k.push(
     frame(
       {
@@ -261,33 +277,28 @@ function buildKeyframes(): Keyframe[] {
     ),
   )
   k.push(frame({ activeView: "tasks", columns: cols({ todo: TASKS.map((t) => card(t)) }) }, 700))
-  k.push(
-    frame(
-      {
-        activeView: "tasks",
-        columns: cols({
-          todo: TASKS.slice(1).map((t) => card(t)),
-          progress: [card(TASKS[0], true)],
-        }),
-        machines: machinesFor({ alpha: "Developer" }),
-      },
-      750,
-    ),
-  )
-  k.push(
-    frame(
-      {
-        activeView: "tasks",
-        columns: cols({
-          todo: TASKS.slice(2).map((t) => card(t)),
-          progress: TASKS.slice(0, 2).map((t) => card(t, true)),
-        }),
-        machines: machinesFor({ alpha: "Developer", bravo: "Developer" }),
-      },
-      750,
-    ),
-  )
-  k.push(frame(DISPATCHED, 950)) // date-range-filter → charlie; all dispatched
+  // Dispatch the first three one at a time — metrics → alpha (hub), chart → echo
+  // (devbox), date-range → bravo (hub) — accumulating the working set so each
+  // frame shows one more workspace busy.
+  const working: Record<string, string> = {}
+  for (let n = 1; n <= 3; n += 1) {
+    const picked = TASKS[n - 1]
+    if (picked.worker) working[picked.worker] = "Developer"
+    k.push(
+      frame(
+        {
+          activeView: "tasks",
+          columns: cols({
+            todo: TASKS.slice(n).map((t) => card(t)),
+            progress: TASKS.slice(0, n).map((t) => card(t, true)),
+          }),
+          machines: machinesFor({ ...working }),
+        },
+        750,
+      ),
+    )
+  }
+  k.push(frame(DISPATCHED, 950)) // csv-export → foxtrot (devbox); four dispatched across hub + devbox
 
   // Beat 7 — observe a worker: focus alpha's Claude-Code pane on its task,
   // running the test then landing green with the session footer. The pane wears
