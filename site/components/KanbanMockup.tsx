@@ -151,8 +151,13 @@ export type ReviewEntry = {
   location?: string
 }
 
-/** Which sidebar nav row is active — also drives the title-bar label. */
-export type NavView = "chat" | "tasks" | "activity"
+/**
+ * Which right-pane view is active — also drives the title-bar label. The
+ * first three map to the sidebar nav rows; `workspace` is the focused-worker
+ * pane (a Claude-Code session for one workspace), reached by selecting a
+ * workspace rather than a nav row, so it carries no nav entry of its own.
+ */
+export type NavView = "chat" | "tasks" | "activity" | "workspace"
 
 /**
  * The full interface state a single mockup renders. Pass one to
@@ -188,6 +193,32 @@ export type AppState = {
    * normal (non-Zen) session.
    */
   zenMode?: boolean
+  /**
+   * Overrides the Chat pane transcript. When omitted the built-in orchestrator
+   * session (`CHAT_LINES`) renders — the static docs default. The hero
+   * animation passes a progressively-revealed transcript here to drive the
+   * typing + streaming beats through the same Claude-Code renderer.
+   */
+  chatLines?: ChatLine[]
+  /**
+   * For `activeView: "workspace"` — the focused workspace's name, shown as the
+   * title-bar label in place of a nav label (e.g. `alpha · my-project`).
+   */
+  focusedWorkspace?: string
+  /**
+   * For `activeView: "workspace"` — the focused worker's Claude-Code transcript,
+   * rendered through the same engine as the Chat pane so the worker pane reads
+   * as a capture of that agent's session.
+   */
+  workspaceLines?: ChatLine[]
+  /**
+   * Pins the terminal body to at least this many rows. Views shorter than the
+   * pin are padded with blank rows so the frame height never changes as a
+   * scenario's content grows or shrinks — the hero animation sets it once so
+   * the frame stays a fixed size across every beat (cards appearing, columns
+   * emptying, panes swapping) instead of resizing with the tallest column.
+   */
+  minBodyRows?: number
 }
 
 const CATEGORY_COLOR: Record<Category, string> = {
@@ -338,10 +369,16 @@ function buildBoardRows(columns: Column[]): Segment[][] {
 }
 
 /** Title bar row: "<View> · <project>  N total" + right-aligned chips. */
-function titleRow(columns: Column[], project: string, activeView: NavView): Segment[] {
+function titleRow(state: AppState): Segment[] {
+  const { columns, project, activeView } = state
   const width = contentWidth(columns)
   const total = columns.reduce((n, c) => n + c.cards.length, 0)
-  const label = NAV_ITEMS.find((n) => n.view === activeView)?.label ?? "Tasks"
+  // The focused-worker pane has no nav row, so its label is the workspace name
+  // (e.g. `alpha · my-project`); the nav views use their nav label.
+  const label =
+    activeView === "workspace"
+      ? (state.focusedWorkspace ?? "workspace")
+      : (NAV_ITEMS.find((n) => n.view === activeView)?.label ?? "Tasks")
   const leftText = ` ${label} · ${project}   ${total} total`
   const workflow = "Workflow: All ▾"
   const workspace = "Workspace: All ▾ "
@@ -371,7 +408,7 @@ function footerRow(activeView: NavView, width: number): Segment[] {
   const key = (t: string) => push(t, TUI_FG)
   // [key, hint] pairs per view.
   const hints: [string, string][] =
-    activeView === "chat"
+    activeView === "chat" || activeView === "workspace"
       ? [["⏎", " send   "], ["↑/↓", " scroll   "], ["esc", " tasks"]]
       : activeView === "activity"
         ? [["j/k", " scroll   "], ["r", " refresh   "], ["esc", " tasks"]]
@@ -674,7 +711,9 @@ function buildActivityRows(state: AppState): Segment[][] {
     rows.push(blankRow(width))
   }
 
-  return padBodyTo(rows, buildBoardRows(state.columns).length, width)
+  // Left unpadded — `TerminalBody` pads every view to a common target height so
+  // the frame stays fixed across nav switches (and any `minBodyRows` pin).
+  return rows
 }
 
 // One line of the Claude Code session the Chat pane hosts — the orchestrator
@@ -689,7 +728,7 @@ function buildActivityRows(state: AppState): Segment[][] {
 // - `working`— the `✻ Working…` spinner line, dim accent.
 // - `status`— the two-line footer (`Model: … · Ctx … · Cost …` + `⏵⏵ auto mode`).
 // - `blank` — vertical spacing between turns.
-type ChatLine =
+export type ChatLine =
   | { kind: "user"; text: string }
   | { kind: "prose"; text: string }
   | { kind: "tool"; name: string; args: string }
@@ -730,12 +769,12 @@ const CHAT_LINES: ChatLine[] = [
 // the full 111-cell pane, the way Claude Code soft-wraps its output.
 const CHAT_WRAP_W = 76
 
-function buildChatRows(state: AppState): Segment[][] {
+function buildChatRows(state: AppState, lines: ChatLine[]): Segment[][] {
   const width = contentWidth(state.columns)
   const row = (segs: Segment[]) => bodyRow(segs, width)
   const rows: Segment[][] = []
 
-  for (const line of CHAT_LINES) {
+  for (const line of lines) {
     switch (line.kind) {
       case "blank":
         rows.push(blankRow(width))
@@ -808,7 +847,8 @@ function buildChatRows(state: AppState): Segment[][] {
     }
   }
 
-  return padBodyTo(rows, buildBoardRows(state.columns).length, width)
+  // Left unpadded — `TerminalBody` pads to the shared target height.
+  return rows
 }
 
 // ── Sidebar ───────────────────────────────────────────────────────────
@@ -1141,17 +1181,24 @@ const PRE_STYLE: React.CSSProperties = {
 }
 
 function TerminalBody({ state }: { state: AppState }) {
-  // The right pane swaps on the active nav view. Activity and Chat are padded
-  // to the board's height so the terminal frame stays a fixed size.
+  // The right pane swaps on the active view. Every view is padded to a common
+  // target height so the terminal frame stays a fixed size when switching views
+  // (and, for the hero animation, across every beat as content grows/shrinks):
+  // the natural board height, floored by any `minBodyRows` pin.
   const width = contentWidth(state.columns)
-  const body: Segment[][] =
+  const boardRows = buildBoardRows(state.columns)
+  const target = Math.max(boardRows.length, state.minBodyRows ?? 0)
+  const raw: Segment[][] =
     state.activeView === "activity"
       ? buildActivityRows(state)
       : state.activeView === "chat"
-        ? buildChatRows(state)
-        : buildBoardRows(state.columns)
+        ? buildChatRows(state, state.chatLines ?? CHAT_LINES)
+        : state.activeView === "workspace"
+          ? buildChatRows(state, state.workspaceLines ?? CHAT_LINES)
+          : boardRows
+  const body = padBodyTo(raw, target, width)
   const rows: Segment[][] = [
-    titleRow(state.columns, state.project, state.activeView),
+    titleRow(state),
     blankRow(width),
     ...body,
     blankRow(width),
@@ -1234,14 +1281,35 @@ function TrafficLight({ color }: { color: string }) {
 export function AppMockup({
   state,
   preset = "default",
+  frameOpacity,
   ...overrides
-}: { state?: AppState; preset?: PresetName } & Partial<AppState>) {
+}: {
+  state?: AppState
+  preset?: PresetName
+  /**
+   * Opacity applied to the terminal frame, with a short transition — the hero
+   * animation drives this to fade the whole frame out and back in at the loop
+   * boundary. Omitted (the docs default) leaves the frame fully opaque.
+   */
+  frameOpacity?: number
+} & Partial<AppState>) {
   const base = state ?? PRESETS[preset]
   const merged: AppState = { ...base, ...overrides }
-  // The active nav view is live, interactive state — seeded from the scenario
-  // so first paint matches the preset exactly (the hero stays on Tasks), then
-  // driven by clicking the sidebar nav. Everything else stays static data.
+  // The active view is live, interactive state — seeded from the scenario so
+  // first paint matches the preset exactly (the hero stays on Tasks), then
+  // driven by clicking the sidebar nav. It also re-syncs when the scenario's
+  // own `activeView` changes, so a timeline that mutates the state over time
+  // (the hero animation) drives the pane too. Everything else stays data.
+  // The sync uses React's "adjust state while rendering" pattern (compare the
+  // scenario's view to the last one we saw, reset on change) rather than an
+  // effect, so a scenario change is reflected in the same render with no extra
+  // commit — and a within-scenario nav click still wins until the next change.
   const [activeView, setActiveView] = useState<NavView>(merged.activeView)
+  const [seenView, setSeenView] = useState<NavView>(merged.activeView)
+  if (merged.activeView !== seenView) {
+    setSeenView(merged.activeView)
+    setActiveView(merged.activeView)
+  }
   const resolved: AppState = { ...merged, activeView }
   return (
     <section className="border-b border-gray-4 px-3 py-6 sm:py-10">
@@ -1251,7 +1319,11 @@ export function AppMockup({
       <div className="mx-auto w-fit max-w-full">
         <div
           className="overflow-hidden rounded-lg shadow-2xl"
-          style={{ boxShadow: "0 24px 48px rgba(0,0,0,0.35), 0 0 0 1px rgba(0,0,0,0.4)" }}
+          style={{
+            boxShadow: "0 24px 48px rgba(0,0,0,0.35), 0 0 0 1px rgba(0,0,0,0.4)",
+            opacity: frameOpacity,
+            transition: frameOpacity === undefined ? undefined : "opacity 500ms ease",
+          }}
         >
           {/* macOS Terminal title bar — traffic lights left, title centered. */}
           <div

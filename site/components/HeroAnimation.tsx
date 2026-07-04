@@ -1,0 +1,318 @@
+"use client"
+
+import { useEffect, useRef, useState } from "react"
+import {
+  AppMockup,
+  type AppState,
+  type Card,
+  type ChatLine,
+  type Column,
+  type Machine,
+} from "./KanbanMockup"
+
+/**
+ * The autoplaying hero: a looping story of using Shelbi end to end, told as a
+ * timeline of beats that mutate an `AppState` over time and render it through
+ * the existing `AppMockup` engine (same Segment/Row grid + palette as the docs
+ * mockups — this file adds no terminal rendering of its own).
+ *
+ * The story (see the beat comments in `buildKeyframes`): you talk to the
+ * orchestrator in the Chat pane; it breaks a plan into tasks that stream in;
+ * you switch to the board; the backlog fills; tasks promote and dispatch to
+ * workers; you watch one worker's Claude-Code session; then it fades and loops.
+ *
+ * The timeline is one flat list of keyframes (`{ state, hold, opacity }`) so
+ * durations and content are all tweakable in one place. A single `setTimeout`
+ * chain walks the list and wraps back to the start. Typing (beat 2) and task
+ * streaming (beat 3) are done by handing `AppMockup` a progressively-built
+ * transcript — no engine typing logic, just different `chatLines` per frame.
+ *
+ * Accessibility + cost: `prefers-reduced-motion` renders a single static frame
+ * (the board mid-dispatch) with no timers; an IntersectionObserver pauses the
+ * loop while the hero is scrolled off-screen. The frame size is pinned via
+ * `minBodyRows` so it never resizes as the story advances.
+ */
+
+// ── Story dataset ─────────────────────────────────────────────────────
+// The `dashboard.md` plan → an Analytics Dashboard feature, six coherent
+// tasks. The first three are created via the chat stream and dispatched to
+// alpha/bravo/charlie; the other three fill the backlog behind them.
+type Task = { id: string; title: string; worker?: string }
+
+const TASKS: Task[] = [
+  { id: "metrics-api-endpoint", title: "Metrics API endpoint", worker: "alpha" },
+  { id: "chart-components", title: "Chart components (line + bar)", worker: "bravo" },
+  { id: "date-range-filter", title: "Date-range filter", worker: "charlie" },
+  { id: "csv-export", title: "CSV export" },
+  { id: "dashboard-empty-states", title: "Empty + loading states" },
+  { id: "dashboard-tests", title: "Dashboard tests" },
+]
+
+/** A backlog/board card for a task; `withWorker` attaches its `@workspace`. */
+function card(t: Task, withWorker = false): Card {
+  return withWorker && t.worker
+    ? { title: t.title, id: t.id, workspace: t.worker }
+    : { title: t.title, id: t.id }
+}
+
+/** The five-column board, with only the columns this story uses populated. */
+function cols(opts: { backlog?: Card[]; todo?: Card[]; progress?: Card[] }): Column[] {
+  return [
+    { label: "BACKLOG", category: "gray", cards: opts.backlog ?? [] },
+    { label: "TO DO", category: "blue", cards: opts.todo ?? [] },
+    { label: "IN PROGRESS", category: "yellow", cards: opts.progress ?? [] },
+    { label: "REVIEW", category: "magenta", cards: [] },
+    { label: "DONE", category: "green", cards: [] },
+  ]
+}
+
+/** One `hub` machine; each named workspace flips to working/<agent>, rest idle. */
+function machinesFor(working: Record<string, string>): Machine[] {
+  const names = ["alpha", "bravo", "charlie", "delta"]
+  return [
+    {
+      name: "hub",
+      workspaces: names.map((name) =>
+        working[name]
+          ? { name, state: "working" as const, agent: working[name] }
+          : { name, state: "idle" as const },
+      ),
+    },
+  ]
+}
+
+// The scenario every beat spreads from — a fresh analytics-dashboard project on
+// the Chat view. `minBodyRows` pins the pane height so the frame never resizes
+// as columns fill/empty or panes swap (a 6-card backlog is the tallest state,
+// at 18 rows: header + 6×2 card rows + 5 gaps).
+const BASE: AppState = {
+  terminalTitle: "jlong@hub — analytics-dashboard",
+  project: "analytics-dashboard",
+  activeView: "chat",
+  minBodyRows: 18,
+  columns: cols({}),
+  machines: machinesFor({}),
+  readyReview: [],
+  queuedReview: [],
+}
+
+// ── Chat + worker transcripts ─────────────────────────────────────────
+const USER_MSG = "Take the @dashboard.md plan and break it down into tasks."
+const CURSOR = "▊"
+
+function userLine(text: string): ChatLine {
+  return { kind: "user", text }
+}
+
+// What the orchestrator streams after the user's message: a line of narration
+// then three `shelbi task add` calls, each with its `⎿ ✓ … created` result.
+const STREAM_TAIL: ChatLine[] = [
+  { kind: "blank" },
+  { kind: "prose", text: "Reading dashboard.md and breaking it into tasks." },
+  { kind: "blank" },
+  { kind: "tool", name: "Bash", args: 'shelbi task add "Metrics API endpoint"' },
+  { kind: "result", text: "✓ metrics-api-endpoint created" },
+  { kind: "blank" },
+  { kind: "tool", name: "Bash", args: 'shelbi task add "Chart components (line + bar)"' },
+  { kind: "result", text: "✓ chart-components created" },
+  { kind: "blank" },
+  { kind: "tool", name: "Bash", args: 'shelbi task add "Date-range filter"' },
+  { kind: "result", text: "✓ date-range-filter created" },
+]
+
+/** Chat transcript with the first `n` streamed lines revealed. */
+function chatUpTo(n: number): ChatLine[] {
+  return [userLine(USER_MSG), ...STREAM_TAIL.slice(0, n)]
+}
+
+// The focused worker (alpha) doing believable work on "Metrics API endpoint":
+// a read, an edit with a diffstat, then a passing test run + the session footer.
+const WORKER_BASE: ChatLine[] = [
+  { kind: "tool", name: "Read", args: "api/metrics.ts" },
+  { kind: "tool", name: "Edit", args: "api/metrics.ts" },
+  { kind: "prose", text: "+38 -4  ·  Added GET /api/metrics with range params." },
+  { kind: "tool", name: "Bash", args: "npm test -- metrics" },
+]
+const WORKER_RUNNING: ChatLine[] = [
+  ...WORKER_BASE,
+  { kind: "working", text: "Working… (3s · ↓ 128 tokens)" },
+]
+const WORKER_DONE: ChatLine[] = [
+  ...WORKER_BASE,
+  { kind: "result", text: "✓ 12 passed" },
+  { kind: "status", model: "Opus 4.8", ctx: "7%", cost: "$0.42" },
+]
+
+// ── Timeline ──────────────────────────────────────────────────────────
+type Keyframe = { state: AppState; hold: number; opacity: number }
+
+function frame(over: Partial<AppState>, hold: number, opacity = 1): Keyframe {
+  return { state: { ...BASE, ...over }, hold, opacity }
+}
+
+// Beat 6's end state — every task dispatched: alpha/bravo/charlie each working a
+// task in IN PROGRESS, the other three waiting in TO DO. Reused as the base for
+// the worker-pane beat and as the reduced-motion static frame.
+const DISPATCHED: Partial<AppState> = {
+  activeView: "tasks",
+  columns: cols({
+    todo: TASKS.slice(3).map((t) => card(t)),
+    progress: TASKS.slice(0, 3).map((t) => card(t, true)),
+  }),
+  machines: machinesFor({ alpha: "Developer", bravo: "Developer", charlie: "Developer" }),
+}
+
+/** The reduced-motion representative frame: the board mid-dispatch. */
+const STATIC_STATE: AppState = { ...BASE, ...DISPATCHED }
+
+function buildKeyframes(): Keyframe[] {
+  const k: Keyframe[] = []
+  const chat = (lines: ChatLine[]): Partial<AppState> => ({ activeView: "chat", chatLines: lines })
+
+  // Beat 1 — Chat view, a fresh `❯` prompt with a blinking cursor.
+  k.push(frame(chat([userLine(CURSOR)]), 900))
+
+  // Beat 2 — type the user's message character by character.
+  for (let i = 1; i <= USER_MSG.length; i += 1) {
+    k.push(frame(chat([userLine(USER_MSG.slice(0, i) + CURSOR)]), 30))
+  }
+  k.push(frame(chat([userLine(USER_MSG + CURSOR)]), 450)) // hold the full line
+  k.push(frame(chat([userLine(USER_MSG)]), 350)) // "send" — cursor drops
+
+  // Beat 3 — the orchestrator streams task creations one at a time. Reveal the
+  // narration, then each `Bash(shelbi task add …)` + `✓ … created` in turn.
+  k.push(frame(chat(chatUpTo(2)), 700)) // narration
+  k.push(frame(chat(chatUpTo(5)), 750)) // metrics-api-endpoint
+  k.push(frame(chat(chatUpTo(8)), 750)) // chart-components
+  k.push(frame(chat(chatUpTo(11)), 950)) // date-range-filter
+
+  // Beat 4 — switch to Tasks; the three created tasks are already in BACKLOG.
+  k.push(
+    frame({ activeView: "tasks", columns: cols({ backlog: TASKS.slice(0, 3).map((t) => card(t)) }) }, 1000),
+  )
+
+  // Beat 5 — the other three tasks pop into the backlog, one at a time.
+  for (let n = 4; n <= 6; n += 1) {
+    k.push(
+      frame(
+        { activeView: "tasks", columns: cols({ backlog: TASKS.slice(0, n).map((t) => card(t)) }) },
+        n === 6 ? 800 : 550,
+      ),
+    )
+  }
+
+  // Beat 6 — promote + dispatch. BACKLOG → TO DO, then TO DO → IN PROGRESS one
+  // worker at a time, each pickup flipping its sidebar workspace to working.
+  k.push(
+    frame(
+      {
+        activeView: "tasks",
+        columns: cols({
+          backlog: TASKS.slice(3).map((t) => card(t)),
+          todo: TASKS.slice(0, 3).map((t) => card(t)),
+        }),
+      },
+      750,
+    ),
+  )
+  k.push(frame({ activeView: "tasks", columns: cols({ todo: TASKS.map((t) => card(t)) }) }, 700))
+  k.push(
+    frame(
+      {
+        activeView: "tasks",
+        columns: cols({
+          todo: TASKS.slice(1).map((t) => card(t)),
+          progress: [card(TASKS[0], true)],
+        }),
+        machines: machinesFor({ alpha: "Developer" }),
+      },
+      750,
+    ),
+  )
+  k.push(
+    frame(
+      {
+        activeView: "tasks",
+        columns: cols({
+          todo: TASKS.slice(2).map((t) => card(t)),
+          progress: TASKS.slice(0, 2).map((t) => card(t, true)),
+        }),
+        machines: machinesFor({ alpha: "Developer", bravo: "Developer" }),
+      },
+      750,
+    ),
+  )
+  k.push(frame(DISPATCHED, 950)) // date-range-filter → charlie; all dispatched
+
+  // Beat 7 — observe a worker: focus alpha's Claude-Code pane on its task,
+  // running the test then landing green with the session footer.
+  const worker = (lines: ChatLine[]): Partial<AppState> => ({
+    ...DISPATCHED,
+    activeView: "workspace",
+    focusedWorkspace: "alpha",
+    workspaceLines: lines,
+  })
+  k.push(frame(worker(WORKER_RUNNING), 1300))
+  k.push(frame(worker(WORKER_DONE), 1900))
+
+  // Beat 8 — fade the frame out; wrapping to beat 1 (opacity 1) fades it back
+  // in on a fresh Chat view, so the loop is seamless.
+  k.push(frame(worker(WORKER_DONE), 650, 0))
+
+  return k
+}
+
+const KEYFRAMES = buildKeyframes()
+
+export function HeroAnimation() {
+  const [index, setIndex] = useState(0)
+  const [visible, setVisible] = useState(true)
+  const [reduced, setReduced] = useState(false)
+  const containerRef = useRef<HTMLDivElement>(null)
+
+  // Respect prefers-reduced-motion: no autoplay, just the static frame.
+  useEffect(() => {
+    const mq = window.matchMedia("(prefers-reduced-motion: reduce)")
+    const update = () => setReduced(mq.matches)
+    update()
+    mq.addEventListener("change", update)
+    return () => mq.removeEventListener("change", update)
+  }, [])
+
+  // Pause the loop while the hero is scrolled off-screen to save CPU.
+  useEffect(() => {
+    const el = containerRef.current
+    if (!el) return
+    const obs = new IntersectionObserver(([entry]) => setVisible(entry.isIntersecting), {
+      threshold: 0.15,
+    })
+    obs.observe(el)
+    return () => obs.disconnect()
+  }, [])
+
+  // Advance the timeline: schedule the next frame after the current hold, and
+  // wrap forever. Re-runs on visibility/reduced changes so pausing (cleanup
+  // clears the pending timer) and resuming both fall out naturally.
+  useEffect(() => {
+    if (reduced || !visible) return
+    const t = window.setTimeout(() => {
+      setIndex((i) => (i + 1) % KEYFRAMES.length)
+    }, KEYFRAMES[index].hold)
+    return () => window.clearTimeout(t)
+  }, [index, visible, reduced])
+
+  if (reduced) {
+    return (
+      <div ref={containerRef}>
+        <AppMockup state={STATIC_STATE} />
+      </div>
+    )
+  }
+
+  const kf = KEYFRAMES[index]
+  return (
+    <div ref={containerRef}>
+      <AppMockup state={kf.state} frameOpacity={kf.opacity} />
+    </div>
+  )
+}
