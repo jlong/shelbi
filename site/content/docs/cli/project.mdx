@@ -1,0 +1,99 @@
+---
+title: shelbi project
+order: 12
+summary: Manage projects — add a new one interactively, or migrate an existing global-mode project into committed in-repo mode.
+---
+
+```text
+shelbi project <COMMAND> [OPTIONS]
+```
+
+`shelbi project` groups the commands for managing which repos Shelbi knows
+about. Use it to onboard an additional project after your first, or to move an
+existing project from per-user global config into committed in-repo config.
+
+Every subcommand accepts the global `--root <PATH>` (override the Shelbi root
+directory, else `$SHELBI_ROOT`, else the install-time default) and
+`-p, --project <PROJECT>` (defaults to `$SHELBI_PROJECT` or the registered
+project whose `work_dir` contains the current directory) flags.
+
+## Commands
+
+| Command | Description |
+| --- | --- |
+| `add` | Set up a new project interactively — walks the same prompt sequence as initial onboarding (project name, machines, workspaces, runners) and writes `~/.shelbi/projects/<name>.yaml`. |
+| `migrate-to-in-repo` | Migrate an existing global-mode project into in-repo mode. |
+
+## add
+
+```text
+shelbi project add [OPTIONS]
+```
+
+Set up a new project interactively. It walks through the same prompts as initial
+onboarding — project name, machines, workspaces, runners — and writes
+`~/.shelbi/projects/<name>.yaml`. Unlike first-run onboarding, it does **not**
+launch the TUI on completion.
+
+## migrate-to-in-repo
+
+```text
+shelbi project migrate-to-in-repo [OPTIONS]
+```
+
+Migrate an existing global-mode project into
+[in-repo mode](/docs/concepts/config-modes). It splits
+`~/.shelbi/projects/<name>.yaml` into a committed shared half at
+`<repo>/.shelbi/project.yaml` and a per-machine
+`~/.shelbi/projects/<name>/local.yaml`, and moves `workflows/`, `agents/`, and
+the workspace-settings template from the state dir into the repo. State
+(`state.json`, `tasks/`, `HANDOFF.md`, `.claude/`, `workspaces/`, `events.log`)
+stays under `~/.shelbi/` in both modes.
+
+The migration is idempotent — safe to re-run on an already-migrated project (a
+no-op) or a half-migrated one (it completes the missing steps). It prints a
+`.gitignore` snippet for the repo root and, outside `--dry-run`, offers to
+auto-append it.
+
+<Callout type="warning" title="One-way migration">
+
+There is no `migrate-to-global` command. Reverting means `git revert` on the
+migration commit (which restores `<repo>/.shelbi/` to its pre-migration state)
+plus manually moving `local.yaml` back to
+`~/.shelbi/projects/<name>.yaml`. A merged migration commit is expensive to
+undo — run `--dry-run` first if you're unsure.
+
+</Callout>
+
+| Flag | Type | Default | Description |
+| --- | --- | --- | --- |
+| `--dry-run` | flag | off | Print the plan without touching disk — every write, move, and delete the real run would perform, in order, so a reviewer can vet it first. |
+| `--yes` | flag | off | Skip the interactive prompt and auto-append the `.gitignore` snippet. Useful for scripts and headless runs with no TTY. Ignored under `--dry-run`. |
+
+## Examples
+
+Onboard a second project from inside its repo:
+
+```bash
+shelbi project add
+```
+
+Preview an in-repo migration without writing anything:
+
+```bash
+shelbi project migrate-to-in-repo --dry-run
+```
+
+Run the migration non-interactively, appending the `.gitignore` snippet:
+
+```bash
+shelbi project migrate-to-in-repo --yes
+```
+
+## See also
+
+- [Config modes](/docs/concepts/config-modes) — the global vs in-repo model, the
+  full on-disk layout, and the `.gitignore` list `migrate-to-in-repo` prints.
+- [`shelbi init`](/docs/cli/init) — first-time scaffolding, including the
+  `--pick-up` flow for cloning a teammate's in-repo config.
+- [`shelbi wizard`](/docs/cli/wizard) — the interactive onboarding walkthrough.

@@ -1,0 +1,51 @@
+---
+title: shelbi wizard
+order: 11
+summary: Run the interactive onboarding walkthrough that sets up a project and writes its config — idempotent, so it skips setup when the project already exists.
+---
+
+```text
+shelbi wizard [OPTIONS]
+```
+
+`shelbi wizard` is the guided front door to Shelbi. It walks you through project
+setup — auto-filling what it can from the current git checkout when there is one
+— and writes `~/.shelbi/projects/<name>.yaml`. It's the interactive counterpart
+to [`shelbi init`](/docs/cli/init): reach for the wizard when you'd rather answer
+prompts than assemble flags.
+
+The walkthrough is **idempotent**. If a project is already on disk, the wizard
+detects it and skips setup rather than clobbering your config, so it's safe to
+re-run. For the end-to-end onboarding story — from install through your first
+task — follow the
+[Create your first project](/docs/guides/getting-started/first-project) guide,
+which drives this command.
+
+## Options
+
+| Flag | Type | Default | Description |
+| --- | --- | --- | --- |
+| `--root <PATH>` | string | install-time default, else `~/.shelbi` | Override the Shelbi root directory. The flag wins over `$SHELBI_ROOT` and the compile-time default. |
+| `-p, --project <PROJECT>` | string | `$SHELBI_PROJECT` / cwd lookup | Project to operate on. Defaults to the project named in `$SHELBI_PROJECT`, or the registered project whose `work_dir` contains the current directory. |
+
+## Examples
+
+Run the onboarding walkthrough from inside the repo you want to manage:
+
+```bash
+shelbi wizard
+```
+
+Re-run it later — setup is skipped because the project already exists:
+
+```bash
+shelbi wizard
+```
+
+## See also
+
+- [Create your first project](/docs/guides/getting-started/first-project) — the
+  getting-started guide that walks through this wizard step by step.
+- [`shelbi init`](/docs/cli/init) — the flag-driven, scriptable form of the same
+  setup, with the global vs in-repo mode choice.
+- [`shelbi project`](/docs/cli/project) — add further projects after the first.

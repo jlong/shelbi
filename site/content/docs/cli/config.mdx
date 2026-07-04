@@ -1,0 +1,84 @@
+---
+title: shelbi config
+order: 34
+summary: Inspect and validate your keybinding configuration — list every action's chords, dump a starter keys.yaml, or check ~/.shelbi/keys.yaml for errors.
+---
+
+```text
+shelbi config <COMMAND> [OPTIONS]
+```
+
+`shelbi config` inspects and validates the TUI's keybinding configuration. It's
+how you see which chords are bound to which actions, generate a starter
+`keys.yaml` to customize, and confirm your overrides parse before you rely on
+them. The bindings themselves live in `~/.shelbi/keys.yaml`, documented
+field-by-field in [Global config](/docs/configuration/global#keysyaml).
+
+Every subcommand accepts the global `--root <PATH>` (override the Shelbi root
+directory, else `$SHELBI_ROOT`, else the install-time default) and
+`-p, --project <PROJECT>` (defaults to `$SHELBI_PROJECT` or the registered
+project whose `work_dir` contains the current directory) flags.
+
+## Commands
+
+| Command | Description |
+| --- | --- |
+| `list-actions` | Print every action with its mode, name, description, and the chord(s) bound to it after the `keys.yaml` merge. |
+| `dump-keybindings` | Dump the full default keymap as YAML — a starting point for `~/.shelbi/keys.yaml`. |
+| `check` | Validate `~/.shelbi/keys.yaml` and print any errors or warnings. |
+
+## list-actions
+
+```text
+shelbi config list-actions
+```
+
+Print every action with its mode, name, description, and the chord(s) bound to
+it **after** the `keys.yaml` merge — so it reflects your overrides, not just the
+built-in defaults. This is the reference for what's bindable and what each
+action currently does.
+
+## dump-keybindings
+
+```text
+shelbi config dump-keybindings
+```
+
+Dump the full default keymap as YAML. Drop the output into `~/.shelbi/keys.yaml`
+as a starting point for customization, then edit the chords you want to change.
+
+## check
+
+```text
+shelbi config check
+```
+
+Validate `~/.shelbi/keys.yaml` and print any errors or warnings. It **exits 1**
+on errors, so it slots cleanly into a pre-flight script; warnings still exit 0.
+
+## Examples
+
+See what every action is bound to after your overrides are applied:
+
+```bash
+shelbi config list-actions
+```
+
+Generate a starter keybindings file to customize:
+
+```bash
+shelbi config dump-keybindings > ~/.shelbi/keys.yaml
+```
+
+Validate your edits before relying on them:
+
+```bash
+shelbi config check
+```
+
+## See also
+
+- [Global config](/docs/configuration/global#keysyaml) — the `keys.yaml` schema:
+  modes, actions, chord syntax, and the built-in defaults.
+- [Enable Zen Mode](/docs/guides/getting-started/enable-zen-mode) — a worked
+  example of customizing a chord (the Zen Mode toggle).

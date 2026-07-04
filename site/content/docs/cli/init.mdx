@@ -1,0 +1,75 @@
+---
+title: shelbi init
+order: 10
+summary: Scaffold ~/.shelbi/ and a starter project, choosing between global and in-repo config — or pick up a teammate's committed in-repo config on a fresh clone.
+---
+
+```text
+shelbi init [OPTIONS]
+```
+
+`shelbi init` bootstraps Shelbi on a machine. It scaffolds `~/.shelbi/` and
+writes a starter project config for the repo you point it at — the one-time
+setup you run before anything else. It's the flag-driven sibling of
+[`shelbi wizard`](/docs/cli/wizard): the wizard walks you through the same setup
+interactively, while `init` is what you reach for in scripts and CI where the
+answers are supplied up front.
+
+The central choice is **where the project config lives**. In *global* mode the
+config is per-user at `~/.shelbi/projects/<name>.yaml` and never committed —
+right for solo or scratch work. In *in-repo* mode it's a committed
+`<repo>/.shelbi/project.yaml` that everyone gets on clone — right for teams. In
+an interactive run the command asks and prefills a recommendation; in a
+non-interactive run (no TTY) `--mode` is **required**, because Shelbi refuses to
+silently pick a mode for a scripted caller. See
+[Config modes](/docs/concepts/config-modes) for the full on-disk layout,
+migration path, and a worked pick-up example.
+
+## Picking up a cloned in-repo config
+
+When you clone a teammate's repo that already carries a committed
+`<repo>/.shelbi/project.yaml`, run `shelbi init --pick-up` to register it into
+your local registry. Pick-up skips mode selection (the mode is already
+`in-repo` by virtue of the committed file existing) and prompts only for the
+user-local fields. If the project's canonical name collides with one already in
+your local registry, the local alias is auto-suffixed (`-2`, `-3`, …) — the
+committed YAML is never touched.
+
+## Options
+
+| Flag | Type | Default | Description |
+| --- | --- | --- | --- |
+| `--project <PROJECT>` | string | basename of the project root | Override the project name. |
+| `--root <ROOT>` | string | current directory | Project root directory — the repo Shelbi will manage. Skips the interactive "Project root?" prompt; required when stdin is not a TTY (CI, piped input). |
+| `--mode <MODE>` | `in-repo` \| `global` | asked interactively | Where the project config lives. `in-repo` writes a committed `<repo>/.shelbi/project.yaml` shared with the team; `global` keeps everything under `~/.shelbi/projects/`. **Required** in non-interactive contexts. |
+| `--pick-up` | flag | off | Register an existing committed `<repo>/.shelbi/project.yaml` into the local registry — the flow for cloning a teammate's Shelbi project. Skips mode selection and prompts only for user-local fields. |
+
+## Examples
+
+Interactive first-time setup in the repo you want to manage:
+
+```bash
+shelbi init
+```
+
+Scripted global-mode setup with no prompts (CI, dotfiles bootstrap):
+
+```bash
+shelbi init --root ~/code/myapp --mode global
+```
+
+Register a teammate's committed in-repo config after cloning:
+
+```bash
+git clone git@github.com:acme/myapp.git && cd myapp
+shelbi init --pick-up
+```
+
+## See also
+
+- [Config modes](/docs/concepts/config-modes) — global vs in-repo, the on-disk
+  layout, migration, and the pick-up walkthrough in full.
+- [`shelbi wizard`](/docs/cli/wizard) — the interactive onboarding walkthrough
+  that runs this same setup.
+- [`shelbi project`](/docs/cli/project) — add more projects or migrate an
+  existing global project into in-repo mode later.
