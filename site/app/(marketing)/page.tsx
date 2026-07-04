@@ -12,8 +12,8 @@ import {
 } from '@heroicons/react/24/outline'
 import Link from 'next/link'
 import { Hero } from '@/components/Hero'
+import { HeroAnimation } from '@/components/HeroAnimation'
 import { InstallCloser } from '@/components/InstallCloser'
-import { KanbanMockup } from '@/components/KanbanMockup'
 
 const pitch = [
   {
@@ -75,7 +75,7 @@ export default function HomePage() {
       <main className="flex flex-1 flex-col">
         <Hero />
 
-        <KanbanMockup />
+        <HeroAnimation />
 
         <section>
           <div className="grid grid-cols-1 md:grid-cols-3 gap-px bg-gray-4">
