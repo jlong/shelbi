@@ -22,11 +22,11 @@ const DEFAULT_DESCRIPTION =
  *
  * Deliberate exception to the strict-monochrome rule in `site/AGENTS.md`
  * (same spirit as the colored callouts): the banner carries a violet accent
- * — tinted background, saturated border, and violet sparkle icon — so the
- * "set this up with an AI agent" affordance stands out. Title/body text stay
- * on the monochrome ramp for legibility. Colors resolve through the
- * `--color-copy-prompt-*` tokens in `app/globals.css`, so light and dark mode
- * follow automatically.
+ * — tinted background, saturated border, violet sparkle icon, and a matching
+ * violet Copy-prompt button (`tone="violet"`) — so the "set this up with an
+ * AI agent" affordance stands out. Title/body text stay on the monochrome
+ * ramp for legibility. Colors resolve through the `--color-copy-prompt-*`
+ * tokens in `app/globals.css`, so light and dark mode follow automatically.
  */
 export function CopyPromptBanner({
   prompt,
@@ -50,7 +50,8 @@ export function CopyPromptBanner({
         label="Copy prompt"
         copiedLabel="Copied"
         ariaLabel="Copy prompt"
-        className="flex shrink-0 items-center gap-1 self-start rounded-sm border border-gray-4 bg-gray-2 px-2 py-1 font-mono text-xs text-gray-7 transition-colors hover:border-gray-5 hover:text-fg focus:outline-none focus-visible:border-gray-6 sm:self-auto"
+        tone="violet"
+        className="shrink-0 self-start px-2 sm:self-auto"
       />
     </div>
   )
