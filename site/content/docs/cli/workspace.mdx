@@ -9,15 +9,15 @@ shelbi workspace <SUBCOMMAND> [OPTIONS]
 ```
 
 `shelbi workspace` is read-mostly: the pool is declared in the project YAML and
-doesn't change at runtime — there's no `workspace add` or `workspace rm`. You
+doesn't change at runtime. There's no `workspace add` or `workspace rm`. You
 use it to observe (what's idle or working, which agent is loaded where) and to
 intervene (stop a pane to release a stuck task).
 
-A [workspace](/docs/concepts/workspaces) is capacity — a machine, a tmux pane,
+A [workspace](/docs/concepts/workspaces) is capacity: a machine, a tmux pane,
 and a worktree; the [agent](/docs/concepts/agents) inside it is chosen per task
 by the workflow, which is why `list` reports both. The sidebar shows the same
-pool, grouped by machine, with a badge marking each state — `⏵` working, `·`
-idle:
+pool, grouped by machine, with a badge marking each state (`⏵` working, `·`
+idle):
 
 <AppMockup
   project="shelbi"
@@ -83,7 +83,7 @@ echo         devbox   sonnet         -              idle
 This is the first command the orchestrator runs at session start to snapshot
 the pool, and the same snapshot you want when answering "who's free, and what
 are they running?" An `AGENT` of `-` with `idle` state is a free slot. `STATE`
-here is board-derived — for the poller's live read (`working`,
+here is board-derived. For the poller's live read (`working`,
 `awaiting_input`, `blocked`), use [`status`](#status).
 
 ## stop
@@ -94,7 +94,7 @@ shelbi workspace stop [OPTIONS] <NAME>
 
 Stop the workspace's tmux pane. By default the in-flight task is released
 back to its `ready` status (`todo` in the default workflow) and its
-`assigned_to` field is cleared — the board never shows an orphaned
+`assigned_to` field is cleared. The board never shows an orphaned
 `in_progress` card pointing at a dead pane. Pass `--keep-task` when you're
 about to restart on the same task and don't want the card to move.
 
@@ -112,7 +112,7 @@ detached agent process lingers on the other machine.
 shelbi workspace status [NAME]
 ```
 
-Print observed workspace state from the hub-side poller — reads
+Print observed workspace state from the hub-side poller. Reads
 `~/.shelbi/workspaces/<name>/status.yaml` files; no tmux probing. Cheaper
 than `list` and safe to call repeatedly. With a `NAME`, prints a single row
 plus the raw status.yaml contents.
@@ -130,14 +130,14 @@ shelbi workspace serve [OPTIONS] [NAME]
 Start (or restart) a [review workspace](/docs/concepts/review-workspaces)'s
 long-lived dev server in a dedicated, Shelbi-managed **server pane**. This is
 the entry point the **Review agent** invokes once it has resolved the serve
-command; from there Shelbi owns the pane's lifecycle — a `server_alive=false`
+command; from there Shelbi owns the pane's lifecycle: a `server_alive=false`
 event on death, teardown on re-dispatch or `stop`, and the leaked-port reaper.
 You rarely run it by hand, but it's the seam if you want to restart a review
 server yourself.
 
 Any server pane already running for the workspace is torn down first, so
 re-running it is also how you **refresh** the server for a new branch. It's
-supported on local machines only — a remote review workspace errors here.
+supported on local machines only. A remote review workspace errors here.
 
 | Flag | Type | Default | Description |
 | --- | --- | --- | --- |
@@ -184,8 +184,8 @@ shelbi workspace status alpha
 ## Deprecation: `shelbi worker`
 
 `shelbi worker` is a deprecated alias for `shelbi workspace`. Every
-subcommand still works under the old name — `shelbi worker list`,
-`shelbi worker stop bravo` — and prints a one-line deprecation notice
+subcommand still works under the old name (`shelbi worker list`,
+`shelbi worker stop bravo`) and prints a one-line deprecation notice
 pointing at the new spelling. The alias is kept so muscle memory and
 existing scripts don't break; new docs, output, and tab-completion use
 `workspace`. The alias may be removed in a future release, so migrate when

@@ -9,19 +9,19 @@ shelbi open [OPTIONS] <NAME>
 ```
 
 `shelbi open` focuses a [workspace](/docs/concepts/workspaces)'s tmux pane,
-creating it — with the agent already running inside — if it doesn't exist yet.
+creating it (with the agent already running inside) if it doesn't exist yet.
 It's the single entry point behind both the sidebar's click-to-focus and the
 dispatch path: the "does this pane exist?" check lives here, so callers never
 have to branch on it themselves.
 
 For a **local** workspace, an empty pane is created by re-entering this same
-command under `--as-pane` — the wrapper that owns the agent subprocess and
+command under `--as-pane`, the wrapper that owns the agent subprocess and
 emits a `pane_alive=false` event when it exits. For a **remote** workspace, the
 pane is a proxy window that `ssh -t … tmux attach`es into the workspace's own
 remote tmux session, since the lifecycle wrapper isn't deployed to remote
 machines.
 
-`open` focuses (or creates) the pane inside the Shelbi tmux session — it's how
+`open` focuses (or creates) the pane inside the Shelbi tmux session. It's how
 you jump to a workspace from the sidebar. To connect your own terminal directly
 to a workspace's pane instead, use [`shelbi attach`](/docs/cli/attach).
 

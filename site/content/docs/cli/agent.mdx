@@ -9,19 +9,19 @@ shelbi agent <SUBCOMMAND> [OPTIONS]
 ```
 
 `shelbi agent` manages the [agents](/docs/concepts/agents) a project ships
-with — the roles (a system prompt plus an optional skill set) a
+with: the roles (a system prompt plus an optional skill set) a
 [workspace](/docs/concepts/workspaces) loads when it picks up a task. Every
-project starts with four — `orchestrator`, `developer`, `qa`,
-`security-review` — and these subcommands surface them and let you author more.
+project starts with four (`orchestrator`, `developer`, `qa`,
+`security-review`), and these subcommands surface them and let you author more.
 
-Agents live under the project's `agents/` directory —
+Agents live under the project's `agents/` directory:
 `~/.shelbi/projects/<project>/agents/<name>/` in the default
 [global mode](/docs/concepts/config-modes) or
 `<repo>/.shelbi/agents/<name>/` in in-repo mode. Each has an
 `instructions.md` (its prompt) and an optional `skills/` directory. The
 shared `agents/_shared/preamble.md` is prepended to every agent's prompt at
 launch time. The defaults are seeded on first load and never clobbered on
-upgrade — see [customizing an agent](/docs/concepts/agents#customizing-an-agent).
+upgrade. See [customizing an agent](/docs/concepts/agents#customizing-an-agent).
 
 Every subcommand accepts the global `-p / --project <PROJECT>` flag, omitted
 from the per-subcommand tables below.
@@ -65,7 +65,7 @@ section listing each `skills/*.md` file with the `description` from its
 frontmatter. Errors if the agent doesn't exist.
 
 This shows you what *one* agent's file holds in isolation. It does **not**
-prepend `agents/_shared/preamble.md` — that composition happens at launch
+prepend `agents/_shared/preamble.md`. That composition happens at launch
 time, not at `show` time. To see the shared preamble, `cat
 ~/.shelbi/projects/<name>/agents/_shared/preamble.md`.
 
@@ -81,11 +81,11 @@ shelbi agent new <NAME>
 
 Scaffold a new agent directory under `agents/<NAME>/` with a starter
 `instructions.md` and an empty `skills/`. The starter prompt is a minimal
-role template, not a copy of `developer` — it's there to be replaced.
+role template, not a copy of `developer`. It's there to be replaced.
 
 Errors if an agent with that name already exists. Names must be non-empty,
-must not start with `.` or `_`, and may only contain `a-z`, `0-9`, `-`, `_`
-— the name doubles as the identifier referenced from workflow `agent:`
+must not start with `.` or `_`, and may only contain `a-z`, `0-9`, `-`, `_`.
+The name doubles as the identifier referenced from workflow `agent:`
 fields, so the validator is stricter than POSIX.
 
 | Argument | Type | Default | Description |
@@ -99,11 +99,11 @@ shelbi agent edit <NAME>
 ```
 
 Open the agent's `instructions.md` in `$EDITOR` (falling back to `$VISUAL`,
-then `vim`). Errors if the agent doesn't exist — run `shelbi agent new
+then `vim`). Errors if the agent doesn't exist. Run `shelbi agent new
 <NAME>` first, or `shelbi reload` to materialize the shipped defaults if
 this is the first time the project's been opened.
 
-Edits take effect the next time the affected agent is launched — for the
+Edits take effect the next time the affected agent is launched: for the
 orchestrator, on the next `shelbi reload`; for a workspace agent, on its
 next task dispatch.
 
@@ -134,7 +134,7 @@ shelbi agent new perf-review
 shelbi agent edit perf-review
 ```
 
-Then wire it into a workflow status — reference the status by `id` (its
+Then wire it into a workflow status. Reference the status by `id` (its
 `name` and `category` live in `statuses.yaml`) and name the agent:
 
 ```yaml

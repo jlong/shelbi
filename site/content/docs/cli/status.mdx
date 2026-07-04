@@ -11,7 +11,7 @@ shelbi status [OPTIONS] [COMMAND]
 `shelbi status` prints the orchestrator's bootstrap snapshot for a project.
 Bare `shelbi status` emits a concise, human-readable summary of where the board
 stands right now. Pass `--full` to emit the full sectioned payload the
-[orchestrator](/docs/concepts/orchestrator) consumes on bootstrap — board +
+[orchestrator](/docs/concepts/orchestrator) consumes on bootstrap: board +
 workspaces + zen + handoff-presence. Both the plain summary and `--full` are
 idempotent and safe to re-run.
 
@@ -21,7 +21,7 @@ present. Because it's destructive, it's kept separate from `--full` so that
 bootstrap snapshots stay safe to re-run.
 
 The flags **compose**: `shelbi status --full --handoff` emits the full payload
-*and* drains the handoff note in one call — the exact shape the orchestrator
+*and* drains the handoff note in one call, the exact shape the orchestrator
 reads when it wakes up and picks up where a previous session left off.
 
 ## Flags
@@ -38,8 +38,8 @@ reads when it wakes up and picks up where a previous session left off.
 shelbi status list
 ```
 
-The legacy `list` subcommand prints the canonical status catalogue — order, id,
-name, and category — read from the project's `workflows/statuses.yaml`. The
+The legacy `list` subcommand prints the canonical status catalogue (order, id,
+name, and category) read from the project's `workflows/statuses.yaml`. The
 order here is the left-to-right column order every view in the project uses.
 
 ## Examples

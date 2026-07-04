@@ -6,8 +6,8 @@ summary: Field-by-field reference for a workflow YAML — statuses (reference-on
 
 A workflow file declares the pipeline a task moves through: which
 statuses it references, which side-effects fire on which edges, and any
-per-workflow git or Zen overrides. For the model behind these fields —
-owners, categories, the any-to-any transition policy — see
+per-workflow git or Zen overrides. For the model behind these fields
+(owners, categories, the any-to-any transition policy), see
 [the workflows concept](/docs/guides/getting-started/workflows).
 
 ## Where it lives
@@ -20,7 +20,7 @@ owners, categories, the any-to-any transition policy — see
 [global mode](/docs/concepts/config-modes) and `<repo>/.shelbi/` in
 in-repo mode. The file's basename is its id; the in-file `name:` field
 must match. Every project has a built-in virtual `default` workflow that
-lives in code until `shelbi workflow new` or `edit` writes a file — see
+lives in code until `shelbi workflow new` or `edit` writes a file. See
 [`shelbi workflow`](/docs/cli/workflow).
 
 ## Example
@@ -62,7 +62,7 @@ transitions:
 Since [#197](https://github.com/jlong/shelbi/pull/197), a workflow status
 entry carries **only** `id`, `owner`, and optional `agent`. The display
 `name` and `category` are declared once in
-[`statuses.yaml`](/docs/configuration/statuses) — repeating an inline
+[`statuses.yaml`](/docs/configuration/statuses). Repeating an inline
 `name:` or `category:` here fails the load. This keeps identity from
 drifting across workflows.
 
@@ -77,8 +77,8 @@ drifting across workflows.
 ## transitions
 
 Each entry declares the hub-side side-effects that fire when a task
-crosses one edge. Transitions do **not** restrict which moves are legal —
-moves are any-to-any; unlisted edges are pure status changes. See
+crosses one edge. Transitions do **not** restrict which moves are legal.
+Moves are any-to-any; unlisted edges are pure status changes. See
 [transitions](/docs/guides/getting-started/workflows#transitions).
 
 | Field | Type | Required | Default | Description |
@@ -125,7 +125,7 @@ placeholders resolved against task params at load time.
 
 Per-workflow override of the project's
 [`zen:`](/docs/configuration/project#zen) block. Each subfield is
-independently optional — override just `checks`, just `ci_timeout`, just
+independently optional: override just `checks`, just `ci_timeout`, just
 `danger_paths`, or any combination. Unset subfields fall back to the
 project. The canonical use is a `research:` workflow opting out of
 code-style checks without affecting `default`.

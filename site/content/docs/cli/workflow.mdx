@@ -10,17 +10,17 @@ shelbi workflow <SUBCOMMAND> [OPTIONS]
 
 `shelbi workflow` manages the YAML files that declare the statuses a task moves
 through, who owns each one, and which git side-effects fire on each transition.
-Every project has a built-in `default` workflow — the canonical five-status
-flow (`Backlog → Todo → InProgress → Review → Done`) — and these subcommands
+Every project has a built-in `default` workflow: the canonical five-status
+flow (`Backlog → Todo → InProgress → Review → Done`). These subcommands
 surface it alongside any custom workflows the project authors.
 
 The default is virtual: it lives in code, not on disk, until `workflow new` or
 `workflow edit` writes a file. Workflow files live at
-`<config-root>/workflows/<name>.yaml` — `<config-root>` is
+`<config-root>/workflows/<name>.yaml`. `<config-root>` is
 `~/.shelbi/projects/<project>/` in the default
 [global mode](/docs/concepts/config-modes), `<repo>/.shelbi/` in in-repo mode.
 A file's basename is its name; the in-file `name:` field must match. Most
-projects never touch this command — reach for it when you want a second
+projects never touch this command. Reach for it when you want a second
 pipeline: a docs-only flow, a research track that never opens PRs, a
 feature-stacking flow off a long-lived branch.
 
@@ -37,7 +37,7 @@ Print every workflow under the project's `workflows/` directory
 (`~/.shelbi/projects/<project>/workflows/` in global mode,
 `<repo>/.shelbi/workflows/` in in-repo mode), one per line, with a
 count of statuses and the YAML description. A `·` marker in the first
-column means the workflow is the built-in fallback — no file has been
+column means the workflow is the built-in fallback. No file has been
 written yet. A blank marker means a file exists on disk.
 
 When the workflows directory is empty, the only entry is the built-in
@@ -49,7 +49,7 @@ When the workflows directory is empty, the only entry is the built-in
 shelbi workflow show <NAME>
 ```
 
-Print the workflow's per-status table — `STATUS`, `OWNER`, and `AGENT` for
+Print the workflow's per-status table: `STATUS`, `OWNER`, and `AGENT` for
 each status, in the canonical `statuses.yaml` order (statuses the workflow
 doesn't declare are dropped). `show default` works even before any file is
 written, rendering the built-in default from code; any other missing name
@@ -63,13 +63,13 @@ shelbi workflow new [OPTIONS] <NAME>
 
 Scaffold a new workflow YAML pre-populated with the canonical five-status
 default. The file's `name:` field is set to `<NAME>` so it matches the
-basename. For non-`default` names the placeholder description is dropped —
-the default's "standard one-track flow…" copy would misrepresent a freshly
+basename. For non-`default` names the placeholder description is dropped.
+The default's "standard one-track flow…" copy would misrepresent a freshly
 scaffolded workflow whose author hasn't written a real description yet.
 
 Errors if a workflow with that name already exists. Names must be
 non-empty, must not start with `.`, and may only contain `a-z`, `0-9`, `-`,
-`_` — the name doubles as a YAML identifier referenced from task
+`_`. The name doubles as a YAML identifier referenced from task
 frontmatter, so the validator is stricter than POSIX.
 
 | Flag | Type | Default | Description |

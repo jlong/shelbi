@@ -18,7 +18,7 @@ is the canonical left-to-right column order in the TUI's all-view.
 
 `<config-root>` is `~/.shelbi/projects/<name>/` in the default
 [global mode](/docs/concepts/config-modes) and `<repo>/.shelbi/` in
-in-repo mode — the same directory as the workflow files.
+in-repo mode, the same directory as the workflow files.
 
 <Callout type="note" title="Migrated from statuses.yml">
 
@@ -57,7 +57,7 @@ statuses:
 
 ## categories
 
-The `category` field is a closed vocabulary of exactly six values —
+The `category` field is a closed vocabulary of exactly six values:
 generic code (the orchestrator, Zen Mode, event-log reactions) keys off
 the category, not the display name, so renaming a status leaves its
 semantics intact. See [status categories](/docs/guides/getting-started/workflows#status-categories).
@@ -73,7 +73,7 @@ semantics intact. See [status categories](/docs/guides/getting-started/workflows
 
 <Callout type="warning" title="At least one terminal category">
 
-Loading fails if no status has category `done` or `archived` — a board
+Loading fails if no status has category `done` or `archived`. A board
 with no terminal state is degenerate, since a task could never leave it.
 A category set is otherwise unconstrained: repeating a category is
 allowed (a long pipeline might have several `active` statuses), though a

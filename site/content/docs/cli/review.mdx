@@ -9,8 +9,8 @@ shelbi review [OPTIONS] <ID>
 ```
 
 `shelbi review` loads a task's branch onto a
-[**review workspace**](/docs/concepts/review-workspaces) — a `role: review`
-pool slot — and starts the **Review agent** there to *run* the change: install
+[**review workspace**](/docs/concepts/review-workspaces) (a `role: review`
+pool slot) and starts the **Review agent** there to *run* the change: install
 deps, build, boot the dev server, and hand you a working URL. It's the same
 load path the orchestrator triggers automatically when a task reaches the
 review status; run it by hand to load (or re-load) a specific task yourself.
@@ -18,14 +18,14 @@ review status; run it by hand to load (or re-load) a specific task yourself.
 The branch is **moved** onto the review workspace's own worktree, so the
 machine's top-level clone is never checked out into or dirtied by review. When
 every review workspace on the resolved machine is already busy, the command
-doesn't fail — it prints the task's **queue position** and the task loads
+doesn't fail. It prints the task's **queue position** and the task loads
 automatically once a slot frees.
 
 By default the command runs on the machine of the task's `assigned_to`
 workspace (when that machine declares review workspaces), else the first
 machine that declares one. Pass `--machine` to override.
 
-A task loaded for review — its card sits in `REVIEW`, and the sidebar's
+When a task is loaded for review, its card sits in `REVIEW` and the sidebar's
 "Ready for Review" section lists it against the review workspace serving it:
 
 <AppMockup
@@ -89,7 +89,7 @@ review pane:
 ```
 
 When every review workspace on the machine is busy, it reports the queue
-position instead of failing — the task stays in Review, marked *pending-load*,
+position instead of failing. The task stays in Review, marked *pending-load*,
 and loads automatically when a slot frees:
 
 ```text
@@ -120,7 +120,7 @@ Add a `role: review` slot to your `workspaces:` (1–2 per machine), run
 ## Examples
 
 Load a task onto a review workspace on the same machine its dev workspace ran
-on (the most common form — the sidebar's "Review" action and the orchestrator's
+on (the most common form: the sidebar's "Review" action and the orchestrator's
 auto-load run exactly this):
 
 ```bash

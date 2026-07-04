@@ -7,7 +7,7 @@ summary: Field-by-field reference for the hub-wide files — ~/.shelbi/config.ya
 Two files under `~/.shelbi/` hold hub-wide settings that apply across
 every project on your machine, independent of any single project's
 [config mode](/docs/concepts/config-modes): `config.yaml` (UI
-preferences) and `keys.yaml` (keybindings). Both are optional — absent or
+preferences) and `keys.yaml` (keybindings). Both are optional: absent or
 partial files fall back to built-in defaults, never an error.
 
 <Callout type="note" title="Home resolution">
@@ -22,8 +22,8 @@ partial files fall back to built-in defaults, never an error.
 
 Per-user UI preferences. Distinct from `shelbi.yaml` (the per-project
 `last_launched` index) so a future `shelbi config reset` can wipe UI
-tweaks without touching hub bookkeeping. A missing file — or one that
-omits a block — resolves to defaults.
+tweaks without touching hub bookkeeping. A missing file, or one that
+omits a block, resolves to defaults.
 
 **Path:** `~/.shelbi/config.yaml`
 
@@ -53,7 +53,7 @@ The accepted values for the Zen toggle chord:
 
 Overrides for the TUI keybindings. Built-in chords apply out of the box;
 this file layers on top of them, either globally (`defaults`) or per
-project (`projects.<name>`). Parse errors never fail the load — a
+project (`projects.<name>`). Parse errors never fail the load. A
 mistyped entry is skipped and that action keeps its built-in chord.
 
 **Path:** `~/.shelbi/keys.yaml`
