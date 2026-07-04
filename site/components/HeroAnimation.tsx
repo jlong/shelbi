@@ -83,7 +83,7 @@ function card(t: Task, withWorker = false): Card {
 // promoted → in progress), landing among these residents on dispatch.
 //
 // Kept deliberately short so the tallest column stays under the pinned
-// `minBodyRows` (26): each card is 3 grid rows, so the deepest beat — a 6-card
+// `minBodyRows` (32): each card is 3 grid rows, so the deepest beat — a 6-card
 // backlog + 2 residents = 8 cards → 24 rows — still fits without resizing the
 // fixed frame.
 const RESIDENT_DONE: Card[] = [
@@ -154,19 +154,21 @@ function machinesFor(working: Record<string, string>): Machine[] {
 
 // The scenario every beat spreads from — a fresh `my-project` project on the
 // Chat view. `minBodyRows` pins the pane height so the frame never resizes as
-// columns fill/empty or panes swap. It's set well above the tallest natural
-// content (a 6-card backlog is only 18 rows: header + 6×2 card rows + 5 gaps)
-// to hold the window at a ~1.6 width:height aspect ratio: the board pane is a
-// fixed 111 cells wide (1 + 5×22) which, at the 13px / 0.6em-advance mono font,
-// is ~866px; a 1.6:1 window is ~541px tall; minus the 28px title bar that
-// leaves ~30 body rows, and the body wraps `minBodyRows` with 4 chrome rows
-// (title + blank + blank + footer), so 30 − 4 = 26. Shorter beats pad with
-// blank rows; taller content clips/scrolls within this fixed area.
+// columns fill/empty or panes swap. It's tuned to hold the framed window at a
+// fixed 640px tall: the window is a 28px title bar over the terminal-body
+// `<pre>`, whose rows render at the 17px line-height in `PRE_STYLE`. The body
+// wraps `minBodyRows` with 4 chrome rows (title + blank + blank + footer), so
+// the pre is `minBodyRows + 4` rows; at 32 that's 36 × 17px = 612px, and
+// 28 + 612 = 640px exactly. That sits well above the tallest natural content (a
+// 6-card backlog + 2 residents = 8 cards → 24 rows), so shorter beats pad with
+// blank rows and taller content clips/scrolls within this fixed area — and the
+// extra headroom over the old 26-row pin gives the Chat and worker transcripts
+// more room to read as fuller, established sessions.
 const BASE: AppState = {
   terminalTitle: "jlong@hub — my-project",
   project: "my-project",
   activeView: "chat",
-  minBodyRows: 26,
+  minBodyRows: 32,
   columns: cols({}),
   machines: machinesFor(RESIDENT_WORKING),
   readyReview: [],
@@ -181,12 +183,23 @@ function userLine(text: string): ChatLine {
   return { kind: "user", text }
 }
 
-// The prior exchange already scrolled into the conversation at beat 1: the user
-// and Claude just wrote `dashboard.md` together and Claude finished, so the new
-// request (beat 2) reads as the natural next step. Kept short so the input box +
-// footer still fit under it in the fixed frame.
+// The prior exchange already scrolled into the conversation at beat 1: an
+// earlier back-and-forth (yesterday's API-cleanup work landing on main) rolls
+// into the user and Claude writing `dashboard.md` together, so the session
+// reads as established and ongoing rather than a fresh start, and the new
+// request (beat 2) reads as the natural next step. The conversation is
+// bottom-anchored in the fixed frame, so the oldest lines clip off the top as
+// later beats stream in more output — the newest turns always stay by the input
+// box.
 const PRIOR_EXCHANGE: ChatLine[] = [
-  userLine("Let's plan an analytics dashboard for the app."),
+  userLine("Morning. Where did the API cleanup land yesterday?"),
+  { kind: "blank" },
+  {
+    kind: "prose",
+    text: "Both tasks cleared review overnight — the rate-limit and the search pagination work merged to main. The board's clear.",
+  },
+  { kind: "blank" },
+  userLine("Nice. Let's plan an analytics dashboard for the app."),
   { kind: "blank" },
   { kind: "prose", text: "On it. I'll draft dashboard.md — metrics, charts, filters, export." },
   { kind: "blank" },
@@ -225,11 +238,21 @@ function streamUpTo(n: number): ChatLine[] {
 }
 
 // The focused worker (alpha) doing believable work on "Metrics API endpoint":
-// a read, an edit with a diffstat, then a passing test run + the session footer.
+// it picks up its dispatched task, reads the spec + the route it's extending,
+// implements the endpoint and its tests (each edit with a diffstat), then runs
+// the suite + lands the session footer. This is the newest content the eye
+// lands on at the end of the loop, so it's the fullest transcript in the story —
+// several steps of in-progress work stacked above the bottom-pinned prompt.
 const WORKER_BASE: ChatLine[] = [
+  { kind: "user", text: "Implement the metrics API endpoint from dashboard.md." },
+  { kind: "blank" },
+  { kind: "prose", text: "Reading the spec and the route I'll extend." },
+  { kind: "tool", name: "Read", args: "dashboard.md" },
   { kind: "tool", name: "Read", args: "api/metrics.ts" },
   { kind: "tool", name: "Edit", args: "api/metrics.ts" },
   { kind: "prose", text: "+38 -4  ·  Added GET /api/metrics with range params." },
+  { kind: "tool", name: "Edit", args: "api/metrics.test.ts" },
+  { kind: "prose", text: "+24 -0  ·  Covered the range params and the empty-range case." },
   { kind: "tool", name: "Bash", args: "npm test -- metrics" },
 ]
 const WORKER_RUNNING: ChatLine[] = [
