@@ -38,8 +38,14 @@ import {
  * loop while the hero is scrolled off-screen. The frame is pinned to a fixed
  * width (5 columns) and height (`minBodyRows`) so it never resizes as the story
  * advances — shorter content is padded, taller content clips/scrolls — and the
- * loop-reset fade (`opacity`) targets only the pane contents, leaving the window
- * chrome static.
+ * loop-reset fade (`opacity`) targets only the panes' text layer: the glyphs
+ * cross-fade while the terminal body background and window chrome stay fully
+ * opaque.
+ *
+ * The board reads as an established project, not an empty demo: a filled DONE
+ * column of prior work and a couple of already-running IN PROGRESS items sit as
+ * a static backdrop (see `RESIDENT_*`), and the six dashboard tasks animate
+ * through it as the stars of the story.
  */
 
 // ── Story dataset ─────────────────────────────────────────────────────
@@ -66,14 +72,62 @@ function card(t: Task, withWorker = false): Card {
     : { title: t.title, id: t.id }
 }
 
-/** The five-column board, with only the columns this story uses populated. */
+// ── Resident backdrop ─────────────────────────────────────────────────
+// The board isn't an empty demo — it's an established project with a history.
+// These "resident" cards are present in every board beat and never animate: a
+// filled DONE column of prior work, a couple of already-running IN PROGRESS
+// items (workers charlie on hub + golf on devbox, distinct from the dashboard
+// dispatch so the column is never empty and the sidebar always shows live
+// workers), and a few lived-in BACKLOG/TO DO items. The six dashboard TASKS are
+// still the stars — they animate through this backdrop (created → backlog →
+// promoted → in progress), landing among these residents on dispatch.
+//
+// Kept deliberately short so the tallest column stays under the pinned
+// `minBodyRows` (26): each card is 3 grid rows, so the deepest beat — a 6-card
+// backlog + 2 residents = 8 cards → 24 rows — still fits without resizing the
+// fixed frame.
+const RESIDENT_DONE: Card[] = [
+  { title: "Migrate to PG 16", id: "t-012" },
+  { title: "Ship dark mode", id: "t-013" },
+  { title: "Wire up OAuth", id: "t-034" },
+  { title: "Add audit logging", id: "t-046" },
+  { title: "Redis cache /profile", id: "t-027" },
+  { title: "Fix flaky CI tests", id: "t-048" },
+]
+const RESIDENT_PROGRESS: Card[] = [
+  { title: "Trim vendor bundle", id: "t-022", workspace: "charlie" },
+  { title: "Backfill order index", id: "t-017", workspace: "golf" },
+]
+const RESIDENT_BACKLOG: Card[] = [
+  { title: "Rework onboarding UX", id: "t-004" },
+  { title: "Audit OSS licenses", id: "t-005" },
+]
+const RESIDENT_TODO: Card[] = [{ title: "Add API ratelimit", id: "t-007" }]
+
+// The resident IN PROGRESS workers, always busy in the sidebar so the two
+// machines read as an active system before the dashboard tasks dispatch.
+const RESIDENT_WORKING: Record<string, string> = {
+  charlie: "Developer",
+  golf: "Developer",
+}
+
+/**
+ * The five-column board. The story's animated cards (`opts`) render on top of
+ * the resident backdrop in each column, so the board always looks lived-in: a
+ * filled DONE column, an IN PROGRESS column that's never empty, and a couple of
+ * standing BACKLOG/TO DO items behind the dashboard tasks.
+ */
 function cols(opts: { backlog?: Card[]; todo?: Card[]; progress?: Card[] }): Column[] {
   return [
-    { label: "BACKLOG", category: "gray", cards: opts.backlog ?? [] },
-    { label: "TO DO", category: "blue", cards: opts.todo ?? [] },
-    { label: "IN PROGRESS", category: "yellow", cards: opts.progress ?? [] },
+    { label: "BACKLOG", category: "gray", cards: [...(opts.backlog ?? []), ...RESIDENT_BACKLOG] },
+    { label: "TO DO", category: "blue", cards: [...(opts.todo ?? []), ...RESIDENT_TODO] },
+    {
+      label: "IN PROGRESS",
+      category: "yellow",
+      cards: [...(opts.progress ?? []), ...RESIDENT_PROGRESS],
+    },
     { label: "REVIEW", category: "magenta", cards: [] },
-    { label: "DONE", category: "green", cards: [] },
+    { label: "DONE", category: "green", cards: RESIDENT_DONE },
   ]
 }
 
@@ -114,7 +168,7 @@ const BASE: AppState = {
   activeView: "chat",
   minBodyRows: 26,
   columns: cols({}),
-  machines: machinesFor({}),
+  machines: machinesFor(RESIDENT_WORKING),
   readyReview: [],
   queuedReview: [],
 }
@@ -204,6 +258,7 @@ const DISPATCHED: Partial<AppState> = {
     progress: TASKS.slice(0, 4).map((t) => card(t, true)),
   }),
   machines: machinesFor({
+    ...RESIDENT_WORKING,
     alpha: "Developer",
     bravo: "Developer",
     echo: "Developer",
@@ -292,7 +347,7 @@ function buildKeyframes(): Keyframe[] {
             todo: TASKS.slice(n).map((t) => card(t)),
             progress: TASKS.slice(0, n).map((t) => card(t, true)),
           }),
-          machines: machinesFor({ ...working }),
+          machines: machinesFor({ ...RESIDENT_WORKING, ...working }),
         },
         750,
       ),
