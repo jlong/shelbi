@@ -12,7 +12,7 @@ tasks. All of that lives in a single YAML file at
 `~/.shelbi/projects/<name>.yaml` in the default **global mode**. To let
 teammates share your workflows and agent prompts across clones instead,
 [in-repo mode](/docs/concepts/config-modes) commits the shared half of the
-config to the repo itself — the wizard offers the choice during setup.
+config to the repo itself. The wizard offers the choice during setup.
 
 This page walks through global-mode setup. In-repo setup follows the same
 prompts; only the shared file's location differs, and the wizard makes that
@@ -45,7 +45,7 @@ The first thing you see is the block-character banner:
 an open-source agent orchestrator for the terminal
 ```
 
-The wizard walks one project through setup. It's idempotent — re-running
+The wizard walks one project through setup. It's idempotent. Re-running
 skips anything already on disk.
 
 ## Project setup
@@ -84,7 +84,7 @@ tmux session name (`shelbi-<name>`), and on the CLI (`shelbi -p <name>`).
 
 The **hub** is the machine you're sitting at. It owns the tmux session,
 runs the orchestrator pane, and holds any local workspaces. The work
-directory is where local worktrees get created — usually the repo path.
+directory is where local worktrees get created, usually the repo path.
 
 </Step>
 <Step title="Remote machines (optional)">
@@ -102,7 +102,7 @@ prompt, with `tmux` and your agent CLI installed. Shelbi prefixes every
 command with `ssh <host> --` and runs the workspaces there in tmux panes
 you can attach to from the hub.
 
-The SSH host defaults to the machine name — convenient if your
+The SSH host defaults to the machine name, convenient if your
 `~/.ssh/config` already aliases hosts (so `devbox` resolves to a full
 host). The work directory is the path on that *remote* where worktrees
 live.
@@ -135,7 +135,7 @@ You can add more machines later by editing the YAML directly and running
 | Greek letters | alpha, beta, gamma, delta, epsilon, zeta, eta, … |
 | Toy Story | woody, buzz, jessie, rex, hamm, slinky, bullseye, … |
 
-Workspaces are laid out machine by machine — the first N names go to the
+Workspaces are laid out machine by machine: the first N names go to the
 hub, the next N to the first remote, and so on.
 
 - **Orchestrator runner** — the agent CLI that runs in window 1 and
@@ -146,7 +146,7 @@ hub, the next N to the first remote, and so on.
 
 The wizard writes the YAML, creates the per-workspace directories under
 `~/.shelbi/workspaces/<name>/`, and launches the TUI. Project resolution
-is by reverse-lookup against the registered YAMLs — no marker file is
+is by reverse-lookup against the registered YAMLs. No marker file is
 dropped in your repo.
 
 The dashboard opens on an empty board: your workspaces idle in the
@@ -225,16 +225,16 @@ useful:
 
   The cadence is **adaptive**: it holds at the standard `interval`
   (default `3m`) while there's supervisable work in flight, then backs
-  off exponentially — doubling each idle tick, capped at `max` (default
-  `60m`) — once the board goes quiescent, and snaps back to `interval`
-  on the next real event. See the
+  off exponentially once the board goes quiescent, doubling each idle
+  tick up to `max` (default `60m`), and snaps back to `interval` on the
+  next real event. See the
   [`heartbeat` field reference](/docs/configuration/project#heartbeat).
 
-  Accepts a bare duration string with an explicit unit suffix — `45s`,
-  `3m`, `1h` (sets `interval`, keeps the default `max`) — a map that
-  sets both bounds, or the literal `"off"` (quote it; YAML otherwise
+  Accepts a bare duration string with an explicit unit suffix like `45s`,
+  `3m`, or `1h` (this sets `interval` and keeps the default `max`), a map
+  that sets both bounds, or the literal `"off"` (quote it; YAML otherwise
   reads bare `off` as the boolean `false`). Bare integers like
-  `heartbeat: 180` are rejected — there's no implicit unit, on purpose.
+  `heartbeat: 180` are rejected: there's no implicit unit, on purpose.
 
   ```yaml
   heartbeat: 3m                     # standard interval, default 60m cap
@@ -246,25 +246,25 @@ useful:
   <Callout type="warning" title="Quote the off value">
 
   Write `heartbeat: "off"` with the quotes. Bare `heartbeat: off` is read
-  by YAML as the boolean `false`, not the string `off` — a silent way to
+  by YAML as the boolean `false`, not the string `off`, a silent way to
   get behavior you didn't ask for.
 
   </Callout>
 
   Emission also resets against everything else in the log: if a real
-  line landed since the last heartbeat — a workspace transition, a task
-  move — that event already woke the orchestrator, so the next tick
+  line landed since the last heartbeat (a workspace transition, a task
+  move), that event already woke the orchestrator, so the next tick
   skips its emission and resets the cadence to the standard `interval`
   rather than padding an already-active feed.
 
-  Heartbeats are intentionally absent from the TUI activity feed —
-  they'd produce one "nothing happened" row every few minutes. Use
+  Heartbeats are intentionally absent from the TUI activity feed.
+  They'd produce one "nothing happened" row every few minutes. Use
   `shelbi events tail` if you want to see them.
 
 ### Naming workspaces by hand
 
-The wizard's presets cover most cases, but the names are just strings —
-nothing about `alpha` or `woody` is special. If you'd rather use roles,
+The wizard's presets cover most cases, but the names are just strings.
+Nothing about `alpha` or `woody` is special. If you'd rather use roles,
 project codes, or your team's nicknames, edit `workspaces[]` directly:
 
 ```yaml
@@ -280,7 +280,7 @@ the project.
 <Callout type="note" title="Renaming leaves the old worktree behind">
 
 Renaming a workspace means the next dispatch creates a *new* worktree
-directory under `~/.shelbi/workspaces/<name>/` — the old one isn't deleted
+directory under `~/.shelbi/workspaces/<name>/`. The old one isn't deleted
 automatically. Remove the stale directory by hand if you want the disk back.
 
 </Callout>
@@ -303,7 +303,7 @@ memory-hungry tasks.
 
 ## Reload after editing
 
-Edit the YAML by hand any time — add a machine, rename a workspace, swap
+Edit the YAML by hand any time: add a machine, rename a workspace, swap
 runners. Then refresh the live dashboard:
 
 ```bash
@@ -319,7 +319,7 @@ You have a project on disk and a workspace pool waiting on work. Time to
 [run your first task](/docs/guides/getting-started/first-task).
 
 Want teammates to clone this project's workflows, agent prompts, and
-runner settings? See [Config modes](/docs/concepts/config-modes) — the
+runner settings? See [Config modes](/docs/concepts/config-modes). The
 `shelbi project migrate-to-in-repo` command splits the shared half of
 this file into `<repo>/.shelbi/project.yaml` (committed) and moves
 `workflows/`, `agents/`, and the workspace-settings template into the

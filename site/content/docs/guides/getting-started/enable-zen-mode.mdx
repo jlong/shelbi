@@ -7,8 +7,8 @@ summary: Add local checks, flip the toggle, and watch the orchestrator take over
 By default the orchestrator is the scheduler and you own both ends: you
 decide what gets promoted out of backlog, and you accept what comes back
 from review. **Zen Mode flips that.** The orchestrator takes the lead on
-both ends — promoting backlog items it judges safe to run and landing
-finished branches that clear a project-defined confidence bar — leaving
+both ends, promoting backlog items it judges safe to run and landing
+finished branches that clear a project-defined confidence bar. It leaves
 you in the loop only for the cases it can't judge.
 
 This page is the practical on-ramp: configure the bar, flip the
@@ -26,9 +26,9 @@ opens a PR.
 <Steps>
 <Step title="Add a zen block to the project YAML">
 
-Open the project's shared YAML — `~/.shelbi/projects/<name>.yaml` in
+Open the project's shared YAML (`~/.shelbi/projects/<name>.yaml` in
 [global mode](/docs/concepts/config-modes) or `<repo>/.shelbi/project.yaml`
-in in-repo mode — and add a `zen` block:
+in in-repo mode) and add a `zen` block:
 
 ```yaml
 # ~/.shelbi/projects/<name>.yaml (global mode)
@@ -112,7 +112,7 @@ Three ways:
 
 You'll know it's on by the **ZEN ON** pill anchored to the bottom of
 the workspaces column in the sidebar. That pill is the at-a-glance "the
-agent is in lead mode" signal — if it's not there, Zen is off or
+agent is in lead mode" signal. If it's not there, Zen is off or
 paused.
 
 ```
@@ -147,7 +147,7 @@ ZEN promoted tighten-rate-limit-error-copy
      (category: routine task shape you accept without changes)
 ```
 
-The dispatch and run that follow look exactly like the manual loop —
+The dispatch and run that follow look exactly like the manual loop:
 the card moves to `in_progress`, the workspace badge flips to `⏵`, and
 the agent works the prompt.
 
@@ -169,7 +169,7 @@ hits the events log:
 2026-06-22T14:31:08+00:00 task=tighten-rate-limit-error-copy review -> done reason=orchestrator:zen-merge sha=abc1234
 ```
 
-The card lands in **Done** and the workspace frees up — all without a
+The card lands in **Done** and the workspace frees up, all without a
 human stop:
 
 <AppMockup
@@ -200,8 +200,8 @@ human stop:
   review={[]}
 />
 
-Fail any of them — a flaky test, a too-large diff, a touch on a
-danger path, a red CI — and the card stops in `review` for you, with
+Fail any of them (a flaky test, a too-large diff, a touch on a
+danger path, a red CI) and the card stops in `review` for you, with
 a tagged reason line that tells you why:
 
 | Reason | Meaning |
@@ -264,7 +264,7 @@ this out in its first reply so you don't miss it. Re-enable with
 
 ## Tune the bar over time
 
-The values you set in `project.yaml` are the easy half — the
+The values you set in `project.yaml` are the easy half. The
 **judgment categories** that decide *which* backlog items the
 orchestrator considers promoting live in its prompt, not the YAML.
 That prompt is a file you own:
@@ -274,8 +274,8 @@ That prompt is a file you own:
 ```
 
 Edit it directly, or run `shelbi agent edit orchestrator`. You can
-tune the auto-promote logic for your project — what counts as
-"routine," when to refuse, how to phrase a decline — by editing
+tune the auto-promote logic for your project (what counts as
+"routine," when to refuse, how to phrase a decline) by editing
 prose, not code. The next page,
 [author a custom workflow](/docs/guides/getting-started/custom-workflow),
 walks through doing it end-to-end.
@@ -294,7 +294,7 @@ In the meantime, the deep reference for everything Zen touches:
 
 You've handed the agent the lead on both ends of the loop and given
 it a confidence bar that matches this project. The last step is
-making the workflow itself yours — [author a custom Shelbi
+making the workflow itself yours: [author a custom Shelbi
 workflow](/docs/guides/getting-started/custom-workflow) to change routing
 rules, tune Zen's judgment, and adjust how the orchestrator reports
 back to you.

@@ -7,14 +7,14 @@ summary: Short-lived branches that merge to main fast, with no separate review c
 **Trunk-based development** keeps a single always-releasable trunk
 (`main`) and merges small, short-lived branches into it as fast as they go
 green. There's no long-lived integration branch and no drawn-out review
-column — work goes from *in progress* to *merged* the moment checks pass.
+column. Work goes from *in progress* to *merged* the moment checks pass.
 
 In Shelbi this is the [feature-branch model](/docs/guides/understanding-workflows/feature-branch)
 with the `Review` handoff collapsed: the `merge` action moves onto the
 `InProgress → Done` edge. Because
 [Zen Mode's confidence bar is action-based](/docs/guides/getting-started/workflows#what-fires-zen-modes-high-confidence-bar)
-— it gates *any* transition whose actions include `merge`, regardless of
-which statuses sit on either side — that collapsed edge trips exactly the
+(it gates *any* transition whose actions include `merge`, regardless of
+which statuses sit on either side), that collapsed edge trips exactly the
 same high-confidence probe the review-gated model does. Trunk-based is
 where Zen [auto-merge](/docs/concepts/zen-mode#the-high-confidence-bar)
 earns its keep: the whole point is to land green work without a manual
@@ -77,13 +77,13 @@ accept step.
 />
 
 Four columns, no `Review`. A task branch is cut off `main` at
-**In Progress** and squash-merged straight back into `main` at **Done** —
+**In Progress** and squash-merged straight back into `main` at **Done**,
 the moment checks pass and Zen clears the bar.
 
 ## The workflow
 
 Trunk-based reuses the shipped [status catalog](/docs/guides/getting-started/workflows#schema)
-(`workflows/statuses.yaml`) — it just leaves the `review` status out of the
+(`workflows/statuses.yaml`). It just leaves the `review` status out of the
 flow. Identity (`name`, `category`) stays in the catalog; the workflow
 references statuses by `id` and adds only `owner` and `agent:`:
 
@@ -124,7 +124,7 @@ zen:
 The single `in-progress → done` transition does the whole cycle: push the
 short branch, open a PR into `main`, squash-merge it, and delete the
 branch. There is no `handoff`-category status because there's no separate
-review stage — the [`zen.checks`](/docs/concepts/zen-mode) that run before
+review stage. The [`zen.checks`](/docs/concepts/zen-mode) that run before
 the merge bar *are* the gate.
 
 ## Orchestrator adjustments
@@ -151,8 +151,8 @@ releasable because nothing lands without a green probe.
 ```
 
 Keep branches short. If a card sits in `InProgress` long enough to drift
-from `main`, prefer restacking or re-cutting it over a big catch-up merge
-— that's the discipline trunk-based trades the review column for.
+from `main`, prefer restacking or re-cutting it over a big catch-up merge.
+That's the discipline trunk-based trades the review column for.
 
 ## See also
 
@@ -160,5 +160,5 @@ from `main`, prefer restacking or re-cutting it over a big catch-up merge
   version of the same branch-per-task shape.
 - [Zen Mode](/docs/concepts/zen-mode) — the confidence bar and the
   `zen.checks` that stand in for a review column here.
-- [Workflows: what fires the high-confidence bar](/docs/guides/getting-started/workflows#what-fires-zen-modes-high-confidence-bar)
-  — why a collapsed `InProgress → Done` merge still trips the probe.
+- [Workflows: what fires the high-confidence bar](/docs/guides/getting-started/workflows#what-fires-zen-modes-high-confidence-bar):
+  why a collapsed `InProgress → Done` merge still trips the probe.

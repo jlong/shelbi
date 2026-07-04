@@ -5,7 +5,7 @@ summary: Scaffold an adversarial-review agent with shelbi agent new, understand 
 ---
 
 An [agent](/docs/concepts/agents) is a directory under your project's
-Shelbi config with, at minimum, an `instructions.md` — its system prompt.
+Shelbi config with, at minimum, an `instructions.md`: its system prompt.
 That's the whole contract. Authoring the Adversarial Review agent means
 scaffolding that directory and writing a prompt that makes the agent a
 genuine skeptic.
@@ -24,7 +24,7 @@ shelbi agent new adversarial-review
 This creates
 `~/.shelbi/projects/<project>/agents/adversarial-review/` with a starter
 `instructions.md` and an empty `skills/`. The starter prompt is a minimal
-role template meant to be replaced — see
+role template meant to be replaced. See
 [`shelbi agent new`](/docs/cli/agent#new). The name doubles as the
 identifier you'll reference from a workflow's `agent:` field, so it has to
 be lowercase kebab-case (`a-z`, `0-9`, `-`, `_`).
@@ -32,7 +32,7 @@ be lowercase kebab-case (`a-z`, `0-9`, `-`, `_`).
 </Step>
 <Step title="Understand what you're editing">
 
-`instructions.md` **is** the agent's system prompt — there's no wrapper or
+`instructions.md` **is** the agent's system prompt. There's no wrapper or
 config layer. Two other things share the launch-time prompt with it:
 
 - **`agents/_shared/preamble.md`** is prepended to *every* agent in the
@@ -40,13 +40,13 @@ config layer. Two other things share the launch-time prompt with it:
   there, so the rendered prompt the runner sees is the preamble followed by
   this agent's `instructions.md`.
 - **`skills/`** is an optional directory of agent-scoped skills the runner
-  loads when this agent is active — reach for it if the reviewer needs a
+  loads when this agent is active. Reach for it if the reviewer needs a
   repeatable procedure (say, a security checklist) rather than just a role.
 
 <Callout type="tip" title="Let the preamble carry shared context">
 
 Don't restate the repo structure, coding conventions, or how to run the
-tests in this agent's prompt — `_shared/preamble.md` is prepended to every
+tests in this agent's prompt. `_shared/preamble.md` is prepended to every
 agent for exactly that reason. Keep `instructions.md` focused on the *role*:
 what an adversarial reviewer is for and how it should behave. Duplicated
 context is just one more place to drift out of sync.
@@ -124,7 +124,7 @@ change holds up — what you checked — so the human reviewer can trust the
 pass. If anything is a `blocker`, say plainly that the change is not ready.
 ```
 
-Tune it to your stack — swap the `.rs:120` example for your language, add a
+Tune it to your stack: swap the `.rs:120` example for your language, add a
 line about a framework you use, point the write-up at wherever your team
 keeps review notes. The shape is what matters: a reviewer that falsifies
 first and earns its sign-off.
@@ -141,7 +141,7 @@ shelbi agent list
 ```
 
 `adversarial-review` shows up in the table with no statuses referencing it
-yet — that's the next part. `shelbi agent show adversarial-review` prints
+yet. That's the next part. `shelbi agent show adversarial-review` prints
 the `instructions.md` you just wrote (without the shared preamble, which is
 composed in at launch time).
 

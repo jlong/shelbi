@@ -6,7 +6,7 @@ summary: Edit the orchestrator agent's instructions to encode routing rules, pro
 
 The orchestrator is your runner (`claude`, `codex`, …) booted with a
 system prompt that explains the board, the workspaces, and the loop. That
-prompt is the **workflow** — the contract for who initiates what, how
+prompt is the **workflow**: the contract for who initiates what, how
 dispatch is decided, and how the agent reports back. Shelbi ships a
 sensible default and seeds it into every project as an editable file.
 
@@ -19,9 +19,9 @@ this is the practical version.
 
 The orchestrator is a [project-local agent with shipped defaults](/docs/concepts/agents).
 Its prompt is composed from two files, both under the project's `agents/`
-directory — `~/.shelbi/projects/<name>/agents/` in the default
-[global mode](/docs/concepts/config-modes) or `<repo>/.shelbi/agents/`
-in in-repo mode:
+directory (`~/.shelbi/projects/<name>/agents/` in the default
+[global mode](/docs/concepts/config-modes), or `<repo>/.shelbi/agents/`
+in in-repo mode):
 
 - **`agents/orchestrator/instructions.md`** — the orchestrator-specific
   system prompt. Seeded with the shipped default on first load; your
@@ -33,18 +33,18 @@ in in-repo mode:
 
 On every `shelbi reload` (and at session start) Shelbi composes
 `preamble.md + instructions.md` and writes the rendered output to
-`~/.shelbi/projects/<name>/CLAUDE.md` —
+`~/.shelbi/projects/<name>/CLAUDE.md`,
 which is state, so it lives under `~/.shelbi/` in both modes. The
 orchestrator launches in that directory and auto-loads the rendered
-prompt — no flags, no env vars, no MCP.
+prompt. No flags, no env vars, no MCP.
 
 <Callout type="warning" title="Don't hand-edit CLAUDE.md">
 
 The legacy `ORCHESTRATOR.md` override file is deprecated. If you have content
 there from an earlier version, move project-wide bits into
 `_shared/preamble.md` and orchestrator-specific bits into
-`agents/orchestrator/instructions.md`. `CLAUDE.md` is now a rendered artifact
-— every `shelbi reload` overwrites it, so hand-edits are silently lost.
+`agents/orchestrator/instructions.md`. `CLAUDE.md` is now a rendered artifact.
+Every `shelbi reload` overwrites it, so hand-edits are silently lost.
 
 </Callout>
 
@@ -62,7 +62,7 @@ shelbi agent edit orchestrator
 That opens `agents/orchestrator/instructions.md` in `$EDITOR` (and
 materializes the shipped default first if you haven't touched it
 yet). The file is plain markdown. Read it top to bottom before changing
-anything — the comments explain why each section exists.
+anything. The comments explain why each section exists.
 
 ## What to keep when you fork
 
@@ -76,13 +76,13 @@ rest of the system. Edit them carefully, but don't delete:
 - **The reaction rules tied to specific reason strings.** The
   orchestrator dispatches on `user:*` promotions, rolls workspaces on
   `worker:review-marker`, and wakes on `heartbeat` lines. The rest
-  of Shelbi emits those strings — your prompt has to recognize them.
+  of Shelbi emits those strings. Your prompt has to recognize them.
 - **The "you are the scheduler" framing.** Without it, the agent
   reverts to chatbot mode and waits to be told what to do. The
   whole loop falls apart.
 - **The Zen-Mode section** (if you intend to use Zen). Replace the
   judgment categories and the merge conditions if they don't fit
-  your project, but keep the section structure — the wrapper around
+  your project, but keep the section structure. The wrapper around
   `shelbi zen probe` reads the same primitives regardless of the
   prose around them.
 
@@ -98,8 +98,8 @@ patterns worth stealing.
 
 The default scheduler picks the first free workspace in YAML
 declaration order, honoring `prefers_machine` hints. If your project
-has natural routing — infra tasks always to a beefy box, UI tasks
-always somewhere with the design system pre-cached — bake it into
+has natural routing (infra tasks always to a beefy box, UI tasks
+always somewhere with the design system pre-cached), bake it into
 the workflow:
 
 ```markdown
@@ -134,7 +134,7 @@ free-workspace scan. No code change.
 The bundled default's judgment categories are deliberately
 conservative: promote if you've routinely accepted this shape, or
 the user just raised the issue, or it's part of a larger body of
-work they kicked off. That's a sensible starting bar — but every
+work they kicked off. That's a sensible starting bar, but every
 project has its own "always safe" pattern. Encode it:
 
 ```markdown
@@ -166,7 +166,7 @@ sure — want me to?").
 (Inherit from the default — see the bundled template.)
 ```
 
-The Rust side (`shelbi zen scan`) never inspects this prose — it
+The Rust side (`shelbi zen scan`) never inspects this prose. It
 just emits the mechanically-eligible candidates. Your override
 decides which of those actually get promoted.
 
@@ -174,7 +174,7 @@ decides which of those actually get promoted.
 
 The default prompt errs toward terse one-line status updates ("✓
 dispatched to delta. branch: shelbi/fix-login"). If you'd rather
-get a richer rundown — or a quieter one — say so:
+get a richer rundown (or a quieter one), say so:
 
 ```markdown
 ## Reporting style
@@ -201,8 +201,8 @@ unless they take action. Silence is fine when the board is quiet.
 ```
 
 This is the easiest place to start customizing. The behavior the
-orchestrator gives you is downstream of the prose you write here —
-ask for the report you actually want.
+orchestrator gives you is downstream of the prose you write here.
+Ask for the report you actually want.
 
 ## Apply the edits
 
@@ -237,12 +237,12 @@ ask for the report you actually want.
 </Steps>
 
 The composed prompt (preamble + instructions) is written to
-`~/.shelbi/projects/<name>/CLAUDE.md` on every `shelbi reload` — read
+`~/.shelbi/projects/<name>/CLAUDE.md` on every `shelbi reload`. Read
 that file to see exactly what the runner loads.
 
 `shelbi reload` respawns the sidebar, Tasks, and Review panes against the
 new config without restarting workspaces or losing chat history. It does
-recycle the orchestrator pane, so its conversation context resets — the
+recycle the orchestrator pane, so its conversation context resets: the
 cost of changing the system prompt mid-session. Heads up before the next
 turn.
 
@@ -252,8 +252,8 @@ The whole point of putting the workflow in markdown is that you can
 keep tightening it. Two practical habits:
 
 - **Treat surprises as prompt bugs.** When the orchestrator does
-  something you didn't expect — promotes a card you'd have held,
-  reports in a style you find noisy, picks the wrong workspace — open
+  something you didn't expect (promotes a card you'd have held,
+  reports in a style you find noisy, picks the wrong workspace), open
   `agents/orchestrator/instructions.md` and add the rule that would
   have produced the outcome you wanted. Reload. Try again.
 - **Version-control the prompt.** Check `agents/orchestrator/` and
@@ -263,7 +263,7 @@ keep tightening it. Two practical habits:
   machine moves and reinstalls.
 
 What you should **not** do is try to encode policy in code. The
-mechanical layer (the Rust CLI) is intentionally generous —
+mechanical layer (the Rust CLI) is intentionally generous.
 `shelbi zen scan` will hand the orchestrator everything that's
 mechanically safe, and your prompt picks which of those to actually
 run. That separation is what lets you raise or lower the bar by

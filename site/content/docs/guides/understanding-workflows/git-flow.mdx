@@ -4,8 +4,8 @@ order: 32
 summary: A long-lived develop integration branch with feature, release, and hotfix branches. Model it as two Shelbi Workflows — features land on develop, releases ship develop to main.
 ---
 
-**Git-flow** keeps two long-lived branches — `main` (released) and
-`develop` (integration) — and cuts three kinds of short branches off
+**Git-flow** keeps two long-lived branches, `main` (released) and
+`develop` (integration), and cuts three kinds of short branches off
 them: `feature/*` off `develop`, `release/*` off `develop` toward `main`,
 and `hotfix/*` off `main`. It trades the simplicity of trunk-based for an
 explicit staging branch where work accumulates before a release.
@@ -85,7 +85,7 @@ their base.
 />
 
 Every card on the `feature` workflow cuts its branch off `develop` and
-squash-merges back into `develop` — the **On Develop** column is "landed
+squash-merges back into `develop`. The **On Develop** column is "landed
 on the integration branch," not "released." Shipping to `main` is a
 separate `release` task.
 
@@ -94,9 +94,9 @@ separate `release` task.
 Status identity lives once in the project's
 [status catalog](/docs/guides/getting-started/workflows#schema),
 `workflows/statuses.yaml`. Git-flow adds one status the shipped defaults
-don't have — `on-develop`, the done-category landing for feature work
-that's merged into `develop` but not yet released — plus `staging` and
-`released` for the release workflow below. Declare them (`id` + `name` +
+don't have: `on-develop`, the done-category landing for feature work
+that's merged into `develop` but not yet released. It also adds `staging`
+and `released` for the release workflow below. Declare them (`id` + `name` +
 `category`) in the catalog first, then reference them by `id`:
 
 ```yaml
@@ -149,7 +149,7 @@ transitions:
     actions: [close_pr, delete_branch]
 ```
 
-Setting `git.base_branch: develop` is the whole trick — branches are cut
+Setting `git.base_branch: develop` is the whole trick: branches are cut
 from `develop` and the `open_pr` action targets `develop` because no
 transition overrides it with a [`target:`](/docs/guides/getting-started/workflows#per-transition-target).
 
@@ -195,7 +195,7 @@ branch: develop                        # operate on develop as-is; don't cut a b
 ```
 
 Note `merge_strategy: merge` (not `squash`) and the absence of
-`delete_branch` — `develop` is long-lived, so the release preserves its
+`delete_branch`: `develop` is long-lived, so the release preserves its
 history and never deletes it.
 
 ## Orchestrator adjustments
@@ -219,7 +219,7 @@ the orchestrator prompt (see
 ```
 
 The develop-back-merge after a hotfix is the one bit of bookkeeping
-git-flow needs that a single workflow can't express — surface it as a
+git-flow needs that a single workflow can't express. Surface it as a
 follow-up task rather than trying to encode it as a transition.
 
 ## See also
