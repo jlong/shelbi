@@ -180,6 +180,145 @@ pub fn clear_review_marker(host: &Host, marker: &Path) -> Result<()> {
     Ok(())
 }
 
+/// The agent-written **transition** marker for a workspace:
+/// `<worktree>/.claude/shelbi-transition`.
+///
+/// Where [`workspace_review_marker`] is the forward-only "I'm done, move me to
+/// review" handoff, this marker lets an agent request an *arbitrary* status
+/// transition for its own task — including a **backward** bounce. A reviewer /
+/// gate agent (e.g. an Adversarial Review or Security Review agent) that finds
+/// problems writes this marker to send the task back to an active status; the
+/// hub poller validates the requested edge against the task's workflow
+/// `transitions` and, if allowed, applies the move (see
+/// `shelbi_tui::poller::maybe_apply_transition`).
+///
+/// ## Format
+///
+/// Two lines of plain UTF-8 text:
+///
+/// ```text
+/// <task-id>
+/// <target-status>
+/// ```
+///
+/// - **Line 1** is the task id the agent is working — it must be the
+///   workspace's own currently-assigned task or the poller treats the marker
+///   as stale/foreign and clears it without moving anything.
+/// - **Line 2** is either a **target status id** (one of the workflow's
+///   declared `statuses[].id`, e.g. `in-progress`) — the primitive — or a
+///   short **verb** as sugar: `reject` / `bounce`, which the poller resolves
+///   to the workflow's designated active (`active`-category) status. Trailing
+///   blank lines / surrounding whitespace are ignored.
+///
+/// Any agent can write this file directly — workspaces have no `shelbi` binary,
+/// so like the review-ready marker it is a plain file an agent's
+/// `instructions.md` can teach it to write. To be torn-write safe, write to a
+/// sibling temp path and atomically `mv` it into place, exactly as the
+/// review-ready marker prompt does:
+///
+/// ```sh
+/// printf '%s\n%s\n' <task-id> <target-status> \
+///   > .claude/shelbi-transition.tmp && mv .claude/shelbi-transition.tmp .claude/shelbi-transition
+/// ```
+///
+/// It lives under `.claude/` for the same reason as the other markers: that
+/// directory is shelbi's gitignored deploy footprint, so the marker never
+/// dirties the worktree between tasks and never trips a clean-worktree check.
+pub fn workspace_transition_marker(machine: &Machine, workspace: &WorkspaceSpec) -> PathBuf {
+    workspace_worktree(machine, workspace)
+        .join(".claude")
+        .join("shelbi-transition")
+}
+
+/// A parsed transition request from the [`workspace_transition_marker`]: the
+/// task id the agent is acting on and the raw target it wrote (a status id or a
+/// verb like `reject` — resolution against the workflow happens poll-side, in
+/// `decide_transition`, since it needs the loaded workflow).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TransitionRequest {
+    /// Task id from line 1 — validated against [`validate_task_id`].
+    pub task_id: String,
+    /// Raw target token from line 2 — a status id or a verb (`reject`/`bounce`).
+    /// Validated only for shape here (a conservative id charset); its meaning
+    /// is resolved against the workflow by the poller.
+    pub target: String,
+}
+
+/// Read the transition marker, returning the [`TransitionRequest`] the workspace
+/// wrote or `None` if the marker is absent or empty. Mirrors
+/// [`read_review_marker`]: routes `cat` through `shelbi-ssh` (a no-op for
+/// [`Host::Local`]) and validates the body before returning it.
+///
+/// Two validations gate the return, and either failing surfaces as an `Err`
+/// (which the poller logs and does NOT clear on — the signal survives to the
+/// next tick, matching the review marker's torn-write handling) rather than
+/// driving a board move off garbage:
+///
+/// - **Line 1** (task id) must pass [`validate_task_id`] — the same allowlist
+///   every task id passes everywhere else. Rejects a torn write (a half-flushed
+///   id) and a hostile body.
+/// - **Line 2** (target) must be a non-empty conservative id token
+///   (alphanumeric plus `-` / `_`). The target is only ever compared against
+///   workflow status ids and used to look up a column — never shell-interpolated
+///   — but validating its shape keeps a stray program's junk out of the log and
+///   the decision path.
+///
+/// Only the first two non-empty lines are consulted, so a multi-line body can't
+/// tear across downstream log records.
+pub fn read_transition_marker(host: &Host, marker: &Path) -> Result<Option<TransitionRequest>> {
+    let path = marker.to_string_lossy().into_owned();
+    let out = shelbi_ssh::run(host, ["cat", path.as_str()]).map_err(Error::Io)?;
+    if !out.status.success() {
+        // Missing file → cat exits non-zero. Not an error: the workspace simply
+        // hasn't requested a transition.
+        return Ok(None);
+    }
+    let content = String::from_utf8_lossy(&out.stdout);
+    let mut lines = content.lines().map(str::trim).filter(|l| !l.is_empty());
+    let Some(task_id) = lines.next() else {
+        // Present but empty/whitespace — treat as no request (poller clears it).
+        return Ok(None);
+    };
+    validate_task_id(task_id).map_err(|_| {
+        Error::Other(format!(
+            "transition marker at {path} holds an invalid task id ({task_id:?}); \
+             leaving it in place"
+        ))
+    })?;
+    let target = lines.next().unwrap_or("");
+    if !is_valid_status_token(target) {
+        return Err(Error::Other(format!(
+            "transition marker at {path} holds an invalid target status ({target:?}); \
+             leaving it in place"
+        )));
+    }
+    Ok(Some(TransitionRequest {
+        task_id: task_id.to_string(),
+        target: target.to_string(),
+    }))
+}
+
+/// Conservative shape check for a transition marker's target token: non-empty,
+/// bounded, and limited to the characters status ids and the `reject`/`bounce`
+/// verbs use (ASCII alphanumerics plus `-` and `_`). Defense-in-depth — the
+/// token is never shell-interpolated — but it keeps a hostile or torn body from
+/// reaching the decision path or the events log.
+fn is_valid_status_token(s: &str) -> bool {
+    !s.is_empty()
+        && s.len() <= 64
+        && s.chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+}
+
+/// Remove the transition marker (idempotent — `rm -f` succeeds if absent). The
+/// `rm -f` is identical to [`clear_review_marker`]'s; kept as a distinct name so
+/// call sites read as transition-vs-review explicitly. Called once the poller
+/// has consumed the request, and at task start to clear any stale marker before
+/// the worktree is reused.
+pub fn clear_transition_marker(host: &Host, marker: &Path) -> Result<()> {
+    clear_review_marker(host, marker)
+}
+
 /// The review-*loaded* file marker for a review workspace:
 /// `<worktree>/.claude/shelbi-review-loaded`.
 ///
@@ -684,6 +823,9 @@ pub fn start_workspace_on_task(spec: StartSpec<'_>) -> Result<TmuxAddr> {
     //     block standing up the workspace.
     let marker = workspace_review_marker(&machine, spec.workspace);
     let _ = clear_review_marker(&host, &marker);
+    // Same for any stale agent-transition marker — a fresh dispatch must not
+    // inherit a bounce request left behind by the previous task on this worktree.
+    let _ = clear_transition_marker(&host, &workspace_transition_marker(&machine, spec.workspace));
 
     // 1. Make sure the worktree exists + is on the right branch, clean.
     //    A failure here (dirty worktree, unreachable origin during the
@@ -794,6 +936,9 @@ pub fn resume_workspace_on_task(spec: StartSpec<'_>) -> Result<TmuxAddr> {
     // any marker present is stale. Best-effort.
     let marker = workspace_review_marker(&machine, spec.workspace);
     let _ = clear_review_marker(&host, &marker);
+    // Same for any stale agent-transition marker — a resumed task is still
+    // in-progress, so any transition request present is stale. Best-effort.
+    let _ = clear_transition_marker(&host, &workspace_transition_marker(&machine, spec.workspace));
 
     // Preserve the worktree: don't reset the branch, don't bail on a dirty
     // tree. Only recreate the worktree if it's gone entirely. A failure here
@@ -895,6 +1040,9 @@ pub fn load_review_workspace(spec: StartSpec<'_>) -> Result<TmuxAddr> {
     // is reused, so the hub can't read an old URL. Best-effort.
     let loaded_marker = workspace_review_loaded_marker(&machine, spec.workspace);
     let _ = clear_review_loaded_marker(&host, &loaded_marker);
+    // A review workspace is exactly where a gate agent writes a bounce, so
+    // clear any stale transition marker before reusing the worktree too.
+    let _ = clear_transition_marker(&host, &workspace_transition_marker(&machine, spec.workspace));
 
     // 1. Move the branch onto the review worktree (release it from the dev
     //    worktree that produced it, then check it out here). A failure here
@@ -3483,6 +3631,85 @@ mod tests {
         // A hostile task-id token fails validation → Err (poller leaves it).
         std::fs::write(&marker, "../etc/passwd http://x").unwrap();
         assert!(read_review_loaded_marker(&Host::Local, &marker).is_err());
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn transition_marker_lives_under_gitignored_claude_dir() {
+        let p = fixture_with_review_workspaces();
+        let r1 = p.workspaces.iter().find(|w| w.name == "review-1").unwrap();
+        let marker = workspace_transition_marker(&p.machines[0], r1);
+        assert_eq!(
+            marker,
+            PathBuf::from("/tmp/myapp/.shelbi/wt/review-1/.claude/shelbi-transition")
+        );
+    }
+
+    #[test]
+    fn read_transition_marker_parses_task_and_target_and_rejects_garbage() {
+        let dir = std::env::temp_dir().join(format!(
+            "shelbi-transition-marker-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let marker = dir.join("shelbi-transition");
+
+        // Absent → None.
+        assert!(read_transition_marker(&Host::Local, &marker).unwrap().is_none());
+
+        // Two lines (task id + target status), with the trailing newline the
+        // worker writes → both trimmed and returned.
+        std::fs::write(&marker, "fix-login\nin-progress\n").unwrap();
+        assert_eq!(
+            read_transition_marker(&Host::Local, &marker).unwrap(),
+            Some(TransitionRequest {
+                task_id: "fix-login".into(),
+                target: "in-progress".into(),
+            })
+        );
+
+        // A verb target (`reject`) is a valid token here — resolution against
+        // the workflow happens poll-side, not in the reader.
+        std::fs::write(&marker, "fix-login\nreject\n").unwrap();
+        assert_eq!(
+            read_transition_marker(&Host::Local, &marker).unwrap(),
+            Some(TransitionRequest {
+                task_id: "fix-login".into(),
+                target: "reject".into(),
+            })
+        );
+
+        // Blank lines between / around the two records are skipped.
+        std::fs::write(&marker, "\nfix-login\n\nin-progress\n\n").unwrap();
+        assert_eq!(
+            read_transition_marker(&Host::Local, &marker).unwrap(),
+            Some(TransitionRequest {
+                task_id: "fix-login".into(),
+                target: "in-progress".into(),
+            })
+        );
+
+        // Empty (or whitespace-only) → None, not an error.
+        std::fs::write(&marker, "\n").unwrap();
+        assert!(read_transition_marker(&Host::Local, &marker).unwrap().is_none());
+
+        // A hostile / torn task id (spaces) fails validation → Err, so the
+        // poller leaves the marker in place instead of clearing on a parse fail.
+        std::fs::write(&marker, "fix login now\nin-progress\n").unwrap();
+        assert!(read_transition_marker(&Host::Local, &marker).is_err());
+
+        // A missing target line → Err (an incomplete request, left in place).
+        std::fs::write(&marker, "fix-login\n").unwrap();
+        assert!(read_transition_marker(&Host::Local, &marker).is_err());
+
+        // A target with shell-ish / path-ish junk fails the token shape check.
+        std::fs::write(&marker, "fix-login\n../etc/passwd\n").unwrap();
+        assert!(read_transition_marker(&Host::Local, &marker).is_err());
 
         std::fs::remove_dir_all(&dir).ok();
     }

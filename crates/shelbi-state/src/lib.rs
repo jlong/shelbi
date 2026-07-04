@@ -1915,6 +1915,52 @@ pub fn move_task(
     Ok(Some((old_column, new_column, workflow)))
 }
 
+/// Move `id` to `new_column` **and** clear its `assigned_to` in a single
+/// locked write. The agent-transition sibling of [`move_task`]: where the
+/// forward review handoff leaves the card in `Review` (out of `in_progress`, so
+/// the finished workspace's supervisor sees no active task on it), an
+/// agent-initiated transition can land the card in an *active* status. If the
+/// card kept its stale `assigned_to == <gate-workspace>` there, the poller's
+/// pane supervisor would find an in-progress task still owned by the just-closed
+/// workspace and relaunch it *on the gate workspace* — exactly the mis-dispatch
+/// we must avoid. Clearing the owner as part of the move makes
+/// `current_task_for(<gate-workspace>)` return `None`, so the closed pane is
+/// left alone and the orchestrator re-dispatches the card fresh onto an
+/// appropriate workspace.
+///
+/// Returns `Some((from, to, workflow))` when the column actually changed (same
+/// shape as [`move_task`], so the caller can append a move event), or `None`
+/// when the task was already in `new_column` (the owner is still cleared in that
+/// case — an idempotent recovery for a card wedged with a stale owner).
+pub fn move_task_and_unassign(
+    project: &str,
+    id: &str,
+    new_column: Column,
+) -> Result<Option<(Column, Column, String)>> {
+    let _lock = lock_tasks(project)?;
+    let TaskFile { mut task, body } = load_task(project, id)?;
+    let old_column = task.column;
+    let workflow = task.workflow_or_default().to_string();
+    let already_there = old_column == new_column;
+    if already_there && task.assigned_to.is_none() {
+        return Ok(None);
+    }
+    task.assigned_to = None;
+    if !already_there {
+        task.column = new_column;
+        task.priority = list_column(project, new_column)?.len() as u32;
+    }
+    task.updated_at = chrono::Utc::now();
+    save_task_unlocked(project, &task, &body)?;
+    if already_there {
+        // Only the owner was cleared — no column move to renumber or log.
+        return Ok(None);
+    }
+    renumber_column_unlocked(project, old_column)?;
+    renumber_column_unlocked(project, new_column)?;
+    Ok(Some((old_column, new_column, workflow)))
+}
+
 /// Release task `id` back to [`Column::Todo`] and clear its `assigned_to`
 /// in a **single** locked write.
 ///
@@ -2829,6 +2875,51 @@ mod tests {
 
         // Fully clean (Todo + unowned) → genuine no-op.
         assert_eq!(release_task_to_todo("p", "t").unwrap(), None);
+
+        std::env::remove_var("SHELBI_HOME");
+    }
+
+    #[test]
+    fn move_task_and_unassign_moves_and_clears_owner_in_one_write() {
+        let _g = TEST_LOCK.lock().unwrap();
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+
+        // A review-gate agent bounces its task from Review back to InProgress:
+        // the card must land in the active column AND lose its owner so the
+        // just-closed gate workspace isn't seen as still holding active work.
+        let mut task = make_task("t", Column::Review, 0);
+        task.assigned_to = Some("review-1".to_string());
+        save_task("p", &task, "").unwrap();
+
+        let moved = move_task_and_unassign("p", "t", Column::InProgress).unwrap();
+        assert_eq!(moved, Some((Column::Review, Column::InProgress, "default".into())));
+
+        let after = load_task("p", "t").unwrap().task;
+        assert_eq!(after.column, Column::InProgress);
+        assert_eq!(after.assigned_to, None);
+        assert!(list_column("p", Column::Review).unwrap().is_empty());
+
+        std::env::remove_var("SHELBI_HOME");
+    }
+
+    #[test]
+    fn move_task_and_unassign_is_idempotent_when_already_there() {
+        let _g = TEST_LOCK.lock().unwrap();
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+
+        // Already in the target column but still owned: clear the owner with no
+        // move event, reporting `None` since the column didn't change.
+        let mut task = make_task("t", Column::InProgress, 0);
+        task.assigned_to = Some("review-1".to_string());
+        save_task("p", &task, "").unwrap();
+
+        assert_eq!(move_task_and_unassign("p", "t", Column::InProgress).unwrap(), None);
+        assert_eq!(load_task("p", "t").unwrap().task.assigned_to, None);
+
+        // Fully clean (already there + unowned) → genuine no-op.
+        assert_eq!(move_task_and_unassign("p", "t", Column::InProgress).unwrap(), None);
 
         std::env::remove_var("SHELBI_HOME");
     }
