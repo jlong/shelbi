@@ -7,6 +7,7 @@ import { CopyPromptBanner } from "./CopyPromptBanner"
 import { InstallCommand } from "./InstallCommand"
 import { Pre } from "./Pre"
 import { Steps, Step } from "./Steps"
+import { TerminalBanner } from "./TerminalBanner"
 
 /**
  * Element overrides applied to rendered docs MDX. Body copy (paragraphs,
@@ -28,6 +29,10 @@ export const mdxComponents: MDXComponents = {
   Steps,
   Step,
   Callout,
+  // Terminal-framed SHELBI banner sourced from the canonical `BANNER_LINES`;
+  // renders the half-block art at line-height 1 so the glyph rows tile. See
+  // `TerminalBanner.tsx`.
+  TerminalBanner,
   // Synced tabbed code blocks (package-manager / shell switcher). Selection
   // syncs across same-`group` blocks on the page; see `CodeTabs.tsx`.
   CodeTabs,

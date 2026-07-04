@@ -6,7 +6,7 @@ import * as React from "react"
  * and the top of `README.md`. Keep all three in sync — the brand is the
  * exact same artwork in every surface.
  */
-const BANNER_LINES = [
+export const BANNER_LINES = [
   "   ▄▀▀▀▀▀▄   ▀▀    ▀▀  ▀▀▀▀▀▀▀   ▀▀   ▀▀▀▀▀▀▀▀▀▀▄   ▀▀▀▀▀",
   "  ▀▀        ▀▀    ▀▀  ▀▀        ▀▀        ▀▀    ▀▀   ▀▀",
   "  ▀▀▀▀▄    ▀▀▀▀▀▀▀▀  ▀▀▀▀▀▀    ▀▀      ▀▀▀▀▀▀▀▀▄    ▀▀",
