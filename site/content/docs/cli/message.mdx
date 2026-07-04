@@ -1,0 +1,83 @@
+---
+title: shelbi message
+order: 33
+summary: Append a durable, acked JSON record to a task's file-based message log that its workspace tails.
+---
+
+```text
+shelbi message [OPTIONS] <ID> <KIND> <BODY>
+```
+
+`shelbi message` pushes a message to a task's assigned
+[workspace](/docs/concepts/workspaces) through a **file-based message log** at
+`<worktree>/.shelbi/messages/<task-id>.log`. Each call appends one durable JSON
+record. The workspace tails that log, folds the message into what it's doing,
+and acks it — so unlike a keystroke injection, the message is persisted and its
+delivery is confirmed.
+
+`<KIND>` classifies the message so the workspace knows how to treat it:
+
+| Kind | Meaning |
+| --- | --- |
+| `reply` | Response to a workspace's `request-clarification`. Pair with `--in-response-to <question-id>`. |
+| `directive` | Course correction — "stop what you're doing, the spec changed." |
+| `context` | Additional background info the workspace should fold in. |
+
+## send vs message
+
+`send` and `message` are easy to confuse — they both get words to a running
+workspace, but through different channels:
+
+| | `shelbi send` | `shelbi message` |
+| --- | --- | --- |
+| Channel | Keystrokes into the tmux pane | JSON record in the message log file |
+| Durability | Ephemeral — no record | Durable — appended to `<worktree>/.shelbi/messages/<task-id>.log` |
+| Acknowledged | No | Yes — the workspace tails and acks it |
+| Typed / classified | Free text | `reply` / `directive` / `context` |
+| Reach for it when | A quick, live nudge to a pane | A message that must survive, be logged, and be confirmed |
+
+Rule of thumb: use [`shelbi send`](/docs/cli/send) for an off-the-cuff nudge,
+and `shelbi message` when the workspace genuinely needs to receive, record, and
+act on the message.
+
+## Arguments
+
+| Argument | Type | Default | Description |
+| --- | --- | --- | --- |
+| `<ID>` | string | — | Task id whose assigned workspace receives the message (required). |
+| `<KIND>` | `reply` \| `directive` \| `context` | — | Message kind (required). |
+| `<BODY>` | string | — | Message body (required). |
+
+## Flags
+
+| Flag | Type | Default | Description |
+| --- | --- | --- | --- |
+| `--in-response-to <QUESTION-ID>` | string | — | Question id this message replies to (sets `in_response_to`). Typically paired with `kind = reply`. |
+| `-p, --project <PROJECT>` | string | env / cwd lookup | Project to operate on. Defaults to `$SHELBI_PROJECT`, or the registered project whose `work_dir` contains the current directory. |
+
+## Examples
+
+Send a course correction to the workspace working `add-auth`:
+
+```bash
+shelbi message add-auth directive "hold off — the auth spec changed, wait for the updated task"
+```
+
+Reply to a workspace's clarification question:
+
+```bash
+shelbi message add-auth reply "yes, use the existing session table" --in-response-to q-004
+```
+
+Fold in extra background without redirecting the work:
+
+```bash
+shelbi message add-auth context "the staging DB is seeded with the fixtures you'll need"
+```
+
+## See also
+
+- [`shelbi send`](/docs/cli/send) — the ephemeral counterpart: types a message
+  straight into the workspace's pane instead of the durable message log.
+- [Workspaces](/docs/concepts/workspaces) — what a workspace is and how a task
+  gets assigned to one.
