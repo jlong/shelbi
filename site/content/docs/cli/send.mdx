@@ -1,0 +1,52 @@
+---
+title: shelbi send
+order: 32
+summary: Inject a follow-up message as keystrokes into a running workspace's tmux pane.
+---
+
+```text
+shelbi send [OPTIONS] <ID> <MESSAGE>
+```
+
+`shelbi send` injects a follow-up message into a running
+[workspace](/docs/concepts/workspaces) — the text is typed into the
+workspace's live tmux pane as keystrokes, exactly as if you'd typed it there
+yourself. Use it to nudge, correct, or add a note to an agent that's already
+working, without interrupting or restarting the pane.
+
+`NAME` is resolved against the project YAML's `workspaces:` block first, then
+falls back to the legacy spawn-agent registry.
+
+Because `send` writes keystrokes into a pane, the message is **ephemeral**:
+it's delivered to whatever is reading that pane at the moment, and there's no
+durable record or acknowledgement. When you need a message that survives, is
+logged, and is acked by the workspace, reach for
+[`shelbi message`](/docs/cli/message) instead — see the comparison there.
+
+## Arguments
+
+| Argument | Type | Default | Description |
+| --- | --- | --- | --- |
+| `<ID>` | string | — | Workspace name (resolved against `workspaces:`), or a legacy spawn-agent id (required). |
+| `<MESSAGE>` | string | — | The message to type into the pane (required). |
+
+## Flags
+
+| Flag | Type | Default | Description |
+| --- | --- | --- | --- |
+| `-p, --project <PROJECT>` | string | env / cwd lookup | Project to operate on. Defaults to `$SHELBI_PROJECT`, or the registered project whose `work_dir` contains the current directory. |
+
+## Examples
+
+Nudge the `alpha` workspace with a follow-up instruction:
+
+```bash
+shelbi send alpha "also update the changelog before you commit"
+```
+
+## See also
+
+- [`shelbi message`](/docs/cli/message) — the durable, acked counterpart:
+  appends a JSON record to a task's message log instead of typing into a pane.
+- [Workspaces](/docs/concepts/workspaces) — what a workspace is and how the
+  `workspaces:` block names them.
