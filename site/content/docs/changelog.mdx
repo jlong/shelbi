@@ -4,8 +4,8 @@ order: 99
 summary: Major Shelbi features and when they landed on main, newest first.
 ---
 
-The major, user-facing features Shelbi has grown — each with the date it landed
-on `main` — newest first. This page is hand-curated: it tracks capabilities, not
+The major, user-facing features Shelbi has grown, each with the date it landed
+on `main`, newest first. This page is hand-curated: it tracks capabilities, not
 every commit, so small copy edits and cosmetic tweaks are folded away. Entries
 are prose with `code` and links where they earn their place.
 
@@ -20,13 +20,13 @@ will resume on their own versus which need a hand.
 **Adaptive hub heartbeats.** The `heartbeat` cadence now backs off when the
 board is quiet instead of firing at a fixed interval forever. It holds at the
 standard `interval` (default `3m`) while there's supervisable work in flight,
-then doubles each idle tick — capped at a new `max` bound (default `60m`) —
+then doubles each idle tick, capped at a new `max` bound (default `60m`),
 once the board goes quiescent, and snaps back to `interval` on the next real
 event. The config gains the `max` field: `heartbeat: 3m` still works (bare
 interval, default cap), as does `heartbeat: off`, and a map
 `heartbeat: { interval: 3m, max: 60m }` sets both bounds. Every existing
 project gets back-off with no YAML edit. Backing off on "nothing supervisable
-in flight" rather than "no log line" is deliberate — a silently-stuck
+in flight" rather than "no log line" is deliberate: a silently-stuck
 `in_progress` task also emits nothing, and the heartbeat sweep is exactly what
 catches it. See the [`heartbeat` field reference](/docs/configuration/project#heartbeat)
 and [the events log](/docs/concepts/events-log#heartbeats).
@@ -42,14 +42,14 @@ resumes the task rather than sitting idle at a fresh prompt.
 
 **Self-documenting config on `.yaml`.** New config scaffolds ship with their
 optional sections present but commented, so the file itself documents every knob
-you can turn — no need to hunt the reference to discover a setting exists. At the
+you can turn. No need to hunt the reference to discover a setting exists. At the
 same time every config file standardizes on the `.yaml` extension; existing
 `.yml` files are migrated automatically on first load.
 
 **Orchestrator naming removed.** The onboarding wizard no longer asks you
 to name your assistant, and the `assistant_name` config field is gone. The
-orchestrator prompt now reads *"You are the Orchestrator"* statically —
-there's no `{{assistant_name}}` substitution at render time. The wizard's
+orchestrator prompt now reads *"You are the Orchestrator"* statically.
+There's no `{{assistant_name}}` substitution at render time. The wizard's
 sole phase is project setup, and `~/.shelbi/shelbi.yaml` is now just the
 per-project `last_launched` index.
 
@@ -76,15 +76,15 @@ half of the config is user-local versus shared.
 just the other way around. A hub-side Unix socket (reverse-forwarded to remote
 machines over SSH) carries a per-task message log, and Claude Code workers inject
 those messages via `SessionStart` + `Stop` hooks; non-hook runners poll for them
-in the prompt. On top of it sits a clarification loop — a worker can ask a
-question and block for an acknowledged answer — plus `launchd`/`systemd`
+in the prompt. On top of it sits a clarification loop (a worker can ask a
+question and block for an acknowledged answer) plus `launchd`/`systemd`
 supervision so the hub socket survives restarts.
 
 ### June 29, 2026
 
 **Custom agents and configurable workflows.** The worker concept was reframed as
 a *workspace* that runs a named *agent*, and dispatch resolves which agent to run
-from the task's workflow status — so different columns can hand work to different
+from the task's workflow status, so different columns can hand work to different
 agents, each with its own context and a shared preamble. A `shelbi agent`
 CLI quartet (`list`/`show`/`new`/`edit`) manages them. Kanban columns are no
 longer hardcoded either: `workflows/statuses.yml` defines the status identity the
@@ -92,7 +92,7 @@ board and CLI render from.
 
 **`shelbi open` and marker-free project resolution.** The pane-lifecycle entry
 point is now the top-level `shelbi open <workspace>` (was `shelbi workspace
-open`) — same behavior, focus a workspace pane and create it if it doesn't exist
+open`): same behavior, focus a workspace pane and create it if it doesn't exist
 yet, under a shorter name. Shelbi also stopped dropping a `.shelbi/project`
 marker into each repo to identify the active project; resolution now scans
 `~/.shelbi/projects/*.yaml`, collects each project's local `work_dir`, and
@@ -105,16 +105,16 @@ on disk; the project YAML is the single source of truth.
 `<ts> project=<name> heartbeat` line to `~/.shelbi/events.log`, giving the
 orchestrator's `events tail --follow` watch a guaranteed recurring trigger
 when the board is otherwise quiet. Cadence is set per project via the
-`heartbeat` key in `project.yaml` — `45s`, `3m`, `1h`, or `"off"` to
+`heartbeat` key in `project.yaml`: `45s`, `3m`, `1h`, or `"off"` to
 disable; default `3m`. Bare integers (`heartbeat: 180`) are rejected at
 load time, so a missing-unit typo can't silently land as seconds. Emission
 is debounced against any other write to the events log, so active boards
-don't see padding. Heartbeats also pause while the hub is offline — a
+don't see padding. Heartbeats also pause while the hub is offline. A
 quick TCP probe of `1.1.1.1:443` gates each due tick and emission resumes
 once connectivity is back, so a coffee-shop wifi drop doesn't fill the
 feed with no-op lines the orchestrator can't act on anyway. Heartbeats
-are filtered out of the TUI activity feed by default — they'd produce
-one "nothing happened" row every few minutes — but show up verbatim
+are filtered out of the TUI activity feed by default (they'd produce
+one "nothing happened" row every few minutes) but show up verbatim
 under `shelbi events tail`. See
 [the events log](/docs/concepts/events-log#heartbeats) for the line shape
 and rationale.
@@ -130,7 +130,7 @@ unsupervised. Drive it from the CLI with `shelbi zen on|off|pause|status`.
 
 ### June 23, 2026
 
-The first public cut of Shelbi — an open-source agent orchestrator for the
+The first public cut of Shelbi: an open-source agent orchestrator for the
 terminal, built on tmux. You talk to one orchestrator agent; it delegates work to
 worker agents running in tmux panes, locally or over SSH, and reports back. This
 landed the full local-to-remote loop end to end.
@@ -150,12 +150,12 @@ Review list. `Ctrl+P` opens a Nucleo-backed fuzzy command palette as a tmux
 popup for jumping between projects, workers, and views.
 
 **Orchestration.** Move a card to Todo and the orchestrator takes it from
-there — it watches the column and, as soon as a worker frees up, checks out the
+there. It watches the column and, as soon as a worker frees up, checks out the
 highest-priority unblocked card on a fresh branch in that worker's own
 worktree and starts the runner. `depends_on` blocks a task until its
 dependencies land in Done. Finished work lands in Review and the worker stops;
 activating a review checks the branch out, spawns a fresh agent pane to
-interrogate the diff, and lets you merge into the default branch — or push and
+interrogate the diff, and lets you merge into the default branch, or push and
 open a PR with `--pr`.
 
 **Anywhere tmux runs.** Workers run on the hub or on any machine reachable over
@@ -166,14 +166,14 @@ worker status, which is what lights up the sidebar badges. Agent runners
 (`claude`, `codex`, or any interactive CLI) are pluggable and declared
 per project.
 
-**State you can read.** No daemons, no servers, no database — every project,
+**State you can read.** No daemons, no servers, no database: every project,
 task, log, and worker status is a markdown or YAML file under `~/.shelbi/`.
 The same `shelbi` CLI the orchestrator drives (`task`, `merge`, `reload`,
 `events`, …) is the one you can run yourself.
 
 **The website and docs.** A Next.js marketing site and a contentlayer-backed
-MDX documentation set — Getting Started, Concepts, and a CLI reference for every
-`shelbi` subcommand — ship alongside the release.
+MDX documentation set (Getting Started, Concepts, and a CLI reference for every
+`shelbi` subcommand) ship alongside the release.
 
 Install from source with `./scripts/install.sh` (builds `--release`, drops the
 binary at `$HOME/bin/shelbi`, ad-hoc re-signs on macOS).
