@@ -130,11 +130,53 @@ pub fn sessions_dir() -> Result<PathBuf> {
 }
 
 pub fn project_dir(project: &str) -> Result<PathBuf> {
-    // Storage-layer chokepoint: every per-project path (tasks/, agents/,
-    // workflows/, state.json) derives from here, so validating the name
+    // Storage-layer chokepoint: every per-project *state* path (tasks/,
+    // state.json, workspaces/) derives from here, so validating the name
     // once keeps a `../`-style project from escaping the projects dir.
+    // Config paths (agents/, workflows/, …) route through
+    // [`config_project_dir`] instead, which is config-mode-aware.
     validate_project_name(project)?;
     Ok(projects_dir()?.join(project))
+}
+
+/// Config-half base directory for `project`, resolved config-mode-aware.
+///
+/// * **Global mode** (the default): the config half lives alongside the
+///   state half at `~/.shelbi/projects/<name>/`, so this returns exactly
+///   [`project_dir`].
+/// * **In-repo mode**: the config half is committed to the repo, so this
+///   returns `<repo>/.shelbi/` — where the project's `agents/`,
+///   `workflows/`, `statuses.yaml`, and workspace-settings template live
+///   and are read from.
+///
+/// This is the config-path counterpart to [`project_dir`] (the state-path
+/// base): every mode-aware config helper — [`agents_dir`],
+/// [`workflows_dir`](crate::workflows_dir), [`statuses_path`](crate::statuses_path),
+/// the agent instruction/log path helpers — derives from here so reads and
+/// writes agree and follow the mode.
+///
+/// The project is loaded to learn its [`ConfigMode`](shelbi_core::ConfigMode).
+/// When it can't be loaded yet — mid-`shelbi init`, before any config file
+/// exists — this degrades to the global [`project_dir`], mirroring how
+/// [`workspace_settings_template_path`]'s mode-aware wrapper falls back to
+/// the default path for a not-yet-created project. The load is the
+/// migration-free [`load_project_bare`], so calling a config helper never
+/// re-enters the one-shot migrations [`load_project`] runs (which would
+/// recurse) and never has heavy side effects.
+///
+/// The global branch keys on `project` (the registry alias / filename), not
+/// the loaded `name:`, so a pick-up-suffixed alias resolves its config half
+/// under the same directory as its state half. Only the in-repo branch is
+/// name-independent (it keys on the repo path).
+pub fn config_project_dir(project: &str) -> Result<PathBuf> {
+    match load_project_bare(project) {
+        Ok(p) if p.config_mode == Some(shelbi_core::ConfigMode::InRepo) => {
+            <Project as ProjectPaths>::config_root(&p)
+        }
+        // Global mode, or a project that can't be loaded yet — both resolve
+        // to the global per-project directory, keyed on the alias.
+        _ => project_dir(project),
+    }
 }
 
 /// Reject a name that isn't exactly one *normal* path component, closing
@@ -376,7 +418,10 @@ pub fn self_heal_workspace_settings_template(
 }
 
 pub fn agents_dir(project: &str) -> Result<PathBuf> {
-    Ok(project_dir(project)?.join("agents"))
+    // Config path — mode-aware. In-repo projects resolve to
+    // `<repo>/.shelbi/agents/`; global projects to
+    // `~/.shelbi/projects/<name>/agents/`.
+    Ok(config_project_dir(project)?.join("agents"))
 }
 
 pub fn tasks_dir(project: &str) -> Result<PathBuf> {
@@ -546,11 +591,35 @@ pub fn load_project(project: &str) -> Result<Project> {
     // short-circuits the default materialization. After this runs, the
     // workflow loader's "statuses.yaml must exist" contract holds for any
     // subsequent open of this project.
-    if let Ok(dir) = project_dir(&p.name) {
+    // Materialize the workflow/statuses defaults under the project's
+    // *config* root — `<repo>/.shelbi/` for in-repo projects, the global
+    // per-project dir otherwise — so an in-repo project's committed config
+    // picks them up rather than stranding them in the global state dir.
+    if let Ok(dir) = <Project as ProjectPaths>::config_root(&p) {
         migrate_statuses_extension(&dir);
         migrate_default_workflow(&dir);
         migrate_default_statuses(&dir);
     }
+    Ok(p)
+}
+
+/// Load a project's config *without* running the one-shot migrations that
+/// [`load_project`] performs. This is the loader [`config_project_dir`]
+/// uses to learn a project's [`ConfigMode`](shelbi_core::ConfigMode): the
+/// config-path helpers must resolve a mode without the heavier IO and
+/// re-entrancy that the full [`load_project`] (which itself calls
+/// [`config_project_dir`] via the migration materialize) would introduce.
+///
+/// Resolution mirrors [`load_project`]: the flat global YAML first, falling
+/// back to the two-file in-repo split. Both branches are read-only.
+fn load_project_bare(project: &str) -> Result<Project> {
+    let global_path = projects_dir()?.join(format!("{project}.yaml"));
+    let p = match fs::read_to_string(&global_path) {
+        Ok(text) => Project::from_yaml_str(&text)?,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => load_project_split(project)?,
+        Err(e) => return Err(shelbi_core::Error::Io(e)),
+    };
+    shelbi_core::validate_agent_id(&p.name)?;
     Ok(p)
 }
 
@@ -4485,6 +4554,167 @@ mod tests {
         let msg = err.to_string();
         assert!(msg.contains("no shared config"), "unexpected err: {msg}");
         assert!(msg.contains("project.yaml"), "should name shared path: {msg}");
+        std::env::remove_var("SHELBI_HOME");
+    }
+
+    // ---- Config-mode-aware free-function resolution ------------------
+    //
+    // The name-based config helpers (`agents_dir`, `workflows_dir`,
+    // `statuses_path`, the agent instruction/log paths) resolve their base
+    // config-mode-aware: an in-repo project routes config to
+    // `<repo>/.shelbi/…`, a global project keeps everything under
+    // `~/.shelbi/projects/<name>/…`. State paths (`tasks_dir`,
+    // `state_path`) stay global in BOTH modes.
+
+    /// Register a global-mode project at `~/.shelbi/projects/<name>.yaml`.
+    fn save_global_project(name: &str, repo: &std::path::Path) {
+        let mut p = fixture_project(name, None);
+        p.config_mode = Some(shelbi_core::ConfigMode::Global);
+        p.repo = repo.to_string_lossy().into_owned();
+        p.machines[0].work_dir = repo.to_path_buf();
+        save_project(&p).unwrap();
+    }
+
+    /// Register an in-repo-mode project: the global YAML carries
+    /// `config_mode: in-repo` and `repo:` pointing at `repo`, exactly the
+    /// shape `shelbi init --mode in-repo` writes.
+    fn save_in_repo_project(name: &str, repo: &std::path::Path) {
+        let mut p = fixture_project(name, None);
+        p.config_mode = Some(shelbi_core::ConfigMode::InRepo);
+        p.repo = repo.to_string_lossy().into_owned();
+        p.machines[0].work_dir = repo.to_path_buf();
+        save_project(&p).unwrap();
+    }
+
+    #[test]
+    fn config_helpers_resolve_under_home_for_a_global_project() {
+        let _g = TEST_LOCK.lock().unwrap();
+        let home = fresh_home();
+        let repo = fresh_repo();
+        std::env::set_var("SHELBI_HOME", &home);
+
+        save_global_project("myapp", &repo);
+        let base = home.join("projects/myapp");
+        assert_eq!(config_project_dir("myapp").unwrap(), base);
+        assert_eq!(agents_dir("myapp").unwrap(), base.join("agents"));
+        assert_eq!(workflows_dir("myapp").unwrap(), base.join("workflows"));
+        assert_eq!(
+            statuses_path("myapp").unwrap(),
+            base.join("workflows/statuses.yaml"),
+        );
+        assert_eq!(
+            agent_instructions_path("myapp", "developer").unwrap(),
+            base.join("agents/developer/instructions.md"),
+        );
+        assert_eq!(
+            agent_log_path("myapp", "developer").unwrap(),
+            base.join("agents/developer.log.md"),
+        );
+        std::env::remove_var("SHELBI_HOME");
+    }
+
+    #[test]
+    fn config_helpers_resolve_under_repo_for_an_in_repo_project() {
+        let _g = TEST_LOCK.lock().unwrap();
+        let home = fresh_home();
+        let repo = fresh_repo();
+        std::env::set_var("SHELBI_HOME", &home);
+
+        save_in_repo_project("myapp", &repo);
+        let cfg = repo.join(".shelbi");
+        assert_eq!(config_project_dir("myapp").unwrap(), cfg);
+        assert_eq!(agents_dir("myapp").unwrap(), cfg.join("agents"));
+        assert_eq!(workflows_dir("myapp").unwrap(), cfg.join("workflows"));
+        assert_eq!(
+            statuses_path("myapp").unwrap(),
+            cfg.join("workflows/statuses.yaml"),
+        );
+        assert_eq!(
+            agent_instructions_path("myapp", "developer").unwrap(),
+            cfg.join("agents/developer/instructions.md"),
+        );
+        assert_eq!(
+            agent_log_path("myapp", "developer").unwrap(),
+            cfg.join("agents/developer.log.md"),
+        );
+        std::env::remove_var("SHELBI_HOME");
+    }
+
+    #[test]
+    fn state_helpers_stay_global_in_both_modes() {
+        let _g = TEST_LOCK.lock().unwrap();
+        let home = fresh_home();
+        let repo = fresh_repo();
+        std::env::set_var("SHELBI_HOME", &home);
+
+        let base = home.join("projects/myapp");
+        for save in [
+            save_global_project as fn(&str, &std::path::Path),
+            save_in_repo_project,
+        ] {
+            // Re-register the project in the target mode; the state paths
+            // must not move regardless of which mode is on disk.
+            let _ = std::fs::remove_file(home.join("projects/myapp.yaml"));
+            save("myapp", &repo);
+            assert_eq!(tasks_dir("myapp").unwrap(), base.join("tasks"));
+            assert_eq!(state_path("myapp").unwrap(), base.join("state.json"));
+            // The orchestrator handoff is a state artifact — stays under the
+            // state root (workdir), never the repo, in both modes.
+            assert_eq!(
+                orchestrator_handoff_path("myapp").unwrap(),
+                base.join("agents/orchestrator/handoff.md"),
+            );
+        }
+        std::env::remove_var("SHELBI_HOME");
+    }
+
+    #[test]
+    fn config_helpers_fall_back_to_global_before_the_project_exists() {
+        // Mid-`shelbi init`, before any project YAML is on disk, the config
+        // helpers must not fail or loop — they degrade to the global path.
+        let _g = TEST_LOCK.lock().unwrap();
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+
+        let base = home.join("projects/fresh");
+        assert_eq!(config_project_dir("fresh").unwrap(), base);
+        assert_eq!(agents_dir("fresh").unwrap(), base.join("agents"));
+        assert_eq!(workflows_dir("fresh").unwrap(), base.join("workflows"));
+        std::env::remove_var("SHELBI_HOME");
+    }
+
+    #[test]
+    fn in_repo_init_materializes_agents_and_statuses_under_the_repo() {
+        // Acceptance: after an in-repo project is registered, materializing
+        // the defaults and the statuses catalogue lands them under
+        // `<repo>/.shelbi/…`, and a follow-up read finds them there — the
+        // reads-and-writes-agree guarantee.
+        let _g = TEST_LOCK.lock().unwrap();
+        let home = fresh_home();
+        let repo = fresh_repo();
+        std::env::set_var("SHELBI_HOME", &home);
+
+        save_in_repo_project("myapp", &repo);
+        materialize_default_agents("myapp").unwrap();
+        scaffold_project_statuses("myapp").unwrap();
+
+        let cfg = repo.join(".shelbi");
+        assert!(
+            cfg.join("agents/developer/instructions.md").is_file(),
+            "default agents should materialize under the repo",
+        );
+        assert!(
+            cfg.join("workflows/statuses.yaml").is_file(),
+            "statuses catalogue should materialize under the repo",
+        );
+        // Nothing leaked into the global config half.
+        assert!(
+            !home.join("projects/myapp/agents").exists(),
+            "in-repo agents must not be written to the global dir",
+        );
+        // A read comes back from the repo.
+        let listed = list_agents("myapp").unwrap();
+        assert!(listed.iter().any(|a| a == "developer"), "got: {listed:?}");
         std::env::remove_var("SHELBI_HOME");
     }
 }
