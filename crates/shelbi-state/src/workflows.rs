@@ -61,12 +61,14 @@ use shelbi_core::{
     Result, Workflow,
 };
 
-use crate::{agents_dir, atomic_write, project_dir};
+use crate::{agents_dir, atomic_write, config_project_dir};
 
-/// Directory holding per-project workflow YAML files:
+/// Directory holding per-project workflow YAML files. Config path —
+/// resolved config-mode-aware via [`config_project_dir`]: in-repo projects
+/// resolve to `<repo>/.shelbi/workflows/`, global projects to
 /// `~/.shelbi/projects/<project>/workflows/`.
 pub fn workflows_dir(project: &str) -> Result<PathBuf> {
-    Ok(project_dir(project)?.join("workflows"))
+    Ok(config_project_dir(project)?.join("workflows"))
 }
 
 /// On-disk path of a single workflow by name:
@@ -532,6 +534,7 @@ mod tests {
         materialize_default_agents, DEVELOPER_AGENT, ORCHESTRATOR_AGENT,
     };
     use crate::ensure_dir;
+    use crate::project_dir;
     use crate::test_lock::LOCK as TEST_LOCK;
     use shelbi_core::{ProjectStatus, StatusCategory};
     use std::path::Path;

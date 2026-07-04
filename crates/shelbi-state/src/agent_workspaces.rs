@@ -215,7 +215,15 @@ pub fn agent_shared_preamble_path(project: &str) -> Result<PathBuf> {
 /// orchestrator's instructions reference, so the directory layout the
 /// running orchestrator sees agrees with the path callers compute.
 pub fn orchestrator_handoff_path(project: &str) -> Result<PathBuf> {
-    Ok(agent_workspace_dir(project, ORCHESTRATOR_AGENT)?.join(HANDOFF_FILE))
+    // State path, NOT the mode-aware `agent_workspace_dir`: the handoff is
+    // a transient state-transfer artifact the running orchestrator writes
+    // CWD-relative to its workdir — which is the project's *state* root
+    // (`project_dir`, see `ensure_dashboard`), not its config root. Keying
+    // it off `project_dir` (via the same [`ORCHESTRATOR_HANDOFF_REL`] the
+    // orchestrator is told to write) keeps the reader and the writer in
+    // agreement in both config modes; in global mode this is byte-identical
+    // to the old `agents/orchestrator/handoff.md` under the project dir.
+    Ok(project_dir(project)?.join(ORCHESTRATOR_HANDOFF_REL))
 }
 
 /// Read and delete the orchestrator's handoff file. Returns `Ok(None)`

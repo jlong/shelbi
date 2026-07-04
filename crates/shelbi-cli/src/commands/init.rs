@@ -290,6 +290,11 @@ struct ProjectYaml<'a> {
     name: &'a str,
     repo: &'a str,
     default_branch: &'a str,
+    /// Emitted only for in-repo projects (`config_mode: in-repo`). Global
+    /// projects omit the key — matching the loader's `None`-is-Global
+    /// default, so the file stays byte-identical to the pre-mode shape.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    config_mode: Option<&'a str>,
     machines: Vec<MachineYaml<'a>>,
     orchestrator: OrchestratorYaml<'a>,
     agent_runners: std::collections::BTreeMap<&'a str, RunnerYaml<'a>>,
@@ -317,7 +322,12 @@ struct RunnerYaml<'a> {
 /// interpolation). Validates `name` first so a value that can't
 /// round-trip through the filesystem path or YAML — the F1 charset gate —
 /// can never reach disk.
-fn render_project_yaml(name: &str, repo: &str, work_dir: &Path) -> Result<String> {
+fn render_project_yaml(
+    name: &str,
+    repo: &str,
+    work_dir: &Path,
+    config_mode: Option<&str>,
+) -> Result<String> {
     validate_project_name(name)?;
     let work_dir = work_dir.to_string_lossy();
     let mut agent_runners = std::collections::BTreeMap::new();
@@ -339,6 +349,7 @@ fn render_project_yaml(name: &str, repo: &str, work_dir: &Path) -> Result<String
         name,
         repo,
         default_branch: "main",
+        config_mode,
         machines: vec![MachineYaml {
             name: "hub",
             kind: "local",
@@ -389,10 +400,21 @@ fn scaffold_project(resolved: &ResolvedProjectRoot, mode: InitMode) -> Result<()
     {
         Ok(mut f) => {
             use std::io::Write;
-            // Fresh init leaves `repo` empty — the local registry entry is
+            // Global mode leaves `repo` empty — the local registry entry is
             // anchored on `work_dir`, and the GitHub URL (if any) is filled
-            // in later by the setup wizard.
-            let yaml = render_project_yaml(&resolved.name, "", &resolved.path)?;
+            // in later by the setup wizard. In-repo mode records `repo` (the
+            // project root) and `config_mode: in-repo` so the loader routes
+            // config paths — agents/, workflows/, statuses.yaml, the
+            // workspace-settings template — to `<repo>/.shelbi/…`, where the
+            // steps below materialize them.
+            let (repo_field, config_mode): (String, Option<&str>) = match mode {
+                InitMode::InRepo => {
+                    (resolved.path.to_string_lossy().into_owned(), Some("in-repo"))
+                }
+                InitMode::Global => (String::new(), None),
+            };
+            let yaml =
+                render_project_yaml(&resolved.name, &repo_field, &resolved.path, config_mode)?;
             f.write_all(yaml.as_bytes())?;
             println!("✓ wrote project: {}", yaml_path.display());
         }
@@ -561,7 +583,17 @@ fn run_pick_up(args: Args) -> Result<PickUpOutcome> {
     // both alike.
     let projects_dir = shelbi_state::projects_dir().map_err(|e| anyhow!(e))?;
     let yaml_path = projects_dir.join(format!("{}.yaml", local_alias));
-    let yaml = render_project_yaml(&local_alias, &repo_root.to_string_lossy(), &repo_root)?;
+    // Pick-up is inherently an in-repo project: the repo already carries a
+    // committed `<repo>/.shelbi/project.yaml`, so record `config_mode:
+    // in-repo` (with `repo` pointing at the checkout) and the teammate's
+    // agents/workflows/statuses resolve to — and materialize under — the
+    // repo's committed `.shelbi/`, not a divergent global copy.
+    let yaml = render_project_yaml(
+        &local_alias,
+        &repo_root.to_string_lossy(),
+        &repo_root,
+        Some("in-repo"),
+    )?;
     std::fs::write(&yaml_path, yaml)?;
     println!("✓ registered project: {}", yaml_path.display());
 
@@ -686,7 +718,12 @@ fn next_available_alias(canonical: &str) -> Result<(String, Option<String>)> {
 }
 
 fn write_workspace_settings_template(project: &str) -> Result<()> {
-    let template_path = shelbi_state::project_dir(project)
+    // Config path — mode-aware. For an in-repo project this lands under
+    // `<repo>/.shelbi/`; for a global project under
+    // `~/.shelbi/projects/<name>/`. The project YAML has already been
+    // written by the time this runs, so `config_project_dir` can read the
+    // mode back off disk.
+    let template_path = shelbi_state::config_project_dir(project)
         .map_err(|e| anyhow!(e))?
         .join("workspace-settings.json.template");
     if template_path.exists() {
@@ -759,7 +796,7 @@ mod tests {
     /// write is the file the loader reads.
     #[test]
     fn render_project_yaml_round_trips_through_the_loader() {
-        let yaml = render_project_yaml("my-app", "", Path::new("/tmp/my-app")).unwrap();
+        let yaml = render_project_yaml("my-app", "", Path::new("/tmp/my-app"), None).unwrap();
         let project: shelbi_core::Project = serde_yaml::from_str(&yaml).unwrap();
         assert_eq!(project.name, "my-app");
         assert_eq!(project.default_branch, "main");
@@ -777,7 +814,7 @@ mod tests {
     /// pointer matches the Configuration section's route.
     #[test]
     fn render_project_yaml_is_self_documenting() {
-        let yaml = render_project_yaml("my-app", "", Path::new("/tmp/my-app")).unwrap();
+        let yaml = render_project_yaml("my-app", "", Path::new("/tmp/my-app"), None).unwrap();
         assert!(
             yaml.contains("https://shelbi.dev/docs/configuration/project"),
             "missing docs header: {yaml}"
@@ -799,12 +836,12 @@ mod tests {
     #[test]
     fn render_project_yaml_escapes_hostile_work_dir_and_rejects_bad_names() {
         let tricky = Path::new("/tmp/weird #dir: value");
-        let yaml = render_project_yaml("safe", "", tricky).unwrap();
+        let yaml = render_project_yaml("safe", "", tricky, None).unwrap();
         let project: shelbi_core::Project = serde_yaml::from_str(&yaml).unwrap();
         assert_eq!(project.machines[0].work_dir, tricky.to_path_buf());
 
-        assert!(render_project_yaml("../../evil", "", Path::new("/tmp")).is_err());
-        assert!(render_project_yaml("has\nnewline", "", Path::new("/tmp")).is_err());
+        assert!(render_project_yaml("../../evil", "", Path::new("/tmp"), None).is_err());
+        assert!(render_project_yaml("has\nnewline", "", Path::new("/tmp"), None).is_err());
     }
 
     /// F4: a scaffold that crashed after writing the YAML but before
@@ -904,12 +941,46 @@ mod tests {
 
         // Global side still exists (same registry mechanism).
         assert!(home.join("projects/team-app.yaml").is_file());
+        // The registry YAML records the mode + repo so the loader routes
+        // config paths into the repo on every subsequent open.
+        let registry = std::fs::read_to_string(home.join("projects/team-app.yaml")).unwrap();
+        assert!(registry.contains("config_mode: in-repo"), "got: {registry}");
+        assert!(
+            registry.contains(&format!("repo: {}", project_root.display())),
+            "in-repo registry must record the repo path, got: {registry}"
+        );
+
         // In-repo side is what pick-up will detect on a teammate's
         // clone. Shape is intentionally minimal — just the canonical name.
         let committed = project_root.join(IN_REPO_CONFIG_REL);
         assert!(committed.is_file());
         let body = std::fs::read_to_string(&committed).unwrap();
         assert_eq!(body.trim(), "name: team-app");
+
+        // Acceptance: agents/, statuses.yaml, and the workspace-settings
+        // template all land under the repo's `.shelbi/`, NOT the global
+        // per-project dir.
+        let cfg = project_root.join(".shelbi");
+        assert!(
+            cfg.join("agents/developer/instructions.md").is_file(),
+            "default agents must materialize under <repo>/.shelbi/agents/"
+        );
+        assert!(
+            cfg.join("workflows/statuses.yaml").is_file(),
+            "statuses catalogue must materialize under <repo>/.shelbi/workflows/"
+        );
+        assert!(
+            cfg.join("workspace-settings.json.template").is_file(),
+            "workspace-settings template must materialize under <repo>/.shelbi/"
+        );
+        assert!(
+            !home.join("projects/team-app/agents").exists(),
+            "in-repo agents must not leak into the global per-project dir"
+        );
+        assert!(
+            !home.join("projects/team-app/workflows").exists(),
+            "in-repo workflows must not leak into the global per-project dir"
+        );
 
         std::env::remove_var("SHELBI_HOME");
     }
