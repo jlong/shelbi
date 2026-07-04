@@ -366,6 +366,7 @@ mod tests {
                 kind: MachineKind::Local,
                 work_dir: repo.into(),
                 host: None,
+                tags: Vec::new(),
             }],
             orchestrator: OrchestratorSpec { runner: "claude".into() },
             agent_runners: runners,

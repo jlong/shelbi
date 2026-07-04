@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -561,7 +561,8 @@ impl std::fmt::Display for MergeStrategy {
 pub struct ReviewConfig {
     /// Base TCP port for the first review workspace's dev server. Each
     /// review workspace gets a deterministic slot `base_port + n *
-    /// port_stride` (see [`Project::review_workspaces`]). Default 3000.
+    /// port_stride`, indexed by declaration order among a machine's
+    /// `review`-tagged workspaces. Default 3000.
     #[serde(default = "default_base_port")]
     pub base_port: u16,
     /// Port spacing between consecutive review workspaces on a machine, so
@@ -670,21 +671,53 @@ impl Project {
         self.workspaces.iter().find(|w| w.name == name)
     }
 
-    /// Review-role workspaces declared on `machine`, in declaration order.
-    /// The slot index into this list drives the deterministic port
-    /// assignment (`review.base_port + i * review.port_stride`). See
-    /// [`ReviewConfig`].
-    pub fn review_workspaces(&self, machine: &str) -> Vec<&WorkspaceSpec> {
+    /// A workspace's **effective tags**: the union of its own [`tags`] and
+    /// the [`tags`] declared on its machine. This is the set every routing
+    /// decision reasons about — a tag declared once on a machine applies to
+    /// all of its slots. A workspace whose `machine` isn't declared (a
+    /// config error caught by [`Project::validate_workspaces`]) contributes
+    /// only its own tags.
+    ///
+    /// [`tags`]: WorkspaceSpec::tags
+    pub fn effective_tags(&self, workspace: &WorkspaceSpec) -> BTreeSet<String> {
+        let mut tags: BTreeSet<String> = workspace.tags.iter().cloned().collect();
+        if let Some(m) = self.machine(&workspace.machine) {
+            tags.extend(m.tags.iter().cloned());
+        }
+        tags
+    }
+
+    /// Workspaces whose [effective tags](Project::effective_tags) are a
+    /// **superset** of `required` (set-AND), in declaration order. An empty
+    /// `required` set matches every workspace — the historical "any free
+    /// workspace" default. This is the generic tag-routing primitive that
+    /// replaced the old role-specific `review_workspaces`/`dev_workspaces`
+    /// queries: pass `{"review"}` for the review pool, or a status's
+    /// required tag set for dispatch routing.
+    pub fn workspaces_matching(&self, required: &BTreeSet<String>) -> Vec<&WorkspaceSpec> {
         self.workspaces
             .iter()
-            .filter(|w| w.machine == machine && w.is_review())
+            .filter(|w| {
+                let tags = self.effective_tags(w);
+                required.iter().all(|r| tags.contains(r))
+            })
             .collect()
     }
 
-    /// All dev-role workspaces across every machine, in declaration order.
-    /// These are the slots that pick up tasks for autonomous development.
-    pub fn dev_workspaces(&self) -> Vec<&WorkspaceSpec> {
-        self.workspaces.iter().filter(|w| !w.is_review()).collect()
+    /// The numeric slot for `workspace`, used as `$SLOT` by transition
+    /// `run:` commands. Returns the explicit [`WorkspaceSpec::slot`] when
+    /// set, otherwise the workspace's zero-based declaration-order index
+    /// among the workspaces on its own machine. An unknown workspace (not
+    /// declared on this project) resolves to `0`.
+    pub fn workspace_slot(&self, workspace: &WorkspaceSpec) -> u32 {
+        if let Some(slot) = workspace.slot {
+            return slot;
+        }
+        self.workspaces
+            .iter()
+            .filter(|w| w.machine == workspace.machine)
+            .position(|w| w.name == workspace.name)
+            .unwrap_or(0) as u32
     }
 
     /// Inspect the filesystem at `root` (typically `self.repo`) and cache
@@ -714,7 +747,7 @@ impl Project {
             if self.runner(&w.runner).is_none() {
                 return Err(crate::Error::UnknownRunner(w.runner.clone()));
             }
-            if w.is_review() {
+            if self.effective_tags(w).contains("review") {
                 *review_per_machine.entry(w.machine.as_str()).or_default() += 1;
             }
         }
@@ -862,37 +895,79 @@ fn retain_fields(value: &mut serde_yaml::Value, keep: &[&str]) {
 /// [`Project::validate_workspaces`]. See `Plans/review-workspaces.md` §5.1.
 pub const MAX_REVIEW_WORKSPACES_PER_MACHINE: usize = 2;
 
-/// Whether a workspace is an autonomous development slot or a slot
-/// designated for human review. See `Plans/review-workspaces.md` §5.
-///
-/// The wire form is `dev` / `review` (lowercase). `Dev` is the default so
-/// existing project YAMLs — which carry no `role:` key — deserialize
-/// unchanged, and the field is elided on serialize (see
-/// [`WorkspaceSpec::role`]) so they round-trip byte-identically.
-#[derive(Debug, Default, PartialEq, Eq, Clone, Copy, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum WorkspaceRole {
-    #[default]
-    Dev,
-    Review,
-}
-
 /// A workspace is a long-lived slot on a machine: one stable worktree, one
 /// runner. Workspaces pick up tasks from the board and switch branches between
 /// assignments (with cleared context). The worktree path is derived as
 /// `<machine.work_dir>/.shelbi/wt/<workspace-name>` — not configurable yet.
+///
+/// Deserializes through [`WorkspaceSpecRaw`] (`#[serde(from = …)]`) so the
+/// wire form can (a) accept the scalar `tag:` / bare-string `tags:`
+/// shorthands and (b) fold the **legacy** `role:` key into `tags` — a
+/// `role: Review` (any case) config loads as `tags: [review]`, `role: Dev`
+/// as no tags. `role` is read-only legacy input and is never written back
+/// out (see [`WorkspaceSpecRaw`]).
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(from = "WorkspaceSpecRaw")]
 pub struct WorkspaceSpec {
     pub name: String,
     pub machine: String,
     pub runner: String,
-    /// Whether this slot does autonomous development ([`WorkspaceRole::Dev`],
-    /// the default) or is reserved for loading & serving a task's branch for
-    /// human review ([`WorkspaceRole::Review`]). Rides the user-local config
-    /// half along with the rest of `workspaces:`. Elided from the wire form
-    /// when `Dev` so existing YAMLs round-trip unchanged.
-    #[serde(default, skip_serializing_if = "is_default")]
-    pub role: WorkspaceRole,
+    /// Free-form capability tags for this slot. The workspace's *effective*
+    /// tags are these unioned with its machine's tags — see
+    /// [`Project::effective_tags`]. Used by tag-based routing (a status may
+    /// require a tag set; dispatch/review-load pick a free workspace whose
+    /// effective tags ⊇ the required set). Elided from the wire form when
+    /// empty.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tags: Vec<String>,
+    /// Explicit numeric slot for this workspace, used by transition `run:`
+    /// commands as `$SLOT` (e.g. to derive a per-slot port). When unset,
+    /// [`Project::workspace_slot`] falls back to the workspace's
+    /// declaration-order index among its machine's workspaces. Elided from
+    /// the wire form when unset.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub slot: Option<u32>,
+}
+
+/// Lenient wire shape for [`WorkspaceSpec`]. Carries the scalar `tag:`
+/// alias / bare-string `tags:` shorthand and the read-only legacy `role:`
+/// key, which [`From`] folds into the strict `tags` set. Never serialized —
+/// `WorkspaceSpec` derives its own `Serialize` and emits only `tags`
+/// (never `role`), so a loaded legacy config is rewritten in the new shape.
+#[derive(Deserialize)]
+struct WorkspaceSpecRaw {
+    name: String,
+    machine: String,
+    runner: String,
+    #[serde(default, alias = "tag", deserialize_with = "de_string_or_seq")]
+    tags: Vec<String>,
+    #[serde(default)]
+    slot: Option<u32>,
+    /// Legacy `dev` / `review` role (any case). Read-only: mapped into
+    /// `tags` and dropped. See the struct-level docs.
+    #[serde(default)]
+    role: Option<String>,
+}
+
+impl From<WorkspaceSpecRaw> for WorkspaceSpec {
+    fn from(raw: WorkspaceSpecRaw) -> Self {
+        let mut tags = raw.tags;
+        // Legacy tolerance: `role: Review` (any case) ⇒ the `review` tag;
+        // `role: Dev` ⇒ no tag. Anything else is ignored — the tag set is
+        // the sole source of truth going forward.
+        if let Some(role) = raw.role {
+            if role.eq_ignore_ascii_case("review") && !tags.iter().any(|t| t == "review") {
+                tags.push("review".to_string());
+            }
+        }
+        WorkspaceSpec {
+            name: raw.name,
+            machine: raw.machine,
+            runner: raw.runner,
+            tags,
+            slot: raw.slot,
+        }
+    }
 }
 
 /// `skip_serializing_if` helper: true when a value equals its `Default`.
@@ -902,12 +977,35 @@ fn is_default<T: Default + PartialEq>(t: &T) -> bool {
     *t == T::default()
 }
 
-impl WorkspaceSpec {
-    /// Whether this workspace is reserved for human review (as opposed to
-    /// autonomous development). See [`WorkspaceRole`].
-    pub fn is_review(&self) -> bool {
-        self.role == WorkspaceRole::Review
+/// Deserialize a `Vec<String>` from either a bare string (`review` →
+/// `[review]`) or a sequence (`[review, gpu]`). Shared by [`Machine`],
+/// [`WorkspaceSpec`], and the workflow `Status` reference entry so the
+/// scalar `tag:` / seq `tags:` shorthands parse uniformly.
+pub(crate) fn de_string_or_seq<'de, D>(d: D) -> std::result::Result<Vec<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    struct V;
+    impl<'de> serde::de::Visitor<'de> for V {
+        type Value = Vec<String>;
+        fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("a string or a sequence of strings")
+        }
+        fn visit_str<E: serde::de::Error>(self, s: &str) -> std::result::Result<Vec<String>, E> {
+            Ok(vec![s.to_string()])
+        }
+        fn visit_seq<A: serde::de::SeqAccess<'de>>(
+            self,
+            mut seq: A,
+        ) -> std::result::Result<Vec<String>, A::Error> {
+            let mut out = Vec::new();
+            while let Some(s) = seq.next_element::<String>()? {
+                out.push(s);
+            }
+            Ok(out)
+        }
     }
+    d.deserialize_any(V)
 }
 
 // ---------------------------------------------------------------------------
@@ -921,6 +1019,20 @@ pub struct Machine {
     /// SSH hostname, required when `kind = ssh`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub host: Option<String>,
+    /// Free-form capability tags for this machine. Every workspace on the
+    /// machine inherits these (see [`Project::effective_tags`]), so a tag
+    /// declared here (e.g. `gpu`, `review`) applies to all of the machine's
+    /// slots without repeating it per workspace. Accepts a scalar `tag:`
+    /// alias and a bare-string value (`tags: review`) as shorthand for a
+    /// one-element list. Elided from the wire form when empty so existing
+    /// project YAMLs round-trip unchanged.
+    #[serde(
+        default,
+        alias = "tag",
+        deserialize_with = "de_string_or_seq",
+        skip_serializing_if = "Vec::is_empty"
+    )]
+    pub tags: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -2607,13 +2719,14 @@ workspace_settings_template: /etc/shelbi/p.json
                 kind: MachineKind::Local,
                 work_dir: "/tmp".into(),
                 host: None,
+                tags: Vec::new(),
             }],
             orchestrator: OrchestratorSpec { runner: "claude".into() },
             agent_runners: runners,
             editor: None,
             github_url: None,
             workspaces: vec![
-                WorkspaceSpec { name: "alice".into(), machine: "hub".into(), runner: "claude".into(), role: Default::default() },
+                WorkspaceSpec { name: "alice".into(), machine: "hub".into(), runner: "claude".into(), tags: Vec::new(), slot: None },
             ],
             workspace_poll_interval_secs: default_workspace_poll_interval_secs(),
             workspace_permissions_mode: default_workspace_permissions_mode(),
@@ -2627,11 +2740,11 @@ workspace_settings_template: /etc/shelbi/p.json
         assert!(project.validate_workspaces().is_ok());
 
         let mut bad = project.clone();
-        bad.workspaces.push(WorkspaceSpec { name: "bob".into(), machine: "ghost".into(), runner: "claude".into(), role: Default::default() });
+        bad.workspaces.push(WorkspaceSpec { name: "bob".into(), machine: "ghost".into(), runner: "claude".into(), tags: Vec::new(), slot: None });
         assert!(matches!(bad.validate_workspaces(), Err(crate::Error::UnknownMachine(_))));
 
         let mut bad2 = project.clone();
-        bad2.workspaces.push(WorkspaceSpec { name: "bob".into(), machine: "hub".into(), runner: "ghost".into(), role: Default::default() });
+        bad2.workspaces.push(WorkspaceSpec { name: "bob".into(), machine: "hub".into(), runner: "ghost".into(), tags: Vec::new(), slot: None });
         assert!(matches!(bad2.validate_workspaces(), Err(crate::Error::UnknownRunner(_))));
     }
 
@@ -2655,6 +2768,7 @@ workspace_settings_template: /etc/shelbi/p.json
             kind: MachineKind::Local,
             work_dir: "/tmp".into(),
             host: None,
+            tags: Vec::new(),
         };
         Project {
             name: "p".into(),
@@ -2680,81 +2794,173 @@ workspace_settings_template: /etc/shelbi/p.json
         }
     }
 
-    fn ws(name: &str, machine: &str, role: WorkspaceRole) -> WorkspaceSpec {
+    /// Build a workspace with the `review` tag when `review` is true, no
+    /// tags otherwise. The tag-era stand-in for the old `role:` param.
+    fn ws(name: &str, machine: &str, review: bool) -> WorkspaceSpec {
         WorkspaceSpec {
             name: name.into(),
             machine: machine.into(),
             runner: "claude".into(),
-            role,
+            tags: if review {
+                vec!["review".to_string()]
+            } else {
+                Vec::new()
+            },
+            slot: None,
         }
     }
 
     #[test]
-    fn workspace_role_parses_and_defaults_to_dev() {
-        // No `role:` key → Dev.
-        let dev: WorkspaceSpec =
+    fn workspace_tags_parse_scalar_seq_and_alias() {
+        // No `tags:`/`tag:` key → empty.
+        let plain: WorkspaceSpec =
             serde_yaml::from_str("{ name: alpha, machine: hub, runner: claude }").unwrap();
-        assert_eq!(dev.role, WorkspaceRole::Dev);
-        assert!(!dev.is_review());
+        assert!(plain.tags.is_empty());
 
-        // Explicit `role: review` (lowercase wire form) → Review.
+        // Bare-string `tags: review` → one-element list (string-or-seq).
+        let scalar: WorkspaceSpec =
+            serde_yaml::from_str("{ name: r, machine: hub, runner: claude, tags: review }").unwrap();
+        assert_eq!(scalar.tags, vec!["review".to_string()]);
+
+        // Scalar `tag:` alias for `tags:`.
+        let alias: WorkspaceSpec =
+            serde_yaml::from_str("{ name: r, machine: hub, runner: claude, tag: review }").unwrap();
+        assert_eq!(alias.tags, vec!["review".to_string()]);
+
+        // Sequence form.
+        let seq: WorkspaceSpec =
+            serde_yaml::from_str("{ name: r, machine: hub, runner: claude, tags: [review, gpu] }")
+                .unwrap();
+        assert_eq!(seq.tags, vec!["review".to_string(), "gpu".to_string()]);
+    }
+
+    #[test]
+    fn legacy_role_folds_into_tags() {
+        // `role: Review` (any case) is read-only legacy → the `review` tag.
         let rev: WorkspaceSpec =
+            serde_yaml::from_str("{ name: review-1, machine: hub, runner: claude, role: Review }")
+                .unwrap();
+        assert_eq!(rev.tags, vec!["review".to_string()]);
+
+        // `role: review` lowercase → same.
+        let rev2: WorkspaceSpec =
             serde_yaml::from_str("{ name: review-1, machine: hub, runner: claude, role: review }")
                 .unwrap();
-        assert_eq!(rev.role, WorkspaceRole::Review);
-        assert!(rev.is_review());
-    }
+        assert_eq!(rev2.tags, vec!["review".to_string()]);
 
-    #[test]
-    fn default_role_is_elided_on_the_wire() {
-        // A Dev workspace must not grow a `role:` key, so existing YAMLs
-        // round-trip byte-identically.
-        let dev = ws("alpha", "hub", WorkspaceRole::Dev);
-        let y = serde_yaml::to_string(&dev).unwrap();
-        assert!(!y.contains("role"), "unexpected role key on the wire: {y}");
+        // `role: Dev` → no tags.
+        let dev: WorkspaceSpec =
+            serde_yaml::from_str("{ name: alpha, machine: hub, runner: claude, role: Dev }").unwrap();
+        assert!(dev.tags.is_empty());
 
-        // A Review workspace does serialize its role.
-        let rev = ws("review-1", "hub", WorkspaceRole::Review);
+        // `role` is never written back out — a loaded legacy config is
+        // rewritten in the tag shape.
         let y = serde_yaml::to_string(&rev).unwrap();
-        assert!(y.contains("role: review"), "missing role key: {y}");
+        assert!(!y.contains("role"), "unexpected role key on the wire: {y}");
+        assert!(y.contains("review"), "review tag should serialize: {y}");
     }
 
     #[test]
-    fn review_and_dev_workspace_partitioning() {
-        let project = project_with_workspaces(vec![
-            ws("alpha", "hub", WorkspaceRole::Dev),
-            ws("review-1", "hub", WorkspaceRole::Review),
-            ws("beta", "devbox", WorkspaceRole::Dev),
-            ws("review-1", "devbox", WorkspaceRole::Review),
+    fn tagless_workspace_is_elided_on_the_wire() {
+        // A workspace with no tags must not grow a `tags:` key, so existing
+        // YAMLs round-trip byte-identically.
+        let dev = ws("alpha", "hub", false);
+        let y = serde_yaml::to_string(&dev).unwrap();
+        assert!(!y.contains("tags"), "unexpected tags key on the wire: {y}");
+        assert!(!y.contains("slot"), "unexpected slot key on the wire: {y}");
+
+        // A tagged workspace serializes its tags as a sequence.
+        let rev = ws("review-1", "hub", true);
+        let y = serde_yaml::to_string(&rev).unwrap();
+        assert!(y.contains("review"), "missing review tag: {y}");
+    }
+
+    #[test]
+    fn effective_tags_union_machine_and_workspace() {
+        // Machine-level tags flow down to every workspace on the machine.
+        let mut project = project_with_workspaces(vec![
+            ws("alpha", "hub", false),
+            ws("review-1", "hub", true),
         ]);
+        project.machines[0].tags = vec!["gpu".to_string()]; // hub
 
-        let hub_review = project.review_workspaces("hub");
-        assert_eq!(hub_review.len(), 1);
-        assert_eq!(hub_review[0].name, "review-1");
-        assert_eq!(hub_review[0].machine, "hub");
+        let alpha = project.workspace("alpha").unwrap();
+        let et = project.effective_tags(alpha);
+        assert!(et.contains("gpu"), "machine tag inherited: {et:?}");
+        assert!(!et.contains("review"));
 
-        // Machine scoping: a machine with no review workspaces yields none.
-        assert!(project.review_workspaces("nonexistent").is_empty());
+        let review = project.workspace("review-1").unwrap();
+        let et = project.effective_tags(review);
+        assert!(et.contains("gpu"), "machine tag inherited: {et:?}");
+        assert!(et.contains("review"), "own tag present: {et:?}");
+    }
 
-        let dev = project.dev_workspaces();
-        let dev_names: Vec<&str> = dev.iter().map(|w| w.name.as_str()).collect();
-        assert_eq!(dev_names, vec!["alpha", "beta"]);
+    #[test]
+    fn workspaces_matching_is_a_superset_query() {
+        let mut project = project_with_workspaces(vec![
+            ws("alpha", "hub", false),
+            ws("review-1", "hub", true),
+            ws("beta", "devbox", false),
+            ws("review-2", "devbox", true),
+        ]);
+        // Tag devbox itself `gpu` so its slots inherit it.
+        project.machines[1].tags = vec!["gpu".to_string()]; // devbox
+
+        // Empty required set → every workspace (the "any free" default).
+        let all = project.workspaces_matching(&BTreeSet::new());
+        assert_eq!(all.len(), 4);
+
+        // `{review}` → the two review slots, declaration order.
+        let review: BTreeSet<String> = std::iter::once("review".to_string()).collect();
+        let names: Vec<&str> = project
+            .workspaces_matching(&review)
+            .iter()
+            .map(|w| w.name.as_str())
+            .collect();
+        assert_eq!(names, vec!["review-1", "review-2"]);
+
+        // AND semantics: `{review, gpu}` → only the devbox review slot.
+        let both: BTreeSet<String> =
+            ["review".to_string(), "gpu".to_string()].into_iter().collect();
+        let names: Vec<&str> = project
+            .workspaces_matching(&both)
+            .iter()
+            .map(|w| w.name.as_str())
+            .collect();
+        assert_eq!(names, vec!["review-2"]);
+    }
+
+    #[test]
+    fn workspace_slot_defaults_to_declaration_order_per_machine() {
+        let mut project = project_with_workspaces(vec![
+            ws("a", "hub", false),
+            ws("b", "hub", false),
+            ws("c", "devbox", false),
+        ]);
+        // Unset slots → zero-based index among the machine's workspaces.
+        assert_eq!(project.workspace_slot(project.workspace("a").unwrap()), 0);
+        assert_eq!(project.workspace_slot(project.workspace("b").unwrap()), 1);
+        assert_eq!(project.workspace_slot(project.workspace("c").unwrap()), 0);
+
+        // An explicit slot wins over the positional default.
+        project.workspaces[1].slot = Some(7);
+        assert_eq!(project.workspace_slot(project.workspace("b").unwrap()), 7);
     }
 
     #[test]
     fn at_most_two_review_workspaces_per_machine() {
         // Exactly two on one machine is fine.
         let ok = project_with_workspaces(vec![
-            ws("review-1", "hub", WorkspaceRole::Review),
-            ws("review-2", "hub", WorkspaceRole::Review),
+            ws("review-1", "hub", true),
+            ws("review-2", "hub", true),
         ]);
         assert!(ok.validate_workspaces().is_ok());
 
         // A third on the same machine is a hard error with a clear message.
         let over = project_with_workspaces(vec![
-            ws("review-1", "hub", WorkspaceRole::Review),
-            ws("review-2", "hub", WorkspaceRole::Review),
-            ws("review-3", "hub", WorkspaceRole::Review),
+            ws("review-1", "hub", true),
+            ws("review-2", "hub", true),
+            ws("review-3", "hub", true),
         ]);
         match over.validate_workspaces() {
             Err(crate::Error::Other(msg)) => {
@@ -2769,10 +2975,10 @@ workspace_settings_template: /etc/shelbi/p.json
 
         // The cap is per-machine: two on hub + two on devbox is fine.
         let split = project_with_workspaces(vec![
-            ws("review-1", "hub", WorkspaceRole::Review),
-            ws("review-2", "hub", WorkspaceRole::Review),
-            ws("review-1", "devbox", WorkspaceRole::Review),
-            ws("review-2", "devbox", WorkspaceRole::Review),
+            ws("review-1", "hub", true),
+            ws("review-2", "hub", true),
+            ws("review-1", "devbox", true),
+            ws("review-2", "devbox", true),
         ]);
         assert!(split.validate_workspaces().is_ok());
     }
@@ -2809,7 +3015,7 @@ workspace_settings_template: /etc/shelbi/p.json
     fn absent_review_block_is_elided_on_the_wire() {
         // A default ReviewConfig on a project must not emit a `review:`
         // key, so existing project YAMLs round-trip byte-identically.
-        let project = project_with_workspaces(vec![ws("alpha", "hub", WorkspaceRole::Dev)]);
+        let project = project_with_workspaces(vec![ws("alpha", "hub", false)]);
         let y = serde_yaml::to_string(&project).unwrap();
         assert!(!y.contains("review:"), "unexpected review block: {y}");
         assert!(!y.contains("role:"), "unexpected role key: {y}");
@@ -2833,6 +3039,7 @@ workspace_settings_template: /etc/shelbi/p.json
                 kind: MachineKind::Local,
                 work_dir: "/tmp".into(),
                 host: None,
+                tags: Vec::new(),
             }],
             orchestrator: OrchestratorSpec { runner: "claude".into() },
             agent_runners: runners,
@@ -3947,13 +4154,15 @@ git:
                 kind: MachineKind::Local,
                 work_dir: "/home/dev/shelbi".into(),
                 host: None,
+                tags: Vec::new(),
             }],
             editor: Some("nvim".into()),
             workspaces: vec![WorkspaceSpec {
                 name: "alpha".into(),
                 machine: "hub".into(),
                 runner: "claude".into(),
-                role: WorkspaceRole::Review,
+                tags: vec!["review".to_string()],
+                slot: None,
             }],
             detected_shapes: Vec::new(),
         }

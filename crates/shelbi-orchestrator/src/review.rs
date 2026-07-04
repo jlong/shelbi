@@ -1,8 +1,8 @@
 //! Review flow: load a ready-for-review task onto a **review workspace** and
 //! start the `review` agent there to serve the branch for a human.
 //!
-//! This is the canonical review surface. Review workspaces are `role: review`
-//! pool slots (scarce by design — 1–2 per machine) that own a persistent
+//! This is the canonical review surface. Review workspaces are slots tagged
+//! `review` (scarce by design — 1–2 per machine) that own a persistent
 //! worktree under `.shelbi/wt/<name>`; the branch is *moved* onto that worktree
 //! (released from whatever dev worktree produced it), so the machine's
 //! top-level clone is never checked out into or dirtied by review. See
@@ -11,7 +11,7 @@
 //! `shelbi review <task>` is now a thin alias over [`review_task`]: it picks a
 //! free review workspace on the resolved machine and loads the task onto it, or
 //! — when every review workspace is busy — reports the task's queue position
-//! rather than failing. A project that declares no `role: review` workspace
+//! rather than failing. A project that declares no `review`-tagged workspace
 //! gets a loud onboarding error pointing at the config it needs to add.
 //!
 //! The heavy lifting (branch move, `PORT` injection, the `review` agent, the
@@ -25,7 +25,10 @@ use std::path::PathBuf;
 use shelbi_core::{Column, Error, Host, Machine, Project, Result, Task, TmuxAddr};
 use shelbi_state::TaskFile;
 
-use crate::workspace::{load_review_workspace, review_workspace_port, workspace_worktree, StartSpec};
+use crate::workspace::{
+    load_review_workspace, review_workspace_port, review_workspaces_on, workspace_worktree,
+    StartSpec,
+};
 
 /// A review workspace currently occupied by a task, surfaced when every review
 /// workspace on a machine is busy so the caller can tell the user what's ahead.
@@ -78,21 +81,25 @@ pub fn review_task(
     // Onboarding cutover (§11): review workspaces are the review surface now.
     // A project that never declared one gets a loud, actionable error rather
     // than a silent fallback to the retired top-level-clone checkout.
-    if !project.workspaces.iter().any(|w| w.is_review()) {
+    if !project
+        .workspaces
+        .iter()
+        .any(|w| project.effective_tags(w).contains("review"))
+    {
         return Err(Error::Other(format!(
-            "project `{project_name}` declares no `role: review` workspace — review \
+            "project `{project_name}` declares no workspace tagged `review` — review \
              workspaces are the review surface now (the old top-level-clone checkout \
              was retired). Declare at least one in your project config, e.g.\n\n  \
-             workspaces:\n    - {{ name: review-1, machine: <machine>, runner: <runner>, role: review }}\n\n\
+             workspaces:\n    - {{ name: review-1, machine: <machine>, runner: <runner>, tags: [review] }}\n\n\
              then re-run `shelbi review {task_id}`. See Plans/review-workspaces.md (§5.1, §11)."
         )));
     }
 
     let machine = resolve_review_machine(&project, &tf.task, machine_override)?.clone();
-    let reviews = project.review_workspaces(&machine.name);
+    let reviews = review_workspaces_on(&project, &machine.name);
     if reviews.is_empty() {
         return Err(Error::Other(format!(
-            "machine `{}` declares no `role: review` workspace — declare one there, or \
+            "machine `{}` declares no workspace tagged `review` — declare one there, or \
              pass `--machine <other>` to review on a machine that has one.",
             machine.name
         )));
@@ -206,7 +213,7 @@ pub fn resolve_review_machine<'a>(
     }
     if let Some(workspace_name) = &task.assigned_to {
         if let Some(workspace) = project.workspace(workspace_name) {
-            if !project.review_workspaces(&workspace.machine).is_empty() {
+            if !review_workspaces_on(project, &workspace.machine).is_empty() {
                 if let Some(m) = project.machine(&workspace.machine) {
                     return Ok(m);
                 }
@@ -216,9 +223,9 @@ pub fn resolve_review_machine<'a>(
     project
         .machines
         .iter()
-        .find(|m| !project.review_workspaces(&m.name).is_empty())
+        .find(|m| !review_workspaces_on(project, &m.name).is_empty())
         .ok_or_else(|| {
-            Error::Other("no machine declares a `role: review` workspace".into())
+            Error::Other("no machine declares a workspace tagged `review`".into())
         })
 }
 
@@ -403,16 +410,21 @@ pub(crate) fn move_branch_to_review_worktree(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use shelbi_core::model::WorkspaceRole;
     use shelbi_core::{AgentRunnerSpec, MachineKind, OrchestratorSpec, WorkspaceSpec};
     use std::collections::BTreeMap;
 
-    fn ws(name: &str, machine: &str, role: WorkspaceRole) -> WorkspaceSpec {
+    /// A workspace tagged `review` when `review` is true, untagged otherwise.
+    fn ws(name: &str, machine: &str, review: bool) -> WorkspaceSpec {
         WorkspaceSpec {
             name: name.into(),
             machine: machine.into(),
             runner: "claude".into(),
-            role,
+            tags: if review {
+                vec!["review".to_string()]
+            } else {
+                Vec::new()
+            },
+            slot: None,
         }
     }
 
@@ -456,12 +468,14 @@ mod tests {
                     kind: MachineKind::Local,
                     work_dir: "/tmp/p".into(),
                     host: None,
+                    tags: Vec::new(),
                 },
                 Machine {
                     name: "m2".into(),
                     kind: MachineKind::Ssh,
                     work_dir: "/work/p".into(),
                     host: Some("m2.local".into()),
+                    tags: Vec::new(),
                 },
             ],
             orchestrator: OrchestratorSpec { runner: "claude".into() },
@@ -483,10 +497,10 @@ mod tests {
     #[test]
     fn machine_resolution_prefers_assigned_workspace_machine_with_review_slots() {
         let p = project(vec![
-            ws("dev-hub", "hub", WorkspaceRole::Dev),
-            ws("review-hub", "hub", WorkspaceRole::Review),
-            ws("dev-m2", "m2", WorkspaceRole::Dev),
-            ws("review-m2", "m2", WorkspaceRole::Review),
+            ws("dev-hub", "hub", false),
+            ws("review-hub", "hub", true),
+            ws("dev-m2", "m2", false),
+            ws("review-m2", "m2", true),
         ]);
         let t = task("x", Column::Review, Some("dev-m2"), 0);
         let m = resolve_review_machine(&p, &t, None).unwrap();
@@ -498,8 +512,8 @@ mod tests {
         // Task ran on hub (no review slot there); fall back to the first
         // machine that has one — m2.
         let p = project(vec![
-            ws("dev-hub", "hub", WorkspaceRole::Dev),
-            ws("review-m2", "m2", WorkspaceRole::Review),
+            ws("dev-hub", "hub", false),
+            ws("review-m2", "m2", true),
         ]);
         let t = task("x", Column::Review, Some("dev-hub"), 0);
         let m = resolve_review_machine(&p, &t, None).unwrap();
@@ -508,7 +522,7 @@ mod tests {
 
     #[test]
     fn machine_resolution_honors_explicit_override() {
-        let p = project(vec![ws("review-m2", "m2", WorkspaceRole::Review)]);
+        let p = project(vec![ws("review-m2", "m2", true)]);
         let t = task("x", Column::Review, None, 0);
         let m = resolve_review_machine(&p, &t, Some("m2")).unwrap();
         assert_eq!(m.name, "m2");
@@ -516,8 +530,8 @@ mod tests {
 
     #[test]
     fn pick_takes_first_free_review_workspace() {
-        let r1 = ws("review-1", "hub", WorkspaceRole::Review);
-        let r2 = ws("review-2", "hub", WorkspaceRole::Review);
+        let r1 = ws("review-1", "hub", true);
+        let r2 = ws("review-2", "hub", true);
         let reviews = vec![&r1, &r2];
         let active = vec![tf(task("a", Column::Review, Some("review-1"), 0))];
         match pick_review_slot(&reviews, &active, "b") {
@@ -528,8 +542,8 @@ mod tests {
 
     #[test]
     fn pick_reuses_the_slot_this_task_is_already_on() {
-        let r1 = ws("review-1", "hub", WorkspaceRole::Review);
-        let r2 = ws("review-2", "hub", WorkspaceRole::Review);
+        let r1 = ws("review-1", "hub", true);
+        let r2 = ws("review-2", "hub", true);
         let reviews = vec![&r1, &r2];
         // review-1 free, review-2 holds our task → refresh reuses review-2.
         let active = vec![tf(task("b", Column::Review, Some("review-2"), 0))];
@@ -541,8 +555,8 @@ mod tests {
 
     #[test]
     fn pick_reports_all_busy_with_holders() {
-        let r1 = ws("review-1", "hub", WorkspaceRole::Review);
-        let r2 = ws("review-2", "hub", WorkspaceRole::Review);
+        let r1 = ws("review-1", "hub", true);
+        let r2 = ws("review-2", "hub", true);
         let reviews = vec![&r1, &r2];
         let active = vec![
             tf(task("a", Column::Review, Some("review-1"), 0)),

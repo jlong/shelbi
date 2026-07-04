@@ -126,13 +126,14 @@ const PROJECT_SECTIONS: &[Section] = &[
     Section {
         prose: &[
             "Workspace pool: long-lived slots that pick up tasks from the board.",
-            "Each owns a worktree at <machine.work_dir>/.shelbi/wt/<name>. A slot",
-            "with role: review is reserved for loading & serving a branch for a human.",
+            "Each owns a worktree at <machine.work_dir>/.shelbi/wt/<name>. Tags route",
+            "work to slots: a status can require tags, and a slot tagged `review` is",
+            "the surface that loads & serves a branch for a human (scalar `tag:` ok).",
         ],
         yaml: "\
 workspaces:
   - { name: alice, machine: hub, runner: claude }
-  - { name: rev, machine: hub, runner: claude, role: review }
+  - { name: rev, machine: hub, runner: claude, tags: [review] }
 ",
     },
     Section {
@@ -421,7 +422,10 @@ agent_runners:
         assert_eq!(p.machines.len(), 2, "ssh machine example uncommented");
         assert!(p.machines.iter().any(|m| m.host.as_deref() == Some("devbox.local")));
         assert_eq!(p.workspaces.len(), 2);
-        assert!(p.workspaces.iter().any(|w| w.is_review()));
+        assert!(p
+            .workspaces
+            .iter()
+            .any(|w| p.effective_tags(w).contains("review")));
         assert_eq!(p.github_url.as_deref(), Some("git@github.com:me/myapp.git"));
         // dialog_signatures nested under the codex runner.
         let codex = p.agent_runners.get("codex").expect("codex runner");

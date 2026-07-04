@@ -138,6 +138,7 @@ mod tests {
             category: StatusCategory::Active,
             owner,
             agent: agent.map(str::to_string),
+            tags: Vec::new(),
         }
     }
 

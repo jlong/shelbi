@@ -255,6 +255,7 @@ mod tests {
                 kind: MachineKind::Local,
                 work_dir: repo.to_path_buf(),
                 host: None,
+                tags: Vec::new(),
             }],
             orchestrator: OrchestratorSpec {
                 runner: "claude".into(),
@@ -266,7 +267,8 @@ mod tests {
                 name: "alice".into(),
                 machine: "hub".into(),
                 runner: "claude".into(),
-                role: Default::default(),
+                tags: Vec::new(),
+                slot: None,
             }],
             workspace_poll_interval_secs: 5,
             workspace_permissions_mode: "auto".into(),

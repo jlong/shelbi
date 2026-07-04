@@ -596,6 +596,21 @@ fn norm_status_id(s: &str) -> String {
 /// be loaded or has no active-category status (legacy workflows without
 /// the two-field design); the worktree's agent context still deploys so
 /// the bundled developer prompt + skills are wired up correctly.
+/// The required workspace tags of the task's workflow active status — the
+/// set a workspace's effective tags must be a superset of to take this task
+/// (see the tag-routing check in [`start`]). Empty when the workflow has no
+/// active status or that status declares no `tags:`.
+fn required_active_tags(project: &str, task: &Task) -> Result<std::collections::BTreeSet<String>> {
+    use shelbi_core::StatusCategory;
+    let workflow = resolve_task_workflow(project, task)?;
+    Ok(workflow
+        .statuses
+        .iter()
+        .find(|s| s.category == StatusCategory::Active)
+        .map(|s| s.tags.iter().cloned().collect())
+        .unwrap_or_default())
+}
+
 fn resolve_active_agent_for_dispatch(project: &str, task: &Task) -> Result<String> {
     use shelbi_core::StatusCategory;
     use shelbi_orchestrator::dispatch::{resolve_dispatch_agent, DispatchDecision};
@@ -732,6 +747,28 @@ fn start(
                 .join(", ")
         )
     })?;
+
+    // Tag routing (Plans/generic-review-via-workflow-primitives): if the
+    // active status the task is entering requires workspace tags, the chosen
+    // workspace's *effective* tags (its own ∪ its machine's) must be a
+    // superset. An empty required set — the default for every stock status —
+    // accepts any workspace, so this is a no-op until a workflow opts in.
+    let required = required_active_tags(project, &tf.task)?;
+    if !required.is_empty() {
+        let effective = project_yaml.effective_tags(workspace);
+        let missing: Vec<&str> = required
+            .iter()
+            .filter(|t| !effective.contains(t.as_str()))
+            .map(String::as_str)
+            .collect();
+        if !missing.is_empty() {
+            bail!(
+                "workspace `{workspace_name}` can't take task `{id}`: its active status \
+                 requires tag(s) {required:?} but the workspace's effective tags are \
+                 {effective:?} (missing {missing:?}) — assign a workspace tagged accordingly"
+            );
+        }
+    }
 
     // Refuse to clobber another in-flight task on the same workspace. Pulling
     // a workspace off mid-task is intentional — make the user do it explicitly

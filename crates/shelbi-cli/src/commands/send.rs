@@ -193,12 +193,14 @@ mod tests {
                     kind: MachineKind::Local,
                     work_dir: "/tmp/repo".into(),
                     host: None,
+                    tags: Vec::new(),
                 },
                 Machine {
                     name: "devbox".into(),
                     kind: MachineKind::Ssh,
                     work_dir: "/work/repo".into(),
                     host: Some("devbox".into()),
+                    tags: Vec::new(),
                 },
             ],
             orchestrator: OrchestratorSpec {
@@ -230,7 +232,8 @@ mod tests {
                 name: "alpha".into(),
                 machine: "hub".into(),
                 runner: "claude".into(),
-                role: Default::default(),
+                tags: Vec::new(),
+                slot: None,
             }],
         );
         match resolve_target(&project, "alpha").unwrap() {
@@ -256,7 +259,8 @@ mod tests {
                 name: "delta".into(),
                 machine: "devbox".into(),
                 runner: "claude".into(),
-                role: Default::default(),
+                tags: Vec::new(),
+                slot: None,
             }],
         );
         match resolve_target(&project, "delta").unwrap() {
@@ -282,13 +286,15 @@ mod tests {
                     name: "alpha".into(),
                     machine: "hub".into(),
                     runner: "claude".into(),
-                    role: Default::default(),
+                    tags: Vec::new(),
+                    slot: None,
                 },
                 WorkspaceSpec {
                     name: "bravo".into(),
                     machine: "hub".into(),
                     runner: "claude".into(),
-                    role: Default::default(),
+                    tags: Vec::new(),
+                    slot: None,
                 },
             ],
         );

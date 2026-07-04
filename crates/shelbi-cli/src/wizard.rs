@@ -142,6 +142,7 @@ pub fn setup_one_project() -> Result<()> {
         kind: MachineKind::Local,
         work_dir: PathBuf::from(&hub_work_dir),
         host: None,
+        tags: Vec::new(),
     }];
 
     // ---- Remote machine loop --------------------------------------------
@@ -158,6 +159,7 @@ pub fn setup_one_project() -> Result<()> {
             kind: MachineKind::Ssh,
             work_dir: PathBuf::from(m_work_dir),
             host: Some(m_host),
+            tags: Vec::new(),
         });
         prompt_label = "Add another remote machine?";
     }
@@ -438,7 +440,8 @@ fn assign_workspace_names(
                 name,
                 machine: machine.name.clone(),
                 runner: Runner::Claude.id().to_string(),
-                role: Default::default(),
+                tags: Vec::new(),
+                slot: None,
             });
         }
     }
@@ -472,6 +475,7 @@ mod tests {
             kind: MachineKind::Local,
             work_dir: "/tmp".into(),
             host: None,
+            tags: Vec::new(),
         }];
         let workspaces = assign_workspace_names(&machines, 3, WorkspaceNamePreset::Phonetic).unwrap();
         let names: Vec<_> = workspaces.iter().map(|w| w.name.as_str()).collect();
@@ -486,12 +490,14 @@ mod tests {
                 kind: MachineKind::Local,
                 work_dir: "/tmp".into(),
                 host: None,
+                tags: Vec::new(),
             },
             Machine {
                 name: "remote".into(),
                 kind: MachineKind::Ssh,
                 work_dir: "/tmp".into(),
                 host: Some("remote".into()),
+                tags: Vec::new(),
             },
         ];
         let workspaces = assign_workspace_names(&machines, 2, WorkspaceNamePreset::Phonetic).unwrap();
@@ -513,6 +519,7 @@ mod tests {
             kind: MachineKind::Local,
             work_dir: "/tmp".into(),
             host: None,
+            tags: Vec::new(),
         }];
         // Toy Story has 20 names; ask for 22.
         let workspaces = assign_workspace_names(&machines, 22, WorkspaceNamePreset::ToyStory).unwrap();

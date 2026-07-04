@@ -99,6 +99,7 @@ pub(crate) mod test_support {
                 kind: MachineKind::Local,
                 work_dir: repo.clone(),
                 host: None,
+                tags: Vec::new(),
             }],
             orchestrator: OrchestratorSpec {
                 runner: "claude".into(),
