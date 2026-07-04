@@ -213,14 +213,17 @@ function userLine(text: string): ChatLine {
   return { kind: "user", text }
 }
 
-// The prior exchange already scrolled into the conversation at beat 1: an
-// earlier back-and-forth (yesterday's API-cleanup work landing on main) rolls
-// into the user and Claude writing `dashboard.md` together, so the session
-// reads as established and ongoing rather than a fresh start, and the new
-// request (beat 2) reads as the natural next step. The conversation is
-// bottom-anchored in the fixed frame, so the oldest lines clip off the top as
-// later beats stream in more output — the newest turns always stay by the input
-// box.
+// The prior exchange the loop opens on (beat 1) is deliberately long — a
+// substantive design conversation about the analytics dashboard: yesterday's
+// API-cleanup landing rolls into a back-and-forth on the metric tiles, the
+// charts, a CSV export, and the empty/loading states, then Claude writes
+// `dashboard.md` and asks to break it up. It's long enough (~35 rendered rows
+// against a ~29-row transcript area) that the earliest turns are already
+// clipped off the top at beat 1, so the pane reads as the MIDDLE of an
+// established session rather than a fresh start. The conversation is bottom-
+// anchored in the fixed frame, so those oldest lines stay clipped as later
+// beats stream in more output — the newest turns always sit by the input box,
+// and the whole design thread lands on the break-it-down prompt (beat 2).
 const PRIOR_EXCHANGE: ChatLine[] = [
   userLine("Morning. Where did the API cleanup land yesterday?"),
   { kind: "blank" },
@@ -229,17 +232,45 @@ const PRIOR_EXCHANGE: ChatLine[] = [
     text: "Both tasks cleared review overnight — the rate-limit and the search pagination work merged to main. The board's clear.",
   },
   { kind: "blank" },
-  userLine("Nice. Let's plan an analytics dashboard for the app."),
+  userLine("Good. Let's design the analytics dashboard we sketched last week."),
   { kind: "blank" },
-  { kind: "prose", text: "On it. I'll draft dashboard.md — metrics, charts, filters, export." },
+  {
+    kind: "prose",
+    text: "Sure. Starting from the mock: a metrics overview across the top, charts beneath, and a date-range filter driving the whole page. What's the headline metric?",
+  },
+  { kind: "blank" },
+  userLine("Signups, active users, and revenue — as big number tiles with week-over-week deltas."),
+  { kind: "blank" },
+  {
+    kind: "prose",
+    text: "Got it. I'll have the tiles read from one /api/metrics endpoint so a single request backs the whole header row.",
+  },
+  { kind: "blank" },
+  userLine("And the charts underneath?"),
+  { kind: "blank" },
+  {
+    kind: "prose",
+    text: "A line chart for the trend and a bar chart for the plan breakdown. Both share the date range, so changing it re-queries once and both redraw.",
+  },
+  { kind: "blank" },
+  userLine("Add a way to pull the raw numbers out too — finance keeps asking."),
+  { kind: "blank" },
+  {
+    kind: "prose",
+    text: "A CSV export scoped to the current filter, then. I'll also handle the empty and loading states so it never paints blank on first load.",
+  },
+  { kind: "blank" },
+  userLine("Perfect. Write it up so we don't lose the thread."),
+  { kind: "blank" },
+  {
+    kind: "prose",
+    text: "On it. I'll draft dashboard.md — metrics API, charts, date-range filter, CSV export, empty/loading states, and tests.",
+  },
   { kind: "blank" },
   { kind: "tool", name: "Write", args: "dashboard.md" },
   { kind: "result", text: "48 lines written" },
   { kind: "blank" },
-  {
-    kind: "prose",
-    text: "Done. dashboard.md covers a metrics API, chart components, a date-range filter, CSV export, empty/loading states, and tests. Want me to break it into tasks?",
-  },
+  { kind: "prose", text: "Done. dashboard.md covers all six. Want me to break it into tasks?" },
 ]
 
 // What the orchestrator streams after the user's message: a line of narration
@@ -267,22 +298,56 @@ function streamUpTo(n: number): ChatLine[] {
   return [...SENT, ...STREAM_TAIL.slice(0, n)]
 }
 
-// The focused worker (alpha) doing believable work on "Metrics API endpoint":
-// it picks up its dispatched task, reads the spec + the route it's extending,
-// implements the endpoint and its tests (each edit with a diffstat), then runs
-// the suite + lands the session footer. This is the newest content the eye
-// lands on at the end of the loop, so it's the fullest transcript in the story —
-// several steps of in-progress work stacked above the bottom-pinned prompt.
+// The focused worker (alpha) doing believable work on "Metrics API endpoint".
+// Its first turn is the dispatched task itself, rendered as a `❯` user prompt —
+// mirroring how a real dispatch seeds the worker's session with the task
+// title/body. From there it reads the spec + the routes it's extending,
+// implements the query, endpoint, response type, and tests (each edit with a
+// diffstat), coalesces the empty-range case, then runs the suite + lands the
+// session footer. It's the fullest transcript in the story and the newest
+// content the eye lands on at the end of the loop: it fills the ~29-row
+// transcript area exactly, so the task prompt sits flush at the very top with
+// no blank padding above it and the work stacks solid down to the pinned input
+// box — the pane reads as work already deep in progress rather than a session
+// that just began. (Worker `user` prompts render on one row, so the prompt is
+// kept under the ~108-cell pane width to stay fully readable at the top edge.)
 const WORKER_BASE: ChatLine[] = [
-  { kind: "user", text: "Implement the metrics API endpoint from dashboard.md." },
+  {
+    kind: "user",
+    text: "Implement the metrics API endpoint from dashboard.md — GET /api/metrics with from/to range params.",
+  },
   { kind: "blank" },
   { kind: "prose", text: "Reading the spec and the route I'll extend." },
   { kind: "tool", name: "Read", args: "dashboard.md" },
   { kind: "tool", name: "Read", args: "api/metrics.ts" },
+  { kind: "tool", name: "Read", args: "db/queries.ts" },
+  {
+    kind: "prose",
+    text: "The tiles need signups, active users, and revenue in one payload, so I'll aggregate all three in a single range-keyed query.",
+  },
+  { kind: "tool", name: "Edit", args: "db/queries.ts" },
+  { kind: "prose", text: "+29 -2  ·  Added metricsForRange() with a grouped aggregate." },
   { kind: "tool", name: "Edit", args: "api/metrics.ts" },
-  { kind: "prose", text: "+38 -4  ·  Added GET /api/metrics with range params." },
+  {
+    kind: "prose",
+    text: "+38 -4  ·  Added GET /api/metrics; validates from/to and defaults to the last 30 days.",
+  },
+  { kind: "blank" },
+  { kind: "prose", text: "Wiring the response type through so the client tiles stay typed." },
+  { kind: "tool", name: "Edit", args: "types/metrics.ts" },
+  { kind: "prose", text: "+11 -0  ·  Exported a MetricsResponse shared by the API and the tiles." },
+  { kind: "tool", name: "Bash", args: "npm run typecheck" },
+  { kind: "result", text: "✓ no type errors" },
+  { kind: "blank" },
+  {
+    kind: "prose",
+    text: "Empty ranges came back null — coalescing to zero so the tiles show 0, not blank.",
+  },
+  { kind: "tool", name: "Edit", args: "api/metrics.ts" },
+  { kind: "prose", text: "+3 -1  ·  Coalesced empty aggregates to zero." },
+  { kind: "blank" },
+  { kind: "prose", text: "Now the tests — valid ranges, a missing param, and the empty-range case." },
   { kind: "tool", name: "Edit", args: "api/metrics.test.ts" },
-  { kind: "prose", text: "+24 -0  ·  Covered the range params and the empty-range case." },
   { kind: "tool", name: "Bash", args: "npm test -- metrics" },
 ]
 const WORKER_RUNNING: ChatLine[] = [
