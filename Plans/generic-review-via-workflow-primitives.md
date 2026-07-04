@@ -1,168 +1,161 @@
 # Generic Review via Workflow Primitives
 
-**Status:** design decisions resolved with jlong 2026-07-03. Ready to break into
+**Status:** design locked with jlong 2026-07-03. Ready to break into
 implementation tasks. Author: Orchestrator.
+
+## North star (definition of done)
+
+**After this plan ships, there is NO review-specific code in the crates.**
+`grep -rniE "review" crates/ --include=*.rs` should find nothing but incidental
+prose — no `Review`-named types, functions, config, routing branches, CLI
+commands, or TUI sections. "Review" becomes purely a *configuration* of generic
+primitives: a workspace carries a **tag**, a **status** routes work to a
+tagged workspace, and **transitions run commands** (setup/serve, readiness,
+teardown). The shipped `review` agent stays only as a *default agent* (content,
+user-editable), referenced by no special-case code.
 
 ## Motivation
 
-Review workspaces currently rely on a bespoke `review:` config block plus
-special-cased loading code. That bakes a web-dev-server assumption (TCP ports +
-HTTP readiness probe) into Shelbi's core, so review only fits web apps. Review
-should instead be **composition of generic workflow primitives** so it works for
-any project type and there is no special "review" machinery in the engine.
+Review is currently a bespoke feature baked into the core: a `review:` config
+block, a `WorkspaceRole` enum, `is_review()` branching, dedicated
+`review.rs`/`load_review_workspace` loading, a `shelbi review` command, and
+hardcoded TUI "Ready/Queued for Review" sections. That assumes a web dev server
+(ports + HTTP probe) and hardwires "review" throughout. Shelbi should express
+review as composition of generic workflow primitives so it works for any project
+type and carries zero review-specific machinery.
 
 ## The vision (jlong)
 
-> A Review column in a workflow is simply a **Status** with settings to use a
-> **workspace with a particular tag** (`review`), and a **transition rule** that
-> runs a set of commands (install libraries, start a server), and even a
-> **transition for teardown** (if needed) that also runs a set of commands.
+> A Review column is simply a **Status** that uses a **workspace with a
+> particular tag**, plus a **transition rule** that runs a set of commands
+> (install libraries, start a server) and a **teardown transition** that runs a
+> set of commands. Workspaces have a **`tag`** key (not `role`). `is_review` and
+> all review-specific code go away.
 
-## Current state (what exists today)
+## Review-specific surface to REMOVE (and its generic replacement)
 
-- **`ReviewConfig`** (`crates/shelbi-core/src/model.rs` \~L580), under the project's
-  `review:` key: `base_port` (3000), `port_stride` (10), `setup: Vec<String>`,
-  `serve: Option<String>`, `ready_probe: { http, timeout: 90s }`.
+| Remove (review-specific) | Replace with (generic) |
+|---|---|
+| `review:` block — `ReviewConfig`/`ReadyProbe` (base_port, port_stride, setup, serve, ready_probe) | transition `run` + `ready`/`ready_timeout` commands; `$SLOT` env |
+| `WorkspaceRole { Dev, Review }` enum + `role` field | workspace **`tag: Option<String>`** |
+| `WorkspaceSpec::is_review()` | generic tag test at call sites / a status↔tag match |
+| `Project::review_workspaces()` / `dev_workspaces()` | generic `workspaces_with_tag(tag)` / `workspaces_untagged()` (or query by the status's required tag) |
+| `review.rs`, `workspace::load_review_workspace`, `review_workspace_port` | generic "load a task onto a workspace matching the status's tag, then run the status's enter-transition commands" |
+| poller `maybe_promote_to_review` review-specifics | generic transition handling (already partly generalized by the shipped transition marker) |
+| `shelbi review <id>` command | generic load/dispatch onto a tagged workspace (command removed or renamed to a tag-neutral form) |
+| TUI hardcoded "Ready for Review" / "Queued for Review" sections + Review column special rendering | render from status/category generically (labels come from the status name) |
 
-- **`WorkspaceSpec.role = review`** — the generic tag already exists on a workspace.
+## Generic design (locked decisions)
 
-- **Transitions** (`transition.rs::execute_transition` / `run_action`): an edge's
-  `actions` is a fixed enum set — `PushBranch, OpenPr, ClosePr, Merge, DeleteBranch, Restack`. No arbitrary commands.
+### A. Workspaces carry a `tag` (remove `role`/`is_review`)
 
-- **Review loading** (`review.rs` + `workspace::load_review_workspace`): picks a
-  free `role: review` slot, moves the branch onto its worktree, injects `$PORT`
-  (`review_workspace_port` from base\_port/stride), starts the `review` agent to
-  run setup/serve/probe.
+```rust
+pub struct WorkspaceSpec {
+    pub name: String, pub machine: String, pub runner: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tag: Option<String>,      // e.g. "review"; None = normal slot
+}
+```
+- Remove `WorkspaceRole`, the `role` field, and `is_review()`. Routing is by tag.
+- **Back-compat:** tolerate a legacy `role:` key on read, mapping `role: Review`
+  (any case) → `tag: "review"`, `role: Dev` → untagged. Canonical/scaffold/docs
+  use `tag`; `role` is never written. No file migration (ContextStore precedent).
 
-- Recently shipped: the **agent transition marker** (`.claude/shelbi-transition`)
-  lets an agent trigger a transition, validated against the workflow's
-  `transitions`. This plan extends transitions to *run commands* when they fire.
-
-## Design (decisions locked)
-
-### 1. Transitions run command sets, with a `$SLOT` env contract
-
-An edge can run shell commands when it fires. The enter transition (into review)
-runs setup + starts the server; the exit transition (out of review) runs teardown:
+### B. A Status routes to a tagged workspace
 
 ```yaml
 statuses:
-  - id: review
+  - id: review           # just a status; nothing special about the name
     owner: user
-    workspace_tag: review          # route to a slot tagged `review`
+    workspace_tag: review # route tasks here to a workspace tagged `review`
+```
+- Dispatch/loader picks a free workspace whose `tag` matches. The status name is
+  arbitrary; no code branches on "review".
 
+### C. Transitions run command sets, with a `$SLOT` env contract
+
+```yaml
 transitions:
   - from: in-progress
     to: review
-    run:                           # commands when the task ENTERS review
+    run:                                            # commands on ENTER
       - npm install
-      - npm run dev -- --port $((3000 + $SLOT))   # server; holds the pane
-    ready: curl -sf localhost:$((3000 + $SLOT))   # readiness: must exit 0
+      - npm run dev -- --port $((3000 + $SLOT))     # server; holds the pane
+    ready: curl -sf localhost:$((3000 + $SLOT))     # readiness: must exit 0
     ready_timeout: 90s
   - from: review
     to: done
     actions: [merge, delete_branch]
-    run:                           # commands when the task LEAVES review (teardown)
-      - <stop server / cleanup, if needed>
+    run:                                            # teardown on EXIT
+      - <stop server / cleanup>
 ```
-
-- **`$SLOT`** **env.** Each workspace carries a numeric **`slot`** key. Shelbi exposes
-  it to every transition command as **`$SLOT`**; the command does its own math
-  (`3000 + $SLOT` → 3001 for slot 1). Shelbi does NOT inject a computed `$PORT` —
-  `$SLOT` is generic (ports, dirs, DB names, whatever the command needs).
-  Collision-free concurrency without a bespoke serving config.
-
-- Also inject `$SHELBI_TASK`, `$SHELBI_BRANCH`, `$SHELBI_WORKTREE`, `$SHELBI_MACHINE`.
-
-- Commands run in the task's worktree, on the workspace's machine, **host-routed
-  through** **`shelbi_ssh::run`** (works on devbox).
-
-- **`ready`** **+** **`ready_timeout`.** After the enter commands, Shelbi polls the `ready`
-  command until it exits 0 (or the timeout, default 90s), then marks the review
-  serving/ready for the human. Generic — not HTTP-specific.
-
-- **Teardown is not magic.** It is simply the `run:` commands on whatever exit
-  transition the workflow declares (`review → done`, `review → in-progress` on a
-  bounce, etc.). No auto-on-pane-close hook. (Transitions are the mechanism: a
-  status change requires a declared transition; commands run when it fires.
-  A `to: "*"` wildcard transition may be worth supporting so one teardown rule
-  covers all exits — see Open items.)
-
+- **`$SLOT`**: each workspace carries a numeric `slot` key; Shelbi exposes it as
+  `$SLOT` to transition commands, which do their own math (`3000 + $SLOT`). No
+  bespoke `$PORT`. Also inject `$SHELBI_TASK`/`$SHELBI_BRANCH`/`$SHELBI_WORKTREE`/`$SHELBI_MACHINE`.
+- Commands run in the task's worktree on the workspace's machine, **host-routed
+  via `shelbi_ssh::run`** (works on devbox).
+- **`ready` + `ready_timeout`** (default 90s): poll until exit 0, then mark serving.
+- **Teardown is not magic**: it's the `run:` commands on the declared exit
+  transition (`review → done`, `review → in-progress` on bounce). No auto hook.
+  (A `to: "*"` wildcard transition may be worth supporting so one teardown rule
+  covers all exits — Open items.)
 - `actions` (git primitives) and `run` (shell) compose on one edge.
+- Serve foreground/background mechanics: the long-running server holds the
+  workspace's pane; the transition is "entered" once launched; `ready` decides
+  serving. Exact mechanics finalized in Phase 1.
 
-- **Serve lifecycle (Phase-1 detail):** the long-running server command holds the
-  review agent's pane; Shelbi treats the transition as entered once the enter
-  commands are launched and uses `ready` to decide when it's serving. Exact
-  background/foreground mechanics to be nailed in Phase 1.
+## Backward compatibility (tolerate, don't migrate)
 
-### 2. A Status requires a workspace tag/role
+- Legacy `review:` blocks are **silently ignored** (ContextStore precedent).
+- Legacy `role:` keys map to `tag` on read (see §A). No on-disk migration; users'
+  files are never rewritten.
+- Existing tagged (`role: review`) workspaces keep working via the alias.
 
-`workspace_tag: review` on a status routes it to a `role: review` pool slot. This
-subsumes today's implicit "review status → role:review workspace" routing. `role`
-on the workspace stays the generic tag; the status references it. Works alongside
-the existing `agent:` field (the `review` agent still runs; the tag decides the slot).
+## Open items (resolve during implementation)
 
-### 3. Remove the bespoke `review:` block
-
-Delete `ReviewConfig` / `ReadyProbe` (`base_port`, `port_stride`, `setup`, `serve`,
-`ready_probe`). Its behavior is reconstructed by the workflow (enter `run` +
-`ready` + `$SLOT`). `review.rs` / `load_review_workspace` stop reading `ReviewConfig`
-and execute the status's enter-transition commands instead.
-
-## Backward compatibility
-
-- Existing `review:` blocks are **silently ignored** (like the removed
-  `contextstore_sync` — tolerate the legacy key, don't act on it, don't migrate
-  the user's file). Users opt into the new workflow form. No on-disk migration.
-
-- Existing `role: review` workspaces keep working; they gain a `slot` number
-  (default by declaration order if unset).
-
-## Open items (smaller, resolve during implementation)
-
-- **`to: "*"`** **wildcard transitions** — jlong noted a status change requires a
-  declared transition. Consider a wildcard target so one exit rule (teardown) can
-  cover all exits from a status. Confirm whether unlisted edges stay any-to-any or
-  become "must be declared."
-
-- **Serve foreground/background mechanics** (see §1) — how the long-running server
-  is held and torn down.
-
-- **Default** **`slot`** assignment when a workspace omits the key.
+- `to: "*"` wildcard transitions (jlong): a status change requires a declared
+  transition; a wildcard target lets one teardown rule cover all exits. Confirm
+  whether unlisted edges stay any-to-any.
+- Serve foreground/background + teardown mechanics (§C).
+- Default `slot` assignment when a workspace omits it (declaration order?).
+- `shelbi review` fate: remove vs. rename to a tag-neutral load command.
+- TUI: how status/category drive the (formerly review) sidebar sections + labels.
 
 ## Implementation phases
 
-- **Phase 1 (app):** workflow schema — transition `run` + `ready`/`ready_timeout`,
-  status `workspace_tag`, workspace `slot`; execute commands host-routed in
-  `execute_transition` with the `$SLOT`/`$SHELBI_*` env; readiness polling. Tests:
-  enter/exit ordering, host routing, env injection, ready timeout, failure short-circuit.
-
-- **Phase 2 (app):** reroute review — `shelbi review` / `load_review_workspace`
-  use the status tag + transition commands instead of `ReviewConfig`; remove
-  `ReviewConfig`/`ReadyProbe`; ignore legacy `review:` blocks. Tests.
-
-- **Phase 3 (docs):** rewrite `concepts/review-workspaces.mdx`,
-  `configuration/workflow.mdx`, `guides/getting-started/review-workspaces.mdx` to
-  the generic model; remove the `review:` block reference; document `$SLOT`,
-  `run`/`ready`/teardown, `workspace_tag`, `slot`.
+- **Phase 1 (app): generic workflow primitives.** Workspace `tag` + `slot`
+  (remove `role`/`WorkspaceRole`/`is_review`, with legacy `role:` tolerance);
+  status `workspace_tag`; transition `run`/`ready`/`ready_timeout` executed
+  host-routed with the `$SLOT`/`$SHELBI_*` env; generic tag queries replacing
+  `review_workspaces()`/`dev_workspaces()`. Tests: tag routing, enter/exit
+  ordering, env, ready timeout, legacy `role:` load.
+- **Phase 2 (app): delete the review-specific code.** Remove `ReviewConfig`/
+  `ReadyProbe`, `review.rs`/`load_review_workspace`/`review_workspace_port`, the
+  poller's review-specifics, `shelbi review`; reroute loading + serving through
+  the generic tag + transition-command path; genericize the TUI sidebar sections
+  and column rendering to be status/category-driven. **Exit check:** `grep
+  -rniE "review" crates/ --include=*.rs` returns only incidental prose. Tests.
+- **Phase 3 (docs): rewrite** `concepts/review-workspaces.mdx`,
+  `configuration/workflow.mdx`, `guides/getting-started/review-workspaces.mdx`,
+  and any `role`/`is_review`/`review:` references to the generic tag+transition
+  model; document `tag`, `slot`, `$SLOT`, `run`/`ready`/teardown, `workspace_tag`.
 
 ## Files likely touched
 
-- `crates/shelbi-core/src/model.rs` — Transition (`run`, `ready`, `ready_timeout`),
-  Status (`workspace_tag`), WorkspaceSpec (`slot`), remove `ReviewConfig`/`ReadyProbe`.
-
-- `crates/shelbi-orchestrator/src/transition.rs` — run shell commands on an edge.
-
-- `crates/shelbi-orchestrator/src/review.rs`, `workspace.rs` — load via tag +
-  commands; `$SLOT`; readiness; remove ReviewConfig reads.
-
-- `crates/shelbi-tui/src/poller.rs` — route a status to its tagged workspace.
-
+- `crates/shelbi-core/src/model.rs` — WorkspaceSpec (`tag`, `slot`, remove
+  `role`/`WorkspaceRole`/`is_review`), Transition (`run`/`ready`/`ready_timeout`),
+  Status (`workspace_tag`), remove `ReviewConfig`/`ReadyProbe`, generic tag queries.
+- `crates/shelbi-orchestrator/src/{transition,review,workspace,poller?}.rs` — run
+  commands on edges; delete review.rs / load_review_workspace; generic tag load.
+- `crates/shelbi-tui/src/{poller,app,kanban,sidebar,review}.rs` — remove review
+  special-casing; status/category-driven rendering.
+- `crates/shelbi-cli/src/…` — remove `shelbi review`; `tag`/`slot` in wizard/scaffold.
 - Docs as in Phase 3.
 
-## Relationship to existing plans
+## Relationship to existing plans / work
 
-- Supersedes the serving-model portion of `Plans/review-workspaces.md`.
-
+- Supersedes `Plans/review-workspaces.md` (the serving model + review-specific machinery).
 - Builds on `Plans/workflow-transition-hooks.md` and the shipped agent send-back /
-  transition-marker feature.
+  transition-marker feature (edges already carry actions + can be triggered; this
+  adds command execution, teardown, `$SLOT`, workspace tags, and removes all
+  review special-casing).
