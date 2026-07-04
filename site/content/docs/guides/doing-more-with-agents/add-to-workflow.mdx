@@ -1,0 +1,179 @@
+---
+title: Add it to a workflow
+order: 42
+summary: Declare an adversarial-review status in statuses.yaml, reference it from a workflow with owner + agent, and rewire the transitions so a branch flows through the automated skeptic on its way to human review.
+---
+
+The [agent exists](/docs/guides/doing-more-with-agents/adversarial-review-agent);
+now give it a status to own. Wiring a new agent into a workflow is two
+files — the status *identity* is declared once in `statuses.yaml`, and the
+workflow file *references* it by `id`, adds an `owner`, and points it at the
+agent. Keep that split correct: repeating `name:` or `category:` in the
+workflow file fails the load.
+
+## 1. Declare the status identity
+
+Add the status to the project-wide catalog in
+[`workflows/statuses.yaml`](/docs/configuration/statuses), placed where you
+want its column to sit — between `in-progress` and `review`:
+
+```yaml
+# workflows/statuses.yaml
+statuses:
+  - { id: backlog,             name: Backlog,             category: backlog }
+  - { id: todo,                name: Todo,                category: ready }
+  - { id: in-progress,         name: In Progress,         category: active }
+  - { id: adversarial-review,  name: Adversarial Review,  category: active }
+  - { id: review,              name: Review,              category: handoff }
+  - { id: done,                name: Done,                category: done }
+```
+
+`category` comes from the
+[closed vocabulary](/docs/configuration/statuses#categories) —
+`backlog`, `ready`, `active`, `handoff`, `done`, `archived`. Because an
+agent is *actively working* the review while a task sits here, it's
+`active`, not `handoff`: `handoff` means "one owner finished, another's
+input is required next," which is what the human `review` status already
+is. Declaration order here is the left-to-right column order in the TUI.
+
+## 2. Reference it from the workflow
+
+In the [workflow file](/docs/configuration/workflow), reference the status
+by `id` between `in-progress` and `review`. Make it agent-owned and point
+it at the agent you authored:
+
+```yaml
+# workflows/default.yaml
+statuses:
+  - { id: backlog,             owner: user,  agent: orchestrator }
+  - { id: todo,                owner: agent, agent: orchestrator }
+  - { id: in-progress,         owner: agent, agent: developer }
+  - { id: adversarial-review,  owner: agent, agent: adversarial-review }
+  - { id: review,              owner: user,  agent: orchestrator }
+  - { id: done,                owner: user }
+```
+
+`owner: agent` makes the status the orchestrator's to act on, so tasks
+that land here are [auto-dispatched](/docs/concepts/orchestrator); the
+`agent: adversarial-review` field names *which* agent runs it. No `name:`
+or `category:` appears here — those live in `statuses.yaml` and repeating
+them fails the load.
+
+## 3. Rewire the transitions
+
+[Transitions](/docs/configuration/workflow#transitions) declare the
+hub-side side-effects that fire on an edge; unlisted edges are pure status
+changes. Route the developer's branch into adversarial review, then on to
+human review, with a bounce-back for when the skeptic finds problems — and
+keep `merge` on the single final edge into `done`:
+
+```yaml
+transitions:
+  - { from: in-progress,        to: adversarial-review, actions: [push_branch, open_pr] }
+  - { from: adversarial-review, to: review,             actions: [] }
+  - { from: adversarial-review, to: in-progress,        actions: [] }
+  - { from: review,             to: done,               actions: [merge, delete_branch] }
+```
+
+What each edge does:
+
+- **`in-progress → adversarial-review`** runs `push_branch` and `open_pr`,
+  so the branch is on the remote with a PR open before the reviewer starts —
+  the reviewer works against a real diff, and its findings have somewhere to
+  land.
+- **`adversarial-review → review`** has no actions: the branch is already
+  pushed and PR'd, so promoting a clean pass to human review is a pure
+  status change.
+- **`adversarial-review → in-progress`** is the bounce-back. When the
+  skeptic files blockers, the task drops to the developer with no git
+  side-effects — same branch, same PR, another pass.
+- **`review → done`** is the only edge carrying `merge` (and
+  `delete_branch`). That's deliberate.
+
+The [action primitives](/docs/configuration/workflow#actions) in play are
+`push_branch` (push the task branch to origin), `open_pr` (open its PR),
+`merge` (merge the branch into its target), and `delete_branch` (delete the
+local and remote branch).
+
+<Callout type="note" title="Keep merge on the final edge">
+
+`merge` trips [Zen Mode's high-confidence bar](/docs/concepts/zen-mode).
+Keeping it on the single `review → done` edge — and nowhere earlier — means
+the automated reviewer never lands code. It surfaces findings; the human
+still owns the accept.
+
+</Callout>
+
+## What you see now
+
+The board grows an **Adversarial Review** column between In Progress and
+Review. Tasks the developer marks ready flow into it, get auto-dispatched
+to the `adversarial-review` agent, and either bounce back with blockers or
+advance to human review with the skeptic's findings already waiting on the
+PR.
+
+<AppMockup
+  state={{
+    terminalTitle: "you@hub — webapp",
+    project: "webapp",
+    activeView: "tasks",
+    columns: [
+      {
+        label: "TO DO",
+        category: "blue",
+        cards: [
+          { title: "Add ratelimit to API", id: "t-043" },
+        ],
+      },
+      {
+        label: "IN PROGRESS",
+        category: "yellow",
+        cards: [
+          { title: "Wire up OAuth flow", id: "t-045", workspace: "bravo" },
+        ],
+      },
+      {
+        label: "ADVERSARIAL REVIEW",
+        category: "yellow",
+        cards: [
+          { title: "Cache warm-up on cold start", id: "t-046", workspace: "charlie", selected: true },
+        ],
+      },
+      {
+        label: "REVIEW",
+        category: "magenta",
+        cards: [
+          { title: "Add CSV export", id: "t-044" },
+        ],
+      },
+      {
+        label: "DONE",
+        category: "green",
+        cards: [
+          { title: "Ship dark-mode toggle", id: "t-047" },
+        ],
+      },
+    ],
+    machines: [
+      {
+        name: "hub",
+        workspaces: [
+          { name: "alpha", state: "idle" },
+          { name: "bravo", state: "working", agent: "developer" },
+          { name: "charlie", state: "working", agent: "adversarial-review" },
+        ],
+      },
+    ],
+    readyReview: [],
+    queuedReview: [],
+  }}
+/>
+
+## See also
+
+- [Workflow config](/docs/configuration/workflow) — the field-by-field
+  reference for `statuses`, `transitions`, and their actions.
+- [Statuses](/docs/configuration/statuses) — the `statuses.yaml` catalog
+  and the closed category vocabulary.
+- [Orchestrator](/docs/concepts/orchestrator) — how agent-owned statuses
+  get auto-dispatched and handed off.
