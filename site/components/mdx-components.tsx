@@ -5,6 +5,7 @@ import { Callout } from "./Callout"
 import { CodeTab, CodeTabs } from "./CodeTabs"
 import { CopyPromptBanner } from "./CopyPromptBanner"
 import { InstallCommand } from "./InstallCommand"
+import { Pre } from "./Pre"
 import { Steps, Step } from "./Steps"
 
 /**
@@ -63,12 +64,8 @@ export const mdxComponents: MDXComponents = {
       {...props}
     />
   ),
-  pre: (props) => (
-    <pre
-      className="my-3 overflow-x-auto rounded-md border border-gray-4 bg-gray-1 px-3 py-3 font-mono text-sm leading-relaxed [&_code]:font-mono"
-      {...props}
-    />
-  ),
+  // Fenced code blocks get a hover/focus copy button; see `Pre.tsx`.
+  pre: (props) => <Pre {...props} />,
   // Tables — strict-mono ruling. Cells inherit `text-gray-7` from the table
   // wrapper; headers and the leftmost label column bump to `text-fg` so the
   // axis of comparison reads first.
