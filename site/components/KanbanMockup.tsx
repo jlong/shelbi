@@ -62,6 +62,7 @@ const TUI_YELLOW = "#dcb767" // ANSI 3 — `Active` category (in_progress)
 const TUI_MAGENTA = "#c586c0" // ANSI 5 — `Handoff` (review) + `@workspace`
 const TUI_GREEN = "#5fb56d" // ANSI 2 — `Done` category + Working badge
 const TUI_CYAN = "#4ec9b0" // ANSI 6 — project name in title bar + ✓ review badge
+const TUI_LIGHT_RED = "#ff6e67" // ANSI 9 — foxtrot's avatar tint (`Color::LightRed` in activity.rs)
 // Zen-mode band fill: the TUI paints the "ZEN MODE ON" footer bar with an
 // explicit `bg(Color::Rgb(0,127,0))` + `fg(White)` bold (`render_zen_row`
 // in `crates/shelbi-tui/src/sidebar.rs`) — not a named ANSI color, so it
@@ -424,182 +425,353 @@ function padBodyTo(rows: Segment[][], target: number): Segment[][] {
   return out
 }
 
-// One Activity feed entry. `started`/`finished`/`idle` mirror the human-friendly
-// reformatting `activity.rs` does over `~/.shelbi/events.log`; `merged` is a
-// board-level "task shipped" line. `detail`/`metric` are the dim second line and
-// the right-aligned figure ("took 12m", "#213").
-type ActivityEvent = {
-  kind: "started" | "finished" | "idle" | "merged"
-  who: string
-  action: string
-  title?: string
-  detail?: { label: string; labelColor: string; branch: string }
-  metric?: string
+// ── Activity avatars ──────────────────────────────────────────────────
+// The exact half-block "face" glyph arrays + per-workspace tints from
+// `crates/shelbi-tui/src/activity.rs` (`ALPHA_AVATAR` … `FOXTROT_AVATAR`,
+// `avatar_for`). Each face is `AVATAR_H` rows of `AVATAR_W` cells; reusing the
+// crate's exact arrays means the mockup can't drift from the running TUI.
+const AVATAR_W = 4 // activity.rs `AVATAR_W`
+const AVATAR_GAP = 2 // activity.rs `AVATAR_GAP` — cells between avatar and text
+const ACT_LEAD = 1 // leading pad; the crate uses `horizontal_margin(2)`, but the
+// mockup matches the board's 1-col left pad so the pane aligns with the title row.
+
+type Avatar = { rows: [string, string, string]; color: string }
+
+const AVATARS: Record<string, Avatar> = {
+  alpha: { rows: ["▄▀▀▄", "█▄▄█", " ▀▀ "], color: TUI_CYAN },
+  bravo: { rows: ["▄██▄", "█▄▄█", "▀  ▀"], color: TUI_MAGENTA },
+  charlie: { rows: ["▄▀▀▄", "▌▄▄▐", "▀  ▀"], color: TUI_GREEN },
+  delta: { rows: ["▄▄▄▄", "▌▄▄▐", "▐  ▌"], color: TUI_YELLOW },
+  echo: { rows: ["▄▀▀▄", "█  █", "▀▀▀▀"], color: TUI_BLUE },
+  foxtrot: { rows: ["▄  ▄", "█▀▀█", "▐▄▄▌"], color: TUI_LIGHT_RED },
 }
 
-// Representative feed for the sample project — same workspaces (alpha/bravo/
-// charlie/echo) and task titles as the board. Simplification: the real view
-// prefixes each attributed row with a multi-line avatar face; here each row
-// carries a single status glyph in its state tint (⏵ working / · idle / ✓ done)
-// instead, so the feed stays on the board's tight monospace grid without an
-// avatar column blowing the alignment budget.
+// One Activity feed row, mirroring the event kinds `render_task_event` /
+// `render_workspace_event` paint. `started`/`finished` are workspace-attributed
+// (a face avatar + the crate's white-bold name); `waiting` is a muted
+// workspace-state row (events.log has no literal "idle" — the nearest state is
+// AwaitingInput, rendered dim); `promoted`/`accepted` are task-only rows drawn
+// with a single glyph in the avatar column (★ / ✓) the way `AvatarSlot::Glyph`
+// does. `detail` is the dim secondary line; `when` is the right-aligned
+// relative timestamp.
+type ActivityEvent =
+  | { kind: "started"; ws: string; agent?: string; title: string; detail: string; when: string }
+  | { kind: "finished"; ws: string; title: string; detail: string; when: string }
+  | { kind: "waiting"; ws: string; verb: string; detail?: string; when: string }
+  | { kind: "promoted"; title: string; detail: string; when: string }
+  | { kind: "accepted"; title: string; detail: string; when: string }
+
+// Representative `Today` feed for the sample project — same workspaces
+// (alpha/bravo/charlie/echo) and task titles as the board, newest first. Titles
+// are wrapped in the curly quotes the crate's `title_quoted` uses.
 const ACTIVITY_EVENTS: ActivityEvent[] = [
   {
     kind: "finished",
-    who: "charlie",
-    action: "finished",
+    ws: "charlie",
     title: "Cold-start cache",
-    detail: { label: "review", labelColor: TUI_MAGENTA, branch: "shelbi/cold-start-cache" },
-    metric: "took 12m",
+    detail: "took 12m · branch: shelbi/cold-start-cache",
+    when: "12m ago",
   },
   {
     kind: "started",
-    who: "alpha",
-    action: "started",
+    ws: "alpha",
+    agent: "Developer",
     title: "Deploy staging env",
-    detail: { label: "in progress", labelColor: TUI_YELLOW, branch: "shelbi/deploy-staging-env" },
+    detail: "branch: shelbi/deploy-staging-env · #2",
+    when: "18m ago",
   },
-  { kind: "idle", who: "bravo", action: "→ idle" },
+  { kind: "waiting", ws: "bravo", verb: "is waiting for input", when: "25m ago" },
   {
     kind: "started",
-    who: "echo",
-    action: "started",
+    ws: "echo",
+    agent: "Developer",
     title: "Backfill order index",
-    detail: { label: "in progress", labelColor: TUI_YELLOW, branch: "shelbi/backfill-order-index" },
+    detail: "branch: shelbi/backfill-order-index · #3",
+    when: "40m ago",
   },
-  { kind: "merged", who: "merged", action: "merged", title: "Ship dark mode", metric: "#213" },
+  { kind: "accepted", title: "Ship dark mode", detail: "moved to done", when: "1h ago" },
 ]
 
-// Column geometry for the feed, in monospace cells.
-const ACT_INDENT = 2 // leading pad before the glyph
-const ACT_GLYPH_W = 2 // glyph + trailing space
-const ACT_WHO_W = 9 // workspace/label column
-const ACT_ACTION_W = 10 // action verb column
-const ACT_DETAIL_INDENT = ACT_INDENT + ACT_GLYPH_W + ACT_WHO_W // detail aligns under the action
+/**
+ * Line 1 of an event row: `[lead][avatar cell][gap][…primary]` with the dim
+ * relative timestamp right-aligned, mirroring `paint_row`'s first line. The
+ * avatar cell is one row of a face (4 cells) or a glyph padded to 4 cells.
+ */
+function actPrimaryLine(cell: string, cellColor: string, primary: Segment[], when: string): Segment[] {
+  const left: Segment[] = [
+    { text: " ".repeat(ACT_LEAD) },
+    { text: cell, color: cellColor },
+    { text: " ".repeat(AVATAR_GAP) },
+    ...primary,
+  ]
+  return bodyRightAlignRow(left, [{ text: when, color: TUI_DARK_GRAY }])
+}
 
-/** Glyph + tint for an event's status badge (green working, gray idle, green done). */
-function activityBadge(kind: ActivityEvent["kind"]): { glyph: string; color: string } {
-  switch (kind) {
-    case "idle":
-      return { glyph: "·", color: TUI_DARK_GRAY }
-    case "merged":
-      return { glyph: "✓", color: TUI_GREEN }
-    default:
-      return { glyph: "⏵", color: TUI_GREEN }
+/**
+ * A secondary/avatar-only continuation line: `[lead][avatar cell][gap][detail]`,
+ * padded to the pane width. `cell` is the next avatar row (faces) or blank
+ * spaces (glyph rows), `detail` the dim secondary text (omitted for the third
+ * avatar row).
+ */
+function actContinuationLine(cell: string, cellColor: string, detail?: string): Segment[] {
+  const segs: Segment[] = [
+    { text: " ".repeat(ACT_LEAD) },
+    { text: cell, color: cellColor },
+  ]
+  if (detail !== undefined) {
+    segs.push({ text: " ".repeat(AVATAR_GAP) })
+    segs.push({ text: detail, color: TUI_DARK_GRAY })
   }
+  return bodyRow(segs)
+}
+
+/** Curly-quote a title the way the crate's `title_quoted` does. */
+function quoted(title: string): string {
+  return `\u{201C}${title}\u{201D}`
+}
+
+/**
+ * Render one event into its terminal lines. Face events emit 3 rows (avatar art
+ * on all three, primary on row 1, secondary on row 2); glyph events emit 1
+ * avatar row (primary) + a blank-avatar secondary — matching `paint_row`'s
+ * per-slot line counts.
+ */
+function activityEventRows(ev: ActivityEvent): Segment[][] {
+  const rows: Segment[][] = []
+  const blankCell = " ".repeat(AVATAR_W)
+
+  const faceRows = (av: Avatar, primary: Segment[], detail: string | undefined, when: string) => {
+    rows.push(actPrimaryLine(av.rows[0], av.color, primary, when))
+    rows.push(actContinuationLine(av.rows[1], av.color, detail))
+    rows.push(actContinuationLine(av.rows[2], av.color))
+  }
+  const glyphRows = (
+    glyph: string,
+    glyphColor: string,
+    primary: Segment[],
+    detail: string,
+    when: string,
+  ) => {
+    rows.push(actPrimaryLine(padTo(glyph, AVATAR_W), glyphColor, primary, when))
+    rows.push(actContinuationLine(blankCell, TUI_DARK_GRAY, detail))
+  }
+
+  switch (ev.kind) {
+    case "started": {
+      // White-bold workspace name + optional dim [agent], `started`, curly title.
+      const primary: Segment[] = [{ text: ev.ws, color: SEL_FG, bold: true }]
+      if (ev.agent) primary.push({ text: ` [${ev.agent}]`, color: TUI_DARK_GRAY })
+      primary.push({ text: "  started  ", color: TUI_GRAY })
+      primary.push({ text: quoted(ev.title), color: TUI_FG })
+      faceRows(AVATARS[ev.ws], primary, ev.detail, ev.when)
+      break
+    }
+    case "finished": {
+      faceRows(
+        AVATARS[ev.ws],
+        [
+          { text: ev.ws, color: SEL_FG, bold: true },
+          { text: "  finished  ", color: TUI_GRAY },
+          { text: quoted(ev.title), color: TUI_FG },
+          { text: " — ready for review", color: TUI_CYAN },
+        ],
+        ev.detail,
+        ev.when,
+      )
+      break
+    }
+    case "waiting": {
+      // Muted workspace-state row — dim bold name + dim verb, face still shown.
+      faceRows(
+        AVATARS[ev.ws],
+        [
+          { text: ev.ws, color: TUI_DARK_GRAY, bold: true },
+          { text: ` ${ev.verb}`, color: TUI_DARK_GRAY },
+        ],
+        ev.detail,
+        ev.when,
+      )
+      break
+    }
+    case "promoted": {
+      glyphRows(
+        "★",
+        TUI_CYAN,
+        [
+          { text: "Promoted", color: TUI_GRAY, bold: true },
+          { text: "  ", color: TUI_GRAY },
+          { text: quoted(ev.title), color: TUI_FG },
+        ],
+        ev.detail,
+        ev.when,
+      )
+      break
+    }
+    case "accepted": {
+      glyphRows(
+        "✓",
+        TUI_CYAN,
+        [
+          { text: quoted(ev.title), color: TUI_FG },
+          { text: " accepted", color: TUI_GRAY },
+        ],
+        ev.detail,
+        ev.when,
+      )
+      break
+    }
+  }
+  return rows
+}
+
+/** The full-width `── Today ───…` date-bucket header, dim (activity.rs `date_header`). */
+function activityDateHeader(label: string): Segment[] {
+  const head = ` ── ${label} `
+  const trail = "─".repeat(Math.max(0, BOARD_W - [...head].length))
+  return [{ text: head + trail, color: TUI_DARK_GRAY }]
 }
 
 function buildActivityRows(state: AppState): Segment[][] {
   const rows: Segment[][] = []
 
-  // `Today` bucket header (DarkGray), mirroring the date-bucketed feed.
-  rows.push(bodyRow([{ text: " Today", color: TUI_DARK_GRAY }]))
+  // Date-bucketed, reverse-chronological feed — one `Today` bucket here.
+  rows.push(activityDateHeader("Today"))
   rows.push(BOARD_BLANK_ROW)
 
   for (const ev of ACTIVITY_EVENTS) {
-    const badge = activityBadge(ev.kind)
-    // Line 1: indent · glyph · who · action · title, with an optional right metric.
-    const left: Segment[] = [
-      { text: " ".repeat(ACT_INDENT) },
-      { text: `${badge.glyph} `, color: badge.color },
-      { text: padTo(ev.who, ACT_WHO_W), color: TUI_GRAY },
-      { text: padTo(ev.action, ACT_ACTION_W), color: TUI_DARK_GRAY },
-    ]
-    if (ev.title) left.push({ text: ev.title, color: TUI_FG, bold: true })
-    rows.push(
-      ev.metric
-        ? bodyRightAlignRow(left, [{ text: ev.metric, color: TUI_DARK_GRAY }])
-        : bodyRow(left),
-    )
-
-    // Line 2 (optional): `label · branch`, the label in its state tint, dim branch.
-    if (ev.detail) {
-      rows.push(
-        bodyRow([
-          { text: " ".repeat(ACT_DETAIL_INDENT) },
-          { text: ev.detail.label, color: ev.detail.labelColor },
-          { text: " · ", color: TUI_DARK_GRAY },
-          { text: ev.detail.branch, color: TUI_DARK_GRAY },
-        ]),
-      )
-    }
+    rows.push(...activityEventRows(ev))
+    rows.push(BOARD_BLANK_ROW)
   }
 
   return padBodyTo(rows, buildBoardRows(state.columns).length)
 }
 
-// One line of the Orchestrator transcript. `you` is the cyan human prompt;
-// `label` is the magenta "Orchestrator" speaker tag; `prose` is wrapped
-// narration; `bullet` is a dispatched-task line (• id title → workspace);
-// `blank` spaces speakers apart.
+// One line of the Claude Code session the Chat pane hosts — the orchestrator
+// agent IS a live Claude Code CLI running in a tmux pane, so this renders the
+// real Claude Code UI elements rather than a generic two-speaker chat:
+// - `user`  — a `❯ ` prompt turn in the foreground color.
+// - `prose` — assistant narration, plain wrapped fg lines.
+// - `tool`  — a `⏺ Name(args)` tool-call bullet (green ⏺, bold-ish name).
+// - `result`— a `⎿` result line indented under the call, dim, optionally
+//             collapsed with a trailing `… +N lines` the way Claude Code folds
+//             long output.
+// - `working`— the `✻ Working…` spinner line, dim accent.
+// - `status`— the two-line footer (`Model: … · Ctx … · Cost …` + `⏵⏵ auto mode`).
+// - `blank` — vertical spacing between turns.
 type ChatLine =
-  | { kind: "you"; text: string }
-  | { kind: "label" }
+  | { kind: "user"; text: string }
   | { kind: "prose"; text: string }
-  | { kind: "bullet"; id: string; title: string; workspace: string }
+  | { kind: "tool"; name: string; args: string }
+  | { kind: "result"; text: string; more?: number }
+  | { kind: "working"; text: string }
+  | { kind: "status"; model: string; ctx: string; cost: string }
   | { kind: "blank" }
 
-// A short Orchestrator conversation over the sample project — the human gives
-// natural-language direction, the Orchestrator narrates what it dispatched.
+// A believable orchestration session over the sample project: the human asks
+// for two pieces of work, the orchestrator adds + dispatches tasks to free
+// workspaces (alpha/bravo) via `shelbi` CLI calls, then summarizes. Matches the
+// board's task titles and workspaces so Chat and Tasks read as one system.
 const CHAT_LINES: ChatLine[] = [
-  { kind: "you", text: "Deploy the staging environment and wire up OAuth." },
+  { kind: "user", text: "Deploy the staging environment and wire up OAuth." },
   { kind: "blank" },
-  { kind: "label" },
-  { kind: "prose", text: "Created two tasks and dispatched them:" },
-  { kind: "bullet", id: "t-009", title: "Deploy staging env", workspace: "alpha" },
-  { kind: "bullet", id: "t-010", title: "Wire up OAuth flow", workspace: "bravo" },
-  { kind: "prose", text: "Both running now. I'll merge as they hand off." },
+  { kind: "prose", text: "I'll create both tasks and dispatch them to free workspaces." },
   { kind: "blank" },
-  { kind: "you", text: "How's OAuth going?" },
+  { kind: "tool", name: "Bash", args: 'shelbi task add "Deploy staging env"' },
+  { kind: "result", text: "✓ deploy-staging-env created in backlog" },
   { kind: "blank" },
-  { kind: "label" },
+  { kind: "tool", name: "Bash", args: "shelbi task start deploy-staging-env --workspace alpha" },
+  { kind: "result", text: "✓ deploy-staging-env → in_progress on alpha", more: 2 },
+  { kind: "blank" },
+  { kind: "tool", name: "Bash", args: "shelbi task start wire-up-oauth-flow --workspace bravo" },
+  { kind: "result", text: "✓ wire-up-oauth-flow → in_progress on bravo" },
+  { kind: "blank" },
   {
     kind: "prose",
-    text: "bravo → t-010, still in progress (~6m). Branch shelbi/wire-up-oauth-flow. I'll ping when it's ready for review.",
+    text: "Both are running now — alpha on staging, bravo on OAuth. I'll merge each as it hands off for review.",
   },
+  { kind: "blank" },
+  { kind: "working", text: "Working… (8s · ↓ 431 tokens)" },
+  { kind: "blank" },
+  { kind: "status", model: "Opus 4.8", ctx: "4%", cost: "$0.36" },
 ]
 
-// Prose wraps well inside the board width; a comfortable measure keeps chat
-// readable rather than stretching lines across the full 111-cell pane.
-const CHAT_WRAP_W = 64
+// Assistant prose wraps at a comfortable measure rather than stretching across
+// the full 111-cell pane, the way Claude Code soft-wraps its output.
+const CHAT_WRAP_W = 76
 
 function buildChatRows(state: AppState): Segment[][] {
   const rows: Segment[][] = []
 
   for (const line of CHAT_LINES) {
-    if (line.kind === "blank") {
-      rows.push(BOARD_BLANK_ROW)
-      continue
-    }
-    if (line.kind === "you") {
-      // Cyan `❯` prompt marker + the human's message in the foreground color.
-      rows.push(
-        bodyRow([
-          { text: " ❯ ", color: TUI_CYAN, bold: true },
-          { text: line.text, color: TUI_FG },
-        ]),
-      )
-      continue
-    }
-    if (line.kind === "label") {
-      rows.push(bodyRow([{ text: "  Orchestrator", color: TUI_MAGENTA, bold: true }]))
-      continue
-    }
-    if (line.kind === "bullet") {
-      rows.push(
-        bodyRow([
-          { text: "    • ", color: TUI_DARK_GRAY },
-          { text: `${line.id} `, color: TUI_DARK_GRAY },
-          { text: padTo(line.title, 20), color: TUI_FG },
-          { text: " → ", color: TUI_DARK_GRAY },
-          { text: line.workspace, color: TUI_MAGENTA },
-        ]),
-      )
-      continue
-    }
-    // Prose: wrapped, indented two cells to sit under the Orchestrator label.
-    for (const wrapped of wrapText(line.text, CHAT_WRAP_W)) {
-      rows.push(bodyRow([{ text: `  ${wrapped}`, color: TUI_FG }]))
+    switch (line.kind) {
+      case "blank":
+        rows.push(BOARD_BLANK_ROW)
+        break
+      case "user":
+        // `❯ ` prompt (cyan) + the human's message in the foreground color.
+        rows.push(
+          bodyRow([
+            { text: " ❯ ", color: TUI_CYAN, bold: true },
+            { text: line.text, color: TUI_FG },
+          ]),
+        )
+        break
+      case "prose":
+        // Assistant narration — indented two cells, wrapped, plain fg.
+        for (const wrapped of wrapText(line.text, CHAT_WRAP_W)) {
+          rows.push(bodyRow([{ text: `  ${wrapped}`, color: TUI_FG }]))
+        }
+        break
+      case "tool":
+        // Tool-call bullet: green `⏺`, bold-ish tool name, args in fg.
+        rows.push(
+          bodyRow([
+            { text: " ⏺ ", color: TUI_GREEN },
+            { text: line.name, color: TUI_FG, bold: true },
+            { text: `(${line.args})`, color: TUI_FG },
+          ]),
+        )
+        break
+      case "result": {
+        // `⎿` result indented under the call, dim; long output collapses to
+        // `… +N lines` aligned under the result text, the way Claude Code folds.
+        rows.push(
+          bodyRow([
+            { text: "   ⎿ ", color: TUI_DARK_GRAY },
+            { text: line.text, color: TUI_DARK_GRAY },
+          ]),
+        )
+        if (line.more) {
+          rows.push(bodyRow([{ text: `     … +${line.more} lines`, color: TUI_DARK_GRAY }]))
+        }
+        break
+      }
+      case "working":
+        // Spinner/working line in a dim magenta accent.
+        rows.push(
+          bodyRow([
+            { text: " ✻ ", color: TUI_MAGENTA },
+            { text: line.text, color: TUI_DARK_GRAY },
+          ]),
+        )
+        break
+      case "status":
+        // Footer status: model/context/cost line, then the auto-mode hint.
+        rows.push(
+          bodyRow([
+            {
+              text: `  Model: ${line.model} · Ctx ${line.ctx} · Cost ${line.cost}`,
+              color: TUI_DARK_GRAY,
+            },
+          ]),
+        )
+        rows.push(
+          bodyRow([
+            { text: "  ⏵⏵ ", color: TUI_GREEN },
+            { text: "auto mode on (shift+tab to cycle)", color: TUI_DARK_GRAY },
+          ]),
+        )
+        break
     }
   }
 
