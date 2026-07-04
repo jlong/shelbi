@@ -1297,7 +1297,23 @@ const PRE_STYLE: React.CSSProperties = {
   minWidth: "max-content",
 }
 
-function TerminalBody({ state }: { state: AppState }) {
+/**
+ * Opacity + transition applied to a pane's `<pre>` (its text/glyph layer) so the
+ * hero can cross-fade the rendered rows at the loop boundary. The pane's own
+ * background is `TUI_BG` — the same fill the solid container carries behind it —
+ * so fading the pane dissolves only the glyphs (and their selection highlights),
+ * while the identical `TUI_BG` behind keeps the terminal body reading fully
+ * opaque. Omitted (the docs default) leaves the pane fully opaque with no
+ * transition.
+ */
+function contentFadeStyle(contentOpacity?: number): React.CSSProperties {
+  return {
+    opacity: contentOpacity,
+    transition: contentOpacity === undefined ? undefined : "opacity 500ms ease",
+  }
+}
+
+function TerminalBody({ state, contentOpacity }: { state: AppState; contentOpacity?: number }) {
   // The right pane swaps on the active view. Every view is padded to a common
   // target height so the terminal frame stays a fixed size when switching views
   // (and, for the hero animation, across every beat as content grows/shrinks):
@@ -1345,6 +1361,7 @@ function TerminalBody({ state }: { state: AppState }) {
         minWidth: `${width}ch`,
         maxWidth: `${width}ch`,
         overflow: "hidden",
+        ...contentFadeStyle(contentOpacity),
       }}
     >
       {rows.map((row, i) => (
@@ -1357,9 +1374,11 @@ function TerminalBody({ state }: { state: AppState }) {
 function Sidebar({
   state,
   onSelectView,
+  contentOpacity,
 }: {
   state: AppState
   onSelectView: (view: NavView) => void
+  contentOpacity?: number
 }) {
   const rows = buildSidebarRows(state)
   return (
@@ -1380,6 +1399,7 @@ function Sidebar({
         minWidth: `${SIDEBAR_W}ch`,
         maxWidth: `${SIDEBAR_W}ch`,
         overflow: "hidden",
+        ...contentFadeStyle(contentOpacity),
       }}
     >
       {rows.map((row, i) =>
@@ -1507,16 +1527,21 @@ export function AppMockup({
               a cropped board. */}
           <div
             className="flex overflow-x-auto"
-            style={{
-              background: TUI_BG,
-              // Only the inner content fades at the loop boundary — the chrome
-              // above (title bar, traffic lights) stays static.
-              opacity: contentOpacity,
-              transition: contentOpacity === undefined ? undefined : "opacity 500ms ease",
-            }}
+            // The solid terminal-body fill stays here at full opacity, so the
+            // body background never dims. Only the two panes' text layers
+            // cross-fade at the loop boundary (via `contentOpacity` on each
+            // `<pre>`): because every pane's own background is this same
+            // `TUI_BG`, fading a pane reveals an identical solid fill behind it,
+            // so the glyphs dissolve while the background — and the window chrome
+            // above — read as fully opaque throughout the loop.
+            style={{ background: TUI_BG }}
           >
-            <Sidebar state={resolved} onSelectView={setActiveView} />
-            <TerminalBody state={resolved} />
+            <Sidebar
+              state={resolved}
+              onSelectView={setActiveView}
+              contentOpacity={contentOpacity}
+            />
+            <TerminalBody state={resolved} contentOpacity={contentOpacity} />
           </div>
         </div>
       </div>
