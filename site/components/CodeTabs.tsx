@@ -4,6 +4,7 @@ import { Children, isValidElement, useId, useRef } from "react"
 import type { KeyboardEvent, ReactElement, ReactNode } from "react"
 import { useCodeTabGroup } from "@/lib/code-tabs-store"
 import { CopyButton } from "./CopyButton"
+import { CopyProvidedContext } from "./CopyProvidedContext"
 
 type CodeTabProps = {
   /** Tab strip label (e.g. `bash`, `zsh`, `brew`). Also the sync key value. */
@@ -99,66 +100,68 @@ export function CodeTabs({ group, children }: CodeTabsProps) {
   }
 
   return (
-    <div className="my-3 overflow-hidden rounded-md border border-gray-4 bg-gray-1">
-      <div
-        role="tablist"
-        aria-orientation="horizontal"
-        className="flex overflow-x-auto border-b border-gray-4"
-      >
+    <CopyProvidedContext.Provider value={true}>
+      <div className="my-3 overflow-hidden rounded-md border border-gray-4 bg-gray-1">
+        <div
+          role="tablist"
+          aria-orientation="horizontal"
+          className="flex overflow-x-auto border-b border-gray-4"
+        >
+          {tabs.map((tab, index) => {
+            const isActive = tab.props.label === active
+            return (
+              <button
+                key={tab.props.label}
+                ref={(el) => {
+                  tabRefs.current[index] = el
+                }}
+                type="button"
+                role="tab"
+                id={`${baseId}-tab-${index}`}
+                aria-selected={isActive}
+                aria-controls={`${baseId}-panel-${index}`}
+                tabIndex={isActive ? 0 : -1}
+                onClick={() => select(tab.props.label)}
+                onKeyDown={(event) => handleKeyDown(event, index)}
+                className={`-mb-px border-b px-3 py-2 font-mono text-xs transition-colors focus:outline-none focus-visible:text-fg ${
+                  isActive
+                    ? "border-fg text-fg"
+                    : "border-transparent text-gray-6 hover:text-fg"
+                }`}
+              >
+                {tab.props.label}
+              </button>
+            )
+          })}
+        </div>
         {tabs.map((tab, index) => {
           const isActive = tab.props.label === active
           return (
-            <button
+            <div
               key={tab.props.label}
-              ref={(el) => {
-                tabRefs.current[index] = el
-              }}
-              type="button"
-              role="tab"
-              id={`${baseId}-tab-${index}`}
-              aria-selected={isActive}
-              aria-controls={`${baseId}-panel-${index}`}
-              tabIndex={isActive ? 0 : -1}
-              onClick={() => select(tab.props.label)}
-              onKeyDown={(event) => handleKeyDown(event, index)}
-              className={`-mb-px border-b px-3 py-2 font-mono text-xs transition-colors focus:outline-none focus-visible:text-fg ${
-                isActive
-                  ? "border-fg text-fg"
-                  : "border-transparent text-gray-6 hover:text-fg"
-              }`}
+              role="tabpanel"
+              id={`${baseId}-panel-${index}`}
+              aria-labelledby={`${baseId}-tab-${index}`}
+              hidden={!isActive}
+              tabIndex={0}
+              className="relative focus:outline-none"
             >
-              {tab.props.label}
-            </button>
+              {/* Neutralize the MDX `pre`/`figure` chrome so the highlighted code
+                  sits flush inside the tab shell instead of nesting a second
+                  bordered card. */}
+              <div
+                ref={(el) => {
+                  paneRefs.current[index] = el
+                }}
+                className="overflow-x-auto [&_figure]:!my-0 [&_pre]:!my-0 [&_pre]:!rounded-none [&_pre]:!border-0"
+              >
+                {tab.props.children}
+              </div>
+              <CopyButton getText={() => paneRefs.current[index]?.textContent ?? ""} />
+            </div>
           )
         })}
       </div>
-      {tabs.map((tab, index) => {
-        const isActive = tab.props.label === active
-        return (
-          <div
-            key={tab.props.label}
-            role="tabpanel"
-            id={`${baseId}-panel-${index}`}
-            aria-labelledby={`${baseId}-tab-${index}`}
-            hidden={!isActive}
-            tabIndex={0}
-            className="relative focus:outline-none"
-          >
-            {/* Neutralize the MDX `pre`/`figure` chrome so the highlighted code
-                sits flush inside the tab shell instead of nesting a second
-                bordered card. */}
-            <div
-              ref={(el) => {
-                paneRefs.current[index] = el
-              }}
-              className="overflow-x-auto [&_figure]:!my-0 [&_pre]:!my-0 [&_pre]:!rounded-none [&_pre]:!border-0"
-            >
-              {tab.props.children}
-            </div>
-            <CopyButton getText={() => paneRefs.current[index]?.textContent ?? ""} />
-          </div>
-        )
-      })}
-    </div>
+    </CopyProvidedContext.Provider>
   )
 }

@@ -3,6 +3,7 @@
 import { useRef } from "react"
 import type { ComponentPropsWithoutRef } from "react"
 import { CopyButton } from "./CopyButton"
+import { useCopyProvided } from "./CopyProvidedContext"
 
 /**
  * Client wrapper the MDX `pre` maps to. Fenced code is highlighted at build
@@ -13,6 +14,9 @@ import { CopyButton } from "./CopyButton"
  */
 export function Pre(props: ComponentPropsWithoutRef<"pre">) {
   const ref = useRef<HTMLPreElement>(null)
+  // An ancestor (e.g. CodeTabs) may already supply a copy button for this
+  // code; skip our own so the block doesn't render two stacked buttons.
+  const copyProvided = useCopyProvided()
 
   return (
     <div className="group relative my-3">
@@ -21,11 +25,13 @@ export function Pre(props: ComponentPropsWithoutRef<"pre">) {
         className="overflow-x-auto rounded-md border border-gray-4 bg-gray-1 px-3 py-3 font-mono text-sm leading-relaxed [&_code]:font-mono"
         {...props}
       />
-      <CopyButton
-        getText={() => (ref.current?.innerText ?? "").replace(/\n$/, "")}
-        ariaLabel="Copy code"
-        className="absolute top-2 right-2 flex items-center gap-1 rounded-sm border border-gray-4 bg-gray-2 px-1 py-1 font-mono text-xs text-gray-7 opacity-0 transition group-hover:opacity-100 hover:border-gray-5 hover:text-fg focus:outline-none focus-visible:border-gray-6 focus-visible:opacity-100"
-      />
+      {!copyProvided && (
+        <CopyButton
+          getText={() => (ref.current?.innerText ?? "").replace(/\n$/, "")}
+          ariaLabel="Copy code"
+          className="absolute top-2 right-2 flex items-center gap-1 rounded-sm border border-gray-4 bg-gray-2 px-1 py-1 font-mono text-xs text-gray-7 opacity-0 transition group-hover:opacity-100 hover:border-gray-5 hover:text-fg focus:outline-none focus-visible:border-gray-6 focus-visible:opacity-100"
+        />
+      )}
     </div>
   )
 }
