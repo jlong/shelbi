@@ -8,7 +8,7 @@ pub mod loader;
 
 pub use actions::{
     Action, ActivityAction, GlobalAction, KanbanAction, PaletteAction, PopoverAction,
-    ReviewAction, SidebarAction, MODE_NAMES,
+    SidebarAction, MODE_NAMES,
 };
 pub use chord::{ChordParseError, KeyChord};
 pub use display::{format_chord, DisplayStyle};

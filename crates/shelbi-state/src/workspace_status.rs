@@ -103,9 +103,9 @@ pub fn parse_pane_title_marker(title: &str) -> Option<PaneMarker> {
     // sitting mid-title, parse as a live marker. Our hooks always emit the
     // marker as the trailing token of the OSC pane title, so the token
     // boundary is the right anchor. This is a *state hint* only — board
-    // moves are driven solely by the independent file-based review marker
-    // (`maybe_promote_to_review`), never by this title, because any program
-    // the agent runs can print an OSC title sequence into the pane.
+    // moves are driven solely by the independent file-based ready marker
+    // (the poller's ready-handoff path), never by this title, because any
+    // program the agent runs can print an OSC title sequence into the pane.
     let last = title.split_whitespace().next_back()?;
     let marker = last.strip_prefix("shelbi:")?;
     // Trim trailing control chars (BEL, ST) some terminals leave behind.
@@ -692,38 +692,6 @@ pub fn append_workspace_pane_event(
     emit_event_body(&body)
 }
 
-/// Append `<rfc3339> project=<project> workspace=<name> server_alive=<bool> reason=<short>`
-/// to `~/.shelbi/events.log`. The review-workspace analog of
-/// [`append_workspace_pane_event`], emitted by the `shelbi open
-/// --as-server-pane` wrapper when the long-lived dev-server process in a
-/// review workspace's server pane exits (crash, clean stop, or tmux
-/// teardown). It's deliberately a distinct verb (`server_alive` rather than
-/// `pane_alive`) so the orchestrator can tell an agent-pane death from a
-/// server-pane death and react appropriately — a dead server pane in a
-/// review workspace means the served URL is down and the port has (usually)
-/// been freed, not that the agent stopped.
-///
-/// Carries the same leading `project=<name>` scope as
-/// [`append_workspace_pane_event`] so a same-named review workspace in another
-/// project can't be mistaken for this one across the hub-global log.
-///
-/// Rides the same socket-preferred / file-fallback emit path as every other
-/// event line (see [`emit_event_body`]); `reason` is folded to a single
-/// short token so the record stays parseable.
-pub fn append_workspace_server_event(
-    project: &str,
-    workspace: &str,
-    alive: bool,
-    reason: &str,
-) -> Result<()> {
-    let project = sanitize_field(project);
-    let workspace = sanitize_field(workspace);
-    let reason = sanitize_reason(reason);
-    let body =
-        format!("project={project} workspace={workspace} server_alive={alive} reason={reason}");
-    emit_event_body(&body)
-}
-
 /// The no-restart key the supervisor consumes to tell a crash from a
 /// deliberate shutdown.
 ///
@@ -740,83 +708,6 @@ pub fn append_workspace_server_event(
 /// consumes it on the death edge and treats a fresh hit as "stay down."
 pub fn supervision_shutdown_key(workspace: &str) -> String {
     format!("{workspace}.supervision")
-}
-
-/// The expected-teardown key for a review workspace's *server* pane.
-///
-/// The agent pane and the server pane share a workspace name but need
-/// independent teardown-suppression markers: killing the server pane on a
-/// reap or a re-dispatch must suppress only the server's `server_alive=false`
-/// event, not the agent's `pane_alive` one (and vice-versa). We derive a
-/// distinct key by suffixing `.server` so it lands in its own
-/// `workspaces/<name>.server/.expected-teardown` file and reuses the exact
-/// [`mark_expected_teardown`] / [`consume_expected_teardown`] machinery the
-/// agent pane already relies on.
-pub fn server_teardown_key(workspace: &str) -> String {
-    format!("{workspace}.server")
-}
-
-/// Record of a review workspace's live server pane, persisted hub-side so
-/// teardown and the reaper can find and kill the pane without re-deriving it
-/// from tmux state (which can't be matched by convention once
-/// `automatic-rename` has renamed the window). Written by
-/// `shelbi_orchestrator::server_pane::spawn_server_pane` when the pane is
-/// created and removed when it's torn down; its presence is the hub's
-/// authority on "this workspace owns a server pane + a bound port."
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ServerPaneRecord {
-    /// The stable tmux pane id (`%N`) of the split server pane. Survives
-    /// `automatic-rename`, so it's what teardown / reaping target.
-    pub pane_id: String,
-    /// The port shelbi assigned to this server (injected as `$PORT`). The
-    /// leaked-port hazard the reaper exists to prevent is about *this* port.
-    pub port: u16,
-    /// The reachable URL the review agent advertises to the human.
-    pub url: String,
-    /// The task whose branch this server is serving. The reaper treats the
-    /// server as leaked once no active (in-progress / review) task with this
-    /// id is still assigned to the workspace.
-    pub task_id: String,
-}
-
-/// `~/.shelbi/workspaces/<name>/server.yaml` — sidecar holding the workspace's
-/// [`ServerPaneRecord`], kept out of `status.yaml` so the poller's per-poll
-/// status rewrite can't clobber it.
-pub fn server_record_path(workspace: &str) -> Result<PathBuf> {
-    Ok(workspaces_dir()?.join(workspace).join("server.yaml"))
-}
-
-/// Persist the workspace's server-pane record (atomic write).
-pub fn save_server_record(workspace: &str, record: &ServerPaneRecord) -> Result<()> {
-    let path = server_record_path(workspace)?;
-    if let Some(parent) = path.parent() {
-        ensure_dir(parent)?;
-    }
-    let yaml = serde_yaml::to_string(record)?;
-    atomic_write(&path, yaml.as_bytes())
-}
-
-/// Load the workspace's server-pane record, or `None` if it has none (no
-/// server pane was ever spawned, or it was torn down).
-pub fn load_server_record(workspace: &str) -> Result<Option<ServerPaneRecord>> {
-    let path = server_record_path(workspace)?;
-    if !path.exists() {
-        return Ok(None);
-    }
-    let text = fs::read_to_string(&path)?;
-    Ok(Some(serde_yaml::from_str(&text)?))
-}
-
-/// Remove the workspace's server-pane record (idempotent — a missing file is
-/// a clean no-op). Called after the server pane is killed so the hub no
-/// longer believes the workspace owns a bound port.
-pub fn clear_server_record(workspace: &str) -> Result<()> {
-    let path = server_record_path(workspace)?;
-    match fs::remove_file(&path) {
-        Ok(()) => Ok(()),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(e) => Err(shelbi_core::Error::Io(e)),
-    }
 }
 
 /// Append `<rfc3339> rebase task=<id> workspace=<name> branch=<branch> status=<status> detail=<detail>`
@@ -1772,35 +1663,6 @@ mod tests {
     }
 
     #[test]
-    fn append_workspace_server_event_writes_distinct_verb() {
-        // The server pane emits `server_alive=` (not `pane_alive=`) so the
-        // orchestrator can tell an agent-pane death from a server-pane death.
-        let _g = TEST_LOCK.lock().unwrap();
-        let home = fresh_home();
-        std::env::set_var("SHELBI_HOME", &home);
-        std::env::remove_var("SHELBI_HUB_SOCK");
-
-        append_workspace_server_event("demo", "review-1", false, "exit:0").unwrap();
-        let log = std::fs::read_to_string(events_log_path().unwrap()).unwrap();
-        let line = log.lines().next().unwrap();
-        assert!(line.contains(" project=demo workspace=review-1 "), "line: {line}");
-        assert!(line.contains(" server_alive=false "), "line: {line}");
-        assert!(!line.contains(" pane_alive="), "must not use the agent verb: {line}");
-        assert!(line.ends_with(" reason=exit:0"), "line: {line}");
-
-        std::env::remove_var("SHELBI_HOME");
-    }
-
-    #[test]
-    fn server_teardown_key_is_distinct_from_the_workspace_name() {
-        // The server pane's teardown-suppression marker must not collide with
-        // the agent pane's — otherwise killing one would suppress the other's
-        // death event.
-        assert_eq!(server_teardown_key("review-1"), "review-1.server");
-        assert_ne!(server_teardown_key("review-1"), "review-1");
-    }
-
-    #[test]
     fn workspace_status_path_rejects_traversal_names() {
         // Residual chokepoint hardening (state-runtime F14): a `..`/absolute/
         // separator workspace name must not escape `~/.shelbi/workspaces/`.
@@ -1812,32 +1674,6 @@ mod tests {
         }
         // A normal single-component name still resolves.
         assert!(workspace_status_path("review-1").is_ok());
-    }
-
-    #[test]
-    fn server_record_roundtrips_and_clears() {
-        let _g = TEST_LOCK.lock().unwrap();
-        let home = fresh_home();
-        std::env::set_var("SHELBI_HOME", &home);
-
-        assert!(load_server_record("review-1").unwrap().is_none());
-
-        let record = ServerPaneRecord {
-            pane_id: "%7".into(),
-            port: 3010,
-            url: "http://localhost:3010".into(),
-            task_id: "feat-x".into(),
-        };
-        save_server_record("review-1", &record).unwrap();
-        assert!(server_record_path("review-1").unwrap().exists());
-        assert_eq!(load_server_record("review-1").unwrap().unwrap(), record);
-
-        clear_server_record("review-1").unwrap();
-        assert!(load_server_record("review-1").unwrap().is_none());
-        // Clearing an already-absent record is a clean no-op.
-        clear_server_record("review-1").unwrap();
-
-        std::env::remove_var("SHELBI_HOME");
     }
 
     #[test]

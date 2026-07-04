@@ -47,32 +47,6 @@ pub enum WorkspaceCmd {
         /// Workspace to inspect. Omit to show every declared workspace.
         name: Option<String>,
     },
-    /// Start (or restart) a review workspace's long-lived dev server in a
-    /// dedicated, shelbi-managed server pane. This is the entry point the
-    /// Review agent invokes once it has resolved the serve command; shelbi
-    /// owns the pane's lifecycle from here (a `server_alive=false` event on
-    /// death, teardown on re-dispatch/stop, and the leaked-port reaper).
-    ///
-    /// The port defaults to the workspace's deterministic review slot; the
-    /// serve command defaults to the project's `review.serve`. Any server
-    /// pane already running for the workspace is torn down first.
-    Serve {
-        /// The review workspace to serve on. Defaults to `$SHELBI_WORKSPACE`
-        /// (set in the review pane's env) when omitted.
-        name: Option<String>,
-        /// Override the injected port. Defaults to the workspace's review
-        /// slot (`review.base_port + index * review.port_stride`).
-        #[arg(long)]
-        port: Option<u16>,
-        /// The dev-server command to run (e.g. `npm run dev -- --port $PORT`).
-        /// Defaults to the project's declared `review.serve`; required when
-        /// that's absent (the agent passes its auto-detected command here).
-        #[arg(long)]
-        serve: Option<String>,
-        /// Skip the HTTP ready-probe and return as soon as the pane is up.
-        #[arg(long)]
-        no_wait: bool,
-    },
 }
 
 pub fn run(project_opt: Option<String>, cmd: WorkspaceCmd) -> Result<()> {
@@ -81,12 +55,6 @@ pub fn run(project_opt: Option<String>, cmd: WorkspaceCmd) -> Result<()> {
         WorkspaceCmd::List => list(&project),
         WorkspaceCmd::Stop { name, keep_task } => stop(&project, &name, keep_task),
         WorkspaceCmd::Status { name } => status(&project, name.as_deref()),
-        WorkspaceCmd::Serve {
-            name,
-            port,
-            serve,
-            no_wait,
-        } => self::serve(&project, name, port, serve, no_wait),
     }
 }
 
@@ -201,116 +169,10 @@ fn stop(project: &str, name: &str, keep_task: bool) -> Result<()> {
     Ok(())
 }
 
-/// Start (or restart) a review workspace's dev server in a managed server
-/// pane. Resolves the port and serve command (CLI override → project config →
-/// review slot), spawns the pane via
-/// [`shelbi_orchestrator::server_pane::spawn_server_pane`], and — unless
-/// `--no-wait` — polls the HTTP ready-probe before printing the URL.
-fn serve(
-    project: &str,
-    name: Option<String>,
-    port_override: Option<u16>,
-    serve_override: Option<String>,
-    no_wait: bool,
-) -> Result<()> {
-    use shelbi_orchestrator::server_pane;
-
-    let p = shelbi_state::load_project(project).map_err(|e| anyhow!(e))?;
-
-    // Workspace: explicit arg wins, else the review pane's injected env, else
-    // an actionable error (no silent guess).
-    let name = name
-        .or_else(|| std::env::var("SHELBI_WORKSPACE").ok().filter(|s| !s.is_empty()))
-        .ok_or_else(|| {
-            anyhow!(
-                "no workspace given: pass a NAME or run inside a review pane \
-                 (which sets $SHELBI_WORKSPACE)"
-            )
-        })?;
-    let workspace = p
-        .workspace(&name)
-        .ok_or_else(|| {
-            anyhow!(
-                "workspace `{name}` not declared in project `{project}` (known: {})",
-                p.workspaces
-                    .iter()
-                    .map(|w| w.name.as_str())
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            )
-        })?
-        .clone();
-
-    // Port: override wins; else the workspace's deterministic review slot.
-    // A dev workspace has no review slot, so serving one requires `--port`.
-    let port = match port_override.or_else(|| {
-        orch_workspace::review_workspace_port(&p, &workspace)
-    }) {
-        Some(port) => port,
-        None => {
-            return Err(anyhow!(
-                "workspace `{name}` isn't a review workspace, so it has no \
-                 assigned port — pass `--port <n>` to serve it anyway"
-            ));
-        }
-    };
-
-    // Serve command: override wins; else the project's declared review.serve.
-    // Auto-detection (framework heuristics) is the Review agent's job — it
-    // passes its resolved command via `--serve` — so an absent command here
-    // is a hard, guidance-carrying error rather than a guess.
-    let serve_cmd = serve_override.or_else(|| p.review.serve.clone()).ok_or_else(|| {
-        anyhow!(
-            "no serve command: pass `--serve '<cmd>'` or declare `review.serve` \
-             in the project config"
-        )
-    })?;
-
-    // The task the server is loading, for the record. Prefer the review
-    // pane's injected TASK_ID; fall back to the active task on the workspace.
-    let task_id = std::env::var("TASK_ID")
-        .ok()
-        .filter(|s| !s.is_empty())
-        .or_else(|| active_task_for(project, &name))
-        .unwrap_or_default();
-
-    let record = server_pane::spawn_server_pane(server_pane::ServerPaneParams {
-        project: &p,
-        workspace: &workspace,
-        task_id: &task_id,
-        port,
-        serve: &serve_cmd,
-    })
-    .map_err(|e| anyhow!(e))?;
-    println!("✓ server pane started for {name} (pane {}) on port {port}", record.pane_id);
-
-    if no_wait {
-        println!("  {} (ready-probe skipped)", record.url);
-        return Ok(());
-    }
-
-    // Ready-probe: gate the "ready" line on the server actually answering.
-    // Timeout comes from `review.ready_probe`; default 90s.
-    let timeout = p
-        .review
-        .ready_probe
-        .as_ref()
-        .map(|rp| rp.timeout)
-        .unwrap_or(std::time::Duration::from_secs(90));
-    match server_pane::wait_for_http_ready(port, "/", timeout) {
-        Some(code) => println!("✓ serving at {} (HTTP {code})", record.url),
-        None => println!(
-            "⚠ {} did not answer within {}s — the pane is up; check its output",
-            record.url,
-            timeout.as_secs()
-        ),
-    }
-    Ok(())
-}
-
 /// The task currently loaded on `workspace` — an in-progress or review-column
-/// task assigned to it. Used to stamp the server record when `$TASK_ID` isn't
-/// in the environment (a human running `serve` by hand).
+/// task assigned to it. Resolves the task a workspace is holding when the
+/// caller doesn't already have `$TASK_ID` in the environment.
+#[cfg_attr(not(test), allow(dead_code))]
 fn active_task_for(project: &str, workspace: &str) -> Option<String> {
     for column in [Column::InProgress, Column::Review] {
         if let Ok(tasks) = shelbi_state::list_column(project, column) {

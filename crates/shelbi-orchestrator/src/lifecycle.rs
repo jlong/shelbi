@@ -280,7 +280,6 @@ mod tests {
                 base_branch: base_branch.map(String::from),
                 ..Default::default()
             },
-            review: Default::default(),
         }
     }
 

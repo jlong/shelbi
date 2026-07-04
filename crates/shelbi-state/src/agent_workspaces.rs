@@ -1332,12 +1332,12 @@ mod tests {
     }
 
     /// Sanity-check the developer prompt has the spec-required hooks
-    /// (review marker handoff, agents/_shared/preamble.md reference,
+    /// (ready marker handoff, agents/_shared/preamble.md reference,
     /// the Phase 5 socket-emit paragraph) so a regression doesn't
     /// quietly ship a half-written prompt.
     #[test]
     fn developer_template_contains_required_hooks() {
-        assert!(DEFAULT_DEVELOPER_INSTRUCTIONS.contains("review marker"));
+        assert!(DEFAULT_DEVELOPER_INSTRUCTIONS.contains("ready marker"));
         assert!(DEFAULT_DEVELOPER_INSTRUCTIONS.contains("agents/_shared/preamble.md"));
         assert!(DEFAULT_DEVELOPER_INSTRUCTIONS.contains("skills"));
         // Phase 5: the same socket-emit paragraph covers hub and remote

@@ -338,7 +338,6 @@ mod tests {
             heartbeat: HeartbeatConfig::default(),
             detected_shapes: Vec::new(),
             git: shelbi_core::GitConfig::default(),
-            review: Default::default(),
         }
     }
 

@@ -26,7 +26,6 @@ mod kanban;
 mod keymap;
 mod markdown;
 mod poller;
-mod review;
 mod sidebar;
 pub mod theme;
 mod zen_probe;
@@ -115,7 +114,6 @@ pub(crate) mod test_support {
             heartbeat: HeartbeatConfig::default(),
             detected_shapes: Vec::new(),
             git: GitConfig::default(),
-            review: Default::default(),
         };
         shelbi_state::save_project(&project).unwrap();
         repo
@@ -126,7 +124,6 @@ pub use activity::ActivityApp;
 pub use app::{App, Row, View, WorkspaceBadge, WorkspaceOverview};
 pub use kanban::KanbanApp;
 pub use poller::WorkspacePoller;
-pub use review::ReviewApp;
 pub use sidebar::decoration_to_color;
 
 /// Set up the project's tmux session and attach to it. If we're already
@@ -248,36 +245,9 @@ pub fn run_tasks(project_name: &str) -> Result<()> {
     result
 }
 
-/// Run the review-queue ratatui view in the current pane. Hosted in the
-/// hidden stash session and swapped in by the palette / sidebar — same
-/// lifecycle as `run_tasks`.
-pub fn run_review(project_name: &str) -> Result<()> {
-    // Load `keys.yaml` before the alt-screen swap. Diagnostics route
-    // through `tracing` (→ `~/.shelbi/logs/tui.log`) so they can't
-    // interleave with ratatui's redraw on the shared pane TTY. Bad
-    // config never blocks launch — affected actions fall back to
-    // built-in defaults. The sidebar pane surfaces a discoverable
-    // count in its status line.
-    let (keymaps, diags) = shelbi_state::keymap::load_keymaps(Some(project_name));
-    log_keymap_diagnostics(&diags);
-
-    let mut term = setup_terminal().context("setting up terminal")?;
-    let mut app = ReviewApp::new(project_name);
-    // Hand the footer renderer its own copy of the resolved keymaps; the
-    // handler keeps the `&keymaps` local below to dodge a borrow conflict
-    // with `&mut app`.
-    app.keymaps = keymaps.clone();
-    app.refresh();
-
-    let result = handlers::review::review_loop(&mut term, &mut app, &keymaps);
-
-    restore_terminal(&mut term).context("restoring terminal")?;
-    result
-}
-
 /// Run the activity-feed ratatui view in the current pane. Hosted in
 /// the hidden stash session and swapped in by the palette / sidebar —
-/// same lifecycle as `run_tasks` and `run_review`.
+/// same lifecycle as `run_tasks`.
 pub fn run_activity(project_name: &str) -> Result<()> {
     let mut term = setup_terminal().context("setting up terminal")?;
     let mut app = ActivityApp::new(project_name);

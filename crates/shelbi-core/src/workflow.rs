@@ -778,13 +778,6 @@ pub enum Owner {
     Agent,
 }
 
-/// The canonical handoff status id in the shipped default workflow —
-/// the `id:` of the `Review` status in [`default_workflow`]. Retained as
-/// a named constant for callers that need the conventional spelling;
-/// [`Workflow::fires_merge_bar`] no longer keys off it (it keys off the
-/// [`StatusCategory::Handoff`] category so renamed handoff ids still
-/// trip the bar).
-pub const LEGACY_REVIEW_STATUS: &str = "review";
 
 /// Default agent name dispatched for a status whose legacy YAML used
 /// bare `owner: agent` on a `ready`-category status. Matches the

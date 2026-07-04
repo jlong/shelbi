@@ -135,7 +135,6 @@ fn chords_for_action(km: &Keymaps, action: Action) -> Vec<KeyChord> {
         Action::Sidebar(a) => km.sidebar.by_action.get(&a).cloned().unwrap_or_default(),
         Action::Kanban(a) => km.kanban.by_action.get(&a).cloned().unwrap_or_default(),
         Action::Popover(a) => km.popover.by_action.get(&a).cloned().unwrap_or_default(),
-        Action::Review(a) => km.review.by_action.get(&a).cloned().unwrap_or_default(),
         Action::Activity(a) => km.activity.by_action.get(&a).cloned().unwrap_or_default(),
         Action::Palette(a) => km.palette.by_action.get(&a).cloned().unwrap_or_default(),
     }
@@ -356,7 +355,6 @@ mod tests {
             ("sidebar", "nav_up"),
             ("kanban", "move_card_left"),
             ("popover", "close"),
-            ("review", "activate"),
             ("activity", "toggle_zen_filter"),
             ("palette", "activate"),
         ] {

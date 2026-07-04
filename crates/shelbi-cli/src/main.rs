@@ -132,12 +132,6 @@ enum Cmd {
         /// path (including SIGHUP/SIGTERM/SIGINT). Not for direct use.
         #[arg(long, hide = true)]
         as_pane: bool,
-        /// Internal re-entry flag for a review workspace's *server* pane.
-        /// When set, this process runs the long-lived dev server from
-        /// `$SHELBI_SERVE_CMD` on `$PORT`, waits, and emits a
-        /// `server_alive=false` event on any exit path. Not for direct use.
-        #[arg(long, hide = true, conflicts_with = "as_pane")]
-        as_server_pane: bool,
         /// Internal re-entry flag set by `shelbi task resume`. When set
         /// alongside `--as-pane`, the wrapper launches a claude runner with
         /// `--continue` so the pane reloads its prior conversation instead of
@@ -202,9 +196,6 @@ enum Cmd {
         #[command(subcommand)]
         cmd: Option<commands::daemon::DaemonCmd>,
     },
-    /// Load a ready-for-review task onto a review workspace (or report its
-    /// queue position when every review workspace is busy).
-    Review(commands::review::Args),
     /// Attach the terminal to a workspace's tmux pane.
     Attach { id: String },
     /// Scaffold ~/.shelbi/ and (optionally) a starter project YAML.
@@ -223,7 +214,7 @@ enum Cmd {
     Wizard,
     /// Start the orchestrator agent in the project's tmux session window 1.
     Orchestrate(commands::orchestrate::Args),
-    /// Respawn the shelbi-owned panes (sidebar + tasks/review/machines)
+    /// Respawn the shelbi-owned panes (sidebar + tasks/machines)
     /// AND the orchestrator pane in place so a freshly installed binary
     /// takes effect — and edits to the orchestrator's instructions /
     /// preamble land without a manual tear-down. The previous
@@ -244,11 +235,6 @@ enum Cmd {
     #[command(hide = true)]
     #[command(name = "__tasks")]
     Tasks { project: String },
-    /// (internal) Run the review-queue ratatui view inside the hidden
-    /// stash pane. Not for direct use.
-    #[command(hide = true)]
-    #[command(name = "__review")]
-    ReviewView { project: String },
     /// (internal) Run the activity-feed ratatui view inside the hidden
     /// stash pane. Not for direct use.
     #[command(hide = true)]
@@ -328,9 +314,8 @@ fn main() -> Result<()> {
         Some(Cmd::Open {
             name,
             as_pane,
-            as_server_pane,
             resume,
-        }) => commands::open::run(cli.project, name, as_pane, as_server_pane, resume),
+        }) => commands::open::run(cli.project, name, as_pane, resume),
         Some(Cmd::Task { cmd }) => commands::task::run(cli.project, cmd),
         Some(Cmd::Workspace { cmd }) => commands::workspace::run(cli.project, cmd),
         Some(Cmd::Worker { cmd }) => {
@@ -345,7 +330,6 @@ fn main() -> Result<()> {
         Some(Cmd::Daemon { cmd }) => commands::daemon::run(cmd),
         Some(Cmd::Zen { cmd }) => commands::zen::run(cli.project, cmd),
         Some(Cmd::Action { cmd }) => commands::action::run(cli.project, cmd),
-        Some(Cmd::Review(args)) => commands::review::run(cli.project, args),
         Some(Cmd::Attach { id }) => commands::attach::run(cli.project, id),
         Some(Cmd::Init(args)) => commands::init::run(args),
         Some(Cmd::Wizard) => commands::wizard::run(false).map(|_| ()),
@@ -353,7 +337,6 @@ fn main() -> Result<()> {
         Some(Cmd::Reload) => commands::reload::run(cli.project),
         Some(Cmd::Sidebar { project }) => shelbi_tui::run_sidebar(&project).context("sidebar"),
         Some(Cmd::Tasks { project }) => shelbi_tui::run_tasks(&project).context("tasks"),
-        Some(Cmd::ReviewView { project }) => shelbi_tui::run_review(&project).context("review"),
         Some(Cmd::Activity { project }) => shelbi_tui::run_activity(&project).context("activity"),
         Some(Cmd::Popup) => commands::popup::run(),
         Some(Cmd::Palette { project }) => commands::palette::run(project),
@@ -475,7 +458,7 @@ fn is_inquire_cancel(e: &anyhow::Error) -> bool {
 
 /// Initialize the tracing subscriber.
 ///
-/// For internal ratatui subcommands (`__sidebar`, `__tasks`, `__review`,
+/// For internal ratatui subcommands (`__sidebar`, `__tasks`,
 /// `__activity`) we route output to `~/.shelbi/logs/tui.log` instead of
 /// stderr. The TUI process
 /// shares its TTY with ratatui's draw cycle, and any stray stderr write
@@ -489,7 +472,6 @@ fn init_tracing(cmd: Option<&Cmd>) {
         cmd,
         Some(Cmd::Sidebar { .. })
             | Some(Cmd::Tasks { .. })
-            | Some(Cmd::ReviewView { .. })
             | Some(Cmd::Activity { .. })
     );
     if is_tui {
@@ -575,9 +557,8 @@ mod cli_tests {
             Some(Cmd::Open {
                 ref name,
                 as_pane,
-                as_server_pane,
                 ..
-            }) if name == "alpha" && !as_pane && !as_server_pane => {}
+            }) if name == "alpha" && !as_pane => {}
             other => panic!("expected Open {{ alpha, as_pane=false }}, got {other:?}"),
         }
 
@@ -586,23 +567,9 @@ mod cli_tests {
             Some(Cmd::Open {
                 ref name,
                 as_pane,
-                as_server_pane,
                 ..
-            }) if name == "delta" && as_pane && !as_server_pane => {}
+            }) if name == "delta" && as_pane => {}
             other => panic!("expected Open {{ delta, as_pane=true }}, got {other:?}"),
-        }
-
-        // The server-pane re-entry flag parses independently and is
-        // mutually exclusive with `--as-pane` (a pane is one or the other).
-        let server = Cli::parse_from(["shelbi", "open", "review-1", "--as-server-pane"]);
-        match server.cmd {
-            Some(Cmd::Open {
-                ref name,
-                as_pane,
-                as_server_pane,
-                ..
-            }) if name == "review-1" && !as_pane && as_server_pane => {}
-            other => panic!("expected Open {{ review-1, as_server_pane=true }}, got {other:?}"),
         }
 
         // `shelbi task resume` re-enters the wrapper with `--as-pane --resume`;

@@ -616,7 +616,6 @@ mod tests {
             zen: ZenConfig::default(),
             heartbeat: HeartbeatConfig::default(),
             git: GitConfig::default(),
-            review: Default::default(),
             detected_shapes: Vec::new(),
         }
     }

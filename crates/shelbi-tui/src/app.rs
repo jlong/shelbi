@@ -545,7 +545,7 @@ impl App {
     }
 
     fn start_review(&self, id: &str) -> Result<String> {
-        shelbi_orchestrator::review::start_review_by_id(&self.project_name, id)
+        shelbi_orchestrator::load::load_task_by_id(&self.project_name, id)
             .map_err(|e| anyhow::anyhow!(e))
     }
 
@@ -730,15 +730,15 @@ fn row_height(row: &Row) -> usize {
 
 /// Split the Review column into the two sidebar sections (spec §16):
 ///
-/// - **Ready** — the task's `assigned_to` names a `role: review` workspace, so
-///   the Review agent has the branch loaded and (usually) serving. Its
-///   `machine:port` URL is the deterministic review port
-///   ([`review_workspace_port`](shelbi_orchestrator::workspace::review_workspace_port)).
+/// - **Ready** — the task's `assigned_to` names a `review`-tagged workspace,
+///   so it's loaded onto a review slot. The location is the review workspace
+///   holding it.
 /// - **Queued** — every other Review-status task (unassigned, or still pinned
 ///   to the dev workspace that produced it): waiting for a free review slot.
 ///
-/// If the project can't be loaded we can't classify by role, so everything
-/// falls back to Queued (no location) rather than mislabelling a task Ready.
+/// Membership is driven by the `review` tag — the workspace-neutral marker for
+/// "this slot is a review surface". If the project can't be loaded we can't
+/// classify, so everything falls back to Queued (no location).
 fn split_review_sections(
     project_name: &str,
     queue: Vec<TaskFile>,
@@ -772,8 +772,7 @@ fn split_review_sections(
             .filter(|w| project.effective_tags(w).contains("review"));
         match loaded_on {
             Some(ws) => {
-                let location = shelbi_orchestrator::workspace::review_workspace_port(&project, ws)
-                    .map(|port| format!("{}:{port}", ws.machine));
+                let location = Some(format!("{}:{}", ws.machine, ws.name));
                 ready.push(entry(&tf.task, location));
             }
             None => queued.push(entry(&tf.task, None)),
@@ -1020,7 +1019,6 @@ mod tests {
             zen: shelbi_core::ZenConfig::default(),
             heartbeat: shelbi_core::HeartbeatConfig::default(),
             git: shelbi_core::GitConfig::default(),
-            review: Default::default(),
             detected_shapes: Vec::new(),
         }
     }
@@ -1173,10 +1171,10 @@ mod tests {
     #[test]
     fn review_tasks_split_into_ready_and_queued_sections() {
         // Spec §16: a Review-status task loaded on a review workspace lands in
-        // "Ready for Review" (✓) with its `machine:port` URL; a Review-status
-        // task still pinned to a dev workspace (or unassigned) lands in
-        // "Queued for Review" (·) with no URL. Both are two-line rows carrying
-        // the branch.
+        // "Ready for Review" (✓) with its `machine:workspace` location; a
+        // Review-status task still pinned to a dev workspace (or unassigned)
+        // lands in "Queued for Review" (·) with no location. Both are two-line
+        // rows carrying the branch.
         let _g = TEST_LOCK.lock().unwrap();
         let home = fresh_home();
         std::env::set_var("SHELBI_HOME", &home);
@@ -1185,7 +1183,7 @@ mod tests {
         shelbi_state::save_project(&project).unwrap();
 
         let now = Utc::now();
-        // Loaded: assigned to the review workspace → Ready, URL hub:3000.
+        // Loaded: assigned to the review workspace → Ready, location hub:review-1.
         shelbi_state::save_task(
             "demo",
             &Task {
@@ -1235,7 +1233,7 @@ mod tests {
         let ready = &app.ready_review[0];
         assert_eq!(ready.task_id, "loaded");
         assert_eq!(ready.branch, "shelbi/palette-fix");
-        assert_eq!(ready.location.as_deref(), Some("hub:3000"));
+        assert_eq!(ready.location.as_deref(), Some("hub:review-1"));
 
         assert_eq!(app.queued_review.len(), 1, "one task still waiting for a slot");
         let queued = &app.queued_review[0];
@@ -1258,7 +1256,7 @@ mod tests {
         assert!(matches!(
             &rows[ready_hdr + 1],
             Row::Review { ready: true, location: Some(loc), branch, .. }
-                if loc == "hub:3000" && branch == "shelbi/palette-fix"
+                if loc == "hub:review-1" && branch == "shelbi/palette-fix"
         ));
         assert!(matches!(
             &rows[queued_hdr + 1],
