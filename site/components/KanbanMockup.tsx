@@ -486,7 +486,8 @@ function titleRow(state: AppState): Segment[] {
  * Footer keybinding hints — matches `render_footer` in the crate, whose hints
  * are per-view. Each view keeps the same key-in-fg / hint-in-dg pattern and
  * pads to the board `width` so the footer (and the frame) is identical across
- * views.
+ * views. The Claude panes (chat + worker) render no footer at all, so this only
+ * covers the activity and board views.
  */
 function footerRow(activeView: NavView, width: number): Segment[] {
   const segs: Segment[] = []
@@ -494,18 +495,16 @@ function footerRow(activeView: NavView, width: number): Segment[] {
   const key = (t: string) => push(t, TUI_FG)
   // [key, hint] pairs per view.
   const hints: [string, string][] =
-    activeView === "chat" || activeView === "workspace"
-      ? [["⏎", " send   "], ["↑/↓", " scroll   "], ["esc", " tasks"]]
-      : activeView === "activity"
-        ? [["j/k", " scroll   "], ["r", " refresh   "], ["esc", " tasks"]]
-        : [
-            ["h/l", " col   "],
-            ["j/k", " row   "],
-            ["⏎", " open   "],
-            ["n", " new   "],
-            ["f", " filter   "],
-            ["r", " refresh"],
-          ]
+    activeView === "activity"
+      ? [["j/k", " scroll   "], ["r", " refresh   "], ["esc", " tasks"]]
+      : [
+          ["h/l", " col   "],
+          ["j/k", " row   "],
+          ["⏎", " open   "],
+          ["n", " new   "],
+          ["f", " filter   "],
+          ["r", " refresh"],
+        ]
   push("  ")
   for (const [k, hint] of hints) {
     key(k)
@@ -1571,18 +1570,17 @@ function TerminalBody({ state, contentOpacity }: { state: AppState; contentOpaci
   const boardRows = buildBoardRows(state.columns)
   const target = Math.max(boardRows.length, state.minBodyRows ?? 0)
   // The board and Activity feed carry the `<label> · <project>  N total …` header
-  // bar; the Chat and worker panes drop it so the Claude-Code session starts flush
-  // at the top of the pane, the way the real CLI does. The header is two rows
-  // (title + the blank beneath it), so a headerless pane reclaims those two rows
-  // into its body — keeping every view the same total height (target + 4 chrome
-  // rows) so the frame never resizes as the story swaps panes.
+  // bar and a footer keybinding hint bar. The Chat and worker panes are full
+  // Claude-Code sessions and drop both, so the session fills the pane flush the
+  // way the real CLI does — no `<label> · <project>` header, no
+  // `⏎ send · ↑/↓ scroll · esc tasks` hint bar. Header and footer are two rows
+  // each (title + blank, blank + hints), so a headerless, footerless pane
+  // reclaims all four rows into its body — keeping every view the same total
+  // height (target + 4 chrome rows) so the frame never resizes as the story
+  // swaps panes.
   const showHeader = state.activeView === "tasks" || state.activeView === "activity"
-  const bodyTarget = target + (showHeader ? 0 : 2)
-  // Chat and worker panes are full Claude-Code sessions with a bottom-pinned
-  // input box + footer, so they build to exactly `bodyTarget` rows themselves
-  // (conversation bottom-anchored against the chrome). Board/activity views
-  // render naturally and get padded/clipped to `bodyTarget` by `padBodyTo`.
   const isClaudePane = state.activeView === "chat" || state.activeView === "workspace"
+  const bodyTarget = target + (isClaudePane ? 4 : 0)
   const raw: Segment[][] = isClaudePane
     ? buildClaudeCodeRows(
         state,
@@ -1595,19 +1593,19 @@ function TerminalBody({ state, contentOpacity }: { state: AppState; contentOpaci
       : boardRows
   const body = padBodyTo(raw, bodyTarget, width)
   // Split the scrolling body (header + content) from the pinned footer so the
-  // `⏎ send  ↑/↓ scroll  esc tasks` hint bar can be pushed to the bottom edge
-  // of the pane (`mt-auto` below) — the same treatment `Sidebar` gives its
-  // `^P palette  q quit` line. This pane is the tallest element in the flex row
-  // today, so it already defines the frame height and the footer lands at the
-  // bottom; splitting it out keeps the bar anchored to the bottom edge no
-  // matter how much (or how little) content sits above it.
+  // hint bar can be pushed to the bottom edge of the pane (`mt-auto` below) —
+  // the same treatment `Sidebar` gives its `^P palette  q quit` line. The Claude
+  // panes carry no footer at all, so `footerRows` is empty for them and their
+  // body reclaims the space.
   const bodyRows: Segment[][] = [
     ...(showHeader ? [titleRow(state), blankRow(width)] : []),
     ...body,
   ]
   // A blank spacer above the footer keeps it off the content/chrome even when
   // the pane isn't stretched; when it is, `mt-auto` absorbs the extra slack.
-  const footerRows: Segment[][] = [blankRow(width), footerRow(state.activeView, width)]
+  const footerRows: Segment[][] = isClaudePane
+    ? []
+    : [blankRow(width), footerRow(state.activeView, width)]
 
   return (
     <pre
