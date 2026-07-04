@@ -13,22 +13,22 @@ orchestrator decides it can't judge.
 
 The mental model is **lead vs. scheduler**. Zen on, the agent makes
 calls; you redirect when you disagree. Zen off (the default), the
-agent waits to be told. Same prompt, same workspaces, same board — the
+agent waits to be told. Same prompt, same workspaces, same board. The
 only thing that changes is who initiates.
 
 ## Turning it on
 
 Three ways to flip the switch:
 
-- **CLI** — `shelbi zen on`, `shelbi zen off`, `shelbi zen pause`.
-- **TUI** — `Alt+Z` toggles between On and Off from any sidebar focus.
-- **Status check** — `shelbi zen status` prints the current mode,
+- **CLI**: `shelbi zen on`, `shelbi zen off`, `shelbi zen pause`.
+- **TUI**: `Alt+Z` toggles between On and Off from any sidebar focus.
+- **Status check**: `shelbi zen status` prints the current mode,
   configured local checks, resolved danger paths, the last crash
   timestamp (if any), and the count of in-flight Zen tasks.
 
 When Zen is **on**, the sidebar shows a green **ZEN ON** pill anchored
 to the bottom of the workspaces column. That pill is the at-a-glance
-"the agent is in lead mode" signal — if it's not there, Zen is off or
+"the agent is in lead mode" signal. If it's not there, Zen is off or
 paused.
 
 ### First-run hotkey probe
@@ -47,29 +47,29 @@ with three fallback chords:
 …plus a "skip" option that leaves the toggle unbound (use the CLI
 instead). Your pick is persisted to `~/.shelbi/shelbi.yaml`.
 
-## What Zen does — two paths
+## What Zen does: two paths
 
 Zen Mode does exactly two things the default scheduler doesn't:
 
-1. **Auto-merge** — when a task is queued for a workflow transition
+1. **Auto-merge**: when a task is queued for a workflow transition
    whose `actions:` include `merge`, Zen runs the high-confidence bar
    (below). If everything passes, the branch lands on its target and
-   the task moves to the transition's `to` status — typically `done`
-   — without a human stop.
-2. **Auto-promote** — when a workspace frees up, Zen scans the backlog
+   the task moves to the transition's `to` status (typically `done`)
+   without a human stop.
+2. **Auto-promote**: when a workspace frees up, Zen scans the backlog
    for tasks that are *mechanically eligible* (see
    [`shelbi zen scan`](/docs/cli/zen#scan)) and then applies the
    **judgment categories** from the orchestrator's prompt to decide
    which ones to promote into todo.
 
 The mechanical layer is in Rust. The judgment layer is in the
-orchestrator's prompt — which means **you own it** and can tune it
+orchestrator's prompt, which means **you own it** and can tune it
 per project. That's the most important point on this page.
 
 ## Per-status automation is declarative
 
-Zen's *judgment* — which backlog items are in scope, where the confidence
-bar sits — is prompt prose, covered below. But the more basic question of
+Zen's *judgment* (which backlog items are in scope, where the confidence
+bar sits) is prompt prose, covered below. But the more basic question of
 **which statuses the orchestrator is allowed to act on, and which agent it
 uses**, is no longer prompt prose at all. It's the
 [`owner` and `agent` fields](/docs/guides/getting-started/workflows#owners-and-agents) on
@@ -89,7 +89,7 @@ orchestrator's prompt are now lines of YAML:
   the final accept. Which agent reviews is data, not a prompt instruction.
 
 Flipping Zen on/off still gates whether the orchestrator *exercises* this
-autonomy at all. But once Zen is on, the workflow YAML — not the prompt —
+autonomy at all. But once Zen is on, the workflow YAML (not the prompt)
 decides per status whether the orchestrator acts and which agent it loads.
 The prompt is left to hold only the genuinely judgment-shaped policy: scope
 and the confidence bar. See
@@ -99,18 +99,18 @@ field semantics and the four validation rules.
 ## The high-confidence bar
 
 The bar fires on **any [workflow](/docs/guides/getting-started/workflows#transitions)
-transition whose `actions:` list includes `merge`** — not on the
+transition whose `actions:` list includes `merge`**, not on the
 `Review` column per se. The canonical default workflow happens to put
 `merge` on the `Review → Done` edge, so the practical effect is the
 same as before: a task that hands off to `review` trips the bar. But a
 trunk-based workflow that skips `Review` entirely and merges straight
-from `InProgress → Done` runs through the *same* probe — gating is
+from `InProgress → Done` runs through the *same* probe. Gating is
 action-based, not status-pair-based. See [What fires Zen Mode's
 high-confidence bar](/docs/guides/getting-started/workflows#what-fires-zen-modes-high-confidence-bar).
 
 When such a transition is queued, the orchestrator runs
 `shelbi zen probe <task-id>` (which threads the task's workflow
-through `probe_in_workflow` so per-workflow overrides take effect — see
+through `probe_in_workflow` so per-workflow overrides take effect; see
 below) to get a single JSON report covering every dimension below.
 Then it applies the conditions in order. Any failure leaves the task
 where it was, with a tagged reason event so the activity feed shows
@@ -133,20 +133,20 @@ semantic exclusively.
 The conditions, in order:
 
 1. **All `local_checks` pass** (exit 0). These are the commands you
-   listed under `zen.checks.local` in the project YAML — or under the
+   listed under `zen.checks.local` in the project YAML, or under the
    workflow's own `zen.checks` block when one is set (see
    [per-workflow overrides](#per-workflow-overrides)).
 2. **No merge conflicts** with the transition's target branch (the
    workflow's resolved `base_branch`, or a per-transition `target:` if
    one is set).
-3. **Diff size within bounds** — by default `files ≤ 30` and
+3. **Diff size within bounds**: by default `files ≤ 30` and
    `lines_added + lines_removed ≤ 2000`. Tunable in the prompt.
-4. **No danger-path matches** — anything matching the resolved
+4. **No danger-path matches**: anything matching the resolved
    danger-paths list (built-ins + detected shape + project
    `zen.danger_paths.extend` + the active workflow's `zen.danger_paths`
    override, if any) bails out.
 5. **PR opens cleanly** via `shelbi zen pr-create`.
-6. **CI is green** — `shelbi zen ci-watch <pr> --task <id>` polls
+6. **CI is green**: `shelbi zen ci-watch <pr> --task <id>` polls
    `gh pr checks --required` until every required check settles. The
    `--task` flag resolves the timeout against the task's workflow
    (`zen.ci_timeout` override, then project default of `15m`); plain
@@ -184,7 +184,7 @@ zen:
 Each [workflow](/docs/guides/getting-started/workflows) may carry its own `zen:`
 block that overrides any subset of the three project-level Zen knobs:
 `checks`, `ci_timeout`, `danger_paths`. Anything you don't set falls
-back to the project default — so a workflow can swap *just* its
+back to the project default, so a workflow can swap *just* its
 checks without restating the rest.
 
 ```yaml
@@ -218,19 +218,19 @@ on relaxed rules.
 
 Resolution rules:
 
-- **`checks`** — when set on the workflow, the workflow's list
+- **`checks`**: when set on the workflow, the workflow's list
   replaces the project's list outright. Per-task `checks_only` /
   `checks_additional` still apply on top (see
   [per-task overrides](#per-task-overrides)).
-- **`ci_timeout`** — when set on the workflow, the workflow's value
+- **`ci_timeout`**: when set on the workflow, the workflow's value
   wins. `shelbi zen ci-watch <pr> --task <id>` resolves through this
   override; without `--task`, the project default is used.
-- **`danger_paths`** — uses the same `extend:` vs `override:` shape as
+- **`danger_paths`**: uses the same `extend:` vs `override:` shape as
   the project block. `extend:` adds to the project's resolved list
   (built-ins + detected shapes + project `extend`). `override:`
   replaces the whole resolved list for tasks in this workflow.
 
-An empty block (`zen: {}`) parses but overrides nothing — semantically
+An empty block (`zen: {}`) parses but overrides nothing, semantically
 identical to omitting the block.
 
 ## The judgment layer
@@ -242,7 +242,7 @@ orchestrator should promote on its own in the first place.
 The Rust side (`shelbi zen scan`) gives the orchestrator a list of
 backlog ids that are *mechanically* safe: not blocked on
 dependencies, not explicitly opted out, no file overlap with anything
-currently in flight. That list is intentionally generous — it doesn't
+currently in flight. That list is intentionally generous. It doesn't
 know what the user wants.
 
 The orchestrator's prompt then applies three judgment categories
@@ -250,24 +250,24 @@ that ship as the default. A candidate gets promoted only if **at
 least one** is true:
 
 1. **It's the kind of work the user generally trusts you with.**
-   Pattern from the `done` column — does the user routinely accept
+   Pattern from the `done` column: does the user routinely accept
    tasks of this shape without changes?
 2. **It's part of fixing an issue the user recently raised.** The
    user mentioned this bug or feature in the last few turns.
 3. **It's part of a larger body of work the user explicitly kicked
-   off.** A multi-step refactor, a sweep across a dozen pages — the
+   off.** A multi-step refactor, a sweep across a dozen pages: the
    remaining items in that batch are in scope.
 
 If nothing fits, the candidate stays in backlog and the orchestrator
 calls it out in its next reply ("I considered promoting `<task>` but
-wasn't sure — want me to?"). It also emits
+wasn't sure. Want me to?"). It also emits
 `reason=orchestrator:zen-decline reason-text=<short>` so the
 activity feed shows what was considered and why.
 
 ### Tuning the judgment categories for your project
 
 This is the power-user invitation. The judgment categories live in
-the orchestrator's prompt — the section titled `## Zen Mode` in the
+the orchestrator's prompt, the section titled `## Zen Mode` in the
 default template. **You can edit it.**
 
 The orchestrator is a [project-local agent with shipped defaults](/docs/concepts/agents),
@@ -310,17 +310,17 @@ reply.
 
 Other places to tune:
 
-- **Raise/lower the diff thresholds** — change `files ≤ 30` to
+- **Raise/lower the diff thresholds**: change `files ≤ 30` to
   whatever fits the project's typical PR size.
-- **Accept partial CI red** — "if only the integration-test job is
+- **Accept partial CI red**: "if only the integration-test job is
   red, treat as green" is a common project-specific carve-out.
-- **Add pre-merge probes** — "before merging anything touching
+- **Add pre-merge probes**: "before merging anything touching
   `migrations/`, also require a passing `shelbi db dry-run`."
 - **Replace categories entirely** with a project-specific
   taxonomy.
 
 The Rust side never inspects this section, so the prose is the
-source of truth. That's the whole design — Zen's policy is one
+source of truth. That's the whole design. Zen's policy is one
 markdown file you own.
 
 For more on how the prompt gets wired in, see
@@ -329,7 +329,7 @@ For more on how the prompt gets wired in, see
 ## Per-task overrides
 
 Sometimes a single task needs different treatment than the project
-default — kept on the manual-review path because it's sensitive, or
+default: kept on the manual-review path because it's sensitive, or
 given an extra check the rest of the project doesn't need. Put a `zen:`
 block in the task's frontmatter:
 
@@ -376,7 +376,7 @@ Resolution rules:
 - `checks_only` takes precedence over `checks_additional`. If both
   are set, `checks_only` wins and `checks_additional` is ignored.
 - `checks_additional` extends whichever list the workflow layer
-  resolved to — workflow `zen.checks.local` if set, else project
+  resolved to: workflow `zen.checks.local` if set, else project
   `zen.checks.local`.
 - Absent both, the task inherits that resolved list verbatim. Full
   precedence: per-task `checks_only` > per-task `checks_additional` >
@@ -447,16 +447,16 @@ with the resolved per-workflow values printed underneath.
 
 Three levels of "stop":
 
-- **`shelbi zen off`** (or `Alt+Z` toggle) — hard off. No new
+- **`shelbi zen off`** (or `Alt+Z` toggle): hard off. No new
   auto-promotions, and the orchestrator stops initiating the merge
   bar on any `merge`-action transition. Anything already mid-flight
   in the conditions flow runs to completion on its current trajectory.
-- **`shelbi zen pause`** — softer. No new auto-promotions, but the
+- **`shelbi zen pause`**: softer. No new auto-promotions, but the
   merge bar keeps applying to in-flight tasks that reach a
   `merge`-action transition. Use this when you want to triage
   incoming work yourself for a bit without losing the auto-merge
   benefit on stuff already in motion.
-- **Per-task pull-back** — `shelbi task move <id> --to backlog`
+- **Per-task pull-back**: `shelbi task move <id> --to backlog`
   from a handoff status pulls a specific card out of Zen's hands
   without changing the global mode.
 
@@ -500,13 +500,13 @@ specific phrasing):
 | `zen:merge-conflict files=<…>` | Branch wouldn't merge cleanly. |
 | `zen:ci-timeout duration=<…>` | CI didn't settle within `ci_timeout`. |
 
-These tags also surface in `~/.shelbi/events.log` — grep there for a
+These tags also surface in `~/.shelbi/events.log`. Grep there for a
 full audit trail across all projects.
 
 The orchestrator also wakes on the project's periodic `heartbeat` line
 (see [the events log](/docs/concepts/events-log#heartbeats)). For Zen
 Mode that's the recurring nudge to check in-flight reviews and stuck
-auto-promotions when nothing else has fired — the merge bar can spend
+auto-promotions when nothing else has fired. The merge bar can spend
 minutes waiting on CI, and heartbeats keep the orchestrator from
 sleeping through the settle. The cadence comes from the `heartbeat`
 key in `project.yaml` (default `3m`).

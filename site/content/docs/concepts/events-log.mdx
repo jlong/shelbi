@@ -16,7 +16,7 @@ trail you grep when something looks wrong.
 
 The log is **hub-global**, not per-project: lines for all projects
 running against this hub interleave in the same file. Filtering by
-project (or workspace, or task) is the orchestrator's job — at the
+project (or workspace, or task) is the orchestrator's job. At the
 filesystem layer, it's one stream.
 
 Defined in `crates/shelbi-state/src/worker_status.rs` (`events_log_path`,
@@ -42,10 +42,10 @@ carries:
 - `<prev-state>` is `none` on the first observation of that workspace.
 - States: `working`, `awaiting_input`, `blocked`. See
   [workspace states](/docs/concepts/workspaces#workspace-states).
-- The `worker=` token is retained for backward compatibility — the
+- The `worker=` token is retained for backward compatibility. The
   slot it names is a [workspace](/docs/concepts/workspaces).
 - Written by the hub-side poller every time it observes a state change
-  (not on every tick — only on actual transitions).
+  (not on every tick, only on actual transitions).
 
 ### Task transitions
 
@@ -81,8 +81,8 @@ carries:
   `project.yaml`. Set to `"off"` to disable.
 - Adaptive cadence: the poller holds at the standard `interval`
   (default `3m`) while there's supervisable work in flight, then backs
-  off exponentially — doubling each idle tick, capped at `max` (default
-  `60m`) — once the board is quiescent. A fully idle hub relaxes
+  off exponentially once the board is quiescent, doubling each idle tick
+  and capping at `max` (default `60m`). A fully idle hub relaxes
   `3m → 6m → 12m → … → 60m`, so even a long-quiet board still sweeps for
   a silently-stuck task about once an hour. Backing off on "no
   supervisable work" rather than "no log line" is deliberate: a stuck
@@ -90,7 +90,7 @@ carries:
   exactly what catches it.
 - Resets on any real event: the poller compares `events.log`'s mtime
   against a baseline it advances on each seed/emit/reset, so any genuine
-  line — a task move, a workspace transition, a dispatch — both skips
+  line (a task move, a workspace transition, a dispatch) both skips
   that tick's emission (the event already woke the orchestrator) and
   snaps the cadence back to the standard `interval`. An active board
   never sees padding lines.
@@ -104,15 +104,15 @@ carries:
 
 Heartbeats exist for the orchestrator's `events tail --follow` watch.
 When nothing's happening on the board, the watch sits idle for as long
-as it takes for *something* to happen — which can be hours, or never if
+as it takes for *something* to happen, which can be hours, or never if
 a marker-emitting code path silently regresses. The recurring line is
 the orchestrator's fallback trigger to wake up and check active tasks.
 
-The TUI activity feed filters heartbeats out by design — they'd
+The TUI activity feed filters heartbeats out by design. They'd
 produce one "nothing happened" row every few minutes. Use
 `shelbi events tail` if you want to see them.
 
-The feed lives behind the **Activity** view in the dashboard — the same events
+The feed lives behind the **Activity** view in the dashboard: the same events
 this log records, rendered for a human instead of grepped:
 
 <AppMockup terminalTitle="jlong@hub — shelbi" activeView="activity" />
@@ -176,7 +176,7 @@ Implementation: `crates/shelbi-cli/src/commands/events.rs`.
 
 ## Reason strings
 
-The `reason=` tag on task lines is a free-form short token — the system
+The `reason=` tag on task lines is a free-form short token. The system
 doesn't enforce a vocabulary, but the orchestrator and CLI use a
 consistent set:
 
@@ -185,19 +185,19 @@ consistent set:
 | `user:cli`                                         | `shelbi task move`                       | You moved the card from the CLI with no explicit reason.                           |
 | `user:cli:start`                                   | `shelbi task start`                      | You launched a workspace on a task from the CLI.                                   |
 | `user:tui:…`                                       | the Kanban TUI                           | You moved the card with `H`/`L` in the TUI.                                        |
-| `user:promote`                                     | a `--reason` you passed                  | Free-form — anything starting with `user:` reads as "the human chose this."        |
+| `user:promote`                                     | a `--reason` you passed                  | Free-form: anything starting with `user:` reads as "the human chose this."         |
 | `orchestrator:auto-dispatch worker=<name>`         | the orchestrator's `shelbi task start`   | The orchestrator picked a free workspace and dispatched per its routing rules.     |
 | `worker:review-marker`                             | the hub poller                           | The workspace wrote its review-ready marker; the poller promoted the task to review. |
 
-These aren't enforced by code — they're a convention the orchestrator
+These aren't enforced by code. They're a convention the orchestrator
 parses to decide whether *it* triggered an event (and shouldn't react)
 or *you* did (and it should respond). The fields the orchestrator pays
 attention to today:
 
-- A `user:*` reason on `backlog -> todo` means "newly triaged" — try to
+- A `user:*` reason on `backlog -> todo` means "newly triaged." Try to
   dispatch.
 - `worker:review-marker` on `in_progress -> review` means "the assigned
-  workspace just became free" — find it the next task.
+  workspace just became free." Find it the next task.
 - `orchestrator:auto-dispatch …` is the orchestrator's own action; it
   doesn't react to it (otherwise it would loop).
 
@@ -213,7 +213,7 @@ contract is:
   via rename.
 - One line per event, RFC3339 timestamp first, ASCII fields separated
   by single spaces.
-- Two prefixes — `worker=` or `task=` — keyed off the second
+- Two prefixes (`worker=` or `task=`) keyed off the second
   whitespace-separated token after the timestamp.
 - Reason strings are tokens (no whitespace). If you need to embed
   structured data, encode it inside the token (the convention
