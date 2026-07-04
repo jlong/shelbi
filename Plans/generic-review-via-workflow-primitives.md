@@ -1,8 +1,5 @@
 # Generic Review via Workflow Primitives
 
-**Status:** design locked with jlong 2026-07-03. Ready to break into
-implementation tasks. Author: Orchestrator.
-
 ## North star (definition of done)
 
 **After this plan ships, there is NO review-specific code in the crates.**
