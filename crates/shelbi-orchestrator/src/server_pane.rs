@@ -755,7 +755,6 @@ mod tests {
             workspace_settings_template: None,
             zen: shelbi_core::ZenConfig::default(),
             heartbeat: shelbi_core::HeartbeatConfig::default(),
-            contextstore_sync: Vec::new(),
             detected_shapes: Vec::new(),
             git: shelbi_core::GitConfig::default(),
             review: shelbi_core::model::ReviewConfig::default(),

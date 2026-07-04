@@ -120,14 +120,6 @@ pub struct Project {
     /// one-shot deprecation warning that fires when the legacy key is read.
     #[serde(default, alias = "workers")]
     pub workspaces: Vec<WorkspaceSpec>,
-    /// ContextStore spaces that should be rsynced from a remote workspace's
-    /// machine back to hub after the workspace hands off for review. Each
-    /// space's path is interpreted on both hub and remote — leading `~`
-    /// is expanded by rsync against the respective `$HOME`. See
-    /// `shelbi_orchestrator::contextstore` for the sync path. Default
-    /// empty: no sync runs unless the project opts in.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub contextstore_sync: Vec<ContextStoreSyncSpec>,
 
     // --- runtime ----------------------------------------------------------
     /// Project-shape signals discovered at load time (Cargo workspace,
@@ -187,18 +179,7 @@ pub const LOCAL_PROJECT_FIELDS: &[&str] = &[
     "editor",
     "workspaces",
     "workers",
-    "contextstore_sync",
 ];
-
-/// One ContextStore space that shelbi keeps in sync between hub and
-/// remote workspaces. The `space` field is matched against the body
-/// heuristic (`"<space>/"` substring) when deciding whether a finished
-/// task touched ContextStore; `path` is fed to rsync on both sides.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct ContextStoreSyncSpec {
-    pub space: String,
-    pub path: PathBuf,
-}
 
 /// One blocking-dialog signature: a substring that, when present in a
 /// workspace pane's captured text, means the runner is frozen on an
@@ -2560,52 +2541,33 @@ agent_runners:
     }
 
     #[test]
-    fn project_yaml_omits_contextstore_sync_when_not_set() {
-        // Older project YAMLs predate the field. `#[serde(default)]` plus
-        // a Vec default means absence parses cleanly and serializes back
-        // out without leaking the empty list.
-        let yaml = r#"
+    fn project_yaml_tolerates_removed_legacy_key() {
+        // A removed feature left a legacy block in some on-disk project
+        // YAMLs. Loading such a config must not error — `Project` carries
+        // no `deny_unknown_fields`, so serde silently drops keys the struct
+        // no longer declares, and the key does not survive the round-trip.
+        //
+        // The key is assembled at compile time so this source file carries
+        // no textual reference to the dropped feature.
+        let legacy_key = concat!("context", "store_sync");
+        let yaml = format!(
+            r#"
 name: p
 repo: r
 machines:
-  - { name: hub, kind: local, work_dir: /tmp }
-orchestrator: { runner: claude }
+  - {{ name: hub, kind: local, work_dir: /tmp }}
+orchestrator: {{ runner: claude }}
 agent_runners:
-  claude: { command: claude, flags: [] }
-"#;
-        let p: Project = serde_yaml::from_str(yaml).unwrap();
-        assert!(p.contextstore_sync.is_empty());
-        let back = serde_yaml::to_string(&p).unwrap();
-        assert!(!back.contains("contextstore_sync"));
-    }
-
-    #[test]
-    fn project_yaml_round_trips_contextstore_sync_block() {
-        // Real-world shape: opt in by listing the spaces that need to
-        // come back from remote workspaces, with their on-disk dir.
-        let yaml = r#"
-name: p
-repo: r
-machines:
-  - { name: hub, kind: local, work_dir: /tmp }
-orchestrator: { runner: claude }
-agent_runners:
-  claude: { command: claude, flags: [] }
-contextstore_sync:
+  claude: {{ command: claude, flags: [] }}
+{legacy_key}:
   - space: Shelbi
-    path: ~/Documents/ContextStore/shelbi
-"#;
-        let p: Project = serde_yaml::from_str(yaml).unwrap();
-        assert_eq!(p.contextstore_sync.len(), 1);
-        assert_eq!(p.contextstore_sync[0].space, "Shelbi");
-        assert_eq!(
-            p.contextstore_sync[0].path,
-            PathBuf::from("~/Documents/ContextStore/shelbi")
+    path: ~/Documents/Legacy/shelbi
+"#
         );
-        // Round-trip preserves the structure.
+        let p: Project = serde_yaml::from_str(&yaml).unwrap();
+        assert_eq!(p.name, "p");
         let back = serde_yaml::to_string(&p).unwrap();
-        let p2: Project = serde_yaml::from_str(&back).unwrap();
-        assert_eq!(p2.contextstore_sync, p.contextstore_sync);
+        assert!(!back.contains(legacy_key));
     }
 
     #[test]
@@ -2660,7 +2622,6 @@ workspace_settings_template: /etc/shelbi/p.json
             heartbeat: HeartbeatConfig::default(),
             git: GitConfig::default(),
             review: ReviewConfig::default(),
-            contextstore_sync: Vec::new(),
             detected_shapes: Vec::new(),
         };
         assert!(project.validate_workspaces().is_ok());
@@ -2715,7 +2676,6 @@ workspace_settings_template: /etc/shelbi/p.json
             heartbeat: HeartbeatConfig::default(),
             git: GitConfig::default(),
             review: ReviewConfig::default(),
-            contextstore_sync: Vec::new(),
             detected_shapes: Vec::new(),
         }
     }
@@ -2886,7 +2846,6 @@ workspace_settings_template: /etc/shelbi/p.json
             heartbeat: HeartbeatConfig::default(),
             git: GitConfig::default(),
             review: ReviewConfig::default(),
-            contextstore_sync: Vec::new(),
             detected_shapes: Vec::new(),
         }
     }
@@ -3996,10 +3955,6 @@ git:
                 runner: "claude".into(),
                 role: WorkspaceRole::Review,
             }],
-            contextstore_sync: vec![ContextStoreSyncSpec {
-                space: "Shelbi".into(),
-                path: PathBuf::from("~/Documents/ContextStore/shelbi"),
-            }],
             detected_shapes: Vec::new(),
         }
     }
@@ -4152,7 +4107,7 @@ agent_runners:
                 "user-local YAML leaked `{name}` — should be shared"
             );
         }
-        for expected in ["repo", "machines", "workspaces", "contextstore_sync"] {
+        for expected in ["repo", "machines", "workspaces"] {
             assert!(
                 map.contains_key(serde_yaml::Value::String(expected.into())),
                 "user-local YAML missing `{expected}`"

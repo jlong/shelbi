@@ -200,16 +200,6 @@ review:
     timeout: 90              # seconds to wait for readiness. Default 90
 ",
     },
-    Section {
-        prose: &[
-            "ContextStore spaces rsynced from a remote workspace's machine back to",
-            "the hub after it hands a task off for review.",
-        ],
-        yaml: "\
-contextstore_sync:
-  - { space: Memories, path: ~/.contextstore/Memories }
-",
-    },
 ];
 
 /// Decorate the serde-rendered required project YAML (`active`) with a header
@@ -417,7 +407,6 @@ agent_runners:
         assert_eq!(p.name, "myapp");
         assert_eq!(p.machines.len(), 1, "ssh example must stay commented");
         assert!(p.workspaces.is_empty(), "workspaces example must stay commented");
-        assert!(p.contextstore_sync.is_empty());
     }
 
     #[test]
@@ -433,7 +422,6 @@ agent_runners:
         assert!(p.machines.iter().any(|m| m.host.as_deref() == Some("devbox.local")));
         assert_eq!(p.workspaces.len(), 2);
         assert!(p.workspaces.iter().any(|w| w.is_review()));
-        assert!(!p.contextstore_sync.is_empty());
         assert_eq!(p.github_url.as_deref(), Some("git@github.com:me/myapp.git"));
         // dialog_signatures nested under the codex runner.
         let codex = p.agent_runners.get("codex").expect("codex runner");

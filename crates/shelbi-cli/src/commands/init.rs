@@ -783,7 +783,7 @@ mod tests {
             "missing docs header: {yaml}"
         );
         // Representative optional features appear as commented examples.
-        for needle in ["#zen:", "#git:", "#workspaces:", "#review:", "#contextstore_sync:"] {
+        for needle in ["#zen:", "#git:", "#workspaces:", "#review:"] {
             assert!(yaml.contains(needle), "missing commented section {needle}");
         }
         // But they stay commented — the parsed project carries only the

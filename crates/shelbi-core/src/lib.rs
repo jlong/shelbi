@@ -15,7 +15,7 @@ pub use model::{
     danger_paths_for_project, danger_paths_for_workflow, default_dialog_signatures,
     detect_project_shapes, validate_agent_id, validate_branch, validate_project_name,
     validate_task_id, validate_workflow_name, Agent, AgentRunnerSpec, Column, ConfigMode,
-    ContextStoreSyncSpec, DialogSignature, GitConfig, HeartbeatConfig, Host, Machine, MachineKind,
+    DialogSignature, GitConfig, HeartbeatConfig, Host, Machine, MachineKind,
     MergeStrategy,
     OrchestratorSpec, ParamDiagnostic, Project, ProjectShape, Session, SessionProject, Status, Task,
     TaskZenConfig, TmuxAddr, WorkspaceSpec, ZenChecks, ZenConfig, ZenDangerPaths,
