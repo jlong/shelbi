@@ -115,13 +115,29 @@ finding:
 
 Order findings by severity, blockers first.
 
-## Signing off
+## Signing off or bouncing
 
-"No issues found" is a conclusion you have to earn, not a default. Only
-sign off clean when you have walked every changed hunk and have a
-specific reason each is sound. If you sign off, say briefly *why* the
-change holds up — what you checked — so the human reviewer can trust the
-pass. If anything is a `blocker`, say plainly that the change is not ready.
+Every review ends one of two ways. Decide from the highest-severity
+finding.
+
+**Clean pass, hand off forward.** If nothing rises to a `blocker`, sign
+off. "No issues found" is a conclusion you have to earn, not a default:
+only sign off clean when you have walked every changed hunk and have a
+specific reason each is sound. Say briefly *why* the change holds up (what
+you checked) so the human reviewer can trust the pass, then hand off
+forward the normal way, by writing the review-ready marker.
+
+**Blocking findings, bounce it back.** If any finding is a `blocker`, the
+change is not ready for a human. Write up your findings, then send the task
+back to the developer by writing the transition marker:
+
+    printf '%s\n%s\n' "$TASK_ID" bounce \
+      > .claude/shelbi-transition.tmp && mv .claude/shelbi-transition.tmp .claude/shelbi-transition
+
+The first line is your task id (`$TASK_ID` in your environment); the second
+is `bounce`, which sends the task back to the active status the developer
+works. Do not sign off and bounce in the same run. Bouncing is the signal
+that blockers exist.
 ```
 
 Tune it to your stack: swap the `.rs:120` example for your language, add a
@@ -131,6 +147,51 @@ first and earns its sign-off.
 
 </Step>
 </Steps>
+
+## How send-back works
+
+A gate agent bounces a task by writing one file: the **transition marker**
+at `<worktree>/.claude/shelbi-transition`. It's the same kind of plain-file
+signal as the review-ready marker a finishing agent writes. Workspaces have
+no `shelbi` binary, so the agent just writes the file and the hub poller
+acts on it.
+
+The format is two lines of UTF-8:
+
+```text
+<task-id>
+<target-status>
+```
+
+- **Line 1** is the agent's own task id. It has to match the task the
+  workspace is currently assigned, or the poller treats the marker as
+  stale and clears it without moving anything.
+- **Line 2** is either a status `id` the workflow declares (the primitive,
+  e.g. `in-progress`) or the verb `bounce` (equivalently `reject`), which
+  Shelbi resolves to the workflow's active status. That verb is why the
+  sample prompt can write `bounce` without hard-coding a status name.
+
+Write it atomically, temp file then `mv`, so the poller never reads a
+half-written marker:
+
+```sh
+printf '%s\n%s\n' "$TASK_ID" bounce \
+  > .claude/shelbi-transition.tmp && mv .claude/shelbi-transition.tmp .claude/shelbi-transition
+```
+
+It lives under `.claude/` because that directory is Shelbi's gitignored
+deploy footprint, so the marker never dirties the worktree or trips a
+clean-branch check between tasks.
+
+<Callout type="note" title="The workflow has the final say">
+
+Writing the marker is a *request*, not a guaranteed move. The poller
+applies it only if the workflow permits that edge. A backward bounce needs
+the `adversarial-review → in-progress` edge declared in the workflow's
+`transitions`, or the poller rejects the marker and the task stays put.
+Wiring that edge is the next part.
+
+</Callout>
 
 ## Confirm it landed
 
