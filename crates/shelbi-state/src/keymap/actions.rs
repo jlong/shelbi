@@ -1,7 +1,7 @@
 //! Customizable keybindings — the action hierarchy.
 //!
 //! Every key in shelbi's TUI maps to an [`Action`]. Actions are split per
-//! mode (global, sidebar, kanban, popover, review, activity, palette) so
+//! mode (global, sidebar, kanban, popover, activity, palette) so
 //! that the same chord can mean different things in different views
 //! without ambiguity.
 //!
@@ -14,7 +14,7 @@
 //! should land directly on the description / default chord list / mode.
 
 /// Mode-tagged action — the dispatched value when a chord matches in one
-/// of the seven TUI modes. Re-exports [`GlobalAction`] etc. through the
+/// of the six TUI modes. Re-exports [`GlobalAction`] etc. through the
 /// inner enums for direct construction.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Action {
@@ -22,7 +22,6 @@ pub enum Action {
     Sidebar(SidebarAction),
     Kanban(KanbanAction),
     Popover(PopoverAction),
-    Review(ReviewAction),
     Activity(ActivityAction),
     Palette(PaletteAction),
 }
@@ -71,19 +70,6 @@ pub enum PopoverAction {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum ReviewAction {
-    NavUp,
-    NavDown,
-    ScrollBodyUp,
-    ScrollBodyDown,
-    PageBodyUp,
-    PageBodyDown,
-    ScrollBodyHome,
-    Activate,
-    Refresh,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ActivityAction {
     ScrollUp,
     ScrollDown,
@@ -109,7 +95,7 @@ pub enum PaletteAction {
 /// Lowercase mode names — also the top-level YAML keys under
 /// `keys.yaml::defaults` and `keys.yaml::projects.<name>`.
 pub const MODE_NAMES: &[&str] = &[
-    "global", "sidebar", "kanban", "popover", "review", "activity", "palette",
+    "global", "sidebar", "kanban", "popover", "activity", "palette",
 ];
 
 impl Action {
@@ -150,17 +136,6 @@ impl Action {
                 PopoverAction::PageUp => "Popover: page up",
                 PopoverAction::PageDown => "Popover: page down",
                 PopoverAction::ScrollHome => "Popover: scroll to top",
-            },
-            Action::Review(a) => match a {
-                ReviewAction::NavUp => "Review: move selection up",
-                ReviewAction::NavDown => "Review: move selection down",
-                ReviewAction::ScrollBodyUp => "Review: scroll body up",
-                ReviewAction::ScrollBodyDown => "Review: scroll body down",
-                ReviewAction::PageBodyUp => "Review: page body up",
-                ReviewAction::PageBodyDown => "Review: page body down",
-                ReviewAction::ScrollBodyHome => "Review: scroll body to top",
-                ReviewAction::Activate => "Review: activate selection",
-                ReviewAction::Refresh => "Review: refresh",
             },
             Action::Activity(a) => match a {
                 ActivityAction::ScrollUp => "Activity: scroll up",
@@ -227,17 +202,6 @@ impl Action {
                 PopoverAction::PageDown => &["page-down", "d"],
                 PopoverAction::ScrollHome => &["g", "home"],
             },
-            Action::Review(a) => match a {
-                ReviewAction::NavUp => &["k", "up"],
-                ReviewAction::NavDown => &["j", "down"],
-                ReviewAction::ScrollBodyUp => &["K"],
-                ReviewAction::ScrollBodyDown => &["J"],
-                ReviewAction::PageBodyUp => &["page-up", "u"],
-                ReviewAction::PageBodyDown => &["page-down", "d"],
-                ReviewAction::ScrollBodyHome => &["g", "home"],
-                ReviewAction::Activate => &["enter", "space"],
-                ReviewAction::Refresh => &["r"],
-            },
             Action::Activity(a) => match a {
                 ActivityAction::ScrollUp => &["k", "up"],
                 ActivityAction::ScrollDown => &["j", "down"],
@@ -267,7 +231,6 @@ impl Action {
             Action::Sidebar(_) => "sidebar",
             Action::Kanban(_) => "kanban",
             Action::Popover(_) => "popover",
-            Action::Review(_) => "review",
             Action::Activity(_) => "activity",
             Action::Palette(_) => "palette",
         }
@@ -310,17 +273,6 @@ impl Action {
                 PopoverAction::PageUp => "page_up",
                 PopoverAction::PageDown => "page_down",
                 PopoverAction::ScrollHome => "scroll_home",
-            },
-            Action::Review(a) => match a {
-                ReviewAction::NavUp => "nav_up",
-                ReviewAction::NavDown => "nav_down",
-                ReviewAction::ScrollBodyUp => "scroll_body_up",
-                ReviewAction::ScrollBodyDown => "scroll_body_down",
-                ReviewAction::PageBodyUp => "page_body_up",
-                ReviewAction::PageBodyDown => "page_body_down",
-                ReviewAction::ScrollBodyHome => "scroll_body_home",
-                ReviewAction::Activate => "activate",
-                ReviewAction::Refresh => "refresh",
             },
             Action::Activity(a) => match a {
                 ActivityAction::ScrollUp => "scroll_up",
@@ -381,17 +333,6 @@ impl Action {
             PopoverAction::PageDown,
             PopoverAction::ScrollHome,
         ];
-        const REVIEW: &[ReviewAction] = &[
-            ReviewAction::NavUp,
-            ReviewAction::NavDown,
-            ReviewAction::ScrollBodyUp,
-            ReviewAction::ScrollBodyDown,
-            ReviewAction::PageBodyUp,
-            ReviewAction::PageBodyDown,
-            ReviewAction::ScrollBodyHome,
-            ReviewAction::Activate,
-            ReviewAction::Refresh,
-        ];
         const ACTIVITY: &[ActivityAction] = &[
             ActivityAction::ScrollUp,
             ActivityAction::ScrollDown,
@@ -418,7 +359,6 @@ impl Action {
             .chain(SIDEBAR.iter().copied().map(Action::Sidebar))
             .chain(KANBAN.iter().copied().map(Action::Kanban))
             .chain(POPOVER.iter().copied().map(Action::Popover))
-            .chain(REVIEW.iter().copied().map(Action::Review))
             .chain(ACTIVITY.iter().copied().map(Action::Activity))
             .chain(PALETTE.iter().copied().map(Action::Palette))
     }

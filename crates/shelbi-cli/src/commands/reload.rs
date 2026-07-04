@@ -6,7 +6,7 @@ use shelbi_state::WorkspaceSettingsTemplateOutcome;
 use super::init::print_agent_materialize_outcome;
 use super::require_project;
 
-/// Respawn the four shelbi-owned panes (sidebar + tasks/review/machines
+/// Respawn the shelbi-owned panes (sidebar + tasks/machines
 /// stash) AND the orchestrator pane in-place, then self-heal the
 /// per-project agent workspaces (`agents/{orchestrator,developer}/`)
 /// and the workspace-settings template so a freshly installed binary
@@ -119,7 +119,6 @@ fn print_report(project: &str, r: &ReloadReport) {
     println!("reload · {project}");
     print_pane("sidebar", &r.sidebar);
     print_pane("tasks", &r.tasks);
-    print_pane("review", &r.review);
     print_pane("machines", &r.machines);
     print_pane("activity", &r.activity);
     if let Some(h) = &r.handoff {

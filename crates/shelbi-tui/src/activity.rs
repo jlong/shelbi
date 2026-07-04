@@ -1841,7 +1841,7 @@ mod tests {
         // `<ts> task=<id> workflow=<name> <from> -> <to> reason=<r>
         //  from_category=<c> to_category=<c>`
         let line = "2026-06-23T04:19:33+00:00 task=ship-it workflow=feature-task \
-                    in_progress -> review reason=workspace:review-marker \
+                    in_progress -> review reason=workspace:ready-marker \
                     from_category=active to_category=handoff";
         match parse_event_line(line) {
             Event::Task {
@@ -1858,7 +1858,7 @@ mod tests {
                 assert_eq!(workflow, "feature-task");
                 assert_eq!(from, Column::InProgress);
                 assert_eq!(to, Column::Review);
-                assert_eq!(reason, "workspace:review-marker");
+                assert_eq!(reason, "workspace:ready-marker");
                 assert_eq!(from_category, StatusCategory::Active);
                 assert_eq!(to_category, StatusCategory::Handoff);
             }
@@ -2134,7 +2134,7 @@ mod tests {
     #[test]
     fn parse_zen_reason_ignores_non_zen_reasons() {
         assert!(parse_zen_reason("user:cli:start").is_none());
-        assert!(parse_zen_reason("workspace:review-marker").is_none());
+        assert!(parse_zen_reason("workspace:ready-marker").is_none());
         assert!(parse_zen_reason("").is_none());
     }
 
@@ -2278,7 +2278,7 @@ mod tests {
             workflow: DEFAULT_WORKFLOW_NAME.into(),
             from: Column::InProgress,
             to: Column::Review,
-            reason: "workspace:review-marker".into(),
+            reason: "workspace:ready-marker".into(),
             agent: None,
             from_category: Column::InProgress.category(),
             to_category: Column::Review.category(),
@@ -2627,7 +2627,7 @@ mod tests {
             workflow: DEFAULT_WORKFLOW_NAME.into(),
             from: Column::InProgress,
             to: Column::Review,
-            reason: "workspace:review-marker".into(),
+            reason: "workspace:ready-marker".into(),
             agent: None,
             from_category: Column::InProgress.category(),
             to_category: Column::Review.category(),

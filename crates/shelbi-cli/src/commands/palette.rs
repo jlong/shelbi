@@ -555,7 +555,7 @@ fn dispatch(project: &str, entry: &Entry) -> Result<()> {
         return Ok(());
     }
     if let Some(task_id) = entry.id.strip_prefix("review:") {
-        let target = shelbi_orchestrator::review::start_review_by_id(project, task_id)
+        let target = shelbi_orchestrator::load::load_task_by_id(project, task_id)
             .map_err(|e| anyhow::anyhow!(e))?;
         super::run_tmux(["select-window", "-t", &exact_window_target(&target)]);
         return Ok(());

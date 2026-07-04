@@ -28,5 +28,5 @@ pub use system_memory::{format_bytes_short, recommended_workspace_count, total_m
 pub use workspace_names::WorkspaceNamePreset;
 pub use workflow::{
     default_workflow, InlineIdentityField, Owner, Status as WorkflowStatus, StatusCategory,
-    Transition, TransitionAction, Workflow, WorkflowZenConfig, LEGACY_REVIEW_STATUS,
+    Transition, TransitionAction, Workflow, WorkflowZenConfig,
 };

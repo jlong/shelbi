@@ -187,20 +187,6 @@ zen:
     extend: [\".env\", \"infra/**\"]   # or `override: [...]`, or a bare list
 ",
     },
-    Section {
-        prose: &["Review workspaces: how a task's branch is loaded and served for review."],
-        yaml: "\
-review:
-  base_port: 3000            # first review dev-server port
-  port_stride: 10            # spacing between concurrent review servers
-  setup:
-    - npm install            # commands before the server (auto-detected if omitted)
-  serve: npm run dev -- --port $PORT
-  ready_probe:
-    http: http://localhost:$PORT
-    timeout: 90              # seconds to wait for readiness. Default 90
-",
-    },
 ];
 
 /// Decorate the serde-rendered required project YAML (`active`) with a header

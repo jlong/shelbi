@@ -2958,7 +2958,6 @@ mod tests {
             default_branch: "main".into(),
             config_mode: None,
             git: shelbi_core::GitConfig::default(),
-            review: Default::default(),
             machines: vec![shelbi_core::Machine {
                 name: "hub".into(),
                 kind: shelbi_core::MachineKind::Local,

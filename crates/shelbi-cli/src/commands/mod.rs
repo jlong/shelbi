@@ -19,7 +19,6 @@ pub mod project;
 pub mod quit_project;
 pub mod quit_shelbi;
 pub mod reload;
-pub mod review;
 pub mod send;
 pub mod spawn;
 pub mod status;
@@ -263,7 +262,6 @@ pub(crate) mod test_support {
             heartbeat: HeartbeatConfig::default(),
             detected_shapes: Vec::new(),
             git: GitConfig::default(),
-            review: Default::default(),
         };
         shelbi_state::save_project(&project).unwrap();
         repo

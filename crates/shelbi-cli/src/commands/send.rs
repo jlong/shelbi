@@ -217,7 +217,6 @@ mod tests {
             heartbeat: HeartbeatConfig::default(),
             detected_shapes: Vec::new(),
             git: GitConfig::default(),
-            review: Default::default(),
         }
     }
 

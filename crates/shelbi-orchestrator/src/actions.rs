@@ -1406,7 +1406,6 @@ mod tests {
             heartbeat: HeartbeatConfig::default(),
             detected_shapes: Vec::new(),
             git: shelbi_core::GitConfig::default(),
-            review: Default::default(),
         }
     }
 
@@ -1463,7 +1462,6 @@ mod tests {
             heartbeat: HeartbeatConfig::default(),
             detected_shapes: Vec::new(),
             git: shelbi_core::GitConfig::default(),
-            review: Default::default(),
         };
         assert!(workspace_holding_branch(&project, "feature").unwrap().is_none());
     }
@@ -1529,7 +1527,6 @@ mod tests {
             heartbeat: HeartbeatConfig::default(),
             detected_shapes: Vec::new(),
             git: shelbi_core::GitConfig::default(),
-            review: Default::default(),
         };
         let out = delete_branch(&project, &task_on_branch("t", "feature")).unwrap();
         assert!(matches!(out, DeleteOutcome::NotPresent), "{out:?}");
@@ -1592,7 +1589,6 @@ mod tests {
             heartbeat: HeartbeatConfig::default(),
             detected_shapes: Vec::new(),
             git: shelbi_core::GitConfig::default(),
-            review: Default::default(),
         };
 
         let wt = local.to_string_lossy().into_owned();
@@ -1833,7 +1829,6 @@ mod tests {
                 base_branch: None,
                 merge_strategy: strategy,
             },
-            review: Default::default(),
         }
     }
 

@@ -15,7 +15,7 @@
 //! machines via shelbi-ssh — which sets up ControlMaster so the marginal
 //! cost per poll is a socket write, not a TCP handshake) and parses the
 //! trailing `shelbi:<state>` marker. The marker file at
-//! `<worktree>/.claude/shelbi-review-ready` is checked first, before any
+//! `<worktree>/.claude/shelbi-ready` is checked first, before any
 //! pane operation, so the review handoff isn't gated on a working pane
 //! title (Claude's own OSC writes often clobber the marker before the
 //! poller sees it).
@@ -504,28 +504,21 @@ fn poll_one(
         return;
     };
 
-    // Review handoff is a file marker the workspace writes when it's done, read
+    // Ready handoff is a file marker the workspace writes when it's done, read
     // independently of the pane title. We check it *before* the pane-title
     // state below (and unconditionally, even if the pane has since died or
     // Claude has overwritten its title) so nothing the agent's UI does can
     // hide the signal. `addr` is threaded in so a dev workspace whose task we
-    // just promoted can close its own session immediately (spec §16).
-    maybe_promote_to_review(project, workspace, machine, &host, &addr);
+    // just handed off can close its own session immediately (spec §16).
+    maybe_apply_ready_handoff(project, workspace, machine, &host, &addr);
 
     // Agent-initiated status transition (bounce / send-back). A reviewer or
     // gate agent writes a transition marker naming its own task and a target
     // status; the poller validates the requested edge against the workflow and,
-    // if allowed, applies it. Checked right after the forward review handoff and
+    // if allowed, applies it. Checked right after the forward ready handoff and
     // independently of the pane title, for the same reason: nothing the agent's
     // UI does can hide a file-based signal.
     maybe_apply_transition(project, workspace, machine, &host, &addr);
-
-    // Reaper sweep (spec §10): a review workspace with a live server pane but
-    // no active task has leaked its bound port, which blocks the next
-    // dispatch onto that slot. Runs every poll as the heartbeat backstop for a
-    // missed teardown; a no-op for the common case (no server pane, or the
-    // server's task is still active).
-    maybe_reap_server_pane(project, workspace);
 
     // No pane → no marker. The display-message call would fail anyway,
     // but checking up-front keeps stderr noise out of the log.
@@ -617,7 +610,7 @@ fn poll_one(
     // ending in `shelbi:review` and drive the pane title, so acting on it
     // here would let untrusted checked-out code promote a task mid-work. The
     // sole trigger for the review column move is the independent file-based
-    // review marker, consumed by `maybe_promote_to_review` above — a file
+    // review marker, consumed by `maybe_apply_ready_handoff` above — a file
     // the agent's UI can't clobber.
 
     *last_known = Some(outcome.status.state);
@@ -803,38 +796,44 @@ fn record_usage_limit_pause(
     *last_known = Some(WorkspaceState::Paused);
 }
 
-/// Check the workspace's review-ready file marker and, if present, move its
-/// in-progress task to the review column. The marker is the workspace's handoff
-/// signal — it writes its task id into `<worktree>/.claude/shelbi-review-ready`
-/// when done (see `shelbi_orchestrator::workspace::workspace_review_marker`).
+/// Check the workspace's ready-handoff file marker and, if present, advance
+/// its in-progress task to the workflow's handoff status. The marker is the
+/// workspace's "I'm done" signal — it writes its task id into
+/// `<worktree>/.claude/shelbi-ready` when done (see
+/// `shelbi_orchestrator::workspace::workspace_ready_marker`).
+///
+/// The forward target is resolved generically from the task's workflow: the
+/// first status in the workflow's [`StatusCategory::Handoff`] category, not a
+/// hardcoded "review" id — so a workflow that renames its handoff status (e.g.
+/// `qa`) advances there just the same. The edge's transition actions +
+/// `run:` / `ready:` commands fire via [`execute_transition`], so serving is
+/// driven entirely by the generic transition-command path.
 ///
 /// Best-effort and idempotent: we consume the marker exactly once by clearing
-/// it after a successful move, and `move_task` is a no-op once the task is
-/// already in review, so a workspace that keeps churning in its pane afterward
-/// never gets pulled back out. A stale marker (worktree reused before the
+/// it after a successful move. A stale marker (worktree reused before the
 /// previous one was cleared) names a task that's no longer in-progress for
 /// this workspace, so we clear it without moving anything.
 ///
-/// On a real promotion this also **closes the dev workspace's session**
+/// On a real handoff this also **closes the dev workspace's session**
 /// immediately (spec §16): the branch is safely handed off, so the finished
 /// pane has no reason to linger and surface a completion glyph. Ordering is
 /// load-bearing — the close happens only AFTER the rebase + column move, never
-/// before, so work can't be stranded. Loading the promoted task onto a review
-/// workspace (or queueing it) is the orchestrator's job, reacting to the
-/// `to_category=handoff` event this move emits.
-fn maybe_promote_to_review(
+/// before, so work can't be stranded. A `review`-tagged workspace is left
+/// running (it reaches the handoff status by being *loaded* onto, not by
+/// finishing an in-progress task), so the guard is defensive.
+fn maybe_apply_ready_handoff(
     project: &Project,
     workspace: &shelbi_core::WorkspaceSpec,
     machine: &shelbi_core::Machine,
     host: &shelbi_core::Host,
     addr: &shelbi_core::TmuxAddr,
 ) {
-    let marker = shelbi_orchestrator::workspace::workspace_review_marker(machine, workspace);
-    let task_id = match shelbi_orchestrator::workspace::read_review_marker(host, &marker) {
+    let marker = shelbi_orchestrator::workspace::workspace_ready_marker(machine, workspace);
+    let task_id = match shelbi_orchestrator::workspace::read_ready_marker(host, &marker) {
         Ok(Some(id)) => id,
         Ok(None) => return,
         Err(e) => {
-            tracing::warn!(workspace = %workspace.name, error = %e, "read_review_marker failed");
+            tracing::warn!(workspace = %workspace.name, error = %e, "read_ready_marker failed");
             return;
         }
     };
@@ -849,27 +848,40 @@ fn maybe_promote_to_review(
             if tf.task.column == Column::InProgress
                 && tf.task.assigned_to.as_deref() == Some(workspace.name.as_str()) =>
         {
-            // Auto-rebase the workspace's branch onto the project's default
-            // branch before the column move. The goal is to absorb any
-            // prereq commits that landed on main while the workspace was
-            // working, so the human reviewer sees a single clean diff
-            // instead of having to drop into the worktree and run the
-            // rebase + force-push by hand. We do this BEFORE the column
-            // move (rather than blocking on it) so the row showing up in
-            // `review` already reflects the rewritten branch; a conflict
-            // is logged but doesn't block the promotion — the human still
-            // wants to see the work in review and resolve the conflict
-            // during the review checkout.
-            rebase_workspace_branch_before_review(project, workspace, machine, host, &task_id);
+            // Resolve the forward handoff target from the task's workflow:
+            // the first handoff-category status. No handoff status → nothing
+            // to advance to; clear the (misconfigured) marker below.
+            let workflow = shelbi_state::load_workflow(&project.name, tf.task.workflow_or_default())
+                .unwrap_or_else(|_| default_workflow());
+            let from_status = resolve_current_status_id(&workflow, Column::InProgress);
+            let Some(handoff) = workflow
+                .statuses
+                .iter()
+                .find(|s| s.category == StatusCategory::Handoff)
+            else {
+                tracing::warn!(workspace = %workspace.name, task = %task_id, "workflow declares no handoff status; clearing ready marker");
+                let _ = shelbi_orchestrator::workspace::clear_ready_marker(host, &marker);
+                return;
+            };
+            let to_status = handoff.id.clone();
+            let to_column = column_for_category(handoff.category);
 
-            match shelbi_state::move_task(&project.name, &task_id, Column::Review) {
+            // Auto-rebase the workspace's branch onto the project's default
+            // branch before the column move, so the human reviewer sees a
+            // single clean diff instead of running the rebase + force-push by
+            // hand. Done BEFORE the move (rather than blocking on it) so the
+            // row showing up already reflects the rewritten branch; a conflict
+            // is logged but doesn't block the handoff.
+            rebase_workspace_branch_before_handoff(project, workspace, machine, host, &task_id);
+
+            match shelbi_state::move_task(&project.name, &task_id, to_column) {
                 Ok(Some((from, to, workflow))) => {
                     if let Err(e) = shelbi_state::append_task_event(
                         &task_id,
                         &workflow,
                         from,
                         to,
-                        "workspace:review-marker",
+                        "workspace:ready-marker",
                     ) {
                         tracing::warn!(workspace = %workspace.name, task = %task_id, error = %e, "append_task_event failed");
                     }
@@ -877,23 +889,39 @@ fn maybe_promote_to_review(
                 Ok(None) => {}
                 Err(e) => {
                     // Leave the marker in place so we retry on the next tick.
-                    tracing::warn!(workspace = %workspace.name, task = %task_id, error = %e, "move_task to review failed");
+                    tracing::warn!(workspace = %workspace.name, task = %task_id, error = %e, "move_task on ready handoff failed");
                     return;
                 }
             }
-            tracing::info!(workspace = %workspace.name, task = %task_id, "promoted task to review via marker");
 
-            // Close the dev session on completion (spec §16). The branch is
-            // now safely promoted, so the finished pane has no reason to
-            // linger — killing it here frees the slot immediately and keeps a
-            // "done" glyph from lingering on the workspace row (the sidebar
-            // represents completion entirely in the review sections). We only
-            // do this for dev workspaces: a review workspace reaches Review by
-            // being *loaded* onto, not by promoting an in-progress task, so it
-            // never lands in this arm — the review-tag guard is defensive.
-            // Best-effort — a stuck kill must not block the marker clear below,
-            // and `kill_workspace_pane` is idempotent, so a pane already gone
-            // is a silent no-op.
+            // Fire the edge's transition actions + `run:` / `ready:` commands
+            // (serving). Best-effort — the move already happened, so a command
+            // failure logs but doesn't roll it back. A workflow with no edge
+            // declared for this move is a clean no-op.
+            match shelbi_orchestrator::transition::execute_transition(
+                project,
+                &project.name,
+                &tf.task,
+                &tf.body,
+                &workflow,
+                &from_status,
+                &to_status,
+            ) {
+                Ok(outcomes) => {
+                    for o in outcomes {
+                        tracing::info!(workspace = %workspace.name, task = %task_id, action = %o.action, line = %o.line, "ready-handoff action fired");
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(workspace = %workspace.name, task = %task_id, error = %e, "ready-handoff transition command failed");
+                }
+            }
+
+            tracing::info!(workspace = %workspace.name, task = %task_id, to = %to_status, "advanced task to handoff via ready marker");
+
+            // Close the dev session on completion (spec §16). Best-effort and
+            // idempotent. A `review`-tagged workspace is left running (it holds
+            // a loaded task, not a just-finished in-progress one).
             if !project.effective_tags(workspace).contains("review") {
                 if let Err(e) = shelbi_orchestrator::workspace::kill_workspace_pane(
                     host,
@@ -916,15 +944,15 @@ fn maybe_promote_to_review(
             }
         }
         Ok(_) => {
-            tracing::debug!(workspace = %workspace.name, task = %task_id, "stale review marker (task not in-progress for this workspace); clearing");
+            tracing::debug!(workspace = %workspace.name, task = %task_id, "stale ready marker (task not in-progress for this workspace); clearing");
         }
         Err(e) => {
-            tracing::warn!(workspace = %workspace.name, task = %task_id, error = %e, "review marker names unloadable task; clearing");
+            tracing::warn!(workspace = %workspace.name, task = %task_id, error = %e, "ready marker names unloadable task; clearing");
         }
     }
 
-    if let Err(e) = shelbi_orchestrator::workspace::clear_review_marker(host, &marker) {
-        tracing::warn!(workspace = %workspace.name, error = %e, "clear_review_marker failed");
+    if let Err(e) = shelbi_orchestrator::workspace::clear_ready_marker(host, &marker) {
+        tracing::warn!(workspace = %workspace.name, error = %e, "clear_ready_marker failed");
     }
 }
 
@@ -1050,7 +1078,7 @@ fn decide_transition(
 
 /// Check the workspace's agent-transition marker and, if it names this
 /// workspace's own task and requests an edge the workflow permits, apply the
-/// move. The generalization of [`maybe_promote_to_review`] to arbitrary
+/// move. The generalization of [`maybe_apply_ready_handoff`] to arbitrary
 /// (including backward) status transitions — see
 /// [`shelbi_orchestrator::workspace::workspace_transition_marker`] for the
 /// marker path + format.
@@ -1213,11 +1241,11 @@ fn maybe_apply_transition(
 /// Resolve the workspace's branch for the in-progress task and rebase it onto
 /// the project's default branch. Records one `rebase` line in `events.log`
 /// describing the outcome (ok / up-to-date / conflict / skipped). Never
-/// blocks the calling review promotion — failures here are advisory.
+/// blocks the calling handoff — failures here are advisory.
 ///
 /// `branch` falls back to the conventional `shelbi/<task-id>` when the task
-/// frontmatter doesn't pin one explicitly; that mirrors the review-load path.
-fn rebase_workspace_branch_before_review(
+/// frontmatter doesn't pin one explicitly.
+fn rebase_workspace_branch_before_handoff(
     project: &Project,
     workspace: &shelbi_core::WorkspaceSpec,
     machine: &shelbi_core::Machine,
@@ -1331,34 +1359,6 @@ fn decide(
             last_transition,
             last_seen: now,
         },
-    }
-}
-
-/// In-progress task currently assigned to `workspace`, if any. Cheap (one
-/// task-dir scan); called once per workspace per poll tick.
-/// Best-effort reaper pass over one workspace's server pane. Logs a reaped
-/// leak (a server whose task has moved on) so the action is visible in the
-/// TUI log; all other outcomes (no server, still-active, GC of a dead record)
-/// are silent. Never propagates — a reaper error must not sink the poll loop.
-fn maybe_reap_server_pane(project: &Project, workspace: &shelbi_core::WorkspaceSpec) {
-    use shelbi_orchestrator::server_pane::ReapOutcome;
-    match shelbi_orchestrator::server_pane::reap_server_pane_if_leaked(project, workspace) {
-        Ok(ReapOutcome::Reaped { task_id, port }) => {
-            tracing::info!(
-                workspace = %workspace.name,
-                task = %task_id,
-                port,
-                "reaped leaked review server pane",
-            );
-        }
-        Ok(_) => {}
-        Err(e) => {
-            tracing::warn!(
-                workspace = %workspace.name,
-                error = %e,
-                "reap_server_pane_if_leaked failed",
-            );
-        }
     }
 }
 
@@ -1723,7 +1723,6 @@ mod tests {
             zen: shelbi_core::ZenConfig::default(),
             heartbeat: shelbi_core::HeartbeatConfig::default(),
             git: shelbi_core::GitConfig::default(),
-            review: Default::default(),
             detected_shapes: Vec::new(),
         }
     }
@@ -1748,7 +1747,7 @@ mod tests {
     }
 
     fn write_marker(project: &Project, body: &str) -> std::path::PathBuf {
-        let marker = shelbi_orchestrator::workspace::workspace_review_marker(
+        let marker = shelbi_orchestrator::workspace::workspace_ready_marker(
             &project.machines[0],
             &project.workspaces[0],
         );
@@ -1779,7 +1778,7 @@ mod tests {
         // Workspace signals review by writing its task id into the marker.
         let marker = write_marker(&project, "fix-login\n");
 
-        maybe_promote_to_review(
+        maybe_apply_ready_handoff(
             &project,
             &project.workspaces[0],
             &project.machines[0],
@@ -1826,7 +1825,7 @@ mod tests {
             task_lines[0]
         );
         assert!(
-            task_lines[0].contains(" reason=workspace:review-marker "),
+            task_lines[0].contains(" reason=workspace:ready-marker "),
             "line: {}",
             task_lines[0]
         );
@@ -1870,7 +1869,7 @@ mod tests {
         // A leftover/stale marker naming a task that's no longer in-progress
         // for this workspace is cleared without moving anything back out.
         let marker = write_marker(&project, "fix-login\n");
-        maybe_promote_to_review(
+        maybe_apply_ready_handoff(
             &project,
             &project.workspaces[0],
             &project.machines[0],
@@ -1911,7 +1910,7 @@ mod tests {
         shelbi_state::save_task("demo", &in_progress_task("fix-login", "alpha"), "body").unwrap();
 
         // No marker on disk → task stays in progress.
-        maybe_promote_to_review(
+        maybe_apply_ready_handoff(
             &project,
             &project.workspaces[0],
             &project.machines[0],

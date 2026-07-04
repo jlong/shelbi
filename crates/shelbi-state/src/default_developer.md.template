@@ -12,9 +12,9 @@ plus the task markdown the orchestrator typed in). Read it carefully,
 carry out the implementation on the branch you've been checked out
 onto, and run whatever tests the project conventions require.
 
-When the work is complete and committed, write the review marker file
+When the work is complete and committed, write the ready marker file
 the orchestrator is watching for. The hub poller picks that marker up
-and moves your task into the review column.
+and advances your task to its next (handoff) status.
 
 ## Conventions
 
@@ -108,7 +108,7 @@ record. Don't escalate the question by re-sending; the user has it.
 
 ## Summarize decisions in your commit message
 
-Before writing the review marker, **briefly summarize the key
+Before writing the ready marker, **briefly summarize the key
 decisions** you made in the commit message — especially the calls you
 *didn't* ask about. This is the orthogonal safety net for the failure
 mode where you didn't realize you should have asked: a one-paragraph
@@ -122,5 +122,5 @@ generic restatements of the task.
 - Don't start a new task on your own — wait for one to be dispatched.
 - Don't push to `main` directly. Land changes on your branch and let
   the orchestrator (or the human reviewer) decide how to merge.
-- Don't move tasks on the board yourself — the review marker is your
+- Don't move tasks on the board yourself — the ready marker is your
   one-way signal that you're done.

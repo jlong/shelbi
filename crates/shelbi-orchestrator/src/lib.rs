@@ -22,9 +22,8 @@ pub mod dispatch;
 mod git;
 pub mod handoff;
 pub mod lifecycle;
+pub mod load;
 pub mod ready;
-pub mod review;
-pub mod server_pane;
 pub mod supervision;
 pub mod transition;
 pub mod workspace;
@@ -82,7 +81,6 @@ pub enum BootstrapStatus {
 pub struct ReloadReport {
     pub sidebar: PaneReloadStatus,
     pub tasks: PaneReloadStatus,
-    pub review: PaneReloadStatus,
     pub machines: PaneReloadStatus,
     pub activity: PaneReloadStatus,
     /// Orchestrator (dashboard right pane). Respawned after the four
@@ -173,11 +171,9 @@ pub fn orchestrator_pane_alive(project_name: &str) -> Result<bool> {
     pane_id_alive(&host, &pane_id)
 }
 
-/// Is `pane_id` (a stable tmux `%N`) among the server's live panes? Mirrors
-/// [`crate::server_pane::server_pane_alive`] but is spelled out here so the
-/// orchestrator-liveness path doesn't read as if it were checking a review
-/// *server* pane. A failed tmux call reports `Ok(false)` — treated as dead,
-/// matching the rest of the liveness probes.
+/// Is `pane_id` (a stable tmux `%N`) among the server's live panes? A failed
+/// tmux call reports `Ok(false)` — treated as dead, matching the rest of the
+/// liveness probes.
 fn pane_id_alive(host: &Host, pane_id: &str) -> Result<bool> {
     let out = shelbi_ssh::run(host, ["tmux", "list-panes", "-a", "-F", "#{pane_id}"])
         .map_err(Error::Io)?;
@@ -189,7 +185,7 @@ fn pane_id_alive(host: &Host, pane_id: &str) -> Result<bool> {
 }
 
 /// Swap the named view's pane into the dashboard's right slot. `view` is
-/// one of `orch`, `tasks`, `review`, `machines`, `activity`. Reads the
+/// one of `orch`, `tasks`, `machines`, `activity`. Reads the
 /// stored pane id from the session's tmux environment.
 pub fn show_view(project_name: &str, view: &str) -> Result<()> {
     let session = format!("shelbi-{project_name}");
@@ -560,14 +556,13 @@ fn apply_palette_binding(
     Ok(tmux_key)
 }
 
-/// The four hidden views, in creation order, paired with the pane command
+/// The three hidden views, in creation order, paired with the pane command
 /// each runs. Order matters only for the fresh-build path (`tasks` seeds the
 /// stash session; the rest split off it), but a single source of truth keeps
 /// the fresh build and the heal pass from drifting apart.
-fn hidden_view_cmds(shelbi_bin: &str, project_name: &str) -> [(&'static str, String); 4] {
+fn hidden_view_cmds(shelbi_bin: &str, project_name: &str) -> [(&'static str, String); 3] {
     [
         ("tasks", tasks_cmd(shelbi_bin, project_name)),
-        ("review", review_cmd(shelbi_bin, project_name)),
         ("machines", machines_cmd(shelbi_bin, project_name)),
         ("activity", activity_cmd(shelbi_bin, project_name)),
     ]
@@ -930,21 +925,13 @@ fn orchestrator_pane_cmd(
     )
 }
 
-// Tasks + review are real ratatui apps (`shelbi __tasks <p>`, `shelbi
-// __review <p>`). Wrap each in a `while true` loop so an accidental crash
-// or Ctrl-C respawns the TUI instead of leaving the stash pane empty —
-// palette swap-pane assumes the pane id stays alive.
+// Tasks is a real ratatui app (`shelbi __tasks <p>`). Wrap it in a `while
+// true` loop so an accidental crash or Ctrl-C respawns the TUI instead of
+// leaving the stash pane empty — palette swap-pane assumes the pane id stays
+// alive.
 fn tasks_cmd(shelbi_bin: &str, project_name: &str) -> String {
     format!(
         "while true; do {bin} __tasks {proj}; sleep 1; done",
-        bin = shelbi_agent::shell_escape(shelbi_bin),
-        proj = shelbi_agent::shell_escape(project_name),
-    )
-}
-
-fn review_cmd(shelbi_bin: &str, project_name: &str) -> String {
-    format!(
-        "while true; do {bin} __review {proj}; sleep 1; done",
         bin = shelbi_agent::shell_escape(shelbi_bin),
         proj = shelbi_agent::shell_escape(project_name),
     )
@@ -985,7 +972,6 @@ fn machines_cmd(shelbi_bin: &str, project_name: &str) -> String {
 ///
 /// - `shelbi-<project>:dashboard.{left}` → `shelbi __sidebar <project>`
 /// - stash `tasks` pane → tasks-view loop
-/// - stash `review` pane → review-view loop
 /// - stash `machines` pane → `shelbi workspace list` loop
 /// - stash `activity` pane → activity-view loop
 /// - orchestrator pane (`dashboard.{right}`) → its launch wrapper
@@ -1060,7 +1046,6 @@ pub fn reload(project_name: &str) -> Result<ReloadReport> {
 
     // 2-5. Stash panes — pane ids are stored in session env at bootstrap.
     report.tasks = reload_stash_pane(&session, "tasks", &tasks_cmd(&shelbi_bin, project_name));
-    report.review = reload_stash_pane(&session, "review", &review_cmd(&shelbi_bin, project_name));
     report.machines = reload_stash_pane(
         &session,
         "machines",
@@ -1328,15 +1313,6 @@ mod pane_cmd_tests {
         assert_eq!(
             out,
             "while true; do /usr/local/bin/shelbi __tasks myapp; sleep 1; done"
-        );
-    }
-
-    #[test]
-    fn review_cmd_wraps_in_respawn_loop() {
-        let out = review_cmd("/usr/local/bin/shelbi", "myapp");
-        assert_eq!(
-            out,
-            "while true; do /usr/local/bin/shelbi __review myapp; sleep 1; done"
         );
     }
 
@@ -1671,7 +1647,7 @@ mod ensure_hidden_views_tmux_tests {
     }
 
     /// Fresh path: no stash session yet. `ensure_hidden_views` must build the
-    /// whole stash — four panes, one env var each on the visible session.
+    /// whole stash — three panes, one env var each on the visible session.
     #[test]
     fn builds_stash_from_scratch_when_missing() {
         if !tmux_available() {
@@ -1689,8 +1665,8 @@ mod ensure_hidden_views_tmux_tests {
 
         ensure_hidden_views(&Host::Local, &vis, "proj", "shelbi").unwrap();
 
-        assert_eq!(pane_count(&format!("{stash}:views")), 4, "expected 4 view panes");
-        for view in ["tasks", "review", "machines", "activity"] {
+        assert_eq!(pane_count(&format!("{stash}:views")), 3, "expected 3 view panes");
+        for view in ["tasks", "machines", "activity"] {
             let id = env_var(&vis, &format!("SHELBI_PANE_{view}"));
             assert!(id.is_some(), "SHELBI_PANE_{view} should be pinned on the visible session");
             assert!(id.unwrap().starts_with('%'), "env should hold a tmux pane id");
@@ -1728,11 +1704,11 @@ mod ensure_hidden_views_tmux_tests {
 
         ensure_hidden_views(&Host::Local, &vis, "proj", "shelbi").unwrap();
 
-        // Seed pane + one fresh pane per view = 5, all four views pinned to a
+        // Seed pane + one fresh pane per view = 4, all three views pinned to a
         // pane that's actually alive in the stash.
-        assert_eq!(pane_count(&format!("{stash}:views")), 5, "one pane spliced per missing view");
+        assert_eq!(pane_count(&format!("{stash}:views")), 4, "one pane spliced per missing view");
         let live = live_stash_pane_ids(&Host::Local, &stash).unwrap();
-        for view in ["tasks", "review", "machines", "activity"] {
+        for view in ["tasks", "machines", "activity"] {
             let id = env_var(&vis, &format!("SHELBI_PANE_{view}"))
                 .unwrap_or_else(|| panic!("SHELBI_PANE_{view} unset after heal"));
             assert!(live.contains(&id), "pinned {view} pane {id} must be alive in the stash");
@@ -1740,7 +1716,7 @@ mod ensure_hidden_views_tmux_tests {
 
         // Second call: every view is now healthy, so nothing new is spliced.
         ensure_hidden_views(&Host::Local, &vis, "proj", "shelbi").unwrap();
-        assert_eq!(pane_count(&format!("{stash}:views")), 5, "heal must be idempotent");
+        assert_eq!(pane_count(&format!("{stash}:views")), 4, "heal must be idempotent");
 
         kill_session(&vis);
         kill_session(&stash);
@@ -1765,7 +1741,7 @@ mod ensure_hidden_views_tmux_tests {
 
         // Build a full stash first.
         ensure_hidden_views(&Host::Local, &vis, "proj", "shelbi").unwrap();
-        assert_eq!(pane_count(&format!("{stash}:views")), 4);
+        assert_eq!(pane_count(&format!("{stash}:views")), 3);
 
         // Point `tasks` at a bogus, non-existent pane id.
         std::process::Command::new("tmux")
@@ -1775,8 +1751,8 @@ mod ensure_hidden_views_tmux_tests {
 
         ensure_hidden_views(&Host::Local, &vis, "proj", "shelbi").unwrap();
 
-        // `tasks` was re-created (5 panes now), the other three untouched.
-        assert_eq!(pane_count(&format!("{stash}:views")), 5, "dead tasks pane re-created");
+        // `tasks` was re-created (4 panes now), the other two untouched.
+        assert_eq!(pane_count(&format!("{stash}:views")), 4, "dead tasks pane re-created");
         let live = live_stash_pane_ids(&Host::Local, &stash).unwrap();
         let tasks_id = env_var(&vis, "SHELBI_PANE_tasks").unwrap();
         assert_ne!(tasks_id, "%99999", "stale id must be replaced");

@@ -211,7 +211,7 @@ fn expand_tilde(p: &std::path::Path) -> PathBuf {
 /// Add shelbi's footprint to the repo's `.gitignore` if it isn't already
 /// covered: `.shelbi/` (metadata) plus the `.claude/` files shelbi deploys
 /// into the worktree on every dispatch (settings.json, agent-instructions.md,
-/// skills/, the review marker). Without the `.claude/` entries a repo that
+/// skills/, the ready marker). Without the `.claude/` entries a repo that
 /// doesn't already ignore that dir shows those files as untracked and the
 /// worktree reads as dirty. Writes to the file on the workspace's filesystem
 /// via `sh -c`; never commits.
@@ -227,15 +227,15 @@ fn ensure_gitignored(host: &Host, machine: &Machine) -> Result<()> {
             "\n# shelbi worktrees + metadata (https://github.com/jlong/shelbi)\n.shelbi/\n",
         );
     }
-    // Representative probe: if the review marker isn't ignored, none of the
+    // Representative probe: if the ready marker isn't ignored, none of the
     // shelbi-written `.claude/` files are, so append the whole block.
-    if !check_ignored(host, &repo, ".claude/shelbi-review-ready")? {
+    if !check_ignored(host, &repo, ".claude/shelbi-ready")? {
         snippet.push_str(
             "\n# shelbi deploy footprint written into the worktree on dispatch\n\
              .claude/settings.json\n\
              .claude/agent-instructions.md\n\
              .claude/skills/\n\
-             .claude/shelbi-review-ready\n",
+             .claude/shelbi-ready\n",
         );
     }
     if snippet.is_empty() {

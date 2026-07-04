@@ -31,7 +31,7 @@ use crossterm::event::KeyEvent;
 use serde::Deserialize;
 use serde_yaml::{Mapping, Value};
 use super::actions::{
-    Action, ActivityAction, GlobalAction, KanbanAction, PaletteAction, PopoverAction, ReviewAction,
+    Action, ActivityAction, GlobalAction, KanbanAction, PaletteAction, PopoverAction,
     SidebarAction, MODE_NAMES,
 };
 use super::chord::KeyChord;
@@ -50,7 +50,6 @@ pub struct Keymaps {
     pub sidebar: ModeKeymap<SidebarAction>,
     pub kanban: ModeKeymap<KanbanAction>,
     pub popover: ModeKeymap<PopoverAction>,
-    pub review: ModeKeymap<ReviewAction>,
     pub activity: ModeKeymap<ActivityAction>,
     pub palette: ModeKeymap<PaletteAction>,
 }
@@ -181,7 +180,7 @@ pub enum WarningKind {
     /// next load sees the legacy field at its default and stays silent.
     LegacyZenToggleMigrated,
     /// A chord bound in a mode that consults `global` first (sidebar,
-    /// kanban, review, activity) also matches a global binding, so the
+    /// kanban, activity) also matches a global binding, so the
     /// per-mode binding can never fire — global dispatch wins. Emitted
     /// only when a user override introduced the shadow (F12).
     ShadowedByGlobal,
@@ -607,7 +606,6 @@ fn build_keymaps(parsed: &HashMap<Action, Vec<KeyChord>>) -> Keymaps {
             Action::Sidebar(a) => insert_into(&mut km.sidebar, a, chords),
             Action::Kanban(a) => insert_into(&mut km.kanban, a, chords),
             Action::Popover(a) => insert_into(&mut km.popover, a, chords),
-            Action::Review(a) => insert_into(&mut km.review, a, chords),
             Action::Activity(a) => insert_into(&mut km.activity, a, chords),
             Action::Palette(a) => insert_into(&mut km.palette, a, chords),
         }
@@ -638,7 +636,7 @@ fn insert_into<A: Copy + Eq + Hash>(
 /// Modes whose key handlers consult `global` before their own bindings, so
 /// a chord shared with a global binding never reaches the mode. Popover and
 /// palette are modal and skip `global`, so they're deliberately excluded.
-const GLOBAL_CONSULTING_MODES: &[&str] = &["sidebar", "kanban", "review", "activity"];
+const GLOBAL_CONSULTING_MODES: &[&str] = &["sidebar", "kanban", "activity"];
 
 /// Every action's built-in chord list, parsed. The baseline the F12 shadow
 /// check subtracts so intentional default overlaps (e.g. `sidebar.quit`
@@ -992,10 +990,6 @@ mod tests {
         assert_eq!(
             km.popover.dispatch(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
             Some(PopoverAction::Close)
-        );
-        assert_eq!(
-            km.review.dispatch(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE)),
-            Some(ReviewAction::Activate)
         );
         assert_eq!(
             km.activity.dispatch(KeyEvent::new(KeyCode::Char('z'), KeyModifiers::NONE)),
