@@ -309,13 +309,12 @@ pub struct CardHit {
 ///
 /// Columns are project-wide (not bound to any workflow): a single
 /// `review` column shows tasks from every workflow whose schema includes
-/// a `review` status. The status's [`StatusCategory`] is mirrored here so:
-///
-/// - the renderer can colour the header using the same palette the legacy
-///   5-column flow uses (Backlog grey, Ready blue, Active yellow…), and
-/// - the move handler can map a target column back to the legacy
-///   [`Column`] enum that `shelbi_state::move_task` still takes — see
-///   [`category_to_column`].
+/// a `review` status. The status's [`StatusCategory`] is mirrored here so
+/// the renderer can colour the header using the stock palette (Backlog
+/// grey, Ready blue, Active yellow…). A card moves to this column by its
+/// [`status_id`](KanbanColumn::status_id) — the destination status id is
+/// the move target verbatim, so any column (including `canceled`) can hold
+/// a card.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct KanbanColumn {
     /// Stable status id ([`shelbi_core::ProjectStatus::id`]) used for
@@ -612,7 +611,7 @@ impl KanbanApp {
         {
             return resolve_task_status(task, wf);
         }
-        task.column.default_status_id().to_string()
+        task.column.as_str().to_string()
     }
 
     /// True when `tf` passes the active workspace filter. With no filter
@@ -631,7 +630,7 @@ impl KanbanApp {
     fn task_columns(&self) -> HashMap<String, Column> {
         self.tasks
             .iter()
-            .map(|tf| (tf.task.id.clone(), tf.task.column))
+            .map(|tf| (tf.task.id.clone(), tf.task.column.clone()))
             .collect()
     }
 
@@ -1214,27 +1213,25 @@ impl KanbanApp {
     }
 
     fn move_card(&mut self, id: &str, new_col_idx: usize) {
-        // `shelbi_state::move_task` still takes the legacy 5-column
-        // enum; map the workflow column's semantic category back to
-        // the matching Column so the on-disk task file lands in the
-        // right bucket. For default-workflow status names this is a
-        // pure identity; for custom workflows the category is the
-        // bridge (`Plans/workflows.md` §1).
+        // A task's position IS its status id, so the destination column's
+        // status id is the move target verbatim — no lossy category round
+        // trip. This is what lets a card land in `canceled` / any custom
+        // column, not just one of the five stock buckets.
         let target_col = self.column(new_col_idx).clone();
-        let new_col = category_to_column(target_col.category);
+        let new_col = Column::from_status_id(&target_col.status_id);
         // Lifecycle hook: when a move actually transitions a task INTO
         // `in_progress`, cut its branch on the hub (depends_on aware) and
         // persist `branch:` first — see `shelbi_orchestrator::lifecycle`.
         // If the cut fails (e.g. depends_on names a branch that doesn't
         // exist locally yet) we bail without moving the card so the YAML
         // and the git refs stay consistent.
-        if matches!(new_col, Column::InProgress) {
+        if new_col == Column::in_progress() {
             if let Some(tf) = self
                 .column_tasks(self.selected_column)
                 .iter()
                 .find(|tf| tf.task.id == id)
             {
-                if tf.task.column != Column::InProgress {
+                if tf.task.column != Column::in_progress() {
                     match shelbi_state::load_project(&self.project_name) {
                         Ok(project) => {
                             if let Err(e) =
@@ -2233,7 +2230,7 @@ fn category_color(category: StatusCategory) -> Color {
 /// the dep-list badges) that still take a `Column` directly. Routes
 /// through [`category_color`] so the canonical 5-status palette stays
 /// the single source of truth.
-fn column_color(c: Column) -> Color {
+fn column_color(c: &Column) -> Color {
     category_color(c.category())
 }
 
@@ -2383,52 +2380,32 @@ fn kanban_columns_from(
         .collect()
 }
 
-/// Resolve the workflow status *id* `task` lives in. Task storage still
-/// uses the legacy [`Column`] enum on disk (`Plans/workflows.md` §10
-/// hasn't moved tasks to status-id yet), so we have to bridge.
+/// Resolve the workflow status *id* `task` lives in. A task's position is
+/// itself a status id ([`Column::as_str`]), so this is mostly an identity
+/// — the fallbacks only matter when the task's stored id isn't one the
+/// workflow declares (a workflow that renamed a status).
 ///
 /// Resolution order, mirroring the events log writer's behaviour:
 ///
-/// 1. **Id match** — if the workflow declares a status whose id equals
-///    `task.column.default_status_id()` (`backlog` / `todo` /
-///    `in-progress` / `review` / `done`), use that id. Covers the
-///    default workflow and any custom workflow that reuses the
-///    canonical ids.
-/// 2. **Category match** — fall back to the first status in the
-///    workflow whose category equals the task's column category.
-///    Handles a custom workflow that renamed `InProgress` to `Design`
-///    (both report `StatusCategory::Active`).
-/// 3. **Canonical** — if the workflow declares no status that matches
-///    by id or category, return the canonical id unchanged. The task
-///    won't bucket cleanly, but the renderer never crashes.
+/// 1. **Id match** — if the workflow declares a status whose id equals the
+///    task's stored position id, use it. Covers the common case.
+/// 2. **Category match** — fall back to the first status in the workflow
+///    whose category equals the task's position category. Handles a custom
+///    workflow that renamed `in-progress` to `design` (both report
+///    `StatusCategory::Active`).
+/// 3. **Canonical** — if the workflow declares no status that matches by
+///    id or category, return the stored id unchanged. The task won't
+///    bucket cleanly, but the renderer never crashes.
 fn resolve_task_status(task: &Task, workflow: &Workflow) -> String {
-    let canonical = task.column.default_status_id();
-    if workflow.status(canonical).is_some() {
-        return canonical.to_string();
+    let stored = task.column.as_str();
+    if workflow.status(stored).is_some() {
+        return stored.to_string();
     }
     let cat = task.column.category();
     if let Some(st) = workflow.statuses.iter().find(|s| s.category == cat) {
         return st.id.clone();
     }
-    canonical.to_string()
-}
-
-/// Map a [`StatusCategory`] back to the canonical [`Column`] enum the
-/// task storage layer still takes. The mapping is 1:1 since each
-/// category maps to exactly one default-workflow status (see the
-/// table in [`Column::category`]).
-fn category_to_column(category: StatusCategory) -> Column {
-    match category {
-        StatusCategory::Backlog => Column::Backlog,
-        StatusCategory::Ready => Column::Todo,
-        StatusCategory::Active => Column::InProgress,
-        StatusCategory::Handoff => Column::Review,
-        StatusCategory::Done => Column::Done,
-        // Legacy `Column` has no Archived bucket — both terminal
-        // categories collapse to `Done` on disk until task storage
-        // moves off the 5-column enum (`Plans/workflows.md` §10).
-        StatusCategory::Archived => Column::Done,
-    }
+    stored.to_string()
 }
 
 // ---------------------------------------------------------------------------
@@ -2526,7 +2503,7 @@ fn popover_header(tf: &TaskFile, columns: &HashMap<String, Column>) -> Vec<Line<
 
     lines.push(meta_row("id", &task.id));
     let col_label = column_label(task.column.default_status_name());
-    let col_span = Span::styled(col_label, Style::default().fg(column_color(task.column)));
+    let col_span = Span::styled(col_label, Style::default().fg(column_color(&task.column)));
     let mut col_line = vec![meta_label("column"), col_span];
     col_line.push(Span::raw("   "));
     col_line.push(meta_label("priority"));
@@ -2553,7 +2530,7 @@ fn popover_header(tf: &TaskFile, columns: &HashMap<String, Column>) -> Vec<Line<
             if i > 0 {
                 spans.push(Span::raw(", "));
             }
-            let dep_col = columns.get(dep).copied();
+            let dep_col = columns.get(dep);
             let label_text = match dep_col {
                 Some(c) => format!("{dep} [{}]", c.as_str()),
                 None => format!("{dep} [missing]"),
@@ -2666,9 +2643,9 @@ mod tests {
         let mut app = KanbanApp::new("demo");
         // Insert in priority order; updated_at is intentionally out of order.
         app.tasks = vec![
-            task_file("old", Column::Done, 0, "2026-06-20T10:00:00Z"),
-            task_file("newest", Column::Done, 1, "2026-06-22T10:00:00Z"),
-            task_file("middle", Column::Done, 2, "2026-06-21T10:00:00Z"),
+            task_file("old", Column::done(), 0, "2026-06-20T10:00:00Z"),
+            task_file("newest", Column::done(), 1, "2026-06-22T10:00:00Z"),
+            task_file("middle", Column::done(), 2, "2026-06-21T10:00:00Z"),
         ];
         let ids: Vec<&str> = app
             .column_tasks(DONE_IDX)
@@ -2682,9 +2659,9 @@ mod tests {
     fn non_done_columns_keep_priority_order() {
         let mut app = KanbanApp::new("demo");
         app.tasks = vec![
-            task_file("a", Column::Backlog, 0, "2026-06-20T10:00:00Z"),
-            task_file("b", Column::Backlog, 1, "2026-06-22T10:00:00Z"),
-            task_file("c", Column::Backlog, 2, "2026-06-21T10:00:00Z"),
+            task_file("a", Column::backlog(), 0, "2026-06-20T10:00:00Z"),
+            task_file("b", Column::backlog(), 1, "2026-06-22T10:00:00Z"),
+            task_file("c", Column::backlog(), 2, "2026-06-21T10:00:00Z"),
         ];
         let ids: Vec<&str> = app
             .column_tasks(BACKLOG_IDX)
@@ -2700,9 +2677,9 @@ mod tests {
         // Equal updated_at → stable sort preserves the priority order, so a
         // re-poll of the same state never reshuffles (no flicker).
         app.tasks = vec![
-            task_file("first", Column::Done, 0, "2026-06-20T10:00:00Z"),
-            task_file("second", Column::Done, 1, "2026-06-20T10:00:00Z"),
-            task_file("third", Column::Done, 2, "2026-06-20T10:00:00Z"),
+            task_file("first", Column::done(), 0, "2026-06-20T10:00:00Z"),
+            task_file("second", Column::done(), 1, "2026-06-20T10:00:00Z"),
+            task_file("third", Column::done(), 2, "2026-06-20T10:00:00Z"),
         ];
         let ids: Vec<&str> = app
             .column_tasks(DONE_IDX)
@@ -2780,7 +2757,7 @@ mod tests {
         let task = shelbi_core::Task {
             id: "fix-login".into(),
             title: "fix login".into(),
-            column: Column::Todo,
+            column: Column::todo(),
             priority: 0,
             assigned_to: None,
             workflow: None,
@@ -2830,10 +2807,10 @@ mod tests {
     fn column_tasks_applies_workspace_filter() {
         let mut app = KanbanApp::new("demo");
         app.tasks = vec![
-            task_file_for("a", Column::Todo, 0, "2026-06-20T10:00:00Z", Some("alpha")),
-            task_file_for("b", Column::Todo, 1, "2026-06-20T10:00:00Z", Some("bravo")),
-            task_file_for("c", Column::InProgress, 0, "2026-06-20T10:00:00Z", Some("alpha")),
-            task_file_for("d", Column::Todo, 2, "2026-06-20T10:00:00Z", None),
+            task_file_for("a", Column::todo(), 0, "2026-06-20T10:00:00Z", Some("alpha")),
+            task_file_for("b", Column::todo(), 1, "2026-06-20T10:00:00Z", Some("bravo")),
+            task_file_for("c", Column::in_progress(), 0, "2026-06-20T10:00:00Z", Some("alpha")),
+            task_file_for("d", Column::todo(), 2, "2026-06-20T10:00:00Z", None),
         ];
         // No filter — all tasks pass through their column filter.
         assert_eq!(app.column_tasks(1).len(), 3);
@@ -2859,10 +2836,10 @@ mod tests {
         let mut app = KanbanApp::new("demo");
         app.workspaces = vec!["alpha".into(), "bravo".into(), "charlie".into()];
         app.tasks = vec![
-            task_file_for("a", Column::Todo, 0, "2026-06-20T10:00:00Z", Some("alpha")),
-            task_file_for("b", Column::Todo, 1, "2026-06-20T10:00:00Z", Some("alpha")),
-            task_file_for("c", Column::Todo, 2, "2026-06-20T10:00:00Z", Some("bravo")),
-            task_file_for("d", Column::Todo, 3, "2026-06-20T10:00:00Z", None),
+            task_file_for("a", Column::todo(), 0, "2026-06-20T10:00:00Z", Some("alpha")),
+            task_file_for("b", Column::todo(), 1, "2026-06-20T10:00:00Z", Some("alpha")),
+            task_file_for("c", Column::todo(), 2, "2026-06-20T10:00:00Z", Some("bravo")),
+            task_file_for("d", Column::todo(), 3, "2026-06-20T10:00:00Z", None),
         ];
         let opts = app.dropdown_options();
         // All / alpha(2) / bravo(1) / charlie(0) / Unassigned(1)
@@ -2885,7 +2862,7 @@ mod tests {
         app.workspaces = vec!["alpha".into()];
         app.tasks = vec![task_file_for(
             "a",
-            Column::Todo,
+            Column::todo(),
             0,
             "2026-06-20T10:00:00Z",
             Some("alpha"),
@@ -2906,8 +2883,8 @@ mod tests {
         let mut app = KanbanApp::new("demo");
         app.workspaces = vec!["alpha".into(), "bravo".into()];
         app.tasks = vec![
-            task_file_for("a", Column::Todo, 0, "2026-06-20T10:00:00Z", Some("alpha")),
-            task_file_for("b", Column::Todo, 1, "2026-06-20T10:00:00Z", Some("bravo")),
+            task_file_for("a", Column::todo(), 0, "2026-06-20T10:00:00Z", Some("alpha")),
+            task_file_for("b", Column::todo(), 1, "2026-06-20T10:00:00Z", Some("bravo")),
         ];
         app.workspace_filter = Some(WorkspaceFilter::Workspace("bravo".into()));
         app.open_workspace_dropdown();
@@ -3036,7 +3013,7 @@ mod tests {
             &shelbi_core::Task {
                 id: "orphan".into(),
                 title: "orphan".into(),
-                column: Column::Backlog,
+                column: Column::backlog(),
                 priority: 0,
                 assigned_to: None,
                 workflow: None,
@@ -3124,8 +3101,8 @@ mod tests {
         let mut app = KanbanApp::new("demo");
         app.workspaces = vec!["alpha".into(), "bravo".into()];
         app.tasks = vec![
-            task_file_for("a", Column::Todo, 0, "2026-06-20T10:00:00Z", Some("alpha")),
-            task_file_for("b", Column::Todo, 1, "2026-06-20T10:00:00Z", Some("bravo")),
+            task_file_for("a", Column::todo(), 0, "2026-06-20T10:00:00Z", Some("alpha")),
+            task_file_for("b", Column::todo(), 1, "2026-06-20T10:00:00Z", Some("bravo")),
         ];
         app.open_workspace_dropdown();
 
@@ -3384,13 +3361,13 @@ mod tests {
             ],
         );
         let t_backlog =
-            task_in_workflow("a", Column::Backlog, Some("design-review"), "2026-06-20T10:00:00Z")
+            task_in_workflow("a", Column::backlog(), Some("design-review"), "2026-06-20T10:00:00Z")
                 .task;
         let t_wip =
-            task_in_workflow("b", Column::InProgress, Some("design-review"), "2026-06-20T10:00:00Z")
+            task_in_workflow("b", Column::in_progress(), Some("design-review"), "2026-06-20T10:00:00Z")
                 .task;
         let t_review =
-            task_in_workflow("c", Column::Review, Some("design-review"), "2026-06-20T10:00:00Z")
+            task_in_workflow("c", Column::review(), Some("design-review"), "2026-06-20T10:00:00Z")
                 .task;
         // Name match.
         assert_eq!(resolve_task_status(&t_backlog, &design), "Backlog");
@@ -3416,27 +3393,27 @@ mod tests {
         app.all_columns = app.compute_all_columns();
         app.tasks = vec![
             // Default-workflow tasks.
-            task_in_workflow("a", Column::Todo, None, "2026-06-20T10:00:00Z"),
-            task_in_workflow("b", Column::Review, Some("default"), "2026-06-20T10:00:00Z"),
+            task_in_workflow("a", Column::todo(), None, "2026-06-20T10:00:00Z"),
+            task_in_workflow("b", Column::review(), Some("default"), "2026-06-20T10:00:00Z"),
             // design-review tasks land in shared columns.
             task_in_workflow(
                 "c",
-                Column::InProgress,
+                Column::in_progress(),
                 Some("design-review"),
                 "2026-06-20T10:00:00Z",
             ),
             task_in_workflow(
                 "d",
-                Column::Done,
+                Column::done(),
                 Some("design-review"),
                 "2026-06-20T10:00:00Z",
             ),
             // A default-workflow task in InProgress shares the column
             // with the design-review InProgress task.
-            task_in_workflow("e", Column::InProgress, None, "2026-06-20T10:00:00Z"),
+            task_in_workflow("e", Column::in_progress(), None, "2026-06-20T10:00:00Z"),
             // Task pointing at a workflow that doesn't exist falls
             // back to default — Todo lands in the project-wide Todo column.
-            task_in_workflow("orphan", Column::Todo, Some("ghost"), "2026-06-20T10:00:00Z"),
+            task_in_workflow("orphan", Column::todo(), Some("ghost"), "2026-06-20T10:00:00Z"),
         ];
 
         // statuses.yaml order: backlog todo in-progress review done canceled
@@ -3468,7 +3445,7 @@ mod tests {
         app.all_columns = app.compute_all_columns();
         app.tasks = vec![task_in_workflow(
             "only",
-            Column::Todo,
+            Column::todo(),
             None,
             "2026-06-20T10:00:00Z",
         )];
@@ -3574,20 +3551,20 @@ mod tests {
         // collapse-empty logic doesn't truncate their headers below the
         // length the assertions look for.
         app.tasks = vec![
-            task_in_workflow("d-backlog", Column::Backlog, None, "2026-06-20T10:00:00Z"),
-            task_in_workflow("d-todo", Column::Todo, None, "2026-06-20T10:00:00Z"),
-            task_in_workflow("d-wip", Column::InProgress, None, "2026-06-20T10:00:00Z"),
-            task_in_workflow("d-review", Column::Review, None, "2026-06-20T10:00:00Z"),
-            task_in_workflow("d-done", Column::Done, None, "2026-06-20T10:00:00Z"),
+            task_in_workflow("d-backlog", Column::backlog(), None, "2026-06-20T10:00:00Z"),
+            task_in_workflow("d-todo", Column::todo(), None, "2026-06-20T10:00:00Z"),
+            task_in_workflow("d-wip", Column::in_progress(), None, "2026-06-20T10:00:00Z"),
+            task_in_workflow("d-review", Column::review(), None, "2026-06-20T10:00:00Z"),
+            task_in_workflow("d-done", Column::done(), None, "2026-06-20T10:00:00Z"),
             task_in_workflow(
                 "dr-wip",
-                Column::InProgress,
+                Column::in_progress(),
                 Some("design-review"),
                 "2026-06-20T10:00:00Z",
             ),
             task_in_workflow(
                 "dr-done",
-                Column::Done,
+                Column::done(),
                 Some("design-review"),
                 "2026-06-20T10:00:00Z",
             ),
@@ -3682,8 +3659,8 @@ mod tests {
         let mut app = KanbanApp::new("demo");
         app.workflows = vec![default_workflow(), design];
         app.tasks = vec![
-            task_in_workflow("a", Column::Todo, None, "2026-06-20T10:00:00Z"),
-            task_in_workflow("b", Column::Backlog, Some("design-review"), "2026-06-20T10:00:00Z"),
+            task_in_workflow("a", Column::todo(), None, "2026-06-20T10:00:00Z"),
+            task_in_workflow("b", Column::backlog(), Some("design-review"), "2026-06-20T10:00:00Z"),
         ];
         let opts = app.workflow_dropdown_options();
         assert_eq!(opts.len(), 3);
@@ -3789,12 +3766,12 @@ mod tests {
             // Default-workflow card in Backlog — design-review also has
             // a `backlog` column, so without the workflow check this
             // card would leak in.
-            task_in_workflow("default-card", Column::Backlog, None, "2026-06-20T10:00:00Z"),
+            task_in_workflow("default-card", Column::backlog(), None, "2026-06-20T10:00:00Z"),
             // design-review card in Backlog — should be the only card
             // visible in the backlog column.
             task_in_workflow(
                 "dr-card",
-                Column::Backlog,
+                Column::backlog(),
                 Some("design-review"),
                 "2026-06-20T10:00:00Z",
             ),
@@ -3833,7 +3810,7 @@ mod tests {
         app.all_columns = app.compute_all_columns();
         app.tasks = vec![task_in_workflow(
             "dr",
-            Column::InProgress,
+            Column::in_progress(),
             Some("design-review"),
             "2026-06-20T10:00:00Z",
         )];
@@ -3969,11 +3946,11 @@ mod tests {
         app.tasks = vec![
             // A default-workflow card in Todo — filtered out because
             // design-review doesn't declare `todo`.
-            task_in_workflow("d1", Column::Todo, None, "2026-06-20T10:00:00Z"),
+            task_in_workflow("d1", Column::todo(), None, "2026-06-20T10:00:00Z"),
             // A design-review card in InProgress — should paint.
             task_in_workflow(
                 "dr1",
-                Column::InProgress,
+                Column::in_progress(),
                 Some("design-review"),
                 "2026-06-20T10:00:00Z",
             ),
@@ -4081,7 +4058,7 @@ mod tests {
         shelbi_core::Task {
             id: id.into(),
             title: id.into(),
-            column: Column::Todo,
+            column: Column::todo(),
             priority: 0,
             assigned_to: None,
             workflow: workflow.map(|s| s.to_string()),
@@ -4319,7 +4296,7 @@ mod tests {
     fn fresh_app_columns_are_auto_and_collapse_on_empty() {
         let mut app = KanbanApp::new("demo");
         // Backlog (idx 0) is empty; Todo (idx 1) has one card.
-        app.tasks = vec![task_file("a", Column::Todo, 0, "2026-06-20T10:00:00Z")];
+        app.tasks = vec![task_file("a", Column::todo(), 0, "2026-06-20T10:00:00Z")];
         assert_eq!(app.column_expansion(0), ColumnExpansion::Auto);
         assert!(app.is_column_collapsed(0), "empty Backlog auto-collapses");
         assert!(!app.is_column_collapsed(1), "non-empty Todo auto-expands");
@@ -4379,7 +4356,7 @@ mod tests {
 
         // First app: collapse a non-empty column explicitly.
         let mut app = KanbanApp::new("demo");
-        app.tasks = vec![task_file("a", Column::Todo, 0, "2026-06-20T10:00:00Z")];
+        app.tasks = vec![task_file("a", Column::todo(), 0, "2026-06-20T10:00:00Z")];
         assert!(!app.is_column_collapsed(1), "non-empty Todo expands by default");
         app.toggle_column(1);
         assert_eq!(app.column_expansion(1), ColumnExpansion::Collapsed);
@@ -4424,7 +4401,7 @@ mod tests {
         assert_eq!(app.column_expansion(0), ColumnExpansion::Collapsed);
 
         // Task lands in the column — override stands, count updates.
-        app.tasks = vec![task_file("a", Column::Backlog, 0, "2026-06-20T10:00:00Z")];
+        app.tasks = vec![task_file("a", Column::backlog(), 0, "2026-06-20T10:00:00Z")];
         assert!(
             app.is_column_collapsed(0),
             "explicit-collapsed must persist after a task arrives",
@@ -4446,7 +4423,7 @@ mod tests {
         let mut app = KanbanApp::new("demo");
         // Seed a single Backlog card so the Backlog column expands —
         // we want a NON-Backlog empty column to verify the strip.
-        app.tasks = vec![task_file("seed", Column::Backlog, 0, "2026-06-20T10:00:00Z")];
+        app.tasks = vec![task_file("seed", Column::backlog(), 0, "2026-06-20T10:00:00Z")];
 
         let backend = TestBackend::new(120, 20);
         let mut term = Terminal::new(backend).unwrap();
@@ -4500,7 +4477,7 @@ mod tests {
         let mut app = KanbanApp::new("demo");
         // One Backlog task → Backlog expands. Every other status is
         // empty → auto-collapses to a strip.
-        app.tasks = vec![task_file("seed", Column::Backlog, 0, "2026-06-20T10:00:00Z")];
+        app.tasks = vec![task_file("seed", Column::backlog(), 0, "2026-06-20T10:00:00Z")];
 
         let backend = TestBackend::new(120, 20);
         let mut term = Terminal::new(backend).unwrap();

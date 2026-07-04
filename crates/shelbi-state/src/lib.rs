@@ -1775,12 +1775,7 @@ pub fn list_tasks(project: &str) -> Result<Vec<TaskFile>> {
     // collide — without it, ties resolve by `read_dir` order, which the
     // filesystem is free to flap between scans.
     out.sort_by(|a, b| {
-        let col_idx = |tf: &TaskFile| {
-            Column::ALL
-                .iter()
-                .position(|c| *c == tf.task.column)
-                .unwrap_or(0)
-        };
+        let col_idx = |tf: &TaskFile| tf.task.column.board_order();
         (col_idx(a), a.task.priority, a.task.id.as_str()).cmp(&(
             col_idx(b),
             b.task.priority,
@@ -1807,7 +1802,7 @@ pub fn task_columns(project: &str) -> Result<HashMap<String, Column>> {
         .collect())
 }
 
-/// Tasks ready to start: in [`Column::Todo`], not blocked by any unfinished
+/// Tasks ready to start: in [`Column::todo()`], not blocked by any unfinished
 /// dependency. Returned in priority order. Both views — the id→column map
 /// and the Todo subset — derive from a single [`list_tasks`] pass, so a
 /// concurrent task move can't make them disagree mid-call.
@@ -1815,21 +1810,21 @@ pub fn list_ready(project: &str) -> Result<Vec<TaskFile>> {
     let tasks = list_tasks(project)?;
     let columns: HashMap<String, Column> = tasks
         .iter()
-        .map(|tf| (tf.task.id.clone(), tf.task.column))
+        .map(|tf| (tf.task.id.clone(), tf.task.column.clone()))
         .collect();
     Ok(tasks
         .into_iter()
-        .filter(|tf| tf.task.column == Column::Todo && !tf.task.is_blocked(&columns))
+        .filter(|tf| tf.task.column == Column::todo() && !tf.task.is_blocked(&columns))
         .collect())
 }
 
 /// Count workspaces with no `active`-category (in-progress) task assigned to
-/// them. A workspace is "idle" when nothing in [`Column::InProgress`] names it
+/// them. A workspace is "idle" when nothing in [`Column::in_progress()`] names it
 /// in `assigned_to` — the same predicate the poller uses to decide a workspace
 /// is free. Surfaced in the heartbeat payload so the orchestrator can tell, at
 /// emit time, whether there's spare capacity to absorb eligible backlog work.
 pub fn idle_workspace_count(project: &Project) -> Result<usize> {
-    let in_progress = list_column(&project.name, Column::InProgress)?;
+    let in_progress = list_column(&project.name, Column::in_progress())?;
     Ok(idle_workspace_count_from(&project.workspaces, &in_progress))
 }
 
@@ -1969,18 +1964,18 @@ pub fn move_task(
     if task.column == new_column {
         return Ok(None);
     }
-    let old_column = task.column;
+    let old_column = task.column.clone();
     let workflow = task.workflow_or_default().to_string();
-    let new_priority = list_column(project, new_column)?.len() as u32;
-    task.column = new_column;
+    let new_priority = list_column(project, new_column.clone())?.len() as u32;
+    task.column = new_column.clone();
     task.priority = new_priority;
     task.updated_at = chrono::Utc::now();
     save_task_unlocked(project, &task, &body)?;
-    renumber_column_unlocked(project, old_column)?;
+    renumber_column_unlocked(project, old_column.clone())?;
     // Renumber the destination too — it repairs duplicate priorities or
     // gaps left behind by older builds (or a crash between the save and
     // the renumber) instead of letting them skew the column forever.
-    renumber_column_unlocked(project, new_column)?;
+    renumber_column_unlocked(project, new_column.clone())?;
     Ok(Some((old_column, new_column, workflow)))
 }
 
@@ -2008,7 +2003,7 @@ pub fn move_task_and_unassign(
 ) -> Result<Option<(Column, Column, String)>> {
     let _lock = lock_tasks(project)?;
     let TaskFile { mut task, body } = load_task(project, id)?;
-    let old_column = task.column;
+    let old_column = task.column.clone();
     let workflow = task.workflow_or_default().to_string();
     let already_there = old_column == new_column;
     if already_there && task.assigned_to.is_none() {
@@ -2016,8 +2011,8 @@ pub fn move_task_and_unassign(
     }
     task.assigned_to = None;
     if !already_there {
-        task.column = new_column;
-        task.priority = list_column(project, new_column)?.len() as u32;
+        task.column = new_column.clone();
+        task.priority = list_column(project, new_column.clone())?.len() as u32;
     }
     task.updated_at = chrono::Utc::now();
     save_task_unlocked(project, &task, &body)?;
@@ -2025,12 +2020,12 @@ pub fn move_task_and_unassign(
         // Only the owner was cleared — no column move to renumber or log.
         return Ok(None);
     }
-    renumber_column_unlocked(project, old_column)?;
-    renumber_column_unlocked(project, new_column)?;
+    renumber_column_unlocked(project, old_column.clone())?;
+    renumber_column_unlocked(project, new_column.clone())?;
     Ok(Some((old_column, new_column, workflow)))
 }
 
-/// Release task `id` back to [`Column::Todo`] and clear its `assigned_to`
+/// Release task `id` back to [`Column::todo()`] and clear its `assigned_to`
 /// in a **single** locked write.
 ///
 /// The workspace-teardown path used to unassign (`save_task`) and then move
@@ -2047,16 +2042,16 @@ pub fn move_task_and_unassign(
 pub fn release_task_to_todo(project: &str, id: &str) -> Result<Option<(Column, Column, String)>> {
     let _lock = lock_tasks(project)?;
     let TaskFile { mut task, body } = load_task(project, id)?;
-    let old_column = task.column;
+    let old_column = task.column.clone();
     let workflow = task.workflow_or_default().to_string();
-    let already_todo = old_column == Column::Todo;
+    let already_todo = old_column == Column::todo();
     if already_todo && task.assigned_to.is_none() {
         return Ok(None);
     }
     task.assigned_to = None;
     if !already_todo {
-        task.column = Column::Todo;
-        task.priority = list_column(project, Column::Todo)?.len() as u32;
+        task.column = Column::todo();
+        task.priority = list_column(project, Column::todo())?.len() as u32;
     }
     task.updated_at = chrono::Utc::now();
     save_task_unlocked(project, &task, &body)?;
@@ -2064,9 +2059,9 @@ pub fn release_task_to_todo(project: &str, id: &str) -> Result<Option<(Column, C
         // Only the owner was cleared — no column move to renumber or log.
         return Ok(None);
     }
-    renumber_column_unlocked(project, old_column)?;
-    renumber_column_unlocked(project, Column::Todo)?;
-    Ok(Some((old_column, Column::Todo, workflow)))
+    renumber_column_unlocked(project, old_column.clone())?;
+    renumber_column_unlocked(project, Column::todo())?;
+    Ok(Some((old_column, Column::todo(), workflow)))
 }
 
 /// Re-position `id` to slot `new_priority` within its current column. Other
@@ -2803,7 +2798,7 @@ mod tests {
     }
 
     fn assigned(id: &str, to: &str) -> TaskFile {
-        let mut task = make_task(id, Column::InProgress, 0);
+        let mut task = make_task(id, Column::in_progress(), 0);
         task.assigned_to = Some(to.to_string());
         TaskFile {
             task,
@@ -2841,11 +2836,11 @@ mod tests {
         let _g = TEST_LOCK.lock().unwrap();
         let home = fresh_home();
         std::env::set_var("SHELBI_HOME", &home);
-        let task = make_task("fix-login", Column::Todo, 3);
+        let task = make_task("fix-login", Column::todo(), 3);
         save_task("proj", &task, "# Description\n").unwrap();
         let back = load_task("proj", "fix-login").unwrap();
         assert_eq!(back.task.id, "fix-login");
-        assert_eq!(back.task.column, Column::Todo);
+        assert_eq!(back.task.column, Column::todo());
         assert_eq!(back.task.priority, 3);
         assert!(back.body.contains("Description"));
         std::env::remove_var("SHELBI_HOME");
@@ -2860,7 +2855,7 @@ mod tests {
         // A `branch:` that would inject a git flag or shell metacharacters
         // must be rejected at the write chokepoint — never persisted, so it
         // can never reach `git checkout` / `git worktree add` on a worker.
-        let mut task = make_task("evil", Column::Todo, 0);
+        let mut task = make_task("evil", Column::todo(), 0);
         task.branch = Some("--upload-pack=touch /tmp/pwn".into());
         assert!(matches!(
             save_task("proj", &task, ""),
@@ -2870,7 +2865,7 @@ mod tests {
         assert!(load_task("proj", "evil").is_err());
 
         // A well-formed namespaced branch still saves fine.
-        let mut ok = make_task("good", Column::Todo, 0);
+        let mut ok = make_task("good", Column::todo(), 0);
         ok.branch = Some("shelbi/good".into());
         save_task("proj", &ok, "").unwrap();
         assert_eq!(
@@ -2886,17 +2881,17 @@ mod tests {
         let home = fresh_home();
         std::env::set_var("SHELBI_HOME", &home);
         for (i, id) in ["a", "b", "c"].iter().enumerate() {
-            save_task("p", &make_task(id, Column::Todo, i as u32), "").unwrap();
+            save_task("p", &make_task(id, Column::todo(), i as u32), "").unwrap();
         }
-        move_task("p", "b", Column::InProgress).unwrap();
+        move_task("p", "b", Column::in_progress()).unwrap();
 
-        let todo = list_column("p", Column::Todo).unwrap();
+        let todo = list_column("p", Column::todo()).unwrap();
         let ids: Vec<_> = todo.iter().map(|tf| tf.task.id.as_str()).collect();
         let prios: Vec<_> = todo.iter().map(|tf| tf.task.priority).collect();
         assert_eq!(ids, vec!["a", "c"]);
         assert_eq!(prios, vec![0, 1]); // renumbered
 
-        let wip = list_column("p", Column::InProgress).unwrap();
+        let wip = list_column("p", Column::in_progress()).unwrap();
         assert_eq!(wip.len(), 1);
         assert_eq!(wip[0].task.id, "b");
         assert_eq!(wip[0].task.priority, 0);
@@ -2909,19 +2904,19 @@ mod tests {
         let home = fresh_home();
         std::env::set_var("SHELBI_HOME", &home);
 
-        let mut task = make_task("t", Column::InProgress, 0);
+        let mut task = make_task("t", Column::in_progress(), 0);
         task.assigned_to = Some("worker-1".to_string());
         save_task("p", &task, "").unwrap();
 
         let moved = release_task_to_todo("p", "t").unwrap();
-        assert_eq!(moved, Some((Column::InProgress, Column::Todo, "default".into())));
+        assert_eq!(moved, Some((Column::in_progress(), Column::todo(), "default".into())));
 
         // Single resulting state: in Todo AND unowned. No window where one
         // mutation landed without the other.
         let after = load_task("p", "t").unwrap().task;
-        assert_eq!(after.column, Column::Todo);
+        assert_eq!(after.column, Column::todo());
         assert_eq!(after.assigned_to, None);
-        assert!(list_column("p", Column::InProgress).unwrap().is_empty());
+        assert!(list_column("p", Column::in_progress()).unwrap().is_empty());
 
         std::env::remove_var("SHELBI_HOME");
     }
@@ -2935,7 +2930,7 @@ mod tests {
         // A card already in Todo but still owned (the exact wedge the old
         // unassign-then-move split could leave behind): clear the owner with
         // no move event, and report `None` since the column didn't change.
-        let mut task = make_task("t", Column::Todo, 0);
+        let mut task = make_task("t", Column::todo(), 0);
         task.assigned_to = Some("worker-1".to_string());
         save_task("p", &task, "").unwrap();
 
@@ -2957,17 +2952,17 @@ mod tests {
         // A review-gate agent bounces its task from Review back to InProgress:
         // the card must land in the active column AND lose its owner so the
         // just-closed gate workspace isn't seen as still holding active work.
-        let mut task = make_task("t", Column::Review, 0);
+        let mut task = make_task("t", Column::review(), 0);
         task.assigned_to = Some("review-1".to_string());
         save_task("p", &task, "").unwrap();
 
-        let moved = move_task_and_unassign("p", "t", Column::InProgress).unwrap();
-        assert_eq!(moved, Some((Column::Review, Column::InProgress, "default".into())));
+        let moved = move_task_and_unassign("p", "t", Column::in_progress()).unwrap();
+        assert_eq!(moved, Some((Column::review(), Column::in_progress(), "default".into())));
 
         let after = load_task("p", "t").unwrap().task;
-        assert_eq!(after.column, Column::InProgress);
+        assert_eq!(after.column, Column::in_progress());
         assert_eq!(after.assigned_to, None);
-        assert!(list_column("p", Column::Review).unwrap().is_empty());
+        assert!(list_column("p", Column::review()).unwrap().is_empty());
 
         std::env::remove_var("SHELBI_HOME");
     }
@@ -2980,15 +2975,15 @@ mod tests {
 
         // Already in the target column but still owned: clear the owner with no
         // move event, reporting `None` since the column didn't change.
-        let mut task = make_task("t", Column::InProgress, 0);
+        let mut task = make_task("t", Column::in_progress(), 0);
         task.assigned_to = Some("review-1".to_string());
         save_task("p", &task, "").unwrap();
 
-        assert_eq!(move_task_and_unassign("p", "t", Column::InProgress).unwrap(), None);
+        assert_eq!(move_task_and_unassign("p", "t", Column::in_progress()).unwrap(), None);
         assert_eq!(load_task("p", "t").unwrap().task.assigned_to, None);
 
         // Fully clean (already there + unowned) → genuine no-op.
-        assert_eq!(move_task_and_unassign("p", "t", Column::InProgress).unwrap(), None);
+        assert_eq!(move_task_and_unassign("p", "t", Column::in_progress()).unwrap(), None);
 
         std::env::remove_var("SHELBI_HOME");
     }
@@ -3001,7 +2996,7 @@ mod tests {
 
         // A real task (so the tasks dir exists) plus a sentinel one level up
         // in the project dir — exactly what `../HANDOFF` would resolve onto.
-        save_task("p", &make_task("keep", Column::Todo, 0), "").unwrap();
+        save_task("p", &make_task("keep", Column::todo(), 0), "").unwrap();
         let sentinel = project_dir("p").unwrap().join("HANDOFF.md");
         std::fs::write(&sentinel, "precious").unwrap();
 
@@ -3015,7 +3010,7 @@ mod tests {
             assert!(load_task("p", bad).is_err(), "load_task should reject `{bad}`");
             assert!(delete_task("p", bad).is_err(), "delete_task should reject `{bad}`");
             assert!(
-                move_task("p", bad, Column::InProgress).is_err(),
+                move_task("p", bad, Column::in_progress()).is_err(),
                 "move_task should reject `{bad}`"
             );
         }
@@ -3050,7 +3045,7 @@ mod tests {
 
         // Hand-edit the frontmatter id so it no longer matches the filename
         // (`fix-login.md`) — the F8 fork trigger.
-        save_task("p", &make_task("fix-login", Column::Todo, 0), "").unwrap();
+        save_task("p", &make_task("fix-login", Column::todo(), 0), "").unwrap();
         let path = task_path("p", "fix-login").unwrap();
         let text = std::fs::read_to_string(&path).unwrap();
         let forged = text.replace("id: fix-login", "id: fix-auth");
@@ -3064,7 +3059,7 @@ mod tests {
             Err(shelbi_core::Error::TaskIdMismatch { .. })
         ));
         assert!(
-            move_task("p", "fix-login", Column::InProgress).is_err(),
+            move_task("p", "fix-login", Column::in_progress()).is_err(),
             "move must not fork the card"
         );
 
@@ -3084,11 +3079,11 @@ mod tests {
         let home = fresh_home();
         std::env::set_var("SHELBI_HOME", &home);
         for (i, id) in ["a", "b", "c", "d"].iter().enumerate() {
-            save_task("p", &make_task(id, Column::Backlog, i as u32), "").unwrap();
+            save_task("p", &make_task(id, Column::backlog(), i as u32), "").unwrap();
         }
         // Move 'd' to slot 1 → expected order: a, d, b, c
         set_task_priority("p", "d", 1).unwrap();
-        let col = list_column("p", Column::Backlog).unwrap();
+        let col = list_column("p", Column::backlog()).unwrap();
         let ids: Vec<_> = col.iter().map(|tf| tf.task.id.as_str()).collect();
         assert_eq!(ids, vec!["a", "d", "b", "c"]);
         std::env::remove_var("SHELBI_HOME");
@@ -3099,14 +3094,14 @@ mod tests {
         let _g = TEST_LOCK.lock().unwrap();
         let home = fresh_home();
         std::env::set_var("SHELBI_HOME", &home);
-        save_task("p", &make_task("t", Column::Todo, 0), "# body\n").unwrap();
+        save_task("p", &make_task("t", Column::todo(), 0), "# body\n").unwrap();
 
         set_task_branch("p", "t", "shelbi/t").unwrap();
         let back = load_task("p", "t").unwrap();
         assert_eq!(back.task.branch.as_deref(), Some("shelbi/t"));
         // Body and other fields survive the targeted write.
         assert_eq!(back.body, "# body\n");
-        assert_eq!(back.task.column, Column::Todo);
+        assert_eq!(back.task.column, Column::todo());
         std::env::remove_var("SHELBI_HOME");
     }
 
@@ -3115,7 +3110,7 @@ mod tests {
         let _g = TEST_LOCK.lock().unwrap();
         let home = fresh_home();
         std::env::set_var("SHELBI_HOME", &home);
-        let mut task = make_task("t", Column::Todo, 0);
+        let mut task = make_task("t", Column::todo(), 0);
         task.branch = Some("shelbi/t".into());
         save_task("p", &task, "").unwrap();
 
@@ -3142,10 +3137,10 @@ mod tests {
         let _g = TEST_LOCK.lock().unwrap();
         let home = fresh_home();
         std::env::set_var("SHELBI_HOME", &home);
-        save_task("p", &make_task("t", Column::Todo, 0), "").unwrap();
+        save_task("p", &make_task("t", Column::todo(), 0), "").unwrap();
 
         // Concurrent writer flips the column.
-        move_task("p", "t", Column::InProgress).unwrap();
+        move_task("p", "t", Column::in_progress()).unwrap();
 
         // Targeted set-branch (as if from a caller holding a pre-move read).
         set_task_branch("p", "t", "shelbi/t").unwrap();
@@ -3154,7 +3149,7 @@ mod tests {
         assert_eq!(back.task.branch.as_deref(), Some("shelbi/t"));
         assert_eq!(
             back.task.column,
-            Column::InProgress,
+            Column::in_progress(),
             "the concurrent column change must survive the set-branch"
         );
         std::env::remove_var("SHELBI_HOME");
@@ -3242,9 +3237,9 @@ mod tests {
         let _g = TEST_LOCK.lock().unwrap();
         let home = fresh_home();
         std::env::set_var("SHELBI_HOME", &home);
-        save_task("p", &make_task("a", Column::Todo, 0), "").unwrap();
+        save_task("p", &make_task("a", Column::todo(), 0), "").unwrap();
         let existing = list_tasks("p").unwrap();
-        let candidate = make_task_with_deps("b", Column::Todo, 1, &["a", "ghost"]);
+        let candidate = make_task_with_deps("b", Column::todo(), 1, &["a", "ghost"]);
         let err = validate_depends_on(&candidate, &existing).unwrap_err();
         assert!(matches!(err, shelbi_core::Error::UnknownDepends(_)));
         assert!(err.to_string().contains("ghost"));
@@ -3256,10 +3251,10 @@ mod tests {
         let _g = TEST_LOCK.lock().unwrap();
         let home = fresh_home();
         std::env::set_var("SHELBI_HOME", &home);
-        save_task("p", &make_task("a", Column::Done, 0), "").unwrap();
-        save_task("p", &make_task_with_deps("b", Column::Todo, 0, &["a"]), "").unwrap();
+        save_task("p", &make_task("a", Column::done(), 0), "").unwrap();
+        save_task("p", &make_task_with_deps("b", Column::todo(), 0, &["a"]), "").unwrap();
         let existing = list_tasks("p").unwrap();
-        let candidate = make_task_with_deps("c", Column::Todo, 1, &["b"]);
+        let candidate = make_task_with_deps("c", Column::todo(), 1, &["b"]);
         validate_depends_on(&candidate, &existing).unwrap();
         std::env::remove_var("SHELBI_HOME");
     }
@@ -3273,7 +3268,7 @@ mod tests {
         // A clean task and a hand-edited one carrying a numeric extra
         // (`retries: 2`). save_task creates the tasks dir; we then write the
         // suspect file's frontmatter directly, the way a human edit would.
-        save_task("p", &make_task("clean", Column::Todo, 0), "").unwrap();
+        save_task("p", &make_task("clean", Column::todo(), 0), "").unwrap();
         let dir = tasks_dir("p").unwrap();
         let now = "2026-06-19T00:00:00Z";
         let suspect = format!(
@@ -3309,9 +3304,9 @@ mod tests {
         let _g = TEST_LOCK.lock().unwrap();
         let home = fresh_home();
         std::env::set_var("SHELBI_HOME", &home);
-        save_task("p", &make_task("a", Column::Todo, 0), "").unwrap();
+        save_task("p", &make_task("a", Column::todo(), 0), "").unwrap();
         let existing = list_tasks("p").unwrap();
-        let candidate = make_task_with_deps("a", Column::Todo, 0, &["a"]);
+        let candidate = make_task_with_deps("a", Column::todo(), 0, &["a"]);
         let err = validate_depends_on(&candidate, &existing).unwrap_err();
         assert!(matches!(err, shelbi_core::Error::DependencyCycle(_)));
         std::env::remove_var("SHELBI_HOME");
@@ -3324,11 +3319,11 @@ mod tests {
         std::env::set_var("SHELBI_HOME", &home);
         // Existing chain: c → b → a (c depends on b, b depends on a).
         // Closing the loop with a → c should be rejected.
-        save_task("p", &make_task("a", Column::Todo, 0), "").unwrap();
-        save_task("p", &make_task_with_deps("b", Column::Todo, 1, &["a"]), "").unwrap();
-        save_task("p", &make_task_with_deps("c", Column::Todo, 2, &["b"]), "").unwrap();
+        save_task("p", &make_task("a", Column::todo(), 0), "").unwrap();
+        save_task("p", &make_task_with_deps("b", Column::todo(), 1, &["a"]), "").unwrap();
+        save_task("p", &make_task_with_deps("c", Column::todo(), 2, &["b"]), "").unwrap();
         let existing = list_tasks("p").unwrap();
-        let candidate = make_task_with_deps("a", Column::Todo, 0, &["c"]);
+        let candidate = make_task_with_deps("a", Column::todo(), 0, &["c"]);
         let err = validate_depends_on(&candidate, &existing).unwrap_err();
         match err {
             shelbi_core::Error::DependencyCycle(chain) => {
@@ -3347,21 +3342,21 @@ mod tests {
         let _g = TEST_LOCK.lock().unwrap();
         let home = fresh_home();
         std::env::set_var("SHELBI_HOME", &home);
-        save_task("p", &make_task("done-a", Column::Done, 0), "").unwrap();
-        save_task("p", &make_task("inprog-b", Column::InProgress, 0), "").unwrap();
+        save_task("p", &make_task("done-a", Column::done(), 0), "").unwrap();
+        save_task("p", &make_task("inprog-b", Column::in_progress(), 0), "").unwrap();
         save_task(
             "p",
-            &make_task_with_deps("free", Column::Todo, 0, &["done-a"]),
+            &make_task_with_deps("free", Column::todo(), 0, &["done-a"]),
             "",
         )
         .unwrap();
         save_task(
             "p",
-            &make_task_with_deps("blocked", Column::Todo, 1, &["inprog-b"]),
+            &make_task_with_deps("blocked", Column::todo(), 1, &["inprog-b"]),
             "",
         )
         .unwrap();
-        save_task("p", &make_task("no-deps", Column::Todo, 2), "").unwrap();
+        save_task("p", &make_task("no-deps", Column::todo(), 2), "").unwrap();
         let ready = list_ready("p").unwrap();
         let ids: Vec<_> = ready.iter().map(|tf| tf.task.id.as_str()).collect();
         assert_eq!(ids, vec!["free", "no-deps"]);
@@ -3773,10 +3768,10 @@ mod tests {
         let _g = TEST_LOCK.lock().unwrap();
         let home = fresh_home();
         std::env::set_var("SHELBI_HOME", &home);
-        save_task("p", &make_task("z", Column::Done, 0), "").unwrap();
-        save_task("p", &make_task("a", Column::Backlog, 1), "").unwrap();
-        save_task("p", &make_task("b", Column::Backlog, 0), "").unwrap();
-        save_task("p", &make_task("c", Column::InProgress, 0), "").unwrap();
+        save_task("p", &make_task("z", Column::done(), 0), "").unwrap();
+        save_task("p", &make_task("a", Column::backlog(), 1), "").unwrap();
+        save_task("p", &make_task("b", Column::backlog(), 0), "").unwrap();
+        save_task("p", &make_task("c", Column::in_progress(), 0), "").unwrap();
         let all = list_tasks("p").unwrap();
         let ids: Vec<_> = all.iter().map(|tf| tf.task.id.as_str()).collect();
         // Column::ALL ordering: backlog, todo, in_progress, review, done
@@ -3916,7 +3911,7 @@ mod tests {
         );
 
         // User fixes the file (a full valid frontmatter via save_task).
-        save_task("p", &make_task("fixme", Column::Todo, 0), "body\n").unwrap();
+        save_task("p", &make_task("fixme", Column::todo(), 0), "body\n").unwrap();
         let _ = list_tasks("p").unwrap();
         assert!(
             cached_parse_warn(&path).is_none(),
@@ -4266,24 +4261,24 @@ mod tests {
         let _g = TEST_LOCK.lock().unwrap();
         let home = fresh_home();
         std::env::set_var("SHELBI_HOME", &home);
-        save_task("p", &make_task("a", Column::Todo, 0), "").unwrap();
-        save_task("p", &make_task("b", Column::Todo, 1), "").unwrap();
+        save_task("p", &make_task("a", Column::todo(), 0), "").unwrap();
+        save_task("p", &make_task("b", Column::todo(), 1), "").unwrap();
 
         let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
         let b1 = barrier.clone();
         let t1 = std::thread::spawn(move || {
             b1.wait();
-            move_task("p", "a", Column::InProgress).unwrap();
+            move_task("p", "a", Column::in_progress()).unwrap();
         });
         let b2 = barrier.clone();
         let t2 = std::thread::spawn(move || {
             b2.wait();
-            move_task("p", "b", Column::InProgress).unwrap();
+            move_task("p", "b", Column::in_progress()).unwrap();
         });
         t1.join().unwrap();
         t2.join().unwrap();
 
-        let col = list_column("p", Column::InProgress).unwrap();
+        let col = list_column("p", Column::in_progress()).unwrap();
         let mut prios: Vec<_> = col.iter().map(|tf| tf.task.priority).collect();
         prios.sort_unstable();
         assert_eq!(prios, vec![0, 1], "destination priorities must be contiguous 0..N");
@@ -4298,13 +4293,13 @@ mod tests {
         let _g = TEST_LOCK.lock().unwrap();
         let home = fresh_home();
         std::env::set_var("SHELBI_HOME", &home);
-        save_task("p", &make_task("a", Column::InProgress, 0), "").unwrap();
-        save_task("p", &make_task("b", Column::InProgress, 0), "").unwrap(); // duplicate
-        save_task("p", &make_task("c", Column::Todo, 0), "").unwrap();
+        save_task("p", &make_task("a", Column::in_progress(), 0), "").unwrap();
+        save_task("p", &make_task("b", Column::in_progress(), 0), "").unwrap(); // duplicate
+        save_task("p", &make_task("c", Column::todo(), 0), "").unwrap();
 
-        move_task("p", "c", Column::InProgress).unwrap();
+        move_task("p", "c", Column::in_progress()).unwrap();
 
-        let col = list_column("p", Column::InProgress).unwrap();
+        let col = list_column("p", Column::in_progress()).unwrap();
         let prios: Vec<_> = col.iter().map(|tf| tf.task.priority).collect();
         assert_eq!(prios, vec![0, 1, 2], "destination must be renumbered contiguous");
         std::env::remove_var("SHELBI_HOME");
@@ -4320,9 +4315,9 @@ mod tests {
         std::env::set_var("SHELBI_HOME", &home);
         // Created in reverse-alphabetical order so read_dir order (often
         // creation order) disagrees with the id tiebreak.
-        save_task("p", &make_task("zeta", Column::Todo, 0), "").unwrap();
-        save_task("p", &make_task("alpha", Column::Todo, 0), "").unwrap();
-        let col = list_column("p", Column::Todo).unwrap();
+        save_task("p", &make_task("zeta", Column::todo(), 0), "").unwrap();
+        save_task("p", &make_task("alpha", Column::todo(), 0), "").unwrap();
+        let col = list_column("p", Column::todo()).unwrap();
         let ids: Vec<_> = col.iter().map(|tf| tf.task.id.as_str()).collect();
         assert_eq!(ids, vec!["alpha", "zeta"]);
         std::env::remove_var("SHELBI_HOME");
@@ -4333,8 +4328,8 @@ mod tests {
         let _g = TEST_LOCK.lock().unwrap();
         let home = fresh_home();
         std::env::set_var("SHELBI_HOME", &home);
-        create_task("p", &make_task("dup", Column::Todo, 0), "original\n").unwrap();
-        let err = create_task("p", &make_task("dup", Column::Todo, 1), "clobber\n").unwrap_err();
+        create_task("p", &make_task("dup", Column::todo(), 0), "original\n").unwrap();
+        let err = create_task("p", &make_task("dup", Column::todo(), 1), "clobber\n").unwrap_err();
         assert!(err.to_string().contains("already exists"), "got: {err}");
         // Original body untouched.
         assert!(load_task("p", "dup").unwrap().body.contains("original"));

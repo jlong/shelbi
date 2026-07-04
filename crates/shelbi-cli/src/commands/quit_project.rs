@@ -112,7 +112,7 @@ pub fn list_active_workspaces(project_name: &str) -> Vec<ActiveWorkspace> {
         Err(_) => return Vec::new(),
     };
     let in_progress =
-        shelbi_state::list_column(project_name, Column::InProgress).unwrap_or_default();
+        shelbi_state::list_column(project_name, Column::in_progress()).unwrap_or_default();
 
     let mut out = Vec::new();
     for workspace in &project.workspaces {

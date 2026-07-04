@@ -346,7 +346,7 @@ mod tests {
         Task {
             id: id.into(),
             title: id.into(),
-            column: shelbi_core::Column::Review,
+            column: shelbi_core::Column::review(),
             priority: 0,
             assigned_to: None,
             workflow: None,

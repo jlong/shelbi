@@ -324,7 +324,7 @@ where
             // blow up here; fall through to the next candidate.
             continue;
         };
-        if parent.column == Column::Done {
+        if parent.column == Column::done() {
             // Parent's branch may already be gone (its Done-side
             // `delete_branch` action ran). Restack handles rewriting
             // the child's base when the parent merges, so by the time
@@ -455,7 +455,7 @@ fn restack_children(
     };
     for tf in tasks {
         let child = tf.task;
-        if child.column == Column::Done {
+        if child.column == Column::done() {
             continue;
         }
         if !child.depends_on.iter().any(|id| id == &parent_task.id) {
@@ -1251,7 +1251,7 @@ mod tests {
         Task {
             id: id.into(),
             title: id.into(),
-            column: Column::InProgress,
+            column: Column::in_progress(),
             priority: 0,
             assigned_to: None,
             workflow: None,
@@ -1637,7 +1637,7 @@ mod tests {
         // user signal. It must beat both the parent chain and the project
         // default — that's how a workflow declares an intermediate hop.
         let child = child("ch", &["par"]);
-        let parents = lookup(vec![parent("par", Column::InProgress, Some("shelbi/par"))]);
+        let parents = lookup(vec![parent("par", Column::in_progress(), Some("shelbi/par"))]);
         let target = resolve_pr_target_from("main", &child, Some("develop"), parents);
         assert_eq!(target, "develop");
     }
@@ -1650,7 +1650,7 @@ mod tests {
         let ch = child("ch", &["par"]);
         let parents = lookup(vec![parent(
             "par",
-            Column::InProgress,
+            Column::in_progress(),
             Some("shelbi/par"),
         )]);
         let target = resolve_pr_target_from("main", &ch, None, parents);
@@ -1664,7 +1664,7 @@ mod tests {
         // a fresh `open_pr` after that point must aim at the project base
         // — not a dangling ref.
         let ch = child("ch", &["par"]);
-        let parents = lookup(vec![parent("par", Column::Done, Some("shelbi/par"))]);
+        let parents = lookup(vec![parent("par", Column::done(), Some("shelbi/par"))]);
         let target = resolve_pr_target_from("main", &ch, None, parents);
         assert_eq!(target, "main");
     }
@@ -1675,7 +1675,7 @@ mod tests {
         // Todo) won't have a `branch:` field. The chain shouldn't synth a
         // branch out of the id; it should keep walking.
         let ch = child("ch", &["par"]);
-        let parents = lookup(vec![parent("par", Column::Backlog, None)]);
+        let parents = lookup(vec![parent("par", Column::backlog(), None)]);
         let target = resolve_pr_target_from("main", &ch, None, parents);
         assert_eq!(target, "main");
     }
@@ -1688,8 +1688,8 @@ mod tests {
         // also has a branch.
         let ch = child("ch", &["par1", "par2"]);
         let parents = lookup(vec![
-            parent("par1", Column::InProgress, Some("shelbi/par1")),
-            parent("par2", Column::InProgress, Some("shelbi/par2")),
+            parent("par1", Column::in_progress(), Some("shelbi/par1")),
+            parent("par2", Column::in_progress(), Some("shelbi/par2")),
         ]);
         let target = resolve_pr_target_from("main", &ch, None, parents);
         assert_eq!(target, "shelbi/par1");
@@ -1702,8 +1702,8 @@ mod tests {
         // par2 rather than fall straight through to project base.
         let ch = child("ch", &["par1", "par2"]);
         let parents = lookup(vec![
-            parent("par1", Column::Done, Some("shelbi/par1")),
-            parent("par2", Column::InProgress, Some("shelbi/par2")),
+            parent("par1", Column::done(), Some("shelbi/par1")),
+            parent("par2", Column::in_progress(), Some("shelbi/par2")),
         ]);
         let target = resolve_pr_target_from("main", &ch, None, parents);
         assert_eq!(target, "shelbi/par2");
@@ -2671,7 +2671,7 @@ mod tests {
         let mut done_child = bare_task("done-ch");
         done_child.branch = Some("done-ch-branch".into());
         done_child.depends_on = vec!["par".into()];
-        done_child.column = Column::Done;
+        done_child.column = Column::done();
         write_task_file("fixture", &done_child);
 
         // Unrelated InProgress task with no dep on `par` — must NOT be

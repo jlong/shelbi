@@ -293,7 +293,7 @@ fn category_counts(project: &str) -> Result<CategoryCounts> {
 /// assignment.
 fn workspace_idle_busy(project: &str) -> Result<(usize, usize)> {
     let p = shelbi_state::load_project(project).map_err(|e| anyhow!(e))?;
-    let in_progress = shelbi_state::list_column(project, Column::InProgress)
+    let in_progress = shelbi_state::list_column(project, Column::in_progress())
         .map_err(|e| anyhow!(e))?;
     let mut idle = 0usize;
     let mut busy = 0usize;
@@ -484,14 +484,14 @@ mod tests {
         std::env::set_var("SHELBI_HOME", &home);
 
         for (col, id) in [
-            (Column::Backlog, "b1"),
-            (Column::Backlog, "b2"),
-            (Column::Todo, "t1"),
-            (Column::InProgress, "i1"),
-            (Column::Review, "r1"),
-            (Column::Done, "d1"),
-            (Column::Done, "d2"),
-            (Column::Done, "d3"),
+            (Column::backlog(), "b1"),
+            (Column::backlog(), "b2"),
+            (Column::todo(), "t1"),
+            (Column::in_progress(), "i1"),
+            (Column::review(), "r1"),
+            (Column::done(), "d1"),
+            (Column::done(), "d2"),
+            (Column::done(), "d3"),
         ] {
             shelbi_state::save_task("p", &make_task(id, col), "").unwrap();
         }

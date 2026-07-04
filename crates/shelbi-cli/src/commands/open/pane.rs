@@ -383,7 +383,7 @@ fn signal_name(sig: i32) -> String {
 /// permissions glitch, transient FS) because a missing `TASK_ID` makes
 /// the hooks no-op but doesn't break the pane.
 fn current_task_for_workspace(project: &str, workspace: &str) -> Option<String> {
-    let in_progress = shelbi_state::list_column(project, Column::InProgress).ok()?;
+    let in_progress = shelbi_state::list_column(project, Column::in_progress()).ok()?;
     in_progress.into_iter().find_map(|tf| {
         if tf.task.assigned_to.as_deref() == Some(workspace) {
             Some(tf.task.id)
@@ -904,11 +904,11 @@ mod tests {
 
         // Task in InProgress assigned to alpha → that's what the
         // wrapper should pick up.
-        let mut task = make_task("feat-x", shelbi_core::Column::InProgress);
+        let mut task = make_task("feat-x", shelbi_core::Column::in_progress());
         task.assigned_to = Some("alpha".into());
         shelbi_state::save_task("demo", &task, "").unwrap();
         // Decoy: a Todo task assigned to alpha must NOT be returned.
-        let mut decoy = make_task("backlog-y", shelbi_core::Column::Todo);
+        let mut decoy = make_task("backlog-y", shelbi_core::Column::todo());
         decoy.assigned_to = Some("alpha".into());
         shelbi_state::save_task("demo", &decoy, "").unwrap();
 
@@ -1064,7 +1064,7 @@ mod tests {
 
         // Seed an in-progress task assigned to the workspace so the
         // wrapper's task lookup returns a non-empty TASK_ID.
-        let mut task = make_task("feat-env", shelbi_core::Column::InProgress);
+        let mut task = make_task("feat-env", shelbi_core::Column::in_progress());
         task.assigned_to = Some("alpha".into());
         shelbi_state::save_task("demo", &task, "").unwrap();
 
@@ -1123,7 +1123,7 @@ mod tests {
         let home = fresh_test_home("pane-tail-cleanup");
         std::env::set_var("SHELBI_HOME", &home);
 
-        let mut task = make_task("feat-tail", shelbi_core::Column::InProgress);
+        let mut task = make_task("feat-tail", shelbi_core::Column::in_progress());
         task.assigned_to = Some("alpha".into());
         shelbi_state::save_task("demo", &task, "").unwrap();
 

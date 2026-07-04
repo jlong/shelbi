@@ -549,7 +549,7 @@ impl ActivityApp {
     /// compute "took Xm" for the review handoff at `idx`.
     fn started_at(&self, idx: usize, task_id: &str) -> Option<DateTime<Utc>> {
         self.events[..idx].iter().rev().find_map(|e| match e {
-            Event::Task { id, to, ts, .. } if id == task_id && *to == Column::InProgress => {
+            Event::Task { id, to, ts, .. } if id == task_id && *to == Column::in_progress() => {
                 Some(*ts)
             }
             _ => None,
@@ -939,7 +939,7 @@ fn build_lines(app: &mut ActivityApp, width: usize, now: DateTime<Utc>) -> Vec<L
         // that joins to its prior `* -> in_progress` partner. Compute
         // it now while we still have `idx` in scope.
         let started_at = if let Event::Task { id, to, .. } = &ev {
-            if *to == Column::Review {
+            if *to == Column::review() {
                 app.started_at(idx, id)
             } else {
                 None
@@ -1243,8 +1243,8 @@ fn render_event(
             app,
             *ts,
             id,
-            *from,
-            *to,
+            from.clone(),
+            to.clone(),
             reason,
             agent.as_deref(),
             raw,
@@ -1355,8 +1355,11 @@ fn render_task_event(
         return render_zen_event(zr, &title, from, to, width, when);
     }
 
-    match (from, to) {
-        (Column::Backlog, Column::Todo) => {
+    // Match on the canonical status ids rather than enum variants so the
+    // renderer stays a fixed-vocabulary special-case for the stock flow;
+    // any other transition falls through to the generic "moved" arm.
+    match (from.as_str(), to.as_str()) {
+        ("backlog", "todo") => {
             // Board-level promote — no agent attribution, neutral marker.
             let mut row = Row::new(Marker::System, "promoted", title, when);
             row.glyph = GLYPH_PROMOTED;
@@ -1364,7 +1367,7 @@ fn render_task_event(
             row.secondary = Some(SecondaryLine::Detail("backlog → todo".to_string()));
             paint_row(row, width)
         }
-        (Column::Todo, Column::InProgress) => {
+        ("todo", "in-progress") => {
             let (name, color) = agent_display(workspace.as_deref());
             let mut row = Row::new(Marker::Agent(color), "started", title, when);
             row.identity = agent_identity(&name, color, agent);
@@ -1373,7 +1376,7 @@ fn render_task_event(
             row.secondary = branch.map(SecondaryLine::Branch);
             paint_row(row, width)
         }
-        (Column::InProgress, Column::Review) => {
+        ("in-progress", "review") => {
             let (name, color) = agent_display(workspace.as_deref());
             // Keep the started→review pairing: prefix "took Xm · " onto the
             // right-aligned time when we found the matching start event.
@@ -1387,7 +1390,7 @@ fn render_task_event(
             row.secondary = branch.map(SecondaryLine::Branch);
             paint_row(row, width)
         }
-        (Column::Review, Column::Done) => {
+        ("review", "done") => {
             // Board-level acceptance — no agent attribution.
             let mut row = Row::new(Marker::System, "accepted", title, when);
             row.glyph = GLYPH_DONE;
@@ -1825,8 +1828,8 @@ mod tests {
             } => {
                 assert_eq!(id, "foo");
                 assert_eq!(workflow, "default");
-                assert_eq!(from, Column::Todo);
-                assert_eq!(to, Column::InProgress);
+                assert_eq!(from, Column::todo());
+                assert_eq!(to, Column::in_progress());
                 assert_eq!(reason, "user:cli:start");
                 assert_eq!(from_category, StatusCategory::Ready);
                 assert_eq!(to_category, StatusCategory::Active);
@@ -1856,8 +1859,8 @@ mod tests {
             } => {
                 assert_eq!(id, "ship-it");
                 assert_eq!(workflow, "feature-task");
-                assert_eq!(from, Column::InProgress);
-                assert_eq!(to, Column::Review);
+                assert_eq!(from, Column::in_progress());
+                assert_eq!(to, Column::review());
                 assert_eq!(reason, "workspace:ready-marker");
                 assert_eq!(from_category, StatusCategory::Active);
                 assert_eq!(to_category, StatusCategory::Handoff);
@@ -2169,12 +2172,12 @@ mod tests {
             ts,
             id: "demo-task".into(),
             workflow: DEFAULT_WORKFLOW_NAME.into(),
-            from: Column::Todo,
-            to: Column::InProgress,
+            from: Column::todo(),
+            to: Column::in_progress(),
             reason: "orchestrator:auto-dispatch_workspace=alpha_agent=developer".into(),
             agent: Some("developer".into()),
-            from_category: Column::Todo.category(),
-            to_category: Column::InProgress.category(),
+            from_category: Column::todo().category(),
+            to_category: Column::in_progress().category(),
             raw: String::new(),
         };
         let lines = render_event(&ev, &mut app, 80, now, None);
@@ -2194,12 +2197,12 @@ mod tests {
             ts,
             id: "demo-task".into(),
             workflow: DEFAULT_WORKFLOW_NAME.into(),
-            from: Column::Todo,
-            to: Column::InProgress,
+            from: Column::todo(),
+            to: Column::in_progress(),
             reason: "user:cli:start".into(),
             agent: None,
-            from_category: Column::Todo.category(),
-            to_category: Column::InProgress.category(),
+            from_category: Column::todo().category(),
+            to_category: Column::in_progress().category(),
             raw: String::new(),
         };
         let lines = render_event(&ev, &mut app, 80, now, None);
@@ -2276,12 +2279,12 @@ mod tests {
             ts,
             id: "demo-task".into(),
             workflow: DEFAULT_WORKFLOW_NAME.into(),
-            from: Column::InProgress,
-            to: Column::Review,
+            from: Column::in_progress(),
+            to: Column::review(),
             reason: "workspace:ready-marker".into(),
             agent: None,
-            from_category: Column::InProgress.category(),
-            to_category: Column::Review.category(),
+            from_category: Column::in_progress().category(),
+            to_category: Column::review().category(),
             raw: String::new(),
         };
         let lines = render_event(&ev, &mut app, 80, now, Some(started));
@@ -2320,12 +2323,12 @@ mod tests {
             ts,
             id: "demo-task".into(),
             workflow: DEFAULT_WORKFLOW_NAME.into(),
+            from_category: from.category(),
+            to_category: to.category(),
             from,
             to,
             reason: reason.into(),
             agent: None,
-            from_category: from.category(),
-            to_category: to.category(),
             raw: String::new(),
         };
         render_event(&ev, &mut app, 80, now, None)
@@ -2335,8 +2338,8 @@ mod tests {
     fn render_zen_promote_uses_neutral_marker_and_no_bg() {
         let lines = render_zen_for_test(
             "orchestrator:zen-promote category=4",
-            Column::Backlog,
-            Column::Todo,
+            Column::backlog(),
+            Column::todo(),
         );
         // Two lines: primary + dim secondary. No 3-row badge avatar.
         assert_eq!(lines.len(), 2, "zen row is a primary + one dim second line");
@@ -2363,8 +2366,8 @@ mod tests {
     fn render_zen_merge_secondary_includes_sha_and_green_checks() {
         let lines = render_zen_for_test(
             "orchestrator:zen-merge sha=abc123",
-            Column::Review,
-            Column::Done,
+            Column::review(),
+            Column::done(),
         );
         let l0 = line_text(&lines[0]);
         assert!(l0.contains("merged"), "primary should say 'merged': {l0:?}");
@@ -2378,8 +2381,8 @@ mod tests {
     fn render_zen_failed_checks_shows_command_and_exit_in_secondary() {
         let lines = render_zen_for_test(
             "zen:failed-checks cmd=\"cargo test\" exit=1",
-            Column::InProgress,
-            Column::Review,
+            Column::in_progress(),
+            Column::review(),
         );
         let l0 = line_text(&lines[0]);
         assert!(l0.contains("bailed on"), "primary missing 'bailed on': {l0:?}");
@@ -2393,8 +2396,8 @@ mod tests {
     fn render_zen_diff_too_large_secondary_is_files_lines() {
         let lines = render_zen_for_test(
             "zen:diff-too-large files=12 lines=2543",
-            Column::InProgress,
-            Column::Review,
+            Column::in_progress(),
+            Column::review(),
         );
         let l1 = line_text(&lines[1]);
         assert!(l1.contains("12 files"), "got {l1:?}");
@@ -2405,8 +2408,8 @@ mod tests {
     fn render_zen_danger_path_humanizes_comma_list() {
         let lines = render_zen_for_test(
             "zen:danger-path paths=src/db.rs,migrations/001.sql",
-            Column::InProgress,
-            Column::Review,
+            Column::in_progress(),
+            Column::review(),
         );
         let l1 = line_text(&lines[1]);
         assert!(l1.contains("touched: src/db.rs, migrations/001.sql"), "got {l1:?}");
@@ -2416,8 +2419,8 @@ mod tests {
     fn render_zen_ci_timeout_secondary_has_duration() {
         let lines = render_zen_for_test(
             "zen:ci-timeout duration=15m",
-            Column::InProgress,
-            Column::Review,
+            Column::in_progress(),
+            Column::review(),
         );
         let l1 = line_text(&lines[1]);
         assert!(l1.contains("ci timeout after 15m"), "got {l1:?}");
@@ -2427,8 +2430,8 @@ mod tests {
     fn render_zen_merge_conflict_secondary_humanizes_files() {
         let lines = render_zen_for_test(
             "zen:merge-conflict files=Cargo.lock,src/main.rs",
-            Column::InProgress,
-            Column::Review,
+            Column::in_progress(),
+            Column::review(),
         );
         let l1 = line_text(&lines[1]);
         assert!(l1.contains("conflict in Cargo.lock, src/main.rs"), "got {l1:?}");
@@ -2439,7 +2442,7 @@ mod tests {
         // Regression — `started`, `finished`, default `Promoted`, etc.
         // must keep `Line.style.bg == None` so the zen tint stays a
         // distinguishing visual signal.
-        let lines = render_zen_for_test("user:cli:start", Column::Todo, Column::InProgress);
+        let lines = render_zen_for_test("user:cli:start", Column::todo(), Column::in_progress());
         for l in &lines {
             assert_eq!(
                 l.style.bg,
@@ -2455,12 +2458,12 @@ mod tests {
             ts: Utc.with_ymd_and_hms(2026, 6, 23, 12, 0, 0).unwrap(),
             id: "demo-task".into(),
             workflow: DEFAULT_WORKFLOW_NAME.into(),
-            from: Column::Todo,
-            to: Column::InProgress,
+            from: Column::todo(),
+            to: Column::in_progress(),
             reason: reason.into(),
             agent: agent_from_reason(reason),
-            from_category: Column::Todo.category(),
-            to_category: Column::InProgress.category(),
+            from_category: Column::todo().category(),
+            to_category: Column::in_progress().category(),
             raw: String::new(),
         }
     }
@@ -2600,12 +2603,12 @@ mod tests {
             ts: Utc.with_ymd_and_hms(2026, 1, 1, 10, 0, 0).unwrap(),
             id: "foo".into(),
             workflow: DEFAULT_WORKFLOW_NAME.into(),
-            from: Column::Todo,
-            to: Column::InProgress,
+            from: Column::todo(),
+            to: Column::in_progress(),
             reason: "user:cli".into(),
             agent: None,
-            from_category: Column::Todo.category(),
-            to_category: Column::InProgress.category(),
+            from_category: Column::todo().category(),
+            to_category: Column::in_progress().category(),
             raw: String::new(),
         });
         // Unrelated task in between — must not affect the lookup.
@@ -2613,24 +2616,24 @@ mod tests {
             ts: Utc.with_ymd_and_hms(2026, 1, 1, 10, 5, 0).unwrap(),
             id: "bar".into(),
             workflow: DEFAULT_WORKFLOW_NAME.into(),
-            from: Column::Todo,
-            to: Column::InProgress,
+            from: Column::todo(),
+            to: Column::in_progress(),
             reason: "user:cli".into(),
             agent: None,
-            from_category: Column::Todo.category(),
-            to_category: Column::InProgress.category(),
+            from_category: Column::todo().category(),
+            to_category: Column::in_progress().category(),
             raw: String::new(),
         });
         app.events.push(Event::Task {
             ts: Utc.with_ymd_and_hms(2026, 1, 1, 10, 18, 0).unwrap(),
             id: "foo".into(),
             workflow: DEFAULT_WORKFLOW_NAME.into(),
-            from: Column::InProgress,
-            to: Column::Review,
+            from: Column::in_progress(),
+            to: Column::review(),
             reason: "workspace:ready-marker".into(),
             agent: None,
-            from_category: Column::InProgress.category(),
-            to_category: Column::Review.category(),
+            from_category: Column::in_progress().category(),
+            to_category: Column::review().category(),
             raw: String::new(),
         });
         let started = app.started_at(2, "foo");

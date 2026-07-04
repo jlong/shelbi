@@ -33,7 +33,7 @@
 //! from the freshly-fetched ref (never a possibly-stale local one). A
 //! depends_on chain across machines is out of scope for this pass.
 
-use shelbi_core::{Column, Error, Host, Project, Result, Task};
+use shelbi_core::{Error, Host, Project, Result, StatusCategory, Task};
 use shelbi_state::TaskFile;
 
 use crate::git::{locate_hub_workdir, run_in_dir};
@@ -79,9 +79,14 @@ pub fn resolve_base_branch(project: &Project, task: &Task, all_tasks: &[TaskFile
         let Some(dep) = all_tasks.iter().find(|tf| tf.task.id == *dep_id) else {
             continue;
         };
-        match dep.task.column {
-            Column::Done => {}
-            Column::InProgress | Column::Review => {
+        // Key off the dep's semantic category, not a fixed column variant,
+        // so a workflow that renames its active/handoff status still hands
+        // us a branch. A terminal `done` dep is satisfied; an `archived`
+        // (e.g. canceled) dep can never complete, so — like a not-yet-done
+        // backlog/ready dep — it blocks (consistent with [`Task::is_blocked`]).
+        match dep.task.column.category() {
+            StatusCategory::Done => {}
+            StatusCategory::Active | StatusCategory::Handoff => {
                 if active_base.is_none() {
                     if let Some(b) = dep.task.branch.as_deref() {
                         let b = b.trim();
@@ -91,7 +96,7 @@ pub fn resolve_base_branch(project: &Project, task: &Task, all_tasks: &[TaskFile
                     }
                 }
             }
-            Column::Backlog | Column::Todo => {
+            StatusCategory::Backlog | StatusCategory::Ready | StatusCategory::Archived => {
                 blocking.push(dep_id.clone());
             }
         }
@@ -313,7 +318,7 @@ mod tests {
 
     #[test]
     fn branch_name_defaults_to_shelbi_slash_id_when_unset() {
-        let t = task_with("fix-login", Column::Todo, None, &[]);
+        let t = task_with("fix-login", Column::todo(), None, &[]);
         assert_eq!(branch_name_for_task(&t), "shelbi/fix-login");
     }
 
@@ -321,7 +326,7 @@ mod tests {
     fn branch_name_honors_existing_value() {
         // Pre-set branch is the "release task" pattern from Plans/workflows.md
         // §12: the user pins a specific ref instead of accepting the default.
-        let t = task_with("release", Column::Todo, Some("release/v1.2"), &[]);
+        let t = task_with("release", Column::todo(), Some("release/v1.2"), &[]);
         assert_eq!(branch_name_for_task(&t), "release/v1.2");
     }
 
@@ -331,7 +336,7 @@ mod tests {
     fn resolve_base_falls_back_to_project_base_when_no_deps() {
         let (_tmp, repo) = fixture_repo();
         let p = project_at(&repo, None);
-        let t = task_with("a", Column::Todo, None, &[]);
+        let t = task_with("a", Column::todo(), None, &[]);
         assert_eq!(resolve_base_branch(&p, &t, &[]).unwrap(), "main");
     }
 
@@ -341,8 +346,8 @@ mod tests {
         // on A. B's base should be `shelbi/a`, not main.
         let (_tmp, repo) = fixture_repo();
         let p = project_at(&repo, None);
-        let dep_a = task_with("a", Column::InProgress, Some("shelbi/a"), &[]);
-        let candidate = task_with("b", Column::Todo, None, &["a"]);
+        let dep_a = task_with("a", Column::in_progress(), Some("shelbi/a"), &[]);
+        let candidate = task_with("b", Column::todo(), None, &["a"]);
         let all = vec![tf_with(dep_a)];
         assert_eq!(resolve_base_branch(&p, &candidate, &all).unwrap(), "shelbi/a");
     }
@@ -353,8 +358,8 @@ mod tests {
         // landed on main yet — stack B on top of it, same as InProgress.
         let (_tmp, repo) = fixture_repo();
         let p = project_at(&repo, None);
-        let dep_a = task_with("a", Column::Review, Some("shelbi/a"), &[]);
-        let candidate = task_with("b", Column::Todo, None, &["a"]);
+        let dep_a = task_with("a", Column::review(), Some("shelbi/a"), &[]);
+        let candidate = task_with("b", Column::todo(), None, &["a"]);
         let all = vec![tf_with(dep_a)];
         assert_eq!(resolve_base_branch(&p, &candidate, &all).unwrap(), "shelbi/a");
     }
@@ -368,8 +373,8 @@ mod tests {
         // on main" and falls back to project base regardless of `branch:`.
         let (_tmp, repo) = fixture_repo();
         let p = project_at(&repo, None);
-        let dep_a = task_with("a", Column::Done, Some("shelbi/a"), &[]);
-        let candidate = task_with("b", Column::Todo, None, &["a"]);
+        let dep_a = task_with("a", Column::done(), Some("shelbi/a"), &[]);
+        let candidate = task_with("b", Column::todo(), None, &["a"]);
         let all = vec![tf_with(dep_a)];
         assert_eq!(resolve_base_branch(&p, &candidate, &all).unwrap(), "main");
     }
@@ -381,9 +386,9 @@ mod tests {
         // stacks correctly.
         let (_tmp, repo) = fixture_repo();
         let p = project_at(&repo, None);
-        let dep_a = task_with("a", Column::Done, Some("shelbi/a"), &[]);
-        let dep_b = task_with("b", Column::InProgress, Some("shelbi/b"), &[]);
-        let candidate = task_with("c", Column::Todo, None, &["a", "b"]);
+        let dep_a = task_with("a", Column::done(), Some("shelbi/a"), &[]);
+        let dep_b = task_with("b", Column::in_progress(), Some("shelbi/b"), &[]);
+        let candidate = task_with("c", Column::todo(), None, &["a", "b"]);
         let all = vec![tf_with(dep_a), tf_with(dep_b)];
         assert_eq!(resolve_base_branch(&p, &candidate, &all).unwrap(), "shelbi/b");
     }
@@ -394,8 +399,8 @@ mod tests {
         // main would strip the depends_on intent, so refuse.
         let (_tmp, repo) = fixture_repo();
         let p = project_at(&repo, None);
-        let dep_a = task_with("a", Column::Backlog, None, &[]);
-        let candidate = task_with("b", Column::Todo, None, &["a"]);
+        let dep_a = task_with("a", Column::backlog(), None, &[]);
+        let candidate = task_with("b", Column::todo(), None, &["a"]);
         let all = vec![tf_with(dep_a)];
         let err = resolve_base_branch(&p, &candidate, &all).unwrap_err();
         let msg = err.to_string();
@@ -410,9 +415,9 @@ mod tests {
         // usable branch, the Todo dep is a hard blocker.
         let (_tmp, repo) = fixture_repo();
         let p = project_at(&repo, None);
-        let dep_a = task_with("todo-dep", Column::Todo, None, &[]);
-        let dep_b = task_with("b", Column::InProgress, Some("shelbi/b"), &[]);
-        let candidate = task_with("c", Column::Todo, None, &["todo-dep", "b"]);
+        let dep_a = task_with("todo-dep", Column::todo(), None, &[]);
+        let dep_b = task_with("b", Column::in_progress(), Some("shelbi/b"), &[]);
+        let candidate = task_with("c", Column::todo(), None, &["todo-dep", "b"]);
         let all = vec![tf_with(dep_a), tf_with(dep_b)];
         let err = resolve_base_branch(&p, &candidate, &all).unwrap_err();
         let msg = err.to_string();
@@ -428,7 +433,7 @@ mod tests {
         // states.
         let (_tmp, repo) = fixture_repo();
         let p = project_at(&repo, None);
-        let candidate = task_with("orphan", Column::Todo, None, &["ghost"]);
+        let candidate = task_with("orphan", Column::todo(), None, &["ghost"]);
         assert_eq!(resolve_base_branch(&p, &candidate, &[]).unwrap(), "main");
     }
 
@@ -439,7 +444,7 @@ mod tests {
         // `default_branch`.
         let (_tmp, repo) = fixture_repo();
         let p = project_at(&repo, Some("develop"));
-        let t = task_with("a", Column::Todo, None, &[]);
+        let t = task_with("a", Column::todo(), None, &[]);
         assert_eq!(resolve_base_branch(&p, &t, &[]).unwrap(), "develop");
     }
 
@@ -450,8 +455,8 @@ mod tests {
         // to project base rather than using whitespace as a ref name.
         let (_tmp, repo) = fixture_repo();
         let p = project_at(&repo, None);
-        let dep_a = task_with("a", Column::InProgress, Some("   "), &[]);
-        let candidate = task_with("b", Column::Todo, None, &["a"]);
+        let dep_a = task_with("a", Column::in_progress(), Some("   "), &[]);
+        let candidate = task_with("b", Column::todo(), None, &["a"]);
         let all = vec![tf_with(dep_a)];
         assert_eq!(resolve_base_branch(&p, &candidate, &all).unwrap(), "main");
     }
@@ -521,7 +526,7 @@ mod tests {
         let (_tmp, repo) = fixture_repo();
         let p = project_at(&repo, None);
 
-        write_task(&home, &p.name, &task_with("solo", Column::Todo, None, &[]), "");
+        write_task(&home, &p.name, &task_with("solo", Column::todo(), None, &[]), "");
 
         let tf = ensure_branch_for_in_progress(&p, "solo").unwrap();
         assert_eq!(tf.task.branch.as_deref(), Some("shelbi/solo"));
@@ -549,13 +554,13 @@ mod tests {
         std::env::set_var("SHELBI_HOME", &home);
         shelbi_state::save_task(
             &p.name,
-            &task_with("a", Column::InProgress, Some("shelbi/a"), &[]),
+            &task_with("a", Column::in_progress(), Some("shelbi/a"), &[]),
             "",
         )
         .unwrap();
         shelbi_state::save_task(
             &p.name,
-            &task_with("b", Column::Todo, None, &["a"]),
+            &task_with("b", Column::todo(), None, &["a"]),
             "",
         )
         .unwrap();
@@ -607,7 +612,7 @@ mod tests {
         std::env::set_var("SHELBI_HOME", &home);
         shelbi_state::save_task(
             &p.name,
-            &task_with("a", Column::Todo, Some("shelbi/a"), &[]),
+            &task_with("a", Column::todo(), Some("shelbi/a"), &[]),
             "",
         )
         .unwrap();
@@ -655,13 +660,13 @@ mod tests {
         std::env::set_var("SHELBI_HOME", &home);
         shelbi_state::save_task(
             &p.name,
-            &task_with("a", Column::InProgress, Some("shelbi/a"), &[]),
+            &task_with("a", Column::in_progress(), Some("shelbi/a"), &[]),
             "",
         )
         .unwrap();
         shelbi_state::save_task(
             &p.name,
-            &task_with("b", Column::Todo, None, &["a"]),
+            &task_with("b", Column::todo(), None, &["a"]),
             "",
         )
         .unwrap();
@@ -692,13 +697,13 @@ mod tests {
         std::env::set_var("SHELBI_HOME", &home);
         shelbi_state::save_task(
             &p.name,
-            &task_with("a", Column::Done, Some("shelbi/a"), &[]),
+            &task_with("a", Column::done(), Some("shelbi/a"), &[]),
             "",
         )
         .unwrap();
         shelbi_state::save_task(
             &p.name,
-            &task_with("b", Column::Todo, None, &["a"]),
+            &task_with("b", Column::todo(), None, &["a"]),
             "",
         )
         .unwrap();
@@ -743,13 +748,13 @@ mod tests {
         std::env::set_var("SHELBI_HOME", &home);
         shelbi_state::save_task(
             &p.name,
-            &task_with("a", Column::Todo, None, &[]),
+            &task_with("a", Column::todo(), None, &[]),
             "",
         )
         .unwrap();
         shelbi_state::save_task(
             &p.name,
-            &task_with("b", Column::Todo, None, &["a"]),
+            &task_with("b", Column::todo(), None, &["a"]),
             "",
         )
         .unwrap();

@@ -419,7 +419,7 @@ fn load_workflow_for_task(project: &str, task: &Task) -> Option<Workflow> {
 }
 
 fn count_in_flight_zen(project: &str, mode: ZenModeState) -> Result<usize> {
-    let tasks = list_column(project, Column::InProgress).map_err(|e| anyhow!(e))?;
+    let tasks = list_column(project, Column::in_progress()).map_err(|e| anyhow!(e))?;
     Ok(tasks.iter().filter(|tf| zen_applies(&tf.task, mode)).count())
 }
 
@@ -627,9 +627,9 @@ mod tests {
 
     #[test]
     fn zen_off_counts_only_explicit_opt_ins() {
-        let opt_in = make_task("a", Column::InProgress, Some(true));
-        let opt_out = make_task("b", Column::InProgress, Some(false));
-        let unset = make_task("c", Column::InProgress, None);
+        let opt_in = make_task("a", Column::in_progress(), Some(true));
+        let opt_out = make_task("b", Column::in_progress(), Some(false));
+        let unset = make_task("c", Column::in_progress(), None);
         assert!(zen_applies(&opt_in, ZenModeState::Off));
         assert!(!zen_applies(&opt_out, ZenModeState::Off));
         assert!(!zen_applies(&unset, ZenModeState::Off));
@@ -637,9 +637,9 @@ mod tests {
 
     #[test]
     fn zen_on_counts_unset_and_opt_ins() {
-        let unset = make_task("a", Column::InProgress, None);
-        let opt_in = make_task("b", Column::InProgress, Some(true));
-        let opt_out = make_task("c", Column::InProgress, Some(false));
+        let unset = make_task("a", Column::in_progress(), None);
+        let opt_in = make_task("b", Column::in_progress(), Some(true));
+        let opt_out = make_task("c", Column::in_progress(), Some(false));
         assert!(zen_applies(&unset, ZenModeState::On));
         assert!(zen_applies(&opt_in, ZenModeState::On));
         assert!(!zen_applies(&opt_out, ZenModeState::On));
@@ -647,8 +647,8 @@ mod tests {
 
     #[test]
     fn zen_paused_matches_on_for_in_flight_counting() {
-        let unset = make_task("a", Column::InProgress, None);
-        let opt_out = make_task("b", Column::InProgress, Some(false));
+        let unset = make_task("a", Column::in_progress(), None);
+        let opt_out = make_task("b", Column::in_progress(), Some(false));
         assert!(zen_applies(&unset, ZenModeState::Paused));
         assert!(!zen_applies(&opt_out, ZenModeState::Paused));
     }
