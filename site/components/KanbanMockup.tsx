@@ -260,6 +260,32 @@ type Segment = {
 function blankRow(width: number): Segment[] {
   return [{ text: " ".repeat(width) }]
 }
+
+/**
+ * Force a row to EXACTLY `width` monospace cells: truncate any segment runs that
+ * overflow and right-pad short rows with spaces. Board rows are already width-
+ * exact by construction, but the Claude-Code panes (Chat / worker) run arbitrary
+ * transcript text through, so every row there is clamped so no line can exceed
+ * the board width and push the pinned pane wider than the frame.
+ */
+function clampRow(segs: Segment[], width: number): Segment[] {
+  const out: Segment[] = []
+  let used = 0
+  for (const seg of segs) {
+    if (used >= width) break
+    const chars = [...seg.text]
+    if (used + chars.length <= width) {
+      out.push(seg)
+      used += chars.length
+    } else {
+      out.push({ ...seg, text: chars.slice(0, width - used).join("") })
+      used = width
+      break
+    }
+  }
+  if (used < width) out.push({ text: " ".repeat(width - used) })
+  return out
+}
 const SIDEBAR_BLANK_ROW: Segment[] = [{ text: " ".repeat(SIDEBAR_W) }]
 
 /**
@@ -937,7 +963,9 @@ function buildClaudeCodeRows(
     conv.length >= convArea
       ? conv.slice(conv.length - convArea)
       : [...Array.from({ length: convArea - conv.length }, () => blankRow(width)), ...conv]
-  return [...visible, ...chrome]
+  // Clamp every row to exactly `width` cells so a long transcript line can't
+  // widen the pane past the board — the frame width stays constant across beats.
+  return [...visible, ...chrome].map((row) => clampRow(row, width))
 }
 
 // ── Sidebar ───────────────────────────────────────────────────────────
@@ -1304,7 +1332,20 @@ function TerminalBody({ state }: { state: AppState }) {
   return (
     <pre
       className="m-0 whitespace-pre font-mono"
-      style={PRE_STYLE}
+      // Pin the pane to exactly `width` cells (`ch` == the monospace advance) so
+      // the frame width is identical across every view. `minWidth: max-content`
+      // would otherwise size the pane to its widest *rendered* line, and the Chat
+      // and worker panes contain glyphs the mono font lacks (the `𖠰` footer badge,
+      // `⏺`/`❯`/`✽` tool bullets) that fall back to a wider face — making those
+      // panes render wider than the pure-ASCII board. Clipping any such overflow
+      // (`overflow: hidden`) only ever trims trailing padding, never content.
+      style={{
+        ...PRE_STYLE,
+        width: `${width}ch`,
+        minWidth: `${width}ch`,
+        maxWidth: `${width}ch`,
+        overflow: "hidden",
+      }}
     >
       {rows.map((row, i) => (
         <Row key={i} segs={row} />
@@ -1330,6 +1371,15 @@ function Sidebar({
         // a mid-gray in the TUI gray family gives a distinct-but-tasteful
         // divider against the dark terminal body.
         borderColor: TUI_DIVIDER,
+        // Pin the sidebar to its fixed cell width so the frame width never
+        // shifts between beats: the working badge (`⏵`) and nav emoji fall back
+        // to wider glyphs than the mono cell, so `max-content` would let a beat
+        // with working workspaces render a hair wider than an all-idle one.
+        // Clipping only trims trailing padding, never a label.
+        width: `${SIDEBAR_W}ch`,
+        minWidth: `${SIDEBAR_W}ch`,
+        maxWidth: `${SIDEBAR_W}ch`,
+        overflow: "hidden",
       }}
     >
       {rows.map((row, i) =>
