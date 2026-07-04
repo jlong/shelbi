@@ -3,8 +3,8 @@
 //! Renders the same append-only event stream `shelbi events tail`
 //! consumes, but reformatted as a date-bucketed reverse-chronological
 //! feed: who started what, who finished what, who's idle, who's waiting.
-//! Per-agent avatars sit to the left of every row attributed to a
-//! workspace so the eye can group runs without re-reading names.
+//! Identity is conveyed by color — a `●` dot and the agent name in the
+//! workspace's tint — so the eye can group runs without re-reading names.
 //!
 //! Hosted in the project's hidden stash session (`shelbi __activity
 //! <project>`) and swapped into the dashboard's right pane by
@@ -18,8 +18,8 @@
 //!
 //! - `~/.shelbi/events.log` — the source of truth (append-only,
 //!   rfc3339-timestamped one-line records).
-//! - `~/.shelbi/projects/<p>/tasks/<id>.md` — task title + priority +
-//!   branch for the row's secondary line. Cached by id, invalidated
+//! - `~/.shelbi/projects/<p>/tasks/<id>.md` — task title + branch for
+//!   the row's title and dim second line. Cached by id, invalidated
 //!   when the file's mtime changes.
 //! - The events list itself — walked backwards to pair a
 //!   `in_progress -> review` event with its prior `* -> in_progress`
@@ -45,42 +45,36 @@ use shelbi_state::{events_log_path, WorkspaceState, ZenModeState};
 
 use crate::keymap::format_chord_or_unbound;
 
-/// Avatar size in character cells. Each cell covers two vertical
-/// pixels with the half-block glyphs (`▀▄█`), so the effective canvas
-/// is 4×6 pixels — small enough that 20+ rows still fit on a typical
-/// terminal, large enough that each face stays recognizable.
-const AVATAR_W: usize = 4;
-const AVATAR_H: usize = 3;
-
-/// Gap (in cells) between the avatar column and the row's primary
-/// text. Keeping it as a single constant means every event-type
-/// renderer lines up against the same left margin.
-const AVATAR_GAP: usize = 2;
-
-/// Phonetic-letter creature avatars. One per phonetic-alphabet workspace
-/// name (alpha…foxtrot). Selected by name lookup in [`avatar_for`];
-/// unknown names fall back to a single-line ` · ` placeholder.
-const ALPHA_AVATAR: [&str; AVATAR_H] = ["▄▀▀▄", "█▄▄█", " ▀▀ "];
-const BRAVO_AVATAR: [&str; AVATAR_H] = ["▄██▄", "█▄▄█", "▀  ▀"];
-const CHARLIE_AVATAR: [&str; AVATAR_H] = ["▄▀▀▄", "▌▄▄▐", "▀  ▀"];
-const DELTA_AVATAR: [&str; AVATAR_H] = ["▄▄▄▄", "▌▄▄▐", "▐  ▌"];
-const ECHO_AVATAR: [&str; AVATAR_H] = ["▄▀▀▄", "█  █", "▀▀▀▀"];
-const FOXTROT_AVATAR: [&str; AVATAR_H] = ["▄  ▄", "█▀▀█", "▐▄▄▌"];
-
-/// Pick the (rows, tint-color) avatar for a workspace name. Mapping is
-/// hard-coded to the six declared phonetic-letter workspaces — every
-/// other name falls back to `None` and the default fg color, so a
-/// project that names workspaces `frontend` / `backend` still renders,
-/// just without a unique face.
-fn avatar_for(name: &str) -> (Option<[&'static str; AVATAR_H]>, Color) {
+/// Per-agent tint color. Identity in the feed is carried by color — a
+/// leading `●` dot plus the agent name, both painted in the workspace's
+/// tint — not by a picture. The mapping is hard-coded to the six declared
+/// phonetic-letter workspaces; every other name falls back to
+/// [`Color::Gray`], so a project that names workspaces `frontend` /
+/// `backend` still renders, just without a unique tint.
+fn agent_color(name: &str) -> Color {
     match name {
-        "alpha" => (Some(ALPHA_AVATAR), Color::Cyan),
-        "bravo" => (Some(BRAVO_AVATAR), Color::Magenta),
-        "charlie" => (Some(CHARLIE_AVATAR), Color::Green),
-        "delta" => (Some(DELTA_AVATAR), Color::Yellow),
-        "echo" => (Some(ECHO_AVATAR), Color::Blue),
-        "foxtrot" => (Some(FOXTROT_AVATAR), Color::LightRed),
-        _ => (None, Color::Gray),
+        "alpha" => Color::Cyan,
+        "bravo" => Color::Magenta,
+        "charlie" => Color::Green,
+        "delta" => Color::Yellow,
+        "echo" => Color::Blue,
+        "foxtrot" => Color::LightRed,
+        _ => Color::Gray,
+    }
+}
+
+/// Per-category tint for the status glyph (`▶`/`✓`/`✔`/…). Mirrors the
+/// canonical 5-status palette the kanban board uses so a "started" glyph
+/// reads the same active-yellow here as the In Progress column does
+/// there — one color language across both views.
+fn category_color(category: StatusCategory) -> Color {
+    match category {
+        StatusCategory::Backlog => Color::Gray,
+        StatusCategory::Ready => Color::Blue,
+        StatusCategory::Active => Color::Yellow,
+        StatusCategory::Handoff => Color::Magenta,
+        StatusCategory::Done => Color::Green,
+        StatusCategory::Archived => Color::DarkGray,
     }
 }
 
@@ -169,7 +163,6 @@ impl Event {
 #[derive(Debug, Clone)]
 struct TaskMeta {
     title: String,
-    priority: u32,
     branch: Option<String>,
     assigned_to: Option<String>,
     mtime: Option<SystemTime>,
@@ -537,7 +530,6 @@ impl ActivityApp {
                         id.to_string(),
                         TaskMeta {
                             title: tf.task.title,
-                            priority: tf.task.priority,
                             branch: tf.task.branch,
                             assigned_to: tf.task.assigned_to,
                             mtime,
@@ -975,32 +967,46 @@ fn date_header(label: &str, width: usize) -> Line<'static> {
     ))
 }
 
-/// What sits in the avatar column. Three shapes — a full 3-row
-/// creature face for workspace-attributed task transitions, a single
-/// glyph (★ / ◆ / ✓) for task-only events, or nothing (raw fallback).
-enum AvatarSlot {
-    Face {
-        rows: [&'static str; AVATAR_H],
-        color: Color,
-    },
-    Glyph {
-        ch: &'static str,
-        color: Color,
-    },
-    None,
+/// The leading identity marker for a feed row. Agent-attributed rows get
+/// a tinted `●` dot; machine-driven rows (zen, dry-run, workspace-state
+/// noise, board-level promotes) get a neutral `◆` with no agent tint, so
+/// the two streams stay visibly separate.
+#[derive(Clone, Copy)]
+enum Marker {
+    /// `●` painted in the agent's tint.
+    Agent(Color),
+    /// Neutral `◆` — no agent identity.
+    System,
 }
 
-/// Background tint for zen-event rows. Indexed-256 #236 is a dark gray
-/// that sits a hair above the default terminal bg on most palettes —
-/// just enough contrast for the eye to pick out machine-driven rows
-/// from the surrounding user-action stream without being loud.
-const ZEN_BG: Color = Color::Indexed(236);
-const ZEN_FG: Color = Color::Green;
+impl Marker {
+    fn glyph(self) -> &'static str {
+        match self {
+            Marker::Agent(_) => MARK_AGENT,
+            Marker::System => MARK_SYSTEM,
+        }
+    }
 
-/// Avatar art for the zen badge: a 4×3 block-edge frame with "ZEN"
-/// lettering on the middle row. Sits in the same column as the
-/// per-workspace creature avatars so layout stays aligned.
-const ZEN_BADGE: [&str; AVATAR_H] = ["▄▄▄▄", " ZEN", "▀▀▀▀"];
+    fn color(self) -> Color {
+        match self {
+            Marker::Agent(c) => c,
+            Marker::System => Color::Gray,
+        }
+    }
+}
+
+/// The dim second line under a row. `Branch` gets the `⎇ ` icon and holds
+/// a git branch name; `Detail` is any other muted context fragment
+/// (`backlog → todo`, a zen bail reason, …). Both truncate with `…` and
+/// render in [`Color::DarkGray`].
+enum SecondaryLine {
+    Branch(String),
+    Detail(String),
+}
+
+/// Foreground for the Zen filter pill. Kept from the old zen styling —
+/// the badge/background tint is gone, but green still reads "zen".
+const ZEN_FG: Color = Color::Green;
 
 /// One parsed `reason=` string from a zen-driven task event. The
 /// orchestrator emits these as `key=value` pairs trailing a
@@ -1139,34 +1145,81 @@ fn parse_kv(s: &str) -> HashMap<String, String> {
     out
 }
 
-impl AvatarSlot {
-    /// Resolve a workspace name into either a creature face (when the
-    /// name is one of the six phonetic-letter workspaces) or `Glyph`
-    /// stand-in keyed by the fallback symbol.
-    fn for_workspace(workspace: Option<&str>, fallback_glyph: &'static str, default_color: Color) -> Self {
-        match workspace {
-            Some(w) => match avatar_for(w) {
-                (Some(rows), color) => AvatarSlot::Face { rows, color },
-                (None, _) => AvatarSlot::Glyph {
-                    ch: fallback_glyph,
-                    color: default_color,
-                },
-            },
-            None => AvatarSlot::Glyph {
-                ch: fallback_glyph,
-                color: default_color,
-            },
+/// One fully-specified feed row, ready for [`paint_row`] to lay out.
+/// The title truncates to fit, the time right-aligns, and the optional
+/// secondary prints as a dim indented second line — no background fill.
+struct Row {
+    marker: Marker,
+    /// Identity spans between the marker and the status glyph — the agent
+    /// name (tinted, bold) plus an optional dim `·role·` tag, or a neutral
+    /// system label. Padded to [`IDENT_W`] so verbs line up across rows.
+    identity: Vec<Span<'static>>,
+    /// Category-tinted status glyph conveying the verb (`▶`/`✓`/`✔`/…).
+    /// The empty string omits it.
+    glyph: &'static str,
+    glyph_color: Color,
+    /// Dim verb word (started / finished / promoted / …).
+    verb: String,
+    /// The task title — bright fg, truncated with `…`.
+    title: String,
+    /// Style for the title. Defaults to bright white; special-case rows
+    /// (raw fallbacks) dim it.
+    title_style: Style,
+    /// Optional spans appended straight after the title (e.g. a zen bail
+    /// tag `— checks failed`). Counted against the title's width budget.
+    trail: Vec<Span<'static>>,
+    /// Right-aligned relative time; finish rows prefix `took Xm · `.
+    time: String,
+    /// Optional dim second line.
+    secondary: Option<SecondaryLine>,
+}
+
+impl Row {
+    /// A row with the common defaults filled in — bright title, no glyph,
+    /// no trail, no secondary. Callers set the fields they care about.
+    fn new(marker: Marker, verb: impl Into<String>, title: impl Into<String>, time: String) -> Self {
+        Row {
+            marker,
+            identity: Vec::new(),
+            glyph: "",
+            glyph_color: Color::DarkGray,
+            verb: verb.into(),
+            title: title.into(),
+            title_style: Style::default().fg(Color::White),
+            trail: Vec::new(),
+            time,
+            secondary: None,
         }
     }
 }
 
-/// The primary + secondary text for one event row.
-struct RowText {
-    /// Top line — bold workspace name (if any), verb, italic title.
-    /// Pre-spanned so workspaces and verbs can carry different styles.
-    primary: Vec<Span<'static>>,
-    /// Optional muted detail line under the primary.
-    secondary: Option<String>,
+/// Identity spans for an agent-attributed row: the workspace name in its
+/// tint (bold) plus an optional dim `·role·` tag.
+fn agent_identity(name: &str, color: Color, role: Option<&str>) -> Vec<Span<'static>> {
+    let mut out = vec![Span::styled(
+        name.to_string(),
+        Style::default().fg(color).add_modifier(Modifier::BOLD),
+    )];
+    if let Some(role) = role {
+        out.push(Span::raw(" "));
+        out.push(Span::styled(
+            format!("·{role}·"),
+            Style::default().fg(Color::DarkGray),
+        ));
+    }
+    out
+}
+
+/// Identity spans for a machine-driven row: a neutral (untinted) label,
+/// or nothing at all when the event carries no natural label.
+fn system_identity(label: &str) -> Vec<Span<'static>> {
+    if label.is_empty() {
+        return Vec::new();
+    }
+    vec![Span::styled(
+        label.to_string(),
+        Style::default().fg(Color::Gray),
+    )]
 }
 
 fn render_event(
@@ -1216,14 +1269,9 @@ fn render_event(
         Event::Heartbeat { .. } => Vec::new(),
         Event::Unknown { ts, raw } => {
             let when = ts.map(|t| relative_time(t, now)).unwrap_or_default();
-            let row = RowText {
-                primary: vec![Span::styled(
-                    format!("? {raw}"),
-                    Style::default().fg(Color::DarkGray),
-                )],
-                secondary: None,
-            };
-            paint_row(AvatarSlot::None, row, width, when, None)
+            let mut row = Row::new(Marker::System, "", raw.to_string(), when);
+            row.title_style = Style::default().fg(Color::DarkGray);
+            paint_row(row, width)
         }
     }
 }
@@ -1247,33 +1295,25 @@ fn render_zen_dryrun_event(
         .map(|m| m.title.clone())
         .unwrap_or_else(|| task_id.to_string());
     let when = relative_time(ts, now);
-    let title_quoted = format!("\u{201C}{title}\u{201D}");
-    let row = RowText {
-        primary: vec![
-            Span::styled(
-                "[DRYRUN]".to_string(),
-                Style::default()
-                    .fg(Color::Yellow)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::raw("  "),
-            Span::styled(
-                format!("would {}", humanize_dryrun_action(action)),
-                Style::default()
-                    .fg(Color::Gray)
-                    .add_modifier(Modifier::ITALIC),
-            ),
-            Span::raw("  "),
-            Span::styled(
-                title_quoted,
-                Style::default()
-                    .fg(Color::DarkGray)
-                    .add_modifier(Modifier::ITALIC),
-            ),
-        ],
-        secondary: Some(detail.replace('_', " ")),
-    };
-    paint_row(AvatarSlot::None, row, width, when, None)
+    let mut row = Row::new(
+        Marker::System,
+        format!("would {}", humanize_dryrun_action(action)),
+        title,
+        when,
+    );
+    // Neutral `[DRYRUN]` label + a subdued move glyph so the row reads as
+    // "what Zen would have done", visibly a preview rather than a real move.
+    row.identity = vec![Span::styled(
+        "[DRYRUN]".to_string(),
+        Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+    )];
+    row.glyph = GLYPH_PROMOTED;
+    row.glyph_color = Color::Yellow;
+    let detail = detail.replace('_', " ");
+    if !detail.is_empty() {
+        row.secondary = Some(SecondaryLine::Detail(detail));
+    }
+    paint_row(row, width)
 }
 
 fn humanize_dryrun_action(action: &str) -> String {
@@ -1304,192 +1344,99 @@ fn render_task_event(
         .as_ref()
         .map(|m| m.title.clone())
         .unwrap_or_else(|| id.to_string());
-    let priority = meta.as_ref().map(|m| m.priority);
     let branch = meta.as_ref().and_then(|m| m.branch.clone());
     let workspace = meta.as_ref().and_then(|m| m.assigned_to.clone());
 
     let when = relative_time(ts, now);
-    let title_quoted = format!("\u{201C}{title}\u{201D}");
 
     // Zen-driven events win over the default (from,to) renderer so the
     // user can scan machine-driven rows distinctly.
     if let Some(zr) = parse_zen_reason(reason) {
-        return render_zen_event(zr, &title_quoted, from, to, width, when);
+        return render_zen_event(zr, &title, from, to, width, when);
     }
 
     match (from, to) {
         (Column::Backlog, Column::Todo) => {
-            // Promoted — no agent attribution.
-            let row = RowText {
-                primary: vec![
-                    Span::styled(
-                        "Promoted".to_string(),
-                        Style::default().fg(Color::Gray).add_modifier(Modifier::BOLD),
-                    ),
-                    Span::raw("  "),
-                    Span::styled(
-                        title_quoted,
-                        Style::default()
-                            .fg(Color::White)
-                            .add_modifier(Modifier::ITALIC),
-                    ),
-                ],
-                secondary: Some(join_detail(&["backlog → todo", &fmt_priority(priority)])),
-            };
-            paint_row(
-                AvatarSlot::Glyph {
-                    ch: GLYPH_PROMOTED,
-                    color: Color::Cyan,
-                },
-                row,
-                width,
-                when,
-                None,
-            )
+            // Board-level promote — no agent attribution, neutral marker.
+            let mut row = Row::new(Marker::System, "promoted", title, when);
+            row.glyph = GLYPH_PROMOTED;
+            row.glyph_color = category_color(to.category());
+            row.secondary = Some(SecondaryLine::Detail("backlog → todo".to_string()));
+            paint_row(row, width)
         }
         (Column::Todo, Column::InProgress) => {
-            let (workspace_span, slot) = workspace_attribution(
-                workspace.as_deref(),
-                GLYPH_STARTED,
-                Color::Green,
-            );
-            let mut primary = vec![workspace_span];
-            if let Some(name) = agent {
-                primary.push(Span::raw(" "));
-                primary.push(Span::styled(
-                    format!("[{name}]"),
-                    Style::default().fg(Color::DarkGray),
-                ));
-            }
-            primary.push(Span::raw("  "));
-            primary.push(Span::styled("started".to_string(), Style::default().fg(Color::Gray)));
-            primary.push(Span::raw("  "));
-            primary.push(Span::styled(
-                title_quoted,
-                Style::default()
-                    .fg(Color::White)
-                    .add_modifier(Modifier::ITALIC),
-            ));
-            let row = RowText {
-                primary,
-                secondary: Some(join_detail(&[
-                    &branch
-                        .as_ref()
-                        .map(|b| format!("branch: {b}"))
-                        .unwrap_or_default(),
-                    &fmt_priority(priority),
-                ])),
-            };
-            paint_row(slot, row, width, when, None)
+            let (name, color) = agent_display(workspace.as_deref());
+            let mut row = Row::new(Marker::Agent(color), "started", title, when);
+            row.identity = agent_identity(&name, color, agent);
+            row.glyph = GLYPH_STARTED;
+            row.glyph_color = category_color(to.category());
+            row.secondary = branch.map(SecondaryLine::Branch);
+            paint_row(row, width)
         }
         (Column::InProgress, Column::Review) => {
-            let (workspace_span, slot) = workspace_attribution(
-                workspace.as_deref(),
-                GLYPH_FINISHED,
-                Color::Cyan,
-            );
-            let took = started_at.map(|s| format!("took {}", short_duration(ts - s)));
-            let row = RowText {
-                primary: vec![
-                    workspace_span,
-                    Span::raw("  "),
-                    Span::styled("finished".to_string(), Style::default().fg(Color::Gray)),
-                    Span::raw("  "),
-                    Span::styled(
-                        title_quoted,
-                        Style::default()
-                            .fg(Color::White)
-                            .add_modifier(Modifier::ITALIC),
-                    ),
-                    Span::styled(
-                        " — ready for review".to_string(),
-                        Style::default().fg(Color::Cyan),
-                    ),
-                ],
-                secondary: Some(join_detail(&[
-                    &took.unwrap_or_default(),
-                    &branch
-                        .as_ref()
-                        .map(|b| format!("branch: {b}"))
-                        .unwrap_or_default(),
-                ])),
-            };
-            paint_row(slot, row, width, when, None)
+            let (name, color) = agent_display(workspace.as_deref());
+            // Keep the started→review pairing: prefix "took Xm · " onto the
+            // right-aligned time when we found the matching start event.
+            let took = started_at
+                .map(|s| format!("took {} · ", short_duration(ts - s)))
+                .unwrap_or_default();
+            let mut row = Row::new(Marker::Agent(color), "finished", title, format!("{took}{when}"));
+            row.identity = agent_identity(&name, color, agent);
+            row.glyph = GLYPH_FINISHED;
+            row.glyph_color = category_color(to.category());
+            row.secondary = branch.map(SecondaryLine::Branch);
+            paint_row(row, width)
         }
         (Column::Review, Column::Done) => {
-            let row = RowText {
-                primary: vec![
-                    Span::styled(
-                        title_quoted,
-                        Style::default()
-                            .fg(Color::White)
-                            .add_modifier(Modifier::ITALIC),
-                    ),
-                    Span::styled(" accepted".to_string(), Style::default().fg(Color::Gray)),
-                ],
-                secondary: Some("moved to done".to_string()),
-            };
-            paint_row(
-                AvatarSlot::Glyph {
-                    ch: GLYPH_ACCEPTED,
-                    color: Color::Cyan,
-                },
-                row,
-                width,
-                when,
-                None,
-            )
+            // Board-level acceptance — no agent attribution.
+            let mut row = Row::new(Marker::System, "accepted", title, when);
+            row.glyph = GLYPH_DONE;
+            row.glyph_color = category_color(to.category());
+            row.secondary = Some(SecondaryLine::Detail("moved to done".to_string()));
+            paint_row(row, width)
         }
         _ => {
-            // Unrecognized transition — render raw line so nothing
+            // Unrecognized transition — keep the raw line so nothing
             // silently disappears from the feed.
-            let summary = format!("task {id}: {from} → {to}");
-            let row = RowText {
-                primary: vec![Span::styled(summary, Style::default().fg(Color::Gray))],
-                secondary: Some(raw.to_string()),
-            };
-            paint_row(AvatarSlot::None, row, width, when, None)
+            let mut row = Row::new(Marker::System, "moved", title, when);
+            row.glyph = GLYPH_MOVED;
+            row.glyph_color = category_color(to.category());
+            row.secondary = Some(SecondaryLine::Detail(format!("{from} → {to}: {raw}")));
+            paint_row(row, width)
         }
     }
 }
 
-/// Compose the primary + secondary text for a zen-driven event and
-/// hand it to `paint_row` with the tinted background. Every zen row
-/// follows the same shape — `zen <verb> "<title>"` on the primary line,
-/// a `·`-joined detail string on the secondary, and the ZEN_BADGE
-/// avatar — so the eye recognizes machine-driven rows at a glance.
+/// Compose a zen-driven event row. Every zen row is machine-driven, so it
+/// gets the neutral `◆` marker and an untinted `zen` label — no agent
+/// identity — with a category-colored status glyph, a verb, and a `·`-joined
+/// detail on the dim second line. Bail reasons add a short colored tag right
+/// after the title.
 fn render_zen_event(
     zr: ZenReason,
-    title_quoted: &str,
+    title: &str,
     from: Column,
     to: Column,
     width: usize,
     when: String,
 ) -> Vec<Line<'static>> {
-    let on_zen = |s: Style| s.bg(ZEN_BG);
-    let badge_style = on_zen(
-        Style::default()
-            .fg(ZEN_FG)
-            .add_modifier(Modifier::BOLD),
-    );
-    let verb_style = on_zen(Style::default().fg(Color::Gray));
-    let title_style = on_zen(
-        Style::default()
-            .fg(Color::White)
-            .add_modifier(Modifier::ITALIC),
-    );
+    let bail_tag = |text: &'static str, color: Color| {
+        vec![Span::styled(text.to_string(), Style::default().fg(color))]
+    };
 
-    let zen_span = Span::styled("zen", badge_style);
-
-    let (primary, secondary): (Vec<Span<'static>>, Option<String>) = match &zr {
+    #[allow(clippy::type_complexity)]
+    let (verb, glyph, glyph_color, trail, secondary): (
+        &str,
+        &'static str,
+        Color,
+        Vec<Span<'static>>,
+        Option<String>,
+    ) = match &zr {
         ZenReason::Promote { .. } => (
-            vec![
-                zen_span,
-                Span::raw("  "),
-                Span::styled("promoted", verb_style),
-                Span::raw("  "),
-                Span::styled(title_quoted.to_string(), title_style),
-            ],
+            "promoted",
+            GLYPH_PROMOTED,
+            category_color(to.category()),
+            Vec::new(),
             Some("backlog → todo".to_string()),
         ),
         ZenReason::Merge { sha } => {
@@ -1498,13 +1445,10 @@ fn render_zen_event(
                 .map(|s| format!("merged {s}"))
                 .unwrap_or_else(|| "merged".to_string());
             (
-                vec![
-                    zen_span,
-                    Span::raw("  "),
-                    Span::styled("merged", verb_style),
-                    Span::raw("  "),
-                    Span::styled(title_quoted.to_string(), title_style),
-                ],
+                "merged",
+                GLYPH_DONE,
+                category_color(StatusCategory::Done),
+                Vec::new(),
                 Some(join_detail(&["tests green", "ci green", &merged])),
             )
         }
@@ -1517,19 +1461,11 @@ fn render_zen_event(
             .flatten()
             .collect();
             (
-                vec![
-                    zen_span,
-                    Span::raw("  "),
-                    Span::styled("bailed on", verb_style),
-                    Span::raw("  "),
-                    Span::styled(title_quoted.to_string(), title_style),
-                    Span::styled(" — checks failed", on_zen(Style::default().fg(Color::LightRed))),
-                ],
-                if parts.is_empty() {
-                    None
-                } else {
-                    Some(parts.join(" · "))
-                },
+                "bailed on",
+                GLYPH_MOVED,
+                Color::LightRed,
+                bail_tag(" — checks failed", Color::LightRed),
+                (!parts.is_empty()).then(|| parts.join(" · ")),
             )
         }
         ZenReason::DiffTooLarge { files, lines } => {
@@ -1541,82 +1477,54 @@ fn render_zen_event(
             .flatten()
             .collect();
             (
-                vec![
-                    zen_span,
-                    Span::raw("  "),
-                    Span::styled("bailed on", verb_style),
-                    Span::raw("  "),
-                    Span::styled(title_quoted.to_string(), title_style),
-                    Span::styled(" — diff too large", on_zen(Style::default().fg(Color::Yellow))),
-                ],
-                if parts.is_empty() {
-                    None
-                } else {
-                    Some(parts.join(" · "))
-                },
+                "bailed on",
+                GLYPH_MOVED,
+                Color::Yellow,
+                bail_tag(" — diff too large", Color::Yellow),
+                (!parts.is_empty()).then(|| parts.join(" · ")),
             )
         }
         ZenReason::DangerPath { paths } => (
-            vec![
-                zen_span,
-                Span::raw("  "),
-                Span::styled("bailed on", verb_style),
-                Span::raw("  "),
-                Span::styled(title_quoted.to_string(), title_style),
-                Span::styled(" — danger path", on_zen(Style::default().fg(Color::Yellow))),
-            ],
+            "bailed on",
+            GLYPH_MOVED,
+            Color::Yellow,
+            bail_tag(" — danger path", Color::Yellow),
             paths
                 .as_ref()
                 .map(|p| format!("touched: {}", humanize_list(p))),
         ),
         ZenReason::CiTimeout { duration } => (
-            vec![
-                zen_span,
-                Span::raw("  "),
-                Span::styled("bailed on", verb_style),
-                Span::raw("  "),
-                Span::styled(title_quoted.to_string(), title_style),
-                Span::styled(" — ci timeout", on_zen(Style::default().fg(Color::Yellow))),
-            ],
-            duration
-                .as_ref()
-                .map(|d| format!("ci timeout after {d}")),
+            "bailed on",
+            GLYPH_MOVED,
+            Color::Yellow,
+            bail_tag(" — ci timeout", Color::Yellow),
+            duration.as_ref().map(|d| format!("ci timeout after {d}")),
         ),
         ZenReason::MergeConflict { files } => (
-            vec![
-                zen_span,
-                Span::raw("  "),
-                Span::styled("bailed on", verb_style),
-                Span::raw("  "),
-                Span::styled(title_quoted.to_string(), title_style),
-                Span::styled(" — merge conflict", on_zen(Style::default().fg(Color::Yellow))),
-            ],
+            "bailed on",
+            GLYPH_MOVED,
+            Color::Yellow,
+            bail_tag(" — merge conflict", Color::Yellow),
             files
                 .as_ref()
                 .map(|f| format!("conflict in {}", humanize_list(f))),
         ),
         ZenReason::Other => (
-            vec![
-                zen_span,
-                Span::raw("  "),
-                Span::styled(format!("{from} → {to}"), verb_style),
-                Span::raw("  "),
-                Span::styled(title_quoted.to_string(), title_style),
-            ],
-            None,
+            "moved",
+            GLYPH_MOVED,
+            category_color(to.category()),
+            Vec::new(),
+            Some(format!("{from} → {to}")),
         ),
     };
 
-    paint_row(
-        AvatarSlot::Face {
-            rows: ZEN_BADGE,
-            color: ZEN_FG,
-        },
-        RowText { primary, secondary },
-        width,
-        when,
-        Some(ZEN_BG),
-    )
+    let mut row = Row::new(Marker::System, verb, title.to_string(), when);
+    row.identity = system_identity("zen");
+    row.glyph = glyph;
+    row.glyph_color = glyph_color;
+    row.trail = trail;
+    row.secondary = secondary.map(SecondaryLine::Detail);
+    paint_row(row, width)
 }
 
 /// Comma-list → human-readable list: `"a,b,c"` → `"a, b, c"`. Used for
@@ -1639,196 +1547,184 @@ fn render_workspace_event(
 ) -> Vec<Line<'static>> {
     let when = relative_time(ts, now);
 
-    // Workspace-state events are noisier than task transitions — render
-    // the primary muted so the eye skims past them in aggregate but
-    // can still see them when looking for context.
-    let muted_name = Style::default()
-        .fg(Color::DarkGray)
-        .add_modifier(Modifier::BOLD);
-    let muted = Style::default().fg(Color::DarkGray);
-
-    let (verb, detail) = match new {
-        WorkspaceState::Working => ("is working", None),
-        WorkspaceState::AwaitingInput => ("is waiting for input", None),
+    // Workspace-state pings are noisier than task transitions and aren't a
+    // single agent action, so they read as machine-driven: neutral ◆ marker,
+    // muted (untinted) name label, no title. The eye skims past them in
+    // aggregate but can still pick out which workspace when scanning.
+    let (verb, glyph, glyph_color, detail) = match new {
+        WorkspaceState::Working => ("working", GLYPH_IDLE, Color::DarkGray, None),
+        WorkspaceState::AwaitingInput => ("awaiting input", GLYPH_AWAITING, Color::Blue, None),
         WorkspaceState::Blocked => (
-            "is blocked on a permission prompt",
+            "blocked",
+            GLYPH_AWAITING,
+            Color::Yellow,
             Some("needs human approval"),
         ),
         WorkspaceState::Paused => (
-            "is paused on a usage limit",
+            "paused",
+            GLYPH_AWAITING,
+            Color::DarkGray,
             Some("waiting for the limit to reset"),
         ),
     };
 
-    let row = RowText {
-        primary: vec![
-            Span::styled(name.to_string(), muted_name),
-            Span::raw(" "),
-            Span::styled(verb.to_string(), muted),
-        ],
-        secondary: detail.map(|d| d.to_string()),
-    };
-
-    // Even for muted rows, keep the avatar visible so the eye can
-    // still group "alpha's run" without re-reading the name.
-    let slot = match avatar_for(name) {
-        (Some(rows), color) => AvatarSlot::Face { rows, color },
-        (None, _) => AvatarSlot::Glyph {
-            ch: GLYPH_DOT,
-            color: Color::DarkGray,
-        },
-    };
-    paint_row(slot, row, width, when, None)
-}
-
-/// Build the "<workspace>" Span and matching avatar slot for a task
-/// transition. Falls back to the supplied glyph + color when the
-/// task isn't assigned to anyone (or is assigned to a non-phonetic
-/// name we don't have art for).
-fn workspace_attribution(
-    workspace: Option<&str>,
-    fallback_glyph: &'static str,
-    fallback_color: Color,
-) -> (Span<'static>, AvatarSlot) {
-    let label = workspace.unwrap_or("orchestrator").to_string();
-    let span = Span::styled(
-        label,
+    let mut row = Row::new(Marker::System, verb, String::new(), when);
+    row.identity = vec![Span::styled(
+        name.to_string(),
         Style::default()
-            .fg(Color::White)
+            .fg(Color::DarkGray)
             .add_modifier(Modifier::BOLD),
-    );
-    let slot = AvatarSlot::for_workspace(workspace, fallback_glyph, fallback_color);
-    (span, slot)
+    )];
+    row.glyph = glyph;
+    row.glyph_color = glyph_color;
+    row.secondary = detail.map(|d| SecondaryLine::Detail(d.to_string()));
+    paint_row(row, width)
 }
 
-const GLYPH_PROMOTED: &str = "★";
-const GLYPH_STARTED: &str = "▲";
-const GLYPH_FINISHED: &str = "◆";
-const GLYPH_ACCEPTED: &str = "✓";
-const GLYPH_DOT: &str = "·";
+/// Resolve a task's workspace into a display name + tint. Unassigned
+/// tasks fall back to `orchestrator` in the default gray.
+fn agent_display(workspace: Option<&str>) -> (String, Color) {
+    match workspace {
+        Some(w) => (w.to_string(), agent_color(w)),
+        None => ("orchestrator".to_string(), Color::Gray),
+    }
+}
 
-/// Paint one event into terminal lines, aligning the avatar/glyph
-/// column on the left, the primary text in the middle, and the
-/// relative timestamp right-aligned on the first line.
+const MARK_AGENT: &str = "●";
+const MARK_SYSTEM: &str = "◆";
+const BRANCH_ICON: &str = "⎇ ";
+
+/// Status glyphs, keyed by the verb/category they convey. Colored by the
+/// destination category at the call site so `started` reads active-yellow,
+/// `finished` handoff-magenta, `done` green, and so on.
+const GLYPH_STARTED: &str = "▶";
+const GLYPH_FINISHED: &str = "✓";
+const GLYPH_DONE: &str = "✔";
+const GLYPH_IDLE: &str = "●";
+const GLYPH_AWAITING: &str = "⏸";
+const GLYPH_MOVED: &str = "⟳";
+const GLYPH_PROMOTED: &str = "⇢";
+
+/// Fixed width (cells) of the identity segment (name + `·role·`) so the
+/// status glyph and verb line up across rows regardless of name length.
+const IDENT_W: usize = 18;
+/// Verbs pad to this width so titles line up across rows.
+const VERB_W: usize = 8;
+/// Left indent (cells) of the dim second line.
+const SECONDARY_INDENT: usize = 4;
+/// Dim verb color — visible but subordinate to the bright title.
+const VERB_FG: Color = Color::Gray;
+
+/// Lay one [`Row`] out into terminal lines:
 ///
-/// Output line count varies by slot kind:
-/// - `Face` → 3 rows of avatar art (lines 1-3), primary text on line
-///   1, optional secondary on line 2.
-/// - `Glyph` → 1 row of avatar art (line 1), primary text on line 1,
-///   optional secondary on line 2.
-/// - `None` → no avatar column; primary + optional secondary indented
-///   under the same left margin.
+/// ```text
+/// ● name ·role·   ▶ verb    Title, truncated…            took Xm · 2m ago
+///     ⎇ branch/name
+/// ```
 ///
-/// When `bg` is set, every emitted line is given a base style with
-/// that background and each row is padded to `width` so the tint
-/// reaches the right edge — used by [`render_zen_event`] to mark
-/// machine-driven rows.
-fn paint_row(
-    slot: AvatarSlot,
-    row: RowText,
-    width: usize,
-    when: String,
-    bg: Option<Color>,
-) -> Vec<Line<'static>> {
-    let when_w = display_w(&when);
-    let when_style = Style::default().fg(Color::DarkGray);
-    let indent_w = AVATAR_W + AVATAR_GAP;
-    let mut out: Vec<Line<'static>> = Vec::new();
+/// The marker leads (a tinted `●` for agents, a neutral `◆` for machine
+/// rows); the identity is padded to [`IDENT_W`] and the verb to [`VERB_W`]
+/// so glyphs, verbs, and titles line up across rows. The title truncates
+/// with `…` so the right-aligned time never collides with it, and the
+/// optional secondary prints as a dim indented second line. No row is
+/// painted with a background fill.
+fn paint_row(row: Row, width: usize) -> Vec<Line<'static>> {
+    let dim = Style::default().fg(Color::DarkGray);
+    let mut spans: Vec<Span<'static>> = Vec::new();
 
-    let (avatar_row1, avatar_row2, avatar_row3, color, has_third_row) = match slot {
-        AvatarSlot::Face { rows, color } => (
-            rows[0].to_string(),
-            rows[1].to_string(),
-            rows[2].to_string(),
-            color,
-            true,
-        ),
-        AvatarSlot::Glyph { ch, color } => {
-            // Pad the single glyph to AVATAR_W cells so the primary
-            // text aligns with the face-avatar rows.
-            let padded = pad_to(ch, AVATAR_W);
-            (padded, pad_to("", AVATAR_W), pad_to("", AVATAR_W), color, false)
-        }
-        AvatarSlot::None => (
-            pad_to("", AVATAR_W),
-            pad_to("", AVATAR_W),
-            pad_to("", AVATAR_W),
-            Color::DarkGray,
-            false,
-        ),
+    // Marker: ● in the agent tint, or a neutral ◆, plus a trailing gap.
+    let marker = row.marker.glyph();
+    spans.push(Span::styled(
+        format!("{marker} "),
+        Style::default().fg(row.marker.color()),
+    ));
+    let marker_w = display_w(marker) + 1;
+
+    // Identity segment, padded to a fixed width so verbs align.
+    let id_w: usize = row.identity.iter().map(|s| display_w(&s.content)).sum();
+    spans.extend(row.identity);
+    let id_pad = IDENT_W.saturating_sub(id_w).max(1);
+    spans.push(Span::raw(" ".repeat(id_pad)));
+
+    // Status glyph (optional) + padded verb.
+    let mut glyph_w = 0;
+    if !row.glyph.is_empty() {
+        spans.push(Span::styled(
+            row.glyph.to_string(),
+            Style::default().fg(row.glyph_color),
+        ));
+        spans.push(Span::raw(" "));
+        glyph_w = display_w(row.glyph) + 1;
+    }
+    let verb = pad_to(&row.verb, VERB_W);
+    let verb_w = display_w(&verb);
+    spans.push(Span::styled(verb, Style::default().fg(VERB_FG)));
+    spans.push(Span::raw("  "));
+
+    // The title takes whatever's left; `trail` and the right-aligned time
+    // both count against its budget so nothing overruns `width`.
+    let prefix_w = marker_w + id_w + id_pad + glyph_w + verb_w + 2;
+    let trail_w: usize = row.trail.iter().map(|s| display_w(&s.content)).sum();
+    let time_w = display_w(&row.time);
+    let time_gap = usize::from(time_w > 0);
+    let title_budget = width
+        .saturating_sub(prefix_w + trail_w + time_w + time_gap)
+        .max(1);
+    let title = truncate(&row.title, title_budget);
+    let title_w = display_w(&title);
+    spans.push(Span::styled(title, row.title_style));
+    spans.extend(row.trail);
+
+    // Pad so the time hugs the right edge.
+    let used = prefix_w + title_w + trail_w;
+    let pad = width.saturating_sub(used + time_w);
+    spans.push(Span::raw(" ".repeat(pad)));
+    if time_w > 0 {
+        spans.push(Span::styled(row.time, dim));
+    }
+
+    let mut out = vec![Line::from(spans)];
+    if let Some(sec) = row.secondary {
+        out.push(paint_secondary(sec, width));
+    }
+    out
+}
+
+/// Paint the dim second line under a row. A `Branch` gets the `⎇ ` icon; a
+/// `Detail` is a plain muted fragment. Both indent under the row and
+/// truncate with `…`.
+fn paint_secondary(sec: SecondaryLine, width: usize) -> Line<'static> {
+    let (icon, text) = match sec {
+        SecondaryLine::Branch(b) => (BRANCH_ICON, b),
+        SecondaryLine::Detail(d) => ("", d),
     };
-    let avatar_style = Style::default().fg(color);
+    let budget = width
+        .saturating_sub(SECONDARY_INDENT + display_w(icon))
+        .max(1);
+    let text = truncate(&text, budget);
+    Line::from(vec![
+        Span::raw(" ".repeat(SECONDARY_INDENT)),
+        Span::styled(format!("{icon}{text}"), Style::default().fg(Color::DarkGray)),
+    ])
+}
 
-    // Row 1: avatar + primary + right-aligned timestamp.
-    let primary_w: usize = row.primary.iter().map(|s| display_w(&s.content)).sum();
-    let used = display_w(&avatar_row1) + AVATAR_GAP + primary_w;
-    let pad = width.saturating_sub(used + when_w);
-    let mut line1: Vec<Span<'static>> = vec![
-        Span::styled(avatar_row1, avatar_style),
-        Span::raw(" ".repeat(AVATAR_GAP)),
-    ];
-    line1.extend(row.primary);
-    line1.push(Span::raw(" ".repeat(pad)));
-    line1.push(Span::styled(when, when_style));
-    out.push(Line::from(line1));
-
-    // Row 2: avatar + secondary (if any). For glyph/none slots, the
-    // avatar row is blank so the secondary text indents cleanly. When
-    // a bg tint is set every row pads to full width so the highlight
-    // reaches the right edge.
-    let row2 = match (row.secondary, has_third_row, !avatar_row2.trim().is_empty()) {
-        (Some(detail), _, _) => {
-            let used = display_w(&avatar_row2) + AVATAR_GAP + display_w(&detail);
-            let pad = width.saturating_sub(used);
-            Some(Line::from(vec![
-                Span::styled(avatar_row2, avatar_style),
-                Span::raw(" ".repeat(AVATAR_GAP)),
-                Span::styled(detail, when_style),
-                Span::raw(" ".repeat(pad)),
-            ]))
-        }
-        (None, true, _) => {
-            // No secondary but we still need the second avatar row to
-            // keep the face intact. Pad to width so a tint bg fills
-            // the row end-to-end.
-            let pad = width.saturating_sub(display_w(&avatar_row2));
-            Some(Line::from(vec![
-                Span::styled(avatar_row2, avatar_style),
-                Span::raw(" ".repeat(pad)),
-            ]))
-        }
-        (None, false, false) => None,
-        (None, false, true) => None,
-    };
-    if let Some(l) = row2 {
-        out.push(l);
+/// Truncate `s` to at most `max` display cells, marking any elision with
+/// a trailing `…`.
+fn truncate(s: &str, max: usize) -> String {
+    if display_w(s) <= max {
+        return s.to_string();
     }
-
-    // Row 3: avatar only (faces); skipped for glyph/none.
-    if has_third_row {
-        let pad = width.saturating_sub(display_w(&avatar_row3));
-        out.push(Line::from(vec![
-            Span::styled(avatar_row3, avatar_style),
-            Span::raw(" ".repeat(pad)),
-        ]));
+    if max == 0 {
+        return String::new();
     }
-
-    // Apply the row tint as a line-level base style — span styles
-    // patch on top, so spans without an explicit bg inherit the tint
-    // and we get a clean contiguous highlight across the row.
-    if let Some(bg) = bg {
-        for l in &mut out {
-            l.style = Style::default().bg(bg);
-        }
-    }
-
-    let _ = indent_w;
+    let mut out: String = s.chars().take(max.saturating_sub(1)).collect();
+    out.push('…');
     out
 }
 
 /// Pad `s` on the right with ASCII spaces to a total visible width
-/// of `w` cells. Char-based count is fine here — avatar art and the
-/// glyph fallbacks are all single-cell.
+/// of `w` cells. Char-based count is fine here — the verbs and glyphs
+/// it pads are all single-cell.
 fn pad_to(s: &str, w: usize) -> String {
     let have = display_w(s);
     if have >= w {
@@ -1886,10 +1782,6 @@ fn short_duration(d: chrono::Duration) -> String {
     } else {
         format!("{hours}h{rem:02}m")
     }
-}
-
-fn fmt_priority(p: Option<u32>) -> String {
-    p.map(|v| format!("#{v}")).unwrap_or_default()
 }
 
 /// Join a list of detail fragments with ` · ` separators, skipping
@@ -2157,25 +2049,24 @@ mod tests {
     }
 
     #[test]
-    fn each_phonetic_workspace_has_unique_avatar() {
-        // The recognizability of the feed depends on each workspace
-        // getting a distinct face — regression-test that no two
-        // phonetic names accidentally share avatar art.
+    fn each_phonetic_workspace_has_a_unique_tint() {
+        // Identity is now color, not a face — recognizability depends on
+        // each workspace getting a distinct tint, so regression-test that
+        // no two phonetic names collide on the same color.
         let workspaces = ["alpha", "bravo", "charlie", "delta", "echo", "foxtrot"];
-        let mut seen: Vec<[&str; AVATAR_H]> = Vec::new();
+        let mut seen: Vec<Color> = Vec::new();
         for w in workspaces {
-            let (avatar, _) = avatar_for(w);
-            let av = avatar.unwrap_or_else(|| panic!("{w} must have an avatar"));
-            assert!(!seen.contains(&av), "duplicate avatar for {w}");
-            seen.push(av);
+            let color = agent_color(w);
+            assert!(!seen.contains(&color), "duplicate tint for {w}");
+            seen.push(color);
         }
     }
 
     #[test]
-    fn unknown_workspace_has_no_avatar_but_default_color() {
-        let (avatar, color) = avatar_for("frontend");
-        assert!(avatar.is_none(), "non-phonetic workspace has no avatar");
-        assert_eq!(color, Color::Gray);
+    fn unknown_workspace_falls_back_to_default_tint() {
+        // A non-phonetic name still renders — just in the neutral gray
+        // rather than a unique tint.
+        assert_eq!(agent_color("frontend"), Color::Gray);
     }
 
     #[test]
@@ -2267,11 +2158,10 @@ mod tests {
     }
 
     #[test]
-    fn render_started_row_includes_agent_tag_after_workspace_name() {
-        // Acceptance (b) — dispatch rows surface the agent name as
-        // `[<agent>]` inline next to the workspace, so the user can read
-        // which role is on the workspace without going back to the
-        // workflow YAML.
+    fn render_started_row_includes_role_tag_after_agent_name() {
+        // Acceptance — dispatch rows surface the agent role as a dim
+        // `·<role>·` tag right after the name, so the user can read which
+        // role is on the workspace without going back to the workflow YAML.
         let mut app = ActivityApp::new("demo");
         let ts = Utc.with_ymd_and_hms(2026, 6, 23, 12, 0, 0).unwrap();
         let now = ts + chrono::Duration::minutes(1);
@@ -2289,14 +2179,14 @@ mod tests {
         };
         let lines = render_event(&ev, &mut app, 80, now, None);
         let primary = line_text(&lines[0]);
-        assert!(primary.contains("[developer]"), "missing tag in: {primary:?}");
+        assert!(primary.contains("·developer·"), "missing role tag in: {primary:?}");
         assert!(primary.contains("started"), "missing verb in: {primary:?}");
     }
 
     #[test]
-    fn render_started_row_without_agent_field_skips_tag() {
-        // Acceptance (b) — backward compat: a legacy event line with no
-        // `agent` field renders cleanly, no empty `[]` left behind.
+    fn render_started_row_without_agent_field_skips_role_tag() {
+        // Backward compat: a legacy event line with no `agent` field
+        // renders cleanly, no empty `··` role tag left behind.
         let mut app = ActivityApp::new("demo");
         let ts = Utc.with_ymd_and_hms(2026, 6, 23, 12, 0, 0).unwrap();
         let now = ts + chrono::Duration::minutes(1);
@@ -2314,8 +2204,91 @@ mod tests {
         };
         let lines = render_event(&ev, &mut app, 80, now, None);
         let primary = line_text(&lines[0]);
-        assert!(!primary.contains('['), "stray bracket in: {primary:?}");
+        assert!(!primary.contains('·'), "stray role tag in: {primary:?}");
         assert!(primary.contains("started"), "missing verb in: {primary:?}");
+    }
+
+    #[test]
+    fn agent_row_leads_with_tinted_dot_and_dim_branch_line() {
+        // Acceptance — an agent row is a colored ● dot + name, a dim role
+        // tag, a status glyph, a verb, a bright title with the time
+        // right-aligned, and a dim `⎇ `-led branch second line. No bg fill.
+        let mut row = Row::new(
+            Marker::Agent(Color::Cyan),
+            "started",
+            "Metrics API endpoint",
+            "just now".to_string(),
+        );
+        row.identity = agent_identity("bravo", Color::Cyan, Some("developer"));
+        row.glyph = GLYPH_STARTED;
+        row.glyph_color = category_color(StatusCategory::Active);
+        row.secondary = Some(SecondaryLine::Branch("shelbi/metrics-api-endpoint".to_string()));
+        let lines = paint_row(row, 80);
+
+        assert_eq!(lines.len(), 2, "primary + one dim branch line");
+        let l0 = line_text(&lines[0]);
+        assert!(l0.starts_with(MARK_AGENT), "row must lead with the agent dot: {l0:?}");
+        assert!(l0.contains("bravo"), "missing agent name: {l0:?}");
+        assert!(l0.contains("·developer·"), "missing dim role tag: {l0:?}");
+        assert!(l0.contains(GLYPH_STARTED), "missing status glyph: {l0:?}");
+        assert!(l0.contains("started"), "missing verb: {l0:?}");
+        assert!(l0.contains("Metrics API endpoint"), "missing title: {l0:?}");
+        assert!(l0.ends_with("just now"), "time must be right-aligned: {l0:?}");
+        assert!(lines.iter().all(|l| l.style.bg.is_none()), "no background fill");
+
+        let l1 = line_text(&lines[1]);
+        assert!(
+            l1.contains("⎇ shelbi/metrics-api-endpoint"),
+            "branch second line led by the ⎇ icon: {l1:?}"
+        );
+    }
+
+    #[test]
+    fn narrow_width_truncates_title_and_preserves_right_aligned_time() {
+        let mut row = Row::new(
+            Marker::Agent(Color::Cyan),
+            "finished",
+            "A very long task title that will never fit into a narrow terminal",
+            "took 34m · 2m ago".to_string(),
+        );
+        row.identity = agent_identity("alpha", Color::Cyan, None);
+        row.glyph = GLYPH_FINISHED;
+        let lines = paint_row(row, 60);
+        let l0 = line_text(&lines[0]);
+        assert!(l0.contains('…'), "long title should be truncated with …: {l0:?}");
+        assert!(l0.contains("took 34m · 2m ago"), "time preserved intact: {l0:?}");
+        assert!(
+            display_w(&l0) <= 60,
+            "row must not overrun width: {} > 60 in {l0:?}",
+            display_w(&l0)
+        );
+    }
+
+    #[test]
+    fn finished_row_prefixes_took_onto_the_time() {
+        // Acceptance — the started→review pairing survives: a finish row's
+        // right-aligned time carries a `took Xm · ` prefix.
+        let mut app = ActivityApp::new("demo");
+        let ts = Utc.with_ymd_and_hms(2026, 6, 23, 12, 0, 0).unwrap();
+        let now = ts + chrono::Duration::minutes(2);
+        let started = ts - chrono::Duration::minutes(34);
+        let ev = Event::Task {
+            ts,
+            id: "demo-task".into(),
+            workflow: DEFAULT_WORKFLOW_NAME.into(),
+            from: Column::InProgress,
+            to: Column::Review,
+            reason: "workspace:review-marker".into(),
+            agent: None,
+            from_category: Column::InProgress.category(),
+            to_category: Column::Review.category(),
+            raw: String::new(),
+        };
+        let lines = render_event(&ev, &mut app, 80, now, Some(started));
+        let l0 = line_text(&lines[0]);
+        assert!(l0.contains("finished"), "missing verb: {l0:?}");
+        assert!(l0.contains("took 34m · "), "missing took prefix: {l0:?}");
+        assert!(l0.contains("2m ago"), "relative time kept: {l0:?}");
     }
 
     #[test]
@@ -2359,31 +2332,28 @@ mod tests {
     }
 
     #[test]
-    fn render_zen_promote_renders_badge_and_tint() {
+    fn render_zen_promote_uses_neutral_marker_and_no_bg() {
         let lines = render_zen_for_test(
             "orchestrator:zen-promote category=4",
             Column::Backlog,
             Column::Todo,
         );
-        assert!(
-            lines.len() >= 3,
-            "zen rows always span the 3-row badge avatar"
-        );
-        // Primary line: ZEN badge top edge + 'zen promoted "<title>"'.
+        // Two lines: primary + dim secondary. No 3-row badge avatar.
+        assert_eq!(lines.len(), 2, "zen row is a primary + one dim second line");
+        // Primary: neutral ◆ marker, untinted 'zen' label, 'promoted' verb.
         let l0 = line_text(&lines[0]);
-        assert!(l0.contains("▄▄▄▄"), "top edge of badge missing in {l0:?}");
-        assert!(l0.contains("zen"), "primary missing zen verb in {l0:?}");
+        assert!(l0.contains(MARK_SYSTEM), "primary missing system marker in {l0:?}");
+        assert!(!l0.contains(MARK_AGENT), "zen row must not use the agent dot in {l0:?}");
+        assert!(l0.contains("zen"), "primary missing zen label in {l0:?}");
         assert!(l0.contains("promoted"), "primary missing 'promoted' in {l0:?}");
         // Secondary line carries the "backlog → todo" detail.
         let l1 = line_text(&lines[1]);
-        assert!(l1.contains("ZEN"), "badge middle row missing in {l1:?}");
         assert!(l1.contains("backlog → todo"), "secondary detail in {l1:?}");
-        // Every line carries the zen background tint as its base style.
+        // No row carries a background fill — the reversed-box look is gone.
         for l in &lines {
             assert_eq!(
-                l.style.bg,
-                Some(ZEN_BG),
-                "every zen row must carry the tint base style: {:?}",
+                l.style.bg, None,
+                "no zen row should carry a background fill: {:?}",
                 line_text(l)
             );
         }
