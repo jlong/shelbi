@@ -1048,7 +1048,15 @@ function navRowSegs(glyph: string, label: string, selected: boolean, filled: boo
   return inner
 }
 
-function buildSidebarRows(state: AppState): SidebarRow[] {
+/**
+ * The sidebar split into the scrollable body (project header, nav, workspace
+ * and review sections) and the footer that stays pinned to the bottom of the
+ * sidebar — the `^P palette  q quit` keybind line plus, when Zen Mode is on,
+ * the full-width green band. The `Sidebar` component renders `body` at the top
+ * and `footer` flush against the bottom edge so the footer always sits at the
+ * bottom of the window regardless of how many workspace/review rows precede it.
+ */
+function buildSidebarRows(state: AppState): { body: SidebarRow[]; footer: SidebarRow[] } {
   const rows: SidebarRow[] = []
 
   // Project header — same Cyan Bold `app.project_name` renders at.
@@ -1139,20 +1147,21 @@ function buildSidebarRows(state: AppState): SidebarRow[] {
   // the full-width green "ZEN MODE ON" band the TUI paints while Zen is on.
   // The band bypasses the 1-col horizontal margin so its green fill reaches
   // both sidebar edges, matching the crate. It's opt-in (default off) so it
-  // shows only on the hero and Zen-describing docs, not every mockup.
-  rows.push(SIDEBAR_BLANK_ROW)
-  rows.push(
+  // shows only on the hero and Zen-describing docs, not every mockup. Returned
+  // separately so `Sidebar` can pin it to the bottom edge — the flex gap above
+  // it replaces the leading blank row the inline layout used for spacing.
+  const footer: SidebarRow[] = [
     padSidebarRow([
       { text: " " },
       { text: "^P palette  q quit", color: TUI_DARK_GRAY },
     ]),
-  )
+  ]
   if (state.zenMode) {
-    rows.push(SIDEBAR_BLANK_ROW)
-    rows.push(zenBandRow())
+    footer.push(SIDEBAR_BLANK_ROW)
+    footer.push(zenBandRow())
   }
 
-  return rows
+  return { body: rows, footer }
 }
 
 /**
@@ -1395,10 +1404,21 @@ function Sidebar({
   onSelectView: (view: NavView) => void
   contentOpacity?: number
 }) {
-  const rows = buildSidebarRows(state)
+  const { body, footer } = buildSidebarRows(state)
+  const renderRow = (row: SidebarRow, i: number) =>
+    Array.isArray(row) ? (
+      <Row key={i} segs={row} />
+    ) : (
+      <NavRow key={i} nav={row.nav} selected={row.selected} onSelect={onSelectView} />
+    )
   return (
     <pre
-      className="m-0 hidden whitespace-pre border-r font-mono md:block"
+      // `flex flex-col` so the footer group can be pushed to the bottom edge
+      // (`mt-auto`) — the board pane is taller than the sidebar's content, and
+      // the flex row stretches this `<pre>` to that height, so the footer
+      // otherwise floats right under the last workspace row instead of sitting
+      // at the bottom of the window like the TUI's `render_footer` does.
+      className="m-0 hidden flex-col whitespace-pre border-r font-mono md:flex"
       style={{
         ...PRE_STYLE,
         // CHROME_BAR_BG/BORDER sit too close to TUI_BG to read as a rule;
@@ -1417,13 +1437,10 @@ function Sidebar({
         ...contentFadeStyle(contentOpacity),
       }}
     >
-      {rows.map((row, i) =>
-        Array.isArray(row) ? (
-          <Row key={i} segs={row} />
-        ) : (
-          <NavRow key={i} nav={row.nav} selected={row.selected} onSelect={onSelectView} />
-        ),
-      )}
+      <div>{body.map(renderRow)}</div>
+      {/* Pinned to the bottom of the sidebar; the auto top margin absorbs the
+          slack between the workspace list and the bottom edge. */}
+      <div className="mt-auto">{footer.map(renderRow)}</div>
     </pre>
   )
 }
