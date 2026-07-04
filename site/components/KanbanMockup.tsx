@@ -1091,16 +1091,24 @@ function buildSidebarRows(state: AppState): SidebarRow[] {
       const badgeGlyph = w.state === "working" ? "⏵" : "·"
       const badgeColor = w.state === "working" ? TUI_GREEN : TUI_DARK_GRAY
       const rightLabel = w.agent ?? "idle"
+      // The focused-worker pane selects a workspace (rather than a nav row), so
+      // that workspace reads as the active/selected row in the sidebar — the same
+      // full-row `SIDEBAR_SEL_BG` fill + white-bold treatment the nav selection
+      // uses. Only the currently-focused workspace on the `workspace` view lights
+      // up; every other view leaves the list unselected.
+      const selected = state.activeView === "workspace" && w.name === state.focusedWorkspace
+      const bg = selected ? SIDEBAR_SEL_BG : undefined
       rows.push(
         sidebarRightAlignRow(
           [
-            { text: " " },
-            { text: "  " }, // machine-group indent
-            { text: `${badgeGlyph} `, color: badgeColor },
-            { text: w.name, color: TUI_GRAY },
+            { text: " ", bg },
+            { text: "  ", bg }, // machine-group indent
+            { text: `${badgeGlyph} `, color: badgeColor, bg },
+            { text: w.name, color: selected ? SEL_FG : TUI_GRAY, bg, bold: selected },
           ],
           rightLabel,
-          TUI_DARK_GRAY,
+          selected ? SEL_FG : TUI_DARK_GRAY,
+          bg,
         ),
       )
     }
@@ -1321,25 +1329,32 @@ function TerminalBody({ state, contentOpacity }: { state: AppState; contentOpaci
   const width = contentWidth(state.columns)
   const boardRows = buildBoardRows(state.columns)
   const target = Math.max(boardRows.length, state.minBodyRows ?? 0)
+  // The board and Activity feed carry the `<label> · <project>  N total …` header
+  // bar; the Chat and worker panes drop it so the Claude-Code session starts flush
+  // at the top of the pane, the way the real CLI does. The header is two rows
+  // (title + the blank beneath it), so a headerless pane reclaims those two rows
+  // into its body — keeping every view the same total height (target + 4 chrome
+  // rows) so the frame never resizes as the story swaps panes.
+  const showHeader = state.activeView === "tasks" || state.activeView === "activity"
+  const bodyTarget = target + (showHeader ? 0 : 2)
   // Chat and worker panes are full Claude-Code sessions with a bottom-pinned
-  // input box + footer, so they build to exactly `target` rows themselves
+  // input box + footer, so they build to exactly `bodyTarget` rows themselves
   // (conversation bottom-anchored against the chrome). Board/activity views
-  // render naturally and get padded/clipped to `target` by `padBodyTo`.
+  // render naturally and get padded/clipped to `bodyTarget` by `padBodyTo`.
   const isClaudePane = state.activeView === "chat" || state.activeView === "workspace"
   const raw: Segment[][] = isClaudePane
     ? buildClaudeCodeRows(
         state,
         (state.activeView === "chat" ? state.chatLines : state.workspaceLines) ?? CHAT_LINES,
-        target,
+        bodyTarget,
         width,
       )
     : state.activeView === "activity"
       ? buildActivityRows(state)
       : boardRows
-  const body = padBodyTo(raw, target, width)
+  const body = padBodyTo(raw, bodyTarget, width)
   const rows: Segment[][] = [
-    titleRow(state),
-    blankRow(width),
+    ...(showHeader ? [titleRow(state), blankRow(width)] : []),
     ...body,
     blankRow(width),
     footerRow(state.activeView, width),

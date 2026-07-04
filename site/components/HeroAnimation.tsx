@@ -189,8 +189,10 @@ const PRIOR_EXCHANGE: ChatLine[] = [
   userLine("Let's plan an analytics dashboard for the app."),
   { kind: "blank" },
   { kind: "prose", text: "On it. I'll draft dashboard.md — metrics, charts, filters, export." },
+  { kind: "blank" },
   { kind: "tool", name: "Write", args: "dashboard.md" },
   { kind: "result", text: "48 lines written" },
+  { kind: "blank" },
   {
     kind: "prose",
     text: "Done. dashboard.md covers a metrics API, chart components, a date-range filter, CSV export, empty/loading states, and tests. Want me to break it into tasks?",
