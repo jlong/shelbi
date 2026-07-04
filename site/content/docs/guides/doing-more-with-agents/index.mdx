@@ -1,0 +1,61 @@
+---
+title: Doing More with Agents
+order: 40
+summary: Shelbi ships three agents, but an agent is just a role — a system prompt plus a skill set. Author your own and slot it into a workflow's statuses. This guide builds an Adversarial Review agent, an automated skeptic that tries to break a change before a human sees it, and wires it into a workflow.
+---
+
+Shelbi ships three agents — `orchestrator`, `developer`, and `review` —
+and for most projects that's the whole cast. But none of them is
+privileged machinery. An **[agent](/docs/concepts/agents) is just a
+role**: a system prompt plus an optional skill set. Nothing stops you from
+authoring your own and dropping it onto a workflow status, exactly the way
+the built-ins are wired.
+
+This guide builds one worth having and shows where it goes.
+
+## The worked example: an Adversarial Review agent
+
+The three shipped agents bracket the loop optimistically. The `developer`
+implements a task and marks it review-ready; the `review` agent serves the
+finished branch to a human. Nothing in that path is *trying to prove the
+change is wrong*.
+
+An **Adversarial Review** agent is that missing skeptic. Its job is not to
+approve a change — it's to try to *break* it: find the bug, the injection,
+the unhandled error, the edge case the tests quietly skip. It reads the
+diff on the task's branch, writes up what it finds with severity and
+`file:line` references, and only signs off when "no issues found" has
+actually been earned.
+
+Slotted between "in progress" and human review, it becomes an automated
+adversarial pass that every task walks through before a person spends
+attention on it. The developer's optimism gets a counterweight, and the
+human reviewer arrives to findings already on the table instead of a blank
+diff.
+
+This is the same "a reviewer is a role you can drop on a status" idea the
+[Agents](/docs/concepts/agents) concept describes — a task is the work, a
+[workspace](/docs/concepts/workspaces) is the capacity, and the agent is
+the role that decides *how* the work gets done. Here we author a new role
+and give it a status to own.
+
+## Where to go next
+
+The guide is two parts — author the agent, then wire it in:
+
+1. **[Create the agent →](/docs/guides/doing-more-with-agents/adversarial-review-agent)**
+   — scaffold `adversarial-review` with `shelbi agent new`, understand the
+   `instructions.md` / preamble / skills model, and drop in a concrete,
+   usable skeptic prompt.
+2. **[Add it to a workflow →](/docs/guides/doing-more-with-agents/add-to-workflow)**
+   — declare an `adversarial-review` status, point it at the new agent, and
+   rewire the transitions so a branch flows through the automated review on
+   its way to a human.
+
+## See also
+
+- [Agents](/docs/concepts/agents) — the role/task/workspace model, the
+  three shipped agents, and how a custom one slots in.
+- [Understanding Workflows](/docs/guides/understanding-workflows) — the
+  branching models a workflow can implement, if you want to place this
+  review gate inside a larger shape.

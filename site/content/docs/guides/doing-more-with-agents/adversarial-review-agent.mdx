@@ -1,0 +1,160 @@
+---
+title: Create the Adversarial Review agent
+order: 41
+summary: Scaffold an adversarial-review agent with shelbi agent new, understand the instructions.md / preamble / skills model, and drop in a concrete role prompt that tries to break a change instead of approving it.
+---
+
+An [agent](/docs/concepts/agents) is a directory under your project's
+Shelbi config with, at minimum, an `instructions.md` — its system prompt.
+That's the whole contract. Authoring the Adversarial Review agent means
+scaffolding that directory and writing a prompt that makes the agent a
+genuine skeptic.
+
+## Scaffold the agent
+
+<Steps>
+<Step title="Create the directory">
+
+Scaffold a new agent with the CLI:
+
+```bash
+shelbi agent new adversarial-review
+```
+
+This creates
+`~/.shelbi/projects/<project>/agents/adversarial-review/` with a starter
+`instructions.md` and an empty `skills/`. The starter prompt is a minimal
+role template meant to be replaced — see
+[`shelbi agent new`](/docs/cli/agent#new). The name doubles as the
+identifier you'll reference from a workflow's `agent:` field, so it has to
+be lowercase kebab-case (`a-z`, `0-9`, `-`, `_`).
+
+</Step>
+<Step title="Understand what you're editing">
+
+`instructions.md` **is** the agent's system prompt — there's no wrapper or
+config layer. Two other things share the launch-time prompt with it:
+
+- **`agents/_shared/preamble.md`** is prepended to *every* agent in the
+  project. Your repo layout, house style, and the test command already live
+  there, so the rendered prompt the runner sees is the preamble followed by
+  this agent's `instructions.md`.
+- **`skills/`** is an optional directory of agent-scoped skills the runner
+  loads when this agent is active — reach for it if the reviewer needs a
+  repeatable procedure (say, a security checklist) rather than just a role.
+
+<Callout type="tip" title="Let the preamble carry shared context">
+
+Don't restate the repo structure, coding conventions, or how to run the
+tests in this agent's prompt — `_shared/preamble.md` is prepended to every
+agent for exactly that reason. Keep `instructions.md` focused on the *role*:
+what an adversarial reviewer is for and how it should behave. Duplicated
+context is just one more place to drift out of sync.
+
+</Callout>
+
+</Step>
+<Step title="Write the role prompt">
+
+Open it in your editor:
+
+```bash
+shelbi agent edit adversarial-review
+```
+
+Replace the starter body with a prompt that makes the agent adversarial by
+default. The sample below is tight enough to paste and get a genuinely
+useful skeptic:
+
+```markdown
+# Adversarial Review
+
+You are an adversarial code reviewer. A developer agent has finished a
+task and believes its branch is ready. Your job is **not** to confirm
+that belief — it is to try to prove the change is wrong before a human
+spends attention on it. Assume there is a bug until you have looked hard
+enough to say otherwise.
+
+## What to review
+
+Review the diff on the current task's branch against the base branch —
+only what this task changed, plus the code that change touches. You are
+looking for defects the developer and the tests missed, not for style
+nits the preamble's checks already cover.
+
+## How to review
+
+Work through every changed hunk and actively try to falsify it:
+
+- **Correctness** — Does it do what the task asked? Trace the non-obvious
+  paths by hand. Off-by-one, wrong operator, inverted condition, a branch
+  that silently does nothing.
+- **Security** — Untrusted input reaching a query, a shell, a path, or a
+  template. Missing authz checks. Secrets in logs or errors. Unsafe
+  defaults.
+- **Error handling** — What happens when the call fails, the input is
+  empty, the list is huge, the value is null, two requests race?
+- **Edge cases** — Boundaries, empty and maximal inputs, concurrency,
+  encoding, time zones — whatever this code plausibly meets in production.
+- **Test coverage** — Do the tests actually exercise the new behavior, or
+  do they assert around it? Find a real input the change gets wrong that
+  no test would catch, and treat that as a finding.
+
+## How to report
+
+Write your findings as a structured review on the branch — a markdown
+`## Adversarial Review` section (a review comment on the PR, or a note
+committed with the branch, per this project's convention). For each
+finding:
+
+- **Severity** — `blocker`, `major`, or `minor`.
+- **Location** — `path/to/file.rs:120` (or a range).
+- **The problem** — what breaks, and the concrete input or sequence that
+  triggers it. A finding with a repro beats a vague worry.
+- **Suggested fix** — one line, when the fix is obvious.
+
+Order findings by severity, blockers first.
+
+## Signing off
+
+"No issues found" is a conclusion you have to earn, not a default. Only
+sign off clean when you have walked every changed hunk and have a
+specific reason each is sound. If you sign off, say briefly *why* the
+change holds up — what you checked — so the human reviewer can trust the
+pass. If anything is a `blocker`, say plainly that the change is not ready.
+```
+
+Tune it to your stack — swap the `.rs:120` example for your language, add a
+line about a framework you use, point the write-up at wherever your team
+keeps review notes. The shape is what matters: a reviewer that falsifies
+first and earns its sign-off.
+
+</Step>
+</Steps>
+
+## Confirm it landed
+
+Check the agent is registered:
+
+```bash
+shelbi agent list
+```
+
+`adversarial-review` shows up in the table with no statuses referencing it
+yet — that's the next part. `shelbi agent show adversarial-review` prints
+the `instructions.md` you just wrote (without the shared preamble, which is
+composed in at launch time).
+
+## Next
+
+You have a skeptic on disk with nothing to review. Wire it into a workflow
+so tasks actually flow through it:
+
+**[Add it to a workflow →](/docs/guides/doing-more-with-agents/add-to-workflow)**
+
+## See also
+
+- [Agents](/docs/concepts/agents) — the role/task/workspace model and the
+  on-disk agent layout.
+- [`shelbi agent`](/docs/cli/agent) — the full command set: `list`, `show`,
+  `new`, `edit`.
