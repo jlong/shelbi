@@ -1796,7 +1796,7 @@ fn render_column(
 
     // Columns are project-wide post-`statuses.yaml` — no per-column
     // workflow subscript any more. A single header row is all we need;
-    // per-card workflow names still surface via [`workflow_card_indicator`].
+    // per-card workflow names still surface via [`card_meta_line`].
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([Constraint::Length(1), Constraint::Min(0)])
@@ -1810,13 +1810,18 @@ fn render_column(
     // collide; List doesn't clip Line spans on its own.
     let max_text = area.width.saturating_sub(2) as usize;
     let mut items: Vec<ListItem> = Vec::with_capacity(tasks.len());
+    // Per-card rendered height (2 rows for a single-line title, 3 when the
+    // title wraps). Recorded alongside the items so the hit-test loop below
+    // can walk a running `y` offset instead of assuming a uniform card.
+    let mut card_heights: Vec<u16> = Vec::with_capacity(tasks.len());
     for (row, tf) in tasks.iter().enumerate() {
         let blocked = tf.task.is_blocked(columns);
         // 2-char prefix when blocked so the badge can't visually melt into
         // the title text on narrow columns. Lock glyph stays in the same
-        // slot whether or not other rows show one.
+        // slot whether or not other rows show one. Kept on line 1 only.
         let badge_prefix = if blocked { "🔒 " } else { "" };
-        let title_text = truncate(&format!("{badge_prefix}{}", tf.task.title), max_text);
+        let (line1, line2) =
+            wrap_title_two_lines(&format!("{badge_prefix}{}", tf.task.title), max_text);
         let title_style = if blocked {
             Style::default()
                 .fg(Color::DarkGray)
@@ -1824,40 +1829,21 @@ fn render_column(
         } else {
             Style::default().add_modifier(Modifier::BOLD)
         };
-        let mut lines = vec![Line::from(Span::styled(title_text, title_style))];
-        let id_w = tf.task.id.chars().count();
-        let workspace_w = tf
-            .task
-            .assigned_to
-            .as_deref()
-            .map(|w| 3 + w.chars().count())
-            .unwrap_or(0);
-        let meta_line = if id_w + workspace_w <= max_text {
-            let mut spans = vec![Span::styled(
-                tf.task.id.clone(),
-                Style::default().fg(Color::DarkGray),
-            )];
-            if let Some(w) = &tf.task.assigned_to {
-                spans.push(Span::raw("  "));
-                spans.push(Span::styled(
-                    format!("@{w}"),
-                    Style::default().fg(Color::Magenta),
-                ));
-            }
-            Line::from(spans)
-        } else {
-            Line::from(Span::styled(
-                truncate(&tf.task.id, max_text),
-                Style::default().fg(Color::DarkGray),
-            ))
-        };
-        lines.push(meta_line);
-        lines.push(workflow_card_indicator(
+        let mut lines = vec![Line::from(Span::styled(line1, title_style))];
+        if let Some(line2) = line2 {
+            lines.push(Line::from(Span::styled(line2, title_style)));
+        }
+        // Meta line: workflow badge (bg-filled) + `⎇ branch`. Always emitted
+        // — even when blank — so every card carries a title+meta pair and the
+        // height stays 2 (single-line title) or 3 (wrapped title) rows.
+        lines.push(card_meta_line(
             &tf.task,
             &app.workflows,
             show_card_workflow_label,
             max_text,
         ));
+
+        card_heights.push(lines.len() as u16);
 
         let mut item = ListItem::new(lines);
         if focused && row == app.selected_row {
@@ -1884,21 +1870,21 @@ fn render_column(
     let list = List::new(items);
     f.render_stateful_widget(list, list_area, &mut state);
 
-    // Each card item renders 3 lines (title, meta, workflow indicator —
-    // see [`workflow_card_indicator`], which renders blank when there's
-    // nothing to surface so this constant stays correct). Clip the last
-    // card if it overflows the visible list area so clicks far below it
-    // don't count. Scroll offsets aren't tracked here — a long column that
-    // scrolls past its visible area will mis-attribute clicks for any row
-    // off-screen; tolerable until columns regularly exceed visible height.
-    const ROWS_PER_CARD: u16 = 3;
+    // Cards are now variable height: 2 rows for a single-line title, 3 when
+    // the title wraps to two lines (see `card_heights`, filled as the items
+    // were built). Walk a running `y` offset so each card's `CardHit` rect
+    // matches its actual rendered footprint. Clip the last visible card if
+    // it overflows the list area so clicks far below it don't count. Scroll
+    // offsets aren't tracked here — a long column that scrolls past its
+    // visible area will mis-attribute clicks for any row off-screen;
+    // tolerable until columns regularly exceed visible height.
     let list_bottom = list_area.y.saturating_add(list_area.height);
-    for (row, _) in tasks.iter().enumerate() {
-        let card_top = list_area.y.saturating_add(row as u16 * ROWS_PER_CARD);
+    let mut card_top = list_area.y;
+    for (row, &rows) in card_heights.iter().enumerate() {
         if card_top >= list_bottom {
             break;
         }
-        let card_height = (list_bottom - card_top).min(ROWS_PER_CARD);
+        let card_height = (list_bottom - card_top).min(rows);
         hits.push(CardHit {
             area: Rect {
                 x: list_area.x,
@@ -1909,6 +1895,7 @@ fn render_column(
             col_idx,
             row_idx: row,
         });
+        card_top = card_top.saturating_add(rows);
     }
 }
 
@@ -2259,57 +2246,115 @@ fn truncate(s: &str, max: usize) -> String {
     out
 }
 
-/// Build the third-line workflow indicator shown at the bottom of each
-/// card. Renders the task's workflow name and — when the workflow's
-/// `git.base_branch` template carries a `{{var}}` placeholder that
-/// resolves from this task's params — the resolved branch alongside it.
+/// Wrap `title` to at most two lines within `max` columns, using char
+/// count as the width proxy (matching [`truncate`] and the rest of the
+/// card layout, which don't account for wide glyphs). Line 1 fills the
+/// width, breaking on the last space that fits so a word isn't split when
+/// avoidable; a first token longer than the width hard-wraps at `max`.
+/// Line 2 holds the remainder, truncated with `…` when it overflows.
 ///
-/// `show_workflow_name` mirrors the column-header `show_workflow_label`:
-/// true when the visible board mixes more than one workflow, so naming
-/// each card's workflow disambiguates which lane it belongs to. When
-/// false, the workflow name is suppressed (the column header already
-/// implies it) but a resolved branch is still surfaced because that's
-/// per-task information the column subscript can't carry.
-///
-/// Returns `Line::raw("")` when there's nothing useful to say so the
-/// card retains its canonical 3-row height (preserves [`CardHit`]
-/// geometry and the `ROWS_PER_CARD` constant downstream).
-fn workflow_card_indicator(
-    task: &Task,
-    workflows: &[Workflow],
-    show_workflow_name: bool,
-    max_text: usize,
-) -> Line<'static> {
-    let wf_name = task.workflow_or_default();
-    let resolved_branch = workflows
+/// Returns `(line1, None)` when the title fits on one line, so the caller
+/// can render a 2-row card; `(line1, Some(line2))` when it wraps (3-row
+/// card).
+fn wrap_title_two_lines(title: &str, max: usize) -> (String, Option<String>) {
+    if max == 0 {
+        return (String::new(), None);
+    }
+    let chars: Vec<char> = title.chars().collect();
+    if chars.len() <= max {
+        return (title.to_string(), None);
+    }
+    // Prefer the last space at or before `max` so line 1 ends on a word
+    // boundary; ignore a space at index 0 (would leave line 1 empty) and
+    // hard-wrap at `max` when the first token alone overflows the width.
+    let break_idx = (1..=max).rev().find(|&i| chars[i] == ' ');
+    let (line1_end, remainder_start) = match break_idx {
+        Some(i) => (i, i + 1), // drop the breaking space
+        None => (max, max),    // hard wrap mid-token
+    };
+    let line1: String = chars[..line1_end].iter().collect();
+    let remainder: String = chars[remainder_start..].iter().collect();
+    (line1, Some(truncate(&remainder, max)))
+}
+
+/// Resolve the branch to surface on a card's meta line. Prefers the
+/// task's own `branch` (the working branch, once the orchestrator has cut
+/// it) and otherwise falls back to the workflow's `git.base_branch`
+/// template when it carries a `{{var}}` placeholder that resolves cleanly
+/// from this task's params. A fixed `base_branch: main` (no placeholder)
+/// or a half-substituted template resolves to `None` — neither adds
+/// trustworthy per-task info at the card-glance scale.
+fn card_branch(task: &Task, workflows: &[Workflow]) -> Option<String> {
+    if let Some(branch) = task.branch.as_deref().filter(|b| !b.is_empty()) {
+        return Some(branch.to_string());
+    }
+    workflows
         .iter()
-        .find(|w| w.name == wf_name)
+        .find(|w| w.name == task.workflow_or_default())
         .and_then(|w| w.git.as_ref())
         .and_then(|g| g.base_branch.as_deref())
-        // Only interesting when the template carries a placeholder — a
-        // fixed `base_branch: main` would add no per-task info.
         .filter(|tmpl| tmpl.contains("{{"))
         .and_then(|tmpl| {
             let mut missing = Vec::new();
             let resolved =
                 shelbi_core::substitute_placeholders(tmpl, &task.string_params(), &mut missing);
-            // Hide on unresolved — a half-substituted branch at the
-            // per-card glance scale would mislead more than help.
             missing.is_empty().then_some(resolved)
-        });
+        })
+}
 
-    let text = match (show_workflow_name, resolved_branch) {
-        (false, None) => return Line::raw(""),
-        (true, None) => wf_name.to_string(),
-        (true, Some(branch)) => format!("{wf_name} · {branch}"),
-        (false, Some(branch)) => branch,
-    };
-    Line::from(Span::styled(
-        truncate(&text, max_text),
-        Style::default()
-            .fg(Color::DarkGray)
-            .add_modifier(Modifier::ITALIC),
-    ))
+/// Build the card's meta line: the task's workflow name rendered as a
+/// small background-filled badge, followed on the same line by the branch
+/// prefixed with `⎇ ` (dim, truncated to the remaining width).
+///
+/// `show_workflow_name` mirrors the column-header `show_workflow_label`:
+/// true when the visible board mixes more than one workflow, so naming
+/// each card's workflow disambiguates which lane it belongs to. When
+/// false, the badge is suppressed (the column header already implies it)
+/// and the meta line is just `⎇ branch`. When there's neither a badge nor
+/// a branch to show, returns `Line::raw("")` — the row is still emitted so
+/// the card keeps its title+meta shape, it just renders blank.
+fn card_meta_line(
+    task: &Task,
+    workflows: &[Workflow],
+    show_workflow_name: bool,
+    max_text: usize,
+) -> Line<'static> {
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    let mut used = 0usize;
+
+    if show_workflow_name {
+        // One space of padding either side so the background reads as a
+        // chip rather than butting straight against the glyphs.
+        let badge = truncate(&format!(" {} ", task.workflow_or_default()), max_text);
+        used += badge.chars().count();
+        spans.push(Span::styled(
+            badge,
+            Style::default()
+                .bg(crate::theme::WORKFLOW_BADGE_BG)
+                .fg(crate::theme::WORKFLOW_BADGE_FG),
+        ));
+    }
+
+    if let Some(branch) = card_branch(task, workflows) {
+        // A single space separates the badge from the branch; skip it when
+        // the badge is hidden so the branch sits flush with the gutter.
+        let sep = if spans.is_empty() { 0 } else { 1 };
+        let remaining = max_text.saturating_sub(used + sep);
+        if remaining > 0 {
+            if sep == 1 {
+                spans.push(Span::raw(" "));
+            }
+            spans.push(Span::styled(
+                truncate(&format!("⎇ {branch}"), remaining),
+                Style::default().fg(Color::DarkGray),
+            ));
+        }
+    }
+
+    if spans.is_empty() {
+        return Line::raw("");
+    }
+    Line::from(spans)
 }
 
 // ---------------------------------------------------------------------------
@@ -4076,48 +4121,49 @@ mod tests {
         }
     }
 
-    /// Single-workflow project, default workflow, no git params → the
-    /// card's third line stays blank, matching the legacy layout the
-    /// pre-workflow TUI rendered. Avoids forcing a redundant "default"
-    /// label onto every card in projects that haven't adopted workflows.
+    /// Single-workflow project, default workflow, no branch → the meta
+    /// line stays blank (badge hidden because the header already implies
+    /// the sole workflow, no branch to surface). Avoids forcing a
+    /// redundant "default" badge onto every card in projects that haven't
+    /// adopted workflows.
     #[test]
-    fn workflow_card_indicator_blank_for_default_only() {
+    fn card_meta_line_blank_for_default_only() {
         let task = task_with_params("t", None, &[]);
         let workflows = vec![default_workflow()];
-        let line = workflow_card_indicator(&task, &workflows, false, 40);
+        let line = card_meta_line(&task, &workflows, false, 40);
         assert_eq!(line_text(&line), "");
     }
 
-    /// Multi-workflow board, default-workflow task → name surfaces so
-    /// the user can distinguish "default" cards from cards belonging to
-    /// other workflows on the same screen.
+    /// Multi-workflow board, default-workflow task → the workflow badge
+    /// surfaces (space-padded) so the user can distinguish "default"
+    /// cards from cards belonging to other workflows on the same screen.
     #[test]
-    fn workflow_card_indicator_shows_default_when_multiple_workflows() {
+    fn card_meta_line_shows_default_badge_when_multiple_workflows() {
         let task = task_with_params("t", None, &[]);
         let workflows = vec![default_workflow(), workflow_with_git("feature-task", None)];
-        let line = workflow_card_indicator(&task, &workflows, true, 40);
-        assert_eq!(line_text(&line), "default");
+        let line = card_meta_line(&task, &workflows, true, 40);
+        assert_eq!(line_text(&line), " default ");
     }
 
-    /// Custom workflow with no `git:` block → indicator falls back to
-    /// just the workflow name. Nothing to resolve.
+    /// Custom workflow with no `git:` block and no task branch → just the
+    /// badge. Nothing to resolve.
     #[test]
-    fn workflow_card_indicator_shows_workflow_name_without_git_block() {
+    fn card_meta_line_shows_workflow_badge_without_git_block() {
         let task = task_with_params("t", Some("design-review"), &[]);
         let workflows = vec![
             default_workflow(),
             workflow_with_git("design-review", None),
         ];
-        let line = workflow_card_indicator(&task, &workflows, true, 40);
-        assert_eq!(line_text(&line), "design-review");
+        let line = card_meta_line(&task, &workflows, true, 40);
+        assert_eq!(line_text(&line), " design-review ");
     }
 
     /// Resolved placeholder: `base_branch: feature/{{feature}}` + the
-    /// task carrying `feature: auth-rewrite` renders as
-    /// `feature-task · feature/auth-rewrite`. This is the headline case
-    /// the task description names — workflow + resolved parameter.
+    /// task carrying `feature: auth-rewrite` renders as the badge plus
+    /// `⎇ feature/auth-rewrite`. Headline case — workflow badge +
+    /// resolved branch on one line.
     #[test]
-    fn workflow_card_indicator_appends_resolved_branch() {
+    fn card_meta_line_appends_resolved_branch() {
         let task = task_with_params(
             "t",
             Some("feature-task"),
@@ -4127,16 +4173,18 @@ mod tests {
             "feature-task",
             Some("feature/{{feature}}"),
         )];
-        let line = workflow_card_indicator(&task, &workflows, true, 60);
-        assert_eq!(line_text(&line), "feature-task · feature/auth-rewrite");
+        let line = card_meta_line(&task, &workflows, true, 60);
+        // Two spaces between badge and branch: the badge's own trailing
+        // padding (bg-filled) plus a plain separator space.
+        assert_eq!(line_text(&line), " feature-task  ⎇ feature/auth-rewrite");
     }
 
     /// When the column header already implies the workflow (single
-    /// workflow visible, so `show_workflow_name=false`), the per-card
-    /// indicator drops the redundant name but keeps the resolved branch
-    /// — it's the only per-task signal worth carrying.
+    /// workflow visible, so `show_workflow_name=false`), the meta line
+    /// drops the badge but keeps `⎇ branch` — the only per-task signal
+    /// worth carrying.
     #[test]
-    fn workflow_card_indicator_omits_name_but_keeps_branch_when_filtered() {
+    fn card_meta_line_omits_badge_but_keeps_branch_when_filtered() {
         let task = task_with_params(
             "t",
             Some("feature-task"),
@@ -4146,49 +4194,69 @@ mod tests {
             "feature-task",
             Some("feature/{{feature}}"),
         )];
-        let line = workflow_card_indicator(&task, &workflows, false, 60);
-        assert_eq!(line_text(&line), "feature/dashboard-v2");
+        let line = card_meta_line(&task, &workflows, false, 60);
+        assert_eq!(line_text(&line), "⎇ feature/dashboard-v2");
+    }
+
+    /// The task's own `branch` (once the orchestrator has cut it) wins
+    /// over the workflow's base-branch template — it's the working branch
+    /// the card is actually operating on.
+    #[test]
+    fn card_meta_line_prefers_task_branch_over_template() {
+        let mut task = task_with_params(
+            "t",
+            Some("feature-task"),
+            &[("feature", "auth")],
+        );
+        task.branch = Some("shelbi/t".into());
+        let workflows = vec![workflow_with_git(
+            "feature-task",
+            Some("feature/{{feature}}"),
+        )];
+        let line = card_meta_line(&task, &workflows, false, 60);
+        assert_eq!(line_text(&line), "⎇ shelbi/t");
     }
 
     /// A `base_branch` without any placeholder (e.g. `main`) carries no
-    /// per-task info, so the indicator suppresses it. Falls through to
-    /// the workflow-name (when `show_workflow_name`) or blank line.
+    /// per-task info and the task has no branch of its own, so the branch
+    /// is suppressed. Falls through to the badge (when shown) or blank.
     #[test]
-    fn workflow_card_indicator_skips_non_templated_branch() {
+    fn card_meta_line_skips_non_templated_branch() {
         let task = task_with_params("t", Some("feature-release"), &[]);
         let workflows = vec![workflow_with_git("feature-release", Some("main"))];
-        // Show name path: drop the branch, keep the workflow name.
-        let with_name = workflow_card_indicator(&task, &workflows, true, 60);
-        assert_eq!(line_text(&with_name), "feature-release");
-        // No name path: nothing left worth showing → blank.
-        let without_name = workflow_card_indicator(&task, &workflows, false, 60);
+        // Show badge path: drop the branch, keep the badge.
+        let with_name = card_meta_line(&task, &workflows, true, 60);
+        assert_eq!(line_text(&with_name), " feature-release ");
+        // No badge path: nothing left worth showing → blank.
+        let without_name = card_meta_line(&task, &workflows, false, 60);
         assert_eq!(line_text(&without_name), "");
     }
 
     /// Missing param keeps the placeholder unresolved. Rather than
     /// surface a half-substituted `feature/{{feature}}` (which would
-    /// mislead at a glance), the indicator drops the branch and shows
-    /// just the workflow name (or blank when the column header already
-    /// names the workflow). The popover stays responsible for surfacing
-    /// the actionable error.
+    /// mislead at a glance), the meta line drops the branch and shows
+    /// just the badge (or blank when the column header already names the
+    /// workflow). The popover stays responsible for surfacing the
+    /// actionable error.
     #[test]
-    fn workflow_card_indicator_hides_branch_when_param_missing() {
+    fn card_meta_line_hides_branch_when_param_missing() {
         let task = task_with_params("t", Some("feature-task"), &[]);
         let workflows = vec![workflow_with_git(
             "feature-task",
             Some("feature/{{feature}}"),
         )];
-        let with_name = workflow_card_indicator(&task, &workflows, true, 60);
-        assert_eq!(line_text(&with_name), "feature-task");
-        let without_name = workflow_card_indicator(&task, &workflows, false, 60);
+        let with_name = card_meta_line(&task, &workflows, true, 60);
+        assert_eq!(line_text(&with_name), " feature-task ");
+        let without_name = card_meta_line(&task, &workflows, false, 60);
         assert_eq!(line_text(&without_name), "");
     }
 
-    /// `max_text` clips long indicators with an ellipsis, matching how
-    /// titles and meta lines are already truncated so narrow columns
-    /// don't push spans past the card's right gutter.
+    /// `max_text` clips the meta line with an ellipsis, matching how the
+    /// title is truncated so narrow columns don't push spans past the
+    /// card's right gutter. The badge keeps its full width; the branch
+    /// takes whatever remains.
     #[test]
-    fn workflow_card_indicator_truncates_to_max_text() {
+    fn card_meta_line_truncates_to_max_text() {
         let task = task_with_params(
             "t",
             Some("feature-task"),
@@ -4198,11 +4266,37 @@ mod tests {
             "feature-task",
             Some("feature/{{feature}}"),
         )];
-        let line = workflow_card_indicator(&task, &workflows, true, 20);
+        let line = card_meta_line(&task, &workflows, true, 20);
         let text = line_text(&line);
-        assert_eq!(text.chars().count(), 20, "got: {text:?}");
+        assert!(text.chars().count() <= 20, "overflows width: {text:?}");
         assert!(text.ends_with('…'), "should end with ellipsis: {text:?}");
-        assert!(text.starts_with("feature-task"), "kept the leading workflow name: {text:?}");
+        assert!(
+            text.starts_with(" feature-task "),
+            "kept the leading workflow badge: {text:?}"
+        );
+    }
+
+    /// `wrap_title_two_lines` keeps a short title on one line (2-row
+    /// card), word-wraps a long title at the last space that fits, and
+    /// truncates an over-long second line with `…`. A first token wider
+    /// than the column hard-wraps mid-word.
+    #[test]
+    fn wrap_title_two_lines_behaviour() {
+        // Fits → single line.
+        assert_eq!(
+            wrap_title_two_lines("short title", 20),
+            ("short title".to_string(), None)
+        );
+        // Word-wrap at the last fitting space.
+        assert_eq!(
+            wrap_title_two_lines("one two three four five", 12),
+            ("one two".to_string(), Some("three four …".to_string()))
+        );
+        // First token longer than the width → hard wrap.
+        assert_eq!(
+            wrap_title_two_lines("supercalifragilistic done", 10),
+            ("supercalif".to_string(), Some("ragilisti…".to_string()))
+        );
     }
 
     // ---- column collapse / expand ----------------------------------------
@@ -4500,7 +4594,7 @@ mod tests {
     /// render two different resolved branches. The acceptance criterion
     /// behind "Per-task overlays read from the owning workflow."
     #[test]
-    fn workflow_card_indicator_reads_owning_workflow_not_statuses_yml() {
+    fn card_meta_line_reads_owning_workflow_not_statuses_yml() {
         let frontend = workflow_with_git("frontend", Some("feature/fe-{{feature}}"));
         let backend = workflow_with_git("backend", Some("feature/be-{{feature}}"));
         let workflows = vec![frontend, backend];
@@ -4512,9 +4606,9 @@ mod tests {
 
         // Both tasks live in the same project-wide `Todo` status, but
         // each resolves against its OWN workflow's `git:` template.
-        let fe_line = workflow_card_indicator(&fe_task, &workflows, true, 60);
-        let be_line = workflow_card_indicator(&be_task, &workflows, true, 60);
-        assert_eq!(line_text(&fe_line), "frontend · feature/fe-login");
-        assert_eq!(line_text(&be_line), "backend · feature/be-login");
+        let fe_line = card_meta_line(&fe_task, &workflows, true, 60);
+        let be_line = card_meta_line(&be_task, &workflows, true, 60);
+        assert_eq!(line_text(&fe_line), " frontend  ⎇ feature/fe-login");
+        assert_eq!(line_text(&be_line), " backend  ⎇ feature/be-login");
     }
 }
