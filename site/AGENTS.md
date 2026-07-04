@@ -48,10 +48,19 @@ intentional departures — keep them; do not revert to strict-mono here:
   monochrome ramp for legibility. Keep the violet here; do not revert it to
   strict-mono.
 
-These are driven by `--color-prose`, the `--color-callout-*` tokens, and the
-`--color-copy-prompt-*` tokens in `app/globals.css` (defined per theme). This
-hue is scoped to docs callouts and the copy-prompt banner only — do not spread
-accent color into the rest of the monochrome brand.
+- **Buttons inside a colored container match its hue.** The `CopyButton`
+  `tone` prop (`components/CopyButton.tsx`) lets a copy button sitting inside a
+  colored callout/banner draw its border/background/text from the matching hue
+  so it reads as "part of" that container — `violet` for the copy-prompt
+  banner, `info`/`tip`/`warning`/`danger` for the callout tones. Each tone
+  fills a step stronger than the container tint so it still reads as a button.
+  The default `neutral` tone stays strict-mono (code-block copy button, etc.).
+
+These are driven by `--color-prose`, the `--color-callout-*` tokens, the
+`--color-copy-prompt-*` tokens, and the per-family `--color-*-button-*` tints
+in `app/globals.css` (defined per theme). This hue is scoped to docs callouts,
+the copy-prompt banner, and buttons inside those colored containers only — do
+not spread accent color into the rest of the monochrome brand.
 
 # Typography
 

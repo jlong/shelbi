@@ -76,6 +76,44 @@
   --color-copy-prompt-border: #C4B5FD;
   --color-copy-prompt-icon: #7C3AED;
 
+  /* ----- Button-in-container tints (light) -----
+     A button that sits inside a colored callout/copy-prompt container reads
+     as "part of" that container by drawing its chrome from the matching hue.
+     Each family carries a slightly STRONGER fill + border than the container
+     tint (one step up the same scale) so the button still reads as a button.
+     Idle bg/border/text plus a hover step; focus-visible reuses the hover
+     border. Consumed by the `CopyButton` `tone` prop. Tuned for both themes
+     (see the `.dark` overrides). Documented in `AGENTS.md`. */
+  --color-copy-prompt-button-bg: #EDE9FE;
+  --color-copy-prompt-button-border: #A78BFA;
+  --color-copy-prompt-button-text: #6D28D9;
+  --color-copy-prompt-button-hover-bg: #DDD6FE;
+  --color-copy-prompt-button-hover-border: #8B5CF6;
+
+  --color-callout-info-button-bg: #DBEAFE;
+  --color-callout-info-button-border: #60A5FA;
+  --color-callout-info-button-text: #1D4ED8;
+  --color-callout-info-button-hover-bg: #BFDBFE;
+  --color-callout-info-button-hover-border: #3B82F6;
+
+  --color-callout-tip-button-bg: #DCFCE7;
+  --color-callout-tip-button-border: #4ADE80;
+  --color-callout-tip-button-text: #15803D;
+  --color-callout-tip-button-hover-bg: #BBF7D0;
+  --color-callout-tip-button-hover-border: #22C55E;
+
+  --color-callout-warning-button-bg: #FEF9C3;
+  --color-callout-warning-button-border: #FBBF24;
+  --color-callout-warning-button-text: #854D0E;
+  --color-callout-warning-button-hover-bg: #FEF08A;
+  --color-callout-warning-button-hover-border: #F59E0B;
+
+  --color-callout-danger-button-bg: #FEE2E2;
+  --color-callout-danger-button-border: #F87171;
+  --color-callout-danger-button-text: #B91C1C;
+  --color-callout-danger-button-hover-bg: #FECACA;
+  --color-callout-danger-button-hover-border: #EF4444;
+
   /* ----- Spacing (8px base) ----- */
   --spacing: 8px;
 }
@@ -126,6 +164,39 @@
   --color-copy-prompt-bg: #17112E;
   --color-copy-prompt-border: #4A3A82;
   --color-copy-prompt-icon: #A78BFA;
+
+  /* Button-in-container tints — dark. Fill a step above the container bg,
+     a brighter border, and light text so the button stays legible on the
+     deep tinted canvas without glowing; hover lifts both a further step. */
+  --color-copy-prompt-button-bg: #2A1E52;
+  --color-copy-prompt-button-border: #6D4FB8;
+  --color-copy-prompt-button-text: #DDD6FE;
+  --color-copy-prompt-button-hover-bg: #34266A;
+  --color-copy-prompt-button-hover-border: #8B6FD8;
+
+  --color-callout-info-button-bg: #16263F;
+  --color-callout-info-button-border: #3E68A8;
+  --color-callout-info-button-text: #DBEAFE;
+  --color-callout-info-button-hover-bg: #1E3352;
+  --color-callout-info-button-hover-border: #4F80C8;
+
+  --color-callout-tip-button-bg: #14301F;
+  --color-callout-tip-button-border: #3E8B5B;
+  --color-callout-tip-button-text: #DCFCE7;
+  --color-callout-tip-button-hover-bg: #1B3F29;
+  --color-callout-tip-button-hover-border: #4FA870;
+
+  --color-callout-warning-button-bg: #372D08;
+  --color-callout-warning-button-border: #9A7A1E;
+  --color-callout-warning-button-text: #FDE68A;
+  --color-callout-warning-button-hover-bg: #443709;
+  --color-callout-warning-button-hover-border: #B89428;
+
+  --color-callout-danger-button-bg: #3A1818;
+  --color-callout-danger-button-border: #A03C3C;
+  --color-callout-danger-button-text: #FECACA;
+  --color-callout-danger-button-hover-bg: #481D1D;
+  --color-callout-danger-button-hover-border: #C05050;
 }
 
 /* ============================================================
