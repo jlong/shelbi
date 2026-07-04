@@ -90,15 +90,21 @@ function machinesFor(working: Record<string, string>): Machine[] {
   ]
 }
 
-// The scenario every beat spreads from — a fresh analytics-dashboard project on
-// the Chat view. `minBodyRows` pins the pane height so the frame never resizes
-// as columns fill/empty or panes swap (a 6-card backlog is the tallest state,
-// at 18 rows: header + 6×2 card rows + 5 gaps).
+// The scenario every beat spreads from — a fresh `my-project` project on the
+// Chat view. `minBodyRows` pins the pane height so the frame never resizes as
+// columns fill/empty or panes swap. It's set well above the tallest natural
+// content (a 6-card backlog is only 18 rows: header + 6×2 card rows + 5 gaps)
+// to hold the window at a ~1.6 width:height aspect ratio: the board pane is a
+// fixed 111 cells wide (1 + 5×22) which, at the 13px / 0.6em-advance mono font,
+// is ~866px; a 1.6:1 window is ~541px tall; minus the 28px title bar that
+// leaves ~30 body rows, and the body wraps `minBodyRows` with 4 chrome rows
+// (title + blank + blank + footer), so 30 − 4 = 26. Shorter beats pad with
+// blank rows; taller content clips/scrolls within this fixed area.
 const BASE: AppState = {
-  terminalTitle: "jlong@hub — analytics-dashboard",
-  project: "analytics-dashboard",
+  terminalTitle: "jlong@hub — my-project",
+  project: "my-project",
   activeView: "chat",
-  minBodyRows: 18,
+  minBodyRows: 26,
   columns: cols({}),
   machines: machinesFor({}),
   readyReview: [],
