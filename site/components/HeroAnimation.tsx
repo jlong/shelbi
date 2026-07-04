@@ -8,6 +8,7 @@ import {
   type ChatLine,
   type Column,
   type Machine,
+  type PaletteItem,
 } from "./KanbanMockup"
 
 /**
@@ -19,8 +20,9 @@ import {
  * The story (see the beat comments in `buildKeyframes`): you talk to the
  * orchestrator in the Chat pane; it breaks a plan into tasks that stream in;
  * you switch to the board; the backlog fills; tasks promote and dispatch to
- * workers; you watch one worker's Claude-Code session; then its contents fade
- * and the loop wraps.
+ * workers; you open the ⌃P command palette and type to filter it down to the
+ * alpha workspace, then activate it to watch alpha's Claude-Code session; then
+ * its contents fade and the loop wraps.
  *
  * The timeline is one flat list of keyframes (`{ state, hold, opacity }`) so
  * durations and content are all tweakable in one place. A single `setTimeout`
@@ -151,6 +153,34 @@ function machinesFor(working: Record<string, string>): Machine[] {
     ),
   }))
 }
+
+// ── Command palette ───────────────────────────────────────────────────
+// The ⌃P palette's command list for the ending beats: the three nav views, the
+// Zen toggle, then every workspace across both machines (generated from
+// `MACHINES` so the hub/devbox split matches the sidebar exactly), then the
+// project/session actions. Only labels are fuzzy-matched, so typing `alpha`
+// narrows this to the single alpha row (no other label is a subsequence of
+// `alpha`), which is then activated.
+const PALETTE_ITEMS: PaletteItem[] = [
+  { glyph: "💬", label: "Chat", desc: "the claude pane you talk to" },
+  { glyph: "📋", label: "Tasks", desc: "live `shelbi list`" },
+  { glyph: "⚡", label: "Activity", desc: "human-readable events feed" },
+  { glyph: "⚡", label: "Turn Zen Mode on", desc: "currently off" },
+  ...MACHINES.flatMap((m) =>
+    m.workspaces.map((name) => ({
+      glyph: "·",
+      label: name,
+      desc: `workspace · ${m.name}`,
+    })),
+  ),
+  { glyph: "⚡", label: "Switch Project", desc: "fuzzy-pick another project and swap the dashboard" },
+  { glyph: "⚡", label: "Quit Project", desc: "close every pane and switch to the next project" },
+  { glyph: "⚡", label: "Quit Shelbi", desc: "close every Shelbi session on this host" },
+]
+
+// The query the palette is typed to at the end — narrows the list to the alpha
+// workspace, which the loop then activates.
+const PALETTE_QUERY = "alpha"
 
 // The scenario every beat spreads from — a fresh `my-project` project on the
 // Chat view. `minBodyRows` pins the pane height so the frame never resizes as
@@ -380,10 +410,26 @@ function buildKeyframes(): Keyframe[] {
   }
   k.push(frame(DISPATCHED, 950)) // csv-export → foxtrot (devbox); four dispatched across hub + devbox
 
-  // Beat 7 — observe a worker: focus alpha's Claude-Code pane on its task,
-  // running the test then landing green with the session footer. The pane wears
-  // the same Claude-Code chrome as the orchestrator Chat — transcript above, an
-  // idle (empty) input box + footer below, titled with the worker's name.
+  // Beat 7 — open the ⌃P command palette over the dashboard: the centered modal
+  // appears with an empty `>` prompt and the full command list, its top row
+  // highlighted (the board stays put underneath, dimmed by the scrim).
+  const paletteFrame = (query: string, hold: number): Keyframe =>
+    frame({ ...DISPATCHED, palette: { query, items: PALETTE_ITEMS } }, hold)
+  k.push(paletteFrame("", 800))
+
+  // Beat 8 — type the filter query one character at a time; the list fuzzy-
+  // filters down as it goes until only the alpha workspace remains, highlighted
+  // as the top match. Hold the resolved `alpha` frame a beat longer so it reads.
+  for (let i = 1; i <= PALETTE_QUERY.length; i += 1) {
+    const done = i === PALETTE_QUERY.length
+    k.push(paletteFrame(PALETTE_QUERY.slice(0, i), done ? 950 : 260))
+  }
+
+  // Beat 9 — activate alpha (Enter): the palette closes and the view lands on
+  // alpha's Claude-Code pane, mid-work on its dispatched task then landing green
+  // with the session footer. The pane wears the same Claude-Code chrome as the
+  // orchestrator Chat — transcript above, an idle input box + footer below,
+  // titled with the worker's name.
   const worker = (lines: ChatLine[]): Partial<AppState> => ({
     ...DISPATCHED,
     activeView: "workspace",
@@ -394,7 +440,7 @@ function buildKeyframes(): Keyframe[] {
   k.push(frame(worker(WORKER_RUNNING), 1300))
   k.push(frame(worker(WORKER_DONE), 1900))
 
-  // Beat 8 — fade the pane CONTENTS out (the window chrome stays static);
+  // Beat 10 — fade the pane CONTENTS out (the window chrome stays static);
   // wrapping to beat 1 (opacity 1) cross-fades the contents back in on a fresh
   // Chat view, so the window sits still and its contents dissolve/reappear.
   k.push(frame(worker(WORKER_DONE), 650, 0))

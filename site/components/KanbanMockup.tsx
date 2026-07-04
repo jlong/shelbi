@@ -160,6 +160,34 @@ export type ReviewEntry = {
 export type NavView = "chat" | "tasks" | "activity" | "workspace"
 
 /**
+ * One row in the ⌃P command palette: a left icon, a command label the fuzzy
+ * filter matches the typed query against, and a dim right-aligned description.
+ */
+export type PaletteItem = {
+  /** Left icon — an emoji action/nav glyph (💬 📋 ⚡) or the `·` workspace bullet. */
+  glyph: string
+  /** Command label; the fuzzy filter matches the typed query against this. */
+  label: string
+  /** Dim, right-aligned description of what the command does. */
+  desc: string
+}
+
+/**
+ * The ⌃P command-palette overlay state. When present on an `AppState`,
+ * `AppMockup` draws the centered palette modal over the active view: a `>`
+ * prompt showing `query`, the `items` fuzzy-filtered by it (a case-insensitive
+ * label subsequence match), and the top surviving match highlighted. The hero
+ * animation types `query` from empty up to `alpha` to narrow the list, then
+ * clears the palette as the alpha workspace activates.
+ */
+export type PaletteState = {
+  /** Text typed after the `>` prompt; fuzzy-filters `items` by label. */
+  query: string
+  /** The full command list; the renderer filters it by `query`. */
+  items: PaletteItem[]
+}
+
+/**
  * The full interface state a single mockup renders. Pass one to
  * `<AppMockup state={...} />`; start from a preset (`defaultAppState`,
  * `starterAppState`) and override only what your scenario changes.
@@ -228,6 +256,14 @@ export type AppState = {
    * emptying, panes swapping) instead of resizing with the tallest column.
    */
   minBodyRows?: number
+  /**
+   * When set, the ⌃P command palette renders as a centered modal over the active
+   * view (the board stays put underneath, dimmed by a scrim). Omitted (the
+   * default) shows no palette. Only the hero animation's ending beats set it —
+   * opening the palette, typing to filter the list down to `alpha`, then clearing
+   * it as the alpha workspace activates.
+   */
+  palette?: PaletteState
 }
 
 const CATEGORY_COLOR: Record<Category, string> = {
@@ -254,6 +290,15 @@ type Segment = {
   color?: string
   bg?: string
   bold?: boolean
+  /**
+   * Pin this run to exactly `cells` monospace columns (`ch`), regardless of the
+   * glyph's real advance. Used for the command palette's emoji icons (💬 📋 ⚡),
+   * which render wider than one cell in the mono font: pinning them to their
+   * logical 2-cell width keeps the modal's right border aligned across rows (the
+   * glyph is free to bleed into the following gap, which is blank). Omitted rows
+   * lay out by their natural text width.
+   */
+  cells?: number
 }
 
 /** A full-width blank board row, sized to a scenario's content width. */
@@ -1221,6 +1266,157 @@ function reviewEntryRows(entry: ReviewEntry, ready: boolean): Segment[][] {
   return [line1, line2]
 }
 
+// ── Command palette ───────────────────────────────────────────────────
+// The centered ⌃P command palette overlay: a bordered modal (`shelbi ·
+// <project>` title) with a `>` fuzzy-filter prompt over the command list — the
+// nav views, a Zen toggle, every workspace, and the project/session actions.
+// It's drawn as an absolutely-positioned box centered over the dashboard (the
+// board stays put underneath, dimmed by a scrim) rather than as a pane in the
+// monospace grid, so the frame width/height are untouched. The hero types the
+// prompt from empty to `alpha` to filter the list down before activating that
+// workspace. `AppState.palette` carries the query + item list; the renderer
+// fuzzy-filters and highlights the top match.
+
+const PAL_INNER = 52 // text columns between the box's " " side margins
+const PAL_BOX = PAL_INNER + 4 // + │, left margin, right margin, │
+const PAL_BG = "#2a2a2a" // modal panel fill — lifted off the darker board body
+const PAL_BORDER = "#6a6a6a" // crisp modal edge against the scrim
+
+/**
+ * Monospace cell width of `text`, counting the palette's emoji icons (💬 📋 ⚡,
+ * and the ⏵/↑↓-range action glyphs) as the 2 cells a terminal renders them so
+ * the right-aligned descriptions and the box's right border line up. `·` and
+ * plain ASCII count as 1.
+ */
+function palWidth(text: string): number {
+  let w = 0
+  for (const ch of text) {
+    const cp = ch.codePointAt(0) ?? 0
+    w += cp >= 0x1f000 || (cp >= 0x2600 && cp <= 0x27bf) ? 2 : 1
+  }
+  return w
+}
+
+/** Case-insensitive subsequence match: `query`'s chars appear in order in `text`. */
+function paletteMatch(query: string, text: string): boolean {
+  const q = [...query.toLowerCase()]
+  if (q.length === 0) return true
+  let qi = 0
+  for (const ch of text.toLowerCase()) {
+    if (ch === q[qi]) {
+      qi += 1
+      if (qi === q.length) return true
+    }
+  }
+  return false
+}
+
+/**
+ * Wrap one row's inner segments in the palette's side borders, padding (or, for
+ * the selected row, filling) the interior to `PAL_INNER` so the box edges stay
+ * vertically aligned. `fill` backs the whole interior — `PAL_BG` normally,
+ * `SEL_BG` for the highlighted row.
+ */
+function palRow(inner: Segment[], fill: string = PAL_BG): Segment[] {
+  const used = inner.reduce((a, s) => a + (s.cells ?? palWidth(s.text)), 0)
+  const pad = Math.max(0, PAL_INNER - used)
+  return [
+    { text: "│", color: PAL_BORDER, bg: PAL_BG },
+    { text: " ", bg: fill },
+    ...inner.map((s) => ({ ...s, bg: s.bg ?? fill })),
+    { text: " ".repeat(pad + 1), bg: fill },
+    { text: "│", color: PAL_BORDER, bg: PAL_BG },
+  ]
+}
+
+/** The titled top border: `╭─ shelbi · <project> ───╮`. */
+function palTopBorder(project: string): Segment[] {
+  const pre = "╭─ "
+  const brand = "shelbi"
+  const sep = " · "
+  const fixed = palWidth(pre) + palWidth(brand) + palWidth(sep) + palWidth(project) + 2
+  const dashes = "─".repeat(Math.max(0, PAL_BOX - fixed))
+  return [
+    { text: pre, color: PAL_BORDER, bg: PAL_BG },
+    { text: brand, color: TUI_FG, bold: true, bg: PAL_BG },
+    { text: sep, color: TUI_DARK_GRAY, bg: PAL_BG },
+    { text: project, color: TUI_CYAN, bold: true, bg: PAL_BG },
+    { text: ` ${dashes}╮`, color: PAL_BORDER, bg: PAL_BG },
+  ]
+}
+
+/** A `├───┤` interior divider spanning the box width. */
+function palDivider(): Segment[] {
+  return [{ text: `├${"─".repeat(PAL_BOX - 2)}┤`, color: PAL_BORDER, bg: PAL_BG }]
+}
+
+/** The plain `╰───╯` bottom border. */
+function palBottomBorder(): Segment[] {
+  return [{ text: `╰${"─".repeat(PAL_BOX - 2)}╯`, color: PAL_BORDER, bg: PAL_BG }]
+}
+
+/** The `>` fuzzy-filter prompt row: the typed query + a block cursor. */
+function palPromptRow(query: string): Segment[] {
+  return palRow([
+    { text: "> ", color: TUI_CYAN, bold: true },
+    { text: query, color: TUI_FG },
+    { text: "▊", color: TUI_CYAN },
+  ])
+}
+
+/** One command row: `<icon>  <label>            <description>` (top match highlighted). */
+function palItemRow(item: PaletteItem, selected: boolean): Segment[] {
+  const fill = selected ? SEL_BG : PAL_BG
+  const glyphW = palWidth(item.glyph)
+  const gap = "  "
+  const leftW = glyphW + gap.length + [...item.label].length
+  // Right-align the description at the box edge, truncating (…-suffix) any that's
+  // too long to leave at least a one-column gap after the label — so a long
+  // action description can't collide with its label or push the right border out.
+  const desc = truncate(item.desc, Math.max(1, PAL_INNER - leftW - 1))
+  const pad = Math.max(1, PAL_INNER - leftW - [...desc].length)
+  const inner: Segment[] = [
+    // Pin the icon to its logical width so a double-width emoji can't shift the
+    // description column or the right border.
+    { text: item.glyph, color: item.glyph === "·" ? TUI_DARK_GRAY : undefined, cells: glyphW },
+    { text: gap },
+    { text: item.label, color: selected ? SEL_FG : TUI_FG, bold: selected },
+    { text: " ".repeat(pad) },
+    { text: desc, color: selected ? SEL_FG : TUI_DARK_GRAY },
+  ]
+  return palRow(inner, fill)
+}
+
+/** The footer keybinding hint row: keys in fg, connectors dim. */
+function palFooterRow(): Segment[] {
+  const dim = TUI_DARK_GRAY
+  return palRow([
+    { text: "↑↓", color: TUI_FG },
+    { text: " navigate · ", color: dim },
+    { text: "Enter", color: TUI_FG },
+    { text: " activate · ", color: dim },
+    { text: "Esc / Ctrl+P", color: TUI_FG },
+    { text: " close", color: dim },
+  ])
+}
+
+/**
+ * Build the palette modal's rows for the current query + item list: titled top
+ * border, the `>` prompt, a divider, the fuzzy-filtered command list (top match
+ * highlighted), then a divider, the footer hints, and the bottom border.
+ */
+function buildPaletteRows(palette: PaletteState, project: string): Segment[][] {
+  const matches = palette.items.filter((it) => paletteMatch(palette.query, it.label))
+  const rows: Segment[][] = [palTopBorder(project), palPromptRow(palette.query), palDivider()]
+  if (matches.length === 0) {
+    rows.push(palRow([{ text: "no matching commands", color: TUI_DARK_GRAY }]))
+  } else {
+    matches.forEach((it, i) => rows.push(palItemRow(it, i === 0)))
+  }
+  rows.push(palDivider(), palFooterRow(), palBottomBorder())
+  return rows
+}
+
 // ── Panels ────────────────────────────────────────────────────────────
 
 /** The `<span>` runs for one row's segments — shared by `Row` and `NavRow`. */
@@ -1232,6 +1428,13 @@ function SegSpans({ segs }: { segs: Segment[] }) {
         if (seg.color) style.color = seg.color
         if (seg.bg) style.background = seg.bg
         if (seg.bold) style.fontWeight = 700
+        if (seg.cells !== undefined) {
+          // Fixed-width cell: pin the layout advance to `cells` ch so a
+          // wider-than-mono glyph (palette emoji) can't shift the columns after
+          // it; the glyph bleeds harmlessly into the following blank gap.
+          style.display = "inline-block"
+          style.width = `${seg.cells}ch`
+        }
         return (
           <span key={j} style={style}>
             {seg.text}
@@ -1464,6 +1667,39 @@ function TrafficLight({ color }: { color: string }) {
 }
 
 /**
+ * The centered ⌃P command-palette modal, drawn over the terminal body. A dim
+ * scrim covers the board and the bordered box floats near the top-center, so the
+ * palette reads as a modal overlay without disturbing the fixed-size grid
+ * underneath. Non-interactive — the hero drives its query via keyframes.
+ */
+function PaletteOverlay({ palette, project }: { palette: PaletteState; project: string }) {
+  const rows = buildPaletteRows(palette, project)
+  return (
+    <div
+      className="absolute inset-0 flex justify-center"
+      // Top-anchored so the box's top edge stays put while the list shrinks from
+      // the bottom as the query narrows it — the way a real fuzzy picker filters.
+      style={{ alignItems: "flex-start", background: "rgba(0,0,0,0.5)", pointerEvents: "none" }}
+    >
+      <pre
+        className="m-0 whitespace-pre font-mono"
+        style={{
+          ...PRE_STYLE,
+          background: PAL_BG,
+          marginTop: 48,
+          minWidth: "max-content",
+          boxShadow: "0 16px 40px rgba(0,0,0,0.55)",
+        }}
+      >
+        {rows.map((row, i) => (
+          <Row key={i} segs={row} />
+        ))}
+      </pre>
+    </div>
+  )
+}
+
+/**
  * Render a Shelbi TUI dashboard scenario inside a macOS-Terminal frame.
  * The look is fixed — only the scenario varies. Three ways to drive it:
  *
@@ -1558,7 +1794,7 @@ export function AppMockup({
               hides below `md` so phones don't get a cramped strip beside
               a cropped board. */}
           <div
-            className="flex overflow-x-auto"
+            className="relative flex overflow-x-auto"
             // The solid terminal-body fill stays here at full opacity, so the
             // body background never dims. Only the two panes' text layers
             // cross-fade at the loop boundary (via `contentOpacity` on each
@@ -1574,6 +1810,9 @@ export function AppMockup({
               contentOpacity={contentOpacity}
             />
             <TerminalBody state={resolved} contentOpacity={contentOpacity} />
+            {resolved.palette ? (
+              <PaletteOverlay palette={resolved.palette} project={resolved.project} />
+            ) : null}
           </div>
         </div>
       </div>
