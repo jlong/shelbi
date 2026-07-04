@@ -1,0 +1,45 @@
+---
+title: shelbi attach
+order: 30
+summary: Attach your terminal to a workspace's tmux pane.
+---
+
+```text
+shelbi attach [OPTIONS] <ID>
+```
+
+`shelbi attach` connects your terminal to a
+[workspace](/docs/concepts/workspaces)'s tmux pane, dropping you straight into
+the agent's session so you can watch or drive it interactively.
+
+Where [`shelbi open`](/docs/cli/open) focuses (and, if needed, creates) the pane
+*inside* the Shelbi tmux session, `attach` wires *your* terminal to the
+workspace's pane directly.
+
+## Arguments
+
+| Argument | Type | Default | Description |
+| --- | --- | --- | --- |
+| `<ID>` | string | — | Workspace to attach to (required). |
+
+## Flags
+
+| Flag | Type | Default | Description |
+| --- | --- | --- | --- |
+| `--root <PATH>` | string | install-time default / `$SHELBI_ROOT` / `~/.shelbi` | Override the Shelbi root directory. The flag wins over both the env var and the compile-time default. |
+| `-p, --project <PROJECT>` | string | env / cwd lookup | Project to operate on. |
+
+## Examples
+
+Attach your terminal to the `alpha` workspace's pane:
+
+```bash
+shelbi attach alpha
+```
+
+## See also
+
+- [Workspaces](/docs/concepts/workspaces) — what a workspace is and how its
+  pane is created and owned.
+- [`shelbi open`](/docs/cli/open) — focus (or create) a workspace's pane inside
+  the Shelbi tmux session rather than attaching your own terminal to it.

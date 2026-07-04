@@ -1,0 +1,54 @@
+---
+title: shelbi open
+order: 29
+summary: Focus a workspace's tmux pane, creating it (with the agent running) if it doesn't exist yet.
+---
+
+```text
+shelbi open [OPTIONS] <NAME>
+```
+
+`shelbi open` focuses a [workspace](/docs/concepts/workspaces)'s tmux pane,
+creating it — with the agent already running inside — if it doesn't exist yet.
+It's the single entry point behind both the sidebar's click-to-focus and the
+dispatch path: the "does this pane exist?" check lives here, so callers never
+have to branch on it themselves.
+
+For a **local** workspace, an empty pane is created by re-entering this same
+command under `--as-pane` — the wrapper that owns the agent subprocess and
+emits a `pane_alive=false` event when it exits. For a **remote** workspace, the
+pane is a proxy window that `ssh -t … tmux attach`es into the workspace's own
+remote tmux session, since the lifecycle wrapper isn't deployed to remote
+machines.
+
+`open` focuses (or creates) the pane inside the Shelbi tmux session — it's how
+you jump to a workspace from the sidebar. To connect your own terminal directly
+to a workspace's pane instead, use [`shelbi attach`](/docs/cli/attach).
+
+## Arguments
+
+| Argument | Type | Default | Description |
+| --- | --- | --- | --- |
+| `<NAME>` | string | — | Name of the workspace to open (required). |
+
+## Flags
+
+| Flag | Type | Default | Description |
+| --- | --- | --- | --- |
+| `--root <PATH>` | string | install-time default / `$SHELBI_ROOT` / `~/.shelbi` | Override the Shelbi root directory. The flag wins over both the env var and the compile-time default. |
+| `-p, --project <PROJECT>` | string | env / cwd lookup | Project to operate on. |
+
+## Examples
+
+Focus (or create) the `alpha` workspace's pane:
+
+```bash
+shelbi open alpha
+```
+
+## See also
+
+- [Workspaces](/docs/concepts/workspaces) — what a workspace is, its pane
+  lifecycle, and the local vs. remote distinction.
+- [`shelbi attach`](/docs/cli/attach) — connect your terminal directly to a
+  workspace's pane instead of focusing it inside the Shelbi session.
