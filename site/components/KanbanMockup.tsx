@@ -212,6 +212,15 @@ export type AppState = {
    */
   workspaceLines?: ChatLine[]
   /**
+   * The text currently sitting in the Claude-Code input box at the bottom of the
+   * Chat / worker pane. Real Claude Code pins the prompt to the bottom of the
+   * pane with the conversation scrolling above it, so this is separate from the
+   * transcript (`chatLines`/`workspaceLines`): the hero animation types beat 2's
+   * message here character by character, then clears it on "send" as the message
+   * moves up into the conversation. Empty (the default) renders an idle prompt.
+   */
+  chatInput?: string
+  /**
    * Pins the terminal body to at least this many rows. Views shorter than the
    * pin are padded with blank rows so the frame height never changes as a
    * scenario's content grows or shrinks — the hero animation sets it once so
@@ -318,9 +327,15 @@ function columnRows(col: Column): Segment[][] {
       ])
     }
 
-    // Meta row — id (DarkGray) + optional `  @workspace` (Magenta).
+    // Meta row — id (DarkGray) + optional `  @workspace` (Magenta). The
+    // `@workspace` is the priority tag, so the id truncates (…-suffix) to
+    // whatever COL_W leaves after reserving room for `  @workspace`; this keeps
+    // the cell exactly COL_W wide even for long id+workspace pairs (e.g.
+    // `metrics-api-endpoint  @alpha`) so the board never grows past its
+    // canonical width and the frame can't resize between views.
     const wsSuffix = card.workspace ? `  @${card.workspace}` : ""
-    const metaBaseLen = card.id.length + wsSuffix.length
+    const id = truncate(card.id, Math.max(1, COL_W - [...wsSuffix].length))
+    const metaBaseLen = [...id].length + [...wsSuffix].length
     const metaPad = COL_W - metaBaseLen
     if (card.selected) {
       // Selected card: the highlight bg spans the full cell — id and
@@ -329,13 +344,13 @@ function columnRows(col: Column): Segment[][] {
       // the entire row.
       rows.push([
         {
-          text: padTo(`${card.id}${wsSuffix}`, COL_W),
+          text: padTo(`${id}${wsSuffix}`, COL_W),
           color: SEL_FG,
           bg: SEL_BG,
         },
       ])
     } else {
-      const segs: Segment[] = [{ text: card.id, color: TUI_DARK_GRAY }]
+      const segs: Segment[] = [{ text: id, color: TUI_DARK_GRAY }]
       if (card.workspace) {
         segs.push({ text: "  " })
         segs.push({ text: `@${card.workspace}`, color: TUI_MAGENTA })
@@ -726,7 +741,9 @@ function buildActivityRows(state: AppState): Segment[][] {
 //             collapsed with a trailing `… +N lines` the way Claude Code folds
 //             long output.
 // - `working`— the `✻ Working…` spinner line, dim accent.
-// - `status`— the two-line footer (`Model: … · Ctx … · Cost …` + `⏵⏵ auto mode`).
+// - `status`— session stats that drive the pane's pinned footer (`Model: … ·
+//             Ctx … · Cost … · Session …`); rendered as chrome at the bottom of
+//             the pane rather than inline in the transcript.
 // - `blank` — vertical spacing between turns.
 export type ChatLine =
   | { kind: "user"; text: string }
@@ -734,7 +751,7 @@ export type ChatLine =
   | { kind: "tool"; name: string; args: string }
   | { kind: "result"; text: string; more?: number }
   | { kind: "working"; text: string }
-  | { kind: "status"; model: string; ctx: string; cost: string }
+  | { kind: "status"; model: string; ctx: string; cost: string; session?: string }
   | { kind: "blank" }
 
 // A believable orchestration session over the sample project: the human asks
@@ -768,9 +785,19 @@ const CHAT_LINES: ChatLine[] = [
 // Assistant prose wraps at a comfortable measure rather than stretching across
 // the full 111-cell pane, the way Claude Code soft-wraps its output.
 const CHAT_WRAP_W = 76
+// The Claude-Code prompt is a bordered box pinned to the bottom of the pane: a
+// rule above it, the `❯` input line, a rule below it, then the two footer lines
+// (session stats + auto-mode). That's a fixed 5-row chunk the conversation
+// scrolls above — see `buildClaudeCodeRows`.
+const CLAUDE_CHROME_ROWS = 5
 
-function buildChatRows(state: AppState, lines: ChatLine[]): Segment[][] {
-  const width = contentWidth(state.columns)
+/**
+ * Render just the scrolling transcript above the input box: assistant prose,
+ * `⏺` tool bullets, `⎿` results, and the optional `✽ Working…` spinner. `status`
+ * lines carry no transcript row — they feed the pinned footer instead — so they
+ * are skipped here.
+ */
+function conversationRows(lines: ChatLine[], width: number): Segment[][] {
   const row = (segs: Segment[]) => bodyRow(segs, width)
   const rows: Segment[][] = []
 
@@ -780,7 +807,9 @@ function buildChatRows(state: AppState, lines: ChatLine[]): Segment[][] {
         rows.push(blankRow(width))
         break
       case "user":
-        // `❯ ` prompt (cyan) + the human's message in the foreground color.
+        // `❯ ` prompt (cyan) + the human's message in the foreground color — a
+        // sent turn that now lives in the transcript (the live input box below
+        // is where an unsent message is typed).
         rows.push(
           row([
             { text: " ❯ ", color: TUI_CYAN, bold: true },
@@ -822,33 +851,93 @@ function buildChatRows(state: AppState, lines: ChatLine[]): Segment[][] {
         // Spinner/working line in a dim magenta accent.
         rows.push(
           row([
-            { text: " ✻ ", color: TUI_MAGENTA },
+            { text: " ✽ ", color: TUI_MAGENTA },
             { text: line.text, color: TUI_DARK_GRAY },
           ]),
         )
         break
       case "status":
-        // Footer status: model/context/cost line, then the auto-mode hint.
-        rows.push(
-          row([
-            {
-              text: `  Model: ${line.model} · Ctx ${line.ctx} · Cost ${line.cost}`,
-              color: TUI_DARK_GRAY,
-            },
-          ]),
-        )
-        rows.push(
-          row([
-            { text: "  ⏵⏵ ", color: TUI_GREEN },
-            { text: "auto mode on (shift+tab to cycle)", color: TUI_DARK_GRAY },
-          ]),
-        )
+        // Drives the pinned footer, not a transcript row — skip here.
         break
     }
   }
-
-  // Left unpadded — `TerminalBody` pads to the shared target height.
   return rows
+}
+
+/** A full-width dim horizontal rule — the top/bottom border of the input box. */
+function claudeRuleRow(width: number): Segment[] {
+  return [{ text: "─".repeat(width), color: TUI_DIVIDER }]
+}
+
+/**
+ * The pinned bottom chrome of a Claude-Code pane (`CLAUDE_CHROME_ROWS` rows): a
+ * bordered `❯` input box (rule / input line / rule) over the two-line footer —
+ * `Model … · Ctx … · Cost … · Session …` with the `𖠰 <badge>` session badge
+ * right-aligned, then the `⏵⏵ auto mode on` hint. Session stats come from a
+ * `status` line in the transcript (falling back to sensible defaults) so the
+ * footer reads live; the badge is the orchestrator's `hub` or, on a worker
+ * pane, the focused workspace name.
+ */
+function claudeChromeRows(state: AppState, lines: ChatLine[], width: number): Segment[][] {
+  const input = state.chatInput ?? ""
+  const inputRow = bodyRow(
+    [
+      { text: " ❯ ", color: TUI_CYAN, bold: true },
+      { text: input, color: TUI_FG },
+    ],
+    width,
+  )
+
+  const status = lines.find((l) => l.kind === "status")
+  const model = status?.model ?? "Opus 4.8"
+  const ctx = status?.ctx ?? "4%"
+  const cost = status?.cost ?? "$0.36"
+  const session = status?.session ?? "3m"
+  const badge =
+    state.activeView === "workspace" ? (state.focusedWorkspace ?? "worker") : "hub"
+  const footerStats = bodyRightAlignRow(
+    [
+      {
+        text: `  Model: ${model} · Ctx ${ctx} · Cost ${cost} · Session ${session}`,
+        color: TUI_DARK_GRAY,
+      },
+    ],
+    [{ text: `𖠰 ${badge}`, color: TUI_DARK_GRAY }],
+    width,
+  )
+  const footerMode = bodyRow(
+    [
+      { text: "  ⏵⏵ ", color: TUI_GREEN },
+      { text: "auto mode on (shift+tab to cycle)", color: TUI_DARK_GRAY },
+    ],
+    width,
+  )
+
+  return [claudeRuleRow(width), inputRow, claudeRuleRow(width), footerStats, footerMode]
+}
+
+/**
+ * A full Claude-Code pane, sized to exactly `target` rows: the transcript
+ * scrolls in the area above a bottom-pinned input box + footer, mirroring the
+ * real CLI. The conversation is bottom-anchored against the input box — short
+ * transcripts leave blank rows above, long ones clip from the top so the most
+ * recent turns stay next to the prompt — so the frame never resizes as the
+ * story streams in more output.
+ */
+function buildClaudeCodeRows(
+  state: AppState,
+  lines: ChatLine[],
+  target: number,
+  width: number,
+): Segment[][] {
+  const chrome = claudeChromeRows(state, lines, width)
+  const convArea = Math.max(0, target - CLAUDE_CHROME_ROWS)
+  const conv = conversationRows(lines, width)
+  const visible =
+    conv.length >= convArea
+      ? conv.slice(conv.length - convArea)
+      : [...Array.from({ length: convArea - conv.length }, () => blankRow(width)), ...conv]
+  return [...visible, ...chrome]
 }
 
 // ── Sidebar ───────────────────────────────────────────────────────────
@@ -1188,14 +1277,21 @@ function TerminalBody({ state }: { state: AppState }) {
   const width = contentWidth(state.columns)
   const boardRows = buildBoardRows(state.columns)
   const target = Math.max(boardRows.length, state.minBodyRows ?? 0)
-  const raw: Segment[][] =
-    state.activeView === "activity"
+  // Chat and worker panes are full Claude-Code sessions with a bottom-pinned
+  // input box + footer, so they build to exactly `target` rows themselves
+  // (conversation bottom-anchored against the chrome). Board/activity views
+  // render naturally and get padded/clipped to `target` by `padBodyTo`.
+  const isClaudePane = state.activeView === "chat" || state.activeView === "workspace"
+  const raw: Segment[][] = isClaudePane
+    ? buildClaudeCodeRows(
+        state,
+        (state.activeView === "chat" ? state.chatLines : state.workspaceLines) ?? CHAT_LINES,
+        target,
+        width,
+      )
+    : state.activeView === "activity"
       ? buildActivityRows(state)
-      : state.activeView === "chat"
-        ? buildChatRows(state, state.chatLines ?? CHAT_LINES)
-        : state.activeView === "workspace"
-          ? buildChatRows(state, state.workspaceLines ?? CHAT_LINES)
-          : boardRows
+      : boardRows
   const body = padBodyTo(raw, target, width)
   const rows: Segment[][] = [
     titleRow(state),
@@ -1281,17 +1377,19 @@ function TrafficLight({ color }: { color: string }) {
 export function AppMockup({
   state,
   preset = "default",
-  frameOpacity,
+  contentOpacity,
   ...overrides
 }: {
   state?: AppState
   preset?: PresetName
   /**
-   * Opacity applied to the terminal frame, with a short transition — the hero
-   * animation drives this to fade the whole frame out and back in at the loop
-   * boundary. Omitted (the docs default) leaves the frame fully opaque.
+   * Opacity applied to the terminal's inner content (the sidebar + pane), with a
+   * short transition — the hero animation drives this to cross-fade the pane
+   * contents at the loop boundary while the window chrome (frame, title bar,
+   * traffic lights) stays fully visible and static. Omitted (the docs default)
+   * leaves the content fully opaque.
    */
-  frameOpacity?: number
+  contentOpacity?: number
 } & Partial<AppState>) {
   const base = state ?? PRESETS[preset]
   const merged: AppState = { ...base, ...overrides }
@@ -1321,8 +1419,6 @@ export function AppMockup({
           className="overflow-hidden rounded-lg shadow-2xl"
           style={{
             boxShadow: "0 24px 48px rgba(0,0,0,0.35), 0 0 0 1px rgba(0,0,0,0.4)",
-            opacity: frameOpacity,
-            transition: frameOpacity === undefined ? undefined : "opacity 500ms ease",
           }}
         >
           {/* macOS Terminal title bar — traffic lights left, title centered. */}
@@ -1361,7 +1457,13 @@ export function AppMockup({
               a cropped board. */}
           <div
             className="flex overflow-x-auto"
-            style={{ background: TUI_BG }}
+            style={{
+              background: TUI_BG,
+              // Only the inner content fades at the loop boundary — the chrome
+              // above (title bar, traffic lights) stays static.
+              opacity: contentOpacity,
+              transition: contentOpacity === undefined ? undefined : "opacity 500ms ease",
+            }}
           >
             <Sidebar state={resolved} onSelectView={setActiveView} />
             <TerminalBody state={resolved} />

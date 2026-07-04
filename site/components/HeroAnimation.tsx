@@ -19,18 +19,27 @@ import {
  * The story (see the beat comments in `buildKeyframes`): you talk to the
  * orchestrator in the Chat pane; it breaks a plan into tasks that stream in;
  * you switch to the board; the backlog fills; tasks promote and dispatch to
- * workers; you watch one worker's Claude-Code session; then it fades and loops.
+ * workers; you watch one worker's Claude-Code session; then its contents fade
+ * and the loop wraps.
  *
  * The timeline is one flat list of keyframes (`{ state, hold, opacity }`) so
  * durations and content are all tweakable in one place. A single `setTimeout`
- * chain walks the list and wraps back to the start. Typing (beat 2) and task
- * streaming (beat 3) are done by handing `AppMockup` a progressively-built
- * transcript — no engine typing logic, just different `chatLines` per frame.
+ * chain walks the list and wraps back to the start. Typing (beat 2) is done by
+ * feeding `chatInput` the growing message in the bottom input box; task
+ * streaming (beat 3) hands `AppMockup` a progressively-built transcript — no
+ * engine typing logic, just different `chatLines`/`chatInput` per frame.
+ *
+ * The Chat and worker panes render as real Claude-Code sessions: the transcript
+ * scrolls above a bottom-pinned `❯` input box and a Model/Cost/Session footer
+ * (see `buildClaudeCodeRows` in `KanbanMockup`).
  *
  * Accessibility + cost: `prefers-reduced-motion` renders a single static frame
  * (the board mid-dispatch) with no timers; an IntersectionObserver pauses the
- * loop while the hero is scrolled off-screen. The frame size is pinned via
- * `minBodyRows` so it never resizes as the story advances.
+ * loop while the hero is scrolled off-screen. The frame is pinned to a fixed
+ * width (5 columns) and height (`minBodyRows`) so it never resizes as the story
+ * advances — shorter content is padded, taller content clips/scrolls — and the
+ * loop-reset fade (`opacity`) targets only the pane contents, leaving the window
+ * chrome static.
  */
 
 // ── Story dataset ─────────────────────────────────────────────────────
@@ -104,6 +113,22 @@ function userLine(text: string): ChatLine {
   return { kind: "user", text }
 }
 
+// The prior exchange already scrolled into the conversation at beat 1: the user
+// and Claude just wrote `dashboard.md` together and Claude finished, so the new
+// request (beat 2) reads as the natural next step. Kept short so the input box +
+// footer still fit under it in the fixed frame.
+const PRIOR_EXCHANGE: ChatLine[] = [
+  userLine("Let's plan an analytics dashboard for the app."),
+  { kind: "blank" },
+  { kind: "prose", text: "On it. I'll draft dashboard.md — metrics, charts, filters, export." },
+  { kind: "tool", name: "Write", args: "dashboard.md" },
+  { kind: "result", text: "48 lines written" },
+  {
+    kind: "prose",
+    text: "Done. dashboard.md covers a metrics API, chart components, a date-range filter, CSV export, empty/loading states, and tests. Want me to break it into tasks?",
+  },
+]
+
 // What the orchestrator streams after the user's message: a line of narration
 // then three `shelbi task add` calls, each with its `⎿ ✓ … created` result.
 const STREAM_TAIL: ChatLine[] = [
@@ -120,9 +145,13 @@ const STREAM_TAIL: ChatLine[] = [
   { kind: "result", text: "✓ date-range-filter created" },
 ]
 
-/** Chat transcript with the first `n` streamed lines revealed. */
-function chatUpTo(n: number): ChatLine[] {
-  return [userLine(USER_MSG), ...STREAM_TAIL.slice(0, n)]
+// The user's message, once sent, sits in the conversation just below the prior
+// exchange; beat 3 streams the orchestrator's reply beneath it.
+const SENT: ChatLine[] = [...PRIOR_EXCHANGE, { kind: "blank" }, userLine(USER_MSG)]
+
+/** Conversation with the sent message + the first `n` streamed reply lines. */
+function streamUpTo(n: number): ChatLine[] {
+  return [...SENT, ...STREAM_TAIL.slice(0, n)]
 }
 
 // The focused worker (alpha) doing believable work on "Metrics API endpoint":
@@ -167,24 +196,34 @@ const STATIC_STATE: AppState = { ...BASE, ...DISPATCHED }
 
 function buildKeyframes(): Keyframe[] {
   const k: Keyframe[] = []
-  const chat = (lines: ChatLine[]): Partial<AppState> => ({ activeView: "chat", chatLines: lines })
+  // A Chat beat: the conversation transcript above, and whatever's sitting in
+  // the bottom input box (`input`) — empty once a message is sent.
+  const chat = (lines: ChatLine[], input: string): Partial<AppState> => ({
+    activeView: "chat",
+    chatLines: lines,
+    chatInput: input,
+  })
 
-  // Beat 1 — Chat view, a fresh `❯` prompt with a blinking cursor.
-  k.push(frame(chat([userLine(CURSOR)]), 900))
+  // Beat 1 — Chat view: the prior exchange is already scrolled into the
+  // conversation and the bottom input box waits empty with a blinking cursor.
+  k.push(frame(chat(PRIOR_EXCHANGE, CURSOR), 900))
 
-  // Beat 2 — type the user's message character by character.
+  // Beat 2 — type the user's message character by character in the bottom input
+  // box (the conversation above is unchanged).
   for (let i = 1; i <= USER_MSG.length; i += 1) {
-    k.push(frame(chat([userLine(USER_MSG.slice(0, i) + CURSOR)]), 30))
+    k.push(frame(chat(PRIOR_EXCHANGE, USER_MSG.slice(0, i) + CURSOR), 30))
   }
-  k.push(frame(chat([userLine(USER_MSG + CURSOR)]), 450)) // hold the full line
-  k.push(frame(chat([userLine(USER_MSG)]), 350)) // "send" — cursor drops
+  k.push(frame(chat(PRIOR_EXCHANGE, USER_MSG + CURSOR), 450)) // hold the full line
+  // "Send" — the message jumps up into the conversation and the input clears.
+  k.push(frame(chat(SENT, ""), 350))
 
-  // Beat 3 — the orchestrator streams task creations one at a time. Reveal the
-  // narration, then each `Bash(shelbi task add …)` + `✓ … created` in turn.
-  k.push(frame(chat(chatUpTo(2)), 700)) // narration
-  k.push(frame(chat(chatUpTo(5)), 750)) // metrics-api-endpoint
-  k.push(frame(chat(chatUpTo(8)), 750)) // chart-components
-  k.push(frame(chat(chatUpTo(11)), 950)) // date-range-filter
+  // Beat 3 — the orchestrator streams task creations one at a time into the
+  // conversation area above the (now empty) input box. Reveal the narration,
+  // then each `Bash(shelbi task add …)` + `✓ … created` in turn.
+  k.push(frame(chat(streamUpTo(2), ""), 700)) // narration
+  k.push(frame(chat(streamUpTo(5), ""), 750)) // metrics-api-endpoint
+  k.push(frame(chat(streamUpTo(8), ""), 750)) // chart-components
+  k.push(frame(chat(streamUpTo(11), ""), 950)) // date-range-filter
 
   // Beat 4 — switch to Tasks; the three created tasks are already in BACKLOG.
   k.push(
@@ -245,18 +284,22 @@ function buildKeyframes(): Keyframe[] {
   k.push(frame(DISPATCHED, 950)) // date-range-filter → charlie; all dispatched
 
   // Beat 7 — observe a worker: focus alpha's Claude-Code pane on its task,
-  // running the test then landing green with the session footer.
+  // running the test then landing green with the session footer. The pane wears
+  // the same Claude-Code chrome as the orchestrator Chat — transcript above, an
+  // idle (empty) input box + footer below, titled with the worker's name.
   const worker = (lines: ChatLine[]): Partial<AppState> => ({
     ...DISPATCHED,
     activeView: "workspace",
     focusedWorkspace: "alpha",
     workspaceLines: lines,
+    chatInput: "",
   })
   k.push(frame(worker(WORKER_RUNNING), 1300))
   k.push(frame(worker(WORKER_DONE), 1900))
 
-  // Beat 8 — fade the frame out; wrapping to beat 1 (opacity 1) fades it back
-  // in on a fresh Chat view, so the loop is seamless.
+  // Beat 8 — fade the pane CONTENTS out (the window chrome stays static);
+  // wrapping to beat 1 (opacity 1) cross-fades the contents back in on a fresh
+  // Chat view, so the window sits still and its contents dissolve/reappear.
   k.push(frame(worker(WORKER_DONE), 650, 0))
 
   return k
@@ -312,7 +355,7 @@ export function HeroAnimation() {
   const kf = KEYFRAMES[index]
   return (
     <div ref={containerRef}>
-      <AppMockup state={kf.state} frameOpacity={kf.opacity} />
+      <AppMockup state={kf.state} contentOpacity={kf.opacity} />
     </div>
   )
 }
