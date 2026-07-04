@@ -8,15 +8,15 @@ A **workflow** is a YAML file that declares the statuses a task moves
 through, who owns each one, and what git side-effects fire on each
 transition. Every project ships with a `default` workflow that matches
 the canonical five-status board (`Backlog → Todo → InProgress → Review
-→ Done`). Drop another YAML next to it and you have a second pipeline —
+→ Done`). Drop another YAML next to it and you have a second pipeline:
 a docs-only flow, a research pipeline that never opens PRs, a
 feature-stacking flow whose tasks branch off a long-lived feature
 branch.
 
-Status *names* are user-facing labels — what shows up on the Kanban
+Status *names* are user-facing labels: what shows up on the Kanban
 card. Generic code (orchestrator auto-dispatch, Zen Mode's confidence
 bar, the events log, the activity feed) keeps working unchanged
-because every status maps to a small, closed set of **categories** —
+because every status maps to a small, closed set of **categories**:
 `backlog`, `ready`, `active`, `handoff`, `done`. Categories are the
 vocabulary the rest of the system reasons in.
 
@@ -31,8 +31,8 @@ Workflow files live at
 
 ## Schema
 
-A workflow is split across **two files**. Status *identity* — the stable
-`id`, the display `name`, and the `category` — is declared once in
+A workflow is split across **two files**. Status *identity* (the stable
+`id`, the display `name`, and the `category`) is declared once in
 `workflows/statuses.yaml`, the project-wide status catalog. Each workflow
 file then **references** statuses by `id` and adds only what's
 workflow-specific: the `owner`, and an optional `agent:`.
@@ -87,7 +87,7 @@ statuses:
 ```
 
 Why two files? A status's identity is project-wide, but its automation
-differs per workflow — the same `review` status can be owned by a human in
+differs per workflow. The same `review` status can be owned by a human in
 one workflow and handled by a `qa` agent in another. Declaring `name` and
 `category` once in `statuses.yaml` keeps those facts from drifting between
 workflow files; the loader **rejects** a workflow that repeats `name:` or
@@ -95,7 +95,7 @@ workflow files; the loader **rejects** a workflow that repeats `name:` or
 
 The required fields are `name` and `statuses` (at least one). Everything
 else is optional. A workflow without `transitions:` is a pure
-bookkeeping workflow — no git side-effects fire on any move.
+bookkeeping workflow: no git side-effects fire on any move.
 
 Validation runs at load time and catches status ids not declared in
 `statuses.yaml`, duplicate status ids, `initial_status` pointing at
@@ -105,7 +105,7 @@ message names the workflow and the bad field.
 
 ## Status categories
 
-Every status — default or custom — declares one of five categories:
+Every status, default or custom, declares one of five categories:
 
 | Category   | Semantic                                                            | Example status names                                  |
 | ---------- | ------------------------------------------------------------------- | ----------------------------------------------------- |
@@ -116,7 +116,7 @@ Every status — default or custom — declares one of five categories:
 | `done`     | Terminal — accepted, shipped.                                       | `Done`, `Shipped`, `Released`                         |
 
 The category set is **closed at five**. A workflow can't introduce a
-sixth — generic code (Zen Mode, activity feed, orchestrator routing)
+sixth. Generic code (Zen Mode, activity feed, orchestrator routing)
 keys off the category, and an unknown one would have nowhere to fit. A
 workflow *can* repeat a category, though: a long pipeline might have
 three `active` statuses (Design, Build, QA) with different owners.
@@ -128,7 +128,7 @@ names:
   is `agent`. It doesn't care whether you called the column `Todo` or
   `Ready` or `Next Up`.
 - The hub poller's review-marker promotion lands a task in the next
-  `handoff` status — same code path for `Review`, `QA`,
+  `handoff` status: the same code path for `Review`, `QA`,
   `Awaiting Sign-off`.
 - The activity feed renders an `active → handoff` move as
   "handed off" regardless of the actual status names involved.
@@ -139,7 +139,7 @@ See [events log line shape](/docs/concepts/events-log#task-transitions).
 
 ## Owners and agents
 
-Each status declares two things about who handles it — one required, one
+Each status declares two things about who handles it, one required, one
 optional:
 
 ```yaml
@@ -152,7 +152,7 @@ statuses:
   - { id: done,        owner: user }
 ```
 
-**`owner: user | agent`** — *who* the next mover is:
+**`owner: user | agent`** declares *who* the next mover is:
 
 - **`agent`** — the orchestrator is the next mover. Tasks sitting in an
   `agent`-owned `ready` status are eligible for auto-dispatch onto a free
@@ -161,15 +161,15 @@ statuses:
   move it, surfaced in the activity feed so you know your attention is
   requested.
 
-There's no third "either" — a status is either work the orchestrator will
+There's no third "either": a status is either work the orchestrator will
 pick up or work that waits for a human. If you want to grab an agent-owned
 task by hand, reassign it through the normal CLI/TUI; that's an action, not
 a schema field.
 
-**`agent: <agent-name>`** — *which* [agent](/docs/concepts/agents) role does
+**`agent: <agent-name>`** names *which* [agent](/docs/concepts/agents) role does
 the work, when `owner: agent`. Omit it and Shelbi derives a default from the
 category (`developer` for `active`, `orchestrator` for `ready`). Name
-one — `qa`, `security-review`, or any agent you've authored — and the
+one (`qa`, `security-review`, or any agent you've authored) and the
 orchestrator loads *that* role into the workspace it dispatches to. The
 `Review` status above is auto-handled by the `qa` agent before any human is
 involved; that's how "this status is reviewed by QA" becomes a line of YAML
@@ -184,19 +184,19 @@ names the workflow and status:
    references statuses by id; an id the catalog doesn't know about (a typo,
    a status you forgot to add) fails the load, and the error lists the
    available ids. Repeating an inline `name:` or `category:` in a workflow
-   file is rejected too — identity lives in the catalog, so the two files
+   file is rejected too. Identity lives in the catalog, so the two files
    can't drift.
 2. **`owner` is `user` or `agent`.** No other value parses, and a missing
-   `owner` is an error too — there's no implicit default.
+   `owner` is an error too. There's no implicit default.
 3. **An `agent`-owned status must name its `agent:`.** For the `ready` and
    `active` categories a bare `owner: agent` is accepted and defaults to
    `orchestrator` / `developer` (with a deprecation warning); any other
    category with `owner: agent` and no `agent:` fails the load.
 4. **A `user`-owned status may still name an `agent:`.** That declares
    "under [Zen Mode](/docs/concepts/zen-mode) this agent may act without
-   me" — it's how the shipped default lets the orchestrator handle
+   me". It's how the shipped default lets the orchestrator handle
    `Backlog` and `Review` under automation. Terminal statuses (`Done`,
-   `Canceled`) simply omit it — no automation path at all.
+   `Canceled`) simply omit it: no automation path at all.
 
 ### Zen as declarative data
 
@@ -209,15 +209,15 @@ a YAML edit:
 - **"Auto-merge but don't auto-promote."** Keep `Backlog` as
   `owner: user` (you still triage), but make the merge-bearing handoff
   status `owner: agent`. The orchestrator lands finished work without
-  touching your triage queue — no prompt surgery.
+  touching your triage queue. No prompt surgery.
 - **"Review with QA, sign off by hand."** Split the handoff into a
   `Review` status (`owner: agent, agent: qa`) and a `Signoff` status
   (`owner: user`), as in the example above. The QA pass is automated; the
   final accept stays human.
 
-The [judgment policy](/docs/concepts/zen-mode#the-judgment-layer) — *which*
+The [judgment policy](/docs/concepts/zen-mode#the-judgment-layer) (*which*
 backlog items are in scope to promote, and the confidence bar a merge must
-clear — still lives in the orchestrator's prompt, because it's a judgment
+clear) still lives in the orchestrator's prompt, because it's a judgment
 call. But the structural "is this status automated, and by whom" question is
 now answered declaratively in the workflow. See
 [Zen Mode](/docs/concepts/zen-mode#per-status-automation-is-declarative).
@@ -230,7 +230,7 @@ controls is what *happens* on the way. An undeclared edge is a pure
 status change with no git activity.
 
 Each transition lists actions in execution order. Failures
-short-circuit the rest — if `merge` fails, `delete_branch` does not
+short-circuit the rest: if `merge` fails, `delete_branch` does not
 run.
 
 | Action          | Effect                                                                                                                                                                                                |
@@ -239,7 +239,7 @@ run.
 | `open_pr`       | Open a PR. Base is `transition.target` if set, else the workflow's resolved `base_branch`, else the parent task's branch when `depends_on` is set. No-op if a PR is already open.                     |
 | `merge`         | Merge the task's branch with the effective `merge_strategy`. Via `gh pr merge` when a PR is open; via local `git merge` on the hub otherwise. v1 strategies: `squash`, `merge`.                       |
 | `close_pr`      | Close any open PR without merging.                                                                                                                                                                    |
-| `delete_branch` | Delete the local + remote branch. Skipped if a workspace still has the branch checked out — that worktree replaces the branch on its next dispatch.                                                   |
+| `delete_branch` | Delete the local + remote branch. Skipped if a workspace still has the branch checked out. That worktree replaces the branch on its next dispatch.                                                   |
 | `restack`       | Rebase the task's branch onto its parent task's current branch. Fires automatically on dependent tasks when a parent's `merge` completes (see [`depends_on`](#dependent-tasks-with-depends_on)).      |
 
 All actions are **hub-side** and idempotent. The orchestrator (or the
@@ -277,8 +277,8 @@ transitions:
     actions: [open_pr, merge]
 ```
 
-`target:` does **not** affect where new task branches are cut from —
-that's always the resolved `base_branch`. It only controls where
+`target:` does **not** affect where new task branches are cut from.
+That's always the resolved `base_branch`. It only controls where
 merges land for this particular hop.
 
 ### What fires Zen Mode's high-confidence bar
@@ -293,7 +293,7 @@ gate is action-based, not status-pair-based.
 
 ## The `branch:` task field
 
-Every task carries an optional `branch:` field in its frontmatter — the
+Every task carries an optional `branch:` field in its frontmatter: the
 name of the git branch the task operates on. Its presence at creation
 controls whether Shelbi cuts a fresh branch or uses an existing one.
 
@@ -326,7 +326,7 @@ branch: feature/auth-rewrite       # pre-existing — use this branch as-is
 ```
 
 Once populated, `branch:` is the source of truth for every subsequent
-action — `push_branch`, `open_pr`, `merge`, `delete_branch` all
+action: `push_branch`, `open_pr`, `merge`, and `delete_branch` all
 operate on it. Workflows don't carry a separate "what branch to ship"
 field; the task does.
 
@@ -394,7 +394,7 @@ Substitution rules:
 
 Tasks declare a `depends_on:` list in their frontmatter to express a
 parent/child relationship. This is how Graphite-style stacked PRs are
-modeled — task B builds on top of task A's branch, which builds on
+modeled: task B builds on top of task A's branch, which builds on
 `main`.
 
 ```markdown
@@ -421,7 +421,7 @@ Three behaviors fire when `depends_on:` is set:
    status. The Kanban renders blocked cards with a `🔒` badge; they
    sit in the `ready`-category column until their dependencies clear.
    This is the same gate the default workflow's `Todo` status applies
-   to dependent tasks — see the
+   to dependent tasks. See the
    [lifecycle walkthrough](#lifecycle-who-moves-a-task-between-the-default-statuses)
    above.
 2. **Branch cut from the parent.** When the dependent task transitions
@@ -430,7 +430,7 @@ Three behaviors fire when `depends_on:` is set:
    `base_branch`). The child branch is still named conventionally
    (`shelbi/<child-task-id>`).
 3. **PR base is the parent.** When the dependent task's `open_pr`
-   action runs, the PR's base is the parent task's branch — not the
+   action runs, the PR's base is the parent task's branch, not the
    workflow's `base_branch`.
 
 A fourth behavior fires *on the parent*:
@@ -487,20 +487,20 @@ statuses:
   - { id: done,        owner: user }
 ```
 
-This makes the default an editable file rather than implicit behavior
-— you can rename `Todo` to `Ready` in `statuses.yaml` without breaking
+This makes the default an editable file rather than implicit behavior.
+You can rename `Todo` to `Ready` in `statuses.yaml` without breaking
 anything, since the rest of the system reasons in categories.
 
 If a project has no `workflows/` directory at all (legacy state),
 Shelbi auto-generates `default.yaml` on first load. Existing task files
-are not modified — a task with no `workflow:` field is treated as
+are not modified. A task with no `workflow:` field is treated as
 belonging to the default workflow, so there's nothing to backfill.
 
 The shipped default omits `transitions:` for a reason: a workflow with
 no transitions block falls back to the legacy 5-status convention for
 Zen Mode's merge-bar trigger (a task in `Review` trips the bar). Once
 you declare a `transitions:` block, the trigger becomes
-action-based exclusively — any edge whose actions include `merge`.
+action-based exclusively: any edge whose actions include `merge`.
 
 ### Lifecycle: who moves a task between the default statuses
 
@@ -524,7 +524,7 @@ default workflow legible at a glance:
   `Todo` (or a workspace frees up), the orchestrator routes it to a
   free workspace. This is the auto-dispatch loop. A task is **blocked**
   and skipped while any id in [`depends_on:`](#dependent-tasks-with-depends_on)
-  is not yet in a `done`-category status — the Kanban shows blocked
+  is not yet in a `done`-category status. The Kanban shows blocked
   cards with a `🔒` badge.
 - **`InProgress → Review` — hub poller.** Promoted automatically the
   moment the workspace writes its review-ready marker (see
@@ -533,12 +533,12 @@ default workflow legible at a glance:
 - **`Review → Done` — you.** Accepting a diff is the moment the human
   signs off on the work. The orchestrator never crosses this edge on
   its own (except under specific multi-task loops the user has
-  authorized — typically via [Zen Mode's auto-merge](/docs/concepts/zen-mode#the-high-confidence-bar)).
+  authorized, typically via [Zen Mode's auto-merge](/docs/concepts/zen-mode#the-high-confidence-bar)).
 
 The pattern generalizes: **you own the intent boundaries (triage and
 accept), the system handles the mechanical middle**. A custom
 workflow that swaps `Review` for `QA` + `Awaiting Sign-off` doesn't
-change the principle — anywhere `owner: user` sits, the orchestrator
+change the principle: anywhere `owner: user` sits, the orchestrator
 waits for you.
 
 ### Review-marker promotion
@@ -565,14 +565,14 @@ The orchestrator hears about it through its `shelbi events tail
 workspace.
 
 That this works without the workspace holding any Shelbi-specific state
-is the point. The marker is the *entire* on-workspace protocol — see the
+is the point. The marker is the *entire* on-workspace protocol. See the
 [workspaces concept page](/docs/concepts/workspaces#how-a-task-completes)
 for the rationale and the [reason strings reference](/docs/concepts/events-log#reason-strings)
 for the full set of tokens.
 
 ## A worked example: stacked feature branches
 
-The full picture — two workflows working together to ship a multi-task
+The full picture: two workflows working together to ship a multi-task
 feature.
 
 `workflows/feature-task.yaml`:
@@ -624,7 +624,7 @@ transitions:
 ```
 
 Now tasks in `feature-task` carry `feature: auth-rewrite` in their
-frontmatter — `feature-task`'s `base_branch` resolves to
+frontmatter, so `feature-task`'s `base_branch` resolves to
 `feature/auth-rewrite`, and the orchestrator cuts each task branch off
 it at dispatch. A second feature's tasks carry `feature: dashboard-v2`.
 Same workflow file, two concurrent stacks.
@@ -632,7 +632,7 @@ Same workflow file, two concurrent stacks.
 When auth-rewrite is ready to ship, create a task in `feature-release`
 with `branch: feature/auth-rewrite` pre-filled. Because `branch:` is
 set, the orchestrator skips the "cut a new branch" step and operates
-directly on the feature branch — one PR-and-merge cycle lands the
+directly on the feature branch. One PR-and-merge cycle lands the
 whole feature into `main`.
 
 ## CLI reference
@@ -651,7 +651,7 @@ whole feature into `main`.
 ## See also
 
 - [Workflow config](/docs/configuration/workflow) and
-  [Statuses](/docs/configuration/statuses) — the field-by-field YAML
+  [Statuses](/docs/configuration/statuses): the field-by-field YAML
   reference for the files this page explains conceptually.
 - [Workspaces](/docs/concepts/workspaces) — what's on the receiving end
   of an `active`-category dispatch, and the review-marker mechanism

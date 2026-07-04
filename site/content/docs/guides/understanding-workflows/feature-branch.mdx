@@ -7,7 +7,7 @@ summary: Branch per task off main, open a PR, merge back. This is the default Sh
 **Feature-branch** (a.k.a. GitHub-flow) is the simplest durable model:
 `main` is always deployable, every task cuts a short branch off it, opens
 a pull request, and merges back. There are no long-lived integration
-branches — the PR *is* the integration point.
+branches. The PR *is* the integration point.
 
 This is the model Shelbi's [`default` workflow](/docs/guides/getting-started/workflows#default-workflow)
 already implements, so this guide doubles as a full annotation of the
@@ -88,8 +88,8 @@ pushed and PR'd on the way to **Review**, and squash-merged back into
 
 ## The workflow
 
-Status identity — the stable `id`, the display `name`, and the
-`category` — lives once in `workflows/statuses.yaml`, the project-wide
+Status identity (the stable `id`, the display `name`, and the
+`category`) lives once in `workflows/statuses.yaml`, the project-wide
 [status catalog](/docs/guides/getting-started/workflows#schema). Every workflow file
 then references those statuses by `id` and adds only what's
 workflow-specific (`owner`, and an optional `agent:`). The shipped
@@ -106,7 +106,7 @@ statuses:
   - { id: canceled,    name: Canceled,    category: archived }
 ```
 
-The default workflow references them by `id` — no `name:` or `category:`
+The default workflow references them by `id`. No `name:` or `category:`
 is repeated here (the loader rejects a workflow file that does):
 
 ```yaml
@@ -149,12 +149,12 @@ Nothing here overrides the project git defaults, so branches cut off
 `main` and merges land back on `main`. The `open_pr` action opens the PR
 with `main` as its base because no transition declares a
 [`target:`](/docs/guides/getting-started/workflows#per-transition-target). The
-`user`-owned `review` status still names `agent: orchestrator` — that's
+`user`-owned `review` status still names `agent: orchestrator`. That's
 what lets [Zen Mode](/docs/concepts/zen-mode) land the merge without you.
 
 ## Orchestrator adjustments
 
-None. This is the shape the shipped orchestrator prompt already assumes —
+None. This is the shape the shipped orchestrator prompt already assumes:
 triage into `Backlog`, dispatch `Todo`, hand off to `Review` on the
 [review marker](/docs/guides/getting-started/workflows#review-marker-promotion), and
 leave the `Review → Done` accept to you. If you turn on

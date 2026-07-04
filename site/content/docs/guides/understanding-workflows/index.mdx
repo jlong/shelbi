@@ -5,9 +5,9 @@ summary: Deep-dives that map a well-known git branching model — trunk-based, g
 ---
 
 These are reference deep-dives for readers who already know the workflow
-basics. If a Shelbi Workflow — the per-project YAML that declares the
+basics. If a Shelbi Workflow (the per-project YAML that declares the
 statuses a task moves through and the git side-effects that fire on each
-transition — is new to you, start with
+transition) is new to you, start with
 **[Workflows](/docs/guides/getting-started/workflows)** for the fundamentals, then come
 back here.
 
@@ -21,7 +21,7 @@ route and merge the way that model expects.
 ## The models
 
 Read **[Feature-branch](/docs/guides/understanding-workflows/feature-branch)**
-first — it's the model Shelbi ships by default, written out in full, and
+first. It's the model Shelbi ships by default, written out in full, and
 the other three guides are described as deltas from it.
 
 | Model | Shape | Guide |
@@ -33,8 +33,8 @@ the other three guides are described as deltas from it.
 
 <Callout type="note" title="Statuses are defined once, referenced by id">
 
-Every guide shows two YAML shapes. Status *identity* — `id`, `name`, and
-`category` — is declared once in `workflows/statuses.yaml`, the
+Every guide shows two YAML shapes. Status *identity* (`id`, `name`, and
+`category`) is declared once in `workflows/statuses.yaml`, the
 project-wide status catalog. Each workflow file **references** statuses by
 `id` and adds only its `owner` and optional `agent:`; it never repeats
 `name:` or `category:` (the loader rejects a workflow that does). See

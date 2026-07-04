@@ -5,7 +5,7 @@ summary: Fill the backlog, promote a stack of cards, and watch the orchestrator 
 ---
 
 One task at a time is the on-ramp. The reason Shelbi exists is the
-other direction — half a dozen workspaces all running in their own
+other direction: half a dozen workspaces all running in their own
 worktrees, the orchestrator keeping every free slot loaded with the
 next ready card. This page walks the loop end-to-end.
 
@@ -31,12 +31,12 @@ echo      devbox                       idle
 foxtrot   devbox                       idle
 ```
 
-Every row should show `idle` under `STATE`, with empty `MODEL`/`AGENT` —
-nothing is loaded yet. If a pane is dead, jump to the workspace (`Enter`
+Every row should show `idle` under `STATE`, with empty `MODEL`/`AGENT`.
+Nothing is loaded yet. If a pane is dead, jump to the workspace (`Enter`
 on its sidebar row): the session may have stalled on a permission dialog,
 and resolving it puts the workspace back in the rotation.
 
-You want at least three free slots to see the loop do its job — two cards
+You want at least three free slots to see the loop do its job. Two cards
 on a one-slot pool is a queue, not a loop.
 
 ## Queue up a stack of work
@@ -65,7 +65,7 @@ shelbi task add "Tighten the rate-limit error copy"
 ```
 
 Each lands in `backlog` as its own markdown card under
-`~/.shelbi/projects/<name>/tasks/`. Nothing dispatches yet — the
+`~/.shelbi/projects/<name>/tasks/`. Nothing dispatches yet. The
 backlog is still your triage queue.
 
 ### Route a task to a specific machine
@@ -85,7 +85,7 @@ task becomes ready, the card stays in `todo`.
 <Callout type="note" title="A machine preference is never overridden silently">
 
 Shelbi will not re-route a `--prefers-machine` task to the hub just because
-the preferred machine is busy — it parks the card in `todo` and waits. Free
+the preferred machine is busy. It parks the card in `todo` and waits. Free
 a workspace on that machine, or drop the preference, to get it moving.
 
 </Callout>
@@ -113,7 +113,7 @@ Promotion is the start signal. Move all three cards into **todo** in
 the order you want them picked up:
 
 - **From the Kanban view** — `Ctrl+P` → Tasks, then `H`/`L` to walk
-  cards into the next column. `K`/`J` to reorder within `todo` — the
+  cards into the next column. `K`/`J` to reorder within `todo`. The
   orchestrator dispatches from the top.
 - **From the orchestrator** — just ask:
 
@@ -136,7 +136,7 @@ and triggers an immediate dispatch attempt.
 ## Watch the loop in action
 
 Within a second or two, the sidebar lights up. Workspace badges flip
-from `·` to `⏵` in YAML declaration order — `alpha`, then `bravo`,
+from `·` to `⏵` in YAML declaration order: `alpha`, then `bravo`,
 then `charlie`, until either the `todo` column is empty or every
 workspace is busy. The sidebar groups slots under the machine they're
 pinned to, and each busy row shows the agent it's running:
@@ -200,8 +200,8 @@ To see the raw stream, open a second pane and tail the log:
 shelbi events tail --follow
 ```
 
-You'll see the column moves and the workspace state changes interleaved
-— exactly what the orchestrator is reacting to (the `worker=` token on
+You'll see the column moves and the workspace state changes interleaved,
+exactly what the orchestrator is reacting to (the `worker=` token on
 those lines is the retained backward-compatible spelling):
 
 ```
@@ -243,7 +243,7 @@ Open the review:
 Shelbi checks the branch out into the project's working directory on
 the machine that ran the task and spawns a fresh agent session pointed
 at the diff. Ask it to walk you through the change, run tests, or
-request edits — the workspace that produced the branch is busy on
+request edits. The workspace that produced the branch is busy on
 something else, but the review pane is its own conversation in the
 same worktree.
 
@@ -261,7 +261,7 @@ Mode](/docs/guides/getting-started/enable-zen-mode).
 
 While you've been reviewing, the orchestrator has been working the
 backlog. By the time you finish accepting one branch, two more may be
-in review. The board state is the single source of truth — the
+in review. The board state is the single source of truth: the
 sidebar mirrors it, the events log records every move, and the
 orchestrator keeps every free slot loaded.
 
@@ -279,7 +279,7 @@ intent for breakage:
   workspace on the target machine (kill another task, or remove the
   preference).
 - **The workspace's pane died.** The orchestrator surfaces it
-  (`worker=<name> pane_alive=false` — the retained backward-compatible
+  (`worker=<name> pane_alive=false`, the retained backward-compatible
   token) and waits for you. Re-launch with `Enter` on the workspace
   row, or `shelbi workspace stop <name>` to release the in-flight task
   back to `todo`.
@@ -288,15 +288,15 @@ intent for breakage:
   back-to-back dispatches that would talk over you. The next event
   resumes the loop.
 
-Everything else — diff size, branch contents, file ownership — is the
+Everything else (diff size, branch contents, file ownership) is the
 orchestrator's job to figure out from the prompt. Move the card and
 move on.
 
 ## Next
 
 The orchestrator is now keeping every workspace fed without your
-involvement past triage and review. Reviewing a diff is one thing —
-the next step is *running* the change: [set up review
+involvement past triage and review. Reviewing a diff is one thing.
+The next step is *running* the change: [set up review
 workspaces](/docs/guides/getting-started/review-workspaces) to load a
 finished branch onto a live dev server and click through it before you
 accept. After that, [enable Zen Mode](/docs/guides/getting-started/enable-zen-mode)

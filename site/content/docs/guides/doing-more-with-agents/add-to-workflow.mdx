@@ -6,7 +6,7 @@ summary: Declare an adversarial-review status in statuses.yaml, reference it fro
 
 The [agent exists](/docs/guides/doing-more-with-agents/adversarial-review-agent);
 now give it a status to own. Wiring a new agent into a workflow is two
-files — the status *identity* is declared once in `statuses.yaml`, and the
+files: the status *identity* is declared once in `statuses.yaml`, and the
 workflow file *references* it by `id`, adds an `owner`, and points it at the
 agent. Keep that split correct: repeating `name:` or `category:` in the
 workflow file fails the load.
@@ -15,7 +15,7 @@ workflow file fails the load.
 
 Add the status to the project-wide catalog in
 [`workflows/statuses.yaml`](/docs/configuration/statuses), placed where you
-want its column to sit — between `in-progress` and `review`:
+want its column to sit, between `in-progress` and `review`:
 
 ```yaml
 # workflows/statuses.yaml
@@ -29,7 +29,7 @@ statuses:
 ```
 
 `category` comes from the
-[closed vocabulary](/docs/configuration/statuses#categories) —
+[closed vocabulary](/docs/configuration/statuses#categories):
 `backlog`, `ready`, `active`, `handoff`, `done`, `archived`. Because an
 agent is *actively working* the review while a task sits here, it's
 `active`, not `handoff`: `handoff` means "one owner finished, another's
@@ -56,7 +56,7 @@ statuses:
 `owner: agent` makes the status the orchestrator's to act on, so tasks
 that land here are [auto-dispatched](/docs/concepts/orchestrator); the
 `agent: adversarial-review` field names *which* agent runs it. No `name:`
-or `category:` appears here — those live in `statuses.yaml` and repeating
+or `category:` appears here. Those live in `statuses.yaml`, and repeating
 them fails the load.
 
 ## 3. Rewire the transitions
@@ -64,7 +64,7 @@ them fails the load.
 [Transitions](/docs/configuration/workflow#transitions) declare the
 hub-side side-effects that fire on an edge; unlisted edges are pure status
 changes. Route the developer's branch into adversarial review, then on to
-human review, with a bounce-back for when the skeptic finds problems — and
+human review, with a bounce-back for when the skeptic finds problems, and
 keep `merge` on the single final edge into `done`:
 
 ```yaml
@@ -78,15 +78,15 @@ transitions:
 What each edge does:
 
 - **`in-progress → adversarial-review`** runs `push_branch` and `open_pr`,
-  so the branch is on the remote with a PR open before the reviewer starts —
-  the reviewer works against a real diff, and its findings have somewhere to
+  so the branch is on the remote with a PR open before the reviewer starts.
+  The reviewer works against a real diff, and its findings have somewhere to
   land.
 - **`adversarial-review → review`** has no actions: the branch is already
   pushed and PR'd, so promoting a clean pass to human review is a pure
   status change.
 - **`adversarial-review → in-progress`** is the bounce-back. When the
   skeptic files blockers, the task drops to the developer with no git
-  side-effects — same branch, same PR, another pass.
+  side-effects: same branch, same PR, another pass.
 - **`review → done`** is the only edge carrying `merge` (and
   `delete_branch`). That's deliberate.
 
@@ -98,7 +98,7 @@ local and remote branch).
 <Callout type="note" title="Keep merge on the final edge">
 
 `merge` trips [Zen Mode's high-confidence bar](/docs/concepts/zen-mode).
-Keeping it on the single `review → done` edge — and nowhere earlier — means
+Keeping it on the single `review → done` edge, and nowhere earlier, means
 the automated reviewer never lands code. It surfaces findings; the human
 still owns the accept.
 

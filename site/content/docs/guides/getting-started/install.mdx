@@ -6,7 +6,7 @@ summary: Hosted install script and manual source install, both build with cargo,
 
 <CopyPromptBanner prompt="Install Shelbi on my machine. It builds from source with cargo — there's no prebuilt binary. First make sure I have a Rust toolchain (rustup), tmux 3.2 or later, and at least one authenticated agent CLI (claude or codex). Then run the hosted install script: curl -fsSL https://shelbi.dev/install.sh | sh. Finally verify with `shelbi --version` and make sure the install path (~/bin by default) is on my PATH." />
 
-Shelbi builds from source with `cargo` — there's no prebuilt binary
+Shelbi builds from source with `cargo`. There's no prebuilt binary
 today. The hosted install script does the clone-and-build for you:
 
 <InstallCommand />
@@ -21,15 +21,15 @@ manually](#install-from-source-manually) instead.
 You need three things before you start:
 
 - **A Rust toolchain.** Every install path builds from source. The
-  workspace targets the stable channel — install it with
+  workspace targets the stable channel. Install it with
   [rustup](https://rustup.rs) if you don't already have it.
 - **`tmux` 3.2 or later.** Shelbi runs every workspace inside a tmux pane
   and drives it with `send-keys` / `capture-pane`; older releases miss
   features the TUI relies on.
 - **An agent CLI.** At least one of `claude`
   ([Claude Code](https://docs.claude.com/en/docs/claude-code)) or `codex`,
-  installed and authenticated. Declare more than one later — the project
-  YAML picks per workspace.
+  installed and authenticated. Declare more than one later, and the
+  project YAML picks per workspace.
 
 Install `tmux` with your package manager:
 
@@ -63,8 +63,8 @@ run on, plus an `ssh` host you can reach without a password prompt.
 ## Install from source manually
 
 The hosted script discards its temp clone after the build. To keep the
-checkout around — to rebuild after pulling updates, or to hack on Shelbi
-itself — clone it to a permanent path and run the same script directly:
+checkout around (to rebuild after pulling updates, or to hack on Shelbi
+itself), clone it to a permanent path and run the same script directly:
 
 ```bash
 git clone https://github.com/jlong/shelbi.git
@@ -79,7 +79,7 @@ The script runs `cargo build --release` and copies the binary to
 SHELBI_INSTALL_PATH=/usr/local/bin/shelbi ./scripts/install.sh
 ```
 
-Re-run it any time you pull updates — one step rebuilds and reinstalls.
+Re-run it any time you pull updates. One step rebuilds and reinstalls.
 The orchestrator and workspace panes re-shell into `shelbi` on every call,
 so they pick up the new binary automatically; only the sidebar, Tasks, and
 Review views need a manual `shelbi reload` to respawn against the new build.
@@ -97,7 +97,7 @@ codesign --sign - "$INSTALL_PATH"
 
 `cargo build` embeds an ad-hoc signature; `cp` invalidates it, and the
 next exec dies with `Killed: 9` and no useful error. Re-signing after the
-copy restores it. `scripts/install.sh` does this for you — you only hit
+copy restores it. `scripts/install.sh` does this for you, so you only hit
 the failure if you copy the binary out of `target/release/` by hand.
 Linux and Windows don't need it, and the script skips it there.
 
@@ -110,7 +110,7 @@ shelbi --version
 ```
 
 You should see the installed version. If the shell can't find the binary,
-the install path isn't on your `PATH` — see below.
+the install path isn't on your `PATH`. See below.
 
 ## Troubleshooting
 

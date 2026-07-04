@@ -5,13 +5,13 @@ summary: "Declare a review workspace, hand it a finished branch, and click throu
 ---
 
 The [multi-workspace loop](/docs/guides/getting-started/multi-workspace) gets
-finished branches back to you — but reading a diff isn't the same as *running*
+finished branches back to you. But reading a diff isn't the same as *running*
 the change. Most real review of an app or a site means booting the dev server,
 opening a URL, and clicking through it. A **review workspace** is the pool slot
 that does exactly that: it loads a finished task's branch, installs and builds
 it, and serves it on a port so you can inspect the running app.
 
-This page walks the whole flow end to end — declare the slot, reload, get a
+This page walks the whole flow end to end: declare the slot, reload, get a
 task to the review status, load it, open the served URL, and accept or bounce.
 For the model underneath it (ports, the `review:` config block, the Review
 agent, the load → serve lifecycle), see the reference:
@@ -20,7 +20,7 @@ agent, the load → serve lifecycle), see the reference:
 <Callout type="note" title="You need a working pool first">
 
 This page assumes you already have a project with a workspace pool and can
-promote a task through the board — the [first task](/docs/guides/getting-started/first-task)
+promote a task through the board. The [first task](/docs/guides/getting-started/first-task)
 and [multi-workspace](/docs/guides/getting-started/multi-workspace) pages get
 you there. A review workspace is an *addition* to that pool, not a replacement.
 
@@ -32,9 +32,9 @@ you there. A review workspace is an *addition* to that pool, not a replacement.
 <Step title="Declare a review workspace">
 
 A review workspace is an ordinary `workspaces:` entry with one extra key:
-`role: review`. Open your project's YAML — `~/.shelbi/projects/<name>.yaml` in
+`role: review`. Open your project's YAML (`~/.shelbi/projects/<name>.yaml` in
 [global mode](/docs/concepts/config-modes), `<repo>/.shelbi/project.yaml`
-in-repo — and add one to the pool:
+in-repo) and add one to the pool:
 
 ```yaml
 workspaces:
@@ -52,7 +52,7 @@ slots their own machines carry.
 <Callout type="warning" title="Two review workspaces per machine, max">
 
 Review workspaces are **scarce by design: 1–2 per machine**, because each one
-may hold a running server bound to a port. That's a hard invariant — the config
+may hold a running server bound to a port. That's a hard invariant: the config
 loader refuses to start a project that declares a third review slot on any one
 machine. One is plenty to start with. See [the scarcity
 invariant](/docs/concepts/review-workspaces#the-scarcity-invariant) for why.
@@ -62,8 +62,8 @@ invariant](/docs/concepts/review-workspaces#the-scarcity-invariant) for why.
 Most projects need nothing else: the Review agent auto-detects how to install,
 build, and serve from your project shape (`package.json`, `Cargo.toml`, a
 `Makefile`, a `Procfile`). If yours needs explicit commands or a non-default
-port, add a [`review:` block](/docs/concepts/review-workspaces#the-review-config-block)
-— but leave it out until you find you need it.
+port, add a [`review:` block](/docs/concepts/review-workspaces#the-review-config-block),
+but leave it out until you find you need it.
 
 </Step>
 <Step title="Reload to pick it up">
@@ -78,22 +78,22 @@ machine and reading `idle` until a task loads onto it.
 </Step>
 <Step title="Get a task to the review status">
 
-Run a task the way you normally would — promote a card and let a dev workspace
+Run a task the way you normally would: promote a card and let a dev workspace
 pick it up, or dispatch one through the orchestrator. When the dev workspace
 finishes it writes its review-ready marker; the hub poller rebases the branch
 onto the base branch and moves the task into the **Review** status. (That
 `handoff`-category status is a [workflow](/docs/guides/getting-started/workflows)
-concept — the board column a task sits in awaiting human input.)
+concept: the board column a task sits in awaiting human input.)
 
-The finishing dev workspace then closes its own session and returns to `idle` —
-it doesn't linger. Its work is now waiting to be *run*, not edited.
+The finishing dev workspace then closes its own session and returns to `idle`.
+It doesn't linger. Its work is now waiting to be *run*, not edited.
 
 </Step>
 <Step title="Load it onto a review workspace">
 
 If your project declares any review workspace, the **orchestrator auto-loads**
-the task onto a free review slot the moment it reaches the review status — the
-same path you can trigger by hand:
+the task onto a free review slot the moment it reaches the review status. It's
+the same path you can trigger by hand:
 
 ```bash
 shelbi review dark-mode-toggle-polish
@@ -109,7 +109,7 @@ probe, and posts a "ready" note with the URL. When a slot is free you'll see:
 ```
 
 If every review slot on the machine is already busy, nothing fails and nothing
-is preempted — the task waits in Review, marked *pending-load*, and the command
+is preempted. The task waits in Review, marked *pending-load*, and the command
 reports its queue position:
 
 ```text
@@ -122,7 +122,7 @@ It will load automatically when a review workspace frees.
 
 Review workspaces are the only review surface. `shelbi review <id>` on a
 project that declares none gives a loud onboarding error telling you to add a
-`role: review` slot and reload — it never silently falls back. See
+`role: review` slot and reload. It never silently falls back. See
 [`shelbi review`](/docs/cli/review) for the full command reference.
 
 </Callout>
@@ -131,7 +131,7 @@ project that declares none gives a loud onboarding error telling you to add a
 <Step title="Open the served URL and click through">
 
 Select the task under **Ready for Review** in the sidebar (or press `Enter` on
-its review-workspace row) to focus that workspace's window — the managed server
+its review-workspace row) to focus that workspace's window. The managed server
 pane sits beside the agent pane. Open the served URL,
 `http://localhost:3000` here, and click through the running change the way a
 user would.
@@ -172,7 +172,7 @@ user would.
 />
 
 The Review agent's charter is narrow: **load and serve, don't code.** It won't
-modify the branch or move the card — the one exception is if you explicitly ask
+modify the branch or move the card. The one exception is if you explicitly ask
 for a tweak ("bump the header padding"), which it makes in place and refreshes.
 
 </Step>
@@ -220,8 +220,8 @@ slots per machine, the queue is where you see review pressure build.
 
 ## Next
 
-Routing a task onto a review workspace is the *human* path — the whole point is
-human eyes on the running app — so a review-loaded task is deliberately **not**
+Routing a task onto a review workspace is the *human* path: the whole point is
+human eyes on the running app. So a review-loaded task is deliberately **not**
 eligible for Zen Mode's auto-merge. When you're ready to hand the orchestrator
 the cases it *can* judge on its own,
 [enable Zen Mode](/docs/guides/getting-started/enable-zen-mode) to auto-promote

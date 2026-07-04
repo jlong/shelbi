@@ -5,14 +5,14 @@ summary: Contributions arrive as pull requests from forks, and a review gate sta
 ---
 
 In the **forking workflow** contributors don't push to the canonical
-repository at all — they fork it, work on their own copy, and open a pull
+repository at all. They fork it, work on their own copy, and open a pull
 request from the fork. The maintainer's job is a *review gate*: triage
 what comes in, run it through checks, and merge only what clears sign-off.
 It's the model most open-source projects run.
 
 Shelbi models the **maintainer's side**. Because the branch lives on
-someone else's fork, Shelbi doesn't cut branches or push here — each task
-carries the fork's PR branch in [`branch:`](/docs/guides/getting-started/workflows#the-branch-task-field)
+someone else's fork, Shelbi doesn't cut branches or push here. Each task
+carries the fork's PR branch in [`branch:`](/docs/guides/getting-started/workflows#the-branch-task-field),
 and the workflow is mostly about the gate: a `handoff` sign-off status
 that's `owner: user` so nothing reaches `main` without a human (or a
 [Zen](/docs/concepts/zen-mode)-authorized reviewer agent) accepting it.
@@ -91,8 +91,8 @@ in **Sign-off** for a maintainer to accept before it's **Merged**.
 
 The forking flow relabels the whole board, so declare its statuses (`id`
 + `name` + `category`) in the project's
-[status catalog](/docs/guides/getting-started/workflows#schema) first —
-`workflows/statuses.yaml` — then reference them by `id` from the workflow:
+[status catalog](/docs/guides/getting-started/workflows#schema) first
+(`workflows/statuses.yaml`), then reference them by `id` from the workflow:
 
 ```yaml
 # workflows/statuses.yaml — the forking project's status catalog.
@@ -144,13 +144,13 @@ Two side-effects that the [feature-branch](/docs/guides/understanding-workflows/
 model uses are deliberately *absent* here:
 
 - **No `open_pr`.** The contributor already opened the PR from their fork.
-  The task just tracks it — pre-fill `branch:` with the PR's head ref so
+  The task just tracks it. Pre-fill `branch:` with the PR's head ref so
   `merge` and `close_pr` act on the right PR.
 - **No `delete_branch`.** Shelbi can't delete a branch it doesn't own. The
   fork keeps its branch whether the PR merges or is declined.
 
 The `in-review` status names an [`agent: reviewer`](/docs/concepts/agents)
-role — an agent you author to run the untrusted contribution through the
+role, an agent you author to run the untrusted contribution through the
 project's checks and summarize risk before a human ever looks. The
 `sign-off` status stays `owner: user`: the gate is the whole point.
 
