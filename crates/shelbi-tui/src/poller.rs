@@ -62,7 +62,7 @@ use std::time::{Duration, Instant, SystemTime};
 
 use chrono::{DateTime, Utc};
 
-use shelbi_core::{Column, Project};
+use shelbi_core::{default_workflow, Column, Project, StatusCategory, Workflow};
 use shelbi_orchestrator::supervision::{SupervisionAction, SupervisionInputs, SupervisionState};
 use shelbi_state::{
     append_contextstore_event, append_heartbeat_event, append_rebase_event,
@@ -513,6 +513,14 @@ fn poll_one(
     // just promoted can close its own session immediately (spec §16).
     maybe_promote_to_review(project, workspace, machine, &host, &addr);
 
+    // Agent-initiated status transition (bounce / send-back). A reviewer or
+    // gate agent writes a transition marker naming its own task and a target
+    // status; the poller validates the requested edge against the workflow and,
+    // if allowed, applies it. Checked right after the forward review handoff and
+    // independently of the pane title, for the same reason: nothing the agent's
+    // UI does can hide a file-based signal.
+    maybe_apply_transition(project, workspace, machine, &host, &addr);
+
     // Reaper sweep (spec §10): a review workspace with a live server pane but
     // no active task has leaked its bound port, which blocks the next
     // dispatch onto that slot. Runs every poll as the heartbeat backstop for a
@@ -927,6 +935,288 @@ fn maybe_promote_to_review(
 
     if let Err(e) = shelbi_orchestrator::workspace::clear_review_marker(host, &marker) {
         tracing::warn!(workspace = %workspace.name, error = %e, "clear_review_marker failed");
+    }
+}
+
+/// The board move an agent-transition request resolves to, or the reason it was
+/// refused. Pure data produced by [`decide_transition`] so the validation +
+/// resolution logic is unit-testable without touching disk.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum TransitionDecision {
+    /// The requested edge is allowed. Move the task to `to_column` and fire the
+    /// `from_status -> to_status` edge's declared actions. `from_status` /
+    /// `to_status` are the workflow status ids (verb expanded), needed to look
+    /// up the edge's `actions:`.
+    Apply {
+        from_status: String,
+        to_status: String,
+        to_column: Column,
+    },
+    /// The request is refused — `reason` is a short token for the log. The task
+    /// is NOT moved; the marker is still consumed so a persistently-illegal
+    /// request doesn't re-log every tick.
+    Reject { reason: &'static str },
+}
+
+/// Map a workflow [`StatusCategory`] onto the legacy [`Column`] a task's
+/// position is actually stored in. The 5-column model has no dedicated
+/// `Archived` lane, so a terminal `archived` status folds onto `Done` (both are
+/// terminal and non-dispatchable) — the closest faithful home in the current
+/// storage model. This is the inverse of [`Column::category`].
+fn column_for_category(category: StatusCategory) -> Column {
+    match category {
+        StatusCategory::Backlog => Column::Backlog,
+        StatusCategory::Ready => Column::Todo,
+        StatusCategory::Active => Column::InProgress,
+        StatusCategory::Handoff => Column::Review,
+        StatusCategory::Done | StatusCategory::Archived => Column::Done,
+    }
+}
+
+/// Resolve the workflow status id a task in `current_column` currently occupies.
+/// Mirrors the orchestrator's `resolve_task_status` (and the TUI's
+/// `resolve_task_status`): prefer an id match on the column's canonical status
+/// id, then fall back to the first status sharing the column's category (so a
+/// workflow that renamed `review` to `qa` still resolves), and finally to the
+/// canonical id string when the workflow declares nothing compatible.
+fn resolve_current_status_id(workflow: &Workflow, current_column: Column) -> String {
+    let canonical = current_column.default_status_id();
+    if workflow.status(canonical).is_some() {
+        return canonical.to_string();
+    }
+    let cat = current_column.category();
+    workflow
+        .statuses
+        .iter()
+        .find(|s| s.category == cat)
+        .map(|s| s.id.clone())
+        .unwrap_or_else(|| canonical.to_string())
+}
+
+/// Pure core of the agent-transition handler. Given the task's current column,
+/// its workflow, and the raw target the agent wrote (a status id, or the
+/// `reject` / `bounce` verb sugar), decide whether the requested edge is legal
+/// and where it lands.
+///
+/// Validation, in order:
+///
+/// 1. **Verb expansion.** `reject` / `bounce` resolve to the workflow's
+///    designated active (`active`-category) status — the "send it back to be
+///    reworked" target. A workflow with no active status can't be bounced into,
+///    so the request is refused.
+/// 2. **Target must be declared.** The resolved target must be a status id the
+///    workflow declares.
+/// 3. **Edge must be permitted.** If the workflow declares a `transitions:`
+///    block, the `current -> target` edge must appear in it — agents may only
+///    take edges the workflow author sanctioned. With no `transitions:` block,
+///    moves are any-to-any (both statuses just have to be declared), matching
+///    [`Workflow::transition_allowed`].
+/// 4. **Must actually move.** The 5-column store can't represent a move between
+///    two statuses that share a column, so a target resolving to the current
+///    column is refused as a no-op (guarding against unassigning a task that
+///    wouldn't actually change lanes).
+fn decide_transition(
+    workflow: &Workflow,
+    current_column: Column,
+    raw_target: &str,
+) -> TransitionDecision {
+    let from_status = resolve_current_status_id(workflow, current_column);
+
+    let to_status = match raw_target {
+        "reject" | "bounce" => match workflow
+            .statuses
+            .iter()
+            .find(|s| s.category == StatusCategory::Active)
+        {
+            Some(s) => s.id.clone(),
+            None => return TransitionDecision::Reject { reason: "no-active-status" },
+        },
+        other => other.to_string(),
+    };
+
+    let Some(target) = workflow.status(&to_status) else {
+        return TransitionDecision::Reject { reason: "unknown-target-status" };
+    };
+
+    let allowed = match &workflow.transitions {
+        Some(ts) => ts.iter().any(|t| t.from == from_status && t.to == to_status),
+        None => true,
+    };
+    if !allowed {
+        return TransitionDecision::Reject { reason: "edge-not-in-workflow" };
+    }
+
+    let to_column = column_for_category(target.category);
+    if to_column == current_column {
+        return TransitionDecision::Reject { reason: "target-is-current-column" };
+    }
+
+    TransitionDecision::Apply {
+        from_status,
+        to_status,
+        to_column,
+    }
+}
+
+/// Check the workspace's agent-transition marker and, if it names this
+/// workspace's own task and requests an edge the workflow permits, apply the
+/// move. The generalization of [`maybe_promote_to_review`] to arbitrary
+/// (including backward) status transitions — see
+/// [`shelbi_orchestrator::workspace::workspace_transition_marker`] for the
+/// marker path + format.
+///
+/// Best-effort and idempotent, matching the review-marker contract:
+///
+/// - A marker naming a task **not owned by this workspace** (stale worktree
+///   reuse, or a foreign id a stray program dropped) is cleared without moving.
+/// - A move whose **workflow forbids the edge** is refused (logged) and the
+///   marker cleared, so a persistently-illegal request doesn't re-log forever.
+/// - A successful move emits a `reason=workspace:agent-transition` task event,
+///   fires any actions the edge declares (a bounce edge typically has none),
+///   then **closes the finishing pane** so the orchestrator re-dispatches the
+///   task fresh onto an appropriate workspace off the resulting event. Ordering
+///   is load-bearing: move first, then close, never strand work — the move also
+///   clears the task's owner ([`shelbi_state::move_task_and_unassign`]) so the
+///   just-closed pane isn't seen by the supervisor as still holding active work.
+/// - Only a genuine move *failure* leaves the marker in place to retry; every
+///   other path consumes it exactly once.
+fn maybe_apply_transition(
+    project: &Project,
+    workspace: &shelbi_core::WorkspaceSpec,
+    machine: &shelbi_core::Machine,
+    host: &shelbi_core::Host,
+    addr: &shelbi_core::TmuxAddr,
+) {
+    let marker = shelbi_orchestrator::workspace::workspace_transition_marker(machine, workspace);
+    let req = match shelbi_orchestrator::workspace::read_transition_marker(host, &marker) {
+        Ok(Some(r)) => r,
+        Ok(None) => return,
+        Err(e) => {
+            // Torn / hostile body — leave the marker (read didn't clear it) so a
+            // half-flushed write survives to the next tick.
+            tracing::warn!(workspace = %workspace.name, error = %e, "read_transition_marker failed");
+            return;
+        }
+    };
+
+    let task_file = shelbi_state::load_task(&project.name, &req.task_id);
+    match &task_file {
+        Ok(tf) if tf.task.assigned_to.as_deref() == Some(workspace.name.as_str()) => {
+            // Load the task's workflow; fall back to the built-in default
+            // (no transitions → any-to-any) if the YAML is missing or invalid,
+            // so a transient workflow typo doesn't wedge the bounce.
+            let workflow = shelbi_state::load_workflow(&project.name, tf.task.workflow_or_default())
+                .unwrap_or_else(|_| default_workflow());
+
+            match decide_transition(&workflow, tf.task.column, &req.target) {
+                TransitionDecision::Reject { reason } => {
+                    tracing::warn!(
+                        workspace = %workspace.name,
+                        task = %req.task_id,
+                        target = %req.target,
+                        reason,
+                        "agent transition rejected; clearing marker without moving",
+                    );
+                }
+                TransitionDecision::Apply {
+                    from_status,
+                    to_status,
+                    to_column,
+                } => {
+                    match shelbi_state::move_task_and_unassign(&project.name, &req.task_id, to_column)
+                    {
+                        Ok(Some((from, to, wf))) => {
+                            if let Err(e) = shelbi_state::append_task_event(
+                                &req.task_id,
+                                &wf,
+                                from,
+                                to,
+                                "workspace:agent-transition",
+                            ) {
+                                tracing::warn!(workspace = %workspace.name, task = %req.task_id, error = %e, "append_task_event failed");
+                            }
+
+                            // Fire any side-effect actions the edge declares
+                            // (a bounce edge typically declares none; a gate
+                            // that closes a PR on send-back would attach
+                            // `close_pr`). Reuses the same primitive path the
+                            // workflow engine walks. Best-effort — the move
+                            // already happened, so an action failure logs but
+                            // doesn't roll it back.
+                            match shelbi_orchestrator::transition::execute_transition(
+                                project,
+                                &project.name,
+                                &tf.task,
+                                &tf.body,
+                                &workflow,
+                                &from_status,
+                                &to_status,
+                            ) {
+                                Ok(outcomes) => {
+                                    for o in outcomes {
+                                        tracing::info!(
+                                            workspace = %workspace.name,
+                                            task = %req.task_id,
+                                            action = %o.action,
+                                            line = %o.line,
+                                            "agent-transition action fired",
+                                        );
+                                    }
+                                }
+                                Err(e) => {
+                                    tracing::warn!(workspace = %workspace.name, task = %req.task_id, error = %e, "agent-transition action failed");
+                                }
+                            }
+
+                            tracing::info!(
+                                workspace = %workspace.name,
+                                task = %req.task_id,
+                                from = %from_status,
+                                to = %to_status,
+                                "applied agent transition via marker",
+                            );
+
+                            // Close the finishing pane so the slot frees and the
+                            // orchestrator re-dispatches fresh off the emitted
+                            // event. Best-effort and idempotent — a pane already
+                            // gone is a silent no-op — and it runs only AFTER the
+                            // move so work is never stranded.
+                            if let Err(e) = shelbi_orchestrator::workspace::kill_workspace_pane(
+                                host,
+                                addr,
+                                &workspace.name,
+                            ) {
+                                tracing::warn!(workspace = %workspace.name, task = %req.task_id, error = %e, "close pane after agent transition failed");
+                            } else {
+                                tracing::info!(workspace = %workspace.name, task = %req.task_id, "closed pane after agent transition; workspace idle");
+                            }
+                        }
+                        Ok(None) => {
+                            // Already in the target column — `decide_transition`
+                            // rejects same-column targets, so this is a rare
+                            // race (the task moved between our load and the
+                            // move). Nothing to do but clear the marker.
+                            tracing::debug!(workspace = %workspace.name, task = %req.task_id, "agent transition no-op (task already at target); clearing marker");
+                        }
+                        Err(e) => {
+                            // Leave the marker in place so we retry next tick.
+                            tracing::warn!(workspace = %workspace.name, task = %req.task_id, error = %e, "move_task_and_unassign failed");
+                            return;
+                        }
+                    }
+                }
+            }
+        }
+        Ok(_) => {
+            tracing::debug!(workspace = %workspace.name, task = %req.task_id, "stale/foreign transition marker (task not owned by this workspace); clearing");
+        }
+        Err(e) => {
+            tracing::warn!(workspace = %workspace.name, task = %req.task_id, error = %e, "transition marker names unloadable task; clearing");
+        }
+    }
+
+    if let Err(e) = shelbi_orchestrator::workspace::clear_transition_marker(host, &marker) {
+        tracing::warn!(workspace = %workspace.name, error = %e, "clear_transition_marker failed");
     }
 }
 
@@ -2287,6 +2577,129 @@ mod tests {
 
         std::env::remove_var("SHELBI_HOME");
         let _ = std::fs::remove_dir_all(&home);
+    }
+
+    // ---------------------------------------------------------------------
+    // Agent-transition decision core
+
+    /// A workflow WITH an explicit `transitions:` block. Declares only the
+    /// `review -> in-progress` bounce edge (plus the forward `review -> done`),
+    /// so any other edge out of `review` is refused for an agent request.
+    fn workflow_with_bounce() -> Workflow {
+        let yaml = r#"
+name: gated
+statuses:
+  - { id: backlog,     name: Backlog,     category: backlog, owner: user,  agent: orchestrator }
+  - { id: todo,        name: Todo,        category: ready,   owner: agent, agent: orchestrator }
+  - { id: in-progress, name: In Progress, category: active,  owner: agent, agent: developer    }
+  - { id: review,      name: Review,      category: handoff, owner: user,  agent: reviewer     }
+  - { id: done,        name: Done,        category: done,    owner: user                       }
+transitions:
+  - { from: review, to: in-progress }
+  - { from: review, to: done, actions: [merge] }
+"#;
+        Workflow::from_yaml_str(yaml).expect("workflow parses")
+    }
+
+    #[test]
+    fn decide_transition_accepts_declared_bounce_edge() {
+        // review -> in-progress is a declared edge → applied, landing in the
+        // active column.
+        let wf = workflow_with_bounce();
+        assert_eq!(
+            decide_transition(&wf, Column::Review, "in-progress"),
+            TransitionDecision::Apply {
+                from_status: "review".into(),
+                to_status: "in-progress".into(),
+                to_column: Column::InProgress,
+            }
+        );
+    }
+
+    #[test]
+    fn decide_transition_resolves_reject_verb_to_active_status() {
+        // The `reject` / `bounce` sugar resolves to the workflow's active
+        // status, and that edge is declared → applied.
+        let wf = workflow_with_bounce();
+        for verb in ["reject", "bounce"] {
+            assert_eq!(
+                decide_transition(&wf, Column::Review, verb),
+                TransitionDecision::Apply {
+                    from_status: "review".into(),
+                    to_status: "in-progress".into(),
+                    to_column: Column::InProgress,
+                },
+                "verb {verb} should resolve to the active status",
+            );
+        }
+    }
+
+    #[test]
+    fn decide_transition_rejects_edge_absent_from_transitions_block() {
+        // review -> backlog is a legal status pair but NOT a declared edge, and
+        // this workflow declares a transitions block → agents may only take
+        // sanctioned edges, so it's refused and the task must not move.
+        let wf = workflow_with_bounce();
+        assert_eq!(
+            decide_transition(&wf, Column::Review, "backlog"),
+            TransitionDecision::Reject { reason: "edge-not-in-workflow" }
+        );
+    }
+
+    #[test]
+    fn decide_transition_rejects_unknown_target_status() {
+        let wf = workflow_with_bounce();
+        assert_eq!(
+            decide_transition(&wf, Column::Review, "nonexistent"),
+            TransitionDecision::Reject { reason: "unknown-target-status" }
+        );
+    }
+
+    #[test]
+    fn decide_transition_any_to_any_when_no_transitions_block() {
+        // The default workflow declares NO transitions block, so moves are
+        // any-to-any (both statuses just have to be declared). A bounce from
+        // review back to in-progress is allowed.
+        let wf = default_workflow();
+        assert_eq!(
+            decide_transition(&wf, Column::Review, "in-progress"),
+            TransitionDecision::Apply {
+                from_status: "review".into(),
+                to_status: "in-progress".into(),
+                to_column: Column::InProgress,
+            }
+        );
+        // The verb sugar works there too.
+        assert_eq!(
+            decide_transition(&wf, Column::Review, "bounce"),
+            TransitionDecision::Apply {
+                from_status: "review".into(),
+                to_status: "in-progress".into(),
+                to_column: Column::InProgress,
+            }
+        );
+    }
+
+    #[test]
+    fn decide_transition_rejects_same_column_noop() {
+        // A target resolving to the column the task is already in can't be
+        // represented as a move in the 5-column store → refused (so we never
+        // unassign a task that wouldn't actually change lanes).
+        let wf = default_workflow();
+        assert_eq!(
+            decide_transition(&wf, Column::InProgress, "in-progress"),
+            TransitionDecision::Reject { reason: "target-is-current-column" }
+        );
+    }
+
+    #[test]
+    fn column_for_category_is_inverse_of_column_category() {
+        // Every column round-trips through category → column …
+        for col in Column::ALL {
+            assert_eq!(column_for_category(col.category()), col);
+        }
+        // … and the archived category (no dedicated lane) folds onto Done.
+        assert_eq!(column_for_category(StatusCategory::Archived), Column::Done);
     }
 }
 
