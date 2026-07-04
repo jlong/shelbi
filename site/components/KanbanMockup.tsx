@@ -1401,6 +1401,48 @@ function palFooterRow(): Segment[] {
 }
 
 /**
+ * Pin every non-ASCII glyph in each palette row to its logical cell width so the
+ * modal renders as a strict monospace grid, keeping the box's borders aligned
+ * across rows.
+ *
+ * The mono font (Geist Mono) has no box-drawing (`─ │ ╭ ╮ ├ ┤ ╰ ╯`), block
+ * (`▊`), arrow (`↑↓`) or middle-dot glyphs, so the browser substitutes a
+ * fallback whose advance is a hair wider than one cell. A border/divider row is
+ * 56 such glyphs and drifts ~56 sub-cells wider than an item row (which is
+ * mostly 1-cell ASCII text plus just two `│` borders) — so the item/prompt rows'
+ * right border ends up inset from the border rows', reading as a stray inner
+ * vertical rule. Pinning each substituted glyph to its `palWidth` (via the same
+ * fixed-`cells` inline-block the emoji icons use) forces a true grid: the wider
+ * glyph bleeds harmlessly past its cell (box lines stay continuous) but the
+ * column advance is exact, so every row shares the same left/right edges. ASCII
+ * runs are left as natural text (they already advance one cell) to keep the
+ * label/description columns and the selected-row fill untouched.
+ */
+function pinPaletteCells(rows: Segment[][]): Segment[][] {
+  return rows.map((row) =>
+    row.flatMap((seg) => {
+      if (seg.cells !== undefined) return [seg] // already pinned (emoji icon)
+      const out: Segment[] = []
+      let ascii = ""
+      const flush = () => {
+        if (ascii) out.push({ ...seg, text: ascii })
+        ascii = ""
+      }
+      for (const ch of seg.text) {
+        if ((ch.codePointAt(0) ?? 0) > 0x7f) {
+          flush()
+          out.push({ ...seg, text: ch, cells: palWidth(ch) })
+        } else {
+          ascii += ch
+        }
+      }
+      flush()
+      return out
+    }),
+  )
+}
+
+/**
  * Build the palette modal's rows for the current query + item list: titled top
  * border, the `>` prompt, a divider, the fuzzy-filtered command list (top match
  * highlighted), then a divider, the footer hints, and the bottom border.
@@ -1414,7 +1456,7 @@ function buildPaletteRows(palette: PaletteState, project: string): Segment[][] {
     matches.forEach((it, i) => rows.push(palItemRow(it, i === 0)))
   }
   rows.push(palDivider(), palFooterRow(), palBottomBorder())
-  return rows
+  return pinPaletteCells(rows)
 }
 
 // ── Panels ────────────────────────────────────────────────────────────
