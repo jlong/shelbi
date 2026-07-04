@@ -34,7 +34,7 @@ runner settings without each of them having to redo the setup wizard.
 | Piece | Global mode | In-repo mode |
 | --- | --- | --- |
 | Shared config (name, default_branch, orchestrator, agent_runners, zen, heartbeat, git, workflows/, agents/, workspace-settings.json.template) | `~/.shelbi/projects/<name>.yaml` and `~/.shelbi/projects/<name>/` | `<repo>/.shelbi/project.yaml` and `<repo>/.shelbi/` |
-| User-local config (repo path, machines, workspaces, editor, contextstore_sync) | Same YAML: `~/.shelbi/projects/<name>.yaml` | `~/.shelbi/projects/<name>/local.yaml` |
+| User-local config (repo path, machines, workspaces, editor) | Same YAML: `~/.shelbi/projects/<name>.yaml` | `~/.shelbi/projects/<name>/local.yaml` |
 | State (state.json, tasks/, HANDOFF.md, .claude/, workspaces/, events.log) | `~/.shelbi/projects/<name>/` (+ `~/.shelbi/events.log`) | `~/.shelbi/projects/<name>/` (+ `~/.shelbi/events.log`) |
 | Discovery | Reverse-lookup: cwd matched against every registered project's local `work_dir` | Walk up from cwd for `<dir>/.shelbi/project.yaml`, then require a matching `local.yaml` |
 | Shared with clones? | No: every teammate reruns `shelbi init` | Yes: everything under `<repo>/.shelbi/` (minus the gitignored state pieces) travels with `git clone` |
@@ -100,7 +100,7 @@ committed.
   projects/
     <name>/
       local.yaml              # ← user-local: repo, machines, workspaces,
-                              #   editor, contextstore_sync
+                              #   editor
       state.json              # ← state — never committed
       tasks/
       HANDOFF.md

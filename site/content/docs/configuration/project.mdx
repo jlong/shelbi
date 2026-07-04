@@ -1,7 +1,7 @@
 ---
 title: Project config
 order: 30
-summary: Field-by-field reference for a project's YAML — name, repo, machines, orchestrator, agent runners, workspaces, ContextStore sync, and Zen Mode.
+summary: Field-by-field reference for a project's YAML — name, repo, machines, orchestrator, agent runners, workspaces, and Zen Mode.
 ---
 
 The project YAML is the root of a Shelbi project: it declares the repo,
@@ -22,7 +22,7 @@ The file's location depends on the project's
 In global mode every field lives in one flat file. In in-repo mode the
 **shared** fields (`name`, `default_branch`, `orchestrator`,
 `agent_runners`, `zen`, …) are committed and the **user-local** fields
-(`repo`, `machines`, `workspaces`, `editor`, `contextstore_sync`) live in
+(`repo`, `machines`, `workspaces`, `editor`) live in
 a per-machine `local.yaml`. Putting a field on the wrong side errors at
 load time. The canonical bucket lists are `SHARED_PROJECT_FIELDS` and
 `LOCAL_PROJECT_FIELDS` in
@@ -60,7 +60,6 @@ workspaces:
 | `orchestrator` | [Orchestrator](#orchestrator) | yes | — | Which runner boots the orchestrator. |
 | `agent_runners` | map of name → [AgentRunner](#agent-runners) | yes | — | The command lines agents and the orchestrator are launched with. |
 | `workspaces` | list of [Workspace](#workspaces) | no | `[]` | Fixed pool of workspace slots. User-local. Also accepts the legacy key `workers`. |
-| `contextstore_sync` | list of [ContextStoreSync](#contextstore-sync) | no | `[]` | ContextStore spaces rsynced back from remote workspaces after review. User-local. |
 | `zen` | [Zen](#zen) | no | all defaults | Zen Mode check list, CI timeout, and danger paths. |
 | `editor` | string | no | `$EDITOR` | Editor invoked by `shelbi … edit` commands. User-local. |
 | `github_url` | string | no | — | Informational GitHub URL recorded by the setup wizard. |
@@ -148,22 +147,6 @@ workspaces:
   - { name: alice, machine: hub, runner: claude }
   - { name: bob,   machine: m2,  runner: claude }
   - { name: rev,   machine: hub, runner: claude, role: review }
-```
-
-## contextstore_sync
-
-ContextStore spaces that are rsynced from a remote workspace's machine
-back to the hub after the workspace hands off for review. Default empty:
-no sync runs unless the project opts in.
-
-| Field | Type | Required | Default | Description |
-| --- | --- | --- | --- | --- |
-| `space` | string | yes | — | ContextStore space name. Matched against the task body to decide whether a finished task touched ContextStore. |
-| `path` | path | yes | — | Directory fed to rsync on both hub and remote. A leading `~` is expanded against each side's `$HOME`. |
-
-```yaml
-contextstore_sync:
-  - { space: Memories, path: ~/.contextstore/Memories }
 ```
 
 ## zen
