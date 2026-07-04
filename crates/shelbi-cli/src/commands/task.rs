@@ -16,7 +16,7 @@ use chrono::Utc;
 use clap::{Args as ClapArgs, Subcommand};
 use shelbi_core::{
     default_workflow, validate_task_id, validate_workflow_name, Column, Task, Workflow,
-    WorkflowStatus, MAX_TASK_ID_LEN,
+    MAX_TASK_ID_LEN,
 };
 
 use super::require_project;
@@ -47,12 +47,10 @@ pub enum TaskCmd {
     Show { id: String },
     /// Edit a task's dependency list.
     Depends(DependsArgs),
-    /// Move a task to another status. The destination is resolved against
-    /// the task's workflow, but the board can only store a task in one of
-    /// the five fixed columns (backlog/todo/in_progress/review/done), so a
-    /// workflow status with no column backing (a genuinely custom status)
-    /// isn't a reachable move target — the command errors and names only
-    /// the statuses it can actually reach.
+    /// Move a task to another status. A task's position is a status id, so
+    /// the destination may be ANY status the task's workflow declares —
+    /// including `canceled` / archived statuses and any status a user adds.
+    /// A status the workflow doesn't declare errors, naming the ids it does.
     Move {
         id: String,
         #[arg(long, value_name = "STATUS")]
@@ -228,14 +226,14 @@ fn add(project: &str, args: AddArgs) -> Result<()> {
     if let Some(name) = args.workflow.as_deref() {
         validate_workflow_name(name).map_err(|e| anyhow!(e))?;
     }
-    let priority = shelbi_state::list_column(project, column)
+    let priority = shelbi_state::list_column(project, column.clone())
         .map_err(|e| anyhow!(e))?
         .len() as u32;
     let now = Utc::now();
     let task = Task {
         id: id.clone(),
         title: args.title.clone(),
-        column,
+        column: column.clone(),
         priority,
         assigned_to: None,
         workflow: args.workflow.clone(),
@@ -319,10 +317,9 @@ fn list(
         return Ok(());
     }
 
-    let filter = status_filter
-        .map(Column::from_str)
-        .transpose()
-        .map_err(|e| anyhow!(e))?;
+    // Any status id is a valid filter — normalized so `wip` matches
+    // `in-progress`.
+    let filter = status_filter.map(Column::from_status_id);
 
     let all = shelbi_state::list_tasks(project).map_err(|e| anyhow!(e))?;
     if all.is_empty() {
@@ -334,17 +331,26 @@ fn list(
     // whether the visible task is actually blocked.
     let columns: std::collections::HashMap<String, Column> = all
         .iter()
-        .map(|tf| (tf.task.id.clone(), tf.task.column))
+        .map(|tf| (tf.task.id.clone(), tf.task.column.clone()))
         .collect();
-    for col in Column::ALL {
-        if let Some(want) = filter {
+    // The stock columns (always shown, even empty) plus any custom /
+    // archived status a task actually occupies, in board order.
+    let mut cols: Vec<Column> = Column::core();
+    for tf in &all {
+        if !cols.contains(&tf.task.column) {
+            cols.push(tf.task.column.clone());
+        }
+    }
+    cols.sort_by(|a, b| (a.board_order(), a.as_str()).cmp(&(b.board_order(), b.as_str())));
+    for col in &cols {
+        if let Some(want) = &filter {
             if want != col {
                 continue;
             }
         }
         let in_col: Vec<_> = all
             .iter()
-            .filter(|tf| tf.task.column == col && matches_workflow(&tf.task))
+            .filter(|tf| &tf.task.column == col && matches_workflow(&tf.task))
             .collect();
         println!("{col} ({})", in_col.len());
         for tf in in_col {
@@ -437,13 +443,10 @@ fn depends(project: &str, args: DependsArgs) -> Result<()> {
 fn move_to(project: &str, id: &str, to: &str, reason: Option<&str>) -> Result<()> {
     let tf = shelbi_state::load_task(project, id).map_err(|e| anyhow!(e))?;
     let workflow = resolve_task_workflow(project, &tf.task)?;
-    // Resolve the destination against the task's workflow BEFORE mapping
-    // it to a Column (F5). Parsing `to` through `Column::from_str` first
-    // rejected any custom workflow status (`--to qa` → "unknown column:
-    // qa") even while the rejection message for a builtin advertised that
-    // same `qa` as valid. `resolve_move_target` matches `to` against the
-    // workflow's declared statuses and only ever names statuses the board
-    // can actually store.
+    // Resolve the destination against the task's workflow. A task's position
+    // is a status id, so ANY status the workflow declares is a valid target
+    // — including `canceled` / archived and any status a user adds. A target
+    // the workflow doesn't declare errors, naming the declared statuses.
     let column = resolve_move_target(&workflow, to)?;
 
     // Lifecycle hook: a move INTO `in_progress` cuts the task's branch on
@@ -458,14 +461,14 @@ fn move_to(project: &str, id: &str, to: &str, reason: Option<&str>) -> Result<()
     // abort the move — silently dropping the depends_on intent and
     // shipping the card to in_progress without a usable branch would be
     // the worst of both worlds.
-    if column == Column::InProgress && tf.task.column != Column::InProgress {
+    if column == Column::in_progress() && tf.task.column != Column::in_progress() {
         let project_yaml =
             shelbi_state::load_project(project).map_err(|e| anyhow!(e))?;
         shelbi_orchestrator::lifecycle::ensure_branch_for_in_progress(&project_yaml, id)
             .map_err(|e| anyhow!(e))?;
     }
 
-    let moved = shelbi_state::move_task(project, id, column).map_err(|e| anyhow!(e))?;
+    let moved = shelbi_state::move_task(project, id, column.clone()).map_err(|e| anyhow!(e))?;
     if let Some((from, to_col, workflow)) = moved {
         let reason = reason.unwrap_or("user:cli");
         if let Err(e) = shelbi_state::append_task_event(id, &workflow, from, to_col, reason) {
@@ -490,102 +493,39 @@ fn resolve_task_workflow(project: &str, task: &Task) -> Result<Workflow> {
 }
 
 /// Resolve a `task move --to <STATUS>` argument against the task's
-/// workflow, returning the backing [`Column`] the board can store.
+/// workflow, returning the target position (a status id).
 ///
-/// The board tracks a task's position as one of the five fixed
-/// [`Column`] variants, so only workflow statuses whose id maps onto a
-/// Column are reachable move targets. `to` is matched:
-///
-/// 1. as a builtin Column (including the friendly `Column::from_str`
-///    aliases such as `wip`), provided that Column is actually declared
-///    in the workflow; failing that
-/// 2. against the workflow's declared status ids — a match with no
-///    Column backing (a genuinely custom status like `qa`) gets its own
-///    "not supported by the board yet" error rather than being
-///    advertised as valid and then rejected by the Column parser.
-///
-/// Every error names only the *reachable* statuses (those with a Column
-/// backing), so the message never tells the user to type something the
-/// board can't store. Custom statuses beyond the five columns aren't
-/// representable on the board yet — see `Plans/workflows.md`.
+/// A task's position is a status id, so any status the workflow declares
+/// is a reachable target — including `canceled` / archived statuses and
+/// any status a user adds later. `to` is matched against the declared
+/// status ids, first through the same alias normalization a stored
+/// position gets (so `wip` / `in_progress` resolve onto `in-progress`),
+/// then verbatim against the raw declared ids (for custom ids the
+/// normalizer passes through untouched). A `to` the workflow doesn't
+/// declare errors, listing the ids it does.
 fn resolve_move_target(workflow: &Workflow, to: &str) -> Result<Column> {
-    let reachable = reachable_statuses(workflow);
-    let valid = || {
-        reachable
-            .iter()
-            .map(|(s, _)| s.id.clone())
-            .collect::<Vec<_>>()
-            .join(", ")
-    };
-
-    // Path 1: `to` parses as a builtin Column (with aliases). Honor it
-    // only when that Column is actually part of this workflow.
-    if let Ok(col) = Column::from_str(to) {
-        if reachable.iter().any(|(_, c)| *c == col) {
-            return Ok(col);
-        }
-        bail!(
-            "`{to}` is not a status in workflow `{}` (valid: {})",
-            workflow.name,
-            valid(),
-        );
+    // Alias-normalized lookup: folds the friendly CLI spellings onto the
+    // canonical id before checking the workflow.
+    let normalized = Column::from_status_id(to);
+    if let Some(status) = workflow.status(normalized.as_str()) {
+        return Ok(Column::from_status_id(&status.id));
+    }
+    // Verbatim lookup: a custom id the normalizer left untouched still has
+    // to match a declared status id exactly (modulo surrounding whitespace).
+    if let Some(status) = workflow.statuses.iter().find(|s| s.id == to.trim()) {
+        return Ok(Column::from_status_id(&status.id));
     }
 
-    // Path 2: `to` isn't a Column alias. It may still name a declared
-    // workflow status that has no Column backing (custom / archived).
-    if let Some(status) = workflow
+    let valid = workflow
         .statuses
         .iter()
-        .find(|s| norm_status_id(&s.id) == norm_status_id(to))
-    {
-        bail!(
-            "status `{}` in workflow `{}` isn't supported by the board yet — the board \
-             tracks task position as one of: {}. A custom status without a column backing \
-             can't be a `task move` target.",
-            status.id,
-            workflow.name,
-            valid(),
-        );
-    }
-
+        .map(|s| s.id.clone())
+        .collect::<Vec<_>>()
+        .join(", ");
     bail!(
-        "`{to}` is not a status in workflow `{}` (valid: {})",
+        "`{to}` is not a status in workflow `{}` (valid: {valid})",
         workflow.name,
-        valid(),
     );
-}
-
-/// The workflow statuses the board can represent as a task position:
-/// those whose id maps onto one of the five fixed [`Column`] variants.
-/// Each is paired with its Column so callers can both list the reachable
-/// ids and resolve a match.
-fn reachable_statuses(workflow: &Workflow) -> Vec<(&WorkflowStatus, Column)> {
-    workflow
-        .statuses
-        .iter()
-        .filter_map(|s| column_for_status_id(&s.id).map(|c| (s, c)))
-        .collect()
-}
-
-/// Map a workflow status id onto its backing [`Column`], if any, using
-/// the same lenient normalization (lowercase alphanumerics) as
-/// [`norm_status_id`] so the kebab-case id form (`in-progress`), the
-/// underscore CLI form (`in_progress` from [`Column::as_str`]), and the
-/// historic PascalCase (`InProgress`) all resolve to
-/// [`Column::InProgress`]. Returns `None` for a status with no Column
-/// backing (e.g. `canceled`).
-fn column_for_status_id(id: &str) -> Option<Column> {
-    let target = norm_status_id(id);
-    Column::ALL
-        .into_iter()
-        .find(|c| norm_status_id(c.as_str()) == target)
-}
-
-fn norm_status_id(s: &str) -> String {
-    s.chars()
-        .filter(char::is_ascii_alphanumeric)
-        .map(|c| c.to_ascii_lowercase())
-        .collect()
 }
 
 /// Resolve which agent should drive the workspace once it lands in the
@@ -689,7 +629,7 @@ fn unassign(project: &str, id: &str) -> Result<()> {
 
 fn prio(project: &str, args: PrioArgs) -> Result<()> {
     let tf = shelbi_state::load_task(project, &args.id).map_err(|e| anyhow!(e))?;
-    let col = shelbi_state::list_column(project, tf.task.column).map_err(|e| anyhow!(e))?;
+    let col = shelbi_state::list_column(project, tf.task.column.clone()).map_err(|e| anyhow!(e))?;
     let pos = col
         .iter()
         .position(|x| x.task.id == args.id)
@@ -773,7 +713,7 @@ fn start(
     // Refuse to clobber another in-flight task on the same workspace. Pulling
     // a workspace off mid-task is intentional — make the user do it explicitly
     // via `task move <other> --to todo` first.
-    let conflict = shelbi_state::list_column(project, Column::InProgress)
+    let conflict = shelbi_state::list_column(project, Column::in_progress())
         .map_err(|e| anyhow!(e))?
         .into_iter()
         .find(|tf| {
@@ -833,21 +773,21 @@ fn start(
     // spawn failure can roll the card back rather than strand it in
     // `in_progress` pointing at a pane that never launched.
     let original = tf.task.clone();
-    let prev_column = tf.task.column;
+    let prev_column = tf.task.column.clone();
     let now = Utc::now();
     tf.task.assigned_to = Some(workspace_name.clone());
     tf.task.branch = Some(branch.clone());
     tf.task.updated_at = now;
-    if prev_column != Column::InProgress {
-        let new_priority = shelbi_state::list_column(project, Column::InProgress)
+    if prev_column != Column::in_progress() {
+        let new_priority = shelbi_state::list_column(project, Column::in_progress())
             .map_err(|e| anyhow!(e))?
             .len() as u32;
-        tf.task.column = Column::InProgress;
+        tf.task.column = Column::in_progress();
         tf.task.priority = new_priority;
     }
     shelbi_state::save_task(project, &tf.task, &tf.body).map_err(|e| anyhow!(e))?;
-    if prev_column != Column::InProgress {
-        shelbi_state::renumber_column(project, prev_column).map_err(|e| anyhow!(e))?;
+    if prev_column != Column::in_progress() {
+        shelbi_state::renumber_column(project, prev_column.clone()).map_err(|e| anyhow!(e))?;
     }
 
     println!("→ launching {workspace_name} on {id} (branch: {branch}, agent: {agent_name})");
@@ -869,7 +809,7 @@ fn start(
             // original spawn error is what the user needs to see, but a
             // rollback failure is surfaced too so a half-moved board isn't
             // silent.
-            if let Err(re) = rollback_start(project, &original, &tf.body, prev_column) {
+            if let Err(re) = rollback_start(project, &original, &tf.body, prev_column.clone()) {
                 eprintln!(
                     "warning: `{id}` was moved to in_progress but the spawn failed and the \
                      rollback also failed ({re}); run `shelbi task move {id} --to {prev_column}` \
@@ -883,15 +823,15 @@ fn start(
     // Spawn succeeded — record the dispatch event now (only successful
     // starts get an events.log line; a rolled-back start leaves no
     // misleading dispatch record).
-    if prev_column != Column::InProgress {
+    if prev_column != Column::in_progress() {
         let base_reason = reason.unwrap_or("user:cli:start");
         let dispatched_reason = dispatch_reason_with_agent(base_reason, &agent_name);
         let workflow = tf.task.workflow_or_default();
         if let Err(e) = shelbi_state::append_task_event(
             id,
             workflow,
-            prev_column,
-            Column::InProgress,
+            prev_column.clone(),
+            Column::in_progress(),
             &dispatched_reason,
         ) {
             eprintln!("warning: append_task_event failed: {e}");
@@ -913,8 +853,8 @@ fn rollback_start(
     prev_column: Column,
 ) -> Result<()> {
     shelbi_state::save_task(project, original, body).map_err(|e| anyhow!(e))?;
-    if prev_column != Column::InProgress {
-        shelbi_state::renumber_column(project, Column::InProgress).map_err(|e| anyhow!(e))?;
+    if prev_column != Column::in_progress() {
+        shelbi_state::renumber_column(project, Column::in_progress()).map_err(|e| anyhow!(e))?;
         shelbi_state::renumber_column(project, prev_column).map_err(|e| anyhow!(e))?;
     }
     Ok(())
@@ -978,7 +918,7 @@ fn resume(
     // Refuse to clobber a DIFFERENT in-flight task on the same workspace —
     // same guard as `start`. Resuming this task onto a workspace busy with
     // another would leave two agents racing one worktree.
-    let conflict = shelbi_state::list_column(project, Column::InProgress)
+    let conflict = shelbi_state::list_column(project, Column::in_progress())
         .map_err(|e| anyhow!(e))?
         .into_iter()
         .find(|other| {
@@ -1012,21 +952,21 @@ fn resume(
     // the in-flight work the instant the agent can exist. `original` snapshots
     // the pre-move frontmatter so a spawn failure rolls the card back.
     let original = tf.task.clone();
-    let prev_column = tf.task.column;
-    let moved_into_progress = prev_column != Column::InProgress;
+    let prev_column = tf.task.column.clone();
+    let moved_into_progress = prev_column != Column::in_progress();
     tf.task.assigned_to = Some(workspace_name.clone());
     tf.task.branch = Some(branch.clone());
     tf.task.updated_at = Utc::now();
     if moved_into_progress {
-        let new_priority = shelbi_state::list_column(project, Column::InProgress)
+        let new_priority = shelbi_state::list_column(project, Column::in_progress())
             .map_err(|e| anyhow!(e))?
             .len() as u32;
-        tf.task.column = Column::InProgress;
+        tf.task.column = Column::in_progress();
         tf.task.priority = new_priority;
     }
     shelbi_state::save_task(project, &tf.task, &tf.body).map_err(|e| anyhow!(e))?;
     if moved_into_progress {
-        shelbi_state::renumber_column(project, prev_column).map_err(|e| anyhow!(e))?;
+        shelbi_state::renumber_column(project, prev_column.clone()).map_err(|e| anyhow!(e))?;
     }
 
     println!("→ resuming {workspace_name} on {id} (branch: {branch}, agent: {agent_name})");
@@ -1046,7 +986,7 @@ fn resume(
             // already-in-progress task left the board untouched, so there's
             // nothing to undo.
             if moved_into_progress {
-                if let Err(re) = rollback_start(project, &original, &tf.body, prev_column) {
+                if let Err(re) = rollback_start(project, &original, &tf.body, prev_column.clone()) {
                     eprintln!(
                         "warning: `{id}` was restored to in_progress but the resume failed and \
                          the rollback also failed ({re}); run `shelbi task move {id} --to \
@@ -1067,8 +1007,8 @@ fn resume(
         if let Err(e) = shelbi_state::append_task_event(
             id,
             workflow,
-            prev_column,
-            Column::InProgress,
+            prev_column.clone(),
+            Column::in_progress(),
             &dispatched_reason,
         ) {
             eprintln!("warning: append_task_event failed: {e}");
@@ -1219,7 +1159,7 @@ mod tests {
         let home = fresh_home();
         std::env::set_var("SHELBI_HOME", &home);
 
-        shelbi_state::save_task("p", &task_in(Column::Backlog, "a"), "").unwrap();
+        shelbi_state::save_task("p", &task_in(Column::backlog(), "a"), "").unwrap();
         move_to("p", "a", "todo", None).unwrap();
 
         let log = std::fs::read_to_string(shelbi_state::events_log_path().unwrap()).unwrap();
@@ -1250,7 +1190,7 @@ mod tests {
         // repo at the hub's `work_dir`, so we provision them up front.
         crate::commands::test_support::provision_hub_repo_for_project(&home, "p");
 
-        shelbi_state::save_task("p", &task_in(Column::Todo, "b"), "").unwrap();
+        shelbi_state::save_task("p", &task_in(Column::todo(), "b"), "").unwrap();
         move_to("p", "b", "in_progress", Some("orchestrator:auto-dispatch workspace=alpha"))
             .unwrap();
 
@@ -1281,7 +1221,7 @@ mod tests {
         let home = fresh_home();
         std::env::set_var("SHELBI_HOME", &home);
 
-        shelbi_state::save_task("p", &task_in(Column::Todo, "c"), "").unwrap();
+        shelbi_state::save_task("p", &task_in(Column::todo(), "c"), "").unwrap();
         // Already in `todo` — move_task short-circuits, no event line.
         move_to("p", "c", "todo", None).unwrap();
 
@@ -1324,7 +1264,7 @@ statuses:
         )
         .unwrap();
 
-        let mut task = task_in(Column::Todo, "d");
+        let mut task = task_in(Column::todo(), "d");
         task.workflow = Some("research".into());
         shelbi_state::save_task("p", &task, "").unwrap();
 
@@ -1355,12 +1295,11 @@ statuses:
     }
 
     #[test]
-    fn move_to_custom_status_reports_only_reachable_statuses() {
-        // F5: a workflow may declare a status with no board `Column`
-        // backing (`qa`). `task move --to qa` must fail with a message
-        // that explains the board can't store it — NOT clap's opaque
-        // "unknown column: qa" — and every valid-status list must name
-        // only statuses the board can actually reach.
+    fn move_to_custom_status_is_a_valid_target() {
+        // A task's position is a status id, so ANY status the workflow
+        // declares — including a custom `qa` status with no legacy column
+        // backing — is a reachable `task move` target. A status the
+        // workflow does NOT declare still errors, naming the declared ids.
         let _g = TEST_LOCK.lock().unwrap();
         let home = fresh_home();
         std::env::set_var("SHELBI_HOME", &home);
@@ -1389,30 +1328,21 @@ statuses:
         )
         .unwrap();
 
-        let mut task = task_in(Column::Todo, "t");
+        let mut task = task_in(Column::todo(), "t");
         task.workflow = Some("qa".into());
         shelbi_state::save_task("p", &task, "").unwrap();
 
-        // `--to qa`: real workflow status, no Column backing → board-not-
-        // supported error, task stays put.
-        let err = move_to("p", "t", "qa", None).unwrap_err().to_string();
-        assert!(err.contains("isn't supported by the board"), "{err}");
-        assert!(!err.contains("unknown column"), "{err}");
-        let list = err
-            .split_once("one of: ")
-            .and_then(|(_, tail)| tail.split_once('.'))
-            .map(|(l, _)| l)
-            .unwrap_or("");
-        assert!(list.contains("backlog") && list.contains("done"), "{err}");
-        assert!(!list.contains("qa"), "reachable list must not name qa: {err}");
+        // `--to qa`: a declared custom status is now a real move target and
+        // the task lands there (its stored position id is the custom id).
+        move_to("p", "t", "qa", None).unwrap();
         assert_eq!(
-            shelbi_state::load_task("p", "t").unwrap().task.column,
-            Column::Todo,
-            "rejected move must not relocate the task",
+            shelbi_state::load_task("p", "t").unwrap().task.column.as_str(),
+            "qa",
         );
 
-        // A builtin status absent from this workflow (`review`) is
-        // rejected with only reachable statuses listed — never `qa`.
+        // A status absent from this workflow (`review`) still errors, and
+        // the valid-status list names the declared ids (never the undeclared
+        // target). Task stays put.
         let err = move_to("p", "t", "review", None).unwrap_err().to_string();
         let valid = err
             .split_once("(valid:")
@@ -1420,16 +1350,51 @@ statuses:
             .map(|(l, _)| l.trim())
             .unwrap_or("");
         assert!(valid.contains("backlog"), "{err}");
-        assert!(!valid.contains("qa"), "{err}");
+        assert!(valid.contains("qa"), "{err}");
         assert!(!valid.contains("review"), "{err}");
+        assert_eq!(
+            shelbi_state::load_task("p", "t").unwrap().task.column.as_str(),
+            "qa",
+            "rejected move must not relocate the task",
+        );
 
-        // The reachable side of the AC: a Column-backed status in the same
-        // custom workflow moves successfully.
+        // A core status the workflow declares still moves successfully.
         move_to("p", "t", "done", None).unwrap();
         assert_eq!(
             shelbi_state::load_task("p", "t").unwrap().task.column,
-            Column::Done,
+            Column::done(),
         );
+
+        std::env::remove_var("SHELBI_HOME");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn move_to_canceled_succeeds_and_round_trips() {
+        // The headline acceptance: a default-workflow task can be moved to
+        // the archived `canceled` status, and it round-trips through disk.
+        let _g = TEST_LOCK.lock().unwrap();
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+
+        shelbi_state::save_project_statuses("p", &shelbi_core::default_project_statuses())
+            .unwrap();
+        // A default-workflow task (no explicit `workflow:` field).
+        shelbi_state::save_task("p", &task_in(Column::todo(), "c"), "").unwrap();
+
+        move_to("p", "c", "canceled", None).unwrap();
+        let reloaded = shelbi_state::load_task("p", "c").unwrap();
+        assert_eq!(reloaded.task.column, Column::canceled());
+        assert_eq!(reloaded.task.column.as_str(), "canceled");
+        assert_eq!(
+            reloaded.task.column.category(),
+            shelbi_core::StatusCategory::Archived,
+        );
+
+        // The move emitted an events-log line with the archived category.
+        let log = std::fs::read_to_string(shelbi_state::events_log_path().unwrap()).unwrap();
+        assert!(log.contains(" todo -> canceled "), "{log}");
+        assert!(log.contains("to_category=archived"), "{log}");
 
         std::env::remove_var("SHELBI_HOME");
         let _ = std::fs::remove_dir_all(&home);
@@ -1447,10 +1412,10 @@ statuses:
         let home = fresh_home();
         std::env::set_var("SHELBI_HOME", &home);
 
-        let mut a = task_in(Column::Todo, "a");
+        let mut a = task_in(Column::todo(), "a");
         a.workflow = Some("research".into());
-        let b = task_in(Column::Todo, "b"); // no workflow → matches `default`
-        let mut c = task_in(Column::Backlog, "c");
+        let b = task_in(Column::todo(), "b"); // no workflow → matches `default`
+        let mut c = task_in(Column::backlog(), "c");
         c.workflow = Some("research".into());
         for t in [&a, &b, &c] {
             shelbi_state::save_task("p", t, "").unwrap();
@@ -1482,10 +1447,10 @@ statuses:
         // filter) rely on. Verified by exercising the matcher closure
         // directly through the filter_workflow_name helper-equivalent
         // pattern used inside `list`.
-        let no_explicit = task_in(Column::Todo, "n");
+        let no_explicit = task_in(Column::todo(), "n");
         assert_eq!(no_explicit.workflow_or_default(), "default");
 
-        let mut research = task_in(Column::Todo, "r");
+        let mut research = task_in(Column::todo(), "r");
         research.workflow = Some("research".into());
         assert_eq!(research.workflow_or_default(), "research");
     }
@@ -1554,8 +1519,8 @@ statuses:
         shelbi_state::append_task_event(
             "demo",
             "default",
-            Column::Todo,
-            Column::InProgress,
+            Column::todo(),
+            Column::in_progress(),
             &dispatched,
         )
         .unwrap();
@@ -1595,7 +1560,7 @@ statuses:
 "#,
         );
 
-        let task = task_in(Column::Todo, "t1");
+        let task = task_in(Column::todo(), "t1");
         let agent = resolve_active_agent_for_dispatch("p", &task).unwrap();
         assert_eq!(agent, "developer");
 
@@ -1625,7 +1590,7 @@ statuses:
   - { id: done,    name: Done,    category: done,    owner: user }
 "#,
         );
-        let task = task_in(Column::Todo, "t2");
+        let task = task_in(Column::todo(), "t2");
         let agent = resolve_active_agent_for_dispatch("p", &task).unwrap();
         assert_eq!(agent, shelbi_state::DEVELOPER_AGENT);
 
@@ -1643,7 +1608,7 @@ statuses:
         std::env::set_var("SHELBI_HOME", &home);
         crate::commands::test_support::provision_hub_repo_for_project(&home, "p");
 
-        shelbi_state::save_task("p", &task_in(Column::InProgress, "orphan"), "").unwrap();
+        shelbi_state::save_task("p", &task_in(Column::in_progress(), "orphan"), "").unwrap();
         let err = resume("p", "orphan", None, None).unwrap_err().to_string();
         assert!(err.contains("no assigned workspace"), "err: {err}");
 
@@ -1662,7 +1627,7 @@ statuses:
         // is "unknown" — exactly the case under test.
         crate::commands::test_support::provision_hub_repo_for_project(&home, "p");
 
-        shelbi_state::save_task("p", &task_in(Column::InProgress, "t"), "").unwrap();
+        shelbi_state::save_task("p", &task_in(Column::in_progress(), "t"), "").unwrap();
         let err = resume("p", "t", Some("ghost"), None).unwrap_err().to_string();
         assert!(err.contains("workspace `ghost` not declared"), "err: {err}");
 
@@ -1679,7 +1644,7 @@ statuses:
         let home = fresh_home();
         std::env::set_var("SHELBI_HOME", &home);
 
-        let mut task = task_in(Column::Todo, "e");
+        let mut task = task_in(Column::todo(), "e");
         task.workflow = Some("nonexistent".into());
         shelbi_state::save_task("p", &task, "").unwrap();
 

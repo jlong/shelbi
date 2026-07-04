@@ -458,9 +458,12 @@ fn board_is_quiescent(project: &Project) -> bool {
 /// with in-memory fixtures without touching disk or `SHELBI_HOME`.
 fn tasks_are_quiescent(tasks: &[shelbi_state::TaskFile]) -> bool {
     !tasks.iter().any(|tf| {
+        // Quiescent = nothing ready/active/in-handoff. Keyed off the
+        // semantic category so a workflow that renames these statuses still
+        // counts; terminal (done/archived) and backlog tasks don't.
         matches!(
-            tf.task.column,
-            Column::InProgress | Column::Todo | Column::Review
+            tf.task.column.category(),
+            StatusCategory::Ready | StatusCategory::Active | StatusCategory::Handoff
         )
     })
 }
@@ -845,7 +848,7 @@ fn maybe_apply_ready_handoff(
 
     match &task_file {
         Ok(tf)
-            if tf.task.column == Column::InProgress
+            if tf.task.column == Column::in_progress()
                 && tf.task.assigned_to.as_deref() == Some(workspace.name.as_str()) =>
         {
             // Resolve the forward handoff target from the task's workflow:
@@ -853,7 +856,7 @@ fn maybe_apply_ready_handoff(
             // to advance to; clear the (misconfigured) marker below.
             let workflow = shelbi_state::load_workflow(&project.name, tf.task.workflow_or_default())
                 .unwrap_or_else(|_| default_workflow());
-            let from_status = resolve_current_status_id(&workflow, Column::InProgress);
+            let from_status = resolve_current_status_id(&workflow, Column::in_progress());
             let Some(handoff) = workflow
                 .statuses
                 .iter()
@@ -864,7 +867,7 @@ fn maybe_apply_ready_handoff(
                 return;
             };
             let to_status = handoff.id.clone();
-            let to_column = column_for_category(handoff.category);
+            let to_column = Column::from_status_id(&handoff.id);
 
             // Auto-rebase the workspace's branch onto the project's default
             // branch before the column move, so the human reviewer sees a
@@ -976,31 +979,15 @@ enum TransitionDecision {
     Reject { reason: &'static str },
 }
 
-/// Map a workflow [`StatusCategory`] onto the legacy [`Column`] a task's
-/// position is actually stored in. The 5-column model has no dedicated
-/// `Archived` lane, so a terminal `archived` status folds onto `Done` (both are
-/// terminal and non-dispatchable) — the closest faithful home in the current
-/// storage model. This is the inverse of [`Column::category`].
-fn column_for_category(category: StatusCategory) -> Column {
-    match category {
-        StatusCategory::Backlog => Column::Backlog,
-        StatusCategory::Ready => Column::Todo,
-        StatusCategory::Active => Column::InProgress,
-        StatusCategory::Handoff => Column::Review,
-        StatusCategory::Done | StatusCategory::Archived => Column::Done,
-    }
-}
-
 /// Resolve the workflow status id a task in `current_column` currently occupies.
-/// Mirrors the orchestrator's `resolve_task_status` (and the TUI's
-/// `resolve_task_status`): prefer an id match on the column's canonical status
-/// id, then fall back to the first status sharing the column's category (so a
-/// workflow that renamed `review` to `qa` still resolves), and finally to the
-/// canonical id string when the workflow declares nothing compatible.
+/// A task's position is itself a status id, so this is an identity when the
+/// workflow declares that id; it only falls back to a same-category status
+/// (so a workflow that renamed `review` to `qa` still resolves) or, last, the
+/// stored id string when the workflow declares nothing compatible.
 fn resolve_current_status_id(workflow: &Workflow, current_column: Column) -> String {
-    let canonical = current_column.default_status_id();
-    if workflow.status(canonical).is_some() {
-        return canonical.to_string();
+    let stored = current_column.as_str();
+    if workflow.status(stored).is_some() {
+        return stored.to_string();
     }
     let cat = current_column.category();
     workflow
@@ -1008,7 +995,7 @@ fn resolve_current_status_id(workflow: &Workflow, current_column: Column) -> Str
         .iter()
         .find(|s| s.category == cat)
         .map(|s| s.id.clone())
-        .unwrap_or_else(|| canonical.to_string())
+        .unwrap_or_else(|| stored.to_string())
 }
 
 /// Pure core of the agent-transition handler. Given the task's current column,
@@ -1029,10 +1016,9 @@ fn resolve_current_status_id(workflow: &Workflow, current_column: Column) -> Str
 ///    take edges the workflow author sanctioned. With no `transitions:` block,
 ///    moves are any-to-any (both statuses just have to be declared), matching
 ///    [`Workflow::transition_allowed`].
-/// 4. **Must actually move.** The 5-column store can't represent a move between
-///    two statuses that share a column, so a target resolving to the current
-///    column is refused as a no-op (guarding against unassigning a task that
-///    wouldn't actually change lanes).
+/// 4. **Must actually move.** A target resolving to the status the task is
+///    already in is refused as a no-op (guarding against unassigning a task
+///    that wouldn't actually change lanes).
 fn decide_transition(
     workflow: &Workflow,
     current_column: Column,
@@ -1052,7 +1038,7 @@ fn decide_transition(
         other => other.to_string(),
     };
 
-    let Some(target) = workflow.status(&to_status) else {
+    if workflow.status(&to_status).is_none() {
         return TransitionDecision::Reject { reason: "unknown-target-status" };
     };
 
@@ -1064,10 +1050,13 @@ fn decide_transition(
         return TransitionDecision::Reject { reason: "edge-not-in-workflow" };
     }
 
-    let to_column = column_for_category(target.category);
-    if to_column == current_column {
-        return TransitionDecision::Reject { reason: "target-is-current-column" };
+    // The target's status id IS the destination position — no category round
+    // trip, so a move between two distinct statuses in the same category is a
+    // real move, not a false no-op.
+    if to_status == from_status {
+        return TransitionDecision::Reject { reason: "target-is-current-status" };
     }
+    let to_column = Column::from_status_id(&to_status);
 
     TransitionDecision::Apply {
         from_status,
@@ -1126,7 +1115,7 @@ fn maybe_apply_transition(
             let workflow = shelbi_state::load_workflow(&project.name, tf.task.workflow_or_default())
                 .unwrap_or_else(|_| default_workflow());
 
-            match decide_transition(&workflow, tf.task.column, &req.target) {
+            match decide_transition(&workflow, tf.task.column.clone(), &req.target) {
                 TransitionDecision::Reject { reason } => {
                     tracing::warn!(
                         workspace = %workspace.name,
@@ -1535,7 +1524,7 @@ fn maybe_supervise_orchestrator(project: &Project, state: &mut SupervisionState)
 }
 
 fn current_task_for(project: &Project, workspace_name: &str) -> Option<String> {
-    shelbi_state::list_column(&project.name, Column::InProgress)
+    shelbi_state::list_column(&project.name, Column::in_progress())
         .ok()?
         .into_iter()
         .find(|tf| tf.task.assigned_to.as_deref() == Some(workspace_name))
@@ -1732,7 +1721,7 @@ mod tests {
         Task {
             id: id.into(),
             title: id.into(),
-            column: Column::InProgress,
+            column: Column::in_progress(),
             priority: 0,
             assigned_to: Some(workspace.into()),
             workflow: None,
@@ -1791,7 +1780,7 @@ mod tests {
                 .unwrap()
                 .task
                 .column,
-            Column::Review,
+            Column::review(),
             "task should be promoted to review"
         );
         assert!(!marker.exists(), "marker should be consumed (cleared)");
@@ -1881,7 +1870,7 @@ mod tests {
                 .unwrap()
                 .task
                 .column,
-            Column::Review,
+            Column::review(),
             "task already in review must not be pulled back out"
         );
         assert!(!marker.exists(), "stale marker should be cleared");
@@ -1922,7 +1911,7 @@ mod tests {
                 .unwrap()
                 .task
                 .column,
-            Column::InProgress
+            Column::in_progress()
         );
 
         std::env::remove_var("SHELBI_HOME");
@@ -2132,14 +2121,14 @@ mod tests {
 
     fn todo_task(id: &str) -> Task {
         let mut t = in_progress_task(id, "alpha");
-        t.column = Column::Todo;
+        t.column = Column::todo();
         t.assigned_to = None;
         t
     }
 
     fn review_task(id: &str) -> Task {
         let mut t = in_progress_task(id, "alpha");
-        t.column = Column::Review;
+        t.column = Column::review();
         t.assigned_to = None;
         t
     }
@@ -2160,12 +2149,12 @@ mod tests {
         assert!(tasks_are_quiescent(&[
             tf({
                 let mut t = todo_task("b");
-                t.column = Column::Backlog;
+                t.column = Column::backlog();
                 t
             }),
             tf({
                 let mut t = todo_task("d");
-                t.column = Column::Done;
+                t.column = Column::done();
                 t
             }),
         ]));
@@ -2177,7 +2166,7 @@ mod tests {
         assert!(!tasks_are_quiescent(&[
             tf({
                 let mut t = todo_task("b");
-                t.column = Column::Backlog;
+                t.column = Column::backlog();
                 t
             }),
             tf(review_task("v")),
@@ -2414,11 +2403,11 @@ transitions:
         // active column.
         let wf = workflow_with_bounce();
         assert_eq!(
-            decide_transition(&wf, Column::Review, "in-progress"),
+            decide_transition(&wf, Column::review(), "in-progress"),
             TransitionDecision::Apply {
                 from_status: "review".into(),
                 to_status: "in-progress".into(),
-                to_column: Column::InProgress,
+                to_column: Column::in_progress(),
             }
         );
     }
@@ -2430,11 +2419,11 @@ transitions:
         let wf = workflow_with_bounce();
         for verb in ["reject", "bounce"] {
             assert_eq!(
-                decide_transition(&wf, Column::Review, verb),
+                decide_transition(&wf, Column::review(), verb),
                 TransitionDecision::Apply {
                     from_status: "review".into(),
                     to_status: "in-progress".into(),
-                    to_column: Column::InProgress,
+                    to_column: Column::in_progress(),
                 },
                 "verb {verb} should resolve to the active status",
             );
@@ -2448,7 +2437,7 @@ transitions:
         // sanctioned edges, so it's refused and the task must not move.
         let wf = workflow_with_bounce();
         assert_eq!(
-            decide_transition(&wf, Column::Review, "backlog"),
+            decide_transition(&wf, Column::review(), "backlog"),
             TransitionDecision::Reject { reason: "edge-not-in-workflow" }
         );
     }
@@ -2457,7 +2446,7 @@ transitions:
     fn decide_transition_rejects_unknown_target_status() {
         let wf = workflow_with_bounce();
         assert_eq!(
-            decide_transition(&wf, Column::Review, "nonexistent"),
+            decide_transition(&wf, Column::review(), "nonexistent"),
             TransitionDecision::Reject { reason: "unknown-target-status" }
         );
     }
@@ -2469,44 +2458,34 @@ transitions:
         // review back to in-progress is allowed.
         let wf = default_workflow();
         assert_eq!(
-            decide_transition(&wf, Column::Review, "in-progress"),
+            decide_transition(&wf, Column::review(), "in-progress"),
             TransitionDecision::Apply {
                 from_status: "review".into(),
                 to_status: "in-progress".into(),
-                to_column: Column::InProgress,
+                to_column: Column::in_progress(),
             }
         );
         // The verb sugar works there too.
         assert_eq!(
-            decide_transition(&wf, Column::Review, "bounce"),
+            decide_transition(&wf, Column::review(), "bounce"),
             TransitionDecision::Apply {
                 from_status: "review".into(),
                 to_status: "in-progress".into(),
-                to_column: Column::InProgress,
+                to_column: Column::in_progress(),
             }
         );
     }
 
     #[test]
-    fn decide_transition_rejects_same_column_noop() {
-        // A target resolving to the column the task is already in can't be
-        // represented as a move in the 5-column store → refused (so we never
-        // unassign a task that wouldn't actually change lanes).
+    fn decide_transition_rejects_same_status_noop() {
+        // A target resolving to the status the task is already in is a no-op
+        // → refused (so we never unassign a task that wouldn't actually
+        // change lanes).
         let wf = default_workflow();
         assert_eq!(
-            decide_transition(&wf, Column::InProgress, "in-progress"),
-            TransitionDecision::Reject { reason: "target-is-current-column" }
+            decide_transition(&wf, Column::in_progress(), "in-progress"),
+            TransitionDecision::Reject { reason: "target-is-current-status" }
         );
-    }
-
-    #[test]
-    fn column_for_category_is_inverse_of_column_category() {
-        // Every column round-trips through category → column …
-        for col in Column::ALL {
-            assert_eq!(column_for_category(col.category()), col);
-        }
-        // … and the archived category (no dedicated lane) folds onto Done.
-        assert_eq!(column_for_category(StatusCategory::Archived), Column::Done);
     }
 }
 

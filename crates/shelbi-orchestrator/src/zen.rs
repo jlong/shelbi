@@ -2065,7 +2065,7 @@ mod probe_tests {
         Task {
             id: "task1".into(),
             title: "task1".into(),
-            column: Column::Review,
+            column: Column::review(),
             priority: 0,
             assigned_to: Some("ws1".into()),
             workflow: None,
@@ -2244,18 +2244,18 @@ pub fn mechanically_eligible_from(
 ) -> Vec<String> {
     let columns: std::collections::HashMap<String, Column> = tasks
         .iter()
-        .map(|tf| (tf.task.id.clone(), tf.task.column))
+        .map(|tf| (tf.task.id.clone(), tf.task.column.clone()))
         .collect();
 
     let in_flight_bodies: Vec<&str> = tasks
         .iter()
-        .filter(|tf| tf.task.column == Column::InProgress)
+        .filter(|tf| tf.task.column == Column::in_progress())
         .map(|tf| tf.body.as_str())
         .collect();
 
     let mut candidates: Vec<&Task> = tasks
         .iter()
-        .filter(|tf| tf.task.column == Column::Backlog)
+        .filter(|tf| tf.task.column == Column::backlog())
         .filter(|tf| !tf.task.is_blocked(&columns))
         .filter(|tf| !zen_disabled(&tf.task))
         .filter(|tf| !demoted.contains(&tf.task.id))
@@ -2412,8 +2412,8 @@ mod scan_tests {
     #[test]
     fn empty_backlog_returns_empty() {
         let tasks = vec![
-            tf(task("done-a", Column::Done, 0, &[]), ""),
-            tf(task("todo-a", Column::Todo, 0, &[]), ""),
+            tf(task("done-a", Column::done(), 0, &[]), ""),
+            tf(task("todo-a", Column::todo(), 0, &[]), ""),
         ];
         let got = mechanically_eligible_from(&tasks, &HashSet::new());
         assert!(got.is_empty());
@@ -2422,9 +2422,9 @@ mod scan_tests {
     #[test]
     fn returns_eligible_in_priority_order() {
         let tasks = vec![
-            tf(task("b", Column::Backlog, 2, &[]), ""),
-            tf(task("a", Column::Backlog, 0, &[]), ""),
-            tf(task("c", Column::Backlog, 1, &[]), ""),
+            tf(task("b", Column::backlog(), 2, &[]), ""),
+            tf(task("a", Column::backlog(), 0, &[]), ""),
+            tf(task("c", Column::backlog(), 1, &[]), ""),
         ];
         let got = mechanically_eligible_from(&tasks, &HashSet::new());
         assert_eq!(got, vec!["a", "c", "b"]);
@@ -2433,8 +2433,8 @@ mod scan_tests {
     #[test]
     fn excludes_blocked_by_unfinished_deps() {
         let tasks = vec![
-            tf(task("blocked", Column::Backlog, 0, &["other"]), ""),
-            tf(task("other", Column::Todo, 0, &[]), ""),
+            tf(task("blocked", Column::backlog(), 0, &["other"]), ""),
+            tf(task("other", Column::todo(), 0, &[]), ""),
         ];
         let got = mechanically_eligible_from(&tasks, &HashSet::new());
         assert!(got.is_empty(), "{got:?}");
@@ -2444,10 +2444,10 @@ mod scan_tests {
     fn returns_empty_when_every_backlog_task_is_blocked() {
         // Mix of blocked-by-todo and blocked-by-in-progress. None can move.
         let tasks = vec![
-            tf(task("a", Column::Backlog, 0, &["x"]), ""),
-            tf(task("b", Column::Backlog, 1, &["y"]), ""),
-            tf(task("x", Column::Todo, 0, &[]), ""),
-            tf(task("y", Column::InProgress, 0, &[]), ""),
+            tf(task("a", Column::backlog(), 0, &["x"]), ""),
+            tf(task("b", Column::backlog(), 1, &["y"]), ""),
+            tf(task("x", Column::todo(), 0, &[]), ""),
+            tf(task("y", Column::in_progress(), 0, &[]), ""),
         ];
         let got = mechanically_eligible_from(&tasks, &HashSet::new());
         assert!(got.is_empty(), "{got:?}");
@@ -2456,8 +2456,8 @@ mod scan_tests {
     #[test]
     fn done_deps_unblock_a_task() {
         let tasks = vec![
-            tf(task("waiting", Column::Backlog, 0, &["dep"]), ""),
-            tf(task("dep", Column::Done, 0, &[]), ""),
+            tf(task("waiting", Column::backlog(), 0, &["dep"]), ""),
+            tf(task("dep", Column::done(), 0, &[]), ""),
         ];
         let got = mechanically_eligible_from(&tasks, &HashSet::new());
         assert_eq!(got, vec!["waiting"]);
@@ -2465,7 +2465,7 @@ mod scan_tests {
 
     #[test]
     fn excludes_zen_enabled_false() {
-        let mut t = task("opt-out", Column::Backlog, 0, &[]);
+        let mut t = task("opt-out", Column::backlog(), 0, &[]);
         t.zen = Some(shelbi_core::TaskZenConfig {
             enabled: Some(false),
             ..Default::default()
@@ -2477,12 +2477,12 @@ mod scan_tests {
 
     #[test]
     fn zen_enabled_true_or_unset_is_eligible() {
-        let mut opt_in = task("opt-in", Column::Backlog, 0, &[]);
+        let mut opt_in = task("opt-in", Column::backlog(), 0, &[]);
         opt_in.zen = Some(shelbi_core::TaskZenConfig {
             enabled: Some(true),
             ..Default::default()
         });
-        let unset = task("unset", Column::Backlog, 1, &[]);
+        let unset = task("unset", Column::backlog(), 1, &[]);
         let tasks = vec![tf(opt_in, ""), tf(unset, "")];
         let got = mechanically_eligible_from(&tasks, &HashSet::new());
         assert_eq!(got, vec!["opt-in", "unset"]);
@@ -2491,8 +2491,8 @@ mod scan_tests {
     #[test]
     fn excludes_previously_user_demoted() {
         let tasks = vec![
-            tf(task("demoted", Column::Backlog, 0, &[]), ""),
-            tf(task("fresh", Column::Backlog, 1, &[]), ""),
+            tf(task("demoted", Column::backlog(), 0, &[]), ""),
+            tf(task("fresh", Column::backlog(), 1, &[]), ""),
         ];
         let mut demoted = HashSet::new();
         demoted.insert("demoted".to_string());
@@ -2508,8 +2508,8 @@ mod scan_tests {
         let body_a = "Refactor `crates/shelbi-cli/src/main.rs` to split the dispatch path.";
         let body_b = "Add tests covering crates/shelbi-cli/src/main.rs error paths.";
         let tasks = vec![
-            tf(task("in-flight", Column::InProgress, 0, &[]), body_a),
-            tf(task("candidate", Column::Backlog, 0, &[]), body_b),
+            tf(task("in-flight", Column::in_progress(), 0, &[]), body_a),
+            tf(task("candidate", Column::backlog(), 0, &[]), body_b),
         ];
         let got = mechanically_eligible_from(&tasks, &HashSet::new());
         assert!(got.is_empty(), "{got:?}");
@@ -2520,8 +2520,8 @@ mod scan_tests {
         let in_flight_body = "Working on `crates/shelbi-tui/src/app.rs`.";
         let candidate_body = "Touch `crates/shelbi-state/src/lib.rs` only.";
         let tasks = vec![
-            tf(task("in-flight", Column::InProgress, 0, &[]), in_flight_body),
-            tf(task("candidate", Column::Backlog, 0, &[]), candidate_body),
+            tf(task("in-flight", Column::in_progress(), 0, &[]), in_flight_body),
+            tf(task("candidate", Column::backlog(), 0, &[]), candidate_body),
         ];
         let got = mechanically_eligible_from(&tasks, &HashSet::new());
         assert_eq!(got, vec!["candidate"]);
@@ -2532,7 +2532,7 @@ mod scan_tests {
         // Ten eligible tasks; we get all ten back. The orchestrator's
         // judgment layer picks how many to actually promote.
         let tasks: Vec<TaskFile> = (0..10)
-            .map(|i| tf(task(&format!("t-{i}"), Column::Backlog, i, &[]), ""))
+            .map(|i| tf(task(&format!("t-{i}"), Column::backlog(), i, &[]), ""))
             .collect();
         let got = mechanically_eligible_from(&tasks, &HashSet::new());
         assert_eq!(got.len(), 10);
@@ -2617,7 +2617,7 @@ mod scan_tests {
         let tasks: Vec<TaskFile> = bodies
             .iter()
             .enumerate()
-            .map(|(i, body)| tf(task(&format!("t-{i}"), Column::Backlog, i as u32, &[]), body))
+            .map(|(i, body)| tf(task(&format!("t-{i}"), Column::backlog(), i as u32, &[]), body))
             .collect();
         let got = mechanically_eligible_from(&tasks, &HashSet::new());
         assert_eq!(got, vec!["t-0", "t-1", "t-2"]);
@@ -2731,7 +2731,7 @@ impl DryRunAction {
 /// workflow, say) sit in their handoff status without ever tripping the
 /// dry-run preview.
 ///
-/// Iteration is by **category**, not by hardcoded [`Column::Review`]:
+/// Iteration is by **category**, not by hardcoded [`Column::review()`]:
 /// a custom workflow whose handoff status is named `QA` or
 /// `Awaiting Sign-off` (instead of `Review`) trips the same bar.
 pub fn dry_run_tick(project: &Project) -> Result<Vec<DryRunDecision>> {
@@ -2751,7 +2751,7 @@ pub fn dry_run_tick(project: &Project) -> Result<Vec<DryRunDecision>> {
 
     // 2. Handoff-category probes — action-based bar gated by the task's
     //    workflow. Filter is on the resolved workflow status's category
-    //    rather than `Column::Review` so custom workflows with renamed
+    //    rather than `Column::review()` so custom workflows with renamed
     //    handoff statuses still get probed.
     for tf in shelbi_state::list_tasks(&project.name)? {
         let workflow = load_task_workflow(&project.name, &tf.task);
@@ -2765,7 +2765,7 @@ pub fn dry_run_tick(project: &Project) -> Result<Vec<DryRunDecision>> {
         }
         let status_id = status
             .map(|s| s.id.as_str())
-            .unwrap_or_else(|| tf.task.column.default_status_id());
+            .unwrap_or_else(|| tf.task.column.as_str());
         let fires_bar = workflow_ref
             .map(|w| w.fires_merge_bar(status_id))
             .unwrap_or(true);
@@ -2811,7 +2811,7 @@ pub fn dry_run_tick(project: &Project) -> Result<Vec<DryRunDecision>> {
 /// Resolution order:
 ///
 /// 1. **Id match** — workflow declares a status whose `id` equals
-///    `task.column.default_status_id()` (`backlog` / `todo` /
+///    `task.column.as_str()` (`backlog` / `todo` /
 ///    `in-progress` / `review` / `done`). Covers the default workflow
 ///    and any custom workflow that reuses the canonical ids.
 /// 2. **Category match** — first status in the workflow whose category
@@ -2820,7 +2820,7 @@ pub fn dry_run_tick(project: &Project) -> Result<Vec<DryRunDecision>> {
 /// 3. **None** — the workflow declares no compatible status. Callers
 ///    fall back to column-level metadata.
 fn resolve_task_status<'w>(task: &Task, workflow: &'w Workflow) -> Option<&'w WorkflowStatus> {
-    let canonical = task.column.default_status_id();
+    let canonical = task.column.as_str();
     if let Some(s) = workflow.status(canonical) {
         return Some(s);
     }
@@ -3079,7 +3079,7 @@ mod dry_run_tests {
                 .map(|(n, c)| WorkflowStatus {
                     // Tests pass a single label; collapse it onto both
                     // id and name. resolve_task_status keys off id, so
-                    // it has to match `task.column.default_status_id()`
+                    // it has to match `task.column.as_str()`
                     // for the name-match branch — but the inputs here
                     // (`Backlog`, `Design`, `QA`, …) are deliberate
                     // mismatches against the canonical ids, leaving the
@@ -3118,13 +3118,13 @@ mod dry_run_tests {
         }
     }
 
-    /// A task in `Column::Review` against the canonical default workflow
+    /// A task in `Column::review()` against the canonical default workflow
     /// resolves to the `Review` status — name match wins. The category
     /// readback is what the dry-run handoff filter keys off.
     #[test]
     fn resolve_status_name_match_picks_default_review() {
         let wf = shelbi_core::default_workflow();
-        let t = task_in_column("t", Column::Review);
+        let t = task_in_column("t", Column::review());
         let s = resolve_task_status(&t, &wf).expect("default workflow declares Review");
         assert_eq!(s.name, "Review");
         assert_eq!(s.category, StatusCategory::Handoff);
@@ -3145,7 +3145,7 @@ mod dry_run_tests {
                 ("Done", StatusCategory::Done),
             ],
         );
-        let t = task_in_column("t", Column::Review);
+        let t = task_in_column("t", Column::review());
         let s = resolve_task_status(&t, &wf).expect("category fallback should find QA");
         assert_eq!(s.name, "QA");
         assert_eq!(s.category, StatusCategory::Handoff);
@@ -3165,7 +3165,7 @@ mod dry_run_tests {
                 ("Shipped", StatusCategory::Done),
             ],
         );
-        let t = task_in_column("t", Column::Review);
+        let t = task_in_column("t", Column::review());
         assert!(resolve_task_status(&t, &wf).is_none());
     }
 }

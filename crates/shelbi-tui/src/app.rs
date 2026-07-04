@@ -412,7 +412,7 @@ impl App {
     pub fn refresh(&mut self) -> Result<()> {
         self.agents = load_agents(&self.project_name).unwrap_or_default();
         let review =
-            shelbi_state::list_column(&self.project_name, Column::Review).unwrap_or_default();
+            shelbi_state::list_column(&self.project_name, Column::review()).unwrap_or_default();
         let (ready, queued) = split_review_sections(&self.project_name, review);
         self.ready_review = ready;
         self.queued_review = queued;
@@ -792,13 +792,13 @@ fn load_workspaces(project: &str) -> Result<Vec<WorkspaceOverview>> {
         Err(_) => return Ok(Vec::new()),
     };
     let in_progress =
-        shelbi_state::list_column(project, Column::InProgress).unwrap_or_default();
+        shelbi_state::list_column(project, Column::in_progress()).unwrap_or_default();
     // A review workspace's loaded task sits in the Review column (it's *loaded*
     // onto the slot, never promoted from in-progress), so its "serving" state
     // isn't visible in the in-progress scan. Read the Review column too and use
     // it for review workspaces so a serving slot reads `Review` / active rather
     // than `idle` — the §16 mockup's `▸ review-1  Review`.
-    let review_col = shelbi_state::list_column(project, Column::Review).unwrap_or_default();
+    let review_col = shelbi_state::list_column(project, Column::review()).unwrap_or_default();
     let mut out = Vec::with_capacity(p.workspaces.len());
     for workspace in &p.workspaces {
         let machine = match p.machine(&workspace.machine) {
@@ -1036,7 +1036,7 @@ mod tests {
         let assigned = Task {
             id: "fix-thing".into(),
             title: "Fix the thing".into(),
-            column: Column::InProgress,
+            column: Column::in_progress(),
             priority: 0,
             assigned_to: Some("delta".into()),
             workflow: None,
@@ -1087,7 +1087,7 @@ mod tests {
             &Task {
                 id: "wip".into(),
                 title: "wip".into(),
-                column: Column::InProgress,
+                column: Column::in_progress(),
                 priority: 0,
                 assigned_to: Some("alpha".into()),
                 workflow: None,
@@ -1189,7 +1189,7 @@ mod tests {
             &Task {
                 id: "loaded".into(),
                 title: "Palette fuzzy-match fix".into(),
-                column: Column::Review,
+                column: Column::review(),
                 priority: 0,
                 assigned_to: Some("review-1".into()),
                 workflow: None,
@@ -1210,7 +1210,7 @@ mod tests {
             &Task {
                 id: "waiting".into(),
                 title: "Rework onboarding copy".into(),
-                column: Column::Review,
+                column: Column::review(),
                 priority: 0,
                 assigned_to: Some("alpha".into()),
                 workflow: None,
@@ -1287,7 +1287,7 @@ mod tests {
             &Task {
                 id: "loaded".into(),
                 title: "loaded".into(),
-                column: Column::Review,
+                column: Column::review(),
                 priority: 0,
                 assigned_to: Some("review-1".into()),
                 workflow: None,
@@ -1438,7 +1438,7 @@ mod tests {
             &Task {
                 id: "wip".into(),
                 title: "wip".into(),
-                column: Column::InProgress,
+                column: Column::in_progress(),
                 priority: 0,
                 assigned_to: Some("alpha".into()),
                 workflow: None,
@@ -1589,7 +1589,7 @@ mod tests {
                 &Task {
                     id: id.into(),
                     title: id.into(),
-                    column: Column::InProgress,
+                    column: Column::in_progress(),
                     priority: 0,
                     assigned_to: Some(ws.into()),
                     workflow: None,
@@ -1759,7 +1759,7 @@ mod tests {
             &Task {
                 id: "explicit".into(),
                 title: "explicit".into(),
-                column: Column::InProgress,
+                column: Column::in_progress(),
                 priority: 0,
                 assigned_to: Some("alpha".into()),
                 workflow: None,
@@ -1780,7 +1780,7 @@ mod tests {
             &Task {
                 id: "default".into(),
                 title: "default".into(),
-                column: Column::InProgress,
+                column: Column::in_progress(),
                 priority: 0,
                 assigned_to: Some("delta".into()),
                 workflow: None,
@@ -1824,7 +1824,7 @@ mod tests {
             &Task {
                 id: "active".into(),
                 title: "active".into(),
-                column: Column::InProgress,
+                column: Column::in_progress(),
                 priority: 0,
                 assigned_to: Some("alpha".into()),
                 workflow: None,
@@ -1878,7 +1878,7 @@ mod tests {
                 &Task {
                     id: id.into(),
                     title: id.into(),
-                    column: Column::InProgress,
+                    column: Column::in_progress(),
                     priority: 0,
                     assigned_to: Some(workspace.into()),
                     workflow: None,
@@ -1931,7 +1931,7 @@ mod tests {
             &Task {
                 id: "t".into(),
                 title: "t".into(),
-                column: Column::InProgress,
+                column: Column::in_progress(),
                 priority: 0,
                 assigned_to: Some("alpha".into()),
                 workflow: None,
@@ -1984,7 +1984,7 @@ mod tests {
             &Task {
                 id: "t".into(),
                 title: "t".into(),
-                column: Column::InProgress,
+                column: Column::in_progress(),
                 priority: 0,
                 assigned_to: Some("alpha".into()),
                 workflow: None,
@@ -2038,7 +2038,7 @@ mod tests {
             &Task {
                 id: "ready".into(),
                 title: "ready".into(),
-                column: Column::Review,
+                column: Column::review(),
                 priority: 0,
                 assigned_to: Some("alpha".into()),
                 workflow: None,
@@ -2161,7 +2161,7 @@ mod tests {
             &Task {
                 id: "ready".into(),
                 title: "Fix login".into(),
-                column: Column::Review,
+                column: Column::review(),
                 priority: 0,
                 assigned_to: Some("delta".into()),
                 workflow: None,

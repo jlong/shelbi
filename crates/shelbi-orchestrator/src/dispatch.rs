@@ -262,7 +262,7 @@ statuses:
         let task = Task {
             id: "fix-login".into(),
             title: "fix-login".into(),
-            column: shelbi_core::Column::InProgress,
+            column: shelbi_core::Column::in_progress(),
             priority: 0,
             assigned_to: Some("alpha".into()),
             workflow: None,

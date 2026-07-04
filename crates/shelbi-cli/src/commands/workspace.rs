@@ -76,7 +76,7 @@ pub(crate) fn print_workspaces(project: &str) -> Result<()> {
     // Surfaces every in-progress task assigned to the workspace. There
     // should normally be at most one, but if shelbi's state diverged we
     // print all of them in the STATE cell so the user sees the mess.
-    let in_progress = shelbi_state::list_column(project, Column::InProgress)
+    let in_progress = shelbi_state::list_column(project, Column::in_progress())
         .map_err(|e| anyhow!(e))?;
     let assigned: Vec<&Task> = in_progress.iter().map(|tf| &tf.task).collect();
 
@@ -89,7 +89,7 @@ pub(crate) fn print_workspaces(project: &str) -> Result<()> {
 /// Render the `shelbi workspace list` table: a header row followed by one
 /// row per workspace. Pure so the column rendering can be tested without
 /// touching stdout. The caller has already filtered `in_progress` to
-/// `Column::InProgress` tasks — we still re-filter by `assigned_to` per
+/// `Column::in_progress()` tasks — we still re-filter by `assigned_to` per
 /// workspace.
 ///
 /// Errors when a workspace references an undeclared machine: that's a
@@ -174,7 +174,7 @@ fn stop(project: &str, name: &str, keep_task: bool) -> Result<()> {
 /// caller doesn't already have `$TASK_ID` in the environment.
 #[cfg_attr(not(test), allow(dead_code))]
 fn active_task_for(project: &str, workspace: &str) -> Option<String> {
-    for column in [Column::InProgress, Column::Review] {
+    for column in [Column::in_progress(), Column::review()] {
         if let Ok(tasks) = shelbi_state::list_column(project, column) {
             if let Some(tf) = tasks
                 .into_iter()
@@ -292,7 +292,7 @@ fn format_ago(now: DateTime<Utc>, then: DateTime<Utc>) -> String {
 /// release them all so the board doesn't keep dangling cards pointing at
 /// a dead pane.
 fn release_workspace_tasks(project: &str, workspace_name: &str) -> Result<Vec<String>> {
-    let in_progress = shelbi_state::list_column(project, Column::InProgress)
+    let in_progress = shelbi_state::list_column(project, Column::in_progress())
         .map_err(|e| anyhow!(e))?;
     let mut released = Vec::new();
     for tf in in_progress {
@@ -372,7 +372,7 @@ mod tests {
             make_workspace("alpha", "hub", "opus-4-7"),
             make_workspace("bravo", "hub", "opus-4-7"),
         ];
-        let assigned = make_task("aw-task-1", Column::InProgress, 0, Some("alpha"));
+        let assigned = make_task("aw-task-1", Column::in_progress(), 0, Some("alpha"));
         let in_progress: Vec<&Task> = vec![&assigned];
 
         let rows = render_list(&workspaces, &in_progress).unwrap();
@@ -396,7 +396,7 @@ mod tests {
     #[test]
     fn render_list_active_workspace_surfaces_model_and_default_agent() {
         let workspaces = vec![make_workspace("alpha", "hub", "opus-4-7")];
-        let task = make_task("aw-fix-login", Column::InProgress, 0, Some("alpha"));
+        let task = make_task("aw-fix-login", Column::in_progress(), 0, Some("alpha"));
         let in_progress: Vec<&Task> = vec![&task];
 
         let rows = render_list(&workspaces, &in_progress).unwrap();
@@ -418,7 +418,7 @@ mod tests {
     #[test]
     fn render_list_honors_explicit_agent_frontmatter() {
         let workspaces = vec![make_workspace("delta", "devbox", "sonnet-4-6")];
-        let mut task = make_task("aw-write-tests", Column::InProgress, 0, Some("delta"));
+        let mut task = make_task("aw-write-tests", Column::in_progress(), 0, Some("delta"));
         task.params.insert("agent".into(), "qa".into());
         let in_progress: Vec<&Task> = vec![&task];
 
@@ -460,7 +460,7 @@ mod tests {
             make_workspace("alpha", "hub", "opus-4-7"),
             make_workspace("bravo", "hub", "opus-4-7"),
         ];
-        let task = make_task("aw-fix-login", Column::InProgress, 0, Some("alpha"));
+        let task = make_task("aw-fix-login", Column::in_progress(), 0, Some("alpha"));
         let in_progress: Vec<&Task> = vec![&task];
 
         let rows = render_list(&workspaces, &in_progress).unwrap();
@@ -504,7 +504,7 @@ mod tests {
         // In-progress task on review-1 → found.
         shelbi_state::save_task(
             "p",
-            &make_task("feat-x", Column::InProgress, 0, Some("review-1")),
+            &make_task("feat-x", Column::in_progress(), 0, Some("review-1")),
             "",
         )
         .unwrap();
@@ -513,7 +513,7 @@ mod tests {
         // A review-column task also counts (a branch loaded for a human).
         shelbi_state::save_task(
             "p",
-            &make_task("feat-y", Column::Review, 0, Some("review-2")),
+            &make_task("feat-y", Column::review(), 0, Some("review-2")),
             "",
         )
         .unwrap();
@@ -535,23 +535,23 @@ mod tests {
         // Bob's task should stay put; alice's should come back to todo.
         shelbi_state::save_task(
             "p",
-            &make_task("fix-login", Column::InProgress, 0, Some("alice")),
+            &make_task("fix-login", Column::in_progress(), 0, Some("alice")),
             "# body\n",
         )
         .unwrap();
         shelbi_state::save_task(
             "p",
-            &make_task("other", Column::InProgress, 1, Some("bob")),
+            &make_task("other", Column::in_progress(), 1, Some("bob")),
             "",
         )
         .unwrap();
-        shelbi_state::save_task("p", &make_task("a", Column::Todo, 0, None), "").unwrap();
+        shelbi_state::save_task("p", &make_task("a", Column::todo(), 0, None), "").unwrap();
 
         let released = release_workspace_tasks("p", "alice").unwrap();
         assert_eq!(released, vec!["fix-login"]);
 
         let fix = shelbi_state::load_task("p", "fix-login").unwrap();
-        assert_eq!(fix.task.column, Column::Todo);
+        assert_eq!(fix.task.column, Column::todo());
         assert_eq!(fix.task.assigned_to, None);
         // Lands at the bottom of `todo` (after the existing `a`).
         assert_eq!(fix.task.priority, 1);
@@ -559,7 +559,7 @@ mod tests {
 
         // Bob's task is untouched.
         let bob_task = shelbi_state::load_task("p", "other").unwrap();
-        assert_eq!(bob_task.task.column, Column::InProgress);
+        assert_eq!(bob_task.task.column, Column::in_progress());
         assert_eq!(bob_task.task.assigned_to.as_deref(), Some("bob"));
         // After alice's task moves out, in_progress is renumbered 0..N.
         assert_eq!(bob_task.task.priority, 0);
@@ -610,7 +610,7 @@ mod tests {
         let _g = TEST_LOCK.lock().unwrap();
         let home = fresh_home();
         std::env::set_var("SHELBI_HOME", &home);
-        shelbi_state::save_task("p", &make_task("a", Column::Todo, 0, None), "").unwrap();
+        shelbi_state::save_task("p", &make_task("a", Column::todo(), 0, None), "").unwrap();
 
         let released = release_workspace_tasks("p", "alice").unwrap();
         assert!(released.is_empty());

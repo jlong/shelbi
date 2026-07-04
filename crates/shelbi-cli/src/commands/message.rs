@@ -94,7 +94,7 @@ pub fn run(
     // A `done` task still has a worktree (the workspace keeps it across tasks),
     // so a push is harmless and useful for archival/replay — just warn so the
     // operator knows the workspace has likely moved on.
-    if tf.task.column == Column::Done {
+    if tf.task.column == Column::done() {
         eprintln!("warning: task `{id}` is in `done` — pushing message anyway");
     }
 

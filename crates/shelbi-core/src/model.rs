@@ -1042,112 +1042,200 @@ impl TmuxAddr {
 // ---------------------------------------------------------------------------
 // Tasks (Kanban board)
 
-/// Where on the board a task lives.
+/// Where on the board a task lives: the stable **status id** of a status
+/// declared in the project's `workflows/statuses.yaml`.
 ///
-/// Lifecycle:
+/// This is an *open* string id, not a closed enum — any declared status is
+/// a valid position, including `canceled` / archived statuses and any
+/// status a user adds later. The five historical columns (`backlog`,
+/// `todo`, `in-progress`, `review`, `done`) are just the ids the default
+/// workflow happens to ship; nothing in this type privileges them.
 ///
-/// - `Backlog`: orchestrator-created, awaiting user triage.
-/// - `Todo`: user-curated, ready for a workspace to pick up.
-/// - `InProgress`: assigned and active on a workspace.
-/// - `Review`: workspace reports done; user inspects via the review dir.
-/// - `Done`: accepted by user.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum Column {
-    Backlog,
-    Todo,
-    InProgress,
-    Review,
-    Done,
-}
+/// The id is stored in canonical **kebab-case** form (`in-progress`), the
+/// same spelling `statuses.yaml` and workflow `id:` fields use — so
+/// `workflow.status(col.as_str())` is the right lookup and two positions
+/// compare equal iff they name the same status. [`Column::from_status_id`]
+/// (and the serde `Deserialize` impl) normalize the handful of legacy /
+/// friendly spellings (`in_progress`, `wip`, `to-do`, …) onto the
+/// canonical id so an old task file keeps loading and comparisons stay
+/// reliable.
+///
+/// On the wire we still emit the legacy snake_case spelling for the core
+/// ids (`in_progress`, not `in-progress`) so an older shelbi binary keeps
+/// parsing task files and events-log lines — see [`Column::wire_str`].
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct Column(String);
 
 impl Column {
-    pub const ALL: [Column; 5] = [
-        Column::Backlog,
-        Column::Todo,
-        Column::InProgress,
-        Column::Review,
-        Column::Done,
+    /// The canonical status ids of the five historical core columns plus
+    /// the default workflow's terminal `canceled` lane, in board order.
+    /// Used to order tasks for the CLI board render and to enumerate the
+    /// stock columns; it is *not* an exhaustive set of valid positions.
+    pub const CORE_IDS: [&'static str; 6] = [
+        "backlog",
+        "todo",
+        "in-progress",
+        "review",
+        "done",
+        "canceled",
     ];
 
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Column::Backlog => "backlog",
-            Column::Todo => "todo",
-            Column::InProgress => "in_progress",
-            Column::Review => "review",
-            Column::Done => "done",
+    pub fn backlog() -> Self {
+        Self("backlog".to_string())
+    }
+    pub fn todo() -> Self {
+        Self("todo".to_string())
+    }
+    pub fn in_progress() -> Self {
+        Self("in-progress".to_string())
+    }
+    pub fn review() -> Self {
+        Self("review".to_string())
+    }
+    pub fn done() -> Self {
+        Self("done".to_string())
+    }
+    pub fn canceled() -> Self {
+        Self("canceled".to_string())
+    }
+
+    /// The stock board columns, in order — one [`Column`] per
+    /// [`Column::CORE_IDS`] entry. Callers that need to iterate the
+    /// historical column set (the CLI board render, ordering) use this;
+    /// the TUI kanban enumerates `statuses.yaml` directly instead.
+    pub fn core() -> Vec<Column> {
+        Self::CORE_IDS.iter().map(|id| Column(id.to_string())).collect()
+    }
+
+    /// Build a position from a status id, normalizing the legacy /
+    /// friendly spellings onto the canonical kebab-case id. Any string is
+    /// accepted — validation that the id is actually *declared* in a
+    /// workflow happens at the move layer, not here.
+    pub fn from_status_id(id: impl AsRef<str>) -> Self {
+        Self(normalize_status_id(id.as_ref()))
+    }
+
+    /// The canonical status id (kebab-case). This is the value to compare
+    /// against `statuses.yaml` / workflow `id:` fields.
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    /// Consume `self`, yielding the owned canonical id.
+    pub fn into_string(self) -> String {
+        self.0
+    }
+
+    /// On-disk / events-log spelling. The core columns keep the legacy
+    /// snake_case wire form (`in_progress`) the pre-workflow board wrote,
+    /// so an older shelbi binary still parses the file; every other id
+    /// (including custom and `canceled`) is emitted verbatim. Only
+    /// `in-progress` actually differs from [`Column::as_str`].
+    pub fn wire_str(&self) -> &str {
+        match self.0.as_str() {
+            "in-progress" => "in_progress",
+            other => other,
         }
     }
 
-    /// The PascalCase status *display name* this column maps to under
-    /// the canonical default workflow (see `default_workflow()`). Used
-    /// when rendering labels for tasks whose only known position is the
-    /// legacy [`Column`]. Generic code that needs to ask "is this task
-    /// in the merge-bar trigger status?" should use
-    /// [`Column::default_status_id`] instead — workflow lookups are
-    /// keyed by the stable `id`, not the renamable display label.
-    pub fn default_status_name(self) -> &'static str {
-        match self {
-            Column::Backlog => "Backlog",
-            Column::Todo => "Todo",
-            Column::InProgress => "In Progress",
-            Column::Review => "Review",
-            Column::Done => "Done",
+    /// The PascalCase status *display name* for a core id, used as a
+    /// last-resort label when the workflow/`statuses.yaml` isn't loaded.
+    /// A custom id has no canonical display name here, so it falls back to
+    /// its own id string.
+    pub fn default_status_name(&self) -> &str {
+        match self.0.as_str() {
+            "backlog" => "Backlog",
+            "todo" => "Todo",
+            "in-progress" => "In Progress",
+            "review" => "Review",
+            "done" => "Done",
+            "canceled" => "Canceled",
+            other => other,
         }
     }
 
-    /// The stable status *id* this column maps to under the canonical
-    /// default workflow (see `default_workflow()`). Matches the `id:`
-    /// fields the workflow YAML's `from:` / `to:` strings reference, so
-    /// `workflow.status(col.default_status_id())` is the right lookup
-    /// for "find the canonical status for this task's legacy column."
-    pub fn default_status_id(self) -> &'static str {
-        match self {
-            Column::Backlog => "backlog",
-            Column::Todo => "todo",
-            Column::InProgress => "in-progress",
-            Column::Review => "review",
-            Column::Done => "done",
+    /// The semantic [`crate::StatusCategory`] this position maps to under
+    /// the canonical default workflow. Used by the events-log writer to
+    /// fill the `from_category=`/`to_category=` fields and by display code
+    /// for header colours.
+    ///
+    /// This is a best-effort mapping for the stock ids only — the
+    /// authoritative category for a *custom* status lives in
+    /// `statuses.yaml` and is resolved through the loaded [`crate::Workflow`]
+    /// / [`crate::ProjectStatuses`] wherever the workflow is in hand. A
+    /// custom id this function doesn't recognize falls back to
+    /// [`crate::StatusCategory::Backlog`]; behaviour-driving code keys off
+    /// the workflow-resolved category, never this fallback.
+    pub fn category(&self) -> crate::StatusCategory {
+        use crate::StatusCategory;
+        match self.0.as_str() {
+            "backlog" => StatusCategory::Backlog,
+            "todo" => StatusCategory::Ready,
+            "in-progress" => StatusCategory::Active,
+            "review" => StatusCategory::Handoff,
+            "done" => StatusCategory::Done,
+            "canceled" => StatusCategory::Archived,
+            _ => StatusCategory::Backlog,
         }
     }
 
-    /// The semantic [`crate::StatusCategory`] this column maps to under
-    /// the canonical default workflow. Used by the events log writer to
-    /// fill the `from_category=`/`to_category=` fields on the new line
-    /// shape, and by the back-compat parser to derive a category for
-    /// pre-workflow lines that don't carry one. See `Plans/workflows.md`
-    /// §1 for the category table.
-    pub fn category(self) -> crate::StatusCategory {
-        match self {
-            Column::Backlog => crate::StatusCategory::Backlog,
-            Column::Todo => crate::StatusCategory::Ready,
-            Column::InProgress => crate::StatusCategory::Active,
-            Column::Review => crate::StatusCategory::Handoff,
-            Column::Done => crate::StatusCategory::Done,
-        }
+    /// Sort key for board ordering: the index of this position among
+    /// [`Column::CORE_IDS`], with any custom id sorting after the stock
+    /// columns (ties broken by the caller, e.g. on priority then id).
+    pub fn board_order(&self) -> usize {
+        Self::CORE_IDS
+            .iter()
+            .position(|id| *id == self.0)
+            .unwrap_or(Self::CORE_IDS.len())
+    }
+}
+
+/// Normalize a status id: fold the legacy on-disk snake_case spellings and
+/// a few friendly CLI aliases onto the canonical kebab-case ids the rest of
+/// the system compares against. Unrecognized ids are returned trimmed but
+/// otherwise verbatim — they're valid custom statuses, case preserved.
+fn normalize_status_id(s: &str) -> String {
+    let trimmed = s.trim();
+    match trimmed.to_ascii_lowercase().as_str() {
+        "backlog" => "backlog".to_string(),
+        "todo" | "to_do" | "to-do" => "todo".to_string(),
+        "in_progress" | "in-progress" | "inprogress" | "wip" => "in-progress".to_string(),
+        "review" | "ready_for_review" | "ready-for-review" => "review".to_string(),
+        "done" | "complete" | "completed" => "done".to_string(),
+        "canceled" | "cancelled" => "canceled".to_string(),
+        _ => trimmed.to_string(),
     }
 }
 
 impl std::fmt::Display for Column {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(self.as_str())
+        f.write_str(self.wire_str())
     }
 }
 
 impl std::str::FromStr for Column {
     type Err = crate::Error;
+    /// Infallible in practice: any string is a valid status id (legacy and
+    /// friendly spellings are normalized; everything else is taken as a
+    /// custom id). Kept as `FromStr` for the `str::parse` call sites and
+    /// the back-compat events-log parser.
     fn from_str(s: &str) -> crate::Result<Self> {
-        // Accept both the canonical form and a few friendly aliases users
-        // are likely to type at the CLI ("in-progress", "wip", "todo").
-        match s.trim().to_ascii_lowercase().as_str() {
-            "backlog" => Ok(Column::Backlog),
-            "todo" | "to_do" | "to-do" => Ok(Column::Todo),
-            "in_progress" | "in-progress" | "wip" => Ok(Column::InProgress),
-            "review" | "ready_for_review" | "ready-for-review" => Ok(Column::Review),
-            "done" | "complete" | "completed" => Ok(Column::Done),
-            other => Err(crate::Error::Other(format!("unknown column: {other}"))),
-        }
+        Ok(Column::from_status_id(s))
+    }
+}
+
+impl serde::Serialize for Column {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> std::result::Result<S::Ok, S::Error> {
+        // Emit the legacy snake_case wire form for core ids so an older
+        // binary keeps reading the `column:` field.
+        s.serialize_str(self.wire_str())
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for Column {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> std::result::Result<Self, D::Error> {
+        let raw = String::deserialize(d)?;
+        Ok(Column::from_status_id(raw))
     }
 }
 
@@ -1176,7 +1264,7 @@ pub struct Task {
     pub branch: Option<String>,
     /// Other task ids this task depends on. A task is **blocked** (see
     /// [`Task::is_blocked`]) when any of these are not yet in
-    /// [`Column::Done`]. Stored as a list rather than a reverse `blocks`
+    /// [`Column::done()`]. Stored as a list rather than a reverse `blocks`
     /// field so cycle detection and dep editing only touch one file.
     /// Cycles are rejected at save time by
     /// [`shelbi_state::validate_depends_on`].
@@ -1228,9 +1316,10 @@ impl Task {
     /// the project-wide validation that rejects unknown ids at save time
     /// — if a dep id is unknown here, the safer answer is still blocked).
     pub fn is_blocked(&self, columns: &std::collections::HashMap<String, Column>) -> bool {
+        let done = Column::done();
         self.depends_on
             .iter()
-            .any(|id| columns.get(id).copied() != Some(Column::Done))
+            .any(|id| columns.get(id) != Some(&done))
     }
 
     /// The workflow name this task runs under: the explicit
@@ -2023,25 +2112,51 @@ mod tests {
 
     #[test]
     fn column_serde_roundtrip() {
-        for c in Column::ALL {
+        for c in Column::core() {
             let y = serde_yaml::to_string(&c).unwrap();
             let back: Column = serde_yaml::from_str(&y).unwrap();
             assert_eq!(c, back);
         }
-        // Wire format is the snake_case form.
-        assert_eq!(serde_yaml::to_string(&Column::InProgress).unwrap().trim(), "in_progress");
+        // Wire format keeps the legacy snake_case form for the core ids so
+        // an older binary still parses the `column:` field.
+        assert_eq!(serde_yaml::to_string(&Column::in_progress()).unwrap().trim(), "in_progress");
+        // A custom / archived status round-trips through its verbatim id.
+        let canceled: Column =
+            serde_yaml::from_str(&serde_yaml::to_string(&Column::canceled()).unwrap()).unwrap();
+        assert_eq!(canceled, Column::canceled());
+        assert_eq!(serde_yaml::to_string(&Column::canceled()).unwrap().trim(), "canceled");
+        // The legacy snake_case on-disk spelling still deserializes onto the
+        // canonical kebab-case id, so old task files keep loading.
+        assert_eq!(
+            serde_yaml::from_str::<Column>("in_progress").unwrap(),
+            Column::in_progress()
+        );
     }
 
     #[test]
     fn column_from_str_friendly_aliases() {
         use std::str::FromStr;
-        assert_eq!(Column::from_str("backlog").unwrap(), Column::Backlog);
-        assert_eq!(Column::from_str("to-do").unwrap(), Column::Todo);
-        assert_eq!(Column::from_str("WIP").unwrap(), Column::InProgress);
-        assert_eq!(Column::from_str("in-progress").unwrap(), Column::InProgress);
-        assert_eq!(Column::from_str("ready-for-review").unwrap(), Column::Review);
-        assert_eq!(Column::from_str("complete").unwrap(), Column::Done);
-        assert!(Column::from_str("garbage").is_err());
+        assert_eq!(Column::from_str("backlog").unwrap(), Column::backlog());
+        assert_eq!(Column::from_str("to-do").unwrap(), Column::todo());
+        assert_eq!(Column::from_str("WIP").unwrap(), Column::in_progress());
+        assert_eq!(Column::from_str("in-progress").unwrap(), Column::in_progress());
+        assert_eq!(Column::from_str("ready-for-review").unwrap(), Column::review());
+        assert_eq!(Column::from_str("complete").unwrap(), Column::done());
+        // Any other string is a valid custom status id, not an error — the
+        // board no longer whitelists a fixed set of positions.
+        assert_eq!(Column::from_str("qa").unwrap().as_str(), "qa");
+        assert_eq!(Column::canceled().as_str(), "canceled");
+    }
+
+    #[test]
+    fn column_category_maps_core_ids_including_canceled() {
+        use crate::StatusCategory;
+        assert_eq!(Column::backlog().category(), StatusCategory::Backlog);
+        assert_eq!(Column::todo().category(), StatusCategory::Ready);
+        assert_eq!(Column::in_progress().category(), StatusCategory::Active);
+        assert_eq!(Column::review().category(), StatusCategory::Handoff);
+        assert_eq!(Column::done().category(), StatusCategory::Done);
+        assert_eq!(Column::canceled().category(), StatusCategory::Archived);
     }
 
     #[test]
@@ -2187,7 +2302,7 @@ updated_at: 2026-06-19T00:00:00Z
         let task = Task {
             id: "a".into(),
             title: "A".into(),
-            column: Column::Todo,
+            column: Column::todo(),
             priority: 0,
             assigned_to: None,
             workflow: None,
@@ -2200,11 +2315,11 @@ updated_at: 2026-06-19T00:00:00Z
             params: BTreeMap::new(),
         };
         let mut cols = std::collections::HashMap::new();
-        cols.insert("b".to_string(), Column::Done);
-        cols.insert("c".to_string(), Column::InProgress);
+        cols.insert("b".to_string(), Column::done());
+        cols.insert("c".to_string(), Column::in_progress());
         assert!(task.is_blocked(&cols));
 
-        cols.insert("c".to_string(), Column::Done);
+        cols.insert("c".to_string(), Column::done());
         assert!(!task.is_blocked(&cols));
 
         // Unknown dep id is treated as not-done.
@@ -2218,7 +2333,7 @@ updated_at: 2026-06-19T00:00:00Z
         let task = Task {
             id: "linux-probe".into(),
             title: "Tune the readiness probe".into(),
-            column: Column::Todo,
+            column: Column::todo(),
             priority: 0,
             assigned_to: None,
             workflow: None,
@@ -2889,7 +3004,7 @@ workspaces:
         Task {
             id: "t".into(),
             title: "T".into(),
-            column: Column::Todo,
+            column: Column::todo(),
             priority: 0,
             assigned_to: None,
             workflow: None,

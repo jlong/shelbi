@@ -1794,16 +1794,16 @@ mod tests {
         append_task_event(
             "fix-login",
             "default",
-            Column::Todo,
-            Column::InProgress,
+            Column::todo(),
+            Column::in_progress(),
             "assigned",
         )
         .unwrap();
         append_task_event(
             "fix-login",
             "default",
-            Column::InProgress,
-            Column::Review,
+            Column::in_progress(),
+            Column::review(),
             "workspace_review",
         )
         .unwrap();
@@ -1851,7 +1851,7 @@ mod tests {
         let home = fresh_home();
         std::env::set_var("SHELBI_HOME", &home);
 
-        append_task_event("a", "", Column::Todo, Column::Done, "assigned").unwrap();
+        append_task_event("a", "", Column::todo(), Column::done(), "assigned").unwrap();
         let log = std::fs::read_to_string(events_log_path().unwrap()).unwrap();
         let line = log.lines().next().unwrap();
         assert!(line.contains(" workflow=default "), "line: {line}");
@@ -1868,8 +1868,8 @@ mod tests {
         append_task_event(
             "ship-it",
             "feature-task",
-            Column::InProgress,
-            Column::Review,
+            Column::in_progress(),
+            Column::review(),
             "workspace:review-marker",
         )
         .unwrap();
@@ -2014,7 +2014,7 @@ mod tests {
         let home = fresh_home();
         std::env::set_var("SHELBI_HOME", &home);
 
-        append_task_event("a", "default", Column::Todo, Column::Done, "user moved\nit").unwrap();
+        append_task_event("a", "default", Column::todo(), Column::done(), "user moved\nit").unwrap();
         let log = std::fs::read_to_string(events_log_path().unwrap()).unwrap();
         let lines: Vec<&str> = log.lines().collect();
         // The reason newline must not produce a torn line — the line keeps
@@ -2050,8 +2050,8 @@ mod tests {
         append_task_event(
             hostile_id,
             hostile_workflow,
-            Column::Todo,
-            Column::InProgress,
+            Column::todo(),
+            Column::in_progress(),
             "assigned",
         )
         .unwrap();
@@ -2113,8 +2113,8 @@ mod tests {
                 append_task_event(
                     &format!("t{i:04}"),
                     "default",
-                    Column::Todo,
-                    Column::InProgress,
+                    Column::todo(),
+                    Column::in_progress(),
                     "assigned",
                 )
                 .unwrap();

@@ -42,7 +42,7 @@ pub fn load_task_by_id(project_name: &str, task_id: &str) -> Result<String> {
     // doesn't wedge the load.
     let workflow = shelbi_state::load_workflow(project_name, tf.task.workflow_or_default())
         .unwrap_or_else(|_| shelbi_core::default_workflow());
-    let status_id = tf.task.column.default_status_id();
+    let status_id = tf.task.column.as_str();
     let status = workflow.status(status_id);
     let required: BTreeSet<String> = status
         .map(|s| s.tags.iter().cloned().collect())
@@ -59,8 +59,8 @@ pub fn load_task_by_id(project_name: &str, task_id: &str) -> Result<String> {
     }
 
     // Busy = holding some *other* active (in-progress / handoff) task.
-    let mut active = shelbi_state::list_column(project_name, Column::InProgress)?;
-    active.extend(shelbi_state::list_column(project_name, Column::Review)?);
+    let mut active = shelbi_state::list_column(project_name, Column::in_progress())?;
+    active.extend(shelbi_state::list_column(project_name, Column::review())?);
     let busy: HashSet<&str> = active
         .iter()
         .filter(|t| t.task.id != task_id)
