@@ -1277,10 +1277,9 @@ function reviewEntryRows(entry: ReviewEntry, ready: boolean): Segment[][] {
 // workspace. `AppState.palette` carries the query + item list; the renderer
 // fuzzy-filters and highlights the top match.
 
-const PAL_INNER = 52 // text columns between the box's " " side margins
-const PAL_BOX = PAL_INNER + 4 // + │, left margin, right margin, │
+const PAL_INNER = 52 // text columns of content between the box's 1-cell side margins
 const PAL_BG = "#2a2a2a" // modal panel fill — lifted off the darker board body
-const PAL_BORDER = "#6a6a6a" // crisp modal edge against the scrim
+const PAL_BORDER = "#6a6a6a" // CSS border color for the modal frame + internal rules
 
 /**
  * Monospace cell width of `text`, counting the palette's emoji icons (💬 📋 ⚡,
@@ -1312,47 +1311,30 @@ function paletteMatch(query: string, text: string): boolean {
 }
 
 /**
- * Wrap one row's inner segments in the palette's side borders, padding (or, for
- * the selected row, filling) the interior to `PAL_INNER` so the box edges stay
- * vertically aligned. `fill` backs the whole interior — `PAL_BG` normally,
+ * Pad one row's inner segments to `PAL_INNER` columns, with a one-cell margin on
+ * each side, so every row is the same width and the description column and the
+ * box's right edge stay aligned. The frame itself is a CSS border on the section
+ * div (see `PaletteOverlay`), not a `│` glyph, so this row carries no border
+ * characters. `fill` backs the whole row edge-to-edge — `PAL_BG` normally,
  * `SEL_BG` for the highlighted row.
  */
 function palRow(inner: Segment[], fill: string = PAL_BG): Segment[] {
   const used = inner.reduce((a, s) => a + (s.cells ?? palWidth(s.text)), 0)
   const pad = Math.max(0, PAL_INNER - used)
   return [
-    { text: "│", color: PAL_BORDER, bg: PAL_BG },
     { text: " ", bg: fill },
     ...inner.map((s) => ({ ...s, bg: s.bg ?? fill })),
     { text: " ".repeat(pad + 1), bg: fill },
-    { text: "│", color: PAL_BORDER, bg: PAL_BG },
   ]
 }
 
-/** The titled top border: `╭─ shelbi · <project> ───╮`. */
-function palTopBorder(project: string): Segment[] {
-  const pre = "╭─ "
-  const brand = "shelbi"
-  const sep = " · "
-  const fixed = palWidth(pre) + palWidth(brand) + palWidth(sep) + palWidth(project) + 2
-  const dashes = "─".repeat(Math.max(0, PAL_BOX - fixed))
-  return [
-    { text: pre, color: PAL_BORDER, bg: PAL_BG },
-    { text: brand, color: TUI_FG, bold: true, bg: PAL_BG },
-    { text: sep, color: TUI_DARK_GRAY, bg: PAL_BG },
-    { text: project, color: TUI_CYAN, bold: true, bg: PAL_BG },
-    { text: ` ${dashes}╮`, color: PAL_BORDER, bg: PAL_BG },
-  ]
-}
-
-/** A `├───┤` interior divider spanning the box width. */
-function palDivider(): Segment[] {
-  return [{ text: `├${"─".repeat(PAL_BOX - 2)}┤`, color: PAL_BORDER, bg: PAL_BG }]
-}
-
-/** The plain `╰───╯` bottom border. */
-function palBottomBorder(): Segment[] {
-  return [{ text: `╰${"─".repeat(PAL_BOX - 2)}╯`, color: PAL_BORDER, bg: PAL_BG }]
+/** The title row `shelbi · <project>`, sitting above the `>` prompt. */
+function palTitleRow(project: string): Segment[] {
+  return palRow([
+    { text: "shelbi", color: TUI_FG, bold: true },
+    { text: " · ", color: TUI_DARK_GRAY },
+    { text: project, color: TUI_CYAN, bold: true },
+  ])
 }
 
 /** The `>` fuzzy-filter prompt row: the typed query + a block cursor. */
@@ -1402,21 +1384,19 @@ function palFooterRow(): Segment[] {
 
 /**
  * Pin every non-ASCII glyph in each palette row to its logical cell width so the
- * modal renders as a strict monospace grid, keeping the box's borders aligned
- * across rows.
+ * modal renders as a strict monospace grid, keeping the description column and
+ * the box's right edge aligned across rows.
  *
- * The mono font (Geist Mono) has no box-drawing (`─ │ ╭ ╮ ├ ┤ ╰ ╯`), block
- * (`▊`), arrow (`↑↓`) or middle-dot glyphs, so the browser substitutes a
- * fallback whose advance is a hair wider than one cell. A border/divider row is
- * 56 such glyphs and drifts ~56 sub-cells wider than an item row (which is
- * mostly 1-cell ASCII text plus just two `│` borders) — so the item/prompt rows'
- * right border ends up inset from the border rows', reading as a stray inner
- * vertical rule. Pinning each substituted glyph to its `palWidth` (via the same
+ * The mono font (Geist Mono) has no block (`▊`), arrow (`↑↓`) or middle-dot
+ * glyphs, so the browser substitutes a fallback whose advance is a hair wider
+ * than one cell. Left as natural text, a row carrying several of these drifts
+ * wider than a plain-ASCII row, so their right edges no longer line up under the
+ * CSS border. Pinning each substituted glyph to its `palWidth` (via the same
  * fixed-`cells` inline-block the emoji icons use) forces a true grid: the wider
- * glyph bleeds harmlessly past its cell (box lines stay continuous) but the
- * column advance is exact, so every row shares the same left/right edges. ASCII
- * runs are left as natural text (they already advance one cell) to keep the
- * label/description columns and the selected-row fill untouched.
+ * glyph bleeds harmlessly past its cell but the column advance is exact, so
+ * every row shares the same width. ASCII runs are left as natural text (they
+ * already advance one cell) to keep the label/description columns and the
+ * selected-row fill untouched.
  */
 function pinPaletteCells(rows: Segment[][]): Segment[][] {
   return rows.map((row) =>
@@ -1443,20 +1423,27 @@ function pinPaletteCells(rows: Segment[][]): Segment[][] {
 }
 
 /**
- * Build the palette modal's rows for the current query + item list: titled top
- * border, the `>` prompt, a divider, the fuzzy-filtered command list (top match
- * highlighted), then a divider, the footer hints, and the bottom border.
+ * Build the palette modal's rows, grouped into the three CSS-bordered sections
+ * `PaletteOverlay` stacks: `header` (the title + `>` prompt), `list` (the
+ * fuzzy-filtered command rows, top match highlighted), and `footer` (the
+ * keybinding hints). The frame and the rules between these sections are CSS
+ * borders on the section divs — not box-drawing rows — so there are no border,
+ * divider, or corner glyphs here.
  */
-function buildPaletteRows(palette: PaletteState, project: string): Segment[][] {
+function buildPaletteSections(
+  palette: PaletteState,
+  project: string,
+): { header: Segment[][]; list: Segment[][]; footer: Segment[][] } {
   const matches = palette.items.filter((it) => paletteMatch(palette.query, it.label))
-  const rows: Segment[][] = [palTopBorder(project), palPromptRow(palette.query), palDivider()]
-  if (matches.length === 0) {
-    rows.push(palRow([{ text: "no matching commands", color: TUI_DARK_GRAY }]))
-  } else {
-    matches.forEach((it, i) => rows.push(palItemRow(it, i === 0)))
+  const list =
+    matches.length === 0
+      ? [palRow([{ text: "no matching commands", color: TUI_DARK_GRAY }])]
+      : matches.map((it, i) => palItemRow(it, i === 0))
+  return {
+    header: pinPaletteCells([palTitleRow(project), palPromptRow(palette.query)]),
+    list: pinPaletteCells(list),
+    footer: pinPaletteCells([palFooterRow()]),
   }
-  rows.push(palDivider(), palFooterRow(), palBottomBorder())
-  return pinPaletteCells(rows)
 }
 
 // ── Panels ────────────────────────────────────────────────────────────
@@ -1730,13 +1717,45 @@ function TrafficLight({ color }: { color: string }) {
 }
 
 /**
+ * One CSS-bordered section of the palette modal: its monospace rows rendered as
+ * a `<pre>`, each row a block `<span>` so they stack without a trailing blank
+ * line (the frame is drawn by the parent div's border, so an extra newline would
+ * show as a gap inside the box). `borderTop` draws the internal rule that
+ * separates this section from the one above it.
+ */
+function PaletteSection({ rows, borderTop }: { rows: Segment[][]; borderTop?: boolean }) {
+  return (
+    <pre
+      className="m-0 whitespace-pre font-mono"
+      style={{
+        ...PRE_STYLE,
+        // Inherit the box's PAL_BG (segments still paint their own SEL_BG fill).
+        background: "transparent",
+        borderTop: borderTop ? `1px solid ${PAL_BORDER}` : undefined,
+      }}
+    >
+      {rows.map((row, i) => (
+        <span key={i} style={{ display: "block" }}>
+          <SegSpans segs={row} />
+        </span>
+      ))}
+    </pre>
+  )
+}
+
+/**
  * The centered ⌃P command-palette modal, drawn over the terminal body. A dim
  * scrim covers the board and the bordered box floats near the top-center, so the
  * palette reads as a modal overlay without disturbing the fixed-size grid
  * underneath. Non-interactive — the hero drives its query via keyframes.
+ *
+ * The frame is a CSS `border` + `border-radius` on the box div (rounded corners,
+ * no box-drawing glyphs); the internal rules between the query header, the
+ * command list, and the footer hints are `border-top`s on the sections. The rows
+ * keep the monospace grid for their content (icon + label + description).
  */
 function PaletteOverlay({ palette, project }: { palette: PaletteState; project: string }) {
-  const rows = buildPaletteRows(palette, project)
+  const { header, list, footer } = buildPaletteSections(palette, project)
   return (
     <div
       className="absolute inset-0 flex justify-center"
@@ -1744,20 +1763,22 @@ function PaletteOverlay({ palette, project }: { palette: PaletteState; project: 
       // the bottom as the query narrows it — the way a real fuzzy picker filters.
       style={{ alignItems: "flex-start", background: "rgba(0,0,0,0.5)", pointerEvents: "none" }}
     >
-      <pre
-        className="m-0 whitespace-pre font-mono"
+      <div
         style={{
-          ...PRE_STYLE,
-          background: PAL_BG,
           marginTop: 48,
+          background: PAL_BG,
+          border: `1px solid ${PAL_BORDER}`,
+          borderRadius: 8,
+          // Clip the section fills (and the internal rules) to the rounded corners.
+          overflow: "hidden",
           minWidth: "max-content",
           boxShadow: "0 16px 40px rgba(0,0,0,0.55)",
         }}
       >
-        {rows.map((row, i) => (
-          <Row key={i} segs={row} />
-        ))}
-      </pre>
+        <PaletteSection rows={header} />
+        <PaletteSection rows={list} borderTop />
+        <PaletteSection rows={footer} borderTop />
+      </div>
     </div>
   )
 }
