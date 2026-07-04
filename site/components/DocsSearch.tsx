@@ -55,6 +55,19 @@ async function loadIndex(): Promise<Fuse<SearchRecord>> {
 
 const MAX_RESULTS = 30
 
+// Shown under a "Jump to" group when the query is empty, so the palette is
+// useful the instant it opens. These flow through the same group/flat model as
+// real search hits (see `defaultGroups`), so keyboard nav and `go()` apply
+// unchanged.
+const DEFAULT_ENTRIES: { title: string; url: string }[] = [
+  { title: "Overview", url: "/docs" },
+  { title: "Getting Started", url: "/docs/guides/getting-started" },
+  {
+    title: "Understanding Workflows",
+    url: "/docs/guides/understanding-workflows",
+  },
+]
+
 type ResultGroup = {
   pageUrl: string
   pageTitle: string
@@ -257,8 +270,42 @@ function SearchModal({
     })
   }, [fuse, query])
 
+  const hasQuery = query.trim().length > 0
+
+  // Empty-query defaults, wrapped in the same group/flat shape as real hits so
+  // one render path and keyboard model cover both. Only ready once the index
+  // has loaded, matching the "Loading search…" gate below.
+  const defaultGroups = useMemo<ResultGroup[]>(() => {
+    if (!fuse) return []
+    return [
+      {
+        pageUrl: "__defaults__",
+        pageTitle: "",
+        sectionLabel: "Jump to",
+        items: DEFAULT_ENTRIES.map((entry) => ({
+          id: `default:${entry.url}`,
+          url: entry.url,
+          pageUrl: entry.url,
+          pageTitle: entry.title,
+          section: "",
+          sectionLabel: "Jump to",
+          heading: null,
+          content: "",
+          summary: null,
+        })),
+      },
+    ]
+  }, [fuse])
+
+  // With a query, live results; otherwise the default destinations. Typing
+  // swaps to `groups`; clearing brings the defaults back.
+  const activeGroups = hasQuery ? groups : defaultGroups
+
   // Flat list mirrors visual order for keyboard navigation.
-  const flat = useMemo(() => groups.flatMap((group) => group.items), [groups])
+  const flat = useMemo(
+    () => activeGroups.flatMap((group) => group.items),
+    [activeGroups],
+  )
 
   // Reset the highlight whenever the query changes — done during render (the
   // React-recommended "adjust state" pattern) rather than in an effect.
@@ -318,7 +365,6 @@ function SearchModal({
     }
   }
 
-  const hasQuery = query.trim().length > 0
   let flatIndex = -1
 
   const modal = (
@@ -337,10 +383,10 @@ function SearchModal({
         role="dialog"
         aria-modal="true"
         aria-label="Search documentation"
-        className="relative z-10 mt-[8vh] flex max-h-[70vh] w-full max-w-xl flex-col overflow-hidden rounded-md border border-gray-4 bg-bg shadow-2xl"
+        className="relative z-10 mt-[8vh] flex max-h-[70vh] w-full max-w-xl flex-col overflow-hidden rounded-md border border-gray-5 bg-bg shadow-2xl"
       >
         {/* Search input row */}
-        <div className="flex items-center gap-1.5 border-b border-gray-4 px-2">
+        <div className="flex items-center gap-1.5 border-b border-gray-5 px-2">
           <MagnifyingGlassIcon
             className="h-2.5 w-2.5 shrink-0 text-gray-6"
             aria-hidden="true"
@@ -361,36 +407,38 @@ function SearchModal({
             autoComplete="off"
             autoCorrect="off"
             spellCheck={false}
-            className="h-5 w-full bg-transparent font-sans text-base text-fg outline-none placeholder:text-gray-5"
+            className="h-5 w-full bg-transparent font-sans text-base text-fg outline-none placeholder:text-gray-6"
           />
         </div>
 
         {/* Results / states */}
         <div className="min-h-0 flex-1 overflow-y-auto overscroll-contain">
           {loadError ? (
-            <p className="px-2 py-3 text-center font-sans text-sm text-gray-6">
+            <p className="px-2 py-3 text-center font-sans text-sm text-gray-7">
               Couldn’t load the search index. Check your connection and try
               again.
             </p>
-          ) : !hasQuery ? (
-            <div className="px-2 py-4 text-center font-sans text-sm text-gray-6">
-              {fuse
-                ? "Search titles, sections, and page content."
-                : "Loading search…"}
+          ) : !fuse ? (
+            <div className="px-2 py-4 text-center font-sans text-sm text-gray-7">
+              Loading search…
             </div>
-          ) : flat.length === 0 ? (
-            <p className="px-2 py-4 text-center font-sans text-sm text-gray-6">
+          ) : hasQuery && flat.length === 0 ? (
+            <p className="px-2 py-4 text-center font-sans text-sm text-gray-7">
               No results for{" "}
               <span className="font-medium text-fg">“{query.trim()}”</span>.
             </p>
           ) : (
             <ul ref={listRef} id={listId} role="listbox" className="py-1">
-              {groups.map((group) => (
+              {activeGroups.map((group) => (
                 <li key={group.pageUrl} role="presentation">
-                  <div className="px-2 pt-1.5 pb-0.5 font-mono text-xs font-medium tracking-wider text-gray-6 uppercase">
+                  <div className="px-2 pt-1.5 pb-0.5 font-mono text-xs font-medium tracking-wider text-gray-7 uppercase">
                     {group.sectionLabel}
-                    <span className="text-gray-5"> › </span>
-                    {group.pageTitle}
+                    {group.pageTitle ? (
+                      <>
+                        <span className="text-gray-6"> › </span>
+                        {group.pageTitle}
+                      </>
+                    ) : null}
                   </div>
                   <ul role="presentation">
                     {group.items.map((record) => {
@@ -419,7 +467,7 @@ function SearchModal({
                               {!isPage ? (
                                 <span
                                   aria-hidden="true"
-                                  className="font-mono text-xs text-gray-5"
+                                  className="font-mono text-xs text-gray-6"
                                 >
                                   #
                                 </span>
@@ -429,7 +477,7 @@ function SearchModal({
                               </span>
                             </div>
                             {snippet ? (
-                              <p className="mt-0.5 line-clamp-1 font-sans text-xs text-gray-6">
+                              <p className="mt-0.5 line-clamp-1 font-sans text-xs text-gray-7">
                                 <Highlight text={snippet} terms={terms} />
                               </p>
                             ) : null}
@@ -445,7 +493,7 @@ function SearchModal({
         </div>
 
         {/* Keyboard legend */}
-        <div className="flex items-center gap-2 border-t border-gray-4 px-2 py-1 font-sans text-xs text-gray-6">
+        <div className="flex items-center gap-2 border-t border-gray-5 px-2 py-1 font-sans text-xs text-gray-7">
           <LegendKey label="↑↓" text="Navigate" />
           <LegendKey label="↵" text="Open" />
           <LegendKey label="Esc" text="Close" />
@@ -461,7 +509,7 @@ function SearchModal({
 function LegendKey({ label, text }: { label: string; text: string }) {
   return (
     <span className="inline-flex items-center gap-1">
-      <kbd className="rounded-[3px] border border-gray-4 bg-gray-2 px-1 font-mono text-gray-6">
+      <kbd className="rounded-[3px] border border-gray-5 bg-gray-2 px-1 font-mono text-gray-7">
         {label}
       </kbd>
       <span className="hidden sm:inline">{text}</span>
