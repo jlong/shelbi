@@ -257,10 +257,11 @@ export type AppState = {
    */
   minBodyRows?: number
   /**
-   * When set, the ⌃P command palette renders as a centered modal over the active
-   * view (the board stays put underneath, dimmed by a scrim). Omitted (the
-   * default) shows no palette. Only the hero animation's ending beats set it —
-   * opening the palette, typing to filter the list down to `alpha`, then clearing
+   * When set, the ⌃P command palette renders as a centered box-drawing frame over
+   * the active view (the board stays put and undimmed underneath, the console
+   * background bleeding around the frame). Omitted (the default) shows no palette.
+   * Only the hero animation's ending beats set it — opening the palette, typing to
+   * filter the list down to `alpha`, then clearing
    * it as the alpha workspace activates.
    */
   palette?: PaletteState
@@ -1266,19 +1267,25 @@ function reviewEntryRows(entry: ReviewEntry, ready: boolean): Segment[][] {
 }
 
 // ── Command palette ───────────────────────────────────────────────────
-// The centered ⌃P command palette overlay: a bordered modal (`shelbi ·
-// <project>` title) with a `>` fuzzy-filter prompt over the command list — the
-// nav views, a Zen toggle, every workspace, and the project/session actions.
-// It's drawn as an absolutely-positioned box centered over the dashboard (the
-// board stays put underneath, dimmed by a scrim) rather than as a pane in the
-// monospace grid, so the frame width/height are untouched. The hero types the
+// The centered ⌃P command palette overlay: a thin box-drawing-style frame
+// (`shelbi · <project>` title) with a `>` fuzzy-filter prompt over the command
+// list — the nav views, a Zen toggle, every workspace, and the project/session
+// actions. It's drawn as an absolutely-positioned box centered over the dashboard
+// (the board stays put and undimmed underneath, the console background bleeding
+// around the frame) rather than as a pane in the monospace grid, so the frame
+// width/height are untouched. The hero types the
 // prompt from empty to `alpha` to filter the list down before activating that
 // workspace. `AppState.palette` carries the query + item list; the renderer
 // fuzzy-filters and highlights the top match.
 
 const PAL_INNER = 52 // text columns of content between the box's 1-cell side margins
-const PAL_BG = "#2a2a2a" // modal panel fill — lifted off the darker board body
-const PAL_BORDER = "#6a6a6a" // CSS border color for the modal frame + internal rules
+// The palette reads as a box-drawing frame on the console, not a modal card: its
+// interior is the same background as the terminal body (`TUI_BG`) so the console
+// bleeds continuously under and around the border, and the frame + internal rules
+// are the console's muted divider gray (`TUI_DIVIDER`) — the same thin line the
+// sidebar/board rules use — not a bright card edge.
+const PAL_BG = TUI_BG // interior fill = terminal body, so no panel lifts off the board
+const PAL_BORDER = TUI_DIVIDER // thin muted console rule for the frame + internal rules
 
 /**
  * Monospace cell width of `text`, counting the palette's emoji icons (💬 📋 ⚡,
@@ -1742,15 +1749,18 @@ function PaletteSection({ rows, borderTop }: { rows: Segment[][]; borderTop?: bo
 }
 
 /**
- * The centered ⌃P command-palette modal, drawn over the terminal body. A dim
- * scrim covers the board and the bordered box floats near the top-center, so the
- * palette reads as a modal overlay without disturbing the fixed-size grid
- * underneath. Non-interactive — the hero drives its query via keyframes.
+ * The centered ⌃P command-palette, drawn over the terminal body so it reads like
+ * a box-drawing frame on the console — not a modal card floating above it.
+ * Non-interactive — the hero drives its query via keyframes.
  *
- * The frame is a CSS `border` + `border-radius` on the box div (rounded corners,
- * no box-drawing glyphs); the internal rules between the query header, the
- * command list, and the footer hints are `border-top`s on the sections. The rows
- * keep the monospace grid for their content (icon + label + description).
+ * There's no scrim, fill lift, or drop shadow: the box's interior is the same
+ * `TUI_BG` as the terminal body and the board underneath is left undimmed, so the
+ * console background is continuous under and around the thin `TUI_DIVIDER` border
+ * — the way a box-drawing glyph is just a stroke inside a cell that otherwise
+ * shows the same background. The frame is a CSS `border` (clean corners, no `│ ─`
+ * junction jank); the internal rules between the query header, the command list,
+ * and the footer hints are `border-top`s on the sections. The rows keep the
+ * monospace grid for their content (icon + label + description).
  */
 function PaletteOverlay({ palette, project }: { palette: PaletteState; project: string }) {
   const { header, list, footer } = buildPaletteSections(palette, project)
@@ -1759,18 +1769,23 @@ function PaletteOverlay({ palette, project }: { palette: PaletteState; project: 
       className="absolute inset-0 flex justify-center"
       // Top-anchored so the box's top edge stays put while the list shrinks from
       // the bottom as the query narrows it — the way a real fuzzy picker filters.
-      style={{ alignItems: "flex-start", background: "rgba(0,0,0,0.5)", pointerEvents: "none" }}
+      // No scrim: the board stays at full console brightness on both sides of the
+      // border so the terminal background bleeds continuously around the frame.
+      style={{ alignItems: "flex-start", background: "transparent", pointerEvents: "none" }}
     >
       <div
         style={{
           marginTop: 48,
+          // Interior = terminal body, so the same background reads on both sides
+          // of the thin border and the box doesn't lift off the console as a card.
           background: PAL_BG,
           border: `1px solid ${PAL_BORDER}`,
-          borderRadius: 8,
+          // A tight radius keeps the corners clean (like a rounded box-drawing
+          // junction) without the card-like softness of a large modal radius.
+          borderRadius: 3,
           // Clip the section fills (and the internal rules) to the rounded corners.
           overflow: "hidden",
           minWidth: "max-content",
-          boxShadow: "0 16px 40px rgba(0,0,0,0.55)",
         }}
       >
         <PaletteSection rows={header} />
