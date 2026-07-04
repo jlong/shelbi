@@ -20,17 +20,20 @@ any project type and there is no special "review" machinery in the engine.
 
 ## Current state (what exists today)
 
-- **`ReviewConfig`** (`crates/shelbi-core/src/model.rs` ~L580), under the project's
+- **`ReviewConfig`** (`crates/shelbi-core/src/model.rs` \~L580), under the project's
   `review:` key: `base_port` (3000), `port_stride` (10), `setup: Vec<String>`,
   `serve: Option<String>`, `ready_probe: { http, timeout: 90s }`.
+
 - **`WorkspaceSpec.role = review`** — the generic tag already exists on a workspace.
+
 - **Transitions** (`transition.rs::execute_transition` / `run_action`): an edge's
-  `actions` is a fixed enum set — `PushBranch, OpenPr, ClosePr, Merge,
-  DeleteBranch, Restack`. No arbitrary commands.
+  `actions` is a fixed enum set — `PushBranch, OpenPr, ClosePr, Merge, DeleteBranch, Restack`. No arbitrary commands.
+
 - **Review loading** (`review.rs` + `workspace::load_review_workspace`): picks a
   free `role: review` slot, moves the branch onto its worktree, injects `$PORT`
-  (`review_workspace_port` from base_port/stride), starts the `review` agent to
+  (`review_workspace_port` from base\_port/stride), starts the `review` agent to
   run setup/serve/probe.
+
 - Recently shipped: the **agent transition marker** (`.claude/shelbi-transition`)
   lets an agent trigger a transition, validated against the workflow's
   `transitions`. This plan extends transitions to *run commands* when they fire.
@@ -63,24 +66,30 @@ transitions:
       - <stop server / cleanup, if needed>
 ```
 
-- **`$SLOT` env.** Each workspace carries a numeric **`slot`** key. Shelbi exposes
+- **`$SLOT`** **env.** Each workspace carries a numeric **`slot`** key. Shelbi exposes
   it to every transition command as **`$SLOT`**; the command does its own math
   (`3000 + $SLOT` → 3001 for slot 1). Shelbi does NOT inject a computed `$PORT` —
   `$SLOT` is generic (ports, dirs, DB names, whatever the command needs).
   Collision-free concurrency without a bespoke serving config.
+
 - Also inject `$SHELBI_TASK`, `$SHELBI_BRANCH`, `$SHELBI_WORKTREE`, `$SHELBI_MACHINE`.
+
 - Commands run in the task's worktree, on the workspace's machine, **host-routed
-  through `shelbi_ssh::run`** (works on devbox).
-- **`ready` + `ready_timeout`.** After the enter commands, Shelbi polls the `ready`
+  through** **`shelbi_ssh::run`** (works on devbox).
+
+- **`ready`** **+** **`ready_timeout`.** After the enter commands, Shelbi polls the `ready`
   command until it exits 0 (or the timeout, default 90s), then marks the review
   serving/ready for the human. Generic — not HTTP-specific.
+
 - **Teardown is not magic.** It is simply the `run:` commands on whatever exit
   transition the workflow declares (`review → done`, `review → in-progress` on a
   bounce, etc.). No auto-on-pane-close hook. (Transitions are the mechanism: a
   status change requires a declared transition; commands run when it fires.
   A `to: "*"` wildcard transition may be worth supporting so one teardown rule
   covers all exits — see Open items.)
+
 - `actions` (git primitives) and `run` (shell) compose on one edge.
+
 - **Serve lifecycle (Phase-1 detail):** the long-running server command holds the
   review agent's pane; Shelbi treats the transition as entered once the enter
   commands are launched and uses `ready` to decide when it's serving. Exact
@@ -105,18 +114,21 @@ and execute the status's enter-transition commands instead.
 - Existing `review:` blocks are **silently ignored** (like the removed
   `contextstore_sync` — tolerate the legacy key, don't act on it, don't migrate
   the user's file). Users opt into the new workflow form. No on-disk migration.
+
 - Existing `role: review` workspaces keep working; they gain a `slot` number
   (default by declaration order if unset).
 
 ## Open items (smaller, resolve during implementation)
 
-- **`to: "*"` wildcard transitions** — jlong noted a status change requires a
+- **`to: "*"`** **wildcard transitions** — jlong noted a status change requires a
   declared transition. Consider a wildcard target so one exit rule (teardown) can
   cover all exits from a status. Confirm whether unlisted edges stay any-to-any or
   become "must be declared."
+
 - **Serve foreground/background mechanics** (see §1) — how the long-running server
   is held and torn down.
-- **Default `slot`** assignment when a workspace omits the key.
+
+- **Default** **`slot`** assignment when a workspace omits the key.
 
 ## Implementation phases
 
@@ -124,9 +136,11 @@ and execute the status's enter-transition commands instead.
   status `workspace_tag`, workspace `slot`; execute commands host-routed in
   `execute_transition` with the `$SLOT`/`$SHELBI_*` env; readiness polling. Tests:
   enter/exit ordering, host routing, env injection, ready timeout, failure short-circuit.
+
 - **Phase 2 (app):** reroute review — `shelbi review` / `load_review_workspace`
   use the status tag + transition commands instead of `ReviewConfig`; remove
   `ReviewConfig`/`ReadyProbe`; ignore legacy `review:` blocks. Tests.
+
 - **Phase 3 (docs):** rewrite `concepts/review-workspaces.mdx`,
   `configuration/workflow.mdx`, `guides/getting-started/review-workspaces.mdx` to
   the generic model; remove the `review:` block reference; document `$SLOT`,
@@ -136,14 +150,19 @@ and execute the status's enter-transition commands instead.
 
 - `crates/shelbi-core/src/model.rs` — Transition (`run`, `ready`, `ready_timeout`),
   Status (`workspace_tag`), WorkspaceSpec (`slot`), remove `ReviewConfig`/`ReadyProbe`.
+
 - `crates/shelbi-orchestrator/src/transition.rs` — run shell commands on an edge.
+
 - `crates/shelbi-orchestrator/src/review.rs`, `workspace.rs` — load via tag +
   commands; `$SLOT`; readiness; remove ReviewConfig reads.
+
 - `crates/shelbi-tui/src/poller.rs` — route a status to its tagged workspace.
+
 - Docs as in Phase 3.
 
 ## Relationship to existing plans
 
 - Supersedes the serving-model portion of `Plans/review-workspaces.md`.
+
 - Builds on `Plans/workflow-transition-hooks.md` and the shipped agent send-back /
   transition-marker feature.
