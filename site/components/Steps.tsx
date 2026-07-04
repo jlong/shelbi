@@ -29,13 +29,18 @@ type StepProps = {
 export function Step({ title, children, number, isLast }: StepProps) {
   return (
     <div className="relative flex gap-3 pb-6 last:pb-0">
-      <div className="relative flex w-3 shrink-0 justify-center">
-        {/* Connecting rule: runs from just below this marker to the next
-            step's marker. Absolute + bottom-0 lets it span the row's padding;
-            hidden on the last step. */}
+      {/* `mt-0.5` drops the marker column so the circle's center lines up with
+          the optical center of the headline's first line rather than the row
+          top. The rule lives inside this column, so its `top-3` start stays
+          pinned just below the circle without adjustment. */}
+      <div className="relative mt-0.5 flex w-3 shrink-0 justify-center">
+        {/* Connecting rule: runs from just below this marker toward the next
+            step's marker. The `-bottom-0.5` cancels the column's `mt-0.5` so the
+            reach past this row is unchanged from before the shift; hidden on the
+            last step. */}
         {!isLast && (
           <div
-            className="absolute top-3 bottom-0 left-1/2 w-px -translate-x-1/2 bg-gray-4"
+            className="absolute top-3 -bottom-0.5 left-1/2 w-px -translate-x-1/2 bg-gray-4"
             aria-hidden="true"
           />
         )}
