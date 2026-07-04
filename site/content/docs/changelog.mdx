@@ -9,7 +9,7 @@ on `main` — newest first. This page is hand-curated: it tracks capabilities, n
 every commit, so small copy edits and cosmetic tweaks are folded away. Entries
 are prose with `code` and links where they earn their place.
 
-### 2026-07-03
+### July 3, 2026
 
 **Usage-limit pause detection.** The workspace poller now recognizes when a
 worker has stalled on an agent usage limit rather than genuinely working, and
@@ -53,7 +53,7 @@ there's no `{{assistant_name}}` substitution at render time. The wizard's
 sole phase is project setup, and `~/.shelbi/shelbi.yaml` is now just the
 per-project `last_launched` index.
 
-### 2026-07-02
+### July 2, 2026
 
 **Review workspaces.** Reviewing a finished task now loads its branch into a
 dedicated, long-lived review workspace with its own agent, rather than a
@@ -62,7 +62,7 @@ workspace, a review queue tracks what's waiting, and the sidebar gains `Ready`
 and `Queued` sections so you can see the pipeline at a glance. The server pane
 persists across reviews and is reaped on completion.
 
-### 2026-07-01
+### July 1, 2026
 
 **In-repo project config.** A project's configuration can now live inside the
 repo at `.shelbi/project.yaml` instead of only under `~/.shelbi/`, so it can be
@@ -70,7 +70,7 @@ committed and shared with a team. `shelbi migrate-to-in-repo` converts an
 existing global project in one step, and resolution is mode-aware about which
 half of the config is user-local versus shared.
 
-### 2026-06-30
+### June 30, 2026
 
 **Two-way worker communication.** Workers can talk back to the orchestrator, not
 just the other way around. A hub-side Unix socket (reverse-forwarded to remote
@@ -80,7 +80,7 @@ in the prompt. On top of it sits a clarification loop — a worker can ask a
 question and block for an acknowledged answer — plus `launchd`/`systemd`
 supervision so the hub socket survives restarts.
 
-### 2026-06-29
+### June 29, 2026
 
 **Custom agents and configurable workflows.** The worker concept was reframed as
 a *workspace* that runs a named *agent*, and dispatch resolves which agent to run
@@ -99,7 +99,7 @@ marker into each repo to identify the active project; resolution now scans
 matches the current directory against them (deepest match wins). Less stray state
 on disk; the project YAML is the single source of truth.
 
-### 2026-06-25
+### June 25, 2026
 
 **Hub heartbeats.** The hub-side workspace-state poller appends a periodic
 `<ts> project=<name> heartbeat` line to `~/.shelbi/events.log`, giving the
@@ -119,7 +119,7 @@ under `shelbi events tail`. See
 [the events log](/docs/concepts/events-log#heartbeats) for the line shape
 and rationale.
 
-### 2026-06-24
+### June 24, 2026
 
 **Zen Mode.** An opt-in autopilot that lets the orchestrator promote and merge
 low-risk work without waiting on you. A per-action confidence bar, configurable
@@ -128,7 +128,7 @@ the `ZEN ON` pill in the sidebar (toggle with `Alt+Z`) makes the state
 unmistakable. Zen auto-disables after an orchestrator crash so it never runs
 unsupervised. Drive it from the CLI with `shelbi zen on|off|pause|status`.
 
-### 2026-06-23
+### June 23, 2026
 
 The first public cut of Shelbi — an open-source agent orchestrator for the
 terminal, built on tmux. You talk to one orchestrator agent; it delegates work to
