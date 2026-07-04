@@ -242,7 +242,6 @@ pub fn setup_one_project() -> Result<()> {
         heartbeat: shelbi_core::HeartbeatConfig::default(),
         git: shelbi_core::GitConfig::default(),
         review: Default::default(),
-        contextstore_sync: Vec::new(),
         detected_shapes: Vec::new(),
     };
     project.validate_workspaces().map_err(|e| anyhow!(e))?;

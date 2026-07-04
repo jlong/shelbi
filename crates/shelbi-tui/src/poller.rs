@@ -65,10 +65,9 @@ use chrono::{DateTime, Utc};
 use shelbi_core::{default_workflow, Column, Project, StatusCategory, Workflow};
 use shelbi_orchestrator::supervision::{SupervisionAction, SupervisionInputs, SupervisionState};
 use shelbi_state::{
-    append_contextstore_event, append_heartbeat_event, append_rebase_event,
-    append_workspace_dialog_event, append_workspace_event, append_workspace_pause_event,
-    events_log_path, load_workspace_status, parse_pane_title_marker, save_workspace_status,
-    WorkspaceState, WorkspaceStatus,
+    append_heartbeat_event, append_rebase_event, append_workspace_dialog_event,
+    append_workspace_event, append_workspace_pause_event, events_log_path, load_workspace_status,
+    parse_pane_title_marker, save_workspace_status, WorkspaceState, WorkspaceStatus,
 };
 
 /// How often each per-workspace thread re-verifies its host's reverse
@@ -840,10 +839,9 @@ fn maybe_promote_to_review(
         }
     };
 
-    // Capture the task body up front: we use it both for the column move
-    // path (to gate sync on the ContextStore heuristic) and to know we
-    // had a valid task at all. If the load fails or the task isn't ours
-    // in-progress, we still fall through to clear the (stale) marker.
+    // Load the task up front so we can confirm we had a valid task at all.
+    // If the load fails or the task isn't ours in-progress, we still fall
+    // through to clear the (stale) marker.
     let task_file = shelbi_state::load_task(&project.name, &task_id);
 
     match &task_file {
@@ -884,14 +882,6 @@ fn maybe_promote_to_review(
                 }
             }
             tracing::info!(workspace = %workspace.name, task = %task_id, "promoted task to review via marker");
-
-            // Best-effort: pull any ContextStore writes the workspace made
-            // on its machine back to hub. Skipped silently when the
-            // project has no `contextstore_sync` configured, when the
-            // body doesn't trip the heuristic, or when the workspace is
-            // local. Failures log to events.log but never block the
-            // promotion — that's the contract on this path.
-            sync_contextstore_from_workspace(project, machine, &tf.body);
 
             // Close the dev session on completion (spec §16). The branch is
             // now safely promoted, so the finished pane has no reason to
@@ -1292,69 +1282,6 @@ fn rebase_workspace_branch_before_review(
                 detail = %detail,
                 "auto-rebase outcome",
             );
-        }
-    }
-}
-
-/// Run the cross-machine ContextStore sync after a successful review
-/// promotion and record one `events.log` line per attempted space.
-///
-/// Keeping this side-effecting wrapper next to the poller means the
-/// `contextstore` module stays purely about the rsync mechanic — the
-/// "where to log it" lives with the rest of the poller's event-logging
-/// calls. Failures here are intentionally swallowed: the task is already
-/// in review and the user can re-run sync manually if needed.
-fn sync_contextstore_from_workspace(
-    project: &Project,
-    machine: &shelbi_core::Machine,
-    task_body: &str,
-) {
-    let outcomes =
-        shelbi_orchestrator::contextstore::sync_after_review(project, machine, task_body);
-    for outcome in outcomes {
-        let status = outcome.status.label();
-        let detail = outcome.status.detail();
-        let detail_for_log = if detail.is_empty() {
-            "-".to_string()
-        } else {
-            detail.clone()
-        };
-        if let Err(e) = append_contextstore_event(
-            &outcome.space,
-            &outcome.machine,
-            status,
-            &detail_for_log,
-        ) {
-            tracing::warn!(
-                space = %outcome.space,
-                machine = %outcome.machine,
-                error = %e,
-                "append_contextstore_event failed",
-            );
-        }
-        match outcome.status {
-            shelbi_orchestrator::contextstore::SyncStatus::Ok => {
-                tracing::info!(
-                    space = %outcome.space,
-                    machine = %outcome.machine,
-                    "contextstore synced from remote workspace",
-                );
-            }
-            shelbi_orchestrator::contextstore::SyncStatus::Failed { .. } => {
-                tracing::warn!(
-                    space = %outcome.space,
-                    machine = %outcome.machine,
-                    detail = %detail,
-                    "contextstore sync failed",
-                );
-            }
-            shelbi_orchestrator::contextstore::SyncStatus::SkippedLocal => {
-                tracing::debug!(
-                    space = %outcome.space,
-                    machine = %outcome.machine,
-                    "contextstore sync skipped — workspace is local",
-                );
-            }
         }
     }
 }
@@ -1795,7 +1722,6 @@ mod tests {
             heartbeat: shelbi_core::HeartbeatConfig::default(),
             git: shelbi_core::GitConfig::default(),
             review: Default::default(),
-            contextstore_sync: Vec::new(),
             detected_shapes: Vec::new(),
         }
     }
@@ -1958,126 +1884,6 @@ mod tests {
             "task already in review must not be pulled back out"
         );
         assert!(!marker.exists(), "stale marker should be cleared");
-
-        std::env::remove_var("SHELBI_HOME");
-        let _ = std::fs::remove_dir_all(&home);
-    }
-
-    #[test]
-    fn promotion_with_contextstore_match_on_local_logs_skipped_event() {
-        // Local-host workspace — sync must short-circuit to SkippedLocal so
-        // we don't shell out to rsync for files already on hub. Even on
-        // the skip path we still log the decision: that's the contract
-        // for surfacing what happened.
-        let _g = crate::test_support::ENV_LOCK.lock().unwrap();
-        let home = std::env::temp_dir().join(format!(
-            "shelbi-poller-cstore-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        std::fs::create_dir_all(&home).unwrap();
-        std::env::set_var("SHELBI_HOME", &home);
-
-        let work_dir = home.join("repo");
-        std::fs::create_dir_all(&work_dir).unwrap();
-        let mut project = local_project(&work_dir);
-        project
-            .contextstore_sync
-            .push(shelbi_core::ContextStoreSyncSpec {
-                space: "Shelbi".into(),
-                path: std::path::PathBuf::from("~/Documents/ContextStore/shelbi"),
-            });
-        // Body trips the heuristic via the `Shelbi/` substring.
-        shelbi_state::save_task(
-            "demo",
-            &in_progress_task("write-notes", "alpha"),
-            "Write Shelbi/Research/notes.md",
-        )
-        .unwrap();
-        let _marker = write_marker(&project, "write-notes\n");
-
-        maybe_promote_to_review(
-            &project,
-            &project.workspaces[0],
-            &project.machines[0],
-            &Host::Local,
-            &TmuxAddr { session: "s".into(), window: "w".into() },
-        );
-
-        let log = std::fs::read_to_string(shelbi_state::events_log_path().unwrap()).unwrap();
-        let cs_lines: Vec<&str> = log
-            .lines()
-            .filter(|l| l.contains(" contextstore "))
-            .collect();
-        assert_eq!(cs_lines.len(), 1, "log: {log:?}");
-        // Local workspace = SkippedLocal status (`skipped-local`).
-        assert!(
-            cs_lines[0].contains("space=Shelbi"),
-            "line: {}",
-            cs_lines[0]
-        );
-        assert!(
-            cs_lines[0].contains("status=skipped-local"),
-            "line: {}",
-            cs_lines[0]
-        );
-
-        std::env::remove_var("SHELBI_HOME");
-        let _ = std::fs::remove_dir_all(&home);
-    }
-
-    #[test]
-    fn promotion_without_contextstore_heuristic_skips_sync_event() {
-        // Body doesn't trip the heuristic — no `cstore` keyword, no
-        // matching space path. The sync code should never run, so
-        // events.log gets no `contextstore` line even though the project
-        // is configured. Important: the heuristic exists precisely to
-        // avoid rsync'ing for every single review handoff.
-        let _g = crate::test_support::ENV_LOCK.lock().unwrap();
-        let home = std::env::temp_dir().join(format!(
-            "shelbi-poller-cstore-nomatch-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        std::fs::create_dir_all(&home).unwrap();
-        std::env::set_var("SHELBI_HOME", &home);
-
-        let work_dir = home.join("repo");
-        std::fs::create_dir_all(&work_dir).unwrap();
-        let mut project = local_project(&work_dir);
-        project
-            .contextstore_sync
-            .push(shelbi_core::ContextStoreSyncSpec {
-                space: "Shelbi".into(),
-                path: std::path::PathBuf::from("~/Documents/ContextStore/shelbi"),
-            });
-        shelbi_state::save_task(
-            "demo",
-            &in_progress_task("fix-login", "alpha"),
-            "Fix the Safari SSO bug.",
-        )
-        .unwrap();
-        let _marker = write_marker(&project, "fix-login\n");
-
-        maybe_promote_to_review(
-            &project,
-            &project.workspaces[0],
-            &project.machines[0],
-            &Host::Local,
-            &TmuxAddr { session: "s".into(), window: "w".into() },
-        );
-
-        let log = std::fs::read_to_string(shelbi_state::events_log_path().unwrap()).unwrap();
-        assert!(
-            !log.contains(" contextstore "),
-            "no cstore-touching body → no sync event; log: {log:?}"
-        );
 
         std::env::remove_var("SHELBI_HOME");
         let _ = std::fs::remove_dir_all(&home);

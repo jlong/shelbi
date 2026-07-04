@@ -554,30 +554,6 @@ pub fn append_supervision_event(
     append_event_line(&line)
 }
 
-/// Append `<rfc3339> contextstore space=<space> machine=<machine> status=<status> detail=<detail>`
-/// to `~/.shelbi/events.log`. Use this to record cross-machine ContextStore
-/// sync attempts run after a remote workspace hands off for review, so the user
-/// (and the orchestrator) can see when a workspace's `cstore` writes did — or
-/// did not — make it back to the hub copy.
-///
-/// `detail` is folded to a single token (whitespace → underscores) so the
-/// line stays parseable; pass the short rsync stderr excerpt or a status label.
-pub fn append_contextstore_event(
-    space: &str,
-    machine: &str,
-    status: &str,
-    detail: &str,
-) -> Result<()> {
-    let ts = Utc::now().to_rfc3339();
-    let space = sanitize_field(space);
-    let machine = sanitize_field(machine);
-    let status = sanitize_reason(status);
-    let detail = sanitize_reason(detail);
-    append_event_line(&format!(
-        "{ts} contextstore space={space} machine={machine} status={status} detail={detail}"
-    ))
-}
-
 /// Append `<rfc3339> project=<name> mode=zen <prev> -> <new> reason=<source>`
 /// to `~/.shelbi/events.log`. The orchestrator's tail watches this line shape
 /// to react to Zen Mode toggles without re-reading `state.json`. Sources
