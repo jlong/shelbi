@@ -39,6 +39,37 @@ This is the same "a reviewer is a role you can drop on a status" idea the
 the role that decides *how* the work gets done. Here we author a new role
 and give it a status to own.
 
+## Other agents you could build
+
+The Adversarial Review agent is a **gate**: it reviews work and can send it
+back. That's one of two shapes a custom agent tends to take, and the
+distinction is worth keeping in mind as you design your own.
+
+- **Gate agents** review a task and can bounce it back to an earlier status
+  when they find problems. They rely on
+  [send-back](/docs/guides/doing-more-with-agents/adversarial-review-agent#how-send-back-works),
+  which the reviewer here uses to return work to the developer.
+- **Producer agents** do work and hand off forward when they're done, the
+  way the `developer` marks a branch review-ready.
+
+A few worth having:
+
+- **Security reviewer** *(gate)* — audits a branch's diff for injection,
+  broken authorization, leaked secrets, and risky dependency bumps before
+  merge, and bounces the task back on findings.
+- **Test author / QA** *(producer + gate)* — given a change, writes or
+  extends tests, runs the suite, and reports coverage gaps.
+- **Docs writer** *(producer)* — keeps docs, READMEs, and the changelog in
+  sync with a code change, then hands off forward.
+- **Performance reviewer** *(gate)* — flags regressions, N+1 queries, and
+  hot-path allocations a diff introduces.
+
+Each slots onto a workflow status the same way the Adversarial Review agent
+does. A gate agent owns an `active` status between the work and the human
+and needs a bounce edge declared in the workflow's `transitions`. A
+producer agent owns a status where its output is the deliverable, then hands
+off forward.
+
 ## Where to go next
 
 The guide is two parts. Author the agent, then wire it in:

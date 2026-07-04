@@ -62,10 +62,14 @@ them fails the load.
 ## 3. Rewire the transitions
 
 [Transitions](/docs/configuration/workflow#transitions) declare the
-hub-side side-effects that fire on an edge; unlisted edges are pure status
-changes. Route the developer's branch into adversarial review, then on to
-human review, with a bounce-back for when the skeptic finds problems, and
-keep `merge` on the single final edge into `done`:
+hub-side side-effects that fire on an edge. For the moves a human makes on
+the board, an unlisted edge is just a pure status change. For an
+**agent-initiated** move (the reviewer's bounce), the block does double
+duty as an allowlist: once a `transitions:` block exists, an agent may only
+take edges it declares, so the bounce edge has to be listed or the poller
+rejects it. Route the developer's branch into adversarial review, then on
+to human review, with a bounce-back for when the skeptic finds problems,
+and keep `merge` on the single final edge into `done`:
 
 ```yaml
 transitions:
@@ -85,8 +89,11 @@ What each edge does:
   pushed and PR'd, so promoting a clean pass to human review is a pure
   status change.
 - **`adversarial-review → in-progress`** is the bounce-back. When the
-  skeptic files blockers, the task drops to the developer with no git
-  side-effects: same branch, same PR, another pass.
+  skeptic files blockers and writes the
+  [transition marker](/docs/guides/doing-more-with-agents/adversarial-review-agent#how-send-back-works),
+  the task drops to the developer with no git side-effects: same branch,
+  same PR, another pass. This edge is what makes that bounce legal; drop it
+  and the poller refuses the reviewer's send-back.
 - **`review → done`** is the only edge carrying `merge` (and
   `delete_branch`). That's deliberate.
 
