@@ -5,15 +5,15 @@ summary: An agent is a role — a system prompt plus a skill set — not the tas
 ---
 
 An **agent** is a *role*: a system prompt plus a set of skills. It is the
-"who" of a piece of work — the orchestrator that schedules, the developer
+"who" of a piece of work: the orchestrator that schedules, the developer
 that writes the code, the reviewer that checks it. An agent is deliberately
 *not* the task it's handed, and *not* the slot it runs in. Those are separate
 things:
 
-- The **task** is the work — a markdown card with a prompt and a branch.
-- The **[workspace](/docs/concepts/workspaces)** is the capacity — a tmux
+- The **task** is the work: a markdown card with a prompt and a branch.
+- The **[workspace](/docs/concepts/workspaces)** is the capacity: a tmux
   pane plus a git worktree on some machine.
-- The **agent** is the role — the prompt and skills that decide *how* the
+- The **agent** is the role: the prompt and skills that decide *how* the
   work gets done.
 
 Splitting these apart is what lets the same workspace run a developer agent
@@ -23,7 +23,7 @@ the security agent" as a line of YAML rather than a paragraph of prompt prose.
 
 ## The three shipped agents
 
-Every project ships with three agents — `orchestrator`, `developer`, and
+Every project ships with three agents: `orchestrator`, `developer`, and
 `review`. They bracket the loop end to end: schedule the work, build it, serve
 the result for a human. They're the defaults the generic machinery wires up
 unless you say otherwise.
@@ -32,21 +32,21 @@ unless you say otherwise.
 | --- | --- |
 | `orchestrator` | The agent you talk to. Turns requests into cards, dispatches tasks to free workspaces, tails the events log, reports back. Runs in window 1, never in a workspace. See [Orchestrator](/docs/concepts/orchestrator). |
 | `developer` | The default workspace agent. Implements a task on its branch, runs the project's checks, writes the review-ready marker. This is the agent an `agent`-owned status uses when no other is named. |
-| `review` | The agent that runs on a [review workspace](/docs/concepts/review-workspaces). It loads a finished branch and *serves* it — installs deps, builds, boots the dev server — then hands a human a working URL. It doesn't write code (bar an explicitly requested tweak). |
+| `review` | The agent that runs on a [review workspace](/docs/concepts/review-workspaces). It loads a finished branch and *serves* it (installs deps, builds, boots the dev server), then hands a human a working URL. It doesn't write code (bar an explicitly requested tweak). |
 
 `developer` runs most often; `orchestrator` and `review` bracket it.
 
-Reviewer roles aren't shipped, but they're a `shelbi agent new` away — and
+Reviewer roles aren't shipped, but they're a `shelbi agent new` away, and
 because an agent is just a role, an authored one slots into the loop exactly
 like a built-in. Two common ones:
 
-- **`qa`** — exercises a finished branch against acceptance criteria before it
+- **`qa`** exercises a finished branch against acceptance criteria before it
   reaches a human. Point a `handoff`-category status at it.
-- **`security-review`** — a focused adversarial pass for sensitive diffs (auth,
+- **`security-review`**: a focused adversarial pass for sensitive diffs (auth,
   migrations, install scripts). Pair it with a status, or a danger-path-heavy
   workflow, where the extra latency is worth it.
 
-Which role is loaded shows up in the sidebar next to each busy workspace — the
+Which role is loaded shows up in the sidebar next to each busy workspace. The
 same slot runs `developer` on one task and a reviewer role on the next:
 
 <AppMockup
@@ -85,7 +85,7 @@ An agent is a directory under the project's Shelbi config:
     └── instructions.md
 ```
 
-Each agent has at minimum an `instructions.md` — its system prompt. It may
+Each agent has at minimum an `instructions.md`: its system prompt. It may
 also carry a `skills/` directory of agent-scoped skills the runner loads when
 that agent is active. The `_shared/preamble.md` file is special: its contents
 are prepended to *every* agent's instructions, so project-wide context (the
@@ -93,8 +93,8 @@ repo layout, the house style, the test command) lives in one place instead of
 being copy-pasted into four prompts.
 
 When a task is dispatched, the agent named for that status (or `developer` by
-default) has its rendered prompt — `_shared/preamble.md` followed by the
-agent's own `instructions.md` — handed to the runner in the workspace. The
+default) has its rendered prompt (`_shared/preamble.md` followed by the
+agent's own `instructions.md`) handed to the runner in the workspace. The
 [orchestrator's own prompt](/docs/concepts/orchestrator#how-the-prompt-is-wired)
 is rendered the same way; it's just the agent that happens to run in window 1.
 
@@ -102,12 +102,12 @@ is rendered the same way; it's just the agent that happens to run in window 1.
 
 Agents are **project-local with shipped defaults**. The first time a project
 loads, Shelbi materializes the three default agents into the directory above.
-From then on they're yours to edit — change `developer/instructions.md` to
+From then on they're yours to edit: change `developer/instructions.md` to
 bake in your repo's conventions, drop a skill into a role's `skills/`, tighten
 an authored `security-review` prompt to your threat model.
 
 The defaults are *seeded, not enforced*. On upgrade, Shelbi only writes an
-agent file that doesn't already exist — it never clobbers a file you've
+agent file that doesn't already exist. It never clobbers a file you've
 edited. New shipped agents (or new skills) show up; your customizations stay
 put. If you want to reset an agent to the current default, delete its
 `instructions.md` and reload.
@@ -140,7 +140,7 @@ statuses:
 `owner: agent` makes a status the orchestrator's to act on; the optional
 `agent:` field names *which* agent does it. Omit `agent:` and the
 `developer` agent is used. The `review` status above is auto-reviewed by a
-`qa` agent you've authored before a human ever sees it — that's the whole "a
+`qa` agent you've authored before a human ever sees it. That's the whole "a
 reviewer is a role you can drop on a status" idea, expressed declaratively. See
 [owners](/docs/guides/getting-started/workflows#owners-and-agents) for the rules.
 

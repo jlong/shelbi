@@ -7,10 +7,10 @@ summary: One agent in window 1 you talk to — it dispatches tasks to workspaces
 The orchestrator is the agent you talk to. It lives in window 1 of the
 project's tmux session (`shelbi-<project>:dashboard`), runs whatever
 runner the project declares (typically `claude`), and treats the
-`shelbi` CLI as its tool surface — the same CLI you use yourself.
+`shelbi` CLI as its tool surface, the same CLI you use yourself.
 
-It is a [**named agent**](/docs/concepts/agents) like any other —
-`agents/orchestrator/` — with an editable `instructions.md` for its system
+It is a [**named agent**](/docs/concepts/agents) like any other
+(`agents/orchestrator/`), with an editable `instructions.md` for its system
 prompt. What makes it special is only *where* it runs: window 1, talking to
 you, rather than in a [workspace](/docs/concepts/workspaces) picking up
 tasks. The `developer` agent (and any reviewer roles you author) run inside
@@ -22,7 +22,7 @@ does not promote backlog items on its own. It turns natural-language
 requests into Kanban cards, picks free workspaces, and reports progress
 back.
 
-The board it runs is the whole dashboard — the columns cards move through and
+The board it runs is the whole dashboard: the columns cards move through and
 the workspaces it dispatches them to:
 
 <AppMockup terminalTitle="jlong@hub — shelbi" />
@@ -31,16 +31,16 @@ the workspaces it dispatches them to:
 
 A useful contrast: a generic chatbot waits to be asked. The orchestrator
 does not. As soon as a task lands in the `ready` category (`todo` in the
-default workflow), that is the start signal — the orchestrator's job is
+default workflow), that is the start signal. The orchestrator's job is
 to find a free workspace, route the task to it, and tell you it did. When
-a workspace hands off (its task moves into the `handoff` category —
+a workspace hands off (its task moves into the `handoff` category,
 `review` in the default workflow), the orchestrator's job is to give that
 workspace the next ready task without waiting to be prompted.
 
 This is what makes the loop feel continuous. You drop work into the
 backlog, triage what's ready, and review what comes back. Everything in
-between — assignment, branch setup, launch, completion detection,
-re-dispatch — is the orchestrator's responsibility.
+between (assignment, branch setup, launch, completion detection,
+re-dispatch) is the orchestrator's responsibility.
 
 ## Categories: the vocabulary the orchestrator reasons in
 
@@ -53,11 +53,11 @@ names:
 
 | Category   | What it means                                                        | Default workflow status |
 | ---------- | -------------------------------------------------------------------- | ----------------------- |
-| `backlog`  | Not yet ready for work — triage stage.                               | `backlog`               |
+| `backlog`  | Not yet ready for work (triage stage).                               | `backlog`               |
 | `ready`    | Queued for whoever owns it next (typically a workspace).             | `todo`                  |
 | `active`   | Owner is working on it now.                                          | `in_progress`           |
 | `handoff`  | One owner finished their part; another's input is required next.    | `review`                |
-| `done`     | Terminal — accepted by the user.                                     | `done`                  |
+| `done`     | Terminal; accepted by the user.                                      | `done`                  |
 
 The category set is fixed; status names are user-customizable per
 workflow. A workflow that renames `Review` to `QA`, or splits `handoff`
@@ -67,16 +67,16 @@ the name. See the [Workflows](/docs/guides/getting-started/workflows#status-cate
 concept page for the full schema.
 
 The `shelbi task move --to <status>` CLI accepts the literal status name
-from the active workflow — `<status>` is never a category. The category
+from the active workflow. `<status>` is never a category. The category
 is the semantic layer above; the orchestrator reads it from each task's
 status definition (and, on the wire, from the `from_category=` /
-`to_category=` tokens on every task event line — see [the events
+`to_category=` tokens on every task event line; see [the events
 log](/docs/concepts/events-log#task-transitions)).
 
 ## How the prompt is wired
 
-The shape of the orchestrator's responsibility — the bootstrap flow,
-the category-keyed reaction rules, the dispatch contract — is encoded in
+The shape of the orchestrator's responsibility (the bootstrap flow,
+the category-keyed reaction rules, the dispatch contract) is encoded in
 the orchestrator agent's `instructions.md`. Like every
 [agent](/docs/concepts/agents), its rendered prompt is its
 `agents/_shared/preamble.md` (project-wide context) followed by its own
@@ -86,7 +86,7 @@ the orchestrator agent's `instructions.md`. Like every
 When you boot a project (`shelbi orchestrate` or via the TUI launcher),
 `ensure_dashboard()` does the following:
 
-1. Resolves the orchestrator agent's prompt — `_shared/preamble.md`
+1. Resolves the orchestrator agent's prompt: `_shared/preamble.md`
    prepended to `agents/orchestrator/instructions.md` (see
    [customizing the prompt](#customizing-the-prompt-per-project) below).
 2. Writes the composed prompt to the launch directory's `CLAUDE.md`.
@@ -96,21 +96,21 @@ When you boot a project (`shelbi orchestrate` or via the TUI launcher),
 That working-directory choice is the entire wiring trick. The runner
 (claude) auto-loads `CLAUDE.md` from its `cwd`, so rendering the
 orchestrator agent's prompt to a `CLAUDE.md` in the launch directory and
-launching claude there is enough — no flags, no env vars, no MCP servers.
+launching claude there is enough. No flags, no env vars, no MCP servers.
 The orchestrator starts with the full prompt in context and the `shelbi`
 CLI on its PATH. Note the split: the *source* you edit is
 `instructions.md`; `CLAUDE.md` is a rendered build artifact, not a file
 you maintain by hand (see [the CLAUDE.md note](#claudemd-is-now-a-build-artifact)).
 
 Orchestrator window setup lives in
-`crates/shelbi-orchestrator/src/lib.rs` — `ensure_dashboard(project)`
+`crates/shelbi-orchestrator/src/lib.rs`. `ensure_dashboard(project)`
 resolves the agent prompt, renders it, and launches the runner in that
 directory.
 
 ## Bootstrap flow on session start
 
 The prompt instructs the orchestrator to do three things on the first
-reply of a session (or right after `shelbi reload`) — before answering
+reply of a session (or right after `shelbi reload`), before answering
 the user:
 
 1. **Read the board.** `shelbi task list` for the column membership,
@@ -125,7 +125,7 @@ the user:
    orchestrator must consider.
 
 After that, the in-memory snapshot is kept up to date from the event
-stream — the orchestrator only re-runs `workspace list` / `task list` if
+stream. The orchestrator only re-runs `workspace list` / `task list` if
 the tail process dies and it has to rebuild.
 
 The reaction rules pattern-match the **category** tokens on each task
@@ -138,7 +138,7 @@ backward compatibility):
   workspace, dispatch.
 - `task=<id> ... to_category=handoff reason=worker:review-marker` →
   the finishing dev workspace has already closed its session, so it's
-  *already free* — find it the next ready task. If the project declares
+  *already free*. Find it the next ready task. If the project declares
   [review workspaces](/docs/concepts/review-workspaces), also load the
   finished branch onto one with `shelbi review <id>` (or leave it queued
   when they're all busy) so a human can run the change.
@@ -147,7 +147,7 @@ backward compatibility):
 - `worker=<name> pane_alive=false` → surface to the user; don't
   auto-restart.
 - `project=<name> heartbeat` → no state change to react to, but the
-  watch is awake — a good time to re-check `active`-category tasks for
+  watch is awake. A good time to re-check `active`-category tasks for
   stuck workspaces or missed markers. See
   [heartbeats](/docs/concepts/events-log#heartbeats) for the cadence
   config and rationale; tune it via the `heartbeat` key in
@@ -159,25 +159,25 @@ hints. If a task names a machine and no workspace on that machine is free,
 it stays in the `ready` category rather than getting routed to the wrong
 host.
 
-The full set of rules — including when *not* to dispatch (failed
-retries, deduplicated misclicks, mid-conversation with the user) — is
-in the default prompt. It's worth a read; it doubles as the spec for
+The full set of rules is in the default prompt, including when *not*
+to dispatch (failed retries, deduplicated misclicks, mid-conversation
+with the user). It's worth a read; it doubles as the spec for
 what the orchestrator is supposed to do.
 
 ## Customizing the prompt per project
 
 The orchestrator is a [project-local agent with shipped defaults](/docs/concepts/agents#customizing-an-agent),
-so customizing it is the same as customizing any other agent — edit a file:
+so customizing it is the same as customizing any other agent. Edit a file:
 
 - **Per-project prompt:** edit
-  `<config-root>/agents/orchestrator/instructions.md` — where
+  `<config-root>/agents/orchestrator/instructions.md`, where
   `<config-root>` is `~/.shelbi/projects/<name>/` in
   [global mode](/docs/concepts/config-modes) or `<repo>/.shelbi/` in
   in-repo mode. This is the orchestrator's system prompt; Shelbi seeds
   it with the shipped default on first load and never clobbers your
   edits on upgrade. Or run `shelbi agent edit orchestrator`.
 - **Project-wide context:** put anything that should apply to *every* agent
-  — repo layout, house style, the test command — in
+  (repo layout, house style, the test command) in
   `<config-root>/agents/_shared/preamble.md`. It's prepended to
   the orchestrator's prompt (and every other agent's), so you write it once
   instead of pasting it into four `instructions.md` files.
@@ -196,7 +196,7 @@ Earlier versions had you edit an `ORCHESTRATOR.md` override and treated
 `~/.shelbi/projects/<name>/CLAUDE.md` as the source of the prompt. That's
 deprecated. The *source* is now `agents/orchestrator/instructions.md` plus
 `agents/_shared/preamble.md`; the `CLAUDE.md` Shelbi writes is a rendered
-artifact for the runner to auto-load — don't hand-edit it, your changes are
+artifact for the runner to auto-load. Don't hand-edit it; your changes are
 overwritten on the next render. If you have content in an old `CLAUDE.md`,
 move the project-wide parts into `_shared/preamble.md` and the
 orchestrator-specific parts into `agents/orchestrator/instructions.md`.
@@ -208,7 +208,7 @@ A few things worth keeping when you fork the default prompt:
 - The **category-based** reaction-rule matching. Patterns key off
   `to_category=<c>` (`ready`, `handoff`) rather than the literal status
   pair, so the rules survive workflow customization. Hardcoding default-
-  workflow status names here is a footgun — a project that later renames
+  workflow status names here is a footgun. A project that later renames
   `Todo` to `Ready` or splits `Review` into `Code Review` + `QA` will
   fall through the matches.
 - The reaction rules tied to specific reason strings (`user:*`,
@@ -220,14 +220,14 @@ A few things worth keeping when you fork the default prompt:
 
 What you might *want* to change per project:
 
-- Routing rules — "always send infra tasks to charlie", "never use the
+- Routing rules: "always send infra tasks to charlie", "never use the
   hub for benchmarks".
-- Merge policy — by default the orchestrator stops at the `handoff`
+- Merge policy: by default the orchestrator stops at the `handoff`
   category (`review` in the default workflow); you can authorize specific
   loops where it squash-merges and moves straight to `done` (see the
   "Mark review done, merge, and push" section in the default prompt for
   the existing recipe).
-- Reporting style — the one-line activity summary is tunable.
+- Reporting style: the one-line activity summary is tunable.
 
 ## What the orchestrator does not do
 
@@ -243,7 +243,7 @@ What you might *want* to change per project:
 
 These are guardrails encoded in the prompt itself. They're worth
 calling out because the temptation when watching a fast loop is to let
-the orchestrator do *more*. Don't — the boundaries are what keep the
+the orchestrator do *more*. Don't. The boundaries are what keep the
 workflow legible.
 
 ## Going further: Zen Mode
@@ -255,7 +255,7 @@ auto-promotes `backlog`-category tasks into `ready` when it judges the
 work in scope, and it lands finished branches past a project-defined
 confidence bar without waiting on a human reviewer. The policy that
 decides "in scope" lives in the orchestrator agent's `instructions.md`
-described above — you tune it by editing prose, not code. Whether a given
+described above. You tune it by editing prose, not code. Whether a given
 status is automated and which agent handles it is separate, and lives in
 the [workflow YAML](/docs/guides/getting-started/workflows#owners-and-agents).
 
