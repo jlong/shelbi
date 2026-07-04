@@ -9,16 +9,16 @@ shelbi init [OPTIONS]
 ```
 
 `shelbi init` bootstraps Shelbi on a machine. It scaffolds `~/.shelbi/` and
-writes a starter project config for the repo you point it at — the one-time
+writes a starter project config for the repo you point it at, the one-time
 setup you run before anything else. It's the flag-driven sibling of
 [`shelbi wizard`](/docs/cli/wizard): the wizard walks you through the same setup
 interactively, while `init` is what you reach for in scripts and CI where the
 answers are supplied up front.
 
 The central choice is **where the project config lives**. In *global* mode the
-config is per-user at `~/.shelbi/projects/<name>.yaml` and never committed —
+config is per-user at `~/.shelbi/projects/<name>.yaml` and never committed,
 right for solo or scratch work. In *in-repo* mode it's a committed
-`<repo>/.shelbi/project.yaml` that everyone gets on clone — right for teams. In
+`<repo>/.shelbi/project.yaml` that everyone gets on clone, right for teams. In
 an interactive run the command asks and prefills a recommendation; in a
 non-interactive run (no TTY) `--mode` is **required**, because Shelbi refuses to
 silently pick a mode for a scripted caller. See
@@ -32,7 +32,7 @@ When you clone a teammate's repo that already carries a committed
 your local registry. Pick-up skips mode selection (the mode is already
 `in-repo` by virtue of the committed file existing) and prompts only for the
 user-local fields. If the project's canonical name collides with one already in
-your local registry, the local alias is auto-suffixed (`-2`, `-3`, …) — the
+your local registry, the local alias is auto-suffixed (`-2`, `-3`, …). The
 committed YAML is never touched.
 
 ## Options

@@ -31,7 +31,7 @@ shelbi project add [OPTIONS]
 ```
 
 Set up a new project interactively. It walks through the same prompts as initial
-onboarding — project name, machines, workspaces, runners — and writes
+onboarding (project name, machines, workspaces, runners) and writes
 `~/.shelbi/projects/<name>.yaml`. Unlike first-run onboarding, it does **not**
 launch the TUI on completion.
 
@@ -50,7 +50,7 @@ the workspace-settings template from the state dir into the repo. State
 (`state.json`, `tasks/`, `HANDOFF.md`, `.claude/`, `workspaces/`, `events.log`)
 stays under `~/.shelbi/` in both modes.
 
-The migration is idempotent — safe to re-run on an already-migrated project (a
+The migration is idempotent: safe to re-run on an already-migrated project (a
 no-op) or a half-migrated one (it completes the missing steps). It prints a
 `.gitignore` snippet for the repo root and, outside `--dry-run`, offers to
 auto-append it.
@@ -61,7 +61,7 @@ There is no `migrate-to-global` command. Reverting means `git revert` on the
 migration commit (which restores `<repo>/.shelbi/` to its pre-migration state)
 plus manually moving `local.yaml` back to
 `~/.shelbi/projects/<name>.yaml`. A merged migration commit is expensive to
-undo — run `--dry-run` first if you're unsure.
+undo. Run `--dry-run` first if you're unsure.
 
 </Callout>
 

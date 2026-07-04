@@ -9,7 +9,7 @@ shelbi send [OPTIONS] <ID> <MESSAGE>
 ```
 
 `shelbi send` injects a follow-up message into a running
-[workspace](/docs/concepts/workspaces) — the text is typed into the
+[workspace](/docs/concepts/workspaces). The text is typed into the
 workspace's live tmux pane as keystrokes, exactly as if you'd typed it there
 yourself. Use it to nudge, correct, or add a note to an agent that's already
 working, without interrupting or restarting the pane.
@@ -21,7 +21,7 @@ Because `send` writes keystrokes into a pane, the message is **ephemeral**:
 it's delivered to whatever is reading that pane at the moment, and there's no
 durable record or acknowledgement. When you need a message that survives, is
 logged, and is acked by the workspace, reach for
-[`shelbi message`](/docs/cli/message) instead — see the comparison there.
+[`shelbi message`](/docs/cli/message) instead. See the comparison there.
 
 ## Arguments
 

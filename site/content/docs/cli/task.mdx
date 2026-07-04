@@ -14,8 +14,8 @@ shelbi task <SUBCOMMAND> [OPTIONS]
 the same files. The orchestrator drives the board through it, and it's where
 scripting, automation, and one-off fixes live.
 
-A board mid-flight — one task promoted to `TO DO`, one dispatched to a
-workspace, one already `DONE`:
+A board mid-flight, with one task promoted to `TO DO`, one dispatched to a
+workspace, and one already `DONE`:
 
 <AppMockup
   project="shelbi"
@@ -58,7 +58,7 @@ tables below.
 shelbi task add [OPTIONS] <TITLE>
 ```
 
-Create a new task. Lands in `backlog` by default — your inbox for triage.
+Create a new task. Lands in `backlog` by default, your inbox for triage.
 Pass `--status todo` to skip triage when you're already sure.
 
 | Flag | Type | Default | Description |
@@ -80,7 +80,7 @@ shelbi task list [OPTIONS]
 
 Print every task grouped by column, in priority order within each column. Use
 `--status <NAME>` to scope to one status, or `--ready` to see only unblocked
-`todo` items in dispatch order — that's the orchestrator's view of "what
+`todo` items in dispatch order. That's the orchestrator's view of "what
 should I assign next." `--workflow <NAME>` narrows either view to a single
 workflow.
 
@@ -120,10 +120,10 @@ shelbi task move --to <STATUS> [OPTIONS] <ID>
 ```
 
 Move a task between statuses. Promoting to `todo` is the orchestrator's start
-signal — it picks a free workspace and runs `task start` itself.
+signal. It picks a free workspace and runs `task start` itself.
 
 The destination is validated against the task's workflow. A status the workflow
-doesn't declare — or a custom status with no backing column — errors with the
+doesn't declare (or a custom status with no backing column) errors with the
 list of reachable statuses, and the task stays put. Matching is case- and
 punctuation-insensitive (`InProgress` matches `in_progress`); a task pinned to a
 workflow with no YAML on disk falls back to the built-in `default`, so legacy
@@ -166,7 +166,7 @@ Launch the assigned workspace on this task. Three things happen in one shot:
 
 1. The workspace's worktree is checked out to the task's branch (defaults
    to `shelbi/<task-id>`).
-2. Any existing pane for that workspace is killed — context is wiped clean.
+2. Any existing pane for that workspace is killed. Context is wiped clean.
 3. The runner relaunches with the task prompt and the column transitions
    into `in_progress`.
 
@@ -186,25 +186,25 @@ shelbi task resume [OPTIONS] <ID>
 ```
 
 Relaunch the assigned workspace on the task it is **already** working, without
-throwing away progress. Use it when a worker stalls or its session dies —
-a killed tmux session, a wedged pane, an agent that stopped mid-task — and you
+throwing away progress. Use it when a worker stalls or its session dies
+(a killed tmux session, a wedged pane, an agent that stopped mid-task) and you
 want it going again on the same task with its work intact.
 
-`resume` is the recovery counterpart to [`start`](#start). Where `start` wipes
-the agent's context (kills the pane and re-checks-out a clean branch) — right
-for a fresh dispatch, wrong for recovery — `resume` preserves the in-flight
-state:
+`resume` is the recovery counterpart to [`start`](#start). `start` wipes
+the agent's context (kills the pane and re-checks-out a clean branch): right
+for a fresh dispatch, wrong for recovery. `resume` instead preserves the
+in-flight state:
 
-1. The workspace's worktree is left **as-is** — its branch, commits, and
+1. The workspace's worktree is left **as-is**: its branch, commits, and
    uncommitted changes stay exactly where the worker left them. The branch is
    never reset or re-checked-out. (If the worktree was torn down entirely, it's
    recreated on the task's existing branch.)
-2. The runner pane is recreated or reclaimed — a killed session is stood back
+2. The runner pane is recreated or reclaimed: a killed session is stood back
    up, and a stale or wedged one (the duplicate-session case) is torn down
    before the fresh pane comes up.
 3. For a **claude** runner the pane relaunches with `--continue`, so the worker
    reloads its prior conversation and picks up mid-thought with full context.
-   Other runners fall back to re-injecting the task prompt — the agent continues
+   Other runners fall back to re-injecting the task prompt. The agent continues
    by reading its own prior work in the worktree. Either way the prompt is
    auto-submitted.
 
@@ -252,7 +252,7 @@ Delete a task file.
 
 <Callout type="warning" title="Irreversible">
 
-`shelbi task rm` deletes the task's markdown file outright — there's no
+`shelbi task rm` deletes the task's markdown file outright. There's no
 trash and no undo. To take a card off the board without destroying its
 history, move it back to `backlog` instead.
 
@@ -267,7 +267,7 @@ shelbi task add "Wire up changelog page" \
     --depends-on docs-write-getting-started-section
 ```
 
-Promote a triaged task to `todo` — the orchestrator picks it up:
+Promote a triaged task to `todo`, and the orchestrator picks it up:
 
 ```bash
 shelbi task move docs-write-cli-reference-pages --to todo
@@ -285,8 +285,8 @@ Manually dispatch an explicit workspace (overrides the orchestrator's routing):
 shelbi task start docs-write-changelog-page --workspace delta
 ```
 
-Recover a stalled worker without losing its in-flight work — relaunch the pane
-and resume the conversation on the same task:
+Recover a stalled worker without losing its in-flight work, relaunching the pane
+and resuming the conversation on the same task:
 
 ```bash
 shelbi task resume docs-write-changelog-page

@@ -11,7 +11,7 @@ shelbi zen <SUBCOMMAND> [OPTIONS]
 `shelbi zen` is the CLI face of [Zen Mode](/docs/concepts/zen-mode).
 The toggle subcommands (`on`, `off`, `pause`, `status`) flip the
 project's mode in `state.json` and write a `mode=zen <prev> -> <new>
-reason=user:cli` line to `~/.shelbi/events.log` — the orchestrator
+reason=user:cli` line to `~/.shelbi/events.log`. The orchestrator
 reads those events to know when to switch behavior.
 
 The remaining subcommands are single-purpose primitives. The
@@ -49,7 +49,7 @@ In-flight workspaces keep going; nothing already running is cancelled.
 shelbi zen pause
 ```
 
-Pause Zen Mode — no *new* auto-promotions, but tasks already on the
+Pause Zen Mode: no *new* auto-promotions, but tasks already on the
 Zen track may still complete their merge. Use this to triage incoming
 work yourself for a bit without losing the auto-merge benefit on
 stuff already in motion.
@@ -76,7 +76,7 @@ Print backlog task ids that are *mechanically* eligible for Zen
 auto-promotion, one per line, in priority order. "Mechanical" means
 not blocked on dependencies, not opted out via task frontmatter, and
 no file overlap with anything currently in flight. The orchestrator's
-prompt applies the judgment categories on top of this list — see
+prompt applies the judgment categories on top of this list. See
 [the judgment layer](/docs/concepts/zen-mode#the-judgment-layer).
 
 ## dry-run
@@ -121,8 +121,8 @@ worktree to read from.
 shelbi zen pr-create <ID>
 ```
 
-Push the workspace's branch and open a PR for the task. Idempotent —
-if an open PR for the branch already exists, returns its number
+Push the workspace's branch and open a PR for the task. Idempotent.
+If an open PR for the branch already exists, returns its number
 instead of opening a second one. Prints the PR number on stdout.
 
 | Argument | Type | Default | Description |
@@ -159,8 +159,8 @@ shelbi zen pr-merge <PR_NUMBER>
 ```
 
 Squash-merge the PR and delete its source branch. Prints the merge
-SHA on stdout. Use this only after `ci-watch` reports `green` —
-there's no built-in safeguard, the orchestrator's prompt is what
+SHA on stdout. Use this only after `ci-watch` reports `green`.
+There's no built-in safeguard; the orchestrator's prompt is what
 sequences the checks.
 
 | Argument | Type | Default | Description |
@@ -201,7 +201,7 @@ through `jq`:
 shelbi zen probe docs-write-cli-reference-pages | jq .
 ```
 
-Drive the full merge flow manually, one primitive at a time —
+Drive the full merge flow manually, one primitive at a time,
 exactly the sequence the orchestrator runs internally:
 
 ```bash

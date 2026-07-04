@@ -10,7 +10,7 @@ shelbi events <SUBCOMMAND> [OPTIONS]
 
 `shelbi events` exposes `~/.shelbi/events.log`, the append-only log of every
 column transition and workspace state change across the hub. The orchestrator
-follows it as its trigger stream — to see what the orchestrator is seeing, run
+follows it as its trigger stream. To see what the orchestrator is seeing, run
 `events tail --follow` in another pane.
 
 The most common line shapes are:
@@ -22,7 +22,7 @@ The most common line shapes are:
 ```
 
 `heartbeat` is the periodic wake-up the hub poller writes when the
-board is otherwise quiet — cadence comes from the `heartbeat` key in
+board is otherwise quiet. Cadence comes from the `heartbeat` key in
 `project.yaml` (default `3m`). See
 [the events log](/docs/concepts/events-log#heartbeats) for the full
 shape catalog.
@@ -54,7 +54,7 @@ See the last twenty transitions:
 shelbi events tail
 ```
 
-Follow the log live — the same thing the orchestrator does on bootstrap:
+Follow the log live, the same thing the orchestrator does on bootstrap:
 
 ```bash
 shelbi events tail --follow

@@ -9,8 +9,8 @@ shelbi reload [OPTIONS]
 ```
 
 `shelbi reload` is the "I just rebuilt the binary, pick up the new code"
-command. It respawns the Shelbi-owned panes in place — the sidebar, the hidden
-tasks / review / machines panes, and the orchestrator pane — so a new binary
+command. It respawns the Shelbi-owned panes in place (the sidebar, the hidden
+tasks / review / machines panes, and the orchestrator pane) so a new binary
 takes effect and edits to the orchestrator's instructions or the shared
 preamble land without tearing down your tmux session.
 
@@ -18,7 +18,7 @@ The orchestrator's context survives the respawn. Before the old pane is
 replaced, it's asked to write `agents/orchestrator/handoff.md` covering its
 in-flight state; the new instance ingests that file (then deletes it) and
 resumes mid-thought rather than cold. A missing or timed-out handoff degrades
-to a cold start — never fatal.
+to a cold start, never fatal.
 
 The workspace panes are left alone: they re-shell into `shelbi` on every call
 and pick up the new binary on their next invocation, so there's nothing to
@@ -28,7 +28,7 @@ Use it any time `scripts/install.sh` (or your own build) has produced a new
 binary and you want the long-lived TUI surfaces to start using it.
 
 `shelbi reload` also sweeps any leftover `.shelbi/project` marker files from
-earlier versions — resolution now reverse-looks-up against the registered
+earlier versions. Resolution now reverse-looks-up against the registered
 project YAMLs, so the markers are redundant.
 
 ## Flags
