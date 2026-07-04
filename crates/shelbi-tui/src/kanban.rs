@@ -2919,6 +2919,7 @@ mod tests {
                 kind: shelbi_core::MachineKind::Local,
                 work_dir: "/tmp/demo".into(),
                 host: None,
+                tags: Vec::new(),
             }],
             orchestrator: shelbi_core::OrchestratorSpec {
                 runner: "claude".into(),
@@ -2942,13 +2943,15 @@ mod tests {
                     name: "alpha".into(),
                     machine: "hub".into(),
                     runner: "claude".into(),
-                    role: Default::default(),
+                    tags: Vec::new(),
+                    slot: None,
                 },
                 shelbi_core::WorkspaceSpec {
                     name: "bravo".into(),
                     machine: "hub".into(),
                     runner: "claude".into(),
-                    role: Default::default(),
+                    tags: Vec::new(),
+                    slot: None,
                 },
             ],
             workspace_poll_interval_secs: 5,
@@ -3228,6 +3231,7 @@ mod tests {
                     category: *c,
                     owner: shelbi_core::Owner::Agent,
                     agent: Some("orchestrator".into()),
+                    tags: Vec::new(),
                 })
                 .collect(),
             initial_status: None,
@@ -3292,6 +3296,7 @@ mod tests {
                         category: canonical.category,
                         owner: shelbi_core::Owner::Agent,
                         agent: Some("orchestrator".into()),
+                        tags: Vec::new(),
                     }
                 })
                 .collect(),
@@ -4059,6 +4064,7 @@ mod tests {
                 category: StatusCategory::Ready,
                 owner: shelbi_core::Owner::Agent,
                 agent: Some("orchestrator".into()),
+                tags: Vec::new(),
             }],
             initial_status: None,
             transitions: None,

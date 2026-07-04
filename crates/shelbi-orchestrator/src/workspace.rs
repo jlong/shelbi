@@ -398,7 +398,7 @@ pub fn clear_review_loaded_marker(host: &Host, marker: &Path) -> Result<()> {
 /// Deterministic dev-server port for a review workspace:
 /// `review.base_port + index * review.port_stride`, where `index` is the
 /// workspace's position among its machine's review workspaces (declaration
-/// order — see [`Project::review_workspaces`]). With the defaults that's
+/// order — see [`review_workspaces_on`]). With the defaults that's
 /// review-1→3000, review-2→3010.
 ///
 /// Returns `None` when `workspace` isn't a review workspace on its machine,
@@ -407,10 +407,29 @@ pub fn clear_review_loaded_marker(host: &Host, marker: &Path) -> Result<()> {
 /// per-machine cap ([`shelbi_core::MAX_REVIEW_WORKSPACES_PER_MACHINE`]) means
 /// real indices are only 0 or 1.
 pub fn review_workspace_port(project: &Project, workspace: &WorkspaceSpec) -> Option<u16> {
-    let reviews = project.review_workspaces(&workspace.machine);
+    let reviews = review_workspaces_on(project, &workspace.machine);
     let index = reviews.iter().position(|w| w.name == workspace.name)?;
     let offset = (index as u16).saturating_mul(project.review.port_stride);
     Some(project.review.base_port.saturating_add(offset))
+}
+
+/// Workspaces on `machine` whose effective tags include `review`, in
+/// declaration order. The generic-tag-query replacement for the removed
+/// `Project::review_workspaces(machine)` — the review-serving path (slot
+/// picking, port assignment, machine resolution) routes through here until
+/// Phase 2 deletes it. The declaration-order slice drives the deterministic
+/// port assignment in [`review_workspace_port`].
+pub(crate) fn review_workspaces_on<'a>(
+    project: &'a Project,
+    machine: &str,
+) -> Vec<&'a WorkspaceSpec> {
+    let review: std::collections::BTreeSet<String> =
+        std::iter::once("review".to_string()).collect();
+    project
+        .workspaces_matching(&review)
+        .into_iter()
+        .filter(|w| w.machine == machine)
+        .collect()
 }
 
 /// Outcome of [`rebase_workspace_branch_onto_default`]. Pure data — the caller
@@ -2943,7 +2962,6 @@ fn sync_review_worktree(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use shelbi_core::model::WorkspaceRole;
     use shelbi_core::{AgentRunnerSpec, MachineKind, OrchestratorSpec};
     use std::collections::BTreeMap;
 
@@ -2968,12 +2986,14 @@ mod tests {
                     kind: MachineKind::Local,
                     work_dir: "/tmp/myapp".into(),
                     host: None,
+                    tags: Vec::new(),
                 },
                 Machine {
                     name: "m2".into(),
                     kind: MachineKind::Ssh,
                     work_dir: "/work/myapp".into(),
                     host: Some("m2.local".into()),
+                    tags: Vec::new(),
                 },
             ],
             orchestrator: OrchestratorSpec {
@@ -2987,13 +3007,15 @@ mod tests {
                     name: "alice".into(),
                     machine: "hub".into(),
                     runner: "claude".into(),
-                    role: Default::default(),
+                    tags: Vec::new(),
+                    slot: None,
                 },
                 WorkspaceSpec {
                     name: "bob".into(),
                     machine: "m2".into(),
                     runner: "claude".into(),
-                    role: Default::default(),
+                    tags: Vec::new(),
+                    slot: None,
                 },
             ],
             workspace_poll_interval_secs: 5,
@@ -3525,19 +3547,22 @@ mod tests {
                 name: "alpha".into(),
                 machine: "hub".into(),
                 runner: "claude".into(),
-                role: WorkspaceRole::Dev,
+                tags: Vec::new(),
+                slot: None,
             },
             WorkspaceSpec {
                 name: "review-1".into(),
                 machine: "hub".into(),
                 runner: "claude".into(),
-                role: WorkspaceRole::Review,
+                tags: vec!["review".to_string()],
+                slot: None,
             },
             WorkspaceSpec {
                 name: "review-2".into(),
                 machine: "hub".into(),
                 runner: "claude".into(),
-                role: WorkspaceRole::Review,
+                tags: vec!["review".to_string()],
+                slot: None,
             },
         ];
         p
@@ -5229,14 +5254,15 @@ mod sync_worktree_git_tests {
                 kind: MachineKind::Local,
                 work_dir: repo.to_path_buf(),
                 host: None,
+                tags: Vec::new(),
             }],
             orchestrator: OrchestratorSpec { runner: "claude".into() },
             agent_runners: runners,
             editor: None,
             github_url: None,
             workspaces: vec![
-                WorkspaceSpec { name: "alice".into(), machine: "hub".into(), runner: "claude".into(), role: Default::default() },
-                WorkspaceSpec { name: "bob".into(), machine: "hub".into(), runner: "claude".into(), role: Default::default() },
+                WorkspaceSpec { name: "alice".into(), machine: "hub".into(), runner: "claude".into(), tags: Vec::new(), slot: None },
+                WorkspaceSpec { name: "bob".into(), machine: "hub".into(), runner: "claude".into(), tags: Vec::new(), slot: None },
             ],
             workspace_poll_interval_secs: 5,
             workspace_permissions_mode: "auto".into(),
@@ -5506,6 +5532,7 @@ mod sync_worktree_freshcut_tests {
             kind: MachineKind::Local,
             work_dir: repo.to_path_buf(),
             host: None,
+            tags: Vec::new(),
         }
     }
 
@@ -5798,6 +5825,7 @@ mod sync_worktree_freshcut_tests {
                 kind: MachineKind::Local,
                 work_dir: machine_repo.clone(),
                 host: None,
+                tags: Vec::new(),
             }],
             orchestrator: shelbi_core::OrchestratorSpec {
                 runner: "claude".into(),
@@ -5809,7 +5837,8 @@ mod sync_worktree_freshcut_tests {
                 name: "alice".into(),
                 machine: "hub".into(),
                 runner: "claude".into(),
-                role: Default::default(),
+                tags: Vec::new(),
+                slot: None,
             }],
             workspace_poll_interval_secs: 5,
             // NOT "auto": keeps `require_auto_mode_supported` from probing

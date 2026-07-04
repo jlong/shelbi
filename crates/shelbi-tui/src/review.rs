@@ -121,7 +121,9 @@ impl ReviewApp {
     pub fn location_for(&self, task: &Task) -> Option<String> {
         let project = self.project.as_ref()?;
         let name = task.assigned_to.as_deref()?;
-        let ws = project.workspace(name).filter(|w| w.is_review())?;
+        let ws = project
+            .workspace(name)
+            .filter(|w| project.effective_tags(w).contains("review"))?;
         shelbi_orchestrator::workspace::review_workspace_port(project, ws)
             .map(|port| format!("{}:{port}", ws.machine))
     }
@@ -483,7 +485,8 @@ mod tests {
             name: "review-1".into(),
             machine: "hub".into(),
             runner: "claude".into(),
-            role: shelbi_core::model::WorkspaceRole::Review,
+            tags: vec!["review".to_string()],
+            slot: None,
         });
         shelbi_state::save_project(&project).unwrap();
 

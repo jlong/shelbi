@@ -890,11 +890,11 @@ fn maybe_promote_to_review(
             // represents completion entirely in the review sections). We only
             // do this for dev workspaces: a review workspace reaches Review by
             // being *loaded* onto, not by promoting an in-progress task, so it
-            // never lands in this arm — the `!is_review()` guard is defensive.
+            // never lands in this arm — the review-tag guard is defensive.
             // Best-effort — a stuck kill must not block the marker clear below,
             // and `kill_workspace_pane` is idempotent, so a pane already gone
             // is a silent no-op.
-            if !workspace.is_review() {
+            if !project.effective_tags(workspace).contains("review") {
                 if let Err(e) = shelbi_orchestrator::workspace::kill_workspace_pane(
                     host,
                     addr,
@@ -1702,6 +1702,7 @@ mod tests {
                 kind: MachineKind::Local,
                 work_dir: work_dir.to_path_buf(),
                 host: None,
+                tags: Vec::new(),
             }],
             orchestrator: OrchestratorSpec {
                 runner: "claude".into(),
@@ -1713,7 +1714,8 @@ mod tests {
                 name: "alpha".into(),
                 machine: "hub".into(),
                 runner: "claude".into(),
-                role: Default::default(),
+                tags: Vec::new(),
+                slot: None,
             }],
             workspace_poll_interval_secs: 5,
             workspace_permissions_mode: "auto".into(),

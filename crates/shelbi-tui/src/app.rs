@@ -769,7 +769,7 @@ fn split_review_sections(
             .assigned_to
             .as_deref()
             .and_then(|name| project.workspace(name))
-            .filter(|w| w.is_review());
+            .filter(|w| project.effective_tags(w).contains("review"));
         match loaded_on {
             Some(ws) => {
                 let location = shelbi_orchestrator::workspace::review_workspace_port(&project, ws)
@@ -814,7 +814,7 @@ fn load_workspaces(project: &str) -> Result<Vec<WorkspaceOverview>> {
                 // Only review slots pick up a Review-column task as their
                 // active work; a dev workspace pinned to a queued Review task
                 // has already closed its session (spec §16) and reads idle.
-                if !workspace.is_review() {
+                if !p.effective_tags(workspace).contains("review") {
                     return None;
                 }
                 review_col
@@ -830,7 +830,7 @@ fn load_workspaces(project: &str) -> Result<Vec<WorkspaceOverview>> {
         // Idle workspaces get `None` — the renderer surfaces "idle" in that
         // case rather than the default agent name.
         let agent = assigned_task.map(|tf| {
-            if workspace.is_review() {
+            if p.effective_tags(workspace).contains("review") {
                 shelbi_state::REVIEW_AGENT.to_string()
             } else {
                 tf.task
@@ -982,12 +982,14 @@ mod tests {
                     kind: MachineKind::Local,
                     work_dir: "/tmp/demo".into(),
                     host: None,
+                    tags: Vec::new(),
                 },
                 Machine {
                     name: "devbox".into(),
                     kind: MachineKind::Ssh,
                     work_dir: "/work/demo".into(),
                     host: Some("devbox.local".into()),
+                    tags: Vec::new(),
                 },
             ],
             orchestrator: OrchestratorSpec {
@@ -1001,13 +1003,15 @@ mod tests {
                     name: "alpha".into(),
                     machine: "hub".into(),
                     runner: "claude".into(),
-                    role: Default::default(),
+                    tags: Vec::new(),
+                    slot: None,
                 },
                 WorkspaceSpec {
                     name: "delta".into(),
                     machine: "devbox".into(),
                     runner: "claude".into(),
-                    role: Default::default(),
+                    tags: Vec::new(),
+                    slot: None,
                 },
             ],
             workspace_poll_interval_secs: 5,
@@ -1160,7 +1164,8 @@ mod tests {
             name: "review-1".into(),
             machine: "hub".into(),
             runner: "claude".into(),
-            role: shelbi_core::model::WorkspaceRole::Review,
+            tags: vec!["review".to_string()],
+            slot: None,
         });
         p
     }
@@ -1552,25 +1557,29 @@ mod tests {
                 name: "alpha".into(),
                 machine: "hub".into(),
                 runner: "claude".into(),
-                role: Default::default(),
+                tags: Vec::new(),
+                slot: None,
             },
             shelbi_core::WorkspaceSpec {
                 name: "bravo".into(),
                 machine: "hub".into(),
                 runner: "claude".into(),
-                role: Default::default(),
+                tags: Vec::new(),
+                slot: None,
             },
             shelbi_core::WorkspaceSpec {
                 name: "charlie".into(),
                 machine: "hub".into(),
                 runner: "claude".into(),
-                role: Default::default(),
+                tags: Vec::new(),
+                slot: None,
             },
             shelbi_core::WorkspaceSpec {
                 name: "delta".into(),
                 machine: "devbox".into(),
                 runner: "claude".into(),
-                role: Default::default(),
+                tags: Vec::new(),
+                slot: None,
             },
         ];
         shelbi_state::save_project(&project).unwrap();

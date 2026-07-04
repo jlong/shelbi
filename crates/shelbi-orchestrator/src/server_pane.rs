@@ -718,6 +718,7 @@ mod tests {
             kind: shelbi_core::MachineKind::Local,
             work_dir: work_dir.to_path_buf(),
             host: None,
+            tags: Vec::new(),
         }
     }
 
@@ -748,7 +749,8 @@ mod tests {
                 runner: "claude".into(),
                 // These fixtures exercise the review-server lifecycle, so the
                 // slot is a review workspace (drives review_workspace_port).
-                role: shelbi_core::model::WorkspaceRole::Review,
+                tags: vec!["review".to_string()],
+                slot: None,
             }],
             workspace_poll_interval_secs: 5,
             workspace_permissions_mode: "auto".into(),

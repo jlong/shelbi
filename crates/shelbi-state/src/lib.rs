@@ -2234,6 +2234,7 @@ mod tests {
                 kind: MachineKind::Local,
                 work_dir: "/tmp".into(),
                 host: None,
+                tags: Vec::new(),
             }],
             orchestrator: OrchestratorSpec { runner: "claude".into() },
             agent_runners: runners,
@@ -2797,7 +2798,8 @@ mod tests {
             name: name.to_string(),
             machine: "local".to_string(),
             runner: "claude".to_string(),
-            role: Default::default(),
+            tags: Vec::new(),
+            slot: None,
         }
     }
 

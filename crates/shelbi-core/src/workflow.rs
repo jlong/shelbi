@@ -519,6 +519,7 @@ pub fn default_workflow() -> Workflow {
                 category: StatusCategory::Backlog,
                 owner: Owner::User,
                 agent: Some("orchestrator".into()),
+                tags: Vec::new(),
             },
             Status {
                 id: "todo".into(),
@@ -526,6 +527,7 @@ pub fn default_workflow() -> Workflow {
                 category: StatusCategory::Ready,
                 owner: Owner::Agent,
                 agent: Some("orchestrator".into()),
+                tags: Vec::new(),
             },
             Status {
                 id: "in-progress".into(),
@@ -533,6 +535,7 @@ pub fn default_workflow() -> Workflow {
                 category: StatusCategory::Active,
                 owner: Owner::Agent,
                 agent: Some("developer".into()),
+                tags: Vec::new(),
             },
             Status {
                 id: "review".into(),
@@ -540,6 +543,7 @@ pub fn default_workflow() -> Workflow {
                 category: StatusCategory::Handoff,
                 owner: Owner::User,
                 agent: Some("orchestrator".into()),
+                tags: Vec::new(),
             },
             Status {
                 id: "done".into(),
@@ -547,6 +551,7 @@ pub fn default_workflow() -> Workflow {
                 category: StatusCategory::Done,
                 owner: Owner::User,
                 agent: None,
+                tags: Vec::new(),
             },
             Status {
                 id: "canceled".into(),
@@ -554,6 +559,7 @@ pub fn default_workflow() -> Workflow {
                 category: StatusCategory::Archived,
                 owner: Owner::User,
                 agent: None,
+                tags: Vec::new(),
             },
         ],
         initial_status: None,
@@ -615,6 +621,20 @@ pub struct Status {
     /// owner / agent split.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent: Option<String>,
+    /// Required workspace tags for this status: the orchestrator/dispatch
+    /// and review-load routing pick a *free* workspace whose
+    /// [effective tags](crate::Project::effective_tags) are a superset of
+    /// this set (set-AND). An empty set means "any free workspace" — the
+    /// historical default. Accepts a scalar `tag:` alias and a bare-string
+    /// `tags:` value as shorthand for a one-element list. Elided from the
+    /// wire form when empty.
+    #[serde(
+        default,
+        alias = "tag",
+        deserialize_with = "crate::model::de_string_or_seq",
+        skip_serializing_if = "Vec::is_empty"
+    )]
+    pub tags: Vec<String>,
 }
 
 impl serde::Serialize for Status {
@@ -627,7 +647,7 @@ impl serde::Serialize for Status {
         // [`Workflow::resolve_against`] step fills both back in on
         // read.
         use serde::ser::SerializeMap;
-        let len = 2 + usize::from(self.agent.is_some());
+        let len = 2 + usize::from(self.agent.is_some()) + usize::from(!self.tags.is_empty());
         let mut m = s.serialize_map(Some(len))?;
         m.serialize_entry("id", &self.id)?;
         // `owner` round-trips through the `Owner` enum's snake_case
@@ -636,6 +656,11 @@ impl serde::Serialize for Status {
         m.serialize_entry("owner", &self.owner)?;
         if let Some(agent) = &self.agent {
             m.serialize_entry("agent", agent)?;
+        }
+        // Required routing tags — emitted only when non-empty so a
+        // tag-less status round-trips to the same lean `id`/`owner` form.
+        if !self.tags.is_empty() {
+            m.serialize_entry("tags", &self.tags)?;
         }
         m.end()
     }
@@ -834,6 +859,58 @@ pub struct Transition {
     /// note).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub target: Option<String>,
+
+    /// Shell commands to run, in order, when this edge fires. They execute
+    /// in the task's worktree, host-routed via
+    /// [`shelbi_ssh::run`](https://docs.rs) on the assigned workspace's
+    /// machine, with `$SLOT` / `$SHELBI_TASK` / `$SHELBI_BRANCH` /
+    /// `$SHELBI_WORKTREE` / `$SHELBI_MACHINE` exported. They compose with —
+    /// and run after — this edge's git [`actions`](Self::actions); a
+    /// non-zero exit short-circuits the edge just as a failing action does.
+    /// Teardown is expressed as the `run:` of an exit transition; there is
+    /// no separate teardown hook. Empty (omitted on the wire) means no
+    /// commands.
+    ///
+    /// **Blocking mechanic:** each command is run synchronously and must
+    /// return promptly. A long-running server therefore has to background
+    /// itself (`… &`, `nohup`, a detached tmux pane); the edge is treated
+    /// as entered the moment the launcher returns, and [`ready`](Self::ready)
+    /// is what marks the server actually up. See the executor in
+    /// `shelbi-orchestrator::transition`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub run: Vec<String>,
+
+    /// Optional readiness probe: a shell command polled (in the same
+    /// worktree/env as [`run`](Self::run)) until it exits 0, or until
+    /// [`ready_timeout`](Self::ready_timeout) elapses. Used after a `run:`
+    /// launches a server to block until it answers. `None` means no probe —
+    /// the edge is done as soon as the `run:` commands return.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ready: Option<String>,
+
+    /// How long to poll [`ready`](Self::ready) before giving up, in
+    /// seconds on the wire. `None` (the default) means
+    /// [`Transition::ready_timeout_or_default`] — 90s. Ignored when `ready`
+    /// is unset.
+    #[serde(
+        default,
+        with = "opt_duration_secs",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub ready_timeout: Option<Duration>,
+}
+
+impl Transition {
+    /// Default readiness-probe timeout when [`ready_timeout`](Self::ready_timeout)
+    /// is unset: 90 seconds.
+    pub const DEFAULT_READY_TIMEOUT: Duration = Duration::from_secs(90);
+
+    /// The effective readiness-probe timeout — the explicit
+    /// [`ready_timeout`](Self::ready_timeout) or
+    /// [`DEFAULT_READY_TIMEOUT`](Self::DEFAULT_READY_TIMEOUT).
+    pub fn ready_timeout_or_default(&self) -> Duration {
+        self.ready_timeout.unwrap_or(Self::DEFAULT_READY_TIMEOUT)
+    }
 }
 
 /// One of the six hub-side action primitives the workflow engine can
@@ -993,6 +1070,15 @@ struct RawStatus {
     owner: String,
     #[serde(default)]
     agent: Option<String>,
+    /// Required routing tags. Accepts the scalar `tag:` alias and the
+    /// bare-string shorthand via [`crate::model::de_string_or_seq`], same
+    /// as the machine/workspace tag fields.
+    #[serde(
+        default,
+        alias = "tag",
+        deserialize_with = "crate::model::de_string_or_seq"
+    )]
+    tags: Vec<String>,
     /// Accepted-and-discarded for legacy YAML compatibility; serde reads
     /// it but the conversion step doesn't need it.
     #[serde(default)]
@@ -1049,6 +1135,7 @@ fn convert_raw_workflow(raw: RawWorkflow) -> crate::Result<(Workflow, Vec<Status
             category,
             owner,
             agent,
+            tags: st.tags,
         });
     }
 
@@ -1649,6 +1736,59 @@ transitions:
     }
 
     #[test]
+    fn transition_run_ready_parse_and_round_trip() {
+        let yaml = r#"
+name: w
+statuses:
+  - { id: todo,  name: Todo,  category: ready,   owner: agent, agent: orchestrator }
+  - { id: serve, name: Serve, category: handoff, owner: user                        }
+transitions:
+  - from: todo
+    to: serve
+    actions: [push_branch]
+    run:
+      - "npm ci"
+      - "npm run dev -- --port $SLOT &"
+    ready: "curl -sf http://localhost:$SLOT"
+    ready_timeout: 30
+"#;
+        let wf = Workflow::from_yaml_str(yaml).expect("parse");
+        let t = wf.transition("todo", "serve").expect("edge present");
+        assert_eq!(t.actions, vec![TransitionAction::PushBranch]);
+        assert_eq!(
+            t.run,
+            vec![
+                "npm ci".to_string(),
+                "npm run dev -- --port $SLOT &".to_string()
+            ]
+        );
+        assert_eq!(t.ready.as_deref(), Some("curl -sf http://localhost:$SLOT"));
+        assert_eq!(t.ready_timeout, Some(Duration::from_secs(30)));
+        assert_eq!(t.ready_timeout_or_default(), Duration::from_secs(30));
+
+        // Round-trip: run/ready survive; ready_timeout is seconds on the wire.
+        let out = serde_yaml::to_string(&wf).unwrap();
+        assert!(out.contains("npm ci"), "run should serialize: {out}");
+        assert!(out.contains("ready_timeout: 30"), "timeout secs: {out}");
+
+        // An edge that declares neither run nor ready keeps the default
+        // 90s and stays lean on the wire.
+        let bare = Transition {
+            from: "a".into(),
+            to: "b".into(),
+            actions: Vec::new(),
+            target: None,
+            run: Vec::new(),
+            ready: None,
+            ready_timeout: None,
+        };
+        assert_eq!(bare.ready_timeout_or_default(), Duration::from_secs(90));
+        let out = serde_yaml::to_string(&bare).unwrap();
+        assert!(!out.contains("run"), "no run key: {out}");
+        assert!(!out.contains("ready"), "no ready key: {out}");
+    }
+
+    #[test]
     fn transition_allowed_is_any_to_any_between_declared_statuses() {
         let wf = default_workflow();
         // Both endpoints exist → allowed, no whitelist semantic. The
@@ -1949,6 +2089,7 @@ statuses:
                 category: StatusCategory::Ready,
                 owner: Owner::Agent,
                 agent: None,
+                tags: Vec::new(),
             }],
             initial_status: None,
             transitions: None,
@@ -2421,6 +2562,7 @@ statuses:
             category: StatusCategory::Handoff,
             owner: Owner::User,
             agent: Some("orchestrator".into()),
+            tags: Vec::new(),
         };
         let y = serde_yaml::to_string(&s).unwrap();
         assert!(y.contains("id: review"), "got: {y}");
@@ -2431,6 +2573,32 @@ statuses:
     }
 
     #[test]
+    fn status_tags_parse_scalar_seq_and_alias_and_round_trip() {
+        // Bare-string `tags:`, scalar `tag:` alias, and the seq form all
+        // land in the same `Vec<String>`; a tag-less status stays lean.
+        let yaml = r#"
+name: w
+statuses:
+  - { id: a, owner: agent, agent: dev, category: active, tags: gpu }
+  - { id: b, owner: agent, agent: dev, category: active, tag: [gpu, review] }
+  - { id: c, owner: user, category: done }
+"#;
+        let wf = Workflow::from_yaml_str(yaml).expect("parse");
+        assert_eq!(wf.statuses[0].tags, vec!["gpu".to_string()]);
+        assert_eq!(
+            wf.statuses[1].tags,
+            vec!["gpu".to_string(), "review".to_string()]
+        );
+        assert!(wf.statuses[2].tags.is_empty());
+
+        // Round-trip: tags serialize as a sequence, tag-less stays absent.
+        let out = serde_yaml::to_string(&wf.statuses[0]).unwrap();
+        assert!(out.contains("tags"), "tags should serialize: {out}");
+        let out = serde_yaml::to_string(&wf.statuses[2]).unwrap();
+        assert!(!out.contains("tags"), "tag-less status must stay lean: {out}");
+    }
+
+    #[test]
     fn status_serializes_without_agent_when_none() {
         let s = Status {
             id: "todo".into(),
@@ -2438,6 +2606,7 @@ statuses:
             category: StatusCategory::Ready,
             owner: Owner::Agent,
             agent: None,
+            tags: Vec::new(),
         };
         let y = serde_yaml::to_string(&s).unwrap();
         assert!(!y.contains("agent:"), "unexpected agent: in {y}");

@@ -601,6 +601,7 @@ mod tests {
                 kind: MachineKind::Local,
                 work_dir: repo.to_path_buf(),
                 host: None,
+                tags: Vec::new(),
             }],
             orchestrator: OrchestratorSpec {
                 runner: "claude".into(),
