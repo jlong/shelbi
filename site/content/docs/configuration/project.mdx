@@ -68,7 +68,6 @@ workspaces:
 | `workspace_permissions_mode` | string | no | `auto` | Permissions posture rendered into the workspace settings template (`auto` → claude's `acceptEdits`). |
 | `heartbeat` | [Heartbeat](#heartbeat) | no | `3m` / `60m` | Adaptive hub heartbeat written to `events.log` so the orchestrator's watch fires on a quiet board. Holds at `interval` while work is in flight, backs off toward `max` when quiescent. |
 | `git` | [Git](#git) | no | all defaults | Base branch and merge strategy for `shelbi merge` and Zen's auto-merge. |
-| `review` | object | no | all defaults | How [review workspaces](/docs/concepts/review-workspaces) load and serve a branch (ports, setup/serve commands). |
 
 ## machines
 
@@ -81,12 +80,14 @@ workspace lives at `<work_dir>/.shelbi/wt/<workspace-name>`.
 | `kind` | `local` \| `ssh` | yes | — | Whether commands run on this box or over SSH. |
 | `work_dir` | path | yes | — | Base directory the repo checkout and worktrees live under. `~` is expanded. |
 | `host` | string | no | `name` | SSH hostname. Required when `kind: ssh`; falls back to `name` if omitted. Ignored for `local`. |
+| `tags` | list of string | no | `[]` | Capability tags every workspace on this machine inherits (e.g. `gpu`, `review`). A tag declared here applies to all of the machine's slots without repeating it per workspace. Accepts a scalar `tag:` alias and a bare string as shorthand. Elided when empty. |
 
 ```yaml
 machines:
   - name: hub
     kind: local
     work_dir: ~/Workspaces/myapp
+    tags: [review]        # every slot on hub inherits the review tag
   - name: m2
     kind: ssh
     host: m2.local
@@ -140,14 +141,25 @@ cleared context) between assignments. See
 | `name` | string | yes | — | Workspace identifier. Names the worktree at `<machine.work_dir>/.shelbi/wt/<name>`. |
 | `machine` | string | yes | — | Name of a [machine](#machines) this slot runs on. |
 | `runner` | string | yes | — | Name of an [agent runner](#agent-runners) this slot boots. |
-| `role` | `dev` \| `review` | no | `dev` | `dev` does autonomous work; `review` is reserved for loading and serving a branch for human inspection. Elided when `dev`. |
+| `tags` | list of string | no | `[]` | Capability tags for this slot. A workspace's *effective* tags are these unioned with its machine's [`tags`](#machines). Tag-based routing picks a free workspace whose effective tags are a superset of a status's required [`tags`](/docs/configuration/workflow#statuses). Accepts a scalar `tag:` alias and a bare string as shorthand for a one-element list. Elided when empty. |
+| `slot` | integer | no | declaration-order index | Numeric slot exported to transition [`run`](/docs/configuration/workflow#transitions) commands as `$SLOT` (e.g. to derive a per-slot port). When unset, falls back to the slot's zero-based index among its machine's workspaces. Elided when unset. |
 
 ```yaml
 workspaces:
   - { name: alice, machine: hub, runner: claude }
   - { name: bob,   machine: m2,  runner: claude }
-  - { name: rev,   machine: hub, runner: claude, role: review }
+  - { name: rev,   machine: hub, runner: claude, tags: [review], slot: 0 }
 ```
+
+<Callout type="note" title="Legacy review designator folds into tags">
+
+The retired per-slot review designator is still read for backward
+compatibility — it folds into the `review` tag on load and is never written
+back — but prefer `tags:` in new configs. See
+[review workspaces](/docs/concepts/review-workspaces#legacy-configs) for the
+exact migration and the tag-routing model that replaced it.
+
+</Callout>
 
 ## zen
 

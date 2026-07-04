@@ -121,38 +121,14 @@ plus the raw status.yaml contents.
 | --- | --- | --- | --- |
 | `[NAME]` | string | — | Workspace to inspect (positional, optional). Omit to show every declared workspace. |
 
-## serve
+<Callout type="note" title="Serving a review branch is a transition, not a subcommand">
 
-```text
-shelbi workspace serve [OPTIONS] [NAME]
-```
+Booting a dev server for review is no longer a workspace subcommand. A review
+status boots and tears down its server through
+[transition `run`/`ready` commands](/docs/configuration/workflow#run-ready-and-teardown);
+see [review workspaces](/docs/concepts/review-workspaces) for the full model.
 
-Start (or restart) a [review workspace](/docs/concepts/review-workspaces)'s
-long-lived dev server in a dedicated, Shelbi-managed **server pane**. This is
-the entry point the **Review agent** invokes once it has resolved the serve
-command; from there Shelbi owns the pane's lifecycle: a `server_alive=false`
-event on death, teardown on re-dispatch or `stop`, and the leaked-port reaper.
-You rarely run it by hand, but it's the seam if you want to restart a review
-server yourself.
-
-Any server pane already running for the workspace is torn down first, so
-re-running it is also how you **refresh** the server for a new branch. It's
-supported on local machines only. A remote review workspace errors here.
-
-| Flag | Type | Default | Description |
-| --- | --- | --- | --- |
-| `[NAME]` | string | `$SHELBI_WORKSPACE` | Review workspace to serve on (positional). Defaults to the env var set in the review pane. |
-| `--port <PORT>` | number | the workspace's review slot (`review.base_port + index * review.port_stride`) | Override the injected port. |
-| `--serve <CMD>` | string | the project's `review.serve` | Dev-server command (e.g. `npm run dev -- --port $PORT`). Required when `review.serve` is absent — the agent passes its auto-detected command here. |
-| `--no-wait` | flag | off | Skip the HTTP ready-probe and return as soon as the pane is up (for an app with no HTTP endpoint). |
-
-Unless `--no-wait` is passed, the command blocks on the HTTP ready-probe (using
-`review.ready_probe.timeout`, default 90s) and prints the serving URL:
-
-```text
-✓ server pane started for review-1
-✓ serving at http://localhost:3000 (HTTP 200)
-```
+</Callout>
 
 ## Examples
 
@@ -195,8 +171,8 @@ convenient.
 
 - [Workspaces](/docs/concepts/workspaces) — the slot model, the
   machine-grouped sidebar, and the lifecycle states `status` reports.
-- [Review workspaces](/docs/concepts/review-workspaces) — `role: review`
-  slots, the `serve` server pane, and the review lifecycle.
+- [Review workspaces](/docs/concepts/review-workspaces) — tag-routed review
+  slots and the transition commands that boot and tear down their servers.
 - [Agents](/docs/concepts/agents) — the role shown in the `AGENT` column.
 - [`shelbi agent`](/docs/cli/agent) — manage the agents a workspace can run.
 - [Orchestrator](/docs/concepts/orchestrator) — how the scheduler picks a

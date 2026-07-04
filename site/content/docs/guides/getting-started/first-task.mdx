@@ -201,22 +201,16 @@ into **Review**, and the workspace's badge flips to `✓`. The sidebar's
 ✓ fix-login   delta
 ```
 
-Click that row (or `Enter` on it) and Shelbi checks the branch out into
-the project's working directory on the machine that ran the task, then
-spawns a fresh review pane there for you to interrogate the diff. The
-same thing happens from the CLI:
-
-```bash
-shelbi review fix-login-bug-on-safari
-```
-
-`--machine <name>` overrides where the checkout lands, handy when a
-task ran on a remote but you want to review locally.
-
-The review pane is a fresh agent session in the checked-out worktree.
-Ask it to walk you through the diff, run tests, or explain a tricky
+Click that row (or `Enter` on it) to focus the workspace's window, where
+the finished branch is checked out for you to interrogate the diff. Ask
+the agent to walk you through the change, run tests, or explain a tricky
 hunk. Nothing about the workspace's run is locked in yet; you can ask for
 edits and have them committed onto the same branch.
+
+To go a step further and *run* the change — boot its dev server and click
+through the app — tag a slot for review and let the review status route the
+branch onto it. See [set up review
+workspaces](/docs/guides/getting-started/review-workspaces).
 
 ## Accept the task
 

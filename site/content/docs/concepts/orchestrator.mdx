@@ -138,10 +138,11 @@ backward compatibility):
   workspace, dispatch.
 - `task=<id> ... to_category=handoff reason=worker:review-marker` →
   the finishing dev workspace has already closed its session, so it's
-  *already free*. Find it the next ready task. If the project declares
-  [review workspaces](/docs/concepts/review-workspaces), also load the
-  finished branch onto one with `shelbi review <id>` (or leave it queued
-  when they're all busy) so a human can run the change.
+  *already free*. Find it the next ready task. If the handoff status
+  requires [review tags](/docs/concepts/review-workspaces), also route the
+  finished branch onto a matching workspace — firing the status's enter
+  transition to boot a server (or leave it queued when they're all busy) so a
+  human can run the change.
 - `worker=<name> working -> awaiting_input` → same idea, the workspace
   just freed up.
 - `worker=<name> pane_alive=false` → surface to the user; don't
@@ -265,9 +266,9 @@ the [workflow YAML](/docs/guides/getting-started/workflows#owners-and-agents).
   its prompt, skills, and customization work.
 - [Workspaces](/docs/concepts/workspaces) — what the orchestrator
   dispatches tasks to.
-- [Review workspaces](/docs/concepts/review-workspaces) — the slots the
-  orchestrator auto-loads a finished branch onto on handoff, and the
-  pending-load queue it drains as they free.
+- [Review workspaces](/docs/concepts/review-workspaces) — the tag-routed slots
+  the orchestrator loads a finished branch onto on handoff, and the queue it
+  drains as they free.
 - [Workflows](/docs/guides/getting-started/workflows) — the schema behind the board,
   including the full category set and the events-log annotations the
   orchestrator pattern-matches on.
