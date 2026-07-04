@@ -350,10 +350,6 @@ const WORKER_BASE: ChatLine[] = [
   { kind: "tool", name: "Edit", args: "api/metrics.test.ts" },
   { kind: "tool", name: "Bash", args: "npm test -- metrics" },
 ]
-const WORKER_RUNNING: ChatLine[] = [
-  ...WORKER_BASE,
-  { kind: "working", text: "Working… (3s · ↓ 128 tokens)" },
-]
 const WORKER_DONE: ChatLine[] = [
   ...WORKER_BASE,
   { kind: "result", text: "✓ 12 passed" },
@@ -491,10 +487,16 @@ function buildKeyframes(): Keyframe[] {
   }
 
   // Beat 9 — activate alpha (Enter): the palette closes and the view lands on
-  // alpha's Claude-Code pane, mid-work on its dispatched task then landing green
-  // with the session footer. The pane wears the same Claude-Code chrome as the
-  // orchestrator Chat — transcript above, an idle input box + footer below,
-  // titled with the worker's name.
+  // alpha's Claude-Code pane, where we WATCH IT WORK. Rather than dump the whole
+  // transcript at once, the work STREAMS in a few lines per frame and the pane
+  // auto-scrolls to follow: it's bottom-anchored against the input box, so as the
+  // transcript outgrows the visible area the oldest lines clip off the top and
+  // the newest sit by the prompt — reading as live, ongoing work, not a static
+  // block. The reveal steps trace the implementation (read spec → aggregate query
+  // → endpoint → typecheck → empty-range fix → tests) and their holds sum to a
+  // sustained ~5s of scrolling before it lands green with the session footer. The
+  // pane wears the same Claude-Code chrome as the orchestrator Chat — transcript
+  // above, an idle input box + footer below, titled with the worker's name.
   const worker = (lines: ChatLine[]): Partial<AppState> => ({
     ...DISPATCHED,
     activeView: "workspace",
@@ -502,8 +504,32 @@ function buildKeyframes(): Keyframe[] {
     workspaceLines: lines,
     chatInput: "",
   })
-  k.push(frame(worker(WORKER_RUNNING), 1300))
-  k.push(frame(worker(WORKER_DONE), 1900))
+  // A mid-work frame: the first `n` transcript lines with a live `Working…`
+  // spinner pinned at the end (its elapsed time + token count climbing), so every
+  // streaming frame reads as actively working.
+  const streaming = (n: number, secs: number, tokens: number): ChatLine[] => [
+    ...WORKER_BASE.slice(0, n),
+    { kind: "working", text: `Working… (${secs}s · ↓ ${tokens} tokens)` },
+  ]
+  // [linesRevealed, hold] per streaming frame — each step lands on a clean beat
+  // of the work (a finished read, an edit + its diffstat, a passing check). The
+  // final step (n = 25) is the full transcript with the suite running; holds sum
+  // to ~5s of continuous scrolling.
+  const STREAM_STEPS: [number, number][] = [
+    [3, 600],
+    [6, 550],
+    [9, 550],
+    [11, 500],
+    [15, 550],
+    [17, 500],
+    [21, 550],
+    [24, 550],
+    [25, 650],
+  ]
+  STREAM_STEPS.forEach(([n, hold], i) => {
+    k.push(frame(worker(streaming(n, i + 1, 128 + i * 112)), hold))
+  })
+  k.push(frame(worker(WORKER_DONE), 1400)) // lands green with the session footer
 
   // Beat 10 — fade the pane CONTENTS out (the window chrome stays static);
   // wrapping to beat 1 (opacity 1) cross-fades the contents back in on a fresh
