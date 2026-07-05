@@ -511,7 +511,7 @@ fn entry_from_row(row: &Row, workspaces: &[WorkspaceOverview]) -> Option<Entry> 
 /// destination is for first-time users.
 fn nav_subtitle(view: &View) -> Option<String> {
     match view {
-        View::Builtin("orch") => Some("the claude pane you talk to".into()),
+        View::Builtin("orch") => Some("the orchestrator pane you talk to".into()),
         View::Builtin("tasks") => Some("live `shelbi list`".into()),
         View::Builtin("activity") => Some("human-readable events feed".into()),
         _ => None,

@@ -631,12 +631,16 @@ impl Project {
         self.detected_shapes = detect_project_shapes(root.as_ref());
     }
 
-    /// Cross-check that every workspace references a declared machine and
-    /// runner.
+    /// Cross-check that the orchestrator and every workspace reference
+    /// declared runners, and that every workspace references a declared
+    /// machine.
     ///
     /// Hard errors: an unknown machine or runner. Other conditions are soft
     /// and left to callers to warn about rather than fail the load.
     pub fn validate_workspaces(&self) -> crate::Result<()> {
+        if self.runner(&self.orchestrator.runner).is_none() {
+            return Err(crate::Error::UnknownRunner(self.orchestrator.runner.clone()));
+        }
         for w in &self.workspaces {
             if self.machine(&w.machine).is_none() {
                 return Err(crate::Error::UnknownMachine(w.machine.clone()));
@@ -2732,6 +2736,31 @@ workspace_settings_template: /etc/shelbi/p.json
         let mut bad2 = project.clone();
         bad2.workspaces.push(WorkspaceSpec { name: "bob".into(), machine: "hub".into(), runner: "ghost".into(), tags: Vec::new(), slot: None });
         assert!(matches!(bad2.validate_workspaces(), Err(crate::Error::UnknownRunner(_))));
+
+        let mut bad3 = project.clone();
+        bad3.orchestrator.runner = "ghost".into();
+        assert!(matches!(bad3.validate_workspaces(), Err(crate::Error::UnknownRunner(_))));
+    }
+
+    #[test]
+    fn project_yaml_validates_codex_orchestrator_runner() {
+        let yaml = r#"
+name: p
+repo: r
+machines:
+  - { name: hub, kind: local, work_dir: /tmp }
+orchestrator: { runner: codex }
+agent_runners:
+  claude: { command: claude, flags: [] }
+  codex:
+    command: codex
+    flags: []
+workspaces:
+  - { name: alice, machine: hub, runner: codex }
+"#;
+        let p: Project = serde_yaml::from_str(yaml).unwrap();
+        p.validate_workspaces()
+            .expect("codex orchestrator and workspace runner are declared");
     }
 
     // ---- Review workspaces -------------------------------------------------

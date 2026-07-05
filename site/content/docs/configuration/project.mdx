@@ -108,6 +108,26 @@ orchestrator:
   runner: claude
 ```
 
+To run the orchestrator with Codex, point `orchestrator.runner` at a
+declared Codex runner:
+
+```yaml
+orchestrator:
+  runner: codex
+agent_runners:
+  codex:
+    command: codex
+    flags: []
+```
+
+Shelbi validates that `orchestrator.runner` names an entry in
+`agent_runners`. Claude gets Shelbi's Claude-specific launch wiring
+(`--append-system-prompt` and the first-message bootstrap prompt). Codex
+is launched as the configured `command` plus `flags`, then receives an
+initial startup prompt containing the rendered orchestrator instructions
+and bootstrap request. Other runners launch exactly as configured. Put any
+required Codex mode flags in `agent_runners.codex.flags`.
+
 ## agent_runners
 
 A map from runner name to the command line agents are launched with.
@@ -126,7 +146,7 @@ agent_runners:
     flags: []
   codex:
     command: codex
-    flags: ["--full-auto"]
+    flags: []
 ```
 
 ## workspaces

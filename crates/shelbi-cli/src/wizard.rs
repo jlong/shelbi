@@ -203,7 +203,7 @@ pub fn setup_one_project() -> Result<()> {
     .context("orchestrator runner select")?;
 
     // ---- Assemble workspaces ----------------------------------------------
-    let workspaces = assign_workspace_names(&machines, count, preset)?;
+    let workspaces = assign_workspace_names(&machines, count, preset, agent_runner)?;
 
     // ---- Assemble Project struct ---------------------------------------
     let mut agent_runners = BTreeMap::new();
@@ -421,6 +421,7 @@ fn assign_workspace_names(
     machines: &[Machine],
     count: u32,
     preset: WorkspaceNamePreset,
+    runner: Runner,
 ) -> Result<Vec<WorkspaceSpec>> {
     let preset_names = preset.names();
     let total = (count as usize) * machines.len();
@@ -438,7 +439,7 @@ fn assign_workspace_names(
             workspaces.push(WorkspaceSpec {
                 name,
                 machine: machine.name.clone(),
-                runner: Runner::Claude.id().to_string(),
+                runner: runner.id().to_string(),
                 tags: Vec::new(),
                 slot: None,
             });
@@ -476,7 +477,7 @@ mod tests {
             host: None,
             tags: Vec::new(),
         }];
-        let workspaces = assign_workspace_names(&machines, 3, WorkspaceNamePreset::Phonetic).unwrap();
+        let workspaces = assign_workspace_names(&machines, 3, WorkspaceNamePreset::Phonetic, Runner::Claude).unwrap();
         let names: Vec<_> = workspaces.iter().map(|w| w.name.as_str()).collect();
         assert_eq!(names, vec!["alpha", "bravo", "charlie"]);
     }
@@ -499,7 +500,7 @@ mod tests {
                 tags: Vec::new(),
             },
         ];
-        let workspaces = assign_workspace_names(&machines, 2, WorkspaceNamePreset::Phonetic).unwrap();
+        let workspaces = assign_workspace_names(&machines, 2, WorkspaceNamePreset::Phonetic, Runner::Claude).unwrap();
         assert_eq!(workspaces.len(), 4);
         assert_eq!(workspaces[0].name, "alpha");
         assert_eq!(workspaces[0].machine, "hub");
@@ -521,12 +522,25 @@ mod tests {
             tags: Vec::new(),
         }];
         // Toy Story has 20 names; ask for 22.
-        let workspaces = assign_workspace_names(&machines, 22, WorkspaceNamePreset::ToyStory).unwrap();
+        let workspaces = assign_workspace_names(&machines, 22, WorkspaceNamePreset::ToyStory, Runner::Claude).unwrap();
         assert_eq!(workspaces.len(), 22);
         // First 20 come from the preset; tail falls back to <machine>-<n>.
         assert_eq!(workspaces[0].name, "woody");
         assert_eq!(workspaces[20].name, "hub-21");
         assert_eq!(workspaces[21].name, "hub-22");
+    }
+
+    #[test]
+    fn assign_workspace_names_uses_selected_runner() {
+        let machines = vec![Machine {
+            name: "hub".into(),
+            kind: MachineKind::Local,
+            work_dir: "/tmp".into(),
+            host: None,
+            tags: Vec::new(),
+        }];
+        let workspaces = assign_workspace_names(&machines, 2, WorkspaceNamePreset::Phonetic, Runner::Codex).unwrap();
+        assert!(workspaces.iter().all(|w| w.runner == "codex"));
     }
 
     #[test]
