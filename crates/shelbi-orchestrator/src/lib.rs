@@ -252,12 +252,7 @@ pub fn show_view(project_name: &str, view: &str) -> Result<()> {
 pub fn focus_workspace(project_name: &str, workspace_name: &str) -> Result<()> {
     let shelbi_bin = current_exe_string()?;
     let out = std::process::Command::new(&shelbi_bin)
-        .args([
-            "--project",
-            project_name,
-            "open",
-            workspace_name,
-        ])
+        .args(["--project", project_name, "open", workspace_name])
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::piped())
         .output()
@@ -342,8 +337,7 @@ pub fn ensure_dashboard(project_name: &str) -> Result<BootstrapStatus> {
     // tmux double-quote / $VAR / #{...} escape gymnastics that fighting
     // the same logic inline would require.
     let clamp_script_path = workdir.join("sidebar-clamp.sh");
-    std::fs::write(&clamp_script_path, sidebar_clamp_script(session))
-        .map_err(Error::Io)?;
+    std::fs::write(&clamp_script_path, sidebar_clamp_script(session)).map_err(Error::Io)?;
 
     let shelbi_bin = current_exe_string()?;
     let sidebar_cmd_str = sidebar_cmd(&shelbi_bin, project_name);
@@ -375,10 +369,8 @@ pub fn ensure_dashboard(project_name: &str) -> Result<BootstrapStatus> {
             ],
         )?;
     } else {
-        let windows = shelbi_ssh::run_capture(
-            &host,
-            ["tmux", "list-windows", "-t", session, "-F", "#W"],
-        )?;
+        let windows =
+            shelbi_ssh::run_capture(&host, ["tmux", "list-windows", "-t", session, "-F", "#W"])?;
         if !windows.lines().any(|w| w.trim() == "dashboard") {
             shelbi_ssh::run_capture(
                 &host,
@@ -402,10 +394,7 @@ pub fn ensure_dashboard(project_name: &str) -> Result<BootstrapStatus> {
     // wheel reach the ratatui pane. Scoped to this session — won't disturb
     // mouse behavior in the user's other tmux sessions. Idempotent; safe
     // to call every bootstrap.
-    let _ = shelbi_ssh::run_capture(
-        &host,
-        ["tmux", "set-option", "-t", session, "mouse", "on"],
-    );
+    let _ = shelbi_ssh::run_capture(&host, ["tmux", "set-option", "-t", session, "mouse", "on"]);
 
     // Install / re-install the palette popup tmux binding using the chord
     // resolved from `keys.yaml` (with this project's overrides applied).
@@ -419,10 +408,8 @@ pub fn ensure_dashboard(project_name: &str) -> Result<BootstrapStatus> {
     //    upgrade that added a view. The old early-return here (before step 4)
     //    meant that half-created stash never healed (F9). Run the idempotent
     //    view heal, then report AlreadyRunning.
-    let panes = shelbi_ssh::run_capture(
-        &host,
-        ["tmux", "list-panes", "-t", &dashboard, "-F", "#P"],
-    )?;
+    let panes =
+        shelbi_ssh::run_capture(&host, ["tmux", "list-panes", "-t", &dashboard, "-F", "#P"])?;
     let pane_count = panes.lines().filter(|l| !l.trim().is_empty()).count();
     if pane_count >= 2 {
         ensure_hidden_views(&host, session, project_name, &shelbi_bin)?;
@@ -458,7 +445,12 @@ pub fn ensure_dashboard(project_name: &str) -> Result<BootstrapStatus> {
     // Focus the orchestrator pane so the user can type immediately.
     shelbi_ssh::run_capture(
         &host,
-        ["tmux", "select-pane", "-t", &format!("{dashboard}.{{right}}")],
+        [
+            "tmux",
+            "select-pane",
+            "-t",
+            &format!("{dashboard}.{{right}}"),
+        ],
     )?;
 
     // Bound the sidebar to a sane char-width range so it neither
@@ -613,9 +605,17 @@ fn ensure_hidden_views(
         let pane_id = shelbi_ssh::run_capture(
             host,
             [
-                "tmux", "split-window", "-v", "-t", &stash_win,
-                "-P", "-F", "#{pane_id}",
-                "sh", "-c", &cmd,
+                "tmux",
+                "split-window",
+                "-v",
+                "-t",
+                &stash_win,
+                "-P",
+                "-F",
+                "#{pane_id}",
+                "sh",
+                "-c",
+                &cmd,
             ],
         )?;
         set_session_env(host, session, &env_key, pane_id.trim())?;
@@ -630,7 +630,16 @@ fn ensure_hidden_views(
 fn resize_stash_window(host: &shelbi_core::Host, stash_win: &str) {
     let _ = shelbi_ssh::run(
         host,
-        ["tmux", "resize-window", "-t", stash_win, "-x", "220", "-y", "200"],
+        [
+            "tmux",
+            "resize-window",
+            "-t",
+            stash_win,
+            "-x",
+            "220",
+            "-y",
+            "200",
+        ],
     );
 }
 
@@ -638,7 +647,14 @@ fn resize_stash_window(host: &shelbi_core::Host, stash_win: &str) {
 fn live_stash_pane_ids(host: &shelbi_core::Host, stash: &str) -> Result<Vec<String>> {
     let out = shelbi_ssh::run_capture(
         host,
-        ["tmux", "list-panes", "-t", &format!("{stash}:views"), "-F", "#{pane_id}"],
+        [
+            "tmux",
+            "list-panes",
+            "-t",
+            &format!("{stash}:views"),
+            "-F",
+            "#{pane_id}",
+        ],
     )?;
     Ok(out
         .lines()
@@ -708,9 +724,19 @@ fn create_hidden_views(
             let id = shelbi_ssh::run_capture(
                 host,
                 [
-                    "tmux", "new-session", "-d", "-s", &stash, "-n", "views",
-                    "-P", "-F", "#{pane_id}",
-                    "sh", "-c", cmd,
+                    "tmux",
+                    "new-session",
+                    "-d",
+                    "-s",
+                    &stash,
+                    "-n",
+                    "views",
+                    "-P",
+                    "-F",
+                    "#{pane_id}",
+                    "sh",
+                    "-c",
+                    cmd,
                 ],
             )?;
             // Grow the detached window before stacking the rest so the splits
@@ -721,23 +747,31 @@ fn create_hidden_views(
             shelbi_ssh::run_capture(
                 host,
                 [
-                    "tmux", "split-window", "-v", "-t", &stash_win,
-                    "-P", "-F", "#{pane_id}",
-                    "sh", "-c", cmd,
+                    "tmux",
+                    "split-window",
+                    "-v",
+                    "-t",
+                    &stash_win,
+                    "-P",
+                    "-F",
+                    "#{pane_id}",
+                    "sh",
+                    "-c",
+                    cmd,
                 ],
             )?
         };
-        set_session_env(host, session, &format!("SHELBI_PANE_{view}"), pane_id.trim())?;
+        set_session_env(
+            host,
+            session,
+            &format!("SHELBI_PANE_{view}"),
+            pane_id.trim(),
+        )?;
     }
     Ok(())
 }
 
-fn set_session_env(
-    host: &shelbi_core::Host,
-    session: &str,
-    key: &str,
-    value: &str,
-) -> Result<()> {
+fn set_session_env(host: &shelbi_core::Host, session: &str, key: &str, value: &str) -> Result<()> {
     shelbi_ssh::run_capture(host, ["tmux", "set-environment", "-t", session, key, value])?;
     Ok(())
 }
@@ -777,10 +811,7 @@ fn install_sidebar_clamp_hooks(
     let path_esc = shelbi_agent::shell_escape(&script_path.to_string_lossy());
     let hook_cmd = format!("run-shell -b 'sh {path_esc}'");
     for event in ["client-attached", "client-resized"] {
-        let _ = shelbi_ssh::run(
-            host,
-            ["tmux", "set-hook", "-t", session, event, &hook_cmd],
-        );
+        let _ = shelbi_ssh::run(host, ["tmux", "set-hook", "-t", session, event, &hook_cmd]);
     }
     Ok(())
 }
@@ -853,8 +884,9 @@ const ORCH_BOOTSTRAP_PROMPT: &str = "Run the \"Bootstrap on session start\" sequ
 /// shape. Codex has no `--append-system-prompt` equivalent in Shelbi's
 /// runner abstraction, but its interactive CLI accepts an initial
 /// positional prompt; for Codex we build that prompt from the project
-/// identity, worktree path, rendered instructions file, and bootstrap
-/// request so the first turn already knows it is Shelbi's scheduler.
+/// identity, worktree path, rendered instructions file, bootstrap
+/// request, and any reload handoff context spliced into the rendered
+/// file so the first turn already knows it is Shelbi's scheduler.
 fn launch_with_bootstrap(
     spec: &shelbi_core::AgentRunnerSpec,
     project_name: &str,
@@ -897,7 +929,10 @@ fn codex_orchestrator_prompt_arg(project_name: &str, workdir: &std::path::Path) 
         "You are Shelbi's orchestrator/scheduler for project `{project_name}`.\n\
          Project worktree: `{workdir}`.\n\
          Do not edit project code directly; coordinate workspaces and board state.\n\n\
-         Authoritative Shelbi orchestrator instructions follow. Treat them as your developer-agent contract.\n\n",
+         Authoritative Shelbi orchestrator instructions follow. Treat them as your developer-agent contract. \
+         They include the project-local orchestrator role, bootstrap rules, event-tail responsibility, \
+         Zen Mode rules, and any reload handoff context captured before this pane was restarted. \
+         If a handoff `<system-reminder>` block is present there, use it as continuity context.\n\n",
     );
     let after = format!("\n\n{ORCH_BOOTSTRAP_PROMPT}");
     concat_shell_prompt_parts(&before, ORCH_AGENT_INSTRUCTIONS_REL, &after)
@@ -1090,8 +1125,11 @@ pub fn reload(project_name: &str) -> Result<ReloadReport> {
         "machines",
         &machines_cmd(&shelbi_bin, project_name),
     );
-    report.activity =
-        reload_stash_pane(&session, "activity", &activity_cmd(&shelbi_bin, project_name));
+    report.activity = reload_stash_pane(
+        &session,
+        "activity",
+        &activity_cmd(&shelbi_bin, project_name),
+    );
 
     // 6. Orchestrator pane. Re-deploy the agent context first so the new
     //    launch sees the latest `instructions.md` / `preamble.md` AND
@@ -1400,18 +1438,28 @@ mod pane_cmd_tests {
         assert!(out.starts_with("cd /Users/me/.shelbi/projects/myapp && "));
         assert!(out.contains("export SHELBI_PROJECT=myapp SHELBI_TMUX_SESSION=shelbi-myapp"));
         // Crash recovery check runs before the heartbeat loop spawns.
-        let start_idx = out.find("__zen-orch-start myapp").expect("missing __zen-orch-start");
+        let start_idx = out
+            .find("__zen-orch-start myapp")
+            .expect("missing __zen-orch-start");
         let heartbeat_idx = out
             .find("__zen-heartbeat myapp")
             .expect("missing __zen-heartbeat");
         let launch_idx = out.find("claude --print").expect("missing launch");
-        let exit_idx = out.find("__zen-orch-exit myapp").expect("missing __zen-orch-exit");
+        let exit_idx = out
+            .find("__zen-orch-exit myapp")
+            .expect("missing __zen-orch-exit");
         assert!(start_idx < heartbeat_idx, "start must precede heartbeat");
-        assert!(heartbeat_idx < launch_idx, "heartbeat must spawn before launch");
+        assert!(
+            heartbeat_idx < launch_idx,
+            "heartbeat must spawn before launch"
+        );
         assert!(launch_idx < exit_idx, "exit must run after launch returns");
         // Heartbeat loop is spawned in the background and killed afterwards.
         assert!(out.contains("HB=$!"), "must capture heartbeat pid");
-        assert!(out.contains("kill $HB"), "must kill heartbeat after launch exits");
+        assert!(
+            out.contains("kill $HB"),
+            "must kill heartbeat after launch exits"
+        );
         // We deliberately don't exec the launch so the wrapper survives.
         assert!(!out.contains(" exec "), "exec would skip the cleanup hooks");
         // Exit code of the agent is preserved.
@@ -1450,9 +1498,18 @@ mod pane_cmd_tests {
         );
         // Single-quoted so the whole prompt lands as one positional arg
         // inside the `sh -c "...; {launch}; ..."` wrapper.
-        assert!(out.contains("'Run the \"Bootstrap on session start\""), "missing escaped prompt: {out}");
-        assert!(out.contains("shelbi events tail --follow"), "prompt must name the tail command");
-        assert!(out.contains("Monitor tool"), "prompt must mention the Monitor tool");
+        assert!(
+            out.contains("'Run the \"Bootstrap on session start\""),
+            "missing escaped prompt: {out}"
+        );
+        assert!(
+            out.contains("shelbi events tail --follow"),
+            "prompt must name the tail command"
+        );
+        assert!(
+            out.contains("Monitor tool"),
+            "prompt must mention the Monitor tool"
+        );
         // Orchestrator now sources its system prompt from
         // `agents/orchestrator/instructions.md` (composed with the
         // shared preamble) via `--append-system-prompt`, replacing the
@@ -1496,7 +1553,8 @@ mod pane_cmd_tests {
         // Codex accepts an initial positional prompt but has no
         // --append-system-prompt surface in Shelbi's runner abstraction.
         // The prompt must therefore carry the rendered orchestrator
-        // instructions, project identity, worktree, and bootstrap ask.
+        // instructions, project identity, worktree, bootstrap ask, and
+        // reload handoff continuity guidance.
         let spec = shelbi_core::AgentRunnerSpec {
             command: "codex".into(),
             flags: vec!["--print".into()],
@@ -1524,8 +1582,16 @@ mod pane_cmd_tests {
             "Codex prompt must receive rendered orchestrator instructions: {out}"
         );
         assert!(
+            out.contains("handoff `<system-reminder>` block"),
+            "Codex startup must call out reload handoff continuity: {out}"
+        );
+        assert!(
             out.contains("Run the \"Bootstrap on session start\" sequence"),
             "missing bootstrap request: {out}"
+        );
+        assert!(
+            !out.contains("--append-system-prompt"),
+            "Codex must not receive Claude-only flags: {out}"
         );
     }
 
@@ -1618,7 +1684,15 @@ mod create_stash_pane_tmux_tests {
 
         let ok = std::process::Command::new("tmux")
             .args([
-                "new-session", "-d", "-s", &vis, "-n", "dashboard", "sh", "-c", "sleep 30",
+                "new-session",
+                "-d",
+                "-s",
+                &vis,
+                "-n",
+                "dashboard",
+                "sh",
+                "-c",
+                "sleep 30",
             ])
             .status()
             .map(|s| s.success())
@@ -1627,7 +1701,15 @@ mod create_stash_pane_tmux_tests {
 
         let ok = std::process::Command::new("tmux")
             .args([
-                "new-session", "-d", "-s", &stash, "-n", "views", "sh", "-c", "sleep 30",
+                "new-session",
+                "-d",
+                "-s",
+                &stash,
+                "-n",
+                "views",
+                "sh",
+                "-c",
+                "sleep 30",
             ])
             .status()
             .map(|s| s.success())
@@ -1650,7 +1732,10 @@ mod create_stash_pane_tmux_tests {
             PaneReloadStatus::Created { target } => target.clone(),
             other => panic!("expected Created, got {other:?}"),
         };
-        assert!(pane_id.starts_with('%'), "expected tmux pane id like `%42`, got `{pane_id}`");
+        assert!(
+            pane_id.starts_with('%'),
+            "expected tmux pane id like `%42`, got `{pane_id}`"
+        );
 
         // Env was pinned to the visible session under the canonical key.
         let env_out = std::process::Command::new("tmux")
@@ -1753,17 +1838,37 @@ mod ensure_hidden_views_tmux_tests {
         kill_session(&vis);
         kill_session(&stash);
         std::process::Command::new("tmux")
-            .args(["new-session", "-d", "-s", &vis, "-n", "dashboard", "sh", "-c", "sleep 30"])
+            .args([
+                "new-session",
+                "-d",
+                "-s",
+                &vis,
+                "-n",
+                "dashboard",
+                "sh",
+                "-c",
+                "sleep 30",
+            ])
             .status()
             .unwrap();
 
         ensure_hidden_views(&Host::Local, &vis, "proj", "shelbi").unwrap();
 
-        assert_eq!(pane_count(&format!("{stash}:views")), 3, "expected 3 view panes");
+        assert_eq!(
+            pane_count(&format!("{stash}:views")),
+            3,
+            "expected 3 view panes"
+        );
         for view in ["tasks", "machines", "activity"] {
             let id = env_var(&vis, &format!("SHELBI_PANE_{view}"));
-            assert!(id.is_some(), "SHELBI_PANE_{view} should be pinned on the visible session");
-            assert!(id.unwrap().starts_with('%'), "env should hold a tmux pane id");
+            assert!(
+                id.is_some(),
+                "SHELBI_PANE_{view} should be pinned on the visible session"
+            );
+            assert!(
+                id.unwrap().starts_with('%'),
+                "env should hold a tmux pane id"
+            );
         }
 
         kill_session(&vis);
@@ -1785,13 +1890,33 @@ mod ensure_hidden_views_tmux_tests {
         kill_session(&vis);
         kill_session(&stash);
         std::process::Command::new("tmux")
-            .args(["new-session", "-d", "-s", &vis, "-n", "dashboard", "sh", "-c", "sleep 30"])
+            .args([
+                "new-session",
+                "-d",
+                "-s",
+                &vis,
+                "-n",
+                "dashboard",
+                "sh",
+                "-c",
+                "sleep 30",
+            ])
             .status()
             .unwrap();
         // Stash exists with a lone seed pane and NO env pinned — the
         // "half-created view stash" the old early-return never healed.
         std::process::Command::new("tmux")
-            .args(["new-session", "-d", "-s", &stash, "-n", "views", "sh", "-c", "sleep 30"])
+            .args([
+                "new-session",
+                "-d",
+                "-s",
+                &stash,
+                "-n",
+                "views",
+                "sh",
+                "-c",
+                "sleep 30",
+            ])
             .status()
             .unwrap();
         assert_eq!(pane_count(&format!("{stash}:views")), 1);
@@ -1800,17 +1925,28 @@ mod ensure_hidden_views_tmux_tests {
 
         // Seed pane + one fresh pane per view = 4, all three views pinned to a
         // pane that's actually alive in the stash.
-        assert_eq!(pane_count(&format!("{stash}:views")), 4, "one pane spliced per missing view");
+        assert_eq!(
+            pane_count(&format!("{stash}:views")),
+            4,
+            "one pane spliced per missing view"
+        );
         let live = live_stash_pane_ids(&Host::Local, &stash).unwrap();
         for view in ["tasks", "machines", "activity"] {
             let id = env_var(&vis, &format!("SHELBI_PANE_{view}"))
                 .unwrap_or_else(|| panic!("SHELBI_PANE_{view} unset after heal"));
-            assert!(live.contains(&id), "pinned {view} pane {id} must be alive in the stash");
+            assert!(
+                live.contains(&id),
+                "pinned {view} pane {id} must be alive in the stash"
+            );
         }
 
         // Second call: every view is now healthy, so nothing new is spliced.
         ensure_hidden_views(&Host::Local, &vis, "proj", "shelbi").unwrap();
-        assert_eq!(pane_count(&format!("{stash}:views")), 4, "heal must be idempotent");
+        assert_eq!(
+            pane_count(&format!("{stash}:views")),
+            4,
+            "heal must be idempotent"
+        );
 
         kill_session(&vis);
         kill_session(&stash);
@@ -1829,7 +1965,17 @@ mod ensure_hidden_views_tmux_tests {
         kill_session(&vis);
         kill_session(&stash);
         std::process::Command::new("tmux")
-            .args(["new-session", "-d", "-s", &vis, "-n", "dashboard", "sh", "-c", "sleep 30"])
+            .args([
+                "new-session",
+                "-d",
+                "-s",
+                &vis,
+                "-n",
+                "dashboard",
+                "sh",
+                "-c",
+                "sleep 30",
+            ])
             .status()
             .unwrap();
 
@@ -1846,7 +1992,11 @@ mod ensure_hidden_views_tmux_tests {
         ensure_hidden_views(&Host::Local, &vis, "proj", "shelbi").unwrap();
 
         // `tasks` was re-created (4 panes now), the other two untouched.
-        assert_eq!(pane_count(&format!("{stash}:views")), 4, "dead tasks pane re-created");
+        assert_eq!(
+            pane_count(&format!("{stash}:views")),
+            4,
+            "dead tasks pane re-created"
+        );
         let live = live_stash_pane_ids(&Host::Local, &stash).unwrap();
         let tasks_id = env_var(&vis, "SHELBI_PANE_tasks").unwrap();
         assert_ne!(tasks_id, "%99999", "stale id must be replaced");
