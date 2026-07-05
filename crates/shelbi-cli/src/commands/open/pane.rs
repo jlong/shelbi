@@ -104,15 +104,19 @@ pub fn run(
     let has_agent_instructions = worktree
         .join(orch_workspace::WORKTREE_AGENT_INSTRUCTIONS_REL)
         .exists();
+    let codex_startup_prompt_rel = worktree
+        .join(orch_workspace::WORKTREE_CODEX_STARTUP_PROMPT_REL)
+        .exists()
+        .then_some(orch_workspace::WORKTREE_CODEX_STARTUP_PROMPT_REL);
     // Build the launch command through the shared constructor so this local
     // wrapper path and the remote dispatch path (`deploy_and_spawn`) apply the
-    // same runner / permission-mode / append-system-prompt logic and can't
-    // drift.
-    let launch_full = orch_workspace::workspace_launch_command(
+    // same runner / permission-mode / startup-prompt logic and can't drift.
+    let launch_full = orch_workspace::workspace_launch_command_with_startup_prompt(
         &runner,
         &project.workspace_permissions_mode,
         has_agent_instructions,
         resume,
+        codex_startup_prompt_rel,
     );
 
     // `cd` falls back to $HOME if the worktree doesn't exist — that keeps
