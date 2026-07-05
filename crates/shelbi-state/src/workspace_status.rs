@@ -464,7 +464,7 @@ fn truncate_with_ellipsis(s: &str, max: usize) -> String {
 /// workflow-aware line shape from `Plans/workflows.md` §10:
 ///
 /// ```text
-/// <rfc3339> task=<id> workflow=<name> <from> -> <to> reason=<short> from_category=<cat> to_category=<cat>
+/// <rfc3339> project=<project> task=<id> workflow=<name> <from> -> <to> reason=<short> from_category=<cat> to_category=<cat>
 /// ```
 ///
 /// Shares the file with workspace events; the orchestrator distinguishes the
@@ -481,6 +481,7 @@ fn truncate_with_ellipsis(s: &str, max: usize) -> String {
 /// `reason` should be a single short token (whitespace/newlines are folded
 /// to underscores so the line stays parseable).
 pub fn append_task_event(
+    project: &str,
     task_id: &str,
     workflow: &str,
     from: Column,
@@ -488,6 +489,7 @@ pub fn append_task_event(
     reason: &str,
 ) -> Result<()> {
     let ts = Utc::now().to_rfc3339();
+    let project = sanitize_field(project);
     let task_id = sanitize_field(task_id);
     let reason = sanitize_reason(reason);
     let workflow_name = if workflow.trim().is_empty() {
@@ -498,7 +500,7 @@ pub fn append_task_event(
     let from_category = from.category();
     let to_category = to.category();
     append_event_line(&format!(
-        "{ts} task={task_id} workflow={workflow_name} {from} -> {to} \
+        "{ts} project={project} task={task_id} workflow={workflow_name} {from} -> {to} \
          reason={reason} from_category={from_category} to_category={to_category}"
     ))
 }
@@ -1792,6 +1794,7 @@ mod tests {
         std::env::set_var("SHELBI_HOME", &home);
 
         append_task_event(
+            "demo",
             "fix-login",
             "default",
             Column::todo(),
@@ -1800,6 +1803,7 @@ mod tests {
         )
         .unwrap();
         append_task_event(
+            "demo",
             "fix-login",
             "default",
             Column::in_progress(),
@@ -1813,7 +1817,7 @@ mod tests {
         assert_eq!(lines.len(), 2);
 
         // Each line must split cleanly back into its fields:
-        // `<ts> task=<id> workflow=<name> <from> -> <to> reason=<r>
+        // `<ts> project=<project> task=<id> workflow=<name> <from> -> <to> reason=<r>
         //  from_category=<c> to_category=<c>` — see `Plans/workflows.md` §10.
         let parsed: Vec<Vec<&str>> = lines
             .iter()
@@ -1826,18 +1830,19 @@ mod tests {
             chrono::DateTime::parse_from_rfc3339(ts)
                 .unwrap_or_else(|_| panic!("not rfc3339: {ts}"));
         }
-        assert_eq!(parsed[0][1], "task=fix-login");
-        assert_eq!(parsed[0][2], "workflow=default");
-        assert_eq!(parsed[0][3], "todo");
-        assert_eq!(parsed[0][4], "->");
-        assert_eq!(parsed[0][5], "in_progress");
-        assert_eq!(parsed[0][6], "reason=assigned");
-        assert_eq!(parsed[0][7], "from_category=ready");
-        assert_eq!(parsed[0][8], "to_category=active");
-        assert_eq!(parsed[1][5], "review");
-        assert_eq!(parsed[1][6], "reason=workspace_review");
-        assert_eq!(parsed[1][7], "from_category=active");
-        assert_eq!(parsed[1][8], "to_category=handoff");
+        assert_eq!(parsed[0][1], "project=demo");
+        assert_eq!(parsed[0][2], "task=fix-login");
+        assert_eq!(parsed[0][3], "workflow=default");
+        assert_eq!(parsed[0][4], "todo");
+        assert_eq!(parsed[0][5], "->");
+        assert_eq!(parsed[0][6], "in_progress");
+        assert_eq!(parsed[0][7], "reason=assigned");
+        assert_eq!(parsed[0][8], "from_category=ready");
+        assert_eq!(parsed[0][9], "to_category=active");
+        assert_eq!(parsed[1][6], "review");
+        assert_eq!(parsed[1][7], "reason=workspace_review");
+        assert_eq!(parsed[1][8], "from_category=active");
+        assert_eq!(parsed[1][9], "to_category=handoff");
 
         std::env::remove_var("SHELBI_HOME");
     }
@@ -1851,7 +1856,7 @@ mod tests {
         let home = fresh_home();
         std::env::set_var("SHELBI_HOME", &home);
 
-        append_task_event("a", "", Column::todo(), Column::done(), "assigned").unwrap();
+        append_task_event("demo", "a", "", Column::todo(), Column::done(), "assigned").unwrap();
         let log = std::fs::read_to_string(events_log_path().unwrap()).unwrap();
         let line = log.lines().next().unwrap();
         assert!(line.contains(" workflow=default "), "line: {line}");
@@ -1866,6 +1871,7 @@ mod tests {
         std::env::set_var("SHELBI_HOME", &home);
 
         append_task_event(
+            "demo",
             "ship-it",
             "feature-task",
             Column::in_progress(),
@@ -2014,7 +2020,15 @@ mod tests {
         let home = fresh_home();
         std::env::set_var("SHELBI_HOME", &home);
 
-        append_task_event("a", "default", Column::todo(), Column::done(), "user moved\nit").unwrap();
+        append_task_event(
+            "demo",
+            "a",
+            "default",
+            Column::todo(),
+            Column::done(),
+            "user moved\nit",
+        )
+        .unwrap();
         let log = std::fs::read_to_string(events_log_path().unwrap()).unwrap();
         let lines: Vec<&str> = log.lines().collect();
         // The reason newline must not produce a torn line — the line keeps
@@ -2048,6 +2062,7 @@ mod tests {
         let hostile_id = "evil\nworkspace=x pane_alive=false reason=pwned";
         let hostile_workflow = "wf\r\nmode=zen off -> on reason=user:hotkey";
         append_task_event(
+            "demo",
             hostile_id,
             hostile_workflow,
             Column::todo(),
@@ -2111,6 +2126,7 @@ mod tests {
         let task_thread = std::thread::spawn(|| {
             for i in 0..N {
                 append_task_event(
+                    "demo",
                     &format!("t{i:04}"),
                     "default",
                     Column::todo(),

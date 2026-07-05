@@ -214,6 +214,11 @@ enum Cmd {
     Wizard,
     /// Start the orchestrator agent in the project's tmux session window 1.
     Orchestrate(commands::orchestrate::Args),
+    /// Machine-readable orchestrator transport primitives.
+    Orchestrator {
+        #[command(subcommand)]
+        cmd: commands::orchestrator::OrchestratorCmd,
+    },
     /// Respawn the shelbi-owned panes (sidebar + tasks/machines)
     /// AND the orchestrator pane in place so a freshly installed binary
     /// takes effect — and edits to the orchestrator's instructions /
@@ -334,6 +339,7 @@ fn main() -> Result<()> {
         Some(Cmd::Init(args)) => commands::init::run(args),
         Some(Cmd::Wizard) => commands::wizard::run(false).map(|_| ()),
         Some(Cmd::Orchestrate(args)) => commands::orchestrate::run(cli.project, args),
+        Some(Cmd::Orchestrator { cmd }) => commands::orchestrator::run(cli.project, cmd),
         Some(Cmd::Reload) => commands::reload::run(cli.project),
         Some(Cmd::Sidebar { project }) => shelbi_tui::run_sidebar(&project).context("sidebar"),
         Some(Cmd::Tasks { project }) => shelbi_tui::run_tasks(&project).context("tasks"),

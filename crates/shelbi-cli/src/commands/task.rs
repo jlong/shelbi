@@ -471,7 +471,9 @@ fn move_to(project: &str, id: &str, to: &str, reason: Option<&str>) -> Result<()
     let moved = shelbi_state::move_task(project, id, column.clone()).map_err(|e| anyhow!(e))?;
     if let Some((from, to_col, workflow)) = moved {
         let reason = reason.unwrap_or("user:cli");
-        if let Err(e) = shelbi_state::append_task_event(id, &workflow, from, to_col, reason) {
+        if let Err(e) =
+            shelbi_state::append_task_event(project, id, &workflow, from, to_col, reason)
+        {
             eprintln!("warning: append_task_event failed: {e}");
         }
     }
@@ -828,6 +830,7 @@ fn start(
         let dispatched_reason = dispatch_reason_with_agent(base_reason, &agent_name);
         let workflow = tf.task.workflow_or_default();
         if let Err(e) = shelbi_state::append_task_event(
+            project,
             id,
             workflow,
             prev_column.clone(),
@@ -1005,6 +1008,7 @@ fn resume(
         let dispatched_reason = dispatch_reason_with_agent(base_reason, &agent_name);
         let workflow = tf.task.workflow_or_default();
         if let Err(e) = shelbi_state::append_task_event(
+            project,
             id,
             workflow,
             prev_column.clone(),
@@ -1518,6 +1522,7 @@ statuses:
             dispatch_reason_with_agent("orchestrator:auto-dispatch workspace=alpha", "developer");
         shelbi_state::append_task_event(
             "demo",
+            "demo-task",
             "default",
             Column::todo(),
             Column::in_progress(),

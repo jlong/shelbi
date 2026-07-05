@@ -308,7 +308,7 @@ fn release_workspace_tasks(project: &str, workspace_name: &str) -> Result<Vec<St
             shelbi_state::release_task_to_todo(project, &id).map_err(|e| anyhow!(e))?;
         if let Some((from, to, workflow)) = moved {
             if let Err(e) =
-                shelbi_state::append_task_event(&id, &workflow, from, to, "workspace:stop")
+                shelbi_state::append_task_event(project, &id, &workflow, from, to, "workspace:stop")
             {
                 eprintln!("warning: append_task_event failed: {e}");
             }

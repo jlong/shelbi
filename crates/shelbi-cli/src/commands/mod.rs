@@ -11,6 +11,7 @@ pub mod list;
 pub mod merge;
 pub mod message;
 pub mod open;
+pub mod orchestrator;
 pub mod orchestrate;
 pub mod palette;
 pub mod picker;

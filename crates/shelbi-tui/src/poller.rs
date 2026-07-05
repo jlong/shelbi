@@ -880,6 +880,7 @@ fn maybe_apply_ready_handoff(
             match shelbi_state::move_task(&project.name, &task_id, to_column) {
                 Ok(Some((from, to, workflow))) => {
                     if let Err(e) = shelbi_state::append_task_event(
+                        &project.name,
                         &task_id,
                         &workflow,
                         from,
@@ -1134,6 +1135,7 @@ fn maybe_apply_transition(
                     {
                         Ok(Some((from, to, wf))) => {
                             if let Err(e) = shelbi_state::append_task_event(
+                                &project.name,
                                 &req.task_id,
                                 &wf,
                                 from,
@@ -1796,11 +1798,7 @@ mod tests {
         let log = std::fs::read_to_string(shelbi_state::events_log_path().unwrap()).unwrap();
         let task_lines: Vec<&str> = log
             .lines()
-            .filter(|l| {
-                let mut parts = l.splitn(3, ' ');
-                let _ts = parts.next();
-                parts.next() == Some("task=fix-login")
-            })
+            .filter(|l| l.contains(" project=demo task=fix-login "))
             .collect();
         assert_eq!(task_lines.len(), 1, "log: {log:?}");
         assert!(
