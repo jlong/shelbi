@@ -710,6 +710,7 @@ pub fn start_workspace_on_task(spec: StartSpec<'_>) -> Result<TmuxAddr> {
     //     prompt on every command — exactly the bug we're trying to avoid.
     //     Surface it up front so the failure mode is "shelbi rejected this
     //     machine" instead of "my workspace keeps pausing for no reason."
+    require_runner_available(&host, &runner)?;
     require_auto_mode_supported(&host, &runner, &spec.project.workspace_permissions_mode)?;
 
     // 0b. Clear any stale review marker left in the worktree from a previous
@@ -942,6 +943,14 @@ fn deploy_and_spawn(a: SpawnArgs<'_>) -> Result<()> {
         deploy_agent_context(a.host, a.worktree, &a.project.name, agent)?;
     }
 
+    let codex_startup_prompt_rel = if is_codex_runner(&a.runner.command) {
+        let startup_prompt = render_codex_startup_prompt(a.prompt, a.agent.is_some());
+        deploy_codex_startup_prompt(a.host, a.worktree, &startup_prompt)?;
+        Some(WORKTREE_CODEX_STARTUP_PROMPT_REL)
+    } else {
+        None
+    };
+
     // 3. Reset the tmux pane — that's how we clear context. If it doesn't
     //    exist yet, this is a no-op; otherwise the next step recreates it.
     kill_workspace_pane(a.host, a.addr, &a.workspace.name)?;
@@ -1003,25 +1012,51 @@ fn deploy_and_spawn(a: SpawnArgs<'_>) -> Result<()> {
                 pane_cmd: &pane_cmd,
                 port: a.port,
             });
-            shelbi_ssh::run_capture(a.host, &argv)?;
+            shelbi_ssh::run_capture(a.host, &argv).map_err(|e| {
+                Error::Other(format!(
+                    "pane startup failure for workspace `{}` using {} runner `{}`: {e}",
+                    a.workspace.name,
+                    runner_label(&a.runner.command),
+                    a.runner.command,
+                ))
+            })?;
         }
         Host::Ssh { .. } => {
-            shelbi_tmux::new_session(a.host, &a.addr.session, &a.addr.window, None)?;
+            shelbi_tmux::new_session(a.host, &a.addr.session, &a.addr.window, None).map_err(|e| {
+                Error::Other(format!(
+                    "pane startup failure for workspace `{}` using {} runner `{}`: {e}",
+                    a.workspace.name,
+                    runner_label(&a.runner.command),
+                    a.runner.command,
+                ))
+            })?;
             // Remote panes run the agent directly — the lifecycle wrapper isn't
             // deployed on the workspace host — so we build the launch command
             // here and send it into the pane. This goes through the SAME
             // `workspace_launch_command` constructor the local wrapper
             // (`shelbi open --as-pane`) uses, so the two host paths can't drift.
-            let launch = workspace_launch_command(
+            let launch = workspace_launch_command_with_startup_prompt(
                 a.runner,
                 &a.project.workspace_permissions_mode,
                 a.agent.is_some(),
                 a.resume,
+                codex_startup_prompt_rel,
             );
             let cd_launch =
                 remote_cd_launch(a.worktree, &launch, a.port, &a.workspace.name);
-            shelbi_tmux::send_line(a.host, a.addr, &cd_launch)?;
+            shelbi_tmux::send_line(a.host, a.addr, &cd_launch).map_err(|e| {
+                Error::Other(format!(
+                    "pane startup failure for workspace `{}` using {} runner `{}`: {e}",
+                    a.workspace.name,
+                    runner_label(&a.runner.command),
+                    a.runner.command,
+                ))
+            })?;
         }
+    }
+
+    if is_codex_runner(&a.runner.command) {
+        return Ok(());
     }
 
     // 6. Wait until claude has drawn its input box before typing the prompt.
@@ -1440,6 +1475,54 @@ fn require_auto_mode_supported(
     Ok(())
 }
 
+/// Validate the runner shape and ensure the executable is visible from the
+/// workspace host before we tear down the old pane. This turns a missing
+/// `codex`/`claude` binary into an immediate dispatch error instead of a tmux
+/// pane that starts, prints "command not found", and exits before Shelbi can
+/// deliver the startup prompt.
+fn require_runner_available(host: &Host, runner: &shelbi_core::AgentRunnerSpec) -> Result<()> {
+    let command = runner.command.trim();
+    if command.is_empty() {
+        return Err(Error::Other(
+            "invalid runner config: runner command is empty".into(),
+        ));
+    }
+    if command.contains('\n') || command.contains('\0') {
+        return Err(Error::Other(format!(
+            "invalid runner config: runner command `{command:?}` contains an unsupported control character"
+        )));
+    }
+
+    let script = if command.contains('/') {
+        format!("test -x {}", shelbi_agent::shell_escape(command))
+    } else {
+        format!("command -v -- {} >/dev/null", shelbi_agent::shell_escape(command))
+    };
+    let out = match host {
+        Host::Local => shelbi_ssh::run(host, ["sh", "-lc", &script]),
+        Host::Ssh { .. } => crate::git::run_login_shell_script(host, &script),
+    }
+    .map_err(|e| Error::Other(format!("checking runner binary `{command}` failed: {e}")))?;
+    if !out.status.success() {
+        return Err(Error::Other(format!(
+            "missing {} binary: runner command `{command}` was not found on the workspace host. \
+             Install it there or update this workspace's runner config.",
+            runner_label(command),
+        )));
+    }
+    Ok(())
+}
+
+fn runner_label(command: &str) -> &'static str {
+    if shelbi_agent::is_claude_runner(command) {
+        "Claude"
+    } else if is_codex_runner(command) {
+        "Codex"
+    } else {
+        "agent runner"
+    }
+}
+
 /// Run `claude --version` on `host` and parse `(major, minor, patch)` from
 /// its stdout. Returns `None` on any failure — caller decides how to react.
 ///
@@ -1542,6 +1625,7 @@ pub fn deploy_workspace_settings(
 /// gitignored together and there's exactly one place to look when
 /// debugging an agent that loaded the wrong prompt.
 pub const WORKTREE_AGENT_INSTRUCTIONS_REL: &str = ".claude/agent-instructions.md";
+pub const WORKTREE_CODEX_STARTUP_PROMPT_REL: &str = ".shelbi/codex-startup-prompt.md";
 
 /// Relative path (from the worktree root) where the dispatched agent's
 /// `skills/` directory is mounted. Claude Code auto-loads any
@@ -1660,6 +1744,45 @@ pub fn deploy_agent_instructions(
             instructions,
             "agent-instructions",
         ),
+    }
+}
+
+fn render_codex_startup_prompt(prompt: &str, include_agent_instructions: bool) -> String {
+    let mut out = String::new();
+    if include_agent_instructions {
+        out.push_str("Read `.claude/agent-instructions.md` first. ");
+        out.push_str("Treat it as your developer-agent instructions for this Shelbi workspace.\n\n");
+    }
+    out.push_str(prompt);
+    if !out.ends_with('\n') {
+        out.push('\n');
+    }
+    out
+}
+
+fn deploy_codex_startup_prompt(host: &Host, worktree: &Path, prompt: &str) -> Result<()> {
+    let dest_path = worktree.join(WORKTREE_CODEX_STARTUP_PROMPT_REL);
+    let dest_dir = dest_path.parent().ok_or_else(|| {
+        Error::Other(format!(
+            "invalid codex startup prompt path `{WORKTREE_CODEX_STARTUP_PROMPT_REL}`"
+        ))
+    })?;
+    match host {
+        Host::Local => {
+            std::fs::create_dir_all(dest_dir)
+                .map_err(|e| Error::Other(format!("codex startup prompt delivery failure: {e}")))?;
+            std::fs::write(&dest_path, prompt)
+                .map_err(|e| Error::Other(format!("codex startup prompt delivery failure: {e}")))?;
+            Ok(())
+        }
+        Host::Ssh { host: ssh_host } => scp_text_to_remote(
+            ssh_host,
+            &dest_dir.to_string_lossy(),
+            &dest_path.to_string_lossy(),
+            prompt,
+            "codex-startup-prompt",
+        )
+        .map_err(|e| Error::Other(format!("codex startup prompt delivery failure: {e}"))),
     }
 }
 
@@ -1919,17 +2042,34 @@ pub fn workspace_launch_command(
     include_agent_instructions: bool,
     resume: bool,
 ) -> String {
+    workspace_launch_command_with_startup_prompt(
+        runner,
+        permissions_mode,
+        include_agent_instructions,
+        resume,
+        None,
+    )
+}
+
+pub fn workspace_launch_command_with_startup_prompt(
+    runner: &shelbi_core::AgentRunnerSpec,
+    permissions_mode: &str,
+    include_agent_instructions: bool,
+    resume: bool,
+    startup_prompt_rel: Option<&str>,
+) -> String {
     // `resume` (a `shelbi task resume`) adds `--continue` for a claude runner
     // so the pane reloads its prior conversation instead of starting cold —
     // see [`shelbi_agent::with_continue`]. It's a no-op for a normal dispatch
     // and for non-claude runners.
     let runner_with_mode = shelbi_agent::with_permission_mode(runner, permissions_mode);
     let runner_resolved = shelbi_agent::with_continue(&runner_with_mode, resume);
-    with_agent_system_prompt(
+    let launch = with_agent_system_prompt(
         &shelbi_agent::launch_command(&runner_resolved),
         include_agent_instructions.then_some(WORKTREE_AGENT_INSTRUCTIONS_REL),
         runner,
-    )
+    );
+    with_codex_startup_prompt(&launch, startup_prompt_rel, runner)
 }
 
 /// Append the `--append-system-prompt "$(cat .claude/agent-instructions.md)"`
@@ -1964,6 +2104,30 @@ fn with_agent_system_prompt(
         "{launch} --append-system-prompt \"$(cat {rel})\"",
         rel = shelbi_agent::shell_escape(rel),
     )
+}
+
+fn with_codex_startup_prompt(
+    launch: &str,
+    startup_prompt_rel: Option<&str>,
+    runner: &shelbi_core::AgentRunnerSpec,
+) -> String {
+    let Some(rel) = startup_prompt_rel else {
+        return launch.to_string();
+    };
+    if !is_codex_runner(&runner.command) {
+        return launch.to_string();
+    }
+    format!(
+        "{launch} \"$(cat {rel})\"",
+        rel = shelbi_agent::shell_escape(rel),
+    )
+}
+
+fn is_codex_runner(command: &str) -> bool {
+    std::path::Path::new(command)
+        .file_name()
+        .and_then(|s| s.to_str())
+        == Some("codex")
 }
 
 /// Build the `host:path` target scp expects, shell-escaping the *path*
@@ -2891,6 +3055,82 @@ mod tests {
         // A normal (non-resume) dispatch never adds --continue, even for claude.
         let launch = workspace_launch_command(claude, &p.workspace_permissions_mode, false, false);
         assert!(!launch.contains("--continue"), "non-resume must not add --continue: {launch}");
+    }
+
+    #[test]
+    fn codex_launch_uses_initial_prompt_file_without_claude_flags() {
+        let codex = AgentRunnerSpec {
+            command: "codex".into(),
+            flags: vec!["--model".into(), "gpt-5".into()],
+            dialog_signatures: vec![],
+        };
+        let launch = workspace_launch_command_with_startup_prompt(
+            &codex,
+            "auto",
+            true,
+            true,
+            Some(WORKTREE_CODEX_STARTUP_PROMPT_REL),
+        );
+        assert_eq!(
+            launch,
+            "codex --model gpt-5 \"$(cat .shelbi/codex-startup-prompt.md)\"",
+        );
+        assert!(
+            !launch.contains("--permission-mode"),
+            "codex must not receive claude permission flags: {launch}"
+        );
+        assert!(
+            !launch.contains("--continue"),
+            "codex must not receive claude resume flags: {launch}"
+        );
+        assert!(
+            !launch.contains("--append-system-prompt"),
+            "codex must not receive claude system-prompt flags: {launch}"
+        );
+    }
+
+    #[test]
+    fn claude_launch_ignores_codex_prompt_file_and_keeps_system_prompt() {
+        let claude = AgentRunnerSpec {
+            command: "claude".into(),
+            flags: vec![],
+            dialog_signatures: vec![],
+        };
+        let launch = workspace_launch_command_with_startup_prompt(
+            &claude,
+            "auto",
+            true,
+            true,
+            Some(WORKTREE_CODEX_STARTUP_PROMPT_REL),
+        );
+        assert_eq!(
+            launch,
+            "claude --permission-mode auto --continue \
+             --append-system-prompt \"$(cat .claude/agent-instructions.md)\"",
+        );
+        assert!(
+            !launch.contains(WORKTREE_CODEX_STARTUP_PROMPT_REL),
+            "claude must not receive the codex prompt-file positional arg: {launch}"
+        );
+    }
+
+    #[test]
+    fn render_and_deploy_codex_startup_prompt_points_at_agent_instructions() {
+        let rendered = render_codex_startup_prompt("Do the task.\n", true);
+        assert!(
+            rendered.starts_with("Read `.claude/agent-instructions.md` first."),
+            "codex startup prompt must point at deployed agent instructions: {rendered}"
+        );
+        assert!(rendered.ends_with("Do the task.\n"));
+
+        let tmp = agent_test_tmpdir("codex-startup");
+        let worktree = tmp.join("wt");
+        std::fs::create_dir_all(&worktree).unwrap();
+        deploy_codex_startup_prompt(&Host::Local, &worktree, &rendered).unwrap();
+        let dest = worktree.join(WORKTREE_CODEX_STARTUP_PROMPT_REL);
+        assert_eq!(std::fs::read_to_string(dest).unwrap(), rendered);
+
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     // Captured from a workspace pane that had just submitted its prompt and
