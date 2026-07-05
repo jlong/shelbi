@@ -347,7 +347,7 @@ pub fn ensure_dashboard(project_name: &str) -> Result<BootstrapStatus> {
 
     let shelbi_bin = current_exe_string()?;
     let sidebar_cmd_str = sidebar_cmd(&shelbi_bin, project_name);
-    let launch = launch_with_bootstrap(&runner_spec);
+    let launch = launch_with_bootstrap(&runner_spec, project_name, &workdir);
     let orch_cmd = orchestrator_pane_cmd(
         &shelbi_bin,
         project_name,
@@ -845,21 +845,32 @@ const ORCH_BOOTSTRAP_PROMPT: &str = "Run the \"Bootstrap on session start\" sequ
     to new transitions.";
 
 /// Wrap `launch_command(runner_spec)` with the orchestrator's
-/// auto-bootstrap initial prompt and the `--append-system-prompt` flag
-/// that loads `<workdir>/.claude/agent-instructions.md` (composed by
-/// [`ensure_dashboard`] from the shared preamble + the orchestrator's
-/// `instructions.md`) when the runner is `claude`. The positional-prompt
-/// CLI convention is claude-specific (`claude "<msg>"` submits `<msg>`
-/// as the first user message); other runners are returned untouched so
-/// a project that pins `codex` or similar doesn't get its launch line
-/// garbled by flags it doesn't understand.
-fn launch_with_bootstrap(spec: &shelbi_core::AgentRunnerSpec) -> String {
+/// auto-bootstrap context.
+///
+/// Claude receives the composed `agents/orchestrator/instructions.md`
+/// through `--append-system-prompt` and the bootstrap request as its
+/// first positional prompt, preserving the historical Claude startup
+/// shape. Codex has no `--append-system-prompt` equivalent in Shelbi's
+/// runner abstraction, but its interactive CLI accepts an initial
+/// positional prompt; for Codex we build that prompt from the project
+/// identity, worktree path, rendered instructions file, and bootstrap
+/// request so the first turn already knows it is Shelbi's scheduler.
+fn launch_with_bootstrap(
+    spec: &shelbi_core::AgentRunnerSpec,
+    project_name: &str,
+    workdir: &std::path::Path,
+) -> String {
     let launch = shelbi_agent::launch_command(spec);
     if is_claude_runner(spec) {
         format!(
             "{launch} --append-system-prompt \"$(cat {rel})\" {prompt}",
             rel = shelbi_agent::shell_escape(ORCH_AGENT_INSTRUCTIONS_REL),
             prompt = shelbi_agent::shell_escape(ORCH_BOOTSTRAP_PROMPT),
+        )
+    } else if is_codex_runner(spec) {
+        format!(
+            "{launch} {prompt}",
+            prompt = codex_orchestrator_prompt_arg(project_name, workdir),
         )
     } else {
         launch
@@ -871,6 +882,34 @@ fn is_claude_runner(spec: &shelbi_core::AgentRunnerSpec) -> bool {
         .file_name()
         .and_then(|s| s.to_str())
         == Some("claude")
+}
+
+fn is_codex_runner(spec: &shelbi_core::AgentRunnerSpec) -> bool {
+    std::path::Path::new(&spec.command)
+        .file_name()
+        .and_then(|s| s.to_str())
+        == Some("codex")
+}
+
+fn codex_orchestrator_prompt_arg(project_name: &str, workdir: &std::path::Path) -> String {
+    let workdir = workdir.to_string_lossy();
+    let before = format!(
+        "You are Shelbi's orchestrator/scheduler for project `{project_name}`.\n\
+         Project worktree: `{workdir}`.\n\
+         Do not edit project code directly; coordinate workspaces and board state.\n\n\
+         Authoritative Shelbi orchestrator instructions follow. Treat them as your developer-agent contract.\n\n",
+    );
+    let after = format!("\n\n{ORCH_BOOTSTRAP_PROMPT}");
+    concat_shell_prompt_parts(&before, ORCH_AGENT_INSTRUCTIONS_REL, &after)
+}
+
+fn concat_shell_prompt_parts(before: &str, cat_rel: &str, after: &str) -> String {
+    format!(
+        "\"$(printf %s {before})$(cat {cat_rel})$(printf %s {after})\"",
+        before = shelbi_agent::shell_escape(before),
+        cat_rel = shelbi_agent::shell_escape(cat_rel),
+        after = shelbi_agent::shell_escape(after),
+    )
 }
 
 /// Heartbeat cadence for the orchestrator pane's background liveness
@@ -1124,7 +1163,7 @@ fn reload_orchestrator_pane(
         );
     }
 
-    let launch = launch_with_bootstrap(&runner_spec);
+    let launch = launch_with_bootstrap(&runner_spec, project_name, &workdir);
     let cmd = orchestrator_pane_cmd(
         shelbi_bin,
         project_name,
@@ -1404,8 +1443,11 @@ mod pane_cmd_tests {
             flags: vec![],
             dialog_signatures: vec![],
         };
-        let out = launch_with_bootstrap(&spec);
-        assert!(out.starts_with("claude "), "launch should start with `claude`, got: {out}");
+        let out = launch_with_bootstrap(&spec, "myapp", std::path::Path::new("/tmp/myapp"));
+        assert!(
+            out.starts_with("claude "),
+            "launch should start with `claude`, got: {out}"
+        );
         // Single-quoted so the whole prompt lands as one positional arg
         // inside the `sh -c "...; {launch}; ..."` wrapper.
         assert!(out.contains("'Run the \"Bootstrap on session start\""), "missing escaped prompt: {out}");
@@ -1433,7 +1475,7 @@ mod pane_cmd_tests {
             flags: vec!["--permission-mode".into(), "auto".into()],
             dialog_signatures: vec![],
         };
-        let out = launch_with_bootstrap(&spec);
+        let out = launch_with_bootstrap(&spec, "myapp", std::path::Path::new("/tmp/myapp"));
         // The runner's own flags must land before `--append-system-prompt`
         // (so `--permission-mode` isn't consumed by the wrong parser) and
         // both must land before the positional bootstrap prompt.
@@ -1450,17 +1492,52 @@ mod pane_cmd_tests {
     }
 
     #[test]
-    fn launch_with_bootstrap_skips_non_claude_runners() {
-        // codex (and any other runner) doesn't accept a positional prompt
-        // in the same way; pasting the bootstrap text would either error
-        // or land in the wrong place. Leave the launch line alone.
+    fn launch_with_bootstrap_embeds_orchestrator_context_for_codex() {
+        // Codex accepts an initial positional prompt but has no
+        // --append-system-prompt surface in Shelbi's runner abstraction.
+        // The prompt must therefore carry the rendered orchestrator
+        // instructions, project identity, worktree, and bootstrap ask.
         let spec = shelbi_core::AgentRunnerSpec {
             command: "codex".into(),
             flags: vec!["--print".into()],
             dialog_signatures: vec![],
         };
-        let out = launch_with_bootstrap(&spec);
-        assert_eq!(out, "codex --print");
+        let out = launch_with_bootstrap(
+            &spec,
+            "shelbi",
+            std::path::Path::new("/Users/jlong/Workspaces/shelbi"),
+        );
+        assert!(
+            out.starts_with("codex --print "),
+            "runner flags must be preserved: {out}"
+        );
+        assert!(
+            out.contains("orchestrator/scheduler for project `shelbi`"),
+            "missing Codex role/project identity: {out}"
+        );
+        assert!(
+            out.contains("Project worktree: `/Users/jlong/Workspaces/shelbi`"),
+            "missing project worktree: {out}"
+        );
+        assert!(
+            out.contains("$(cat .claude/agent-instructions.md)"),
+            "Codex prompt must receive rendered orchestrator instructions: {out}"
+        );
+        assert!(
+            out.contains("Run the \"Bootstrap on session start\" sequence"),
+            "missing bootstrap request: {out}"
+        );
+    }
+
+    #[test]
+    fn launch_with_bootstrap_skips_unknown_runners() {
+        let spec = shelbi_core::AgentRunnerSpec {
+            command: "aider".into(),
+            flags: vec!["--foo".into()],
+            dialog_signatures: vec![],
+        };
+        let out = launch_with_bootstrap(&spec, "myapp", std::path::Path::new("/tmp/myapp"));
+        assert_eq!(out, "aider --foo");
     }
 
     #[test]
@@ -1472,8 +1549,25 @@ mod pane_cmd_tests {
             flags: vec![],
             dialog_signatures: vec![],
         };
-        let out = launch_with_bootstrap(&spec);
-        assert!(out.contains("'Run the \"Bootstrap on session start\""), "claude detected by basename: {out}");
+        let out = launch_with_bootstrap(&spec, "myapp", std::path::Path::new("/tmp/myapp"));
+        assert!(
+            out.contains("'Run the \"Bootstrap on session start\""),
+            "claude detected by basename: {out}"
+        );
+    }
+
+    #[test]
+    fn launch_with_bootstrap_recognizes_absolute_codex_paths() {
+        let spec = shelbi_core::AgentRunnerSpec {
+            command: "/opt/homebrew/bin/codex".into(),
+            flags: vec![],
+            dialog_signatures: vec![],
+        };
+        let out = launch_with_bootstrap(&spec, "myapp", std::path::Path::new("/tmp/myapp"));
+        assert!(
+            out.contains("orchestrator/scheduler for project `myapp`"),
+            "codex detected by basename: {out}"
+        );
     }
 
     #[test]
