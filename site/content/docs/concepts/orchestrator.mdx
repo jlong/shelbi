@@ -80,8 +80,8 @@ the category-keyed reaction rules, the dispatch contract) is encoded in
 the orchestrator agent's `instructions.md`. Like every
 [agent](/docs/concepts/agents), its rendered prompt is its
 `agents/_shared/preamble.md` (project-wide context) followed by its own
-`agents/orchestrator/instructions.md`. The orchestrator is *just claude*
-(or whatever runner you configured) with that prompt loaded.
+`agents/orchestrator/instructions.md`. The orchestrator is the configured
+runner with that prompt staged in its launch directory.
 
 When you boot a project (`shelbi orchestrate` or via the TUI launcher),
 `ensure_dashboard()` does the following:
@@ -89,23 +89,48 @@ When you boot a project (`shelbi orchestrate` or via the TUI launcher),
 1. Resolves the orchestrator agent's prompt: `_shared/preamble.md`
    prepended to `agents/orchestrator/instructions.md` (see
    [customizing the prompt](#customizing-the-prompt-per-project) below).
-2. Writes the composed prompt to the launch directory's `CLAUDE.md`.
+2. Writes the composed prompt to
+   `.claude/agent-instructions.md` in the launch directory.
 3. Launches the orchestrator runner in the right pane of the
    `dashboard` window, with that path as its working directory.
 
-That working-directory choice is the entire wiring trick. The runner
-(claude) auto-loads `CLAUDE.md` from its `cwd`, so rendering the
-orchestrator agent's prompt to a `CLAUDE.md` in the launch directory and
-launching claude there is enough. No flags, no env vars, no MCP servers.
-The orchestrator starts with the full prompt in context and the `shelbi`
-CLI on its PATH. Note the split: the *source* you edit is
-`instructions.md`; `CLAUDE.md` is a rendered build artifact, not a file
-you maintain by hand (see [the CLAUDE.md note](#claudemd-is-now-a-build-artifact)).
+For Claude, Shelbi adds Claude-specific launch wiring:
+`--append-system-prompt "$(cat .claude/agent-instructions.md)"` and an
+initial positional prompt that tells Claude to run the bootstrap sequence.
+For Codex and other non-Claude runners, Shelbi launches exactly the
+configured `command` and `flags`; it does not add Claude-only flags or a
+Claude-style first message. The prompt file is still staged so the runner
+can inspect it, but the runner must support any prompt-loading flags you
+declare in `agent_runners.<name>.flags`.
+
+The split is: the *source* you edit is `instructions.md`;
+`.claude/agent-instructions.md` is a rendered build artifact, not a file
+you maintain by hand.
 
 Orchestrator window setup lives in
 `crates/shelbi-orchestrator/src/lib.rs`. `ensure_dashboard(project)`
 resolves the agent prompt, renders it, and launches the runner in that
 directory.
+
+### Choosing Codex
+
+Declare Codex in `agent_runners` and select it for the orchestrator:
+
+```yaml
+orchestrator:
+  runner: codex
+agent_runners:
+  codex:
+    command: codex
+    flags: []
+```
+
+`orchestrator.runner` must name a declared runner; otherwise project
+validation fails before the dashboard launches. If your Codex CLI needs a
+specific approval mode, sandbox mode, or model flag for unattended work,
+put those arguments in `flags`. Shelbi does not translate Claude's
+`workspace_permissions_mode`, `--permission-mode`, `--continue`, or
+`--append-system-prompt` behavior to Codex.
 
 ## Bootstrap flow on session start
 
@@ -187,20 +212,21 @@ so customizing it is the same as customizing any other agent. Edit a file:
   shipped-with-Shelbi changes; edit it and rebuild.
 
 The composed output (preamble + instructions) is rewritten to the launch
-directory's `CLAUDE.md` on every `ensure_dashboard` call, so your edits
-take effect the next time the dashboard is bootstrapped (or `shelbi
-reload`d).
+directory's `.claude/agent-instructions.md` on every `ensure_dashboard`
+call, so your edits take effect the next time the dashboard is
+bootstrapped (or `shelbi reload`d).
 
-### CLAUDE.md is now a build artifact
+### Prompt artifact
 
 Earlier versions had you edit an `ORCHESTRATOR.md` override and treated
 `~/.shelbi/projects/<name>/CLAUDE.md` as the source of the prompt. That's
 deprecated. The *source* is now `agents/orchestrator/instructions.md` plus
-`agents/_shared/preamble.md`; the `CLAUDE.md` Shelbi writes is a rendered
-artifact for the runner to auto-load. Don't hand-edit it; your changes are
-overwritten on the next render. If you have content in an old `CLAUDE.md`,
-move the project-wide parts into `_shared/preamble.md` and the
-orchestrator-specific parts into `agents/orchestrator/instructions.md`.
+`agents/_shared/preamble.md`; the generated
+`.claude/agent-instructions.md` is a rendered artifact. Don't hand-edit
+it; your changes are overwritten on the next render. If you have content
+in an old `CLAUDE.md`, move the project-wide parts into
+`_shared/preamble.md` and the orchestrator-specific parts into
+`agents/orchestrator/instructions.md`.
 
 A few things worth keeping when you fork the default prompt:
 

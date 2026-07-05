@@ -10,6 +10,9 @@ machines:
     host: m2.local
     work_dir: ~/work/myapp
 orchestrator:
+  # Switch this to `codex` to boot the dashboard orchestrator with Codex.
+  # Shelbi launches Codex as the declared command/flags and does not add
+  # Claude-specific bootstrap prompt or --append-system-prompt flags.
   runner: claude
 agent_runners:
   claude:
@@ -24,5 +27,5 @@ agent_runners:
 # with a fresh context each time.
 workspaces:
   - { name: alice, machine: hub, runner: claude }
-  - { name: bob,   machine: m2,  runner: claude }
+  - { name: bob,   machine: m2,  runner: codex }
   - { name: carol, machine: m2,  runner: claude }

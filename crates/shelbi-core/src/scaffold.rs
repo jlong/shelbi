@@ -88,6 +88,10 @@ const PROJECT_HEADER: &str = "\
 ## Shelbi project config — full reference: https://shelbi.dev/docs/configuration/project
 ## Required fields are populated below. Every commented block beneath them is an
 ## optional feature: uncomment and edit it to turn the feature on.
+## To run the orchestrator with Codex, edit the active `orchestrator.runner`
+## value from `claude` to `codex`; keep the `agent_runners.codex` entry declared.
+## Non-Claude runners launch as the configured command plus flags, without
+## Shelbi's Claude-only bootstrap prompt or --append-system-prompt flags.
 
 ";
 
@@ -133,6 +137,7 @@ const PROJECT_SECTIONS: &[Section] = &[
         yaml: "\
 workspaces:
   - { name: alice, machine: hub, runner: claude }
+  - { name: bob, machine: hub, runner: codex }
   - { name: rev, machine: hub, runner: claude, tags: [review] }
 ",
     },
@@ -407,7 +412,8 @@ agent_runners:
         // Spot-check that representative optional features actually turned on.
         assert_eq!(p.machines.len(), 2, "ssh machine example uncommented");
         assert!(p.machines.iter().any(|m| m.host.as_deref() == Some("devbox.local")));
-        assert_eq!(p.workspaces.len(), 2);
+        assert_eq!(p.workspaces.len(), 3);
+        assert!(p.workspaces.iter().any(|w| w.runner == "codex"));
         assert!(p
             .workspaces
             .iter()

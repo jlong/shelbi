@@ -1,5 +1,5 @@
 //! `shelbi send <name> <message>` — deliver `<message>` to a workspace's
-//! claude pane.
+//! runner pane.
 //!
 //! Resolution order:
 //!
@@ -36,7 +36,7 @@ pub fn run(project: Option<String>, id: String, message: String) -> Result<()> {
     match resolve_target(&project, &id)? {
         ResolvedTarget::Workspace { host, addr } => {
             // Pane must be live — the workspace can be declared but idle, in
-            // which case there's no claude to send to. Surface that as an
+            // which case there's no runner to send to. Surface that as an
             // actionable error rather than the opaque `os error 2` the
             // legacy path produced.
             let alive = orch_workspace::workspace_pane_alive(&host, &addr)
