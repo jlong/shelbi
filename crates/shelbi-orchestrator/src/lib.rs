@@ -845,14 +845,16 @@ const ORCH_BOOTSTRAP_PROMPT: &str = "Run the \"Bootstrap on session start\" sequ
     to new transitions.";
 
 /// Wrap `launch_command(runner_spec)` with the orchestrator's
-/// auto-bootstrap initial prompt and the `--append-system-prompt` flag
-/// that loads `<workdir>/.claude/agent-instructions.md` (composed by
+/// auto-bootstrap initial prompt. Claude also gets the
+/// `--append-system-prompt` flag that loads
+/// `<workdir>/.claude/agent-instructions.md` (composed by
 /// [`ensure_dashboard`] from the shared preamble + the orchestrator's
-/// `instructions.md`) when the runner is `claude`. The positional-prompt
-/// CLI convention is claude-specific (`claude "<msg>"` submits `<msg>`
-/// as the first user message); other runners are returned untouched so
-/// a project that pins `codex` or similar doesn't get its launch line
-/// garbled by flags it doesn't understand.
+/// `instructions.md`) as native system context. Codex does not accept
+/// that Claude flag, but it does accept an initial positional prompt; for
+/// Codex we make that first prompt explicitly read the staged file before
+/// bootstrapping so reload carries the rendered orchestrator instructions
+/// and any spliced handoff context without relying on Claude-only
+/// semantics.
 fn launch_with_bootstrap(spec: &shelbi_core::AgentRunnerSpec) -> String {
     let launch = shelbi_agent::launch_command(spec);
     if is_claude_runner(spec) {
@@ -860,6 +862,11 @@ fn launch_with_bootstrap(spec: &shelbi_core::AgentRunnerSpec) -> String {
             "{launch} --append-system-prompt \"$(cat {rel})\" {prompt}",
             rel = shelbi_agent::shell_escape(ORCH_AGENT_INSTRUCTIONS_REL),
             prompt = shelbi_agent::shell_escape(ORCH_BOOTSTRAP_PROMPT),
+        )
+    } else if is_codex_runner(spec) {
+        format!(
+            "{launch} {prompt}",
+            prompt = shelbi_agent::shell_escape(&codex_orchestrator_startup_prompt()),
         )
     } else {
         launch
@@ -871,6 +878,30 @@ fn is_claude_runner(spec: &shelbi_core::AgentRunnerSpec) -> bool {
         .file_name()
         .and_then(|s| s.to_str())
         == Some("claude")
+}
+
+fn is_codex_runner(spec: &shelbi_core::AgentRunnerSpec) -> bool {
+    std::path::Path::new(&spec.command)
+        .file_name()
+        .and_then(|s| s.to_str())
+        == Some("codex")
+}
+
+fn codex_orchestrator_startup_prompt() -> String {
+    format!(
+        "Read `{rel}` first and treat it as your developer-agent instructions for this \
+         Shelbi orchestrator pane. It contains the project-local orchestrator role, \
+         bootstrap rules, event-tail responsibility, Zen Mode rules, and any \
+         reload handoff context captured before this pane was restarted. If a \
+         handoff `<system-reminder>` block is present there, use it as continuity \
+         context. Then run the \"Bootstrap on session start\" sequence from those \
+         instructions now without explaining the reload to the user: snapshot \
+         `shelbi task list`, `shelbi workspace list`, and `shelbi zen status`; scan \
+         recent `~/.shelbi/events.log` for a `zen=off reason=crash-recovery` line; \
+         then start `shelbi events tail --follow` in the background and watch it \
+         with the Monitor tool so auto-dispatch reacts to new transitions.",
+        rel = ORCH_AGENT_INSTRUCTIONS_REL,
+    )
 }
 
 /// Heartbeat cadence for the orchestrator pane's background liveness
@@ -1450,17 +1481,64 @@ mod pane_cmd_tests {
     }
 
     #[test]
-    fn launch_with_bootstrap_skips_non_claude_runners() {
-        // codex (and any other runner) doesn't accept a positional prompt
-        // in the same way; pasting the bootstrap text would either error
-        // or land in the wrong place. Leave the launch line alone.
+    fn launch_with_bootstrap_adds_codex_startup_prompt() {
+        // Codex has no Claude-compatible --append-system-prompt flag here,
+        // but it does accept an initial prompt. That prompt must make the
+        // staged orchestrator instructions + spliced handoff context
+        // load-bearing before bootstrap starts.
         let spec = shelbi_core::AgentRunnerSpec {
             command: "codex".into(),
             flags: vec!["--print".into()],
             dialog_signatures: vec![],
         };
         let out = launch_with_bootstrap(&spec);
-        assert_eq!(out, "codex --print");
+        assert!(
+            out.starts_with("codex --print 'Read `"),
+            "runner flags must be preserved before prompt: {out}"
+        );
+        assert!(
+            out.contains(".claude/agent-instructions.md"),
+            "Codex startup must read staged orchestrator instructions: {out}"
+        );
+        assert!(
+            out.contains("handoff `<system-reminder>` block"),
+            "Codex startup must call out reload handoff continuity: {out}"
+        );
+        assert!(
+            out.contains("shelbi events tail --follow"),
+            "prompt must name the tail command"
+        );
+        assert!(
+            !out.contains("--append-system-prompt"),
+            "Codex must not receive Claude-only flags: {out}"
+        );
+    }
+
+    #[test]
+    fn launch_with_bootstrap_recognizes_absolute_codex_paths() {
+        let spec = shelbi_core::AgentRunnerSpec {
+            command: "/opt/homebrew/bin/codex".into(),
+            flags: vec![],
+            dialog_signatures: vec![],
+        };
+        let out = launch_with_bootstrap(&spec);
+        assert!(
+            out.contains(".claude/agent-instructions.md"),
+            "codex detected by basename: {out}"
+        );
+    }
+
+    #[test]
+    fn launch_with_bootstrap_skips_unknown_runners() {
+        // Unknown runners may not accept the same positional-prompt
+        // semantics as Claude/Codex; leave their launch line alone.
+        let spec = shelbi_core::AgentRunnerSpec {
+            command: "aider".into(),
+            flags: vec!["--yes".into()],
+            dialog_signatures: vec![],
+        };
+        let out = launch_with_bootstrap(&spec);
+        assert_eq!(out, "aider --yes");
     }
 
     #[test]
