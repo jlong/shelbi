@@ -173,6 +173,33 @@ Keep the snapshot in your head and update it as events arrive. If the tail
 process dies (Monitor reports the task ended), restart it on your next
 turn.
 
+## Polling-only event drain
+
+Some runners cannot receive asynchronous Monitor callbacks while they are
+thinking or answering. In those polling-only harnesses, the background
+`shelbi events tail --follow` process is only a compatibility watch: before
+every user-facing reply, drain project events yourself and treat the batch as
+new input before you answer.
+
+Use the durable cursor primitive:
+
+    CURSOR=$(cat .claude/shelbi-event-cursor 2>/dev/null || echo 0)
+    shelbi orchestrator events drain --cursor "$CURSOR"
+
+If the JSON response contains events, apply the normal reaction rules below
+first. Then write the returned top-level `cursor` value to
+`.claude/shelbi-event-cursor` before producing your reply. If the batch is
+empty, still advance the cursor. If the command is unavailable, fall back to
+reading `~/.shelbi/events.log` from the last stored byte offset and keep the
+same cursor discipline so events are neither missed nor replayed.
+
+The drain layer only delivers facts. Do not invent scheduling inside the drain
+step; after each batch, decide normally whether to dispatch, review-load,
+Zen-scan, surface a pane death, or simply answer the user. The JSON `kind`
+field distinguishes `task_transition`, `workspace_transition`, `heartbeat`,
+`pane_death`, and other event classes, and the original line is preserved in
+`raw`.
+
 ## Reaction rules
 
 One bullet per event prefix. React to every matching line.
