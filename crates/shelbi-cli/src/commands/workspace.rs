@@ -82,15 +82,17 @@ fn list(project: &str) -> Result<()> {
 pub(crate) fn print_workspaces(project: &str) -> Result<()> {
     let p = shelbi_state::load_project(project).map_err(|e| anyhow!(e))?;
     if p.workspaces.is_empty() {
-        println!("(no workspaces declared in {project} — add a `workspaces:` block to the project YAML)");
+        println!(
+            "(no workspaces declared in {project} — add a `workspaces:` block to the project YAML)"
+        );
         return Ok(());
     }
 
     // Surfaces every in-progress task assigned to the workspace. There
     // should normally be at most one, but if shelbi's state diverged we
     // print all of them in the STATE cell so the user sees the mess.
-    let in_progress = shelbi_state::list_column(project, Column::in_progress())
-        .map_err(|e| anyhow!(e))?;
+    let in_progress =
+        shelbi_state::list_column(project, Column::in_progress()).map_err(|e| anyhow!(e))?;
     let assigned: Vec<&Task> = in_progress.iter().map(|tf| &tf.task).collect();
 
     let occupied = occupied_idle_workspaces(&p, &assigned)?;
@@ -121,8 +123,8 @@ fn occupied_idle_workspaces(
             )
         })?;
         let host = machine.host();
-        let addr = orch_workspace::workspace_tmux_addr(project, workspace)
-            .map_err(|e| anyhow!(e))?;
+        let addr =
+            orch_workspace::workspace_tmux_addr(project, workspace).map_err(|e| anyhow!(e))?;
         if orch_workspace::workspace_slot_alive(&host, &addr).map_err(|e| anyhow!(e))? {
             occupied.insert(workspace.name.clone());
         }
@@ -179,7 +181,11 @@ fn render_list_with_occupied(
                 .param_str("agent")
                 .unwrap_or(DEFAULT_TASK_AGENT)
                 .to_string();
-            let ids = mine.iter().map(|t| t.id.as_str()).collect::<Vec<_>>().join(", ");
+            let ids = mine
+                .iter()
+                .map(|t| t.id.as_str())
+                .collect::<Vec<_>>()
+                .join(", ");
             (agent, format!("in_progress: {ids}"))
         };
         out.push(format!(
@@ -283,9 +289,12 @@ fn stop(project: &str, name: &str, keep_task: bool) -> Result<()> {
                 .join(", ")
         )
     })?;
-    let machine = p
-        .machine(&workspace.machine)
-        .ok_or_else(|| anyhow!("workspace references unknown machine `{}`", workspace.machine))?;
+    let machine = p.machine(&workspace.machine).ok_or_else(|| {
+        anyhow!(
+            "workspace references unknown machine `{}`",
+            workspace.machine
+        )
+    })?;
     let host = machine.host();
     let addr = orch_workspace::workspace_tmux_addr(&p, workspace).map_err(|e| anyhow!(e))?;
     orch_workspace::kill_workspace_pane(&host, &addr, &workspace.name).map_err(|e| anyhow!(e))?;
@@ -374,10 +383,7 @@ fn print_status_table(names: &[String]) -> Result<()> {
                 format_ago(now, s.last_seen),
                 format_ago(now, s.last_transition),
             ),
-            Ok(None) => println!(
-                "{:<12} {:<24} {:<14} {:<12} —",
-                name, "—", "?", "never"
-            ),
+            Ok(None) => println!("{:<12} {:<24} {:<14} {:<12} —", name, "—", "?", "never"),
             // A corrupt or unreadable status.yaml for one workspace must
             // not blank out the whole fleet table. Surface the failure on
             // its own row (and to stderr) and keep rendering the rest.
@@ -394,7 +400,9 @@ fn print_status_table(names: &[String]) -> Result<()> {
 }
 
 fn task_cell(s: &WorkspaceStatus) -> String {
-    s.current_task.clone().unwrap_or_else(|| "(idle)".to_string())
+    s.current_task
+        .clone()
+        .unwrap_or_else(|| "(idle)".to_string())
 }
 
 /// Compact "12s" / "5m" / "2h" / "3d" style age. Floors at the unit
@@ -424,8 +432,8 @@ fn format_ago(now: DateTime<Utc>, then: DateTime<Utc>) -> String {
 /// release them all so the board doesn't keep dangling cards pointing at
 /// a dead pane.
 fn release_workspace_tasks(project: &str, workspace_name: &str) -> Result<Vec<String>> {
-    let in_progress = shelbi_state::list_column(project, Column::in_progress())
-        .map_err(|e| anyhow!(e))?;
+    let in_progress =
+        shelbi_state::list_column(project, Column::in_progress()).map_err(|e| anyhow!(e))?;
     let mut released = Vec::new();
     for tf in in_progress {
         if tf.task.assigned_to.as_deref() != Some(workspace_name) {
@@ -436,8 +444,7 @@ fn release_workspace_tasks(project: &str, workspace_name: &str) -> Result<Vec<St
         // unassign-then-move split could crash between the two writes and
         // strand the card unowned-but-still-in-progress, where the
         // owner-keyed recovery scan would never see it again (F18).
-        let moved =
-            shelbi_state::release_task_to_todo(project, &id).map_err(|e| anyhow!(e))?;
+        let moved = shelbi_state::release_task_to_todo(project, &id).map_err(|e| anyhow!(e))?;
         if let Some((from, to, workflow)) = moved {
             if let Err(e) =
                 shelbi_state::append_task_event(project, &id, &workflow, from, to, "workspace:stop")

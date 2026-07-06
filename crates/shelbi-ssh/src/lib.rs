@@ -118,6 +118,21 @@ fn apply_ssh_control_opts(cmd: &mut Command) {
     }
 }
 
+/// Apply only the conservative connection options needed for one-shot
+/// maintenance commands. Deliberately avoids ControlMaster and `-R`:
+/// these commands inspect or remove the reverse-forward landing socket,
+/// so they must not create the socket as a side effect.
+fn apply_ssh_no_forward_opts(cmd: &mut Command) {
+    for (flag, value) in [
+        ("-o", "ControlMaster=no"),
+        ("-o", "ConnectTimeout=5"),
+        ("-o", "BatchMode=yes"),
+        ("-o", "LogLevel=ERROR"),
+    ] {
+        cmd.arg(flag).arg(value);
+    }
+}
+
 /// Build (but do not execute) a `Command` that will run the given argv on
 /// `host`.
 ///
@@ -350,11 +365,44 @@ fn open_master_with_stream_local_unlink(hostname: &str) -> std::io::Result<Outpu
 }
 
 /// Does the reverse-forward landing socket exist on the remote? `test -S`
-/// is true only for an existing socket node. Routed through `run` so it
-/// reuses (or, as a side effect, opens) the multiplexed master rather than
-/// paying a fresh handshake.
+/// is true only for an existing socket node. Routed through the no-forward
+/// maintenance path so the probe observes the socket without creating it.
 fn remote_socket_present(host: &Host, remote_sock: &str) -> bool {
-    matches!(run(host, ["test", "-S", remote_sock]), Ok(o) if o.status.success())
+    match host {
+        Host::Local => false,
+        Host::Ssh { host } => {
+            matches!(run_without_reverse_forward(host, ["test", "-S", remote_sock]), Ok(o) if o.status.success())
+        }
+    }
+}
+
+/// Run a remote maintenance/probe command without installing or reusing
+/// Shelbi's reverse forward. This keeps health checks pure: `test -S` must
+/// observe the landing socket, and `rm -f` must remove it, without the SSH
+/// wrapper first binding a fresh one.
+fn build_no_forward_command<I, S>(hostname: &str, argv: I) -> Command
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<OsStr>,
+{
+    let mut cmd = Command::new("ssh");
+    apply_ssh_no_forward_opts(&mut cmd);
+    cmd.arg(hostname);
+    cmd.arg("--");
+    for a in argv {
+        cmd.arg(escape_for_wire(a.as_ref()));
+    }
+    cmd
+}
+
+fn run_without_reverse_forward<I, S>(hostname: &str, argv: I) -> std::io::Result<Output>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<OsStr>,
+{
+    let mut cmd = build_no_forward_command(hostname, argv);
+    tracing::debug!(?cmd, host = %hostname, "ssh::run_without_reverse_forward");
+    cmd.output()
 }
 
 /// Ensure the hub's reverse forward to `host` is bound and healthy,
@@ -392,12 +440,10 @@ pub fn ensure_reverse_forward(host: &Host) -> shelbi_core::Result<()> {
     // forward never bound (stale socket collided with the `-R`), and
     // `ControlMaster=auto` would otherwise reuse it and skip the rebind.
     drop_master(&hostname);
-    // Remove the stale landing socket. We only reach here when no live
-    // master owns the forward, so any leftover socket file is a leak from a
-    // dead master — safe to unlink. This one-shot `rm` opens a transient
-    // master (whose own `-R` still collides with the not-yet-removed
-    // socket); drop that too so the reopen below starts genuinely clean.
-    let cleanup = run(host, ["rm", "-f", remote_sock.as_str()]);
+    // dead master — safe to unlink. The cleanup command deliberately bypasses
+    // shelbi's ControlMaster/`-R` wrapper; otherwise an absent socket can be
+    // recreated by SSH and then immediately removed by this `rm`.
+    let cleanup = run_without_reverse_forward(&hostname, ["rm", "-f", remote_sock.as_str()]);
     drop_master(&hostname);
 
     // Reopen the master, rebinding `-R` against the now-clean path. `true`
@@ -512,7 +558,10 @@ mod tests {
         let spec = &args[r_pos + 1];
         assert!(
             spec.starts_with("/tmp/shelbi-hub.sock:")
-                || spec.starts_with(&format!("{}:", shelbi_state::remote_hub_socket_path().display())),
+                || spec.starts_with(&format!(
+                    "{}:",
+                    shelbi_state::remote_hub_socket_path().display()
+                )),
             "forward spec didn't start with remote socket path: {spec}",
         );
         // ControlPath lands under SHELBI_HOME so the hub's startup
@@ -562,7 +611,15 @@ mod tests {
         let host = Host::Ssh {
             host: "devbox".into(),
         };
-        let args = ["printf", "[%s]\n", "a b", "#{pane_title}", "x && y", "p;q", "$HOME"];
+        let args = [
+            "printf",
+            "[%s]\n",
+            "a b",
+            "#{pane_title}",
+            "x && y",
+            "p;q",
+            "$HOME",
+        ];
         let wire = remote_wire(&host, &args);
         let out = std::process::Command::new("sh")
             .arg("-c")
@@ -582,8 +639,7 @@ mod tests {
         // `cat` echoes stdin to stdout — round-trips embedded newlines so
         // we know multi-line payloads survive the pipe end-to-end.
         let payload = "line one\nline two\nline three";
-        let out = run_with_stdin(&Host::Local, ["cat"], payload.as_bytes())
-            .expect("cat failed");
+        let out = run_with_stdin(&Host::Local, ["cat"], payload.as_bytes()).expect("cat failed");
         assert_eq!(out, payload);
     }
 
@@ -614,5 +670,27 @@ mod tests {
         // Local hosts have no reverse forward to establish — the call must
         // short-circuit without shelling out to ssh.
         ensure_reverse_forward(&Host::Local).expect("local ensure should be Ok");
+    }
+
+    #[test]
+    fn no_forward_maintenance_command_does_not_request_reverse_forward() {
+        let cmd = build_no_forward_command("devbox", ["rm", "-f", "/tmp/shelbi-hub-501.sock"]);
+        let args: Vec<String> = cmd
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+
+        assert!(
+            !args.iter().any(|a| a == "-R"),
+            "maintenance command must not create the socket it is repairing: {args:?}"
+        );
+        assert!(
+            args.iter().any(|a| a == "ControlMaster=no"),
+            "maintenance command must bypass shelbi's persistent ControlMaster: {args:?}"
+        );
+        assert!(
+            args.windows(2).any(|w| w == ["--", "rm"]),
+            "remote argv should still be sent after --: {args:?}"
+        );
     }
 }
