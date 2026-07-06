@@ -139,11 +139,20 @@ pub fn save_project_statuses(project: &str, statuses: &ProjectStatuses) -> Resul
 /// the canonical six statuses plus a docs-linked header and a commented
 /// example for adding custom statuses (see
 /// [`shelbi_core::scaffold::default_statuses_yaml`]). Used by `shelbi init`;
-/// the load-time [`crate::migrate_default_statuses`] writes the same content
-/// for projects that pre-date the file. Creates the workflows/ dir on demand.
+/// the explicit migration path writes the same content for projects that
+/// pre-date the file. Creates the workflows/ dir on demand.
 pub fn scaffold_project_statuses(project: &str) -> Result<()> {
     let path = statuses_path(project)?;
     let yaml = shelbi_core::scaffold::default_statuses_yaml()?;
+    atomic_write(&path, yaml.as_bytes())
+}
+
+/// Write the self-documenting default `default.yaml` for a fresh project.
+/// Used by `shelbi init` and explicit migration/reload paths; normal
+/// project loads do not recreate this file when users remove it.
+pub fn scaffold_project_workflow(project: &str) -> Result<()> {
+    let path = workflow_path(project, shelbi_core::DEFAULT_WORKFLOW_NAME)?;
+    let yaml = shelbi_core::scaffold::default_workflow_yaml()?;
     atomic_write(&path, yaml.as_bytes())
 }
 

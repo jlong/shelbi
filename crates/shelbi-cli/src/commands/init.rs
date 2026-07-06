@@ -429,11 +429,15 @@ fn scaffold_project(resolved: &ResolvedProjectRoot, mode: InitMode) -> Result<()
         print_agent_materialize_outcome(&outcome);
     }
 
-    // Materialize `workflows/statuses.yaml` so a fresh project ships with
-    // the project-wide status catalogue alongside its starter
-    // `default.yaml`. `load_project` runs the same migration when the
-    // project is opened, but writing it here keeps `shelbi init`'s
-    // post-condition self-contained.
+    // Materialize the starter workflow files so `shelbi init`'s
+    // post-condition is self-contained. Ordinary project loads do not
+    // recreate `default.yaml` after a project intentionally removes it.
+    let workflow_path =
+        shelbi_state::default_workflow_path(&resolved.name).map_err(|e| anyhow!(e))?;
+    if !workflow_path.exists() {
+        shelbi_state::scaffold_project_workflow(&resolved.name).map_err(|e| anyhow!(e))?;
+        println!("✓ wrote project workflow: {}", workflow_path.display());
+    }
     let statuses_path = shelbi_state::statuses_path(&resolved.name).map_err(|e| anyhow!(e))?;
     if !statuses_path.exists() {
         shelbi_state::scaffold_project_statuses(&resolved.name).map_err(|e| anyhow!(e))?;
@@ -600,6 +604,12 @@ fn run_pick_up(args: Args) -> Result<PickUpOutcome> {
     if !statuses_path.exists() {
         shelbi_state::scaffold_project_statuses(&local_alias).map_err(|e| anyhow!(e))?;
         println!("✓ wrote project statuses: {}", statuses_path.display());
+    }
+    let workflow_path =
+        shelbi_state::default_workflow_path(&local_alias).map_err(|e| anyhow!(e))?;
+    if !workflow_path.exists() {
+        shelbi_state::scaffold_project_workflow(&local_alias).map_err(|e| anyhow!(e))?;
+        println!("✓ wrote project workflow: {}", workflow_path.display());
     }
 
     println!();
@@ -861,7 +871,9 @@ mod tests {
         // YAML exists, but the agents/ workspaces and statuses do not.
         let yaml_path = home.join("projects/halfapp.yaml");
         std::fs::write(&yaml_path, "name: halfapp\nrepo: \n").unwrap();
+        let workflow_path = shelbi_state::default_workflow_path("halfapp").unwrap();
         let statuses_path = shelbi_state::statuses_path("halfapp").unwrap();
+        assert!(!workflow_path.exists());
         assert!(!statuses_path.exists());
 
         // Re-running scaffold must NOT bail with a bogus "already exists"
@@ -870,6 +882,10 @@ mod tests {
         assert!(
             statuses_path.is_file(),
             "re-run should have written the statuses catalogue"
+        );
+        assert!(
+            workflow_path.is_file(),
+            "re-run should have written the default workflow"
         );
         assert!(
             shelbi_state::project_dir("halfapp")
