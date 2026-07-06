@@ -27,6 +27,106 @@ use shelbi_core::{Column, Result, DEFAULT_WORKFLOW_NAME};
 
 use crate::{atomic_write, ensure_dir, shelbi_home};
 
+/// Harness callback socket for push-capable orchestrator runners.
+///
+/// When set, every successfully appended `events.log` line is also delivered
+/// as a newline-delimited [`EventEnvelope`] JSON object to this Unix socket.
+/// Delivery is best-effort by design: Shelbi is the event transport, not the
+/// scheduler. A missing or failing callback never replaces the durable log;
+/// runners without push support keep draining or tailing `events.log`.
+pub const ORCH_EVENT_CALLBACK_SOCK_ENV: &str = "SHELBI_ORCH_EVENT_CALLBACK_SOCK";
+
+/// Normalized, harness-neutral event envelope.
+///
+/// The `line` field is exactly the event-stream record that polling runners
+/// consume from `events.log`; push-capable runners receive this same envelope
+/// over their callback transport so both paths share semantics.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EventEnvelope {
+    pub version: u8,
+    pub transport: String,
+    pub kind: EventKind,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub project: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub timestamp: Option<String>,
+    pub line: String,
+}
+
+impl EventEnvelope {
+    pub fn from_log_line(line: &str) -> Self {
+        let mut parts = line.split_whitespace();
+        let timestamp = parts.next().map(str::to_string);
+        let body = match timestamp.as_deref() {
+            Some(ts) => line.strip_prefix(ts).map(str::trim_start).unwrap_or(line),
+            None => line,
+        };
+        let project = event_field(body, "project").map(str::to_string);
+        Self {
+            version: 1,
+            transport: "shelbi.events".to_string(),
+            kind: EventKind::from_body(body),
+            project,
+            timestamp,
+            line: line.to_string(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum EventKind {
+    Heartbeat,
+    Task,
+    Workspace,
+    WorkspacePane,
+    Message,
+    Clarification,
+    Dispatch,
+    Rebase,
+    Zen,
+    ZenDryrun,
+    Supervision,
+    Project,
+    External,
+}
+
+impl EventKind {
+    fn from_body(body: &str) -> Self {
+        if body.contains(" heartbeat") || body.ends_with(" heartbeat") {
+            EventKind::Heartbeat
+        } else if body.contains(" task=") || body.starts_with("task=") {
+            EventKind::Task
+        } else if body.contains(" workspace=") || body.starts_with("workspace=") {
+            if body.contains(" pane_alive=") {
+                EventKind::WorkspacePane
+            } else if body.contains(" supervision=") {
+                EventKind::Supervision
+            } else {
+                EventKind::Workspace
+            }
+        } else if body.contains(" message=") || body.starts_with("message=") {
+            EventKind::Message
+        } else if body.contains(" question=") || body.starts_with("question=") {
+            EventKind::Clarification
+        } else if body.contains(" dispatch ") || body.starts_with("dispatch ") {
+            EventKind::Dispatch
+        } else if body.contains(" rebase ") || body.starts_with("rebase ") {
+            EventKind::Rebase
+        } else if body.contains(" mode=zen ") {
+            EventKind::Zen
+        } else if body.contains(" zen-dryrun ") || body.starts_with("zen-dryrun ") {
+            EventKind::ZenDryrun
+        } else if body.contains(" supervision=") {
+            EventKind::Supervision
+        } else if body.contains(" project=") || body.starts_with("project=") {
+            EventKind::Project
+        } else {
+            EventKind::External
+        }
+    }
+}
+
 /// The marker emitted by the workspace's claude hooks. `idle` from the hook
 /// wire-format maps to [`WorkspaceState::AwaitingInput`] — Stop fires when
 /// claude finishes a turn and is waiting for the next prompt, which is
@@ -337,7 +437,9 @@ pub fn append_workspace_dialog_event(
     let workspace = sanitize_field(workspace);
     let kind = sanitize_reason(kind);
     let line = if blocked {
-        format!("{ts} project={project} workspace={workspace} working -> blocked reason=dialog:{kind}")
+        format!(
+            "{ts} project={project} workspace={workspace} working -> blocked reason=dialog:{kind}"
+        )
     } else {
         format!(
             "{ts} project={project} workspace={workspace} blocked -> working reason=dialog:{kind}:cleared"
@@ -378,8 +480,9 @@ pub fn append_workspace_pause_event(
     // A usage-limited pane was, by definition, working — use that as the
     // sensible default when we've no prior observation on record yet.
     let prev_str = prev.map(|s| s.as_str()).unwrap_or("working");
-    let mut line =
-        format!("{ts} project={project} workspace={workspace} {prev_str} -> paused reason=usage-limit");
+    let mut line = format!(
+        "{ts} project={project} workspace={workspace} {prev_str} -> paused reason=usage-limit"
+    );
     if let Some(reset) = reset {
         let reset = sanitize_reason(reset);
         if !reset.is_empty() {
@@ -550,7 +653,9 @@ pub fn append_supervision_event(
             format!("{ts} project={project} workspace={w} supervision={action} reason={reason}")
         }
         None => {
-            format!("{ts} project={project} supervision={action} target=orchestrator reason={reason}")
+            format!(
+                "{ts} project={project} supervision={action} target=orchestrator reason={reason}"
+            )
         }
     };
     append_event_line(&line)
@@ -690,7 +795,8 @@ pub fn append_workspace_pane_event(
     let project = sanitize_field(project);
     let workspace = sanitize_field(workspace);
     let reason = sanitize_reason(reason);
-    let body = format!("project={project} workspace={workspace} pane_alive={alive} reason={reason}");
+    let body =
+        format!("project={project} workspace={workspace} pane_alive={alive} reason={reason}");
     emit_event_body(&body)
 }
 
@@ -909,7 +1015,36 @@ fn append_event_line(line: &str) -> Result<()> {
         .append(true)
         .open(&path)?;
     f.write_all(buf.as_bytes())?;
+    deliver_event_envelope(&EventEnvelope::from_log_line(line));
     Ok(())
+}
+
+fn deliver_event_envelope(envelope: &EventEnvelope) {
+    let Some(sock) = std::env::var_os(ORCH_EVENT_CALLBACK_SOCK_ENV) else {
+        return;
+    };
+    let payload = match serde_json::to_vec(envelope) {
+        Ok(mut bytes) => {
+            bytes.push(b'\n');
+            bytes
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "failed to serialize event envelope");
+            return;
+        }
+    };
+    match UnixStream::connect(PathBuf::from(sock)).and_then(|mut stream| {
+        let _ = stream.set_write_timeout(Some(Duration::from_millis(100)));
+        stream.write_all(&payload)
+    }) {
+        Ok(()) => {}
+        Err(e) => {
+            tracing::debug!(
+                error = %e,
+                "orchestrator event callback unavailable; durable events.log remains the fallback",
+            );
+        }
+    }
 }
 
 /// Size ceiling for `events.log` before an append rotates it. The log is
@@ -942,6 +1077,12 @@ fn sanitize_reason(s: &str) -> String {
         .collect()
 }
 
+fn event_field<'a>(body: &'a str, key: &str) -> Option<&'a str> {
+    let prefix = format!("{key}=");
+    body.split_whitespace()
+        .find_map(|part| part.strip_prefix(&prefix))
+}
+
 /// Sanitize an *identifier* field before interpolating it into an events.log
 /// line. Unlike [`sanitize_reason`] (which only folds whitespace, keeping
 /// free-text readable), identifiers — task ids from filenames, workflow
@@ -970,6 +1111,8 @@ fn sanitize_field(s: &str) -> String {
 mod tests {
     use super::*;
     use crate::test_lock::LOCK as TEST_LOCK;
+    use std::io::BufRead;
+    use std::os::unix::net::UnixListener;
     use std::path::PathBuf;
 
     fn fresh_home() -> PathBuf {
@@ -983,6 +1126,76 @@ mod tests {
         ));
         std::fs::create_dir_all(&p).unwrap();
         p
+    }
+
+    #[test]
+    fn event_envelope_normalizes_project_heartbeat_and_workspace_lines() {
+        let heartbeat = EventEnvelope::from_log_line(
+            "2026-07-06T12:00:00+00:00 project=demo heartbeat zen_eligible=1 idle_workspaces=2",
+        );
+        assert_eq!(heartbeat.version, 1);
+        assert_eq!(heartbeat.transport, "shelbi.events");
+        assert_eq!(heartbeat.kind, EventKind::Heartbeat);
+        assert_eq!(heartbeat.project.as_deref(), Some("demo"));
+        assert_eq!(
+            heartbeat.timestamp.as_deref(),
+            Some("2026-07-06T12:00:00+00:00")
+        );
+
+        let workspace = EventEnvelope::from_log_line(
+            "2026-07-06T12:01:00+00:00 project=demo workspace=alpha working -> awaiting_input",
+        );
+        assert_eq!(workspace.kind, EventKind::Workspace);
+        assert_eq!(workspace.project.as_deref(), Some("demo"));
+    }
+
+    #[test]
+    fn callback_socket_receives_same_envelope_after_log_append() {
+        let _g = TEST_LOCK.lock().unwrap();
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+
+        let sock = PathBuf::from(format!(
+            "shelbi-cb-{}-{}.sock",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_file(&sock);
+        let listener = match UnixListener::bind(&sock) {
+            Ok(listener) => listener,
+            Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+                std::env::remove_var("SHELBI_HOME");
+                let _ = std::fs::remove_file(&sock);
+                let _ = std::fs::remove_dir_all(&home);
+                eprintln!("skipping callback socket test: Unix sockets unavailable in sandbox");
+                return;
+            }
+            Err(e) => panic!("bind callback socket: {e}"),
+        };
+        std::env::set_var(ORCH_EVENT_CALLBACK_SOCK_ENV, &sock);
+
+        append_heartbeat_event("demo", 3, 4).unwrap();
+
+        let (stream, _) = listener.accept().unwrap();
+        let mut line = String::new();
+        std::io::BufReader::new(stream)
+            .read_line(&mut line)
+            .unwrap();
+        let envelope: EventEnvelope = serde_json::from_str(line.trim_end()).unwrap();
+        assert_eq!(envelope.kind, EventKind::Heartbeat);
+        assert_eq!(envelope.project.as_deref(), Some("demo"));
+        assert!(envelope.line.contains("project=demo heartbeat"));
+
+        let log = std::fs::read_to_string(events_log_path().unwrap()).unwrap();
+        assert_eq!(log.trim_end(), envelope.line);
+
+        std::env::remove_var(ORCH_EVENT_CALLBACK_SOCK_ENV);
+        std::env::remove_var("SHELBI_HOME");
+        let _ = std::fs::remove_file(&sock);
+        let _ = std::fs::remove_dir_all(&home);
     }
 
     #[test]
@@ -1039,19 +1252,22 @@ mod tests {
             lines[0]
         );
         assert!(
-            lines[1].contains(" project=demo workspace=alpha supervision=gave-up reason=crash-loop"),
+            lines[1]
+                .contains(" project=demo workspace=alpha supervision=gave-up reason=crash-loop"),
             "line: {}",
             lines[1]
         );
         assert!(
-            lines[2]
-                .contains(" project=demo supervision=restart target=orchestrator reason=crash"),
+            lines[2].contains(" project=demo supervision=restart target=orchestrator reason=crash"),
             "line: {}",
             lines[2]
         );
         // Every supervision line is project-scoped so a hub-global tail can
         // tell two projects' same-named workspaces apart (acceptance §5).
-        assert!(lines.iter().all(|l| l.contains("project=demo")), "log: {log}");
+        assert!(
+            lines.iter().all(|l| l.contains("project=demo")),
+            "log: {log}"
+        );
 
         std::env::remove_var("SHELBI_HOME");
         let _ = std::fs::remove_dir_all(&home);
@@ -1572,8 +1788,16 @@ mod tests {
             "line: {}",
             lines[0]
         );
-        assert!(lines[0].contains(" pane_alive=false "), "line: {}", lines[0]);
-        assert!(lines[0].ends_with(" reason=signal:SIGTERM"), "line: {}", lines[0]);
+        assert!(
+            lines[0].contains(" pane_alive=false "),
+            "line: {}",
+            lines[0]
+        );
+        assert!(
+            lines[0].ends_with(" reason=signal:SIGTERM"),
+            "line: {}",
+            lines[0]
+        );
 
         assert!(lines[1].ends_with(" reason=exit:0"), "line: {}", lines[1]);
 
@@ -1944,8 +2168,13 @@ mod tests {
             "no submit signal after retry",
         )
         .unwrap();
-        append_dispatch_event("build-thing", "charlie", "readiness-timeout", "input box not ready")
-            .unwrap();
+        append_dispatch_event(
+            "build-thing",
+            "charlie",
+            "readiness-timeout",
+            "input box not ready",
+        )
+        .unwrap();
         let log = std::fs::read_to_string(events_log_path().unwrap()).unwrap();
         let lines: Vec<&str> = log.lines().collect();
         assert_eq!(lines.len(), 2);
@@ -1957,8 +2186,15 @@ mod tests {
         assert!(line.contains(" workspace=alpha "), "line: {line}");
         assert!(line.contains(" status=prompt-lost "), "line: {line}");
         // Whitespace in detail folds to underscores so the line stays parseable.
-        assert!(line.ends_with(" detail=no_submit_signal_after_retry"), "line: {line}");
-        assert!(lines[1].contains(" status=readiness-timeout "), "line: {}", lines[1]);
+        assert!(
+            line.ends_with(" detail=no_submit_signal_after_retry"),
+            "line: {line}"
+        );
+        assert!(
+            lines[1].contains(" status=readiness-timeout "),
+            "line: {}",
+            lines[1]
+        );
 
         std::env::remove_var("SHELBI_HOME");
     }
@@ -1969,12 +2205,8 @@ mod tests {
         let home = fresh_home();
         std::env::set_var("SHELBI_HOME", &home);
 
-        append_zen_dryrun_event(
-            "fix-typo",
-            "consider-auto-promote",
-            "mechanically eligible",
-        )
-        .unwrap();
+        append_zen_dryrun_event("fix-typo", "consider-auto-promote", "mechanically eligible")
+            .unwrap();
         let log = std::fs::read_to_string(events_log_path().unwrap()).unwrap();
         let lines: Vec<&str> = log.lines().collect();
         assert_eq!(lines.len(), 1);
@@ -1983,8 +2215,14 @@ mod tests {
         // with a distinct visual tag. Detail whitespace folds to
         // underscores so the line stays parseable.
         assert!(line.contains(" zen-dryrun task=fix-typo "), "line: {line}");
-        assert!(line.contains(" action=consider-auto-promote "), "line: {line}");
-        assert!(line.ends_with(" detail=mechanically_eligible"), "line: {line}");
+        assert!(
+            line.contains(" action=consider-auto-promote "),
+            "line: {line}"
+        );
+        assert!(
+            line.ends_with(" detail=mechanically_eligible"),
+            "line: {line}"
+        );
 
         std::env::remove_var("SHELBI_HOME");
     }
@@ -2039,7 +2277,11 @@ mod tests {
             "line: {}",
             lines[0]
         );
-        assert!(lines[0].ends_with(" to_category=done"), "line: {}", lines[0]);
+        assert!(
+            lines[0].ends_with(" to_category=done"),
+            "line: {}",
+            lines[0]
+        );
 
         std::env::remove_var("SHELBI_HOME");
     }
@@ -2152,7 +2394,13 @@ mod tests {
 
         let log = std::fs::read_to_string(events_log_path().unwrap()).unwrap();
         let lines: Vec<&str> = log.lines().collect();
-        assert_eq!(lines.len(), 2 * N, "expected {} lines, got {}", 2 * N, lines.len());
+        assert_eq!(
+            lines.len(),
+            2 * N,
+            "expected {} lines, got {}",
+            2 * N,
+            lines.len()
+        );
 
         let mut task_lines = 0usize;
         let mut workspace_lines = 0usize;
@@ -2168,7 +2416,10 @@ mod tests {
             );
             if has_task {
                 task_lines += 1;
-                assert!(line.contains("reason="), "task line missing reason: {line:?}");
+                assert!(
+                    line.contains("reason="),
+                    "task line missing reason: {line:?}"
+                );
             } else {
                 workspace_lines += 1;
             }
@@ -2265,7 +2516,12 @@ mod tests {
         // SAFETY: cpath owns the null-terminated bytes for the duration
         // of the call; `times` is a valid array of two timevals.
         let rc = unsafe { libc::utimes(cpath.as_ptr(), times.as_ptr()) };
-        assert_eq!(rc, 0, "utimes failed: errno={}", std::io::Error::last_os_error());
+        assert_eq!(
+            rc,
+            0,
+            "utimes failed: errno={}",
+            std::io::Error::last_os_error()
+        );
     }
 
     /// `clear_expected_teardown` is idempotent: no marker on disk → OK.
