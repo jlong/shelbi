@@ -155,6 +155,7 @@ pub enum RestackOutcome {
     },
     /// Nothing was rewritten. `reason` is a short token-style label
     /// (`held-by-<workspace>`, `no-branch`, `already-restacked`,
+    /// `restack-deferred:waiting-on=<ids>`,
     /// `no-commits-beyond-from-base`, `rebase-conflict`, …) so a caller
     /// can match on a prefix without parsing free-form text.
     Skipped { task_id: String, reason: String },
@@ -428,10 +429,18 @@ pub fn merge(
 
 /// Walk every not-`Done` task in the project, restacking the ones that
 /// list `parent_task.id` in their `depends_on:`. Used by [`merge`] to keep
-/// stacked PR chains coherent after the parent merges. Errors inside a
-/// single child's restack are captured as a `Skipped` outcome rather than
-/// short-circuiting the cascade — the parent has already been integrated,
-/// so a child rebase conflict shouldn't roll back the merge.
+/// stacked PR chains coherent after the parent merges.
+///
+/// Multi-parent children defer until every parent dependency is Done. The
+/// merge that just completed counts as Done for this decision even if the
+/// caller supplied a pre-move task snapshot; TUI transitions persist the
+/// Done column before firing actions, while manual `shelbi action merge`
+/// calls do not. Once all parents are Done, the child is restacked once
+/// using the dependency branch it was most likely cut from as the rebase
+/// cutoff. Errors inside a single child's restack are captured as a
+/// `Skipped` outcome rather than short-circuiting the cascade — the
+/// parent has already been integrated, so a child rebase conflict
+/// shouldn't roll back the merge.
 fn restack_children(
     project: &Project,
     project_name: &str,
@@ -453,16 +462,25 @@ fn restack_children(
             return outcomes;
         }
     };
-    for tf in tasks {
-        let child = tf.task;
+    for tf in &tasks {
+        let child = &tf.task;
         if child.column == Column::done() {
             continue;
         }
         if !child.depends_on.iter().any(|id| id == &parent_task.id) {
             continue;
         }
+        let (from_base, deferred) =
+            restack_base_for_child(child, &tasks, parent_task, parent_branch);
+        if let Some(waiting_on) = deferred {
+            outcomes.push(RestackOutcome::Skipped {
+                task_id: child.id.clone(),
+                reason: format!("restack-deferred:waiting-on={}", waiting_on.join(",")),
+            });
+            continue;
+        }
         let id = child.id.clone();
-        match restack(project, &child, parent_branch, Some(onto)) {
+        match restack(project, child, &from_base, Some(onto)) {
             Ok(outcome) => outcomes.push(outcome),
             Err(e) => outcomes.push(RestackOutcome::Skipped {
                 task_id: id,
@@ -471,6 +489,65 @@ fn restack_children(
         }
     }
     outcomes
+}
+
+fn restack_base_for_child(
+    child: &Task,
+    tasks: &[shelbi_state::TaskFile],
+    just_merged_parent: &Task,
+    just_merged_parent_branch: &str,
+) -> (String, Option<Vec<String>>) {
+    if child.depends_on.len() <= 1 {
+        return (just_merged_parent_branch.to_string(), None);
+    }
+
+    let waiting_on = unfinished_multi_parent_deps(child, tasks, &just_merged_parent.id);
+    if !waiting_on.is_empty() {
+        return (just_merged_parent_branch.to_string(), Some(waiting_on));
+    }
+
+    (
+        multi_parent_restack_cutoff(child, tasks).unwrap_or_else(|| just_merged_parent_branch.to_string()),
+        None,
+    )
+}
+
+fn unfinished_multi_parent_deps(
+    child: &Task,
+    tasks: &[shelbi_state::TaskFile],
+    just_merged_parent_id: &str,
+) -> Vec<String> {
+    if child.depends_on.len() <= 1 {
+        return Vec::new();
+    }
+
+    child
+        .depends_on
+        .iter()
+        .filter(|dep_id| {
+            if dep_id.as_str() == just_merged_parent_id {
+                return false;
+            }
+            tasks
+                .iter()
+                .find(|tf| tf.task.id == **dep_id)
+                .map(|tf| tf.task.column != Column::done())
+                .unwrap_or(true)
+        })
+        .cloned()
+        .collect()
+}
+
+fn multi_parent_restack_cutoff(child: &Task, tasks: &[shelbi_state::TaskFile]) -> Option<String> {
+    child.depends_on.iter().find_map(|dep_id| {
+        tasks
+            .iter()
+            .find(|tf| tf.task.id == *dep_id)
+            .and_then(|tf| tf.task.branch.as_deref())
+            .map(str::trim)
+            .filter(|branch| !branch.is_empty())
+            .map(str::to_string)
+    })
 }
 
 /// Rewrite `child_task`'s branch onto a new base.
@@ -1068,6 +1145,12 @@ pub fn delete_branch(project: &Project, task: &Task) -> Result<DeleteOutcome> {
         });
     }
 
+    if let Some(child_id) = deferred_multi_parent_child_needing_branch(project, task, &branch) {
+        return Ok(DeleteOutcome::Skipped {
+            reason: format!("restack-deferred:needed-by={child_id}"),
+        });
+    }
+
     let (host, dir) = locate_hub_workdir(project)?;
     let wt = dir.to_string_lossy().into_owned();
 
@@ -1111,6 +1194,25 @@ pub fn delete_branch(project: &Project, task: &Task) -> Result<DeleteOutcome> {
     }
 
     Ok(DeleteOutcome::Deleted)
+}
+
+fn deferred_multi_parent_child_needing_branch(
+    project: &Project,
+    parent_task: &Task,
+    parent_branch: &str,
+) -> Option<String> {
+    let tasks = shelbi_state::list_tasks(&project.name).ok()?;
+    tasks
+        .iter()
+        .map(|tf| &tf.task)
+        .find(|child| {
+            child.column != Column::done()
+                && child.depends_on.len() > 1
+                && child.depends_on.iter().any(|id| id == &parent_task.id)
+                && !unfinished_multi_parent_deps(child, &tasks, &parent_task.id).is_empty()
+                && multi_parent_restack_cutoff(child, &tasks).as_deref() == Some(parent_branch)
+        })
+        .map(|child| child.id.clone())
 }
 
 // ---------------------------------------------------------------------------
@@ -1604,6 +1706,54 @@ mod tests {
         // Idempotent — second call sees nothing to do.
         let again = delete_branch(&project, &task_on_branch("t", "feature")).unwrap();
         assert!(matches!(again, DeleteOutcome::NotPresent), "{again:?}");
+    }
+
+    #[test]
+    fn delete_branch_preserves_cutoff_for_deferred_multi_parent_child() {
+        let _g = auto_fire_lock();
+        let home = fresh_shelbi_home("delete-deferred-cutoff");
+        std::env::set_var("SHELBI_HOME", &home);
+
+        let (_tmp, _remote, local) = fixture_repo_with_stacked_branches();
+        add_second_parent_branch(&local);
+        let project = project_with_no_workspaces(&local);
+
+        let mut parent = bare_task("par");
+        parent.branch = Some("parent".into());
+        write_task_file("fixture", &parent);
+
+        let mut other_parent = bare_task("par2");
+        other_parent.branch = Some("parent2".into());
+        write_task_file("fixture", &other_parent);
+
+        let mut child = bare_task("ch");
+        child.branch = Some("child".into());
+        child.depends_on = vec!["par".into(), "par2".into()];
+        write_task_file("fixture", &child);
+
+        let out = delete_branch(&project, &parent).unwrap();
+        assert_eq!(
+            out,
+            DeleteOutcome::Skipped {
+                reason: "restack-deferred:needed-by=ch".into()
+            }
+        );
+
+        let wt = local.to_string_lossy().into_owned();
+        assert!(
+            run_capture_stdout(&Host::Local, &wt, &["git", "rev-parse", "--verify", "parent"])
+                .is_ok()
+        );
+        assert!(
+            run_capture_stdout(
+                &Host::Local,
+                &wt,
+                &["git", "rev-parse", "--verify", "origin/parent"],
+            )
+            .is_ok()
+        );
+
+        std::env::remove_var("SHELBI_HOME");
     }
 
     // --- open_pr target resolution chain ----------------------------------
@@ -2357,6 +2507,22 @@ mod tests {
         run_git(local, &["push", "origin", "main"]);
     }
 
+    fn add_second_parent_branch(local: &std::path::Path) {
+        run_git(local, &["checkout", "-b", "parent2", "main"]);
+        std::fs::write(local.join("parent2.txt"), "from parent2\n").unwrap();
+        run_git(local, &["add", "parent2.txt"]);
+        run_git(local, &["commit", "-q", "-m", "parent2 work"]);
+        run_git(local, &["push", "-u", "origin", "parent2"]);
+        run_git(local, &["checkout", "main"]);
+    }
+
+    fn advance_main_with_second_parent_squashed(local: &std::path::Path) {
+        run_git(local, &["checkout", "main"]);
+        run_git(local, &["merge", "--squash", "parent2"]);
+        run_git(local, &["commit", "-q", "-m", "shelbi: squash parent2 into main"]);
+        run_git(local, &["push", "origin", "main"]);
+    }
+
     fn project_with_no_workspaces(local: &std::path::Path) -> Project {
         project_at(local, MergeStrategy::Squash)
     }
@@ -2710,6 +2876,126 @@ mod tests {
         .unwrap();
         let subjects: Vec<&str> = child_log.lines().collect();
         assert_eq!(subjects[0], "child work", "{child_log}");
+
+        std::env::remove_var("SHELBI_HOME");
+    }
+
+    #[test]
+    fn restack_children_defers_multi_parent_child_until_all_parents_done() {
+        let _g = auto_fire_lock();
+        let home = fresh_shelbi_home("multi-parent-defer");
+        std::env::set_var("SHELBI_HOME", &home);
+
+        let (_tmp, _remote, local) = fixture_repo_with_stacked_branches();
+        add_second_parent_branch(&local);
+        advance_main_with_parent_squashed(&local);
+        let project = project_with_no_workspaces(&local);
+
+        let mut parent = bare_task("par");
+        parent.branch = Some("parent".into());
+        write_task_file("fixture", &parent);
+
+        let mut other_parent = bare_task("par2");
+        other_parent.branch = Some("parent2".into());
+        write_task_file("fixture", &other_parent);
+
+        let mut child = bare_task("ch");
+        child.branch = Some("child".into());
+        child.depends_on = vec!["par".into(), "par2".into()];
+        write_task_file("fixture", &child);
+
+        let outcomes =
+            restack_children(&project, "fixture", &parent, "parent", "main");
+        assert_eq!(outcomes.len(), 1, "{outcomes:?}");
+        match &outcomes[0] {
+            RestackOutcome::Skipped { task_id, reason } => {
+                assert_eq!(task_id, "ch");
+                assert_eq!(reason, "restack-deferred:waiting-on=par2");
+            }
+            other => panic!("expected deferred skip, got {other:?}"),
+        }
+
+        let wt = local.to_string_lossy().into_owned();
+        run_or_command_err(&Host::Local, &wt, &["git", "fetch", "origin"], || {
+            "git fetch origin".into()
+        })
+        .unwrap();
+        let child_log = run_capture_stdout(
+            &Host::Local,
+            &wt,
+            &["git", "log", "origin/child", "--format=%s"],
+        )
+        .unwrap();
+        let subjects: Vec<&str> = child_log.lines().collect();
+        assert_eq!(subjects[0], "child work", "{child_log}");
+        assert_eq!(subjects[1], "parent work", "{child_log}");
+
+        std::env::remove_var("SHELBI_HOME");
+    }
+
+    #[test]
+    fn restack_children_rebases_multi_parent_child_once_when_all_parents_done() {
+        let _g = auto_fire_lock();
+        let home = fresh_shelbi_home("multi-parent-ready");
+        std::env::set_var("SHELBI_HOME", &home);
+
+        let (_tmp, _remote, local) = fixture_repo_with_stacked_branches();
+        add_second_parent_branch(&local);
+        advance_main_with_parent_squashed(&local);
+        advance_main_with_second_parent_squashed(&local);
+        let project = project_with_no_workspaces(&local);
+
+        let mut parent = bare_task("par");
+        parent.branch = Some("parent".into());
+        parent.column = Column::done();
+        write_task_file("fixture", &parent);
+
+        let mut final_parent = bare_task("par2");
+        final_parent.branch = Some("parent2".into());
+        final_parent.column = Column::done();
+        write_task_file("fixture", &final_parent);
+
+        let mut child = bare_task("ch");
+        child.branch = Some("child".into());
+        child.depends_on = vec!["par".into(), "par2".into()];
+        write_task_file("fixture", &child);
+
+        let outcomes =
+            restack_children(&project, "fixture", &final_parent, "parent2", "main");
+        assert_eq!(outcomes.len(), 1, "{outcomes:?}");
+        match &outcomes[0] {
+            RestackOutcome::Restacked {
+                task_id, new_base, ..
+            } => {
+                assert_eq!(task_id, "ch");
+                assert_eq!(new_base, "main");
+            }
+            other => panic!("expected Restacked, got {other:?}"),
+        }
+
+        let wt = local.to_string_lossy().into_owned();
+        run_or_command_err(&Host::Local, &wt, &["git", "fetch", "origin"], || {
+            "git fetch origin".into()
+        })
+        .unwrap();
+        let child_log = run_capture_stdout(
+            &Host::Local,
+            &wt,
+            &["git", "log", "origin/child", "--format=%s"],
+        )
+        .unwrap();
+        let subjects: Vec<&str> = child_log.lines().collect();
+        assert_eq!(subjects[0], "child work", "{child_log}");
+        assert!(subjects.contains(&"shelbi: squash parent into main"));
+        assert!(subjects.contains(&"shelbi: squash parent2 into main"));
+        assert!(
+            !subjects.contains(&"parent work"),
+            "child history should not replay the original parent branch:\n{child_log}"
+        );
+        assert!(
+            !subjects.contains(&"parent2 work"),
+            "child history should not replay the second parent branch:\n{child_log}"
+        );
 
         std::env::remove_var("SHELBI_HOME");
     }

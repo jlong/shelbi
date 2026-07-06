@@ -440,7 +440,9 @@ A fourth behavior fires *on the parent*:
    `depends_on:` containing the parent's id and runs the `restack`
    action on each. The child branch is rebased onto the parent's
    target (typically `main`), and any open PR's base is updated to
-   match. Chains restack transitively.
+   match. A child with multiple parents waits until every parent is
+   in a `done`-category status, then restacks once onto the converged
+   target. Chains restack transitively.
 
 Cycles in `depends_on:` are rejected at task-load time with a clear
 error naming the offending task and the cycle path. A task whose
