@@ -44,9 +44,9 @@ pub fn run(project_opt: Option<String>) -> Result<()> {
     // indirectly, but doing it here makes the contract explicit:
     // `shelbi reload` always leaves both files on disk.
     let _ = shelbi_state::load_project(&project_name);
+    let outcomes = shelbi_state::self_heal_default_agents(&project_name).map_err(|e| anyhow!(e))?;
     let report = shelbi_orchestrator::reload(&project_name).map_err(|e| anyhow!(e))?;
     print_report(&project_name, &report);
-    let outcomes = shelbi_state::self_heal_default_agents(&project_name).map_err(|e| anyhow!(e))?;
     for outcome in outcomes {
         print_agent_materialize_outcome(&outcome);
     }
