@@ -498,10 +498,30 @@ fn move_to(project: &str, id: &str, to: &str, reason: Option<&str>) -> Result<()
     let moved = shelbi_state::move_task(project, id, column.clone()).map_err(|e| anyhow!(e))?;
     if let Some((from, to_col, workflow)) = moved {
         let reason = reason.unwrap_or("user:cli");
-        if let Err(e) =
-            shelbi_state::append_task_event(project, id, &workflow, from, to_col, reason)
-        {
-            eprintln!("warning: append_task_event failed: {e}");
+        if let Err(e) = shelbi_state::append_task_event(
+            project,
+            id,
+            &workflow,
+            from.clone(),
+            to_col.clone(),
+            reason,
+        ) {
+            match shelbi_state::move_task(project, id, from.clone()) {
+                Ok(_) => {
+                    return Err(anyhow!(
+                        "moved {id} to {to_col}, but failed to append task event ({e}); \
+                         rolled back to {from}. Fix events.log permissions or restart the \
+                         Shelbi daemon, then retry the move"
+                    ));
+                }
+                Err(re) => {
+                    return Err(anyhow!(
+                        "moved {id} to {to_col}, but failed to append task event ({e}); \
+                         rollback to {from} also failed ({re}). Fix events.log permissions, \
+                         then run `shelbi task move {id} --to {from}` or retry the intended move"
+                    ));
+                }
+            }
         }
     }
     println!("✓ {id} → {column}");
@@ -1122,6 +1142,7 @@ fn slugify(s: &str) -> String {
 mod tests {
     use super::*;
     use crate::commands::test_support::ENV_LOCK as TEST_LOCK;
+    use std::os::unix::fs::PermissionsExt;
     use std::path::PathBuf;
 
     fn fresh_home() -> PathBuf {
@@ -1134,6 +1155,12 @@ mod tests {
                 .as_nanos()
         ));
         std::fs::create_dir_all(&p).unwrap();
+        p
+    }
+
+    fn short_test_socket(tag: &str) -> PathBuf {
+        let p = PathBuf::from(format!("/tmp/shb-cli-{}-{tag}.sock", std::process::id()));
+        let _ = std::fs::remove_file(&p);
         p
     }
 
@@ -1255,6 +1282,77 @@ mod tests {
             lines[0],
         );
 
+        std::env::remove_var("SHELBI_HOME");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn move_to_records_orchestrator_backlog_promotion() {
+        let _g = TEST_LOCK.lock().unwrap();
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+
+        shelbi_state::save_task("p", &task_in(Column::backlog(), "promo"), "").unwrap();
+        move_to(
+            "p",
+            "promo",
+            "todo",
+            Some("orchestrator:zen-promote category=2"),
+        )
+        .unwrap();
+
+        let log = std::fs::read_to_string(shelbi_state::events_log_path().unwrap()).unwrap();
+        let lines: Vec<&str> = log.lines().collect();
+        assert_eq!(lines.len(), 1);
+        let line = lines[0];
+        assert!(line.contains(" task=promo "), "line: {line}");
+        assert!(line.contains(" backlog -> todo "), "line: {line}");
+        assert!(
+            line.contains(" reason=orchestrator:zen-promote_category=2 "),
+            "line: {line}"
+        );
+        assert!(line.contains(" from_category=backlog "), "line: {line}");
+        assert!(line.ends_with(" to_category=ready"), "line: {line}");
+
+        std::env::remove_var("SHELBI_HOME");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn move_to_rolls_back_when_event_append_permission_denied() {
+        let _g = TEST_LOCK.lock().unwrap();
+        let home = fresh_home();
+        let sock = short_test_socket("move-denied");
+        std::env::set_var("SHELBI_HOME", &home);
+        std::env::set_var("SHELBI_HUB_SOCK", &sock);
+
+        shelbi_state::save_task("p", &task_in(Column::backlog(), "denied"), "").unwrap();
+        let log_path = shelbi_state::events_log_path().unwrap();
+        std::fs::write(&log_path, "").unwrap();
+        std::fs::set_permissions(&log_path, std::fs::Permissions::from_mode(0o444)).unwrap();
+
+        let err = move_to(
+            "p",
+            "denied",
+            "todo",
+            Some("orchestrator:zen-promote category=2"),
+        )
+        .unwrap_err()
+        .to_string();
+        std::fs::set_permissions(&log_path, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        assert!(err.contains("failed to append task event"), "err: {err}");
+        assert!(err.contains("rolled back to backlog"), "err: {err}");
+        let tf = shelbi_state::load_task("p", "denied").unwrap();
+        assert_eq!(tf.task.column, Column::backlog());
+        let log = std::fs::read_to_string(&log_path).unwrap();
+        assert!(
+            !log.contains("task=denied"),
+            "failed move must not leave a missing-transition success: {log}"
+        );
+
+        let _ = std::fs::remove_file(&sock);
+        std::env::remove_var("SHELBI_HUB_SOCK");
         std::env::remove_var("SHELBI_HOME");
         let _ = std::fs::remove_dir_all(&home);
     }
