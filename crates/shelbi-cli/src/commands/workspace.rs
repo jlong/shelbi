@@ -123,8 +123,8 @@ fn occupied_idle_workspaces(
             )
         })?;
         let host = machine.host();
-        let addr =
-            orch_workspace::workspace_tmux_addr(project, workspace).map_err(|e| anyhow!(e))?;
+        let addr = orch_workspace::workspace_tmux_addr(project, workspace)
+            .map_err(|e| anyhow!(e))?;
         if orch_workspace::workspace_slot_alive(&host, &addr).map_err(|e| anyhow!(e))? {
             occupied.insert(workspace.name.clone());
         }
