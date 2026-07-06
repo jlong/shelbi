@@ -607,6 +607,19 @@ pub fn workspace_pane_alive(host: &Host, addr: &TmuxAddr) -> Result<bool> {
     Ok(stdout.lines().any(|w| w.trim() == addr.window))
 }
 
+/// Does this workspace slot have a live tmux allocation right now?
+///
+/// Local workspaces are windows inside the project session, so the window is
+/// the slot. Remote workspaces are standalone `shelbi-w-<name>` sessions; tmux
+/// may auto-rename the lone window away from `agent`, so session liveness is
+/// the authoritative availability check there.
+pub fn workspace_slot_alive(host: &Host, addr: &TmuxAddr) -> Result<bool> {
+    match host {
+        Host::Local => workspace_pane_alive(host, addr),
+        Host::Ssh { .. } => shelbi_tmux::has_session(host, &addr.session),
+    }
+}
+
 /// Kill the workspace's pane (idempotent — silently OK if already gone).
 ///
 /// Marks an "expected teardown" for `workspace_name` before touching tmux
@@ -632,7 +645,7 @@ pub fn kill_workspace_pane(host: &Host, addr: &TmuxAddr, workspace_name: &str) -
     // around to collide with the next `task start`.
     match host {
         Host::Local => {
-            if !workspace_pane_alive(host, addr)? {
+            if !workspace_slot_alive(host, addr)? {
                 return Ok(());
             }
             // Best-effort — the wrapper's fallback (fire the event with
@@ -643,7 +656,7 @@ pub fn kill_workspace_pane(host: &Host, addr: &TmuxAddr, workspace_name: &str) -
                 .map_err(Error::Io)?;
         }
         Host::Ssh { .. } => {
-            if !shelbi_tmux::has_session(host, &addr.session)? {
+            if !workspace_slot_alive(host, addr)? {
                 return Ok(());
             }
             // Remote workspaces don't run the lifecycle wrapper (no

@@ -2,7 +2,7 @@
 //! pool. Workspaces are durable slots (one worktree each); tasks come and go.
 //! See [`shelbi_orchestrator::workspace`] for the lifecycle primitives.
 
-use std::fs;
+use std::{collections::BTreeSet, fs};
 
 use anyhow::{anyhow, Result};
 use chrono::{DateTime, Utc};
@@ -93,10 +93,41 @@ pub(crate) fn print_workspaces(project: &str) -> Result<()> {
         .map_err(|e| anyhow!(e))?;
     let assigned: Vec<&Task> = in_progress.iter().map(|tf| &tf.task).collect();
 
-    for line in render_list(&p.workspaces, &assigned)? {
+    let occupied = occupied_idle_workspaces(&p, &assigned)?;
+    for line in render_list_with_occupied(&p.workspaces, &assigned, &occupied)? {
         println!("{line}");
     }
     Ok(())
+}
+
+fn occupied_idle_workspaces(
+    project: &shelbi_core::Project,
+    in_progress: &[&Task],
+) -> Result<BTreeSet<String>> {
+    let assigned: BTreeSet<&str> = in_progress
+        .iter()
+        .filter_map(|t| t.assigned_to.as_deref())
+        .collect();
+    let mut occupied = BTreeSet::new();
+    for workspace in &project.workspaces {
+        if assigned.contains(workspace.name.as_str()) {
+            continue;
+        }
+        let machine = project.machine(&workspace.machine).ok_or_else(|| {
+            anyhow!(
+                "workspace `{}` references unknown machine `{}`",
+                workspace.name,
+                workspace.machine
+            )
+        })?;
+        let host = machine.host();
+        let addr = orch_workspace::workspace_tmux_addr(project, workspace)
+            .map_err(|e| anyhow!(e))?;
+        if orch_workspace::workspace_slot_alive(&host, &addr).map_err(|e| anyhow!(e))? {
+            occupied.insert(workspace.name.clone());
+        }
+    }
+    Ok(occupied)
 }
 
 /// Render the `shelbi workspace list` table: a header row followed by one
@@ -112,6 +143,14 @@ pub(crate) fn render_list(
     workspaces: &[WorkspaceSpec],
     in_progress: &[&Task],
 ) -> Result<Vec<String>> {
+    render_list_with_occupied(workspaces, in_progress, &BTreeSet::new())
+}
+
+fn render_list_with_occupied(
+    workspaces: &[WorkspaceSpec],
+    in_progress: &[&Task],
+    occupied_idle: &BTreeSet<String>,
+) -> Result<Vec<String>> {
     let mut out = Vec::with_capacity(workspaces.len() + 1);
     out.push(format!(
         "{:<12} {:<8} {:<14} {:<14} {}",
@@ -124,7 +163,12 @@ pub(crate) fn render_list(
             .filter(|t| t.assigned_to.as_deref() == Some(workspace.name.as_str()))
             .collect();
         let (agent, state) = if mine.is_empty() {
-            (IDLE_AGENT_CELL.to_string(), "idle".to_string())
+            let state = if occupied_idle.contains(&workspace.name) {
+                "orphaned session"
+            } else {
+                "idle"
+            };
+            (IDLE_AGENT_CELL.to_string(), state.to_string())
         } else {
             // `agent:` from the task frontmatter wins when present —
             // matches the same lookup the task-start path uses to load
@@ -542,6 +586,32 @@ mod tests {
         // there's no assigned task.
         assert!(row.trim_end().ends_with("idle"), "row: {row}");
         assert!(!row.contains("in_progress:"), "row: {row}");
+    }
+
+    #[test]
+    fn render_list_marks_unassigned_live_slot_as_orphaned_session() {
+        let workspaces = vec![make_workspace("delta", "devbox", "sonnet-4-6")];
+        let in_progress: Vec<&Task> = Vec::new();
+        let occupied = BTreeSet::from(["delta".to_string()]);
+
+        let rows = render_list_with_occupied(&workspaces, &in_progress, &occupied).unwrap();
+        let row = &rows[1];
+        assert!(row.contains("delta"), "row: {row}");
+        assert!(row.contains(&format!(" {IDLE_AGENT_CELL} ")), "row: {row}");
+        assert!(row.trim_end().ends_with("orphaned session"), "row: {row}");
+    }
+
+    #[test]
+    fn render_list_prefers_assigned_task_over_orphan_marker() {
+        let workspaces = vec![make_workspace("delta", "devbox", "sonnet-4-6")];
+        let task = make_task("bug-fix", Column::in_progress(), 0, Some("delta"));
+        let in_progress: Vec<&Task> = vec![&task];
+        let occupied = BTreeSet::from(["delta".to_string()]);
+
+        let rows = render_list_with_occupied(&workspaces, &in_progress, &occupied).unwrap();
+        let row = &rows[1];
+        assert!(row.contains("in_progress: bug-fix"), "row: {row}");
+        assert!(!row.contains("orphaned session"), "row: {row}");
     }
 
     #[test]
