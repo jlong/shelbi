@@ -162,13 +162,7 @@ pub const SHARED_PROJECT_FIELDS: &[&str] = &[
 /// YAML keys that belong in the *user-local* half of a split project
 /// config. Includes the legacy `workers` alias so a misplaced legacy key
 /// still routes to the right side of the split.
-pub const LOCAL_PROJECT_FIELDS: &[&str] = &[
-    "repo",
-    "machines",
-    "editor",
-    "workspaces",
-    "workers",
-];
+pub const LOCAL_PROJECT_FIELDS: &[&str] = &["repo", "machines", "editor", "workspaces", "workers"];
 
 /// One blocking-dialog signature: a substring that, when present in a
 /// workspace pane's captured text, means the runner is frozen on an
@@ -228,6 +222,18 @@ pub fn default_dialog_signatures(command: &str) -> Vec<DialogSignature> {
             DialogSignature::new("permission", "Enter to confirm"),
         ],
         _ => Vec::new(),
+    }
+}
+
+pub fn default_prompt_injection(command: &str) -> PromptInjectionSpec {
+    let base = Path::new(command)
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or(command);
+    match base {
+        "claude" | "codex" => PromptInjectionSpec::positional_arg(),
+        "aider" => PromptInjectionSpec::flag_file("--message-file"),
+        _ => PromptInjectionSpec::stdin(),
     }
 }
 
@@ -352,7 +358,9 @@ fn parse_heartbeat_duration(s: &str) -> std::result::Result<Duration, String> {
         .parse()
         .map_err(|_| format!("heartbeat `{s}`: not a number followed by `s`/`m`/`h`"))?;
     if n == 0 {
-        return Err(format!("heartbeat `{s}`: zero interval — use `off` to disable"));
+        return Err(format!(
+            "heartbeat `{s}`: zero interval — use `off` to disable"
+        ));
     }
     let secs = n
         .checked_mul(mult)
@@ -387,9 +395,7 @@ impl std::str::FromStr for HeartbeatConfig {
     fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
         let trimmed = s.trim();
         if trimmed.is_empty() {
-            return Err(
-                "heartbeat: empty string — use a duration like `3m` or `off`".to_string(),
-            );
+            return Err("heartbeat: empty string — use a duration like `3m` or `off`".to_string());
         }
         if trimmed.eq_ignore_ascii_case("off") {
             return Ok(HeartbeatConfig::Off);
@@ -639,7 +645,9 @@ impl Project {
     /// and left to callers to warn about rather than fail the load.
     pub fn validate_workspaces(&self) -> crate::Result<()> {
         if self.runner(&self.orchestrator.runner).is_none() {
-            return Err(crate::Error::UnknownRunner(self.orchestrator.runner.clone()));
+            return Err(crate::Error::UnknownRunner(
+                self.orchestrator.runner.clone(),
+            ));
         }
         for w in &self.workspaces {
             if self.machine(&w.machine).is_none() {
@@ -672,10 +680,7 @@ impl Project {
     /// Duplicate keys — the same field name appearing in both halves —
     /// are rejected: which side wins is not a decision this layer should
     /// make, so the merge refuses instead of silently dropping one.
-    pub fn from_split_yaml_str(
-        shared_yaml: &str,
-        local_yaml: &str,
-    ) -> crate::Result<Self> {
+    pub fn from_split_yaml_str(shared_yaml: &str, local_yaml: &str) -> crate::Result<Self> {
         let shared_val: serde_yaml::Value = serde_yaml::from_str(shared_yaml)?;
         let local_val: serde_yaml::Value = serde_yaml::from_str(local_yaml)?;
 
@@ -958,6 +963,15 @@ pub struct AgentRunnerSpec {
     /// Extra flags to append to every invocation.
     #[serde(default)]
     pub flags: Vec<String>,
+    /// How Shelbi should deliver the per-task initial prompt to this runner.
+    ///
+    /// When omitted, Shelbi uses built-in defaults keyed on the executable
+    /// basename: Claude and Codex receive a launch-time positional prompt,
+    /// aider receives `--message-file <prompt-file>`, and unknown runners read
+    /// the prompt on stdin. `paste` is reserved for genuinely REPL-only
+    /// harnesses.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt_injection: Option<PromptInjectionSpec>,
     /// Blocking-dialog signatures for this runner. When empty, the poller
     /// falls back to [`default_dialog_signatures`] keyed on `command`, so
     /// the built-in per-runner set applies with no config. Populate this in
@@ -978,6 +992,59 @@ impl AgentRunnerSpec {
             self.dialog_signatures.clone()
         }
     }
+
+    pub fn effective_prompt_injection(&self) -> PromptInjectionSpec {
+        if let Some(spec) = &self.prompt_injection {
+            return spec.clone();
+        }
+        default_prompt_injection(&self.command)
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PromptInjectionSpec {
+    pub kind: PromptInjectionKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub flag: Option<String>,
+}
+
+impl PromptInjectionSpec {
+    pub fn positional_arg() -> Self {
+        Self {
+            kind: PromptInjectionKind::PositionalArg,
+            flag: None,
+        }
+    }
+
+    pub fn flag_file(flag: impl Into<String>) -> Self {
+        Self {
+            kind: PromptInjectionKind::FlagFile,
+            flag: Some(flag.into()),
+        }
+    }
+
+    pub fn stdin() -> Self {
+        Self {
+            kind: PromptInjectionKind::Stdin,
+            flag: None,
+        }
+    }
+
+    pub fn paste() -> Self {
+        Self {
+            kind: PromptInjectionKind::Paste,
+            flag: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum PromptInjectionKind {
+    PositionalArg,
+    FlagFile,
+    Stdin,
+    Paste,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1108,7 +1175,10 @@ impl Column {
     /// historical column set (the CLI board render, ordering) use this;
     /// the TUI kanban enumerates `statuses.yaml` directly instead.
     pub fn core() -> Vec<Column> {
-        Self::CORE_IDS.iter().map(|id| Column(id.to_string())).collect()
+        Self::CORE_IDS
+            .iter()
+            .map(|id| Column(id.to_string()))
+            .collect()
     }
 
     /// Build a position from a status id, normalizing the legacy /
@@ -1410,8 +1480,13 @@ impl Task {
 /// `column`, `priority`, the timestamps) are omitted on purpose: dropping
 /// or misspelling one of those already makes deserialize fail loudly, so a
 /// near-miss warning there would be redundant noise.
-pub const KNOWN_OPTIONAL_TASK_FIELDS: &[&str] =
-    &["assigned_to", "branch", "workflow", "prefers_machine", "zen"];
+pub const KNOWN_OPTIONAL_TASK_FIELDS: &[&str] = &[
+    "assigned_to",
+    "branch",
+    "workflow",
+    "prefers_machine",
+    "zen",
+];
 
 /// A post-deserialize problem [`Task::validate_params`] found in a task's
 /// flattened [`Task::params`]. See that method for why the check is a
@@ -1433,10 +1508,7 @@ pub enum ParamDiagnostic {
     /// forward-compat artifact from a newer binary. Error-severity, naming
     /// the key, without failing the whole task the way the old
     /// `String`-typed map did.
-    NonStringValue {
-        field: String,
-        kind: &'static str,
-    },
+    NonStringValue { field: String, kind: &'static str },
 }
 
 impl ParamDiagnostic {
@@ -1712,8 +1784,14 @@ impl TryFrom<ZenDangerPathsRepr> for ZenDangerPaths {
 impl From<ZenDangerPaths> for ZenDangerPathsRepr {
     fn from(p: ZenDangerPaths) -> Self {
         match p {
-            ZenDangerPaths::Extend(v) => Self { extend: Some(v), override_: None },
-            ZenDangerPaths::Override(v) => Self { extend: None, override_: Some(v) },
+            ZenDangerPaths::Extend(v) => Self {
+                extend: Some(v),
+                override_: None,
+            },
+            ZenDangerPaths::Override(v) => Self {
+                extend: None,
+                override_: Some(v),
+            },
         }
     }
 }
@@ -1783,10 +1861,7 @@ impl ProjectShape {
                 "vercel.json",
                 ".npmrc",
             ],
-            ProjectShape::GitHub => &[
-                ".github/CODEOWNERS",
-                ".github/dependabot.yml",
-            ],
+            ProjectShape::GitHub => &[".github/CODEOWNERS", ".github/dependabot.yml"],
             ProjectShape::Docker => &["Dockerfile", "compose.yaml"],
             ProjectShape::Shelbi => &[".shelbi/**", "shelbi.yaml"],
         }
@@ -1898,10 +1973,7 @@ pub fn checks_for_task_in_workflow(
 /// Resolve the effective Zen `ci_timeout` for `project` + an optional
 /// `workflow`. The workflow's `zen.ci_timeout` override wins when set;
 /// otherwise the project default applies.
-pub fn ci_timeout_for_workflow(
-    project: &Project,
-    workflow: Option<&crate::Workflow>,
-) -> Duration {
+pub fn ci_timeout_for_workflow(project: &Project, workflow: Option<&crate::Workflow>) -> Duration {
     workflow
         .and_then(|w| w.zen.as_ref())
         .and_then(|z| z.ci_timeout)
@@ -1953,8 +2025,7 @@ pub fn danger_paths_for_workflow(
 pub fn danger_paths_for_project(project: &Project) -> Vec<String> {
     match &project.zen.danger_paths {
         ZenDangerPaths::Extend(extra) => {
-            let mut out: Vec<String> =
-                BUILTIN_DANGER_PATHS.iter().map(|s| s.to_string()).collect();
+            let mut out: Vec<String> = BUILTIN_DANGER_PATHS.iter().map(|s| s.to_string()).collect();
             for shape in &project.detected_shapes {
                 for p in shape.danger_paths() {
                     out.push((*p).to_string());
@@ -2123,12 +2194,20 @@ mod tests {
         }
         // Wire format keeps the legacy snake_case form for the core ids so
         // an older binary still parses the `column:` field.
-        assert_eq!(serde_yaml::to_string(&Column::in_progress()).unwrap().trim(), "in_progress");
+        assert_eq!(
+            serde_yaml::to_string(&Column::in_progress())
+                .unwrap()
+                .trim(),
+            "in_progress"
+        );
         // A custom / archived status round-trips through its verbatim id.
         let canceled: Column =
             serde_yaml::from_str(&serde_yaml::to_string(&Column::canceled()).unwrap()).unwrap();
         assert_eq!(canceled, Column::canceled());
-        assert_eq!(serde_yaml::to_string(&Column::canceled()).unwrap().trim(), "canceled");
+        assert_eq!(
+            serde_yaml::to_string(&Column::canceled()).unwrap().trim(),
+            "canceled"
+        );
         // The legacy snake_case on-disk spelling still deserializes onto the
         // canonical kebab-case id, so old task files keep loading.
         assert_eq!(
@@ -2143,8 +2222,14 @@ mod tests {
         assert_eq!(Column::from_str("backlog").unwrap(), Column::backlog());
         assert_eq!(Column::from_str("to-do").unwrap(), Column::todo());
         assert_eq!(Column::from_str("WIP").unwrap(), Column::in_progress());
-        assert_eq!(Column::from_str("in-progress").unwrap(), Column::in_progress());
-        assert_eq!(Column::from_str("ready-for-review").unwrap(), Column::review());
+        assert_eq!(
+            Column::from_str("in-progress").unwrap(),
+            Column::in_progress()
+        );
+        assert_eq!(
+            Column::from_str("ready-for-review").unwrap(),
+            Column::review()
+        );
         assert_eq!(Column::from_str("complete").unwrap(), Column::done());
         // Any other string is a valid custom status id, not an error — the
         // board no longer whitelists a fixed set of positions.
@@ -2466,7 +2551,10 @@ updated_at: 2026-06-19T00:00:00Z
         // their original YAML types, not stringified.
         let back = serde_yaml::to_string(&t).unwrap();
         let reparsed: Task = serde_yaml::from_str(&back).unwrap();
-        assert_eq!(reparsed.params.get("retries"), Some(&serde_yaml::Value::from(2)));
+        assert_eq!(
+            reparsed.params.get("retries"),
+            Some(&serde_yaml::Value::from(2))
+        );
         assert_eq!(
             reparsed.params.get("zen_optional"),
             Some(&serde_yaml::Value::from(true))
@@ -2699,7 +2787,15 @@ workspace_settings_template: /etc/shelbi/p.json
     #[test]
     fn workspaces_validate_against_machines_and_runners() {
         let mut runners = std::collections::BTreeMap::new();
-        runners.insert("claude".to_string(), AgentRunnerSpec { command: "claude".into(), flags: vec![], dialog_signatures: vec![] });
+        runners.insert(
+            "claude".to_string(),
+            AgentRunnerSpec {
+                command: "claude".into(),
+                flags: vec![],
+                prompt_injection: None,
+                dialog_signatures: vec![],
+            },
+        );
         let project = Project {
             name: "p".into(),
             repo: "r".into(),
@@ -2712,13 +2808,19 @@ workspace_settings_template: /etc/shelbi/p.json
                 host: None,
                 tags: Vec::new(),
             }],
-            orchestrator: OrchestratorSpec { runner: "claude".into() },
+            orchestrator: OrchestratorSpec {
+                runner: "claude".into(),
+            },
             agent_runners: runners,
             editor: None,
             github_url: None,
-            workspaces: vec![
-                WorkspaceSpec { name: "alice".into(), machine: "hub".into(), runner: "claude".into(), tags: Vec::new(), slot: None },
-            ],
+            workspaces: vec![WorkspaceSpec {
+                name: "alice".into(),
+                machine: "hub".into(),
+                runner: "claude".into(),
+                tags: Vec::new(),
+                slot: None,
+            }],
             workspace_poll_interval_secs: default_workspace_poll_interval_secs(),
             workspace_permissions_mode: default_workspace_permissions_mode(),
             workspace_settings_template: None,
@@ -2730,16 +2832,37 @@ workspace_settings_template: /etc/shelbi/p.json
         assert!(project.validate_workspaces().is_ok());
 
         let mut bad = project.clone();
-        bad.workspaces.push(WorkspaceSpec { name: "bob".into(), machine: "ghost".into(), runner: "claude".into(), tags: Vec::new(), slot: None });
-        assert!(matches!(bad.validate_workspaces(), Err(crate::Error::UnknownMachine(_))));
+        bad.workspaces.push(WorkspaceSpec {
+            name: "bob".into(),
+            machine: "ghost".into(),
+            runner: "claude".into(),
+            tags: Vec::new(),
+            slot: None,
+        });
+        assert!(matches!(
+            bad.validate_workspaces(),
+            Err(crate::Error::UnknownMachine(_))
+        ));
 
         let mut bad2 = project.clone();
-        bad2.workspaces.push(WorkspaceSpec { name: "bob".into(), machine: "hub".into(), runner: "ghost".into(), tags: Vec::new(), slot: None });
-        assert!(matches!(bad2.validate_workspaces(), Err(crate::Error::UnknownRunner(_))));
+        bad2.workspaces.push(WorkspaceSpec {
+            name: "bob".into(),
+            machine: "hub".into(),
+            runner: "ghost".into(),
+            tags: Vec::new(),
+            slot: None,
+        });
+        assert!(matches!(
+            bad2.validate_workspaces(),
+            Err(crate::Error::UnknownRunner(_))
+        ));
 
         let mut bad3 = project.clone();
         bad3.orchestrator.runner = "ghost".into();
-        assert!(matches!(bad3.validate_workspaces(), Err(crate::Error::UnknownRunner(_))));
+        assert!(matches!(
+            bad3.validate_workspaces(),
+            Err(crate::Error::UnknownRunner(_))
+        ));
     }
 
     #[test]
@@ -2775,6 +2898,7 @@ workspaces:
             AgentRunnerSpec {
                 command: "claude".into(),
                 flags: vec![],
+                prompt_injection: None,
                 dialog_signatures: vec![],
             },
         );
@@ -2833,7 +2957,8 @@ workspaces:
 
         // Bare-string `tags: review` → one-element list (string-or-seq).
         let scalar: WorkspaceSpec =
-            serde_yaml::from_str("{ name: r, machine: hub, runner: claude, tags: review }").unwrap();
+            serde_yaml::from_str("{ name: r, machine: hub, runner: claude, tags: review }")
+                .unwrap();
         assert_eq!(scalar.tags, vec!["review".to_string()]);
 
         // Scalar `tag:` alias for `tags:`.
@@ -2864,7 +2989,8 @@ workspaces:
 
         // `role: Dev` → no tags.
         let dev: WorkspaceSpec =
-            serde_yaml::from_str("{ name: alpha, machine: hub, runner: claude, role: Dev }").unwrap();
+            serde_yaml::from_str("{ name: alpha, machine: hub, runner: claude, role: Dev }")
+                .unwrap();
         assert!(dev.tags.is_empty());
 
         // `role` is never written back out — a loaded legacy config is
@@ -2892,10 +3018,8 @@ workspaces:
     #[test]
     fn effective_tags_union_machine_and_workspace() {
         // Machine-level tags flow down to every workspace on the machine.
-        let mut project = project_with_workspaces(vec![
-            ws("alpha", "hub", false),
-            ws("review-1", "hub", true),
-        ]);
+        let mut project =
+            project_with_workspaces(vec![ws("alpha", "hub", false), ws("review-1", "hub", true)]);
         project.machines[0].tags = vec!["gpu".to_string()]; // hub
 
         let alpha = project.workspace("alpha").unwrap();
@@ -2934,8 +3058,9 @@ workspaces:
         assert_eq!(names, vec!["review-1", "review-2"]);
 
         // AND semantics: `{review, gpu}` → only the devbox review slot.
-        let both: BTreeSet<String> =
-            ["review".to_string(), "gpu".to_string()].into_iter().collect();
+        let both: BTreeSet<String> = ["review".to_string(), "gpu".to_string()]
+            .into_iter()
+            .collect();
         let names: Vec<&str> = project
             .workspaces_matching(&both)
             .iter()
@@ -2999,7 +3124,12 @@ workspaces:
         let mut runners = std::collections::BTreeMap::new();
         runners.insert(
             "claude".to_string(),
-            AgentRunnerSpec { command: "claude".into(), flags: vec![], dialog_signatures: vec![] },
+            AgentRunnerSpec {
+                command: "claude".into(),
+                flags: vec![],
+                prompt_injection: None,
+                dialog_signatures: vec![],
+            },
         );
         Project {
             name: "p".into(),
@@ -3013,7 +3143,9 @@ workspaces:
                 host: None,
                 tags: Vec::new(),
             }],
-            orchestrator: OrchestratorSpec { runner: "claude".into() },
+            orchestrator: OrchestratorSpec {
+                runner: "claude".into(),
+            },
             agent_runners: runners,
             editor: None,
             github_url: None,
@@ -3124,7 +3256,9 @@ zen:
     #[test]
     fn zen_config_yaml_round_trip() {
         let cfg = ZenConfig {
-            checks: ZenChecks { local: vec!["cargo test".into()] },
+            checks: ZenChecks {
+                local: vec!["cargo test".into()],
+            },
             ci_timeout: Duration::from_secs(900),
             danger_paths: ZenDangerPaths::Extend(vec!["docs/**".into()]),
         };
@@ -3189,7 +3323,9 @@ updated_at: 2026-06-19T00:00:00Z
     #[test]
     fn checks_for_task_falls_back_to_project_when_no_overrides() {
         let p = project_with_zen(ZenConfig {
-            checks: ZenChecks { local: vec!["cargo test".into()] },
+            checks: ZenChecks {
+                local: vec!["cargo test".into()],
+            },
             ..Default::default()
         });
         let t = task_with_zen(None);
@@ -3199,7 +3335,9 @@ updated_at: 2026-06-19T00:00:00Z
     #[test]
     fn checks_for_task_extends_with_additional() {
         let p = project_with_zen(ZenConfig {
-            checks: ZenChecks { local: vec!["cargo test".into()] },
+            checks: ZenChecks {
+                local: vec!["cargo test".into()],
+            },
             ..Default::default()
         });
         let t = task_with_zen(Some(TaskZenConfig {
@@ -3212,7 +3350,9 @@ updated_at: 2026-06-19T00:00:00Z
     #[test]
     fn checks_for_task_only_replaces_project_checks() {
         let p = project_with_zen(ZenConfig {
-            checks: ZenChecks { local: vec!["cargo test".into()] },
+            checks: ZenChecks {
+                local: vec!["cargo test".into()],
+            },
             ..Default::default()
         });
         let t = task_with_zen(Some(TaskZenConfig {
@@ -3232,7 +3372,10 @@ updated_at: 2026-06-19T00:00:00Z
         });
         let paths = danger_paths_for_project(&p);
         for builtin in BUILTIN_DANGER_PATHS {
-            assert!(paths.iter().any(|p| p == builtin), "missing builtin {builtin}");
+            assert!(
+                paths.iter().any(|p| p == builtin),
+                "missing builtin {builtin}"
+            );
         }
         assert!(paths.iter().any(|p| p == "secrets/**"));
     }
@@ -3308,7 +3451,10 @@ updated_at: 2026-06-19T00:00:00Z
 
         let with_compose = fresh_tempdir("compose");
         std::fs::write(with_compose.join("compose.yaml"), "services: {}\n").unwrap();
-        assert_eq!(detect_project_shapes(&with_compose), vec![ProjectShape::Docker]);
+        assert_eq!(
+            detect_project_shapes(&with_compose),
+            vec![ProjectShape::Docker]
+        );
     }
 
     #[test]
@@ -3319,7 +3465,10 @@ updated_at: 2026-06-19T00:00:00Z
 
         let with_yaml = fresh_tempdir("shelbi-yaml");
         std::fs::write(with_yaml.join("shelbi.yaml"), "").unwrap();
-        assert_eq!(detect_project_shapes(&with_yaml), vec![ProjectShape::Shelbi]);
+        assert_eq!(
+            detect_project_shapes(&with_yaml),
+            vec![ProjectShape::Shelbi]
+        );
     }
 
     #[test]
@@ -3457,8 +3606,14 @@ updated_at: 2026-06-19T00:00:00Z
             HeartbeatConfig::from_str("2H").unwrap(),
             HeartbeatConfig::every(Duration::from_secs(7_200))
         );
-        assert_eq!(HeartbeatConfig::from_str("OFF").unwrap(), HeartbeatConfig::Off);
-        assert_eq!(HeartbeatConfig::from_str("off").unwrap(), HeartbeatConfig::Off);
+        assert_eq!(
+            HeartbeatConfig::from_str("OFF").unwrap(),
+            HeartbeatConfig::Off
+        );
+        assert_eq!(
+            HeartbeatConfig::from_str("off").unwrap(),
+            HeartbeatConfig::Off
+        );
     }
 
     #[test]
@@ -3471,7 +3626,7 @@ updated_at: 2026-06-19T00:00:00Z
         // Unknown units.
         assert!(HeartbeatConfig::from_str("5x").is_err());
         assert!(HeartbeatConfig::from_str("1d").is_err()); // days unsupported
-        // Zero interval is a misuse; ask for `off` instead.
+                                                           // Zero interval is a misuse; ask for `off` instead.
         assert!(HeartbeatConfig::from_str("0s").is_err());
         assert!(HeartbeatConfig::from_str("0m").is_err());
         // Empty.
@@ -3485,7 +3640,10 @@ updated_at: 2026-06-19T00:00:00Z
         let cfg = HeartbeatConfig::every(Duration::from_secs(180));
         let y = serde_yaml::to_string(&cfg).unwrap();
         assert!(y.contains("3m"), "got {y:?}");
-        assert!(!y.contains("interval"), "default cap must stay a scalar: {y:?}");
+        assert!(
+            !y.contains("interval"),
+            "default cap must stay a scalar: {y:?}"
+        );
         let back: HeartbeatConfig = serde_yaml::from_str(&y).unwrap();
         assert_eq!(back, cfg);
 
@@ -3510,7 +3668,10 @@ updated_at: 2026-06-19T00:00:00Z
             max: Duration::from_secs(1_800),
         };
         let y = serde_yaml::to_string(&cfg).unwrap();
-        assert!(y.contains("interval"), "non-default cap must emit a map: {y:?}");
+        assert!(
+            y.contains("interval"),
+            "non-default cap must emit a map: {y:?}"
+        );
         assert!(y.contains("2m"), "got {y:?}");
         assert!(y.contains("30m"), "got {y:?}");
         let back: HeartbeatConfig = serde_yaml::from_str(&y).unwrap();
@@ -3538,8 +3699,7 @@ updated_at: 2026-06-19T00:00:00Z
             }
         );
         // Both set.
-        let cfg: HeartbeatConfig =
-            serde_yaml::from_str("interval: 1m\nmax: 10m\n").unwrap();
+        let cfg: HeartbeatConfig = serde_yaml::from_str("interval: 1m\nmax: 10m\n").unwrap();
         assert_eq!(
             cfg,
             HeartbeatConfig::On {
@@ -3548,8 +3708,7 @@ updated_at: 2026-06-19T00:00:00Z
             }
         );
         // `interval: off` inside the map disables regardless of `max`.
-        let cfg: HeartbeatConfig =
-            serde_yaml::from_str("interval: \"off\"\nmax: 30m\n").unwrap();
+        let cfg: HeartbeatConfig = serde_yaml::from_str("interval: \"off\"\nmax: 30m\n").unwrap();
         assert_eq!(cfg, HeartbeatConfig::Off);
     }
 
@@ -3585,6 +3744,7 @@ updated_at: 2026-06-19T00:00:00Z
         let spec = AgentRunnerSpec {
             command: "claude".into(),
             flags: vec![],
+            prompt_injection: None,
             dialog_signatures: vec![],
         };
         assert_eq!(
@@ -3598,6 +3758,7 @@ updated_at: 2026-06-19T00:00:00Z
         let spec = AgentRunnerSpec {
             command: "claude".into(),
             flags: vec![],
+            prompt_injection: None,
             dialog_signatures: vec![custom.clone()],
         };
         assert_eq!(spec.effective_dialog_signatures(), vec![custom]);
@@ -3608,6 +3769,7 @@ updated_at: 2026-06-19T00:00:00Z
         let spec = AgentRunnerSpec {
             command: "claude".into(),
             flags: vec![],
+            prompt_injection: None,
             dialog_signatures: vec![DialogSignature::new("usage-limit", "Stop and wait")],
         };
         let y = serde_yaml::to_string(&spec).unwrap();
@@ -3616,11 +3778,42 @@ updated_at: 2026-06-19T00:00:00Z
         assert_eq!(back.dialog_signatures, spec.dialog_signatures);
 
         // Absent in YAML → empty (and elided on the way back out).
-        let spec2: AgentRunnerSpec =
-            serde_yaml::from_str("command: claude\nflags: []\n").unwrap();
+        let spec2: AgentRunnerSpec = serde_yaml::from_str("command: claude\nflags: []\n").unwrap();
         assert!(spec2.dialog_signatures.is_empty());
         let y2 = serde_yaml::to_string(&spec2).unwrap();
-        assert!(!y2.contains("dialog_signatures"), "should be elided: {y2:?}");
+        assert!(
+            !y2.contains("dialog_signatures"),
+            "should be elided: {y2:?}"
+        );
+    }
+
+    #[test]
+    fn prompt_injection_defaults_and_round_trips_through_yaml() {
+        let claude: AgentRunnerSpec = serde_yaml::from_str("command: claude\n").unwrap();
+        assert_eq!(
+            claude.effective_prompt_injection(),
+            PromptInjectionSpec::positional_arg()
+        );
+        let aider: AgentRunnerSpec = serde_yaml::from_str("command: aider\n").unwrap();
+        assert_eq!(
+            aider.effective_prompt_injection(),
+            PromptInjectionSpec::flag_file("--message-file")
+        );
+        let unknown: AgentRunnerSpec = serde_yaml::from_str("command: custom-agent\n").unwrap();
+        assert_eq!(
+            unknown.effective_prompt_injection(),
+            PromptInjectionSpec::stdin()
+        );
+
+        let spec: AgentRunnerSpec =
+            serde_yaml::from_str("command: repl-only\nprompt_injection: { kind: paste }\n")
+                .unwrap();
+        assert_eq!(
+            spec.effective_prompt_injection(),
+            PromptInjectionSpec::paste()
+        );
+        let y = serde_yaml::to_string(&spec).unwrap();
+        assert!(y.contains("prompt_injection"), "got {y:?}");
     }
 
     #[test]
@@ -3671,10 +3864,7 @@ agent_runners:
 heartbeat: 90s
 "#;
         let p: Project = serde_yaml::from_str(yaml).unwrap();
-        assert_eq!(
-            p.heartbeat,
-            HeartbeatConfig::every(Duration::from_secs(90))
-        );
+        assert_eq!(p.heartbeat, HeartbeatConfig::every(Duration::from_secs(90)));
 
         // Map form: both bounds set explicitly.
         let yaml = r#"
@@ -3736,7 +3926,9 @@ heartbeat: 180
     #[test]
     fn merge_strategy_yaml_wire_form_is_snake_case() {
         assert_eq!(
-            serde_yaml::to_string(&MergeStrategy::Squash).unwrap().trim(),
+            serde_yaml::to_string(&MergeStrategy::Squash)
+                .unwrap()
+                .trim(),
             "squash"
         );
         assert_eq!(
@@ -3744,10 +3936,16 @@ heartbeat: 180
             "merge"
         );
         assert_eq!(
-            serde_yaml::to_string(&MergeStrategy::Rebase).unwrap().trim(),
+            serde_yaml::to_string(&MergeStrategy::Rebase)
+                .unwrap()
+                .trim(),
             "rebase"
         );
-        for s in [MergeStrategy::Squash, MergeStrategy::Merge, MergeStrategy::Rebase] {
+        for s in [
+            MergeStrategy::Squash,
+            MergeStrategy::Merge,
+            MergeStrategy::Rebase,
+        ] {
             let y = serde_yaml::to_string(&s).unwrap();
             let back: MergeStrategy = serde_yaml::from_str(&y).unwrap();
             assert_eq!(s, back);
@@ -4080,6 +4278,7 @@ git:
             AgentRunnerSpec {
                 command: "claude".into(),
                 flags: vec!["--verbose".into()],
+                prompt_injection: None,
                 dialog_signatures: vec![],
             },
         );
@@ -4094,9 +4293,7 @@ git:
             github_url: Some("git@github.com:example/shelbi.git".into()),
             workspace_poll_interval_secs: 7,
             workspace_permissions_mode: "acceptEdits".into(),
-            workspace_settings_template: Some(PathBuf::from(
-                "workspace-settings.json.template",
-            )),
+            workspace_settings_template: Some(PathBuf::from("workspace-settings.json.template")),
             zen: ZenConfig {
                 checks: ZenChecks {
                     local: vec!["cargo test".into()],
@@ -4256,7 +4453,16 @@ agent_runners:
         }
         // Sample assertions: the shared half must carry the fields the
         // task description explicitly enumerates.
-        for expected in ["name", "default_branch", "orchestrator", "agent_runners", "zen", "git", "heartbeat", "config_mode"] {
+        for expected in [
+            "name",
+            "default_branch",
+            "orchestrator",
+            "agent_runners",
+            "zen",
+            "git",
+            "heartbeat",
+            "config_mode",
+        ] {
             assert!(
                 map.contains_key(serde_yaml::Value::String(expected.into())),
                 "shared YAML missing `{expected}`"

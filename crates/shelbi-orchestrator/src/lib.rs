@@ -1499,6 +1499,7 @@ mod pane_cmd_tests {
         let spec = shelbi_core::AgentRunnerSpec {
             command: "claude".into(),
             flags: vec![],
+            prompt_injection: None,
             dialog_signatures: vec![],
         };
         let out = launch_with_bootstrap(&spec, "myapp", std::path::Path::new("/tmp/myapp"));
@@ -1540,6 +1541,7 @@ mod pane_cmd_tests {
         let spec = shelbi_core::AgentRunnerSpec {
             command: "claude".into(),
             flags: vec!["--permission-mode".into(), "auto".into()],
+            prompt_injection: None,
             dialog_signatures: vec![],
         };
         let out = launch_with_bootstrap(&spec, "myapp", std::path::Path::new("/tmp/myapp"));
@@ -1568,6 +1570,7 @@ mod pane_cmd_tests {
         let spec = shelbi_core::AgentRunnerSpec {
             command: "codex".into(),
             flags: vec!["--print".into()],
+            prompt_injection: None,
             dialog_signatures: vec![],
         };
         let out = launch_with_bootstrap(
@@ -1610,6 +1613,7 @@ mod pane_cmd_tests {
         let spec = shelbi_core::AgentRunnerSpec {
             command: "aider".into(),
             flags: vec!["--foo".into()],
+            prompt_injection: None,
             dialog_signatures: vec![],
         };
         let out = launch_with_bootstrap(&spec, "myapp", std::path::Path::new("/tmp/myapp"));
@@ -1623,6 +1627,7 @@ mod pane_cmd_tests {
         let spec = shelbi_core::AgentRunnerSpec {
             command: "/opt/homebrew/bin/claude".into(),
             flags: vec![],
+            prompt_injection: None,
             dialog_signatures: vec![],
         };
         let out = launch_with_bootstrap(&spec, "myapp", std::path::Path::new("/tmp/myapp"));
@@ -1637,6 +1642,7 @@ mod pane_cmd_tests {
         let spec = shelbi_core::AgentRunnerSpec {
             command: "/opt/homebrew/bin/codex".into(),
             flags: vec![],
+            prompt_injection: None,
             dialog_signatures: vec![],
         };
         let out = launch_with_bootstrap(&spec, "myapp", std::path::Path::new("/tmp/myapp"));

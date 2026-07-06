@@ -299,7 +299,11 @@ fn resolve_pr_target(
         project.base_branch(),
         task,
         target_override,
-        |parent_id| shelbi_state::load_task(project_name, parent_id).ok().map(|tf| tf.task),
+        |parent_id| {
+            shelbi_state::load_task(project_name, parent_id)
+                .ok()
+                .map(|tf| tf.task)
+        },
     ))
 }
 
@@ -604,8 +608,7 @@ pub fn restack(
     // The child branch doesn't come through `require_branch`, so guard it
     // here — it's spliced into `--force-with-lease={branch}` and
     // `HEAD:{branch}`, where a crafted value becomes a git option.
-    validate_branch(&child_branch)
-        .map_err(|e| Error::Other(format!("task `{task_id}`: {e}")))?;
+    validate_branch(&child_branch).map_err(|e| Error::Other(format!("task `{task_id}`: {e}")))?;
 
     if let Some(workspace_name) = workspace_holding_branch(project, &child_branch)? {
         return Ok(RestackOutcome::Skipped {
@@ -646,7 +649,15 @@ pub fn restack(
     run_or_command_err(
         &host,
         &wt,
-        &["git", "fetch", "origin", "--", &child_branch, from_base, &onto],
+        &[
+            "git",
+            "fetch",
+            "origin",
+            "--",
+            &child_branch,
+            from_base,
+            &onto,
+        ],
         || format!("git -C {wt} fetch origin -- {child_branch} {from_base} {onto}"),
     )?;
 
@@ -723,11 +734,7 @@ pub fn restack(
         // best-effort — even on failure we still want to surface the
         // skip rather than tangle the cleanup with the conflict report.
         let _ = run_in_dir(&host, &tmp, &["git", "rebase", "--abort"]);
-        let _ = run_in_dir(
-            &host,
-            &wt,
-            &["git", "worktree", "remove", "--force", &tmp],
-        );
+        let _ = run_in_dir(&host, &wt, &["git", "worktree", "remove", "--force", &tmp]);
         let _ = std::fs::remove_dir_all(&tmp_path);
         return Ok(RestackOutcome::Skipped {
             task_id,
@@ -760,11 +767,7 @@ pub fn restack(
 
     // Tear the worktree down before bailing on a push error so we don't
     // leak it; the error is what the caller gets, regardless.
-    let _ = run_in_dir(
-        &host,
-        &wt,
-        &["git", "worktree", "remove", "--force", &tmp],
-    );
+    let _ = run_in_dir(&host, &wt, &["git", "worktree", "remove", "--force", &tmp]);
     let _ = std::fs::remove_dir_all(&tmp_path);
 
     if !push_status.success() {
@@ -786,11 +789,7 @@ pub fn restack(
     let retargeted_pr = match lookup_open_pr_tolerant(&host, &wt, &child_branch)? {
         Some(pr) => {
             let pr_str = pr.to_string();
-            let out = run_in_dir(
-                &host,
-                &wt,
-                &["gh", "pr", "edit", &pr_str, "--base", &onto],
-            )?;
+            let out = run_in_dir(&host, &wt, &["gh", "pr", "edit", &pr_str, "--base", &onto])?;
             if !out.status.success() {
                 return Err(Error::Command {
                     cmd: format!("gh pr edit {pr_str} --base {onto}"),
@@ -856,7 +855,13 @@ fn unique_temp_worktree_path(kind: &str, id: &str) -> std::path::PathBuf {
 /// repo.
 fn sanitize_path_segment(s: &str) -> String {
     s.chars()
-        .map(|c| if c.is_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
+        .map(|c| {
+            if c.is_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
         .collect()
 }
 
@@ -868,12 +873,7 @@ fn sanitize_path_segment(s: &str) -> String {
 /// Returns `None` when the PR reports `MERGED` but GitHub hadn't recorded
 /// the merge commit yet after the polling window — see
 /// [`wait_for_merge_commit_sha`].
-fn merge_via_pr(
-    host: &Host,
-    wt: &str,
-    pr: u64,
-    strategy: MergeStrategy,
-) -> Result<Option<String>> {
+fn merge_via_pr(host: &Host, wt: &str, pr: u64, strategy: MergeStrategy) -> Result<Option<String>> {
     let pr_str = pr.to_string();
     let strategy_flag = strategy.gh_flag();
     let out = run_in_dir(host, wt, &["gh", "pr", "merge", &pr_str, strategy_flag])?;
@@ -1026,13 +1026,7 @@ fn merge_and_push_in_worktree(
             run_or_command_err(
                 host,
                 tmp,
-                &[
-                    "git",
-                    "merge",
-                    "--no-ff",
-                    "--no-edit",
-                    &origin_branch,
-                ],
+                &["git", "merge", "--no-ff", "--no-edit", &origin_branch],
                 || format!("git -C {tmp} merge --no-ff origin/{branch}"),
             )?;
         }
@@ -1278,7 +1272,11 @@ fn worktree_branch(host: &Host, wt: &str) -> Result<Option<String>> {
 
 fn local_branch_exists(host: &Host, wt: &str, branch: &str) -> Result<bool> {
     let ref_name = format!("refs/heads/{branch}");
-    let out = run_in_dir(host, wt, &["git", "rev-parse", "--verify", "--quiet", &ref_name])?;
+    let out = run_in_dir(
+        host,
+        wt,
+        &["git", "rev-parse", "--verify", "--quiet", &ref_name],
+    )?;
     match out.status.code() {
         // Ref resolves → the branch exists.
         Some(0) => Ok(true),
@@ -1392,17 +1390,18 @@ mod tests {
             let mut t = bare_task("evil");
             t.branch = Some(bad.into());
             let err = require_branch(&t).unwrap_err();
-            assert!(
-                err.to_string().contains("invalid branch"),
-                "{bad}: {err}"
-            );
+            assert!(err.to_string().contains("invalid branch"), "{bad}: {err}");
         }
     }
 
     // --- git-backed primitives against fixture repos ----------------------
 
     fn run_git(cwd: &std::path::Path, args: &[&str]) {
-        let status = Command::new("git").current_dir(cwd).args(args).status().unwrap();
+        let status = Command::new("git")
+            .current_dir(cwd)
+            .args(args)
+            .status()
+            .unwrap();
         assert!(status.success(), "git {args:?} failed in {}", cwd.display());
     }
 
@@ -1465,18 +1464,18 @@ mod tests {
         std::fs::create_dir_all(wt_path.parent().unwrap()).unwrap();
         run_git(
             repo,
-            &[
-                "worktree",
-                "add",
-                wt_path.to_str().unwrap(),
-                branch,
-            ],
+            &["worktree", "add", wt_path.to_str().unwrap(), branch],
         );
 
         let mut runners = BTreeMap::new();
         runners.insert(
             "claude".to_string(),
-            AgentRunnerSpec { command: "claude".into(), flags: vec![], dialog_signatures: vec![] },
+            AgentRunnerSpec {
+                command: "claude".into(),
+                flags: vec![],
+                prompt_injection: None,
+                dialog_signatures: vec![],
+            },
         );
         Project {
             name: "fixture".into(),
@@ -1490,7 +1489,9 @@ mod tests {
                 host: None,
                 tags: Vec::new(),
             }],
-            orchestrator: OrchestratorSpec { runner: "claude".into() },
+            orchestrator: OrchestratorSpec {
+                runner: "claude".into(),
+            },
             agent_runners: runners,
             editor: None,
             github_url: None,
@@ -1520,7 +1521,9 @@ mod tests {
         assert_eq!(holder.as_deref(), Some("alice"));
 
         // A branch nobody holds returns None.
-        assert!(workspace_holding_branch(&project, "other").unwrap().is_none());
+        assert!(workspace_holding_branch(&project, "other")
+            .unwrap()
+            .is_none());
     }
 
     #[test]
@@ -1532,7 +1535,12 @@ mod tests {
         let mut runners = BTreeMap::new();
         runners.insert(
             "claude".to_string(),
-            AgentRunnerSpec { command: "claude".into(), flags: vec![], dialog_signatures: vec![] },
+            AgentRunnerSpec {
+                command: "claude".into(),
+                flags: vec![],
+                prompt_injection: None,
+                dialog_signatures: vec![],
+            },
         );
         let project = Project {
             name: "fixture".into(),
@@ -1546,7 +1554,9 @@ mod tests {
                 host: None,
                 tags: Vec::new(),
             }],
-            orchestrator: OrchestratorSpec { runner: "claude".into() },
+            orchestrator: OrchestratorSpec {
+                runner: "claude".into(),
+            },
             agent_runners: runners,
             editor: None,
             github_url: None,
@@ -1565,7 +1575,9 @@ mod tests {
             detected_shapes: Vec::new(),
             git: shelbi_core::GitConfig::default(),
         };
-        assert!(workspace_holding_branch(&project, "feature").unwrap().is_none());
+        assert!(workspace_holding_branch(&project, "feature")
+            .unwrap()
+            .is_none());
     }
 
     fn task_on_branch(id: &str, branch: &str) -> Task {
@@ -1603,7 +1615,12 @@ mod tests {
         let mut runners = BTreeMap::new();
         runners.insert(
             "claude".to_string(),
-            AgentRunnerSpec { command: "claude".into(), flags: vec![], dialog_signatures: vec![] },
+            AgentRunnerSpec {
+                command: "claude".into(),
+                flags: vec![],
+                prompt_injection: None,
+                dialog_signatures: vec![],
+            },
         );
         let project = Project {
             name: "fixture".into(),
@@ -1617,7 +1634,9 @@ mod tests {
                 host: None,
                 tags: Vec::new(),
             }],
-            orchestrator: OrchestratorSpec { runner: "claude".into() },
+            orchestrator: OrchestratorSpec {
+                runner: "claude".into(),
+            },
             agent_runners: runners,
             editor: None,
             github_url: None,
@@ -1647,7 +1666,10 @@ mod tests {
         run_git(&local, &["init", "-q", "-b", "main", "."]);
         run_git(&local, &["config", "user.email", "test@example.com"]);
         run_git(&local, &["config", "user.name", "Test"]);
-        run_git(&local, &["remote", "add", "origin", remote.to_str().unwrap()]);
+        run_git(
+            &local,
+            &["remote", "add", "origin", remote.to_str().unwrap()],
+        );
         std::fs::write(local.join("README.md"), "hi\n").unwrap();
         run_git(&local, &["add", "README.md"]);
         run_git(&local, &["commit", "-q", "-m", "init"]);
@@ -1665,7 +1687,12 @@ mod tests {
         let mut runners = BTreeMap::new();
         runners.insert(
             "claude".to_string(),
-            AgentRunnerSpec { command: "claude".into(), flags: vec![], dialog_signatures: vec![] },
+            AgentRunnerSpec {
+                command: "claude".into(),
+                flags: vec![],
+                prompt_injection: None,
+                dialog_signatures: vec![],
+            },
         );
         let project = Project {
             name: "fixture".into(),
@@ -1679,7 +1706,9 @@ mod tests {
                 host: None,
                 tags: Vec::new(),
             }],
-            orchestrator: OrchestratorSpec { runner: "claude".into() },
+            orchestrator: OrchestratorSpec {
+                runner: "claude".into(),
+            },
             agent_runners: runners,
             editor: None,
             github_url: None,
@@ -1787,7 +1816,11 @@ mod tests {
         // user signal. It must beat both the parent chain and the project
         // default — that's how a workflow declares an intermediate hop.
         let child = child("ch", &["par"]);
-        let parents = lookup(vec![parent("par", Column::in_progress(), Some("shelbi/par"))]);
+        let parents = lookup(vec![parent(
+            "par",
+            Column::in_progress(),
+            Some("shelbi/par"),
+        )]);
         let target = resolve_pr_target_from("main", &child, Some("develop"), parents);
         assert_eq!(target, "develop");
     }
@@ -1950,7 +1983,12 @@ mod tests {
         let mut runners = BTreeMap::new();
         runners.insert(
             "claude".to_string(),
-            AgentRunnerSpec { command: "claude".into(), flags: vec![], dialog_signatures: vec![] },
+            AgentRunnerSpec {
+                command: "claude".into(),
+                flags: vec![],
+                prompt_injection: None,
+                dialog_signatures: vec![],
+            },
         );
         Project {
             name: "fixture".into(),
@@ -1964,7 +2002,9 @@ mod tests {
                 host: None,
                 tags: Vec::new(),
             }],
-            orchestrator: OrchestratorSpec { runner: "claude".into() },
+            orchestrator: OrchestratorSpec {
+                runner: "claude".into(),
+            },
             agent_runners: runners,
             editor: None,
             github_url: None,
@@ -2017,14 +2057,11 @@ mod tests {
 
         // The squashed change landed on origin/main — integration is a
         // remote-side fact now that the merge runs in a temp worktree.
-        let remote_sha = run_capture_stdout(
-            &Host::Local,
-            &wt,
-            &["git", "rev-parse", "origin/main"],
-        )
-        .unwrap()
-        .trim()
-        .to_string();
+        let remote_sha =
+            run_capture_stdout(&Host::Local, &wt, &["git", "rev-parse", "origin/main"])
+                .unwrap()
+                .trim()
+                .to_string();
         assert_eq!(remote_sha, sha);
 
         // The squash commit is a single new commit on origin/main (the
@@ -2145,19 +2182,14 @@ mod tests {
         // The rebase gate fires before merge() reaches the child-task
         // enumeration, so it never touches shelbi_state. No SHELBI_HOME
         // dance needed here.
-        let err = merge(&project, "fixture", &task_on_branch("t", "feature"), None)
-            .unwrap_err();
+        let err = merge(&project, "fixture", &task_on_branch("t", "feature"), None).unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("rebase"), "{msg}");
 
         // Tree untouched — main still at the initial commit.
         let wt = local.to_string_lossy().into_owned();
-        let log = run_capture_stdout(
-            &Host::Local,
-            &wt,
-            &["git", "log", "main", "--format=%s"],
-        )
-        .unwrap();
+        let log =
+            run_capture_stdout(&Host::Local, &wt, &["git", "log", "main", "--format=%s"]).unwrap();
         assert_eq!(log.trim(), "init");
     }
 
@@ -2292,7 +2324,11 @@ mod tests {
             &["git", "rev-parse", "--abbrev-ref", "HEAD"],
         )
         .unwrap();
-        assert_eq!(branch_after.trim(), "parked", "checked-out branch must not change");
+        assert_eq!(
+            branch_after.trim(),
+            "parked",
+            "checked-out branch must not change"
+        );
         let head_after =
             run_capture_stdout(&Host::Local, &wt, &["git", "rev-parse", "HEAD"]).unwrap();
         assert_eq!(head_after, head_before, "HEAD must not move");
@@ -2396,9 +2432,12 @@ mod tests {
                 &["git", "show", "--name-only", "--format=", sha],
             )
             .unwrap();
-            let files: Vec<&str> =
-                touched.lines().filter(|l| !l.trim().is_empty()).collect();
-            assert_eq!(files, vec![expected_file], "commit {subject} must touch only its own file");
+            let files: Vec<&str> = touched.lines().filter(|l| !l.trim().is_empty()).collect();
+            assert_eq!(
+                files,
+                vec![expected_file],
+                "commit {subject} must touch only its own file"
+            );
         }
 
         // The shared work_dir came through clean and unmoved.
@@ -2503,7 +2542,10 @@ mod tests {
     fn advance_main_with_parent_squashed(local: &std::path::Path) {
         run_git(local, &["checkout", "main"]);
         run_git(local, &["merge", "--squash", "parent"]);
-        run_git(local, &["commit", "-q", "-m", "shelbi: squash parent into main"]);
+        run_git(
+            local,
+            &["commit", "-q", "-m", "shelbi: squash parent into main"],
+        );
         run_git(local, &["push", "origin", "main"]);
     }
 
@@ -2846,8 +2888,7 @@ mod tests {
         unrelated.branch = Some("solo-branch".into());
         write_task_file("fixture", &unrelated);
 
-        let outcomes =
-            restack_children(&project, "fixture", &parent, "parent", "main");
+        let outcomes = restack_children(&project, "fixture", &parent, "parent", "main");
 
         // Exactly one outcome — for `ch`.
         assert_eq!(outcomes.len(), 1, "{outcomes:?}");
@@ -3015,8 +3056,7 @@ mod tests {
         parent.branch = Some("parent".into());
         write_task_file("fixture", &parent);
 
-        let outcomes =
-            restack_children(&project, "fixture", &parent, "parent", "main");
+        let outcomes = restack_children(&project, "fixture", &parent, "parent", "main");
         assert!(outcomes.is_empty(), "{outcomes:?}");
 
         std::env::remove_var("SHELBI_HOME");
@@ -3045,7 +3085,10 @@ mod tests {
         let (_tmp, _remote, local) = fixture_repo_with_stacked_branches();
         run_git(&local, &["checkout", "-b", "develop", "main"]);
         run_git(&local, &["merge", "--squash", "parent"]);
-        run_git(&local, &["commit", "-q", "-m", "squash parent into develop"]);
+        run_git(
+            &local,
+            &["commit", "-q", "-m", "squash parent into develop"],
+        );
         run_git(&local, &["push", "-u", "origin", "develop"]);
         run_git(&local, &["checkout", "main"]);
 
@@ -3069,11 +3112,8 @@ exit 0
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(
-                bin.join("gh"),
-                std::fs::Permissions::from_mode(0o755),
-            )
-            .unwrap();
+            std::fs::set_permissions(bin.join("gh"), std::fs::Permissions::from_mode(0o755))
+                .unwrap();
         }
         std::fs::write(
             stub.path().join(".profile"),
@@ -3176,8 +3216,7 @@ exit 0
         child.depends_on = vec!["par".into()];
         write_task_file("fixture", &child);
 
-        let outcomes =
-            restack_children(&project, "fixture", &parent, "parent", "main");
+        let outcomes = restack_children(&project, "fixture", &parent, "parent", "main");
         assert_eq!(outcomes.len(), 1, "{outcomes:?}");
         match &outcomes[0] {
             RestackOutcome::Skipped { task_id, reason } => {
