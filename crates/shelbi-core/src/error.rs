@@ -61,7 +61,7 @@ pub enum Error {
 
     #[error(
         "task id `{id}` is too long: {len} bytes (max {max}); git ref names \
-         (`shelbi/<id>`) must stay under GitHub's 255-byte limit"
+         must leave room for a generated branch prefix under GitHub's 255-byte ref limit"
     )]
     TaskIdTooLong { id: String, len: usize, max: usize },
 

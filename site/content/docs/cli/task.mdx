@@ -70,7 +70,7 @@ Pass `--status todo` to skip triage when you're already sure.
 | `--depends-on <ID>` | string (repeatable) | — | Block this task on another. Repeat for multiple deps. |
 | `--prefers-machine <NAME>` | string | — | Hint for the orchestrator to route this task to a workspace on a specific machine. |
 | `--workflow <NAME>` | string | project default | Workflow this task runs under. Names a file in `workflows/<NAME>.yaml`. Omit to inherit the project's default workflow. |
-| `--branch <BRANCH>` | string | `shelbi/<task-id>` at dispatch | Pre-fill the task's `branch:` frontmatter field. Omit to let the orchestrator cut `shelbi/<task-id>` off the resolved base branch at dispatch time; supply a value to point the task at an existing branch (the *release task* pattern). |
+| `--branch <BRANCH>` | string | generated at dispatch | Pre-fill the task's `branch:` frontmatter field. Omit to let the orchestrator generate `<prefix>/<task-id>` from workflow config, project config, or your GitHub username; supply a value to point the task at an existing branch (the *release task* pattern). |
 
 ## list
 
@@ -164,8 +164,8 @@ shelbi task start [OPTIONS] <ID>
 
 Launch the assigned workspace on this task. Three things happen in one shot:
 
-1. The workspace's worktree is checked out to the task's branch (defaults
-   to `shelbi/<task-id>`).
+1. The workspace's worktree is checked out to the task's branch (generated
+   from workflow config, project config, or your GitHub username when unset).
 2. Any existing pane for that workspace is killed. Context is wiped clean.
 3. The runner relaunches with the task prompt and the column transitions
    into `in_progress`.
@@ -176,7 +176,7 @@ the orchestrator runs when a task hits `todo`.
 | Flag | Type | Default | Description |
 | --- | --- | --- | --- |
 | `--workspace <WORKSPACE>` | string | task's `assigned_to` | Assign and launch in one call. |
-| `--branch <BRANCH>` | string | `shelbi/<task-id>` | Override the default branch name. |
+| `--branch <BRANCH>` | string | generated | Override the default branch name. |
 | `--reason <REASON>` | string | `user:cli:start` | Reason tag recorded in `~/.shelbi/events.log` when the column transitions to `in_progress`. |
 
 ## resume

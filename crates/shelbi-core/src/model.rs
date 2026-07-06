@@ -495,6 +495,12 @@ pub struct GitConfig {
     /// `None`, callers fall back to [`Project::default_branch`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub base_branch: Option<String>,
+    /// Prefix for generated task branches. When a task omits `branch:`,
+    /// Shelbi cuts `<branch_prefix>/<task-id>`. Workflow-level `git:`
+    /// blocks may override this field; when no config supplies it, the
+    /// orchestrator falls back to the authenticated GitHub username.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub branch_prefix: Option<String>,
     /// How `shelbi merge` (and Zen Mode's auto-merge path) integrates a
     /// workspace branch back into [`Project::base_branch`]. Default
     /// [`MergeStrategy::Squash`] preserves the historical behavior.
@@ -661,6 +667,9 @@ impl Project {
     pub fn validate_workspaces(&self) -> crate::Result<()> {
         if let Some(name) = &self.default_workflow {
             validate_workflow_name(name)?;
+        }
+        if let Some(prefix) = &self.git.branch_prefix {
+            validate_branch_prefix(prefix)?;
         }
         if self.runner(&self.orchestrator.runner).is_none() {
             return Err(crate::Error::UnknownRunner(
@@ -1349,7 +1358,7 @@ pub struct Task {
     pub workflow: Option<String>,
     /// The git branch this task operates on. Two modes (`Plans/workflows.md`
     /// §12): omitted at creation means the orchestrator will cut
-    /// `shelbi/<task-id>` off the resolved base branch when the task moves
+    /// `<prefix>/<task-id>` off the resolved base branch when the task moves
     /// to `InProgress` and write the name back here; pre-filled at creation
     /// means use that branch as-is (the *release task* pattern).
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1613,13 +1622,13 @@ fn levenshtein(a: &str, b: &str) -> usize {
 /// every new project (`workflows/default.yaml`).
 pub const DEFAULT_WORKFLOW_NAME: &str = "default";
 
-/// Max byte length of a task id. The workspace branch is `shelbi/<id>` (7-byte
-/// prefix) and GitHub caps ref names at 255 bytes; we leave a 15-byte buffer
-/// so refs derived from the id stay at most 240 bytes.
+/// Max byte length of a task id. GitHub caps ref names at 255 bytes; we leave
+/// a small buffer so refs derived from the id plus a configured/user prefix
+/// stay pushable in normal use.
 pub const MAX_TASK_ID_LEN: usize = 233;
 
 /// Same character set as agent ids (kebab/snake alphanumeric), plus a length
-/// cap so the derived `shelbi/<id>` branch stays pushable to GitHub.
+/// cap so the derived task branch stays pushable to GitHub.
 pub fn validate_task_id(s: &str) -> crate::Result<()> {
     validate_agent_id(s)?;
     if s.len() > MAX_TASK_ID_LEN {
@@ -1644,7 +1653,7 @@ pub fn validate_workflow_name(s: &str) -> crate::Result<()> {
 /// shell-escapes it (so it survives as one word), but escaping alone doesn't
 /// stop git from reading a leading `-` as a flag (argument injection). So we
 /// pin the value to the task-id character set plus `/` (branch names are
-/// conventionally slash-namespaced, e.g. `shelbi/<id>` or `feature/foo`):
+/// conventionally slash-namespaced, e.g. `user/<id>` or `feature/foo`):
 /// ASCII alphanumerics, `-`, `_`, `/`, and a required alphanumeric first
 /// character. That rejects `-`-leading flags, `..`, and every shell/dash
 /// metacharacter before the value can reach git. Length is bounded by
@@ -1659,10 +1668,26 @@ pub fn validate_branch(s: &str) -> crate::Result<()> {
     let chars_ok = s
         .chars()
         .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '/'));
-    if !first_ok || !chars_ok || s.len() > 255 {
+    if !first_ok
+        || !chars_ok
+        || s.len() > 255
+        || s.contains("..")
+        || s.contains("//")
+        || s.ends_with('/')
+    {
         return Err(crate::Error::InvalidBranch(s.to_string()));
     }
     Ok(())
+}
+
+/// Validate a configured/generated branch prefix before it is combined with
+/// a task id. Prefixes share the branch character set, may be namespaced with
+/// `/`, and must compose predictably as `<prefix>/<task-id>`.
+pub fn validate_branch_prefix(s: &str) -> crate::Result<()> {
+    if s.is_empty() || s.ends_with('/') {
+        return Err(crate::Error::InvalidBranch(s.to_string()));
+    }
+    validate_branch(s)
 }
 
 /// Validate a project name used as a directory component under
@@ -2092,7 +2117,7 @@ mod duration_secs {
 ///
 /// Uppercase is rejected — not merely conventional. Ids become
 /// case-preserving filesystem paths (`<id>.md`) and git refs
-/// (`shelbi/<id>`), and macOS's default case-insensitive APFS/HFS+ and
+/// (`<prefix>/<id>`), and macOS's default case-insensitive APFS/HFS+ and
 /// git's `core.ignorecase=true` treat `Fix-Login` and `fix-login` as the
 /// same path. Two ids differing only in case would silently overwrite one
 /// another, so we pin the id to a single case at the validation
@@ -2143,7 +2168,7 @@ mod tests {
     #[test]
     fn task_id_rejects_uppercase() {
         // validate_task_id delegates to validate_agent_id, so the same
-        // case rule guards the `<id>.md` file and `shelbi/<id>` branch.
+        // case rule guards the `<id>.md` file and generated task branch.
         assert!(validate_task_id("fix-login").is_ok());
         assert!(validate_task_id("Fix-Login").is_err());
     }
@@ -3941,6 +3966,7 @@ heartbeat: 180
     fn git_config_defaults_to_squash_and_no_base_branch_override() {
         let g = GitConfig::default();
         assert!(g.base_branch.is_none());
+        assert!(g.branch_prefix.is_none());
         assert_eq!(g.merge_strategy, MergeStrategy::Squash);
     }
 
@@ -4013,10 +4039,12 @@ agent_runners:
   claude: { command: claude, flags: [] }
 git:
   base_branch: trunk
+  branch_prefix: team
   merge_strategy: rebase
 "#;
         let p: Project = serde_yaml::from_str(yaml).unwrap();
         assert_eq!(p.git.base_branch.as_deref(), Some("trunk"));
+        assert_eq!(p.git.branch_prefix.as_deref(), Some("team"));
         assert_eq!(p.git.merge_strategy, MergeStrategy::Rebase);
         // base_branch() prefers git.base_branch over default_branch when
         // both are present.
@@ -4052,6 +4080,7 @@ git:
         let cfg = GitConfig {
             base_branch: None,
             merge_strategy: MergeStrategy::Merge,
+            ..Default::default()
         };
         let y = serde_yaml::to_string(&cfg).unwrap();
         // base_branch is None → must not surface on the wire.
@@ -4063,6 +4092,7 @@ git:
         let cfg = GitConfig {
             base_branch: Some("trunk".into()),
             merge_strategy: MergeStrategy::Squash,
+            ..Default::default()
         };
         let y = serde_yaml::to_string(&cfg).unwrap();
         assert!(y.contains("base_branch: trunk"), "got: {y}");
@@ -4327,6 +4357,7 @@ git:
             git: GitConfig {
                 base_branch: Some("trunk".into()),
                 merge_strategy: MergeStrategy::Rebase,
+                ..Default::default()
             },
             repo: "/home/dev/shelbi".into(),
             machines: vec![Machine {

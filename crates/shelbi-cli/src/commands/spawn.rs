@@ -19,7 +19,7 @@ pub struct Args {
     pub runner: String,
     /// Initial prompt to send to the agent.
     pub prompt: String,
-    /// Override the default branch name (`shelbi/<id>`).
+    /// Override the generated branch name.
     #[arg(long)]
     pub branch: Option<String>,
     /// tmux session to attach the workspace window to. Defaults to
