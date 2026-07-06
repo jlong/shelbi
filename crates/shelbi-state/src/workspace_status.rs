@@ -1156,7 +1156,7 @@ mod tests {
         std::env::set_var("SHELBI_HOME", &home);
 
         let sock = PathBuf::from(format!(
-            "shelbi-cb-{}-{}.sock",
+            "/tmp/sb-cb-{}-{}.sock",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -1188,6 +1188,69 @@ mod tests {
         assert_eq!(envelope.kind, EventKind::Heartbeat);
         assert_eq!(envelope.project.as_deref(), Some("demo"));
         assert!(envelope.line.contains("project=demo heartbeat"));
+
+        let log = std::fs::read_to_string(events_log_path().unwrap()).unwrap();
+        assert_eq!(log.trim_end(), envelope.line);
+
+        std::env::remove_var(ORCH_EVENT_CALLBACK_SOCK_ENV);
+        std::env::remove_var("SHELBI_HOME");
+        let _ = std::fs::remove_file(&sock);
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn callback_socket_receives_ready_task_without_polling_turn() {
+        let _g = TEST_LOCK.lock().unwrap();
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+
+        let sock = PathBuf::from(format!(
+            "/tmp/sb-cbr-{}-{}.sock",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_file(&sock);
+        let listener = match UnixListener::bind(&sock) {
+            Ok(listener) => listener,
+            Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+                std::env::remove_var("SHELBI_HOME");
+                let _ = std::fs::remove_file(&sock);
+                let _ = std::fs::remove_dir_all(&home);
+                eprintln!("skipping callback socket test: Unix sockets unavailable in sandbox");
+                return;
+            }
+            Err(e) => panic!("bind callback socket: {e}"),
+        };
+        listener
+            .set_nonblocking(false)
+            .expect("callback listener should accept");
+        std::env::set_var(ORCH_EVENT_CALLBACK_SOCK_ENV, &sock);
+
+        append_task_event(
+            "demo",
+            "ready-task",
+            "default",
+            Column::backlog(),
+            Column::todo(),
+            "user:move",
+        )
+        .unwrap();
+
+        let (stream, _) = listener.accept().unwrap();
+        let mut line = String::new();
+        std::io::BufReader::new(stream)
+            .read_line(&mut line)
+            .unwrap();
+        let envelope: EventEnvelope = serde_json::from_str(line.trim_end()).unwrap();
+
+        assert_eq!(envelope.kind, EventKind::Task);
+        assert_eq!(envelope.project.as_deref(), Some("demo"));
+        assert!(envelope.line.contains(" task=ready-task "));
+        assert!(envelope.line.contains("backlog -> todo"));
+        assert!(envelope.line.contains(" to_category=ready"));
 
         let log = std::fs::read_to_string(events_log_path().unwrap()).unwrap();
         assert_eq!(log.trim_end(), envelope.line);

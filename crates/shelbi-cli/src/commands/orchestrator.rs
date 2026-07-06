@@ -339,7 +339,7 @@ mod tests {
     use shelbi_core::{Column, Task};
     use shelbi_state::{
         append_external_event, append_heartbeat_event, append_task_event, append_workspace_event,
-        save_task, WorkspaceState,
+        list_tasks, save_task, WorkspaceState,
     };
     use tempfile::TempDir;
 
@@ -362,11 +362,15 @@ mod tests {
     }
 
     fn save_demo_task(project: &str, id: &str) {
+        save_demo_task_in_column(project, id, Column::todo());
+    }
+
+    fn save_demo_task_in_column(project: &str, id: &str, column: Column) {
         let now = Utc::now();
         let task = Task {
             id: id.into(),
             title: id.into(),
-            column: Column::todo(),
+            column,
             priority: 0,
             assigned_to: None,
             workflow: None,
@@ -379,6 +383,17 @@ mod tests {
             params: BTreeMap::new(),
         };
         save_task(project, &task, "body").unwrap();
+    }
+
+    fn event<'a>(response: &'a DrainResponse, kind: &str, id: &str) -> &'a NormalizedEvent {
+        response
+            .events
+            .iter()
+            .find(|event| {
+                event.kind == kind
+                    && (event.task.as_deref() == Some(id) || event.workspace.as_deref() == Some(id))
+            })
+            .unwrap_or_else(|| panic!("missing {kind} event for {id}: {:?}", response.events))
     }
 
     #[test]
@@ -513,6 +528,140 @@ mod tests {
     }
 
     #[test]
+    fn polling_turn_boundary_delivers_ready_task_without_scheduling_it() {
+        let (_guard, _tmp) = setup_home();
+        save_demo_task("demo", "ready-task");
+        append_task_event(
+            "demo",
+            "ready-task",
+            "default",
+            Column::backlog(),
+            Column::todo(),
+            "user:move",
+        )
+        .unwrap();
+
+        // Polling-only runners see the fact when they drain at the next turn
+        // boundary. This is a fact batch, not an implicit dispatch.
+        let response = drain_once("demo", 0).unwrap();
+        let task = event(&response, "task_transition", "ready-task");
+
+        assert_eq!(task.from.as_deref(), Some("backlog"));
+        assert_eq!(task.to.as_deref(), Some("todo"));
+        assert_eq!(
+            task.metadata.get("to_category").map(String::as_str),
+            Some("ready")
+        );
+        let stored = list_tasks("demo").unwrap();
+        assert_eq!(stored.len(), 1);
+        assert_eq!(stored[0].task.column, Column::todo());
+        assert_eq!(
+            stored[0].task.assigned_to, None,
+            "event delivery must not assign or start work"
+        );
+    }
+
+    #[test]
+    fn drain_presents_active_to_handoff_and_idle_workspace_as_facts() {
+        let (_guard, _tmp) = setup_home();
+        save_demo_task_in_column("demo", "handoff-task", Column::review());
+        append_task_event(
+            "demo",
+            "handoff-task",
+            "default",
+            Column::in_progress(),
+            Column::review(),
+            "workspace:ready",
+        )
+        .unwrap();
+        append_workspace_event(
+            "demo",
+            "alpha",
+            Some(WorkspaceState::Working),
+            WorkspaceState::AwaitingInput,
+        )
+        .unwrap();
+
+        let response = drain_once("demo", 0).unwrap();
+        let handoff = event(&response, "task_transition", "handoff-task");
+        assert_eq!(handoff.from.as_deref(), Some("in_progress"));
+        assert_eq!(handoff.to.as_deref(), Some("review"));
+        assert_eq!(
+            handoff.metadata.get("from_category").map(String::as_str),
+            Some("active")
+        );
+        assert_eq!(
+            handoff.metadata.get("to_category").map(String::as_str),
+            Some("handoff")
+        );
+
+        let workspace = event(&response, "workspace_transition", "alpha");
+        assert_eq!(workspace.from.as_deref(), Some("working"));
+        assert_eq!(workspace.to.as_deref(), Some("awaiting_input"));
+    }
+
+    #[test]
+    fn idle_workspace_event_arrives_while_ready_task_remains_orchestrator_choice() {
+        let (_guard, _tmp) = setup_home();
+        save_demo_task("demo", "ready-next");
+        append_workspace_event(
+            "demo",
+            "dev-1",
+            Some(WorkspaceState::Working),
+            WorkspaceState::AwaitingInput,
+        )
+        .unwrap();
+
+        let response = drain_once("demo", 0).unwrap();
+        let workspace = event(&response, "workspace_transition", "dev-1");
+        assert_eq!(workspace.to.as_deref(), Some("awaiting_input"));
+
+        let stored = list_tasks("demo").unwrap();
+        assert_eq!(stored[0].task.id, "ready-next");
+        assert_eq!(stored[0].task.column, Column::todo());
+        assert_eq!(
+            stored[0].task.assigned_to, None,
+            "idle-workspace delivery must not consume the ready task"
+        );
+    }
+
+    #[test]
+    fn heartbeat_backstop_surfaces_missed_immediate_event_for_bounded_sweep() {
+        let (_guard, _tmp) = setup_home();
+        save_demo_task("demo", "ready-after-miss");
+        append_task_event(
+            "demo",
+            "ready-after-miss",
+            "default",
+            Column::backlog(),
+            Column::todo(),
+            "user:move",
+        )
+        .unwrap();
+        let missed = drain_once("demo", 0).unwrap();
+
+        append_heartbeat_event("demo", 1, 1).unwrap();
+
+        let response = wait_next("demo", missed.cursor_offset, Duration::from_millis(250)).unwrap();
+        assert_eq!(response.events.len(), 1);
+        assert_eq!(response.events[0].kind, "heartbeat");
+        assert_eq!(
+            response.events[0]
+                .metadata
+                .get("zen_eligible")
+                .map(String::as_str),
+            Some("1")
+        );
+        assert_eq!(
+            response.events[0]
+                .metadata
+                .get("idle_workspaces")
+                .map(String::as_str),
+            Some("1")
+        );
+    }
+
+    #[test]
     fn drain_labels_heartbeat_and_pane_death_without_scheduling() {
         let (_guard, _tmp) = setup_home();
         append_heartbeat_event("demo", 1, 1).unwrap();
@@ -545,5 +694,23 @@ mod tests {
         );
         assert_eq!(response.events[1].workspace.as_deref(), Some("alpha"));
         assert_eq!(response.events[2].workspace.as_deref(), Some("review"));
+    }
+
+    #[test]
+    fn pane_death_fact_is_delivered_without_supervision_restart_action() {
+        let (_guard, _tmp) = setup_home();
+        append_external_event("project=demo workspace=alpha pane_alive=false reason=exit:1")
+            .unwrap();
+
+        let response = drain_once("demo", 0).unwrap();
+
+        assert_eq!(response.events.len(), 1);
+        assert_eq!(response.events[0].kind, "pane_death");
+        assert_eq!(response.events[0].workspace.as_deref(), Some("alpha"));
+        assert_eq!(response.events[0].reason.as_deref(), Some("exit:1"));
+        assert!(
+            response.events[0].metadata.get("supervision").is_none(),
+            "pane death delivery must not be conflated with auto-restart"
+        );
     }
 }
