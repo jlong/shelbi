@@ -542,6 +542,8 @@ mod tests {
         Project, WorkspaceSpec, ZenConfig,
     };
     use std::collections::BTreeMap;
+    use std::io::Read;
+    use std::os::fd::AsRawFd;
     use std::os::unix::process::ExitStatusExt;
     use std::path::{Path, PathBuf};
     use std::time::Duration;
@@ -1063,6 +1065,74 @@ mod tests {
         // Reap our bystander so it doesn't linger past the test.
         let _ = bystander.kill();
         let _ = bystander.wait();
+        let _ = std::fs::remove_dir_all(&worktree);
+    }
+
+    #[test]
+    fn background_message_tail_output_is_unread_until_drained() {
+        let worktree = fresh_test_home("tail-drain-regression");
+        let msgs = worktree.join(".shelbi").join("messages");
+        std::fs::create_dir_all(&msgs).unwrap();
+        let log = msgs.join("feat-x.log");
+        std::fs::write(&log, b"").unwrap();
+
+        let mut child = std::process::Command::new("tail")
+            .arg("-f")
+            .arg("-n")
+            .arg("0")
+            .arg(&log)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn tail");
+
+        let mut stdout = child.stdout.take().expect("tail stdout should be piped");
+        let fd = stdout.as_raw_fd();
+        let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+        assert!(flags >= 0, "F_GETFL failed");
+        let set = unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) };
+        assert_eq!(set, 0, "F_SETFL O_NONBLOCK failed");
+
+        let mut buf = [0u8; 256];
+        match stdout.read(&mut buf) {
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+            other => panic!("tail should have no output before append: {other:?}"),
+        }
+
+        std::thread::sleep(Duration::from_millis(100));
+        {
+            let mut f = std::fs::OpenOptions::new().append(true).open(&log).unwrap();
+            f.write_all(b"{\"msg_id\":\"m-1\",\"body\":\"wake\"}\n")
+                .unwrap();
+        }
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let mut drained = Vec::new();
+        while std::time::Instant::now() < deadline {
+            match stdout.read(&mut buf) {
+                Ok(0) => std::thread::sleep(Duration::from_millis(20)),
+                Ok(n) => {
+                    drained.extend_from_slice(&buf[..n]);
+                    if drained.ends_with(b"\n") {
+                        break;
+                    }
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+                Err(e) => panic!("read tail stdout: {e}"),
+            }
+        }
+
+        let drained = String::from_utf8_lossy(&drained);
+        assert!(
+            drained.contains("\"msg_id\":\"m-1\""),
+            "tail had unread output only once explicitly drained; got {drained:?}"
+        );
+
+        let _ = child.kill();
+        let _ = child.wait();
         let _ = std::fs::remove_dir_all(&worktree);
     }
 
