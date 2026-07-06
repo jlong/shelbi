@@ -1221,6 +1221,13 @@ fn reload_orchestrator_pane(
         &launch,
     );
 
+    if let Err(e) = mark_orchestrator_reload_expected(project_name) {
+        return PaneReloadStatus::Failed {
+            target: format!("{session}:dashboard.{{right}}"),
+            reason: format!("mark expected orchestrator shutdown: {e}"),
+        };
+    }
+
     // Prefer the stored pane id so a view-swap-mid-reload (orchestrator
     // not currently visible in the right slot) still hits the right
     // pane. Fall back to the positional `{right}` target for older
@@ -1236,6 +1243,10 @@ fn reload_orchestrator_pane(
         }
     };
     respawn_pane(&target, &cmd)
+}
+
+fn mark_orchestrator_reload_expected(project_name: &str) -> Result<()> {
+    shelbi_state::zen_clear_crash(project_name)
 }
 
 fn reload_stash_pane(session: &str, view: &str, cmd: &str) -> PaneReloadStatus {
@@ -1490,6 +1501,37 @@ mod pane_cmd_tests {
             "claude",
         );
         assert!(out.contains("cd '/Users/me/My Projects/myapp' && "));
+    }
+
+    #[test]
+    fn reload_expected_shutdown_clears_crash_marker_without_disabling_zen() {
+        let _g = crate::test_lock::acquire();
+        let home = std::env::temp_dir().join(format!(
+            "shelbi-reload-expected-{}-{}",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("anon")
+        ));
+        let _ = std::fs::remove_dir_all(&home);
+        std::env::set_var("SHELBI_HOME", &home);
+
+        shelbi_state::write_state(
+            "myapp",
+            &shelbi_state::State {
+                zen_mode: shelbi_state::ZenModeState::On,
+                zen_last_crashed_at: Some(chrono::Utc::now()),
+                ..shelbi_state::State::default()
+            },
+        )
+        .unwrap();
+
+        mark_orchestrator_reload_expected("myapp").unwrap();
+
+        let state = shelbi_state::read_state("myapp").unwrap();
+        assert_eq!(state.zen_mode, shelbi_state::ZenModeState::On);
+        assert!(state.zen_last_crashed_at.is_none());
+
+        std::env::remove_var("SHELBI_HOME");
+        let _ = std::fs::remove_dir_all(&home);
     }
 
     #[test]
