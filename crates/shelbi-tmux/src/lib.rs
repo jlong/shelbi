@@ -28,7 +28,12 @@ fn exact(target: &str) -> String {
 // structural tests.
 
 fn has_session_argv(name: &str) -> Vec<String> {
-    vec!["tmux".into(), "has-session".into(), "-t".into(), exact(name)]
+    vec![
+        "tmux".into(),
+        "has-session".into(),
+        "-t".into(),
+        exact(name),
+    ]
 }
 
 fn kill_window_argv(addr: &TmuxAddr) -> Vec<String> {
@@ -264,7 +269,10 @@ pub fn send_line(host: &Host, addr: &TmuxAddr, text: &str) -> Result<()> {
     } else {
         shelbi_ssh::run_capture(host, send_keys_literal_argv(addr, text))?;
     }
-    shelbi_ssh::run_capture(host, ["tmux", "send-keys", "-t", &exact(&addr.target()), "Enter"])?;
+    shelbi_ssh::run_capture(
+        host,
+        ["tmux", "send-keys", "-t", &exact(&addr.target()), "Enter"],
+    )?;
     Ok(())
 }
 
@@ -272,7 +280,10 @@ pub fn send_line(host: &Host, addr: &TmuxAddr, text: &str) -> Result<()> {
 /// modal prompts (e.g. claude's "trust this folder" dialog, whose default
 /// selection is the affirmative option) without typing anything into them.
 pub fn send_enter(host: &Host, addr: &TmuxAddr) -> Result<()> {
-    shelbi_ssh::run_capture(host, ["tmux", "send-keys", "-t", &exact(&addr.target()), "Enter"])?;
+    shelbi_ssh::run_capture(
+        host,
+        ["tmux", "send-keys", "-t", &exact(&addr.target()), "Enter"],
+    )?;
     Ok(())
 }
 
@@ -302,7 +313,14 @@ pub fn pane_title(host: &Host, addr: &TmuxAddr) -> Result<String> {
 pub fn capture(host: &Host, addr: &TmuxAddr) -> Result<String> {
     shelbi_ssh::run_capture(
         host,
-        ["tmux", "capture-pane", "-p", "-J", "-t", &exact(&addr.target())],
+        [
+            "tmux",
+            "capture-pane",
+            "-p",
+            "-J",
+            "-t",
+            &exact(&addr.target()),
+        ],
     )
 }
 
@@ -335,10 +353,7 @@ mod tests {
 
     fn ssh_args(cmd: std::process::Command) -> Vec<String> {
         let raw: Vec<String> = std::iter::once(cmd.get_program().to_string_lossy().into_owned())
-            .chain(
-                cmd.get_args()
-                    .map(|a| a.to_string_lossy().into_owned()),
-            )
+            .chain(cmd.get_args().map(|a| a.to_string_lossy().into_owned()))
             .collect();
         // For SSH-routed commands, strip the connection-multiplexing
         // options and the hub-side reverse forward that shelbi-ssh
@@ -408,7 +423,15 @@ mod tests {
         // `--` terminates flags so a dash-leading payload is literal (F5).
         assert_eq!(
             send_keys_literal_argv(&addr("shelbi-myapp", "w-x"), "hello"),
-            vec!["tmux", "send-keys", "-t", "=shelbi-myapp:w-x", "-l", "--", "hello"]
+            vec![
+                "tmux",
+                "send-keys",
+                "-t",
+                "=shelbi-myapp:w-x",
+                "-l",
+                "--",
+                "hello"
+            ]
         );
     }
 
@@ -512,13 +535,20 @@ mod tests {
         // so a torn-down `shelbi-w-bob` would prefix-match the live
         // sibling `shelbi-w-bob-2`. The `=` prefix forces exact match and
         // must be present on every session/window target we build.
-        assert_eq!(has_session_argv("shelbi-w-bob").last().unwrap(), "=shelbi-w-bob");
         assert_eq!(
-            kill_window_argv(&addr("shelbi-w-bob", "agent")).last().unwrap(),
+            has_session_argv("shelbi-w-bob").last().unwrap(),
+            "=shelbi-w-bob"
+        );
+        assert_eq!(
+            kill_window_argv(&addr("shelbi-w-bob", "agent"))
+                .last()
+                .unwrap(),
             "=shelbi-w-bob:agent"
         );
         assert_eq!(
-            paste_buffer_argv("b", &addr("shelbi-w-bob", "agent")).last().unwrap(),
+            paste_buffer_argv("b", &addr("shelbi-w-bob", "agent"))
+                .last()
+                .unwrap(),
             "=shelbi-w-bob:agent"
         );
         assert_eq!(
@@ -605,8 +635,11 @@ mod tests {
         // distinct, intact argument — not stripped as a `#` comment.
         let tmp = tempfile::tempdir().unwrap();
         let shim = tmp.path().join("tmux");
-        std::fs::write(&shim, "#!/bin/sh\nfor a in \"$@\"; do printf '<%s>' \"$a\"; done\n")
-            .unwrap();
+        std::fs::write(
+            &shim,
+            "#!/bin/sh\nfor a in \"$@\"; do printf '<%s>' \"$a\"; done\n",
+        )
+        .unwrap();
         let mut perms = std::fs::metadata(&shim).unwrap().permissions();
         {
             use std::os::unix::fs::PermissionsExt;

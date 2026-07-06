@@ -226,7 +226,9 @@ fn run_workspace_poll_loop(
     // and verify the hub's `-R` forward at thread start and on a slow
     // cadence after, so a ControlMaster that died and left a stale remote
     // socket behind gets repaired instead of silently swallowing every
-    // worker→hub message (adversarial review F7). `None` means "due now";
+    // worker→hub message (Shelbi ContextStore
+    // docs/planning:reviews/adversarial-2026-07/process-boundaries.md F7).
+    // `None` means "due now";
     // the check is a cheap no-op for local hosts and two probe round-trips
     // when the forward is already healthy.
     let mut next_forward_check: Option<Instant> = None;

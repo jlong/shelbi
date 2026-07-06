@@ -20,12 +20,7 @@ use super::require_project;
 
 pub mod pane;
 
-pub fn run(
-    project_opt: Option<String>,
-    name: String,
-    as_pane: bool,
-    resume: bool,
-) -> Result<()> {
+pub fn run(project_opt: Option<String>, name: String, as_pane: bool, resume: bool) -> Result<()> {
     let project = require_project(project_opt)?;
     open(&project, &name, as_pane, resume)
 }
@@ -41,12 +36,7 @@ pub fn run(
 /// install signal handlers, and stay alive until the agent exits or a
 /// signal arrives, then write the lifecycle event and (on clean exit)
 /// prompt the user before tearing down so final output stays visible.
-fn open(
-    project: &str,
-    name: &str,
-    as_pane: bool,
-    resume: bool,
-) -> Result<()> {
+fn open(project: &str, name: &str, as_pane: bool, resume: bool) -> Result<()> {
     let p = shelbi_state::load_project(project).map_err(|e| anyhow!(e))?;
     let workspace = p
         .workspace(name)
@@ -91,11 +81,7 @@ fn open(
 /// Existing pane → focus and exit. Missing pane → create one (with the
 /// lifecycle wrapper for local hosts; with the legacy proxy-window for
 /// remote hosts) and select it.
-fn focus_or_create(
-    project: &Project,
-    workspace: &WorkspaceSpec,
-    host: &Host,
-) -> Result<()> {
+fn focus_or_create(project: &Project, workspace: &WorkspaceSpec, host: &Host) -> Result<()> {
     let project_session = format!("shelbi-{}", project.name);
     // `=` anchors the window-name half so tmux matches it EXACTLY rather
     // than by prefix: without it, `shelbi open web` would resolve (and
@@ -194,7 +180,8 @@ where
 /// Run a tmux command whose failure is a real error (not a probe),
 /// returning `Ok(())` on success or `Err(<stderr>)` so the caller can fold
 /// tmux's own reason into its message instead of collapsing to an opaque
-/// `false` (cli-session-ux F12). `<stderr>` falls back to the exit status
+/// `false` (Shelbi ContextStore
+/// docs/planning:reviews/adversarial-2026-07/cli-session-ux.md F12). `<stderr>` falls back to the exit status
 /// (or the spawn error) when tmux printed nothing.
 fn run_local_tmux_checked<I, S>(args: I) -> std::result::Result<(), String>
 where
@@ -217,7 +204,5 @@ where
 }
 
 fn current_exe_string() -> Result<String> {
-    Ok(std::env::current_exe()?
-        .to_string_lossy()
-        .into_owned())
+    Ok(std::env::current_exe()?.to_string_lossy().into_owned())
 }

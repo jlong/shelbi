@@ -1591,7 +1591,8 @@ fn probe_claude_version(host: &Host) -> Option<(u32, u32, u32)> {
         // Remote: reuse the canonical login-shell bootstrap. Passing a bare
         // `$SHELL` / pre-quoted `'claude --version'` argv used to work only
         // because the SSH boundary did no escaping; now that it escapes
-        // (F2), route through `run_login_shell_script` so `$SHELL` still
+        // (Shelbi ContextStore
+        // docs/planning:reviews/adversarial-2026-07/process-boundaries.md F2), route through `run_login_shell_script` so `$SHELL` still
         // expands and the raw script isn't double-quoted.
         Host::Ssh { .. } => crate::git::run_login_shell_script(host, "claude --version").ok()?,
     };
@@ -2497,7 +2498,8 @@ fn message_polling_section(task_id: &str, project: &str, id_esc: &str) -> String
 ///
 /// A failing fetch when `origin` exists is a HARD error, not a silent
 /// fallback — same principle as the `fetch_probe_base` silent-fallback
-/// finding (orchestrator-zen review F7): the caller must abort the dispatch
+/// finding (Shelbi ContextStore
+/// docs/planning:reviews/adversarial-2026-07/orchestrator-zen.md F7): the caller must abort the dispatch
 /// (task stays put, event emitted) rather than cut from a possibly-stale
 /// ref.
 fn resolve_fresh_cut_base(host: &Host, repo: &str, default_branch: &str) -> Result<String> {
@@ -2540,7 +2542,9 @@ fn sync_worktree(
     let repo = machine.work_dir.to_string_lossy().into_owned();
     let wt_str = worktree.to_string_lossy().into_owned();
 
-    // F5: a dispatch killed after the worktree *dir* was created but before
+    // Shelbi ContextStore
+    // docs/planning:reviews/adversarial-2026-07/orchestrator-lifecycle.md F5:
+    // a dispatch killed after the worktree *dir* was created but before
     // its `.git` gitlink was written leaves `<wt>` present-but-invalid.
     // Every later `git worktree add <wt>` then aborts with "already exists"
     // and wedges the workspace forever. Prune stale bookkeeping first, then
@@ -2705,7 +2709,8 @@ fn sync_worktree(
 ///   [`resolve_fresh_cut_base`] the dev path uses) so the recreate still
 ///   succeeds rather than wedging the resume.
 ///
-/// The stale-`.git`-gitlink healing (F5) is shared with `sync_worktree`: a dir
+/// The stale-`.git`-gitlink healing (Shelbi ContextStore
+/// docs/planning:reviews/adversarial-2026-07/orchestrator-lifecycle.md F5) is shared with `sync_worktree`: a dir
 /// present without a valid `.git` is force-removed and recreated so a later
 /// `worktree add` doesn't abort with "already exists".
 fn sync_worktree_for_resume(
@@ -2719,7 +2724,8 @@ fn sync_worktree_for_resume(
     let wt_str = worktree.to_string_lossy().into_owned();
 
     // Prune stale bookkeeping, then heal a present-but-invalid worktree dir
-    // (F5) exactly as `sync_worktree` does. Best-effort.
+    // (Shelbi ContextStore
+    // docs/planning:reviews/adversarial-2026-07/orchestrator-lifecycle.md F5) exactly as `sync_worktree` does. Best-effort.
     let _ = shelbi_ssh::run(host, ["git", "-C", &repo, "worktree", "prune"]);
 
     let has_git = shelbi_ssh::run(host, ["test", "-d", &format!("{wt_str}/.git")])
@@ -2795,7 +2801,8 @@ fn sync_worktree_for_resume(
 /// it to a detached HEAD so the branch ref is free for another worktree to
 /// claim. Bails on a dirty workspace worktree (we'd silently lose work).
 ///
-/// [`sync_worktree`] uses this on the dispatch path (F14): re-dispatching a
+/// [`sync_worktree`] uses this on the dispatch path (Shelbi ContextStore
+/// docs/planning:reviews/adversarial-2026-07/orchestrator-lifecycle.md F14): re-dispatching a
 /// task whose branch is live in another workspace's worktree would otherwise
 /// die on `fatal: '<branch>' is already checked out`. It's safe to call from
 /// there because the dispatch only reaches its checkout when the *target*
@@ -3839,7 +3846,9 @@ mod tests {
 
     #[test]
     fn both_host_kinds_construct_the_same_launch_command() {
-        // F12: the local dispatch path (via the `shelbi open --as-pane`
+        // Shelbi ContextStore
+        // docs/planning:reviews/adversarial-2026-07/cli-session-ux.md F12:
+        // the local dispatch path (via the `shelbi open --as-pane`
         // wrapper) and the remote dispatch path (`deploy_and_spawn`'s SSH
         // branch) both build their launch through `workspace_launch_command`.
         // Feed each host's workspace/runner through it and assert the launch
@@ -5135,8 +5144,9 @@ mod rebase_git_tests {
 
 #[cfg(test)]
 mod sync_worktree_git_tests {
-    //! Real-git tests for [`sync_worktree`]'s recovery paths (F5 partial
-    //! worktree, F14 branch-checked-out-elsewhere). Each provisions a tiny
+    //! Real-git tests for [`sync_worktree`]'s recovery paths (Shelbi ContextStore
+    //! docs/planning:reviews/adversarial-2026-07/orchestrator-lifecycle.md F5
+    //! partial worktree, F14 branch-checked-out-elsewhere). Each provisions a tiny
     //! on-disk repo whose `work_dir` doubles as the main clone, then drives
     //! `sync_worktree` against `Host::Local`. Skipped when `git` isn't on
     //! PATH so a git-less sandbox still passes.
@@ -5251,7 +5261,9 @@ mod sync_worktree_git_tests {
 
     #[test]
     fn recovers_from_a_partial_worktree_dir() {
-        // F5: dir exists without a valid `.git` (dispatch killed mid-add).
+        // Shelbi ContextStore
+        // docs/planning:reviews/adversarial-2026-07/orchestrator-lifecycle.md F5:
+        // dir exists without a valid `.git` (dispatch killed mid-add).
         // sync_worktree must prune/remove it and add a fresh worktree rather
         // than aborting with "already exists".
         if !git_available() {
@@ -5277,7 +5289,9 @@ mod sync_worktree_git_tests {
 
     #[test]
     fn releases_branch_checked_out_in_another_worktree() {
-        // F14: the requested branch is already checked out in `alice`'s
+        // Shelbi ContextStore
+        // docs/planning:reviews/adversarial-2026-07/orchestrator-lifecycle.md F14:
+        // the requested branch is already checked out in `alice`'s
         // worktree. Dispatching it to `bob` must detach it from `alice`
         // first instead of dying on "already checked out".
         if !git_available() {

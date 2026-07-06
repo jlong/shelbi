@@ -34,10 +34,7 @@ pub enum SkipReason {
     NoAgentForStatus { status_id: String },
     /// `owner: user` with an `agent:` field, but Zen is off. The status
     /// is human-driven by default; Zen unlocks the agent path.
-    AgentRequiresZen {
-        status_id: String,
-        agent: String,
-    },
+    AgentRequiresZen { status_id: String, agent: String },
 }
 
 impl SkipReason {
@@ -45,9 +42,7 @@ impl SkipReason {
     pub fn human_message(&self) -> String {
         match self {
             SkipReason::NoAgentForStatus { status_id } => {
-                format!(
-                    "status `{status_id}` has no agent declared — no automation path"
-                )
+                format!("status `{status_id}` has no agent declared — no automation path")
             }
             SkipReason::AgentRequiresZen { status_id, agent } => {
                 format!(
@@ -149,11 +144,15 @@ mod tests {
         let s = status("in-progress", Owner::Agent, Some("developer"));
         assert_eq!(
             resolve_dispatch_agent(&s, false),
-            DispatchDecision::Dispatch { agent: "developer".into() },
+            DispatchDecision::Dispatch {
+                agent: "developer".into()
+            },
         );
         assert_eq!(
             resolve_dispatch_agent(&s, true),
-            DispatchDecision::Dispatch { agent: "developer".into() },
+            DispatchDecision::Dispatch {
+                agent: "developer".into()
+            },
         );
     }
 
@@ -187,7 +186,9 @@ mod tests {
         }
         assert_eq!(
             resolve_dispatch_agent(&s, true),
-            DispatchDecision::Dispatch { agent: "orchestrator".into() },
+            DispatchDecision::Dispatch {
+                agent: "orchestrator".into()
+            },
         );
     }
 
@@ -211,11 +212,15 @@ statuses:
         let active = wf.status("in-progress").unwrap();
         assert_eq!(
             resolve_dispatch_agent(active, false),
-            DispatchDecision::Dispatch { agent: "developer".into() },
+            DispatchDecision::Dispatch {
+                agent: "developer".into()
+            },
         );
         assert_eq!(
             resolve_dispatch_agent(active, true),
-            DispatchDecision::Dispatch { agent: "developer".into() },
+            DispatchDecision::Dispatch {
+                agent: "developer".into()
+            },
         );
     }
 
@@ -244,7 +249,9 @@ statuses:
         // Zen on → orchestrator takes over.
         assert_eq!(
             resolve_dispatch_agent(review, true),
-            DispatchDecision::Dispatch { agent: "orchestrator".into() },
+            DispatchDecision::Dispatch {
+                agent: "orchestrator".into()
+            },
         );
     }
 

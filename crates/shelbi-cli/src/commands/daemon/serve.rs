@@ -217,8 +217,8 @@ pub(super) fn run_foreground() -> Result<()> {
     let prev_umask = unsafe { libc::umask(0o177) };
     let bind_result = UnixListener::bind(&sock);
     unsafe { libc::umask(prev_umask) };
-    let listener = bind_result
-        .with_context(|| format!("binding hub socket at {}", sock.display()))?;
+    let listener =
+        bind_result.with_context(|| format!("binding hub socket at {}", sock.display()))?;
     // Belt-and-suspenders in case a non-default umask still widened the
     // inode (umask can only clear bits, not set them).
     fs::set_permissions(&sock, fs::Permissions::from_mode(0o600))
@@ -502,9 +502,8 @@ fn prepare_socket(sock: &Path) -> Result<()> {
                 ));
             }
             Err(_) => {
-                fs::remove_file(sock).with_context(|| {
-                    format!("removing stale socket at {}", sock.display())
-                })?;
+                fs::remove_file(sock)
+                    .with_context(|| format!("removing stale socket at {}", sock.display()))?;
             }
         }
     }
@@ -519,8 +518,8 @@ fn prepare_socket(sock: &Path) -> Result<()> {
 /// Ctrl-C / SIGTERM must still work without resorting to SIGKILL (which
 /// would skip socket/PID cleanup entirely).
 fn install_shutdown_listener(stop: Arc<AtomicBool>, sock: PathBuf) -> Result<()> {
-    let mut signals = Signals::new([SIGTERM, SIGINT, SIGHUP])
-        .context("installing daemon signal handlers")?;
+    let mut signals =
+        Signals::new([SIGTERM, SIGINT, SIGHUP]).context("installing daemon signal handlers")?;
     thread::spawn(move || {
         let mut seen_first = false;
         for sig in signals.forever() {
@@ -587,9 +586,7 @@ fn handle_client(stream: UnixStream, daemon: &Daemon) {
         }
         let terminated = buf.last() == Some(&b'\n');
         if !terminated && n as u64 > MAX_FRAME_BYTES {
-            eprintln!(
-                "shelbi daemon: frame exceeds {MAX_FRAME_BYTES} bytes; closing connection"
-            );
+            eprintln!("shelbi daemon: frame exceeds {MAX_FRAME_BYTES} bytes; closing connection");
             return;
         }
         while matches!(buf.last(), Some(b'\n') | Some(b'\r')) {
@@ -831,7 +828,11 @@ mod tests {
             std::fs::create_dir_all(&home).unwrap();
             let prev = std::env::var("SHELBI_HOME").ok();
             std::env::set_var("SHELBI_HOME", &home);
-            Self { _lock: lock, prev, home }
+            Self {
+                _lock: lock,
+                prev,
+                home,
+            }
         }
     }
     impl Drop for IsolatedShelbiHome {
@@ -1169,7 +1170,10 @@ mod tests {
         let second = acquire_bind_lock(&sock);
         assert!(second.is_err(), "second lock must be refused while held");
         assert!(
-            second.unwrap_err().to_string().contains("another shelbi daemon"),
+            second
+                .unwrap_err()
+                .to_string()
+                .contains("another shelbi daemon"),
             "error should name the culprit"
         );
         drop(first);
@@ -1212,8 +1216,8 @@ mod tests {
         let handler = thread::spawn(move || handle_client(server, &d));
 
         let big = vec![b'x'; MAX_FRAME_BYTES as usize + 2]; // no newline anywhere
-        // The daemon may close mid-write once it sees the cap blown;
-        // a BrokenPipe here is part of the expected behavior.
+                                                            // The daemon may close mid-write once it sees the cap blown;
+                                                            // a BrokenPipe here is part of the expected behavior.
         let _ = (&client).write_all(&big);
         let _ = client.shutdown(Shutdown::Write);
         let mut ack = Vec::new();

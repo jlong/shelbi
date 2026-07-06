@@ -176,7 +176,9 @@ pub fn load_workflow(project: &str, name: &str) -> Result<Workflow> {
         return Err(missing_statuses_error(&st_path));
     }
     let statuses = load_project_statuses(project)?;
-    let resolved = wf.resolve_against(&statuses).map_err(|e| annotate(&path, e))?;
+    let resolved = wf
+        .resolve_against(&statuses)
+        .map_err(|e| annotate(&path, e))?;
 
     validate_agent_references(project, &resolved).map_err(|e| annotate(&path, e))?;
     Ok(resolved)
@@ -498,7 +500,10 @@ static EMITTED_NAME_MISMATCHES: Mutex<Option<HashSet<PathBuf>>> = Mutex::new(Non
 /// `name:` differs from its file stem. [`load_workflow`] resolves by
 /// filename, so the name shown in pickers wouldn't load.
 fn warn_name_stem_mismatch_once(path: &Path, declared: &str) {
-    let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or_default();
+    let stem = path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or_default();
     if stem == declared {
         return;
     }
@@ -716,15 +721,24 @@ statuses:
         assert_eq!(out.len(), 1);
 
         let path = workflow_path("p", "renamed").unwrap();
-        let guard = EMITTED_NAME_MISMATCHES.lock().unwrap_or_else(|p| p.into_inner());
+        let guard = EMITTED_NAME_MISMATCHES
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
         assert!(guard.as_ref().unwrap().contains(&path));
         drop(guard);
 
         // Second listing doesn't re-insert (dedupe holds).
         let _ = list_workflows("p").unwrap();
-        let guard = EMITTED_NAME_MISMATCHES.lock().unwrap_or_else(|p| p.into_inner());
+        let guard = EMITTED_NAME_MISMATCHES
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
         assert_eq!(
-            guard.as_ref().unwrap().iter().filter(|p| **p == path).count(),
+            guard
+                .as_ref()
+                .unwrap()
+                .iter()
+                .filter(|p| **p == path)
+                .count(),
             1
         );
         drop(guard);
@@ -742,7 +756,9 @@ statuses:
         write_workflow(&dir, "design-review", SIMPLE_WORKFLOW);
         let _ = list_workflows("p").unwrap();
         let path = workflow_path("p", "design-review").unwrap();
-        let guard = EMITTED_NAME_MISMATCHES.lock().unwrap_or_else(|p| p.into_inner());
+        let guard = EMITTED_NAME_MISMATCHES
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
         assert!(!guard.as_ref().map(|s| s.contains(&path)).unwrap_or(false));
         drop(guard);
         std::env::remove_var("SHELBI_HOME");
@@ -843,9 +859,15 @@ statuses:
         let err = list_workflows("p").unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("statuses.yaml"), "msg: {msg}");
-        assert!(msg.contains("shelbi init") || msg.contains("shelbi reload"), "msg: {msg}");
+        assert!(
+            msg.contains("shelbi init") || msg.contains("shelbi reload"),
+            "msg: {msg}"
+        );
         // No file was materialized as a side effect.
-        assert!(!statuses_path("p").unwrap().exists(), "loader must not auto-create statuses.yaml");
+        assert!(
+            !statuses_path("p").unwrap().exists(),
+            "loader must not auto-create statuses.yaml"
+        );
         std::env::remove_var("SHELBI_HOME");
     }
 
@@ -885,7 +907,10 @@ statuses:
         let err = load_workflow("p", "default").unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("statuses.yaml"), "msg: {msg}");
-        assert!(msg.contains("shelbi init") || msg.contains("shelbi reload"), "msg: {msg}");
+        assert!(
+            msg.contains("shelbi init") || msg.contains("shelbi reload"),
+            "msg: {msg}"
+        );
         std::env::remove_var("SHELBI_HOME");
     }
 
@@ -1025,7 +1050,12 @@ statuses:
         let _ = load_workflow("p", "legacy").unwrap();
         let guard = EMITTED_DEPRECATIONS.lock().unwrap();
         assert_eq!(
-            guard.as_ref().unwrap().iter().filter(|p| **p == path).count(),
+            guard
+                .as_ref()
+                .unwrap()
+                .iter()
+                .filter(|p| **p == path)
+                .count(),
             1
         );
         drop(guard);

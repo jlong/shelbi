@@ -182,7 +182,8 @@ pub fn config_project_dir(project: &str) -> Result<PathBuf> {
 /// `join` a caller-influenced name. Mirrors
 /// [`shelbi_core::validate_project_name`]'s security-critical invariant for
 /// the workspace/agent chokepoints #137's hardening didn't cover
-/// (state-runtime F14): a hostile or synced workspace/agent name could
+/// (Shelbi ContextStore docs/planning:reviews/adversarial-2026-07/state-runtime.md
+/// F14): a hostile or synced workspace/agent name could
 /// otherwise escape `~/.shelbi/workspaces/` or `~/.shelbi/projects/<p>/agents/`.
 pub(crate) fn ensure_flat_path_component(kind: &str, name: &str) -> Result<()> {
     use std::path::{Component, Path};
@@ -731,7 +732,8 @@ pub fn save_session(s: &Session) -> Result<()> {
 /// orchestrator can keep the user from re-arming a flapping pipeline.
 /// ## Forward-compatibility contract
 ///
-/// The `extra` catch-all (adversarial review F6) keeps an *older* binary
+/// The `extra` catch-all (Shelbi ContextStore
+/// docs/planning:reviews/adversarial-2026-07/state-persistence.md F6) keeps an *older* binary
 /// from destroying fields a *newer* binary wrote. Without it, every field
 /// serde doesn't recognize is dropped on read, so any read-modify-write
 /// mutator (`zen_heartbeat`, `set_workspace_filter`, …) run by an old
@@ -1093,7 +1095,8 @@ mod global_state_tests {
 
     #[test]
     fn global_state_read_modify_write_preserves_unknown_fields() {
-        // Forward-compat (adversarial review F6), global half: an older
+        // Forward-compat (Shelbi ContextStore
+        // docs/planning:reviews/adversarial-2026-07/state-persistence.md F6), global half: an older
         // binary toggling a field it knows about must not drop a field a
         // newer binary added to `~/.shelbi/state.json`.
         let _g = LOCK.lock().unwrap();
@@ -2026,7 +2029,8 @@ pub fn move_task_and_unassign(
 /// (`move_task`) as two separate writes; a crash between them left the card
 /// unowned but still in `in_progress`, and because the recovery scan keys off
 /// `assigned_to == <workspace>`, the now-unassigned card was skipped forever
-/// (cli-daemon-board F18). Folding both mutations into one save closes that
+/// (Shelbi ContextStore docs/planning:reviews/adversarial-2026-07/cli-daemon-board.md
+/// F18). Folding both mutations into one save closes that
 /// window, and clearing the owner even when the card is already in Todo makes
 /// the operation an idempotent recovery for a card wedged by the old path.
 ///
@@ -2302,7 +2306,8 @@ mod tests {
 
     #[test]
     fn state_read_modify_write_preserves_unknown_fields() {
-        // Forward-compat (adversarial review F6): an *older* binary doing a
+        // Forward-compat (Shelbi ContextStore
+        // docs/planning:reviews/adversarial-2026-07/state-persistence.md F6): an *older* binary doing a
         // read-modify-write on `state.json` must not destroy a field a
         // *newer* binary wrote. Here the newer field is `review_rounds`; the
         // old binary flips `workspace_filter` (a known field) and the

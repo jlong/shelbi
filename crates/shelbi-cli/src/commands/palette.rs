@@ -45,7 +45,8 @@ pub fn run(project: String) -> Result<()> {
     // or panic between here and the explicit `restore_terminal` below would
     // otherwise leave the user's terminal stuck in raw mode / the alt-screen.
     // The guard restores it on drop no matter how we leave the scope
-    // (cli-session-ux F7).
+    // (Shelbi ContextStore
+    // docs/planning:reviews/adversarial-2026-07/cli-session-ux.md F7).
     let _guard = TerminalGuard;
     let mut state = State::new(&project, &keymaps)?;
 
@@ -95,7 +96,8 @@ pub fn run(project: String) -> Result<()> {
     };
     // Propagate a picker/sub-picker error instead of silently discarding it in
     // the `if let Ok(..)` below — an event-read failure would otherwise make
-    // the palette exit `Ok(())` as if nothing was chosen (cli-session-ux F7).
+    // the palette exit `Ok(())` as if nothing was chosen (Shelbi ContextStore
+    // docs/planning:reviews/adversarial-2026-07/cli-session-ux.md F7).
     // The terminal is restored by `_guard` on this early return.
     let chosen = chosen?;
     let quit_shelbi_confirmed = match &chosen {

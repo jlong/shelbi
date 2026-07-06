@@ -511,7 +511,8 @@ fn restack_base_for_child(
     }
 
     (
-        multi_parent_restack_cutoff(child, tasks).unwrap_or_else(|| just_merged_parent_branch.to_string()),
+        multi_parent_restack_cutoff(child, tasks)
+            .unwrap_or_else(|| just_merged_parent_branch.to_string()),
         None,
     )
 }
@@ -1769,18 +1770,18 @@ mod tests {
         );
 
         let wt = local.to_string_lossy().into_owned();
-        assert!(
-            run_capture_stdout(&Host::Local, &wt, &["git", "rev-parse", "--verify", "parent"])
-                .is_ok()
-        );
-        assert!(
-            run_capture_stdout(
-                &Host::Local,
-                &wt,
-                &["git", "rev-parse", "--verify", "origin/parent"],
-            )
-            .is_ok()
-        );
+        assert!(run_capture_stdout(
+            &Host::Local,
+            &wt,
+            &["git", "rev-parse", "--verify", "parent"]
+        )
+        .is_ok());
+        assert!(run_capture_stdout(
+            &Host::Local,
+            &wt,
+            &["git", "rev-parse", "--verify", "origin/parent"],
+        )
+        .is_ok());
 
         std::env::remove_var("SHELBI_HOME");
     }
@@ -2561,7 +2562,10 @@ mod tests {
     fn advance_main_with_second_parent_squashed(local: &std::path::Path) {
         run_git(local, &["checkout", "main"]);
         run_git(local, &["merge", "--squash", "parent2"]);
-        run_git(local, &["commit", "-q", "-m", "shelbi: squash parent2 into main"]);
+        run_git(
+            local,
+            &["commit", "-q", "-m", "shelbi: squash parent2 into main"],
+        );
         run_git(local, &["push", "origin", "main"]);
     }
 
@@ -2945,8 +2949,7 @@ mod tests {
         child.depends_on = vec!["par".into(), "par2".into()];
         write_task_file("fixture", &child);
 
-        let outcomes =
-            restack_children(&project, "fixture", &parent, "parent", "main");
+        let outcomes = restack_children(&project, "fixture", &parent, "parent", "main");
         assert_eq!(outcomes.len(), 1, "{outcomes:?}");
         match &outcomes[0] {
             RestackOutcome::Skipped { task_id, reason } => {
@@ -3001,8 +3004,7 @@ mod tests {
         child.depends_on = vec!["par".into(), "par2".into()];
         write_task_file("fixture", &child);
 
-        let outcomes =
-            restack_children(&project, "fixture", &final_parent, "parent2", "main");
+        let outcomes = restack_children(&project, "fixture", &final_parent, "parent2", "main");
         assert_eq!(outcomes.len(), 1, "{outcomes:?}");
         match &outcomes[0] {
             RestackOutcome::Restacked {

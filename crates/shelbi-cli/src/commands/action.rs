@@ -136,9 +136,8 @@ pub fn run(project_opt: Option<String>, cmd: ActionCmd) -> Result<()> {
         }
         ActionCmd::Merge { task_id, target } => {
             let tf = load_task(&project_name, &task_id).map_err(|e| anyhow!(e))?;
-            let result =
-                actions::merge(&project, &project_name, &tf.task, target.as_deref())
-                    .map_err(|e| anyhow!(e))?;
+            let result = actions::merge(&project, &project_name, &tf.task, target.as_deref())
+                .map_err(|e| anyhow!(e))?;
             println!("{}", result.merge.as_line());
             for r in &result.restacks {
                 println!("{}", r.as_line());
@@ -151,11 +150,14 @@ pub fn run(project_opt: Option<String>, cmd: ActionCmd) -> Result<()> {
             println!("{}", outcome.as_line());
             Ok(())
         }
-        ActionCmd::Restack { task_id, from, onto } => {
+        ActionCmd::Restack {
+            task_id,
+            from,
+            onto,
+        } => {
             let tf = load_task(&project_name, &task_id).map_err(|e| anyhow!(e))?;
-            let outcome =
-                actions::restack(&project, &tf.task, &from, onto.as_deref())
-                    .map_err(|e| anyhow!(e))?;
+            let outcome = actions::restack(&project, &tf.task, &from, onto.as_deref())
+                .map_err(|e| anyhow!(e))?;
             println!("{}", outcome.as_line());
             Ok(())
         }

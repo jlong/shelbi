@@ -63,10 +63,7 @@ enum Cmd {
     /// Send a follow-up message to a running workspace (or legacy spawn
     /// agent). Resolves NAME against the project YAML's `workspaces:`
     /// block first, then falls back to the legacy spawn agent registry.
-    Send {
-        id: String,
-        message: String,
-    },
+    Send { id: String, message: String },
     /// Push a message to a task's workspace via the file-based message log
     /// (`<worktree>/.shelbi/messages/<task-id>.log`). Distinct from `send`:
     /// `send` injects keystrokes into a tmux pane; `message` appends a
@@ -476,9 +473,7 @@ fn init_tracing(cmd: Option<&Cmd>) {
     let filter = EnvFilter::try_from_env("SHELBI_LOG").unwrap_or_else(|_| EnvFilter::new("info"));
     let is_tui = matches!(
         cmd,
-        Some(Cmd::Sidebar { .. })
-            | Some(Cmd::Tasks { .. })
-            | Some(Cmd::Activity { .. })
+        Some(Cmd::Sidebar { .. }) | Some(Cmd::Tasks { .. }) | Some(Cmd::Activity { .. })
     );
     if is_tui {
         if let Some(file) = open_tui_log_file() {
@@ -533,9 +528,12 @@ mod cli_tests {
                 _ => Cli::parse_from(["shelbi", "worker", verb]),
             };
             match cli.cmd {
-                Some(Cmd::Worker { cmd: WorkspaceCmd::List }) if verb == "list" => {}
-                Some(Cmd::Worker { cmd: WorkspaceCmd::Stop { name, .. } })
-                    if verb == "stop" && name == "alpha" => {}
+                Some(Cmd::Worker {
+                    cmd: WorkspaceCmd::List,
+                }) if verb == "list" => {}
+                Some(Cmd::Worker {
+                    cmd: WorkspaceCmd::Stop { name, .. },
+                }) if verb == "stop" && name == "alpha" => {}
                 other => panic!("expected Cmd::Worker for `{verb}`, got {other:?}"),
             }
         }
@@ -547,7 +545,9 @@ mod cli_tests {
     fn workspace_canonical_form_parses() {
         let cli = Cli::parse_from(["shelbi", "workspace", "list"]);
         match cli.cmd {
-            Some(Cmd::Workspace { cmd: WorkspaceCmd::List }) => {}
+            Some(Cmd::Workspace {
+                cmd: WorkspaceCmd::List,
+            }) => {}
             other => panic!("expected Cmd::Workspace::List, got {other:?}"),
         }
     }
@@ -561,9 +561,7 @@ mod cli_tests {
         let plain = Cli::parse_from(["shelbi", "open", "alpha"]);
         match plain.cmd {
             Some(Cmd::Open {
-                ref name,
-                as_pane,
-                ..
+                ref name, as_pane, ..
             }) if name == "alpha" && !as_pane => {}
             other => panic!("expected Open {{ alpha, as_pane=false }}, got {other:?}"),
         }
@@ -571,9 +569,7 @@ mod cli_tests {
         let wrapped = Cli::parse_from(["shelbi", "open", "delta", "--as-pane"]);
         match wrapped.cmd {
             Some(Cmd::Open {
-                ref name,
-                as_pane,
-                ..
+                ref name, as_pane, ..
             }) if name == "delta" && as_pane => {}
             other => panic!("expected Open {{ delta, as_pane=true }}, got {other:?}"),
         }
@@ -625,10 +621,7 @@ mod cli_tests {
     /// positional gone, clap rejects the unknown token.
     #[test]
     fn mistyped_subcommand_is_a_parse_error() {
-        for argv in [
-            vec!["shelbi", "statsu"],
-            vec!["shelbi", "tsk", "list"],
-        ] {
+        for argv in [vec!["shelbi", "statsu"], vec!["shelbi", "tsk", "list"]] {
             assert!(
                 Cli::try_parse_from(&argv).is_err(),
                 "expected `{argv:?}` to be rejected, not parsed",

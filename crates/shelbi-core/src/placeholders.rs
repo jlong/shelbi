@@ -128,11 +128,8 @@ mod tests {
     #[test]
     fn tolerates_inner_whitespace_in_token() {
         let mut missing = Vec::new();
-        let out = substitute_placeholders(
-            "{{ feature }}",
-            &params(&[("feature", "x")]),
-            &mut missing,
-        );
+        let out =
+            substitute_placeholders("{{ feature }}", &params(&[("feature", "x")]), &mut missing);
         assert_eq!(out, "x");
         assert!(missing.is_empty());
     }
@@ -148,11 +145,7 @@ mod tests {
     #[test]
     fn records_missing_keys_once_in_order() {
         let mut missing = Vec::new();
-        let out = substitute_placeholders(
-            "{{a}}-{{b}}-{{a}}",
-            &params(&[]),
-            &mut missing,
-        );
+        let out = substitute_placeholders("{{a}}-{{b}}-{{a}}", &params(&[]), &mut missing);
         // Unresolved tokens are left in place so the user can see what
         // the source said.
         assert_eq!(out, "{{a}}-{{b}}-{{a}}");
@@ -181,8 +174,7 @@ mod tests {
     #[test]
     fn treats_whitespace_body_as_literal() {
         let mut missing = Vec::new();
-        let out =
-            substitute_placeholders("{{   }}", &params(&[]), &mut missing);
+        let out = substitute_placeholders("{{   }}", &params(&[]), &mut missing);
         assert_eq!(out, "{{   }}");
         assert!(missing.is_empty());
     }
@@ -193,11 +185,8 @@ mod tests {
         // b}}` is suspicious enough that we'd rather preserve the source
         // than silently fail-or-substitute. No key is looked up.
         let mut missing = Vec::new();
-        let out = substitute_placeholders(
-            "{{a b}}",
-            &params(&[("a", "x"), ("b", "y")]),
-            &mut missing,
-        );
+        let out =
+            substitute_placeholders("{{a b}}", &params(&[("a", "x"), ("b", "y")]), &mut missing);
         assert_eq!(out, "{{a b}}");
         assert!(missing.is_empty());
     }
@@ -205,11 +194,7 @@ mod tests {
     #[test]
     fn unclosed_open_braces_pass_through() {
         let mut missing = Vec::new();
-        let out = substitute_placeholders(
-            "prefix {{ no close here",
-            &params(&[]),
-            &mut missing,
-        );
+        let out = substitute_placeholders("prefix {{ no close here", &params(&[]), &mut missing);
         assert_eq!(out, "prefix {{ no close here");
         assert!(missing.is_empty());
     }
@@ -220,11 +205,7 @@ mod tests {
         // — single-pass substitution avoids infinite loops and surprise
         // chained resolution.
         let mut missing = Vec::new();
-        let out = substitute_placeholders(
-            "{{a}}",
-            &params(&[("a", "{{a}}")]),
-            &mut missing,
-        );
+        let out = substitute_placeholders("{{a}}", &params(&[("a", "{{a}}")]), &mut missing);
         assert_eq!(out, "{{a}}");
         assert!(missing.is_empty());
     }

@@ -535,7 +535,10 @@ mod tests {
         // Canonicalize: macOS /var symlinks to /private/var, and login sh
         // may resolve $PWD differently — compare on the trailing component.
         assert!(
-            stdout.starts_with("ran-in:") && stdout.trim().ends_with(tmp.path().file_name().unwrap().to_str().unwrap()),
+            stdout.starts_with("ran-in:")
+                && stdout
+                    .trim()
+                    .ends_with(tmp.path().file_name().unwrap().to_str().unwrap()),
             "expected the cd+printf chain to run in {}, got: {stdout} (wire: {wire})",
             dir,
         );

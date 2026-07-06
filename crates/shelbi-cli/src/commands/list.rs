@@ -38,13 +38,7 @@ pub fn run(project: Option<String>) -> Result<()> {
         return Ok(());
     }
     for (id, machine, branch, status) in rows {
-        println!(
-            "{} {:<24} {:<10} {}",
-            status.glyph(),
-            id,
-            machine,
-            branch
-        );
+        println!("{} {:<24} {:<10} {}", status.glyph(), id, machine, branch);
     }
     Ok(())
 }

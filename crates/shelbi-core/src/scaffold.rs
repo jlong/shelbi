@@ -399,7 +399,10 @@ agent_runners:
         let p = Project::from_yaml_str(&decorated).expect("decorated project parses");
         assert_eq!(p.name, "myapp");
         assert_eq!(p.machines.len(), 1, "ssh example must stay commented");
-        assert!(p.workspaces.is_empty(), "workspaces example must stay commented");
+        assert!(
+            p.workspaces.is_empty(),
+            "workspaces example must stay commented"
+        );
     }
 
     #[test]
@@ -412,7 +415,10 @@ agent_runners:
             .expect("uncommented workspaces reference real machines/runners");
         // Spot-check that representative optional features actually turned on.
         assert_eq!(p.machines.len(), 2, "ssh machine example uncommented");
-        assert!(p.machines.iter().any(|m| m.host.as_deref() == Some("devbox.local")));
+        assert!(p
+            .machines
+            .iter()
+            .any(|m| m.host.as_deref() == Some("devbox.local")));
         assert_eq!(p.workspaces.len(), 3);
         assert!(p.workspaces.iter().any(|w| w.runner == "codex"));
         assert!(p
@@ -432,7 +438,10 @@ agent_runners:
         // As written: default six-status flow, no transitions.
         let wf = Workflow::from_yaml_str(&yaml).expect("decorated workflow parses");
         assert_eq!(wf.name, "default");
-        assert!(wf.transitions.is_none(), "transitions example stays commented");
+        assert!(
+            wf.transitions.is_none(),
+            "transitions example stays commented"
+        );
 
         // Uncommented: transitions/git/zen/initial_status all turn on and validate.
         let wf = Workflow::from_yaml_str(&uncomment(&yaml))

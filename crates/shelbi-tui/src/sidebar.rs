@@ -50,7 +50,9 @@ fn render_list(f: &mut Frame, app: &mut App, area: Rect) {
     let title = Paragraph::new(vec![
         Line::from(Span::styled(
             app.project_name.clone(),
-            Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
         )),
         Line::raw(""),
     ]);
@@ -139,9 +141,14 @@ fn render_row(row: &Row, selected: bool, width: usize) -> ListItem<'static> {
             }
         }
         Row::Workspace {
-            name, agent, indent, ..
+            name,
+            agent,
+            indent,
+            ..
         } => {
-            let dec = row.decoration().expect("workspace rows always have a decoration");
+            let dec = row
+                .decoration()
+                .expect("workspace rows always have a decoration");
             // Multi-machine projects indent workspace rows by two columns
             // so they sit visually inside their `▾ <machine>` group; flat
             // single-machine layouts skip the indent.
@@ -186,7 +193,9 @@ fn render_row(row: &Row, selected: bool, width: usize) -> ListItem<'static> {
             // (dim ·) has no location yet. Line 2: branch, dim. The badge
             // glyph/color come from `row.decoration()`, the single source
             // shared with the palette.
-            let dec = row.decoration().expect("review rows always have a decoration");
+            let dec = row
+                .decoration()
+                .expect("review rows always have a decoration");
             let badge = Span::styled(
                 format!("{} ", dec.glyph),
                 Style::default().fg(decoration_to_color(dec.color)),
@@ -219,11 +228,7 @@ fn render_row(row: &Row, selected: bool, width: usize) -> ListItem<'static> {
             let line2 = Line::from(Span::styled(format!("  {branch}"), branch_style));
             ListItem::new(vec![line1, line2])
         }
-        Row::LegacyAgent {
-            id,
-            machine,
-            ..
-        } => {
+        Row::LegacyAgent { id, machine, .. } => {
             let dec = row
                 .decoration()
                 .expect("legacy-agent rows always have a decoration");
@@ -238,7 +243,11 @@ fn render_row(row: &Row, selected: bool, width: usize) -> ListItem<'static> {
                 Style::default().fg(Color::DarkGray),
                 width,
             );
-            ListItem::new(if selected { Line::from(bold(line)) } else { Line::from(line) })
+            ListItem::new(if selected {
+                Line::from(bold(line))
+            } else {
+                Line::from(line)
+            })
         }
     }
 }
@@ -386,10 +395,7 @@ fn render_zen_row(f: &mut Frame, area: Rect, app: &App) {
             let right = pad - left;
             format!("{}{}{}", " ".repeat(left), label, " ".repeat(right))
         };
-        f.render_widget(
-            Paragraph::new(Line::from(Span::styled(line, style))),
-            area,
-        );
+        f.render_widget(Paragraph::new(Line::from(Span::styled(line, style))), area);
         return;
     }
 
@@ -516,7 +522,12 @@ mod tests {
     fn row_y(rows: &[String], needle: &str) -> usize {
         rows.iter()
             .position(|r| r.contains(needle))
-            .unwrap_or_else(|| panic!("expected row containing {needle:?} in:\n{}", rows.join("\n")))
+            .unwrap_or_else(|| {
+                panic!(
+                    "expected row containing {needle:?} in:\n{}",
+                    rows.join("\n")
+                )
+            })
     }
 
     /// On state: full-width green band carrying `ZEN MODE ON`, one blank
@@ -574,7 +585,10 @@ mod tests {
 
         let rows = dump(&term);
         let joined = rows.join("\n");
-        assert!(!joined.contains("ZEN MODE ON"), "no green band when off, got:\n{joined}");
+        assert!(
+            !joined.contains("ZEN MODE ON"),
+            "no green band when off, got:\n{joined}"
+        );
         assert!(
             joined.contains("⌥Z Zen mode"),
             "expected hotkey hint sourced from configured chord in:\n{joined}"
@@ -644,7 +658,10 @@ mod tests {
         app.zen_toggle_chord = ZenToggleChord::AltZ;
         term.draw(|f| render_full(f, &mut app, f.area())).unwrap();
         let joined = dump(&term).join("\n");
-        assert!(!joined.contains("ZEN MODE ON"), "paused must not show green band, got:\n{joined}");
+        assert!(
+            !joined.contains("ZEN MODE ON"),
+            "paused must not show green band, got:\n{joined}"
+        );
         assert!(
             joined.contains("⌥Z Zen mode"),
             "paused should still show the hotkey hint, got:\n{joined}"
@@ -664,7 +681,10 @@ mod tests {
         app.zen_toggle_chord = ZenToggleChord::None;
         term.draw(|f| render_full(f, &mut app, f.area())).unwrap();
         let joined = dump(&term).join("\n");
-        assert!(!joined.contains("Zen mode"), "no hint expected when no chord bound, got:\n{joined}");
+        assert!(
+            !joined.contains("Zen mode"),
+            "no hint expected when no chord bound, got:\n{joined}"
+        );
     }
 
     /// Multi-machine layout reads like the wireframe: the renamed
@@ -814,8 +834,14 @@ mod tests {
             "collapsed hub must hide all workspace rows, got:\n{joined}"
         );
         // devbox is still expanded — its single workspace renders.
-        assert!(joined.contains("▾ devbox"), "devbox stays expanded, got:\n{joined}");
-        assert!(joined.contains("delta"), "expanded devbox surfaces its workspace, got:\n{joined}");
+        assert!(
+            joined.contains("▾ devbox"),
+            "devbox stays expanded, got:\n{joined}"
+        );
+        assert!(
+            joined.contains("delta"),
+            "expanded devbox surfaces its workspace, got:\n{joined}"
+        );
     }
 
     /// Active workspaces use the `Working` badge glyph (`⏵`). Collapsed
@@ -939,13 +965,23 @@ mod tests {
         let rows = dump(&term);
         let joined = rows.join("\n");
 
-        assert!(joined.contains("Ready for Review"), "Ready header, got:\n{joined}");
-        assert!(joined.contains("Queued for Review"), "Queued header, got:\n{joined}");
+        assert!(
+            joined.contains("Ready for Review"),
+            "Ready header, got:\n{joined}"
+        );
+        assert!(
+            joined.contains("Queued for Review"),
+            "Queued header, got:\n{joined}"
+        );
 
         // Ready item: ✓ badge, title, and the machine:port URL on line 1;
         // branch dim on the very next line.
         let ready_y = row_y(&rows, "Palette fuzzy-match fix");
-        assert!(rows[ready_y].contains('✓'), "Ready row carries ✓, got: {:?}", rows[ready_y]);
+        assert!(
+            rows[ready_y].contains('✓'),
+            "Ready row carries ✓, got: {:?}",
+            rows[ready_y]
+        );
         assert!(
             rows[ready_y].contains("hub:3000"),
             "Ready row's line 1 carries the machine:port URL, got: {:?}",
@@ -959,7 +995,11 @@ mod tests {
 
         // Queued item: · badge, no URL; branch on the next line.
         let queued_y = row_y(&rows, "Rework onboarding copy");
-        assert!(rows[queued_y].contains('·'), "Queued row carries ·, got: {:?}", rows[queued_y]);
+        assert!(
+            rows[queued_y].contains('·'),
+            "Queued row carries ·, got: {:?}",
+            rows[queued_y]
+        );
         assert!(
             !rows[queued_y].contains(':'),
             "a queued item has no location badge, got: {:?}",

@@ -349,17 +349,26 @@ mod tests {
         // Source code containing the exact option string as a literal.
         let code = "        DialogSignature::new(\"usage-limit\", \"Stop and wait for limit to reset\"),\n\
                     // matches the usage limit modal claude renders";
-        assert!(detect_usage_limit(code).is_none(), "source literal must not detect");
+        assert!(
+            detect_usage_limit(code).is_none(),
+            "source literal must not detect"
+        );
 
         // Prose / docs describing the behavior.
         let docs = "When Claude Code hits your usage limit, it prints \"usage limit reached\" and \
                     waits until the limit resets at the top of the hour.";
-        assert!(detect_usage_limit(docs).is_none(), "docs prose must not detect");
+        assert!(
+            detect_usage_limit(docs).is_none(),
+            "docs prose must not detect"
+        );
 
         // An agent's own chat mentioning it while working on this task.
         let chat = "I'll add detection for the usage limit stall — the 'Stop and wait for limit \
                     to reset' option — and show a pause badge.";
-        assert!(detect_usage_limit(chat).is_none(), "agent chat must not detect");
+        assert!(
+            detect_usage_limit(chat).is_none(),
+            "agent chat must not detect"
+        );
 
         // A live, ready input box (no limit at all).
         assert!(detect_usage_limit(INPUT_BOX_SCREEN).is_none());
@@ -391,14 +400,18 @@ mod tests {
 
     #[test]
     fn is_menu_option_line_requires_menu_chrome() {
-        assert!(is_menu_option_line(" ❯ 1. Stop and wait for limit to reset"));
+        assert!(is_menu_option_line(
+            " ❯ 1. Stop and wait for limit to reset"
+        ));
         assert!(is_menu_option_line("   2. Upgrade your plan"));
         assert!(is_menu_option_line("10. tenth option"));
         // A bare mention with no menu framing is not a menu option.
         assert!(!is_menu_option_line(
             "DialogSignature::new(\"usage-limit\", \"Stop and wait for limit to reset\"),"
         ));
-        assert!(!is_menu_option_line("the option: Stop and wait for limit to reset"));
+        assert!(!is_menu_option_line(
+            "the option: Stop and wait for limit to reset"
+        ));
         assert!(!is_menu_option_line("❯ Try \"edit <filepath>\""));
     }
 
@@ -430,7 +443,10 @@ mod tests {
     fn detect_blocking_dialog_honors_custom_signature() {
         // The "extensible via config" path: a project-defined signature is
         // matched just like the built-ins.
-        let sigs = vec![shelbi_core::DialogSignature::new("codex-approve", "Approve this edit?")];
+        let sigs = vec![shelbi_core::DialogSignature::new(
+            "codex-approve",
+            "Approve this edit?",
+        )];
         assert_eq!(
             detect_blocking_dialog("codex › Approve this edit? (y/n)", &sigs).as_deref(),
             Some("codex-approve")

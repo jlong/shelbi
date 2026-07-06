@@ -46,9 +46,7 @@ pub fn validate_root(path: &Path) -> RootValidation {
     if !path.exists() {
         return RootValidation::NotExists;
     }
-    let is_dir = std::fs::metadata(path)
-        .map(|m| m.is_dir())
-        .unwrap_or(false);
+    let is_dir = std::fs::metadata(path).map(|m| m.is_dir()).unwrap_or(false);
     if !is_dir {
         return RootValidation::NotDirectory;
     }
@@ -90,7 +88,9 @@ fn is_git_repo(path: &Path) -> bool {
 /// why the same check backstops the serde-rendered project YAML.
 pub fn validate_project_name(name: &str) -> Result<()> {
     if name.is_empty() {
-        bail!("project name is empty — pass --project NAME (allowed: [A-Za-z0-9_-], no leading `.`)");
+        bail!(
+            "project name is empty — pass --project NAME (allowed: [A-Za-z0-9_-], no leading `.`)"
+        );
     }
     if name.starts_with('.') {
         bail!(
@@ -151,9 +151,7 @@ pub fn resolve_root_for_init(
         return resolve_scripted(cwd, &root, force_name);
     }
     if !std::io::stdin().is_terminal() {
-        bail!(
-            "shelbi: not running interactively — pass --root <path> to set the project root."
-        );
+        bail!("shelbi: not running interactively — pass --root <path> to set the project root.");
     }
     prompt_loop(cwd, force_name)
 }
@@ -264,7 +262,10 @@ fn prompt_loop(cwd: &Path, force_name: Option<&str>) -> Result<ResolvedProjectRo
             }
         }
 
-        return Ok(ResolvedProjectRoot { path: candidate, name });
+        return Ok(ResolvedProjectRoot {
+            path: candidate,
+            name,
+        });
     }
 }
 
@@ -415,7 +416,10 @@ mod tests {
     #[test]
     fn absolutize_makes_relative_absolute() {
         let cwd = PathBuf::from("/tmp/cwd");
-        assert_eq!(absolutize(&cwd, Path::new("sub")), PathBuf::from("/tmp/cwd/sub"));
+        assert_eq!(
+            absolutize(&cwd, Path::new("sub")),
+            PathBuf::from("/tmp/cwd/sub")
+        );
     }
 
     #[test]
@@ -468,8 +472,7 @@ mod tests {
         std::fs::create_dir_all(repo.join(".git")).unwrap();
 
         let cwd = std::env::current_dir().unwrap();
-        let resolved =
-            resolve_root_for_init(&cwd, Some(repo.clone()), None).expect("resolver");
+        let resolved = resolve_root_for_init(&cwd, Some(repo.clone()), None).expect("resolver");
         assert_eq!(resolved.path, repo);
         assert_eq!(resolved.name, "my-repo");
         std::env::remove_var("SHELBI_HOME");
@@ -525,8 +528,8 @@ mod tests {
         std::fs::create_dir_all(repo.join(".git")).unwrap();
 
         let cwd = std::env::current_dir().unwrap();
-        let resolved = resolve_root_for_init(&cwd, Some(repo.clone()), Some("custom-name"))
-            .expect("resolver");
+        let resolved =
+            resolve_root_for_init(&cwd, Some(repo.clone()), Some("custom-name")).expect("resolver");
         assert_eq!(resolved.name, "custom-name");
         std::env::remove_var("SHELBI_HOME");
     }

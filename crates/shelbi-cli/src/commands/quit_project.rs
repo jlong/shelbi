@@ -202,7 +202,12 @@ fn pick_next_session(listing: &str, current: &str) -> Option<String> {
     for line in listing.lines() {
         let mut parts = line.splitn(2, ' ');
         let name = parts.next().unwrap_or("").trim();
-        let ts = parts.next().unwrap_or("").trim().parse::<u64>().unwrap_or(0);
+        let ts = parts
+            .next()
+            .unwrap_or("")
+            .trim()
+            .parse::<u64>()
+            .unwrap_or(0);
         if name.is_empty() || name == current || !name.starts_with("shelbi-") {
             continue;
         }
@@ -279,12 +284,18 @@ shelbi-bravo 0
         // No in-progress card on the board — the workspace is idle even if
         // the status.yaml still says "working" from a previous turn.
         assert_eq!(workspace_state_label(false, None), "idle");
-        assert_eq!(workspace_state_label(false, Some(WorkspaceState::Working)), "idle");
+        assert_eq!(
+            workspace_state_label(false, Some(WorkspaceState::Working)),
+            "idle"
+        );
         assert_eq!(
             workspace_state_label(false, Some(WorkspaceState::AwaitingInput)),
             "idle"
         );
-        assert_eq!(workspace_state_label(false, Some(WorkspaceState::Blocked)), "idle");
+        assert_eq!(
+            workspace_state_label(false, Some(WorkspaceState::Blocked)),
+            "idle"
+        );
     }
 
     #[test]

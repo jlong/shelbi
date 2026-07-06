@@ -3,9 +3,7 @@ use std::path::PathBuf;
 use anyhow::{anyhow, bail, Context, Result};
 use chrono::Utc;
 use clap::Args as ClapArgs;
-use shelbi_core::{
-    validate_agent_id, Agent, Host, Machine, Project, Status, TmuxAddr,
-};
+use shelbi_core::{validate_agent_id, Agent, Host, Machine, Project, Status, TmuxAddr};
 
 use super::require_project;
 
@@ -276,15 +274,19 @@ fn create_worktree(
     // if not, create it from the default branch.
     let branch_exists = shelbi_ssh::run(
         host,
-        [
-            "git", "-C", &repo_dir, "rev-parse", "--verify", branch,
-        ],
+        ["git", "-C", &repo_dir, "rev-parse", "--verify", branch],
     )
     .map_err(|e| anyhow!(e))?
     .status
     .success();
 
-    let mut args: Vec<String> = vec!["git".into(), "-C".into(), repo_dir.clone(), "worktree".into(), "add".into()];
+    let mut args: Vec<String> = vec![
+        "git".into(),
+        "-C".into(),
+        repo_dir.clone(),
+        "worktree".into(),
+        "add".into(),
+    ];
     if branch_exists {
         args.push(wt_str.clone());
         args.push(branch.into());

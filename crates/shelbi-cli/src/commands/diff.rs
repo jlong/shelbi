@@ -20,13 +20,10 @@ pub fn run(project: Option<String>, id: String) -> Result<()> {
     .map_err(|e| anyhow!(e))?;
     let base = merge_base.trim();
 
-    let diff = shelbi_ssh::run_capture(
-        &host,
-        ["git", "-C", &wt, "diff", &format!("{base}..HEAD")],
-    )
-    .map_err(|e| anyhow!(e))?;
-    let working = shelbi_ssh::run_capture(&host, ["git", "-C", &wt, "diff"])
+    let diff = shelbi_ssh::run_capture(&host, ["git", "-C", &wt, "diff", &format!("{base}..HEAD")])
         .map_err(|e| anyhow!(e))?;
+    let working =
+        shelbi_ssh::run_capture(&host, ["git", "-C", &wt, "diff"]).map_err(|e| anyhow!(e))?;
 
     if diff.is_empty() && working.is_empty() {
         println!("(no diff)");

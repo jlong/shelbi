@@ -31,8 +31,8 @@ use std::path::PathBuf;
 use shelbi_core::{Error, Result};
 
 use crate::{
-    agents_dir, atomic_write, ensure_dir, project_dir, read_state,
-    update_state, DEFAULT_WORKSPACE_SETTINGS_TEMPLATE,
+    agents_dir, atomic_write, ensure_dir, project_dir, read_state, update_state,
+    DEFAULT_WORKSPACE_SETTINGS_TEMPLATE,
 };
 
 /// Stable identifier of the default orchestrator agent.
@@ -79,8 +79,7 @@ pub const DEFAULT_ORCHESTRATOR_INSTRUCTIONS: &str =
     include_str!("default_orchestrator.md.template");
 
 /// Bundled developer `instructions.md` content.
-pub const DEFAULT_DEVELOPER_INSTRUCTIONS: &str =
-    include_str!("default_developer.md.template");
+pub const DEFAULT_DEVELOPER_INSTRUCTIONS: &str = include_str!("default_developer.md.template");
 
 /// Bundled review `instructions.md` content — the loader charter.
 pub const DEFAULT_REVIEW_INSTRUCTIONS: &str = include_str!("default_review.md.template");
@@ -89,8 +88,7 @@ pub const DEFAULT_REVIEW_INSTRUCTIONS: &str = include_str!("default_review.md.te
 /// auto-detect heuristics for booting an unknown project on `$PORT`.
 /// Kept in the agent (Decision A in the review-workspaces plan) rather
 /// than in Rust so per-repo detection stays flexible without schema churn.
-pub const DEFAULT_REVIEW_LOAD_RUN_SKILL: &str =
-    include_str!("skills/load_run_detection.SKILL.md");
+pub const DEFAULT_REVIEW_LOAD_RUN_SKILL: &str = include_str!("skills/load_run_detection.SKILL.md");
 
 /// One bundled file under a default agent's `skills/` directory. `rel_path`
 /// is relative to `<workspace>/skills/` and may include subdirectories
@@ -161,7 +159,8 @@ pub const DEFAULT_AGENTS: &[BundledAgent] = &[
 pub fn agent_workspace_dir(project: &str, agent: &str) -> Result<PathBuf> {
     // `agents_dir` validates the project name; guard the agent name here so a
     // `..`/absolute/`a/b` agent can't escape the project's `agents/` dir
-    // (state-runtime F14).
+    // (Shelbi ContextStore
+    // docs/planning:reviews/adversarial-2026-07/state-runtime.md F14).
     crate::ensure_flat_path_component("agent", agent)?;
     Ok(agents_dir(project)?.join(agent))
 }
@@ -708,7 +707,8 @@ pub fn self_heal_default_agents(project: &str) -> Result<Vec<AgentMaterializeOut
                     // Atomic (tmp + rename): a crash mid-write must never
                     // leave a truncated `instructions.md`, which the next
                     // self-heal pass would misclassify as a user
-                    // customization and preserve forever (F8).
+                    // customization and preserve forever (Shelbi ContextStore
+                    // docs/planning:reviews/adversarial-2026-07/state-runtime.md F8).
                     atomic_write(&path, agent.instructions.as_bytes())?;
                     state.notified_diverged_agents.remove(agent.name);
                     state
@@ -722,7 +722,10 @@ pub fn self_heal_default_agents(project: &str) -> Result<Vec<AgentMaterializeOut
                 Err(e) => return Err(Error::Io(e)),
             };
 
-            let deployed = state.deployed_agent_defaults.get(agent.name).map(String::as_str);
+            let deployed = state
+                .deployed_agent_defaults
+                .get(agent.name)
+                .map(String::as_str);
             match classify_agent_divergence(deployed, agent.instructions, &current) {
                 AgentDivergence::PristineCurrent => {
                     // Matches the current compiled default. Clear any stale
@@ -779,14 +782,18 @@ fn write_bundled_agent(project: &str, agent: &BundledAgent) -> Result<()> {
     ensure_dir(&agent_skills_dir(project, agent.name)?)?;
     // Atomic (tmp + rename) so a crash mid-`shelbi init` can't leave a
     // truncated `instructions.md` that self-heal later preserves as a
-    // "customization" (F8) — the agent would then dispatch with half a
+    // "customization" (Shelbi ContextStore
+    // docs/planning:reviews/adversarial-2026-07/state-runtime.md F8) — the agent would then dispatch with half a
     // prompt. `atomic_write` is the same sink `status.yaml`/`keys.yaml` use.
     atomic_write(
         &agent_instructions_path(project, agent.name)?,
         agent.instructions.as_bytes(),
     )?;
     if let Some(settings) = agent.settings_template {
-        atomic_write(&agent_settings_path(project, agent.name)?, settings.as_bytes())?;
+        atomic_write(
+            &agent_settings_path(project, agent.name)?,
+            settings.as_bytes(),
+        )?;
     }
     for skill in agent.skills {
         write_bundled_skill(project, agent.name, skill)?;
@@ -804,7 +811,8 @@ fn write_bundled_skill(project: &str, agent: &str, skill: &BundledSkill) -> Resu
     if let Some(parent) = path.parent() {
         ensure_dir(parent)?;
     }
-    // Atomic (tmp + rename) for the same F8 reason as `instructions.md`: a
+    // Atomic (tmp + rename) for the same Shelbi ContextStore
+    // docs/planning:reviews/adversarial-2026-07/state-runtime.md F8 reason as `instructions.md`: a
     // crash mid-write must not leave a truncated skill that self-heal later
     // preserves as a "customization" — the same sink used elsewhere here.
     atomic_write(&path, skill.content.as_bytes())
@@ -825,7 +833,8 @@ fn ensure_agent_settings_present(project: &str, agent: &BundledAgent) -> Result<
         return Ok(());
     }
     // Atomic write — a torn `settings.json` from a mid-write crash would
-    // drop the message-tail hooks silently (F8).
+    // drop the message-tail hooks silently (Shelbi ContextStore
+    // docs/planning:reviews/adversarial-2026-07/state-runtime.md F8).
     atomic_write(&path, default.as_bytes())
 }
 
@@ -1022,7 +1031,10 @@ mod tests {
         let state = read_state("p").unwrap();
         for agent in DEFAULT_AGENTS {
             assert_eq!(
-                state.deployed_agent_defaults.get(agent.name).map(String::as_str),
+                state
+                    .deployed_agent_defaults
+                    .get(agent.name)
+                    .map(String::as_str),
                 Some(content_hash(agent.instructions).as_str()),
                 "provenance for {} should be the deployed default's hash",
                 agent.name,
@@ -1078,7 +1090,10 @@ mod tests {
         assert!(!state.notified_diverged_agents.contains(ORCHESTRATOR_AGENT));
         // ...and provenance was re-recorded to the new default.
         assert_eq!(
-            state.deployed_agent_defaults.get(ORCHESTRATOR_AGENT).map(String::as_str),
+            state
+                .deployed_agent_defaults
+                .get(ORCHESTRATOR_AGENT)
+                .map(String::as_str),
             Some(content_hash(DEFAULT_ORCHESTRATOR_INSTRUCTIONS).as_str()),
         );
 
@@ -1672,7 +1687,8 @@ mod tests {
 
     #[test]
     fn agent_workspace_dir_rejects_traversal_names() {
-        // Residual chokepoint hardening (state-runtime F14): a `..`/absolute/
+        // Residual chokepoint hardening (Shelbi ContextStore
+        // docs/planning:reviews/adversarial-2026-07/state-runtime.md F14): a `..`/absolute/
         // separator agent name must not escape the project's `agents/` dir.
         for bad in ["..", "../evil", "a/b", "/abs", "nested/../escape", ""] {
             assert!(

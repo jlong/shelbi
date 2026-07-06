@@ -27,9 +27,6 @@ use std::fs;
 use std::hash::Hash;
 use std::path::Path;
 
-use crossterm::event::KeyEvent;
-use serde::Deserialize;
-use serde_yaml::{Mapping, Value};
 use super::actions::{
     Action, ActivityAction, GlobalAction, KanbanAction, PaletteAction, PopoverAction,
     SidebarAction, MODE_NAMES,
@@ -37,6 +34,9 @@ use super::actions::{
 use super::chord::KeyChord;
 use crate::user_config::{load_user_config, save_user_config, ZenToggleChord};
 use crate::{atomic_write, shelbi_home};
+use crossterm::event::KeyEvent;
+use serde::Deserialize;
+use serde_yaml::{Mapping, Value};
 
 /// Filename under `$SHELBI_HOME` for user-authored key overrides.
 pub const KEYS_FILENAME: &str = "keys.yaml";
@@ -316,7 +316,14 @@ pub fn load_keymaps(project_name: Option<&str>) -> (Keymaps, Vec<KeymapDiagnosti
     // Layer 1: embedded defaults — every action gets its built-in chords.
     let mut staged: HashMap<Action, Vec<String>> = HashMap::new();
     for action in Action::all() {
-        staged.insert(action, action.default_chords().iter().map(|s| s.to_string()).collect());
+        staged.insert(
+            action,
+            action
+                .default_chords()
+                .iter()
+                .map(|s| s.to_string())
+                .collect(),
+        );
     }
 
     // Layer 2/3: load keys.yaml if present. Missing file is fine.
@@ -613,11 +620,7 @@ fn build_keymaps(parsed: &HashMap<Action, Vec<KeyChord>>) -> Keymaps {
     km
 }
 
-fn insert_into<A: Copy + Eq + Hash>(
-    map: &mut ModeKeymap<A>,
-    action: A,
-    chords: &[KeyChord],
-) {
+fn insert_into<A: Copy + Eq + Hash>(map: &mut ModeKeymap<A>, action: A, chords: &[KeyChord]) {
     for c in chords {
         match map.bindings.get(c) {
             // Another action already claimed this chord. The collision
@@ -960,43 +963,53 @@ mod tests {
         // Spot-check a representative chord from every mode against the
         // hardcoded mappings in shelbi-tui/src/lib.rs and palette.rs.
         assert_eq!(
-            km.global.dispatch(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)),
+            km.global
+                .dispatch(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)),
             Some(GlobalAction::Quit)
         );
         assert_eq!(
-            km.global.dispatch(KeyEvent::new(KeyCode::Char('z'), KeyModifiers::ALT)),
+            km.global
+                .dispatch(KeyEvent::new(KeyCode::Char('z'), KeyModifiers::ALT)),
             Some(GlobalAction::ZenToggle)
         );
         assert_eq!(
-            km.global.dispatch(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL)),
+            km.global
+                .dispatch(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL)),
             Some(GlobalAction::OpenPalette)
         );
         assert_eq!(
-            km.sidebar.dispatch(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE)),
+            km.sidebar
+                .dispatch(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE)),
             Some(SidebarAction::NavDown)
         );
         assert_eq!(
-            km.sidebar.dispatch(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE)),
+            km.sidebar
+                .dispatch(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE)),
             Some(SidebarAction::NavUp)
         );
         assert_eq!(
-            km.kanban.dispatch(KeyEvent::new(KeyCode::Char('H'), KeyModifiers::SHIFT)),
+            km.kanban
+                .dispatch(KeyEvent::new(KeyCode::Char('H'), KeyModifiers::SHIFT)),
             Some(KanbanAction::MoveCardLeft)
         );
         assert_eq!(
-            km.kanban.dispatch(KeyEvent::new(KeyCode::Up, KeyModifiers::SHIFT)),
+            km.kanban
+                .dispatch(KeyEvent::new(KeyCode::Up, KeyModifiers::SHIFT)),
             Some(KanbanAction::ReorderUp)
         );
         assert_eq!(
-            km.popover.dispatch(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
+            km.popover
+                .dispatch(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
             Some(PopoverAction::Close)
         );
         assert_eq!(
-            km.activity.dispatch(KeyEvent::new(KeyCode::Char('z'), KeyModifiers::NONE)),
+            km.activity
+                .dispatch(KeyEvent::new(KeyCode::Char('z'), KeyModifiers::NONE)),
             Some(ActivityAction::ToggleZenFilter)
         );
         assert_eq!(
-            km.palette.dispatch(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL)),
+            km.palette
+                .dispatch(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL)),
             Some(PaletteAction::Close)
         );
 
@@ -1019,21 +1032,25 @@ mod tests {
         assert!(diags.is_empty(), "{diags:?}");
         // nav_up is now `w` (replaces — not unions — the default).
         assert_eq!(
-            km.sidebar.dispatch(KeyEvent::new(KeyCode::Char('w'), KeyModifiers::NONE)),
+            km.sidebar
+                .dispatch(KeyEvent::new(KeyCode::Char('w'), KeyModifiers::NONE)),
             Some(SidebarAction::NavUp)
         );
         // The old defaults are gone.
         assert_eq!(
-            km.sidebar.dispatch(KeyEvent::new(KeyCode::Char('k'), KeyModifiers::NONE)),
+            km.sidebar
+                .dispatch(KeyEvent::new(KeyCode::Char('k'), KeyModifiers::NONE)),
             None
         );
         assert_eq!(
-            km.sidebar.dispatch(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE)),
+            km.sidebar
+                .dispatch(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE)),
             None
         );
         // Other actions still have their defaults.
         assert_eq!(
-            km.sidebar.dispatch(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE)),
+            km.sidebar
+                .dispatch(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE)),
             Some(SidebarAction::NavDown)
         );
 
@@ -1068,7 +1085,8 @@ mod tests {
         );
         // ...and its override took effect on this very load.
         assert_eq!(
-            km.sidebar.dispatch(KeyEvent::new(KeyCode::Char('w'), KeyModifiers::NONE)),
+            km.sidebar
+                .dispatch(KeyEvent::new(KeyCode::Char('w'), KeyModifiers::NONE)),
             Some(SidebarAction::NavUp)
         );
 
@@ -1083,8 +1101,16 @@ mod tests {
         ensure_dir(&home).unwrap();
         // Both present: the canonical .yaml wins and the legacy .yml is
         // left untouched (never deleted) so no user data is lost.
-        std::fs::write(home.join("keys.yml"), "defaults:\n  sidebar:\n    nav_up: q\n").unwrap();
-        std::fs::write(home.join("keys.yaml"), "defaults:\n  sidebar:\n    nav_up: w\n").unwrap();
+        std::fs::write(
+            home.join("keys.yml"),
+            "defaults:\n  sidebar:\n    nav_up: q\n",
+        )
+        .unwrap();
+        std::fs::write(
+            home.join("keys.yaml"),
+            "defaults:\n  sidebar:\n    nav_up: w\n",
+        )
+        .unwrap();
 
         let (km, diags) = load_keymaps(None);
         assert!(diags.is_empty(), "{diags:?}");
@@ -1098,7 +1124,8 @@ mod tests {
         // resolving to NavUp is only possible if the `.yaml` — not the
         // `.yml` — was the file that got read.
         assert_eq!(
-            km.sidebar.dispatch(KeyEvent::new(KeyCode::Char('w'), KeyModifiers::NONE)),
+            km.sidebar
+                .dispatch(KeyEvent::new(KeyCode::Char('w'), KeyModifiers::NONE)),
             Some(SidebarAction::NavUp),
             "the canonical .yaml must be authoritative, not the stale .yml"
         );
@@ -1129,27 +1156,34 @@ projects:
         let (km, _) = load_keymaps(Some("shelbi"));
         // defaults layer's override survives where projects didn't touch.
         assert_eq!(
-            km.sidebar.dispatch(KeyEvent::new(KeyCode::Char('w'), KeyModifiers::NONE)),
+            km.sidebar
+                .dispatch(KeyEvent::new(KeyCode::Char('w'), KeyModifiers::NONE)),
             Some(SidebarAction::NavUp)
         );
         // project's override replaces the default.
         assert_eq!(
-            km.sidebar.dispatch(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::NONE)),
+            km.sidebar
+                .dispatch(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::NONE)),
             Some(SidebarAction::NavDown)
         );
         assert_eq!(
-            km.sidebar.dispatch(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE)),
+            km.sidebar
+                .dispatch(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE)),
             None
         );
 
         // For an unrelated project the override does NOT apply.
         let (km_other, _) = load_keymaps(Some("other"));
         assert_eq!(
-            km_other.sidebar.dispatch(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::NONE)),
+            km_other
+                .sidebar
+                .dispatch(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::NONE)),
             None
         );
         assert_eq!(
-            km_other.sidebar.dispatch(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE)),
+            km_other
+                .sidebar
+                .dispatch(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE)),
             Some(SidebarAction::NavDown)
         );
         std::env::remove_var("SHELBI_HOME");
@@ -1167,12 +1201,14 @@ projects:
         let (km, diags) = load_keymaps(None);
         // Migrated chord wins on the very first load.
         assert_eq!(
-            km.global.dispatch(KeyEvent::new(KeyCode::Char('g'), KeyModifiers::CONTROL)),
+            km.global
+                .dispatch(KeyEvent::new(KeyCode::Char('g'), KeyModifiers::CONTROL)),
             Some(GlobalAction::ZenToggle)
         );
         // Alt+Z is no longer the binding.
         assert_eq!(
-            km.global.dispatch(KeyEvent::new(KeyCode::Char('z'), KeyModifiers::ALT)),
+            km.global
+                .dispatch(KeyEvent::new(KeyCode::Char('z'), KeyModifiers::ALT)),
             None
         );
         // One-time migration notice fires.
@@ -1208,15 +1244,15 @@ projects:
             !diags2.iter().any(|d| matches!(
                 d,
                 KeymapDiagnostic::Warning {
-                    kind: WarningKind::LegacyZenToggleMigrated
-                        | WarningKind::LegacyZenToggleField,
+                    kind: WarningKind::LegacyZenToggleMigrated | WarningKind::LegacyZenToggleField,
                     ..
                 }
             )),
             "second load should be silent, got {diags2:?}"
         );
         assert_eq!(
-            km2.global.dispatch(KeyEvent::new(KeyCode::Char('g'), KeyModifiers::CONTROL)),
+            km2.global
+                .dispatch(KeyEvent::new(KeyCode::Char('g'), KeyModifiers::CONTROL)),
             Some(GlobalAction::ZenToggle)
         );
         std::env::remove_var("SHELBI_HOME");
@@ -1244,12 +1280,14 @@ projects:
         let (km, _diags) = load_keymaps(None);
         // The pre-existing nav_up override survives the migration.
         assert_eq!(
-            km.sidebar.dispatch(KeyEvent::new(KeyCode::Char('w'), KeyModifiers::NONE)),
+            km.sidebar
+                .dispatch(KeyEvent::new(KeyCode::Char('w'), KeyModifiers::NONE)),
             Some(SidebarAction::NavUp)
         );
         // And the migrated zen_toggle is in effect.
         assert_eq!(
-            km.global.dispatch(KeyEvent::new(KeyCode::Char('g'), KeyModifiers::CONTROL)),
+            km.global
+                .dispatch(KeyEvent::new(KeyCode::Char('g'), KeyModifiers::CONTROL)),
             Some(GlobalAction::ZenToggle)
         );
 
@@ -1297,11 +1335,13 @@ projects:
         // New field wins — the two configs disagree so migration must
         // refuse to clobber the keys.yaml value.
         assert_eq!(
-            km.global.dispatch(KeyEvent::new(KeyCode::Char('\\'), KeyModifiers::CONTROL)),
+            km.global
+                .dispatch(KeyEvent::new(KeyCode::Char('\\'), KeyModifiers::CONTROL)),
             Some(GlobalAction::ZenToggle)
         );
         assert_eq!(
-            km.global.dispatch(KeyEvent::new(KeyCode::Char('g'), KeyModifiers::CONTROL)),
+            km.global
+                .dispatch(KeyEvent::new(KeyCode::Char('g'), KeyModifiers::CONTROL)),
             None
         );
         // Warning fires telling the user to remove the legacy field.
@@ -1350,8 +1390,7 @@ projects:
             diags.iter().all(|d| !matches!(
                 d,
                 KeymapDiagnostic::Warning {
-                    kind: WarningKind::LegacyZenToggleField
-                        | WarningKind::LegacyZenToggleMigrated,
+                    kind: WarningKind::LegacyZenToggleField | WarningKind::LegacyZenToggleMigrated,
                     ..
                 }
             )),
@@ -1365,8 +1404,7 @@ projects:
             diags.iter().all(|d| !matches!(
                 d,
                 KeymapDiagnostic::Warning {
-                    kind: WarningKind::LegacyZenToggleField
-                        | WarningKind::LegacyZenToggleMigrated,
+                    kind: WarningKind::LegacyZenToggleField | WarningKind::LegacyZenToggleMigrated,
                     ..
                 }
             )),
@@ -1394,8 +1432,7 @@ projects:
             diags.iter().all(|d| !matches!(
                 d,
                 KeymapDiagnostic::Warning {
-                    kind: WarningKind::LegacyZenToggleField
-                        | WarningKind::LegacyZenToggleMigrated,
+                    kind: WarningKind::LegacyZenToggleField | WarningKind::LegacyZenToggleMigrated,
                     ..
                 }
             )),
@@ -1476,27 +1513,32 @@ defaults:
         .unwrap();
 
         let (km, diags) = load_keymaps(None);
-        let coll = diags.iter().any(|d| matches!(
-            d,
-            KeymapDiagnostic::Error {
-                kind: ErrorKind::Collision,
-                ..
-            }
-        ));
+        let coll = diags.iter().any(|d| {
+            matches!(
+                d,
+                KeymapDiagnostic::Error {
+                    kind: ErrorKind::Collision,
+                    ..
+                }
+            )
+        });
         assert!(coll, "expected Collision diagnostic, got {diags:?}");
 
         // Both colliding actions revert to defaults.
         assert_eq!(
-            km.sidebar.dispatch(KeyEvent::new(KeyCode::Char('k'), KeyModifiers::NONE)),
+            km.sidebar
+                .dispatch(KeyEvent::new(KeyCode::Char('k'), KeyModifiers::NONE)),
             Some(SidebarAction::NavUp)
         );
         assert_eq!(
-            km.sidebar.dispatch(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE)),
+            km.sidebar
+                .dispatch(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE)),
             Some(SidebarAction::NavDown)
         );
         // The colliding chord itself is no longer bound.
         assert_eq!(
-            km.sidebar.dispatch(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE)),
+            km.sidebar
+                .dispatch(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE)),
             None
         );
         std::env::remove_var("SHELBI_HOME");
@@ -1516,12 +1558,16 @@ defaults:
         let (km, diags) = load_keymaps(None);
         // Default bindings still loaded.
         assert_eq!(
-            km.sidebar.dispatch(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE)),
+            km.sidebar
+                .dispatch(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE)),
             Some(SidebarAction::NavDown)
         );
         assert!(diags.iter().any(|d| matches!(
             d,
-            KeymapDiagnostic::Error { kind: ErrorKind::UnknownAction, .. }
+            KeymapDiagnostic::Error {
+                kind: ErrorKind::UnknownAction,
+                ..
+            }
         )));
         std::env::remove_var("SHELBI_HOME");
     }
@@ -1539,12 +1585,16 @@ defaults:
         .unwrap();
         let (km, diags) = load_keymaps(None);
         assert_eq!(
-            km.sidebar.dispatch(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE)),
+            km.sidebar
+                .dispatch(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE)),
             Some(SidebarAction::NavDown)
         );
         assert!(diags.iter().any(|d| matches!(
             d,
-            KeymapDiagnostic::Error { kind: ErrorKind::UnknownAction, .. }
+            KeymapDiagnostic::Error {
+                kind: ErrorKind::UnknownAction,
+                ..
+            }
         )));
         std::env::remove_var("SHELBI_HOME");
     }
@@ -1572,7 +1622,8 @@ projects:
         assert!(diags.is_empty(), "{diags:?}");
         // null in project falls back to defaults' `w`.
         assert_eq!(
-            km.sidebar.dispatch(KeyEvent::new(KeyCode::Char('w'), KeyModifiers::NONE)),
+            km.sidebar
+                .dispatch(KeyEvent::new(KeyCode::Char('w'), KeyModifiers::NONE)),
             Some(SidebarAction::NavUp)
         );
         std::env::remove_var("SHELBI_HOME");
@@ -1604,10 +1655,7 @@ projects:
                 let b = KeyChord::parse(&canon).unwrap_or_else(|e| {
                     panic!("canonical {canon} for {action:?} failed to re-parse: {e}")
                 });
-                assert_eq!(
-                    a, b,
-                    "round trip broken for {action:?}: {raw} → {canon}"
-                );
+                assert_eq!(a, b, "round trip broken for {action:?}: {raw} → {canon}");
             }
         }
     }
@@ -1621,7 +1669,8 @@ projects:
         std::env::set_var("SHELBI_HOME", &home);
         let (km, _) = load_keymaps(None);
         assert_eq!(
-            km.kanban.dispatch(KeyEvent::new(KeyCode::Char('J'), KeyModifiers::NONE)),
+            km.kanban
+                .dispatch(KeyEvent::new(KeyCode::Char('J'), KeyModifiers::NONE)),
             Some(KanbanAction::ReorderDown)
         );
         std::env::remove_var("SHELBI_HOME");
@@ -1646,17 +1695,20 @@ projects:
         assert!(diags.is_empty(), "unbind should be silent, got {diags:?}");
         // Both former defaults are gone — nav_up is unbound.
         assert_eq!(
-            km.sidebar.dispatch(KeyEvent::new(KeyCode::Char('k'), KeyModifiers::NONE)),
+            km.sidebar
+                .dispatch(KeyEvent::new(KeyCode::Char('k'), KeyModifiers::NONE)),
             None
         );
         assert_eq!(
-            km.sidebar.dispatch(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE)),
+            km.sidebar
+                .dispatch(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE)),
             None
         );
         assert!(km.sidebar.first_chord_for(SidebarAction::NavUp).is_none());
         // A sibling action still keeps its default.
         assert_eq!(
-            km.sidebar.dispatch(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE)),
+            km.sidebar
+                .dispatch(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE)),
             Some(SidebarAction::NavDown)
         );
         std::env::remove_var("SHELBI_HOME");
@@ -1681,17 +1733,22 @@ projects:
         assert!(
             diags.iter().any(|d| matches!(
                 d,
-                KeymapDiagnostic::Error { kind: ErrorKind::ParseError, .. }
+                KeymapDiagnostic::Error {
+                    kind: ErrorKind::ParseError,
+                    ..
+                }
             )),
             "expected ParseError, got {diags:?}"
         );
         // Fell back to the built-in `k` / `up`.
         assert_eq!(
-            km.sidebar.dispatch(KeyEvent::new(KeyCode::Char('k'), KeyModifiers::NONE)),
+            km.sidebar
+                .dispatch(KeyEvent::new(KeyCode::Char('k'), KeyModifiers::NONE)),
             Some(SidebarAction::NavUp)
         );
         assert_eq!(
-            km.sidebar.dispatch(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE)),
+            km.sidebar
+                .dispatch(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE)),
             Some(SidebarAction::NavUp)
         );
         std::env::remove_var("SHELBI_HOME");
@@ -1716,16 +1773,21 @@ projects:
         assert!(
             !diags.iter().any(|d| matches!(
                 d,
-                KeymapDiagnostic::Error { kind: ErrorKind::Collision, .. }
+                KeymapDiagnostic::Error {
+                    kind: ErrorKind::Collision,
+                    ..
+                }
             )),
             "duplicate chord in one list must not self-collide, got {diags:?}"
         );
         assert_eq!(
-            km.sidebar.dispatch(KeyEvent::new(KeyCode::Char('k'), KeyModifiers::NONE)),
+            km.sidebar
+                .dispatch(KeyEvent::new(KeyCode::Char('k'), KeyModifiers::NONE)),
             Some(SidebarAction::NavUp)
         );
         assert_eq!(
-            km.sidebar.dispatch(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE)),
+            km.sidebar
+                .dispatch(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE)),
             Some(SidebarAction::NavUp)
         );
         // The reverse index is deduped too.
@@ -1759,24 +1821,35 @@ defaults:
         // The two bad entries are reported…
         let parse_errs = diags
             .iter()
-            .filter(|d| matches!(
-                d,
-                KeymapDiagnostic::Error { kind: ErrorKind::ParseError, .. }
-            ))
+            .filter(|d| {
+                matches!(
+                    d,
+                    KeymapDiagnostic::Error {
+                        kind: ErrorKind::ParseError,
+                        ..
+                    }
+                )
+            })
             .count();
-        assert_eq!(parse_errs, 2, "expected two per-entry errors, got {diags:?}");
+        assert_eq!(
+            parse_errs, 2,
+            "expected two per-entry errors, got {diags:?}"
+        );
         // …the bad entries revert to their defaults…
         assert_eq!(
-            km.sidebar.dispatch(KeyEvent::new(KeyCode::Char('k'), KeyModifiers::NONE)),
+            km.sidebar
+                .dispatch(KeyEvent::new(KeyCode::Char('k'), KeyModifiers::NONE)),
             Some(SidebarAction::NavUp)
         );
         assert_eq!(
-            km.global.dispatch(KeyEvent::new(KeyCode::Char('z'), KeyModifiers::ALT)),
+            km.global
+                .dispatch(KeyEvent::new(KeyCode::Char('z'), KeyModifiers::ALT)),
             Some(GlobalAction::ZenToggle)
         );
         // …and the sibling override on the same file still took effect.
         assert_eq!(
-            km.sidebar.dispatch(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::NONE)),
+            km.sidebar
+                .dispatch(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::NONE)),
             Some(SidebarAction::NavDown)
         );
         std::env::remove_var("SHELBI_HOME");
@@ -1798,13 +1871,17 @@ defaults:
         assert!(
             diags.iter().any(|d| matches!(
                 d,
-                KeymapDiagnostic::Error { kind: ErrorKind::ParseError, .. }
+                KeymapDiagnostic::Error {
+                    kind: ErrorKind::ParseError,
+                    ..
+                }
             )),
             "expected ParseError, got {diags:?}"
         );
         // Whole entry skipped → reverts to default (not partially applied).
         assert_eq!(
-            km.sidebar.dispatch(KeyEvent::new(KeyCode::Char('k'), KeyModifiers::NONE)),
+            km.sidebar
+                .dispatch(KeyEvent::new(KeyCode::Char('k'), KeyModifiers::NONE)),
             Some(SidebarAction::NavUp)
         );
         std::env::remove_var("SHELBI_HOME");
@@ -1853,27 +1930,38 @@ defaults:
         // enter/space).
         let (km, diags) = load_keymaps(None);
         assert_eq!(
-            km.sidebar.dispatch(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE)),
+            km.sidebar
+                .dispatch(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE)),
             Some(SidebarAction::NavDown)
         );
         assert_eq!(
-            km.sidebar.dispatch(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            km.sidebar
+                .dispatch(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
             Some(SidebarAction::Activate)
         );
         // `x` is unbound (both original colliders reverted away from it).
         assert_eq!(
-            km.sidebar.dispatch(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE)),
+            km.sidebar
+                .dispatch(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE)),
             None
         );
         // Two distinct collisions were reported (x, and j).
         let collisions = diags
             .iter()
-            .filter(|d| matches!(
-                d,
-                KeymapDiagnostic::Error { kind: ErrorKind::Collision, .. }
-            ))
+            .filter(|d| {
+                matches!(
+                    d,
+                    KeymapDiagnostic::Error {
+                        kind: ErrorKind::Collision,
+                        ..
+                    }
+                )
+            })
             .count();
-        assert_eq!(collisions, 2, "expected two collision reports, got {diags:?}");
+        assert_eq!(
+            collisions, 2,
+            "expected two collision reports, got {diags:?}"
+        );
         std::env::remove_var("SHELBI_HOME");
     }
 
@@ -1896,7 +1984,10 @@ defaults:
         assert!(
             diags.iter().any(|d| matches!(
                 d,
-                KeymapDiagnostic::Warning { kind: WarningKind::ShadowedByGlobal, .. }
+                KeymapDiagnostic::Warning {
+                    kind: WarningKind::ShadowedByGlobal,
+                    ..
+                }
             )),
             "expected ShadowedByGlobal warning, got {diags:?}"
         );
@@ -1923,7 +2014,10 @@ defaults:
         assert!(
             !diags.iter().any(|d| matches!(
                 d,
-                KeymapDiagnostic::Warning { kind: WarningKind::ShadowedByGlobal, .. }
+                KeymapDiagnostic::Warning {
+                    kind: WarningKind::ShadowedByGlobal,
+                    ..
+                }
             )),
             "modal mode must not warn on global overlap, got {diags:?}"
         );
@@ -1942,7 +2036,10 @@ defaults:
         assert!(
             !diags.iter().any(|d| matches!(
                 d,
-                KeymapDiagnostic::Warning { kind: WarningKind::ShadowedByGlobal, .. }
+                KeymapDiagnostic::Warning {
+                    kind: WarningKind::ShadowedByGlobal,
+                    ..
+                }
             )),
             "default config must not warn on shared ctrl-c, got {diags:?}"
         );

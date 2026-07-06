@@ -207,8 +207,7 @@ mod tests {
     fn cli_flag_expands_tilde() {
         let _g = LOCK.lock().unwrap();
         clear_env();
-        let (path, source) =
-            resolve_with(Some(PathBuf::from("~/from-flag-tilde")), "").unwrap();
+        let (path, source) = resolve_with(Some(PathBuf::from("~/from-flag-tilde")), "").unwrap();
         let expected = dirs::home_dir().unwrap().join("from-flag-tilde");
         assert_eq!(path, expected);
         assert_eq!(source, RootSource::CliFlag);

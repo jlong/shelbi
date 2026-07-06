@@ -193,7 +193,8 @@ mod tests {
         // focused machine row's collapse state without leaving the
         // keyboard.
         assert_eq!(
-            km.sidebar.dispatch(ev(KeyCode::Char(' '), KeyModifiers::NONE)),
+            km.sidebar
+                .dispatch(ev(KeyCode::Char(' '), KeyModifiers::NONE)),
             Some(SidebarAction::Activate)
         );
         assert_eq!(
@@ -242,7 +243,8 @@ mod tests {
 
         let mut app = App::new_sidebar("demo");
         assert_eq!(
-            km.sidebar.dispatch(ev(KeyCode::Char('w'), KeyModifiers::NONE)),
+            km.sidebar
+                .dispatch(ev(KeyCode::Char('w'), KeyModifiers::NONE)),
             Some(SidebarAction::NavUp)
         );
         // `w` flows through the dispatcher into NavUp (Outcome::Continue,
@@ -255,10 +257,14 @@ mod tests {
         // Old defaults no longer fire NavUp — dispatcher returns None for
         // `k` / Up under the sidebar mode.
         assert_eq!(
-            km.sidebar.dispatch(ev(KeyCode::Char('k'), KeyModifiers::NONE)),
+            km.sidebar
+                .dispatch(ev(KeyCode::Char('k'), KeyModifiers::NONE)),
             None
         );
-        assert_eq!(km.sidebar.dispatch(ev(KeyCode::Up, KeyModifiers::NONE)), None);
+        assert_eq!(
+            km.sidebar.dispatch(ev(KeyCode::Up, KeyModifiers::NONE)),
+            None
+        );
 
         std::env::remove_var("SHELBI_HOME");
     }

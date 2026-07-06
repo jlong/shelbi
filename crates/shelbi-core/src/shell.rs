@@ -4,8 +4,8 @@
 //! process-boundary layer (`shelbi-ssh`, which escapes every argv element
 //! it hands to a remote shell) and the command-string builders
 //! (`shelbi-agent`, the orchestrator) can reach the same escaper without
-//! anyone depending upward. See F2 in
-//! `docs/reviews/adversarial-2026-07/process-boundaries.md`.
+//! anyone depending upward. See F2 in Shelbi ContextStore
+//! docs/planning:reviews/adversarial-2026-07/process-boundaries.md.
 
 /// Conservative POSIX-shell quoting: wrap in single quotes, escape internal
 /// single quotes by closing-and-reopening (`'\''`).

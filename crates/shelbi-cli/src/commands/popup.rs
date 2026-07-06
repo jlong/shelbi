@@ -8,8 +8,8 @@ use anyhow::{anyhow, Result};
 
 pub fn run() -> Result<()> {
     // Detect the current tmux session via display-message.
-    let session = tmux_capture(&["display-message", "-p", "#{session_name}"])
-        .map_err(|e| anyhow!(e))?;
+    let session =
+        tmux_capture(&["display-message", "-p", "#{session_name}"]).map_err(|e| anyhow!(e))?;
     let session = session.trim();
 
     let Some(project) = session.strip_prefix("shelbi-") else {
