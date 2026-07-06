@@ -191,6 +191,52 @@ pub(crate) mod test_support {
     /// silently interleave and produce flaky failures.
     pub static ENV_LOCK: Mutex<()> = Mutex::new(());
 
+    /// Restores process environment variables on drop.
+    ///
+    /// Caller must hold `ENV_LOCK`; this guard only makes cleanup
+    /// panic-safe for tests that intentionally set or clear env vars.
+    pub struct EnvGuard {
+        saved: Vec<(&'static str, Option<std::ffi::OsString>)>,
+    }
+
+    impl EnvGuard {
+        pub fn new(keys: &[&'static str]) -> Self {
+            Self {
+                saved: keys
+                    .iter()
+                    .copied()
+                    .map(|key| (key, std::env::var_os(key)))
+                    .collect(),
+            }
+        }
+
+        pub fn set<K, V>(&self, key: K, value: V)
+        where
+            K: AsRef<std::ffi::OsStr>,
+            V: AsRef<std::ffi::OsStr>,
+        {
+            std::env::set_var(key, value);
+        }
+
+        pub fn remove<K>(&self, key: K)
+        where
+            K: AsRef<std::ffi::OsStr>,
+        {
+            std::env::remove_var(key);
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            for (key, value) in self.saved.iter().rev() {
+                match value {
+                    Some(value) => std::env::set_var(key, value),
+                    None => std::env::remove_var(key),
+                }
+            }
+        }
+    }
+
     /// Provision a real git repo + project YAML at `<home>/projects/<name>.yaml`
     /// pointing the hub machine at the repo. Used by tests that exercise CLI
     /// paths now gated on `shelbi_orchestrator::lifecycle` running a

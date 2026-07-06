@@ -529,7 +529,7 @@ fn process_argv_blob(_pid: libc::pid_t) -> Option<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::commands::test_support::ENV_LOCK;
+    use crate::commands::test_support::{EnvGuard, ENV_LOCK};
     use shelbi_core::{
         AgentRunnerSpec, GitConfig, HeartbeatConfig, Machine, MachineKind, OrchestratorSpec,
         Project, WorkspaceSpec, ZenConfig,
@@ -1059,12 +1059,15 @@ mod tests {
     #[test]
     fn run_exports_phase7_env_vars_to_agent_subprocess() {
         let _g = ENV_LOCK.lock().unwrap();
+        let env = EnvGuard::new(&["SHELBI_HOME", "TASK_ID", "PROJECT", "SHELBI_HUB_SOCK"]);
         let home = fresh_test_home("pane-env-exports");
-        std::env::set_var("SHELBI_HOME", &home);
+        env.set("SHELBI_HOME", &home);
+        env.remove("TASK_ID");
+        env.remove("PROJECT");
         // Honor explicit override — verifies the wrapper doesn't stomp
         // a remote-pane SHELBI_HUB_SOCK that was set by the SSH layer.
         let sock_override = home.join("custom-hub.sock");
-        std::env::set_var("SHELBI_HUB_SOCK", &sock_override);
+        env.set("SHELBI_HUB_SOCK", &sock_override);
 
         // Seed an in-progress task assigned to the workspace so the
         // wrapper's task lookup returns a non-empty TASK_ID.
@@ -1110,8 +1113,6 @@ mod tests {
             "SHELBI_HUB_SOCK line: {body:?}",
         );
 
-        std::env::remove_var("SHELBI_HOME");
-        std::env::remove_var("SHELBI_HUB_SOCK");
         let _ = std::fs::remove_dir_all(&home);
     }
 
@@ -1424,17 +1425,18 @@ mod tests {
     #[test]
     fn run_prefers_inherited_task_id_over_state_lookup() {
         let _g = ENV_LOCK.lock().unwrap();
+        let env = EnvGuard::new(&["SHELBI_HOME", "TASK_ID", "PROJECT", "SHELBI_HUB_SOCK"]);
         let home = fresh_test_home("pane-inherited-task-id");
-        std::env::set_var("SHELBI_HOME", &home);
+        env.set("SHELBI_HOME", &home);
         // No task in state → the state-lookup fallback would resolve
         // TASK_ID="". The tmux -e injection is simulated by setting
         // TASK_ID directly in the process env before `run()`.
-        std::env::set_var("TASK_ID", "feat-race");
+        env.set("TASK_ID", "feat-race");
         // Same override treatment for PROJECT / SHELBI_HUB_SOCK, since
         // the wrapper pins all three on the child.
-        std::env::set_var("PROJECT", "demo");
+        env.set("PROJECT", "demo");
         let sock_override = home.join("custom-hub.sock");
-        std::env::set_var("SHELBI_HUB_SOCK", &sock_override);
+        env.set("SHELBI_HUB_SOCK", &sock_override);
 
         let dump_path = home.join("agent-env.dump");
         let dump_str = dump_path.to_string_lossy().into_owned();
@@ -1465,10 +1467,6 @@ mod tests {
         let lines: Vec<&str> = body.lines().collect();
         assert_eq!(lines[1], "feat-race", "inherited TASK_ID must win: {body:?}");
 
-        std::env::remove_var("SHELBI_HOME");
-        std::env::remove_var("TASK_ID");
-        std::env::remove_var("PROJECT");
-        std::env::remove_var("SHELBI_HUB_SOCK");
         let _ = std::fs::remove_dir_all(&home);
     }
 }
