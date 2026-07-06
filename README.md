@@ -82,9 +82,8 @@ machines, plus whichever agent CLI you intend to run (`claude`, `codex`, …).
 ## First run
 
 Run `shelbi` with no projects configured and it drops you into the wizard.
-Two phases: name your assistant, then walk one or more projects through
-setup. Each phase is idempotent — re-running the wizard skips anything
-already on disk.
+The wizard walks one or more projects through setup. It is idempotent —
+re-running it skips anything already on disk.
 
 The wizard asks up front where the project's config should live:
 
@@ -101,9 +100,6 @@ Global is the default; you can migrate to in-repo later with
 
 ```
 $ shelbi
-? What should we call your assistant? Orchestrator
-✓ assistant: Orchestrator
-
 ? Project name: myapp
 ? Path to the repo: /Users/you/Workspaces/myapp
 ? Default branch: main
