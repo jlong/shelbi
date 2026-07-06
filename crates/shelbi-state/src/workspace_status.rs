@@ -602,10 +602,16 @@ pub fn append_task_event(
     };
     let from_category = from.category();
     let to_category = to.category();
-    append_event_line(&format!(
-        "{ts} project={project} task={task_id} workflow={workflow_name} {from} -> {to} \
+    let body = format!(
+        "project={project} task={task_id} workflow={workflow_name} {from} -> {to} \
          reason={reason} from_category={from_category} to_category={to_category}"
-    ))
+    );
+    let line = format!("{ts} {body}");
+    match append_event_line(&line) {
+        Ok(()) => Ok(()),
+        Err(e) if is_permission_denied(&e) => emit_event_body(&body),
+        Err(e) => Err(e),
+    }
 }
 
 /// Append `<rfc3339> project=<name> <action> reason=<reason>` to
@@ -1017,6 +1023,10 @@ fn append_event_line(line: &str) -> Result<()> {
     f.write_all(buf.as_bytes())?;
     deliver_event_envelope(&EventEnvelope::from_log_line(line));
     Ok(())
+}
+
+fn is_permission_denied(err: &shelbi_core::Error) -> bool {
+    matches!(err, shelbi_core::Error::Io(e) if e.kind() == std::io::ErrorKind::PermissionDenied)
 }
 
 fn deliver_event_envelope(envelope: &EventEnvelope) {
@@ -1699,6 +1709,66 @@ mod tests {
         );
         // Exactly one line — the fallback must NOT have fired alongside
         // the daemon append (that would duplicate the event).
+        assert_eq!(log.lines().count(), 1, "log: {log}");
+
+        let _ = std::fs::remove_file(&sock);
+        std::env::remove_var("SHELBI_HUB_SOCK");
+        std::env::remove_var("SHELBI_HOME");
+    }
+
+    #[test]
+    fn append_task_event_uses_socket_when_direct_append_is_permission_denied() {
+        use std::io::BufRead;
+        use std::os::unix::fs::PermissionsExt;
+        use std::os::unix::net::UnixListener;
+        let _g = TEST_LOCK.lock().unwrap();
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+        let sock = short_test_socket("task-perm");
+        std::env::set_var("SHELBI_HUB_SOCK", &sock);
+
+        let log_path = events_log_path().unwrap();
+        std::fs::write(&log_path, "").unwrap();
+        std::fs::set_permissions(&log_path, std::fs::Permissions::from_mode(0o444)).unwrap();
+
+        let _ = std::fs::remove_file(&sock);
+        let listener = UnixListener::bind(&sock).unwrap();
+        let daemon_log_path = log_path.clone();
+        let daemon = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut reader = std::io::BufReader::new(stream.try_clone().unwrap());
+            let mut line = String::new();
+            reader.read_line(&mut line).unwrap();
+            let msg: serde_json::Value = serde_json::from_str(line.trim()).unwrap();
+            let body = msg["line"].as_str().unwrap().to_string();
+            std::fs::set_permissions(&daemon_log_path, std::fs::Permissions::from_mode(0o644))
+                .unwrap();
+            append_external_event(&body).unwrap();
+            stream.write_all(DAEMON_ACK).unwrap();
+        });
+
+        append_task_event(
+            "demo",
+            "promote-me",
+            "default",
+            Column::backlog(),
+            Column::todo(),
+            "orchestrator:zen-promote category=2",
+        )
+        .unwrap();
+        daemon.join().unwrap();
+
+        let log = std::fs::read_to_string(&log_path).unwrap();
+        let line = log
+            .lines()
+            .next()
+            .expect("daemon should have appended task event");
+        assert!(line.contains(" task=promote-me "), "line: {line}");
+        assert!(line.contains(" backlog -> todo "), "line: {line}");
+        assert!(
+            line.contains(" reason=orchestrator:zen-promote_category=2 "),
+            "line: {line}"
+        );
         assert_eq!(log.lines().count(), 1, "log: {log}");
 
         let _ = std::fs::remove_file(&sock);
