@@ -1832,8 +1832,7 @@ mod tests {
         // surfaces the handoff as part of the canonical event stream.
         // Shape from `Plans/workflows.md` §10. We match on the canonical
         // `<ts> task=<id> <from> -> <to>` shape so other event kinds that
-        // happen to mention the same task id (e.g. the auto-rebase line
-        // emitted just before the promotion) don't get counted as task
+        // happen to mention the same task id don't get counted as task
         // transitions.
         let log = std::fs::read_to_string(shelbi_state::events_log_path().unwrap()).unwrap();
         let task_lines: Vec<&str> = log
@@ -1860,37 +1859,6 @@ mod tests {
             task_lines[0].ends_with(" to_category=handoff"),
             "line: {}",
             task_lines[0]
-        );
-
-        // Auto-rebase also lands one line per promotion. In this test the
-        // work_dir isn't a real git repo, so the rebase short-circuits to
-        // `skipped`; the event still gets recorded so the user can tell
-        // from events.log whether the auto-rebase ran or punted.
-        let rebase_lines: Vec<&str> = log
-            .lines()
-            .filter(|l| {
-                let mut parts = l.splitn(3, ' ');
-                let _ts = parts.next();
-                parts.next() == Some("rebase")
-            })
-            .collect();
-        assert_eq!(rebase_lines.len(), 1, "log: {log:?}");
-        let rebase_line = rebase_lines[0];
-        assert!(
-            rebase_line.contains("task=fix-login"),
-            "line: {rebase_line}"
-        );
-        assert!(
-            rebase_line.contains("workspace=alpha"),
-            "line: {rebase_line}"
-        );
-        assert!(
-            rebase_line.contains("branch=shelbi/fix-login"),
-            "line: {rebase_line}"
-        );
-        assert!(
-            rebase_line.contains("status=skipped"),
-            "expected skipped on a non-git work_dir, got: {rebase_line}"
         );
 
         // A leftover/stale marker naming a task that's no longer in-progress
