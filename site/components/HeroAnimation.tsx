@@ -279,13 +279,13 @@ const STREAM_TAIL: ChatLine[] = [
   { kind: "blank" },
   { kind: "prose", text: "Reading dashboard.md and breaking it into tasks." },
   { kind: "blank" },
-  { kind: "tool", name: "Bash", args: 'shelbi task add "Metrics API endpoint"' },
+  { kind: "tool", name: "Bash", args: 'shelbi task add "Metrics API endpoint" --workflow app-feature' },
   { kind: "result", text: "✓ metrics-api-endpoint created" },
   { kind: "blank" },
-  { kind: "tool", name: "Bash", args: 'shelbi task add "Chart components (line + bar)"' },
+  { kind: "tool", name: "Bash", args: 'shelbi task add "Chart components (line + bar)" --workflow app-feature' },
   { kind: "result", text: "✓ chart-components created" },
   { kind: "blank" },
-  { kind: "tool", name: "Bash", args: 'shelbi task add "Date-range filter"' },
+  { kind: "tool", name: "Bash", args: 'shelbi task add "Date-range filter" --workflow app-feature' },
   { kind: "result", text: "✓ date-range-filter created" },
 ]
 

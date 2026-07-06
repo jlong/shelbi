@@ -834,7 +834,7 @@ const CHAT_LINES: ChatLine[] = [
   { kind: "blank" },
   { kind: "prose", text: "I'll create both tasks and dispatch them to free workspaces." },
   { kind: "blank" },
-  { kind: "tool", name: "Bash", args: 'shelbi task add "Deploy staging env"' },
+  { kind: "tool", name: "Bash", args: 'shelbi task add "Deploy staging env" --workflow app' },
   { kind: "result", text: "✓ deploy-staging-env created in backlog" },
   { kind: "blank" },
   { kind: "tool", name: "Bash", args: "shelbi task start deploy-staging-env --workspace alpha" },

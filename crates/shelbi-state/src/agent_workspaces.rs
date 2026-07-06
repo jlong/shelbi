@@ -1346,6 +1346,25 @@ mod tests {
         assert!(t.contains("review-workspace gate"));
     }
 
+    /// Scheduler-created tasks must be pinned to the project workflow that
+    /// matches the work, rather than accidentally inheriting whatever
+    /// `default_workflow` happens to be configured.
+    #[test]
+    fn orchestrator_template_guides_explicit_workflow_selection() {
+        let t = DEFAULT_ORCHESTRATOR_INSTRUCTIONS;
+        assert!(t.contains("shelbi task add \"Title\" --workflow <name>"));
+        assert!(t.contains("only omit `--workflow` when the task truly"));
+        assert!(t.contains("`app` for bugs, maintenance, refactors, infrastructure"));
+        assert!(t.contains("shelbi task add \"Fix task move event log\""));
+        assert!(t.contains("--workflow app"));
+        assert!(t.contains("`app-feature` for new Shelbi application capabilities"));
+        assert!(t.contains("--workflow app-feature"));
+        assert!(t.contains("`site` for marketing, documentation, content"));
+        assert!(t.contains("--workflow site"));
+        assert!(t.contains("`default` only when the task truly has no better"));
+        assert!(t.contains("--workflow default"));
+    }
+
     /// Sanity-check the developer prompt has the spec-required hooks
     /// (ready marker handoff, agents/_shared/preamble.md reference,
     /// the Phase 5 socket-emit paragraph) so a regression doesn't

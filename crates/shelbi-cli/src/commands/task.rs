@@ -1193,6 +1193,34 @@ mod tests {
     }
 
     #[test]
+    fn add_app_bug_task_persists_explicit_app_workflow() {
+        let _g = TEST_LOCK.lock().unwrap();
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+
+        add(
+            "p",
+            AddArgs {
+                title: "Fix task move event log".into(),
+                id: Some("fix-task-move-event-log".into()),
+                status: "backlog".into(),
+                description: Some("Bug task for Shelbi app code.".into()),
+                depends_on: Vec::new(),
+                prefers_machine: None,
+                workflow: Some("app".into()),
+                branch: None,
+            },
+        )
+        .unwrap();
+
+        let reloaded = shelbi_state::load_task("p", "fix-task-move-event-log").unwrap();
+        assert_eq!(reloaded.task.workflow.as_deref(), Some("app"));
+
+        std::env::remove_var("SHELBI_HOME");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
     fn move_to_writes_default_reason_to_events_log() {
         let _g = TEST_LOCK.lock().unwrap();
         let home = fresh_home();

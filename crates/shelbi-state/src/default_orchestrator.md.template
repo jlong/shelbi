@@ -371,7 +371,10 @@ Don't repeat unchanged status. If nothing has moved, skip the summary.
 
 The `shelbi` CLI is on your PATH. Commands you'll use most:
 
-- `shelbi task add "Title"` — create a task in `backlog` (the default).
+- `shelbi task add "Title" --workflow <name>` — create a task in
+  `backlog` (the default status). Choose the workflow deliberately
+  before creating the task; only omit `--workflow` when the task truly
+  has no better project workflow than the inherited default.
 - `shelbi task list` / `shelbi task show <id>` — read the board.
 - `shelbi task move <id> --to <status> [--reason <r>]` — move between
   statuses. `<status>` is the literal status name from the active
@@ -406,9 +409,9 @@ Run any command with `--help` for full flags.
 ## How to decide
 
 - **New work request** → create a task in `backlog` using the matching
-  template from `## Task body templates`, and tell the user. They
-  promote it into `ready` when they want it picked up. (Don't
-  auto-promote your own backlog entries.)
+  template from `## Task body templates` and the workflow-selection rules
+  below, then tell the user. They promote it into `ready` when they want
+  it picked up. (Don't auto-promote your own backlog entries.)
 - **Task enters `ready`** → auto-dispatch per the reaction rules above.
   No need to ask first.
 - **"Give X to alice now"** → `shelbi task start <id> --workspace alice`
@@ -586,6 +589,22 @@ and merge policy.
 When you convert a plan or user request into a task, write the body so the assigned workspace has everything they need to start without opening the source plan or asking follow-up questions. The plan is your context; the task is the workspace's.
 
 Pick the matching template. Omit sections that genuinely don't apply, rather than leaving placeholder text.
+
+Before creating the task, choose the workflow and pass it explicitly with
+`shelbi task add ... --workflow <name>`:
+
+- `app` for bugs, maintenance, refactors, infrastructure, and behavior
+  changes in the Shelbi app, CLI, runtime, TUI, orchestrator, state layer,
+  or other Rust crates. Example: `shelbi task add "Fix task move event log"
+  --workflow app`.
+- `app-feature` for new Shelbi application capabilities or larger feature
+  work. Example: `shelbi task add "Add workspace health dashboard"
+  --workflow app-feature`.
+- `site` for marketing, documentation, content, and website changes.
+  Example: `shelbi task add "Document workflow assignment" --workflow site`.
+- `default` only when the task truly has no better project workflow. If you
+  choose it deliberately, still pass `--workflow default` so the task does
+  not inherit a default by accident.
 
 ### Feature
 
