@@ -80,6 +80,9 @@ pub struct KanbanApp {
     /// a respawn. Empty when the loader errors — the board degrades to
     /// the canonical default workflow.
     pub workflows: Vec<Workflow>,
+    /// Effective project default workflow name. Defaults to the historical
+    /// `default`, then refreshes from project config when available.
+    pub default_workflow_name: String,
     /// Project-wide canonical column catalogue, loaded from
     /// `workflows/statuses.yaml`. Source of truth for column identity
     /// (id, name, category) and ordering — workflows can no longer
@@ -364,6 +367,7 @@ impl KanbanApp {
             filter_chip_hit: None,
             dropdown_hits: Vec::new(),
             workflows: vec![default_workflow()],
+            default_workflow_name: DEFAULT_WORKFLOW_NAME.to_string(),
             project_statuses,
             all_columns,
             workflow_filter: None,
@@ -423,15 +427,24 @@ impl KanbanApp {
     /// different workflows tracks its expansion state independently.
     fn override_key_for(&self, col_idx: usize) -> Option<String> {
         let col = self.all_columns.get(col_idx)?;
-        let workflow = self.workflow_filter.as_deref().unwrap_or("default");
-        Some(shelbi_state::kanban_column_override_key(workflow, &col.status_id))
+        let workflow = self
+            .workflow_filter
+            .as_deref()
+            .unwrap_or(&self.default_workflow_name);
+        Some(shelbi_state::kanban_column_override_key(
+            workflow,
+            &col.status_id,
+        ))
     }
 
     /// Resolved collapse state for column slot `col_idx`. Explicit
     /// overrides win; an absent override resolves to `Auto` (the
     /// renderer collapses on empty / expands otherwise).
     pub fn column_expansion(&self, col_idx: usize) -> ColumnExpansion {
-        match self.override_key_for(col_idx).and_then(|k| self.column_overrides.get(&k)) {
+        match self
+            .override_key_for(col_idx)
+            .and_then(|k| self.column_overrides.get(&k))
+        {
             Some(KanbanColumnOverride::Collapsed) => ColumnExpansion::Collapsed,
             Some(KanbanColumnOverride::Expanded) => ColumnExpansion::Expanded,
             None => ColumnExpansion::Auto,
@@ -466,7 +479,10 @@ impl KanbanApp {
         };
         self.column_overrides.insert(key.clone(), new_state);
         let col = self.all_columns[col_idx].clone();
-        let workflow = self.workflow_filter.clone().unwrap_or_else(|| "default".to_string());
+        let workflow = self
+            .workflow_filter
+            .clone()
+            .unwrap_or_else(|| "default".to_string());
         if let Err(e) = shelbi_state::set_kanban_column_override(
             &self.project_name,
             &workflow,
@@ -589,18 +605,24 @@ impl KanbanApp {
     /// workflows that both declare `review` would share that column).
     fn task_belongs_to(&self, task: &Task, ac: &KanbanColumn) -> bool {
         if let Some(name) = &self.workflow_filter {
-            if task.workflow_or_default() != name.as_str() {
+            if self.task_workflow_name(task) != name.as_str() {
                 return false;
             }
         }
         self.resolved_status_id(task) == ac.status_id
     }
 
+    fn task_workflow_name<'a>(&'a self, task: &'a Task) -> &'a str {
+        task.workflow
+            .as_deref()
+            .unwrap_or(&self.default_workflow_name)
+    }
+
     /// Resolve a task to its status id. Prefers the task's own workflow,
     /// then the default workflow, then the legacy column-derived id as
     /// a last-resort fallback.
     fn resolved_status_id(&self, task: &Task) -> String {
-        let wf_name = task.workflow_or_default();
+        let wf_name = self.task_workflow_name(task);
         if let Some(wf) = self.workflows.iter().find(|w| w.name == wf_name) {
             return resolve_task_status(task, wf);
         }
@@ -644,9 +666,16 @@ impl KanbanApp {
         // empty workspace list rather than failing the refresh; the
         // dropdown will degrade to just "All" / "Unassigned" until the
         // project file appears.
-        self.workspaces = shelbi_state::load_project(&self.project_name)
-            .map(|p| p.workspaces.into_iter().map(|w| w.name).collect())
-            .unwrap_or_default();
+        match shelbi_state::load_project(&self.project_name) {
+            Ok(p) => {
+                self.default_workflow_name = p.default_workflow_name().to_string();
+                self.workspaces = p.workspaces.into_iter().map(|w| w.name).collect();
+            }
+            Err(_) => {
+                self.default_workflow_name = DEFAULT_WORKFLOW_NAME.to_string();
+                self.workspaces = Vec::new();
+            }
+        }
         // Workspace filter is persisted view state — a missing /
         // unreadable state.json falls back to "All" silently. Reload
         // every tick so a CLI or palette edit shows up without a
@@ -853,8 +882,7 @@ impl KanbanApp {
     /// scaffolding behaviour the workspace dropdown uses for the same
     /// reason).
     pub fn workflow_dropdown_options(&self) -> Vec<WorkflowDropdownOption> {
-        let mut opts: Vec<WorkflowDropdownOption> =
-            Vec::with_capacity(self.workflows.len() + 1);
+        let mut opts: Vec<WorkflowDropdownOption> = Vec::with_capacity(self.workflows.len() + 1);
         opts.push(WorkflowDropdownOption {
             filter: None,
             count: self.tasks.len(),
@@ -863,7 +891,7 @@ impl KanbanApp {
             let count = self
                 .tasks
                 .iter()
-                .filter(|tf| tf.task.workflow_or_default() == w.name)
+                .filter(|tf| self.task_workflow_name(&tf.task) == w.name)
                 .count();
             opts.push(WorkflowDropdownOption {
                 filter: Some(w.name.clone()),
@@ -1167,7 +1195,10 @@ impl KanbanApp {
     /// [`Self::adjacent_column_in_workflow`] for the underlying rule.
     fn adjacent_column_for_task(&self, task_id: &str, forward: bool) -> Option<usize> {
         let task = &self.tasks.iter().find(|tf| tf.task.id == task_id)?.task;
-        let wf = self.workflows.iter().find(|w| w.name == task.workflow_or_default())?;
+        let wf = self
+            .workflows
+            .iter()
+            .find(|w| w.name == self.task_workflow_name(task))?;
         let current_id = self.resolved_status_id(task);
         self.adjacent_column_in_workflow(&current_id, wf, forward)
     }
@@ -1253,9 +1284,14 @@ impl KanbanApp {
         }
         match shelbi_state::move_task(&self.project_name, id, new_col) {
             Ok(Some((from, to, workflow))) => {
-                if let Err(e) =
-                    shelbi_state::append_task_event(id, &workflow, from, to, "user:tui")
-                {
+                if let Err(e) = shelbi_state::append_task_event(
+                    &self.project_name,
+                    id,
+                    &workflow,
+                    from,
+                    to,
+                    "user:tui",
+                ) {
                     tracing::warn!(task = %id, error = %e, "append_task_event failed");
                 }
             }
@@ -1398,7 +1434,9 @@ fn render_title(f: &mut Frame, app: &mut KanbanApp, area: Rect) {
         Span::styled("Tasks · ", Style::default().fg(Color::DarkGray)),
         Span::styled(
             app.project_name.clone(),
-            Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
         ),
         Span::styled(
             format!("   {total} total"),
@@ -1409,7 +1447,9 @@ fn render_title(f: &mut Frame, app: &mut KanbanApp, area: Rect) {
 
     if let Some(area) = workflow_area {
         let style = if app.workflow_filter.is_some() {
-            Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD)
         } else {
             Style::default().fg(Color::DarkGray)
         };
@@ -1424,7 +1464,9 @@ fn render_title(f: &mut Frame, app: &mut KanbanApp, area: Rect) {
 
     if let Some(area) = workspace_area {
         let style = if app.workspace_filter.is_some() {
-            Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD)
         } else {
             Style::default().fg(Color::DarkGray)
         };
@@ -1491,8 +1533,12 @@ fn render_columns(f: &mut Frame, app: &mut KanbanApp, hits: &mut Vec<CardHit>, a
     let collapsed_states: Vec<bool> = (0..app.all_columns.len())
         .map(|i| app.is_column_collapsed(i))
         .collect();
-    let widths =
-        compute_column_widths(&app.all_columns, &collapsed_states, app.column_scroll, area.width);
+    let widths = compute_column_widths(
+        &app.all_columns,
+        &collapsed_states,
+        app.column_scroll,
+        area.width,
+    );
     let visible_start = app.column_scroll;
     let visible_end = visible_start + widths.len();
 
@@ -1537,7 +1583,9 @@ fn render_columns(f: &mut Frame, app: &mut KanbanApp, hits: &mut Vec<CardHit>, a
     if visible_start > 0 {
         let glyph = Span::styled(
             "◂",
-            Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
         );
         let pos = Rect {
             x: area.x,
@@ -1550,7 +1598,9 @@ fn render_columns(f: &mut Frame, app: &mut KanbanApp, hits: &mut Vec<CardHit>, a
     if visible_end < app.all_columns.len() {
         let glyph = Span::styled(
             "▸",
-            Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
         );
         let pos = Rect {
             x: area.x.saturating_add(area.width).saturating_sub(1),
@@ -1684,7 +1734,9 @@ fn render_collapsed_column(
             .fg(header_color)
             .add_modifier(Modifier::BOLD | Modifier::UNDERLINED)
     } else {
-        Style::default().fg(header_color).add_modifier(Modifier::BOLD)
+        Style::default()
+            .fg(header_color)
+            .add_modifier(Modifier::BOLD)
     };
 
     // Whole column area routes clicks to the toggle — there's nothing
@@ -1801,7 +1853,10 @@ fn render_column(
     let header_area = chunks[0];
     let list_area = chunks[1];
     f.render_widget(Paragraph::new(title_line), header_area);
-    header_hits.push(HeaderHit { area: header_area, col_idx });
+    header_hits.push(HeaderHit {
+        area: header_area,
+        col_idx,
+    });
 
     // Reserve a 2-char right gutter so adjacent cells don't visually
     // collide; List doesn't clip Line spans on its own.
@@ -1836,6 +1891,7 @@ fn render_column(
         lines.push(card_meta_line(
             &tf.task,
             &app.workflows,
+            app.task_workflow_name(&tf.task),
             show_card_workflow_label,
             max_text,
         ));
@@ -1943,7 +1999,11 @@ fn render_workspace_dropdown(f: &mut Frame, app: &mut KanbanApp, area: Rect) {
         app.close_workspace_dropdown();
         return;
     }
-    let cursor = app.workspace_dropdown.as_ref().map(|d| d.cursor).unwrap_or(0);
+    let cursor = app
+        .workspace_dropdown
+        .as_ref()
+        .map(|d| d.cursor)
+        .unwrap_or(0);
 
     // Width = widest "Workspace name (count)" row + 4 chars of chrome
     // (border + arrow + padding). Cap so the popover never spans more
@@ -1972,7 +2032,10 @@ fn render_workspace_dropdown(f: &mut Frame, app: &mut KanbanApp, area: Rect) {
     let popover_h = (opts.len() as u16 + 3).min(area.height.saturating_sub(1));
     // Place directly under the title row (area.y + 1) so the chip
     // remains visible above it.
-    let popover_y = area.y.saturating_add(1).min(area.y + area.height.saturating_sub(popover_h));
+    let popover_y = area
+        .y
+        .saturating_add(1)
+        .min(area.y + area.height.saturating_sub(popover_h));
 
     let popover_area = Rect {
         x: popover_x,
@@ -1987,7 +2050,9 @@ fn render_workspace_dropdown(f: &mut Frame, app: &mut KanbanApp, area: Rect) {
         .border_style(Style::default().fg(Color::Cyan))
         .title(Line::from(vec![Span::styled(
             " Filter by workspace ",
-            Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
         )]));
     let inner = block.inner(popover_area);
     f.render_widget(block, popover_area);
@@ -2011,7 +2076,9 @@ fn render_workspace_dropdown(f: &mut Frame, app: &mut KanbanApp, area: Rect) {
         // highlight_style below.
         let prefix = if active { "● " } else { "  " };
         let label_style = if active {
-            Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD)
         } else {
             Style::default()
         };
@@ -2117,7 +2184,9 @@ fn render_workflow_dropdown(f: &mut Frame, app: &mut KanbanApp, area: Rect) {
         .border_style(Style::default().fg(Color::Cyan))
         .title(Line::from(vec![Span::styled(
             " Filter by workflow ",
-            Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
         )]));
     let inner = block.inner(popover_area);
     f.render_widget(block, popover_area);
@@ -2136,7 +2205,9 @@ fn render_workflow_dropdown(f: &mut Frame, app: &mut KanbanApp, area: Rect) {
         let label = workflow_dropdown_row_text(opt);
         let prefix = if active { "● " } else { "  " };
         let label_style = if active {
-            Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD)
         } else {
             Style::default()
         };
@@ -2281,13 +2352,13 @@ fn wrap_title_two_lines(title: &str, max: usize) -> (String, Option<String>) {
 /// from this task's params. A fixed `base_branch: main` (no placeholder)
 /// or a half-substituted template resolves to `None` — neither adds
 /// trustworthy per-task info at the card-glance scale.
-fn card_branch(task: &Task, workflows: &[Workflow]) -> Option<String> {
+fn card_branch(task: &Task, workflows: &[Workflow], workflow_name: &str) -> Option<String> {
     if let Some(branch) = task.branch.as_deref().filter(|b| !b.is_empty()) {
         return Some(branch.to_string());
     }
     workflows
         .iter()
-        .find(|w| w.name == task.workflow_or_default())
+        .find(|w| w.name == workflow_name)
         .and_then(|w| w.git.as_ref())
         .and_then(|g| g.base_branch.as_deref())
         .filter(|tmpl| tmpl.contains("{{"))
@@ -2313,6 +2384,7 @@ fn card_branch(task: &Task, workflows: &[Workflow]) -> Option<String> {
 fn card_meta_line(
     task: &Task,
     workflows: &[Workflow],
+    workflow_name: &str,
     show_workflow_name: bool,
     max_text: usize,
 ) -> Line<'static> {
@@ -2322,7 +2394,7 @@ fn card_meta_line(
     if show_workflow_name {
         // One space of padding either side so the background reads as a
         // chip rather than butting straight against the glyphs.
-        let badge = truncate(&format!(" {} ", task.workflow_or_default()), max_text);
+        let badge = truncate(&format!(" {workflow_name} "), max_text);
         used += badge.chars().count();
         spans.push(Span::styled(
             badge,
@@ -2332,7 +2404,7 @@ fn card_meta_line(
         ));
     }
 
-    if let Some(branch) = card_branch(task, workflows) {
+    if let Some(branch) = card_branch(task, workflows, workflow_name) {
         // A single space separates the badge from the branch; skip it when
         // the badge is hidden so the branch sits flush with the gutter.
         let sep = if spans.is_empty() { 0 } else { 1 };
@@ -2371,7 +2443,11 @@ fn kanban_columns_from(
     statuses
         .statuses
         .iter()
-        .filter(|st| allowed.as_ref().map_or(true, |set| set.contains(st.id.as_str())))
+        .filter(|st| {
+            allowed
+                .as_ref()
+                .map_or(true, |set| set.contains(st.id.as_str()))
+        })
         .map(|st| KanbanColumn {
             status_id: st.id.clone(),
             status_name: st.name.clone(),
@@ -2439,7 +2515,9 @@ fn render_popover(f: &mut Frame, app: &KanbanApp, area: Rect) {
             Span::styled(" ", Style::default()),
             Span::styled(
                 title_text,
-                Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
             ),
             Span::raw(" "),
         ]));
@@ -2561,10 +2639,7 @@ fn popover_header(tf: &TaskFile, columns: &HashMap<String, Column>) -> Vec<Line<
 }
 
 fn meta_label(label: &str) -> Span<'static> {
-    Span::styled(
-        format!("{label}: "),
-        Style::default().fg(Color::DarkGray),
-    )
+    Span::styled(format!("{label}: "), Style::default().fg(Color::DarkGray))
 }
 
 fn meta_row(label: &str, value: &str) -> Line<'static> {
@@ -2598,7 +2673,11 @@ mod tests {
     use super::*;
 
     fn hit(area: Rect, col_idx: usize, row_idx: usize) -> CardHit {
-        CardHit { area, col_idx, row_idx }
+        CardHit {
+            area,
+            col_idx,
+            row_idx,
+        }
     }
 
     fn task_file(id: &str, column: Column, priority: u32, updated: &str) -> TaskFile {
@@ -2693,20 +2772,56 @@ mod tests {
     fn card_at_returns_first_matching_hit() {
         let mut app = KanbanApp::new("demo");
         app.card_hits = vec![
-            hit(Rect { x: 0, y: 2, width: 20, height: 3 }, 0, 0),
-            hit(Rect { x: 0, y: 5, width: 20, height: 3 }, 0, 1),
-            hit(Rect { x: 20, y: 2, width: 20, height: 3 }, 1, 0),
+            hit(
+                Rect {
+                    x: 0,
+                    y: 2,
+                    width: 20,
+                    height: 3,
+                },
+                0,
+                0,
+            ),
+            hit(
+                Rect {
+                    x: 0,
+                    y: 5,
+                    width: 20,
+                    height: 3,
+                },
+                0,
+                1,
+            ),
+            hit(
+                Rect {
+                    x: 20,
+                    y: 2,
+                    width: 20,
+                    height: 3,
+                },
+                1,
+                0,
+            ),
         ];
         assert_eq!(app.card_at(5, 2), Some((0, 0)));
-        assert_eq!(app.card_at(5, 4), Some((0, 0)));   // last row of card
-        assert_eq!(app.card_at(5, 5), Some((0, 1)));   // first row of next card
-        assert_eq!(app.card_at(25, 3), Some((1, 0)));  // adjacent column
+        assert_eq!(app.card_at(5, 4), Some((0, 0))); // last row of card
+        assert_eq!(app.card_at(5, 5), Some((0, 1))); // first row of next card
+        assert_eq!(app.card_at(25, 3), Some((1, 0))); // adjacent column
     }
 
     #[test]
     fn card_at_misses_outside_any_rect() {
         let mut app = KanbanApp::new("demo");
-        app.card_hits = vec![hit(Rect { x: 0, y: 2, width: 20, height: 3 }, 0, 0)];
+        app.card_hits = vec![hit(
+            Rect {
+                x: 0,
+                y: 2,
+                width: 20,
+                height: 3,
+            },
+            0,
+            0,
+        )];
         // Above the card.
         assert_eq!(app.card_at(5, 1), None);
         // Below the card.
@@ -2785,14 +2900,22 @@ mod tests {
         // `workflow=`, `reason=`, and trailing `from_category=` /
         // `to_category=` annotations.
         assert!(lines[0].contains(" task=fix-login "), "line: {}", lines[0]);
-        assert!(lines[0].contains(" workflow=default "), "line: {}", lines[0]);
+        assert!(
+            lines[0].contains(" workflow=default "),
+            "line: {}",
+            lines[0]
+        );
         assert!(
             lines[0].contains(" todo -> in_progress "),
             "line: {}",
             lines[0]
         );
         assert!(lines[0].contains(" reason=user:tui "), "line: {}", lines[0]);
-        assert!(lines[0].ends_with(" to_category=active"), "line: {}", lines[0]);
+        assert!(
+            lines[0].ends_with(" to_category=active"),
+            "line: {}",
+            lines[0]
+        );
 
         std::env::remove_var("SHELBI_HOME");
         let _ = std::fs::remove_dir_all(&home);
@@ -2807,9 +2930,27 @@ mod tests {
     fn column_tasks_applies_workspace_filter() {
         let mut app = KanbanApp::new("demo");
         app.tasks = vec![
-            task_file_for("a", Column::todo(), 0, "2026-06-20T10:00:00Z", Some("alpha")),
-            task_file_for("b", Column::todo(), 1, "2026-06-20T10:00:00Z", Some("bravo")),
-            task_file_for("c", Column::in_progress(), 0, "2026-06-20T10:00:00Z", Some("alpha")),
+            task_file_for(
+                "a",
+                Column::todo(),
+                0,
+                "2026-06-20T10:00:00Z",
+                Some("alpha"),
+            ),
+            task_file_for(
+                "b",
+                Column::todo(),
+                1,
+                "2026-06-20T10:00:00Z",
+                Some("bravo"),
+            ),
+            task_file_for(
+                "c",
+                Column::in_progress(),
+                0,
+                "2026-06-20T10:00:00Z",
+                Some("alpha"),
+            ),
             task_file_for("d", Column::todo(), 2, "2026-06-20T10:00:00Z", None),
         ];
         // No filter — all tasks pass through their column filter.
@@ -2817,14 +2958,30 @@ mod tests {
         assert_eq!(app.column_tasks(2).len(), 1);
 
         app.workspace_filter = Some(WorkspaceFilter::Workspace("alpha".into()));
-        let todo: Vec<&str> = app.column_tasks(1).iter().map(|t| t.task.id.as_str()).collect();
+        let todo: Vec<&str> = app
+            .column_tasks(1)
+            .iter()
+            .map(|t| t.task.id.as_str())
+            .collect();
         assert_eq!(todo, vec!["a"]);
-        let wip: Vec<&str> = app.column_tasks(2).iter().map(|t| t.task.id.as_str()).collect();
+        let wip: Vec<&str> = app
+            .column_tasks(2)
+            .iter()
+            .map(|t| t.task.id.as_str())
+            .collect();
         assert_eq!(wip, vec!["c"]);
 
         app.workspace_filter = Some(WorkspaceFilter::Unassigned);
-        let todo: Vec<&str> = app.column_tasks(1).iter().map(|t| t.task.id.as_str()).collect();
-        assert_eq!(todo, vec!["d"], "Unassigned filter keeps only `assigned_to: None`");
+        let todo: Vec<&str> = app
+            .column_tasks(1)
+            .iter()
+            .map(|t| t.task.id.as_str())
+            .collect();
+        assert_eq!(
+            todo,
+            vec!["d"],
+            "Unassigned filter keeps only `assigned_to: None`"
+        );
     }
 
     /// `dropdown_options` builds `All` + each workspace + (optional)
@@ -2836,9 +2993,27 @@ mod tests {
         let mut app = KanbanApp::new("demo");
         app.workspaces = vec!["alpha".into(), "bravo".into(), "charlie".into()];
         app.tasks = vec![
-            task_file_for("a", Column::todo(), 0, "2026-06-20T10:00:00Z", Some("alpha")),
-            task_file_for("b", Column::todo(), 1, "2026-06-20T10:00:00Z", Some("alpha")),
-            task_file_for("c", Column::todo(), 2, "2026-06-20T10:00:00Z", Some("bravo")),
+            task_file_for(
+                "a",
+                Column::todo(),
+                0,
+                "2026-06-20T10:00:00Z",
+                Some("alpha"),
+            ),
+            task_file_for(
+                "b",
+                Column::todo(),
+                1,
+                "2026-06-20T10:00:00Z",
+                Some("alpha"),
+            ),
+            task_file_for(
+                "c",
+                Column::todo(),
+                2,
+                "2026-06-20T10:00:00Z",
+                Some("bravo"),
+            ),
             task_file_for("d", Column::todo(), 3, "2026-06-20T10:00:00Z", None),
         ];
         let opts = app.dropdown_options();
@@ -2846,9 +3021,15 @@ mod tests {
         assert_eq!(opts.len(), 5);
         assert!(opts[0].filter.is_none());
         assert_eq!(opts[0].count, 4);
-        assert_eq!(opts[1].filter, Some(WorkspaceFilter::Workspace("alpha".into())));
+        assert_eq!(
+            opts[1].filter,
+            Some(WorkspaceFilter::Workspace("alpha".into()))
+        );
         assert_eq!(opts[1].count, 2);
-        assert_eq!(opts[3].filter, Some(WorkspaceFilter::Workspace("charlie".into())));
+        assert_eq!(
+            opts[3].filter,
+            Some(WorkspaceFilter::Workspace("charlie".into()))
+        );
         assert_eq!(opts[3].count, 0, "zero-count workspaces still appear");
         assert_eq!(opts[4].filter, Some(WorkspaceFilter::Unassigned));
         assert_eq!(opts[4].count, 1);
@@ -2869,7 +3050,9 @@ mod tests {
         )];
         let opts = app.dropdown_options();
         assert!(
-            !opts.iter().any(|o| o.filter == Some(WorkspaceFilter::Unassigned)),
+            !opts
+                .iter()
+                .any(|o| o.filter == Some(WorkspaceFilter::Unassigned)),
             "no unassigned tasks → no Unassigned row, got {:?}",
             opts.iter().map(|o| &o.filter).collect::<Vec<_>>()
         );
@@ -2883,8 +3066,20 @@ mod tests {
         let mut app = KanbanApp::new("demo");
         app.workspaces = vec!["alpha".into(), "bravo".into()];
         app.tasks = vec![
-            task_file_for("a", Column::todo(), 0, "2026-06-20T10:00:00Z", Some("alpha")),
-            task_file_for("b", Column::todo(), 1, "2026-06-20T10:00:00Z", Some("bravo")),
+            task_file_for(
+                "a",
+                Column::todo(),
+                0,
+                "2026-06-20T10:00:00Z",
+                Some("alpha"),
+            ),
+            task_file_for(
+                "b",
+                Column::todo(),
+                1,
+                "2026-06-20T10:00:00Z",
+                Some("bravo"),
+            ),
         ];
         app.workspace_filter = Some(WorkspaceFilter::Workspace("bravo".into()));
         app.open_workspace_dropdown();
@@ -2892,9 +3087,17 @@ mod tests {
         assert_eq!(app.workspace_dropdown.as_ref().unwrap().cursor, 2);
 
         app.dropdown_nav_down();
-        assert_eq!(app.workspace_dropdown.as_ref().unwrap().cursor, 0, "wraps to top");
+        assert_eq!(
+            app.workspace_dropdown.as_ref().unwrap().cursor,
+            0,
+            "wraps to top"
+        );
         app.dropdown_nav_up();
-        assert_eq!(app.workspace_dropdown.as_ref().unwrap().cursor, 2, "wraps to bottom");
+        assert_eq!(
+            app.workspace_dropdown.as_ref().unwrap().cursor,
+            2,
+            "wraps to bottom"
+        );
     }
 
     /// An active filter that no longer matches any option (e.g. a
@@ -2933,6 +3136,7 @@ mod tests {
             name: "demo".into(),
             repo: "git@example:demo.git".into(),
             default_branch: "main".into(),
+            default_workflow: None,
             config_mode: None,
             git: shelbi_core::GitConfig::default(),
             machines: vec![shelbi_core::Machine {
@@ -2952,6 +3156,7 @@ mod tests {
                     shelbi_core::AgentRunnerSpec {
                         command: "claude".into(),
                         flags: vec![],
+                        prompt_injection: None,
                         dialog_signatures: vec![],
                     },
                 );
@@ -2986,8 +3191,14 @@ mod tests {
 
         let mut app = KanbanApp::new("demo");
         app.refresh();
-        assert!(app.workspace_filter.is_none(), "fresh state.json → no filter");
-        assert_eq!(app.workspaces, vec!["alpha".to_string(), "bravo".to_string()]);
+        assert!(
+            app.workspace_filter.is_none(),
+            "fresh state.json → no filter"
+        );
+        assert_eq!(
+            app.workspaces,
+            vec!["alpha".to_string(), "bravo".to_string()]
+        );
 
         // Open, navigate to the bravo row (All=0, alpha=1, bravo=2),
         // commit. The dropdown closes itself.
@@ -2996,12 +3207,18 @@ mod tests {
         app.dropdown_nav_down();
         app.dropdown_select();
         assert!(!app.workspace_dropdown_is_open());
-        assert_eq!(app.workspace_filter, Some(WorkspaceFilter::Workspace("bravo".into())));
+        assert_eq!(
+            app.workspace_filter,
+            Some(WorkspaceFilter::Workspace("bravo".into()))
+        );
 
         // A fresh app rehydrates the same filter from disk.
         let mut app2 = KanbanApp::new("demo");
         app2.refresh();
-        assert_eq!(app2.workspace_filter, Some(WorkspaceFilter::Workspace("bravo".into())));
+        assert_eq!(
+            app2.workspace_filter,
+            Some(WorkspaceFilter::Workspace("bravo".into()))
+        );
 
         // Unassigned round-trips through the sentinel.
         app2.open_workspace_dropdown();
@@ -3101,8 +3318,20 @@ mod tests {
         let mut app = KanbanApp::new("demo");
         app.workspaces = vec!["alpha".into(), "bravo".into()];
         app.tasks = vec![
-            task_file_for("a", Column::todo(), 0, "2026-06-20T10:00:00Z", Some("alpha")),
-            task_file_for("b", Column::todo(), 1, "2026-06-20T10:00:00Z", Some("bravo")),
+            task_file_for(
+                "a",
+                Column::todo(),
+                0,
+                "2026-06-20T10:00:00Z",
+                Some("alpha"),
+            ),
+            task_file_for(
+                "b",
+                Column::todo(),
+                1,
+                "2026-06-20T10:00:00Z",
+                Some("bravo"),
+            ),
         ];
         app.open_workspace_dropdown();
 
@@ -3122,11 +3351,23 @@ mod tests {
             .collect();
         let joined = rendered.join("\n");
 
-        assert!(joined.contains("Workspace: All ▾"), "chip missing in:\n{joined}");
-        assert!(joined.contains("Filter by workspace"), "dropdown title missing");
+        assert!(
+            joined.contains("Workspace: All ▾"),
+            "chip missing in:\n{joined}"
+        );
+        assert!(
+            joined.contains("Filter by workspace"),
+            "dropdown title missing"
+        );
         assert!(joined.contains("All (2)"), "All row missing in:\n{joined}");
-        assert!(joined.contains("alpha (1)"), "alpha row missing in:\n{joined}");
-        assert!(joined.contains("bravo (1)"), "bravo row missing in:\n{joined}");
+        assert!(
+            joined.contains("alpha (1)"),
+            "alpha row missing in:\n{joined}"
+        );
+        assert!(
+            joined.contains("bravo (1)"),
+            "bravo row missing in:\n{joined}"
+        );
 
         assert!(app.filter_chip_hit.is_some(), "chip rect not recorded");
         assert_eq!(
@@ -3228,7 +3469,11 @@ mod tests {
         assert!(!app.filter_chip_at(55, 1), "chip lives on y=0 only");
         assert_eq!(app.dropdown_option_at(55, 1), Some(0));
         assert_eq!(app.dropdown_option_at(55, 2), Some(1));
-        assert_eq!(app.dropdown_option_at(10, 1), None, "miss outside chip x range");
+        assert_eq!(
+            app.dropdown_option_at(10, 1),
+            None,
+            "miss outside chip x range"
+        );
     }
 
     // ---- All-mode column rendering ---------------------------------------
@@ -3339,7 +3584,14 @@ mod tests {
         let names: Vec<&str> = cols.iter().map(|c| c.status_name.as_str()).collect();
         assert_eq!(
             names,
-            vec!["Backlog", "Todo", "In Progress", "Review", "Done", "Canceled"]
+            vec![
+                "Backlog",
+                "Todo",
+                "In Progress",
+                "Review",
+                "Done",
+                "Canceled"
+            ]
         );
     }
 
@@ -3360,15 +3612,27 @@ mod tests {
                 ("Done", StatusCategory::Done),
             ],
         );
-        let t_backlog =
-            task_in_workflow("a", Column::backlog(), Some("design-review"), "2026-06-20T10:00:00Z")
-                .task;
-        let t_wip =
-            task_in_workflow("b", Column::in_progress(), Some("design-review"), "2026-06-20T10:00:00Z")
-                .task;
-        let t_review =
-            task_in_workflow("c", Column::review(), Some("design-review"), "2026-06-20T10:00:00Z")
-                .task;
+        let t_backlog = task_in_workflow(
+            "a",
+            Column::backlog(),
+            Some("design-review"),
+            "2026-06-20T10:00:00Z",
+        )
+        .task;
+        let t_wip = task_in_workflow(
+            "b",
+            Column::in_progress(),
+            Some("design-review"),
+            "2026-06-20T10:00:00Z",
+        )
+        .task;
+        let t_review = task_in_workflow(
+            "c",
+            Column::review(),
+            Some("design-review"),
+            "2026-06-20T10:00:00Z",
+        )
+        .task;
         // Name match.
         assert_eq!(resolve_task_status(&t_backlog, &design), "Backlog");
         // Category fallback — `InProgress` is not declared by name.
@@ -3394,7 +3658,12 @@ mod tests {
         app.tasks = vec![
             // Default-workflow tasks.
             task_in_workflow("a", Column::todo(), None, "2026-06-20T10:00:00Z"),
-            task_in_workflow("b", Column::review(), Some("default"), "2026-06-20T10:00:00Z"),
+            task_in_workflow(
+                "b",
+                Column::review(),
+                Some("default"),
+                "2026-06-20T10:00:00Z",
+            ),
             // design-review tasks land in shared columns.
             task_in_workflow(
                 "c",
@@ -3413,7 +3682,12 @@ mod tests {
             task_in_workflow("e", Column::in_progress(), None, "2026-06-20T10:00:00Z"),
             // Task pointing at a workflow that doesn't exist falls
             // back to default — Todo lands in the project-wide Todo column.
-            task_in_workflow("orphan", Column::todo(), Some("ghost"), "2026-06-20T10:00:00Z"),
+            task_in_workflow(
+                "orphan",
+                Column::todo(),
+                Some("ghost"),
+                "2026-06-20T10:00:00Z",
+            ),
         ];
 
         // statuses.yaml order: backlog todo in-progress review done canceled
@@ -3432,7 +3706,11 @@ mod tests {
         );
         assert_eq!(ids(3), vec!["b"], "review");
         assert_eq!(ids(4), vec!["d"], "done");
-        assert_eq!(ids(5), Vec::<&str>::new(), "canceled stays visible but empty");
+        assert_eq!(
+            ids(5),
+            Vec::<&str>::new(),
+            "canceled stays visible but empty"
+        );
     }
 
     /// Every status declared in `statuses.yaml` gets a column even if
@@ -3474,7 +3752,10 @@ mod tests {
         // nav_right walks all six columns and wraps at the end.
         app.selected_column = 5; // canceled
         app.nav_right();
-        assert_eq!(app.selected_column, 0, "wraps from canceled back to backlog");
+        assert_eq!(
+            app.selected_column, 0,
+            "wraps from canceled back to backlog"
+        );
         for expected in 1..=5 {
             app.nav_right();
             assert_eq!(app.selected_column, expected);
@@ -3623,7 +3904,11 @@ mod tests {
 
         app.workflow_filter = Some("design-review".into());
         app.all_columns = app.compute_all_columns();
-        let ids: Vec<&str> = app.all_columns.iter().map(|c| c.status_id.as_str()).collect();
+        let ids: Vec<&str> = app
+            .all_columns
+            .iter()
+            .map(|c| c.status_id.as_str())
+            .collect();
         assert_eq!(
             ids,
             vec!["backlog", "in-progress", "done"],
@@ -3660,7 +3945,12 @@ mod tests {
         app.workflows = vec![default_workflow(), design];
         app.tasks = vec![
             task_in_workflow("a", Column::todo(), None, "2026-06-20T10:00:00Z"),
-            task_in_workflow("b", Column::backlog(), Some("design-review"), "2026-06-20T10:00:00Z"),
+            task_in_workflow(
+                "b",
+                Column::backlog(),
+                Some("design-review"),
+                "2026-06-20T10:00:00Z",
+            ),
         ];
         let opts = app.workflow_dropdown_options();
         assert_eq!(opts.len(), 3);
@@ -3766,7 +4056,12 @@ mod tests {
             // Default-workflow card in Backlog — design-review also has
             // a `backlog` column, so without the workflow check this
             // card would leak in.
-            task_in_workflow("default-card", Column::backlog(), None, "2026-06-20T10:00:00Z"),
+            task_in_workflow(
+                "default-card",
+                Column::backlog(),
+                None,
+                "2026-06-20T10:00:00Z",
+            ),
             // design-review card in Backlog — should be the only card
             // visible in the backlog column.
             task_in_workflow(
@@ -3815,7 +4110,11 @@ mod tests {
             "2026-06-20T10:00:00Z",
         )];
 
-        let ids: Vec<&str> = app.all_columns.iter().map(|c| c.status_id.as_str()).collect();
+        let ids: Vec<&str> = app
+            .all_columns
+            .iter()
+            .map(|c| c.status_id.as_str())
+            .collect();
         assert_eq!(
             ids,
             vec!["backlog", "in-progress", "done"],
@@ -3824,7 +4123,11 @@ mod tests {
         let counts: Vec<usize> = (0..app.all_columns.len())
             .map(|i| app.column_tasks(i).len())
             .collect();
-        assert_eq!(counts, vec![0, 1, 0], "empty columns persist alongside the populated one");
+        assert_eq!(
+            counts,
+            vec![0, 1, 0],
+            "empty columns persist alongside the populated one"
+        );
     }
 
     /// Filter state is in-memory only — `apply_workflow_filter` must
@@ -3883,7 +4186,10 @@ mod tests {
         assert_eq!(widths.len(), 6);
         for (i, w) in &widths {
             if collapsed[*i] {
-                assert_eq!(*w, COLLAPSED_MIN_W, "collapsed column {i} should stay at min");
+                assert_eq!(
+                    *w, COLLAPSED_MIN_W,
+                    "collapsed column {i} should stay at min"
+                );
             } else {
                 assert!(
                     *w > NONEMPTY_MIN_W,
@@ -3978,7 +4284,10 @@ mod tests {
             rendered.contains("Workflow: design-review ▾"),
             "workflow chip missing or wrong:\n{rendered}"
         );
-        assert!(rendered.contains("IN PROGRESS"), "IN PROGRESS column missing");
+        assert!(
+            rendered.contains("IN PROGRESS"),
+            "IN PROGRESS column missing"
+        );
         // TO DO is a project-wide column with the legacy uppercase label —
         // never paints under the design-review filter (design-review
         // doesn't declare `todo`).
@@ -4106,7 +4415,7 @@ mod tests {
     fn card_meta_line_blank_for_default_only() {
         let task = task_with_params("t", None, &[]);
         let workflows = vec![default_workflow()];
-        let line = card_meta_line(&task, &workflows, false, 40);
+        let line = card_meta_line(&task, &workflows, "default", false, 40);
         assert_eq!(line_text(&line), "");
     }
 
@@ -4117,7 +4426,7 @@ mod tests {
     fn card_meta_line_shows_default_badge_when_multiple_workflows() {
         let task = task_with_params("t", None, &[]);
         let workflows = vec![default_workflow(), workflow_with_git("feature-task", None)];
-        let line = card_meta_line(&task, &workflows, true, 40);
+        let line = card_meta_line(&task, &workflows, "default", true, 40);
         assert_eq!(line_text(&line), " default ");
     }
 
@@ -4126,11 +4435,8 @@ mod tests {
     #[test]
     fn card_meta_line_shows_workflow_badge_without_git_block() {
         let task = task_with_params("t", Some("design-review"), &[]);
-        let workflows = vec![
-            default_workflow(),
-            workflow_with_git("design-review", None),
-        ];
-        let line = card_meta_line(&task, &workflows, true, 40);
+        let workflows = vec![default_workflow(), workflow_with_git("design-review", None)];
+        let line = card_meta_line(&task, &workflows, "design-review", true, 40);
         assert_eq!(line_text(&line), " design-review ");
     }
 
@@ -4140,16 +4446,12 @@ mod tests {
     /// resolved branch on one line.
     #[test]
     fn card_meta_line_appends_resolved_branch() {
-        let task = task_with_params(
-            "t",
-            Some("feature-task"),
-            &[("feature", "auth-rewrite")],
-        );
+        let task = task_with_params("t", Some("feature-task"), &[("feature", "auth-rewrite")]);
         let workflows = vec![workflow_with_git(
             "feature-task",
             Some("feature/{{feature}}"),
         )];
-        let line = card_meta_line(&task, &workflows, true, 60);
+        let line = card_meta_line(&task, &workflows, "feature-task", true, 60);
         // Two spaces between badge and branch: the badge's own trailing
         // padding (bg-filled) plus a plain separator space.
         assert_eq!(line_text(&line), " feature-task  ⎇ feature/auth-rewrite");
@@ -4161,16 +4463,12 @@ mod tests {
     /// worth carrying.
     #[test]
     fn card_meta_line_omits_badge_but_keeps_branch_when_filtered() {
-        let task = task_with_params(
-            "t",
-            Some("feature-task"),
-            &[("feature", "dashboard-v2")],
-        );
+        let task = task_with_params("t", Some("feature-task"), &[("feature", "dashboard-v2")]);
         let workflows = vec![workflow_with_git(
             "feature-task",
             Some("feature/{{feature}}"),
         )];
-        let line = card_meta_line(&task, &workflows, false, 60);
+        let line = card_meta_line(&task, &workflows, "feature-task", false, 60);
         assert_eq!(line_text(&line), "⎇ feature/dashboard-v2");
     }
 
@@ -4179,17 +4477,13 @@ mod tests {
     /// the card is actually operating on.
     #[test]
     fn card_meta_line_prefers_task_branch_over_template() {
-        let mut task = task_with_params(
-            "t",
-            Some("feature-task"),
-            &[("feature", "auth")],
-        );
+        let mut task = task_with_params("t", Some("feature-task"), &[("feature", "auth")]);
         task.branch = Some("shelbi/t".into());
         let workflows = vec![workflow_with_git(
             "feature-task",
             Some("feature/{{feature}}"),
         )];
-        let line = card_meta_line(&task, &workflows, false, 60);
+        let line = card_meta_line(&task, &workflows, "feature-task", false, 60);
         assert_eq!(line_text(&line), "⎇ shelbi/t");
     }
 
@@ -4201,10 +4495,10 @@ mod tests {
         let task = task_with_params("t", Some("feature-release"), &[]);
         let workflows = vec![workflow_with_git("feature-release", Some("main"))];
         // Show badge path: drop the branch, keep the badge.
-        let with_name = card_meta_line(&task, &workflows, true, 60);
+        let with_name = card_meta_line(&task, &workflows, "feature-release", true, 60);
         assert_eq!(line_text(&with_name), " feature-release ");
         // No badge path: nothing left worth showing → blank.
-        let without_name = card_meta_line(&task, &workflows, false, 60);
+        let without_name = card_meta_line(&task, &workflows, "feature-release", false, 60);
         assert_eq!(line_text(&without_name), "");
     }
 
@@ -4221,9 +4515,9 @@ mod tests {
             "feature-task",
             Some("feature/{{feature}}"),
         )];
-        let with_name = card_meta_line(&task, &workflows, true, 60);
+        let with_name = card_meta_line(&task, &workflows, "feature-task", true, 60);
         assert_eq!(line_text(&with_name), " feature-task ");
-        let without_name = card_meta_line(&task, &workflows, false, 60);
+        let without_name = card_meta_line(&task, &workflows, "feature-task", false, 60);
         assert_eq!(line_text(&without_name), "");
     }
 
@@ -4236,13 +4530,16 @@ mod tests {
         let task = task_with_params(
             "t",
             Some("feature-task"),
-            &[("feature", "very-long-feature-name-that-exceeds-the-cell-width")],
+            &[(
+                "feature",
+                "very-long-feature-name-that-exceeds-the-cell-width",
+            )],
         );
         let workflows = vec![workflow_with_git(
             "feature-task",
             Some("feature/{{feature}}"),
         )];
-        let line = card_meta_line(&task, &workflows, true, 20);
+        let line = card_meta_line(&task, &workflows, "feature-task", true, 20);
         let text = line_text(&line);
         assert!(text.chars().count() <= 20, "overflows width: {text:?}");
         assert!(text.ends_with('…'), "should end with ellipsis: {text:?}");
@@ -4357,7 +4654,10 @@ mod tests {
         // First app: collapse a non-empty column explicitly.
         let mut app = KanbanApp::new("demo");
         app.tasks = vec![task_file("a", Column::todo(), 0, "2026-06-20T10:00:00Z")];
-        assert!(!app.is_column_collapsed(1), "non-empty Todo expands by default");
+        assert!(
+            !app.is_column_collapsed(1),
+            "non-empty Todo expands by default"
+        );
         app.toggle_column(1);
         assert_eq!(app.column_expansion(1), ColumnExpansion::Collapsed);
 
@@ -4423,7 +4723,12 @@ mod tests {
         let mut app = KanbanApp::new("demo");
         // Seed a single Backlog card so the Backlog column expands —
         // we want a NON-Backlog empty column to verify the strip.
-        app.tasks = vec![task_file("seed", Column::backlog(), 0, "2026-06-20T10:00:00Z")];
+        app.tasks = vec![task_file(
+            "seed",
+            Column::backlog(),
+            0,
+            "2026-06-20T10:00:00Z",
+        )];
 
         let backend = TestBackend::new(120, 20);
         let mut term = Terminal::new(backend).unwrap();
@@ -4477,7 +4782,12 @@ mod tests {
         let mut app = KanbanApp::new("demo");
         // One Backlog task → Backlog expands. Every other status is
         // empty → auto-collapses to a strip.
-        app.tasks = vec![task_file("seed", Column::backlog(), 0, "2026-06-20T10:00:00Z")];
+        app.tasks = vec![task_file(
+            "seed",
+            Column::backlog(),
+            0,
+            "2026-06-20T10:00:00Z",
+        )];
 
         let backend = TestBackend::new(120, 20);
         let mut term = Terminal::new(backend).unwrap();
@@ -4485,8 +4795,7 @@ mod tests {
 
         // Every header hit's first row should agree — collapsed strips
         // and expanded banners both anchor at the top of their slot.
-        let header_top_rows: Vec<u16> =
-            app.header_hits.iter().map(|h| h.area.y).collect();
+        let header_top_rows: Vec<u16> = app.header_hits.iter().map(|h| h.area.y).collect();
         assert!(
             header_top_rows.windows(2).all(|w| w[0] == w[1]),
             "header hit rects sit on different top rows: {header_top_rows:?}"
@@ -4506,8 +4815,7 @@ mod tests {
             .iter()
             .find(|h| h.col_idx == backlog_idx)
             .expect("backlog header registered a hit");
-        let backlog_row: String = (backlog_hit.area.x
-            ..backlog_hit.area.x + backlog_hit.area.width)
+        let backlog_row: String = (backlog_hit.area.x..backlog_hit.area.x + backlog_hit.area.width)
             .map(|x| buf[(x, header_y)].symbol().to_string())
             .collect();
         assert!(
@@ -4543,16 +4851,31 @@ mod tests {
         let mut app = KanbanApp::new("demo");
         app.header_hits = vec![
             HeaderHit {
-                area: Rect { x: 0, y: 1, width: 20, height: 1 },
+                area: Rect {
+                    x: 0,
+                    y: 1,
+                    width: 20,
+                    height: 1,
+                },
                 col_idx: 0,
             },
             HeaderHit {
-                area: Rect { x: 20, y: 1, width: 20, height: 1 },
+                area: Rect {
+                    x: 20,
+                    y: 1,
+                    width: 20,
+                    height: 1,
+                },
                 col_idx: 1,
             },
             // A collapsed column registers its whole vertical strip.
             HeaderHit {
-                area: Rect { x: 40, y: 1, width: 3, height: 12 },
+                area: Rect {
+                    x: 40,
+                    y: 1,
+                    width: 3,
+                    height: 12,
+                },
                 col_idx: 2,
             },
         ];
@@ -4575,15 +4898,13 @@ mod tests {
         let backend = workflow_with_git("backend", Some("feature/be-{{feature}}"));
         let workflows = vec![frontend, backend];
 
-        let fe_task =
-            task_with_params("a", Some("frontend"), &[("feature", "login")]);
-        let be_task =
-            task_with_params("b", Some("backend"), &[("feature", "login")]);
+        let fe_task = task_with_params("a", Some("frontend"), &[("feature", "login")]);
+        let be_task = task_with_params("b", Some("backend"), &[("feature", "login")]);
 
         // Both tasks live in the same project-wide `Todo` status, but
         // each resolves against its OWN workflow's `git:` template.
-        let fe_line = card_meta_line(&fe_task, &workflows, true, 60);
-        let be_line = card_meta_line(&be_task, &workflows, true, 60);
+        let fe_line = card_meta_line(&fe_task, &workflows, "frontend", true, 60);
+        let be_line = card_meta_line(&be_task, &workflows, "backend", true, 60);
         assert_eq!(line_text(&fe_line), " frontend  ⎇ feature/fe-login");
         assert_eq!(line_text(&be_line), " backend  ⎇ feature/be-login");
     }

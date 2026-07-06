@@ -129,9 +129,7 @@ impl ProjectPaths for Project {
         if let Some(p) = &self.workspace_settings_template {
             return Ok(expand_tilde_path(p));
         }
-        Ok(self
-            .config_root()?
-            .join("workspace-settings.json.template"))
+        Ok(self.config_root()?.join("workspace-settings.json.template"))
     }
 
     fn state_json_path(&self) -> Result<PathBuf> {
@@ -278,16 +276,18 @@ mod scan {
             .find(|(_, l)| l.trim_start().starts_with("#[cfg(test)]"))
             .map(|(i, _)| i)
             .unwrap_or(usize::MAX);
-        text.lines()
-            .enumerate()
-            .take_while(move |(i, _)| *i < cut)
+        text.lines().enumerate().take_while(move |(i, _)| *i < cut)
     }
 
     #[test]
     fn no_new_callsite_hand_builds_a_per_project_shelbi_path() {
         let root = workspace_root();
         let crates_dir = root.join("crates");
-        assert!(crates_dir.is_dir(), "expected crates/ at {}", crates_dir.display());
+        assert!(
+            crates_dir.is_dir(),
+            "expected crates/ at {}",
+            crates_dir.display()
+        );
         let mut files = Vec::new();
         collect_rs(&crates_dir, &mut files);
         files.sort();
@@ -298,7 +298,10 @@ mod scan {
             if s.ends_with(SELF_SUFFIX) {
                 continue;
             }
-            if CRATE_OWNER_SUFFIXES.iter().any(|suffix| s.ends_with(*suffix)) {
+            if CRATE_OWNER_SUFFIXES
+                .iter()
+                .any(|suffix| s.ends_with(*suffix))
+            {
                 continue;
             }
             let Ok(text) = fs::read_to_string(path) else {
@@ -354,12 +357,18 @@ mod tests {
         let mut runners = std::collections::BTreeMap::new();
         runners.insert(
             "claude".to_string(),
-            AgentRunnerSpec { command: "claude".into(), flags: vec![], dialog_signatures: vec![] },
+            AgentRunnerSpec {
+                command: "claude".into(),
+                flags: vec![],
+                prompt_injection: None,
+                dialog_signatures: vec![],
+            },
         );
         Project {
             name: name.into(),
             repo: repo.into(),
             default_branch: "main".into(),
+            default_workflow: None,
             config_mode: mode,
             machines: vec![Machine {
                 name: "hub".into(),
@@ -368,7 +377,9 @@ mod tests {
                 host: None,
                 tags: Vec::new(),
             }],
-            orchestrator: OrchestratorSpec { runner: "claude".into() },
+            orchestrator: OrchestratorSpec {
+                runner: "claude".into(),
+            },
             agent_runners: runners,
             editor: None,
             github_url: None,
@@ -392,7 +403,10 @@ mod tests {
         for mode in [None, Some(ConfigMode::Global)] {
             let p = fixture_project("myapp", "/repos/myapp", mode);
             assert_eq!(p.config_root().unwrap(), home.join("projects/myapp"));
-            assert_eq!(p.workflows_dir().unwrap(), home.join("projects/myapp/workflows"));
+            assert_eq!(
+                p.workflows_dir().unwrap(),
+                home.join("projects/myapp/workflows")
+            );
             assert_eq!(p.agents_dir().unwrap(), home.join("projects/myapp/agents"));
             assert_eq!(
                 p.statuses_yaml_path().unwrap(),
@@ -437,10 +451,19 @@ mod tests {
         for mode in [None, Some(ConfigMode::Global), Some(ConfigMode::InRepo)] {
             let p = fixture_project("myapp", "/repos/myapp", mode);
             assert_eq!(p.state_root().unwrap(), home.join("projects/myapp"));
-            assert_eq!(p.state_json_path().unwrap(), home.join("projects/myapp/state.json"));
+            assert_eq!(
+                p.state_json_path().unwrap(),
+                home.join("projects/myapp/state.json")
+            );
             assert_eq!(p.tasks_dir().unwrap(), home.join("projects/myapp/tasks"));
-            assert_eq!(p.handoff_md_path().unwrap(), home.join("projects/myapp/HANDOFF.md"));
-            assert_eq!(p.workspaces_dir().unwrap(), home.join("projects/myapp/workspaces"));
+            assert_eq!(
+                p.handoff_md_path().unwrap(),
+                home.join("projects/myapp/HANDOFF.md")
+            );
+            assert_eq!(
+                p.workspaces_dir().unwrap(),
+                home.join("projects/myapp/workspaces")
+            );
             assert_eq!(p.claude_dir().unwrap(), home.join("projects/myapp/.claude"));
             assert_eq!(p.events_log_path().unwrap(), home.join("events.log"));
         }
@@ -480,7 +503,10 @@ mod tests {
         assert_eq!(global.config_root().unwrap(), global.state_root().unwrap());
 
         let in_repo = fixture_project("ir", "/repos/ir", Some(ConfigMode::InRepo));
-        assert_ne!(in_repo.config_root().unwrap(), in_repo.state_root().unwrap());
+        assert_ne!(
+            in_repo.config_root().unwrap(),
+            in_repo.state_root().unwrap()
+        );
         std::env::remove_var("SHELBI_HOME");
     }
 }

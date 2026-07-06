@@ -34,10 +34,7 @@ pub enum SkipReason {
     NoAgentForStatus { status_id: String },
     /// `owner: user` with an `agent:` field, but Zen is off. The status
     /// is human-driven by default; Zen unlocks the agent path.
-    AgentRequiresZen {
-        status_id: String,
-        agent: String,
-    },
+    AgentRequiresZen { status_id: String, agent: String },
 }
 
 impl SkipReason {
@@ -45,9 +42,7 @@ impl SkipReason {
     pub fn human_message(&self) -> String {
         match self {
             SkipReason::NoAgentForStatus { status_id } => {
-                format!(
-                    "status `{status_id}` has no agent declared — no automation path"
-                )
+                format!("status `{status_id}` has no agent declared — no automation path")
             }
             SkipReason::AgentRequiresZen { status_id, agent } => {
                 format!(
@@ -108,7 +103,8 @@ pub fn resolve_dispatch_agent(status: &WorkflowStatus, zen_on: bool) -> Dispatch
 /// project's live Zen state so an `owner: user` active status only pulls in
 /// its agent when Zen is on, matching the declarative dispatch rules.
 pub fn resolve_active_agent(project_name: &str, task: &Task) -> String {
-    let workflow = shelbi_state::load_workflow(project_name, task.workflow_or_default())
+    let workflow = shelbi_state::load_project(project_name)
+        .and_then(|project| shelbi_state::load_task_workflow(project_name, &project, task))
         .unwrap_or_else(|_| shelbi_core::default_workflow());
     let zen_on = matches!(
         shelbi_state::read_state(project_name).map(|s| s.zen_mode),
@@ -149,11 +145,15 @@ mod tests {
         let s = status("in-progress", Owner::Agent, Some("developer"));
         assert_eq!(
             resolve_dispatch_agent(&s, false),
-            DispatchDecision::Dispatch { agent: "developer".into() },
+            DispatchDecision::Dispatch {
+                agent: "developer".into()
+            },
         );
         assert_eq!(
             resolve_dispatch_agent(&s, true),
-            DispatchDecision::Dispatch { agent: "developer".into() },
+            DispatchDecision::Dispatch {
+                agent: "developer".into()
+            },
         );
     }
 
@@ -187,7 +187,9 @@ mod tests {
         }
         assert_eq!(
             resolve_dispatch_agent(&s, true),
-            DispatchDecision::Dispatch { agent: "orchestrator".into() },
+            DispatchDecision::Dispatch {
+                agent: "orchestrator".into()
+            },
         );
     }
 
@@ -211,11 +213,15 @@ statuses:
         let active = wf.status("in-progress").unwrap();
         assert_eq!(
             resolve_dispatch_agent(active, false),
-            DispatchDecision::Dispatch { agent: "developer".into() },
+            DispatchDecision::Dispatch {
+                agent: "developer".into()
+            },
         );
         assert_eq!(
             resolve_dispatch_agent(active, true),
-            DispatchDecision::Dispatch { agent: "developer".into() },
+            DispatchDecision::Dispatch {
+                agent: "developer".into()
+            },
         );
     }
 
@@ -244,7 +250,9 @@ statuses:
         // Zen on → orchestrator takes over.
         assert_eq!(
             resolve_dispatch_agent(review, true),
-            DispatchDecision::Dispatch { agent: "orchestrator".into() },
+            DispatchDecision::Dispatch {
+                agent: "orchestrator".into()
+            },
         );
     }
 

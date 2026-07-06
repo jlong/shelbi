@@ -108,7 +108,10 @@ pub enum Error {
     /// concrete example) so the user immediately knows what to add —
     /// see `Plans/workflows.md` §12 "Parameterization".
     #[error("{}", missing_task_params_message(.workflow, .params))]
-    MissingTaskParams { workflow: String, params: Vec<String> },
+    MissingTaskParams {
+        workflow: String,
+        params: Vec<String>,
+    },
 
     /// A split project YAML (in-repo mode) has a key that belongs on the
     /// other side of the split — e.g. `machines:` in the shared file, or

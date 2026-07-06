@@ -54,8 +54,8 @@ pub(crate) mod test_support {
     /// drive further git operations against it.
     pub fn provision_hub_repo_for_project(home: &Path, project_name: &str) -> PathBuf {
         use shelbi_core::{
-            AgentRunnerSpec, GitConfig, HeartbeatConfig, Machine, MachineKind,
-            OrchestratorSpec, Project, ZenConfig,
+            AgentRunnerSpec, GitConfig, HeartbeatConfig, Machine, MachineKind, OrchestratorSpec,
+            Project, ZenConfig,
         };
         use std::collections::BTreeMap;
         use std::process::Command;
@@ -85,6 +85,7 @@ pub(crate) mod test_support {
             AgentRunnerSpec {
                 command: "claude".into(),
                 flags: vec![],
+                prompt_injection: None,
                 dialog_signatures: vec![],
             },
         );
@@ -92,6 +93,7 @@ pub(crate) mod test_support {
             name: project_name.into(),
             repo: repo.to_string_lossy().into(),
             default_branch: "main".into(),
+            default_workflow: None,
             config_mode: None,
             machines: vec![Machine {
                 name: "hub".into(),
@@ -194,8 +196,8 @@ pub fn run_sidebar(project_name: &str) -> Result<()> {
     // verify Alt+Z is delivered and let the user pick a fallback if not.
     // Best-effort: an error here defaults to Alt+Z so the sidebar still
     // launches with a working binding on cooperative terminals.
-    let probe_chord = zen_probe::ensure_zen_keymap(&mut term)
-        .unwrap_or(shelbi_state::ZenToggleChord::AltZ);
+    let probe_chord =
+        zen_probe::ensure_zen_keymap(&mut term).unwrap_or(shelbi_state::ZenToggleChord::AltZ);
     // Prefer the keys.yaml-resolved chord (so a migrated `zen_toggle`
     // shows the right glyph even though `config.yaml` is now at default)
     // and fall back to the probe's answer for chords the four-value
@@ -274,7 +276,11 @@ fn restore_terminal<B: ratatui::backend::Backend + std::io::Write>(
     term: &mut Terminal<B>,
 ) -> Result<()> {
     disable_raw_mode()?;
-    execute!(term.backend_mut(), DisableMouseCapture, LeaveAlternateScreen)?;
+    execute!(
+        term.backend_mut(),
+        DisableMouseCapture,
+        LeaveAlternateScreen
+    )?;
     term.show_cursor()?;
     Ok(())
 }
@@ -291,11 +297,15 @@ fn log_keymap_diagnostics(diags: &[shelbi_state::keymap::KeymapDiagnostic]) -> u
     use shelbi_state::keymap::KeymapDiagnostic;
     for d in diags {
         match d {
-            KeymapDiagnostic::Error { message, location, .. } => match location {
+            KeymapDiagnostic::Error {
+                message, location, ..
+            } => match location {
                 Some(loc) => tracing::error!("keys.yaml error: {message} (at {loc})"),
                 None => tracing::error!("keys.yaml error: {message}"),
             },
-            KeymapDiagnostic::Warning { message, location, .. } => match location {
+            KeymapDiagnostic::Warning {
+                message, location, ..
+            } => match location {
                 Some(loc) => tracing::warn!("keys.yaml warning: {message} (at {loc})"),
                 None => tracing::warn!("keys.yaml warning: {message}"),
             },
@@ -368,12 +378,10 @@ mod tests {
     /// status line, so the nav labels stay clean.
     #[test]
     fn sidebar_nav_labels_render_uninterrupted_with_startup_warnings() {
-        let diags = vec![
-            warning(
-                "config.yaml::keymap.zen_toggle has no keys.yaml::default for zen_toggle",
-                Some("config.yaml"),
-            ),
-        ];
+        let diags = vec![warning(
+            "config.yaml::keymap.zen_toggle has no keys.yaml::default for zen_toggle",
+            Some("config.yaml"),
+        )];
         let count = log_keymap_diagnostics(&diags);
         let mut app = App::new_sidebar("demo");
         if count > 0 {
@@ -382,7 +390,8 @@ mod tests {
 
         let backend = TestBackend::new(60, 20);
         let mut term = Terminal::new(backend).unwrap();
-        term.draw(|f| sidebar::render_full(f, &mut app, f.area())).unwrap();
+        term.draw(|f| sidebar::render_full(f, &mut app, f.area()))
+            .unwrap();
         let buf = term.backend().buffer().clone();
         let dumped: Vec<String> = (0..buf.area.height)
             .map(|y| {

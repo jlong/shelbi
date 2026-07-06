@@ -263,9 +263,15 @@ mod tests {
     fn default_keymap_w_toggles_workspaces_filter() {
         let (mut app, km) = default_app_and_keymaps();
         handle_activity_key(&mut app, ev_plain(KeyCode::Char('w')), &km);
-        assert!(app.filter.workspaces, "w should flip the workspaces pill on");
+        assert!(
+            app.filter.workspaces,
+            "w should flip the workspaces pill on"
+        );
         handle_activity_key(&mut app, ev_plain(KeyCode::Char('w')), &km);
-        assert!(!app.filter.workspaces, "w should flip the workspaces pill off");
+        assert!(
+            !app.filter.workspaces,
+            "w should flip the workspaces pill off"
+        );
     }
 
     #[test]

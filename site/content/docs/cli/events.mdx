@@ -45,6 +45,11 @@ in the background and watch with `Monitor`), and for post-hoc forensics
 | `-n, --lines <LINES>` | integer | `20` | Number of trailing lines to print before following (or before exiting if `--follow` is not set). |
 | `--since <SINCE>` | duration (e.g. `10m`, `2h`, `1d`) | — | Only show events newer than this. When set, `-n` is ignored and *all* matching lines print. |
 | `-f, --follow` | flag | off | Stream new transitions as they're appended. Exit on Ctrl-C. |
+| `--format <FORMAT>` | `raw`, `envelope` | `raw` | Print historical log lines, or a normalized JSON envelope with `kind`, `project`, `timestamp`, and the original `line`. Push-capable harness callbacks use this same envelope. |
+
+Shelbi only transports events. Whether a harness wakes the orchestrator through
+Claude-style `Monitor` output, a callback socket, or the pre-turn drain path, the
+orchestrator remains responsible for deciding what action to take.
 
 ## Examples
 

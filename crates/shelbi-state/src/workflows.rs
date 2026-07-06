@@ -57,8 +57,8 @@ use std::sync::Mutex;
 use std::time::SystemTime;
 
 use shelbi_core::{
-    default_project_statuses, default_workflow, validate_workflow_name, Error, ProjectStatuses,
-    Result, Workflow,
+    default_project_statuses, default_workflow, validate_workflow_name, Error, Project,
+    ProjectStatuses, Result, Task, Workflow,
 };
 
 use crate::{agents_dir, atomic_write, config_project_dir};
@@ -176,10 +176,32 @@ pub fn load_workflow(project: &str, name: &str) -> Result<Workflow> {
         return Err(missing_statuses_error(&st_path));
     }
     let statuses = load_project_statuses(project)?;
-    let resolved = wf.resolve_against(&statuses).map_err(|e| annotate(&path, e))?;
+    let resolved = wf
+        .resolve_against(&statuses)
+        .map_err(|e| annotate(&path, e))?;
 
     validate_agent_references(project, &resolved).map_err(|e| annotate(&path, e))?;
     Ok(resolved)
+}
+
+/// Resolve the workflow name for `task` with project context:
+/// explicit task `workflow:` wins, then project `default_workflow:`,
+/// then the built-in `default` fallback.
+pub fn resolve_task_workflow_name<'a>(project: &'a Project, task: &'a Task) -> &'a str {
+    task.workflow
+        .as_deref()
+        .unwrap_or_else(|| project.default_workflow_name())
+}
+
+/// Load the workflow that applies to `task` under `project_config`.
+/// This validates a configured project default through the same strict
+/// named-workflow path used by explicit task workflows.
+pub fn load_task_workflow(
+    project: &str,
+    project_config: &Project,
+    task: &Task,
+) -> Result<Workflow> {
+    load_workflow(project, resolve_task_workflow_name(project_config, task))
 }
 
 /// Discover every `*.yaml` file in the project's `workflows/` directory
@@ -498,7 +520,10 @@ static EMITTED_NAME_MISMATCHES: Mutex<Option<HashSet<PathBuf>>> = Mutex::new(Non
 /// `name:` differs from its file stem. [`load_workflow`] resolves by
 /// filename, so the name shown in pickers wouldn't load.
 fn warn_name_stem_mismatch_once(path: &Path, declared: &str) {
-    let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or_default();
+    let stem = path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or_default();
     if stem == declared {
         return;
     }
@@ -586,6 +611,137 @@ statuses:
   - { id: review,      owner: user                          }
   - { id: done,        owner: user                          }
 "#;
+
+    const APP_WORKFLOW: &str = r#"
+name: app
+description: App development workflow.
+statuses:
+  - { id: backlog,     owner: user                          }
+  - { id: in-progress, owner: agent, agent: developer       }
+  - { id: review,      owner: user                          }
+  - { id: done,        owner: user                          }
+"#;
+
+    fn write_project_yaml(home: &Path, name: &str, default_workflow: Option<&str>) {
+        ensure_dir(&home.join("projects")).unwrap();
+        let default_workflow = default_workflow
+            .map(|w| format!("default_workflow: {w}\n"))
+            .unwrap_or_default();
+        std::fs::write(
+            home.join(format!("projects/{name}.yaml")),
+            format!(
+                r#"name: {name}
+repo: /tmp/{name}
+default_branch: main
+{default_workflow}orchestrator:
+  runner: claude
+agent_runners:
+  claude:
+    command: claude
+    flags: []
+machines:
+  - name: local
+    kind: local
+    work_dir: /tmp/{name}
+workspaces:
+  - {{ name: dev, machine: local, runner: claude }}
+"#
+            ),
+        )
+        .unwrap();
+    }
+
+    fn task_with_workflow(workflow: Option<&str>) -> Task {
+        let now = chrono::Utc::now();
+        Task {
+            id: "t".into(),
+            title: "Task".into(),
+            column: shelbi_core::Column::todo(),
+            priority: 0,
+            assigned_to: None,
+            workflow: workflow.map(str::to_string),
+            branch: None,
+            depends_on: Vec::new(),
+            prefers_machine: None,
+            zen: None,
+            created_at: now,
+            updated_at: now,
+            params: Default::default(),
+        }
+    }
+
+    fn write_app_workflow(project: &str) {
+        write_default_statuses(project);
+        let dir = workflows_dir(project).unwrap();
+        write_workflow(&dir, "app", APP_WORKFLOW);
+    }
+
+    #[test]
+    fn resolve_task_workflow_name_uses_project_default() {
+        let _g = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+        write_project_yaml(&home, "p", Some("app"));
+        write_app_workflow("p");
+        let project = crate::load_project("p").unwrap();
+        let task = task_with_workflow(None);
+
+        assert_eq!(resolve_task_workflow_name(&project, &task), "app");
+        let workflow = load_task_workflow("p", &project, &task).unwrap();
+        assert_eq!(workflow.name, "app");
+
+        std::env::remove_var("SHELBI_HOME");
+    }
+
+    #[test]
+    fn resolve_task_workflow_name_prefers_explicit_task_workflow() {
+        let _g = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+        write_project_yaml(&home, "p", Some("app"));
+        write_app_workflow("p");
+        let dir = workflows_dir("p").unwrap();
+        write_workflow(&dir, "design-review", SIMPLE_WORKFLOW);
+        let project = crate::load_project("p").unwrap();
+        let task = task_with_workflow(Some("design-review"));
+
+        assert_eq!(resolve_task_workflow_name(&project, &task), "design-review");
+        let workflow = load_task_workflow("p", &project, &task).unwrap();
+        assert_eq!(workflow.name, "design-review");
+
+        std::env::remove_var("SHELBI_HOME");
+    }
+
+    #[test]
+    fn resolve_task_workflow_name_keeps_legacy_default_fallback() {
+        let _g = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+        write_project_yaml(&home, "p", None);
+        let project = crate::load_project("p").unwrap();
+        let task = task_with_workflow(None);
+
+        assert_eq!(resolve_task_workflow_name(&project, &task), "default");
+        assert_eq!(task.workflow_or_default(), "default");
+
+        std::env::remove_var("SHELBI_HOME");
+    }
+
+    #[test]
+    fn load_project_rejects_missing_configured_default_workflow() {
+        let _g = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+        write_project_yaml(&home, "p", Some("app"));
+
+        let err = crate::load_project("p").unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("default_workflow"), "msg: {msg}");
+        assert!(msg.contains("app"), "msg: {msg}");
+        assert!(msg.contains("could not be loaded"), "msg: {msg}");
+
+        std::env::remove_var("SHELBI_HOME");
+    }
 
     #[test]
     fn workflows_dir_lands_under_project_dir() {
@@ -716,15 +872,24 @@ statuses:
         assert_eq!(out.len(), 1);
 
         let path = workflow_path("p", "renamed").unwrap();
-        let guard = EMITTED_NAME_MISMATCHES.lock().unwrap_or_else(|p| p.into_inner());
+        let guard = EMITTED_NAME_MISMATCHES
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
         assert!(guard.as_ref().unwrap().contains(&path));
         drop(guard);
 
         // Second listing doesn't re-insert (dedupe holds).
         let _ = list_workflows("p").unwrap();
-        let guard = EMITTED_NAME_MISMATCHES.lock().unwrap_or_else(|p| p.into_inner());
+        let guard = EMITTED_NAME_MISMATCHES
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
         assert_eq!(
-            guard.as_ref().unwrap().iter().filter(|p| **p == path).count(),
+            guard
+                .as_ref()
+                .unwrap()
+                .iter()
+                .filter(|p| **p == path)
+                .count(),
             1
         );
         drop(guard);
@@ -742,7 +907,9 @@ statuses:
         write_workflow(&dir, "design-review", SIMPLE_WORKFLOW);
         let _ = list_workflows("p").unwrap();
         let path = workflow_path("p", "design-review").unwrap();
-        let guard = EMITTED_NAME_MISMATCHES.lock().unwrap_or_else(|p| p.into_inner());
+        let guard = EMITTED_NAME_MISMATCHES
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
         assert!(!guard.as_ref().map(|s| s.contains(&path)).unwrap_or(false));
         drop(guard);
         std::env::remove_var("SHELBI_HOME");
@@ -843,9 +1010,15 @@ statuses:
         let err = list_workflows("p").unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("statuses.yaml"), "msg: {msg}");
-        assert!(msg.contains("shelbi init") || msg.contains("shelbi reload"), "msg: {msg}");
+        assert!(
+            msg.contains("shelbi init") || msg.contains("shelbi reload"),
+            "msg: {msg}"
+        );
         // No file was materialized as a side effect.
-        assert!(!statuses_path("p").unwrap().exists(), "loader must not auto-create statuses.yaml");
+        assert!(
+            !statuses_path("p").unwrap().exists(),
+            "loader must not auto-create statuses.yaml"
+        );
         std::env::remove_var("SHELBI_HOME");
     }
 
@@ -885,7 +1058,10 @@ statuses:
         let err = load_workflow("p", "default").unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("statuses.yaml"), "msg: {msg}");
-        assert!(msg.contains("shelbi init") || msg.contains("shelbi reload"), "msg: {msg}");
+        assert!(
+            msg.contains("shelbi init") || msg.contains("shelbi reload"),
+            "msg: {msg}"
+        );
         std::env::remove_var("SHELBI_HOME");
     }
 
@@ -1025,7 +1201,12 @@ statuses:
         let _ = load_workflow("p", "legacy").unwrap();
         let guard = EMITTED_DEPRECATIONS.lock().unwrap();
         assert_eq!(
-            guard.as_ref().unwrap().iter().filter(|p| **p == path).count(),
+            guard
+                .as_ref()
+                .unwrap()
+                .iter()
+                .filter(|p| **p == path)
+                .count(),
             1
         );
         drop(guard);

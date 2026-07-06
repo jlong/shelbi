@@ -28,8 +28,8 @@ mod resolve;
 mod root;
 mod ssh_control;
 mod user_config;
-mod workspace_status;
 mod workflows;
+mod workspace_status;
 
 pub use migrate::{
     append_gitignore_snippet, apply_migration_plan, gitignore_already_has_snippet,
@@ -49,11 +49,10 @@ pub use agent_workspaces::{
     legacy_claude_md_path, list_agents, load_agent_settings, load_shared_preamble,
     materialize_default_agents, maybe_emit_claude_md_migration_hint, orchestrator_handoff_path,
     reset_claude_md_migration_hint, self_heal_default_agents, take_orchestrator_handoff,
-    AgentDivergence, AgentMaterializeOutcome, BundledAgent,
-    BundledSkill, DEFAULT_AGENTS, DEFAULT_DEVELOPER_INSTRUCTIONS, DEFAULT_ORCHESTRATOR_INSTRUCTIONS,
-    DEFAULT_REVIEW_INSTRUCTIONS, DEFAULT_REVIEW_LOAD_RUN_SKILL, DEVELOPER_AGENT, HANDOFF_FILE,
-    ORCHESTRATOR_AGENT, ORCHESTRATOR_HANDOFF_REL, REVIEW_AGENT, SHARED_AGENT_DIR,
-    SHARED_PREAMBLE_FILE,
+    AgentDivergence, AgentMaterializeOutcome, BundledAgent, BundledSkill, DEFAULT_AGENTS,
+    DEFAULT_DEVELOPER_INSTRUCTIONS, DEFAULT_ORCHESTRATOR_INSTRUCTIONS, DEFAULT_REVIEW_INSTRUCTIONS,
+    DEFAULT_REVIEW_LOAD_RUN_SKILL, DEVELOPER_AGENT, HANDOFF_FILE, ORCHESTRATOR_AGENT,
+    ORCHESTRATOR_HANDOFF_REL, REVIEW_AGENT, SHARED_AGENT_DIR, SHARED_PREAMBLE_FILE,
 };
 pub use hub_config::{
     hub_config_path, list_projects, load_hub_config, save_hub_config, touch_project_launched,
@@ -72,23 +71,23 @@ pub use user_config::{
     load_user_config, save_user_config, scaffold_user_config_if_missing, user_config_path, Keymap,
     UserConfig, ZenToggleChord,
 };
-pub use workspace_status::{
-    append_clarification_event, append_dispatch_event,
-    append_external_event, append_heartbeat_event, append_message_ack_event, append_message_event,
-    append_project_event, append_rebase_event, append_supervision_event, append_task_event,
-    append_workspace_dialog_event, append_workspace_event, append_workspace_pane_event,
-    append_workspace_pause_event, append_zen_dryrun_event,
-    append_zen_mode_event,
-    clear_expected_teardown, consume_expected_teardown, emit_event_body,
-    events_log_path, expected_teardown_marker_path, hub_socket_path,
-    load_workspace_status, mark_expected_teardown, parse_pane_title_marker, parse_pane_title_state,
-    save_workspace_status,
-    supervision_shutdown_key, workspace_status_path, workspaces_dir, PaneMarker,
-    WorkspaceState, WorkspaceStatus, DAEMON_ACK, EXPECTED_TEARDOWN_MAX_AGE,
-};
 pub use workflows::{
-    list_workflows, load_project_statuses, load_workflow, save_project_statuses,
-    scaffold_project_statuses, statuses_path, workflow_path, workflows_dir,
+    list_workflows, load_project_statuses, load_task_workflow, load_workflow,
+    resolve_task_workflow_name, save_project_statuses, scaffold_project_statuses, statuses_path,
+    workflow_path, workflows_dir,
+};
+pub use workspace_status::{
+    append_clarification_event, append_dispatch_event, append_external_event,
+    append_heartbeat_event, append_message_ack_event, append_message_event, append_project_event,
+    append_rebase_event, append_supervision_event, append_task_event,
+    append_workspace_dialog_event, append_workspace_event, append_workspace_pane_event,
+    append_workspace_pause_event, append_zen_dryrun_event, append_zen_mode_event,
+    clear_expected_teardown, consume_expected_teardown, emit_event_body, events_log_path,
+    expected_teardown_marker_path, hub_socket_path, load_workspace_status, mark_expected_teardown,
+    parse_pane_title_marker, parse_pane_title_state, save_workspace_status,
+    supervision_shutdown_key, workspace_status_path, workspaces_dir, EventEnvelope, EventKind,
+    PaneMarker, WorkspaceState, WorkspaceStatus, DAEMON_ACK, EXPECTED_TEARDOWN_MAX_AGE,
+    ORCH_EVENT_CALLBACK_SOCK_ENV,
 };
 
 #[cfg(test)]
@@ -184,7 +183,8 @@ pub fn config_project_dir(project: &str) -> Result<PathBuf> {
 /// `join` a caller-influenced name. Mirrors
 /// [`shelbi_core::validate_project_name`]'s security-critical invariant for
 /// the workspace/agent chokepoints #137's hardening didn't cover
-/// (state-runtime F14): a hostile or synced workspace/agent name could
+/// (Shelbi ContextStore docs/planning:reviews/adversarial-2026-07/state-runtime.md
+/// F14): a hostile or synced workspace/agent name could
 /// otherwise escape `~/.shelbi/workspaces/` or `~/.shelbi/projects/<p>/agents/`.
 pub(crate) fn ensure_flat_path_component(kind: &str, name: &str) -> Result<()> {
     use std::path::{Component, Path};
@@ -351,7 +351,10 @@ pub fn render_workspace_settings(project: &Project) -> Result<String> {
         }
         Err(e) => return Err(shelbi_core::Error::Io(e)),
     };
-    Ok(template.replace("{{workspace_permissions_mode}}", &project.workspace_permissions_mode))
+    Ok(template.replace(
+        "{{workspace_permissions_mode}}",
+        &project.workspace_permissions_mode,
+    ))
 }
 
 /// Outcome of [`self_heal_workspace_settings_template`].
@@ -600,6 +603,14 @@ pub fn load_project(project: &str) -> Result<Project> {
         migrate_default_workflow(&dir);
         migrate_default_statuses(&dir);
     }
+    if let Some(name) = &p.default_workflow {
+        workflows::load_workflow(project, name).map_err(|e| {
+            shelbi_core::Error::InvalidWorkflow(format!(
+                "project `{}` declares default_workflow: `{name}`, but that workflow could not be loaded: {e}",
+                p.name
+            ))
+        })?;
+    }
     Ok(p)
 }
 
@@ -730,7 +741,8 @@ pub fn save_session(s: &Session) -> Result<()> {
 /// orchestrator can keep the user from re-arming a flapping pipeline.
 /// ## Forward-compatibility contract
 ///
-/// The `extra` catch-all (adversarial review F6) keeps an *older* binary
+/// The `extra` catch-all (Shelbi ContextStore
+/// docs/planning:reviews/adversarial-2026-07/state-persistence.md F6) keeps an *older* binary
 /// from destroying fields a *newer* binary wrote. Without it, every field
 /// serde doesn't recognize is dropped on read, so any read-modify-write
 /// mutator (`zen_heartbeat`, `set_workspace_filter`, …) run by an old
@@ -995,8 +1007,7 @@ pub fn read_global_state() -> Result<GlobalState> {
         }
         Err(e) => return Err(shelbi_core::Error::Io(e)),
     };
-    serde_json::from_str(&text)
-        .map_err(|e| shelbi_core::Error::Other(format!("state.json: {e}")))
+    serde_json::from_str(&text).map_err(|e| shelbi_core::Error::Other(format!("state.json: {e}")))
 }
 
 /// Atomically write `state` to `~/.shelbi/state.json`, holding the state
@@ -1093,7 +1104,8 @@ mod global_state_tests {
 
     #[test]
     fn global_state_read_modify_write_preserves_unknown_fields() {
-        // Forward-compat (adversarial review F6), global half: an older
+        // Forward-compat (Shelbi ContextStore
+        // docs/planning:reviews/adversarial-2026-07/state-persistence.md F6), global half: an older
         // binary toggling a field it knows about must not drop a field a
         // newer binary added to `~/.shelbi/state.json`.
         let _g = LOCK.lock().unwrap();
@@ -1274,9 +1286,7 @@ pub enum ZenCrashRecovery {
     /// `zen_last_crashed_at` was within the recovery window AND
     /// `zen_mode == On`. The mode has been forced to `Off` on disk;
     /// the caller should emit the warning event + log line.
-    AutoDisabled {
-        crashed_at: DateTime<Utc>,
-    },
+    AutoDisabled { crashed_at: DateTime<Utc> },
 }
 
 /// Heartbeat tick — refresh `zen_last_crashed_at = now`. The intent is
@@ -1340,8 +1350,7 @@ pub fn read_state(project: &str) -> Result<State> {
         }
         Err(e) => return Err(shelbi_core::Error::Io(e)),
     };
-    serde_json::from_str(&text)
-        .map_err(|e| shelbi_core::Error::Other(format!("state.json: {e}")))
+    serde_json::from_str(&text).map_err(|e| shelbi_core::Error::Other(format!("state.json: {e}")))
 }
 
 /// Atomically write `state` to `~/.shelbi/projects/<project>/state.json`,
@@ -1926,10 +1935,7 @@ fn find_cycle(graph: &HashMap<&str, &[String]>, start: &str) -> Option<Vec<Strin
                 continue;
             }
             // Resolve to a stable key in the graph (so &str borrows survive).
-            let key = graph
-                .get_key_value(next)
-                .map(|(k, _)| *k)
-                .unwrap_or(next);
+            let key = graph.get_key_value(next).map(|(k, _)| *k).unwrap_or(next);
             path.push(key);
             on_path.insert(key);
             iter_stack.push(0);
@@ -1948,9 +1954,9 @@ fn find_cycle(graph: &HashMap<&str, &[String]>, start: &str) -> Option<Vec<Strin
 ///
 /// Returns `Some((from, to, workflow))` when the move happened, or `None`
 /// when the task was already in `new_column`. The workflow name is the
-/// task's resolved workflow (`task.workflow_or_default()`) so callers can
-/// hand it straight to [`append_task_event`] without re-reading the task
-/// file just to fill the events log line.
+/// project-aware resolved workflow so callers can hand it straight to
+/// [`append_task_event`] without re-reading the task file just to fill the
+/// events log line.
 pub fn move_task(
     project: &str,
     id: &str,
@@ -1965,7 +1971,7 @@ pub fn move_task(
         return Ok(None);
     }
     let old_column = task.column.clone();
-    let workflow = task.workflow_or_default().to_string();
+    let workflow = resolved_task_workflow_name_for_project(project, &task)?;
     let new_priority = list_column(project, new_column.clone())?.len() as u32;
     task.column = new_column.clone();
     task.priority = new_priority;
@@ -2004,7 +2010,7 @@ pub fn move_task_and_unassign(
     let _lock = lock_tasks(project)?;
     let TaskFile { mut task, body } = load_task(project, id)?;
     let old_column = task.column.clone();
-    let workflow = task.workflow_or_default().to_string();
+    let workflow = resolved_task_workflow_name_for_project(project, &task)?;
     let already_there = old_column == new_column;
     if already_there && task.assigned_to.is_none() {
         return Ok(None);
@@ -2032,7 +2038,8 @@ pub fn move_task_and_unassign(
 /// (`move_task`) as two separate writes; a crash between them left the card
 /// unowned but still in `in_progress`, and because the recovery scan keys off
 /// `assigned_to == <workspace>`, the now-unassigned card was skipped forever
-/// (cli-daemon-board F18). Folding both mutations into one save closes that
+/// (Shelbi ContextStore docs/planning:reviews/adversarial-2026-07/cli-daemon-board.md
+/// F18). Folding both mutations into one save closes that
 /// window, and clearing the owner even when the card is already in Todo makes
 /// the operation an idempotent recovery for a card wedged by the old path.
 ///
@@ -2043,7 +2050,7 @@ pub fn release_task_to_todo(project: &str, id: &str) -> Result<Option<(Column, C
     let _lock = lock_tasks(project)?;
     let TaskFile { mut task, body } = load_task(project, id)?;
     let old_column = task.column.clone();
-    let workflow = task.workflow_or_default().to_string();
+    let workflow = resolved_task_workflow_name_for_project(project, &task)?;
     let already_todo = old_column == Column::todo();
     if already_todo && task.assigned_to.is_none() {
         return Ok(None);
@@ -2062,6 +2069,12 @@ pub fn release_task_to_todo(project: &str, id: &str) -> Result<Option<(Column, C
     renumber_column_unlocked(project, old_column.clone())?;
     renumber_column_unlocked(project, Column::todo())?;
     Ok(Some((old_column, Column::todo(), workflow)))
+}
+
+fn resolved_task_workflow_name_for_project(project: &str, task: &Task) -> Result<String> {
+    Ok(load_project(project)
+        .map(|p| resolve_task_workflow_name(&p, task).to_string())
+        .unwrap_or_else(|_| task.workflow_or_default().to_string()))
 }
 
 /// Re-position `id` to slot `new_priority` within its current column. Other
@@ -2141,7 +2154,9 @@ fn renumber_column_unlocked(project: &str, column: Column) -> Result<()> {
 
 /// Split a string on `^---\n` … `^---\n`. Returns (frontmatter, body).
 fn split_frontmatter(s: &str) -> Option<(&str, &str)> {
-    let rest = s.strip_prefix("---\n").or_else(|| s.strip_prefix("---\r\n"))?;
+    let rest = s
+        .strip_prefix("---\n")
+        .or_else(|| s.strip_prefix("---\r\n"))?;
     // Find closing `---` on its own line.
     let mut search_from = 0usize;
     while let Some(idx) = rest[search_from..].find("\n---") {
@@ -2150,7 +2165,7 @@ fn split_frontmatter(s: &str) -> Option<(&str, &str)> {
         let after_byte = rest.as_bytes().get(after_dashes).copied();
         if matches!(after_byte, Some(b'\n') | Some(b'\r') | None) {
             let front = &rest[..abs - 1]; // strip the trailing \n before the closing dashes
-            // Skip the closing line and its terminator.
+                                          // Skip the closing line and its terminator.
             let body_start = match after_byte {
                 Some(b'\r') => after_dashes + 2, // \r\n
                 Some(b'\n') => after_dashes + 1,
@@ -2217,12 +2232,18 @@ mod tests {
         let mut runners = std::collections::BTreeMap::new();
         runners.insert(
             "claude".to_string(),
-            AgentRunnerSpec { command: "claude".into(), flags: vec![], dialog_signatures: vec![] },
+            AgentRunnerSpec {
+                command: "claude".into(),
+                flags: vec![],
+                prompt_injection: None,
+                dialog_signatures: vec![],
+            },
         );
         Project {
             name: name.into(),
             repo: "r".into(),
             default_branch: "main".into(),
+            default_workflow: None,
             config_mode: None,
             machines: vec![Machine {
                 name: "hub".into(),
@@ -2231,7 +2252,9 @@ mod tests {
                 host: None,
                 tags: Vec::new(),
             }],
-            orchestrator: OrchestratorSpec { runner: "claude".into() },
+            orchestrator: OrchestratorSpec {
+                runner: "claude".into(),
+            },
             agent_runners: runners,
             editor: None,
             github_url: None,
@@ -2299,7 +2322,8 @@ mod tests {
 
     #[test]
     fn state_read_modify_write_preserves_unknown_fields() {
-        // Forward-compat (adversarial review F6): an *older* binary doing a
+        // Forward-compat (Shelbi ContextStore
+        // docs/planning:reviews/adversarial-2026-07/state-persistence.md F6): an *older* binary doing a
         // read-modify-write on `state.json` must not destroy a field a
         // *newer* binary wrote. Here the newer field is `review_rounds`; the
         // old binary flips `workspace_filter` (a known field) and the
@@ -2515,7 +2539,11 @@ mod tests {
         // creation), and the diagnostic log must contain a timestamped
         // line naming the failure mode.
         let diag = tmp.join(".shelbi/messages/.no-task-id.log");
-        assert!(diag.exists(), "diagnostic log missing at {}", diag.display());
+        assert!(
+            diag.exists(),
+            "diagnostic log missing at {}",
+            diag.display()
+        );
         let body = std::fs::read_to_string(&diag).unwrap();
         assert!(
             body.contains("no TASK_ID"),
@@ -2560,7 +2588,11 @@ mod tests {
         // Verify the durable beacon exists (this is what `shelbi
         // message`'s tail_pid_alive probe reads).
         let pid_path = tmp.join(".shelbi/messages/feat-x.tail.d/pid");
-        assert!(pid_path.exists(), "tail pid file missing at {}", pid_path.display());
+        assert!(
+            pid_path.exists(),
+            "tail pid file missing at {}",
+            pid_path.display()
+        );
         let pid_text = std::fs::read_to_string(&pid_path).unwrap();
         let pid: libc::pid_t = pid_text.trim().parse().unwrap();
 
@@ -2582,7 +2614,13 @@ mod tests {
         let _g = TEST_LOCK.lock().unwrap();
         let home = fresh_home();
         std::env::set_var("SHELBI_HOME", &home);
-        for mode in ["auto", "acceptEdits", "bypassPermissions", "default", "plan"] {
+        for mode in [
+            "auto",
+            "acceptEdits",
+            "bypassPermissions",
+            "default",
+            "plan",
+        ] {
             let mut p = fixture_project("myapp", None);
             p.workspace_permissions_mode = mode.into();
             let rendered = render_workspace_settings(&p).unwrap();
@@ -2728,8 +2766,7 @@ mod tests {
         );
         // The default-path location was never created — we stayed out of
         // the way entirely.
-        let default_path =
-            home.join("projects/myapp/workspace-settings.json.template");
+        let default_path = home.join("projects/myapp/workspace-settings.json.template");
         assert!(!default_path.exists());
         std::env::remove_var("SHELBI_HOME");
     }
@@ -2909,7 +2946,10 @@ mod tests {
         save_task("p", &task, "").unwrap();
 
         let moved = release_task_to_todo("p", "t").unwrap();
-        assert_eq!(moved, Some((Column::in_progress(), Column::todo(), "default".into())));
+        assert_eq!(
+            moved,
+            Some((Column::in_progress(), Column::todo(), "default".into()))
+        );
 
         // Single resulting state: in Todo AND unowned. No window where one
         // mutation landed without the other.
@@ -2957,7 +2997,10 @@ mod tests {
         save_task("p", &task, "").unwrap();
 
         let moved = move_task_and_unassign("p", "t", Column::in_progress()).unwrap();
-        assert_eq!(moved, Some((Column::review(), Column::in_progress(), "default".into())));
+        assert_eq!(
+            moved,
+            Some((Column::review(), Column::in_progress(), "default".into()))
+        );
 
         let after = load_task("p", "t").unwrap().task;
         assert_eq!(after.column, Column::in_progress());
@@ -2979,11 +3022,17 @@ mod tests {
         task.assigned_to = Some("review-1".to_string());
         save_task("p", &task, "").unwrap();
 
-        assert_eq!(move_task_and_unassign("p", "t", Column::in_progress()).unwrap(), None);
+        assert_eq!(
+            move_task_and_unassign("p", "t", Column::in_progress()).unwrap(),
+            None
+        );
         assert_eq!(load_task("p", "t").unwrap().task.assigned_to, None);
 
         // Fully clean (already there + unowned) → genuine no-op.
-        assert_eq!(move_task_and_unassign("p", "t", Column::in_progress()).unwrap(), None);
+        assert_eq!(
+            move_task_and_unassign("p", "t", Column::in_progress()).unwrap(),
+            None
+        );
 
         std::env::remove_var("SHELBI_HOME");
     }
@@ -3003,12 +3052,21 @@ mod tests {
         for bad in ["../HANDOFF", "../../other/tasks/foo", "a/b", "..", "x/../y"] {
             // The chokepoint itself refuses to build the path.
             assert!(
-                matches!(task_path("p", bad), Err(shelbi_core::Error::InvalidAgentId(_))),
+                matches!(
+                    task_path("p", bad),
+                    Err(shelbi_core::Error::InvalidAgentId(_))
+                ),
                 "task_path should reject `{bad}`"
             );
             // Every read/move/delete handler inherits the rejection.
-            assert!(load_task("p", bad).is_err(), "load_task should reject `{bad}`");
-            assert!(delete_task("p", bad).is_err(), "delete_task should reject `{bad}`");
+            assert!(
+                load_task("p", bad).is_err(),
+                "load_task should reject `{bad}`"
+            );
+            assert!(
+                delete_task("p", bad).is_err(),
+                "delete_task should reject `{bad}`"
+            );
             assert!(
                 move_task("p", bad, Column::in_progress()).is_err(),
                 "move_task should reject `{bad}`"
@@ -3028,7 +3086,10 @@ mod tests {
         std::env::set_var("SHELBI_HOME", &home);
         for bad in ["../evil", "..", "a/b", ""] {
             assert!(
-                matches!(project_dir(bad), Err(shelbi_core::Error::InvalidProjectName(_))),
+                matches!(
+                    project_dir(bad),
+                    Err(shelbi_core::Error::InvalidProjectName(_))
+                ),
                 "project_dir should reject `{bad}`"
             );
             assert!(tasks_dir(bad).is_err(), "tasks_dir should reject `{bad}`");
@@ -3049,7 +3110,10 @@ mod tests {
         let path = task_path("p", "fix-login").unwrap();
         let text = std::fs::read_to_string(&path).unwrap();
         let forged = text.replace("id: fix-login", "id: fix-auth");
-        assert!(forged.contains("id: fix-auth"), "sanity: id line was rewritten");
+        assert!(
+            forged.contains("id: fix-auth"),
+            "sanity: id line was rewritten"
+        );
         std::fs::write(&path, &forged).unwrap();
 
         // Loading by the filename stem is rejected rather than silently
@@ -3252,7 +3316,12 @@ mod tests {
         let home = fresh_home();
         std::env::set_var("SHELBI_HOME", &home);
         save_task("p", &make_task("a", Column::done(), 0), "").unwrap();
-        save_task("p", &make_task_with_deps("b", Column::todo(), 0, &["a"]), "").unwrap();
+        save_task(
+            "p",
+            &make_task_with_deps("b", Column::todo(), 0, &["a"]),
+            "",
+        )
+        .unwrap();
         let existing = list_tasks("p").unwrap();
         let candidate = make_task_with_deps("c", Column::todo(), 1, &["b"]);
         validate_depends_on(&candidate, &existing).unwrap();
@@ -3320,8 +3389,18 @@ mod tests {
         // Existing chain: c → b → a (c depends on b, b depends on a).
         // Closing the loop with a → c should be rejected.
         save_task("p", &make_task("a", Column::todo(), 0), "").unwrap();
-        save_task("p", &make_task_with_deps("b", Column::todo(), 1, &["a"]), "").unwrap();
-        save_task("p", &make_task_with_deps("c", Column::todo(), 2, &["b"]), "").unwrap();
+        save_task(
+            "p",
+            &make_task_with_deps("b", Column::todo(), 1, &["a"]),
+            "",
+        )
+        .unwrap();
+        save_task(
+            "p",
+            &make_task_with_deps("c", Column::todo(), 2, &["b"]),
+            "",
+        )
+        .unwrap();
         let existing = list_tasks("p").unwrap();
         let candidate = make_task_with_deps("a", Column::todo(), 0, &["c"]);
         let err = validate_depends_on(&candidate, &existing).unwrap_err();
@@ -3384,9 +3463,7 @@ mod tests {
         std::env::set_var("SHELBI_HOME", &home);
         let original = State {
             zen_mode: ZenModeState::On,
-            zen_last_crashed_at: Some(
-                "2026-06-19T12:34:56Z".parse::<DateTime<Utc>>().unwrap(),
-            ),
+            zen_last_crashed_at: Some("2026-06-19T12:34:56Z".parse::<DateTime<Utc>>().unwrap()),
             ..State::default()
         };
         write_state("p", &original).unwrap();
@@ -3405,7 +3482,11 @@ mod tests {
         let _g = TEST_LOCK.lock().unwrap();
         let home = fresh_home();
         std::env::set_var("SHELBI_HOME", &home);
-        let s = State { zen_mode: ZenModeState::On, zen_last_crashed_at: None, ..State::default() };
+        let s = State {
+            zen_mode: ZenModeState::On,
+            zen_last_crashed_at: None,
+            ..State::default()
+        };
         write_state("p", &s).unwrap();
         let on_disk = std::fs::read_to_string(state_path("p").unwrap()).unwrap();
         assert!(!on_disk.contains("zen_last_crashed_at"));
@@ -3422,7 +3503,11 @@ mod tests {
             (ZenModeState::Paused, "\"paused\""),
             (ZenModeState::On, "\"on\""),
         ] {
-            let s = State { zen_mode: mode, zen_last_crashed_at: None, ..State::default() };
+            let s = State {
+                zen_mode: mode,
+                zen_last_crashed_at: None,
+                ..State::default()
+            };
             write_state("p", &s).unwrap();
             let on_disk = std::fs::read_to_string(state_path("p").unwrap()).unwrap();
             assert!(on_disk.contains(expect), "{mode:?} → {on_disk}");
@@ -3443,25 +3528,43 @@ mod tests {
         // Setting an override persists under the composed
         // workflow:status_id key so two workflows with the same status
         // id stay distinct.
-        set_kanban_column_override("p", "default", "in-progress", Some(KanbanColumnOverride::Collapsed))
-            .unwrap();
-        set_kanban_column_override("p", "design-review", "in-progress", Some(KanbanColumnOverride::Expanded))
-            .unwrap();
+        set_kanban_column_override(
+            "p",
+            "default",
+            "in-progress",
+            Some(KanbanColumnOverride::Collapsed),
+        )
+        .unwrap();
+        set_kanban_column_override(
+            "p",
+            "design-review",
+            "in-progress",
+            Some(KanbanColumnOverride::Expanded),
+        )
+        .unwrap();
         let s = read_state("p").unwrap();
         assert_eq!(
-            s.kanban_column_overrides.get("default:in-progress").copied(),
+            s.kanban_column_overrides
+                .get("default:in-progress")
+                .copied(),
             Some(KanbanColumnOverride::Collapsed)
         );
         assert_eq!(
-            s.kanban_column_overrides.get("design-review:in-progress").copied(),
+            s.kanban_column_overrides
+                .get("design-review:in-progress")
+                .copied(),
             Some(KanbanColumnOverride::Expanded)
         );
 
         // Clearing removes the entry without touching siblings.
         set_kanban_column_override("p", "default", "in-progress", None).unwrap();
         let s = read_state("p").unwrap();
-        assert!(!s.kanban_column_overrides.contains_key("default:in-progress"));
-        assert!(s.kanban_column_overrides.contains_key("design-review:in-progress"));
+        assert!(!s
+            .kanban_column_overrides
+            .contains_key("default:in-progress"));
+        assert!(s
+            .kanban_column_overrides
+            .contains_key("design-review:in-progress"));
 
         std::env::remove_var("SHELBI_HOME");
     }
@@ -3489,7 +3592,9 @@ mod tests {
         std::env::set_var("SHELBI_HOME", &home);
         zen_heartbeat("p").unwrap();
         let s = read_state("p").unwrap();
-        let ts = s.zen_last_crashed_at.expect("heartbeat should set the timestamp");
+        let ts = s
+            .zen_last_crashed_at
+            .expect("heartbeat should set the timestamp");
         // Newly written timestamp should be within the last few seconds.
         let age = (Utc::now() - ts).num_seconds().abs();
         assert!(age < 5, "heartbeat timestamp suspiciously old: {age}s");
@@ -3518,10 +3623,17 @@ mod tests {
         std::env::set_var("SHELBI_HOME", &home);
         write_state(
             "p",
-            &State { zen_mode: ZenModeState::On, zen_last_crashed_at: None, ..State::default() },
+            &State {
+                zen_mode: ZenModeState::On,
+                zen_last_crashed_at: None,
+                ..State::default()
+            },
         )
         .unwrap();
-        assert_eq!(zen_check_crash_recovery("p").unwrap(), ZenCrashRecovery::NoCrash);
+        assert_eq!(
+            zen_check_crash_recovery("p").unwrap(),
+            ZenCrashRecovery::NoCrash
+        );
         // Mode untouched.
         assert_eq!(read_state("p").unwrap().zen_mode, ZenModeState::On);
         std::env::remove_var("SHELBI_HOME");
@@ -3550,7 +3662,10 @@ mod tests {
         }
         let s = read_state("p").unwrap();
         assert_eq!(s.zen_mode, ZenModeState::Off);
-        assert!(s.zen_last_crashed_at.is_none(), "signal must be cleared after consumption");
+        assert!(
+            s.zen_last_crashed_at.is_none(),
+            "signal must be cleared after consumption"
+        );
         std::env::remove_var("SHELBI_HOME");
     }
 
@@ -3570,7 +3685,10 @@ mod tests {
             },
         )
         .unwrap();
-        assert_eq!(zen_check_crash_recovery("p").unwrap(), ZenCrashRecovery::NoCrash);
+        assert_eq!(
+            zen_check_crash_recovery("p").unwrap(),
+            ZenCrashRecovery::NoCrash
+        );
         let s = read_state("p").unwrap();
         // Mode left alone; stale timestamp cleared so the next heartbeat
         // starts fresh.
@@ -3596,7 +3714,10 @@ mod tests {
         .unwrap();
         // Recent crash but Zen wasn't on — nothing to disable, just
         // clean up the signal.
-        assert_eq!(zen_check_crash_recovery("p").unwrap(), ZenCrashRecovery::NoCrash);
+        assert_eq!(
+            zen_check_crash_recovery("p").unwrap(),
+            ZenCrashRecovery::NoCrash
+        );
         let s = read_state("p").unwrap();
         assert_eq!(s.zen_mode, ZenModeState::Off);
         assert!(s.zen_last_crashed_at.is_none());
@@ -3618,7 +3739,10 @@ mod tests {
             },
         )
         .unwrap();
-        assert_eq!(zen_check_crash_recovery("p").unwrap(), ZenCrashRecovery::NoCrash);
+        assert_eq!(
+            zen_check_crash_recovery("p").unwrap(),
+            ZenCrashRecovery::NoCrash
+        );
         assert_eq!(read_state("p").unwrap().zen_mode, ZenModeState::Paused);
         std::env::remove_var("SHELBI_HOME");
     }
@@ -3644,7 +3768,10 @@ mod tests {
             zen_check_crash_recovery("p").unwrap(),
             ZenCrashRecovery::AutoDisabled { .. }
         ));
-        assert_eq!(zen_check_crash_recovery("p").unwrap(), ZenCrashRecovery::NoCrash);
+        assert_eq!(
+            zen_check_crash_recovery("p").unwrap(),
+            ZenCrashRecovery::NoCrash
+        );
         std::env::remove_var("SHELBI_HOME");
     }
 
@@ -3739,7 +3866,11 @@ mod tests {
         std::env::set_var("SHELBI_HOME", &home);
         write_state(
             "p",
-            &State { zen_mode: ZenModeState::Paused, zen_last_crashed_at: None, ..State::default() },
+            &State {
+                zen_mode: ZenModeState::Paused,
+                zen_last_crashed_at: None,
+                ..State::default()
+            },
         )
         .unwrap();
         let new = toggle_zen_mode("p", "user:hotkey").unwrap();
@@ -3805,7 +3936,10 @@ mod tests {
                 .as_nanos()
         ));
         let mtime = Some(SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1));
-        let msg = format!("shelbi: skipping malformed task file {}: missing field `created_at`", path.display());
+        let msg = format!(
+            "shelbi: skipping malformed task file {}: missing field `created_at`",
+            path.display()
+        );
         assert!(should_warn_about_parse(&path, mtime, &msg));
         assert!(!should_warn_about_parse(&path, mtime, &msg));
     }
@@ -3839,8 +3973,10 @@ mod tests {
                 .as_nanos()
         ));
         let mtime = Some(SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1));
-        let missing_created = "shelbi: skipping malformed task file: missing field `created_at`".to_string();
-        let missing_title = "shelbi: skipping malformed task file: missing field `title`".to_string();
+        let missing_created =
+            "shelbi: skipping malformed task file: missing field `created_at`".to_string();
+        let missing_title =
+            "shelbi: skipping malformed task file: missing field `title`".to_string();
         assert!(should_warn_about_parse(&path, mtime, &missing_created));
         assert!(should_warn_about_parse(&path, mtime, &missing_title));
         // Latest signature is now cached — same args suppress.
@@ -3901,8 +4037,11 @@ mod tests {
         std::env::set_var("SHELBI_HOME", &home);
         let path = tasks_dir("p").unwrap().join("fixme.md");
         ensure_dir(path.parent().unwrap()).unwrap();
-        std::fs::write(&path, "---\nid: fixme\ntitle: t\ncolumn: todo\npriority: 0\n---\n")
-            .unwrap();
+        std::fs::write(
+            &path,
+            "---\nid: fixme\ntitle: t\ncolumn: todo\npriority: 0\n---\n",
+        )
+        .unwrap();
 
         let _ = list_tasks("p").unwrap();
         assert!(
@@ -3957,8 +4096,7 @@ mod tests {
         // Resolve it against the freshly written statuses.yaml before
         // comparing to the canonical default.
         let text = std::fs::read_to_string(&path).unwrap();
-        let st_text =
-            std::fs::read_to_string(dir.join("workflows/statuses.yaml")).unwrap();
+        let st_text = std::fs::read_to_string(dir.join("workflows/statuses.yaml")).unwrap();
         let statuses = shelbi_core::ProjectStatuses::from_yaml_str(&st_text).unwrap();
         let parsed = shelbi_core::Workflow::from_yaml_str(&text)
             .expect("created default.yaml should round-trip through the workflow parser")
@@ -3978,8 +4116,8 @@ mod tests {
         let path = dir.join("workflows/statuses.yaml");
         assert!(path.exists(), "statuses.yaml should be created");
         let text = std::fs::read_to_string(&path).unwrap();
-        let parsed = shelbi_core::ProjectStatuses::from_yaml_str(&text)
-            .expect("statuses.yaml should parse");
+        let parsed =
+            shelbi_core::ProjectStatuses::from_yaml_str(&text).expect("statuses.yaml should parse");
         assert_eq!(parsed, default_project_statuses());
         std::env::remove_var("SHELBI_HOME");
     }
@@ -4070,8 +4208,14 @@ mod tests {
         load_project("myapp").unwrap();
 
         let canonical = workflows.join("statuses.yaml");
-        assert!(!legacy.exists(), "legacy .yml should be renamed away on load");
-        assert!(canonical.exists(), "canonical .yaml should exist after load");
+        assert!(
+            !legacy.exists(),
+            "legacy .yml should be renamed away on load"
+        );
+        assert!(
+            canonical.exists(),
+            "canonical .yaml should exist after load"
+        );
         // The renamed file is the loadable status catalogue (not the
         // default-materializer's fresh copy — same content, verified via load).
         let statuses = load_project_statuses("myapp").unwrap();
@@ -4102,7 +4246,10 @@ mod tests {
         let p = fixture_project("myapp", None);
         save_project(&p).unwrap();
         let workflow_path = default_workflow_path("myapp").unwrap();
-        assert!(!workflow_path.exists(), "precondition: workflow file absent");
+        assert!(
+            !workflow_path.exists(),
+            "precondition: workflow file absent"
+        );
         let loaded = load_project("myapp").unwrap();
         assert_eq!(loaded.name, "myapp");
         assert!(
@@ -4126,7 +4273,8 @@ mod tests {
         save_project(&p).unwrap();
         let workflow_path = default_workflow_path("myapp").unwrap();
         ensure_dir(workflow_path.parent().unwrap()).unwrap();
-        let user_yaml = "name: default\nstatuses:\n  - { name: Inbox, category: backlog, owner: user }\n";
+        let user_yaml =
+            "name: default\nstatuses:\n  - { name: Inbox, category: backlog, owner: user }\n";
         std::fs::write(&workflow_path, user_yaml).unwrap();
         let _ = load_project("myapp").unwrap();
         assert_eq!(std::fs::read_to_string(&workflow_path).unwrap(), user_yaml);
@@ -4281,7 +4429,11 @@ mod tests {
         let col = list_column("p", Column::in_progress()).unwrap();
         let mut prios: Vec<_> = col.iter().map(|tf| tf.task.priority).collect();
         prios.sort_unstable();
-        assert_eq!(prios, vec![0, 1], "destination priorities must be contiguous 0..N");
+        assert_eq!(
+            prios,
+            vec![0, 1],
+            "destination priorities must be contiguous 0..N"
+        );
         std::env::remove_var("SHELBI_HOME");
     }
 
@@ -4301,7 +4453,11 @@ mod tests {
 
         let col = list_column("p", Column::in_progress()).unwrap();
         let prios: Vec<_> = col.iter().map(|tf| tf.task.priority).collect();
-        assert_eq!(prios, vec![0, 1, 2], "destination must be renumbered contiguous");
+        assert_eq!(
+            prios,
+            vec![0, 1, 2],
+            "destination must be renumbered contiguous"
+        );
         std::env::remove_var("SHELBI_HOME");
     }
 
@@ -4400,7 +4556,10 @@ mod tests {
             .map(|e| e.file_name().to_string_lossy().into_owned())
             .filter(|n| n.contains(".tmp."))
             .collect();
-        assert!(leftovers.is_empty(), "temp files left behind: {leftovers:?}");
+        assert!(
+            leftovers.is_empty(),
+            "temp files left behind: {leftovers:?}"
+        );
     }
 
     /// `update_state` skips the disk write when the closure leaves the
@@ -4412,7 +4571,14 @@ mod tests {
         let home = fresh_home();
         std::env::set_var("SHELBI_HOME", &home);
 
-        write_state("p", &State { zen_mode: ZenModeState::On, ..State::default() }).unwrap();
+        write_state(
+            "p",
+            &State {
+                zen_mode: ZenModeState::On,
+                ..State::default()
+            },
+        )
+        .unwrap();
         let mtime_before = std::fs::metadata(state_path("p").unwrap())
             .unwrap()
             .modified()
@@ -4424,7 +4590,10 @@ mod tests {
             .unwrap()
             .modified()
             .unwrap();
-        assert_eq!(mtime_before, mtime_after, "no-op update must not rewrite the file");
+        assert_eq!(
+            mtime_before, mtime_after,
+            "no-op update must not rewrite the file"
+        );
 
         // Failing closure → mutation not persisted.
         let err = update_state("p", |state| {
@@ -4549,7 +4718,10 @@ mod tests {
         let err = load_project("myapp").unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("no shared config"), "unexpected err: {msg}");
-        assert!(msg.contains("project.yaml"), "should name shared path: {msg}");
+        assert!(
+            msg.contains("project.yaml"),
+            "should name shared path: {msg}"
+        );
         std::env::remove_var("SHELBI_HOME");
     }
 

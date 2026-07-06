@@ -195,14 +195,16 @@ Field by field:
   - `work_dir` — where worktrees live on that machine.
   - `host` — SSH hostname (required when `kind: ssh`).
 - **`orchestrator.runner`** — which agent runner powers the
-  orchestrator window.
+  orchestrator window. This is independent from the workspace runners.
 - **`agent_runners`** — the runner registry. Each entry is a
   `command` plus optional `flags` appended to every invocation. Add
   custom runners here (e.g. `aider`) to make them available to workspaces.
 - **`workspaces[]`** — the fixed workspace pool. Each workspace is a name,
   the machine it lives on, and the runner it uses. Order matters: the
   orchestrator picks free workspaces in declaration order when
-  dispatching.
+  dispatching. Change these `runner` values, or run
+  `shelbi workspace set-runner <runner> --all`, to switch existing worker
+  slots after setup.
 
 ### Optional keys
 

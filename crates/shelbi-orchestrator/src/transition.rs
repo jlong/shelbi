@@ -130,9 +130,9 @@ fn run_shell_commands(
             task.id, project.name
         ))
     })?;
-    let machine = project.machine(&workspace.machine).ok_or_else(|| {
-        Error::UnknownMachine(workspace.machine.clone())
-    })?;
+    let machine = project
+        .machine(&workspace.machine)
+        .ok_or_else(|| Error::UnknownMachine(workspace.machine.clone()))?;
     let host = machine.host();
     let worktree = workspace_worktree(machine, workspace);
     let worktree = worktree.to_string_lossy().into_owned();
@@ -155,8 +155,7 @@ fn run_shell_commands(
             task = %task.id, from = %transition.from, to = %transition.to,
             command = %cmd, "transition run"
         );
-        let out = shelbi_ssh::run(&host, ["sh", "-c", &env.script(cmd)])
-            .map_err(Error::Io)?;
+        let out = shelbi_ssh::run(&host, ["sh", "-c", &env.script(cmd)]).map_err(Error::Io)?;
         if !out.status.success() {
             // Short-circuit: mirror the git-action failure contract.
             return Err(Error::Command {
@@ -215,12 +214,7 @@ impl TransitionEnv<'_> {
 /// elapses. A timeout is an edge failure, matching the short-circuit
 /// contract — a serve edge whose server never came up must not be reported
 /// as clean.
-fn wait_ready(
-    host: &Host,
-    env: &TransitionEnv<'_>,
-    probe: &str,
-    timeout: Duration,
-) -> Result<()> {
+fn wait_ready(host: &Host, env: &TransitionEnv<'_>, probe: &str, timeout: Duration) -> Result<()> {
     let script = env.script(probe);
     let started = Instant::now();
     loop {
@@ -311,6 +305,7 @@ mod tests {
             AgentRunnerSpec {
                 command: "claude".into(),
                 flags: vec![],
+                prompt_injection: None,
                 dialog_signatures: vec![],
             },
         );
@@ -318,6 +313,7 @@ mod tests {
             name: "fixture".into(),
             repo: "/tmp/fixture".into(),
             default_branch: "main".into(),
+            default_workflow: None,
             config_mode: None,
             machines: vec![Machine {
                 name: "hub".into(),
@@ -326,7 +322,9 @@ mod tests {
                 host: None,
                 tags: Vec::new(),
             }],
-            orchestrator: OrchestratorSpec { runner: "claude".into() },
+            orchestrator: OrchestratorSpec {
+                runner: "claude".into(),
+            },
             agent_runners: runners,
             editor: None,
             github_url: None,
@@ -398,16 +396,26 @@ transitions:
             "review",
         )
         .expect("no-op transition");
-        assert!(out.is_empty(), "undeclared edge should run nothing: {out:?}");
+        assert!(
+            out.is_empty(),
+            "undeclared edge should run nothing: {out:?}"
+        );
     }
 
     #[test]
     fn empty_action_list_is_a_clean_noop() {
         let wf = workflow_with_edge("", None);
         let task = bare_task("t-1");
-        let out =
-            execute_transition(&bare_project(), "fixture", &task, "body", &wf, "review", "done")
-                .expect("empty-action transition");
+        let out = execute_transition(
+            &bare_project(),
+            "fixture",
+            &task,
+            "body",
+            &wf,
+            "review",
+            "done",
+        )
+        .expect("empty-action transition");
         assert!(out.is_empty(), "empty actions should run nothing: {out:?}");
     }
 
@@ -451,7 +459,10 @@ transitions:
         )
         .expect_err("missing target param must fail");
         let msg = err.to_string();
-        assert!(msg.contains("version"), "error should name the param: {msg}");
+        assert!(
+            msg.contains("version"),
+            "error should name the param: {msg}"
+        );
     }
 
     // ---- run: / ready: shell-command execution ---------------------------
@@ -483,7 +494,11 @@ transitions:
         t
     }
 
-    fn workflow_with_run(run: &[&str], ready: Option<&str>, ready_timeout: Option<u64>) -> Workflow {
+    fn workflow_with_run(
+        run: &[&str],
+        ready: Option<&str>,
+        ready_timeout: Option<u64>,
+    ) -> Workflow {
         let run_lines: String = run.iter().map(|c| format!("\n      - {c:?}")).collect();
         let ready_line = ready
             .map(|r| format!("\n    ready: {r:?}"))
@@ -514,14 +529,18 @@ transitions:
 
         // The command writes $SLOT and the worktree $PWD out to a file so
         // the test can assert both the env injection and the `cd`.
-        let wf = workflow_with_run(
-            &["printf '%s %s' \"$SLOT\" \"$PWD\" > env.out"],
-            None,
-            None,
-        );
+        let wf = workflow_with_run(&["printf '%s %s' \"$SLOT\" \"$PWD\" > env.out"], None, None);
         let task = task_assigned("t-1", "alpha");
-        let out = execute_transition(&project, "fixture", &task, "body", &wf, "in-progress", "serve")
-            .expect("run commands succeed");
+        let out = execute_transition(
+            &project,
+            "fixture",
+            &task,
+            "body",
+            &wf,
+            "in-progress",
+            "serve",
+        )
+        .expect("run commands succeed");
         // No git actions declared, so the outcome list is empty.
         assert!(out.is_empty());
 
@@ -549,7 +568,13 @@ transitions:
         let wf = workflow_with_run(&["exit 3", "touch should_not_exist"], None, None);
         let task = task_assigned("t-1", "alpha");
         let err = execute_transition(
-            &project, "fixture", &task, "body", &wf, "in-progress", "serve",
+            &project,
+            "fixture",
+            &task,
+            "body",
+            &wf,
+            "in-progress",
+            "serve",
         )
         .expect_err("failing command aborts the edge");
         assert!(err.to_string().contains("exit 3") || matches!(err, Error::Command { .. }));
@@ -565,10 +590,22 @@ transitions:
         let project = local_project_with_worktree(dir.path());
 
         // The run command creates the readiness marker; the probe checks it.
-        let wf = workflow_with_run(&["touch ready.marker"], Some("test -f ready.marker"), Some(5));
+        let wf = workflow_with_run(
+            &["touch ready.marker"],
+            Some("test -f ready.marker"),
+            Some(5),
+        );
         let task = task_assigned("t-1", "alpha");
-        execute_transition(&project, "fixture", &task, "body", &wf, "in-progress", "serve")
-            .expect("ready probe should pass once the marker exists");
+        execute_transition(
+            &project,
+            "fixture",
+            &task,
+            "body",
+            &wf,
+            "in-progress",
+            "serve",
+        )
+        .expect("ready probe should pass once the marker exists");
     }
 
     #[test]
@@ -581,13 +618,16 @@ transitions:
         let wf = workflow_with_run(&[], Some("test -f never.marker"), Some(1));
         let task = task_assigned("t-1", "alpha");
         let err = execute_transition(
-            &project, "fixture", &task, "body", &wf, "in-progress", "serve",
+            &project,
+            "fixture",
+            &task,
+            "body",
+            &wf,
+            "in-progress",
+            "serve",
         )
         .expect_err("probe that never passes must time out");
-        assert!(
-            err.to_string().contains("ready probe"),
-            "got: {err}"
-        );
+        assert!(err.to_string().contains("ready probe"), "got: {err}");
     }
 
     #[test]
@@ -597,7 +637,13 @@ transitions:
         let wf = workflow_with_run(&["true"], None, None);
         let task = bare_task("t-1"); // no assigned_to
         let err = execute_transition(
-            &project, "fixture", &task, "body", &wf, "in-progress", "serve",
+            &project,
+            "fixture",
+            &task,
+            "body",
+            &wf,
+            "in-progress",
+            "serve",
         )
         .expect_err("run without assignment can't resolve a worktree");
         assert!(

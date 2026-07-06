@@ -46,8 +46,7 @@ pub fn run(project_opt: Option<String>) -> Result<()> {
     let _ = shelbi_state::load_project(&project_name);
     let report = shelbi_orchestrator::reload(&project_name).map_err(|e| anyhow!(e))?;
     print_report(&project_name, &report);
-    let outcomes = shelbi_state::self_heal_default_agents(&project_name)
-        .map_err(|e| anyhow!(e))?;
+    let outcomes = shelbi_state::self_heal_default_agents(&project_name).map_err(|e| anyhow!(e))?;
     for outcome in outcomes {
         print_agent_materialize_outcome(&outcome);
     }
@@ -99,7 +98,9 @@ fn print_workspace_settings_template_outcome(outcome: &WorkspaceSettingsTemplate
         WorkspaceSettingsTemplateOutcome::Unchanged => {
             println!("(workspace-settings.json.template already matches the shipped default)");
         }
-        WorkspaceSettingsTemplateOutcome::Overwritten { had_legacy_placeholder } => {
+        WorkspaceSettingsTemplateOutcome::Overwritten {
+            had_legacy_placeholder,
+        } => {
             if *had_legacy_placeholder {
                 println!(
                     "✓ healed workspace-settings.json.template — stale \

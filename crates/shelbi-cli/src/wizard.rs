@@ -18,7 +18,8 @@ use anyhow::{anyhow, Context, Result};
 use inquire::{Confirm, Select, Text};
 use shelbi_core::{
     format_bytes_short, recommended_workspace_count, total_memory_bytes, validate_agent_id,
-    AgentRunnerSpec, Machine, MachineKind, OrchestratorSpec, Project, WorkspaceNamePreset, WorkspaceSpec,
+    AgentRunnerSpec, Machine, MachineKind, OrchestratorSpec, Project, WorkspaceNamePreset,
+    WorkspaceSpec,
 };
 
 /// Half-block ASCII banner for the shelbi brand. Reproduced verbatim at
@@ -115,7 +116,10 @@ pub fn setup_one_project() -> Result<()> {
     let repo_path = text("Path to the repo:", &cwd.display().to_string())?;
     let repo_path = repo_path.trim().to_string();
 
-    let default_branch = text("Default branch:", git.default_branch.as_deref().unwrap_or("main"))?;
+    let default_branch = text(
+        "Default branch:",
+        git.default_branch.as_deref().unwrap_or("main"),
+    )?;
     let default_branch = default_branch.trim().to_string();
 
     let github_url_raw = text(
@@ -194,13 +198,10 @@ pub fn setup_one_project() -> Result<()> {
         Runner::Claude => 0,
         Runner::Codex => 1,
     };
-    let orch_runner = Select::new(
-        "Orchestrator runner:",
-        vec![Runner::Claude, Runner::Codex],
-    )
-    .with_starting_cursor(orch_default)
-    .prompt()
-    .context("orchestrator runner select")?;
+    let orch_runner = Select::new("Orchestrator runner:", vec![Runner::Claude, Runner::Codex])
+        .with_starting_cursor(orch_default)
+        .prompt()
+        .context("orchestrator runner select")?;
 
     // ---- Assemble workspaces ----------------------------------------------
     let workspaces = assign_workspace_names(&machines, count, preset, agent_runner)?;
@@ -212,6 +213,7 @@ pub fn setup_one_project() -> Result<()> {
         AgentRunnerSpec {
             command: Runner::Claude.id().to_string(),
             flags: vec![],
+            prompt_injection: None,
             dialog_signatures: vec![],
         },
     );
@@ -220,6 +222,7 @@ pub fn setup_one_project() -> Result<()> {
         AgentRunnerSpec {
             command: Runner::Codex.id().to_string(),
             flags: vec![],
+            prompt_injection: None,
             dialog_signatures: vec![],
         },
     );
@@ -228,6 +231,7 @@ pub fn setup_one_project() -> Result<()> {
         name: name.clone(),
         repo: repo_path.clone(),
         default_branch,
+        default_workflow: None,
         config_mode: None,
         machines,
         orchestrator: OrchestratorSpec {
@@ -251,8 +255,7 @@ pub fn setup_one_project() -> Result<()> {
     shelbi_state::save_project(&project).map_err(|e| anyhow!(e))?;
 
     write_workspace_settings_template(&name)?;
-    let _ = shelbi_state::materialize_default_agents(&name)
-        .map_err(|e| anyhow!(e))?;
+    let _ = shelbi_state::materialize_default_agents(&name).map_err(|e| anyhow!(e))?;
 
     // ---- Done -----------------------------------------------------------
     let names_csv = project
@@ -477,7 +480,9 @@ mod tests {
             host: None,
             tags: Vec::new(),
         }];
-        let workspaces = assign_workspace_names(&machines, 3, WorkspaceNamePreset::Phonetic, Runner::Claude).unwrap();
+        let workspaces =
+            assign_workspace_names(&machines, 3, WorkspaceNamePreset::Phonetic, Runner::Claude)
+                .unwrap();
         let names: Vec<_> = workspaces.iter().map(|w| w.name.as_str()).collect();
         assert_eq!(names, vec!["alpha", "bravo", "charlie"]);
     }
@@ -500,7 +505,9 @@ mod tests {
                 tags: Vec::new(),
             },
         ];
-        let workspaces = assign_workspace_names(&machines, 2, WorkspaceNamePreset::Phonetic, Runner::Claude).unwrap();
+        let workspaces =
+            assign_workspace_names(&machines, 2, WorkspaceNamePreset::Phonetic, Runner::Claude)
+                .unwrap();
         assert_eq!(workspaces.len(), 4);
         assert_eq!(workspaces[0].name, "alpha");
         assert_eq!(workspaces[0].machine, "hub");
@@ -522,7 +529,9 @@ mod tests {
             tags: Vec::new(),
         }];
         // Toy Story has 20 names; ask for 22.
-        let workspaces = assign_workspace_names(&machines, 22, WorkspaceNamePreset::ToyStory, Runner::Claude).unwrap();
+        let workspaces =
+            assign_workspace_names(&machines, 22, WorkspaceNamePreset::ToyStory, Runner::Claude)
+                .unwrap();
         assert_eq!(workspaces.len(), 22);
         // First 20 come from the preset; tail falls back to <machine>-<n>.
         assert_eq!(workspaces[0].name, "woody");
@@ -539,7 +548,9 @@ mod tests {
             host: None,
             tags: Vec::new(),
         }];
-        let workspaces = assign_workspace_names(&machines, 2, WorkspaceNamePreset::Phonetic, Runner::Codex).unwrap();
+        let workspaces =
+            assign_workspace_names(&machines, 2, WorkspaceNamePreset::Phonetic, Runner::Codex)
+                .unwrap();
         assert!(workspaces.iter().all(|w| w.runner == "codex"));
     }
 

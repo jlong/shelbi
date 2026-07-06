@@ -12,6 +12,7 @@ pub mod merge;
 pub mod message;
 pub mod open;
 pub mod orchestrate;
+pub mod orchestrator;
 pub mod palette;
 pub mod picker;
 pub mod popup;
@@ -25,8 +26,8 @@ pub mod status;
 pub mod tail;
 pub mod task;
 pub mod wizard;
-pub mod workspace;
 pub mod workflow;
+pub mod workspace;
 pub mod zen;
 pub mod zen_intro;
 pub mod zen_lifecycle;
@@ -84,7 +85,8 @@ pub fn launch_editor(path: &Path) -> Result<()> {
 /// zero. Unlike a bare `.status()` call this captures stderr and, on failure
 /// (non-zero exit OR a spawn error), surfaces it on our own stderr so a broken
 /// tmux invocation is diagnosable instead of silently collapsing to `false`
-/// (cli-session-ux F12). Shared across the CLI's non-TUI tmux call sites
+/// (Shelbi ContextStore docs/planning:reviews/adversarial-2026-07/cli-session-ux.md
+/// F12). Shared across the CLI's non-TUI tmux call sites
 /// (`open`, `palette`, `quit_project`, `quit_shelbi`) so the diagnostics and
 /// stderr handling live in one place (F14). Not for use inside a live ratatui
 /// screen — writing to stderr there would corrupt the alt-screen; those paths
@@ -94,8 +96,10 @@ where
     I: IntoIterator<Item = S>,
     S: AsRef<std::ffi::OsStr>,
 {
-    let args: Vec<std::ffi::OsString> =
-        args.into_iter().map(|a| a.as_ref().to_os_string()).collect();
+    let args: Vec<std::ffi::OsString> = args
+        .into_iter()
+        .map(|a| a.as_ref().to_os_string())
+        .collect();
     let argv = || {
         args.iter()
             .map(|a| a.to_string_lossy())
@@ -190,6 +194,52 @@ pub(crate) mod test_support {
     /// silently interleave and produce flaky failures.
     pub static ENV_LOCK: Mutex<()> = Mutex::new(());
 
+    /// Restores process environment variables on drop.
+    ///
+    /// Caller must hold `ENV_LOCK`; this guard only makes cleanup
+    /// panic-safe for tests that intentionally set or clear env vars.
+    pub struct EnvGuard {
+        saved: Vec<(&'static str, Option<std::ffi::OsString>)>,
+    }
+
+    impl EnvGuard {
+        pub fn new(keys: &[&'static str]) -> Self {
+            Self {
+                saved: keys
+                    .iter()
+                    .copied()
+                    .map(|key| (key, std::env::var_os(key)))
+                    .collect(),
+            }
+        }
+
+        pub fn set<K, V>(&self, key: K, value: V)
+        where
+            K: AsRef<std::ffi::OsStr>,
+            V: AsRef<std::ffi::OsStr>,
+        {
+            std::env::set_var(key, value);
+        }
+
+        pub fn remove<K>(&self, key: K)
+        where
+            K: AsRef<std::ffi::OsStr>,
+        {
+            std::env::remove_var(key);
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            for (key, value) in self.saved.iter().rev() {
+                match value {
+                    Some(value) => std::env::set_var(key, value),
+                    None => std::env::remove_var(key),
+                }
+            }
+        }
+    }
+
     /// Provision a real git repo + project YAML at `<home>/projects/<name>.yaml`
     /// pointing the hub machine at the repo. Used by tests that exercise CLI
     /// paths now gated on `shelbi_orchestrator::lifecycle` running a
@@ -202,8 +252,8 @@ pub(crate) mod test_support {
     /// test can drive further git operations against it.
     pub fn provision_hub_repo_for_project(home: &Path, project_name: &str) -> PathBuf {
         use shelbi_core::{
-            AgentRunnerSpec, GitConfig, HeartbeatConfig, Machine, MachineKind,
-            OrchestratorSpec, Project, ZenConfig,
+            AgentRunnerSpec, GitConfig, HeartbeatConfig, Machine, MachineKind, OrchestratorSpec,
+            Project, ZenConfig,
         };
         use std::collections::BTreeMap;
         use std::process::Command;
@@ -233,6 +283,7 @@ pub(crate) mod test_support {
             AgentRunnerSpec {
                 command: "claude".into(),
                 flags: vec![],
+                prompt_injection: None,
                 dialog_signatures: vec![],
             },
         );
@@ -240,6 +291,7 @@ pub(crate) mod test_support {
             name: project_name.into(),
             repo: repo.to_string_lossy().into(),
             default_branch: "main".into(),
+            default_workflow: None,
             config_mode: None,
             machines: vec![Machine {
                 name: "hub".into(),

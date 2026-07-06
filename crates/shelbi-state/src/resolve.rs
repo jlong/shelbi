@@ -334,10 +334,7 @@ fn match_root(cwd: &Path, roots: &[ProjectRoot]) -> Option<String> {
     // match — no separate length sort needed.
     let mut cur: Option<&Path> = Some(&start);
     while let Some(dir) = cur {
-        if let Some(root) = roots
-            .iter()
-            .find(|r| r.canonical.as_deref() == Some(dir))
-        {
+        if let Some(root) = roots.iter().find(|r| r.canonical.as_deref() == Some(dir)) {
             return Some(root.name.clone());
         }
         cur = dir.parent();
@@ -493,7 +490,10 @@ mod tests {
         let roots = project_roots().unwrap();
         assert_eq!(roots.len(), 1);
         assert_eq!(roots[0].name, "foo");
-        assert_eq!(resolve_project_for_cwd(&root).unwrap().as_deref(), Some("foo"));
+        assert_eq!(
+            resolve_project_for_cwd(&root).unwrap().as_deref(),
+            Some("foo")
+        );
         std::env::remove_var("SHELBI_HOME");
     }
 
@@ -660,12 +660,11 @@ mod tests {
                 assert_eq!(name, "shelbi");
                 assert_eq!(
                     config_path,
-                    fs::canonicalize(&repo).unwrap().join(".shelbi/project.yaml"),
+                    fs::canonicalize(&repo)
+                        .unwrap()
+                        .join(".shelbi/project.yaml"),
                 );
-                assert_eq!(
-                    expected_local,
-                    home.join("projects/shelbi/local.yaml"),
-                );
+                assert_eq!(expected_local, home.join("projects/shelbi/local.yaml"),);
             }
             other => panic!("expected ProjectNotPickedUp, got {other:?}"),
         }
@@ -771,7 +770,11 @@ mod tests {
         std::env::set_var("SHELBI_HOME", &home);
         let cfg_dir = repo.join(".shelbi");
         fs::create_dir_all(&cfg_dir).unwrap();
-        fs::write(cfg_dir.join("project.yaml"), "name: [this is not a scalar\n").unwrap();
+        fs::write(
+            cfg_dir.join("project.yaml"),
+            "name: [this is not a scalar\n",
+        )
+        .unwrap();
 
         // A corrupt in-repo config is no longer fatal: with no registry
         // entry it's skipped (warned, not propagated) and resolution finds

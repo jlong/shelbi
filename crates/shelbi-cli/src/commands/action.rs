@@ -11,7 +11,7 @@ use anyhow::{anyhow, Result};
 use clap::Subcommand;
 
 use shelbi_orchestrator::{actions, transition};
-use shelbi_state::{load_project, load_task, load_workflow};
+use shelbi_state::{load_project, load_task};
 
 use crate::commands::require_project;
 
@@ -136,9 +136,8 @@ pub fn run(project_opt: Option<String>, cmd: ActionCmd) -> Result<()> {
         }
         ActionCmd::Merge { task_id, target } => {
             let tf = load_task(&project_name, &task_id).map_err(|e| anyhow!(e))?;
-            let result =
-                actions::merge(&project, &project_name, &tf.task, target.as_deref())
-                    .map_err(|e| anyhow!(e))?;
+            let result = actions::merge(&project, &project_name, &tf.task, target.as_deref())
+                .map_err(|e| anyhow!(e))?;
             println!("{}", result.merge.as_line());
             for r in &result.restacks {
                 println!("{}", r.as_line());
@@ -151,17 +150,20 @@ pub fn run(project_opt: Option<String>, cmd: ActionCmd) -> Result<()> {
             println!("{}", outcome.as_line());
             Ok(())
         }
-        ActionCmd::Restack { task_id, from, onto } => {
+        ActionCmd::Restack {
+            task_id,
+            from,
+            onto,
+        } => {
             let tf = load_task(&project_name, &task_id).map_err(|e| anyhow!(e))?;
-            let outcome =
-                actions::restack(&project, &tf.task, &from, onto.as_deref())
-                    .map_err(|e| anyhow!(e))?;
+            let outcome = actions::restack(&project, &tf.task, &from, onto.as_deref())
+                .map_err(|e| anyhow!(e))?;
             println!("{}", outcome.as_line());
             Ok(())
         }
         ActionCmd::ApplyTransition { task_id, from, to } => {
             let tf = load_task(&project_name, &task_id).map_err(|e| anyhow!(e))?;
-            let workflow = load_workflow(&project_name, tf.task.workflow_or_default())
+            let workflow = shelbi_state::load_task_workflow(&project_name, &project, &tf.task)
                 .map_err(|e| anyhow!(e))?;
             let outcomes = transition::execute_transition(
                 &project,

@@ -173,9 +173,7 @@ pub fn run(
 /// Absence means no live worker tailing the log — the caller treats that
 /// as a delivery failure so the message doesn't silently vanish.
 fn tail_pid_alive(host: &Host, messages_dir: &std::path::Path, task_id: &str) -> Result<bool> {
-    let pid_path = messages_dir
-        .join(format!("{task_id}.tail.d"))
-        .join("pid");
+    let pid_path = messages_dir.join(format!("{task_id}.tail.d")).join("pid");
     match host {
         Host::Local => {
             let pid_text = match std::fs::read_to_string(&pid_path) {
@@ -428,7 +426,11 @@ mod tests {
         // in a test that lasts milliseconds and doesn't fork thousands
         // of processes. `sh -c :` is portable across macOS (no /bin/true)
         // and Linux.
-        let child = std::process::Command::new("sh").arg("-c").arg(":").spawn().unwrap();
+        let child = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(":")
+            .spawn()
+            .unwrap();
         let pid = child.id();
         let _ = child.wait_with_output();
         std::fs::write(lock_dir.join("pid"), pid.to_string()).unwrap();

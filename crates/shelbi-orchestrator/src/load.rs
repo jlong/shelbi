@@ -40,7 +40,7 @@ pub fn load_task_by_id(project_name: &str, task_id: &str) -> Result<String> {
     // agent. A missing/invalid workflow falls back to the built-in default
     // (no required tags → any free workspace), so a transient config typo
     // doesn't wedge the load.
-    let workflow = shelbi_state::load_workflow(project_name, tf.task.workflow_or_default())
+    let workflow = shelbi_state::load_task_workflow(project_name, &project, &tf.task)
         .unwrap_or_else(|_| shelbi_core::default_workflow());
     let status_id = tf.task.column.as_str();
     let status = workflow.status(status_id);

@@ -57,11 +57,9 @@ const SSH_CONTROL_OPTS_STATIC: &[&str] = &[
     // (the default) and LogLevel=ERROR keep duplicate-forward warnings
     // on slave reconnects from blocking the connection or polluting
     // the user's terminal. NB: these options silence the forward-failed
-    // warning on the *master open* too — a stale remote socket that
-    // blocks the `-R` bind fails silently here. That gap is closed out
-    // of band by [`ensure_reverse_forward`], which cleans the stale
-    // socket and verifies the forward instead of relying on ssh's
-    // (suppressed) stderr.
+    // warning on the *master open* too. That gap is closed out of band by
+    // [`ensure_reverse_forward`], which cleans and verifies the forward
+    // instead of relying on ssh's suppressed stderr.
     "-o",
     "ExitOnForwardFailure=no",
     "-o",
@@ -120,6 +118,21 @@ fn apply_ssh_control_opts(cmd: &mut Command) {
     }
 }
 
+/// Apply only the conservative connection options needed for one-shot
+/// maintenance commands. Deliberately avoids ControlMaster and `-R`:
+/// these commands inspect or remove the reverse-forward landing socket,
+/// so they must not create the socket as a side effect.
+fn apply_ssh_no_forward_opts(cmd: &mut Command) {
+    for (flag, value) in [
+        ("-o", "ControlMaster=no"),
+        ("-o", "ConnectTimeout=5"),
+        ("-o", "BatchMode=yes"),
+        ("-o", "LogLevel=ERROR"),
+    ] {
+        cmd.arg(flag).arg(value);
+    }
+}
+
 /// Build (but do not execute) a `Command` that will run the given argv on
 /// `host`.
 ///
@@ -132,7 +145,8 @@ fn apply_ssh_control_opts(cmd: &mut Command) {
 /// survive the remote shell as exactly one literal word, giving the SSH
 /// arm the same "argv is argv" semantics the local arm already has.
 ///
-/// This closes F1/F2 from the process-boundaries review: an unquoted
+/// This closes F1/F2 from Shelbi ContextStore
+/// docs/planning:reviews/adversarial-2026-07/process-boundaries.md: an unquoted
 /// `#{pane_title}` (comment-stripped by the remote shell) or a command
 /// string containing `&&` / `;` / `$` / spaces no longer silently
 /// re-parses on the far side. Callers must therefore pass *raw* argv and
@@ -271,7 +285,9 @@ where
     // `wait`, so the long-lived hub daemon would accumulate `<defunct>` ssh
     // processes, and (b) surface a bare `BrokenPipe` while the real
     // diagnostic ("Connection refused", "Permission denied") sits unread in
-    // the child's stderr (adversarial review F8). Instead we record the
+    // the child's stderr (Shelbi ContextStore
+    // docs/planning:reviews/adversarial-2026-07/process-boundaries.md F8).
+    // Instead we record the
     // error, always drain to `wait_with_output` below (which reaps the
     // child), and fold its stderr into the returned error.
     let write_err = {
@@ -319,18 +335,6 @@ fn control_path_opt() -> Vec<String> {
     vec!["-o".to_string(), format!("ControlPath={cp}")]
 }
 
-/// Is a ControlMaster currently alive for `hostname`? `ssh -O check`
-/// queries the existing master via its ControlPath and exits 0 when one is
-/// running — without opening a new connection.
-fn master_is_alive(hostname: &str) -> bool {
-    let mut cmd = Command::new("ssh");
-    for o in control_path_opt() {
-        cmd.arg(o);
-    }
-    cmd.arg("-O").arg("check").arg(hostname);
-    matches!(cmd.output(), Ok(o) if o.status.success())
-}
-
 /// Tear down any ControlMaster for `hostname` (`ssh -O exit`). Best-effort:
 /// a nonzero exit just means there was no master to close. We drop the
 /// master before reopening so `ControlMaster=auto` opens a *fresh* one that
@@ -345,12 +349,63 @@ fn drop_master(hostname: &str) {
     let _ = cmd.output();
 }
 
+/// Open a fresh ControlMaster with the reverse-forward unlink option enabled.
+/// Callers must drop the existing master first; applying
+/// StreamLocalBindUnlink to ordinary multiplexed slave commands could replace
+/// an already-healthy listener for only the lifetime of that slave.
+fn open_master_with_stream_local_unlink(hostname: &str) -> std::io::Result<Output> {
+    let mut cmd = Command::new("ssh");
+    for o in build_ssh_control_opts() {
+        cmd.arg(o);
+    }
+    cmd.arg("-o")
+        .arg("StreamLocalBindUnlink=yes")
+        .arg(hostname)
+        .arg("--")
+        .arg("true");
+    tracing::debug!(?cmd, host = %hostname, "ssh::open_master_with_stream_local_unlink");
+    cmd.output()
+}
+
 /// Does the reverse-forward landing socket exist on the remote? `test -S`
-/// is true only for an existing socket node. Routed through `run` so it
-/// reuses (or, as a side effect, opens) the multiplexed master rather than
-/// paying a fresh handshake.
+/// is true only for an existing socket node. Routed through the no-forward
+/// maintenance path so the probe observes the socket without creating it.
 fn remote_socket_present(host: &Host, remote_sock: &str) -> bool {
-    matches!(run(host, ["test", "-S", remote_sock]), Ok(o) if o.status.success())
+    match host {
+        Host::Local => false,
+        Host::Ssh { host } => {
+            matches!(run_without_reverse_forward(host, ["test", "-S", remote_sock]), Ok(o) if o.status.success())
+        }
+    }
+}
+
+/// Run a remote maintenance/probe command without installing or reusing
+/// Shelbi's reverse forward. This keeps health checks pure: `test -S` must
+/// observe the landing socket, and `rm -f` must remove it, without the SSH
+/// wrapper first binding a fresh one.
+fn build_no_forward_command<I, S>(hostname: &str, argv: I) -> Command
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<OsStr>,
+{
+    let mut cmd = Command::new("ssh");
+    apply_ssh_no_forward_opts(&mut cmd);
+    cmd.arg(hostname);
+    cmd.arg("--");
+    for a in argv {
+        cmd.arg(escape_for_wire(a.as_ref()));
+    }
+    cmd
+}
+
+fn run_without_reverse_forward<I, S>(hostname: &str, argv: I) -> std::io::Result<Output>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<OsStr>,
+{
+    let mut cmd = build_no_forward_command(hostname, argv);
+    tracing::debug!(?cmd, host = %hostname, "ssh::run_without_reverse_forward");
+    cmd.output()
 }
 
 /// Ensure the hub's reverse forward to `host` is bound and healthy,
@@ -359,23 +414,21 @@ fn remote_socket_present(host: &Host, remote_sock: &str) -> bool {
 /// Every shelbi-routed `ssh` invocation carries
 /// `-R <remote>:<local hub.sock>` so remote workers can write to the hub's
 /// `events.log` over the multiplexed channel. But `-R` to a Unix socket
-/// binds successfully only when the landing path is free: sshd unlinks a
-/// pre-existing remote socket only with `StreamLocalBindUnlink yes`
-/// (default `no`, and the client can't force it). When a master dies
-/// abnormally it leaves its socket file behind, so the next master's `-R`
-/// bind collides with the leak — and `ExitOnForwardFailure=no` +
-/// `LogLevel=ERROR` (which keep slave reconnects quiet) swallow the
-/// warning. The result: every worker→hub message silently drops into a
-/// dead file until someone cleans it by hand (adversarial review F7).
+/// binds successfully only when the landing path is free. The verified master
+/// reopen uses `StreamLocalBindUnlink=yes`, but we still verify because
+/// older/stricter servers and permission mismatches can leave the forward
+/// unbound while `ExitOnForwardFailure=no` + `LogLevel=ERROR` swallow the
+/// warning. The result would otherwise be every worker→hub message silently
+/// dropping into a dead file until someone cleans it by hand (adversarial
+/// review in Shelbi ContextStore
+/// docs/planning:reviews/adversarial-2026-07/process-boundaries.md F7).
 ///
 /// This is a no-op for [`Host::Local`]. For SSH hosts it:
-///  1. Fast-paths out when a live master already backs an existing landing
-///     socket (the healthy steady state — two cheap probe round-trips).
-///  2. Otherwise drops any half-broken master, removes the stale remote
+///  1. Drops any half-broken master, removes the stale remote
 ///     socket (safe: we only get here when no live master owns the
 ///     forward), and reopens the master so `-R` rebinds against a clean
 ///     path.
-///  3. Verifies the landing socket now exists and, on failure, records a
+///  2. Verifies the landing socket now exists and, on failure, records a
 ///     line to `events.log` so a dead channel is diagnosable instead of
 ///     invisible — then returns an error the caller can log.
 pub fn ensure_reverse_forward(host: &Host) -> shelbi_core::Result<()> {
@@ -387,43 +440,53 @@ pub fn ensure_reverse_forward(host: &Host) -> shelbi_core::Result<()> {
         .to_string_lossy()
         .into_owned();
 
-    // Fast path: a live master carries the `-R` forward it opened with, so
-    // "master alive AND landing socket present" means the forward is
-    // healthy. Leave everything untouched.
-    if master_is_alive(&hostname) && remote_socket_present(host, &remote_sock) {
-        return Ok(());
-    }
-
     // Repair. Drop any existing master first: it may be a master whose
     // forward never bound (stale socket collided with the `-R`), and
     // `ControlMaster=auto` would otherwise reuse it and skip the rebind.
     drop_master(&hostname);
     // Remove the stale landing socket. We only reach here when no live
     // master owns the forward, so any leftover socket file is a leak from a
-    // dead master — safe to unlink. This one-shot `rm` opens a transient
-    // master (whose own `-R` still collides with the not-yet-removed
-    // socket); drop that too so the reopen below starts genuinely clean.
-    let _ = run(host, ["rm", "-f", remote_sock.as_str()]);
+    // dead master — safe to unlink. The cleanup command deliberately bypasses
+    // shelbi's ControlMaster/`-R` wrapper; otherwise an absent socket can be
+    // recreated by SSH and then immediately removed by this `rm`.
+    let cleanup = run_without_reverse_forward(&hostname, ["rm", "-f", remote_sock.as_str()]);
     drop_master(&hostname);
 
     // Reopen the master, rebinding `-R` against the now-clean path. `true`
     // is the cheapest remote command; the master opens (and ControlPersist
     // keeps it) as a side effect.
-    let opened = run(host, ["true"]).map_err(shelbi_core::Error::Io)?;
+    let opened = open_master_with_stream_local_unlink(&hostname).map_err(shelbi_core::Error::Io)?;
 
     if opened.status.success() && remote_socket_present(host, &remote_sock) {
         return Ok(());
     }
 
-    let detail = if opened.status.success() {
-        "landing_socket_missing"
-    } else {
+    let detail = if !opened.status.success() {
         "master_open_failed"
+    } else if matches!(&cleanup, Ok(o) if !o.status.success()) {
+        "stale_socket_cleanup_failed"
+    } else if cleanup.is_err() {
+        "stale_socket_cleanup_unavailable"
+    } else {
+        "landing_socket_missing"
+    };
+    let cleanup_stderr = match &cleanup {
+        Ok(o) if !o.status.success() => {
+            let stderr = String::from_utf8_lossy(&o.stderr);
+            let trimmed = stderr.trim();
+            if trimmed.is_empty() {
+                String::new()
+            } else {
+                format!(" cleanup_stderr={}", trimmed)
+            }
+        }
+        Err(e) => format!(" cleanup_error={e}"),
+        _ => String::new(),
     };
     // Surface to events.log (best-effort — a wedged forward shouldn't also
     // hard-fail on a logging hiccup).
     let _ = shelbi_state::emit_event_body(&format!(
-        "ssh reverse-forward host={hostname} remote_sock={remote_sock} status=failed detail={detail}"
+        "ssh reverse-forward host={hostname} remote_sock={remote_sock} status=failed detail={detail}{cleanup_stderr}"
     ));
     Err(shelbi_core::Error::Other(format!(
         "ssh reverse forward to {hostname} could not be verified ({detail}); \
@@ -501,7 +564,10 @@ mod tests {
         let spec = &args[r_pos + 1];
         assert!(
             spec.starts_with("/tmp/shelbi-hub.sock:")
-                || spec.starts_with(&format!("{}:", shelbi_state::remote_hub_socket_path().display())),
+                || spec.starts_with(&format!(
+                    "{}:",
+                    shelbi_state::remote_hub_socket_path().display()
+                )),
             "forward spec didn't start with remote socket path: {spec}",
         );
         // ControlPath lands under SHELBI_HOME so the hub's startup
@@ -551,7 +617,15 @@ mod tests {
         let host = Host::Ssh {
             host: "devbox".into(),
         };
-        let args = ["printf", "[%s]\n", "a b", "#{pane_title}", "x && y", "p;q", "$HOME"];
+        let args = [
+            "printf",
+            "[%s]\n",
+            "a b",
+            "#{pane_title}",
+            "x && y",
+            "p;q",
+            "$HOME",
+        ];
         let wire = remote_wire(&host, &args);
         let out = std::process::Command::new("sh")
             .arg("-c")
@@ -571,8 +645,7 @@ mod tests {
         // `cat` echoes stdin to stdout — round-trips embedded newlines so
         // we know multi-line payloads survive the pipe end-to-end.
         let payload = "line one\nline two\nline three";
-        let out = run_with_stdin(&Host::Local, ["cat"], payload.as_bytes())
-            .expect("cat failed");
+        let out = run_with_stdin(&Host::Local, ["cat"], payload.as_bytes()).expect("cat failed");
         assert_eq!(out, payload);
     }
 
@@ -603,5 +676,27 @@ mod tests {
         // Local hosts have no reverse forward to establish — the call must
         // short-circuit without shelling out to ssh.
         ensure_reverse_forward(&Host::Local).expect("local ensure should be Ok");
+    }
+
+    #[test]
+    fn no_forward_maintenance_command_does_not_request_reverse_forward() {
+        let cmd = build_no_forward_command("devbox", ["rm", "-f", "/tmp/shelbi-hub-501.sock"]);
+        let args: Vec<String> = cmd
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+
+        assert!(
+            !args.iter().any(|a| a == "-R"),
+            "maintenance command must not create the socket it is repairing: {args:?}"
+        );
+        assert!(
+            args.iter().any(|a| a == "ControlMaster=no"),
+            "maintenance command must bypass shelbi's persistent ControlMaster: {args:?}"
+        );
+        assert!(
+            args.windows(2).any(|w| w == ["--", "rm"]),
+            "remote argv should still be sent after --: {args:?}"
+        );
     }
 }

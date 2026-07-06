@@ -278,10 +278,7 @@ pub fn plan_in_repo_migration(project_name: &str) -> Result<MigrationPlan> {
 /// the half can actually be loaded, not merely stat'd. A missing file,
 /// an unreadable file, or a file that fails to merge into a `Project`
 /// all report `false` so the planner re-queues the write.
-fn existing_half_is_loadable(
-    path: &Path,
-    validate: impl FnOnce(&str) -> Result<Project>,
-) -> bool {
+fn existing_half_is_loadable(path: &Path, validate: impl FnOnce(&str) -> Result<Project>) -> bool {
     match fs::read_to_string(path) {
         Ok(text) => validate(&text).is_ok(),
         Err(_) => false,
@@ -588,6 +585,7 @@ mod tests {
             AgentRunnerSpec {
                 command: "claude".into(),
                 flags: vec![],
+                prompt_injection: None,
                 dialog_signatures: vec![],
             },
         );
@@ -595,6 +593,7 @@ mod tests {
             name: name.into(),
             repo: repo.to_string_lossy().into_owned(),
             default_branch: "main".into(),
+            default_workflow: None,
             config_mode: None,
             machines: vec![Machine {
                 name: "hub".into(),

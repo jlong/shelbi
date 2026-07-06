@@ -36,8 +36,8 @@ use shelbi_core::{
 };
 use shelbi_orchestrator::zen::{self, CiVerdict, DryRunDecision};
 use shelbi_state::{
-    append_zen_dryrun_event, list_column, load_project, load_workflow, read_state, set_zen_mode,
-    State, ZenModeState,
+    append_zen_dryrun_event, list_column, load_project, read_state, set_zen_mode, State,
+    ZenModeState,
 };
 
 use crate::commands::require_project;
@@ -208,8 +208,7 @@ pub fn run(project_opt: Option<String>, cmd: ZenCmd) -> Result<()> {
                     ci_timeout_for_workflow(&project, workflow.as_ref())
                 }
             };
-            let verdict =
-                zen::ci_watch(&project, pr_number, timeout).map_err(|e| anyhow!(e))?;
+            let verdict = zen::ci_watch(&project, pr_number, timeout).map_err(|e| anyhow!(e))?;
             println!("{}", verdict.as_line());
             match verdict {
                 CiVerdict::Green => Ok(()),
@@ -301,9 +300,7 @@ fn print_status(project: &str, state: &State) -> Result<()> {
     match load_project(project) {
         Ok(p) => {
             if p.zen.checks.local.is_empty() {
-                println!(
-                    "checks: (none configured — set zen.checks.local in {project}.yaml)"
-                );
+                println!("checks: (none configured — set zen.checks.local in {project}.yaml)");
             } else {
                 println!("checks:");
                 for c in &p.zen.checks.local {
@@ -367,8 +364,7 @@ fn print_workflow_zen_overrides(project: &str, p: &Project) {
             }
         }
         if let Some(ref dp) = z.danger_paths {
-            let resolved =
-                shelbi_core::danger_paths_for_workflow(p, Some(w));
+            let resolved = shelbi_core::danger_paths_for_workflow(p, Some(w));
             let label = match dp {
                 ZenDangerPaths::Override(_) => "override",
                 ZenDangerPaths::Extend(_) => "extend",
@@ -389,12 +385,9 @@ fn print_danger_paths(p: &Project) {
     let resolved = danger_paths_for_project(p);
     let header = match &p.zen.danger_paths {
         ZenDangerPaths::Override(_) => "danger paths (project override):".to_string(),
-        ZenDangerPaths::Extend(_) if p.detected_shapes.is_empty() => {
-            "danger paths:".to_string()
-        }
+        ZenDangerPaths::Extend(_) if p.detected_shapes.is_empty() => "danger paths:".to_string(),
         ZenDangerPaths::Extend(_) => {
-            let labels: Vec<&'static str> =
-                p.detected_shapes.iter().map(|s| s.label()).collect();
+            let labels: Vec<&'static str> = p.detected_shapes.iter().map(|s| s.label()).collect();
             format!("danger paths (detected: {}):", labels.join(", "))
         }
     };
@@ -415,12 +408,16 @@ fn print_danger_paths(p: &Project) {
 /// [`Task::workflow_or_default`] so a task without an explicit
 /// `workflow:` field routes to the project's default workflow.
 fn load_workflow_for_task(project: &str, task: &Task) -> Option<Workflow> {
-    load_workflow(project, task.workflow_or_default()).ok()
+    let project_yaml = shelbi_state::load_project(project).ok()?;
+    shelbi_state::load_task_workflow(project, &project_yaml, task).ok()
 }
 
 fn count_in_flight_zen(project: &str, mode: ZenModeState) -> Result<usize> {
     let tasks = list_column(project, Column::in_progress()).map_err(|e| anyhow!(e))?;
-    Ok(tasks.iter().filter(|tf| zen_applies(&tf.task, mode)).count())
+    Ok(tasks
+        .iter()
+        .filter(|tf| zen_applies(&tf.task, mode))
+        .count())
 }
 
 fn zen_applies(task: &Task, mode: ZenModeState) -> bool {
@@ -487,7 +484,9 @@ fn dry_run(project: &str, duration: Option<Duration>, interval: Duration) -> Res
                 let now = Instant::now();
                 match deadline {
                     Some(end) if now >= end => break,
-                    Some(end) => std::thread::sleep(interval.min(end.saturating_duration_since(now))),
+                    Some(end) => {
+                        std::thread::sleep(interval.min(end.saturating_duration_since(now)))
+                    }
                     None => std::thread::sleep(interval),
                 }
                 continue;

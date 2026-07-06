@@ -139,7 +139,14 @@ fn print_summary(project: &str) -> Result<()> {
     println!("zen: {}", zen.summary_line());
 
     let hp = handoff_present(project)?;
-    println!("handoff: {}", if hp { "present (run `shelbi status --handoff` to consume)" } else { "none" });
+    println!(
+        "handoff: {}",
+        if hp {
+            "present (run `shelbi status --handoff` to consume)"
+        } else {
+            "none"
+        }
+    );
     Ok(())
 }
 
@@ -167,9 +174,7 @@ fn print_full(project: &str) -> Result<()> {
     println!();
     let present = handoff_present(project)?;
     if present {
-        println!(
-            "HANDOFF.md present — run `shelbi status --handoff` to read and consume it."
-        );
+        println!("HANDOFF.md present — run `shelbi status --handoff` to read and consume it.");
     } else {
         println!("no HANDOFF.md present");
     }
@@ -293,8 +298,8 @@ fn category_counts(project: &str) -> Result<CategoryCounts> {
 /// assignment.
 fn workspace_idle_busy(project: &str) -> Result<(usize, usize)> {
     let p = shelbi_state::load_project(project).map_err(|e| anyhow!(e))?;
-    let in_progress = shelbi_state::list_column(project, Column::in_progress())
-        .map_err(|e| anyhow!(e))?;
+    let in_progress =
+        shelbi_state::list_column(project, Column::in_progress()).map_err(|e| anyhow!(e))?;
     let mut idle = 0usize;
     let mut busy = 0usize;
     for w in &p.workspaces {
@@ -557,7 +562,10 @@ mod tests {
         // A second `--full` still leaves it in place — this is the
         // acceptance-criterion "safe to re-run" test.
         snapshot("p", true, false).unwrap();
-        assert!(handoff.exists(), "second --full still must not delete HANDOFF.md");
+        assert!(
+            handoff.exists(),
+            "second --full still must not delete HANDOFF.md"
+        );
 
         std::env::remove_var("SHELBI_HOME");
         let _ = std::fs::remove_dir_all(&home);
@@ -612,14 +620,20 @@ mod tests {
         // The old line-count heuristic would flag this forever; the
         // timestamp check must not (F20).
         let old = (Utc::now() - Duration::days(3)).to_rfc3339();
-        std::fs::write(&path, format!("{old} project=p zen=off reason=crash-recovery\n"))
-            .unwrap();
+        std::fs::write(
+            &path,
+            format!("{old} project=p zen=off reason=crash-recovery\n"),
+        )
+        .unwrap();
         assert!(!has_recent_crash_event("p").unwrap());
 
         // A fresh line for the same project IS flagged.
         let fresh = Utc::now().to_rfc3339();
-        std::fs::write(&path, format!("{fresh} project=p zen=off reason=crash-recovery\n"))
-            .unwrap();
+        std::fs::write(
+            &path,
+            format!("{fresh} project=p zen=off reason=crash-recovery\n"),
+        )
+        .unwrap();
         assert!(has_recent_crash_event("p").unwrap());
 
         std::env::remove_var("SHELBI_HOME");

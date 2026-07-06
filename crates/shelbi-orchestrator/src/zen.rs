@@ -25,7 +25,7 @@ use globset::{Glob, GlobSetBuilder};
 use serde::Serialize;
 use shelbi_core::{
     checks_for_task_in_workflow, danger_paths_for_workflow, Column, Error, Host, Machine, Project,
-    Result, StatusCategory, Task, WorkspaceSpec, Workflow, WorkflowStatus,
+    Result, StatusCategory, Task, Workflow, WorkflowStatus, WorkspaceSpec,
 };
 
 use crate::git::{
@@ -338,9 +338,7 @@ pub fn ci_watch(project: &Project, pr: u64, timeout: Duration) -> Result<CiVerdi
         let stderr = String::from_utf8_lossy(&out.stderr);
         match classify_poll(mode, code, &stdout, &stderr) {
             PollOutcome::Green => return Ok(CiVerdict::Green),
-            PollOutcome::Red { check, summary } => {
-                return Ok(CiVerdict::Red { check, summary })
-            }
+            PollOutcome::Red { check, summary } => return Ok(CiVerdict::Red { check, summary }),
             PollOutcome::FlipToAllReported => {
                 // No required checks configured on the target branch —
                 // flip to the all-reported fallback and re-poll
@@ -425,11 +423,7 @@ fn merge_state_status(host: &Host, wt: &str, pr_str: &str) -> Result<String> {
 /// TOCTOU window between "checks were green on X" and "merge whatever
 /// the head is now" is closed at the source. `None` preserves the
 /// unpinned behavior for manual invocations that never probed.
-pub fn pr_merge(
-    project: &Project,
-    pr: u64,
-    expected_head: Option<&str>,
-) -> Result<Option<String>> {
+pub fn pr_merge(project: &Project, pr: u64, expected_head: Option<&str>) -> Result<Option<String>> {
     let (host, dir) = locate_hub_workdir(project)?;
     let wt = dir.to_string_lossy().into_owned();
     let pr_str = pr.to_string();
@@ -495,9 +489,7 @@ fn delete_remote_head_branch(host: &Host, wt: &str, pr_str: &str) {
         ],
     );
     let head_ref = match view {
-        Ok(out) if out.status.success() => {
-            String::from_utf8_lossy(&out.stdout).trim().to_string()
-        }
+        Ok(out) if out.status.success() => String::from_utf8_lossy(&out.stdout).trim().to_string(),
         _ => return,
     };
     if head_ref.is_empty() {
@@ -720,9 +712,15 @@ mod tests {
     fn classify_poll_required_mode() {
         // Exit 0 in the strict path is green outright — no merge-state
         // detour.
-        assert_eq!(classify_poll(WatchMode::Required, 0, "", ""), PollOutcome::Green);
+        assert_eq!(
+            classify_poll(WatchMode::Required, 0, "", ""),
+            PollOutcome::Green
+        );
         // Exit 8 is pending.
-        assert_eq!(classify_poll(WatchMode::Required, 8, "", ""), PollOutcome::Pending);
+        assert_eq!(
+            classify_poll(WatchMode::Required, 8, "", ""),
+            PollOutcome::Pending
+        );
         // "no required checks" flips to the fallback.
         assert_eq!(
             classify_poll(
@@ -788,7 +786,6 @@ mod tests {
         );
     }
 }
-
 
 // ===========================================================================
 // Probe primitives — local checks, conflict, diff size, danger paths
@@ -1214,7 +1211,10 @@ fn init_log(path: &std::path::Path, task_id: &str, n_checks: usize) -> std::io::
         .write(true)
         .truncate(true)
         .open(path)?;
-    writeln!(f, "# shelbi zen probe — task {task_id} — {n_checks} check(s)")?;
+    writeln!(
+        f,
+        "# shelbi zen probe — task {task_id} — {n_checks} check(s)"
+    )?;
     Ok(())
 }
 
@@ -1294,7 +1294,10 @@ fn probe_merge_conflict(
         .take_while(|l| !l.trim().is_empty())
         .map(|l| l.trim().to_string())
         .collect();
-    Ok(ConflictProbe { conflicts: true, files })
+    Ok(ConflictProbe {
+        conflicts: true,
+        files,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -1317,7 +1320,14 @@ fn probe_diff_size(
     let range = format!("{main}...{branch}");
     let stdout = shelbi_ssh::run_capture(
         host,
-        ["git", "-C", wt.as_str(), "diff", "--shortstat", range.as_str()],
+        [
+            "git",
+            "-C",
+            wt.as_str(),
+            "diff",
+            "--shortstat",
+            range.as_str(),
+        ],
     )?;
     Ok(parse_shortstat(&stdout))
 }
@@ -1384,7 +1394,14 @@ fn probe_danger_paths(
     let range = format!("{base}...{branch}");
     let stdout = shelbi_ssh::run_capture(
         host,
-        ["git", "-C", wt.as_str(), "diff", "--name-only", range.as_str()],
+        [
+            "git",
+            "-C",
+            wt.as_str(),
+            "diff",
+            "--name-only",
+            range.as_str(),
+        ],
     )?;
     let changed: Vec<&str> = stdout
         .lines()
@@ -1618,7 +1635,11 @@ mod probe_tests {
     }
 
     fn run_git(cwd: &std::path::Path, args: &[&str]) {
-        let status = Command::new("git").current_dir(cwd).args(args).status().unwrap();
+        let status = Command::new("git")
+            .current_dir(cwd)
+            .args(args)
+            .status()
+            .unwrap();
         assert!(status.success(), "git {args:?} failed in {}", cwd.display());
     }
 
@@ -1824,7 +1845,10 @@ mod probe_tests {
         let wt = tmp.path();
         let tool = "shelbi-test-no-such-tool-9c3a7b";
         let res = run_one_check(&Host::Local, wt, tool);
-        assert_eq!(res.exit_code, 127, "expected POSIX 'command not found' exit");
+        assert_eq!(
+            res.exit_code, 127,
+            "expected POSIX 'command not found' exit"
+        );
         assert!(
             res.output_tail.contains("shelbi:"),
             "expected shelbi-prefixed hint, got: {}",
@@ -1972,11 +1996,29 @@ mod probe_tests {
 
         // Bare origin holding the canonical default branch.
         let origin = base_path.join("origin.git");
-        run_git(&base_path, &["init", "-q", "--bare", "-b", "main", origin.to_str().unwrap()]);
+        run_git(
+            &base_path,
+            &[
+                "init",
+                "-q",
+                "--bare",
+                "-b",
+                "main",
+                origin.to_str().unwrap(),
+            ],
+        );
 
         // A throwaway seed clone to push the initial `main` commit.
         let seed = base_path.join("seed");
-        run_git(&base_path, &["clone", "-q", origin.to_str().unwrap(), seed.to_str().unwrap()]);
+        run_git(
+            &base_path,
+            &[
+                "clone",
+                "-q",
+                origin.to_str().unwrap(),
+                seed.to_str().unwrap(),
+            ],
+        );
         run_git(&seed, &["config", "user.email", "test@example.com"]);
         run_git(&seed, &["config", "user.name", "Test"]);
         std::fs::write(seed.join("seed.txt"), "seed\n").unwrap();
@@ -1988,7 +2030,15 @@ mod probe_tests {
         // computes, so `probe_in_workflow` resolves to it unchanged.
         let wt = base_path.join(".shelbi").join("wt").join("ws1");
         std::fs::create_dir_all(wt.parent().unwrap()).unwrap();
-        run_git(&base_path, &["clone", "-q", origin.to_str().unwrap(), wt.to_str().unwrap()]);
+        run_git(
+            &base_path,
+            &[
+                "clone",
+                "-q",
+                origin.to_str().unwrap(),
+                wt.to_str().unwrap(),
+            ],
+        );
         run_git(&wt, &["config", "user.email", "test@example.com"]);
         run_git(&wt, &["config", "user.name", "Test"]);
 
@@ -2005,7 +2055,15 @@ mod probe_tests {
         mutate: F,
     ) {
         let bump = base.join(format!("bump-{msg}").replace(' ', "-"));
-        run_git(base, &["clone", "-q", origin.to_str().unwrap(), bump.to_str().unwrap()]);
+        run_git(
+            base,
+            &[
+                "clone",
+                "-q",
+                origin.to_str().unwrap(),
+                bump.to_str().unwrap(),
+            ],
+        );
         run_git(&bump, &["config", "user.email", "test@example.com"]);
         run_git(&bump, &["config", "user.name", "Test"]);
         mutate(&bump);
@@ -2020,12 +2078,18 @@ mod probe_tests {
         let mut runners = std::collections::BTreeMap::new();
         runners.insert(
             "claude".to_string(),
-            AgentRunnerSpec { command: "claude".into(), flags: vec![], dialog_signatures: vec![] },
+            AgentRunnerSpec {
+                command: "claude".into(),
+                flags: vec![],
+                prompt_injection: None,
+                dialog_signatures: vec![],
+            },
         );
         Project {
             name: "probe-test".into(),
             repo: work_dir.to_string_lossy().into(),
             default_branch: "main".into(),
+            default_workflow: None,
             config_mode: None,
             machines: vec![Machine {
                 name: "hub".into(),
@@ -2034,7 +2098,9 @@ mod probe_tests {
                 host: None,
                 tags: Vec::new(),
             }],
-            orchestrator: OrchestratorSpec { runner: "claude".into() },
+            orchestrator: OrchestratorSpec {
+                runner: "claude".into(),
+            },
             agent_runners: runners,
             editor: None,
             github_url: None,
@@ -2081,7 +2147,12 @@ mod probe_tests {
 
     fn head_sha(repo: &std::path::Path) -> String {
         String::from_utf8_lossy(
-            &Command::new("git").current_dir(repo).args(["rev-parse", "HEAD"]).output().unwrap().stdout,
+            &Command::new("git")
+                .current_dir(repo)
+                .args(["rev-parse", "HEAD"])
+                .output()
+                .unwrap()
+                .stdout,
         )
         .trim()
         .to_string()
@@ -2110,9 +2181,14 @@ mod probe_tests {
 
         let project = probe_project(base.path(), &["test -f fix.txt"]);
         let task = probe_task("shelbi/task1");
-        let report =
-            probe_in_workflow(&project, None, &task, "shelbi/task1", RebasePolicy::RebaseOntoDefault)
-                .unwrap();
+        let report = probe_in_workflow(
+            &project,
+            None,
+            &task,
+            "shelbi/task1",
+            RebasePolicy::RebaseOntoDefault,
+        )
+        .unwrap();
 
         assert!(!report.rebase_conflict.conflicts, "clean rebase expected");
         assert_eq!(report.local_checks.len(), 1, "the local check must run");
@@ -2123,7 +2199,10 @@ mod probe_tests {
         );
         // The branch was actually rewritten onto the advanced default.
         assert_ne!(head_sha(&wt), before, "HEAD must move after the rebase");
-        assert!(wt.join("fix.txt").exists(), "worktree must contain the fix after rebase");
+        assert!(
+            wt.join("fix.txt").exists(),
+            "worktree must contain the fix after rebase"
+        );
         // The report pins the *post-rebase* tip — the SHA pr-merge must be
         // matched against, not the stale handoff commit.
         assert_eq!(
@@ -2154,11 +2233,19 @@ mod probe_tests {
         // check result, is what suppresses it.
         let project = probe_project(base.path(), &["true"]);
         let task = probe_task("shelbi/task1");
-        let report =
-            probe_in_workflow(&project, None, &task, "shelbi/task1", RebasePolicy::RebaseOntoDefault)
-                .unwrap();
+        let report = probe_in_workflow(
+            &project,
+            None,
+            &task,
+            "shelbi/task1",
+            RebasePolicy::RebaseOntoDefault,
+        )
+        .unwrap();
 
-        assert!(report.rebase_conflict.conflicts, "expected a rebase conflict");
+        assert!(
+            report.rebase_conflict.conflicts,
+            "expected a rebase conflict"
+        );
         assert!(
             report.rebase_conflict.files.iter().any(|f| f == "seed.txt"),
             "conflict files should name seed.txt, got {:?}",
@@ -2198,18 +2285,36 @@ mod probe_tests {
 
         let project = probe_project(base.path(), &["true"]);
         let task = probe_task("shelbi/task1");
-        let report =
-            probe_in_workflow(&project, None, &task, "shelbi/task1", RebasePolicy::RebaseOntoDefault)
-                .unwrap();
+        let report = probe_in_workflow(
+            &project,
+            None,
+            &task,
+            "shelbi/task1",
+            RebasePolicy::RebaseOntoDefault,
+        )
+        .unwrap();
 
-        assert!(!report.rebase_conflict.conflicts, "no conflict on a current worktree");
-        assert_eq!(report.local_checks.len(), 1, "the check runs when up to date");
+        assert!(
+            !report.rebase_conflict.conflicts,
+            "no conflict on a current worktree"
+        );
+        assert_eq!(
+            report.local_checks.len(),
+            1,
+            "the check runs when up to date"
+        );
         assert_eq!(report.local_checks[0].exit_code, 0);
-        assert_eq!(head_sha(&wt), before, "an up-to-date branch must not be rewritten");
-        assert_eq!(report.head_sha, before, "head_sha must be the (unmoved) branch tip");
+        assert_eq!(
+            head_sha(&wt),
+            before,
+            "an up-to-date branch must not be rewritten"
+        );
+        assert_eq!(
+            report.head_sha, before,
+            "head_sha must be the (unmoved) branch tip"
+        );
     }
 }
-
 
 // ===========================================================================
 // Backlog scan — mechanical eligibility for Zen auto-promotion
@@ -2282,9 +2387,11 @@ fn zen_disabled(task: &Task) -> bool {
 /// might queue behind something already being touched.
 fn file_overlaps_in_flight(candidate_body: &str, in_flight_bodies: &[&str]) -> bool {
     let tokens = extract_path_tokens(candidate_body);
-    tokens
-        .iter()
-        .any(|tok| in_flight_bodies.iter().any(|body| body.contains(tok.as_str())))
+    tokens.iter().any(|tok| {
+        in_flight_bodies
+            .iter()
+            .any(|body| body.contains(tok.as_str()))
+    })
 }
 
 /// Pull out tokens that look like file paths. A "path-like" token is a
@@ -2297,9 +2404,9 @@ fn file_overlaps_in_flight(candidate_body: &str, in_flight_bodies: &[&str]) -> b
 /// alphabet.
 pub fn extract_path_tokens(body: &str) -> Vec<String> {
     let mut out = Vec::new();
-    for raw in body.split(|c: char| {
-        !(c.is_alphanumeric() || c == '/' || c == '.' || c == '-' || c == '_')
-    }) {
+    for raw in
+        body.split(|c: char| !(c.is_alphanumeric() || c == '/' || c == '.' || c == '-' || c == '_'))
+    {
         if let Some(tok) = canonical_path_token(raw) {
             out.push(tok);
         }
@@ -2520,7 +2627,10 @@ mod scan_tests {
         let in_flight_body = "Working on `crates/shelbi-tui/src/app.rs`.";
         let candidate_body = "Touch `crates/shelbi-state/src/lib.rs` only.";
         let tasks = vec![
-            tf(task("in-flight", Column::in_progress(), 0, &[]), in_flight_body),
+            tf(
+                task("in-flight", Column::in_progress(), 0, &[]),
+                in_flight_body,
+            ),
             tf(task("candidate", Column::backlog(), 0, &[]), candidate_body),
         ];
         let got = mechanically_eligible_from(&tasks, &HashSet::new());
@@ -2617,13 +2727,17 @@ mod scan_tests {
         let tasks: Vec<TaskFile> = bodies
             .iter()
             .enumerate()
-            .map(|(i, body)| tf(task(&format!("t-{i}"), Column::backlog(), i as u32, &[]), body))
+            .map(|(i, body)| {
+                tf(
+                    task(&format!("t-{i}"), Column::backlog(), i as u32, &[]),
+                    body,
+                )
+            })
             .collect();
         let got = mechanically_eligible_from(&tasks, &HashSet::new());
         assert_eq!(got, vec!["t-0", "t-1", "t-2"]);
     }
 }
-
 
 // ===========================================================================
 // Dry-run preview — what would Zen do, without doing it
@@ -2835,8 +2949,8 @@ fn resolve_task_status<'w>(task: &Task, workflow: &'w Workflow) -> Option<&'w Wo
 /// state, and a transient typo in a workflow YAML shouldn't kill the
 /// whole preview pass for unrelated tasks.
 fn load_task_workflow(project: &str, task: &Task) -> Option<Workflow> {
-    let name = task.workflow_or_default();
-    shelbi_state::load_workflow(project, name).ok()
+    let project_yaml = shelbi_state::load_project(project).ok()?;
+    shelbi_state::load_task_workflow(project, &project_yaml, task).ok()
 }
 
 /// Apply the default merge-conditions bar to a probe report. Returns a
@@ -2846,11 +2960,7 @@ fn load_task_workflow(project: &str, task: &Task) -> Option<Workflow> {
 /// Gate order matches the prompt template — first failure wins so the
 /// user sees the same single reason live Zen would emit.
 pub fn evaluate_probe(task_id: &str, report: &ProbeReport) -> DryRunDecision {
-    if let Some(failed) = report
-        .local_checks
-        .iter()
-        .find(|c| c.exit_code != 0)
-    {
+    if let Some(failed) = report.local_checks.iter().find(|c| c.exit_code != 0) {
         return DryRunDecision {
             action: DryRunAction::BlockMerge,
             task_id: task_id.to_string(),
@@ -2895,10 +3005,7 @@ pub fn evaluate_probe(task_id: &str, report: &ProbeReport) -> DryRunDecision {
             detail: "diff-too-large".into(),
             explanation: format!(
                 "diff too large ({} files / {} lines; max {} files / {} lines)",
-                report.diff_size.files,
-                total_lines,
-                DRYRUN_MAX_DIFF_FILES,
-                DRYRUN_MAX_DIFF_LINES,
+                report.diff_size.files, total_lines, DRYRUN_MAX_DIFF_FILES, DRYRUN_MAX_DIFF_LINES,
             ),
         };
     }
@@ -2939,7 +3046,11 @@ mod dry_run_tests {
             }],
             merge_conflict: ConflictProbe::default(),
             rebase_conflict: ConflictProbe::default(),
-            diff_size: DiffSize { files: 3, lines_added: 40, lines_removed: 5 },
+            diff_size: DiffSize {
+                files: 3,
+                lines_added: 40,
+                lines_removed: 5,
+            },
             danger_paths: DangerPaths::default(),
         }
     }

@@ -117,7 +117,9 @@ pub fn render_intro(f: &mut Frame, area: Rect, state: &IntroState) {
         .border_style(Style::default().fg(Color::Cyan))
         .title(Line::from(Span::styled(
             " Enable Zen Mode? ",
-            Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
         )));
     let inner = block.inner(overlay);
     f.render_widget(block, overlay);
@@ -228,11 +230,20 @@ mod tests {
         // Starting at Enable (default), forward Tab walks Enable →
         // Checkbox → Cancel → Enable.
         let mut s = IntroState::default();
-        assert_eq!(step_intro(&mut s, key(KeyCode::Tab)), IntroOutcome::Continue);
+        assert_eq!(
+            step_intro(&mut s, key(KeyCode::Tab)),
+            IntroOutcome::Continue
+        );
         assert_eq!(s.focus, IntroFocus::Checkbox);
-        assert_eq!(step_intro(&mut s, key(KeyCode::Tab)), IntroOutcome::Continue);
+        assert_eq!(
+            step_intro(&mut s, key(KeyCode::Tab)),
+            IntroOutcome::Continue
+        );
         assert_eq!(s.focus, IntroFocus::Cancel);
-        assert_eq!(step_intro(&mut s, key(KeyCode::Tab)), IntroOutcome::Continue);
+        assert_eq!(
+            step_intro(&mut s, key(KeyCode::Tab)),
+            IntroOutcome::Continue
+        );
         assert_eq!(s.focus, IntroFocus::Enable);
     }
 
@@ -263,7 +274,10 @@ mod tests {
                 focus,
                 dont_show_again: false,
             };
-            assert_eq!(step_intro(&mut s, key(KeyCode::Esc)), IntroOutcome::Cancelled);
+            assert_eq!(
+                step_intro(&mut s, key(KeyCode::Esc)),
+                IntroOutcome::Cancelled
+            );
         }
     }
 
@@ -294,10 +308,16 @@ mod tests {
             focus: IntroFocus::Checkbox,
             dont_show_again: false,
         };
-        assert_eq!(step_intro(&mut s, key(KeyCode::Enter)), IntroOutcome::Continue);
+        assert_eq!(
+            step_intro(&mut s, key(KeyCode::Enter)),
+            IntroOutcome::Continue
+        );
         assert!(s.dont_show_again);
         // Second activation un-checks.
-        assert_eq!(step_intro(&mut s, key(KeyCode::Enter)), IntroOutcome::Continue);
+        assert_eq!(
+            step_intro(&mut s, key(KeyCode::Enter)),
+            IntroOutcome::Continue
+        );
         assert!(!s.dont_show_again);
     }
 

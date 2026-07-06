@@ -39,3 +39,6 @@ nucleo-matcher = { workspace = true }
 inquire = { workspace = true }
 signal-hook = "0.3"
 libc = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"

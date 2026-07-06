@@ -98,9 +98,7 @@ pub fn request_orchestrator_handoff(project_name: &str) -> Result<HandoffOutcome
     let deadline = Instant::now() + HANDOFF_TIMEOUT;
     while Instant::now() < deadline {
         if handoff_path.exists() {
-            return Ok(HandoffOutcome::Written {
-                path: handoff_path,
-            });
+            return Ok(HandoffOutcome::Written { path: handoff_path });
         }
         std::thread::sleep(POLL_INTERVAL);
     }
@@ -214,15 +212,7 @@ fn send_to_pane(pane_id: &str, text: &str) -> std::result::Result<(), String> {
     }
 
     let paste = std::process::Command::new("tmux")
-        .args([
-            "paste-buffer",
-            "-p",
-            "-d",
-            "-b",
-            BUFFER,
-            "-t",
-            pane_id,
-        ])
+        .args(["paste-buffer", "-p", "-d", "-b", BUFFER, "-t", pane_id])
         .output()
         .map_err(|e| format!("tmux paste-buffer: {e}"))?;
     if !paste.status.success() {

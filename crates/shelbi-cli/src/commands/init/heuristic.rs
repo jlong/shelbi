@@ -59,9 +59,7 @@ fn has_remote_origin(cwd: &Path) -> bool {
         .args(["config", "--get", "remote.origin.url"])
         .current_dir(cwd)
         .output()
-        .map(|o| {
-            o.status.success() && !String::from_utf8_lossy(&o.stdout).trim().is_empty()
-        })
+        .map(|o| o.status.success() && !String::from_utf8_lossy(&o.stdout).trim().is_empty())
         .unwrap_or(false)
 }
 

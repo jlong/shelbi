@@ -20,7 +20,7 @@ The file's location depends on the project's
 | In-repo | `<repo>/.shelbi/project.yaml` (committed) | `~/.shelbi/projects/<name>/local.yaml` |
 
 In global mode every field lives in one flat file. In in-repo mode the
-**shared** fields (`name`, `default_branch`, `orchestrator`,
+**shared** fields (`name`, `default_branch`, `default_workflow`, `orchestrator`,
 `agent_runners`, `zen`, …) are committed and the **user-local** fields
 (`repo`, `machines`, `workspaces`, `editor`) live in
 a per-machine `local.yaml`. Putting a field on the wrong side errors at
@@ -35,6 +35,9 @@ load time. The canonical bucket lists are `SHARED_PROJECT_FIELDS` and
 name: myapp
 repo: git@github.com:me/myapp.git
 default_branch: main
+# Optional: tasks without `workflow:` use workflows/app.yaml instead of
+# workflows/default.yaml.
+default_workflow: app
 machines:
   - name: hub
     kind: local
@@ -44,6 +47,9 @@ orchestrator:
 agent_runners:
   claude:
     command: claude
+    flags: []
+  codex:
+    command: codex
     flags: []
 workspaces:
   - { name: alice, machine: hub, runner: claude }
@@ -56,6 +62,7 @@ workspaces:
 | `name` | string | yes | — | Project identifier. Doubles as the local registry key (`~/.shelbi/projects/<name>.yaml`). |
 | `repo` | string | yes | — | Clone URL or path to the repository. User-local. |
 | `default_branch` | string | no | `main` | Branch new work is based on and the fallback merge target when `git.base_branch` is unset. |
+| `default_workflow` | string | no | `default` | Workflow used by tasks that omit `workflow:` frontmatter. Names `workflows/<name>.yaml`; explicit task `workflow:` still wins. |
 | `machines` | list of [Machine](#machines) | yes | — | The hosts workspaces run on. User-local. |
 | `orchestrator` | [Orchestrator](#orchestrator) | yes | — | Which runner boots the orchestrator. |
 | `agent_runners` | map of name → [AgentRunner](#agent-runners) | yes | — | The command lines agents and the orchestrator are launched with. |
@@ -128,6 +135,12 @@ initial startup prompt containing the rendered orchestrator instructions
 and bootstrap request. Other runners launch exactly as configured. Put any
 required Codex mode flags in `agent_runners.codex.flags`.
 
+`orchestrator.runner` only controls the dashboard/orchestrator pane. It does
+not change worker slots. Worker slots use their own
+[`workspaces[].runner`](#workspaces) value, so a project can run a Codex
+orchestrator while still dispatching tasks to Claude workers, or mix Claude
+and Codex workers in the same pool.
+
 ## agent_runners
 
 A map from runner name to the command line agents are launched with.
@@ -167,9 +180,29 @@ cleared context) between assignments. See
 ```yaml
 workspaces:
   - { name: alice, machine: hub, runner: claude }
-  - { name: bob,   machine: m2,  runner: claude }
+  - { name: bob,   machine: m2,  runner: codex }
   - { name: rev,   machine: hub, runner: claude, tags: [review], slot: 0 }
 ```
+
+To switch existing worker slots after setup, use:
+
+```bash
+shelbi workspace set-runner codex --all
+```
+
+That command edits the same `workspaces[].runner` fields shown above and
+validates that `codex` is declared in `agent_runners`. You can also update
+the YAML directly by changing each desired workspace row:
+
+```yaml
+workspaces:
+  - { name: alice, machine: hub, runner: codex }
+  - { name: bob,   machine: m2,  runner: codex }
+```
+
+Leave `orchestrator.runner` unchanged unless you also want to change the
+dashboard/orchestrator pane. Run `shelbi workspace list` afterward; its
+`RUNNER` column shows the runner each workspace will launch.
 
 <Callout type="note" title="Legacy review designator folds into tags">
 

@@ -7,8 +7,8 @@ use shelbi_core::{Agent, Column, Status};
 use shelbi_palette::{Decoration, DecorationColor};
 use shelbi_state::{
     keymap::{DisplayStyle, Keymaps},
-    load_workspace_status, read_state, sidebar_collapsed_machines, toggle_sidebar_machine_collapsed,
-    TaskFile, WorkspaceState, ZenModeState, ZenToggleChord,
+    load_workspace_status, read_state, sidebar_collapsed_machines,
+    toggle_sidebar_machine_collapsed, TaskFile, WorkspaceState, ZenModeState, ZenToggleChord,
 };
 
 /// What's currently highlighted in the sidebar — drives selection logic
@@ -791,8 +791,7 @@ fn load_workspaces(project: &str) -> Result<Vec<WorkspaceOverview>> {
         Ok(p) => p,
         Err(_) => return Ok(Vec::new()),
     };
-    let in_progress =
-        shelbi_state::list_column(project, Column::in_progress()).unwrap_or_default();
+    let in_progress = shelbi_state::list_column(project, Column::in_progress()).unwrap_or_default();
     // A review workspace's loaded task sits in the Review column (it's *loaded*
     // onto the slot, never promoted from in-progress), so its "serving" state
     // isn't visible in the in-progress scan. Read the Review column too and use
@@ -941,7 +940,8 @@ mod tests {
     use super::*;
     use chrono::Utc;
     use shelbi_core::{
-        AgentRunnerSpec, Column, Machine, MachineKind, OrchestratorSpec, Project, Task, WorkspaceSpec,
+        AgentRunnerSpec, Column, Machine, MachineKind, OrchestratorSpec, Project, Task,
+        WorkspaceSpec,
     };
     use std::collections::BTreeMap;
 
@@ -967,6 +967,7 @@ mod tests {
             AgentRunnerSpec {
                 command: "claude".into(),
                 flags: vec![],
+                prompt_injection: None,
                 dialog_signatures: vec![],
             },
         );
@@ -974,6 +975,7 @@ mod tests {
             name: "demo".into(),
             repo: "git@example:demo.git".into(),
             default_branch: "main".into(),
+            default_workflow: None,
             config_mode: None,
             machines: vec![
                 Machine {
@@ -1062,12 +1064,18 @@ mod tests {
         let delta = &workspaces[1];
         assert_eq!(delta.name, "delta");
         assert_eq!(delta.machine, "devbox");
-        assert!(delta.is_remote, "ssh-machine workspaces must report is_remote=true");
+        assert!(
+            delta.is_remote,
+            "ssh-machine workspaces must report is_remote=true"
+        );
         assert_eq!(delta.current_task.as_deref(), Some("fix-thing"));
         // Default agent — the task carries no `agent:` in params, so the
         // sidebar surfaces the project's default task agent verbatim.
         assert_eq!(delta.agent.as_deref(), Some("developer"));
-        assert!(alpha.agent.is_none(), "idle workspaces must not carry an agent name");
+        assert!(
+            alpha.agent.is_none(),
+            "idle workspaces must not carry an agent name"
+        );
 
         std::env::remove_var("SHELBI_HOME");
     }
@@ -1121,9 +1129,15 @@ mod tests {
         assert!(matches!(&rows[7], Row::MachineGroup { name, .. } if name == "devbox"));
 
         // alpha (busy, no status file yet) — default to Working.
-        assert_eq!(find_workspace_badge(&rows, "alpha").unwrap(), WorkspaceBadge::Working);
+        assert_eq!(
+            find_workspace_badge(&rows, "alpha").unwrap(),
+            WorkspaceBadge::Working
+        );
         // delta (idle remote) — Idle.
-        assert_eq!(find_workspace_badge(&rows, "delta").unwrap(), WorkspaceBadge::Idle);
+        assert_eq!(
+            find_workspace_badge(&rows, "delta").unwrap(),
+            WorkspaceBadge::Idle
+        );
 
         std::env::remove_var("SHELBI_HOME");
     }
@@ -1229,16 +1243,27 @@ mod tests {
         let mut app = App::new_sidebar("demo");
         app.refresh().unwrap();
 
-        assert_eq!(app.ready_review.len(), 1, "one task loaded on a review worktree");
+        assert_eq!(
+            app.ready_review.len(),
+            1,
+            "one task loaded on a review worktree"
+        );
         let ready = &app.ready_review[0];
         assert_eq!(ready.task_id, "loaded");
         assert_eq!(ready.branch, "shelbi/palette-fix");
         assert_eq!(ready.location.as_deref(), Some("hub:review-1"));
 
-        assert_eq!(app.queued_review.len(), 1, "one task still waiting for a slot");
+        assert_eq!(
+            app.queued_review.len(),
+            1,
+            "one task still waiting for a slot"
+        );
         let queued = &app.queued_review[0];
         assert_eq!(queued.task_id, "waiting");
-        assert_eq!(queued.branch, "shelbi/waiting", "branch falls back to shelbi/<id>");
+        assert_eq!(
+            queued.branch, "shelbi/waiting",
+            "branch falls back to shelbi/<id>"
+        );
         assert!(queued.location.is_none(), "queued tasks have no URL yet");
 
         // Row layout: a Ready section (✓, loaded row) precedes a Queued
@@ -1368,7 +1393,11 @@ mod tests {
         // The Queued review row sits one line lower than a naive
         // one-line-per-row map would place it (the Ready row ate two lines).
         let queued_line = ready_line + 2 /* ready row height */ + 1 /* blank */ + 1 /* header */;
-        assert_eq!(app.row_at(1, queued_line), Some(queued_idx), "queued title line");
+        assert_eq!(
+            app.row_at(1, queued_line),
+            Some(queued_idx),
+            "queued title line"
+        );
         assert_eq!(
             app.row_at(1, queued_line + 1),
             Some(queued_idx),
@@ -1380,7 +1409,11 @@ mod tests {
             .iter()
             .position(|r| matches!(r, Row::Section { label } if label == "Ready for Review"))
             .unwrap() as u16;
-        assert_eq!(app.row_at(1, ready_hdr), None, "section headers aren't clickable");
+        assert_eq!(
+            app.row_at(1, ready_hdr),
+            None,
+            "section headers aren't clickable"
+        );
         // First nav row still maps to index 0.
         assert_eq!(app.row_at(1, 0), Some(0));
     }
@@ -1409,7 +1442,8 @@ mod tests {
         );
         // 3 nav + 1 blank + 1 Workspaces section + 1 workspace = 6 rows.
         assert_eq!(rows.len(), 6);
-        let alpha = find_workspace_row(&rows, "alpha").expect("alpha must render at the section root");
+        let alpha =
+            find_workspace_row(&rows, "alpha").expect("alpha must render at the section root");
         assert!(
             matches!(alpha, Row::Workspace { indent: false, .. }),
             "flat-list rows render without indent"
@@ -1467,11 +1501,21 @@ mod tests {
             .expect("devbox group must render");
         assert!(matches!(
             hub,
-            Row::MachineGroup { collapsed: false, total: 1, active: 1, .. }
+            Row::MachineGroup {
+                collapsed: false,
+                total: 1,
+                active: 1,
+                ..
+            }
         ));
         assert!(matches!(
             devbox,
-            Row::MachineGroup { collapsed: false, total: 1, active: 0, .. }
+            Row::MachineGroup {
+                collapsed: false,
+                total: 1,
+                active: 0,
+                ..
+            }
         ));
 
         std::env::remove_var("SHELBI_HOME");
@@ -1505,7 +1549,13 @@ mod tests {
             .iter()
             .find(|r| matches!(r, Row::MachineGroup { name, .. } if name == "hub"))
             .expect("hub header still renders when collapsed");
-        assert!(matches!(hub, Row::MachineGroup { collapsed: true, .. }));
+        assert!(matches!(
+            hub,
+            Row::MachineGroup {
+                collapsed: true,
+                ..
+            }
+        ));
         assert!(
             find_workspace_row(&rows, "alpha").is_none(),
             "collapsed hub must hide its workspace rows"
@@ -1529,7 +1579,9 @@ mod tests {
         // Toggle hub again → expanded.
         app.toggle_machine_collapsed("hub");
         assert!(find_workspace_row(&app.rows(), "alpha").is_some());
-        assert!(!shelbi_state::sidebar_collapsed_machines().unwrap().contains("hub"));
+        assert!(!shelbi_state::sidebar_collapsed_machines()
+            .unwrap()
+            .contains("hub"));
 
         std::env::remove_var("SHELBI_HOME");
     }
@@ -1616,7 +1668,12 @@ mod tests {
             .expect("hub header must render even when collapsed");
         assert!(matches!(
             hub,
-            Row::MachineGroup { collapsed: true, total: 3, active: 2, .. }
+            Row::MachineGroup {
+                collapsed: true,
+                total: 3,
+                active: 2,
+                ..
+            }
         ));
 
         std::env::remove_var("SHELBI_HOME");
@@ -1646,16 +1703,22 @@ mod tests {
         // project. Hub and devbox render normally.
         assert!(app.collapsed_machines.contains("ghost"));
         let rows = app.rows();
-        assert!(!rows.iter().any(
-            |r| matches!(r, Row::MachineGroup { name, .. } if name == "ghost")
-        ));
+        assert!(!rows
+            .iter()
+            .any(|r| matches!(r, Row::MachineGroup { name, .. } if name == "ghost")));
         // Real machines are still rendered expanded — `ghost` doesn't
         // leak its collapse state to anyone else.
         let hub = rows
             .iter()
             .find(|r| matches!(r, Row::MachineGroup { name, .. } if name == "hub"))
             .expect("hub header must render");
-        assert!(matches!(hub, Row::MachineGroup { collapsed: false, .. }));
+        assert!(matches!(
+            hub,
+            Row::MachineGroup {
+                collapsed: false,
+                ..
+            }
+        ));
 
         // And the on-disk entry survives the render pass — no silent
         // pruning.
@@ -1726,7 +1789,10 @@ mod tests {
             .iter()
             .position(|r| matches!(r, Row::MachineGroup { name, .. } if name == "devbox"))
             .expect("devbox group header must render in a multi-machine project");
-        assert!(devbox_idx > hub_idx, "machine headers must follow project declaration order");
+        assert!(
+            devbox_idx > hub_idx,
+            "machine headers must follow project declaration order"
+        );
         assert!(matches!(
             &rows[devbox_idx + 1],
             Row::Workspace { name, indent: true, .. } if name == "delta"
@@ -1853,8 +1919,14 @@ mod tests {
         assert!(matches!(delta, Row::Workspace { agent: None, .. }));
 
         // Active row's badge is not Idle; idle row's badge is.
-        assert_ne!(find_workspace_badge(&rows, "alpha").unwrap(), WorkspaceBadge::Idle);
-        assert_eq!(find_workspace_badge(&rows, "delta").unwrap(), WorkspaceBadge::Idle);
+        assert_ne!(
+            find_workspace_badge(&rows, "alpha").unwrap(),
+            WorkspaceBadge::Idle
+        );
+        assert_eq!(
+            find_workspace_badge(&rows, "delta").unwrap(),
+            WorkspaceBadge::Idle
+        );
 
         std::env::remove_var("SHELBI_HOME");
     }
@@ -1907,7 +1979,10 @@ mod tests {
         app.refresh().unwrap();
         let rows = app.rows();
 
-        assert_eq!(find_workspace_badge(&rows, "alpha").unwrap(), WorkspaceBadge::Working);
+        assert_eq!(
+            find_workspace_badge(&rows, "alpha").unwrap(),
+            WorkspaceBadge::Working
+        );
         assert_eq!(
             find_workspace_badge(&rows, "delta").unwrap(),
             WorkspaceBadge::AwaitingInput
@@ -2100,7 +2175,10 @@ mod tests {
         let mut app = App::new_sidebar("demo");
         app.refresh().unwrap();
         let rows = app.rows();
-        assert_eq!(find_workspace_badge(&rows, "alpha").unwrap(), WorkspaceBadge::Idle);
+        assert_eq!(
+            find_workspace_badge(&rows, "alpha").unwrap(),
+            WorkspaceBadge::Idle
+        );
 
         std::env::remove_var("SHELBI_HOME");
     }
@@ -2151,7 +2229,9 @@ mod tests {
         let mut app = App::new_sidebar("demo");
         app.refresh().unwrap();
         assert!(
-            !app.rows().iter().any(|r| matches!(r, Row::Section { label } if label == "Queued for Review")),
+            !app.rows()
+                .iter()
+                .any(|r| matches!(r, Row::Section { label } if label == "Queued for Review")),
             "empty review queue must not render the section header"
         );
 
@@ -2192,7 +2272,9 @@ mod tests {
         ));
         // No Ready section — the task is queued, not loaded on a review slot.
         assert!(
-            !rows.iter().any(|r| matches!(r, Row::Section { label } if label == "Ready for Review")),
+            !rows
+                .iter()
+                .any(|r| matches!(r, Row::Section { label } if label == "Ready for Review")),
             "a task on a dev workspace is queued, never Ready"
         );
         // Exactly one blank row separates the preceding list from the Queued
@@ -2323,7 +2405,11 @@ mod tests {
         assert_eq!(d.glyph, shelbi_core::Status::Running.glyph());
         assert_eq!(d.color, DecorationColor::Green);
 
-        assert!(Row::Section { label: "Workspaces".into() }.decoration().is_none());
+        assert!(Row::Section {
+            label: "Workspaces".into()
+        }
+        .decoration()
+        .is_none());
         assert!(Row::Blank.decoration().is_none());
         assert!(
             Row::MachineGroup {

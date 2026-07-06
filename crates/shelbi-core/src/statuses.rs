@@ -85,12 +85,10 @@ impl ProjectStatuses {
                 )));
             }
         }
-        let has_terminal = self.statuses.iter().any(|st| {
-            matches!(
-                st.category,
-                StatusCategory::Done | StatusCategory::Archived
-            )
-        });
+        let has_terminal = self
+            .statuses
+            .iter()
+            .any(|st| matches!(st.category, StatusCategory::Done | StatusCategory::Archived));
         if !has_terminal {
             return Err(invalid(
                 "statuses.yaml declares no terminal status — at least one status must \
@@ -364,7 +362,9 @@ statuses:
         let ps = ProjectStatuses::from_yaml_str(yaml).unwrap();
         let warnings = ps.category_warnings();
         assert!(
-            warnings.iter().any(|w| w.contains("more than one `handoff`")),
+            warnings
+                .iter()
+                .any(|w| w.contains("more than one `handoff`")),
             "got: {warnings:?}"
         );
     }
@@ -382,7 +382,14 @@ statuses:
         let ps = default_project_statuses();
         assert_eq!(
             ps.ids(),
-            vec!["backlog", "todo", "in-progress", "review", "done", "canceled"]
+            vec![
+                "backlog",
+                "todo",
+                "in-progress",
+                "review",
+                "done",
+                "canceled"
+            ]
         );
     }
 }

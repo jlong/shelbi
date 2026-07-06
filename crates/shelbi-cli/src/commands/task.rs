@@ -122,7 +122,12 @@ pub struct AddArgs {
     pub id: Option<String>,
     /// Initial status. Defaults to `backlog`. `--column` accepted as a
     /// hidden alias for one release while older scripts catch up.
-    #[arg(long = "status", alias = "column", default_value = "backlog", value_name = "STATUS")]
+    #[arg(
+        long = "status",
+        alias = "column",
+        default_value = "backlog",
+        value_name = "STATUS"
+    )]
     pub status: String,
     /// Optional description; if omitted, the body starts empty (use
     /// `shelbi task edit` to fill it in).
@@ -187,20 +192,33 @@ pub fn run(project_opt: Option<String>, cmd: TaskCmd) -> Result<()> {
     let project = require_project(project_opt)?;
     match cmd {
         TaskCmd::Add(args) => add(&project, args),
-        TaskCmd::List { status, ready, workflow } => {
-            list(&project, status.as_deref(), ready, workflow.as_deref())
-        }
+        TaskCmd::List {
+            status,
+            ready,
+            workflow,
+        } => list(&project, status.as_deref(), ready, workflow.as_deref()),
         TaskCmd::Show { id } => show(&project, &id),
         TaskCmd::Depends(args) => depends(&project, args),
         TaskCmd::Move { id, to, reason } => move_to(&project, &id, &to, reason.as_deref()),
         TaskCmd::Assign { id, to } => assign(&project, &id, &to),
         TaskCmd::Unassign { id } => unassign(&project, &id),
-        TaskCmd::Start { id, workspace, branch, reason } => {
-            start(&project, &id, workspace.as_deref(), branch.as_deref(), reason.as_deref())
-        }
-        TaskCmd::Resume { id, workspace, reason } => {
-            resume(&project, &id, workspace.as_deref(), reason.as_deref())
-        }
+        TaskCmd::Start {
+            id,
+            workspace,
+            branch,
+            reason,
+        } => start(
+            &project,
+            &id,
+            workspace.as_deref(),
+            branch.as_deref(),
+            reason.as_deref(),
+        ),
+        TaskCmd::Resume {
+            id,
+            workspace,
+            reason,
+        } => resume(&project, &id, workspace.as_deref(), reason.as_deref()),
         TaskCmd::Prio(args) => prio(&project, args),
         TaskCmd::Edit { id } => edit(&project, &id),
         TaskCmd::Rm { id } => rm(&project, &id),
@@ -288,12 +306,18 @@ fn list(
     ready: bool,
     workflow_filter: Option<&str>,
 ) -> Result<()> {
-    // String-compare against `workflow_or_default()` so a filter of
-    // `default` matches both tasks pinned explicitly to `default` and
-    // tasks with no `workflow:` field (the canonical absence semantics).
+    let project_yaml = shelbi_state::load_project(project).ok();
+    // String-compare against the project-aware resolver so a filter of the
+    // configured default matches tasks with no `workflow:` field.
     let matches_workflow = |task: &Task| -> bool {
         match workflow_filter {
-            Some(name) => task.workflow_or_default() == name,
+            Some(name) => {
+                project_yaml
+                    .as_ref()
+                    .map(|p| shelbi_state::resolve_task_workflow_name(p, task))
+                    .unwrap_or_else(|| task.workflow_or_default())
+                    == name
+            }
             None => true,
         }
     };
@@ -360,7 +384,11 @@ fn list(
                 .as_deref()
                 .map(|w| format!("  [{w}]"))
                 .unwrap_or_default();
-            let badge = if tf.task.is_blocked(&columns) { " 🔒" } else { "" };
+            let badge = if tf.task.is_blocked(&columns) {
+                " 🔒"
+            } else {
+                ""
+            };
             println!("  {:<28} {}{owner}{badge}", tf.task.id, tf.task.title);
         }
     }
@@ -369,8 +397,8 @@ fn list(
 
 fn show(project: &str, id: &str) -> Result<()> {
     let path = shelbi_state::task_path(project, id).map_err(|e| anyhow!(e))?;
-    let text = std::fs::read_to_string(&path)
-        .with_context(|| format!("reading {}", path.display()))?;
+    let text =
+        std::fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
     print!("{text}");
 
     // Footer: resolved depends_on. Done lazily after the raw file dump so
@@ -462,8 +490,7 @@ fn move_to(project: &str, id: &str, to: &str, reason: Option<&str>) -> Result<()
     // shipping the card to in_progress without a usable branch would be
     // the worst of both worlds.
     if column == Column::in_progress() && tf.task.column != Column::in_progress() {
-        let project_yaml =
-            shelbi_state::load_project(project).map_err(|e| anyhow!(e))?;
+        let project_yaml = shelbi_state::load_project(project).map_err(|e| anyhow!(e))?;
         shelbi_orchestrator::lifecycle::ensure_branch_for_in_progress(&project_yaml, id)
             .map_err(|e| anyhow!(e))?;
     }
@@ -471,7 +498,9 @@ fn move_to(project: &str, id: &str, to: &str, reason: Option<&str>) -> Result<()
     let moved = shelbi_state::move_task(project, id, column.clone()).map_err(|e| anyhow!(e))?;
     if let Some((from, to_col, workflow)) = moved {
         let reason = reason.unwrap_or("user:cli");
-        if let Err(e) = shelbi_state::append_task_event(id, &workflow, from, to_col, reason) {
+        if let Err(e) =
+            shelbi_state::append_task_event(project, id, &workflow, from, to_col, reason)
+        {
             eprintln!("warning: append_task_event failed: {e}");
         }
     }
@@ -479,16 +508,24 @@ fn move_to(project: &str, id: &str, to: &str, reason: Option<&str>) -> Result<()
     Ok(())
 }
 
-/// Load the workflow assigned to `task`, falling back to the canonical
-/// [`default_workflow`] when the project hasn't authored a YAML for it.
-/// Plans/workflows.md §5 specifies that missing workflows are tolerated:
-/// "If `workflow` references a missing definition, shelbi falls back to
-/// default."
+/// Load the workflow assigned to `task`. Project defaults are resolved via
+/// project config; explicit task workflow misses keep the legacy fallback to
+/// the canonical default workflow.
 fn resolve_task_workflow(project: &str, task: &Task) -> Result<Workflow> {
-    let name = task.workflow_or_default();
+    let project_yaml = shelbi_state::load_project(project).ok();
+    let name = project_yaml
+        .as_ref()
+        .map(|p| shelbi_state::resolve_task_workflow_name(p, task))
+        .unwrap_or_else(|| task.workflow_or_default());
     match shelbi_state::load_workflow(project, name) {
         Ok(wf) => Ok(wf),
-        Err(_) => Ok(default_workflow()),
+        Err(e) if task.workflow.is_some() || project_yaml.is_none() => {
+            eprintln!(
+                "warning: workflow `{name}` could not be loaded ({e}); using built-in default"
+            );
+            Ok(default_workflow())
+        }
+        Err(e) => Err(anyhow!(e)),
     }
 }
 
@@ -650,8 +687,7 @@ fn prio(project: &str, args: PrioArgs) -> Result<()> {
         bail!("specify one of --up, --down, --top, --bottom, --set N");
     };
 
-    shelbi_state::set_task_priority(project, &args.id, new_pos as u32)
-        .map_err(|e| anyhow!(e))?;
+    shelbi_state::set_task_priority(project, &args.id, new_pos as u32).map_err(|e| anyhow!(e))?;
     println!("✓ {} now at slot {new_pos} in {}", args.id, tf.task.column);
     Ok(())
 }
@@ -737,11 +773,9 @@ fn start(
     // that ref directly (the *release task* pattern, Plans/workflows.md
     // §12).
     if branch_arg.is_none() {
-        let updated = shelbi_orchestrator::lifecycle::ensure_branch_for_in_progress(
-            &project_yaml,
-            id,
-        )
-        .map_err(|e| anyhow!(e))?;
+        let updated =
+            shelbi_orchestrator::lifecycle::ensure_branch_for_in_progress(&project_yaml, id)
+                .map_err(|e| anyhow!(e))?;
         tf = updated;
     }
     let branch = branch_arg
@@ -758,8 +792,8 @@ fn start(
     // command, that's the intent override. We still surface the
     // resolver's verdict via the `agent=` field on StartSpec so the
     // worktree picks up the right `instructions.md` + skills mount.
-    let agent_name = resolve_active_agent_for_dispatch(project, &tf.task)
-        .map_err(|e| anyhow!(e))?;
+    let agent_name =
+        resolve_active_agent_for_dispatch(project, &tf.task).map_err(|e| anyhow!(e))?;
 
     // Persist the in_progress move BEFORE spawning the pane (F7). Ordering
     // is load-bearing: if we spawned first and the process died before the
@@ -826,8 +860,9 @@ fn start(
     if prev_column != Column::in_progress() {
         let base_reason = reason.unwrap_or("user:cli:start");
         let dispatched_reason = dispatch_reason_with_agent(base_reason, &agent_name);
-        let workflow = tf.task.workflow_or_default();
+        let workflow = shelbi_state::resolve_task_workflow_name(&project_yaml, &tf.task);
         if let Err(e) = shelbi_state::append_task_event(
+            project,
             id,
             workflow,
             prev_column.clone(),
@@ -838,7 +873,10 @@ fn start(
         }
     }
 
-    println!("✓ {id} → in_progress on {workspace_name} ({})", addr.target());
+    println!(
+        "✓ {id} → in_progress on {workspace_name} ({})",
+        addr.target()
+    );
     Ok(())
 }
 
@@ -846,12 +884,7 @@ fn start(
 /// spawn itself failed. Re-saves the pre-move frontmatter and renumbers
 /// both the column we bumped the card out of and `in_progress` (where the
 /// aborted card was briefly appended) so priorities stay contiguous.
-fn rollback_start(
-    project: &str,
-    original: &Task,
-    body: &str,
-    prev_column: Column,
-) -> Result<()> {
+fn rollback_start(project: &str, original: &Task, body: &str, prev_column: Column) -> Result<()> {
     shelbi_state::save_task(project, original, body).map_err(|e| anyhow!(e))?;
     if prev_column != Column::in_progress() {
         shelbi_state::renumber_column(project, Column::in_progress()).map_err(|e| anyhow!(e))?;
@@ -944,8 +977,8 @@ fn resume(
 
     // Same agent-resolution as `start` — the active status's agent under the
     // project's Zen state, developer as the fallback.
-    let agent_name = resolve_active_agent_for_dispatch(project, &tf.task)
-        .map_err(|e| anyhow!(e))?;
+    let agent_name =
+        resolve_active_agent_for_dispatch(project, &tf.task).map_err(|e| anyhow!(e))?;
 
     // Restore `in_progress` if the card drifted out of it. Persist BEFORE the
     // relaunch (same ordering rationale as `start`): the board should reflect
@@ -1003,8 +1036,9 @@ fn resume(
     if moved_into_progress {
         let base_reason = reason.unwrap_or("user:cli:resume");
         let dispatched_reason = dispatch_reason_with_agent(base_reason, &agent_name);
-        let workflow = tf.task.workflow_or_default();
+        let workflow = shelbi_state::resolve_task_workflow_name(&project_yaml, &tf.task);
         if let Err(e) = shelbi_state::append_task_event(
+            project,
             id,
             workflow,
             prev_column.clone(),
@@ -1124,7 +1158,10 @@ mod tests {
 
     #[test]
     fn slugify_basic() {
-        assert_eq!(slugify("Fix login bug on Safari"), "fix-login-bug-on-safari");
+        assert_eq!(
+            slugify("Fix login bug on Safari"),
+            "fix-login-bug-on-safari"
+        );
         assert_eq!(slugify("  Hello, World!  "), "hello-world");
         assert_eq!(slugify("CSV → JSON"), "csv-json");
         assert_eq!(slugify("---"), "");
@@ -1140,7 +1177,9 @@ mod tests {
         // A title whose slug exceeds the limit by a few bytes is enough to
         // trip the workspace branch over GitHub's 255-byte ref cap.
         let long_title = "a".repeat(MAX_TASK_ID_LEN + 10);
-        let err = generate_unique_id("p", &long_title).unwrap_err().to_string();
+        let err = generate_unique_id("p", &long_title)
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("title is too long"), "err: {err}");
         assert!(err.contains(&MAX_TASK_ID_LEN.to_string()), "err: {err}");
 
@@ -1191,8 +1230,13 @@ mod tests {
         crate::commands::test_support::provision_hub_repo_for_project(&home, "p");
 
         shelbi_state::save_task("p", &task_in(Column::todo(), "b"), "").unwrap();
-        move_to("p", "b", "in_progress", Some("orchestrator:auto-dispatch workspace=alpha"))
-            .unwrap();
+        move_to(
+            "p",
+            "b",
+            "in_progress",
+            Some("orchestrator:auto-dispatch workspace=alpha"),
+        )
+        .unwrap();
 
         let log = std::fs::read_to_string(shelbi_state::events_log_path().unwrap()).unwrap();
         let lines: Vec<&str> = log.lines().collect();
@@ -1243,11 +1287,7 @@ mod tests {
 
         // Stand in for `shelbi init` — the workflow loader requires
         // the project's status catalogue to be on disk.
-        shelbi_state::save_project_statuses(
-            "p",
-            &shelbi_core::default_project_statuses(),
-        )
-        .unwrap();
+        shelbi_state::save_project_statuses("p", &shelbi_core::default_project_statuses()).unwrap();
 
         // Author a workflow that omits `review` — moves to it must fail.
         let wf_dir = shelbi_state::workflows_dir("p").unwrap();
@@ -1336,7 +1376,11 @@ statuses:
         // the task lands there (its stored position id is the custom id).
         move_to("p", "t", "qa", None).unwrap();
         assert_eq!(
-            shelbi_state::load_task("p", "t").unwrap().task.column.as_str(),
+            shelbi_state::load_task("p", "t")
+                .unwrap()
+                .task
+                .column
+                .as_str(),
             "qa",
         );
 
@@ -1353,7 +1397,11 @@ statuses:
         assert!(valid.contains("qa"), "{err}");
         assert!(!valid.contains("review"), "{err}");
         assert_eq!(
-            shelbi_state::load_task("p", "t").unwrap().task.column.as_str(),
+            shelbi_state::load_task("p", "t")
+                .unwrap()
+                .task
+                .column
+                .as_str(),
             "qa",
             "rejected move must not relocate the task",
         );
@@ -1377,8 +1425,7 @@ statuses:
         let home = fresh_home();
         std::env::set_var("SHELBI_HOME", &home);
 
-        shelbi_state::save_project_statuses("p", &shelbi_core::default_project_statuses())
-            .unwrap();
+        shelbi_state::save_project_statuses("p", &shelbi_core::default_project_statuses()).unwrap();
         // A default-workflow task (no explicit `workflow:` field).
         shelbi_state::save_task("p", &task_in(Column::todo(), "c"), "").unwrap();
 
@@ -1483,11 +1530,12 @@ statuses:
 
         // Orchestrator-supplied reason (the auto-dispatch contract from
         // the default orchestrator playbook).
-        let r = dispatch_reason_with_agent(
-            "orchestrator:auto-dispatch workspace=alpha",
-            "developer",
+        let r =
+            dispatch_reason_with_agent("orchestrator:auto-dispatch workspace=alpha", "developer");
+        assert_eq!(
+            r,
+            "orchestrator:auto-dispatch workspace=alpha agent=developer"
         );
-        assert_eq!(r, "orchestrator:auto-dispatch workspace=alpha agent=developer");
 
         // After the sanitizer runs (whitespace → underscore) the on-disk
         // shape becomes a single parseable token — that's what the
@@ -1518,6 +1566,7 @@ statuses:
             dispatch_reason_with_agent("orchestrator:auto-dispatch workspace=alpha", "developer");
         shelbi_state::append_task_event(
             "demo",
+            "demo-task",
             "default",
             Column::todo(),
             Column::in_progress(),
@@ -1525,8 +1574,7 @@ statuses:
         )
         .unwrap();
 
-        let log =
-            std::fs::read_to_string(shelbi_state::events_log_path().unwrap()).unwrap();
+        let log = std::fs::read_to_string(shelbi_state::events_log_path().unwrap()).unwrap();
         assert!(
             log.contains(" reason=orchestrator:auto-dispatch_workspace=alpha_agent=developer "),
             "log: {log}",
@@ -1628,7 +1676,9 @@ statuses:
         crate::commands::test_support::provision_hub_repo_for_project(&home, "p");
 
         shelbi_state::save_task("p", &task_in(Column::in_progress(), "t"), "").unwrap();
-        let err = resume("p", "t", Some("ghost"), None).unwrap_err().to_string();
+        let err = resume("p", "t", Some("ghost"), None)
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("workspace `ghost` not declared"), "err: {err}");
 
         std::env::remove_var("SHELBI_HOME");

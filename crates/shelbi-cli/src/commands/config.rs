@@ -174,8 +174,7 @@ fn dump_keybindings(out: Option<PathBuf>, force: bool) -> Result<()> {
                     path.display()
                 );
             }
-            std::fs::write(&path, &yaml)
-                .with_context(|| format!("writing {}", path.display()))?
+            std::fs::write(&path, &yaml).with_context(|| format!("writing {}", path.display()))?
         }
         None => print!("{yaml}"),
     }
@@ -628,7 +627,10 @@ mod tests {
         let (errors, text) = run_check(None);
         assert_eq!(errors, 0, "reserved-chord rebind should not error: {text}");
         assert!(text.contains("warning:"), "expected warning: {text}");
-        assert!(text.contains("ctrl-c"), "warning should mention ctrl-c: {text}");
+        assert!(
+            text.contains("ctrl-c"),
+            "warning should mention ctrl-c: {text}"
+        );
         std::env::remove_var("SHELBI_HOME");
     }
 

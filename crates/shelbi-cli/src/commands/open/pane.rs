@@ -104,10 +104,10 @@ pub fn run(
     let has_agent_instructions = worktree
         .join(orch_workspace::WORKTREE_AGENT_INSTRUCTIONS_REL)
         .exists();
-    let codex_startup_prompt_rel = worktree
-        .join(orch_workspace::WORKTREE_CODEX_STARTUP_PROMPT_REL)
+    let startup_prompt_rel = worktree
+        .join(orch_workspace::WORKTREE_STARTUP_PROMPT_REL)
         .exists()
-        .then_some(orch_workspace::WORKTREE_CODEX_STARTUP_PROMPT_REL);
+        .then_some(orch_workspace::WORKTREE_STARTUP_PROMPT_REL);
     // Build the launch command through the shared constructor so this local
     // wrapper path and the remote dispatch path (`deploy_and_spawn`) apply the
     // same runner / permission-mode / startup-prompt logic and can't drift.
@@ -116,7 +116,7 @@ pub fn run(
         &project.workspace_permissions_mode,
         has_agent_instructions,
         resume,
-        codex_startup_prompt_rel,
+        startup_prompt_rel,
     );
 
     // `cd` falls back to $HOME if the worktree doesn't exist — that keeps
@@ -149,7 +149,9 @@ pub fn run(
     // children too); recording the signal lets us label the events.log
     // reason and skip the "press enter" prompt on a forced teardown.
     //
-    // The listener is installed BEFORE the child is spawned (F11): a
+    // The listener is installed BEFORE the child is spawned (Shelbi
+    // ContextStore docs/planning:reviews/adversarial-2026-07/cli-session-ux.md
+    // F11): a
     // signal arriving in the spawn window would otherwise hit the
     // wrapper's default disposition and kill it outright, orphaning a
     // half-started pane and dropping the lifecycle event. The child's
@@ -176,8 +178,8 @@ pub fn run(
     // Phase 7: also export `$PROJECT` and `$TASK_ID` so the Claude Code
     // SessionStart + Stop hooks can write to and tail the per-task
     // message log at `.shelbi/messages/$TASK_ID.log`.
-    let hub_sock = shelbi_state::hub_socket_path()
-        .map_err(|e| anyhow!("resolving hub socket path: {e}"))?;
+    let hub_sock =
+        shelbi_state::hub_socket_path().map_err(|e| anyhow!("resolving hub socket path: {e}"))?;
     let mut child = Command::new("sh")
         .arg("-c")
         .arg(&shell_cmd)
@@ -239,9 +241,12 @@ pub fn run(
         shelbi_state::consume_expected_teardown(&workspace.name).unwrap_or(false);
     if !intentional_teardown {
         // Best-effort: a failure here shouldn't keep the pane from closing.
-        if let Err(e) =
-            shelbi_state::append_workspace_pane_event(&project.name, &workspace.name, false, &reason)
-        {
+        if let Err(e) = shelbi_state::append_workspace_pane_event(
+            &project.name,
+            &workspace.name,
+            false,
+            &reason,
+        ) {
             eprintln!(
                 "shelbi: warning: couldn't write workspace pane-death event for `{}`: {e}",
                 workspace.name
@@ -261,9 +266,9 @@ pub fn run(
     // the supervisor sees no marker and at worst relaunches a pane that exited
     // cleanly, which the next expected-teardown on its own teardown corrects.
     if intentional_teardown || reason == "exit:0" {
-        if let Err(e) = shelbi_state::mark_expected_teardown(&shelbi_state::supervision_shutdown_key(
-            &workspace.name,
-        )) {
+        if let Err(e) = shelbi_state::mark_expected_teardown(
+            &shelbi_state::supervision_shutdown_key(&workspace.name),
+        ) {
             eprintln!(
                 "shelbi: warning: couldn't write supervision no-restart marker for `{}`: {e}",
                 workspace.name
@@ -298,7 +303,8 @@ pub fn run(
 /// returns.
 ///
 /// `child_pid_cell` is read at signal time rather than captured by value
-/// so this can be installed BEFORE the child is spawned (F11): the
+/// so this can be installed BEFORE the child is spawned (Shelbi ContextStore
+/// docs/planning:reviews/adversarial-2026-07/cli-session-ux.md F11): the
 /// caller stores the real PID into the cell the moment `spawn()`
 /// succeeds. A signal that arrives while the cell is still `0` (the
 /// pre-spawn window) is recorded but not forwarded here — the caller
@@ -418,7 +424,8 @@ fn kill_task_tail(worktree: &Path, task_id: &str) -> std::io::Result<()> {
         // recording `$!` and this cleanup running, the tail may have died
         // and its PID been recycled to an unrelated process. Signaling
         // that innocent process is the bug. Same principle as
-        // state-runtime F5's identity check — verify the PID still names
+        // Shelbi ContextStore docs/planning:reviews/adversarial-2026-07/state-runtime.md
+        // F5's identity check — verify the PID still names
         // *our* tail (a `tail` invocation referencing this task's message
         // log) before signaling. A recycled/unidentifiable PID is left
         // alone: leaking a stray tail is far less harmful than killing a
@@ -529,12 +536,14 @@ fn process_argv_blob(_pid: libc::pid_t) -> Option<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::commands::test_support::ENV_LOCK;
+    use crate::commands::test_support::{EnvGuard, ENV_LOCK};
     use shelbi_core::{
         AgentRunnerSpec, GitConfig, HeartbeatConfig, Machine, MachineKind, OrchestratorSpec,
         Project, WorkspaceSpec, ZenConfig,
     };
     use std::collections::BTreeMap;
+    use std::io::Read;
+    use std::os::fd::AsRawFd;
     use std::os::unix::process::ExitStatusExt;
     use std::path::{Path, PathBuf};
     use std::time::Duration;
@@ -614,6 +623,7 @@ mod tests {
         assert_eq!(signal_name(99), "99");
     }
 
+    /// Shelbi ContextStore docs/planning:reviews/adversarial-2026-07/cli-session-ux.md
     /// F11 acceptance: the signal listener is installed BEFORE the child
     /// is spawned, so a signal delivered in the spawn window is *captured*
     /// (not fatal to the wrapper) and forwarded to the child once its PID
@@ -730,6 +740,7 @@ mod tests {
         let runner = AgentRunnerSpec {
             command: "/bin/sh".into(),
             flags: vec!["-c".into(), "exit 0".into()],
+            prompt_injection: None,
             dialog_signatures: vec![],
         };
         let project = fixture_project("demo", machine.clone(), workspace.clone(), runner);
@@ -738,7 +749,11 @@ mod tests {
 
         let log = std::fs::read_to_string(shelbi_state::events_log_path().unwrap()).unwrap();
         let lines: Vec<&str> = log.lines().collect();
-        assert_eq!(lines.len(), 1, "expected exactly one event line, got: {log}");
+        assert_eq!(
+            lines.len(),
+            1,
+            "expected exactly one event line, got: {log}"
+        );
         let line = lines[0];
         assert!(line.contains(" workspace=alpha "), "line: {line}");
         assert!(line.contains(" pane_alive=false "), "line: {line}");
@@ -776,13 +791,11 @@ mod tests {
         // Runner writes the value the wrapper pinned into its env into a
         // file the test reads back below. `printenv VAR` exits 1 if the
         // var is absent, which would also show up in events.log.
-        let cmd = format!(
-            "printenv SHELBI_HUB_SOCK > {} ; exit 0",
-            env_out.display()
-        );
+        let cmd = format!("printenv SHELBI_HUB_SOCK > {} ; exit 0", env_out.display());
         let runner = AgentRunnerSpec {
             command: "/bin/sh".into(),
             flags: vec!["-c".into(), cmd],
+            prompt_injection: None,
             dialog_signatures: vec![],
         };
         let project = fixture_project("demo", machine.clone(), workspace.clone(), runner);
@@ -824,6 +837,7 @@ mod tests {
         let runner = AgentRunnerSpec {
             command: "/bin/sh".into(),
             flags: vec!["-c".into(), "exit 42".into()],
+            prompt_injection: None,
             dialog_signatures: vec![],
         };
         let project = fixture_project("demo", machine.clone(), workspace.clone(), runner);
@@ -878,6 +892,7 @@ mod tests {
             name: name.into(),
             repo: "git@example:repo.git".into(),
             default_branch: "main".into(),
+            default_workflow: None,
             config_mode: None,
             machines: vec![machine],
             orchestrator: OrchestratorSpec {
@@ -1005,7 +1020,8 @@ mod tests {
         let _ = std::fs::remove_dir_all(&worktree);
     }
 
-    /// PID-reuse guard (F11): if the recorded PID no longer names *our*
+    /// PID-reuse guard (Shelbi ContextStore
+    /// docs/planning:reviews/adversarial-2026-07/cli-session-ux.md F11): if the recorded PID no longer names *our*
     /// tail — because the tail died and its PID was recycled to an
     /// unrelated process — `kill_task_tail` must NOT signal it. Stand in
     /// for the recycled process with a bare `sleep` (argv doesn't look
@@ -1052,6 +1068,74 @@ mod tests {
         let _ = std::fs::remove_dir_all(&worktree);
     }
 
+    #[test]
+    fn background_message_tail_output_is_unread_until_drained() {
+        let worktree = fresh_test_home("tail-drain-regression");
+        let msgs = worktree.join(".shelbi").join("messages");
+        std::fs::create_dir_all(&msgs).unwrap();
+        let log = msgs.join("feat-x.log");
+        std::fs::write(&log, b"").unwrap();
+
+        let mut child = std::process::Command::new("tail")
+            .arg("-f")
+            .arg("-n")
+            .arg("0")
+            .arg(&log)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn tail");
+
+        let mut stdout = child.stdout.take().expect("tail stdout should be piped");
+        let fd = stdout.as_raw_fd();
+        let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+        assert!(flags >= 0, "F_GETFL failed");
+        let set = unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) };
+        assert_eq!(set, 0, "F_SETFL O_NONBLOCK failed");
+
+        let mut buf = [0u8; 256];
+        match stdout.read(&mut buf) {
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+            other => panic!("tail should have no output before append: {other:?}"),
+        }
+
+        std::thread::sleep(Duration::from_millis(100));
+        {
+            let mut f = std::fs::OpenOptions::new().append(true).open(&log).unwrap();
+            f.write_all(b"{\"msg_id\":\"m-1\",\"body\":\"wake\"}\n")
+                .unwrap();
+        }
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let mut drained = Vec::new();
+        while std::time::Instant::now() < deadline {
+            match stdout.read(&mut buf) {
+                Ok(0) => std::thread::sleep(Duration::from_millis(20)),
+                Ok(n) => {
+                    drained.extend_from_slice(&buf[..n]);
+                    if drained.ends_with(b"\n") {
+                        break;
+                    }
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+                Err(e) => panic!("read tail stdout: {e}"),
+            }
+        }
+
+        let drained = String::from_utf8_lossy(&drained);
+        assert!(
+            drained.contains("\"msg_id\":\"m-1\""),
+            "tail had unread output only once explicitly drained; got {drained:?}"
+        );
+
+        let _ = child.kill();
+        let _ = child.wait();
+        let _ = std::fs::remove_dir_all(&worktree);
+    }
+
     /// End-to-end: the agent subprocess sees `$PROJECT`, `$TASK_ID`,
     /// and `$SHELBI_HUB_SOCK` in its env. Stub runner dumps the three
     /// vars to a file we then assert on, so we exercise the actual
@@ -1059,12 +1143,15 @@ mod tests {
     #[test]
     fn run_exports_phase7_env_vars_to_agent_subprocess() {
         let _g = ENV_LOCK.lock().unwrap();
+        let env = EnvGuard::new(&["SHELBI_HOME", "TASK_ID", "PROJECT", "SHELBI_HUB_SOCK"]);
         let home = fresh_test_home("pane-env-exports");
-        std::env::set_var("SHELBI_HOME", &home);
+        env.set("SHELBI_HOME", &home);
+        env.remove("TASK_ID");
+        env.remove("PROJECT");
         // Honor explicit override — verifies the wrapper doesn't stomp
         // a remote-pane SHELBI_HUB_SOCK that was set by the SSH layer.
         let sock_override = home.join("custom-hub.sock");
-        std::env::set_var("SHELBI_HUB_SOCK", &sock_override);
+        env.set("SHELBI_HUB_SOCK", &sock_override);
 
         // Seed an in-progress task assigned to the workspace so the
         // wrapper's task lookup returns a non-empty TASK_ID.
@@ -1093,6 +1180,7 @@ mod tests {
                     dump_str
                 ),
             ],
+            prompt_injection: None,
             dialog_signatures: vec![],
         };
         let project = fixture_project("demo", machine.clone(), workspace.clone(), runner);
@@ -1110,8 +1198,6 @@ mod tests {
             "SHELBI_HUB_SOCK line: {body:?}",
         );
 
-        std::env::remove_var("SHELBI_HOME");
-        std::env::remove_var("SHELBI_HUB_SOCK");
         let _ = std::fs::remove_dir_all(&home);
     }
 
@@ -1168,7 +1254,7 @@ mod tests {
                      exit 0"
                 ),
             ],
-            dialog_signatures: vec![],
+            prompt_injection: None, dialog_signatures: vec![],
         };
         let project = fixture_project("demo", machine.clone(), workspace.clone(), runner);
 
@@ -1271,6 +1357,7 @@ mod tests {
         let runner = AgentRunnerSpec {
             command: "/bin/sh".into(),
             flags: vec!["-c".into(), mark_cmd],
+            prompt_injection: None,
             dialog_signatures: vec![],
         };
         let project = fixture_project("demo", machine.clone(), workspace.clone(), runner);
@@ -1339,6 +1426,7 @@ mod tests {
         let runner = AgentRunnerSpec {
             command: "/bin/sh".into(),
             flags: vec!["-c".into(), stale_plant],
+            prompt_injection: None,
             dialog_signatures: vec![],
         };
         let project = fixture_project("demo", machine.clone(), workspace.clone(), runner);
@@ -1395,6 +1483,7 @@ mod tests {
         let runner = AgentRunnerSpec {
             command: "/bin/sh".into(),
             flags: vec!["-c".into(), "exit 0".into()],
+            prompt_injection: None,
             dialog_signatures: vec![],
         };
         let project = fixture_project("demo", machine.clone(), workspace.clone(), runner);
@@ -1424,17 +1513,18 @@ mod tests {
     #[test]
     fn run_prefers_inherited_task_id_over_state_lookup() {
         let _g = ENV_LOCK.lock().unwrap();
+        let env = EnvGuard::new(&["SHELBI_HOME", "TASK_ID", "PROJECT", "SHELBI_HUB_SOCK"]);
         let home = fresh_test_home("pane-inherited-task-id");
-        std::env::set_var("SHELBI_HOME", &home);
+        env.set("SHELBI_HOME", &home);
         // No task in state → the state-lookup fallback would resolve
         // TASK_ID="". The tmux -e injection is simulated by setting
         // TASK_ID directly in the process env before `run()`.
-        std::env::set_var("TASK_ID", "feat-race");
+        env.set("TASK_ID", "feat-race");
         // Same override treatment for PROJECT / SHELBI_HUB_SOCK, since
         // the wrapper pins all three on the child.
-        std::env::set_var("PROJECT", "demo");
+        env.set("PROJECT", "demo");
         let sock_override = home.join("custom-hub.sock");
-        std::env::set_var("SHELBI_HUB_SOCK", &sock_override);
+        env.set("SHELBI_HUB_SOCK", &sock_override);
 
         let dump_path = home.join("agent-env.dump");
         let dump_str = dump_path.to_string_lossy().into_owned();
@@ -1455,6 +1545,7 @@ mod tests {
                     dump_str
                 ),
             ],
+            prompt_injection: None,
             dialog_signatures: vec![],
         };
         let project = fixture_project("demo", machine.clone(), workspace.clone(), runner);
@@ -1463,12 +1554,11 @@ mod tests {
 
         let body = std::fs::read_to_string(&dump_path).unwrap();
         let lines: Vec<&str> = body.lines().collect();
-        assert_eq!(lines[1], "feat-race", "inherited TASK_ID must win: {body:?}");
+        assert_eq!(
+            lines[1], "feat-race",
+            "inherited TASK_ID must win: {body:?}"
+        );
 
-        std::env::remove_var("SHELBI_HOME");
-        std::env::remove_var("TASK_ID");
-        std::env::remove_var("PROJECT");
-        std::env::remove_var("SHELBI_HUB_SOCK");
         let _ = std::fs::remove_dir_all(&home);
     }
 }
