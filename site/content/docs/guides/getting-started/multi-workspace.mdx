@@ -22,19 +22,22 @@ shelbi workspace list
 ```
 
 ```
-NAME      HOST      MODEL    AGENT      STATE
-alpha     hub                          idle
-bravo     hub                          idle
-charlie   hub                          idle
-delta     devbox                       idle
-echo      devbox                       idle
-foxtrot   devbox                       idle
+NAME      HOST      RUNNER   AGENT      STATE
+alpha     hub       claude   -          idle
+bravo     hub       claude   -          idle
+charlie   hub       claude   -          idle
+delta     devbox    codex    -          idle
+echo      devbox    claude   -          idle
+foxtrot   devbox    codex    -          idle
 ```
 
-Every row should show `idle` under `STATE`, with empty `MODEL`/`AGENT`.
-Nothing is loaded yet. If a pane is dead, jump to the workspace (`Enter`
-on its sidebar row): the session may have stalled on a permission dialog,
-and resolving it puts the workspace back in the rotation.
+Every row should show `idle` under `STATE` and `-` under `AGENT`.
+The `RUNNER` column is the configured `workspaces[].runner` value, so it
+is where you confirm whether each slot will launch Claude, Codex, or
+another declared runner. Nothing is loaded yet. If a pane is dead, jump
+to the workspace (`Enter` on its sidebar row): the session may have
+stalled on a permission dialog, and resolving it puts the workspace back
+in the rotation.
 
 You want at least three free slots to see the loop do its job. Two cards
 on a one-slot pool is a queue, not a loop.
