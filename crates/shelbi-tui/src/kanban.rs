@@ -1291,8 +1291,7 @@ impl KanbanApp {
                     from,
                     to,
                     "user:tui",
-                )
-                {
+                ) {
                     tracing::warn!(task = %id, error = %e, "append_task_event failed");
                 }
             }
