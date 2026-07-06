@@ -202,7 +202,11 @@ so customizing it is the same as customizing any other agent. Edit a file:
   [global mode](/docs/concepts/config-modes) or `<repo>/.shelbi/` in
   in-repo mode. This is the orchestrator's system prompt; Shelbi seeds
   it with the shipped default on first load and never clobbers your
-  edits on upgrade. Or run `shelbi agent edit orchestrator`.
+  edits on upgrade. On `shelbi reload`, Shelbi may append missing
+  runner-critical sections from the shipped default, such as
+  `Polling-only event drain`, so customized Codex orchestrators still
+  receive required polling contracts without losing local changes. Or
+  run `shelbi agent edit orchestrator`.
 - **Project-wide context:** put anything that should apply to *every* agent
   (repo layout, house style, the test command) in
   `<config-root>/agents/_shared/preamble.md`. It's prepended to
@@ -216,6 +220,11 @@ The composed output (preamble + instructions) is rewritten to the launch
 directory's `.claude/agent-instructions.md` on every `ensure_dashboard`
 call, so your edits take effect the next time the dashboard is
 bootstrapped (or `shelbi reload`d).
+
+`shelbi reload` runs the agent self-heal before respawning the orchestrator
+pane. If your customized `agents/orchestrator/instructions.md` is missing a
+required shipped section, reload appends only that section and reports the
+repair in its output; the rest of your prompt is preserved.
 
 ### Prompt artifact
 
@@ -233,6 +242,10 @@ A few things worth keeping when you fork the default prompt:
 
 - The bootstrap flow. The orchestrator needs the initial `task list` /
   `workspace list` snapshot and the tail process to do its job.
+- The polling-only event drain. Codex-backed and other polling-only runners
+  must drain pending project events before each user-facing reply, using
+  `shelbi orchestrator events drain --cursor "$CURSOR"` or the documented
+  cursor-based `events.log` fallback if that CLI primitive is unavailable.
 - The **category-based** reaction-rule matching. Patterns key off
   `to_category=<c>` (`ready`, `handoff`) rather than the literal status
   pair, so the rules survive workflow customization. Hardcoding default-

@@ -4401,6 +4401,7 @@ mod tests {
             git: base_branch.map(|b| shelbi_core::GitConfig {
                 base_branch: Some(b.into()),
                 merge_strategy: shelbi_core::MergeStrategy::Squash,
+                ..Default::default()
             }),
             zen: None,
         }

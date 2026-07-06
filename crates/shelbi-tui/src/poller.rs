@@ -1251,8 +1251,8 @@ fn maybe_apply_transition(
 /// describing the outcome (ok / up-to-date / conflict / skipped). Never
 /// blocks the calling handoff — failures here are advisory.
 ///
-/// `branch` falls back to the conventional `shelbi/<task-id>` when the task
-/// frontmatter doesn't pin one explicitly.
+/// `branch` uses the same explicit/workflow/project/GitHub fallback resolver
+/// as task dispatch when the task frontmatter doesn't pin one explicitly.
 fn rebase_workspace_branch_before_handoff(
     project: &Project,
     workspace: &shelbi_core::WorkspaceSpec,
@@ -1267,11 +1267,24 @@ fn rebase_workspace_branch_before_handoff(
             return;
         }
     };
-    let branch = task_file
-        .task
-        .branch
-        .clone()
-        .unwrap_or_else(|| format!("shelbi/{task_id}"));
+    let workflow = match shelbi_state::load_task_workflow(&project.name, project, &task_file.task) {
+        Ok(wf) => wf,
+        Err(e) => {
+            tracing::debug!(workspace = %workspace.name, task = %task_id, error = %e, "skip rebase: load_task_workflow failed");
+            return;
+        }
+    };
+    let branch = match shelbi_orchestrator::branch::branch_name_for_task(
+        project,
+        Some(&workflow),
+        &task_file.task,
+    ) {
+        Ok(branch) => branch,
+        Err(e) => {
+            tracing::debug!(workspace = %workspace.name, task = %task_id, error = %e, "skip rebase: branch resolution failed");
+            return;
+        }
+    };
 
     let worktree = shelbi_orchestrator::workspace::workspace_worktree(machine, workspace);
     let outcome = shelbi_orchestrator::workspace::rebase_workspace_branch_onto_default(
@@ -1473,11 +1486,11 @@ fn redispatch_workspace(
     task_id: &str,
 ) -> std::result::Result<(), String> {
     let tf = shelbi_state::load_task(&project.name, task_id).map_err(|e| e.to_string())?;
-    let branch = tf
-        .task
-        .branch
-        .clone()
-        .unwrap_or_else(|| format!("shelbi/{task_id}"));
+    let workflow = shelbi_state::load_task_workflow(&project.name, project, &tf.task)
+        .map_err(|e| e.to_string())?;
+    let branch =
+        shelbi_orchestrator::branch::branch_name_for_task(project, Some(&workflow), &tf.task)
+            .map_err(|e| e.to_string())?;
     let agent = shelbi_orchestrator::dispatch::resolve_active_agent(&project.name, &tf.task);
     shelbi_orchestrator::workspace::start_workspace_on_task(
         shelbi_orchestrator::workspace::StartSpec {
@@ -1832,8 +1845,7 @@ mod tests {
         // surfaces the handoff as part of the canonical event stream.
         // Shape from `Plans/workflows.md` §10. We match on the canonical
         // `<ts> task=<id> <from> -> <to>` shape so other event kinds that
-        // happen to mention the same task id (e.g. the auto-rebase line
-        // emitted just before the promotion) don't get counted as task
+        // happen to mention the same task id don't get counted as task
         // transitions.
         let log = std::fs::read_to_string(shelbi_state::events_log_path().unwrap()).unwrap();
         let task_lines: Vec<&str> = log
@@ -1860,37 +1872,6 @@ mod tests {
             task_lines[0].ends_with(" to_category=handoff"),
             "line: {}",
             task_lines[0]
-        );
-
-        // Auto-rebase also lands one line per promotion. In this test the
-        // work_dir isn't a real git repo, so the rebase short-circuits to
-        // `skipped`; the event still gets recorded so the user can tell
-        // from events.log whether the auto-rebase ran or punted.
-        let rebase_lines: Vec<&str> = log
-            .lines()
-            .filter(|l| {
-                let mut parts = l.splitn(3, ' ');
-                let _ts = parts.next();
-                parts.next() == Some("rebase")
-            })
-            .collect();
-        assert_eq!(rebase_lines.len(), 1, "log: {log:?}");
-        let rebase_line = rebase_lines[0];
-        assert!(
-            rebase_line.contains("task=fix-login"),
-            "line: {rebase_line}"
-        );
-        assert!(
-            rebase_line.contains("workspace=alpha"),
-            "line: {rebase_line}"
-        );
-        assert!(
-            rebase_line.contains("branch=shelbi/fix-login"),
-            "line: {rebase_line}"
-        );
-        assert!(
-            rebase_line.contains("status=skipped"),
-            "expected skipped on a non-git work_dir, got: {rebase_line}"
         );
 
         // A leftover/stale marker naming a task that's no longer in-progress

@@ -38,15 +38,22 @@ pub fn run(project_opt: Option<String>) -> Result<()> {
     // --root at a fresh path), this puts the layout back; if the root is
     // unwritable, it hard-fails with a source-tagged error.
     shelbi_state::ensure_root_subdirs().map_err(|e| anyhow!(e))?;
-    // Touching `load_project` runs the `workflows/statuses.yaml` +
-    // `workflows/default.yaml` materialization migration as a side
-    // effect. The pane respawn below already triggers `load_project`
-    // indirectly, but doing it here makes the contract explicit:
-    // `shelbi reload` always leaves both files on disk.
-    let _ = shelbi_state::load_project(&project_name);
+    // Explicit compatibility materialization for projects created before
+    // workflows/statuses.yaml and workflows/default.yaml were split out.
+    // Ordinary project loads stay read-only with respect to default.yaml,
+    // but `shelbi reload` remains the user-facing repair path.
+    let workflow_path =
+        shelbi_state::default_workflow_path(&project_name).map_err(|e| anyhow!(e))?;
+    if !workflow_path.exists() {
+        shelbi_state::scaffold_project_workflow(&project_name).map_err(|e| anyhow!(e))?;
+    }
+    let statuses_path = shelbi_state::statuses_path(&project_name).map_err(|e| anyhow!(e))?;
+    if !statuses_path.exists() {
+        shelbi_state::scaffold_project_statuses(&project_name).map_err(|e| anyhow!(e))?;
+    }
+    let outcomes = shelbi_state::self_heal_default_agents(&project_name).map_err(|e| anyhow!(e))?;
     let report = shelbi_orchestrator::reload(&project_name).map_err(|e| anyhow!(e))?;
     print_report(&project_name, &report);
-    let outcomes = shelbi_state::self_heal_default_agents(&project_name).map_err(|e| anyhow!(e))?;
     for outcome in outcomes {
         print_agent_materialize_outcome(&outcome);
     }

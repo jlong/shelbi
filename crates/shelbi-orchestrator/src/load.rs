@@ -16,6 +16,7 @@ use std::collections::{BTreeSet, HashSet};
 
 use shelbi_core::{Column, Error, Result};
 
+use crate::branch;
 use crate::workspace::{start_workspace_on_task, StartSpec};
 
 /// Load `task_id` onto a free workspace whose effective tags satisfy the
@@ -78,11 +79,7 @@ pub fn load_task_by_id(project_name: &str, task_id: &str) -> Result<String> {
         })?;
     let ws = (*chosen).clone();
 
-    let branch = tf
-        .task
-        .branch
-        .clone()
-        .unwrap_or_else(|| format!("shelbi/{task_id}"));
+    let branch = branch::branch_name_for_task(&project, Some(&workflow), &tf.task)?;
 
     // Persist the assignment before dispatch so a concurrent load can't pick
     // the same slot, and roll it back on a dispatch failure.

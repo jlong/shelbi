@@ -74,7 +74,7 @@ workspaces:
 | `workspace_poll_interval_secs` | integer | no | `5` | How often the hub poller samples each workspace pane for state changes. |
 | `workspace_permissions_mode` | string | no | `auto` | Permissions posture rendered into the workspace settings template (`auto` → claude's `acceptEdits`). |
 | `heartbeat` | [Heartbeat](#heartbeat) | no | `3m` / `60m` | Adaptive hub heartbeat written to `events.log` so the orchestrator's watch fires on a quiet board. Holds at `interval` while work is in flight, backs off toward `max` when quiescent. |
-| `git` | [Git](#git) | no | all defaults | Base branch and merge strategy for `shelbi merge` and Zen's auto-merge. |
+| `git` | [Git](#git) | no | all defaults | Base branch, generated task branch prefix, and merge strategy for `shelbi merge` and Zen's auto-merge. |
 
 ## machines
 
@@ -286,19 +286,25 @@ heartbeat:
 
 ## git
 
-Where workspace branches are based and how they integrate back. See
-[the merge command](/docs/cli/merge).
+Where workspace branches are based, how generated task branches are named,
+and how they integrate back. See [the merge command](/docs/cli/merge).
 
 | Field | Type | Required | Default | Description |
 | --- | --- | --- | --- | --- |
 | `base_branch` | string | no | `default_branch` | Branch new work is based on and merged into. Falls back to the project's `default_branch`. |
+| `branch_prefix` | string | no | GitHub username, then `user` | Prefix for generated task branches when a task omits `branch:` and its workflow does not override the prefix. Shelbi cuts `<branch_prefix>/<task-id>`. |
 | `merge_strategy` | `squash` \| `merge` \| `rebase` | no | `squash` | How `shelbi merge` and Zen's auto-merge integrate a workspace branch. Maps 1:1 onto `gh pr merge --{squash,merge,rebase}`. |
 
 ```yaml
 git:
   base_branch: develop
+  branch_prefix: jlong
   merge_strategy: rebase
 ```
+
+`branch_prefix` accepts the same safe branch characters Shelbi allows for
+generated refs: ASCII letters, numbers, `-`, `_`, and `/`. It must not end
+with `/`. An explicit task `branch:` still wins over every prefix setting.
 
 ## See also
 

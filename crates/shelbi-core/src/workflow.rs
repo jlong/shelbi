@@ -45,7 +45,7 @@ use std::time::Duration;
 use serde::{Deserialize, Deserializer, Serialize};
 
 use crate::placeholders::substitute_placeholders;
-use crate::{Error, GitConfig, ZenChecks, ZenDangerPaths};
+use crate::{validate_branch_prefix, Error, GitConfig, ZenChecks, ZenDangerPaths};
 
 // ---------------------------------------------------------------------------
 // Workflow
@@ -338,6 +338,19 @@ impl Workflow {
             }
         }
 
+        if let Some(git) = &self.git {
+            if let Some(prefix) = &git.branch_prefix {
+                if !prefix.contains("{{") {
+                    validate_branch_prefix(prefix).map_err(|e| {
+                        workflow_err(format!(
+                            "workflow `{}`: git.branch_prefix `{}` is invalid: {e}",
+                            self.name, prefix
+                        ))
+                    })?;
+                }
+            }
+        }
+
         Ok(())
     }
 
@@ -435,6 +448,10 @@ impl Workflow {
             .base_branch
             .as_ref()
             .map(|s| substitute_placeholders(s, params, &mut missing));
+        let branch_prefix = git
+            .branch_prefix
+            .as_ref()
+            .map(|s| substitute_placeholders(s, params, &mut missing));
         if !missing.is_empty() {
             return Err(Error::MissingTaskParams {
                 workflow: self.name.clone(),
@@ -443,6 +460,7 @@ impl Workflow {
         }
         Ok(Some(GitConfig {
             base_branch,
+            branch_prefix,
             merge_strategy: git.merge_strategy,
         }))
     }
@@ -2140,10 +2158,12 @@ statuses:
   - { name: Todo, category: ready, owner: agent, agent: orchestrator }
 git:
   base_branch: feature/{{feature}}
+  branch_prefix: app/{{team}}
 "#;
         let wf = Workflow::from_yaml_str(yaml).expect("parse");
         let git = wf.git.expect("git block parsed");
         assert_eq!(git.base_branch.as_deref(), Some("feature/{{feature}}"));
+        assert_eq!(git.branch_prefix.as_deref(), Some("app/{{team}}"));
     }
 
     #[test]
@@ -2174,17 +2194,19 @@ statuses:
   - { name: Todo, category: ready, owner: agent, agent: orchestrator }
 git:
   base_branch: feature/{{feature}}
+  branch_prefix: app/{{team}}
   merge_strategy: merge
 "#;
         let wf = Workflow::from_yaml_str(yaml).unwrap();
         let resolved = wf
-            .resolve_git(&params(&[("feature", "auth-rewrite")]))
+            .resolve_git(&params(&[("feature", "auth-rewrite"), ("team", "web")]))
             .unwrap()
             .expect("git block present");
         assert_eq!(
             resolved.base_branch.as_deref(),
             Some("feature/auth-rewrite")
         );
+        assert_eq!(resolved.branch_prefix.as_deref(), Some("app/web"));
         assert_eq!(resolved.merge_strategy, MergeStrategy::Merge);
     }
 
@@ -2227,12 +2249,13 @@ statuses:
   - { name: Todo, category: ready, owner: agent, agent: orchestrator }
 git:
   base_branch: feature/{{feature}}-{{region}}
+  branch_prefix: app/{{team}}
 "#;
         let wf = Workflow::from_yaml_str(yaml).unwrap();
         let err = wf.resolve_git(&params(&[("feature", "auth")])).unwrap_err();
         match err {
             Error::MissingTaskParams { params, .. } => {
-                assert_eq!(params, vec!["region".to_string()]);
+                assert_eq!(params, vec!["region".to_string(), "team".to_string()]);
             }
             other => panic!("expected MissingTaskParams, got {other:?}"),
         }
@@ -2248,11 +2271,13 @@ statuses:
   - { name: Todo, category: ready, owner: agent, agent: orchestrator }
 git:
   base_branch: main
+  branch_prefix: releases
   merge_strategy: squash
 "#;
         let wf = Workflow::from_yaml_str(yaml).unwrap();
         let resolved = wf.resolve_git(&params(&[])).unwrap().unwrap();
         assert_eq!(resolved.base_branch.as_deref(), Some("main"));
+        assert_eq!(resolved.branch_prefix.as_deref(), Some("releases"));
         assert_eq!(resolved.merge_strategy, MergeStrategy::Squash);
     }
 
@@ -2341,6 +2366,7 @@ statuses:
   - { id: todo, name: Todo, category: ready, owner: agent, agent: orchestrator }
 git:
   base_branch: feature/{{feature}}
+  branch_prefix: app
   merge_strategy: merge
 "#;
         let wf = Workflow::from_yaml_str(yaml).unwrap();
