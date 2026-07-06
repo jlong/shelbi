@@ -4533,6 +4533,46 @@ agent_runners:
     }
 
     #[test]
+    fn legacy_assistant_name_field_is_ignored_without_reemitting() {
+        // The old configurable assistant/orchestrator display-name field was
+        // removed from the schema. Existing configs that still carry it must
+        // keep loading, but new serialized configs must not expose it.
+        let global = r#"
+name: p
+assistant_name: Legacy Shelbi
+repo: /tmp/p
+machines:
+  - { name: hub, kind: local, work_dir: /tmp/p }
+orchestrator: { runner: claude }
+agent_runners:
+  claude: { command: claude, flags: [] }
+"#;
+        let parsed = Project::from_yaml_str(global).unwrap();
+        assert!(!serde_yaml::to_string(&parsed)
+            .unwrap()
+            .contains("assistant_name"));
+
+        let shared = r#"
+name: p
+assistant_name: Legacy Shelbi
+default_branch: main
+orchestrator: { runner: claude }
+agent_runners:
+  claude: { command: claude, flags: [] }
+"#;
+        let local = r#"
+repo: /tmp/p
+machines:
+  - { name: hub, kind: local, work_dir: /tmp/p }
+"#;
+        let parsed = Project::from_split_yaml_str(shared, local).unwrap();
+        assert!(!parsed
+            .to_shared_yaml_string()
+            .unwrap()
+            .contains("assistant_name"));
+    }
+
+    #[test]
     fn split_yaml_rejects_user_local_field_in_shared_file() {
         // A shared YAML that includes `machines:` (a user-local field)
         // must produce a targeted error pointing at the correct file —

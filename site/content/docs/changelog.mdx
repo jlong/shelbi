@@ -46,12 +46,10 @@ you can turn. No need to hunt the reference to discover a setting exists. At the
 same time every config file standardizes on the `.yaml` extension; existing
 `.yml` files are migrated automatically on first load.
 
-**Orchestrator naming removed.** The onboarding wizard no longer asks you
-to name your assistant, and the `assistant_name` config field is gone. The
-orchestrator prompt now reads *"You are the Orchestrator"* statically.
-There's no `{{assistant_name}}` substitution at render time. The wizard's
-sole phase is project setup, and `~/.shelbi/shelbi.yaml` is now just the
-per-project `last_launched` index.
+**Wizard simplified.** The onboarding wizard's sole phase is project setup.
+The orchestrator prompt now reads *"You are the Orchestrator"* statically,
+with no legacy name placeholder substitution at render time.
+`~/.shelbi/shelbi.yaml` is now just the per-project `last_launched` index.
 
 ### July 2, 2026
 
