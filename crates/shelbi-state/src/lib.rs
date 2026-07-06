@@ -73,8 +73,8 @@ pub use user_config::{
 };
 pub use workflows::{
     list_workflows, load_project_statuses, load_task_workflow, load_workflow,
-    resolve_task_workflow_name, save_project_statuses, scaffold_project_statuses, statuses_path,
-    workflow_path, workflows_dir,
+    resolve_task_workflow_name, save_project_statuses, scaffold_project_statuses,
+    scaffold_project_workflow, statuses_path, workflow_path, workflows_dir,
 };
 pub use workspace_status::{
     append_clarification_event, append_dispatch_event, append_external_event,
@@ -245,42 +245,16 @@ fn migrate_workspace_settings_template(project_dir: &Path) {
     }
 }
 
-/// One-shot migration: write `workflows/default.yaml` into the project's
-/// workflows directory if it's missing. Serializes the canonical
-/// [`default_workflow`] from `shelbi-core` so existing projects pick up
-/// an editable copy on their next load without forcing a manual step.
-///
-/// Idempotent — already-present files are left untouched (the user may
-/// have edited them). Best-effort — any IO or serialization error is
-/// swallowed so a permissions hiccup or full disk doesn't break opening
-/// the project; the loader's in-memory fallback covers the file-missing
-/// case until the next successful run.
-///
-/// Companion to [`migrate_default_statuses`] — the on-disk form is the
-/// post-split reference-only shape (id + owner + optional agent), with
-/// status identity (id, name, category) living in `statuses.yaml`.
-fn migrate_default_workflow(project_dir: &Path) {
-    let path = project_dir.join("workflows").join("default.yaml");
-    if path.exists() {
-        return;
-    }
-    let Ok(yaml) = shelbi_core::scaffold::default_workflow_yaml() else {
-        return;
-    };
-    let _ = atomic_write(&path, yaml.as_bytes());
-}
-
 /// One-shot migration companion: write `workflows/statuses.yaml` if
 /// missing. The file is the project-wide source of truth for status
 /// identity (id, name, category, ordering); workflow YAMLs reference
 /// ids declared here and add per-workflow owner/agent.
 ///
 /// Idempotent and best-effort, same semantics as
-/// [`migrate_default_workflow`]. The workflow loader requires
+/// [`scaffold_project_workflow`]. The workflow loader requires
 /// `statuses.yaml` to be present whenever workflow files exist — this
-/// helper is what `shelbi init` / `shelbi reload` (via `load_project`)
-/// call to satisfy that contract for existing projects that pre-date
-/// the file.
+/// helper is what `shelbi init` / `shelbi reload` call to satisfy that
+/// contract for existing projects that pre-date the file.
 fn migrate_default_statuses(project_dir: &Path) {
     let path = project_dir.join("workflows").join("statuses.yaml");
     if path.exists() {
@@ -431,9 +405,7 @@ pub fn tasks_dir(project: &str) -> Result<PathBuf> {
     Ok(project_dir(project)?.join("tasks"))
 }
 
-/// Path to a project's default workflow YAML
-/// (`<workflows_dir>/default.yaml`). Auto-created on first load when
-/// missing — see [`migrate_default_workflow`].
+/// Path to a project's default workflow YAML (`<workflows_dir>/default.yaml`).
 pub fn default_workflow_path(project: &str) -> Result<PathBuf> {
     Ok(workflows_dir(project)?.join("default.yaml"))
 }
@@ -587,20 +559,17 @@ pub fn load_project(project: &str) -> Result<Project> {
     let repo = p.repo.clone();
     p.detect_shapes(repo);
     // Best-effort, on first load: rename a legacy `workflows/statuses.yml`
-    // to the canonical `.yaml`, then drop workflows/default.yaml and
-    // workflows/statuses.yaml into the project directory. All idempotent —
-    // see migrate_statuses_extension / migrate_default_workflow /
-    // migrate_default_statuses. The rename runs first so a converted file
-    // short-circuits the default materialization. After this runs, the
-    // workflow loader's "statuses.yaml must exist" contract holds for any
-    // subsequent open of this project.
+    // to the canonical `.yaml`, then drop workflows/statuses.yaml into the
+    // project directory. Idempotent — see migrate_statuses_extension /
+    // migrate_default_statuses. `workflows/default.yaml` is materialized only
+    // by explicit init/reload paths so a project can intentionally remove it
+    // after switching `default_workflow:` to another workflow.
     // Materialize the workflow/statuses defaults under the project's
     // *config* root — `<repo>/.shelbi/` for in-repo projects, the global
     // per-project dir otherwise — so an in-repo project's committed config
     // picks them up rather than stranding them in the global state dir.
     if let Ok(dir) = <Project as ProjectPaths>::config_root(&p) {
         migrate_statuses_extension(&dir);
-        migrate_default_workflow(&dir);
         migrate_default_statuses(&dir);
     }
     if let Some(name) = &p.default_workflow {
@@ -2225,7 +2194,7 @@ pub(crate) fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use shelbi_core::{default_project_statuses, default_workflow};
+    use shelbi_core::default_project_statuses;
 
     fn fixture_project(name: &str, override_template: Option<PathBuf>) -> shelbi_core::Project {
         use shelbi_core::*;
@@ -4080,31 +4049,7 @@ mod tests {
         std::env::remove_var("SHELBI_HOME");
     }
 
-    // ---- workflows/default.yaml migration --------------------------------
-
-    #[test]
-    fn migrate_default_workflow_writes_yaml_when_directory_missing() {
-        let _g = TEST_LOCK.lock().unwrap();
-        let home = fresh_home();
-        std::env::set_var("SHELBI_HOME", &home);
-        let dir = home.join("projects/myapp");
-        migrate_default_workflow(&dir);
-        migrate_default_statuses(&dir);
-        let path = dir.join("workflows/default.yaml");
-        assert!(path.exists(), "default.yaml should be created");
-        // The on-disk form is post-migration (id + owner + agent only).
-        // Resolve it against the freshly written statuses.yaml before
-        // comparing to the canonical default.
-        let text = std::fs::read_to_string(&path).unwrap();
-        let st_text = std::fs::read_to_string(dir.join("workflows/statuses.yaml")).unwrap();
-        let statuses = shelbi_core::ProjectStatuses::from_yaml_str(&st_text).unwrap();
-        let parsed = shelbi_core::Workflow::from_yaml_str(&text)
-            .expect("created default.yaml should round-trip through the workflow parser")
-            .resolve_against(&statuses)
-            .expect("resolved workflow validates against statuses.yaml");
-        assert_eq!(parsed, default_workflow());
-        std::env::remove_var("SHELBI_HOME");
-    }
+    // ---- workflows/default.yaml scaffold ---------------------------------
 
     #[test]
     fn migrate_default_statuses_writes_yaml_when_directory_missing() {
@@ -4224,22 +4169,7 @@ mod tests {
     }
 
     #[test]
-    fn migrate_default_workflow_is_noop_when_file_already_exists() {
-        let _g = TEST_LOCK.lock().unwrap();
-        let home = fresh_home();
-        std::env::set_var("SHELBI_HOME", &home);
-        let dir = home.join("projects/myapp");
-        let path = dir.join("workflows/default.yaml");
-        ensure_dir(path.parent().unwrap()).unwrap();
-        // A user-edited file we must not stomp on.
-        std::fs::write(&path, "name: custom\n").unwrap();
-        migrate_default_workflow(&dir);
-        assert_eq!(std::fs::read_to_string(&path).unwrap(), "name: custom\n");
-        std::env::remove_var("SHELBI_HOME");
-    }
-
-    #[test]
-    fn load_project_auto_creates_default_workflow_on_first_load() {
+    fn scaffold_project_workflow_creates_default_workflow() {
         let _g = TEST_LOCK.lock().unwrap();
         let home = fresh_home();
         std::env::set_var("SHELBI_HOME", &home);
@@ -4250,17 +4180,47 @@ mod tests {
             !workflow_path.exists(),
             "precondition: workflow file absent"
         );
-        let loaded = load_project("myapp").unwrap();
-        assert_eq!(loaded.name, "myapp");
+        scaffold_project_workflow("myapp").unwrap();
         assert!(
             workflow_path.exists(),
-            "load_project should auto-create workflows/default.yaml"
+            "scaffold_project_workflow should create workflows/default.yaml"
         );
-        // Second load is a no-op — content unchanged.
+        // The scaffold is stable when repeated.
         let first_bytes = std::fs::read(&workflow_path).unwrap();
-        let _ = load_project("myapp").unwrap();
+        scaffold_project_workflow("myapp").unwrap();
         let second_bytes = std::fs::read(&workflow_path).unwrap();
         assert_eq!(first_bytes, second_bytes);
+        std::env::remove_var("SHELBI_HOME");
+    }
+
+    #[test]
+    fn load_project_does_not_recreate_default_workflow_for_non_default_project() {
+        let _g = TEST_LOCK.lock().unwrap();
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+        let mut p = fixture_project("myapp", None);
+        p.default_workflow = Some("app".into());
+        save_project(&p).unwrap();
+
+        scaffold_project_statuses("myapp").unwrap();
+        let app_path = workflow_path("myapp", "app").unwrap();
+        let app_yaml = shelbi_core::scaffold::default_workflow_yaml()
+            .unwrap()
+            .replacen("name: default", "name: app", 1);
+        atomic_write(&app_path, app_yaml.as_bytes()).unwrap();
+
+        let default_path = default_workflow_path("myapp").unwrap();
+        assert!(
+            !default_path.exists(),
+            "precondition: default workflow file absent"
+        );
+
+        let loaded = load_project("myapp").unwrap();
+        assert_eq!(loaded.default_workflow_name(), "app");
+        assert!(
+            !default_path.exists(),
+            "load_project should not recreate workflows/default.yaml"
+        );
         std::env::remove_var("SHELBI_HOME");
     }
 
