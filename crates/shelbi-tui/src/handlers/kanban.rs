@@ -163,16 +163,12 @@ pub fn handle_kanban_mouse(app: &mut KanbanApp, mouse: MouseEvent) {
             app.open_workspace_dropdown();
             return;
         }
-        // Card hits take precedence over header hits: a clicked card
-        // sits inside the column's body band, never inside the header
-        // band, so the two regions are disjoint — but checking cards
-        // first keeps the routing obvious if that ever drifts.
-        if let Some((col, row)) = app.card_at(mouse.column, mouse.row) {
-            app.open_popover_at(col, row);
-            return;
-        }
         if let Some(col_idx) = app.header_at(mouse.column, mouse.row) {
             app.toggle_column(col_idx);
+            return;
+        }
+        if let Some((col, row)) = app.card_at(mouse.column, mouse.row) {
+            app.open_popover_at(col, row);
         }
     }
 }
@@ -224,10 +220,13 @@ pub fn handle_workflow_dropdown_key(app: &mut KanbanApp, code: KeyCode) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::kanban::TaskPopover;
+    use crate::kanban::{CardHit, HeaderHit, TaskPopover};
     use crate::test_support::ENV_LOCK;
     use crossterm::event::KeyModifiers;
+    use ratatui::layout::Rect;
+    use shelbi_core::Column;
     use shelbi_state::keymap::load_keymaps;
+    use shelbi_state::TaskFile;
 
     /// Load a default `Keymaps` from a temp `$SHELBI_HOME` so a stray
     /// real `~/.shelbi/keys.yaml` can't pollute the test. Caller holds
@@ -253,6 +252,126 @@ mod tests {
 
     fn key_with(code: KeyCode, mods: KeyModifiers) -> KeyEvent {
         KeyEvent::new(code, mods)
+    }
+
+    fn left_click(column: u16, row: u16) -> MouseEvent {
+        MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column,
+            row,
+            modifiers: KeyModifiers::NONE,
+        }
+    }
+
+    fn task_file(id: &str, column: Column) -> TaskFile {
+        let now = chrono::DateTime::parse_from_rfc3339("2026-06-20T10:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        TaskFile {
+            task: shelbi_core::Task {
+                id: id.to_string(),
+                title: id.to_string(),
+                column,
+                priority: 0,
+                assigned_to: None,
+                workflow: None,
+                branch: None,
+                depends_on: Vec::new(),
+                prefers_machine: None,
+                zen: None,
+                created_at: now,
+                updated_at: now,
+                params: std::collections::BTreeMap::new(),
+            },
+            body: String::new(),
+        }
+    }
+
+    #[test]
+    fn header_click_wins_over_overlapping_card_hit() {
+        let _g = ENV_LOCK.lock().unwrap();
+        let home = std::env::temp_dir().join(format!(
+            "shelbi-kanban-header-click-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&home).unwrap();
+        std::env::set_var("SHELBI_HOME", &home);
+
+        let mut app = KanbanApp::new("demo");
+        app.tasks = vec![task_file("task-1", Column::backlog())];
+        app.selected_column = 1;
+        app.selected_row = 2;
+        app.header_hits = vec![HeaderHit {
+            area: Rect {
+                x: 0,
+                y: 1,
+                width: 20,
+                height: 1,
+            },
+            col_idx: 0,
+        }];
+        app.card_hits = vec![CardHit {
+            area: Rect {
+                x: 0,
+                y: 1,
+                width: 20,
+                height: 3,
+            },
+            col_idx: 0,
+            row_idx: 0,
+        }];
+
+        handle_kanban_mouse(&mut app, left_click(5, 1));
+
+        assert!(
+            !app.popover_is_open(),
+            "header click must not open card popover"
+        );
+        assert_eq!(app.selected_column, 1);
+        assert_eq!(app.selected_row, 2);
+        assert!(
+            app.is_column_collapsed(0),
+            "header click should still toggle the column"
+        );
+
+        std::env::remove_var("SHELBI_HOME");
+    }
+
+    #[test]
+    fn first_card_click_still_opens_popover() {
+        let mut app = KanbanApp::new("demo");
+        app.tasks = vec![task_file("task-1", Column::backlog())];
+        app.selected_column = 1;
+        app.selected_row = 2;
+        app.header_hits = vec![HeaderHit {
+            area: Rect {
+                x: 0,
+                y: 1,
+                width: 20,
+                height: 1,
+            },
+            col_idx: 0,
+        }];
+        app.card_hits = vec![CardHit {
+            area: Rect {
+                x: 0,
+                y: 2,
+                width: 20,
+                height: 3,
+            },
+            col_idx: 0,
+            row_idx: 0,
+        }];
+
+        handle_kanban_mouse(&mut app, left_click(5, 2));
+
+        assert_eq!(app.selected_column, 0);
+        assert_eq!(app.selected_row, 0);
+        assert!(app.popover_is_open());
     }
 
     #[test]
