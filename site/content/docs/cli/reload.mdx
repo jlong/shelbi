@@ -31,6 +31,14 @@ binary and you want the long-lived TUI surfaces to start using it.
 earlier versions. Resolution now reverse-looks-up against the registered
 project YAMLs, so the markers are redundant.
 
+Reload also self-heals the shipped agent workspaces before respawning the
+orchestrator pane. User-customized `agents/*/instructions.md` files are
+preserved; for `agents/orchestrator/instructions.md`, Shelbi appends any
+missing runner-critical shipped sections, such as `Polling-only event drain`,
+instead of overwriting the whole file. That lets existing Codex-backed
+orchestrators pick up the required event-drain contract while keeping local
+prompt customizations.
+
 ## Flags
 
 | Flag | Type | Default | Description |
