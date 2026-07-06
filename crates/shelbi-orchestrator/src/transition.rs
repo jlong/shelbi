@@ -313,6 +313,7 @@ mod tests {
             name: "fixture".into(),
             repo: "/tmp/fixture".into(),
             default_branch: "main".into(),
+            default_workflow: None,
             config_mode: None,
             machines: vec![Machine {
                 name: "hub".into(),

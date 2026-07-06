@@ -890,6 +890,7 @@ mod tests {
             name: name.into(),
             repo: "git@example:repo.git".into(),
             default_branch: "main".into(),
+            default_workflow: None,
             config_mode: None,
             machines: vec![machine],
             orchestrator: OrchestratorSpec {

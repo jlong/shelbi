@@ -93,6 +93,7 @@ pub(crate) mod test_support {
             name: project_name.into(),
             repo: repo.to_string_lossy().into(),
             default_branch: "main".into(),
+            default_workflow: None,
             config_mode: None,
             machines: vec![Machine {
                 name: "hub".into(),

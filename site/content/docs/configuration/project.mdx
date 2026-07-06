@@ -20,7 +20,7 @@ The file's location depends on the project's
 | In-repo | `<repo>/.shelbi/project.yaml` (committed) | `~/.shelbi/projects/<name>/local.yaml` |
 
 In global mode every field lives in one flat file. In in-repo mode the
-**shared** fields (`name`, `default_branch`, `orchestrator`,
+**shared** fields (`name`, `default_branch`, `default_workflow`, `orchestrator`,
 `agent_runners`, `zen`, …) are committed and the **user-local** fields
 (`repo`, `machines`, `workspaces`, `editor`) live in
 a per-machine `local.yaml`. Putting a field on the wrong side errors at
@@ -35,6 +35,9 @@ load time. The canonical bucket lists are `SHARED_PROJECT_FIELDS` and
 name: myapp
 repo: git@github.com:me/myapp.git
 default_branch: main
+# Optional: tasks without `workflow:` use workflows/app.yaml instead of
+# workflows/default.yaml.
+default_workflow: app
 machines:
   - name: hub
     kind: local
@@ -59,6 +62,7 @@ workspaces:
 | `name` | string | yes | — | Project identifier. Doubles as the local registry key (`~/.shelbi/projects/<name>.yaml`). |
 | `repo` | string | yes | — | Clone URL or path to the repository. User-local. |
 | `default_branch` | string | no | `main` | Branch new work is based on and the fallback merge target when `git.base_branch` is unset. |
+| `default_workflow` | string | no | `default` | Workflow used by tasks that omit `workflow:` frontmatter. Names `workflows/<name>.yaml`; explicit task `workflow:` still wins. |
 | `machines` | list of [Machine](#machines) | yes | — | The hosts workspaces run on. User-local. |
 | `orchestrator` | [Orchestrator](#orchestrator) | yes | — | Which runner boots the orchestrator. |
 | `agent_runners` | map of name → [AgentRunner](#agent-runners) | yes | — | The command lines agents and the orchestrator are launched with. |

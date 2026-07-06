@@ -231,6 +231,7 @@ pub fn setup_one_project() -> Result<()> {
         name: name.clone(),
         repo: repo_path.clone(),
         default_branch,
+        default_workflow: None,
         config_mode: None,
         machines,
         orchestrator: OrchestratorSpec {

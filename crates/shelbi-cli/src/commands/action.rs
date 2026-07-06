@@ -11,7 +11,7 @@ use anyhow::{anyhow, Result};
 use clap::Subcommand;
 
 use shelbi_orchestrator::{actions, transition};
-use shelbi_state::{load_project, load_task, load_workflow};
+use shelbi_state::{load_project, load_task};
 
 use crate::commands::require_project;
 
@@ -163,7 +163,7 @@ pub fn run(project_opt: Option<String>, cmd: ActionCmd) -> Result<()> {
         }
         ActionCmd::ApplyTransition { task_id, from, to } => {
             let tf = load_task(&project_name, &task_id).map_err(|e| anyhow!(e))?;
-            let workflow = load_workflow(&project_name, tf.task.workflow_or_default())
+            let workflow = shelbi_state::load_task_workflow(&project_name, &project, &tf.task)
                 .map_err(|e| anyhow!(e))?;
             let outcomes = transition::execute_transition(
                 &project,

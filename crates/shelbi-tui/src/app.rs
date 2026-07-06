@@ -975,6 +975,7 @@ mod tests {
             name: "demo".into(),
             repo: "git@example:demo.git".into(),
             default_branch: "main".into(),
+            default_workflow: None,
             config_mode: None,
             machines: vec![
                 Machine {

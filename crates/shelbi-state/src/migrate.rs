@@ -593,6 +593,7 @@ mod tests {
             name: name.into(),
             repo: repo.to_string_lossy().into_owned(),
             default_branch: "main".into(),
+            default_workflow: None,
             config_mode: None,
             machines: vec![Machine {
                 name: "hub".into(),

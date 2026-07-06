@@ -80,6 +80,9 @@ pub struct KanbanApp {
     /// a respawn. Empty when the loader errors — the board degrades to
     /// the canonical default workflow.
     pub workflows: Vec<Workflow>,
+    /// Effective project default workflow name. Defaults to the historical
+    /// `default`, then refreshes from project config when available.
+    pub default_workflow_name: String,
     /// Project-wide canonical column catalogue, loaded from
     /// `workflows/statuses.yaml`. Source of truth for column identity
     /// (id, name, category) and ordering — workflows can no longer
@@ -364,6 +367,7 @@ impl KanbanApp {
             filter_chip_hit: None,
             dropdown_hits: Vec::new(),
             workflows: vec![default_workflow()],
+            default_workflow_name: DEFAULT_WORKFLOW_NAME.to_string(),
             project_statuses,
             all_columns,
             workflow_filter: None,
@@ -423,7 +427,10 @@ impl KanbanApp {
     /// different workflows tracks its expansion state independently.
     fn override_key_for(&self, col_idx: usize) -> Option<String> {
         let col = self.all_columns.get(col_idx)?;
-        let workflow = self.workflow_filter.as_deref().unwrap_or("default");
+        let workflow = self
+            .workflow_filter
+            .as_deref()
+            .unwrap_or(&self.default_workflow_name);
         Some(shelbi_state::kanban_column_override_key(
             workflow,
             &col.status_id,
@@ -598,18 +605,24 @@ impl KanbanApp {
     /// workflows that both declare `review` would share that column).
     fn task_belongs_to(&self, task: &Task, ac: &KanbanColumn) -> bool {
         if let Some(name) = &self.workflow_filter {
-            if task.workflow_or_default() != name.as_str() {
+            if self.task_workflow_name(task) != name.as_str() {
                 return false;
             }
         }
         self.resolved_status_id(task) == ac.status_id
     }
 
+    fn task_workflow_name<'a>(&'a self, task: &'a Task) -> &'a str {
+        task.workflow
+            .as_deref()
+            .unwrap_or(&self.default_workflow_name)
+    }
+
     /// Resolve a task to its status id. Prefers the task's own workflow,
     /// then the default workflow, then the legacy column-derived id as
     /// a last-resort fallback.
     fn resolved_status_id(&self, task: &Task) -> String {
-        let wf_name = task.workflow_or_default();
+        let wf_name = self.task_workflow_name(task);
         if let Some(wf) = self.workflows.iter().find(|w| w.name == wf_name) {
             return resolve_task_status(task, wf);
         }
@@ -653,9 +666,16 @@ impl KanbanApp {
         // empty workspace list rather than failing the refresh; the
         // dropdown will degrade to just "All" / "Unassigned" until the
         // project file appears.
-        self.workspaces = shelbi_state::load_project(&self.project_name)
-            .map(|p| p.workspaces.into_iter().map(|w| w.name).collect())
-            .unwrap_or_default();
+        match shelbi_state::load_project(&self.project_name) {
+            Ok(p) => {
+                self.default_workflow_name = p.default_workflow_name().to_string();
+                self.workspaces = p.workspaces.into_iter().map(|w| w.name).collect();
+            }
+            Err(_) => {
+                self.default_workflow_name = DEFAULT_WORKFLOW_NAME.to_string();
+                self.workspaces = Vec::new();
+            }
+        }
         // Workspace filter is persisted view state — a missing /
         // unreadable state.json falls back to "All" silently. Reload
         // every tick so a CLI or palette edit shows up without a
@@ -871,7 +891,7 @@ impl KanbanApp {
             let count = self
                 .tasks
                 .iter()
-                .filter(|tf| tf.task.workflow_or_default() == w.name)
+                .filter(|tf| self.task_workflow_name(&tf.task) == w.name)
                 .count();
             opts.push(WorkflowDropdownOption {
                 filter: Some(w.name.clone()),
@@ -1178,7 +1198,7 @@ impl KanbanApp {
         let wf = self
             .workflows
             .iter()
-            .find(|w| w.name == task.workflow_or_default())?;
+            .find(|w| w.name == self.task_workflow_name(task))?;
         let current_id = self.resolved_status_id(task);
         self.adjacent_column_in_workflow(&current_id, wf, forward)
     }
@@ -1871,6 +1891,7 @@ fn render_column(
         lines.push(card_meta_line(
             &tf.task,
             &app.workflows,
+            app.task_workflow_name(&tf.task),
             show_card_workflow_label,
             max_text,
         ));
@@ -2331,13 +2352,13 @@ fn wrap_title_two_lines(title: &str, max: usize) -> (String, Option<String>) {
 /// from this task's params. A fixed `base_branch: main` (no placeholder)
 /// or a half-substituted template resolves to `None` — neither adds
 /// trustworthy per-task info at the card-glance scale.
-fn card_branch(task: &Task, workflows: &[Workflow]) -> Option<String> {
+fn card_branch(task: &Task, workflows: &[Workflow], workflow_name: &str) -> Option<String> {
     if let Some(branch) = task.branch.as_deref().filter(|b| !b.is_empty()) {
         return Some(branch.to_string());
     }
     workflows
         .iter()
-        .find(|w| w.name == task.workflow_or_default())
+        .find(|w| w.name == workflow_name)
         .and_then(|w| w.git.as_ref())
         .and_then(|g| g.base_branch.as_deref())
         .filter(|tmpl| tmpl.contains("{{"))
@@ -2363,6 +2384,7 @@ fn card_branch(task: &Task, workflows: &[Workflow]) -> Option<String> {
 fn card_meta_line(
     task: &Task,
     workflows: &[Workflow],
+    workflow_name: &str,
     show_workflow_name: bool,
     max_text: usize,
 ) -> Line<'static> {
@@ -2372,7 +2394,7 @@ fn card_meta_line(
     if show_workflow_name {
         // One space of padding either side so the background reads as a
         // chip rather than butting straight against the glyphs.
-        let badge = truncate(&format!(" {} ", task.workflow_or_default()), max_text);
+        let badge = truncate(&format!(" {workflow_name} "), max_text);
         used += badge.chars().count();
         spans.push(Span::styled(
             badge,
@@ -2382,7 +2404,7 @@ fn card_meta_line(
         ));
     }
 
-    if let Some(branch) = card_branch(task, workflows) {
+    if let Some(branch) = card_branch(task, workflows, workflow_name) {
         // A single space separates the badge from the branch; skip it when
         // the badge is hidden so the branch sits flush with the gutter.
         let sep = if spans.is_empty() { 0 } else { 1 };
@@ -3114,6 +3136,7 @@ mod tests {
             name: "demo".into(),
             repo: "git@example:demo.git".into(),
             default_branch: "main".into(),
+            default_workflow: None,
             config_mode: None,
             git: shelbi_core::GitConfig::default(),
             machines: vec![shelbi_core::Machine {
@@ -4392,7 +4415,7 @@ mod tests {
     fn card_meta_line_blank_for_default_only() {
         let task = task_with_params("t", None, &[]);
         let workflows = vec![default_workflow()];
-        let line = card_meta_line(&task, &workflows, false, 40);
+        let line = card_meta_line(&task, &workflows, "default", false, 40);
         assert_eq!(line_text(&line), "");
     }
 
@@ -4403,7 +4426,7 @@ mod tests {
     fn card_meta_line_shows_default_badge_when_multiple_workflows() {
         let task = task_with_params("t", None, &[]);
         let workflows = vec![default_workflow(), workflow_with_git("feature-task", None)];
-        let line = card_meta_line(&task, &workflows, true, 40);
+        let line = card_meta_line(&task, &workflows, "default", true, 40);
         assert_eq!(line_text(&line), " default ");
     }
 
@@ -4413,7 +4436,7 @@ mod tests {
     fn card_meta_line_shows_workflow_badge_without_git_block() {
         let task = task_with_params("t", Some("design-review"), &[]);
         let workflows = vec![default_workflow(), workflow_with_git("design-review", None)];
-        let line = card_meta_line(&task, &workflows, true, 40);
+        let line = card_meta_line(&task, &workflows, "design-review", true, 40);
         assert_eq!(line_text(&line), " design-review ");
     }
 
@@ -4428,7 +4451,7 @@ mod tests {
             "feature-task",
             Some("feature/{{feature}}"),
         )];
-        let line = card_meta_line(&task, &workflows, true, 60);
+        let line = card_meta_line(&task, &workflows, "feature-task", true, 60);
         // Two spaces between badge and branch: the badge's own trailing
         // padding (bg-filled) plus a plain separator space.
         assert_eq!(line_text(&line), " feature-task  ⎇ feature/auth-rewrite");
@@ -4445,7 +4468,7 @@ mod tests {
             "feature-task",
             Some("feature/{{feature}}"),
         )];
-        let line = card_meta_line(&task, &workflows, false, 60);
+        let line = card_meta_line(&task, &workflows, "feature-task", false, 60);
         assert_eq!(line_text(&line), "⎇ feature/dashboard-v2");
     }
 
@@ -4460,7 +4483,7 @@ mod tests {
             "feature-task",
             Some("feature/{{feature}}"),
         )];
-        let line = card_meta_line(&task, &workflows, false, 60);
+        let line = card_meta_line(&task, &workflows, "feature-task", false, 60);
         assert_eq!(line_text(&line), "⎇ shelbi/t");
     }
 
@@ -4472,10 +4495,10 @@ mod tests {
         let task = task_with_params("t", Some("feature-release"), &[]);
         let workflows = vec![workflow_with_git("feature-release", Some("main"))];
         // Show badge path: drop the branch, keep the badge.
-        let with_name = card_meta_line(&task, &workflows, true, 60);
+        let with_name = card_meta_line(&task, &workflows, "feature-release", true, 60);
         assert_eq!(line_text(&with_name), " feature-release ");
         // No badge path: nothing left worth showing → blank.
-        let without_name = card_meta_line(&task, &workflows, false, 60);
+        let without_name = card_meta_line(&task, &workflows, "feature-release", false, 60);
         assert_eq!(line_text(&without_name), "");
     }
 
@@ -4492,9 +4515,9 @@ mod tests {
             "feature-task",
             Some("feature/{{feature}}"),
         )];
-        let with_name = card_meta_line(&task, &workflows, true, 60);
+        let with_name = card_meta_line(&task, &workflows, "feature-task", true, 60);
         assert_eq!(line_text(&with_name), " feature-task ");
-        let without_name = card_meta_line(&task, &workflows, false, 60);
+        let without_name = card_meta_line(&task, &workflows, "feature-task", false, 60);
         assert_eq!(line_text(&without_name), "");
     }
 
@@ -4516,7 +4539,7 @@ mod tests {
             "feature-task",
             Some("feature/{{feature}}"),
         )];
-        let line = card_meta_line(&task, &workflows, true, 20);
+        let line = card_meta_line(&task, &workflows, "feature-task", true, 20);
         let text = line_text(&line);
         assert!(text.chars().count() <= 20, "overflows width: {text:?}");
         assert!(text.ends_with('…'), "should end with ellipsis: {text:?}");
@@ -4880,8 +4903,8 @@ mod tests {
 
         // Both tasks live in the same project-wide `Todo` status, but
         // each resolves against its OWN workflow's `git:` template.
-        let fe_line = card_meta_line(&fe_task, &workflows, true, 60);
-        let be_line = card_meta_line(&be_task, &workflows, true, 60);
+        let fe_line = card_meta_line(&fe_task, &workflows, "frontend", true, 60);
+        let be_line = card_meta_line(&be_task, &workflows, "backend", true, 60);
         assert_eq!(line_text(&fe_line), " frontend  ⎇ feature/fe-login");
         assert_eq!(line_text(&be_line), " backend  ⎇ feature/be-login");
     }

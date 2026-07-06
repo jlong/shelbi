@@ -306,12 +306,18 @@ fn list(
     ready: bool,
     workflow_filter: Option<&str>,
 ) -> Result<()> {
-    // String-compare against `workflow_or_default()` so a filter of
-    // `default` matches both tasks pinned explicitly to `default` and
-    // tasks with no `workflow:` field (the canonical absence semantics).
+    let project_yaml = shelbi_state::load_project(project).ok();
+    // String-compare against the project-aware resolver so a filter of the
+    // configured default matches tasks with no `workflow:` field.
     let matches_workflow = |task: &Task| -> bool {
         match workflow_filter {
-            Some(name) => task.workflow_or_default() == name,
+            Some(name) => {
+                project_yaml
+                    .as_ref()
+                    .map(|p| shelbi_state::resolve_task_workflow_name(p, task))
+                    .unwrap_or_else(|| task.workflow_or_default())
+                    == name
+            }
             None => true,
         }
     };
@@ -502,16 +508,24 @@ fn move_to(project: &str, id: &str, to: &str, reason: Option<&str>) -> Result<()
     Ok(())
 }
 
-/// Load the workflow assigned to `task`, falling back to the canonical
-/// [`default_workflow`] when the project hasn't authored a YAML for it.
-/// Plans/workflows.md §5 specifies that missing workflows are tolerated:
-/// "If `workflow` references a missing definition, shelbi falls back to
-/// default."
+/// Load the workflow assigned to `task`. Project defaults are resolved via
+/// project config; explicit task workflow misses keep the legacy fallback to
+/// the canonical default workflow.
 fn resolve_task_workflow(project: &str, task: &Task) -> Result<Workflow> {
-    let name = task.workflow_or_default();
+    let project_yaml = shelbi_state::load_project(project).ok();
+    let name = project_yaml
+        .as_ref()
+        .map(|p| shelbi_state::resolve_task_workflow_name(p, task))
+        .unwrap_or_else(|| task.workflow_or_default());
     match shelbi_state::load_workflow(project, name) {
         Ok(wf) => Ok(wf),
-        Err(_) => Ok(default_workflow()),
+        Err(e) if task.workflow.is_some() || project_yaml.is_none() => {
+            eprintln!(
+                "warning: workflow `{name}` could not be loaded ({e}); using built-in default"
+            );
+            Ok(default_workflow())
+        }
+        Err(e) => Err(anyhow!(e)),
     }
 }
 
@@ -846,7 +860,7 @@ fn start(
     if prev_column != Column::in_progress() {
         let base_reason = reason.unwrap_or("user:cli:start");
         let dispatched_reason = dispatch_reason_with_agent(base_reason, &agent_name);
-        let workflow = tf.task.workflow_or_default();
+        let workflow = shelbi_state::resolve_task_workflow_name(&project_yaml, &tf.task);
         if let Err(e) = shelbi_state::append_task_event(
             project,
             id,
@@ -1022,7 +1036,7 @@ fn resume(
     if moved_into_progress {
         let base_reason = reason.unwrap_or("user:cli:resume");
         let dispatched_reason = dispatch_reason_with_agent(base_reason, &agent_name);
-        let workflow = tf.task.workflow_or_default();
+        let workflow = shelbi_state::resolve_task_workflow_name(&project_yaml, &tf.task);
         if let Err(e) = shelbi_state::append_task_event(
             project,
             id,
