@@ -13,7 +13,7 @@ use std::time::Duration;
 
 use anyhow::{anyhow, Context, Result};
 use chrono::{DateTime, Utc};
-use clap::Subcommand;
+use clap::{Subcommand, ValueEnum};
 
 #[derive(Debug, Subcommand)]
 pub enum EventsCmd {
@@ -32,16 +32,32 @@ pub enum EventsCmd {
         /// Stream new transitions as they're appended. Exit on Ctrl-C.
         #[arg(short = 'f', long)]
         follow: bool,
+        /// Output shape. `raw` preserves the historical events.log lines;
+        /// `envelope` emits the same normalized JSON object used by callback
+        /// delivery for push-capable harnesses.
+        #[arg(long, value_enum, default_value_t = EventFormat::Raw)]
+        format: EventFormat,
     },
 }
 
 pub fn run(cmd: EventsCmd) -> Result<()> {
     match cmd {
-        EventsCmd::Tail { lines, since, follow } => tail(lines, since, follow),
+        EventsCmd::Tail {
+            lines,
+            since,
+            follow,
+            format,
+        } => tail(lines, since, follow, format),
     }
 }
 
-fn tail(lines: usize, since: Option<String>, follow: bool) -> Result<()> {
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum EventFormat {
+    Raw,
+    Envelope,
+}
+
+fn tail(lines: usize, since: Option<String>, follow: bool, format: EventFormat) -> Result<()> {
     let path = shelbi_state::events_log_path().map_err(|e| anyhow!(e))?;
 
     let (initial, end_offset) = match fs::read(&path) {
@@ -60,7 +76,10 @@ fn tail(lines: usize, since: Option<String>, follow: bool) -> Result<()> {
                 let start = all.len().saturating_sub(lines);
                 all[start..].to_vec()
             };
-            let initial = filtered.iter().map(|l| (*l).to_string()).collect::<Vec<_>>();
+            let initial = filtered
+                .iter()
+                .map(|l| (*l).to_string())
+                .collect::<Vec<_>>();
             (initial, len)
         }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => (Vec::new(), 0),
@@ -68,21 +87,21 @@ fn tail(lines: usize, since: Option<String>, follow: bool) -> Result<()> {
     };
 
     for line in &initial {
-        println!("{line}");
+        print_event(line, format)?;
     }
 
     if !follow {
         return Ok(());
     }
 
-    follow_from(&path, end_offset)
+    follow_from(&path, end_offset, format)
 }
 
 /// `tail -f` shape: park at `start_offset` and print any newly appended
 /// bytes. Polling cadence (250ms) matches the workspace poller's typical
 /// inter-tick gap — fast enough to feel live, slow enough that a 10-workspace
 /// project barely touches the filesystem.
-fn follow_from(path: &std::path::PathBuf, start_offset: u64) -> Result<()> {
+fn follow_from(path: &std::path::PathBuf, start_offset: u64, format: EventFormat) -> Result<()> {
     let interval = Duration::from_millis(250);
     let mut offset = start_offset;
     let mut pending = String::new();
@@ -94,10 +113,7 @@ fn follow_from(path: &std::path::PathBuf, start_offset: u64) -> Result<()> {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
             Err(e) => return Err(anyhow::Error::new(e).context("opening events.log")),
         };
-        let len = file
-            .metadata()
-            .context("stat events.log")?
-            .len();
+        let len = file.metadata().context("stat events.log")?.len();
 
         // File was truncated or rotated — restart from the top so we
         // don't silently drop the new content the next writer added.
@@ -121,8 +137,22 @@ fn follow_from(path: &std::path::PathBuf, start_offset: u64) -> Result<()> {
             let line = pending[..nl].to_string();
             pending.drain(..=nl);
             if !line.is_empty() {
-                println!("{line}");
+                print_event(&line, format)?;
             }
+        }
+    }
+}
+
+fn print_event(line: &str, format: EventFormat) -> Result<()> {
+    match format {
+        EventFormat::Raw => {
+            println!("{line}");
+            Ok(())
+        }
+        EventFormat::Envelope => {
+            let envelope = shelbi_state::EventEnvelope::from_log_line(line);
+            println!("{}", serde_json::to_string(&envelope)?);
+            Ok(())
         }
     }
 }
