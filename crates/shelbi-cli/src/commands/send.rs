@@ -187,6 +187,7 @@ mod tests {
             name: name.into(),
             repo: "/tmp/repo".into(),
             default_branch: "main".into(),
+            default_workflow: None,
             config_mode: None,
             machines: vec![
                 Machine {

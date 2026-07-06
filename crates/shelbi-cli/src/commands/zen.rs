@@ -36,8 +36,8 @@ use shelbi_core::{
 };
 use shelbi_orchestrator::zen::{self, CiVerdict, DryRunDecision};
 use shelbi_state::{
-    append_zen_dryrun_event, list_column, load_project, load_workflow, read_state, set_zen_mode,
-    State, ZenModeState,
+    append_zen_dryrun_event, list_column, load_project, read_state, set_zen_mode, State,
+    ZenModeState,
 };
 
 use crate::commands::require_project;
@@ -408,7 +408,8 @@ fn print_danger_paths(p: &Project) {
 /// [`Task::workflow_or_default`] so a task without an explicit
 /// `workflow:` field routes to the project's default workflow.
 fn load_workflow_for_task(project: &str, task: &Task) -> Option<Workflow> {
-    load_workflow(project, task.workflow_or_default()).ok()
+    let project_yaml = shelbi_state::load_project(project).ok()?;
+    shelbi_state::load_task_workflow(project, &project_yaml, task).ok()
 }
 
 fn count_in_flight_zen(project: &str, mode: ZenModeState) -> Result<usize> {

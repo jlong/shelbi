@@ -858,9 +858,8 @@ fn maybe_apply_ready_handoff(
             // Resolve the forward handoff target from the task's workflow:
             // the first handoff-category status. No handoff status → nothing
             // to advance to; clear the (misconfigured) marker below.
-            let workflow =
-                shelbi_state::load_workflow(&project.name, tf.task.workflow_or_default())
-                    .unwrap_or_else(|_| default_workflow());
+            let workflow = shelbi_state::load_task_workflow(&project.name, project, &tf.task)
+                .unwrap_or_else(|_| default_workflow());
             let from_status = resolve_current_status_id(&workflow, Column::in_progress());
             let Some(handoff) = workflow
                 .statuses
@@ -1128,9 +1127,8 @@ fn maybe_apply_transition(
             // Load the task's workflow; fall back to the built-in default
             // (no transitions → any-to-any) if the YAML is missing or invalid,
             // so a transient workflow typo doesn't wedge the bounce.
-            let workflow =
-                shelbi_state::load_workflow(&project.name, tf.task.workflow_or_default())
-                    .unwrap_or_else(|_| default_workflow());
+            let workflow = shelbi_state::load_task_workflow(&project.name, project, &tf.task)
+                .unwrap_or_else(|_| default_workflow());
 
             match decide_transition(&workflow, tf.task.column.clone(), &req.target) {
                 TransitionDecision::Reject { reason } => {
@@ -1725,6 +1723,7 @@ mod tests {
             name: "demo".into(),
             repo: "git@example:demo.git".into(),
             default_branch: "main".into(),
+            default_workflow: None,
             config_mode: None,
             machines: vec![Machine {
                 name: "hub".into(),

@@ -29,6 +29,28 @@ Schema and parser live in `crates/shelbi-core/src/workflow.rs`.
 Workflow files live at
 `~/.shelbi/projects/<project>/workflows/<name>.yaml`.
 
+## Choosing the default workflow
+
+A task can pin a workflow explicitly:
+
+```yaml
+workflow: feature-task
+```
+
+When `workflow:` is absent, Shelbi checks the project config for
+`default_workflow:`:
+
+```yaml
+# ~/.shelbi/projects/myapp.yaml or <repo>/.shelbi/project.yaml
+default_workflow: app
+```
+
+That makes new and existing tasks without `workflow:` behave as if they
+declared `workflow: app`. If the project field is omitted, Shelbi keeps the
+backward-compatible built-in fallback of `default`. A configured default must
+name an existing `workflows/<name>.yaml`; if it does not, project loading fails
+with a workflow error instead of silently falling back.
+
 ## Schema
 
 A workflow is split across **two files**. Status *identity* (the stable
@@ -458,14 +480,17 @@ Tasks declare which workflow they belong to in frontmatter:
 ---
 id: design-the-thing
 title: Design the thing
-workflow: design-review         # optional; defaults to "default" if omitted
+workflow: design-review         # optional; otherwise project default, then "default"
 column: Designing               # uses a status name from the assigned workflow
 ---
 ```
 
-If `workflow:` is absent, the task uses the default workflow. If
-`workflow:` references a missing definition, Shelbi falls back to
-`default` and logs a warning to the events feed.
+If `workflow:` is absent, the task uses `default_workflow:` from project
+config. If the project does not declare one, Shelbi falls back to `default`.
+If an explicit task `workflow:` references a missing definition, legacy
+best-effort paths fall back to the built-in `default`; a missing configured
+project default fails project loading because that would otherwise reroute
+every implicit task silently.
 
 A task is bound to its workflow at creation. **Cross-workflow moves are
 not allowed.** To switch a task into a different workflow, create a
@@ -496,7 +521,8 @@ anything, since the rest of the system reasons in categories.
 If a project has no `workflows/` directory at all (legacy state),
 Shelbi auto-generates `default.yaml` on first load. Existing task files
 are not modified. A task with no `workflow:` field is treated as
-belonging to the default workflow, so there's nothing to backfill.
+belonging to the project default workflow, or `default` when the project
+does not configure one, so there's nothing to backfill.
 
 The shipped default omits `transitions:` for a reason: a workflow with
 no transitions block falls back to the legacy 5-status convention for

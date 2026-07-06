@@ -2089,6 +2089,7 @@ mod probe_tests {
             name: "probe-test".into(),
             repo: work_dir.to_string_lossy().into(),
             default_branch: "main".into(),
+            default_workflow: None,
             config_mode: None,
             machines: vec![Machine {
                 name: "hub".into(),
@@ -2948,8 +2949,8 @@ fn resolve_task_status<'w>(task: &Task, workflow: &'w Workflow) -> Option<&'w Wo
 /// state, and a transient typo in a workflow YAML shouldn't kill the
 /// whole preview pass for unrelated tasks.
 fn load_task_workflow(project: &str, task: &Task) -> Option<Workflow> {
-    let name = task.workflow_or_default();
-    shelbi_state::load_workflow(project, name).ok()
+    let project_yaml = shelbi_state::load_project(project).ok()?;
+    shelbi_state::load_task_workflow(project, &project_yaml, task).ok()
 }
 
 /// Apply the default merge-conditions bar to a probe report. Returns a

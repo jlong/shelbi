@@ -88,7 +88,7 @@ workflow.
 | --- | --- | --- | --- |
 | `--status <STATUS>` | string | — | Restrict to a single status. `--column` is a deprecated alias kept for one release. |
 | `--ready` | flag | off | Show only unblocked `todo` items, in priority order. Mutually exclusive with `--status`. |
-| `--workflow <NAME>` | string | — | Restrict to tasks pinned to the named workflow. Tasks with no explicit `workflow:` field are treated as the canonical `default` workflow. Composes with `--status` and `--ready`. |
+| `--workflow <NAME>` | string | — | Restrict to tasks resolved to the named workflow. Tasks with no explicit `workflow:` field inherit the project's `default_workflow`, or `default` when unset. Composes with `--status` and `--ready`. |
 
 ## show
 

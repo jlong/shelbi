@@ -2883,6 +2883,7 @@ mod tests {
             name: "myapp".into(),
             repo: "git@example:repo.git".into(),
             default_branch: "main".into(),
+            default_workflow: None,
             config_mode: None,
             machines: vec![
                 Machine {
@@ -5213,6 +5214,7 @@ mod sync_worktree_git_tests {
             name: "sync-test".into(),
             repo: repo.to_string_lossy().into(),
             default_branch: "main".into(),
+            default_workflow: None,
             config_mode: None,
             machines: vec![Machine {
                 name: "hub".into(),
@@ -5581,6 +5583,7 @@ mod sync_worktree_freshcut_tests {
             name: "synccut".into(),
             repo: repo.to_string_lossy().into(),
             default_branch: "main".into(),
+            default_workflow: None,
             config_mode: None,
             machines: vec![machine_at(repo)],
             orchestrator: shelbi_core::OrchestratorSpec {
@@ -5943,6 +5946,7 @@ mod sync_worktree_freshcut_tests {
             name: "synccut".into(),
             repo: machine_repo.to_string_lossy().into(),
             default_branch: "main".into(),
+            default_workflow: None,
             config_mode: None,
             machines: vec![Machine {
                 name: "hub".into(),

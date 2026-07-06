@@ -103,7 +103,8 @@ pub fn resolve_dispatch_agent(status: &WorkflowStatus, zen_on: bool) -> Dispatch
 /// project's live Zen state so an `owner: user` active status only pulls in
 /// its agent when Zen is on, matching the declarative dispatch rules.
 pub fn resolve_active_agent(project_name: &str, task: &Task) -> String {
-    let workflow = shelbi_state::load_workflow(project_name, task.workflow_or_default())
+    let workflow = shelbi_state::load_project(project_name)
+        .and_then(|project| shelbi_state::load_task_workflow(project_name, &project, task))
         .unwrap_or_else(|_| shelbi_core::default_workflow());
     let zen_on = matches!(
         shelbi_state::read_state(project_name).map(|s| s.zen_mode),

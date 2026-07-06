@@ -72,8 +72,9 @@ pub use user_config::{
     UserConfig, ZenToggleChord,
 };
 pub use workflows::{
-    list_workflows, load_project_statuses, load_workflow, save_project_statuses,
-    scaffold_project_statuses, statuses_path, workflow_path, workflows_dir,
+    list_workflows, load_project_statuses, load_task_workflow, load_workflow,
+    resolve_task_workflow_name, save_project_statuses, scaffold_project_statuses, statuses_path,
+    workflow_path, workflows_dir,
 };
 pub use workspace_status::{
     append_clarification_event, append_dispatch_event, append_external_event,
@@ -601,6 +602,14 @@ pub fn load_project(project: &str) -> Result<Project> {
         migrate_statuses_extension(&dir);
         migrate_default_workflow(&dir);
         migrate_default_statuses(&dir);
+    }
+    if let Some(name) = &p.default_workflow {
+        workflows::load_workflow(project, name).map_err(|e| {
+            shelbi_core::Error::InvalidWorkflow(format!(
+                "project `{}` declares default_workflow: `{name}`, but that workflow could not be loaded: {e}",
+                p.name
+            ))
+        })?;
     }
     Ok(p)
 }
@@ -1945,9 +1954,9 @@ fn find_cycle(graph: &HashMap<&str, &[String]>, start: &str) -> Option<Vec<Strin
 ///
 /// Returns `Some((from, to, workflow))` when the move happened, or `None`
 /// when the task was already in `new_column`. The workflow name is the
-/// task's resolved workflow (`task.workflow_or_default()`) so callers can
-/// hand it straight to [`append_task_event`] without re-reading the task
-/// file just to fill the events log line.
+/// project-aware resolved workflow so callers can hand it straight to
+/// [`append_task_event`] without re-reading the task file just to fill the
+/// events log line.
 pub fn move_task(
     project: &str,
     id: &str,
@@ -1962,7 +1971,7 @@ pub fn move_task(
         return Ok(None);
     }
     let old_column = task.column.clone();
-    let workflow = task.workflow_or_default().to_string();
+    let workflow = resolved_task_workflow_name_for_project(project, &task)?;
     let new_priority = list_column(project, new_column.clone())?.len() as u32;
     task.column = new_column.clone();
     task.priority = new_priority;
@@ -2001,7 +2010,7 @@ pub fn move_task_and_unassign(
     let _lock = lock_tasks(project)?;
     let TaskFile { mut task, body } = load_task(project, id)?;
     let old_column = task.column.clone();
-    let workflow = task.workflow_or_default().to_string();
+    let workflow = resolved_task_workflow_name_for_project(project, &task)?;
     let already_there = old_column == new_column;
     if already_there && task.assigned_to.is_none() {
         return Ok(None);
@@ -2041,7 +2050,7 @@ pub fn release_task_to_todo(project: &str, id: &str) -> Result<Option<(Column, C
     let _lock = lock_tasks(project)?;
     let TaskFile { mut task, body } = load_task(project, id)?;
     let old_column = task.column.clone();
-    let workflow = task.workflow_or_default().to_string();
+    let workflow = resolved_task_workflow_name_for_project(project, &task)?;
     let already_todo = old_column == Column::todo();
     if already_todo && task.assigned_to.is_none() {
         return Ok(None);
@@ -2060,6 +2069,12 @@ pub fn release_task_to_todo(project: &str, id: &str) -> Result<Option<(Column, C
     renumber_column_unlocked(project, old_column.clone())?;
     renumber_column_unlocked(project, Column::todo())?;
     Ok(Some((old_column, Column::todo(), workflow)))
+}
+
+fn resolved_task_workflow_name_for_project(project: &str, task: &Task) -> Result<String> {
+    Ok(load_project(project)
+        .map(|p| resolve_task_workflow_name(&p, task).to_string())
+        .unwrap_or_else(|_| task.workflow_or_default().to_string()))
 }
 
 /// Re-position `id` to slot `new_priority` within its current column. Other
@@ -2228,6 +2243,7 @@ mod tests {
             name: name.into(),
             repo: "r".into(),
             default_branch: "main".into(),
+            default_workflow: None,
             config_mode: None,
             machines: vec![Machine {
                 name: "hub".into(),

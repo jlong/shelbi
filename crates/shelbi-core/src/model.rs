@@ -50,6 +50,11 @@ pub struct Project {
     pub name: String,
     #[serde(default = "default_branch")]
     pub default_branch: String,
+    /// Project-level default workflow for tasks that omit `workflow:`.
+    /// When absent, Shelbi uses the built-in [`DEFAULT_WORKFLOW_NAME`]
+    /// for backwards compatibility.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_workflow: Option<String>,
     /// Which YAML layout this project uses on disk. See [`ConfigMode`].
     /// `None` (the default) means [`ConfigMode::Global`] — the historical
     /// single-YAML shape — and is elided from the wire form so existing
@@ -147,6 +152,7 @@ pub enum ConfigMode {
 pub const SHARED_PROJECT_FIELDS: &[&str] = &[
     "name",
     "default_branch",
+    "default_workflow",
     "config_mode",
     "orchestrator",
     "agent_runners",
@@ -572,6 +578,15 @@ impl Project {
         self.git.merge_strategy
     }
 
+    /// Workflow name used for tasks that omit `workflow:` in frontmatter.
+    /// Keeps the historical `default` fallback when the project config
+    /// does not declare `default_workflow:`.
+    pub fn default_workflow_name(&self) -> &str {
+        self.default_workflow
+            .as_deref()
+            .unwrap_or(DEFAULT_WORKFLOW_NAME)
+    }
+
     pub fn runner(&self, name: &str) -> Option<&AgentRunnerSpec> {
         self.agent_runners.get(name)
     }
@@ -644,6 +659,9 @@ impl Project {
     /// Hard errors: an unknown machine or runner. Other conditions are soft
     /// and left to callers to warn about rather than fail the load.
     pub fn validate_workspaces(&self) -> crate::Result<()> {
+        if let Some(name) = &self.default_workflow {
+            validate_workflow_name(name)?;
+        }
         if self.runner(&self.orchestrator.runner).is_none() {
             return Err(crate::Error::UnknownRunner(
                 self.orchestrator.runner.clone(),
@@ -1396,11 +1414,10 @@ impl Task {
             .any(|id| columns.get(id) != Some(&done))
     }
 
-    /// The workflow name this task runs under: the explicit
+    /// Context-free fallback for legacy paths/tests: the explicit
     /// [`Task::workflow`] field if set, otherwise [`DEFAULT_WORKFLOW_NAME`].
-    /// Callers that need to look up the YAML definition should hit this
-    /// instead of the raw `workflow` field so absence routes to the
-    /// default uniformly.
+    /// Runtime callers with project context should prefer the project-aware
+    /// resolver in `shelbi_state` so `default_workflow:` is honored.
     pub fn workflow_or_default(&self) -> &str {
         self.workflow.as_deref().unwrap_or(DEFAULT_WORKFLOW_NAME)
     }
@@ -2801,6 +2818,7 @@ workspace_settings_template: /etc/shelbi/p.json
             name: "p".into(),
             repo: "r".into(),
             default_branch: "main".into(),
+            default_workflow: None,
             config_mode: None,
             machines: vec![Machine {
                 name: "hub".into(),
@@ -2914,6 +2932,7 @@ workspaces:
             name: "p".into(),
             repo: "r".into(),
             default_branch: "main".into(),
+            default_workflow: None,
             config_mode: None,
             machines: vec![machine("hub"), machine("devbox")],
             orchestrator: OrchestratorSpec {
@@ -3136,6 +3155,7 @@ workspaces:
             name: "p".into(),
             repo: "r".into(),
             default_branch: "main".into(),
+            default_workflow: None,
             config_mode: None,
             machines: vec![Machine {
                 name: "hub".into(),
@@ -4286,6 +4306,7 @@ git:
         Project {
             name: "shelbi".into(),
             default_branch: "main".into(),
+            default_workflow: None,
             config_mode: Some(ConfigMode::InRepo),
             orchestrator: OrchestratorSpec {
                 runner: "claude".into(),

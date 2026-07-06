@@ -1482,6 +1482,7 @@ mod tests {
             name: "fixture".into(),
             repo: repo.to_string_lossy().into(),
             default_branch: "main".into(),
+            default_workflow: None,
             config_mode: None,
             machines: vec![Machine {
                 name: "hub".into(),
@@ -1547,6 +1548,7 @@ mod tests {
             name: "fixture".into(),
             repo: repo.to_string_lossy().into(),
             default_branch: "main".into(),
+            default_workflow: None,
             config_mode: None,
             machines: vec![Machine {
                 name: "hub".into(),
@@ -1627,6 +1629,7 @@ mod tests {
             name: "fixture".into(),
             repo: local.to_string_lossy().into(),
             default_branch: "main".into(),
+            default_workflow: None,
             config_mode: None,
             machines: vec![Machine {
                 name: "hub".into(),
@@ -1699,6 +1702,7 @@ mod tests {
             name: "fixture".into(),
             repo: local.to_string_lossy().into(),
             default_branch: "main".into(),
+            default_workflow: None,
             config_mode: None,
             machines: vec![Machine {
                 name: "hub".into(),
@@ -1995,6 +1999,7 @@ mod tests {
             name: "fixture".into(),
             repo: local.to_string_lossy().into(),
             default_branch: "main".into(),
+            default_workflow: None,
             config_mode: None,
             machines: vec![Machine {
                 name: "hub".into(),
