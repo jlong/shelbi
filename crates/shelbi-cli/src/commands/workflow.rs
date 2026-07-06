@@ -152,8 +152,8 @@ fn write_starter(path: &Path, name: &str) -> Result<()> {
     if name != "default" {
         wf.description = None;
     }
-    let yaml = serde_yaml::to_string(&wf)
-        .map_err(|e| anyhow!("serializing starter workflow: {e}"))?;
+    let yaml =
+        serde_yaml::to_string(&wf).map_err(|e| anyhow!("serializing starter workflow: {e}"))?;
     fs::write(path, yaml).map_err(|e| anyhow!("writing {}: {e}", path.display()))?;
     Ok(())
 }
@@ -265,10 +265,7 @@ statuses:
 
         new("p", "research", false).unwrap();
         let err = new("p", "research", false).unwrap_err();
-        assert!(
-            err.to_string().contains("already exists"),
-            "got: {err}"
-        );
+        assert!(err.to_string().contains("already exists"), "got: {err}");
 
         std::env::remove_var("SHELBI_HOME");
     }
@@ -314,7 +311,10 @@ statuses:
         edit_cmd("p", "default").unwrap();
 
         let path = shelbi_state::workflow_path("p", "default").unwrap();
-        assert!(path.exists(), "default workflow should be on disk after edit");
+        assert!(
+            path.exists(),
+            "default workflow should be on disk after edit"
+        );
         let text = std::fs::read_to_string(&path).unwrap();
         // The materialized file is in post-migration form — identity
         // lives in `statuses.yaml`. Resolve before comparing.
@@ -348,11 +348,7 @@ statuses:
         // project-wide status catalogue is materialized by
         // `shelbi init` / `shelbi reload` (via `load_project`). Stand
         // in for that step here so the loader has its prerequisite.
-        shelbi_state::save_project_statuses(
-            "p",
-            &shelbi_core::default_project_statuses(),
-        )
-        .unwrap();
+        shelbi_state::save_project_statuses("p", &shelbi_core::default_project_statuses()).unwrap();
         new("p", "design-review", false).unwrap();
         // The loader returns the on-disk workflow plus skips the default
         // fallback once at least one file exists.
@@ -369,11 +365,7 @@ statuses:
         std::env::set_var("SHELBI_HOME", &home);
         let dir = shelbi_state::workflows_dir("p").unwrap();
         shelbi_state::ensure_dir(&dir).unwrap();
-        shelbi_state::save_project_statuses(
-            "p",
-            &shelbi_core::default_project_statuses(),
-        )
-        .unwrap();
+        shelbi_state::save_project_statuses("p", &shelbi_core::default_project_statuses()).unwrap();
         std::fs::write(dir.join("design.yaml"), DESIGN_YAML).unwrap();
         show("p", "design").unwrap();
         std::env::remove_var("SHELBI_HOME");
@@ -390,11 +382,7 @@ statuses:
         std::env::set_var("SHELBI_HOME", &home);
         let dir = shelbi_state::workflows_dir("p").unwrap();
         shelbi_state::ensure_dir(&dir).unwrap();
-        shelbi_state::save_project_statuses(
-            "p",
-            &shelbi_core::default_project_statuses(),
-        )
-        .unwrap();
+        shelbi_state::save_project_statuses("p", &shelbi_core::default_project_statuses()).unwrap();
         std::fs::write(
             dir.join("app.yaml"),
             r#"
@@ -421,7 +409,9 @@ statuses:
         // The default name has a built-in fallback even before any file
         // exists on disk; the call must succeed without writing anything.
         show("p", "default").unwrap();
-        assert!(!shelbi_state::workflow_path("p", "default").unwrap().exists());
+        assert!(!shelbi_state::workflow_path("p", "default")
+            .unwrap()
+            .exists());
         std::env::remove_var("SHELBI_HOME");
     }
 

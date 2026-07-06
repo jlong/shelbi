@@ -11,8 +11,8 @@ pub fn run(project: Option<String>, id: String, lines: usize) -> Result<()> {
         .ok_or_else(|| anyhow!("machine `{}` no longer in project", file.agent.machine))?;
     let host = machine.host();
 
-    let out = shelbi_tmux::capture_history(&host, &file.agent.tmux, lines)
-        .map_err(|e| anyhow!(e))?;
+    let out =
+        shelbi_tmux::capture_history(&host, &file.agent.tmux, lines).map_err(|e| anyhow!(e))?;
     print!("{}", out);
     if !out.ends_with('\n') {
         println!();

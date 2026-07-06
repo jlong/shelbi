@@ -149,7 +149,9 @@ pub fn run(
     // children too); recording the signal lets us label the events.log
     // reason and skip the "press enter" prompt on a forced teardown.
     //
-    // The listener is installed BEFORE the child is spawned (F11): a
+    // The listener is installed BEFORE the child is spawned (Shelbi
+    // ContextStore docs/planning:reviews/adversarial-2026-07/cli-session-ux.md
+    // F11): a
     // signal arriving in the spawn window would otherwise hit the
     // wrapper's default disposition and kill it outright, orphaning a
     // half-started pane and dropping the lifecycle event. The child's
@@ -301,7 +303,8 @@ pub fn run(
 /// returns.
 ///
 /// `child_pid_cell` is read at signal time rather than captured by value
-/// so this can be installed BEFORE the child is spawned (F11): the
+/// so this can be installed BEFORE the child is spawned (Shelbi ContextStore
+/// docs/planning:reviews/adversarial-2026-07/cli-session-ux.md F11): the
 /// caller stores the real PID into the cell the moment `spawn()`
 /// succeeds. A signal that arrives while the cell is still `0` (the
 /// pre-spawn window) is recorded but not forwarded here — the caller
@@ -421,7 +424,8 @@ fn kill_task_tail(worktree: &Path, task_id: &str) -> std::io::Result<()> {
         // recording `$!` and this cleanup running, the tail may have died
         // and its PID been recycled to an unrelated process. Signaling
         // that innocent process is the bug. Same principle as
-        // state-runtime F5's identity check — verify the PID still names
+        // Shelbi ContextStore docs/planning:reviews/adversarial-2026-07/state-runtime.md
+        // F5's identity check — verify the PID still names
         // *our* tail (a `tail` invocation referencing this task's message
         // log) before signaling. A recycled/unidentifiable PID is left
         // alone: leaking a stray tail is far less harmful than killing a
@@ -617,6 +621,7 @@ mod tests {
         assert_eq!(signal_name(99), "99");
     }
 
+    /// Shelbi ContextStore docs/planning:reviews/adversarial-2026-07/cli-session-ux.md
     /// F11 acceptance: the signal listener is installed BEFORE the child
     /// is spawned, so a signal delivered in the spawn window is *captured*
     /// (not fatal to the wrapper) and forwarded to the child once its PID
@@ -1012,7 +1017,8 @@ mod tests {
         let _ = std::fs::remove_dir_all(&worktree);
     }
 
-    /// PID-reuse guard (F11): if the recorded PID no longer names *our*
+    /// PID-reuse guard (Shelbi ContextStore
+    /// docs/planning:reviews/adversarial-2026-07/cli-session-ux.md F11): if the recorded PID no longer names *our*
     /// tail — because the tail died and its PID was recycled to an
     /// unrelated process — `kill_task_tail` must NOT signal it. Stand in
     /// for the recycled process with a bare `sleep` (argv doesn't look

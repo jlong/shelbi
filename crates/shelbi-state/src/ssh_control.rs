@@ -14,7 +14,8 @@
 //! To survive PID reuse the file records a process *identity* token (the
 //! recorded process's start-time) alongside the bare PID: a recycled PID
 //! whose start-time no longer matches is recognized as NOT the daemon,
-//! so cleanup isn't skipped forever (adversarial review state-runtime F5).
+//! so cleanup isn't skipped forever (Shelbi ContextStore
+//! docs/planning:reviews/adversarial-2026-07/state-runtime.md F5).
 
 use std::ffi::OsString;
 use std::fs;
@@ -64,7 +65,8 @@ pub fn ensure_ssh_control_dir() -> Result<()> {
 /// user) — rather than the human-readable `%r@%h`, so the expanded path
 /// is a fixed short length regardless of how long `$SHELBI_HOME`, the
 /// username, or the FQDN are. `%r@%h` could push the path past macOS's
-/// ~104-byte `sun_path` cap (adversarial review F12), which fails every
+/// ~104-byte `sun_path` cap (Shelbi ContextStore
+/// docs/planning:reviews/adversarial-2026-07/process-boundaries.md F12), which fails every
 /// SSH invocation with `ControlPath too long`. The directory matches
 /// [`ssh_control_dir`] so this module's cleanup logic and ssh's runtime
 /// agree on the path; the cleanup probes sockets by `connect()`, not by
@@ -268,7 +270,8 @@ fn process_start_time(_pid: libc::pid_t) -> Option<u64> {
 /// process? A bare [`is_process_alive`] probe isn't enough: after PID
 /// reuse the recorded PID may belong to an unrelated process, and
 /// treating that as "another daemon" would skip ControlMaster cleanup
-/// forever (adversarial review state-runtime F5).
+/// forever (Shelbi ContextStore
+/// docs/planning:reviews/adversarial-2026-07/state-runtime.md F5).
 ///
 /// When the record carries a start-time and we can read the current
 /// process's start-time, they must match — a mismatch means the PID was
@@ -318,7 +321,10 @@ pub fn cleanup_stale_control_masters(self_pid: libc::pid_t) -> Result<CmCleanupO
 
     let dir = ssh_control_dir()?;
     if !dir.exists() {
-        return Ok(CmCleanupOutcome::Scanned { removed: 0, kept: 0 });
+        return Ok(CmCleanupOutcome::Scanned {
+            removed: 0,
+            kept: 0,
+        });
     }
 
     let mut removed = 0;
@@ -622,7 +628,8 @@ mod tests {
         // pairs it with a start-time that can't match — the hallmark of a
         // recycled PID that now belongs to an unrelated process. The old
         // bare kill-0 check would treat this as "another daemon" and skip
-        // cleanup forever (state-runtime F5).
+        // cleanup forever (Shelbi ContextStore
+        // docs/planning:reviews/adversarial-2026-07/state-runtime.md F5).
         let self_pid = std::process::id() as libc::pid_t;
         let real = process_start_time(self_pid).expect("own start-time readable");
         let bogus = real ^ 0xDEAD_BEEF;
@@ -633,7 +640,13 @@ mod tests {
         // rather than the "that PID is us" short-circuit. Identity
         // mismatch → recycled → cleanup proceeds and the orphan is gone.
         let outcome = cleanup_stale_control_masters(self_pid + 1).unwrap();
-        assert_eq!(outcome, CmCleanupOutcome::Scanned { removed: 1, kept: 0 });
+        assert_eq!(
+            outcome,
+            CmCleanupOutcome::Scanned {
+                removed: 1,
+                kept: 0
+            }
+        );
         assert!(!orphan.exists());
 
         std::env::remove_var("SHELBI_HOME");
@@ -661,7 +674,10 @@ mod tests {
         // A different caller PID → identity check fires, start-times match,
         // so we recognise a live daemon and skip cleanup.
         let outcome = cleanup_stale_control_masters(self_pid + 1).unwrap();
-        assert_eq!(outcome, CmCleanupOutcome::SkippedAnotherDaemon { pid: self_pid });
+        assert_eq!(
+            outcome,
+            CmCleanupOutcome::SkippedAnotherDaemon { pid: self_pid }
+        );
         assert!(orphan.exists(), "another daemon's socket must be untouched");
 
         std::env::remove_var("SHELBI_HOME");
@@ -701,7 +717,13 @@ mod tests {
 
         // No PID file → cleanup proceeds.
         let outcome = cleanup_stale_control_masters(std::process::id() as libc::pid_t).unwrap();
-        assert_eq!(outcome, CmCleanupOutcome::Scanned { removed: 1, kept: 1 });
+        assert_eq!(
+            outcome,
+            CmCleanupOutcome::Scanned {
+                removed: 1,
+                kept: 1
+            }
+        );
         assert!(!orphan.exists());
         assert!(live.exists());
         assert!(stray.exists());
@@ -725,7 +747,13 @@ mod tests {
         write_daemon_pid(0).unwrap();
         let outcome = cleanup_stale_control_masters(std::process::id() as libc::pid_t).unwrap();
         // orphan2 should be removed; live still alive.
-        assert!(matches!(outcome, CmCleanupOutcome::Scanned { removed: 1, kept: 1 }));
+        assert!(matches!(
+            outcome,
+            CmCleanupOutcome::Scanned {
+                removed: 1,
+                kept: 1
+            }
+        ));
         assert!(!orphan2.exists());
 
         std::env::remove_var("SHELBI_HOME");

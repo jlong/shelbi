@@ -140,7 +140,8 @@ impl SupervisionState {
             return SupervisionAction::None;
         }
 
-        self.restarts.retain(|&t| now.duration_since(t) < CRASH_LOOP_WINDOW);
+        self.restarts
+            .retain(|&t| now.duration_since(t) < CRASH_LOOP_WINDOW);
         if self.restarts.len() >= MAX_RESTARTS_IN_WINDOW {
             self.gave_up = true;
             return SupervisionAction::GiveUp;
@@ -172,10 +173,18 @@ mod tests {
     use super::*;
 
     fn dead_crash() -> SupervisionInputs {
-        SupervisionInputs { alive: false, intentional_shutdown: false, has_work: true }
+        SupervisionInputs {
+            alive: false,
+            intentional_shutdown: false,
+            has_work: true,
+        }
     }
     fn alive() -> SupervisionInputs {
-        SupervisionInputs { alive: true, intentional_shutdown: false, has_work: false }
+        SupervisionInputs {
+            alive: true,
+            intentional_shutdown: false,
+            has_work: false,
+        }
     }
 
     #[test]
@@ -201,7 +210,11 @@ mod tests {
         let mut s = SupervisionState::default();
         let t = Instant::now();
         s.decide(&alive(), t);
-        let stop = SupervisionInputs { alive: false, intentional_shutdown: true, has_work: true };
+        let stop = SupervisionInputs {
+            alive: false,
+            intentional_shutdown: true,
+            has_work: true,
+        };
         assert_eq!(s.decide(&stop, t), SupervisionAction::None);
         // And it stays down on subsequent dead ticks (no marker anymore):
         // the reset dropped `ever_alive`, so a crash-shaped observation is
@@ -214,7 +227,11 @@ mod tests {
         let mut s = SupervisionState::default();
         let t = Instant::now();
         s.decide(&alive(), t);
-        let idle = SupervisionInputs { alive: false, intentional_shutdown: false, has_work: false };
+        let idle = SupervisionInputs {
+            alive: false,
+            intentional_shutdown: false,
+            has_work: false,
+        };
         assert_eq!(s.decide(&idle, t), SupervisionAction::None);
     }
 
@@ -268,7 +285,10 @@ mod tests {
         assert_eq!(s.decide(&alive(), recovered), SupervisionAction::None);
         // …so a fresh crash much later is a clean first restart again, not
         // the second attempt of the old loop.
-        assert_eq!(s.decide(&dead_crash(), recovered), SupervisionAction::Restart);
+        assert_eq!(
+            s.decide(&dead_crash(), recovered),
+            SupervisionAction::Restart
+        );
     }
 
     #[test]

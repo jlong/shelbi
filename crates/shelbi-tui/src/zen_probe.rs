@@ -238,7 +238,9 @@ fn render_probe(f: &mut Frame, area: Rect) {
         .border_style(Style::default().fg(Color::Cyan))
         .title(Line::from(Span::styled(
             " Zen Mode hotkey ",
-            Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
         )));
     let inner = block.inner(overlay);
     f.render_widget(block, overlay);

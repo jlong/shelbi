@@ -422,9 +422,22 @@ mod tests {
     #[test]
     fn parses_every_named_key() {
         for name in [
-            "up", "down", "left", "right", "enter", "space", "esc", "tab",
-            "back-tab", "backspace", "delete", "insert", "home", "end",
-            "page-up", "page-down",
+            "up",
+            "down",
+            "left",
+            "right",
+            "enter",
+            "space",
+            "esc",
+            "tab",
+            "back-tab",
+            "backspace",
+            "delete",
+            "insert",
+            "home",
+            "end",
+            "page-up",
+            "page-down",
         ] {
             let _ = parse(name);
         }
@@ -457,8 +470,14 @@ mod tests {
 
     #[test]
     fn rejects_empty_input() {
-        assert!(matches!(KeyChord::parse("").unwrap_err(), ChordParseError::Empty));
-        assert!(matches!(KeyChord::parse("   ").unwrap_err(), ChordParseError::Empty));
+        assert!(matches!(
+            KeyChord::parse("").unwrap_err(),
+            ChordParseError::Empty
+        ));
+        assert!(matches!(
+            KeyChord::parse("   ").unwrap_err(),
+            ChordParseError::Empty
+        ));
     }
 
     #[test]
@@ -479,10 +498,32 @@ mod tests {
         // Every default chord we install must survive a parse→canonical→parse
         // round trip identically.
         let samples = [
-            "j", "shift-j", "ctrl-c", "alt-z", "ctrl-p", "up", "down", "left",
-            "right", "enter", "space", "esc", "tab", "back-tab", "backspace",
-            "delete", "insert", "home", "end", "page-up", "page-down", "f1",
-            "f12", "shift-up", "shift-down", "ctrl-alt-shift-x",
+            "j",
+            "shift-j",
+            "ctrl-c",
+            "alt-z",
+            "ctrl-p",
+            "up",
+            "down",
+            "left",
+            "right",
+            "enter",
+            "space",
+            "esc",
+            "tab",
+            "back-tab",
+            "backspace",
+            "delete",
+            "insert",
+            "home",
+            "end",
+            "page-up",
+            "page-down",
+            "f1",
+            "f12",
+            "shift-up",
+            "shift-down",
+            "ctrl-alt-shift-x",
         ];
         for s in samples {
             let a = parse(s);

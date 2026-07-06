@@ -109,7 +109,9 @@ pub fn run(args: Args) -> Result<()> {
                 outcome.canonical_name
             );
         } else {
-            println!("  2. spawn your first agent: shelbi spawn TASK --on hub --runner claude \"…\"");
+            println!(
+                "  2. spawn your first agent: shelbi spawn TASK --on hub --runner claude \"…\""
+            );
         }
         return Ok(());
     }
@@ -213,11 +215,7 @@ pub fn scaffold_with_prompt(args: Args) -> Result<ResolvedProjectRoot> {
 /// `--mode` wins when set; interactive mode falls back to the picker
 /// (prefilled from the heuristic); non-interactive without `--mode` is
 /// a hard error so scripts can't silently pick the wrong side.
-fn resolve_mode(
-    from_flag: Option<InitMode>,
-    interactive: bool,
-    root: &Path,
-) -> Result<InitMode> {
+fn resolve_mode(from_flag: Option<InitMode>, interactive: bool, root: &Path) -> Result<InitMode> {
     if let Some(m) = from_flag {
         return Ok(m);
     }
@@ -246,18 +244,11 @@ fn prompt_mode(root: &Path) -> Result<InitMode> {
     };
     println!();
     println!("Where should this project's shelbi config live?");
-    println!(
-        "  in-repo — committed at <repo>/.shelbi/project.yaml, shared with the team."
-    );
-    println!(
-        "  global  — per-user under ~/.shelbi/projects/<name>.yaml, not committed."
-    );
+    println!("  in-repo — committed at <repo>/.shelbi/project.yaml, shared with the team.");
+    println!("  global  — per-user under ~/.shelbi/projects/<name>.yaml, not committed.");
     println!("{recommendation_hint}");
 
-    let options = vec![
-        ModeChoice(InitMode::InRepo),
-        ModeChoice(InitMode::Global),
-    ];
+    let options = vec![ModeChoice(InitMode::InRepo), ModeChoice(InitMode::Global)];
     let starting_cursor = match recommended {
         InitMode::InRepo => 0,
         InitMode::Global => 1,
@@ -392,7 +383,8 @@ fn scaffold_project(resolved: &ResolvedProjectRoot, mode: InitMode) -> Result<()
     // concurrent `init` could land between the two and get clobbered). O_EXCL
     // makes "create only if absent" a single atomic syscall; an existing file
     // surfaces as `AlreadyExists`, which we treat as the idempotent no-op
-    // (cli-session-ux F9).
+    // (Shelbi ContextStore
+    // docs/planning:reviews/adversarial-2026-07/cli-session-ux.md F9).
     match std::fs::OpenOptions::new()
         .write(true)
         .create_new(true)
@@ -408,9 +400,10 @@ fn scaffold_project(resolved: &ResolvedProjectRoot, mode: InitMode) -> Result<()
             // workspace-settings template — to `<repo>/.shelbi/…`, where the
             // steps below materialize them.
             let (repo_field, config_mode): (String, Option<&str>) = match mode {
-                InitMode::InRepo => {
-                    (resolved.path.to_string_lossy().into_owned(), Some("in-repo"))
-                }
+                InitMode::InRepo => (
+                    resolved.path.to_string_lossy().into_owned(),
+                    Some("in-repo"),
+                ),
                 InitMode::Global => (String::new(), None),
             };
             let yaml =
@@ -430,8 +423,8 @@ fn scaffold_project(resolved: &ResolvedProjectRoot, mode: InitMode) -> Result<()
 
     write_workspace_settings_template(&resolved.name)?;
 
-    let outcomes = shelbi_state::materialize_default_agents(&resolved.name)
-        .map_err(|e| anyhow!(e))?;
+    let outcomes =
+        shelbi_state::materialize_default_agents(&resolved.name).map_err(|e| anyhow!(e))?;
     for outcome in outcomes {
         print_agent_materialize_outcome(&outcome);
     }
@@ -441,8 +434,7 @@ fn scaffold_project(resolved: &ResolvedProjectRoot, mode: InitMode) -> Result<()
     // `default.yaml`. `load_project` runs the same migration when the
     // project is opened, but writing it here keeps `shelbi init`'s
     // post-condition self-contained.
-    let statuses_path =
-        shelbi_state::statuses_path(&resolved.name).map_err(|e| anyhow!(e))?;
+    let statuses_path = shelbi_state::statuses_path(&resolved.name).map_err(|e| anyhow!(e))?;
     if !statuses_path.exists() {
         shelbi_state::scaffold_project_statuses(&resolved.name).map_err(|e| anyhow!(e))?;
         println!("✓ wrote project statuses: {}", statuses_path.display());
@@ -476,8 +468,8 @@ fn write_in_repo_config(root: &Path, name: &str) -> Result<()> {
 /// isn't a YAML map with a `name` key — we don't want a malformed
 /// commit to abort `shelbi init` on every clone.
 fn read_in_repo_name(path: &Path) -> Result<Option<String>> {
-    let text = std::fs::read_to_string(path)
-        .with_context(|| format!("reading {}", path.display()))?;
+    let text =
+        std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
     #[derive(serde::Deserialize)]
     struct Head {
         name: Option<String>,
@@ -598,14 +590,13 @@ fn run_pick_up(args: Args) -> Result<PickUpOutcome> {
     println!("✓ registered project: {}", yaml_path.display());
 
     write_workspace_settings_template(&local_alias)?;
-    let outcomes = shelbi_state::materialize_default_agents(&local_alias)
-        .map_err(|e| anyhow!(e))?;
+    let outcomes =
+        shelbi_state::materialize_default_agents(&local_alias).map_err(|e| anyhow!(e))?;
     for outcome in outcomes {
         print_agent_materialize_outcome(&outcome);
     }
 
-    let statuses_path =
-        shelbi_state::statuses_path(&local_alias).map_err(|e| anyhow!(e))?;
+    let statuses_path = shelbi_state::statuses_path(&local_alias).map_err(|e| anyhow!(e))?;
     if !statuses_path.exists() {
         shelbi_state::scaffold_project_statuses(&local_alias).map_err(|e| anyhow!(e))?;
         println!("✓ wrote project statuses: {}", statuses_path.display());
@@ -734,7 +725,10 @@ fn write_workspace_settings_template(project: &str) -> Result<()> {
         return Ok(());
     }
     shelbi_state::ensure_dir(template_path.parent().unwrap()).map_err(|e| anyhow!(e))?;
-    std::fs::write(&template_path, shelbi_state::DEFAULT_WORKSPACE_SETTINGS_TEMPLATE)?;
+    std::fs::write(
+        &template_path,
+        shelbi_state::DEFAULT_WORKSPACE_SETTINGS_TEMPLATE,
+    )?;
     println!(
         "✓ wrote workspace settings template: {}",
         template_path.display()
@@ -760,7 +754,10 @@ pub(super) fn print_agent_materialize_outcome(outcome: &AgentMaterializeOutcome)
                  (was the previous default, untouched — nothing to preserve)"
             );
         }
-        AgentMaterializeOutcome::Preserved { agent, first_notice } => {
+        AgentMaterializeOutcome::Preserved {
+            agent,
+            first_notice,
+        } => {
             if *first_notice {
                 println!(
                     "(preserved your custom agents/{agent}/instructions.md — \
@@ -903,7 +900,11 @@ mod tests {
         scaffold_project(&resolved, InitMode::Global).unwrap();
 
         let yaml = home.join("projects/myapp.yaml");
-        assert!(yaml.is_file(), "expected project YAML at {}", yaml.display());
+        assert!(
+            yaml.is_file(),
+            "expected project YAML at {}",
+            yaml.display()
+        );
         let body = std::fs::read_to_string(&yaml).unwrap();
         assert!(body.contains(&format!("work_dir: {}", project_root.display())));
 

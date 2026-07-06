@@ -85,7 +85,8 @@ pub fn launch_editor(path: &Path) -> Result<()> {
 /// zero. Unlike a bare `.status()` call this captures stderr and, on failure
 /// (non-zero exit OR a spawn error), surfaces it on our own stderr so a broken
 /// tmux invocation is diagnosable instead of silently collapsing to `false`
-/// (cli-session-ux F12). Shared across the CLI's non-TUI tmux call sites
+/// (Shelbi ContextStore docs/planning:reviews/adversarial-2026-07/cli-session-ux.md
+/// F12). Shared across the CLI's non-TUI tmux call sites
 /// (`open`, `palette`, `quit_project`, `quit_shelbi`) so the diagnostics and
 /// stderr handling live in one place (F14). Not for use inside a live ratatui
 /// screen — writing to stderr there would corrupt the alt-screen; those paths

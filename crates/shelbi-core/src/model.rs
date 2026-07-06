@@ -2515,7 +2515,8 @@ updated_at: 2026-06-19T00:00:00Z
 
     #[test]
     fn non_string_params_round_trip_and_are_excluded_from_substitution() {
-        // Forward-compat (adversarial review F6): a *newer* binary adds
+        // Forward-compat (Shelbi ContextStore
+        // docs/planning:reviews/adversarial-2026-07/core-model.md F6): a *newer* binary adds
         // typed scalar fields; an *older* binary must still parse the whole
         // task (not drop the card) and preserve those fields verbatim on a
         // read-modify-write. A `String`-typed `params` would fail

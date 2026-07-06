@@ -29,7 +29,8 @@ pub fn matches_zen_toggle(code: KeyCode, mods: KeyModifiers, chord: ZenToggleCho
             // Crossterm sometimes reports the SHIFT bit set on Alt+letter
             // depending on the terminal; the only thing we care about is
             // that ALT is held and the key is z (case-insensitive).
-            mods.contains(KeyModifiers::ALT) && matches!(code, KeyCode::Char('z') | KeyCode::Char('Z'))
+            mods.contains(KeyModifiers::ALT)
+                && matches!(code, KeyCode::Char('z') | KeyCode::Char('Z'))
         }
         ZenToggleChord::CtrlBackslash => {
             mods.contains(KeyModifiers::CONTROL) && matches!(code, KeyCode::Char('\\'))

@@ -211,7 +211,10 @@ fn status_launchd() -> Result<()> {
     if let Some(le) = last_exit {
         println!("  last exit code:  {le}");
     }
-    println!("  plist:           {}", launch_agent_plist_path()?.display());
+    println!(
+        "  plist:           {}",
+        launch_agent_plist_path()?.display()
+    );
     Ok(())
 }
 
@@ -390,8 +393,7 @@ fn uninstall_systemd() -> Result<()> {
 
     let unit_path = systemd_unit_path()?;
     if unit_path.exists() {
-        fs::remove_file(&unit_path)
-            .with_context(|| format!("removing {}", unit_path.display()))?;
+        fs::remove_file(&unit_path).with_context(|| format!("removing {}", unit_path.display()))?;
         println!("✓ removed {}", unit_path.display());
     } else {
         println!("(no unit at {})", unit_path.display());
@@ -431,9 +433,7 @@ fn restart_systemd() -> Result<()> {
 #[cfg(target_os = "linux")]
 fn systemd_unit_path() -> Result<PathBuf> {
     let home = dirs::home_dir().context("resolving $HOME for systemd unit path")?;
-    Ok(home
-        .join(".config/systemd/user")
-        .join(SYSTEMD_SERVICE_NAME))
+    Ok(home.join(".config/systemd/user").join(SYSTEMD_SERVICE_NAME))
 }
 
 #[cfg(target_os = "linux")]
@@ -522,7 +522,10 @@ mod tests {
             stderr_path: PathBuf::from("/Users/dev/.shelbi/logs/daemon.err"),
         };
         let plist = render_launchd_plist(&inputs);
-        assert!(plist.contains("<string>co.32pixels.shelbi</string>"), "{plist}");
+        assert!(
+            plist.contains("<string>co.32pixels.shelbi</string>"),
+            "{plist}"
+        );
         assert!(
             plist.contains("<string>/Users/dev/bin/shelbi</string>"),
             "absolute binary path: {plist}"
@@ -554,7 +557,10 @@ mod tests {
             stderr_path: PathBuf::from("/o&p<x>/.shelbi/logs/daemon.err"),
         };
         let plist = render_launchd_plist(&inputs);
-        assert!(plist.contains("/o&amp;p&lt;x&gt;/shelbi"), "escaped: {plist}");
+        assert!(
+            plist.contains("/o&amp;p&lt;x&gt;/shelbi"),
+            "escaped: {plist}"
+        );
         assert!(!plist.contains("/o&p<x>/shelbi"), "raw leaked: {plist}");
     }
 
@@ -614,7 +620,10 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn xml_escape_handles_all_specials() {
-        assert_eq!(xml_escape("a&b<c>d\"e'f"), "a&amp;b&lt;c&gt;d&quot;e&apos;f");
+        assert_eq!(
+            xml_escape("a&b<c>d\"e'f"),
+            "a&amp;b&lt;c&gt;d&quot;e&apos;f"
+        );
         assert_eq!(xml_escape("plain/path/to/binary"), "plain/path/to/binary");
     }
 }

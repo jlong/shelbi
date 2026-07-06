@@ -350,10 +350,7 @@ impl Workflow {
     /// The error for an unknown id includes the full list of available
     /// ids — the user contract documented in `Plans/shared-statuses.md`
     /// (Loader validation rules).
-    pub fn resolve_against(
-        mut self,
-        statuses: &crate::ProjectStatuses,
-    ) -> crate::Result<Self> {
+    pub fn resolve_against(mut self, statuses: &crate::ProjectStatuses) -> crate::Result<Self> {
         for st in &mut self.statuses {
             let known = statuses.get(&st.id).ok_or_else(|| {
                 let available = statuses
@@ -509,9 +506,7 @@ impl<'de> Deserialize<'de> for Workflow {
 pub fn default_workflow() -> Workflow {
     Workflow {
         name: "default".to_string(),
-        description: Some(
-            "The standard one-track flow shipped with every project.".to_string(),
-        ),
+        description: Some("The standard one-track flow shipped with every project.".to_string()),
         statuses: vec![
             Status {
                 id: "backlog".into(),
@@ -778,7 +773,6 @@ pub enum Owner {
     Agent,
 }
 
-
 /// Default agent name dispatched for a status whose legacy YAML used
 /// bare `owner: agent` on a `ready`-category status. Matches the
 /// `agents/orchestrator/` workspace materialized by `shelbi init`.
@@ -973,7 +967,11 @@ pub struct WorkflowZenConfig {
     /// CI watch timeout for this workflow — overrides
     /// `project.zen.ci_timeout` when set. Serialized as a number of
     /// seconds, matching the project-level field's wire format.
-    #[serde(default, with = "opt_duration_secs", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        with = "opt_duration_secs",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub ci_timeout: Option<Duration>,
 
     /// Danger-glob list for this workflow — overrides
@@ -1001,19 +999,14 @@ mod opt_duration_secs {
 
     use serde::{Deserialize, Deserializer, Serializer};
 
-    pub fn serialize<S: Serializer>(
-        d: &Option<Duration>,
-        s: S,
-    ) -> Result<S::Ok, S::Error> {
+    pub fn serialize<S: Serializer>(d: &Option<Duration>, s: S) -> Result<S::Ok, S::Error> {
         match d {
             Some(d) => s.serialize_u64(d.as_secs()),
             None => s.serialize_none(),
         }
     }
 
-    pub fn deserialize<'de, D: Deserializer<'de>>(
-        d: D,
-    ) -> Result<Option<Duration>, D::Error> {
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Option<Duration>, D::Error> {
         let opt = Option::<u64>::deserialize(d)?;
         Ok(opt.map(Duration::from_secs))
     }
@@ -1116,8 +1109,7 @@ fn convert_raw_workflow(raw: RawWorkflow) -> crate::Result<(Workflow, Vec<Status
         // migration so it can tell "no default for this real category"
         // apart from "category not yet resolved" — see below. The Status
         // struct still gets the sentinel-filled value.
-        let (owner, agent, migration) =
-            resolve_owner_agent(&id, &st.owner, st.agent, st.category)?;
+        let (owner, agent, migration) = resolve_owner_agent(&id, &st.owner, st.agent, st.category)?;
         let category = st.category.unwrap_or(StatusCategory::Backlog);
         if let Some(m) = migration {
             migrations.push(m);
@@ -1148,10 +1140,7 @@ fn convert_raw_workflow(raw: RawWorkflow) -> crate::Result<(Workflow, Vec<Status
 
 /// Fill in the id↔name fallback for legacy workflow YAMLs that only
 /// carried one of the two before the split.
-fn resolve_id_name(
-    id: Option<String>,
-    name: Option<String>,
-) -> crate::Result<(String, String)> {
+fn resolve_id_name(id: Option<String>, name: Option<String>) -> crate::Result<(String, String)> {
     match (id, name) {
         (Some(id), Some(name)) => Ok((id, name)),
         (Some(id), None) => {
@@ -1423,13 +1412,27 @@ statuses:
         let ids: Vec<_> = wf.statuses.iter().map(|s| s.id.as_str()).collect();
         assert_eq!(
             ids,
-            vec!["backlog", "todo", "in-progress", "review", "done", "canceled"]
+            vec![
+                "backlog",
+                "todo",
+                "in-progress",
+                "review",
+                "done",
+                "canceled"
+            ]
         );
 
         let names: Vec<_> = wf.statuses.iter().map(|s| s.name.as_str()).collect();
         assert_eq!(
             names,
-            vec!["Backlog", "Todo", "In Progress", "Review", "Done", "Canceled"]
+            vec![
+                "Backlog",
+                "Todo",
+                "In Progress",
+                "Review",
+                "Done",
+                "Canceled"
+            ]
         );
 
         let cats: Vec<_> = wf.statuses.iter().map(|s| s.category).collect();
@@ -1460,8 +1463,7 @@ statuses:
 
         // The two-field design: each non-terminal status names the agent
         // that runs it under Zen. Terminal Done / Canceled stay None.
-        let agents: Vec<Option<&str>> =
-            wf.statuses.iter().map(|s| s.agent.as_deref()).collect();
+        let agents: Vec<Option<&str>> = wf.statuses.iter().map(|s| s.agent.as_deref()).collect();
         assert_eq!(
             agents,
             vec![
@@ -1489,8 +1491,8 @@ statuses:
         // a status entry.
         for line in y.lines() {
             assert!(
-                !line.trim_start().starts_with("name:") || !line.starts_with("  -")
-                    && !line.starts_with("    name:"),
+                !line.trim_start().starts_with("name:")
+                    || !line.starts_with("  -") && !line.starts_with("    name:"),
                 "unexpected per-status name: in {y}",
             );
         }
@@ -1556,7 +1558,11 @@ statuses:
         let (wf, diags) = Workflow::from_yaml_str_with_diagnostics(yaml).unwrap();
         assert_eq!(wf.statuses[0].owner, Owner::Agent);
         assert_eq!(wf.statuses[0].agent.as_deref(), Some("either"));
-        assert_eq!(diags.len(), 1, "expected one bundled diagnostic, got {diags:?}");
+        assert_eq!(
+            diags.len(),
+            1,
+            "expected one bundled diagnostic, got {diags:?}"
+        );
         assert!(diags[0].contains("legacy"));
         assert!(diags[0].contains("either"));
     }
@@ -1582,7 +1588,9 @@ statuses:
   - { name: Todo, category: ready, owner: agent, agent: orchestrator }
 "#;
         let err = Workflow::from_yaml_str(yaml).unwrap_err();
-        assert!(matches!(err, Error::InvalidWorkflow(ref m) if m.contains("name must not be empty")));
+        assert!(
+            matches!(err, Error::InvalidWorkflow(ref m) if m.contains("name must not be empty"))
+        );
     }
 
     #[test]
@@ -1593,7 +1601,9 @@ statuses:
   - { id: "", name: Todo, category: ready, owner: agent, agent: orchestrator }
 "#;
         let err = Workflow::from_yaml_str(yaml).unwrap_err();
-        assert!(matches!(err, Error::InvalidWorkflow(ref m) if m.contains("status id must not be empty")));
+        assert!(
+            matches!(err, Error::InvalidWorkflow(ref m) if m.contains("status id must not be empty"))
+        );
     }
 
     #[test]
@@ -1885,7 +1895,10 @@ transitions:
         // the canonical `review` id (category handoff) trips it — display
         // labels (`Review`) and non-handoff statuses never do.
         let wf = default_workflow();
-        assert!(wf.transitions.is_none(), "default ships without transitions");
+        assert!(
+            wf.transitions.is_none(),
+            "default ships without transitions"
+        );
         assert!(wf.fires_merge_bar("review"));
         assert!(!wf.fires_merge_bar("Review"), "name is not an id");
         assert!(!wf.fires_merge_bar("in-progress"));
@@ -1965,7 +1978,10 @@ statuses:
   - { id: todo, name: Todo, category: ready, owner: agent, agent: orchestrator }
 "#;
         let (wf, diags) = Workflow::from_yaml_str_with_diagnostics(yaml).unwrap();
-        assert!(diags.is_empty(), "explicit two-field form should not warn: {diags:?}");
+        assert!(
+            diags.is_empty(),
+            "explicit two-field form should not warn: {diags:?}"
+        );
         assert_eq!(wf.statuses[0].owner, Owner::Agent);
         assert_eq!(wf.statuses[0].agent.as_deref(), Some("orchestrator"));
     }
@@ -2009,7 +2025,11 @@ statuses:
         assert_eq!(wf.statuses[1].owner, Owner::Agent);
         assert_eq!(wf.statuses[1].agent.as_deref(), Some("developer"));
         // Exactly one diagnostic, even though two statuses migrated.
-        assert_eq!(diags.len(), 1, "expected one bundled diagnostic, got: {diags:?}");
+        assert_eq!(
+            diags.len(),
+            1,
+            "expected one bundled diagnostic, got: {diags:?}"
+        );
         let msg = &diags[0];
         assert!(msg.contains("legacy"), "msg: {msg}");
         assert!(msg.contains("`todo`"), "msg: {msg}");
@@ -2048,7 +2068,10 @@ statuses:
             Error::InvalidWorkflow(msg) => {
                 assert!(msg.contains("alice"), "msg: {msg}");
                 assert!(msg.contains("bob"), "msg: {msg}");
-                assert!(msg.contains("conflict") || msg.contains("drop one"), "msg: {msg}");
+                assert!(
+                    msg.contains("conflict") || msg.contains("drop one"),
+                    "msg: {msg}"
+                );
             }
             other => panic!("expected InvalidWorkflow, got {other:?}"),
         }
@@ -2158,7 +2181,10 @@ git:
             .resolve_git(&params(&[("feature", "auth-rewrite")]))
             .unwrap()
             .expect("git block present");
-        assert_eq!(resolved.base_branch.as_deref(), Some("feature/auth-rewrite"));
+        assert_eq!(
+            resolved.base_branch.as_deref(),
+            Some("feature/auth-rewrite")
+        );
         assert_eq!(resolved.merge_strategy, MergeStrategy::Merge);
     }
 
@@ -2203,9 +2229,7 @@ git:
   base_branch: feature/{{feature}}-{{region}}
 "#;
         let wf = Workflow::from_yaml_str(yaml).unwrap();
-        let err = wf
-            .resolve_git(&params(&[("feature", "auth")]))
-            .unwrap_err();
+        let err = wf.resolve_git(&params(&[("feature", "auth")])).unwrap_err();
         match err {
             Error::MissingTaskParams { params, .. } => {
                 assert_eq!(params, vec!["region".to_string()]);
@@ -2588,7 +2612,10 @@ statuses:
         let out = serde_yaml::to_string(&wf.statuses[0]).unwrap();
         assert!(out.contains("tags"), "tags should serialize: {out}");
         let out = serde_yaml::to_string(&wf.statuses[2]).unwrap();
-        assert!(!out.contains("tags"), "tag-less status must stay lean: {out}");
+        assert!(
+            !out.contains("tags"),
+            "tag-less status must stay lean: {out}"
+        );
     }
 
     #[test]

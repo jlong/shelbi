@@ -215,7 +215,8 @@ pub fn show_view(project_name: &str, view: &str) -> Result<()> {
     // Swap the target pane into the dashboard's right slot. A non-zero exit
     // here means the click silently no-ops (e.g. the stored pane id is stale
     // or the dashboard layout lost its `{right}` slot) — surface it instead
-    // of discarding the status (orchestrator-lifecycle F13).
+    // of discarding the status (Shelbi ContextStore
+    // docs/planning:reviews/adversarial-2026-07/orchestrator-lifecycle.md F13).
     let dashboard = format!("{session}:dashboard.{{right}}");
     let swap = std::process::Command::new("tmux")
         .args(["swap-pane", "-s", pane_id, "-t", &dashboard])

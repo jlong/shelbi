@@ -87,8 +87,8 @@ fn list(project: &str) -> Result<()> {
             .map(|set| set.iter().cloned().collect::<Vec<_>>().join(", "))
             .filter(|s| !s.is_empty())
             .unwrap_or_else(|| "-".to_string());
-        let skill_count = shelbi_state::count_agent_skills(project, name)
-            .map_err(|e| anyhow!(e))?;
+        let skill_count =
+            shelbi_state::count_agent_skills(project, name).map_err(|e| anyhow!(e))?;
         let customized = customized_marker(project, name)?;
         println!(
             "{:<14} {:<26} {:<7} {}",
@@ -114,16 +114,18 @@ fn list(project: &str) -> Result<()> {
 ///   compare against.
 fn customized_marker(project: &str, agent: &str) -> Result<&'static str> {
     use shelbi_state::AgentDivergence;
-    Ok(match shelbi_state::agent_divergence(project, agent).map_err(|e| anyhow!(e))? {
-        None => "-",
-        // Pristine-current and pristine-stale are both "not user-customized".
-        // Pristine-stale re-materializes to the current default on the next
-        // `shelbi reload`, but it was never edited, so `no` is truthful.
-        Some(AgentDivergence::PristineCurrent | AgentDivergence::PristineStale) => "no",
-        // A genuine edit, or a missing instructions.md (self-heal will
-        // recreate it, but right now it's divergent from the bundled body).
-        Some(AgentDivergence::Customized) => "yes",
-    })
+    Ok(
+        match shelbi_state::agent_divergence(project, agent).map_err(|e| anyhow!(e))? {
+            None => "-",
+            // Pristine-current and pristine-stale are both "not user-customized".
+            // Pristine-stale re-materializes to the current default on the next
+            // `shelbi reload`, but it was never edited, so `no` is truthful.
+            Some(AgentDivergence::PristineCurrent | AgentDivergence::PristineStale) => "no",
+            // A genuine edit, or a missing instructions.md (self-heal will
+            // recreate it, but right now it's divergent from the bundled body).
+            Some(AgentDivergence::Customized) => "yes",
+        },
+    )
 }
 
 fn agents_dir_display(project: &str) -> Result<String> {
@@ -138,8 +140,7 @@ fn show(project: &str, name: &str) -> Result<()> {
     // must too, so a traversal-shaped argument is rejected up front with the
     // same message rather than reaching `agent_workspace_dir`'s join (F15).
     validate_agent_name(name)?;
-    let workspace =
-        shelbi_state::agent_workspace_dir(project, name).map_err(|e| anyhow!(e))?;
+    let workspace = shelbi_state::agent_workspace_dir(project, name).map_err(|e| anyhow!(e))?;
     if !workspace.exists() {
         bail!(
             "agent `{name}` not found at {}. Run `shelbi agent new {name}` to create it.",
@@ -170,10 +171,7 @@ fn show(project: &str, name: &str) -> Result<()> {
         println!("  (none)");
     } else {
         for s in &skills {
-            let description = s
-                .description
-                .as_deref()
-                .unwrap_or("(no description)");
+            let description = s.description.as_deref().unwrap_or("(no description)");
             println!("- {} — {description}", s.name);
         }
     }
@@ -182,8 +180,7 @@ fn show(project: &str, name: &str) -> Result<()> {
 
 fn new(project: &str, name: &str) -> Result<()> {
     validate_agent_name(name)?;
-    let workspace =
-        shelbi_state::agent_workspace_dir(project, name).map_err(|e| anyhow!(e))?;
+    let workspace = shelbi_state::agent_workspace_dir(project, name).map_err(|e| anyhow!(e))?;
     if workspace.exists() {
         bail!("agent `{name}` already exists at {}", workspace.display());
     }
@@ -195,21 +192,16 @@ fn new(project: &str, name: &str) -> Result<()> {
     fs::write(&instructions_path, placeholder_instructions(name))?;
     println!("✓ agent '{name}' scaffolded at agents/{name}/.");
     println!();
-    println!(
-        "next: edit agents/{name}/instructions.md, then bind it to a workflow status:"
-    );
+    println!("next: edit agents/{name}/instructions.md, then bind it to a workflow status:");
     println!("  workflows/<workflow>.yaml: add `agent: {name}` to a status's frontmatter.");
     Ok(())
 }
 
 fn edit(project: &str, name: &str) -> Result<()> {
     validate_agent_name(name)?;
-    let workspace =
-        shelbi_state::agent_workspace_dir(project, name).map_err(|e| anyhow!(e))?;
+    let workspace = shelbi_state::agent_workspace_dir(project, name).map_err(|e| anyhow!(e))?;
     if !workspace.exists() {
-        bail!(
-            "agent `{name}` not found. Run 'shelbi agent new {name}' to create it."
-        );
+        bail!("agent `{name}` not found. Run 'shelbi agent new {name}' to create it.");
     }
     let instructions_path =
         shelbi_state::agent_instructions_path(project, name).map_err(|e| anyhow!(e))?;
@@ -292,9 +284,7 @@ fn validate_agent_name(name: &str) -> Result<()> {
         bail!("agent name `{name}` must not start with `.`");
     }
     if name.starts_with('_') {
-        bail!(
-            "agent name `{name}` must not start with `_` (reserved for the shared preamble dir)"
-        );
+        bail!("agent name `{name}` must not start with `_` (reserved for the shared preamble dir)");
     }
     for c in name.chars() {
         if !(c.is_ascii_alphanumeric() || c == '-' || c == '_') {
@@ -407,15 +397,9 @@ mod tests {
         // No frontmatter.
         assert_eq!(parse_skill_description("no fm\n"), None);
         // Frontmatter without description key.
-        assert_eq!(
-            parse_skill_description("---\nname: x\n---\nbody\n"),
-            None
-        );
+        assert_eq!(parse_skill_description("---\nname: x\n---\nbody\n"), None);
         // Malformed YAML — must not panic, just degrade to None.
-        assert_eq!(
-            parse_skill_description("---\n: :\n---\nbody\n"),
-            None
-        );
+        assert_eq!(parse_skill_description("---\n: :\n---\nbody\n"), None);
     }
 
     #[test]
@@ -515,11 +499,7 @@ mod tests {
         materialize_defaults("p");
         // The workflow loader requires `statuses.yaml` to be present —
         // stand in for the `shelbi init` / `shelbi reload` step.
-        shelbi_state::save_project_statuses(
-            "p",
-            &shelbi_core::default_project_statuses(),
-        )
-        .unwrap();
+        shelbi_state::save_project_statuses("p", &shelbi_core::default_project_statuses()).unwrap();
         // Author two workflows that both bind a status to `developer`.
         let dir = shelbi_state::workflows_dir("p").unwrap();
         std::fs::create_dir_all(&dir).unwrap();
@@ -684,5 +664,4 @@ statuses:
         std::env::remove_var("SHELBI_HOME");
         let _ = std::fs::remove_dir_all(&home);
     }
-
 }

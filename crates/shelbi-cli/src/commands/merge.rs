@@ -39,7 +39,13 @@ pub fn run(project_opt: Option<String>, id: String, pr: bool) -> Result<()> {
     preflight(&host, &machine, &target)?;
     capture_uncommitted(&host, &file.agent.worktree, &id)?;
     integrate_branch(&host, &machine, &branch, &target, strategy, &id)?;
-    cleanup(&host, &machine, &file.agent.worktree, &branch, &file.agent.tmux);
+    cleanup(
+        &host,
+        &machine,
+        &file.agent.worktree,
+        &branch,
+        &file.agent.tmux,
+    );
 
     let mut updated = file.agent.clone();
     updated.status = Status::Done;
@@ -89,17 +95,12 @@ fn run_pr(
     // 5. Open the PR. Title pulled from the task heading in the markdown body;
     //    body is the rest of the agent file (sans the H1) plus the diff stat
     //    and transcript sections.
-    let (title, body) = derive_pr_text(
-        &file.body,
-        id,
-        diff_stat.as_deref(),
-        transcript.as_deref(),
-    );
+    let (title, body) = derive_pr_text(&file.body, id, diff_stat.as_deref(), transcript.as_deref());
     let pr_url = shelbi_ssh::run_capture(
         host,
         [
-            "gh", "-C", &wt, "pr", "create", "--base", target, "--head", branch, "--title",
-            &title, "--body", &body,
+            "gh", "-C", &wt, "pr", "create", "--base", target, "--head", branch, "--title", &title,
+            "--body", &body,
         ],
     )
     .map_err(|e| anyhow!(e))?;
@@ -134,7 +135,11 @@ fn derive_pr_text(
             continue;
         }
         // First line of task prompt becomes the PR title (truncated).
-        title = if t.len() > 70 { format!("{}…", &t[..69]) } else { t.to_string() };
+        title = if t.len() > 70 {
+            format!("{}…", &t[..69])
+        } else {
+            t.to_string()
+        };
         break;
     }
 
@@ -168,8 +173,8 @@ fn derive_pr_text(
 /// reflects what the PR actually adds, not unrelated drift on `target`.
 fn capture_diff_stat(host: &Host, worktree: &str, target: &str, branch: &str) -> Option<String> {
     let range = format!("{target}...{branch}");
-    let out = shelbi_ssh::run_capture(host, ["git", "-C", worktree, "diff", "--stat", &range])
-        .ok()?;
+    let out =
+        shelbi_ssh::run_capture(host, ["git", "-C", worktree, "diff", "--stat", &range]).ok()?;
     let trimmed = out.trim();
     if trimmed.is_empty() {
         None
@@ -291,7 +296,9 @@ fn integrate_branch(
             // branch is a fast-forward — matches gh's behavior.
             shelbi_ssh::run_capture(
                 host,
-                ["git", "-C", &repo, "merge", "--no-ff", "-m", &summary, branch],
+                [
+                    "git", "-C", &repo, "merge", "--no-ff", "-m", &summary, branch,
+                ],
             )
             .map_err(|e| anyhow!(e))?;
         }
@@ -300,18 +307,12 @@ fn integrate_branch(
             // replays it onto target. Switch back to target and fast-
             // forward so the parent repo lands on the rebased tip with
             // `target` as the current branch.
-            shelbi_ssh::run_capture(
-                host,
-                ["git", "-C", &repo, "rebase", target, branch],
-            )
-            .map_err(|e| anyhow!(e))?;
+            shelbi_ssh::run_capture(host, ["git", "-C", &repo, "rebase", target, branch])
+                .map_err(|e| anyhow!(e))?;
             shelbi_ssh::run_capture(host, ["git", "-C", &repo, "checkout", target])
                 .map_err(|e| anyhow!(e))?;
-            shelbi_ssh::run_capture(
-                host,
-                ["git", "-C", &repo, "merge", "--ff-only", branch],
-            )
-            .map_err(|e| anyhow!(e))?;
+            shelbi_ssh::run_capture(host, ["git", "-C", &repo, "merge", "--ff-only", branch])
+                .map_err(|e| anyhow!(e))?;
         }
     }
     Ok(())
@@ -362,7 +363,8 @@ mod tests {
 
     #[test]
     fn pr_body_includes_diff_stat_when_provided() {
-        let stat = " src/foo.rs | 12 +++++++-----\n 1 file changed, 7 insertions(+), 5 deletions(-)";
+        let stat =
+            " src/foo.rs | 12 +++++++-----\n 1 file changed, 7 insertions(+), 5 deletions(-)";
         let (_, body) = derive_pr_text("# Task\n\nFix.\n", "fix", Some(stat), None);
         assert!(body.contains("## Files changed"));
         assert!(body.contains("src/foo.rs | 12 +++++++-----"));

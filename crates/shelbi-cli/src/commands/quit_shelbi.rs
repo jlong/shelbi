@@ -237,9 +237,7 @@ fn build_local_teardown_script(names: &[String]) -> String {
         ));
     }
     for name in names {
-        s.push_str(&format!(
-            "tmux kill-session -t shelbi-{name} 2>/dev/null; "
-        ));
+        s.push_str(&format!("tmux kill-session -t shelbi-{name} 2>/dev/null; "));
     }
     // Belt-and-braces: most clients detach automatically when their
     // session is killed above, but a client attached to a non-shelbi

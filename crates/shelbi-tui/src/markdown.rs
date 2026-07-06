@@ -303,9 +303,7 @@ mod tests {
 
     /// True if any span in the line carries the inline-code background.
     fn has_code_bg(line: &Line<'_>) -> bool {
-        line.spans
-            .iter()
-            .any(|s| s.style.bg == Some(CODE_BG))
+        line.spans.iter().any(|s| s.style.bg == Some(CODE_BG))
     }
 
     #[test]

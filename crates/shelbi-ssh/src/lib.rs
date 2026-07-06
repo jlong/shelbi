@@ -145,7 +145,8 @@ fn apply_ssh_no_forward_opts(cmd: &mut Command) {
 /// survive the remote shell as exactly one literal word, giving the SSH
 /// arm the same "argv is argv" semantics the local arm already has.
 ///
-/// This closes F1/F2 from the process-boundaries review: an unquoted
+/// This closes F1/F2 from Shelbi ContextStore
+/// docs/planning:reviews/adversarial-2026-07/process-boundaries.md: an unquoted
 /// `#{pane_title}` (comment-stripped by the remote shell) or a command
 /// string containing `&&` / `;` / `$` / spaces no longer silently
 /// re-parses on the far side. Callers must therefore pass *raw* argv and
@@ -284,7 +285,9 @@ where
     // `wait`, so the long-lived hub daemon would accumulate `<defunct>` ssh
     // processes, and (b) surface a bare `BrokenPipe` while the real
     // diagnostic ("Connection refused", "Permission denied") sits unread in
-    // the child's stderr (adversarial review F8). Instead we record the
+    // the child's stderr (Shelbi ContextStore
+    // docs/planning:reviews/adversarial-2026-07/process-boundaries.md F8).
+    // Instead we record the
     // error, always drain to `wait_with_output` below (which reaps the
     // child), and fold its stderr into the returned error.
     let write_err = {
@@ -417,7 +420,8 @@ where
 /// unbound while `ExitOnForwardFailure=no` + `LogLevel=ERROR` swallow the
 /// warning. The result would otherwise be every worker→hub message silently
 /// dropping into a dead file until someone cleans it by hand (adversarial
-/// review F7).
+/// Shelbi ContextStore
+/// docs/planning:reviews/adversarial-2026-07/process-boundaries.md F7).
 ///
 /// This is a no-op for [`Host::Local`]. For SSH hosts it:
 ///  1. Drops any half-broken master, removes the stale remote

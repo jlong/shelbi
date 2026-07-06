@@ -1890,7 +1890,8 @@ mod tests {
 
     #[test]
     fn workspace_status_path_rejects_traversal_names() {
-        // Residual chokepoint hardening (state-runtime F14): a `..`/absolute/
+        // Residual chokepoint hardening (Shelbi ContextStore
+        // docs/planning:reviews/adversarial-2026-07/state-runtime.md F14): a `..`/absolute/
         // separator workspace name must not escape `~/.shelbi/workspaces/`.
         for bad in ["..", "../evil", "a/b", "/abs", "nested/../escape", ""] {
             assert!(

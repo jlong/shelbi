@@ -772,7 +772,9 @@ fn render_title(f: &mut Frame, app: &ActivityApp, area: Rect) {
     let title = Line::from(vec![
         Span::styled(
             "Activity",
-            Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
         ),
         Span::styled(
             format!("   {}", app.project_name),
@@ -872,7 +874,9 @@ fn render_footer(f: &mut Frame, app: &ActivityApp, area: Rect) {
         fc(km.activity.first_chord_for(ActivityAction::Refresh)),
         fc(km.activity.first_chord_for(ActivityAction::ResetFilter)),
         fc(km.activity.first_chord_for(ActivityAction::ToggleZenFilter)),
-        fc(km.activity.first_chord_for(ActivityAction::ToggleWorkspacesFilter)),
+        fc(km
+            .activity
+            .first_chord_for(ActivityAction::ToggleWorkspacesFilter)),
     );
     let footer = Paragraph::new(Line::from(Span::styled(
         text,
@@ -1054,7 +1058,9 @@ fn parse_zen_reason(reason: &str) -> Option<ZenReason> {
     let extras = parse_kv(rest);
     let get = |k: &str| extras.get(k).cloned();
     Some(match head {
-        "orchestrator:zen-promote" => ZenReason::Promote { category: get("category") },
+        "orchestrator:zen-promote" => ZenReason::Promote {
+            category: get("category"),
+        },
         "orchestrator:zen-merge" => ZenReason::Merge { sha: get("sha") },
         "zen:failed-checks" => ZenReason::FailedChecks {
             cmd: get("cmd"),
@@ -1064,9 +1070,15 @@ fn parse_zen_reason(reason: &str) -> Option<ZenReason> {
             files: get("files"),
             lines: get("lines"),
         },
-        "zen:danger-path" => ZenReason::DangerPath { paths: get("paths") },
-        "zen:ci-timeout" => ZenReason::CiTimeout { duration: get("duration") },
-        "zen:merge-conflict" => ZenReason::MergeConflict { files: get("files") },
+        "zen:danger-path" => ZenReason::DangerPath {
+            paths: get("paths"),
+        },
+        "zen:ci-timeout" => ZenReason::CiTimeout {
+            duration: get("duration"),
+        },
+        "zen:merge-conflict" => ZenReason::MergeConflict {
+            files: get("files"),
+        },
         other if other.starts_with("zen:") || other.starts_with("orchestrator:zen-") => {
             ZenReason::Other
         }
@@ -1177,7 +1189,12 @@ struct Row {
 impl Row {
     /// A row with the common defaults filled in — bright title, no glyph,
     /// no trail, no secondary. Callers set the fields they care about.
-    fn new(marker: Marker, verb: impl Into<String>, title: impl Into<String>, time: String) -> Self {
+    fn new(
+        marker: Marker,
+        verb: impl Into<String>,
+        title: impl Into<String>,
+        time: String,
+    ) -> Self {
         Row {
             marker,
             identity: Vec::new(),
@@ -1252,9 +1269,9 @@ fn render_event(
             now,
             started_at,
         ),
-        Event::Workspace {
-            ts, name, new, ..
-        } => render_workspace_event(*ts, name, *new, width, now),
+        Event::Workspace { ts, name, new, .. } => {
+            render_workspace_event(*ts, name, *new, width, now)
+        }
         Event::ZenDryRun {
             ts,
             task_id,
@@ -1305,7 +1322,9 @@ fn render_zen_dryrun_event(
     // "what Zen would have done", visibly a preview rather than a real move.
     row.identity = vec![Span::styled(
         "[DRYRUN]".to_string(),
-        Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+        Style::default()
+            .fg(Color::Yellow)
+            .add_modifier(Modifier::BOLD),
     )];
     row.glyph = GLYPH_PROMOTED;
     row.glyph_color = Color::Yellow;
@@ -1383,7 +1402,12 @@ fn render_task_event(
             let took = started_at
                 .map(|s| format!("took {} · ", short_duration(ts - s)))
                 .unwrap_or_default();
-            let mut row = Row::new(Marker::Agent(color), "finished", title, format!("{took}{when}"));
+            let mut row = Row::new(
+                Marker::Agent(color),
+                "finished",
+                title,
+                format!("{took}{when}"),
+            );
             row.identity = agent_identity(&name, color, agent);
             row.glyph = GLYPH_FINISHED;
             row.glyph_color = category_color(to.category());
@@ -1707,7 +1731,10 @@ fn paint_secondary(sec: SecondaryLine, width: usize) -> Line<'static> {
     let text = truncate(&text, budget);
     Line::from(vec![
         Span::raw(" ".repeat(SECONDARY_INDENT)),
-        Span::styled(format!("{icon}{text}"), Style::default().fg(Color::DarkGray)),
+        Span::styled(
+            format!("{icon}{text}"),
+            Style::default().fg(Color::DarkGray),
+        ),
     ])
 }
 
@@ -1814,7 +1841,8 @@ mod tests {
         // categories from the canonical 5-status map — that's what the
         // orchestrator's reaction rules now key off, so old lines have to
         // come through with the same shape new ones do.
-        let line = "2026-06-23T04:19:33.715717+00:00 task=foo todo -> in_progress reason=user:cli:start";
+        let line =
+            "2026-06-23T04:19:33.715717+00:00 task=foo todo -> in_progress reason=user:cli:start";
         match parse_event_line(line) {
             Event::Task {
                 id,
@@ -1929,7 +1957,9 @@ mod tests {
     fn parses_workspace_event() {
         let line = "2026-06-23T04:19:33Z workspace=alpha working -> awaiting_input";
         match parse_event_line(line) {
-            Event::Workspace { name, prev, new, .. } => {
+            Event::Workspace {
+                name, prev, new, ..
+            } => {
                 assert_eq!(name, "alpha");
                 assert_eq!(prev, Some(WorkspaceState::Working));
                 assert_eq!(new, WorkspaceState::AwaitingInput);
@@ -1942,7 +1972,9 @@ mod tests {
     fn parses_first_observation_workspace_event_with_none_prev() {
         let line = "2026-06-23T04:19:33Z workspace=alpha none -> working";
         match parse_event_line(line) {
-            Event::Workspace { name, prev, new, .. } => {
+            Event::Workspace {
+                name, prev, new, ..
+            } => {
                 assert_eq!(name, "alpha");
                 assert!(prev.is_none(), "`none` prev must parse as Option::None");
                 assert_eq!(new, WorkspaceState::Working);
@@ -1960,7 +1992,9 @@ mod tests {
     fn parses_legacy_worker_event_form_as_workspace_event() {
         let line = "2026-06-23T04:19:33Z worker=alpha working -> awaiting_input";
         match parse_event_line(line) {
-            Event::Workspace { name, prev, new, .. } => {
+            Event::Workspace {
+                name, prev, new, ..
+            } => {
                 assert_eq!(name, "alpha");
                 assert_eq!(prev, Some(WorkspaceState::Working));
                 assert_eq!(new, WorkspaceState::AwaitingInput);
@@ -2182,7 +2216,10 @@ mod tests {
         };
         let lines = render_event(&ev, &mut app, 80, now, None);
         let primary = line_text(&lines[0]);
-        assert!(primary.contains("·developer·"), "missing role tag in: {primary:?}");
+        assert!(
+            primary.contains("·developer·"),
+            "missing role tag in: {primary:?}"
+        );
         assert!(primary.contains("started"), "missing verb in: {primary:?}");
     }
 
@@ -2225,19 +2262,30 @@ mod tests {
         row.identity = agent_identity("bravo", Color::Cyan, Some("developer"));
         row.glyph = GLYPH_STARTED;
         row.glyph_color = category_color(StatusCategory::Active);
-        row.secondary = Some(SecondaryLine::Branch("shelbi/metrics-api-endpoint".to_string()));
+        row.secondary = Some(SecondaryLine::Branch(
+            "shelbi/metrics-api-endpoint".to_string(),
+        ));
         let lines = paint_row(row, 80);
 
         assert_eq!(lines.len(), 2, "primary + one dim branch line");
         let l0 = line_text(&lines[0]);
-        assert!(l0.starts_with(MARK_AGENT), "row must lead with the agent dot: {l0:?}");
+        assert!(
+            l0.starts_with(MARK_AGENT),
+            "row must lead with the agent dot: {l0:?}"
+        );
         assert!(l0.contains("bravo"), "missing agent name: {l0:?}");
         assert!(l0.contains("·developer·"), "missing dim role tag: {l0:?}");
         assert!(l0.contains(GLYPH_STARTED), "missing status glyph: {l0:?}");
         assert!(l0.contains("started"), "missing verb: {l0:?}");
         assert!(l0.contains("Metrics API endpoint"), "missing title: {l0:?}");
-        assert!(l0.ends_with("just now"), "time must be right-aligned: {l0:?}");
-        assert!(lines.iter().all(|l| l.style.bg.is_none()), "no background fill");
+        assert!(
+            l0.ends_with("just now"),
+            "time must be right-aligned: {l0:?}"
+        );
+        assert!(
+            lines.iter().all(|l| l.style.bg.is_none()),
+            "no background fill"
+        );
 
         let l1 = line_text(&lines[1]);
         assert!(
@@ -2258,8 +2306,14 @@ mod tests {
         row.glyph = GLYPH_FINISHED;
         let lines = paint_row(row, 60);
         let l0 = line_text(&lines[0]);
-        assert!(l0.contains('…'), "long title should be truncated with …: {l0:?}");
-        assert!(l0.contains("took 34m · 2m ago"), "time preserved intact: {l0:?}");
+        assert!(
+            l0.contains('…'),
+            "long title should be truncated with …: {l0:?}"
+        );
+        assert!(
+            l0.contains("took 34m · 2m ago"),
+            "time preserved intact: {l0:?}"
+        );
         assert!(
             display_w(&l0) <= 60,
             "row must not overrun width: {} > 60 in {l0:?}",
@@ -2345,17 +2399,27 @@ mod tests {
         assert_eq!(lines.len(), 2, "zen row is a primary + one dim second line");
         // Primary: neutral ◆ marker, untinted 'zen' label, 'promoted' verb.
         let l0 = line_text(&lines[0]);
-        assert!(l0.contains(MARK_SYSTEM), "primary missing system marker in {l0:?}");
-        assert!(!l0.contains(MARK_AGENT), "zen row must not use the agent dot in {l0:?}");
+        assert!(
+            l0.contains(MARK_SYSTEM),
+            "primary missing system marker in {l0:?}"
+        );
+        assert!(
+            !l0.contains(MARK_AGENT),
+            "zen row must not use the agent dot in {l0:?}"
+        );
         assert!(l0.contains("zen"), "primary missing zen label in {l0:?}");
-        assert!(l0.contains("promoted"), "primary missing 'promoted' in {l0:?}");
+        assert!(
+            l0.contains("promoted"),
+            "primary missing 'promoted' in {l0:?}"
+        );
         // Secondary line carries the "backlog → todo" detail.
         let l1 = line_text(&lines[1]);
         assert!(l1.contains("backlog → todo"), "secondary detail in {l1:?}");
         // No row carries a background fill — the reversed-box look is gone.
         for l in &lines {
             assert_eq!(
-                l.style.bg, None,
+                l.style.bg,
+                None,
                 "no zen row should carry a background fill: {:?}",
                 line_text(l)
             );
@@ -2372,9 +2436,18 @@ mod tests {
         let l0 = line_text(&lines[0]);
         assert!(l0.contains("merged"), "primary should say 'merged': {l0:?}");
         let l1 = line_text(&lines[1]);
-        assert!(l1.contains("tests green"), "secondary missing tests-green: {l1:?}");
-        assert!(l1.contains("ci green"), "secondary missing ci-green: {l1:?}");
-        assert!(l1.contains("merged abc123"), "secondary missing sha: {l1:?}");
+        assert!(
+            l1.contains("tests green"),
+            "secondary missing tests-green: {l1:?}"
+        );
+        assert!(
+            l1.contains("ci green"),
+            "secondary missing ci-green: {l1:?}"
+        );
+        assert!(
+            l1.contains("merged abc123"),
+            "secondary missing sha: {l1:?}"
+        );
     }
 
     #[test]
@@ -2385,10 +2458,19 @@ mod tests {
             Column::review(),
         );
         let l0 = line_text(&lines[0]);
-        assert!(l0.contains("bailed on"), "primary missing 'bailed on': {l0:?}");
-        assert!(l0.contains("— checks failed"), "primary missing bail tag: {l0:?}");
+        assert!(
+            l0.contains("bailed on"),
+            "primary missing 'bailed on': {l0:?}"
+        );
+        assert!(
+            l0.contains("— checks failed"),
+            "primary missing bail tag: {l0:?}"
+        );
         let l1 = line_text(&lines[1]);
-        assert!(l1.contains("`cargo test`"), "secondary missing failing cmd: {l1:?}");
+        assert!(
+            l1.contains("`cargo test`"),
+            "secondary missing failing cmd: {l1:?}"
+        );
         assert!(l1.contains("exit 1"), "secondary missing exit code: {l1:?}");
     }
 
@@ -2412,7 +2494,10 @@ mod tests {
             Column::review(),
         );
         let l1 = line_text(&lines[1]);
-        assert!(l1.contains("touched: src/db.rs, migrations/001.sql"), "got {l1:?}");
+        assert!(
+            l1.contains("touched: src/db.rs, migrations/001.sql"),
+            "got {l1:?}"
+        );
     }
 
     #[test]
@@ -2434,7 +2519,10 @@ mod tests {
             Column::review(),
         );
         let l1 = line_text(&lines[1]);
-        assert!(l1.contains("conflict in Cargo.lock, src/main.rs"), "got {l1:?}");
+        assert!(
+            l1.contains("conflict in Cargo.lock, src/main.rs"),
+            "got {l1:?}"
+        );
     }
 
     #[test]
@@ -2520,12 +2608,24 @@ mod tests {
         // happened" row every few minutes.
         let configs = [
             ActivityFilter::default(),
-            ActivityFilter { zen: true, workspaces: false },
-            ActivityFilter { zen: false, workspaces: true },
-            ActivityFilter { zen: true, workspaces: true },
+            ActivityFilter {
+                zen: true,
+                workspaces: false,
+            },
+            ActivityFilter {
+                zen: false,
+                workspaces: true,
+            },
+            ActivityFilter {
+                zen: true,
+                workspaces: true,
+            },
         ];
         for f in configs {
-            assert!(!f.matches(&heartbeat_event()), "heartbeat passed filter: {f:?}");
+            assert!(
+                !f.matches(&heartbeat_event()),
+                "heartbeat passed filter: {f:?}"
+            );
         }
     }
 
