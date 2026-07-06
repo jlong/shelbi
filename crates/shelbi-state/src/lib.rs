@@ -83,8 +83,9 @@ pub use workspace_status::{
     events_log_path, expected_teardown_marker_path, hub_socket_path,
     load_workspace_status, mark_expected_teardown, parse_pane_title_marker, parse_pane_title_state,
     save_workspace_status,
-    supervision_shutdown_key, workspace_status_path, workspaces_dir, PaneMarker,
-    WorkspaceState, WorkspaceStatus, DAEMON_ACK, EXPECTED_TEARDOWN_MAX_AGE,
+    supervision_shutdown_key, workspace_status_path, workspaces_dir, EventEnvelope, EventKind,
+    PaneMarker, WorkspaceState, WorkspaceStatus, DAEMON_ACK, EXPECTED_TEARDOWN_MAX_AGE,
+    ORCH_EVENT_CALLBACK_SOCK_ENV,
 };
 pub use workflows::{
     list_workflows, load_project_statuses, load_workflow, save_project_statuses,
