@@ -72,7 +72,11 @@ pub fn branch_name_for_task(task: &Task) -> String {
 /// mid-flight) are treated defensively as skips — `validate_depends_on`
 /// rejects unknown ids at save time, so this only kicks in for corrupt
 /// state.
-pub fn resolve_base_branch(project: &Project, task: &Task, all_tasks: &[TaskFile]) -> Result<String> {
+pub fn resolve_base_branch(
+    project: &Project,
+    task: &Task,
+    all_tasks: &[TaskFile],
+) -> Result<String> {
     let mut active_base: Option<String> = None;
     let mut blocking: Vec<String> = Vec::new();
     for dep_id in &task.depends_on {
@@ -183,7 +187,11 @@ pub fn ensure_branch_for_in_progress(project: &Project, task_id: &str) -> Result
 
 fn local_branch_exists(host: &Host, wt: &str, branch: &str) -> Result<bool> {
     let ref_name = format!("refs/heads/{branch}");
-    let out = run_in_dir(host, wt, &["git", "rev-parse", "--verify", "--quiet", &ref_name])?;
+    let out = run_in_dir(
+        host,
+        wt,
+        &["git", "rev-parse", "--verify", "--quiet", &ref_name],
+    )?;
     Ok(out.status.success())
 }
 
@@ -247,6 +255,7 @@ mod tests {
             AgentRunnerSpec {
                 command: "claude".into(),
                 flags: vec![],
+                prompt_injection: None,
                 dialog_signatures: vec![],
             },
         );
@@ -289,7 +298,11 @@ mod tests {
     }
 
     fn run_git(cwd: &std::path::Path, args: &[&str]) {
-        let status = Command::new("git").current_dir(cwd).args(args).status().unwrap();
+        let status = Command::new("git")
+            .current_dir(cwd)
+            .args(args)
+            .status()
+            .unwrap();
         assert!(status.success(), "git {args:?} failed in {}", cwd.display());
     }
 
@@ -308,7 +321,12 @@ mod tests {
     fn branch_exists(repo: &std::path::Path, branch: &str) -> bool {
         Command::new("git")
             .current_dir(repo)
-            .args(["rev-parse", "--verify", "--quiet", &format!("refs/heads/{branch}")])
+            .args([
+                "rev-parse",
+                "--verify",
+                "--quiet",
+                &format!("refs/heads/{branch}"),
+            ])
             .status()
             .unwrap()
             .success()
@@ -349,7 +367,10 @@ mod tests {
         let dep_a = task_with("a", Column::in_progress(), Some("shelbi/a"), &[]);
         let candidate = task_with("b", Column::todo(), None, &["a"]);
         let all = vec![tf_with(dep_a)];
-        assert_eq!(resolve_base_branch(&p, &candidate, &all).unwrap(), "shelbi/a");
+        assert_eq!(
+            resolve_base_branch(&p, &candidate, &all).unwrap(),
+            "shelbi/a"
+        );
     }
 
     #[test]
@@ -361,7 +382,10 @@ mod tests {
         let dep_a = task_with("a", Column::review(), Some("shelbi/a"), &[]);
         let candidate = task_with("b", Column::todo(), None, &["a"]);
         let all = vec![tf_with(dep_a)];
-        assert_eq!(resolve_base_branch(&p, &candidate, &all).unwrap(), "shelbi/a");
+        assert_eq!(
+            resolve_base_branch(&p, &candidate, &all).unwrap(),
+            "shelbi/a"
+        );
     }
 
     #[test]
@@ -390,7 +414,10 @@ mod tests {
         let dep_b = task_with("b", Column::in_progress(), Some("shelbi/b"), &[]);
         let candidate = task_with("c", Column::todo(), None, &["a", "b"]);
         let all = vec![tf_with(dep_a), tf_with(dep_b)];
-        assert_eq!(resolve_base_branch(&p, &candidate, &all).unwrap(), "shelbi/b");
+        assert_eq!(
+            resolve_base_branch(&p, &candidate, &all).unwrap(),
+            "shelbi/b"
+        );
     }
 
     #[test]
@@ -526,7 +553,12 @@ mod tests {
         let (_tmp, repo) = fixture_repo();
         let p = project_at(&repo, None);
 
-        write_task(&home, &p.name, &task_with("solo", Column::todo(), None, &[]), "");
+        write_task(
+            &home,
+            &p.name,
+            &task_with("solo", Column::todo(), None, &[]),
+            "",
+        );
 
         let tf = ensure_branch_for_in_progress(&p, "solo").unwrap();
         assert_eq!(tf.task.branch.as_deref(), Some("shelbi/solo"));
@@ -558,12 +590,8 @@ mod tests {
             "",
         )
         .unwrap();
-        shelbi_state::save_task(
-            &p.name,
-            &task_with("b", Column::todo(), None, &["a"]),
-            "",
-        )
-        .unwrap();
+        shelbi_state::save_task(&p.name, &task_with("b", Column::todo(), None, &["a"]), "")
+            .unwrap();
 
         // Advance `shelbi/a` so we can verify B's branch is cut off
         // *that* commit, not off main.
@@ -596,7 +624,11 @@ mod tests {
                 .stdout,
         )
         .unwrap();
-        assert_eq!(b_sha.trim(), a_sha, "shelbi/b must be cut at shelbi/a's HEAD");
+        assert_eq!(
+            b_sha.trim(),
+            a_sha,
+            "shelbi/b must be cut at shelbi/a's HEAD"
+        );
 
         std::env::remove_var("SHELBI_HOME");
         let _ = std::fs::remove_dir_all(&home);
@@ -618,12 +650,10 @@ mod tests {
         .unwrap();
         run_git(&repo, &["branch", "shelbi/a", "main"]);
 
-        let before_mtime = std::fs::metadata(
-            shelbi_state::task_path(&p.name, "a").unwrap(),
-        )
-        .unwrap()
-        .modified()
-        .unwrap();
+        let before_mtime = std::fs::metadata(shelbi_state::task_path(&p.name, "a").unwrap())
+            .unwrap()
+            .modified()
+            .unwrap();
 
         // Sleep so a write would produce a fresh mtime — we're proving
         // the save is skipped, not just that it happened too fast to
@@ -631,12 +661,10 @@ mod tests {
         std::thread::sleep(std::time::Duration::from_millis(20));
         ensure_branch_for_in_progress(&p, "a").unwrap();
 
-        let after_mtime = std::fs::metadata(
-            shelbi_state::task_path(&p.name, "a").unwrap(),
-        )
-        .unwrap()
-        .modified()
-        .unwrap();
+        let after_mtime = std::fs::metadata(shelbi_state::task_path(&p.name, "a").unwrap())
+            .unwrap()
+            .modified()
+            .unwrap();
         assert_eq!(
             before_mtime, after_mtime,
             "no-op ensure must not rewrite the task file"
@@ -664,12 +692,8 @@ mod tests {
             "",
         )
         .unwrap();
-        shelbi_state::save_task(
-            &p.name,
-            &task_with("b", Column::todo(), None, &["a"]),
-            "",
-        )
-        .unwrap();
+        shelbi_state::save_task(&p.name, &task_with("b", Column::todo(), None, &["a"]), "")
+            .unwrap();
         // No `shelbi/a` branch in the repo — the cut for b must fail.
         let err = match ensure_branch_for_in_progress(&p, "b") {
             Ok(_) => panic!("expected error when dep's branch doesn't exist on hub"),
@@ -701,12 +725,8 @@ mod tests {
             "",
         )
         .unwrap();
-        shelbi_state::save_task(
-            &p.name,
-            &task_with("b", Column::todo(), None, &["a"]),
-            "",
-        )
-        .unwrap();
+        shelbi_state::save_task(&p.name, &task_with("b", Column::todo(), None, &["a"]), "")
+            .unwrap();
         // Deliberately: no `shelbi/a` branch in the repo. Simulates the
         // post-merge state where the dep's branch was deleted from the
         // hub.
@@ -746,18 +766,9 @@ mod tests {
         let p = project_at(&repo, None);
 
         std::env::set_var("SHELBI_HOME", &home);
-        shelbi_state::save_task(
-            &p.name,
-            &task_with("a", Column::todo(), None, &[]),
-            "",
-        )
-        .unwrap();
-        shelbi_state::save_task(
-            &p.name,
-            &task_with("b", Column::todo(), None, &["a"]),
-            "",
-        )
-        .unwrap();
+        shelbi_state::save_task(&p.name, &task_with("a", Column::todo(), None, &[]), "").unwrap();
+        shelbi_state::save_task(&p.name, &task_with("b", Column::todo(), None, &["a"]), "")
+            .unwrap();
 
         let err = match ensure_branch_for_in_progress(&p, "b") {
             Ok(_) => panic!("expected error when dep is still in todo"),

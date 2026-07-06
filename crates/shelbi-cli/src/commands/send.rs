@@ -39,8 +39,8 @@ pub fn run(project: Option<String>, id: String, message: String) -> Result<()> {
             // which case there's no runner to send to. Surface that as an
             // actionable error rather than the opaque `os error 2` the
             // legacy path produced.
-            let alive = orch_workspace::workspace_pane_alive(&host, &addr)
-                .map_err(|e| anyhow!(e))?;
+            let alive =
+                orch_workspace::workspace_pane_alive(&host, &addr).map_err(|e| anyhow!(e))?;
             if !alive {
                 return Err(anyhow!(
                     "workspace `{id}` has no live tmux pane at `{}` — open it with \
@@ -105,9 +105,9 @@ fn resolve_target(project: &Project, id: &str) -> Result<ResolvedTarget> {
     // registries' members.
     match shelbi_state::load_agent(&project.name, id) {
         Ok(file) => {
-            let machine = project.machine(&file.agent.machine).ok_or_else(|| {
-                anyhow!("machine `{}` no longer in project", file.agent.machine)
-            })?;
+            let machine = project
+                .machine(&file.agent.machine)
+                .ok_or_else(|| anyhow!("machine `{}` no longer in project", file.agent.machine))?;
             Ok(ResolvedTarget::LegacyAgent {
                 host: machine.host(),
                 addr: file.agent.tmux.clone(),
@@ -179,6 +179,7 @@ mod tests {
             AgentRunnerSpec {
                 command: "claude".into(),
                 flags: vec![],
+                prompt_injection: None,
                 dialog_signatures: vec![],
             },
         );
@@ -298,7 +299,10 @@ mod tests {
             ],
         );
         let msg = unknown_id_error(&project, "charlie");
-        assert!(msg.contains("unknown workspace/agent `charlie`"), "msg: {msg}");
+        assert!(
+            msg.contains("unknown workspace/agent `charlie`"),
+            "msg: {msg}"
+        );
         assert!(msg.contains("alpha"), "msg: {msg}");
         assert!(msg.contains("bravo"), "msg: {msg}");
     }

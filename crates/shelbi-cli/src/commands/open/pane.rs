@@ -104,10 +104,10 @@ pub fn run(
     let has_agent_instructions = worktree
         .join(orch_workspace::WORKTREE_AGENT_INSTRUCTIONS_REL)
         .exists();
-    let codex_startup_prompt_rel = worktree
-        .join(orch_workspace::WORKTREE_CODEX_STARTUP_PROMPT_REL)
+    let startup_prompt_rel = worktree
+        .join(orch_workspace::WORKTREE_STARTUP_PROMPT_REL)
         .exists()
-        .then_some(orch_workspace::WORKTREE_CODEX_STARTUP_PROMPT_REL);
+        .then_some(orch_workspace::WORKTREE_STARTUP_PROMPT_REL);
     // Build the launch command through the shared constructor so this local
     // wrapper path and the remote dispatch path (`deploy_and_spawn`) apply the
     // same runner / permission-mode / startup-prompt logic and can't drift.
@@ -116,7 +116,7 @@ pub fn run(
         &project.workspace_permissions_mode,
         has_agent_instructions,
         resume,
-        codex_startup_prompt_rel,
+        startup_prompt_rel,
     );
 
     // `cd` falls back to $HOME if the worktree doesn't exist — that keeps
@@ -176,8 +176,8 @@ pub fn run(
     // Phase 7: also export `$PROJECT` and `$TASK_ID` so the Claude Code
     // SessionStart + Stop hooks can write to and tail the per-task
     // message log at `.shelbi/messages/$TASK_ID.log`.
-    let hub_sock = shelbi_state::hub_socket_path()
-        .map_err(|e| anyhow!("resolving hub socket path: {e}"))?;
+    let hub_sock =
+        shelbi_state::hub_socket_path().map_err(|e| anyhow!("resolving hub socket path: {e}"))?;
     let mut child = Command::new("sh")
         .arg("-c")
         .arg(&shell_cmd)
@@ -239,9 +239,12 @@ pub fn run(
         shelbi_state::consume_expected_teardown(&workspace.name).unwrap_or(false);
     if !intentional_teardown {
         // Best-effort: a failure here shouldn't keep the pane from closing.
-        if let Err(e) =
-            shelbi_state::append_workspace_pane_event(&project.name, &workspace.name, false, &reason)
-        {
+        if let Err(e) = shelbi_state::append_workspace_pane_event(
+            &project.name,
+            &workspace.name,
+            false,
+            &reason,
+        ) {
             eprintln!(
                 "shelbi: warning: couldn't write workspace pane-death event for `{}`: {e}",
                 workspace.name
@@ -261,9 +264,9 @@ pub fn run(
     // the supervisor sees no marker and at worst relaunches a pane that exited
     // cleanly, which the next expected-teardown on its own teardown corrects.
     if intentional_teardown || reason == "exit:0" {
-        if let Err(e) = shelbi_state::mark_expected_teardown(&shelbi_state::supervision_shutdown_key(
-            &workspace.name,
-        )) {
+        if let Err(e) = shelbi_state::mark_expected_teardown(
+            &shelbi_state::supervision_shutdown_key(&workspace.name),
+        ) {
             eprintln!(
                 "shelbi: warning: couldn't write supervision no-restart marker for `{}`: {e}",
                 workspace.name
@@ -730,6 +733,7 @@ mod tests {
         let runner = AgentRunnerSpec {
             command: "/bin/sh".into(),
             flags: vec!["-c".into(), "exit 0".into()],
+            prompt_injection: None,
             dialog_signatures: vec![],
         };
         let project = fixture_project("demo", machine.clone(), workspace.clone(), runner);
@@ -738,7 +742,11 @@ mod tests {
 
         let log = std::fs::read_to_string(shelbi_state::events_log_path().unwrap()).unwrap();
         let lines: Vec<&str> = log.lines().collect();
-        assert_eq!(lines.len(), 1, "expected exactly one event line, got: {log}");
+        assert_eq!(
+            lines.len(),
+            1,
+            "expected exactly one event line, got: {log}"
+        );
         let line = lines[0];
         assert!(line.contains(" workspace=alpha "), "line: {line}");
         assert!(line.contains(" pane_alive=false "), "line: {line}");
@@ -776,13 +784,11 @@ mod tests {
         // Runner writes the value the wrapper pinned into its env into a
         // file the test reads back below. `printenv VAR` exits 1 if the
         // var is absent, which would also show up in events.log.
-        let cmd = format!(
-            "printenv SHELBI_HUB_SOCK > {} ; exit 0",
-            env_out.display()
-        );
+        let cmd = format!("printenv SHELBI_HUB_SOCK > {} ; exit 0", env_out.display());
         let runner = AgentRunnerSpec {
             command: "/bin/sh".into(),
             flags: vec!["-c".into(), cmd],
+            prompt_injection: None,
             dialog_signatures: vec![],
         };
         let project = fixture_project("demo", machine.clone(), workspace.clone(), runner);
@@ -824,6 +830,7 @@ mod tests {
         let runner = AgentRunnerSpec {
             command: "/bin/sh".into(),
             flags: vec!["-c".into(), "exit 42".into()],
+            prompt_injection: None,
             dialog_signatures: vec![],
         };
         let project = fixture_project("demo", machine.clone(), workspace.clone(), runner);
@@ -1096,6 +1103,7 @@ mod tests {
                     dump_str
                 ),
             ],
+            prompt_injection: None,
             dialog_signatures: vec![],
         };
         let project = fixture_project("demo", machine.clone(), workspace.clone(), runner);
@@ -1169,7 +1177,7 @@ mod tests {
                      exit 0"
                 ),
             ],
-            dialog_signatures: vec![],
+            prompt_injection: None, dialog_signatures: vec![],
         };
         let project = fixture_project("demo", machine.clone(), workspace.clone(), runner);
 
@@ -1272,6 +1280,7 @@ mod tests {
         let runner = AgentRunnerSpec {
             command: "/bin/sh".into(),
             flags: vec!["-c".into(), mark_cmd],
+            prompt_injection: None,
             dialog_signatures: vec![],
         };
         let project = fixture_project("demo", machine.clone(), workspace.clone(), runner);
@@ -1340,6 +1349,7 @@ mod tests {
         let runner = AgentRunnerSpec {
             command: "/bin/sh".into(),
             flags: vec!["-c".into(), stale_plant],
+            prompt_injection: None,
             dialog_signatures: vec![],
         };
         let project = fixture_project("demo", machine.clone(), workspace.clone(), runner);
@@ -1396,6 +1406,7 @@ mod tests {
         let runner = AgentRunnerSpec {
             command: "/bin/sh".into(),
             flags: vec!["-c".into(), "exit 0".into()],
+            prompt_injection: None,
             dialog_signatures: vec![],
         };
         let project = fixture_project("demo", machine.clone(), workspace.clone(), runner);
@@ -1457,6 +1468,7 @@ mod tests {
                     dump_str
                 ),
             ],
+            prompt_injection: None,
             dialog_signatures: vec![],
         };
         let project = fixture_project("demo", machine.clone(), workspace.clone(), runner);
@@ -1465,7 +1477,10 @@ mod tests {
 
         let body = std::fs::read_to_string(&dump_path).unwrap();
         let lines: Vec<&str> = body.lines().collect();
-        assert_eq!(lines[1], "feat-race", "inherited TASK_ID must win: {body:?}");
+        assert_eq!(
+            lines[1], "feat-race",
+            "inherited TASK_ID must win: {body:?}"
+        );
 
         let _ = std::fs::remove_dir_all(&home);
     }

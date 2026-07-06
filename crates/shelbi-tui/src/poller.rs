@@ -152,7 +152,10 @@ fn run_poller_loop(project_name: String, shutdown: Arc<AtomicBool>) {
             // workspace doesn't leave it un-respawned. (Per-workspace threads
             // shouldn't normally panic — poll_one swallows errors — but
             // defense-in-depth.)
-            if spawned.get(&workspace.name).is_some_and(|h| h.is_finished()) {
+            if spawned
+                .get(&workspace.name)
+                .is_some_and(|h| h.is_finished())
+            {
                 if let Some(h) = spawned.remove(&workspace.name) {
                     let _ = h.join();
                 }
@@ -165,7 +168,9 @@ fn run_poller_loop(project_name: String, shutdown: Arc<AtomicBool>) {
             let shutdown_clone = shutdown.clone();
             let handle = thread::Builder::new()
                 .name(format!("shelbi-poller-{workspace_name}"))
-                .spawn(move || run_workspace_poll_loop(project_name, workspace_name, shutdown_clone))
+                .spawn(move || {
+                    run_workspace_poll_loop(project_name, workspace_name, shutdown_clone)
+                })
                 .ok();
             if let Some(h) = handle {
                 spawned.insert(workspace.name.clone(), h);
@@ -781,12 +786,9 @@ fn record_usage_limit_pause(
         tracing::warn!(workspace = %workspace.name, error = %e, "save_workspace_status failed");
     }
     if outcome.transitioned {
-        if let Err(e) = append_workspace_pause_event(
-            &project.name,
-            &workspace.name,
-            outcome.prev_state,
-            reset,
-        ) {
+        if let Err(e) =
+            append_workspace_pause_event(&project.name, &workspace.name, outcome.prev_state, reset)
+        {
             tracing::warn!(workspace = %workspace.name, error = %e, "append_workspace_pause_event failed");
         }
         tracing::info!(
@@ -854,8 +856,9 @@ fn maybe_apply_ready_handoff(
             // Resolve the forward handoff target from the task's workflow:
             // the first handoff-category status. No handoff status → nothing
             // to advance to; clear the (misconfigured) marker below.
-            let workflow = shelbi_state::load_workflow(&project.name, tf.task.workflow_or_default())
-                .unwrap_or_else(|_| default_workflow());
+            let workflow =
+                shelbi_state::load_workflow(&project.name, tf.task.workflow_or_default())
+                    .unwrap_or_else(|_| default_workflow());
             let from_status = resolve_current_status_id(&workflow, Column::in_progress());
             let Some(handoff) = workflow
                 .statuses
@@ -927,11 +930,9 @@ fn maybe_apply_ready_handoff(
             // idempotent. A `review`-tagged workspace is left running (it holds
             // a loaded task, not a just-finished in-progress one).
             if !project.effective_tags(workspace).contains("review") {
-                if let Err(e) = shelbi_orchestrator::workspace::kill_workspace_pane(
-                    host,
-                    addr,
-                    &workspace.name,
-                ) {
+                if let Err(e) =
+                    shelbi_orchestrator::workspace::kill_workspace_pane(host, addr, &workspace.name)
+                {
                     tracing::warn!(
                         workspace = %workspace.name,
                         task = %task_id,
@@ -1034,28 +1035,40 @@ fn decide_transition(
             .find(|s| s.category == StatusCategory::Active)
         {
             Some(s) => s.id.clone(),
-            None => return TransitionDecision::Reject { reason: "no-active-status" },
+            None => {
+                return TransitionDecision::Reject {
+                    reason: "no-active-status",
+                }
+            }
         },
         other => other.to_string(),
     };
 
     if workflow.status(&to_status).is_none() {
-        return TransitionDecision::Reject { reason: "unknown-target-status" };
+        return TransitionDecision::Reject {
+            reason: "unknown-target-status",
+        };
     };
 
     let allowed = match &workflow.transitions {
-        Some(ts) => ts.iter().any(|t| t.from == from_status && t.to == to_status),
+        Some(ts) => ts
+            .iter()
+            .any(|t| t.from == from_status && t.to == to_status),
         None => true,
     };
     if !allowed {
-        return TransitionDecision::Reject { reason: "edge-not-in-workflow" };
+        return TransitionDecision::Reject {
+            reason: "edge-not-in-workflow",
+        };
     }
 
     // The target's status id IS the destination position — no category round
     // trip, so a move between two distinct statuses in the same category is a
     // real move, not a false no-op.
     if to_status == from_status {
-        return TransitionDecision::Reject { reason: "target-is-current-status" };
+        return TransitionDecision::Reject {
+            reason: "target-is-current-status",
+        };
     }
     let to_column = Column::from_status_id(&to_status);
 
@@ -1113,8 +1126,9 @@ fn maybe_apply_transition(
             // Load the task's workflow; fall back to the built-in default
             // (no transitions → any-to-any) if the YAML is missing or invalid,
             // so a transient workflow typo doesn't wedge the bounce.
-            let workflow = shelbi_state::load_workflow(&project.name, tf.task.workflow_or_default())
-                .unwrap_or_else(|_| default_workflow());
+            let workflow =
+                shelbi_state::load_workflow(&project.name, tf.task.workflow_or_default())
+                    .unwrap_or_else(|_| default_workflow());
 
             match decide_transition(&workflow, tf.task.column.clone(), &req.target) {
                 TransitionDecision::Reject { reason } => {
@@ -1131,8 +1145,11 @@ fn maybe_apply_transition(
                     to_status,
                     to_column,
                 } => {
-                    match shelbi_state::move_task_and_unassign(&project.name, &req.task_id, to_column)
-                    {
+                    match shelbi_state::move_task_and_unassign(
+                        &project.name,
+                        &req.task_id,
+                        to_column,
+                    ) {
                         Ok(Some((from, to, wf))) => {
                             if let Err(e) = shelbi_state::append_task_event(
                                 &project.name,
@@ -1638,7 +1655,13 @@ mod tests {
             state: WorkspaceState::Working,
             last_transition: Some(ts(50)),
         });
-        let paused = decide("alpha", Some("t".into()), prior, WorkspaceState::Paused, ts(100));
+        let paused = decide(
+            "alpha",
+            Some("t".into()),
+            prior,
+            WorkspaceState::Paused,
+            ts(100),
+        );
         assert!(paused.transitioned);
         assert_eq!(paused.prev_state, Some(WorkspaceState::Working));
         assert_eq!(paused.status.state, WorkspaceState::Paused);
@@ -1650,7 +1673,13 @@ mod tests {
             state: WorkspaceState::Paused,
             last_transition: Some(ts(100)),
         });
-        let out = decide("alpha", Some("t".into()), still, WorkspaceState::Paused, ts(160));
+        let out = decide(
+            "alpha",
+            Some("t".into()),
+            still,
+            WorkspaceState::Paused,
+            ts(160),
+        );
         assert!(!out.transitioned);
         assert_eq!(out.status.last_transition, ts(100));
         assert_eq!(out.status.last_seen, ts(160));
@@ -1658,7 +1687,13 @@ mod tests {
         // Resume: the limit lifts, the live marker reads working again, and
         // Paused -> Working transitions — this is the clear-on-resume edge the
         // title path emits (`paused -> working`) so the ⏸ badge reverts.
-        let resumed = decide("alpha", Some("t".into()), still, WorkspaceState::Working, ts(200));
+        let resumed = decide(
+            "alpha",
+            Some("t".into()),
+            still,
+            WorkspaceState::Working,
+            ts(200),
+        );
         assert!(resumed.transitioned);
         assert_eq!(resumed.prev_state, Some(WorkspaceState::Paused));
         assert_eq!(resumed.status.state, WorkspaceState::Working);
@@ -1680,6 +1715,7 @@ mod tests {
             AgentRunnerSpec {
                 command: "claude".into(),
                 flags: vec![],
+                prompt_injection: None,
                 dialog_signatures: vec![],
             },
         );
@@ -1774,7 +1810,10 @@ mod tests {
             &project.workspaces[0],
             &project.machines[0],
             &Host::Local,
-            &TmuxAddr { session: "s".into(), window: "w".into() },
+            &TmuxAddr {
+                session: "s".into(),
+                window: "w".into(),
+            },
         );
 
         assert_eq!(
@@ -1861,7 +1900,10 @@ mod tests {
             &project.workspaces[0],
             &project.machines[0],
             &Host::Local,
-            &TmuxAddr { session: "s".into(), window: "w".into() },
+            &TmuxAddr {
+                session: "s".into(),
+                window: "w".into(),
+            },
         );
         assert_eq!(
             shelbi_state::load_task("demo", "fix-login")
@@ -1902,7 +1944,10 @@ mod tests {
             &project.workspaces[0],
             &project.machines[0],
             &Host::Local,
-            &TmuxAddr { session: "s".into(), window: "w".into() },
+            &TmuxAddr {
+                session: "s".into(),
+                window: "w".into(),
+            },
         );
         assert_eq!(
             shelbi_state::load_task("demo", "fix-login")
@@ -1944,7 +1989,10 @@ mod tests {
         let mut hb = HeartbeatSchedule::default();
         // First call seeds the schedule and returns without writing.
         maybe_emit_heartbeat(&project, &mut hb, || true);
-        assert!(hb.next_attempt.is_some(), "first tick must seed the schedule");
+        assert!(
+            hb.next_attempt.is_some(),
+            "first tick must seed the schedule"
+        );
         let log = shelbi_state::events_log_path().unwrap();
         assert!(
             !log.exists() || std::fs::read_to_string(&log).unwrap().is_empty(),
@@ -2008,8 +2056,7 @@ mod tests {
 
         let log = shelbi_state::events_log_path().unwrap();
         let body = std::fs::read_to_string(&log).unwrap();
-        let hb_lines: Vec<&str> =
-            body.lines().filter(|l| l.contains("heartbeat")).collect();
+        let hb_lines: Vec<&str> = body.lines().filter(|l| l.contains("heartbeat")).collect();
         assert!(
             hb_lines.is_empty(),
             "debounce must skip emission when events.log was just written; log: {body:?}"
@@ -2047,7 +2094,10 @@ mod tests {
             last_log_mtime: None,
         };
         maybe_emit_heartbeat(&project, &mut hb, || true);
-        assert!(hb.next_attempt.is_none(), "off must clear the pending schedule");
+        assert!(
+            hb.next_attempt.is_none(),
+            "off must clear the pending schedule"
+        );
         assert!(hb.interval.is_none(), "off must clear the back-off level");
 
         let log = shelbi_state::events_log_path().unwrap();
@@ -2105,8 +2155,7 @@ mod tests {
         std::thread::sleep(Duration::from_millis(5));
         maybe_emit_heartbeat(&project, &mut hb, || true);
         let body = std::fs::read_to_string(&log).unwrap();
-        let online_hb_lines: Vec<&str> =
-            body.lines().filter(|l| l.contains("heartbeat")).collect();
+        let online_hb_lines: Vec<&str> = body.lines().filter(|l| l.contains("heartbeat")).collect();
         assert_eq!(
             online_hb_lines.len(),
             1,
@@ -2212,7 +2261,11 @@ mod tests {
 
         let mut hb = HeartbeatSchedule::default();
         maybe_emit_heartbeat(&project, &mut hb, || true); // seed
-        assert_eq!(hb.interval, Some(Duration::from_secs(1)), "seeded at standard");
+        assert_eq!(
+            hb.interval,
+            Some(Duration::from_secs(1)),
+            "seeded at standard"
+        );
 
         // Each forced tick emits once (quiescent) and doubles the cadence,
         // capped at max.
@@ -2436,7 +2489,9 @@ transitions:
         let wf = workflow_with_bounce();
         assert_eq!(
             decide_transition(&wf, Column::review(), "backlog"),
-            TransitionDecision::Reject { reason: "edge-not-in-workflow" }
+            TransitionDecision::Reject {
+                reason: "edge-not-in-workflow"
+            }
         );
     }
 
@@ -2445,7 +2500,9 @@ transitions:
         let wf = workflow_with_bounce();
         assert_eq!(
             decide_transition(&wf, Column::review(), "nonexistent"),
-            TransitionDecision::Reject { reason: "unknown-target-status" }
+            TransitionDecision::Reject {
+                reason: "unknown-target-status"
+            }
         );
     }
 
@@ -2482,7 +2539,9 @@ transitions:
         let wf = default_workflow();
         assert_eq!(
             decide_transition(&wf, Column::in_progress(), "in-progress"),
-            TransitionDecision::Reject { reason: "target-is-current-status" }
+            TransitionDecision::Reject {
+                reason: "target-is-current-status"
+            }
         );
     }
 }

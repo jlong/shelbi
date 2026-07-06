@@ -116,6 +116,7 @@ mod tests {
         let spec = AgentRunnerSpec {
             command: "claude".into(),
             flags: vec![],
+            prompt_injection: None,
             dialog_signatures: vec![],
         };
         assert_eq!(launch_command(&spec), "claude");
@@ -126,6 +127,7 @@ mod tests {
         let spec = AgentRunnerSpec {
             command: "codex".into(),
             flags: vec!["--print".into(), "thinking".into()],
+            prompt_injection: None,
             dialog_signatures: vec![],
         };
         assert_eq!(launch_command(&spec), "codex --print thinking");
@@ -133,7 +135,12 @@ mod tests {
 
     #[test]
     fn with_permission_mode_appends_for_claude() {
-        let spec = AgentRunnerSpec { command: "claude".into(), flags: vec![], dialog_signatures: vec![] };
+        let spec = AgentRunnerSpec {
+            command: "claude".into(),
+            flags: vec![],
+            prompt_injection: None,
+            dialog_signatures: vec![],
+        };
         let out = with_permission_mode(&spec, "auto");
         assert_eq!(out.command, "claude");
         assert_eq!(out.flags, vec!["--permission-mode", "auto"]);
@@ -145,12 +152,17 @@ mod tests {
         let spec = AgentRunnerSpec {
             command: "claude".into(),
             flags: vec!["--dangerously-skip-permissions".into()],
+            prompt_injection: None,
             dialog_signatures: vec![],
         };
         let out = with_permission_mode(&spec, "acceptEdits");
         assert_eq!(
             out.flags,
-            vec!["--dangerously-skip-permissions", "--permission-mode", "acceptEdits"]
+            vec![
+                "--dangerously-skip-permissions",
+                "--permission-mode",
+                "acceptEdits"
+            ]
         );
     }
 
@@ -161,6 +173,7 @@ mod tests {
         let spec = AgentRunnerSpec {
             command: "/opt/homebrew/bin/claude".into(),
             flags: vec![],
+            prompt_injection: None,
             dialog_signatures: vec![],
         };
         let out = with_permission_mode(&spec, "auto");
@@ -172,6 +185,7 @@ mod tests {
         let spec = AgentRunnerSpec {
             command: "codex".into(),
             flags: vec!["--print".into()],
+            prompt_injection: None,
             dialog_signatures: vec![],
         };
         let out = with_permission_mode(&spec, "auto");
@@ -183,7 +197,12 @@ mod tests {
     fn with_permission_mode_skips_default_mode() {
         // `default` is claude's own baseline; passing the flag is redundant
         // and could surprise a user who reads the launched command line.
-        let spec = AgentRunnerSpec { command: "claude".into(), flags: vec![], dialog_signatures: vec![] };
+        let spec = AgentRunnerSpec {
+            command: "claude".into(),
+            flags: vec![],
+            prompt_injection: None,
+            dialog_signatures: vec![],
+        };
         let out = with_permission_mode(&spec, "default");
         assert!(out.flags.is_empty());
     }
@@ -198,6 +217,7 @@ mod tests {
         let spec = AgentRunnerSpec {
             command: "claude".into(),
             flags: vec!["--permission-mode".into(), "auto".into()],
+            prompt_injection: None,
             dialog_signatures: vec![],
         };
         let out = with_permission_mode(&spec, "auto");
@@ -214,6 +234,7 @@ mod tests {
         let spec = AgentRunnerSpec {
             command: "claude".into(),
             flags: vec!["--permission-mode=plan".into()],
+            prompt_injection: None,
             dialog_signatures: vec![],
         };
         let out = with_permission_mode(&spec, "auto");
@@ -229,6 +250,7 @@ mod tests {
         let spec = AgentRunnerSpec {
             command: "claude".into(),
             flags: vec!["--permission-mode".into(), "plan".into()],
+            prompt_injection: None,
             dialog_signatures: vec![],
         };
         let out = with_permission_mode(&spec, "auto");
@@ -236,7 +258,12 @@ mod tests {
     }
 
     fn runner(command: &str) -> AgentRunnerSpec {
-        AgentRunnerSpec { command: command.into(), flags: vec![], dialog_signatures: vec![] }
+        AgentRunnerSpec {
+            command: command.into(),
+            flags: vec![],
+            prompt_injection: None,
+            dialog_signatures: vec![],
+        }
     }
 
     #[test]
@@ -284,10 +311,15 @@ mod tests {
             let spec = AgentRunnerSpec {
                 command: "claude".into(),
                 flags: vec![existing.into()],
+                prompt_injection: None,
                 dialog_signatures: vec![],
             };
             let out = with_continue(&spec, true);
-            assert_eq!(out.flags, vec![existing], "should not double-add for {existing}");
+            assert_eq!(
+                out.flags,
+                vec![existing],
+                "should not double-add for {existing}"
+            );
         }
     }
 
@@ -296,6 +328,7 @@ mod tests {
         let spec = AgentRunnerSpec {
             command: "claude".into(),
             flags: vec!["--permission-mode".into(), "auto".into()],
+            prompt_injection: None,
             dialog_signatures: vec![],
         };
         let out = with_continue(&spec, true);

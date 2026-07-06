@@ -2157,24 +2157,12 @@ mod tests {
         let home = fresh_home();
         std::env::set_var("SHELBI_HOME", &home);
 
-        // `prompt-lost` and `readiness-timeout` are the two dispatch-failure
-        // statuses the workspace dispatch path emits (see
-        // `shelbi_orchestrator::workspace`); the orchestrator greps for them to
-        // recover a dispatch that never reached its workspace.
-        append_dispatch_event(
-            "fix-login",
-            "alpha",
-            "prompt-lost",
-            "no submit signal after retry",
-        )
-        .unwrap();
-        append_dispatch_event(
-            "build-thing",
-            "charlie",
-            "readiness-timeout",
-            "input box not ready",
-        )
-        .unwrap();
+        // `confirmed` and `stalled` are the two dispatch-verification statuses
+        // the workspace dispatch path emits (see `shelbi_orchestrator::workspace`);
+        // the orchestrator greps for `stalled` to recover a dispatch that never
+        // reached its workspace.
+        append_dispatch_event("fix-login", "alpha", "confirmed", "busy observed").unwrap();
+        append_dispatch_event("build-thing", "charlie", "stalled", "readiness timeout").unwrap();
         let log = std::fs::read_to_string(events_log_path().unwrap()).unwrap();
         let lines: Vec<&str> = log.lines().collect();
         assert_eq!(lines.len(), 2);
@@ -2184,17 +2172,10 @@ mod tests {
         let line = lines[0];
         assert!(line.contains(" dispatch task=fix-login "), "line: {line}");
         assert!(line.contains(" workspace=alpha "), "line: {line}");
-        assert!(line.contains(" status=prompt-lost "), "line: {line}");
+        assert!(line.contains(" status=confirmed "), "line: {line}");
         // Whitespace in detail folds to underscores so the line stays parseable.
-        assert!(
-            line.ends_with(" detail=no_submit_signal_after_retry"),
-            "line: {line}"
-        );
-        assert!(
-            lines[1].contains(" status=readiness-timeout "),
-            "line: {}",
-            lines[1]
-        );
+        assert!(line.ends_with(" detail=busy_observed"), "line: {line}");
+        assert!(lines[1].contains(" status=stalled "), "line: {}", lines[1]);
 
         std::env::remove_var("SHELBI_HOME");
     }
