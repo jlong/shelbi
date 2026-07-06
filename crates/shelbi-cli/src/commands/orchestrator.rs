@@ -258,8 +258,19 @@ fn event_kind(parsed: &ParsedLine) -> String {
     if parsed.fields.contains_key("question") {
         return "clarification".into();
     }
-    if parsed.fields.contains_key("pane_alive") {
-        return "workspace_pane".into();
+    if parsed
+        .fields
+        .get("pane_alive")
+        .is_some_and(|alive| alive == "false")
+        || parsed
+            .fields
+            .get("server_alive")
+            .is_some_and(|alive| alive == "false")
+    {
+        return "pane_death".into();
+    }
+    if parsed.fields.contains_key("pane_alive") || parsed.fields.contains_key("server_alive") {
+        return "pane_lifecycle".into();
     }
     if parsed.fields.contains_key("supervision") {
         return "supervision".into();
@@ -326,7 +337,10 @@ mod tests {
     use crate::commands::test_support::ENV_LOCK;
     use chrono::Utc;
     use shelbi_core::{Column, Task};
-    use shelbi_state::{append_task_event, append_workspace_event, save_task, WorkspaceState};
+    use shelbi_state::{
+        append_external_event, append_heartbeat_event, append_task_event, append_workspace_event,
+        save_task, WorkspaceState,
+    };
     use tempfile::TempDir;
 
     struct TestHome {
@@ -454,5 +468,82 @@ mod tests {
 
         assert_eq!(response.events.len(), 1);
         assert_eq!(response.events[0].workspace.as_deref(), Some("alpha"));
+    }
+
+    #[test]
+    fn drain_presents_ready_task_and_idle_workspace_as_distinct_facts() {
+        let (_guard, _tmp) = setup_home();
+        save_demo_task("demo", "ready-task");
+        append_task_event(
+            "demo",
+            "ready-task",
+            "default",
+            Column::backlog(),
+            Column::todo(),
+            "user:move",
+        )
+        .unwrap();
+        append_workspace_event(
+            "demo",
+            "alpha",
+            Some(WorkspaceState::Working),
+            WorkspaceState::AwaitingInput,
+        )
+        .unwrap();
+
+        let response = drain_once("demo", 0).unwrap();
+
+        assert_eq!(response.events.len(), 2);
+        let task = &response.events[0];
+        assert_eq!(task.kind, "task_transition");
+        assert_eq!(task.task.as_deref(), Some("ready-task"));
+        assert_eq!(task.from.as_deref(), Some("backlog"));
+        assert_eq!(task.to.as_deref(), Some("todo"));
+        assert_eq!(
+            task.metadata.get("to_category").map(String::as_str),
+            Some("ready")
+        );
+        assert_eq!(task.reason.as_deref(), Some("user:move"));
+
+        let workspace = &response.events[1];
+        assert_eq!(workspace.kind, "workspace_transition");
+        assert_eq!(workspace.workspace.as_deref(), Some("alpha"));
+        assert_eq!(workspace.from.as_deref(), Some("working"));
+        assert_eq!(workspace.to.as_deref(), Some("awaiting_input"));
+    }
+
+    #[test]
+    fn drain_labels_heartbeat_and_pane_death_without_scheduling() {
+        let (_guard, _tmp) = setup_home();
+        append_heartbeat_event("demo", 1, 1).unwrap();
+        append_external_event("project=demo workspace=alpha pane_alive=false reason=signal:SIGHUP")
+            .unwrap();
+        append_external_event("project=demo workspace=review server_alive=false reason=exit:1")
+            .unwrap();
+
+        let response = drain_once("demo", 0).unwrap();
+
+        let kinds = response
+            .events
+            .iter()
+            .map(|event| event.kind.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(kinds, vec!["heartbeat", "pane_death", "pane_death"]);
+        assert_eq!(
+            response.events[0]
+                .metadata
+                .get("zen_eligible")
+                .map(String::as_str),
+            Some("1")
+        );
+        assert_eq!(
+            response.events[0]
+                .metadata
+                .get("idle_workspaces")
+                .map(String::as_str),
+            Some("1")
+        );
+        assert_eq!(response.events[1].workspace.as_deref(), Some("alpha"));
+        assert_eq!(response.events[2].workspace.as_deref(), Some("review"));
     }
 }
