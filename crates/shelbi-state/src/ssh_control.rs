@@ -22,6 +22,7 @@ use std::io;
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
+use std::sync::OnceLock;
 
 use shelbi_core::Result;
 
@@ -77,19 +78,33 @@ pub fn ssh_control_path_template() -> Result<String> {
 /// `$SHELBI_REMOTE_HUB_SOCK` wins so remote workers (Phase 5) can be
 /// pointed at the same value via env without rebuilding the binary.
 ///
-/// Default `/tmp/shelbi-hub-<uid>.sock`. The uid suffix keeps two
-/// different users who both reverse-forward to the same shared remote
-/// host from colliding on one fixed `/tmp` path (the first one to bind
-/// wins and the second silently fails, or worse, talks to the wrong
-/// daemon). The uid is the *local* caller's — computed the same way on
-/// every consumer (`spawn`, the `-R` spec builder) so both ends of a
-/// given forward always agree.
+/// Default `/tmp/shelbi-hub-<uid>-<pid>-<start>.sock`. The uid suffix keeps
+/// different local users who both reverse-forward to the same shared remote
+/// host from colliding, and the per-process token keeps stale sockets from a
+/// crashed/reloaded hub from poisoning the next hub process. The uid is the
+/// *local* caller's — computed the same way on every consumer (`spawn`, the
+/// `-R` spec builder) so both ends of a given forward always agree.
 pub fn remote_hub_socket_path() -> PathBuf {
     if let Some(p) = std::env::var_os("SHELBI_REMOTE_HUB_SOCK") {
         return PathBuf::from(p);
     }
-    let uid = unsafe { libc::getuid() };
-    PathBuf::from(format!("/tmp/shelbi-hub-{uid}.sock"))
+    PathBuf::from(format!(
+        "/tmp/shelbi-hub-{}.sock",
+        remote_hub_socket_token()
+    ))
+}
+
+fn remote_hub_socket_token() -> &'static str {
+    static TOKEN: OnceLock<String> = OnceLock::new();
+    TOKEN.get_or_init(|| {
+        let uid = unsafe { libc::getuid() };
+        let pid = std::process::id();
+        let start = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        format!("{uid}-{pid}-{start:x}")
+    })
 }
 
 /// Daemon PID file: `$SHELBI_HOME/shelbi.pid`. Used by the cleanup
@@ -480,12 +495,20 @@ mod tests {
     }
 
     #[test]
-    fn remote_hub_socket_defaults_to_per_uid_tmp_and_env_overrides() {
+    fn remote_hub_socket_defaults_to_per_session_tmp_and_env_overrides() {
         std::env::remove_var("SHELBI_REMOTE_HUB_SOCK");
         let uid = unsafe { libc::getuid() };
+        let path = remote_hub_socket_path();
+        let s = path.to_string_lossy();
+        assert!(
+            s.starts_with(&format!("/tmp/shelbi-hub-{uid}-")),
+            "got: {s}"
+        );
+        assert!(s.ends_with(".sock"), "got: {s}");
         assert_eq!(
+            path,
             remote_hub_socket_path(),
-            PathBuf::from(format!("/tmp/shelbi-hub-{uid}.sock"))
+            "path must be stable in-process"
         );
         std::env::set_var("SHELBI_REMOTE_HUB_SOCK", "/run/foo.sock");
         assert_eq!(remote_hub_socket_path(), PathBuf::from("/run/foo.sock"));
@@ -718,7 +741,11 @@ mod tests {
         let spec = reverse_forward_spec().unwrap();
         let s = spec.to_string_lossy().into_owned();
         let uid = unsafe { libc::getuid() };
-        assert!(s.starts_with(&format!("/tmp/shelbi-hub-{uid}.sock:")), "got: {s}");
+        assert!(
+            s.starts_with(&format!("/tmp/shelbi-hub-{uid}-")),
+            "got: {s}"
+        );
+        assert!(s.contains(".sock:"), "got: {s}");
         assert!(s.ends_with("/hub.sock"), "got: {s}");
         std::env::remove_var("SHELBI_HOME");
     }
