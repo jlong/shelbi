@@ -28,6 +28,7 @@ use shelbi_core::{
     Result, StatusCategory, Task, Workflow, WorkflowStatus, WorkspaceSpec,
 };
 
+use crate::branch;
 use crate::git::{
     compose_pr_body, head_commit_subject, locate_hub_workdir, locate_workspace_worktree,
     login_shell_prefix, lookup_open_pr, parse_pr_number_from_url, run_in_dir,
@@ -224,10 +225,9 @@ pub fn pr_create(
 ) -> Result<u64> {
     let (host, worktree) = locate_workspace_worktree(project, task)?;
     let wt = worktree.to_string_lossy().into_owned();
-    let branch = task
-        .branch
-        .clone()
-        .unwrap_or_else(|| format!("shelbi/{}", task.id));
+    let workflow = shelbi_state::load_task_workflow(project_name, project, task)
+        .unwrap_or_else(|_| shelbi_core::default_workflow());
+    let branch = branch::branch_name_for_task(project, Some(&workflow), task)?;
     let target = project.base_branch();
 
     // Idempotency: if a PR for this branch is already open, return it
@@ -2889,11 +2889,7 @@ pub fn dry_run_tick(project: &Project) -> Result<Vec<DryRunDecision>> {
             // workflow for bookkeeping only.
             continue;
         }
-        let branch = tf
-            .task
-            .branch
-            .clone()
-            .unwrap_or_else(|| format!("shelbi/{}", tf.task.id));
+        let branch = branch::branch_name_for_task(project, workflow_ref, &tf.task)?;
         // Dry-run is a read-only preview — never fetch or rewrite a
         // worktree here. `AsIs` keeps the branch exactly as it sits.
         match probe_in_workflow(project, workflow_ref, &tf.task, &branch, RebasePolicy::AsIs) {

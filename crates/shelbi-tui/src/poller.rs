@@ -1251,8 +1251,8 @@ fn maybe_apply_transition(
 /// describing the outcome (ok / up-to-date / conflict / skipped). Never
 /// blocks the calling handoff — failures here are advisory.
 ///
-/// `branch` falls back to the conventional `shelbi/<task-id>` when the task
-/// frontmatter doesn't pin one explicitly.
+/// `branch` uses the same explicit/workflow/project/GitHub fallback resolver
+/// as task dispatch when the task frontmatter doesn't pin one explicitly.
 fn rebase_workspace_branch_before_handoff(
     project: &Project,
     workspace: &shelbi_core::WorkspaceSpec,
@@ -1267,11 +1267,24 @@ fn rebase_workspace_branch_before_handoff(
             return;
         }
     };
-    let branch = task_file
-        .task
-        .branch
-        .clone()
-        .unwrap_or_else(|| format!("shelbi/{task_id}"));
+    let workflow = match shelbi_state::load_task_workflow(&project.name, project, &task_file.task) {
+        Ok(wf) => wf,
+        Err(e) => {
+            tracing::debug!(workspace = %workspace.name, task = %task_id, error = %e, "skip rebase: load_task_workflow failed");
+            return;
+        }
+    };
+    let branch = match shelbi_orchestrator::branch::branch_name_for_task(
+        project,
+        Some(&workflow),
+        &task_file.task,
+    ) {
+        Ok(branch) => branch,
+        Err(e) => {
+            tracing::debug!(workspace = %workspace.name, task = %task_id, error = %e, "skip rebase: branch resolution failed");
+            return;
+        }
+    };
 
     let worktree = shelbi_orchestrator::workspace::workspace_worktree(machine, workspace);
     let outcome = shelbi_orchestrator::workspace::rebase_workspace_branch_onto_default(
@@ -1473,11 +1486,11 @@ fn redispatch_workspace(
     task_id: &str,
 ) -> std::result::Result<(), String> {
     let tf = shelbi_state::load_task(&project.name, task_id).map_err(|e| e.to_string())?;
-    let branch = tf
-        .task
-        .branch
-        .clone()
-        .unwrap_or_else(|| format!("shelbi/{task_id}"));
+    let workflow = shelbi_state::load_task_workflow(&project.name, project, &tf.task)
+        .map_err(|e| e.to_string())?;
+    let branch =
+        shelbi_orchestrator::branch::branch_name_for_task(project, Some(&workflow), &tf.task)
+            .map_err(|e| e.to_string())?;
     let agent = shelbi_orchestrator::dispatch::resolve_active_agent(&project.name, &tf.task);
     shelbi_orchestrator::workspace::start_workspace_on_task(
         shelbi_orchestrator::workspace::StartSpec {

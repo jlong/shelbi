@@ -637,7 +637,7 @@ pub enum Row {
     /// free review workspace). See spec §16.
     Review {
         title: String,
-        /// Branch name shown dim on line 2 (`shelbi/<id>` fallback).
+        /// Branch name shown dim on line 2.
         branch: String,
         /// `machine:port` URL the human can open — `Some` only for a Ready
         /// (loaded) task; `None` for a Queued one (nothing serving yet).
@@ -712,7 +712,7 @@ impl Row {
 pub struct ReviewEntry {
     pub task_id: String,
     pub title: String,
-    /// Branch shown dim on line 2 — `shelbi/<id>` when the task pins none.
+    /// Branch shown dim on line 2.
     pub branch: String,
     /// `machine:port` URL badge (Ready only); `None` when queued.
     pub location: Option<String>,
@@ -743,21 +743,40 @@ fn split_review_sections(
     project_name: &str,
     queue: Vec<TaskFile>,
 ) -> (Vec<ReviewEntry>, Vec<ReviewEntry>) {
-    let entry = |task: &shelbi_core::Task, location: Option<String>| ReviewEntry {
+    let fallback_entry = |task: &shelbi_core::Task, location: Option<String>| ReviewEntry {
         task_id: task.id.clone(),
         title: task.title.clone(),
         branch: task
             .branch
             .clone()
-            .unwrap_or_else(|| format!("shelbi/{}", task.id)),
+            .unwrap_or_else(|| format!("user/{}", task.id)),
         location,
     };
 
     let project = match shelbi_state::load_project(project_name) {
         Ok(p) => p,
         Err(_) => {
-            let queued = queue.iter().map(|tf| entry(&tf.task, None)).collect();
+            let queued = queue
+                .iter()
+                .map(|tf| fallback_entry(&tf.task, None))
+                .collect();
             return (Vec::new(), queued);
+        }
+    };
+    let entry = |task: &shelbi_core::Task, location: Option<String>| {
+        let workflow = shelbi_state::load_task_workflow(project_name, &project, task).ok();
+        let branch =
+            shelbi_orchestrator::branch::branch_name_for_task(&project, workflow.as_ref(), task)
+                .unwrap_or_else(|_| {
+                    task.branch
+                        .clone()
+                        .unwrap_or_else(|| format!("user/{}", task.id))
+                });
+        ReviewEntry {
+            task_id: task.id.clone(),
+            title: task.title.clone(),
+            branch,
+            location,
         }
     };
 
@@ -1020,7 +1039,10 @@ mod tests {
             workspace_settings_template: None,
             zen: shelbi_core::ZenConfig::default(),
             heartbeat: shelbi_core::HeartbeatConfig::default(),
-            git: shelbi_core::GitConfig::default(),
+            git: shelbi_core::GitConfig {
+                branch_prefix: Some("shelbi".into()),
+                ..Default::default()
+            },
             detected_shapes: Vec::new(),
         }
     }
@@ -1262,7 +1284,7 @@ mod tests {
         assert_eq!(queued.task_id, "waiting");
         assert_eq!(
             queued.branch, "shelbi/waiting",
-            "branch falls back to shelbi/<id>"
+            "branch falls back to the configured prefix"
         );
         assert!(queued.location.is_none(), "queued tasks have no URL yet");
 
@@ -2218,7 +2240,7 @@ mod tests {
         // task (assigned to a dev workspace) lands in the **Queued for Review**
         // section — nothing is loaded onto a review worktree, so there's no
         // Ready section. The row is two-line: title on line 1, branch on
-        // line 2 (the `shelbi/<id>` fallback since the task pins none).
+        // line 2 (the configured-prefix fallback since the task pins none).
         let _g = TEST_LOCK.lock().unwrap();
         let home = fresh_home();
         std::env::set_var("SHELBI_HOME", &home);

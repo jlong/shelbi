@@ -18,6 +18,7 @@ use shelbi_core::{Error, Host, MachineKind, Result, TmuxAddr};
 use shelbi_state::keymap::{load_keymaps, GlobalAction};
 
 pub mod actions;
+pub mod branch;
 pub mod dispatch;
 mod git;
 pub mod handoff;

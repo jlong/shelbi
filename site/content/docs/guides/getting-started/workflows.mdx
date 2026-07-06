@@ -324,16 +324,17 @@ controls whether Shelbi cuts a fresh branch or uses an existing one.
 id: build-login-form
 title: Build the login form
 workflow: default
-# branch:  ← omitted → orchestrator cuts shelbi/build-login-form on dispatch
+# branch:  ← omitted → orchestrator generates <prefix>/build-login-form on dispatch
 ---
 ```
 
 - **Omitted at creation.** When the task moves into its first
   `active`-category status (typically `InProgress`), the orchestrator
-  cuts a fresh branch off the workflow's resolved `base_branch`, names
-  it `shelbi/<task-id>`, and writes the name back into the task's
-  frontmatter. The user never types a branch name. This is the common
-  case.
+  cuts a fresh branch off the workflow's resolved `base_branch`, names it
+  `<prefix>/<task-id>` using workflow `git.branch_prefix`, project
+  `git.branch_prefix`, or your GitHub username, and writes the name back
+  into the task's frontmatter. The user never types a branch name. This is
+  the common case.
 - **Set at creation.** The orchestrator uses that branch as-is. No new
   branch is cut. This is how **release tasks** work: the user already
   knows the branch (typically `feature/<name>`) and pre-fills it.
@@ -449,8 +450,8 @@ Three behaviors fire when `depends_on:` is set:
 2. **Branch cut from the parent.** When the dependent task transitions
    into its first `active`-category status, the orchestrator cuts its
    branch off the **parent task's `branch:`** (not the workflow's
-   `base_branch`). The child branch is still named conventionally
-   (`shelbi/<child-task-id>`).
+   `base_branch`). The child branch is still generated as
+   `<prefix>/<child-task-id>`.
 3. **PR base is the parent.** When the dependent task's `open_pr`
    action runs, the PR's base is the parent task's branch, not the
    workflow's `base_branch`.
