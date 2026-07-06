@@ -1253,8 +1253,14 @@ impl KanbanApp {
         }
         match shelbi_state::move_task(&self.project_name, id, new_col) {
             Ok(Some((from, to, workflow))) => {
-                if let Err(e) =
-                    shelbi_state::append_task_event(id, &workflow, from, to, "user:tui")
+                if let Err(e) = shelbi_state::append_task_event(
+                    &self.project_name,
+                    id,
+                    &workflow,
+                    from,
+                    to,
+                    "user:tui",
+                )
                 {
                     tracing::warn!(task = %id, error = %e, "append_task_event failed");
                 }
