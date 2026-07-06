@@ -82,8 +82,7 @@ pub fn run(project: String) -> Result<()> {
                 continue;
             }
             Ok(Some(entry))
-                if entry.id == "action:toggle-zen"
-                    && should_show_zen_intro(&project) =>
+                if entry.id == "action:toggle-zen" && should_show_zen_intro(&project) =>
             {
                 handle_zen_intro_then_toggle(&mut term, &project, &keymaps)?;
                 // Toggle (or its suppression) was handled inline — we
@@ -200,11 +199,15 @@ impl Drop for TerminalGuard {
 /// location inline.
 fn format_diag(d: &KeymapDiagnostic) -> String {
     match d {
-        KeymapDiagnostic::Error { message, location, .. } => match location {
+        KeymapDiagnostic::Error {
+            message, location, ..
+        } => match location {
             Some(loc) => format!("keys.yaml error [{loc}]: {message}"),
             None => format!("keys.yaml error: {message}"),
         },
-        KeymapDiagnostic::Warning { message, location, .. } => match location {
+        KeymapDiagnostic::Warning {
+            message, location, ..
+        } => match location {
             Some(loc) => format!("keys.yaml warning [{loc}]: {message}"),
             None => format!("keys.yaml warning: {message}"),
         },
@@ -292,7 +295,9 @@ fn render(f: &mut Frame, state: &State, results: &[(Entry, u16)]) {
     // Title.
     let title = Paragraph::new(Line::from(Span::styled(
         format!("shelbi · {}", state.project),
-        Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+        Style::default()
+            .fg(Color::Cyan)
+            .add_modifier(Modifier::BOLD),
     )));
     f.render_widget(title, layout[0]);
 
@@ -390,7 +395,13 @@ fn build_entries(app: &App, zen_mode: ZenModeState, zen_chord: ZenToggleChord) -
         }
         // The Zen-Mode toggle sits inline with the top nav block so users
         // discover it where they already look for the dashboard.
-        if matches!(&row, Row::Nav { view: View::Builtin("activity"), .. }) {
+        if matches!(
+            &row,
+            Row::Nav {
+                view: View::Builtin("activity"),
+                ..
+            }
+        ) {
             out.push(zen_toggle_entry(zen_mode, zen_chord));
         }
     }
@@ -470,7 +481,12 @@ fn entry_from_row(row: &Row, workspaces: &[WorkspaceOverview]) -> Option<Entry> 
                 decoration,
             })
         }
-        Row::Review { title, location, view, .. } => {
+        Row::Review {
+            title,
+            location,
+            view,
+            ..
+        } => {
             let id = match view {
                 View::ReviewTask(task_id) => format!("review:{task_id}"),
                 _ => return None,
@@ -569,8 +585,7 @@ fn dispatch(project: &str, entry: &Entry) -> Result<()> {
         // and the CLI's `shelbi zen on|off` — only the source tag
         // differs (`user:palette`) so the activity feed can attribute
         // the toggle back to the palette.
-        shelbi_state::toggle_zen_mode(project, "user:palette")
-            .map_err(|e| anyhow::anyhow!(e))?;
+        shelbi_state::toggle_zen_mode(project, "user:palette").map_err(|e| anyhow::anyhow!(e))?;
         return Ok(());
     }
     // `action:quit-project` is intentionally not handled here — the
@@ -647,8 +662,7 @@ fn apply_zen_intro_result(project: &str, outcome: ZenIntroResult) -> Result<()> 
         let _ = shelbi_state::mark_zen_intro_seen();
     }
     if outcome.confirmed {
-        shelbi_state::toggle_zen_mode(project, "user:palette")
-            .map_err(|e| anyhow::anyhow!(e))?;
+        shelbi_state::toggle_zen_mode(project, "user:palette").map_err(|e| anyhow::anyhow!(e))?;
     }
     Ok(())
 }
@@ -1063,7 +1077,9 @@ fn render_quit_shelbi_confirm(
     if let Some(summary) = dirty_summary {
         let warning = Paragraph::new(Line::from(Span::styled(
             summary,
-            Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
         )));
         f.render_widget(warning, layout[5]);
     }
@@ -1238,7 +1254,10 @@ mod tests {
             exact_window_target("shelbi-proj:w-fix-login"),
             "shelbi-proj:=w-fix-login"
         );
-        assert_eq!(exact_window_target("shelbi-proj:agent-1"), "shelbi-proj:=agent-1");
+        assert_eq!(
+            exact_window_target("shelbi-proj:agent-1"),
+            "shelbi-proj:=agent-1"
+        );
         // Defensive: a target without a `:` is passed through untouched.
         assert_eq!(exact_window_target("no-colon"), "no-colon");
     }
@@ -1314,7 +1333,11 @@ mod tests {
         assert_eq!(format_active_workspaces(11), "(11 active workspaces)");
     }
 
-    fn dirty_project(name: &str, active: usize, dirty: &[&str]) -> super::super::quit_shelbi::ManagedProject {
+    fn dirty_project(
+        name: &str,
+        active: usize,
+        dirty: &[&str],
+    ) -> super::super::quit_shelbi::ManagedProject {
         super::super::quit_shelbi::ManagedProject {
             name: name.to_string(),
             active_workspaces: active,
@@ -1373,7 +1396,10 @@ mod tests {
         // assumes this exact id and a rename would silently break it.
         let app = App::new_sidebar("demo");
         let entries = build_entries(&app, ZenModeState::Off, ZenToggleChord::AltZ);
-        assert_eq!(entries.last().map(|e| e.id.as_str()), Some("action:quit-shelbi"));
+        assert_eq!(
+            entries.last().map(|e| e.id.as_str()),
+            Some("action:quit-shelbi")
+        );
     }
 
     #[test]

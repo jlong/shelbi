@@ -11,8 +11,8 @@ pub mod list;
 pub mod merge;
 pub mod message;
 pub mod open;
-pub mod orchestrator;
 pub mod orchestrate;
+pub mod orchestrator;
 pub mod palette;
 pub mod picker;
 pub mod popup;
@@ -26,8 +26,8 @@ pub mod status;
 pub mod tail;
 pub mod task;
 pub mod wizard;
-pub mod workspace;
 pub mod workflow;
+pub mod workspace;
 pub mod zen;
 pub mod zen_intro;
 pub mod zen_lifecycle;
@@ -95,8 +95,10 @@ where
     I: IntoIterator<Item = S>,
     S: AsRef<std::ffi::OsStr>,
 {
-    let args: Vec<std::ffi::OsString> =
-        args.into_iter().map(|a| a.as_ref().to_os_string()).collect();
+    let args: Vec<std::ffi::OsString> = args
+        .into_iter()
+        .map(|a| a.as_ref().to_os_string())
+        .collect();
     let argv = || {
         args.iter()
             .map(|a| a.to_string_lossy())
@@ -249,8 +251,8 @@ pub(crate) mod test_support {
     /// test can drive further git operations against it.
     pub fn provision_hub_repo_for_project(home: &Path, project_name: &str) -> PathBuf {
         use shelbi_core::{
-            AgentRunnerSpec, GitConfig, HeartbeatConfig, Machine, MachineKind,
-            OrchestratorSpec, Project, ZenConfig,
+            AgentRunnerSpec, GitConfig, HeartbeatConfig, Machine, MachineKind, OrchestratorSpec,
+            Project, ZenConfig,
         };
         use std::collections::BTreeMap;
         use std::process::Command;
@@ -280,6 +282,7 @@ pub(crate) mod test_support {
             AgentRunnerSpec {
                 command: "claude".into(),
                 flags: vec![],
+                prompt_injection: None,
                 dialog_signatures: vec![],
             },
         );

@@ -16,7 +16,8 @@
 use std::path::{Path, PathBuf};
 
 use shelbi_core::{
-    validate_task_id, Error, Host, Machine, Project, Result, TmuxAddr, WorkspaceSpec,
+    validate_task_id, Error, Host, Machine, Project, PromptInjectionKind, Result, TmuxAddr,
+    WorkspaceSpec,
 };
 
 /// Absolute path to the currently-running `shelbi` binary, so the
@@ -113,7 +114,11 @@ pub fn workspace_tmux_addr(project: &Project, workspace: &WorkspaceSpec) -> Resu
 /// `<machine.work_dir>/.shelbi/wt/<workspace-name>` — the workspace's persistent
 /// worktree path on its machine.
 pub fn workspace_worktree(machine: &Machine, workspace: &WorkspaceSpec) -> PathBuf {
-    machine.work_dir.join(".shelbi").join("wt").join(&workspace.name)
+    machine
+        .work_dir
+        .join(".shelbi")
+        .join("wt")
+        .join(&workspace.name)
 }
 
 /// The ready-handoff file marker for a workspace:
@@ -479,9 +484,7 @@ pub fn rebase_workspace_branch_onto_default(
             &format!("{default_branch}^{{commit}}"),
         ],
     ) {
-        Ok(o) if o.status.success() => {
-            String::from_utf8_lossy(&o.stdout).trim().to_string()
-        }
+        Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).trim().to_string(),
         Ok(_) | Err(_) => {
             return RebaseOutcome::Skipped {
                 reason: format!("default_branch_{default_branch}_not_found"),
@@ -489,17 +492,15 @@ pub fn rebase_workspace_branch_onto_default(
         }
     };
 
-    let before_sha = match shelbi_ssh::run_capture(
-        host,
-        ["git", "-C", &wt_str, "rev-parse", "HEAD"],
-    ) {
-        Ok(s) => s.trim().to_string(),
-        Err(e) => {
-            return RebaseOutcome::Skipped {
-                reason: format!("rev_parse_HEAD_failed:{e}"),
-            };
-        }
-    };
+    let before_sha =
+        match shelbi_ssh::run_capture(host, ["git", "-C", &wt_str, "rev-parse", "HEAD"]) {
+            Ok(s) => s.trim().to_string(),
+            Err(e) => {
+                return RebaseOutcome::Skipped {
+                    reason: format!("rev_parse_HEAD_failed:{e}"),
+                };
+            }
+        };
 
     // 3. Already a descendant? `merge-base --is-ancestor` exits 0 when
     //    `default_branch` is reachable from HEAD — i.e. the workspace's
@@ -539,7 +540,14 @@ pub fn rebase_workspace_branch_onto_default(
         // left in a conflicted state.
         let files: Vec<String> = shelbi_ssh::run_capture(
             host,
-            ["git", "-C", &wt_str, "diff", "--name-only", "--diff-filter=U"],
+            [
+                "git",
+                "-C",
+                &wt_str,
+                "diff",
+                "--name-only",
+                "--diff-filter=U",
+            ],
         )
         .map(|s| {
             s.lines()
@@ -733,7 +741,10 @@ pub fn start_workspace_on_task(spec: StartSpec<'_>) -> Result<TmuxAddr> {
     let _ = clear_ready_marker(&host, &marker);
     // Same for any stale agent-transition marker — a fresh dispatch must not
     // inherit a bounce request left behind by the previous task on this worktree.
-    let _ = clear_transition_marker(&host, &workspace_transition_marker(&machine, spec.workspace));
+    let _ = clear_transition_marker(
+        &host,
+        &workspace_transition_marker(&machine, spec.workspace),
+    );
 
     // 1. Make sure the worktree exists + is on the right branch, clean.
     //    A failure here (dirty worktree, unreachable origin during the
@@ -852,7 +863,10 @@ pub fn resume_workspace_on_task(spec: StartSpec<'_>) -> Result<TmuxAddr> {
     let _ = clear_ready_marker(&host, &marker);
     // Same for any stale agent-transition marker — a resumed task is still
     // in-progress, so any transition request present is stale. Best-effort.
-    let _ = clear_transition_marker(&host, &workspace_transition_marker(&machine, spec.workspace));
+    let _ = clear_transition_marker(
+        &host,
+        &workspace_transition_marker(&machine, spec.workspace),
+    );
 
     // Preserve the worktree: don't reset the branch, don't bail on a dirty
     // tree. Only recreate the worktree if it's gone entirely. A failure here
@@ -961,10 +975,12 @@ fn deploy_and_spawn(a: SpawnArgs<'_>) -> Result<()> {
         deploy_agent_context(a.host, a.worktree, &a.project.name, agent)?;
     }
 
-    let codex_startup_prompt_rel = if is_codex_runner(&a.runner.command) {
-        let startup_prompt = render_codex_startup_prompt(a.prompt, a.agent.is_some());
-        deploy_codex_startup_prompt(a.host, a.worktree, &startup_prompt)?;
-        Some(WORKTREE_CODEX_STARTUP_PROMPT_REL)
+    let prompt_injection = effective_prompt_injection_for_spawn(a.runner, a.resume);
+    let launch_seed = prompt_injection.kind != PromptInjectionKind::Paste;
+    let startup_prompt_rel = if launch_seed {
+        let startup_prompt = render_startup_prompt(a.prompt, a.agent.is_some(), a.runner);
+        deploy_startup_prompt(a.host, a.worktree, &startup_prompt)?;
+        Some(WORKTREE_STARTUP_PROMPT_REL)
     } else {
         None
     };
@@ -1040,14 +1056,16 @@ fn deploy_and_spawn(a: SpawnArgs<'_>) -> Result<()> {
             })?;
         }
         Host::Ssh { .. } => {
-            shelbi_tmux::new_session(a.host, &a.addr.session, &a.addr.window, None).map_err(|e| {
-                Error::Other(format!(
-                    "pane startup failure for workspace `{}` using {} runner `{}`: {e}",
-                    a.workspace.name,
-                    runner_label(&a.runner.command),
-                    a.runner.command,
-                ))
-            })?;
+            shelbi_tmux::new_session(a.host, &a.addr.session, &a.addr.window, None).map_err(
+                |e| {
+                    Error::Other(format!(
+                        "pane startup failure for workspace `{}` using {} runner `{}`: {e}",
+                        a.workspace.name,
+                        runner_label(&a.runner.command),
+                        a.runner.command,
+                    ))
+                },
+            )?;
             // Remote panes run the agent directly — the lifecycle wrapper isn't
             // deployed on the workspace host — so we build the launch command
             // here and send it into the pane. This goes through the SAME
@@ -1058,10 +1076,9 @@ fn deploy_and_spawn(a: SpawnArgs<'_>) -> Result<()> {
                 &a.project.workspace_permissions_mode,
                 a.agent.is_some(),
                 a.resume,
-                codex_startup_prompt_rel,
+                startup_prompt_rel,
             );
-            let cd_launch =
-                remote_cd_launch(a.worktree, &launch, a.port, &a.workspace.name);
+            let cd_launch = remote_cd_launch(a.worktree, &launch, a.port, &a.workspace.name);
             shelbi_tmux::send_line(a.host, a.addr, &cd_launch).map_err(|e| {
                 Error::Other(format!(
                     "pane startup failure for workspace `{}` using {} runner `{}`: {e}",
@@ -1073,8 +1090,22 @@ fn deploy_and_spawn(a: SpawnArgs<'_>) -> Result<()> {
         }
     }
 
-    if is_codex_runner(&a.runner.command) {
-        return Ok(());
+    if launch_seed {
+        if confirm_dispatch_started(a.host, a.addr, a.task_id, &a.workspace.name, a.prompt) {
+            return Ok(());
+        }
+        if shelbi_agent::is_claude_runner(&a.runner.command)
+            && crate::ready::wait_for_claude_ready(a.host, a.addr, crate::ready::READY_TIMEOUT)?
+        {
+            shelbi_tmux::send_line(a.host, a.addr, a.prompt)?;
+            if confirm_dispatch_started(a.host, a.addr, a.task_id, &a.workspace.name, a.prompt) {
+                return Ok(());
+            }
+        }
+        return Err(Error::Other(format!(
+            "dispatch to {} was not confirmed — no busy signal after launch-seed delivery",
+            a.addr.target(),
+        )));
     }
 
     // 6. Wait until claude has drawn its input box before typing the prompt.
@@ -1094,10 +1125,10 @@ fn deploy_and_spawn(a: SpawnArgs<'_>) -> Result<()> {
         if let Err(e) = shelbi_state::append_dispatch_event(
             a.task_id,
             &a.workspace.name,
-            "readiness-timeout",
-            "input box not ready",
+            "stalled",
+            "readiness_timeout",
         ) {
-            eprintln!("shelbi: failed to record dispatch readiness-timeout in events.log: {e}");
+            eprintln!("shelbi: failed to record dispatch stalled in events.log: {e}");
         }
         return Err(Error::Other(format!(
             "claude readiness probe timed out after {}s on {} — dispatch aborted, \
@@ -1118,12 +1149,12 @@ fn deploy_and_spawn(a: SpawnArgs<'_>) -> Result<()> {
     //    and was dropped; resend it once and try again.
     //
     //    If it STILL never lands, the prompt is lost — do not mark the task
-    //    active. `confirm_prompt_submitted` records a `status=prompt-lost`
+    //    active. `confirm_dispatch_started` records a `status=stalled`
     //    dispatch event; we then return an error so the caller leaves the task
     //    in its ready-category column, exactly like a readiness timeout,
     //    instead of moving it to `in_progress` on a workspace that never got
     //    the prompt.
-    if !confirm_prompt_submitted(a.host, a.addr, a.task_id, &a.workspace.name, a.prompt) {
+    if !confirm_dispatch_started(a.host, a.addr, a.task_id, &a.workspace.name, a.prompt) {
         return Err(Error::Other(format!(
             "prompt was not accepted on {} — no submission signal after a retry \
              Enter. Dispatch aborted so the task stays put for retry; check the \
@@ -1156,7 +1187,7 @@ const PROMPT_SUBMIT_SCROLLBACK: usize = 200;
 
 /// Wait for the prompt-submitted signal; if it doesn't arrive, resend Enter
 /// once and wait again. Returns `true` once submission is confirmed. If it is
-/// still unconfirmed after the retry, record an actionable `status=prompt-lost`
+/// still unconfirmed after the retry, record an actionable `status=stalled`
 /// dispatch event (so `shelbi events tail` and the orchestrator see it) and
 /// return `false` — the caller aborts the dispatch rather than marking the
 /// task active on a workspace sitting on an unsubmitted (or swallowed) prompt.
@@ -1169,7 +1200,7 @@ const PROMPT_SUBMIT_SCROLLBACK: usize = 200;
 /// parked in the box: re-Entering an already-cleared box is pointless, and
 /// re-Entering a box the user has since started typing into could fire a
 /// partial message.
-fn confirm_prompt_submitted(
+fn confirm_dispatch_started(
     host: &Host,
     addr: &TmuxAddr,
     task_id: &str,
@@ -1177,6 +1208,7 @@ fn confirm_prompt_submitted(
     prompt: &str,
 ) -> bool {
     if wait_for_prompt_submitted(host, addr, prompt, PROMPT_SUBMIT_WAIT) {
+        append_dispatch_status(task_id, workspace, "confirmed", "busy_observed");
         return true;
     }
     // No positive signal in the first window. Nudge with one retry Enter only
@@ -1185,8 +1217,10 @@ fn confirm_prompt_submitted(
     // case, where the first Enter after the paste was dropped). If it's cleared
     // (submitted; busy signal just missed) or we can't see the box, there's
     // nothing a retry would fix.
-    if input_holds_unsubmitted_prompt(&shelbi_tmux::capture(host, addr).unwrap_or_default(), prompt)
-    {
+    if input_holds_unsubmitted_prompt(
+        &shelbi_tmux::capture(host, addr).unwrap_or_default(),
+        prompt,
+    ) {
         // First Enter likely raced claude's focus — resend a bare Enter and
         // give the hook one more window to fire. Avoid spamming Enters: a
         // second one after the prompt is already processed would submit an
@@ -1199,23 +1233,23 @@ fn confirm_prompt_submitted(
             );
         }
         if wait_for_prompt_submitted(host, addr, prompt, PROMPT_SUBMIT_WAIT) {
+            append_dispatch_status(task_id, workspace, "confirmed", "retry_enter");
             return true;
         }
     }
     eprintln!(
         "shelbi: dispatched prompt to {} but no submission signal appeared \
-         after a retry Enter — the prompt was lost; leaving the task unmoved",
+         after a retry Enter — dispatch stalled; leaving the task unmoved",
         addr.target(),
     );
-    if let Err(e) = shelbi_state::append_dispatch_event(
-        task_id,
-        workspace,
-        "prompt-lost",
-        "no submit signal after retry",
-    ) {
-        eprintln!("shelbi: failed to record dispatch prompt-lost in events.log: {e}");
-    }
+    append_dispatch_status(task_id, workspace, "stalled", "no_busy_signal_after_retry");
     false
+}
+
+fn append_dispatch_status(task_id: &str, workspace: &str, status: &str, detail: &str) {
+    if let Err(e) = shelbi_state::append_dispatch_event(task_id, workspace, status, detail) {
+        eprintln!("shelbi: failed to record dispatch {status} in events.log: {e}");
+    }
 }
 
 /// Poll the workspace's pane until we have proof the prompt got submitted, or
@@ -1514,7 +1548,10 @@ fn require_runner_available(host: &Host, runner: &shelbi_core::AgentRunnerSpec) 
     let script = if command.contains('/') {
         format!("test -x {}", shelbi_agent::shell_escape(command))
     } else {
-        format!("command -v -- {} >/dev/null", shelbi_agent::shell_escape(command))
+        format!(
+            "command -v -- {} >/dev/null",
+            shelbi_agent::shell_escape(command)
+        )
     };
     let out = match host {
         Host::Local => shelbi_ssh::run(host, ["sh", "-lc", &script]),
@@ -1607,7 +1644,10 @@ pub fn render_workspace_settings_preferring_agent(
         None => shelbi_state::render_workspace_settings(project)
             .map_err(|e| Error::Other(format!("{e}")))?,
     };
-    Ok(template.replace("{{workspace_permissions_mode}}", &project.workspace_permissions_mode))
+    Ok(template.replace(
+        "{{workspace_permissions_mode}}",
+        &project.workspace_permissions_mode,
+    ))
 }
 
 /// Write the rendered workspace `settings.json` to `<worktree>/.claude/` on
@@ -1643,7 +1683,7 @@ pub fn deploy_workspace_settings(
 /// gitignored together and there's exactly one place to look when
 /// debugging an agent that loaded the wrong prompt.
 pub const WORKTREE_AGENT_INSTRUCTIONS_REL: &str = ".claude/agent-instructions.md";
-pub const WORKTREE_CODEX_STARTUP_PROMPT_REL: &str = ".shelbi/codex-startup-prompt.md";
+pub const WORKTREE_STARTUP_PROMPT_REL: &str = ".shelbi/startup-prompt.md";
 
 /// Relative path (from the worktree root) where the dispatched agent's
 /// `skills/` directory is mounted. Claude Code auto-loads any
@@ -1723,8 +1763,7 @@ pub fn deploy_agent_context(
 /// Pure on its inputs so it's unit-testable without a real handoff
 /// file on disk.
 fn splice_orchestrator_handoff(composed: &str, handoff: &str) -> String {
-    let mut out =
-        String::with_capacity(composed.len() + handoff.len() + 64);
+    let mut out = String::with_capacity(composed.len() + handoff.len() + 64);
     out.push_str(composed);
     if !composed.ends_with('\n') {
         out.push('\n');
@@ -1742,11 +1781,7 @@ fn splice_orchestrator_handoff(composed: &str, handoff: &str) -> String {
 /// Write `instructions` to `<worktree>/.claude/agent-instructions.md` so
 /// the runner can `--append-system-prompt "$(cat …)"` from it on launch.
 /// Mirrors [`deploy_workspace_settings`]'s local-vs-remote split.
-pub fn deploy_agent_instructions(
-    host: &Host,
-    worktree: &Path,
-    instructions: &str,
-) -> Result<()> {
+pub fn deploy_agent_instructions(host: &Host, worktree: &Path, instructions: &str) -> Result<()> {
     let claude_dir = worktree.join(".claude");
     let dest_path = claude_dir.join("agent-instructions.md");
     match host {
@@ -1765,11 +1800,17 @@ pub fn deploy_agent_instructions(
     }
 }
 
-fn render_codex_startup_prompt(prompt: &str, include_agent_instructions: bool) -> String {
+fn render_startup_prompt(
+    prompt: &str,
+    include_agent_instructions: bool,
+    runner: &shelbi_core::AgentRunnerSpec,
+) -> String {
     let mut out = String::new();
-    if include_agent_instructions {
+    if include_agent_instructions && !shelbi_agent::is_claude_runner(&runner.command) {
         out.push_str("Read `.claude/agent-instructions.md` first. ");
-        out.push_str("Treat it as your developer-agent instructions for this Shelbi workspace.\n\n");
+        out.push_str(
+            "Treat it as your developer-agent instructions for this Shelbi workspace.\n\n",
+        );
     }
     out.push_str(prompt);
     if !out.ends_with('\n') {
@@ -1778,19 +1819,19 @@ fn render_codex_startup_prompt(prompt: &str, include_agent_instructions: bool) -
     out
 }
 
-fn deploy_codex_startup_prompt(host: &Host, worktree: &Path, prompt: &str) -> Result<()> {
-    let dest_path = worktree.join(WORKTREE_CODEX_STARTUP_PROMPT_REL);
+fn deploy_startup_prompt(host: &Host, worktree: &Path, prompt: &str) -> Result<()> {
+    let dest_path = worktree.join(WORKTREE_STARTUP_PROMPT_REL);
     let dest_dir = dest_path.parent().ok_or_else(|| {
         Error::Other(format!(
-            "invalid codex startup prompt path `{WORKTREE_CODEX_STARTUP_PROMPT_REL}`"
+            "invalid startup prompt path `{WORKTREE_STARTUP_PROMPT_REL}`"
         ))
     })?;
     match host {
         Host::Local => {
             std::fs::create_dir_all(dest_dir)
-                .map_err(|e| Error::Other(format!("codex startup prompt delivery failure: {e}")))?;
+                .map_err(|e| Error::Other(format!("startup prompt delivery failure: {e}")))?;
             std::fs::write(&dest_path, prompt)
-                .map_err(|e| Error::Other(format!("codex startup prompt delivery failure: {e}")))?;
+                .map_err(|e| Error::Other(format!("startup prompt delivery failure: {e}")))?;
             Ok(())
         }
         Host::Ssh { host: ssh_host } => scp_text_to_remote(
@@ -1798,9 +1839,9 @@ fn deploy_codex_startup_prompt(host: &Host, worktree: &Path, prompt: &str) -> Re
             &dest_dir.to_string_lossy(),
             &dest_path.to_string_lossy(),
             prompt,
-            "codex-startup-prompt",
+            "startup-prompt",
         )
-        .map_err(|e| Error::Other(format!("codex startup prompt delivery failure: {e}"))),
+        .map_err(|e| Error::Other(format!("startup prompt delivery failure: {e}"))),
     }
 }
 
@@ -1893,7 +1934,9 @@ fn copy_dir_contents_to_remote(ssh_host: &str, src: &Path, dest: &Path) -> Resul
         let target_str = target.to_string_lossy().into_owned();
         if file_type.is_dir() {
             let mkdir = shelbi_ssh::run(
-                &Host::Ssh { host: ssh_host.to_string() },
+                &Host::Ssh {
+                    host: ssh_host.to_string(),
+                },
                 ["mkdir", "-p", &target_str],
             )
             .map_err(Error::Io)?;
@@ -2024,7 +2067,10 @@ fn remote_cd_launch(worktree: &Path, launch: &str, port: Option<u16>, workspace:
     // Review workspaces (Some port) also get SHELBI_WORKSPACE so the Review
     // agent's `shelbi workspace serve` resolves its slot.
     let port_env = match port {
-        Some(p) => format!("PORT={p} SHELBI_WORKSPACE={ws} ", ws = shelbi_agent::shell_escape(workspace)),
+        Some(p) => format!(
+            "PORT={p} SHELBI_WORKSPACE={ws} ",
+            ws = shelbi_agent::shell_escape(workspace)
+        ),
         None => String::new(),
     };
     format!(
@@ -2087,7 +2133,7 @@ pub fn workspace_launch_command_with_startup_prompt(
         include_agent_instructions.then_some(WORKTREE_AGENT_INSTRUCTIONS_REL),
         runner,
     );
-    with_codex_startup_prompt(&launch, startup_prompt_rel, runner)
+    with_startup_prompt(&launch, startup_prompt_rel, runner, resume)
 }
 
 /// Append the `--append-system-prompt "$(cat .claude/agent-instructions.md)"`
@@ -2124,21 +2170,45 @@ fn with_agent_system_prompt(
     )
 }
 
-fn with_codex_startup_prompt(
+fn effective_prompt_injection_for_spawn(
+    runner: &shelbi_core::AgentRunnerSpec,
+    resume: bool,
+) -> shelbi_core::PromptInjectionSpec {
+    if resume && shelbi_agent::is_claude_runner(&runner.command) {
+        return shelbi_core::PromptInjectionSpec::paste();
+    }
+    runner.effective_prompt_injection()
+}
+
+fn with_startup_prompt(
     launch: &str,
     startup_prompt_rel: Option<&str>,
     runner: &shelbi_core::AgentRunnerSpec,
+    resume: bool,
 ) -> String {
     let Some(rel) = startup_prompt_rel else {
         return launch.to_string();
     };
-    if !is_codex_runner(&runner.command) {
-        return launch.to_string();
+    match effective_prompt_injection_for_spawn(runner, resume).kind {
+        PromptInjectionKind::PositionalArg => format!(
+            "{launch} \"$(cat {rel})\"",
+            rel = shelbi_agent::shell_escape(rel),
+        ),
+        PromptInjectionKind::FlagFile => {
+            let spec = effective_prompt_injection_for_spawn(runner, resume);
+            let flag = spec.flag.as_deref().unwrap_or("--message-file");
+            format!(
+                "{launch} {flag} {rel}",
+                flag = shelbi_agent::shell_escape(flag),
+                rel = shelbi_agent::shell_escape(rel),
+            )
+        }
+        PromptInjectionKind::Stdin => format!(
+            "cat {rel} | {launch}",
+            rel = shelbi_agent::shell_escape(rel),
+        ),
+        PromptInjectionKind::Paste => launch.to_string(),
     }
-    format!(
-        "{launch} \"$(cat {rel})\"",
-        rel = shelbi_agent::shell_escape(rel),
-    )
 }
 
 fn is_codex_runner(command: &str) -> bool {
@@ -2164,7 +2234,13 @@ fn scp_settings_to_remote(
     remote_path: &str,
     rendered: &str,
 ) -> Result<()> {
-    scp_text_to_remote(ssh_host, remote_dir, remote_path, rendered, "workspace-settings")
+    scp_text_to_remote(
+        ssh_host,
+        remote_dir,
+        remote_path,
+        rendered,
+        "workspace-settings",
+    )
 }
 
 /// Push `body` to `remote_path` on `ssh_host`, ensuring `remote_dir`
@@ -2181,7 +2257,9 @@ fn scp_text_to_remote(
 ) -> Result<()> {
     // 1. Ensure the .claude/ dir exists on the remote.
     let mkdir = shelbi_ssh::run(
-        &Host::Ssh { host: ssh_host.to_string() },
+        &Host::Ssh {
+            host: ssh_host.to_string(),
+        },
         ["mkdir", "-p", remote_dir],
     )
     .map_err(Error::Io)?;
@@ -2497,13 +2575,11 @@ fn sync_worktree(
 
     let worktree_exists = has_git;
 
-    let branch_exists = shelbi_ssh::run(
-        host,
-        ["git", "-C", &repo, "rev-parse", "--verify", branch],
-    )
-    .map_err(Error::Io)?
-    .status
-    .success();
+    let branch_exists =
+        shelbi_ssh::run(host, ["git", "-C", &repo, "rev-parse", "--verify", branch])
+            .map_err(Error::Io)?
+            .status
+            .success();
 
     // Every `!branch_exists` path below cuts a fresh branch, so resolve
     // (and fetch) the base up front — and abort the whole sync if the
@@ -2680,10 +2756,11 @@ fn sync_worktree_for_resume(
     // follows a task that was already in progress, so the branch should exist;
     // fall back to cutting a fresh one off a current base if it somehow
     // doesn't, rather than failing the recreate.
-    let branch_exists = shelbi_ssh::run(host, ["git", "-C", &repo, "rev-parse", "--verify", branch])
-        .map_err(Error::Io)?
-        .status
-        .success();
+    let branch_exists =
+        shelbi_ssh::run(host, ["git", "-C", &repo, "rev-parse", "--verify", branch])
+            .map_err(Error::Io)?
+            .status
+            .success();
 
     let mut argv: Vec<String> = vec![
         "git".into(),
@@ -2791,6 +2868,7 @@ mod tests {
             AgentRunnerSpec {
                 command: "claude".into(),
                 flags: vec![],
+                prompt_injection: None,
                 dialog_signatures: vec![],
             },
         );
@@ -2898,8 +2976,15 @@ mod tests {
     #[test]
     fn prompt_falls_back_to_task_id_heading_when_body_empty() {
         let marker = PathBuf::from("/work/myapp/.shelbi/wt/alice/.claude/shelbi-ready");
-        let prompt =
-            compose_prompt("fix-login", "shelbi/fix-login", "   ", &marker, "main", "myapp", false);
+        let prompt = compose_prompt(
+            "fix-login",
+            "shelbi/fix-login",
+            "   ",
+            &marker,
+            "main",
+            "myapp",
+            false,
+        );
         assert!(prompt.contains("# Task fix-login"));
         assert!(prompt.contains(".claude/shelbi-ready"));
     }
@@ -3010,17 +3095,29 @@ mod tests {
             false,
             true,
         );
-        assert!(prompt.contains("Resumed."), "missing resume banner: {prompt}");
-        assert!(prompt.contains("Fix the Safari SSO bug."), "body dropped: {prompt}");
+        assert!(
+            prompt.contains("Resumed."),
+            "missing resume banner: {prompt}"
+        );
+        assert!(
+            prompt.contains("Fix the Safari SSO bug."),
+            "body dropped: {prompt}"
+        );
         assert!(
             prompt.contains("git fetch origin main && git rebase origin/main"),
             "handoff rebase missing: {prompt}"
         );
-        assert!(prompt.contains(".claude/shelbi-ready"), "marker missing: {prompt}");
+        assert!(
+            prompt.contains(".claude/shelbi-ready"),
+            "marker missing: {prompt}"
+        );
         // The banner is a preamble — it precedes the body + handoff.
         let banner_at = prompt.find("Resumed.").unwrap();
         let body_at = prompt.find("Fix the Safari SSO bug.").unwrap();
-        assert!(banner_at < body_at, "banner must precede the body: {prompt}");
+        assert!(
+            banner_at < body_at,
+            "banner must precede the body: {prompt}"
+        );
     }
 
     #[test]
@@ -3057,11 +3154,15 @@ mod tests {
         let p = fixture_project();
         let claude = p.runner("claude").unwrap();
         let launch = workspace_launch_command(claude, &p.workspace_permissions_mode, false, true);
-        assert!(launch.contains("--continue"), "claude resume must add --continue: {launch}");
+        assert!(
+            launch.contains("--continue"),
+            "claude resume must add --continue: {launch}"
+        );
 
         let codex = AgentRunnerSpec {
             command: "codex".into(),
             flags: vec!["--print".into()],
+            prompt_injection: None,
             dialog_signatures: vec![],
         };
         let launch = workspace_launch_command(&codex, &p.workspace_permissions_mode, false, true);
@@ -3072,7 +3173,10 @@ mod tests {
 
         // A normal (non-resume) dispatch never adds --continue, even for claude.
         let launch = workspace_launch_command(claude, &p.workspace_permissions_mode, false, false);
-        assert!(!launch.contains("--continue"), "non-resume must not add --continue: {launch}");
+        assert!(
+            !launch.contains("--continue"),
+            "non-resume must not add --continue: {launch}"
+        );
     }
 
     #[test]
@@ -3080,6 +3184,7 @@ mod tests {
         let codex = AgentRunnerSpec {
             command: "codex".into(),
             flags: vec!["--model".into(), "gpt-5".into()],
+            prompt_injection: None,
             dialog_signatures: vec![],
         };
         let launch = workspace_launch_command_with_startup_prompt(
@@ -3087,11 +3192,11 @@ mod tests {
             "auto",
             true,
             true,
-            Some(WORKTREE_CODEX_STARTUP_PROMPT_REL),
+            Some(WORKTREE_STARTUP_PROMPT_REL),
         );
         assert_eq!(
             launch,
-            "codex --model gpt-5 \"$(cat .shelbi/codex-startup-prompt.md)\"",
+            "codex --model gpt-5 \"$(cat .shelbi/startup-prompt.md)\"",
         );
         assert!(
             !launch.contains("--permission-mode"),
@@ -3108,10 +3213,34 @@ mod tests {
     }
 
     #[test]
-    fn claude_launch_ignores_codex_prompt_file_and_keeps_system_prompt() {
+    fn claude_cold_launch_uses_initial_prompt_file_and_keeps_system_prompt() {
         let claude = AgentRunnerSpec {
             command: "claude".into(),
             flags: vec![],
+            prompt_injection: None,
+            dialog_signatures: vec![],
+        };
+        let launch = workspace_launch_command_with_startup_prompt(
+            &claude,
+            "auto",
+            true,
+            false,
+            Some(WORKTREE_STARTUP_PROMPT_REL),
+        );
+        assert_eq!(
+            launch,
+            "claude --permission-mode auto \
+             --append-system-prompt \"$(cat .claude/agent-instructions.md)\" \
+             \"$(cat .shelbi/startup-prompt.md)\"",
+        );
+    }
+
+    #[test]
+    fn claude_resume_uses_continue_without_launch_seed_prompt() {
+        let claude = AgentRunnerSpec {
+            command: "claude".into(),
+            flags: vec![],
+            prompt_injection: None,
             dialog_signatures: vec![],
         };
         let launch = workspace_launch_command_with_startup_prompt(
@@ -3119,33 +3248,35 @@ mod tests {
             "auto",
             true,
             true,
-            Some(WORKTREE_CODEX_STARTUP_PROMPT_REL),
+            Some(WORKTREE_STARTUP_PROMPT_REL),
         );
         assert_eq!(
             launch,
             "claude --permission-mode auto --continue \
              --append-system-prompt \"$(cat .claude/agent-instructions.md)\"",
         );
-        assert!(
-            !launch.contains(WORKTREE_CODEX_STARTUP_PROMPT_REL),
-            "claude must not receive the codex prompt-file positional arg: {launch}"
-        );
     }
 
     #[test]
-    fn render_and_deploy_codex_startup_prompt_points_at_agent_instructions() {
-        let rendered = render_codex_startup_prompt("Do the task.\n", true);
+    fn render_and_deploy_startup_prompt_points_non_claude_at_agent_instructions() {
+        let codex = AgentRunnerSpec {
+            command: "codex".into(),
+            flags: vec![],
+            prompt_injection: None,
+            dialog_signatures: vec![],
+        };
+        let rendered = render_startup_prompt("Do the task.\n", true, &codex);
         assert!(
             rendered.starts_with("Read `.claude/agent-instructions.md` first."),
-            "codex startup prompt must point at deployed agent instructions: {rendered}"
+            "non-claude startup prompt must point at deployed agent instructions: {rendered}"
         );
         assert!(rendered.ends_with("Do the task.\n"));
 
-        let tmp = agent_test_tmpdir("codex-startup");
+        let tmp = agent_test_tmpdir("startup-prompt");
         let worktree = tmp.join("wt");
         std::fs::create_dir_all(&worktree).unwrap();
-        deploy_codex_startup_prompt(&Host::Local, &worktree, &rendered).unwrap();
-        let dest = worktree.join(WORKTREE_CODEX_STARTUP_PROMPT_REL);
+        deploy_startup_prompt(&Host::Local, &worktree, &rendered).unwrap();
+        let dest = worktree.join(WORKTREE_STARTUP_PROMPT_REL);
         assert_eq!(std::fs::read_to_string(dest).unwrap(), rendered);
 
         let _ = std::fs::remove_dir_all(&tmp);
@@ -3208,7 +3339,7 @@ mod tests {
         // Both fixtures are post-submit screens where claude is mid-turn.
         // Neither has a `shelbi:` title marker (claude's own OSC 2 writes
         // have already overwritten it), so the title-based probe alone
-        // would mis-fire a `prompt-lost` abort on a prompt that actually
+        // would mis-fire a `stalled` abort on a prompt that actually
         // landed. The content fallback catches both.
         assert!(claude_is_processing(BUSY_SCREEN_SPINNER));
         assert!(claude_is_processing(BUSY_SCREEN_ESC_FOOTER));
@@ -3487,7 +3618,9 @@ mod tests {
         let marker = dir.join("shelbi-transition");
 
         // Absent → None.
-        assert!(read_transition_marker(&Host::Local, &marker).unwrap().is_none());
+        assert!(read_transition_marker(&Host::Local, &marker)
+            .unwrap()
+            .is_none());
 
         // Two lines (task id + target status), with the trailing newline the
         // worker writes → both trimmed and returned.
@@ -3523,7 +3656,9 @@ mod tests {
 
         // Empty (or whitespace-only) → None, not an error.
         std::fs::write(&marker, "\n").unwrap();
-        assert!(read_transition_marker(&Host::Local, &marker).unwrap().is_none());
+        assert!(read_transition_marker(&Host::Local, &marker)
+            .unwrap()
+            .is_none());
 
         // A hostile / torn task id (spaces) fails validation → Err, so the
         // poller leaves the marker in place instead of clearing on a parse fail.
@@ -3570,8 +3705,14 @@ mod tests {
 
     #[test]
     fn parses_typical_claude_version_output() {
-        assert_eq!(parse_claude_version("2.1.83 (Claude Code)\n"), Some((2, 1, 83)));
-        assert_eq!(parse_claude_version("2.1.153 (Claude Code)"), Some((2, 1, 153)));
+        assert_eq!(
+            parse_claude_version("2.1.83 (Claude Code)\n"),
+            Some((2, 1, 83))
+        );
+        assert_eq!(
+            parse_claude_version("2.1.153 (Claude Code)"),
+            Some((2, 1, 153))
+        );
         assert_eq!(parse_claude_version("10.0.0\n"), Some((10, 0, 0)));
     }
 
@@ -3602,7 +3743,12 @@ mod tests {
     fn require_auto_mode_no_op_for_non_auto_modes() {
         // Skip the probe entirely if the user picked anything other than
         // `auto` — other modes don't depend on the classifier.
-        let runner = AgentRunnerSpec { command: "claude".into(), flags: vec![], dialog_signatures: vec![] };
+        let runner = AgentRunnerSpec {
+            command: "claude".into(),
+            flags: vec![],
+            prompt_injection: None,
+            dialog_signatures: vec![],
+        };
         for mode in ["acceptEdits", "bypassPermissions", "plan", "default"] {
             require_auto_mode_supported(&Host::Local, &runner, mode).unwrap();
         }
@@ -3659,6 +3805,7 @@ mod tests {
             AgentRunnerSpec {
                 command: "claude".into(),
                 flags: vec!["--permission-mode".into(), "auto".into()],
+                prompt_injection: None,
                 dialog_signatures: vec![],
             },
         );
@@ -3676,7 +3823,12 @@ mod tests {
         let mut p = fixture_project();
         p.agent_runners.insert(
             "codex".into(),
-            AgentRunnerSpec { command: "codex".into(), flags: vec!["--print".into()], dialog_signatures: vec![] },
+            AgentRunnerSpec {
+                command: "codex".into(),
+                flags: vec!["--print".into()],
+                prompt_injection: None,
+                dialog_signatures: vec![],
+            },
         );
         let runner = p.runner("codex").unwrap().clone();
         let runner_with_mode =
@@ -3740,7 +3892,12 @@ mod tests {
         // Auto mode is a claude setting; codex / other runners ignore the
         // `defaultMode` key, so probing their `--version` would be both
         // pointless and misleading.
-        let runner = AgentRunnerSpec { command: "codex".into(), flags: vec!["--print".into()], dialog_signatures: vec![] };
+        let runner = AgentRunnerSpec {
+            command: "codex".into(),
+            flags: vec!["--print".into()],
+            prompt_injection: None,
+            dialog_signatures: vec![],
+        };
         require_auto_mode_supported(&Host::Local, &runner, "auto").unwrap();
     }
 
@@ -3904,14 +4061,23 @@ mod tests {
             "expected default socket path in: {line}"
         );
         // No PORT on the dev path.
-        assert!(!line.contains("PORT="), "dev path must not inject PORT: {line}");
+        assert!(
+            !line.contains("PORT="),
+            "dev path must not inject PORT: {line}"
+        );
         // Must scope to the exec'd shell, not the surrounding tmux
         // pane — otherwise the `$SHELL -lc` env-strip drops it before
         // claude inherits it.
         let env_at = line.find("SHELBI_HUB_SOCK=").unwrap();
         let exec_at = line.find("exec ").unwrap();
-        assert!(env_at < exec_at, "SHELBI_HUB_SOCK must come BEFORE exec: {line}");
-        assert!(line.starts_with("cd "), "still cd's into the worktree: {line}");
+        assert!(
+            env_at < exec_at,
+            "SHELBI_HUB_SOCK must come BEFORE exec: {line}"
+        );
+        assert!(
+            line.starts_with("cd "),
+            "still cd's into the worktree: {line}"
+        );
         assert!(line.contains("LANG=C.UTF-8"), "LANG fix preserved: {line}");
     }
 
@@ -3949,13 +4115,14 @@ mod tests {
 
     #[test]
     fn with_agent_system_prompt_appends_claude_flag_when_agent_set() {
-        let runner = AgentRunnerSpec { command: "claude".into(), flags: vec![], dialog_signatures: vec![] };
+        let runner = AgentRunnerSpec {
+            command: "claude".into(),
+            flags: vec![],
+            prompt_injection: None,
+            dialog_signatures: vec![],
+        };
         let launch = "claude --permission-mode auto";
-        let out = with_agent_system_prompt(
-            launch,
-            Some(WORKTREE_AGENT_INSTRUCTIONS_REL),
-            &runner,
-        );
+        let out = with_agent_system_prompt(launch, Some(WORKTREE_AGENT_INSTRUCTIONS_REL), &runner);
         // The flag reads from the worktree-relative file so it works
         // identically on local and remote hosts (cwd is the worktree).
         assert!(
@@ -3967,31 +4134,37 @@ mod tests {
             "expected cat substitution in launch line: {out}"
         );
         // The pre-existing flags must survive the append.
-        assert!(out.starts_with("claude --permission-mode auto"), "got: {out}");
+        assert!(
+            out.starts_with("claude --permission-mode auto"),
+            "got: {out}"
+        );
     }
 
     #[test]
     fn with_agent_system_prompt_noop_when_no_agent_or_non_claude() {
-        let claude = AgentRunnerSpec { command: "claude".into(), flags: vec![], dialog_signatures: vec![] };
-        let codex = AgentRunnerSpec { command: "codex".into(), flags: vec![], dialog_signatures: vec![] };
+        let claude = AgentRunnerSpec {
+            command: "claude".into(),
+            flags: vec![],
+            prompt_injection: None,
+            dialog_signatures: vec![],
+        };
+        let codex = AgentRunnerSpec {
+            command: "codex".into(),
+            flags: vec![],
+            prompt_injection: None,
+            dialog_signatures: vec![],
+        };
         let base = "claude --permission-mode auto";
 
         // No agent → no flag injection (e.g. a test or non-CLI caller
         // that omits the agent context).
-        assert_eq!(
-            with_agent_system_prompt(base, None, &claude),
-            base,
-        );
+        assert_eq!(with_agent_system_prompt(base, None, &claude), base,);
 
         // Codex doesn't understand the flag; injecting would crash the
         // runner. The agent's instructions.md is still on disk for any
         // future runner-specific loader to pick up.
         assert_eq!(
-            with_agent_system_prompt(
-                "codex",
-                Some(WORKTREE_AGENT_INSTRUCTIONS_REL),
-                &codex,
-            ),
+            with_agent_system_prompt("codex", Some(WORKTREE_AGENT_INSTRUCTIONS_REL), &codex,),
             "codex",
         );
     }
@@ -4038,8 +4211,7 @@ mod tests {
 
         // Without an agent name → project-wide template fallback. The
         // shipped default contains the Phase 7 SessionStart hook string.
-        let rendered_fallback =
-            render_workspace_settings_preferring_agent(&project, None).unwrap();
+        let rendered_fallback = render_workspace_settings_preferring_agent(&project, None).unwrap();
         assert!(
             rendered_fallback.contains("SessionStart"),
             "project-wide default must include SessionStart hook: {rendered_fallback}",
@@ -4161,10 +4333,7 @@ mod tests {
         // The next orchestrator instance reads the handoff as system-
         // reminder context — locked-in shape so a renamer doesn't
         // silently move the marker tags.
-        let out = splice_orchestrator_handoff(
-            "# orchestrator\nbody\n",
-            "in-flight: nothing\n",
-        );
+        let out = splice_orchestrator_handoff("# orchestrator\nbody\n", "in-flight: nothing\n");
         assert!(out.starts_with("# orchestrator\nbody\n"));
         assert!(out.contains("<system-reminder>\nin-flight: nothing\n</system-reminder>\n"));
     }
@@ -4492,11 +4661,10 @@ mod rebase_git_tests {
                 assert_eq!(default_sha, new_main);
                 assert_ne!(after_sha, feature_before, "HEAD must move");
                 // Post-rebase: the feature commit sits on top of new main.
-                let parent_of_head = String::from_utf8_lossy(
-                    &run_git_in(&repo, &["rev-parse", "HEAD~1"]).stdout,
-                )
-                .trim()
-                .to_string();
+                let parent_of_head =
+                    String::from_utf8_lossy(&run_git_in(&repo, &["rev-parse", "HEAD~1"]).stdout)
+                        .trim()
+                        .to_string();
                 assert_eq!(parent_of_head, new_main);
                 // Both files survive the rewrite.
                 assert!(repo.join("feature.txt").exists());
@@ -4534,7 +4702,11 @@ mod rebase_git_tests {
 
         let outcome = rebase_workspace_branch_onto_default(&Host::Local, &repo, "main");
         match outcome {
-            RebaseOutcome::Conflict { stderr_excerpt, files, .. } => {
+            RebaseOutcome::Conflict {
+                stderr_excerpt,
+                files,
+                ..
+            } => {
                 assert!(
                     !stderr_excerpt.is_empty(),
                     "expected a non-empty conflict excerpt"
@@ -4578,8 +4750,11 @@ mod rebase_git_tests {
         run_git_in(&repo, &["checkout", "-q", "-b", "feature"]);
         commit_file(&repo, "feature.txt", "hi\n", "feature work");
 
-        let outcome =
-            rebase_workspace_branch_onto_default(&Host::Local, &repo, "ghost-branch-does-not-exist");
+        let outcome = rebase_workspace_branch_onto_default(
+            &Host::Local,
+            &repo,
+            "ghost-branch-does-not-exist",
+        );
         match outcome {
             RebaseOutcome::Skipped { reason } => {
                 assert!(
@@ -4704,7 +4879,10 @@ mod rebase_git_tests {
         // A top-level file literally named `.shelbimeta` must NOT be carved
         // out — the prefix guard is `.shelbi/`, not `.shelbi`.
         let lookalike = "?? .shelbimeta\0";
-        assert_eq!(user_dirty_porcelain_lines(lookalike), vec!["?? .shelbimeta"]);
+        assert_eq!(
+            user_dirty_porcelain_lines(lookalike),
+            vec!["?? .shelbimeta"]
+        );
 
         // A clean tree is clean.
         assert!(user_dirty_porcelain_lines("").is_empty());
@@ -4791,7 +4969,8 @@ mod rebase_git_tests {
             "PROJECT -e missing: {argv:?}"
         );
         assert!(
-            argv.iter().any(|s| s == "SHELBI_HUB_SOCK=/tmp/shelbi-hub.sock"),
+            argv.iter()
+                .any(|s| s == "SHELBI_HUB_SOCK=/tmp/shelbi-hub.sock"),
             "SHELBI_HUB_SOCK -e missing: {argv:?}"
         );
         // Every `-e` sits directly before its KEY=VAL payload — tmux
@@ -4863,9 +5042,16 @@ mod rebase_git_tests {
             .iter()
             .position(|s| s == "PORT=3010")
             .unwrap_or_else(|| panic!("PORT -e missing: {argv:?}"));
-        assert_eq!(argv[port_at - 1], "-e", "PORT payload not preceded by -e: {argv:?}");
+        assert_eq!(
+            argv[port_at - 1],
+            "-e",
+            "PORT payload not preceded by -e: {argv:?}"
+        );
         let sh_at = argv.iter().position(|s| s == "sh").unwrap();
-        assert!(port_at < sh_at, "PORT must precede the sh -c positional: {argv:?}");
+        assert!(
+            port_at < sh_at,
+            "PORT must precede the sh -c positional: {argv:?}"
+        );
     }
 
     /// The path half of scp's `host:path` target is re-parsed by the remote
@@ -4917,7 +5103,9 @@ mod rebase_git_tests {
         // Build the exact argv refresh_agent_skills uses, routed through the
         // SSH transport, then extract the words ssh joins for the remote shell.
         let skills_str = skills.to_string_lossy().into_owned();
-        let host = Host::Ssh { host: "devbox".into() };
+        let host = Host::Ssh {
+            host: "devbox".into(),
+        };
         let cmd = shelbi_ssh::build_command(&host, ["rm", "-rf", skills_str.as_str()]);
         let parts: Vec<String> = cmd
             .get_args()
@@ -4937,7 +5125,10 @@ mod rebase_git_tests {
             sentinel.exists(),
             "sibling dir was destroyed by word-split — wire: {wire}",
         );
-        assert!(!skills.exists(), "intended skills dir not removed — wire: {wire}");
+        assert!(
+            !skills.exists(),
+            "intended skills dir not removed — wire: {wire}"
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 }
@@ -4950,9 +5141,7 @@ mod sync_worktree_git_tests {
     //! `sync_worktree` against `Host::Local`. Skipped when `git` isn't on
     //! PATH so a git-less sandbox still passes.
     use super::*;
-    use shelbi_core::{
-        AgentRunnerSpec, MachineKind, OrchestratorSpec, WorkspaceSpec,
-    };
+    use shelbi_core::{AgentRunnerSpec, MachineKind, OrchestratorSpec, WorkspaceSpec};
     use std::collections::BTreeMap;
 
     fn git_available() -> bool {
@@ -4986,10 +5175,14 @@ mod sync_worktree_git_tests {
                 .as_nanos(),
         ));
         std::fs::create_dir_all(&dir).unwrap();
-        assert!(run_git_in(&dir, &["init", "-q", "-b", "main"]).status.success());
+        assert!(run_git_in(&dir, &["init", "-q", "-b", "main"])
+            .status
+            .success());
         std::fs::write(dir.join("README.md"), "# repo\n").unwrap();
         assert!(run_git_in(&dir, &["add", "README.md"]).status.success());
-        assert!(run_git_in(&dir, &["commit", "-q", "-m", "initial"]).status.success());
+        assert!(run_git_in(&dir, &["commit", "-q", "-m", "initial"])
+            .status
+            .success());
         dir
     }
 
@@ -4999,7 +5192,12 @@ mod sync_worktree_git_tests {
         let mut runners = BTreeMap::new();
         runners.insert(
             "claude".to_string(),
-            AgentRunnerSpec { command: "claude".into(), flags: vec![], dialog_signatures: vec![] },
+            AgentRunnerSpec {
+                command: "claude".into(),
+                flags: vec![],
+                prompt_injection: None,
+                dialog_signatures: vec![],
+            },
         );
         Project {
             name: "sync-test".into(),
@@ -5013,13 +5211,27 @@ mod sync_worktree_git_tests {
                 host: None,
                 tags: Vec::new(),
             }],
-            orchestrator: OrchestratorSpec { runner: "claude".into() },
+            orchestrator: OrchestratorSpec {
+                runner: "claude".into(),
+            },
             agent_runners: runners,
             editor: None,
             github_url: None,
             workspaces: vec![
-                WorkspaceSpec { name: "alice".into(), machine: "hub".into(), runner: "claude".into(), tags: Vec::new(), slot: None },
-                WorkspaceSpec { name: "bob".into(), machine: "hub".into(), runner: "claude".into(), tags: Vec::new(), slot: None },
+                WorkspaceSpec {
+                    name: "alice".into(),
+                    machine: "hub".into(),
+                    runner: "claude".into(),
+                    tags: Vec::new(),
+                    slot: None,
+                },
+                WorkspaceSpec {
+                    name: "bob".into(),
+                    machine: "hub".into(),
+                    runner: "claude".into(),
+                    tags: Vec::new(),
+                    slot: None,
+                },
             ],
             workspace_poll_interval_secs: 5,
             workspace_permissions_mode: "auto".into(),
@@ -5075,22 +5287,52 @@ mod sync_worktree_git_tests {
         let repo = init_repo("release");
         let project = project_at(&repo);
         let machine = project.machines[0].clone();
-        assert!(run_git_in(&repo, &["branch", "shelbi/x", "main"]).status.success());
+        assert!(run_git_in(&repo, &["branch", "shelbi/x", "main"])
+            .status
+            .success());
 
         // alice takes shelbi/x first.
         let alice_wt = workspace_worktree(&machine, &project.workspaces[0]);
-        sync_worktree(&project, &Host::Local, &machine, &alice_wt, "shelbi/x", "main").unwrap();
+        sync_worktree(
+            &project,
+            &Host::Local,
+            &machine,
+            &alice_wt,
+            "shelbi/x",
+            "main",
+        )
+        .unwrap();
         assert_eq!(head_of(&alice_wt), "shelbi/x");
 
         // bob is created on its own branch, then re-dispatched onto shelbi/x
         // (which is still live in alice's worktree).
         let bob_wt = workspace_worktree(&machine, &project.workspaces[1]);
-        sync_worktree(&project, &Host::Local, &machine, &bob_wt, "shelbi/bobinit", "main").unwrap();
-        sync_worktree(&project, &Host::Local, &machine, &bob_wt, "shelbi/x", "main").unwrap();
+        sync_worktree(
+            &project,
+            &Host::Local,
+            &machine,
+            &bob_wt,
+            "shelbi/bobinit",
+            "main",
+        )
+        .unwrap();
+        sync_worktree(
+            &project,
+            &Host::Local,
+            &machine,
+            &bob_wt,
+            "shelbi/x",
+            "main",
+        )
+        .unwrap();
 
         assert_eq!(head_of(&bob_wt), "shelbi/x", "bob must claim the branch");
         // alice was released (detached) so the branch was free to move.
-        assert_ne!(head_of(&alice_wt), "shelbi/x", "alice must have been detached");
+        assert_ne!(
+            head_of(&alice_wt),
+            "shelbi/x",
+            "alice must have been detached"
+        );
         let _ = std::fs::remove_dir_all(&repo);
     }
 
@@ -5122,7 +5364,10 @@ mod sync_worktree_git_tests {
         // But a genuine user change still blocks.
         std::fs::write(wt.join("user.txt"), "real work\n").unwrap();
         let err = sync_worktree(&project, &Host::Local, &machine, &wt, "shelbi/x", "main");
-        assert!(err.is_err(), "user-authored change must still block the switch");
+        assert!(
+            err.is_err(),
+            "user-authored change must still block the switch"
+        );
         let _ = std::fs::remove_dir_all(&repo);
     }
 
@@ -5145,12 +5390,13 @@ mod sync_worktree_git_tests {
         sync_worktree(&project, &Host::Local, &machine, &wt, "shelbi/x", "main").unwrap();
         std::fs::write(wt.join("committed.txt"), "done\n").unwrap();
         assert!(run_git_in(&wt, &["add", "committed.txt"]).status.success());
-        assert!(run_git_in(&wt, &["commit", "-q", "-m", "wip"]).status.success());
-        let committed_sha = String::from_utf8_lossy(
-            &run_git_in(&wt, &["rev-parse", "HEAD"]).stdout,
-        )
-        .trim()
-        .to_string();
+        assert!(run_git_in(&wt, &["commit", "-q", "-m", "wip"])
+            .status
+            .success());
+        let committed_sha =
+            String::from_utf8_lossy(&run_git_in(&wt, &["rev-parse", "HEAD"]).stdout)
+                .trim()
+                .to_string();
         // Uncommitted change that a `start`-style clean checkout would reject.
         std::fs::write(wt.join("scratch.txt"), "half-finished\n").unwrap();
 
@@ -5159,8 +5405,7 @@ mod sync_worktree_git_tests {
 
         assert_eq!(head_of(&wt), "shelbi/x", "branch must be preserved");
         assert_eq!(
-            String::from_utf8_lossy(&run_git_in(&wt, &["rev-parse", "HEAD"]).stdout)
-                .trim(),
+            String::from_utf8_lossy(&run_git_in(&wt, &["rev-parse", "HEAD"]).stdout).trim(),
             committed_sha,
             "commit must be preserved",
         );
@@ -5194,17 +5439,25 @@ mod sync_worktree_git_tests {
         sync_worktree(&project, &Host::Local, &machine, &wt, "shelbi/x", "main").unwrap();
         std::fs::write(wt.join("work.txt"), "landed\n").unwrap();
         assert!(run_git_in(&wt, &["add", "work.txt"]).status.success());
-        assert!(run_git_in(&wt, &["commit", "-q", "-m", "landed"]).status.success());
-        assert!(run_git_in(&repo, &["worktree", "remove", "--force", &wt.to_string_lossy()])
+        assert!(run_git_in(&wt, &["commit", "-q", "-m", "landed"])
             .status
             .success());
+        assert!(run_git_in(
+            &repo,
+            &["worktree", "remove", "--force", &wt.to_string_lossy()]
+        )
+        .status
+        .success());
         assert!(!wt.join(".git").exists(), "worktree should be gone");
 
         sync_worktree_for_resume(&Host::Local, &machine, &wt, "shelbi/x", "main").unwrap();
 
         assert!(wt.join(".git").exists(), "worktree must be recreated");
         assert_eq!(head_of(&wt), "shelbi/x", "must reclaim the existing branch");
-        assert!(wt.join("work.txt").exists(), "prior commit's file must be present");
+        assert!(
+            wt.join("work.txt").exists(),
+            "prior commit's file must be present"
+        );
         let _ = std::fs::remove_dir_all(&repo);
     }
 }
@@ -5267,7 +5520,10 @@ mod sync_worktree_freshcut_tests {
     fn commit_file(repo: &std::path::Path, name: &str, contents: &str, message: &str) {
         std::fs::write(repo.join(name), contents).unwrap();
         assert_git_ok(&run_git_in(repo, &["add", name]), "git add");
-        assert_git_ok(&run_git_in(repo, &["commit", "-q", "-m", message]), "git commit");
+        assert_git_ok(
+            &run_git_in(repo, &["commit", "-q", "-m", message]),
+            "git commit",
+        );
     }
 
     fn rev_parse(repo: &std::path::Path, r: &str) -> String {
@@ -5303,6 +5559,7 @@ mod sync_worktree_freshcut_tests {
             shelbi_core::AgentRunnerSpec {
                 command: "claude".into(),
                 flags: vec![],
+                prompt_injection: None,
                 dialog_signatures: vec![],
             },
         );
@@ -5338,14 +5595,23 @@ mod sync_worktree_freshcut_tests {
         let root = fresh_root(label);
         let seed = root.join("seed");
         std::fs::create_dir_all(&seed).unwrap();
-        assert_git_ok(&run_git_in(&seed, &["init", "-q", "-b", "main"]), "git init");
+        assert_git_ok(
+            &run_git_in(&seed, &["init", "-q", "-b", "main"]),
+            "git init",
+        );
         commit_file(&seed, "README.md", "# repo\n", "initial");
 
         let bare = root.join("origin.git");
         assert_git_ok(
             &run_git_in(
                 &root,
-                &["clone", "-q", "--bare", seed.to_str().unwrap(), bare.to_str().unwrap()],
+                &[
+                    "clone",
+                    "-q",
+                    "--bare",
+                    seed.to_str().unwrap(),
+                    bare.to_str().unwrap(),
+                ],
             ),
             "bare clone",
         );
@@ -5354,7 +5620,12 @@ mod sync_worktree_freshcut_tests {
         assert_git_ok(
             &run_git_in(
                 &root,
-                &["clone", "-q", bare.to_str().unwrap(), machine.to_str().unwrap()],
+                &[
+                    "clone",
+                    "-q",
+                    bare.to_str().unwrap(),
+                    machine.to_str().unwrap(),
+                ],
             ),
             "machine clone",
         );
@@ -5365,11 +5636,21 @@ mod sync_worktree_freshcut_tests {
         assert_git_ok(
             &run_git_in(
                 &root,
-                &["clone", "-q", bare.to_str().unwrap(), writer.to_str().unwrap()],
+                &[
+                    "clone",
+                    "-q",
+                    bare.to_str().unwrap(),
+                    writer.to_str().unwrap(),
+                ],
             ),
             "writer clone",
         );
-        commit_file(&writer, "upstream.txt", "merged upstream\n", "upstream landed");
+        commit_file(
+            &writer,
+            "upstream.txt",
+            "merged upstream\n",
+            "upstream landed",
+        );
         assert_git_ok(
             &run_git_in(&writer, &["push", "-q", "origin", "main"]),
             "writer push",
@@ -5391,8 +5672,15 @@ mod sync_worktree_freshcut_tests {
         let (root, machine, fresh, stale) = stale_clone_fixture("fresh-wt");
         let wt = root.join("wt-alpha");
 
-        sync_worktree(&project_at(&machine), &Host::Local, &machine_at(&machine), &wt, "shelbi/task-x", "main")
-            .expect("sync_worktree should succeed with a reachable origin");
+        sync_worktree(
+            &project_at(&machine),
+            &Host::Local,
+            &machine_at(&machine),
+            &wt,
+            "shelbi/task-x",
+            "main",
+        )
+        .expect("sync_worktree should succeed with a reachable origin");
 
         assert_eq!(
             rev_parse(&machine, "shelbi/task-x"),
@@ -5405,9 +5693,12 @@ mod sync_worktree_freshcut_tests {
         assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "shelbi/task-x");
         // --no-track: a task branch must not adopt origin/main as upstream.
         assert!(
-            !run_git_in(&wt, &["rev-parse", "--abbrev-ref", "shelbi/task-x@{upstream}"])
-                .status
-                .success(),
+            !run_git_in(
+                &wt,
+                &["rev-parse", "--abbrev-ref", "shelbi/task-x@{upstream}"]
+            )
+            .status
+            .success(),
             "task branch must not track origin/main"
         );
 
@@ -5427,13 +5718,28 @@ mod sync_worktree_freshcut_tests {
         assert_git_ok(
             &run_git_in(
                 &machine,
-                &["worktree", "add", "-q", "-b", "shelbi/prev-task", wt.to_str().unwrap(), "main"],
+                &[
+                    "worktree",
+                    "add",
+                    "-q",
+                    "-b",
+                    "shelbi/prev-task",
+                    wt.to_str().unwrap(),
+                    "main",
+                ],
             ),
             "pre-existing worktree",
         );
 
-        sync_worktree(&project_at(&machine), &Host::Local, &machine_at(&machine), &wt, "shelbi/task-y", "main")
-            .expect("sync_worktree should succeed with a reachable origin");
+        sync_worktree(
+            &project_at(&machine),
+            &Host::Local,
+            &machine_at(&machine),
+            &wt,
+            "shelbi/task-y",
+            "main",
+        )
+        .expect("sync_worktree should succeed with a reachable origin");
 
         assert_eq!(
             rev_parse(&machine, "shelbi/task-y"),
@@ -5460,17 +5766,35 @@ mod sync_worktree_freshcut_tests {
         assert_git_ok(
             &run_git_in(
                 &machine,
-                &["remote", "set-url", "origin", "/nonexistent/shelbi-gone.git"],
+                &[
+                    "remote",
+                    "set-url",
+                    "origin",
+                    "/nonexistent/shelbi-gone.git",
+                ],
             ),
             "break origin",
         );
         let wt = root.join("wt-charlie");
 
-        let err = sync_worktree(&project_at(&machine), &Host::Local, &machine_at(&machine), &wt, "shelbi/task-z", "main")
-            .expect_err("unreachable origin must abort the sync");
+        let err = sync_worktree(
+            &project_at(&machine),
+            &Host::Local,
+            &machine_at(&machine),
+            &wt,
+            "shelbi/task-z",
+            "main",
+        )
+        .expect_err("unreachable origin must abort the sync");
         let msg = err.to_string();
-        assert!(msg.contains("fetch"), "error must name the failing fetch: {msg}");
-        assert!(msg.contains("main"), "error must name the base branch: {msg}");
+        assert!(
+            msg.contains("fetch"),
+            "error must name the failing fetch: {msg}"
+        );
+        assert!(
+            msg.contains("main"),
+            "error must name the base branch: {msg}"
+        );
         assert!(
             !ref_exists(&machine, "refs/heads/shelbi/task-z"),
             "no branch may be cut from the stale ref"
@@ -5492,13 +5816,23 @@ mod sync_worktree_freshcut_tests {
         let root = fresh_root("no-origin");
         let repo = root.join("repo");
         std::fs::create_dir_all(&repo).unwrap();
-        assert_git_ok(&run_git_in(&repo, &["init", "-q", "-b", "main"]), "git init");
+        assert_git_ok(
+            &run_git_in(&repo, &["init", "-q", "-b", "main"]),
+            "git init",
+        );
         commit_file(&repo, "README.md", "# repo\n", "initial");
         let local_main = rev_parse(&repo, "main");
         let wt = root.join("wt-delta");
 
-        sync_worktree(&project_at(&repo), &Host::Local, &machine_at(&repo), &wt, "shelbi/task-l", "main")
-            .expect("no-origin repo must fall back to the local default");
+        sync_worktree(
+            &project_at(&repo),
+            &Host::Local,
+            &machine_at(&repo),
+            &wt,
+            "shelbi/task-l",
+            "main",
+        )
+        .expect("no-origin repo must fall back to the local default");
         assert_eq!(rev_parse(&repo, "shelbi/task-l"), local_main);
 
         let _ = std::fs::remove_dir_all(&root);
@@ -5521,18 +5855,33 @@ mod sync_worktree_freshcut_tests {
         assert_git_ok(
             &run_git_in(
                 &machine,
-                &["remote", "set-url", "origin", "/nonexistent/shelbi-gone.git"],
+                &[
+                    "remote",
+                    "set-url",
+                    "origin",
+                    "/nonexistent/shelbi-gone.git",
+                ],
             ),
             "break origin",
         );
         let wt = root.join("wt-echo");
 
-        sync_worktree(&project_at(&machine), &Host::Local, &machine_at(&machine), &wt, "shelbi/pre-cut", "main")
-            .expect("existing branch must check out without fetching");
+        sync_worktree(
+            &project_at(&machine),
+            &Host::Local,
+            &machine_at(&machine),
+            &wt,
+            "shelbi/pre-cut",
+            "main",
+        )
+        .expect("existing branch must check out without fetching");
         assert_eq!(rev_parse(&machine, "shelbi/pre-cut"), stale);
         let out = run_git_in(&wt, &["rev-parse", "--abbrev-ref", "HEAD"]);
         assert_git_ok(&out, "worktree HEAD");
-        assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "shelbi/pre-cut");
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout).trim(),
+            "shelbi/pre-cut"
+        );
 
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -5552,7 +5901,12 @@ mod sync_worktree_freshcut_tests {
         assert_git_ok(
             &run_git_in(
                 &machine_repo,
-                &["remote", "set-url", "origin", "/nonexistent/shelbi-gone.git"],
+                &[
+                    "remote",
+                    "set-url",
+                    "origin",
+                    "/nonexistent/shelbi-gone.git",
+                ],
             ),
             "break origin",
         );
@@ -5567,6 +5921,7 @@ mod sync_worktree_freshcut_tests {
             shelbi_core::AgentRunnerSpec {
                 command: "claude".into(),
                 flags: vec![],
+                prompt_injection: None,
                 dialog_signatures: vec![],
             },
         );
@@ -5622,7 +5977,10 @@ mod sync_worktree_freshcut_tests {
             None => std::env::remove_var("SHELBI_HOME"),
         }
 
-        assert!(result.is_err(), "start must abort when the sync fetch fails");
+        assert!(
+            result.is_err(),
+            "start must abort when the sync fetch fails"
+        );
         let line = events
             .lines()
             .find(|l| l.contains("dispatch task=task-ev"))
