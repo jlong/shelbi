@@ -141,7 +141,8 @@ fn occupied_idle_workspaces(
 /// Errors when a workspace references an undeclared machine: that's a
 /// project YAML bug the user should fix, and surfacing it from `list` is
 /// the same behavior as the old per-row `machine().ok_or_else(...)` path.
-pub(crate) fn render_list(
+#[cfg(test)]
+fn render_list(
     workspaces: &[WorkspaceSpec],
     in_progress: &[&Task],
 ) -> Result<Vec<String>> {

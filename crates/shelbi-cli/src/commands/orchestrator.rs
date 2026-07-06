@@ -240,7 +240,7 @@ fn line_belongs_to_project(scope: &ProjectScope, parsed: &ParsedLine) -> bool {
 }
 
 fn event_kind(parsed: &ParsedLine) -> String {
-    if parsed.fields.get("heartbeat").is_some() {
+    if parsed.fields.contains_key("heartbeat") {
         return "heartbeat".into();
     }
     if parsed.fields.get("mode").is_some_and(|mode| mode == "zen") && parsed.from.is_some() {
@@ -709,7 +709,7 @@ mod tests {
         assert_eq!(response.events[0].workspace.as_deref(), Some("alpha"));
         assert_eq!(response.events[0].reason.as_deref(), Some("exit:1"));
         assert!(
-            response.events[0].metadata.get("supervision").is_none(),
+            !response.events[0].metadata.contains_key("supervision"),
             "pane death delivery must not be conflated with auto-restart"
         );
     }
