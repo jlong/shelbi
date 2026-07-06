@@ -2590,6 +2590,22 @@ mod tests {
         run_git(local, &["push", "origin", "main"]);
     }
 
+    fn add_second_parent_branch(local: &std::path::Path) {
+        run_git(local, &["checkout", "-b", "parent2", "main"]);
+        std::fs::write(local.join("parent2.txt"), "from parent2\n").unwrap();
+        run_git(local, &["add", "parent2.txt"]);
+        run_git(local, &["commit", "-q", "-m", "parent2 work"]);
+        run_git(local, &["push", "-u", "origin", "parent2"]);
+        run_git(local, &["checkout", "main"]);
+    }
+
+    fn advance_main_with_second_parent_squashed(local: &std::path::Path) {
+        run_git(local, &["checkout", "main"]);
+        run_git(local, &["merge", "--squash", "parent2"]);
+        run_git(local, &["commit", "-q", "-m", "shelbi: squash parent2 into main"]);
+        run_git(local, &["push", "origin", "main"]);
+    }
+
     fn project_with_no_workspaces(local: &std::path::Path) -> Project {
         project_at(local, MergeStrategy::Squash)
     }
