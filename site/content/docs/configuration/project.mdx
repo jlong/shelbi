@@ -45,6 +45,9 @@ agent_runners:
   claude:
     command: claude
     flags: []
+  codex:
+    command: codex
+    flags: []
 workspaces:
   - { name: alice, machine: hub, runner: claude }
 ```
@@ -128,6 +131,12 @@ initial startup prompt containing the rendered orchestrator instructions
 and bootstrap request. Other runners launch exactly as configured. Put any
 required Codex mode flags in `agent_runners.codex.flags`.
 
+`orchestrator.runner` only controls the dashboard/orchestrator pane. It does
+not change worker slots. Worker slots use their own
+[`workspaces[].runner`](#workspaces) value, so a project can run a Codex
+orchestrator while still dispatching tasks to Claude workers, or mix Claude
+and Codex workers in the same pool.
+
 ## agent_runners
 
 A map from runner name to the command line agents are launched with.
@@ -167,9 +176,29 @@ cleared context) between assignments. See
 ```yaml
 workspaces:
   - { name: alice, machine: hub, runner: claude }
-  - { name: bob,   machine: m2,  runner: claude }
+  - { name: bob,   machine: m2,  runner: codex }
   - { name: rev,   machine: hub, runner: claude, tags: [review], slot: 0 }
 ```
+
+To switch existing worker slots after setup, use:
+
+```bash
+shelbi workspace set-runner codex --all
+```
+
+That command edits the same `workspaces[].runner` fields shown above and
+validates that `codex` is declared in `agent_runners`. You can also update
+the YAML directly by changing each desired workspace row:
+
+```yaml
+workspaces:
+  - { name: alice, machine: hub, runner: codex }
+  - { name: bob,   machine: m2,  runner: codex }
+```
+
+Leave `orchestrator.runner` unchanged unless you also want to change the
+dashboard/orchestrator pane. Run `shelbi workspace list` afterward; its
+`RUNNER` column shows the runner each workspace will launch.
 
 <Callout type="note" title="Legacy review designator folds into tags">
 
