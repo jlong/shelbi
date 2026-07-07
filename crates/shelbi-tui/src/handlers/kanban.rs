@@ -342,6 +342,63 @@ mod tests {
     }
 
     #[test]
+    fn collapsed_header_click_expands_without_card_fallthrough() {
+        let _g = ENV_LOCK.lock().unwrap();
+        let home = std::env::temp_dir().join(format!(
+            "shelbi-kanban-collapsed-header-click-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&home).unwrap();
+        std::env::set_var("SHELBI_HOME", &home);
+
+        let mut app = KanbanApp::new("demo");
+        assert!(
+            app.is_column_collapsed(0),
+            "empty backlog starts auto-collapsed"
+        );
+        app.selected_column = 1;
+        app.selected_row = 2;
+        app.header_hits = vec![HeaderHit {
+            area: Rect {
+                x: 0,
+                y: 1,
+                width: 3,
+                height: 12,
+            },
+            col_idx: 0,
+        }];
+        app.card_hits = vec![CardHit {
+            area: Rect {
+                x: 0,
+                y: 1,
+                width: 20,
+                height: 3,
+            },
+            col_idx: 0,
+            row_idx: 0,
+        }];
+
+        handle_kanban_mouse(&mut app, left_click(1, 4));
+
+        assert!(
+            !app.popover_is_open(),
+            "collapsed header click must not open a stale card popover"
+        );
+        assert_eq!(app.selected_column, 1);
+        assert_eq!(app.selected_row, 2);
+        assert!(
+            !app.is_column_collapsed(0),
+            "collapsed header click should expand the column once"
+        );
+
+        std::env::remove_var("SHELBI_HOME");
+    }
+
+    #[test]
     fn first_card_click_still_opens_popover() {
         let mut app = KanbanApp::new("demo");
         app.tasks = vec![task_file("task-1", Column::backlog())];
