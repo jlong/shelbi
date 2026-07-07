@@ -1,0 +1,51 @@
+name: release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  pull_request:
+    paths:
+      - 'Cargo.toml'
+      - 'crates/shelbi-cli/Cargo.toml'
+      - 'scripts/release/check-version.sh'
+      - '.github/workflows/release.yml'
+
+jobs:
+  validate:
+    name: Validate release metadata
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Check release tag matches Cargo version
+        if: github.ref_type == 'tag'
+        run: scripts/release/check-version.sh
+
+      - name: Exercise release version guard
+        if: github.ref_type != 'tag'
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          version="$(
+            cargo metadata --no-deps --format-version 1 \
+              | python3 -c 'import json, sys; print(next(package["version"] for package in json.load(sys.stdin)["packages"] if package["manifest_path"].endswith("/crates/shelbi-cli/Cargo.toml")))'
+          )"
+
+          GITHUB_REF_NAME="v${version}" scripts/release/check-version.sh
+
+          if GITHUB_REF_NAME="${version}" scripts/release/check-version.sh 2>missing-v.err; then
+            echo "expected non-v release tag to fail" >&2
+            exit 1
+          fi
+          grep -F "expected vMAJOR.MINOR.PATCH" missing-v.err
+
+          if GITHUB_REF_NAME="v0.0.0" scripts/release/check-version.sh 2>mismatch.err; then
+            echo "expected mismatched release tag to fail" >&2
+            exit 1
+          fi
+          grep -F "does not match shelbi CLI Cargo version" mismatch.err
