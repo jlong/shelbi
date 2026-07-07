@@ -407,6 +407,129 @@ pub fn reverse_forward_spec() -> Result<OsString> {
     Ok(s)
 }
 
+/// The `-R` argument for a **TCP loopback** reverse forward: OpenSSH binds
+/// `127.0.0.1:<port>` on the remote and forwards it onto the hub's local
+/// `hub.sock`. This is the fallback shape for hosts (Tailscale SSH) where the
+/// Unix-socket landing path lands root-owned and unusable.
+///
+/// Layout: `127.0.0.1:<port>:<local_hub_sock>` — the remote-TCP → local-Unix
+/// form of ssh's `-R`.
+pub fn reverse_forward_spec_tcp(port: u16) -> Result<OsString> {
+    let local = crate::hub_socket_path()?;
+    let mut s = OsString::from(format!("{TCP_FORWARD_BIND_ADDR}:{port}:"));
+    s.push(local);
+    Ok(s)
+}
+
+/// Loopback address the TCP reverse forward binds on the remote. Loopback (not
+/// `*`) keeps the forwarded listener reachable only from the remote host
+/// itself — a worker in a pane there — never from the wider tailnet/LAN.
+pub const TCP_FORWARD_BIND_ADDR: &str = "127.0.0.1";
+
+/// First candidate port for a TCP loopback reverse forward, and the size of
+/// the band we sweep on a bind collision. Ports are picked deterministically
+/// from `[TCP_FORWARD_PORT_BASE, TCP_FORWARD_PORT_BASE + TCP_FORWARD_PORT_SPAN)`
+/// so a re-established forward reuses the same port a worker was told about
+/// whenever it's still free.
+pub const TCP_FORWARD_PORT_BASE: u16 = 47100;
+pub const TCP_FORWARD_PORT_SPAN: u16 = 16;
+
+/// Persisted forward decision for a single remote host: which mode the hub
+/// settled on, plus the loopback port a TCP forward bound (so the next
+/// forward and the worker env agree on it).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct HostForward {
+    pub mode: shelbi_core::ForwardMode,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub port: Option<u16>,
+}
+
+/// State file recording the per-host forward decisions:
+/// `$SHELBI_HOME/forward-modes.json`. A flat `{ "<host>": {mode, port} }` map,
+/// small enough to read-modify-write atomically on each update.
+pub fn forward_state_path() -> Result<PathBuf> {
+    Ok(shelbi_home()?.join("forward-modes.json"))
+}
+
+/// Read the whole forward-mode map. Best-effort: a missing or unparseable file
+/// yields an empty map so a torn write never wedges the forward path — the
+/// worst case is re-running detection.
+pub fn load_forward_state() -> std::collections::HashMap<String, HostForward> {
+    let path = match forward_state_path() {
+        Ok(p) => p,
+        Err(_) => return std::collections::HashMap::new(),
+    };
+    match fs::read_to_string(&path) {
+        Ok(t) => serde_json::from_str(&t).unwrap_or_default(),
+        Err(_) => std::collections::HashMap::new(),
+    }
+}
+
+/// The remembered forward decision for `host`, if any. `None` means detection
+/// hasn't run (or was reset) and the caller should start from the Unix default.
+pub fn load_host_forward(host: &str) -> Option<HostForward> {
+    load_forward_state().get(host).copied()
+}
+
+/// Record (or clear) the forward decision for `host`. Read-modify-write against
+/// the whole map so a concurrent update for a *different* host isn't lost.
+/// Passing `None` forgets the host — used to reset back to auto-detection.
+pub fn save_host_forward(host: &str, decision: Option<HostForward>) -> Result<()> {
+    let mut map = load_forward_state();
+    match decision {
+        Some(hf) => {
+            map.insert(host.to_string(), hf);
+        }
+        None => {
+            map.remove(host);
+        }
+    }
+    let body = serde_json::to_vec_pretty(&map).map_err(|e| {
+        shelbi_core::Error::Other(format!("serializing forward-mode state: {e}"))
+    })?;
+    let path = forward_state_path()?;
+    crate::atomic_write(&path, &body)
+}
+
+/// Where a *worker* on a remote host reaches the hub daemon — the endpoint the
+/// hub's `-R` forward lands on. Resolved from the persisted per-host decision:
+/// a host in TCP mode (with a bound port) yields [`HubEndpoint::Tcp`], everyone
+/// else the default Unix landing socket.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HubEndpoint {
+    Unix(PathBuf),
+    Tcp { addr: String, port: u16 },
+}
+
+impl HubEndpoint {
+    /// The scheme-tagged value for the worker's `SHELBI_HUB_ADDR` env var, so
+    /// the pane snippet can dispatch a Unix vs TCP connect without re-deriving
+    /// anything: `unix:<path>` or `tcp:<addr>:<port>`.
+    pub fn addr_env_value(&self) -> String {
+        match self {
+            HubEndpoint::Unix(p) => format!("unix:{}", p.display()),
+            HubEndpoint::Tcp { addr, port } => format!("tcp:{addr}:{port}"),
+        }
+    }
+}
+
+/// Resolve the hub endpoint a worker on `host` should connect to, honoring the
+/// persisted forward decision. Defaults to the Unix landing socket
+/// ([`remote_hub_socket_path`]) unless the host has settled on TCP with a bound
+/// port.
+pub fn remote_hub_endpoint(host: &str) -> HubEndpoint {
+    match load_host_forward(host) {
+        Some(HostForward {
+            mode: shelbi_core::ForwardMode::Tcp,
+            port: Some(port),
+        }) => HubEndpoint::Tcp {
+            addr: TCP_FORWARD_BIND_ADDR.to_string(),
+            port,
+        },
+        _ => HubEndpoint::Unix(remote_hub_socket_path()),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -775,6 +898,138 @@ mod tests {
         );
         assert!(s.contains(".sock:"), "got: {s}");
         assert!(s.ends_with("/hub.sock"), "got: {s}");
+        std::env::remove_var("SHELBI_HOME");
+    }
+
+    #[test]
+    fn reverse_forward_spec_tcp_binds_loopback_port_onto_hub_sock() {
+        let _g = lock_test();
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+        std::env::remove_var("SHELBI_HUB_SOCK");
+        let spec = reverse_forward_spec_tcp(47105).unwrap();
+        let s = spec.to_string_lossy().into_owned();
+        // `127.0.0.1:<port>:<hub.sock>` — remote-TCP → local-Unix `-R` form.
+        assert!(s.starts_with("127.0.0.1:47105:"), "got: {s}");
+        assert!(s.ends_with("/hub.sock"), "got: {s}");
+        std::env::remove_var("SHELBI_HOME");
+    }
+
+    #[test]
+    fn host_forward_state_round_trips_and_clears() {
+        let _g = lock_test();
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+
+        // Unknown host → no decision recorded.
+        assert_eq!(load_host_forward("devbox"), None);
+
+        // Persist a TCP decision with a bound port; it reads back verbatim.
+        save_host_forward(
+            "devbox",
+            Some(HostForward {
+                mode: shelbi_core::ForwardMode::Tcp,
+                port: Some(47101),
+            }),
+        )
+        .unwrap();
+        assert_eq!(
+            load_host_forward("devbox"),
+            Some(HostForward {
+                mode: shelbi_core::ForwardMode::Tcp,
+                port: Some(47101),
+            })
+        );
+
+        // A decision for a *different* host doesn't clobber the first
+        // (read-modify-write against the whole map).
+        save_host_forward(
+            "mac",
+            Some(HostForward {
+                mode: shelbi_core::ForwardMode::Unix,
+                port: None,
+            }),
+        )
+        .unwrap();
+        assert_eq!(
+            load_host_forward("devbox").unwrap().mode,
+            shelbi_core::ForwardMode::Tcp
+        );
+
+        // Clearing forgets just that host (back to auto-detection).
+        save_host_forward("devbox", None).unwrap();
+        assert_eq!(load_host_forward("devbox"), None);
+        assert!(load_host_forward("mac").is_some());
+
+        std::env::remove_var("SHELBI_HOME");
+    }
+
+    #[test]
+    fn remote_hub_endpoint_reflects_persisted_mode() {
+        let _g = lock_test();
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+        std::env::remove_var("SHELBI_REMOTE_HUB_SOCK");
+
+        // Default (no decision) → Unix landing socket, `unix:` scheme.
+        match remote_hub_endpoint("fresh") {
+            HubEndpoint::Unix(p) => {
+                assert!(p.to_string_lossy().starts_with("/tmp/shelbi-hub-"));
+            }
+            other => panic!("expected Unix endpoint, got {other:?}"),
+        }
+        assert!(remote_hub_endpoint("fresh")
+            .addr_env_value()
+            .starts_with("unix:/tmp/shelbi-hub-"));
+
+        // Persisted TCP with a port → TCP loopback endpoint, `tcp:` scheme.
+        save_host_forward(
+            "tsbox",
+            Some(HostForward {
+                mode: shelbi_core::ForwardMode::Tcp,
+                port: Some(47108),
+            }),
+        )
+        .unwrap();
+        assert_eq!(
+            remote_hub_endpoint("tsbox"),
+            HubEndpoint::Tcp {
+                addr: "127.0.0.1".into(),
+                port: 47108,
+            }
+        );
+        assert_eq!(
+            remote_hub_endpoint("tsbox").addr_env_value(),
+            "tcp:127.0.0.1:47108"
+        );
+
+        // TCP recorded but no port yet → fall back to Unix until a port binds.
+        save_host_forward(
+            "halfway",
+            Some(HostForward {
+                mode: shelbi_core::ForwardMode::Tcp,
+                port: None,
+            }),
+        )
+        .unwrap();
+        assert!(matches!(
+            remote_hub_endpoint("halfway"),
+            HubEndpoint::Unix(_)
+        ));
+
+        std::env::remove_var("SHELBI_HOME");
+    }
+
+    #[test]
+    fn load_forward_state_tolerates_missing_and_torn_file() {
+        let _g = lock_test();
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+        // Missing file → empty map, no error.
+        assert!(load_forward_state().is_empty());
+        // Torn/garbage file → empty map, not a panic.
+        fs::write(forward_state_path().unwrap(), "{ not json").unwrap();
+        assert!(load_forward_state().is_empty());
         std::env::remove_var("SHELBI_HOME");
     }
 }

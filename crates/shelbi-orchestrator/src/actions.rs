@@ -1490,6 +1490,7 @@ mod tests {
                 work_dir: repo.to_path_buf(),
                 host: None,
                 tags: Vec::new(),
+                forward: None,
             }],
             orchestrator: OrchestratorSpec {
                 runner: "claude".into(),
@@ -1556,6 +1557,7 @@ mod tests {
                 work_dir: repo.to_path_buf(),
                 host: None,
                 tags: Vec::new(),
+                forward: None,
             }],
             orchestrator: OrchestratorSpec {
                 runner: "claude".into(),
@@ -1637,6 +1639,7 @@ mod tests {
                 work_dir: local.clone(),
                 host: None,
                 tags: Vec::new(),
+                forward: None,
             }],
             orchestrator: OrchestratorSpec {
                 runner: "claude".into(),
@@ -1710,6 +1713,7 @@ mod tests {
                 work_dir: local.clone(),
                 host: None,
                 tags: Vec::new(),
+                forward: None,
             }],
             orchestrator: OrchestratorSpec {
                 runner: "claude".into(),
@@ -2007,6 +2011,7 @@ mod tests {
                 work_dir: local.to_path_buf(),
                 host: None,
                 tags: Vec::new(),
+                forward: None,
             }],
             orchestrator: OrchestratorSpec {
                 runner: "claude".into(),

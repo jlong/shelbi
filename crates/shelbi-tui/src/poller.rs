@@ -273,7 +273,7 @@ fn run_workspace_poll_loop(
         if next_forward_check.map_or(true, |t| Instant::now() >= t) {
             if let Some(machine) = project.machine(&workspace.machine) {
                 let host = machine.host();
-                if let Err(e) = shelbi_ssh::ensure_reverse_forward(&host) {
+                if let Err(e) = shelbi_ssh::ensure_reverse_forward(&host, machine.forward) {
                     tracing::warn!(
                         workspace = %workspace_name,
                         error = %e,
@@ -1744,6 +1744,7 @@ mod tests {
                 work_dir: work_dir.to_path_buf(),
                 host: None,
                 tags: Vec::new(),
+                forward: None,
             }],
             orchestrator: OrchestratorSpec {
                 runner: "claude".into(),

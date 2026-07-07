@@ -941,6 +941,16 @@ pub struct Machine {
         skip_serializing_if = "Vec::is_empty"
     )]
     pub tags: Vec<String>,
+    /// Override for how the hub reverse-forwards its daemon socket to this
+    /// machine. `None` (the default) means "auto": start with a Unix-socket
+    /// forward and fall back to TCP loopback if the Unix landing socket turns
+    /// out to be unusable (the Tailscale-SSH root-owned-socket wedge — see
+    /// [`shelbi-ssh`]). `Some(Tcp)` skips detection and forwards over TCP
+    /// loopback from the first attempt; `Some(Unix)` pins the Unix forward and
+    /// disables the automatic fallback. Elided from the wire form when unset so
+    /// existing project YAMLs round-trip unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub forward: Option<ForwardMode>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -948,6 +958,28 @@ pub struct Machine {
 pub enum MachineKind {
     Local,
     Ssh,
+}
+
+/// How the hub exposes its daemon socket to a remote machine via SSH.
+///
+/// The hub carries a `-R` reverse forward on every outbound `ssh` so a
+/// remote worker can write events back to hub's `hub.sock` over the
+/// multiplexed channel. Two shapes exist:
+///
+/// - [`ForwardMode::Unix`] — `ssh -R <remote_sock>:<hub.sock>`. The default,
+///   and the only mode plain OpenSSH needs: sshd binds the remote landing
+///   socket as the login user, so the worker can connect to it.
+/// - [`ForwardMode::Tcp`] — `ssh -R 127.0.0.1:<port>:<hub.sock>`. The fallback
+///   for hosts reached via Tailscale SSH, where tailscaled (running as root)
+///   binds the Unix landing socket `srw------- root root`, leaving it
+///   unconnectable and unremovable by the login user. OpenSSH forwards a remote
+///   TCP listener onto the local Unix socket just fine, and Tailscale SSH
+///   handles TCP forwards without the ownership problem.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ForwardMode {
+    Unix,
+    Tcp,
 }
 
 impl Machine {
@@ -2851,6 +2883,7 @@ workspace_settings_template: /etc/shelbi/p.json
                 work_dir: "/tmp".into(),
                 host: None,
                 tags: Vec::new(),
+                forward: None,
             }],
             orchestrator: OrchestratorSpec {
                 runner: "claude".into(),
@@ -2952,6 +2985,7 @@ workspaces:
             work_dir: "/tmp".into(),
             host: None,
             tags: Vec::new(),
+            forward: None,
         };
         Project {
             name: "p".into(),
@@ -3016,6 +3050,32 @@ workspaces:
             serde_yaml::from_str("{ name: r, machine: hub, runner: claude, tags: [review, gpu] }")
                 .unwrap();
         assert_eq!(seq.tags, vec!["review".to_string(), "gpu".to_string()]);
+    }
+
+    #[test]
+    fn machine_forward_override_parses_and_defaults_to_none() {
+        // No `forward:` key → auto (None), and it round-trips out elided.
+        let auto: Machine = serde_yaml::from_str(
+            "{ name: devbox, kind: ssh, work_dir: /home/u, host: devbox }",
+        )
+        .unwrap();
+        assert_eq!(auto.forward, None);
+        let back = serde_yaml::to_string(&auto).unwrap();
+        assert!(!back.contains("forward"), "None must not serialize: {back}");
+
+        // `forward: tcp` pins the TCP loopback fallback explicitly.
+        let tcp: Machine = serde_yaml::from_str(
+            "{ name: devbox, kind: ssh, work_dir: /home/u, host: devbox, forward: tcp }",
+        )
+        .unwrap();
+        assert_eq!(tcp.forward, Some(ForwardMode::Tcp));
+
+        // `forward: unix` pins the Unix forward (disables auto-fallback).
+        let unix: Machine = serde_yaml::from_str(
+            "{ name: box, kind: ssh, work_dir: /home/u, host: box, forward: unix }",
+        )
+        .unwrap();
+        assert_eq!(unix.forward, Some(ForwardMode::Unix));
     }
 
     #[test]
@@ -3188,6 +3248,7 @@ workspaces:
                 work_dir: "/tmp".into(),
                 host: None,
                 tags: Vec::new(),
+                forward: None,
             }],
             orchestrator: OrchestratorSpec {
                 runner: "claude".into(),
@@ -4366,6 +4427,7 @@ git:
                 work_dir: "/home/dev/shelbi".into(),
                 host: None,
                 tags: Vec::new(),
+                forward: None,
             }],
             editor: Some("nvim".into()),
             workspaces: vec![WorkspaceSpec {

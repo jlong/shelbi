@@ -321,6 +321,7 @@ mod tests {
                 work_dir: "/tmp/fixture".into(),
                 host: None,
                 tags: Vec::new(),
+                forward: None,
             }],
             orchestrator: OrchestratorSpec {
                 runner: "claude".into(),

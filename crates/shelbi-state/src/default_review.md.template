@@ -114,23 +114,34 @@ to exactly what was asked; do not expand the change, and return to the
 
 ## Signalling
 
-The hub daemon listens on a Unix-domain socket at `$SHELBI_HUB_SOCK`
-(`~/.shelbi/hub.sock` by default — the pane wrapper pins it in your env).
+The hub daemon is reachable at the address the pane wrapper pins in your
+env. `$SHELBI_HUB_ADDR` is scheme-tagged and always set — either
+`unix:<path>` or `tcp:127.0.0.1:<port>` (the TCP loopback fallback used
+on Tailscale-SSH hosts, where the Unix landing socket isn't usable).
+`$SHELBI_HUB_SOCK` is the legacy Unix path, set only on Unix-socket hosts.
 Emit your ready signal by writing one newline-terminated JSON object to
-it. The verb is `event`; the body goes in `line` and lands in
+the hub. The verb is `event`; the body goes in `line` and lands in
 `events.log`:
 
 ```sh
-# Pick whichever is on PATH. nc -U is the smallest and most common.
+# Portable send that handles either transport. Reads the JSON on stdin.
+shelbi_hub_send() {
+  case "${SHELBI_HUB_ADDR:-unix:$SHELBI_HUB_SOCK}" in
+    tcp:*)  hostport=${SHELBI_HUB_ADDR#tcp:}
+            nc "${hostport%:*}" "${hostport##*:}" ;;   # nc <host> <port>
+    unix:*) nc -U "${SHELBI_HUB_ADDR#unix:}" ;;        # nc -U <path>
+    *)      nc -U "$SHELBI_HUB_SOCK" ;;                 # legacy fallback
+  esac
+}
 echo '{"verb":"event","project":"<project>","line":"workspace=<your-workspace> review_ready=true url=http://<host>:<port>"}' \
-  | nc -U "$SHELBI_HUB_SOCK"
+  | shelbi_hub_send
 
-# socat substitutes on hosts whose nc lacks -U.
-echo '{"verb":"event","project":"<project>","line":"workspace=<your-workspace> review_ready=true url=http://<host>:<port>"}' \
-  | socat - UNIX-CONNECT:"$SHELBI_HUB_SOCK"
+# socat substitutes on hosts whose nc lacks -U — match your addr's scheme:
+#   unix:  socat - UNIX-CONNECT:"${SHELBI_HUB_ADDR#unix:}"
+#   tcp:   socat - TCP:127.0.0.1:<port>
 
 # python3 is always present on macOS and most Linux — use it if neither
-# of the above is available.
+# of the above is available (AF_UNIX for unix:, AF_INET for tcp:).
 python3 -c 'import socket,sys; s=socket.socket(socket.AF_UNIX); s.connect(sys.argv[1]); s.sendall(sys.stdin.buffer.read())' \
   "$SHELBI_HUB_SOCK" <<<'{"verb":"event","project":"<project>","line":"workspace=<your-workspace> review_loaded=true url=http://<host>:<port>"}'
 ```

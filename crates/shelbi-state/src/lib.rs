@@ -62,10 +62,12 @@ pub use resolve::{
     cleanup_legacy_markers, project_roots, resolve_project_for_cwd, MarkerCleanup, ProjectRoot,
 };
 pub use ssh_control::{
-    cleanup_stale_control_masters, daemon_pid_file_path, ensure_ssh_control_dir, is_process_alive,
-    read_daemon_pid, read_daemon_pid_record, remote_hub_socket_path, remove_daemon_pid_file,
-    reverse_forward_spec, ssh_control_dir, ssh_control_path_template, write_daemon_pid,
-    CmCleanupOutcome, DaemonPidRecord,
+    cleanup_stale_control_masters, daemon_pid_file_path, ensure_ssh_control_dir,
+    forward_state_path, is_process_alive, load_forward_state, load_host_forward, read_daemon_pid,
+    read_daemon_pid_record, remote_hub_endpoint, remote_hub_socket_path, remove_daemon_pid_file,
+    reverse_forward_spec, reverse_forward_spec_tcp, save_host_forward, ssh_control_dir,
+    ssh_control_path_template, write_daemon_pid, CmCleanupOutcome, DaemonPidRecord, HostForward,
+    HubEndpoint, TCP_FORWARD_BIND_ADDR, TCP_FORWARD_PORT_BASE, TCP_FORWARD_PORT_SPAN,
 };
 pub use user_config::{
     load_user_config, save_user_config, scaffold_user_config_if_missing, user_config_path, Keymap,
@@ -2220,6 +2222,7 @@ mod tests {
                 work_dir: "/tmp".into(),
                 host: None,
                 tags: Vec::new(),
+                forward: None,
             }],
             orchestrator: OrchestratorSpec {
                 runner: "claude".into(),

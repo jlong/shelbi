@@ -23,26 +23,41 @@ and any agent-level skills under your `skills/` directory.
 
 ## Sending events back to the orchestrator
 
-The hub daemon listens on a Unix-domain socket at `$SHELBI_HUB_SOCK`
-(`~/.shelbi/hub.sock` by default — the pane wrapper pins it in your env
-so you don't have to derive it). The same env var works whether you're
-on the hub (writes go directly to the local socket) or a remote machine
-(writes go through an SSH reverse-forward landing on hub's daemon). To
-emit an event, write one newline-terminated JSON object to that socket.
+The hub daemon is reachable at the address the pane wrapper pins in your
+env. Two transports exist, both set for you — you don't have to derive
+either:
+
+- `$SHELBI_HUB_ADDR` — scheme-tagged, always set. Either
+  `unix:<path>` (the hub, or a remote reached over a Unix-socket reverse
+  forward) or `tcp:127.0.0.1:<port>` (a remote reached via Tailscale SSH,
+  where the Unix landing socket isn't usable so hub forwards a TCP
+  loopback port instead). **Prefer this** — it works on every host.
+- `$SHELBI_HUB_SOCK` — the legacy Unix path, set only when the transport
+  is a Unix socket. Absent on TCP-fallback hosts.
+
+To emit an event, write one newline-terminated JSON object to the hub.
 The verb is `event`; the body line goes in `line` and lands in
 `events.log` with a hub-side timestamp prepended.
 
 ```sh
-# Pick whichever is on PATH. nc -U is the smallest and most common.
+# Portable send that handles either transport. Reads the JSON on stdin.
+shelbi_hub_send() {
+  case "${SHELBI_HUB_ADDR:-unix:$SHELBI_HUB_SOCK}" in
+    tcp:*)  hostport=${SHELBI_HUB_ADDR#tcp:}
+            nc "${hostport%:*}" "${hostport##*:}" ;;   # nc <host> <port>
+    unix:*) nc -U "${SHELBI_HUB_ADDR#unix:}" ;;        # nc -U <path>
+    *)      nc -U "$SHELBI_HUB_SOCK" ;;                 # legacy fallback
+  esac
+}
 echo '{"verb":"event","project":"<project>","line":"workspace=<your-workspace> note=<short>"}' \
-  | nc -U "$SHELBI_HUB_SOCK"
+  | shelbi_hub_send
 
-# socat is a fine substitute on hosts that only ship -E nc (no -U).
-echo '{"verb":"event","project":"<project>","line":"workspace=<your-workspace> note=<short>"}' \
-  | socat - UNIX-CONNECT:"$SHELBI_HUB_SOCK"
+# socat substitute (hosts whose nc lacks -U). Pick the matching form:
+#   unix:  socat - UNIX-CONNECT:"${SHELBI_HUB_ADDR#unix:}"
+#   tcp:   socat - TCP:127.0.0.1:<port>     # from ${SHELBI_HUB_ADDR#tcp:127.0.0.1:}
 
-# python3 is always present on macOS and most Linux. Use this if neither
-# of the above is available.
+# python3 fallback (always present on macOS / most Linux). AF_UNIX for a
+# unix: addr, AF_INET for a tcp: addr — split $SHELBI_HUB_ADDR on the scheme.
 python3 -c 'import socket,sys; s=socket.socket(socket.AF_UNIX); s.connect(sys.argv[1]); s.sendall(sys.stdin.buffer.read())' \
   "$SHELBI_HUB_SOCK" <<<'{"verb":"event","project":"<project>","line":"workspace=<your-workspace> note=<short>"}'
 ```

@@ -938,6 +938,7 @@ mod tests {
             work_dir: home.to_path_buf(),
             host: None,
             tags: Vec::new(),
+            forward: None,
         }
     }
 
