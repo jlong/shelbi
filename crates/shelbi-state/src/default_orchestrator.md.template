@@ -192,13 +192,17 @@ new input before you answer.
 
 Use the durable cursor primitive:
 
-    CURSOR=$(cat .claude/shelbi-event-cursor 2>/dev/null || echo 0)
-    shelbi orchestrator events drain --cursor "$CURSOR"
+    shelbi orchestrator events drain
+
+The cursor is persisted for you in the project config dir
+(`~/.shelbi/projects/<name>/event-cursor`), so `drain` resumes from and
+advances it automatically — no cwd-relative bookkeeping, and it works the
+same no matter which directory your shell happens to be sitting in. Pass
+`--cursor <N>` only to replay from an explicit offset (e.g. `--cursor 0` for
+the whole log).
 
 If the JSON response contains events, apply the normal reaction rules below
-first. Then write the returned top-level `cursor` value to
-`.claude/shelbi-event-cursor` before producing your reply. If the batch is
-empty, still advance the cursor. If the command is unavailable, fall back to
+first, then produce your reply. If the command is unavailable, fall back to
 reading `~/.shelbi/events.log` from the last stored byte offset and keep the
 same cursor discipline so events are neither missed nor replayed.
 

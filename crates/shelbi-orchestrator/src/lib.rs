@@ -877,9 +877,10 @@ const ORCH_BOOTSTRAP_PROMPT: &str = "Run the \"Bootstrap on session start\" sequ
     in the background and watch it with the Monitor tool so auto-dispatch reacts \
     to new transitions. If this runner cannot receive asynchronous Monitor callbacks, \
     also follow the \"Polling-only event drain\" section: before every user-facing \
-    reply, run `shelbi orchestrator events drain` with the stored cursor, apply \
-    any returned task/workspace/heartbeat/pane-death facts through the normal \
-    reaction rules, persist the returned cursor, and only then answer.";
+    reply, run `shelbi orchestrator events drain` (the durable cursor is persisted \
+    for you in the project config dir and resumes automatically), apply any returned \
+    task/workspace/heartbeat/pane-death facts through the normal reaction rules, and \
+    only then answer.";
 
 /// Wrap `launch_command(runner_spec)` with the orchestrator's
 /// auto-bootstrap context.
@@ -940,11 +941,13 @@ fn codex_orchestrator_prompt_arg(project_name: &str, workdir: &std::path::Path) 
          Zen Mode rules, and any reload handoff context captured before this pane was restarted. \
          If a handoff `<system-reminder>` block is present there, use it as continuity context.\n\n\
          This is a polling-only runner contract: before every user-facing reply, drain \
-         pending project events with `shelbi orchestrator events drain --cursor <cursor>`, \
-         persist the returned cursor in `.claude/shelbi-event-cursor`, apply any returned \
-         task transitions, workspace transitions, heartbeats, and pane-death facts through \
-         the normal reaction rules, and only then answer the user. The drain gives facts; \
-         you remain responsible for scheduling decisions.\n\n",
+         pending project events with `shelbi orchestrator events drain` (the cursor is \
+         persisted for you in the project config dir and resumes automatically regardless \
+         of your shell's working directory; pass `--cursor <N>` only to replay from an \
+         explicit offset), apply any returned task transitions, workspace transitions, \
+         heartbeats, and pane-death facts through the normal reaction rules, and only then \
+         answer the user. The drain gives facts; you remain responsible for scheduling \
+         decisions.\n\n",
     );
     let after = format!("\n\n{ORCH_BOOTSTRAP_PROMPT}");
     concat_shell_prompt_parts(&before, ORCH_AGENT_INSTRUCTIONS_REL, &after)
