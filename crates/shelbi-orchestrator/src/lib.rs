@@ -21,6 +21,7 @@ pub mod actions;
 pub mod branch;
 pub mod dispatch;
 mod git;
+pub mod githook;
 pub mod handoff;
 pub mod lifecycle;
 pub mod load;
@@ -314,6 +315,37 @@ pub fn ensure_dashboard(project_name: &str) -> Result<BootstrapStatus> {
     // Idempotent and project-agnostic — set every ensure_dashboard call so
     // it survives shelbi upgrades and tmux-server restarts.
     install_stash_cleanup_hook(&host)?;
+
+    // Install/refresh the hub checkout's default-branch commit guard
+    // (bug-worker-commit-landed-on-hub-main-checkout): a pre-commit hook
+    // that rejects commits while HEAD is attached to the default branch,
+    // so an agent session working in the hub checkout can't land code on
+    // local `main` before cutting a branch. Best-effort — a work_dir
+    // that isn't a git repo (fresh setup, test fixture) or a foreign user
+    // hook degrades to a loud warning, not a failed project open.
+    let mut protected: Vec<&str> = vec![&project.default_branch];
+    if project.base_branch() != project.default_branch {
+        protected.push(project.base_branch());
+    }
+    match githook::install_hub_branch_guard(&hub.work_dir, &protected) {
+        Ok(githook::HookInstall::SkippedForeignHook) => {
+            eprintln!(
+                "shelbi: warning: {}/.git/hooks/pre-commit is user-authored — \
+                 the default-branch commit guard was NOT installed; commits on \
+                 `{}` in the hub checkout stay unguarded",
+                hub.work_dir.display(),
+                project.default_branch,
+            );
+        }
+        Ok(_) => {}
+        Err(e) => {
+            eprintln!(
+                "shelbi: warning: couldn't install the default-branch commit \
+                 guard in {}: {e}",
+                hub.work_dir.display(),
+            );
+        }
+    }
 
     // Materialize the orchestrator's workdir upfront — needed whether we
     // create the session from scratch or just the right pane. The

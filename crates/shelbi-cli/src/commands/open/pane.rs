@@ -96,19 +96,31 @@ pub fn run(
     // writes the task's state, so a state lookup would race the save).
     let assigned_task = assigned_task_for_workspace(&project.name, &workspace.name);
 
+    // An inherited non-empty `TASK_ID` means the dispatch path launched this
+    // pane (deploy_and_spawn injects it via tmux `-e`) — a sidebar click
+    // inherits nothing. Dispatch-originated launches hold a hard contract on
+    // the worktree (bug-worker-commit-landed-on-hub-main-checkout): the agent
+    // must start in it or not at all, never in a `$HOME` fallback where its
+    // commits could land somewhere surprising.
+    let inherited_task_id = std::env::var(ENV_TASK_ID)
+        .ok()
+        .filter(|s| !s.is_empty());
+    let dispatched = inherited_task_id.is_some();
+
     // Missing-worktree recovery (bug-review-workspace-open-creates-missing-worktree):
     // when a task is assigned to this workspace but its worktree hasn't been
     // created yet, create + check out the worktree on the task's branch BEFORE
     // the agent launches so it starts in the worktree, not the `cd`-with-no-arg
-    // home fallback. We only act when the worktree is entirely absent — an
-    // existing worktree (even mid-task, dirty, or on another branch) is left
-    // untouched, and healing a present-but-corrupt one stays the dispatch /
-    // resume paths' job. Best-effort: a git failure here degrades to the
-    // `cd … || cd` fallback below rather than killing the pane, and a bare
-    // sidebar click on an unassigned workspace resolves no task so nothing is
-    // created.
+    // home fallback. A bare (sidebar-click) launch only acts when the worktree
+    // is entirely absent — an existing worktree (even mid-task, dirty, or on
+    // another branch) is left untouched — and stays best-effort: a git failure
+    // degrades to the `cd … || cd` fallback below rather than killing the
+    // pane. A dispatched launch additionally heals a present-but-broken dir
+    // (created but never got its `.git`) and hard-fails after this block if
+    // no valid worktree came out of it.
+    let worktree_valid = |wt: &Path| wt.join(".git").is_dir() || wt.join(".git").is_file();
     if let Some(task) = &assigned_task {
-        if !worktree.exists() {
+        if !worktree.exists() || (dispatched && !worktree_valid(&worktree)) {
             if let Some(branch) = resolve_task_branch(project, task) {
                 if let Err(e) = orch_workspace::ensure_workspace_worktree(
                     machine,
@@ -118,12 +130,35 @@ pub fn run(
                 ) {
                     eprintln!(
                         "shelbi: warning: couldn't create worktree for task `{}` assigned to \
-                         workspace `{}` (agent will start in $HOME): {e}",
+                         workspace `{}`: {e}",
                         task.id, workspace.name,
                     );
                 }
             }
         }
+    }
+
+    // Dispatch-originated launches must have a usable worktree by now —
+    // whatever sync_worktree stood up, plus the recovery above. Refuse to
+    // launch the agent anywhere else. The events.log line makes the stall
+    // visible to the orchestrator and `shelbi events tail`; the dispatch
+    // caller also notices via its readiness timeout.
+    if dispatched && !worktree_valid(&worktree) {
+        if let Err(e) = shelbi_state::append_workspace_pane_event(
+            &project.name,
+            &workspace.name,
+            false,
+            "worktree-missing",
+        ) {
+            eprintln!("shelbi: warning: couldn't write worktree-missing event: {e}");
+        }
+        return Err(anyhow!(
+            "workspace `{}` was dispatched a task but its worktree at {} is \
+             missing or broken — refusing to launch the agent outside it \
+             (re-run `shelbi task start` after fixing the worktree)",
+            workspace.name,
+            worktree.display(),
+        ));
     }
 
     // A crashed prior wrapper (mark_expected_teardown → tmux kill-window →
@@ -158,13 +193,23 @@ pub fn run(
         startup_prompt_rel,
     );
 
-    // `cd` falls back to $HOME if the worktree doesn't exist — that keeps
-    // a sidebar click on a never-used workspace from leaving the user in
-    // an empty pane that immediately closes.
-    let shell_cmd = format!(
-        "cd {wd} 2>/dev/null || cd; LANG=C.UTF-8 {launch_full}",
-        wd = shelbi_agent::shell_escape(&worktree_str),
-    );
+    // Bare launch: `cd` falls back to $HOME if the worktree doesn't exist —
+    // that keeps a sidebar click on a never-used workspace from leaving the
+    // user in an empty pane that immediately closes. Dispatched launch: no
+    // fallback — the worktree was verified above, and if it vanishes in the
+    // spawn window the agent must not start somewhere else, so the pane
+    // exits instead (the wrapper's exit path still emits the pane event).
+    let shell_cmd = if dispatched {
+        format!(
+            "cd {wd} || {{ echo 'shelbi: worktree {wd} disappeared before launch; aborting' >&2; exit 1; }}; LANG=C.UTF-8 {launch_full}",
+            wd = shelbi_agent::shell_escape(&worktree_str),
+        )
+    } else {
+        format!(
+            "cd {wd} 2>/dev/null || cd; LANG=C.UTF-8 {launch_full}",
+            wd = shelbi_agent::shell_escape(&worktree_str),
+        )
+    };
 
     // Seed `$TASK_ID` so the Phase 7 hooks (SessionStart tail + Stop
     // message-inject) have a concrete id to anchor their per-task paths on.
@@ -174,9 +219,8 @@ pub fn run(
     // lookup above would race the state save and return None. Fall back to that
     // lookup for the sidebar-click path (no env → empty TASK_ID when nothing is
     // assigned, and the hooks no-op cleanly).
-    let task_id = std::env::var(ENV_TASK_ID)
-        .ok()
-        .filter(|s| !s.is_empty())
+    let task_id = inherited_task_id
+        .clone()
         .or_else(|| assigned_task.as_ref().map(|t| t.id.clone()))
         .unwrap_or_default();
 
@@ -789,6 +833,12 @@ mod tests {
     #[test]
     fn run_writes_pane_alive_false_event_when_agent_exits_cleanly() {
         let _g = ENV_LOCK.lock().unwrap();
+        // A leaked TASK_ID (running tests inside a worker pane) would flip
+        // run() into dispatched mode and hard-fail on the missing worktree.
+        let env = EnvGuard::new(&["SHELBI_HOME", "TASK_ID", "PROJECT", "SHELBI_HUB_SOCK"]);
+        env.remove("TASK_ID");
+        env.remove("PROJECT");
+        env.remove("SHELBI_HUB_SOCK");
         let home = fresh_test_home("pane-clean-exit");
         std::env::set_var("SHELBI_HOME", &home);
 
@@ -837,6 +887,12 @@ mod tests {
     #[test]
     fn run_passes_shelbi_hub_sock_into_agent_env() {
         let _g = ENV_LOCK.lock().unwrap();
+        // See run_writes_pane_alive_false_event_when_agent_exits_cleanly —
+        // a leaked TASK_ID would make this bare launch dispatched.
+        let env = EnvGuard::new(&["SHELBI_HOME", "TASK_ID", "PROJECT", "SHELBI_HUB_SOCK"]);
+        env.remove("TASK_ID");
+        env.remove("PROJECT");
+        env.remove("SHELBI_HUB_SOCK");
         let home = fresh_test_home("pane-env-hub-sock");
         std::env::set_var("SHELBI_HOME", &home);
         // Clear any caller-supplied override so we test the default
@@ -888,6 +944,12 @@ mod tests {
     #[test]
     fn run_propagates_nonzero_exit_code_into_reason_field() {
         let _g = ENV_LOCK.lock().unwrap();
+        // See run_writes_pane_alive_false_event_when_agent_exits_cleanly —
+        // a leaked TASK_ID would make this bare launch dispatched.
+        let env = EnvGuard::new(&["SHELBI_HOME", "TASK_ID", "PROJECT", "SHELBI_HUB_SOCK"]);
+        env.remove("TASK_ID");
+        env.remove("PROJECT");
+        env.remove("SHELBI_HUB_SOCK");
         let home = fresh_test_home("pane-nonzero-exit");
         std::env::set_var("SHELBI_HOME", &home);
 
@@ -1290,6 +1352,110 @@ mod tests {
         let _ = std::fs::remove_dir_all(&home);
     }
 
+    /// Dispatch-originated launches hard-fail on a missing worktree
+    /// (bug-worker-commit-landed-on-hub-main-checkout): an inherited
+    /// `TASK_ID` marks the pane as dispatched, and with no valid worktree
+    /// the wrapper must refuse to spawn the agent (no `$HOME` fallback),
+    /// returning an error and emitting a `worktree-missing` event.
+    #[test]
+    fn dispatched_run_hard_fails_when_worktree_missing() {
+        let _g = ENV_LOCK.lock().unwrap();
+        let env = EnvGuard::new(&["SHELBI_HOME", "TASK_ID", "PROJECT", "SHELBI_HUB_SOCK"]);
+        env.remove("PROJECT");
+        env.remove("SHELBI_HUB_SOCK");
+        let home = fresh_test_home("pane-dispatched-missing-wt");
+        env.set("SHELBI_HOME", &home);
+        env.set("TASK_ID", "feat-hard-fail");
+
+        let marker = home.join("agent-ran");
+        let machine = local_machine(&home);
+        let workspace = WorkspaceSpec {
+            name: "alpha".into(),
+            machine: "hub".into(),
+            runner: "stub".into(),
+            tags: Vec::new(),
+            slot: None,
+        };
+        // If the wrapper ever spawns the agent anyway, this file appears
+        // and the assertion below catches it.
+        let runner = AgentRunnerSpec {
+            command: "/bin/sh".into(),
+            flags: vec!["-c".into(), format!("touch {}", marker.display())],
+            prompt_injection: None,
+            dialog_signatures: vec![],
+        };
+        let project = fixture_project("demo", machine.clone(), workspace.clone(), runner);
+
+        let err = run(&project, &workspace, &machine, false)
+            .expect_err("dispatched launch with no worktree must hard-fail");
+        assert!(
+            err.to_string().contains("missing or broken"),
+            "error must explain the worktree state: {err}"
+        );
+        assert!(
+            !marker.exists(),
+            "the agent must never have been spawned outside its worktree"
+        );
+
+        let log = std::fs::read_to_string(shelbi_state::events_log_path().unwrap()).unwrap();
+        assert!(
+            log.contains(" pane_alive=false ") && log.contains(" reason=worktree-missing"),
+            "hard-fail must be visible in events.log, got: {log}"
+        );
+
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// The dispatched hard-fail only triggers on a missing/broken
+    /// worktree: with a valid one in place, an inherited `TASK_ID` launch
+    /// proceeds normally (and the strict no-fallback `cd` succeeds).
+    #[test]
+    fn dispatched_run_proceeds_with_valid_worktree() {
+        let _g = ENV_LOCK.lock().unwrap();
+        let env = EnvGuard::new(&["SHELBI_HOME", "TASK_ID", "PROJECT", "SHELBI_HUB_SOCK"]);
+        env.remove("PROJECT");
+        env.remove("SHELBI_HUB_SOCK");
+        let home = fresh_test_home("pane-dispatched-valid-wt");
+        env.set("SHELBI_HOME", &home);
+        env.set("TASK_ID", "feat-valid");
+
+        let machine = local_machine(&home);
+        let workspace = WorkspaceSpec {
+            name: "alpha".into(),
+            machine: "hub".into(),
+            runner: "stub".into(),
+            tags: Vec::new(),
+            slot: None,
+        };
+        // A linked worktree's `.git` is a gitlink *file* — stand one up
+        // so the validity check sees a real-shaped worktree without
+        // needing a full git repo in the fixture.
+        let worktree = orch_workspace::workspace_worktree(&machine, &workspace);
+        std::fs::create_dir_all(&worktree).unwrap();
+        std::fs::write(worktree.join(".git"), "gitdir: elsewhere\n").unwrap();
+
+        let marker = worktree.join("agent-ran");
+        let runner = AgentRunnerSpec {
+            command: "/bin/sh".into(),
+            // `touch` relative to cwd: also proves the agent started IN
+            // the worktree, not in a fallback dir.
+            flags: vec!["-c".into(), "touch agent-ran".into()],
+            prompt_injection: None,
+            dialog_signatures: vec![],
+        };
+        let project = fixture_project("demo", machine.clone(), workspace.clone(), runner);
+
+        run(&project, &workspace, &machine, false).unwrap();
+
+        assert!(
+            marker.exists(),
+            "agent should have run inside the worktree at {}",
+            worktree.display()
+        );
+
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
     /// End-to-end: when the agent exits, any tail process the
     /// SessionStart hook spawned is reaped — no orphan tails leak
     /// across worker restarts. Stub runner spawns a `sleep` standing in
@@ -1299,6 +1465,13 @@ mod tests {
     #[test]
     fn run_kills_session_tail_on_agent_exit() {
         let _g = ENV_LOCK.lock().unwrap();
+        // See run_writes_pane_alive_false_event_when_agent_exits_cleanly —
+        // a leaked TASK_ID would make this bare launch dispatched (and the
+        // stood-up worktree here has no `.git`, so it would hard-fail).
+        let env = EnvGuard::new(&["SHELBI_HOME", "TASK_ID", "PROJECT", "SHELBI_HUB_SOCK"]);
+        env.remove("TASK_ID");
+        env.remove("PROJECT");
+        env.remove("SHELBI_HUB_SOCK");
         let home = fresh_test_home("pane-tail-cleanup");
         std::env::set_var("SHELBI_HOME", &home);
 
@@ -1625,6 +1798,13 @@ mod tests {
             tags: Vec::new(),
             slot: None,
         };
+        // An inherited TASK_ID marks the launch as dispatch-originated,
+        // which now requires a valid worktree (in the real race,
+        // sync_worktree stood it up before the pane spawned). A linked
+        // worktree's `.git` is a gitlink file — fake one.
+        let worktree = orch_workspace::workspace_worktree(&machine, &workspace);
+        std::fs::create_dir_all(&worktree).unwrap();
+        std::fs::write(worktree.join(".git"), "gitdir: elsewhere\n").unwrap();
         let runner = AgentRunnerSpec {
             command: "/bin/sh".into(),
             flags: vec![
