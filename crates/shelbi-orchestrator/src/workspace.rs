@@ -2967,6 +2967,30 @@ fn sync_worktree_for_resume(
     Ok(())
 }
 
+/// Ensure `workspace`'s worktree exists and is checked out on `branch`,
+/// creating it (off `default_branch` if the branch is somehow absent) when
+/// it's missing — WITHOUT disturbing an existing worktree's in-flight state.
+///
+/// This is the pane wrapper's safety net against launching the agent in
+/// `$HOME` (bug-review-workspace-open-creates-missing-worktree): when a task
+/// is assigned to a workspace whose worktree hasn't been created yet — e.g. a
+/// review workspace picking up a task that's already in Review — the wrapper
+/// calls this before `cd`-ing so the agent starts in the worktree rather than
+/// the `cd`-with-no-arg home fallback. It delegates to
+/// [`sync_worktree_for_resume`] rather than [`sync_worktree`] so it can't
+/// drift from the resume path and, like resume, never resets or bails on an
+/// existing worktree — the only case it acts on is a fully-missing one.
+pub fn ensure_workspace_worktree(
+    machine: &Machine,
+    workspace: &WorkspaceSpec,
+    branch: &str,
+    default_branch: &str,
+) -> Result<()> {
+    let host = machine.host();
+    let worktree = workspace_worktree(machine, workspace);
+    sync_worktree_for_resume(&host, machine, &worktree, branch, default_branch)
+}
+
 /// If a workspace worktree on this machine is currently on `branch`, switch
 /// it to a detached HEAD so the branch ref is free for another worktree to
 /// claim. Bails on a dirty workspace worktree (we'd silently lose work).
@@ -5567,6 +5591,79 @@ mod sync_worktree_git_tests {
 
         assert!(wt.join(".git").exists(), "a valid worktree must now exist");
         assert_eq!(head_of(&wt), "shelbi/x");
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    #[test]
+    fn ensure_workspace_worktree_creates_missing_worktree_on_task_branch() {
+        // bug-review-workspace-open-creates-missing-worktree: a task is
+        // assigned to a workspace (e.g. a review workspace on a task already
+        // in Review) but the workspace's worktree was never created. The pane
+        // wrapper calls `ensure_workspace_worktree` before launching so the
+        // agent starts in the worktree rather than $HOME. The task's branch
+        // already exists (the task was in progress before Review), so the
+        // recovery must check the worktree out onto it.
+        if !git_available() {
+            eprintln!("skipping: git not on PATH");
+            return;
+        }
+        let repo = init_repo("ensure-missing");
+        let project = project_at(&repo);
+        let machine = project.machines[0].clone();
+        let workspace = &project.workspaces[0];
+        // The task's branch exists on the hub, but no worktree claims it yet.
+        assert!(run_git_in(&repo, &["branch", "shelbi/review-me", "main"])
+            .status
+            .success());
+        let wt = workspace_worktree(&machine, workspace);
+        assert!(!wt.exists(), "worktree must start missing");
+
+        ensure_workspace_worktree(&machine, workspace, "shelbi/review-me", "main").unwrap();
+
+        assert!(
+            wt.join(".git").exists(),
+            "a valid worktree must have been created at {}",
+            wt.display()
+        );
+        assert_eq!(
+            head_of(&wt),
+            "shelbi/review-me",
+            "worktree must be checked out on the task branch"
+        );
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    #[test]
+    fn ensure_workspace_worktree_preserves_existing_worktree() {
+        // The recovery must never disturb an in-flight worktree: if one
+        // already exists (even dirty, even on another branch), `ensure` is a
+        // no-op. Otherwise opening a workspace mid-task could reset the branch
+        // or lose uncommitted work.
+        if !git_available() {
+            eprintln!("skipping: git not on PATH");
+            return;
+        }
+        let repo = init_repo("ensure-preserve");
+        let project = project_at(&repo);
+        let machine = project.machines[0].clone();
+        let workspace = &project.workspaces[0];
+        let wt = workspace_worktree(&machine, workspace);
+        // Stand up the worktree on one branch, dirty it, then ask ensure for a
+        // DIFFERENT branch — it must leave the tree exactly as-is.
+        sync_worktree(&project, &Host::Local, &machine, &wt, "shelbi/inflight", "main").unwrap();
+        std::fs::write(wt.join("wip.txt"), "uncommitted\n").unwrap();
+
+        ensure_workspace_worktree(&machine, workspace, "shelbi/other", "main").unwrap();
+
+        assert_eq!(
+            head_of(&wt),
+            "shelbi/inflight",
+            "existing worktree branch must be preserved"
+        );
+        assert!(
+            wt.join("wip.txt").exists(),
+            "uncommitted work must be preserved"
+        );
         let _ = std::fs::remove_dir_all(&repo);
     }
 

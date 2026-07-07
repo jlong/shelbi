@@ -25,7 +25,7 @@ use std::sync::{
 };
 
 use anyhow::{anyhow, Result};
-use shelbi_core::{Column, Machine, Project, WorkspaceSpec};
+use shelbi_core::{Machine, Project, StatusCategory, Task, WorkspaceSpec};
 use shelbi_orchestrator::workspace as orch_workspace;
 
 /// Env var the agent inherits naming the project the worker belongs to.
@@ -87,6 +87,45 @@ pub fn run(
     let worktree = orch_workspace::workspace_worktree(machine, workspace);
     let worktree_str = worktree.to_string_lossy().into_owned();
 
+    // Resolve the task assigned to this workspace up front — used both to seed
+    // `$TASK_ID` for the Phase 7 hooks (below) and to recover a missing
+    // worktree (next). Covers in-progress AND in-review assignments: a review
+    // workspace picking up a task that's already in Review is exactly the case
+    // the missing-worktree recovery exists for. An inherited `TASK_ID` still
+    // wins for the id itself (the dispatch path spawns this wrapper before it
+    // writes the task's state, so a state lookup would race the save).
+    let assigned_task = assigned_task_for_workspace(&project.name, &workspace.name);
+
+    // Missing-worktree recovery (bug-review-workspace-open-creates-missing-worktree):
+    // when a task is assigned to this workspace but its worktree hasn't been
+    // created yet, create + check out the worktree on the task's branch BEFORE
+    // the agent launches so it starts in the worktree, not the `cd`-with-no-arg
+    // home fallback. We only act when the worktree is entirely absent — an
+    // existing worktree (even mid-task, dirty, or on another branch) is left
+    // untouched, and healing a present-but-corrupt one stays the dispatch /
+    // resume paths' job. Best-effort: a git failure here degrades to the
+    // `cd … || cd` fallback below rather than killing the pane, and a bare
+    // sidebar click on an unassigned workspace resolves no task so nothing is
+    // created.
+    if let Some(task) = &assigned_task {
+        if !worktree.exists() {
+            if let Some(branch) = resolve_task_branch(project, task) {
+                if let Err(e) = orch_workspace::ensure_workspace_worktree(
+                    machine,
+                    workspace,
+                    &branch,
+                    project.base_branch(),
+                ) {
+                    eprintln!(
+                        "shelbi: warning: couldn't create worktree for task `{}` assigned to \
+                         workspace `{}` (agent will start in $HOME): {e}",
+                        task.id, workspace.name,
+                    );
+                }
+            }
+        }
+    }
+
     // A crashed prior wrapper (mark_expected_teardown → tmux kill-window →
     // wrapper SIGKILLed before it could consume) can leave a stale
     // `.expected-teardown` marker for this workspace. Clear it up front so
@@ -127,19 +166,18 @@ pub fn run(
         wd = shelbi_agent::shell_escape(&worktree_str),
     );
 
-    // Resolve the task currently assigned to this workspace so the
-    // Phase 7 hooks (SessionStart tail + Stop message-inject) have a
-    // concrete `$TASK_ID` to anchor their per-task paths on. Prefer an
-    // inherited `TASK_ID` env var when the caller injected one via tmux
-    // `-e`: the dispatch path spawns this wrapper BEFORE writing the
-    // task's `assigned_to`/`column=in_progress` to disk, so the state
-    // lookup would race the state save and return None. Fall back to
-    // the state lookup for the sidebar-click path (no env, no task in
-    // progress → empty TASK_ID, hooks no-op cleanly).
+    // Seed `$TASK_ID` so the Phase 7 hooks (SessionStart tail + Stop
+    // message-inject) have a concrete id to anchor their per-task paths on.
+    // Prefer an inherited `TASK_ID` env var when the caller injected one via
+    // tmux `-e`: the dispatch path spawns this wrapper BEFORE writing the
+    // task's `assigned_to`/`column=in_progress` to disk, so the `assigned_task`
+    // lookup above would race the state save and return None. Fall back to that
+    // lookup for the sidebar-click path (no env → empty TASK_ID when nothing is
+    // assigned, and the hooks no-op cleanly).
     let task_id = std::env::var(ENV_TASK_ID)
         .ok()
         .filter(|s| !s.is_empty())
-        .or_else(|| current_task_for_workspace(&project.name, &workspace.name))
+        .or_else(|| assigned_task.as_ref().map(|t| t.id.clone()))
         .unwrap_or_default();
 
     // Signal handling: arrange for SIGHUP / SIGTERM / SIGINT to be
@@ -382,25 +420,52 @@ fn signal_name(sig: i32) -> String {
     }
 }
 
-/// Look up the in-progress task assigned to `workspace`, if any. Used
-/// by the pane wrapper to seed `$TASK_ID` for the Phase 7 hooks. The
-/// poller's invariant guarantees at most one in-progress task per
-/// workspace (it dispatches sequentially), so `find` is correct — if
-/// the invariant ever breaks we want the first match, not a silent
-/// collapse to None.
+/// Look up the task currently assigned to `workspace`, if any. Used by the
+/// pane wrapper to seed `$TASK_ID` for the Phase 7 hooks AND to recover a
+/// missing worktree before launch. Considers both the active (`in-progress`)
+/// and handoff (`review`) categories: a review workspace's task sits in
+/// Review, so an in-progress-only lookup would miss it and leave the
+/// worktree uncreated — the very bug this recovery closes.
+///
+/// The poller's invariant guarantees at most one such task per workspace (it
+/// dispatches sequentially), so `find` is correct — if the invariant ever
+/// breaks we want the first match, not a silent collapse to None.
 ///
 /// Best-effort: returns `None` on read errors (missing project state,
-/// permissions glitch, transient FS) because a missing `TASK_ID` makes
-/// the hooks no-op but doesn't break the pane.
-fn current_task_for_workspace(project: &str, workspace: &str) -> Option<String> {
-    let in_progress = shelbi_state::list_column(project, Column::in_progress()).ok()?;
-    in_progress.into_iter().find_map(|tf| {
-        if tf.task.assigned_to.as_deref() == Some(workspace) {
-            Some(tf.task.id)
+/// permissions glitch, transient FS) because a missing task just makes the
+/// hooks no-op and skips the worktree recovery — neither breaks the pane.
+fn assigned_task_for_workspace(project: &str, workspace: &str) -> Option<Task> {
+    let tasks = shelbi_state::list_tasks(project).ok()?;
+    tasks.into_iter().find_map(|tf| {
+        let anchors = matches!(
+            tf.task.column.category(),
+            StatusCategory::Active | StatusCategory::Handoff
+        );
+        if anchors && tf.task.assigned_to.as_deref() == Some(workspace) {
+            Some(tf.task)
         } else {
             None
         }
     })
+}
+
+/// Resolve the branch a task's worktree must be checked out on, mirroring the
+/// `shelbi task start` dispatch path: an explicit `task.branch` wins;
+/// otherwise it's composed from the task's workflow + project config via
+/// [`shelbi_orchestrator::branch::branch_name_for_task`]. An assigned
+/// (in-progress or in-review) task almost always has `task.branch` already
+/// written back, so the compose path is a rare fallback.
+///
+/// Best-effort: returns `None` (worktree recovery is skipped, and the pane
+/// falls back to `$HOME`) when the branch can't be resolved — losing the
+/// recovery is strictly better than aborting the pane.
+fn resolve_task_branch(project: &Project, task: &Task) -> Option<String> {
+    if let Some(branch) = &task.branch {
+        return Some(branch.clone());
+    }
+    let workflow = shelbi_state::load_task_workflow(&project.name, project, task)
+        .unwrap_or_else(|_| shelbi_core::default_workflow());
+    shelbi_orchestrator::branch::branch_name_for_task(project, Some(&workflow), task).ok()
 }
 
 /// Reasoned cleanup of the SessionStart tail on pane exit. Reads the
@@ -912,11 +977,11 @@ mod tests {
         }
     }
 
-    /// `current_task_for_workspace` finds the in-progress task whose
+    /// `assigned_task_for_workspace` finds the in-progress task whose
     /// `assigned_to` matches the workspace. The wrapper uses this to
     /// seed `$TASK_ID` for the Phase 7 hooks.
     #[test]
-    fn current_task_for_workspace_returns_in_progress_assignment() {
+    fn assigned_task_for_workspace_returns_in_progress_assignment() {
         let _g = ENV_LOCK.lock().unwrap();
         let home = fresh_test_home("current-task-lookup");
         std::env::set_var("SHELBI_HOME", &home);
@@ -932,11 +997,34 @@ mod tests {
         shelbi_state::save_task("demo", &decoy, "").unwrap();
 
         assert_eq!(
-            current_task_for_workspace("demo", "alpha").as_deref(),
-            Some("feat-x"),
+            assigned_task_for_workspace("demo", "alpha").map(|t| t.id),
+            Some("feat-x".to_string()),
         );
         // Workspace with nothing assigned → None.
-        assert_eq!(current_task_for_workspace("demo", "bravo"), None);
+        assert!(assigned_task_for_workspace("demo", "bravo").is_none());
+
+        std::env::remove_var("SHELBI_HOME");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// The review path the bug is about: a task assigned to a workspace
+    /// while it sits in **Review** (the handoff category) must still be
+    /// resolved, so its worktree gets recovered on open. An in-progress-only
+    /// lookup would miss it and leave the review agent in `$HOME`.
+    #[test]
+    fn assigned_task_for_workspace_returns_review_assignment() {
+        let _g = ENV_LOCK.lock().unwrap();
+        let home = fresh_test_home("review-task-lookup");
+        std::env::set_var("SHELBI_HOME", &home);
+
+        let mut task = make_task("bug-z", shelbi_core::Column::review());
+        task.assigned_to = Some("review".into());
+        shelbi_state::save_task("demo", &task, "").unwrap();
+
+        assert_eq!(
+            assigned_task_for_workspace("demo", "review").map(|t| t.id),
+            Some("bug-z".to_string()),
+        );
 
         std::env::remove_var("SHELBI_HOME");
         let _ = std::fs::remove_dir_all(&home);
