@@ -52,17 +52,20 @@ Shelbi gives you:
 
 ## Install
 
-On macOS, install Shelbi from the Homebrew tap:
+Shelbi publishes prebuilt releases for macOS and Ubuntu. Use the package
+manager path for your platform, then confirm the binary is on your `PATH`.
+
+### macOS: Homebrew
 
 ```bash
-brew tap jlong/shelbi
+brew tap shelbi/shelbi
 brew install shelbi
 ```
 
-The tap repository still needs to be created and seeded before the first
-tagged release can publish its formula.
+The Homebrew formula installs the prebuilt macOS release archive from
+`jlong/shelbi` and verifies its SHA256 checksum from the release.
 
-On Ubuntu, install Shelbi from the signed APT repository:
+### Ubuntu: APT
 
 ```bash
 sudo install -d -m 0755 /etc/apt/keyrings
@@ -76,14 +79,44 @@ sudo apt update
 sudo apt install shelbi
 ```
 
+APT verifies the signed `InRelease` metadata during `apt update`. The initial
+APT repository publishes `amd64` packages under the `stable` suite.
+
 The published key fingerprint is available at
 `https://apt.shelbi.dev/shelbi-archive-keyring.fingerprint`.
 
-For contributor/source installs, clone and run `./scripts/install.sh` — it
-builds with `cargo build --release` and drops the binary at
-`$HOME/bin/shelbi` (override with
-`SHELBI_INSTALL_PATH=/somewhere/else`). `cargo install shelbi` will land once
-the first crate is published.
+### Verify release artifacts manually
+
+GitHub Releases are the artifact ledger for package-manager installs and
+manual downloads. To verify a downloaded `.deb` against the release checksum
+file, use the matching version tag and package name:
+
+```bash
+version=0.1.0
+curl -fsSLO "https://github.com/jlong/shelbi/releases/download/v${version}/checksums.txt"
+curl -fsSLO "https://github.com/jlong/shelbi/releases/download/v${version}/shelbi_${version}_amd64.deb"
+sha256sum -c checksums.txt --ignore-missing
+```
+
+For macOS release archives, download `checksums.txt` and the archive you want,
+then verify with `shasum`:
+
+```bash
+version=0.1.0
+curl -fsSLO "https://github.com/jlong/shelbi/releases/download/v${version}/checksums.txt"
+curl -fsSLO "https://github.com/jlong/shelbi/releases/download/v${version}/shelbi_Darwin_arm64.tar.gz"
+grep "shelbi_Darwin_arm64.tar.gz" checksums.txt | shasum -a 256 --check -
+```
+
+Release artifacts also have GitHub artifact attestations when the release
+workflow publishes them.
+
+### Build from source for development
+
+Contributors and anyone testing unreleased changes can clone and run
+`./scripts/install.sh`. It builds with `cargo build --release` and drops the
+binary at `$HOME/bin/shelbi` (override with
+`SHELBI_INSTALL_PATH=/somewhere/else`).
 
 ```bash
 git clone https://github.com/jlong/shelbi.git
