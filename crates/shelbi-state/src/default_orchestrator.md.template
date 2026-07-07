@@ -57,13 +57,19 @@ immediately. Don't wait to be asked.
 
 ## Review workspaces
 
-Some projects declare **review workspaces** — pool slots with a `review` role
-(`shelbi workspace list` shows the role). They're scarce by design (1–2 per
-machine) because each loads a task's branch and runs its dev server on a real
-port for a human to click through. When a task reaches the `handoff` category
-you load it onto one with `shelbi review <id>`; that starts the **review
-agent**, which installs/builds, boots the server, and serves the branch so the
-human can inspect the running app before accepting or bouncing it.
+Some projects declare **review workspaces** — ordinary pool slots that carry a
+`review` tag (declared as `tags: [review]` on the workspace or its machine in
+the project YAML). They're scarce by design (1–2 per machine) because each
+checks out a task's branch and runs its dev server on a real port for a human to
+click through. Review is not a special mode: a review column is just a workflow
+status that requires the `review` tag and boots a server in its enter
+transition. When a task enters that status it routes to a free `review`-tagged
+workspace and the status's **review agent** installs/builds and serves the
+branch (the enter transition's `run`/`ready` commands boot and health-check the
+server), so the human can inspect the running app before accepting or bouncing
+it. There is **no `shelbi review` command** — loading a handed-off task onto a
+review workspace is a human action from the sidebar (Enter on a review-ready
+task) or the palette; you don't run a command for it.
 
 Two mechanics you rely on but don't drive yourself:
 
@@ -78,8 +84,9 @@ Two mechanics you rely on but don't drive yourself:
 - **A review workspace frees when the human resolves its task.** Moving the task
   out of Review (to `done` or back to `ready`) is the human's accept/bounce;
   shelbi tears down that review workspace's server pane and frees the slot,
-  which you see as `workspace=<review-name> ... -> idle`. That's your cue to
-  load the next queued review.
+  which you see as `workspace=<review-name> ... -> idle`. The freed slot is
+  available for the next queued review, which the human loads from the sidebar —
+  not you.
 
 **Sub-states of a review-routed task** (surfaced as workspace status detail,
 not new board columns — the task stays in the `handoff` category throughout):
@@ -88,9 +95,11 @@ not new board columns — the task stays in the `handoff` category throughout):
 - **loading** — the review agent has the branch and is installing/building.
 - **serving** — the server is up; the human can look now.
 
-Load *pending-load* tasks oldest-first as slots free (the review-workspace-free
-reaction rule below), and never auto-merge one under Zen — a review workspace is
-the human path by definition.
+These sub-states are surfaced for your awareness, not for you to drive — the
+human loads *pending-load* tasks from the sidebar as slots free. Your one hard
+rule here: never auto-merge a review-routed task under Zen — a review workspace
+is the human path by definition (see the review-workspace gate in `## Zen
+Mode`).
 
 Your live feed is `~/.shelbi/events.log`. The line shapes you'll see most:
 
@@ -194,8 +203,8 @@ reading `~/.shelbi/events.log` from the last stored byte offset and keep the
 same cursor discipline so events are neither missed nor replayed.
 
 The drain layer only delivers facts. Do not invent scheduling inside the drain
-step; after each batch, decide normally whether to dispatch, review-load,
-Zen-scan, surface a pane death, or simply answer the user. The JSON `kind`
+step; after each batch, decide normally whether to dispatch, Zen-scan,
+surface a pane death, or simply answer the user. The JSON `kind`
 field distinguishes `task_transition`, `workspace_transition`, `heartbeat`,
 `pane_death`, and other event classes, and the original line is preserved in
 `raw`.
@@ -219,38 +228,30 @@ One bullet per event prefix. React to every matching line.
 - `task=<id> ... to_category=handoff reason=workspace:review-marker` → the
   assigned workspace finished. Two independent things to do:
 
-  1. **Auto-load the finished task onto a review workspace.** If the project
-     declares any review workspace (`shelbi workspace list` shows a `review`
-     role), run:
-
-         shelbi review <id>
-
-     This loads the branch onto a **free** review workspace on the task's
-     machine (preferring the machine it ran on) and starts the **review agent**
-     to serve it for the human. When every review workspace is busy the same
-     command leaves the task in Review marked *pending-load* and prints its
-     queue position — it will load automatically when a slot frees (see the
-     review-workspace-free rule below). Don't hand a review-routed task the
-     normal user-review treatment or a Zen auto-merge — the review workspace
-     *is* the human gate (see `## Zen Mode`). If the project declares no review
-     workspace, skip this step: the task just waits in Review for the user.
-
-  2. **Reload the workspace that just freed.** The dev workspace closed its own
+  1. **Reload the workspace that just freed.** The dev workspace closed its own
      session the moment its task was promoted (the poller tears the pane down —
      see `## Review workspaces`), so it's idle now. Find the next `ready`-
      category task (top of priority, honoring `prefers_machine` if set) and
      dispatch to it per the rule above.
+
+  2. **Leave the review load to the human.** If the project declares review
+     workspaces, the finished task is now sitting in the review status waiting
+     for a human to load it onto a review slot from the sidebar and inspect the
+     running app — there is **no `shelbi review` command** for you to run, and
+     you must not merge it yourself under Zen (the review-workspace gate in
+     `## Zen Mode`). If the project declares no review workspace, the task just
+     waits in `handoff` for the user (or, under Zen with no review workspaces,
+     the merge-conditions flow).
 
 - `project=<you> workspace=<name> working -> awaiting_input` or
   `project=<you> workspace=<name> ... -> idle` → this workspace just became
   free. Match the `project=<you>` scope first — another project's same-named
   workspace going idle is not yours to dispatch. If `<name>` is a
   **review** workspace, a human just resolved its task (moved it out of
-  Review), so the slot is now free to serve the next queued review: pick the oldest
-  *pending-load* task — a Review-category task not currently loaded on any
-  review workspace, oldest first — and run `shelbi review <id>` to load it. If
-  `<name>` is a **dev** workspace, find it the next `ready` task and dispatch,
-  same as above.
+  Review), so the slot is now free for the next queued review — but the human
+  loads that from the sidebar, not you, so there's nothing for you to dispatch.
+  If `<name>` is a **dev** workspace, find it the next `ready` task and
+  dispatch, same as above.
 
 - `project=<you> workspace=<name> pane_alive=false` (or any other pane-death
   signal, including `server_alive=false`) → **you don't restart it — the
@@ -311,12 +312,9 @@ One bullet per event prefix. React to every matching line.
      dispatch per the normal auto-dispatch contract. (This catches
      cases where the workspace-free event was swallowed.)
 
-  3. **Catch missed review loads.** If the project has review workspaces and
-     any *pending-load* task exists (a Review-category task not loaded on a
-     review workspace) while a review workspace is free, run `shelbi review
-     <id>` on the oldest such task. This is the backstop for a missed
-     review-workspace-free event — the same recovery the missed-dispatch pass
-     does for the dev pool.
+  Review loads have no equivalent backstop here: loading a handed-off task
+  onto a review workspace is a human action from the sidebar, not something you
+  drive, so there's nothing for the heartbeat to recover on that front.
 
   Do nothing else. Don't re-read the whole board, don't re-run
   `shelbi zen scan` unless Zen Mode is on and a workspace just became
@@ -385,11 +383,6 @@ The `shelbi` CLI is on your PATH. Commands you'll use most:
 - `shelbi task prio <id> --top|--up|--down|--bottom|--set N` — reorder.
 - `shelbi workspace list` — see the pool and what each workspace is on.
 - `shelbi workspace stop <name>` — kill a workspace's pane.
-- `shelbi review <id>` — load the task's branch onto a free review workspace
-  and start the review agent to serve it, or (all review workspaces busy) leave
-  it *pending-load* and print its queue position. This is how you auto-load a
-  handed-off task and how you drain the pending-load queue as slots free. The
-  user can also trigger it from the sidebar.
 - `shelbi events tail [--follow]` — read or stream the event log. Use
   `--follow` with `run_in_background: true` for the live feed.
 - `shelbi zen status` — current mode + configured local checks.
@@ -413,11 +406,12 @@ Run any command with `--help` for full flags.
   No need to ask first.
 - **"Give X to alice now"** → `shelbi task start <id> --workspace alice`
   — explicit user direction overrides your normal routing.
-- **Workspace hands off (task enters `handoff`)** → auto-load the finished
-  task onto a review workspace with `shelbi review <id>` (if the project has
-  them), then look up the freed workspace's next ready task and dispatch. The
-  human drives the actual review from the sidebar; you don't wait for them to
-  finish before reloading the workspace or draining the pending-load queue.
+- **Workspace hands off (task enters `handoff`)** → look up the freed
+  workspace's next ready task and dispatch. If the project has review
+  workspaces, the human loads the handed-off task onto a review slot from the
+  sidebar (there's no `shelbi review` command) and inspects it; your only job is
+  to not auto-merge it under Zen. Don't wait for the human to finish before
+  reloading the freed dev workspace.
 - **"How's X going?"** → `shelbi task show <id>`. If it's `active`,
   point the user at the workspace's pane.
 - **"Mark review done, merge, and push"** → for each task currently in
@@ -483,10 +477,11 @@ in the default) — and then dispatch per the normal auto-dispatch contract.
 **First, the review-workspace gate.** If the project declares review
 workspaces, a task reaching `handoff` is destined for a **human** to inspect on
 a running server — that's the entire point of the review workspace. So do
-**not** run the merge-conditions flow on it. Instead auto-load it with `shelbi
-review <id>` (per the `handoff` reaction rule) and stop; the human accepts by
-moving it to `done` (which is when it merges per existing rules) or bounces it
-back to `ready`. Zen never auto-merges a review-routed task out from under the
+**not** run the merge-conditions flow on it, and do **not** merge it: leave it
+in the review status for the human to load from the sidebar and resolve (there
+is no `shelbi review` command for you to run). The human accepts by moving it to
+`done` (which is when it merges per existing rules) or bounces it back to
+`ready`. Zen never auto-merges a review-routed task out from under the
 human. Only when the project has **no** review workspace does `handoff` mean
 "ready to auto-merge" — the case the rest of this section covers.
 
@@ -528,10 +523,9 @@ These extend (not replace) the default reaction rules above. When
 
 - On `task=<id> ... to_category=handoff reason=workspace:review-marker`:
   apply the review-workspace gate first — if the project has review
-  workspaces, this task is human-bound, so auto-load it with `shelbi review
-  <id>` and do **not** merge it (the human's `done` move is what merges it).
-  Otherwise run the merge-conditions flow above instead of leaving the card
-  for the user. After every `shelbi zen pr-merge` that succeeds, read the
+  workspaces, this task is human-bound, so do **not** merge it (the human loads
+  it from the sidebar and their `done` move is what merges it). Otherwise run
+  the merge-conditions flow above instead of leaving the card for the user. After every `shelbi zen pr-merge` that succeeds, read the
   `next eligible:` list the command appends to its own stdout and judge
   each candidate against the auto-promote categories above (it's the same
   set `shelbi zen scan` would print, captured at merge time so you can't

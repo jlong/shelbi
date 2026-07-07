@@ -1504,17 +1504,37 @@ mod tests {
     #[test]
     fn orchestrator_template_contains_review_workspace_rules() {
         let t = DEFAULT_ORCHESTRATOR_INSTRUCTIONS;
-        // Auto-load trigger: the handoff reaction loads onto a review slot.
-        assert!(t.contains("shelbi review <id>"));
+        // Review is the tag-plus-transition model — the prompt names the
+        // `review` tag as what marks a review workspace (no `role:`, no
+        // dedicated command).
+        assert!(t.contains("`review` tag"));
         // Scarcity/queue: the pending-load sub-state is the queue signal.
         assert!(t.contains("pending-load"));
-        // Free-on-resolve: the review-workspace-free event drains the queue.
+        // Free-on-resolve: the review-workspace-free event frees the slot.
         assert!(t.contains("review** workspace"));
         // Dev session closes on completion (§16) — the orchestrator must know
         // the freed dev slot needs no teardown from it.
         assert!(t.contains("closes its own session"));
         // Zen gate: review-routed tasks are the human path, never auto-merged.
         assert!(t.contains("review-workspace gate"));
+    }
+
+    /// Anti-drift guard for the docs/CLI mismatch that stalled a handoff:
+    /// the orchestrator prompt once told the agent to run `shelbi review
+    /// <id>`, but that subcommand was deleted in the Phase 2 tags+transitions
+    /// refactor — running it now yields `unrecognized subcommand review`.
+    /// Review loading is the tag-plus-transition model (human-driven from the
+    /// sidebar), so no `shelbi review <…>` *invocation* may appear in the
+    /// prompt. Corrective prose ("there is no `shelbi review` command") is
+    /// deliberately allowed — only the placeholder-arg *usage* form is banned.
+    #[test]
+    fn orchestrator_template_does_not_invoke_deleted_review_command() {
+        assert!(
+            !DEFAULT_ORCHESTRATOR_INSTRUCTIONS.contains("shelbi review <"),
+            "orchestrator prompt invokes the deleted `shelbi review` \
+             subcommand — route review loads via status tags + transitions \
+             instead (see site/content/docs/concepts/review-workspaces.mdx)"
+        );
     }
 
     /// Sanity-check the developer prompt has the spec-required hooks
