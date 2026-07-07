@@ -1,3 +1,9 @@
 name: Shelbi
 createdAt: '2026-06-20T00:00:00Z'
+folderOrder:
+  '':
+  - Product
+  - Plans
+  - Research
+  - reviews
 showFrontmatter: false
