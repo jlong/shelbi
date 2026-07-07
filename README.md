@@ -52,10 +52,38 @@ Shelbi gives you:
 
 ## Install
 
-For now: clone and run `./scripts/install.sh` — it builds with
-`cargo build --release` and drops the binary at `$HOME/bin/shelbi`
-(override with `SHELBI_INSTALL_PATH=/somewhere/else`). `cargo install
-shelbi` will land once the first crate is published.
+On macOS, install Shelbi from the Homebrew tap:
+
+```bash
+brew tap jlong/shelbi
+brew install shelbi
+```
+
+The tap repository still needs to be created and seeded before the first
+tagged release can publish its formula.
+
+On Ubuntu, install Shelbi from the signed APT repository:
+
+```bash
+sudo install -d -m 0755 /etc/apt/keyrings
+curl -fsSL https://apt.shelbi.dev/shelbi-archive-keyring.gpg \
+  | sudo tee /etc/apt/keyrings/shelbi-archive-keyring.gpg >/dev/null
+
+echo "deb [arch=amd64 signed-by=/etc/apt/keyrings/shelbi-archive-keyring.gpg] https://apt.shelbi.dev stable main" \
+  | sudo tee /etc/apt/sources.list.d/shelbi.list >/dev/null
+
+sudo apt update
+sudo apt install shelbi
+```
+
+The published key fingerprint is available at
+`https://apt.shelbi.dev/shelbi-archive-keyring.fingerprint`.
+
+For contributor/source installs, clone and run `./scripts/install.sh` — it
+builds with `cargo build --release` and drops the binary at
+`$HOME/bin/shelbi` (override with
+`SHELBI_INSTALL_PATH=/somewhere/else`). `cargo install shelbi` will land once
+the first crate is published.
 
 ```bash
 git clone https://github.com/jlong/shelbi.git

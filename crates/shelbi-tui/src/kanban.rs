@@ -399,6 +399,10 @@ impl KanbanApp {
     /// if the click missed every card (including clicks on column headers,
     /// the footer, or empty space below the last card).
     pub fn card_at(&self, x: u16, y: u16) -> Option<(usize, usize)> {
+        if self.header_at(x, y).is_some() {
+            return None;
+        }
+
         self.card_hits.iter().find_map(|hit| {
             let r = hit.area;
             let in_x = x >= r.x && x < r.x.saturating_add(r.width);
@@ -482,7 +486,7 @@ impl KanbanApp {
         let workflow = self
             .workflow_filter
             .clone()
-            .unwrap_or_else(|| "default".to_string());
+            .unwrap_or_else(|| self.default_workflow_name.clone());
         if let Err(e) = shelbi_state::set_kanban_column_override(
             &self.project_name,
             &workflow,
@@ -4675,6 +4679,97 @@ mod tests {
         let _ = std::fs::remove_dir_all(&home);
     }
 
+    /// All-view column overrides are scoped to the project's configured
+    /// default workflow, not the literal legacy `default` workflow. When
+    /// those keys diverge, a refresh must reload the just-written override
+    /// instead of falling back to Auto.
+    #[test]
+    fn all_view_toggle_uses_project_default_workflow_key() {
+        let _g = crate::test_support::ENV_LOCK.lock().unwrap();
+        let home = std::env::temp_dir().join(format!(
+            "shelbi-tui-default-workflow-column-override-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&home).unwrap();
+        std::env::set_var("SHELBI_HOME", &home);
+
+        let project = shelbi_core::Project {
+            name: "demo".into(),
+            repo: "git@example:demo.git".into(),
+            default_branch: "main".into(),
+            default_workflow: Some("app".into()),
+            config_mode: None,
+            git: shelbi_core::GitConfig::default(),
+            machines: vec![shelbi_core::Machine {
+                name: "hub".into(),
+                kind: shelbi_core::MachineKind::Local,
+                work_dir: "/tmp/demo".into(),
+                host: None,
+                tags: Vec::new(),
+            }],
+            orchestrator: shelbi_core::OrchestratorSpec {
+                runner: "claude".into(),
+            },
+            agent_runners: {
+                let mut m = std::collections::BTreeMap::new();
+                m.insert(
+                    "claude".into(),
+                    shelbi_core::AgentRunnerSpec {
+                        command: "claude".into(),
+                        flags: vec![],
+                        prompt_injection: None,
+                        dialog_signatures: vec![],
+                    },
+                );
+                m
+            },
+            editor: None,
+            github_url: None,
+            workspaces: Vec::new(),
+            workspace_poll_interval_secs: 5,
+            workspace_permissions_mode: "auto".into(),
+            workspace_settings_template: None,
+            zen: shelbi_core::ZenConfig::default(),
+            heartbeat: shelbi_core::HeartbeatConfig::default(),
+            detected_shapes: Vec::new(),
+        };
+        shelbi_state::save_project(&project).unwrap();
+        shelbi_state::scaffold_project_statuses("demo").unwrap();
+        let workflows_dir = shelbi_state::project_dir("demo").unwrap().join("workflows");
+        std::fs::create_dir_all(&workflows_dir).unwrap();
+        let app_workflow = shelbi_core::scaffold::default_workflow_yaml()
+            .unwrap()
+            .replacen("name: default", "name: app", 1);
+        std::fs::write(workflows_dir.join("app.yaml"), app_workflow).unwrap();
+        let loaded = shelbi_state::load_project("demo").unwrap();
+        assert_eq!(loaded.default_workflow_name(), "app");
+
+        let mut app = KanbanApp::new("demo");
+        app.refresh();
+        assert_eq!(app.default_workflow_name, "app");
+        assert!(app.workflow_filter.is_none(), "precondition: All view");
+        assert!(app.is_column_collapsed(0), "empty Backlog auto-collapses");
+
+        app.toggle_column(0);
+        assert_eq!(app.column_expansion(0), ColumnExpansion::Expanded);
+
+        app.refresh();
+        assert_eq!(app.default_workflow_name, "app");
+        assert_eq!(
+            app.column_expansion(0),
+            ColumnExpansion::Expanded,
+            "All-view override should reload from app:<status>, not default:<status>",
+        );
+        assert!(!app.is_column_collapsed(0));
+
+        std::env::remove_var("SHELBI_HOME");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
     /// When a task lands in an explicitly-collapsed column the override
     /// stays — only the `(N)` count surfaces the change. The
     /// acceptance criterion: a non-empty + explicitly-collapsed column
@@ -4885,6 +4980,37 @@ mod tests {
         assert_eq!(app.header_at(41, 8), Some(2));
         assert_eq!(app.header_at(41, 14), None, "below the strip");
         assert_eq!(app.header_at(50, 1), None, "right of every header");
+    }
+
+    /// Card hit-testing treats column headers as reserved space even
+    /// when a stale or overlapping card rectangle also covers the same
+    /// cell. The mouse handler checks headers first, and this keeps the
+    /// lower-level card path from re-handling that same click.
+    #[test]
+    fn card_at_ignores_points_inside_header_hits() {
+        let mut app = KanbanApp::new("demo");
+        app.header_hits = vec![HeaderHit {
+            area: Rect {
+                x: 0,
+                y: 1,
+                width: 20,
+                height: 1,
+            },
+            col_idx: 0,
+        }];
+        app.card_hits = vec![CardHit {
+            area: Rect {
+                x: 0,
+                y: 1,
+                width: 20,
+                height: 3,
+            },
+            col_idx: 0,
+            row_idx: 0,
+        }];
+
+        assert_eq!(app.card_at(5, 1), None, "header wins overlap");
+        assert_eq!(app.card_at(5, 2), Some((0, 0)), "card body still hits");
     }
 
     /// Per-task overlay reads from the **owning workflow**, not
