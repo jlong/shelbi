@@ -23,6 +23,8 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: read
+    env:
+      GH_TOKEN: ${{ github.token }}
     outputs:
       version: ${{ steps.version.outputs.version }}
       tag: ${{ steps.version.outputs.tag }}
@@ -56,6 +58,11 @@ jobs:
           echo "version=$version" >> "$GITHUB_OUTPUT"
           echo "tag=$RELEASE_REF_NAME" >> "$GITHUB_OUTPUT"
           echo "dry_run=$IS_DRY_RUN" >> "$GITHUB_OUTPUT"
+
+      - name: Configure git identity
+        run: |
+          git config --global user.email "ci@shelbi.local"
+          git config --global user.name "shelbi CI"
 
       - name: Core release tests
         run: cargo test --workspace
