@@ -4,6 +4,10 @@ Tagline: Do more with your agents
 
 Expanded Tagline: An open source, multi-machine orchestrator built on tmux. Dispatch tasks to a team of agents locally or over SSH.
 
+<br />
+
+## Background
+
 My main method is to first create a markdown plan for a feature. Then when I'm satisfied with the plan I ask the Orchestrator to break it into tasks and distribute them to the worker agents.\
 \
 If you're using sub-agents with Claude (most people are even if they don't realize it now) then you're already getting some of the benefits of parallelization.\
