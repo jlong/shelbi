@@ -812,7 +812,13 @@ fn record_usage_limit_pause(
 /// The forward target is resolved generically from the task's workflow: the
 /// first status in the workflow's [`StatusCategory::Handoff`] category, not a
 /// hardcoded "review" id — so a workflow that renames its handoff status (e.g.
-/// `qa`) advances there just the same. The edge's transition actions +
+/// `qa`) advances there just the same. A workflow with *no* handoff status
+/// (e.g. `app-feature-subtask`: todo → in-progress → done) instead advances
+/// along the active status's outgoing merge-firing transition
+/// ([`Workflow::outgoing_merge_transitions`]), landing the task straight in
+/// that edge's target — never in a review workspace, which only receives
+/// tasks in a handoff status. Only a workflow with neither is treated as
+/// misconfigured (warn + clear). The edge's transition actions +
 /// `run:` / `ready:` commands fire via [`execute_transition`], so serving is
 /// driven entirely by the generic transition-command path.
 ///
@@ -855,28 +861,44 @@ fn maybe_apply_ready_handoff(
             if tf.task.column == Column::in_progress()
                 && tf.task.assigned_to.as_deref() == Some(workspace.name.as_str()) =>
         {
-            // Resolve the forward handoff target from the task's workflow:
-            // the first handoff-category status. No handoff status → nothing
-            // to advance to; clear the (misconfigured) marker below.
+            // Resolve the forward target from the task's workflow: the first
+            // handoff-category status. A workflow may legitimately declare no
+            // handoff status (e.g. a subtask flow that merges straight to
+            // done) — then fall back to the active status's outgoing
+            // merge-firing edge and auto-advance along it, so the finished
+            // task isn't stranded in-progress. That edge lands the task
+            // directly in its (done) target — it is NOT a handoff, so it can
+            // never be routed to a review workspace, which only receives
+            // tasks sitting in a handoff-category status. Neither a handoff
+            // status nor a merge edge → nothing to advance to; clear the
+            // (misconfigured) marker below.
             let workflow = shelbi_state::load_task_workflow(&project.name, project, &tf.task)
                 .unwrap_or_else(|_| default_workflow());
             let from_status = resolve_current_status_id(&workflow, Column::in_progress());
-            let Some(handoff) = workflow
+            let to_status = if let Some(handoff) = workflow
                 .statuses
                 .iter()
                 .find(|s| s.category == StatusCategory::Handoff)
-            else {
-                tracing::warn!(workspace = %workspace.name, task = %task_id, "workflow declares no handoff status; clearing ready marker");
+            {
+                handoff.id.clone()
+            } else if let Some(edge) =
+                workflow.outgoing_merge_transitions(&from_status).first()
+            {
+                tracing::info!(workspace = %workspace.name, task = %task_id, from = %from_status, to = %edge.to, "workflow declares no handoff status; auto-advancing along merge transition");
+                edge.to.clone()
+            } else {
+                tracing::warn!(workspace = %workspace.name, task = %task_id, "workflow declares no handoff status and no merge transition out of the active status; clearing ready marker");
                 let _ = shelbi_orchestrator::workspace::clear_ready_marker(host, &marker);
                 return;
             };
-            let to_status = handoff.id.clone();
-            let to_column = Column::from_status_id(&handoff.id);
+            let to_column = Column::from_status_id(&to_status);
 
-            // Auto-rebase the workspace's branch onto the project's default
-            // branch before the column move, so the human reviewer sees a
-            // single clean diff instead of running the rebase + force-push by
-            // hand. Done BEFORE the move (rather than blocking on it) so the
+            // Auto-rebase the workspace's branch onto its base branch (the
+            // branch the work merges into — see
+            // `rebase_workspace_branch_before_handoff`) before the column
+            // move, so the human reviewer sees a single clean diff instead of
+            // running the rebase + force-push by hand. Done BEFORE the move
+            // (rather than blocking on it) so the
             // row showing up already reflects the rewritten branch; a conflict
             // is logged but doesn't block the handoff.
             rebase_workspace_branch_before_handoff(project, workspace, machine, host, &task_id);
@@ -925,7 +947,7 @@ fn maybe_apply_ready_handoff(
                 }
             }
 
-            tracing::info!(workspace = %workspace.name, task = %task_id, to = %to_status, "advanced task to handoff via ready marker");
+            tracing::info!(workspace = %workspace.name, task = %task_id, to = %to_status, "advanced task via ready marker");
 
             // Close the dev session on completion (spec §16). Best-effort and
             // idempotent. A `review`-tagged workspace is left running (it holds
@@ -1247,9 +1269,12 @@ fn maybe_apply_transition(
 }
 
 /// Resolve the workspace's branch for the in-progress task and rebase it onto
-/// the project's default branch. Records one `rebase` line in `events.log`
-/// describing the outcome (ok / up-to-date / conflict / skipped). Never
-/// blocks the calling handoff — failures here are advisory.
+/// the workflow's resolved `git.base_branch` (the branch the work merges
+/// into — e.g. `feature/{{feature}}` for a subtask flow), falling back to the
+/// project's default branch when the workflow declares none. Records one
+/// `rebase` line in `events.log` describing the outcome (ok / up-to-date /
+/// conflict / skipped). Never blocks the calling handoff — failures here are
+/// advisory.
 ///
 /// `branch` uses the same explicit/workflow/project/GitHub fallback resolver
 /// as task dispatch when the task frontmatter doesn't pin one explicitly.
@@ -1286,11 +1311,26 @@ fn rebase_workspace_branch_before_handoff(
         }
     };
 
+    // Rebase onto the branch this work will merge into: the workflow's
+    // resolved `git.base_branch` when declared (a subtask branch cut from
+    // `feature/x` must not be rewritten onto main), else the project
+    // default. An unresolvable placeholder skips the (advisory) rebase
+    // rather than rebasing onto the wrong base.
+    let base_branch = match workflow.resolve_git(&task_file.task.string_params()) {
+        Ok(git) => git
+            .and_then(|g| g.base_branch)
+            .unwrap_or_else(|| project.default_branch.clone()),
+        Err(e) => {
+            tracing::debug!(workspace = %workspace.name, task = %task_id, error = %e, "skip rebase: workflow git block unresolvable");
+            return;
+        }
+    };
+
     let worktree = shelbi_orchestrator::workspace::workspace_worktree(machine, workspace);
     let outcome = shelbi_orchestrator::workspace::rebase_workspace_branch_onto_default(
         host,
         &worktree,
-        &project.default_branch,
+        &base_branch,
     );
 
     let status = outcome.status_token();
@@ -1309,8 +1349,9 @@ fn rebase_workspace_branch_before_handoff(
                 workspace = %workspace.name,
                 task = %task_id,
                 branch = %branch,
+                base = %base_branch,
                 detail = %detail,
-                "auto-rebase onto default branch conflicted; worktree returned to pre-rebase state",
+                "auto-rebase onto base branch conflicted; worktree returned to pre-rebase state",
             );
         }
         shelbi_orchestrator::workspace::RebaseOutcome::Skipped { .. } => {
@@ -1897,6 +1938,161 @@ mod tests {
             "task already in review must not be pulled back out"
         );
         assert!(!marker.exists(), "stale marker should be cleared");
+
+        std::env::remove_var("SHELBI_HOME");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// Materialize a named workflow (reference form) plus the default
+    /// `statuses.yaml` and bundled agents, so `load_task_workflow` resolves
+    /// it through the real on-disk loader.
+    fn write_project_workflow(name: &str, yaml: &str) {
+        shelbi_state::materialize_default_agents("demo").unwrap();
+        shelbi_state::save_project_statuses("demo", &shelbi_core::default_project_statuses())
+            .unwrap();
+        let path = shelbi_state::workflow_path("demo", name).unwrap();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, yaml).unwrap();
+    }
+
+    #[test]
+    fn handoffless_workflow_auto_advances_along_merge_edge() {
+        // A workflow with NO handoff-category status but an
+        // `in-progress -> done: [merge, delete_branch]` edge — the
+        // `app-feature-subtask` shape. The ready marker must advance the
+        // task straight to done instead of stranding it in-progress.
+        let _g = crate::test_support::ENV_LOCK.lock().unwrap();
+        let home = std::env::temp_dir().join(format!(
+            "shelbi-poller-automerge-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&home).unwrap();
+        std::env::set_var("SHELBI_HOME", &home);
+
+        let work_dir = home.join("repo");
+        std::fs::create_dir_all(&work_dir).unwrap();
+        let project = local_project(&work_dir);
+        write_project_workflow(
+            "subtask",
+            r#"
+name: subtask
+statuses:
+  - { id: todo,        owner: agent, agent: orchestrator }
+  - { id: in-progress, owner: agent, agent: developer    }
+  - { id: done,        owner: user }
+transitions:
+  - { from: todo, to: in-progress }
+  - { from: in-progress, to: done, actions: [merge, delete_branch] }
+"#,
+        );
+        let mut task = in_progress_task("subtask-a", "alpha");
+        task.workflow = Some("subtask".into());
+        shelbi_state::save_task("demo", &task, "body").unwrap();
+
+        let marker = write_marker(&project, "subtask-a\n");
+        maybe_apply_ready_handoff(
+            &project,
+            &project.workspaces[0],
+            &project.machines[0],
+            &Host::Local,
+            &TmuxAddr {
+                session: "s".into(),
+                window: "w".into(),
+            },
+        );
+
+        assert_eq!(
+            shelbi_state::load_task("demo", "subtask-a")
+                .unwrap()
+                .task
+                .column,
+            Column::done(),
+            "task should auto-advance along the merge edge"
+        );
+        assert!(!marker.exists(), "marker should be consumed (cleared)");
+
+        // The move lands in the canonical event stream like any other
+        // marker-driven advance.
+        let log = std::fs::read_to_string(shelbi_state::events_log_path().unwrap()).unwrap();
+        let task_lines: Vec<&str> = log
+            .lines()
+            .filter(|l| l.contains(" project=demo task=subtask-a "))
+            .collect();
+        assert_eq!(task_lines.len(), 1, "log: {log:?}");
+        assert!(
+            task_lines[0].contains(" in_progress -> done "),
+            "line: {}",
+            task_lines[0]
+        );
+        assert!(
+            task_lines[0].contains(" reason=workspace:ready-marker "),
+            "line: {}",
+            task_lines[0]
+        );
+
+        std::env::remove_var("SHELBI_HOME");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn workflow_without_handoff_or_merge_edge_warns_and_clears_marker() {
+        // Neither a handoff status nor a merge-firing edge out of the
+        // active status — still a misconfiguration: the task stays put and
+        // the marker is consumed so it doesn't re-log every tick.
+        let _g = crate::test_support::ENV_LOCK.lock().unwrap();
+        let home = std::env::temp_dir().join(format!(
+            "shelbi-poller-deadend-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&home).unwrap();
+        std::env::set_var("SHELBI_HOME", &home);
+
+        let work_dir = home.join("repo");
+        std::fs::create_dir_all(&work_dir).unwrap();
+        let project = local_project(&work_dir);
+        write_project_workflow(
+            "deadend",
+            r#"
+name: deadend
+statuses:
+  - { id: todo,        owner: agent, agent: orchestrator }
+  - { id: in-progress, owner: agent, agent: developer    }
+  - { id: done,        owner: user }
+transitions:
+  - { from: todo, to: in-progress }
+  - { from: in-progress, to: done }
+"#,
+        );
+        let mut task = in_progress_task("stuck-a", "alpha");
+        task.workflow = Some("deadend".into());
+        shelbi_state::save_task("demo", &task, "body").unwrap();
+
+        let marker = write_marker(&project, "stuck-a\n");
+        maybe_apply_ready_handoff(
+            &project,
+            &project.workspaces[0],
+            &project.machines[0],
+            &Host::Local,
+            &TmuxAddr {
+                session: "s".into(),
+                window: "w".into(),
+            },
+        );
+
+        assert_eq!(
+            shelbi_state::load_task("demo", "stuck-a").unwrap().task.column,
+            Column::in_progress(),
+            "task must stay in-progress when no advance target exists"
+        );
+        assert!(!marker.exists(), "misconfigured marker should be cleared");
 
         std::env::remove_var("SHELBI_HOME");
         let _ = std::fs::remove_dir_all(&home);

@@ -56,8 +56,15 @@ pub struct ActionOutcome {
 /// via [`Workflow::resolve_transition_target`] — substituting `{{var}}`
 /// placeholders from the task's frontmatter params — and threaded into
 /// the `merge` / `open_pr` primitives; every other primitive ignores it.
-/// A `target:` naming a param the task doesn't provide fails the whole
-/// transition before any action runs (`Error::MissingTaskParams`).
+/// With no `target:` on the edge, a `merge` / `open_pr` edge falls back
+/// to the workflow's resolved `git.base_branch` (the documented default
+/// in [`Workflow::resolve_transition_target`]), and only then to the
+/// project base inside the primitive itself. The fallback is resolved
+/// lazily — an edge whose actions never consume a target skips it, so a
+/// `git.base_branch` placeholder the task can't satisfy doesn't fail a
+/// pure bounce edge. A `target:` (or consulted `git.base_branch`) naming
+/// a param the task doesn't provide fails the whole transition before
+/// any action runs (`Error::MissingTaskParams`).
 pub fn execute_transition(
     project: &Project,
     project_name: &str,
@@ -67,7 +74,7 @@ pub fn execute_transition(
     from: &str,
     to: &str,
 ) -> Result<Vec<ActionOutcome>> {
-    let target = workflow.resolve_transition_target(from, to, &task.string_params())?;
+    let target = resolve_effective_target(workflow, task, from, to)?;
     let mut outcomes = Vec::new();
     for &action in workflow.actions_for_transition(from, to) {
         let line = run_action(
@@ -93,6 +100,32 @@ pub fn execute_transition(
     }
 
     Ok(outcomes)
+}
+
+/// The branch a `merge` / `open_pr` on the `from -> to` edge should land
+/// on: the edge's own `target:` override, else the workflow's resolved
+/// `git.base_branch`. `None` means the primitive's own default (the
+/// project base) wins. The `git.base_branch` fallback is only resolved
+/// when the edge actually declares an action that consumes a target, so
+/// an unresolvable placeholder can't fail an edge that never needed it.
+fn resolve_effective_target(
+    workflow: &Workflow,
+    task: &Task,
+    from: &str,
+    to: &str,
+) -> Result<Option<String>> {
+    let params = task.string_params();
+    if let Some(t) = workflow.resolve_transition_target(from, to, &params)? {
+        return Ok(Some(t));
+    }
+    let needs_target = workflow
+        .actions_for_transition(from, to)
+        .iter()
+        .any(|a| matches!(a, TransitionAction::Merge | TransitionAction::OpenPr));
+    if !needs_target {
+        return Ok(None);
+    }
+    Ok(workflow.resolve_git(&params)?.and_then(|g| g.base_branch))
 }
 
 /// Execute a transition's `run:` commands (in order) and then poll its
@@ -464,6 +497,86 @@ transitions:
             msg.contains("version"),
             "error should name the param: {msg}"
         );
+    }
+
+    // ---- effective merge/open_pr target resolution ------------------------
+
+    /// A workflow with a parameterized `git.base_branch` and one
+    /// `in-progress -> done` edge — the handoff-less subtask shape.
+    fn workflow_with_git_base(actions_yaml: &str, target: Option<&str>) -> Workflow {
+        let target_line = target
+            .map(|t| format!(", target: \"{t}\""))
+            .unwrap_or_default();
+        let yaml = format!(
+            r#"
+name: subtask
+git:
+  base_branch: feature/{{{{feature}}}}
+statuses:
+  - {{ id: in-progress, name: In Progress, category: active, owner: agent, agent: developer }}
+  - {{ id: done,        name: Done,        category: done,   owner: user                    }}
+transitions:
+  - {{ from: in-progress, to: done, actions: [{actions_yaml}]{target_line} }}
+"#
+        );
+        Workflow::from_yaml_str(&yaml).expect("workflow parses")
+    }
+
+    #[test]
+    fn effective_target_prefers_edge_target_over_git_base() {
+        let wf = workflow_with_git_base("merge", Some("develop"));
+        let task = bare_task("t-1");
+        let target = resolve_effective_target(&wf, &task, "in-progress", "done")
+            .expect("target resolves");
+        assert_eq!(target.as_deref(), Some("develop"));
+    }
+
+    #[test]
+    fn effective_target_falls_back_to_resolved_git_base_branch() {
+        // No `target:` on the merge edge → the workflow's `git.base_branch`
+        // wins, with `{{feature}}` substituted from the task's params. This
+        // is what lands a subtask merge on `feature/auth` instead of the
+        // project base.
+        let wf = workflow_with_git_base("merge, delete_branch", None);
+        let mut task = bare_task("t-1");
+        task.params.insert("feature".into(), "auth".into());
+        let target = resolve_effective_target(&wf, &task, "in-progress", "done")
+            .expect("target resolves");
+        assert_eq!(target.as_deref(), Some("feature/auth"));
+    }
+
+    #[test]
+    fn effective_target_missing_git_base_param_fails_merge_edge() {
+        // The merge edge consumes the git base, so an unresolvable
+        // `{{feature}}` must fail loudly (MissingTaskParams), not merge
+        // into a half-substituted branch name.
+        let wf = workflow_with_git_base("merge", None);
+        let task = bare_task("t-1");
+        let err = resolve_effective_target(&wf, &task, "in-progress", "done")
+            .expect_err("missing param must fail");
+        assert!(err.to_string().contains("feature"), "{err}");
+    }
+
+    #[test]
+    fn effective_target_skips_git_base_on_edges_that_never_consume_it() {
+        // An edge without merge/open_pr never reads the target, so the
+        // unresolvable `{{feature}}` placeholder must not fail it.
+        let wf = workflow_with_git_base("push_branch", None);
+        let task = bare_task("t-1");
+        let target = resolve_effective_target(&wf, &task, "in-progress", "done")
+            .expect("targetless edge resolves");
+        assert_eq!(target, None);
+    }
+
+    #[test]
+    fn effective_target_none_without_git_block_or_target() {
+        // No edge `target:`, no workflow `git:` block → None; the merge
+        // primitive's own project-base default wins.
+        let wf = workflow_with_edge("merge", None);
+        let task = bare_task("t-1");
+        let target = resolve_effective_target(&wf, &task, "review", "done")
+            .expect("resolves to none");
+        assert_eq!(target, None);
     }
 
     // ---- run: / ready: shell-command execution ---------------------------
