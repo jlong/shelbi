@@ -18,7 +18,7 @@ My main method is to first create a markdown plan for a feature. Then when I'm s
 \
 If you're using sub-agents with Claude (most people are even if they don't realize it now) then you're already getting some of the benefits of parallelization.\
 \
-Where Shelbi shines though is in giving the agents discrete chunks of work. Task-level turns out to be an extremely helpful resolution for worker agents. By breaking large plans down into tasks, and creating one off tasks for smaller work, Shelbi can balance large and small things well leading to greater personal productivity.
+Where Shelbi shines  is in giving the agents discrete chunks of work. Task-level turns out to be an extremely helpful resolution for worker agents. By breaking large plans down into tasks, and creating one off tasks for smaller work, Shelbi can balance large and small things well leading to greater personal productivity.
 
 <br />
 
