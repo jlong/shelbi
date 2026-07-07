@@ -65,15 +65,19 @@ Keep the APT signing key separate from maintainer Git tag-signing keys.
 
 ## Downstream Publication
 
-Homebrew and APT publication are deliberately gated until the downstream repos,
-domains, and secrets are provisioned. The release workflow has a downstream
-preparation job that records the required state after GitHub Release publication.
+Homebrew and APT publication run as jobs in the release workflow, gated on
+repository variables so they skip cleanly until the downstream repos, domains,
+and secrets are provisioned. The downstream preparation job records the
+publication state after GitHub Release publication.
 
-For Homebrew, publish a formula in a dedicated tap such as
-`jlong/homebrew-shelbi` or `shelbi/homebrew-shelbi` that points to the GitHub
-Release tarballs and their SHA256 checksums.
+For Homebrew, the `homebrew-pr` job runs when `HOMEBREW_TAP_REPOSITORY` is set.
+Publish a formula in a dedicated tap such as `jlong/homebrew-shelbi` or
+`shelbi/homebrew-shelbi` that points to the GitHub Release tarballs and their
+SHA256 checksums.
 
-For APT, publish the `.deb` into a signed static repository with this shape:
+For APT, the `apt-publish` job runs when the `APT_REPO` variable names the
+hosting repository (for example `jlong/shelbi-apt`). It publishes the `.deb`
+into a signed static repository (see docs/release-apt.md) with this shape:
 
 ```text
 pool/main/s/shelbi/shelbi_VERSION_amd64.deb

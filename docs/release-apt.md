@@ -5,7 +5,8 @@ Shelbi's Ubuntu packages are published through a signed static APT repository.
 ## Public Endpoint
 
 - APT repository: `https://apt.shelbi.dev/`
-- Hosting repository: `shelbi/apt`
+- Hosting repository: `shelbi-apt` (set the `APT_REPO` repository variable, for
+  example `jlong/shelbi-apt`)
 - Suite: `stable`
 - Component: `main`
 - Architecture: `amd64`
@@ -54,15 +55,21 @@ Configure these in the main Shelbi repository:
 - `APT_GPG_PRIVATE_KEY`: ASCII-armored private key for the dedicated APT key.
 - `APT_GPG_PASSPHRASE`: passphrase for that private key.
 
-Optional repository variables:
+Repository variables:
 
-- `APT_REPO`: override the hosting repository, default `shelbi/apt`.
+- `APT_REPO`: the hosting repository, for example `jlong/shelbi-apt`. The
+  `apt-publish` job in the release workflow only runs when this is set; the
+  manual backfill workflow defaults to `<owner>/shelbi-apt`.
 - `APT_BASE_URL`: override the public URL, default `https://apt.shelbi.dev`.
 
 ## Publish Flow
 
-`.github/workflows/release-apt.yml` runs when a GitHub Release is published, or
-manually with a release tag. It:
+The `apt-publish` job in `.github/workflows/release.yml` runs after the GitHub
+Release is published on a `v*` tag push, once `APT_REPO` and the secrets above
+are provisioned. `.github/workflows/release-apt.yml` provides the same path as
+a manual backfill, dispatched with a release tag. (A `release: published`
+trigger would not work for the automated path: GitHub Releases created with the
+workflow `GITHUB_TOKEN` do not start new workflow runs.) The publish path:
 
 1. Verifies the `v*` tag matches the workspace Cargo version.
 2. Downloads the release `.deb` matching `shelbi_*_amd64.deb`.

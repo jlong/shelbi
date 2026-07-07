@@ -267,11 +267,126 @@ jobs:
             --title "shelbi ${version}" \
             --body "Updates the Shelbi formula to ${version} after GitHub Release artifacts were published."
 
+  apt-publish:
+    name: Publish APT repository
+    needs: release
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v') && vars.APT_REPO != ''
+    runs-on: ubuntu-latest
+    environment: release-downstream
+    permissions:
+      contents: read
+    env:
+      APT_SUITE: stable
+    steps:
+      - name: Checkout Shelbi
+        uses: actions/checkout@v4
+        with:
+          path: shelbi
+
+      - name: Install APT repository tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y apt-utils gnupg gzip ca-certificates
+
+      - name: Download release package
+        working-directory: shelbi
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p dist
+          gh release download "$GITHUB_REF_NAME" \
+            --pattern 'shelbi_*_amd64.deb' \
+            --dir dist
+          test "$(find dist -maxdepth 1 -name 'shelbi_*_amd64.deb' | wc -l)" -eq 1
+
+      - name: Checkout APT repository
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ vars.APT_REPO }}
+          token: ${{ secrets.APT_REPO_TOKEN }}
+          path: apt-repo
+
+      - name: Import APT signing key
+        env:
+          APT_GPG_PRIVATE_KEY: ${{ secrets.APT_GPG_PRIVATE_KEY }}
+        run: |
+          export GNUPGHOME="$RUNNER_TEMP/apt-gnupg"
+          install -d -m 0700 "$GNUPGHOME"
+          printf '%s\n' "$APT_GPG_PRIVATE_KEY" | gpg --batch --import
+          shelbi/scripts/release/export-apt-public-key.sh --output apt-repo
+          fingerprint=$(cat apt-repo/shelbi-archive-keyring.fingerprint)
+          echo "APT_GPG_KEY_ID=$fingerprint" >> "$GITHUB_ENV"
+          echo "GNUPGHOME=$GNUPGHOME" >> "$GITHUB_ENV"
+
+      - name: Build signed APT repository
+        env:
+          APT_GPG_PASSPHRASE: ${{ secrets.APT_GPG_PASSPHRASE }}
+        run: |
+          deb=$(find shelbi/dist -maxdepth 1 -name 'shelbi_*_amd64.deb' -print -quit)
+          shelbi/scripts/release/build-apt-repo.sh \
+            --repo-dir apt-repo \
+            --deb "$deb" \
+            --suite "$APT_SUITE"
+
+      - name: Assert required repository layout
+        run: |
+          test -d apt-repo/pool/main/s/shelbi
+          test -d apt-repo/dists/stable
+          test -f apt-repo/dists/stable/main/binary-amd64/Packages
+          test -f apt-repo/dists/stable/main/binary-amd64/Packages.gz
+          test -f apt-repo/dists/stable/Release
+          test -f apt-repo/dists/stable/InRelease
+          test -f apt-repo/dists/stable/Release.gpg
+          test -f apt-repo/shelbi-archive-keyring.gpg
+          test -f apt-repo/shelbi-archive-keyring.fingerprint
+
+      - name: Publish APT repository
+        working-directory: apt-repo
+        run: |
+          git config user.name "shelbi release automation"
+          git config user.email "release@shelbi.dev"
+          git add shelbi-archive-keyring.gpg shelbi-archive-keyring.fingerprint pool dists
+          git diff --cached --quiet && exit 0
+          git commit -m "Publish Shelbi ${GITHUB_REF_NAME} to APT"
+          git push
+
+  apt-verify-install:
+    name: Verify APT install
+    needs: apt-publish
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    env:
+      APT_BASE_URL: ${{ vars.APT_BASE_URL || 'https://apt.shelbi.dev' }}
+      APT_SUITE: stable
+    steps:
+      - name: Install Shelbi from hosted APT repository
+        run: |
+          sudo install -d -m 0755 /etc/apt/keyrings
+          curl -fsSL "$APT_BASE_URL/shelbi-archive-keyring.gpg" \
+            | sudo tee /etc/apt/keyrings/shelbi-archive-keyring.gpg >/dev/null
+          echo "deb [arch=amd64 signed-by=/etc/apt/keyrings/shelbi-archive-keyring.gpg] $APT_BASE_URL $APT_SUITE main" \
+            | sudo tee /etc/apt/sources.list.d/shelbi.list >/dev/null
+
+          for attempt in 1 2 3 4 5; do
+            if sudo apt-get update; then
+              break
+            fi
+            if [[ "$attempt" == 5 ]]; then
+              exit 1
+            fi
+            sleep 15
+          done
+
+          sudo apt-get install -y shelbi
+          shelbi --version
+
   downstream-publication:
     name: Prepare downstream publication
     needs:
       - release
       - homebrew-pr
+      - apt-publish
     if: always() && github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     environment: release-downstream
@@ -279,12 +394,17 @@ jobs:
       contents: read
     steps:
       - name: Downstream release state
+        env:
+          HOMEBREW_RESULT: ${{ needs.homebrew-pr.result }}
+          APT_RESULT: ${{ needs.apt-publish.result }}
         run: |
-          cat <<'EOF'
+          cat <<EOF
           GitHub Release artifacts, checksums, .deb package, and attestations are published.
 
-          Homebrew and APT publication are intentionally gated until the downstream
-          repositories and secrets documented in docs/release.md are provisioned:
-          - TAP_GITHUB_TOKEN for the dedicated Homebrew tap.
-          - APT_REPO_TOKEN, APT_GPG_PRIVATE_KEY, and APT_GPG_PASSPHRASE for the signed APT repo.
+          Downstream publication runs automatically once configured per docs/release.md:
+          - Homebrew tap PR (result: $HOMEBREW_RESULT) is gated on
+            vars.HOMEBREW_TAP_REPOSITORY and TAP_GITHUB_TOKEN.
+          - APT publish (result: $APT_RESULT) is gated on vars.APT_REPO (the shelbi-apt
+            hosting repository) plus APT_REPO_TOKEN, APT_GPG_PRIVATE_KEY, and
+            APT_GPG_PASSPHRASE.
           EOF

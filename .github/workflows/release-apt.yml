@@ -1,8 +1,10 @@
+# Manual backfill/re-publish path. Tag-driven releases publish to APT via the
+# apt-publish job in release.yml — a `release: published` trigger would never
+# fire there because events created with the workflow GITHUB_TOKEN do not
+# start new workflow runs.
 name: release-apt
 
 on:
-  release:
-    types: [published]
   workflow_dispatch:
     inputs:
       tag:
@@ -13,7 +15,7 @@ permissions:
   contents: read
 
 env:
-  APT_REPO: ${{ vars.APT_REPO || 'shelbi/apt' }}
+  APT_REPO: ${{ vars.APT_REPO || format('{0}/shelbi-apt', github.repository_owner) }}
   APT_BASE_URL: ${{ vars.APT_BASE_URL || 'https://apt.shelbi.dev' }}
   APT_SUITE: stable
 
@@ -23,7 +25,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: ${{ github.event.release.tag_name || inputs.tag }}
+          ref: ${{ inputs.tag }}
           fetch-depth: 0
 
       - name: Install Rust toolchain
@@ -33,7 +35,7 @@ jobs:
 
       - name: Validate release tag
         env:
-          GITHUB_REF_NAME: ${{ github.event.release.tag_name || inputs.tag }}
+          GITHUB_REF_NAME: ${{ inputs.tag }}
         run: scripts/release/check-version.sh
 
   publish:
@@ -46,7 +48,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: ${{ github.event.release.tag_name || inputs.tag }}
+          ref: ${{ inputs.tag }}
 
       - name: Install APT repository tools
         run: |
@@ -55,7 +57,7 @@ jobs:
 
       - name: Download release package
         env:
-          RELEASE_TAG: ${{ github.event.release.tag_name || inputs.tag }}
+          RELEASE_TAG: ${{ inputs.tag }}
         run: |
           mkdir -p dist
           gh release download "$RELEASE_TAG" \
@@ -108,7 +110,7 @@ jobs:
           git config user.email "release@shelbi.dev"
           git add shelbi-archive-keyring.gpg shelbi-archive-keyring.fingerprint pool dists
           git diff --cached --quiet && exit 0
-          git commit -m "Publish Shelbi ${GITHUB_REF_NAME:-${{ github.event.release.tag_name || inputs.tag }}} to APT"
+          git commit -m "Publish Shelbi ${{ inputs.tag }} to APT"
           git push
 
   verify-install:
