@@ -1,0 +1,30 @@
+name: tap-ci
+
+on:
+  pull_request:
+    paths:
+      - 'Formula/**'
+      - '.github/workflows/tap-ci.yml'
+  push:
+    branches: [main]
+    paths:
+      - 'Formula/**'
+      - '.github/workflows/tap-ci.yml'
+
+jobs:
+  test:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Update Homebrew
+        run: brew update
+
+      - name: Audit formula
+        run: brew audit --strict --online --formula Formula/shelbi.rb
+
+      - name: Install formula
+        run: brew install --formula Formula/shelbi.rb
+
+      - name: Test formula
+        run: brew test shelbi
