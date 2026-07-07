@@ -1,0 +1,137 @@
+name: release-apt
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Release tag to publish into the APT repository
+        required: true
+
+permissions:
+  contents: read
+
+env:
+  APT_REPO: ${{ vars.APT_REPO || 'shelbi/apt' }}
+  APT_BASE_URL: ${{ vars.APT_BASE_URL || 'https://apt.shelbi.dev' }}
+  APT_SUITE: stable
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.release.tag_name || inputs.tag }}
+          fetch-depth: 0
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Validate release tag
+        env:
+          GITHUB_REF_NAME: ${{ github.event.release.tag_name || inputs.tag }}
+        run: scripts/release/check-version.sh
+
+  publish:
+    needs: validate
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+      APT_GPG_PRIVATE_KEY: ${{ secrets.APT_GPG_PRIVATE_KEY }}
+      APT_GPG_PASSPHRASE: ${{ secrets.APT_GPG_PASSPHRASE }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.release.tag_name || inputs.tag }}
+
+      - name: Install APT repository tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y apt-utils gnupg gzip ca-certificates
+
+      - name: Download release package
+        env:
+          RELEASE_TAG: ${{ github.event.release.tag_name || inputs.tag }}
+        run: |
+          mkdir -p dist
+          gh release download "$RELEASE_TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            --pattern 'shelbi_*_amd64.deb' \
+            --dir dist
+          test "$(find dist -maxdepth 1 -name 'shelbi_*_amd64.deb' | wc -l)" -eq 1
+
+      - name: Checkout APT repository
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.APT_REPO }}
+          token: ${{ secrets.APT_REPO_TOKEN }}
+          path: apt-repo
+
+      - name: Import APT signing key
+        run: |
+          export GNUPGHOME="$RUNNER_TEMP/apt-gnupg"
+          install -d -m 0700 "$GNUPGHOME"
+          printf '%s\n' "$APT_GPG_PRIVATE_KEY" | gpg --batch --import
+          scripts/release/export-apt-public-key.sh --output apt-repo
+          fingerprint=$(cat apt-repo/shelbi-archive-keyring.fingerprint)
+          echo "APT_GPG_KEY_ID=$fingerprint" >> "$GITHUB_ENV"
+          echo "GNUPGHOME=$GNUPGHOME" >> "$GITHUB_ENV"
+
+      - name: Build signed APT repository
+        run: |
+          deb=$(find dist -maxdepth 1 -name 'shelbi_*_amd64.deb' -print -quit)
+          scripts/release/build-apt-repo.sh \
+            --repo-dir apt-repo \
+            --deb "$deb" \
+            --suite "$APT_SUITE"
+
+      - name: Assert required repository layout
+        run: |
+          test -d apt-repo/pool/main/s/shelbi
+          test -d apt-repo/dists/stable
+          test -f apt-repo/dists/stable/main/binary-amd64/Packages
+          test -f apt-repo/dists/stable/main/binary-amd64/Packages.gz
+          test -f apt-repo/dists/stable/Release
+          test -f apt-repo/dists/stable/InRelease
+          test -f apt-repo/dists/stable/Release.gpg
+          test -f apt-repo/shelbi-archive-keyring.gpg
+          test -f apt-repo/shelbi-archive-keyring.fingerprint
+
+      - name: Publish APT repository
+        working-directory: apt-repo
+        run: |
+          git config user.name "shelbi release automation"
+          git config user.email "release@shelbi.dev"
+          git add shelbi-archive-keyring.gpg shelbi-archive-keyring.fingerprint pool dists
+          git diff --cached --quiet && exit 0
+          git commit -m "Publish Shelbi ${GITHUB_REF_NAME:-${{ github.event.release.tag_name || inputs.tag }}} to APT"
+          git push
+
+  verify-install:
+    needs: publish
+    runs-on: ubuntu-latest
+    steps:
+      - name: Install Shelbi from hosted APT repository
+        run: |
+          sudo install -d -m 0755 /etc/apt/keyrings
+          curl -fsSL "$APT_BASE_URL/shelbi-archive-keyring.gpg" \
+            | sudo tee /etc/apt/keyrings/shelbi-archive-keyring.gpg >/dev/null
+          echo "deb [arch=amd64 signed-by=/etc/apt/keyrings/shelbi-archive-keyring.gpg] $APT_BASE_URL $APT_SUITE main" \
+            | sudo tee /etc/apt/sources.list.d/shelbi.list >/dev/null
+
+          for attempt in 1 2 3 4 5; do
+            if sudo apt-get update; then
+              break
+            fi
+            if [[ "$attempt" == 5 ]]; then
+              exit 1
+            fi
+            sleep 15
+          done
+
+          sudo apt-get install -y shelbi
+          shelbi --version
