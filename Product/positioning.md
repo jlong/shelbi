@@ -20,8 +20,6 @@ If you're using sub-agents with Claude (most people are even if they don't reali
 \
 Where Shelbi shines  is in giving the agents discrete chunks of work. Task-level turns out to be an extremely helpful resolution for worker agents. By breaking large plans down into tasks, and creating one off tasks for smaller work, Shelbi can balance large and small things well leading to greater personal productivity.
 
-<br />
-
 As far as review, yes using Shelbi you might have more code to review, but if you work on the systems a bit you can probably worry less about the code and trust the agents to do their jobs.\
 \
 What I mean is Shelbi provides some of the primitives you need to support workflows that produce extremely high quality code. For example, you can create specialized agents to do specific tasks like Adversarial Code review, QA, and Security. Each agent can govern a column on the board so that every task benefits from the same scrutiny. The net effect is that work can be delivered at a higher quality bar, not lower. The key is building that bar into the system.
