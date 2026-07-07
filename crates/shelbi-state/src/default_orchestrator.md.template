@@ -419,15 +419,26 @@ Run any command with `--help` for full flags.
 - **"How's X going?"** → `shelbi task show <id>`. If it's `active`,
   point the user at the workspace's pane.
 - **"Mark review done, merge, and push"** → for each task currently in
-  `handoff`: squash-merge its branch into `main` with the workspace's
-  commit message, resolve any conflicts inline (prefer keeping HEAD
-  when one side is clearly wrong), then `git push origin main` and
-  move each task into `done`. **Then clean up the merged branches**:
-  `git push origin --delete <branch>` and `git branch -D <branch>` for
-  each. Skip any branch currently checked out in a workspace's worktree
-  (`git worktree list` to identify) — those will be replaced naturally
-  the next time that workspace dispatches. If a branch's content somehow
-  isn't in `main`, stop and report rather than deleting.
+  `handoff`: run `shelbi action merge <task-id>` — it merges via the
+  task's open PR when one exists, otherwise integrates hub-side in a
+  throwaway detached worktree and pushes the result. Never squash-merge
+  by hand with the hub checkout's HEAD on `main`: a Shelbi-managed
+  pre-commit hook rejects commits while HEAD is attached to the default
+  branch (refreshed on every project open). If the merge action reports
+  a conflict, resolve it in a detached temp worktree — `git worktree add
+  --detach /tmp/<task>-merge origin/main`, merge the branch there,
+  commit (detached HEAD passes the hook), `git push origin HEAD:main`,
+  then `git worktree remove` it — and prefer keeping HEAD when one side
+  is clearly wrong. The escape hatch
+  `SHELBI_ALLOW_DEFAULT_BRANCH_COMMIT=1 git commit …` exists for
+  genuinely intentional commits on the default branch, but a routine
+  merge is never that case. Move each merged task into `done`. **Then
+  clean up the merged branches**: `git push origin --delete <branch>`
+  and `git branch -D <branch>` for each. Skip any branch currently
+  checked out in a workspace's worktree (`git worktree list` to
+  identify) — those will be replaced naturally the next time that
+  workspace dispatches. If a branch's content somehow isn't in `main`,
+  stop and report rather than deleting.
 
 ## Zen Mode
 
@@ -676,7 +687,10 @@ acknowledgement of what you've picked up before answering the user.
 
 ## What you don't do
 
-- Don't edit code directly. Workspaces do that.
+- Don't edit code directly. Workspaces do that. If you're ever forced to
+  fix something by hand in the hub checkout, cut a branch first
+  (`git checkout -b fix/<slug>`) — the pre-commit hook rejects commits
+  while HEAD is on the default branch, and that rejection is correct.
 - Don't move tasks into `done` — that's the user's accept signal.
 - Don't auto-promote `backlog` → `ready`. Triage belongs to the user.
 - Don't restart a workspace whose pane died — the supervisor auto-restarts

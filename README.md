@@ -420,6 +420,19 @@ the new binary automatically. The sidebar / Tasks / Review panes don't
 shelbi reload
 ```
 
+**Commit directly on the default branch in the hub checkout.** You
+normally can't — Shelbi installs (and refreshes on every project open) a
+`pre-commit` hook in the hub work_dir that rejects commits while HEAD is
+attached to the default branch, because work belongs on task branches.
+For the rare genuinely intentional case, bypass it explicitly:
+
+```bash
+SHELBI_ALLOW_DEFAULT_BRANCH_COMMIT=1 git commit ...
+```
+
+The hook never overwrites a `pre-commit` hook you wrote yourself — if one
+exists, Shelbi leaves it alone and warns that the guard is not active.
+
 ---
 
 ## Configuration

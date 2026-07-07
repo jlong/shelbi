@@ -770,6 +770,24 @@ pub fn start_workspace_on_task(spec: StartSpec<'_>) -> Result<TmuxAddr> {
         return Err(e);
     }
 
+    // 1b. Branch-discipline check (bug-worker-commit-landed-on-hub-main-
+    //     checkout): the launch cwd's HEAD must be attached to the task
+    //     branch before any agent starts. `sync_worktree` is supposed to
+    //     guarantee this, so a mismatch means something raced or healed
+    //     wrong — abort the dispatch rather than launch an agent whose
+    //     commits would land on the wrong ref.
+    if let Err(e) = verify_worktree_on_branch(&host, &worktree, spec.branch) {
+        if let Err(log_err) = shelbi_state::append_dispatch_event(
+            spec.task_id,
+            &spec.workspace.name,
+            "branch-mismatch",
+            &e.to_string(),
+        ) {
+            eprintln!("shelbi: failed to record dispatch branch mismatch in events.log: {log_err}");
+        }
+        return Err(e);
+    }
+
     // The worktree is now clean and ready, but the old pane is still intact.
     // Validate the runner here so a missing `codex`/`claude` binary is an
     // actionable dispatch error rather than a pane that starts and exits
@@ -2906,6 +2924,35 @@ fn sync_worktree(
             status: out.status.to_string(),
             stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
         });
+    }
+    Ok(())
+}
+
+/// Assert the worktree's HEAD is attached to `branch` — the dispatch
+/// path's branch-discipline check
+/// (bug-worker-commit-landed-on-hub-main-checkout). Runs after
+/// [`sync_worktree`], which should already guarantee it, so any failure
+/// here means the sync raced another actor or healed into the wrong
+/// state; the caller aborts the dispatch before an agent can commit on
+/// the wrong ref. A detached HEAD reports as `HEAD` and fails the check
+/// too — an agent must never start detached.
+pub(crate) fn verify_worktree_on_branch(
+    host: &Host,
+    worktree: &std::path::Path,
+    branch: &str,
+) -> Result<()> {
+    let wt_str = worktree.to_string_lossy().into_owned();
+    let head = shelbi_ssh::run_capture(
+        host,
+        ["git", "-C", &wt_str, "rev-parse", "--abbrev-ref", "HEAD"],
+    )?;
+    let head = head.trim();
+    if head != branch {
+        return Err(Error::Other(format!(
+            "refusing to dispatch: worktree at {wt_str} has HEAD on `{head}` \
+             but the task expects branch `{branch}` — re-run `shelbi task \
+             start` after checking the worktree, or fix the checkout manually",
+        )));
     }
     Ok(())
 }
@@ -5767,6 +5814,43 @@ mod sync_worktree_git_tests {
             "shelbi/review-me",
             "worktree must be checked out on the task branch"
         );
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    /// Dispatch branch-discipline check
+    /// (bug-worker-commit-landed-on-hub-main-checkout): after sync, the
+    /// launch cwd's HEAD must be attached to the task branch. A worktree
+    /// on the wrong branch — or detached — fails; the matching branch
+    /// passes.
+    #[test]
+    fn verify_worktree_on_branch_rejects_mismatch_and_detached_head() {
+        if !git_available() {
+            eprintln!("skipping: git not on PATH");
+            return;
+        }
+        let repo = init_repo("verify-branch");
+        let project = project_at(&repo);
+        let machine = project.machines[0].clone();
+        let wt = workspace_worktree(&machine, &project.workspaces[0]);
+        sync_worktree(&project, &Host::Local, &machine, &wt, "shelbi/right", "main").unwrap();
+
+        // On the expected branch → passes.
+        verify_worktree_on_branch(&Host::Local, &wt, "shelbi/right").unwrap();
+
+        // Expecting a different branch → clear, dispatch-aborting error.
+        let err = verify_worktree_on_branch(&Host::Local, &wt, "shelbi/other")
+            .expect_err("mismatched branch must be rejected");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("shelbi/right") && msg.contains("shelbi/other"),
+            "error must name both branches: {msg}"
+        );
+
+        // Detached HEAD → rejected too; an agent must never start detached.
+        assert!(run_git_in(&wt, &["checkout", "--detach"]).status.success());
+        verify_worktree_on_branch(&Host::Local, &wt, "shelbi/right")
+            .expect_err("detached HEAD must be rejected");
+
         let _ = std::fs::remove_dir_all(&repo);
     }
 
