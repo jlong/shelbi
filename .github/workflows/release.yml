@@ -80,15 +80,13 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          # Linux only: macOS runners (especially the Intel macos-13 pool)
+          # queue for tens of minutes and shouldn't gate releases. The
+          # shipped darwin binaries are cross-compiled in the publish job;
+          # real-hardware verification happens on the maintainer's mac.
           - target: x86_64-unknown-linux-gnu
             os: ubuntu-latest
             binary: target/x86_64-unknown-linux-gnu/release/shelbi
-          - target: aarch64-apple-darwin
-            os: macos-14
-            binary: target/aarch64-apple-darwin/release/shelbi
-          - target: x86_64-apple-darwin
-            os: macos-13
-            binary: target/x86_64-apple-darwin/release/shelbi
     runs-on: ${{ matrix.os }}
     permissions:
       contents: read
