@@ -614,9 +614,11 @@ mod tests {
                 "display-message",
                 "-p",
                 "-t",
-                // Exact-match `=` target (tmux sweep F3) passes through the
-                // escaper unquoted — `=`, `:`, `-` are all in the safe set.
-                "=shelbi-w-fix-login:agent",
+                // Exact-match `=` target (tmux sweep F3) must arrive quoted:
+                // zsh's default EQUALS option expands an unquoted leading
+                // `=word` as `=command` filename expansion and kills the
+                // whole remote command line.
+                "'=shelbi-w-fix-login:agent'",
                 // Single-quoted on the wire so the remote shell doesn't eat
                 // `#{pane_title}` as a comment (F1). Without the quotes tmux
                 // never receives the format string and returns its default
@@ -753,7 +755,7 @@ mod tests {
                 "-p",
                 "-J",
                 "-t",
-                "=shelbi-w-fix-login:agent",
+                "'=shelbi-w-fix-login:agent'",
             ]
         );
     }
