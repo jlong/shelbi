@@ -28,13 +28,21 @@ pub fn launch_command(spec: &AgentRunnerSpec) -> String {
 
 /// Whether `command` launches Claude Code. Keyed off the path basename so a
 /// runner declared as `/usr/local/bin/claude` classifies the same as a bare
-/// `claude`. The one runtime shelbi knows to have a hook surface is claude;
-/// every other runner is treated as a non-claude (polling) runner.
+/// `claude`.
 pub fn is_claude_runner(command: &str) -> bool {
     std::path::Path::new(command)
         .file_name()
         .and_then(|s| s.to_str())
         == Some("claude")
+}
+
+/// Whether `command` launches Codex. Keyed off the path basename so a runner
+/// declared as `/opt/homebrew/bin/codex` classifies the same as a bare `codex`.
+pub fn is_codex_runner(command: &str) -> bool {
+    std::path::Path::new(command)
+        .file_name()
+        .and_then(|s| s.to_str())
+        == Some("codex")
 }
 
 /// Return a copy of `spec` with `--permission-mode <mode>` appended when the
@@ -96,15 +104,54 @@ pub fn with_continue(spec: &AgentRunnerSpec, resume: bool) -> AgentRunnerSpec {
     out
 }
 
+/// Return a copy of `spec` with Codex's hook config path wired to Shelbi's
+/// per-worktree adapter. The installed Codex CLI exposes hooks through
+/// `-c core.hooksPath=<path>` and requires either persisted hook trust or the
+/// explicit automation flag `--dangerously-bypass-hook-trust`. Shelbi deploys
+/// the hook config and scripts under `.shelbi/hooks/`, so this helper only
+/// touches Codex launch flags and leaves user-owned `.codex/` config alone.
+///
+/// Idempotent: user-authored runner flags that already set `core.hooksPath`
+/// or hook-trust behavior win. That keeps explicit project YAML in control and
+/// avoids duplicate flags in the pane command.
+pub fn with_codex_hooks(spec: &AgentRunnerSpec, hooks_path: &str) -> AgentRunnerSpec {
+    if !is_codex_runner(&spec.command) {
+        return spec.clone();
+    }
+
+    let mut out = spec.clone();
+    let has_hooks_path = out.flags.windows(2).any(|w| {
+        matches!(w, [flag, value] if (flag == "-c" || flag == "--config") && value.starts_with("core.hooksPath="))
+    }) || out
+        .flags
+        .iter()
+        .any(|f| f.starts_with("-c core.hooksPath=") || f.starts_with("--config core.hooksPath="));
+    if !has_hooks_path {
+        out.flags.push("-c".into());
+        out.flags.push(format!("core.hooksPath={hooks_path}"));
+    }
+
+    if !out
+        .flags
+        .iter()
+        .any(|f| f == "--dangerously-bypass-hook-trust")
+    {
+        out.flags.push("--dangerously-bypass-hook-trust".into());
+    }
+
+    out
+}
+
 /// Does this runner pull hub→workspace messages by polling the log itself?
 ///
-/// Claude Code receives messages through its hook surface (a PostToolUse /
-/// Stop hook the hub drives — Phase 7), so it never needs to poll. Every
-/// other runner (codex, aider, …) has no such surface, so the workspace
-/// prompt must instruct it to tail `.shelbi/messages/<task-id>.log` on a
-/// concrete cadence and ack each line itself (Phase 8).
+/// Claude and Codex receive messages through runner hooks Shelbi deploys under
+/// `.shelbi/hooks/`, so they do not need prompt-level polling. Every other
+/// runner (aider, custom CLIs, …) has no supported hook surface Shelbi knows
+/// how to wire, so the workspace prompt must instruct it to tail
+/// `.shelbi/messages/<task-id>.log` on a concrete cadence and ack each line
+/// itself.
 pub fn polls_for_messages(spec: &AgentRunnerSpec) -> bool {
-    !is_claude_runner(&spec.command)
+    !(is_claude_runner(&spec.command) || is_codex_runner(&spec.command))
 }
 
 #[cfg(test)]
@@ -273,14 +320,68 @@ mod tests {
     }
 
     #[test]
-    fn codex_and_other_runners_poll_for_messages() {
-        assert!(polls_for_messages(&runner("codex")));
-        assert!(polls_for_messages(&runner("/opt/bin/codex")));
+    fn codex_does_not_poll_for_messages_when_hooks_are_wired() {
+        assert!(!polls_for_messages(&runner("codex")));
+        assert!(!polls_for_messages(&runner("/opt/bin/codex")));
+    }
+
+    #[test]
+    fn unknown_runners_poll_for_messages() {
         assert!(polls_for_messages(&runner("aider")));
         // No `.exe` special-casing: a Windows-style basename isn't "claude",
         // so it classifies as a polling runner — consistent with how
         // `with_permission_mode` keys off the exact basename.
         assert!(polls_for_messages(&runner("claude.exe")));
+    }
+
+    #[test]
+    fn with_codex_hooks_adds_hooks_path_and_trust_bypass() {
+        let out = with_codex_hooks(&runner("codex"), ".shelbi/hooks/codex.toml");
+        assert_eq!(
+            out.flags,
+            vec![
+                "-c",
+                "core.hooksPath=.shelbi/hooks/codex.toml",
+                "--dangerously-bypass-hook-trust",
+            ],
+        );
+        assert_eq!(
+            launch_command(&out),
+            "codex -c core.hooksPath=.shelbi/hooks/codex.toml --dangerously-bypass-hook-trust",
+        );
+    }
+
+    #[test]
+    fn with_codex_hooks_recognizes_absolute_codex_paths() {
+        let out = with_codex_hooks(
+            &runner("/opt/homebrew/bin/codex"),
+            ".shelbi/hooks/codex.toml",
+        );
+        assert_eq!(out.flags[0], "-c");
+        assert_eq!(out.flags[1], "core.hooksPath=.shelbi/hooks/codex.toml");
+    }
+
+    #[test]
+    fn with_codex_hooks_preserves_user_hooks_path_and_trust_flag() {
+        let spec = AgentRunnerSpec {
+            command: "codex".into(),
+            flags: vec![
+                "-c".into(),
+                "core.hooksPath=.custom/hooks.toml".into(),
+                "--dangerously-bypass-hook-trust".into(),
+            ],
+            prompt_injection: None,
+            dialog_signatures: vec![],
+        };
+        let out = with_codex_hooks(&spec, ".shelbi/hooks/codex.toml");
+        assert_eq!(
+            out.flags,
+            vec![
+                "-c",
+                "core.hooksPath=.custom/hooks.toml",
+                "--dangerously-bypass-hook-trust",
+            ],
+        );
     }
 
     #[test]

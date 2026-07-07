@@ -1873,9 +1873,9 @@ mod tests {
 
     /// `shelbi init` happy path for per-role settings.json: both default
     /// Claude-Code agents land with their `settings.json` containing the
-    /// SessionStart + Stop message-tail hook scripts. This is the file
-    /// the deploy path prefers over the project-wide workspace-settings
-    /// template on each task dispatch (Phase 7).
+    /// SessionStart + Stop hook adapters. This is the file the deploy path
+    /// prefers over the project-wide workspace-settings template on each task
+    /// dispatch (Phase 7).
     #[test]
     fn materialize_writes_per_role_settings_json_with_message_hooks() {
         let _g = LOCK.lock().unwrap_or_else(|p| p.into_inner());
@@ -1889,16 +1889,16 @@ mod tests {
             let body = fs::read_to_string(&settings).unwrap();
             assert!(body.contains("SessionStart"), "{name} missing SessionStart");
             assert!(
-                body.contains(".shelbi/messages/$TASK_ID.tail.d"),
-                "{name} missing tail-lock script"
+                body.contains(".shelbi/hooks/claude.session-start"),
+                "{name} missing SessionStart hook adapter"
             );
             assert!(
-                body.contains("UNREAD=.shelbi/messages/$TASK_ID.unread.log"),
-                "{name} missing Stop message-inject script"
+                body.contains(".shelbi/hooks/claude.stop"),
+                "{name} missing Stop message-inject hook adapter"
             );
             assert!(
-                body.contains("message-ack"),
-                "{name} missing message-ack write"
+                !body.contains(".shelbi/messages/$TASK_ID.tail.d"),
+                "{name} should not inline Shelbi hook bodies"
             );
         }
 
