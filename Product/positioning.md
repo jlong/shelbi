@@ -12,7 +12,7 @@ My core motivation with the project was that I was getting tired of managing sep
 
 <br />
 
-<br />
+## How I work
 
 My main method is to first create a markdown plan for a feature. Then when I'm satisfied with the plan I ask the Orchestrator to break it into tasks and distribute them to the worker agents.\
 \
