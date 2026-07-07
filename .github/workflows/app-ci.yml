@@ -7,15 +7,29 @@ on:
       - 'Cargo.toml'
       - 'Cargo.lock'
       - 'crates/**'
+      - '.goreleaser.yaml'
       - '.github/workflows/app-ci.yml'
   pull_request:
     paths:
       - 'Cargo.toml'
       - 'Cargo.lock'
       - 'crates/**'
+      - '.goreleaser.yaml'
       - '.github/workflows/app-ci.yml'
 
 jobs:
+  goreleaser-check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check GoReleaser config
+        uses: goreleaser/goreleaser-action@v6
+        with:
+          distribution: goreleaser
+          version: latest
+          args: check
+
   build:
     runs-on: ubuntu-latest
     env:

@@ -1,0 +1,48 @@
+version: 2
+
+project_name: shelbi
+
+builds:
+  - id: shelbi
+    builder: rust
+    binary: shelbi
+    tool: cargo
+    command: zigbuild
+    targets:
+      - aarch64-apple-darwin
+      - x86_64-unknown-linux-gnu
+    flags:
+      - --release
+      - --locked
+      - -p=shelbi
+
+archives:
+  - id: shelbi
+    ids:
+      - shelbi
+    formats:
+      - tar.gz
+    name_template: >-
+      shelbi_
+      {{- if eq .Os "darwin" -}}Darwin{{- else if eq .Os "linux" -}}Linux{{- else -}}{{ .Os }}{{- end -}}
+      _
+      {{- if eq .Arch "amd64" -}}x86_64{{- else -}}{{ .Arch }}{{- end -}}
+    wrap_in_directory: false
+    files:
+      - LICENSE
+      - README.md
+
+checksum:
+  name_template: checksums.txt
+  algorithm: sha256
+
+snapshot:
+  version_template: "{{ incpatch .Version }}-next"
+
+release:
+  github:
+    owner: jlong
+    name: shelbi
+
+# Deferred until CI runner support or validated cross-compilation is in place:
+# - x86_64-apple-darwin, which would produce shelbi_Darwin_x86_64.tar.gz.
