@@ -66,17 +66,10 @@ const SSH_CONTROL_OPTS_STATIC: &[&str] = &[
     "LogLevel=ERROR",
 ];
 
-/// The full set of `-o` options + the `-R` reverse forward for a
-/// shelbi-routed `ssh` invocation. Built fresh per call so a SHELBI_HOME
-/// or SHELBI_HUB_SOCK override picked up at process start lands in the
-/// args without baking it into a const.
-///
-/// The reverse forward exposes the hub daemon's `~/.shelbi/hub.sock` to
-/// the remote side as `/tmp/shelbi-hub-<uid>.sock` (overridable via
-/// `SHELBI_REMOTE_HUB_SOCK`). Remote workers — Phase 5 — write to that
-/// path and the messages land in hub's events.log without an extra
-/// outbound channel.
-fn build_ssh_control_opts() -> Vec<String> {
+/// The static control options plus the per-invocation `ControlPath`, but
+/// *without* the `-R` reverse forward — the forward spec is mode-dependent
+/// (Unix vs TCP loopback) and layered on by the callers below.
+fn base_control_opts() -> Vec<String> {
     let mut opts: Vec<String> = SSH_CONTROL_OPTS_STATIC
         .iter()
         .map(|s| (*s).to_string())
@@ -99,21 +92,46 @@ fn build_ssh_control_opts() -> Vec<String> {
         .unwrap_or_else(|_| "~/.shelbi/ssh/%C".to_string());
     opts.push("-o".into());
     opts.push(format!("ControlPath={cp}"));
-    // Reverse forward: <remote>:<local>. Fall back to the in-spec
-    // default pair on resolution failure so the connection still works
-    // — the master just won't carry the forward this round.
-    let rev = shelbi_state::reverse_forward_spec()
-        .map(|os| os.to_string_lossy().into_owned())
-        .ok();
-    if let Some(spec) = rev {
+    opts
+}
+
+/// The `-R` reverse-forward spec to install for `hostname`, honoring the
+/// persisted forward decision: a host that fell back to (or was pinned to)
+/// TCP loopback gets `127.0.0.1:<port>:<hub.sock>`; everyone else gets the
+/// default Unix-socket forward. `None` only when spec resolution itself fails
+/// (no `$HOME`, etc.), in which case the master just won't carry the forward
+/// this round.
+fn forward_spec_for_host(hostname: &str) -> Option<String> {
+    let spec = match shelbi_state::load_host_forward(hostname) {
+        Some(shelbi_state::HostForward {
+            mode: shelbi_core::ForwardMode::Tcp,
+            port: Some(port),
+        }) => shelbi_state::reverse_forward_spec_tcp(port),
+        _ => shelbi_state::reverse_forward_spec(),
+    };
+    spec.map(|os| os.to_string_lossy().into_owned()).ok()
+}
+
+/// The full control options + the mode-aware `-R` reverse forward for a
+/// shelbi-routed `ssh` invocation to `hostname`. Built fresh per call so a
+/// `SHELBI_HOME`/`SHELBI_HUB_SOCK` override — or a forward-mode decision the
+/// hub persisted after a TCP fallback — lands in the args without baking it
+/// into a const.
+///
+/// The reverse forward exposes the hub daemon's `~/.shelbi/hub.sock` to the
+/// remote side so remote workers can write to hub's events.log without an extra
+/// outbound channel.
+fn build_ssh_control_opts(hostname: &str) -> Vec<String> {
+    let mut opts = base_control_opts();
+    if let Some(spec) = forward_spec_for_host(hostname) {
         opts.push("-R".into());
         opts.push(spec);
     }
     opts
 }
 
-fn apply_ssh_control_opts(cmd: &mut Command) {
-    for opt in build_ssh_control_opts() {
+fn apply_ssh_control_opts(cmd: &mut Command, hostname: &str) {
+    for opt in build_ssh_control_opts(hostname) {
         cmd.arg(opt);
     }
 }
@@ -168,7 +186,7 @@ where
         }
         Host::Ssh { host } => {
             let mut cmd = Command::new("ssh");
-            apply_ssh_control_opts(&mut cmd);
+            apply_ssh_control_opts(&mut cmd, host);
             cmd.arg(host);
             cmd.arg("--");
             for a in &argv {
@@ -206,7 +224,7 @@ where
         }
         Host::Ssh { host } => {
             let mut cmd = Command::new("ssh");
-            apply_ssh_control_opts(&mut cmd);
+            apply_ssh_control_opts(&mut cmd, host);
             cmd.arg("-t");
             cmd.arg(host);
             cmd.arg("--");
@@ -355,7 +373,7 @@ fn drop_master(hostname: &str) {
 /// an already-healthy listener for only the lifetime of that slave.
 fn open_master_with_stream_local_unlink(hostname: &str) -> std::io::Result<Output> {
     let mut cmd = Command::new("ssh");
-    for o in build_ssh_control_opts() {
+    for o in build_ssh_control_opts(hostname) {
         cmd.arg(o);
     }
     cmd.arg("-o")
@@ -367,6 +385,45 @@ fn open_master_with_stream_local_unlink(hostname: &str) -> std::io::Result<Outpu
     cmd.output()
 }
 
+/// Open a fresh ControlMaster carrying a **TCP loopback** reverse forward
+/// (`-R 127.0.0.1:<port>:<hub.sock>`) instead of the Unix-socket forward.
+///
+/// `ExitOnForwardFailure=yes` is the linchpin of port-collision handling: if
+/// the remote can't bind `127.0.0.1:<port>` (already in use), ssh exits
+/// nonzero and no master persists, so the caller sweeps to the next candidate
+/// port. It's set *before* the static opts so its value wins over the
+/// `ExitOnForwardFailure=no` we hand the normal (multiplexed-slave) path —
+/// OpenSSH honors the first value seen for each option.
+fn open_master_tcp(hostname: &str, port: u16) -> std::io::Result<Output> {
+    let spec = match shelbi_state::reverse_forward_spec_tcp(port) {
+        Ok(s) => s.to_string_lossy().into_owned(),
+        Err(e) => {
+            return Err(std::io::Error::other(e.to_string()));
+        }
+    };
+    let mut cmd = Command::new("ssh");
+    for a in build_tcp_master_args(hostname, &spec) {
+        cmd.arg(a);
+    }
+    tracing::debug!(?cmd, host = %hostname, port, "ssh::open_master_tcp");
+    cmd.output()
+}
+
+/// Assemble the argv (after the `ssh` program) for a TCP-loopback master open:
+/// `ExitOnForwardFailure=yes` first so it wins over the static `=no`, then the
+/// base control opts, then the TCP `-R` spec, then `<host> -- true`. Split out
+/// so the arg shape is unit-testable without shelling out.
+fn build_tcp_master_args(hostname: &str, spec: &str) -> Vec<String> {
+    let mut args = vec!["-o".to_string(), "ExitOnForwardFailure=yes".to_string()];
+    args.extend(base_control_opts());
+    args.push("-R".to_string());
+    args.push(spec.to_string());
+    args.push(hostname.to_string());
+    args.push("--".to_string());
+    args.push("true".to_string());
+    args
+}
+
 /// Does the reverse-forward landing socket exist on the remote? `test -S`
 /// is true only for an existing socket node. Routed through the no-forward
 /// maintenance path so the probe observes the socket without creating it.
@@ -375,6 +432,306 @@ fn remote_socket_present(host: &Host, remote_sock: &str) -> bool {
         Host::Local => false,
         Host::Ssh { host } => {
             matches!(run_without_reverse_forward(host, ["test", "-S", remote_sock]), Ok(o) if o.status.success())
+        }
+    }
+}
+
+/// Is the landing socket *usable* by the login user — i.e. writable, so a
+/// worker on the remote could actually `connect()` to it? This is the check
+/// that distinguishes a healthy forward from the Tailscale-SSH wedge: there
+/// tailscaled binds the socket `srw------- root root`, so `test -w` fails for
+/// the login user even though `test -S` (a bare stat) still passes.
+fn remote_socket_writable(host: &Host, remote_sock: &str) -> bool {
+    match host {
+        Host::Local => false,
+        Host::Ssh { host } => {
+            matches!(run_without_reverse_forward(host, ["test", "-w", remote_sock]), Ok(o) if o.status.success())
+        }
+    }
+}
+
+/// Did the `rm -f` cleanup fail with `EPERM` ("Operation not permitted")? That
+/// is the fingerprint of the Tailscale-SSH wedge: a root-owned landing socket
+/// in sticky `/tmp` that the login user cannot unlink.
+fn cleanup_hit_eperm(cleanup: &std::io::Result<Output>) -> bool {
+    matches!(cleanup, Ok(o) if !o.status.success()
+        && String::from_utf8_lossy(&o.stderr).contains("Operation not permitted"))
+}
+
+/// Paths for which a cleanup-EPERM event has already been logged, so repeated
+/// health checks against the same wedged socket log once — not once per retry
+/// (Acceptance: "Repeated cleanup EPERM on the same path logs a single event").
+fn eperm_logged() -> &'static std::sync::Mutex<std::collections::HashSet<String>> {
+    static LOGGED: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<String>>> =
+        std::sync::OnceLock::new();
+    LOGGED.get_or_init(|| std::sync::Mutex::new(std::collections::HashSet::new()))
+}
+
+/// Log a cleanup-EPERM event at most once per socket path.
+fn log_eperm_once(hostname: &str, remote_sock: &str) {
+    let mut set = eperm_logged()
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    if set.insert(remote_sock.to_string()) {
+        let _ = shelbi_state::emit_event_body(&format!(
+            "ssh reverse-forward host={hostname} remote_sock={remote_sock} \
+             detail=stale_socket_cleanup_failed cleanup_stderr=Operation not permitted"
+        ));
+    }
+}
+
+/// Outcome of the Unix-socket forward attempt, so the caller can tell a
+/// transient network failure (don't fall back) from the Tailscale-SSH wedge
+/// (do fall back to TCP loopback when allowed).
+enum UnixForwardOutcome {
+    /// Forward is bound and the landing socket is usable.
+    Ok,
+    /// The master never opened — unreachable host, refused auth, connect
+    /// timeout. NOT the wedge; surface it, do not fall back to TCP
+    /// (`master_open_failed` with a connect timeout must not misfire).
+    MasterOpenFailed,
+    /// The master opened (network fine) but the landing socket is unusable —
+    /// the root-owned-socket wedge. `detail` describes the exact shape.
+    Wedged { detail: &'static str },
+}
+
+/// The Unix-socket reverse-forward repair path (the original behavior),
+/// refactored to classify its result so [`ensure_reverse_forward`] can decide
+/// whether to fall back to TCP.
+fn ensure_unix_forward(host: &Host, hostname: &str, remote_sock: &str) -> UnixForwardOutcome {
+    // Repair. Drop any existing master first: it may be a master whose
+    // forward never bound (stale socket collided with the `-R`), and
+    // `ControlMaster=auto` would otherwise reuse it and skip the rebind.
+    drop_master(hostname);
+    // Remove the stale landing socket. We only reach here when no live
+    // master owns the forward, so any leftover socket file is a leak from a
+    // dead master — safe to unlink. The cleanup command deliberately bypasses
+    // shelbi's ControlMaster/`-R` wrapper; otherwise an absent socket can be
+    // recreated by SSH and then immediately removed by this `rm`.
+    let cleanup = run_without_reverse_forward(hostname, ["rm", "-f", remote_sock]);
+    drop_master(hostname);
+
+    // A cleanup EPERM is the smoking gun of the wedge — a root-owned socket the
+    // login user can't unlink. Log it once per path (not per retry) regardless
+    // of what the reopen below does.
+    if cleanup_hit_eperm(&cleanup) {
+        log_eperm_once(hostname, remote_sock);
+    }
+
+    // Reopen the master, rebinding `-R` against the now-clean path. `true`
+    // is the cheapest remote command; the master opens (and ControlPersist
+    // keeps it) as a side effect.
+    let opened = match open_master_with_stream_local_unlink(hostname) {
+        Ok(o) => o,
+        // Failure to even spawn ssh is treated as a master-open failure — a
+        // local/transient problem, not the wedge.
+        Err(_) => return UnixForwardOutcome::MasterOpenFailed,
+    };
+
+    if !opened.status.success() {
+        return UnixForwardOutcome::MasterOpenFailed;
+    }
+
+    // Master opened → network/auth are fine. If the landing socket is now
+    // usable, we're done. Otherwise this is the wedge.
+    let present = remote_socket_present(host, remote_sock);
+    if present && remote_socket_writable(host, remote_sock) {
+        return UnixForwardOutcome::Ok;
+    }
+    if cleanup_hit_eperm(&cleanup) {
+        UnixForwardOutcome::Wedged {
+            detail: "stale_socket_cleanup_failed",
+        }
+    } else if present {
+        // Present but not writable — bound root-owned (Tailscale SSH).
+        UnixForwardOutcome::Wedged {
+            detail: "landing_socket_unwritable",
+        }
+    } else {
+        // Master opened but no socket landed — a stricter server refused the
+        // StreamLocalBind, or it was removed out from under us. TCP loopback
+        // sidesteps the Unix-bind path entirely.
+        UnixForwardOutcome::Wedged {
+            detail: "landing_socket_missing",
+        }
+    }
+}
+
+/// Candidate loopback ports to try, starting from `start` (the port a previous
+/// forward bound, if any) and sweeping the configured band on a collision.
+fn tcp_candidate_ports(start: u16) -> Vec<u16> {
+    let base = shelbi_state::TCP_FORWARD_PORT_BASE;
+    let span = shelbi_state::TCP_FORWARD_PORT_SPAN;
+    // Normalize `start` into the band so a stale/out-of-range persisted port
+    // can't push us outside it.
+    let first = if start >= base && start < base + span {
+        start
+    } else {
+        base
+    };
+    let mut ports = Vec::with_capacity(span as usize);
+    ports.push(first);
+    for i in 0..span {
+        let p = base + i;
+        if p != first {
+            ports.push(p);
+        }
+    }
+    ports
+}
+
+/// Establish (or re-establish) a TCP loopback reverse forward for `hostname`.
+///
+/// A no-forward connectivity probe runs first: if the host is unreachable we
+/// surface that immediately instead of hammering every candidate port — and,
+/// critically, once the probe succeeds we *know* any subsequent master-open
+/// failure is a port-bind collision (not a network fault), so sweeping ports
+/// is safe and can't misfire on a transient timeout.
+fn ensure_tcp_forward(hostname: &str) -> shelbi_core::Result<u16> {
+    // Connectivity gate. `ControlMaster=no` one-shot, no forward — purely "can
+    // we reach the host at all?"
+    let reachable = matches!(
+        run_without_reverse_forward(hostname, ["true"]),
+        Ok(o) if o.status.success()
+    );
+    if !reachable {
+        let _ = shelbi_state::emit_event_body(&format!(
+            "ssh reverse-forward host={hostname} mode=tcp status=failed detail=master_open_failed"
+        ));
+        return Err(shelbi_core::Error::Other(format!(
+            "ssh reverse forward to {hostname} could not be established over TCP loopback \
+             (host unreachable); worker→hub messages will not be delivered"
+        )));
+    }
+
+    let start = shelbi_state::load_host_forward(hostname)
+        .and_then(|h| h.port)
+        .unwrap_or(shelbi_state::TCP_FORWARD_PORT_BASE);
+
+    for port in tcp_candidate_ports(start) {
+        // Drop any master first so ControlMaster=auto opens a fresh one that
+        // binds this candidate port's `-R`.
+        drop_master(hostname);
+        let opened = open_master_tcp(hostname, port);
+        if matches!(&opened, Ok(o) if o.status.success()) {
+            // ExitOnForwardFailure=yes guarantees the `-R` bound when the
+            // master opened. Remember the mode + port so subsequent outbound
+            // ssh (and the worker env) reuse this exact port. Success is silent
+            // — like the Unix path, we only log failures, so the 120s rechecks
+            // don't flood events.log.
+            let _ = shelbi_state::save_host_forward(
+                hostname,
+                Some(shelbi_state::HostForward {
+                    mode: shelbi_core::ForwardMode::Tcp,
+                    port: Some(port),
+                }),
+            );
+            return Ok(port);
+        }
+        // Network was already proven reachable, so a failure here is a bind
+        // collision — try the next candidate port.
+    }
+
+    let _ = shelbi_state::emit_event_body(&format!(
+        "ssh reverse-forward host={hostname} mode=tcp status=failed detail=tcp_forward_failed \
+         no free loopback port in band"
+    ));
+    Err(shelbi_core::Error::Other(format!(
+        "ssh reverse forward to {hostname} could not bind a TCP loopback port; \
+         worker→hub messages will not be delivered"
+    )))
+}
+
+/// Ensure the hub's reverse forward to `host` is bound and healthy, repairing
+/// a stale-remote-socket wedge if one is present and falling back to a TCP
+/// loopback forward when the Unix landing socket turns out to be unusable
+/// (the Tailscale-SSH root-owned-socket condition).
+///
+/// Every shelbi-routed `ssh` invocation carries `-R <remote>:<local hub.sock>`
+/// so remote workers can write to the hub's `events.log` over the multiplexed
+/// channel. But `-R` to a Unix socket binds usefully only when the login user
+/// owns the landing path. On hosts reached via Tailscale SSH, tailscaled (root)
+/// binds it `srw------- root root`: unconnectable and unremovable by the login
+/// user, so every retry re-wedges and leaks another root-owned socket. When we
+/// detect that, we switch the host to a TCP loopback forward
+/// (`-R 127.0.0.1:<port>:<hub.sock>`) and remember the decision so subsequent
+/// forwards skip the failing Unix attempt.
+///
+/// `configured` is the per-machine `forward:` override from project YAML:
+/// `Some(Tcp)` goes straight to TCP (no detection), `Some(Unix)` pins the Unix
+/// forward and disables the fallback, `None` is auto (Unix first, fall back to
+/// TCP on the wedge, remembering the choice).
+///
+/// This is a no-op for [`Host::Local`].
+pub fn ensure_reverse_forward(
+    host: &Host,
+    configured: Option<shelbi_core::ForwardMode>,
+) -> shelbi_core::Result<()> {
+    let hostname = match host {
+        Host::Local => return Ok(()),
+        Host::Ssh { host } => host.clone(),
+    };
+    let remote_sock = shelbi_state::remote_hub_socket_path()
+        .to_string_lossy()
+        .into_owned();
+
+    // Decide the mode to attempt and whether auto-fallback is permitted.
+    let (mode, allow_fallback) = match configured {
+        Some(shelbi_core::ForwardMode::Tcp) => (shelbi_core::ForwardMode::Tcp, false),
+        Some(shelbi_core::ForwardMode::Unix) => (shelbi_core::ForwardMode::Unix, false),
+        None => match shelbi_state::load_host_forward(&hostname) {
+            Some(hf) => (hf.mode, true),
+            None => (shelbi_core::ForwardMode::Unix, true),
+        },
+    };
+
+    if mode == shelbi_core::ForwardMode::Tcp {
+        return ensure_tcp_forward(&hostname).map(|_| ());
+    }
+
+    match ensure_unix_forward(host, &hostname, &remote_sock) {
+        UnixForwardOutcome::Ok => Ok(()),
+        UnixForwardOutcome::MasterOpenFailed => {
+            // Transient / network — surface, never fall back (a connect
+            // timeout is not the wedge).
+            let _ = shelbi_state::emit_event_body(&format!(
+                "ssh reverse-forward host={hostname} remote_sock={remote_sock} \
+                 status=failed detail=master_open_failed"
+            ));
+            Err(shelbi_core::Error::Other(format!(
+                "ssh reverse forward to {hostname} could not be verified (master_open_failed); \
+                 worker→hub messages via {remote_sock} will not be delivered"
+            )))
+        }
+        UnixForwardOutcome::Wedged { detail } => {
+            if allow_fallback {
+                // The Tailscale-SSH wedge. Switch this host to TCP loopback and
+                // remember it so we stop re-attempting (and re-leaking) Unix.
+                // Log the transition once (subsequent rechecks find the mode
+                // already persisted and go straight to TCP without re-entering
+                // this branch).
+                match ensure_tcp_forward(&hostname) {
+                    Ok(port) => {
+                        let _ = shelbi_state::emit_event_body(&format!(
+                            "ssh reverse-forward host={hostname} remote_sock={remote_sock} \
+                             detail={detail} action=falling_back_to_tcp mode=tcp port={port} \
+                             status=established"
+                        ));
+                        Ok(())
+                    }
+                    Err(e) => Err(e),
+                }
+            } else {
+                // `forward: unix` pinned — respect it, don't silently switch.
+                let _ = shelbi_state::emit_event_body(&format!(
+                    "ssh reverse-forward host={hostname} remote_sock={remote_sock} \
+                     status=failed detail={detail}"
+                ));
+                Err(shelbi_core::Error::Other(format!(
+                    "ssh reverse forward to {hostname} could not be verified ({detail}); \
+                     worker→hub messages via {remote_sock} will not be delivered"
+                )))
+            }
         }
     }
 }
@@ -408,92 +765,6 @@ where
     cmd.output()
 }
 
-/// Ensure the hub's reverse forward to `host` is bound and healthy,
-/// repairing a stale-remote-socket wedge if one is present.
-///
-/// Every shelbi-routed `ssh` invocation carries
-/// `-R <remote>:<local hub.sock>` so remote workers can write to the hub's
-/// `events.log` over the multiplexed channel. But `-R` to a Unix socket
-/// binds successfully only when the landing path is free. The verified master
-/// reopen uses `StreamLocalBindUnlink=yes`, but we still verify because
-/// older/stricter servers and permission mismatches can leave the forward
-/// unbound while `ExitOnForwardFailure=no` + `LogLevel=ERROR` swallow the
-/// warning. The result would otherwise be every worker→hub message silently
-/// dropping into a dead file until someone cleans it by hand (adversarial
-/// review in Shelbi ContextStore
-/// docs/planning:reviews/adversarial-2026-07/process-boundaries.md F7).
-///
-/// This is a no-op for [`Host::Local`]. For SSH hosts it:
-///  1. Drops any half-broken master, removes the stale remote
-///     socket (safe: we only get here when no live master owns the
-///     forward), and reopens the master so `-R` rebinds against a clean
-///     path.
-///  2. Verifies the landing socket now exists and, on failure, records a
-///     line to `events.log` so a dead channel is diagnosable instead of
-///     invisible — then returns an error the caller can log.
-pub fn ensure_reverse_forward(host: &Host) -> shelbi_core::Result<()> {
-    let hostname = match host {
-        Host::Local => return Ok(()),
-        Host::Ssh { host } => host.clone(),
-    };
-    let remote_sock = shelbi_state::remote_hub_socket_path()
-        .to_string_lossy()
-        .into_owned();
-
-    // Repair. Drop any existing master first: it may be a master whose
-    // forward never bound (stale socket collided with the `-R`), and
-    // `ControlMaster=auto` would otherwise reuse it and skip the rebind.
-    drop_master(&hostname);
-    // Remove the stale landing socket. We only reach here when no live
-    // master owns the forward, so any leftover socket file is a leak from a
-    // dead master — safe to unlink. The cleanup command deliberately bypasses
-    // shelbi's ControlMaster/`-R` wrapper; otherwise an absent socket can be
-    // recreated by SSH and then immediately removed by this `rm`.
-    let cleanup = run_without_reverse_forward(&hostname, ["rm", "-f", remote_sock.as_str()]);
-    drop_master(&hostname);
-
-    // Reopen the master, rebinding `-R` against the now-clean path. `true`
-    // is the cheapest remote command; the master opens (and ControlPersist
-    // keeps it) as a side effect.
-    let opened = open_master_with_stream_local_unlink(&hostname).map_err(shelbi_core::Error::Io)?;
-
-    if opened.status.success() && remote_socket_present(host, &remote_sock) {
-        return Ok(());
-    }
-
-    let detail = if !opened.status.success() {
-        "master_open_failed"
-    } else if matches!(&cleanup, Ok(o) if !o.status.success()) {
-        "stale_socket_cleanup_failed"
-    } else if cleanup.is_err() {
-        "stale_socket_cleanup_unavailable"
-    } else {
-        "landing_socket_missing"
-    };
-    let cleanup_stderr = match &cleanup {
-        Ok(o) if !o.status.success() => {
-            let stderr = String::from_utf8_lossy(&o.stderr);
-            let trimmed = stderr.trim();
-            if trimmed.is_empty() {
-                String::new()
-            } else {
-                format!(" cleanup_stderr={}", trimmed)
-            }
-        }
-        Err(e) => format!(" cleanup_error={e}"),
-        _ => String::new(),
-    };
-    // Surface to events.log (best-effort — a wedged forward shouldn't also
-    // hard-fail on a logging hiccup).
-    let _ = shelbi_state::emit_event_body(&format!(
-        "ssh reverse-forward host={hostname} remote_sock={remote_sock} status=failed detail={detail}{cleanup_stderr}"
-    ));
-    Err(shelbi_core::Error::Other(format!(
-        "ssh reverse forward to {hostname} could not be verified ({detail}); \
-         worker→hub messages via {remote_sock} will not be delivered"
-    )))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -521,7 +792,7 @@ mod tests {
             .collect();
         // Control-master opts ride in front of every SSH invocation so
         // back-to-back hub→workspace commands reuse a single socket.
-        let mut expected: Vec<String> = build_ssh_control_opts();
+        let mut expected: Vec<String> = build_ssh_control_opts("m2.local");
         expected.extend(["m2.local", "--", "tmux", "new-session"].map(String::from));
         assert_eq!(args, expected);
     }
@@ -538,7 +809,7 @@ mod tests {
             .get_args()
             .map(|a| a.to_string_lossy().into_owned())
             .collect();
-        let mut expected: Vec<String> = build_ssh_control_opts();
+        let mut expected: Vec<String> = build_ssh_control_opts("m2.local");
         expected.extend(["-t", "m2.local", "--", "vi", "foo.txt"].map(String::from));
         assert_eq!(args, expected);
     }
@@ -675,7 +946,7 @@ mod tests {
     fn ensure_reverse_forward_is_noop_for_local() {
         // Local hosts have no reverse forward to establish — the call must
         // short-circuit without shelling out to ssh.
-        ensure_reverse_forward(&Host::Local).expect("local ensure should be Ok");
+        ensure_reverse_forward(&Host::Local, None).expect("local ensure should be Ok");
     }
 
     #[test]
@@ -698,5 +969,85 @@ mod tests {
             args.windows(2).any(|w| w == ["--", "rm"]),
             "remote argv should still be sent after --: {args:?}"
         );
+    }
+
+    #[test]
+    fn tcp_master_args_force_exit_on_forward_failure_and_carry_tcp_r() {
+        // The TCP master open must (a) set ExitOnForwardFailure=yes so a bind
+        // collision fails the open (letting the caller sweep ports), placed
+        // BEFORE the static ExitOnForwardFailure=no so its value wins, and
+        // (b) carry the loopback `-R` spec — never a Unix socket path.
+        let spec = "127.0.0.1:47100:/home/u/.shelbi/hub.sock";
+        let args = build_tcp_master_args("devbox", spec);
+
+        // ExitOnForwardFailure appears with =yes first, =no (from the static
+        // opts) only later. OpenSSH honors the first value.
+        let yes = args
+            .iter()
+            .position(|a| a == "ExitOnForwardFailure=yes")
+            .expect("missing ExitOnForwardFailure=yes");
+        let no = args.iter().position(|a| a == "ExitOnForwardFailure=no");
+        assert!(
+            no.map_or(true, |n| yes < n),
+            "=yes must precede =no so it wins: {args:?}"
+        );
+
+        // The forward is the TCP spec, and no `-R` carries a /tmp Unix socket.
+        let r = args.iter().position(|a| a == "-R").expect("missing -R");
+        assert_eq!(args[r + 1], spec);
+        assert!(
+            !args.iter().any(|a| a.contains("/tmp/shelbi-hub")),
+            "TCP master must not reference a Unix landing socket: {args:?}"
+        );
+
+        // Ends with `<host> -- true` — the cheapest remote no-op that persists
+        // the master.
+        let tail = &args[args.len() - 3..];
+        assert_eq!(tail, ["devbox", "--", "true"], "unexpected tail: {args:?}");
+    }
+
+    #[test]
+    fn tcp_candidate_ports_starts_from_hint_then_sweeps_band() {
+        let base = shelbi_state::TCP_FORWARD_PORT_BASE;
+        let span = shelbi_state::TCP_FORWARD_PORT_SPAN;
+
+        // A hint inside the band is tried first, then the rest of the band
+        // (each port exactly once).
+        let ports = tcp_candidate_ports(base + 3);
+        assert_eq!(ports[0], base + 3, "hint must be tried first: {ports:?}");
+        assert_eq!(ports.len(), span as usize, "one entry per band port");
+        let mut sorted = ports.clone();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(sorted.len(), span as usize, "no duplicate ports: {ports:?}");
+        assert_eq!(*sorted.first().unwrap(), base);
+        assert_eq!(*sorted.last().unwrap(), base + span - 1);
+
+        // An out-of-band hint is normalized back to the band base.
+        let ports = tcp_candidate_ports(1);
+        assert_eq!(ports[0], base, "stale hint falls back to base: {ports:?}");
+        assert_eq!(ports.len(), span as usize);
+    }
+
+    #[test]
+    fn cleanup_hit_eperm_detects_operation_not_permitted() {
+        // A cleanup that exits nonzero with "Operation not permitted" on stderr
+        // is the Tailscale-SSH fingerprint.
+        let eperm = std::process::Command::new("sh")
+            .arg("-c")
+            .arg("echo \"rm: cannot remove '/tmp/x.sock': Operation not permitted\" >&2; exit 1")
+            .output();
+        assert!(cleanup_hit_eperm(&eperm));
+
+        // A clean success is not EPERM.
+        let ok = std::process::Command::new("sh").arg("-c").arg("true").output();
+        assert!(!cleanup_hit_eperm(&ok));
+
+        // A different failure (e.g. ordinary error) is not EPERM either.
+        let other = std::process::Command::new("sh")
+            .arg("-c")
+            .arg("echo 'some other error' >&2; exit 1")
+            .output();
+        assert!(!cleanup_hit_eperm(&other));
     }
 }

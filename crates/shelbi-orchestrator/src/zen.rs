@@ -2097,6 +2097,7 @@ mod probe_tests {
                 work_dir: work_dir.to_path_buf(),
                 host: None,
                 tags: Vec::new(),
+                forward: None,
             }],
             orchestrator: OrchestratorSpec {
                 runner: "claude".into(),

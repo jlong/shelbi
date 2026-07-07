@@ -299,6 +299,7 @@ pub(crate) mod test_support {
                 work_dir: repo.clone(),
                 host: None,
                 tags: Vec::new(),
+                forward: None,
             }],
             orchestrator: OrchestratorSpec {
                 runner: "claude".into(),

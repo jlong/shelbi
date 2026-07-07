@@ -1079,7 +1079,7 @@ fn deploy_and_spawn(a: SpawnArgs<'_>) -> Result<()> {
                 a.resume,
                 startup_prompt_rel,
             );
-            let cd_launch = remote_cd_launch(a.worktree, &launch, a.port, &a.workspace.name);
+            let cd_launch = remote_cd_launch(a.host, a.worktree, &launch, a.port, &a.workspace.name);
             shelbi_tmux::send_line(a.host, a.addr, &cd_launch).map_err(|e| {
                 Error::Other(format!(
                     "pane startup failure for workspace `{}` using {} runner `{}`: {e}",
@@ -1721,10 +1721,15 @@ if [ -s "$UNREAD" ]; then
   echo "<system-reminder>New orchestrator messages:"
   cat "$PROC"
   echo "</system-reminder>"
-  if [ -n "${SHELBI_HUB_SOCK:-}" ] && command -v jq >/dev/null 2>&1 && command -v nc >/dev/null 2>&1; then
+  HUB_ADDR="${SHELBI_HUB_ADDR:-${SHELBI_HUB_SOCK:+unix:$SHELBI_HUB_SOCK}}"
+  if [ -n "$HUB_ADDR" ] && command -v jq >/dev/null 2>&1 && command -v nc >/dev/null 2>&1; then
     jq -r '.msg_id // empty' "$PROC" 2>/dev/null | while read MSG_ID; do
       [ -n "$MSG_ID" ] || continue
-      printf '{"verb":"message-ack","project":"%s","task_id":"%s","msg_id":"%s"}\n' "$PROJECT" "$TASK_ID" "$MSG_ID" | nc -U "$SHELBI_HUB_SOCK" 2>/dev/null || true
+      ACK=$(printf '{"verb":"message-ack","project":"%s","task_id":"%s","msg_id":"%s"}\n' "$PROJECT" "$TASK_ID" "$MSG_ID")
+      case "$HUB_ADDR" in
+        tcp:*) HP=${HUB_ADDR#tcp:}; printf '%s' "$ACK" | nc "${HP%:*}" "${HP##*:}" 2>/dev/null || true ;;
+        unix:*) printf '%s' "$ACK" | nc -U "${HUB_ADDR#unix:}" 2>/dev/null || true ;;
+      esac
     done
   fi
   rm "$PROC"
@@ -2239,8 +2244,21 @@ fn local_pane_tmux_argv(a: LocalPaneTmuxArgs<'_>) -> Vec<String> {
 /// for "set var for THIS command only and inherit it"). `port`, when
 /// `Some`, is injected as `PORT` in the same env prefix (review
 /// workspaces); dev workspaces pass `None`.
-fn remote_cd_launch(worktree: &Path, launch: &str, port: Option<u16>, workspace: &str) -> String {
-    let sock = shelbi_state::remote_hub_socket_path();
+///
+/// `host` selects how the worker reaches the hub. The pane always gets
+/// `SHELBI_HUB_ADDR` (scheme-tagged: `unix:<path>` or `tcp:<addr>:<port>`) so
+/// the send helper can dispatch either transport; on a Unix-forward host we
+/// *also* set the legacy `SHELBI_HUB_SOCK` so the plain `nc -U "$SHELBI_HUB_SOCK"`
+/// path keeps working unchanged. A TCP-fallback host (Tailscale SSH) gets only
+/// `SHELBI_HUB_ADDR`, since there is no usable Unix landing socket there.
+fn remote_cd_launch(
+    host: &Host,
+    worktree: &Path,
+    launch: &str,
+    port: Option<u16>,
+    workspace: &str,
+) -> String {
+    let hub_env = remote_hub_env_prefix(host);
     // Review workspaces (Some port) also get SHELBI_WORKSPACE so the Review
     // agent's `shelbi workspace serve` resolves its slot.
     let port_env = match port {
@@ -2251,11 +2269,43 @@ fn remote_cd_launch(worktree: &Path, launch: &str, port: Option<u16>, workspace:
         None => String::new(),
     };
     format!(
-        "cd {wd} && LANG=C.UTF-8 {port_env}SHELBI_HUB_SOCK={sock} exec \"${{SHELL:-/bin/bash}}\" -lc {launch}",
+        "cd {wd} && LANG=C.UTF-8 {port_env}{hub_env}exec \"${{SHELL:-/bin/bash}}\" -lc {launch}",
         wd = shelbi_agent::shell_escape(&worktree.to_string_lossy()),
-        sock = shelbi_agent::shell_escape(&sock.to_string_lossy()),
         launch = shelbi_agent::shell_escape(launch),
     )
+}
+
+/// Build the `SHELBI_HUB_ADDR=… [SHELBI_HUB_SOCK=…] ` env prefix (trailing
+/// space included) a remote pane needs to reach the hub daemon, resolving the
+/// per-host forward decision. Shared by [`remote_cd_launch`] and the
+/// `shelbi spawn` path so the two can't drift.
+pub fn remote_hub_env_prefix(host: &Host) -> String {
+    let hostname = match host {
+        Host::Local => return String::new(),
+        Host::Ssh { host } => host.as_str(),
+    };
+    match shelbi_state::remote_hub_endpoint(hostname) {
+        endpoint @ shelbi_state::HubEndpoint::Unix(_) => {
+            // Unix forward: set both the scheme-tagged addr and the legacy
+            // SHELBI_HUB_SOCK path the existing worker snippets consume.
+            let sock = match &endpoint {
+                shelbi_state::HubEndpoint::Unix(p) => p.to_string_lossy().into_owned(),
+                _ => unreachable!(),
+            };
+            format!(
+                "SHELBI_HUB_ADDR={addr} SHELBI_HUB_SOCK={sock} ",
+                addr = shelbi_agent::shell_escape(&endpoint.addr_env_value()),
+                sock = shelbi_agent::shell_escape(&sock),
+            )
+        }
+        endpoint @ shelbi_state::HubEndpoint::Tcp { .. } => {
+            // TCP loopback: no Unix socket exists, so only the addr is set.
+            format!(
+                "SHELBI_HUB_ADDR={addr} ",
+                addr = shelbi_agent::shell_escape(&endpoint.addr_env_value()),
+            )
+        }
+    }
 }
 
 /// Construct the shell command that launches the agent runner for a workspace
@@ -3086,6 +3136,7 @@ mod tests {
                     work_dir: "/tmp/myapp".into(),
                     host: None,
                     tags: Vec::new(),
+                    forward: None,
                 },
                 Machine {
                     name: "m2".into(),
@@ -3093,6 +3144,7 @@ mod tests {
                     work_dir: "/work/myapp".into(),
                     host: Some("m2.local".into()),
                     tags: Vec::new(),
+                    forward: None,
                 },
             ],
             orchestrator: OrchestratorSpec {
@@ -4078,6 +4130,9 @@ mod tests {
         // The remote wrapper embeds exactly that shared launch, so the SSH
         // pane execs the same command the local wrapper would.
         let cd_launch = remote_cd_launch(
+            &Host::Ssh {
+                host: "testhost".into(),
+            },
             Path::new("/work/myapp/.shelbi/wt/bob"),
             &remote_launch,
             None,
@@ -4369,7 +4424,15 @@ mod tests {
         let _g = crate::test_lock::acquire();
         std::env::remove_var("SHELBI_REMOTE_HUB_SOCK");
         let wt = PathBuf::from("/work/myapp/.shelbi/wt/bob");
-        let line = remote_cd_launch(&wt, "claude --permission-mode auto", None, "bob");
+        let line = remote_cd_launch(
+            &Host::Ssh {
+                host: "testhost".into(),
+            },
+            &wt,
+            "claude --permission-mode auto",
+            None,
+            "bob",
+        );
         let expected = shelbi_state::remote_hub_socket_path();
         assert!(
             line.contains(&format!("SHELBI_HUB_SOCK={}", expected.display())),
@@ -4405,12 +4468,77 @@ mod tests {
         let _g = crate::test_lock::acquire();
         std::env::set_var("SHELBI_REMOTE_HUB_SOCK", "/run/user/1000/shelbi.sock");
         let wt = PathBuf::from("/work/myapp/.shelbi/wt/bob");
-        let line = remote_cd_launch(&wt, "claude", None, "bob");
+        let line = remote_cd_launch(
+            &Host::Ssh {
+                host: "testhost".into(),
+            },
+            &wt,
+            "claude",
+            None,
+            "bob",
+        );
         assert!(
             line.contains("SHELBI_HUB_SOCK=/run/user/1000/shelbi.sock"),
             "override not honored: {line}"
         );
         std::env::remove_var("SHELBI_REMOTE_HUB_SOCK");
+    }
+
+    /// A TCP-fallback host (Tailscale SSH) gets `SHELBI_HUB_ADDR=tcp:…` and
+    /// NO `SHELBI_HUB_SOCK` — there is no usable Unix landing socket there.
+    /// A Unix-forward host keeps both (the legacy socket path plus the
+    /// scheme-tagged addr) so existing worker snippets are unaffected.
+    #[test]
+    fn remote_hub_env_prefix_switches_on_persisted_forward_mode() {
+        let _g = crate::test_lock::acquire();
+        let home = std::env::temp_dir().join(format!(
+            "shelbi-fwd-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        std::fs::create_dir_all(&home).unwrap();
+        std::env::set_var("SHELBI_HOME", &home);
+        std::env::remove_var("SHELBI_REMOTE_HUB_SOCK");
+
+        // Default host (no persisted decision) → Unix: both vars present.
+        let unix = remote_hub_env_prefix(&Host::Ssh {
+            host: "plainbox".into(),
+        });
+        assert!(
+            unix.contains("SHELBI_HUB_ADDR=unix:"),
+            "unix host must carry a unix: addr: {unix}"
+        );
+        assert!(
+            unix.contains("SHELBI_HUB_SOCK="),
+            "unix host must keep the legacy socket var: {unix}"
+        );
+
+        // Persist a TCP decision for a Tailscale-SSH host.
+        shelbi_state::save_host_forward(
+            "tsbox",
+            Some(shelbi_state::HostForward {
+                mode: shelbi_core::ForwardMode::Tcp,
+                port: Some(47102),
+            }),
+        )
+        .unwrap();
+        let tcp = remote_hub_env_prefix(&Host::Ssh {
+            host: "tsbox".into(),
+        });
+        assert!(
+            tcp.contains("SHELBI_HUB_ADDR=tcp:127.0.0.1:47102"),
+            "tcp host must carry the loopback addr: {tcp}"
+        );
+        assert!(
+            !tcp.contains("SHELBI_HUB_SOCK="),
+            "tcp host must NOT set a Unix socket var: {tcp}"
+        );
+
+        // Local host has no reverse forward at all → empty prefix.
+        assert_eq!(remote_hub_env_prefix(&Host::Local), "");
+
+        std::env::remove_var("SHELBI_HOME");
+        let _ = std::fs::remove_dir_all(&home);
     }
 
     /// A dispatch with an explicit `PORT` injects it into the remote pane's
@@ -4421,7 +4549,15 @@ mod tests {
         let _g = crate::test_lock::acquire();
         std::env::remove_var("SHELBI_REMOTE_HUB_SOCK");
         let wt = PathBuf::from("/work/myapp/.shelbi/wt/slot-1");
-        let line = remote_cd_launch(&wt, "claude", Some(3010), "slot-1");
+        let line = remote_cd_launch(
+            &Host::Ssh {
+                host: "testhost".into(),
+            },
+            &wt,
+            "claude",
+            Some(3010),
+            "slot-1",
+        );
         assert!(line.contains("PORT=3010"), "expected PORT in: {line}");
         let port_at = line.find("PORT=3010").unwrap();
         let exec_at = line.find("exec ").unwrap();
@@ -5527,6 +5663,7 @@ mod sync_worktree_git_tests {
                 work_dir: repo.to_path_buf(),
                 host: None,
                 tags: Vec::new(),
+                forward: None,
             }],
             orchestrator: OrchestratorSpec {
                 runner: "claude".into(),
@@ -5939,6 +6076,7 @@ mod sync_worktree_freshcut_tests {
             work_dir: repo.to_path_buf(),
             host: None,
             tags: Vec::new(),
+            forward: None,
         }
     }
 
@@ -6332,6 +6470,7 @@ mod sync_worktree_freshcut_tests {
                 work_dir: machine_repo.clone(),
                 host: None,
                 tags: Vec::new(),
+                forward: None,
             }],
             orchestrator: shelbi_core::OrchestratorSpec {
                 runner: "claude".into(),

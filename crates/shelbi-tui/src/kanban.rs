@@ -3149,6 +3149,7 @@ mod tests {
                 work_dir: "/tmp/demo".into(),
                 host: None,
                 tags: Vec::new(),
+                forward: None,
             }],
             orchestrator: shelbi_core::OrchestratorSpec {
                 runner: "claude".into(),
@@ -4710,6 +4711,7 @@ mod tests {
                 work_dir: "/tmp/demo".into(),
                 host: None,
                 tags: Vec::new(),
+                forward: None,
             }],
             orchestrator: shelbi_core::OrchestratorSpec {
                 runner: "claude".into(),

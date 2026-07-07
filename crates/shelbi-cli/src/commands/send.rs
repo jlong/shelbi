@@ -196,6 +196,7 @@ mod tests {
                     work_dir: "/tmp/repo".into(),
                     host: None,
                     tags: Vec::new(),
+                    forward: None,
                 },
                 Machine {
                     name: "devbox".into(),
@@ -203,6 +204,7 @@ mod tests {
                     work_dir: "/work/repo".into(),
                     host: Some("devbox".into()),
                     tags: Vec::new(),
+                    forward: None,
                 },
             ],
             orchestrator: OrchestratorSpec {

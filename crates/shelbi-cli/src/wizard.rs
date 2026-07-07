@@ -147,6 +147,7 @@ pub fn setup_one_project() -> Result<()> {
         work_dir: PathBuf::from(&hub_work_dir),
         host: None,
         tags: Vec::new(),
+        forward: None,
     }];
 
     // ---- Remote machine loop --------------------------------------------
@@ -164,6 +165,7 @@ pub fn setup_one_project() -> Result<()> {
             work_dir: PathBuf::from(m_work_dir),
             host: Some(m_host),
             tags: Vec::new(),
+            forward: None,
         });
         prompt_label = "Add another remote machine?";
     }
@@ -479,6 +481,7 @@ mod tests {
             work_dir: "/tmp".into(),
             host: None,
             tags: Vec::new(),
+            forward: None,
         }];
         let workspaces =
             assign_workspace_names(&machines, 3, WorkspaceNamePreset::Phonetic, Runner::Claude)
@@ -496,6 +499,7 @@ mod tests {
                 work_dir: "/tmp".into(),
                 host: None,
                 tags: Vec::new(),
+                forward: None,
             },
             Machine {
                 name: "remote".into(),
@@ -503,6 +507,7 @@ mod tests {
                 work_dir: "/tmp".into(),
                 host: Some("remote".into()),
                 tags: Vec::new(),
+                forward: None,
             },
         ];
         let workspaces =
@@ -527,6 +532,7 @@ mod tests {
             work_dir: "/tmp".into(),
             host: None,
             tags: Vec::new(),
+            forward: None,
         }];
         // Toy Story has 20 names; ask for 22.
         let workspaces =
@@ -547,6 +553,7 @@ mod tests {
             work_dir: "/tmp".into(),
             host: None,
             tags: Vec::new(),
+            forward: None,
         }];
         let workspaces =
             assign_workspace_names(&machines, 2, WorkspaceNamePreset::Phonetic, Runner::Codex)

@@ -112,6 +112,7 @@ mod tests {
                 work_dir: PathBuf::from("/tmp/p"),
                 host: None,
                 tags: Vec::new(),
+                forward: None,
             }],
             orchestrator: OrchestratorSpec {
                 runner: "claude".into(),
