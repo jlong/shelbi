@@ -72,9 +72,9 @@ half of the config is user-local versus shared.
 
 **Two-way worker communication.** Workers can talk back to the orchestrator, not
 just the other way around. A hub-side Unix socket (reverse-forwarded to remote
-machines over SSH) carries a per-task message log, and Claude Code workers inject
-those messages via `SessionStart` + `Stop` hooks; non-hook runners poll for them
-in the prompt. On top of it sits a clarification loop (a worker can ask a
+machines over SSH) carries a per-task message log, and hook-capable workers
+inject those messages via `SessionStart` + `Stop` hooks; non-hook runners poll
+for them in the prompt. On top of it sits a clarification loop (a worker can ask a
 question and block for an acknowledged answer) plus `launchd`/`systemd`
 supervision so the hub socket survives restarts.
 
