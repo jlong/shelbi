@@ -195,10 +195,73 @@ jobs:
         with:
           subject-checksums: dist/checksums.txt
 
+  homebrew-pr:
+    name: Open Homebrew tap PR
+    needs: release
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v') && vars.HOMEBREW_TAP_REPOSITORY != ''
+    runs-on: ubuntu-latest
+    environment: release-downstream
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout Shelbi
+        uses: actions/checkout@v4
+        with:
+          path: shelbi
+
+      - name: Download release checksums
+        working-directory: shelbi
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p dist
+          gh release download "$GITHUB_REF_NAME" \
+            --pattern checksums.txt \
+            --dir dist
+
+      - name: Checkout Homebrew tap
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ vars.HOMEBREW_TAP_REPOSITORY }}
+          token: ${{ secrets.TAP_GITHUB_TOKEN }}
+          path: homebrew-tap
+
+      - name: Update formula
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          ruby shelbi/scripts/release/update-homebrew-formula.rb \
+            --tap-dir homebrew-tap \
+            --version "$version" \
+            --checksums shelbi/dist/checksums.txt \
+            --github-repo "$GITHUB_REPOSITORY"
+
+      - name: Open tap update PR
+        working-directory: homebrew-tap
+        env:
+          GH_TOKEN: ${{ secrets.TAP_GITHUB_TOKEN }}
+          TAP_REPOSITORY: ${{ vars.HOMEBREW_TAP_REPOSITORY }}
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          branch="shelbi-${version}"
+          git config user.name "shelbi-release-bot"
+          git config user.email "shelbi-release-bot@users.noreply.github.com"
+          git checkout -B "$branch"
+          git add Formula/shelbi.rb
+          git commit -m "shelbi ${version}"
+          git push --force-with-lease origin "$branch"
+          gh pr create \
+            --repo "$TAP_REPOSITORY" \
+            --base main \
+            --head "$branch" \
+            --title "shelbi ${version}" \
+            --body "Updates the Shelbi formula to ${version} after GitHub Release artifacts were published."
+
   downstream-publication:
     name: Prepare downstream publication
-    needs: release
-    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    needs:
+      - release
+      - homebrew-pr
+    if: always() && github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     environment: release-downstream
     permissions:

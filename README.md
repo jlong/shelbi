@@ -52,7 +52,16 @@ Shelbi gives you:
 
 ## Install
 
-For now: clone and run `./scripts/install.sh` — it builds with
+The first packaged macOS install path is the Shelbi Homebrew tap:
+
+```bash
+brew tap jlong/shelbi
+brew install shelbi
+```
+
+The tap repository still needs to be created and seeded before the first
+tagged release can publish its formula. Until then, clone and run
+`./scripts/install.sh` — it builds with
 `cargo build --release` and drops the binary at `$HOME/bin/shelbi`
 (override with `SHELBI_INSTALL_PATH=/somewhere/else`). `cargo install
 shelbi` will land once the first crate is published.
