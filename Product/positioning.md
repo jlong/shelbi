@@ -2,7 +2,7 @@
 
 Tagline: Do more with your agents
 
-Expanded Tagline: An open source, multi-machine orchestrator built on tmux. Ideal for managing your personal workflow. Dispatch tasks to a team of agents locally or over SSH.
+Expanded Tagline: An open source, multi-machine orchestrator built on tmux. Made for managing your personal workflow. 
 
 <br />
 
