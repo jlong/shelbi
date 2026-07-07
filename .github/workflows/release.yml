@@ -1,0 +1,216 @@
+name: release
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+  workflow_dispatch:
+    inputs:
+      ref_name:
+        description: 'Synthetic tag for validation, for example v0.1.0'
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  validate:
+    name: Validate release
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      tag: ${{ steps.version.outputs.tag }}
+      dry_run: ${{ steps.version.outputs.dry_run }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install jq
+        run: sudo apt-get update && sudo apt-get install -y jq
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Validate tag and Cargo version
+        env:
+          GITHUB_REF_NAME: ${{ github.event_name == 'workflow_dispatch' && inputs.ref_name || github.ref_name }}
+        run: scripts/release/check-version.sh
+
+      - name: Capture release metadata
+        id: version
+        env:
+          RELEASE_REF_NAME: ${{ github.event_name == 'workflow_dispatch' && inputs.ref_name || github.ref_name }}
+          IS_DRY_RUN: ${{ github.event_name == 'workflow_dispatch' }}
+        run: |
+          version="$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.name == "shelbi") | .version')"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "tag=$RELEASE_REF_NAME" >> "$GITHUB_OUTPUT"
+          echo "dry_run=$IS_DRY_RUN" >> "$GITHUB_OUTPUT"
+
+      - name: Core release tests
+        run: cargo test --workspace
+
+      - name: Check GoReleaser config
+        uses: goreleaser/goreleaser-action@v6
+        with:
+          version: latest
+          args: check
+
+  smoke:
+    name: Smoke ${{ matrix.target }}
+    needs: validate
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+            binary: target/x86_64-unknown-linux-gnu/release/shelbi
+          - target: aarch64-apple-darwin
+            os: macos-14
+            binary: target/aarch64-apple-darwin/release/shelbi
+          - target: x86_64-apple-darwin
+            os: macos-13
+            binary: target/x86_64-apple-darwin/release/shelbi
+    runs-on: ${{ matrix.os }}
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build release binary
+        run: cargo build --release -p shelbi --target ${{ matrix.target }}
+
+      - name: Smoke test version
+        run: ${{ matrix.binary }} --version
+
+  goreleaser-dry-run:
+    name: GoReleaser dry run
+    needs:
+      - validate
+      - smoke
+    if: needs.validate.outputs.dry_run == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    env:
+      GORELEASER_CURRENT_TAG: ${{ needs.validate.outputs.tag }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install Zig
+        uses: goto-bus-stop/setup-zig@v2
+
+      - name: Install cargo-zigbuild
+        uses: taiki-e/install-action@cargo-zigbuild
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build snapshot artifacts
+        uses: goreleaser/goreleaser-action@v6
+        with:
+          version: latest
+          args: release --snapshot --clean
+
+      - name: Verify checksums file
+        run: test -s dist/checksums.txt
+
+      - name: Verify .deb package exists
+        run: test -n "$(find dist -maxdepth 1 -name 'shelbi_*_amd64.deb' -print -quit)"
+
+  release:
+    name: Publish GitHub release
+    needs:
+      - validate
+      - smoke
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    environment: release
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+      artifact-metadata: write
+    env:
+      GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Verify tag points at checked out commit
+        run: |
+          test "$(git rev-list -n 1 "$GITHUB_REF_NAME")" = "$GITHUB_SHA"
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install Zig
+        uses: goto-bus-stop/setup-zig@v2
+
+      - name: Install cargo-zigbuild
+        uses: taiki-e/install-action@cargo-zigbuild
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Run GoReleaser
+        uses: goreleaser/goreleaser-action@v6
+        with:
+          version: latest
+          args: release --clean
+
+      - name: Verify checksums file
+        run: test -s dist/checksums.txt
+
+      - name: Verify .deb package exists
+        run: test -n "$(find dist -maxdepth 1 -name 'shelbi_*_amd64.deb' -print -quit)"
+
+      - name: Attest release artifacts
+        uses: actions/attest@v4
+        with:
+          subject-checksums: dist/checksums.txt
+
+  downstream-publication:
+    name: Prepare downstream publication
+    needs: release
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    environment: release-downstream
+    permissions:
+      contents: read
+    steps:
+      - name: Downstream release state
+        run: |
+          cat <<'EOF'
+          GitHub Release artifacts, checksums, .deb package, and attestations are published.
+
+          Homebrew and APT publication are intentionally gated until the downstream
+          repositories and secrets documented in docs/release.md are provisioned:
+          - TAP_GITHUB_TOKEN for the dedicated Homebrew tap.
+          - APT_REPO_TOKEN, APT_GPG_PRIVATE_KEY, and APT_GPG_PASSPHRASE for the signed APT repo.
+          EOF
