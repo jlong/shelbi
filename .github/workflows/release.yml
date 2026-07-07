@@ -113,7 +113,10 @@ jobs:
       - validate
       - smoke
     if: needs.validate.outputs.dry_run == 'true'
-    runs-on: ubuntu-latest
+    # macos-14: darwin targets need a real macOS SDK for framework linking
+    # (zig cross-compilation from Linux fails on -framework CoreFoundation).
+    # The Linux target cross-compiles fine from macOS via cargo-zigbuild.
+    runs-on: macos-14
     permissions:
       contents: read
     env:
@@ -153,7 +156,10 @@ jobs:
       - validate
       - smoke
     if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
-    runs-on: ubuntu-latest
+    # macos-14: darwin targets need a real macOS SDK for framework linking
+    # (zig cross-compilation from Linux fails on -framework CoreFoundation).
+    # The Linux target cross-compiles fine from macOS via cargo-zigbuild.
+    runs-on: macos-14
     environment: release
     permissions:
       contents: write
