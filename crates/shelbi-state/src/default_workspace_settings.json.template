@@ -5,7 +5,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "mkdir -p .shelbi/messages\nif [ -z \"$TASK_ID\" ]; then\n  printf '%s no TASK_ID in env; message-tail not started (sidebar-click pane, or dispatch env leak)\\n' \"$(date -u +%Y-%m-%dT%H:%M:%SZ)\" >> .shelbi/messages/.no-task-id.log\n  echo 'shelbi: SessionStart hook: TASK_ID unset — message channel disabled for this session' >&2\n  exit 0\nfi\nLOCKDIR=.shelbi/messages/$TASK_ID.tail.d\nif [ -f \"$LOCKDIR/pid\" ]; then\n  kill \"$(cat $LOCKDIR/pid)\" 2>/dev/null || true\n  rm -rf \"$LOCKDIR\"\nfi\nmkdir -p \"$LOCKDIR\"\ntouch .shelbi/messages/$TASK_ID.log\ntail -f -n 0 .shelbi/messages/$TASK_ID.log > .shelbi/messages/$TASK_ID.unread.log 2>/dev/null &\necho $! > \"$LOCKDIR/pid\""
+            "command": ".shelbi/hooks/claude.session-start"
           }
         ]
       }
@@ -13,14 +13,14 @@
     "Stop": [
       {
         "hooks": [
-          { "type": "command", "command": "printf '\\033]2;shelbi:idle\\007'" }
+          { "type": "command", "command": ".shelbi/hooks/claude.pane-idle" }
         ]
       },
       {
         "hooks": [
           {
             "type": "command",
-            "command": "[ -n \"$TASK_ID\" ] || exit 0\nUNREAD=.shelbi/messages/$TASK_ID.unread.log\nPROC=$UNREAD.processing\nif [ -s \"$UNREAD\" ]; then\n  mv \"$UNREAD\" \"$PROC\"\n  touch \"$UNREAD\"\n  echo \"<system-reminder>New orchestrator messages:\"\n  cat \"$PROC\"\n  echo \"</system-reminder>\"\n  if [ -n \"$SHELBI_HUB_SOCK\" ] && command -v jq >/dev/null 2>&1 && command -v nc >/dev/null 2>&1; then\n    jq -r '.msg_id // empty' \"$PROC\" 2>/dev/null | while read MSG_ID; do\n      [ -n \"$MSG_ID\" ] || continue\n      printf '{\"verb\":\"message-ack\",\"project\":\"%s\",\"task_id\":\"%s\",\"msg_id\":\"%s\"}\\n' \"$PROJECT\" \"$TASK_ID\" \"$MSG_ID\" | nc -U \"$SHELBI_HUB_SOCK\" 2>/dev/null || true\n    done\n  fi\n  rm \"$PROC\"\nfi"
+            "command": ".shelbi/hooks/claude.stop"
           }
         ]
       }
@@ -28,21 +28,21 @@
     "Notification": [
       {
         "hooks": [
-          { "type": "command", "command": "printf '\\033]2;shelbi:blocked\\007'" }
+          { "type": "command", "command": ".shelbi/hooks/claude.pane-blocked" }
         ]
       }
     ],
     "UserPromptSubmit": [
       {
         "hooks": [
-          { "type": "command", "command": "printf '\\033]2;shelbi:working\\007'" }
+          { "type": "command", "command": ".shelbi/hooks/claude.pane-working" }
         ]
       }
     ],
     "PreToolUse": [
       {
         "hooks": [
-          { "type": "command", "command": "printf '\\033]2;shelbi:working\\007'" }
+          { "type": "command", "command": ".shelbi/hooks/claude.pane-working" }
         ]
       }
     ]

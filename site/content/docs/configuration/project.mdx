@@ -135,6 +135,11 @@ initial startup prompt containing the rendered orchestrator instructions
 and bootstrap request. Other runners launch exactly as configured. Put any
 required Codex mode flags in `agent_runners.codex.flags`.
 
+Worker hooks are deployed into each worktree under `.shelbi/hooks/`. Claude's
+`.claude/settings.json` references `.shelbi/hooks/claude.*`; Codex receives
+`core.hooksPath=.shelbi/hooks/codex.toml` on its launch command. Shelbi-owned
+hook files stay out of user-owned `.codex/` configuration.
+
 `orchestrator.runner` only controls the dashboard/orchestrator pane. It does
 not change worker slots. Worker slots use their own
 [`workspaces[].runner`](#workspaces) value, so a project can run a Codex

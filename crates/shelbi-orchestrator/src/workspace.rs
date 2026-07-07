@@ -962,6 +962,7 @@ fn deploy_and_spawn(a: SpawnArgs<'_>) -> Result<()> {
     //    entire on-workspace footprint and we re-render it on every start.
     let rendered = render_workspace_settings_preferring_agent(a.project, a.agent)?;
     deploy_workspace_settings(a.host, a.worktree, &rendered)?;
+    deploy_runner_hooks(a.host, a.worktree)?;
 
     // 2b. Deploy the dispatched agent's `instructions.md` + skills into the
     //     worktree's `.claude/` footprint. The instructions file becomes the
@@ -1571,7 +1572,7 @@ fn require_runner_available(host: &Host, runner: &shelbi_core::AgentRunnerSpec) 
 fn runner_label(command: &str) -> &'static str {
     if shelbi_agent::is_claude_runner(command) {
         "Claude"
-    } else if is_codex_runner(command) {
+    } else if shelbi_agent::is_codex_runner(command) {
         "Codex"
     } else {
         "agent runner"
@@ -1685,11 +1686,186 @@ pub fn deploy_workspace_settings(
 /// debugging an agent that loaded the wrong prompt.
 pub const WORKTREE_AGENT_INSTRUCTIONS_REL: &str = ".claude/agent-instructions.md";
 pub const WORKTREE_STARTUP_PROMPT_REL: &str = ".shelbi/startup-prompt.md";
+pub const WORKTREE_CODEX_HOOKS_REL: &str = ".shelbi/hooks/codex.toml";
 
 /// Relative path (from the worktree root) where the dispatched agent's
 /// `skills/` directory is mounted. Claude Code auto-loads any
 /// `.claude/skills/` entries on launch.
 pub const WORKTREE_AGENT_SKILLS_REL: &str = ".claude/skills";
+
+const MESSAGE_TAIL_START_SH: &str = r#"#!/bin/sh
+mkdir -p .shelbi/messages
+if [ -z "${TASK_ID:-}" ]; then
+  printf '%s no TASK_ID in env; message-tail not started (sidebar-click pane, or dispatch env leak)\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> .shelbi/messages/.no-task-id.log
+  echo 'shelbi: SessionStart hook: TASK_ID unset; message channel disabled for this session' >&2
+  exit 0
+fi
+LOCKDIR=.shelbi/messages/$TASK_ID.tail.d
+if [ -f "$LOCKDIR/pid" ]; then
+  kill "$(cat "$LOCKDIR/pid")" 2>/dev/null || true
+  rm -rf "$LOCKDIR"
+fi
+mkdir -p "$LOCKDIR"
+touch .shelbi/messages/$TASK_ID.log
+tail -f -n 0 .shelbi/messages/$TASK_ID.log > .shelbi/messages/$TASK_ID.unread.log 2>/dev/null &
+echo $! > "$LOCKDIR/pid"
+"#;
+
+const MESSAGE_DRAIN_STOP_SH: &str = r#"#!/bin/sh
+[ -n "${TASK_ID:-}" ] || exit 0
+UNREAD=.shelbi/messages/$TASK_ID.unread.log
+PROC=$UNREAD.processing
+if [ -s "$UNREAD" ]; then
+  mv "$UNREAD" "$PROC"
+  touch "$UNREAD"
+  echo "<system-reminder>New orchestrator messages:"
+  cat "$PROC"
+  echo "</system-reminder>"
+  if [ -n "${SHELBI_HUB_SOCK:-}" ] && command -v jq >/dev/null 2>&1 && command -v nc >/dev/null 2>&1; then
+    jq -r '.msg_id // empty' "$PROC" 2>/dev/null | while read MSG_ID; do
+      [ -n "$MSG_ID" ] || continue
+      printf '{"verb":"message-ack","project":"%s","task_id":"%s","msg_id":"%s"}\n' "$PROJECT" "$TASK_ID" "$MSG_ID" | nc -U "$SHELBI_HUB_SOCK" 2>/dev/null || true
+    done
+  fi
+  rm "$PROC"
+fi
+"#;
+
+const PANE_IDLE_SH: &str = "#!/bin/sh\nprintf '\\033]2;shelbi:idle\\007'\n";
+const PANE_WORKING_SH: &str = "#!/bin/sh\nprintf '\\033]2;shelbi:working\\007'\n";
+const PANE_BLOCKED_SH: &str = "#!/bin/sh\nprintf '\\033]2;shelbi:blocked\\007'\n";
+
+const CODEX_HOOKS_TOML: &str = r#"SessionStart = ".shelbi/hooks/codex.session-start"
+UserPromptSubmit = ".shelbi/hooks/codex.pane-working"
+PreToolUse = ".shelbi/hooks/codex.pane-working"
+PostToolUse = ".shelbi/hooks/codex.stop"
+Stop = [".shelbi/hooks/codex.pane-idle", ".shelbi/hooks/codex.stop"]
+"#;
+
+struct RunnerHookFile {
+    rel_path: &'static str,
+    body: &'static str,
+    executable: bool,
+}
+
+const RUNNER_HOOK_FILES: &[RunnerHookFile] = &[
+    RunnerHookFile {
+        rel_path: ".shelbi/hooks/claude.session-start",
+        body: MESSAGE_TAIL_START_SH,
+        executable: true,
+    },
+    RunnerHookFile {
+        rel_path: ".shelbi/hooks/claude.stop",
+        body: MESSAGE_DRAIN_STOP_SH,
+        executable: true,
+    },
+    RunnerHookFile {
+        rel_path: ".shelbi/hooks/claude.pane-idle",
+        body: PANE_IDLE_SH,
+        executable: true,
+    },
+    RunnerHookFile {
+        rel_path: ".shelbi/hooks/claude.pane-working",
+        body: PANE_WORKING_SH,
+        executable: true,
+    },
+    RunnerHookFile {
+        rel_path: ".shelbi/hooks/claude.pane-blocked",
+        body: PANE_BLOCKED_SH,
+        executable: true,
+    },
+    RunnerHookFile {
+        rel_path: ".shelbi/hooks/codex.session-start",
+        body: MESSAGE_TAIL_START_SH,
+        executable: true,
+    },
+    RunnerHookFile {
+        rel_path: ".shelbi/hooks/codex.stop",
+        body: MESSAGE_DRAIN_STOP_SH,
+        executable: true,
+    },
+    RunnerHookFile {
+        rel_path: ".shelbi/hooks/codex.pane-idle",
+        body: PANE_IDLE_SH,
+        executable: true,
+    },
+    RunnerHookFile {
+        rel_path: ".shelbi/hooks/codex.pane-working",
+        body: PANE_WORKING_SH,
+        executable: true,
+    },
+    RunnerHookFile {
+        rel_path: WORKTREE_CODEX_HOOKS_REL,
+        body: CODEX_HOOKS_TOML,
+        executable: false,
+    },
+];
+
+/// Deploy Shelbi-owned hook implementations under `<worktree>/.shelbi/hooks`.
+///
+/// Runner-owned config files stay as thin adapters: Claude's
+/// `.claude/settings.json` calls the `claude.*` scripts, and Codex is launched
+/// with `core.hooksPath=.shelbi/hooks/codex.toml`. The hook bodies live in
+/// Shelbi's scratch namespace so dispatches do not overwrite user-owned
+/// `.codex/` config and only rewrite Shelbi-owned files.
+pub fn deploy_runner_hooks(host: &Host, worktree: &Path) -> Result<()> {
+    for file in RUNNER_HOOK_FILES {
+        deploy_runner_hook_file(host, worktree, file)?;
+    }
+    Ok(())
+}
+
+fn deploy_runner_hook_file(host: &Host, worktree: &Path, file: &RunnerHookFile) -> Result<()> {
+    let dest = worktree.join(file.rel_path);
+    let dest_dir = dest
+        .parent()
+        .ok_or_else(|| Error::Other(format!("invalid runner hook path `{}`", file.rel_path)))?;
+    match host {
+        Host::Local => {
+            std::fs::create_dir_all(dest_dir).map_err(Error::Io)?;
+            std::fs::write(&dest, file.body).map_err(Error::Io)?;
+            if file.executable {
+                set_executable(&dest)?;
+            }
+            Ok(())
+        }
+        Host::Ssh { host: ssh_host } => {
+            scp_text_to_remote(
+                ssh_host,
+                &dest_dir.to_string_lossy(),
+                &dest.to_string_lossy(),
+                file.body,
+                "runner-hook",
+            )?;
+            if file.executable {
+                let chmod = shelbi_ssh::run(host, ["chmod", "755", &dest.to_string_lossy()])
+                    .map_err(Error::Io)?;
+                if !chmod.status.success() {
+                    return Err(Error::Command {
+                        cmd: format!("chmod 755 {}", dest.display()),
+                        status: chmod.status.to_string(),
+                        stderr: String::from_utf8_lossy(&chmod.stderr).into_owned(),
+                    });
+                }
+            }
+            Ok(())
+        }
+    }
+}
+
+#[cfg(unix)]
+fn set_executable(path: &Path) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let mut perms = std::fs::metadata(path).map_err(Error::Io)?.permissions();
+    perms.set_mode(0o755);
+    std::fs::set_permissions(path, perms).map_err(Error::Io)
+}
+
+#[cfg(not(unix))]
+fn set_executable(_path: &Path) -> Result<()> {
+    Ok(())
+}
 
 /// Deploy the dispatched agent's `instructions.md` to the worktree and
 /// refresh `.claude/skills/` from the agent's `skills/` directory. One
@@ -2127,7 +2303,8 @@ pub fn workspace_launch_command_with_startup_prompt(
     // so the pane reloads its prior conversation instead of starting cold —
     // see [`shelbi_agent::with_continue`]. It's a no-op for a normal dispatch
     // and for non-claude runners.
-    let runner_with_mode = shelbi_agent::with_permission_mode(runner, permissions_mode);
+    let runner_with_hooks = shelbi_agent::with_codex_hooks(runner, WORKTREE_CODEX_HOOKS_REL);
+    let runner_with_mode = shelbi_agent::with_permission_mode(&runner_with_hooks, permissions_mode);
     let runner_resolved = shelbi_agent::with_continue(&runner_with_mode, resume);
     let launch = with_agent_system_prompt(
         &shelbi_agent::launch_command(&runner_resolved),
@@ -2210,13 +2387,6 @@ fn with_startup_prompt(
         ),
         PromptInjectionKind::Paste => launch.to_string(),
     }
-}
-
-fn is_codex_runner(command: &str) -> bool {
-    std::path::Path::new(command)
-        .file_name()
-        .and_then(|s| s.to_str())
-        == Some("codex")
 }
 
 /// Build the `host:path` target scp expects, shell-escaping the *path*
@@ -2402,7 +2572,7 @@ fn compose_prompt(
 /// Reusing `compose_prompt` for the body + handoff keeps the resume path from
 /// drifting from the dev-start path on the load-bearing bits (the atomic marker
 /// write, the rebase-before-marker ordering, the message-polling section for
-/// non-hook runners).
+/// runners Shelbi cannot wire with hooks).
 #[allow(clippy::too_many_arguments)]
 fn compose_resume_prompt(
     task_id: &str,
@@ -2445,8 +2615,8 @@ fn compose_resume_prompt(
 }
 
 /// The pull-style message-delivery paragraph appended to the prompt for
-/// runners without a hook surface (codex, aider, …). Claude Code receives
-/// hub messages through its hooks and never sees this section.
+/// runners without a hook surface (aider, custom CLIs, …). Claude and Codex
+/// receive hub messages through hooks and never see this section.
 ///
 /// Codex drives every step — file reads, edits, and commands — through its
 /// `shell` tool, so "after every shell command" is the concrete, guaranteed
@@ -3158,7 +3328,7 @@ mod tests {
     fn resume_adds_continue_flag_only_for_claude() {
         // `shelbi task resume` builds the launch with resume=true. A claude
         // runner gains `--continue` so it reloads its prior conversation; a
-        // non-claude runner has no such flag shelbi drives, so it's untouched.
+        // non-claude runner has no such flag shelbi drives.
         let p = fixture_project();
         let claude = p.runner("claude").unwrap();
         let launch = workspace_launch_command(claude, &p.workspace_permissions_mode, false, true);
@@ -3177,6 +3347,10 @@ mod tests {
         assert!(
             !launch.contains("--continue"),
             "non-claude runner must not get --continue: {launch}"
+        );
+        assert!(
+            launch.contains("core.hooksPath=.shelbi/hooks/codex.toml"),
+            "codex still gets Shelbi hook wiring: {launch}"
         );
 
         // A normal (non-resume) dispatch never adds --continue, even for claude.
@@ -3204,7 +3378,7 @@ mod tests {
         );
         assert_eq!(
             launch,
-            "codex --model gpt-5 \"$(cat .shelbi/startup-prompt.md)\"",
+            "codex --model gpt-5 -c core.hooksPath=.shelbi/hooks/codex.toml --dangerously-bypass-hook-trust \"$(cat .shelbi/startup-prompt.md)\"",
         );
         assert!(
             !launch.contains("--permission-mode"),
@@ -3825,9 +3999,10 @@ mod tests {
     }
 
     #[test]
-    fn spawn_path_leaves_non_claude_runners_alone() {
+    fn spawn_path_wires_codex_hooks_without_claude_permission_mode() {
         // Codex doesn't understand --permission-mode; injecting it would
-        // crash the runner on launch.
+        // crash the runner on launch. It does receive Shelbi's Codex hook
+        // config path.
         let mut p = fixture_project();
         p.agent_runners.insert(
             "codex".into(),
@@ -3839,10 +4014,12 @@ mod tests {
             },
         );
         let runner = p.runner("codex").unwrap().clone();
-        let runner_with_mode =
-            shelbi_agent::with_permission_mode(&runner, &p.workspace_permissions_mode);
-        let launch = shelbi_agent::launch_command(&runner_with_mode);
-        assert_eq!(launch, "codex --print");
+        let launch = workspace_launch_command(&runner, &p.workspace_permissions_mode, false, false);
+        assert_eq!(
+            launch,
+            "codex --print -c core.hooksPath=.shelbi/hooks/codex.toml --dangerously-bypass-hook-trust",
+        );
+        assert!(!launch.contains("--permission-mode"));
     }
 
     #[test]
@@ -3936,6 +4113,110 @@ mod tests {
         deploy_workspace_settings(&Host::Local, &worktree, updated).unwrap();
         let actual2 = std::fs::read_to_string(&settings).unwrap();
         assert_eq!(actual2, updated);
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn deploy_runner_hooks_writes_shelbi_owned_scripts_and_codex_config() {
+        let tmp = std::env::temp_dir().join(format!(
+            "shelbi-runner-hooks-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let worktree = tmp.join("wt");
+        std::fs::create_dir_all(&worktree).unwrap();
+
+        deploy_runner_hooks(&Host::Local, &worktree).unwrap();
+
+        let claude_start = worktree.join(".shelbi/hooks/claude.session-start");
+        let claude_stop = worktree.join(".shelbi/hooks/claude.stop");
+        let codex_config = worktree.join(WORKTREE_CODEX_HOOKS_REL);
+        assert!(claude_start.is_file(), "missing {}", claude_start.display());
+        assert!(claude_stop.is_file(), "missing {}", claude_stop.display());
+        assert!(codex_config.is_file(), "missing {}", codex_config.display());
+
+        let start_body = std::fs::read_to_string(&claude_start).unwrap();
+        assert!(start_body.contains(".shelbi/messages/$TASK_ID.tail.d"));
+        assert!(start_body.contains(".no-task-id.log"));
+
+        let stop_body = std::fs::read_to_string(&claude_stop).unwrap();
+        assert!(stop_body.contains("UNREAD=.shelbi/messages/$TASK_ID.unread.log"));
+        assert!(stop_body.contains("message-ack"));
+        assert!(stop_body.contains("$SHELBI_HUB_SOCK"));
+
+        let codex_body = std::fs::read_to_string(&codex_config).unwrap();
+        assert!(codex_body.contains("SessionStart = \".shelbi/hooks/codex.session-start\""));
+        assert!(codex_body.contains("PostToolUse = \".shelbi/hooks/codex.stop\""));
+        assert!(codex_body.contains("Stop = [\".shelbi/hooks/codex.pane-idle\""));
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&claude_start)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(mode, 0o755);
+        }
+
+        assert!(
+            !worktree.join(".codex").exists(),
+            "Shelbi must not create or overwrite user-owned .codex config",
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn deployed_claude_session_start_hook_starts_tail_and_logs_missing_task_id() {
+        let tmp = std::env::temp_dir().join(format!(
+            "shelbi-runner-hooks-exec-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let worktree = tmp.join("wt");
+        std::fs::create_dir_all(&worktree).unwrap();
+        deploy_runner_hooks(&Host::Local, &worktree).unwrap();
+
+        let script = ".shelbi/hooks/claude.session-start";
+        let missing = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(script)
+            .env_remove("TASK_ID")
+            .current_dir(&worktree)
+            .output()
+            .expect("run hook without task id");
+        assert!(missing.status.success());
+        assert!(
+            String::from_utf8_lossy(&missing.stderr).contains("TASK_ID unset"),
+            "missing-task warning should be visible",
+        );
+        assert!(worktree.join(".shelbi/messages/.no-task-id.log").is_file());
+
+        let out = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(script)
+            .env("TASK_ID", "feat-x")
+            .current_dir(&worktree)
+            .output()
+            .expect("run hook with task id");
+        assert!(out.status.success(), "hook must succeed: {:?}", out.status);
+
+        let pid_path = worktree.join(".shelbi/messages/feat-x.tail.d/pid");
+        assert!(pid_path.is_file(), "tail pid file missing");
+        let pid = std::fs::read_to_string(&pid_path).unwrap();
+        let _ = std::process::Command::new("kill")
+            .arg("-TERM")
+            .arg(pid.trim())
+            .output();
 
         let _ = std::fs::remove_dir_all(&tmp);
     }
