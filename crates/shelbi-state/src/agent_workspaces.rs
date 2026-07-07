@@ -22,8 +22,10 @@
 //! Both are materialized on first [`materialize_default_agents`] (called
 //! from `shelbi init`) and self-healed by [`self_heal_default_agents`]
 //! (called from `shelbi reload`). User edits to `instructions.md` are
-//! preserved on self-heal — a byte-compare against the bundled default
-//! decides whether to fire the "you've customized this agent" notice.
+//! preserved on self-heal. Runner-critical orchestrator sections are
+//! merged into customized prompts when missing; otherwise a byte-compare
+//! against the bundled default decides whether to fire the "you've
+//! customized this agent" notice.
 
 use std::fs;
 use std::path::PathBuf;
@@ -89,6 +91,11 @@ pub const DEFAULT_REVIEW_INSTRUCTIONS: &str = include_str!("default_review.md.te
 /// Kept in the agent (Decision A in the review-workspaces plan) rather
 /// than in Rust so per-repo detection stays flexible without schema churn.
 pub const DEFAULT_REVIEW_LOAD_RUN_SKILL: &str = include_str!("skills/load_run_detection.SKILL.md");
+
+/// Bundled orchestrator sections that are operational contracts with the
+/// runner, not optional style guidance. Customized orchestrator prompts keep
+/// their local edits, but `shelbi reload` appends these sections if missing.
+const REQUIRED_ORCHESTRATOR_SECTION_HEADINGS: &[&str] = &["## Polling-only event drain"];
 
 /// One bundled file under a default agent's `skills/` directory. `rel_path`
 /// is relative to `<workspace>/skills/` and may include subdirectories
@@ -584,6 +591,14 @@ pub enum AgentMaterializeOutcome {
     /// divergence — callers should surface a user-facing notice in
     /// that case and stay silent otherwise.
     Preserved { agent: String, first_notice: bool },
+    /// The agent had user-customized `instructions.md`, but self-heal merged
+    /// missing runner-critical sections from the bundled default without
+    /// overwriting the rest of the file.
+    RepairedRequiredSections {
+        agent: String,
+        sections: Vec<String>,
+        first_notice: bool,
+    },
 }
 
 impl AgentMaterializeOutcome {
@@ -593,7 +608,8 @@ impl AgentMaterializeOutcome {
             Self::Created { agent }
             | Self::Unchanged { agent }
             | Self::Upgraded { agent }
-            | Self::Preserved { agent, .. } => agent,
+            | Self::Preserved { agent, .. }
+            | Self::RepairedRequiredSections { agent, .. } => agent,
         }
     }
 }
@@ -753,22 +769,113 @@ pub fn self_heal_default_agents(project: &str) -> Result<Vec<AgentMaterializeOut
                     });
                 }
                 AgentDivergence::Customized => {
-                    // Genuine user edit — leave it untouched and keep the
-                    // recorded provenance so reverting to the deployed
-                    // default is recognized later. Fire the notice once.
+                    let repair = repair_required_instruction_sections(
+                        agent.name,
+                        agent.instructions,
+                        &current,
+                    )?;
                     let first_notice = state
                         .notified_diverged_agents
                         .insert(agent.name.to_string());
-                    outcomes.push(AgentMaterializeOutcome::Preserved {
-                        agent: agent.name.to_string(),
-                        first_notice,
-                    });
+                    if let Some(repair) = repair {
+                        atomic_write(&path, repair.body.as_bytes())?;
+                        outcomes.push(AgentMaterializeOutcome::RepairedRequiredSections {
+                            agent: agent.name.to_string(),
+                            sections: repair.sections,
+                            first_notice,
+                        });
+                    } else {
+                        // Genuine user edit — leave it untouched and keep the
+                        // recorded provenance so reverting to the deployed
+                        // default is recognized later. Fire the notice once.
+                        outcomes.push(AgentMaterializeOutcome::Preserved {
+                            agent: agent.name.to_string(),
+                            first_notice,
+                        });
+                    }
                 }
             }
         }
 
         Ok(outcomes)
     })
+}
+
+struct RequiredSectionRepair {
+    body: String,
+    sections: Vec<String>,
+}
+
+fn repair_required_instruction_sections(
+    agent_name: &str,
+    default_body: &str,
+    current: &str,
+) -> Result<Option<RequiredSectionRepair>> {
+    if agent_name != ORCHESTRATOR_AGENT {
+        return Ok(None);
+    }
+
+    let mut repaired = current.to_string();
+    let mut added = Vec::new();
+    for heading in REQUIRED_ORCHESTRATOR_SECTION_HEADINGS {
+        if markdown_contains_heading(&repaired, heading) {
+            continue;
+        }
+        let section = extract_markdown_section(default_body, heading).ok_or_else(|| {
+            Error::Other(format!(
+                "bundled orchestrator instructions missing required section `{heading}`"
+            ))
+        })?;
+        if !repaired.ends_with('\n') {
+            repaired.push('\n');
+        }
+        repaired.push('\n');
+        repaired.push_str(section.trim_end());
+        repaired.push('\n');
+        added.push((*heading).to_string());
+    }
+
+    if added.is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(RequiredSectionRepair {
+            body: repaired,
+            sections: added,
+        }))
+    }
+}
+
+fn markdown_contains_heading(body: &str, heading: &str) -> bool {
+    body.lines().any(|line| line.trim_end() == heading)
+}
+
+fn extract_markdown_section<'a>(body: &'a str, heading: &str) -> Option<&'a str> {
+    let start = body.find(heading)?;
+    if start > 0 && body.as_bytes().get(start - 1) != Some(&b'\n') {
+        return None;
+    }
+    let after_heading = start + heading.len();
+    if !matches!(
+        body.as_bytes().get(after_heading),
+        None | Some(b'\n' | b'\r')
+    ) {
+        return None;
+    }
+
+    let rest = &body[after_heading..];
+    let end = rest
+        .match_indices('\n')
+        .skip(1)
+        .find_map(|(idx, _)| {
+            let line_start = after_heading + idx + 1;
+            let line = body[line_start..]
+                .split_once('\n')
+                .map(|(line, _)| line)
+                .unwrap_or(&body[line_start..]);
+            line.starts_with("## ").then_some(line_start)
+        })
+        .unwrap_or(body.len());
+    Some(&body[start..end])
 }
 
 /// Create `<workspace>/` and `<workspace>/skills/`, then write
@@ -1111,7 +1218,8 @@ mod tests {
         materialize_default_agents("p").unwrap();
         // Provenance says v1 was deployed; the user then edited the file.
         let v1 = "# previous bundled default\n";
-        let custom = "# my orchestrator\nlocal rules\n";
+        let custom =
+            "# my orchestrator\nlocal rules\n\n## Polling-only event drain\n\nLocal copy.\n";
         let path = agent_instructions_path("p", ORCHESTRATOR_AGENT).unwrap();
         fs::write(&path, custom).unwrap();
         update_state("p", |s| {
@@ -1144,6 +1252,68 @@ mod tests {
                 .map(String::as_str),
             Some(content_hash(v1).as_str()),
         );
+
+        std::env::remove_var("SHELBI_HOME");
+    }
+
+    #[test]
+    fn self_heal_repairs_custom_orchestrator_missing_polling_drain_section() {
+        let _g = LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+
+        materialize_default_agents("p").unwrap();
+        let custom = "# Local Orchestrator\n\nKeep my local scheduling rule.\n";
+        let path = agent_instructions_path("p", ORCHESTRATOR_AGENT).unwrap();
+        fs::write(&path, custom).unwrap();
+
+        let outcomes = self_heal_default_agents("p").unwrap();
+        let orch = outcomes
+            .iter()
+            .find(|o| o.agent() == ORCHESTRATOR_AGENT)
+            .unwrap();
+        assert_eq!(
+            orch,
+            &AgentMaterializeOutcome::RepairedRequiredSections {
+                agent: ORCHESTRATOR_AGENT.to_string(),
+                sections: vec!["## Polling-only event drain".to_string()],
+                first_notice: true,
+            },
+        );
+
+        let repaired = fs::read_to_string(&path).unwrap();
+        assert!(repaired.starts_with(custom));
+        assert!(repaired.contains("## Polling-only event drain"));
+        assert!(repaired.contains("shelbi orchestrator events drain --cursor \"$CURSOR\""));
+        assert!(repaired.contains("fall back to\nreading `~/.shelbi/events.log`"));
+
+        std::env::remove_var("SHELBI_HOME");
+    }
+
+    #[test]
+    fn self_heal_preserves_custom_orchestrator_when_polling_drain_present() {
+        let _g = LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+
+        materialize_default_agents("p").unwrap();
+        let custom = "# Local Orchestrator\n\n## Polling-only event drain\n\nLocal copy.\n";
+        let path = agent_instructions_path("p", ORCHESTRATOR_AGENT).unwrap();
+        fs::write(&path, custom).unwrap();
+
+        let outcomes = self_heal_default_agents("p").unwrap();
+        let orch = outcomes
+            .iter()
+            .find(|o| o.agent() == ORCHESTRATOR_AGENT)
+            .unwrap();
+        assert_eq!(
+            orch,
+            &AgentMaterializeOutcome::Preserved {
+                agent: ORCHESTRATOR_AGENT.to_string(),
+                first_notice: true,
+            },
+        );
+        assert_eq!(fs::read_to_string(&path).unwrap(), custom);
 
         std::env::remove_var("SHELBI_HOME");
     }
@@ -1223,7 +1393,8 @@ mod tests {
         std::env::set_var("SHELBI_HOME", &home);
 
         materialize_default_agents("p").unwrap();
-        let custom = "# my orchestrator\nlocal rules go here\n";
+        let custom =
+            "# my orchestrator\nlocal rules go here\n\n## Polling-only event drain\n\nLocal copy.\n";
         let path = agent_instructions_path("p", ORCHESTRATOR_AGENT).unwrap();
         fs::write(&path, custom).unwrap();
 
@@ -1333,17 +1504,37 @@ mod tests {
     #[test]
     fn orchestrator_template_contains_review_workspace_rules() {
         let t = DEFAULT_ORCHESTRATOR_INSTRUCTIONS;
-        // Auto-load trigger: the handoff reaction loads onto a review slot.
-        assert!(t.contains("shelbi review <id>"));
+        // Review is the tag-plus-transition model — the prompt names the
+        // `review` tag as what marks a review workspace (no `role:`, no
+        // dedicated command).
+        assert!(t.contains("`review` tag"));
         // Scarcity/queue: the pending-load sub-state is the queue signal.
         assert!(t.contains("pending-load"));
-        // Free-on-resolve: the review-workspace-free event drains the queue.
+        // Free-on-resolve: the review-workspace-free event frees the slot.
         assert!(t.contains("review** workspace"));
         // Dev session closes on completion (§16) — the orchestrator must know
         // the freed dev slot needs no teardown from it.
         assert!(t.contains("closes its own session"));
         // Zen gate: review-routed tasks are the human path, never auto-merged.
         assert!(t.contains("review-workspace gate"));
+    }
+
+    /// Anti-drift guard for the docs/CLI mismatch that stalled a handoff:
+    /// the orchestrator prompt once told the agent to run `shelbi review
+    /// <id>`, but that subcommand was deleted in the Phase 2 tags+transitions
+    /// refactor — running it now yields `unrecognized subcommand review`.
+    /// Review loading is the tag-plus-transition model (human-driven from the
+    /// sidebar), so no `shelbi review <…>` *invocation* may appear in the
+    /// prompt. Corrective prose ("there is no `shelbi review` command") is
+    /// deliberately allowed — only the placeholder-arg *usage* form is banned.
+    #[test]
+    fn orchestrator_template_does_not_invoke_deleted_review_command() {
+        assert!(
+            !DEFAULT_ORCHESTRATOR_INSTRUCTIONS.contains("shelbi review <"),
+            "orchestrator prompt invokes the deleted `shelbi review` \
+             subcommand — route review loads via status tags + transitions \
+             instead (see site/content/docs/concepts/review-workspaces.mdx)"
+        );
     }
 
     /// Sanity-check the developer prompt has the spec-required hooks
@@ -1702,9 +1893,9 @@ mod tests {
 
     /// `shelbi init` happy path for per-role settings.json: both default
     /// Claude-Code agents land with their `settings.json` containing the
-    /// SessionStart + Stop message-tail hook scripts. This is the file
-    /// the deploy path prefers over the project-wide workspace-settings
-    /// template on each task dispatch (Phase 7).
+    /// SessionStart + Stop hook adapters. This is the file the deploy path
+    /// prefers over the project-wide workspace-settings template on each task
+    /// dispatch (Phase 7).
     #[test]
     fn materialize_writes_per_role_settings_json_with_message_hooks() {
         let _g = LOCK.lock().unwrap_or_else(|p| p.into_inner());
@@ -1718,16 +1909,16 @@ mod tests {
             let body = fs::read_to_string(&settings).unwrap();
             assert!(body.contains("SessionStart"), "{name} missing SessionStart");
             assert!(
-                body.contains(".shelbi/messages/$TASK_ID.tail.d"),
-                "{name} missing tail-lock script"
+                body.contains(".shelbi/hooks/claude.session-start"),
+                "{name} missing SessionStart hook adapter"
             );
             assert!(
-                body.contains("UNREAD=.shelbi/messages/$TASK_ID.unread.log"),
-                "{name} missing Stop message-inject script"
+                body.contains(".shelbi/hooks/claude.stop"),
+                "{name} missing Stop message-inject hook adapter"
             );
             assert!(
-                body.contains("message-ack"),
-                "{name} missing message-ack write"
+                !body.contains(".shelbi/messages/$TASK_ID.tail.d"),
+                "{name} should not inline Shelbi hook bodies"
             );
         }
 

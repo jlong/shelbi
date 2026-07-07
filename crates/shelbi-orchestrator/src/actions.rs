@@ -2024,6 +2024,7 @@ mod tests {
             git: shelbi_core::GitConfig {
                 base_branch: None,
                 merge_strategy: strategy,
+                ..Default::default()
             },
         }
     }

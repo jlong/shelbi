@@ -77,7 +77,7 @@ pub enum TaskCmd {
         id: String,
         #[arg(long, value_name = "WORKSPACE")]
         workspace: Option<String>,
-        /// Override the default branch name (`shelbi/<task-id>`).
+        /// Override the generated branch name.
         #[arg(long)]
         branch: Option<String>,
         /// Reason string recorded in `~/.shelbi/events.log` when the
@@ -149,9 +149,10 @@ pub struct AddArgs {
     #[arg(long = "workflow", value_name = "NAME")]
     pub workflow: Option<String>,
     /// Pre-fill the task's `branch:` frontmatter field. Omit to let the
-    /// orchestrator cut `shelbi/<task-id>` off the resolved base branch
-    /// at dispatch time; supply a value to point the task at an existing
-    /// branch (the *release task* pattern in `Plans/workflows.md` §12).
+    /// orchestrator generate a branch from workflow config, project config,
+    /// or the GitHub username at dispatch time; supply a value to point the
+    /// task at an existing branch (the *release task* pattern in
+    /// `Plans/workflows.md` §12).
     #[arg(long = "branch", value_name = "BRANCH")]
     pub branch: Option<String>,
 }
@@ -801,7 +802,17 @@ fn start(
     let branch = branch_arg
         .map(str::to_string)
         .or_else(|| tf.task.branch.clone())
-        .unwrap_or_else(|| format!("shelbi/{id}"));
+        .map(Ok)
+        .unwrap_or_else(|| {
+            let workflow = shelbi_state::load_task_workflow(project, &project_yaml, &tf.task)
+                .unwrap_or_else(|_| shelbi_core::default_workflow());
+            shelbi_orchestrator::branch::branch_name_for_task(
+                &project_yaml,
+                Some(&workflow),
+                &tf.task,
+            )
+            .map_err(|e| anyhow!(e))
+        })?;
 
     // Resolve which agent runs in the spawned pane. `shelbi task start`
     // is always putting the task into `in_progress`, so we look up the
@@ -988,12 +999,12 @@ fn resume(
 
     // Resolve the branch WITHOUT cutting or resetting it: the branch already
     // exists (the worker created + committed on it). Prefer the task's recorded
-    // branch, falling back to the conventional `shelbi/<id>`.
-    let branch = tf
-        .task
-        .branch
-        .clone()
-        .unwrap_or_else(|| format!("shelbi/{id}"));
+    // branch, falling back through workflow/project/GitHub prefix resolution.
+    let workflow = shelbi_state::load_task_workflow(project, &project_yaml, &tf.task)
+        .map_err(|e| anyhow!(e))?;
+    let branch =
+        shelbi_orchestrator::branch::branch_name_for_task(&project_yaml, Some(&workflow), &tf.task)
+            .map_err(|e| anyhow!(e))?;
 
     // Same agent-resolution as `start` — the active status's agent under the
     // project's Zen state, developer as the fallback.
@@ -1112,7 +1123,7 @@ fn generate_unique_id(project: &str, title: &str) -> Result<String> {
     if candidate.len() > MAX_TASK_ID_LEN {
         bail!(
             "title is too long: it slugifies to a {}-byte id (max {MAX_TASK_ID_LEN}) — \
-             the workspace branch `shelbi/<id>` would exceed GitHub's 255-byte ref limit. \
+             the generated workspace branch would exceed GitHub's 255-byte ref limit. \
              Shorten the title or pass --id with an explicit shorter id.",
             candidate.len(),
         );

@@ -777,6 +777,14 @@ pub(super) fn print_agent_materialize_outcome(outcome: &AgentMaterializeOutcome)
                 println!("(preserved your custom agents/{agent}/instructions.md)");
             }
         }
+        AgentMaterializeOutcome::RepairedRequiredSections {
+            agent, sections, ..
+        } => {
+            println!(
+                "✓ repaired custom agents/{agent}/instructions.md — added required section(s): {}",
+                sections.join(", ")
+            );
+        }
     }
 }
 

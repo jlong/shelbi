@@ -36,18 +36,8 @@
 use shelbi_core::{Error, Host, Project, Result, StatusCategory, Task};
 use shelbi_state::TaskFile;
 
+use crate::branch;
 use crate::git::{locate_hub_workdir, run_in_dir};
-
-/// The branch a task's worktree should be on. Returns `task.branch` if
-/// already populated; otherwise the conventional `shelbi/<task-id>`.
-///
-/// Pure — no I/O. Use [`ensure_branch_for_in_progress`] when you also
-/// want the branch cut on disk + persisted into the task file.
-pub fn branch_name_for_task(task: &Task) -> String {
-    task.branch
-        .clone()
-        .unwrap_or_else(|| format!("shelbi/{}", task.id))
-}
 
 /// Resolve the base branch a task's feature branch should be cut from.
 ///
@@ -167,7 +157,9 @@ pub fn cut_branch_on_hub(project: &Project, branch: &str, base: &str) -> Result<
 pub fn ensure_branch_for_in_progress(project: &Project, task_id: &str) -> Result<TaskFile> {
     let mut tf = shelbi_state::load_task(&project.name, task_id)?;
     let all_tasks = shelbi_state::list_tasks(&project.name)?;
-    let branch = branch_name_for_task(&tf.task);
+    let workflow = shelbi_state::load_task_workflow(&project.name, project, &tf.task)
+        .unwrap_or_else(|_| shelbi_core::default_workflow());
+    let branch = branch::branch_name_for_task(project, Some(&workflow), &tf.task)?;
     let base = resolve_base_branch(project, &tf.task, &all_tasks)?;
     cut_branch_on_hub(project, &branch, &base)?;
     if tf.task.branch.as_deref() != Some(branch.as_str()) {
@@ -293,6 +285,7 @@ mod tests {
             detected_shapes: Vec::new(),
             git: GitConfig {
                 base_branch: base_branch.map(String::from),
+                branch_prefix: Some("shelbi".into()),
                 ..Default::default()
             },
         }
@@ -334,20 +327,6 @@ mod tests {
     }
 
     // ----- branch_name_for_task ----------------------------------------
-
-    #[test]
-    fn branch_name_defaults_to_shelbi_slash_id_when_unset() {
-        let t = task_with("fix-login", Column::todo(), None, &[]);
-        assert_eq!(branch_name_for_task(&t), "shelbi/fix-login");
-    }
-
-    #[test]
-    fn branch_name_honors_existing_value() {
-        // Pre-set branch is the "release task" pattern from Plans/workflows.md
-        // §12: the user pins a specific ref instead of accepting the default.
-        let t = task_with("release", Column::todo(), Some("release/v1.2"), &[]);
-        assert_eq!(branch_name_for_task(&t), "release/v1.2");
-    }
 
     // ----- resolve_base_branch -----------------------------------------
 

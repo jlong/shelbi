@@ -316,6 +316,8 @@ pub(crate) mod test_support {
             git: GitConfig::default(),
         };
         shelbi_state::save_project(&project).unwrap();
+        shelbi_state::scaffold_project_statuses(project_name).unwrap();
+        shelbi_state::scaffold_project_workflow(project_name).unwrap();
         repo
     }
 }

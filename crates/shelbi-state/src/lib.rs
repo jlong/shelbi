@@ -2366,11 +2366,11 @@ mod tests {
         // The default no longer ships a permissions block — claude's
         // permission mode is passed on the CLI by the spawn path now. What
         // the default DOES ship is the title-state hooks the sidebar
-        // poller depends on.
+        // poller depends on, as script references under .shelbi/hooks.
         assert!(!rendered.contains("\"permissions\""));
         assert!(!rendered.contains("{{workspace_permissions_mode}}"));
-        assert!(rendered.contains("shelbi:idle"));
-        assert!(rendered.contains("shelbi:working"));
+        assert!(rendered.contains(".shelbi/hooks/claude.pane-idle"));
+        assert!(rendered.contains(".shelbi/hooks/claude.pane-working"));
         let _: serde_json::Value = serde_json::from_str(&rendered).unwrap();
         std::env::remove_var("SHELBI_HOME");
     }
@@ -2427,9 +2427,15 @@ mod tests {
         assert!(s.contains("Notification"));
         assert!(s.contains("UserPromptSubmit"));
         assert!(s.contains("PreToolUse"));
-        assert!(s.contains("shelbi:idle"));
-        assert!(s.contains("shelbi:blocked"));
-        assert!(s.contains("shelbi:working"));
+        assert!(s.contains(".shelbi/hooks/claude.session-start"));
+        assert!(s.contains(".shelbi/hooks/claude.stop"));
+        assert!(s.contains(".shelbi/hooks/claude.pane-idle"));
+        assert!(s.contains(".shelbi/hooks/claude.pane-blocked"));
+        assert!(s.contains(".shelbi/hooks/claude.pane-working"));
+        assert!(
+            !s.contains(".shelbi/messages/$TASK_ID.tail.d"),
+            "hook bodies must live under .shelbi/hooks, not inline in settings.json",
+        );
         // The default ships ready to use — no substitution required.
         let _: serde_json::Value =
             serde_json::from_str(s).expect("default template is valid JSON as-shipped");
@@ -2450,128 +2456,22 @@ mod tests {
         );
     }
 
-    /// Regression: the SessionStart hook must NOT silently exit 0 when
-    /// `$TASK_ID` is unset — that was the bug that made `shelbi
-    /// message` look successful while the worker had no tail running.
-    /// The current shape:
-    ///  - `mkdir -p .shelbi/messages` (unconditional, so the dir exists
-    ///    even for sidebar-click panes with no assigned task).
-    ///  - When TASK_ID is empty: append to
-    ///    `.shelbi/messages/.no-task-id.log` and print a warning to
-    ///    stderr, THEN exit 0 (so the pane still starts).
-    ///
-    /// This test runs the hook body with TASK_ID unset in a temp
-    /// worktree and asserts both side-effects.
     #[test]
-    fn session_start_hook_records_diagnostic_when_task_id_missing() {
-        let tmp = std::env::temp_dir().join(format!(
-            "shelbi-sessionstart-hook-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        std::fs::create_dir_all(&tmp).unwrap();
-
-        // Yank the SessionStart hook command out of the template so the
-        // test exercises the actual shipped script — no drift between
-        // what the template ships and what this test asserts.
+    fn default_workspace_settings_template_is_thin_claude_adapter() {
         let v: serde_json::Value =
             serde_json::from_str(DEFAULT_WORKSPACE_SETTINGS_TEMPLATE).unwrap();
-        let cmd = v["hooks"]["SessionStart"][0]["hooks"][0]["command"]
-            .as_str()
-            .expect("SessionStart hook command must be a string");
-
-        // Run the hook with TASK_ID unset, cwd = temp worktree.
-        let out = std::process::Command::new("sh")
-            .arg("-c")
-            .arg(cmd)
-            .env_remove("TASK_ID")
-            .current_dir(&tmp)
-            .output()
-            .expect("run SessionStart hook");
-        assert!(
-            out.status.success(),
-            "hook should exit 0 (soft failure): status={:?} stderr={}",
-            out.status,
-            String::from_utf8_lossy(&out.stderr),
+        assert_eq!(
+            v["hooks"]["SessionStart"][0]["hooks"][0]["command"],
+            ".shelbi/hooks/claude.session-start",
         );
-        let stderr = String::from_utf8_lossy(&out.stderr);
-        assert!(
-            stderr.contains("TASK_ID unset"),
-            "hook must emit a loud stderr warning when TASK_ID missing, got: {stderr:?}"
+        assert_eq!(
+            v["hooks"]["Stop"][0]["hooks"][0]["command"],
+            ".shelbi/hooks/claude.pane-idle",
         );
-
-        // The messages dir must have been created even without a task
-        // (so downstream tools can inspect state without racing dir
-        // creation), and the diagnostic log must contain a timestamped
-        // line naming the failure mode.
-        let diag = tmp.join(".shelbi/messages/.no-task-id.log");
-        assert!(
-            diag.exists(),
-            "diagnostic log missing at {}",
-            diag.display()
+        assert_eq!(
+            v["hooks"]["Stop"][1]["hooks"][0]["command"],
+            ".shelbi/hooks/claude.stop",
         );
-        let body = std::fs::read_to_string(&diag).unwrap();
-        assert!(
-            body.contains("no TASK_ID"),
-            "diagnostic log missing marker: {body:?}"
-        );
-
-        let _ = std::fs::remove_dir_all(&tmp);
-    }
-
-    /// Positive path: when TASK_ID IS set, the hook creates the lock
-    /// dir, starts a tail, and records its pid — exactly the state
-    /// `shelbi message`'s delivery-verification probe checks for. This
-    /// is the round-trip contract between the two sides of the file
-    /// channel.
-    #[test]
-    fn session_start_hook_starts_tail_and_records_pid_when_task_id_set() {
-        let tmp = std::env::temp_dir().join(format!(
-            "shelbi-sessionstart-happy-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        std::fs::create_dir_all(&tmp).unwrap();
-
-        let v: serde_json::Value =
-            serde_json::from_str(DEFAULT_WORKSPACE_SETTINGS_TEMPLATE).unwrap();
-        let cmd = v["hooks"]["SessionStart"][0]["hooks"][0]["command"]
-            .as_str()
-            .unwrap();
-
-        let out = std::process::Command::new("sh")
-            .arg("-c")
-            .arg(cmd)
-            .env("TASK_ID", "feat-x")
-            .current_dir(&tmp)
-            .output()
-            .expect("run SessionStart hook");
-        assert!(out.status.success(), "hook must succeed: {:?}", out.status);
-
-        // Verify the durable beacon exists (this is what `shelbi
-        // message`'s tail_pid_alive probe reads).
-        let pid_path = tmp.join(".shelbi/messages/feat-x.tail.d/pid");
-        assert!(
-            pid_path.exists(),
-            "tail pid file missing at {}",
-            pid_path.display()
-        );
-        let pid_text = std::fs::read_to_string(&pid_path).unwrap();
-        let pid: libc::pid_t = pid_text.trim().parse().unwrap();
-
-        // Reap the tail we just spawned so it doesn't linger past the
-        // test run. Best-effort — a slow-to-die child is not this
-        // test's concern.
-        unsafe {
-            libc::kill(pid, libc::SIGTERM);
-        }
-        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     /// Acceptance criterion (a): the shipped default flows through the
