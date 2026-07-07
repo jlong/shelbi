@@ -244,7 +244,8 @@ A few things worth keeping when you fork the default prompt:
   `workspace list` snapshot and the tail process to do its job.
 - The polling-only event drain. Codex-backed and other polling-only runners
   must drain pending project events before each user-facing reply, using
-  `shelbi orchestrator events drain --cursor "$CURSOR"` or the documented
+  `shelbi orchestrator events drain` (the durable cursor is persisted in the
+  project config dir and resumes automatically) or the documented
   cursor-based `events.log` fallback if that CLI primitive is unavailable.
 - The **category-based** reaction-rule matching. Patterns key off
   `to_category=<c>` (`ready`, `handoff`) rather than the literal status

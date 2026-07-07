@@ -6,6 +6,7 @@
 use std::collections::{BTreeMap, HashSet};
 use std::fs;
 use std::io::{Read, Seek, SeekFrom};
+use std::path::PathBuf;
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -28,9 +29,11 @@ pub enum OrchestratorCmd {
 pub enum OrchestratorEventsCmd {
     /// Drain all currently pending project events since the cursor.
     Drain {
-        /// Durable cursor returned by a prior drain. Use `0` for the first read.
-        #[arg(long, default_value = "0")]
-        cursor: String,
+        /// Explicit cursor override. Omit to resume from — and persist back
+        /// to — the durable cursor in the project config dir. Use `0` to
+        /// replay the whole log from the start.
+        #[arg(long)]
+        cursor: Option<String>,
     },
     /// Wait up to `--timeout` for the next non-empty project event batch.
     Next {
@@ -48,7 +51,8 @@ pub fn run(project_opt: Option<String>, cmd: OrchestratorCmd) -> Result<()> {
     match cmd {
         OrchestratorCmd::Events { cmd } => match cmd {
             OrchestratorEventsCmd::Drain { cursor } => {
-                let response = drain_once(&project, parse_cursor(&cursor)?)?;
+                let cursor_override = cursor.as_deref().map(parse_cursor).transpose()?;
+                let response = drain_persisted(&project, cursor_override)?;
                 print_response(&response)
             }
             OrchestratorEventsCmd::Next { cursor, timeout } => {
@@ -125,6 +129,59 @@ fn drain_once(project: &str, cursor: u64) -> Result<DrainResponse> {
         cursor_offset: next_cursor,
         events,
     })
+}
+
+/// Drain with durable-cursor persistence anchored in the project config
+/// dir (`~/.shelbi/projects/<name>/event-cursor`), independent of the
+/// caller's shell cwd.
+///
+/// * `cursor_override = None` — resume from the persisted cursor.
+/// * `cursor_override = Some(n)` — start at `n` (an explicit replay).
+///
+/// Either way the new cursor is written back only after `drain_once`
+/// succeeds, so a failed drain never clobbers the persisted position.
+fn drain_persisted(project: &str, cursor_override: Option<u64>) -> Result<DrainResponse> {
+    let start = match cursor_override {
+        Some(cursor) => cursor,
+        None => read_persisted_cursor(project)?,
+    };
+    let response = drain_once(project, start)?;
+    write_persisted_cursor(project, response.cursor_offset)?;
+    Ok(response)
+}
+
+/// Durable cursor path: a fixed location in the project config dir, NOT
+/// under `.claude/` — Shelbi state is runner-agnostic (the Codex runner
+/// drains the same stream) and `.claude/` is deployed agent config, not
+/// durable state.
+fn cursor_path(project: &str) -> Result<PathBuf> {
+    Ok(shelbi_state::project_dir(project)
+        .map_err(|e| anyhow!(e))?
+        .join("event-cursor"))
+}
+
+fn read_persisted_cursor(project: &str) -> Result<u64> {
+    let path = cursor_path(project)?;
+    match fs::read_to_string(&path) {
+        // A missing or malformed cursor file resumes from the log start,
+        // matching the old shell `cat ... || echo 0` behavior.
+        Ok(text) => Ok(text.trim().parse().unwrap_or(0)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(0),
+        Err(e) => Err(anyhow::Error::new(e).context("reading event cursor")),
+    }
+}
+
+fn write_persisted_cursor(project: &str, cursor: u64) -> Result<()> {
+    let path = cursor_path(project)?;
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).context("creating project dir for event cursor")?;
+    }
+    // Write-then-rename so a torn write never leaves a partial cursor a
+    // later drain would misparse to 0 and replay the whole log.
+    let tmp = path.with_extension("tmp");
+    fs::write(&tmp, cursor.to_string()).context("writing event cursor")?;
+    fs::rename(&tmp, &path).context("persisting event cursor")?;
+    Ok(())
 }
 
 fn parse_cursor(cursor: &str) -> Result<u64> {
@@ -694,6 +751,103 @@ mod tests {
         );
         assert_eq!(response.events[1].workspace.as_deref(), Some("alpha"));
         assert_eq!(response.events[2].workspace.as_deref(), Some("review"));
+    }
+
+    #[test]
+    fn cursor_path_lives_in_project_config_dir_not_claude() {
+        let (_guard, _tmp) = setup_home();
+        let path = cursor_path("demo").unwrap();
+        assert_eq!(path.file_name().and_then(|s| s.to_str()), Some("event-cursor"));
+        assert_eq!(
+            path.parent(),
+            Some(shelbi_state::project_dir("demo").unwrap().as_path())
+        );
+        assert!(
+            !path.components().any(|c| c.as_os_str() == ".claude"),
+            "cursor must not live under .claude/: {path:?}"
+        );
+    }
+
+    #[test]
+    fn drain_persisted_resumes_from_persisted_cursor() {
+        let (_guard, _tmp) = setup_home();
+        save_demo_task("demo", "first");
+        append_task_event(
+            "demo",
+            "first",
+            "default",
+            Column::todo(),
+            Column::done(),
+            "one",
+        )
+        .unwrap();
+
+        // No override: reads 0 (no file yet), drains, and persists the new cursor.
+        let first = drain_persisted("demo", None).unwrap();
+        assert_eq!(first.events.len(), 1);
+        assert_eq!(first.events[0].task.as_deref(), Some("first"));
+        let stored = fs::read_to_string(cursor_path("demo").unwrap()).unwrap();
+        assert_eq!(stored.trim(), first.cursor_offset.to_string());
+
+        save_demo_task("demo", "second");
+        append_task_event(
+            "demo",
+            "second",
+            "default",
+            Column::todo(),
+            Column::done(),
+            "two",
+        )
+        .unwrap();
+
+        // No override again: resumes from the persisted cursor, so the first
+        // event is not replayed.
+        let second = drain_persisted("demo", None).unwrap();
+        assert_eq!(second.events.len(), 1);
+        assert_eq!(second.events[0].task.as_deref(), Some("second"));
+    }
+
+    #[test]
+    fn drain_persisted_explicit_cursor_overrides_and_advances_persisted() {
+        let (_guard, _tmp) = setup_home();
+        save_demo_task("demo", "first");
+        append_task_event(
+            "demo",
+            "first",
+            "default",
+            Column::todo(),
+            Column::done(),
+            "one",
+        )
+        .unwrap();
+        // Consume the first event and persist a non-zero cursor.
+        let first = drain_persisted("demo", None).unwrap();
+        assert_eq!(first.events.len(), 1);
+
+        save_demo_task("demo", "second");
+        append_task_event(
+            "demo",
+            "second",
+            "default",
+            Column::todo(),
+            Column::done(),
+            "two",
+        )
+        .unwrap();
+
+        // Explicit `--cursor 0` replays the whole log despite the persisted cursor.
+        let replay = drain_persisted("demo", Some(0)).unwrap();
+        assert_eq!(replay.events.len(), 2);
+
+        // A successful override drain advances the persisted cursor too.
+        let stored = fs::read_to_string(cursor_path("demo").unwrap()).unwrap();
+        assert_eq!(stored.trim(), replay.cursor_offset.to_string());
+    }
+
+    #[test]
+    fn read_persisted_cursor_defaults_to_zero_when_absent() {
+        let (_guard, _tmp) = setup_home();
+        assert_eq!(read_persisted_cursor("demo").unwrap(), 0);
     }
 
     #[test]

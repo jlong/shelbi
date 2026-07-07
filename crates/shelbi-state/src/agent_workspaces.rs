@@ -1284,7 +1284,7 @@ mod tests {
         let repaired = fs::read_to_string(&path).unwrap();
         assert!(repaired.starts_with(custom));
         assert!(repaired.contains("## Polling-only event drain"));
-        assert!(repaired.contains("shelbi orchestrator events drain --cursor \"$CURSOR\""));
+        assert!(repaired.contains("shelbi orchestrator events drain"));
         assert!(repaired.contains("fall back to\nreading `~/.shelbi/events.log`"));
 
         std::env::remove_var("SHELBI_HOME");
