@@ -83,8 +83,9 @@ Conductor's default loop is workspace → diff → PR → merge → archive,
 with the user moving through contextual actions. Shelbi makes "ready for
 human review" its own column. The hub poller promotes a card to `review`
 the moment the workspace writes its marker; the sidebar's *Ready for
-Review* list mirrors it; `shelbi review <id>` checks the branch into a
-dedicated review pane with a fresh Claude window pointed at the diff.
+Review* list mirrors it, and selecting a card there checks the branch onto a
+dedicated [review workspace](/docs/concepts/review-workspaces) with a fresh
+Claude window that boots the app for you to click through.
 `review → done` is *yours* — the orchestrator does not make that move
 except under explicit authorized loops. (See
 [Workflows](/docs/guides/getting-started/workflows#lifecycle-who-moves-a-task-between-the-default-statuses).)
