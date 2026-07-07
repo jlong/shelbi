@@ -1,0 +1,414 @@
+---
+title: Release Runbook
+order: 98
+summary: Maintainer checklist for tagging, GoReleaser dry runs, package verification, rollback, and signing-key recovery.
+---
+
+This is the operational checklist for Shelbi maintainers publishing a release.
+Run every command from a clean checkout of `https://github.com/jlong/shelbi`
+unless a step says otherwise.
+
+## Current Release Scope
+
+- **Primary repository:** `jlong/shelbi`
+- **Release binary:** `shelbi`
+- **Release branch:** `main`
+- **Release tags:** `vMAJOR.MINOR.PATCH`, for example `v0.1.0`
+- **Homebrew tap:** unresolved; plan recommends `shelbi/homebrew-shelbi` if a
+  Shelbi org exists, otherwise `jlong/homebrew-shelbi`
+- **APT repository:** unresolved; plan recommends a dedicated Pages or object
+  storage repository
+- **APT repository domain:** unresolved; plan recommends `https://apt.shelbi.dev`
+- **Current release owner:** unresolved
+- **Signing-key owner:** unresolved
+
+Do not ship a release until every unresolved owner, repository, and domain is
+confirmed in the maintainer channel.
+
+## Required Access
+
+The release operator needs these local tools:
+
+```bash
+cargo --version
+git --version
+gh --version
+goreleaser --version
+jq --version
+dpkg-deb --version
+ar --version
+tar --version
+gpg --version
+apt-ftparchive --version
+brew --version
+docker --version
+```
+
+The release automation needs these secrets:
+
+- `GITHUB_TOKEN` or a GitHub App token with permission to create releases and
+  upload release artifacts in `jlong/shelbi`.
+- `TAP_GITHUB_TOKEN`, a fine-scoped token or GitHub App credential that can
+  write only to the confirmed Homebrew tap where possible.
+- `APT_REPO_TOKEN`, a fine-scoped token or GitHub App credential that can write
+  to the confirmed APT hosting repository.
+- `APT_GPG_PRIVATE_KEY`, an ASCII-armored private key for APT metadata signing.
+- `APT_GPG_PASSPHRASE`, the passphrase for the APT private key.
+- `APT_SIGNING_KEY_ID`, the public fingerprint for the APT metadata signing key.
+- OIDC permissions for keyless Sigstore signing, or `COSIGN_*` only if the
+  release workflow chooses long-lived cosign secrets.
+
+The signing-key owner rotates APT and artifact signing keys. The release owner
+rotates publishing tokens. Rotate immediately after suspected exposure, staff
+offboarding, or a failed release where a secret may have been printed in logs.
+
+## Pre-Tag Checks
+
+Start from an up-to-date `main`:
+
+```bash
+git fetch origin main --tags
+git checkout main
+git pull --ff-only origin main
+git status --short
+```
+
+`git status --short` must print nothing. Confirm the version before tagging:
+
+```bash
+VERSION=0.1.0
+test "$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.name == "shelbi") | .version')" = "$VERSION"
+```
+
+Run the workspace tests and build the exact release profile:
+
+```bash
+cargo test --workspace
+cargo build --release --bin shelbi
+./target/release/shelbi --version
+```
+
+The version output must match the tag you intend to publish:
+
+```bash
+./target/release/shelbi --version | grep "shelbi $VERSION"
+```
+
+## GoReleaser Dry Run
+
+Validate the GoReleaser configuration:
+
+```bash
+goreleaser check
+```
+
+Build local snapshot artifacts without publishing:
+
+```bash
+goreleaser release --snapshot --clean
+```
+
+Expected snapshot output under `dist/`:
+
+- `shelbi_Darwin_x86_64.tar.gz`
+- `shelbi_Darwin_arm64.tar.gz`
+- `shelbi_Linux_x86_64.tar.gz`
+- `shelbi_0.1.0_amd64.deb`
+- `checksums.txt`
+- signed checksums or Sigstore bundle, if signing is configured
+- Homebrew formula output, if the confirmed tap is configured
+- APT repository metadata output, if the confirmed repository is configured
+
+Linux `arm64` and Debian `arm64` artifacts are out of scope until they are
+built and smoke-tested in CI or on a reliable runner.
+
+Inspect the generated files:
+
+```bash
+find dist -maxdepth 2 -type f | sort
+grep -E 'shelbi_(Darwin|Linux)|\\.deb$' dist/checksums.txt
+```
+
+## Local Artifact Verification
+
+Verify archive contents and checksums:
+
+```bash
+shasum -a 256 -c dist/checksums.txt
+tar -tzf dist/shelbi_Linux_x86_64.tar.gz | grep '^shelbi$'
+tar -xzf dist/shelbi_Linux_x86_64.tar.gz -C /tmp
+/tmp/shelbi --version
+rm /tmp/shelbi
+```
+
+Verify the Debian package locally:
+
+```bash
+DEB=$(find dist -name 'shelbi_*_amd64.deb' | head -n 1)
+dpkg-deb --info "$DEB"
+dpkg-deb --contents "$DEB"
+dpkg-deb --field "$DEB" Package Version Architecture Maintainer
+dpkg-deb --field "$DEB" Package | grep '^shelbi$'
+dpkg-deb --field "$DEB" Version | grep "^$VERSION"
+dpkg-deb --field "$DEB" Architecture | grep '^amd64$'
+```
+
+Install and execute the package in a clean Debian or Ubuntu container:
+
+```bash
+docker run --rm -v "$PWD/dist:/dist:ro" debian:bookworm bash -euxo pipefail -c '
+  apt-get update
+  apt-get install -y /dist/shelbi_*_amd64.deb
+  shelbi --version
+  command -v shelbi
+'
+```
+
+## Homebrew Formula Verification
+
+After the dry run generates or updates the formula, check the formula in the
+confirmed tap checkout:
+
+```bash
+TAP_DIR=/tmp/homebrew-shelbi-tap
+git clone git@github.com:OWNER/HOMEBREW_TAP_REPO.git "$TAP_DIR"
+cd "$TAP_DIR"
+brew audit --strict --online Formula/shelbi.rb
+brew style Formula/shelbi.rb
+brew install --build-from-source Formula/shelbi.rb
+shelbi --version
+brew test shelbi
+brew uninstall shelbi
+```
+
+Replace `OWNER/HOMEBREW_TAP_REPO` with the confirmed Homebrew tap. If the tap
+uses a different formula path, update the path before release and commit the
+runbook correction in the same change.
+
+## APT Repository Verification
+
+Verify repository metadata before users can consume it:
+
+```bash
+APT_ROOT=dist/apt
+find "$APT_ROOT" -type f | sort
+test -f "$APT_ROOT/dists/stable/Release"
+test -f "$APT_ROOT/dists/stable/InRelease"
+test -f "$APT_ROOT/dists/stable/Release.gpg"
+gpg --verify "$APT_ROOT/dists/stable/Release.gpg" "$APT_ROOT/dists/stable/Release"
+gpg --verify "$APT_ROOT/dists/stable/InRelease"
+grep '^Suite: stable$' "$APT_ROOT/dists/stable/Release"
+grep '^Codename: stable$' "$APT_ROOT/dists/stable/Release"
+grep '^Architectures: amd64$' "$APT_ROOT/dists/stable/Release"
+grep 'pool/.*/shelbi_.*_amd64.deb' "$APT_ROOT/dists/stable/main/binary-amd64/Packages"
+```
+
+Then install from the staged repository in a container:
+
+```bash
+docker run --rm -v "$PWD/dist/apt:/repo:ro" debian:bookworm bash -euxo pipefail -c '
+  apt-get update
+  apt-get install -y ca-certificates gnupg
+  install -d -m 0755 /etc/apt/keyrings
+  cp /repo/shelbi-archive-keyring.gpg /etc/apt/keyrings/shelbi.gpg
+  echo "deb [arch=amd64 signed-by=/etc/apt/keyrings/shelbi.gpg] file:/repo stable main" > /etc/apt/sources.list.d/shelbi.list
+  apt-get update
+  apt-cache policy shelbi
+  apt-get install -y shelbi
+  shelbi --version
+'
+```
+
+For the live repository, replace the `file:/repo` source with the confirmed
+HTTPS APT domain and repeat the same container test.
+
+## Tag And Publish
+
+Create an annotated tag only after the dry run and local verification pass:
+
+```bash
+VERSION=0.1.0
+git checkout main
+git pull --ff-only origin main
+git tag -a "v$VERSION" -m "Shelbi v$VERSION"
+git push origin "v$VERSION"
+```
+
+Publish with GoReleaser:
+
+```bash
+goreleaser release --clean
+```
+
+Verify the GitHub release:
+
+```bash
+gh release view "v$VERSION" --repo jlong/shelbi
+gh release download "v$VERSION" --repo jlong/shelbi --dir "/tmp/shelbi-v$VERSION"
+cd "/tmp/shelbi-v$VERSION"
+shasum -a 256 -c checksums.txt
+```
+
+Expected published artifacts:
+
+- Darwin `amd64` archive
+- Darwin `arm64` archive
+- Linux `amd64` archive
+- Debian `amd64` package
+- `checksums.txt`
+- Artifact signatures, if signing is enabled
+- SBOM/provenance files, if configured
+- Homebrew formula update in the confirmed tap
+- APT pool package, `Packages`, `Release`, `InRelease`, and `Release.gpg`
+
+## Post-Release Verification
+
+Verify install paths after publication:
+
+```bash
+brew update
+brew install shelbi
+shelbi --version
+brew test shelbi
+brew uninstall shelbi
+```
+
+Verify APT from the live repository:
+
+```bash
+docker run --rm debian:bookworm bash -euxo pipefail -c '
+  apt-get update
+  apt-get install -y ca-certificates curl gnupg
+  install -d -m 0755 /etc/apt/keyrings
+  curl -fsSL https://APT_DOMAIN/shelbi-archive-keyring.gpg -o /etc/apt/keyrings/shelbi.gpg
+  echo "deb [arch=amd64 signed-by=/etc/apt/keyrings/shelbi.gpg] https://APT_DOMAIN stable main" > /etc/apt/sources.list.d/shelbi.list
+  apt-get update
+  apt-cache policy shelbi
+  apt-get install -y shelbi
+  shelbi --version
+'
+```
+
+Replace `APT_DOMAIN` with the confirmed release domain. The installed version
+must match `VERSION`.
+
+## Rollback
+
+### Bad GitHub Artifacts
+
+If an artifact is corrupt before the release is announced, stop package
+publication, delete the draft or unpublished release, and rerun the release from
+the same tag:
+
+```bash
+VERSION=0.1.0
+gh release delete "v$VERSION" --repo jlong/shelbi --yes
+goreleaser release --clean
+```
+
+After public announcement or package-manager publication, do not replace or
+delete GitHub release assets. Publish a patch version from a fix commit:
+
+```bash
+NEXT_VERSION=0.1.1
+git checkout main
+git pull --ff-only origin main
+git tag -a "v$NEXT_VERSION" -m "Shelbi v$NEXT_VERSION"
+git push origin "v$NEXT_VERSION"
+goreleaser release --clean
+```
+
+If the tag points at the wrong commit and the release is not public yet, delete
+the release and tag, then recreate the tag on the correct commit:
+
+```bash
+VERSION=0.1.0
+gh release delete "v$VERSION" --repo jlong/shelbi --yes
+git push origin ":refs/tags/v$VERSION"
+git tag -d "v$VERSION"
+git checkout CORRECT_COMMIT_SHA
+git tag -a "v$VERSION" -m "Shelbi v$VERSION"
+git push origin "v$VERSION"
+goreleaser release --clean
+```
+
+Announce the tag move in the maintainer channel. Never move a tag silently
+after users may have fetched it. After public announcement, leave the bad tag in
+place and publish a patch version.
+
+### Bad Homebrew Formula
+
+Revert the formula commit in the tap and push the revert:
+
+```bash
+cd "$TAP_DIR"
+git pull --ff-only
+git log --oneline -- Formula/shelbi.rb
+git revert BAD_FORMULA_COMMIT_SHA
+brew audit --strict --online Formula/shelbi.rb
+brew test shelbi
+git push origin HEAD
+```
+
+If the formula points at a bad GitHub artifact, complete the GitHub artifact
+rollback first, then update the formula checksums and run the formula
+verification again.
+
+### Bad APT Package
+
+Republish APT metadata without the bad package as the candidate version. Leave
+the bad `.deb` in `pool/` for auditability unless it is actively harmful. The
+resulting repository must no longer advertise the bad version:
+
+```bash
+apt-cache policy shelbi
+```
+
+Regenerate and sign repository metadata:
+
+```bash
+apt-ftparchive packages pool > dists/stable/main/binary-amd64/Packages
+gzip -kf dists/stable/main/binary-amd64/Packages
+apt-ftparchive release dists/stable > dists/stable/Release
+gpg --batch --yes --default-key "$APT_SIGNING_KEY_ID" --clearsign -o dists/stable/InRelease dists/stable/Release
+gpg --batch --yes --default-key "$APT_SIGNING_KEY_ID" -abs -o dists/stable/Release.gpg dists/stable/Release
+```
+
+Run the live APT container verification again. Publish a maintainer note telling
+users to run `sudo apt update` before retrying. APT does not automatically
+downgrade installed packages; once at least two versions exist, document the
+manual downgrade:
+
+```bash
+apt-cache madison shelbi
+sudo apt install shelbi=PREVIOUS_GOOD_VERSION
+sudo apt-mark hold shelbi
+```
+
+### APT Key Compromise
+
+Treat a suspected signing-key exposure as a release incident:
+
+1. Freeze APT publication and remove repository write credentials from CI.
+2. Revoke the compromised key if a revocation certificate exists.
+3. Generate a new offline signing key and store its revocation certificate in
+   the maintainer secret store.
+4. Export the new public key as `shelbi-archive-keyring.gpg`.
+5. Replace `APT_GPG_PRIVATE_KEY`, `APT_GPG_PASSPHRASE`, `APT_SIGNING_KEY_ID`,
+   and any deployment secret that could have accessed the old private key.
+6. Re-sign the repository metadata with the new key.
+7. Publish the new keyring at the confirmed APT domain.
+8. Publish user-facing migration instructions that replace the old keyring file
+   before running `sudo apt update`.
+
+Use these local commands for the new key material:
+
+```bash
+gpg --batch --full-generate-key
+gpg --list-secret-keys --keyid-format LONG
+gpg --output shelbi-archive-keyring.gpg --export "$NEW_APT_SIGNING_KEY_ID"
+gpg --output shelbi-archive-revocation.asc --gen-revoke "$NEW_APT_SIGNING_KEY_ID"
+```
+
+Do not delete the old public key from public history. Users need a clear
+migration path from the old key to the new one.
