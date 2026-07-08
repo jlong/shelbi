@@ -9,6 +9,28 @@ on `main`, newest first. This page is hand-curated: it tracks capabilities, not
 every commit, so small copy edits and cosmetic tweaks are folded away. Entries
 are prose with `code` and links where they earn their place.
 
+### July 7, 2026
+
+**v0.2.0.** A same-day follow-up that closes the loop on packaging: the release
+workflow now publishes the Debian package to the signed APT repository as part
+of the tag-triggered pipeline, so `apt install shelbi` picks up new versions
+without a manual publish step. It also ships two supervision fixes. The hub
+poller can now drive a workflow that declares no review/handoff status to
+completion — when a worker finishes and its status has an outgoing transition
+that merges, the poller advances the task along that edge (merge, branch
+cleanup) instead of stranding it in progress. And the hub checkout is guarded
+against stray commits: a Shelbi-managed pre-commit hook rejects commits made
+directly on the default branch, backed by dispatch-time branch checks.
+
+**v0.1.0 — the first versioned release.** Shelbi now ships as prebuilt
+binaries, not just source. Pushing a `v*` tag runs a release workflow that
+builds macOS (Apple Silicon and Intel) and Linux x86_64 binaries, publishes
+them with SHA256 checksums and GitHub artifact attestations, opens a
+version-bump PR against the Homebrew tap, and produces a Debian package.
+`brew tap shelbi/shelbi && brew install shelbi` on macOS; a signed APT
+repository serves Ubuntu. See the
+[install guide](/docs/guides/getting-started/install) for both paths.
+
 ### July 3, 2026
 
 **Usage-limit pause detection.** The workspace poller now recognizes when a
