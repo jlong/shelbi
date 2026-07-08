@@ -23,15 +23,25 @@ jobs:
   validate:
     runs-on: ubuntu-latest
     steps:
+      # Two checkouts: release scripts come from the workflow's own ref
+      # (normally main) so they stay in lockstep with this workflow file,
+      # while the tag's tree is what the version check inspects. Running the
+      # tag's copy of check-version.sh would resurrect whatever bugs it had
+      # at tag time.
       - uses: actions/checkout@v4
+
+      - name: Checkout release tag
+        uses: actions/checkout@v4
         with:
           ref: ${{ inputs.tag }}
-          fetch-depth: 0
+          path: tag-src
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
 
       - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: tag-src
 
       - name: Validate release tag
         # The runner overwrites default GITHUB_* variables after env blocks are
@@ -39,7 +49,8 @@ jobs:
         # reads RELEASE_TAG instead.
         env:
           RELEASE_TAG: ${{ inputs.tag }}
-        run: scripts/release/check-version.sh
+        working-directory: tag-src
+        run: "$GITHUB_WORKSPACE/scripts/release/check-version.sh"
 
   publish:
     needs: validate
@@ -49,9 +60,10 @@ jobs:
       APT_GPG_PRIVATE_KEY: ${{ secrets.APT_GPG_PRIVATE_KEY }}
       APT_GPG_PASSPHRASE: ${{ secrets.APT_GPG_PASSPHRASE }}
     steps:
+      # Workflow ref, not the tag: this job only needs the release scripts
+      # (the .deb comes from the GitHub release), and they must match what
+      # this workflow file expects, not what the tag shipped.
       - uses: actions/checkout@v4
-        with:
-          ref: ${{ inputs.tag }}
 
       - name: Install APT repository tools
         run: |
