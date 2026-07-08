@@ -28,6 +28,14 @@
   --color-gray-6: #666666;
   --color-gray-7: #333333;
 
+  /* ----- Eyebrow accent (light blue) -----
+     A restrained light-blue accent for section eyebrows so they lift off
+     the gray body copy without shouting. Per-theme values: on the light
+     (white) canvas a mid blue stays legible; the `.dark` override lightens
+     to a sky tone that reads on black. Consumed via the `text-accent`
+     utility; keep it subtle, not neon. */
+  --color-accent: #3B82F6;
+
   /* ----- Docs prose (higher-contrast body text) -----
      Docs reading experience only. Prose was rendered at `text-gray-7`,
      which is comfortable for UI chrome but too soft for long-form body
@@ -131,6 +139,9 @@
   --color-gray-5: #444444;
   --color-gray-6: #666666;
   --color-gray-7: #999999;
+
+  /* Eyebrow accent: lighten to a sky tone so it reads on the black canvas. */
+  --color-accent: #7DD3FC;
 
   /* Docs prose — lift off pure black for comfortable long-form reading. */
   --color-prose: #C9C9C9;

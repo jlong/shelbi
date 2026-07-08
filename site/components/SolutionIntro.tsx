@@ -9,7 +9,7 @@ export function SolutionIntro() {
     <section className="border-t border-gray-4">
       <div className="mx-auto w-full max-w-3xl px-4 py-8 lg:px-6 lg:py-12">
         <div className="flex flex-col gap-4">
-          <p className="font-mono text-xs font-medium uppercase tracking-[0.2em] text-gray-6">With Shelbi</p>
+          <p className="font-mono text-xs font-medium uppercase tracking-[0.2em] text-accent">With Shelbi</p>
           <h2 className="font-sans text-3xl font-semibold tracking-tight text-fg sm:text-4xl">
             Inbox Zero, for agent work.
           </h2>
