@@ -1,10 +1,13 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-tag="${GITHUB_REF_NAME:-}"
+# RELEASE_TAG takes precedence: the Actions runner sets the default GITHUB_*
+# variables after applying workflow env blocks, so a GITHUB_REF_NAME override
+# in a workflow never reaches this script.
+tag="${RELEASE_TAG:-${GITHUB_REF_NAME:-}}"
 
 if [[ -z "$tag" ]]; then
-  echo "GITHUB_REF_NAME is required" >&2
+  echo "RELEASE_TAG or GITHUB_REF_NAME is required" >&2
   exit 1
 fi
 
