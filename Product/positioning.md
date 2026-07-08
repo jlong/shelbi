@@ -80,6 +80,40 @@ Install CTA (`curl … | sh` code block) + "Build from source" docs link.
 
 <br />
 
+## Handoff notes (for the homepage build)
+
+**This blueprint supersedes the current site hero** ("Manage a team of coding agents from your terminal"). The H1, H2, and badge above are the new hero.
+
+**Copy rules, non-negotiable:**
+
+- Developer-flat register. Clear over clever. No grandeur (no "mission control" or similar).
+
+- No em-dashes anywhere in published copy. Use periods, commas, or colons.
+
+- First-order benefits only. Never "do more," "boost productivity," or other multi-order claims.
+
+- Every claim states a mechanism. If a sentence has no feature behind it, cut it.
+
+**Show, don't claim:**
+
+- The single most convincing moment for the champion is watching the orchestrator turn a lazy one-line request ("the events log rotation thing from yesterday, fix it") into a crisp, scoped task. Get that beat into the hero animation.
+
+- Put the GitHub link with stars within one click of the hero. It is the open source trust signal standing in for customer logos.
+
+**Fact-check status (verified against source, July 2026):** orchestrator-as-interface, multi-machine SSH workers, YAML workflows with per-status agents, pluggable runners (Claude Code, Codex, aider), and the Zen primitives are all shipped. Keep two claims honest in final copy:
+
+- "Adversarial review, QA, security" agents are built with shipped primitives (`shelbi agent new`, per-status `agent:` assignment), not shipped presets. Phrase as what you can add, not what comes in the box.
+
+- Zen's "digest" is the orchestrator reporting back conversationally plus probe and CI output, not a formatted digest feature.
+
+- If copy names workflow stages, use the real defaults: backlog, todo, in-progress, review, done, canceled.
+
+**Don't lead with table stakes:** parallel agents, worktree isolation, and auto-PRs are claimed by every competitor (see `Research/` for the teardowns). Shelbi's rare claims are the orchestrator interface, kanban intake, the multi-machine pool, plain-file state, and the tmux runtime.
+
+**Deliberately excluded from the homepage:** "Claude Code" by name in the hero (scope stays open; say "coding agents"), "Inbox Zero" as the H1 (solution-intro level only), `shelbi zen dry-run` (docs material), and the review-burden reassurance beyond beat 5 plus the triad (don't over-defend).
+
+<br />
+
 ## Source narrative (founder's words, kept as raw material)
 
 **Background.** My core motivation with the project was that I was getting tired of managing separate workstreams in terminal tabs each running their own agents. I sometimes found myself sending the wrong thing to an agent just because I picked the wrong Terminal tab to respond in. I also found myself forgetting about tabs where they would be paused for a long time waiting for the answer to a question. Shelbi removes the pain of manually orchestrating the agents and allows me to focus more on giving them the right direction on the plan and task level.
