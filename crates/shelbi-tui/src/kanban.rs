@@ -1902,7 +1902,13 @@ fn render_column(
     // Reserve a 2-char right gutter so adjacent cells don't visually
     // collide; List doesn't clip Line spans on its own.
     let max_text = area.width.saturating_sub(2) as usize;
-    let mut items: Vec<ListItem> = Vec::with_capacity(tasks.len());
+    // A full blank row separates consecutive cards so each reads as a
+    // distinct block. Rendered as its own (unstyled) list item between
+    // cards — never leading the first card or trailing the last — so the
+    // selection highlight lands on the card and not the gap. The
+    // hit-test loop below accounts for the same spacer when walking `y`.
+    let last_row = tasks.len().saturating_sub(1);
+    let mut items: Vec<ListItem> = Vec::with_capacity(tasks.len() * 2);
     // Per-card rendered height (2 rows for a single-line title, 3 when the
     // title wraps). Recorded alongside the items so the hit-test loop below
     // can walk a running `y` offset instead of assuming a uniform card.
@@ -1949,6 +1955,10 @@ fn render_column(
             );
         }
         items.push(item);
+        // One blank spacer between cards — never after the last.
+        if row != last_row {
+            items.push(ListItem::new(Line::from("")));
+        }
     }
     if items.is_empty() {
         items.push(ListItem::new(Line::from(Span::styled(
@@ -1959,7 +1969,9 @@ fn render_column(
 
     let mut state = ListState::default();
     if focused && !tasks.is_empty() {
-        state.select(Some(app.selected_row));
+        // Each card is preceded by a one-row spacer item (except the
+        // first), so the selected card sits at list index `row * 2`.
+        state.select(Some(app.selected_row * 2));
     }
     let list = List::new(items);
     f.render_stateful_widget(list, list_area, &mut state);
@@ -1974,6 +1986,7 @@ fn render_column(
     // tolerable until columns regularly exceed visible height.
     let list_bottom = list_area.y.saturating_add(list_area.height);
     let mut card_top = list_area.y;
+    let last_row = card_heights.len().saturating_sub(1);
     for (row, &rows) in card_heights.iter().enumerate() {
         if card_top >= list_bottom {
             break;
@@ -1990,6 +2003,12 @@ fn render_column(
             row_idx: row,
         });
         card_top = card_top.saturating_add(rows);
+        // Skip the blank spacer row rendered between cards (not after the
+        // last one). No CardHit is recorded for it, so a click in the gap
+        // misses every card — matching the un-highlighted empty row.
+        if row != last_row {
+            card_top = card_top.saturating_add(1);
+        }
     }
 }
 
@@ -4151,6 +4170,59 @@ mod tests {
             rendered.contains("design-review") || rendered.contains("design-revi"),
             "design-review card label missing:\n{rendered}"
         );
+    }
+
+    /// A full blank row separates consecutive cards in a column: the
+    /// second card's hit rect starts one row below the first card's
+    /// bottom (not flush against it), there's no leading gap above the
+    /// first card, and a click landing on the gap row misses every card.
+    #[test]
+    fn cards_render_with_one_blank_row_between_them() {
+        use ratatui::{backend::TestBackend, Terminal};
+        let mut app = KanbanApp::new("demo");
+        app.workflows = vec![default_workflow()];
+        app.project_statuses = default_project_statuses();
+        app.all_columns = app.compute_all_columns();
+        // Two cards in the same (backlog) column — the gap only appears
+        // between cards, so we need at least two.
+        app.tasks = vec![
+            task_in_workflow("t-one", Column::backlog(), None, "2026-06-20T10:00:00Z"),
+            task_in_workflow("t-two", Column::backlog(), None, "2026-06-20T10:00:00Z"),
+        ];
+        app.selected_column = 0;
+
+        let backend = TestBackend::new(160, 20);
+        let mut term = Terminal::new(backend).unwrap();
+        term.draw(|f| render_full(f, &mut app, f.area())).unwrap();
+
+        let mut col0: Vec<&CardHit> = app
+            .card_hits
+            .iter()
+            .filter(|h| h.col_idx == 0)
+            .collect();
+        col0.sort_by_key(|h| h.row_idx);
+        assert_eq!(col0.len(), 2, "both backlog cards recorded a hit rect");
+        let (first, second) = (col0[0], col0[1]);
+
+        // One full blank row between the cards: the second card starts a
+        // single row below the first card's bottom edge.
+        assert_eq!(
+            second.area.y,
+            first.area.y + first.area.height + 1,
+            "expected exactly one blank row between cards"
+        );
+
+        // The gap row belongs to no card.
+        let gap_y = first.area.y + first.area.height;
+        let x = first.area.x + 1;
+        assert_eq!(
+            app.card_at(x, gap_y),
+            None,
+            "click on the inter-card gap misses every card"
+        );
+        // Cards on either side of the gap still map to the right rows.
+        assert_eq!(app.card_at(x, first.area.y), Some((0, 0)));
+        assert_eq!(app.card_at(x, second.area.y), Some((0, 1)));
     }
 
     // ---- workflow filter -------------------------------------------------
