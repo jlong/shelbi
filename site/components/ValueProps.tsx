@@ -1,18 +1,29 @@
 import type { ReactNode } from "react"
+import {
+  ScopedTaskMockup,
+  SpecializationMockup,
+  WorkflowMockup,
+} from "./KanbanMockup"
 
 /**
- * The value-prop triad: tasks, agents, workflows. Each states the
- * mechanism, not the benefit. Rendered as H3 cards below the solution
- * intro's H2.
+ * The value-prop triad: tasks, agents, workflows. Each states the mechanism,
+ * not the benefit, and pairs its heading + body with a focused Shelbi mockup
+ * that shows the mechanism in action. The three render as separate full-width
+ * sections stacked down the page, the mockup alternating left/right on desktop
+ * and stacking under the copy on mobile. The headings stay H3 — they unpack the
+ * solution intro's H2 ("Inbox Zero, for agent work"), so they sit a level below
+ * it in the page outline.
  */
-const triad: { title: string; body: ReactNode }[] = [
+const triad: { title: string; body: ReactNode; mockup: ReactNode }[] = [
   {
     title: "Tasks keep work focused.",
     body: "Every item becomes a scoped task before an agent touches it. Agents do their best work on focused chunks, and big features and quick fixes flow through the same system.",
+    mockup: <ScopedTaskMockup />,
   },
   {
     title: "Agents provide specialization.",
     body: "Workers execute. Add reviewers that scrutinize: adversarial review, QA, security. Each does one job well, on every task.",
+    mockup: <SpecializationMockup />,
   },
   {
     title: "Workflows provide boundaries.",
@@ -26,20 +37,39 @@ const triad: { title: string; body: ReactNode }[] = [
         landed and what needs you.
       </>
     ),
+    mockup: <WorkflowMockup />,
   },
 ]
 
 export function ValueProps() {
   return (
-    <section className="border-t border-gray-4">
-      <div className="grid grid-cols-1 gap-px bg-gray-4 md:grid-cols-3">
-        {triad.map((item) => (
-          <div key={item.title} className="flex flex-col gap-2 bg-bg p-4">
-            <h3 className="text-xl font-semibold text-fg">{item.title}</h3>
-            <p className="leading-relaxed text-gray-7">{item.body}</p>
-          </div>
-        ))}
-      </div>
-    </section>
+    <>
+      {triad.map((item, i) => {
+        // Alternate the mockup side down the page: even rows keep it on the
+        // right (copy left), odd rows swap it to the left on desktop. The DOM
+        // order is always copy-then-mockup, so on mobile (single column) the
+        // copy reads first and the mockup stacks beneath it regardless of side.
+        const mockupLeft = i % 2 === 1
+        return (
+          <section key={item.title} className="border-t border-gray-4">
+            <div className="mx-auto grid w-full max-w-6xl grid-cols-1 items-center gap-8 px-4 py-10 lg:grid-cols-2 lg:gap-12 lg:px-6 lg:py-16">
+              <div className="flex flex-col gap-3">
+                <h3 className="font-sans text-2xl font-semibold tracking-tight text-fg sm:text-3xl">
+                  {item.title}
+                </h3>
+                <p className="text-base leading-relaxed text-gray-7 sm:text-lg">
+                  {item.body}
+                </p>
+              </div>
+              <div
+                className={`flex justify-center ${mockupLeft ? "lg:order-first" : ""}`}
+              >
+                {item.mockup}
+              </div>
+            </div>
+          </section>
+        )
+      })}
+    </>
   )
 }

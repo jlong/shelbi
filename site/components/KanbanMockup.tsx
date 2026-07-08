@@ -1797,6 +1797,58 @@ function PaletteOverlay({ palette, project }: { palette: PaletteState; project: 
 }
 
 /**
+ * The macOS-Terminal window chrome — rounded frame, drop shadow, and the title
+ * bar with its three traffic lights — around an arbitrary dark terminal body.
+ * `AppMockup` wraps the full sidebar+board dashboard in it; the compact homepage
+ * value-prop fragments (`ScopedTaskMockup` and friends) wrap a single small
+ * `<pre>` in the same frame, so a focused illustration reads as a capture from
+ * the same terminal as the hero without re-implementing any chrome. `bodyClassName`
+ * styles the body wrapper — the dashboard passes `relative flex …` so the sidebar
+ * and board sit side by side under the palette overlay; a fragment leaves the
+ * default so its single pane just scrolls if it ever overflows.
+ */
+export function TerminalFrame({
+  title,
+  bodyClassName = "overflow-x-auto",
+  children,
+}: {
+  title: string
+  bodyClassName?: string
+  children: React.ReactNode
+}) {
+  return (
+    <div
+      className="overflow-hidden rounded-lg shadow-2xl"
+      style={{ boxShadow: "0 24px 48px rgba(0,0,0,0.35), 0 0 0 1px rgba(0,0,0,0.4)" }}
+    >
+      {/* macOS Terminal title bar — traffic lights left, title centered. */}
+      <div
+        className="relative flex items-center justify-center border-b px-3"
+        style={{ background: CHROME_BAR_BG, borderColor: CHROME_BAR_BORDER, height: 28 }}
+      >
+        <div
+          className="absolute flex items-center"
+          // Equal top/left inset so the red light is equidistant from the top
+          // and left edges — tucked into the corner. 8px keeps it inside the
+          // 28px bar (8 + 12 + 8 = 28) with no height change.
+          style={{ top: 8, left: 8, gap: 8 }}
+        >
+          <TrafficLight color={TRAFFIC_RED} />
+          <TrafficLight color={TRAFFIC_YELLOW} />
+          <TrafficLight color={TRAFFIC_GREEN} />
+        </div>
+        <span className="font-mono text-xs font-medium" style={{ color: CHROME_TITLE }}>
+          {title}
+        </span>
+      </div>
+      <div className={bodyClassName} style={{ background: TUI_BG }}>
+        {children}
+      </div>
+    </div>
+  )
+}
+
+/**
  * Render a Shelbi TUI dashboard scenario inside a macOS-Terminal frame.
  * The look is fixed — only the scenario varies. Three ways to drive it:
  *
@@ -1850,68 +1902,31 @@ export function AppMockup({
           inner overflow-x-auto in charge on viewports narrower than
           the board. */}
       <div className="mx-auto w-fit max-w-full">
-        <div
-          className="overflow-hidden rounded-lg shadow-2xl"
-          style={{
-            boxShadow: "0 24px 48px rgba(0,0,0,0.35), 0 0 0 1px rgba(0,0,0,0.4)",
-          }}
+        {/* Terminal body — two `<pre>` blocks (sidebar + board) sit side-by-side
+            inside one dark surface, so the whole panel reads as a single
+            captured terminal frame. The board `<pre>` overflows horizontally on
+            narrow viewports; the sidebar hides below `md` so phones don't get a
+            cramped strip beside a cropped board. The solid terminal-body fill
+            (via `TerminalFrame`) stays at full opacity so the body background
+            never dims — only the two panes' text layers cross-fade at the loop
+            boundary (via `contentOpacity` on each `<pre>`): because every pane's
+            own background is this same `TUI_BG`, fading a pane reveals an
+            identical solid fill behind it, so the glyphs dissolve while the
+            background — and the window chrome above — read as fully opaque. */}
+        <TerminalFrame
+          title={resolved.terminalTitle}
+          bodyClassName="relative flex overflow-x-auto"
         >
-          {/* macOS Terminal title bar — traffic lights left, title centered. */}
-          <div
-            className="relative flex items-center justify-center border-b px-3"
-            style={{
-              background: CHROME_BAR_BG,
-              borderColor: CHROME_BAR_BORDER,
-              height: 28,
-            }}
-          >
-            <div
-              className="absolute flex items-center"
-              // Equal top/left inset so the red light is equidistant from the
-              // top and left edges — tucked into the corner. 8px keeps it
-              // inside the 28px bar (8 + 12 + 8 = 28) with no height change.
-              style={{ top: 8, left: 8, gap: 8 }}
-            >
-              <TrafficLight color={TRAFFIC_RED} />
-              <TrafficLight color={TRAFFIC_YELLOW} />
-              <TrafficLight color={TRAFFIC_GREEN} />
-            </div>
-            <span
-              className="font-mono text-xs font-medium"
-              style={{ color: CHROME_TITLE }}
-            >
-              {resolved.terminalTitle}
-            </span>
-          </div>
-
-          {/* Terminal body — two `<pre>` blocks (sidebar + board) sit
-              side-by-side inside one dark surface, so the whole panel
-              reads as a single captured terminal frame. The board `<pre>`
-              overflows horizontally on narrow viewports; the sidebar
-              hides below `md` so phones don't get a cramped strip beside
-              a cropped board. */}
-          <div
-            className="relative flex overflow-x-auto"
-            // The solid terminal-body fill stays here at full opacity, so the
-            // body background never dims. Only the two panes' text layers
-            // cross-fade at the loop boundary (via `contentOpacity` on each
-            // `<pre>`): because every pane's own background is this same
-            // `TUI_BG`, fading a pane reveals an identical solid fill behind it,
-            // so the glyphs dissolve while the background — and the window chrome
-            // above — read as fully opaque throughout the loop.
-            style={{ background: TUI_BG }}
-          >
-            <Sidebar
-              state={resolved}
-              onSelectView={setActiveView}
-              contentOpacity={contentOpacity}
-            />
-            <TerminalBody state={resolved} contentOpacity={contentOpacity} />
-            {resolved.palette ? (
-              <PaletteOverlay palette={resolved.palette} project={resolved.project} />
-            ) : null}
-          </div>
-        </div>
+          <Sidebar
+            state={resolved}
+            onSelectView={setActiveView}
+            contentOpacity={contentOpacity}
+          />
+          <TerminalBody state={resolved} contentOpacity={contentOpacity} />
+          {resolved.palette ? (
+            <PaletteOverlay palette={resolved.palette} project={resolved.project} />
+          ) : null}
+        </TerminalFrame>
       </div>
     </section>
   )
@@ -2089,6 +2104,222 @@ export const PRESETS = {
 
 /** A key of {@link PRESETS} — the `preset` prop's accepted values. */
 export type PresetName = keyof typeof PRESETS
+
+// ── Value-prop fragments ──────────────────────────────────────────────
+// Compact, single-pane illustrations for the homepage value-prop sections.
+// Each is a focused fragment (a scoped task, a workspace roster, a workflow
+// strip) rather than the full dashboard — small enough to sit beside copy
+// without dominating it — but built from the same palette, the same `Segment`
+// rows, and the same `Row` renderer inside the same `TerminalFrame` chrome as
+// the hero's `AppMockup`, so they read as captures from the same terminal.
+
+// Fixed, sensible fragment width: wide enough for the workflow stage strip
+// (`BACKLOG → … → DONE`), narrow enough to stay a supporting illustration.
+const FRAG_W = 50
+
+/**
+ * A fragment's single terminal pane: its `Segment` rows rendered through the
+ * same `Row` engine as the dashboard panes, pinned to `FRAG_W` cells with a
+ * little breathing room so the text isn't flush against the frame.
+ */
+function FragmentPane({ rows }: { rows: Segment[][] }) {
+  return (
+    <pre
+      className="m-0 whitespace-pre font-mono"
+      style={{
+        ...PRE_STYLE,
+        width: `${FRAG_W}ch`,
+        minWidth: `${FRAG_W}ch`,
+        maxWidth: `${FRAG_W}ch`,
+        padding: "12px 14px",
+        overflow: "hidden",
+      }}
+    >
+      {rows.map((row, i) => (
+        <Row key={i} segs={row} />
+      ))}
+    </pre>
+  )
+}
+
+/**
+ * Fragment 1 — "Tasks keep work focused." A lazy one-liner at the `❯` prompt
+ * becoming a scoped task: a titled card with a couple of scope lines, the way
+ * the orchestrator turns an offhand request into focused work before an agent
+ * touches it.
+ */
+function scopedTaskRows(): Segment[][] {
+  const rows: Segment[][] = []
+  const scope = (text: string) =>
+    rows.push(
+      bodyRow(
+        [
+          { text: "   ◇ ", color: TUI_MAGENTA },
+          { text, color: TUI_GRAY },
+        ],
+        FRAG_W,
+      ),
+    )
+
+  rows.push(
+    bodyRow(
+      [
+        { text: " ❯ ", color: TUI_CYAN, bold: true },
+        { text: "ship the csv export thing", color: TUI_FG },
+      ],
+      FRAG_W,
+    ),
+  )
+  rows.push(blankRow(FRAG_W))
+  rows.push(
+    bodyRow(
+      [
+        { text: " ⏺ ", color: TUI_GREEN },
+        { text: "Scoped and added to the backlog:", color: TUI_FG },
+      ],
+      FRAG_W,
+    ),
+  )
+  rows.push(blankRow(FRAG_W))
+  rows.push(
+    bodyRow([{ text: "   Export orders to CSV", color: TUI_FG, bold: true }], FRAG_W),
+  )
+  rows.push(bodyRow([{ text: "   export-orders-csv", color: TUI_DARK_GRAY }], FRAG_W))
+  rows.push(blankRow(FRAG_W))
+  scope("GET /account/orders.csv, streamed")
+  scope("Columns: date, sku, qty, total")
+  scope("Done when it handles 10k+ rows")
+  return rows
+}
+
+/**
+ * Fragment 2 — "Agents provide specialization." The workspace roster with each
+ * workspace's agent right of its name: developers execute while reviewers, QA,
+ * and security scrutinize, each doing one job on the work that reaches it.
+ */
+function specializationRows(): Segment[][] {
+  const rows: Segment[][] = []
+  const NAME_W = 10
+  const workspace = (name: string, agent: string, agentColor: string) =>
+    rows.push(
+      bodyRow(
+        [
+          { text: " ⏵ ", color: TUI_GREEN },
+          { text: padTo(name, NAME_W), color: TUI_GRAY },
+          { text: agent, color: agentColor },
+        ],
+        FRAG_W,
+      ),
+    )
+
+  rows.push(bodyRow([{ text: " — Workspaces —", color: TUI_DARK_GRAY }], FRAG_W))
+  rows.push(blankRow(FRAG_W))
+  workspace("alpha", "Developer", TUI_FG)
+  workspace("bravo", "Developer", TUI_FG)
+  workspace("charlie", "Reviewer", TUI_MAGENTA)
+  workspace("delta", "QA", TUI_BLUE)
+  workspace("echo", "Security", TUI_CYAN)
+  return rows
+}
+
+/**
+ * Fragment 3 — "Workflows provide boundaries." The default workflow's real
+ * stages as a pipeline strip with the gate at REVIEW, then Zen Mode reporting
+ * what it merged and what it held for you — boundaries that make autonomy safe.
+ */
+function workflowRows(): Segment[][] {
+  const rows: Segment[][] = []
+  const arrow: Segment = { text: " → ", color: TUI_DARK_GRAY }
+
+  rows.push(
+    bodyRow(
+      [
+        { text: " " },
+        { text: "BACKLOG", color: TUI_GRAY, bold: true },
+        arrow,
+        { text: "TO DO", color: TUI_BLUE, bold: true },
+        arrow,
+        { text: "IN PROGRESS", color: TUI_YELLOW, bold: true },
+        arrow,
+        { text: "REVIEW", color: TUI_MAGENTA, bold: true },
+        arrow,
+        { text: "DONE", color: TUI_GREEN, bold: true },
+      ],
+      FRAG_W,
+    ),
+  )
+  rows.push(blankRow(FRAG_W))
+  rows.push(
+    bodyRow(
+      [
+        { text: " gate at ", color: TUI_DARK_GRAY },
+        { text: "REVIEW", color: TUI_MAGENTA },
+        { text: ": checks green · no danger paths", color: TUI_DARK_GRAY },
+      ],
+      FRAG_W,
+    ),
+  )
+  rows.push(blankRow(FRAG_W))
+  rows.push(
+    bodyRow(
+      [
+        { text: " ⏵⏵ ", color: TUI_GREEN },
+        { text: "zen mode on", color: TUI_DARK_GRAY },
+      ],
+      FRAG_W,
+    ),
+  )
+  rows.push(
+    bodyRow(
+      [
+        { text: "  ⏺ ", color: TUI_GREEN },
+        { text: "merged ", color: TUI_FG },
+        { text: quoted("Cold-start cache"), color: TUI_FG },
+        { text: "  · checks green", color: TUI_DARK_GRAY },
+      ],
+      FRAG_W,
+    ),
+  )
+  rows.push(
+    bodyRow(
+      [
+        { text: "  ⎿ ", color: TUI_DARK_GRAY },
+        { text: "held ", color: TUI_FG },
+        { text: quoted("Harden token refresh"), color: TUI_FG },
+        { text: "  · needs you", color: TUI_DARK_GRAY },
+      ],
+      FRAG_W,
+    ),
+  )
+  return rows
+}
+
+/** "Tasks keep work focused" — a lazy request becoming a scoped task. */
+export function ScopedTaskMockup() {
+  return (
+    <TerminalFrame title="shelbi · task">
+      <FragmentPane rows={scopedTaskRows()} />
+    </TerminalFrame>
+  )
+}
+
+/** "Agents provide specialization" — the workspace roster, one agent per job. */
+export function SpecializationMockup() {
+  return (
+    <TerminalFrame title="shelbi · workspaces">
+      <FragmentPane rows={specializationRows()} />
+    </TerminalFrame>
+  )
+}
+
+/** "Workflows provide boundaries" — the default stages, the gate, the Zen report. */
+export function WorkflowMockup() {
+  return (
+    <TerminalFrame title="shelbi · workflow">
+      <FragmentPane rows={workflowRows()} />
+    </TerminalFrame>
+  )
+}
 
 /**
  * Thin preset used by the marketing landing page. Renders `AppMockup` with
