@@ -298,7 +298,7 @@ export function ProblemSection() {
   return (
     <section ref={containerRef} className="border-t border-gray-4">
       <div className="mx-auto w-full max-w-6xl px-4 py-6 lg:px-6 lg:py-8">
-        <p className="font-mono text-xs font-medium uppercase tracking-[0.2em] text-accent">
+        <p className="font-mono text-sm font-medium uppercase tracking-[0.2em] text-accent">
           The old way
         </p>
         <h2 className="mt-2 max-w-3xl font-sans text-4xl font-semibold tracking-tight text-fg">
