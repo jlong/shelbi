@@ -112,13 +112,20 @@ pub fn handle_kanban_key(app: &mut KanbanApp, key: KeyEvent, km: &Keymaps) -> Ou
 }
 
 /// Left-click on a card opens its popover — same path as ENTER/SPACE on the
-/// keyboard. Clicks outside any card are a no-op. With the popover open we
-/// ignore clicks entirely; the popover has its own dismiss keys. With only
+/// keyboard. Clicks outside any card are a no-op. With the popover open the
+/// modal captures all mouse input: wheel events scroll the popover body and
+/// everything else (clicks included) is swallowed, so the board underneath
+/// never scrolls or reacts — the popover has its own dismiss keys. With only
 /// the workspace filter dropdown open, a click on an option commits it; a
 /// click anywhere outside the dropdown closes it (drop-to-dismiss pattern
 /// that matches what users expect from native dropdowns).
 pub fn handle_kanban_mouse(app: &mut KanbanApp, mouse: MouseEvent) {
     if app.popover_is_open() {
+        match mouse.kind {
+            MouseEventKind::ScrollUp => app.popover_scroll_up(),
+            MouseEventKind::ScrollDown => app.popover_scroll_down(),
+            _ => {}
+        }
         return;
     }
     if let MouseEventKind::Down(MouseButton::Left) = mouse.kind {
@@ -259,6 +266,15 @@ mod tests {
             kind: MouseEventKind::Down(MouseButton::Left),
             column,
             row,
+            modifiers: KeyModifiers::NONE,
+        }
+    }
+
+    fn wheel(kind: MouseEventKind) -> MouseEvent {
+        MouseEvent {
+            kind,
+            column: 10,
+            row: 5,
             modifiers: KeyModifiers::NONE,
         }
     }
@@ -429,6 +445,58 @@ mod tests {
         assert_eq!(app.selected_column, 0);
         assert_eq!(app.selected_row, 0);
         assert!(app.popover_is_open());
+    }
+
+    #[test]
+    fn wheel_scrolls_open_popover_and_clamps_at_top() {
+        let mut app = KanbanApp::new("demo");
+        app.popover = Some(TaskPopover {
+            task_id: "task-1".into(),
+            scroll: 0,
+        });
+
+        handle_kanban_mouse(&mut app, wheel(MouseEventKind::ScrollDown));
+        handle_kanban_mouse(&mut app, wheel(MouseEventKind::ScrollDown));
+        assert_eq!(app.popover.as_ref().unwrap().scroll, 2);
+
+        handle_kanban_mouse(&mut app, wheel(MouseEventKind::ScrollUp));
+        handle_kanban_mouse(&mut app, wheel(MouseEventKind::ScrollUp));
+        handle_kanban_mouse(&mut app, wheel(MouseEventKind::ScrollUp));
+        assert_eq!(
+            app.popover.as_ref().unwrap().scroll,
+            0,
+            "wheel up clamps at the top"
+        );
+    }
+
+    #[test]
+    fn open_popover_swallows_clicks_without_falling_through_to_board() {
+        let mut app = KanbanApp::new("demo");
+        app.tasks = vec![task_file("task-1", Column::backlog())];
+        app.selected_column = 1;
+        app.selected_row = 2;
+        app.card_hits = vec![CardHit {
+            area: Rect {
+                x: 0,
+                y: 2,
+                width: 20,
+                height: 3,
+            },
+            col_idx: 0,
+            row_idx: 0,
+        }];
+        app.popover = Some(TaskPopover {
+            task_id: "task-1".into(),
+            scroll: 3,
+        });
+
+        handle_kanban_mouse(&mut app, left_click(5, 2));
+
+        let p = app.popover.as_ref().expect("popover stays open");
+        assert_eq!(p.task_id, "task-1");
+        assert_eq!(p.scroll, 3, "click must not touch the scroll offset");
+        assert_eq!(app.selected_column, 1, "board selection untouched");
+        assert_eq!(app.selected_row, 2);
     }
 
     #[test]

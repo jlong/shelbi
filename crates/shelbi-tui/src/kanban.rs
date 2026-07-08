@@ -2491,7 +2491,7 @@ fn resolve_task_status(task: &Task, workflow: &Workflow) -> String {
 // ---------------------------------------------------------------------------
 // Task detail popover
 
-fn render_popover(f: &mut Frame, app: &KanbanApp, area: Rect) {
+fn render_popover(f: &mut Frame, app: &mut KanbanApp, area: Rect) {
     let popover_area = centered_rect(80, 80, area);
 
     // Clear underneath so the kanban columns don't bleed through.
@@ -2552,10 +2552,20 @@ fn render_popover(f: &mut Frame, app: &KanbanApp, area: Rect) {
         chunks[1],
     );
 
-    let scroll = app.popover.as_ref().map(|p| p.scroll).unwrap_or(0);
     // Pre-wrap so inline-code highlights stay within the popover's inner
     // width — see `markdown::render_note`.
     let lines = crate::markdown::render_note(&body_text, chunks[2].width as usize);
+    // Clamp scroll at the bottom against this frame's wrapped-line count,
+    // same render-time clamp the activity feed uses — the scroll methods
+    // only saturate at the top and can't know the wrapped height.
+    let total_lines = u16::try_from(lines.len()).unwrap_or(u16::MAX);
+    let max_scroll = total_lines.saturating_sub(chunks[2].height);
+    if let Some(p) = app.popover.as_mut() {
+        if p.scroll > max_scroll {
+            p.scroll = max_scroll;
+        }
+    }
+    let scroll = app.popover.as_ref().map(|p| p.scroll).unwrap_or(0);
     let body = Paragraph::new(lines).scroll((scroll, 0));
     f.render_widget(body, chunks[2]);
 
@@ -3381,6 +3391,76 @@ mod tests {
             "expected 3 dropdown hits (All + 2 workspaces), got {}",
             app.dropdown_hits.len()
         );
+    }
+
+    /// Scrolling past the end of the popover body (wheel or keyboard —
+    /// both only saturate at the top) must clamp at the bottom on the
+    /// next render, leaving the body's last line visible instead of a
+    /// blank pane. Same render-time clamp the activity feed uses.
+    #[test]
+    fn popover_render_clamps_scroll_at_bottom() {
+        use ratatui::{backend::TestBackend, Terminal};
+        let body: String = (1..=60)
+            .map(|i| format!("body line {i}\n"))
+            .collect();
+        let mut tf = task_file("task-1", Column::todo(), 0, "2026-06-20T10:00:00Z");
+        tf.body = body;
+        let mut app = KanbanApp::new("demo");
+        app.tasks = vec![tf];
+        app.popover = Some(TaskPopover {
+            task_id: "task-1".into(),
+            scroll: u16::MAX,
+        });
+
+        let backend = TestBackend::new(80, 24);
+        let mut term = Terminal::new(backend).unwrap();
+        term.draw(|f| render_full(f, &mut app, f.area())).unwrap();
+
+        let clamped = app.popover.as_ref().unwrap().scroll;
+        assert!(
+            clamped < u16::MAX,
+            "render must clamp an overshot scroll offset"
+        );
+
+        let buf = term.backend().buffer().clone();
+        let joined: String = (0..buf.area.height)
+            .map(|y| {
+                (0..buf.area.width)
+                    .map(|x| buf[(x, y)].symbol().to_string())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            joined.contains("body line 60"),
+            "at max scroll the last body line is visible, got:\n{joined}"
+        );
+
+        // A second render must not move the offset — the clamp is a
+        // fixed point, not a per-frame decrement.
+        term.draw(|f| render_full(f, &mut app, f.area())).unwrap();
+        assert_eq!(app.popover.as_ref().unwrap().scroll, clamped);
+    }
+
+    /// A body shorter than the popover viewport clamps to zero — no
+    /// scrolling into blank space below a short note.
+    #[test]
+    fn popover_render_clamps_short_body_to_zero() {
+        use ratatui::{backend::TestBackend, Terminal};
+        let mut tf = task_file("task-1", Column::todo(), 0, "2026-06-20T10:00:00Z");
+        tf.body = "just one line".to_string();
+        let mut app = KanbanApp::new("demo");
+        app.tasks = vec![tf];
+        app.popover = Some(TaskPopover {
+            task_id: "task-1".into(),
+            scroll: 7,
+        });
+
+        let backend = TestBackend::new(80, 24);
+        let mut term = Terminal::new(backend).unwrap();
+        term.draw(|f| render_full(f, &mut app, f.area())).unwrap();
+
+        assert_eq!(app.popover.as_ref().unwrap().scroll, 0);
     }
 
     /// The board footer sources every nav/move/reorder/open/refresh/
