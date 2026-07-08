@@ -31,7 +31,7 @@
 | ------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | **Use case / context**    | Shipping code changes — large and small — with multiple coding agents working concurrently                                                              |
 | **Current tool**          | Terminal tabs, one agent per tab, you as the router and scheduler                                                                                       |
-| **Problem**               | Wrong-tab replies; forgotten paused agents; constant tab-cycling; the backlog living in your head                                                       |
+| **Problem**               | Wrong-tab replies; forgotten paused agents; constant tab-cycling; the backlog living in your head; a review pile that grows faster than your trust in it |
 | **Capability**            | Talk to one agent — it writes work up as focused tasks, dispatches to workers, tracks everything, and returns finished work for review                  |
 | **Features**              | Orchestrator · kanban TUI · worker pool (any machine, tmux) · configurable workflow columns and review gates · specialized review agents · Zen Mode     |
 | **Benefit (first-order)** | Work is out of your head and nothing gets dropped; agents do better work on focused tasks; the quality bar is built into the system, not your vigilance |
@@ -50,12 +50,13 @@
 
 (Meets the Minimum Viable Positioning bar: market element = the tab mess; product elements = orchestrator, dispatch, review.)
 
-### Problem section — four beats
+### Problem section — five beats
 
 1. **Replied to the wrong tab.** You typed instructions meant for one agent into another agent's session.
 2. **The forgotten paused agent.** An agent asked you a question two hours ago. It's still sitting there, blocked, in a tab you forgot existed.
 3. **You are the scheduler.** Cycling through tabs asking "who's done? who's stuck? who needs me?" — you've become a human scheduler for your own tools.
 4. **The backlog lives in your head.** New work occurs to you while every agent is mid-task. Interrupting one derails it, so you sit on the idea — and carry it.
+5. **The review queue is you.** Every new agent makes the pile taller — and you trust it less. Faster output isn't the win it looked like when careful review is the bottleneck.
 
 ### Solution intro
 
@@ -67,9 +68,11 @@
 
 ### Value props — the triad
 
+(Together these answer beat 5, the scariest objection on the page: more agent throughput does *not* mean a taller, sloppier review pile — the quality bar is built into the system, so work arrives at your review already scrutinized.)
+
 1. **Tasks keep work focused.** The orchestrator writes every item up as a scoped, self-contained task before any agent touches it. Agents do their best work on ordered, focused chunks — and big features and one-off fixes flow through the same system.
 2. **Agents provide specialization.** Workers execute. Specialized agents review — adversarial code review, QA, security — each doing one job well, so every task gets the same expert-shaped scrutiny.
-3. **Workflows provide boundaries.** Every task moves through stages you define — review gates, QA, security — before it reaches you. And boundaries are what make autonomy safe: when your gates are catching what you would, flip `shelbi zen on` and let the orchestrator triage, dispatch, and merge green work itself. You get a digest of what landed and what needs you.
+3. **Workflows provide boundaries.** Every task moves through stages you define — review gates, QA, security — before it reaches you. Shelbi ships with a sensible default workflow (plan → work → review → merge), so day one needs no process design; add gates and specialized reviewers when you're ready. And boundaries are what make autonomy safe: when your gates are catching what you would, flip `shelbi zen on` and let the orchestrator triage, dispatch, and merge green work itself. You get a digest of what landed and what needs you.
 
 ### Feature grid (supporting facts)
 
