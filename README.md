@@ -92,7 +92,7 @@ manual downloads. To verify a downloaded `.deb` against the release checksum
 file, use the matching version tag and package name:
 
 ```bash
-version=0.1.0
+version=0.2.0
 curl -fsSLO "https://github.com/jlong/shelbi/releases/download/v${version}/checksums.txt"
 curl -fsSLO "https://github.com/jlong/shelbi/releases/download/v${version}/shelbi_${version}_amd64.deb"
 sha256sum -c checksums.txt --ignore-missing
@@ -102,7 +102,7 @@ For macOS release archives, download `checksums.txt` and the archive you want,
 then verify with `shasum`:
 
 ```bash
-version=0.1.0
+version=0.2.0
 curl -fsSLO "https://github.com/jlong/shelbi/releases/download/v${version}/checksums.txt"
 curl -fsSLO "https://github.com/jlong/shelbi/releases/download/v${version}/shelbi_Darwin_arm64.tar.gz"
 grep "shelbi_Darwin_arm64.tar.gz" checksums.txt | shasum -a 256 --check -
