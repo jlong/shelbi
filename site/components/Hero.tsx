@@ -50,9 +50,9 @@ export function Hero() {
         </h1>
 
         <h2 className="max-w-2xl text-balance text-base font-normal leading-relaxed text-gray-7 sm:text-lg">
-          You talk to one agent, the orchestrator. It writes your work up
-          as tasks, dispatches them to workers, and brings the finished
-          work back for your review.
+          With Shelbi, talk to one agent that writes up work as tasks,
+          dispatches to workers, and brings finished work back to you for
+          review.
         </h2>
 
         <p className="font-mono text-xs uppercase tracking-[0.25em] text-gray-7 sm:text-sm">
