@@ -58,7 +58,7 @@ manager path for your platform, then confirm the binary is on your `PATH`.
 ### macOS: Homebrew
 
 ```bash
-brew tap shelbi/shelbi
+brew tap jlong/shelbi
 brew install shelbi
 ```
 
