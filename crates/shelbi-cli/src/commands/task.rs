@@ -129,7 +129,9 @@ pub struct AddArgs {
         value_name = "STATUS"
     )]
     pub status: String,
-    /// Optional description; if omitted, the body starts empty (use
+    /// Optional description. The body may also be piped on stdin
+    /// (`shelbi task add "Title" <<EOF ... EOF`); passing both is an
+    /// error. If neither is given, the body defaults to the title (use
     /// `shelbi task edit` to fill it in).
     #[arg(long, short)]
     pub description: Option<String>,
@@ -227,6 +229,31 @@ pub fn run(project_opt: Option<String>, cmd: TaskCmd) -> Result<()> {
 }
 
 fn add(project: &str, args: AddArgs) -> Result<()> {
+    add_with_stdin(project, args, read_piped_stdin()?)
+}
+
+/// Read piped stdin, if any. `None` when stdin is a terminal (interactive
+/// invocation — nothing to read, and reading would block on the user).
+/// A non-TTY stdin (pipe, heredoc, `/dev/null`) is drained to EOF; an
+/// empty result is normalized to `None` so `< /dev/null` behaves like no
+/// pipe at all.
+fn read_piped_stdin() -> Result<Option<String>> {
+    use std::io::{IsTerminal, Read};
+    let mut stdin = std::io::stdin();
+    if stdin.is_terminal() {
+        return Ok(None);
+    }
+    let mut buf = String::new();
+    stdin
+        .read_to_string(&mut buf)
+        .context("reading piped stdin")?;
+    if buf.trim().is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(buf))
+}
+
+fn add_with_stdin(project: &str, args: AddArgs, stdin_body: Option<String>) -> Result<()> {
     let column = Column::from_str(&args.status).map_err(|e| anyhow!(e))?;
     let id = match args.id {
         Some(id) => {
@@ -268,10 +295,18 @@ fn add(project: &str, args: AddArgs) -> Result<()> {
         let existing = shelbi_state::list_tasks(project).map_err(|e| anyhow!(e))?;
         shelbi_state::validate_depends_on(&task, &existing).map_err(|e| anyhow!(e))?;
     }
-    let body = args
-        .description
-        .map(|d| format!("# Task\n\n{d}\n"))
-        .unwrap_or_else(|| format!("# Task\n\n{}\n", args.title));
+    // Body precedence: `-d` and piped stdin are two spellings of the same
+    // input, so supplying both is ambiguous — refuse rather than silently
+    // discard either one. With neither, the body defaults to the title.
+    let body = match (args.description, stdin_body) {
+        (Some(_), Some(_)) => bail!(
+            "both --description and piped stdin were given — pass the body one way \
+             (drop -d, or close stdin)"
+        ),
+        (Some(d), None) => format!("# Task\n\n{d}\n"),
+        (None, Some(s)) => format!("# Task\n\n{}\n", s.trim_end()),
+        (None, None) => format!("# Task\n\n{}\n", args.title),
+    };
     // Create-exclusive: the up-front existence checks above are advisory
     // (they race against concurrent creators); this is the authoritative
     // no-overwrite guarantee.
@@ -1204,6 +1239,80 @@ mod tests {
         assert_eq!(slugify("CSV → JSON"), "csv-json");
         assert_eq!(slugify("---"), "");
         assert_eq!(slugify("Already-kebab-OK"), "already-kebab-ok");
+    }
+
+    fn add_args(title: &str) -> AddArgs {
+        AddArgs {
+            title: title.into(),
+            id: None,
+            status: "backlog".into(),
+            description: None,
+            depends_on: Vec::new(),
+            prefers_machine: None,
+            workflow: None,
+            branch: None,
+        }
+    }
+
+    #[test]
+    fn add_persists_piped_stdin_as_body() {
+        let _g = TEST_LOCK.lock().unwrap();
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+
+        let piped = "Ship the thing.\n\n## Acceptance Criteria\n- [ ] it ships\n";
+        add_with_stdin("p", add_args("Piped body"), Some(piped.into())).unwrap();
+
+        let tf = shelbi_state::load_task("p", "piped-body").unwrap();
+        assert_eq!(
+            tf.body,
+            "# Task\n\nShip the thing.\n\n## Acceptance Criteria\n- [ ] it ships\n"
+        );
+
+        std::env::remove_var("SHELBI_HOME");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn add_rejects_description_flag_combined_with_piped_stdin() {
+        let _g = TEST_LOCK.lock().unwrap();
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+
+        let mut args = add_args("Ambiguous");
+        args.description = Some("flag body".into());
+        let err = add_with_stdin("p", args, Some("piped body".into()))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("both --description and piped stdin"),
+            "err: {err}"
+        );
+        // The refusal must happen before the task file is written.
+        assert!(shelbi_state::load_task("p", "ambiguous").is_err());
+
+        std::env::remove_var("SHELBI_HOME");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn add_description_flag_and_title_default_unchanged_without_stdin() {
+        let _g = TEST_LOCK.lock().unwrap();
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+
+        let mut args = add_args("With flag");
+        args.description = Some("flag body".into());
+        add_with_stdin("p", args, None).unwrap();
+        let tf = shelbi_state::load_task("p", "with-flag").unwrap();
+        assert_eq!(tf.body, "# Task\n\nflag body\n");
+
+        add_with_stdin("p", add_args("Bare title"), None).unwrap();
+        let tf = shelbi_state::load_task("p", "bare-title").unwrap();
+        assert_eq!(tf.body, "# Task\n\nBare title\n");
+
+        std::env::remove_var("SHELBI_HOME");
+        let _ = std::fs::remove_dir_all(&home);
     }
 
     #[test]
