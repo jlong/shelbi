@@ -16,7 +16,7 @@
 
 - **Differentiation wedge:** *you talk to one agent that runs the rest.* With tabs, you are the router — multiplexing attention, replying in wrong tabs, forgetting paused sessions. With Shelbi you're no longer the router. Key mechanism backing the claim: **the orchestrator doesn't do the work, it assigns it** — so you can dump work on it as it occurs to you without derailing anything.
 
-- **Secondary anchors (hero-level):** open source · terminal/tmux-native · workers across your machines. Not in the hero: "Claude Code" by name (keeps scope open for other agent CLIs; use "coding agents" as the generic noun).
+- **Secondary anchors (hero-level):** open source · made with tmux · workers across your machines. Not in the hero: "Claude Code" by name (keeps scope open for other agent CLIs; use "coding agents" as the generic noun).
 
 - **Register:** developer-flat. Clear beats clever. No grandeur ("mission control" was considered and rejected), no multi-order benefits ("do more," "greater productivity"), no vision copy.
 
@@ -46,7 +46,7 @@
 >
 > **H2:** With Shelbi you talk to one agent — an orchestrator that breaks work into tasks, dispatches them to worker agents on any of your machines, and brings finished work back for your review.
 >
-> Badge line: `open source · tmux-native` — CTAs: **Install now** / **Read the docs**
+> Badge line: `open source · made with tmux · multi-machine` — CTAs: **Install now** / **Read the docs**
 
 (Meets the Minimum Viable Positioning bar: market element = the tab mess; product elements = orchestrator, dispatch, review.)
 
@@ -73,7 +73,7 @@
 
 ### Feature grid (supporting facts)
 
-Kanban TUI · workers on any machine · tmux-native · review flow · events log · open source
+Kanban TUI · workers on any machine · made with tmux · review flow · events log · open source
 
 ### Closer
 
