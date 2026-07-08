@@ -191,6 +191,8 @@ pub fn handle_popover_key(app: &mut KanbanApp, key: KeyEvent, km: &Keymaps) {
         Some(PopoverAction::PageUp) => app.popover_scroll_page_up(),
         Some(PopoverAction::PageDown) => app.popover_scroll_page_down(),
         Some(PopoverAction::ScrollHome) => app.popover_scroll_home(),
+        Some(PopoverAction::MoveLeft) => app.popover_move_left(),
+        Some(PopoverAction::MoveRight) => app.popover_move_right(),
         None => {}
     }
 }
@@ -600,6 +602,43 @@ mod tests {
         // Esc — a `km.popover` chord — closes.
         handle_popover_key(&mut app, key(KeyCode::Esc), &km);
         assert!(!app.popover_is_open(), "Esc closes the popover");
+
+        std::env::remove_var("SHELBI_HOME");
+    }
+
+    #[test]
+    fn popover_move_chords_dispatch_to_move_actions() {
+        // Same capital H / L the board's move_card_* uses, plus the
+        // shift+arrow pair, so the move gesture is one muscle memory
+        // whether the popover is open or not.
+        let _g = ENV_LOCK.lock().unwrap();
+        let km = fresh_keymaps();
+
+        assert_eq!(
+            km.popover
+                .dispatch(key_with(KeyCode::Char('H'), KeyModifiers::SHIFT)),
+            Some(PopoverAction::MoveLeft)
+        );
+        assert_eq!(
+            km.popover
+                .dispatch(key_with(KeyCode::Left, KeyModifiers::SHIFT)),
+            Some(PopoverAction::MoveLeft)
+        );
+        assert_eq!(
+            km.popover
+                .dispatch(key_with(KeyCode::Char('L'), KeyModifiers::SHIFT)),
+            Some(PopoverAction::MoveRight)
+        );
+        assert_eq!(
+            km.popover
+                .dispatch(key_with(KeyCode::Right, KeyModifiers::SHIFT)),
+            Some(PopoverAction::MoveRight)
+        );
+
+        // Plain arrows / h / l stay unbound in the popover — nav must
+        // not accidentally relocate a task while the user is reading.
+        assert_eq!(km.popover.dispatch(key(KeyCode::Left)), None);
+        assert_eq!(km.popover.dispatch(key(KeyCode::Right)), None);
 
         std::env::remove_var("SHELBI_HOME");
     }

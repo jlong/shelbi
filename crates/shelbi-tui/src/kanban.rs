@@ -1176,7 +1176,7 @@ impl KanbanApp {
         let Some(id) = self.selected_task().map(|tf| tf.task.id.clone()) else {
             return;
         };
-        let Some(new_col_idx) = self.adjacent_column_for_task(&id, false) else {
+        let Some(new_col_idx) = self.adjacent_column_for_task(&id, false, true) else {
             return;
         };
         self.move_card(&id, new_col_idx);
@@ -1186,41 +1186,73 @@ impl KanbanApp {
         let Some(id) = self.selected_task().map(|tf| tf.task.id.clone()) else {
             return;
         };
-        let Some(new_col_idx) = self.adjacent_column_for_task(&id, true) else {
+        let Some(new_col_idx) = self.adjacent_column_for_task(&id, true, true) else {
+            return;
+        };
+        self.move_card(&id, new_col_idx);
+    }
+
+    /// Move the popover's task one workflow-eligible column left/right.
+    /// Same `move_card` path the board's `move_card_*` uses (workflow
+    /// validation, branch-cut lifecycle, event line) but **clamped** at
+    /// the workflow's first/last eligible column instead of wrapping —
+    /// wrapping inside the modal would teleport the card from `done`
+    /// back to `backlog` with no board visible to make that legible.
+    /// A clamped no-op surfaces on the status line under the popover.
+    pub fn popover_move_left(&mut self) {
+        self.popover_move(false);
+    }
+
+    pub fn popover_move_right(&mut self) {
+        self.popover_move(true);
+    }
+
+    fn popover_move(&mut self, forward: bool) {
+        let Some(id) = self.popover.as_ref().map(|p| p.task_id.clone()) else {
+            return;
+        };
+        let Some(new_col_idx) = self.adjacent_column_for_task(&id, forward, false) else {
+            let dir = if forward { "right" } else { "left" };
+            self.status_line = format!("{id}: no column to the {dir} in its workflow");
             return;
         };
         self.move_card(&id, new_col_idx);
     }
 
     /// Find the next/prev column slot that belongs to a status the
-    /// task's owning workflow declares. Wraps within the workflow's
-    /// eligible set. Returns `None` when the task isn't currently in
-    /// `self.tasks` or its workflow isn't loaded — see
-    /// [`Self::adjacent_column_in_workflow`] for the underlying rule.
-    fn adjacent_column_for_task(&self, task_id: &str, forward: bool) -> Option<usize> {
+    /// task's owning workflow declares. With `wrap`, wraps within the
+    /// workflow's eligible set; otherwise clamps at the ends. Returns
+    /// `None` when the task isn't currently in `self.tasks` or its
+    /// workflow isn't loaded — see [`Self::adjacent_column_in_workflow`]
+    /// for the underlying rule.
+    fn adjacent_column_for_task(&self, task_id: &str, forward: bool, wrap: bool) -> Option<usize> {
         let task = &self.tasks.iter().find(|tf| tf.task.id == task_id)?.task;
         let wf = self
             .workflows
             .iter()
             .find(|w| w.name == self.task_workflow_name(task))?;
         let current_id = self.resolved_status_id(task);
-        self.adjacent_column_in_workflow(&current_id, wf, forward)
+        self.adjacent_column_in_workflow(&current_id, wf, forward, wrap)
     }
 
     /// Index of the next/prev column the workflow can land on, relative
     /// to `current_status_id`. Skips columns whose status the workflow
-    /// doesn't declare and wraps within the workflow's eligible set in
-    /// `statuses.yaml` order. Returns `None` when:
+    /// doesn't declare; with `wrap` it wraps within the workflow's
+    /// eligible set in `statuses.yaml` order, otherwise it clamps (the
+    /// popover's behavior). Returns `None` when:
     ///
     /// - the workflow declares fewer than two statuses that appear in
-    ///   the current column set (nowhere to move), or
+    ///   the current column set (nowhere to move),
     /// - `current_status_id` isn't in the current column set (an off-
-    ///   list state — refuse to invent a move).
+    ///   list state — refuse to invent a move), or
+    /// - `wrap` is off and the task already sits at the workflow's
+    ///   first/last eligible column in the requested direction.
     fn adjacent_column_in_workflow(
         &self,
         current_status_id: &str,
         workflow: &Workflow,
         forward: bool,
+        wrap: bool,
     ) -> Option<usize> {
         let eligible: Vec<usize> = self
             .all_columns
@@ -1238,11 +1270,17 @@ impl KanbanApp {
             .position(|c| c.status_id == current_status_id)?;
         let pos = eligible.iter().position(|&i| i == current_col_idx)?;
         let next = if forward {
-            (pos + 1) % eligible.len()
-        } else if pos == 0 {
+            match pos + 1 {
+                n if n < eligible.len() => n,
+                _ if wrap => 0,
+                _ => return None,
+            }
+        } else if pos > 0 {
+            pos - 1
+        } else if wrap {
             eligible.len() - 1
         } else {
-            pos - 1
+            return None;
         };
         Some(eligible[next])
     }
@@ -1261,11 +1299,10 @@ impl KanbanApp {
         // exist locally yet) we bail without moving the card so the YAML
         // and the git refs stay consistent.
         if new_col == Column::in_progress() {
-            if let Some(tf) = self
-                .column_tasks(self.selected_column)
-                .iter()
-                .find(|tf| tf.task.id == id)
-            {
+            // By-id lookup (not a selected-column scan): the popover's
+            // move path keys off the popover task, which a background
+            // refresh may have drifted away from the board selection.
+            if let Some(tf) = self.tasks.iter().find(|tf| tf.task.id == id) {
                 if tf.task.column != Column::in_progress() {
                     match shelbi_state::load_project(&self.project_name) {
                         Ok(project) => {
@@ -2576,11 +2613,13 @@ fn render_popover(f: &mut Frame, app: &mut KanbanApp, area: Rect) {
     let style = app.display_style();
     let fc = |c| format_chord_or_unbound(c, style);
     let hint_text = format!(
-        "  {}  close      {}/{}  scroll      {}  top",
+        "  {}  close      {}/{}  scroll      {}  top      {}/{}  move col",
         fc(km.popover.first_chord_for(PopoverAction::Close)),
         fc(km.popover.first_chord_for(PopoverAction::ScrollDown)),
         fc(km.popover.first_chord_for(PopoverAction::ScrollUp)),
         fc(km.popover.first_chord_for(PopoverAction::ScrollHome)),
+        fc(km.popover.first_chord_for(PopoverAction::MoveLeft)),
+        fc(km.popover.first_chord_for(PopoverAction::MoveRight)),
     );
     let hint = Line::from(Span::styled(
         hint_text,
@@ -2933,6 +2972,131 @@ mod tests {
 
         std::env::remove_var("SHELBI_HOME");
         let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// The popover's move shortcut drives the same `move_card` path the
+    /// board uses: the task file's column persists, the `task=` event
+    /// line lands in `~/.shelbi/events.log`, and the popover stays open
+    /// on the moved task while the board selection follows it.
+    #[test]
+    fn popover_move_right_persists_emits_event_and_keeps_popover_open() {
+        let _g = crate::test_support::ENV_LOCK.lock().unwrap();
+        let home = std::env::temp_dir().join(format!(
+            "shelbi-tui-popover-move-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&home).unwrap();
+        std::env::set_var("SHELBI_HOME", &home);
+        // Moving into `in_progress` fires the branch-cut lifecycle hook,
+        // which needs a loadable project and a git repo at the hub workdir.
+        crate::test_support::provision_hub_repo_for_project(&home, "demo");
+
+        use chrono::Utc;
+        let now = Utc::now();
+        let task = shelbi_core::Task {
+            id: "fix-login".into(),
+            title: "fix login".into(),
+            column: Column::todo(),
+            priority: 0,
+            assigned_to: None,
+            workflow: None,
+            branch: None,
+            depends_on: Vec::new(),
+            prefers_machine: None,
+            zen: None,
+            created_at: now,
+            updated_at: now,
+            params: std::collections::BTreeMap::new(),
+        };
+        shelbi_state::save_task("demo", &task, "").unwrap();
+
+        let mut app = KanbanApp::new("demo");
+        app.refresh();
+        app.selected_column = 1; // todo
+        app.selected_row = 0;
+        app.open_popover();
+        assert!(app.popover_is_open());
+
+        app.popover_move_right();
+
+        // Same status-move path as the board: event line emitted…
+        let log = std::fs::read_to_string(shelbi_state::events_log_path().unwrap()).unwrap();
+        let lines: Vec<&str> = log.lines().collect();
+        assert_eq!(lines.len(), 1, "log: {log:?}");
+        assert!(lines[0].contains(" task=fix-login "), "line: {}", lines[0]);
+        assert!(
+            lines[0].contains(" todo -> in_progress "),
+            "line: {}",
+            lines[0]
+        );
+        assert!(lines[0].contains(" reason=user:tui "), "line: {}", lines[0]);
+
+        // …popover follows the task into its new column…
+        let p = app.popover.as_ref().expect("popover stays open");
+        assert_eq!(p.task_id, "fix-login");
+        assert_eq!(
+            app.popover_task().unwrap().task.column,
+            Column::in_progress(),
+            "popover shows the task in its new column"
+        );
+        // …and the board selection underneath follows too.
+        assert_eq!(app.selected_column, 2);
+        assert_eq!(app.selected_row, 0);
+
+        std::env::remove_var("SHELBI_HOME");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// At the workflow's first eligible column the popover move clamps:
+    /// no move, no event, popover open, and the status line explains why
+    /// (the board's `move_card_*` wraps instead — the modal must not
+    /// teleport the card across the board while it's hidden).
+    #[test]
+    fn popover_move_left_clamps_at_first_column_with_feedback() {
+        let mut app = KanbanApp::new("demo");
+        app.tasks = vec![{
+            let now = chrono::Utc::now();
+            TaskFile {
+                task: shelbi_core::Task {
+                    id: "task-1".into(),
+                    title: "task-1".into(),
+                    column: Column::backlog(),
+                    priority: 0,
+                    assigned_to: None,
+                    workflow: None,
+                    branch: None,
+                    depends_on: Vec::new(),
+                    prefers_machine: None,
+                    zen: None,
+                    created_at: now,
+                    updated_at: now,
+                    params: std::collections::BTreeMap::new(),
+                },
+                body: String::new(),
+            }
+        }];
+        app.popover = Some(TaskPopover {
+            task_id: "task-1".into(),
+            scroll: 0,
+        });
+
+        app.popover_move_left();
+
+        assert_eq!(
+            app.tasks[0].task.column,
+            Column::backlog(),
+            "clamped move must not change the column"
+        );
+        assert!(app.popover_is_open(), "popover survives a clamped no-op");
+        assert!(
+            app.status_line.contains("no column to the left"),
+            "status line: {:?}",
+            app.status_line
+        );
     }
 
     // ---- workspace filter ---------------------------------------------------
@@ -3855,17 +4019,17 @@ mod tests {
             .find(|w| w.name == "design-review")
             .unwrap();
         assert_eq!(
-            app.adjacent_column_in_workflow("backlog", design_review, true),
+            app.adjacent_column_in_workflow("backlog", design_review, true, true),
             Some(2),
             "design-review skips todo on right"
         );
         assert_eq!(
-            app.adjacent_column_in_workflow("done", design_review, true),
+            app.adjacent_column_in_workflow("done", design_review, true, true),
             Some(0),
             "wraps back to the workflow's first declared status"
         );
         assert_eq!(
-            app.adjacent_column_in_workflow("backlog", design_review, false),
+            app.adjacent_column_in_workflow("backlog", design_review, false, true),
             Some(4),
             "wrap left from first → workflow's last status"
         );
@@ -3873,9 +4037,28 @@ mod tests {
         // The default workflow's adjacency walks every column (no gaps).
         let default = app.workflows.iter().find(|w| w.name == "default").unwrap();
         assert_eq!(
-            app.adjacent_column_in_workflow("backlog", default, true),
+            app.adjacent_column_in_workflow("backlog", default, true, true),
             Some(1),
             "default → next column without skipping"
+        );
+
+        // Clamped adjacency (the popover's mode): interior moves match
+        // the wrapping ones, but the workflow's first/last eligible
+        // column has no adjacent in that direction.
+        assert_eq!(
+            app.adjacent_column_in_workflow("backlog", design_review, true, false),
+            Some(2),
+            "clamped interior move matches the wrapping one"
+        );
+        assert_eq!(
+            app.adjacent_column_in_workflow("done", design_review, true, false),
+            None,
+            "clamped at the workflow's last eligible column"
+        );
+        assert_eq!(
+            app.adjacent_column_in_workflow("backlog", design_review, false, false),
+            None,
+            "clamped at the workflow's first eligible column"
         );
     }
 
@@ -3889,11 +4072,11 @@ mod tests {
         app.project_statuses = default_project_statuses();
         app.all_columns = app.compute_all_columns();
         assert_eq!(
-            app.adjacent_column_in_workflow("in-progress", &solo, true),
+            app.adjacent_column_in_workflow("in-progress", &solo, true, true),
             None
         );
         assert_eq!(
-            app.adjacent_column_in_workflow("in-progress", &solo, false),
+            app.adjacent_column_in_workflow("in-progress", &solo, false, true),
             None
         );
     }

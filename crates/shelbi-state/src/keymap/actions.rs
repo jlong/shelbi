@@ -67,6 +67,8 @@ pub enum PopoverAction {
     PageUp,
     PageDown,
     ScrollHome,
+    MoveLeft,
+    MoveRight,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -136,6 +138,8 @@ impl Action {
                 PopoverAction::PageUp => "Popover: page up",
                 PopoverAction::PageDown => "Popover: page down",
                 PopoverAction::ScrollHome => "Popover: scroll to top",
+                PopoverAction::MoveLeft => "Popover: move task to the left column",
+                PopoverAction::MoveRight => "Popover: move task to the right column",
             },
             Action::Activity(a) => match a {
                 ActivityAction::ScrollUp => "Activity: scroll up",
@@ -201,6 +205,11 @@ impl Action {
                 PopoverAction::PageUp => &["page-up", "u"],
                 PopoverAction::PageDown => &["page-down", "d"],
                 PopoverAction::ScrollHome => &["g", "home"],
+                // Same capital H / L the board uses for `move_card_*`,
+                // so muscle memory carries into the modal. Shift+arrows
+                // join them the way `reorder_*` pairs K / shift-up.
+                PopoverAction::MoveLeft => &["H", "shift-left"],
+                PopoverAction::MoveRight => &["L", "shift-right"],
             },
             Action::Activity(a) => match a {
                 ActivityAction::ScrollUp => &["k", "up"],
@@ -273,6 +282,8 @@ impl Action {
                 PopoverAction::PageUp => "page_up",
                 PopoverAction::PageDown => "page_down",
                 PopoverAction::ScrollHome => "scroll_home",
+                PopoverAction::MoveLeft => "move_left",
+                PopoverAction::MoveRight => "move_right",
             },
             Action::Activity(a) => match a {
                 ActivityAction::ScrollUp => "scroll_up",
@@ -332,6 +343,8 @@ impl Action {
             PopoverAction::PageUp,
             PopoverAction::PageDown,
             PopoverAction::ScrollHome,
+            PopoverAction::MoveLeft,
+            PopoverAction::MoveRight,
         ];
         const ACTIVITY: &[ActivityAction] = &[
             ActivityAction::ScrollUp,
