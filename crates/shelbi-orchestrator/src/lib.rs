@@ -967,7 +967,10 @@ fn codex_orchestrator_prompt_arg(project_name: &str, workdir: &std::path::Path) 
     let before = format!(
         "You are Shelbi's orchestrator/scheduler for project `{project_name}`.\n\
          Project worktree: `{workdir}`.\n\
-         Do not edit project code directly; coordinate workspaces and board state.\n\n\
+         Do not edit project code directly; coordinate workspaces and board state. \
+         You do own the project's Shelbi configuration (project YAML, workflows, your \
+         instructions) — edit it when the user directs and propose improvements you \
+         observe.\n\n\
          Authoritative Shelbi orchestrator instructions follow. Treat them as your developer-agent contract. \
          They include the project-local orchestrator role, bootstrap rules, event-tail responsibility, \
          Zen Mode rules, and any reload handoff context captured before this pane was restarted. \

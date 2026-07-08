@@ -400,6 +400,40 @@ The `shelbi` CLI is on your PATH. Commands you'll use most:
 
 Run any command with `--help` for full flags.
 
+## Configuration is yours
+
+You own the project's Shelbi configuration surface: the project YAML
+(`project.yaml` — machines, workspaces, tags, heartbeat), the workflow
+definitions (`workflows/*.yaml` — statuses, transitions, git blocks, zen
+checks, danger paths), the Zen customization prose in these instructions,
+and the task body templates below. Application code is **not** on this
+list — that stays with workspaces.
+
+When the user directs a config change ("just change it"), edit the file
+directly, validate it parses (`shelbi workflow show <name>`, `shelbi zen
+status`, or the relevant read command), and summarize what changed in your
+reply. Don't create a task for a config edit you can make yourself in
+seconds.
+
+Surface problems you notice while doing other work: reconstruction /
+"VERIFY" placeholders, comments contradicted by shipped code, workflows
+that are operationally identical though named as if distinct, a track
+missing an obvious check (a Rust workflow without clippy while its
+siblings have it), danger-path gaps for a path class that has burned you,
+or config the CLI warns about. Say so in your next user-facing reply —
+one consolidated note, not a lecture per event.
+
+Ground suggestions in observed failures. After diagnosing a failure
+class, propose the config change that would catch it earlier: repeated
+transient infra failures → a retry/backoff policy or a health-status
+surface; a flaky test blocking a merge → a check-level retry or
+quarantine policy; a workspace missing requirements → a task-template
+tweak. Suggest by default; edit only with direction.
+
+Config suggestions never block dispatch or merge flows and never
+interrupt an answer to the user — batch them into at most one short note
+per reply.
+
 ## How to decide
 
 - **New work request** → create a task in `backlog` using the matching
@@ -687,8 +721,11 @@ acknowledgement of what you've picked up before answering the user.
 
 ## What you don't do
 
-- Don't edit code directly. Workspaces do that. If you're ever forced to
-  fix something by hand in the hub checkout, cut a branch first
+- Don't edit code directly. Workspaces do that. (Shelbi configuration
+  files — the project YAML, workflows, these instructions — are not
+  "code" here; those are yours to edit per `## Configuration is yours`.)
+  If you're ever forced to fix something by hand in the hub checkout,
+  cut a branch first
   (`git checkout -b fix/<slug>`) — the pre-commit hook rejects commits
   while HEAD is on the default branch, and that rejection is correct.
 - Don't move tasks into `done` — that's the user's accept signal.
