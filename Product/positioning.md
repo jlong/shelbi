@@ -3,7 +3,7 @@
 
 **Positioning statement:**
 
-> For developers already running multiple coding agents in terminal tabs, Shelbi replaces the tab-juggling with a single agent you talk to — an orchestrator that writes work up as focused tasks, dispatches them to worker agents on any of your machines, and delivers the results back through workflows you define.
+> For developers already running multiple coding agents in terminal tabs, Shelbi replaces the tab-juggling with a single agent you talk to: an orchestrator that writes work up as focused tasks, dispatches them to worker agents on any of your machines, and delivers the results back through workflows you define.
 
 **Tagline (short form, README / metadata):** One agent to talk to. Workers do the rest.
 
@@ -44,7 +44,7 @@
 
 > **H1:** Stop babysitting a mess of agent tabs.
 >
-> **H2:** With Shelbi you talk to one agent — an orchestrator that breaks work into tasks, dispatches them to worker agents on any of your machines, and brings finished work back for your review.
+> **H2:** You talk to one agent, the orchestrator. It writes your work up as tasks, dispatches them to workers, and brings the finished work back for your review.
 >
 > Badge line: `open source · made with tmux · multi-machine` — CTAs: **Install now** / **Read the docs**
 
@@ -52,29 +52,27 @@
 
 ### Problem section — five beats
 
-1. **Replied to the wrong tab.** You typed instructions meant for one agent into another agent's session.
-2. **The forgotten paused agent.** An agent asked you a question two hours ago. It's still sitting there, blocked, in a tab you forgot existed.
-3. **You are the scheduler.** Cycling through tabs asking "who's done? who's stuck? who needs me?" — you've become a human scheduler for your own tools.
-4. **The backlog lives in your head.** New work occurs to you while every agent is mid-task. Interrupting one derails it, so you sit on the idea — and carry it.
-5. **The review queue is you.** Every new agent makes the pile taller — and you trust it less. Faster output isn't the win it looked like when careful review is the bottleneck.
+1. **Replied to the wrong tab.** You typed instructions for one agent into another one's session.
+2. **The forgotten paused agent.** An agent asked you a question two hours ago. It's still waiting, in a tab you forgot.
+3. **You are the scheduler.** Who's done? Who's stuck? Who needs you? You've become a human scheduler for your own tools.
+4. **The backlog lives in your head.** New work occurs to you while every agent is mid-task. Interrupting one derails it, so you carry the idea instead.
+5. **The review queue is you.** Every new agent makes the pile taller, and you trust it less.
 
 ### Solution intro
 
 > **Inbox Zero, for agent work.**
 >
-> Dump work on the orchestrator the moment it occurs to you — it writes each item up as a focused task, dispatches it to worker agents, and makes sure it comes back done. Out of your head. Off your tabs. Through your review.
-
-(Interrupt-safety is the load-bearing claim: because the orchestrator doesn't do the work itself, telling it something new never derails work in flight.)
+> Dump work on the orchestrator the moment it occurs to you. It doesn't do the work itself, so there's nothing to derail. Each item becomes a focused task, and nothing gets dropped. Out of your head. Off your tabs.
 
 ### Value props — the triad
 
-1. **Tasks keep work focused.** The orchestrator writes every item up as a scoped, self-contained task before any agent touches it. Agents do their best work on ordered, focused chunks — and big features and one-off fixes flow through the same system.
-2. **Agents provide specialization.** Workers execute. Specialized agents review — adversarial code review, QA, security — each doing one job well, so every task gets the same expert-shaped scrutiny.
-3. **Workflows provide boundaries.** Every task moves through stages you define — review gates, QA, security — before it reaches you. And boundaries are what make autonomy safe: when your gates are catching what you would, flip `shelbi zen on` and let the orchestrator triage, dispatch, and merge green work itself. You get a digest of what landed and what needs you.
+1. **Tasks keep work focused.** Every item becomes a scoped task before an agent touches it. Agents do their best work on focused chunks, and big features and quick fixes flow through the same system.
+2. **Agents provide specialization.** Workers execute. Reviewers scrutinize: adversarial review, QA, security. Each does one job well, on every task.
+3. **Workflows provide boundaries.** Every task moves through stages you define before it reaches you. Boundaries are what make autonomy safe. When your gates catch what you would, flip `shelbi zen on` and the orchestrator merges green work itself. You get a digest of what landed and what needs you.
 
 ### Feature grid (supporting facts)
 
-Kanban TUI · workers on any machine · made with tmux · review flow · events log · open source
+Kanban TUI · workers on any machine (just tmux + an agent CLI) · made with tmux · review flow · plain-file state (markdown & YAML, no database, no cloud) · open source
 
 ### Closer
 
@@ -90,4 +88,4 @@ Install CTA (`curl … | sh` code block) + "Build from source" docs link.
 
 **On the orchestrator.** The orchestrator is key. So much easier to talk to one agent, rather than managing agents in multiple tabs. Because the orchestrator doesn't do the work, but rather assigns it to others, you can dump work on it as it occurs to you without worrying about getting it distracted. Its job is to write the work up for you in a way that other agents can execute. The agents benefit from ordered, focused work. It's like Inbox Zero. Instead of keeping all of this stuff in your head you just tell it to the orchestrator. It organizes it and makes sure it gets done. A relationship of trust develops. Eventually you turn on Zen Mode so that the orchestrator can blitz through the work.
 
-**On quality.** Shelbi provides the primitives you need to support workflows that produce extremely high quality code — specialized agents for adversarial code review, QA, and security, each governing a column on the board so that every task benefits from the same scrutiny. Work can be delivered at a higher quality bar, not lower. The key is building that bar into the system. Workflows provide boundaries. Agents provide specialization. Tasks keep work focused.
+**On quality.** Shelbi provides the primitives you need to support workflows that produce extremely high quality code: specialized agents for adversarial code review, QA, and security, each governing a column on the board so that every task benefits from the same scrutiny. Work can be delivered at a higher quality bar, not lower. The key is building that bar into the system. Workflows provide boundaries. Agents provide specialization. Tasks keep work focused.
