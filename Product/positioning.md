@@ -12,7 +12,6 @@ Worked out July 2026 using a homepage-first positioning method (research notes l
 
 ## The decisions
 
-- **Champion (target segment):** the developer *already* running 2+ CLI coding agents in terminal tabs and feeling the pain — the "M2 kinetic energy" segment (already doing the job, painfully). No convincing needed that parallel agents are good; only that there's a better way. Explicitly not: agent-curious single-agent devs (M1), users of competing orchestrators (M3), or eng-lead/team buyers.
 
 - **Primary anchor:** competitive alternative — *the mess of terminal tabs*. The enemy is universally understood by the champion; it is literally their screen right now.
 
@@ -24,7 +23,6 @@ Worked out July 2026 using a homepage-first positioning method (research notes l
 
 - **Frame:** "Inbox Zero, for agent work" — used at solution-intro level, not the H1. Get the backlog out of your head; tell the orchestrator; it organizes it and makes sure it gets done.
 
-- **Note on the old tagline:** "Do more with your agents" is a desired-outcome anchor only — it can't classify the product ("but what IS it?"). Retired.
 
 <br />
 
