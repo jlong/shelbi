@@ -34,8 +34,11 @@ jobs:
       - uses: Swatinem/rust-cache@v2
 
       - name: Validate release tag
+        # The runner overwrites default GITHUB_* variables after env blocks are
+        # applied, so GITHUB_REF_NAME cannot be overridden here; the script
+        # reads RELEASE_TAG instead.
         env:
-          GITHUB_REF_NAME: ${{ inputs.tag }}
+          RELEASE_TAG: ${{ inputs.tag }}
         run: scripts/release/check-version.sh
 
   publish:

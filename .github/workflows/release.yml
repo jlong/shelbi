@@ -44,8 +44,11 @@ jobs:
       - uses: Swatinem/rust-cache@v2
 
       - name: Validate tag and Cargo version
+        # The runner overwrites default GITHUB_* variables after env blocks are
+        # applied, so GITHUB_REF_NAME cannot be overridden here; the script
+        # reads RELEASE_TAG instead.
         env:
-          GITHUB_REF_NAME: ${{ github.event_name == 'workflow_dispatch' && inputs.ref_name || github.ref_name }}
+          RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.ref_name || github.ref_name }}
         run: scripts/release/check-version.sh
 
       - name: Capture release metadata
