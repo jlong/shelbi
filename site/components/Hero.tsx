@@ -45,8 +45,8 @@ export function Hero() {
       <div className="relative mx-auto flex w-full max-w-4xl flex-col items-center gap-5 px-3 pb-3 pt-12 text-center md:pb-2.5 md:pt-16">
         <WordmarkSvg className="w-full max-w-[240px] text-fg md:max-w-[420px]" />
 
-        <h1 className="max-w-3xl text-balance text-3xl font-semibold leading-tight text-fg sm:text-4xl md:text-5xl">
-          Stop babysitting a mess of agent tabs.
+        <h1 className="max-w-3xl text-balance text-4xl font-semibold leading-tight text-fg sm:text-5xl md:text-6xl">
+          Stop babysitting agent tabs.
         </h1>
 
         <h2 className="max-w-2xl text-balance text-base font-normal leading-relaxed text-gray-7 sm:text-lg">
