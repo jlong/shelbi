@@ -35,6 +35,12 @@ export function OgCard({ title, section }: OgCardProps) {
   const wordmarkHeight = WORDMARK_PIXEL_ROWS * wordmarkPixel
   const wordmarkWidth = WORDMARK_COLS * wordmarkPixel
 
+  // The wordmark sits to the left, leaving a fairly narrow text column, so
+  // longer titles (e.g. the home-page tagline) get a smaller size to wrap
+  // to a balanced 2-3 lines instead of a cramped stack.
+  const titleFontSize =
+    title.length > 55 ? 44 : title.length > 40 ? 48 : 56
+
   return (
     <div
       style={{
@@ -91,7 +97,7 @@ export function OgCard({ title, section }: OgCardProps) {
         ) : null}
         <div
           style={{
-            fontSize: 56,
+            fontSize: titleFontSize,
             fontWeight: 600,
             lineHeight: 1.12,
             letterSpacing: "-0.02em",
