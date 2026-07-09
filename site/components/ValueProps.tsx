@@ -1,9 +1,6 @@
 import type { ReactNode } from "react"
-import {
-  ScopedTaskMockup,
-  SpecializationMockup,
-  WorkflowMockup,
-} from "./KanbanMockup"
+import { BoardAnimation } from "./BoardAnimation"
+import { AgentInstructionsMockup, WorkflowConfigMockup } from "./KanbanMockup"
 
 /**
  * The value-prop triad: tasks, agents, workflows. Each states the mechanism,
@@ -14,16 +11,31 @@ import {
  * solution intro's H2 ("Inbox Zero, for agent work"), so they sit a level below
  * it in the page outline.
  */
-const triad: { title: string; body: ReactNode; mockup: ReactNode }[] = [
+// `bleed` (the board) sizes to its own natural width and overflows the column.
+// `edge` (the vim editors) is a fluid full-bleed: the panel fills from the
+// viewport edge to the far side of its column, cropped at the page edge.
+const triad: {
+  title: string
+  body: ReactNode
+  mockup: ReactNode
+  bleed?: boolean
+  edge?: "left" | "right"
+}[] = [
   {
     title: "Tasks keep work focused.",
-    body: "Every item becomes a scoped task before an agent touches it. Agents do their best work on focused chunks, and big features and quick fixes flow through the same system.",
-    mockup: <ScopedTaskMockup />,
+    body: "Every item becomes a scoped task before a worker agent touches it. Agents do their best work in focused chunks. The orchestrator breaks big features down into smaller tasks. Small changes flow through quickly.",
+    // The full board hangs off the right edge of the page (see `bleed` below) so
+    // it reads as the same live dashboard the hero shows, cropped by the viewport,
+    // with work animating rightward through the pipeline.
+    mockup: <BoardAnimation />,
+    bleed: true,
   },
   {
     title: "Agents provide specialization.",
-    body: "Workers execute. Add reviewers that scrutinize: adversarial review, QA, security. Each does one job well, on every task.",
-    mockup: <SpecializationMockup />,
+    body: "Use custom instructions and skills to tailor agents to fit your workflow. Create agents for QA, Security, Adversarial Review, and more!",
+    // Editor bleeds off the left edge (mockup sits on the left on desktop).
+    mockup: <AgentInstructionsMockup />,
+    edge: "left",
   },
   {
     title: "Workflows provide boundaries.",
@@ -37,7 +49,9 @@ const triad: { title: string; body: ReactNode; mockup: ReactNode }[] = [
         landed and what needs you.
       </>
     ),
-    mockup: <WorkflowMockup />,
+    // Editor bleeds off the right edge (mockup sits on the right on desktop).
+    mockup: <WorkflowConfigMockup />,
+    edge: "right",
   },
 ]
 
@@ -51,7 +65,14 @@ export function ValueProps() {
         // copy reads first and the mockup stacks beneath it regardless of side.
         const mockupLeft = i % 2 === 1
         return (
-          <section key={item.title} className="border-t border-gray-4">
+          <section
+            key={item.title}
+            // A bleed/edge row lets its mockup run past the content column;
+            // `overflow-x-clip` crops it at the viewport edge so it hangs off the
+            // page without adding a page scrollbar. The first row drops its top
+            // border so the SolutionIntro arrow flows across the seam uninterrupted.
+            className={`border-gray-4 ${i === 0 ? "" : "border-t"} ${item.bleed || item.edge ? "overflow-x-clip" : ""}`}
+          >
             <div className="mx-auto grid w-full max-w-6xl grid-cols-1 items-center gap-8 px-4 py-10 lg:grid-cols-2 lg:gap-12 lg:px-6 lg:py-16">
               <div className="flex flex-col gap-3">
                 <h3 className="font-sans text-2xl font-semibold tracking-tight text-fg sm:text-3xl">
@@ -61,11 +82,38 @@ export function ValueProps() {
                   {item.body}
                 </p>
               </div>
-              <div
-                className={`flex justify-center ${mockupLeft ? "lg:order-first" : ""}`}
-              >
-                {item.mockup}
-              </div>
+              {item.bleed ? (
+                // Board sizes to its full natural width (`w-max`) and overflows
+                // this grid cell to the right; the grid track (minmax(0,1fr))
+                // stays put and the section's overflow-x-clip crops the spill at
+                // the viewport edge, so the board hangs off the page.
+                <div className={mockupLeft ? "lg:order-first" : undefined}>
+                  <div className="w-max">{item.mockup}</div>
+                </div>
+              ) : item.edge ? (
+                // Edge bleed: the panel spans from the page edge to the far side
+                // of its column — `50vw - 3rem` wide (half the viewport minus the
+                // grid's half-gutter). A left bleed also pulls its left edge past
+                // the centered container to the page edge; a right bleed just
+                // overflows rightward. overflow-x-clip on the section crops it.
+                <div
+                  className={[
+                    mockupLeft ? "lg:order-first" : "",
+                    "lg:w-[calc(50vw_-_3rem)]",
+                    item.edge === "left"
+                      ? "lg:ml-[calc(-1*(max(0px,(100vw_-_72rem)/2)_+_3rem))]"
+                      : "",
+                  ]
+                    .filter(Boolean)
+                    .join(" ")}
+                >
+                  {item.mockup}
+                </div>
+              ) : (
+                <div className={mockupLeft ? "lg:order-first" : undefined}>
+                  {item.mockup}
+                </div>
+              )}
             </div>
           </section>
         )

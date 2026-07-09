@@ -49,7 +49,7 @@ export function Step({ title, children, number, isLast }: StepProps) {
         </div>
       </div>
       <div className="min-w-0 flex-1">
-        <h3 className="mt-0.5 mb-1 scroll-mt-8 text-lg font-semibold tracking-tight text-fg">
+        <h3 className="mt-0.5 mb-1 scroll-mt-11 text-lg font-semibold tracking-tight text-fg">
           {title}
         </h3>
         <div className="text-gray-7">{children}</div>
