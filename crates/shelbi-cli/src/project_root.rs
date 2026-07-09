@@ -82,32 +82,45 @@ fn is_git_repo(path: &Path) -> bool {
 /// traverse out of the projects dir, and an embedded newline would inject
 /// keys into the local registry.
 ///
-/// Rules: non-empty, no leading `.` (would hide the file or start a `..`
-/// traversal), and only ASCII alphanumerics, `_`, and `-`. The charset
-/// also guarantees the name round-trips through YAML unquoted, which is
-/// why the same check backstops the serde-rendered project YAML.
+/// Delegates to [`shelbi_core::validate_project_name`] — the storage-layer
+/// chokepoint — so the CLI pre-check and the on-disk invariant enforce one
+/// charset and can't drift apart. That means a name must be a single path
+/// component of lowercase `[a-z0-9_-]` starting with a letter or digit; the
+/// charset also guarantees the name round-trips through YAML unquoted.
+/// Onboarding-captured names are normalized into this charset first (see
+/// [`normalize_project_name_announced`]); this guard is for the paths that
+/// pass a raw name straight through (chiefly the pick-up committed name).
 pub fn validate_project_name(name: &str) -> Result<()> {
-    if name.is_empty() {
-        bail!(
-            "project name is empty — pass --project NAME (allowed: [A-Za-z0-9_-], no leading `.`)"
-        );
+    shelbi_core::validate_project_name(name).map_err(|_| {
+        anyhow!(
+            "project name `{name}` is invalid — it must be a single path component of \
+             lowercase `[a-z0-9_-]` starting with a letter or digit (no `/`, `..`, spaces, \
+             uppercase, or leading `.`). Pass --project NAME with a name like `my-app`."
+        )
+    })
+}
+
+/// Normalize a captured project name into the agent-id charset, printing a
+/// one-line notice when the result differs from the input so the change is
+/// never silent. Errors (with a suggestion) when the input can't reduce to
+/// a valid name — e.g. it was all punctuation.
+///
+/// This is the single capture-time chokepoint for the `shelbi init` /
+/// first-run path: every name (basename default or `--project` override)
+/// flows through [`pick_name`] into here before it reaches the on-disk
+/// layout, so files are only ever written under the normalized name.
+pub fn normalize_project_name_announced(raw: &str) -> Result<String> {
+    let normalized = shelbi_core::normalize_project_name(raw).map_err(|_| {
+        anyhow!(
+            "project name `{raw}` can't be normalized to a valid id — it needs at \
+             least one ASCII letter or digit (allowed characters: [a-z0-9_-]). \
+             Pass --project NAME with a name like `my-app`."
+        )
+    })?;
+    if normalized != raw {
+        println!("using project name '{normalized}' (normalized from '{raw}')");
     }
-    if name.starts_with('.') {
-        bail!(
-            "project name `{name}` starts with `.` — not allowed (it would hide the config or \
-             escape ~/.shelbi/projects/). Pass --project NAME to choose a safe name."
-        );
-    }
-    if let Some(bad) = name
-        .chars()
-        .find(|c| !(c.is_ascii_alphanumeric() || *c == '_' || *c == '-'))
-    {
-        bail!(
-            "project name `{name}` contains an invalid character {bad:?} — only [A-Za-z0-9_-] \
-             are allowed. Pass --project NAME to choose a safe name."
-        );
-    }
-    Ok(())
+    Ok(normalized)
 }
 
 /// Project name derived from a chosen root: the basename of the path,
@@ -270,7 +283,7 @@ fn prompt_loop(cwd: &Path, force_name: Option<&str>) -> Result<ResolvedProjectRo
 }
 
 fn pick_name(path: &Path, force_name: Option<&str>) -> Result<String> {
-    let name = match force_name {
+    let raw = match force_name {
         Some(n) => n.to_string(),
         None => project_name_from_root(path).ok_or_else(|| {
             anyhow!(
@@ -279,8 +292,10 @@ fn pick_name(path: &Path, force_name: Option<&str>) -> Result<String> {
             )
         })?,
     };
-    validate_project_name(&name)?;
-    Ok(name)
+    // Normalize the captured name (folder basename or `--project` override)
+    // into the agent-id charset before it becomes a path component. A folder
+    // like `Shaft` becomes project `shaft` instead of erroring at launch.
+    normalize_project_name_announced(&raw)
 }
 
 /// Expand `~` / `~/...` against `$HOME` and resolve relative paths
@@ -371,9 +386,12 @@ mod tests {
 
     #[test]
     fn validate_project_name_accepts_ordinary_names() {
-        for ok in ["shelbi", "my-app", "app_2", "Web3", "a"] {
+        for ok in ["shelbi", "my-app", "app_2", "web3", "a"] {
             assert!(validate_project_name(ok).is_ok(), "expected `{ok}` to pass");
         }
+        // Uppercase is now rejected here (it would crash dashboard setup);
+        // onboarding normalizes it upstream instead.
+        assert!(validate_project_name("Web3").is_err());
     }
 
     #[test]
@@ -394,10 +412,18 @@ mod tests {
     }
 
     #[test]
-    fn pick_name_rejects_unsafe_force_name() {
+    fn pick_name_normalizes_force_name() {
         let cwd = PathBuf::from("/tmp/cwd");
-        assert!(pick_name(&cwd, Some("../evil")).is_err());
-        assert!(pick_name(&cwd, Some("ok-name")).is_ok());
+        // A valid name passes through unchanged.
+        assert_eq!(pick_name(&cwd, Some("ok-name")).unwrap(), "ok-name");
+        // Uppercase / spaces are slugified rather than rejected.
+        assert_eq!(pick_name(&cwd, Some("Shaft")).unwrap(), "shaft");
+        assert_eq!(pick_name(&cwd, Some("My App")).unwrap(), "my-app");
+        // Traversal metacharacters are neutralized by normalization (the
+        // `/` and `.` are stripped), so no `../`-style name survives.
+        assert_eq!(pick_name(&cwd, Some("../evil")).unwrap(), "evil");
+        // An all-punctuation name can't be normalized → clear error.
+        assert!(pick_name(&cwd, Some("...")).is_err());
     }
 
     #[test]

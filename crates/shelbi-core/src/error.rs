@@ -39,13 +39,17 @@ pub enum Error {
     )]
     InvalidAgentId(String),
 
-    /// A project name would resolve to something other than a single safe
-    /// path component (empty, contains a path separator, or is `.`/`..`).
-    /// Rejected at the storage-layer chokepoint ([`crate::validate_project_name`])
-    /// so a `../`-style name can't escape `~/.shelbi/projects/`.
+    /// A project name isn't a single safe path component or isn't a valid
+    /// agent id (empty, contains a path separator or `.`/`..`, or uses a
+    /// character outside the agent-id charset). Rejected at the storage-layer
+    /// chokepoint ([`crate::validate_project_name`]) so a `../`-style name
+    /// can't escape `~/.shelbi/projects/` and a name that isn't a valid agent
+    /// id can't crash dashboard setup. Onboarding normalizes names into this
+    /// charset first (see [`crate::normalize_project_name`]).
     #[error(
-        "invalid project name `{0}`: must be a single path component with no \
-         `/`, `\\`, or `..`"
+        "invalid project name `{0}`: must be a single path component of \
+         lowercase `[a-z0-9_-]` starting with a letter or digit (try something \
+         like `my-app`)"
     )]
     InvalidProjectName(String),
 

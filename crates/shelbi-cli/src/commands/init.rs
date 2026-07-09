@@ -551,8 +551,12 @@ fn run_pick_up(args: Args) -> Result<PickUpOutcome> {
     // Honor `--project` as an explicit override (the user picking their
     // own local alias up front); otherwise walk the collision ladder
     // starting from the canonical name.
-    let (local_alias, suffixed_from) = if let Some(override_name) = args.project.clone() {
-        validate_project_name(&override_name)?;
+    let (local_alias, suffixed_from) = if let Some(raw_override) = args.project.clone() {
+        // `--project` is an explicit name the user typed, so normalize it into
+        // the agent-id charset (announcing the change) rather than rejecting a
+        // folder-style value like `My-Repo`.
+        let override_name =
+            crate::project_root::normalize_project_name_announced(&raw_override)?;
         if project_name_collides(&override_name)? {
             bail!(
                 "a shelbi project named `{override_name}` already exists locally — pick a \

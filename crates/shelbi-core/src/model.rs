@@ -1723,20 +1723,75 @@ pub fn validate_branch_prefix(s: &str) -> crate::Result<()> {
 }
 
 /// Validate a project name used as a directory component under
-/// `~/.shelbi/projects/<name>/`. Unlike task/agent ids, project names
-/// default to a repo basename and historically carry a looser character
-/// set (dots, mixed case), so this only enforces the security-critical
-/// invariant: the name must resolve to exactly one *normal* path
-/// component — never empty, never containing a separator, never `.`/`..`.
-/// That closes the `../`-traversal hole at the storage chokepoint
-/// (`shelbi_state::project_dir`) without rejecting existing names.
+/// `~/.shelbi/projects/<name>/`. This is the storage-layer chokepoint, so
+/// it enforces two invariants:
+///
+/// 1. **Single path component** — the name must resolve to exactly one
+///    *normal* path component (never empty, no separator, never `.`/`..`),
+///    which closes the `../`-traversal hole at
+///    (`shelbi_state::project_dir`).
+/// 2. **Agent-id charset** — the name must also be a valid [`validate_agent_id`].
+///    Dashboard setup derives an agent id from the project name (and the
+///    loader re-validates the name as one), so a name that isn't a valid
+///    agent id — e.g. `Shaft`, `My App`, `shelbi.rs` — would pass storage
+///    but then crash at launch. Reusing [`validate_agent_id`] here keeps
+///    the two rules from drifting apart. Callers feed this the *normalized*
+///    name (see [`normalize_project_name`]), which always passes.
+///
+/// The agent-id charset already excludes `/` and `.`, so it subsumes the
+/// single-component check for any accepted name; the explicit component
+/// check is retained as defense-in-depth at the traversal chokepoint.
 pub fn validate_project_name(s: &str) -> crate::Result<()> {
     use std::path::{Component, Path};
     let mut comps = Path::new(s).components();
-    match (comps.next(), comps.next()) {
-        (Some(Component::Normal(c)), None) if c.to_str() == Some(s) => Ok(()),
-        _ => Err(crate::Error::InvalidProjectName(s.to_string())),
+    let single_component = matches!(
+        (comps.next(), comps.next()),
+        (Some(Component::Normal(c)), None) if c.to_str() == Some(s)
+    );
+    if !single_component || validate_agent_id(s).is_err() {
+        return Err(crate::Error::InvalidProjectName(s.to_string()));
     }
+    Ok(())
+}
+
+/// Normalize a candidate project name into the agent-id charset so it can
+/// safely become a filesystem path component *and* a derived agent id.
+///
+/// Project names default to a repo-folder basename, which routinely carries
+/// uppercase letters, spaces, or dots (`Shaft`, `My App`, `shelbi.rs`) that
+/// [`validate_agent_id`] — and therefore the dashboard setup that derives an
+/// agent id from the name — rejects. Rather than hard-fail onboarding, we
+/// slugify:
+///   - lowercase;
+///   - collapse any run of characters outside `[a-z0-9_-]` into a single `-`;
+///   - trim leading/trailing `-`/`_` (which also strips any leading char
+///     that would otherwise leave the id starting on a separator).
+///
+/// Returns the normalized name, or [`Error::InvalidProjectName`](crate::Error::InvalidProjectName)
+/// when the input reduces to something empty or still invalid (e.g. a name
+/// that was all punctuation) so the caller can surface a clear error with a
+/// suggestion. Examples: `Shaft` → `shaft`, `My App` → `my-app`,
+/// `shelbi.rs` → `shelbi-rs`.
+pub fn normalize_project_name(input: &str) -> crate::Result<String> {
+    let mut slug = String::with_capacity(input.len());
+    let mut prev_dash = false;
+    for c in input.chars() {
+        let c = c.to_ascii_lowercase();
+        if c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_' || c == '-' {
+            slug.push(c);
+            prev_dash = false;
+        } else if !prev_dash {
+            slug.push('-');
+            prev_dash = true;
+        }
+    }
+    let normalized = slug.trim_matches(|c| c == '-' || c == '_').to_string();
+    // A valid agent id starts with a lowercase letter or digit, which the
+    // trim above guarantees for any non-empty result. Round-trip through the
+    // real validator so `normalize` and `validate` can never disagree.
+    validate_project_name(&normalized)
+        .map_err(|_| crate::Error::InvalidProjectName(input.to_string()))?;
+    Ok(normalized)
 }
 
 // ---------------------------------------------------------------------------
@@ -2440,15 +2495,17 @@ updated_at: 2026-06-19T00:00:00Z
     }
 
     #[test]
-    fn project_name_rejects_path_traversal_but_allows_looser_names() {
+    fn project_name_enforces_agent_id_charset_and_rejects_traversal() {
         // Security-critical: a name must be exactly one *normal* path
         // component so it can't escape `~/.shelbi/projects/`.
         assert!(validate_project_name("shelbi").is_ok());
         assert!(validate_project_name("my-app").is_ok());
         assert!(validate_project_name("my_app").is_ok());
-        // Looser than task/agent ids on purpose (repo-basename defaults):
-        assert!(validate_project_name("My.App").is_ok());
         assert!(validate_project_name("app2").is_ok());
+        // Now enforces the agent-id charset (the storage chokepoint must
+        // match the derived agent id): uppercase and dots are rejected.
+        assert!(validate_project_name("My.App").is_err());
+        assert!(validate_project_name("Shaft").is_err());
         // Traversal / separators / specials are rejected.
         assert!(validate_project_name("").is_err());
         assert!(validate_project_name(".").is_err());
@@ -2457,6 +2514,31 @@ updated_at: 2026-06-19T00:00:00Z
         assert!(validate_project_name("a/b").is_err());
         assert!(validate_project_name("/abs").is_err());
         assert!(validate_project_name("nested/../escape").is_err());
+    }
+
+    #[test]
+    fn normalize_project_name_slugifies_into_agent_id_charset() {
+        // Uppercase folder basename → lowercase id (the reported bug).
+        assert_eq!(normalize_project_name("Shaft").unwrap(), "shaft");
+        // Spaces and dots collapse to a single `-`.
+        assert_eq!(normalize_project_name("My App").unwrap(), "my-app");
+        assert_eq!(normalize_project_name("shelbi.rs").unwrap(), "shelbi-rs");
+        // A whole run of invalid chars collapses to a single `-`, and
+        // leading/trailing separators are trimmed.
+        assert_eq!(normalize_project_name("my...app").unwrap(), "my-app");
+        assert_eq!(normalize_project_name("  Foo Bar!! ").unwrap(), "foo-bar");
+        // Already-valid names are returned unchanged.
+        assert_eq!(normalize_project_name("my-app").unwrap(), "my-app");
+        assert_eq!(normalize_project_name("app_2").unwrap(), "app_2");
+        // Every normalization output must itself pass validation.
+        for input in ["Shaft", "My App", "shelbi.rs", "a.b.c"] {
+            let out = normalize_project_name(input).unwrap();
+            assert!(validate_project_name(&out).is_ok(), "`{out}` should validate");
+        }
+        // All-punctuation / empty inputs can't be normalized → clear error.
+        assert!(normalize_project_name("").is_err());
+        assert!(normalize_project_name("...").is_err());
+        assert!(normalize_project_name("!@#$%").is_err());
     }
 
     #[test]
