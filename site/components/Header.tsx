@@ -12,6 +12,7 @@ import { WordmarkSvg } from "./Wordmark"
 const NAV_LINKS = [
   { label: "Documentation", href: "/docs" },
   { label: "Changelog", href: "/docs/changelog" },
+  { label: "Discord", href: "/discord" },
 ] as const
 
 const INSTALL_HREF = "/docs/guides/getting-started/install"
