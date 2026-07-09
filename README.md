@@ -59,6 +59,7 @@ manager path for your platform, then confirm the binary is on your `PATH`.
 
 ```bash
 brew tap jlong/shelbi
+brew trust jlong/shelbi
 brew install shelbi
 ```
 
