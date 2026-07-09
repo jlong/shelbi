@@ -19,7 +19,7 @@ const INSTALL_HREF = "/docs/guides/getting-started/install"
 // Header bar height in px — used to shrink the IntersectionObserver
 // root so the hero is considered "off-screen" the moment its bottom
 // passes under the header (not when it reaches the viewport top).
-const HEADER_HEIGHT_PX = 24
+const HEADER_HEIGHT_PX = 72
 
 const GITHUB_HREF = "https://github.com/jlong/shelbi"
 
@@ -50,10 +50,11 @@ type HeaderProps = {
  * rightmost element on mobile; the Install CTA sits immediately to
  * its left.
  *
- * On the home page only, the logo and bottom border fade in once the
- * user scrolls past the hero (which already shows the wordmark large
- * — duplicating it in the header at the top is visual noise). Every
- * other route keeps both visible at all scroll positions.
+ * The logo is always visible. On the home page only, the header's
+ * bottom border fades in once the user scrolls past the hero, so the
+ * chrome reads as borderless over the hero and gains a divider once
+ * content scrolls beneath it. Every other route keeps the border at
+ * all scroll positions.
  */
 export function Header({ docsSections = [] }: HeaderProps) {
   const pathname = usePathname()
@@ -166,15 +167,11 @@ export function Header({ docsSections = [] }: HeaderProps) {
         transparent ? "border-transparent" : "border-gray-4"
       }`}
     >
-      <div className="flex h-6 w-full items-center gap-2 px-3 lg:px-4 sm:gap-3">
+      <div className="flex w-full items-center gap-2 p-2.5 sm:gap-3">
         <Link
           href="/"
           aria-label="Shelbi home"
-          aria-hidden={transparent || undefined}
-          tabIndex={transparent ? -1 : 0}
-          className={`inline-flex shrink-0 text-fg transition-opacity duration-200 ${
-            transparent ? "opacity-0 pointer-events-none" : "opacity-100"
-          }`}
+          className="inline-flex shrink-0 text-fg"
         >
           <WordmarkSvg
             style={{ height: "20px", width: `${(20 * 684) / 108}px` }}
@@ -258,14 +255,14 @@ export function Header({ docsSections = [] }: HeaderProps) {
           <div
             aria-hidden="true"
             onClick={() => setOpen(false)}
-            className="fixed inset-x-0 top-6 bottom-0 z-30 bg-bg/80 md:hidden"
+            className="fixed inset-x-0 top-9 bottom-0 z-30 bg-bg/80 md:hidden"
           />
           <div
             id="site-header-drawer"
             role="dialog"
             aria-modal="true"
             aria-label="Site navigation"
-            className="absolute inset-x-0 top-full z-40 max-h-[calc(100vh-3rem)] overflow-y-auto border-b border-gray-4 bg-bg md:hidden"
+            className="absolute inset-x-0 top-full z-40 max-h-[calc(100vh-72px)] overflow-y-auto border-b border-gray-4 bg-bg md:hidden"
           >
             <nav
               aria-label="Mobile"

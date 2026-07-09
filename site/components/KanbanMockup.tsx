@@ -78,6 +78,15 @@ const SEL_FG = "#ffffff" // ratatui `fg(White)` for a focused card
 // Sidebar's per-row selection fill uses the same `theme::SELECTION_BG` gray
 // as the focused card above — one selection color across every surface.
 const SIDEBAR_SEL_BG = SEL_BG
+// A subtle fill just above the terminal body (`TUI_BG`) for the injected
+// task-body callout in a worker pane — dark enough to read as a quiet block
+// rather than a highlight standing off the background.
+const TASK_BOX_BG = "#292929"
+// The small workflow-name badge painted on the meta line of each kanban card —
+// a neutral gray chip matching the other gray fills in the terminal (the
+// selection gray), with light near-white text.
+const WORKFLOW_BADGE_BG = "#3f3f3f" // neutral gray, same as SEL_BG
+const WORKFLOW_BADGE_FG = "#dcdfe8"
 
 // ── Layout constants ─────────────────────────────────────────────────
 // Kanban columns are fixed at 22 monospace cells (20 for card text + a
@@ -87,17 +96,25 @@ const SIDEBAR_SEL_BG = SEL_BG
 // its 1-col horizontal padding on each side).
 const COL_W = 22
 const TEXT_W = 20
+// A collapsed column folds down to this narrow strip (category caret, the label
+// spelled vertically, and the hidden-card count) so it sits as a thin gutter
+// beside the active columns instead of a full 22-cell column.
+const COLLAPSED_W = 6
 const SIDEBAR_W = 30
+/** A single column's rendered width in monospace cells — collapsed or full. */
+function colWidth(col: Column): number {
+  return col.collapsed ? COLLAPSED_W : COL_W
+}
 /**
- * The board content width for a scenario, in monospace cells: 1 leading pad
- * + one `COL_W` cell per column (so a 5-column board is `1 + 5 * 22 = 111`,
- * the canonical dashboard width the TUI draws). This is the width every view
- * within a single mockup pins to — the Chat and Activity panes size to it so
- * switching nav rows never changes the frame width, even for boards with
- * fewer or more than five columns (e.g. a four-column trunk-based board).
+ * The board content width for a scenario, in monospace cells: 1 leading pad plus
+ * each column's own width (`COL_W`, or `COLLAPSED_W` for a folded column). A full
+ * five-column board is `1 + 5 * 22 = 111`, the canonical dashboard width the TUI
+ * draws. This is the width every view within a single mockup pins to — the Chat
+ * and Activity panes size to it so switching nav rows never changes the frame
+ * width, even for boards with a collapsed column or a different column count.
  */
 function contentWidth(columns: Column[]): number {
-  return 1 + columns.length * COL_W
+  return 1 + columns.reduce((w, c) => w + colWidth(c), 0)
 }
 
 // ── Scenario model ────────────────────────────────────────────────────
@@ -121,6 +138,14 @@ export type Column = {
   label: string
   category: Category
   cards: Card[]
+  /**
+   * Fold the column down to a narrow strip — the category caret, the label
+   * spelled vertically, and the hidden-card count — instead of a full column of
+   * cards. Used to push a stage out of the way (e.g. a deep BACKLOG) so the eye
+   * stays on the columns where work is actually moving. Its cards still count
+   * toward the folded strip's total but aren't drawn.
+   */
+  collapsed?: boolean
 }
 
 /** A workspace row in the sidebar, grouped under its machine. */
@@ -201,6 +226,12 @@ export type AppState = {
   activeView: NavView
   /** Kanban columns rendered in the main board (5-column layout). */
   columns: Column[]
+  /**
+   * Workflow name shown as the small badge on each card's meta line. When set,
+   * every card renders ` <workflow> ` as a bluish-gray chip (followed by the
+   * branch once one is cut); omit it to suppress the badge.
+   */
+  workflow?: string
   /** Sidebar machine groups and their workspaces. */
   machines: Machine[]
   /**
@@ -345,6 +376,46 @@ function truncate(text: string, width: number): string {
   return chars.slice(0, width - 1).join("") + "…"
 }
 
+/**
+ * Kebab-case a title into the slug the working branch is named after — Shelbi
+ * cuts `shelbi/<task-id>` and the id is the slugged title, so this reproduces
+ * the branch a card's meta line surfaces.
+ */
+function slugify(title: string): string {
+  return title
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "")
+}
+
+/**
+ * Wrap `title` to at most two lines within `max` cells, mirroring
+ * `wrap_title_two_lines` in crates/shelbi-tui/src/kanban.rs. Returns
+ * `[line1, null]` when the title fits on one line (2-row card) and
+ * `[line1, line2]` when it wraps (3-row card). Line 1 breaks on the last space
+ * that fits so a word isn't split when avoidable, hard-wrapping at `max` when
+ * the first token alone overflows; line 2 is the remainder, `…`-truncated.
+ */
+function wrapTitleTwoLines(title: string, max: number): [string, string | null] {
+  if (max <= 0) return ["", null]
+  const chars = [...title]
+  if (chars.length <= max) return [title, null]
+  // The last space at or before `max` (indices 1..=max), so line 1 ends on a
+  // word boundary; index 0 is skipped (would leave line 1 empty) and a first
+  // token longer than the width hard-wraps at `max`.
+  let breakIdx = -1
+  for (let i = max; i >= 1; i -= 1) {
+    if (chars[i] === " ") {
+      breakIdx = i
+      break
+    }
+  }
+  const [line1End, remainderStart] = breakIdx >= 0 ? [breakIdx, breakIdx + 1] : [max, max]
+  const line1 = chars.slice(0, line1End).join("")
+  const remainder = chars.slice(remainderStart).join("")
+  return [line1, truncate(remainder, max)]
+}
+
 /** Right-pad a text run with spaces so it fills exactly `width` cells. */
 function padTo(text: string, width: number): string {
   const len = [...text].length
@@ -357,11 +428,36 @@ function blankColRow(): Segment[] {
 }
 
 /**
- * Build the visible rows for a single column: header row followed by
- * one entry per card (2 rows each: title + id/@workspace) with a blank
- * row between cards.
+ * A collapsed column's rows: the label spelled one letter per row in the
+ * category color, then the hidden-card count in parens — a thin folded strip
+ * pinned to `COLLAPSED_W` cells. Each row is centered within the strip so the
+ * stacked letters sit centered over the `(N)` count beneath them; the first
+ * letter is on row 0 so the strip lines up with the full columns' header row,
+ * and the count reads as "N cards folded away here".
  */
-function columnRows(col: Column): Segment[][] {
+function collapsedColumnRows(col: Column): Segment[][] {
+  const cat = CATEGORY_COLOR[col.category]
+  const center = (segs: Segment[]): Segment[] => {
+    const used = segs.reduce((n, s) => n + [...s.text].length, 0)
+    const total = Math.max(0, COLLAPSED_W - used)
+    const left = Math.floor(total / 2)
+    return [{ text: " ".repeat(left) }, ...segs, { text: " ".repeat(total - left) }]
+  }
+  const rows: Segment[][] = []
+  for (const ch of col.label) {
+    rows.push(ch === " " ? center([]) : center([{ text: ch, color: cat }]))
+  }
+  rows.push(center([{ text: `(${col.cards.length})`, color: TUI_DARK_GRAY }]))
+  return rows
+}
+
+/**
+ * Build the visible rows for a single column: header row followed by
+ * one entry per card (title on one or two lines + a branch meta row) with a
+ * blank row between cards. A collapsed column folds to its narrow strip instead.
+ */
+function columnRows(col: Column, workflow?: string): Segment[][] {
+  if (col.collapsed) return collapsedColumnRows(col)
   const rows: Segment[][] = []
 
   // Header row: `LABEL (N)` in the category color, count in DarkGray,
@@ -379,56 +475,59 @@ function columnRows(col: Column): Segment[][] {
   col.cards.forEach((card, idx) => {
     if (idx > 0) rows.push(blankColRow())
 
-    // Title row — truncated to TEXT_W with ellipsis, right-padded with
-    // the 2-cell gutter that lives inside the column's cell.
-    const title = truncate(card.title, TEXT_W)
-    const titlePad = COL_W - [...title].length
-    if (card.selected) {
-      rows.push([
-        {
-          text: padTo(title, COL_W),
-          color: SEL_FG,
-          bg: SEL_BG,
-          bold: true,
-        },
-      ])
-    } else {
-      rows.push([
-        { text: title, color: TUI_FG, bold: true },
-        { text: " ".repeat(Math.max(0, titlePad)) },
-      ])
+    // Title rows — wrapped to at most two lines within TEXT_W (the way the TUI
+    // wraps card titles), each bold and right-padded with the 2-cell gutter that
+    // lives inside the column's cell. A title that fits is one row; a longer one
+    // wraps to two, with the overflow `…`-truncated on line 2.
+    const [titleLine1, titleLine2] = wrapTitleTwoLines(card.title, TEXT_W)
+    for (const tline of titleLine2 === null ? [titleLine1] : [titleLine1, titleLine2]) {
+      if (card.selected) {
+        rows.push([{ text: padTo(tline, COL_W), color: SEL_FG, bg: SEL_BG, bold: true }])
+      } else {
+        rows.push([
+          { text: tline, color: TUI_FG, bold: true },
+          { text: " ".repeat(Math.max(0, COL_W - [...tline].length)) },
+        ])
+      }
     }
 
-    // Meta row — id (DarkGray) + optional `  @workspace` (Magenta). The
-    // `@workspace` is the priority tag, so the id truncates (…-suffix) to
-    // whatever COL_W leaves after reserving room for `  @workspace`; this keeps
-    // the cell exactly COL_W wide even for long id+workspace pairs (e.g.
-    // `metrics-api-endpoint  @alpha`) so the board never grows past its
-    // canonical width and the frame can't resize between views.
-    const wsSuffix = card.workspace ? `  @${card.workspace}` : ""
-    const id = truncate(card.id, Math.max(1, COL_W - [...wsSuffix].length))
-    const metaBaseLen = [...id].length + [...wsSuffix].length
-    const metaPad = COL_W - metaBaseLen
-    if (card.selected) {
-      // Selected card: the highlight bg spans the full cell — id and
-      // workspace both render as white-on-gray instead of their normal
-      // hues, matching how ratatui applies `List::highlight_style` to
-      // the entire row.
-      rows.push([
-        {
-          text: padTo(`${id}${wsSuffix}`, COL_W),
-          color: SEL_FG,
-          bg: SEL_BG,
-        },
-      ])
-    } else {
-      const segs: Segment[] = [{ text: id, color: TUI_DARK_GRAY }]
-      if (card.workspace) {
-        segs.push({ text: "  " })
-        segs.push({ text: `@${card.workspace}`, color: TUI_MAGENTA })
+    // Meta row — the workflow name as a bluish-gray badge chip, followed by the
+    // task's git branch (`⎇ …`, dim) once one has been cut. Mirrors
+    // `card_meta_line` in crates/shelbi-tui/src/kanban.rs: a branch only exists
+    // after the task is dispatched into IN PROGRESS or handed off to REVIEW, so
+    // BACKLOG / TO DO and merged DONE cards show just the badge. When the board
+    // carries no workflow name the badge is suppressed (blank meta row).
+    const hasBranch = col.category === "yellow" || col.category === "magenta"
+    const branch = hasBranch ? `⎇ shelbi/${slugify(card.title)}` : ""
+    const meta: Segment[] = []
+    let metaUsed = 0
+    if (workflow) {
+      const badge = ` ${workflow} `
+      meta.push({ text: badge, bg: WORKFLOW_BADGE_BG, color: WORKFLOW_BADGE_FG })
+      metaUsed += [...badge].length
+    }
+    if (branch) {
+      const sep = meta.length ? 1 : 0
+      const remaining = COL_W - metaUsed - sep
+      if (remaining > 0) {
+        if (sep) meta.push({ text: " " })
+        const b = truncate(branch, remaining)
+        meta.push({ text: b, color: TUI_DARK_GRAY })
+        metaUsed += sep + [...b].length
       }
-      segs.push({ text: " ".repeat(Math.max(0, metaPad)) })
-      rows.push(segs)
+    }
+    if (metaUsed < COL_W) meta.push({ text: " ".repeat(COL_W - metaUsed) })
+    if (card.selected) {
+      // The whole row takes the selection gray, but the badge keeps its own
+      // fill (its bg is distinct from the selection gray on purpose) so it
+      // stays visible — matching `theme::WORKFLOW_BADGE_BG`.
+      rows.push(
+        meta.map((s) =>
+          s.bg === WORKFLOW_BADGE_BG ? { ...s, color: SEL_FG } : { ...s, bg: SEL_BG, color: SEL_FG },
+        ),
+      )
+    } else {
+      rows.push(meta)
     }
   })
 
@@ -439,15 +538,17 @@ function columnRows(col: Column): Segment[][] {
  * Zip all columns row-by-row into a single board grid. Shorter columns
  * are padded down with blank rows so the grid stays rectangular.
  */
-function buildBoardRows(columns: Column[]): Segment[][] {
-  const perCol = columns.map(columnRows)
+function buildBoardRows(columns: Column[], workflow?: string): Segment[][] {
+  const perCol = columns.map((c) => columnRows(c, workflow))
   const maxRows = Math.max(...perCol.map((r) => r.length))
   const grid: Segment[][] = []
 
   for (let r = 0; r < maxRows; r += 1) {
     const rowSegs: Segment[] = [{ text: " " }]
     for (let c = 0; c < perCol.length; c += 1) {
-      const cellRow = perCol[c][r] ?? blankColRow()
+      // Pad short columns with a blank cell of that column's own width, so a
+      // collapsed column's narrow strip stays narrow on its empty rows too.
+      const cellRow = perCol[c][r] ?? [{ text: " ".repeat(colWidth(columns[c])) }]
       rowSegs.push(...cellRow)
     }
     grid.push(rowSegs)
@@ -824,6 +925,12 @@ export type ChatLine =
   | { kind: "working"; text: string }
   | { kind: "status"; model: string; ctx: string; cost: string; session?: string }
   | { kind: "blank" }
+  // A dispatched task's markdown body seeded into a worker's session as its
+  // opening `❯` prompt: the `# Title`, a short description, and `##` sections
+  // (Technical Details, Acceptance Criteria with `- [ ]` items) — the
+  // orchestrator's Feature task-body template, rendered with light markdown
+  // styling. `body` is pre-wrapped (one buffer row per line).
+  | { kind: "task"; body: string }
 
 // A believable orchestration session over the sample project: the human asks
 // for two pieces of work, the orchestrator adds + dispatches tasks to free
@@ -888,6 +995,27 @@ function conversationRows(lines: ChatLine[], width: number): Segment[][] {
           ]),
         )
         break
+      case "task": {
+        // The dispatched task body, rendered as a quiet full-width box of white
+        // text — a callout that reads as the injected task, distinct from the
+        // work transcript around it. `body` is pre-wrapped (one source line per
+        // row); markdown headings (`#`, `##`) stay bold. The box spans the whole
+        // pane width, with a 2-cell left margin and a blank boxed row top/bottom.
+        const boxRow = (content: Segment[]): Segment[] => {
+          const inner: Segment[] = [{ text: "  ", bg: TASK_BOX_BG }, ...content.map((s) => ({ ...s, bg: TASK_BOX_BG }))]
+          const used = inner.reduce((a, s) => a + [...s.text].length, 0)
+          if (used < width) inner.push({ text: " ".repeat(width - used), bg: TASK_BOX_BG })
+          return inner
+        }
+        const bodyLines = line.body.split("\n")
+        rows.push(boxRow([]))
+        for (const ln of bodyLines) {
+          const bold = ln.startsWith("# ") || ln.startsWith("## ")
+          rows.push(ln === "" ? boxRow([]) : boxRow([{ text: ln, color: SEL_FG, bold }]))
+        }
+        rows.push(boxRow([]))
+        break
+      }
       case "prose":
         // Assistant narration — indented two cells, wrapped, plain fg.
         for (const wrapped of wrapText(line.text, CHAT_WRAP_W)) {
@@ -1574,7 +1702,7 @@ function TerminalBody({ state, contentOpacity }: { state: AppState; contentOpaci
   // (and, for the hero animation, across every beat as content grows/shrinks):
   // the natural board height, floored by any `minBodyRows` pin.
   const width = contentWidth(state.columns)
-  const boardRows = buildBoardRows(state.columns)
+  const boardRows = buildBoardRows(state.columns, state.workflow)
   const target = Math.max(boardRows.length, state.minBodyRows ?? 0)
   // The board and Activity feed carry the `<label> · <project>  N total …` header
   // bar and a footer keybinding hint bar. The Chat and worker panes are full
@@ -1797,6 +1925,58 @@ function PaletteOverlay({ palette, project }: { palette: PaletteState; project: 
 }
 
 /**
+ * The macOS-Terminal window chrome — rounded frame, drop shadow, and the title
+ * bar with its three traffic lights — around an arbitrary dark terminal body.
+ * `AppMockup` wraps the full sidebar+board dashboard in it; the compact homepage
+ * value-prop fragments (`ScopedTaskMockup` and friends) wrap a single small
+ * `<pre>` in the same frame, so a focused illustration reads as a capture from
+ * the same terminal as the hero without re-implementing any chrome. `bodyClassName`
+ * styles the body wrapper — the dashboard passes `relative flex …` so the sidebar
+ * and board sit side by side under the palette overlay; a fragment leaves the
+ * default so its single pane just scrolls if it ever overflows.
+ */
+export function TerminalFrame({
+  title,
+  bodyClassName = "overflow-x-auto",
+  children,
+}: {
+  title: string
+  bodyClassName?: string
+  children: React.ReactNode
+}) {
+  return (
+    <div
+      className="overflow-hidden rounded-lg shadow-2xl"
+      style={{ boxShadow: "0 24px 48px rgba(0,0,0,0.35), 0 0 0 1px rgba(0,0,0,0.4)" }}
+    >
+      {/* macOS Terminal title bar — traffic lights left, title centered. */}
+      <div
+        className="relative flex items-center justify-center border-b px-3"
+        style={{ background: CHROME_BAR_BG, borderColor: CHROME_BAR_BORDER, height: 28 }}
+      >
+        <div
+          className="absolute flex items-center"
+          // Equal top/left inset so the red light is equidistant from the top
+          // and left edges — tucked into the corner. 8px keeps it inside the
+          // 28px bar (8 + 12 + 8 = 28) with no height change.
+          style={{ top: 8, left: 8, gap: 8 }}
+        >
+          <TrafficLight color={TRAFFIC_RED} />
+          <TrafficLight color={TRAFFIC_YELLOW} />
+          <TrafficLight color={TRAFFIC_GREEN} />
+        </div>
+        <span className="font-mono text-xs font-medium" style={{ color: CHROME_TITLE }}>
+          {title}
+        </span>
+      </div>
+      <div className={bodyClassName} style={{ background: TUI_BG }}>
+        {children}
+      </div>
+    </div>
+  )
+}
+
+/**
  * Render a Shelbi TUI dashboard scenario inside a macOS-Terminal frame.
  * The look is fixed — only the scenario varies. Three ways to drive it:
  *
@@ -1828,15 +2008,50 @@ export function AppMockup({
 } & Partial<AppState>) {
   const base = state ?? PRESETS[preset]
   const merged: AppState = { ...base, ...overrides }
-  // The active view is live, interactive state — seeded from the scenario so
-  // first paint matches the preset exactly (the hero stays on Tasks), then
-  // driven by clicking the sidebar nav. It also re-syncs when the scenario's
-  // own `activeView` changes, so a timeline that mutates the state over time
-  // (the hero animation) drives the pane too. Everything else stays data.
-  // The sync uses React's "adjust state while rendering" pattern (compare the
-  // scenario's view to the last one we saw, reset on change) rather than an
-  // effect, so a scenario change is reflected in the same render with no extra
-  // commit — and a within-scenario nav click still wins until the next change.
+  return (
+    <section className="border-b border-gray-4 px-3 py-6 sm:py-10">
+      {/* w-fit hugs the board's natural width; max-w-full keeps the
+          inner overflow-x-auto in charge on viewports narrower than
+          the board. */}
+      <div className="mx-auto w-fit max-w-full">
+        <DashboardFrame merged={merged} contentOpacity={contentOpacity} />
+      </div>
+    </section>
+  )
+}
+
+/**
+ * The stateful sidebar + board dashboard inside a macOS-Terminal frame, with no
+ * outer `<section>` wrapper. Owns the live `activeView` — seeded from the
+ * scenario so first paint matches the preset exactly (the hero stays on Tasks),
+ * driven by clicking the sidebar nav, and re-synced when the scenario's own
+ * `activeView` changes so a timeline that mutates the state over time (the hero
+ * animation) drives the pane too. The sync uses React's "adjust state while
+ * rendering" pattern (compare the scenario's view to the last one we saw, reset
+ * on change) rather than an effect, so a scenario change is reflected in the same
+ * render with no extra commit — and a within-scenario nav click still wins until
+ * the next change.
+ *
+ * Both `AppMockup` (centered in its own section) and `BoardMockup` (bare, for
+ * embeds that bleed past the page edge) render this, so there is one dashboard
+ * implementation the two can't drift apart from. `bodyClassName` is forwarded to
+ * `TerminalFrame`: the two `<pre>` blocks (sidebar + board) sit side by side in
+ * one dark surface so the panel reads as a single captured terminal, and an
+ * embed can drop the default `overflow-x-auto` when it means the board to bleed
+ * rather than scroll inside a clipped box. The solid terminal-body fill stays
+ * fully opaque; only the two panes' text layers cross-fade at the loop boundary
+ * via `contentOpacity` (each pane's own background is this same `TUI_BG`, so
+ * fading a pane dissolves its glyphs while the background reads opaque).
+ */
+function DashboardFrame({
+  merged,
+  contentOpacity,
+  bodyClassName = "relative flex overflow-x-auto",
+}: {
+  merged: AppState
+  contentOpacity?: number
+  bodyClassName?: string
+}) {
   const [activeView, setActiveView] = useState<NavView>(merged.activeView)
   const [seenView, setSeenView] = useState<NavView>(merged.activeView)
   if (merged.activeView !== seenView) {
@@ -1845,76 +2060,37 @@ export function AppMockup({
   }
   const resolved: AppState = { ...merged, activeView }
   return (
-    <section className="border-b border-gray-4 px-3 py-6 sm:py-10">
-      {/* w-fit hugs the board's natural width; max-w-full keeps the
-          inner overflow-x-auto in charge on viewports narrower than
-          the board. */}
-      <div className="mx-auto w-fit max-w-full">
-        <div
-          className="overflow-hidden rounded-lg shadow-2xl"
-          style={{
-            boxShadow: "0 24px 48px rgba(0,0,0,0.35), 0 0 0 1px rgba(0,0,0,0.4)",
-          }}
-        >
-          {/* macOS Terminal title bar — traffic lights left, title centered. */}
-          <div
-            className="relative flex items-center justify-center border-b px-3"
-            style={{
-              background: CHROME_BAR_BG,
-              borderColor: CHROME_BAR_BORDER,
-              height: 28,
-            }}
-          >
-            <div
-              className="absolute flex items-center"
-              // Equal top/left inset so the red light is equidistant from the
-              // top and left edges — tucked into the corner. 8px keeps it
-              // inside the 28px bar (8 + 12 + 8 = 28) with no height change.
-              style={{ top: 8, left: 8, gap: 8 }}
-            >
-              <TrafficLight color={TRAFFIC_RED} />
-              <TrafficLight color={TRAFFIC_YELLOW} />
-              <TrafficLight color={TRAFFIC_GREEN} />
-            </div>
-            <span
-              className="font-mono text-xs font-medium"
-              style={{ color: CHROME_TITLE }}
-            >
-              {resolved.terminalTitle}
-            </span>
-          </div>
-
-          {/* Terminal body — two `<pre>` blocks (sidebar + board) sit
-              side-by-side inside one dark surface, so the whole panel
-              reads as a single captured terminal frame. The board `<pre>`
-              overflows horizontally on narrow viewports; the sidebar
-              hides below `md` so phones don't get a cramped strip beside
-              a cropped board. */}
-          <div
-            className="relative flex overflow-x-auto"
-            // The solid terminal-body fill stays here at full opacity, so the
-            // body background never dims. Only the two panes' text layers
-            // cross-fade at the loop boundary (via `contentOpacity` on each
-            // `<pre>`): because every pane's own background is this same
-            // `TUI_BG`, fading a pane reveals an identical solid fill behind it,
-            // so the glyphs dissolve while the background — and the window chrome
-            // above — read as fully opaque throughout the loop.
-            style={{ background: TUI_BG }}
-          >
-            <Sidebar
-              state={resolved}
-              onSelectView={setActiveView}
-              contentOpacity={contentOpacity}
-            />
-            <TerminalBody state={resolved} contentOpacity={contentOpacity} />
-            {resolved.palette ? (
-              <PaletteOverlay palette={resolved.palette} project={resolved.project} />
-            ) : null}
-          </div>
-        </div>
-      </div>
-    </section>
+    <TerminalFrame title={resolved.terminalTitle} bodyClassName={bodyClassName}>
+      <Sidebar state={resolved} onSelectView={setActiveView} contentOpacity={contentOpacity} />
+      <TerminalBody state={resolved} contentOpacity={contentOpacity} />
+      {resolved.palette ? (
+        <PaletteOverlay palette={resolved.palette} project={resolved.project} />
+      ) : null}
+    </TerminalFrame>
   )
+}
+
+/**
+ * The full dashboard board (sidebar + kanban) in its terminal frame, with no
+ * outer section wrapper — for embedding beside copy where the board is meant to
+ * bleed off the page edge instead of sitting centered in its own section. Takes
+ * the same `state` / `preset` / field-override props as `AppMockup` and defaults
+ * to the busy `defaultAppState` board. Uses `relative flex` (no `overflow-x-auto`)
+ * so the frame sizes to the board's full width and bleeds past the container edge
+ * rather than scrolling inside a clipped box — the embedding layout is
+ * responsible for clipping the overflow at the page edge.
+ */
+export function BoardMockup({
+  state,
+  preset = "default",
+  ...overrides
+}: {
+  state?: AppState
+  preset?: PresetName
+} & Partial<AppState>) {
+  const base = state ?? PRESETS[preset]
+  const merged: AppState = { ...base, ...overrides }
+  return <DashboardFrame merged={merged} bodyClassName="relative flex" />
 }
 
 // ── Presets ───────────────────────────────────────────────────────────
@@ -1933,6 +2109,7 @@ export const defaultAppState: AppState = {
   terminalTitle: "jlong@hub — my-project",
   project: "my-project",
   activeView: "tasks",
+  workflow: "app",
   // The hero showcases a busy, autonomous system — Zen Mode on, so the
   // full-width green band is part of the landing-page capture.
   zenMode: true,
@@ -2089,6 +2266,734 @@ export const PRESETS = {
 
 /** A key of {@link PRESETS} — the `preset` prop's accepted values. */
 export type PresetName = keyof typeof PRESETS
+
+// ── Value-prop fragments ──────────────────────────────────────────────
+// Compact, single-pane illustrations for the homepage value-prop sections.
+// Each is a focused fragment (a scoped task, a workspace roster, a workflow
+// strip) rather than the full dashboard — small enough to sit beside copy
+// without dominating it — but built from the same palette, the same `Segment`
+// rows, and the same `Row` renderer inside the same `TerminalFrame` chrome as
+// the hero's `AppMockup`, so they read as captures from the same terminal.
+
+// Fixed, sensible fragment width: wide enough for the workflow stage strip
+// (`BACKLOG → … → DONE`), narrow enough to stay a supporting illustration.
+const FRAG_W = 50
+
+/**
+ * A fragment's single terminal pane: its `Segment` rows rendered through the
+ * same `Row` engine as the dashboard panes, pinned to `FRAG_W` cells with a
+ * little breathing room so the text isn't flush against the frame.
+ */
+function FragmentPane({ rows }: { rows: Segment[][] }) {
+  return (
+    <pre
+      className="m-0 whitespace-pre font-mono"
+      style={{
+        ...PRE_STYLE,
+        width: `${FRAG_W}ch`,
+        minWidth: `${FRAG_W}ch`,
+        maxWidth: `${FRAG_W}ch`,
+        padding: "12px 14px",
+        overflow: "hidden",
+      }}
+    >
+      {rows.map((row, i) => (
+        <Row key={i} segs={row} />
+      ))}
+    </pre>
+  )
+}
+
+/**
+ * Fragment 1 — "Tasks keep work focused." A lazy one-liner at the `❯` prompt
+ * becoming a scoped task: a titled card with a couple of scope lines, the way
+ * the orchestrator turns an offhand request into focused work before an agent
+ * touches it.
+ */
+function scopedTaskRows(): Segment[][] {
+  const rows: Segment[][] = []
+  const scope = (text: string) =>
+    rows.push(
+      bodyRow(
+        [
+          { text: "   ◇ ", color: TUI_MAGENTA },
+          { text, color: TUI_GRAY },
+        ],
+        FRAG_W,
+      ),
+    )
+
+  rows.push(
+    bodyRow(
+      [
+        { text: " ❯ ", color: TUI_CYAN, bold: true },
+        { text: "ship the csv export thing", color: TUI_FG },
+      ],
+      FRAG_W,
+    ),
+  )
+  rows.push(blankRow(FRAG_W))
+  rows.push(
+    bodyRow(
+      [
+        { text: " ⏺ ", color: TUI_GREEN },
+        { text: "Scoped and added to the backlog:", color: TUI_FG },
+      ],
+      FRAG_W,
+    ),
+  )
+  rows.push(blankRow(FRAG_W))
+  rows.push(
+    bodyRow([{ text: "   Export orders to CSV", color: TUI_FG, bold: true }], FRAG_W),
+  )
+  rows.push(bodyRow([{ text: "   export-orders-csv", color: TUI_DARK_GRAY }], FRAG_W))
+  rows.push(blankRow(FRAG_W))
+  scope("GET /account/orders.csv, streamed")
+  scope("Columns: date, sku, qty, total")
+  scope("Done when it handles 10k+ rows")
+  return rows
+}
+
+/**
+ * Fragment 2 — "Agents provide specialization." The workspace roster with each
+ * workspace's agent right of its name: developers execute while reviewers, QA,
+ * and security scrutinize, each doing one job on the work that reaches it.
+ */
+function specializationRows(): Segment[][] {
+  const rows: Segment[][] = []
+  const NAME_W = 10
+  const workspace = (name: string, agent: string, agentColor: string) =>
+    rows.push(
+      bodyRow(
+        [
+          { text: " ⏵ ", color: TUI_GREEN },
+          { text: padTo(name, NAME_W), color: TUI_GRAY },
+          { text: agent, color: agentColor },
+        ],
+        FRAG_W,
+      ),
+    )
+
+  rows.push(bodyRow([{ text: " — Workspaces —", color: TUI_DARK_GRAY }], FRAG_W))
+  rows.push(blankRow(FRAG_W))
+  workspace("alpha", "Developer", TUI_FG)
+  workspace("bravo", "Developer", TUI_FG)
+  workspace("charlie", "Reviewer", TUI_MAGENTA)
+  workspace("delta", "QA", TUI_BLUE)
+  workspace("echo", "Security", TUI_CYAN)
+  return rows
+}
+
+/**
+ * Fragment 3 — "Workflows provide boundaries." The default workflow's real
+ * stages as a pipeline strip with the gate at REVIEW, then Zen Mode reporting
+ * what it merged and what it held for you — boundaries that make autonomy safe.
+ */
+function workflowRows(): Segment[][] {
+  const rows: Segment[][] = []
+  const arrow: Segment = { text: " → ", color: TUI_DARK_GRAY }
+
+  rows.push(
+    bodyRow(
+      [
+        { text: " " },
+        { text: "BACKLOG", color: TUI_GRAY, bold: true },
+        arrow,
+        { text: "TO DO", color: TUI_BLUE, bold: true },
+        arrow,
+        { text: "IN PROGRESS", color: TUI_YELLOW, bold: true },
+        arrow,
+        { text: "REVIEW", color: TUI_MAGENTA, bold: true },
+        arrow,
+        { text: "DONE", color: TUI_GREEN, bold: true },
+      ],
+      FRAG_W,
+    ),
+  )
+  rows.push(blankRow(FRAG_W))
+  rows.push(
+    bodyRow(
+      [
+        { text: " gate at ", color: TUI_DARK_GRAY },
+        { text: "REVIEW", color: TUI_MAGENTA },
+        { text: ": checks green · no danger paths", color: TUI_DARK_GRAY },
+      ],
+      FRAG_W,
+    ),
+  )
+  rows.push(blankRow(FRAG_W))
+  rows.push(
+    bodyRow(
+      [
+        { text: " ⏵⏵ ", color: TUI_GREEN },
+        { text: "zen mode on", color: TUI_DARK_GRAY },
+      ],
+      FRAG_W,
+    ),
+  )
+  rows.push(
+    bodyRow(
+      [
+        { text: "  ⏺ ", color: TUI_GREEN },
+        { text: "merged ", color: TUI_FG },
+        { text: quoted("Cold-start cache"), color: TUI_FG },
+        { text: "  · checks green", color: TUI_DARK_GRAY },
+      ],
+      FRAG_W,
+    ),
+  )
+  rows.push(
+    bodyRow(
+      [
+        { text: "  ⎿ ", color: TUI_DARK_GRAY },
+        { text: "held ", color: TUI_FG },
+        { text: quoted("Harden token refresh"), color: TUI_FG },
+        { text: "  · needs you", color: TUI_DARK_GRAY },
+      ],
+      FRAG_W,
+    ),
+  )
+  return rows
+}
+
+/** "Tasks keep work focused" — a lazy request becoming a scoped task. */
+export function ScopedTaskMockup() {
+  return (
+    <TerminalFrame title="shelbi · task">
+      <FragmentPane rows={scopedTaskRows()} />
+    </TerminalFrame>
+  )
+}
+
+/** "Agents provide specialization" — the workspace roster, one agent per job. */
+export function SpecializationMockup() {
+  return (
+    <TerminalFrame title="shelbi · workspaces">
+      <FragmentPane rows={specializationRows()} />
+    </TerminalFrame>
+  )
+}
+
+/** "Workflows provide boundaries" — the default stages, the gate, the Zen report. */
+export function WorkflowMockup() {
+  return (
+    <TerminalFrame title="shelbi · workflow">
+      <FragmentPane rows={workflowRows()} />
+    </TerminalFrame>
+  )
+}
+
+// ── Editor (vim) fragments ────────────────────────────────────────────
+// "Specialization / boundaries" examples rendered as files open in vim: an
+// agent's brief (`instructions.md`) and the workflow definition (`workflow.yml`).
+// They make the point that an agent's job and a task's path are editable files,
+// not baked in — built from the same Segment/Row engine, palette, and terminal
+// frame as the other mockups. Unlike the fixed-width fragment panes, the vim
+// window is laid out fluid: a full-width buffer `<pre>` with a real full-width
+// status bar, so it fills whatever width its container gives it (the landing
+// page bleeds it edge to edge) and stands `VIM_TOTAL_PX` tall — the same height
+// as the animated board beside it.
+
+const VIM_TOTAL_PX = 640 // the window stands this tall (title bar + body)
+const VIM_TITLE_PX = 28 // TerminalFrame title-bar height
+const VIM_LINE_PX = 17 // matches PRE_STYLE line-height
+const VIM_GUTTER = 4 // 3-cell right-aligned line number + 1 trailing space
+// Enough `~` end-of-buffer rows that the buffer always fills its flex area (any
+// extra clip); the file's real lines sit above them.
+const VIM_BUFFER_FILL = 40
+
+/** One rendered line of the buffer, with light syntax coloring (no gutter). */
+type VimLine = Segment[]
+const VIM_BLANK: VimLine = []
+
+// The wrap width the prose/bullets are folded to. Comfortably inside the window
+// at its common column widths; longer lines just clip like any vim buffer.
+const VIM_WRAP = 54
+
+/** A block of the source markdown doc, before it's wrapped into buffer lines. */
+type DocBlock =
+  | { k: "h"; t: string } // heading (`#`/`##`) — cyan bold
+  | { k: "p"; t: string } // paragraph — wrapped, fg
+  | { k: "li"; t: string } // bullet — wrapped, hanging indent, bold lead term
+  | { k: "blank" }
+
+// The real Adversarial Review agent instructions.md, verbatim from
+// site/content/docs/guides/doing-more-with-agents/adversarial-review-agent.mdx —
+// the sample role prompt a reader pastes to get a genuine skeptic. Only the top
+// of the file shows in the window; the rest scrolls off, like any real prompt.
+const REVIEW_DOC: DocBlock[] = [
+  { k: "h", t: "# Adversarial Review" },
+  { k: "blank" },
+  {
+    k: "p",
+    t: "You are an adversarial code reviewer. A developer agent has finished a task and believes its branch is ready. Your job is not to confirm that belief — it is to try to prove the change is wrong before a human spends attention on it. Assume there is a bug until you have looked hard enough to say otherwise.",
+  },
+  { k: "blank" },
+  { k: "h", t: "## What to review" },
+  { k: "blank" },
+  {
+    k: "p",
+    t: "Review the diff on the current task's branch against the base branch — only what this task changed, plus the code that change touches. You are looking for defects the developer and the tests missed, not for style nits the preamble's checks already cover.",
+  },
+  { k: "blank" },
+  { k: "h", t: "## How to review" },
+  { k: "blank" },
+  { k: "p", t: "Work through every changed hunk and actively try to falsify it:" },
+  { k: "blank" },
+  {
+    k: "li",
+    t: "Correctness — Does it do what the task asked? Trace the non-obvious paths by hand. Off-by-one, wrong operator, inverted condition, a branch that silently does nothing.",
+  },
+  {
+    k: "li",
+    t: "Security — Untrusted input reaching a query, a shell, a path, or a template. Missing authz checks. Secrets in logs or errors. Unsafe defaults.",
+  },
+  {
+    k: "li",
+    t: "Error handling — What happens when the call fails, the input is empty, the list is huge, the value is null, two requests race?",
+  },
+  {
+    k: "li",
+    t: "Edge cases — Boundaries, empty and maximal inputs, concurrency, encoding, time zones — whatever this code plausibly meets in production.",
+  },
+  {
+    k: "li",
+    t: "Test coverage — Do the tests actually exercise the new behavior, or do they assert around it? Find a real input the change gets wrong that no test would catch, and treat that as a finding.",
+  },
+  { k: "blank" },
+  { k: "h", t: "## How to report" },
+  { k: "blank" },
+  {
+    k: "p",
+    t: "Write your findings as a structured review on the branch — a markdown ## Adversarial Review section, per this project's convention. For each finding:",
+  },
+  { k: "blank" },
+  { k: "li", t: "Severity — blocker, major, or minor." },
+  { k: "li", t: "Location — path/to/file.rs:120 (or a range)." },
+  {
+    k: "li",
+    t: "The problem — what breaks, and the concrete input or sequence that triggers it. A finding with a repro beats a vague worry.",
+  },
+  { k: "li", t: "Suggested fix — one line, when the fix is obvious." },
+  { k: "blank" },
+  { k: "p", t: "Order findings by severity, blockers first." },
+  { k: "blank" },
+  { k: "h", t: "## Signing off or bouncing" },
+  { k: "blank" },
+  {
+    k: "p",
+    t: "Every review ends one of two ways. Decide from the highest-severity finding. If nothing rises to a blocker, sign off and hand off forward. If any finding is a blocker, write up the findings and bounce the task back to the developer.",
+  },
+]
+
+/**
+ * Wrap the source doc into colored buffer lines: headings cyan-bold, paragraphs
+ * wrapped in the foreground color, bullets wrapped with a hanging indent and the
+ * lead term (before the ` — `) bolded — the light markdown rendering the other
+ * vim buffer uses, applied to the real doc.
+ */
+function docToVimLines(blocks: DocBlock[]): VimLine[] {
+  const out: VimLine[] = []
+  for (const b of blocks) {
+    if (b.k === "blank") {
+      out.push(VIM_BLANK)
+    } else if (b.k === "h") {
+      out.push([{ text: b.t, color: TUI_CYAN, bold: true }])
+    } else if (b.k === "p") {
+      for (const line of wrapText(b.t, VIM_WRAP)) out.push([{ text: line, color: TUI_FG }])
+    } else {
+      wrapText(b.t, VIM_WRAP - 2).forEach((line, i) => {
+        if (i > 0) {
+          out.push([{ text: `  ${line}`, color: TUI_FG }])
+          return
+        }
+        const dash = line.indexOf(" — ")
+        out.push(
+          dash > 0
+            ? [
+                { text: "- ", color: TUI_DARK_GRAY },
+                { text: line.slice(0, dash), color: TUI_FG, bold: true },
+                { text: line.slice(dash), color: TUI_FG },
+              ]
+            : [
+                { text: "- ", color: TUI_DARK_GRAY },
+                { text: line, color: TUI_FG },
+              ],
+        )
+      })
+    }
+  }
+  return out
+}
+
+const REVIEW_INSTRUCTIONS: VimLine[] = docToVimLines(REVIEW_DOC)
+
+/**
+ * The buffer rows for a file: a right-aligned line-number gutter beside each
+ * line, then `~` end-of-buffer rows filling down. Left-aligned and unpadded —
+ * the pane is fluid, so the rest of each line is just terminal background, the
+ * way vim leaves it.
+ */
+function buildVimBuffer(lines: VimLine[]): Segment[][] {
+  const rows: Segment[][] = lines.map((line, i) => [
+    { text: `${i + 1}`.padStart(VIM_GUTTER - 1) + " ", color: TUI_DARK_GRAY },
+    ...line,
+  ])
+  while (rows.length < VIM_BUFFER_FILL) rows.push([{ text: "~", color: TUI_BLUE }])
+  return rows
+}
+
+// Neo-tree-style file explorer for the vim window's left split: expander chevrons
+// (▾ open / ▸ closed) on directories, real Seti-UI file-type icons, and git-status
+// symbols RIGHT-ALIGNED at the panel edge (modified `M` yellow, added `A` green) —
+// the neo-tree "right-aligned symbols" look. The root is cyan, directories
+// blue-bold, files foreground, the open file gets a full-row selection bar.
+const NERD_W = 30
+const NERD_AGENTS = ["adversarial-review", "developer", "orchestrator", "qa", "review"]
+
+type NeoNode = {
+  depth: number
+  name: string
+  dir: boolean
+  expanded?: boolean
+  git?: "M" | "A"
+  active?: boolean
+}
+
+// File icons from Seti-UI (github.com/elviswolcott/seti-icons), inlined as SVG
+// strings — the package's recommended approach for static sites — so the sidebar
+// shows real file-type icons without bundling its ~100K icon set. seti-icons
+// ships no folder icon, so directories use the Octicons `file-directory-fill`
+// glyph (a common neo-tree folder choice). Icon tints are mapped from Seti's
+// color keywords to the terminal palette.
+const SETI_MD =
+  '<svg viewBox="0 0 32 32"><path d="M20.7 6.7v9.9h3.8c-2.9 3-5.8 5.9-8.7 8.8-2.7-2.8-5.6-5.8-8.4-8.7h3.5V6.6c1.3.9 4.4 3.1 5 3.1.6 0 3.6-2.2 4.8-3z"/></svg>'
+const SETI_JSON =
+  '<svg viewBox="0 0 32 32"><path d="M7.5 15.1c1.5 0 1.7-.8 1.7-1.5 0-.6-.1-1.1-.1-1.7S9 10.7 9 10.2c0-2.1 1.3-3 3.4-3h.8v1.9h-.4c-1 0-1.3.6-1.3 1.6 0 .4.1.8.1 1.3 0 .4.1.9.1 1.5 0 1.7-.7 2.3-1.9 2.6 1.2.3 1.9.9 1.9 2.6 0 .6-.1 1.1-.1 1.5 0 .4-.1.9-.1 1.2 0 1 .3 1.6 1.3 1.6h.4v1.9h-.8c-2 0-3.3-.8-3.3-3 0-.6 0-1.1.1-1.7.1-.6.1-1.2.1-1.7 0-.6-.2-1.5-1.7-1.5l-.1-1.9zm17 1.7c-1.5 0-1.7.9-1.7 1.5s.1 1.1.1 1.7c.1.6.1 1.2.1 1.7 0 2.2-1.4 3-3.4 3h-.8V23h.4c1 0 1.3-.6 1.3-1.6 0-.4 0-.8-.1-1.2 0-.5-.1-1-.1-1.5 0-1.7.7-2.3 1.9-2.6-1.2-.3-1.9-.9-1.9-2.6 0-.6.1-1.1.1-1.5.1-.5.1-.9.1-1.3 0-1-.4-1.5-1.3-1.6h-.4V7.2h.8c2.1 0 3.4.9 3.4 3 0 .6-.1 1.1-.1 1.7-.1.6-.1 1.2-.1 1.7 0 .7.2 1.5 1.7 1.5v1.7z"/></svg>'
+const SETI_DEFAULT =
+  '<svg viewBox="0 0 1200 1000"><path d="M394.1 537.8h411.7v54.7H394.1v-54.7zm0-130.3H624v54.7H394.1v-54.7zm0-130.3h411.7v54.7H394.1v-54.7zm0 390.9H700v54.7H394.1v-54.7z"/></svg>'
+// Octicons file-directory-fill (github.com/primer/octicons), MIT-licensed.
+const FOLDER_SVG =
+  '<svg viewBox="0 0 16 16"><path d="M1.75 1A1.75 1.75 0 0 0 0 2.75v10.5C0 14.216.784 15 1.75 15h12.5A1.75 1.75 0 0 0 16 13.25v-8.5A1.75 1.75 0 0 0 14.25 3H7.5a.25.25 0 0 1-.2-.1l-.9-1.2C6.07 1.26 5.55 1 5 1H1.75Z"/></svg>'
+
+type IconSpec = { svg: string; color: string }
+function iconFor(node: NeoNode): IconSpec {
+  if (node.dir) return { svg: FOLDER_SVG, color: TUI_BLUE }
+  if (node.name.endsWith(".md")) return { svg: SETI_MD, color: TUI_BLUE }
+  if (node.name.endsWith(".json")) return { svg: SETI_JSON, color: TUI_YELLOW }
+  return { svg: SETI_DEFAULT, color: TUI_FG }
+}
+
+/** An inline Seti SVG icon, sized to the row and tinted via `currentColor`. */
+function SetiIcon({ spec }: { spec: IconSpec }) {
+  return (
+    <span
+      aria-hidden="true"
+      style={{ display: "inline-flex", flex: "none", width: 14, height: 14, marginRight: "0.4ch", color: spec.color }}
+      dangerouslySetInnerHTML={{
+        __html: spec.svg.replace("<svg ", '<svg style="width:100%;height:100%;fill:currentColor" '),
+      }}
+    />
+  )
+}
+
+/** One neo-tree row: indent + chevron + Seti icon + name, git symbol right-aligned. */
+function NeoRow({ node }: { node: NeoNode }) {
+  const bg = node.active ? SEL_BG : undefined
+  const indent = " " + "  ".repeat(node.depth) // 1-col panel margin + per-depth indent
+  const marker = node.dir ? (node.expanded ? "▾ " : "▸ ") : "  "
+  const nameColor = node.active
+    ? SEL_FG
+    : node.depth === 0
+      ? TUI_CYAN
+      : node.dir
+        ? TUI_BLUE
+        : TUI_FG
+  return (
+    <div
+      className="flex items-center whitespace-pre"
+      style={{ height: VIM_LINE_PX, background: bg, paddingRight: "1ch" }}
+    >
+      <span style={{ color: TUI_DARK_GRAY }}>{indent + marker}</span>
+      <SetiIcon spec={iconFor(node)} />
+      <span style={{ color: nameColor, fontWeight: node.dir ? 700 : 400 }}>{node.name}</span>
+      {node.git ? (
+        <span
+          style={{
+            marginLeft: "auto",
+            color: node.active ? SEL_FG : node.git === "A" ? TUI_GREEN : TUI_YELLOW,
+            fontWeight: 700,
+          }}
+        >
+          {node.git}
+        </span>
+      ) : null}
+    </div>
+  )
+}
+
+/** The neo-tree sidebar panel: a fixed-width, bordered column of rows. */
+function NeoTreeSidebar({ nodes }: { nodes: NeoNode[] }) {
+  return (
+    <div
+      className="hidden shrink-0 overflow-hidden border-r font-mono md:block"
+      style={{
+        width: `${NERD_W}ch`,
+        minWidth: `${NERD_W}ch`,
+        background: TUI_BG,
+        borderColor: TUI_DIVIDER,
+        fontSize: 13,
+        lineHeight: `${VIM_LINE_PX}px`,
+      }}
+    >
+      {nodes.map((node, i) => (
+        <NeoRow key={i} node={node} />
+      ))}
+    </div>
+  )
+}
+
+/**
+ * Build the `agents/` tree nodes, highlighting `<activeDir>/<activeFile>` and
+ * overlaying a believable git status: the reviewer being edited shows modified
+ * (`M`), and a freshly-added `qa` agent shows added (`A`).
+ */
+function agentsTreeNodes(activeDir: string, activeFile: string): NeoNode[] {
+  const nodes: NeoNode[] = [{ depth: 0, name: "agents", dir: true, expanded: true }]
+  for (const agent of NERD_AGENTS) {
+    const added = agent === "qa" // a newly-added agent, shown as git-added
+    const modified = agent === "adversarial-review" // the agent being edited
+    const dirGit = added ? "A" : modified ? "M" : undefined
+    nodes.push({ depth: 1, name: agent, dir: true, expanded: true, git: dirGit })
+    nodes.push({
+      depth: 2,
+      name: "instructions.md",
+      dir: false,
+      git: added ? "A" : modified ? "M" : undefined,
+      active: agent === activeDir && activeFile === "instructions.md",
+    })
+    nodes.push({ depth: 2, name: "settings.json", dir: false, git: added ? "A" : undefined })
+    nodes.push({ depth: 2, name: "skills", dir: true, expanded: false, git: added ? "A" : undefined })
+  }
+  return nodes
+}
+
+/**
+ * A full vim editor window: a fluid-width buffer `<pre>` that fills whatever
+ * width its container gives it, an optional NERDTree-style file-explorer sidebar
+ * split on the left, a reverse-video status line (filename left, ruler right),
+ * and the file-open message on the command line — the whole window
+ * `VIM_TOTAL_PX` tall, with the split row flexing to fill whatever the two
+ * bottom lines leave. The sidebar hides below `md` so a narrow window isn't
+ * cramped.
+ */
+function VimWindow({
+  lines,
+  filename,
+  sidebar,
+}: {
+  lines: VimLine[]
+  filename: string
+  sidebar?: React.ReactNode
+}) {
+  const bytes = lines.reduce(
+    (n, l) => n + l.reduce((m, s) => m + [...s.text].length, 0) + 1,
+    0,
+  )
+  const mono: React.CSSProperties = { fontSize: 13, lineHeight: `${VIM_LINE_PX}px`, height: VIM_LINE_PX }
+  return (
+    <div className="w-full">
+      <TerminalFrame title={`jlong@hub — nvim ${filename}`}>
+        <div className="flex flex-col" style={{ height: VIM_TOTAL_PX - VIM_TITLE_PX }}>
+          <div className="flex flex-1 overflow-hidden">
+            {sidebar}
+            <pre
+              className="m-0 flex-1 overflow-hidden whitespace-pre font-mono"
+              style={{ ...PRE_STYLE, width: "100%", minWidth: 0 }}
+            >
+              {buildVimBuffer(lines).map((row, i) => (
+                <Row key={i} segs={row} />
+              ))}
+            </pre>
+          </div>
+          {/* Reverse-video status line, full width: filename left, ruler right. */}
+          <div
+            className="flex shrink-0 items-center justify-between whitespace-pre font-mono"
+            style={{
+              ...mono,
+              background: TUI_GRAY,
+              color: TUI_BG,
+              paddingLeft: "1ch",
+              paddingRight: "1ch",
+            }}
+          >
+            <span style={{ fontWeight: 700 }}>{filename}</span>
+            <span>1,1&nbsp;&nbsp;&nbsp;&nbsp;All</span>
+          </div>
+          {/* Command line: the message vim prints when the file opens. */}
+          <div
+            className="shrink-0 whitespace-pre font-mono"
+            style={{ ...mono, color: TUI_DARK_GRAY, paddingLeft: "1ch" }}
+          >
+            {`"${filename}" ${lines.length}L, ${bytes}B`}
+          </div>
+        </div>
+      </TerminalFrame>
+    </div>
+  )
+}
+
+/** "Agents provide specialization" — an agent's instructions.md open in vim. */
+export function AgentInstructionsMockup() {
+  return (
+    <VimWindow
+      lines={REVIEW_INSTRUCTIONS}
+      filename="instructions.md"
+      sidebar={<NeoTreeSidebar nodes={agentsTreeNodes("adversarial-review", "instructions.md")} />}
+    />
+  )
+}
+
+// ── Workflow config (vim) fragment ────────────────────────────────────
+// A boundaries example: a real Shelbi workflow open in vim — the `feature`
+// workflow (the app-feature shape). It uses the actual schema: reference-only
+// `statuses` (id + owner + optional agent), `transitions` with hub-side actions,
+// and a per-workflow `git` override, matching `default_workflow_yaml` /
+// `scaffold.rs` in the crate. Status ids carry their kanban category colors so
+// the config ties back to the board.
+
+const YKEY = TUI_CYAN // YAML keys
+const YDIM = TUI_DARK_GRAY // comments + flow-map punctuation
+const STATUS_CAT: Record<string, string> = {
+  backlog: TUI_GRAY,
+  todo: TUI_BLUE,
+  "in-progress": TUI_YELLOW,
+  "agent-review": TUI_MAGENTA,
+  qa: TUI_BLUE,
+  security: TUI_CYAN,
+  review: TUI_MAGENTA,
+  done: TUI_GREEN,
+}
+const STATUS_AGENT: Record<string, string> = {
+  orchestrator: TUI_CYAN,
+  developer: TUI_YELLOW,
+  "adversarial-review": TUI_MAGENTA,
+  qa: TUI_BLUE,
+  security: TUI_CYAN,
+}
+const catColor = (id: string): string => STATUS_CAT[id] ?? TUI_FG
+const ID_W = 12 // pad ids / `from` so the following field aligns down the block
+
+const yKey = (key: string, val?: string, valColor = TUI_FG): VimLine =>
+  val === undefined
+    ? [{ text: `${key}:`, color: YKEY }]
+    : [
+        { text: `${key}: `, color: YKEY },
+        { text: val, color: valColor, bold: valColor !== TUI_FG },
+      ]
+
+/** `  - { id: <id>, owner: <owner>[, agent: <agent>] }` */
+const yStatus = (id: string, owner: string, agent?: string): VimLine => {
+  const segs: VimLine = [
+    { text: "  - { ", color: YDIM },
+    { text: "id: ", color: YKEY },
+    { text: id, color: catColor(id), bold: true },
+    { text: `,${" ".repeat(Math.max(1, ID_W + 1 - id.length))}`, color: YDIM },
+    { text: "owner: ", color: YKEY },
+    { text: owner, color: TUI_FG },
+  ]
+  if (agent) {
+    segs.push({ text: ", ", color: YDIM })
+    segs.push({ text: "agent: ", color: YKEY })
+    segs.push({ text: agent, color: STATUS_AGENT[agent] ?? TUI_FG })
+  }
+  segs.push({ text: " }", color: YDIM })
+  return segs
+}
+
+/** `  - { from: <from>, to: <to>[, actions: [<a>, ...]] }` */
+const yTransition = (from: string, to: string, actions?: string[]): VimLine => {
+  const segs: VimLine = [
+    { text: "  - { ", color: YDIM },
+    { text: "from: ", color: YKEY },
+    { text: from, color: catColor(from), bold: true },
+    { text: `,${" ".repeat(Math.max(1, ID_W + 1 - from.length))}`, color: YDIM },
+    { text: "to: ", color: YKEY },
+    { text: to, color: catColor(to), bold: true },
+  ]
+  if (actions) {
+    segs.push({ text: ", ", color: YDIM })
+    segs.push({ text: "actions: ", color: YKEY })
+    segs.push({ text: "[", color: YDIM })
+    actions.forEach((a, i) => {
+      if (i) segs.push({ text: ", ", color: YDIM })
+      segs.push({ text: a, color: TUI_GREEN })
+    })
+    segs.push({ text: "]", color: YDIM })
+  }
+  segs.push({ text: " }", color: YDIM })
+  return segs
+}
+
+/** A 2-space-indented `  key: <value…>` under a mapping, with optional inline comment. */
+const yGit = (key: string, value: VimLine, note?: string): VimLine => {
+  const segs: VimLine = [{ text: `  ${key}: `, color: YKEY }, ...value]
+  if (note) segs.push({ text: `   # ${note}`, color: YDIM })
+  return segs
+}
+
+/** A folded block scalar: `key: >` then its indented, wrapped lines. */
+const yFolded = (key: string, lines: string[]): VimLine[] => [
+  [
+    { text: `${key}: `, color: YKEY },
+    { text: ">", color: YDIM },
+  ],
+  ...lines.map((t): VimLine => [{ text: `  ${t}`, color: TUI_FG }]),
+]
+
+// The `feature` workflow — the app-feature shape: a whole feature travels
+// backlog → in-progress → agent-review → qa → security → review → done. A
+// developer builds it on a branch off main; the adversarial-review, QA, and
+// security agents each gate the diff before a human signs off and it merges.
+// Real Shelbi schema: reference-only `statuses`, `transitions` with hub-side
+// actions, and a per-workflow `git` override.
+const WORKFLOW_CONFIG: VimLine[] = [
+  yKey("name", "feature"),
+  ...yFolded("description", [
+    "A full app feature, from idea to merged. A",
+    "developer builds it on a branch off main; then",
+    "adversarial review, QA, and security each gate",
+    "it before a human signs off and it merges.",
+  ]),
+  VIM_BLANK,
+  yKey("initial_status", "backlog", catColor("backlog")),
+  VIM_BLANK,
+  yKey("statuses"),
+  yStatus("backlog", "user"),
+  yStatus("in-progress", "agent", "developer"),
+  yStatus("agent-review", "agent", "adversarial-review"),
+  yStatus("qa", "agent", "qa"),
+  yStatus("security", "agent", "security"),
+  yStatus("review", "user"),
+  yStatus("done", "user"),
+  VIM_BLANK,
+  yKey("transitions"),
+  yTransition("backlog", "in-progress"),
+  yTransition("in-progress", "agent-review", ["push_branch", "open_pr"]),
+  yTransition("agent-review", "qa"),
+  yTransition("qa", "security"),
+  yTransition("security", "review"),
+  yTransition("review", "done", ["merge", "delete_branch"]),
+  VIM_BLANK,
+  yKey("git"),
+  yGit("base_branch", [{ text: "main", color: TUI_FG }]),
+  yGit("merge_strategy", [{ text: "squash", color: TUI_FG }]),
+]
+
+/** "Workflows provide boundaries" — the feature workflow open in vim. */
+export function WorkflowConfigMockup() {
+  return <VimWindow lines={WORKFLOW_CONFIG} filename="feature.yaml" />
+}
 
 /**
  * Thin preset used by the marketing landing page. Renders `AppMockup` with

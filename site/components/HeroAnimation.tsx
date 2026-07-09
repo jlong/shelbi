@@ -199,6 +199,7 @@ const BASE: AppState = {
   project: "my-project",
   activeView: "chat",
   minBodyRows: 32,
+  workflow: "app",
   columns: cols({}),
   machines: machinesFor(RESIDENT_WORKING),
   readyReview: [],
@@ -298,10 +299,32 @@ function streamUpTo(n: number): ChatLine[] {
   return [...SENT, ...STREAM_TAIL.slice(0, n)]
 }
 
+// The dispatched task body seeded into alpha's session — the orchestrator's
+// Feature template from its instructions.md (# title, a one-line description,
+// ## Technical Details, ## Acceptance Criteria with `- [ ]` items), pre-wrapped
+// so each line is one buffer row. It renders as the opening `❯` prompt of the
+// worker pane (see the `task` ChatLine in KanbanMockup).
+const TASK_BODY = `# Metrics API endpoint
+
+Signups, active users, and revenue as big-number
+tiles, backed by a single GET /api/metrics request.
+
+## Technical Details
+
+- One /api/metrics returns all three metrics
+- from/to params, default to the last 30 days
+- Coalesce empty ranges to 0 so tiles never blank
+
+## Acceptance Criteria
+- [ ] Returns signups, active users, and revenue
+- [ ] Respects from/to; defaults to 30 days
+- [ ] Empty ranges read 0, not null
+- [ ] Response type shared with the client tiles`
+
 // The focused worker (alpha) doing believable work on "Metrics API endpoint".
-// Its first turn is the dispatched task itself, rendered as a `❯` user prompt —
-// mirroring how a real dispatch seeds the worker's session with the task
-// title/body. From there it reads the spec + the routes it's extending,
+// Its first turn is the dispatched task body itself (`TASK_BODY`), the way a
+// real dispatch seeds the worker's session. From there it reads the spec + the
+// routes it's extending,
 // implements the query, endpoint, response type, and tests (each edit with a
 // diffstat), coalesces the empty-range case, then runs the suite + lands the
 // session footer. It's the fullest transcript in the story and the newest
@@ -312,10 +335,7 @@ function streamUpTo(n: number): ChatLine[] {
 // that just began. (Worker `user` prompts render on one row, so the prompt is
 // kept under the ~108-cell pane width to stay fully readable at the top edge.)
 const WORKER_BASE: ChatLine[] = [
-  {
-    kind: "user",
-    text: "Implement the metrics API endpoint from dashboard.md — GET /api/metrics with from/to range params.",
-  },
+  { kind: "task", body: TASK_BODY },
   { kind: "blank" },
   { kind: "prose", text: "Reading the spec and the route I'll extend." },
   { kind: "tool", name: "Read", args: "dashboard.md" },
@@ -431,45 +451,63 @@ function buildKeyframes(): Keyframe[] {
     )
   }
 
-  // Beat 6 — promote + dispatch across BOTH machines. BACKLOG → TO DO, then
-  // TO DO → IN PROGRESS one worker at a time, each pickup flipping its sidebar
-  // workspace to working. The workers alternate hub (alpha, bravo) and devbox
-  // (echo, foxtrot), so the sidebar lights up on both machines at once.
-  k.push(
-    frame(
-      {
-        activeView: "tasks",
-        columns: cols({
-          backlog: TASKS.slice(3).map((t) => card(t)),
-          todo: TASKS.slice(0, 3).map((t) => card(t)),
-        }),
-      },
-      750,
-    ),
-  )
-  k.push(frame({ activeView: "tasks", columns: cols({ todo: TASKS.map((t) => card(t)) }) }, 700))
-  // Dispatch the first three one at a time — metrics → alpha (hub), chart → echo
-  // (devbox), date-range → bravo (hub) — accumulating the working set so each
-  // frame shows one more workspace busy.
+  // Beat 6 — promote + dispatch, ONE card at a time. Every frame moves exactly
+  // one dashboard card (the residents never move): promote it BACKLOG → TO DO,
+  // then dispatch TO DO → IN PROGRESS as a worker picks it up (its sidebar
+  // workspace flips to working). Workers alternate hub (alpha, bravo) and devbox
+  // (echo, foxtrot), so both machines light up. The first four dispatch; the
+  // last two just promote into TO DO and wait for a free worker.
   const working: Record<string, string> = {}
-  for (let n = 1; n <= 3; n += 1) {
-    const picked = TASKS[n - 1]
-    if (picked.worker) working[picked.worker] = "Developer"
+  for (let i = 0; i < 4; i += 1) {
+    // Promote task i: one card, BACKLOG → TO DO.
     k.push(
       frame(
         {
           activeView: "tasks",
           columns: cols({
-            todo: TASKS.slice(n).map((t) => card(t)),
-            progress: TASKS.slice(0, n).map((t) => card(t, true)),
+            backlog: TASKS.slice(i + 1).map((t) => card(t)),
+            todo: [card(TASKS[i])],
+            progress: TASKS.slice(0, i).map((t) => card(t, true)),
           }),
           machines: machinesFor({ ...RESIDENT_WORKING, ...working }),
         },
-        750,
+        600,
+      ),
+    )
+    // Dispatch task i: one card, TO DO → IN PROGRESS; its worker flips to busy.
+    const w = TASKS[i].worker
+    if (w) working[w] = "Developer"
+    k.push(
+      frame(
+        {
+          activeView: "tasks",
+          columns: cols({
+            backlog: TASKS.slice(i + 1).map((t) => card(t)),
+            todo: [],
+            progress: TASKS.slice(0, i + 1).map((t) => card(t, true)),
+          }),
+          machines: machinesFor({ ...RESIDENT_WORKING, ...working }),
+        },
+        650,
       ),
     )
   }
-  k.push(frame(DISPATCHED, 950)) // csv-export → foxtrot (devbox); four dispatched across hub + devbox
+  // Promote the fifth task into TO DO (one card); the sixth follows in DISPATCHED.
+  k.push(
+    frame(
+      {
+        activeView: "tasks",
+        columns: cols({
+          backlog: TASKS.slice(5).map((t) => card(t)),
+          todo: [card(TASKS[4])],
+          progress: TASKS.slice(0, 4).map((t) => card(t, true)),
+        }),
+        machines: machinesFor({ ...RESIDENT_WORKING, ...working }),
+      },
+      600,
+    ),
+  )
+  k.push(frame(DISPATCHED, 950)) // sixth task promoted — both remaining wait in TO DO
 
   // Beat 7 — open the ⌃P command palette over the dashboard: the centered modal
   // appears with an empty `>` prompt and the full command list, its top row
