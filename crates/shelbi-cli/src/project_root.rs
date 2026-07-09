@@ -426,6 +426,31 @@ mod tests {
         assert!(pick_name(&cwd, Some("...")).is_err());
     }
 
+    /// The actual bug scenario: the project name is *derived from the
+    /// directory basename* (no `--project` override), which is the common
+    /// case for a bare `shelbi` launch. `pick_name_normalizes_force_name`
+    /// only exercises the explicit-override branch; this guards the
+    /// basename branch, where a raw `Shaft` used to flow straight through
+    /// and crash dashboard setup with the invalid-agent-id error.
+    #[test]
+    fn pick_name_normalizes_derived_basename() {
+        for (dir, want) in [
+            ("/tmp/Shaft", "shaft"),
+            ("/tmp/My App", "my-app"),
+            ("/tmp/shelbi.rs", "shelbi-rs"),
+        ] {
+            let got = pick_name(Path::new(dir), None).unwrap();
+            assert_eq!(got, want, "basename of {dir}");
+            // The derived name must satisfy the storage chokepoint — the
+            // same validator dashboard/agent-id setup relies on — so it
+            // can never raise the `invalid agent id` error downstream.
+            assert!(
+                validate_project_name(&got).is_ok(),
+                "derived name `{got}` must pass validate_project_name"
+            );
+        }
+    }
+
     #[test]
     fn project_name_from_root_uses_basename() {
         assert_eq!(
@@ -557,6 +582,42 @@ mod tests {
         let resolved =
             resolve_root_for_init(&cwd, Some(repo.clone()), Some("custom-name")).expect("resolver");
         assert_eq!(resolved.name, "custom-name");
+        std::env::remove_var("SHELBI_HOME");
+    }
+
+    /// Regression for the capitalized-directory launch crash: resolving a
+    /// project root whose basename is `Shaft` (or `My App`) must yield a
+    /// valid lowercase project name through the scripted `--root` resolve
+    /// path — the same path `shelbi init` and the bare first-run launch
+    /// flow (`default_entry` → `scaffold_with_prompt`) go through — and
+    /// never surface the invalid-agent-id error. The on-disk directory
+    /// keeps its original name; only the derived project *name* normalizes.
+    #[test]
+    fn resolve_root_normalizes_capitalized_or_spaced_basename() {
+        let _g = ENV_LOCK.lock().unwrap();
+        let home = fresh_tmp_dir();
+        std::env::set_var("SHELBI_HOME", &home);
+        std::fs::create_dir_all(home.join("projects")).unwrap();
+
+        for (dirname, want) in [("Shaft", "shaft"), ("My App", "my-app")] {
+            let repo = home.join(dirname);
+            std::fs::create_dir_all(repo.join(".git")).unwrap();
+
+            let cwd = std::env::current_dir().unwrap();
+            let resolved =
+                resolve_root_for_init(&cwd, Some(repo.clone()), None).expect("resolver");
+            assert_eq!(resolved.name, want, "basename `{dirname}`");
+            // Passes the storage chokepoint → dashboard/agent-id setup
+            // downstream can't hit the invalid-agent-id error.
+            assert!(
+                validate_project_name(&resolved.name).is_ok(),
+                "resolved name `{}` must pass validate_project_name",
+                resolved.name
+            );
+            // The path is preserved verbatim so the cwd→project association
+            // still points at the real (capitalized/spaced) directory.
+            assert_eq!(resolved.path, repo);
+        }
         std::env::remove_var("SHELBI_HOME");
     }
 }
