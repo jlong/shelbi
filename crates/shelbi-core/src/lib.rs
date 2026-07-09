@@ -12,8 +12,9 @@ pub use error::{Error, Result};
 pub use model::{
     checks_for_task, checks_for_task_in_workflow, ci_timeout_for_workflow,
     danger_paths_for_project, danger_paths_for_workflow, default_dialog_signatures,
-    default_prompt_injection, detect_project_shapes, validate_agent_id, validate_branch,
-    validate_branch_prefix, validate_project_name, validate_task_id, validate_workflow_name, Agent,
+    default_prompt_injection, detect_project_shapes, normalize_project_name, validate_agent_id,
+    validate_branch, validate_branch_prefix, validate_project_name, validate_task_id,
+    validate_workflow_name, Agent,
     AgentRunnerSpec, Column, ConfigMode, DialogSignature, ForwardMode, GitConfig, HeartbeatConfig,
     Host, Machine, MachineKind, MergeStrategy, OrchestratorSpec, ParamDiagnostic, Project,
     ProjectShape,

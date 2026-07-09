@@ -17,8 +17,8 @@ use std::process::Command;
 use anyhow::{anyhow, Context, Result};
 use inquire::{Confirm, Select, Text};
 use shelbi_core::{
-    format_bytes_short, recommended_workspace_count, total_memory_bytes, validate_agent_id,
-    AgentRunnerSpec, Machine, MachineKind, OrchestratorSpec, Project, WorkspaceNamePreset,
+    format_bytes_short, recommended_workspace_count, total_memory_bytes, AgentRunnerSpec, Machine,
+    MachineKind, OrchestratorSpec, Project, WorkspaceNamePreset,
     WorkspaceSpec,
 };
 
@@ -106,11 +106,14 @@ pub fn setup_one_project() -> Result<()> {
     let git = GitDefaults::probe(&cwd);
 
     // ---- Project basics --------------------------------------------------
+    // Normalize the folder-basename default up front so the pre-filled value
+    // is already a valid id (a folder like `Shaft` shows as `shaft`). Fall
+    // back to `my-project` when the basename can't be normalized.
     let default_name = cwd
         .file_name()
         .and_then(|s| s.to_str())
-        .unwrap_or("my-project")
-        .to_string();
+        .and_then(|s| shelbi_core::normalize_project_name(s).ok())
+        .unwrap_or_else(|| "my-project".to_string());
     let name = prompt_project_name(&default_name)?;
 
     let repo_path = text("Path to the repo:", &cwd.display().to_string())?;
@@ -371,12 +374,14 @@ fn probe_remote_url(cwd: &Path) -> Option<String> {
 
 fn prompt_project_name(default: &str) -> Result<String> {
     use inquire::validator::{ErrorMessage, Validation};
+    // Accept anything that can be slugified into a valid id — the wizard
+    // normalizes on submit rather than forcing the user to pre-lowercase.
     let validator = |s: &str| -> std::result::Result<Validation, inquire::CustomUserError> {
-        if validate_agent_id(s.trim()).is_ok() {
+        if shelbi_core::normalize_project_name(s.trim()).is_ok() {
             Ok(Validation::Valid)
         } else {
             Ok(Validation::Invalid(ErrorMessage::Custom(
-                "project name must be kebab/snake-case alphanumeric (e.g. `my-app`)".into(),
+                "project name needs at least one letter or digit (e.g. `my-app`)".into(),
             )))
         }
     };
@@ -385,7 +390,9 @@ fn prompt_project_name(default: &str) -> Result<String> {
         .with_validator(validator)
         .prompt()
         .context("project name prompt")?;
-    Ok(raw.trim().to_string())
+    // Normalize the submitted name (e.g. `My App` → `my-app`), announcing the
+    // change when it differs from what the user typed.
+    crate::project_root::normalize_project_name_announced(raw.trim())
 }
 
 /// Returns `(recommended_count, optional_hint_to_print_above_prompt)`.
