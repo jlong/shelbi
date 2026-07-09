@@ -92,7 +92,7 @@ export function Footer() {
               <Wordmark size="sm" />
             </Link>
             <p className="max-w-xs text-sm leading-relaxed text-gray-7">
-              An open-source agent orchestrator for the terminal.
+              An open-source, personal agent orchestrator for the terminal.
             </p>
             <Link
               href={REPO_URL}
@@ -127,15 +127,16 @@ export function Footer() {
 
         <div className="mt-8 border-t border-gray-4 pt-4">
           <p className="font-mono text-xs text-gray-6">
-            &copy; {new Date().getFullYear()}{" "}
+            &copy; {new Date().getFullYear()} John W. Long
+            <span className="px-2 text-gray-5">&middot;</span>
             <Link
-              href="https://32pixels.co"
+              href="https://github.com/jlong/shelbi/blob/main/LICENSE"
+              target="_blank"
+              rel="noopener noreferrer"
               className="transition-colors hover:text-fg"
             >
-              32pixels, LLC
+              MIT License
             </Link>
-            <span className="px-2 text-gray-5">&middot;</span>
-            MIT License
           </p>
         </div>
       </div>

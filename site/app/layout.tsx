@@ -18,23 +18,29 @@ const sourceCodePro = Source_Code_Pro({
 })
 
 const SITE_URL = "https://shelbi.dev"
+const SITE_TAGLINE =
+  "An open-source, personal agent orchestrator for the terminal."
+// Home page title: brand plus positioning line so the tab, OG title, and
+// search snippet all lead with the tagline. Subpages override with their
+// own `title` string.
+const SITE_TITLE = `Shelbi: ${SITE_TAGLINE}`
 const SITE_DESCRIPTION =
-  "Do more with your agents — an open source, multi-machine orchestrator built on tmux. Dispatch tasks to a team of agents locally or over SSH."
+  "An open-source, personal agent orchestrator for the terminal. Dispatch tasks to a team of agents running in parallel across machines, locally or over SSH."
 
 export const metadata: Metadata = {
   metadataBase: new URL(SITE_URL),
-  title: "Shelbi",
+  title: SITE_TITLE,
   description: SITE_DESCRIPTION,
   openGraph: {
     type: "website",
     siteName: "Shelbi",
     url: SITE_URL,
-    title: "Shelbi",
+    title: SITE_TITLE,
     description: SITE_DESCRIPTION,
   },
   twitter: {
     card: "summary_large_image",
-    title: "Shelbi",
+    title: SITE_TITLE,
     description: SITE_DESCRIPTION,
   },
 }

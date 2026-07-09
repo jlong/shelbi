@@ -4,11 +4,11 @@ import { join } from "node:path"
 import { OG_CARD_SIZE, OgCard } from "@/components/OgCard"
 
 export const alt =
-  "Do more with your agents — an open source, multi-machine orchestrator built on tmux"
+  "Shelbi: an open-source, personal agent orchestrator for the terminal"
 export const size = OG_CARD_SIZE
 export const contentType = "image/png"
 
-const TITLE = "Do more with your agents"
+const TITLE = "An open-source, personal agent orchestrator for the terminal."
 
 export default async function Image() {
   const [geistRegular, geistSemiBold, sourceCodeProRegular] = await Promise.all([
