@@ -49,10 +49,12 @@ pub use agent_workspaces::{
     legacy_claude_md_path, list_agents, load_agent_settings, load_shared_preamble,
     materialize_default_agents, maybe_emit_claude_md_migration_hint, orchestrator_handoff_path,
     reset_claude_md_migration_hint, self_heal_default_agents, take_orchestrator_handoff,
-    AgentDivergence, AgentMaterializeOutcome, BundledAgent, BundledSkill, DEFAULT_AGENTS,
-    DEFAULT_DEVELOPER_INSTRUCTIONS, DEFAULT_ORCHESTRATOR_INSTRUCTIONS, DEFAULT_REVIEW_INSTRUCTIONS,
-    DEFAULT_REVIEW_LOAD_RUN_SKILL, DEVELOPER_AGENT, HANDOFF_FILE, ORCHESTRATOR_AGENT,
-    ORCHESTRATOR_HANDOFF_REL, REVIEW_AGENT, SHARED_AGENT_DIR, SHARED_PREAMBLE_FILE,
+    AgentDivergence, AgentMaterializeOutcome, BundledAgent, BundledSkill, ADVERSARIAL_AGENT,
+    DEFAULT_ADVERSARIAL_INSTRUCTIONS, DEFAULT_AGENTS, DEFAULT_DEVELOPER_INSTRUCTIONS,
+    DEFAULT_ORCHESTRATOR_INSTRUCTIONS, DEFAULT_QA_INSTRUCTIONS, DEFAULT_REVIEW_INSTRUCTIONS,
+    DEFAULT_REVIEW_LOAD_RUN_SKILL, DEFAULT_SECURITY_INSTRUCTIONS, DEVELOPER_AGENT, HANDOFF_FILE,
+    ORCHESTRATOR_AGENT, ORCHESTRATOR_HANDOFF_REL, QA_AGENT, REVIEW_AGENT, SECURITY_AGENT,
+    SHARED_AGENT_DIR, SHARED_PREAMBLE_FILE,
 };
 pub use hub_config::{
     hub_config_path, list_projects, load_hub_config, save_hub_config, touch_project_launched,

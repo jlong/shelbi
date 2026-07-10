@@ -485,8 +485,8 @@ mod tests {
         let _g = TEST_LOCK.lock().unwrap();
         let home = fresh_home();
         std::env::set_var("SHELBI_HOME", &home);
-        new("p", "qa").unwrap();
-        assert_eq!(customized_marker("p", "qa").unwrap(), "-");
+        new("p", "sidekick").unwrap();
+        assert_eq!(customized_marker("p", "sidekick").unwrap(), "-");
         std::env::remove_var("SHELBI_HOME");
         let _ = std::fs::remove_dir_all(&home);
     }
