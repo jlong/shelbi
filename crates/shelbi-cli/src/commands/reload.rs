@@ -42,9 +42,15 @@ pub fn run(project_opt: Option<String>) -> Result<()> {
     // workflows/statuses.yaml and the shipped workflow files were split out.
     // Ordinary project loads stay read-only with respect to these files, but
     // `shelbi reload` remains the user-facing repair path.
-    // `scaffold_project_workflow` self-guards per file, so it only writes the
-    // task.yaml / subtask.yaml that are actually missing.
-    shelbi_state::scaffold_project_workflow(&project_name).map_err(|e| anyhow!(e))?;
+    //
+    // The default-workflow migration self-guards: it only writes the
+    // task.yaml / subtask.yaml that are actually missing, and only rewrites
+    // `default_workflow:` when it is unset or the legacy `default` — a
+    // deliberate custom default is left alone, and no task frontmatter or
+    // existing `default.yaml` is touched.
+    let wf_migration =
+        shelbi_state::migrate_default_workflow_to_task(&project_name).map_err(|e| anyhow!(e))?;
+    print_default_workflow_migration(&wf_migration);
     let statuses_path = shelbi_state::statuses_path(&project_name).map_err(|e| anyhow!(e))?;
     if !statuses_path.exists() {
         shelbi_state::scaffold_project_statuses(&project_name).map_err(|e| anyhow!(e))?;
@@ -86,6 +92,15 @@ fn cleanup_legacy_markers() {
                 c.work_dir.display()
             );
         }
+    }
+}
+
+fn print_default_workflow_migration(m: &shelbi_state::DefaultWorkflowMigration) {
+    for path in &m.created_workflows {
+        println!("✓ wrote {} (was missing)", path.display());
+    }
+    if m.default_workflow_set_to_task {
+        println!("✓ set default_workflow: task (migrated from the legacy `default`)");
     }
 }
 

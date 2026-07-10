@@ -310,6 +310,78 @@ fn migrate_statuses_extension(project_dir: &Path) {
     }
 }
 
+/// Outcome of [`migrate_default_workflow_to_task`], so callers can report
+/// exactly what the migration touched.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct DefaultWorkflowMigration {
+    /// The `task.yaml` / `subtask.yaml` files that were created because
+    /// they were missing. Empty when the scaffold already existed.
+    pub created_workflows: Vec<PathBuf>,
+    /// `true` when the project's `default_workflow:` was rewritten to
+    /// `task` (it was previously unset or the legacy `default`).
+    pub default_workflow_set_to_task: bool,
+}
+
+/// One-time migration that brings a project created before the
+/// `task`/`subtask` scaffold onto the new default shape:
+///
+/// 1. Materialize `workflows/task.yaml` and `workflows/subtask.yaml` when
+///    absent (via [`scaffold_project_workflow`] — self-guarding per file,
+///    so user edits and a half-scaffolded state are preserved).
+/// 2. Point the project's `default_workflow:` at `task` when it is unset
+///    or still the legacy `default`. A project that already declares some
+///    other workflow (a deliberate user choice) is left untouched.
+///
+/// The migration **does not** rewrite user task frontmatter and **does
+/// not** delete a `workflows/default.yaml` — existing tasks that carry
+/// `workflow: default` keep resolving, either against a still-present
+/// `default.yaml` or, once that file is gone, through the load-time alias
+/// (`default` → `task`; see [`workflows::load_workflow`]). So nothing a
+/// task still references is stranded.
+///
+/// Idempotent: a second run finds the scaffold present and
+/// `default_workflow: task` already set, so it reports an empty outcome.
+/// This is the explicit repair path `shelbi reload` runs; ordinary
+/// project loads stay read-only with respect to the project YAML.
+pub fn migrate_default_workflow_to_task(project: &str) -> Result<DefaultWorkflowMigration> {
+    let created_workflows = scaffold_project_workflow(project)?;
+
+    // Reload after scaffolding so `load_project`'s `default_workflow:`
+    // validation resolves against the freshly written `task.yaml` (the
+    // alias maps a lingering `default_workflow: default` onto it).
+    let mut project_config = load_project(project)?;
+    let should_set = matches!(
+        project_config.default_workflow.as_deref(),
+        None | Some(shelbi_core::DEFAULT_WORKFLOW_NAME)
+    );
+    let mut default_workflow_set_to_task = false;
+    if should_set {
+        project_config.default_workflow = Some(shelbi_core::TASK_WORKFLOW_NAME.to_string());
+        save_project_config(&project_config)?;
+        default_workflow_set_to_task = true;
+    }
+
+    Ok(DefaultWorkflowMigration {
+        created_workflows,
+        default_workflow_set_to_task,
+    })
+}
+
+/// Persist a loaded [`Project`]'s config to the right on-disk location for
+/// its [`ConfigMode`](shelbi_core::ConfigMode). Global projects round-trip
+/// through the flat `~/.shelbi/projects/<name>.yaml` ([`save_project`]);
+/// in-repo projects rewrite only the *shared* half at
+/// `<repo>/.shelbi/project.yaml`, leaving the user-local half untouched.
+/// `default_workflow` is a shared field ([`shelbi_core::SHARED_PROJECT_FIELDS`]),
+/// so the shared write is the correct target for this migration.
+fn save_project_config(project: &Project) -> Result<()> {
+    if project.config_mode == Some(shelbi_core::ConfigMode::InRepo) {
+        let shared_path = <Project as ProjectPaths>::config_root(project)?.join("project.yaml");
+        return atomic_write(&shared_path, project.to_shared_yaml_string()?.as_bytes());
+    }
+    save_project(project)
+}
+
 /// Render the workspace settings JSON for `project`: read the template file
 /// resolved by [`workspace_settings_template_path`] (falling back to
 /// [`DEFAULT_WORKSPACE_SETTINGS_TEMPLATE`] when the file is missing — a fresh
@@ -4142,6 +4214,107 @@ mod tests {
         let created = scaffold_project_workflow("myapp").unwrap();
         assert_eq!(created, vec![subtask_path.clone()]);
         assert!(std::fs::read_to_string(&task_path).unwrap().contains("id: done"));
+        std::env::remove_var("SHELBI_HOME");
+    }
+
+    #[test]
+    fn migrate_default_workflow_to_task_migrates_pre_existing_project() {
+        // A project created before the task/subtask scaffold: it declares
+        // `default_workflow: default`, carries a legacy `default.yaml`, and
+        // has a task whose frontmatter references `workflow: default`. The
+        // migration adds task.yaml/subtask.yaml and flips the project
+        // default to `task` — without touching the task file or deleting
+        // the referenced `default.yaml`.
+        let _g = TEST_LOCK.lock().unwrap();
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+        let mut p = fixture_project("myapp", None);
+        p.default_workflow = Some(shelbi_core::DEFAULT_WORKFLOW_NAME.into());
+        save_project(&p).unwrap();
+
+        // Legacy on-disk workflow files: statuses + a real `default.yaml`.
+        scaffold_project_statuses("myapp").unwrap();
+        let default_path = default_workflow_path("myapp").unwrap();
+        atomic_write(
+            &default_path,
+            shelbi_core::scaffold::default_workflow_yaml()
+                .unwrap()
+                .as_bytes(),
+        )
+        .unwrap();
+
+        // A pre-existing task pinned to the legacy `default` workflow.
+        let task_file = task_path("myapp", "t1").unwrap();
+        let task_body = "---\nid: t1\ntitle: Legacy\nworkflow: default\n---\n\nBody\n";
+        ensure_dir(task_file.parent().unwrap()).unwrap();
+        std::fs::write(&task_file, task_body).unwrap();
+
+        let outcome = migrate_default_workflow_to_task("myapp").unwrap();
+
+        // task.yaml + subtask.yaml were materialized.
+        let task_wf = workflow_path("myapp", shelbi_core::TASK_WORKFLOW_NAME).unwrap();
+        let subtask_wf = workflow_path("myapp", shelbi_core::SUBTASK_WORKFLOW_NAME).unwrap();
+        assert!(task_wf.exists() && subtask_wf.exists());
+        assert_eq!(outcome.created_workflows.len(), 2);
+        assert!(outcome.default_workflow_set_to_task);
+
+        // The project default now points at `task`.
+        let reloaded = load_project("myapp").unwrap();
+        assert_eq!(
+            reloaded.default_workflow_name(),
+            shelbi_core::TASK_WORKFLOW_NAME
+        );
+
+        // The referenced `default.yaml` is not stranded, and the task
+        // frontmatter is byte-for-byte intact.
+        assert!(default_path.exists(), "default.yaml must not be deleted");
+        assert_eq!(std::fs::read_to_string(&task_file).unwrap(), task_body);
+        std::env::remove_var("SHELBI_HOME");
+    }
+
+    #[test]
+    fn migrate_default_workflow_to_task_is_idempotent() {
+        let _g = TEST_LOCK.lock().unwrap();
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+        let p = fixture_project("myapp", None);
+        save_project(&p).unwrap();
+
+        let first = migrate_default_workflow_to_task("myapp").unwrap();
+        assert_eq!(first.created_workflows.len(), 2);
+        assert!(first.default_workflow_set_to_task);
+
+        // Second run: scaffold present, default already `task` → no-op.
+        let second = migrate_default_workflow_to_task("myapp").unwrap();
+        assert!(second.created_workflows.is_empty());
+        assert!(!second.default_workflow_set_to_task);
+        std::env::remove_var("SHELBI_HOME");
+    }
+
+    #[test]
+    fn migrate_default_workflow_to_task_leaves_custom_default_untouched() {
+        // A project that deliberately declares a non-default workflow keeps
+        // it — the migration only rewrites an unset or legacy `default`.
+        let _g = TEST_LOCK.lock().unwrap();
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+        let mut p = fixture_project("myapp", None);
+        p.default_workflow = Some("app".into());
+        save_project(&p).unwrap();
+        scaffold_project_statuses("myapp").unwrap();
+        let app_yaml = shelbi_core::scaffold::default_workflow_yaml()
+            .unwrap()
+            .replacen("name: default", "name: app", 1);
+        atomic_write(
+            &workflow_path("myapp", "app").unwrap(),
+            app_yaml.as_bytes(),
+        )
+        .unwrap();
+
+        let outcome = migrate_default_workflow_to_task("myapp").unwrap();
+        assert_eq!(outcome.created_workflows.len(), 2, "scaffold still runs");
+        assert!(!outcome.default_workflow_set_to_task);
+        assert_eq!(load_project("myapp").unwrap().default_workflow_name(), "app");
         std::env::remove_var("SHELBI_HOME");
     }
 
