@@ -697,7 +697,7 @@ mod tests {
         .unwrap();
         let missed = drain_once("demo", 0).unwrap();
 
-        append_heartbeat_event("demo", 1, 1).unwrap();
+        append_heartbeat_event("demo", 1, 1, None).unwrap();
 
         let response = wait_next("demo", missed.cursor_offset, Duration::from_millis(250)).unwrap();
         assert_eq!(response.events.len(), 1);
@@ -721,7 +721,7 @@ mod tests {
     #[test]
     fn drain_labels_heartbeat_and_pane_death_without_scheduling() {
         let (_guard, _tmp) = setup_home();
-        append_heartbeat_event("demo", 1, 1).unwrap();
+        append_heartbeat_event("demo", 1, 1, None).unwrap();
         append_external_event("project=demo workspace=alpha pane_alive=false reason=signal:SIGHUP")
             .unwrap();
         append_external_event("project=demo workspace=review server_alive=false reason=exit:1")

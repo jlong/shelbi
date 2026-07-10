@@ -1,0 +1,113 @@
+Zen: auto-promote eligible backlog and run the merge-conditions flow on handoff without asking; only stop for danger paths, review-workspace tasks, or genuine ambiguity.
+
+# Zen Mode policy
+
+This file is the source of truth for what Zen Mode means in **this** project.
+The orchestrator reads it (and re-reads it periodically, prompted by the
+heartbeat) to keep its behavior aligned with your intent. The Rust side never
+inspects the prose below, so edit it freely to tune Zen for your project.
+
+The **first line of this file is the one-line summary** the heartbeat echoes
+back to the orchestrator every few ticks. Keep it a single line and keep it
+accurate: if you change what Zen means here, change that line too, because that
+is what gets re-injected as a live reminder.
+
+When Zen is on the orchestrator acts as lead rather than scheduler. It may:
+
+1. Auto-merge work that passes the merge-conditions flow below.
+2. Auto-promote `backlog`-category tasks into `ready` when they fit at least
+   one of the judgment categories below.
+
+When Zen is `paused` it stops starting new auto-promotions but keeps applying
+the merge-conditions flow to in-flight tasks that reach `handoff`. When Zen is
+`off` the orchestrator is a plain scheduler: it dispatches what you promote and
+leaves handoffs for you.
+
+## Auto-promote judgment categories
+
+The mechanical eligibility scan (`shelbi zen scan`) hands the orchestrator
+`backlog`-category task ids that are safe from a state-machine standpoint: not
+blocked, not opt-out, no file overlap with anything in flight. From that list,
+**only auto-promote** a candidate if **at least one** of these is true:
+
+1. **It's the kind of work the user generally trusts you with.** Look at the
+   `done`-category column. Does the user routinely accept tasks of this shape
+   without changes? (Examples: docs typo fixes, dependency bumps, content
+   sweeps that match a recently-stated convention.) If their done-history shows
+   pattern acceptance, this is in scope.
+2. **It's part of fixing an issue the user recently raised.** Did the user
+   mention this bug, feature, or concern in conversation in the last few turns?
+   Tasks that respond to something the user explicitly asked for are in scope.
+3. **It's part of a larger body of work the user explicitly kicked off.** If
+   the user filed a batch of related tasks (e.g. 13 vs-pages, a multi-step
+   refactor), the remaining items in that batch are in scope.
+
+If a candidate fits none of these, **leave it in `backlog`** and surface it in
+your next user-facing reply: *"I considered promoting `<task>` but wasn't sure
+if it fits your intent, want me to?"* Also emit
+`reason=orchestrator:zen-decline reason-text=<short>` on the task so the
+activity feed shows what you considered.
+
+For ones you do promote, run `shelbi task move <id> --to <ready-status>
+--reason "orchestrator:zen-promote category=<n>"` (`<ready-status>` is the
+literal `ready`-category status name from the active workflow, `todo` in the
+default) and then dispatch per the normal auto-dispatch contract.
+
+## Merge conditions
+
+**First, the review-workspace gate.** If the project declares review
+workspaces, a task reaching `handoff` is destined for a **human** to inspect on
+a running server, that's the entire point of the review workspace. So do
+**not** run the merge-conditions flow on it, and do **not** merge it: leave it
+in the review status for the human to load from the sidebar and resolve (there
+is no `shelbi review` command for you to run). The human accepts by moving it
+to `done` (which is when it merges per existing rules) or bounces it back to
+`ready`. Zen never auto-merges a review-routed task out from under the human.
+Only when the project has **no** review workspace does `handoff` mean "ready to
+auto-merge", the case the rest of this section covers.
+
+When a task enters `handoff` and Zen is on (and the project has no review
+workspaces), run `shelbi zen probe <task-id>` to get a JSON report covering
+local checks, merge conflicts, diff size, and danger-path matches. Apply these
+conditions to the report:
+
+1. **All `local_checks` must have `exit_code == 0`.** If any failed, leave in
+   `handoff` and emit `reason=zen:failed-checks` with the failing command +
+   output tail.
+2. **`merge_conflict.conflicts` must be `false`.** Otherwise emit
+   `reason=zen:merge-conflict` with the files.
+3. **`diff_size.files` <= 30 AND `diff_size.lines_added + lines_removed` <=
+   2000.** Otherwise emit `reason=zen:diff-too-large` with the stats.
+4. **`danger_paths.matched` must be empty.** Otherwise emit
+   `reason=zen:danger-path` with the paths.
+
+If all pre-PR conditions pass:
+
+5. Run `shelbi zen pr-create <task-id>` to push + open the PR. Capture the PR
+   number it prints.
+6. Run `shelbi zen ci-watch <pr-number> --timeout 15m`. Stdout is `green`,
+   `red:<check>:<summary>`, or `timeout`. The condition: must be `green`.
+7. If green: run `shelbi zen pr-merge <pr-number>` to squash + delete branch.
+   Move the task into `done` and emit `reason=orchestrator:zen-merge` with the
+   merge SHA. The command appends a `next eligible:` list to its stdout, read
+   it before moving on.
+8. If red or timeout: leave in `handoff`; emit `reason=zen:failed-checks` (red)
+   or `reason=zen:ci-timeout`.
+
+## Customization
+
+Edit this file to tune Zen Mode per project. The prose is the source of truth
+for both auto-promote and merge policy, and for the one-line summary at the
+top.
+
+- **Summary line** — rewrite the first line to match whatever policy you set
+  below. It is what the heartbeat re-injects, so it is the fastest lever on the
+  orchestrator's live behavior.
+- **Auto-promote judgment categories** — add ("anything tagged `automation:`
+  is always in scope"), tighten ("only auto-promote if the user has accepted
+  >=3 tasks of this shape without changes"), or replace the list entirely.
+- **Merge conditions** — raise/lower the diff-size thresholds, accept partial
+  CI red ("if only the integration-test job is red, treat as green"), add new
+  pre-merge probes ("before merging anything touching `migrations/`, also
+  require a passing `shelbi db dry-run`"), or change which conditions are
+  strict vs warnings.

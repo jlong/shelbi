@@ -728,16 +728,70 @@ pub fn append_zen_dryrun_event(task_id: &str, action: &str, detail: &str) -> Res
 /// back into the scan loop. The tokens are appended after the `heartbeat`
 /// keyword so existing parsers that key off the leading `project=<name>
 /// heartbeat` prefix keep working.
+///
+/// `zen` is `Some(..)` only while Zen Mode is On, in which case a `zen=on`
+/// token is inserted right after `heartbeat` and a trailing reminder may be
+/// appended per the [`ZenHeartbeatCue`] variant (the poller drives the two
+/// re-injection cadences). When Zen is Off the caller passes `None` and the
+/// line is byte-identical to the pre-Zen-pairing shape.
 pub fn append_heartbeat_event(
     project: &str,
     zen_eligible: usize,
     idle_workspaces: usize,
+    zen: Option<ZenHeartbeatCue>,
 ) -> Result<()> {
     let ts = Utc::now().to_rfc3339();
     let project = sanitize_field(project);
-    append_event_line(&format!(
-        "{ts} project={project} heartbeat zen_eligible={zen_eligible} idle_workspaces={idle_workspaces}"
-    ))
+    // `zen=on` is emitted only when Zen Mode is On (the poller passes
+    // `Some(..)` in that case). A Zen-off heartbeat carries no zen token at
+    // all, so its line shape is byte-identical to the pre-Zen-pairing form.
+    let zen_marker = if zen.is_some() { " zen=on" } else { "" };
+    let mut line = format!(
+        "{ts} project={project} heartbeat{zen_marker} zen_eligible={zen_eligible} idle_workspaces={idle_workspaces}"
+    );
+    // The reminder is trailing free text (introduced by ` — `) so it stays
+    // human-readable for the orchestrator rather than underscore-folded; the
+    // structured `key=value` tokens above are unaffected. `Plain` adds
+    // nothing beyond `zen=on`.
+    match zen {
+        Some(ZenHeartbeatCue::Summary(summary)) => {
+            // The summary is the first line of `zenmode.md` (already a single
+            // line); collapse any stray whitespace so the record can't be
+            // torn across lines.
+            let summary = summary.split_whitespace().collect::<Vec<_>>().join(" ");
+            if !summary.is_empty() {
+                line.push_str(" — ");
+                line.push_str(&summary);
+            }
+        }
+        Some(ZenHeartbeatCue::Reread) => {
+            line.push_str(" — re-read zenmode.md now to refresh Zen policy");
+        }
+        Some(ZenHeartbeatCue::Plain) | None => {}
+    }
+    append_event_line(&line)
+}
+
+/// Reminder appended to a heartbeat line while Zen Mode is On. Off-mode
+/// heartbeats pass `None` to [`append_heartbeat_event`] and carry no zen
+/// tokens at all. The poller decides which variant to emit on two cadences
+/// (see its `maybe_emit_heartbeat`): the one-line [`Summary`] roughly every
+/// few heartbeats, the full [`Reread`] instruction roughly hourly, and
+/// [`Plain`] (bare `zen=on`) on the ticks in between.
+///
+/// [`Summary`]: ZenHeartbeatCue::Summary
+/// [`Reread`]: ZenHeartbeatCue::Reread
+/// [`Plain`]: ZenHeartbeatCue::Plain
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ZenHeartbeatCue {
+    /// Zen on, no extra reminder this tick — the line carries only `zen=on`.
+    Plain,
+    /// Append the one-line Zen summary (the first line of `zenmode.md`, read
+    /// fresh) as a live reminder of what Zen means for this project.
+    Summary(String),
+    /// Append the instruction to re-read `zenmode.md` in full now — the
+    /// deeper periodic refresh of Zen policy.
+    Reread,
 }
 
 /// Append `<rfc3339> dispatch task=<id> workspace=<name> status=<status> detail=<detail>`
@@ -1187,7 +1241,7 @@ mod tests {
         };
         std::env::set_var(ORCH_EVENT_CALLBACK_SOCK_ENV, &sock);
 
-        append_heartbeat_event("demo", 3, 4).unwrap();
+        append_heartbeat_event("demo", 3, 4, None).unwrap();
 
         let (stream, _) = listener.accept().unwrap();
         let mut line = String::new();
@@ -2258,8 +2312,8 @@ mod tests {
         let home = fresh_home();
         std::env::set_var("SHELBI_HOME", &home);
 
-        append_heartbeat_event("myapp", 5, 4).unwrap();
-        append_heartbeat_event("myapp", 0, 0).unwrap();
+        append_heartbeat_event("myapp", 5, 4, None).unwrap();
+        append_heartbeat_event("myapp", 0, 0, None).unwrap();
 
         let log = std::fs::read_to_string(events_log_path().unwrap()).unwrap();
         let lines: Vec<&str> = log.lines().collect();
@@ -2281,6 +2335,59 @@ mod tests {
             chrono::DateTime::parse_from_rfc3339(ts)
                 .unwrap_or_else(|_| panic!("not rfc3339: {ts}"));
         }
+
+        std::env::remove_var("SHELBI_HOME");
+    }
+
+    #[test]
+    fn heartbeat_zen_cues_write_expected_shapes() {
+        // Zen-on heartbeats carry a `zen=on` marker right after `heartbeat`.
+        // Plain adds nothing more; Summary appends the one-line reminder;
+        // Reread appends the full re-read instruction. Zen-off stays bare.
+        let _g = TEST_LOCK.lock().unwrap();
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+
+        append_heartbeat_event("myapp", 2, 1, Some(ZenHeartbeatCue::Plain)).unwrap();
+        append_heartbeat_event(
+            "myapp",
+            2,
+            1,
+            Some(ZenHeartbeatCue::Summary("Zen: do the thing.".into())),
+        )
+        .unwrap();
+        append_heartbeat_event("myapp", 2, 1, Some(ZenHeartbeatCue::Reread)).unwrap();
+        append_heartbeat_event("myapp", 2, 1, None).unwrap();
+
+        let log = std::fs::read_to_string(events_log_path().unwrap()).unwrap();
+        let lines: Vec<&str> = log.lines().collect();
+        assert_eq!(lines.len(), 4);
+        assert!(
+            lines[0].ends_with(" project=myapp heartbeat zen=on zen_eligible=2 idle_workspaces=1"),
+            "plain: {}",
+            lines[0]
+        );
+        assert!(
+            lines[1].ends_with(
+                " project=myapp heartbeat zen=on zen_eligible=2 idle_workspaces=1 — Zen: do the thing."
+            ),
+            "summary: {}",
+            lines[1]
+        );
+        assert!(
+            lines[2].ends_with(
+                " project=myapp heartbeat zen=on zen_eligible=2 idle_workspaces=1 — re-read zenmode.md now to refresh Zen policy"
+            ),
+            "reread: {}",
+            lines[2]
+        );
+        // Zen off: no `zen=on`, no reminder — the pre-Zen-pairing shape.
+        assert!(
+            lines[3].ends_with(" project=myapp heartbeat zen_eligible=2 idle_workspaces=1"),
+            "off: {}",
+            lines[3]
+        );
+        assert!(!lines[3].contains("zen=on"), "off must not carry zen=on");
 
         std::env::remove_var("SHELBI_HOME");
     }

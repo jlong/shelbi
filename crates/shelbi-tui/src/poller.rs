@@ -67,7 +67,8 @@ use shelbi_orchestrator::supervision::{SupervisionAction, SupervisionInputs, Sup
 use shelbi_state::{
     append_heartbeat_event, append_rebase_event, append_workspace_dialog_event,
     append_workspace_event, append_workspace_pause_event, events_log_path, load_workspace_status,
-    parse_pane_title_marker, save_workspace_status, WorkspaceState, WorkspaceStatus,
+    parse_pane_title_marker, read_state, read_zenmode_summary, save_workspace_status,
+    WorkspaceState, WorkspaceStatus, ZenHeartbeatCue, ZenModeState,
 };
 
 /// How often each per-workspace thread re-verifies its host's reverse
@@ -296,12 +297,23 @@ fn run_workspace_poll_loop(
     }
 }
 
+/// How often (in emitted Zen-on heartbeats) the one-line `zenmode.md`
+/// summary is re-injected. The cheap, frequent reminder of what Zen means:
+/// every Nth Zen heartbeat carries the summary; the ticks in between carry a
+/// bare `zen=on`. Tunable here rather than hardcoded inline at the callsite.
+const ZEN_SUMMARY_EVERY_N_HEARTBEATS: u32 = 3;
+
+/// How often the fuller "re-read `zenmode.md` now" instruction is injected
+/// while Zen is on — the deeper periodic refresh of Zen policy, layered over
+/// the frequent summary reminder. Tunable here rather than hardcoded inline.
+const ZEN_REREAD_INTERVAL: Duration = Duration::from_secs(60 * 60);
+
 /// Adaptive heartbeat cadence state, threaded across supervisor ticks.
 ///
 /// The cadence is `standard` (from config) whenever there's supervisable work
 /// in flight, and backs off exponentially — doubling each idle tick, capped at
 /// the configured `max` — while the board is quiescent. Any real event resets
-/// it to `standard`. This struct carries the three things that survive between
+/// it to `standard`. This struct carries the things that survive between
 /// ticks; the state machine lives in [`maybe_emit_heartbeat`].
 #[derive(Default)]
 struct HeartbeatSchedule {
@@ -319,6 +331,15 @@ struct HeartbeatSchedule {
     /// Advanced on seed / emit / reset so pre-existing history and an already-
     /// consumed event can't be mistaken for fresh activity.
     last_log_mtime: Option<SystemTime>,
+    /// Count of Zen-on heartbeats emitted so far (reset to 0 whenever Zen is
+    /// observed off). Drives the every-Nth-heartbeat summary cadence.
+    zen_heartbeats: u32,
+    /// When the last full re-read instruction was injected. `None` until the
+    /// first Zen-on heartbeat seeds it (so the first re-read waits a full
+    /// [`ZEN_REREAD_INTERVAL`] rather than firing immediately); reset to
+    /// `None` whenever Zen is observed off so re-enabling Zen doesn't fire a
+    /// re-read off a stale, hour-old timestamp.
+    zen_last_reread: Option<Instant>,
 }
 
 /// Consider emitting one heartbeat for `project`. Called once per poller
@@ -407,7 +428,13 @@ fn maybe_emit_heartbeat(
         .map(|ids| ids.len())
         .unwrap_or(0);
     let idle_workspaces = shelbi_state::idle_workspace_count(project).unwrap_or(0);
-    if let Err(e) = append_heartbeat_event(&project.name, zen_eligible, idle_workspaces) {
+    // Zen-pairing: only while Zen Mode is On does the heartbeat carry a
+    // `zen=on` marker and (on two cadences) a re-injected reminder of what
+    // Zen means. Off / paused / an unreadable state.json all leave the line
+    // in its plain shape. Computed here — the cadence counters live in the
+    // schedule — so the summary/reread decision is one place, not inline.
+    let zen_cue = zen_heartbeat_cue(project, schedule, now);
+    if let Err(e) = append_heartbeat_event(&project.name, zen_eligible, idle_workspaces, zen_cue) {
         tracing::warn!(
             project = %project.name,
             error = %e,
@@ -427,6 +454,64 @@ fn maybe_emit_heartbeat(
     };
     schedule.interval = Some(next_interval);
     schedule.next_attempt = Some(now + next_interval);
+}
+
+/// Decide the Zen reminder to attach to this heartbeat and advance the Zen
+/// cadence counters in `schedule`. Called only from the emit path of
+/// [`maybe_emit_heartbeat`], so every call corresponds to a heartbeat that
+/// is actually being written.
+///
+/// Returns `None` — a plain heartbeat with no `zen=on` marker at all — when
+/// Zen Mode is not `On` (off, paused, or an unreadable `state.json`), and
+/// resets the Zen cadence so a later off→on re-enable starts clean. When Zen
+/// is `On`, advances `zen_heartbeats` and returns, in priority order:
+///
+/// 1. [`ZenHeartbeatCue::Reread`] once at least [`ZEN_REREAD_INTERVAL`] has
+///    elapsed since the last full re-read injection (the deeper hourly
+///    refresh, which subsumes the summary);
+/// 2. [`ZenHeartbeatCue::Summary`] on every
+///    [`ZEN_SUMMARY_EVERY_N_HEARTBEATS`]th Zen heartbeat — the one-line
+///    `zenmode.md` summary read *fresh* so a user's edit to the first line
+///    shows up without a reload, degrading to `Plain` if it can't be read;
+/// 3. [`ZenHeartbeatCue::Plain`] (bare `zen=on`) on the ticks in between.
+fn zen_heartbeat_cue(
+    project: &Project,
+    schedule: &mut HeartbeatSchedule,
+    now: Instant,
+) -> Option<ZenHeartbeatCue> {
+    let zen_on = read_state(&project.name)
+        .map(|s| s.zen_mode == ZenModeState::On)
+        .unwrap_or(false);
+    if !zen_on {
+        schedule.zen_heartbeats = 0;
+        schedule.zen_last_reread = None;
+        return None;
+    }
+
+    schedule.zen_heartbeats = schedule.zen_heartbeats.saturating_add(1);
+
+    // Seed the re-read timer on the first Zen heartbeat so the first re-read
+    // waits a full interval rather than firing immediately.
+    let reread_due = match schedule.zen_last_reread {
+        None => {
+            schedule.zen_last_reread = Some(now);
+            false
+        }
+        Some(t) => now.saturating_duration_since(t) >= ZEN_REREAD_INTERVAL,
+    };
+    if reread_due {
+        schedule.zen_last_reread = Some(now);
+        return Some(ZenHeartbeatCue::Reread);
+    }
+
+    if schedule.zen_heartbeats % ZEN_SUMMARY_EVERY_N_HEARTBEATS == 0 {
+        return match read_zenmode_summary(&project.name) {
+            Ok(Some(summary)) => Some(ZenHeartbeatCue::Summary(summary)),
+            _ => Some(ZenHeartbeatCue::Plain),
+        };
+    }
+
+    Some(ZenHeartbeatCue::Plain)
 }
 
 /// True iff `events.log` advanced past `baseline` — i.e. a real event landed
@@ -2200,6 +2285,138 @@ transitions:
     }
 
     #[test]
+    fn zen_heartbeat_cue_only_fires_when_zen_is_on() {
+        // Zen off (no state.json) → no cue at all, and any stale Zen cadence
+        // counters are cleared so a later off→on re-enable starts fresh.
+        let _g = crate::test_support::ENV_LOCK.lock().unwrap();
+        let home = std::env::temp_dir().join(format!(
+            "shelbi-poller-zencue-off-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&home).unwrap();
+        std::env::set_var("SHELBI_HOME", &home);
+        let work_dir = home.join("repo");
+        std::fs::create_dir_all(&work_dir).unwrap();
+        let project = local_project(&work_dir);
+
+        let mut hb = HeartbeatSchedule {
+            zen_heartbeats: 5,
+            zen_last_reread: Some(Instant::now()),
+            ..HeartbeatSchedule::default()
+        };
+        assert_eq!(zen_heartbeat_cue(&project, &mut hb, Instant::now()), None);
+        assert_eq!(hb.zen_heartbeats, 0, "off must reset the summary counter");
+        assert_eq!(hb.zen_last_reread, None, "off must reset the reread timer");
+
+        std::env::remove_var("SHELBI_HOME");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn zen_heartbeat_cue_summary_and_reread_cadences() {
+        let _g = crate::test_support::ENV_LOCK.lock().unwrap();
+        let home = std::env::temp_dir().join(format!(
+            "shelbi-poller-zencue-on-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&home).unwrap();
+        std::env::set_var("SHELBI_HOME", &home);
+        let work_dir = home.join("repo");
+        std::fs::create_dir_all(&work_dir).unwrap();
+        let project = local_project(&work_dir);
+
+        shelbi_state::set_zen_mode("demo", ZenModeState::On, "test").unwrap();
+        shelbi_state::scaffold_zenmode("demo").unwrap();
+        let summary = shelbi_state::read_zenmode_summary("demo").unwrap().unwrap();
+
+        let mut hb = HeartbeatSchedule::default();
+        let t0 = Instant::now();
+
+        // Summary cadence: bare `zen=on` on the ticks in between, the one-line
+        // summary on every ZEN_SUMMARY_EVERY_N_HEARTBEATS-th Zen heartbeat.
+        // The first tick also seeds the reread timer.
+        for i in 1..ZEN_SUMMARY_EVERY_N_HEARTBEATS {
+            assert_eq!(
+                zen_heartbeat_cue(&project, &mut hb, t0),
+                Some(ZenHeartbeatCue::Plain),
+                "heartbeat {i} should be plain"
+            );
+        }
+        assert!(hb.zen_last_reread.is_some(), "first Zen tick seeds reread");
+        assert_eq!(
+            zen_heartbeat_cue(&project, &mut hb, t0),
+            Some(ZenHeartbeatCue::Summary(summary.clone())),
+            "Nth heartbeat carries the fresh summary"
+        );
+
+        // Reread cadence: once the interval elapses the next tick injects the
+        // full re-read cue (subsuming the summary), then the timer resets so
+        // the following tick is not another reread.
+        let later = t0 + ZEN_REREAD_INTERVAL;
+        assert_eq!(
+            zen_heartbeat_cue(&project, &mut hb, later),
+            Some(ZenHeartbeatCue::Reread),
+        );
+        assert!(
+            !matches!(
+                zen_heartbeat_cue(&project, &mut hb, later),
+                Some(ZenHeartbeatCue::Reread)
+            ),
+            "reread must not fire twice back-to-back"
+        );
+
+        std::env::remove_var("SHELBI_HOME");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn zen_heartbeat_cue_degrades_to_plain_when_zenmode_missing() {
+        // Zen on but no zenmode.md on disk (e.g. before the next reload
+        // materializes it): the summary tick degrades to a bare `zen=on`
+        // rather than dropping the heartbeat.
+        let _g = crate::test_support::ENV_LOCK.lock().unwrap();
+        let home = std::env::temp_dir().join(format!(
+            "shelbi-poller-zencue-missing-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&home).unwrap();
+        std::env::set_var("SHELBI_HOME", &home);
+        let work_dir = home.join("repo");
+        std::fs::create_dir_all(&work_dir).unwrap();
+        let project = local_project(&work_dir);
+
+        shelbi_state::set_zen_mode("demo", ZenModeState::On, "test").unwrap();
+        // Deliberately do NOT scaffold zenmode.md.
+        assert_eq!(shelbi_state::read_zenmode_summary("demo").unwrap(), None);
+
+        let mut hb = HeartbeatSchedule::default();
+        let t0 = Instant::now();
+        for _ in 1..ZEN_SUMMARY_EVERY_N_HEARTBEATS {
+            zen_heartbeat_cue(&project, &mut hb, t0);
+        }
+        // The summary tick lands on Plain because the file can't be read.
+        assert_eq!(
+            zen_heartbeat_cue(&project, &mut hb, t0),
+            Some(ZenHeartbeatCue::Plain),
+        );
+
+        std::env::remove_var("SHELBI_HOME");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
     fn maybe_emit_heartbeat_debounces_against_recent_activity() {
         // A workspace transition lands in events.log moments before the
         // heartbeat attempt — the heartbeat must skip this consideration
@@ -2271,6 +2488,7 @@ transitions:
             next_attempt: Some(Instant::now() - Duration::from_secs(60)),
             interval: Some(Duration::from_secs(180)),
             last_log_mtime: None,
+            ..HeartbeatSchedule::default()
         };
         maybe_emit_heartbeat(&project, &mut hb, || true);
         assert!(

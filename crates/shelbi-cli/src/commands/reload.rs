@@ -55,6 +55,16 @@ pub fn run(project_opt: Option<String>) -> Result<()> {
     if !statuses_path.exists() {
         shelbi_state::scaffold_project_statuses(&project_name).map_err(|e| anyhow!(e))?;
     }
+    // Self-heal `zenmode.md` for projects that predate it — written only when
+    // absent, so a user's edits (including the first-line Zen summary the
+    // heartbeat re-injects) are preserved byte-for-byte, same as
+    // `instructions.md`.
+    if shelbi_state::scaffold_zenmode(&project_name).map_err(|e| anyhow!(e))?
+        == shelbi_state::ZenmodeOutcome::Created
+    {
+        let zenmode_path = shelbi_state::zenmode_path(&project_name).map_err(|e| anyhow!(e))?;
+        println!("✓ wrote Zen policy: {} (was missing)", zenmode_path.display());
+    }
     let outcomes = shelbi_state::self_heal_default_agents(&project_name).map_err(|e| anyhow!(e))?;
     let report = shelbi_orchestrator::reload(&project_name).map_err(|e| anyhow!(e))?;
     print_report(&project_name, &report);
