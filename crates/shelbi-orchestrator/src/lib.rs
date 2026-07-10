@@ -1905,6 +1905,35 @@ mod ensure_hidden_views_tmux_tests {
             .output();
     }
 
+    /// Create a detached session named `name` (first window `win`, running a
+    /// long `sleep`) and block until tmux reports it live. `tmux new-session`
+    /// can exit non-zero under parallel CI load — several tmux tests racing to
+    /// fork the shared server hit a transient window where the client can't
+    /// reach the half-started server, or trips a stale-socket error. A bare
+    /// `.status().unwrap()` swallows that non-zero exit, leaving the session
+    /// absent; `ensure_hidden_views` then fails to `set-environment` on it and
+    /// panics far from the real cause. Retry the create until `has-session`
+    /// confirms it, so callers never race an unregistered session.
+    fn start_session(name: &str, win: &str) {
+        for _ in 0..50 {
+            let _ = std::process::Command::new("tmux")
+                .args([
+                    "new-session", "-d", "-s", name, "-n", win, "sh", "-c", "sleep 30",
+                ])
+                .status();
+            let live = std::process::Command::new("tmux")
+                .args(["has-session", "-t", name])
+                .output()
+                .map(|o| o.status.success())
+                .unwrap_or(false);
+            if live {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        panic!("tmux session `{name}` never came up");
+    }
+
     fn pane_count(session_win: &str) -> usize {
         let out = std::process::Command::new("tmux")
             .args(["list-panes", "-t", session_win, "-F", "#{pane_id}"])
@@ -1935,20 +1964,7 @@ mod ensure_hidden_views_tmux_tests {
         let stash = format!("_{vis}");
         kill_session(&vis);
         kill_session(&stash);
-        std::process::Command::new("tmux")
-            .args([
-                "new-session",
-                "-d",
-                "-s",
-                &vis,
-                "-n",
-                "dashboard",
-                "sh",
-                "-c",
-                "sleep 30",
-            ])
-            .status()
-            .unwrap();
+        start_session(&vis, "dashboard");
 
         ensure_hidden_views(&Host::Local, &vis, "proj", "shelbi").unwrap();
 
@@ -1987,36 +2003,10 @@ mod ensure_hidden_views_tmux_tests {
         let stash = format!("_{vis}");
         kill_session(&vis);
         kill_session(&stash);
-        std::process::Command::new("tmux")
-            .args([
-                "new-session",
-                "-d",
-                "-s",
-                &vis,
-                "-n",
-                "dashboard",
-                "sh",
-                "-c",
-                "sleep 30",
-            ])
-            .status()
-            .unwrap();
+        start_session(&vis, "dashboard");
         // Stash exists with a lone seed pane and NO env pinned — the
         // "half-created view stash" the old early-return never healed.
-        std::process::Command::new("tmux")
-            .args([
-                "new-session",
-                "-d",
-                "-s",
-                &stash,
-                "-n",
-                "views",
-                "sh",
-                "-c",
-                "sleep 30",
-            ])
-            .status()
-            .unwrap();
+        start_session(&stash, "views");
         assert_eq!(pane_count(&format!("{stash}:views")), 1);
 
         ensure_hidden_views(&Host::Local, &vis, "proj", "shelbi").unwrap();
@@ -2062,20 +2052,7 @@ mod ensure_hidden_views_tmux_tests {
         let stash = format!("_{vis}");
         kill_session(&vis);
         kill_session(&stash);
-        std::process::Command::new("tmux")
-            .args([
-                "new-session",
-                "-d",
-                "-s",
-                &vis,
-                "-n",
-                "dashboard",
-                "sh",
-                "-c",
-                "sleep 30",
-            ])
-            .status()
-            .unwrap();
+        start_session(&vis, "dashboard");
 
         // Build a full stash first.
         ensure_hidden_views(&Host::Local, &vis, "proj", "shelbi").unwrap();
