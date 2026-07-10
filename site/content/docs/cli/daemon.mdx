@@ -39,6 +39,36 @@ Every subcommand accepts the same options:
 | `--root <PATH>` | string | install-time default / `$SHELBI_ROOT` / `~/.shelbi` | Override the Shelbi root directory. The flag wins over both the env var and the compile-time default. |
 | `-p, --project <PROJECT>` | string | env / cwd lookup | Project to operate on. |
 
+## Reverse-forward health and tuning
+
+Every shelbi-routed `ssh` invocation carries a reverse forward so remote workers
+can write to the hub's events log over the multiplexed channel. The TUI poller
+rechecks that forward on a slow cadence and repairs it if it has gone stale.
+
+Two failure modes are transient (direct SSH stays healthy) but were noisy in the
+events log, so the recheck now handles them explicitly:
+
+- A flaky `master_open` is retried with exponential backoff before it is
+  reported. A blip that self-heals is logged once as
+  `detail=master_open_recovered attempts=N status=established`; only an outage
+  that survives the whole retry budget logs `detail=master_open_failed
+  attempts=N status=failed`.
+- Loopback-port exhaustion on a TCP-fallback host is now surfaced distinctly as
+  `detail=loopback_port_exhausted band=<lo>-<hi>` rather than the ambiguous old
+  "no free loopback port in band" line, so it reads apart from a master-open
+  blip. Before allocating, the recheck reclaims the port its own prior master
+  was holding, then sweeps the configured band.
+
+These environment variables tune the behavior (all optional; sensible defaults
+apply):
+
+| Variable | Default | Description |
+| --- | --- | --- |
+| `SHELBI_FORWARD_RETRY_ATTEMPTS` | `3` | Master-open attempts before a transient failure is reported. Clamped to `1..=10`. |
+| `SHELBI_FORWARD_RETRY_BACKOFF_MS` | `250` | Base backoff between attempts; doubles each retry. Clamped to `<= 5000`. |
+| `SHELBI_TCP_FORWARD_PORT_BASE` | `47100` | First loopback port for a TCP-fallback forward. |
+| `SHELBI_TCP_FORWARD_PORT_SPAN` | `64` | Width of the loopback band swept on a bind collision. Widen this if you see `loopback_port_exhausted`. |
+
 ## Examples
 
 Install the supervisor unit so the daemon auto-starts at login and restarts on
