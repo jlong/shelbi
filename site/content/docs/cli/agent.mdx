@@ -11,8 +11,9 @@ shelbi agent <SUBCOMMAND> [OPTIONS]
 `shelbi agent` manages the [agents](/docs/concepts/agents) a project ships
 with: the roles (a system prompt plus an optional skill set) a
 [workspace](/docs/concepts/workspaces) loads when it picks up a task. Every
-project starts with four (`orchestrator`, `developer`, `qa`,
-`security-review`), and these subcommands surface them and let you author more.
+project starts with six (`orchestrator`, `developer`, `review`, `qa`,
+`security`, `adversarial`), and these subcommands surface them and let you
+author more.
 
 Agents live under the project's `agents/` directory:
 `~/.shelbi/projects/<project>/agents/<name>/` in the default
@@ -42,8 +43,10 @@ has been customized away from the bundled default.
 AGENT          STATUSES                   SKILLS  CUSTOMIZED
 orchestrator   -                          0       no
 developer      InProgress, Todo           0       no
-qa             Review                     0       no
-security-review -                         0       no
+review         Review                     1       no
+qa             -                          0       no
+security       -                          0       no
+adversarial    -                          0       no
 ```
 
 The `CUSTOMIZED` column reads:
@@ -144,7 +147,7 @@ statuses:
 
 ## See also
 
-- [Agents](/docs/concepts/agents) — what an agent is, the four shipped
+- [Agents](/docs/concepts/agents) — what an agent is, the six shipped
   roles, on-disk layout, and the customization story.
 - [Workflows](/docs/guides/getting-started/workflows#owners-and-agents) — the `owner` +
   `agent` fields that route a status to one of these agents.

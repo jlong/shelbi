@@ -1,7 +1,7 @@
 ---
 title: Agents
 order: 11
-summary: An agent is a role — a system prompt plus a skill set — not the task it's handed or the slot it runs in. Shelbi ships three (orchestrator, developer, review); each is a directory you can edit, and you can author more.
+summary: An agent is a role, a system prompt plus a skill set, not the task it's handed or the slot it runs in. Shelbi ships six (orchestrator, developer, review, and the qa, security, and adversarial reviewers); each is a directory you can edit, and you can author more.
 ---
 
 An **agent** is a *role*: a system prompt plus a set of skills. It is the
@@ -21,30 +21,27 @@ on one task and a reviewer agent on the next, and what lets a
 [workflow](/docs/guides/getting-started/workflows#owners-and-agents) say "this status is reviewed by
 the security agent" as a line of YAML rather than a paragraph of prompt prose.
 
-## The three shipped agents
+## The shipped agents
 
-Every project ships with three agents: `orchestrator`, `developer`, and
-`review`. They bracket the loop end to end: schedule the work, build it, serve
-the result for a human. They're the defaults the generic machinery wires up
-unless you say otherwise.
+Every project ships with six agents. Three run the core loop, and three
+are specialized reviewers:
 
 | Agent | Role |
 | --- | --- |
 | `orchestrator` | The agent you talk to. Turns requests into cards, dispatches tasks to free workspaces, tails the events log, reports back. Runs in window 1, never in a workspace. See [Orchestrator](/docs/concepts/orchestrator). |
 | `developer` | The default workspace agent. Implements a task on its branch, runs the project's checks, writes the review-ready marker. This is the agent an `agent`-owned status uses when no other is named. |
-| `review` | The agent named by a review status, run on a [review workspace](/docs/concepts/review-workspaces). Its charter is to make the finished branch runnable for a human — the dev server itself is booted by the status's transition commands — and to hand over a working URL. It doesn't write code (bar an explicitly requested tweak). |
+| `review` | The agent named by a review status, run on a [review workspace](/docs/concepts/review-workspaces). Its charter is to make the finished branch runnable for a human. The dev server itself is booted by the status's transition commands, and it hands over a working URL. It doesn't write code (bar an explicitly requested tweak). |
+| `qa` | Exercises a finished change against its acceptance criteria and reports pass or fail with concrete repro steps. It verifies, it doesn't rewrite. |
+| `security` | A defensive-only review of the diff: injection, broken authorization, leaked secrets, unsafe deserialization, path traversal, risky dependencies. Reports findings with severity and location. It does not write exploits. |
+| `adversarial` | An automated skeptic. It tries to refute the change, defaulting to skeptical, and states what breaks and how to reproduce it, labeling confirmed versus suspected. |
 
-`developer` runs most often; `orchestrator` and `review` bracket it.
-
-Reviewer roles aren't shipped, but they're a `shelbi agent new` away, and
-because an agent is just a role, an authored one slots into the loop exactly
-like a built-in. Two common ones:
-
-- **`qa`** exercises a finished branch against acceptance criteria before it
-  reaches a human. Point a `handoff`-category status at it.
-- **`security-review`**: a focused adversarial pass for sensitive diffs (auth,
-  migrations, install scripts). Pair it with a status, or a danger-path-heavy
-  workflow, where the extra latency is worth it.
+`developer` runs most often; `orchestrator` and `review` bracket it. The
+three reviewers ship materialized but unwired: they sit in the agents
+directory ready to use, and none governs a column until you name it on a
+status's [`agent:`](#assigning-an-agent-to-work) field. That keeps the
+default board a plain `developer → review` loop, and makes adding a QA,
+Security, or Adversarial gate a one-line YAML edit rather than a
+`shelbi agent new` first.
 
 Which role is loaded shows up in the sidebar next to each busy workspace. The
 same slot runs `developer` on one task and a reviewer role on the next:
@@ -59,7 +56,7 @@ same slot runs `developer` on one task and a reviewer role on the next:
       { name: "charlie", state: "idle" },
     ]},
     { name: "devbox", workspaces: [
-      { name: "delta", state: "working", agent: "security-review" },
+      { name: "delta", state: "working", agent: "security" },
       { name: "echo", state: "idle" },
     ]},
   ]}
@@ -81,7 +78,13 @@ An agent is a directory under the project's Shelbi config:
 ├── review/
 │   ├── instructions.md      # the Review agent's system prompt
 │   └── skills/              # ships a `load-run-detection` skill
-└── qa/                      # ← one you authored with `shelbi agent new`
+├── qa/                      # shipped reviewer preset
+│   └── instructions.md
+├── security/                # shipped reviewer preset
+│   └── instructions.md
+├── adversarial/             # shipped reviewer preset
+│   └── instructions.md
+└── perf/                    # ← one you authored with `shelbi agent new`
     └── instructions.md
 ```
 
@@ -101,10 +104,10 @@ is rendered the same way; it's just the agent that happens to run in window 1.
 ## Customizing an agent
 
 Agents are **project-local with shipped defaults**. The first time a project
-loads, Shelbi materializes the three default agents into the directory above.
+loads, Shelbi materializes the six default agents into the directory above.
 From then on they're yours to edit: change `developer/instructions.md` to
 bake in your repo's conventions, drop a skill into a role's `skills/`, tighten
-an authored `security-review` prompt to your threat model.
+the shipped `security` prompt to your threat model.
 
 The defaults are *seeded, not enforced*. On upgrade, Shelbi only writes an
 agent file that doesn't already exist. It never clobbers a file you've
@@ -115,10 +118,10 @@ put. If you want to reset an agent to the current default, delete its
 Edit an agent by hand, or through the CLI:
 
 ```bash
-shelbi agent list                 # the three shipped, plus any you've added
+shelbi agent list                 # the six shipped, plus any you've added
 shelbi agent show developer       # print instructions.md + skills list
 shelbi agent edit developer       # open instructions.md in $EDITOR
-shelbi agent new qa               # author a reviewer role
+shelbi agent new perf             # author a role of your own
 ```
 
 See the [`shelbi agent`](/docs/cli/agent) reference for the full command set.
@@ -139,10 +142,19 @@ statuses:
 
 `owner: agent` makes a status the orchestrator's to act on; the optional
 `agent:` field names *which* agent does it. Omit `agent:` and the
-`developer` agent is used. The `review` status above is auto-reviewed by a
-`qa` agent you've authored before a human ever sees it. That's the whole "a
-reviewer is a role you can drop on a status" idea, expressed declaratively. See
-[owners](/docs/guides/getting-started/workflows#owners-and-agents) for the rules.
+`developer` agent is used. The `review` status above is auto-reviewed by the
+shipped `qa` agent before a human ever sees it. That's the whole "a
+reviewer is a role you can drop on a status" idea, expressed declaratively.
+
+Because `qa`, `security`, and `adversarial` already ship, opting one onto a
+column is a **one-line edit**: name it on that status's `agent:` field. Point
+a `handoff`- or `active`-category status at `agent: security` for a defensive
+diff pass, or at `agent: adversarial` for an automated skeptic, and the
+orchestrator loads that role into the workspace it dispatches. No
+`shelbi agent new` first. See
+[owners](/docs/guides/getting-started/workflows#owners-and-agents) for the
+rules, and [Doing more with agents](/docs/guides/doing-more-with-agents) for a
+worked wiring example.
 
 ## See also
 

@@ -6,9 +6,11 @@ summary: A per-project YAML that declares the statuses a task moves through, who
 
 A **workflow** is a YAML file that declares the statuses a task moves
 through, who owns each one, and what git side-effects fire on each
-transition. Every project ships with a `default` workflow that matches
-the canonical five-status board (`Backlog → Todo → InProgress → Review
-→ Done`). Drop another YAML next to it and you have a second pipeline:
+transition. `shelbi init` ships two: **`task`**, the review-gated default
+(`Backlog → Todo → In Progress → Review → Done`, plus `Canceled`), and
+**`subtask`**, a lighter flow for a piece of a parent task that opens no PR
+and has no review (see [Shipped workflows](#shipped-workflows-task-and-subtask)
+below). Drop another YAML next to them and you have a third pipeline:
 a docs-only flow, a research pipeline that never opens PRs, a
 feature-stacking flow whose tasks branch off a long-lived feature
 branch.
@@ -42,14 +44,17 @@ When `workflow:` is absent, Shelbi checks the project config for
 
 ```yaml
 # ~/.shelbi/projects/myapp.yaml or <repo>/.shelbi/project.yaml
-default_workflow: app
+default_workflow: task
 ```
 
 That makes new and existing tasks without `workflow:` behave as if they
-declared `workflow: app`. If the project field is omitted, Shelbi keeps the
-backward-compatible built-in fallback of `default`. A configured default must
-name an existing `workflows/<name>.yaml`; if it does not, project loading fails
-with a workflow error instead of silently falling back.
+declared `workflow: task`. Fresh projects get `default_workflow: task`
+written by the scaffold, so the review-gated `task` flow is the default out
+of the box. If the project field is omitted (a pre-existing board that never
+set it), Shelbi keeps the backward-compatible built-in fallback of `default`.
+A configured default must name an existing `workflows/<name>.yaml`; if it does
+not, project loading fails with a workflow error instead of silently falling
+back.
 
 ## Schema
 
@@ -191,8 +196,9 @@ a schema field.
 **`agent: <agent-name>`** names *which* [agent](/docs/concepts/agents) role does
 the work, when `owner: agent`. Omit it and Shelbi derives a default from the
 category (`developer` for `active`, `orchestrator` for `ready`). Name
-one (`qa`, `security-review`, or any agent you've authored) and the
-orchestrator loads *that* role into the workspace it dispatches to. The
+one (a shipped reviewer like `qa`, `security`, or `adversarial`, or any
+agent you've authored) and the orchestrator loads *that* role into the
+workspace it dispatches to. The
 `Review` status above is auto-handled by the `qa` agent before any human is
 involved; that's how "this status is reviewed by QA" becomes a line of YAML
 instead of a paragraph of orchestrator prompt.
@@ -498,38 +504,108 @@ not allowed.** To switch a task into a different workflow, create a
 fresh task in the target workflow (and archive the original if you
 want).
 
-## Default workflow
+## Shipped workflows: task and subtask
 
-Every new project ships with `workflows/default.yaml`:
+Every new project ships two workflow files, and `default_workflow: task`
+is written into the project config so `task` is the default.
+
+### task
+
+`workflows/task.yaml` is the review-gated default: a task branches off
+`main` as `task/<id>`, moves through `Backlog → Todo → In Progress →
+Review → Done` (with a `Canceled` archive status), and squash-merges to
+`main` on accept. It opens exactly one PR, on `In Progress → Review`,
+which is both the review surface and, once accepted, what lands on `main`.
 
 ```yaml
-# workflows/default.yaml — references statuses.yaml (see Schema above)
-name: default
-description: The standard one-track flow shipped with every project.
+# workflows/task.yaml — references statuses.yaml (see Schema above)
+name: task
+description: "Branch work with a review gate: the default track shipped with every project."
+
+git:
+  base_branch: main
+  branch_prefix: task
+  merge_strategy: squash
 
 statuses:
   - { id: backlog,     owner: user,  agent: orchestrator }
   - { id: todo,        owner: agent, agent: orchestrator }
   - { id: in-progress, owner: agent, agent: developer }
-  - { id: review,      owner: user,  agent: orchestrator }
+  - { id: review,      owner: user,  agent: review, tags: [review] }
   - { id: done,        owner: user }
+  - { id: canceled,    owner: user }
+
+transitions:
+  - { from: in-progress, to: review,   actions: [push_branch, open_pr] }
+  - { from: review,      to: done,     actions: [merge, delete_branch] }
+  - { from: in-progress, to: canceled, actions: [close_pr, delete_branch] }
+  - { from: review,      to: canceled, actions: [close_pr, delete_branch] }
 ```
 
-This makes the default an editable file rather than implicit behavior.
-You can rename `Todo` to `Ready` in `statuses.yaml` without breaking
-anything, since the rest of the system reasons in categories.
+The `Review` status is where the review workspace comes in. It's
+`owner: user` (you still own the accept), but it names `agent: review` and
+carries `tags: [review]`. When a task lands here, the orchestrator dispatches
+it to a **`review`-tagged workspace** and loads the [Reviewer
+agent](/docs/concepts/agents), which stands up the running app so you can
+click through the branch before you merge. The scaffold provisions one
+`review`-tagged workspace slot on the hub for exactly this. See
+[Review workspaces](/docs/concepts/review-workspaces) for the tag-matching
+rules and how the dev server is booted.
 
-If a project has no `workflows/` directory at all (legacy state),
-Shelbi auto-generates `default.yaml` on first load. Existing task files
-are not modified. A task with no `workflow:` field is treated as
-belonging to the project default workflow, or `default` when the project
-does not configure one, so there's nothing to backfill.
+To put a shipped reviewer on the board, name it on a status's `agent:`
+field. The three reviewer presets (`qa`, `security`, `adversarial`) ship
+materialized but unwired, so wiring one in is a one-line edit: point a status
+at `agent: qa` (or `security`, or `adversarial`). [Doing more with
+agents](/docs/guides/doing-more-with-agents) walks a full example, including
+adding a dedicated review column and its transitions.
 
-The shipped default omits `transitions:` for a reason: a workflow with
-no transitions block falls back to the legacy 5-status convention for
-Zen Mode's merge-bar trigger (a task in `Review` trips the bar). Once
-you declare a `transitions:` block, the trigger becomes
-action-based exclusively: any edge whose actions include `merge`.
+### subtask
+
+`workflows/subtask.yaml` is for a piece of a parent `task`, done on its own
+branch with **no PR and no review**. A subtask names its parent task's id in
+its `task:` frontmatter, and the templated `base_branch: task/{{task}}`
+resolves to the parent's branch, so the subtask branches from and
+squash-merges directly into that branch, never `main`. Its work surfaces only
+on the parent task's single PR. It's handoff-less by design: it declares no
+`handoff` status, so the hub poller auto-advances a finished worker straight
+to `Done`, firing the merge into the parent branch.
+
+```yaml
+# workflows/subtask.yaml
+name: subtask
+description: A piece of a parent task, squash-merged into the parent's branch with no PR or review.
+
+git:
+  base_branch: task/{{task}}      # resolves to the parent task's branch
+  branch_prefix: subtask
+  merge_strategy: squash
+
+statuses:
+  - { id: backlog,     owner: user,  agent: orchestrator }
+  - { id: todo,        owner: agent, agent: orchestrator }
+  - { id: in-progress, owner: agent, agent: developer }
+  - { id: done,        owner: user }
+  - { id: canceled,    owner: user }
+
+transitions:
+  - { from: in-progress, to: done,     actions: [merge, delete_branch] }
+  - { from: in-progress, to: canceled, actions: [delete_branch] }
+```
+
+Shipping these as editable files makes the default flow a thing you can
+read and change rather than implicit behavior. You can rename `Todo` to
+`Ready` in `statuses.yaml` without breaking anything, since the rest of the
+system reasons in categories.
+
+### The built-in `default` fallback
+
+The `default` workflow name still exists as a **built-in fallback** for
+pre-existing boards. If a project has no `workflows/` directory at all
+(legacy state), or a task names a `workflow:` that can't be found, Shelbi
+falls back to the built-in `default`. Existing task files are not modified.
+A task with no `workflow:` field is treated as belonging to the project
+default workflow (`task` on a freshly scaffolded project), or `default` when
+the project configures none, so there's nothing to backfill.
 
 ### Lifecycle: who moves a task between the default statuses
 

@@ -1,24 +1,37 @@
 ---
 title: Doing More with Agents
 order: 40
-summary: Shelbi ships three agents, but an agent is just a role — a system prompt plus a skill set. Author your own and slot it into a workflow's statuses. This guide builds an Adversarial Review agent, an automated skeptic that tries to break a change before a human sees it, and wires it into a workflow.
+summary: An agent is just a role, a system prompt plus a skill set, so nothing stops you authoring your own and slotting it into a workflow's statuses. This guide builds an Adversarial Review agent, an automated skeptic that tries to break a change before a human sees it, and wires it into a workflow. Shelbi already ships that reviewer as a preset; the guide is the mechanism behind it.
 ---
 
-Shelbi ships three agents (`orchestrator`, `developer`, and `review`),
-and for most projects that's the whole cast. But none of them is
-privileged machinery. An **[agent](/docs/concepts/agents) is just a
-role**: a system prompt plus an optional skill set. Nothing stops you from
-authoring your own and dropping it onto a workflow status, exactly the way
-the built-ins are wired.
+Shelbi ships six agents: the `orchestrator`, `developer`, and `review`
+roles that run the core loop, plus three reviewer presets (`qa`,
+`security`, and `adversarial`). None of them is privileged machinery. An
+**[agent](/docs/concepts/agents) is just a role**: a system prompt plus an
+optional skill set. Nothing stops you from authoring your own and dropping
+it onto a workflow status, exactly the way the built-ins are wired.
 
 This guide builds one worth having and shows where it goes.
 
+<Callout type="note" title="The Adversarial Review agent already ships">
+
+The worked example below builds an adversarial reviewer from scratch,
+because doing it once teaches the whole author-and-wire mechanism. If you
+only want the reviewer, you already have it: the shipped `adversarial`
+preset (alongside `qa` and `security`) is the same role, materialized and
+ready. Skip to [Add it to a
+workflow](/docs/guides/doing-more-with-agents/add-to-workflow) and name
+`agent: adversarial` on a status to wire the shipped one in one line.
+
+</Callout>
+
 ## The worked example: an Adversarial Review agent
 
-The three shipped agents bracket the loop optimistically. The `developer`
-implements a task and marks it review-ready; the `review` agent serves the
-finished branch to a human. Nothing in that path is *trying to prove the
-change is wrong*.
+The core loop is optimistic. The `developer` implements a task and marks it
+review-ready; the `review` agent serves the finished branch to a human.
+Nothing in that path is *trying to prove the change is wrong* (that's the
+job of the shipped `adversarial`, `qa`, and `security` reviewers, which is
+why they exist).
 
 An **Adversarial Review** agent is that missing skeptic. Its job is not to
 approve a change. It's to try to *break* it: find the bug, the injection,
@@ -52,13 +65,15 @@ distinction is worth keeping in mind as you design your own.
 - **Producer agents** do work and hand off forward when they're done, the
   way the `developer` marks a branch review-ready.
 
-A few worth having:
+A few worth having (the first two ship as presets already, the rest are
+yours to author):
 
 - **Security reviewer** *(gate)* — audits a branch's diff for injection,
-  broken authorization, leaked secrets, and risky dependency bumps before
-  merge, and bounces the task back on findings.
-- **Test author / QA** *(producer + gate)* — given a change, writes or
-  extends tests, runs the suite, and reports coverage gaps.
+  broken authorization, leaked secrets, and risky dependency bumps. Ships as
+  the `security` preset; wire it onto a status to use it.
+- **QA** *(producer + gate)* — exercises a change against its acceptance
+  criteria and reports pass or fail with repro steps. Ships as the `qa`
+  preset.
 - **Docs writer** *(producer)* — keeps docs, READMEs, and the changelog in
   sync with a code change, then hands off forward.
 - **Performance reviewer** *(gate)* — flags regressions, N+1 queries, and
@@ -86,7 +101,7 @@ The guide is two parts. Author the agent, then wire it in:
 ## See also
 
 - [Agents](/docs/concepts/agents) — the role/task/workspace model, the
-  three shipped agents, and how a custom one slots in.
+  six shipped agents, and how a custom one slots in.
 - [Understanding Workflows](/docs/guides/understanding-workflows) — the
   branching models a workflow can implement, if you want to place this
   review gate inside a larger shape.
