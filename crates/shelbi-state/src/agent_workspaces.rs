@@ -7,7 +7,7 @@
 //! the agent's `instructions.md` system prompt plus a `skills/` subdir
 //! that the task-dispatch path mounts into `.claude/skills/`.
 //!
-//! Three agents ship with the binary:
+//! Six agents ship with the binary:
 //!
 //! - **orchestrator** — the coordinator agent that runs in the
 //!   dashboard's right pane. Its bundled prompt is the content
@@ -18,8 +18,17 @@
 //!   builds, and serves a branch so a human can run it, and does not
 //!   modify code. Bundled prompt lives in `default_review.md.template`
 //!   and it ships a `load-run-detection` skill.
+//! - **qa** — verifies a finished change against its acceptance criteria
+//!   and reports pass/fail. Bundled prompt in `default_qa.md.template`.
+//! - **security** — defensive review of the diff for security issues.
+//!   Bundled prompt in `default_security.md.template`.
+//! - **adversarial** — tries to refute a change, hunting correctness bugs
+//!   and unhandled cases. Bundled prompt in `default_adversarial.md.template`.
 //!
-//! Both are materialized on first [`materialize_default_agents`] (called
+//! The qa / security / adversarial trio are specialized *reviewers* that
+//! scrutinize a diff — distinct from the `review` loader, which boots a
+//! workspace server. All are materialized on first
+//! [`materialize_default_agents`] (called
 //! from `shelbi init`) and self-healed by [`self_heal_default_agents`]
 //! (called from `shelbi reload`). User edits to `instructions.md` are
 //! preserved on self-heal. Runner-critical orchestrator sections are
@@ -47,6 +56,21 @@ pub const DEVELOPER_AGENT: &str = "developer";
 /// prepares a branch on a review workspace so a human can run it. Unlike
 /// the developer, it loads-and-serves and does not modify code.
 pub const REVIEW_AGENT: &str = "review";
+
+/// Stable identifier of the default QA agent — exercises a finished change
+/// against its acceptance criteria and reports pass/fail. Verifies; does
+/// not rewrite the feature.
+pub const QA_AGENT: &str = "qa";
+
+/// Stable identifier of the default security agent — defensive review of
+/// the diff for injection, authz/authn gaps, secrets, unsafe
+/// deserialization, path traversal, and supply-chain issues.
+pub const SECURITY_AGENT: &str = "security";
+
+/// Stable identifier of the default adversarial agent — tries to refute a
+/// change by hunting correctness bugs and unhandled cases, defaulting to
+/// skeptical.
+pub const ADVERSARIAL_AGENT: &str = "adversarial";
 
 /// Reserved subdirectory name under `agents/` that holds the per-project
 /// shared preamble — project-wide context prepended to every agent's
@@ -85,6 +109,19 @@ pub const DEFAULT_DEVELOPER_INSTRUCTIONS: &str = include_str!("default_developer
 
 /// Bundled review `instructions.md` content — the loader charter.
 pub const DEFAULT_REVIEW_INSTRUCTIONS: &str = include_str!("default_review.md.template");
+
+/// Bundled QA `instructions.md` content — the verify-against-acceptance
+/// -criteria charter.
+pub const DEFAULT_QA_INSTRUCTIONS: &str = include_str!("default_qa.md.template");
+
+/// Bundled security `instructions.md` content — the defensive-diff-review
+/// charter.
+pub const DEFAULT_SECURITY_INSTRUCTIONS: &str = include_str!("default_security.md.template");
+
+/// Bundled adversarial `instructions.md` content — the refute-the-change
+/// charter.
+pub const DEFAULT_ADVERSARIAL_INSTRUCTIONS: &str =
+    include_str!("default_adversarial.md.template");
 
 /// Bundled body of the review agent's `load-run-detection` skill: the
 /// auto-detect heuristics for booting an unknown project on `$PORT`.
@@ -132,7 +169,7 @@ pub struct BundledAgent {
 /// order matches the order outcomes appear in
 /// [`materialize_default_agents`] / [`self_heal_default_agents`] reports.
 ///
-/// Both default agents currently run on Claude Code, so both scaffold an
+/// Every default agent currently runs on Claude Code, so each scaffolds an
 /// `agents/<role>/settings.json` from the shared workspace-settings
 /// template. The settings file is what Claude Code reads on session
 /// start — its hooks tail the per-task message log
@@ -157,6 +194,24 @@ pub const DEFAULT_AGENTS: &[BundledAgent] = &[
         instructions: DEFAULT_REVIEW_INSTRUCTIONS,
         settings_template: Some(DEFAULT_WORKSPACE_SETTINGS_TEMPLATE),
         skills: REVIEW_SKILLS,
+    },
+    BundledAgent {
+        name: QA_AGENT,
+        instructions: DEFAULT_QA_INSTRUCTIONS,
+        settings_template: Some(DEFAULT_WORKSPACE_SETTINGS_TEMPLATE),
+        skills: &[],
+    },
+    BundledAgent {
+        name: SECURITY_AGENT,
+        instructions: DEFAULT_SECURITY_INSTRUCTIONS,
+        settings_template: Some(DEFAULT_WORKSPACE_SETTINGS_TEMPLATE),
+        skills: &[],
+    },
+    BundledAgent {
+        name: ADVERSARIAL_AGENT,
+        instructions: DEFAULT_ADVERSARIAL_INSTRUCTIONS,
+        settings_template: Some(DEFAULT_WORKSPACE_SETTINGS_TEMPLATE),
+        skills: &[],
     },
 ];
 
@@ -428,8 +483,8 @@ pub fn default_agent_settings(name: &str) -> Option<&'static str> {
         .and_then(|a| a.settings_template)
 }
 
-/// True iff `name` is a shipped default agent (currently `orchestrator`
-/// or `developer`). Convenience over [`default_agent_body`] for callers
+/// True iff `name` is a shipped default agent (any [`DEFAULT_AGENTS`]
+/// entry). Convenience over [`default_agent_body`] for callers
 /// that only care about presence, not the bundled body.
 pub fn is_default_agent(name: &str) -> bool {
     default_agent_body(name).is_some()
@@ -614,8 +669,9 @@ impl AgentMaterializeOutcome {
     }
 }
 
-/// Create `agents/{orchestrator,developer,review}/` from the bundled
-/// defaults for `project`. Each agent's directory is created only if missing —
+/// Create `agents/<role>/` for every [`DEFAULT_AGENTS`] entry
+/// (orchestrator, developer, review, qa, security, adversarial) from the
+/// bundled defaults for `project`. Each agent's directory is created only if missing —
 /// existing directories are left untouched and reported as `Unchanged`
 /// (init is conservative; self-heal does the SHA-compare).
 ///
@@ -990,10 +1046,17 @@ mod tests {
         std::env::set_var("SHELBI_HOME", &home);
 
         let outcomes = materialize_default_agents("p").unwrap();
-        assert_eq!(outcomes.len(), 3);
-        for (i, name) in [ORCHESTRATOR_AGENT, DEVELOPER_AGENT, REVIEW_AGENT]
-            .iter()
-            .enumerate()
+        assert_eq!(outcomes.len(), DEFAULT_AGENTS.len());
+        for (i, name) in [
+            ORCHESTRATOR_AGENT,
+            DEVELOPER_AGENT,
+            REVIEW_AGENT,
+            QA_AGENT,
+            SECURITY_AGENT,
+            ADVERSARIAL_AGENT,
+        ]
+        .iter()
+        .enumerate()
         {
             assert_eq!(
                 outcomes[i],
@@ -1006,9 +1069,15 @@ mod tests {
             assert!(instructions.exists(), "{name}: instructions.md missing");
             assert!(skills.is_dir(), "{name}: skills/ missing");
         }
-        // Orchestrator + developer ship an empty skills/ dir; review ships
-        // its load-run-detection skill.
-        for name in [ORCHESTRATOR_AGENT, DEVELOPER_AGENT] {
+        // Orchestrator, developer, and the qa/security/adversarial reviewers
+        // ship an empty skills/ dir; review ships its load-run-detection skill.
+        for name in [
+            ORCHESTRATOR_AGENT,
+            DEVELOPER_AGENT,
+            QA_AGENT,
+            SECURITY_AGENT,
+            ADVERSARIAL_AGENT,
+        ] {
             let skills = agent_skills_dir("p", name).unwrap();
             assert_eq!(
                 fs::read_dir(&skills).unwrap().count(),
@@ -1034,6 +1103,18 @@ mod tests {
         assert_eq!(
             fs::read_to_string(agent_instructions_path("p", REVIEW_AGENT).unwrap()).unwrap(),
             DEFAULT_REVIEW_INSTRUCTIONS
+        );
+        assert_eq!(
+            fs::read_to_string(agent_instructions_path("p", QA_AGENT).unwrap()).unwrap(),
+            DEFAULT_QA_INSTRUCTIONS
+        );
+        assert_eq!(
+            fs::read_to_string(agent_instructions_path("p", SECURITY_AGENT).unwrap()).unwrap(),
+            DEFAULT_SECURITY_INSTRUCTIONS
+        );
+        assert_eq!(
+            fs::read_to_string(agent_instructions_path("p", ADVERSARIAL_AGENT).unwrap()).unwrap(),
+            DEFAULT_ADVERSARIAL_INSTRUCTIONS
         );
 
         std::env::remove_var("SHELBI_HOME");
@@ -1067,6 +1148,15 @@ mod tests {
                 },
                 AgentMaterializeOutcome::Unchanged {
                     agent: REVIEW_AGENT.to_string()
+                },
+                AgentMaterializeOutcome::Unchanged {
+                    agent: QA_AGENT.to_string()
+                },
+                AgentMaterializeOutcome::Unchanged {
+                    agent: SECURITY_AGENT.to_string()
+                },
+                AgentMaterializeOutcome::Unchanged {
+                    agent: ADVERSARIAL_AGENT.to_string()
                 },
             ]
         );
@@ -1343,7 +1433,7 @@ mod tests {
             Some(AgentDivergence::PristineStale),
         );
         // A non-default agent has nothing to compare against.
-        assert_eq!(agent_divergence("p", "qa").unwrap(), None);
+        assert_eq!(agent_divergence("p", "ghost").unwrap(), None);
 
         std::env::remove_var("SHELBI_HOME");
     }
@@ -1834,7 +1924,10 @@ mod tests {
         assert!(is_default_agent(ORCHESTRATOR_AGENT));
         assert!(is_default_agent(DEVELOPER_AGENT));
         assert!(is_default_agent(REVIEW_AGENT));
-        assert!(!is_default_agent("qa"));
+        assert!(is_default_agent(QA_AGENT));
+        assert!(is_default_agent(SECURITY_AGENT));
+        assert!(is_default_agent(ADVERSARIAL_AGENT));
+        assert!(!is_default_agent("ghost"));
         assert!(!is_default_agent(""));
     }
 
@@ -1852,7 +1945,16 @@ mod tests {
             default_agent_body(REVIEW_AGENT),
             Some(DEFAULT_REVIEW_INSTRUCTIONS),
         );
-        assert_eq!(default_agent_body("qa"), None);
+        assert_eq!(default_agent_body(QA_AGENT), Some(DEFAULT_QA_INSTRUCTIONS));
+        assert_eq!(
+            default_agent_body(SECURITY_AGENT),
+            Some(DEFAULT_SECURITY_INSTRUCTIONS),
+        );
+        assert_eq!(
+            default_agent_body(ADVERSARIAL_AGENT),
+            Some(DEFAULT_ADVERSARIAL_INSTRUCTIONS),
+        );
+        assert_eq!(default_agent_body("ghost"), None);
     }
 
     /// Both default agents currently run on Claude Code, so both ship a
