@@ -2658,7 +2658,7 @@ function buildVimBuffer(lines: VimLine[]): Segment[][] {
 // the neo-tree "right-aligned symbols" look. The root is cyan, directories
 // blue-bold, files foreground, the open file gets a full-row selection bar.
 const NERD_W = 30
-const NERD_AGENTS = ["adversarial-review", "developer", "orchestrator", "qa", "review"]
+const NERD_AGENTS = ["adversarial", "developer", "orchestrator", "qa", "review", "security"]
 
 type NeoNode = {
   depth: number
@@ -2764,25 +2764,27 @@ function NeoTreeSidebar({ nodes }: { nodes: NeoNode[] }) {
 
 /**
  * Build the `agents/` tree nodes, highlighting `<activeDir>/<activeFile>` and
- * overlaying a believable git status: the reviewer being edited shows modified
- * (`M`), and a freshly-added `qa` agent shows added (`A`).
+ * overlaying a believable git status: the shipped `adversarial` reviewer being
+ * customized shows modified (`M`). All six presets ship, so nothing is a fresh
+ * git-add.
  */
 function agentsTreeNodes(activeDir: string, activeFile: string): NeoNode[] {
   const nodes: NeoNode[] = [{ depth: 0, name: "agents", dir: true, expanded: true }]
   for (const agent of NERD_AGENTS) {
-    const added = agent === "qa" // a newly-added agent, shown as git-added
-    const modified = agent === "adversarial-review" // the agent being edited
-    const dirGit = added ? "A" : modified ? "M" : undefined
+    // All six presets ship, so none is a fresh git-add; the open file is the
+    // shipped `adversarial` preset being customized, shown as git-modified.
+    const modified = agent === "adversarial"
+    const dirGit = modified ? "M" : undefined
     nodes.push({ depth: 1, name: agent, dir: true, expanded: true, git: dirGit })
     nodes.push({
       depth: 2,
       name: "instructions.md",
       dir: false,
-      git: added ? "A" : modified ? "M" : undefined,
+      git: modified ? "M" : undefined,
       active: agent === activeDir && activeFile === "instructions.md",
     })
-    nodes.push({ depth: 2, name: "settings.json", dir: false, git: added ? "A" : undefined })
-    nodes.push({ depth: 2, name: "skills", dir: true, expanded: false, git: added ? "A" : undefined })
+    nodes.push({ depth: 2, name: "settings.json", dir: false })
+    nodes.push({ depth: 2, name: "skills", dir: true, expanded: false })
   }
   return nodes
 }
@@ -2858,7 +2860,7 @@ export function AgentInstructionsMockup() {
     <VimWindow
       lines={REVIEW_INSTRUCTIONS}
       filename="instructions.md"
-      sidebar={<NeoTreeSidebar nodes={agentsTreeNodes("adversarial-review", "instructions.md")} />}
+      sidebar={<NeoTreeSidebar nodes={agentsTreeNodes("adversarial", "instructions.md")} />}
     />
   )
 }
@@ -2886,7 +2888,7 @@ const STATUS_CAT: Record<string, string> = {
 const STATUS_AGENT: Record<string, string> = {
   orchestrator: TUI_CYAN,
   developer: TUI_YELLOW,
-  "adversarial-review": TUI_MAGENTA,
+  adversarial: TUI_MAGENTA,
   qa: TUI_BLUE,
   security: TUI_CYAN,
 }
@@ -2962,7 +2964,7 @@ const yFolded = (key: string, lines: string[]): VimLine[] => [
 
 // The `feature` workflow — the app-feature shape: a whole feature travels
 // backlog → in-progress → agent-review → qa → security → review → done. A
-// developer builds it on a branch off main; the adversarial-review, QA, and
+// developer builds it on a branch off main; the shipped adversarial, QA, and
 // security agents each gate the diff before a human signs off and it merges.
 // Real Shelbi schema: reference-only `statuses`, `transitions` with hub-side
 // actions, and a per-workflow `git` override.
@@ -2980,7 +2982,7 @@ const WORKFLOW_CONFIG: VimLine[] = [
   yKey("statuses"),
   yStatus("backlog", "user"),
   yStatus("in-progress", "agent", "developer"),
-  yStatus("agent-review", "agent", "adversarial-review"),
+  yStatus("agent-review", "agent", "adversarial"),
   yStatus("qa", "agent", "qa"),
   yStatus("security", "agent", "security"),
   yStatus("review", "user"),

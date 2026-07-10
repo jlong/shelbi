@@ -32,7 +32,7 @@ const triad: {
   },
   {
     title: "Agents provide specialization.",
-    body: "Use custom instructions and skills to tailor agents to fit your workflow. Create agents for QA, Security, Adversarial Review, and more!",
+    body: "Workers build the code. Reviewers scrutinize it: QA, Security, and Adversarial Review ship in the box, each doing one job well. Tailor any of them with custom instructions and skills, or author your own.",
     // Editor bleeds off the left edge (mockup sits on the left on desktop).
     mockup: <AgentInstructionsMockup />,
     edge: "left",

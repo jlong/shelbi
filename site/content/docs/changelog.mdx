@@ -9,6 +9,28 @@ on `main`, newest first. This page is hand-curated: it tracks capabilities, not
 every commit, so small copy edits and cosmetic tweaks are folded away. Entries
 are prose with `code` and links where they earn their place.
 
+### July 9, 2026
+
+**A batteries-included default install.** `shelbi init` now sets up the loop
+most projects want without any YAML editing. Two things landed. First, six
+agent presets materialize on first load instead of three: the
+`orchestrator`, `developer`, and `review` roles that run the core loop, plus
+three specialized reviewers, `qa` (verifies a change against its acceptance
+criteria), `security` (a defensive-only diff review), and `adversarial` (an
+automated skeptic that tries to refute the change). The reviewers ship
+materialized but unwired, so the default board stays a plain
+`developer → review` loop and adding a gate is a one-line edit: name
+`agent: qa` (or `security`, or `adversarial`) on a status. Second, the scaffold
+ships two workflows instead of one. `task` is the new review-gated default:
+branch off `main`, `Backlog → Todo → In Progress → Review → Done`, one PR on
+the `In Progress → Review` edge, squash-merge to `main` on accept, with the
+`Review` status served on a `review`-tagged workspace by the Reviewer agent.
+`subtask` is a lighter flow for a piece of a parent task: it branches off and
+merges into the parent's branch, opens no PR, and has no review. Fresh
+projects get `default_workflow: task` written in, so the review gate is on out
+of the box. See the [agents concept](/docs/concepts/agents) and the
+[workflows guide](/docs/guides/getting-started/workflows#shipped-workflows-task-and-subtask).
+
 ### July 8, 2026
 
 **v0.2.0.** The headline fix: launching a pane on a remote machine whose login
