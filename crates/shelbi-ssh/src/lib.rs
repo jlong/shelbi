@@ -8,8 +8,79 @@
 use std::ffi::OsStr;
 use std::io::Write;
 use std::process::{Command, Output, Stdio};
+use std::time::Duration;
 
 use shelbi_core::Host;
+
+/// How many times to attempt a transient master open before giving up, and the
+/// base backoff between attempts. Both env-overridable so a chronically noisy
+/// host can be given a longer leash without a rebuild:
+/// `SHELBI_FORWARD_RETRY_ATTEMPTS` (clamped 1..=10) and
+/// `SHELBI_FORWARD_RETRY_BACKOFF_MS` (clamped 0..=5000).
+///
+/// The forward health check runs on a slow (120s) cadence in its own
+/// per-workspace thread, so the few hundred ms of bounded backoff a retry adds
+/// on a blip is invisible to the rest of the poller — and far cheaper than the
+/// event noise + missed worker→hub messages a spurious `master_open_failed`
+/// costs. `master_open_failed` for devbox was observed recurring *transiently*
+/// (direct ssh stayed healthy the whole time), which is exactly the shape a
+/// short retry absorbs.
+const DEFAULT_FORWARD_RETRY_ATTEMPTS: u32 = 3;
+const DEFAULT_FORWARD_RETRY_BACKOFF_MS: u64 = 250;
+
+fn forward_retry_attempts() -> u32 {
+    parse_env_u64("SHELBI_FORWARD_RETRY_ATTEMPTS")
+        .map(|v| v as u32)
+        .unwrap_or(DEFAULT_FORWARD_RETRY_ATTEMPTS)
+        .clamp(1, 10)
+}
+
+fn forward_retry_backoff_base() -> Duration {
+    let ms = parse_env_u64("SHELBI_FORWARD_RETRY_BACKOFF_MS")
+        .unwrap_or(DEFAULT_FORWARD_RETRY_BACKOFF_MS)
+        .min(5_000);
+    Duration::from_millis(ms)
+}
+
+fn parse_env_u64(key: &str) -> Option<u64> {
+    std::env::var(key).ok()?.trim().parse::<u64>().ok()
+}
+
+/// The sleep schedule *between* `attempts` tries: `attempts - 1` delays that
+/// grow exponentially from `base` (`base`, `2·base`, `4·base`, …). A single
+/// attempt yields no delays. Split out as a pure function so the backoff shape
+/// is unit-testable without shelling out or actually sleeping. The shift is
+/// capped so a large configured attempt count can't overflow the multiplier.
+fn backoff_delays(attempts: u32, base: Duration) -> Vec<Duration> {
+    (0..attempts.saturating_sub(1))
+        .map(|i| base.saturating_mul(1u32.checked_shl(i.min(16)).unwrap_or(u32::MAX)))
+        .collect()
+}
+
+/// Run `op` (returns `true` on success) up to `attempts` times, sleeping the
+/// [`backoff_delays`] schedule between failed tries. Returns the 1-based
+/// attempt number that first succeeded, or `None` if every attempt failed.
+/// `on_retry` runs after each *failed* attempt that will be retried — the Unix
+/// path uses it to drop the half-open master so `ControlMaster=auto` reopens
+/// fresh on the next try.
+fn retry_master_open(
+    attempts: u32,
+    base: Duration,
+    mut op: impl FnMut() -> bool,
+    mut on_retry: impl FnMut(),
+) -> Option<u32> {
+    let delays = backoff_delays(attempts, base);
+    for i in 0..attempts {
+        if op() {
+            return Some(i + 1);
+        }
+        if let Some(delay) = delays.get(i as usize) {
+            on_retry();
+            std::thread::sleep(*delay);
+        }
+    }
+    None
+}
 
 /// Static fragment of the SSH connection-multiplexing options injected
 /// into every SSH-routed command. With these set (combined with the
@@ -520,16 +591,32 @@ fn ensure_unix_forward(host: &Host, hostname: &str, remote_sock: &str) -> UnixFo
 
     // Reopen the master, rebinding `-R` against the now-clean path. `true`
     // is the cheapest remote command; the master opens (and ControlPersist
-    // keeps it) as a side effect.
-    let opened = match open_master_with_stream_local_unlink(hostname) {
-        Ok(o) => o,
-        // Failure to even spawn ssh is treated as a master-open failure — a
-        // local/transient problem, not the wedge.
-        Err(_) => return UnixForwardOutcome::MasterOpenFailed,
-    };
-
-    if !opened.status.success() {
+    // keeps it) as a side effect. Retried across transient blips with
+    // backoff: `master_open_failed` was observed recurring transiently for
+    // devbox while direct ssh stayed healthy, so a short retry absorbs the
+    // flap instead of surfacing (and re-surfacing) a hard failure. Between
+    // failed tries we drop the half-open master so `ControlMaster=auto`
+    // genuinely reopens fresh rather than reusing a wedged socket.
+    let attempts = forward_retry_attempts();
+    let opened_on = retry_master_open(
+        attempts,
+        forward_retry_backoff_base(),
+        || matches!(open_master_with_stream_local_unlink(hostname), Ok(o) if o.status.success()),
+        || drop_master(hostname),
+    );
+    let Some(opened_attempt) = opened_on else {
+        // Every attempt failed to even open the master — a local/transient
+        // problem, not the wedge.
         return UnixForwardOutcome::MasterOpenFailed;
+    };
+    if opened_attempt > 1 {
+        // Health visibility: the master open flickered but self-healed. Emit
+        // the recovery distinctly so a recurring blip stays visible without
+        // masquerading as a hard `master_open_failed`.
+        let _ = shelbi_state::emit_event_body(&format!(
+            "ssh reverse-forward host={hostname} remote_sock={remote_sock} \
+             detail=master_open_recovered attempts={opened_attempt} status=established"
+        ));
     }
 
     // Master opened → network/auth are fine. If the landing socket is now
@@ -560,19 +647,24 @@ fn ensure_unix_forward(host: &Host, hostname: &str, remote_sock: &str) -> UnixFo
 /// Candidate loopback ports to try, starting from `start` (the port a previous
 /// forward bound, if any) and sweeping the configured band on a collision.
 fn tcp_candidate_ports(start: u16) -> Vec<u16> {
-    let base = shelbi_state::TCP_FORWARD_PORT_BASE;
-    let span = shelbi_state::TCP_FORWARD_PORT_SPAN;
+    let base = shelbi_state::tcp_forward_port_base();
+    let span = shelbi_state::tcp_forward_port_span();
+    // Widen to u32 for the band arithmetic: the band is clamped so that
+    // `base + span - 1 == u16::MAX` is legal, and computing `base + span` in
+    // u16 there would overflow (panic in debug builds).
+    let (base32, span32) = (base as u32, span as u32);
     // Normalize `start` into the band so a stale/out-of-range persisted port
     // can't push us outside it.
-    let first = if start >= base && start < base + span {
+    let start32 = start as u32;
+    let first = if start32 >= base32 && start32 < base32 + span32 {
         start
     } else {
         base
     };
     let mut ports = Vec::with_capacity(span as usize);
     ports.push(first);
-    for i in 0..span {
-        let p = base + i;
+    for i in 0..span32 {
+        let p = (base32 + i) as u16;
         if p != first {
             ports.push(p);
         }
@@ -589,26 +681,55 @@ fn tcp_candidate_ports(start: u16) -> Vec<u16> {
 /// is safe and can't misfire on a transient timeout.
 fn ensure_tcp_forward(hostname: &str) -> shelbi_core::Result<u16> {
     // Connectivity gate. `ControlMaster=no` one-shot, no forward — purely "can
-    // we reach the host at all?"
-    let reachable = matches!(
-        run_without_reverse_forward(hostname, ["true"]),
-        Ok(o) if o.status.success()
+    // we reach the host at all?" Retried across transient blips with backoff:
+    // the whole point of the gate is to prove reachability so a later bind
+    // failure is unambiguously exhaustion, not a network hiccup — so a *flaky*
+    // probe must not be mistaken for an unreachable host.
+    let attempts = forward_retry_attempts();
+    let reached_on = retry_master_open(
+        attempts,
+        forward_retry_backoff_base(),
+        || {
+            matches!(
+                run_without_reverse_forward(hostname, ["true"]),
+                Ok(o) if o.status.success()
+            )
+        },
+        || {},
     );
-    if !reachable {
+    let Some(gate_attempt) = reached_on else {
         let _ = shelbi_state::emit_event_body(&format!(
-            "ssh reverse-forward host={hostname} mode=tcp status=failed detail=master_open_failed"
+            "ssh reverse-forward host={hostname} mode=tcp status=failed \
+             detail=master_open_failed attempts={attempts}"
         ));
         return Err(shelbi_core::Error::Other(format!(
             "ssh reverse forward to {hostname} could not be established over TCP loopback \
-             (host unreachable); worker→hub messages will not be delivered"
+             (host unreachable after {attempts} attempts); worker→hub messages will not be delivered"
         )));
+    };
+    if gate_attempt > 1 {
+        // Health visibility: the probe flickered but self-healed. Emit the
+        // recovery distinctly so a recurring blip is visible in events.log
+        // without masquerading as a hard failure.
+        let _ = shelbi_state::emit_event_body(&format!(
+            "ssh reverse-forward host={hostname} mode=tcp detail=master_open_recovered \
+             attempts={gate_attempt} status=established"
+        ));
     }
+
+    // Reclaim before allocating: drop any master we still own for this host so
+    // the loopback port it was holding is released back into the band before we
+    // start the sweep. Without this, a still-persisted master from the previous
+    // recheck keeps "its" port bound and we'd needlessly skip past it.
+    drop_master(hostname);
 
     let start = shelbi_state::load_host_forward(hostname)
         .and_then(|h| h.port)
-        .unwrap_or(shelbi_state::TCP_FORWARD_PORT_BASE);
+        .unwrap_or_else(shelbi_state::tcp_forward_port_base);
 
-    for port in tcp_candidate_ports(start) {
+    let candidates = tcp_candidate_ports(start);
+    let band_len = candidates.len();
+    for port in candidates {
         // Drop any master first so ControlMaster=auto opens a fresh one that
         // binds this candidate port's `-R`.
         drop_master(hostname);
@@ -632,12 +753,21 @@ fn ensure_tcp_forward(hostname: &str) -> shelbi_core::Result<u16> {
         // collision — try the next candidate port.
     }
 
+    // Genuine exhaustion: every port in the band collided even though the host
+    // is reachable. Surface it *distinctly* from a transient master-open blip
+    // (`detail=loopback_port_exhausted`, with the band that was swept) so an
+    // operator can tell "widen the band / find the port hog" apart from "the
+    // network flickered." Widening the band (SHELBI_TCP_FORWARD_PORT_SPAN) or
+    // moving it (SHELBI_TCP_FORWARD_PORT_BASE) is the remedy this points at.
+    let base = shelbi_state::tcp_forward_port_base();
+    let band_hi = base as u32 + band_len.saturating_sub(1) as u32;
     let _ = shelbi_state::emit_event_body(&format!(
-        "ssh reverse-forward host={hostname} mode=tcp status=failed detail=tcp_forward_failed \
-         no free loopback port in band"
+        "ssh reverse-forward host={hostname} mode=tcp status=failed \
+         detail=loopback_port_exhausted band={base}-{band_hi} tried={band_len}"
     ));
     Err(shelbi_core::Error::Other(format!(
-        "ssh reverse forward to {hostname} could not bind a TCP loopback port; \
+        "ssh reverse forward to {hostname} could not bind a TCP loopback port \
+         (all {band_len} ports in band {base}-{band_hi} in use); \
          worker→hub messages will not be delivered"
     )))
 }
@@ -693,10 +823,15 @@ pub fn ensure_reverse_forward(
         UnixForwardOutcome::Ok => Ok(()),
         UnixForwardOutcome::MasterOpenFailed => {
             // Transient / network — surface, never fall back (a connect
-            // timeout is not the wedge).
+            // timeout is not the wedge). We only reach here after the retry
+            // budget in `ensure_unix_forward` is exhausted, so record how many
+            // attempts we burned: a `master_open_failed attempts=3` that keeps
+            // recurring is a real outage, not a one-off blip the retry would
+            // have caught.
+            let attempts = forward_retry_attempts();
             let _ = shelbi_state::emit_event_body(&format!(
                 "ssh reverse-forward host={hostname} remote_sock={remote_sock} \
-                 status=failed detail=master_open_failed"
+                 status=failed detail=master_open_failed attempts={attempts}"
             ));
             Err(shelbi_core::Error::Other(format!(
                 "ssh reverse forward to {hostname} could not be verified (master_open_failed); \
@@ -1049,5 +1184,108 @@ mod tests {
             .arg("echo 'some other error' >&2; exit 1")
             .output();
         assert!(!cleanup_hit_eperm(&other));
+    }
+
+    #[test]
+    fn backoff_delays_grows_exponentially_and_has_attempts_minus_one_entries() {
+        let base = Duration::from_millis(100);
+
+        // A single attempt means no waiting — you just try once.
+        assert!(backoff_delays(1, base).is_empty());
+        assert!(backoff_delays(0, base).is_empty());
+
+        // N attempts → N-1 sleeps, doubling from `base`.
+        let d = backoff_delays(4, base);
+        assert_eq!(
+            d,
+            vec![
+                Duration::from_millis(100),
+                Duration::from_millis(200),
+                Duration::from_millis(400),
+            ]
+        );
+
+        // A zero base disables the wait entirely regardless of attempt count.
+        assert!(backoff_delays(5, Duration::ZERO)
+            .iter()
+            .all(|d| d.is_zero()));
+
+        // A large attempt count can't overflow the shift/multiply.
+        let big = backoff_delays(40, base);
+        assert_eq!(big.len(), 39);
+        assert!(big.iter().all(|d| *d <= Duration::MAX));
+    }
+
+    #[test]
+    fn retry_master_open_reports_first_successful_attempt() {
+        // Succeeds immediately → attempt 1, on_retry never fires.
+        let mut retries = 0;
+        let got = retry_master_open(3, Duration::ZERO, || true, || retries += 1);
+        assert_eq!(got, Some(1));
+        assert_eq!(retries, 0, "no retry callback when the first try wins");
+    }
+
+    #[test]
+    fn retry_master_open_absorbs_a_transient_blip() {
+        // Fails twice, then succeeds on the third attempt. on_retry fires once
+        // per *failed* try that is followed by another attempt (2 here).
+        let mut calls = 0;
+        let mut retries = 0;
+        let got = retry_master_open(
+            3,
+            Duration::ZERO,
+            || {
+                calls += 1;
+                calls == 3
+            },
+            || retries += 1,
+        );
+        assert_eq!(got, Some(3), "self-heals on the third attempt");
+        assert_eq!(calls, 3);
+        assert_eq!(retries, 2, "one retry hook per failed-but-retried attempt");
+    }
+
+    #[test]
+    fn retry_master_open_gives_up_after_exhausting_attempts() {
+        // Never succeeds → None, and on_retry fires only between tries
+        // (attempts - 1), never after the final failed attempt.
+        let mut calls = 0;
+        let mut retries = 0;
+        let got = retry_master_open(
+            3,
+            Duration::ZERO,
+            || {
+                calls += 1;
+                false
+            },
+            || retries += 1,
+        );
+        assert_eq!(got, None);
+        assert_eq!(calls, 3, "used the whole attempt budget");
+        assert_eq!(retries, 2, "no backoff sleep after the last attempt");
+    }
+
+    #[test]
+    fn forward_retry_config_clamps_to_safe_bounds() {
+        // Attempts clamp into 1..=10; a zero or absurd value can't disable the
+        // single guaranteed try or spin forever.
+        std::env::set_var("SHELBI_FORWARD_RETRY_ATTEMPTS", "0");
+        assert_eq!(forward_retry_attempts(), 1);
+        std::env::set_var("SHELBI_FORWARD_RETRY_ATTEMPTS", "9999");
+        assert_eq!(forward_retry_attempts(), 10);
+        std::env::set_var("SHELBI_FORWARD_RETRY_ATTEMPTS", "not-a-number");
+        assert_eq!(forward_retry_attempts(), DEFAULT_FORWARD_RETRY_ATTEMPTS);
+        std::env::remove_var("SHELBI_FORWARD_RETRY_ATTEMPTS");
+
+        // Backoff clamps to <= 5s so a fat-fingered value can't stall the
+        // per-workspace poller thread for minutes.
+        std::env::set_var("SHELBI_FORWARD_RETRY_BACKOFF_MS", "100000");
+        assert_eq!(forward_retry_backoff_base(), Duration::from_millis(5_000));
+        std::env::set_var("SHELBI_FORWARD_RETRY_BACKOFF_MS", "garbage");
+        assert_eq!(
+            forward_retry_backoff_base(),
+            Duration::from_millis(DEFAULT_FORWARD_RETRY_BACKOFF_MS)
+        );
+        std::env::remove_var("SHELBI_FORWARD_RETRY_BACKOFF_MS");
     }
 }

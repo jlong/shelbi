@@ -431,8 +431,46 @@ pub const TCP_FORWARD_BIND_ADDR: &str = "127.0.0.1";
 /// from `[TCP_FORWARD_PORT_BASE, TCP_FORWARD_PORT_BASE + TCP_FORWARD_PORT_SPAN)`
 /// so a re-established forward reuses the same port a worker was told about
 /// whenever it's still free.
+///
+/// These are the *defaults*: [`tcp_forward_port_base`] and
+/// [`tcp_forward_port_span`] read env overrides on top of them. The span is
+/// deliberately roomy — a narrow band on a busy remote (many concurrent
+/// workers, orphaned masters from a hard hub kill still holding ports until
+/// their ControlPersist expires) is exactly the "no free loopback port in
+/// band" exhaustion we widened it to avoid.
 pub const TCP_FORWARD_PORT_BASE: u16 = 47100;
-pub const TCP_FORWARD_PORT_SPAN: u16 = 16;
+pub const TCP_FORWARD_PORT_SPAN: u16 = 64;
+
+/// The first candidate loopback port, honoring the `SHELBI_TCP_FORWARD_PORT_BASE`
+/// override. A malformed or zero value falls back to [`TCP_FORWARD_PORT_BASE`]
+/// so a typo in the environment can never wedge the forward path.
+pub fn tcp_forward_port_base() -> u16 {
+    parse_env_u16("SHELBI_TCP_FORWARD_PORT_BASE")
+        .filter(|&p| p > 0)
+        .unwrap_or(TCP_FORWARD_PORT_BASE)
+}
+
+/// The width of the loopback band swept on a bind collision, honoring the
+/// `SHELBI_TCP_FORWARD_PORT_SPAN` override. Falls back to
+/// [`TCP_FORWARD_PORT_SPAN`] on a malformed/zero value, and is clamped so the
+/// band `[base, base + span)` can never run past `u16::MAX` — otherwise the
+/// sweep in `tcp_candidate_ports` would overflow when adding `base + i`.
+pub fn tcp_forward_port_span() -> u16 {
+    let base = tcp_forward_port_base();
+    let span = parse_env_u16("SHELBI_TCP_FORWARD_PORT_SPAN")
+        .filter(|&s| s > 0)
+        .unwrap_or(TCP_FORWARD_PORT_SPAN);
+    // Keep base + span - 1 <= u16::MAX so the deterministic sweep stays in range.
+    let max_span = (u16::MAX - base).saturating_add(1);
+    span.min(max_span).max(1)
+}
+
+/// Parse a `u16` from an environment variable, tolerating surrounding
+/// whitespace. `None` on absent or unparseable values — callers substitute a
+/// safe default rather than surfacing an error.
+fn parse_env_u16(key: &str) -> Option<u16> {
+    std::env::var(key).ok()?.trim().parse::<u16>().ok()
+}
 
 /// Persisted forward decision for a single remote host: which mode the hub
 /// settled on, plus the loopback port a TCP forward bound (so the next
@@ -1018,6 +1056,45 @@ mod tests {
         ));
 
         std::env::remove_var("SHELBI_HOME");
+    }
+
+    #[test]
+    fn tcp_forward_band_honors_env_overrides_and_clamps() {
+        let _g = lock_test();
+        // Clean slate: no overrides → defaults.
+        std::env::remove_var("SHELBI_TCP_FORWARD_PORT_BASE");
+        std::env::remove_var("SHELBI_TCP_FORWARD_PORT_SPAN");
+        assert_eq!(tcp_forward_port_base(), TCP_FORWARD_PORT_BASE);
+        assert_eq!(tcp_forward_port_span(), TCP_FORWARD_PORT_SPAN);
+
+        // Valid overrides are honored (whitespace tolerated).
+        std::env::set_var("SHELBI_TCP_FORWARD_PORT_BASE", " 50000 ");
+        std::env::set_var("SHELBI_TCP_FORWARD_PORT_SPAN", "128");
+        assert_eq!(tcp_forward_port_base(), 50000);
+        assert_eq!(tcp_forward_port_span(), 128);
+
+        // Malformed / zero values fall back to the compiled defaults rather
+        // than wedging the forward path.
+        std::env::set_var("SHELBI_TCP_FORWARD_PORT_BASE", "not-a-port");
+        std::env::set_var("SHELBI_TCP_FORWARD_PORT_SPAN", "0");
+        assert_eq!(tcp_forward_port_base(), TCP_FORWARD_PORT_BASE);
+        assert_eq!(tcp_forward_port_span(), TCP_FORWARD_PORT_SPAN);
+
+        // A span that would push the band past u16::MAX is clamped so the
+        // deterministic sweep (base + i) can't overflow.
+        std::env::set_var("SHELBI_TCP_FORWARD_PORT_BASE", "65500");
+        std::env::set_var("SHELBI_TCP_FORWARD_PORT_SPAN", "1000");
+        assert_eq!(tcp_forward_port_base(), 65500);
+        let span = tcp_forward_port_span();
+        assert_eq!(span, u16::MAX - 65500 + 1, "span clamped to fit the band");
+        assert_eq!(
+            65500u32 + span as u32 - 1,
+            u16::MAX as u32,
+            "top of band lands exactly on u16::MAX",
+        );
+
+        std::env::remove_var("SHELBI_TCP_FORWARD_PORT_BASE");
+        std::env::remove_var("SHELBI_TCP_FORWARD_PORT_SPAN");
     }
 
     #[test]
