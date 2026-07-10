@@ -107,13 +107,8 @@ pub fn setup_one_project() -> Result<()> {
 
     // ---- Project basics --------------------------------------------------
     // Normalize the folder-basename default up front so the pre-filled value
-    // is already a valid id (a folder like `Shaft` shows as `shaft`). Fall
-    // back to `my-project` when the basename can't be normalized.
-    let default_name = cwd
-        .file_name()
-        .and_then(|s| s.to_str())
-        .and_then(|s| shelbi_core::normalize_project_name(s).ok())
-        .unwrap_or_else(|| "my-project".to_string());
+    // is already a valid id (a folder like `Shaft` shows as `shaft`).
+    let default_name = wizard_default_project_name(&cwd);
     let name = prompt_project_name(&default_name)?;
 
     let repo_path = text("Path to the repo:", &cwd.display().to_string())?;
@@ -372,6 +367,25 @@ fn probe_remote_url(cwd: &Path) -> Option<String> {
     }
 }
 
+/// Derive the wizard's pre-filled project-name default from the current
+/// directory: the folder basename slugified into the agent-id charset
+/// (`Shaft` → `shaft`, `My App` → `my-app`), falling back to `my-project`
+/// when the basename is absent or can't be normalized (e.g. `/` or an
+/// all-punctuation folder name).
+///
+/// Pulled out of [`setup_one_project`] so the derivation — the exact step
+/// that a capitalized folder name flows through on its way to becoming a
+/// project id — is unit-testable without driving the interactive prompts.
+/// The name is also normalized again on submit (see [`prompt_project_name`]),
+/// so a user who overtypes the default with another capitalized value is
+/// still funneled through [`shelbi_core::normalize_project_name`].
+fn wizard_default_project_name(cwd: &Path) -> String {
+    cwd.file_name()
+        .and_then(|s| s.to_str())
+        .and_then(|s| shelbi_core::normalize_project_name(s).ok())
+        .unwrap_or_else(|| "my-project".to_string())
+}
+
 fn prompt_project_name(default: &str) -> Result<String> {
     use inquire::validator::{ErrorMessage, Validation};
     // Accept anything that can be slugified into a valid id — the wizard
@@ -566,6 +580,47 @@ mod tests {
             assign_workspace_names(&machines, 2, WorkspaceNamePreset::Phonetic, Runner::Codex)
                 .unwrap();
         assert!(workspaces.iter().all(|w| w.runner == "codex"));
+    }
+
+    /// The wizard's basename-derived default is the same capitalized-folder
+    /// path that used to reach dashboard setup as a raw agent id and crash.
+    /// It must slugify `Shaft` → `shaft` and `My App` → `my-app`, pass an
+    /// already-valid name through untouched, and fall back to `my-project`
+    /// when the basename is missing or all-punctuation.
+    #[test]
+    fn wizard_default_project_name_normalizes_basename() {
+        assert_eq!(
+            wizard_default_project_name(Path::new("/tmp/Shaft")),
+            "shaft"
+        );
+        assert_eq!(
+            wizard_default_project_name(Path::new("/tmp/My App")),
+            "my-app"
+        );
+        assert_eq!(
+            wizard_default_project_name(Path::new("/home/me/shelbi.rs")),
+            "shelbi-rs"
+        );
+        // Already-valid names are returned unchanged.
+        assert_eq!(
+            wizard_default_project_name(Path::new("/tmp/my-app")),
+            "my-app"
+        );
+        // The derived default must itself satisfy the storage chokepoint, so
+        // it can never raise the invalid-agent-id error downstream.
+        for dir in ["/tmp/Shaft", "/tmp/My App", "/home/me/shelbi.rs"] {
+            let got = wizard_default_project_name(Path::new(dir));
+            assert!(
+                shelbi_core::validate_project_name(&got).is_ok(),
+                "derived default `{got}` (from {dir}) must pass validate_project_name"
+            );
+        }
+        // No usable basename (`/`) or an all-punctuation folder → fallback.
+        assert_eq!(wizard_default_project_name(Path::new("/")), "my-project");
+        assert_eq!(
+            wizard_default_project_name(Path::new("/tmp/...")),
+            "my-project"
+        );
     }
 
     #[test]

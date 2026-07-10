@@ -551,12 +551,16 @@ pub fn load_project(project: &str) -> Result<Project> {
         Err(e) => return Err(shelbi_core::Error::Io(e)),
     };
     // Defense-in-depth: the project name is interpolated into shell command
-    // strings (tmux pane loops, `--project` args) all over the orchestrator.
-    // Creation already enforces a kebab/snake slug via `validate_agent_id`,
-    // but a hand-edited YAML could smuggle in quotes/metacharacters. Reject
-    // them here so a name like `x'; rm -rf ~; echo '` can never reach a
-    // shell, independent of any single call site's escaping.
-    shelbi_core::validate_agent_id(&p.name)?;
+    // strings (tmux pane loops, `--project` args) all over the orchestrator,
+    // and dashboard setup derives an agent id from it. Creation already
+    // normalizes the name into a kebab/snake slug, but a project scaffolded
+    // by a pre-normalization shelbi, or a hand-edited YAML, could carry an
+    // uppercase/space/metacharacter name. Reject it here — the single load
+    // chokepoint every dashboard/orchestrator path funnels through — so such
+    // a name can never reach a shell or `validate_agent_id` deep in
+    // `ensure_dashboard`, and the user gets an actionable rename hint instead
+    // of the bare invalid-agent-id crash.
+    validate_loaded_project_name(&p.name)?;
     p.validate_workspaces()?;
     let repo = p.repo.clone();
     p.detect_shapes(repo);
@@ -601,8 +605,43 @@ fn load_project_bare(project: &str) -> Result<Project> {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => load_project_split(project)?,
         Err(e) => return Err(shelbi_core::Error::Io(e)),
     };
-    shelbi_core::validate_agent_id(&p.name)?;
+    validate_loaded_project_name(&p.name)?;
     Ok(p)
+}
+
+/// Guard a *loaded* project's `name:` at the storage chokepoint.
+///
+/// Every dashboard/orchestrator entry point loads the project through
+/// [`load_project`] before deriving agent ids and tmux session names from
+/// its `name`, so this is the single place an un-normalized on-disk name can
+/// be stopped before it reaches [`shelbi_core::validate_agent_id`] deep in
+/// `ensure_dashboard` — where it would otherwise surface as the bare, cryptic
+/// `invalid agent id` error (the capitalized-directory launch crash).
+///
+/// A valid id passes straight through. An invalid one becomes an actionable
+/// error that names the offending project and, when the name can be
+/// slugified, the normalized id to rename it to. Onboarding normalizes names
+/// into this charset up front (see [`shelbi_core::normalize_project_name`]),
+/// so this only ever fires for a project scaffolded by a pre-normalization
+/// shelbi or a hand-edited YAML.
+fn validate_loaded_project_name(name: &str) -> Result<()> {
+    if shelbi_core::validate_agent_id(name).is_ok() {
+        return Ok(());
+    }
+    let rename_hint = match shelbi_core::normalize_project_name(name) {
+        Ok(suggestion) => format!(
+            "rename it to `{suggestion}`: move ~/.shelbi/projects/{name}.yaml to \
+             ~/.shelbi/projects/{suggestion}.yaml and set its `name:` field to `{suggestion}`"
+        ),
+        Err(_) => "rename it to a valid id — lowercase ASCII letters, digits, `-`, and `_`, \
+                   starting with a letter or digit (e.g. `my-app`)"
+            .to_string(),
+    };
+    Err(shelbi_core::Error::Other(format!(
+        "project name `{name}` is not a valid shelbi id (only lowercase ASCII letters, digits, \
+         `-`, and `_` are allowed, starting with a letter or digit). Dashboard setup derives an \
+         agent id from it and can't launch as-is — {rename_hint}."
+    )))
 }
 
 /// In-repo fallback for [`load_project`]: read
@@ -4502,6 +4541,47 @@ mod tests {
         assert_eq!(loaded.name, "myapp");
         // Pre-split YAMLs carry no `config_mode:` → global mode.
         assert_eq!(loaded.config_mode, None);
+        std::env::remove_var("SHELBI_HOME");
+    }
+
+    /// The defensive chokepoint: a project whose on-disk `name:` is not a
+    /// valid agent id (a capitalized folder that a pre-normalization shelbi
+    /// scaffolded, or a hand-edited YAML) must fail `load_project` with an
+    /// actionable rename hint — NOT the bare `invalid agent id` crash that
+    /// `ensure_dashboard` would otherwise surface. This guards the launch
+    /// path even if some future ingress forgets to normalize.
+    #[test]
+    fn load_project_rejects_uppercase_name_with_actionable_error() {
+        let _g = TEST_LOCK.lock().unwrap();
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+
+        // Plant an on-disk YAML whose `name:` is `Shaft`, bypassing
+        // `save_project` (which normalizes/validates on write) so we
+        // exercise the loader's own guard.
+        std::fs::create_dir_all(home.join("projects")).unwrap();
+        let mut p = fixture_project("shaft", None);
+        p.name = "Shaft".to_string();
+        let yaml = serde_yaml::to_string(&p).unwrap();
+        std::fs::write(home.join("projects/Shaft.yaml"), yaml).unwrap();
+
+        let err = load_project("Shaft").unwrap_err();
+        let msg = err.to_string();
+        // Names the offending project and suggests the normalized id...
+        assert!(msg.contains("Shaft"), "should name the project: {msg}");
+        assert!(
+            msg.contains("`shaft`"),
+            "should suggest the normalized name `shaft`: {msg}"
+        );
+        // ...and is NOT the cryptic bare invalid-agent-id error.
+        assert!(
+            !msg.contains("invalid agent id"),
+            "should not surface the bare invalid-agent-id error: {msg}"
+        );
+        assert!(
+            !matches!(err, shelbi_core::Error::InvalidAgentId(_)),
+            "chokepoint should return an actionable error, not InvalidAgentId"
+        );
         std::env::remove_var("SHELBI_HOME");
     }
 
