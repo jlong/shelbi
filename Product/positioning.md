@@ -103,9 +103,9 @@ Install CTA (`curl … | sh` code block) + "Build from source" docs link.
 
 - Put the GitHub link with stars within one click of the hero. It is the open source trust signal standing in for customer logos.
 
-**Fact-check status (verified against source, July 2026):** orchestrator-as-interface, multi-machine SSH workers, YAML workflows with per-status agents, pluggable runners (Claude Code, Codex, aider), and the Zen primitives are all shipped. Keep two claims honest in final copy:
+**Fact-check status (verified against source, July 2026; reviewer presets updated July 9, 2026):** orchestrator-as-interface, multi-machine SSH workers, YAML workflows with per-status agents, pluggable runners (Claude Code, Codex, aider), and the Zen primitives are all shipped. As of the Default Install Experience work, `shelbi init` now materializes six agent presets (orchestrator, developer, review, plus `qa`, `security`, and `adversarial`) and ships two default workflows: `task` (the review-gated default) and `subtask` (no PR). Keep these claims honest in final copy:
 
-- "Adversarial review, QA, security" agents are built with shipped primitives (`shelbi agent new`, per-status `agent:` assignment), not shipped presets. Phrase as what you can add, not what comes in the box.
+- QA, Security, and Adversarial Review now **ship as presets**, not just as something you can build with `shelbi agent new`. This reverses the earlier "not shipped presets" caveat. Stay honest about what each one does (QA verifies against acceptance criteria, Security is a defensive-only diff review, Adversarial tries to refute the change) and that they ship materialized-but-unwired: you opt one onto a column by naming it on that status's `agent:` field. The claim is "they come in the box," not "they govern every board by default."
 
 - Zen's "digest" is the orchestrator reporting back conversationally plus probe and CI output, not a formatted digest feature.
 
