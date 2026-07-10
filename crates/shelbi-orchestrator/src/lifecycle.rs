@@ -18,7 +18,12 @@
 //!   intent.
 //!
 //! With no active dep branch (all deps done, or no deps at all) the cut
-//! falls back to the project-level base from [`Project::base_branch`].
+//! falls back to the workflow's resolved `git.base_branch` when the task's
+//! workflow declares one — a subtask whose workflow sets
+//! `base_branch: feature/{{feature}}` is cut from `feature/<feature>`, with
+//! `{{var}}` placeholders interpolated from the task's frontmatter. Only
+//! when the workflow has no `git.base_branch` does the cut fall back to the
+//! project-level base from [`Project::base_branch`].
 //!
 //! This module wraps `shelbi_state::move_task` for both the CLI
 //! (`shelbi task move`) and the TUI (kanban left/right). `shelbi task
@@ -33,7 +38,7 @@
 //! from the freshly-fetched ref (never a possibly-stale local one). A
 //! depends_on chain across machines is out of scope for this pass.
 
-use shelbi_core::{Error, Host, Project, Result, StatusCategory, Task};
+use shelbi_core::{Error, Host, Project, Result, StatusCategory, Task, Workflow};
 use shelbi_state::TaskFile;
 
 use crate::branch;
@@ -57,13 +62,19 @@ use crate::git::{locate_hub_workdir, run_in_dir};
 ///   falling back to the project base would strip the depends_on
 ///   intent.
 ///
-/// If nothing blocks and no active dep hands us a branch, fall back to
-/// [`Project::base_branch`]. Unknown dep ids (a task file deleted
-/// mid-flight) are treated defensively as skips — `validate_depends_on`
-/// rejects unknown ids at save time, so this only kicks in for corrupt
-/// state.
+/// If nothing blocks and no active dep hands us a branch, resolve the
+/// task's workflow `git.base_branch` (substituting `{{var}}` placeholders
+/// from the task's frontmatter) and cut from that; only when the workflow
+/// declares no base do we fall back to [`Project::base_branch`]. An
+/// unresolvable placeholder (the task is missing a `{{var}}` the workflow
+/// references) surfaces the [`Error::MissingTaskParams`] from
+/// [`Workflow::resolve_git`] rather than silently cutting from the project
+/// default. Unknown dep ids (a task file deleted mid-flight) are treated
+/// defensively as skips — `validate_depends_on` rejects unknown ids at save
+/// time, so this only kicks in for corrupt state.
 pub fn resolve_base_branch(
     project: &Project,
+    workflow: &Workflow,
     task: &Task,
     all_tasks: &[TaskFile],
 ) -> Result<String> {
@@ -103,41 +114,115 @@ pub fn resolve_base_branch(
             list = blocking.join(", "),
         )));
     }
-    Ok(active_base.unwrap_or_else(|| project.base_branch().to_string()))
+    if let Some(active) = active_base {
+        return Ok(active);
+    }
+    // No active dep to stack on. Prefer the workflow's resolved
+    // `git.base_branch` (with `{{var}}` substitution from the task's
+    // frontmatter) so a subtask declared `base_branch: feature/{{feature}}`
+    // is cut from that branch, not the project default. A workflow with no
+    // `git:` block, or a `git:` block that omits `base_branch`, falls
+    // through to the project base.
+    if let Some(base) = workflow
+        .resolve_git(&task.string_params())?
+        .and_then(|g| g.base_branch)
+    {
+        return Ok(base);
+    }
+    Ok(project.base_branch().to_string())
 }
 
 /// Idempotently cut `branch` off `base` in the project's hub workdir.
 ///
 /// Behavior:
 /// - Branch already exists on hub → success, no-op.
-/// - Branch missing, base exists on hub → `git branch <branch> <base>`.
-/// - Branch missing, base missing → [`Error::Other`] naming both refs so
-///   the caller can surface a clear "this dep hasn't been pushed yet"
-///   message. The transition that triggered the cut is the right place
-///   to abort: silently dropping back to `main` would lose the
-///   depends_on intent without the user noticing.
+/// - Branch missing → resolve `base` to a concrete ref via
+///   [`resolve_hub_cut_base`] (a local head, else a freshly-fetched
+///   `origin/<base>`) and `git branch --no-track <branch> <ref>`.
+/// - Branch missing, base resolvable on neither the hub nor `origin` →
+///   [`Error::Other`] naming both refs so the caller can surface a clear
+///   "this base/dep hasn't been pushed yet" message. The transition that
+///   triggered the cut is the right place to abort: silently dropping back
+///   to `main` would lose the depends_on / `base_branch` intent without the
+///   user noticing.
+///
+/// `--no-track` keeps the task branch from adopting `origin/<base>` as its
+/// upstream when the cut comes from a remote-tracking ref — a task branch
+/// must never push to or diff against the shared base branch.
 pub fn cut_branch_on_hub(project: &Project, branch: &str, base: &str) -> Result<()> {
     let (host, dir) = locate_hub_workdir(project)?;
     let wt = dir.to_string_lossy().into_owned();
     if local_branch_exists(&host, &wt, branch)? {
         return Ok(());
     }
-    if !local_branch_exists(&host, &wt, base)? {
+    let Some(base_ref) = resolve_hub_cut_base(&host, &wt, base)? else {
         return Err(Error::Other(format!(
             "branch-cut: cannot cut `{branch}` because base `{base}` does not exist \
-             on the hub repo at `{wt}` (push the dep's branch first, or set \
-             `branch:` on the task to point at an existing ref)"
+             on the hub repo at `{wt}` or on `origin` (push the base/dep branch first, \
+             or set `branch:` on the task to point at an existing ref)"
         )));
-    }
-    let out = run_in_dir(&host, &wt, &["git", "branch", branch, base])?;
+    };
+    let out = run_in_dir(&host, &wt, &["git", "branch", "--no-track", branch, &base_ref])?;
     if !out.status.success() {
         return Err(Error::Command {
-            cmd: format!("git -C {wt} branch {branch} {base}"),
+            cmd: format!("git -C {wt} branch --no-track {branch} {base_ref}"),
             status: out.status.to_string(),
             stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
         });
     }
     Ok(())
+}
+
+/// Resolve the concrete ref [`cut_branch_on_hub`] should branch from.
+///
+/// Precedence:
+/// 1. A local head `refs/heads/<base>` — the dependency-stacking case,
+///    where the base is an in-progress sibling's branch that lives only on
+///    the hub (never pushed to origin). Used as-is, no fetch.
+/// 2. Otherwise, when the repo has an `origin` remote, fetch `<base>` from
+///    it and cut from the freshly-updated `origin/<base>`. This is how a
+///    workflow `git.base_branch` like `update/homepage` — a shared branch
+///    that lives on origin but was never checked out as a local head on the
+///    hub — becomes cuttable, and the fetch guarantees the cut sees the
+///    branch's current tip rather than a stale remote-tracking ref.
+/// 3. Otherwise the base genuinely can't be found (no local head, no
+///    origin, or not present on origin): `Ok(None)`, so the caller raises a
+///    clear error naming it instead of silently falling back to `main`.
+fn resolve_hub_cut_base(host: &Host, wt: &str, base: &str) -> Result<Option<String>> {
+    if local_branch_exists(host, wt, base)? {
+        return Ok(Some(base.to_string()));
+    }
+    let has_origin = run_in_dir(host, wt, &["git", "config", "--get", "remote.origin.url"])?
+        .status
+        .success();
+    if !has_origin {
+        return Ok(None);
+    }
+    // A fetch that fails because `<base>` isn't on origin (or origin is
+    // unreachable) is treated as "base not found" — the caller surfaces a
+    // clear error naming the base either way, which beats silently cutting
+    // from the project default.
+    if !run_in_dir(host, wt, &["git", "fetch", "origin", base])?
+        .status
+        .success()
+    {
+        return Ok(None);
+    }
+    let remote_ref = format!("origin/{base}");
+    let exists = run_in_dir(
+        host,
+        wt,
+        &[
+            "git",
+            "rev-parse",
+            "--verify",
+            "--quiet",
+            &format!("refs/remotes/{remote_ref}"),
+        ],
+    )?
+    .status
+    .success();
+    Ok(exists.then_some(remote_ref))
 }
 
 /// Prepare a task for the `Todo -> InProgress` transition: pick a
@@ -160,7 +245,7 @@ pub fn ensure_branch_for_in_progress(project: &Project, task_id: &str) -> Result
     let workflow = shelbi_state::load_task_workflow(&project.name, project, &tf.task)
         .unwrap_or_else(|_| shelbi_core::default_workflow());
     let branch = branch::branch_name_for_task(project, Some(&workflow), &tf.task)?;
-    let base = resolve_base_branch(project, &tf.task, &all_tasks)?;
+    let base = resolve_base_branch(project, &workflow, &tf.task, &all_tasks)?;
     cut_branch_on_hub(project, &branch, &base)?;
     if tf.task.branch.as_deref() != Some(branch.as_str()) {
         // Targeted, locked set-branch instead of writing the whole task back
@@ -240,6 +325,25 @@ mod tests {
         }
     }
 
+    /// A workflow with no `git:` block — the common case for the
+    /// dependency-resolution tests, which only care about dep stacking and
+    /// the project-base fallback.
+    fn wf() -> Workflow {
+        shelbi_core::default_workflow()
+    }
+
+    /// A workflow whose `git.base_branch` is `base` verbatim (may contain
+    /// `{{var}}` placeholders for the templating tests).
+    fn wf_with_base(base: &str) -> Workflow {
+        let mut w = shelbi_core::default_workflow();
+        w.git = Some(shelbi_core::GitConfig {
+            base_branch: Some(base.to_string()),
+            branch_prefix: None,
+            merge_strategy: shelbi_core::MergeStrategy::Squash,
+        });
+        w
+    }
+
     fn project_at(repo: &std::path::Path, base_branch: Option<&str>) -> Project {
         let mut runners = BTreeMap::new();
         runners.insert(
@@ -313,6 +417,60 @@ mod tests {
         (tmp, repo)
     }
 
+    /// A hub-repo clone whose `<base>` branch lives ONLY on `origin` — the
+    /// clone has a local `main` head but sees `<base>` only as
+    /// `origin/<base>`. Mirrors the reported bug's hub state: the workflow
+    /// `base_branch` (e.g. `update/homepage`) is present and freshly pushed
+    /// on origin but was never checked out as a local head on the hub.
+    fn fixture_clone_with_origin_base(base: &str) -> (tempfile::TempDir, PathBuf) {
+        let tmp = tempfile::tempdir().unwrap();
+        let origin = tmp.path().join("origin.git");
+        let seed = tmp.path().join("seed");
+        let clone = tmp.path().join("clone");
+        run_git(
+            tmp.path(),
+            &["init", "-q", "--bare", "-b", "main", origin.to_str().unwrap()],
+        );
+        run_git(
+            tmp.path(),
+            &["clone", "-q", origin.to_str().unwrap(), seed.to_str().unwrap()],
+        );
+        run_git(&seed, &["config", "user.email", "test@example.com"]);
+        run_git(&seed, &["config", "user.name", "Test"]);
+        std::fs::write(seed.join("README.md"), "hi\n").unwrap();
+        run_git(&seed, &["add", "README.md"]);
+        run_git(&seed, &["commit", "-q", "-m", "init"]);
+        run_git(&seed, &["push", "-q", "origin", "main"]);
+        // Diverge `<base>` from main so we can prove the cut lands on the
+        // base tip, not on main.
+        run_git(&seed, &["checkout", "-q", "-b", base]);
+        std::fs::write(seed.join("base.txt"), "from base\n").unwrap();
+        run_git(&seed, &["add", "base.txt"]);
+        run_git(&seed, &["commit", "-q", "-m", "base work"]);
+        run_git(&seed, &["push", "-q", "origin", base]);
+        // Fresh clone: only `main` is a local head; `<base>` is reachable
+        // solely via `origin/<base>`.
+        run_git(
+            tmp.path(),
+            &["clone", "-q", origin.to_str().unwrap(), clone.to_str().unwrap()],
+        );
+        (tmp, clone)
+    }
+
+    fn rev(repo: &std::path::Path, refname: &str) -> String {
+        String::from_utf8(
+            Command::new("git")
+                .current_dir(repo)
+                .args(["rev-parse", refname])
+                .output()
+                .unwrap()
+                .stdout,
+        )
+        .unwrap()
+        .trim()
+        .to_string()
+    }
+
     fn branch_exists(repo: &std::path::Path, branch: &str) -> bool {
         Command::new("git")
             .current_dir(repo)
@@ -336,7 +494,7 @@ mod tests {
         let (_tmp, repo) = fixture_repo();
         let p = project_at(&repo, None);
         let t = task_with("a", Column::todo(), None, &[]);
-        assert_eq!(resolve_base_branch(&p, &t, &[]).unwrap(), "main");
+        assert_eq!(resolve_base_branch(&p, &wf(), &t, &[]).unwrap(), "main");
     }
 
     #[test]
@@ -349,7 +507,7 @@ mod tests {
         let candidate = task_with("b", Column::todo(), None, &["a"]);
         let all = vec![tf_with(dep_a)];
         assert_eq!(
-            resolve_base_branch(&p, &candidate, &all).unwrap(),
+            resolve_base_branch(&p, &wf(), &candidate, &all).unwrap(),
             "shelbi/a"
         );
     }
@@ -364,7 +522,7 @@ mod tests {
         let candidate = task_with("b", Column::todo(), None, &["a"]);
         let all = vec![tf_with(dep_a)];
         assert_eq!(
-            resolve_base_branch(&p, &candidate, &all).unwrap(),
+            resolve_base_branch(&p, &wf(), &candidate, &all).unwrap(),
             "shelbi/a"
         );
     }
@@ -381,7 +539,7 @@ mod tests {
         let dep_a = task_with("a", Column::done(), Some("shelbi/a"), &[]);
         let candidate = task_with("b", Column::todo(), None, &["a"]);
         let all = vec![tf_with(dep_a)];
-        assert_eq!(resolve_base_branch(&p, &candidate, &all).unwrap(), "main");
+        assert_eq!(resolve_base_branch(&p, &wf(), &candidate, &all).unwrap(), "main");
     }
 
     #[test]
@@ -396,7 +554,7 @@ mod tests {
         let candidate = task_with("c", Column::todo(), None, &["a", "b"]);
         let all = vec![tf_with(dep_a), tf_with(dep_b)];
         assert_eq!(
-            resolve_base_branch(&p, &candidate, &all).unwrap(),
+            resolve_base_branch(&p, &wf(), &candidate, &all).unwrap(),
             "shelbi/b"
         );
     }
@@ -410,7 +568,7 @@ mod tests {
         let dep_a = task_with("a", Column::backlog(), None, &[]);
         let candidate = task_with("b", Column::todo(), None, &["a"]);
         let all = vec![tf_with(dep_a)];
-        let err = resolve_base_branch(&p, &candidate, &all).unwrap_err();
+        let err = resolve_base_branch(&p, &wf(), &candidate, &all).unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("`b`"), "msg: {msg}");
         assert!(msg.contains("not yet started: a"), "msg: {msg}");
@@ -427,7 +585,7 @@ mod tests {
         let dep_b = task_with("b", Column::in_progress(), Some("shelbi/b"), &[]);
         let candidate = task_with("c", Column::todo(), None, &["todo-dep", "b"]);
         let all = vec![tf_with(dep_a), tf_with(dep_b)];
-        let err = resolve_base_branch(&p, &candidate, &all).unwrap_err();
+        let err = resolve_base_branch(&p, &wf(), &candidate, &all).unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("not yet started: todo-dep"), "msg: {msg}");
     }
@@ -442,7 +600,7 @@ mod tests {
         let (_tmp, repo) = fixture_repo();
         let p = project_at(&repo, None);
         let candidate = task_with("orphan", Column::todo(), None, &["ghost"]);
-        assert_eq!(resolve_base_branch(&p, &candidate, &[]).unwrap(), "main");
+        assert_eq!(resolve_base_branch(&p, &wf(), &candidate, &[]).unwrap(), "main");
     }
 
     #[test]
@@ -453,7 +611,7 @@ mod tests {
         let (_tmp, repo) = fixture_repo();
         let p = project_at(&repo, Some("develop"));
         let t = task_with("a", Column::todo(), None, &[]);
-        assert_eq!(resolve_base_branch(&p, &t, &[]).unwrap(), "develop");
+        assert_eq!(resolve_base_branch(&p, &wf(), &t, &[]).unwrap(), "develop");
     }
 
     #[test]
@@ -466,7 +624,71 @@ mod tests {
         let dep_a = task_with("a", Column::in_progress(), Some("   "), &[]);
         let candidate = task_with("b", Column::todo(), None, &["a"]);
         let all = vec![tf_with(dep_a)];
-        assert_eq!(resolve_base_branch(&p, &candidate, &all).unwrap(), "main");
+        assert_eq!(resolve_base_branch(&p, &wf(), &candidate, &all).unwrap(), "main");
+    }
+
+    #[test]
+    fn resolve_base_uses_templated_workflow_base_branch() {
+        // The reported bug: a subtask whose workflow declares
+        // `base_branch: update/{{update}}` and whose frontmatter sets
+        // `update: homepage` must be cut from `update/homepage`, not the
+        // project default. No deps, so the workflow base is the fallback.
+        let (_tmp, repo) = fixture_repo();
+        let p = project_at(&repo, None);
+        let mut t = task_with("hp-refresh", Column::todo(), None, &[]);
+        t.params.insert("update".into(), "homepage".into());
+        let wf = wf_with_base("update/{{update}}");
+        assert_eq!(
+            resolve_base_branch(&p, &wf, &t, &[]).unwrap(),
+            "update/homepage"
+        );
+    }
+
+    #[test]
+    fn resolve_base_workflow_base_wins_over_project_default() {
+        // Even when the project sets `git.base_branch: develop`, a workflow
+        // that declares its own (non-templated) base_branch takes
+        // precedence for tasks on that workflow.
+        let (_tmp, repo) = fixture_repo();
+        let p = project_at(&repo, Some("develop"));
+        let t = task_with("a", Column::todo(), None, &[]);
+        let wf = wf_with_base("release/next");
+        assert_eq!(
+            resolve_base_branch(&p, &wf, &t, &[]).unwrap(),
+            "release/next"
+        );
+    }
+
+    #[test]
+    fn resolve_base_active_dep_wins_over_workflow_base_branch() {
+        // Dep stacking is still the highest-priority signal: a chain must
+        // stack on the active dep's branch even when the workflow declares
+        // a base_branch. The workflow base is only the no-active-dep
+        // fallback.
+        let (_tmp, repo) = fixture_repo();
+        let p = project_at(&repo, None);
+        let dep_a = task_with("a", Column::in_progress(), Some("shelbi/a"), &[]);
+        let candidate = task_with("b", Column::todo(), None, &["a"]);
+        let all = vec![tf_with(dep_a)];
+        let wf = wf_with_base("feature/x");
+        assert_eq!(
+            resolve_base_branch(&p, &wf, &candidate, &all).unwrap(),
+            "shelbi/a"
+        );
+    }
+
+    #[test]
+    fn resolve_base_surfaces_missing_param_for_templated_base() {
+        // Workflow declares `base_branch: update/{{update}}` but the task
+        // has no `update:` frontmatter. Rather than silently cutting from
+        // main, surface the parameterization error naming the missing key.
+        let (_tmp, repo) = fixture_repo();
+        let p = project_at(&repo, None);
+        let t = task_with("no-param", Column::todo(), None, &[]);
+        let wf = wf_with_base("update/{{update}}");
+        let err = resolve_base_branch(&p, &wf, &t, &[]).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("update"), "msg: {msg}");
     }
 
     // ----- cut_branch_on_hub -------------------------------------------
@@ -518,6 +740,64 @@ mod tests {
         assert!(msg.contains("shelbi/dep"), "msg: {msg}");
         assert!(msg.contains("base"), "msg: {msg}");
         assert!(!branch_exists(&repo, "shelbi/dependent"));
+    }
+
+    #[test]
+    fn cut_branch_uses_origin_base_when_only_on_origin() {
+        // The reported bug's hub state: the workflow `base_branch`
+        // (`update/homepage`) exists only as `origin/update/homepage` — no
+        // local head. The cut must fetch and branch from the origin ref, so
+        // the task branch carries the base's work, not main's.
+        let (_tmp, repo) = fixture_clone_with_origin_base("update/homepage");
+        let p = project_at(&repo, None);
+        assert!(
+            !branch_exists(&repo, "update/homepage"),
+            "precondition: base must not be a local head"
+        );
+
+        cut_branch_on_hub(&p, "jlong/hp-task", "update/homepage").unwrap();
+
+        assert!(branch_exists(&repo, "jlong/hp-task"));
+        assert_eq!(
+            rev(&repo, "jlong/hp-task"),
+            rev(&repo, "origin/update/homepage"),
+            "task branch must be cut from origin/update/homepage's tip"
+        );
+        assert_ne!(
+            rev(&repo, "jlong/hp-task"),
+            rev(&repo, "main"),
+            "task branch must NOT be cut from main"
+        );
+        // `--no-track`: the task branch must not adopt the shared base as
+        // its upstream.
+        let upstream = Command::new("git")
+            .current_dir(&repo)
+            .args([
+                "rev-parse",
+                "--abbrev-ref",
+                "--symbolic-full-name",
+                "jlong/hp-task@{upstream}",
+            ])
+            .output()
+            .unwrap();
+        assert!(
+            !upstream.status.success(),
+            "task branch must have no upstream set"
+        );
+    }
+
+    #[test]
+    fn cut_branch_errors_when_base_absent_on_hub_and_origin() {
+        // Base is neither a local head nor present on origin — the fetch
+        // fails and the cut surfaces a clear error rather than falling back
+        // to main.
+        let (_tmp, repo) = fixture_clone_with_origin_base("update/homepage");
+        let p = project_at(&repo, None);
+        let err = cut_branch_on_hub(&p, "jlong/ghost-task", "update/does-not-exist").unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("update/does-not-exist"), "msg: {msg}");
+        assert!(msg.contains("origin"), "msg: {msg}");
+        assert!(!branch_exists(&repo, "jlong/ghost-task"));
     }
 
     // ----- ensure_branch_for_in_progress -------------------------------
