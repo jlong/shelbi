@@ -190,7 +190,8 @@ pub fn scaffold_project_workflow(project: &str) -> Result<Vec<PathBuf>> {
 /// must exist (the post-Phase-1 contract). `shelbi init` and `shelbi
 /// reload` materialize the shipped default when missing.
 pub fn load_workflow(project: &str, name: &str) -> Result<Workflow> {
-    let path = workflow_path(project, name)?;
+    let name = resolve_workflow_alias(project, name)?;
+    let path = workflow_path(project, &name)?;
     let text = fs::read_to_string(&path)?;
 
     let inline = Workflow::inline_identity_fields(&text).map_err(|e| annotate(&path, e))?;
@@ -213,6 +214,36 @@ pub fn load_workflow(project: &str, name: &str) -> Result<Workflow> {
 
     validate_agent_references(project, &resolved).map_err(|e| annotate(&path, e))?;
     Ok(resolved)
+}
+
+/// Alias the legacy workflow name `default` to `task` at load time.
+///
+/// Projects created before the `task`/`subtask` scaffold refer to the
+/// workflow name `default` — both in a project's `default_workflow:` and
+/// in existing task frontmatter (`workflow: default`). Once such a
+/// project has been migrated to the new scaffold (ships `task.yaml`, no
+/// longer carries its own `workflows/default.yaml`), those references
+/// resolve here to `task`, so the board keeps loading and dispatching
+/// against the current default track.
+///
+/// The alias fires **only when `default.yaml` is genuinely absent** and a
+/// `task.yaml` is present: a project that still has a real `default.yaml`
+/// (a user's own workflow, or a not-yet-migrated legacy default) loads it
+/// verbatim, so the alias never shadows a workflow the user put on disk.
+/// When neither file exists the name is returned unchanged, preserving the
+/// existing built-in-default fallback the callers apply on the resulting
+/// `NotFound`.
+fn resolve_workflow_alias(project: &str, name: &str) -> Result<String> {
+    if name != shelbi_core::DEFAULT_WORKFLOW_NAME {
+        return Ok(name.to_string());
+    }
+    if workflow_path(project, shelbi_core::DEFAULT_WORKFLOW_NAME)?.exists() {
+        return Ok(name.to_string());
+    }
+    if workflow_path(project, shelbi_core::TASK_WORKFLOW_NAME)?.exists() {
+        return Ok(shelbi_core::TASK_WORKFLOW_NAME.to_string());
+    }
+    Ok(name.to_string())
 }
 
 /// Resolve the workflow name for `task` with project context:
@@ -755,6 +786,62 @@ workspaces:
         assert_eq!(resolve_task_workflow_name(&project, &task), "default");
         assert_eq!(task.workflow_or_default(), "default");
 
+        std::env::remove_var("SHELBI_HOME");
+    }
+
+    #[test]
+    fn load_workflow_aliases_default_to_task_when_only_task_present() {
+        // A migrated project ships `task.yaml`/`subtask.yaml` and no
+        // `default.yaml`. Existing task frontmatter (`workflow: default`)
+        // must keep loading — it resolves to the `task` workflow.
+        let _g = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+        materialize_default_agents("p").unwrap();
+        write_default_statuses("p");
+        scaffold_project_workflow("p").unwrap();
+        // No `default.yaml` on disk.
+        assert!(!workflow_path("p", "default").unwrap().exists());
+
+        let wf = load_workflow("p", "default").unwrap();
+        assert_eq!(wf.name, shelbi_core::TASK_WORKFLOW_NAME);
+        std::env::remove_var("SHELBI_HOME");
+    }
+
+    #[test]
+    fn load_workflow_prefers_real_default_yaml_over_alias() {
+        // A project that still carries its own `default.yaml` (a user's
+        // workflow, or a not-yet-migrated legacy default) loads it
+        // verbatim — the alias never shadows a workflow on disk even when
+        // `task.yaml` also exists.
+        let _g = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+        materialize_default_agents("p").unwrap();
+        write_default_statuses("p");
+        scaffold_project_workflow("p").unwrap();
+        let dir = workflows_dir("p").unwrap();
+        // A real `default.yaml` with a distinguishable status subset.
+        write_workflow(&dir, "default", SIMPLE_WORKFLOW);
+
+        let wf = load_workflow("p", "default").unwrap();
+        // Declared `name:` in SIMPLE_WORKFLOW is `design-review`; the point
+        // is that the on-disk `default.yaml` was loaded, not `task.yaml`.
+        assert_ne!(wf.name, shelbi_core::TASK_WORKFLOW_NAME);
+        std::env::remove_var("SHELBI_HOME");
+    }
+
+    #[test]
+    fn load_workflow_leaves_default_unchanged_when_no_task_yaml() {
+        // Truly legacy project — neither `default.yaml` nor `task.yaml`
+        // present. The alias is a no-op and the name is looked up as-is,
+        // yielding the usual NotFound the callers fall back on.
+        let _g = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+        write_default_statuses("p");
+        let err = load_workflow("p", "default").unwrap_err();
+        assert!(matches!(err, Error::Io(_)), "got: {err}");
         std::env::remove_var("SHELBI_HOME");
     }
 
