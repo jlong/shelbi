@@ -1,6 +1,6 @@
 use anyhow::{anyhow, Result};
 use shelbi_orchestrator::handoff::HandoffOutcome;
-use shelbi_orchestrator::{PaneReloadStatus, ReloadReport};
+use shelbi_orchestrator::{PaneReloadStatus, ReloadReport, ReloadTarget};
 use shelbi_state::WorkspaceSettingsTemplateOutcome;
 
 use super::init::print_agent_materialize_outcome;
@@ -25,7 +25,36 @@ use super::require_project;
 /// the workspace-settings template is always re-aligned with the
 /// shipped default (users who want customization point
 /// `workspace_settings_template` at their own file).
-pub fn run(project_opt: Option<String>) -> Result<()> {
+pub fn run(
+    project_opt: Option<String>,
+    target: Option<String>,
+    name: Option<String>,
+) -> Result<()> {
+    let target =
+        ReloadTarget::parse(target.as_deref(), name.as_deref()).map_err(|e| anyhow!(e))?;
+
+    // A targeted pane reload respawns one pane in place and deliberately
+    // skips the whole-hub self-heal (root/subdir re-materialization,
+    // workflow + statuses compatibility migration, agent-workspace and
+    // settings-template repair, legacy-marker sweep). Each target carries
+    // its own dependency refresh: `chat` re-deploys the orchestrator agent
+    // context inside the respawn, and the TUI panes render derived state
+    // straight from disk.
+    if !matches!(target, ReloadTarget::All) {
+        let project_name = require_project(project_opt)?;
+        let report =
+            shelbi_orchestrator::reload_target(&project_name, &target).map_err(|e| anyhow!(e))?;
+        print_report(&project_name, &report);
+        return Ok(());
+    }
+
+    run_all(project_opt)
+}
+
+/// The whole-hub reload: sweep legacy markers, self-heal the project's
+/// materialized state, then respawn every shelbi-owned pane and the
+/// orchestrator.
+fn run_all(project_opt: Option<String>) -> Result<()> {
     // Migration hook for the dropped `.shelbi/project` marker: sweep every
     // registered project's work_dir, delete any leftover marker, and warn
     // about work_dirs that have gone missing. Runs before `require_project`
@@ -148,14 +177,27 @@ fn print_workspace_settings_template_outcome(outcome: &WorkspaceSettingsTemplate
 
 fn print_report(project: &str, r: &ReloadReport) {
     println!("reload · {project}");
-    print_pane("sidebar", &r.sidebar);
-    print_pane("tasks", &r.tasks);
-    print_pane("machines", &r.machines);
-    print_pane("activity", &r.activity);
+    // A whole-hub reload attempts every pane; a targeted reload leaves the
+    // untouched panes `NotAttempted`. Skip those so a targeted reload prints
+    // only the pane(s) it actually respawned.
+    print_pane_if_attempted("sidebar", &r.sidebar);
+    print_pane_if_attempted("tasks", &r.tasks);
+    print_pane_if_attempted("machines", &r.machines);
+    print_pane_if_attempted("activity", &r.activity);
     if let Some(h) = &r.handoff {
         print_handoff(h);
     }
-    print_pane("orch", &r.orchestrator);
+    print_pane_if_attempted("orch", &r.orchestrator);
+    if let Some(ws) = &r.workspace {
+        print_pane(&format!("ws:{}", ws.name), &ws.status);
+    }
+}
+
+fn print_pane_if_attempted(name: &str, status: &PaneReloadStatus) {
+    if matches!(status, PaneReloadStatus::NotAttempted) {
+        return;
+    }
+    print_pane(name, status);
 }
 
 fn print_handoff(outcome: &HandoffOutcome) {

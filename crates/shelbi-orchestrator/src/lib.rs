@@ -98,6 +98,88 @@ pub struct ReloadReport {
     /// the legacy/no-attempt state; otherwise carries the outcome of
     /// the request (file written, pane already dead, timeout, etc.).
     pub handoff: Option<handoff::HandoffOutcome>,
+    /// Set only by a targeted `workspace <name>` reload — the worker pane
+    /// that was respawned and its outcome. `None` on the whole-hub reload
+    /// and every other targeted reload (worker panes are out of scope
+    /// there: they re-shell `shelbi` on each call).
+    pub workspace: Option<WorkspaceReloadStatus>,
+}
+
+/// Outcome of a targeted `shelbi reload workspace <name>`.
+#[derive(Debug, Clone)]
+pub struct WorkspaceReloadStatus {
+    pub name: String,
+    pub status: PaneReloadStatus,
+}
+
+/// Which part of the hub a `shelbi reload` should respawn. `All` is the
+/// back-compat default (whole-hub reload, carrying the orchestrator
+/// handoff forward); every other variant respawns a single pane in place
+/// and leaves the rest — and their state — untouched.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReloadTarget {
+    /// Whole hub: sidebar + stash panes + orchestrator, with handoff.
+    All,
+    /// The orchestrator chat pane (respawn with handoff carried forward).
+    Chat,
+    /// The tasks / kanban stash pane.
+    Tasks,
+    /// The activity / events-feed stash pane.
+    Activity,
+    /// The workspace-roster sidebar pane.
+    Sidebar,
+    /// A single worker workspace pane, named.
+    Workspace(String),
+}
+
+impl ReloadTarget {
+    /// Parse the `shelbi reload [<target>] [<name>]` positionals. `target`
+    /// is the first positional (`chat`, `tasks`, `activity`, `sidebar`,
+    /// `workspace`, `all`, or absent); `name` is the second, required only
+    /// for `workspace`. Unknown targets and misplaced names are hard
+    /// errors so the CLI can surface the valid set.
+    pub fn parse(target: Option<&str>, name: Option<&str>) -> Result<Self> {
+        let target = target.map(str::trim).filter(|t| !t.is_empty());
+        let name = name.map(str::trim).filter(|n| !n.is_empty());
+        match target {
+            None | Some("all") => {
+                if let Some(name) = name {
+                    return Err(Error::Other(format!(
+                        "`shelbi reload` reloads the whole hub and takes no name; \
+                         did you mean `shelbi reload workspace {name}`?"
+                    )));
+                }
+                Ok(ReloadTarget::All)
+            }
+            Some("workspace") => {
+                let name = name.ok_or_else(|| {
+                    Error::Other(
+                        "`shelbi reload workspace` requires a workspace name \
+                         (e.g. `shelbi reload workspace alpha`)"
+                            .into(),
+                    )
+                })?;
+                Ok(ReloadTarget::Workspace(name.to_string()))
+            }
+            Some(single @ ("chat" | "tasks" | "activity" | "sidebar")) => {
+                if name.is_some() {
+                    return Err(Error::Other(format!(
+                        "`shelbi reload {single}` takes no extra argument"
+                    )));
+                }
+                Ok(match single {
+                    "chat" => ReloadTarget::Chat,
+                    "tasks" => ReloadTarget::Tasks,
+                    "activity" => ReloadTarget::Activity,
+                    _ => ReloadTarget::Sidebar,
+                })
+            }
+            Some(other) => Err(Error::Other(format!(
+                "unknown reload target `{other}`; valid targets: \
+                 chat, tasks, activity, sidebar, workspace <name>, all"
+            ))),
+        }
+    }
 }
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
@@ -1087,6 +1169,32 @@ fn machines_cmd(shelbi_bin: &str, project_name: &str) -> String {
     )
 }
 
+/// The `sh -c` body a LOCAL workspace pane runs: the lifecycle wrapper
+/// (`shelbi open <name> --as-pane`). `resume` appends `--resume` so the
+/// wrapper relaunches the runner with `--continue` (claude) instead of a
+/// cold start — used by the targeted `workspace` reload so a respawned
+/// worker keeps its conversation. Shared with the CLI's focus-or-create
+/// path (`shelbi-cli` `open/pane.rs::wrapper_invocation`) so the two
+/// can't drift.
+pub fn workspace_pane_cmd(
+    shelbi_bin: &str,
+    project: &str,
+    workspace: &str,
+    resume: bool,
+) -> String {
+    let base = format!(
+        "{bin} --project {proj} open {ws} --as-pane",
+        bin = shelbi_agent::shell_escape(shelbi_bin),
+        proj = shelbi_agent::shell_escape(project),
+        ws = shelbi_agent::shell_escape(workspace),
+    );
+    if resume {
+        format!("{base} --resume")
+    } else {
+        base
+    }
+}
+
 // ---------------------------------------------------------------------------
 // reload — respawn shelbi-owned panes in-place so a freshly installed
 // binary takes effect without disturbing the orchestrator or workspaces.
@@ -1123,6 +1231,18 @@ fn machines_cmd(shelbi_bin: &str, project_name: &str) -> String {
 /// so a fresh process picks up where the old one was. A missing pane
 /// is created on the first call and respawned on subsequent ones.
 pub fn reload(project_name: &str) -> Result<ReloadReport> {
+    reload_target(project_name, &ReloadTarget::All)
+}
+
+/// Reload one part of the hub (or, for [`ReloadTarget::All`], the whole
+/// thing). Every arm respawns its pane(s) in place, preserving pane ids
+/// so view-swaps keep working. A targeted reload touches ONLY the named
+/// pane and populates only that field of the returned [`ReloadReport`];
+/// the CLI's whole-hub self-heal is skipped for targeted reloads (the
+/// pane each target touches carries its own dependency refresh — `chat`
+/// re-deploys the orchestrator agent context, the TUI panes render
+/// derived state straight from disk).
+pub fn reload_target(project_name: &str, target: &ReloadTarget) -> Result<ReloadReport> {
     let session = format!("shelbi-{project_name}");
 
     // Session must exist — there's nothing to reload if the user hasn't
@@ -1134,14 +1254,87 @@ pub fn reload(project_name: &str) -> Result<ReloadReport> {
     }
 
     let shelbi_bin = current_exe_string()?;
+    let mut report = ReloadReport::default();
 
-    // 0. Ask the previous orchestrator to write its handoff before we
-    //    touch any pane. Done up front so the orchestrator has the most
-    //    time possible to respond before we get to the respawn step,
-    //    and so its write doesn't race the sidebar flicker. Errors are
-    //    swallowed — the report's `handoff` field records what
-    //    happened for the caller's display.
-    let handoff_outcome = match handoff::request_orchestrator_handoff(project_name) {
+    match target {
+        ReloadTarget::All => reload_all(&session, project_name, &shelbi_bin, &mut report),
+        ReloadTarget::Sidebar => {
+            report.sidebar = reload_sidebar(&session, project_name, &shelbi_bin);
+        }
+        ReloadTarget::Tasks => {
+            report.tasks =
+                reload_stash_pane(&session, "tasks", &tasks_cmd(&shelbi_bin, project_name));
+        }
+        ReloadTarget::Activity => {
+            report.activity = reload_stash_pane(
+                &session,
+                "activity",
+                &activity_cmd(&shelbi_bin, project_name),
+            );
+        }
+        ReloadTarget::Chat => {
+            // Carry the orchestrator's mid-thought context forward exactly
+            // as the whole-hub reload does: request the handoff, then
+            // respawn the pane (which re-deploys the agent context and
+            // splices in / deletes handoff.md).
+            report.handoff = request_orchestrator_handoff_best_effort(project_name);
+            report.orchestrator = reload_orchestrator_pane(&session, project_name, &shelbi_bin);
+        }
+        ReloadTarget::Workspace(name) => {
+            let status = reload_workspace_pane(project_name, &session, &shelbi_bin, name)?;
+            report.workspace = Some(WorkspaceReloadStatus {
+                name: name.clone(),
+                status,
+            });
+        }
+    }
+
+    Ok(report)
+}
+
+/// The whole-hub reload body: request the handoff up front (so the
+/// orchestrator has the most time possible to respond before its pane is
+/// touched), then respawn every shelbi-owned pane, then the orchestrator
+/// pane last (see [`reload_orchestrator_pane`]).
+fn reload_all(session: &str, project_name: &str, shelbi_bin: &str, report: &mut ReloadReport) {
+    // 0. Handoff request first — before any pane flicker races its write.
+    report.handoff = request_orchestrator_handoff_best_effort(project_name);
+
+    // Re-apply the palette tmux binding so reload picks up `keys.yaml`
+    // edits without forcing the user to kill + restart the dashboard.
+    let _ = apply_palette_binding(&Host::Local, project_name, shelbi_bin);
+
+    // 1. Sidebar.
+    report.sidebar = reload_sidebar(session, project_name, shelbi_bin);
+
+    // 2-4. Stash panes — pane ids are stored in session env at bootstrap.
+    report.tasks = reload_stash_pane(session, "tasks", &tasks_cmd(shelbi_bin, project_name));
+    report.machines =
+        reload_stash_pane(session, "machines", &machines_cmd(shelbi_bin, project_name));
+    report.activity =
+        reload_stash_pane(session, "activity", &activity_cmd(shelbi_bin, project_name));
+
+    // 5. Orchestrator pane, respawned last so its handoff had maximum time.
+    report.orchestrator = reload_orchestrator_pane(session, project_name, shelbi_bin);
+}
+
+/// Respawn the sidebar pane. Its pane id isn't stored at bootstrap, so
+/// target it positionally: `dashboard.{left}` resolves to the leftmost
+/// pane in the dashboard window, which is always the sidebar (the
+/// orchestrator split landed on the right and view-swaps only touch
+/// `dashboard.{right}`).
+fn reload_sidebar(session: &str, project_name: &str, shelbi_bin: &str) -> PaneReloadStatus {
+    let sidebar_target = format!("{session}:dashboard.{{left}}");
+    respawn_pane(&sidebar_target, &sidebar_cmd(shelbi_bin, project_name))
+}
+
+/// Ask the previous orchestrator to write `handoff.md`, mapping a request
+/// failure to `None` (the pane restarts cold) with a warning. Shared by
+/// the whole-hub reload and the `chat`-only reload.
+fn request_orchestrator_handoff_best_effort(
+    project_name: &str,
+) -> Option<handoff::HandoffOutcome> {
+    match handoff::request_orchestrator_handoff(project_name) {
         Ok(outcome) => Some(outcome),
         Err(e) => {
             tracing::warn!(
@@ -1151,44 +1344,79 @@ pub fn reload(project_name: &str) -> Result<ReloadReport> {
             );
             None
         }
+    }
+}
+
+/// Respawn a single worker workspace pane in place.
+///
+/// Local workspaces run the `shelbi open <name> --as-pane` lifecycle
+/// wrapper as their pane process; respawning it with `--resume` relaunches
+/// the agent with `--continue` so the worker keeps its conversation
+/// (mirroring how `chat` carries the orchestrator handoff). tmux preserves
+/// the pane's injected `TASK_ID` / `PROJECT` / `SHELBI_HUB_SOCK` (and any
+/// review-slot `PORT` / `SHELBI_WORKSPACE`) env across `respawn-pane`, so
+/// the resumed wrapper stays wired to the same task and hub socket. An
+/// expected-teardown mark is set first so the SIGHUP `respawn-pane -k`
+/// delivers to the old wrapper doesn't fire a spurious `pane_alive=false`
+/// event (the fresh wrapper clears any leftover mark on startup).
+///
+/// Remote workspaces have no local wrapper — the dashboard pane is a proxy
+/// that `ssh -t … tmux attach`es into the workspace's own remote session;
+/// respawning it just reconnects that view, leaving the remote agent
+/// untouched.
+///
+/// An unknown workspace name, an unknown backing machine, or a workspace
+/// with no live pane are hard errors so the CLI surfaces them clearly.
+fn reload_workspace_pane(
+    project_name: &str,
+    session: &str,
+    shelbi_bin: &str,
+    name: &str,
+) -> Result<PaneReloadStatus> {
+    let project = shelbi_state::load_project(project_name)?;
+    let workspace = project.workspace(name).ok_or_else(|| {
+        let known = project
+            .workspaces
+            .iter()
+            .map(|w| w.name.as_str())
+            .collect::<Vec<_>>()
+            .join(", ");
+        Error::Other(format!(
+            "unknown workspace `{name}` in project `{project_name}` (known: {known})"
+        ))
+    })?;
+    let machine = project
+        .machine(&workspace.machine)
+        .ok_or_else(|| Error::UnknownMachine(workspace.machine.clone()))?;
+    let host = machine.host();
+    let addr = workspace::workspace_tmux_addr(&project, workspace)?;
+
+    // Nothing to respawn if the pane was never started (or is already gone).
+    if !workspace::workspace_slot_alive(&host, &addr)? {
+        return Err(Error::Other(format!(
+            "workspace `{name}` has no running pane to reload; \
+             start it first (dispatch a task, or `shelbi open {name}`)"
+        )));
+    }
+
+    // Exact window match (`=`) so `web` never resolves an existing
+    // `web-api` window.
+    let target = format!("{session}:={name}");
+    let cmd = match &host {
+        Host::Local => {
+            let _ = shelbi_state::mark_expected_teardown(name);
+            workspace_pane_cmd(shelbi_bin, project_name, name, true)
+        }
+        Host::Ssh { host: ssh_host } => {
+            let remote_session = format!("shelbi-w-{name}");
+            format!(
+                "ssh -t {host} tmux attach -t {remote_session}",
+                host = shelbi_agent::shell_escape(ssh_host),
+                remote_session = shelbi_agent::shell_escape(&remote_session),
+            )
+        }
     };
-    let mut report = ReloadReport {
-        handoff: handoff_outcome,
-        ..Default::default()
-    };
-
-    // Re-apply the palette tmux binding so reload picks up `keys.yaml`
-    // edits without forcing the user to kill + restart the dashboard.
-    let _ = apply_palette_binding(&Host::Local, project_name, &shelbi_bin);
-
-    // 1. Sidebar — pane id isn't stored at bootstrap; target positionally.
-    //    `dashboard.{left}` resolves to the leftmost pane in the dashboard
-    //    window, which is always the sidebar (the orchestrator's split
-    //    landed on the right and view-swaps only touch dashboard.{right}).
-    let sidebar_target = format!("{session}:dashboard.{{left}}");
-    report.sidebar = respawn_pane(&sidebar_target, &sidebar_cmd(&shelbi_bin, project_name));
-
-    // 2-5. Stash panes — pane ids are stored in session env at bootstrap.
-    report.tasks = reload_stash_pane(&session, "tasks", &tasks_cmd(&shelbi_bin, project_name));
-    report.machines = reload_stash_pane(
-        &session,
-        "machines",
-        &machines_cmd(&shelbi_bin, project_name),
-    );
-    report.activity = reload_stash_pane(
-        &session,
-        "activity",
-        &activity_cmd(&shelbi_bin, project_name),
-    );
-
-    // 6. Orchestrator pane. Re-deploy the agent context first so the new
-    //    launch sees the latest `instructions.md` / `preamble.md` AND
-    //    splices in the handoff (then deletes it). Then respawn the
-    //    pane in place — the pane id is preserved by `respawn-pane`,
-    //    so `show_view("orch")` keeps working.
-    report.orchestrator = reload_orchestrator_pane(&session, project_name, &shelbi_bin);
-
-    Ok(report)
+    Ok(respawn_pane(&target, &cmd))
 }
 
 /// Respawn the orchestrator pane in place. Re-deploys the agent
@@ -1741,6 +1969,110 @@ mod pane_cmd_tests {
         let out = sidebar_cmd("/Users/jane doe/.cargo/bin/shelbi", "myapp");
         assert_eq!(out, "'/Users/jane doe/.cargo/bin/shelbi' __sidebar myapp");
     }
+
+    #[test]
+    fn workspace_pane_cmd_is_the_wrapper_invocation() {
+        // Matches the CLI's `open/pane.rs::wrapper_invocation` output byte
+        // for byte — the two share this builder so a focus/create pane and
+        // a reloaded one run the identical wrapper.
+        let out = workspace_pane_cmd("shelbi", "demo", "alpha", false);
+        assert_eq!(out, "shelbi --project demo open alpha --as-pane");
+    }
+
+    #[test]
+    fn workspace_pane_cmd_appends_resume_flag() {
+        // A targeted `workspace` reload resumes so the worker keeps its
+        // conversation (claude `--continue`).
+        let out = workspace_pane_cmd("shelbi", "demo", "alpha", true);
+        assert_eq!(out, "shelbi --project demo open alpha --as-pane --resume");
+    }
+
+    #[test]
+    fn workspace_pane_cmd_shell_escapes_each_segment() {
+        // A spaced binary path / project / workspace must each come out
+        // individually quoted inside the enclosing `sh -c '<…>'`.
+        let out = workspace_pane_cmd("/Users/jane doe/shelbi", "my proj", "alpha", true);
+        assert!(out.contains("'/Users/jane doe/shelbi'"), "got: {out}");
+        assert!(out.contains("--project 'my proj'"), "got: {out}");
+        assert!(out.ends_with("open alpha --as-pane --resume"), "got: {out}");
+    }
+
+    #[test]
+    fn reload_target_parses_bare_and_all() {
+        assert_eq!(ReloadTarget::parse(None, None).unwrap(), ReloadTarget::All);
+        assert_eq!(
+            ReloadTarget::parse(Some("all"), None).unwrap(),
+            ReloadTarget::All
+        );
+        // Whitespace/empty target normalizes to the whole-hub default.
+        assert_eq!(
+            ReloadTarget::parse(Some("  "), None).unwrap(),
+            ReloadTarget::All
+        );
+    }
+
+    #[test]
+    fn reload_target_parses_single_pane_targets() {
+        assert_eq!(
+            ReloadTarget::parse(Some("chat"), None).unwrap(),
+            ReloadTarget::Chat
+        );
+        assert_eq!(
+            ReloadTarget::parse(Some("tasks"), None).unwrap(),
+            ReloadTarget::Tasks
+        );
+        assert_eq!(
+            ReloadTarget::parse(Some("activity"), None).unwrap(),
+            ReloadTarget::Activity
+        );
+        assert_eq!(
+            ReloadTarget::parse(Some("sidebar"), None).unwrap(),
+            ReloadTarget::Sidebar
+        );
+    }
+
+    #[test]
+    fn reload_target_parses_workspace_with_name() {
+        assert_eq!(
+            ReloadTarget::parse(Some("workspace"), Some("alpha")).unwrap(),
+            ReloadTarget::Workspace("alpha".into())
+        );
+    }
+
+    #[test]
+    fn reload_target_workspace_requires_a_name() {
+        let err = ReloadTarget::parse(Some("workspace"), None).unwrap_err();
+        assert!(
+            err.to_string().contains("requires a workspace name"),
+            "got: {err}"
+        );
+        // Whitespace-only name is treated as missing.
+        assert!(ReloadTarget::parse(Some("workspace"), Some("   ")).is_err());
+    }
+
+    #[test]
+    fn reload_target_rejects_unknown_target_with_valid_set() {
+        let err = ReloadTarget::parse(Some("orchestrator"), None).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("unknown reload target `orchestrator`"), "got: {msg}");
+        // The error lists every valid target so the user can self-correct.
+        for t in ["chat", "tasks", "activity", "sidebar", "workspace", "all"] {
+            assert!(msg.contains(t), "valid set should mention `{t}`: {msg}");
+        }
+    }
+
+    #[test]
+    fn reload_target_rejects_a_stray_name_on_non_workspace_targets() {
+        // A name only belongs to `workspace`; anywhere else it's a usage error.
+        assert!(ReloadTarget::parse(Some("chat"), Some("alpha")).is_err());
+        assert!(ReloadTarget::parse(Some("tasks"), Some("alpha")).is_err());
+        // A stray name with the whole-hub default nudges toward `workspace`.
+        let err = ReloadTarget::parse(None, Some("alpha")).unwrap_err();
+        assert!(
+            err.to_string().contains("shelbi reload workspace alpha"),
+            "got: {err}"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -2079,5 +2411,256 @@ mod ensure_hidden_views_tmux_tests {
 
         kill_session(&vis);
         kill_session(&stash);
+    }
+}
+
+#[cfg(test)]
+mod reload_target_tmux_tests {
+    //! Tmux-touching tests for [`reload_target`]: a targeted reload must
+    //! respawn ONLY the named pane and leave every other pane's report
+    //! field `NotAttempted`. Each test provisions the sessions reload
+    //! expects, exercises one target, and asserts the isolation. Skipped
+    //! silently when `tmux` isn't on PATH.
+    use super::*;
+
+    fn tmux_available() -> bool {
+        std::process::Command::new("tmux")
+            .arg("-V")
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false)
+    }
+
+    fn kill_session(name: &str) {
+        let _ = std::process::Command::new("tmux")
+            .args(["kill-session", "-t", name])
+            .output();
+    }
+
+    fn start_session(name: &str, win: &str) {
+        for _ in 0..50 {
+            let _ = std::process::Command::new("tmux")
+                .args([
+                    "new-session", "-d", "-s", name, "-n", win, "sh", "-c", "sleep 30",
+                ])
+                .status();
+            let live = std::process::Command::new("tmux")
+                .args(["has-session", "-t", name])
+                .output()
+                .map(|o| o.status.success())
+                .unwrap_or(false);
+            if live {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        panic!("tmux session `{name}` never came up");
+    }
+
+    /// `reload tasks` respawns the tasks stash pane and touches nothing else.
+    #[test]
+    fn tasks_target_respawns_only_the_tasks_pane() {
+        if !tmux_available() {
+            eprintln!("skipping: tmux not on PATH");
+            return;
+        }
+        let project = format!("tgt-tasks-{}", std::process::id());
+        let vis = format!("shelbi-{project}");
+        let stash = format!("_{vis}");
+        kill_session(&vis);
+        kill_session(&stash);
+        start_session(&vis, "dashboard");
+        start_session(&stash, "views");
+
+        // Pin a tasks stash pane so the reload respawns (rather than creates) it.
+        let created = reload_stash_pane(&vis, "tasks", "sleep 30");
+        assert!(
+            matches!(created, PaneReloadStatus::Created { .. }),
+            "setup: expected Created, got {created:?}"
+        );
+
+        let report = reload_target(&project, &ReloadTarget::Tasks).unwrap();
+        assert!(
+            matches!(report.tasks, PaneReloadStatus::Respawned { .. }),
+            "tasks should be respawned, got {:?}",
+            report.tasks
+        );
+        // Every other pane is left alone.
+        assert!(matches!(report.sidebar, PaneReloadStatus::NotAttempted));
+        assert!(matches!(report.machines, PaneReloadStatus::NotAttempted));
+        assert!(matches!(report.activity, PaneReloadStatus::NotAttempted));
+        assert!(matches!(report.orchestrator, PaneReloadStatus::NotAttempted));
+        assert!(report.handoff.is_none(), "no handoff for a tasks-only reload");
+        assert!(report.workspace.is_none());
+
+        kill_session(&vis);
+        kill_session(&stash);
+    }
+
+    /// `reload sidebar` respawns the dashboard's left pane and nothing else.
+    #[test]
+    fn sidebar_target_respawns_only_the_sidebar_pane() {
+        if !tmux_available() {
+            eprintln!("skipping: tmux not on PATH");
+            return;
+        }
+        let project = format!("tgt-sidebar-{}", std::process::id());
+        let vis = format!("shelbi-{project}");
+        kill_session(&vis);
+        start_session(&vis, "dashboard");
+
+        let report = reload_target(&project, &ReloadTarget::Sidebar).unwrap();
+        match &report.sidebar {
+            PaneReloadStatus::Respawned { target } => {
+                assert!(
+                    target.ends_with("dashboard.{left}"),
+                    "sidebar target should be the dashboard left pane, got {target}"
+                );
+            }
+            other => panic!("sidebar should be respawned, got {other:?}"),
+        }
+        assert!(matches!(report.tasks, PaneReloadStatus::NotAttempted));
+        assert!(matches!(report.machines, PaneReloadStatus::NotAttempted));
+        assert!(matches!(report.activity, PaneReloadStatus::NotAttempted));
+        assert!(matches!(report.orchestrator, PaneReloadStatus::NotAttempted));
+        assert!(report.handoff.is_none());
+        assert!(report.workspace.is_none());
+
+        kill_session(&vis);
+    }
+
+    /// A missing session is a clear error regardless of target.
+    #[test]
+    fn errors_when_the_session_is_not_running() {
+        if !tmux_available() {
+            eprintln!("skipping: tmux not on PATH");
+            return;
+        }
+        let project = format!("tgt-nosession-{}", std::process::id());
+        kill_session(&format!("shelbi-{project}"));
+        let err = reload_target(&project, &ReloadTarget::Tasks).unwrap_err();
+        assert!(
+            err.to_string().contains("not running"),
+            "expected a not-running error, got: {err}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod reload_workspace_tmux_tests {
+    //! Tmux + fixture-home tests for the `workspace <name>` reload target's
+    //! error paths. Holds the crate `test_lock` because it mutates
+    //! `SHELBI_HOME`, and is skipped silently when `tmux` isn't on PATH.
+    use super::*;
+    use shelbi_core::{
+        AgentRunnerSpec, GitConfig, HeartbeatConfig, Machine, MachineKind, OrchestratorSpec,
+        Project, WorkspaceSpec, ZenConfig,
+    };
+    use std::collections::BTreeMap;
+
+    fn tmux_available() -> bool {
+        std::process::Command::new("tmux")
+            .arg("-V")
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false)
+    }
+
+    fn kill_session(name: &str) {
+        let _ = std::process::Command::new("tmux")
+            .args(["kill-session", "-t", name])
+            .output();
+    }
+
+    /// A minimal on-disk project with a single local workspace `alpha`.
+    fn save_min_project(name: &str) {
+        let mut runners = BTreeMap::new();
+        runners.insert(
+            "claude".to_string(),
+            AgentRunnerSpec {
+                command: "claude".into(),
+                flags: vec![],
+                prompt_injection: None,
+                dialog_signatures: vec![],
+            },
+        );
+        let project = Project {
+            name: name.into(),
+            repo: "/tmp/repo".into(),
+            default_branch: "main".into(),
+            default_workflow: None,
+            config_mode: None,
+            machines: vec![Machine {
+                name: "hub".into(),
+                kind: MachineKind::Local,
+                work_dir: std::path::PathBuf::from("/tmp/repo"),
+                host: None,
+                tags: Vec::new(),
+                forward: None,
+            }],
+            orchestrator: OrchestratorSpec {
+                runner: "claude".into(),
+            },
+            agent_runners: runners,
+            editor: None,
+            github_url: None,
+            workspaces: vec![WorkspaceSpec {
+                name: "alpha".into(),
+                machine: "hub".into(),
+                runner: "claude".into(),
+                tags: Vec::new(),
+                slot: None,
+            }],
+            workspace_poll_interval_secs: 5,
+            workspace_permissions_mode: "auto".into(),
+            workspace_settings_template: None,
+            zen: ZenConfig::default(),
+            heartbeat: HeartbeatConfig::default(),
+            detected_shapes: Vec::new(),
+            git: GitConfig::default(),
+        };
+        shelbi_state::save_project(&project).unwrap();
+    }
+
+    /// An unknown workspace name errors clearly and lists the known set.
+    #[test]
+    fn unknown_workspace_name_errors_with_known_set() {
+        if !tmux_available() {
+            eprintln!("skipping: tmux not on PATH");
+            return;
+        }
+        let _g = crate::test_lock::acquire();
+        let home = std::env::temp_dir().join(format!(
+            "shelbi-reload-ws-{}-{}",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("anon")
+        ));
+        let _ = std::fs::remove_dir_all(&home);
+        std::env::set_var("SHELBI_HOME", &home);
+
+        let project = "reload-ws-proj";
+        save_min_project(project);
+        let vis = format!("shelbi-{project}");
+        kill_session(&vis);
+        // The session must exist so the reload gets past the liveness gate
+        // to the workspace lookup.
+        let _ = std::process::Command::new("tmux")
+            .args(["new-session", "-d", "-s", &vis, "-n", "dashboard", "sh", "-c", "sleep 30"])
+            .status();
+
+        let err = reload_target(project, &ReloadTarget::Workspace("ghost".into())).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("unknown workspace `ghost`"),
+            "should name the bad workspace, got: {msg}"
+        );
+        assert!(
+            msg.contains("alpha"),
+            "should list the known workspace, got: {msg}"
+        );
+
+        kill_session(&vis);
+        std::env::remove_var("SHELBI_HOME");
+        let _ = std::fs::remove_dir_all(&home);
     }
 }

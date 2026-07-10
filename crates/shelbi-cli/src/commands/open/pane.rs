@@ -52,13 +52,11 @@ const ENV_HUB_SOCK: &str = "SHELBI_HUB_SOCK";
 /// Build the `sh -c …`-suitable command string that re-enters this
 /// binary under `--as-pane`. Exposed so `focus_or_create` and
 /// `start_workspace_on_task` use the exact same string and can't drift.
+/// Delegates to [`shelbi_orchestrator::workspace_pane_cmd`] (the shared
+/// builder the targeted `shelbi reload workspace` path also uses) with
+/// `resume: false` — a fresh focus/create never resumes.
 pub fn wrapper_invocation(shelbi_bin: &str, project: &str, workspace: &str) -> String {
-    format!(
-        "{bin} --project {proj} open {ws} --as-pane",
-        bin = shelbi_agent::shell_escape(shelbi_bin),
-        proj = shelbi_agent::shell_escape(project),
-        ws = shelbi_agent::shell_escape(workspace),
-    )
+    shelbi_orchestrator::workspace_pane_cmd(shelbi_bin, project, workspace, false)
 }
 
 /// Run the wrapper: spawn the agent, wait, emit the lifecycle event,

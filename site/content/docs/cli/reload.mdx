@@ -5,7 +5,7 @@ summary: Respawn the Shelbi-owned tmux panes in place so a freshly installed bin
 ---
 
 ```text
-shelbi reload [OPTIONS]
+shelbi reload [OPTIONS] [TARGET] [NAME]
 ```
 
 `shelbi reload` is the "I just rebuilt the binary, pick up the new code"
@@ -26,6 +26,36 @@ restart there.
 
 Use it any time `scripts/install.sh` (or your own build) has produced a new
 binary and you want the long-lived TUI surfaces to start using it.
+
+## Targets
+
+Pass a target to reload just one part in place without bouncing the whole hub
+(and, for `chat`, without losing the orchestrator's context). A targeted reload
+respawns only the named pane, leaves every other pane and its state untouched,
+and skips the whole-hub self-heal below.
+
+| Target | Reloads |
+| --- | --- |
+| `chat` | The orchestrator chat pane. Carries the handoff forward exactly like the whole-hub reload, so the reloaded orchestrator keeps its mid-thought context instead of starting cold. |
+| `tasks` | The tasks / kanban pane. |
+| `activity` | The activity / events-feed pane. |
+| `sidebar` | The workspace-roster sidebar pane. |
+| `workspace <name>` | A single worker's pane. Local workers respawn with `--resume` so the agent keeps its conversation and its task wiring (`TASK_ID`, hub socket) is preserved. A missing or unknown name is a clear error. |
+| omitted, or `all` | The whole-hub reload described above (the default, unchanged). |
+
+```bash
+# Get the tasks pane back without touching the orchestrator's context.
+shelbi reload tasks
+
+# Respawn just the orchestrator, carrying its handoff forward.
+shelbi reload chat
+
+# Bounce one stuck worker pane.
+shelbi reload workspace alpha
+```
+
+An unknown target, or a bare `workspace` with no name, errors with the valid
+set so you can self-correct.
 
 `shelbi reload` also sweeps any leftover `.shelbi/project` marker files from
 earlier versions. Resolution now reverse-looks-up against the registered
