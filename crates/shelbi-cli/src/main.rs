@@ -226,7 +226,21 @@ enum Cmd {
     /// mid-thought context forward. Workspace panes are left alone —
     /// they re-shell into shelbi on every call and pick up the new
     /// binary automatically.
-    Reload,
+    ///
+    /// Pass a target to reload just one part in place without bouncing
+    /// the whole hub: `chat` (the orchestrator pane — respawned with its
+    /// handoff carried forward), `tasks`, `activity`, `sidebar`, or
+    /// `workspace <name>` for a single worker pane. Omitting the target
+    /// (or `all`) is the whole-hub reload above.
+    Reload {
+        /// What to reload: chat, tasks, activity, sidebar, workspace, or
+        /// all (default). Omit for the whole hub.
+        #[arg(value_name = "TARGET")]
+        target: Option<String>,
+        /// Workspace name — required when TARGET is `workspace`.
+        #[arg(value_name = "NAME")]
+        name: Option<String>,
+    },
     /// (internal) Run the sidebar ratatui process inside the dashboard's
     /// left pane. Not for direct use.
     #[command(hide = true)]
@@ -337,7 +351,7 @@ fn main() -> Result<()> {
         Some(Cmd::Wizard) => commands::wizard::run(false).map(|_| ()),
         Some(Cmd::Orchestrate(args)) => commands::orchestrate::run(cli.project, args),
         Some(Cmd::Orchestrator { cmd }) => commands::orchestrator::run(cli.project, cmd),
-        Some(Cmd::Reload) => commands::reload::run(cli.project),
+        Some(Cmd::Reload { target, name }) => commands::reload::run(cli.project, target, name),
         Some(Cmd::Sidebar { project }) => shelbi_tui::run_sidebar(&project).context("sidebar"),
         Some(Cmd::Tasks { project }) => shelbi_tui::run_tasks(&project).context("tasks"),
         Some(Cmd::Activity { project }) => shelbi_tui::run_activity(&project).context("activity"),
