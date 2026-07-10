@@ -4114,27 +4114,34 @@ mod tests {
     }
 
     #[test]
-    fn scaffold_project_workflow_creates_default_workflow() {
+    fn scaffold_project_workflow_creates_task_and_subtask() {
         let _g = TEST_LOCK.lock().unwrap();
         let home = fresh_home();
         std::env::set_var("SHELBI_HOME", &home);
         let p = fixture_project("myapp", None);
         save_project(&p).unwrap();
-        let workflow_path = default_workflow_path("myapp").unwrap();
-        assert!(
-            !workflow_path.exists(),
-            "precondition: workflow file absent"
-        );
-        scaffold_project_workflow("myapp").unwrap();
-        assert!(
-            workflow_path.exists(),
-            "scaffold_project_workflow should create workflows/default.yaml"
-        );
-        // The scaffold is stable when repeated.
-        let first_bytes = std::fs::read(&workflow_path).unwrap();
-        scaffold_project_workflow("myapp").unwrap();
-        let second_bytes = std::fs::read(&workflow_path).unwrap();
-        assert_eq!(first_bytes, second_bytes);
+        let task_path = workflow_path("myapp", shelbi_core::TASK_WORKFLOW_NAME).unwrap();
+        let subtask_path = workflow_path("myapp", shelbi_core::SUBTASK_WORKFLOW_NAME).unwrap();
+        assert!(!task_path.exists() && !subtask_path.exists());
+
+        // First run creates both files and reports them.
+        let created = scaffold_project_workflow("myapp").unwrap();
+        assert_eq!(created.len(), 2, "both task.yaml and subtask.yaml written");
+        assert!(task_path.exists() && subtask_path.exists());
+
+        // Idempotent: a repeat writes nothing and preserves the bytes.
+        let first_bytes = std::fs::read(&task_path).unwrap();
+        let created = scaffold_project_workflow("myapp").unwrap();
+        assert!(created.is_empty(), "re-run creates nothing when both exist");
+        assert_eq!(std::fs::read(&task_path).unwrap(), first_bytes);
+
+        // Half-init: only the missing file is (re)created, user edits kept.
+        std::fs::remove_file(&subtask_path).unwrap();
+        std::fs::write(&task_path, "name: task\nstatuses:\n  - { id: done, owner: user }\n")
+            .unwrap();
+        let created = scaffold_project_workflow("myapp").unwrap();
+        assert_eq!(created, vec![subtask_path.clone()]);
+        assert!(std::fs::read_to_string(&task_path).unwrap().contains("id: done"));
         std::env::remove_var("SHELBI_HOME");
     }
 

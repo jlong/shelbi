@@ -21,14 +21,15 @@ pub use model::{
     PromptInjectionKind, PromptInjectionSpec, Session, SessionProject, Status, Task, TaskZenConfig,
     TmuxAddr, WorkspaceSpec, ZenChecks, ZenConfig, ZenDangerPaths, BUILTIN_DANGER_PATHS,
     DEFAULT_WORKFLOW_NAME, HEARTBEAT_DEFAULT, KNOWN_OPTIONAL_TASK_FIELDS, LOCAL_PROJECT_FIELDS,
-    MAX_TASK_ID_LEN, SHARED_PROJECT_FIELDS,
+    MAX_TASK_ID_LEN, SHARED_PROJECT_FIELDS, SUBTASK_WORKFLOW_NAME, TASK_WORKFLOW_NAME,
 };
 pub use placeholders::substitute_placeholders;
 pub use shell::shell_escape;
 pub use statuses::{default_project_statuses, ProjectStatus, ProjectStatuses};
 pub use system_memory::{format_bytes_short, recommended_workspace_count, total_memory_bytes};
 pub use workflow::{
-    default_workflow, InlineIdentityField, Owner, Status as WorkflowStatus, StatusCategory,
-    Transition, TransitionAction, Workflow, WorkflowZenConfig,
+    default_workflow, subtask_workflow, task_workflow, InlineIdentityField, Owner,
+    Status as WorkflowStatus, StatusCategory, Transition, TransitionAction, Workflow,
+    WorkflowZenConfig,
 };
 pub use workspace_names::WorkspaceNamePreset;

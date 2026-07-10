@@ -588,6 +588,208 @@ pub fn default_workflow() -> Workflow {
     }
 }
 
+/// The default shipped workflow: normal branch work with a review gate.
+///
+/// A task branches off `main` as `task/<id>`, moves
+/// backlog → todo → in-progress → review → done, and squash-merges to `main`
+/// on accept. The `review` status is served on a `review`-tagged workspace by
+/// the Reviewer agent (the `review` loader), which stands up the running app
+/// for a human to click through. It opens exactly **one** PR — on
+/// `in-progress -> review` — which is the review surface and, when accepted,
+/// what lands on `main`.
+///
+/// A `task`'s own branch (`task/<id>`) doubles as the parent branch that
+/// [`subtask_workflow`] subtasks target and merge into, so no separate
+/// umbrella workflow is needed. Serialized to `workflows/task.yaml` by
+/// `shelbi init`; see `Plans/default-install-experience-workflows-and-agents.md`.
+pub fn task_workflow() -> Workflow {
+    Workflow {
+        name: crate::TASK_WORKFLOW_NAME.to_string(),
+        description: Some(
+            "Branch work with a review gate: the default track shipped with every project."
+                .to_string(),
+        ),
+        statuses: vec![
+            Status {
+                id: "backlog".into(),
+                name: "Backlog".into(),
+                category: StatusCategory::Backlog,
+                owner: Owner::User,
+                agent: Some("orchestrator".into()),
+                tags: Vec::new(),
+            },
+            Status {
+                id: "todo".into(),
+                name: "Todo".into(),
+                category: StatusCategory::Ready,
+                owner: Owner::Agent,
+                agent: Some("orchestrator".into()),
+                tags: Vec::new(),
+            },
+            Status {
+                id: "in-progress".into(),
+                name: "In Progress".into(),
+                category: StatusCategory::Active,
+                owner: Owner::Agent,
+                agent: Some("developer".into()),
+                tags: Vec::new(),
+            },
+            Status {
+                id: "review".into(),
+                name: "Review".into(),
+                category: StatusCategory::Handoff,
+                owner: Owner::User,
+                // The Reviewer agent (the `review` loader) serves the branch on
+                // a `review`-tagged workspace so a human can run it.
+                agent: Some("review".into()),
+                tags: vec!["review".into()],
+            },
+            Status {
+                id: "done".into(),
+                name: "Done".into(),
+                category: StatusCategory::Done,
+                owner: Owner::User,
+                agent: None,
+                tags: Vec::new(),
+            },
+            Status {
+                id: "canceled".into(),
+                name: "Canceled".into(),
+                category: StatusCategory::Archived,
+                owner: Owner::User,
+                agent: None,
+                tags: Vec::new(),
+            },
+        ],
+        initial_status: None,
+        transitions: Some(vec![
+            transition(
+                "in-progress",
+                "review",
+                &[TransitionAction::PushBranch, TransitionAction::OpenPr],
+            ),
+            transition(
+                "review",
+                "done",
+                &[TransitionAction::Merge, TransitionAction::DeleteBranch],
+            ),
+            transition(
+                "in-progress",
+                "canceled",
+                &[TransitionAction::ClosePr, TransitionAction::DeleteBranch],
+            ),
+            transition(
+                "review",
+                "canceled",
+                &[TransitionAction::ClosePr, TransitionAction::DeleteBranch],
+            ),
+        ]),
+        git: Some(GitConfig {
+            base_branch: Some("main".into()),
+            branch_prefix: Some(crate::TASK_WORKFLOW_NAME.into()),
+            merge_strategy: crate::MergeStrategy::Squash,
+        }),
+        zen: None,
+    }
+}
+
+/// The shipped subtask workflow: a piece of a parent [`task_workflow`] task,
+/// done on its own branch with **no PR and no review**.
+///
+/// A subtask names its parent task's id in its `task:` frontmatter field; the
+/// templated `base_branch: task/{{task}}` resolves to the parent task's branch
+/// so the subtask branches from — and squash-merges directly into — that
+/// branch, never `main`. Its work surfaces only on the parent task's single
+/// PR. Handoff-less by design: it declares no `handoff` status, so the hub
+/// poller auto-advances a finished worker straight to `done`, firing the merge
+/// into the parent branch. Serialized to `workflows/subtask.yaml` by
+/// `shelbi init`; see `Plans/default-install-experience-workflows-and-agents.md`.
+pub fn subtask_workflow() -> Workflow {
+    Workflow {
+        name: crate::SUBTASK_WORKFLOW_NAME.to_string(),
+        description: Some(
+            "A piece of a parent task, squash-merged into the parent's branch with no PR or review."
+                .to_string(),
+        ),
+        statuses: vec![
+            Status {
+                id: "backlog".into(),
+                name: "Backlog".into(),
+                category: StatusCategory::Backlog,
+                owner: Owner::User,
+                agent: Some("orchestrator".into()),
+                tags: Vec::new(),
+            },
+            Status {
+                id: "todo".into(),
+                name: "Todo".into(),
+                category: StatusCategory::Ready,
+                owner: Owner::Agent,
+                agent: Some("orchestrator".into()),
+                tags: Vec::new(),
+            },
+            Status {
+                id: "in-progress".into(),
+                name: "In Progress".into(),
+                category: StatusCategory::Active,
+                owner: Owner::Agent,
+                agent: Some("developer".into()),
+                tags: Vec::new(),
+            },
+            Status {
+                id: "done".into(),
+                name: "Done".into(),
+                category: StatusCategory::Done,
+                owner: Owner::User,
+                agent: None,
+                tags: Vec::new(),
+            },
+            Status {
+                id: "canceled".into(),
+                name: "Canceled".into(),
+                category: StatusCategory::Archived,
+                owner: Owner::User,
+                agent: None,
+                tags: Vec::new(),
+            },
+        ],
+        initial_status: None,
+        transitions: Some(vec![
+            // A direct local squash-merge into the parent task's branch — no
+            // push_branch / open_pr, so a subtask never opens its own PR.
+            transition(
+                "in-progress",
+                "done",
+                &[TransitionAction::Merge, TransitionAction::DeleteBranch],
+            ),
+            transition("in-progress", "canceled", &[TransitionAction::DeleteBranch]),
+        ]),
+        git: Some(GitConfig {
+            // Interpolated from the subtask's `task:` frontmatter (the parent
+            // task's id) at dispatch — see [`Workflow::resolve_git`].
+            base_branch: Some("task/{{task}}".into()),
+            branch_prefix: Some(crate::SUBTASK_WORKFLOW_NAME.into()),
+            merge_strategy: crate::MergeStrategy::Squash,
+        }),
+        zen: None,
+    }
+}
+
+/// Build a [`Transition`] with just `from`/`to`/`actions` set — the shipped
+/// workflows declare no `target:`, `run:`, or `ready:` overrides, so this
+/// keeps [`task_workflow`] / [`subtask_workflow`] readable.
+fn transition(from: &str, to: &str, actions: &[TransitionAction]) -> Transition {
+    Transition {
+        from: from.to_string(),
+        to: to.to_string(),
+        actions: actions.to_vec(),
+        target: None,
+        run: Vec::new(),
+        ready: None,
+        ready_timeout: None,
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Status
 
@@ -1493,6 +1695,88 @@ statuses:
                 None,
             ]
         );
+    }
+
+    #[test]
+    fn task_workflow_is_the_review_gated_default() {
+        let wf = task_workflow();
+        wf.validate().expect("shipped task workflow validates");
+        assert_eq!(wf.name, "task");
+
+        // Six statuses ending in the terminal pair; `review` is the handoff.
+        let ids: Vec<_> = wf.statuses.iter().map(|s| s.id.as_str()).collect();
+        assert_eq!(
+            ids,
+            vec!["backlog", "todo", "in-progress", "review", "done", "canceled"]
+        );
+        let review = wf.status("review").expect("review status");
+        assert_eq!(review.category, StatusCategory::Handoff);
+        // Served by the Reviewer agent on a review-tagged workspace.
+        assert_eq!(review.agent.as_deref(), Some("review"));
+        assert_eq!(review.tags, vec!["review".to_string()]);
+
+        // Git: branch off main as task/<id>, squash-merge back.
+        let git = wf.git.as_ref().expect("git block");
+        assert_eq!(git.base_branch.as_deref(), Some("main"));
+        assert_eq!(git.branch_prefix.as_deref(), Some("task"));
+        assert_eq!(git.merge_strategy, MergeStrategy::Squash);
+
+        // Exactly one PR — a single open_pr edge, on in-progress -> review.
+        let transitions = wf.transitions.as_ref().expect("transitions");
+        let open_pr_edges: Vec<_> = transitions
+            .iter()
+            .filter(|t| t.actions.contains(&TransitionAction::OpenPr))
+            .collect();
+        assert_eq!(open_pr_edges.len(), 1);
+        assert_eq!(open_pr_edges[0].from, "in-progress");
+        assert_eq!(open_pr_edges[0].to, "review");
+        // review -> done squash-merges to main.
+        assert!(wf.is_merge_transition("review", "done"));
+        // The review handoff has the outgoing merge edge, so it trips the
+        // confidence bar; in-progress (no merge edge) does not.
+        assert!(wf.fires_merge_bar("review"));
+        assert!(!wf.fires_merge_bar("in-progress"));
+    }
+
+    #[test]
+    fn subtask_workflow_has_no_review_and_opens_no_pr() {
+        let wf = subtask_workflow();
+        wf.validate().expect("shipped subtask workflow validates");
+        assert_eq!(wf.name, "subtask");
+
+        // No review/handoff status at all — the poller auto-advances to done.
+        let ids: Vec<_> = wf.statuses.iter().map(|s| s.id.as_str()).collect();
+        assert_eq!(ids, vec!["backlog", "todo", "in-progress", "done", "canceled"]);
+        assert!(wf
+            .statuses
+            .iter()
+            .all(|s| s.category != StatusCategory::Handoff));
+
+        // Branches from and merges into the parent task's branch, templated.
+        let git = wf.git.as_ref().expect("git block");
+        assert_eq!(git.base_branch.as_deref(), Some("task/{{task}}"));
+        assert_eq!(git.merge_strategy, MergeStrategy::Squash);
+
+        // Never opens a PR: no open_pr / push_branch on any edge.
+        let transitions = wf.transitions.as_ref().expect("transitions");
+        assert!(transitions.iter().all(|t| {
+            !t.actions.contains(&TransitionAction::OpenPr)
+                && !t.actions.contains(&TransitionAction::PushBranch)
+        }));
+        // in-progress -> done is the direct local squash-merge.
+        assert!(wf.is_merge_transition("in-progress", "done"));
+    }
+
+    #[test]
+    fn subtask_git_base_branch_resolves_parent_task_id() {
+        // The templated base_branch resolves against the subtask's `task:`
+        // frontmatter param at dispatch (the fix in
+        // bug-dispatch-ignores-templated-base-branch relies on this).
+        let wf = subtask_workflow();
+        let mut params = std::collections::BTreeMap::new();
+        params.insert("task".to_string(), "add-auth".to_string());
+        let git = wf.resolve_git(&params).unwrap().expect("git block present");
+        assert_eq!(git.base_branch.as_deref(), Some("task/add-auth"));
     }
 
     #[test]

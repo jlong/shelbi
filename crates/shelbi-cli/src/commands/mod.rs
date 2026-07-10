@@ -291,7 +291,11 @@ pub(crate) mod test_support {
             name: project_name.into(),
             repo: repo.to_string_lossy().into(),
             default_branch: "main".into(),
-            default_workflow: None,
+            // Mirror a fresh `shelbi init`: default to the shipped `task`
+            // workflow, which `scaffold_project_workflow` materializes below as
+            // `workflows/task.yaml`. Leaving this unset would resolve to the
+            // built-in `default` name, whose YAML the scaffold no longer writes.
+            default_workflow: Some(shelbi_core::TASK_WORKFLOW_NAME.into()),
             config_mode: None,
             machines: vec![Machine {
                 name: "hub".into(),

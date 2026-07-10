@@ -286,8 +286,19 @@ struct ProjectYaml<'a> {
     /// default, so the file stays byte-identical to the pre-mode shape.
     #[serde(skip_serializing_if = "Option::is_none")]
     config_mode: Option<&'a str>,
+    /// The default workflow a task lands on when its frontmatter omits
+    /// `workflow:`. Fresh projects ship `task` (the review-gated default);
+    /// `workflows/task.yaml` and `workflows/subtask.yaml` are materialized
+    /// alongside.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    default_workflow: Option<&'a str>,
     machines: Vec<MachineYaml<'a>>,
     orchestrator: OrchestratorYaml<'a>,
+    /// Starter pool. Serialized between `orchestrator:` and `agent_runners:`
+    /// so [`shelbi_core::scaffold::decorate_project_yaml`] can splice its
+    /// "add more workspaces" example as an extra commented list item.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    workspaces: Vec<WorkspaceYaml<'a>>,
     agent_runners: std::collections::BTreeMap<&'a str, RunnerYaml<'a>>,
 }
 
@@ -301,6 +312,18 @@ struct MachineYaml<'a> {
 #[derive(serde::Serialize)]
 struct OrchestratorYaml<'a> {
     runner: &'a str,
+}
+
+#[derive(serde::Serialize)]
+struct WorkspaceYaml<'a> {
+    name: &'a str,
+    machine: &'a str,
+    runner: &'a str,
+    /// Routing tags — `[review]` on the review slot the `task` workflow's
+    /// review status requires. Elided when empty so a tag-less slot stays
+    /// lean.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    tags: Vec<&'a str>,
 }
 
 #[derive(serde::Serialize)]
@@ -341,12 +364,32 @@ fn render_project_yaml(
         repo,
         default_branch: "main",
         config_mode,
+        // Fresh projects default to the review-gated `task` workflow; the
+        // `subtask` workflow ships alongside for parent/child work.
+        default_workflow: Some(shelbi_core::TASK_WORKFLOW_NAME),
         machines: vec![MachineYaml {
             name: "hub",
             kind: "local",
             work_dir: &work_dir,
         }],
         orchestrator: OrchestratorYaml { runner: "claude" },
+        // Provision a starter pool: a dev slot plus a `review`-tagged slot on
+        // the hub so the `task` workflow's `review` status (which requires the
+        // `review` tag) has somewhere to run.
+        workspaces: vec![
+            WorkspaceYaml {
+                name: "dev",
+                machine: "hub",
+                runner: "claude",
+                tags: vec![],
+            },
+            WorkspaceYaml {
+                name: "rev",
+                machine: "hub",
+                runner: "claude",
+                tags: vec!["review"],
+            },
+        ],
         agent_runners,
     };
     let active = serde_yaml::to_string(&doc).context("serializing project YAML")?;
@@ -429,14 +472,12 @@ fn scaffold_project(resolved: &ResolvedProjectRoot, mode: InitMode) -> Result<()
         print_agent_materialize_outcome(&outcome);
     }
 
-    // Materialize the starter workflow files so `shelbi init`'s
-    // post-condition is self-contained. Ordinary project loads do not
-    // recreate `default.yaml` after a project intentionally removes it.
-    let workflow_path =
-        shelbi_state::default_workflow_path(&resolved.name).map_err(|e| anyhow!(e))?;
-    if !workflow_path.exists() {
-        shelbi_state::scaffold_project_workflow(&resolved.name).map_err(|e| anyhow!(e))?;
-        println!("✓ wrote project workflow: {}", workflow_path.display());
+    // Materialize the starter workflow files (task.yaml + subtask.yaml) so
+    // `shelbi init`'s post-condition is self-contained. Each is written only
+    // when absent; ordinary project loads do not recreate them after a project
+    // intentionally removes one.
+    for path in shelbi_state::scaffold_project_workflow(&resolved.name).map_err(|e| anyhow!(e))? {
+        println!("✓ wrote project workflow: {}", path.display());
     }
     let statuses_path = shelbi_state::statuses_path(&resolved.name).map_err(|e| anyhow!(e))?;
     if !statuses_path.exists() {
@@ -609,11 +650,8 @@ fn run_pick_up(args: Args) -> Result<PickUpOutcome> {
         shelbi_state::scaffold_project_statuses(&local_alias).map_err(|e| anyhow!(e))?;
         println!("✓ wrote project statuses: {}", statuses_path.display());
     }
-    let workflow_path =
-        shelbi_state::default_workflow_path(&local_alias).map_err(|e| anyhow!(e))?;
-    if !workflow_path.exists() {
-        shelbi_state::scaffold_project_workflow(&local_alias).map_err(|e| anyhow!(e))?;
-        println!("✓ wrote project workflow: {}", workflow_path.display());
+    for path in shelbi_state::scaffold_project_workflow(&local_alias).map_err(|e| anyhow!(e))? {
+        println!("✓ wrote project workflow: {}", path.display());
     }
 
     println!();
@@ -825,6 +863,14 @@ mod tests {
         assert_eq!(project.orchestrator.runner, "claude");
         assert!(project.agent_runners.contains_key("claude"));
         assert!(project.agent_runners.contains_key("codex"));
+        // Fresh projects default to `task` and ship a starter pool including a
+        // review-tagged slot for the `task` workflow's review status.
+        assert_eq!(project.default_workflow.as_deref(), Some("task"));
+        assert_eq!(project.workspaces.len(), 2);
+        assert!(project
+            .workspaces
+            .iter()
+            .any(|w| project.effective_tags(w).contains("review")));
     }
 
     /// The scaffolded project YAML is self-documenting: a docs-linked header
@@ -839,13 +885,15 @@ mod tests {
             "missing docs header: {yaml}"
         );
         // Representative optional features appear as commented examples.
-        for needle in ["#zen:", "#git:", "#workspaces:"] {
+        // (`workspaces:` is now an active starter pool, so the commented hint
+        // is an extra list item under it rather than a `#workspaces:` key.)
+        for needle in ["#zen:", "#git:", "#- { name: bob"] {
             assert!(yaml.contains(needle), "missing commented section {needle}");
         }
-        // But they stay commented — the parsed project carries only the
-        // required fields until the user opts in.
+        // The commented extras stay inert: the parsed project carries only the
+        // active starter pool (dev + rev) and one machine until the user opts in.
         let project: shelbi_core::Project = serde_yaml::from_str(&yaml).unwrap();
-        assert!(project.workspaces.is_empty());
+        assert_eq!(project.workspaces.len(), 2);
         assert_eq!(project.machines.len(), 1);
     }
 
@@ -883,9 +931,13 @@ mod tests {
         // YAML exists, but the agents/ workspaces and statuses do not.
         let yaml_path = home.join("projects/halfapp.yaml");
         std::fs::write(&yaml_path, "name: halfapp\nrepo: \n").unwrap();
-        let workflow_path = shelbi_state::default_workflow_path("halfapp").unwrap();
+        let workflow_path =
+            shelbi_state::workflow_path("halfapp", shelbi_core::TASK_WORKFLOW_NAME).unwrap();
+        let subtask_path =
+            shelbi_state::workflow_path("halfapp", shelbi_core::SUBTASK_WORKFLOW_NAME).unwrap();
         let statuses_path = shelbi_state::statuses_path("halfapp").unwrap();
         assert!(!workflow_path.exists());
+        assert!(!subtask_path.exists());
         assert!(!statuses_path.exists());
 
         // Re-running scaffold must NOT bail with a bogus "already exists"
@@ -896,8 +948,8 @@ mod tests {
             "re-run should have written the statuses catalogue"
         );
         assert!(
-            workflow_path.is_file(),
-            "re-run should have written the default workflow"
+            workflow_path.is_file() && subtask_path.is_file(),
+            "re-run should have written the task + subtask workflows"
         );
         assert!(
             shelbi_state::project_dir("halfapp")
