@@ -127,6 +127,53 @@
 }
 
 /* ============================================================
+   TUI mockup palette (light defaults)
+   ============================================================
+   The homepage mockups (KanbanMockup engine, TerminalBanner) render a
+   captured terminal via inline `color`/`background` styles rather than
+   Tailwind utilities, so they read these `--tui-*` variables directly.
+   Light is the default here — a light canvas with dark text and darker,
+   saturated syntax/status accents that stay legible on white; the `.dark`
+   block below restores the original dark terminal hex so dark mode is
+   unchanged. Traffic-light dots stay hardcoded in the component (they read
+   the same in both modes, like real macOS window buttons).
+   ============================================================ */
+:root {
+  --tui-chrome-bar-bg: #E4E4E4;
+  --tui-chrome-bar-border: #CFCFCF;
+  --tui-chrome-title: #4A4A4A;
+
+  --tui-bg: #F7F7F7; /* light terminal canvas */
+  --tui-fg: #1A1A1A; /* near-black body text */
+  --tui-gray: #555555; /* ANSI 7 — column headers, nav labels */
+  --tui-dark-gray: #767676; /* ANSI 8 — dim chrome (ids, footer, branches) */
+  --tui-divider: #D0D0D0; /* sidebar/board/palette rule */
+
+  /* Syntax/status accents — darkened + saturated so they stay legible on the
+     light canvas (the dark-tuned pastels wash out on white). */
+  --tui-blue: #2563C9; /* Ready category (todo) */
+  --tui-yellow: #9A6A05; /* Active category (in_progress) */
+  --tui-magenta: #A21CAF; /* Handoff (review) + @workspace */
+  --tui-green: #1A7F37; /* Done category + Working badge */
+  --tui-cyan: #0F766E; /* project name + review badge */
+  --tui-light-red: #D92D20; /* foxtrot avatar tint */
+
+  /* Zen band — a soft light-green fill; text is `--tui-sel-fg` (dark on light),
+     so the band stays a legible highlight rather than white-on-green. */
+  --tui-zen-green: #C8ECCF;
+
+  /* Selection / emphasis — a light gray fill with dark text. `--tui-sel-fg`
+     doubles as the emphasis color for white-bold names on the plain canvas, so
+     it is near-black in light mode. */
+  --tui-sel-bg: #DADADA;
+  --tui-sel-fg: #111111;
+
+  --tui-task-box-bg: #ECECEC; /* quiet callout block, a step off the canvas */
+  --tui-workflow-badge-bg: #D0D0D0; /* neutral gray chip */
+  --tui-workflow-badge-fg: #333333;
+}
+
+/* ============================================================
    Dark mode — redefine the same tokens
    ============================================================ */
 .dark {
@@ -208,6 +255,36 @@
   --color-callout-danger-button-text: #FECACA;
   --color-callout-danger-button-hover-bg: #481D1D;
   --color-callout-danger-button-hover-border: #C05050;
+
+  /* TUI mockup palette — dark. The original terminal hex, so dark mode renders
+     exactly as before (macOS Terminal / iTerm2 dark defaults). Kept in sync
+     with the light defaults above and consumed by the KanbanMockup engine and
+     TerminalBanner via `var(--tui-*)`. */
+  --tui-chrome-bar-bg: #2D2D2D;
+  --tui-chrome-bar-border: #1A1A1A;
+  --tui-chrome-title: #C7C7C7;
+
+  --tui-bg: #1E1E1E;
+  --tui-fg: #E5E5E5;
+  --tui-gray: #B8B8B8;
+  --tui-dark-gray: #7C7C7C;
+  --tui-divider: #4A4A4A;
+
+  --tui-blue: #4A8FD7;
+  --tui-yellow: #DCB767;
+  --tui-magenta: #C586C0;
+  --tui-green: #5FB56D;
+  --tui-cyan: #4EC9B0;
+  --tui-light-red: #FF6E67;
+
+  --tui-zen-green: #007F00; /* Rgb(0,127,0) — full-width Zen band fill */
+
+  --tui-sel-bg: #3F3F3F;
+  --tui-sel-fg: #FFFFFF;
+
+  --tui-task-box-bg: #292929;
+  --tui-workflow-badge-bg: #3F3F3F;
+  --tui-workflow-badge-fg: #DCDFE8;
 }
 
 /* ============================================================

@@ -41,52 +41,61 @@ import { useState } from "react"
  */
 
 // ── Palette ───────────────────────────────────────────────────────────
-// Terminal chrome (window frame) and terminal-body ANSI equivalents.
-// Chosen to match how ratatui's named colors render in macOS Terminal
-// with a Solarized-adjacent dark scheme — the setup a Shelbi user is
-// most likely to see when they run the TUI locally.
-const CHROME_BAR_BG = "#2d2d2d"
-const CHROME_BAR_BORDER = "#1a1a1a"
-const CHROME_TITLE = "#c7c7c7"
+// Terminal chrome (window frame) and terminal-body ANSI equivalents. Every
+// value below the traffic lights is a theme-aware CSS variable resolved in
+// `site/app/globals.css`: the `.dark` block holds the original terminal hex
+// (how ratatui's named colors render in a Solarized-adjacent dark macOS
+// Terminal — the setup a Shelbi user is most likely to see locally), and the
+// `:root` defaults hold a light-canvas variant (dark text on a light body,
+// darkened/saturated accents that stay legible on white). Because these feed
+// inline `color`/`background` styles, the mockups invert with the site's
+// `.dark` class for free — dark stays the terminal aesthetic, light becomes a
+// light-background capture. Keep the two blocks in globals.css in sync.
+const CHROME_BAR_BG = "var(--tui-chrome-bar-bg)"
+const CHROME_BAR_BORDER = "var(--tui-chrome-bar-border)"
+const CHROME_TITLE = "var(--tui-chrome-title)"
+// Traffic lights are the one exception — the macOS window-button dots read the
+// same on a light or dark title bar, so they stay literal (not theme-driven).
 const TRAFFIC_RED = "#ff5f57"
 const TRAFFIC_YELLOW = "#febc2e"
 const TRAFFIC_GREEN = "#28c840"
 
-const TUI_BG = "#1e1e1e"
-const TUI_FG = "#e5e5e5"
-const TUI_GRAY = "#b8b8b8" // ANSI 7 — column header for `Backlog`, nav labels
-const TUI_DARK_GRAY = "#7c7c7c" // ANSI 8 — chrome text (`Tasks · `, ids, footer)
-const TUI_DIVIDER = "#4a4a4a" // mid-gray rule — sidebar/board divider, reads on TUI_BG
-const TUI_BLUE = "#4a8fd7" // ANSI 4 — `Ready` category (todo)
-const TUI_YELLOW = "#dcb767" // ANSI 3 — `Active` category (in_progress)
-const TUI_MAGENTA = "#c586c0" // ANSI 5 — `Handoff` (review) + `@workspace`
-const TUI_GREEN = "#5fb56d" // ANSI 2 — `Done` category + Working badge
-const TUI_CYAN = "#4ec9b0" // ANSI 6 — project name in title bar + ✓ review badge
-const TUI_LIGHT_RED = "#ff6e67" // ANSI 9 — foxtrot's avatar tint (`Color::LightRed` in activity.rs)
+const TUI_BG = "var(--tui-bg)"
+const TUI_FG = "var(--tui-fg)"
+const TUI_GRAY = "var(--tui-gray)" // ANSI 7 — column header for `Backlog`, nav labels
+const TUI_DARK_GRAY = "var(--tui-dark-gray)" // ANSI 8 — chrome text (`Tasks · `, ids, footer)
+const TUI_DIVIDER = "var(--tui-divider)" // mid-gray rule — sidebar/board divider, reads on TUI_BG
+const TUI_BLUE = "var(--tui-blue)" // ANSI 4 — `Ready` category (todo)
+const TUI_YELLOW = "var(--tui-yellow)" // ANSI 3 — `Active` category (in_progress)
+const TUI_MAGENTA = "var(--tui-magenta)" // ANSI 5 — `Handoff` (review) + `@workspace`
+const TUI_GREEN = "var(--tui-green)" // ANSI 2 — `Done` category + Working badge
+const TUI_CYAN = "var(--tui-cyan)" // ANSI 6 — project name in title bar + ✓ review badge
+const TUI_LIGHT_RED = "var(--tui-light-red)" // ANSI 9 — foxtrot's avatar tint (`Color::LightRed` in activity.rs)
 // Zen-mode band fill: the TUI paints the "ZEN MODE ON" footer bar with an
 // explicit `bg(Color::Rgb(0,127,0))` + `fg(White)` bold (`render_zen_row`
-// in `crates/shelbi-tui/src/sidebar.rs`) — not a named ANSI color, so it
-// renders as this exact hex rather than the brighter ANSI-2 `TUI_GREEN`.
-const TUI_ZEN_GREEN = "#007f00" // Rgb(0,127,0) — full-width Zen band fill
+// in `crates/shelbi-tui/src/sidebar.rs`). Dark keeps that green band; light
+// uses a soft light-green fill so the dark band text (`SEL_FG`, now near-black
+// on light) stays legible.
+const TUI_ZEN_GREEN = "var(--tui-zen-green)"
 // Focused-card highlight: the shared selection gray `theme::SELECTION_BG`
 // (`Color::Rgb(63,63,63)`) the TUI paints every selection background with —
 // nav, kanban card, review queue, and filter dropdowns all use this one
 // value so they can't drift. Selected text keeps an explicit `fg(White)` +
-// bold so it stays readable on the gray.
-const SEL_BG = "#3f3f3f" // ratatui `bg(theme::SELECTION_BG)` for a focused card
-const SEL_FG = "#ffffff" // ratatui `fg(White)` for a focused card
+// bold so it stays readable on the gray (near-black on the light fill).
+const SEL_BG = "var(--tui-sel-bg)" // ratatui `bg(theme::SELECTION_BG)` for a focused card
+const SEL_FG = "var(--tui-sel-fg)" // ratatui `fg(White)` for a focused card
 // Sidebar's per-row selection fill uses the same `theme::SELECTION_BG` gray
 // as the focused card above — one selection color across every surface.
 const SIDEBAR_SEL_BG = SEL_BG
 // A subtle fill just above the terminal body (`TUI_BG`) for the injected
-// task-body callout in a worker pane — dark enough to read as a quiet block
-// rather than a highlight standing off the background.
-const TASK_BOX_BG = "#292929"
+// task-body callout in a worker pane — a step off the body so it reads as a
+// quiet block rather than a highlight standing off the background.
+const TASK_BOX_BG = "var(--tui-task-box-bg)"
 // The small workflow-name badge painted on the meta line of each kanban card —
 // a neutral gray chip matching the other gray fills in the terminal (the
-// selection gray), with light near-white text.
-const WORKFLOW_BADGE_BG = "#3f3f3f" // neutral gray, same as SEL_BG
-const WORKFLOW_BADGE_FG = "#dcdfe8"
+// selection gray), with contrasting text.
+const WORKFLOW_BADGE_BG = "var(--tui-workflow-badge-bg)" // neutral gray, same as SEL_BG
+const WORKFLOW_BADGE_FG = "var(--tui-workflow-badge-fg)"
 
 // ── Layout constants ─────────────────────────────────────────────────
 // Kanban columns are fixed at 22 monospace cells (20 for card text + a
