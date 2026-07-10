@@ -1650,9 +1650,23 @@ fn levenshtein(a: &str, b: &str) -> usize {
 }
 
 /// Name of the workflow used when a task's `workflow:` frontmatter field
-/// is absent. Matches the filename of the workflow YAML that ships with
-/// every new project (`workflows/default.yaml`).
+/// is absent and the project declares no `default_workflow:`. Kept as the
+/// built-in fallback for legacy projects created before the two-workflow
+/// scaffold; fresh projects declare `default_workflow: task` explicitly and
+/// ship [`TASK_WORKFLOW_NAME`] + [`SUBTASK_WORKFLOW_NAME`] YAML files.
 pub const DEFAULT_WORKFLOW_NAME: &str = "default";
+
+/// Name of the default shipped workflow: normal branch work with a review
+/// gate, squash-merged to the base branch. Scaffolded to `workflows/task.yaml`
+/// and set as a fresh project's `default_workflow:`. See
+/// [`crate::workflow::task_workflow`].
+pub const TASK_WORKFLOW_NAME: &str = "task";
+
+/// Name of the shipped subtask workflow: a piece of a parent `task`, done on
+/// its own branch and squash-merged into the parent's branch (`task/{{task}}`)
+/// with no PR and no review. Scaffolded to `workflows/subtask.yaml`. See
+/// [`crate::workflow::subtask_workflow`].
+pub const SUBTASK_WORKFLOW_NAME: &str = "subtask";
 
 /// Max byte length of a task id. GitHub caps ref names at 255 bytes; we leave
 /// a small buffer so refs derived from the id plus a configured/user prefix

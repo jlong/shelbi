@@ -21,7 +21,7 @@
 //! the `uncomment`-round-trip tests in this module enforce exactly that.
 
 use crate::statuses::default_project_statuses;
-use crate::workflow::default_workflow;
+use crate::workflow::{default_workflow, subtask_workflow, task_workflow};
 use crate::Result;
 
 /// One optional, commented-out section: a short prose header (rendered as
@@ -125,23 +125,23 @@ const RUNNER_DIALOG: Section = Section {
     yaml: "    dialog_signatures:\n      - { kind: trust, pattern: \"Do you trust the files\" }\n",
 };
 
+/// Commented example of an extra workspace — spliced into the active
+/// `workspaces:` pool the scaffolder now emits, so uncommenting it adds a
+/// sibling slot rather than a duplicate `workspaces:` key.
+const WORKSPACES_EXTRA: Section = Section {
+    prose: &[
+        "Add more workspaces to the pool above. Each owns a worktree at",
+        "<machine.work_dir>/.shelbi/wt/<name> and picks up tasks from the board.",
+        "Tags route work: a status can require tags, and a slot tagged `review` is",
+        "the surface the Reviewer agent loads a branch onto for a human to run",
+        "(scalar `tag:` also accepted).",
+    ],
+    yaml: "- { name: bob, machine: hub, runner: codex }\n",
+};
+
 /// Optional top-level project keys, none of which the required file emits, so
 /// each is additive and independently uncommentable.
 const PROJECT_SECTIONS: &[Section] = &[
-    Section {
-        prose: &[
-            "Workspace pool: long-lived slots that pick up tasks from the board.",
-            "Each owns a worktree at <machine.work_dir>/.shelbi/wt/<name>. Tags route",
-            "work to slots: a status can require tags, and a slot tagged `review` is",
-            "the surface that loads & serves a branch for a human (scalar `tag:` ok).",
-        ],
-        yaml: "\
-workspaces:
-  - { name: alice, machine: hub, runner: claude }
-  - { name: bob, machine: hub, runner: codex }
-  - { name: rev, machine: hub, runner: claude, tags: [review] }
-",
-    },
     Section {
         prose: &["Informational GitHub URL, recorded by the setup wizard."],
         yaml: "github_url: git@github.com:me/myapp.git\n",
@@ -212,11 +212,28 @@ pub fn decorate_project_yaml(active: &str) -> String {
         s.push_str(&comment_block(MACHINES_SSH.yaml));
         s
     };
-    let mut spliced = false;
+    // Splice the extra-workspace example into the active `workspaces:` list.
+    // Serde emits `workspaces:` (when present) right before `agent_runners:`,
+    // so the hint lands as an additional commented list item under the pool.
+    let workspaces_hint = {
+        let mut s = prose_block(WORKSPACES_EXTRA.prose);
+        s.push_str(&comment_block(WORKSPACES_EXTRA.yaml));
+        s
+    };
+    let mut spliced_machines = false;
+    let mut saw_workspaces = false;
+    let mut spliced_workspaces = false;
     for line in active.lines() {
-        if !spliced && line == "orchestrator:" {
+        if line == "workspaces:" {
+            saw_workspaces = true;
+        }
+        if !spliced_machines && line == "orchestrator:" {
             out.push_str(&machines_hint);
-            spliced = true;
+            spliced_machines = true;
+        }
+        if !spliced_workspaces && saw_workspaces && line == "agent_runners:" {
+            out.push_str(&workspaces_hint);
+            spliced_workspaces = true;
         }
         out.push_str(line);
         out.push('\n');
@@ -281,6 +298,31 @@ zen:
     },
 ];
 
+/// Commented optional blocks for the shipped `task` / `subtask` workflows.
+/// Both already carry active `transitions:` and `git:` blocks, so — unlike
+/// [`WORKFLOW_SECTIONS`] — this set omits those keys (a commented duplicate
+/// would collide on uncomment). Only the two additive keys neither shipped
+/// workflow sets are offered: `initial_status:` and a per-workflow `zen:`
+/// override.
+const SHIPPED_WORKFLOW_SECTIONS: &[Section] = &[
+    Section {
+        prose: &["Stable id a new task lands in. Defaults to the first status when unset."],
+        yaml: "initial_status: backlog\n",
+    },
+    Section {
+        prose: &[
+            "Per-workflow Zen override — each subfield independently optional. The",
+            "canonical use is a research workflow opting out of the project's checks.",
+        ],
+        yaml: "\
+zen:
+  checks:
+    local: []                # replace the project's checks for this workflow
+  ci_timeout: 900
+",
+    },
+];
+
 /// The self-documenting `workflows/default.yaml` written for a fresh project:
 /// the serialized [`default_workflow`] plus a header and commented optional
 /// blocks (initial_status, transitions, per-workflow git/zen).
@@ -289,6 +331,29 @@ pub fn default_workflow_yaml() -> Result<String> {
     Ok(format!(
         "{WORKFLOW_HEADER}{active}\n{}",
         render_sections(WORKFLOW_SECTIONS)
+    ))
+}
+
+/// The self-documenting `workflows/task.yaml` written for a fresh project: the
+/// serialized [`task_workflow`] (active `transitions:` + `git:` included) plus
+/// a header and the additive commented blocks that don't collide with them.
+pub fn task_workflow_yaml() -> Result<String> {
+    let active = serde_yaml::to_string(&task_workflow())?;
+    Ok(format!(
+        "{WORKFLOW_HEADER}{active}\n{}",
+        render_sections(SHIPPED_WORKFLOW_SECTIONS)
+    ))
+}
+
+/// The self-documenting `workflows/subtask.yaml` written for a fresh project:
+/// the serialized [`subtask_workflow`] plus a header and the additive
+/// commented blocks. Its `git.base_branch` is the templated `task/{{task}}`,
+/// resolved from the subtask's `task:` frontmatter at dispatch.
+pub fn subtask_workflow_yaml() -> Result<String> {
+    let active = serde_yaml::to_string(&subtask_workflow())?;
+    Ok(format!(
+        "{WORKFLOW_HEADER}{active}\n{}",
+        render_sections(SHIPPED_WORKFLOW_SECTIONS)
     ))
 }
 
@@ -354,7 +419,7 @@ keymap:
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{Project, ProjectStatuses, Workflow};
+    use crate::{Project, ProjectStatuses, TransitionAction, Workflow};
 
     /// Strip exactly one leading `#` from every line — the inverse of
     /// [`comment_block`]. A `##` prose line becomes a plain `#` comment
@@ -369,18 +434,30 @@ mod tests {
     }
 
     /// A minimal required project YAML mirroring what `shelbi init`'s serde
-    /// renderer emits (name/repo/default_branch/machines/orchestrator/
-    /// agent_runners), used to exercise the decoration + uncomment round-trip.
+    /// renderer emits (name/repo/default_branch/default_workflow/machines/
+    /// orchestrator/workspaces/agent_runners), used to exercise the decoration
+    /// and uncomment round-trip. `workspaces:` sits between `orchestrator:` and
+    /// `agent_runners:` so the extra-workspace splice lands in the pool.
     const REQUIRED_PROJECT: &str = "\
 name: myapp
 repo: ''
 default_branch: main
+default_workflow: task
 machines:
 - name: hub
   kind: local
   work_dir: /tmp/myapp
 orchestrator:
   runner: claude
+workspaces:
+- name: dev
+  machine: hub
+  runner: claude
+- name: rev
+  machine: hub
+  runner: claude
+  tags:
+  - review
 agent_runners:
   claude:
     command: claude
@@ -399,9 +476,13 @@ agent_runners:
         let p = Project::from_yaml_str(&decorated).expect("decorated project parses");
         assert_eq!(p.name, "myapp");
         assert_eq!(p.machines.len(), 1, "ssh example must stay commented");
+        // The active starter pool ships (dev + review slot); the extra-workspace
+        // example spliced into it stays commented.
+        assert_eq!(p.workspaces.len(), 2, "extra-workspace example must stay commented");
+        assert_eq!(p.default_workflow.as_deref(), Some("task"));
         assert!(
-            p.workspaces.is_empty(),
-            "workspaces example must stay commented"
+            p.workspaces.iter().any(|w| p.effective_tags(w).contains("review")),
+            "the scaffolded pool must include a review-tagged slot"
         );
     }
 
@@ -419,6 +500,7 @@ agent_runners:
             .machines
             .iter()
             .any(|m| m.host.as_deref() == Some("devbox.local")));
+        // The two active slots (dev + rev) plus the uncommented extra (bob).
         assert_eq!(p.workspaces.len(), 3);
         assert!(p.workspaces.iter().any(|w| w.runner == "codex"));
         assert!(p
@@ -451,6 +533,53 @@ agent_runners:
         assert!(wf.git.is_some());
         assert!(wf.zen.is_some());
         assert_eq!(wf.initial_status.as_deref(), Some("backlog"));
+    }
+
+    #[test]
+    fn task_workflow_yaml_ships_active_transitions_and_git_and_uncomments_cleanly() {
+        let yaml = task_workflow_yaml().unwrap();
+        assert!(yaml.contains("https://shelbi.dev/docs/configuration/workflow"));
+
+        // As written: the review-gated `task` flow with ACTIVE transitions +
+        // git (unlike the lean `default` scaffold, these are not commented).
+        let wf = Workflow::from_yaml_str(&yaml).expect("decorated task workflow parses");
+        assert_eq!(wf.name, "task");
+        let transitions = wf.transitions.as_ref().expect("transitions are active");
+        // Exactly one PR: a single edge fires open_pr (in-progress -> review).
+        let open_prs = transitions
+            .iter()
+            .filter(|t| t.actions.contains(&TransitionAction::OpenPr))
+            .count();
+        assert_eq!(open_prs, 1, "task opens exactly one PR");
+        let git = wf.git.as_ref().expect("git block is active");
+        assert_eq!(git.base_branch.as_deref(), Some("main"));
+        assert_eq!(git.branch_prefix.as_deref(), Some("task"));
+
+        // Uncommenting the additive blocks (initial_status, zen) must not
+        // collide with the already-active transitions/git.
+        let wf = Workflow::from_yaml_str(&uncomment(&yaml))
+            .expect("uncommented task workflow parses without duplicate keys");
+        assert_eq!(wf.initial_status.as_deref(), Some("backlog"));
+        assert!(wf.zen.is_some());
+    }
+
+    #[test]
+    fn subtask_workflow_yaml_opens_no_pr_and_targets_parent_branch() {
+        let yaml = subtask_workflow_yaml().unwrap();
+        let wf = Workflow::from_yaml_str(&yaml).expect("decorated subtask workflow parses");
+        assert_eq!(wf.name, "subtask");
+        let transitions = wf.transitions.as_ref().expect("transitions are active");
+        // A subtask never opens a PR — no open_pr / push_branch anywhere.
+        assert!(transitions.iter().all(|t| {
+            !t.actions.contains(&TransitionAction::OpenPr)
+                && !t.actions.contains(&TransitionAction::PushBranch)
+        }));
+        let git = wf.git.as_ref().expect("git block is active");
+        assert_eq!(git.base_branch.as_deref(), Some("task/{{task}}"));
+
+        // Uncomment round-trip still valid.
+        Workflow::from_yaml_str(&uncomment(&yaml))
+            .expect("uncommented subtask workflow parses without duplicate keys");
     }
 
     #[test]

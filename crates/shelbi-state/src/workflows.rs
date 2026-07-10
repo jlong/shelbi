@@ -147,13 +147,35 @@ pub fn scaffold_project_statuses(project: &str) -> Result<()> {
     atomic_write(&path, yaml.as_bytes())
 }
 
-/// Write the self-documenting default `default.yaml` for a fresh project.
-/// Used by `shelbi init` and explicit migration/reload paths; normal
-/// project loads do not recreate this file when users remove it.
-pub fn scaffold_project_workflow(project: &str) -> Result<()> {
-    let path = workflow_path(project, shelbi_core::DEFAULT_WORKFLOW_NAME)?;
-    let yaml = shelbi_core::scaffold::default_workflow_yaml()?;
-    atomic_write(&path, yaml.as_bytes())
+/// Write the self-documenting default workflow files for a fresh project:
+/// `task.yaml` (the default track, with a review gate) and `subtask.yaml`
+/// (a piece of a parent task, no PR). Each file is written **only when
+/// absent**, so a re-run preserves user edits and a half-initialized project
+/// (one file written, the other not) is completed rather than clobbered.
+/// Used by `shelbi init` and explicit migration/reload paths; normal project
+/// loads do not recreate these files when users remove them. Returns the
+/// paths that were created (empty when both already existed).
+pub fn scaffold_project_workflow(project: &str) -> Result<Vec<PathBuf>> {
+    let files = [
+        (
+            shelbi_core::TASK_WORKFLOW_NAME,
+            shelbi_core::scaffold::task_workflow_yaml()?,
+        ),
+        (
+            shelbi_core::SUBTASK_WORKFLOW_NAME,
+            shelbi_core::scaffold::subtask_workflow_yaml()?,
+        ),
+    ];
+    let mut created = Vec::new();
+    for (name, yaml) in files {
+        let path = workflow_path(project, name)?;
+        if path.exists() {
+            continue;
+        }
+        atomic_write(&path, yaml.as_bytes())?;
+        created.push(path);
+    }
+    Ok(created)
 }
 
 /// Load and validate a single workflow by name. Errors if the file is

@@ -39,14 +39,12 @@ pub fn run(project_opt: Option<String>) -> Result<()> {
     // unwritable, it hard-fails with a source-tagged error.
     shelbi_state::ensure_root_subdirs().map_err(|e| anyhow!(e))?;
     // Explicit compatibility materialization for projects created before
-    // workflows/statuses.yaml and workflows/default.yaml were split out.
-    // Ordinary project loads stay read-only with respect to default.yaml,
-    // but `shelbi reload` remains the user-facing repair path.
-    let workflow_path =
-        shelbi_state::default_workflow_path(&project_name).map_err(|e| anyhow!(e))?;
-    if !workflow_path.exists() {
-        shelbi_state::scaffold_project_workflow(&project_name).map_err(|e| anyhow!(e))?;
-    }
+    // workflows/statuses.yaml and the shipped workflow files were split out.
+    // Ordinary project loads stay read-only with respect to these files, but
+    // `shelbi reload` remains the user-facing repair path.
+    // `scaffold_project_workflow` self-guards per file, so it only writes the
+    // task.yaml / subtask.yaml that are actually missing.
+    shelbi_state::scaffold_project_workflow(&project_name).map_err(|e| anyhow!(e))?;
     let statuses_path = shelbi_state::statuses_path(&project_name).map_err(|e| anyhow!(e))?;
     if !statuses_path.exists() {
         shelbi_state::scaffold_project_statuses(&project_name).map_err(|e| anyhow!(e))?;
