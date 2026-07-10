@@ -484,6 +484,15 @@ fn scaffold_project(resolved: &ResolvedProjectRoot, mode: InitMode) -> Result<()
         shelbi_state::scaffold_project_statuses(&resolved.name).map_err(|e| anyhow!(e))?;
         println!("✓ wrote project statuses: {}", statuses_path.display());
     }
+    // The user-owned Zen policy definition. First line is the one-line Zen
+    // summary the heartbeat re-injects; the rest is the auto-promote + merge
+    // policy. Written only when absent so user edits survive re-runs.
+    if shelbi_state::scaffold_zenmode(&resolved.name).map_err(|e| anyhow!(e))?
+        == shelbi_state::ZenmodeOutcome::Created
+    {
+        let zenmode_path = shelbi_state::zenmode_path(&resolved.name).map_err(|e| anyhow!(e))?;
+        println!("✓ wrote Zen policy: {}", zenmode_path.display());
+    }
     Ok(())
 }
 
@@ -652,6 +661,12 @@ fn run_pick_up(args: Args) -> Result<PickUpOutcome> {
     }
     for path in shelbi_state::scaffold_project_workflow(&local_alias).map_err(|e| anyhow!(e))? {
         println!("✓ wrote project workflow: {}", path.display());
+    }
+    if shelbi_state::scaffold_zenmode(&local_alias).map_err(|e| anyhow!(e))?
+        == shelbi_state::ZenmodeOutcome::Created
+    {
+        let zenmode_path = shelbi_state::zenmode_path(&local_alias).map_err(|e| anyhow!(e))?;
+        println!("✓ wrote Zen policy: {}", zenmode_path.display());
     }
 
     println!();
