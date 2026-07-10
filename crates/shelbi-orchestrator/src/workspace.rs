@@ -1110,14 +1110,18 @@ fn deploy_and_spawn(a: SpawnArgs<'_>) -> Result<()> {
     }
 
     if launch_seed {
-        if confirm_dispatch_started(a.host, a.addr, a.task_id, &a.workspace.name, a.prompt) {
+        // The pane was just killed + recreated (step 3), so it carries no
+        // scrollback from a prior run — any busy signal is genuinely this
+        // dispatch. `stale_busy = false` keeps the busy-scrollback signal live.
+        if confirm_dispatch_started(a.host, a.addr, a.task_id, &a.workspace.name, a.prompt, false) {
             return Ok(());
         }
         if shelbi_agent::is_claude_runner(&a.runner.command)
             && crate::ready::wait_for_claude_ready(a.host, a.addr, crate::ready::READY_TIMEOUT)?
         {
             shelbi_tmux::send_line(a.host, a.addr, a.prompt)?;
-            if confirm_dispatch_started(a.host, a.addr, a.task_id, &a.workspace.name, a.prompt) {
+            if confirm_dispatch_started(a.host, a.addr, a.task_id, &a.workspace.name, a.prompt, false)
+            {
                 return Ok(());
             }
         }
@@ -1157,6 +1161,18 @@ fn deploy_and_spawn(a: SpawnArgs<'_>) -> Result<()> {
             a.addr.target(),
         )));
     }
+    // Baseline the pane's busy state BEFORE we deliver the prompt. On a claude
+    // `--continue` resume the pane replays the prior conversation into the
+    // scrollback — token-usage footers (`… ↑ 3.2k tokens)`) and all — so
+    // `claude_is_processing` would read that replay as "busy" and false-confirm
+    // a prompt whose Enter was actually dropped (the workspace then sits idle at
+    // Ctx 0 while the board shows `in_progress`; observed 2026-07-09 on bravo
+    // after a `task resume`). When the pane already looks busy, the busy-
+    // scrollback signal is not proof THIS prompt landed, so we suppress it and
+    // rely on the reliable signals (title marker / input box clearing).
+    let stale_busy = claude_is_processing(
+        &shelbi_tmux::capture_history(a.host, a.addr, PROMPT_SUBMIT_SCROLLBACK).unwrap_or_default(),
+    );
     shelbi_tmux::send_line(a.host, a.addr, a.prompt)?;
 
     // 7. Verify the prompt actually got submitted, not just typed into the
@@ -1173,7 +1189,8 @@ fn deploy_and_spawn(a: SpawnArgs<'_>) -> Result<()> {
     //    in its ready-category column, exactly like a readiness timeout,
     //    instead of moving it to `in_progress` on a workspace that never got
     //    the prompt.
-    if !confirm_dispatch_started(a.host, a.addr, a.task_id, &a.workspace.name, a.prompt) {
+    if !confirm_dispatch_started(a.host, a.addr, a.task_id, &a.workspace.name, a.prompt, stale_busy)
+    {
         return Err(Error::Other(format!(
             "prompt was not accepted on {} — no submission signal after a retry \
              Enter. Dispatch aborted so the task stays put for retry; check the \
@@ -1219,14 +1236,21 @@ const PROMPT_SUBMIT_SCROLLBACK: usize = 200;
 /// parked in the box: re-Entering an already-cleared box is pointless, and
 /// re-Entering a box the user has since started typing into could fire a
 /// partial message.
+///
+/// `stale_busy` reports whether the pane ALREADY looked busy before this prompt
+/// was delivered — true on a `--continue` resume, where claude replays the
+/// prior conversation (token-usage footers included) into the scrollback. When
+/// set, the busy-scrollback signal is untrustworthy for this dispatch, so
+/// confirmation leans on the title marker and the input box actually clearing.
 fn confirm_dispatch_started(
     host: &Host,
     addr: &TmuxAddr,
     task_id: &str,
     workspace: &str,
     prompt: &str,
+    stale_busy: bool,
 ) -> bool {
-    if wait_for_prompt_submitted(host, addr, prompt, PROMPT_SUBMIT_WAIT) {
+    if wait_for_prompt_submitted(host, addr, prompt, stale_busy, PROMPT_SUBMIT_WAIT) {
         append_dispatch_status(task_id, workspace, "confirmed", "busy_observed");
         return true;
     }
@@ -1251,7 +1275,7 @@ fn confirm_dispatch_started(
                 addr.target(),
             );
         }
-        if wait_for_prompt_submitted(host, addr, prompt, PROMPT_SUBMIT_WAIT) {
+        if wait_for_prompt_submitted(host, addr, prompt, stale_busy, PROMPT_SUBMIT_WAIT) {
             append_dispatch_status(task_id, workspace, "confirmed", "retry_enter");
             return true;
         }
@@ -1305,10 +1329,15 @@ fn append_dispatch_status(task_id: &str, workspace: &str, status: &str, detail: 
 ///    [`input_holds_unsubmitted_prompt`]): a chip is an un-submitted prompt
 ///    whose body claude never echoes, so counting it as cleared is precisely
 ///    the auto-restart false positive this guards against.
+///
+/// `stale_busy` suppresses signal (2): see [`screen_shows_submitted`]. On a
+/// `--continue` resume the replayed scrollback carries old token footers, so
+/// the busy signal would fire on content that predates this prompt.
 fn wait_for_prompt_submitted(
     host: &Host,
     addr: &TmuxAddr,
     prompt: &str,
+    stale_busy: bool,
     timeout: std::time::Duration,
 ) -> bool {
     let start = std::time::Instant::now();
@@ -1324,19 +1353,34 @@ fn wait_for_prompt_submitted(
         // output has scrolled the footer.
         let screen =
             shelbi_tmux::capture_history(host, addr, PROMPT_SUBMIT_SCROLLBACK).unwrap_or_default();
-        if claude_is_processing(&screen) {
-            return true;
-        }
-        // Most direct of all: the prompt is gone from the input box. Guard on
-        // the box actually being on screen (`input_box_cleared`) so a capture
-        // that missed the box — or one taken before claude echoed the typed
-        // prompt — doesn't read as "submitted."
-        if input_box_cleared(&screen, prompt) {
+        if screen_shows_submitted(&screen, prompt, stale_busy) {
             return true;
         }
         std::thread::sleep(PROMPT_SUBMIT_POLL);
     }
     false
+}
+
+/// Decide, from a single captured pane screen, whether the just-delivered
+/// prompt has been submitted. Encodes signals (2) and (3) from
+/// [`wait_for_prompt_submitted`]; signal (1) (the pane title marker) is polled
+/// separately because it reads the title, not the body.
+///
+/// - Signal (2): claude is actively processing ([`claude_is_processing`]).
+///   Suppressed when `stale_busy` is set — on a `--continue` resume the pane
+///   replays the prior conversation into the scrollback, token-usage footers
+///   (`… tokens)`) and all, so a busy match there is NOT proof THIS prompt
+///   landed. Counting it was the resume false-confirm: the dispatch reported
+///   `busy_observed` while the resume prompt sat un-submitted at Ctx 0.
+/// - Signal (3): the input box no longer holds the prompt
+///   ([`input_box_cleared`]) — direct proof it was consumed. This one is safe
+///   on resume: before delivery the box was empty (readiness passed), so a
+///   cleared box after delivery can only mean the prompt we typed was taken.
+fn screen_shows_submitted(screen: &str, prompt: &str, stale_busy: bool) -> bool {
+    if !stale_busy && claude_is_processing(screen) {
+        return true;
+    }
+    input_box_cleared(screen, prompt)
 }
 
 /// Minimum number of non-whitespace characters a captured input-box line must
@@ -3811,6 +3855,71 @@ mod tests {
         // A busy/mid-turn pane has no chip either — still cleared.
         assert!(!input_holds_pasted_chip(BUSY_SCREEN_SPINNER));
         assert!(input_box_cleared(BUSY_SCREEN_SPINNER, &prompt));
+    }
+
+    // The exact state the resume false-confirm bug left the pane in: a claude
+    // `--continue` resume replayed the prior conversation into the scrollback,
+    // leaving a token-usage footer (`… ↑ 19.8k tokens)`) above the box — the
+    // very string `claude_is_processing` keys on — while the resume prompt we
+    // just pasted sits UN-submitted in the input box (its Enter was dropped).
+    // The board showed `in_progress` at Ctx 0 until a human pressed Enter
+    // (observed 2026-07-09 on bravo after a `task resume`).
+    const RESUMED_STALE_SCREEN: &str = "\
+⏺ Read(src/main.rs)
+  ⎿  Read 42 lines
+
+⏺ Done. (7m 16s · ↑ 19.8k tokens)
+────────────────────────────────────────────────────
+❯ # dispatch: enter-stalled false positive — submit
+  signal detector reports a stall on submitted prompts
+────────────────────────────────────────────────────
+  ⏵⏵ auto mode on (shift+tab to cycle)";
+
+    #[test]
+    fn resume_replay_scrollback_is_the_false_positive_without_stale_guard() {
+        // Sanity: the fixture really does carry BOTH the stale token footer
+        // (which trips `claude_is_processing`) AND the un-submitted prompt in
+        // the box — so without the guard, `screen_shows_submitted` reads the
+        // replay as "this prompt submitted." That is the bug.
+        let prompt = stalled_prompt();
+        assert!(claude_is_processing(RESUMED_STALE_SCREEN));
+        assert!(input_holds_prompt(RESUMED_STALE_SCREEN, &prompt));
+        assert!(!input_box_cleared(RESUMED_STALE_SCREEN, &prompt));
+        // stale_busy = false (the pre-fix behavior / the launch-seed path):
+        // the busy signal fires on replayed scrollback → false confirm.
+        assert!(screen_shows_submitted(RESUMED_STALE_SCREEN, &prompt, false));
+    }
+
+    #[test]
+    fn stale_busy_guard_suppresses_replayed_busy_signal_on_resume() {
+        // The fix: when the pane already looked busy before we delivered the
+        // prompt (a resume replay), the busy-scrollback signal is not proof
+        // THIS prompt landed. With the prompt still parked in the box, the
+        // guard must report "not submitted" so the retry-Enter path fires and
+        // the dispatch isn't falsely confirmed.
+        let prompt = stalled_prompt();
+        assert!(!screen_shows_submitted(RESUMED_STALE_SCREEN, &prompt, true));
+    }
+
+    #[test]
+    fn stale_busy_guard_still_confirms_once_the_box_clears() {
+        // A resume prompt that genuinely submitted clears the box, even though
+        // the replayed token footer is still in the scrollback. The box-cleared
+        // signal (3) survives the stale-busy guard, so the real submit is still
+        // confirmed — the guard only mutes the unreliable busy signal (2).
+        let prompt = stalled_prompt();
+        assert!(input_box_cleared(BUSY_SCREEN_SPINNER, &prompt));
+        assert!(screen_shows_submitted(BUSY_SCREEN_SPINNER, &prompt, true));
+    }
+
+    #[test]
+    fn fresh_dispatch_still_confirms_via_busy_signal() {
+        // The launch-seed / fresh-start path passes stale_busy = false (the
+        // pane was just recreated, no replay), so a genuinely busy pane whose
+        // box we can't cleanly read is still confirmed via the busy signal —
+        // no regression to the non-resume path.
+        let prompt = stalled_prompt();
+        assert!(screen_shows_submitted(BUSY_SCREEN_ESC_FOOTER, &prompt, false));
     }
 
     #[test]
