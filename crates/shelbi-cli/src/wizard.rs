@@ -204,7 +204,12 @@ pub fn setup_one_project() -> Result<()> {
         .context("orchestrator runner select")?;
 
     // ---- Assemble workspaces ----------------------------------------------
-    let workspaces = assign_workspace_names(&machines, count, preset, agent_runner)?;
+    // The dev pool comes from the naming preset; then append a dedicated hub
+    // review slot tagged `review` so the `task` workflow's review status
+    // (which routes to a `review`-tagged workspace) always has somewhere to
+    // land. Mirrors the `dev` + `rev` starter pool `shelbi init` provisions.
+    let mut workspaces = assign_workspace_names(&machines, count, preset, agent_runner)?;
+    append_review_workspace(&mut workspaces, &machines[0], agent_runner);
 
     // ---- Assemble Project struct ---------------------------------------
     let mut agent_runners = BTreeMap::new();
@@ -231,7 +236,10 @@ pub fn setup_one_project() -> Result<()> {
         name: name.clone(),
         repo: repo_path.clone(),
         default_branch,
-        default_workflow: None,
+        // Fresh projects land on the review-gated `task` workflow; the
+        // `subtask` workflow ships alongside (materialized below). Matches
+        // the default `shelbi init` scaffold.
+        default_workflow: Some(shelbi_core::TASK_WORKFLOW_NAME.to_string()),
         config_mode: None,
         machines,
         orchestrator: OrchestratorSpec {
@@ -255,7 +263,16 @@ pub fn setup_one_project() -> Result<()> {
     shelbi_state::save_project(&project).map_err(|e| anyhow!(e))?;
 
     write_workspace_settings_template(&name)?;
+    // Six agents (orchestrator, developer, review, qa, security, adversarial).
     let _ = shelbi_state::materialize_default_agents(&name).map_err(|e| anyhow!(e))?;
+    // Materialize the starter workflow files (task.yaml + subtask.yaml) and the
+    // project statuses catalogue so the new project is self-contained the same
+    // way `shelbi init` leaves it. Each is written only when absent.
+    let _ = shelbi_state::scaffold_project_workflow(&name).map_err(|e| anyhow!(e))?;
+    let statuses_path = shelbi_state::statuses_path(&name).map_err(|e| anyhow!(e))?;
+    if !statuses_path.exists() {
+        shelbi_state::scaffold_project_statuses(&name).map_err(|e| anyhow!(e))?;
+    }
 
     // ---- Done -----------------------------------------------------------
     let names_csv = project
@@ -270,6 +287,11 @@ pub fn setup_one_project() -> Result<()> {
         project.workspaces.len(),
         names_csv
     );
+    println!("  Workflows: task (cuts a branch, gates on review) and subtask (a piece of a");
+    println!("  parent task, no PR). New tasks default to task.");
+    println!("  The `review` workspace runs the review gate for the task workflow.");
+    println!("  Six agents are ready under agents/. Three specialized reviewers ship opt-in:");
+    println!("  qa, security, and adversarial. Wire one into a workflow's review step to use it.");
     Ok(())
 }
 
@@ -474,6 +496,22 @@ fn assign_workspace_names(
     Ok(workspaces)
 }
 
+/// Append a dedicated `review`-tagged workspace on `hub` (the local hub
+/// machine) to an already-assembled dev pool. The `task` workflow's review
+/// status routes to a workspace carrying the `review` tag, so a fresh project
+/// needs at least one; this is the wizard's counterpart to the `rev` slot
+/// `shelbi init` provisions. The slot is named `review` — a name no naming
+/// preset produces, so it can never collide with the dev pool.
+fn append_review_workspace(workspaces: &mut Vec<WorkspaceSpec>, hub: &Machine, runner: Runner) {
+    workspaces.push(WorkspaceSpec {
+        name: "review".to_string(),
+        machine: hub.name.clone(),
+        runner: runner.id().to_string(),
+        tags: vec!["review".to_string()],
+        slot: None,
+    });
+}
+
 /// Drop the per-project workspace-settings template at
 /// `~/.shelbi/projects/<name>/workspace-settings.json` so the workspace deploy
 /// step has something to render. Mirrors `shelbi init --project`.
@@ -621,6 +659,30 @@ mod tests {
             wizard_default_project_name(Path::new("/tmp/...")),
             "my-project"
         );
+    }
+
+    #[test]
+    fn append_review_workspace_adds_review_tagged_hub_slot() {
+        let hub = Machine {
+            name: "hub".into(),
+            kind: MachineKind::Local,
+            work_dir: "/tmp".into(),
+            host: None,
+            tags: Vec::new(),
+            forward: None,
+        };
+        let mut workspaces =
+            assign_workspace_names(std::slice::from_ref(&hub), 2, WorkspaceNamePreset::Phonetic, Runner::Claude)
+                .unwrap();
+        append_review_workspace(&mut workspaces, &hub, Runner::Claude);
+        // Dev pool is untouched and the appended slot is the review workspace.
+        assert_eq!(workspaces.len(), 3);
+        assert!(workspaces[..2].iter().all(|w| w.tags.is_empty()));
+        let review = workspaces.last().unwrap();
+        assert_eq!(review.name, "review");
+        assert_eq!(review.machine, "hub");
+        assert_eq!(review.runner, "claude");
+        assert_eq!(review.tags, vec!["review".to_string()]);
     }
 
     #[test]
