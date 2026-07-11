@@ -2,7 +2,10 @@
 //! pool. Workspaces are durable slots (one worktree each); tasks come and go.
 //! See [`shelbi_orchestrator::workspace`] for the lifecycle primitives.
 
-use std::{collections::BTreeSet, fs};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    fs,
+};
 
 use anyhow::{anyhow, Result};
 use chrono::{DateTime, Utc};
@@ -102,15 +105,35 @@ pub(crate) fn print_workspaces(project: &str) -> Result<()> {
     Ok(())
 }
 
+/// Why an idle workspace's tmux slot is still alive. A **user shell** is
+/// the sidebar's click-an-idle-workspace pane (deliberate, user-occupied,
+/// not dispatchable — `shelbi task start` refuses it); an **orphaned
+/// session** is any other leftover allocation (e.g. an agent pane whose
+/// task was moved away), which dispatch will reset as before.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OccupiedKind {
+    UserShell,
+    Orphaned,
+}
+
+impl OccupiedKind {
+    fn state_cell(self) -> &'static str {
+        match self {
+            OccupiedKind::UserShell => "occupied (user shell)",
+            OccupiedKind::Orphaned => "orphaned session",
+        }
+    }
+}
+
 fn occupied_idle_workspaces(
     project: &shelbi_core::Project,
     in_progress: &[&Task],
-) -> Result<BTreeSet<String>> {
+) -> Result<BTreeMap<String, OccupiedKind>> {
     let assigned: BTreeSet<&str> = in_progress
         .iter()
         .filter_map(|t| t.assigned_to.as_deref())
         .collect();
-    let mut occupied = BTreeSet::new();
+    let mut occupied = BTreeMap::new();
     for workspace in &project.workspaces {
         if assigned.contains(workspace.name.as_str()) {
             continue;
@@ -126,7 +149,15 @@ fn occupied_idle_workspaces(
         let addr =
             orch_workspace::workspace_tmux_addr(project, workspace).map_err(|e| anyhow!(e))?;
         if orch_workspace::workspace_slot_alive(&host, &addr).map_err(|e| anyhow!(e))? {
-            occupied.insert(workspace.name.clone());
+            // Best-effort mark probe: an unreadable option degrades to the
+            // historical "orphaned session" reading, never an error.
+            let kind = if orch_workspace::workspace_user_shell_open(&host, &addr).unwrap_or(false)
+            {
+                OccupiedKind::UserShell
+            } else {
+                OccupiedKind::Orphaned
+            };
+            occupied.insert(workspace.name.clone(), kind);
         }
     }
     Ok(occupied)
@@ -146,13 +177,13 @@ fn render_list(
     workspaces: &[WorkspaceSpec],
     in_progress: &[&Task],
 ) -> Result<Vec<String>> {
-    render_list_with_occupied(workspaces, in_progress, &BTreeSet::new())
+    render_list_with_occupied(workspaces, in_progress, &BTreeMap::new())
 }
 
 fn render_list_with_occupied(
     workspaces: &[WorkspaceSpec],
     in_progress: &[&Task],
-    occupied_idle: &BTreeSet<String>,
+    occupied_idle: &BTreeMap<String, OccupiedKind>,
 ) -> Result<Vec<String>> {
     let mut out = Vec::with_capacity(workspaces.len() + 1);
     out.push(format!(
@@ -166,10 +197,9 @@ fn render_list_with_occupied(
             .filter(|t| t.assigned_to.as_deref() == Some(workspace.name.as_str()))
             .collect();
         let (agent, state) = if mine.is_empty() {
-            let state = if occupied_idle.contains(&workspace.name) {
-                "orphaned session"
-            } else {
-                "idle"
+            let state = match occupied_idle.get(&workspace.name) {
+                Some(kind) => kind.state_cell(),
+                None => "idle",
             };
             (IDLE_AGENT_CELL.to_string(), state.to_string())
         } else {
@@ -600,7 +630,7 @@ mod tests {
     fn render_list_marks_unassigned_live_slot_as_orphaned_session() {
         let workspaces = vec![make_workspace("delta", "devbox", "sonnet-4-6")];
         let in_progress: Vec<&Task> = Vec::new();
-        let occupied = BTreeSet::from(["delta".to_string()]);
+        let occupied = BTreeMap::from([("delta".to_string(), OccupiedKind::Orphaned)]);
 
         let rows = render_list_with_occupied(&workspaces, &in_progress, &occupied).unwrap();
         let row = &rows[1];
@@ -609,12 +639,33 @@ mod tests {
         assert!(row.trim_end().ends_with("orphaned session"), "row: {row}");
     }
 
+    /// A live slot carrying the user-shell mark (sidebar click on an idle
+    /// workspace) renders as user-occupied, not as an orphaned session —
+    /// that's the cell the orchestrator reads to skip the slot for
+    /// dispatch while the user is in it.
+    #[test]
+    fn render_list_marks_user_shell_slot_as_occupied() {
+        let workspaces = vec![make_workspace("delta", "devbox", "sonnet-4-6")];
+        let in_progress: Vec<&Task> = Vec::new();
+        let occupied = BTreeMap::from([("delta".to_string(), OccupiedKind::UserShell)]);
+
+        let rows = render_list_with_occupied(&workspaces, &in_progress, &occupied).unwrap();
+        let row = &rows[1];
+        assert!(row.contains("delta"), "row: {row}");
+        assert!(row.contains(&format!(" {IDLE_AGENT_CELL} ")), "row: {row}");
+        assert!(
+            row.trim_end().ends_with("occupied (user shell)"),
+            "row: {row}"
+        );
+        assert!(!row.contains("orphaned session"), "row: {row}");
+    }
+
     #[test]
     fn render_list_prefers_assigned_task_over_orphan_marker() {
         let workspaces = vec![make_workspace("delta", "devbox", "sonnet-4-6")];
         let task = make_task("bug-fix", Column::in_progress(), 0, Some("delta"));
         let in_progress: Vec<&Task> = vec![&task];
-        let occupied = BTreeSet::from(["delta".to_string()]);
+        let occupied = BTreeMap::from([("delta".to_string(), OccupiedKind::Orphaned)]);
 
         let rows = render_list_with_occupied(&workspaces, &in_progress, &occupied).unwrap();
         let row = &rows[1];

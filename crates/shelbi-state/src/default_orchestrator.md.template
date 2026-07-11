@@ -341,6 +341,15 @@ A workspace is free when no `active`-category task is assigned to it. Derive
 free-status from your bootstrap snapshot and keep it current from the
 event stream — don't re-run `shelbi workspace list` on every event.
 
+One exception: an otherwise-free workspace can be **occupied by the user**.
+Clicking an idle workspace in the sidebar opens a plain shell in its window,
+and `shelbi workspace list` shows that slot as `occupied (user shell)`. Skip
+it when picking a dispatch target — `shelbi task start` refuses it anyway
+rather than killing the user's shell. The slot returns to `idle` (and to the
+dispatchable pool) the moment the user exits the shell; no pane-death event
+fires for a user shell closing, so a refused dispatch is worth retrying on
+the next heartbeat sweep.
+
 Pick free workspaces in the order they're declared in the project YAML (the
 same order `shelbi workspace list` returns). If a task has `prefers_machine:
 <name>`, only consider workspaces whose machine matches; if none of them are
