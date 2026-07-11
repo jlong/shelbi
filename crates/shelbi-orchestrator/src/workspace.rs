@@ -3197,6 +3197,92 @@ pub(crate) fn release_branch_from_workspace_worktrees(
     Ok(())
 }
 
+/// Outcome of [`detach_workspace_worktree`], reported so the caller can emit a
+/// single traceable `events.log` line either way.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DetachOutcome {
+    /// HEAD was pointed at the current commit with the branch ref released.
+    /// `from_branch` is the branch the worktree held before (or `None` if it
+    /// was already detached — the detach is idempotent).
+    Detached { from_branch: Option<String> },
+    /// The worktree isn't present on disk (never created, or already torn
+    /// down) — there's no branch to free, so this is a benign no-op.
+    NoWorktree,
+    /// The detach couldn't be performed (probe or `git checkout --detach`
+    /// errored). `reason` is a short snippet for the log; the caller keeps the
+    /// handoff standing regardless.
+    Failed { reason: String },
+}
+
+/// Point a workspace worktree's HEAD at its current commit in *detached* state,
+/// releasing the branch ref so no worktree holds it. This is the root-cause fix
+/// for the post-handoff "branch is already checked out at `<worktree>`" family
+/// of failures: git refuses to check out or delete a branch that's live in
+/// another worktree, so a finished worker sitting on its task branch blocks the
+/// review checkout and the merge / `delete_branch` primitives that come next.
+///
+/// Detaching *in place* (no target commit) leaves the working tree byte-for-byte
+/// unchanged — it only rewrites `HEAD` from `ref: refs/heads/<branch>` to the
+/// raw commit sha. The branch ref and every commit on it survive untouched; the
+/// branch simply becomes free for another worktree to claim or for a delete to
+/// remove. We deliberately do NOT `git checkout <default_branch>` (a named
+/// checkout): the default branch is normally live in the hub's own clone, and
+/// git won't let two worktrees hold the same branch.
+///
+/// Idempotent: a worktree whose HEAD is already detached re-detaches cleanly and
+/// reports `from_branch: None`. Best-effort by contract — every failure surfaces
+/// as [`DetachOutcome::Failed`]/[`DetachOutcome::NoWorktree`] rather than a
+/// panic, so a caller on the handoff path can log it and move on without rolling
+/// the handoff back.
+///
+/// A subsequent dispatch onto this workspace re-attaches the worktree to the new
+/// task branch via [`sync_worktree`] / [`release_branch_from_workspace_worktrees`],
+/// so leaving the idle worktree detached is safe and expected.
+pub fn detach_workspace_worktree(host: &Host, worktree: &Path) -> DetachOutcome {
+    let wt_str = worktree.to_string_lossy().into_owned();
+
+    // Nothing to free if the worktree was never materialized.
+    match shelbi_ssh::run(host, ["test", "-e", &format!("{wt_str}/.git")]) {
+        Ok(o) if o.status.success() => {}
+        Ok(_) => return DetachOutcome::NoWorktree,
+        Err(e) => {
+            return DetachOutcome::Failed {
+                reason: format!("worktree_probe_failed:{e}"),
+            }
+        }
+    }
+
+    // Record the branch we're releasing, for the event. An already-detached
+    // HEAD reports the literal `HEAD`, which we normalize to `None`.
+    let from_branch = shelbi_ssh::run_capture(
+        host,
+        ["git", "-C", &wt_str, "rev-parse", "--abbrev-ref", "HEAD"],
+    )
+    .ok()
+    .map(|s| s.trim().to_string())
+    .filter(|b| !b.is_empty() && b != "HEAD");
+
+    let out = match shelbi_ssh::run(host, ["git", "-C", &wt_str, "checkout", "--detach"]) {
+        Ok(o) => o,
+        Err(e) => {
+            return DetachOutcome::Failed {
+                reason: format!("checkout_detach_spawn_failed:{e}"),
+            }
+        }
+    };
+    if !out.status.success() {
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        let reason = stderr
+            .lines()
+            .map(|l| l.trim())
+            .find(|l| !l.is_empty())
+            .unwrap_or("checkout_detach_failed")
+            .to_string();
+        return DetachOutcome::Failed { reason };
+    }
+    DetachOutcome::Detached { from_branch }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -6057,6 +6143,163 @@ mod sync_worktree_git_tests {
             "shelbi/x",
             "alice must have been detached"
         );
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    #[test]
+    fn detach_workspace_worktree_frees_branch_preserves_commits_and_allows_reclaim() {
+        // The handoff root-cause fix: a finished worker's worktree sitting on
+        // its task branch must be detachable so the branch is free for the
+        // review checkout / merge / delete. Detaching in place must lose no
+        // work (branch ref + commits survive) and leave the branch claimable
+        // by another worktree.
+        if !git_available() {
+            eprintln!("skipping: git not on PATH");
+            return;
+        }
+        let repo = init_repo("detach-free");
+        let project = project_at(&repo);
+        let machine = project.machines[0].clone();
+
+        // alice takes shelbi/x and commits real work onto it.
+        let alice_wt = workspace_worktree(&machine, &project.workspaces[0]);
+        sync_worktree(&project, &Host::Local, &machine, &alice_wt, "shelbi/x", "main").unwrap();
+        std::fs::write(alice_wt.join("work.txt"), "task output\n").unwrap();
+        assert!(run_git_in(&alice_wt, &["add", "work.txt"]).status.success());
+        assert!(run_git_in(&alice_wt, &["commit", "-q", "-m", "task work"])
+            .status
+            .success());
+        let tip = String::from_utf8_lossy(&run_git_in(&alice_wt, &["rev-parse", "HEAD"]).stdout)
+            .trim()
+            .to_string();
+
+        let outcome = detach_workspace_worktree(&Host::Local, &alice_wt);
+        assert_eq!(
+            outcome,
+            DetachOutcome::Detached {
+                from_branch: Some("shelbi/x".to_string())
+            },
+            "detach must report the branch it released"
+        );
+
+        // HEAD is now detached at the same commit — no branch held.
+        assert_eq!(head_of(&alice_wt), "HEAD", "worktree HEAD must be detached");
+        assert_eq!(
+            String::from_utf8_lossy(&run_git_in(&alice_wt, &["rev-parse", "HEAD"]).stdout).trim(),
+            tip,
+            "detached HEAD must sit at the former branch tip"
+        );
+
+        // The branch ref + its commit survive untouched.
+        let branch_sha =
+            String::from_utf8_lossy(&run_git_in(&repo, &["rev-parse", "shelbi/x"]).stdout)
+                .trim()
+                .to_string();
+        assert_eq!(branch_sha, tip, "branch ref must still point at the work");
+        assert!(
+            run_git_in(&repo, &["cat-file", "-e", &format!("{tip}^{{commit}}")])
+                .status
+                .success(),
+            "the branch's commit must still be reachable"
+        );
+
+        // The branch is now free: bob can claim it in its own worktree, and it
+        // can then be deleted — neither hits `already checked out`.
+        let bob_wt = workspace_worktree(&machine, &project.workspaces[1]);
+        sync_worktree(&project, &Host::Local, &machine, &bob_wt, "shelbi/x", "main").unwrap();
+        assert_eq!(head_of(&bob_wt), "shelbi/x", "bob must claim the freed branch");
+        // Free bob too, then the ref deletes cleanly.
+        assert_eq!(
+            detach_workspace_worktree(&Host::Local, &bob_wt),
+            DetachOutcome::Detached {
+                from_branch: Some("shelbi/x".to_string())
+            }
+        );
+        assert!(
+            run_git_in(&repo, &["branch", "-D", "shelbi/x"]).status.success(),
+            "branch must delete without an `already checked out` error"
+        );
+
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    #[test]
+    fn detach_workspace_worktree_is_idempotent_when_already_detached() {
+        if !git_available() {
+            eprintln!("skipping: git not on PATH");
+            return;
+        }
+        let repo = init_repo("detach-idem");
+        let project = project_at(&repo);
+        let machine = project.machines[0].clone();
+        let wt = workspace_worktree(&machine, &project.workspaces[0]);
+        sync_worktree(&project, &Host::Local, &machine, &wt, "shelbi/x", "main").unwrap();
+
+        assert!(matches!(
+            detach_workspace_worktree(&Host::Local, &wt),
+            DetachOutcome::Detached { from_branch: Some(_) }
+        ));
+        // Re-detaching an already-detached worktree is a clean no-op with no
+        // branch to report.
+        assert_eq!(
+            detach_workspace_worktree(&Host::Local, &wt),
+            DetachOutcome::Detached { from_branch: None }
+        );
+        assert_eq!(head_of(&wt), "HEAD");
+
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    #[test]
+    fn detach_workspace_worktree_reports_no_worktree_when_missing() {
+        if !git_available() {
+            eprintln!("skipping: git not on PATH");
+            return;
+        }
+        let repo = init_repo("detach-missing");
+        let project = project_at(&repo);
+        let machine = project.machines[0].clone();
+        let wt = workspace_worktree(&machine, &project.workspaces[0]);
+        assert!(!wt.exists(), "worktree must start missing");
+
+        assert_eq!(
+            detach_workspace_worktree(&Host::Local, &wt),
+            DetachOutcome::NoWorktree,
+            "a missing worktree holds no branch — benign no-op"
+        );
+
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    #[test]
+    fn dispatch_onto_detached_worktree_reattaches_to_new_branch() {
+        // After a handoff leaves the worktree detached, the next dispatch onto
+        // that idle workspace must still work: sync_worktree re-attaches it to
+        // the new task branch from the detached state.
+        if !git_available() {
+            eprintln!("skipping: git not on PATH");
+            return;
+        }
+        let repo = init_repo("detach-redispatch");
+        let project = project_at(&repo);
+        let machine = project.machines[0].clone();
+        let wt = workspace_worktree(&machine, &project.workspaces[0]);
+        sync_worktree(&project, &Host::Local, &machine, &wt, "shelbi/x", "main").unwrap();
+
+        assert!(matches!(
+            detach_workspace_worktree(&Host::Local, &wt),
+            DetachOutcome::Detached { .. }
+        ));
+        assert_eq!(head_of(&wt), "HEAD");
+
+        // A fresh dispatch onto a brand-new branch re-attaches cleanly.
+        sync_worktree(&project, &Host::Local, &machine, &wt, "shelbi/y", "main").unwrap();
+        assert_eq!(
+            head_of(&wt),
+            "shelbi/y",
+            "next dispatch must re-attach the detached worktree to the new branch"
+        );
+
         let _ = std::fs::remove_dir_all(&repo);
     }
 

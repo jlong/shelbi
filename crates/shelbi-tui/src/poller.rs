@@ -66,7 +66,8 @@ use shelbi_core::{default_workflow, Column, Project, StatusCategory, Workflow};
 use shelbi_orchestrator::supervision::{SupervisionAction, SupervisionInputs, SupervisionState};
 use shelbi_state::{
     append_heartbeat_event, append_rebase_event, append_workspace_dialog_event,
-    append_workspace_event, append_workspace_pause_event, events_log_path, load_workspace_status,
+    append_workspace_event, append_workspace_pause_event, append_worktree_detach_event,
+    events_log_path, load_workspace_status,
     parse_pane_title_marker, read_state, read_zenmode_summary, save_workspace_status,
     WorkspaceState, WorkspaceStatus, ZenHeartbeatCue, ZenModeState,
 };
@@ -1009,6 +1010,23 @@ fn maybe_apply_ready_handoff(
                 }
             }
 
+            // Release the worker's worktree from the task branch now that the
+            // handoff has landed (rebase + column move both succeeded). Detach
+            // the worktree's HEAD in place so `<task.branch>` is no longer held
+            // by any worktree — the review checkout and the later merge /
+            // `delete_branch` would otherwise die on `already checked out at
+            // <worktree>`. Done BEFORE `execute_transition` on purpose: a
+            // handoff-less workflow's edge fires `merge` + `delete_branch` right
+            // here, and `delete_branch` skips a branch still held by a worktree
+            // (see `actions::workspace_holding_branch`), so freeing it first is
+            // what lets the immediate delete succeed. Ordering stays
+            // load-bearing — this runs only AFTER the move, and its failure
+            // never rolls the handoff back (the promoted task is the source of
+            // truth). This is also the missed-marker recovery path (this whole
+            // function runs on later ticks even after the pane has died), so
+            // both routes leave the branch free.
+            detach_workspace_worktree_after_handoff(workspace, machine, host, &task_id);
+
             // Fire the edge's transition actions + `run:` / `ready:` commands
             // (serving). Best-effort — the move already happened, so a command
             // failure logs but doesn't roll it back. A workflow with no edge
@@ -1456,6 +1474,61 @@ fn rebase_workspace_branch_before_handoff(
                 status = %status,
                 detail = %detail,
                 "auto-rebase outcome",
+            );
+        }
+    }
+}
+
+/// Detach the finishing worker's worktree from its task branch after a ready
+/// handoff, on the workspace's own host (SSH for a remote machine, local for
+/// the hub — resolved through the same `host`/`workspace_worktree` path the
+/// rebase step uses). Frees the branch so the review checkout and the later
+/// merge / `delete_branch` don't hit `already checked out at <worktree>`.
+///
+/// Best-effort and non-blocking by contract: the handoff (task already promoted
+/// to its handoff status) is the source of truth, so every outcome — success,
+/// missing worktree, or a real git failure — is only recorded to `events.log`,
+/// never propagated. A failure emits an explicit `reason=worktree-detach-failed`
+/// line so a downstream `already checked out` merge error is traceable to a
+/// still-held branch rather than looking silent.
+fn detach_workspace_worktree_after_handoff(
+    workspace: &shelbi_core::WorkspaceSpec,
+    machine: &shelbi_core::Machine,
+    host: &shelbi_core::Host,
+    task_id: &str,
+) {
+    let worktree = shelbi_orchestrator::workspace::workspace_worktree(machine, workspace);
+    match shelbi_orchestrator::workspace::detach_workspace_worktree(host, &worktree) {
+        shelbi_orchestrator::workspace::DetachOutcome::Detached { from_branch } => {
+            let branch = from_branch.as_deref().unwrap_or("(already-detached)");
+            if let Err(e) =
+                append_worktree_detach_event(task_id, &workspace.name, branch, true, "")
+            {
+                tracing::warn!(workspace = %workspace.name, task = %task_id, error = %e, "append_worktree_detach_event failed");
+            }
+            tracing::info!(
+                workspace = %workspace.name,
+                task = %task_id,
+                branch = %branch,
+                "detached worker worktree from task branch; branch free for review checkout / merge",
+            );
+        }
+        shelbi_orchestrator::workspace::DetachOutcome::NoWorktree => {
+            // No worktree to release (never created or already torn down) — the
+            // branch isn't held, so there's nothing to trace. Debug-only.
+            tracing::debug!(workspace = %workspace.name, task = %task_id, "no worktree to detach on handoff");
+        }
+        shelbi_orchestrator::workspace::DetachOutcome::Failed { reason } => {
+            if let Err(e) =
+                append_worktree_detach_event(task_id, &workspace.name, "?", false, &reason)
+            {
+                tracing::warn!(workspace = %workspace.name, task = %task_id, error = %e, "append_worktree_detach_event failed");
+            }
+            tracing::warn!(
+                workspace = %workspace.name,
+                task = %task_id,
+                reason = %reason,
+                "worktree detach on handoff failed; task branch may still be held by the worktree — a later merge / delete may report `already checked out`",
             );
         }
     }
@@ -2023,6 +2096,217 @@ mod tests {
             "task already in review must not be pulled back out"
         );
         assert!(!marker.exists(), "stale marker should be cleared");
+
+        std::env::remove_var("SHELBI_HOME");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    fn git_available() -> bool {
+        std::process::Command::new("git")
+            .arg("--version")
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false)
+    }
+
+    fn git_in(dir: &std::path::Path, args: &[&str]) -> std::process::Output {
+        let mut cmd = std::process::Command::new("git");
+        cmd.arg("-C").arg(dir);
+        for a in args {
+            cmd.arg(a);
+        }
+        cmd.env("GIT_AUTHOR_NAME", "Shelbi Test")
+            .env("GIT_AUTHOR_EMAIL", "test@shelbi.local")
+            .env("GIT_COMMITTER_NAME", "Shelbi Test")
+            .env("GIT_COMMITTER_EMAIL", "test@shelbi.local");
+        cmd.output().expect("git failed to spawn")
+    }
+
+    #[test]
+    fn review_marker_detaches_worker_worktree_and_frees_branch() {
+        // End-to-end: a normal ready-marker handoff must, after the rebase +
+        // column move, detach the worker's worktree from its task branch so the
+        // branch is no longer held — free for the review checkout / merge /
+        // delete — while the branch ref and its commits survive.
+        if !git_available() {
+            eprintln!("skipping: git not on PATH");
+            return;
+        }
+        let _g = crate::test_support::ENV_LOCK.lock().unwrap();
+        let home = std::env::temp_dir().join(format!(
+            "shelbi-poller-detach-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&home).unwrap();
+        std::env::set_var("SHELBI_HOME", &home);
+
+        // A real repo at work_dir doubles as the main clone; the workspace's
+        // worktree is checked out on the task branch, cut from main.
+        let work_dir = home.join("repo");
+        std::fs::create_dir_all(&work_dir).unwrap();
+        assert!(git_in(&work_dir, &["init", "-q", "-b", "main"]).status.success());
+        std::fs::write(work_dir.join("README.md"), "# repo\n").unwrap();
+        assert!(git_in(&work_dir, &["add", "README.md"]).status.success());
+        assert!(git_in(&work_dir, &["commit", "-q", "-m", "init"]).status.success());
+
+        let project = local_project(&work_dir);
+        let wt = shelbi_orchestrator::workspace::workspace_worktree(
+            &project.machines[0],
+            &project.workspaces[0],
+        );
+        std::fs::create_dir_all(wt.parent().unwrap()).unwrap();
+        assert!(git_in(
+            &work_dir,
+            &["worktree", "add", "-q", "-b", "shelbi/fix-login", wt.to_str().unwrap(), "main"],
+        )
+        .status
+        .success());
+        assert_eq!(
+            String::from_utf8_lossy(
+                &git_in(&wt, &["rev-parse", "--abbrev-ref", "HEAD"]).stdout
+            )
+            .trim(),
+            "shelbi/fix-login",
+        );
+
+        shelbi_state::save_task("demo", &in_progress_task("fix-login", "alpha"), "body").unwrap();
+        let marker = write_marker(&project, "fix-login\n");
+
+        maybe_apply_ready_handoff(
+            &project,
+            &project.workspaces[0],
+            &project.machines[0],
+            &Host::Local,
+            &TmuxAddr {
+                session: "s".into(),
+                window: "w".into(),
+            },
+        );
+
+        // Handoff landed.
+        assert_eq!(
+            shelbi_state::load_task("demo", "fix-login")
+                .unwrap()
+                .task
+                .column,
+            Column::review(),
+            "task should be promoted to review"
+        );
+        assert!(!marker.exists(), "marker should be consumed");
+
+        // Worktree HEAD is detached; the branch is no longer held.
+        assert_eq!(
+            String::from_utf8_lossy(
+                &git_in(&wt, &["rev-parse", "--abbrev-ref", "HEAD"]).stdout
+            )
+            .trim(),
+            "HEAD",
+            "worker worktree must be detached from the task branch"
+        );
+        // Branch ref + commits survive the detach.
+        assert!(
+            git_in(&work_dir, &["rev-parse", "--verify", "shelbi/fix-login"])
+                .status
+                .success(),
+            "task branch ref must be preserved"
+        );
+        // Branch is free: it deletes without an `already checked out` error.
+        assert!(
+            git_in(&work_dir, &["branch", "-D", "shelbi/fix-login"])
+                .status
+                .success(),
+            "freed branch must be deletable"
+        );
+
+        // The detach is recorded as a traceable ok event.
+        let log = std::fs::read_to_string(shelbi_state::events_log_path().unwrap()).unwrap();
+        let detach_lines: Vec<&str> = log
+            .lines()
+            .filter(|l| l.contains(" worktree-detach ") && l.contains(" task=fix-login "))
+            .collect();
+        assert_eq!(detach_lines.len(), 1, "log: {log:?}");
+        assert!(
+            detach_lines[0].contains(" detached-from=shelbi/fix-login ")
+                && detach_lines[0].contains(" status=ok"),
+            "line: {}",
+            detach_lines[0]
+        );
+
+        std::env::remove_var("SHELBI_HOME");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn review_marker_detach_failure_still_leaves_task_in_handoff() {
+        // A detach failure must not roll back or block the handoff: the task
+        // stays promoted and the failure is emitted as a traceable
+        // `reason=worktree-detach-failed` event.
+        if !git_available() {
+            eprintln!("skipping: git not on PATH");
+            return;
+        }
+        let _g = crate::test_support::ENV_LOCK.lock().unwrap();
+        let home = std::env::temp_dir().join(format!(
+            "shelbi-poller-detachfail-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&home).unwrap();
+        std::env::set_var("SHELBI_HOME", &home);
+
+        let work_dir = home.join("repo");
+        std::fs::create_dir_all(&work_dir).unwrap();
+        let project = local_project(&work_dir);
+
+        // A worktree dir whose `.git` is present-but-invalid: the existence
+        // probe passes, but `git checkout --detach` fails — simulating a broken
+        // worktree the handoff must survive.
+        let wt = shelbi_orchestrator::workspace::workspace_worktree(
+            &project.machines[0],
+            &project.workspaces[0],
+        );
+        std::fs::create_dir_all(&wt).unwrap();
+        std::fs::write(wt.join(".git"), "gitdir: /nonexistent\n").unwrap();
+
+        shelbi_state::save_task("demo", &in_progress_task("fix-login", "alpha"), "body").unwrap();
+        let marker = write_marker(&project, "fix-login\n");
+
+        maybe_apply_ready_handoff(
+            &project,
+            &project.workspaces[0],
+            &project.machines[0],
+            &Host::Local,
+            &TmuxAddr {
+                session: "s".into(),
+                window: "w".into(),
+            },
+        );
+
+        // Handoff still stands despite the detach failure.
+        assert_eq!(
+            shelbi_state::load_task("demo", "fix-login")
+                .unwrap()
+                .task
+                .column,
+            Column::review(),
+            "handoff must not roll back on a detach failure"
+        );
+        assert!(!marker.exists(), "marker should still be consumed");
+
+        let log = std::fs::read_to_string(shelbi_state::events_log_path().unwrap()).unwrap();
+        assert!(
+            log.lines().any(|l| l.contains(" worktree-detach ")
+                && l.contains(" task=fix-login ")
+                && l.contains("reason=worktree-detach-failed")),
+            "a detach failure must be traceably logged; log: {log:?}"
+        );
 
         std::env::remove_var("SHELBI_HOME");
         let _ = std::fs::remove_dir_all(&home);
