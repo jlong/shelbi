@@ -5,6 +5,7 @@
 //! action and exits.
 
 use std::io;
+use std::path::PathBuf;
 use std::time::Duration;
 
 use anyhow::Result;
@@ -407,6 +408,11 @@ fn build_entries(app: &App, zen_mode: ZenModeState, zen_chord: ZenToggleChord) -
             out.push(zen_toggle_entry(zen_mode, zen_chord));
         }
     }
+    // Hidden-until-queried config openers. They carry the `hidden_until_query`
+    // flag so an empty-query palette reads exactly as it did before; typing
+    // `E` / `Edit` / `settings` surfaces them. Placed ahead of the global
+    // action trail so "Quit Shelbi" stays the structurally-last entry.
+    out.extend(edit_entries(&app.project_name));
     out.push(Entry {
         id: "action:switch-project".into(),
         label: "Switch Project".into(),
@@ -414,6 +420,7 @@ fn build_entries(app: &App, zen_mode: ZenModeState, zen_chord: ZenToggleChord) -
         subtitle: Some("fuzzy-pick another project and swap the dashboard".into()),
         shortcut: None,
         decoration: None,
+        hidden_until_query: false,
     });
     out.push(Entry {
         id: "action:quit-project".into(),
@@ -424,6 +431,7 @@ fn build_entries(app: &App, zen_mode: ZenModeState, zen_chord: ZenToggleChord) -
         ),
         shortcut: None,
         decoration: None,
+        hidden_until_query: false,
     });
     // Most-destructive action lands last so fuzzy search doesn't
     // surface it ahead of the per-project quit, and so users who
@@ -438,8 +446,152 @@ fn build_entries(app: &App, zen_mode: ZenModeState, zen_chord: ZenToggleChord) -
         ),
         shortcut: None,
         decoration: None,
+        hidden_until_query: false,
     });
     out
+}
+
+// ---------------------------------------------------------------------------
+// "Edit …" config openers
+//
+// Hidden-until-queried shortcuts that open a project's config files in the
+// user's `$EDITOR`. Each is skipped when its target file/dir doesn't exist
+// so the palette never offers a dead entry, and the per-agent openers are
+// enumerated from the agents dir rather than hardcoded. Paths come from the
+// `shelbi-state` helpers so the palette can't drift from where the rest of
+// the codebase reads/writes these files.
+
+/// Build the hidden `edit:*` entries for `project`. Every entry sets
+/// `hidden_until_query` and only appears once its target exists on disk.
+fn edit_entries(project: &str) -> Vec<Entry> {
+    let mut candidates: Vec<(String, String, String)> = vec![(
+        "edit:project".into(),
+        "Edit Project Settings".into(),
+        "opens project.yaml".into(),
+    )];
+
+    // Per-agent openers, enumerated from `agents/` (orchestrator, developer,
+    // review, and any custom agents). Sorted so the list is stable across
+    // runs regardless of readdir order.
+    if let Ok(dir) = shelbi_state::agents_dir(project) {
+        if let Ok(rd) = std::fs::read_dir(&dir) {
+            let mut agents: Vec<String> = rd
+                .filter_map(|e| e.ok())
+                .filter(|e| e.file_type().map(|t| t.is_dir()).unwrap_or(false))
+                .filter_map(|e| e.file_name().into_string().ok())
+                .collect();
+            agents.sort();
+            for agent in agents {
+                candidates.push((
+                    format!("edit:agent:{agent}"),
+                    format!("Edit {agent} Settings"),
+                    format!("opens agents/{agent}/instructions.md"),
+                ));
+            }
+        }
+    }
+
+    candidates.push((
+        "edit:zenmode".into(),
+        "Edit Zen Mode".into(),
+        "opens zenmode.md".into(),
+    ));
+    candidates.push((
+        "edit:workflows".into(),
+        "Edit Workflows".into(),
+        "opens the workflows/ config".into(),
+    ));
+
+    candidates
+        .into_iter()
+        .filter_map(|(id, label, subtitle)| {
+            let path = edit_target_path(project, &id)?;
+            // A genuinely-missing target is skipped rather than offered as a
+            // dead entry the editor would open on nothing.
+            if !path.exists() {
+                return None;
+            }
+            Some(Entry {
+                id,
+                label,
+                kind: EntryKind::Action,
+                subtitle: Some(subtitle),
+                shortcut: None,
+                decoration: None,
+                hidden_until_query: true,
+            })
+        })
+        .collect()
+}
+
+/// Resolve an `edit:*` id to the config file/dir it opens. Pure mapping —
+/// no `$EDITOR`, no side effects — so both [`edit_entries`] (to attach a
+/// real path and existence-check it) and [`dispatch`] (to know what to hand
+/// the editor) share one source of truth. Returns `None` for an id that
+/// isn't a recognized `edit:*` target.
+fn edit_target_path(project: &str, id: &str) -> Option<PathBuf> {
+    match id.strip_prefix("edit:")? {
+        "project" => project_settings_path(project),
+        "zenmode" => shelbi_state::zenmode_path(project).ok(),
+        "workflows" => shelbi_state::workflows_dir(project).ok(),
+        other => {
+            let agent = other.strip_prefix("agent:")?;
+            Some(
+                shelbi_state::agents_dir(project)
+                    .ok()?
+                    .join(agent)
+                    .join("instructions.md"),
+            )
+        }
+    }
+}
+
+/// Path to the editable `project.yaml` for `project`, resolving the two
+/// config layouts: in-repo projects keep it at `<repo>/.shelbi/project.yaml`
+/// (via the config-mode-aware `config_project_dir`), global projects at
+/// `~/.shelbi/projects/<name>.yaml`. Prefers the in-repo file when present
+/// and otherwise returns the global path so a missing file still yields a
+/// stable (and thus skippable) target.
+fn project_settings_path(project: &str) -> Option<PathBuf> {
+    if let Ok(dir) = shelbi_state::config_project_dir(project) {
+        let in_repo = dir.join("project.yaml");
+        if in_repo.exists() {
+            return Some(in_repo);
+        }
+    }
+    Some(
+        shelbi_state::projects_dir()
+            .ok()?
+            .join(format!("{project}.yaml")),
+    )
+}
+
+/// Open an `edit:*` entry's target in the user's editor. By the time
+/// `dispatch` runs, `run` has already torn the palette's alt-screen down via
+/// [`restore_terminal`], so the child inherits a clean normal-mode terminal;
+/// we block until it exits and let the palette process close afterward.
+/// Editor precedence: `$VISUAL`, then `$EDITOR`, falling back to `vi`. A
+/// multi-word editor command (e.g. `code -w`) is split so leading args are
+/// preserved before the file path.
+fn open_edit_target(project: &str, id: &str) -> Result<()> {
+    let path = edit_target_path(project, id)
+        .ok_or_else(|| anyhow::anyhow!("unknown edit target: {id}"))?;
+    let editor = std::env::var("VISUAL")
+        .or_else(|_| std::env::var("EDITOR"))
+        .unwrap_or_else(|_| "vi".to_string());
+    let mut parts = editor.split_whitespace();
+    let prog = parts.next().unwrap_or("vi");
+    let status = std::process::Command::new(prog)
+        .args(parts)
+        .arg(&path)
+        .status()
+        .map_err(|e| anyhow::anyhow!("failed to launch editor `{editor}`: {e}"))?;
+    if !status.success() {
+        // A non-zero editor exit isn't fatal to shelbi — surface it but
+        // don't fail the palette out.
+        eprintln!("shelbi: editor `{editor}` exited with {status}");
+    }
+    Ok(())
 }
 
 /// Translate one sidebar [`Row`] into a palette [`Entry`]. The row's
@@ -462,6 +614,7 @@ fn entry_from_row(row: &Row, workspaces: &[WorkspaceOverview]) -> Option<Entry> 
                 subtitle: nav_subtitle(view),
                 shortcut: None,
                 decoration,
+                hidden_until_query: false,
             })
         }
         Row::Workspace { name, .. } => {
@@ -481,6 +634,7 @@ fn entry_from_row(row: &Row, workspaces: &[WorkspaceOverview]) -> Option<Entry> 
                 }),
                 shortcut: None,
                 decoration,
+                hidden_until_query: false,
             })
         }
         Row::Review {
@@ -505,6 +659,7 @@ fn entry_from_row(row: &Row, workspaces: &[WorkspaceOverview]) -> Option<Entry> 
                 }),
                 shortcut: None,
                 decoration,
+                hidden_until_query: false,
             })
         }
         Row::LegacyAgent {
@@ -519,6 +674,7 @@ fn entry_from_row(row: &Row, workspaces: &[WorkspaceOverview]) -> Option<Entry> 
             subtitle: Some(format!("{machine} · {status:?}")),
             shortcut: None,
             decoration,
+            hidden_until_query: false,
         }),
         Row::Section { .. } | Row::Blank | Row::MachineGroup { .. } => None,
     }
@@ -560,6 +716,7 @@ fn zen_toggle_entry(current: ZenModeState, chord: ZenToggleChord) -> Entry {
         subtitle: Some(subtitle.into()),
         shortcut,
         decoration: None,
+        hidden_until_query: false,
     }
 }
 
@@ -581,6 +738,12 @@ fn dispatch(project: &str, entry: &Entry) -> Result<()> {
     if let Some(id) = entry.id.strip_prefix("agent:") {
         super::run_tmux(["select-window", "-t", &format!("shelbi-{project}:={id}")]);
         return Ok(());
+    }
+    if entry.id.starts_with("edit:") {
+        // Config opener. `run` has already restored the terminal before
+        // dispatch, so the editor inherits a clean normal-mode terminal and
+        // the palette process closes once it returns.
+        return open_edit_target(project, &entry.id);
     }
     if entry.id == "action:toggle-zen" {
         // Shares the read/write/log path with the TUI's Alt+Z handler
@@ -1448,6 +1611,127 @@ mod tests {
                 e.decoration
             );
         }
+    }
+
+    // ---- "Edit …" config openers ------------------------------------------
+    //
+    // Exercise the pure id→path resolver and the disk-enumerated build path
+    // without launching `$EDITOR`. A distinct project name (`editproj`) keeps
+    // these fixtures from colliding with the `demo` project the ordering
+    // tests above assume has no scaffolded files. (`ENV_LOCK`, `fresh_home`,
+    // and `PathBuf` are declared in the Zen-intro test section below and are
+    // module-scoped, so they're reused here.)
+
+    /// Scaffold a global-mode project on disk under `home`: the global
+    /// `project.yaml`, an `agents/<id>/instructions.md` per named agent, a
+    /// `zenmode.md`, and a `workflows/` dir — everything the edit openers
+    /// resolve to. Returns the per-project config dir.
+    fn scaffold_edit_project(home: &std::path::Path, name: &str, agents: &[&str]) -> PathBuf {
+        let projects = home.join("projects");
+        std::fs::create_dir_all(&projects).unwrap();
+        // Global-mode project config lives at `projects/<name>.yaml`.
+        std::fs::write(projects.join(format!("{name}.yaml")), format!("name: {name}\n")).unwrap();
+        // Config half (agents/, zenmode.md, workflows/) sits under the
+        // per-project dir in global mode.
+        let cfg = projects.join(name);
+        for a in agents {
+            let ad = cfg.join("agents").join(a);
+            std::fs::create_dir_all(&ad).unwrap();
+            std::fs::write(ad.join("instructions.md"), "# instructions\n").unwrap();
+        }
+        std::fs::write(cfg.join("zenmode.md"), "zen summary\n").unwrap();
+        std::fs::create_dir_all(cfg.join("workflows")).unwrap();
+        cfg
+    }
+
+    #[test]
+    fn edit_target_path_resolves_each_id_to_its_file() {
+        let _g = ENV_LOCK.lock().unwrap();
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+        let cfg = scaffold_edit_project(&home, "editproj", &["developer"]);
+
+        assert_eq!(
+            edit_target_path("editproj", "edit:project"),
+            Some(home.join("projects").join("editproj.yaml"))
+        );
+        assert_eq!(
+            edit_target_path("editproj", "edit:agent:developer"),
+            Some(cfg.join("agents").join("developer").join("instructions.md"))
+        );
+        assert_eq!(
+            edit_target_path("editproj", "edit:zenmode"),
+            Some(cfg.join("zenmode.md"))
+        );
+        assert_eq!(
+            edit_target_path("editproj", "edit:workflows"),
+            Some(cfg.join("workflows"))
+        );
+        // Not a recognized edit target.
+        assert_eq!(edit_target_path("editproj", "edit:bogus"), None);
+        assert_eq!(edit_target_path("editproj", "view:orch"), None);
+
+        std::env::remove_var("SHELBI_HOME");
+    }
+
+    #[test]
+    fn build_entries_emits_edit_entries_enumerated_from_agents_dir() {
+        let _g = ENV_LOCK.lock().unwrap();
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+        scaffold_edit_project(&home, "editproj", &["orchestrator", "developer", "review"]);
+
+        let app = App::new_sidebar("editproj");
+        let entries = build_entries(&app, ZenModeState::Off, ZenToggleChord::AltZ);
+        let ids: Vec<&str> = entries.iter().map(|e| e.id.as_str()).collect();
+
+        for expected in [
+            "edit:project",
+            "edit:agent:developer",
+            "edit:agent:orchestrator",
+            "edit:agent:review",
+            "edit:zenmode",
+            "edit:workflows",
+        ] {
+            assert!(ids.contains(&expected), "missing {expected} in {ids:?}");
+        }
+        // Every edit entry is hidden-until-query so the default list is
+        // unchanged, and "Quit Shelbi" is still structurally last.
+        for e in entries.iter().filter(|e| e.id.starts_with("edit:")) {
+            assert!(e.hidden_until_query, "{} must be hidden until query", e.id);
+        }
+        assert_eq!(
+            entries.last().map(|e| e.id.as_str()),
+            Some("action:quit-shelbi")
+        );
+
+        std::env::remove_var("SHELBI_HOME");
+    }
+
+    #[test]
+    fn build_entries_skips_edit_entries_whose_target_is_missing() {
+        // Only scaffold project.yaml + one agent — no zenmode.md, no
+        // workflows/ dir — and confirm the missing-target openers are
+        // dropped rather than offered as dead entries.
+        let _g = ENV_LOCK.lock().unwrap();
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+        let projects = home.join("projects");
+        std::fs::create_dir_all(&projects).unwrap();
+        std::fs::write(projects.join("sparse.yaml"), "name: sparse\n").unwrap();
+        let ad = projects.join("sparse").join("agents").join("developer");
+        std::fs::create_dir_all(&ad).unwrap();
+        std::fs::write(ad.join("instructions.md"), "x\n").unwrap();
+
+        let app = App::new_sidebar("sparse");
+        let entries = build_entries(&app, ZenModeState::Off, ZenToggleChord::AltZ);
+        let ids: Vec<&str> = entries.iter().map(|e| e.id.as_str()).collect();
+        assert!(ids.contains(&"edit:project"));
+        assert!(ids.contains(&"edit:agent:developer"));
+        assert!(!ids.contains(&"edit:zenmode"), "zenmode.md is absent");
+        assert!(!ids.contains(&"edit:workflows"), "workflows/ is absent");
+
+        std::env::remove_var("SHELBI_HOME");
     }
 
     // ---- Zen intro popover gate + apply -----------------------------------
