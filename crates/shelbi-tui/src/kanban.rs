@@ -3479,6 +3479,24 @@ mod tests {
     /// has to accept `None` as a valid choice.
     #[test]
     fn dropdown_select_all_clears_filter() {
+        // `dropdown_select` persists through `set_workspace_filter`, a
+        // real disk write keyed off whatever `SHELBI_HOME` is set at that
+        // instant. Unlocked, this test raced the persistence tests and
+        // cleared the filter they had just written into *their* temp home
+        // (both use project "demo"), so hold `ENV_LOCK` and write into a
+        // throwaway home of our own.
+        let _g = crate::test_support::ENV_LOCK.lock().unwrap();
+        let home = std::env::temp_dir().join(format!(
+            "shelbi-tui-dropdown-clear-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&home).unwrap();
+        std::env::set_var("SHELBI_HOME", &home);
+
         let mut app = KanbanApp::new("demo");
         app.workspaces = vec!["alpha".into()];
         app.workspace_filter = Some(WorkspaceFilter::Workspace("alpha".into()));
@@ -3486,12 +3504,11 @@ mod tests {
         // Cursor seeds on alpha (idx 1). Walk back to All.
         app.dropdown_nav_up();
         assert_eq!(app.workspace_dropdown.as_ref().unwrap().cursor, 0);
-        // No disk write here because no SHELBI_HOME is set — the
-        // persist error lands in status_line but the in-memory state
-        // still updates.
         app.dropdown_select();
         assert!(app.workspace_filter.is_none());
         assert!(!app.workspace_dropdown_is_open());
+
+        std::env::remove_var("SHELBI_HOME");
     }
 
     /// Toggling the dropdown closes it when open, opens when closed —
