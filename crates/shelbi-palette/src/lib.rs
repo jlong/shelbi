@@ -26,6 +26,12 @@ pub struct Entry {
     /// status tint the sidebar does. `None` falls back to the dim
     /// `EntryKind::icon()` used for entries without a sidebar twin.
     pub decoration: Option<Decoration>,
+    /// When set, the entry is excluded from the empty-query palette list
+    /// but included (fuzzy-scored) the moment the query is non-empty.
+    /// Power-user shortcuts — the "Edit …" config openers — set this so
+    /// they don't clutter the default list; every other entry leaves it
+    /// `false` and stays visible on an empty query.
+    pub hidden_until_query: bool,
 }
 
 /// Icon + color attached to an [`Entry`]. Mirrors what the sidebar
@@ -97,11 +103,18 @@ pub fn score(matcher: &mut Matcher, pattern: &str, label: &str) -> Option<u16> {
 }
 
 /// Filter + sort `entries` against `query`. Best match first.
+///
+/// Entries flagged [`Entry::hidden_until_query`] are dropped while the
+/// query is empty or whitespace-only, then scored normally the instant the
+/// user types a non-blank character — a "hidden until searched" tier for
+/// power-user shortcuts that shouldn't pad the default list.
 pub fn search(entries: &[Entry], query: &str) -> Vec<(Entry, u16)> {
     let mut matcher = Matcher::new(nucleo_matcher::Config::DEFAULT);
     let pattern = parse_pattern(query);
+    let query_blank = query.trim().is_empty();
     let mut hits: Vec<(Entry, u16)> = entries
         .iter()
+        .filter(|e| !(query_blank && e.hidden_until_query))
         .filter_map(|e| score_pattern(&mut matcher, &pattern, &e.label).map(|s| (e.clone(), s)))
         .collect();
     hits.sort_by_key(|h| std::cmp::Reverse(h.1));
@@ -121,6 +134,7 @@ mod tests {
                 subtitle: None,
                 shortcut: None,
                 decoration: None,
+                hidden_until_query: false,
             },
             Entry {
                 id: "agent:fix-login-bug".into(),
@@ -129,6 +143,7 @@ mod tests {
                 subtitle: Some("m2 · running".into()),
                 shortcut: None,
                 decoration: None,
+                hidden_until_query: false,
             },
             Entry {
                 id: "action:new-task".into(),
@@ -137,8 +152,23 @@ mod tests {
                 subtitle: None,
                 shortcut: None,
                 decoration: None,
+                hidden_until_query: false,
             },
         ]
+    }
+
+    /// A `hidden_until_query` entry to append to [`sample`] for the
+    /// hidden-tier filtering tests.
+    fn hidden_entry() -> Entry {
+        Entry {
+            id: "edit:project".into(),
+            label: "Edit Project Settings".into(),
+            kind: EntryKind::Action,
+            subtitle: Some("opens project.yaml".into()),
+            shortcut: None,
+            decoration: None,
+            hidden_until_query: true,
+        }
     }
 
     #[test]
@@ -158,5 +188,32 @@ mod tests {
     fn no_match_returns_empty() {
         let hits = search(&sample(), "qqqqqqq");
         assert!(hits.is_empty());
+    }
+
+    #[test]
+    fn hidden_until_query_excluded_on_blank_query() {
+        let mut entries = sample();
+        entries.push(hidden_entry());
+        // Empty query: the hidden entry stays out, the three always-visible
+        // ones remain — the default list is unchanged from before the flag.
+        let empty = search(&entries, "");
+        assert_eq!(empty.len(), 3);
+        assert!(empty.iter().all(|(e, _)| e.id != "edit:project"));
+        // A whitespace-only query counts as blank too.
+        let ws = search(&entries, "   ");
+        assert!(ws.iter().all(|(e, _)| e.id != "edit:project"));
+    }
+
+    #[test]
+    fn hidden_until_query_included_on_nonempty_query() {
+        let mut entries = sample();
+        entries.push(hidden_entry());
+        // The moment the query is non-blank, the hidden entry is scored
+        // like any other and surfaces when it matches.
+        let hits = search(&entries, "Edit");
+        assert!(hits.iter().any(|(e, _)| e.id == "edit:project"));
+        // ...and still doesn't appear for a query it doesn't match.
+        let miss = search(&entries, "Chat");
+        assert!(miss.iter().all(|(e, _)| e.id != "edit:project"));
     }
 }
