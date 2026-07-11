@@ -1475,6 +1475,68 @@ fn record_dispatch_submit(
             false
         }
     }
+/// Outcome of one auto-resume nudge on a usage-limit-stalled pane. Every
+/// variant is a normal, recorded result — only transport errors surface as
+/// `Err` from [`resume_limit_stalled_pane`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LimitResumeOutcome {
+    /// The resume prompt was delivered and provably submitted.
+    Submitted,
+    /// The pane is no longer on the limit banner (or is actively working) —
+    /// someone already resumed it, so we touched nothing.
+    SkippedBannerGone,
+    /// The limit modal never gave way to a ready input box — the window
+    /// likely hasn't actually reset yet. Nothing was typed.
+    InputNotReady,
+    /// The prompt was typed but no submission signal appeared even after the
+    /// retry Enter — it may be sitting unsubmitted in the input box.
+    SubmitUnconfirmed,
+}
+
+/// Nudge a worker pane stalled on claude's usage/session-limit modal back to
+/// work, once its limit window has reset. Called by the hub poller when a
+/// scheduled resume comes due (see the poller's limit-resume state machine).
+///
+/// The sequence mirrors what a human does at the pane, wrapped in the same
+/// safeguards the dispatch path uses:
+///
+/// 1. Re-verify the stall on a fresh capture. If the banner is gone or the
+///    pane is busy processing, a manual resume beat us — skip, so a late
+///    auto-resume never double-submits.
+/// 2. Enter selects the modal's default option (`Stop and wait for limit to
+///    reset`), which returns claude to its input box once the window has
+///    reset; then wait for readiness exactly like dispatch does.
+/// 3. Deliver `prompt` and verify it provably submitted (title marker, busy
+///    signal, or the input box clearing — with one retry Enter), via the
+///    same [`crate::submit::send_verified`] primitive dispatch uses. Its
+///    pre-delivery baseline suppresses stale busy signals from the prior
+///    conversation's scrollback.
+pub fn resume_limit_stalled_pane(
+    host: &Host,
+    addr: &TmuxAddr,
+    prompt: &str,
+) -> Result<LimitResumeOutcome> {
+    let screen = shelbi_tmux::capture(host, addr)?;
+    if crate::ready::detect_usage_limit(&screen).is_none()
+        || crate::submit::claude_is_processing(&screen)
+    {
+        return Ok(LimitResumeOutcome::SkippedBannerGone);
+    }
+    shelbi_tmux::send_enter(host, addr)?;
+    if !crate::ready::wait_for_claude_ready(host, addr, crate::ready::READY_TIMEOUT)? {
+        return Ok(LimitResumeOutcome::InputNotReady);
+    }
+    let baseline = crate::submit::PaneBaseline::capture(
+        host,
+        addr,
+        crate::submit::SubmitProfile::ClaudeUi,
+    );
+    match crate::submit::send_verified(host, addr, prompt, &baseline)? {
+        crate::submit::SubmitStatus::Submitted { .. } => Ok(LimitResumeOutcome::Submitted),
+        crate::submit::SubmitStatus::DeliveredUnverified { .. }
+        | crate::submit::SubmitStatus::StillInBox
+        | crate::submit::SubmitStatus::Unconfirmed => Ok(LimitResumeOutcome::SubmitUnconfirmed),
+    }
 }
 
 fn append_dispatch_status(task_id: &str, workspace: &str, status: &str, detail: &str) {

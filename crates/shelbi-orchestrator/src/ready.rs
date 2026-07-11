@@ -119,8 +119,10 @@ pub fn detect_blocking_dialog(
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UsageLimitStall {
     /// The reset-time hint (e.g. `3pm (America/New_York)`), or `None` when the
-    /// pane showed no parseable reset wording. Advisory only — folded into the
-    /// `paused` event, never parsed into a real timestamp.
+    /// pane showed no parseable reset wording. Folded into the `paused` event
+    /// as-is; the auto-resume scheduler additionally tries to turn it into a
+    /// real instant via [`next_reset_instant`], degrading to a needs-human
+    /// warning when it can't.
     pub reset: Option<String>,
 }
 
@@ -178,8 +180,9 @@ pub fn detect_usage_limit(screen: &str) -> Option<UsageLimitStall> {
     let lower = screen.to_ascii_lowercase();
     // The modal's limit wording must be present somewhere on screen. Cheap
     // corroborating token that a prose/code mention of just the option text
-    // alone won't satisfy on its own.
-    if !lower.contains("usage limit") {
+    // alone won't satisfy on its own. Claude words the banner either
+    // "usage limit" or "session limit" depending on which window tripped.
+    if !lower.contains("usage limit") && !lower.contains("session limit") {
         return None;
     }
     // The actionable option must be rendered as an actual claude menu option,
@@ -245,6 +248,134 @@ pub fn parse_usage_limit_reset(screen: &str) -> Option<String> {
         None
     } else {
         Some(captured.to_string())
+    }
+}
+
+/// Turn a scraped reset hint (see [`parse_usage_limit_reset`]) into the
+/// concrete UTC instant the limit window resets, e.g.
+/// `7:20am (America/New_York)` observed at 06:00 UTC → today 11:20 UTC.
+/// This is what the poller's auto-resume schedules against.
+///
+/// Deliberately conservative — `None` means "don't guess" and the caller
+/// surfaces a needs-human warning instead of resuming at a wrong time:
+///
+/// - The leading token must parse as a wall-clock time (`7:20am`, `3pm`,
+///   `9:00`). A bare hour with no meridiem/colon (`resets 3`) is ambiguous →
+///   `None`. So is date-first wording (`resets Jul 15 at 3am`) — a multi-day
+///   window must not be collapsed onto today's clock.
+/// - A parenthesized zone must be a recognizable IANA name
+///   (`(America/New_York)`); anything else (`(ET)`) → `None` rather than
+///   silently reinterpreting the time in the hub's zone. No parens at all
+///   assumes the hub's local zone — claude prints the user's own timezone and
+///   the hub runs on the user's machine.
+///
+/// The reset is the *next* occurrence of that wall time: today if still
+/// ahead, else tomorrow. As a backstop, a computed occurrence more than 23h
+/// out means the stated time passed just before `now` (a stall observed
+/// late — e.g. the hub was down over the window), so the window has already
+/// reset and we return `now`.
+pub fn next_reset_instant(
+    hint: &str,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Option<chrono::DateTime<chrono::Utc>> {
+    let time = parse_wall_time(hint)?;
+    match parse_hint_zone(hint) {
+        HintZone::Named(tz) => next_occurrence(time, &tz, now),
+        HintZone::LocalImplied => next_occurrence(time, &chrono::Local, now),
+        HintZone::Unrecognized => None,
+    }
+}
+
+/// The timezone a reset hint carries. Split three ways because the two
+/// failure-ish shapes must behave differently: no parens at all means claude
+/// printed a bare time (assume the hub's zone), while parens holding
+/// something we can't map to an IANA zone means we *know* the time is in a
+/// zone we can't resolve — guessing would risk a wrong-time resume.
+enum HintZone {
+    Named(chrono_tz::Tz),
+    LocalImplied,
+    Unrecognized,
+}
+
+fn parse_hint_zone(hint: &str) -> HintZone {
+    let Some(start) = hint.find('(') else {
+        return HintZone::LocalImplied;
+    };
+    let Some(len) = hint[start + 1..].find(')') else {
+        return HintZone::Unrecognized;
+    };
+    match hint[start + 1..start + 1 + len].trim().parse() {
+        Ok(tz) => HintZone::Named(tz),
+        Err(_) => HintZone::Unrecognized,
+    }
+}
+
+/// Parse the leading token of a reset hint as a wall-clock time: `7:20am`,
+/// `10:30pm`, `3pm`, `9:00`. Returns `None` for anything ambiguous — a bare
+/// number with neither meridiem nor colon, an out-of-range hour, or a token
+/// that isn't a time at all (`Jul`).
+fn parse_wall_time(hint: &str) -> Option<chrono::NaiveTime> {
+    let token = hint.split_whitespace().next()?.trim_matches(',');
+    let lower = token.to_ascii_lowercase();
+    let (digits, meridiem) = if let Some(d) = lower.strip_suffix("am") {
+        (d, Some(false))
+    } else if let Some(d) = lower.strip_suffix("pm") {
+        (d, Some(true))
+    } else {
+        (lower.as_str(), None)
+    };
+    let (h_str, m_str) = digits.split_once(':').unwrap_or((digits, "0"));
+    let hour: u32 = h_str.parse().ok()?;
+    let minute: u32 = m_str.parse().ok()?;
+    let hour = match meridiem {
+        // 12-hour clock: `12am` is midnight, `12pm` is noon.
+        Some(_) if !(1..=12).contains(&hour) => return None,
+        Some(false) => hour % 12,
+        Some(true) => hour % 12 + 12,
+        // A bare number with no colon (`resets 3`) is too ambiguous to
+        // schedule on; a colon form (`9:00`) reads as 24-hour time.
+        None if !digits.contains(':') => return None,
+        None => hour,
+    };
+    chrono::NaiveTime::from_hms_opt(hour, minute, 0)
+}
+
+/// The next occurrence of wall time `t` in zone `tz`, strictly after `now`,
+/// as a UTC instant. See [`next_reset_instant`] for the >23h backstop.
+fn next_occurrence<Tz: chrono::TimeZone>(
+    t: chrono::NaiveTime,
+    tz: &Tz,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Option<chrono::DateTime<chrono::Utc>> {
+    let today = now.with_timezone(tz).date_naive();
+    let mut candidate = resolve_local(tz, today, t)?;
+    if candidate <= now {
+        candidate = resolve_local(tz, today.succ_opt()?, t)?;
+    }
+    if candidate.signed_duration_since(now) > chrono::Duration::hours(23) {
+        // The stated time passed within the last hour — the window already
+        // reset; scheduling for tomorrow would strand the worker a full day.
+        return Some(now);
+    }
+    Some(candidate)
+}
+
+/// Resolve a local date+time in `tz` to UTC, tolerating DST edges: an
+/// ambiguous time (fall-back hour) takes the earlier reading, a nonexistent
+/// time (spring-forward gap) slides one hour later.
+fn resolve_local<Tz: chrono::TimeZone>(
+    tz: &Tz,
+    date: chrono::NaiveDate,
+    t: chrono::NaiveTime,
+) -> Option<chrono::DateTime<chrono::Utc>> {
+    let naive = date.and_time(t);
+    match tz.from_local_datetime(&naive) {
+        chrono::LocalResult::Single(dt) => Some(dt.with_timezone(&chrono::Utc)),
+        chrono::LocalResult::Ambiguous(earlier, _) => Some(earlier.with_timezone(&chrono::Utc)),
+        chrono::LocalResult::None => tz
+            .from_local_datetime(&(naive + chrono::Duration::hours(1)))
+            .earliest()
+            .map(|dt| dt.with_timezone(&chrono::Utc)),
     }
 }
 
@@ -438,6 +569,84 @@ mod tests {
         assert!(parse_usage_limit_reset("Stop and wait for limit to reset").is_none());
         // The bare modal footer has "reset" with nothing usable after it.
         assert!(parse_usage_limit_reset("please reset.").is_none());
+    }
+
+    // The session-limit variant of the same modal — different limit wording,
+    // same menu chrome. Observed 2026-07-11 (alpha): the pane stalled on
+    // "session limit" with an inline `resets <time> (<tz>)` clause.
+    const SESSION_LIMIT_MODAL_SCREEN: &str = "\
+⏱ You've hit your session limit · resets 7:20am (America/New_York)
+
+ ❯ 1. Stop and wait for limit to reset
+   2. Upgrade your plan";
+
+    #[test]
+    fn detect_usage_limit_matches_the_session_limit_wording() {
+        let stall = detect_usage_limit(SESSION_LIMIT_MODAL_SCREEN).expect("modal must detect");
+        assert_eq!(stall.reset.as_deref(), Some("7:20am (America/New_York)"));
+    }
+
+    #[test]
+    fn parse_wall_time_accepts_clock_forms_and_rejects_ambiguity() {
+        let t = |h, m| chrono::NaiveTime::from_hms_opt(h, m, 0).unwrap();
+        assert_eq!(parse_wall_time("7:20am (America/New_York)"), Some(t(7, 20)));
+        assert_eq!(parse_wall_time("10:30pm"), Some(t(22, 30)));
+        assert_eq!(parse_wall_time("3pm (America/New_York)"), Some(t(15, 0)));
+        assert_eq!(parse_wall_time("9:00"), Some(t(9, 0)));
+        assert_eq!(parse_wall_time("12am"), Some(t(0, 0)));
+        assert_eq!(parse_wall_time("12pm"), Some(t(12, 0)));
+        // Ambiguous / not-a-time forms must not guess.
+        assert_eq!(parse_wall_time("3"), None, "bare hour is ambiguous");
+        assert_eq!(parse_wall_time("Jul 15 at 3am"), None, "date-first wording");
+        assert_eq!(parse_wall_time("19pm"), None, "out-of-range 12h hour");
+        assert_eq!(parse_wall_time(""), None);
+    }
+
+    #[test]
+    fn next_reset_instant_schedules_todays_or_tomorrows_occurrence() {
+        use chrono::{TimeZone, Utc};
+        // 02:28 UTC on 2026-07-11 == 22:28 EDT on 2026-07-10. The observed
+        // incident: reset "2:20am (America/New_York)" == 06:20 UTC, later
+        // today — the very stall this feature exists for.
+        let now = Utc.with_ymd_and_hms(2026, 7, 11, 2, 28, 0).unwrap();
+        assert_eq!(
+            next_reset_instant("2:20am (America/New_York)", now),
+            Some(Utc.with_ymd_and_hms(2026, 7, 11, 6, 20, 0).unwrap()),
+        );
+        // A wall time well past in the banner's zone rolls to tomorrow —
+        // 8pm EDT was 2.5h before `now`, outside the just-passed backstop.
+        assert_eq!(
+            next_reset_instant("8pm (America/New_York)", now),
+            Some(Utc.with_ymd_and_hms(2026, 7, 12, 0, 0, 0).unwrap()),
+        );
+    }
+
+    #[test]
+    fn next_reset_instant_treats_a_just_passed_time_as_already_reset() {
+        use chrono::{TimeZone, Utc};
+        // Stall observed 10 minutes AFTER the stated reset (hub was down over
+        // the window): the naive "next occurrence" is ~23h50m out, which
+        // would strand the worker a full day. The backstop resumes now.
+        let now = Utc.with_ymd_and_hms(2026, 7, 11, 6, 30, 0).unwrap();
+        assert_eq!(
+            next_reset_instant("2:20am (America/New_York)", now),
+            Some(now),
+        );
+    }
+
+    #[test]
+    fn next_reset_instant_never_guesses_an_unrecognized_zone() {
+        use chrono::{TimeZone, Utc};
+        let now = Utc.with_ymd_and_hms(2026, 7, 11, 2, 28, 0).unwrap();
+        // Parens naming a zone we can't resolve: reinterpreting the time in
+        // the hub's zone could resume mid-window — refuse instead.
+        assert_eq!(next_reset_instant("7:20am (ET)", now), None);
+        // Unparseable time with a good zone: same refusal.
+        assert_eq!(next_reset_instant("soon (America/New_York)", now), None);
+        // No parens at all: claude printed a bare time in the user's own
+        // zone, and the hub runs on the user's machine — local is implied.
+        let local = next_reset_instant("7:20am", now).expect("local-implied time must parse");
+        assert!(local > now && local <= now + chrono::Duration::hours(24));
     }
 
     #[test]

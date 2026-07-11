@@ -32,7 +32,12 @@
 //!   reason=usage-limit` line is emitted (with the reset time when shown). The
 //!   state clears — reverting to the title-derived state — on the first poll
 //!   after the limit lifts, so the orchestrator can hold new work off a limited
-//!   slot until it frees up.
+//!   slot until it frees up. The detection also arms an **auto-resume**: the
+//!   reset time is parsed from the banner and, shortly after it passes, the
+//!   poller nudges the pane back to work with a verified-submitted resume
+//!   prompt (see [`LimitResumeState`]), so a limited worker doesn't sit idle
+//!   until a human notices. Unparseable banners degrade to a
+//!   `status=needs-human` warning instead of guessing a resume time.
 //! - **Blocking dialogs.** Otherwise the sample is matched against the runner's
 //!   blocking-dialog signatures (see `shelbi_core::default_dialog_signatures` /
 //!   `AgentRunnerSpec::dialog_signatures`) for a human-gated modal
@@ -65,7 +70,8 @@ use chrono::{DateTime, Utc};
 use shelbi_core::{default_workflow, Column, Project, StatusCategory, Workflow};
 use shelbi_orchestrator::supervision::{SupervisionAction, SupervisionInputs, SupervisionState};
 use shelbi_state::{
-    append_heartbeat_event, append_rebase_event, append_workspace_dialog_event,
+    append_heartbeat_event, append_limit_resume_event, append_rebase_event,
+    append_workspace_dialog_event,
     append_workspace_event, append_workspace_pause_event, append_worktree_detach_event,
     events_log_path, load_workspace_status,
     parse_pane_title_marker, read_state, read_zenmode_summary, save_workspace_status,
@@ -261,6 +267,13 @@ fn run_workspace_poll_loop(
     // already mid-crash-loop. See `shelbi_orchestrator::supervision`.
     let mut supervision = SupervisionState::default();
 
+    // Usage-limit auto-resume schedule for this workspace's pane. Same
+    // per-thread lifetime as the rest: a poller restart drops it, and the
+    // next poll re-detects the (still-on-screen) banner and re-schedules —
+    // re-parsing recovers even a reset time that passed while we were down
+    // (see `ready::next_reset_instant`'s just-passed backstop).
+    let mut limit_resume = LimitResumeState::default();
+
     loop {
         if shutdown.load(Ordering::SeqCst) {
             break;
@@ -304,6 +317,7 @@ fn run_workspace_poll_loop(
             &mut last_known,
             &mut last_dialog,
             &mut supervision,
+            &mut limit_resume,
         );
 
         sleep_interruptible(interval, &shutdown);
@@ -603,6 +617,7 @@ fn poll_one(
     last_known: &mut Option<WorkspaceState>,
     last_dialog: &mut Option<String>,
     supervision: &mut SupervisionState,
+    limit_resume: &mut LimitResumeState,
 ) {
     // Gate the whole tick before reading/consuming ready or transition
     // markers. Under a mismatch those durable markers stay in place, and the
@@ -654,8 +669,10 @@ fn poll_one(
         // The pane is gone (dispatch teardown, crash, or normal exit). Any
         // dialog we were tracking can't be "cleared" in a meaningful way —
         // pane death has its own `pane_alive=false` event — so just drop the
-        // stuck-state so a respawned pane re-detects from scratch.
+        // stuck-state so a respawned pane re-detects from scratch. Same for
+        // a pending limit-resume: there's no pane left to nudge.
         *last_dialog = None;
+        *limit_resume = LimitResumeState::Idle;
         return;
     }
 
@@ -679,9 +696,31 @@ fn poll_one(
         .and_then(shelbi_orchestrator::ready::detect_usage_limit)
     {
         record_usage_limit_pause(project, workspace, last_known, stall.reset.as_deref());
+        // The action half of the detection: schedule a resume off the
+        // banner's reset time and, once it comes due, nudge the pane back to
+        // work with a verified-submitted prompt.
+        handle_limit_stall(
+            project,
+            workspace,
+            &host,
+            &addr,
+            stall.reset.as_deref(),
+            limit_resume,
+        );
         // Pause supersedes any tracked advisory dialog.
         *last_dialog = None;
         return;
+    }
+    // A good sample with no limit banner: drop any pending auto-resume. A
+    // manual resume (or the limit lifting on its own) already unstuck the
+    // pane, so a late scheduled nudge would double-submit. Only a real
+    // sample clears it — a transient capture failure keeps the schedule.
+    if screen.is_some() && *limit_resume != LimitResumeState::Idle {
+        tracing::debug!(
+            workspace = %workspace.name,
+            "limit banner gone before the scheduled resume — dropping the auto-resume",
+        );
+        *limit_resume = LimitResumeState::Idle;
     }
 
     // Generic blocking-dialog advisory (trust / permission), deduped via
@@ -912,6 +951,215 @@ fn record_usage_limit_pause(
     }
 
     *last_known = Some(WorkspaceState::Paused);
+}
+
+/// Grace margin past the banner's stated reset time before the resume nudge
+/// fires — covers clock skew between the hub and Anthropic's window clock,
+/// and the minute-granularity of the stated time itself.
+const LIMIT_RESUME_GRACE_SECS: i64 = 90;
+
+/// Backoff between resume attempts against the same banner. A failed nudge
+/// (window not actually reset yet, submit unconfirmed) retries on this
+/// cadence rather than hammering the pane every poll tick.
+const LIMIT_RESUME_RETRY_SECS: i64 = 5 * 60;
+
+/// How many resume attempts one banner gets before the poller stops and
+/// surfaces a needs-human line instead.
+const LIMIT_RESUME_MAX_ATTEMPTS: u32 = 3;
+
+/// The prompt the auto-resume submits to the stalled pane.
+const LIMIT_RESUME_PROMPT: &str = "The session limit has reset. Please continue with the task.";
+
+/// Per-workspace auto-resume bookkeeping for a usage-limit stall, advanced
+/// once per poll tick that observes the banner ([`advance_limit_resume`])
+/// and reset to `Idle` when the banner is gone or the pane dies. The `hint`
+/// each non-idle variant carries is the banner text the state was built
+/// from: a tick observing a *different* hint is a fresh banner (the next
+/// limit window), which restarts the cycle — that's the "each stall
+/// re-parses the fresh banner" rule.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+enum LimitResumeState {
+    /// No stall being tracked.
+    #[default]
+    Idle,
+    /// Reset time parsed; nudge the pane at `due`. `attempts` counts nudges
+    /// already fired against this banner (each pushes `due` out by the retry
+    /// backoff until [`LIMIT_RESUME_MAX_ATTEMPTS`] trips needs-human).
+    Scheduled {
+        hint: String,
+        due: DateTime<Utc>,
+        attempts: u32,
+    },
+    /// This banner can't drive a resume (unparseable reset time, or every
+    /// attempt failed). Warned once; inert until the banner changes.
+    NeedsHuman { hint: Option<String> },
+}
+
+/// What one stall tick asks the caller to do. Split from the I/O so the
+/// schedule/retry/give-up rules are unit-testable on fixtures.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum LimitResumeAction {
+    /// Nothing this tick (waiting for the due time, or already inert).
+    None,
+    /// A resume was just scheduled — emit the `status=scheduled` line.
+    Scheduled { due: DateTime<Utc> },
+    /// The schedule is due — attempt the resume nudge now.
+    Attempt,
+    /// This banner needs a human — emit the `status=needs-human` line once.
+    NeedsHuman { reason: &'static str },
+}
+
+/// Advance the limit-resume state machine for one poll tick that observed
+/// the usage-limit banner (with `hint` as its scraped reset wording, if any)
+/// and return what to do. Pure — `now` is threaded in and all I/O (the
+/// nudge itself, events.log lines) stays in [`handle_limit_stall`].
+fn advance_limit_resume(
+    state: &mut LimitResumeState,
+    hint: Option<&str>,
+    now: DateTime<Utc>,
+) -> LimitResumeAction {
+    let fresh_banner = match state {
+        LimitResumeState::Idle => true,
+        LimitResumeState::Scheduled { hint: h, .. } => Some(h.as_str()) != hint,
+        LimitResumeState::NeedsHuman { hint: h } => h.as_deref() != hint,
+    };
+    if fresh_banner {
+        return match hint.and_then(|h| shelbi_orchestrator::ready::next_reset_instant(h, now)) {
+            Some(reset) => {
+                let due = reset + chrono::Duration::seconds(LIMIT_RESUME_GRACE_SECS);
+                *state = LimitResumeState::Scheduled {
+                    // `hint` is `Some` — `next_reset_instant` parsed it.
+                    hint: hint.unwrap_or_default().to_string(),
+                    due,
+                    attempts: 0,
+                };
+                LimitResumeAction::Scheduled { due }
+            }
+            None => {
+                *state = LimitResumeState::NeedsHuman {
+                    hint: hint.map(str::to_string),
+                };
+                LimitResumeAction::NeedsHuman {
+                    reason: "unparseable-reset",
+                }
+            }
+        };
+    }
+    if let LimitResumeState::Scheduled {
+        hint,
+        due,
+        attempts,
+    } = state
+    {
+        if now >= *due {
+            if *attempts >= LIMIT_RESUME_MAX_ATTEMPTS {
+                let hint = Some(std::mem::take(hint));
+                *state = LimitResumeState::NeedsHuman { hint };
+                return LimitResumeAction::NeedsHuman {
+                    reason: "resume-attempts-exhausted",
+                };
+            }
+            *attempts += 1;
+            *due = now + chrono::Duration::seconds(LIMIT_RESUME_RETRY_SECS);
+            return LimitResumeAction::Attempt;
+        }
+    }
+    LimitResumeAction::None
+}
+
+/// The I/O half of the usage-limit auto-resume, run on every poll tick that
+/// detects the stall banner (right after [`record_usage_limit_pause`]):
+/// advance the schedule and act on its verdict — emit the scheduled /
+/// needs-human events.log lines, or fire the resume nudge
+/// ([`shelbi_orchestrator::workspace::resume_limit_stalled_pane`]) and
+/// record how it went. Every emitted line carries
+/// `supervision=limit-resume` so the orchestrator and the activity feed can
+/// follow the cycle.
+fn handle_limit_stall(
+    project: &Project,
+    workspace: &shelbi_core::WorkspaceSpec,
+    host: &shelbi_core::Host,
+    addr: &shelbi_core::TmuxAddr,
+    reset_hint: Option<&str>,
+    state: &mut LimitResumeState,
+) {
+    let append = |status: &str, details: &[(&str, &str)]| {
+        if let Err(e) = append_limit_resume_event(&project.name, &workspace.name, status, details) {
+            tracing::warn!(workspace = %workspace.name, error = %e, "append_limit_resume_event failed");
+        }
+    };
+    match advance_limit_resume(state, reset_hint, Utc::now()) {
+        LimitResumeAction::None => {}
+        LimitResumeAction::Scheduled { due } => {
+            append("scheduled", &[("scheduled_for", &due.to_rfc3339())]);
+            tracing::info!(
+                workspace = %workspace.name,
+                due = %due.to_rfc3339(),
+                reset = ?reset_hint,
+                "usage-limit stall: auto-resume scheduled",
+            );
+        }
+        LimitResumeAction::NeedsHuman { reason } => {
+            append(
+                "needs-human",
+                &[("reason", reason), ("reset", reset_hint.unwrap_or("none"))],
+            );
+            tracing::warn!(
+                workspace = %workspace.name,
+                reason,
+                reset = ?reset_hint,
+                "usage-limit stall can't be auto-resumed — waiting for a human",
+            );
+        }
+        LimitResumeAction::Attempt => {
+            use shelbi_orchestrator::workspace::LimitResumeOutcome;
+            match shelbi_orchestrator::workspace::resume_limit_stalled_pane(
+                host,
+                addr,
+                LIMIT_RESUME_PROMPT,
+            ) {
+                Ok(LimitResumeOutcome::Submitted) => {
+                    append("sent", &[]);
+                    tracing::info!(
+                        workspace = %workspace.name,
+                        "usage-limit auto-resume prompt submitted",
+                    );
+                }
+                Ok(LimitResumeOutcome::SkippedBannerGone) => {
+                    // Someone resumed the pane between our capture and the
+                    // nudge — nothing was typed. Keep the (backed-off)
+                    // schedule rather than resetting to Idle: the first
+                    // sample without the banner clears it in `poll_one`,
+                    // whereas an Idle reset here would re-schedule and
+                    // re-attempt every tick while stale modal text lingers
+                    // on a busy screen.
+                    append("skipped", &[("reason", "banner-gone")]);
+                }
+                Ok(LimitResumeOutcome::InputNotReady) => {
+                    append("failed", &[("reason", "input-not-ready")]);
+                    tracing::warn!(
+                        workspace = %workspace.name,
+                        "usage-limit auto-resume: no input box after dismissing the modal; will retry",
+                    );
+                }
+                Ok(LimitResumeOutcome::SubmitUnconfirmed) => {
+                    append("failed", &[("reason", "submit-unconfirmed")]);
+                    tracing::warn!(
+                        workspace = %workspace.name,
+                        "usage-limit auto-resume: prompt delivery unconfirmed; will retry",
+                    );
+                }
+                Err(e) => {
+                    append("failed", &[("reason", "io-error")]);
+                    tracing::warn!(
+                        workspace = %workspace.name,
+                        error = %e,
+                        "usage-limit auto-resume: pane io failed; will retry",
+                    );
+                }
+            }
+        }
+    }
 }
 
 /// Check the workspace's ready-handoff file marker and, if present, advance
@@ -1935,6 +2183,116 @@ mod tests {
         assert_eq!(resumed.prev_state, Some(WorkspaceState::Paused));
         assert_eq!(resumed.status.state, WorkspaceState::Working);
         assert_eq!(resumed.status.last_transition, ts(200));
+    }
+
+    #[test]
+    fn limit_resume_schedules_once_then_attempts_at_due_with_backoff() {
+        // The observed incident: alpha stalled at 02:28 UTC on a banner whose
+        // reset ("2:20am America/New_York") is 06:20 UTC later that morning.
+        let now = Utc.with_ymd_and_hms(2026, 7, 11, 2, 28, 0).unwrap();
+        let reset = Utc.with_ymd_and_hms(2026, 7, 11, 6, 20, 0).unwrap();
+        let hint = Some("2:20am (America/New_York)");
+        let mut state = LimitResumeState::default();
+
+        // First stall tick: schedule at reset + grace, emit once.
+        let due = reset + chrono::Duration::seconds(LIMIT_RESUME_GRACE_SECS);
+        assert_eq!(
+            advance_limit_resume(&mut state, hint, now),
+            LimitResumeAction::Scheduled { due },
+        );
+        // Subsequent ticks on the same banner before due: silent — no
+        // re-schedule spam and, crucially, no re-parse (which would roll the
+        // occurrence to tomorrow once the time passes).
+        assert_eq!(
+            advance_limit_resume(&mut state, hint, now + chrono::Duration::minutes(5)),
+            LimitResumeAction::None,
+        );
+        // Due passes and the banner is still up: attempt the nudge.
+        let tick = due + chrono::Duration::seconds(5);
+        assert_eq!(
+            advance_limit_resume(&mut state, hint, tick),
+            LimitResumeAction::Attempt,
+        );
+        // Right after a (failed) attempt: backed off, not hammering.
+        assert_eq!(
+            advance_limit_resume(&mut state, hint, tick + chrono::Duration::seconds(10)),
+            LimitResumeAction::None,
+        );
+        // Retries fire on the backoff cadence until the cap…
+        let mut tick = tick;
+        for _ in 1..LIMIT_RESUME_MAX_ATTEMPTS {
+            tick += chrono::Duration::seconds(LIMIT_RESUME_RETRY_SECS + 5);
+            assert_eq!(
+                advance_limit_resume(&mut state, hint, tick),
+                LimitResumeAction::Attempt,
+            );
+        }
+        // …then the banner is handed to a human, once, and goes quiet.
+        tick += chrono::Duration::seconds(LIMIT_RESUME_RETRY_SECS + 5);
+        assert_eq!(
+            advance_limit_resume(&mut state, hint, tick),
+            LimitResumeAction::NeedsHuman {
+                reason: "resume-attempts-exhausted"
+            },
+        );
+        assert_eq!(
+            advance_limit_resume(&mut state, hint, tick + chrono::Duration::minutes(10)),
+            LimitResumeAction::None,
+        );
+    }
+
+    #[test]
+    fn limit_resume_unparseable_banner_warns_once_never_guesses() {
+        let now = Utc.with_ymd_and_hms(2026, 7, 11, 2, 28, 0).unwrap();
+        let mut state = LimitResumeState::default();
+
+        // A zone we can't resolve must not drive a wrong-time resume.
+        assert_eq!(
+            advance_limit_resume(&mut state, Some("7:20am (ET)"), now),
+            LimitResumeAction::NeedsHuman {
+                reason: "unparseable-reset"
+            },
+        );
+        // Same banner keeps quiet — one warning per incident.
+        assert_eq!(
+            advance_limit_resume(&mut state, Some("7:20am (ET)"), now),
+            LimitResumeAction::None,
+        );
+        // A banner with no reset wording at all takes the same path.
+        let mut state = LimitResumeState::default();
+        assert_eq!(
+            advance_limit_resume(&mut state, None, now),
+            LimitResumeAction::NeedsHuman {
+                reason: "unparseable-reset"
+            },
+        );
+        assert_eq!(advance_limit_resume(&mut state, None, now), LimitResumeAction::None);
+    }
+
+    #[test]
+    fn limit_resume_fresh_banner_restarts_the_cycle() {
+        // Worker resumed, worked, and hit the NEXT window: the new banner
+        // carries a different reset time and must re-schedule from scratch —
+        // even from the needs-human latch.
+        let now = Utc.with_ymd_and_hms(2026, 7, 11, 2, 28, 0).unwrap();
+        let mut state = LimitResumeState::NeedsHuman {
+            hint: Some("7:20am (ET)".into()),
+        };
+        let due = Utc.with_ymd_and_hms(2026, 7, 11, 11, 20, 0).unwrap()
+            + chrono::Duration::seconds(LIMIT_RESUME_GRACE_SECS);
+        assert_eq!(
+            advance_limit_resume(&mut state, Some("7:20am (America/New_York)"), now),
+            LimitResumeAction::Scheduled { due },
+        );
+        // And a different hint while Scheduled also re-schedules (the stall
+        // rolled to a new window before the old due fired).
+        assert_eq!(
+            advance_limit_resume(&mut state, Some("11:20am (America/New_York)"), now),
+            LimitResumeAction::Scheduled {
+                due: Utc.with_ymd_and_hms(2026, 7, 11, 15, 20, 0).unwrap()
+                    + chrono::Duration::seconds(LIMIT_RESUME_GRACE_SECS)
+            },
+        );
     }
 
     use shelbi_core::{
