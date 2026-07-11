@@ -906,6 +906,45 @@ pub fn append_rebase_event(
     ))
 }
 
+/// Append a worktree-detach line to `~/.shelbi/events.log`. Emitted by the
+/// poller's ready-marker handoff after it promotes a task: the finishing
+/// worker's worktree is detached from the task branch so nothing holds it,
+/// freeing the branch for the review checkout and the later merge /
+/// `delete_branch`.
+///
+/// - success: `<rfc3339> worktree-detach task=<id> workspace=<name> detached-from=<branch> status=ok`
+/// - failure: `<rfc3339> worktree-detach task=<id> workspace=<name> branch=<branch> status=failed reason=worktree-detach-failed detail=<detail>`
+///
+/// The failure line carries an explicit `reason=worktree-detach-failed` token so
+/// a subsequent `already checked out` merge failure is traceable back to a
+/// still-held branch rather than looking silent. Carries the same leading
+/// `project=`-less shape as [`append_rebase_event`] (both are task-scoped, not
+/// workspace-state lines); whitespace in every field folds to underscores so
+/// the record stays a single parseable line.
+pub fn append_worktree_detach_event(
+    task_id: &str,
+    workspace: &str,
+    branch: &str,
+    detached: bool,
+    detail: &str,
+) -> Result<()> {
+    let ts = Utc::now().to_rfc3339();
+    let task_id = sanitize_field(task_id);
+    let workspace = sanitize_field(workspace);
+    let branch = sanitize_reason(branch);
+    let detail = sanitize_reason(detail);
+    let line = if detached {
+        format!(
+            "{ts} worktree-detach task={task_id} workspace={workspace} detached-from={branch} status=ok"
+        )
+    } else {
+        format!(
+            "{ts} worktree-detach task={task_id} workspace={workspace} branch={branch} status=failed reason=worktree-detach-failed detail={detail}"
+        )
+    };
+    append_event_line(&line)
+}
+
 /// Append `<rfc3339> <body>` to `~/.shelbi/events.log`. Used by the hub
 /// daemon (`shelbi daemon`) for `event`-verb messages received over the
 /// Unix socket — the worker hands us a pre-formatted body line (e.g.
