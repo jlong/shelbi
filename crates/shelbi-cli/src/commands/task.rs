@@ -802,6 +802,32 @@ fn start(
         }
     }
 
+    // Refuse to clobber a user shell. Clicking an idle workspace in the
+    // sidebar opens a plain shell in its window (marked with a tmux user
+    // option — see `shelbi_orchestrator::workspace::USER_SHELL_OPTION`);
+    // dispatching would kill that shell out from under the user, since
+    // `start_workspace_on_task` resets the pane. The workspace becomes
+    // dispatchable again the moment the shell exits. Best-effort: a probe
+    // failure (ssh blip) degrades to the historical reset-the-pane
+    // behavior rather than blocking dispatch.
+    if let Some(ws_machine) = project_yaml.machine(&workspace.machine) {
+        if let Ok(ws_addr) =
+            shelbi_orchestrator::workspace::workspace_tmux_addr(&project_yaml, workspace)
+        {
+            let shell_open = shelbi_orchestrator::workspace::workspace_user_shell_open(
+                &ws_machine.host(),
+                &ws_addr,
+            )
+            .unwrap_or(false);
+            if shell_open {
+                bail!(
+                    "workspace `{workspace_name}` is occupied by a user shell (opened from \
+                     the sidebar) — exit the shell there, or dispatch to another workspace"
+                );
+            }
+        }
+    }
+
     // Refuse to clobber another in-flight task on the same workspace. Pulling
     // a workspace off mid-task is intentional — make the user do it explicitly
     // via `task move <other> --to todo` first.

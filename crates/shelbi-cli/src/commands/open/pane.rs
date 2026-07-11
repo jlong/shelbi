@@ -464,7 +464,10 @@ fn signal_name(sig: i32) -> String {
 
 /// Look up the task currently assigned to `workspace`, if any. Used by the
 /// pane wrapper to seed `$TASK_ID` for the Phase 7 hooks AND to recover a
-/// missing worktree before launch. Considers both the active (`in-progress`)
+/// missing worktree before launch — and by the parent module's
+/// `focus_or_create` to decide whether a sidebar click relaunches the
+/// worker (task assigned) or opens a plain user shell (idle).
+/// Considers both the active (`in-progress`)
 /// and handoff (`review`) categories: a review workspace's task sits in
 /// Review, so an in-progress-only lookup would miss it and leave the
 /// worktree uncreated — the very bug this recovery closes.
@@ -476,7 +479,7 @@ fn signal_name(sig: i32) -> String {
 /// Best-effort: returns `None` on read errors (missing project state,
 /// permissions glitch, transient FS) because a missing task just makes the
 /// hooks no-op and skips the worktree recovery — neither breaks the pane.
-fn assigned_task_for_workspace(project: &str, workspace: &str) -> Option<Task> {
+pub(super) fn assigned_task_for_workspace(project: &str, workspace: &str) -> Option<Task> {
     let tasks = shelbi_state::list_tasks(project).ok()?;
     tasks.into_iter().find_map(|tf| {
         let anchors = matches!(

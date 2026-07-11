@@ -330,7 +330,9 @@ pub fn show_view(project_name: &str, view: &str) -> Result<()> {
 /// lifecycle wrapper that wraps local workspace panes (so a worker
 /// dying writes a `pane_alive=false` event to `~/.shelbi/events.log`)
 /// and preserves the remote proxy-window mechanism that makes devbox
-/// workspaces clickable from the local sidebar.
+/// workspaces clickable from the local sidebar. It also owns the
+/// idle-vs-working branch: a workspace with no assigned task gets a
+/// plain user shell in its worktree instead of an agent pane.
 ///
 /// Used by the sidebar's Enter-on-workspace handler and the Ctrl+P
 /// palette's workspace entries — both call here so they can't drift.

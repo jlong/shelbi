@@ -628,6 +628,81 @@ pub fn workspace_slot_alive(host: &Host, addr: &TmuxAddr) -> Result<bool> {
     }
 }
 
+/// tmux user option marking a workspace slot as a plain user shell opened
+/// from the sidebar (`shelbi open` on an idle workspace) rather than a
+/// shelbi-managed agent pane. Window-scoped for local workspaces (the
+/// window is the slot), session-scoped for remote ones (the session is the
+/// slot), so the mark dies with the slot and needs no cleanup path.
+/// Dispatch reads it to refuse clobbering the user's shell;
+/// `shelbi workspace list` reads it to render the slot as user-occupied
+/// instead of an orphaned session.
+pub const USER_SHELL_OPTION: &str = "@shelbi-user-shell";
+
+/// Stamp the workspace's live tmux slot as a user shell (see
+/// [`USER_SHELL_OPTION`]). Called right after the shell pane/session is
+/// created by the open-idle-workspace path.
+pub fn mark_user_shell(host: &Host, addr: &TmuxAddr) -> Result<()> {
+    let argv: Vec<String> = match host {
+        Host::Local => vec![
+            "tmux".into(),
+            "set-option".into(),
+            "-w".into(),
+            "-t".into(),
+            format!("={}", addr.target()),
+            USER_SHELL_OPTION.into(),
+            "1".into(),
+        ],
+        Host::Ssh { .. } => vec![
+            "tmux".into(),
+            "set-option".into(),
+            "-t".into(),
+            format!("={}", addr.session),
+            USER_SHELL_OPTION.into(),
+            "1".into(),
+        ],
+    };
+    shelbi_ssh::run_capture(host, &argv)?;
+    Ok(())
+}
+
+/// Is this workspace slot occupied by a user shell — a live slot carrying
+/// the [`USER_SHELL_OPTION`] mark? `false` for a dead slot, a live agent
+/// pane, or an orphaned session (only the sidebar's open-idle-shell path
+/// sets the mark). Dispatch uses this to skip the workspace while the
+/// user is in it; the shell exiting tears the slot (and the mark) down,
+/// returning the workspace to dispatchable.
+pub fn workspace_user_shell_open(host: &Host, addr: &TmuxAddr) -> Result<bool> {
+    if !workspace_slot_alive(host, addr)? {
+        return Ok(false);
+    }
+    let argv: Vec<String> = match host {
+        Host::Local => vec![
+            "tmux".into(),
+            "show-options".into(),
+            "-w".into(),
+            "-v".into(),
+            "-t".into(),
+            format!("={}", addr.target()),
+            USER_SHELL_OPTION.into(),
+        ],
+        Host::Ssh { .. } => vec![
+            "tmux".into(),
+            "show-options".into(),
+            "-v".into(),
+            "-t".into(),
+            format!("={}", addr.session),
+            USER_SHELL_OPTION.into(),
+        ],
+    };
+    let out = shelbi_ssh::run(host, &argv).map_err(Error::Io)?;
+    if !out.status.success() {
+        // Older tmux exits non-zero for an unset user option; that's a
+        // plain "not marked", not an error worth surfacing.
+        return Ok(false);
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).trim() == "1")
+}
+
 /// Kill the workspace's pane (idempotent — silently OK if already gone).
 ///
 /// Marks an "expected teardown" for `workspace_name` before touching tmux
@@ -5194,6 +5269,84 @@ mod tests {
 
         std::env::remove_var("SHELBI_HOME");
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+}
+
+#[cfg(test)]
+mod user_shell_tmux_tests {
+    //! Real-tmux round-trip for the user-shell slot mark. Skipped silently
+    //! when `tmux` isn't on PATH, same doctrine as the other tmux-driven
+    //! tests in this workspace.
+    use super::*;
+    use shelbi_core::Host;
+
+    fn tmux_available() -> bool {
+        std::process::Command::new("tmux")
+            .arg("-V")
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false)
+    }
+
+    fn kill_session(name: &str) {
+        let _ = std::process::Command::new("tmux")
+            .args(["kill-session", "-t", &format!("={name}")])
+            .output();
+    }
+
+    /// An unmarked live slot (agent pane / orphaned session) is not a user
+    /// shell; a marked one is; a dead slot never is. Exercises the local
+    /// window-scoped arm end-to-end so the set-option/show-options wire
+    /// shape can't silently drift from what tmux accepts.
+    #[test]
+    fn user_shell_mark_round_trips_and_dies_with_the_slot() {
+        if !tmux_available() {
+            eprintln!("skipping: tmux not on PATH");
+            return;
+        }
+        let session = format!("shelbi-test-usershell-{}", std::process::id());
+        kill_session(&session);
+        let ok = std::process::Command::new("tmux")
+            .args([
+                "new-session",
+                "-d",
+                "-s",
+                &session,
+                "-n",
+                "alpha",
+                "sh",
+                "-c",
+                "sleep 30",
+            ])
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        assert!(ok, "failed to create test session `{session}`");
+
+        let host = Host::Local;
+        let addr = TmuxAddr {
+            session: session.clone(),
+            window: "alpha".into(),
+        };
+
+        // Live but unmarked: an agent pane or orphaned session, not a shell.
+        assert!(
+            !workspace_user_shell_open(&host, &addr).unwrap(),
+            "unmarked slot must not read as a user shell"
+        );
+
+        mark_user_shell(&host, &addr).expect("set-option should succeed on a live window");
+        assert!(
+            workspace_user_shell_open(&host, &addr).unwrap(),
+            "marked slot must read as a user shell"
+        );
+
+        // Slot torn down (user exited the shell): back to plain not-open.
+        kill_session(&session);
+        assert!(
+            !workspace_user_shell_open(&host, &addr).unwrap(),
+            "dead slot must not read as a user shell"
+        );
     }
 }
 
