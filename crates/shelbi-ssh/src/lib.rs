@@ -319,6 +319,85 @@ where
     cmd.output()
 }
 
+/// How often [`run_with_deadline`] polls the child for exit. Small enough
+/// that a fast probe isn't slowed noticeably; large enough not to spin.
+const DEADLINE_POLL: Duration = Duration::from_millis(15);
+
+/// Run a command like [`run`], but bound its total wall-clock time: if the
+/// child hasn't exited within `deadline` it is killed and the call returns
+/// `ErrorKind::TimedOut`.
+///
+/// This exists for hub-side *probes* (workspace liveness for `shelbi
+/// workspace list` / `status --full`). `ConnectTimeout` + `BatchMode` bound
+/// most SSH failure modes, but not all of them: Tailscale SSH's web-auth
+/// interception accepts the TCP connection and then parks the session on a
+/// "To authenticate, visit …" prompt that runs outside the openssh client,
+/// so BatchMode never sees it and the child blocks forever. A wall-clock
+/// deadline is the only bound that covers every such case.
+///
+/// stdin is `null` (a probe must never trigger an interactive prompt), and
+/// stdout/stderr are drained on their own threads so a chatty child can't
+/// deadlock the deadline loop on a full pipe buffer.
+pub fn run_with_deadline<I, S>(
+    host: &Host,
+    argv: I,
+    deadline: Duration,
+) -> std::io::Result<Output>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<OsStr>,
+{
+    let mut cmd = build_command(host, argv);
+    cmd.stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    tracing::debug!(?cmd, host = ?host, ?deadline, "ssh::run_with_deadline");
+    let mut child = cmd.spawn()?;
+
+    let mut stdout_pipe = child.stdout.take().expect("stdout was piped");
+    let mut stderr_pipe = child.stderr.take().expect("stderr was piped");
+    let stdout_reader = std::thread::spawn(move || {
+        use std::io::Read;
+        let mut buf = Vec::new();
+        let _ = stdout_pipe.read_to_end(&mut buf);
+        buf
+    });
+    let stderr_reader = std::thread::spawn(move || {
+        use std::io::Read;
+        let mut buf = Vec::new();
+        let _ = stderr_pipe.read_to_end(&mut buf);
+        buf
+    });
+
+    let start = std::time::Instant::now();
+    let status = loop {
+        if let Some(status) = child.try_wait()? {
+            break status;
+        }
+        if start.elapsed() >= deadline {
+            // Kill (best-effort — the child may have exited in the gap) and
+            // reap so the long-lived hub daemon doesn't accumulate zombies.
+            let _ = child.kill();
+            let _ = child.wait();
+            // The kill closed the pipes, so the readers see EOF and finish.
+            let _ = stdout_reader.join();
+            let _ = stderr_reader.join();
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                format!("command did not finish within {deadline:?}"),
+            ));
+        }
+        std::thread::sleep(DEADLINE_POLL);
+    };
+    let stdout = stdout_reader.join().unwrap_or_default();
+    let stderr = stderr_reader.join().unwrap_or_default();
+    Ok(Output {
+        status,
+        stdout,
+        stderr,
+    })
+}
+
 /// Run a command and return stdout as String on success, returning the
 /// shelbi-core `Error::Command` variant on non-zero exit.
 pub fn run_capture<I, S>(host: &Host, argv: I) -> shelbi_core::Result<String>
@@ -1044,6 +1123,44 @@ mod tests {
             "[a b]\n[#{pane_title}]\n[x && y]\n[p;q]\n[$HOME]\n",
             "wire: {wire}",
         );
+    }
+
+    #[test]
+    fn run_with_deadline_returns_output_for_a_fast_child() {
+        let out = run_with_deadline(&Host::Local, ["echo", "shelbi"], Duration::from_secs(10))
+            .expect("fast echo must not time out");
+        assert!(out.status.success());
+        assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "shelbi");
+    }
+
+    #[test]
+    fn run_with_deadline_kills_a_hung_child_and_reports_timed_out() {
+        // Models the Tailscale-SSH auth wedge: a child that accepts the
+        // connection (spawns fine) and then never exits. The deadline must
+        // kill it and surface TimedOut — well before the child's own 30s.
+        let start = std::time::Instant::now();
+        let err = run_with_deadline(&Host::Local, ["sleep", "30"], Duration::from_millis(200))
+            .expect_err("hung child must time out");
+        assert_eq!(err.kind(), std::io::ErrorKind::TimedOut, "err: {err}");
+        assert!(
+            start.elapsed() < Duration::from_secs(5),
+            "deadline enforcement took {:?}",
+            start.elapsed()
+        );
+    }
+
+    #[test]
+    fn run_with_deadline_captures_nonzero_exit_and_stderr() {
+        // A probe classifier needs the exit status and stderr of a child
+        // that *did* answer (e.g. ssh exiting 255 with its diagnostic).
+        let out = run_with_deadline(
+            &Host::Local,
+            ["sh", "-c", "echo denied >&2; exit 255"],
+            Duration::from_secs(10),
+        )
+        .expect("child ran to completion");
+        assert_eq!(out.status.code(), Some(255));
+        assert!(String::from_utf8_lossy(&out.stderr).contains("denied"));
     }
 
     #[test]

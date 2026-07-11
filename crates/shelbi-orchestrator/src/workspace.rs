@@ -599,15 +599,24 @@ pub fn rebase_workspace_branch_onto_default(
     }
 }
 
+/// Argv for the local slot-liveness probe: list the project session's
+/// windows so the caller can look for the workspace's window among them.
+fn list_windows_argv(addr: &TmuxAddr) -> Vec<String> {
+    vec![
+        "tmux".into(),
+        "list-windows".into(),
+        "-t".into(),
+        addr.session.clone(),
+        "-F".into(),
+        "#W".into(),
+    ]
+}
+
 /// Does the workspace have a live tmux pane right now?
 pub fn workspace_pane_alive(host: &Host, addr: &TmuxAddr) -> Result<bool> {
     // Local: check `session:window` exists. Remote: it's a whole session.
     // `tmux list-windows -t session -F #W | grep -w window` does both.
-    let out = shelbi_ssh::run(
-        host,
-        ["tmux", "list-windows", "-t", &addr.session, "-F", "#W"],
-    )
-    .map_err(Error::Io)?;
+    let out = shelbi_ssh::run(host, list_windows_argv(addr)).map_err(Error::Io)?;
     if !out.status.success() {
         return Ok(false);
     }
@@ -675,7 +684,14 @@ pub fn workspace_user_shell_open(host: &Host, addr: &TmuxAddr) -> Result<bool> {
     if !workspace_slot_alive(host, addr)? {
         return Ok(false);
     }
-    let argv: Vec<String> = match host {
+    let out = shelbi_ssh::run(host, user_shell_probe_argv(host, addr)).map_err(Error::Io)?;
+    Ok(user_shell_mark_set(&out))
+}
+
+/// Argv reading the [`USER_SHELL_OPTION`] mark off a live slot — window-scoped
+/// for local workspaces, session-scoped for remote ones.
+fn user_shell_probe_argv(host: &Host, addr: &TmuxAddr) -> Vec<String> {
+    match host {
         Host::Local => vec![
             "tmux".into(),
             "show-options".into(),
@@ -693,14 +709,147 @@ pub fn workspace_user_shell_open(host: &Host, addr: &TmuxAddr) -> Result<bool> {
             format!("={}", addr.session),
             USER_SHELL_OPTION.into(),
         ],
-    };
-    let out = shelbi_ssh::run(host, &argv).map_err(Error::Io)?;
-    if !out.status.success() {
-        // Older tmux exits non-zero for an unset user option; that's a
-        // plain "not marked", not an error worth surfacing.
-        return Ok(false);
     }
-    Ok(String::from_utf8_lossy(&out.stdout).trim() == "1")
+}
+
+/// Did the user-shell option probe report the mark as set? A non-zero exit is
+/// a plain "not marked" — older tmux exits non-zero for an unset user option —
+/// not an error worth surfacing.
+fn user_shell_mark_set(out: &std::process::Output) -> bool {
+    out.status.success() && String::from_utf8_lossy(&out.stdout).trim() == "1"
+}
+
+/// Result of a *bounded* workspace-slot probe — the variant of
+/// [`workspace_slot_alive`] + [`workspace_user_shell_open`] used by
+/// `shelbi workspace list` / `status --full`, where a machine that wedges
+/// mid-handshake (e.g. Tailscale SSH parked on its web-auth prompt) must
+/// degrade to an `unreachable` row instead of hanging the whole command.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SlotProbe {
+    /// The machine answered: no live tmux allocation for this slot.
+    Dead,
+    /// The machine answered: the slot has a live tmux allocation.
+    Alive {
+        /// The slot carries the [`USER_SHELL_OPTION`] mark.
+        user_shell: bool,
+    },
+    /// The machine could not be asked — probe timed out or the transport
+    /// failed. `reason` is a one-line human-readable cause for the row.
+    Unreachable { reason: String },
+}
+
+/// Default wall-clock budget for one bounded slot probe. `ConnectTimeout=5`
+/// already bounds a dead host, so this only has to catch the post-connect
+/// wedges (interactive auth interception); 5s keeps `workspace list` well
+/// under ~10s even with an extra machine, since unreachability is cached
+/// per machine by the caller.
+const DEFAULT_PROBE_TIMEOUT_MS: u64 = 5_000;
+
+/// The probe deadline, env-overridable via `SHELBI_PROBE_TIMEOUT_MS`
+/// (clamped 500..=60_000) so a chronically slow link can be given a longer
+/// leash without a rebuild.
+pub fn probe_deadline() -> std::time::Duration {
+    let ms = std::env::var("SHELBI_PROBE_TIMEOUT_MS")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .unwrap_or(DEFAULT_PROBE_TIMEOUT_MS)
+        .clamp(500, 60_000);
+    std::time::Duration::from_millis(ms)
+}
+
+/// Probe the workspace slot with a wall-clock deadline on every remote
+/// command, classifying failures instead of propagating them: the caller
+/// renders a table row per outcome and must never wedge or abort the whole
+/// listing because one machine is down.
+pub fn probe_workspace_slot(
+    host: &Host,
+    addr: &TmuxAddr,
+    deadline: std::time::Duration,
+) -> SlotProbe {
+    let alive = match host {
+        Host::Local => {
+            // Same semantics as `workspace_pane_alive`: a non-zero exit is
+            // "no session" (dead), success means look for the window.
+            match shelbi_ssh::run_with_deadline(host, list_windows_argv(addr), deadline) {
+                Ok(out) => {
+                    out.status.success()
+                        && String::from_utf8_lossy(&out.stdout)
+                            .lines()
+                            .any(|w| w.trim() == addr.window)
+                }
+                Err(e) => {
+                    return SlotProbe::Unreachable {
+                        reason: probe_error_reason(&e, deadline),
+                    }
+                }
+            }
+        }
+        Host::Ssh { .. } => {
+            let argv = vec![
+                "tmux".to_string(),
+                "has-session".to_string(),
+                "-t".to_string(),
+                format!("={}", addr.session),
+            ];
+            match shelbi_ssh::run_with_deadline(host, argv, deadline) {
+                // Same discrimination as `shelbi_tmux::has_session`: tmux
+                // answers 0 (exists) or 1 (doesn't, incl. no server); any
+                // other exit is the transport failing, not tmux answering.
+                Ok(out) => match out.status.code() {
+                    Some(0) => true,
+                    Some(1) => false,
+                    _ => {
+                        return SlotProbe::Unreachable {
+                            reason: transport_failure_reason(&out),
+                        }
+                    }
+                },
+                Err(e) => {
+                    return SlotProbe::Unreachable {
+                        reason: probe_error_reason(&e, deadline),
+                    }
+                }
+            }
+        }
+    };
+    if !alive {
+        return SlotProbe::Dead;
+    }
+    // Best-effort mark probe, same degradation as the unbounded path: an
+    // unreadable option reads as "not a user shell", never an error. The
+    // machine just answered the liveness probe, so a timeout here is a
+    // blip, not the auth wedge — degrading beats flapping to unreachable.
+    let mark_argv = user_shell_probe_argv(host, addr);
+    let user_shell = match shelbi_ssh::run_with_deadline(host, mark_argv, deadline) {
+        Ok(out) => user_shell_mark_set(&out),
+        Err(_) => false,
+    };
+    SlotProbe::Alive { user_shell }
+}
+
+/// One-line reason for a probe that never produced an exit status. The
+/// timeout case is worded for its dominant cause — an SSH session parked on
+/// an interactive auth step that BatchMode can't suppress (Tailscale SSH's
+/// web-auth flow runs outside the openssh client).
+fn probe_error_reason(e: &std::io::Error, deadline: std::time::Duration) -> String {
+    if e.kind() == std::io::ErrorKind::TimedOut {
+        format!(
+            "ssh probe timed out after {}s (interactive auth pending?)",
+            deadline.as_secs()
+        )
+    } else {
+        format!("probe failed: {e}")
+    }
+}
+
+/// One-line reason for a probe whose transport answered with a non-tmux
+/// exit (e.g. ssh's 255): prefer ssh's own first diagnostic line.
+fn transport_failure_reason(out: &std::process::Output) -> String {
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    match stderr.lines().find(|l| !l.trim().is_empty()) {
+        Some(line) => line.trim().to_string(),
+        None => format!("ssh exited {}", out.status),
+    }
 }
 
 /// Kill the workspace's pane (idempotent — silently OK if already gone).
@@ -5347,6 +5496,155 @@ mod user_shell_tmux_tests {
             !workspace_user_shell_open(&host, &addr).unwrap(),
             "dead slot must not read as a user shell"
         );
+    }
+}
+
+#[cfg(test)]
+mod slot_probe_tests {
+    //! Classification tests for the bounded slot probe: the pure reason
+    //! helpers, the deadline config clamp, and (when tmux is on PATH) a
+    //! real-tmux round-trip of [`probe_workspace_slot`]'s local arm.
+    use super::*;
+    use shelbi_core::Host;
+    use std::time::Duration;
+
+    /// Build a real `Output` with the given exit code — `ExitStatus` has no
+    /// public constructor, so we harvest one from a `sh -c "exit N"`.
+    fn fake_output(code: i32, stdout: &str, stderr: &str) -> std::process::Output {
+        let status = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(format!("exit {code}"))
+            .status()
+            .expect("sh must run");
+        std::process::Output {
+            status,
+            stdout: stdout.as_bytes().to_vec(),
+            stderr: stderr.as_bytes().to_vec(),
+        }
+    }
+
+    #[test]
+    fn probe_error_reason_words_the_timeout_for_the_auth_wedge() {
+        let timeout = std::io::Error::new(std::io::ErrorKind::TimedOut, "deadline");
+        let reason = probe_error_reason(&timeout, Duration::from_secs(5));
+        assert_eq!(
+            reason,
+            "ssh probe timed out after 5s (interactive auth pending?)"
+        );
+
+        // A non-timeout spawn failure keeps its own diagnostic.
+        let other = std::io::Error::new(std::io::ErrorKind::NotFound, "no such binary");
+        let reason = probe_error_reason(&other, Duration::from_secs(5));
+        assert!(reason.contains("no such binary"), "reason: {reason}");
+        assert!(!reason.contains("timed out"), "reason: {reason}");
+    }
+
+    #[test]
+    fn transport_failure_reason_prefers_ssh_stderr_over_exit_status() {
+        // ssh's own diagnostic (first non-blank line) is the best reason.
+        let out = fake_output(255, "", "\nssh: connect to host devbox port 22: refused\n");
+        assert_eq!(
+            transport_failure_reason(&out),
+            "ssh: connect to host devbox port 22: refused"
+        );
+
+        // No stderr at all → fall back to the exit status.
+        let out = fake_output(255, "", "");
+        assert!(
+            transport_failure_reason(&out).contains("255"),
+            "reason: {}",
+            transport_failure_reason(&out)
+        );
+    }
+
+    #[test]
+    fn user_shell_mark_set_requires_success_and_the_literal_1() {
+        assert!(user_shell_mark_set(&fake_output(0, "1\n", "")));
+        assert!(!user_shell_mark_set(&fake_output(0, "0\n", "")));
+        assert!(!user_shell_mark_set(&fake_output(0, "", "")));
+        // Older tmux exits non-zero for an unset user option — plain "not
+        // marked", even if something landed on stdout.
+        assert!(!user_shell_mark_set(&fake_output(1, "1\n", "")));
+    }
+
+    #[test]
+    fn probe_deadline_clamps_the_env_override() {
+        // NB: env-mutating — this is the only test touching this variable.
+        std::env::set_var("SHELBI_PROBE_TIMEOUT_MS", "100");
+        assert_eq!(probe_deadline(), Duration::from_millis(500), "clamps low");
+        std::env::set_var("SHELBI_PROBE_TIMEOUT_MS", "999999");
+        assert_eq!(probe_deadline(), Duration::from_millis(60_000), "clamps high");
+        std::env::set_var("SHELBI_PROBE_TIMEOUT_MS", "garbage");
+        assert_eq!(
+            probe_deadline(),
+            Duration::from_millis(DEFAULT_PROBE_TIMEOUT_MS),
+            "garbage falls back to the default"
+        );
+        std::env::remove_var("SHELBI_PROBE_TIMEOUT_MS");
+        assert_eq!(probe_deadline(), Duration::from_millis(DEFAULT_PROBE_TIMEOUT_MS));
+    }
+
+    fn tmux_available() -> bool {
+        std::process::Command::new("tmux")
+            .arg("-V")
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false)
+    }
+
+    /// The local arm answers Dead/Alive with the same semantics as the
+    /// unbounded `workspace_slot_alive`, well inside the deadline.
+    #[test]
+    fn probe_workspace_slot_local_reports_dead_then_alive() {
+        if !tmux_available() {
+            eprintln!("skipping: tmux not on PATH");
+            return;
+        }
+        let session = format!("shelbi-test-slotprobe-{}", std::process::id());
+        let kill = || {
+            let _ = std::process::Command::new("tmux")
+                .args(["kill-session", "-t", &format!("={session}")])
+                .output();
+        };
+        kill();
+
+        let host = Host::Local;
+        let addr = TmuxAddr {
+            session: session.clone(),
+            window: "alpha".into(),
+        };
+        let deadline = Duration::from_secs(10);
+
+        assert_eq!(
+            probe_workspace_slot(&host, &addr, deadline),
+            SlotProbe::Dead,
+            "no session yet"
+        );
+
+        let ok = std::process::Command::new("tmux")
+            .args([
+                "new-session",
+                "-d",
+                "-s",
+                &session,
+                "-n",
+                "alpha",
+                "sh",
+                "-c",
+                "sleep 30",
+            ])
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        assert!(ok, "failed to create test session `{session}`");
+
+        assert_eq!(
+            probe_workspace_slot(&host, &addr, deadline),
+            SlotProbe::Alive { user_shell: false },
+            "live unmarked slot"
+        );
+
+        kill();
     }
 }
 

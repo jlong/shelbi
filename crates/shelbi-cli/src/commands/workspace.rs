@@ -105,22 +105,27 @@ pub(crate) fn print_workspaces(project: &str) -> Result<()> {
     Ok(())
 }
 
-/// Why an idle workspace's tmux slot is still alive. A **user shell** is
-/// the sidebar's click-an-idle-workspace pane (deliberate, user-occupied,
-/// not dispatchable — `shelbi task start` refuses it); an **orphaned
-/// session** is any other leftover allocation (e.g. an agent pane whose
-/// task was moved away), which dispatch will reset as before.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Why an idle workspace's STATE cell isn't the plain `idle` token. A
+/// **user shell** is the sidebar's click-an-idle-workspace pane
+/// (deliberate, user-occupied, not dispatchable — `shelbi task start`
+/// refuses it); an **orphaned session** is any other leftover allocation
+/// (e.g. an agent pane whose task was moved away), which dispatch will
+/// reset as before; **unreachable** means the workspace's machine couldn't
+/// be probed (timeout or transport failure) and carries the one-line
+/// reason to render.
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum OccupiedKind {
     UserShell,
     Orphaned,
+    Unreachable(String),
 }
 
 impl OccupiedKind {
-    fn state_cell(self) -> &'static str {
+    fn state_cell(&self) -> String {
         match self {
-            OccupiedKind::UserShell => "occupied (user shell)",
-            OccupiedKind::Orphaned => "orphaned session",
+            OccupiedKind::UserShell => "occupied (user shell)".to_string(),
+            OccupiedKind::Orphaned => "orphaned session".to_string(),
+            OccupiedKind::Unreachable(reason) => format!("unreachable ({reason})"),
         }
     }
 }
@@ -133,9 +138,23 @@ fn occupied_idle_workspaces(
         .iter()
         .filter_map(|t| t.assigned_to.as_deref())
         .collect();
+    let deadline = orch_workspace::probe_deadline();
+    // One unreachable verdict per *machine*, not per workspace: once a
+    // machine's probe times out or fails, its remaining workspaces inherit
+    // the verdict without burning another deadline each — that's what keeps
+    // `workspace list` bounded (~one deadline per dead machine) instead of
+    // deadline × workspaces.
+    let mut machine_down: BTreeMap<String, String> = BTreeMap::new();
     let mut occupied = BTreeMap::new();
     for workspace in &project.workspaces {
         if assigned.contains(workspace.name.as_str()) {
+            continue;
+        }
+        if let Some(reason) = machine_down.get(&workspace.machine) {
+            occupied.insert(
+                workspace.name.clone(),
+                OccupiedKind::Unreachable(reason.clone()),
+            );
             continue;
         }
         let machine = project.machine(&workspace.machine).ok_or_else(|| {
@@ -148,16 +167,20 @@ fn occupied_idle_workspaces(
         let host = machine.host();
         let addr =
             orch_workspace::workspace_tmux_addr(project, workspace).map_err(|e| anyhow!(e))?;
-        if orch_workspace::workspace_slot_alive(&host, &addr).map_err(|e| anyhow!(e))? {
-            // Best-effort mark probe: an unreadable option degrades to the
-            // historical "orphaned session" reading, never an error.
-            let kind = if orch_workspace::workspace_user_shell_open(&host, &addr).unwrap_or(false)
-            {
-                OccupiedKind::UserShell
-            } else {
-                OccupiedKind::Orphaned
-            };
-            occupied.insert(workspace.name.clone(), kind);
+        match orch_workspace::probe_workspace_slot(&host, &addr, deadline) {
+            orch_workspace::SlotProbe::Dead => {}
+            orch_workspace::SlotProbe::Alive { user_shell } => {
+                let kind = if user_shell {
+                    OccupiedKind::UserShell
+                } else {
+                    OccupiedKind::Orphaned
+                };
+                occupied.insert(workspace.name.clone(), kind);
+            }
+            orch_workspace::SlotProbe::Unreachable { reason } => {
+                machine_down.insert(workspace.machine.clone(), reason.clone());
+                occupied.insert(workspace.name.clone(), OccupiedKind::Unreachable(reason));
+            }
         }
     }
     Ok(occupied)
@@ -199,9 +222,9 @@ fn render_list_with_occupied(
         let (agent, state) = if mine.is_empty() {
             let state = match occupied_idle.get(&workspace.name) {
                 Some(kind) => kind.state_cell(),
-                None => "idle",
+                None => "idle".to_string(),
             };
-            (IDLE_AGENT_CELL.to_string(), state.to_string())
+            (IDLE_AGENT_CELL.to_string(), state)
         } else {
             // `agent:` from the task frontmatter wins when present —
             // matches the same lookup the task-start path uses to load
@@ -658,6 +681,32 @@ mod tests {
             "row: {row}"
         );
         assert!(!row.contains("orphaned session"), "row: {row}");
+    }
+
+    /// A machine that can't be probed (SSH parked on interactive auth, or
+    /// any transport failure) renders its idle workspaces as `unreachable`
+    /// with the one-line reason — instead of hanging or aborting the table.
+    #[test]
+    fn render_list_marks_unprobeable_machine_workspaces_unreachable() {
+        let workspaces = vec![make_workspace("delta", "devbox", "sonnet-4-6")];
+        let in_progress: Vec<&Task> = Vec::new();
+        let occupied = BTreeMap::from([(
+            "delta".to_string(),
+            OccupiedKind::Unreachable(
+                "ssh probe timed out after 5s (interactive auth pending?)".to_string(),
+            ),
+        )]);
+
+        let rows = render_list_with_occupied(&workspaces, &in_progress, &occupied).unwrap();
+        let row = &rows[1];
+        assert!(row.contains("delta"), "row: {row}");
+        assert!(row.contains(&format!(" {IDLE_AGENT_CELL} ")), "row: {row}");
+        assert!(
+            row.trim_end()
+                .ends_with("unreachable (ssh probe timed out after 5s (interactive auth pending?))"),
+            "row: {row}"
+        );
+        assert!(!row.contains("idle"), "row: {row}");
     }
 
     #[test]
