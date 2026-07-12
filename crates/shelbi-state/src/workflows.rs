@@ -116,7 +116,7 @@ pub fn load_project_statuses(project: &str) -> Result<ProjectStatuses> {
     // Read unconditionally and map only NotFound to the default — an
     // `exists()` probe also reports false on EACCES/ELOOP, which would
     // make a transiently unreadable file look missing.
-    let text = match fs::read_to_string(&path) {
+    let text = match crate::read_to_string_at(&path) {
         Ok(t) => t,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             return Ok(default_project_statuses());
@@ -192,7 +192,7 @@ pub fn scaffold_project_workflow(project: &str) -> Result<Vec<PathBuf>> {
 pub fn load_workflow(project: &str, name: &str) -> Result<Workflow> {
     let name = resolve_workflow_alias(project, name)?;
     let path = workflow_path(project, &name)?;
-    let text = fs::read_to_string(&path)?;
+    let text = crate::read_to_string_at(&path)?;
 
     let inline = Workflow::inline_identity_fields(&text).map_err(|e| annotate(&path, e))?;
     if !inline.is_empty() {
@@ -314,7 +314,7 @@ pub fn list_workflows(project: &str) -> Result<Vec<Workflow>> {
         return Err(missing_statuses_error(&st_path));
     }
 
-    let st_text = fs::read_to_string(&st_path)?;
+    let st_text = crate::read_to_string_at(&st_path)?;
     let statuses = ProjectStatuses::from_yaml_str(&st_text).map_err(|e| annotate(&st_path, e))?;
     emit_status_warnings_once(&st_path, &statuses);
 
@@ -423,7 +423,7 @@ fn read_raw_workflow_files(dir: &Path) -> Result<Vec<RawWorkflowFile>> {
             continue;
         }
         let mtime = entry.metadata().and_then(|m| m.modified()).ok();
-        let text = fs::read_to_string(&path)?;
+        let text = crate::read_to_string_at(&path)?;
         out.push(RawWorkflowFile { path, text, mtime });
     }
     out.sort_by(|a, b| a.path.cmp(&b.path));
@@ -1162,6 +1162,12 @@ statuses:
         std::env::set_var("SHELBI_HOME", &home);
         let err = load_workflow("p", "ghost").unwrap_err();
         assert!(matches!(err, Error::Io(_)), "got: {err}");
+        // The io error must name the file it failed on — a bare ENOENT
+        // out of a transition is undiagnosable (the CLI-transition bug).
+        assert!(
+            err.to_string().contains("ghost.yaml"),
+            "error must name the missing file, got: {err}"
+        );
         std::env::remove_var("SHELBI_HOME");
     }
 

@@ -376,7 +376,7 @@ pub fn load_workspace_status(workspace: &str) -> Result<Option<WorkspaceStatus>>
     if !path.exists() {
         return Ok(None);
     }
-    let text = fs::read_to_string(&path)?;
+    let text = crate::read_to_string_at(&path)?;
     Ok(Some(serde_yaml::from_str(&text)?))
 }
 
@@ -1112,8 +1112,10 @@ fn append_event_line(line: &str) -> Result<()> {
     let mut f = fs::OpenOptions::new()
         .create(true)
         .append(true)
-        .open(&path)?;
-    f.write_all(buf.as_bytes())?;
+        .open(&path)
+        .map_err(|e| shelbi_core::Error::Io(crate::annotate_io_error(&path, e)))?;
+    f.write_all(buf.as_bytes())
+        .map_err(|e| shelbi_core::Error::Io(crate::annotate_io_error(&path, e)))?;
     deliver_event_envelope(&EventEnvelope::from_log_line(line));
     Ok(())
 }

@@ -401,7 +401,7 @@ fn save_project_config(project: &Project) -> Result<()> {
 /// the settings.json races that motivated this change.
 pub fn render_workspace_settings(project: &Project) -> Result<String> {
     let path = workspace_settings_template_path(project)?;
-    let template = match fs::read_to_string(&path) {
+    let template = match read_to_string_at(&path) {
         Ok(s) => s,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             DEFAULT_WORKSPACE_SETTINGS_TEMPLATE.to_string()
@@ -458,7 +458,7 @@ pub fn self_heal_workspace_settings_template(
     if let Some(parent) = path.parent() {
         ensure_dir(parent)?;
     }
-    match fs::read_to_string(&path) {
+    match read_to_string_at(&path) {
         Ok(s) if s == DEFAULT_WORKSPACE_SETTINGS_TEMPLATE => {
             Ok(WorkspaceSettingsTemplateOutcome::Unchanged)
         }
@@ -495,8 +495,24 @@ pub fn default_workflow_path(project: &str) -> Result<PathBuf> {
 
 /// Ensure a directory exists.
 pub fn ensure_dir(p: &Path) -> Result<()> {
-    fs::create_dir_all(p)?;
+    fs::create_dir_all(p).map_err(|e| shelbi_core::Error::Io(annotate_io_error(p, e)))?;
     Ok(())
+}
+
+/// Stamp `path` into an io error's message while preserving its
+/// [`std::io::ErrorKind`], so `kind() == NotFound` matchers keep working
+/// but the error no longer surfaces as the undiagnosable bare
+/// `io: No such file or directory (os error 2)` with no hint of *which*
+/// file was involved (the CLI-transition ENOENT bug).
+pub(crate) fn annotate_io_error(path: &Path, e: std::io::Error) -> std::io::Error {
+    std::io::Error::new(e.kind(), format!("{}: {e}", path.display()))
+}
+
+/// [`fs::read_to_string`] that names the failing path in the error.
+/// Every read on the task-transition path must go through here (or
+/// otherwise annotate) so a transient ENOENT is diagnosable in the field.
+pub(crate) fn read_to_string_at(path: &Path) -> std::io::Result<String> {
+    fs::read_to_string(path).map_err(|e| annotate_io_error(path, e))
 }
 
 // ---------------------------------------------------------------------------
@@ -526,7 +542,8 @@ pub(crate) fn acquire_file_lock(lock_path: &Path) -> Result<FileLockGuard> {
         .truncate(false)
         .read(true)
         .write(true)
-        .open(lock_path)?;
+        .open(lock_path)
+        .map_err(|e| shelbi_core::Error::Io(annotate_io_error(lock_path, e)))?;
     #[cfg(unix)]
     {
         use std::os::unix::io::AsRawFd;
@@ -621,7 +638,7 @@ fn sibling_lock_path(path: &Path) -> PathBuf {
 ///   the migrated config through here without a mode flag.
 pub fn load_project(project: &str) -> Result<Project> {
     let global_path = projects_dir()?.join(format!("{project}.yaml"));
-    let mut p = match fs::read_to_string(&global_path) {
+    let mut p = match read_to_string_at(&global_path) {
         Ok(text) => {
             warn_legacy_workers_key(project, &text);
             Project::from_yaml_str(&text)?
@@ -681,7 +698,7 @@ pub fn load_project(project: &str) -> Result<Project> {
 /// back to the two-file in-repo split. Both branches are read-only.
 fn load_project_bare(project: &str) -> Result<Project> {
     let global_path = projects_dir()?.join(format!("{project}.yaml"));
-    let p = match fs::read_to_string(&global_path) {
+    let p = match read_to_string_at(&global_path) {
         Ok(text) => Project::from_yaml_str(&text)?,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => load_project_split(project)?,
         Err(e) => return Err(shelbi_core::Error::Io(e)),
@@ -739,7 +756,7 @@ fn validate_loaded_project_name(name: &str) -> Result<()> {
 fn load_project_split(project: &str) -> Result<Project> {
     let global_path = projects_dir()?.join(format!("{project}.yaml"));
     let local_path = project_dir(project)?.join("local.yaml");
-    let local_text = match fs::read_to_string(&local_path) {
+    let local_text = match read_to_string_at(&local_path) {
         Ok(t) => t,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             return Err(shelbi_core::Error::Other(format!(
@@ -752,7 +769,7 @@ fn load_project_split(project: &str) -> Result<Project> {
     };
     let repo = migrate::extract_repo_from_local_yaml(&local_text, &local_path)?;
     let shared_path = expand_tilde_str(&repo).join(".shelbi").join("project.yaml");
-    let shared_text = match fs::read_to_string(&shared_path) {
+    let shared_text = match read_to_string_at(&shared_path) {
         Ok(t) => t,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             return Err(shelbi_core::Error::Other(format!(
@@ -813,7 +830,7 @@ pub fn save_project(p: &Project) -> Result<()> {
 
 pub fn load_session(name: &str) -> Result<Session> {
     let p = sessions_dir()?.join(format!("{name}.yaml"));
-    let text = fs::read_to_string(&p)?;
+    let text = read_to_string_at(&p)?;
     Ok(serde_yaml::from_str(&text)?)
 }
 
@@ -853,6 +870,15 @@ pub fn save_session(s: &Session) -> Result<()> {
 pub struct State {
     #[serde(default, deserialize_with = "ZenModeState::deserialize_lenient")]
     pub zen_mode: ZenModeState,
+    /// Liveness heartbeat, not a crash counter, despite the name: the
+    /// orchestrator pane wrapper refreshes this to "now" every 60s via
+    /// `shelbi __zen-heartbeat` ([`zen_heartbeat`]) and clears it on
+    /// graceful exit ([`zen_clear_crash`]). Only a timestamp that is
+    /// *still recent at the next orchestrator start* is read as a crash
+    /// signal ([`zen_check_crash_recovery`]). So watching this field
+    /// advance roughly once a minute while an orchestrator pane is open
+    /// is normal operation — it does not indicate that anything (a CLI
+    /// transition, a Zen re-eval, …) crashed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub zen_last_crashed_at: Option<DateTime<Utc>>,
     /// Persisted Kanban workspace filter — `None` means "All workspaces". The
@@ -1091,7 +1117,7 @@ pub fn global_state_path() -> Result<PathBuf> {
 /// mistaken for a missing one and clobbered by the next mutator write.
 pub fn read_global_state() -> Result<GlobalState> {
     let path = global_state_path()?;
-    let text = match fs::read_to_string(&path) {
+    let text = match read_to_string_at(&path) {
         Ok(t) => t,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             return Ok(GlobalState::default());
@@ -1434,7 +1460,7 @@ pub fn zen_check_crash_recovery(project: &str) -> Result<ZenCrashRecovery> {
 /// unreadable file isn't replaced with defaults by the next write.
 pub fn read_state(project: &str) -> Result<State> {
     let path = state_path(project)?;
-    let text = match fs::read_to_string(&path) {
+    let text = match read_to_string_at(&path) {
         Ok(t) => t,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             return Ok(State::default());
@@ -1623,7 +1649,7 @@ pub struct AgentFile {
 /// Read an agent file from disk and split frontmatter from body.
 pub fn load_agent(project: &str, id: &str) -> Result<AgentFile> {
     let path = agent_path(project, id)?;
-    let text = fs::read_to_string(&path)?;
+    let text = read_to_string_at(&path)?;
     parse_agent_file(&text)
 }
 
@@ -1642,7 +1668,11 @@ pub fn append_log(project: &str, id: &str, line: &str) -> Result<()> {
     use std::fs::OpenOptions;
     ensure_dir(&agents_dir(project)?)?;
     let path = agent_log_path(project, id)?;
-    let mut f = OpenOptions::new().create(true).append(true).open(&path)?;
+    let mut f = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+        .map_err(|e| shelbi_core::Error::Io(annotate_io_error(&path, e)))?;
     let ts = chrono::Utc::now().to_rfc3339();
     writeln!(f, "[{ts}] {line}")?;
     Ok(())
@@ -1712,7 +1742,7 @@ pub fn create_task(project: &str, task: &Task, body_md: &str) -> Result<()> {
 
 pub fn load_task(project: &str, id: &str) -> Result<TaskFile> {
     let path = task_path(project, id)?;
-    let text = fs::read_to_string(&path)?;
+    let text = read_to_string_at(&path)?;
     let tf = parse_task_file(&text)?;
     // Reads address the file by its `<id>.md` name; writes address it by
     // the parsed frontmatter id (`save_task`). If a hand-edit lets those
@@ -2299,11 +2329,14 @@ pub(crate) fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
         SEQ.fetch_add(1, Ordering::Relaxed)
     ));
     let tmp = dir.join(tmp_name);
+    // Every step names the file it failed on: a bare ENOENT out of a
+    // state write is undiagnosable once it bubbles up through a
+    // transition's error chain.
     let write_and_rename = || -> Result<()> {
-        let mut f = fs::File::create(&tmp)?;
-        f.write_all(bytes)?;
-        f.sync_all()?;
-        fs::rename(&tmp, path)?;
+        let mut f = fs::File::create(&tmp).map_err(|e| annotate_io_error(&tmp, e))?;
+        f.write_all(bytes).map_err(|e| annotate_io_error(&tmp, e))?;
+        f.sync_all().map_err(|e| annotate_io_error(&tmp, e))?;
+        fs::rename(&tmp, path).map_err(|e| annotate_io_error(path, e))?;
         Ok(())
     };
     let result = write_and_rename();
@@ -4069,6 +4102,32 @@ mod tests {
             cached_parse_warn(&path).is_none(),
             "deleted file should be pruned so a re-create emits fresh"
         );
+        std::env::remove_var("SHELBI_HOME");
+    }
+
+    #[test]
+    fn load_task_missing_file_error_names_the_path() {
+        // A bare `io: No such file or directory (os error 2)` with no path
+        // is undiagnosable in the field (the CLI-transition ENOENT bug):
+        // every read on the transition path must name the file it failed
+        // on, while preserving the ErrorKind for NotFound matchers.
+        let _g = TEST_LOCK.lock().unwrap();
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+
+        let err = match load_task("p", "ghost") {
+            Ok(_) => panic!("load_task must fail for a missing file"),
+            Err(e) => e,
+        };
+        assert!(
+            matches!(&err, shelbi_core::Error::Io(e) if e.kind() == std::io::ErrorKind::NotFound),
+            "kind must survive annotation, got: {err}"
+        );
+        assert!(
+            err.to_string().contains("ghost.md"),
+            "error must name the missing file, got: {err}"
+        );
+
         std::env::remove_var("SHELBI_HOME");
     }
 

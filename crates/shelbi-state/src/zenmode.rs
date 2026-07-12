@@ -14,7 +14,6 @@
 //! (including edits to the first-line summary) survive a reload. Only a
 //! genuinely missing file is (re)created.
 
-use std::fs;
 use std::path::PathBuf;
 
 use shelbi_core::{Error, Result};
@@ -72,7 +71,7 @@ pub fn scaffold_zenmode(project: &str) -> Result<ZenmodeOutcome> {
 /// transiently unreadable file isn't silently treated as absent.
 pub fn read_zenmode_summary(project: &str) -> Result<Option<String>> {
     let path = zenmode_path(project)?;
-    let text = match fs::read_to_string(&path) {
+    let text = match crate::read_to_string_at(&path) {
         Ok(t) => t,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(e) => return Err(Error::Io(e)),
@@ -88,6 +87,7 @@ pub fn read_zenmode_summary(project: &str) -> Result<Option<String>> {
 mod tests {
     use super::*;
     use crate::test_lock::LOCK as TEST_LOCK;
+    use std::fs;
     use std::path::PathBuf;
 
     fn fresh_home() -> PathBuf {
