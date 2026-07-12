@@ -74,7 +74,12 @@ pub fn orch_start(project: &str) -> Result<()> {
 /// orchestrator pane.
 pub fn heartbeat(project: &str) -> Result<()> {
     if let Err(e) = zen_heartbeat(project) {
-        tracing::debug!(project, "zen heartbeat failed (will retry): {e}");
+        // Surface, don't swallow: a persistent heartbeat write failure
+        // means the crash-recovery signal on disk is stale, and the
+        // previous debug-level line was invisible in the field. The
+        // hook still exits 0 so a one-off hiccup can't kill the
+        // orchestrator pane.
+        tracing::warn!(project, "zen heartbeat failed (will retry): {e}");
     }
     Ok(())
 }

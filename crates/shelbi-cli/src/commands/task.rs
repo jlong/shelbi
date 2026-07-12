@@ -565,8 +565,20 @@ fn move_to(project: &str, id: &str, to: &str, reason: Option<&str>) -> Result<()
 }
 
 /// Load the workflow assigned to `task`. Project defaults are resolved via
-/// project config; explicit task workflow misses keep the legacy fallback to
-/// the canonical default workflow.
+/// project config; a workflow that can't be loaded — whatever the reason —
+/// falls back to the canonical default workflow with a stderr warning.
+///
+/// The fail-soft is deliberate and load-bearing: this sits on the status
+/// transition path (`task move` / `task start`), and a workflow YAML can be
+/// absent through no fault of the project's config — a stale daemon
+/// managing an older state layout the CLI doesn't expect (the observed
+/// field failure: a 0.1 daemon under a 0.3.2 CLI), or an in-repo
+/// `<repo>/.shelbi/workflows/` momentarily blipped by a git checkout.
+/// Hard-failing here froze the whole board from the CLI (bare
+/// `io: ENOENT`, no state change) while the poller — whose transition
+/// path already swallows this load — kept working. Falling back mirrors
+/// the poller's behavior; the warning keeps a genuinely misconfigured
+/// workflow loud.
 fn resolve_task_workflow(project: &str, task: &Task) -> Result<Workflow> {
     let project_yaml = shelbi_state::load_project(project).ok();
     let name = project_yaml
@@ -575,13 +587,12 @@ fn resolve_task_workflow(project: &str, task: &Task) -> Result<Workflow> {
         .unwrap_or_else(|| task.workflow_or_default());
     match shelbi_state::load_workflow(project, name) {
         Ok(wf) => Ok(wf),
-        Err(e) if task.workflow.is_some() || project_yaml.is_none() => {
+        Err(e) => {
             eprintln!(
                 "warning: workflow `{name}` could not be loaded ({e}); using built-in default"
             );
             Ok(default_workflow())
         }
-        Err(e) => Err(anyhow!(e)),
     }
 }
 
@@ -1750,6 +1761,63 @@ statuses:
         let dir = shelbi_state::workflows_dir(project).unwrap();
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join(format!("{name}.yaml")), yaml).unwrap();
+    }
+
+    fn write_project_yaml(home: &std::path::Path, name: &str) {
+        std::fs::create_dir_all(home.join("projects")).unwrap();
+        std::fs::write(
+            home.join(format!("projects/{name}.yaml")),
+            format!(
+                r#"name: {name}
+repo: /tmp/{name}
+default_branch: main
+orchestrator:
+  runner: claude
+agent_runners:
+  claude:
+    command: claude
+    flags: []
+machines:
+  - name: local
+    kind: local
+    work_dir: /tmp/{name}
+workspaces:
+  - {{ name: dev, machine: local, runner: claude }}
+"#
+            ),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn move_to_falls_back_when_project_workflow_file_is_absent() {
+        // The CLI-transition ENOENT bug: the project YAML loads fine, the
+        // task has no explicit `workflow:`, and the workflow file the
+        // project default resolves to is not on disk (e.g. a state layout
+        // the running daemon version never materialized, or an in-repo
+        // `workflows/` blipped by a git checkout). This used to hard-fail
+        // the transition with a bare `io: No such file or directory`;
+        // it must instead fall back to the built-in default workflow and
+        // complete the move.
+        let _g = TEST_LOCK.lock().unwrap();
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+
+        write_project_yaml(&home, "p");
+        shelbi_state::save_task("p", &task_in(Column::backlog(), "f"), "").unwrap();
+
+        move_to("p", "f", "todo", None).unwrap();
+
+        assert_eq!(
+            shelbi_state::load_task("p", "f").unwrap().task.column,
+            Column::todo(),
+        );
+        let log = std::fs::read_to_string(shelbi_state::events_log_path().unwrap()).unwrap();
+        assert!(log.contains(" task=f "), "{log}");
+        assert!(log.contains(" backlog -> todo "), "{log}");
+
+        std::env::remove_var("SHELBI_HOME");
+        let _ = std::fs::remove_dir_all(&home);
     }
 
     fn materialize_default_agents_for_test(project: &str) {
