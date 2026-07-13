@@ -7,20 +7,22 @@ over SSH. The repo is a Rust workspace plus a Next.js marketing/docs site.
 
 ## Layout
 
-- `crates/shelbi-cli`: the `shelbi` binary (CLI commands, hub daemon, dispatch)
+- `crates/shelbi-cli`: the `shelbi` binary (command routing, wizard, hub daemon)
 - `crates/shelbi-core`: shared domain types
-- `crates/shelbi-orchestrator`: orchestrator pane bootstrap, system prompt, branch and git-hook logic
+- `crates/shelbi-orchestrator`: orchestrator bootstrap, dispatch, workspace
+  lifecycle, workflow actions, and git integration
 - `crates/shelbi-state`: markdown + frontmatter state IO
 - `crates/shelbi-tmux`: tmux send-keys / capture-pane abstractions
 - `crates/shelbi-tui`: ratatui dashboard
-- `crates/shelbi-palette`: fuzzy command palette (Ctrl+Space) for the TUI
+- `crates/shelbi-palette`: fuzzy command palette (Ctrl+P by default) for the TUI
 - `crates/shelbi-agent`: pluggable agent CLI runners
 - `crates/shelbi-ssh`: local/SSH command execution wrapper
 - `site/`: Next.js marketing and docs site (has its own AGENTS.md)
 - `scripts/`: install script; release scripts in `scripts/release/`
-- `packaging/`: Homebrew tap source (`packaging/homebrew-shelbi/`)
+- `packaging/`: Homebrew tap bootstrap source (`packaging/homebrew-shelbi/`)
 - `docs/`: release runbooks
-- `.shelbi/wt/`: workspace worktrees. Never touch another workspace's worktree.
+- `<machine.work_dir>/.shelbi/wt/`: persistent workspace worktrees. Never touch
+  another workspace's worktree.
 
 ## Build, test, lint
 
@@ -32,9 +34,10 @@ over SSH. The repo is a Rust workspace plus a Next.js marketing/docs site.
 
 ## Git discipline
 
-- Never commit on `main`: a Shelbi-managed pre-commit hook rejects it. Work
-  happens on task branches cut by dispatch (e.g. `jlong/<task-id>`) or
-  `fix/<slug>` branches for hand fixes.
+- Never commit on `main`. Shelbi installs a managed pre-commit guard when it
+  can, but leaves an existing user-authored hook untouched. Work happens on
+  task branches cut by dispatch (e.g. `jlong/<task-id>`) or `fix/<slug>`
+  branches for hand fixes.
 - `main` is protected: changes land only via squash-merged PRs.
 
 ## Conventions
