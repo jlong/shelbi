@@ -866,7 +866,7 @@ pub fn append_dispatch_event(
 /// `shelbi send` (verified pane-injection): `status=submitted` when the
 /// worker's input consumed the text, `status=queued` when the pane was
 /// mid-turn and the text is parked as claude's queued input, and
-/// `status=unverified` when a non-Claude runner received the split text/Enter
+/// `status=unverified` when a custom runner received the split text/Enter
 /// delivery but exposes no supported pane-verification capability. Finally,
 /// `status=stuck` when no submission signal appeared even after the retry
 /// Enter — the failure that used to be silent, leaving text sitting in the

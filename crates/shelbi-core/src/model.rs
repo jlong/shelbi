@@ -1156,7 +1156,9 @@ impl Status {
     }
 }
 
-/// A tmux address — `session:window` (we keep pane implicit; one pane per workspace).
+/// A tmux address. Most callers use `session:window`; dashboard view code may
+/// target a stable tmux pane id (`%N`) because that pane can be swapped between
+/// windows while retaining its identity.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TmuxAddr {
     pub session: String,
@@ -1164,8 +1166,19 @@ pub struct TmuxAddr {
 }
 
 impl TmuxAddr {
+    pub fn pane_id(pane_id: impl Into<String>) -> Self {
+        Self {
+            session: String::new(),
+            window: pane_id.into(),
+        }
+    }
+
     pub fn target(&self) -> String {
-        format!("{}:{}", self.session, self.window)
+        if self.session.is_empty() {
+            self.window.clone()
+        } else {
+            format!("{}:{}", self.session, self.window)
+        }
     }
 }
 
@@ -2246,6 +2259,19 @@ pub fn validate_agent_id(s: &str) -> crate::Result<()> {
 mod tests {
     use super::*;
     use crate::WorkflowZenConfig;
+
+    #[test]
+    fn tmux_addr_can_target_a_stable_pane_id() {
+        assert_eq!(TmuxAddr::pane_id("%42").target(), "%42");
+        assert_eq!(
+            TmuxAddr {
+                session: "shelbi-demo".into(),
+                window: "dashboard".into(),
+            }
+            .target(),
+            "shelbi-demo:dashboard"
+        );
+    }
 
     #[test]
     fn agent_id_validation() {

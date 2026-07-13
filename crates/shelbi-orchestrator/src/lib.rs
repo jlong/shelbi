@@ -29,6 +29,7 @@ pub mod ready;
 pub mod submit;
 pub mod supervision;
 pub mod transition;
+pub mod wake;
 pub mod workspace;
 pub mod zen;
 
@@ -807,6 +808,29 @@ fn read_session_env_var(
         Some((_, value)) if !value.is_empty() => Ok(Some(value.to_string())),
         _ => Ok(None),
     }
+}
+
+/// Resolve the orchestrator's stable tmux pane id. The pane may currently be
+/// stashed in `__views` rather than visible in `dashboard`, so callers that
+/// inject scheduler prompts must target this id instead of a window position.
+pub fn orchestrator_pane_addr(project_name: &str) -> Result<Option<(Host, TmuxAddr)>> {
+    let project = shelbi_state::load_project(project_name)?;
+    let Some(hub) = project
+        .machines
+        .iter()
+        .find(|machine| matches!(machine.kind, MachineKind::Local))
+    else {
+        return Ok(None);
+    };
+    let host = hub.host();
+    let session = dashboard_addr(project_name).session;
+    let Some(pane_id) = read_session_env_var(&host, &session, "SHELBI_PANE_orch")? else {
+        return Ok(None);
+    };
+    if !pane_id_alive(&host, &pane_id)? {
+        return Ok(None);
+    }
+    Ok(Some((host, TmuxAddr::pane_id(pane_id))))
 }
 
 fn create_hidden_views(
