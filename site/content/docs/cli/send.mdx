@@ -14,13 +14,24 @@ workspace's live tmux pane as keystrokes, exactly as if you'd typed it there
 yourself. Use it to nudge, correct, or add a note to an agent that's already
 working, without interrupting or restarting the pane.
 
+Shelbi delivers the text first, sends Enter as a separate key event, and then
+waits for evidence that the pane accepted the submission. If the text remains
+in the input box, Shelbi retries Enter once. A busy Claude pane may keep the
+accepted text visible as queued input until its current turn ends. Every result
+is recorded in `~/.shelbi/events.log` as `status=submitted`, `status=queued`,
+or `status=stuck`; a stuck result also makes the command fail instead of
+silently waiting for a human keypress. Codex and custom runners still receive
+the split text/Enter sequence, but Shelbi does not apply Claude's UI parser to
+them. Their result is explicit `status=unverified`, which preserves delivery
+without claiming runner-specific proof.
+
 `NAME` is resolved against the project YAML's `workspaces:` block first, then
 falls back to the legacy spawn-agent registry.
 
-Because `send` writes keystrokes into a pane, the message is **ephemeral**:
-it's delivered to whatever is reading that pane at the moment, and there's no
-durable record or acknowledgement. When you need a message that survives, is
-logged, and is acked by the workspace, reach for
+Because `send` writes keystrokes into a pane, the message content is
+**ephemeral**. Shelbi records and verifies the delivery result, but the worker
+does not semantically acknowledge or persist the message body. When you need a
+message that survives, is logged, and is acked by the workspace, reach for
 [`shelbi message`](/docs/cli/message) instead. See the comparison there.
 
 ## Arguments

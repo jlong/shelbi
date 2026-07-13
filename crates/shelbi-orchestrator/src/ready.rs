@@ -23,7 +23,8 @@ pub const READY_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_m
 
 /// Poll the pane until claude's input box is on screen and ready to accept
 /// the initial prompt. Returns `Ok(true)` once ready, `Ok(false)` on
-/// timeout (the caller sends anyway).
+/// timeout. Pane-injection callers abort on timeout so they never type into an
+/// unknown startup or modal screen.
 ///
 /// ## Why this exists / what the bug actually was
 ///

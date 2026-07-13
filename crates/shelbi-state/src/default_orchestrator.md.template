@@ -112,6 +112,13 @@ Your live feed is `~/.shelbi/events.log`. The line shapes you'll see most:
   same-named workspace rides your tail too and must be ignored (reacting to it
   is the cross-project false-death bug). Covers the `pane_alive=<bool>` and
   `server_alive=<bool>` death lines and the `reason=dialog:*` block/clear lines.
+- `<ts> send project=<name> workspace=<name> status=<submitted|queued|unverified|stuck> detail=<reason>`
+  records the verified delivery result for `shelbi send`.
+  `submitted` and `queued` are accepted deliveries. `unverified` means Shelbi
+  delivered text and a separate Enter to a runner whose UI has no supported
+  submit probe. `stuck` means a Claude pane injection was not confirmed after
+  its bounded Enter retry and needs your attention. Apply the same
+  project-scope filter as workspace events.
 - `<ts> project=<name> workspace=<name> supervision=<action> reason=<r>` (or
   `project=<name> supervision=<action> target=orchestrator reason=<r>`) — the
   auto-restart supervisor relaunched a crashed pane (`action=restart`) or gave
@@ -210,8 +217,8 @@ The drain layer only delivers facts. Do not invent scheduling inside the drain
 step; after each batch, decide normally whether to dispatch, Zen-scan,
 surface a pane death, or simply answer the user. The JSON `kind`
 field distinguishes `task_transition`, `workspace_transition`, `heartbeat`,
-`pane_death`, and other event classes, and the original line is preserved in
-`raw`.
+`pane_death`, `send`, and other event classes, and the original line is
+preserved in `raw`.
 
 ## Reaction rules
 
@@ -228,6 +235,22 @@ One bullet per event prefix. React to every matching line.
   If no eligible free workspace exists, leave the task in `ready` and
   mention it in your next user-facing reply so they know nothing is
   stalled by mistake.
+
+- `send project=<you> workspace=<name> status=<status> detail=<reason>` →
+  `submitted` and `queued` are informational; the delivery was accepted.
+  `unverified` is the safe capability fallback for a non-Claude runner: text
+  and a separate Enter were delivered, but consumption was not proven. Do not
+  retry it blindly; mention the uncertainty when the instruction is material.
+  For `status=stuck`, do not assume the worker received the text. Surface the
+  failed delivery in your next user-facing reply and inspect the pane before
+  deciding what to do next. Do not blindly repeat the send because an
+  unconfirmed delivery may still have landed, and never fall back to raw
+  `tmux send-keys`. If the instruction must be durable, identify the task
+  assigned to the workspace and use
+  `shelbi message <task-id> directive "<text>"` (or the `context` kind); that
+  channel records and acknowledges
+  delivery. A legacy spawn agent has no durable task-message equivalent, so
+  report that case instead.
 
 - `task=<id> ... to_category=handoff reason=workspace:review-marker` → the
   assigned workspace finished. Two independent things to do:

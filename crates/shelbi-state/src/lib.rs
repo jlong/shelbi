@@ -91,7 +91,7 @@ pub use workflows::{
 pub use workspace_status::{
     append_clarification_event, append_dispatch_event, append_external_event,
     append_heartbeat_event, append_message_ack_event, append_message_event, append_project_event,
-    append_rebase_event, append_supervision_event, append_task_event,
+    append_rebase_event, append_send_event, append_supervision_event, append_task_event,
     append_workspace_dialog_event, append_workspace_event, append_workspace_pane_event,
     append_workspace_pause_event, append_worktree_detach_event, append_zen_dryrun_event,
     append_zen_mode_event,

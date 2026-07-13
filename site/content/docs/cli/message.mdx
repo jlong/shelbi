@@ -15,6 +15,11 @@ record. The workspace tails that log, folds the message into what it's doing,
 and acks it, so unlike a keystroke injection, the message is persisted and its
 delivery is confirmed.
 
+`shelbi message` does not type text or Enter into the tmux pane, so the pane's
+verified-submit mechanism intentionally does not apply. Runner hooks consume
+the file record and acknowledge its `msg_id`. Keeping this path file-based
+avoids duplicate delivery and lets the message survive a pane restart.
+
 `<KIND>` classifies the message so the workspace knows how to treat it:
 
 | Kind | Meaning |
@@ -31,8 +36,8 @@ workspace, but through different channels:
 | | `shelbi send` | `shelbi message` |
 | --- | --- | --- |
 | Channel | Keystrokes into the tmux pane | JSON record in the message log file |
-| Durability | Ephemeral — no record | Durable — appended to `<worktree>/.shelbi/messages/<task-id>.log` |
-| Acknowledged | No | Yes — the workspace tails and acks it |
+| Durability | Message text is ephemeral; delivery verdict is recorded in `events.log` | Durable record in `<worktree>/.shelbi/messages/<task-id>.log` |
+| Delivery proof | Pane submission is verified; no worker semantic ack | Workspace tails and acknowledges the `msg_id` |
 | Typed / classified | Free text | `reply` / `directive` / `context` |
 | Reach for it when | A quick, live nudge to a pane | A message that must survive, be logged, and be confirmed |
 

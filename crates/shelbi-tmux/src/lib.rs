@@ -262,6 +262,21 @@ fn uses_buffer_path(host: &Host, text: &str) -> bool {
 /// with no separator) and let `&&`, `|`, etc. escape into the remote
 /// shell.
 pub fn send_line(host: &Host, addr: &TmuxAddr, text: &str) -> Result<()> {
+    send_text(host, addr, text)?;
+    send_enter(host, addr)
+}
+
+/// Send a string to the target's keyboard input WITHOUT a trailing Enter.
+///
+/// Same delivery mechanics as [`send_line`] (literal `send-keys -l` fast
+/// path locally, paste-buffer staging for multi-line/SSH payloads) minus
+/// the submit keypress. Callers that need the text *submitted* should
+/// follow up with [`send_enter`] as a separate key event after a short
+/// settle — an Enter sent in the same breath as a bracketed paste is
+/// sometimes consumed as part of the paste by the receiving app (claude's
+/// input box keeps the text un-submitted), which is exactly the race the
+/// verified-submit flow in shelbi-orchestrator exists to close.
+pub fn send_text(host: &Host, addr: &TmuxAddr, text: &str) -> Result<()> {
     if uses_buffer_path(host, text) {
         let buffer = paste_buffer_name();
         shelbi_ssh::run_with_stdin(host, load_buffer_argv(&buffer), text.as_bytes())?;
@@ -269,10 +284,6 @@ pub fn send_line(host: &Host, addr: &TmuxAddr, text: &str) -> Result<()> {
     } else {
         shelbi_ssh::run_capture(host, send_keys_literal_argv(addr, text))?;
     }
-    shelbi_ssh::run_capture(
-        host,
-        ["tmux", "send-keys", "-t", &exact(&addr.target()), "Enter"],
-    )?;
     Ok(())
 }
 
