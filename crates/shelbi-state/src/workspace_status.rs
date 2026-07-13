@@ -15,7 +15,7 @@
 //! markers; they don't own these files.
 
 use std::fs;
-use std::io::{Read, Write};
+use std::io::Write;
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
 use std::time::{Duration, SystemTime};
@@ -1071,15 +1071,9 @@ fn try_emit_via_socket(sock: &std::path::Path, body: &str) -> std::io::Result<()
     // open for the ack.
     let _ = stream.shutdown(std::net::Shutdown::Write);
     let _ = stream.set_read_timeout(Some(SOCKET_EMIT_ACK_TIMEOUT));
-    let mut ack = [0u8; DAEMON_ACK.len()];
-    stream.read_exact(&mut ack)?;
-    if ack != *DAEMON_ACK {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            "unexpected daemon ack",
-        ));
-    }
-    Ok(())
+    // A post-handshake daemon writes its version hello before the ack;
+    // the shared reader discards it so both daemon generations pass.
+    crate::hub_version::read_daemon_ack(&stream)
 }
 
 /// Open `events.log` with O_APPEND and write one terminated line in a

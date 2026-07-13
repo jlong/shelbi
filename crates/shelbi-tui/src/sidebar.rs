@@ -357,9 +357,34 @@ fn render_footer(f: &mut Frame, app: &App, area: Rect) {
         ))),
         rows[idx].inner(indent),
     );
-    idx += 2; // skip blank row
+    idx += 1;
+
+    // Version row (the former blank spacer): daemon/CLI version probed
+    // once at startup, painted red when the running daemon doesn't match
+    // this binary. Blank until probed, so the rhythm is unchanged.
+    render_version_row(f, rows[idx].inner(indent), app);
+    idx += 1;
 
     render_zen_row(f, rows[idx], app);
+}
+
+/// Single-line daemon/CLI version segment in the footer's spacer row.
+/// Dim on match (`daemon 0.4.0 · cli 0.4.0`), red on mismatch (`daemon
+/// 0.1.0 ≠ cli 0.4.0 — shelbi daemon restart`). Nothing until the startup
+/// probe has run.
+fn render_version_row(f: &mut Frame, area: Rect, app: &App) {
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
+    let Some(line) = app.daemon_version_line.clone() else {
+        return;
+    };
+    let style = if app.daemon_version_mismatch {
+        Style::default().fg(Color::Red)
+    } else {
+        Style::default().fg(Color::DarkGray)
+    };
+    f.render_widget(Paragraph::new(Line::from(Span::styled(line, style))), area);
 }
 
 /// Single-line zen indicator anchored to the sidebar footer.

@@ -76,6 +76,13 @@ pub fn run(
     handoff: bool,
 ) -> Result<()> {
     let project = require_project(project)?;
+    if handoff {
+        // Consuming HANDOFF.md deletes it, so this is the mutating status
+        // shape and must not run against a stale daemon.
+        super::hub_version::ensure_daemon_matches_for_mutation()?;
+    } else {
+        super::hub_version::warn_on_mismatch();
+    }
     match cmd {
         Some(StatusCmd::List) => list(&project),
         None => snapshot(&project, full, handoff),
@@ -147,6 +154,8 @@ fn print_summary(project: &str) -> Result<()> {
             "none"
         }
     );
+
+    println!("daemon: {}", super::hub_version::status_line());
     Ok(())
 }
 
@@ -178,6 +187,11 @@ fn print_full(project: &str) -> Result<()> {
     } else {
         println!("no HANDOFF.md present");
     }
+
+    println!();
+    println!("## Daemon");
+    println!();
+    println!("daemon: {}", super::hub_version::status_line());
     Ok(())
 }
 
@@ -295,8 +309,9 @@ fn category_counts(project: &str) -> Result<CategoryCounts> {
 
 /// Count declared workspaces bucketed into idle / in-progress. Reads the
 /// project YAML for the declared pool and the `in_progress` column for
-/// assignment.
-fn workspace_idle_busy(project: &str) -> Result<(usize, usize)> {
+/// assignment. Also used by the daemon version gate to decide whether an
+/// automatic daemon restart is safe.
+pub(crate) fn workspace_idle_busy(project: &str) -> Result<(usize, usize)> {
     let p = shelbi_state::load_project(project).map_err(|e| anyhow!(e))?;
     let in_progress =
         shelbi_state::list_column(project, Column::in_progress()).map_err(|e| anyhow!(e))?;

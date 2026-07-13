@@ -31,6 +31,16 @@
 //! sequences into the operator's terminal) and the daemon keeps running
 //! — a single bad client must not be able to take the listener down.
 //!
+//! ## Version handshake
+//!
+//! The daemon speaks first on every accepted connection: one
+//! [`shelbi_state::DaemonHello`] JSON line carrying the binary's semver
+//! and the socket protocol number, written before any read. The CLI
+//! probes this to detect a stale daemon left running across a binary
+//! upgrade (the shaft-project outage class). The daemon's version is
+//! also recorded in the PID file next to the PID so the mismatch is
+//! detectable from disk.
+//!
 //! ## Hardening
 //!
 //! - Frames are capped at [`MAX_FRAME_BYTES`]; an over-limit or
@@ -544,6 +554,15 @@ fn install_shutdown_listener(stop: Arc<AtomicBool>, sock: PathBuf) -> Result<()>
 /// dispatched independently so a bad line in the middle of a batch
 /// doesn't kill the rest. EOF closes the handler cleanly.
 ///
+/// **Version handshake:** the daemon speaks first — one
+/// [`shelbi_state::DaemonHello`] line carrying `CARGO_PKG_VERSION` and
+/// the socket protocol number is written before anything is read, so a
+/// connecting CLI can detect a stale daemon left running across a binary
+/// upgrade without sending a byte. Write errors are ignored like the ack
+/// writes below (the shutdown self-poke and liveness probes connect and
+/// immediately close). Shell clients are unaffected: `nc` prints the
+/// hello line followed by the usual `ok`.
+///
 /// Two hardening properties on top of the dispatch loop:
 ///
 /// - **Frame cap.** Each line is read through a [`MAX_FRAME_BYTES`]
@@ -563,6 +582,8 @@ fn install_shutdown_listener(stop: Arc<AtomicBool>, sock: PathBuf) -> Result<()>
 /// bytes from a hostile or confused client can't reach the operator's
 /// terminal through `tail -f` on the daemon log.
 fn handle_client(stream: UnixStream, daemon: &Daemon) {
+    let hello = shelbi_state::DaemonHello::new(env!("CARGO_PKG_VERSION"));
+    let _ = (&stream).write_all(hello.to_line().as_bytes());
     let mut reader = BufReader::new(&stream);
     let mut buf: Vec<u8> = Vec::with_capacity(256);
     loop {
@@ -843,6 +864,45 @@ mod tests {
             }
             let _ = std::fs::remove_dir_all(&self.home);
         }
+    }
+
+    /// Split the daemon's version hello off the front of a captured
+    /// client-side byte stream: assert the first line is a well-formed
+    /// hello carrying this binary's version, and return the remainder
+    /// (the acks, if any).
+    fn strip_hello(bytes: &[u8]) -> &[u8] {
+        let nl = bytes
+            .iter()
+            .position(|&b| b == b'\n')
+            .unwrap_or_else(|| panic!("no hello line in {bytes:?}"));
+        let (first, rest) = bytes.split_at(nl + 1);
+        let hello = shelbi_state::DaemonHello::parse(std::str::from_utf8(first).unwrap())
+            .expect("first line must be the daemon hello");
+        assert_eq!(hello.version, env!("CARGO_PKG_VERSION"));
+        assert_eq!(hello.protocol, shelbi_state::HUB_PROTOCOL_VERSION);
+        rest
+    }
+
+    /// The version handshake: the daemon speaks first. A client that
+    /// connects and sends nothing still receives the hello frame — this
+    /// is what lets the CLI probe a daemon's version without a write.
+    #[test]
+    fn hello_is_first_frame_on_every_connection() {
+        use std::net::Shutdown;
+        let d = test_daemon();
+        let (client, server) = UnixStream::pair().unwrap();
+        let handler = thread::spawn(move || handle_client(server, &d));
+
+        client.shutdown(Shutdown::Write).unwrap(); // send nothing
+        let mut bytes = Vec::new();
+        (&client).read_to_end(&mut bytes).unwrap();
+        handler.join().unwrap();
+
+        let rest = strip_hello(&bytes);
+        assert!(
+            rest.is_empty(),
+            "no ack without a dispatched line: {rest:?}"
+        );
     }
 
     #[test]
@@ -1195,8 +1255,9 @@ mod tests {
             .write_all(b"{\"verb\":\"event\",\"project\":\"shelbi\",\"line\":\"note=ack-me\"}\n")
             .unwrap();
         client.shutdown(Shutdown::Write).unwrap();
-        let mut ack = Vec::new();
-        (&client).read_to_end(&mut ack).unwrap();
+        let mut bytes = Vec::new();
+        (&client).read_to_end(&mut bytes).unwrap();
+        let ack = strip_hello(&bytes);
         assert_eq!(ack, shelbi_state::DAEMON_ACK, "ack: {ack:?}");
         handler.join().unwrap();
 
@@ -1220,9 +1281,14 @@ mod tests {
                                                             // a BrokenPipe here is part of the expected behavior.
         let _ = (&client).write_all(&big);
         let _ = client.shutdown(Shutdown::Write);
-        let mut ack = Vec::new();
-        let n = (&client).read_to_end(&mut ack).unwrap_or(0);
-        assert_eq!(n, 0, "no ack for an oversized frame, got: {ack:?}");
+        let mut bytes = Vec::new();
+        let _ = (&client).read_to_end(&mut bytes);
+        // Only the version hello comes back — never an ack.
+        let ack = strip_hello(&bytes);
+        assert!(
+            ack.is_empty(),
+            "no ack for an oversized frame, got: {ack:?}"
+        );
         handler.join().unwrap();
     }
 
@@ -1242,8 +1308,9 @@ mod tests {
             )
             .unwrap();
         client.shutdown(Shutdown::Write).unwrap();
-        let mut acks = Vec::new();
-        (&client).read_to_end(&mut acks).unwrap();
+        let mut bytes = Vec::new();
+        (&client).read_to_end(&mut bytes).unwrap();
+        let acks = strip_hello(&bytes);
         assert_eq!(acks, shelbi_state::DAEMON_ACK, "exactly one ack: {acks:?}");
         handler.join().unwrap();
 
@@ -1279,8 +1346,9 @@ mod tests {
             .write_all(b"{\"verb\":\"event\",\"project\":\"shelbi\",\"line\":\"note=drained\"}\n")
             .unwrap();
         client.shutdown(Shutdown::Write).unwrap();
-        let mut ack = Vec::new();
-        (&client).read_to_end(&mut ack).unwrap();
+        let mut bytes = Vec::new();
+        (&client).read_to_end(&mut bytes).unwrap();
+        let ack = strip_hello(&bytes);
         assert_eq!(ack, shelbi_state::DAEMON_ACK, "ack: {ack:?}");
         server.join().unwrap();
 

@@ -123,10 +123,16 @@ pub fn daemon_pid_file_path() -> Result<PathBuf> {
 /// this crate recorded identity) or when the writing daemon's start-time
 /// couldn't be read. In that case identity can't be verified and callers
 /// fall back to a bare liveness probe.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// `version` is the daemon binary's semver, recorded so a CLI/daemon
+/// version mismatch is detectable from disk even without a live socket
+/// round-trip. `None` for files written by binaries that predate the
+/// version handshake.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DaemonPidRecord {
     pub pid: libc::pid_t,
     pub start_time: Option<u64>,
+    pub version: Option<String>,
 }
 
 /// Read and parse `$SHELBI_HOME/shelbi.pid`. Returns `Ok(None)` when the
@@ -134,9 +140,12 @@ pub struct DaemonPidRecord {
 /// empty file from a crashed write is treated the same as "no previous
 /// daemon recorded itself."
 ///
-/// File layout is `<pid>` or `<pid> <start_time>` (whitespace-separated,
-/// one line). A missing or unparseable second field yields
-/// `start_time: None`, keeping the reader compatible with legacy files.
+/// File layout is `<pid>`, `<pid> <start_time>`, or
+/// `<pid> <start_time|-> <version>` (whitespace-separated, one line —
+/// `-` stands in for an unreadable start-time so the version keeps a
+/// stable field position). A missing or unparseable second field yields
+/// `start_time: None` and a missing third yields `version: None`,
+/// keeping the reader compatible with legacy files.
 pub fn read_daemon_pid_record() -> Result<Option<DaemonPidRecord>> {
     let path = daemon_pid_file_path()?;
     let text = match fs::read_to_string(&path) {
@@ -150,7 +159,12 @@ pub fn read_daemon_pid_record() -> Result<Option<DaemonPidRecord>> {
         None => return Ok(None),
     };
     let start_time = fields.next().and_then(|f| f.parse::<u64>().ok());
-    Ok(Some(DaemonPidRecord { pid, start_time }))
+    let version = fields.next().map(|f| f.to_string());
+    Ok(Some(DaemonPidRecord {
+        pid,
+        start_time,
+        version,
+    }))
 }
 
 /// Read just the PID stored in `$SHELBI_HOME/shelbi.pid`. Thin wrapper
@@ -164,11 +178,17 @@ pub fn read_daemon_pid() -> Result<Option<libc::pid_t>> {
 /// identity token — to `$SHELBI_HOME/shelbi.pid`. Recording the
 /// start-time lets the next startup's cleanup tell a genuine live daemon
 /// apart from an unrelated process that recycled the same PID.
+///
+/// The third field is this crate's `CARGO_PKG_VERSION` — every shelbi
+/// crate ships the single workspace version, so it equals the daemon
+/// binary's semver. An unreadable start-time is written as `-` so the
+/// version keeps a stable field position.
 pub fn write_daemon_pid(pid: libc::pid_t) -> Result<()> {
     let path = daemon_pid_file_path()?;
+    let version = env!("CARGO_PKG_VERSION");
     let body = match process_start_time(pid) {
-        Some(start) => format!("{pid} {start}\n"),
-        None => format!("{pid}\n"),
+        Some(start) => format!("{pid} {start} {version}\n"),
+        None => format!("{pid} - {version}\n"),
     };
     crate::atomic_write(&path, body.as_bytes())
 }
@@ -279,7 +299,7 @@ fn process_start_time(_pid: libc::pid_t) -> Option<u64> {
 /// unavailable (a legacy file, or a live process we can't introspect) we
 /// conservatively fall back to liveness so we never nuke a real daemon's
 /// ControlMasters on a probe we couldn't complete.
-fn is_recorded_daemon_alive(rec: DaemonPidRecord) -> bool {
+fn is_recorded_daemon_alive(rec: &DaemonPidRecord) -> bool {
     if !is_process_alive(rec.pid) {
         return false;
     }
@@ -314,7 +334,7 @@ pub enum CmCleanupOutcome {
 /// shouldn't keep the daemon from starting.
 pub fn cleanup_stale_control_masters(self_pid: libc::pid_t) -> Result<CmCleanupOutcome> {
     if let Some(rec) = read_daemon_pid_record()? {
-        if rec.pid != self_pid && is_recorded_daemon_alive(rec) {
+        if rec.pid != self_pid && is_recorded_daemon_alive(&rec) {
             return Ok(CmCleanupOutcome::SkippedAnotherDaemon { pid: rec.pid });
         }
     }
@@ -751,6 +771,7 @@ mod tests {
         assert_eq!(rec.pid, self_pid);
         assert_eq!(rec.start_time, process_start_time(self_pid));
         assert!(rec.start_time.is_some());
+        assert_eq!(rec.version.as_deref(), Some(env!("CARGO_PKG_VERSION")));
         std::env::remove_var("SHELBI_HOME");
     }
 
@@ -765,8 +786,24 @@ mod tests {
         let rec = read_daemon_pid_record().unwrap().unwrap();
         assert_eq!(rec.pid, 4242);
         assert_eq!(rec.start_time, None);
+        assert_eq!(rec.version, None);
         // The pid-only accessor still works too.
         assert_eq!(read_daemon_pid().unwrap(), Some(4242));
+        std::env::remove_var("SHELBI_HOME");
+    }
+
+    #[test]
+    fn pid_file_with_placeholder_start_time_still_carries_version() {
+        let _g = lock_test();
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+        // The `-` placeholder keeps the version at a stable field
+        // position when the writer couldn't read its own start-time.
+        fs::write(home.join("shelbi.pid"), "4242 - 0.4.0\n").unwrap();
+        let rec = read_daemon_pid_record().unwrap().unwrap();
+        assert_eq!(rec.pid, 4242);
+        assert_eq!(rec.start_time, None);
+        assert_eq!(rec.version.as_deref(), Some("0.4.0"));
         std::env::remove_var("SHELBI_HOME");
     }
 

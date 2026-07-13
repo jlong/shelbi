@@ -64,6 +64,12 @@ pub enum WorkspaceCmd {
 
 pub fn run(project_opt: Option<String>, cmd: WorkspaceCmd) -> Result<()> {
     let project = require_project(project_opt)?;
+    // Version gate: `stop` and `set-runner` mutate board/config state;
+    // the views warn and proceed.
+    match &cmd {
+        WorkspaceCmd::List | WorkspaceCmd::Status { .. } => super::hub_version::warn_on_mismatch(),
+        _ => super::hub_version::ensure_daemon_matches_for_mutation()?,
+    }
     match cmd {
         WorkspaceCmd::List => list(&project),
         WorkspaceCmd::SetRunner { runner, names, all } => {

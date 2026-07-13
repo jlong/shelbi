@@ -21,6 +21,7 @@ use shelbi_core::{
 
 mod agent_workspaces;
 mod hub_config;
+mod hub_version;
 pub mod keymap;
 mod migrate;
 mod project_paths;
@@ -60,6 +61,9 @@ pub use agent_workspaces::{
 pub use hub_config::{
     hub_config_path, list_projects, load_hub_config, save_hub_config, touch_project_launched,
     HubConfig, ProjectMeta, ProjectSummary,
+};
+pub use hub_version::{
+    probe_daemon_hello, read_daemon_ack, DaemonHello, DaemonProbe, HUB_PROTOCOL_VERSION,
 };
 pub use resolve::{
     cleanup_legacy_markers, project_roots, resolve_project_for_cwd, MarkerCleanup, ProjectRoot,

@@ -25,6 +25,12 @@ struct Cli {
     #[arg(long, short = 'p', global = true, env = "SHELBI_PROJECT")]
     project: Option<String>,
 
+    /// Assume "yes" for interactive confirmations — currently the offer
+    /// to run `shelbi daemon restart` when a command detects the running
+    /// daemon's version doesn't match this CLI.
+    #[arg(long, global = true)]
+    yes: bool,
+
     #[command(subcommand)]
     cmd: Option<Cmd>,
 }
@@ -306,6 +312,13 @@ fn main() -> Result<()> {
         // Stash before any helper reads the resolved root. `expand_tilde_*`
         // happens inside `resolve()` so the user can pass `~/scratch`.
         shelbi_state::set_root_override(root);
+    }
+    if cli.yes {
+        // Carried through the environment (like `--root` via the override
+        // stash) so deep call sites — the daemon-restart offer in the
+        // version gate — don't need `--yes` plumbed through every
+        // subcommand's argument struct.
+        std::env::set_var(commands::hub_version::ASSUME_YES_ENV, "1");
     }
     init_tracing(cli.cmd.as_ref());
 

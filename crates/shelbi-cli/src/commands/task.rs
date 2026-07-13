@@ -193,6 +193,13 @@ pub struct PrioArgs {
 
 pub fn run(project_opt: Option<String>, cmd: TaskCmd) -> Result<()> {
     let project = require_project(project_opt)?;
+    // Version gate: board mutations against a stale daemon (old binary
+    // kept running across an upgrade) produce undiagnosable io errors —
+    // refuse up front. Read-only views still work, with a warning.
+    match &cmd {
+        TaskCmd::List { .. } | TaskCmd::Show { .. } => super::hub_version::warn_on_mismatch(),
+        _ => super::hub_version::ensure_daemon_matches_for_mutation()?,
+    }
     match cmd {
         TaskCmd::Add(args) => add(&project, args),
         TaskCmd::List {

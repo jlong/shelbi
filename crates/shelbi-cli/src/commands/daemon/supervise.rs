@@ -220,20 +220,39 @@ fn status_launchd() -> Result<()> {
 
 #[cfg(target_os = "macos")]
 fn restart_launchd() -> Result<()> {
+    // Refresh the plist before restarting. Package-manager upgrades can
+    // leave a long-lived daemon running after the binary has moved; a
+    // bare kickstart would relaunch the stale ProgramArguments path.
+    let plist_path = launch_agent_plist_path()?;
+    if let Some(parent) = plist_path.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("creating LaunchAgents dir {}", parent.display()))?;
+    }
+    ensure_log_dir()?;
+    let plist = render_launchd_plist(&LaunchdInputs::resolve()?);
+    fs::write(&plist_path, plist)
+        .with_context(|| format!("writing launchd plist {}", plist_path.display()))?;
+
     let uid = current_uid();
     let target = gui_target(uid);
+    // bootout + bootstrap forces launchd to ingest the refreshed plist;
+    // kickstart alone keeps the already-loaded (possibly stale) unit.
+    let _ = Command::new("launchctl")
+        .args(["bootout", &target])
+        .status();
     let status = Command::new("launchctl")
-        .args(["kickstart", "-k", &target])
+        .args(["bootstrap", &gui_domain(uid)])
+        .arg(&plist_path)
         .status()
-        .context("invoking launchctl kickstart")?;
+        .context("invoking launchctl bootstrap")?;
     if !status.success() {
         bail!(
-            "launchctl kickstart {} failed — is the agent installed? \
+            "launchctl bootstrap {} failed — is the agent installed? \
              (run `shelbi daemon install`)",
             target
         );
     }
-    println!("✓ kickstarted {target}");
+    println!("✓ restarted {target} on the current shelbi binary");
     Ok(())
 }
 
@@ -425,8 +444,21 @@ fn status_systemd() -> Result<()> {
 
 #[cfg(target_os = "linux")]
 fn restart_systemd() -> Result<()> {
+    // Refresh ExecStart before restarting. A package-manager upgrade may
+    // move the executable while systemd still holds the old unit in
+    // memory; daemon-reload is required for the restart to use this CLI.
+    let unit_path = systemd_unit_path()?;
+    if let Some(parent) = unit_path.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("creating systemd user unit dir {}", parent.display()))?;
+    }
+    ensure_log_dir()?;
+    let unit = render_systemd_unit(&SystemdInputs::resolve()?);
+    fs::write(&unit_path, unit)
+        .with_context(|| format!("writing systemd user unit {}", unit_path.display()))?;
+    run_systemctl(&["daemon-reload"])?;
     run_systemctl(&["restart", SYSTEMD_SERVICE_NAME])?;
-    println!("✓ restarted {SYSTEMD_SERVICE_NAME}");
+    println!("✓ restarted {SYSTEMD_SERVICE_NAME} on the current shelbi binary");
     Ok(())
 }
 

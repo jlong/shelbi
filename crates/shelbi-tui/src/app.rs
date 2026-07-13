@@ -187,6 +187,13 @@ pub struct App {
     /// Stale entries (machine names not declared in the current project)
     /// are silently ignored at row-build time — no error, no warning.
     pub collapsed_machines: BTreeSet<String>,
+    /// Preformatted daemon/CLI version segment for the footer, probed
+    /// once at sidebar startup by [`App::probe_daemon_version`]. `None`
+    /// until probed (the row renders blank).
+    pub daemon_version_line: Option<String>,
+    /// True when the probed daemon version differs from this binary —
+    /// the footer paints [`App::daemon_version_line`] red instead of dim.
+    pub daemon_version_mismatch: bool,
 }
 
 impl App {
@@ -207,7 +214,37 @@ impl App {
             display_style: DisplayStyle::detect(),
             list_area: Rect::default(),
             collapsed_machines: BTreeSet::new(),
+            daemon_version_line: None,
+            daemon_version_mismatch: false,
         }
+    }
+
+    /// Probe the hub daemon's hello frame once and precompute the footer
+    /// version segment. A match still labels both sides so the daemon
+    /// and CLI versions remain explicit; a mismatch also names the fix
+    /// and flips [`App::daemon_version_mismatch`] so the footer flags it.
+    pub fn probe_daemon_version(&mut self) {
+        let cli = env!("CARGO_PKG_VERSION");
+        let (line, mismatch) = match shelbi_state::probe_daemon_hello() {
+            shelbi_state::DaemonProbe::NotRunning => {
+                (format!("daemon not running · cli {cli}"), false)
+            }
+            shelbi_state::DaemonProbe::NoHello => (
+                format!("daemon outdated ≠ cli {cli} — shelbi daemon restart"),
+                true,
+            ),
+            shelbi_state::DaemonProbe::Hello(h)
+                if h.version == cli && h.protocol == shelbi_state::HUB_PROTOCOL_VERSION =>
+            {
+                (format!("daemon {cli} · cli {cli}"), false)
+            }
+            shelbi_state::DaemonProbe::Hello(h) => (
+                format!("daemon {} ≠ cli {cli} — shelbi daemon restart", h.version),
+                true,
+            ),
+        };
+        self.daemon_version_line = Some(line);
+        self.daemon_version_mismatch = mismatch;
     }
 
     /// Borrow the keymaps populated at startup by `run_sidebar`. The

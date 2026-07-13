@@ -11,6 +11,7 @@ const TRANSCRIPT_LINES: usize = 500;
 
 pub fn run(project_opt: Option<String>, id: String, pr: bool) -> Result<()> {
     let project_name = require_project(project_opt)?;
+    super::hub_version::ensure_daemon_matches_for_mutation()?;
     let file = shelbi_state::load_agent(&project_name, &id).map_err(|e| anyhow!(e))?;
     let project = shelbi_state::load_project(&project_name).map_err(|e| anyhow!(e))?;
     let machine = project
