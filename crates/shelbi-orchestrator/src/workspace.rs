@@ -606,7 +606,7 @@ fn list_windows_argv(addr: &TmuxAddr) -> Vec<String> {
         "tmux".into(),
         "list-windows".into(),
         "-t".into(),
-        addr.session.clone(),
+        format!("={}", addr.session),
         "-F".into(),
         "#W".into(),
     ]
@@ -657,7 +657,7 @@ pub fn mark_user_shell(host: &Host, addr: &TmuxAddr) -> Result<()> {
             "set-option".into(),
             "-w".into(),
             "-t".into(),
-            format!("={}", addr.target()),
+            shelbi_tmux::command_target(addr),
             USER_SHELL_OPTION.into(),
             "1".into(),
         ],
@@ -698,7 +698,7 @@ fn user_shell_probe_argv(host: &Host, addr: &TmuxAddr) -> Vec<String> {
             "-w".into(),
             "-v".into(),
             "-t".into(),
-            format!("={}", addr.target()),
+            shelbi_tmux::command_target(addr),
             USER_SHELL_OPTION.into(),
         ],
         Host::Ssh { .. } => vec![
@@ -884,7 +884,8 @@ pub fn kill_workspace_pane(host: &Host, addr: &TmuxAddr, workspace_name: &str) -
             // its historical reason) is the pre-fix behavior, so a mark
             // failure just degrades to that.
             let _ = shelbi_state::mark_expected_teardown(workspace_name);
-            let _ = shelbi_ssh::run(host, ["tmux", "kill-window", "-t", &addr.target()])
+            let target = shelbi_tmux::command_target(addr);
+            let _ = shelbi_ssh::run(host, ["tmux", "kill-window", "-t", &target])
                 .map_err(Error::Io)?;
         }
         Host::Ssh { .. } => {
@@ -896,7 +897,8 @@ pub fn kill_workspace_pane(host: &Host, addr: &TmuxAddr, workspace_name: &str) -
             // to suppress on that side — but writing the marker is
             // still safe and keeps the API symmetric.
             let _ = shelbi_state::mark_expected_teardown(workspace_name);
-            let _ = shelbi_ssh::run(host, ["tmux", "kill-session", "-t", &addr.session])
+            let target = format!("={}", addr.session);
+            let _ = shelbi_ssh::run(host, ["tmux", "kill-session", "-t", &target])
                 .map_err(Error::Io)?;
         }
     }
@@ -2280,7 +2282,7 @@ fn copy_dir_contents_to_remote(ssh_host: &str, src: &Path, dest: &Path) -> Resul
 /// without spinning up a tmux server.
 struct LocalPaneTmuxArgs<'a> {
     /// `true` → `tmux new-session -d -s <session> -n <window> …`.
-    /// `false` → `tmux new-window -d -t <session>: -n <window> …` inside
+    /// `false` → `tmux new-window -d -t =<session>: -n <window> …` inside
     /// the already-live project session.
     create_new_session: bool,
     session: &'a str,
@@ -2328,7 +2330,7 @@ fn local_pane_tmux_argv(a: LocalPaneTmuxArgs<'_>) -> Vec<String> {
             "new-window".into(),
             "-d".into(),
             "-t".into(),
-            format!("{}:", a.session),
+            format!("{}:", shelbi_tmux::session_target(a.session)),
             "-n".into(),
             a.window.into(),
         ]
@@ -5702,7 +5704,7 @@ mod rebase_git_tests {
         assert_eq!(argv[0], "tmux");
         assert_eq!(argv[1], "new-window");
         assert!(argv.iter().any(|s| s == "-t"));
-        assert!(argv.iter().any(|s| s == "shelbi-demo:"));
+        assert!(argv.iter().any(|s| s == "=shelbi-demo:"));
         assert!(argv.iter().any(|s| s == "TASK_ID=bug-x"));
         assert!(argv.iter().any(|s| s == "PROJECT=demo"));
         assert!(argv

@@ -10,7 +10,7 @@ use std::collections::HashMap;
 use std::fs;
 use std::io::{Read, Seek, SeekFrom};
 
-use shelbi_core::{Project, StatusCategory};
+use shelbi_core::{Error, Project, StatusCategory};
 
 use crate::submit::{PaneBaseline, SubmitProfile, SubmitStatus};
 
@@ -85,14 +85,32 @@ pub fn maybe_wake_codex(project: &Project, state: &mut CodexWakeState) {
             ?status,
             "Codex event wake was not submitted; retrying when idle",
         ),
-        Err(error) => tracing::warn!(
-            project = %project.name,
-            %error,
-            "Codex event wake delivery failed; retrying when idle",
-        ),
+        Err(error) => {
+            let error = wake_delivery_error_summary(&error);
+            tracing::warn!(
+                project = %project.name,
+                target_kind = addr.target_kind(),
+                target = %addr.target(),
+                %error,
+                "Codex event wake delivery failed; retrying when idle",
+            );
+        }
     }
     // Every other result remains pending. The next supervisor tick retries a
     // failed delivery, or waits for an active turn to become idle.
+}
+
+/// A wake-safe error summary. `shelbi_ssh::run_capture` includes the complete
+/// argv in `Error::Command`, and the local literal-send argv contains the wake
+/// prompt. Keep tmux's status and stderr while deliberately omitting that
+/// command field; the caller logs the target kind/value separately.
+fn wake_delivery_error_summary(error: &Error) -> String {
+    match error {
+        Error::Command { status, stderr, .. } => {
+            format!("status={status}; stderr={}", stderr.trim())
+        }
+        other => other.to_string(),
+    }
 }
 
 fn should_submit(state: &CodexWakeState, pending: PendingWake, active: bool) -> bool {
@@ -213,6 +231,21 @@ mod tests {
     use super::*;
 
     #[test]
+    fn delivery_diagnostic_keeps_tmux_context_but_redacts_prompt_argv() {
+        let secret = "private wake prompt body";
+        let error = Error::Command {
+            cmd: format!("tmux send-keys -t =%99 -l -- {secret}"),
+            status: "exit status: 1".into(),
+            stderr: "can't find pane: %99\n".into(),
+        };
+        let summary = wake_delivery_error_summary(&error);
+        assert!(summary.contains("exit status: 1"));
+        assert!(summary.contains("can't find pane: %99"));
+        assert!(!summary.contains(secret));
+        assert!(!summary.contains("send-keys"));
+    }
+
+    #[test]
     fn scopes_events_and_coalesces_to_highest_priority() {
         assert_eq!(
             line_priority(
@@ -303,5 +336,243 @@ mod tests {
         let pending = PendingWake { through: 42 };
         state.woken_through = pending.through;
         assert!(!should_submit(&state, pending, false));
+    }
+
+    #[test]
+    fn actionable_event_starts_a_turn_in_the_stable_orchestrator_pane() {
+        use shelbi_core::{
+            AgentRunnerSpec, GitConfig, HeartbeatConfig, Machine, MachineKind,
+            OrchestratorSpec, ZenConfig,
+        };
+        use std::collections::BTreeMap;
+        use std::ffi::OsString;
+        use std::path::PathBuf;
+        use std::process::Command;
+        use std::time::{Duration, Instant};
+
+        let _test_lock = crate::test_lock::acquire();
+        match Command::new("tmux").arg("-V").output() {
+            Ok(output) => assert!(
+                output.status.success(),
+                "tmux -V failed: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            ),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return,
+            Err(error) => panic!("could not probe tmux: {error}"),
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join("home");
+
+        struct RootEnvGuard {
+            root: Option<OsString>,
+            home: Option<OsString>,
+        }
+        impl RootEnvGuard {
+            fn install(home: &std::path::Path) -> Self {
+                let guard = Self {
+                    root: std::env::var_os("SHELBI_ROOT"),
+                    home: std::env::var_os("SHELBI_HOME"),
+                };
+                std::env::remove_var("SHELBI_ROOT");
+                std::env::set_var("SHELBI_HOME", home);
+                guard
+            }
+        }
+        impl Drop for RootEnvGuard {
+            fn drop(&mut self) {
+                match &self.root {
+                    Some(value) => std::env::set_var("SHELBI_ROOT", value),
+                    None => std::env::remove_var("SHELBI_ROOT"),
+                }
+                match &self.home {
+                    Some(value) => std::env::set_var("SHELBI_HOME", value),
+                    None => std::env::remove_var("SHELBI_HOME"),
+                }
+            }
+        }
+        let _env = RootEnvGuard::install(&home);
+
+        let project_name = format!("wake-pane-{}", std::process::id());
+        let session = format!("shelbi-{project_name}");
+        let session_target = format!("={session}");
+        let _ = Command::new("tmux")
+            .args(["kill-session", "-t", &session_target])
+            .output();
+
+        let script = tmp.path().join("fake-codex.sh");
+        let receipt = tmp.path().join("wake-receipt");
+        std::fs::write(
+            &script,
+            "#!/bin/sh\n\
+             stty -echo\n\
+             printf '\\033[2J\\033[H› Ask Codex to do anything\\n\\n  ? for shortcuts\\n'\n\
+             IFS= read -r line\n\
+             printf '%s\\n' \"$line\" > \"$1\"\n\
+             printf '\\033[2J\\033[H• Working (1s)\\n  esc to interrupt\\n'\n\
+             sleep 5\n",
+        )
+        .unwrap();
+
+        let mut started = false;
+        let mut start_error = String::new();
+        for _ in 0..50 {
+            match Command::new("tmux")
+                .args([
+                    "new-session",
+                    "-d",
+                    "-s",
+                    &session,
+                    "-n",
+                    "dashboard",
+                    "sh",
+                    script.to_str().unwrap(),
+                    receipt.to_str().unwrap(),
+                ])
+                .output()
+            {
+                Ok(output) if !output.status.success() => {
+                    start_error = String::from_utf8_lossy(&output.stderr).trim().to_string();
+                }
+                Err(error) => start_error = error.to_string(),
+                Ok(_) => {}
+            }
+            let live = Command::new("tmux")
+                .args(["has-session", "-t", &session_target])
+                .output();
+            started = match live {
+                Ok(output) if output.status.success() => true,
+                Ok(output) => {
+                    if start_error.is_empty() {
+                        start_error = String::from_utf8_lossy(&output.stderr).trim().to_string();
+                    }
+                    false
+                }
+                Err(error) => {
+                    start_error = error.to_string();
+                    false
+                }
+            };
+            if started {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(started, "tmux session never came up: {start_error}");
+
+        struct SessionGuard(String);
+        impl Drop for SessionGuard {
+            fn drop(&mut self) {
+                let _ = Command::new("tmux")
+                    .args(["kill-session", "-t", &format!("={}", self.0)])
+                    .output();
+            }
+        }
+        let _session = SessionGuard(session.clone());
+
+        let pane = Command::new("tmux")
+            .args([
+                "list-panes",
+                "-t",
+                &session_target,
+                "-F",
+                "#{pane_id}",
+            ])
+            .output()
+            .unwrap();
+        assert!(pane.status.success());
+        let pane_id = String::from_utf8_lossy(&pane.stdout).trim().to_string();
+        assert!(pane_id.starts_with('%'), "unexpected pane id: {pane_id}");
+        let pinned = Command::new("tmux")
+            .args([
+                "set-environment",
+                "-t",
+                &session_target,
+                "SHELBI_PANE_orch",
+                &pane_id,
+            ])
+            .status()
+            .unwrap();
+        assert!(pinned.success());
+
+        let ready_deadline = Instant::now() + Duration::from_secs(2);
+        let mut screen = String::new();
+        while Instant::now() < ready_deadline {
+            let output = Command::new("tmux")
+                .args(["capture-pane", "-p", "-t", &pane_id])
+                .output()
+                .unwrap();
+            screen = String::from_utf8_lossy(&output.stdout).into_owned();
+            if screen.contains("Ask Codex") {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(screen.contains("Ask Codex"), "fixture never became idle: {screen}");
+
+        let mut runners = BTreeMap::new();
+        runners.insert(
+            "codex".into(),
+            AgentRunnerSpec {
+                command: "codex".into(),
+                flags: Vec::new(),
+                prompt_injection: None,
+                dialog_signatures: Vec::new(),
+            },
+        );
+        let project = Project {
+            name: project_name.clone(),
+            repo: tmp.path().to_string_lossy().into_owned(),
+            default_branch: "main".into(),
+            default_workflow: None,
+            config_mode: None,
+            machines: vec![Machine {
+                name: "hub".into(),
+                kind: MachineKind::Local,
+                work_dir: PathBuf::from(tmp.path()),
+                host: None,
+                tags: Vec::new(),
+                forward: None,
+            }],
+            orchestrator: OrchestratorSpec {
+                runner: "codex".into(),
+            },
+            agent_runners: runners,
+            editor: None,
+            github_url: None,
+            workspaces: Vec::new(),
+            workspace_poll_interval_secs: 5,
+            workspace_permissions_mode: "auto".into(),
+            workspace_settings_template: None,
+            zen: ZenConfig::default(),
+            heartbeat: HeartbeatConfig::default(),
+            detected_shapes: Vec::new(),
+            git: GitConfig::default(),
+        };
+        shelbi_state::save_project(&project).unwrap();
+        std::fs::write(
+            shelbi_state::events_log_path().unwrap(),
+            format!(
+                "2026-07-13T12:00:00Z project={project_name} task=ready x -> review to_category=handoff\n"
+            ),
+        )
+        .unwrap();
+
+        let resolved = crate::orchestrator_pane_addr(&project_name)
+            .unwrap()
+            .expect("pinned orchestrator pane should resolve");
+        assert!(resolved.1.is_pane_id());
+        assert_eq!(resolved.1.target(), pane_id);
+
+        let mut state = CodexWakeState::default();
+        maybe_wake_codex(&project, &mut state);
+        assert!(state.woken_through > 0, "wake was not verified as submitted");
+        assert_eq!(std::fs::read_to_string(&receipt).unwrap().trim(), WAKE_PROMPT);
+
+        let woken_through = state.woken_through;
+        maybe_wake_codex(&project, &mut state);
+        assert_eq!(
+            state.woken_through, woken_through,
+            "the same durable position should not schedule a duplicate wake"
+        );
     }
 }

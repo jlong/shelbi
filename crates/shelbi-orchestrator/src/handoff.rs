@@ -126,8 +126,9 @@ fn handoff_request_message() -> String {
 
 /// `tmux has-session -t <name>` on the local server.
 fn local_session_exists(session: &str) -> Result<bool> {
+    let target = shelbi_tmux::session_target(session);
     let out = std::process::Command::new("tmux")
-        .args(["has-session", "-t", session])
+        .args(["has-session", "-t", &target])
         .output()
         .map_err(Error::Io)?;
     Ok(out.status.success())
@@ -137,8 +138,14 @@ fn local_session_exists(session: &str) -> Result<bool> {
 /// `None` when the var is unset (older session before
 /// `ensure_dashboard` pinned it) or empty.
 fn read_orch_pane_id(session: &str) -> Result<Option<String>> {
+    let target = shelbi_tmux::session_target(session);
     let out = std::process::Command::new("tmux")
-        .args(["show-environment", "-t", session, "SHELBI_PANE_orch"])
+        .args([
+            "show-environment",
+            "-t",
+            &target,
+            "SHELBI_PANE_orch",
+        ])
         .output()
         .map_err(Error::Io)?;
     if !out.status.success() {
