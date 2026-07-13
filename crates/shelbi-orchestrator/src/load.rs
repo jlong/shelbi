@@ -34,6 +34,10 @@ use crate::workspace::{start_workspace_on_task, StartSpec};
 /// rolled back if the dispatch fails, so a failed load never strands the card
 /// pinned to a workspace that isn't running.
 pub fn load_task_by_id(project_name: &str, task_id: &str) -> Result<String> {
+    // Review activation persists assignment/branch and starts a workspace.
+    // Both sidebar and palette converge here, so keep the mismatch guard at
+    // this shared boundary rather than relying on every UI surface to remember.
+    shelbi_state::ensure_daemon_matches_for_mutation()?;
     let project = shelbi_state::load_project(project_name)?;
     let mut tf = shelbi_state::load_task(project_name, task_id)?;
 

@@ -820,6 +820,12 @@ fn handle_zen_intro_then_toggle<B: ratatui::backend::Backend>(
 /// `zen_intro_seen = true` so the popover never re-fires — either
 /// choice acknowledges that the user has read the explanation.
 fn apply_zen_intro_result(project: &str, outcome: ZenIntroResult) -> Result<()> {
+    // Confirming will mutate project state. Gate before even the optional
+    // "don't show again" preference write so a rejected toggle is entirely
+    // side-effect free and can be retried after the daemon restart.
+    if outcome.confirmed {
+        shelbi_state::ensure_daemon_matches_for_mutation().map_err(|e| anyhow::anyhow!(e))?;
+    }
     if outcome.dont_show_again {
         // Best-effort — a write failure shouldn't block the toggle (the
         // popover re-firing once more is much milder than swallowing

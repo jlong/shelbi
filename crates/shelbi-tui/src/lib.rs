@@ -188,11 +188,8 @@ pub fn run_sidebar(project_name: &str) -> Result<()> {
 
     let mut term = setup_terminal().context("setting up terminal")?;
     let mut app = App::new_sidebar(project_name);
-    // One-shot daemon-version probe for the footer — a stale daemon left
-    // running across a binary upgrade gets flagged in red. Startup-only
-    // by design: the sidebar itself is respawned by `shelbi reload`, so
-    // its snapshot is as fresh as the binary it runs.
-    app.probe_daemon_version();
+    // `refresh` also probes daemon compatibility. Keeping that in the normal
+    // refresh path lets the footer clear itself after `shelbi daemon restart`.
     app.refresh().ok();
     if startup_warnings > 0 {
         app.status_line = startup_warnings_status_line(startup_warnings);

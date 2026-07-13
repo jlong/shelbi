@@ -241,8 +241,8 @@ fn notify_daemon_message_pushed(project: &str, task_id: &str, msg_id: &str) {
     // Wait (briefly) for the daemon's ack so the connection isn't torn
     // down while the daemon is still dispatching. Still best-effort: a
     // missing ack just means the timeout timer may not be armed, and the
-    // push itself is already durable on disk. The shared reader skips
-    // the version hello a post-handshake daemon sends first.
+    // push itself is already durable on disk. The shared reader also skips
+    // the briefly-shipped server-first hello for rolling compatibility.
     let _ = stream.set_read_timeout(Some(Duration::from_millis(500)));
     let _ = shelbi_state::read_daemon_ack(&stream);
 }

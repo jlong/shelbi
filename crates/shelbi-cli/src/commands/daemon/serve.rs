@@ -33,13 +33,14 @@
 //!
 //! ## Version handshake
 //!
-//! The daemon speaks first on every accepted connection: one
-//! [`shelbi_state::DaemonHello`] JSON line carrying the binary's semver
-//! and the socket protocol number, written before any read. The CLI
-//! probes this to detect a stale daemon left running across a binary
-//! upgrade (the shaft-project outage class). The daemon's version is
-//! also recorded in the PID file next to the PID so the mismatch is
-//! detectable from disk.
+//! A CLI probe opens an empty connection and half-closes its write side.
+//! EOF-before-any-frame is the hello request: the daemon replies with one
+//! [`shelbi_state::DaemonHello`] JSON line carrying its semver and socket
+//! protocol. Real event/message connections keep the legacy wire contract
+//! exactly, with `ok\n` as their first response only after dispatch. That
+//! client-first negotiation lets old pane wrappers survive a daemon restart
+//! without mistaking the hello for a failed delivery and duplicating events.
+//! The daemon's version is also recorded in the PID file next to the PID.
 //!
 //! ## Hardening
 //!
@@ -554,14 +555,12 @@ fn install_shutdown_listener(stop: Arc<AtomicBool>, sock: PathBuf) -> Result<()>
 /// dispatched independently so a bad line in the middle of a batch
 /// doesn't kill the rest. EOF closes the handler cleanly.
 ///
-/// **Version handshake:** the daemon speaks first — one
-/// [`shelbi_state::DaemonHello`] line carrying `CARGO_PKG_VERSION` and
-/// the socket protocol number is written before anything is read, so a
-/// connecting CLI can detect a stale daemon left running across a binary
-/// upgrade without sending a byte. Write errors are ignored like the ack
-/// writes below (the shutdown self-poke and liveness probes connect and
-/// immediately close). Shell clients are unaffected: `nc` prints the
-/// hello line followed by the usual `ok`.
+/// **Version handshake:** a dedicated probe sends no frame and half-closes
+/// its write side. When the first read returns EOF, the daemon replies with
+/// one [`shelbi_state::DaemonHello`] line and closes. A connection that sends
+/// any frame never receives that hello, preserving the pre-handshake client's
+/// exact post-dispatch `ok\n` response. Write errors are ignored because the
+/// shutdown self-poke and liveness probes also connect and immediately close.
 ///
 /// Two hardening properties on top of the dispatch loop:
 ///
@@ -582,10 +581,9 @@ fn install_shutdown_listener(stop: Arc<AtomicBool>, sock: PathBuf) -> Result<()>
 /// bytes from a hostile or confused client can't reach the operator's
 /// terminal through `tail -f` on the daemon log.
 fn handle_client(stream: UnixStream, daemon: &Daemon) {
-    let hello = shelbi_state::DaemonHello::new(env!("CARGO_PKG_VERSION"));
-    let _ = (&stream).write_all(hello.to_line().as_bytes());
     let mut reader = BufReader::new(&stream);
     let mut buf: Vec<u8> = Vec::with_capacity(256);
+    let mut saw_frame = false;
     loop {
         buf.clear();
         // `take` bounds this read: read_until returns at the newline,
@@ -603,8 +601,16 @@ fn handle_client(stream: UnixStream, daemon: &Daemon) {
             }
         };
         if n == 0 {
+            if !saw_frame {
+                // Empty, half-closed connection: explicit hello probe. This
+                // reply happens only after EOF, never ahead of a legacy event
+                // frame whose client expects `ok\n` as the first three bytes.
+                let hello = shelbi_state::DaemonHello::new(env!("CARGO_PKG_VERSION"));
+                let _ = (&stream).write_all(hello.to_line().as_bytes());
+            }
             break; // EOF
         }
+        saw_frame = true;
         let terminated = buf.last() == Some(&b'\n');
         if !terminated && n as u64 > MAX_FRAME_BYTES {
             eprintln!("shelbi daemon: frame exceeds {MAX_FRAME_BYTES} bytes; closing connection");
@@ -866,28 +872,18 @@ mod tests {
         }
     }
 
-    /// Split the daemon's version hello off the front of a captured
-    /// client-side byte stream: assert the first line is a well-formed
-    /// hello carrying this binary's version, and return the remainder
-    /// (the acks, if any).
-    fn strip_hello(bytes: &[u8]) -> &[u8] {
-        let nl = bytes
-            .iter()
-            .position(|&b| b == b'\n')
-            .unwrap_or_else(|| panic!("no hello line in {bytes:?}"));
-        let (first, rest) = bytes.split_at(nl + 1);
-        let hello = shelbi_state::DaemonHello::parse(std::str::from_utf8(first).unwrap())
-            .expect("first line must be the daemon hello");
+    fn assert_hello(bytes: &[u8]) {
+        let hello = shelbi_state::DaemonHello::parse(std::str::from_utf8(bytes).unwrap())
+            .expect("response must be the daemon hello");
         assert_eq!(hello.version, env!("CARGO_PKG_VERSION"));
         assert_eq!(hello.protocol, shelbi_state::HUB_PROTOCOL_VERSION);
-        rest
     }
 
-    /// The version handshake: the daemon speaks first. A client that
-    /// connects and sends nothing still receives the hello frame — this
-    /// is what lets the CLI probe a daemon's version without a write.
+    /// The version handshake uses an empty, half-closed connection as its
+    /// request. No ordinary client frame is present, so the only response is
+    /// the version/protocol hello.
     #[test]
-    fn hello_is_first_frame_on_every_connection() {
+    fn empty_half_closed_connection_returns_hello() {
         use std::net::Shutdown;
         let d = test_daemon();
         let (client, server) = UnixStream::pair().unwrap();
@@ -898,11 +894,7 @@ mod tests {
         (&client).read_to_end(&mut bytes).unwrap();
         handler.join().unwrap();
 
-        let rest = strip_hello(&bytes);
-        assert!(
-            rest.is_empty(),
-            "no ack without a dispatched line: {rest:?}"
-        );
+        assert_hello(&bytes);
     }
 
     #[test]
@@ -1241,10 +1233,12 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// F3 (ack half): a successfully dispatched event is acknowledged on
-    /// the same connection, and the event actually lands in events.log.
+    /// Rolling-upgrade regression: a pre-handshake client reads exactly the
+    /// first three response bytes and accepts only `ok\n`. A new daemon must
+    /// preserve that response so the already-recorded event is not retried and
+    /// then appended again through the degraded fallback.
     #[test]
-    fn handle_client_acks_processed_event() {
+    fn legacy_client_gets_bare_ack_and_pane_death_lands_once() {
         use std::net::Shutdown;
         let _iso = IsolatedShelbiHome::new("hc-ack");
         let d = test_daemon();
@@ -1252,17 +1246,28 @@ mod tests {
         let handler = thread::spawn(move || handle_client(server, &d));
 
         (&client)
-            .write_all(b"{\"verb\":\"event\",\"project\":\"shelbi\",\"line\":\"note=ack-me\"}\n")
+            .write_all(
+                b"{\"verb\":\"event\",\"project\":\"shelbi\",\"line\":\"project=shelbi workspace=bravo pane_alive=false reason=exit:0\"}\n",
+            )
             .unwrap();
         client.shutdown(Shutdown::Write).unwrap();
-        let mut bytes = Vec::new();
-        (&client).read_to_end(&mut bytes).unwrap();
-        let ack = strip_hello(&bytes);
-        assert_eq!(ack, shelbi_state::DAEMON_ACK, "ack: {ack:?}");
+        let mut ack = [0u8; 3];
+        (&client).read_exact(&mut ack).unwrap();
+        assert_eq!(&ack, shelbi_state::DAEMON_ACK, "legacy ack: {ack:?}");
+        let mut trailing = Vec::new();
+        (&client).read_to_end(&mut trailing).unwrap();
+        assert!(trailing.is_empty(), "legacy response grew: {trailing:?}");
         handler.join().unwrap();
 
         let log = std::fs::read_to_string(shelbi_state::events_log_path().unwrap()).unwrap();
-        assert!(log.contains("note=ack-me"), "log: {log}");
+        assert!(log.contains("workspace=bravo pane_alive=false"), "log: {log}");
+        assert_eq!(
+            log.lines()
+                .filter(|line| line.contains("workspace=bravo pane_alive=false"))
+                .count(),
+            1,
+            "pane-death event must be recorded exactly once: {log}"
+        );
     }
 
     /// F2: an over-limit (newline-free) frame is rejected, the buffer
@@ -1283,12 +1288,7 @@ mod tests {
         let _ = client.shutdown(Shutdown::Write);
         let mut bytes = Vec::new();
         let _ = (&client).read_to_end(&mut bytes);
-        // Only the version hello comes back — never an ack.
-        let ack = strip_hello(&bytes);
-        assert!(
-            ack.is_empty(),
-            "no ack for an oversized frame, got: {ack:?}"
-        );
+        assert!(bytes.is_empty(), "no response for oversized frame: {bytes:?}");
         handler.join().unwrap();
     }
 
@@ -1310,8 +1310,11 @@ mod tests {
         client.shutdown(Shutdown::Write).unwrap();
         let mut bytes = Vec::new();
         (&client).read_to_end(&mut bytes).unwrap();
-        let acks = strip_hello(&bytes);
-        assert_eq!(acks, shelbi_state::DAEMON_ACK, "exactly one ack: {acks:?}");
+        assert_eq!(
+            bytes,
+            shelbi_state::DAEMON_ACK,
+            "exactly one ack: {bytes:?}"
+        );
         handler.join().unwrap();
 
         let log = std::fs::read_to_string(shelbi_state::events_log_path().unwrap()).unwrap();
@@ -1346,14 +1349,18 @@ mod tests {
             .write_all(b"{\"verb\":\"event\",\"project\":\"shelbi\",\"line\":\"note=drained\"}\n")
             .unwrap();
         client.shutdown(Shutdown::Write).unwrap();
-        let mut bytes = Vec::new();
-        (&client).read_to_end(&mut bytes).unwrap();
-        let ack = strip_hello(&bytes);
-        assert_eq!(ack, shelbi_state::DAEMON_ACK, "ack: {ack:?}");
+        let mut ack = [0u8; 3];
+        (&client).read_exact(&mut ack).unwrap();
+        assert_eq!(&ack, shelbi_state::DAEMON_ACK, "legacy ack: {ack:?}");
         server.join().unwrap();
 
         let log = std::fs::read_to_string(shelbi_state::events_log_path().unwrap()).unwrap();
         assert!(log.contains("note=drained"), "log: {log}");
+        assert_eq!(
+            log.lines().filter(|line| line.contains("note=drained")).count(),
+            1,
+            "drained event must land exactly once: {log}"
+        );
         let _ = std::fs::remove_file(&sock);
     }
 }

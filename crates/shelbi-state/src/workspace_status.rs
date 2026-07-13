@@ -1071,8 +1071,9 @@ fn try_emit_via_socket(sock: &std::path::Path, body: &str) -> std::io::Result<()
     // open for the ack.
     let _ = stream.shutdown(std::net::Shutdown::Write);
     let _ = stream.set_read_timeout(Some(SOCKET_EMIT_ACK_TIMEOUT));
-    // A post-handshake daemon writes its version hello before the ack;
-    // the shared reader discards it so both daemon generations pass.
+    // Stable daemons answer event frames with a bare ack. The shared reader
+    // also tolerates the briefly-shipped server-first hello so upgrades can
+    // still communicate with and restart that interim daemon.
     crate::hub_version::read_daemon_ack(&stream)
 }
 

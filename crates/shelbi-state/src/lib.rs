@@ -63,7 +63,9 @@ pub use hub_config::{
     HubConfig, ProjectMeta, ProjectSummary,
 };
 pub use hub_version::{
-    probe_daemon_hello, read_daemon_ack, DaemonHello, DaemonProbe, HUB_PROTOCOL_VERSION,
+    classify_daemon_version, daemon_version_status, ensure_daemon_matches_for_mutation,
+    probe_daemon_hello, read_daemon_ack, DaemonHello, DaemonProbe, DaemonVersionStatus,
+    CLIENT_VERSION, HUB_PROTOCOL_VERSION,
 };
 pub use resolve::{
     cleanup_legacy_markers, project_roots, resolve_project_for_cwd, MarkerCleanup, ProjectRoot,
@@ -1416,6 +1418,7 @@ pub enum ZenCrashRecovery {
 /// [`zen_check_crash_recovery`] detect the crash. Writes only to
 /// `state.json` — keeps the events log clean.
 pub fn zen_heartbeat(project: &str) -> Result<()> {
+    hub_version::ensure_daemon_matches_for_mutation()?;
     update_state(project, |state| {
         state.zen_last_crashed_at = Some(Utc::now());
         Ok(())
@@ -1427,6 +1430,7 @@ pub fn zen_heartbeat(project: &str) -> Result<()> {
 /// a stale timestamp on disk that the next start would misread as a
 /// crash. Idempotent — a no-op when nothing is set.
 pub fn zen_clear_crash(project: &str) -> Result<()> {
+    hub_version::ensure_daemon_matches_for_mutation()?;
     update_state(project, |state| {
         state.zen_last_crashed_at = None;
         Ok(())
@@ -1440,6 +1444,7 @@ pub fn zen_clear_crash(project: &str) -> Result<()> {
 /// consumed once read — calling this a second time on the same disk
 /// state returns `NoCrash`.
 pub fn zen_check_crash_recovery(project: &str) -> Result<ZenCrashRecovery> {
+    hub_version::ensure_daemon_matches_for_mutation()?;
     update_state(project, |state| {
         let Some(crashed_at) = state.zen_last_crashed_at else {
             return Ok(ZenCrashRecovery::NoCrash);
@@ -1531,6 +1536,7 @@ pub fn update_state<R>(project: &str, f: impl FnOnce(&mut State) -> Result<R>) -
 /// the prior mode for callers that want to render a diff without a
 /// follow-up read.
 pub fn set_zen_mode(project: &str, target: ZenModeState, source: &str) -> Result<ZenModeState> {
+    hub_version::ensure_daemon_matches_for_mutation()?;
     let prev = update_state(project, |state| {
         let prev = state.zen_mode;
         state.zen_mode = target;
@@ -1594,6 +1600,7 @@ pub fn set_kanban_column_override(
 /// section (not read-then-`set_zen_mode`) so a concurrent mutator can't
 /// slip between the two and get its write flipped on a stale snapshot.
 pub fn toggle_zen_mode(project: &str, source: &str) -> Result<ZenModeState> {
+    hub_version::ensure_daemon_matches_for_mutation()?;
     let (prev, target) = update_state(project, |state| {
         let prev = state.zen_mode;
         let target = match prev {
@@ -2087,6 +2094,7 @@ pub fn move_task(
     id: &str,
     new_column: Column,
 ) -> Result<Option<(Column, Column, String)>> {
+    hub_version::ensure_daemon_matches_for_mutation()?;
     // The whole load → count → save → renumber sequence runs under the
     // task lock: two concurrent moves into one column would otherwise
     // both read the same `len()` and land on duplicate priorities.
@@ -2132,6 +2140,7 @@ pub fn move_task_and_unassign(
     id: &str,
     new_column: Column,
 ) -> Result<Option<(Column, Column, String)>> {
+    hub_version::ensure_daemon_matches_for_mutation()?;
     let _lock = lock_tasks(project)?;
     let TaskFile { mut task, body } = load_task(project, id)?;
     let old_column = task.column.clone();
@@ -2172,6 +2181,7 @@ pub fn move_task_and_unassign(
 /// column actually changed so the caller can append a move event, or `None`
 /// when nothing needed moving.
 pub fn release_task_to_todo(project: &str, id: &str) -> Result<Option<(Column, Column, String)>> {
+    hub_version::ensure_daemon_matches_for_mutation()?;
     let _lock = lock_tasks(project)?;
     let TaskFile { mut task, body } = load_task(project, id)?;
     let old_column = task.column.clone();
@@ -2205,6 +2215,7 @@ fn resolved_task_workflow_name_for_project(project: &str, task: &Task) -> Result
 /// Re-position `id` to slot `new_priority` within its current column. Other
 /// tasks shift to keep the column contiguous from 0.
 pub fn set_task_priority(project: &str, id: &str, new_priority: u32) -> Result<()> {
+    hub_version::ensure_daemon_matches_for_mutation()?;
     let _lock = lock_tasks(project)?;
     let target = load_task(project, id)?;
     let column = target.task.column;
@@ -2232,6 +2243,7 @@ pub fn set_task_priority(project: &str, id: &str, new_priority: u32) -> Result<(
 /// mtime bump) when the branch already matches, so re-running a dispatch on
 /// an already-branched task doesn't churn `updated_at`.
 pub fn set_task_branch(project: &str, id: &str, branch: &str) -> Result<()> {
+    hub_version::ensure_daemon_matches_for_mutation()?;
     let _lock = lock_tasks(project)?;
     let mut tf = load_task(project, id)?;
     if tf.task.branch.as_deref() == Some(branch) {

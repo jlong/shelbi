@@ -240,6 +240,11 @@ fn resolve_hub_cut_base(host: &Host, wt: &str, base: &str) -> Result<Option<Stri
 /// git refs stay in sync); callers translate the error into their own
 /// surface.
 pub fn ensure_branch_for_in_progress(project: &Project, task_id: &str) -> Result<TaskFile> {
+    // This function creates the git ref before persisting `branch:`, so the
+    // compatibility gate must precede both side effects. Callers also gate
+    // their surrounding transition, while this shared boundary protects any
+    // future CLI/TUI entry point.
+    shelbi_state::ensure_daemon_matches_for_mutation()?;
     let mut tf = shelbi_state::load_task(&project.name, task_id)?;
     let all_tasks = shelbi_state::list_tasks(&project.name)?;
     let workflow = shelbi_state::load_task_workflow(&project.name, project, &tf.task)

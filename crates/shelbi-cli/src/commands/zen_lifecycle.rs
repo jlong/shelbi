@@ -39,6 +39,10 @@ use shelbi_state::{
 /// re-checks; the hint itself is a one-shot stderr nudge that v2 will
 /// drop entirely.
 pub fn orch_start(project: &str) -> Result<()> {
+    // This internal hook can disable Zen and also updates its per-session
+    // migration latch. Refuse the whole mutation bundle before touching disk
+    // when the long-lived daemon belongs to another Shelbi build.
+    shelbi_state::ensure_daemon_matches_for_mutation().map_err(|e| anyhow!(e))?;
     // Best-effort: a write failure here doesn't change Zen-recovery
     // semantics, and the migration hint is purely advisory. We don't
     // want a state.json hiccup to kill the orchestrator pane on start.

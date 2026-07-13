@@ -179,18 +179,30 @@ fn run_poller_loop(project_name: String, shutdown: Arc<AtomicBool>) {
             }
         }
 
-        // Heartbeat is project-wide (one per project, not per workspace),
-        // so it lives on the supervisor rather than inside any per-workspace
-        // thread. The function is a no-op if heartbeat is off or not yet
-        // due, and debounces against any other events.log activity.
-        // `online_probe` is the connectivity gate: while the box is
-        // offline the heartbeat skips silently so the feed doesn't fill
-        // with no-op lines during a network drop.
-        maybe_emit_heartbeat(&project, &mut heartbeat, online_probe);
+        // Heartbeats and pane supervision both mutate hub state. Re-evaluate
+        // compatibility every tick so a stale-daemon period is read-only and
+        // the poller resumes automatically on the first tick after restart.
+        match shelbi_state::ensure_daemon_matches_for_mutation() {
+            Ok(()) => {
+                // Heartbeat is project-wide (one per project, not per workspace),
+                // so it lives on the supervisor rather than inside any per-workspace
+                // thread. The function is a no-op if heartbeat is off or not yet
+                // due, and debounces against any other events.log activity.
+                // `online_probe` is the connectivity gate: while the box is
+                // offline the heartbeat skips silently so the feed doesn't fill
+                // with no-op lines during a network drop.
+                maybe_emit_heartbeat(&project, &mut heartbeat, online_probe);
 
-        // Relaunch the orchestrator pane if it crashed (Zen stays off after
-        // the restart via its own `__zen-orch-start` crash-recovery step).
-        maybe_supervise_orchestrator(&project, &mut orch_supervision);
+                // Relaunch the orchestrator pane if it crashed (Zen stays off after
+                // the restart via its own `__zen-orch-start` crash-recovery step).
+                maybe_supervise_orchestrator(&project, &mut orch_supervision);
+            }
+            Err(e) => tracing::debug!(
+                project = %project.name,
+                error = %e,
+                "poller supervisor mutations paused for daemon mismatch",
+            ),
+        }
 
         // Supervisor cadence is fixed at 5s — independent of
         // `workspace_poll_interval_secs`, which governs each per-workspace
@@ -592,6 +604,19 @@ fn poll_one(
     last_dialog: &mut Option<String>,
     supervision: &mut SupervisionState,
 ) {
+    // Gate the whole tick before reading/consuming ready or transition
+    // markers. Under a mismatch those durable markers stay in place, and the
+    // next compatible tick applies each one once. This also covers workspace
+    // status writes, event appends, and pane supervision later in the tick.
+    if let Err(e) = shelbi_state::ensure_daemon_matches_for_mutation() {
+        tracing::debug!(
+            project = %project.name,
+            workspace = %workspace.name,
+            error = %e,
+            "poller mutations paused for daemon mismatch",
+        );
+        return;
+    }
     let Some(machine) = project.machine(&workspace.machine) else {
         return;
     };
@@ -1995,6 +2020,101 @@ mod tests {
         std::fs::create_dir_all(marker.parent().unwrap()).unwrap();
         std::fs::write(&marker, body).unwrap();
         marker
+    }
+
+    #[test]
+    fn poll_tick_preserves_markers_and_task_on_daemon_version_mismatch() {
+        use std::io::{Read, Write};
+        use std::os::unix::net::UnixListener;
+
+        let _g = crate::test_support::ENV_LOCK.lock().unwrap();
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let home = std::env::temp_dir().join(format!(
+            "shelbi-poller-version-mismatch-{}-{nonce}",
+            std::process::id(),
+        ));
+        std::fs::create_dir_all(&home).unwrap();
+        std::env::set_var("SHELBI_HOME", &home);
+
+        let work_dir = home.join("repo");
+        std::fs::create_dir_all(&work_dir).unwrap();
+        let project = local_project(&work_dir);
+        shelbi_state::save_task("demo", &in_progress_task("fix-login", "alpha"), "body").unwrap();
+
+        let ready_marker = write_marker(&project, "fix-login\n");
+        let transition_marker = shelbi_orchestrator::workspace::workspace_transition_marker(
+            &project.machines[0],
+            &project.workspaces[0],
+        );
+        std::fs::write(&transition_marker, "fix-login\nreview\n").unwrap();
+        let task_path = shelbi_state::task_path("demo", "fix-login").unwrap();
+        let task_before = std::fs::read(&task_path).unwrap();
+
+        // The probe protocol is an empty half-closed connection. Advertise a
+        // different workspace version so poll_one must return before reading
+        // either marker or reaching any tmux operation.
+        let sock = std::env::temp_dir().join(format!(
+            "shb-pm-{}-{nonce}.sock",
+            std::process::id(),
+        ));
+        let _ = std::fs::remove_file(&sock);
+        let listener = UnixListener::bind(&sock).unwrap();
+        std::env::set_var("SHELBI_HUB_SOCK", &sock);
+        let daemon = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = Vec::new();
+            stream.read_to_end(&mut request).unwrap();
+            assert!(request.is_empty(), "version probe must send no frame");
+            let daemon_version = if env!("CARGO_PKG_VERSION") == "0.0.0" {
+                "0.0.1"
+            } else {
+                "0.0.0"
+            };
+            stream
+                .write_all(
+                    shelbi_state::DaemonHello::new(daemon_version)
+                        .to_line()
+                        .as_bytes(),
+                )
+                .unwrap();
+        });
+
+        let mut last_known = None;
+        let mut last_dialog = None;
+        let mut supervision = SupervisionState::default();
+        poll_one(
+            &project,
+            &project.workspaces[0],
+            &mut last_known,
+            &mut last_dialog,
+            &mut supervision,
+        );
+        daemon.join().unwrap();
+
+        assert_eq!(
+            std::fs::read(&ready_marker).unwrap(),
+            b"fix-login\n",
+            "ready marker must survive the mismatched tick",
+        );
+        assert_eq!(
+            std::fs::read(&transition_marker).unwrap(),
+            b"fix-login\nreview\n",
+            "transition marker must survive the mismatched tick",
+        );
+        assert_eq!(
+            std::fs::read(&task_path).unwrap(),
+            task_before,
+            "task frontmatter and body must remain byte-for-byte unchanged",
+        );
+        assert!(last_known.is_none(), "workspace state must not be sampled");
+
+        std::env::remove_var("SHELBI_HUB_SOCK");
+        std::env::remove_var("SHELBI_HOME");
+        let _ = std::fs::remove_file(&sock);
+        let _ = std::fs::remove_dir_all(&home);
     }
 
     #[test]

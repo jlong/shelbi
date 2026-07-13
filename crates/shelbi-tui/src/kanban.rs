@@ -1286,6 +1286,12 @@ impl KanbanApp {
     }
 
     fn move_card(&mut self, id: &str, new_col_idx: usize) {
+        // Gate before the in-progress lifecycle can create a git branch. A
+        // stale daemon must leave both the board and repository untouched.
+        if let Err(e) = shelbi_state::ensure_daemon_matches_for_mutation() {
+            self.status_line = format!("move blocked: {e}");
+            return;
+        }
         // A task's position IS its status id, so the destination column's
         // status id is the move target verbatim — no lossy category round
         // trip. This is what lets a card land in `canceled` / any custom
@@ -1375,6 +1381,10 @@ impl KanbanApp {
         let Some(id) = self.selected_task().map(|tf| tf.task.id.clone()) else {
             return;
         };
+        if let Err(e) = shelbi_state::ensure_daemon_matches_for_mutation() {
+            self.status_line = format!("reorder blocked: {e}");
+            return;
+        }
         if let Err(e) = shelbi_state::set_task_priority(&self.project_name, &id, new_pos as u32) {
             self.status_line = format!("reorder failed: {e}");
             return;
@@ -2744,6 +2754,81 @@ fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
 mod tests {
     use super::*;
 
+    struct IsolatedKanbanEnv {
+        home: std::path::PathBuf,
+        socket: std::path::PathBuf,
+        previous_home: Option<std::ffi::OsString>,
+        previous_socket: Option<std::ffi::OsString>,
+    }
+
+    impl IsolatedKanbanEnv {
+        fn new(label: &str) -> Self {
+            let unique = format!(
+                "{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            );
+            let home = std::env::temp_dir().join(format!("shelbi-kanban-{label}-{unique}"));
+            // Keep this short: Unix-domain socket paths are capped at roughly
+            // 100 bytes on macOS.
+            let socket = std::env::temp_dir().join(format!("shb-kb-{unique}.sock"));
+            let previous_home = std::env::var_os("SHELBI_HOME");
+            let previous_socket = std::env::var_os("SHELBI_HUB_SOCK");
+
+            std::fs::create_dir_all(&home).unwrap();
+            let _ = std::fs::remove_file(&socket);
+            std::env::set_var("SHELBI_HOME", &home);
+            // The socket does not exist while fixtures are written, so the
+            // mutation guard correctly treats the daemon as not running.
+            std::env::set_var("SHELBI_HUB_SOCK", &socket);
+
+            Self {
+                home,
+                socket,
+                previous_home,
+                previous_socket,
+            }
+        }
+    }
+
+    impl Drop for IsolatedKanbanEnv {
+        fn drop(&mut self) {
+            match &self.previous_home {
+                Some(value) => std::env::set_var("SHELBI_HOME", value),
+                None => std::env::remove_var("SHELBI_HOME"),
+            }
+            match &self.previous_socket {
+                Some(value) => std::env::set_var("SHELBI_HUB_SOCK", value),
+                None => std::env::remove_var("SHELBI_HUB_SOCK"),
+            }
+            let _ = std::fs::remove_file(&self.socket);
+            let _ = std::fs::remove_dir_all(&self.home);
+        }
+    }
+
+    fn serve_mismatched_daemon_once(socket: &std::path::Path) -> std::thread::JoinHandle<()> {
+        use std::io::{Read, Write};
+        use std::net::Shutdown;
+        use std::os::unix::net::UnixListener;
+
+        let listener = UnixListener::bind(socket).unwrap();
+        let hello = shelbi_state::DaemonHello::new("0.1.0").to_line();
+        std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = Vec::new();
+            stream.read_to_end(&mut request).unwrap();
+            assert!(
+                request.is_empty(),
+                "version probe must be client-write-free"
+            );
+            stream.write_all(hello.as_bytes()).unwrap();
+            let _ = stream.shutdown(Shutdown::Both);
+        })
+    }
+
     fn hit(area: Rect, col_idx: usize, row_idx: usize) -> CardHit {
         CardHit {
             area,
@@ -2914,6 +2999,78 @@ mod tests {
         assert_eq!(app.selected_column, 2);
         assert_eq!(app.selected_row, 4);
         assert!(!app.popover_is_open());
+    }
+
+    #[test]
+    fn move_card_is_blocked_by_mismatched_daemon_without_mutating_task() {
+        let _g = crate::test_support::ENV_LOCK.lock().unwrap();
+        let env = IsolatedKanbanEnv::new("mismatch-move");
+        crate::test_support::provision_hub_repo_for_project(&env.home, "demo");
+
+        let task = task_file("fix-login", Column::todo(), 0, "2026-07-13T12:00:00Z");
+        shelbi_state::save_task("demo", &task.task, &task.body).unwrap();
+
+        let mut app = KanbanApp::new("demo");
+        app.refresh();
+        app.selected_column = 1;
+        app.selected_row = 0;
+
+        let server = serve_mismatched_daemon_once(&env.socket);
+        app.move_card_right();
+        server.join().unwrap();
+
+        let persisted = shelbi_state::load_task("demo", "fix-login").unwrap();
+        assert_eq!(persisted.task.column, Column::todo());
+        assert_eq!(persisted.task.priority, 0);
+        assert_eq!(persisted.task.branch, None);
+        assert!(
+            app.status_line.contains("shelbi daemon restart"),
+            "status: {}",
+            app.status_line
+        );
+        assert!(
+            app.status_line.contains("0.1.0"),
+            "status: {}",
+            app.status_line
+        );
+        assert!(!shelbi_state::events_log_path().unwrap().exists());
+    }
+
+    #[test]
+    fn reorder_is_blocked_by_mismatched_daemon_without_mutating_priorities() {
+        let _g = crate::test_support::ENV_LOCK.lock().unwrap();
+        let env = IsolatedKanbanEnv::new("mismatch-reorder");
+        crate::test_support::provision_hub_repo_for_project(&env.home, "demo");
+
+        let first = task_file("first", Column::todo(), 0, "2026-07-13T12:00:00Z");
+        let second = task_file("second", Column::todo(), 1, "2026-07-13T12:00:01Z");
+        shelbi_state::save_task("demo", &first.task, &first.body).unwrap();
+        shelbi_state::save_task("demo", &second.task, &second.body).unwrap();
+
+        let mut app = KanbanApp::new("demo");
+        app.refresh();
+        app.selected_column = 1;
+        app.selected_row = 0;
+
+        let server = serve_mismatched_daemon_once(&env.socket);
+        app.reorder_down();
+        server.join().unwrap();
+
+        let first = shelbi_state::load_task("demo", "first").unwrap();
+        let second = shelbi_state::load_task("demo", "second").unwrap();
+        assert_eq!(first.task.priority, 0);
+        assert_eq!(second.task.priority, 1);
+        assert_eq!(app.selected_row, 0);
+        assert!(
+            app.status_line.contains("shelbi daemon restart"),
+            "status: {}",
+            app.status_line
+        );
+        assert!(
+            app.status_line.contains("0.1.0"),
+            "status: {}",
+            app.status_line
+        );
     }
 
     /// Driving `move_card` should both persist the column change and append

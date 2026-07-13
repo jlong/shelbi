@@ -7,7 +7,7 @@
 //! `io: No such file or directory` failures on every status transition.
 //!
 //! This module turns that silent skew into an actionable signal, driven
-//! by the hello frame the daemon writes on every hub-socket connection
+//! by the hello frame returned on a dedicated empty probe connection
 //! (see `shelbi_state::probe_daemon_hello`):
 //!
 //! - **State-mutating commands** (`task move`, `task start`, `zen pr-*`,
@@ -25,7 +25,7 @@ use std::io::IsTerminal;
 use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
-use shelbi_state::{DaemonProbe, HUB_PROTOCOL_VERSION};
+pub use shelbi_state::DaemonVersionStatus;
 
 /// This binary's version — what the daemon's hello must equal exactly
 /// (daemon and CLI ship from the same workspace version; no range logic).
@@ -42,41 +42,9 @@ pub const ASSUME_YES_ENV: &str = "SHELBI_YES";
 /// tell the user to re-run.
 const RESTART_VERIFY_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// Outcome of comparing the daemon's advertised version against ours.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum DaemonVersionStatus {
-    /// Nothing is listening on the hub socket.
-    NotRunning,
-    /// Daemon and CLI agree on version and protocol.
-    Match { version: String },
-    /// The daemon is running a different build than this CLI. `daemon`
-    /// is a human-readable description of what it's running.
-    Mismatch { daemon: String },
-}
-
 /// Probe the hub socket and classify the daemon's version against ours.
 pub fn check() -> DaemonVersionStatus {
-    match shelbi_state::probe_daemon_hello() {
-        DaemonProbe::NotRunning => DaemonVersionStatus::NotRunning,
-        // A listener that sends no hello is a daemon from before the
-        // handshake existed — exactly the stale-daemon case, not an
-        // error loop.
-        DaemonProbe::NoHello => DaemonVersionStatus::Mismatch {
-            daemon: "an older version (predates the version handshake)".into(),
-        },
-        DaemonProbe::Hello(h) if h.protocol != HUB_PROTOCOL_VERSION => {
-            DaemonVersionStatus::Mismatch {
-                daemon: format!(
-                    "{} (socket protocol {}, this CLI speaks {})",
-                    h.version, h.protocol, HUB_PROTOCOL_VERSION
-                ),
-            }
-        }
-        DaemonProbe::Hello(h) if h.version != CLI_VERSION => {
-            DaemonVersionStatus::Mismatch { daemon: h.version }
-        }
-        DaemonProbe::Hello(h) => DaemonVersionStatus::Match { version: h.version },
-    }
+    shelbi_state::daemon_version_status()
 }
 
 /// Gate for state-mutating commands: on a version mismatch, either fix
@@ -193,7 +161,7 @@ fn busy_workspaces() -> usize {
 mod tests {
     use super::*;
     use crate::commands::test_support::{EnvGuard, ENV_LOCK};
-    use std::io::Write;
+    use std::io::{Read, Write};
     use std::os::unix::net::UnixListener;
 
     /// RAII: point `SHELBI_HUB_SOCK` at a path for the test's duration.
@@ -209,16 +177,17 @@ mod tests {
         std::path::PathBuf::from(format!("/tmp/shb-{tag}-{}.sock", std::process::id()))
     }
 
-    /// Serve exactly one connection, answering with `hello_line` (or
-    /// nothing when `None`, emulating a pre-handshake daemon).
+    /// Serve exactly one empty probe connection, answering with `hello_line`
+    /// (or closing without a response when `None`, like a pre-handshake daemon).
     fn serve_once(listener: UnixListener, hello_line: Option<String>) {
         std::thread::spawn(move || {
             if let Ok((mut s, _)) = listener.accept() {
-                match hello_line {
-                    Some(line) => {
+                let mut request = Vec::new();
+                let _ = s.read_to_end(&mut request);
+                if request.is_empty() {
+                    if let Some(line) = hello_line {
                         let _ = s.write_all(line.as_bytes());
                     }
-                    None => std::thread::sleep(Duration::from_millis(1500)),
                 }
             }
         });
@@ -281,7 +250,7 @@ mod tests {
         let listener = UnixListener::bind(&sock).unwrap();
         let _g = hub_sock_guard(&sock);
         let mut hello = shelbi_state::DaemonHello::new(CLI_VERSION);
-        hello.protocol = HUB_PROTOCOL_VERSION + 1;
+        hello.protocol = shelbi_state::HUB_PROTOCOL_VERSION + 1;
         serve_once(listener, Some(hello.to_line()));
         match check() {
             DaemonVersionStatus::Mismatch { daemon } => {
