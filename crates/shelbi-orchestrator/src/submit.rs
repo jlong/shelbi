@@ -196,6 +196,9 @@ pub enum SubmitStatus {
     /// explicit capability fallback, not proof that the worker consumed the
     /// message and not a reason to run Claude's retry heuristic.
     DeliveredUnverified { detail: &'static str },
+    /// The caller's live authorization guard changed after delivery but
+    /// before a retry Enter could submit text still parked in the input box.
+    EligibilityRevoked,
     /// No submit signal after the retry Enter, and the text is *visibly
     /// still parked* in the input box. On an idle pane this is a stuck
     /// delivery. A caller with strong evidence the pane was actively mid-turn
@@ -254,8 +257,27 @@ pub fn send_verified(
     text: &str,
     baseline: &PaneBaseline,
 ) -> Result<SubmitStatus> {
+    send_verified_guarded(host, addr, text, baseline, || true)
+}
+
+/// Guarded form of [`send_verified`] for lifecycle-sensitive injections.
+/// The guard is checked before delivery and again before the verifier's only
+/// retry Enter. This lets a caller revoke a stale task's authorization while
+/// retaining the shared text/settle/Enter and submission-verification path.
+pub fn send_verified_guarded(
+    host: &Host,
+    addr: &TmuxAddr,
+    text: &str,
+    baseline: &PaneBaseline,
+    may_submit: impl Fn() -> bool,
+) -> Result<SubmitStatus> {
+    if !may_submit() {
+        return Ok(SubmitStatus::EligibilityRevoked);
+    }
     deliver_text(host, addr, text)?;
-    Ok(verify_submitted(host, addr, text, baseline))
+    Ok(verify_submitted_guarded(
+        host, addr, text, baseline, may_submit,
+    ))
 }
 
 /// Wait for the text-submitted signal; if it doesn't arrive and the text is
@@ -277,6 +299,16 @@ pub fn verify_submitted(
     text: &str,
     baseline: &PaneBaseline,
 ) -> SubmitStatus {
+    verify_submitted_guarded(host, addr, text, baseline, || true)
+}
+
+fn verify_submitted_guarded(
+    host: &Host,
+    addr: &TmuxAddr,
+    text: &str,
+    baseline: &PaneBaseline,
+    may_submit: impl Fn() -> bool,
+) -> SubmitStatus {
     if !baseline.profile.has_ui_verifier() {
         return SubmitStatus::DeliveredUnverified {
             detail: "verification_unsupported",
@@ -287,12 +319,16 @@ pub fn verify_submitted(
         || wait_for_prompt_submitted(host, addr, text, baseline, PROMPT_SUBMIT_WAIT),
         || shelbi_tmux::capture(host, addr).unwrap_or_default(),
         || {
+            if !may_submit() {
+                return false;
+            }
             if let Err(e) = shelbi_tmux::send_enter(host, addr) {
                 eprintln!(
                     "shelbi: retry Enter to {} after stalled submit failed: {e}",
                     addr.target(),
                 );
             }
+            true
         },
     )
 }
@@ -304,7 +340,7 @@ fn verify_submitted_with(
     text: &str,
     mut wait_for_submit: impl FnMut() -> bool,
     mut capture: impl FnMut() -> String,
-    mut retry_enter: impl FnMut(),
+    mut retry_enter: impl FnMut() -> bool,
 ) -> SubmitStatus {
     if wait_for_submit() {
         return SubmitStatus::Submitted {
@@ -318,7 +354,9 @@ fn verify_submitted_with(
     if input_holds_unsubmitted_prompt(&capture(), text) {
         // First Enter likely raced claude's focus. Exactly one retry is
         // allowed; after that we surface StillInBox instead of spamming keys.
-        retry_enter();
+        if !retry_enter() {
+            return SubmitStatus::EligibilityRevoked;
+        }
         if wait_for_submit() {
             return SubmitStatus::Submitted {
                 detail: "retry_enter",
@@ -583,7 +621,7 @@ fn is_pasted_chip(line: &str) -> bool {
 /// large multi-line paste into a `[Pasted text …]` chip
 /// ([`input_holds_pasted_chip`]). Both mean Enter has not landed; the chip
 /// case is the one the auto-restart bug hit.
-fn input_holds_unsubmitted_prompt(screen: &str, text: &str) -> bool {
+pub fn input_holds_unsubmitted_prompt(screen: &str, text: &str) -> bool {
     input_holds_prompt(screen, text) || input_holds_pasted_chip(screen)
 }
 
@@ -642,7 +680,11 @@ fn claude_has_live_spinner(screen: &str) -> bool {
         return false;
     };
     let lines = screen.lines().collect::<Vec<_>>();
-    let Some(line) = lines[..top].iter().rev().find(|line| !line.trim().is_empty()) else {
+    let Some(line) = lines[..top]
+        .iter()
+        .rev()
+        .find(|line| !line.trim().is_empty())
+    else {
         return false;
     };
     let line = line.trim();
@@ -809,7 +851,10 @@ mod tests {
                 "idle pane note",
                 || true,
                 || panic!("confirmed delivery must not need a screen capture"),
-                || retries.set(retries.get() + 1),
+                || {
+                    retries.set(retries.get() + 1);
+                    true
+                },
             );
             assert_eq!(
                 status,
@@ -881,8 +926,7 @@ mod tests {
                 std::thread::sleep(std::time::Duration::from_millis(20));
             }
 
-            let baseline =
-                PaneBaseline::capture(&Host::Local, &addr, SubmitProfile::ClaudeUi);
+            let baseline = PaneBaseline::capture(&Host::Local, &addr, SubmitProfile::ClaudeUi);
             let result = send_verified(
                 &Host::Local,
                 &addr,
@@ -1018,8 +1062,7 @@ mod tests {
         );
 
         let wait_for_stops = |expected_stops: usize, label: &str, timeout_secs: u64| {
-            let deadline =
-                std::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
             while std::time::Instant::now() < deadline {
                 let stops = std::fs::read_to_string(tmp.path().join(".shelbi/live-idle.log"))
                     .unwrap_or_default()
@@ -1037,8 +1080,7 @@ mod tests {
         };
 
         for trial in 0..20 {
-            let baseline =
-                PaneBaseline::capture(&Host::Local, &addr, SubmitProfile::ClaudeUi);
+            let baseline = PaneBaseline::capture(&Host::Local, &addr, SubmitProfile::ClaudeUi);
             assert!(
                 !baseline.actively_busy,
                 "idle trial {trial} started from a busy pane"
@@ -1069,8 +1111,7 @@ mod tests {
 
         let busy_deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
         let busy_baseline = loop {
-            let candidate =
-                PaneBaseline::capture(&Host::Local, &addr, SubmitProfile::ClaudeUi);
+            let candidate = PaneBaseline::capture(&Host::Local, &addr, SubmitProfile::ClaudeUi);
             if candidate.actively_busy {
                 break candidate;
             }
@@ -1113,7 +1154,10 @@ mod tests {
             "retry tests",
             || waits.borrow_mut().pop_front().unwrap(),
             || visible_short_message("retry tests"),
-            || retries.set(retries.get() + 1),
+            || {
+                retries.set(retries.get() + 1);
+                true
+            },
         );
         assert_eq!(
             status,
@@ -1133,7 +1177,10 @@ mod tests {
             "retry tests",
             || waits.borrow_mut().pop_front().unwrap(),
             || visible_short_message("retry tests"),
-            || retries.set(retries.get() + 1),
+            || {
+                retries.set(retries.get() + 1);
+                true
+            },
         );
         assert_eq!(status, SubmitStatus::StillInBox);
         assert_eq!(retries.get(), 1, "retry must be bounded to one Enter");
@@ -1146,10 +1193,29 @@ mod tests {
             "retry tests",
             || false,
             || TRUST_DIALOG_SCREEN.to_string(),
-            || retries.set(retries.get() + 1),
+            || {
+                retries.set(retries.get() + 1);
+                true
+            },
         );
         assert_eq!(status, SubmitStatus::Unconfirmed);
         assert_eq!(retries.get(), 0);
+    }
+
+    #[test]
+    fn verifier_withholds_retry_when_authorization_is_revoked() {
+        let retries = Cell::new(0);
+        let status = verify_submitted_with(
+            "retry tests",
+            || false,
+            || visible_short_message("retry tests"),
+            || {
+                retries.set(retries.get() + 1);
+                false
+            },
+        );
+        assert_eq!(status, SubmitStatus::EligibilityRevoked);
+        assert_eq!(retries.get(), 1);
     }
 
     #[test]

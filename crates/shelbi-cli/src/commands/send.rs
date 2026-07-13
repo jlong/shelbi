@@ -141,11 +141,8 @@ pub(super) fn send_verified(
     // send and still has strong current-turn evidence at the final verdict.
     let finally_actively_busy = matches!(status, SubmitStatus::StillInBox)
         && PaneBaseline::capture(host, addr, profile).actively_busy;
-    let (event_status, detail, delivery) = classify_delivery(
-        status,
-        baseline.actively_busy,
-        finally_actively_busy,
-    );
+    let (event_status, detail, delivery) =
+        classify_delivery(status, baseline.actively_busy, finally_actively_busy);
     shelbi_state::append_send_event(project, id, event_status, detail).map_err(|e| anyhow!(e))?;
     delivery.ok_or_else(|| {
         anyhow!(
@@ -171,6 +168,7 @@ fn classify_delivery(
         SubmitStatus::DeliveredUnverified { detail } => {
             ("unverified", detail, Some(SendDelivery::Unverified))
         }
+        SubmitStatus::EligibilityRevoked => ("stuck", "eligibility_revoked", None),
         SubmitStatus::StillInBox if baseline_actively_busy && finally_actively_busy => (
             "queued",
             "busy_pane_visible_queue",
@@ -300,8 +298,8 @@ mod tests {
     use super::*;
     use crate::commands::test_support::{EnvGuard, ENV_LOCK};
     use shelbi_core::{
-        Agent, AgentRunnerSpec, GitConfig, HeartbeatConfig, Machine, MachineKind,
-        OrchestratorSpec, WorkspaceSpec, ZenConfig,
+        Agent, AgentRunnerSpec, GitConfig, HeartbeatConfig, Machine, MachineKind, OrchestratorSpec,
+        WorkspaceSpec, ZenConfig,
     };
     use std::collections::BTreeMap;
 

@@ -88,6 +88,15 @@ pub fn is_input_ready(screen: &str) -> bool {
     READY_MARKERS.iter().any(|m| screen.contains(m))
 }
 
+/// True when Claude's current footer says a turn is actively running. This is
+/// deliberately narrower than the dispatch verifier's scrollback heuristics:
+/// old `tokens)` text can remain above a genuine limit modal, while these
+/// interrupt/stop controls belong to the live busy footer the modal replaces.
+pub fn is_claude_busy(screen: &str) -> bool {
+    let lower = screen.to_ascii_lowercase();
+    lower.contains("esc to interrupt") || lower.contains("ctrl+c to stop")
+}
+
 /// True when the captured pane shows claude's "trust this folder" dialog.
 pub fn is_trust_dialog(screen: &str) -> bool {
     let s = screen.to_ascii_lowercase();
@@ -118,6 +127,10 @@ pub fn detect_blocking_dialog(
 /// pane when claude showed one.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UsageLimitStall {
+    /// The structurally paired current banner line. The poller uses this as a
+    /// stable incident key so stale visible modal text cannot re-arm a resume
+    /// after a confirmed submission or task lifecycle change.
+    pub banner: String,
     /// The reset-time hint (e.g. `3pm (America/New_York)`), or `None` when the
     /// pane showed no parseable reset wording. Folded into the `paused` event
     /// as-is; the auto-resume scheduler additionally tries to turn it into a
@@ -125,6 +138,12 @@ pub struct UsageLimitStall {
     /// warning when it can't.
     pub reset: Option<String>,
 }
+
+/// Maximum number of rendered lines that belong to one usage-limit modal,
+/// starting at its `You've hit ... limit` banner. The observed variants use
+/// four to six lines; the extra room tolerates wrapping without allowing an
+/// unrelated reset mention elsewhere in the pane to supply the schedule.
+const USAGE_LIMIT_MODAL_MAX_LINES: usize = 12;
 
 /// Detect whether a captured pane shows claude *actually stalled on its
 /// usage/session limit* — as opposed to merely containing the words "usage
@@ -163,41 +182,70 @@ pub struct UsageLimitStall {
 /// rather miss that than pause a healthy worker) for robustness against the
 /// false positive.
 ///
-/// As a final backstop we require the pane to *not* also show claude's live,
-/// ready input box (see [`is_input_ready`]). A genuine usage-limit modal
-/// replaces the input box, just as the trust dialog does; so if the ready
-/// footer is still on screen the pane is actively working — the textbook case
-/// being a worker *editing* usage-limit code/fixtures whose source embeds the
-/// modal text (menu glyphs and all) as a string literal. `capture` samples the
-/// visible screen only (no scrollback), so the footer's presence is a reliable
-/// "this pane is live, not stalled" signal.
+/// As a final backstop we require the pane to *not* also show Claude's live
+/// ready input box ([`is_input_ready`]) or active-turn footer
+/// ([`is_claude_busy`]). A genuine usage-limit modal replaces both. This
+/// rejects a worker editing a modal fixture and, after a confirmed resume, old
+/// modal pixels that remain visible above a current busy footer. `capture`
+/// samples the visible screen only (no scrollback), so those live controls are
+/// reliable "this pane is working, not stalled" signals.
 pub fn detect_usage_limit(screen: &str) -> Option<UsageLimitStall> {
     // A live, ready input box means the pane is working, not stalled on a
     // modal — so any usage-limit wording present is mere content.
-    if is_input_ready(screen) {
+    if is_input_ready(screen) || is_claude_busy(screen) {
         return None;
     }
-    let lower = screen.to_ascii_lowercase();
-    // The modal's limit wording must be present somewhere on screen. Cheap
-    // corroborating token that a prose/code mention of just the option text
-    // alone won't satisfy on its own. Claude words the banner either
-    // "usage limit" or "session limit" depending on which window tripped.
-    if !lower.contains("usage limit") && !lower.contains("session limit") {
-        return None;
-    }
-    // The actionable option must be rendered as an actual claude menu option,
-    // i.e. on a line that begins with menu chrome — never a bare substring.
-    let is_stall = screen.lines().any(|line| {
-        line.to_ascii_lowercase()
-            .contains("stop and wait for limit to reset")
-            && is_menu_option_line(line)
+    let lines: Vec<&str> = screen.lines().collect();
+
+    // Select the bottom-most *paired* modal, not independent occurrences of
+    // limit wording and menu chrome anywhere on screen. A visible pane can
+    // retain an earlier limit banner in conversation above the current one;
+    // parsing the full capture would schedule against that stale reset time.
+    // Bounding the suffix also prevents prose outside the rendered modal from
+    // donating a reset clause to a banner that has none.
+    let (banner, modal) = lines
+        .iter()
+        .enumerate()
+        .rev()
+        .filter(|(_, line)| is_usage_limit_banner_line(line))
+        .find_map(|(start, _)| {
+            let end = (start + USAGE_LIMIT_MODAL_MAX_LINES).min(lines.len());
+            let block = &lines[start..end];
+            block
+                .iter()
+                .any(|line| {
+                    line.to_ascii_lowercase()
+                        .contains("stop and wait for limit to reset")
+                        && is_menu_option_line(line)
+                })
+                .then_some((*lines.get(start)?, block))
+        })?;
+
+    // The session-limit variant carries `resets ...` inline on the banner.
+    // The usage-limit variant puts it on a dedicated `Your limit will reset
+    // ...` footer. Read only those structural locations: an unrelated line
+    // later in the bounded block must not donate a plausible-but-wrong time.
+    let reset = parse_usage_limit_reset(banner).or_else(|| {
+        modal
+            .iter()
+            .find(|line| line.to_ascii_lowercase().contains("your limit will reset"))
+            .and_then(|line| parse_usage_limit_reset(line))
     });
-    if !is_stall {
-        return None;
-    }
     Some(UsageLimitStall {
-        reset: parse_usage_limit_reset(screen),
+        banner: banner.trim().to_string(),
+        reset,
     })
+}
+
+/// True when `line` is claude's usage/session-limit banner. Requiring the
+/// complete banner wording is what ties reset extraction to the current
+/// rendered modal instead of a loose `usage limit` mention in conversation.
+fn is_usage_limit_banner_line(line: &str) -> bool {
+    let lower = line.to_ascii_lowercase();
+    lower.contains("you've hit your usage limit")
+        || lower.contains("you've hit your session limit")
+        || lower.contains("you’ve hit your usage limit")
+        || lower.contains("you’ve hit your session limit")
 }
 
 /// True when `line` is rendered as one of claude's interactive menu options —
@@ -215,21 +263,21 @@ fn is_menu_option_line(line: &str) -> bool {
     !digits.is_empty() && rest[digits.len()..].starts_with('.')
 }
 
-/// Best-effort extraction of the reset-time hint from a captured usage-limit
-/// pane, e.g. `Your limit will reset at 3pm (America/New_York)` →
+/// Best-effort extraction of the reset-time hint from a bounded usage-limit
+/// modal, e.g. `Your limit will reset at 3pm (America/New_York)` →
 /// `3pm (America/New_York)`, or `resets 10:30am` → `10:30am`. Returns `None`
 /// when no reset wording is present (claude doesn't always show one).
 ///
-/// Only meaningful once [`detect_usage_limit`] has confirmed the pane is on a
-/// real stall — outside that context a stray "reset" in scrollback would
-/// mis-parse. The captured value is advisory: it's folded into the `paused`
-/// event so an operator sees when the limit lifts, not parsed into a real
-/// timestamp.
-pub fn parse_usage_limit_reset(screen: &str) -> Option<String> {
+/// [`detect_usage_limit`] is responsible for selecting the current structural
+/// modal before calling this helper. Passing a whole pane capture directly is
+/// intentionally unsupported: stale conversation may contain an older reset
+/// clause. The captured value is folded into the `paused` event and parsed by
+/// [`next_reset_instant`] for scheduling.
+pub fn parse_usage_limit_reset(modal: &str) -> Option<String> {
     // `to_ascii_lowercase` preserves byte length, so an index found in the
     // lowered copy addresses the same byte in the original (case-preserved)
     // screen — we search lowered but slice the original.
-    let lower = screen.to_ascii_lowercase();
+    let lower = modal.to_ascii_lowercase();
     // Anchor on the reset-*time* wording. Deliberately NOT a bare "reset":
     // the modal's own option text ("Stop and wait for limit to reset") ends
     // in "reset", and anchoring there would capture the next menu option
@@ -239,7 +287,7 @@ pub fn parse_usage_limit_reset(screen: &str) -> Option<String> {
         .iter()
         .filter_map(|k| lower.find(k).map(|i| (i, k.len())))
         .min_by_key(|(i, _)| *i)?;
-    let rest = screen[idx + klen..].trim_start();
+    let rest = modal[idx + klen..].trim_start();
     // The reset clause ends at the first sentence break or newline.
     let end = rest.find(['\n', '.']).unwrap_or(rest.len());
     let captured: String = rest[..end].trim().chars().take(60).collect();
@@ -253,8 +301,11 @@ pub fn parse_usage_limit_reset(screen: &str) -> Option<String> {
 
 /// Turn a scraped reset hint (see [`parse_usage_limit_reset`]) into the
 /// concrete UTC instant the limit window resets, e.g.
-/// `7:20am (America/New_York)` observed at 06:00 UTC → today 11:20 UTC.
-/// This is what the poller's auto-resume schedules against.
+/// `7:20am (America/New_York)` first observed at 06:00 UTC → today 11:20
+/// UTC. This is what the poller's auto-resume schedules against. The
+/// reference instant must be when this stall was first observed (persisted
+/// across poller restarts), not the time a restarted poller happened to
+/// rebuild its in-memory schedule.
 ///
 /// Deliberately conservative — `None` means "don't guess" and the caller
 /// surfaces a needs-human warning instead of resuming at a wrong time:
@@ -265,23 +316,28 @@ pub fn parse_usage_limit_reset(screen: &str) -> Option<String> {
 ///   window must not be collapsed onto today's clock.
 /// - A parenthesized zone must be a recognizable IANA name
 ///   (`(America/New_York)`); anything else (`(ET)`) → `None` rather than
-///   silently reinterpreting the time in the hub's zone. No parens at all
-///   assumes the hub's local zone — claude prints the user's own timezone and
-///   the hub runs on the user's machine.
+///   silently reinterpreting the time in the hub's zone. No parens at all may
+///   use the hub's local zone only when `allow_local_implied` is true. Callers
+///   must pass false for remote panes, whose timezone may differ from the hub.
 ///
 /// The reset is the *next* occurrence of that wall time: today if still
-/// ahead, else tomorrow. As a backstop, a computed occurrence more than 23h
-/// out means the stated time passed just before `now` (a stall observed
-/// late — e.g. the hub was down over the window), so the window has already
-/// reset and we return `now`.
+/// ahead of `reference`, else tomorrow. A reset reconstructed after a poller
+/// restart may therefore be before the caller's current time, which correctly
+/// makes the persisted schedule immediately due. Ambiguous fall-back times
+/// choose the later occurrence (safe-late); nonexistent spring-forward times
+/// return `None` rather than guessing.
 pub fn next_reset_instant(
     hint: &str,
-    now: chrono::DateTime<chrono::Utc>,
+    reference: chrono::DateTime<chrono::Utc>,
+    allow_local_implied: bool,
 ) -> Option<chrono::DateTime<chrono::Utc>> {
     let time = parse_wall_time(hint)?;
     match parse_hint_zone(hint) {
-        HintZone::Named(tz) => next_occurrence(time, &tz, now),
-        HintZone::LocalImplied => next_occurrence(time, &chrono::Local, now),
+        HintZone::Named(tz) => next_occurrence(time, &tz, reference),
+        HintZone::LocalImplied if allow_local_implied => {
+            next_occurrence(time, &chrono::Local, reference)
+        }
+        HintZone::LocalImplied => None,
         HintZone::Unrecognized => None,
     }
 }
@@ -304,25 +360,51 @@ fn parse_hint_zone(hint: &str) -> HintZone {
     let Some(len) = hint[start + 1..].find(')') else {
         return HintZone::Unrecognized;
     };
+    let end = start + 1 + len;
+    if !hint[end + 1..].trim().is_empty() {
+        return HintZone::Unrecognized;
+    }
     match hint[start + 1..start + 1 + len].trim().parse() {
         Ok(tz) => HintZone::Named(tz),
         Err(_) => HintZone::Unrecognized,
     }
 }
 
-/// Parse the leading token of a reset hint as a wall-clock time: `7:20am`,
-/// `10:30pm`, `3pm`, `9:00`. Returns `None` for anything ambiguous — a bare
-/// number with neither meridiem nor colon, an out-of-range hour, or a token
-/// that isn't a time at all (`Jul`).
+/// Parse the complete pre-timezone phrase of a reset hint as a wall-clock
+/// time: `7:20am`, `7:20 PM`, `3pm`, `9:00`. Returns `None` for anything
+/// ambiguous, including a bare hour, an out-of-range value, or trailing date
+/// wording (`7:20am tomorrow`). Consuming the complete phrase is deliberate:
+/// silently ignoring a separated `PM` would schedule twelve hours early.
 fn parse_wall_time(hint: &str) -> Option<chrono::NaiveTime> {
-    let token = hint.split_whitespace().next()?.trim_matches(',');
-    let lower = token.to_ascii_lowercase();
-    let (digits, meridiem) = if let Some(d) = lower.strip_suffix("am") {
+    let clock_phrase = match hint.find('(') {
+        Some(start) => {
+            let close = hint[start + 1..].find(')')? + start + 1;
+            if !hint[close + 1..].trim().is_empty() {
+                return None;
+            }
+            hint[..start].trim().trim_end_matches(',').trim()
+        }
+        None => hint.trim().trim_end_matches(',').trim(),
+    };
+    let mut parts = clock_phrase.split_whitespace();
+    let clock = parts.next()?.trim_matches(',').to_ascii_lowercase();
+    let separate_meridiem = parts.next().map(str::to_ascii_lowercase);
+    if parts.next().is_some() {
+        return None;
+    }
+    let (digits, attached_meridiem) = if let Some(d) = clock.strip_suffix("am") {
         (d, Some(false))
-    } else if let Some(d) = lower.strip_suffix("pm") {
+    } else if let Some(d) = clock.strip_suffix("pm") {
         (d, Some(true))
     } else {
-        (lower.as_str(), None)
+        (clock.as_str(), None)
+    };
+    let meridiem = match (attached_meridiem, separate_meridiem.as_deref()) {
+        (Some(value), None) => Some(value),
+        (None, Some("am")) => Some(false),
+        (None, Some("pm")) => Some(true),
+        (None, None) => None,
+        _ => return None,
     };
     let (h_str, m_str) = digits.split_once(':').unwrap_or((digits, "0"));
     let hour: u32 = h_str.parse().ok()?;
@@ -340,29 +422,25 @@ fn parse_wall_time(hint: &str) -> Option<chrono::NaiveTime> {
     chrono::NaiveTime::from_hms_opt(hour, minute, 0)
 }
 
-/// The next occurrence of wall time `t` in zone `tz`, strictly after `now`,
-/// as a UTC instant. See [`next_reset_instant`] for the >23h backstop.
+/// The next occurrence of wall time `t` in zone `tz`, strictly after
+/// `reference`, as a UTC instant.
 fn next_occurrence<Tz: chrono::TimeZone>(
     t: chrono::NaiveTime,
     tz: &Tz,
-    now: chrono::DateTime<chrono::Utc>,
+    reference: chrono::DateTime<chrono::Utc>,
 ) -> Option<chrono::DateTime<chrono::Utc>> {
-    let today = now.with_timezone(tz).date_naive();
+    let today = reference.with_timezone(tz).date_naive();
     let mut candidate = resolve_local(tz, today, t)?;
-    if candidate <= now {
+    if candidate <= reference {
         candidate = resolve_local(tz, today.succ_opt()?, t)?;
-    }
-    if candidate.signed_duration_since(now) > chrono::Duration::hours(23) {
-        // The stated time passed within the last hour — the window already
-        // reset; scheduling for tomorrow would strand the worker a full day.
-        return Some(now);
     }
     Some(candidate)
 }
 
-/// Resolve a local date+time in `tz` to UTC, tolerating DST edges: an
-/// ambiguous time (fall-back hour) takes the earlier reading, a nonexistent
-/// time (spring-forward gap) slides one hour later.
+/// Resolve a local date+time in `tz` to UTC conservatively across DST edges:
+/// an ambiguous fall-back time takes the later reading so an auto-resume can
+/// be late but never an hour early; a nonexistent spring-forward time is
+/// rejected rather than shifted to a guessed instant.
 fn resolve_local<Tz: chrono::TimeZone>(
     tz: &Tz,
     date: chrono::NaiveDate,
@@ -371,11 +449,8 @@ fn resolve_local<Tz: chrono::TimeZone>(
     let naive = date.and_time(t);
     match tz.from_local_datetime(&naive) {
         chrono::LocalResult::Single(dt) => Some(dt.with_timezone(&chrono::Utc)),
-        chrono::LocalResult::Ambiguous(earlier, _) => Some(earlier.with_timezone(&chrono::Utc)),
-        chrono::LocalResult::None => tz
-            .from_local_datetime(&(naive + chrono::Duration::hours(1)))
-            .earliest()
-            .map(|dt| dt.with_timezone(&chrono::Utc)),
+        chrono::LocalResult::Ambiguous(_, later) => Some(later.with_timezone(&chrono::Utc)),
+        chrono::LocalResult::None => None,
     }
 }
 
@@ -531,6 +606,16 @@ mod tests {
     }
 
     #[test]
+    fn detect_usage_limit_ignores_stale_modal_pixels_above_live_busy_footer() {
+        let resumed = format!("{SESSION_LIMIT_MODAL_SCREEN}\n\n· Working…\n  esc to interrupt");
+        assert!(is_claude_busy(&resumed));
+        assert!(
+            detect_usage_limit(&resumed).is_none(),
+            "a current busy footer means the old modal is no longer blocking"
+        );
+    }
+
+    #[test]
     fn is_menu_option_line_requires_menu_chrome() {
         assert!(is_menu_option_line(
             " ❯ 1. Stop and wait for limit to reset"
@@ -587,66 +672,145 @@ mod tests {
     }
 
     #[test]
+    fn detect_usage_limit_parses_only_the_bottom_most_structural_modal() {
+        // A pane can retain the previous limit incident above the current
+        // modal. The old implementation searched the whole capture and took
+        // the earliest `reset(s)` clause, scheduling this pane for 3pm even
+        // though the live modal says 7:20am.
+        let screen = format!(
+            "{USAGE_LIMIT_MODAL_SCREEN}\n\nLimit reset; work continued.\n\n{SESSION_LIMIT_MODAL_SCREEN}"
+        );
+        let stall = detect_usage_limit(&screen).expect("current modal must detect");
+        assert_eq!(stall.reset.as_deref(), Some("7:20am (America/New_York)"));
+    }
+
+    #[test]
+    fn detect_usage_limit_does_not_borrow_reset_from_an_earlier_modal() {
+        let current_without_reset = "\
+⏱ You've hit your session limit
+
+ ❯ 1. Stop and wait for limit to reset
+   2. Upgrade your plan
+
+ unrelated build cache resets 9:45am (America/New_York)";
+        let screen = format!("{USAGE_LIMIT_MODAL_SCREEN}\n\n{current_without_reset}");
+        let stall = detect_usage_limit(&screen).expect("current modal must detect");
+        assert_eq!(stall.reset, None);
+        assert!(stall.banner.contains("session limit"));
+    }
+
+    #[test]
     fn parse_wall_time_accepts_clock_forms_and_rejects_ambiguity() {
         let t = |h, m| chrono::NaiveTime::from_hms_opt(h, m, 0).unwrap();
         assert_eq!(parse_wall_time("7:20am (America/New_York)"), Some(t(7, 20)));
         assert_eq!(parse_wall_time("10:30pm"), Some(t(22, 30)));
         assert_eq!(parse_wall_time("3pm (America/New_York)"), Some(t(15, 0)));
+        assert_eq!(
+            parse_wall_time("7:20 PM (America/New_York)"),
+            Some(t(19, 20)),
+            "a separated meridiem must not be discarded"
+        );
         assert_eq!(parse_wall_time("9:00"), Some(t(9, 0)));
         assert_eq!(parse_wall_time("12am"), Some(t(0, 0)));
         assert_eq!(parse_wall_time("12pm"), Some(t(12, 0)));
         // Ambiguous / not-a-time forms must not guess.
         assert_eq!(parse_wall_time("3"), None, "bare hour is ambiguous");
         assert_eq!(parse_wall_time("Jul 15 at 3am"), None, "date-first wording");
+        assert_eq!(
+            parse_wall_time("7:20am tomorrow (America/New_York)"),
+            None,
+            "date qualifiers are ambiguous"
+        );
+        assert_eq!(
+            parse_wall_time("7:20am (America/New_York) on Jul 15"),
+            None,
+            "trailing wording after the timezone must not be ignored"
+        );
         assert_eq!(parse_wall_time("19pm"), None, "out-of-range 12h hour");
         assert_eq!(parse_wall_time(""), None);
     }
 
     #[test]
-    fn next_reset_instant_schedules_todays_or_tomorrows_occurrence() {
+    fn next_reset_instant_schedules_the_occurrence_after_the_stall_reference() {
         use chrono::{TimeZone, Utc};
         // 02:28 UTC on 2026-07-11 == 22:28 EDT on 2026-07-10. The observed
         // incident: reset "2:20am (America/New_York)" == 06:20 UTC, later
         // today — the very stall this feature exists for.
-        let now = Utc.with_ymd_and_hms(2026, 7, 11, 2, 28, 0).unwrap();
+        let stalled_at = Utc.with_ymd_and_hms(2026, 7, 11, 2, 28, 0).unwrap();
         assert_eq!(
-            next_reset_instant("2:20am (America/New_York)", now),
+            next_reset_instant("2:20am (America/New_York)", stalled_at, false),
             Some(Utc.with_ymd_and_hms(2026, 7, 11, 6, 20, 0).unwrap()),
         );
-        // A wall time well past in the banner's zone rolls to tomorrow —
-        // 8pm EDT was 2.5h before `now`, outside the just-passed backstop.
+        // 8pm EDT was before the first observation, so this banner denotes
+        // the following day's occurrence.
         assert_eq!(
-            next_reset_instant("8pm (America/New_York)", now),
+            next_reset_instant("8pm (America/New_York)", stalled_at, false),
             Some(Utc.with_ymd_and_hms(2026, 7, 12, 0, 0, 0).unwrap()),
         );
     }
 
     #[test]
-    fn next_reset_instant_treats_a_just_passed_time_as_already_reset() {
+    fn next_reset_instant_restart_recovery_uses_the_original_stall_reference() {
         use chrono::{TimeZone, Utc};
-        // Stall observed 10 minutes AFTER the stated reset (hub was down over
-        // the window): the naive "next occurrence" is ~23h50m out, which
-        // would strand the worker a full day. The backstop resumes now.
-        let now = Utc.with_ymd_and_hms(2026, 7, 11, 6, 30, 0).unwrap();
+        let stalled_at = Utc.with_ymd_and_hms(2026, 7, 11, 2, 28, 0).unwrap();
+        let restarted_at = Utc.with_ymd_and_hms(2026, 7, 11, 10, 30, 0).unwrap();
+
+        // Rebuilding more than four hours after reset still reconstructs the
+        // original 06:20 due time. The caller sees it is before `restarted_at`
+        // and attempts immediately instead of deferring until tomorrow.
+        let reset = next_reset_instant("2:20am (America/New_York)", stalled_at, false)
+            .expect("explicit-zone reset must parse");
+        assert_eq!(reset, Utc.with_ymd_and_hms(2026, 7, 11, 6, 20, 0).unwrap());
+        assert!(reset < restarted_at);
+    }
+
+    #[test]
+    fn next_reset_instant_applies_explicit_local_implied_policy() {
+        use chrono::{TimeZone, Utc};
+        let reference = Utc.with_ymd_and_hms(2026, 7, 11, 2, 28, 0).unwrap();
+        // Parens naming a zone we can't resolve: reinterpreting the time in
+        // the hub's zone could resume mid-window — refuse instead.
+        assert_eq!(next_reset_instant("7:20am (ET)", reference, true), None);
+        // Unparseable time with a good zone: same refusal.
         assert_eq!(
-            next_reset_instant("2:20am (America/New_York)", now),
-            Some(now),
+            next_reset_instant("soon (America/New_York)", reference, true),
+            None
+        );
+        // A local pane may explicitly opt into the hub's local timezone.
+        let local = next_reset_instant("7:20am", reference, true)
+            .expect("local-implied time must parse when allowed");
+        assert!(
+            local > reference && local <= reference + chrono::Duration::hours(25),
+            "local occurrence: {local}"
+        );
+        // A remote pane must refuse the same zone-less hint: the remote and
+        // hub timezones are not assumed to match.
+        assert_eq!(next_reset_instant("7:20am", reference, false), None);
+    }
+
+    #[test]
+    fn next_reset_instant_chooses_the_later_fall_back_occurrence() {
+        use chrono::{TimeZone, Utc};
+        // America/New_York repeats 01:30 on 2026-11-01: 05:30 UTC (EDT), then
+        // 06:30 UTC (EST). Safe scheduling takes the later occurrence so it
+        // can never resume an hour before the intended reset.
+        let reference = Utc.with_ymd_and_hms(2026, 11, 1, 4, 0, 0).unwrap();
+        assert_eq!(
+            next_reset_instant("1:30am (America/New_York)", reference, false),
+            Some(Utc.with_ymd_and_hms(2026, 11, 1, 6, 30, 0).unwrap()),
         );
     }
 
     #[test]
-    fn next_reset_instant_never_guesses_an_unrecognized_zone() {
+    fn next_reset_instant_rejects_a_nonexistent_spring_forward_time() {
         use chrono::{TimeZone, Utc};
-        let now = Utc.with_ymd_and_hms(2026, 7, 11, 2, 28, 0).unwrap();
-        // Parens naming a zone we can't resolve: reinterpreting the time in
-        // the hub's zone could resume mid-window — refuse instead.
-        assert_eq!(next_reset_instant("7:20am (ET)", now), None);
-        // Unparseable time with a good zone: same refusal.
-        assert_eq!(next_reset_instant("soon (America/New_York)", now), None);
-        // No parens at all: claude printed a bare time in the user's own
-        // zone, and the hub runs on the user's machine — local is implied.
-        let local = next_reset_instant("7:20am", now).expect("local-implied time must parse");
-        assert!(local > now && local <= now + chrono::Duration::hours(24));
+        // 02:30 never occurs in America/New_York on 2026-03-08. Shifting it
+        // to an invented 03:30 reset would be a wrong-time auto-resume.
+        let reference = Utc.with_ymd_and_hms(2026, 3, 8, 5, 0, 0).unwrap();
+        assert_eq!(
+            next_reset_instant("2:30am (America/New_York)", reference, false),
+            None,
+        );
     }
 
     #[test]
