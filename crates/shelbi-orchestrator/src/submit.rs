@@ -107,6 +107,30 @@ const PROMPT_SUBMIT_SCROLLBACK: usize = 200;
 /// paste so the Enter arrives as an unambiguous, separate keypress.
 const SUBMIT_SETTLE: std::time::Duration = std::time::Duration::from_millis(300);
 
+/// Codex rotates these dim placeholders while its textarea is empty. Plain
+/// tmux capture loses that styling, so autonomous wake eligibility also
+/// requires the empty-composer-only shortcuts footer; either signal by itself
+/// is ambiguous and must defer delivery. Keep the former single placeholder
+/// for compatibility with older Codex versions still used by some projects.
+const CODEX_EMPTY_COMPOSER_PLACEHOLDERS: &[&str] = &[
+    "Explain this codebase",
+    "Summarize recent commits",
+    "Implement {feature}",
+    "Find and fix a bug in @filename",
+    "Write tests for @filename",
+    "Improve documentation in @filename",
+    "Run /review on my current changes",
+    "Use /skills to list available skills",
+    "Ask Codex to do anything",
+];
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CodexComposerState {
+    Empty,
+    Occupied,
+    Unknown,
+}
+
 /// What the pane looked like BEFORE this delivery — captured so submit
 /// signals that were already true can't be mistaken for proof that THIS
 /// text landed.
@@ -130,6 +154,9 @@ pub struct PaneBaseline {
     /// title keeps the marker from ITS current turn, so seeing it after our
     /// delivery proves nothing; verification then leans on the input box.
     pub title_working: bool,
+    /// Conservative reading of Codex's live composer. Capture failure and UI
+    /// shapes that do not positively identify an empty textarea stay Unknown.
+    codex_composer: CodexComposerState,
 }
 
 impl PaneBaseline {
@@ -146,15 +173,27 @@ impl PaneBaseline {
         }
         let screen =
             shelbi_tmux::capture_history(host, addr, PROMPT_SUBMIT_SCROLLBACK).unwrap_or_default();
-        let visible_screen = shelbi_tmux::capture(host, addr).unwrap_or_default();
+        // Preserve failure separately from a successful empty capture. Wake
+        // injection may never interpret an unavailable composer as empty.
+        let visible_screen = shelbi_tmux::capture(host, addr).ok();
         let title = shelbi_tmux::pane_title(host, addr).unwrap_or_default();
-        Self::from_snapshots(profile, &screen, &visible_screen, &title)
+        Self::from_capture(profile, &screen, visible_screen.as_deref(), &title)
     }
 
+    #[cfg(test)]
     fn from_snapshots(
         profile: SubmitProfile,
         screen: &str,
         visible_screen: &str,
+        title: &str,
+    ) -> Self {
+        Self::from_capture(profile, screen, Some(visible_screen), title)
+    }
+
+    fn from_capture(
+        profile: SubmitProfile,
+        screen: &str,
+        visible_screen: Option<&str>,
         title: &str,
     ) -> Self {
         if !profile.has_ui_verifier() {
@@ -163,8 +202,10 @@ impl PaneBaseline {
                 busy: false,
                 actively_busy: false,
                 title_working: false,
+                codex_composer: CodexComposerState::Unknown,
             };
         }
+        let visible = visible_screen.unwrap_or_default();
         let title_working = profile == SubmitProfile::ClaudeUi
             && matches!(
                 shelbi_state::parse_pane_title_marker(title),
@@ -173,12 +214,9 @@ impl PaneBaseline {
         let (busy, actively_busy) = match profile {
             SubmitProfile::ClaudeUi => (
                 claude_is_processing(screen),
-                title_working || claude_is_actively_processing(visible_screen),
+                title_working || claude_is_actively_processing(visible),
             ),
-            SubmitProfile::CodexUi => (
-                codex_is_processing(screen),
-                codex_is_processing(visible_screen),
-            ),
+            SubmitProfile::CodexUi => (codex_is_processing(screen), codex_is_processing(visible)),
             SubmitProfile::DeliveryOnly => (false, false),
         };
         PaneBaseline {
@@ -186,6 +224,11 @@ impl PaneBaseline {
             busy,
             actively_busy,
             title_working,
+            codex_composer: if profile == SubmitProfile::CodexUi {
+                codex_composer_state(visible_screen)
+            } else {
+                CodexComposerState::Unknown
+            },
         }
     }
 
@@ -199,6 +242,7 @@ impl PaneBaseline {
             busy: false,
             actively_busy: false,
             title_working: false,
+            codex_composer: CodexComposerState::Unknown,
         }
     }
 
@@ -206,6 +250,14 @@ impl PaneBaseline {
     /// Wake schedulers use this to defer delivery until the pane is idle.
     pub fn is_actively_busy(&self) -> bool {
         self.actively_busy
+    }
+
+    /// Only a positively identified empty, idle Codex composer may receive an
+    /// autonomous board wake. Unknown is deliberately not equivalent to idle.
+    pub(crate) fn is_codex_wake_ready(&self) -> bool {
+        self.profile == SubmitProfile::CodexUi
+            && self.codex_composer == CodexComposerState::Empty
+            && !self.actively_busy
     }
 }
 
@@ -296,13 +348,42 @@ pub fn send_verified_guarded(
     baseline: &PaneBaseline,
     may_submit: impl Fn() -> bool,
 ) -> Result<SubmitStatus> {
-    if !may_submit() {
+    let may_submit = &may_submit;
+    send_verified_guarded_with_guards(host, addr, text, baseline, may_submit, may_submit)
+}
+
+/// Guarded submit with distinct authorization for the first delivery and the
+/// verifier's retry Enter. Autonomous wake delivery requires an empty composer
+/// immediately before typing, but after Shelbi types its own prompt the
+/// composer is intentionally occupied; reusing that empty-composer predicate
+/// for the retry would revoke every legitimate dropped-Enter recovery.
+pub(crate) fn send_verified_guarded_with_guards(
+    host: &Host,
+    addr: &TmuxAddr,
+    text: &str,
+    baseline: &PaneBaseline,
+    may_deliver: impl Fn() -> bool,
+    may_retry_enter: impl Fn() -> bool,
+) -> Result<SubmitStatus> {
+    guarded_delivery_with(
+        may_deliver,
+        || deliver_text(host, addr, text),
+        || verify_submitted_guarded(host, addr, text, baseline, may_retry_enter),
+    )
+}
+
+/// Testable boundary around the final pre-delivery authorization check. A
+/// false guard must return before either the text or its Enter can touch tmux.
+fn guarded_delivery_with(
+    may_deliver: impl FnOnce() -> bool,
+    deliver: impl FnOnce() -> Result<()>,
+    verify: impl FnOnce() -> SubmitStatus,
+) -> Result<SubmitStatus> {
+    if !may_deliver() {
         return Ok(SubmitStatus::EligibilityRevoked);
     }
-    deliver_text(host, addr, text)?;
-    Ok(verify_submitted_guarded(
-        host, addr, text, baseline, may_submit,
-    ))
+    deliver()?;
+    Ok(verify())
 }
 
 /// Wait for the text-submitted signal; if it doesn't arrive and the text is
@@ -711,15 +792,165 @@ fn profile_input_box_cleared(screen: &str, text: &str, profile: SubmitProfile) -
     }
 }
 
+/// Capture the minimum live Codex UI needed by the last-moment autonomous
+/// wake guard. Failure is unsafe: unlike submit verification, this path may
+/// not degrade an unavailable capture into an apparently empty composer.
+pub(crate) fn codex_wake_ready(host: &Host, addr: &TmuxAddr) -> bool {
+    shelbi_tmux::capture(host, addr)
+        .ok()
+        .is_some_and(|screen| codex_screen_wake_ready(&screen))
+}
+
+fn codex_screen_wake_ready(screen: &str) -> bool {
+    !codex_is_processing(screen) && codex_composer_state(Some(screen)) == CodexComposerState::Empty
+}
+
+/// Wake-specific authorization for the verifier's one retry Enter. The first
+/// Enter may have been dropped after Shelbi typed the wake, so the composer is
+/// expected to be occupied here. Retry only when a fresh successful capture
+/// shows exactly Shelbi's prompt and no active turn; appended user text,
+/// partial/ambiguous UI, and capture failure all revoke the keypress.
+pub(crate) fn codex_wake_retry_ready(host: &Host, addr: &TmuxAddr, text: &str) -> bool {
+    let screen = shelbi_tmux::capture(host, addr).ok();
+    codex_wake_retry_ready_from_capture(screen.as_deref(), text)
+}
+
+fn codex_wake_retry_ready_from_capture(screen: Option<&str>, text: &str) -> bool {
+    let Some(screen) = screen else {
+        return false;
+    };
+    if codex_is_processing(screen) {
+        return false;
+    }
+    let Some(line) = codex_wake_retry_composer_line(screen) else {
+        return false;
+    };
+    let line = squeeze_ws(line);
+    let text = squeeze_ws(text);
+    !text.is_empty() && line == text
+}
+
+/// Locate an unchanged single-row wake in Codex's live draft composer. The
+/// normal draft-mode context footer anchors the region; a matching history row
+/// under a modal is not enough. Requiring every row between the prompt and
+/// footer to be blank also rejects hard-newline user text and attachments.
+fn codex_wake_retry_composer_line(screen: &str) -> Option<&str> {
+    const TAIL_LINES: usize = 8;
+
+    let lines = screen.lines().collect::<Vec<_>>();
+    let visible_end = lines
+        .iter()
+        .rposition(|line| !line.trim().is_empty())
+        .map(|index| index + 1)?;
+    let footer = visible_end.checked_sub(1)?;
+    let footer_lower = lines[footer].to_ascii_lowercase();
+    if !(footer_lower.contains("context left") || footer_lower.contains("context used")) {
+        return None;
+    }
+
+    let tail_start = visible_end.saturating_sub(TAIL_LINES);
+    let candidates = (tail_start..footer)
+        .filter_map(|index| codex_composer_line(lines[index]).map(|line| (index, line)))
+        .collect::<Vec<_>>();
+    let [(composer, line)] = candidates.as_slice() else {
+        return None;
+    };
+    if lines[composer + 1..footer]
+        .iter()
+        .any(|line| !line.trim().is_empty())
+    {
+        return None;
+    }
+    Some(line)
+}
+
+/// Read the live Codex composer conservatively from a plain tmux capture.
+///
+/// Codex's placeholder is dim only while its textarea is empty, but ordinary
+/// capture strips that style. Its `? for shortcuts` footer supplies a second,
+/// semantic signal: Codex shows that hint in its empty-composer mode and hides
+/// it once a draft exists. We require both in the bottom UI region. A bare
+/// prompt glyph, a placeholder without the footer, multiple candidate rows,
+/// a missing composer, or capture failure is Unknown rather than Empty.
+fn codex_composer_state(screen: Option<&str>) -> CodexComposerState {
+    const TAIL_LINES: usize = 8;
+    const COMPOSER_ROWS_BEFORE_FOOTER: usize = 4;
+
+    let Some(screen) = screen else {
+        return CodexComposerState::Unknown;
+    };
+    let lines = screen.lines().collect::<Vec<_>>();
+    let Some(visible_end) = lines
+        .iter()
+        .rposition(|line| !line.trim().is_empty())
+        .map(|index| index + 1)
+    else {
+        return CodexComposerState::Unknown;
+    };
+    let tail_start = visible_end.saturating_sub(TAIL_LINES);
+    // The footer must be the last non-empty row. If a dialog or popup is
+    // rendered below it, the underlying composer is not the live input target.
+    let footer = visible_end
+        .checked_sub(1)
+        .filter(|index| lines[*index].contains("? for shortcuts"));
+
+    if let Some(footer) = footer {
+        let composer_start = footer
+            .saturating_sub(COMPOSER_ROWS_BEFORE_FOOTER)
+            .max(tail_start);
+        let candidates = (composer_start..footer)
+            .filter_map(|index| codex_composer_line(lines[index]).map(|line| (index, line)))
+            .collect::<Vec<_>>();
+        if candidates.len() != 1 {
+            return CodexComposerState::Unknown;
+        }
+        let text = candidates[0].1.trim();
+        return if codex_is_empty_composer_placeholder(text) {
+            CodexComposerState::Empty
+        } else if text.is_empty() {
+            CodexComposerState::Unknown
+        } else {
+            CodexComposerState::Occupied
+        };
+    }
+
+    // Without the empty-mode footer, a non-empty row is still positive
+    // evidence of a draft. The placeholder or a bare glyph alone is
+    // ambiguous, because capture may have missed or truncated the footer.
+    let candidate = lines[tail_start..visible_end]
+        .iter()
+        .rev()
+        .find_map(|line| codex_composer_line(line));
+    match candidate.map(str::trim) {
+        Some(text) if !text.is_empty() && !codex_is_empty_composer_placeholder(text) => {
+            CodexComposerState::Occupied
+        }
+        _ => CodexComposerState::Unknown,
+    }
+}
+
+fn codex_is_empty_composer_placeholder(text: &str) -> bool {
+    CODEX_EMPTY_COMPOSER_PLACEHOLDERS.contains(&text)
+}
+
+fn codex_composer_line(line: &str) -> Option<&str> {
+    line.trim_start().strip_prefix('›').map(str::trim_start)
+}
+
 /// Codex renders its live composer as a bottom-of-screen `› …` row rather
 /// than Claude's bordered box. Restrict the match to the tail so a submitted
 /// `› prompt` in conversation history cannot be mistaken for parked input.
 fn codex_input_line(screen: &str) -> Option<&str> {
-    screen
-        .lines()
+    let lines = screen.lines().collect::<Vec<_>>();
+    let visible_end = lines
+        .iter()
+        .rposition(|line| !line.trim().is_empty())
+        .map_or(0, |index| index + 1);
+    lines[..visible_end]
+        .iter()
         .rev()
         .take(8)
-        .find_map(|line| line.trim_start().strip_prefix('›').map(str::trim_start))
+        .find_map(|line| codex_composer_line(line))
 }
 
 fn codex_input_holds_prompt(screen: &str, text: &str) -> bool {
@@ -950,7 +1181,7 @@ mod tests {
     #[test]
     fn codex_profile_detects_busy_idle_and_parked_input() {
         let busy = "• Working (4s)\n  esc to interrupt";
-        let idle = "› Ask Codex to do anything\n\n  ? for shortcuts";
+        let idle = "› Explain this codebase\n\n  ? for shortcuts";
         let parked = "› [shelbi board wake] Project events are pending. Drain them now.\n\n  ? for shortcuts";
         assert!(codex_is_processing(busy));
         assert!(!codex_is_processing(idle));
@@ -964,6 +1195,160 @@ mod tests {
             "[shelbi board wake] Project events are pending. Drain them now.",
             SubmitProfile::CodexUi,
         ));
+        assert_eq!(codex_composer_state(Some(idle)), CodexComposerState::Empty);
+        assert!(codex_screen_wake_ready(idle));
+        assert!(!codex_screen_wake_ready(busy));
+    }
+
+    #[test]
+    fn codex_composer_treats_drafts_and_uncertain_captures_conservatively() {
+        let draft = "› How do I recover this unsent draft?\n\n  gpt-5 · 100% context left";
+        assert_eq!(
+            codex_composer_state(Some(draft)),
+            CodexComposerState::Occupied
+        );
+        assert!(!codex_screen_wake_ready(draft));
+
+        for placeholder in CODEX_EMPTY_COMPOSER_PLACEHOLDERS {
+            let screen = format!("› {placeholder}\n\n  ? for shortcuts");
+            assert_eq!(
+                codex_composer_state(Some(&screen)),
+                CodexComposerState::Empty,
+                "placeholder: {placeholder}"
+            );
+        }
+
+        for screen in [
+            "",
+            "Do you approve this command?\n  Enter to confirm · Esc to cancel",
+            "›\n\n  ? for shortcuts",
+            "› Ask Codex to do anything",
+            "› first candidate\n› Ask Codex to do anything\n\n  ? for shortcuts",
+            "› Ask Codex to do anything\n\n  ? for shortcuts\nApprove this command?",
+        ] {
+            assert_eq!(
+                codex_composer_state(Some(screen)),
+                CodexComposerState::Unknown,
+                "screen: {screen:?}"
+            );
+            assert!(!codex_screen_wake_ready(screen));
+        }
+        assert_eq!(
+            codex_composer_state(None),
+            CodexComposerState::Unknown,
+            "capture failure must not look empty"
+        );
+
+        let unavailable = PaneBaseline::from_capture(SubmitProfile::CodexUi, "", None, "");
+        assert!(!unavailable.is_codex_wake_ready());
+    }
+
+    #[test]
+    fn codex_baseline_requires_empty_composer_and_no_active_turn() {
+        let idle = "› Explain this codebase\n\n  ? for shortcuts";
+        let ready = PaneBaseline::from_snapshots(SubmitProfile::CodexUi, idle, idle, "");
+        assert!(ready.is_codex_wake_ready());
+
+        let active_screen =
+            "• Working (4s)\n  esc to interrupt\n› Explain this codebase\n\n  ? for shortcuts";
+        let active =
+            PaneBaseline::from_snapshots(SubmitProfile::CodexUi, active_screen, active_screen, "");
+        assert!(active.is_actively_busy());
+        assert!(!active.is_codex_wake_ready());
+    }
+
+    #[test]
+    fn empty_codex_composer_allows_text_and_enter_delivery() {
+        let idle = "› Explain this codebase\n\n  ? for shortcuts";
+        let calls = RefCell::new(Vec::new());
+        let status = guarded_delivery_with(
+            || codex_screen_wake_ready(idle),
+            || {
+                deliver_text_with(
+                    || {
+                        calls.borrow_mut().push("text");
+                        Ok(())
+                    },
+                    || calls.borrow_mut().push("settle"),
+                    || {
+                        calls.borrow_mut().push("enter");
+                        Ok(())
+                    },
+                )
+            },
+            || SubmitStatus::Submitted {
+                detail: "busy_observed",
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            status,
+            SubmitStatus::Submitted {
+                detail: "busy_observed"
+            }
+        );
+        assert_eq!(*calls.borrow(), ["text", "settle", "enter"]);
+    }
+
+    #[test]
+    fn occupied_or_unknown_codex_composer_is_never_touched() {
+        for screen in [
+            Some("› an unsent user draft\n\n  gpt-5 · 100% context left"),
+            Some("Do you approve this command?\n  Enter to confirm · Esc to cancel"),
+            None,
+        ] {
+            let calls = RefCell::new(Vec::new());
+            let status = guarded_delivery_with(
+                || screen.is_some_and(codex_screen_wake_ready),
+                || {
+                    deliver_text_with(
+                        || {
+                            calls.borrow_mut().push("text");
+                            Ok(())
+                        },
+                        || calls.borrow_mut().push("settle"),
+                        || {
+                            calls.borrow_mut().push("enter");
+                            Ok(())
+                        },
+                    )
+                },
+                || panic!("revoked delivery must not start verification"),
+            )
+            .unwrap();
+            assert_eq!(status, SubmitStatus::EligibilityRevoked);
+            assert!(calls.borrow().is_empty(), "screen was touched: {screen:?}");
+        }
+    }
+
+    #[test]
+    fn codex_draft_appearing_after_baseline_revokes_delivery() {
+        let idle = "› Explain this codebase\n\n  ? for shortcuts";
+        let draft = "› user started typing after baseline\n\n  gpt-5 · 100% context left";
+        let baseline = PaneBaseline::from_snapshots(SubmitProfile::CodexUi, idle, idle, "");
+        assert!(baseline.is_codex_wake_ready());
+
+        let calls = RefCell::new(Vec::new());
+        let status = guarded_delivery_with(
+            || codex_screen_wake_ready(draft),
+            || {
+                deliver_text_with(
+                    || {
+                        calls.borrow_mut().push("text");
+                        Ok(())
+                    },
+                    || calls.borrow_mut().push("settle"),
+                    || {
+                        calls.borrow_mut().push("enter");
+                        Ok(())
+                    },
+                )
+            },
+            || panic!("revoked delivery must not start verification"),
+        )
+        .unwrap();
+        assert_eq!(status, SubmitStatus::EligibilityRevoked);
+        assert!(calls.borrow().is_empty());
     }
 
     #[test]
@@ -992,6 +1377,57 @@ mod tests {
             }
         );
         assert_eq!(retries.get(), 1);
+    }
+
+    #[test]
+    fn codex_wake_retry_requires_exact_own_prompt_and_successful_capture() {
+        let text = "[shelbi board wake] Project events are pending. Drain them now.";
+        let exact = format!("› {text}\n\n  gpt-5 · 100% context left");
+        assert!(codex_wake_retry_ready_from_capture(Some(&exact), text));
+
+        for screen in [
+            Some(format!("› {text} user draft\n\n  gpt-5 · 100% context left")),
+            Some(format!(
+                "› {text}\n  user draft\n\n  gpt-5 · 100% context left"
+            )),
+            Some("› Project events are pending.\n\n  gpt-5 · 100% context left".into()),
+            Some(format!("• Working\n  esc to interrupt\n› {text}")),
+            Some(format!(
+                "› {text}\n\nApprove this command?\nEnter to confirm · Esc to cancel"
+            )),
+            None,
+        ] {
+            assert!(
+                !codex_wake_retry_ready_from_capture(screen.as_deref(), text),
+                "retry unexpectedly authorized for {screen:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn codex_wake_retry_does_not_enter_a_prompt_with_appended_user_text() {
+        let text = "[shelbi board wake] Project events are pending. Drain them now.";
+        for combined in [
+            format!("› {text} user draft\n\n  gpt-5 · 100% context left"),
+            format!("› {text}\n  user draft\n\n  gpt-5 · 100% context left"),
+        ] {
+            let retries = Cell::new(0);
+            let status = verify_submitted_with_profile(
+                text,
+                || false,
+                || combined.clone(),
+                || {
+                    if !codex_wake_retry_ready_from_capture(Some(&combined), text) {
+                        return false;
+                    }
+                    retries.set(retries.get() + 1);
+                    true
+                },
+                SubmitProfile::CodexUi,
+            );
+            assert_eq!(status, SubmitStatus::EligibilityRevoked);
+            assert_eq!(retries.get(), 0, "combined composer received Enter");
+        }
     }
 
     fn visible_short_message(text: &str) -> String {
