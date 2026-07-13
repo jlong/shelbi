@@ -7,7 +7,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use shelbi_core::{Error, Host, Result, TmuxAddr};
 
-/// Wrap a tmux `-t` target in the `=` exact-match prefix.
+/// Wrap one named component of a tmux `-t` target in the `=` exact-match
+/// prefix.
 ///
 /// tmux resolves a bare `-t NAME` by trying, in order: exact match, then
 /// unique *prefix*, then fnmatch. That prefix step is a footgun for us:
@@ -16,10 +17,34 @@ use shelbi_core::{Error, Host, Result, TmuxAddr};
 /// reports the dead session as alive and a later `send-keys` would paste
 /// one agent's prompt into another agent's pane. A leading `=` forces an
 /// exact match and disables the prefix/fnmatch fallbacks (verified
-/// against tmux 3.6). Every `-t` we build for a session or window routes
-/// through here.
+/// against tmux 3.6). Session and window names must be anchored separately:
+/// `=session:window` still allows a prefix match on `window`, while
+/// `=session:=window` protects both components.
 fn exact(target: &str) -> String {
     format!("={target}")
+}
+
+/// Render an exact tmux session target for commands that do not address a
+/// particular window.
+pub fn session_target(session: &str) -> String {
+    exact(session)
+}
+
+/// Render the target passed to tmux commands.
+///
+/// Stable pane ids are already exact, globally unique tmux identifiers and
+/// tmux rejects the otherwise-valid-looking `=%N` spelling. Named addresses
+/// retain exact-match protection on both their session and window halves.
+/// A malformed name-only address falls back to one exact component rather
+/// than silently becoming a prefix/fnmatch target.
+pub fn command_target(addr: &TmuxAddr) -> String {
+    if addr.is_pane_id() {
+        addr.target()
+    } else if addr.session.is_empty() {
+        exact(&addr.window)
+    } else {
+        format!("{}:{}", exact(&addr.session), exact(&addr.window))
+    }
 }
 
 // Argv builders, kept pure so the tests can assert the exact wire shape
@@ -32,7 +57,7 @@ fn has_session_argv(name: &str) -> Vec<String> {
         "tmux".into(),
         "has-session".into(),
         "-t".into(),
-        exact(name),
+        session_target(name),
     ]
 }
 
@@ -41,7 +66,7 @@ fn kill_window_argv(addr: &TmuxAddr) -> Vec<String> {
         "tmux".into(),
         "kill-window".into(),
         "-t".into(),
-        exact(&addr.target()),
+        command_target(addr),
     ]
 }
 
@@ -52,11 +77,39 @@ fn send_keys_literal_argv(addr: &TmuxAddr, text: &str) -> Vec<String> {
         "tmux".into(),
         "send-keys".into(),
         "-t".into(),
-        exact(&addr.target()),
+        command_target(addr),
         "-l".into(),
         "--".into(),
         text.into(),
     ]
+}
+
+/// Execute the literal fast path without ever formatting the payload into a
+/// trace or returned command error. Prompt bodies are user/task data; a tmux
+/// failure needs the address and stderr, not a copy of that data.
+fn send_keys_literal(host: &Host, addr: &TmuxAddr, text: &str) -> Result<()> {
+    let argv = send_keys_literal_argv(addr, text);
+    let mut command = shelbi_ssh::build_command(host, &argv);
+    tracing::debug!(
+        host = ?host,
+        target_kind = addr.target_kind(),
+        target = %addr.target(),
+        bytes = text.len(),
+        "tmux::send_keys_literal",
+    );
+    let output = command.output().map_err(Error::Io)?;
+    if !output.status.success() {
+        return Err(Error::Command {
+            cmd: format!(
+                "tmux send-keys target_kind={} target={} payload=<redacted>",
+                addr.target_kind(),
+                addr.target(),
+            ),
+            status: output.status.to_string(),
+            stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+        });
+    }
+    Ok(())
 }
 
 fn load_buffer_argv(buffer: &str) -> Vec<String> {
@@ -78,7 +131,52 @@ fn paste_buffer_argv(buffer: &str, addr: &TmuxAddr) -> Vec<String> {
         "-b".into(),
         buffer.into(),
         "-t".into(),
-        exact(&addr.target()),
+        command_target(addr),
+    ]
+}
+
+fn send_enter_argv(addr: &TmuxAddr) -> Vec<String> {
+    vec![
+        "tmux".into(),
+        "send-keys".into(),
+        "-t".into(),
+        command_target(addr),
+        "Enter".into(),
+    ]
+}
+
+fn pane_title_argv(addr: &TmuxAddr) -> Vec<String> {
+    vec![
+        "tmux".into(),
+        "display-message".into(),
+        "-p".into(),
+        "-t".into(),
+        command_target(addr),
+        "#{pane_title}".into(),
+    ]
+}
+
+fn capture_argv(addr: &TmuxAddr) -> Vec<String> {
+    vec![
+        "tmux".into(),
+        "capture-pane".into(),
+        "-p".into(),
+        "-J".into(),
+        "-t".into(),
+        command_target(addr),
+    ]
+}
+
+fn capture_history_argv(addr: &TmuxAddr, lines: usize) -> Vec<String> {
+    vec![
+        "tmux".into(),
+        "capture-pane".into(),
+        "-p".into(),
+        "-J".into(),
+        "-S".into(),
+        format!("-{lines}"),
+        "-t".into(),
+        command_target(addr),
     ]
 }
 
@@ -175,14 +273,16 @@ pub fn new_window(
 /// Does this tmux stderr mean the target window/session is already gone,
 /// as opposed to a failure to reach the host?
 ///
-/// tmux prints `can't find window: …` / `can't find session: …` when the
-/// `-t` target no longer exists, and `no server running on …` when the
-/// whole server has exited — all three mean "already torn down", which is
-/// success for an idempotent teardown. An SSH transport failure prints
-/// ssh's own diagnostic (`Connection refused`, `Connection timed out`,
-/// …), none of which contain these substrings, so it stays an error.
+/// tmux prints `can't find pane: …`, `can't find window: …`, or
+/// `can't find session: …` when the `-t` target no longer exists, and
+/// `no server running on …` when the whole server has exited. All mean
+/// "already torn down", which is success for an idempotent teardown. An SSH
+/// transport failure prints ssh's own diagnostic (`Connection refused`,
+/// `Connection timed out`, …), none of which contain these substrings, so it
+/// stays an error.
 fn is_missing_target(stderr: &str) -> bool {
-    stderr.contains("can't find window")
+    stderr.contains("can't find pane")
+        || stderr.contains("can't find window")
         || stderr.contains("can't find session")
         || stderr.contains("no server running")
 }
@@ -282,7 +382,7 @@ pub fn send_text(host: &Host, addr: &TmuxAddr, text: &str) -> Result<()> {
         shelbi_ssh::run_with_stdin(host, load_buffer_argv(&buffer), text.as_bytes())?;
         shelbi_ssh::run_capture(host, paste_buffer_argv(&buffer, addr))?;
     } else {
-        shelbi_ssh::run_capture(host, send_keys_literal_argv(addr, text))?;
+        send_keys_literal(host, addr, text)?;
     }
     Ok(())
 }
@@ -291,10 +391,7 @@ pub fn send_text(host: &Host, addr: &TmuxAddr, text: &str) -> Result<()> {
 /// modal prompts (e.g. claude's "trust this folder" dialog, whose default
 /// selection is the affirmative option) without typing anything into them.
 pub fn send_enter(host: &Host, addr: &TmuxAddr) -> Result<()> {
-    shelbi_ssh::run_capture(
-        host,
-        ["tmux", "send-keys", "-t", &exact(&addr.target()), "Enter"],
-    )?;
+    shelbi_ssh::run_capture(host, send_enter_argv(addr))?;
     Ok(())
 }
 
@@ -304,17 +401,7 @@ pub fn send_enter(host: &Host, addr: &TmuxAddr) -> Result<()> {
 /// `shelbi-state::default_workspace_settings.json.template`), and the parser in
 /// `shelbi-state` peels the marker back off.
 pub fn pane_title(host: &Host, addr: &TmuxAddr) -> Result<String> {
-    let raw = shelbi_ssh::run_capture(
-        host,
-        [
-            "tmux",
-            "display-message",
-            "-p",
-            "-t",
-            &exact(&addr.target()),
-            "#{pane_title}",
-        ],
-    )?;
+    let raw = shelbi_ssh::run_capture(host, pane_title_argv(addr))?;
     Ok(raw.trim_end_matches(['\n', '\r']).to_string())
 }
 
@@ -322,36 +409,13 @@ pub fn pane_title(host: &Host, addr: &TmuxAddr) -> Result<String> {
 ///
 /// `-p` prints to stdout, `-J` joins wrapped lines.
 pub fn capture(host: &Host, addr: &TmuxAddr) -> Result<String> {
-    shelbi_ssh::run_capture(
-        host,
-        [
-            "tmux",
-            "capture-pane",
-            "-p",
-            "-J",
-            "-t",
-            &exact(&addr.target()),
-        ],
-    )
+    shelbi_ssh::run_capture(host, capture_argv(addr))
 }
 
 /// Capture including the scrollback. `-S -<lines>` includes `lines` lines of
 /// history before the visible area.
 pub fn capture_history(host: &Host, addr: &TmuxAddr, lines: usize) -> Result<String> {
-    let start = format!("-{lines}");
-    shelbi_ssh::run_capture(
-        host,
-        [
-            "tmux",
-            "capture-pane",
-            "-p",
-            "-J",
-            "-S",
-            &start,
-            "-t",
-            &exact(&addr.target()),
-        ],
-    )
+    shelbi_ssh::run_capture(host, capture_history_argv(addr, lines))
 }
 
 #[cfg(test)]
@@ -413,11 +477,17 @@ mod tests {
         // what lets it dismiss a modal without typing into it.
         let cmd = shelbi_ssh::build_command(
             &Host::Local,
-            ["tmux", "send-keys", "-t", "=shelbi-w-bob:agent", "Enter"],
+            send_enter_argv(&addr("shelbi-w-bob", "agent")),
         );
         assert_eq!(
             ssh_args(cmd),
-            vec!["tmux", "send-keys", "-t", "=shelbi-w-bob:agent", "Enter"]
+            vec![
+                "tmux",
+                "send-keys",
+                "-t",
+                "=shelbi-w-bob:=agent",
+                "Enter"
+            ]
         );
     }
 
@@ -430,7 +500,7 @@ mod tests {
 
     #[test]
     fn local_send_keys_argv() {
-        // The local fast path: `-t` carries the `=` exact-match prefix and
+        // The local fast path exact-matches both named target components and
         // `--` terminates flags so a dash-leading payload is literal (F5).
         assert_eq!(
             send_keys_literal_argv(&addr("shelbi-myapp", "w-x"), "hello"),
@@ -438,7 +508,7 @@ mod tests {
                 "tmux",
                 "send-keys",
                 "-t",
-                "=shelbi-myapp:w-x",
+                "=shelbi-myapp:=w-x",
                 "-l",
                 "--",
                 "hello"
@@ -502,8 +572,8 @@ mod tests {
     fn local_paste_buffer_argv() {
         // Multi-line payloads use `paste-buffer -p` so bracketed-paste
         // mode wraps the content and the receiving app treats it as one
-        // atomic paste rather than N Enter keypresses. Target carries the
-        // `=` exact-match prefix; the buffer name is per-invocation (F4).
+        // atomic paste rather than N Enter keypresses. Both named target
+        // components are exact; the buffer name is per-invocation (F4).
         assert_eq!(
             paste_buffer_argv("shelbi-send-42-7", &addr("shelbi-myapp", "w-x")),
             vec![
@@ -514,7 +584,7 @@ mod tests {
                 "-b",
                 "shelbi-send-42-7",
                 "-t",
-                "=shelbi-myapp:w-x",
+                "=shelbi-myapp:=w-x",
             ]
         );
     }
@@ -544,28 +614,63 @@ mod tests {
     fn sibling_prefix_targets_use_exact_match() {
         // Regression (F3): tmux resolves a bare `-t` by exact-then-prefix,
         // so a torn-down `shelbi-w-bob` would prefix-match the live
-        // sibling `shelbi-w-bob-2`. The `=` prefix forces exact match and
-        // must be present on every session/window target we build.
+        // sibling `shelbi-w-bob-2`. Each named component needs its own `=`:
+        // `=session:window` still prefix-matches windows, while
+        // `=session:=window` protects both halves.
         assert_eq!(
             has_session_argv("shelbi-w-bob").last().unwrap(),
             "=shelbi-w-bob"
         );
-        assert_eq!(
-            kill_window_argv(&addr("shelbi-w-bob", "agent"))
-                .last()
-                .unwrap(),
-            "=shelbi-w-bob:agent"
-        );
-        assert_eq!(
-            paste_buffer_argv("b", &addr("shelbi-w-bob", "agent"))
-                .last()
-                .unwrap(),
-            "=shelbi-w-bob:agent"
-        );
-        assert_eq!(
-            send_keys_literal_argv(&addr("shelbi-w-bob", "agent"), "x")[3],
-            "=shelbi-w-bob:agent"
-        );
+        assert_eq!(session_target("shelbi-w-bob"), "=shelbi-w-bob");
+        let named = addr("shelbi-w-bob", "agent");
+        for (operation, argv) in [
+            ("kill-window", kill_window_argv(&named)),
+            ("literal send", send_keys_literal_argv(&named, "x")),
+            ("paste-buffer", paste_buffer_argv("b", &named)),
+            ("Enter", send_enter_argv(&named)),
+            ("pane title", pane_title_argv(&named)),
+            ("capture", capture_argv(&named)),
+            ("history capture", capture_history_argv(&named, 20)),
+        ] {
+            assert_eq!(
+                target_arg(&argv),
+                "=shelbi-w-bob:=agent",
+                "{operation} weakened exact targeting"
+            );
+        }
+    }
+
+    #[test]
+    fn stable_pane_ids_stay_raw_across_every_addressed_operation() {
+        let pane = TmuxAddr::pane_id("%42");
+        for (operation, argv) in [
+            ("kill-window", kill_window_argv(&pane)),
+            ("literal send", send_keys_literal_argv(&pane, "x")),
+            ("paste-buffer", paste_buffer_argv("b", &pane)),
+            ("Enter", send_enter_argv(&pane)),
+            ("pane title", pane_title_argv(&pane)),
+            ("capture", capture_argv(&pane)),
+            ("history capture", capture_history_argv(&pane, 20)),
+        ] {
+            assert_eq!(
+                target_arg(&argv),
+                "%42",
+                "{operation} rewrote the stable pane id"
+            );
+        }
+
+        // A malformed name-only address must fail closed to exact matching;
+        // only the explicit `%N` representation gets raw-target semantics.
+        assert_eq!(command_target(&TmuxAddr::pane_id("agent")), "=agent");
+    }
+
+    fn target_arg(argv: &[String]) -> &str {
+        let target_flag = argv
+            .iter()
+            .position(|arg| arg == "-t")
+            .expect("tmux argv missing -t");
+        argv.get(target_flag + 1)
+            .expect("tmux argv missing target value")
     }
 
     #[test]
@@ -586,6 +691,7 @@ mod tests {
         // Regression (F13): an already-gone window/session (or a stopped
         // server) is benign teardown; an unreachable host is a real error
         // that must not be swallowed as "already gone".
+        assert!(is_missing_target("can't find pane: %42"));
         assert!(is_missing_target("can't find window: agent"));
         assert!(is_missing_target("can't find session: shelbi-w-bob"));
         assert!(is_missing_target(
@@ -606,14 +712,7 @@ mod tests {
             &Host::Ssh {
                 host: "m2.local".into(),
             },
-            [
-                "tmux",
-                "display-message",
-                "-p",
-                "-t",
-                "=shelbi-w-fix-login:agent",
-                "#{pane_title}",
-            ],
+            pane_title_argv(&addr("shelbi-w-fix-login", "agent")),
         );
         assert_eq!(
             ssh_args(cmd),
@@ -629,7 +728,7 @@ mod tests {
                 // zsh's default EQUALS option expands an unquoted leading
                 // `=word` as `=command` filename expansion and kills the
                 // whole remote command line.
-                "'=shelbi-w-fix-login:agent'",
+                "'=shelbi-w-fix-login:=agent'",
                 // Single-quoted on the wire so the remote shell doesn't eat
                 // `#{pane_title}` as a comment (F1). Without the quotes tmux
                 // never receives the format string and returns its default
@@ -746,14 +845,7 @@ mod tests {
             &Host::Ssh {
                 host: "m2.local".into(),
             },
-            [
-                "tmux",
-                "capture-pane",
-                "-p",
-                "-J",
-                "-t",
-                "=shelbi-w-fix-login:agent",
-            ],
+            capture_argv(&addr("shelbi-w-fix-login", "agent")),
         );
         assert_eq!(
             ssh_args(cmd),
@@ -766,8 +858,111 @@ mod tests {
                 "-p",
                 "-J",
                 "-t",
-                "'=shelbi-w-fix-login:agent'",
+                "'=shelbi-w-fix-login:=agent'",
             ]
         );
+    }
+
+    #[test]
+    fn real_tmux_named_prefixes_cannot_cross_target() {
+        match std::process::Command::new("tmux").arg("-V").output() {
+            Ok(output) => assert!(
+                output.status.success(),
+                "tmux -V failed: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            ),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return,
+            Err(error) => panic!("could not probe tmux: {error}"),
+        }
+
+        let tmp = tempfile::tempdir().unwrap();
+        let script = tmp.path().join("receiver.sh");
+        let receipt = tmp.path().join("receipt");
+        std::fs::write(
+            &script,
+            "#!/bin/sh\n\
+             stty -echo\n\
+             IFS= read -r line\n\
+             printf '%s\\n' \"$line\" > \"$1\"\n\
+             sleep 2\n",
+        )
+        .unwrap();
+
+        let short_session = format!("shelbi-tmux-prefix-{}", std::process::id());
+        let live_session = format!("{short_session}-long");
+        let short_window = "agent";
+        let live_window = "agent-long";
+        let _ = std::process::Command::new("tmux")
+            .args(["kill-session", "-t", &format!("={live_session}")])
+            .output();
+        let mut started = false;
+        let mut start_error = String::new();
+        for _ in 0..50 {
+            match std::process::Command::new("tmux")
+                .args([
+                    "new-session",
+                    "-d",
+                    "-s",
+                    &live_session,
+                    "-n",
+                    live_window,
+                    "sh",
+                    script.to_str().unwrap(),
+                    receipt.to_str().unwrap(),
+                ])
+                .output()
+            {
+                Ok(output) if output.status.success() => {
+                    started = true;
+                    break;
+                }
+                Ok(output) => {
+                    start_error = String::from_utf8_lossy(&output.stderr).trim().to_string();
+                }
+                Err(error) => start_error = error.to_string(),
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert!(started, "tmux session never came up: {start_error}");
+
+        struct SessionGuard(String);
+        impl Drop for SessionGuard {
+            fn drop(&mut self) {
+                let _ = std::process::Command::new("tmux")
+                    .args(["kill-session", "-t", &format!("={}", self.0)])
+                    .output();
+            }
+        }
+        let _guard = SessionGuard(live_session.clone());
+        let marker = "prefix isolation marker";
+
+        let missing_session = addr(&short_session, live_window);
+        let missing_session_error = send_text(&Host::Local, &missing_session, marker)
+            .expect_err("a missing session prefix must not resolve to its live sibling");
+        let diagnostic = missing_session_error.to_string();
+        assert!(
+            diagnostic.contains("target_kind=session_window")
+                && diagnostic.contains(&format!("target={short_session}:{live_window}")),
+            "missing target context: {diagnostic}"
+        );
+        assert!(diagnostic.contains("can't find session"), "missing stderr: {diagnostic}");
+        assert!(!diagnostic.contains(marker), "payload leaked: {diagnostic}");
+        let missing_window = addr(&live_session, short_window);
+        assert!(
+            send_text(&Host::Local, &missing_window, marker).is_err(),
+            "a missing window prefix must not resolve to its live sibling"
+        );
+        assert!(
+            !receipt.exists(),
+            "a prefix-targeted payload reached the sibling receiver"
+        );
+
+        let intended = addr(&live_session, live_window);
+        send_line(&Host::Local, &intended, marker).unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while !receipt.exists() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert_eq!(std::fs::read_to_string(receipt).unwrap().trim(), marker);
     }
 }

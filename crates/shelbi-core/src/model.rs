@@ -1173,6 +1173,25 @@ impl TmuxAddr {
         }
     }
 
+    /// Whether this address is a stable tmux pane id (`%N`) rather than a
+    /// named `session:window` address.
+    ///
+    /// Keep both checks: an empty `session` is how [`Self::pane_id`] records
+    /// the address kind, while the `%` sigil prevents a malformed or legacy
+    /// name-only address from silently losing tmux's exact-match protection.
+    pub fn is_pane_id(&self) -> bool {
+        self.session.is_empty() && self.window.starts_with('%')
+    }
+
+    /// Stable label used in tmux delivery diagnostics.
+    pub fn target_kind(&self) -> &'static str {
+        if self.is_pane_id() {
+            "pane_id"
+        } else {
+            "session_window"
+        }
+    }
+
     pub fn target(&self) -> String {
         if self.session.is_empty() {
             self.window.clone()
@@ -2262,15 +2281,22 @@ mod tests {
 
     #[test]
     fn tmux_addr_can_target_a_stable_pane_id() {
-        assert_eq!(TmuxAddr::pane_id("%42").target(), "%42");
-        assert_eq!(
-            TmuxAddr {
-                session: "shelbi-demo".into(),
-                window: "dashboard".into(),
-            }
-            .target(),
-            "shelbi-demo:dashboard"
-        );
+        let pane = TmuxAddr::pane_id("%42");
+        assert_eq!(pane.target(), "%42");
+        assert!(pane.is_pane_id());
+        assert_eq!(pane.target_kind(), "pane_id");
+
+        let named = TmuxAddr {
+            session: "shelbi-demo".into(),
+            window: "dashboard".into(),
+        };
+        assert_eq!(named.target(), "shelbi-demo:dashboard");
+        assert!(!named.is_pane_id());
+        assert_eq!(named.target_kind(), "session_window");
+
+        let malformed = TmuxAddr::pane_id("dashboard");
+        assert!(!malformed.is_pane_id());
+        assert_eq!(malformed.target_kind(), "session_window");
     }
 
     #[test]

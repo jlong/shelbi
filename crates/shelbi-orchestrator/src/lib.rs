@@ -793,7 +793,8 @@ fn read_session_env_var(
     session: &str,
     key: &str,
 ) -> Result<Option<String>> {
-    let out = shelbi_ssh::run(host, ["tmux", "show-environment", "-t", session, key])
+    let target = shelbi_tmux::session_target(session);
+    let out = shelbi_ssh::run(host, ["tmux", "show-environment", "-t", &target, key])
         .map_err(Error::Io)?;
     if !out.status.success() {
         return Ok(None);
@@ -915,7 +916,8 @@ fn create_hidden_views(
 }
 
 fn set_session_env(host: &shelbi_core::Host, session: &str, key: &str, value: &str) -> Result<()> {
-    shelbi_ssh::run_capture(host, ["tmux", "set-environment", "-t", session, key, value])?;
+    let target = shelbi_tmux::session_target(session);
+    shelbi_ssh::run_capture(host, ["tmux", "set-environment", "-t", &target, key, value])?;
     Ok(())
 }
 
