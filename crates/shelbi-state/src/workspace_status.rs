@@ -673,6 +673,43 @@ pub fn append_supervision_event(
     append_event_line(&line)
 }
 
+/// Append a usage-limit auto-resume line to `~/.shelbi/events.log`:
+///
+/// ```text
+/// <rfc3339> project=<p> workspace=<name> supervision=limit-resume status=<status>[ k=v]…
+/// ```
+///
+/// Emitted by the hub poller's limit-resume scheduler — the action half of
+/// the usage-limit pause detection (see [`append_workspace_pause_event`]).
+/// `status` is a short token for where the cycle is (`scheduled`, `sent`,
+/// `skipped`, `failed`, `needs-human`) and `details` carries the
+/// status-specific context (`scheduled_for=<ts>`, `reason=<short>`,
+/// `reset=<hint>`). Keys and values fold whitespace to underscores so the
+/// line stays a single parseable record; the leading `project=` scope
+/// matches every other supervision line.
+pub fn append_limit_resume_event(
+    project: &str,
+    workspace: &str,
+    status: &str,
+    details: &[(&str, &str)],
+) -> Result<()> {
+    let ts = Utc::now().to_rfc3339();
+    let project = sanitize_field(project);
+    let workspace = sanitize_field(workspace);
+    let status = sanitize_reason(status);
+    let mut line = format!(
+        "{ts} project={project} workspace={workspace} supervision=limit-resume status={status}"
+    );
+    for (key, value) in details {
+        line.push_str(&format!(
+            " {}={}",
+            sanitize_reason(key),
+            sanitize_reason(value)
+        ));
+    }
+    append_event_line(&line)
+}
+
 /// Append `<rfc3339> project=<name> mode=zen <prev> -> <new> reason=<source>`
 /// to `~/.shelbi/events.log`. The orchestrator's tail watches this line shape
 /// to react to Zen Mode toggles without re-reading `state.json`. Sources
@@ -1468,6 +1505,61 @@ mod tests {
         assert!(
             lines.iter().all(|l| l.contains("project=demo")),
             "log: {log}"
+        );
+
+        std::env::remove_var("SHELBI_HOME");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn limit_resume_events_carry_status_and_folded_details() {
+        let _g = TEST_LOCK.lock().unwrap();
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+
+        // The scheduled half of the cycle: when the resume will fire.
+        append_limit_resume_event(
+            "demo",
+            "alpha",
+            "scheduled",
+            &[("scheduled_for", "2026-07-11T11:21:30+00:00")],
+        )
+        .unwrap();
+        // The delivery half: the prompt provably submitted.
+        append_limit_resume_event("demo", "alpha", "sent", &[]).unwrap();
+        // The degrade path: an unparseable banner surfaces the raw hint
+        // (whitespace folded so the line stays one record).
+        append_limit_resume_event(
+            "demo",
+            "alpha",
+            "needs-human",
+            &[("reason", "unparseable-reset"), ("reset", "soon ish (ET)")],
+        )
+        .unwrap();
+
+        let log = std::fs::read_to_string(events_log_path().unwrap()).unwrap();
+        let lines: Vec<&str> = log.lines().collect();
+        assert!(
+            lines[0].contains(
+                " project=demo workspace=alpha supervision=limit-resume status=scheduled \
+                 scheduled_for=2026-07-11T11:21:30+00:00"
+            ),
+            "line: {}",
+            lines[0]
+        );
+        assert!(
+            lines[1].contains(" project=demo workspace=alpha supervision=limit-resume status=sent")
+                && !lines[1].contains("status=sent "),
+            "line: {}",
+            lines[1]
+        );
+        assert!(
+            lines[2].contains(
+                " supervision=limit-resume status=needs-human reason=unparseable-reset \
+                 reset=soon_ish_(ET)"
+            ),
+            "line: {}",
+            lines[2]
         );
 
         std::env::remove_var("SHELBI_HOME");

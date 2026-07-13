@@ -1328,7 +1328,8 @@ fn deploy_and_spawn(a: SpawnArgs<'_>) -> Result<()> {
                 a.resume,
                 startup_prompt_rel,
             );
-            let cd_launch = remote_cd_launch(a.host, a.worktree, &launch, a.port, &a.workspace.name);
+            let cd_launch =
+                remote_cd_launch(a.host, a.worktree, &launch, a.port, &a.workspace.name);
             shelbi_tmux::send_line(a.host, a.addr, &cd_launch).map_err(|e| {
                 Error::Other(format!(
                     "pane startup failure for workspace `{}` using {} runner `{}`: {e}",
@@ -1465,7 +1466,9 @@ fn record_dispatch_submit(
             append_dispatch_status(task_id, workspace, "unverified", detail);
             true
         }
-        crate::submit::SubmitStatus::StillInBox | crate::submit::SubmitStatus::Unconfirmed => {
+        crate::submit::SubmitStatus::EligibilityRevoked
+        | crate::submit::SubmitStatus::StillInBox
+        | crate::submit::SubmitStatus::Unconfirmed => {
             eprintln!(
                 "shelbi: dispatched prompt to {} but no submission signal appeared \
                  after a retry Enter — dispatch stalled; leaving the task unmoved",
@@ -1474,6 +1477,121 @@ fn record_dispatch_submit(
             append_dispatch_status(task_id, workspace, "stalled", "no_busy_signal_after_retry");
             false
         }
+    }
+}
+
+/// Outcome of one auto-resume nudge on a usage-limit-stalled pane. Every
+/// variant is a normal, recorded result — only transport errors surface as
+/// `Err` from [`resume_limit_stalled_pane`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LimitResumeOutcome {
+    /// The resume prompt was delivered and provably submitted.
+    Submitted,
+    /// The pane is no longer on the limit banner (or is actively working) —
+    /// someone already resumed it, so we touched nothing.
+    SkippedBannerGone,
+    /// A newer structurally valid banner replaced the scheduled incident.
+    SkippedIncidentChanged,
+    /// The workspace no longer owns the scheduled active Claude task.
+    SkippedIneligible,
+    /// The limit modal never gave way to a ready input box — the window
+    /// likely hasn't actually reset yet. Nothing was typed.
+    InputNotReady,
+    /// The modal disappeared without exposing a ready input box.
+    DeliveryUncertain,
+    /// Ownership changed while the delivered prompt was still parked, so
+    /// the guarded shared submit primitive withheld its retry Enter.
+    PromptParkedIneligible,
+    /// The prompt was typed but no submission signal appeared even after the
+    /// retry Enter — it may be sitting unsubmitted in the input box.
+    SubmitUnconfirmed,
+}
+
+/// Nudge a worker pane stalled on claude's usage/session-limit modal back to
+/// work, once its limit window has reset. Called by the hub poller when a
+/// scheduled resume comes due (see the poller's limit-resume state machine).
+///
+/// The sequence mirrors what a human does at the pane, wrapped in the same
+/// safeguards the dispatch path uses:
+///
+/// 1. Re-verify the exact scheduled stall on a fresh capture. A missing or
+///    different current banner means a manual resume or newer incident beat
+///    us. Check `is_eligible` immediately before the first pane mutation.
+/// 2. Enter selects the modal's default option (`Stop and wait for limit to
+///    reset`), which returns claude to its input box once the window has
+///    reset; then wait for readiness exactly like dispatch does.
+/// 3. Re-check `is_eligible` after readiness and immediately before delivery.
+/// 4. Deliver `prompt` and verify it provably submitted (title marker, busy
+///    signal, or the input box clearing — with one retry Enter), via the
+///    guarded form of the same [`crate::submit::send_verified`] primitive
+///    dispatch uses. Its pre-delivery baseline suppresses stale busy signals
+///    from the prior conversation's scrollback, and its guard is re-checked
+///    before a retry Enter.
+pub fn resume_limit_stalled_pane<F>(
+    host: &Host,
+    addr: &TmuxAddr,
+    expected_stall: &crate::ready::UsageLimitStall,
+    prompt: &str,
+    is_eligible: F,
+) -> Result<LimitResumeOutcome>
+where
+    F: Fn() -> bool,
+{
+    let screen = shelbi_tmux::capture(host, addr)?;
+    match classify_limit_resume_screen(&screen, expected_stall) {
+        LimitResumeScreen::ExpectedIncident => {}
+        LimitResumeScreen::BannerGone => return Ok(LimitResumeOutcome::SkippedBannerGone),
+        LimitResumeScreen::IncidentChanged => {
+            return Ok(LimitResumeOutcome::SkippedIncidentChanged);
+        }
+    }
+    if !is_eligible() {
+        return Ok(LimitResumeOutcome::SkippedIneligible);
+    }
+    shelbi_tmux::send_enter(host, addr)?;
+    if !crate::ready::wait_for_claude_ready(host, addr, crate::ready::READY_TIMEOUT)? {
+        let after_wait = shelbi_tmux::capture(host, addr)?;
+        return Ok(
+            if classify_limit_resume_screen(&after_wait, expected_stall)
+                == LimitResumeScreen::ExpectedIncident
+            {
+                LimitResumeOutcome::InputNotReady
+            } else {
+                LimitResumeOutcome::DeliveryUncertain
+            },
+        );
+    }
+    let baseline =
+        crate::submit::PaneBaseline::capture(host, addr, crate::submit::SubmitProfile::ClaudeUi);
+    if !is_eligible() {
+        return Ok(LimitResumeOutcome::SkippedIneligible);
+    }
+    match crate::submit::send_verified_guarded(host, addr, prompt, &baseline, is_eligible)? {
+        crate::submit::SubmitStatus::Submitted { .. } => Ok(LimitResumeOutcome::Submitted),
+        crate::submit::SubmitStatus::EligibilityRevoked => {
+            Ok(LimitResumeOutcome::PromptParkedIneligible)
+        }
+        crate::submit::SubmitStatus::DeliveredUnverified { .. }
+        | crate::submit::SubmitStatus::StillInBox
+        | crate::submit::SubmitStatus::Unconfirmed => Ok(LimitResumeOutcome::SubmitUnconfirmed),
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LimitResumeScreen {
+    ExpectedIncident,
+    BannerGone,
+    IncidentChanged,
+}
+
+fn classify_limit_resume_screen(
+    screen: &str,
+    expected_stall: &crate::ready::UsageLimitStall,
+) -> LimitResumeScreen {
+    match crate::ready::detect_usage_limit(screen) {
+        None => LimitResumeScreen::BannerGone,
+        Some(current) if current == *expected_stall => LimitResumeScreen::ExpectedIncident,
+        Some(_) => LimitResumeScreen::IncidentChanged,
     }
 }
 
@@ -4381,11 +4499,8 @@ mod tests {
     #[test]
     fn remote_hub_env_prefix_switches_on_persisted_forward_mode() {
         let _g = crate::test_lock::acquire();
-        let home = std::env::temp_dir().join(format!(
-            "shelbi-fwd-{}-{}",
-            std::process::id(),
-            line!()
-        ));
+        let home =
+            std::env::temp_dir().join(format!("shelbi-fwd-{}-{}", std::process::id(), line!()));
         std::fs::create_dir_all(&home).unwrap();
         std::env::set_var("SHELBI_HOME", &home);
         std::env::remove_var("SHELBI_REMOTE_HUB_SOCK");
@@ -4997,7 +5112,11 @@ mod slot_probe_tests {
         std::env::set_var("SHELBI_PROBE_TIMEOUT_MS", "100");
         assert_eq!(probe_deadline(), Duration::from_millis(500), "clamps low");
         std::env::set_var("SHELBI_PROBE_TIMEOUT_MS", "999999");
-        assert_eq!(probe_deadline(), Duration::from_millis(60_000), "clamps high");
+        assert_eq!(
+            probe_deadline(),
+            Duration::from_millis(60_000),
+            "clamps high"
+        );
         std::env::set_var("SHELBI_PROBE_TIMEOUT_MS", "garbage");
         assert_eq!(
             probe_deadline(),
@@ -5005,7 +5124,10 @@ mod slot_probe_tests {
             "garbage falls back to the default"
         );
         std::env::remove_var("SHELBI_PROBE_TIMEOUT_MS");
-        assert_eq!(probe_deadline(), Duration::from_millis(DEFAULT_PROBE_TIMEOUT_MS));
+        assert_eq!(
+            probe_deadline(),
+            Duration::from_millis(DEFAULT_PROBE_TIMEOUT_MS)
+        );
     }
 
     fn tmux_available() -> bool {
@@ -5902,7 +6024,15 @@ mod sync_worktree_git_tests {
         let project = project_at(&repo);
         let machine = project.machines[0].clone();
         let wt = workspace_worktree(&machine, &project.workspaces[0]);
-        sync_worktree(&project, &Host::Local, &machine, &wt, "shelbi/right", "main").unwrap();
+        sync_worktree(
+            &project,
+            &Host::Local,
+            &machine,
+            &wt,
+            "shelbi/right",
+            "main",
+        )
+        .unwrap();
 
         // On the expected branch → passes.
         verify_worktree_on_branch(&Host::Local, &wt, "shelbi/right").unwrap();
@@ -5941,7 +6071,15 @@ mod sync_worktree_git_tests {
         let wt = workspace_worktree(&machine, workspace);
         // Stand up the worktree on one branch, dirty it, then ask ensure for a
         // DIFFERENT branch — it must leave the tree exactly as-is.
-        sync_worktree(&project, &Host::Local, &machine, &wt, "shelbi/inflight", "main").unwrap();
+        sync_worktree(
+            &project,
+            &Host::Local,
+            &machine,
+            &wt,
+            "shelbi/inflight",
+            "main",
+        )
+        .unwrap();
         std::fs::write(wt.join("wip.txt"), "uncommitted\n").unwrap();
 
         ensure_workspace_worktree(&machine, workspace, "shelbi/other", "main").unwrap();
@@ -6038,7 +6176,15 @@ mod sync_worktree_git_tests {
 
         // alice takes shelbi/x and commits real work onto it.
         let alice_wt = workspace_worktree(&machine, &project.workspaces[0]);
-        sync_worktree(&project, &Host::Local, &machine, &alice_wt, "shelbi/x", "main").unwrap();
+        sync_worktree(
+            &project,
+            &Host::Local,
+            &machine,
+            &alice_wt,
+            "shelbi/x",
+            "main",
+        )
+        .unwrap();
         std::fs::write(alice_wt.join("work.txt"), "task output\n").unwrap();
         assert!(run_git_in(&alice_wt, &["add", "work.txt"]).status.success());
         assert!(run_git_in(&alice_wt, &["commit", "-q", "-m", "task work"])
@@ -6081,8 +6227,20 @@ mod sync_worktree_git_tests {
         // The branch is now free: bob can claim it in its own worktree, and it
         // can then be deleted — neither hits `already checked out`.
         let bob_wt = workspace_worktree(&machine, &project.workspaces[1]);
-        sync_worktree(&project, &Host::Local, &machine, &bob_wt, "shelbi/x", "main").unwrap();
-        assert_eq!(head_of(&bob_wt), "shelbi/x", "bob must claim the freed branch");
+        sync_worktree(
+            &project,
+            &Host::Local,
+            &machine,
+            &bob_wt,
+            "shelbi/x",
+            "main",
+        )
+        .unwrap();
+        assert_eq!(
+            head_of(&bob_wt),
+            "shelbi/x",
+            "bob must claim the freed branch"
+        );
         // Free bob too, then the ref deletes cleanly.
         assert_eq!(
             detach_workspace_worktree(&Host::Local, &bob_wt),
@@ -6091,7 +6249,9 @@ mod sync_worktree_git_tests {
             }
         );
         assert!(
-            run_git_in(&repo, &["branch", "-D", "shelbi/x"]).status.success(),
+            run_git_in(&repo, &["branch", "-D", "shelbi/x"])
+                .status
+                .success(),
             "branch must delete without an `already checked out` error"
         );
 
@@ -6112,7 +6272,9 @@ mod sync_worktree_git_tests {
 
         assert!(matches!(
             detach_workspace_worktree(&Host::Local, &wt),
-            DetachOutcome::Detached { from_branch: Some(_) }
+            DetachOutcome::Detached {
+                from_branch: Some(_)
+            }
         ));
         // Re-detaching an already-detached worktree is a clean no-op with no
         // branch to report.

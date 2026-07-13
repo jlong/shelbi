@@ -30,9 +30,15 @@
 //!   pane that merely mentions the phrase doesn't trip it) the workspace is
 //!   marked [`WorkspaceState::Paused`] (⏸ badge) and a `-> paused
 //!   reason=usage-limit` line is emitted (with the reset time when shown). The
-//!   state clears — reverting to the title-derived state — on the first poll
+//!   state clears from a verified resume or fresh live busy/input evidence
 //!   after the limit lifts, so the orchestrator can hold new work off a limited
-//!   slot until it frees up.
+//!   slot until it frees up without trusting Claude's stale pane title. The
+//!   detection also arms an **auto-resume**: the
+//!   reset time is parsed from the banner and, shortly after it passes, the
+//!   poller nudges the pane back to work with a verified-submitted resume
+//!   prompt (see [`LimitResumeState`]), so a limited worker doesn't sit idle
+//!   until a human notices. Unparseable banners degrade to a
+//!   `status=needs-human` warning instead of guessing a resume time.
 //! - **Blocking dialogs.** Otherwise the sample is matched against the runner's
 //!   blocking-dialog signatures (see `shelbi_core::default_dialog_signatures` /
 //!   `AgentRunnerSpec::dialog_signatures`) for a human-gated modal
@@ -65,11 +71,11 @@ use chrono::{DateTime, Utc};
 use shelbi_core::{default_workflow, Column, Project, StatusCategory, Workflow};
 use shelbi_orchestrator::supervision::{SupervisionAction, SupervisionInputs, SupervisionState};
 use shelbi_state::{
-    append_heartbeat_event, append_rebase_event, append_workspace_dialog_event,
-    append_workspace_event, append_workspace_pause_event, append_worktree_detach_event,
-    events_log_path, load_workspace_status,
-    parse_pane_title_marker, read_state, read_zenmode_summary, save_workspace_status,
-    WorkspaceState, WorkspaceStatus, ZenHeartbeatCue, ZenModeState,
+    append_heartbeat_event, append_limit_resume_event, append_rebase_event,
+    append_workspace_dialog_event, append_workspace_event, append_workspace_pause_event,
+    append_worktree_detach_event, events_log_path, load_workspace_status, parse_pane_title_marker,
+    read_state, read_zenmode_summary, save_workspace_status, WorkspaceState, WorkspaceStatus,
+    ZenHeartbeatCue, ZenModeState,
 };
 
 /// How often each per-workspace thread re-verifies its host's reverse
@@ -261,6 +267,13 @@ fn run_workspace_poll_loop(
     // already mid-crash-loop. See `shelbi_orchestrator::supervision`.
     let mut supervision = SupervisionState::default();
 
+    // Usage-limit auto-resume schedule for this workspace's pane. Same
+    // per-thread lifetime as the rest: a poller restart drops it, and the
+    // next poll re-detects the (still-on-screen) banner and re-schedules —
+    // rebuilding from the persisted pause transition recovers even when the
+    // reset passed hours while the hub was down.
+    let mut limit_resume = LimitResumeState::default();
+
     loop {
         if shutdown.load(Ordering::SeqCst) {
             break;
@@ -304,9 +317,13 @@ fn run_workspace_poll_loop(
             &mut last_known,
             &mut last_dialog,
             &mut supervision,
+            &mut limit_resume,
         );
 
-        sleep_interruptible(interval, &shutdown);
+        sleep_interruptible(
+            limit_resume_sleep_interval(&limit_resume, interval, Utc::now()),
+            &shutdown,
+        );
     }
 }
 
@@ -603,6 +620,7 @@ fn poll_one(
     last_known: &mut Option<WorkspaceState>,
     last_dialog: &mut Option<String>,
     supervision: &mut SupervisionState,
+    limit_resume: &mut LimitResumeState,
 ) {
     // Gate the whole tick before reading/consuming ready or transition
     // markers. Under a mismatch those durable markers stay in place, and the
@@ -654,8 +672,10 @@ fn poll_one(
         // The pane is gone (dispatch teardown, crash, or normal exit). Any
         // dialog we were tracking can't be "cleared" in a meaningful way —
         // pane death has its own `pane_alive=false` event — so just drop the
-        // stuck-state so a respawned pane re-detects from scratch.
+        // stuck-state so a respawned pane re-detects from scratch. Same for
+        // a pending limit-resume: there's no pane left to nudge.
         *last_dialog = None;
+        *limit_resume = LimitResumeState::Idle;
         return;
     }
 
@@ -672,16 +692,128 @@ fn poll_one(
     // this code, reading docs, an agent reasoning about the feature) never
     // trips it. A real stall drives a first-class `Paused` state whose ⏸ badge
     // overrides the stale title, so we skip the title path this tick; the
-    // state reverts on the first poll after the limit lifts (which then rides
-    // the ordinary `paused -> working` title transition below).
-    if let Some(stall) = screen
-        .as_deref()
-        .and_then(shelbi_orchestrator::ready::detect_usage_limit)
-    {
-        record_usage_limit_pause(project, workspace, last_known, stall.reset.as_deref());
+    // state reverts after a confirmed send or fresh live busy/input evidence;
+    // Claude's title alone is not enough because it stays stale across the
+    // modal and is commonly clobbered again during resume.
+    let runner_is_claude = project
+        .runner(&workspace.runner)
+        .is_some_and(|runner| shelbi_agent::is_claude_runner(&runner.command));
+    if !runner_is_claude && *limit_resume != LimitResumeState::Idle {
+        if limit_resume.tracked_task().is_some() {
+            if let Err(e) = append_limit_resume_event(
+                &project.name,
+                &workspace.name,
+                "skipped",
+                &[("reason", "runner-not-claude")],
+            ) {
+                tracing::warn!(workspace = %workspace.name, error = %e, "append_limit_resume_event failed");
+            }
+        }
+        *limit_resume = LimitResumeState::Idle;
+    }
+    let limit_stall = runner_is_claude
+        .then(|| {
+            screen
+                .as_deref()
+                .and_then(shelbi_orchestrator::ready::detect_usage_limit)
+        })
+        .flatten();
+    if let Some(stall) = limit_stall {
+        let banner = limit_banner_key(&stall);
+        let active_task = current_task_for(project, &workspace.name);
+
+        // The modal is runner-specific and actionable only while this slot
+        // still owns active work. A pane left behind after cancel, handoff,
+        // bounce, or unassign must never be nudged. Latch this visible banner
+        // as suppressed so assigning a different task before the pane clears
+        // cannot recycle the old task's schedule.
+        let Some(task_id) = active_task else {
+            suppress_limit_banner(project, workspace, limit_resume, banner, "no-active-task");
+            *last_dialog = None;
+            return;
+        };
+
+        // A confirmed send (or a lifecycle change) can leave the old modal's
+        // pixels visible while Claude is already working and has clobbered the
+        // pane title. The same-banner latch prevents those pixels from
+        // re-recording Paused or arming another send.
+        if limit_resume.suppresses_banner(&banner) {
+            *last_dialog = None;
+            return;
+        }
+
+        // Bind every schedule to the exact task that owned the pane when the
+        // stall was observed. If task A was replaced by task B, suppress A's
+        // still-visible banner rather than scheduling it anew for B.
+        if limit_resume
+            .tracked_task()
+            .is_some_and(|scheduled| scheduled != task_id)
+            || paused_status_belongs_to_other_task(&workspace.name, &task_id)
+        {
+            suppress_limit_banner(
+                project,
+                workspace,
+                limit_resume,
+                banner,
+                "active-task-changed",
+            );
+            *last_dialog = None;
+            return;
+        }
+
+        let stalled_at =
+            record_usage_limit_pause(project, workspace, last_known, stall.reset.as_deref());
+        // The action half of the detection: schedule a resume off this
+        // structurally paired banner's reset time and, once it comes due,
+        // nudge the pane back to work with a verified-submitted prompt.
+        handle_limit_stall(
+            project,
+            workspace,
+            &host,
+            LimitResumeIncident {
+                task_id,
+                banner: stall.banner,
+                reset_hint: stall.reset,
+            },
+            stalled_at,
+            limit_resume,
+            last_known,
+        );
         // Pause supersedes any tracked advisory dialog.
         *last_dialog = None;
         return;
+    }
+    // A good sample with no current limit banner invalidates a not-yet-fired
+    // schedule, but it does not by itself prove a paused worker recovered:
+    // Claude's `shelbi:working` title is known to remain stale while the modal
+    // is open. Clear Paused only from a live busy footer or a clean ready input
+    // (one that is not holding our unsubmitted resume prompt). A post-delivery
+    // needs-human latch survives a banner-free screen until that proof arrives.
+    if runner_is_claude {
+        if let Some(screen) = screen.as_deref() {
+            let recovered =
+                record_limit_recovery_from_screen(project, workspace, screen, last_known);
+            if recovered {
+                advance_limit_resume_without_banner(limit_resume, true);
+            } else if let Some(reason) = advance_limit_resume_without_banner(limit_resume, false) {
+                if let Err(e) = append_limit_resume_event(
+                    &project.name,
+                    &workspace.name,
+                    "needs-human",
+                    &[("reason", reason)],
+                ) {
+                    tracing::warn!(workspace = %workspace.name, error = %e, "append_limit_resume_event failed");
+                }
+            }
+
+            // Do not let the known-stale pane title clear a persisted pause
+            // when the screen offered no current recovery proof. A later
+            // busy/ready sample, pane death, or lifecycle change advances it.
+            if workspace_is_paused(&workspace.name, last_known) && !recovered {
+                *last_dialog = None;
+                return;
+            }
+        }
     }
 
     // Generic blocking-dialog advisory (trust / permission), deduped via
@@ -876,15 +1008,16 @@ fn load_prior(workspace_name: &str, last_known: &Option<WorkspaceState>) -> Opti
 ///
 /// Dedupe rides the ordinary [`decide`] transition machinery: while the pane
 /// stays on the limit, subsequent polls observe `prev == Paused == new`, so
-/// only `last_seen` moves and no further event fires. The *resume* edge is not
-/// emitted here — once the limit lifts the poll falls through to the title
-/// path, which records the `paused -> working` transition off the live marker.
+/// only `last_seen` moves and no further event fires. The resume edge is
+/// recorded either immediately after a verified auto-resume or from fresh
+/// busy/clean-input evidence after a manual resume; the stale pane title is
+/// never the sole recovery signal.
 fn record_usage_limit_pause(
     project: &Project,
     workspace: &shelbi_core::WorkspaceSpec,
     last_known: &mut Option<WorkspaceState>,
     reset: Option<&str>,
-) {
+) -> DateTime<Utc> {
     let prior = load_prior(&workspace.name, last_known);
     let current_task = current_task_for(project, &workspace.name);
     let outcome = decide(
@@ -911,7 +1044,545 @@ fn record_usage_limit_pause(
         );
     }
 
+    let stalled_at = outcome.status.last_transition;
     *last_known = Some(WorkspaceState::Paused);
+    stalled_at
+}
+
+/// Persist a strongly observed post-limit state immediately instead of
+/// waiting for a pane title that Claude may overwrite before the next
+/// heartbeat. This clears the sidebar's pause badge even when old modal pixels
+/// remain visible.
+fn record_limit_resume_state(
+    project: &Project,
+    workspace: &shelbi_core::WorkspaceSpec,
+    current_task: Option<String>,
+    new_state: WorkspaceState,
+    last_known: &mut Option<WorkspaceState>,
+) {
+    let prior = load_prior(&workspace.name, last_known);
+    let outcome = decide(&workspace.name, current_task, prior, new_state, Utc::now());
+    if let Err(e) = save_workspace_status(&outcome.status) {
+        tracing::warn!(workspace = %workspace.name, error = %e, "save_workspace_status after limit resume failed");
+    }
+    if outcome.transitioned {
+        if let Err(e) = append_workspace_event(
+            &project.name,
+            &workspace.name,
+            outcome.prev_state,
+            new_state,
+        ) {
+            tracing::warn!(workspace = %workspace.name, error = %e, "append_workspace_event after limit resume failed");
+        }
+    }
+    *last_known = Some(new_state);
+}
+
+fn workspace_is_paused(workspace_name: &str, last_known: &Option<WorkspaceState>) -> bool {
+    matches!(last_known, Some(WorkspaceState::Paused))
+        || matches!(
+            load_workspace_status(workspace_name),
+            Ok(Some(status)) if status.state == WorkspaceState::Paused
+        )
+}
+
+/// Clear a persisted usage-limit pause only from current UI evidence. Busy is
+/// proof Claude is processing; a ready input means the modal is gone and the
+/// worker is awaiting input, provided our resume prompt is not still parked in
+/// that box. Returns whether a paused status was advanced.
+fn record_limit_recovery_from_screen(
+    project: &Project,
+    workspace: &shelbi_core::WorkspaceSpec,
+    screen: &str,
+    last_known: &mut Option<WorkspaceState>,
+) -> bool {
+    if !workspace_is_paused(&workspace.name, last_known) {
+        return false;
+    }
+    let observed = if shelbi_orchestrator::ready::is_claude_busy(screen) {
+        Some(WorkspaceState::Working)
+    } else if shelbi_orchestrator::ready::is_input_ready(screen)
+        && !shelbi_orchestrator::submit::input_holds_unsubmitted_prompt(screen, LIMIT_RESUME_PROMPT)
+    {
+        Some(WorkspaceState::AwaitingInput)
+    } else {
+        None
+    };
+    let Some(observed) = observed else {
+        return false;
+    };
+    record_limit_resume_state(
+        project,
+        workspace,
+        current_task_for(project, &workspace.name),
+        observed,
+        last_known,
+    );
+    true
+}
+
+/// Grace margin past the banner's stated reset time before the resume nudge
+/// fires — covers clock skew between the hub and Anthropic's window clock,
+/// and the minute-granularity of the stated time itself.
+const LIMIT_RESUME_GRACE_SECS: i64 = 90;
+
+/// While a reset is scheduled, never let a user-configured slow workspace
+/// poll cadence push the attempt far past the reset. Ninety seconds of grace
+/// plus at most this 30-second heartbeat delay keeps delivery within roughly
+/// two minutes of the stated time.
+const LIMIT_RESUME_MAX_POLL_SLEEP: Duration = Duration::from_secs(30);
+
+/// Backoff between resume attempts against the same banner. A failed nudge
+/// (window not actually reset yet, submit unconfirmed) retries on this
+/// cadence rather than hammering the pane every poll tick.
+const LIMIT_RESUME_RETRY_SECS: i64 = 5 * 60;
+
+/// How many resume attempts one banner gets before the poller stops and
+/// surfaces a needs-human line instead.
+const LIMIT_RESUME_MAX_ATTEMPTS: u32 = 3;
+
+/// The prompt the auto-resume submits to the stalled pane.
+const LIMIT_RESUME_PROMPT: &str = "The session limit has reset. Please continue with the task.";
+
+/// One limit incident is bound to both the structurally selected banner and
+/// the exact active task that owned the workspace when it was observed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct LimitResumeIncident {
+    task_id: String,
+    /// The raw structurally paired banner line, retained so the delivery path
+    /// can prove the due schedule still refers to the current modal.
+    banner: String,
+    reset_hint: Option<String>,
+}
+
+impl LimitResumeIncident {
+    fn stall(&self) -> shelbi_orchestrator::ready::UsageLimitStall {
+        shelbi_orchestrator::ready::UsageLimitStall {
+            banner: self.banner.clone(),
+            reset: self.reset_hint.clone(),
+        }
+    }
+
+    fn banner_key(&self) -> String {
+        limit_banner_key(&self.stall())
+    }
+}
+
+/// Per-workspace auto-resume bookkeeping for a usage-limit stall, advanced
+/// once per poll tick that observes the banner ([`advance_limit_resume`]) and
+/// reset to `Idle` when the banner is gone or the pane dies.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+enum LimitResumeState {
+    /// No stall being tracked.
+    #[default]
+    Idle,
+    /// Reset time parsed; nudge the pane at `due`. `attempts` counts nudges
+    /// already fired against this banner (each pushes `due` out by the retry
+    /// backoff until [`LIMIT_RESUME_MAX_ATTEMPTS`] trips needs-human).
+    Scheduled {
+        incident: LimitResumeIncident,
+        due: DateTime<Utc>,
+        attempts: u32,
+    },
+    /// This banner can't drive a resume (unparseable reset time, or every
+    /// attempt failed). Warned once; inert until the banner changes.
+    NeedsHuman { incident: LimitResumeIncident },
+    /// This banner was already resumed or invalidated by a lifecycle change.
+    /// Keep it latched until it disappears so stale visible modal text cannot
+    /// re-pause the badge or nudge a newly assigned task.
+    Resumed { banner: String },
+}
+
+impl LimitResumeState {
+    fn tracked_task(&self) -> Option<&str> {
+        match self {
+            LimitResumeState::Scheduled { incident, .. }
+            | LimitResumeState::NeedsHuman { incident } => Some(&incident.task_id),
+            LimitResumeState::Idle | LimitResumeState::Resumed { .. } => None,
+        }
+    }
+
+    fn suppresses_banner(&self, banner: &str) -> bool {
+        matches!(self, LimitResumeState::Resumed { banner: seen } if seen == banner)
+    }
+}
+
+fn limit_resume_sleep_interval(
+    state: &LimitResumeState,
+    configured: Duration,
+    now: DateTime<Utc>,
+) -> Duration {
+    let LimitResumeState::Scheduled { due, .. } = state else {
+        return configured;
+    };
+    let until_due = due
+        .signed_duration_since(now)
+        .to_std()
+        .unwrap_or(Duration::from_secs(1))
+        .max(Duration::from_secs(1));
+    configured.min(LIMIT_RESUME_MAX_POLL_SLEEP).min(until_due)
+}
+
+/// Advance a tracked incident after a successful pane capture no longer shows
+/// its banner. Returns a needs-human reason exactly on the edge where a
+/// retryable modal attempt became ambiguous. Terminal delivery uncertainty is
+/// already represented by `NeedsHuman` and stays latched until live recovery
+/// proof arrives; an unfired schedule is simply invalidated to prevent a late
+/// duplicate nudge.
+fn advance_limit_resume_without_banner(
+    state: &mut LimitResumeState,
+    recovered: bool,
+) -> Option<&'static str> {
+    if recovered {
+        *state = LimitResumeState::Idle;
+        return None;
+    }
+    match state {
+        LimitResumeState::Scheduled {
+            attempts, incident, ..
+        } if *attempts > 0 => {
+            let incident = incident.clone();
+            *state = LimitResumeState::NeedsHuman { incident };
+            Some("banner-gone-after-retryable-attempt")
+        }
+        LimitResumeState::NeedsHuman { .. } => None,
+        LimitResumeState::Idle => None,
+        LimitResumeState::Scheduled { .. } | LimitResumeState::Resumed { .. } => {
+            *state = LimitResumeState::Idle;
+            None
+        }
+    }
+}
+
+/// What one stall tick asks the caller to do. Split from the I/O so the
+/// schedule/retry/give-up rules are unit-testable on fixtures.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum LimitResumeAction {
+    /// Nothing this tick (waiting for the due time, or already inert).
+    None,
+    /// A resume was just scheduled — emit the `status=scheduled` line.
+    Scheduled { due: DateTime<Utc> },
+    /// The schedule is due — attempt the resume nudge now.
+    Attempt { incident: LimitResumeIncident },
+    /// This banner needs a human — emit the `status=needs-human` line once.
+    NeedsHuman { reason: &'static str },
+}
+
+/// Advance the limit-resume state machine for one poll tick that observed
+/// the usage-limit banner (with `hint` as its scraped reset wording, if any)
+/// and return what to do. Pure — `now` is threaded in and all I/O (the
+/// nudge itself, events.log lines) stays in [`handle_limit_stall`].
+fn advance_limit_resume(
+    state: &mut LimitResumeState,
+    incident: &LimitResumeIncident,
+    stalled_at: DateTime<Utc>,
+    now: DateTime<Utc>,
+    allow_local_implied: bool,
+) -> LimitResumeAction {
+    let fresh_banner = match state {
+        LimitResumeState::Idle => true,
+        LimitResumeState::Scheduled {
+            incident: current, ..
+        }
+        | LimitResumeState::NeedsHuman { incident: current } => current != incident,
+        LimitResumeState::Resumed { banner } => banner != &incident.banner_key(),
+    };
+    if fresh_banner {
+        // The banner time is minute-granular. Referencing one grace window
+        // before the persisted first observation keeps a 07:20:30 sample of a
+        // `7:20am` reset on that occurrence instead of rolling to tomorrow.
+        let reference = stalled_at - chrono::Duration::seconds(LIMIT_RESUME_GRACE_SECS);
+        return match incident.reset_hint.as_deref().and_then(|hint| {
+            shelbi_orchestrator::ready::next_reset_instant(hint, reference, allow_local_implied)
+        }) {
+            Some(reset) => {
+                let due = reset + chrono::Duration::seconds(LIMIT_RESUME_GRACE_SECS);
+                *state = LimitResumeState::Scheduled {
+                    incident: incident.clone(),
+                    due,
+                    attempts: 0,
+                };
+                LimitResumeAction::Scheduled { due }
+            }
+            None => {
+                *state = LimitResumeState::NeedsHuman {
+                    incident: incident.clone(),
+                };
+                LimitResumeAction::NeedsHuman {
+                    reason: if !allow_local_implied
+                        && incident
+                            .reset_hint
+                            .as_deref()
+                            .is_some_and(|hint| !hint.contains('('))
+                    {
+                        "missing-timezone-remote"
+                    } else {
+                        "unparseable-reset"
+                    },
+                }
+            }
+        };
+    }
+    if let LimitResumeState::Scheduled {
+        incident,
+        due,
+        attempts,
+    } = state
+    {
+        if now >= *due {
+            if *attempts >= LIMIT_RESUME_MAX_ATTEMPTS {
+                let incident = incident.clone();
+                *state = LimitResumeState::NeedsHuman { incident };
+                return LimitResumeAction::NeedsHuman {
+                    reason: "resume-attempts-exhausted",
+                };
+            }
+            *attempts += 1;
+            *due = now + chrono::Duration::seconds(LIMIT_RESUME_RETRY_SECS);
+            return LimitResumeAction::Attempt {
+                incident: incident.clone(),
+            };
+        }
+    }
+    LimitResumeAction::None
+}
+
+/// The I/O half of the usage-limit auto-resume, run on every poll tick that
+/// detects the stall banner (right after [`record_usage_limit_pause`]):
+/// advance the schedule and act on its verdict — emit the scheduled /
+/// needs-human events.log lines, or fire the resume nudge
+/// ([`shelbi_orchestrator::workspace::resume_limit_stalled_pane`]) and
+/// record how it went. Every emitted line carries
+/// `supervision=limit-resume` so the orchestrator and the activity feed can
+/// follow the cycle.
+fn handle_limit_stall(
+    project: &Project,
+    workspace: &shelbi_core::WorkspaceSpec,
+    host: &shelbi_core::Host,
+    incident: LimitResumeIncident,
+    stalled_at: DateTime<Utc>,
+    state: &mut LimitResumeState,
+    last_known: &mut Option<WorkspaceState>,
+) {
+    let append = |status: &str, details: &[(&str, &str)]| {
+        if let Err(e) = append_limit_resume_event(&project.name, &workspace.name, status, details) {
+            tracing::warn!(workspace = %workspace.name, error = %e, "append_limit_resume_event failed");
+        }
+    };
+    match advance_limit_resume(state, &incident, stalled_at, Utc::now(), host.is_local()) {
+        LimitResumeAction::None => {}
+        LimitResumeAction::Scheduled { due } => {
+            append("scheduled", &[("scheduled_for", &due.to_rfc3339())]);
+            tracing::info!(
+                workspace = %workspace.name,
+                due = %due.to_rfc3339(),
+                reset = ?incident.reset_hint,
+                "usage-limit stall: auto-resume scheduled",
+            );
+        }
+        LimitResumeAction::NeedsHuman { reason } => {
+            append(
+                "needs-human",
+                &[
+                    ("reason", reason),
+                    ("reset", incident.reset_hint.as_deref().unwrap_or("none")),
+                ],
+            );
+            tracing::warn!(
+                workspace = %workspace.name,
+                reason,
+                reset = ?incident.reset_hint,
+                "usage-limit stall can't be auto-resumed — waiting for a human",
+            );
+        }
+        LimitResumeAction::Attempt { incident } => {
+            use shelbi_orchestrator::workspace::LimitResumeOutcome;
+            let project_name = project.name.clone();
+            let workspace_name = workspace.name.clone();
+            let task_id = incident.task_id.clone();
+            let Ok(addr) = shelbi_orchestrator::workspace::workspace_tmux_addr(project, workspace)
+            else {
+                append("needs-human", &[("reason", "invalid-pane-address")]);
+                *state = LimitResumeState::NeedsHuman {
+                    incident: incident.clone(),
+                };
+                return;
+            };
+
+            // Re-resolve immediately before entering the delivery helper. The
+            // helper invokes this same live check once more after modal
+            // dismissal, directly before it types the prompt.
+            if !limit_resume_eligible_now(&project_name, &workspace_name, &task_id) {
+                append("skipped", &[("reason", "no-longer-eligible")]);
+                *state = LimitResumeState::Resumed {
+                    banner: incident.banner_key(),
+                };
+                return;
+            }
+            match shelbi_orchestrator::workspace::resume_limit_stalled_pane(
+                host,
+                &addr,
+                &incident.stall(),
+                LIMIT_RESUME_PROMPT,
+                || limit_resume_eligible_now(&project_name, &workspace_name, &task_id),
+            ) {
+                Ok(LimitResumeOutcome::Submitted) => {
+                    append("sent", &[]);
+                    // Submission is an irreversible fact and is logged even
+                    // if ownership changed while confirmation was arriving.
+                    // Clear Paused on that confirmed fact and resolve the
+                    // current owner afresh, so a lifecycle race never leaves
+                    // the badge stuck or stamps the stale incident task id.
+                    record_limit_resume_state(
+                        project,
+                        workspace,
+                        current_task_for(project, &workspace.name),
+                        WorkspaceState::Working,
+                        last_known,
+                    );
+                    *state = LimitResumeState::Resumed {
+                        banner: incident.banner_key(),
+                    };
+                    tracing::info!(
+                        workspace = %workspace.name,
+                        "usage-limit auto-resume prompt submitted",
+                    );
+                }
+                Ok(LimitResumeOutcome::SkippedBannerGone) => {
+                    // Someone resumed the pane between our capture and the
+                    // nudge, so nothing was typed. Latch this incident until a
+                    // fresh screen sample proves its recovery or a different
+                    // structural banner starts a new cycle.
+                    append("skipped", &[("reason", "banner-gone")]);
+                    *state = LimitResumeState::Resumed {
+                        banner: incident.banner_key(),
+                    };
+                }
+                Ok(LimitResumeOutcome::SkippedIncidentChanged) => {
+                    append("skipped", &[("reason", "incident-changed")]);
+                    // Suppress only the old scheduled incident. The changed
+                    // current banner has a different key and schedules on the
+                    // next heartbeat with its own reset time.
+                    *state = LimitResumeState::Resumed {
+                        banner: incident.banner_key(),
+                    };
+                }
+                Ok(LimitResumeOutcome::SkippedIneligible) => {
+                    append("skipped", &[("reason", "no-longer-eligible")]);
+                    *state = LimitResumeState::Resumed {
+                        banner: incident.banner_key(),
+                    };
+                }
+                Ok(LimitResumeOutcome::InputNotReady) => {
+                    append("failed", &[("reason", "input-not-ready")]);
+                    tracing::warn!(
+                        workspace = %workspace.name,
+                        "usage-limit auto-resume: exact modal still active after dismissal; will retry",
+                    );
+                }
+                Ok(LimitResumeOutcome::DeliveryUncertain) => {
+                    append(
+                        "needs-human",
+                        &[("reason", "state-uncertain-after-dismiss")],
+                    );
+                    *state = LimitResumeState::NeedsHuman {
+                        incident: incident.clone(),
+                    };
+                    tracing::warn!(
+                        workspace = %workspace.name,
+                        "usage-limit auto-resume: modal disappeared without a ready input; waiting for a human",
+                    );
+                }
+                Ok(LimitResumeOutcome::PromptParkedIneligible) => {
+                    append("needs-human", &[("reason", "owner-changed-prompt-parked")]);
+                    *state = LimitResumeState::NeedsHuman {
+                        incident: incident.clone(),
+                    };
+                    tracing::warn!(
+                        workspace = %workspace.name,
+                        "usage-limit auto-resume: task ownership changed with the prompt parked; retry Enter withheld",
+                    );
+                }
+                Ok(LimitResumeOutcome::SubmitUnconfirmed) => {
+                    append("needs-human", &[("reason", "submit-unconfirmed")]);
+                    *state = LimitResumeState::NeedsHuman {
+                        incident: incident.clone(),
+                    };
+                    tracing::warn!(
+                        workspace = %workspace.name,
+                        "usage-limit auto-resume: prompt delivery unconfirmed; not retrying a possibly parked prompt",
+                    );
+                }
+                Err(e) => {
+                    append("needs-human", &[("reason", "io-error-during-delivery")]);
+                    *state = LimitResumeState::NeedsHuman {
+                        incident: incident.clone(),
+                    };
+                    tracing::warn!(
+                        workspace = %workspace.name,
+                        error = %e,
+                        "usage-limit auto-resume: pane io failed at an unknown delivery phase; waiting for a human",
+                    );
+                }
+            }
+        }
+    }
+}
+
+fn limit_banner_key(stall: &shelbi_orchestrator::ready::UsageLimitStall) -> String {
+    format!(
+        "{}\nreset={}",
+        stall.banner,
+        stall.reset.as_deref().unwrap_or("none")
+    )
+}
+
+/// A persisted Paused state survives poller restarts and carries the task that
+/// originally hit the limit. If that task no longer owns the slot, its visible
+/// banner must not seed a schedule for a replacement task.
+fn paused_status_belongs_to_other_task(workspace: &str, task_id: &str) -> bool {
+    matches!(
+        load_workspace_status(workspace),
+        Ok(Some(status))
+            if status.state == WorkspaceState::Paused
+                && status.current_task.as_deref() != Some(task_id)
+    )
+}
+
+fn suppress_limit_banner(
+    project: &Project,
+    workspace: &shelbi_core::WorkspaceSpec,
+    state: &mut LimitResumeState,
+    banner: String,
+    reason: &'static str,
+) {
+    if state.tracked_task().is_some() {
+        if let Err(e) = append_limit_resume_event(
+            &project.name,
+            &workspace.name,
+            "skipped",
+            &[("reason", reason)],
+        ) {
+            tracing::warn!(workspace = %workspace.name, error = %e, "append_limit_resume_event failed");
+        }
+    }
+    *state = LimitResumeState::Resumed { banner };
+}
+
+/// Fail-closed live authorization for the final pane mutation and send. Reload
+/// project config as well as board state so both the runner and the exact task
+/// assignment are current after a potentially long readiness wait.
+fn limit_resume_eligible_now(project_name: &str, workspace_name: &str, task_id: &str) -> bool {
+    let Ok(project) = shelbi_state::load_project(project_name) else {
+        return false;
+    };
+    let Some(workspace) = project.workspace(workspace_name) else {
+        return false;
+    };
+    let runner_is_claude = project
+        .runner(&workspace.runner)
+        .is_some_and(|runner| shelbi_agent::is_claude_runner(&runner.command));
+    runner_is_claude && current_task_for(&project, workspace_name).as_deref() == Some(task_id)
 }
 
 /// Check the workspace's ready-handoff file marker and, if present, advance
@@ -992,9 +1663,7 @@ fn maybe_apply_ready_handoff(
                 .find(|s| s.category == StatusCategory::Handoff)
             {
                 handoff.id.clone()
-            } else if let Some(edge) =
-                workflow.outgoing_merge_transitions(&from_status).first()
-            {
+            } else if let Some(edge) = workflow.outgoing_merge_transitions(&from_status).first() {
                 tracing::info!(workspace = %workspace.name, task = %task_id, from = %from_status, to = %edge.to, "workflow declares no handoff status; auto-advancing along merge transition");
                 edge.to.clone()
             } else {
@@ -1526,8 +2195,7 @@ fn detach_workspace_worktree_after_handoff(
     match shelbi_orchestrator::workspace::detach_workspace_worktree(host, &worktree) {
         shelbi_orchestrator::workspace::DetachOutcome::Detached { from_branch } => {
             let branch = from_branch.as_deref().unwrap_or("(already-detached)");
-            if let Err(e) =
-                append_worktree_detach_event(task_id, &workspace.name, branch, true, "")
+            if let Err(e) = append_worktree_detach_event(task_id, &workspace.name, branch, true, "")
             {
                 tracing::warn!(workspace = %workspace.name, task = %task_id, error = %e, "append_worktree_detach_event failed");
             }
@@ -1780,11 +2448,40 @@ fn maybe_supervise_orchestrator(project: &Project, state: &mut SupervisionState)
 }
 
 fn current_task_for(project: &Project, workspace_name: &str) -> Option<String> {
-    shelbi_state::list_column(&project.name, Column::in_progress())
+    shelbi_state::list_tasks(&project.name)
         .ok()?
         .into_iter()
-        .find(|tf| tf.task.assigned_to.as_deref() == Some(workspace_name))
+        .find(|tf| {
+            tf.task.assigned_to.as_deref() == Some(workspace_name)
+                && task_is_active(project, &tf.task)
+        })
         .map(|tf| tf.task.id)
+}
+
+/// Resolve task activity from its workflow, not from the literal
+/// `in-progress` storage id. Custom workflows may call their active status
+/// `coding`, `research`, or anything else. A configured workflow that cannot
+/// be loaded fails closed; only the legacy implicit `default` workflow uses
+/// the built-in fallback.
+fn task_is_active(project: &Project, task: &shelbi_core::Task) -> bool {
+    let workflow = match shelbi_state::load_task_workflow(&project.name, project, task) {
+        Ok(workflow) => workflow,
+        Err(_)
+            if shelbi_state::resolve_task_workflow_name(project, task)
+                == shelbi_core::DEFAULT_WORKFLOW_NAME =>
+        {
+            default_workflow()
+        }
+        Err(_) => return false,
+    };
+    workflow_status_is_active(&workflow, task.column.clone())
+}
+
+fn workflow_status_is_active(workflow: &Workflow, column: Column) -> bool {
+    let status = resolve_current_status_id(workflow, column);
+    workflow
+        .status(&status)
+        .is_some_and(|status| status.category == StatusCategory::Active)
 }
 
 #[cfg(test)]
@@ -1937,6 +2634,327 @@ mod tests {
         assert_eq!(resumed.status.last_transition, ts(200));
     }
 
+    #[test]
+    fn workflow_status_activity_uses_custom_status_category() {
+        let mut workflow = default_workflow();
+        let active = workflow
+            .statuses
+            .iter_mut()
+            .find(|status| status.category == StatusCategory::Active)
+            .unwrap();
+        active.id = "coding".into();
+
+        assert!(workflow_status_is_active(
+            &workflow,
+            Column::from_status_id("coding")
+        ));
+        assert!(!workflow_status_is_active(
+            &workflow,
+            Column::from_status_id("review")
+        ));
+    }
+
+    #[test]
+    fn limit_resume_schedules_once_then_attempts_at_due_with_backoff() {
+        // The observed incident: alpha stalled at 02:28 UTC on a banner whose
+        // reset ("2:20am America/New_York") is 06:20 UTC later that morning.
+        let now = Utc.with_ymd_and_hms(2026, 7, 11, 2, 28, 0).unwrap();
+        let reset = Utc.with_ymd_and_hms(2026, 7, 11, 6, 20, 0).unwrap();
+        let incident = LimitResumeIncident {
+            task_id: "task-a".into(),
+            banner: "session-limit-2:20".into(),
+            reset_hint: Some("2:20am (America/New_York)".into()),
+        };
+        let mut state = LimitResumeState::default();
+
+        // First stall tick: schedule at reset + grace, emit once.
+        let due = reset + chrono::Duration::seconds(LIMIT_RESUME_GRACE_SECS);
+        assert_eq!(
+            advance_limit_resume(&mut state, &incident, now, now, true),
+            LimitResumeAction::Scheduled { due },
+        );
+        // Subsequent ticks on the same banner before due: silent — no
+        // re-schedule spam and, crucially, no re-parse (which would roll the
+        // occurrence to tomorrow once the time passes).
+        assert_eq!(
+            advance_limit_resume(
+                &mut state,
+                &incident,
+                now,
+                now + chrono::Duration::minutes(5),
+                true,
+            ),
+            LimitResumeAction::None,
+        );
+        // Due passes and the banner is still up: attempt the nudge.
+        let tick = due + chrono::Duration::seconds(5);
+        assert_eq!(
+            advance_limit_resume(&mut state, &incident, now, tick, true),
+            LimitResumeAction::Attempt {
+                incident: incident.clone()
+            },
+        );
+        // Right after a (failed) attempt: backed off, not hammering.
+        assert_eq!(
+            advance_limit_resume(
+                &mut state,
+                &incident,
+                now,
+                tick + chrono::Duration::seconds(10),
+                true,
+            ),
+            LimitResumeAction::None,
+        );
+        // Retries fire on the backoff cadence until the cap…
+        let mut tick = tick;
+        for _ in 1..LIMIT_RESUME_MAX_ATTEMPTS {
+            tick += chrono::Duration::seconds(LIMIT_RESUME_RETRY_SECS + 5);
+            assert_eq!(
+                advance_limit_resume(&mut state, &incident, now, tick, true),
+                LimitResumeAction::Attempt {
+                    incident: incident.clone()
+                },
+            );
+        }
+        // …then the banner is handed to a human, once, and goes quiet.
+        tick += chrono::Duration::seconds(LIMIT_RESUME_RETRY_SECS + 5);
+        assert_eq!(
+            advance_limit_resume(&mut state, &incident, now, tick, true),
+            LimitResumeAction::NeedsHuman {
+                reason: "resume-attempts-exhausted"
+            },
+        );
+        assert_eq!(
+            advance_limit_resume(
+                &mut state,
+                &incident,
+                now,
+                tick + chrono::Duration::minutes(10),
+                true,
+            ),
+            LimitResumeAction::None,
+        );
+    }
+
+    #[test]
+    fn limit_resume_unparseable_banner_warns_once_never_guesses() {
+        let now = Utc.with_ymd_and_hms(2026, 7, 11, 2, 28, 0).unwrap();
+        let mut state = LimitResumeState::default();
+        let invalid_zone = LimitResumeIncident {
+            task_id: "task-a".into(),
+            banner: "bad-zone".into(),
+            reset_hint: Some("7:20am (ET)".into()),
+        };
+
+        // A zone we can't resolve must not drive a wrong-time resume.
+        assert_eq!(
+            advance_limit_resume(&mut state, &invalid_zone, now, now, true),
+            LimitResumeAction::NeedsHuman {
+                reason: "unparseable-reset"
+            },
+        );
+        // Same banner keeps quiet — one warning per incident.
+        assert_eq!(
+            advance_limit_resume(&mut state, &invalid_zone, now, now, true),
+            LimitResumeAction::None,
+        );
+        // A banner with no reset wording at all takes the same path.
+        let mut state = LimitResumeState::default();
+        let no_hint = LimitResumeIncident {
+            task_id: "task-a".into(),
+            banner: "no-hint".into(),
+            reset_hint: None,
+        };
+        assert_eq!(
+            advance_limit_resume(&mut state, &no_hint, now, now, true),
+            LimitResumeAction::NeedsHuman {
+                reason: "unparseable-reset"
+            },
+        );
+        assert_eq!(
+            advance_limit_resume(&mut state, &no_hint, now, now, true),
+            LimitResumeAction::None
+        );
+    }
+
+    #[test]
+    fn limit_resume_remote_banner_without_timezone_needs_human() {
+        let now = Utc.with_ymd_and_hms(2026, 7, 11, 2, 28, 0).unwrap();
+        let incident = LimitResumeIncident {
+            task_id: "task-a".into(),
+            banner: "remote-no-zone".into(),
+            reset_hint: Some("7:20am".into()),
+        };
+        let mut state = LimitResumeState::default();
+        assert_eq!(
+            advance_limit_resume(&mut state, &incident, now, now, false),
+            LimitResumeAction::NeedsHuman {
+                reason: "missing-timezone-remote"
+            },
+        );
+    }
+
+    #[test]
+    fn limit_resume_restart_rebuilds_due_from_persisted_stall_time() {
+        let stalled_at = Utc.with_ymd_and_hms(2026, 7, 11, 2, 28, 0).unwrap();
+        let restarted_at = Utc.with_ymd_and_hms(2026, 7, 11, 10, 30, 0).unwrap();
+        let due = Utc.with_ymd_and_hms(2026, 7, 11, 6, 20, 0).unwrap()
+            + chrono::Duration::seconds(LIMIT_RESUME_GRACE_SECS);
+        let incident = LimitResumeIncident {
+            task_id: "task-a".into(),
+            banner: "session-limit-2:20".into(),
+            reset_hint: Some("2:20am (America/New_York)".into()),
+        };
+        let mut state = LimitResumeState::default();
+
+        assert_eq!(
+            advance_limit_resume(&mut state, &incident, stalled_at, restarted_at, true),
+            LimitResumeAction::Scheduled { due },
+        );
+        assert_eq!(
+            advance_limit_resume(&mut state, &incident, stalled_at, restarted_at, true),
+            LimitResumeAction::Attempt {
+                incident: incident.clone()
+            },
+        );
+    }
+
+    #[test]
+    fn limit_resume_fresh_banner_restarts_the_cycle() {
+        // Worker resumed, worked, and hit the NEXT window: the new banner
+        // carries a different reset time and must re-schedule from scratch —
+        // even from the needs-human latch.
+        let now = Utc.with_ymd_and_hms(2026, 7, 11, 2, 28, 0).unwrap();
+        let old = LimitResumeIncident {
+            task_id: "task-a".into(),
+            banner: "bad-zone".into(),
+            reset_hint: Some("7:20am (ET)".into()),
+        };
+        let mut state = LimitResumeState::NeedsHuman { incident: old };
+        let current = LimitResumeIncident {
+            task_id: "task-a".into(),
+            banner: "session-limit-7:20".into(),
+            reset_hint: Some("7:20am (America/New_York)".into()),
+        };
+        let due = Utc.with_ymd_and_hms(2026, 7, 11, 11, 20, 0).unwrap()
+            + chrono::Duration::seconds(LIMIT_RESUME_GRACE_SECS);
+        assert_eq!(
+            advance_limit_resume(&mut state, &current, now, now, true),
+            LimitResumeAction::Scheduled { due },
+        );
+        // And a different hint while Scheduled also re-schedules (the stall
+        // rolled to a new window before the old due fired).
+        let next = LimitResumeIncident {
+            task_id: "task-a".into(),
+            banner: "session-limit-11:20".into(),
+            reset_hint: Some("11:20am (America/New_York)".into()),
+        };
+        assert_eq!(
+            advance_limit_resume(&mut state, &next, now, now, true),
+            LimitResumeAction::Scheduled {
+                due: Utc.with_ymd_and_hms(2026, 7, 11, 15, 20, 0).unwrap()
+                    + chrono::Duration::seconds(LIMIT_RESUME_GRACE_SECS)
+            },
+        );
+    }
+
+    #[test]
+    fn limit_resume_needs_human_survives_banner_free_ticks_until_live_recovery() {
+        let incident = LimitResumeIncident {
+            task_id: "task-a".into(),
+            banner: "session-limit-7:20".into(),
+            reset_hint: Some("7:20am (America/New_York)".into()),
+        };
+        let mut uncertain = LimitResumeState::NeedsHuman {
+            incident: incident.clone(),
+        };
+        assert_eq!(
+            advance_limit_resume_without_banner(&mut uncertain, false),
+            None
+        );
+        assert!(matches!(uncertain, LimitResumeState::NeedsHuman { .. }));
+
+        // A human resumed before the scheduled due tick. Invalidating the
+        // unfired schedule is what prevents its later prompt from duplicating
+        // that manual recovery.
+        let mut unfired = LimitResumeState::Scheduled {
+            incident: incident.clone(),
+            due: Utc::now() + chrono::Duration::minutes(5),
+            attempts: 0,
+        };
+        assert_eq!(
+            advance_limit_resume_without_banner(&mut unfired, false),
+            None
+        );
+        assert_eq!(unfired, LimitResumeState::Idle);
+
+        // The exact modal was present when the safe retry outcome returned,
+        // then disappeared before the next heartbeat. Surface that ambiguity
+        // once and retain it rather than silently becoming Idle.
+        let mut attempted = LimitResumeState::Scheduled {
+            incident,
+            due: Utc::now(),
+            attempts: 1,
+        };
+        assert_eq!(
+            advance_limit_resume_without_banner(&mut attempted, false),
+            Some("banner-gone-after-retryable-attempt")
+        );
+        assert!(matches!(attempted, LimitResumeState::NeedsHuman { .. }));
+        assert_eq!(
+            advance_limit_resume_without_banner(&mut attempted, false),
+            None
+        );
+
+        advance_limit_resume_without_banner(&mut attempted, true);
+        assert_eq!(attempted, LimitResumeState::Idle);
+    }
+
+    #[test]
+    fn limit_resume_schedule_caps_slow_polling_and_wakes_at_due_time() {
+        let now = Utc.with_ymd_and_hms(2026, 7, 11, 6, 0, 0).unwrap();
+        let configured = Duration::from_secs(10 * 60);
+        let incident = LimitResumeIncident {
+            task_id: "task-a".into(),
+            banner: "session-limit".into(),
+            reset_hint: Some("2:20am (America/New_York)".into()),
+        };
+        let scheduled = |due| LimitResumeState::Scheduled {
+            incident: incident.clone(),
+            due,
+            attempts: 0,
+        };
+
+        assert_eq!(
+            limit_resume_sleep_interval(
+                &scheduled(now + chrono::Duration::minutes(5)),
+                configured,
+                now,
+            ),
+            LIMIT_RESUME_MAX_POLL_SLEEP
+        );
+        assert_eq!(
+            limit_resume_sleep_interval(
+                &scheduled(now + chrono::Duration::seconds(10)),
+                configured,
+                now,
+            ),
+            Duration::from_secs(10)
+        );
+        assert_eq!(
+            limit_resume_sleep_interval(
+                &scheduled(now - chrono::Duration::seconds(1)),
+                configured,
+                now,
+            ),
+            Duration::from_secs(1)
+        );
+        assert_eq!(
+            limit_resume_sleep_interval(&LimitResumeState::Idle, configured, now),
+            configured
+        );
+    }
+
     use shelbi_core::{
         AgentRunnerSpec, Host, Machine, MachineKind, OrchestratorSpec, Task, TmuxAddr,
         WorkspaceSpec,
@@ -2012,6 +3030,477 @@ mod tests {
         }
     }
 
+    fn tmux_available() -> bool {
+        std::process::Command::new("tmux")
+            .arg("-V")
+            .output()
+            .map(|out| out.status.success())
+            .unwrap_or(false)
+    }
+
+    fn kill_tmux_session(session: &str) {
+        let _ = std::process::Command::new("tmux")
+            .args(["kill-session", "-t", &format!("={session}")])
+            .output();
+    }
+
+    /// Start the fake-Claude pane and wait until tmux has registered it. Real
+    /// tmux tests share one server, whose socket can briefly race concurrent
+    /// session creation, so use the retry pattern from the orchestrator's
+    /// existing tmux integration tests rather than trusting one spawn.
+    fn start_limit_resume_tmux_session(
+        session: &str,
+        script: &std::path::Path,
+        receipt: &std::path::Path,
+    ) {
+        kill_tmux_session(session);
+        for _ in 0..50 {
+            let _ = std::process::Command::new("tmux")
+                .args(["new-session", "-d", "-s", session, "-n", "alpha"])
+                .arg("sh")
+                .arg(script)
+                .arg(receipt)
+                .status();
+            let live = std::process::Command::new("tmux")
+                .args(["has-session", "-t", &format!("={session}")])
+                .output()
+                .map(|out| out.status.success())
+                .unwrap_or(false);
+            if live {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        panic!("tmux session `{session}` never came up");
+    }
+
+    fn wait_for_limit_modal(host: &Host, addr: &TmuxAddr) -> String {
+        let start = std::time::Instant::now();
+        let timeout = std::time::Duration::from_secs(3);
+        while start.elapsed() < timeout {
+            let screen = shelbi_tmux::capture(host, addr).unwrap_or_default();
+            if shelbi_orchestrator::ready::detect_usage_limit(&screen).is_some() {
+                return screen;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        panic!(
+            "fake Claude never rendered its limit modal; last screen:\n{}",
+            shelbi_tmux::capture(host, addr).unwrap_or_default()
+        );
+    }
+
+    fn sidebar_badge(project: &str, workspace: &str) -> crate::WorkspaceBadge {
+        let mut app = crate::App::new_sidebar(project);
+        app.refresh().unwrap();
+        app.rows()
+            .into_iter()
+            .find_map(|row| match row {
+                crate::Row::Workspace { name, badge, .. } if name == workspace => Some(badge),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("workspace `{workspace}` missing from sidebar rows"))
+    }
+
+    struct LimitResumeTmuxCleanup {
+        session: String,
+        home: std::path::PathBuf,
+        prior_home: Option<std::ffi::OsString>,
+        prior_hub_sock: Option<std::ffi::OsString>,
+    }
+
+    impl Drop for LimitResumeTmuxCleanup {
+        fn drop(&mut self) {
+            kill_tmux_session(&self.session);
+            if let Some(home) = &self.prior_home {
+                std::env::set_var("SHELBI_HOME", home);
+            } else {
+                std::env::remove_var("SHELBI_HOME");
+            }
+            if let Some(sock) = &self.prior_hub_sock {
+                std::env::set_var("SHELBI_HUB_SOCK", sock);
+            } else {
+                std::env::remove_var("SHELBI_HUB_SOCK");
+            }
+            let _ = std::fs::remove_dir_all(&self.home);
+        }
+    }
+
+    #[test]
+    fn limit_resume_eligibility_is_task_runner_and_workflow_bound() {
+        let _env = crate::test_support::ENV_LOCK.lock().unwrap();
+        let nonce = format!(
+            "{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let project_name = format!("limit-resume-gates-{nonce}");
+        let home = std::env::temp_dir().join(&project_name);
+        std::fs::create_dir_all(&home).unwrap();
+        let prior_home = std::env::var_os("SHELBI_HOME");
+        std::env::set_var("SHELBI_HOME", &home);
+        let _cleanup = LimitResumeTmuxCleanup {
+            session: format!("unused-{project_name}"),
+            home: home.clone(),
+            prior_home,
+            prior_hub_sock: std::env::var_os("SHELBI_HUB_SOCK"),
+        };
+
+        let work_dir = home.join("repo");
+        std::fs::create_dir_all(&work_dir).unwrap();
+        let mut project = local_project(&work_dir);
+        project.name.clone_from(&project_name);
+        project.default_workflow = Some("custom".into());
+        shelbi_state::save_project(&project).unwrap();
+        shelbi_state::save_project_statuses(
+            &project.name,
+            &shelbi_core::ProjectStatuses {
+                statuses: vec![
+                    shelbi_core::ProjectStatus {
+                        id: "backlog".into(),
+                        name: "Backlog".into(),
+                        category: StatusCategory::Backlog,
+                    },
+                    shelbi_core::ProjectStatus {
+                        id: "coding".into(),
+                        name: "Coding".into(),
+                        category: StatusCategory::Active,
+                    },
+                    shelbi_core::ProjectStatus {
+                        id: "done".into(),
+                        name: "Done".into(),
+                        category: StatusCategory::Done,
+                    },
+                ],
+            },
+        )
+        .unwrap();
+        let workflow_path = shelbi_state::workflow_path(&project.name, "custom").unwrap();
+        std::fs::write(
+            workflow_path,
+            "name: custom\nstatuses:\n  - { id: backlog, owner: user }\n  - { id: coding, owner: user }\n  - { id: done, owner: user }\n",
+        )
+        .unwrap();
+
+        let task_id = "custom-active-task";
+        let mut task = in_progress_task(task_id, "alpha");
+        task.column = Column::from_status_id("coding");
+        task.workflow = Some("custom".into());
+        shelbi_state::save_task(&project.name, &task, "work").unwrap();
+
+        assert_eq!(
+            current_task_for(&project, "alpha").as_deref(),
+            Some(task_id)
+        );
+        assert!(limit_resume_eligible_now(&project.name, "alpha", task_id));
+        assert!(!limit_resume_eligible_now(
+            &project.name,
+            "alpha",
+            "different-task"
+        ));
+
+        task.assigned_to = Some("beta".into());
+        shelbi_state::save_task(&project.name, &task, "work").unwrap();
+        assert!(!limit_resume_eligible_now(&project.name, "alpha", task_id));
+
+        task.assigned_to = Some("alpha".into());
+        task.column = Column::from_status_id("done");
+        shelbi_state::save_task(&project.name, &task, "work").unwrap();
+        assert!(!limit_resume_eligible_now(&project.name, "alpha", task_id));
+
+        task.column = Column::from_status_id("coding");
+        shelbi_state::save_task(&project.name, &task, "work").unwrap();
+        project.agent_runners.get_mut("claude").unwrap().command = "codex".into();
+        shelbi_state::save_project(&project).unwrap();
+        assert!(!limit_resume_eligible_now(&project.name, "alpha", task_id));
+    }
+
+    /// Full wire-path regression for a limited Claude worker: the poller
+    /// captures a real tmux pane, schedules the structurally current banner,
+    /// dismisses the modal, delivers + verifies the prompt, clears the pause
+    /// badge, and suppresses the same stale banner on the next heartbeat.
+    #[test]
+    fn limit_resume_tmux_round_trip_clears_pause_without_duplicate() {
+        if !tmux_available() {
+            eprintln!("skipping: tmux not on PATH");
+            return;
+        }
+
+        let _env = crate::test_support::ENV_LOCK.lock().unwrap();
+        let nonce = format!(
+            "{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let project_name = format!("limit-resume-e2e-{nonce}");
+        let session = format!("shelbi-{project_name}");
+        let home = std::env::temp_dir().join(&project_name);
+        std::fs::create_dir_all(&home).unwrap();
+        let prior_home = std::env::var_os("SHELBI_HOME");
+        std::env::set_var("SHELBI_HOME", &home);
+        let prior_hub_sock = std::env::var_os("SHELBI_HUB_SOCK");
+        let hub_sock = home.join("hub.sock");
+        let hub = std::os::unix::net::UnixListener::bind(&hub_sock).unwrap();
+        std::env::set_var("SHELBI_HUB_SOCK", &hub_sock);
+        let matching_daemon = std::thread::spawn(move || {
+            use std::io::{Read, Write};
+            for _ in 0..3 {
+                let (mut stream, _) = hub.accept().unwrap();
+                let mut request = Vec::new();
+                stream.read_to_end(&mut request).unwrap();
+                assert!(request.is_empty(), "version probe must send no frame");
+                stream
+                    .write_all(
+                        shelbi_state::DaemonHello::new(env!("CARGO_PKG_VERSION"))
+                            .to_line()
+                            .as_bytes(),
+                    )
+                    .unwrap();
+            }
+        });
+        let _cleanup = LimitResumeTmuxCleanup {
+            session: session.clone(),
+            home: home.clone(),
+            prior_home,
+            prior_hub_sock,
+        };
+
+        let work_dir = home.join("repo");
+        std::fs::create_dir_all(&work_dir).unwrap();
+        let mut project = local_project(&work_dir);
+        project.name.clone_from(&project_name);
+        shelbi_state::save_project(&project).unwrap();
+        let task_id = "resume-limited-worker";
+        shelbi_state::save_task(
+            &project.name,
+            &in_progress_task(task_id, "alpha"),
+            "keep working",
+        )
+        .unwrap();
+
+        // A tiny deterministic terminal app stands in for Claude. The first
+        // read is the modal-selection Enter. The second is the resume prompt;
+        // after consuming it the app deliberately clobbers its title and
+        // redraws stale modal pixels beside a genuine busy footer. That final
+        // screen pins the Resumed latch and direct badge-clear behavior.
+        let receipt = home.join("fake-claude.receipt");
+        let script = home.join("fake-claude.sh");
+        std::fs::write(
+            &script,
+            r#"receipt=$1
+show_current_modal() {
+  printf '%s\n' \
+    "⏱ You've hit your session limit · resets 7:20am (America/New_York)" \
+    "" \
+    " ❯ 1. Stop and wait for limit to reset" \
+    "   2. Upgrade your plan"
+}
+
+printf '\033]2;shelbi:working\007'
+printf '\033[2J\033[H'
+printf '%s\n' \
+  "Earlier conversation:" \
+  "⏱ You've hit your session limit · resets 1:05am (Europe/London)" \
+  " ❯ 1. Stop and wait for limit to reset" \
+  "   2. Upgrade your plan" \
+  ""
+show_current_modal
+
+IFS= read -r modal_choice
+printf 'dismissed=%s\n' "$modal_choice" > "$receipt"
+printf '\033[2J\033[H'
+printf '%s\n' \
+  "────────────────────────────────────────────────────────" \
+  "❯ " \
+  "────────────────────────────────────────────────────────" \
+  "  ⏵⏵ auto mode on (shift+tab to cycle)"
+
+IFS= read -r prompt
+printf 'prompt=%s\n' "$prompt" >> "$receipt"
+printf '\033]2;Claude Code\007'
+printf '\033[2J\033[H'
+show_current_modal
+printf '%s\n' "" "⏺ Working…" "  esc to interrupt"
+while :; do sleep 60; done
+"#,
+        )
+        .unwrap();
+        start_limit_resume_tmux_session(&session, &script, &receipt);
+
+        let host = Host::Local;
+        let addr = TmuxAddr {
+            session,
+            window: "alpha".into(),
+        };
+        let initial_screen = wait_for_limit_modal(&host, &addr);
+        assert!(initial_screen.contains("1:05am (Europe/London)"));
+        assert!(initial_screen.contains("7:20am (America/New_York)"));
+
+        let workspace = &project.workspaces[0];
+        let mut last_known = None;
+        let mut last_dialog = None;
+        let mut supervision = SupervisionState::default();
+        let mut limit_resume = LimitResumeState::default();
+
+        // Banner -> scheduled: persist the pause and surface the actual badge,
+        // but do not touch the modal before the stated due time.
+        poll_one(
+            &project,
+            workspace,
+            &mut last_known,
+            &mut last_dialog,
+            &mut supervision,
+            &mut limit_resume,
+        );
+        assert_eq!(last_known, Some(WorkspaceState::Paused));
+        let paused = load_workspace_status("alpha").unwrap().unwrap();
+        assert_eq!(paused.state, WorkspaceState::Paused);
+        assert_eq!(paused.current_task.as_deref(), Some(task_id));
+        let badge = sidebar_badge(&project.name, "alpha");
+        assert_eq!(badge, crate::WorkspaceBadge::Paused);
+        assert_eq!(badge.glyph(), "⏸");
+        assert!(!receipt.exists(), "the modal was touched before due");
+
+        let due = match &mut limit_resume {
+            LimitResumeState::Scheduled {
+                incident,
+                due,
+                attempts,
+            } => {
+                assert_eq!(incident.task_id, task_id);
+                assert_eq!(
+                    incident.banner,
+                    "⏱ You've hit your session limit · resets 7:20am (America/New_York)"
+                );
+                assert_eq!(
+                    incident.reset_hint.as_deref(),
+                    Some("7:20am (America/New_York)")
+                );
+                assert_eq!(*attempts, 0);
+                let scheduled = *due;
+                *due = Utc::now() - chrono::Duration::seconds(1);
+                scheduled
+            }
+            other => panic!("expected a scheduled resume, got {other:?}"),
+        };
+        let log = std::fs::read_to_string(shelbi_state::events_log_path().unwrap()).unwrap();
+        assert_eq!(
+            log.lines()
+                .filter(|line| line.contains("supervision=limit-resume status=scheduled"))
+                .count(),
+            1,
+            "events.log: {log}"
+        );
+        assert!(
+            log.contains(&format!("scheduled_for={}", due.to_rfc3339())),
+            "events.log: {log}"
+        );
+        assert!(
+            !log.contains("reset=1:05am_(Europe/London)"),
+            "stale reset leaked into the scheduled incident: {log}"
+        );
+
+        // Due -> modal dismissal -> verified submission. The fake app only
+        // writes the prompt receipt after its terminal read consumed Enter.
+        poll_one(
+            &project,
+            workspace,
+            &mut last_known,
+            &mut last_dialog,
+            &mut supervision,
+            &mut limit_resume,
+        );
+        assert_eq!(
+            std::fs::read_to_string(&receipt).unwrap(),
+            format!("dismissed=\nprompt={LIMIT_RESUME_PROMPT}\n")
+        );
+        assert_eq!(last_known, Some(WorkspaceState::Working));
+        let working = load_workspace_status("alpha").unwrap().unwrap();
+        assert_eq!(working.state, WorkspaceState::Working);
+        assert_eq!(working.current_task.as_deref(), Some(task_id));
+        let badge = sidebar_badge(&project.name, "alpha");
+        assert_eq!(badge, crate::WorkspaceBadge::Working);
+        assert_eq!(badge.glyph(), "⏵");
+        assert!(matches!(limit_resume, LimitResumeState::Resumed { .. }));
+
+        let stale_screen = shelbi_tmux::capture(&host, &addr).unwrap();
+        assert!(stale_screen.contains("7:20am (America/New_York)"));
+        assert!(stale_screen.contains("esc to interrupt"));
+        let title = shelbi_tmux::pane_title(&host, &addr).unwrap();
+        assert!(
+            parse_pane_title_marker(&title).is_none(),
+            "fake Claude must clobber the working marker, got `{title}`"
+        );
+
+        // Simulate a poller restart that inherited Paused on disk from a
+        // manual-resume race and lost its in-memory Resumed latch. The live
+        // busy footer must recover the badge even though the old modal and a
+        // clobbered title remain visible; it must not deliver a duplicate.
+        let restart_time = Utc::now();
+        save_workspace_status(&WorkspaceStatus {
+            workspace: "alpha".into(),
+            current_task: Some(task_id.into()),
+            state: WorkspaceState::Paused,
+            last_transition: restart_time,
+            last_seen: restart_time,
+        })
+        .unwrap();
+        last_known = None;
+        limit_resume = LimitResumeState::default();
+        poll_one(
+            &project,
+            workspace,
+            &mut last_known,
+            &mut last_dialog,
+            &mut supervision,
+            &mut limit_resume,
+        );
+        assert_eq!(last_known, Some(WorkspaceState::Working));
+        assert_eq!(
+            load_workspace_status("alpha").unwrap().unwrap().state,
+            WorkspaceState::Working
+        );
+        assert_eq!(
+            sidebar_badge(&project.name, "alpha"),
+            crate::WorkspaceBadge::Working
+        );
+        assert_eq!(
+            std::fs::read_to_string(&receipt).unwrap(),
+            format!("dismissed=\nprompt={LIMIT_RESUME_PROMPT}\n")
+        );
+
+        let log = std::fs::read_to_string(shelbi_state::events_log_path().unwrap()).unwrap();
+        assert_eq!(
+            log.lines()
+                .filter(|line| line.contains("supervision=limit-resume status=scheduled"))
+                .count(),
+            1,
+            "events.log: {log}"
+        );
+        assert_eq!(
+            log.lines()
+                .filter(|line| line.contains("supervision=limit-resume status=sent"))
+                .count(),
+            1,
+            "events.log: {log}"
+        );
+        assert_eq!(
+            log.lines()
+                .filter(|line| line.contains(" -> paused reason=usage-limit"))
+                .count(),
+            1,
+            "events.log: {log}"
+        );
+        assert!(!log.contains("status=failed"), "events.log: {log}");
+        matching_daemon.join().unwrap();
+    }
+
     fn write_marker(project: &Project, body: &str) -> std::path::PathBuf {
         let marker = shelbi_orchestrator::workspace::workspace_ready_marker(
             &project.machines[0],
@@ -2056,10 +3545,8 @@ mod tests {
         // The probe protocol is an empty half-closed connection. Advertise a
         // different workspace version so poll_one must return before reading
         // either marker or reaching any tmux operation.
-        let sock = std::env::temp_dir().join(format!(
-            "shb-pm-{}-{nonce}.sock",
-            std::process::id(),
-        ));
+        let sock =
+            std::env::temp_dir().join(format!("shb-pm-{}-{nonce}.sock", std::process::id(),));
         let _ = std::fs::remove_file(&sock);
         let listener = UnixListener::bind(&sock).unwrap();
         std::env::set_var("SHELBI_HUB_SOCK", &sock);
@@ -2085,12 +3572,14 @@ mod tests {
         let mut last_known = None;
         let mut last_dialog = None;
         let mut supervision = SupervisionState::default();
+        let mut limit_resume = LimitResumeState::default();
         poll_one(
             &project,
             &project.workspaces[0],
             &mut last_known,
             &mut last_dialog,
             &mut supervision,
+            &mut limit_resume,
         );
         daemon.join().unwrap();
 
@@ -2268,10 +3757,14 @@ mod tests {
         // worktree is checked out on the task branch, cut from main.
         let work_dir = home.join("repo");
         std::fs::create_dir_all(&work_dir).unwrap();
-        assert!(git_in(&work_dir, &["init", "-q", "-b", "main"]).status.success());
+        assert!(git_in(&work_dir, &["init", "-q", "-b", "main"])
+            .status
+            .success());
         std::fs::write(work_dir.join("README.md"), "# repo\n").unwrap();
         assert!(git_in(&work_dir, &["add", "README.md"]).status.success());
-        assert!(git_in(&work_dir, &["commit", "-q", "-m", "init"]).status.success());
+        assert!(git_in(&work_dir, &["commit", "-q", "-m", "init"])
+            .status
+            .success());
 
         let project = local_project(&work_dir);
         let wt = shelbi_orchestrator::workspace::workspace_worktree(
@@ -2281,15 +3774,21 @@ mod tests {
         std::fs::create_dir_all(wt.parent().unwrap()).unwrap();
         assert!(git_in(
             &work_dir,
-            &["worktree", "add", "-q", "-b", "shelbi/fix-login", wt.to_str().unwrap(), "main"],
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                "shelbi/fix-login",
+                wt.to_str().unwrap(),
+                "main"
+            ],
         )
         .status
         .success());
         assert_eq!(
-            String::from_utf8_lossy(
-                &git_in(&wt, &["rev-parse", "--abbrev-ref", "HEAD"]).stdout
-            )
-            .trim(),
+            String::from_utf8_lossy(&git_in(&wt, &["rev-parse", "--abbrev-ref", "HEAD"]).stdout)
+                .trim(),
             "shelbi/fix-login",
         );
 
@@ -2320,10 +3819,8 @@ mod tests {
 
         // Worktree HEAD is detached; the branch is no longer held.
         assert_eq!(
-            String::from_utf8_lossy(
-                &git_in(&wt, &["rev-parse", "--abbrev-ref", "HEAD"]).stdout
-            )
-            .trim(),
+            String::from_utf8_lossy(&git_in(&wt, &["rev-parse", "--abbrev-ref", "HEAD"]).stdout)
+                .trim(),
             "HEAD",
             "worker worktree must be detached from the task branch"
         );
@@ -2577,7 +4074,10 @@ transitions:
         );
 
         assert_eq!(
-            shelbi_state::load_task("demo", "stuck-a").unwrap().task.column,
+            shelbi_state::load_task("demo", "stuck-a")
+                .unwrap()
+                .task
+                .column,
             Column::in_progress(),
             "task must stay in-progress when no advance target exists"
         );
