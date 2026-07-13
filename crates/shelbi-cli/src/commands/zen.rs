@@ -147,6 +147,16 @@ pub enum ZenCmd {
 pub fn run(project_opt: Option<String>, cmd: ZenCmd) -> Result<()> {
     let project_name = require_project(project_opt)?;
 
+    // Version gate: mode flips, PR primitives, and the probe (which
+    // rebases the branch) mutate state — refuse them against a stale
+    // daemon. The observational subcommands warn and proceed.
+    match &cmd {
+        ZenCmd::Status | ZenCmd::Scan | ZenCmd::CiWatch { .. } | ZenCmd::DryRun { .. } => {
+            super::hub_version::warn_on_mismatch()
+        }
+        _ => super::hub_version::ensure_daemon_matches_for_mutation()?,
+    }
+
     match cmd {
         ZenCmd::On => set(&project_name, ZenModeState::On),
         ZenCmd::Off => set(&project_name, ZenModeState::Off),

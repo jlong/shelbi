@@ -187,6 +187,13 @@ pub struct App {
     /// Stale entries (machine names not declared in the current project)
     /// are silently ignored at row-build time — no error, no warning.
     pub collapsed_machines: BTreeSet<String>,
+    /// Preformatted daemon/CLI version segment for the footer, refreshed
+    /// with the rest of the sidebar state. `None` until the first refresh
+    /// (the row renders blank).
+    pub daemon_version_line: Option<String>,
+    /// True when the probed daemon version differs from this binary —
+    /// the footer paints [`App::daemon_version_line`] red instead of dim.
+    pub daemon_version_mismatch: bool,
 }
 
 impl App {
@@ -207,7 +214,31 @@ impl App {
             display_style: DisplayStyle::detect(),
             list_area: Rect::default(),
             collapsed_machines: BTreeSet::new(),
+            daemon_version_line: None,
+            daemon_version_mismatch: false,
         }
+    }
+
+    /// Probe the hub daemon and precompute the footer version segment. A match
+    /// still labels both sides so the daemon and CLI versions remain explicit;
+    /// a mismatch also names the fix and flips
+    /// [`App::daemon_version_mismatch`] so the footer flags it.
+    pub fn probe_daemon_version(&mut self) {
+        let cli = env!("CARGO_PKG_VERSION");
+        let (line, mismatch) = match shelbi_state::daemon_version_status() {
+            shelbi_state::DaemonVersionStatus::NotRunning => {
+                (format!("daemon not running · cli {cli}"), false)
+            }
+            shelbi_state::DaemonVersionStatus::Match { version } => {
+                (format!("daemon {version} · cli {cli}"), false)
+            }
+            shelbi_state::DaemonVersionStatus::Mismatch { daemon } => (
+                format!("daemon {daemon} ≠ cli {cli} — shelbi daemon restart"),
+                true,
+            ),
+        };
+        self.daemon_version_line = Some(line);
+        self.daemon_version_mismatch = mismatch;
     }
 
     /// Borrow the keymaps populated at startup by `run_sidebar`. The
@@ -410,6 +441,11 @@ impl App {
     }
 
     pub fn refresh(&mut self) -> Result<()> {
+        // The daemon can be restarted independently of this long-lived
+        // sidebar process after a package upgrade. Re-probe on the normal
+        // refresh cadence so a stale red mismatch clears without requiring a
+        // separate `shelbi reload sidebar`.
+        self.probe_daemon_version();
         self.agents = load_agents(&self.project_name).unwrap_or_default();
         let review =
             shelbi_state::list_column(&self.project_name, Column::review()).unwrap_or_default();
@@ -963,8 +999,53 @@ mod tests {
         WorkspaceSpec,
     };
     use std::collections::BTreeMap;
+    use std::ffi::OsString;
+    use std::io::{Read, Write};
+    use std::net::Shutdown;
+    use std::os::unix::net::UnixListener;
 
     use crate::test_support::ENV_LOCK as TEST_LOCK;
+
+    struct EnvVarGuard {
+        key: &'static str,
+        previous: Option<OsString>,
+    }
+
+    impl EnvVarGuard {
+        fn set(key: &'static str, value: impl AsRef<std::ffi::OsStr>) -> Self {
+            let previous = std::env::var_os(key);
+            std::env::set_var(key, value);
+            Self { key, previous }
+        }
+    }
+
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            match self.previous.take() {
+                Some(value) => std::env::set_var(self.key, value),
+                None => std::env::remove_var(self.key),
+            }
+        }
+    }
+
+    fn serve_probe_hellos(
+        listener: UnixListener,
+        hellos: Vec<shelbi_state::DaemonHello>,
+    ) -> std::thread::JoinHandle<()> {
+        std::thread::spawn(move || {
+            for hello in hellos {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut request = Vec::new();
+                stream.read_to_end(&mut request).unwrap();
+                assert!(
+                    request.is_empty(),
+                    "version probes must negotiate with EOF, got {request:?}"
+                );
+                stream.write_all(hello.to_line().as_bytes()).unwrap();
+                let _ = stream.shutdown(Shutdown::Both);
+            }
+        })
+    }
 
     fn fresh_home() -> std::path::PathBuf {
         let p = std::env::temp_dir().join(format!(
@@ -977,6 +1058,88 @@ mod tests {
         ));
         std::fs::create_dir_all(&p).unwrap();
         p
+    }
+
+    #[test]
+    fn daemon_version_refresh_changes_mismatch_to_match_without_reload() {
+        let _lock = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let home = fresh_home();
+        let _home_env = EnvVarGuard::set("SHELBI_HOME", &home);
+        // macOS limits Unix-domain socket paths to roughly 104 bytes.
+        let sock =
+            std::path::PathBuf::from(format!("/tmp/shb-tui-refresh-{}.sock", std::process::id()));
+        let _ = std::fs::remove_file(&sock);
+        let listener = UnixListener::bind(&sock).unwrap();
+        let _sock_env = EnvVarGuard::set("SHELBI_HUB_SOCK", &sock);
+        let cli = env!("CARGO_PKG_VERSION");
+        let server = serve_probe_hellos(
+            listener,
+            vec![
+                shelbi_state::DaemonHello::new("0.1.0"),
+                shelbi_state::DaemonHello::new(cli),
+            ],
+        );
+
+        let mut app = App::new_sidebar("demo");
+        app.refresh().unwrap();
+        assert!(app.daemon_version_mismatch);
+        let stale = app.daemon_version_line.as_deref().unwrap();
+        assert!(stale.contains("daemon 0.1.0"), "got: {stale}");
+        assert!(stale.contains(&format!("cli {cli}")), "got: {stale}");
+        assert!(stale.contains("shelbi daemon restart"), "got: {stale}");
+
+        // The same long-lived App observes the relaunched current daemon on
+        // its next ordinary refresh; no sidebar reconstruction/reload occurs.
+        app.refresh().unwrap();
+        assert!(!app.daemon_version_mismatch);
+        assert_eq!(
+            app.daemon_version_line.as_deref(),
+            Some(format!("daemon {cli} · cli {cli}").as_str())
+        );
+
+        server.join().unwrap();
+        let _ = std::fs::remove_file(&sock);
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn daemon_version_display_identifies_protocol_skew() {
+        let _lock = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let home = fresh_home();
+        let _home_env = EnvVarGuard::set("SHELBI_HOME", &home);
+        let sock =
+            std::path::PathBuf::from(format!("/tmp/shb-tui-protocol-{}.sock", std::process::id()));
+        let _ = std::fs::remove_file(&sock);
+        let listener = UnixListener::bind(&sock).unwrap();
+        let _sock_env = EnvVarGuard::set("SHELBI_HUB_SOCK", &sock);
+        let mut hello = shelbi_state::DaemonHello::new(env!("CARGO_PKG_VERSION"));
+        hello.protocol = shelbi_state::HUB_PROTOCOL_VERSION + 1;
+        let server = serve_probe_hellos(listener, vec![hello]);
+
+        let mut app = App::new_sidebar("demo");
+        app.refresh().unwrap();
+
+        assert!(app.daemon_version_mismatch);
+        let line = app.daemon_version_line.as_deref().unwrap();
+        assert!(
+            line.contains(&format!(
+                "socket protocol {}",
+                shelbi_state::HUB_PROTOCOL_VERSION + 1
+            )),
+            "got: {line}"
+        );
+        assert!(
+            line.contains(&format!(
+                "this CLI speaks {}",
+                shelbi_state::HUB_PROTOCOL_VERSION
+            )),
+            "got: {line}"
+        );
+        assert!(line.contains("shelbi daemon restart"), "got: {line}");
+
+        server.join().unwrap();
+        let _ = std::fs::remove_file(&sock);
+        let _ = std::fs::remove_dir_all(&home);
     }
 
     fn fixture_project() -> Project {

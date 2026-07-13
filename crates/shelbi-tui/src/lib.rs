@@ -188,6 +188,8 @@ pub fn run_sidebar(project_name: &str) -> Result<()> {
 
     let mut term = setup_terminal().context("setting up terminal")?;
     let mut app = App::new_sidebar(project_name);
+    // `refresh` also probes daemon compatibility. Keeping that in the normal
+    // refresh path lets the footer clear itself after `shelbi daemon restart`.
     app.refresh().ok();
     if startup_warnings > 0 {
         app.status_line = startup_warnings_status_line(startup_warnings);

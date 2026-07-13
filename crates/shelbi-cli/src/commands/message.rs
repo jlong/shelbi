@@ -68,6 +68,9 @@ pub fn run(
     in_response_to: Option<String>,
 ) -> Result<()> {
     let project_name = require_project(project_opt)?;
+    // Version gate: the push writes the message log and arms the daemon's
+    // ack timer — a stale daemon mishandles both.
+    super::hub_version::ensure_daemon_matches_for_mutation()?;
     let project = shelbi_state::load_project(&project_name).map_err(|e| anyhow!(e))?;
     let tf = shelbi_state::load_task(&project_name, &id).map_err(|e| anyhow!(e))?;
 
@@ -211,7 +214,7 @@ fn tail_pid_alive(host: &Host, messages_dir: &std::path::Path, task_id: &str) ->
 /// every other inbound message. Best-effort: any error is swallowed —
 /// the push is durable on disk regardless of whether the timer arms.
 fn notify_daemon_message_pushed(project: &str, task_id: &str, msg_id: &str) {
-    use std::io::{Read, Write};
+    use std::io::Write;
     use std::os::unix::net::UnixStream;
     use std::time::Duration;
 
@@ -238,10 +241,10 @@ fn notify_daemon_message_pushed(project: &str, task_id: &str, msg_id: &str) {
     // Wait (briefly) for the daemon's ack so the connection isn't torn
     // down while the daemon is still dispatching. Still best-effort: a
     // missing ack just means the timeout timer may not be armed, and the
-    // push itself is already durable on disk.
+    // push itself is already durable on disk. The shared reader also skips
+    // the briefly-shipped server-first hello for rolling compatibility.
     let _ = stream.set_read_timeout(Some(Duration::from_millis(500)));
-    let mut ack = [0u8; shelbi_state::DAEMON_ACK.len()];
-    let _ = stream.read(&mut ack);
+    let _ = shelbi_state::read_daemon_ack(&stream);
 }
 
 /// Is `path` a directory on `host`? `test -d` is a real binary on both Linux

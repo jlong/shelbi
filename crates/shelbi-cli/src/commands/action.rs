@@ -104,6 +104,8 @@ pub enum ActionCmd {
 
 pub fn run(project_opt: Option<String>, cmd: ActionCmd) -> Result<()> {
     let project_name = require_project(project_opt)?;
+    // Every action primitive changes git/PR or transition state.
+    super::hub_version::ensure_daemon_matches_for_mutation()?;
     let project = load_project(&project_name).map_err(|e| anyhow!(e))?;
 
     match cmd {
