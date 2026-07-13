@@ -1382,7 +1382,7 @@ fn deploy_and_spawn(a: SpawnArgs<'_>) -> Result<()> {
     //    alpha). Instead we abort the dispatch cleanly: record an actionable
     //    event and return an error so the caller leaves the task in its
     //    ready-category column for a clean retry.
-    if submit_profile.has_ui_verifier() {
+    if submit_profile.uses_claude_ui() {
         if !crate::ready::wait_for_claude_ready(a.host, a.addr, crate::ready::READY_TIMEOUT)? {
             if let Err(e) = shelbi_state::append_dispatch_event(
                 a.task_id,

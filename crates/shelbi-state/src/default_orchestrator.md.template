@@ -238,7 +238,7 @@ One bullet per event prefix. React to every matching line.
 
 - `send project=<you> workspace=<name> status=<status> detail=<reason>` →
   `submitted` and `queued` are informational; the delivery was accepted.
-  `unverified` is the safe capability fallback for a non-Claude runner: text
+  `unverified` is the safe capability fallback for a custom runner: text
   and a separate Enter were delivered, but consumption was not proven. Do not
   retry it blindly; mention the uncertainty when the instruction is material.
   For `status=stuck`, do not assume the worker received the text. Surface the

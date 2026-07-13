@@ -171,7 +171,7 @@ pub fn run(project_opt: Option<String>, args: Args) -> Result<()> {
     //    retain the conservative startup settle and explicit unverified
     //    delivery verdict.
     let submit_profile = shelbi_orchestrator::submit::SubmitProfile::for_runner(&runner_spec);
-    if submit_profile.has_ui_verifier() {
+    if submit_profile.uses_claude_ui() {
         let ready = match shelbi_orchestrator::ready::wait_for_claude_ready(
             &host,
             &addr,

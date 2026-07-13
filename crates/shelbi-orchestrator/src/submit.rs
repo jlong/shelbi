@@ -24,12 +24,10 @@
 //!    the input box no longer holding the text. If nothing lands and the
 //!    text is visibly parked in the box, retry Enter once and poll again.
 //!
-//! Claude's UI exposes enough stable evidence for Shelbi to verify and retry a
-//! submit. Other runners still use the same text → settle → separate-Enter
-//! delivery sequence, but return [`SubmitStatus::DeliveredUnverified`] instead
-//! of being inspected with Claude-specific screen parsing. This capability
-//! gate preserves safe delivery for Codex and custom runners without inventing
-//! false `stuck` verdicts from UI chrome they do not render.
+//! Claude and Codex expose enough stable UI evidence for Shelbi to verify and
+//! retry a submit. Custom runners still use the same text → settle → separate-
+//! Enter delivery sequence, but return [`SubmitStatus::DeliveredUnverified`]
+//! instead of being inspected with a foreign screen parser.
 //!
 //! The result is a [`SubmitStatus`] the caller maps to its own events.log
 //! vocabulary (`dispatch … status=confirmed`, `send … status=submitted`),
@@ -46,13 +44,14 @@ use shelbi_state::PaneMarker;
 
 /// Verification capability for the runner receiving a pane injection.
 ///
-/// Delivery is shared for every runner. Only Claude may use the input-box and
-/// spinner parser below; applying those heuristics to Codex or a custom TUI can
-/// turn a successful send into a false failure and can make the retry Enter
-/// submit unrelated input.
+/// Delivery is shared for every runner. Claude and Codex each use their own
+/// composer/busy parser; applying either parser to a custom TUI could turn a
+/// successful send into a false failure and make the retry Enter submit
+/// unrelated input.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SubmitProfile {
     ClaudeUi,
+    CodexUi,
     DeliveryOnly,
 }
 
@@ -60,6 +59,8 @@ impl SubmitProfile {
     pub fn for_runner(runner: &AgentRunnerSpec) -> Self {
         if shelbi_agent::is_claude_runner(&runner.command) {
             Self::ClaudeUi
+        } else if shelbi_agent::is_codex_runner(&runner.command) {
+            Self::CodexUi
         } else {
             Self::DeliveryOnly
         }
@@ -68,6 +69,12 @@ impl SubmitProfile {
     /// Whether Shelbi knows how to locate and interpret this runner's live
     /// input UI. Callers use this to avoid Claude-only readiness probes too.
     pub fn has_ui_verifier(self) -> bool {
+        self != Self::DeliveryOnly
+    }
+
+    /// Whether startup readiness may use Claude's bordered-composer parser.
+    /// Codex has submit verification but a different startup UI.
+    pub fn uses_claude_ui(self) -> bool {
         self == Self::ClaudeUi
     }
 }
@@ -158,14 +165,26 @@ impl PaneBaseline {
                 title_working: false,
             };
         }
-        let title_working = matches!(
-            shelbi_state::parse_pane_title_marker(title),
-            Some(PaneMarker::Working)
-        );
+        let title_working = profile == SubmitProfile::ClaudeUi
+            && matches!(
+                shelbi_state::parse_pane_title_marker(title),
+                Some(PaneMarker::Working)
+            );
+        let (busy, actively_busy) = match profile {
+            SubmitProfile::ClaudeUi => (
+                claude_is_processing(screen),
+                title_working || claude_is_actively_processing(visible_screen),
+            ),
+            SubmitProfile::CodexUi => (
+                codex_is_processing(screen),
+                codex_is_processing(visible_screen),
+            ),
+            SubmitProfile::DeliveryOnly => (false, false),
+        };
         PaneBaseline {
             profile,
-            busy: claude_is_processing(screen),
-            actively_busy: title_working || claude_is_actively_processing(visible_screen),
+            busy,
+            actively_busy,
             title_working,
         }
     }
@@ -181,6 +200,12 @@ impl PaneBaseline {
             actively_busy: false,
             title_working: false,
         }
+    }
+
+    /// Whether the runner was visibly processing a turn at capture time.
+    /// Wake schedulers use this to defer delivery until the pane is idle.
+    pub fn is_actively_busy(&self) -> bool {
+        self.actively_busy
     }
 }
 
@@ -314,7 +339,7 @@ fn verify_submitted_guarded(
             detail: "verification_unsupported",
         };
     }
-    verify_submitted_with(
+    verify_submitted_with_profile(
         text,
         || wait_for_prompt_submitted(host, addr, text, baseline, PROMPT_SUBMIT_WAIT),
         || shelbi_tmux::capture(host, addr).unwrap_or_default(),
@@ -330,17 +355,19 @@ fn verify_submitted_guarded(
             }
             true
         },
+        baseline.profile,
     )
 }
 
 /// State-machine core for [`verify_submitted`]. The injected operations make
 /// the retry bound and verdicts deterministic in unit tests without waiting
 /// through real tmux deadlines.
-fn verify_submitted_with(
+fn verify_submitted_with_profile(
     text: &str,
     mut wait_for_submit: impl FnMut() -> bool,
     mut capture: impl FnMut() -> String,
     mut retry_enter: impl FnMut() -> bool,
+    profile: SubmitProfile,
 ) -> SubmitStatus {
     if wait_for_submit() {
         return SubmitStatus::Submitted {
@@ -351,7 +378,7 @@ fn verify_submitted_with(
     // only if the text is genuinely still parked in the input box. If it's
     // cleared (submitted; busy signal just missed) or we can't see the box,
     // there's nothing a retry would fix.
-    if input_holds_unsubmitted_prompt(&capture(), text) {
+    if profile_input_holds_unsubmitted(&capture(), text, profile) {
         // First Enter likely raced claude's focus. Exactly one retry is
         // allowed; after that we surface StillInBox instead of spamming keys.
         if !retry_enter() {
@@ -362,11 +389,27 @@ fn verify_submitted_with(
                 detail: "retry_enter",
             };
         }
-        if input_holds_unsubmitted_prompt(&capture(), text) {
+        if profile_input_holds_unsubmitted(&capture(), text, profile) {
             return SubmitStatus::StillInBox;
         }
     }
     SubmitStatus::Unconfirmed
+}
+
+#[cfg(test)]
+fn verify_submitted_with(
+    text: &str,
+    wait_for_submit: impl FnMut() -> bool,
+    capture: impl FnMut() -> String,
+    retry_enter: impl FnMut() -> bool,
+) -> SubmitStatus {
+    verify_submitted_with_profile(
+        text,
+        wait_for_submit,
+        capture,
+        retry_enter,
+        SubmitProfile::ClaudeUi,
+    )
 }
 
 /// Poll the pane until we have proof the text got submitted, or `timeout`
@@ -416,7 +459,7 @@ fn wait_for_prompt_submitted(
 ) -> bool {
     let start = std::time::Instant::now();
     while start.elapsed() < timeout {
-        if !baseline.title_working {
+        if baseline.profile == SubmitProfile::ClaudeUi && !baseline.title_working {
             let title = shelbi_tmux::pane_title(host, addr).unwrap_or_default();
             if title_signals_submit(&title) {
                 return true;
@@ -430,7 +473,7 @@ fn wait_for_prompt_submitted(
         // footer.
         let screen =
             shelbi_tmux::capture_history(host, addr, PROMPT_SUBMIT_SCROLLBACK).unwrap_or_default();
-        if screen_shows_submitted(&screen, text, baseline.busy) {
+        if screen_shows_submitted_profile(&screen, text, baseline.busy, baseline.profile) {
             return true;
         }
         std::thread::sleep(PROMPT_SUBMIT_POLL);
@@ -465,11 +508,26 @@ fn title_signals_submit(title: &str) -> bool {
 ///   safe on resume: before delivery the box was empty (readiness passed),
 ///   so a cleared box after delivery can only mean the text we typed was
 ///   taken.
-fn screen_shows_submitted(screen: &str, text: &str, stale_busy: bool) -> bool {
-    if !stale_busy && claude_is_processing(screen) {
+fn screen_shows_submitted_profile(
+    screen: &str,
+    text: &str,
+    stale_busy: bool,
+    profile: SubmitProfile,
+) -> bool {
+    let processing = match profile {
+        SubmitProfile::ClaudeUi => claude_is_processing(screen),
+        SubmitProfile::CodexUi => codex_is_processing(screen),
+        SubmitProfile::DeliveryOnly => false,
+    };
+    if !stale_busy && processing {
         return true;
     }
-    input_box_cleared(screen, text)
+    profile_input_box_cleared(screen, text, profile)
+}
+
+#[cfg(test)]
+fn screen_shows_submitted(screen: &str, text: &str, stale_busy: bool) -> bool {
+    screen_shows_submitted_profile(screen, text, stale_busy, SubmitProfile::ClaudeUi)
 }
 
 /// Minimum number of non-whitespace characters a captured input-box line must
@@ -633,6 +691,61 @@ pub fn input_holds_unsubmitted_prompt(screen: &str, text: &str) -> bool {
 /// it's an un-submitted prompt ([`input_holds_unsubmitted_prompt`]).
 fn input_box_cleared(screen: &str, text: &str) -> bool {
     input_box_lines(screen).is_some() && !input_holds_unsubmitted_prompt(screen, text)
+}
+
+fn profile_input_holds_unsubmitted(screen: &str, text: &str, profile: SubmitProfile) -> bool {
+    match profile {
+        SubmitProfile::ClaudeUi => input_holds_unsubmitted_prompt(screen, text),
+        SubmitProfile::CodexUi => codex_input_holds_prompt(screen, text),
+        SubmitProfile::DeliveryOnly => false,
+    }
+}
+
+fn profile_input_box_cleared(screen: &str, text: &str, profile: SubmitProfile) -> bool {
+    match profile {
+        SubmitProfile::ClaudeUi => input_box_cleared(screen, text),
+        SubmitProfile::CodexUi => {
+            codex_input_line(screen).is_some() && !codex_input_holds_prompt(screen, text)
+        }
+        SubmitProfile::DeliveryOnly => false,
+    }
+}
+
+/// Codex renders its live composer as a bottom-of-screen `› …` row rather
+/// than Claude's bordered box. Restrict the match to the tail so a submitted
+/// `› prompt` in conversation history cannot be mistaken for parked input.
+fn codex_input_line(screen: &str) -> Option<&str> {
+    screen
+        .lines()
+        .rev()
+        .take(8)
+        .find_map(|line| line.trim_start().strip_prefix('›').map(str::trim_start))
+}
+
+fn codex_input_holds_prompt(screen: &str, text: &str) -> bool {
+    let Some(line) = codex_input_line(screen) else {
+        return false;
+    };
+    let line = squeeze_ws(line);
+    let text = squeeze_ws(text);
+    if line.starts_with("[PastedContent") || line.starts_with("[Pastedtext") {
+        return true;
+    }
+    !text.is_empty()
+        && if text.chars().count() < PROMPT_ECHO_MIN_MATCH {
+            line == text
+        } else {
+            line.chars().count() >= PROMPT_ECHO_MIN_MATCH
+                && (text.contains(&line) || line.contains(&text))
+        }
+}
+
+/// Stable Codex current-turn chrome. Unlike Claude's historical token footer,
+/// this interrupt hint is present only while a turn is running and disappears
+/// when the live composer becomes available again.
+fn codex_is_processing(screen: &str) -> bool {
+    let lower = screen.to_ascii_lowercase();
+    lower.contains("esc to interrupt") || lower.contains("ctrl+c to stop")
 }
 
 /// True when the captured pane shows claude is actively processing a
@@ -804,14 +917,14 @@ mod tests {
     }
 
     #[test]
-    fn runner_profile_capability_gates_claude_ui_parsing() {
+    fn runner_profile_capability_gates_supported_ui_parsing() {
         assert_eq!(
             SubmitProfile::for_runner(&runner("/opt/bin/claude")),
             SubmitProfile::ClaudeUi
         );
         assert_eq!(
             SubmitProfile::for_runner(&runner("codex")),
-            SubmitProfile::DeliveryOnly
+            SubmitProfile::CodexUi
         );
         assert_eq!(
             SubmitProfile::for_runner(&runner("custom-agent")),
@@ -832,6 +945,53 @@ mod tests {
                 detail: "verification_unsupported"
             }
         );
+    }
+
+    #[test]
+    fn codex_profile_detects_busy_idle_and_parked_input() {
+        let busy = "• Working (4s)\n  esc to interrupt";
+        let idle = "› Ask Codex to do anything\n\n  ? for shortcuts";
+        let parked = "› [shelbi board wake] Project events are pending. Drain them now.\n\n  ? for shortcuts";
+        assert!(codex_is_processing(busy));
+        assert!(!codex_is_processing(idle));
+        assert!(profile_input_box_cleared(
+            idle,
+            "[shelbi board wake] Project events are pending. Drain them now.",
+            SubmitProfile::CodexUi,
+        ));
+        assert!(profile_input_holds_unsubmitted(
+            parked,
+            "[shelbi board wake] Project events are pending. Drain them now.",
+            SubmitProfile::CodexUi,
+        ));
+    }
+
+    #[test]
+    fn codex_dropped_submit_retries_enter_once() {
+        let waits = Cell::new(0);
+        let retries = Cell::new(0);
+        let text = "[shelbi board wake] Project events are pending. Drain them now.";
+        let parked = format!("› {text}\n\n  ? for shortcuts");
+        let status = verify_submitted_with_profile(
+            text,
+            || {
+                waits.set(waits.get() + 1);
+                waits.get() == 2
+            },
+            || parked.clone(),
+            || {
+                retries.set(retries.get() + 1);
+                true
+            },
+            SubmitProfile::CodexUi,
+        );
+        assert_eq!(
+            status,
+            SubmitStatus::Submitted {
+                detail: "retry_enter"
+            }
+        );
+        assert_eq!(retries.get(), 1);
     }
 
     fn visible_short_message(text: &str) -> String {

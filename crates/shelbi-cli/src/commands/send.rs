@@ -435,7 +435,9 @@ mod tests {
         match resolve_target(&project, "bravo").unwrap() {
             ResolvedTarget::Workspace { runner, .. } => {
                 assert_eq!(runner.command, "/opt/homebrew/bin/codex");
-                assert!(!SubmitProfile::for_runner(&runner).has_ui_verifier());
+                let profile = SubmitProfile::for_runner(&runner);
+                assert!(profile.has_ui_verifier());
+                assert!(!profile.uses_claude_ui());
             }
             ResolvedTarget::LegacyAgent { .. } => {
                 panic!("expected workspace resolution, got legacy")

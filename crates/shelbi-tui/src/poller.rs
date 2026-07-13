@@ -140,6 +140,11 @@ fn run_poller_loop(project_name: String, shutdown: Arc<AtomicBool>) {
     // alongside the heartbeat rather than inside any per-workspace thread.
     let mut orch_supervision = SupervisionState::default();
 
+    // Codex cannot turn background tail output into a model turn. Keep a
+    // project-wide coalescing watermark and wake its pinned orchestrator pane
+    // from actionable records beyond the durable drain cursor.
+    let mut codex_wake = shelbi_orchestrator::wake::CodexWakeState::default();
+
     loop {
         if shutdown.load(Ordering::SeqCst) {
             break;
@@ -202,6 +207,11 @@ fn run_poller_loop(project_name: String, shutdown: Arc<AtomicBool>) {
                 // Relaunch the orchestrator pane if it crashed (Zen stays off after
                 // the restart via its own `__zen-orch-start` crash-recovery step).
                 maybe_supervise_orchestrator(&project, &mut orch_supervision);
+
+                // Run after event emission and crash supervision so this tick can wake
+                // for a just-appended transition, while a relaunched orchestrator gets
+                // its bootstrap turn before any deferred wake is submitted.
+                shelbi_orchestrator::wake::maybe_wake_codex(&project, &mut codex_wake);
             }
             Err(e) => tracing::debug!(
                 project = %project.name,
