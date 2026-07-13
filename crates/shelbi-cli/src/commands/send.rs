@@ -24,7 +24,8 @@
 
 use anyhow::{anyhow, Result};
 use chrono::Utc;
-use shelbi_core::{Host, Project, Status, TmuxAddr};
+use shelbi_core::{AgentRunnerSpec, Host, Project, Status, TmuxAddr};
+use shelbi_orchestrator::submit::{PaneBaseline, SubmitProfile, SubmitStatus};
 use shelbi_orchestrator::workspace as orch_workspace;
 
 use super::require_project;
@@ -32,9 +33,19 @@ use super::require_project;
 pub fn run(project: Option<String>, id: String, message: String) -> Result<()> {
     let project_name = require_project(project)?;
     let project = shelbi_state::load_project(&project_name).map_err(|e| anyhow!(e))?;
+    let target = resolve_target(&project, &id)?;
 
-    match resolve_target(&project, &id)? {
-        ResolvedTarget::Workspace { host, addr } => {
+    // Keep the text -> settle -> Enter sequence atomic with respect to every
+    // other dispatch, restart, or send targeting this workspace. Dispatch and
+    // resume hold this same lock across pane recreation and prompt delivery;
+    // using it here also serializes concurrent CLI sends so their 300ms settle
+    // windows cannot merge two messages into one Claude prompt. Legacy agent
+    // ids use the same flat lock namespace.
+    let _pane_injection_lock =
+        shelbi_state::lock_workspace(&project_name, &id).map_err(|e| anyhow!(e))?;
+
+    match target {
+        ResolvedTarget::Workspace { host, addr, runner } => {
             // Pane must be live — the workspace can be declared but idle, in
             // which case there's no runner to send to. Surface that as an
             // actionable error rather than the opaque `os error 2` the
@@ -49,12 +60,12 @@ pub fn run(project: Option<String>, id: String, message: String) -> Result<()> {
                     addr.target(),
                 ));
             }
-            shelbi_tmux::send_line(&host, &addr, &message).map_err(|e| anyhow!(e))?;
-            println!("✓ sent to {} ({})", id, addr.target());
+            let delivery = send_verified(&project_name, &id, &runner, &host, &addr, &message)?;
+            println!("✓ {delivery} to {} ({})", id, addr.target());
             Ok(())
         }
-        ResolvedTarget::LegacyAgent { host, addr } => {
-            shelbi_tmux::send_line(&host, &addr, &message).map_err(|e| anyhow!(e))?;
+        ResolvedTarget::LegacyAgent { host, addr, runner } => {
+            let delivery = send_verified(&project_name, &id, &runner, &host, &addr, &message)?;
             // Legacy path keeps the agent-file housekeeping the old
             // implementation did — bumping `status: running` + `updated`
             // and appending to the per-agent log so `shelbi tail` still
@@ -66,21 +77,128 @@ pub fn run(project: Option<String>, id: String, message: String) -> Result<()> {
                 .map_err(|e| anyhow!(e))?;
             shelbi_state::append_log(&project_name, &id, &format!("send: {message}"))
                 .map_err(|e| anyhow!(e))?;
-            println!("✓ sent to {} ({})", id, addr.target());
+            println!("✓ {delivery} to {} ({})", id, addr.target());
             Ok(())
         }
     }
 }
 
+/// Human-facing success wording for a verified pane injection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum SendDelivery {
+    Submitted,
+    /// Claude was already working. The separately-delivered Enter leaves the
+    /// text in its visible queued-input area until the current turn ends; that
+    /// is an accepted delivery, not a stuck idle prompt.
+    Queued,
+    /// The runner has no pane parser Shelbi knows how to verify. Text and
+    /// Enter were still delivered through the shared race-safe primitive,
+    /// but the CLI is explicit that no runner-specific submit signal exists.
+    Unverified,
+}
+
+impl std::fmt::Display for SendDelivery {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SendDelivery::Submitted => f.write_str("sent"),
+            SendDelivery::Queued => f.write_str("queued"),
+            SendDelivery::Unverified => f.write_str("sent (unverified)"),
+        }
+    }
+}
+
+/// Route `shelbi send` through the orchestrator's shared verified-submit
+/// primitive and record every verdict. A transport failure is also surfaced
+/// as `status=stuck`: without that event, an orchestrator tailing events.log
+/// would still silently assume the nudge arrived.
+pub(super) fn send_verified(
+    project: &str,
+    id: &str,
+    runner: &AgentRunnerSpec,
+    host: &Host,
+    addr: &TmuxAddr,
+    message: &str,
+) -> Result<SendDelivery> {
+    let profile = SubmitProfile::for_runner(runner);
+    let baseline = PaneBaseline::capture(host, addr, profile);
+    let status = match shelbi_orchestrator::submit::send_verified(host, addr, message, &baseline) {
+        Ok(status) => status,
+        Err(e) => {
+            shelbi_state::append_send_event(project, id, "stuck", "transport_error")
+                .map_err(|log_err| {
+                    anyhow!(
+                        "sending to `{id}` failed ({e}); recording the stuck delivery also failed: {log_err}"
+                    )
+                })?;
+            return Err(anyhow!("sending to `{id}` failed: {e}"));
+        }
+    };
+
+    // A busy baseline alone is stale by the time the verifier has spent up
+    // to two polling windows waiting. Claude may have completed that turn in
+    // the meantime, leaving a genuinely wedged prompt in an idle input box.
+    // Accept visible input as a queue only when the pane was busy before the
+    // send and still has strong current-turn evidence at the final verdict.
+    let finally_actively_busy = matches!(status, SubmitStatus::StillInBox)
+        && PaneBaseline::capture(host, addr, profile).actively_busy;
+    let (event_status, detail, delivery) = classify_delivery(
+        status,
+        baseline.actively_busy,
+        finally_actively_busy,
+    );
+    shelbi_state::append_send_event(project, id, event_status, detail).map_err(|e| anyhow!(e))?;
+    delivery.ok_or_else(|| {
+        anyhow!(
+            "message to `{id}` is stuck in {} after a retry Enter; the failure was recorded in events.log",
+            addr.target()
+        )
+    })
+}
+
+/// Map the transport-neutral verifier result to `shelbi send` semantics.
+/// A visibly parked message is acceptable only when the pane was genuinely
+/// busy both before delivery and at the final verdict: Claude keeps submitted
+/// mid-turn input visible as a queue and consumes it when the current turn
+/// ends. The same screen after that turn has ended is the bug this command
+/// must report as stuck.
+fn classify_delivery(
+    status: SubmitStatus,
+    baseline_actively_busy: bool,
+    finally_actively_busy: bool,
+) -> (&'static str, &'static str, Option<SendDelivery>) {
+    match status {
+        SubmitStatus::Submitted { detail } => ("submitted", detail, Some(SendDelivery::Submitted)),
+        SubmitStatus::DeliveredUnverified { detail } => {
+            ("unverified", detail, Some(SendDelivery::Unverified))
+        }
+        SubmitStatus::StillInBox if baseline_actively_busy && finally_actively_busy => (
+            "queued",
+            "busy_pane_visible_queue",
+            Some(SendDelivery::Queued),
+        ),
+        SubmitStatus::StillInBox => ("stuck", "still_in_input_after_retry", None),
+        SubmitStatus::Unconfirmed => ("stuck", "unconfirmed_after_retry", None),
+    }
+}
+
 /// Where the message should land. We resolve once up front so the
 /// send + housekeeping arms each have a single code path.
+#[derive(Debug)]
 enum ResolvedTarget {
     /// Name matched a declared workspace; address derived from the
     /// project YAML + machine spec.
-    Workspace { host: Host, addr: TmuxAddr },
+    Workspace {
+        host: Host,
+        addr: TmuxAddr,
+        runner: AgentRunnerSpec,
+    },
     /// Name only matched a legacy spawn-based agent file. Address read
     /// from the agent's frontmatter.
-    LegacyAgent { host: Host, addr: TmuxAddr },
+    LegacyAgent {
+        host: Host,
+        addr: TmuxAddr,
+        runner: AgentRunnerSpec,
+    },
 }
 
 fn resolve_target(project: &Project, id: &str) -> Result<ResolvedTarget> {
@@ -93,9 +211,16 @@ fn resolve_target(project: &Project, id: &str) -> Result<ResolvedTarget> {
         })?;
         let addr =
             orch_workspace::workspace_tmux_addr(project, workspace).map_err(|e| anyhow!(e))?;
+        let runner = project.runner(&workspace.runner).ok_or_else(|| {
+            anyhow!(
+                "workspace `{id}` references runner `{}` which is not declared in agent_runners",
+                workspace.runner
+            )
+        })?;
         return Ok(ResolvedTarget::Workspace {
             host: machine.host(),
             addr,
+            runner: runner.clone(),
         });
     }
 
@@ -108,9 +233,16 @@ fn resolve_target(project: &Project, id: &str) -> Result<ResolvedTarget> {
             let machine = project
                 .machine(&file.agent.machine)
                 .ok_or_else(|| anyhow!("machine `{}` no longer in project", file.agent.machine))?;
+            let runner = project.runner(&file.agent.runner).ok_or_else(|| {
+                anyhow!(
+                    "legacy agent `{id}` references runner `{}` which is no longer declared in agent_runners",
+                    file.agent.runner
+                )
+            })?;
             Ok(ResolvedTarget::LegacyAgent {
                 host: machine.host(),
                 addr: file.agent.tmux.clone(),
+                runner: runner.clone(),
             })
         }
         Err(_) => Err(anyhow!("{}", unknown_id_error(project, id))),
@@ -166,9 +298,10 @@ fn list_legacy_agent_ids(project: &str) -> Option<Vec<String>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::commands::test_support::{EnvGuard, ENV_LOCK};
     use shelbi_core::{
-        AgentRunnerSpec, GitConfig, HeartbeatConfig, Machine, MachineKind, OrchestratorSpec,
-        WorkspaceSpec, ZenConfig,
+        Agent, AgentRunnerSpec, GitConfig, HeartbeatConfig, Machine, MachineKind,
+        OrchestratorSpec, WorkspaceSpec, ZenConfig,
     };
     use std::collections::BTreeMap;
 
@@ -178,6 +311,15 @@ mod tests {
             "claude".to_string(),
             AgentRunnerSpec {
                 command: "claude".into(),
+                flags: vec![],
+                prompt_injection: None,
+                dialog_signatures: vec![],
+            },
+        );
+        runners.insert(
+            "codex".to_string(),
+            AgentRunnerSpec {
+                command: "/opt/homebrew/bin/codex".into(),
                 flags: vec![],
                 prompt_injection: None,
                 dialog_signatures: vec![],
@@ -240,10 +382,11 @@ mod tests {
             }],
         );
         match resolve_target(&project, "alpha").unwrap() {
-            ResolvedTarget::Workspace { host, addr } => {
+            ResolvedTarget::Workspace { host, addr, runner } => {
                 assert!(host.is_local());
                 assert_eq!(addr.session, "shelbi-demo");
                 assert_eq!(addr.window, "alpha");
+                assert_eq!(runner.command, "claude");
             }
             ResolvedTarget::LegacyAgent { .. } => {
                 panic!("expected workspace resolution, got legacy")
@@ -267,15 +410,84 @@ mod tests {
             }],
         );
         match resolve_target(&project, "delta").unwrap() {
-            ResolvedTarget::Workspace { host, addr } => {
+            ResolvedTarget::Workspace { host, addr, runner } => {
                 assert!(matches!(host, Host::Ssh { ref host } if host == "devbox"));
                 assert_eq!(addr.session, "shelbi-w-delta");
                 assert_eq!(addr.window, "agent");
+                assert_eq!(runner.command, "claude");
             }
             ResolvedTarget::LegacyAgent { .. } => {
                 panic!("expected workspace resolution, got legacy")
             }
         }
+    }
+
+    #[test]
+    fn workspace_resolution_retains_codex_runner_for_submit_gating() {
+        let project = project_with_workspaces(
+            "demo",
+            vec![WorkspaceSpec {
+                name: "bravo".into(),
+                machine: "hub".into(),
+                runner: "codex".into(),
+                tags: Vec::new(),
+                slot: None,
+            }],
+        );
+        match resolve_target(&project, "bravo").unwrap() {
+            ResolvedTarget::Workspace { runner, .. } => {
+                assert_eq!(runner.command, "/opt/homebrew/bin/codex");
+                assert!(!SubmitProfile::for_runner(&runner).has_ui_verifier());
+            }
+            ResolvedTarget::LegacyAgent { .. } => {
+                panic!("expected workspace resolution, got legacy")
+            }
+        }
+    }
+
+    #[test]
+    fn legacy_resolution_retains_runner_and_reports_removed_runner() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let env = EnvGuard::new(&["SHELBI_HOME"]);
+        env.set("SHELBI_HOME", tmp.path());
+
+        let mut project = project_with_workspaces("demo", Vec::new());
+        let now = Utc::now();
+        let agent = Agent {
+            id: "legacy-codex".into(),
+            project: project.name.clone(),
+            machine: "hub".into(),
+            runner: "codex".into(),
+            branch: "shelbi/legacy-codex".into(),
+            worktree: tmp.path().join("legacy-codex"),
+            status: Status::Running,
+            created: now,
+            updated: now,
+            tmux: TmuxAddr {
+                session: "shelbi-demo".into(),
+                window: "legacy-codex".into(),
+            },
+        };
+        shelbi_state::save_agent(&project.name, &agent, "# Task\n").unwrap();
+
+        match resolve_target(&project, "legacy-codex").unwrap() {
+            ResolvedTarget::LegacyAgent { runner, .. } => {
+                assert_eq!(runner.command, "/opt/homebrew/bin/codex");
+            }
+            ResolvedTarget::Workspace { .. } => {
+                panic!("expected legacy resolution, got workspace")
+            }
+        }
+
+        project.agent_runners.remove("codex");
+        let error = resolve_target(&project, "legacy-codex").unwrap_err();
+        assert!(
+            error.to_string().contains(
+                "legacy agent `legacy-codex` references runner `codex` which is no longer declared"
+            ),
+            "error: {error}"
+        );
     }
 
     /// An unknown name on a project with no legacy agent files surfaces
@@ -320,5 +532,70 @@ mod tests {
             msg.contains("no workspaces declared"),
             "msg should mention empty pool: {msg}"
         );
+    }
+
+    #[test]
+    fn idle_visible_input_is_stuck_but_busy_visible_input_is_queued() {
+        assert_eq!(
+            classify_delivery(SubmitStatus::StillInBox, false, false),
+            ("stuck", "still_in_input_after_retry", None)
+        );
+        assert_eq!(
+            classify_delivery(SubmitStatus::StillInBox, true, true),
+            (
+                "queued",
+                "busy_pane_visible_queue",
+                Some(SendDelivery::Queued)
+            )
+        );
+    }
+
+    #[test]
+    fn stale_busy_baseline_does_not_hide_a_wedged_idle_prompt() {
+        assert_eq!(
+            classify_delivery(SubmitStatus::StillInBox, true, false),
+            ("stuck", "still_in_input_after_retry", None)
+        );
+        assert_eq!(
+            classify_delivery(SubmitStatus::StillInBox, false, true),
+            ("stuck", "still_in_input_after_retry", None)
+        );
+    }
+
+    #[test]
+    fn confirmed_and_unconfirmed_verdicts_map_to_delivery_events() {
+        assert_eq!(
+            classify_delivery(
+                SubmitStatus::Submitted {
+                    detail: "retry_enter"
+                },
+                false,
+                false,
+            ),
+            ("submitted", "retry_enter", Some(SendDelivery::Submitted))
+        );
+        assert_eq!(
+            classify_delivery(SubmitStatus::Unconfirmed, true, true),
+            ("stuck", "unconfirmed_after_retry", None)
+        );
+    }
+
+    #[test]
+    fn unsupported_runner_delivery_is_success_but_explicitly_unverified() {
+        assert_eq!(
+            classify_delivery(
+                SubmitStatus::DeliveredUnverified {
+                    detail: "verification_unsupported"
+                },
+                false,
+                false,
+            ),
+            (
+                "unverified",
+                "verification_unsupported",
+                Some(SendDelivery::Unverified)
+            )
+        );
+        assert_eq!(SendDelivery::Unverified.to_string(), "sent (unverified)");
     }
 }

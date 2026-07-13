@@ -13,6 +13,12 @@
 //! racing the agent's own terminal I/O. `message` writes a file: nothing the
 //! agent's UI does can clobber it, and concurrent writers don't interleave
 //! (POSIX `O_APPEND` makes single writes ≤ PIPE_BUF atomic).
+//!
+//! Consequently, `message` is intentionally outside the pane verified-submit
+//! primitive. It sends neither text nor Enter to tmux. The workspace's runner
+//! hooks consume the durable file record and acknowledge its `msg_id`; routing
+//! the same body through pane injection would duplicate delivery and weaken the
+//! restart-safe contract of this channel.
 
 use anyhow::{anyhow, bail, Result};
 use chrono::{SecondsFormat, Utc};

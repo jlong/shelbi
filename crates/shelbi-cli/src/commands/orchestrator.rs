@@ -332,6 +332,9 @@ fn event_kind(parsed: &ParsedLine) -> String {
     if parsed.fields.contains_key("supervision") {
         return "supervision".into();
     }
+    if parsed.fields.contains_key("send") {
+        return "send".into();
+    }
     if parsed.fields.contains_key("dispatch") {
         return "dispatch".into();
     }
@@ -363,7 +366,11 @@ impl ParsedLine {
                 fields.insert(k.to_string(), v.to_string());
             } else if *part == "heartbeat" {
                 fields.insert("heartbeat".into(), "true".into());
-            } else if *part == "dispatch" || *part == "rebase" || *part == "zen-dryrun" {
+            } else if *part == "dispatch"
+                || *part == "send"
+                || *part == "rebase"
+                || *part == "zen-dryrun"
+            {
                 fields.insert((*part).to_string(), "true".into());
             }
         }
@@ -395,8 +402,8 @@ mod tests {
     use chrono::Utc;
     use shelbi_core::{Column, Task};
     use shelbi_state::{
-        append_external_event, append_heartbeat_event, append_task_event, append_workspace_event,
-        list_tasks, save_task, WorkspaceState,
+        append_external_event, append_heartbeat_event, append_send_event, append_task_event,
+        append_workspace_event, list_tasks, save_task, WorkspaceState,
     };
     use tempfile::TempDir;
 
@@ -487,6 +494,59 @@ mod tests {
         assert_eq!(response.events[0].workspace.as_deref(), Some("alpha"));
         assert_eq!(response.events[1].task.as_deref(), Some("owned"));
         assert_eq!(response.events[1].kind, "task_transition");
+    }
+
+    #[test]
+    fn drain_labels_send_verdicts_and_filters_by_project() {
+        let (_guard, _tmp) = setup_home();
+        append_send_event("demo", "alpha", "submitted", "busy_observed").unwrap();
+        append_send_event("demo", "bravo", "stuck", "still_in_input_after_retry").unwrap();
+        append_send_event("other", "charlie", "stuck", "transport_error").unwrap();
+
+        let response = drain_once("demo", 0).unwrap();
+
+        assert_eq!(response.events.len(), 2);
+        let submitted = event(&response, "send", "alpha");
+        assert_eq!(
+            submitted.metadata.get("send").map(String::as_str),
+            Some("true")
+        );
+        assert_eq!(
+            submitted.metadata.get("status").map(String::as_str),
+            Some("submitted")
+        );
+        assert_eq!(
+            submitted.metadata.get("detail").map(String::as_str),
+            Some("busy_observed")
+        );
+
+        let stuck = event(&response, "send", "bravo");
+        assert_eq!(
+            stuck.metadata.get("status").map(String::as_str),
+            Some("stuck")
+        );
+        assert_eq!(
+            stuck.metadata.get("detail").map(String::as_str),
+            Some("still_in_input_after_retry")
+        );
+        assert!(
+            response
+                .events
+                .iter()
+                .all(|event| event.workspace.as_deref() != Some("charlie")),
+            "foreign-project send must not cross the durable drain boundary"
+        );
+    }
+
+    #[test]
+    fn bundled_orchestrator_prompt_makes_stuck_send_actionable() {
+        let prompt = shelbi_state::DEFAULT_ORCHESTRATOR_INSTRUCTIONS;
+        assert!(
+            prompt.contains("send project=<you> workspace=<name> status=<status> detail=<reason>")
+        );
+        assert!(prompt.contains("For `status=stuck`, do not assume the worker received the text"));
+        assert!(prompt.contains("never fall back to raw\n  `tmux send-keys`"));
+        assert!(prompt.contains("shelbi message <task-id> directive"));
     }
 
     #[test]

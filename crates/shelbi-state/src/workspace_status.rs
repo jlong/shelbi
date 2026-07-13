@@ -83,6 +83,7 @@ pub enum EventKind {
     Message,
     Clarification,
     Dispatch,
+    Send,
     Rebase,
     Zen,
     ZenDryrun,
@@ -93,7 +94,12 @@ pub enum EventKind {
 
 impl EventKind {
     fn from_body(body: &str) -> Self {
-        if body.contains(" heartbeat") || body.ends_with(" heartbeat") {
+        // Prefix events may also carry `task=` / `workspace=` metadata. Match
+        // their discriminator before those broad field-based branches or a
+        // send verdict is mislabeled as an ordinary workspace event.
+        if body.starts_with("send ") || body == "send" {
+            EventKind::Send
+        } else if body.contains(" heartbeat") || body.ends_with(" heartbeat") {
             EventKind::Heartbeat
         } else if body.contains(" task=") || body.starts_with("task=") {
             EventKind::Task
@@ -818,6 +824,28 @@ pub fn append_dispatch_event(
     ))
 }
 
+/// Append `<rfc3339> send project=<project> workspace=<name> status=<status> detail=<detail>`
+/// to `~/.shelbi/events.log`. Records the delivery verdict of a
+/// `shelbi send` (verified pane-injection): `status=submitted` when the
+/// worker's input consumed the text, `status=queued` when the pane was
+/// mid-turn and the text is parked as claude's queued input, and
+/// `status=unverified` when a non-Claude runner received the split text/Enter
+/// delivery but exposes no supported pane-verification capability. Finally,
+/// `status=stuck` when no submission signal appeared even after the retry
+/// Enter — the failure that used to be silent, leaving text sitting in the
+/// input box until a human pressed Enter. The orchestrator reads this off
+/// the events tail to react instead of assuming a send landed.
+pub fn append_send_event(project: &str, workspace: &str, status: &str, detail: &str) -> Result<()> {
+    let ts = Utc::now().to_rfc3339();
+    let project = sanitize_field(project);
+    let workspace = sanitize_field(workspace);
+    let status = sanitize_reason(status);
+    let detail = sanitize_reason(detail);
+    append_event_line(&format!(
+        "{ts} send project={project} workspace={workspace} status={status} detail={detail}"
+    ))
+}
+
 /// Append `<rfc3339> project=<project> workspace=<name> pane_alive=<bool> reason=<short>`
 /// to `~/.shelbi/events.log`. Emitted by the `shelbi open --as-pane`
 /// wrapper when its agent subprocess exits (any reason — clean exit,
@@ -1247,6 +1275,16 @@ mod tests {
         );
         assert_eq!(workspace.kind, EventKind::Workspace);
         assert_eq!(workspace.project.as_deref(), Some("demo"));
+
+        let send = EventEnvelope::from_log_line(
+            "2026-07-06T12:02:00+00:00 send project=demo workspace=alpha status=stuck detail=unconfirmed_after_retry",
+        );
+        assert_eq!(send.kind, EventKind::Send);
+        assert_eq!(send.project.as_deref(), Some("demo"));
+        assert_eq!(
+            serde_json::to_value(&send).unwrap()["kind"],
+            serde_json::json!("send")
+        );
     }
 
     #[test]
@@ -2141,6 +2179,40 @@ mod tests {
         assert!(line.contains("message=m-123"));
         assert!(line.contains("task=fix-login"));
         assert!(line.ends_with("push=ok"));
+
+        std::env::remove_var("SHELBI_HOME");
+    }
+
+    #[test]
+    fn append_send_event_writes_delivery_verdict_line() {
+        let _g = TEST_LOCK.lock().unwrap();
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+
+        append_send_event("demo", "alpha", "submitted", "busy_observed").unwrap();
+        append_send_event("demo", "alpha", "stuck", "no submit signal").unwrap();
+        let log = std::fs::read_to_string(events_log_path().unwrap()).unwrap();
+        let lines: Vec<&str> = log.lines().collect();
+        assert_eq!(lines.len(), 2);
+        // Leading RFC3339 timestamp keeps the line uniform with the rest of
+        // events.log (and parseable by the activity feed / `events tail`).
+        assert!(DateTime::parse_from_rfc3339(lines[0].split_whitespace().next().unwrap()).is_ok());
+        assert!(
+            lines[0].contains(
+                " send project=demo workspace=alpha status=submitted detail=busy_observed"
+            ),
+            "{}",
+            lines[0]
+        );
+        // Detail whitespace folds to underscores so the line stays a
+        // single-record `key=value` stream.
+        assert!(
+            lines[1].contains(
+                " send project=demo workspace=alpha status=stuck detail=no_submit_signal"
+            ),
+            "{}",
+            lines[1]
+        );
 
         std::env::remove_var("SHELBI_HOME");
     }

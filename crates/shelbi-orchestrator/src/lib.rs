@@ -26,6 +26,7 @@ pub mod handoff;
 pub mod lifecycle;
 pub mod load;
 pub mod ready;
+pub mod submit;
 pub mod supervision;
 pub mod transition;
 pub mod workspace;

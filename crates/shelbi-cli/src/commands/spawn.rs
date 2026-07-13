@@ -35,6 +35,13 @@ pub fn run(project_opt: Option<String>, args: Args) -> Result<()> {
     let project = shelbi_state::load_project(&project_name)
         .with_context(|| format!("loading project `{project_name}`"))?;
 
+    // Share the workspace injection lock with `shelbi send` and task
+    // dispatch. Besides serializing duplicate legacy spawns, this keeps the
+    // initial text -> settle -> Enter sequence from interleaving with a send
+    // that begins as soon as the agent record becomes visible.
+    let _pane_injection_lock =
+        shelbi_state::lock_workspace(&project_name, &args.id).map_err(|e| anyhow!(e))?;
+
     let machine = project
         .machine(&args.on)
         .ok_or_else(|| anyhow!("machine `{}` not in project `{project_name}`", args.on))?
@@ -157,13 +164,67 @@ pub fn run(project_opt: Option<String>, args: Args) -> Result<()> {
         .map_err(|e| anyhow!(e))
         .context("launching agent")?;
 
-    // 5. Give the agent a moment to boot before piping the initial prompt
-    //    in. claude/codex/etc. tend to print a banner + wait for the TTY
-    //    to settle; sending too early can drop the first character.
-    std::thread::sleep(std::time::Duration::from_millis(1500));
-    shelbi_tmux::send_line(&host, &addr, &args.prompt)
-        .map_err(|e| anyhow!(e))
-        .context("sending initial prompt")?;
+    // 5. Claude must draw its structural input box before we type. A fixed
+    //    delay can land the prompt in a slow startup screen or trust dialog;
+    //    once the later empty box appears, that lost text can look falsely
+    //    submitted. Non-Claude runners have no supported pane parser, so they
+    //    retain the conservative startup settle and explicit unverified
+    //    delivery verdict.
+    let submit_profile = shelbi_orchestrator::submit::SubmitProfile::for_runner(&runner_spec);
+    if submit_profile.has_ui_verifier() {
+        let ready = match shelbi_orchestrator::ready::wait_for_claude_ready(
+            &host,
+            &addr,
+            shelbi_orchestrator::ready::READY_TIMEOUT,
+        ) {
+            Ok(ready) => ready,
+            Err(probe_error) => {
+                shelbi_state::append_send_event(
+                    &project.name,
+                    &args.id,
+                    "stuck",
+                    "readiness_probe_error",
+                )
+                .map_err(|log_error| {
+                    anyhow!(
+                        "waiting for Claude input readiness failed ({probe_error}); recording the stuck delivery also failed: {log_error}"
+                    )
+                })?;
+                return Err(anyhow!(
+                    "waiting for Claude input readiness failed: {probe_error}; prompt was not sent and the failure was recorded in events.log"
+                ));
+            }
+        };
+        if !ready {
+            shelbi_state::append_send_event(
+                &project.name,
+                &args.id,
+                "stuck",
+                "readiness_timeout",
+            )
+            .map_err(|e| {
+                anyhow!(
+                    "Claude input readiness timed out; recording the stuck delivery also failed: {e}"
+                )
+            })?;
+            bail!(
+                "Claude input readiness timed out after {}s on {}; prompt was not sent and the failure was recorded in events.log",
+                shelbi_orchestrator::ready::READY_TIMEOUT.as_secs(),
+                addr.target(),
+            );
+        }
+    } else {
+        std::thread::sleep(std::time::Duration::from_millis(1500));
+    }
+    super::send::send_verified(
+        &project.name,
+        &args.id,
+        &runner_spec,
+        &host,
+        &addr,
+        &args.prompt,
+    )
+    .context("sending initial prompt")?;
 
     // 5. Write the agent state file.
     let now = Utc::now();
