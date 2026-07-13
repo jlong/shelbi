@@ -17,13 +17,15 @@
 You talk to one agent, the orchestrator. It writes your work up as tasks,
 dispatches them to worker agents (Claude Code, Codex, aider, anything with a
 CLI) running in parallel across your machines, locally or over SSH, and brings
-finished work back for you to review. Each task runs on its own git branch in
-its own worktree, so you can review and merge independently. All you need on a
-worker's machine is `tmux` and your agent CLI.
+finished work back for you to review. Each workspace is a persistent tmux slot
+with its own git worktree; Shelbi switches that worktree to each task's branch
+so tasks can be reviewed and merged independently. A workspace machine needs
+`tmux`, `git`, and its configured agent CLI.
 
 ## Install
 
-Shelbi publishes prebuilt releases for macOS and Ubuntu.
+Shelbi publishes prebuilt releases for macOS (Apple silicon and Intel) and
+Ubuntu amd64.
 
 ### macOS: Homebrew
 
@@ -58,8 +60,8 @@ setup wizard, then launches the TUI. See
 
 ## Requirements
 
-`tmux` (≥ 3.2), `git`, and an agent CLI such as `claude` or `codex` on every
-machine a worker runs on.
+`tmux` (≥ 3.2), `git`, and an agent CLI such as `claude` or `codex` on the
+hub and every remote workspace machine.
 
 ## Documentation
 
@@ -77,11 +79,12 @@ Shelbi is a Cargo workspace under `crates/` plus a Next.js site under `site/`.
 ```bash
 cargo build --workspace
 cargo test --workspace
-./scripts/install.sh
+cargo clippy --workspace --all-targets -- -D warnings
+cd site && npm ci && npm run lint && npm run build
 ```
 
-See [CLAUDE.md](CLAUDE.md) for the crate layout and build, test, and lint
-conventions. Bugs and feature requests: <https://github.com/jlong/shelbi/issues>.
+See [AGENTS.md](AGENTS.md) for the crate layout and contributor conventions.
+Bugs and feature requests: <https://github.com/jlong/shelbi/issues>.
 
 ## License
 
