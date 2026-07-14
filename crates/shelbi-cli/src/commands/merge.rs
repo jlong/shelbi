@@ -37,9 +37,16 @@ pub fn run(project_opt: Option<String>, id: String, pr: bool) -> Result<()> {
         );
     }
 
+    // A rebase strategy implicitly checks `branch` out in the parent repo.
+    // Serialize that named checkout with workspace attaches and Zen ref
+    // advancement. This path holds no workspace lock, so it takes the Git
+    // worktree/ref lock directly.
+    let git_worktree_lock = shelbi_state::lock_git_worktrees(&project_name)
+        .map_err(|e| anyhow!(e))?;
     preflight(&host, &machine, &target)?;
     capture_uncommitted(&host, &file.agent.worktree, &id)?;
     integrate_branch(&host, &machine, &branch, &target, strategy, &id)?;
+    drop(git_worktree_lock);
     cleanup(
         &host,
         &machine,

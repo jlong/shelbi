@@ -27,14 +27,13 @@
 //!
 //! The qa / security / adversarial trio are specialized *reviewers* that
 //! scrutinize a diff — distinct from the `review` loader, which boots a
-//! workspace server. All are materialized on first
-//! [`materialize_default_agents`] (called
-//! from `shelbi init`) and self-healed by [`self_heal_default_agents`]
-//! (called from `shelbi reload`). User edits to `instructions.md` are
-//! preserved on self-heal. Runner-critical orchestrator sections are
-//! merged into customized prompts when missing; otherwise a byte-compare
-//! against the bundled default decides whether to fire the "you've
-//! customized this agent" notice.
+//! workspace server. Fresh setup materializes all defaults, while init and
+//! reload use [`self_heal_default_agents`] so an existing project receives
+//! provenance-aware upgrades. User edits to `instructions.md` are preserved
+//! on self-heal. Runner-critical orchestrator sections are merged into
+//! customized prompts when missing; otherwise a byte-compare against the
+//! bundled default decides whether to fire the "you've customized this
+//! agent" notice.
 
 use std::fs;
 use std::path::PathBuf;
@@ -120,8 +119,7 @@ pub const DEFAULT_SECURITY_INSTRUCTIONS: &str = include_str!("default_security.m
 
 /// Bundled adversarial `instructions.md` content — the refute-the-change
 /// charter.
-pub const DEFAULT_ADVERSARIAL_INSTRUCTIONS: &str =
-    include_str!("default_adversarial.md.template");
+pub const DEFAULT_ADVERSARIAL_INSTRUCTIONS: &str = include_str!("default_adversarial.md.template");
 
 /// Bundled body of the review agent's `load-run-detection` skill: the
 /// auto-detect heuristics for booting an unknown project on `$PORT`.
@@ -646,6 +644,10 @@ pub enum AgentMaterializeOutcome {
     /// divergence — callers should surface a user-facing notice in
     /// that case and stay silent otherwise.
     Preserved { agent: String, first_notice: bool },
+    /// A customized orchestrator prompt contained exact stock unpinned Zen
+    /// PR command tokens. Those tokens were pinned atomically while every
+    /// other byte of the user's policy was preserved.
+    MigratedZenCommands { agent: String, first_notice: bool },
     /// The agent had user-customized `instructions.md`, but self-heal merged
     /// missing runner-critical sections from the bundled default without
     /// overwriting the rest of the file.
@@ -664,6 +666,7 @@ impl AgentMaterializeOutcome {
             | Self::Unchanged { agent }
             | Self::Upgraded { agent }
             | Self::Preserved { agent, .. }
+            | Self::MigratedZenCommands { agent, .. }
             | Self::RepairedRequiredSections { agent, .. } => agent,
         }
     }
@@ -673,7 +676,7 @@ impl AgentMaterializeOutcome {
 /// (orchestrator, developer, review, qa, security, adversarial) from the
 /// bundled defaults for `project`. Each agent's directory is created only if missing —
 /// existing directories are left untouched and reported as `Unchanged`
-/// (init is conservative; self-heal does the SHA-compare).
+/// (this helper is conservative; self-heal does the SHA-compare).
 ///
 /// Returns one outcome per default agent, in [`DEFAULT_AGENTS`] order.
 pub fn materialize_default_agents(project: &str) -> Result<Vec<AgentMaterializeOutcome>> {
@@ -734,14 +737,34 @@ pub fn materialize_default_agents(project: &str) -> Result<Vec<AgentMaterializeO
 ///
 /// Also ensures the `skills/` subdir exists for every default agent.
 pub fn self_heal_default_agents(project: &str) -> Result<Vec<AgentMaterializeOutcome>> {
+    self_heal_bundled_agents(project, None)
+}
+
+/// Apply the provenance-aware self-heal only to the orchestrator agent. Used
+/// by targeted chat reloads so their safety migration is not coupled to IO or
+/// upgrades in unrelated worker/reviewer agent workspaces.
+pub fn self_heal_orchestrator_agent(project: &str) -> Result<AgentMaterializeOutcome> {
+    self_heal_bundled_agents(project, Some(ORCHESTRATOR_AGENT))?
+        .into_iter()
+        .next()
+        .ok_or_else(|| Error::Other("bundled orchestrator agent is missing".into()))
+}
+
+fn self_heal_bundled_agents(
+    project: &str,
+    only_agent: Option<&str>,
+) -> Result<Vec<AgentMaterializeOutcome>> {
     // The whole pass runs inside one locked `update_state` so the
     // divergence bookkeeping can't lose a concurrent mutator's fields
-    // (or vice versa). Self-heal runs once per `shelbi reload`, so
+    // (or vice versa). Self-heal runs only during setup/reload operations, so
     // holding the lock across the file IO is fine.
     update_state(project, |state| {
         let mut outcomes = Vec::with_capacity(DEFAULT_AGENTS.len());
 
         for agent in DEFAULT_AGENTS {
+            if only_agent.is_some_and(|name| agent.name != name) {
+                continue;
+            }
             let workspace = agent_workspace_dir(project, agent.name)?;
             if !workspace.exists() {
                 write_bundled_agent(project, agent)?;
@@ -825,10 +848,21 @@ pub fn self_heal_default_agents(project: &str) -> Result<Vec<AgentMaterializeOut
                     });
                 }
                 AgentDivergence::Customized => {
+                    // Classify against the original bytes first so an
+                    // untouched prompt still matching its deployed provenance
+                    // takes the whole-file PristineStale upgrade above. Only
+                    // genuinely customized prompts receive the surgical
+                    // command-token migration.
+                    let migrated = if agent.name == ORCHESTRATOR_AGENT {
+                        crate::zenmode::migrate_legacy_zen_commands(&current)
+                    } else {
+                        None
+                    };
+                    let repair_input = migrated.as_deref().unwrap_or(&current);
                     let repair = repair_required_instruction_sections(
                         agent.name,
                         agent.instructions,
-                        &current,
+                        repair_input,
                     )?;
                     let first_notice = state
                         .notified_diverged_agents
@@ -838,6 +872,12 @@ pub fn self_heal_default_agents(project: &str) -> Result<Vec<AgentMaterializeOut
                         outcomes.push(AgentMaterializeOutcome::RepairedRequiredSections {
                             agent: agent.name.to_string(),
                             sections: repair.sections,
+                            first_notice,
+                        });
+                    } else if let Some(migrated) = migrated {
+                        atomic_write(&path, migrated.as_bytes())?;
+                        outcomes.push(AgentMaterializeOutcome::MigratedZenCommands {
+                            agent: agent.name.to_string(),
                             first_notice,
                         });
                     } else {
@@ -1120,8 +1160,37 @@ mod tests {
         std::env::remove_var("SHELBI_HOME");
     }
 
-    /// `shelbi init` is idempotent and does not stomp a user's edits if
-    /// re-run on an already-materialized project.
+    #[test]
+    fn orchestrator_only_self_heal_does_not_touch_other_agent_workspaces() {
+        let _g = LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+
+        materialize_default_agents("p").unwrap();
+        let developer_instructions = agent_instructions_path("p", DEVELOPER_AGENT).unwrap();
+        let developer_settings = agent_settings_path("p", DEVELOPER_AGENT).unwrap();
+        let custom = "# Custom developer\n\nKeep this exactly.\n";
+        fs::write(&developer_instructions, custom).unwrap();
+        fs::remove_file(&developer_settings).unwrap();
+
+        let outcome = self_heal_orchestrator_agent("p").unwrap();
+        assert_eq!(
+            outcome,
+            AgentMaterializeOutcome::Unchanged {
+                agent: ORCHESTRATOR_AGENT.to_string(),
+            }
+        );
+        assert_eq!(fs::read_to_string(&developer_instructions).unwrap(), custom);
+        assert!(
+            !developer_settings.exists(),
+            "targeted orchestrator healing must not repair unrelated agents"
+        );
+
+        std::env::remove_var("SHELBI_HOME");
+    }
+
+    /// Conservative materialization is idempotent and does not stomp a
+    /// user's edits when called on an already-materialized project.
     #[test]
     fn materialize_is_idempotent_and_does_not_overwrite_existing_workspace() {
         let _g = LOCK.lock().unwrap_or_else(|p| p.into_inner());
@@ -1408,6 +1477,76 @@ mod tests {
         std::env::remove_var("SHELBI_HOME");
     }
 
+    #[test]
+    fn self_heal_pins_stock_zen_commands_inside_custom_orchestrator_policy() {
+        let _g = LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+
+        materialize_default_agents("p").unwrap();
+        let custom = "# Local Orchestrator\n\n\
+Keep this private scheduling rule byte-for-byte.\n\n\
+- `shelbi zen pr-create <task-id> --match-head-commit <head_sha>` / `shelbi zen ci-watch <pr> --match-head-commit <head_sha>` /\n  \
+`shelbi zen pr-merge <pr> --match-head-commit <head_sha>` are my merge tools.\n\n\
+After green, run `shelbi zen pr-merge <pr-number> --match-head-commit <head_sha>`.\n\n\
+## Polling-only event drain\n\nLocal copy.\n";
+        let path = agent_instructions_path("p", ORCHESTRATOR_AGENT).unwrap();
+        fs::write(&path, custom).unwrap();
+
+        let outcomes = self_heal_default_agents("p").unwrap();
+        let orch = outcomes
+            .iter()
+            .find(|o| o.agent() == ORCHESTRATOR_AGENT)
+            .unwrap();
+        assert_eq!(
+            orch,
+            &AgentMaterializeOutcome::MigratedZenCommands {
+                agent: ORCHESTRATOR_AGENT.to_string(),
+                first_notice: true,
+            },
+        );
+
+        let expected = custom
+            .replace(
+                "`shelbi zen pr-create <task-id> --match-head-commit <head_sha>`",
+                "`shelbi zen pr-create <task-id> --match-repository <repository> --match-repository-id <repository_id> --match-base-branch <base_branch> --match-base-commit <base_sha> --match-head-commit <head_sha>`",
+            )
+            .replace(
+                "`shelbi zen ci-watch <pr> --match-head-commit <head_sha>`",
+                "`shelbi zen ci-watch <pr> --match-repository <repository> --match-repository-id <repository_id> --match-base-branch <base_branch> --match-base-commit <base_sha> --match-head-commit <head_sha>`",
+            )
+            .replace(
+                "`shelbi zen pr-merge <pr> --match-head-commit <head_sha>`",
+                "`shelbi zen pr-merge <pr> --match-repository <repository> --match-repository-id <repository_id> --match-base-branch <base_branch> --match-base-commit <base_sha> --match-head-commit <head_sha>`",
+            )
+            .replace(
+                "`shelbi zen pr-merge <pr-number> --match-head-commit <head_sha>`",
+                "`shelbi zen pr-merge <pr-number> --match-repository <repository> --match-repository-id <repository_id> --match-base-branch <base_branch> --match-base-commit <base_sha> --match-head-commit <head_sha>`",
+            );
+        assert_eq!(fs::read_to_string(&path).unwrap(), expected);
+        assert!(fs::read_to_string(&path)
+            .unwrap()
+            .contains("Keep this private scheduling rule byte-for-byte."));
+
+        // The migration is one-shot. The customized file remains owned by
+        // the project and a later reload makes no further byte changes.
+        let outcomes = self_heal_default_agents("p").unwrap();
+        let orch = outcomes
+            .iter()
+            .find(|o| o.agent() == ORCHESTRATOR_AGENT)
+            .unwrap();
+        assert_eq!(
+            orch,
+            &AgentMaterializeOutcome::Preserved {
+                agent: ORCHESTRATOR_AGENT.to_string(),
+                first_notice: false,
+            },
+        );
+        assert_eq!(fs::read_to_string(&path).unwrap(), expected);
+
+        std::env::remove_var("SHELBI_HOME");
+    }
+
     /// Read-only `agent_divergence` reports pristine-stale (not customized)
     /// for an untouched agent after a compiled-default bump — the query the
     /// CLI list marker uses.
@@ -1585,6 +1724,21 @@ mod tests {
     fn orchestrator_template_byte_matches_default_instructions_const() {
         assert!(!DEFAULT_ORCHESTRATOR_INSTRUCTIONS.is_empty());
         assert!(DEFAULT_ORCHESTRATOR_INSTRUCTIONS.contains("# You are the Orchestrator"));
+        assert!(DEFAULT_ORCHESTRATOR_INSTRUCTIONS.contains(
+            "shelbi zen pr-create <task-id> --match-repository <repository> --match-repository-id <repository_id> --match-base-branch <base_branch> --match-base-commit <base_sha> --match-head-commit <head_sha>"
+        ));
+        assert!(DEFAULT_ORCHESTRATOR_INSTRUCTIONS.contains(
+            "shelbi zen ci-watch <pr> --match-repository <repository> --match-repository-id <repository_id> --match-base-branch <base_branch> --match-base-commit <base_sha> --match-head-commit <head_sha>"
+        ));
+        assert!(DEFAULT_ORCHESTRATOR_INSTRUCTIONS.contains(
+            "shelbi zen pr-merge <pr> --match-repository <repository> --match-repository-id <repository_id> --match-base-branch <base_branch> --match-base-commit <base_sha> --match-head-commit <head_sha>"
+        ));
+        assert!(DEFAULT_ORCHESTRATOR_INSTRUCTIONS.contains("atomically leases only"));
+        assert!(
+            crate::zenmode::migrate_legacy_zen_commands(DEFAULT_ORCHESTRATOR_INSTRUCTIONS)
+                .is_none(),
+            "the current orchestrator template must not ship legacy unpinned Zen commands"
+        );
     }
 
     /// Phase 5 (review-workspaces §8/§9/§15/§16): the orchestrator prompt must

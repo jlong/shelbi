@@ -1,4 +1,4 @@
-Zen: auto-promote eligible backlog and run the merge-conditions flow on handoff without asking; only stop for danger paths, review-workspace tasks, or genuine ambiguity.
+Zen: auto-promote eligible backlog and run the exact-provenance merge flow on handoff without asking.
 
 # Zen Mode policy
 
@@ -83,14 +83,24 @@ conditions to the report:
 
 If all pre-PR conditions pass:
 
-5. Run `shelbi zen pr-create <task-id>` to push + open the PR. Capture the PR
-   number it prints.
-6. Run `shelbi zen ci-watch <pr-number> --timeout 15m`. Stdout is `green`,
+5. Freeze the probe's `repository`, `repository_id`, `base_branch`, `base_sha`,
+   and `head_sha`. Run `shelbi zen pr-create <task-id> --match-repository <repository> --match-repository-id <repository_id> --match-base-branch <base_branch> --match-base-commit <base_sha> --match-head-commit <head_sha>`
+   using those exact values. Capture the PR number it prints.
+6. Run `shelbi zen ci-watch <pr-number> --match-repository <repository> --match-repository-id <repository_id> --match-base-branch <base_branch> --match-base-commit <base_sha> --match-head-commit <head_sha> --timeout 15m`
+   using that same probe identity. Stdout is `green`,
    `red:<check>:<summary>`, or `timeout`. The condition: must be `green`.
-7. If green: run `shelbi zen pr-merge <pr-number>` to squash + delete branch.
-   Move the task into `done` and emit `reason=orchestrator:zen-merge` with the
-   merge SHA. The command appends a `next eligible:` list to its stdout, read
-   it before moving on.
+   Any identity movement fails closed; never recompute or substitute a probe
+   field after CI begins.
+7. If green, run `shelbi zen pr-merge <pr-number> --match-repository <repository> --match-repository-id <repository_id> --match-base-branch <base_branch> --match-base-commit <base_sha> --match-head-commit <head_sha>`
+   with that same identity. The command validates repository, base, and head,
+   then supplies `expectedHeadOid` to GitHub's merge or queue mutation. That is
+   an atomic head lease only, not an atomic repository or base lease. A
+   concurrent same-head retarget between validation and mutation remains a
+   documented limitation for separate human design; do not describe this path
+   as atomically base-pinned. If it prints `queued` and exits 2, leave the task
+   in `handoff` and retry the same pinned command later. Only after a merge SHA
+   or `sha-pending` result, move the task into `done` and emit
+   `reason=orchestrator:zen-merge` with the merge SHA.
 8. If red or timeout: leave in `handoff`; emit `reason=zen:failed-checks` (red)
    or `reason=zen:ci-timeout`.
 

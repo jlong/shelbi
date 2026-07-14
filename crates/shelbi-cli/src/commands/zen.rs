@@ -28,7 +28,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Result};
 use chrono::Utc;
-use clap::Subcommand;
+use clap::{Args, Subcommand};
 
 use shelbi_core::{
     ci_timeout_for_workflow, danger_paths_for_project, Column, Project, Task, Workflow,
@@ -53,10 +53,46 @@ const DRYRUN_DEFAULT_INTERVAL: Duration = Duration::from_secs(5);
 /// pegging a core and hammering the log. Clamp up to this instead.
 const DRYRUN_MIN_INTERVAL: Duration = Duration::from_secs(1);
 
+/// Immutable repository/base/head identity emitted by `zen probe` and
+/// required by every later PR-flow primitive. Keeping the five values in one
+/// flattened argument group makes it harder for the CLI paths to accidentally
+/// validate only the head while silently recomputing mutable project state.
+#[derive(Debug, Args)]
+pub struct PinnedIdentityArgs {
+    /// Repository selector from the probe report's `repository` field.
+    #[arg(long, value_name = "REPOSITORY")]
+    pub match_repository: String,
+    /// Immutable GitHub repository id from the probe report's
+    /// `repository_id` field.
+    #[arg(long, value_name = "REPOSITORY_ID")]
+    pub match_repository_id: String,
+    /// Resolved workflow base from the probe report's `base_branch` field.
+    #[arg(long, value_name = "BRANCH")]
+    pub match_base_branch: String,
+    /// Base commit from the probe report's `base_sha` field.
+    #[arg(long, value_name = "SHA")]
+    pub match_base_commit: String,
+    /// Reviewed head from the probe report's `head_sha` field.
+    #[arg(long, value_name = "SHA")]
+    pub match_head_commit: String,
+}
+
+impl PinnedIdentityArgs {
+    fn into_pinned_identity(self) -> zen::PinnedPrIdentity {
+        zen::PinnedPrIdentity {
+            repository: self.match_repository,
+            repository_id: self.match_repository_id,
+            base_branch: self.match_base_branch,
+            base_sha: self.match_base_commit,
+            head_sha: self.match_head_commit,
+        }
+    }
+}
+
 #[derive(Debug, Subcommand)]
 pub enum ZenCmd {
-    /// Turn Zen Mode on — orchestrator may auto-merge and auto-promote
-    /// finished tasks without waiting on a human reviewer.
+    /// Turn Zen Mode on: the orchestrator may auto-promote and auto-merge
+    /// through the exact-provenance PR flow.
     On,
     /// Turn Zen Mode off — every promotion goes through manual review.
     /// In-flight workspaces keep going; nothing already running is cancelled.
@@ -69,14 +105,22 @@ pub enum ZenCmd {
     /// the Zen track.
     Status,
     /// Run every probe primitive for `task` and print the JSON report.
-    /// The task must be assigned to a workspace so we know which worktree
-    /// to probe.
+    /// The task must be assigned to a workspace so we can locate the
+    /// repository containing its named branch.
     Probe { task_id: String },
-    /// Push the workspace's branch and open a PR for the task. Idempotent —
-    /// returns the existing PR number if one is already open for the
-    /// branch. Prints the PR number on stdout.
-    PrCreate { task_id: String },
-    /// Watch the PR's checks until they settle or the timeout fires.
+    /// Push the task's named branch and open a PR. Idempotent: reuses an
+    /// existing open PR only after its head matches the pushed task ref.
+    /// Prints the PR number on stdout.
+    PrCreate {
+        task_id: String,
+        /// Exact repository, resolved base, and reviewed head emitted by the
+        /// probe. Every field is required; any mismatch requires a fresh
+        /// probe.
+        #[command(flatten)]
+        identity: PinnedIdentityArgs,
+    },
+    /// Watch the PR's checks until they settle or the timeout fires, pinned
+    /// to the exact head commit reported by the probe.
     /// Prints `green` / `red:<check>:<summary>` / `timeout` on stdout.
     /// Exit code is 0 only for `green`.
     ///
@@ -92,6 +136,10 @@ pub enum ZenCmd {
     ///   check to leave the pending state.
     CiWatch {
         pr_number: u64,
+        /// Exact repository, resolved base, and reviewed head emitted by the
+        /// probe. Every CI snapshot must retain this identity.
+        #[command(flatten)]
+        identity: PinnedIdentityArgs,
         /// Override the project-level (and per-workflow, if `--task` is
         /// passed) CI timeout. Accepts `30s`, `5m`, `2h`, `1d`, or a
         /// bare integer of seconds.
@@ -108,27 +156,22 @@ pub enum ZenCmd {
     /// Squash-merge the PR and delete the source branch. Prints the
     /// merge SHA on stdout.
     ///
-    /// Always pass `--match-head-commit` with the `head_sha` from the
-    /// probe report: the merge is then pinned to exactly the commit the
-    /// probe and ci-watch evaluated, and GitHub refuses if the branch
-    /// gained commits since. Omitting it merges whatever the PR head is
-    /// *now* — only acceptable for manual invocations that never probed.
+    /// The complete probe identity is required. GitHub's atomic mutation
+    /// leases the reviewed head; repository and base are validated around it.
     PrMerge {
         pr_number: u64,
-        /// Head SHA the PR must still be at for the merge to proceed
-        /// (the `head_sha` field of the probe report). On mismatch the
-        /// merge fails loudly — re-run `shelbi zen probe` and retry
-        /// with the fresh SHA.
-        #[arg(long, value_name = "SHA")]
-        match_head_commit: Option<String>,
+        /// Exact repository, resolved base, and reviewed head emitted by the
+        /// probe. Every field is required; any mismatch fails closed.
+        #[command(flatten)]
+        identity: PinnedIdentityArgs,
     },
     /// Print backlog task ids that are mechanically eligible for Zen
     /// auto-promotion, one per line, in priority order. Mechanical only —
     /// the orchestrator's prompt applies the judgment categories on top.
     Scan,
-    /// Preview what Zen Mode would do without touching any state. Runs
-    /// the backlog scan and the merge-conditions bar on every tick and
-    /// logs each "would have …" decision to stdout, a dedicated dry-run
+    /// Preview what Zen Mode would do without changing task, board, PR, or
+    /// branch state. Runs the backlog scan and merge-conditions bar each tick,
+    /// then logs each "would have …" decision to stdout, a dedicated dry-run
     /// log (`~/.shelbi/logs/zen-dryrun.log`), and the activity feed.
     /// Use this before flipping Zen on for real to confirm the policy
     /// matches your intent. No PRs, merges, or board moves happen.
@@ -165,22 +208,29 @@ pub fn run(project_opt: Option<String>, cmd: ZenCmd) -> Result<()> {
         ZenCmd::Probe { task_id } => {
             let project = load_project(&project_name).map_err(|e| anyhow!(e))?;
             let tf = shelbi_state::load_task(&project_name, &task_id).map_err(|e| anyhow!(e))?;
-            // Best-effort workflow lookup. A missing or malformed YAML
-            // means we fall back to project-level zen config — matching
-            // legacy `zen::probe` behavior.
-            let workflow = load_workflow_for_task(&project_name, &tf.task);
-            let branch = tf
-                .task
-                .branch
-                .clone()
-                .unwrap_or_else(|| format!("shelbi/{}", tf.task.id));
+            // The workflow is part of the probe's durable provenance. A
+            // missing or malformed definition must stop the flow instead of
+            // silently substituting project defaults.
+            let workflow =
+                shelbi_state::load_task_workflow(&project_name, &project, &tf.task)
+                    .map_err(|e| anyhow!(e))?;
+            // Use the same explicit/workflow/project/login fallback chain as
+            // dispatch and PR creation. A hard-coded fallback here could
+            // probe one ref and later ask `pr-create` to publish another.
+            let branch = shelbi_orchestrator::branch::branch_name_for_task(
+                &project,
+                Some(&workflow),
+                &tf.task,
+            )
+            .map_err(|e| anyhow!(e))?;
             // `zen probe` wants facts about the branch as it would land
-            // *today* — fetch the current default and rebase onto it first
+            // *today* — fetch the task's resolved workflow base and rebase
+            // onto it first
             // so a re-probe after a blocker merges reflects the merged fix
             // without a manual `git rebase`.
             let report = zen::probe_in_workflow(
                 &project,
-                workflow.as_ref(),
+                Some(&workflow),
                 &tf.task,
                 &branch,
                 zen::RebasePolicy::RebaseOntoDefault,
@@ -189,16 +239,18 @@ pub fn run(project_opt: Option<String>, cmd: ZenCmd) -> Result<()> {
             println!("{}", serde_json::to_string_pretty(&report)?);
             Ok(())
         }
-        ZenCmd::PrCreate { task_id } => {
+        ZenCmd::PrCreate { task_id, identity } => {
             let project = load_project(&project_name).map_err(|e| anyhow!(e))?;
             let tf = shelbi_state::load_task(&project_name, &task_id).map_err(|e| anyhow!(e))?;
-            let pr = zen::pr_create(&project, &project_name, &tf.task, &tf.body)
+            let identity = identity.into_pinned_identity();
+            let pr = zen::pr_create_at_head(&project, &project_name, &tf.task, &tf.body, &identity)
                 .map_err(|e| anyhow!(e))?;
             println!("{pr}");
             Ok(())
         }
         ZenCmd::CiWatch {
             pr_number,
+            identity,
             timeout,
             task,
         } => {
@@ -218,7 +270,9 @@ pub fn run(project_opt: Option<String>, cmd: ZenCmd) -> Result<()> {
                     ci_timeout_for_workflow(&project, workflow.as_ref())
                 }
             };
-            let verdict = zen::ci_watch(&project, pr_number, timeout).map_err(|e| anyhow!(e))?;
+            let identity = identity.into_pinned_identity();
+            let verdict =
+                zen::ci_watch(&project, pr_number, &identity, timeout).map_err(|e| anyhow!(e))?;
             println!("{}", verdict.as_line());
             match verdict {
                 CiVerdict::Green => Ok(()),
@@ -237,16 +291,23 @@ pub fn run(project_opt: Option<String>, cmd: ZenCmd) -> Result<()> {
         }
         ZenCmd::PrMerge {
             pr_number,
-            match_head_commit,
+            identity,
         } => {
             let project = load_project(&project_name).map_err(|e| anyhow!(e))?;
-            match zen::pr_merge(&project, pr_number, match_head_commit.as_deref())
-                .map_err(|e| anyhow!(e))?
-            {
-                Some(sha) => println!("{sha}"),
+            let identity = identity.into_pinned_identity();
+            match zen::pr_merge(&project, pr_number, &identity).map_err(|e| anyhow!(e))? {
+                zen::PrMergeOutcome::Merged(Some(sha)) => println!("{sha}"),
                 // Merged, but GitHub hadn't recorded the merge commit yet
                 // when polling gave up — success, just without a SHA.
-                None => println!("sha-pending"),
+                zen::PrMergeOutcome::Merged(None) => println!("sha-pending"),
+                zen::PrMergeOutcome::Queued => {
+                    println!("queued");
+                    eprintln!(
+                        "pr-merge: GitHub accepted the pinned head into its merge queue; \
+                         leave the task in handoff and retry this command after it lands"
+                    );
+                    std::process::exit(2);
+                }
             }
             // Forcing function: append the post-merge eligibility scan to the
             // command's own stdout so the orchestrator can't drop the scan it's

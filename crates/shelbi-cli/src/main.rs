@@ -268,8 +268,8 @@ enum Cmd {
     #[command(name = "__codex-orchestrator")]
     CodexOrchestrator { project: String },
     /// Toggle Zen Mode or run its primitives. `shelbi zen on/off/pause` flip
-    /// the trust boundary that lets the orchestrator auto-merge and
-    /// auto-promote. `probe` reports facts about a finished branch (checks,
+    /// the trust boundary for auto-promotion and exact-provenance auto-merge.
+    /// `probe` reports facts about a finished branch (checks,
     /// conflict, diff size, danger paths). `pr-create/ci-watch/pr-merge` are
     /// single-purpose PR primitives the orchestrator sequences per its
     /// Merge Conditions prompt policy.
@@ -550,6 +550,7 @@ fn open_tui_log_file() -> Option<std::fs::File> {
 #[cfg(test)]
 mod cli_tests {
     use super::*;
+    use clap::error::ErrorKind;
     use clap::Parser;
     use commands::workspace::WorkspaceCmd;
 
@@ -686,6 +687,128 @@ mod cli_tests {
         // Bare `shelbi` (no subcommand) is still valid — it drives the
         // default TUI/first-run entry.
         assert!(Cli::try_parse_from(["shelbi"]).is_ok());
+    }
+
+    #[test]
+    fn zen_pr_flow_commands_require_the_complete_probe_identity() {
+        let required = [
+            ("--match-repository", "github.com/acme/widgets"),
+            ("--match-repository-id", "R_123"),
+            ("--match-base-branch", "feature/app"),
+            ("--match-base-commit", "base123"),
+            ("--match-head-commit", "head123"),
+        ];
+        for command in [
+            ["shelbi", "zen", "pr-create", "task-1"],
+            ["shelbi", "zen", "ci-watch", "42"],
+            ["shelbi", "zen", "pr-merge", "42"],
+        ] {
+            for (omitted, _) in required {
+                let mut argv = command.to_vec();
+                for (flag, value) in required {
+                    if flag != omitted {
+                        argv.extend([flag, value]);
+                    }
+                }
+                let err = Cli::try_parse_from(&argv).expect_err(
+                    "a Zen PR flow operation with incomplete provenance must fail parsing",
+                );
+                assert_eq!(err.kind(), ErrorKind::MissingRequiredArgument, "{err}");
+                assert!(err.to_string().contains(omitted), "{err}");
+            }
+        }
+
+        let create = Cli::parse_from([
+            "shelbi",
+            "zen",
+            "pr-create",
+            "task-1",
+            "--match-repository",
+            "github.com/acme/widgets",
+            "--match-repository-id",
+            "R_123",
+            "--match-base-branch",
+            "feature/app",
+            "--match-base-commit",
+            "base123",
+            "--match-head-commit",
+            "head123",
+        ]);
+        assert!(matches!(
+            create.cmd,
+            Some(Cmd::Zen {
+                cmd: commands::zen::ZenCmd::PrCreate {
+                    task_id,
+                    identity,
+                },
+            }) if task_id == "task-1"
+                && identity.match_repository == "github.com/acme/widgets"
+                && identity.match_repository_id == "R_123"
+                && identity.match_base_branch == "feature/app"
+                && identity.match_base_commit == "base123"
+                && identity.match_head_commit == "head123"
+        ));
+
+        let watch = Cli::parse_from([
+            "shelbi",
+            "zen",
+            "ci-watch",
+            "42",
+            "--match-repository",
+            "github.com/acme/widgets",
+            "--match-repository-id",
+            "R_123",
+            "--match-base-branch",
+            "feature/app",
+            "--match-base-commit",
+            "base123",
+            "--match-head-commit",
+            "head123",
+        ]);
+        assert!(matches!(
+            watch.cmd,
+            Some(Cmd::Zen {
+                cmd: commands::zen::ZenCmd::CiWatch {
+                    pr_number: 42,
+                    identity,
+                    ..
+                },
+            }) if identity.match_repository == "github.com/acme/widgets"
+                && identity.match_repository_id == "R_123"
+                && identity.match_base_branch == "feature/app"
+                && identity.match_base_commit == "base123"
+                && identity.match_head_commit == "head123"
+        ));
+
+        let merge = Cli::parse_from([
+            "shelbi",
+            "zen",
+            "pr-merge",
+            "42",
+            "--match-repository",
+            "github.com/acme/widgets",
+            "--match-repository-id",
+            "R_123",
+            "--match-base-branch",
+            "feature/app",
+            "--match-base-commit",
+            "base123",
+            "--match-head-commit",
+            "head123",
+        ]);
+        assert!(matches!(
+            merge.cmd,
+            Some(Cmd::Zen {
+                cmd: commands::zen::ZenCmd::PrMerge {
+                    pr_number: 42,
+                    identity,
+                },
+            }) if identity.match_repository == "github.com/acme/widgets"
+                && identity.match_repository_id == "R_123"
+                && identity.match_base_branch == "feature/app"
+                && identity.match_base_commit == "base123"
+                && identity.match_head_commit == "head123"
+        ));
     }
 
     /// `--root <path>` is a top-level global flag — accepted before *or*

@@ -21,9 +21,10 @@ use super::require_project;
 /// forward instead of starting cold. A missing or timed-out handoff
 /// is degraded (next orchestrator starts cold) but not fatal.
 ///
-/// User-edited `instructions.md` files are preserved byte-for-byte;
-/// the workspace-settings template is always re-aligned with the
-/// shipped default (users who want customization point
+/// User-edited `instructions.md` prose is preserved. Exact legacy Zen PR
+/// command tokens are pinned in place, and required orchestrator sections
+/// may be repaired; the workspace-settings template is always re-aligned
+/// with the shipped default (users who want customization point
 /// `workspace_settings_template` at their own file).
 pub fn run(
     project_opt: Option<String>,
@@ -37,14 +38,24 @@ pub fn run(
     // skips the whole-hub self-heal (root/subdir re-materialization,
     // workflow + statuses compatibility migration, agent-workspace and
     // settings-template repair, legacy-marker sweep). Each target carries
-    // its own dependency refresh: `chat` re-deploys the orchestrator agent
-    // context inside the respawn, and the TUI panes render derived state
-    // straight from disk.
+    // its own dependency refresh: `chat` self-heals the agent automation
+    // before re-deploying the orchestrator context, and the TUI panes render
+    // derived state straight from disk.
     if !matches!(target, ReloadTarget::All) {
         let project_name = require_project(project_opt)?;
+        let outcomes = if matches!(target, ReloadTarget::Chat) {
+            Some(self_heal_zen_automation(&project_name, false)?)
+        } else {
+            None
+        };
         let report =
             shelbi_orchestrator::reload_target(&project_name, &target).map_err(|e| anyhow!(e))?;
         print_report(&project_name, &report);
+        if let Some(outcomes) = outcomes {
+            for outcome in outcomes {
+                print_agent_materialize_outcome(&outcome);
+            }
+        }
         return Ok(());
     }
 
@@ -84,17 +95,7 @@ fn run_all(project_opt: Option<String>) -> Result<()> {
     if !statuses_path.exists() {
         shelbi_state::scaffold_project_statuses(&project_name).map_err(|e| anyhow!(e))?;
     }
-    // Self-heal `zenmode.md` for projects that predate it — written only when
-    // absent, so a user's edits (including the first-line Zen summary the
-    // heartbeat re-injects) are preserved byte-for-byte, same as
-    // `instructions.md`.
-    if shelbi_state::scaffold_zenmode(&project_name).map_err(|e| anyhow!(e))?
-        == shelbi_state::ZenmodeOutcome::Created
-    {
-        let zenmode_path = shelbi_state::zenmode_path(&project_name).map_err(|e| anyhow!(e))?;
-        println!("✓ wrote Zen policy: {} (was missing)", zenmode_path.display());
-    }
-    let outcomes = shelbi_state::self_heal_default_agents(&project_name).map_err(|e| anyhow!(e))?;
+    let outcomes = self_heal_zen_automation(&project_name, true)?;
     let report = shelbi_orchestrator::reload(&project_name).map_err(|e| anyhow!(e))?;
     print_report(&project_name, &report);
     for outcome in outcomes {
@@ -105,6 +106,36 @@ fn run_all(project_opt: Option<String>) -> Result<()> {
         shelbi_state::self_heal_workspace_settings_template(&project).map_err(|e| anyhow!(e))?;
     print_workspace_settings_template_outcome(&template_outcome);
     Ok(())
+}
+
+/// Upgrade the two policy files that can carry the stock Zen PR sequence
+/// before an orchestrator is respawned. The state layer preserves custom
+/// prose and rewrites only exact legacy command tokens in customized files.
+fn self_heal_zen_automation(
+    project_name: &str,
+    all_agents: bool,
+) -> Result<Vec<shelbi_state::AgentMaterializeOutcome>> {
+    match shelbi_state::scaffold_zenmode(project_name).map_err(|e| anyhow!(e))? {
+        shelbi_state::ZenmodeOutcome::Created => {
+            let path = shelbi_state::zenmode_path(project_name).map_err(|e| anyhow!(e))?;
+            println!("✓ wrote Zen policy: {} (was missing)", path.display());
+        }
+        shelbi_state::ZenmodeOutcome::Migrated => {
+            let path = shelbi_state::zenmode_path(project_name).map_err(|e| anyhow!(e))?;
+            println!(
+                "✓ pinned legacy Zen PR commands in {} (custom prose preserved)",
+                path.display()
+            );
+        }
+        shelbi_state::ZenmodeOutcome::Unchanged => {}
+    }
+    if all_agents {
+        shelbi_state::self_heal_default_agents(project_name).map_err(|e| anyhow!(e))
+    } else {
+        let outcome = shelbi_state::self_heal_orchestrator_agent(project_name)
+            .map_err(|e| anyhow!(e))?;
+        Ok(vec![outcome])
+    }
 }
 
 /// Sweep registered project trees for the now-redundant `.shelbi/project`

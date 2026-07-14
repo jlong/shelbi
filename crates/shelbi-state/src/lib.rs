@@ -50,8 +50,9 @@ pub use agent_workspaces::{
     content_hash, count_agent_skills, default_agent_body, default_agent_settings, is_default_agent,
     legacy_claude_md_path, list_agents, load_agent_settings, load_shared_preamble,
     materialize_default_agents, maybe_emit_claude_md_migration_hint, orchestrator_handoff_path,
-    reset_claude_md_migration_hint, self_heal_default_agents, take_orchestrator_handoff,
-    AgentDivergence, AgentMaterializeOutcome, BundledAgent, BundledSkill, ADVERSARIAL_AGENT,
+    reset_claude_md_migration_hint, self_heal_default_agents, self_heal_orchestrator_agent,
+    take_orchestrator_handoff, AgentDivergence, AgentMaterializeOutcome, BundledAgent, BundledSkill,
+    ADVERSARIAL_AGENT,
     DEFAULT_ADVERSARIAL_INSTRUCTIONS, DEFAULT_AGENTS, DEFAULT_DEVELOPER_INSTRUCTIONS,
     DEFAULT_ORCHESTRATOR_INSTRUCTIONS, DEFAULT_QA_INSTRUCTIONS, DEFAULT_REVIEW_INSTRUCTIONS,
     DEFAULT_REVIEW_LOAD_RUN_SKILL, DEFAULT_SECURITY_INSTRUCTIONS, DEVELOPER_AGENT, HANDOFF_FILE,
@@ -599,6 +600,27 @@ pub fn lock_workspace(project: &str, workspace: &str) -> Result<WorkspaceLock> {
     }
     let path = project_dir(project)?.join(format!("workspace-{workspace}.lock"));
     Ok(WorkspaceLock(acquire_file_lock(&path)?))
+}
+
+/// Public RAII handle for the per-project Git worktree/ref lock.
+///
+/// This lock coordinates named-branch checkout with ref rewrites across all
+/// of a project's workspace slots. It is intentionally project-wide: two
+/// machine aliases may identify the same repository, while briefly
+/// serializing distinct repositories is safe.
+#[must_use = "the Git worktree lock is released as soon as the guard is dropped"]
+pub struct GitWorktreeLock(#[allow(dead_code)] FileLockGuard);
+
+/// Block until the project's Git worktree/ref lock is held.
+///
+/// Callers that also need a [`WorkspaceLock`] must acquire that workspace
+/// lock first and this lock second. No code may acquire a workspace lock while
+/// holding this guard. Keeping that order prevents two dispatch/probe paths
+/// from deadlocking while still making a named checkout atomic with a Zen
+/// probe's worktree scan and compare-and-swap ref update.
+pub fn lock_git_worktrees(project: &str) -> Result<GitWorktreeLock> {
+    let path = project_dir(project)?.join("git-worktrees.lock");
+    Ok(GitWorktreeLock(acquire_file_lock(&path)?))
 }
 
 /// Public RAII handle for the per-project dashboard-bootstrap lock. Wraps a
