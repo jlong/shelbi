@@ -133,12 +133,11 @@ pub fn project_name_from_root(path: &Path) -> Option<String> {
         .map(|s| s.to_string())
 }
 
-/// Whether `~/.shelbi/projects/<name>.yaml` already exists. The init
-/// scaffolder uses this to refuse to silently overwrite a pre-existing
-/// project YAML.
+/// Whether either supported local registration for `name` already exists.
+/// The init scaffolder uses this to refuse to silently overwrite or shadow a
+/// pre-existing flat or split project registration.
 pub fn project_name_collides(name: &str) -> Result<bool> {
-    let dir = shelbi_state::projects_dir().map_err(|e| anyhow!(e))?;
-    Ok(dir.join(format!("{name}.yaml")).exists())
+    shelbi_state::has_project_registration(name).map_err(|e| anyhow!(e))
 }
 
 /// Resolved + validated project root, plus the derived project name.
@@ -197,8 +196,8 @@ fn resolve_scripted(
     let name = pick_name(&path, force_name)?;
     if project_name_collides(&name)? {
         bail!(
-            "a shelbi project named `{name}` already exists at \
-             ~/.shelbi/projects/{name}.yaml — remove the existing YAML or pass \
+            "a shelbi project named `{name}` already exists under \
+             ~/.shelbi/projects — remove the existing registration or pass \
              --project NAME to pick a different name"
         );
     }
@@ -264,8 +263,8 @@ fn prompt_loop(cwd: &Path, force_name: Option<&str>) -> Result<ResolvedProjectRo
 
         if project_name_collides(&name)? {
             let proceed = Confirm::new(&format!(
-                "⚠ a shelbi project named `{name}` already exists at \
-                 ~/.shelbi/projects/{name}.yaml. Re-initialize?"
+                "⚠ a shelbi project named `{name}` already exists under \
+                 ~/.shelbi/projects. Re-initialize?"
             ))
             .with_default(false)
             .prompt()
@@ -480,13 +479,20 @@ mod tests {
     }
 
     #[test]
-    fn project_name_collides_detects_existing_yaml() {
+    fn project_name_collides_detects_flat_and_split_registrations() {
         let _g = ENV_LOCK.lock().unwrap();
         let home = fresh_tmp_dir();
         std::env::set_var("SHELBI_HOME", &home);
         std::fs::create_dir_all(home.join("projects")).unwrap();
         std::fs::write(home.join("projects/taken.yaml"), "name: taken\n").unwrap();
+        std::fs::create_dir_all(home.join("projects/split")).unwrap();
+        std::fs::write(
+            home.join("projects/split/local.yaml"),
+            "name: split\nrepo: /tmp/split\n",
+        )
+        .unwrap();
         assert!(project_name_collides("taken").unwrap());
+        assert!(project_name_collides("split").unwrap());
         assert!(!project_name_collides("free").unwrap());
         std::env::remove_var("SHELBI_HOME");
     }

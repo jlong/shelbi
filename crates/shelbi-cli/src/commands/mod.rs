@@ -15,7 +15,6 @@ pub mod open;
 pub mod orchestrate;
 pub mod orchestrator;
 pub mod palette;
-pub mod picker;
 pub mod popup;
 pub mod project;
 pub mod quit_project;

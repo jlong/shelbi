@@ -1,7 +1,7 @@
 //! `shelbi project <subcommand>` — manage projects.
 //!
-//! * `add` — walk the same project-setup prompt sequence as initial
-//!   onboarding without the idempotence guard.
+//! * `add` — run the same detected preflight, one-card confirmation, and
+//!   dashboard launch as initial onboarding.
 //! * `migrate-to-in-repo` — one-way migration of a project's config
 //!   from `~/.shelbi/projects/<name>.yaml` into
 //!   `<repo>/.shelbi/project.yaml` + `~/.shelbi/projects/<name>/local.yaml`.
@@ -17,10 +17,9 @@ use shelbi_state::{
 
 #[derive(Debug, Subcommand)]
 pub enum ProjectCmd {
-    /// Set up a new project interactively. Walks through the same prompt
-    /// sequence as initial onboarding (project name, machines, workspaces,
-    /// runners) and writes `~/.shelbi/projects/<name>.yaml`. Does not
-    /// launch the TUI on completion.
+    /// Set up a new project with the same detected plan card as initial
+    /// onboarding. Writes `~/.shelbi/projects/<name>.yaml` after confirmation
+    /// and launches the dashboard.
     Add,
 
     /// Migrate an existing global-mode project into in-repo mode.
@@ -71,7 +70,7 @@ pub enum ProjectCmd {
 
 pub fn run(cli_project: Option<String>, cmd: ProjectCmd) -> Result<()> {
     match cmd {
-        ProjectCmd::Add => crate::wizard::setup_one_project(),
+        ProjectCmd::Add => super::wizard::run_one_project_and_launch(),
         ProjectCmd::MigrateToInRepo {
             project,
             dry_run,
@@ -259,6 +258,17 @@ mod tests {
             #[command(subcommand)]
             cmd: ProjectCmd,
         },
+    }
+
+    #[test]
+    fn add_subcommand_parses_into_shared_onboarding_route() {
+        let cli = TestCli::parse_from(["shelbi", "project", "add"]);
+        assert!(matches!(
+            cli.cmd,
+            TestCmd::Project {
+                cmd: ProjectCmd::Add
+            }
+        ));
     }
 
     /// `migrate-to-in-repo` parses with the expected defaults (no

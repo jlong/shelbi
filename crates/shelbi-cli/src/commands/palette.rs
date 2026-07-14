@@ -1383,8 +1383,7 @@ fn render_confirm_footer(f: &mut Frame, area: Rect) {
 }
 
 /// Per-project workspace-count suffix shown in the Quit Shelbi popover.
-/// Singular/plural distinction kept so `1 active workspace` reads
-/// naturally — matches how `picker.rs` formats machine/workspace counts.
+/// Singular/plural distinction keeps `1 active workspace` natural.
 fn format_active_workspaces(n: usize) -> String {
     match n {
         0 => "(no active workspaces)".to_string(),

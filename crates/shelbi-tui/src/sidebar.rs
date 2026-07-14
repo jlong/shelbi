@@ -6,7 +6,7 @@ use ratatui::{
     layout::{Constraint, Direction, Layout, Margin, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{List, ListItem, ListState, Paragraph},
+    widgets::{List, ListItem, ListState, Paragraph, Wrap},
     Frame,
 };
 use shelbi_palette::DecorationColor;
@@ -17,10 +17,11 @@ use crate::app::{App, Row};
 use crate::keymap::format_chord_or_unbound;
 
 pub fn render_full(f: &mut Frame, app: &mut App, area: Rect) {
-    // Footer is always: [status?] keybinds, blank, zen-row. The zen row is
-    // a single line in both states so toggling never shifts the rows above
-    // it. Width grows by 1 when there's a `status_line` to surface.
-    let footer_height: u16 = if app.status_line.is_empty() { 3 } else { 4 };
+    // Footer is always: [status?] keybinds, version, zen-row. The exact
+    // first-run copy is wider than the production sidebar's inner width, so
+    // reserve two status rows for it instead of silently clipping "settings".
+    // The zen row remains a single line in every state.
+    let footer_height = 3 + status_row_height(app);
     // Outer split is full-width — the zen ON row paints its green band
     // edge-to-edge of the sidebar column, so it can't sit inside the 1-col
     // horizontal padding the list uses. We re-apply that padding only to
@@ -315,11 +316,11 @@ fn render_footer(f: &mut Frame, app: &App, area: Rect) {
     // zen row sits at the same y-coordinate whether Zen is On or Off so
     // toggling never nudges the keybind line above.
     let has_status = !app.status_line.is_empty();
-    let constraints: Vec<Constraint> = if has_status {
-        vec![Constraint::Length(1); 4]
-    } else {
-        vec![Constraint::Length(1); 3]
-    };
+    let mut constraints = Vec::with_capacity(if has_status { 4 } else { 3 });
+    if has_status {
+        constraints.push(Constraint::Length(status_row_height(app)));
+    }
+    constraints.extend([Constraint::Length(1); 3]);
     let rows = Layout::default()
         .direction(Direction::Vertical)
         .constraints(constraints)
@@ -338,7 +339,8 @@ fn render_footer(f: &mut Frame, app: &App, area: Rect) {
             Paragraph::new(Line::from(Span::styled(
                 app.status_line.clone(),
                 Style::default().fg(Color::Yellow),
-            ))),
+            )))
+            .wrap(Wrap { trim: true }),
             rows[idx].inner(indent),
         );
         idx += 1;
@@ -366,6 +368,16 @@ fn render_footer(f: &mut Frame, app: &App, area: Rect) {
     idx += 1;
 
     render_zen_row(f, rows[idx], app);
+}
+
+fn status_row_height(app: &App) -> u16 {
+    if app.status_line.is_empty() {
+        0
+    } else if app.status_line == crate::FIRST_RUN_HINT {
+        2
+    } else {
+        1
+    }
 }
 
 /// Single-line daemon/CLI version segment in the footer's spacer row.
@@ -526,6 +538,21 @@ mod tests {
         assert!(
             joined.contains("<unbound> palette  <unbound> quit"),
             "expected <unbound> markers in:\n{joined}"
+        );
+    }
+
+    #[test]
+    fn first_run_hint_wraps_without_clipping_at_sidebar_max_width() {
+        let mut app = App::new_sidebar("demo");
+        app.status_line = crate::FIRST_RUN_HINT.to_string();
+        let joined = footer_text(&mut app);
+        assert!(
+            joined.contains("Ctrl+P palette · type E to edit"),
+            "first line of the exact hint is missing:\n{joined}"
+        );
+        assert!(
+            joined.contains("settings"),
+            "the old one-row footer clipped the final word:\n{joined}"
         );
     }
 

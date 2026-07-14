@@ -15,7 +15,9 @@ mod wizard;
 struct Cli {
     /// Override the shelbi root directory (default: baked at install time;
     /// also overridable via $SHELBI_ROOT). The flag wins over both env vars
-    /// and the compile-time default; `~/.shelbi` is the final fallback.
+    /// and the compile-time default; `~/.shelbi` is the final fallback. With
+    /// `init`, place this before the subcommand; `init --root PATH` names the
+    /// project root instead.
     #[arg(long, global = true, value_name = "PATH")]
     root: Option<std::path::PathBuf>,
 
@@ -25,10 +27,9 @@ struct Cli {
     #[arg(long, short = 'p', global = true, env = "SHELBI_PROJECT")]
     project: Option<String>,
 
-    /// Assume "yes" for interactive confirmations — currently the offer
-    /// to run `shelbi daemon restart` when a command detects the running
-    /// daemon's version doesn't match this CLI.
-    #[arg(long, global = true)]
+    /// Accept the detected `shelbi init` plan without prompts. For other
+    /// commands, assume "yes" when an optional confirmation supports it.
+    #[arg(long, short = 'y', global = true)]
     yes: bool,
 
     #[command(subcommand)]
@@ -201,8 +202,13 @@ enum Cmd {
     },
     /// Attach the terminal to a workspace's tmux pane.
     Attach { id: String },
-    /// Scaffold ~/.shelbi/ and (optionally) a starter project YAML.
-    /// Offers a choice of *global* mode (config lives at
+    /// Initialize a Shelbi project. `shelbi init -y` detects the repository,
+    /// runner, tmux, and workspace plan, then scaffolds it without prompts.
+    /// If both Claude and Codex are installed, add `--runner claude` or
+    /// `--runner codex`.
+    ///
+    /// Without `-y`, Shelbi preserves the legacy config-location flow and
+    /// offers a choice of *global* mode (config lives at
     /// ~/.shelbi/projects/<name>.yaml) or *in-repo* mode (shared config
     /// committed at <repo>/.shelbi/project.yaml so teammates get it on
     /// clone). Pass `--pick-up` on a cloned repo carrying an existing
@@ -266,7 +272,13 @@ enum Cmd {
     /// remote TUI for one project. Not for direct use.
     #[command(hide = true)]
     #[command(name = "__codex-orchestrator")]
-    CodexOrchestrator { project: String },
+    CodexOrchestrator {
+        project: String,
+        /// Carry the already-claimed first-project welcome into the native
+        /// bridge. Hidden with the internal command and never set by users.
+        #[arg(long, hide = true)]
+        first_launch: bool,
+    },
     /// Toggle Zen Mode or run its primitives. `shelbi zen on/off/pause` flip
     /// the trust boundary for auto-promotion and exact-provenance auto-merge.
     /// `probe` reports facts about a finished branch (checks,
@@ -313,10 +325,20 @@ enum Cmd {
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
-    if let Some(root) = cli.root.clone() {
-        // Stash before any helper reads the resolved root. `expand_tilde_*`
-        // happens inside `resolve()` so the user can pass `~/scratch`.
-        shelbi_state::set_root_override(root);
+    let init_has_project_root = matches!(cli.cmd.as_ref(), Some(Cmd::Init(_)))
+        && init_project_root_was_explicit(std::env::args_os());
+    // `init` has historically used `--root` for the project root while the
+    // top-level CLI uses the same global spelling for Shelbi's state root.
+    // clap exposes that shared value in both structs. Preserve conventional
+    // scope: before `init` it is the global state root; after `init` it is the
+    // project root. `$SHELBI_ROOT` can express a separate state root when the
+    // project-root form is used.
+    if !init_has_project_root {
+        if let Some(root) = cli.root.clone() {
+            // Stash before any helper reads the resolved root. `expand_tilde_*`
+            // happens inside `resolve()` so the user can pass `~/scratch`.
+            shelbi_state::set_root_override(root);
+        }
     }
     if cli.yes {
         // Carried through the environment (like `--root` via the override
@@ -365,7 +387,14 @@ fn main() -> Result<()> {
         Some(Cmd::Zen { cmd }) => commands::zen::run(cli.project, cmd),
         Some(Cmd::Action { cmd }) => commands::action::run(cli.project, cmd),
         Some(Cmd::Attach { id }) => commands::attach::run(cli.project, id),
-        Some(Cmd::Init(args)) => commands::init::run(args),
+        Some(Cmd::Init(mut args)) => {
+            if !init_has_project_root {
+                // A global `--root` is propagated into the subcommand's field
+                // by clap because both intentionally share the spelling.
+                args.root = None;
+            }
+            commands::init::run(args, cli.yes)
+        }
         Some(Cmd::Wizard) => commands::wizard::run(false).map(|_| ()),
         Some(Cmd::Orchestrate(args)) => commands::orchestrate::run(cli.project, args),
         Some(Cmd::Orchestrator { cmd }) => commands::orchestrator::run(cli.project, cmd),
@@ -373,8 +402,11 @@ fn main() -> Result<()> {
         Some(Cmd::Sidebar { project }) => shelbi_tui::run_sidebar(&project).context("sidebar"),
         Some(Cmd::Tasks { project }) => shelbi_tui::run_tasks(&project).context("tasks"),
         Some(Cmd::Activity { project }) => shelbi_tui::run_activity(&project).context("activity"),
-        Some(Cmd::CodexOrchestrator { project }) => {
-            shelbi_orchestrator::wake::run_codex_bridge(&project)
+        Some(Cmd::CodexOrchestrator {
+            project,
+            first_launch,
+        }) => {
+            shelbi_orchestrator::wake::run_codex_bridge(&project, first_launch)
                 .map_err(|e| anyhow::anyhow!(e.to_string()))
         }
         Some(Cmd::Popup) => commands::popup::run(),
@@ -385,114 +417,126 @@ fn main() -> Result<()> {
     }
 }
 
+fn init_project_root_was_explicit<I, S>(args: I) -> bool
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<std::ffi::OsStr>,
+{
+    let args = args
+        .into_iter()
+        .map(|arg| arg.as_ref().to_string_lossy().into_owned())
+        .collect::<Vec<_>>();
+    let mut index = 1;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--root" | "--project" | "-p" => index += 2,
+            "--yes" | "-y" => index += 1,
+            "init" => {
+                return args[index + 1..]
+                    .iter()
+                    .any(|arg| arg == "--root" || arg.starts_with("--root="));
+            }
+            _ => index += 1,
+        }
+    }
+    false
+}
+
 /// `shelbi` with no subcommand. Dispatches based on what's on disk:
 ///
 /// - `--project` / `SHELBI_PROJECT`, or a cwd inside a registered
-///   project's `work_dir`, that resolves to a YAML on disk → boot that
-///   project's TUI. (cwd resolution is reverse-lookup against the
-///   project YAMLs, so it only ever returns names backed by a YAML.)
+///   project's `work_dir`, that resolves to a local registration → boot that
+///   project's TUI.
 /// - an explicit `--project` / `SHELBI_PROJECT` names a project with no
 ///   YAML on this machine → print a friendly note and fall through to
-///   the first-run prompt so the user can set up the project locally. We
+///   onboarding so the user can set up the project locally. We
 ///   deliberately re-derive the project name from the chosen root's
 ///   basename rather than re-using the missing name.
-/// - `~/.shelbi/` missing OR `~/.shelbi/projects/` empty → onboarding
-///   first-run flow (banner + project-root prompt + scaffold + launch
-///   TUI).
-/// - exactly one project YAML → boot it.
-/// - two or more → project picker.
+/// - cwd does not resolve to a registered project → onboarding for this cwd,
+///   even when other projects already exist. The banner appears only when the
+///   Shelbi home itself is new.
 fn default_entry(explicit: Option<String>) -> Result<()> {
-    let resolved = commands::require_project(explicit).ok();
-    let needs_first_run = match resolved.as_deref() {
-        Some(name) if project_yaml_exists(name) => {
-            return shelbi_tui::run_main(name).context("launching shelbi");
+    let resolved = resolve_or_onboard(commands::require_project(explicit))?;
+    let missing_project = match classify_default_route(resolved, project_registration_exists) {
+        DefaultRoute::Dashboard(name) => {
+            return shelbi_tui::run_main(&name).context("launching shelbi");
         }
-        Some(name) => {
-            eprintln!(
-                "No ~/.shelbi/projects/{name}.yaml on this machine — \
-                 let's set up a project here.\n"
-            );
-            true
-        }
-        None => false,
+        DefaultRoute::Onboarding { missing_project } => missing_project,
     };
+    if let Some(name) = missing_project {
+        eprintln!(
+            "No local registration for project `{name}` on this machine — \
+             let's set up a project here.\n"
+        );
+    }
 
     let home = shelbi_state::shelbi_home().map_err(|e| anyhow::anyhow!(e))?;
     let home_existed = home.exists();
-    let projects = if home_existed {
-        shelbi_state::list_projects().map_err(|e| anyhow::anyhow!(e))?
-    } else {
-        Vec::new()
-    };
+    run_wizard_then_dispatch(!home_existed)
+}
 
-    // A missing-YAML explicit project forces first-run regardless of how
-    // many other projects are on disk — the user named a project that
-    // needs scaffolding and that's the action that maps to their intent.
-    if needs_first_run || projects.is_empty() {
-        return run_wizard_then_dispatch(!home_existed);
-    }
-    if projects.len() == 1 {
-        return shelbi_tui::run_main(&projects[0].name).context("launching shelbi");
-    }
-    match commands::picker::pick_or_setup()? {
-        commands::picker::PickerOutcome::Existing(p)
-        | commands::picker::PickerOutcome::Created(p) => {
-            shelbi_tui::run_main(&p).context("launching shelbi")
-        }
-        commands::picker::PickerOutcome::Cancelled => Ok(()),
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum DefaultRoute {
+    Dashboard(String),
+    Onboarding { missing_project: Option<String> },
+}
+
+fn classify_default_route<F>(resolved: Option<String>, is_registered: F) -> DefaultRoute
+where
+    F: FnOnce(&str) -> bool,
+{
+    match resolved {
+        Some(name) if is_registered(&name) => DefaultRoute::Dashboard(name),
+        missing_project => DefaultRoute::Onboarding { missing_project },
     }
 }
 
-/// Whether `~/.shelbi/projects/<name>.yaml` is on this machine. Used to
-/// distinguish a live marker from a stale one without round-tripping
-/// through the TUI loader's error path.
-fn project_yaml_exists(name: &str) -> bool {
+/// Treat the ordinary "no project specified" miss as an onboarding route,
+/// while preserving structured state errors. In particular, a cloned
+/// in-repo project without its user-local registration must keep directing
+/// the user to `shelbi init --pick-up`; silently replacing that config with a
+/// new global project would corrupt the established config-mode workflow.
+fn resolve_or_onboard(resolved: Result<String>) -> Result<Option<String>> {
+    match resolved {
+        Ok(name) => Ok(Some(name)),
+        Err(error) if error.downcast_ref::<shelbi_core::Error>().is_some() => Err(error),
+        Err(_) => Ok(None),
+    }
+}
+
+/// Whether either supported local registration for `name` is on this
+/// machine: the flat global YAML or an in-repo project's split local half.
+/// This stays a path-only check so the configured-repository bypass does not
+/// trigger the migrations performed by `load_project`.
+fn project_registration_exists(name: &str) -> bool {
+    if shelbi_core::validate_project_name(name).is_err() {
+        return false;
+    }
     match shelbi_state::projects_dir() {
-        Ok(dir) => dir.join(format!("{name}.yaml")).exists(),
+        Ok(dir) => {
+            dir.join(format!("{name}.yaml")).is_file()
+                || dir.join(name).join("local.yaml").is_file()
+        }
         Err(_) => false,
     }
 }
 
-/// First-run dispatcher when `default_entry` finds no projects on disk.
+/// Onboarding dispatcher when `default_entry` cannot resolve this cwd to a
+/// locally registered project.
 /// Prints the brand banner (only on a truly-fresh install), then runs the
-/// same `shelbi init` prompt + scaffold the explicit command runs and
-/// finally launches the TUI against the newly-scaffolded project.
+/// shared detected-plan flow and launches the TUI only when that flow creates
+/// a project.
 ///
 /// `first_run` is true when `~/.shelbi/` did not exist before this
 /// invocation; the banner only prints in that case.
 ///
-/// Cancellation (`Ctrl-C` / `Esc`) at any prompt exits cleanly without
-/// scaffolding anything — the per-step `inquire` calls write state only
-/// at the end of their phase.
+/// Cancellation (`Ctrl-C` / `Esc`) and the plan card's explicit `q` both
+/// resolve to `SetupOutcome::Quit` and exit cleanly without launching.
 fn run_wizard_then_dispatch(first_run: bool) -> Result<()> {
     if first_run {
         wizard::print_banner();
     }
-    let resolved = match commands::init::scaffold_with_prompt(commands::init::Args {
-        project: None,
-        root: None,
-        mode: None,
-        pick_up: false,
-    }) {
-        Ok(r) => r,
-        Err(e) if is_inquire_cancel(&e) => return Ok(()),
-        Err(e) => return Err(e),
-    };
-    shelbi_tui::run_main(&resolved.name).context("launching shelbi")
-}
-
-/// True if `e` was produced by an `inquire` prompt being cancelled or
-/// interrupted (`Esc` / `Ctrl-C`). Walks the anyhow source chain because
-/// the wizard/init helpers wrap each `prompt()` call in
-/// `.with_context(...)`.
-fn is_inquire_cancel(e: &anyhow::Error) -> bool {
-    matches!(
-        e.downcast_ref::<inquire::error::InquireError>(),
-        Some(
-            inquire::error::InquireError::OperationCanceled
-                | inquire::error::InquireError::OperationInterrupted
-        )
-    )
+    commands::wizard::run_one_project_and_launch()
 }
 
 /// Initialize the tracing subscriber.
@@ -553,6 +597,109 @@ mod cli_tests {
     use clap::error::ErrorKind;
     use clap::Parser;
     use commands::workspace::WorkspaceCmd;
+
+    #[test]
+    fn init_yes_parses_every_detected_plan_override() {
+        let cli = Cli::parse_from([
+            "shelbi",
+            "init",
+            "-y",
+            "--project",
+            "demo",
+            "--root",
+            "/tmp/demo",
+            "--runner",
+            "codex",
+            "--default-branch",
+            "develop",
+            "--github-url",
+            "https://github.com/example/demo.git",
+            "--workspace-count",
+            "3",
+            "--workspace-preset",
+            "toy-story",
+            "--orchestrator-runner",
+            "claude",
+        ]);
+        assert!(cli.yes);
+        assert_eq!(cli.root.as_deref(), Some(std::path::Path::new("/tmp/demo")));
+        assert!(init_project_root_was_explicit([
+            "shelbi",
+            "init",
+            "--root",
+            "/tmp/demo"
+        ]));
+        let Some(Cmd::Init(args)) = cli.cmd else {
+            panic!("expected init command");
+        };
+        assert_eq!(args.project.as_deref(), Some("demo"));
+        assert_eq!(
+            args.root.as_deref(),
+            Some(std::path::Path::new("/tmp/demo"))
+        );
+        assert_eq!(args.runner, Some(wizard::Runner::Codex));
+        assert_eq!(args.default_branch.as_deref(), Some("develop"));
+        assert_eq!(
+            args.github_url.as_deref(),
+            Some("https://github.com/example/demo.git")
+        );
+        assert_eq!(args.workspace_count, Some(3));
+        assert_eq!(
+            args.workspace_preset,
+            Some(shelbi_core::WorkspaceNamePreset::ToyStory)
+        );
+        assert_eq!(args.orchestrator_runner, Some(wizard::Runner::Claude));
+    }
+
+    #[test]
+    fn init_root_scope_distinguishes_global_state_from_project_root() {
+        assert!(!init_project_root_was_explicit([
+            "shelbi", "--root", "/tmp/state", "init", "-y"
+        ]));
+        assert!(!init_project_root_was_explicit([
+            "shelbi",
+            "--project",
+            "init",
+            "init",
+            "-y"
+        ]));
+        assert!(init_project_root_was_explicit([
+            "shelbi",
+            "init",
+            "-y",
+            "--root=/tmp/project"
+        ]));
+    }
+
+    #[test]
+    fn init_help_is_copyable_and_documents_detected_plan_flags() {
+        let error = Cli::try_parse_from(["shelbi", "init", "--help"]).unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::DisplayHelp);
+        let help = error.to_string();
+        for expected in [
+            "shelbi init -y",
+            "shelbi init -y --runner codex",
+            "-y, --yes",
+            "--runner <RUNNER>",
+            "--project <PROJECT>",
+            "--root <ROOT>",
+            "--default-branch <BRANCH>",
+            "--github-url <URL>",
+            "--workspace-count <COUNT>",
+            "--workspace-preset <PRESET>",
+            "--orchestrator-runner <RUNNER>",
+        ] {
+            assert!(help.contains(expected), "missing `{expected}` in:\n{help}");
+        }
+        assert!(
+            help.contains("claude"),
+            "runner values missing from:\n{help}"
+        );
+        assert!(
+            help.contains("codex"),
+            "runner values missing from:\n{help}"
+        );
+    }
 
     /// `shelbi worker list` resolves to the same handler as
     /// `shelbi workspace list` — clap parses both into the dispatch
@@ -632,9 +779,26 @@ mod cli_tests {
     fn codex_orchestrator_bridge_command_is_hidden_but_parseable() {
         let cli = Cli::parse_from(["shelbi", "__codex-orchestrator", "myapp"]);
         match cli.cmd {
-            Some(Cmd::CodexOrchestrator { project }) if project == "myapp" => {}
+            Some(Cmd::CodexOrchestrator {
+                project,
+                first_launch,
+            }) if project == "myapp" && !first_launch => {}
             other => panic!("expected CodexOrchestrator {{ myapp }}, got {other:?}"),
         }
+
+        let first = Cli::parse_from([
+            "shelbi",
+            "__codex-orchestrator",
+            "myapp",
+            "--first-launch",
+        ]);
+        assert!(matches!(
+            first.cmd,
+            Some(Cmd::CodexOrchestrator {
+                project,
+                first_launch: true,
+            }) if project == "myapp"
+        ));
 
         let help = Cli::try_parse_from(["shelbi", "--help"])
             .expect_err("--help exits through clap")
@@ -645,13 +809,13 @@ mod cli_tests {
         );
     }
 
-    /// `project_yaml_exists` is the predicate `default_entry` uses to
-    /// decide whether an explicitly-named project is live (boot it) or
-    /// missing on this machine (fall through to first-run). The test pins
-    /// both branches against a tempfile `SHELBI_HOME` so a future refactor
-    /// can't silently invert it.
+    /// `project_registration_exists` is the predicate `default_entry` uses
+    /// to decide whether an explicitly-named project is live (boot it) or
+    /// missing on this machine (fall through to first-run). Both supported
+    /// registry layouts count: a flat global YAML and the local half of an
+    /// in-repo split project.
     #[test]
-    fn project_yaml_exists_pins_missing_project_branch() {
+    fn project_registration_exists_supports_both_config_modes() {
         let _g = commands::test_support::ENV_LOCK.lock().unwrap();
         let home = std::env::temp_dir().join(format!(
             "shelbi-stale-marker-test-{}-{}",
@@ -662,13 +826,77 @@ mod cli_tests {
                 .as_nanos()
         ));
         std::fs::create_dir_all(home.join("projects")).unwrap();
-        std::env::set_var("SHELBI_HOME", &home);
+        let env = commands::test_support::EnvGuard::new(&["SHELBI_HOME"]);
+        env.set("SHELBI_HOME", &home);
 
-        assert!(!project_yaml_exists("nope"), "missing YAML should be stale");
+        assert!(
+            !project_registration_exists("nope"),
+            "missing registration should be stale"
+        );
+        assert!(
+            !project_registration_exists("../live"),
+            "invalid project names must not escape the registry directory"
+        );
         std::fs::write(home.join("projects/live.yaml"), "name: live\n").unwrap();
-        assert!(project_yaml_exists("live"), "present YAML should be live");
+        assert!(
+            project_registration_exists("live"),
+            "flat global YAML should be live"
+        );
 
-        std::env::remove_var("SHELBI_HOME");
+        std::fs::create_dir_all(home.join("projects/split")).unwrap();
+        std::fs::write(
+            home.join("projects/split/local.yaml"),
+            "repo: /tmp/split\nmachines: []\n",
+        )
+        .unwrap();
+        assert!(
+            project_registration_exists("split"),
+            "split local registration should be live"
+        );
+
+        std::fs::create_dir_all(home.join("projects/incomplete")).unwrap();
+        assert!(
+            !project_registration_exists("incomplete"),
+            "a project directory without local.yaml is not registered"
+        );
+
+        assert_eq!(
+            classify_default_route(Some("live".to_string()), |_| true),
+            DefaultRoute::Dashboard("live".to_string())
+        );
+        assert_eq!(
+            classify_default_route(None, |_| true),
+            DefaultRoute::Onboarding {
+                missing_project: None
+            },
+            "an unresolved cwd must onboard instead of selecting an unrelated project"
+        );
+        assert_eq!(
+            classify_default_route(Some("missing".to_string()), |_| false),
+            DefaultRoute::Onboarding {
+                missing_project: Some("missing".to_string())
+            }
+        );
+    }
+
+    #[test]
+    fn onboarding_resolution_preserves_pick_up_errors() {
+        let missing_local = shelbi_core::Error::ProjectNotPickedUp {
+            name: "shared".into(),
+            config_path: "/tmp/shared/.shelbi/project.yaml".into(),
+            expected_local: "/tmp/home/projects/shared/local.yaml".into(),
+        };
+        let error = resolve_or_onboard(Err(anyhow::anyhow!(missing_local))).unwrap_err();
+        assert!(error.to_string().contains("shelbi init --pick-up"));
+
+        assert_eq!(
+            resolve_or_onboard(Err(anyhow::anyhow!("no project specified"))).unwrap(),
+            None
+        );
+        assert_eq!(
+            resolve_or_onboard(Ok("configured".to_string())).unwrap(),
+            Some("configured".to_string())
+        );
     }
 
     /// A mistyped subcommand must be a parse *error*, not silently

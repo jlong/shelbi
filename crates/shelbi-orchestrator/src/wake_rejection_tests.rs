@@ -119,6 +119,7 @@ fn test_bridge(
         tui_ready_deadline: Instant::now() + TUI_READY_TIMEOUT,
         protocol_unsupported: false,
         bootstrap_sent,
+        bootstrap_prompt: crate::ORCH_BOOTSTRAP_PROMPT.into(),
         bootstrap_blocked_generation: None,
         bootstrap_retry_not_before: Instant::now(),
         bootstrap_message_id: format!("shelbi-bootstrap/{THREAD_ID}/1"),
@@ -180,6 +181,87 @@ fn send_idle_resume(socket: &mut WebSocket<UnixStream>, expected_method: &str) {
 }
 
 #[test]
+fn native_first_launch_sends_contextual_prompt_with_stable_message_id() {
+    let _lock = crate::test_lock::acquire();
+    let temp = tempfile::tempdir().unwrap();
+    let _home = HomeGuard::install(temp.path());
+    let socket_path = temp.path().join("app-server.sock");
+    let listener = match UnixListener::bind(&socket_path) {
+        Ok(listener) => listener,
+        Err(error) if error.kind() == io::ErrorKind::PermissionDenied => {
+            eprintln!("skipping: sandbox does not permit Unix sockets");
+            return;
+        }
+        Err(error) => panic!("bind test socket: {error}"),
+    };
+    let (release_tx, release_rx) = mpsc::channel();
+
+    let server = thread::spawn(move || {
+        let mut socket = accept_initialized(&listener);
+        let start = read_json(&mut socket);
+        assert_eq!(start["method"], "turn/start");
+        assert_eq!(
+            start["params"]["clientUserMessageId"],
+            "shelbi-first-launch/demo/thread-1"
+        );
+        let prompt = start["params"]["input"][0]["text"].as_str().unwrap();
+        assert!(prompt.contains("[SHELBI_FIRST_PROJECT_GREETING]"));
+        assert!(prompt.contains("Welcome to demo"));
+        assert!(prompt.contains("write it up as a task and dispatch it"));
+        send_json(
+            &mut socket,
+            json!({"id": start["id"], "result": {"turn": {"id": "first-opening"}}}),
+        );
+        release_rx
+            .recv_timeout(RPC_TIMEOUT)
+            .expect("client should release the fixture socket");
+    });
+
+    let rpc = CodexRpcClient::connect(
+        &socket_path,
+        "wake-rejection-test",
+        env!("CARGO_PKG_VERSION"),
+        RPC_TIMEOUT,
+    )
+    .unwrap();
+    let mut bridge = test_bridge(
+        temp.path(),
+        socket_path,
+        rpc,
+        ThreadPhase::Idle,
+        DurableQueue {
+            project: PROJECT.into(),
+            batches: VecDeque::new(),
+        },
+        false,
+    );
+    bridge.bootstrap_prompt = crate::orchestrator_bootstrap_prompt(
+        PROJECT,
+        Path::new("/tmp/demo"),
+        true,
+    );
+    bridge.bootstrap_message_id = bootstrap_message_id(PROJECT, THREAD_ID, 7, true);
+
+    bridge.maybe_send_bootstrap().unwrap();
+    release_tx.send(()).unwrap();
+    server.join().unwrap();
+    assert!(
+        bridge.bootstrap_sent,
+        "bootstrap was not sent: rpc_connected={} phase={:?} generation={} blocked={:?} \
+         awaiting_nonsteerable={:?}",
+        bridge.rpc.is_some(),
+        bridge.runtime.phase,
+        bridge.runtime.generation,
+        bridge.bootstrap_blocked_generation,
+        bridge.awaiting_nonsteerable_completion,
+    );
+    assert_eq!(
+        bridge.runtime.phase,
+        ThreadPhase::Active("first-opening".into())
+    );
+}
+
+#[test]
 fn bootstrap_rejection_without_notification_rehydrates_and_retries_exact_thread() {
     let _lock = crate::test_lock::acquire();
     let temp = tempfile::tempdir().unwrap();
@@ -193,6 +275,14 @@ fn bootstrap_rejection_without_notification_rehydrates_and_retries_exact_thread(
         let start = read_json(&mut first);
         assert_eq!(start["method"], "turn/start");
         assert_eq!(start["params"]["threadId"], THREAD_ID);
+        assert_eq!(
+            start["params"]["input"][0]["text"],
+            crate::ORCH_BOOTSTRAP_PROMPT
+        );
+        assert!(!start["params"]["input"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("SHELBI_FIRST_PROJECT_GREETING"));
         send_json(
             &mut first,
             json!({

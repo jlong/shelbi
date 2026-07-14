@@ -157,7 +157,7 @@ fn retry_native_start<T>(
 /// draining at turn boundaries. Transient startup and pre-ready failures retry
 /// the native bridge with its durable queue intact. The compatibility path
 /// deliberately has no autonomous tmux injection.
-pub fn run_codex_bridge(project_name: &str) -> Result<()> {
+pub fn run_codex_bridge(project_name: &str, first_launch: bool) -> Result<()> {
     let project = shelbi_state::load_project(project_name)?;
     let runner = project
         .runner(&project.orchestrator.runner)
@@ -171,8 +171,20 @@ pub fn run_codex_bridge(project_name: &str) -> Result<()> {
     }
 
     let workdir = shelbi_state::project_dir(project_name)?;
+    let repo_root = project
+        .machines
+        .iter()
+        .find(|machine| matches!(machine.kind, shelbi_core::MachineKind::Local))
+        .map(|machine| machine.work_dir.clone())
+        .unwrap_or_else(|| PathBuf::from(&project.repo));
     let developer_instructions = developer_instructions(project_name, &workdir)?;
+    let mut first_launch_pending = first_launch;
     loop {
+        let bootstrap_prompt = crate::orchestrator_bootstrap_prompt(
+            project_name,
+            &repo_root,
+            first_launch_pending,
+        );
         let mut bridge = match retry_native_start(
             || {
                 NativeBridge::start(
@@ -180,6 +192,8 @@ pub fn run_codex_bridge(project_name: &str) -> Result<()> {
                     runner.clone(),
                     workdir.clone(),
                     developer_instructions.clone(),
+                    bootstrap_prompt.clone(),
+                    first_launch_pending,
                 )
             },
             |error| {
@@ -197,12 +211,18 @@ pub fn run_codex_bridge(project_name: &str) -> Result<()> {
                     "shelbi: Codex native event bridge unavailable ({error}); \
                      continuing in standalone turn-boundary polling mode"
                 );
-                return run_standalone(&runner, project_name, &workdir);
+                return run_standalone(&runner, project_name, &workdir, &bootstrap_prompt);
             }
         };
 
         let result = bridge.run();
         let protocol_unsupported = bridge.protocol_unsupported;
+        // A successful or deduplicated bootstrap means the one-shot welcome
+        // is present in the exact thread. Any in-process recovery after this
+        // point gets only the normal session bootstrap.
+        if bridge.bootstrap_sent {
+            first_launch_pending = false;
+        }
         drop(bridge);
         match result {
             Ok(()) => return Ok(()),
@@ -211,7 +231,12 @@ pub fn run_codex_bridge(project_name: &str) -> Result<()> {
                     "shelbi: Codex native event bridge unavailable ({error}); \
                      continuing in standalone turn-boundary polling mode"
                 );
-                return run_standalone(&runner, project_name, &workdir);
+                let fallback_prompt = crate::orchestrator_bootstrap_prompt(
+                    project_name,
+                    &repo_root,
+                    first_launch_pending,
+                );
+                return run_standalone(&runner, project_name, &workdir, &fallback_prompt);
             }
             Err(error) => {
                 tracing::warn!(
@@ -229,6 +254,7 @@ fn run_standalone(
     runner: &shelbi_core::AgentRunnerSpec,
     project_name: &str,
     workdir: &Path,
+    bootstrap_prompt: &str,
 ) -> Result<()> {
     // A native attempt may already have persisted the owned thread before a
     // later protocol/TUI failure selects compatibility mode. Mark it inactive
@@ -236,7 +262,8 @@ fn run_standalone(
     // handoff instead of mistaking the parked native identity for the live
     // conversation.
     mark_persisted_codex_thread_inactive(project_name, workdir)?;
-    let launch = crate::codex_standalone_launch(runner, project_name, workdir);
+    let launch =
+        crate::codex_standalone_launch(runner, project_name, workdir, bootstrap_prompt);
     let status = Command::new("sh")
         .arg("-c")
         .arg(launch)
@@ -286,6 +313,7 @@ struct NativeBridge {
     tui_ready_deadline: Instant,
     protocol_unsupported: bool,
     bootstrap_sent: bool,
+    bootstrap_prompt: String,
     bootstrap_blocked_generation: Option<u64>,
     bootstrap_retry_not_before: Instant,
     bootstrap_message_id: String,
@@ -296,12 +324,32 @@ struct NativeBridge {
     next_reconnect: Instant,
 }
 
+fn bootstrap_message_id(
+    project: &str,
+    thread_id: &str,
+    generation: u64,
+    first_launch: bool,
+) -> String {
+    if first_launch {
+        // Stable across an app-server reconnect. If Codex accepted the
+        // contextual turn but the response was lost, its resumed history (or
+        // server-side client-id dedupe) prevents a second opening greeting.
+        // Keep the owned thread in the key so recreating a project with the
+        // same local name cannot collide with an unrelated historical turn.
+        format!("shelbi-first-launch/{project}/{thread_id}")
+    } else {
+        format!("shelbi-bootstrap/{thread_id}/{generation}")
+    }
+}
+
 impl NativeBridge {
     fn start(
         project: Project,
         runner: shelbi_core::AgentRunnerSpec,
         workdir: PathBuf,
         developer_instructions: String,
+        bootstrap_prompt: String,
+        first_launch: bool,
     ) -> NativeStartupResult<Self> {
         verify_remote_tui_support(&runner)?;
         let socket_paths = native_socket_paths(&project.name, &workdir);
@@ -344,6 +392,12 @@ impl NativeBridge {
         let tui = spawn_remote_tui(&runner, &workdir, &relay_socket_path, &thread_id)
             .map_err(NativeStartupError::transient)?;
 
+        let bootstrap_message_id = bootstrap_message_id(
+            &project.name,
+            &thread_id,
+            generation,
+            first_launch,
+        );
         Ok(Self {
             project,
             workdir,
@@ -361,9 +415,10 @@ impl NativeBridge {
             tui_ready_deadline: Instant::now() + TUI_READY_TIMEOUT,
             protocol_unsupported: false,
             bootstrap_sent: false,
+            bootstrap_prompt,
             bootstrap_blocked_generation: None,
             bootstrap_retry_not_before: Instant::now(),
-            bootstrap_message_id: format!("shelbi-bootstrap/{}/{generation}", thread_id),
+            bootstrap_message_id,
             blocked_generation: None,
             awaiting_nonsteerable_completion: None,
             retry_not_before: Instant::now(),
@@ -654,7 +709,7 @@ impl NativeBridge {
         let params = json!({
             "threadId": self.thread_id,
             "clientUserMessageId": self.bootstrap_message_id,
-            "input": [{"type": "text", "text": crate::ORCH_BOOTSTRAP_PROMPT}],
+            "input": [{"type": "text", "text": self.bootstrap_prompt}],
         });
         let result =
             self.rpc
@@ -2477,6 +2532,26 @@ mod tests {
     use std::net::{TcpListener, TcpStream};
 
     use super::*;
+
+    #[test]
+    fn first_launch_bootstrap_id_is_stable_across_thread_resume_generations() {
+        assert_eq!(
+            bootstrap_message_id("demo", "thread-1", 1, true),
+            bootstrap_message_id("demo", "thread-1", 9, true)
+        );
+        assert_ne!(
+            bootstrap_message_id("demo", "thread-1", 1, false),
+            bootstrap_message_id("demo", "thread-1", 9, false)
+        );
+        assert_ne!(
+            bootstrap_message_id("demo", "thread-1", 1, true),
+            bootstrap_message_id("other", "thread-1", 1, true)
+        );
+        assert_ne!(
+            bootstrap_message_id("demo", "thread-1", 1, true),
+            bootstrap_message_id("demo", "thread-2", 1, true)
+        );
+    }
 
     struct RemoteTuiSmokeGuard {
         app_server: Child,

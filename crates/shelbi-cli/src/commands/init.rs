@@ -4,12 +4,14 @@ use std::path::{Path, PathBuf};
 use anyhow::{anyhow, bail, Context, Result};
 use clap::{Args as ClapArgs, ValueEnum};
 use inquire::Select;
+use shelbi_core::WorkspaceNamePreset;
 use shelbi_state::AgentMaterializeOutcome;
 
 use crate::project_root::{
     project_name_collides, resolve_root_for_init, validate_project_name, validate_root,
     ResolvedProjectRoot, RootValidation,
 };
+use crate::wizard::{self, Runner, SetupPlanOverrides};
 
 pub mod heuristic;
 
@@ -54,25 +56,60 @@ impl InitMode {
 }
 
 #[derive(Debug, ClapArgs)]
+#[command(after_long_help = "Examples:\n  shelbi init -y\n  shelbi init -y --runner codex")]
 pub struct Args {
     /// Override the project name. Defaults to the basename of the
     /// project root (current directory or `--root`).
     #[arg(long)]
     pub project: Option<String>,
 
-    /// Project root directory — the repo `shelbi` will manage. Skips
-    /// the interactive "Project root?" prompt. Required when stdin
-    /// is not a TTY (CI, piped input).
+    /// Project root directory — the repo `shelbi` will manage. Defaults to
+    /// the current directory with `-y`; otherwise skips the interactive
+    /// "Project root?" prompt and is required when stdin is not a TTY.
     #[arg(long)]
     pub root: Option<PathBuf>,
+
+    /// Agent runner for every generated workspace. In `-y` mode Shelbi
+    /// detects this when exactly one supported runner is on PATH. When both
+    /// are installed, pass `--runner claude` or `--runner codex`.
+    #[arg(long, value_enum, value_name = "RUNNER")]
+    pub(crate) runner: Option<Runner>,
+
+    /// Override the detected default Git branch in `-y` mode.
+    #[arg(long, alias = "branch", value_name = "BRANCH")]
+    pub(crate) default_branch: Option<String>,
+
+    /// Override the detected origin URL in `-y` mode. Credentials are removed
+    /// before the URL is written. Pass an empty value to omit the URL.
+    #[arg(long, alias = "remote", value_name = "URL")]
+    pub(crate) github_url: Option<String>,
+
+    /// Number of development workspaces to generate in `-y` mode. A separate
+    /// review workspace is always added.
+    #[arg(
+        long,
+        alias = "workspaces",
+        value_name = "COUNT",
+        value_parser = clap::value_parser!(u32).range(1..)
+    )]
+    pub(crate) workspace_count: Option<u32>,
+
+    /// Workspace naming preset in `-y` mode: phonetic, greek, or toy-story.
+    #[arg(long, value_name = "PRESET", value_parser = parse_workspace_preset)]
+    pub(crate) workspace_preset: Option<WorkspaceNamePreset>,
+
+    /// Override the orchestrator runner in `-y` mode. Defaults to `--runner`
+    /// (or the single detected runner) and must also be installed on PATH.
+    #[arg(long, value_enum, value_name = "RUNNER")]
+    pub(crate) orchestrator_runner: Option<Runner>,
 
     /// Where the project config should live: `in-repo` writes a
     /// committed `<repo>/.shelbi/project.yaml` shared with the team;
     /// `global` keeps everything under `~/.shelbi/projects/`. In
     /// interactive contexts this may be omitted — the wizard asks and
-    /// prefills a recommendation. In non-interactive contexts this
-    /// flag is REQUIRED: shelbi refuses to silently pick a mode for
-    /// scripted callers.
+    /// prefills a recommendation. In the legacy flow, non-interactive callers
+    /// must choose it explicitly. It cannot be combined with `-y`, whose
+    /// detected plan uses the onboarding card's global layout.
     #[arg(long, value_enum)]
     pub mode: Option<InitMode>,
 
@@ -89,7 +126,33 @@ pub struct Args {
     pub pick_up: bool,
 }
 
-pub fn run(args: Args) -> Result<()> {
+impl Args {
+    fn has_detected_plan_overrides(&self) -> bool {
+        self.runner.is_some()
+            || self.default_branch.is_some()
+            || self.github_url.is_some()
+            || self.workspace_count.is_some()
+            || self.workspace_preset.is_some()
+            || self.orchestrator_runner.is_some()
+    }
+}
+
+fn parse_workspace_preset(value: &str) -> std::result::Result<WorkspaceNamePreset, String> {
+    value
+        .parse::<WorkspaceNamePreset>()
+        .map_err(|error| error.to_string())
+}
+
+pub fn run(args: Args, assume_yes: bool) -> Result<()> {
+    if assume_yes {
+        return run_detected_plan(args);
+    }
+    if args.has_detected_plan_overrides() {
+        bail!(
+            "detected-plan overrides require `shelbi init -y`; without `-y`, use the existing interactive init flow"
+        );
+    }
+
     if args.pick_up {
         let outcome = run_pick_up(args)?;
         println!();
@@ -126,6 +189,59 @@ pub fn run(args: Args) -> Result<()> {
     println!("  2. add the project to ~/.shelbi/sessions/default.yaml's projects: list");
     println!("  3. spawn your first agent: shelbi spawn TASK --on hub --runner claude \"…\"");
     Ok(())
+}
+
+/// Resolve, validate, and commit the detected onboarding plan without ever
+/// consulting stdin or terminal state. Legacy config-mode and pick-up setup
+/// stay on the existing path because neither is represented by the detected
+/// card model.
+fn run_detected_plan(args: Args) -> Result<()> {
+    if args.pick_up || args.mode.is_some() {
+        bail!(
+            "`shelbi init -y` cannot be combined with `--pick-up` or `--mode`; run those legacy flows without `-y`"
+        );
+    }
+
+    let root = noninteractive_project_root(args.root.as_deref())?;
+    if let Some(project) =
+        shelbi_state::resolve_project_for_cwd(&root).map_err(|error| anyhow!(error))?
+    {
+        println!("✓ Project {project} is already configured.");
+        return Ok(());
+    }
+
+    let mut plan = wizard::detect_setup_plan(&root, args.runner)?;
+    plan.apply_overrides(SetupPlanOverrides {
+        project_name: args.project,
+        default_branch: args.default_branch,
+        remote_url: args.github_url,
+        orchestrator_runner: args.orchestrator_runner,
+        workspace_count: args.workspace_count,
+        workspace_preset: args.workspace_preset,
+    })?;
+    match wizard::accept_setup_plan(plan)? {
+        wizard::SetupOutcome::Created(_) => Ok(()),
+        wizard::SetupOutcome::Quit => {
+            bail!("non-interactive setup quit before creating the project")
+        }
+    }
+}
+
+fn noninteractive_project_root(requested: Option<&Path>) -> Result<PathBuf> {
+    let cwd = std::env::current_dir().context("reading current directory")?;
+    let root = match requested {
+        Some(path) if path.is_absolute() => path.to_path_buf(),
+        Some(path) => cwd.join(path),
+        None => cwd,
+    };
+    if !root.exists() {
+        bail!("project root {} does not exist", root.display());
+    }
+    if !root.is_dir() {
+        bail!("project root {} is not a directory", root.display());
+    }
+    std::fs::canonicalize(&root)
+        .with_context(|| format!("resolving project root {}", root.display()))
 }
 
 /// `shelbi init` entry point factored so the no-subcommand first-run
@@ -400,64 +516,107 @@ fn render_project_yaml(
     Ok(shelbi_core::scaffold::decorate_project_yaml(&active))
 }
 
-/// Write the project YAML, the workspace-settings template, materialize
-/// the default agents, and write the project-wide statuses catalogue.
-/// Deliberately does **not** drop a `.shelbi/project` marker: the project
-/// tree stays clean and resolution reads the registered YAMLs instead.
-///
-/// Every step is individually idempotent (each guards its own target
-/// with `exists()` / preserves user edits), and there is deliberately
-/// **no** whole-function early return: a run that crashed part-way
-/// through — YAML written but agents not yet materialized — must be able
-/// to complete its remaining steps on re-invocation rather than report a
-/// bogus "already exists" success on a half-initialized project. The
-/// per-step guards also keep a race against a concurrent `shelbi init`
-/// from blowing away another invocation's freshly-written files.
-///
-/// When `mode == InRepo`, also writes a minimal committed
-/// `<repo>/.shelbi/project.yaml` carrying just the canonical name.
-/// That's the file `shelbi init --pick-up` reads on a teammate's clone.
+/// Publish a new local registry entry while atomically arming its first-launch
+/// greeting with respect to dashboard bootstrap.
+fn write_new_project_registration(project: &str, yaml_path: &Path, yaml: &str) -> Result<bool> {
+    use std::io::Write;
+
+    // Build the complete registration under a sibling temp name first. A
+    // process crash at any point before the final hard link therefore leaves
+    // no discoverable partial or fully written-but-unarmed project.
+    let (temp_path, mut temp_file) = crate::wizard::create_sibling_temp(yaml_path)?;
+    if let Err(error) = temp_file.write_all(yaml.as_bytes()) {
+        drop(temp_file);
+        let _ = std::fs::remove_file(&temp_path);
+        return Err(error).with_context(|| format!("writing {}", temp_path.display()));
+    }
+    drop(temp_file);
+
+    // Registration publication and the first-launch latch share the same
+    // lock as dashboard bootstrap. Arm first, then atomically publish the
+    // already-complete inode without replacing any existing registration.
+    // If the process dies between those two steps, retry sees no registration
+    // and completes the pending publication safely.
+    let _dashboard_lock = shelbi_state::lock_dashboard(project).map_err(|e| anyhow!(e))?;
+    let split_registration = yaml_path
+        .parent()
+        .expect("project registration has a parent")
+        .join(project)
+        .join("local.yaml");
+    if yaml_path.exists() || split_registration.exists() {
+        let _ = std::fs::remove_file(&temp_path);
+        return Ok(false);
+    }
+    shelbi_state::arm_contextual_greeting(project).map_err(|e| anyhow!(e))?;
+    let publish = std::fs::hard_link(&temp_path, yaml_path);
+    let _ = std::fs::remove_file(&temp_path);
+    match publish {
+        Ok(()) => Ok(true),
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            // A non-cooperating publisher raced the under-lock existence
+            // check. It owns the registration, so clear our latch instead of
+            // allowing a delayed greeting on one of its later launches.
+            shelbi_state::claim_contextual_greeting(project).map_err(|e| anyhow!(e))?;
+            Ok(false)
+        }
+        Err(error) => Err(error)
+            .with_context(|| format!("publishing {} as {}", temp_path.display(), yaml_path.display())),
+    }
+}
+
+/// Write the project YAML, workspace-settings template, default agents, and
+/// project-wide statuses catalogue. Every step is individually idempotent so
+/// a run interrupted after registration can finish materializing on retry.
+/// In-repo mode also writes the committed `<repo>/.shelbi/project.yaml` that
+/// `shelbi init --pick-up` consumes on another clone.
 fn scaffold_project(resolved: &ResolvedProjectRoot, mode: InitMode) -> Result<()> {
     let projects_dir = shelbi_state::projects_dir().map_err(|e| anyhow!(e))?;
+    let _scaffold_lock = shelbi_state::lock_project_scaffold().map_err(|e| anyhow!(e))?;
     let yaml_path = projects_dir.join(format!("{}.yaml", resolved.name));
+    let registration_exists =
+        shelbi_state::has_project_registration(&resolved.name).map_err(|e| anyhow!(e))?;
+    let is_first_registration =
+        !shelbi_state::has_any_project_registration().map_err(|e| anyhow!(e))?;
 
-    // `create_new` (O_EXCL) instead of an `exists()`-then-`write` guard: the
-    // check-then-write pattern claimed a race-safety it didn't have (a
-    // concurrent `init` could land between the two and get clobbered). O_EXCL
-    // makes "create only if absent" a single atomic syscall; an existing file
-    // surfaces as `AlreadyExists`, which we treat as the idempotent no-op
-    // (Shelbi ContextStore
-    // docs/planning:reviews/adversarial-2026-07/cli-session-ux.md F9).
-    match std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&yaml_path)
-    {
-        Ok(mut f) => {
-            use std::io::Write;
-            // Global mode leaves `repo` empty — the local registry entry is
-            // anchored on `work_dir`, and the GitHub URL (if any) is filled
-            // in later by the setup wizard. In-repo mode records `repo` (the
-            // project root) and `config_mode: in-repo` so the loader routes
-            // config paths — agents/, workflows/, statuses.yaml, the
-            // workspace-settings template — to `<repo>/.shelbi/…`, where the
-            // steps below materialize them.
-            let (repo_field, config_mode): (String, Option<&str>) = match mode {
-                InitMode::InRepo => (
-                    resolved.path.to_string_lossy().into_owned(),
-                    Some("in-repo"),
-                ),
-                InitMode::Global => (String::new(), None),
-            };
-            let yaml =
-                render_project_yaml(&resolved.name, &repo_field, &resolved.path, config_mode)?;
-            f.write_all(yaml.as_bytes())?;
-            println!("✓ wrote project: {}", yaml_path.display());
+    // Seed runtime onboarding before publishing the registration. If this
+    // process stops between these steps, the project is still undiscoverable
+    // and a retry idempotently reuses the same fixed Welcome task. Conversely,
+    // a registration that already existed at function entry is user-owned and
+    // must never gain or resurrect onboarding state.
+    if !registration_exists {
+        let _ = shelbi_state::scaffold_welcome_task(&resolved.name).map_err(|e| anyhow!(e))?;
+        if is_first_registration {
+            shelbi_state::arm_first_run_hint().map_err(|e| anyhow!(e))?;
         }
-        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+    }
+
+    if registration_exists {
+        let existing_path = if yaml_path.is_file() {
+            yaml_path.clone()
+        } else {
+            projects_dir.join(&resolved.name).join("local.yaml")
+        };
+        println!(
+            "(project registration already exists at {})",
+            existing_path.display()
+        );
+    } else {
+        // Global mode leaves `repo` empty; in-repo mode records the project
+        // root and routes shared config into `<repo>/.shelbi`.
+        let (repo_field, config_mode): (String, Option<&str>) = match mode {
+            InitMode::InRepo => (
+                resolved.path.to_string_lossy().into_owned(),
+                Some("in-repo"),
+            ),
+            InitMode::Global => (String::new(), None),
+        };
+        let yaml =
+            render_project_yaml(&resolved.name, &repo_field, &resolved.path, config_mode)?;
+        if write_new_project_registration(&resolved.name, &yaml_path, &yaml)? {
+            println!("✓ wrote project: {}", yaml_path.display());
+        } else {
             println!("(project YAML already exists at {})", yaml_path.display());
         }
-        Err(e) => return Err(e.into()),
     }
 
     if mode == InitMode::InRepo {
@@ -609,6 +768,11 @@ fn run_pick_up(args: Args) -> Result<PickUpOutcome> {
         )
     })?;
 
+    // Share the same registration transaction lock as fresh scaffolding.
+    // Without it, a fresh init could seed Welcome state for an alias just
+    // before this existing-project path claimed the registration.
+    let _scaffold_lock = shelbi_state::lock_project_scaffold().map_err(|e| anyhow!(e))?;
+
     // Honor `--project` as an explicit override (the user picking their
     // own local alias up front); otherwise walk the collision ladder
     // starting from the canonical name.
@@ -654,7 +818,12 @@ fn run_pick_up(args: Args) -> Result<PickUpOutcome> {
         &repo_root,
         Some("in-repo"),
     )?;
-    std::fs::write(&yaml_path, yaml)?;
+    if !write_new_project_registration(&local_alias, &yaml_path, &yaml)? {
+        bail!(
+            "a shelbi project named `{local_alias}` was registered concurrently; retry \
+             `shelbi init --pick-up` to choose the next available local alias"
+        );
+    }
     println!("✓ registered project: {}", yaml_path.display());
 
     write_workspace_settings_template(&local_alias)?;
@@ -1064,6 +1233,89 @@ mod tests {
             zenmode_after_migration
         );
 
+        assert!(
+            !shelbi_state::task_path("halfapp", shelbi_state::WELCOME_TASK_ID)
+                .unwrap()
+                .exists(),
+            "a pre-existing registration must remain Welcome-free on re-run"
+        );
+        assert!(
+            shelbi_state::read_global_state().unwrap().first_run_seen,
+            "re-running init for an existing project must not arm onboarding"
+        );
+        assert!(
+            !shelbi_state::claim_contextual_greeting("halfapp").unwrap(),
+            "repairing an existing registration must not arm a first-launch greeting"
+        );
+
+        std::env::remove_var("SHELBI_HOME");
+    }
+
+    #[test]
+    fn new_registration_is_complete_and_armed_before_it_becomes_discoverable() {
+        let _g = ENV_LOCK.lock().unwrap();
+        let home = fresh_dir("publish-home");
+        std::env::set_var("SHELBI_HOME", &home);
+        shelbi_state::ensure_root_subdirs().unwrap();
+
+        let yaml_path = home.join("projects/race.yaml");
+        let dashboard_lock = shelbi_state::lock_dashboard("race").unwrap();
+        let path_for_thread = yaml_path.clone();
+        let writer = std::thread::spawn(move || {
+            write_new_project_registration(
+                "race",
+                &path_for_thread,
+                "name: race\nrepo: ''\nmachines: []\n",
+            )
+            .unwrap()
+        });
+
+        let mut temp_visible = false;
+        for _ in 0..100 {
+            temp_visible = std::fs::read_dir(home.join("projects"))
+                .unwrap()
+                .filter_map(|entry| entry.ok())
+                .any(|entry| entry.file_name().to_string_lossy().starts_with(".race.yaml.tmp-"));
+            if temp_visible {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(temp_visible, "writer never reached its complete temp file");
+        assert!(!yaml_path.exists(), "registration leaked before the latch lock");
+        assert!(
+            !shelbi_state::read_state("race")
+                .unwrap()
+                .contextual_greeting_pending,
+            "the writer should still be blocked before arming"
+        );
+
+        drop(dashboard_lock);
+        assert!(writer.join().unwrap());
+        assert_eq!(
+            std::fs::read_to_string(&yaml_path).unwrap(),
+            "name: race\nrepo: ''\nmachines: []\n"
+        );
+        assert!(shelbi_state::claim_contextual_greeting("race").unwrap());
+
+        std::env::remove_var("SHELBI_HOME");
+    }
+
+    #[test]
+    fn split_registration_is_not_shadowed_or_rearmed() {
+        let _g = ENV_LOCK.lock().unwrap();
+        let home = fresh_dir("split-home");
+        std::env::set_var("SHELBI_HOME", &home);
+        shelbi_state::ensure_root_subdirs().unwrap();
+
+        let split = home.join("projects/existing/local.yaml");
+        std::fs::create_dir_all(split.parent().unwrap()).unwrap();
+        std::fs::write(&split, "name: existing\nrepo: /tmp/existing\n").unwrap();
+        let flat = home.join("projects/existing.yaml");
+        assert!(!write_new_project_registration("existing", &flat, "name: existing\n").unwrap());
+        assert!(!flat.exists());
+        assert!(!shelbi_state::claim_contextual_greeting("existing").unwrap());
+
         std::env::remove_var("SHELBI_HOME");
     }
 
@@ -1089,6 +1341,18 @@ mod tests {
         );
         let body = std::fs::read_to_string(&yaml).unwrap();
         assert!(body.contains(&format!("work_dir: {}", project_root.display())));
+        let tasks = shelbi_state::list_tasks("myapp").unwrap();
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(tasks[0].task.title, shelbi_state::WELCOME_TASK_TITLE);
+        assert_eq!(tasks[0].task.column, shelbi_core::Column::backlog());
+        assert!(!shelbi_state::read_global_state().unwrap().first_run_seen);
+        assert!(shelbi_state::claim_contextual_greeting("myapp").unwrap());
+
+        scaffold_project(&resolved, InitMode::Global).unwrap();
+        assert!(
+            !shelbi_state::claim_contextual_greeting("myapp").unwrap(),
+            "an idempotent init must not re-arm a consumed greeting"
+        );
 
         // Global mode: no in-repo file, no `.shelbi/project` marker,
         // no `.shelbi` directory in the repo tree.
@@ -1139,6 +1403,11 @@ mod tests {
         assert!(committed.is_file());
         let body = std::fs::read_to_string(&committed).unwrap();
         assert_eq!(body.trim(), "name: team-app");
+        let tasks = shelbi_state::list_tasks("team-app").unwrap();
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(tasks[0].task.title, shelbi_state::WELCOME_TASK_TITLE);
+        assert_eq!(tasks[0].task.column, shelbi_core::Column::backlog());
+        assert!(!shelbi_state::read_global_state().unwrap().first_run_seen);
 
         // Acceptance: agents/, statuses.yaml, and the workspace-settings
         // template all land under the repo's `.shelbi/`, NOT the global
@@ -1221,6 +1490,40 @@ mod tests {
         let (alias, from) = next_available_alias("shelbi").unwrap();
         assert_eq!(alias, "shelbi-3");
         assert_eq!(from.as_deref(), Some("shelbi"));
+
+        std::env::remove_var("SHELBI_HOME");
+    }
+
+    #[test]
+    fn pick_up_arms_the_new_local_alias_only() {
+        let _g = ENV_LOCK.lock().unwrap();
+        let home = fresh_dir("pickup-home");
+        let repo_root = fresh_dir("pickup-repo");
+        std::env::set_var("SHELBI_HOME", &home);
+        shelbi_state::ensure_root_subdirs().unwrap();
+
+        std::fs::create_dir_all(repo_root.join(".shelbi")).unwrap();
+        std::fs::write(repo_root.join(IN_REPO_CONFIG_REL), "name: shared\n").unwrap();
+        std::fs::write(home.join("projects/shared.yaml"), "name: shared\n").unwrap();
+
+        let outcome = run_pick_up(Args {
+            project: None,
+            root: Some(repo_root),
+            runner: None,
+            default_branch: None,
+            github_url: None,
+            workspace_count: None,
+            workspace_preset: None,
+            orchestrator_runner: None,
+            mode: None,
+            pick_up: true,
+        })
+        .unwrap();
+
+        assert_eq!(outcome.local_alias, "shared-2");
+        assert!(shelbi_state::claim_contextual_greeting("shared-2").unwrap());
+        assert!(!shelbi_state::claim_contextual_greeting("shared-2").unwrap());
+        assert!(!shelbi_state::claim_contextual_greeting("shared").unwrap());
 
         std::env::remove_var("SHELBI_HOME");
     }
