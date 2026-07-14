@@ -1,9 +1,10 @@
 use std::collections::BTreeMap;
-use std::fs;
+use std::fs::{self, File};
 use std::io::Read;
+use std::os::fd::{AsRawFd, FromRawFd};
 use std::os::unix::fs::{symlink, PermissionsExt};
 use std::path::{Path, PathBuf};
-use std::process::{Command, ExitStatus, Stdio};
+use std::process::{Child, Command, ExitStatus, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -84,7 +85,55 @@ fn git_init(repo: &Path) {
 /// deadline instead of receiving EOF and looking like a clean noninteractive
 /// failure.
 fn run_init(cwd: &Path, home: &Path, path: &Path, args: &[&str]) -> CompletedProcess {
-    let mut child = Command::new(env!("CARGO_BIN_EXE_shelbi"))
+    let mut command = init_command(cwd, home, path, args);
+    let mut child = command
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let open_stdin = child.stdin.take().expect("piped stdin");
+    wait_for_init(child, open_stdin)
+}
+
+/// Attach stdin to a real PTY and leave its master open without
+/// sending input. This catches prompts hidden behind `stdin.is_terminal()`.
+fn run_init_with_tty(cwd: &Path, home: &Path, path: &Path, args: &[&str]) -> CompletedProcess {
+    let mut master_fd = -1;
+    let mut slave_fd = -1;
+    let result = unsafe {
+        libc::openpty(
+            &mut master_fd,
+            &mut slave_fd,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+        )
+    };
+    assert_eq!(
+        result,
+        0,
+        "openpty failed: {}",
+        std::io::Error::last_os_error()
+    );
+
+    let master = unsafe { File::from_raw_fd(master_fd) };
+    let slave = unsafe { File::from_raw_fd(slave_fd) };
+    assert_eq!(unsafe { libc::isatty(slave.as_raw_fd()) }, 1);
+
+    let mut command = init_command(cwd, home, path, args);
+    let child = command
+        .stdin(Stdio::from(slave))
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    wait_for_init(child, master)
+}
+
+fn init_command(cwd: &Path, home: &Path, path: &Path, args: &[&str]) -> Command {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_shelbi"));
+    command
         .args(args)
         .current_dir(cwd)
         .env("SHELBI_HOME", home)
@@ -92,12 +141,11 @@ fn run_init(cwd: &Path, home: &Path, path: &Path, args: &[&str]) -> CompletedPro
         .env("PATH", path)
         .env_remove("SHELBI_ROOT")
         .env_remove("SHELBI_PROJECT")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .unwrap();
-    let open_stdin = child.stdin.take().expect("piped stdin");
+        .stdin(Stdio::null());
+    command
+}
+
+fn wait_for_init<T>(mut child: Child, input_guard: T) -> CompletedProcess {
     let deadline = Instant::now() + PROCESS_DEADLINE;
 
     let status = loop {
@@ -106,7 +154,7 @@ fn run_init(cwd: &Path, home: &Path, path: &Path, args: &[&str]) -> CompletedPro
         }
         if Instant::now() >= deadline {
             child.kill().unwrap();
-            drop(open_stdin);
+            drop(input_guard);
             let _ = child.wait();
             let mut stdout = String::new();
             let mut stderr = String::new();
@@ -129,7 +177,7 @@ fn run_init(cwd: &Path, home: &Path, path: &Path, args: &[&str]) -> CompletedPro
         thread::sleep(Duration::from_millis(20));
     };
 
-    drop(open_stdin);
+    drop(input_guard);
     let mut stdout = String::new();
     let mut stderr = String::new();
     child
@@ -225,25 +273,57 @@ fn yes_mode_with_one_runner_initializes_git_while_stdin_is_open() {
 }
 
 #[test]
-fn root_before_init_selects_state_while_project_defaults_to_cwd() {
+fn yes_mode_with_one_runner_never_reads_from_a_tty() {
     let temp = TempDir::new().unwrap();
-    let repo = temp.path().join("project");
-    let home = temp.path().join("state");
+    let repo = temp.path().join("tty-demo");
+    let home = temp.path().join("home");
     git_init(&repo);
     let bin = fake_path(&temp.path().join("path"), FakePath::one_runner());
-    let home_arg = home.to_str().unwrap();
 
-    let result = run_init(&repo, &home, &bin, &["--root", home_arg, "init", "-y"]);
+    let result = run_init_with_tty(&repo, &home, &bin, &["init", "-y"]);
     assert!(
         result.status.success(),
         "stdout:\n{}\nstderr:\n{}",
         result.stdout,
         result.stderr
     );
-    let project = load_project(&home, "project");
+    assert!(result.stdout.contains("Project tty-demo created"));
+    assert_eq!(
+        load_project(&home, "tty-demo").orchestrator.runner,
+        "claude"
+    );
+}
+
+#[test]
+fn root_before_init_selects_state_while_project_defaults_to_cwd() {
+    let temp = TempDir::new().unwrap();
+    let repo = temp.path().join("project");
+    let env_home = temp.path().join("state-from-env");
+    let flag_home = temp.path().join("state-from-flag");
+    git_init(&repo);
+    let bin = fake_path(&temp.path().join("path"), FakePath::one_runner());
+    let flag_home_arg = flag_home.to_str().unwrap();
+
+    let result = run_init(
+        &repo,
+        &env_home,
+        &bin,
+        &["--root", flag_home_arg, "init", "-y"],
+    );
+    assert!(
+        result.status.success(),
+        "stdout:\n{}\nstderr:\n{}",
+        result.stdout,
+        result.stderr
+    );
+    let project = load_project(&flag_home, "project");
     assert_eq!(
         project.repo,
         fs::canonicalize(&repo).unwrap().display().to_string()
+    );
+    assert!(
+        !env_home.exists(),
+        "the global --root flag must beat SHELBI_HOME"
     );
 }
 
@@ -371,6 +451,29 @@ fn invalid_state_root_fails_before_deferred_git_initialization() {
         result.stderr
     );
     assert_eq!(fs::read_to_string(&state_root).unwrap(), "keep me\n");
+    assert!(!repo.join(".git").exists());
+}
+
+#[test]
+fn blocked_scaffold_directory_fails_before_git_or_state_writes() {
+    let temp = TempDir::new().unwrap();
+    let repo = temp.path().join("blocked");
+    let home = temp.path().join("home");
+    fs::create_dir_all(&repo).unwrap();
+    let project_dir = home.join("projects/blocked");
+    fs::create_dir_all(&project_dir).unwrap();
+    fs::write(project_dir.join("agents"), "keep me\n").unwrap();
+    let before = snapshot_files(&home);
+    let bin = fake_path(&temp.path().join("path"), FakePath::one_runner());
+
+    let result = run_init(&repo, &home, &bin, &["init", "-y"]);
+    assert!(!result.status.success());
+    assert!(
+        result.stderr.contains("agents") && result.stderr.contains("not a directory"),
+        "stderr: {}",
+        result.stderr
+    );
+    assert_eq!(snapshot_files(&home), before);
     assert!(!repo.join(".git").exists());
 }
 

@@ -408,6 +408,10 @@ fn preflight_persistence(plan: &DetectedSetupPlan) -> Result<()> {
     let sessions = shelbi_state::sessions_dir().map_err(|error| anyhow!(error))?;
     let project_dir =
         shelbi_state::project_dir(&plan.project_name).map_err(|error| anyhow!(error))?;
+    let agents = shelbi_state::agents_dir(&plan.project_name).map_err(|error| anyhow!(error))?;
+    let workflows =
+        shelbi_state::workflows_dir(&plan.project_name).map_err(|error| anyhow!(error))?;
+    let tasks = shelbi_state::tasks_dir(&plan.project_name).map_err(|error| anyhow!(error))?;
     let ssh = shelbi_state::ssh_control_dir().map_err(|error| anyhow!(error))?;
 
     for directory in [
@@ -415,6 +419,9 @@ fn preflight_persistence(plan: &DetectedSetupPlan) -> Result<()> {
         projects.as_path(),
         sessions.as_path(),
         project_dir.as_path(),
+        agents.as_path(),
+        workflows.as_path(),
+        tasks.as_path(),
     ] {
         ensure_directory_or_missing(directory)?;
         probe_nearest_writable_directory(directory)?;
@@ -1887,6 +1894,7 @@ mod tests {
         confirm_calls: usize,
         select_calls: usize,
         action_calls: usize,
+        action_input: Option<DetectedSetupPlan>,
         customize_input: Option<DetectedSetupPlan>,
     }
 
@@ -1902,6 +1910,7 @@ mod tests {
                 confirm_calls: 0,
                 select_calls: 0,
                 action_calls: 0,
+                action_input: None,
                 customize_input: None,
             }
         }
@@ -1925,8 +1934,9 @@ mod tests {
             Ok(self.selected_runner)
         }
 
-        fn plan_action(&mut self, _plan: &DetectedSetupPlan) -> Result<PlanAction> {
+        fn plan_action(&mut self, plan: &DetectedSetupPlan) -> Result<PlanAction> {
             self.action_calls += 1;
+            self.action_input = Some(plan.clone());
             Ok(self.action)
         }
 
@@ -2729,10 +2739,13 @@ mod tests {
         let mut interactive_probe = FakeProbe::ready(&root, vec![fixture_runner(Runner::Codex)]);
         let mut interactive_ui = MockUi::new(PlanAction::Launch);
         assert_eq!(
-            create_project_from_plan(plan.clone(), &mut interactive_probe, &mut interactive_ui)
-                .unwrap(),
+            setup_one_project_with(&root, &mut interactive_probe, &mut interactive_ui).unwrap(),
             SetupOutcome::Created("shaft".to_string())
         );
+        assert_eq!(interactive_ui.confirm_calls, 0);
+        assert_eq!(interactive_ui.select_calls, 0);
+        assert_eq!(interactive_ui.action_calls, 1);
+        assert_eq!(interactive_ui.action_input.as_ref(), Some(&plan));
 
         env.set("SHELBI_HOME", &scripted_home);
         assert_eq!(
@@ -2740,9 +2753,33 @@ mod tests {
             SetupOutcome::Created("shaft".to_string())
         );
 
+        let mut interactive_files = snapshot_files(&interactive_home);
+        let mut scripted_files = snapshot_files(&scripted_home);
+        let welcome_path = PathBuf::from("projects")
+            .join("shaft")
+            .join("tasks")
+            .join(format!("{}.md", shelbi_state::WELCOME_TASK_ID));
+        let parse_welcome = |files: &mut BTreeMap<PathBuf, Vec<u8>>| {
+            let contents = files
+                .remove(&welcome_path)
+                .expect("Welcome task must be present in the scaffold snapshot");
+            let text = std::str::from_utf8(&contents).expect("Welcome task must be UTF-8");
+            shelbi_state::parse_task_file(text).expect("Welcome task must parse")
+        };
+        let mut interactive_welcome = parse_welcome(&mut interactive_files);
+        let scripted_welcome = parse_welcome(&mut scripted_files);
+
+        assert_eq!(interactive_files, scripted_files);
+        assert_eq!(interactive_welcome.body, scripted_welcome.body);
+
+        // Welcome timestamps are generated when each scaffold is committed.
+        // Normalize only those volatile fields before comparing all remaining
+        // frontmatter semantically.
+        interactive_welcome.task.created_at = scripted_welcome.task.created_at;
+        interactive_welcome.task.updated_at = scripted_welcome.task.updated_at;
         assert_eq!(
-            snapshot_files(&interactive_home),
-            snapshot_files(&scripted_home)
+            serde_yaml::to_value(&interactive_welcome.task).unwrap(),
+            serde_yaml::to_value(&scripted_welcome.task).unwrap()
         );
     }
 
