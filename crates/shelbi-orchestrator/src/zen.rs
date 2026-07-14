@@ -25,7 +25,7 @@ use globset::{Glob, GlobSetBuilder};
 use serde::Serialize;
 use shelbi_core::{
     checks_for_task_in_workflow, danger_paths_for_workflow, Column, Error, Host, Machine, Project,
-    MergeStrategy, Result, StatusCategory, Task, Workflow, WorkflowStatus, WorkspaceSpec,
+    Result, StatusCategory, Task, Workflow, WorkflowStatus, WorkspaceSpec,
 };
 
 use crate::branch;
@@ -1665,6 +1665,212 @@ fn parse_pending_merge_snapshot(
     })
 }
 
+fn enqueue_pinned_merge_queue(
+    host: &Host,
+    wt: &str,
+    repository: &RepositoryIdentity,
+    pr: u64,
+    snapshot: &PendingMergeSnapshot,
+    expected: &PinnedPrIdentity,
+) -> Result<()> {
+    let query = format!("query={ENQUEUE_PINNED_MERGE_MUTATION}");
+    let id_field = format!("id={}", snapshot.pull_request_id);
+    let head_field = format!("head={}", expected.head_sha);
+    let out = run_in_dir(
+        host,
+        wt,
+        &[
+            "gh",
+            "api",
+            "graphql",
+            "--hostname",
+            repository.host.as_str(),
+            "-f",
+            query.as_str(),
+            "-F",
+            id_field.as_str(),
+            "-F",
+            head_field.as_str(),
+        ],
+    )?;
+    if !out.status.success() {
+        return Err(Error::Command {
+            cmd: format!(
+                "gh api graphql --hostname {} <Shelbi enqueue pinned merge for PR #{pr}>",
+                repository.host
+            ),
+            status: out.status.to_string(),
+            stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
+        });
+    }
+    let value: serde_json::Value = serde_json::from_slice(&out.stdout).map_err(|error| {
+        Error::Other(format!(
+            "GitHub returned invalid pinned-enqueue JSON for PR #{pr}: {error}"
+        ))
+    })?;
+    reject_graphql_errors(&value, pr, "pinned merge enqueue")?;
+    let queued_head = value
+        .pointer("/data/enqueuePullRequest/mergeQueueEntry/headCommit/oid")
+        .and_then(serde_json::Value::as_str)
+        .filter(|oid| !oid.is_empty())
+        .ok_or_else(|| {
+            Error::Other(format!(
+                "GitHub did not return the durable queue head for PR #{pr}; refusing an \
+                 unprovable asynchronous merge"
+            ))
+        })?;
+    if queued_head != expected.head_sha {
+        return Err(Error::Other(format!(
+            "GitHub enqueued PR #{pr} at head {queued_head}, expected reviewed head {}; \
+             refusing the divergent queue entry",
+            expected.head_sha
+        )));
+    }
+    Ok(())
+}
+
+fn merge_pinned_pull_request(
+    host: &Host,
+    wt: &str,
+    repository: &RepositoryIdentity,
+    pr: u64,
+    snapshot: &PendingMergeSnapshot,
+    expected: &PinnedPrIdentity,
+    strategy: &str,
+) -> Result<Option<String>> {
+    let method = match strategy {
+        "squash" => "SQUASH",
+        "merge" => "MERGE",
+        "rebase" => "REBASE",
+        other => {
+            return Err(Error::Other(format!(
+                "unsupported GitHub merge strategy `{other}` for PR #{pr}"
+            )));
+        }
+    };
+    let query = format!("query={MERGE_PINNED_PULL_REQUEST_MUTATION}");
+    let id_field = format!("id={}", snapshot.pull_request_id);
+    let head_field = format!("head={}", expected.head_sha);
+    let method_field = format!("method={method}");
+    let out = run_in_dir(
+        host,
+        wt,
+        &[
+            "gh",
+            "api",
+            "graphql",
+            "--hostname",
+            repository.host.as_str(),
+            "-f",
+            query.as_str(),
+            "-F",
+            id_field.as_str(),
+            "-F",
+            head_field.as_str(),
+            "-F",
+            method_field.as_str(),
+        ],
+    )?;
+    if !out.status.success() {
+        return Err(Error::Command {
+            cmd: format!(
+                "gh api graphql --hostname {} <Shelbi merge pinned PR #{pr} at {}>",
+                repository.host, expected.head_sha
+            ),
+            status: out.status.to_string(),
+            stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
+        });
+    }
+    let value: serde_json::Value = serde_json::from_slice(&out.stdout).map_err(|error| {
+        Error::Other(format!(
+            "GitHub returned invalid pinned-merge JSON for PR #{pr}: {error}"
+        ))
+    })?;
+    reject_graphql_errors(&value, pr, "pinned pull-request merge")?;
+    let merged = value
+        .pointer("/data/mergePullRequest/pullRequest")
+        .filter(|value| !value.is_null())
+        .ok_or_else(|| {
+            Error::Other(format!(
+                "GitHub omitted the merged PR identity for PR #{pr}; refusing to advance task state"
+            ))
+        })?;
+    let field = |name: &str| -> Result<&str> {
+        merged
+            .get(name)
+            .and_then(serde_json::Value::as_str)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| {
+                Error::Other(format!(
+                    "GitHub pinned-merge response omitted `{name}` for PR #{pr}"
+                ))
+            })
+    };
+    let head_repository_id = merged
+        .pointer("/headRepository/id")
+        .and_then(serde_json::Value::as_str)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| {
+            Error::Other(format!(
+                "GitHub pinned-merge response omitted head repository id for PR #{pr}"
+            ))
+        })?;
+    if field("id")? != snapshot.pull_request_id
+        || field("state")? != "MERGED"
+        || field("headRefOid")? != expected.head_sha
+        || field("baseRefName")? != expected.base_branch
+        || field("baseRefOid")? != expected.base_sha
+        || head_repository_id != expected.repository_id
+    {
+        return Err(Error::Other(format!(
+            "GitHub pinned-merge response for PR #{pr} did not preserve the verified \
+             repository/base/head identity; refusing to advance task state"
+        )));
+    }
+    Ok(merged
+        .pointer("/mergeCommit/oid")
+        .and_then(serde_json::Value::as_str)
+        .filter(|oid| !oid.is_empty())
+        .map(str::to_string))
+}
+
+fn delete_remote_head_branch(
+    host: &Host,
+    wt: &str,
+    push_target: &str,
+    repository: &str,
+    pr: u64,
+    expected_head: &str,
+) {
+    let pr_str = pr.to_string();
+    let view = run_in_dir(
+        host,
+        wt,
+        &[
+            "gh",
+            "pr",
+            "view",
+            &pr_str,
+            "--repo",
+            repository,
+            "--json",
+            "headRefName",
+            "--jq",
+            ".headRefName // empty",
+        ],
+    );
+    let head_ref = match view {
+        Ok(out) if out.status.success() => String::from_utf8_lossy(&out.stdout).trim().to_string(),
+        _ => return,
+    };
+    if head_ref.is_empty() {
+        return;
+    }
+    let lease = format!("--force-with-lease=refs/heads/{head_ref}:{expected_head}");
+    let delete = format!(":refs/heads/{head_ref}");
+    let _ = run_in_dir(host, wt, &["git", "push", &lease, push_target, &delete]);
+}
+
 fn cancel_pending_merge_mutation(
     host: &Host,
     wt: &str,
@@ -1832,9 +2038,10 @@ mod tests {
         base: &str,
         auto_merge_enabled: bool,
         queue_present: bool,
-        _queue_head: Option<&str>,
+        queue_head: Option<&str>,
     ) -> PendingMergeSnapshot {
         PendingMergeSnapshot {
+            repository_id: "R_origin".into(),
             pull_request_id: "PR_node".into(),
             state: "OPEN".into(),
             head_oid: head.into(),
@@ -1844,6 +2051,8 @@ mod tests {
             merge_oid: None,
             auto_merge_enabled,
             merge_queue_present: queue_present,
+            merge_queue_head_oid: queue_head.map(str::to_string),
+            merge_queue_available: false,
         }
     }
 
@@ -1874,7 +2083,7 @@ mod tests {
     }
 
     #[test]
-    fn unchanged_head_retarget_cannot_authorize_an_unleased_merge_mutation() {
+    fn preflight_rejects_a_retarget_observed_before_merge_mutation() {
         let reviewed = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
         let expected = pinned_identity(reviewed, "main");
         let before = pending_snapshot(reviewed, "main", false, false, None);
@@ -1883,15 +2092,11 @@ mod tests {
             None
         );
 
-        // Model the adversarial interval GitHub cannot lease: the head stays
-        // A while the PR is retargeted after preflight. Revalidation rejects
-        // it, and the production path never issues a merge/enqueue mutation
-        // even for the matching OPEN snapshot.
+        // A retarget visible to the surrounding snapshots is rejected. GitHub
+        // cannot lease this field atomically with expectedHeadOid, so movement
+        // after the last precheck remains a separately documented residual.
         let after_retarget = pending_snapshot(reviewed, "release", false, false, None);
         assert!(preflight_pending_merge_resolution(379, &after_retarget, &expected).is_err());
-        let error = unleased_base_merge_error(379, &expected).to_string();
-        assert!(error.contains("cannot atomically lease the base ref"), "{error}");
-        assert!(error.contains("human review"), "{error}");
     }
 
     #[test]
@@ -2425,6 +2630,16 @@ mod pr_create_tests {
         )
     }
 
+    fn pinned_pr_identity(worktree: &Path, head_sha: &str) -> PinnedPrIdentity {
+        PinnedPrIdentity {
+            repository: "github.com/example/repo".into(),
+            repository_id: ORIGIN_REPOSITORY_ID.into(),
+            base_branch: "main".into(),
+            base_sha: git_stdout(worktree, &["rev-parse", "main"]),
+            head_sha: head_sha.into(),
+        }
+    }
+
     fn remote_head(origin: &Path) -> String {
         git_stdout(
             origin.parent().unwrap(),
@@ -2558,9 +2773,11 @@ esac
     /// OPEN to MERGED.
     fn install_pr_merge_stub(
         stub_home: &Path,
-        reviewed_head: &str,
+        expected: &PinnedPrIdentity,
         merge_queue_available: bool,
     ) -> (PathBuf, PathBuf) {
+        let reviewed_head = expected.head_sha.as_str();
+        let reviewed_base = expected.base_sha.as_str();
         let bin = stub_home.join("bin");
         std::fs::create_dir_all(&bin).unwrap();
         let log_file = stub_home.join("gh.log");
@@ -2581,6 +2798,7 @@ esac
                         "state": state,
                         "headRefOid": reviewed_head,
                         "baseRefName": "main",
+                        "baseRefOid": reviewed_base,
                         "headRepository": { "id": ORIGIN_REPOSITORY_ID },
                         "mergeCommit": merge_oid.map(|oid| serde_json::json!({ "oid": oid })),
                         "autoMergeRequest": null,
@@ -2622,6 +2840,7 @@ esac
                         "state": "MERGED",
                         "headRefOid": reviewed_head,
                         "baseRefName": "main",
+                        "baseRefOid": reviewed_base,
                         "headRepository": { "id": ORIGIN_REPOSITORY_ID },
                         "mergeCommit": { "oid": "merge-commit" },
                     }}},
@@ -2642,8 +2861,8 @@ case "$1 $2" in
   "pr view")
     printf '%s\n' "$*" >> {log}
     case "$*" in
-      *headRefOid,headRefName,baseRefName,headRepository*)
-        printf '%s\n' {reviewed_head} {task_branch} main {origin_repository_id} {origin_repository_name}
+      *headRefOid,headRefName,baseRefName,baseRefOid,headRepository*)
+        printf '%s\n' {reviewed_head} {task_branch} main {reviewed_base} {origin_repository_id} {origin_repository_name}
         ;;
       *headRefName*)
         printf '%s\n' {task_branch}
@@ -2721,6 +2940,7 @@ esac
             enqueue_response = q(&enqueue_response.to_string_lossy()),
             merge_response = q(&merge_response.to_string_lossy()),
             reviewed_head = q(reviewed_head),
+            reviewed_base = q(reviewed_base),
             task_branch = q(TASK_BRANCH),
             origin_repository_id = q(ORIGIN_REPOSITORY_ID),
             origin_repository_name = q(ORIGIN_REPOSITORY_NAME),
@@ -3631,13 +3851,14 @@ esac
         let _lock = crate::test_lock::acquire();
         let (base, _origin, worktree) = setup_repo(true);
         let reviewed_head = task_branch_head(&worktree);
+        let expected = pinned_pr_identity(&worktree, &reviewed_head);
         let stub = tempfile::tempdir().unwrap();
-        let (log, merged_marker) = install_pr_merge_stub(stub.path(), &reviewed_head, true);
+        let (log, merged_marker) = install_pr_merge_stub(stub.path(), &expected, true);
         let project = ci_project(base.path(), &worktree);
 
         let first = {
             let _env = EnvGuard::install(stub.path());
-            pr_merge(&project, 379, &reviewed_head)
+            pr_merge(&project, 379, &expected)
         };
 
         assert_eq!(first.unwrap(), PrMergeOutcome::Queued);
@@ -3655,7 +3876,7 @@ esac
         std::fs::write(&merged_marker, "merged\n").unwrap();
         let retry = {
             let _env = EnvGuard::install(stub.path());
-            pr_merge(&project, 379, &reviewed_head)
+            pr_merge(&project, 379, &expected)
         };
 
         assert_eq!(
@@ -3680,14 +3901,15 @@ esac
         let _lock = crate::test_lock::acquire();
         let (base, _origin, worktree) = setup_repo(true);
         let reviewed_head = task_branch_head(&worktree);
+        let expected = pinned_pr_identity(&worktree, &reviewed_head);
         let stub = tempfile::tempdir().unwrap();
-        let (log, _merged_marker) = install_pr_merge_stub(stub.path(), &reviewed_head, false);
+        let (log, _merged_marker) = install_pr_merge_stub(stub.path(), &expected, false);
         let mut project = ci_project(base.path(), &worktree);
         project.git.merge_strategy = MergeStrategy::Rebase;
 
         let result = {
             let _env = EnvGuard::install(stub.path());
-            pr_merge(&project, 379, &reviewed_head)
+            pr_merge(&project, 379, &expected)
         };
 
         assert_eq!(
