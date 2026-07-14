@@ -362,7 +362,7 @@ fn pr_create_impl(
     verify_task_branch_head(
         &host,
         &worktree,
-        &branch,
+        branch,
         &operation_head,
         "while it was being pushed",
     )?;
@@ -375,12 +375,12 @@ fn pr_create_impl(
     // a fresh PR. A server-side push hook may also have opened a PR, so this
     // lookup covers both normal reuse and that race window.
     if let Some(num) =
-        lookup_open_pr_in_repository(&host, &wt, &branch, &origin_repository.selector)?
+        lookup_open_pr_in_repository(&host, &wt, branch, &origin_repository.selector)?
     {
         verify_pr_identity(
             &host,
             &worktree,
-            &branch,
+            branch,
             &expected.base_branch,
             &expected.base_sha,
             &origin_repository,
@@ -398,7 +398,7 @@ fn pr_create_impl(
     verify_task_branch_head(
         &host,
         &worktree,
-        &branch,
+        branch,
         &operation_head,
         "before a new PR was created",
     )?;
@@ -413,7 +413,7 @@ fn pr_create_impl(
             "--repo",
             &origin_repository.selector,
             "--head",
-            &branch,
+            branch,
             "--base",
             &expected.base_branch,
             "--title",
@@ -442,7 +442,7 @@ fn pr_create_impl(
     verify_pr_identity(
         &host,
         &worktree,
-        &branch,
+        branch,
         &expected.base_branch,
         &expected.base_sha,
         &origin_repository,
@@ -454,6 +454,7 @@ fn pr_create_impl(
 
 /// Prove that `pr` still names the exact reviewed task branch commit before
 /// its number is allowed to reach CI watching or merging.
+#[allow(clippy::too_many_arguments)]
 fn verify_pr_identity(
     host: &Host,
     worktree: &std::path::Path,
