@@ -1,75 +1,97 @@
 ---
 title: shelbi init
 order: 10
-summary: Scaffold ~/.shelbi/ and a starter project, choosing between global and in-repo config — or pick up a teammate's committed in-repo config on a fresh clone.
+summary: Create a project from Shelbi's detected setup plan, interactively or without prompts for automation.
 ---
 
 ```text
 shelbi init [OPTIONS]
 ```
 
-`shelbi init` bootstraps Shelbi on a machine. It scaffolds `~/.shelbi/` and
-writes a starter project config for the repo you point it at, the one-time
-setup you run before anything else. It's the flag-driven sibling of
-[`shelbi wizard`](/docs/cli/wizard): the wizard walks you through the same setup
-interactively, while `init` is what you reach for in scripts and CI where the
-answers are supplied up front.
+`shelbi init` has two setup paths:
 
-The central choice is **where the project config lives**. In *global* mode the
-config is per-user at `~/.shelbi/projects/<name>.yaml` and never committed,
-right for solo or scratch work. In *in-repo* mode it's a committed
-`<repo>/.shelbi/project.yaml` that everyone gets on clone, right for teams. In
-an interactive run the command asks and prefills a recommendation; in a
-non-interactive run (no TTY) `--mode` is **required**, because Shelbi refuses to
-silently pick a mode for a scripted caller. See
-[Config modes](/docs/concepts/config-modes) for the full on-disk layout,
-migration path, and a worked pick-up example.
+- Run it normally for the existing config-location and pick-up workflows.
+- Add `-y` to detect the same plan as first-run `shelbi`, accept it without a
+  prompt, and write the standard global project layout.
 
-## Picking up a cloned in-repo config
+The `-y` path performs the full prerequisite and project validation before it
+writes anything. It uses the current directory by default, detects the Git
+root, branch, origin, runner, tmux, workspace count, and naming preset, then
+creates the same project and Welcome card as Enter on the interactive setup
+card.
 
-When you clone a teammate's repo that already carries a committed
-`<repo>/.shelbi/project.yaml`, run `shelbi init --pick-up` to register it into
-your local registry. Pick-up skips mode selection (the mode is already
-`in-repo` by virtue of the committed file existing) and prompts only for the
-user-local fields. If the project's canonical name collides with one already in
-your local registry, the local alias is auto-suffixed (`-2`, `-3`, …). The
-committed YAML is never touched.
+## Automation
 
-## Options
+From a repository with exactly one supported runner on `PATH`, this is the
+copy-pasteable zero-prompt setup:
+
+```bash
+shelbi init -y
+```
+
+If both Claude Code and Codex are installed, runner selection is ambiguous.
+Disambiguate it explicitly:
+
+```bash
+shelbi init -y --runner codex
+```
+
+For a different checkout or CI workspace:
+
+```bash
+shelbi init -y --root /workspace/myapp --runner claude
+```
+
+`--runner` selects the runner for generated workspaces and is also the default
+orchestrator runner. Use `--orchestrator-runner` only when those should differ.
+The selected runners must be installed on `PATH`.
+
+<Callout type="warning" title="Do not omit --runner when both are installed">
+
+`shelbi init -y` will stop rather than guess between Claude Code and Codex.
+Pass `--runner claude` or `--runner codex` to make automation deterministic.
+
+</Callout>
+
+## Detected-plan options
 
 | Flag | Type | Default | Description |
 | --- | --- | --- | --- |
-| `--project <PROJECT>` | string | basename of the project root | Override the project name. |
-| `--root <ROOT>` | string | current directory | Project root directory — the repo Shelbi will manage. Skips the interactive "Project root?" prompt; required when stdin is not a TTY (CI, piped input). |
-| `--mode <MODE>` | `in-repo` \| `global` | asked interactively | Where the project config lives. `in-repo` writes a committed `<repo>/.shelbi/project.yaml` shared with the team; `global` keeps everything under `~/.shelbi/projects/`. **Required** in non-interactive contexts. |
-| `--pick-up` | flag | off | Register an existing committed `<repo>/.shelbi/project.yaml` into the local registry — the flow for cloning a teammate's Shelbi project. Skips mode selection and prompts only for user-local fields. |
+| `-y, --yes` | flag | off | Accept the detected plan without prompts. This is a global flag and may appear before or after `init`. |
+| `--project <PROJECT>` | string | project-root basename | Override the generated project name. |
+| `--root <ROOT>` | path | current directory with `-y` | Repository Shelbi will manage. |
+| `--runner <RUNNER>` | `claude` \| `codex` | the only detected runner | Runner for generated workspaces. Required when both supported runners are installed. |
+| `--default-branch <BRANCH>` | string | detected branch, then `main` | Override the detected default branch. `--branch` is an alias. |
+| `--github-url <URL>` | string | detected origin | Override the detected origin URL. `--remote` is an alias; pass an empty value to omit it. |
+| `--workspace-count <COUNT>` | integer, at least 1 | machine recommendation | Number of development workspaces. A separate review workspace is always added. `--workspaces` is an alias. |
+| `--workspace-preset <PRESET>` | `phonetic` \| `greek` \| `toy-story` | detected default | Naming preset for generated workspaces. |
+| `--orchestrator-runner <RUNNER>` | `claude` \| `codex` | selected `--runner` | Use a different installed runner for the orchestrator. |
 
-## Examples
+Detected-plan overrides require `-y`. The `-y` path cannot be combined with
+`--mode` or `--pick-up`.
 
-Interactive first-time setup in the repo you want to manage:
+## Config-location and pick-up options
 
-```bash
-shelbi init
-```
+Without `-y`, `shelbi init` retains the explicit config-mode workflow:
 
-Scripted global-mode setup with no prompts (CI, dotfiles bootstrap):
+| Flag | Type | Default | Description |
+| --- | --- | --- | --- |
+| `--mode <MODE>` | `in-repo` \| `global` | asked interactively | Choose committed in-repo config or per-user global config. Required for this legacy path when stdin is not a TTY. |
+| `--pick-up` | flag | off | Register an existing committed `<repo>/.shelbi/project.yaml` after cloning a teammate's project. |
 
-```bash
-shelbi init --root ~/code/myapp --mode global
-```
-
-Register a teammate's committed in-repo config after cloning:
+Register an existing in-repo project like this:
 
 ```bash
 git clone git@github.com:acme/myapp.git && cd myapp
 shelbi init --pick-up
 ```
 
+See [Config modes](/docs/concepts/config-modes) for the shared/local file split
+and migration path.
+
 ## See also
 
-- [Config modes](/docs/concepts/config-modes) — global vs in-repo, the on-disk
-  layout, migration, and the pick-up walkthrough in full.
-- [`shelbi wizard`](/docs/cli/wizard) — the interactive onboarding walkthrough
-  that runs this same setup.
-- [`shelbi project`](/docs/cli/project) — add more projects or migrate an
-  existing global project into in-repo mode later.
+- [Set up your first project](/docs/guides/getting-started/first-project) for
+  the visible preflight and one-confirmation experience.
+- [`shelbi wizard`](/docs/cli/wizard) for the explicit interactive entry point.
+- [`shelbi project`](/docs/cli/project) for adding or migrating projects.

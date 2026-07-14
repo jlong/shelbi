@@ -1,7 +1,7 @@
 ---
 title: Getting Started
 order: 10
-summary: The on-ramp for a brand-new Shelbi user — install the binary, set up a project, run a task, then scale to a pool of workspaces and hand the loop to the orchestrator. Ends with the workflows fundamentals every other guide builds on.
+summary: Install Shelbi, confirm its detected setup plan once, run a task, then scale to a pool of workspaces and hand the loop to the orchestrator.
 ---
 
 Shelbi is an agent orchestrator for the terminal: a board of tasks, a
@@ -25,8 +25,9 @@ before you start.
 ## The arc
 
 You'll start by **installing** the binary and **setting up a project**.
-The wizard writes the YAML that tells Shelbi which repo, which workspaces,
-and which agent to use. Then you'll **run your first task** end to end,
+Shelbi checks the repo, runner, tmux, and machine, then shows one detected
+plan. Press Enter once to write it and open the dashboard, or press `c` to
+customize the detected values. Then you'll **run your first task** end to end,
 watch a single card cross the board, and review the branch it produces.
 
 From there the guide opens up: a **multi-workspace dispatch loop** fills

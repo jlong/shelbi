@@ -7,7 +7,7 @@ export function InstallCloser() {
     <section className="border-t border-gray-4">
       <div className="mx-auto w-full max-w-6xl px-4 py-6 lg:px-6 lg:py-8">
         <div className="flex flex-col items-start gap-4">
-          <h2 className="font-sans text-4xl font-semibold tracking-tight text-fg">
+          <h2 className="text-balance font-sans text-4xl font-semibold tracking-tight text-fg">
             Get started
           </h2>
           <div className="w-full max-w-3xl">
