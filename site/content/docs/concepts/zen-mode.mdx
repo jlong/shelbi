@@ -1,14 +1,13 @@
 ---
 title: Zen Mode
 order: 16
-summary: The orchestrator triages backlog and lands work through an exact-provenance, base-leased high-confidence bar.
+summary: The orchestrator triages backlog and lands work through an exact-provenance high-confidence bar.
 ---
 
 By default the orchestrator is the scheduler and you are the
 priority-setter + reviewer. Zen Mode flips it: the orchestrator takes
 the lead. It triages mechanically-eligible backlog into todo on its
-own and lands finished work past a pre-defined confidence bar. The landing
-path leases the exact probed base on the Git server.
+own and lands finished work past a pre-defined confidence bar.
 
 The mental model is **lead vs. scheduler**. Zen on, the agent makes
 calls; you redirect when you disagree. Zen off (the default), the
@@ -116,7 +115,7 @@ what happened.
 
 ```text
 merge-transition -> probe -> local checks -> merge conflict -> diff size
-                 -> danger paths -> exact-provenance PR flow -> base-leased landing
+                 -> danger paths -> exact-provenance PR flow -> landing
 ```
 
 <Callout type="note" title="Back-compat fallback">
@@ -162,8 +161,8 @@ The conditions, in order:
    and grades only that atomic snapshot, so persistent movement and a brief
    A-to-B-to-A change both bail instead of authorizing a merge. A snapshot
    that would require pagination also fails closed.
-7. **Base-leased landing** via
-   `shelbi zen pr-merge <pr> --match-repository <repository> --match-repository-id <repository_id> --match-base-branch <base_branch> --match-base-commit <base_sha> --match-head-commit <head_sha>`, passing the same probe identity again. Shelbi integrates the reviewed head on the exact probed base locally, then updates that base in the exact probed repository with a server-side compare-and-swap lease on `base_sha`. GitHub's merge mutation exposes only `expectedHeadOid`, not an expected-base lease, so it is not the integration authority. The leased Git push rejects a concurrent base move before changing the ref. Shelbi then reconciles the PR and requires the exact result; branch protection, a lost lease, or ambiguous reconciliation fails loudly and leaves the task in handoff.
+7. **Landing** via
+   `shelbi zen pr-merge <pr> --match-repository <repository> --match-repository-id <repository_id> --match-base-branch <base_branch> --match-base-commit <base_sha> --match-head-commit <head_sha>`, passing the same probe identity again. Shelbi validates repository, base, and head before the GitHub merge or queue mutation and verifies the result afterward. GitHub's `expectedHeadOid` atomically leases the head only; it exposes no expected-base or expected-repository input. A concurrent same-head retarget between validation and mutation can therefore change the landing target, and a post-response check is too late to undo it. This residual requires separate human design and is not atomic base pinning. Ordinary merge and queue behavior remains unchanged.
 
 The probe's `repository`, `repository_id`, `base_branch`, `base_sha`, and
 `head_sha` form the contract for the whole sequence. They are not recomputed

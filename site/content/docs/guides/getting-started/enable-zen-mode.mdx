@@ -1,15 +1,14 @@
 ---
 title: Enable Zen Mode
 order: 16
-summary: Add local checks, flip the toggle, and let the orchestrator auto-promote work and land exact-provenance PRs under a server-side base lease.
+summary: Add local checks, flip the toggle, and let the orchestrator auto-promote work and run the exact-provenance merge flow.
 ---
 
 By default the orchestrator is the scheduler and you own both ends: you
 decide what gets promoted out of backlog, and you accept what comes back
 from review. **Zen Mode changes that.** The orchestrator promotes backlog items
 it judges safe to run and lands exact-provenance PRs that clear a
-project-defined confidence bar. The target base is protected by a server-side
-compare-and-swap lease.
+project-defined confidence bar.
 
 This page is the practical on-ramp: configure the bar, flip the
 switch, and watch one task land end to end. The
@@ -158,21 +157,21 @@ orchestrator runs the bar:
 ```text
 review-marker -> probe -> local checks -> merge conflict -> diff size
               -> danger paths -> exact-provenance pr-create -> ci-watch
-              -> base-leased pr-merge
+              -> pr-merge
 ```
 
 Each step is a single-purpose CLI primitive (see
 [`shelbi zen`](/docs/cli/zen)). The probe's repository, base, and head identity
-is passed unchanged through every command. `pr-merge` integrates that exact
-head on the probed base locally, then updates the remote base under a
-server-side compare-and-swap lease. The card moves to done only after the
-exact result is reconciled.
+is passed unchanged through every command. GitHub's `expectedHeadOid` leases
+the head only, not the base or repository. A concurrent same-head retarget
+during the merge mutation remains a documented limitation for separate human
+design, so this flow must not be described as atomically base-pinned.
 
 ```
 2026-06-22T14:31:08+00:00 task=tighten-rate-limit-error-copy review -> done reason=orchestrator:zen-merge sha=abc1234
 ```
 
-The card lands in **Done** after the leased update succeeds:
+The card lands in **Done** after GitHub reports the merge:
 
 <AppMockup
   terminalTitle="you@hub — myapp"
@@ -289,15 +288,15 @@ In the meantime, the deep reference for everything Zen touches:
   high-confidence bar, judgment categories, per-task overrides,
   configuration reference.
 - [`shelbi zen`](/docs/cli/zen) - every subcommand the orchestrator
-  sequences during base-leased auto-merge, callable by hand for one-off
+  sequences during exact-provenance auto-merge, callable by hand for one-off
   probes.
 - [The events log](/docs/concepts/events-log) — the canonical format
   of every `mode=zen` and `orchestrator:zen-*` line Zen emits.
 
 ## Next
 
-You've handed the agent autonomous triage and base-leased landing, and given it
-a confidence bar that matches this project. The last step is
+You've handed the agent autonomous triage and merge flow, and given it a
+confidence bar that matches this project. The last step is
 making the workflow itself yours: [author a custom Shelbi
 workflow](/docs/guides/getting-started/custom-workflow) to change routing
 rules, tune Zen's judgment, and adjust how the orchestrator reports

@@ -1,7 +1,7 @@
 ---
 title: shelbi zen
 order: 28
-summary: Toggle Zen Mode and run the exact-provenance, base-leased merge primitives the orchestrator sequences.
+summary: Toggle Zen Mode and run the exact-provenance merge primitives the orchestrator sequences.
 ---
 
 ```text
@@ -31,7 +31,7 @@ shelbi zen on
 ```
 
 Turn Zen Mode on. The orchestrator may auto-promote and auto-merge finished
-work through the exact-provenance, base-leased PR flow. Idempotent. Mirrors
+work through the exact-provenance PR flow. Idempotent. Mirrors
 `Alt+Z` in the TUI.
 
 ## off
@@ -196,18 +196,18 @@ shelbi zen pr-merge <PR_NUMBER> --match-repository <REPOSITORY> --match-reposito
 ```
 
 Land the PR with the configured strategy after `ci-watch` reports `green`.
-Shelbi validates the complete probe identity, integrates the exact reviewed
-head on the exact probed base commit in an isolated local checkout, and pushes
-the resulting commit to the probed repository and base with a server-side
-compare-and-swap lease on `base_sha`. A concurrent base move is rejected by
-the Git server before the ref changes.
+Shelbi validates the complete probe identity before the GitHub merge or queue
+mutation and verifies the result afterward. It supplies `expectedHeadOid`,
+which atomically leases the reviewed head only. GitHub exposes no atomic
+expected-base or expected-repository input.
 
-GitHub's `expectedHeadOid` leases only the head and cannot atomically pin a
-base ref. Shelbi therefore does not use the ordinary merge or enqueue mutation
-as its integration authority. After the leased push, it reconciles the PR and
-requires GitHub to report the exact result. A branch-protection rejection,
-lease failure, or result that cannot be reconciled fails loudly and leaves the
-task in handoff. A landed PR prints its merge SHA or `sha-pending`.
+This leaves a precise residual limitation: a concurrent retarget with an
+unchanged head between validation and mutation can land or enqueue into the
+new base, and a post-response rejection is too late to undo it. The limitation
+requires separate human design and this path must not be described as atomic
+base pinning. Ordinary merge and queue behavior otherwise remains unchanged.
+A landed PR prints its merge SHA or `sha-pending`; a queued PR prints `queued`
+and remains in handoff for a later exact-provenance retry.
 
 | Argument or flag | Type | Default | Description |
 | --- | --- | --- | --- |
