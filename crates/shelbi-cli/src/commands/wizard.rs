@@ -43,24 +43,7 @@ fn wizard_outcome_for_setup(outcome: &wizard::SetupOutcome) -> WizardOutcome {
 }
 
 fn has_any_project_registration() -> Result<bool> {
-    let projects = shelbi_state::projects_dir().map_err(|error| anyhow::anyhow!(error))?;
-    if !projects.exists() {
-        return Ok(false);
-    }
-    for entry in
-        std::fs::read_dir(&projects).with_context(|| format!("reading {}", projects.display()))?
-    {
-        let path = entry
-            .with_context(|| format!("reading an entry in {}", projects.display()))?
-            .path();
-        if (path.is_file()
-            && path.extension().and_then(|extension| extension.to_str()) == Some("yaml"))
-            || (path.is_dir() && path.join("local.yaml").is_file())
-        {
-            return Ok(true);
-        }
-    }
-    Ok(false)
+    shelbi_state::has_any_project_registration().map_err(|error| anyhow::anyhow!(error))
 }
 
 /// Run the shared one-project setup flow, translating prompt cancellation

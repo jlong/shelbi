@@ -419,7 +419,24 @@ fn render_project_yaml(
 /// That's the file `shelbi init --pick-up` reads on a teammate's clone.
 fn scaffold_project(resolved: &ResolvedProjectRoot, mode: InitMode) -> Result<()> {
     let projects_dir = shelbi_state::projects_dir().map_err(|e| anyhow!(e))?;
+    let _scaffold_lock = shelbi_state::lock_project_scaffold().map_err(|e| anyhow!(e))?;
     let yaml_path = projects_dir.join(format!("{}.yaml", resolved.name));
+    let registration_exists =
+        shelbi_state::has_project_registration(&resolved.name).map_err(|e| anyhow!(e))?;
+    let is_first_registration =
+        !shelbi_state::has_any_project_registration().map_err(|e| anyhow!(e))?;
+
+    // Seed runtime onboarding before publishing the registration. If this
+    // process stops between these steps, the project is still undiscoverable
+    // and a retry idempotently reuses the same fixed Welcome task. Conversely,
+    // a registration that already existed at function entry is user-owned and
+    // must never gain or resurrect onboarding state.
+    if !registration_exists {
+        let _ = shelbi_state::scaffold_welcome_task(&resolved.name).map_err(|e| anyhow!(e))?;
+        if is_first_registration {
+            shelbi_state::arm_first_run_hint().map_err(|e| anyhow!(e))?;
+        }
+    }
 
     // `create_new` (O_EXCL) instead of an `exists()`-then-`write` guard: the
     // check-then-write pattern claimed a race-safety it didn't have (a
@@ -428,36 +445,48 @@ fn scaffold_project(resolved: &ResolvedProjectRoot, mode: InitMode) -> Result<()
     // surfaces as `AlreadyExists`, which we treat as the idempotent no-op
     // (Shelbi ContextStore
     // docs/planning:reviews/adversarial-2026-07/cli-session-ux.md F9).
-    match std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&yaml_path)
-    {
-        Ok(mut f) => {
-            use std::io::Write;
-            // Global mode leaves `repo` empty — the local registry entry is
-            // anchored on `work_dir`, and the GitHub URL (if any) is filled
-            // in later by the setup wizard. In-repo mode records `repo` (the
-            // project root) and `config_mode: in-repo` so the loader routes
-            // config paths — agents/, workflows/, statuses.yaml, the
-            // workspace-settings template — to `<repo>/.shelbi/…`, where the
-            // steps below materialize them.
-            let (repo_field, config_mode): (String, Option<&str>) = match mode {
-                InitMode::InRepo => (
-                    resolved.path.to_string_lossy().into_owned(),
-                    Some("in-repo"),
-                ),
-                InitMode::Global => (String::new(), None),
-            };
-            let yaml =
-                render_project_yaml(&resolved.name, &repo_field, &resolved.path, config_mode)?;
-            f.write_all(yaml.as_bytes())?;
-            println!("✓ wrote project: {}", yaml_path.display());
+    if registration_exists {
+        let existing_path = if yaml_path.is_file() {
+            yaml_path.clone()
+        } else {
+            projects_dir.join(&resolved.name).join("local.yaml")
+        };
+        println!(
+            "(project registration already exists at {})",
+            existing_path.display()
+        );
+    } else {
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&yaml_path)
+        {
+            Ok(mut f) => {
+                use std::io::Write;
+                // Global mode leaves `repo` empty — the local registry entry is
+                // anchored on `work_dir`, and the GitHub URL (if any) is filled
+                // in later by the setup wizard. In-repo mode records `repo` (the
+                // project root) and `config_mode: in-repo` so the loader routes
+                // config paths — agents/, workflows/, statuses.yaml, the
+                // workspace-settings template — to `<repo>/.shelbi/…`, where the
+                // steps below materialize them.
+                let (repo_field, config_mode): (String, Option<&str>) = match mode {
+                    InitMode::InRepo => (
+                        resolved.path.to_string_lossy().into_owned(),
+                        Some("in-repo"),
+                    ),
+                    InitMode::Global => (String::new(), None),
+                };
+                let yaml =
+                    render_project_yaml(&resolved.name, &repo_field, &resolved.path, config_mode)?;
+                f.write_all(yaml.as_bytes())?;
+                println!("✓ wrote project: {}", yaml_path.display());
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                println!("(project YAML already exists at {})", yaml_path.display());
+            }
+            Err(e) => return Err(e.into()),
         }
-        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-            println!("(project YAML already exists at {})", yaml_path.display());
-        }
-        Err(e) => return Err(e.into()),
     }
 
     if mode == InitMode::InRepo {
@@ -608,6 +637,11 @@ fn run_pick_up(args: Args) -> Result<PickUpOutcome> {
             config_path.display()
         )
     })?;
+
+    // Share the same registration transaction lock as fresh scaffolding.
+    // Without it, a fresh init could seed Welcome state for an alias just
+    // before this existing-project path claimed the registration.
+    let _scaffold_lock = shelbi_state::lock_project_scaffold().map_err(|e| anyhow!(e))?;
 
     // Honor `--project` as an explicit override (the user picking their
     // own local alias up front); otherwise walk the collision ladder
@@ -1064,6 +1098,17 @@ mod tests {
             zenmode_after_migration
         );
 
+        assert!(
+            !shelbi_state::task_path("halfapp", shelbi_state::WELCOME_TASK_ID)
+                .unwrap()
+                .exists(),
+            "a pre-existing registration must remain Welcome-free on re-run"
+        );
+        assert!(
+            shelbi_state::read_global_state().unwrap().first_run_seen,
+            "re-running init for an existing project must not arm onboarding"
+        );
+
         std::env::remove_var("SHELBI_HOME");
     }
 
@@ -1089,6 +1134,11 @@ mod tests {
         );
         let body = std::fs::read_to_string(&yaml).unwrap();
         assert!(body.contains(&format!("work_dir: {}", project_root.display())));
+        let tasks = shelbi_state::list_tasks("myapp").unwrap();
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(tasks[0].task.title, shelbi_state::WELCOME_TASK_TITLE);
+        assert_eq!(tasks[0].task.column, shelbi_core::Column::backlog());
+        assert!(!shelbi_state::read_global_state().unwrap().first_run_seen);
 
         // Global mode: no in-repo file, no `.shelbi/project` marker,
         // no `.shelbi` directory in the repo tree.
@@ -1139,6 +1189,11 @@ mod tests {
         assert!(committed.is_file());
         let body = std::fs::read_to_string(&committed).unwrap();
         assert_eq!(body.trim(), "name: team-app");
+        let tasks = shelbi_state::list_tasks("team-app").unwrap();
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(tasks[0].task.title, shelbi_state::WELCOME_TASK_TITLE);
+        assert_eq!(tasks[0].task.column, shelbi_core::Column::backlog());
+        assert!(!shelbi_state::read_global_state().unwrap().first_run_seen);
 
         // Acceptance: agents/, statuses.yaml, and the workspace-settings
         // template all land under the repo's `.shelbi/`, NOT the global

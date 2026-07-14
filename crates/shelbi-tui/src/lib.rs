@@ -129,6 +129,11 @@ pub use kanban::KanbanApp;
 pub use poller::WorkspacePoller;
 pub use sidebar::decoration_to_color;
 
+/// Exact one-time orientation copy shown in the sidebar after the first
+/// project scaffold. Kept as one constant so persistence tests and the
+/// narrow-sidebar wrapping path cannot drift from the product wording.
+pub(crate) const FIRST_RUN_HINT: &str = "Ctrl+P palette · type E to edit settings";
+
 /// Set up the project's tmux session and attach to it. If we're already
 /// inside a tmux client, use `switch-client` instead of `attach` (tmux
 /// refuses to nest, modern tmux supports switching).
@@ -191,9 +196,6 @@ pub fn run_sidebar(project_name: &str) -> Result<()> {
     // `refresh` also probes daemon compatibility. Keeping that in the normal
     // refresh path lets the footer clear itself after `shelbi daemon restart`.
     app.refresh().ok();
-    if startup_warnings > 0 {
-        app.status_line = startup_warnings_status_line(startup_warnings);
-    }
 
     // First-run probe: on fresh installs (no ~/.shelbi/config.yaml),
     // verify Alt+Z is delivered and let the user pick a fallback if not.
@@ -207,6 +209,13 @@ pub fn run_sidebar(project_name: &str) -> Result<()> {
     // [`ZenToggleChord`] enum can't represent.
     app.zen_toggle_chord = keymaps.zen_toggle_chord(probe_chord);
     app.keymaps = keymaps;
+
+    // Claim onboarding only after the interactive Zen-key probe is finished.
+    // Otherwise a user who exits during that probe could persist "seen"
+    // without the sidebar ever rendering the hint.
+    if let Some(status_line) = sidebar_startup_status_line(startup_warnings) {
+        app.status_line = status_line;
+    }
 
     // Background poll loop: per-workspace `tmux display-message` every
     // `workspace_poll_interval_secs`, parses the `shelbi:<state>` marker,
@@ -325,6 +334,24 @@ fn startup_warnings_status_line(count: usize) -> String {
     format!("⚠ {count} startup warning{suffix} — see ~/.shelbi/logs/tui.log")
 }
 
+/// Claim and choose the sidebar's launch-time status line. The persisted
+/// first-run hint wins over keymap-warning copy so a genuinely fresh launch
+/// displays the required wording exactly; diagnostics are still written to
+/// the TUI log and surface on a later sidebar restart. A state error fails
+/// closed (no repeat-prone hint) while retaining the warning surface.
+fn sidebar_startup_status_line(startup_warnings: usize) -> Option<String> {
+    match shelbi_state::claim_first_run_hint() {
+        Ok(true) => return Some(FIRST_RUN_HINT.to_string()),
+        Ok(false) => {}
+        Err(error) => tracing::warn!(
+            %error,
+            "could not claim first-run hint; skipping non-durable onboarding copy"
+        ),
+    }
+
+    (startup_warnings > 0).then(|| startup_warnings_status_line(startup_warnings))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -370,6 +397,45 @@ mod tests {
         assert!(one.contains("~/.shelbi/logs/tui.log"), "{one}");
         let many = startup_warnings_status_line(3);
         assert!(many.contains("3 startup warnings "), "{many}");
+    }
+
+    #[test]
+    fn armed_first_run_hint_is_exact_and_claimed_once() {
+        let _g = test_support::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let home = std::env::temp_dir().join(format!(
+            "shelbi-tui-first-run-hint-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos(),
+        ));
+        std::fs::create_dir_all(&home).unwrap();
+        std::env::set_var("SHELBI_HOME", &home);
+
+        shelbi_state::arm_first_run_hint().unwrap();
+        assert_eq!(
+            sidebar_startup_status_line(2).as_deref(),
+            Some(FIRST_RUN_HINT),
+            "the onboarding copy must win over warning status on first launch"
+        );
+        assert!(shelbi_state::read_global_state().unwrap().first_run_seen);
+
+        let reload = sidebar_startup_status_line(0);
+        assert_eq!(reload, None, "a sidebar reload must not repeat the hint");
+
+        // Persisted legacy/global state with no field is deliberately not
+        // armed. Point at a second home to exercise serde's upgrade default,
+        // rather than relying only on the claim above.
+        let legacy_home = home.join("legacy");
+        std::fs::create_dir_all(&legacy_home).unwrap();
+        std::fs::write(legacy_home.join("state.json"), r#"{"zen_intro_seen":true}"#).unwrap();
+        std::env::set_var("SHELBI_HOME", &legacy_home);
+        assert_eq!(sidebar_startup_status_line(0), None);
+
+        std::env::remove_var("SHELBI_HOME");
     }
 
     /// Regression for the startup-warnings-interleave bug. The sidebar

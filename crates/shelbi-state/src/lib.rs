@@ -147,6 +147,35 @@ pub fn projects_dir() -> Result<PathBuf> {
     Ok(shelbi_home()?.join("projects"))
 }
 
+/// Whether `project` already has a discoverable local registration in either
+/// supported config shape.
+pub fn has_project_registration(project: &str) -> Result<bool> {
+    validate_project_name(project)?;
+    let dir = projects_dir()?;
+    Ok(dir.join(format!("{project}.yaml")).is_file()
+        || dir.join(project).join("local.yaml").is_file())
+}
+
+/// Whether this machine already has any locally registered project.
+/// Recognizes both the flat global `<name>.yaml` shape and the split
+/// in-repo `<name>/local.yaml` shape without loading or migrating either.
+/// Incomplete per-project directories do not count as registrations.
+pub fn has_any_project_registration() -> Result<bool> {
+    let dir = projects_dir()?;
+    if !dir.exists() {
+        return Ok(false);
+    }
+    for entry in fs::read_dir(&dir)? {
+        let path = entry?.path();
+        if (path.is_file() && path.extension().and_then(|ext| ext.to_str()) == Some("yaml"))
+            || (path.is_dir() && path.join("local.yaml").is_file())
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 pub fn sessions_dir() -> Result<PathBuf> {
     Ok(shelbi_home()?.join("sessions"))
 }
@@ -645,6 +674,24 @@ pub fn lock_dashboard(project: &str) -> Result<DashboardLock> {
     Ok(DashboardLock(acquire_file_lock(&path)?))
 }
 
+/// Public RAII handle for the global project-registration scaffold lock.
+/// Released when dropped.
+#[must_use = "the project scaffold lock is released as soon as the guard is dropped"]
+pub struct ProjectScaffoldLock(#[allow(dead_code)] FileLockGuard);
+
+/// Block until the exclusive project-registration scaffold lock is held.
+///
+/// Creating a project spans several files, while the flat or split project
+/// registration is its discoverable commit point. Every fresh-init and
+/// pick-up path holds this global guard from its collision check through that
+/// commit point. This prevents a losing scaffold from seeding onboarding into
+/// a registration concurrently claimed by another path, and also makes the
+/// machine-wide "first project" decision deterministic.
+pub fn lock_project_scaffold() -> Result<ProjectScaffoldLock> {
+    let path = projects_dir()?.join("scaffold.lock");
+    Ok(ProjectScaffoldLock(acquire_file_lock(&path)?))
+}
+
 /// Sibling lock-file path for `path` (`state.json` → `state.json.lock`).
 /// The suffix is appended to the full file name — never `with_extension`,
 /// which would collide `a.json` and `a.yaml` onto the same lock.
@@ -1062,14 +1109,14 @@ pub fn state_path(project: &str) -> Result<PathBuf> {
 /// recent tmux palette binding (so the orchestrator can unbind it
 /// cleanly on rebind / project switch), the one-shot acknowledgement
 /// of the Zen Mode intro popover (so the explanation doesn't re-fire in
-/// every project the user opens), and the sidebar's per-machine
-/// collapse state (a UI preference that follows the user across
-/// projects sharing a machine name).
+/// every project the user opens), the one-shot getting-started hint, and
+/// the sidebar's per-machine collapse state (a UI preference that follows
+/// the user across projects sharing a machine name).
 /// See [`State`]'s forward-compatibility contract — `GlobalState` carries
 /// the same `extra` catch-all for the same reason (an older binary must not
 /// drop `~/.shelbi/state.json` fields a newer one wrote), and likewise drops
 /// `Eq` for it.
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct GlobalState {
     /// The exact tmux key string passed to `tmux bind-key -n …` on the
     /// most recent install (e.g. `C-p`, `M-z`). `None` means no shelbi
@@ -1083,6 +1130,13 @@ pub struct GlobalState {
     /// fresh install gets the explanation on the first enable.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub zen_intro_seen: bool,
+    /// Gates the one-time getting-started hint in the dashboard sidebar.
+    /// Missing fields deserialize as `true` so upgrading an existing
+    /// installation cannot re-run onboarding. A genuinely fresh project
+    /// scaffold explicitly arms the hint by persisting `false`; the first
+    /// sidebar process atomically claims it and writes `true`.
+    #[serde(default = "default_first_run_seen")]
+    pub first_run_seen: bool,
     /// Sidebar UI preferences — currently just the per-machine collapse
     /// state for the Workspaces tree. Skipped when default so a fresh
     /// state.json doesn't carry the empty `"sidebar":{}` block.
@@ -1093,6 +1147,22 @@ pub struct GlobalState {
     /// [`State`].
     #[serde(flatten)]
     pub extra: BTreeMap<String, serde_json::Value>,
+}
+
+fn default_first_run_seen() -> bool {
+    true
+}
+
+impl Default for GlobalState {
+    fn default() -> Self {
+        Self {
+            tmux_palette_key: None,
+            zen_intro_seen: false,
+            first_run_seen: true,
+            sidebar: SidebarPrefs::default(),
+            extra: BTreeMap::new(),
+        }
+    }
 }
 
 /// User-level sidebar preferences persisted under
@@ -1116,9 +1186,9 @@ impl SidebarPrefs {
 /// Flip the collapse state for `machine` in `~/.shelbi/state.json` and
 /// return whether the machine is now collapsed. Reads the current
 /// [`GlobalState`], mutates the set, and writes it back — the rest of
-/// the file is preserved (no overwriting `tmux_palette_key` or
-/// `zen_intro_seen`). Used by the sidebar's Space/Enter handler when
-/// focus is on a `MachineGroup` row.
+/// the file is preserved (no overwriting `tmux_palette_key`,
+/// `zen_intro_seen`, or `first_run_seen`). Used by the sidebar's Space/Enter
+/// handler when focus is on a `MachineGroup` row.
 pub fn toggle_sidebar_machine_collapsed(machine: &str) -> Result<bool> {
     update_global_state(|state| {
         Ok(if state.sidebar.collapsed_machines.contains(machine) {
@@ -1209,6 +1279,53 @@ pub fn mark_zen_intro_seen() -> Result<()> {
     })
 }
 
+/// Arm the one-time dashboard hint for a genuinely fresh installation.
+///
+/// Initialization is deliberately one-way: only a missing global state file
+/// is written with `first_run_seen: false`. Any existing file represents an
+/// older installation, an already-armed scaffold, or a claimed first launch
+/// and is left untouched. This second guard prevents concurrent/later project
+/// scaffolds from turning onboarding back on even if a caller misclassifies
+/// itself as the first registration.
+pub fn arm_first_run_hint() -> Result<()> {
+    let path = global_state_path()?;
+    let _lock = acquire_file_lock(&sibling_lock_path(&path))?;
+    match read_to_string_at(&path) {
+        Ok(_) => {
+            // Validate rather than silently accepting a corrupt existing
+            // file. There is nothing to arm, but callers should still learn
+            // that their global state needs repair.
+            let _ = read_global_state()?;
+            Ok(())
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            let state = GlobalState {
+                first_run_seen: false,
+                ..GlobalState::default()
+            };
+            write_global_state_to(&path, &state)
+        }
+        Err(error) => Err(shelbi_core::Error::Io(error)),
+    }
+}
+
+/// Atomically claim the one-time dashboard hint.
+///
+/// Returns `true` to exactly one sidebar launch after
+/// [`arm_first_run_hint`] persisted `first_run_seen: false`, and writes the
+/// flag back to `true` before returning. Legacy state without the field
+/// defaults to already seen, so upgrades and ordinary project reopens do not
+/// acquire a new hint.
+pub fn claim_first_run_hint() -> Result<bool> {
+    update_global_state(|state| {
+        if state.first_run_seen {
+            return Ok(false);
+        }
+        state.first_run_seen = true;
+        Ok(true)
+    })
+}
+
 #[cfg(test)]
 mod global_state_tests {
     use super::*;
@@ -1235,6 +1352,10 @@ mod global_state_tests {
         let s = read_global_state().unwrap();
         assert_eq!(s, GlobalState::default());
         assert!(s.tmux_palette_key.is_none());
+        assert!(
+            s.first_run_seen,
+            "an unarmed/missing state file must not onboard an existing project"
+        );
         std::env::remove_var("SHELBI_HOME");
     }
 
@@ -1282,6 +1403,7 @@ mod global_state_tests {
         let raw = fs::read_to_string(&path).unwrap();
         let disk: serde_json::Value = serde_json::from_str(&raw).unwrap();
         assert_eq!(disk["zen_intro_seen"], serde_json::json!(true));
+        assert_eq!(disk["first_run_seen"], serde_json::json!(true));
         assert_eq!(disk["tmux_palette_key"], serde_json::json!("M-z"));
         assert_eq!(disk["telemetry_opt_in"], serde_json::json!(false));
         assert_eq!(disk["future"], serde_json::json!([1, 2]));
@@ -1347,6 +1469,72 @@ mod global_state_tests {
         std::env::remove_var("SHELBI_HOME");
     }
 
+    #[test]
+    fn first_run_hint_is_explicitly_armed_and_claimed_once() {
+        let _g = LOCK.lock().unwrap();
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+
+        // A legacy state file has no first_run_seen field. Treat it as
+        // already seen so installing a newer Shelbi cannot replay onboarding
+        // in an existing project.
+        fs::write(
+            global_state_path().unwrap(),
+            r#"{"tmux_palette_key":"C-p","legacy_setting":7}"#,
+        )
+        .unwrap();
+        assert!(read_global_state().unwrap().first_run_seen);
+        assert!(!claim_first_run_hint().unwrap());
+        arm_first_run_hint().unwrap();
+        assert!(
+            read_global_state().unwrap().first_run_seen,
+            "an existing legacy state file must never be re-armed"
+        );
+
+        // Only a genuinely fresh scaffold with no global state file arms the
+        // hint. The first sidebar claims it and persists true before
+        // rendering; reloads and later sessions receive false.
+        let fresh = home.join("fresh");
+        fs::create_dir_all(&fresh).unwrap();
+        std::env::set_var("SHELBI_HOME", &fresh);
+        arm_first_run_hint().unwrap();
+        assert!(!read_global_state().unwrap().first_run_seen);
+        arm_first_run_hint().unwrap();
+        assert!(
+            !read_global_state().unwrap().first_run_seen,
+            "a second arm before launch must stay pending, not claim the hint"
+        );
+
+        let mut armed = read_global_state().unwrap();
+        armed.tmux_palette_key = Some("C-p".to_string());
+        armed
+            .extra
+            .insert("legacy_setting".to_string(), serde_json::json!(7));
+        write_global_state(&armed).unwrap();
+        let armed_disk: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(global_state_path().unwrap()).unwrap())
+                .unwrap();
+        assert_eq!(armed_disk["first_run_seen"], serde_json::json!(false));
+
+        assert!(claim_first_run_hint().unwrap());
+        assert!(read_global_state().unwrap().first_run_seen);
+        assert!(!claim_first_run_hint().unwrap());
+
+        let claimed_disk: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(global_state_path().unwrap()).unwrap())
+                .unwrap();
+        assert_eq!(claimed_disk["first_run_seen"], serde_json::json!(true));
+        assert_eq!(claimed_disk["tmux_palette_key"], serde_json::json!("C-p"));
+        assert_eq!(claimed_disk["legacy_setting"], serde_json::json!(7));
+
+        // Once claimed, even an erroneous later arm call is monotonic: the
+        // persisted true survives and the hint cannot return.
+        arm_first_run_hint().unwrap();
+        assert!(read_global_state().unwrap().first_run_seen);
+
+        std::env::remove_var("SHELBI_HOME");
+    }
+
     /// `toggle_sidebar_machine_collapsed` flips set membership in
     /// `~/.shelbi/state.json::sidebar.collapsed_machines` and returns
     /// the new state. A round-trip read sees the same set, so the
@@ -1378,7 +1566,8 @@ mod global_state_tests {
     }
 
     /// Toggling sidebar collapse must not clobber unrelated fields in
-    /// `state.json`. A `tmux_palette_key` and `zen_intro_seen` set
+    /// `state.json`. A `tmux_palette_key`, `zen_intro_seen`, and
+    /// `first_run_seen` set
     /// first must survive a subsequent collapse toggle.
     #[test]
     fn sidebar_collapse_toggle_preserves_other_global_fields() {
@@ -1389,12 +1578,14 @@ mod global_state_tests {
         let mut s = read_global_state().unwrap();
         s.tmux_palette_key = Some("M-z".into());
         s.zen_intro_seen = true;
+        s.first_run_seen = true;
         write_global_state(&s).unwrap();
 
         toggle_sidebar_machine_collapsed("hub").unwrap();
         let after = read_global_state().unwrap();
         assert_eq!(after.tmux_palette_key.as_deref(), Some("M-z"));
         assert!(after.zen_intro_seen);
+        assert!(after.first_run_seen);
         assert!(after.sidebar.collapsed_machines.contains("hub"));
 
         std::env::remove_var("SHELBI_HOME");
@@ -1719,6 +1910,25 @@ pub fn append_log(project: &str, id: &str, line: &str) -> Result<()> {
 // ---------------------------------------------------------------------------
 // Task markdown files
 
+/// Stable identity and copy for the self-demonstrating card seeded into a
+/// newly-created project. Creation paths call [`scaffold_welcome_task`]
+/// explicitly; ordinary loads and repair/migration paths deliberately do not,
+/// so deleting the card is permanent and existing projects never acquire it.
+pub const WELCOME_TASK_ID: &str = "welcome-to-shelbi";
+pub const WELCOME_TASK_TITLE: &str = "Welcome to Shelbi";
+pub const WELCOME_TASK_BODY: &str = "\
+# Welcome to Shelbi
+
+Promote this card from Backlog to Todo when you're ready.
+Shelbi automatically dispatches it to an available workspace.
+Watch the workspace pick it up in the sidebar.
+
+Press Ctrl+P to open the command palette.
+Type E there to find project and agent settings.
+
+This card is only a guide and is safe to delete.
+";
+
 pub fn task_path(project: &str, id: &str) -> Result<PathBuf> {
     validate_task_id(id)?;
     Ok(tasks_dir(project)?.join(format!("{id}.md")))
@@ -1760,6 +1970,39 @@ fn save_task_unlocked(project: &str, task: &Task, body_md: &str) -> Result<()> {
         validate_branch(branch)?;
     }
     write_frontmatter_file(&path, task, body_md)
+}
+
+/// Seed the Welcome card for a project that is still being created.
+///
+/// The fixed id plus the per-project task lock make retries and concurrent
+/// scaffold attempts idempotent. An existing file is user-owned and is never
+/// rewritten, even if its body has since been edited. Callers are responsible
+/// for invoking this only from a fresh-project path, never from reload/open.
+pub fn scaffold_welcome_task(project: &str) -> Result<bool> {
+    let _lock = lock_tasks(project)?;
+    let path = task_path(project, WELCOME_TASK_ID)?;
+    if path.exists() {
+        return Ok(false);
+    }
+
+    let now = Utc::now();
+    let task = Task {
+        id: WELCOME_TASK_ID.to_string(),
+        title: WELCOME_TASK_TITLE.to_string(),
+        column: Column::backlog(),
+        priority: 0,
+        assigned_to: None,
+        workflow: None,
+        branch: None,
+        depends_on: Vec::new(),
+        prefers_machine: None,
+        zen: None,
+        created_at: now,
+        updated_at: now,
+        params: BTreeMap::new(),
+    };
+    save_task_unlocked(project, &task, WELCOME_TASK_BODY)?;
+    Ok(true)
 }
 
 /// Create-exclusive variant of [`save_task`]: fails when a task with the
@@ -2952,6 +3195,40 @@ mod tests {
     }
 
     #[test]
+    fn welcome_task_scaffold_is_exact_and_idempotent() {
+        let _g = TEST_LOCK.lock().unwrap();
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+
+        assert!(scaffold_welcome_task("proj").unwrap());
+        assert!(!scaffold_welcome_task("proj").unwrap());
+
+        let tasks = list_tasks("proj").unwrap();
+        assert_eq!(tasks.len(), 1, "retry must not duplicate the Welcome card");
+        let welcome = &tasks[0];
+        assert_eq!(welcome.task.id, WELCOME_TASK_ID);
+        assert_eq!(welcome.task.title, WELCOME_TASK_TITLE);
+        assert_eq!(welcome.task.column, Column::backlog());
+        assert_eq!(welcome.task.priority, 0);
+        assert_eq!(welcome.body, WELCOME_TASK_BODY);
+        assert_eq!(welcome.body.lines().count(), 10);
+        for concept in [
+            "Backlog to Todo",
+            "automatically dispatches",
+            "Ctrl+P",
+            "safe to delete",
+        ] {
+            assert!(
+                welcome.body.contains(concept),
+                "Welcome body must teach `{concept}`: {}",
+                welcome.body
+            );
+        }
+
+        std::env::remove_var("SHELBI_HOME");
+    }
+
+    #[test]
     fn save_task_rejects_dangerous_branch_override() {
         let _g = TEST_LOCK.lock().unwrap();
         let home = fresh_home();
@@ -3337,6 +3614,50 @@ mod tests {
             "two lock_dashboard holders were inside the critical section at once"
         );
         assert_eq!(acquisitions.load(Ordering::SeqCst), 40);
+        std::env::remove_var("SHELBI_HOME");
+    }
+
+    #[test]
+    fn lock_project_scaffold_serializes_registration_transactions() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        let _g = TEST_LOCK.lock().unwrap();
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+
+        let in_cs = Arc::new(AtomicBool::new(false));
+        let overlaps = Arc::new(AtomicUsize::new(0));
+        let acquisitions = Arc::new(AtomicUsize::new(0));
+        let handles: Vec<_> = (0..2)
+            .map(|_| {
+                let in_cs = Arc::clone(&in_cs);
+                let overlaps = Arc::clone(&overlaps);
+                let acquisitions = Arc::clone(&acquisitions);
+                std::thread::spawn(move || {
+                    for _ in 0..20 {
+                        let _guard = lock_project_scaffold().unwrap();
+                        acquisitions.fetch_add(1, Ordering::SeqCst);
+                        if in_cs.swap(true, Ordering::SeqCst) {
+                            overlaps.fetch_add(1, Ordering::SeqCst);
+                        }
+                        std::thread::yield_now();
+                        in_cs.store(false, Ordering::SeqCst);
+                    }
+                })
+            })
+            .collect();
+        for handle in handles {
+            handle.join().unwrap();
+        }
+
+        assert_eq!(
+            overlaps.load(Ordering::SeqCst),
+            0,
+            "two project scaffold transactions overlapped"
+        );
+        assert_eq!(acquisitions.load(Ordering::SeqCst), 40);
+        assert!(projects_dir().unwrap().join("scaffold.lock").is_file());
         std::env::remove_var("SHELBI_HOME");
     }
 
@@ -4377,6 +4698,10 @@ mod tests {
         // frontmatter is byte-for-byte intact.
         assert!(default_path.exists(), "default.yaml must not be deleted");
         assert_eq!(std::fs::read_to_string(&task_file).unwrap(), task_body);
+        assert!(
+            !task_path("myapp", WELCOME_TASK_ID).unwrap().exists(),
+            "an upgrade migration must not seed onboarding into an existing project"
+        );
         std::env::remove_var("SHELBI_HOME");
     }
 

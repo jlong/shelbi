@@ -319,6 +319,13 @@ fn persist_plan(plan: &DetectedSetupPlan) -> Result<()> {
     let registration_yaml =
         serde_yaml::to_string(&project).context("serializing detected project registration")?;
 
+    // Registration is the discoverable commit point for the multi-file
+    // scaffold. Serialize every creation path (including `init --pick-up`)
+    // from its collision check through publication so a losing attempt can
+    // never seed onboarding into somebody else's registration.
+    let _scaffold_lock =
+        shelbi_state::lock_project_scaffold().map_err(|error| anyhow!(error))?;
+
     let (flat_registration, split_registration) = registration_paths(&project.name)?;
     if let Some(existing) = [&flat_registration, &split_registration]
         .into_iter()
@@ -326,6 +333,8 @@ fn persist_plan(plan: &DetectedSetupPlan) -> Result<()> {
     {
         return Err(project_collision_error(&project.name, existing));
     }
+    let is_first_registration =
+        !shelbi_state::has_any_project_registration().map_err(|error| anyhow!(error))?;
 
     shelbi_state::ensure_root_subdirs().map_err(|error| anyhow!(error))?;
     let sessions_dir = shelbi_state::sessions_dir().map_err(|error| anyhow!(error))?;
@@ -349,6 +358,7 @@ fn persist_plan(plan: &DetectedSetupPlan) -> Result<()> {
         shelbi_state::scaffold_project_statuses(&project.name).map_err(|error| anyhow!(error))?;
     }
     let _ = shelbi_state::scaffold_zenmode(&project.name).map_err(|error| anyhow!(error))?;
+    let _ = shelbi_state::scaffold_welcome_task(&project.name).map_err(|error| anyhow!(error))?;
     // The registration is the commit point. Until it exists, a retry
     // re-enters onboarding and the scaffold helpers can finish any missing
     // files. Publish a complete temporary file with an atomic no-clobber link
@@ -356,6 +366,13 @@ fn persist_plan(plan: &DetectedSetupPlan) -> Result<()> {
     // or replaced registration at the discoverable path.
     if split_registration.exists() {
         return Err(project_collision_error(&project.name, &split_registration));
+    }
+    // Missing first_run_seen means "already seen" for upgrade safety. Arm
+    // the hint explicitly only while publishing this machine's first project,
+    // before the registration commit point so a persistence failure cannot
+    // leave a discoverable project that setup reported as failed.
+    if is_first_registration {
+        shelbi_state::arm_first_run_hint().map_err(|error| anyhow!(error))?;
     }
     write_new_project_registration(
         &flat_registration,
@@ -2363,6 +2380,23 @@ mod tests {
             .join("projects/shaft/workflows/statuses.yaml")
             .is_file());
         assert!(shelbi_state::zenmode_path("shaft").unwrap().is_file());
+        let tasks = shelbi_state::list_tasks("shaft").unwrap();
+        assert_eq!(tasks.len(), 1);
+        let welcome = &tasks[0];
+        assert_eq!(welcome.task.title, shelbi_state::WELCOME_TASK_TITLE);
+        assert_eq!(welcome.task.column, shelbi_core::Column::backlog());
+        for concept in [
+            "Backlog to Todo",
+            "automatically dispatches",
+            "Ctrl+P",
+            "safe to delete",
+        ] {
+            assert!(welcome.body.contains(concept), "missing `{concept}`");
+        }
+        assert!(
+            !shelbi_state::read_global_state().unwrap().first_run_seen,
+            "the machine's first project must arm the launch hint"
+        );
     }
 
     #[test]
@@ -2399,6 +2433,41 @@ mod tests {
         assert!(home
             .join("projects/shaft/agents/developer/instructions.md")
             .is_file());
+    }
+
+    #[test]
+    fn reopen_and_later_project_do_not_reseed_or_rearm_onboarding() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let temp = TempDir::new().unwrap();
+        let home = temp.path().join("home");
+        let root = temp.path().join("shaft");
+        std::fs::create_dir_all(&root).unwrap();
+        let env = EnvGuard::new(&["SHELBI_HOME"]);
+        env.set("SHELBI_HOME", &home);
+
+        persist_plan(&fixture_plan(&root, Runner::Claude)).unwrap();
+        let welcome_path = shelbi_state::task_path("shaft", shelbi_state::WELCOME_TASK_ID).unwrap();
+        assert!(welcome_path.is_file());
+
+        // Deleting the guide is permanent. An ordinary configured-project
+        // load (including its compatibility migrations) must remain read-only
+        // with respect to the Welcome seed.
+        std::fs::remove_file(&welcome_path).unwrap();
+        shelbi_state::load_project("shaft").unwrap();
+        assert!(!welcome_path.exists());
+
+        // Simulate the first sidebar claim, then add another project through
+        // the same detected scaffold used by `shelbi project add`.
+        assert!(shelbi_state::claim_first_run_hint().unwrap());
+        let mut later = fixture_plan(&root, Runner::Codex);
+        later.project_name = "later-project".to_string();
+        persist_plan(&later).unwrap();
+        assert!(shelbi_state::read_global_state().unwrap().first_run_seen);
+        assert_eq!(shelbi_state::list_tasks("later-project").unwrap().len(), 1);
+        assert!(
+            !welcome_path.exists(),
+            "scaffolding another project must not resurrect a deleted guide"
+        );
     }
 
     #[test]
@@ -2497,6 +2566,12 @@ mod tests {
         assert_eq!(
             std::fs::read_to_string(home.join("projects/shaft.yaml")).unwrap(),
             original
+        );
+        assert!(
+            !shelbi_state::task_path("shaft", shelbi_state::WELCOME_TASK_ID)
+                .unwrap()
+                .exists(),
+            "an existing registration must not gain the Welcome card"
         );
         assert!(!home.join("sessions").exists());
         assert!(!home.join("config.yaml").exists());
