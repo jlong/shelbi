@@ -147,26 +147,48 @@ pub(crate) fn locate_hub_workdir(project: &Project) -> Result<(Host, PathBuf)> {
 /// silently picking the first listing would merge or close an arbitrary
 /// one.
 pub(crate) fn lookup_open_pr(host: &Host, wt: &str, branch: &str) -> Result<Option<u64>> {
-    let out = run_in_dir(
-        host,
-        wt,
-        &[
-            "gh",
-            "pr",
-            "list",
-            "--head",
-            branch,
-            "--state",
-            "open",
-            "--json",
-            "number",
-            "--jq",
-            ".[].number",
-        ],
-    )?;
+    lookup_open_pr_impl(host, wt, branch, None)
+}
+
+/// Repository-bound variant used by Zen after resolving the exact `origin`
+/// push target. This prevents a `gh repo set-default` override from selecting
+/// a same-named branch in a different base repository.
+pub(crate) fn lookup_open_pr_in_repository(
+    host: &Host,
+    wt: &str,
+    branch: &str,
+    repository: &str,
+) -> Result<Option<u64>> {
+    lookup_open_pr_impl(host, wt, branch, Some(repository))
+}
+
+fn lookup_open_pr_impl(
+    host: &Host,
+    wt: &str,
+    branch: &str,
+    repository: Option<&str>,
+) -> Result<Option<u64>> {
+    let mut args = vec!["gh", "pr", "list"];
+    if let Some(repository) = repository {
+        args.extend(["--repo", repository]);
+    }
+    args.extend([
+        "--head",
+        branch,
+        "--state",
+        "open",
+        "--json",
+        "number",
+        "--jq",
+        ".[].number",
+    ]);
+    let out = run_in_dir(host, wt, &args)?;
     if !out.status.success() {
         return Err(Error::Command {
-            cmd: format!("gh pr list --head {branch}"),
+            cmd: format!(
+                "gh pr list{} --head {branch}",
+                repository.map_or(String::new(), |repo| format!(" --repo {repo}"))
+            ),
             status: out.status.to_string(),
             stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
         });
@@ -174,41 +196,268 @@ pub(crate) fn lookup_open_pr(host: &Host, wt: &str, branch: &str) -> Result<Opti
     parse_open_pr_list(&String::from_utf8_lossy(&out.stdout), branch)
 }
 
-/// Return the commit currently at an open PR's head.
+/// The immutable and routing-sensitive identity of an open pull request.
 ///
-/// Zen PR creation uses this after pushing the named task branch so a PR
-/// number cannot cross into CI watching or merging unless GitHub reports the
-/// exact reviewed commit that was just pushed.
-pub(crate) fn lookup_pr_head_oid(host: &Host, wt: &str, pr: u64) -> Result<String> {
+/// A branch name and commit OID are not sufficient to identify the PR Shelbi
+/// just published: GitHub permits the same head branch to have PRs against
+/// different bases, and a fork can expose the same branch name and commit.
+/// Zen PR reuse checks every field before allowing the number into CI.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PrIdentity {
+    pub(crate) head_oid: String,
+    pub(crate) head_ref: String,
+    pub(crate) base_ref: String,
+    pub(crate) base_oid: String,
+    pub(crate) head_repository: RepositoryIdentity,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RepositoryIdentity {
+    pub(crate) id: String,
+    pub(crate) name_with_owner: String,
+    /// Credential-free `[HOST/]OWNER/REPO` selector for every downstream gh
+    /// command. Keeping the host is mandatory for GitHub Enterprise.
+    pub(crate) selector: String,
+    pub(crate) host: String,
+}
+
+/// Return the PR head commit, head/base branch names, and owning repository.
+pub(crate) fn lookup_pr_identity(
+    host: &Host,
+    wt: &str,
+    repository: &str,
+    pr: u64,
+) -> Result<PrIdentity> {
     let pr_str = pr.to_string();
+    let fields = "headRefOid,headRefName,baseRefName,baseRefOid,headRepository";
+    let query = r#"[.headRefOid, .headRefName, .baseRefName, .baseRefOid, .headRepository.id, .headRepository.nameWithOwner] | .[]"#;
+    let out = run_in_dir(
+        host,
+        wt,
+        &[
+            "gh", "pr", "view", &pr_str, "--repo", repository, "--json", fields, "--jq", query,
+        ],
+    )?;
+    if !out.status.success() {
+        return Err(Error::Command {
+            cmd: format!("gh pr view {pr_str} --repo {repository} --json {fields}"),
+            status: out.status.to_string(),
+            stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
+        });
+    }
+    let values: Vec<String> = String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .map(str::trim)
+        .map(str::to_string)
+        .collect();
+    let [head_oid, head_ref, base_ref, base_oid, head_repository_id, head_repository_name] =
+        values.as_slice()
+    else {
+        return Err(Error::Other(format!(
+            "gh pr view {pr_str}: expected head/base OIDs, head/base names, and head repository identity, got {} value(s)",
+            values.len()
+        )));
+    };
+    if values
+        .iter()
+        .any(|value| value.is_empty() || value == "null")
+    {
+        return Err(Error::Other(format!(
+            "gh pr view {pr_str}: PR identity contains an empty head, base, or repository field"
+        )));
+    }
+    Ok(PrIdentity {
+        head_oid: head_oid.clone(),
+        head_ref: head_ref.clone(),
+        base_ref: base_ref.clone(),
+        base_oid: base_oid.clone(),
+        head_repository: RepositoryIdentity {
+            id: head_repository_id.clone(),
+            name_with_owner: head_repository_name.clone(),
+            // The PR was queried through the already resolved origin selector,
+            // so its host/routing identity is the same API host. Equality is
+            // still decided by the immutable repository id.
+            selector: repository.to_string(),
+            host: repository
+                .split('/')
+                .next()
+                .unwrap_or("github.com")
+                .to_string(),
+        },
+    })
+}
+
+/// Resolve the immutable GitHub identity of the exact `origin` push target.
+/// This avoids both similarly named forks and a `gh repo set-default` override
+/// that points somewhere other than the remote Shelbi just pushed.
+pub(crate) fn lookup_origin_repository(host: &Host, wt: &str) -> Result<RepositoryIdentity> {
+    lookup_origin_repository_with_push_target(host, wt).map(|(repository, _)| repository)
+}
+
+/// Resolve `origin` once and return both its immutable GitHub identity and the
+/// exact push target that produced that identity. Callers that mutate remote
+/// state can use the captured target instead of re-reading a mutable remote
+/// name after the identity check.
+pub(crate) fn lookup_origin_repository_with_push_target(
+    host: &Host,
+    wt: &str,
+) -> Result<(RepositoryIdentity, String)> {
+    let (remote, selector) = lookup_origin_push_target(host, wt)?;
     let out = run_in_dir(
         host,
         wt,
         &[
             "gh",
-            "pr",
+            "repo",
             "view",
-            &pr_str,
+            &selector,
             "--json",
-            "headRefOid",
+            "id,nameWithOwner,url",
             "--jq",
-            ".headRefOid",
+            "[.id, .nameWithOwner, .url] | .[]",
         ],
     )?;
     if !out.status.success() {
         return Err(Error::Command {
-            cmd: format!("gh pr view {pr_str} --json headRefOid"),
+            // Push URLs can contain credentials. Keep the actual argv out of
+            // diagnostics while still naming the failed verification step.
+            cmd: "gh repo view <origin-push-url> --json id,nameWithOwner,url".into(),
             status: out.status.to_string(),
-            stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
+            stderr: String::from_utf8_lossy(&out.stderr).replace(&remote, "<origin-push-url>"),
         });
     }
-    let oid = String::from_utf8_lossy(&out.stdout).trim().to_string();
-    if oid.is_empty() {
-        return Err(Error::Other(format!(
-            "gh pr view {pr_str}: headRefOid is empty"
-        )));
+    let values: Vec<String> = String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .map(str::trim)
+        .map(str::to_string)
+        .collect();
+    let [id, name_with_owner, repository_url] = values.as_slice() else {
+        return Err(Error::Other(
+            "gh repo view: expected repository id, nameWithOwner, and URL; refusing to identify a PR by branch name alone"
+                .into(),
+        ));
+    };
+    if id.is_empty()
+        || id == "null"
+        || name_with_owner.is_empty()
+        || name_with_owner == "null"
+        || repository_url.is_empty()
+        || repository_url == "null"
+    {
+        return Err(Error::Other(
+            "gh repo view: repository id, nameWithOwner, or URL is empty; refusing to identify a PR by branch name alone"
+                .into(),
+        ));
     }
-    Ok(oid)
+    let canonical = credential_free_repository_selector(repository_url)?;
+    let host = canonical.split('/').next().unwrap_or("").to_string();
+    if host.is_empty() {
+        return Err(Error::Other(
+            "gh repo view: repository URL has no host; refusing ambiguous GitHub routing".into(),
+        ));
+    }
+    Ok((
+        RepositoryIdentity {
+            id: id.clone(),
+            name_with_owner: name_with_owner.clone(),
+            selector: format!("{host}/{name_with_owner}"),
+            host,
+        },
+        remote,
+    ))
+}
+
+pub(crate) fn lookup_origin_repository_selector(host: &Host, wt: &str) -> Result<String> {
+    lookup_origin_push_target(host, wt).map(|(_, selector)| selector)
+}
+
+fn lookup_origin_push_target(host: &Host, wt: &str) -> Result<(String, String)> {
+    let remote = run_in_dir(
+        host,
+        wt,
+        &["git", "remote", "get-url", "--push", "--all", "origin"],
+    )?;
+    if !remote.status.success() {
+        return Err(Error::Command {
+            cmd: "git remote get-url --push --all origin".into(),
+            status: remote.status.to_string(),
+            stderr: String::from_utf8_lossy(&remote.stderr).into_owned(),
+        });
+    }
+    let mut remotes: Vec<String> = String::from_utf8_lossy(&remote.stdout)
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(str::to_string)
+        .collect();
+    remotes.sort();
+    remotes.dedup();
+    let [remote] = remotes.as_slice() else {
+        return Err(Error::Other(
+            "origin must have exactly one distinct push target before Shelbi can verify a PR's head repository"
+                .into(),
+        ));
+    };
+
+    let selector = credential_free_repository_selector(remote)?;
+    Ok((remote.clone(), selector))
+}
+
+/// Convert a network Git URL to gh's credential-free `[HOST/]OWNER/REPO`
+/// selector. Local filesystem remotes are retained for hermetic/test setups;
+/// unlike URL userinfo they do not place an authentication secret in argv.
+fn credential_free_repository_selector(remote: &str) -> Result<String> {
+    if remote
+        .chars()
+        .any(|character| matches!(character, '\n' | '\r' | '\0'))
+    {
+        return Err(Error::Other(
+            "origin push URL contains control characters; refusing GitHub repository lookup".into(),
+        ));
+    }
+
+    if let Some((scheme, rest)) = remote.split_once("://") {
+        if scheme.is_empty() {
+            return Err(Error::Other(
+                "origin push URL has an empty scheme; refusing GitHub repository lookup".into(),
+            ));
+        }
+        let (authority, path) = rest.split_once('/').ok_or_else(|| {
+            Error::Other(
+                "origin push URL does not identify an owner and repository; refusing GitHub repository lookup"
+                    .into(),
+            )
+        })?;
+        let host = authority.rsplit('@').next().unwrap_or("");
+        return hosted_repository_selector(host, path);
+    }
+
+    // SCP-style SSH remotes: `git@github.example:owner/repo.git`.
+    if let Some((authority, path)) = remote.split_once(':') {
+        if authority.contains('@') && !authority.contains('/') {
+            let host = authority.rsplit('@').next().unwrap_or("");
+            return hosted_repository_selector(host, path);
+        }
+    }
+
+    Ok(remote.to_string())
+}
+
+fn hosted_repository_selector(host: &str, path: &str) -> Result<String> {
+    let host = host.trim();
+    let path = path
+        .split(['?', '#'])
+        .next()
+        .unwrap_or("")
+        .trim_matches('/');
+    let path = path.strip_suffix(".git").unwrap_or(path);
+    if host.is_empty() || path.is_empty() || !path.contains('/') {
+        return Err(Error::Other(
+            "origin push URL does not identify a host, owner, and repository; refusing GitHub repository lookup"
+                .into(),
+        ));
+    }
+    Ok(format!("{host}/{path}"))
 }
 
 /// Parse `gh pr list`'s one-number-per-line `--jq .[].number` output.
@@ -284,42 +533,71 @@ pub(crate) fn lookup_pr_base(host: &Host, wt: &str, pr: u64) -> Result<String> {
 
 /// Backoff schedule for [`wait_for_merge_commit_sha`] — ~15s total, enough
 /// to cover GitHub's usual post-merge bookkeeping lag without stalling a
-/// genuinely stuck merge for long.
+/// merge-queue acknowledgement for long.
 const MERGE_SHA_BACKOFF_SECS: [u64; 4] = [1, 2, 4, 8];
 
-/// Read the merge commit SHA of a just-merged PR, polling with backoff.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum MergeCommitPoll {
+    Complete(Option<String>),
+    Retry,
+}
+
+/// Interpret one `gh pr view` result from the post-merge poll.
+fn classify_merge_commit_poll(
+    pr: u64,
+    state: &str,
+    oid: &str,
+    retries_exhausted: bool,
+) -> Result<MergeCommitPoll> {
+    if !oid.is_empty() {
+        return Ok(MergeCommitPoll::Complete(Some(oid.to_string())));
+    }
+    if !retries_exhausted {
+        return Ok(MergeCommitPoll::Retry);
+    }
+    match state {
+        "MERGED" => Ok(MergeCommitPoll::Complete(None)),
+        _ => Err(Error::Other(format!(
+            "gh pr view {pr}: merge reported success but the PR is `{state}` and \
+             mergeCommit.oid is still empty after retries; check the PR on GitHub"
+        ))),
+    }
+}
+
+/// Read the merge commit SHA of a merged PR, polling with backoff.
 ///
 /// GitHub finalizes merges asynchronously (merge queues, busy repos), so
 /// `mergeCommit` can be null for a window after `gh pr merge` exits 0.
 /// Returns:
 ///
 /// - `Ok(Some(sha))` once the SHA materializes;
-/// - `Ok(None)` when the PR reports `MERGED` but the SHA still isn't
-///   recorded after all retries — the merge *succeeded*, callers must
-///   treat this as "merged, SHA pending", not a failure;
-/// - `Err` when the PR never reaches `MERGED` (e.g. it's still queued)
-///   or gh itself fails.
+/// - `Ok(None)` when the PR reports `MERGED` without a recorded SHA;
+/// - `Err` when gh fails or the PR reaches another terminal state.
 pub(crate) fn wait_for_merge_commit_sha(host: &Host, wt: &str, pr: u64) -> Result<Option<String>> {
+    wait_for_merge_commit_sha_impl(host, wt, pr)
+}
+
+fn wait_for_merge_commit_sha_impl(
+    host: &Host,
+    wt: &str,
+    pr: u64,
+) -> Result<Option<String>> {
     let pr_str = pr.to_string();
     let mut attempt = 0;
     loop {
-        let out = run_in_dir(
-            host,
-            wt,
-            &[
-                "gh",
-                "pr",
-                "view",
-                &pr_str,
-                "--json",
-                "state,mergeCommit",
-                "--jq",
-                r#".state + " " + (.mergeCommit.oid // "")"#,
-            ],
-        )?;
+        let mut args = vec!["gh", "pr", "view", pr_str.as_str()];
+        args.extend([
+            "--json",
+            "state,mergeCommit",
+            "--jq",
+            r#".state + " " + (.mergeCommit.oid // "")"#,
+        ]);
+        let out = run_in_dir(host, wt, &args)?;
         if !out.status.success() {
             return Err(Error::Command {
-                cmd: format!("gh pr view {pr_str} --json state,mergeCommit"),
+                cmd: format!(
+                    "gh pr view {pr_str} --json state,mergeCommit"
+                ),
                 status: out.status.to_string(),
                 stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
             });
@@ -328,19 +606,14 @@ pub(crate) fn wait_for_merge_commit_sha(host: &Host, wt: &str, pr: u64) -> Resul
         let mut parts = stdout.split_whitespace();
         let state = parts.next().unwrap_or("").to_string();
         let oid = parts.next().unwrap_or("").to_string();
-        if !oid.is_empty() {
-            return Ok(Some(oid));
-        }
-        if attempt >= MERGE_SHA_BACKOFF_SECS.len() {
-            if state == "MERGED" {
-                return Ok(None);
-            }
-            return Err(Error::Other(format!(
-                "gh pr view {pr_str}: merge reported success but the PR is \
-                 `{state}` and mergeCommit.oid is still empty after retries — \
-                 if the repo uses a merge queue the merge may land later; \
-                 check the PR on GitHub"
-            )));
+        match classify_merge_commit_poll(
+            pr,
+            &state,
+            &oid,
+            attempt >= MERGE_SHA_BACKOFF_SECS.len(),
+        )? {
+            MergeCommitPoll::Complete(sha) => return Ok(sha),
+            MergeCommitPoll::Retry => {}
         }
         std::thread::sleep(std::time::Duration::from_secs(
             MERGE_SHA_BACKOFF_SECS[attempt],
@@ -457,6 +730,52 @@ mod tests {
     fn open_pr_list_rejects_non_numeric_rows() {
         let err = parse_open_pr_list("nope\n", "b").unwrap_err();
         assert!(err.to_string().contains("non-numeric"), "{err}");
+    }
+
+    #[test]
+    fn repository_selector_strips_network_credentials() {
+        assert_eq!(
+            credential_free_repository_selector(
+                "https://oauth2:secret-token@github.example/owner/repo.git"
+            )
+            .unwrap(),
+            "github.example/owner/repo"
+        );
+        assert_eq!(
+            credential_free_repository_selector("git@github.com:owner/repo.git").unwrap(),
+            "github.com/owner/repo"
+        );
+    }
+
+    #[test]
+    fn repository_selector_retains_credential_free_local_remote() {
+        assert_eq!(
+            credential_free_repository_selector("/tmp/repositories/repo.git").unwrap(),
+            "/tmp/repositories/repo.git"
+        );
+    }
+
+    #[test]
+    fn generic_workflow_merge_does_not_treat_open_pr_as_landed() {
+        let error = classify_merge_commit_poll(379, "OPEN", "", true).unwrap_err();
+        assert!(error.to_string().contains("PR is `OPEN`"));
+    }
+
+    #[test]
+    fn post_merge_poll_preserves_existing_terminal_behavior() {
+        assert_eq!(
+            classify_merge_commit_poll(379, "MERGED", "abc123", false).unwrap(),
+            MergeCommitPoll::Complete(Some("abc123".into()))
+        );
+        assert_eq!(
+            classify_merge_commit_poll(379, "MERGED", "", true).unwrap(),
+            MergeCommitPoll::Complete(None)
+        );
+
+        let error = classify_merge_commit_poll(379, "CLOSED", "", true).unwrap_err();
+        let message = error.to_string();
+        assert!(message.contains("PR is `CLOSED`"), "{message}");
+        assert!(message.contains("mergeCommit.oid"), "{message}");
     }
 
     #[test]

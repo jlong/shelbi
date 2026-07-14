@@ -1,7 +1,7 @@
 ---
 title: shelbi zen
 order: 28
-summary: Toggle Zen Mode and run the introspection + merge primitives the orchestrator sequences during auto-merge.
+summary: Toggle Zen Mode and run the exact-provenance, base-leased merge primitives the orchestrator sequences.
 ---
 
 ```text
@@ -30,9 +30,9 @@ from the per-subcommand tables.
 shelbi zen on
 ```
 
-Turn Zen Mode on. The orchestrator may auto-merge and auto-promote
-finished tasks per the project's prompt without waiting on a human
-reviewer. Idempotent. Mirrors `Alt+Z` in the TUI.
+Turn Zen Mode on. The orchestrator may auto-promote and auto-merge finished
+work through the exact-provenance, base-leased PR flow. Idempotent. Mirrors
+`Alt+Z` in the TUI.
 
 ## off
 
@@ -50,9 +50,8 @@ shelbi zen pause
 ```
 
 Pause Zen Mode: no *new* auto-promotions, but tasks already on the
-Zen track may still complete their merge. Use this to triage incoming
-work yourself for a bit without losing the auto-merge benefit on
-stuff already in motion.
+Zen track may still complete their merge flow. Use this to triage incoming
+work yourself while preserving work already in motion.
 
 ## status
 
@@ -112,8 +111,10 @@ The task must be assigned to a workspace so the probe can locate the
 repository that holds its named branch. Shelbi checks out that exact branch
 commit in an isolated temporary worktree, so a newer task reusing the assigned
 workspace is not modified or tested by mistake. A successful rebase advances
-the durable task branch, and the report's `head_sha` identifies the exact
-commit used for every check and fact.
+the durable task branch. The report freezes `repository`, `repository_id`,
+`base_branch`, `base_sha`, and `head_sha`. Together those fields identify the
+exact repository and workflow base used for every check and fact, plus the
+reviewed task commit. Pass the same five values to every later PR command.
 
 | Argument | Type | Default | Description |
 | --- | --- | --- | --- |
@@ -122,7 +123,7 @@ commit used for every check and fact.
 ## pr-create
 
 ```text
-shelbi zen pr-create <ID> --match-head-commit <SHA>
+shelbi zen pr-create <ID> --match-repository <REPOSITORY> --match-repository-id <REPOSITORY_ID> --match-base-branch <BRANCH> --match-base-commit <BASE_SHA> --match-head-commit <HEAD_SHA>
 ```
 
 Push the task's named branch and open a PR. Idempotent. If an open PR for
@@ -130,20 +131,29 @@ the branch already exists, Shelbi updates the branch and returns its number
 only after the PR head matches the exact task branch commit that was pushed.
 Otherwise, it opens a new PR. Prints the PR number on stdout.
 
-`--match-head-commit` is required. Pass the `head_sha` from the immediately
-preceding `probe` report. Shelbi rejects the operation if the durable task
-branch moved after the probe, so an older or newer commit cannot silently
-replace the commit whose checks and diff were reviewed.
+Reuse also requires the exact task branch, resolved workflow base branch and
+commit, and `origin` repository identity. A same-named PR aimed at another
+base or coming from another repository is rejected.
+
+All five `--match-*` flags are required. Copy them from the immediately
+preceding `probe` report without re-resolving configuration or `origin`.
+Shelbi rejects the operation if any part of that identity moved after the
+probe, so mutable workflow, remote, or branch state cannot silently replace
+what was reviewed.
 
 | Argument or flag | Type | Default | Description |
 | --- | --- | --- | --- |
 | `<ID>` | string | — | Task id whose branch to push and PR (required). |
+| `--match-repository <REPOSITORY>` | string | required | Require the `origin` repository selector to equal probe `repository`. |
+| `--match-repository-id <REPOSITORY_ID>` | string | required | Require the immutable GitHub repository id to equal probe `repository_id`. |
+| `--match-base-branch <BRANCH>` | string | required | Require the PR target to equal probe `base_branch`. |
+| `--match-base-commit <SHA>` | string | required | Require the resolved target commit to equal probe `base_sha`. |
 | `--match-head-commit <SHA>` | string | required | Require the task branch and published PR head to match this probe SHA. |
 
 ## ci-watch
 
 ```text
-shelbi zen ci-watch [OPTIONS] <PR_NUMBER>
+shelbi zen ci-watch <PR_NUMBER> --match-repository <REPOSITORY> --match-repository-id <REPOSITORY_ID> --match-base-branch <BRANCH> --match-base-commit <BASE_SHA> --match-head-commit <HEAD_SHA> [OPTIONS]
 ```
 
 Watch the PR's checks until they settle or the timeout fires. Prints one of:
@@ -155,34 +165,58 @@ Watch the PR's checks until they settle or the timeout fires. Prints one of:
 Which checks it watches is auto-selected from the target branch: with
 branch-protection required checks configured, it watches only those; on an
 unprotected branch (or one with no required set) it falls back to every check
-reported on the PR, like `gh pr checks <pr>`.
+reported on the PR and requires GitHub's merge state to be clean. When required
+rows exist, a blocked merge state keeps waiting for a required context that has
+not reported, while an optional failed check does not override passing required
+checks.
 
-Watch the PR number returned by the pinned `pr-create` call and retain that
-probe's `head_sha`. The following `pr-merge` call requires the same SHA and
-refuses to merge if the PR head moved while CI was running.
+All five `--match-*` values must be the unchanged probe identity passed to
+`pr-create`. Each poll verifies that original repository, base name and commit,
+and head commit. Shelbi reads the PR identity and status rollup together,
+including which contexts are required, and grades that one atomic snapshot.
+There is no separate check-result read that a brief A-to-B-to-A head change
+could confuse. Incomplete, paginated, or moved-head results fail closed and
+the whole pinned flow must restart from a fresh probe.
 
 | Flag | Type | Default | Description |
 | --- | --- | --- | --- |
 | `<PR_NUMBER>` | integer | — | The PR number returned by `pr-create` (required). |
+| `--match-repository <REPOSITORY>` | string | required | Require probe `repository` on every snapshot. |
+| `--match-repository-id <REPOSITORY_ID>` | string | required | Require probe `repository_id` on every snapshot. |
+| `--match-base-branch <BRANCH>` | string | required | Require probe `base_branch` on every snapshot. |
+| `--match-base-commit <SHA>` | string | required | Require probe `base_sha` on every snapshot. |
+| `--match-head-commit <SHA>` | string | required | Require the live PR head to stay at the probe SHA throughout the watch. |
 | `--timeout <DURATION>` | duration | project's `zen.ci_timeout` (default `15m`) | Override the wait. Accepts `30s`, `5m`, `2h`, `1d`, or a bare integer of seconds. |
 | `--task <TASK_ID>` | string | — | Resolve the default timeout against the task's workflow's `zen.ci_timeout` (falling back to the project value). Without it, the project default is used directly. |
 
 ## pr-merge
 
 ```text
-shelbi zen pr-merge <PR_NUMBER> --match-head-commit <SHA>
+shelbi zen pr-merge <PR_NUMBER> --match-repository <REPOSITORY> --match-repository-id <REPOSITORY_ID> --match-base-branch <BRANCH> --match-base-commit <BASE_SHA> --match-head-commit <HEAD_SHA>
 ```
 
-Squash-merge the PR and delete its source branch. Prints the merge
-SHA on stdout. Use this only after `ci-watch` reports `green`.
-`--match-head-commit` is required and must receive the same probe
-`head_sha` passed to `pr-create`. Shelbi verifies the live PR head before
-merging, so a branch update during CI stops the merge.
+Land the PR with the configured strategy after `ci-watch` reports `green`.
+Shelbi validates the complete probe identity, integrates the exact reviewed
+head on the exact probed base commit in an isolated local checkout, and pushes
+the resulting commit to the probed repository and base with a server-side
+compare-and-swap lease on `base_sha`. A concurrent base move is rejected by
+the Git server before the ref changes.
+
+GitHub's `expectedHeadOid` leases only the head and cannot atomically pin a
+base ref. Shelbi therefore does not use the ordinary merge or enqueue mutation
+as its integration authority. After the leased push, it reconciles the PR and
+requires GitHub to report the exact result. A branch-protection rejection,
+lease failure, or result that cannot be reconciled fails loudly and leaves the
+task in handoff. A landed PR prints its merge SHA or `sha-pending`.
 
 | Argument or flag | Type | Default | Description |
 | --- | --- | --- | --- |
 | `<PR_NUMBER>` | integer | — | The PR number to merge (required). |
-| `--match-head-commit <SHA>` | string | required | Require the live PR head to equal the probe SHA before merging. |
+| `--match-repository <REPOSITORY>` | string | required | Require probe `repository`. |
+| `--match-repository-id <REPOSITORY_ID>` | string | required | Require probe `repository_id`. |
+| `--match-base-branch <BRANCH>` | string | required | Require probe `base_branch`. |
+| `--match-base-commit <SHA>` | string | required | Require probe `base_sha`. |
+| `--match-head-commit <SHA>` | string | required | Require probe `head_sha`. |
 
 ## Examples
 
@@ -223,10 +257,15 @@ exactly the sequence the orchestrator runs internally:
 
 ```bash
 REPORT=$(shelbi zen probe docs-write-cli-reference-pages)
+REPOSITORY=$(printf '%s\n' "$REPORT" | jq -r .repository)
+REPOSITORY_ID=$(printf '%s\n' "$REPORT" | jq -r .repository_id)
+BASE_BRANCH=$(printf '%s\n' "$REPORT" | jq -r .base_branch)
+BASE_SHA=$(printf '%s\n' "$REPORT" | jq -r .base_sha)
 HEAD_SHA=$(printf '%s\n' "$REPORT" | jq -r .head_sha)
-PR=$(shelbi zen pr-create docs-write-cli-reference-pages --match-head-commit "$HEAD_SHA")
-shelbi zen ci-watch "$PR" --timeout 10m && \
-  shelbi zen pr-merge "$PR" --match-head-commit "$HEAD_SHA"
+PIN=(--match-repository "$REPOSITORY" --match-repository-id "$REPOSITORY_ID" --match-base-branch "$BASE_BRANCH" --match-base-commit "$BASE_SHA" --match-head-commit "$HEAD_SHA")
+PR=$(shelbi zen pr-create docs-write-cli-reference-pages "${PIN[@]}")
+shelbi zen ci-watch "$PR" "${PIN[@]}" --timeout 10m
+shelbi zen pr-merge "$PR" "${PIN[@]}"
 ```
 
 Pause Zen during a release window without aborting in-flight merges:

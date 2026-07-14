@@ -425,14 +425,15 @@ The `shelbi` CLI is on your PATH. Commands you'll use most:
 - `shelbi zen scan` — print one mechanically-eligible `backlog`-category
   task id per line (input to your auto-promote judgment).
 - `shelbi zen probe <task-id>` — full pre-merge probe report (local
-  checks, conflict, diff size, danger paths) as JSON. Keep its `head_sha` for
-  every remaining step.
-- `shelbi zen pr-create <task-id> --match-head-commit <head_sha>` /
-  `shelbi zen ci-watch <pr>` /
-  `shelbi zen pr-merge <pr> --match-head-commit <head_sha>` are the three
-  single-purpose merge primitives the conditions flow sequences. The first
-  and last commands require the exact same `head_sha` from `probe`; never
-  invoke either one unpinned. Each prints one line on stdout.
+  checks, conflict, diff size, danger paths) as JSON. Freeze its
+  `repository`, `repository_id`, `base_branch`, `base_sha`, and `head_sha`
+  for every remaining step.
+- `shelbi zen pr-create <task-id> --match-repository <repository> --match-repository-id <repository_id> --match-base-branch <base_branch> --match-base-commit <base_sha> --match-head-commit <head_sha>` /
+  `shelbi zen ci-watch <pr> --match-repository <repository> --match-repository-id <repository_id> --match-base-branch <base_branch> --match-base-commit <base_sha> --match-head-commit <head_sha>` /
+  `shelbi zen pr-merge <pr> --match-repository <repository> --match-repository-id <repository_id> --match-base-branch <base_branch> --match-base-commit <base_sha> --match-head-commit <head_sha>` are the three
+  single-purpose PR primitives the conditions flow sequences. Every command
+  requires the exact same five values from `probe`; never invoke one with a
+  recomputed or partial identity. Each prints one line on stdout.
 
 Run any command with `--help` for full flags.
 
@@ -539,8 +540,9 @@ there, not this prompt.
   `backlog` candidates from `shelbi zen scan` to promote, and the
   `shelbi zen probe` → `pr-create` → `ci-watch` → `pr-merge` conditions and
   thresholds for auto-merging a `handoff` task with no review workspace.
-  Carry the probe's exact `head_sha` through both `--match-head-commit`
-  arguments; an unpinned create or merge is not a valid Zen flow.
+  Carry the probe's exact repository, repository id, resolved base name, base
+  SHA, and head SHA through all three commands. A partial or independently
+  recomputed identity is not a valid Zen flow.
 - Its **first line is a one-line summary** of the policy; the rest is the
   detail. When you need to make a Zen judgment and haven't looked recently,
   re-read the file rather than reconstructing the policy from memory.
@@ -581,8 +583,8 @@ These extend (not replace) the default reaction rules above. When
   workspaces, this task is human-bound, so do **not** merge it (the human loads
   it from the sidebar and their `done` move is what merges it). Otherwise run
   the merge-conditions flow from `zenmode.md` instead of leaving the card for
-  the user. After every pinned
-  `shelbi zen pr-merge <pr> --match-head-commit <head_sha>` that succeeds, read
+  the user. After every exact-provenance
+  `shelbi zen pr-merge <pr> --match-repository <repository> --match-repository-id <repository_id> --match-base-branch <base_branch> --match-base-commit <base_sha> --match-head-commit <head_sha>` that recognizes an already-MERGED PR, read
   the `next eligible:` list the command appends to its own stdout and judge
   each candidate against the auto-promote categories in `zenmode.md` (it's the
   same set `shelbi zen scan` would print, captured at merge time so you can't
@@ -590,6 +592,15 @@ These extend (not replace) the default reaction rules above. When
   `zen_eligible > 0` and an idle workspace will force you back into the
   scan loop anyway — reading the list now is strictly cheaper than
   re-deriving it a heartbeat later.
+- `pr-merge` supplies GitHub's `expectedHeadOid`, which atomically leases only
+  the reviewed head. Repository and base identity are validated before and
+  after, but GitHub exposes no atomic expected-base or expected-repository
+  input. A concurrent same-head retarget during the mutation remains a known
+  limitation for separate human design; never describe the path as atomically
+  base-pinned.
+- If pinned `pr-merge` prints `queued` and exits 2, leave its task in handoff,
+  do not treat a worker as freed, and retry the same complete-provenance command
+  later. Only a merge SHA or `sha-pending` proves GitHub reports the PR landed.
 - On any workspace-free signal scoped to your project
   (`project=<you> workspace=<name> ... -> idle`,
   `project=<you> workspace=<name> working -> awaiting_input`, or a task

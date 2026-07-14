@@ -65,9 +65,11 @@ project YAMLs, so the markers are redundant.
 Reload also self-heals the shipped agent workspaces before respawning the
 orchestrator pane. User-customized `agents/*/instructions.md` files are
 preserved. In `agents/orchestrator/instructions.md` and `zenmode.md`, Shelbi
-pins only exact legacy stock `pr-create` and `pr-merge` command snippets while
-leaving surrounding custom prose intact. It also appends any missing
-runner-critical orchestrator sections, such as `Polling-only event drain`,
+upgrades only exact legacy stock `pr-create`, `ci-watch`, and `pr-merge`
+command snippets to carry the probe's repository, base, and head identity,
+while leaving surrounding custom prose intact. Both unpinned and older
+head-only stock forms are migrated. It also appends any
+missing runner-critical orchestrator sections, such as `Polling-only event drain`,
 instead of overwriting the whole file. Both a whole-hub reload and
 `shelbi reload chat` apply these automation safeguards before the new
 orchestrator starts.

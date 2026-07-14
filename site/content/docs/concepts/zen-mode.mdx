@@ -1,15 +1,14 @@
 ---
 title: Zen Mode
 order: 16
-summary: Hands-off autonomy — the orchestrator triages backlog, runs the high-confidence merge bar, and lands work without waiting on you. You stay in the loop for anything ambiguous.
+summary: The orchestrator triages backlog and lands work through an exact-provenance, base-leased high-confidence bar.
 ---
 
 By default the orchestrator is the scheduler and you are the
 priority-setter + reviewer. Zen Mode flips it: the orchestrator takes
 the lead. It triages mechanically-eligible backlog into todo on its
-own, and it lands finished work past a pre-defined confidence bar
-without asking. You stay in the loop only for the cases the
-orchestrator decides it can't judge.
+own and lands finished work past a pre-defined confidence bar. The landing
+path leases the exact probed base on the Git server.
 
 The mental model is **lead vs. scheduler**. Zen on, the agent makes
 calls; you redirect when you disagree. Zen off (the default), the
@@ -52,10 +51,9 @@ instead). Your pick is persisted to `~/.shelbi/shelbi.yaml`.
 Zen Mode does exactly two things the default scheduler doesn't:
 
 1. **Auto-merge**: when a task is queued for a workflow transition
-   whose `actions:` include `merge`, Zen runs the high-confidence bar
-   (below). If everything passes, the branch lands on its target and
-   the task moves to the transition's `to` status (typically `done`)
-   without a human stop.
+   whose `actions:` include `merge`, Zen runs the high-confidence bar below.
+   If everything passes, it lands the reviewed head on the exact probed base
+   and moves the task to the transition's `to` status.
 2. **Auto-promote**: when a workspace frees up, Zen scans the backlog
    for tasks that are *mechanically eligible* (see
    [`shelbi zen scan`](/docs/cli/zen#scan)) and then applies the
@@ -80,9 +78,9 @@ orchestrator's prompt are now lines of YAML:
 
 - **"Auto-merge but don't auto-promote."** Make the merge-bearing handoff
   status `owner: agent`, but leave `Backlog` as `owner: user`. The
-  orchestrator lands finished work autonomously while your triage queue
-  stays yours. Previously this was a carve-out you wrote into the prompt;
-  now it's two `owner:` values.
+  orchestrator lands finished work while your triage queue stays yours.
+  Previously this was a carve-out you wrote into the prompt; now it is two
+  `owner:` values.
 - **"Review with QA before a human signs off."** Give the `Review` status
   `owner: agent, agent: qa`. The [`qa` agent](/docs/concepts/agents) runs
   the review pass automatically; a downstream `owner: user` status holds
@@ -118,7 +116,7 @@ what happened.
 
 ```text
 merge-transition -> probe -> local checks -> merge conflict -> diff size
-                 -> danger paths -> pinned pr-create -> ci-watch -> pinned pr-merge
+                 -> danger paths -> exact-provenance PR flow -> base-leased landing
 ```
 
 <Callout type="note" title="Back-compat fallback">
@@ -146,27 +144,32 @@ The conditions, in order:
    `zen.danger_paths.extend` + the active workflow's `zen.danger_paths`
    override, if any) bails out.
 5. **PR opens cleanly** via
-   `shelbi zen pr-create <id> --match-head-commit <head_sha>`, where
-   `head_sha` is copied directly from the probe report. The PR is returned
-   only after its remote head matches that exact commit.
-6. **CI is green**: `shelbi zen ci-watch <pr> --task <id>` polls the PR
-   number returned by that pinned creation step. It runs
-   `gh pr checks --required` until every required check settles. The
+   `shelbi zen pr-create <id> --match-repository <repository> --match-repository-id <repository_id> --match-base-branch <base_branch> --match-base-commit <base_sha> --match-head-commit <head_sha>`. All five values are copied directly from the probe report. The PR is returned
+   only after its remote identity matches the exact repository, resolved
+   workflow base name and commit, task branch, and reviewed head.
+6. **CI is green**:
+   `shelbi zen ci-watch <pr> --match-repository <repository> --match-repository-id <repository_id> --match-base-branch <base_branch> --match-base-commit <base_sha> --match-head-commit <head_sha> --task <id>` polls
+   the PR number returned by that creation step, using the same complete probe
+   identity. One GraphQL response per poll binds the repository, base, PR head, latest commit,
+   required contexts, their results, and GitHub's merge state. A blocked state
+   prevents a not-yet-reported required context from being mistaken for no
+   check, while an optional failed check does not override passing required
+   checks. The
    `--task` flag resolves the timeout against the task's workflow
    (`zen.ci_timeout` override, then project default of `15m`); plain
    `--timeout <duration>` still overrides explicitly. Anything red or
-   a timeout bails.
-7. **Merge** via
-   `shelbi zen pr-merge <pr> --match-head-commit <head_sha>`, passing the
-   same probe SHA again. The command refuses to merge if the PR head moved
-   before or during CI. It uses the workflow's `merge_strategy` (default
-   `squash`), deletes the branch, moves the task into the transition's `to`
-   status (typically `done`), and writes a
-   `reason=orchestrator:zen-merge sha=<short>` line to the events log.
+   a timeout bails. Each poll compares against the frozen probe identity
+   and grades only that atomic snapshot, so persistent movement and a brief
+   A-to-B-to-A change both bail instead of authorizing a merge. A snapshot
+   that would require pagination also fails closed.
+7. **Base-leased landing** via
+   `shelbi zen pr-merge <pr> --match-repository <repository> --match-repository-id <repository_id> --match-base-branch <base_branch> --match-base-commit <base_sha> --match-head-commit <head_sha>`, passing the same probe identity again. Shelbi integrates the reviewed head on the exact probed base locally, then updates that base in the exact probed repository with a server-side compare-and-swap lease on `base_sha`. GitHub's merge mutation exposes only `expectedHeadOid`, not an expected-base lease, so it is not the integration authority. The leased Git push rejects a concurrent base move before changing the ref. Shelbi then reconciles the PR and requires the exact result; branch protection, a lost lease, or ambiguous reconciliation fails loudly and leaves the task in handoff.
 
-The probe's `head_sha` is the contract for the whole sequence. It is not
-recomputed between steps: PR creation publishes that commit, CI watches the
-returned PR, and merge verifies that the PR still names the same commit.
+The probe's `repository`, `repository_id`, `base_branch`, `base_sha`, and
+`head_sha` form the contract for the whole sequence. They are not recomputed
+between steps: PR creation publishes into that repository and base, CI grades
+that identity continuously, and the landing boundary verifies it again. A
+workflow, origin, base, or head change requires a fresh probe and a new flow.
 
 Each step uses a single-purpose CLI primitive. The Rust side does
 mechanical I/O; the orchestrator's prompt holds the policy. That
@@ -233,7 +236,8 @@ Resolution rules:
   `checks_additional` still apply on top (see
   [per-task overrides](#per-task-overrides)).
 - **`ci_timeout`**: when set on the workflow, the workflow's value
-  wins. `shelbi zen ci-watch <pr> --task <id>` resolves through this
+  wins. `shelbi zen ci-watch <pr> <all-probe-match-flags> --task <id>`
+  resolves through this
   override; without `--task`, the project default is used.
 - **`danger_paths`**: uses the same `extend:` vs `override:` shape as
   the project block. `extend:` adds to the project's resolved list
@@ -464,8 +468,7 @@ Three levels of "stop":
 - **`shelbi zen pause`**: softer. No new auto-promotions, but the
   merge bar keeps applying to in-flight tasks that reach a
   `merge`-action transition. Use this when you want to triage
-  incoming work yourself for a bit without losing the auto-merge
-  benefit on stuff already in motion.
+  incoming work yourself without losing validation already in motion.
 - **Per-task pull-back**: `shelbi task move <id> --to backlog`
   from a handoff status pulls a specific card out of Zen's hands
   without changing the global mode.

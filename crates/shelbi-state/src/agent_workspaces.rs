@@ -119,8 +119,7 @@ pub const DEFAULT_SECURITY_INSTRUCTIONS: &str = include_str!("default_security.m
 
 /// Bundled adversarial `instructions.md` content — the refute-the-change
 /// charter.
-pub const DEFAULT_ADVERSARIAL_INSTRUCTIONS: &str =
-    include_str!("default_adversarial.md.template");
+pub const DEFAULT_ADVERSARIAL_INSTRUCTIONS: &str = include_str!("default_adversarial.md.template");
 
 /// Bundled body of the review agent's `load-run-detection` skill: the
 /// auto-detect heuristics for booting an unknown project on `$PORT`.
@@ -1487,9 +1486,9 @@ mod tests {
         materialize_default_agents("p").unwrap();
         let custom = "# Local Orchestrator\n\n\
 Keep this private scheduling rule byte-for-byte.\n\n\
-- `shelbi zen pr-create <task-id>` / `shelbi zen ci-watch <pr>` /\n  \
-`shelbi zen pr-merge <pr>` are my merge tools.\n\n\
-After green, run `shelbi zen pr-merge <pr-number>`.\n\n\
+- `shelbi zen pr-create <task-id> --match-head-commit <head_sha>` / `shelbi zen ci-watch <pr> --match-head-commit <head_sha>` /\n  \
+`shelbi zen pr-merge <pr> --match-head-commit <head_sha>` are my merge tools.\n\n\
+After green, run `shelbi zen pr-merge <pr-number> --match-head-commit <head_sha>`.\n\n\
 ## Polling-only event drain\n\nLocal copy.\n";
         let path = agent_instructions_path("p", ORCHESTRATOR_AGENT).unwrap();
         fs::write(&path, custom).unwrap();
@@ -1509,16 +1508,20 @@ After green, run `shelbi zen pr-merge <pr-number>`.\n\n\
 
         let expected = custom
             .replace(
-                "`shelbi zen pr-create <task-id>`",
                 "`shelbi zen pr-create <task-id> --match-head-commit <head_sha>`",
+                "`shelbi zen pr-create <task-id> --match-repository <repository> --match-repository-id <repository_id> --match-base-branch <base_branch> --match-base-commit <base_sha> --match-head-commit <head_sha>`",
             )
             .replace(
-                "`shelbi zen pr-merge <pr>`",
+                "`shelbi zen ci-watch <pr> --match-head-commit <head_sha>`",
+                "`shelbi zen ci-watch <pr> --match-repository <repository> --match-repository-id <repository_id> --match-base-branch <base_branch> --match-base-commit <base_sha> --match-head-commit <head_sha>`",
+            )
+            .replace(
                 "`shelbi zen pr-merge <pr> --match-head-commit <head_sha>`",
+                "`shelbi zen pr-merge <pr> --match-repository <repository> --match-repository-id <repository_id> --match-base-branch <base_branch> --match-base-commit <base_sha> --match-head-commit <head_sha>`",
             )
             .replace(
-                "`shelbi zen pr-merge <pr-number>`",
                 "`shelbi zen pr-merge <pr-number> --match-head-commit <head_sha>`",
+                "`shelbi zen pr-merge <pr-number> --match-repository <repository> --match-repository-id <repository_id> --match-base-branch <base_branch> --match-base-commit <base_sha> --match-head-commit <head_sha>`",
             );
         assert_eq!(fs::read_to_string(&path).unwrap(), expected);
         assert!(fs::read_to_string(&path)
@@ -1721,10 +1724,16 @@ After green, run `shelbi zen pr-merge <pr-number>`.\n\n\
     fn orchestrator_template_byte_matches_default_instructions_const() {
         assert!(!DEFAULT_ORCHESTRATOR_INSTRUCTIONS.is_empty());
         assert!(DEFAULT_ORCHESTRATOR_INSTRUCTIONS.contains("# You are the Orchestrator"));
-        assert!(DEFAULT_ORCHESTRATOR_INSTRUCTIONS
-            .contains("shelbi zen pr-create <task-id> --match-head-commit <head_sha>"));
-        assert!(DEFAULT_ORCHESTRATOR_INSTRUCTIONS
-            .contains("shelbi zen pr-merge <pr> --match-head-commit <head_sha>"));
+        assert!(DEFAULT_ORCHESTRATOR_INSTRUCTIONS.contains(
+            "shelbi zen pr-create <task-id> --match-repository <repository> --match-repository-id <repository_id> --match-base-branch <base_branch> --match-base-commit <base_sha> --match-head-commit <head_sha>"
+        ));
+        assert!(DEFAULT_ORCHESTRATOR_INSTRUCTIONS.contains(
+            "shelbi zen ci-watch <pr> --match-repository <repository> --match-repository-id <repository_id> --match-base-branch <base_branch> --match-base-commit <base_sha> --match-head-commit <head_sha>"
+        ));
+        assert!(DEFAULT_ORCHESTRATOR_INSTRUCTIONS.contains(
+            "shelbi zen pr-merge <pr> --match-repository <repository> --match-repository-id <repository_id> --match-base-branch <base_branch> --match-base-commit <base_sha> --match-head-commit <head_sha>"
+        ));
+        assert!(DEFAULT_ORCHESTRATOR_INSTRUCTIONS.contains("atomically leases only"));
         assert!(
             crate::zenmode::migrate_legacy_zen_commands(DEFAULT_ORCHESTRATOR_INSTRUCTIONS)
                 .is_none(),
