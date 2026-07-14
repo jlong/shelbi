@@ -118,7 +118,7 @@ what happened.
 
 ```text
 merge-transition -> probe -> local checks -> merge conflict -> diff size
-                 -> danger paths -> pr-create -> ci-watch -> pr-merge
+                 -> danger paths -> pinned pr-create -> ci-watch -> pinned pr-merge
 ```
 
 <Callout type="note" title="Back-compat fallback">
@@ -145,18 +145,28 @@ The conditions, in order:
    danger-paths list (built-ins + detected shape + project
    `zen.danger_paths.extend` + the active workflow's `zen.danger_paths`
    override, if any) bails out.
-5. **PR opens cleanly** via `shelbi zen pr-create`.
-6. **CI is green**: `shelbi zen ci-watch <pr> --task <id>` polls
+5. **PR opens cleanly** via
+   `shelbi zen pr-create <id> --match-head-commit <head_sha>`, where
+   `head_sha` is copied directly from the probe report. The PR is returned
+   only after its remote head matches that exact commit.
+6. **CI is green**: `shelbi zen ci-watch <pr> --task <id>` polls the PR
+   number returned by that pinned creation step. It runs
    `gh pr checks --required` until every required check settles. The
    `--task` flag resolves the timeout against the task's workflow
    (`zen.ci_timeout` override, then project default of `15m`); plain
    `--timeout <duration>` still overrides explicitly. Anything red or
    a timeout bails.
-7. **Merge** via `shelbi zen pr-merge`, using the workflow's
-   `merge_strategy` (default `squash`). The branch is deleted, the
-   task moves into the transition's `to` status (typically `done`),
-   and a `reason=orchestrator:zen-merge sha=<short>` line lands in the
-   events log.
+7. **Merge** via
+   `shelbi zen pr-merge <pr> --match-head-commit <head_sha>`, passing the
+   same probe SHA again. The command refuses to merge if the PR head moved
+   before or during CI. It uses the workflow's `merge_strategy` (default
+   `squash`), deletes the branch, moves the task into the transition's `to`
+   status (typically `done`), and writes a
+   `reason=orchestrator:zen-merge sha=<short>` line to the events log.
+
+The probe's `head_sha` is the contract for the whole sequence. It is not
+recomputed between steps: PR creation publishes that commit, CI watches the
+returned PR, and merge verifies that the PR still names the same commit.
 
 Each step uses a single-purpose CLI primitive. The Rust side does
 mechanical I/O; the orchestrator's prompt holds the policy. That

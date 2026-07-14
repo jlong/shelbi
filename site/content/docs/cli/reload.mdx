@@ -31,8 +31,9 @@ binary and you want the long-lived TUI surfaces to start using it.
 
 Pass a target to reload just one part in place without bouncing the whole hub
 (and, for `chat`, without losing the orchestrator's context). A targeted reload
-respawns only the named pane, leaves every other pane and its state untouched,
-and skips the whole-hub self-heal below.
+respawns only the named pane and leaves every other pane and its state
+untouched. Most targets skip the whole-hub self-heal below. `chat` first
+self-heals the agent automation that it is about to redeploy.
 
 | Target | Reloads |
 | --- | --- |
@@ -63,11 +64,13 @@ project YAMLs, so the markers are redundant.
 
 Reload also self-heals the shipped agent workspaces before respawning the
 orchestrator pane. User-customized `agents/*/instructions.md` files are
-preserved; for `agents/orchestrator/instructions.md`, Shelbi appends any
-missing runner-critical shipped sections, such as `Polling-only event drain`,
-instead of overwriting the whole file. That lets existing Codex-backed
-orchestrators pick up the required event-drain contract while keeping local
-prompt customizations.
+preserved. In `agents/orchestrator/instructions.md` and `zenmode.md`, Shelbi
+pins only exact legacy stock `pr-create` and `pr-merge` command snippets while
+leaving surrounding custom prose intact. It also appends any missing
+runner-critical orchestrator sections, such as `Polling-only event drain`,
+instead of overwriting the whole file. Both a whole-hub reload and
+`shelbi reload chat` apply these automation safeguards before the new
+orchestrator starts.
 
 ## Flags
 

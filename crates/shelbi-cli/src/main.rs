@@ -550,6 +550,7 @@ fn open_tui_log_file() -> Option<std::fs::File> {
 #[cfg(test)]
 mod cli_tests {
     use super::*;
+    use clap::error::ErrorKind;
     use clap::Parser;
     use commands::workspace::WorkspaceCmd;
 
@@ -686,6 +687,55 @@ mod cli_tests {
         // Bare `shelbi` (no subcommand) is still valid — it drives the
         // default TUI/first-run entry.
         assert!(Cli::try_parse_from(["shelbi"]).is_ok());
+    }
+
+    #[test]
+    fn zen_pr_commands_require_the_probed_head_sha() {
+        for argv in [
+            vec!["shelbi", "zen", "pr-create", "task-1"],
+            vec!["shelbi", "zen", "pr-merge", "42"],
+        ] {
+            let err = Cli::try_parse_from(&argv)
+                .expect_err("unpinned Zen PR operations must fail during argument parsing");
+            assert_eq!(err.kind(), ErrorKind::MissingRequiredArgument, "{err}");
+            assert!(err.to_string().contains("--match-head-commit"), "{err}");
+        }
+
+        let create = Cli::parse_from([
+            "shelbi",
+            "zen",
+            "pr-create",
+            "task-1",
+            "--match-head-commit",
+            "abc123",
+        ]);
+        assert!(matches!(
+            create.cmd,
+            Some(Cmd::Zen {
+                cmd: commands::zen::ZenCmd::PrCreate {
+                    task_id,
+                    match_head_commit,
+                },
+            }) if task_id == "task-1" && match_head_commit == "abc123"
+        ));
+
+        let merge = Cli::parse_from([
+            "shelbi",
+            "zen",
+            "pr-merge",
+            "42",
+            "--match-head-commit",
+            "abc123",
+        ]);
+        assert!(matches!(
+            merge.cmd,
+            Some(Cmd::Zen {
+                cmd: commands::zen::ZenCmd::PrMerge {
+                    pr_number: 42,
+                    match_head_commit,
+                },
+            }) if match_head_commit == "abc123"
+        ));
     }
 
     /// `--root <path>` is a top-level global flag — accepted before *or*

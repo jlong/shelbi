@@ -122,20 +122,23 @@ commit used for every check and fact.
 ## pr-create
 
 ```text
-shelbi zen pr-create [OPTIONS] <ID>
+shelbi zen pr-create <ID> --match-head-commit <SHA>
 ```
 
 Push the task's named branch and open a PR. Idempotent. If an open PR for
 the branch already exists, Shelbi updates the branch and returns its number
 only after the PR head matches the exact task branch commit that was pushed.
-Otherwise, it opens a new PR. Prints the PR number on stdout. Pass the probe's
-`head_sha` with `--match-head-commit` to reject any branch movement between
-review and PR creation.
+Otherwise, it opens a new PR. Prints the PR number on stdout.
 
-| Argument | Type | Default | Description |
+`--match-head-commit` is required. Pass the `head_sha` from the immediately
+preceding `probe` report. Shelbi rejects the operation if the durable task
+branch moved after the probe, so an older or newer commit cannot silently
+replace the commit whose checks and diff were reviewed.
+
+| Argument or flag | Type | Default | Description |
 | --- | --- | --- | --- |
 | `<ID>` | string | — | Task id whose branch to push and PR (required). |
-| `--match-head-commit <SHA>` | string | none | Require the task branch to match this probe SHA before pushing. |
+| `--match-head-commit <SHA>` | string | required | Require the task branch and published PR head to match this probe SHA. |
 
 ## ci-watch
 
@@ -154,6 +157,10 @@ branch-protection required checks configured, it watches only those; on an
 unprotected branch (or one with no required set) it falls back to every check
 reported on the PR, like `gh pr checks <pr>`.
 
+Watch the PR number returned by the pinned `pr-create` call and retain that
+probe's `head_sha`. The following `pr-merge` call requires the same SHA and
+refuses to merge if the PR head moved while CI was running.
+
 | Flag | Type | Default | Description |
 | --- | --- | --- | --- |
 | `<PR_NUMBER>` | integer | — | The PR number returned by `pr-create` (required). |
@@ -163,17 +170,19 @@ reported on the PR, like `gh pr checks <pr>`.
 ## pr-merge
 
 ```text
-shelbi zen pr-merge <PR_NUMBER>
+shelbi zen pr-merge <PR_NUMBER> --match-head-commit <SHA>
 ```
 
 Squash-merge the PR and delete its source branch. Prints the merge
 SHA on stdout. Use this only after `ci-watch` reports `green`.
-There's no built-in safeguard; the orchestrator's prompt is what
-sequences the checks.
+`--match-head-commit` is required and must receive the same probe
+`head_sha` passed to `pr-create`. Shelbi verifies the live PR head before
+merging, so a branch update during CI stops the merge.
 
-| Argument | Type | Default | Description |
+| Argument or flag | Type | Default | Description |
 | --- | --- | --- | --- |
 | `<PR_NUMBER>` | integer | — | The PR number to merge (required). |
+| `--match-head-commit <SHA>` | string | required | Require the live PR head to equal the probe SHA before merging. |
 
 ## Examples
 

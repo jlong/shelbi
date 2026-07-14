@@ -81,7 +81,7 @@ pub enum ZenCmd {
         /// pushed (the `head_sha` field of the probe report). On mismatch,
         /// re-run `shelbi zen probe` and retry with the fresh SHA.
         #[arg(long, value_name = "SHA")]
-        match_head_commit: Option<String>,
+        match_head_commit: String,
     },
     /// Watch the PR's checks until they settle or the timeout fires.
     /// Prints `green` / `red:<check>:<summary>` / `timeout` on stdout.
@@ -115,11 +115,9 @@ pub enum ZenCmd {
     /// Squash-merge the PR and delete the source branch. Prints the
     /// merge SHA on stdout.
     ///
-    /// Always pass `--match-head-commit` with the `head_sha` from the
-    /// probe report: the merge is then pinned to exactly the commit the
-    /// probe and ci-watch evaluated, and GitHub refuses if the branch
-    /// gained commits since. Omitting it merges whatever the PR head is
-    /// *now* — only acceptable for manual invocations that never probed.
+    /// `--match-head-commit` is required so the merge is pinned to exactly
+    /// the commit the probe and ci-watch evaluated. GitHub refuses if the
+    /// branch gained commits since.
     PrMerge {
         pr_number: u64,
         /// Head SHA the PR must still be at for the merge to proceed
@@ -127,7 +125,7 @@ pub enum ZenCmd {
         /// merge fails loudly — re-run `shelbi zen probe` and retry
         /// with the fresh SHA.
         #[arg(long, value_name = "SHA")]
-        match_head_commit: Option<String>,
+        match_head_commit: String,
     },
     /// Print backlog task ids that are mechanically eligible for Zen
     /// auto-promotion, one per line, in priority order. Mechanical only —
@@ -206,16 +204,13 @@ pub fn run(project_opt: Option<String>, cmd: ZenCmd) -> Result<()> {
         } => {
             let project = load_project(&project_name).map_err(|e| anyhow!(e))?;
             let tf = shelbi_state::load_task(&project_name, &task_id).map_err(|e| anyhow!(e))?;
-            let pr = match match_head_commit.as_deref() {
-                Some(expected_head) => zen::pr_create_at_head(
-                    &project,
-                    &project_name,
-                    &tf.task,
-                    &tf.body,
-                    expected_head,
-                ),
-                None => zen::pr_create(&project, &project_name, &tf.task, &tf.body),
-            }
+            let pr = zen::pr_create_at_head(
+                &project,
+                &project_name,
+                &tf.task,
+                &tf.body,
+                &match_head_commit,
+            )
             .map_err(|e| anyhow!(e))?;
             println!("{pr}");
             Ok(())
@@ -263,9 +258,7 @@ pub fn run(project_opt: Option<String>, cmd: ZenCmd) -> Result<()> {
             match_head_commit,
         } => {
             let project = load_project(&project_name).map_err(|e| anyhow!(e))?;
-            match zen::pr_merge(&project, pr_number, match_head_commit.as_deref())
-                .map_err(|e| anyhow!(e))?
-            {
+            match zen::pr_merge(&project, pr_number, &match_head_commit).map_err(|e| anyhow!(e))? {
                 Some(sha) => println!("{sha}"),
                 // Merged, but GitHub hadn't recorded the merge commit yet
                 // when polling gave up — success, just without a SHA.

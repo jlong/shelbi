@@ -466,8 +466,11 @@ fn scaffold_project(resolved: &ResolvedProjectRoot, mode: InitMode) -> Result<()
 
     write_workspace_settings_template(&resolved.name)?;
 
+    // Init is idempotent for an existing project. Use the same provenance-
+    // aware self-heal as reload so an upgrade cannot leave stock unpinned Zen
+    // commands in an already-materialized orchestrator prompt.
     let outcomes =
-        shelbi_state::materialize_default_agents(&resolved.name).map_err(|e| anyhow!(e))?;
+        shelbi_state::self_heal_default_agents(&resolved.name).map_err(|e| anyhow!(e))?;
     for outcome in outcomes {
         print_agent_materialize_outcome(&outcome);
     }
@@ -484,14 +487,22 @@ fn scaffold_project(resolved: &ResolvedProjectRoot, mode: InitMode) -> Result<()
         shelbi_state::scaffold_project_statuses(&resolved.name).map_err(|e| anyhow!(e))?;
         println!("✓ wrote project statuses: {}", statuses_path.display());
     }
-    // The user-owned Zen policy definition. First line is the one-line Zen
-    // summary the heartbeat re-injects; the rest is the auto-promote + merge
-    // policy. Written only when absent so user edits survive re-runs.
-    if shelbi_state::scaffold_zenmode(&resolved.name).map_err(|e| anyhow!(e))?
-        == shelbi_state::ZenmodeOutcome::Created
-    {
-        let zenmode_path = shelbi_state::zenmode_path(&resolved.name).map_err(|e| anyhow!(e))?;
-        println!("✓ wrote Zen policy: {}", zenmode_path.display());
+    // The user-owned Zen policy definition. Custom prose survives re-runs;
+    // exact legacy unpinned PR commands are migrated in place so automation
+    // cannot keep following an unsafe stock sequence after an upgrade.
+    match shelbi_state::scaffold_zenmode(&resolved.name).map_err(|e| anyhow!(e))? {
+        shelbi_state::ZenmodeOutcome::Created => {
+            let path = shelbi_state::zenmode_path(&resolved.name).map_err(|e| anyhow!(e))?;
+            println!("✓ wrote Zen policy: {}", path.display());
+        }
+        shelbi_state::ZenmodeOutcome::Migrated => {
+            let path = shelbi_state::zenmode_path(&resolved.name).map_err(|e| anyhow!(e))?;
+            println!(
+                "✓ pinned legacy Zen PR commands in {} (custom prose preserved)",
+                path.display()
+            );
+        }
+        shelbi_state::ZenmodeOutcome::Unchanged => {}
     }
     Ok(())
 }
@@ -649,7 +660,7 @@ fn run_pick_up(args: Args) -> Result<PickUpOutcome> {
 
     write_workspace_settings_template(&local_alias)?;
     let outcomes =
-        shelbi_state::materialize_default_agents(&local_alias).map_err(|e| anyhow!(e))?;
+        shelbi_state::self_heal_default_agents(&local_alias).map_err(|e| anyhow!(e))?;
     for outcome in outcomes {
         print_agent_materialize_outcome(&outcome);
     }
@@ -662,11 +673,19 @@ fn run_pick_up(args: Args) -> Result<PickUpOutcome> {
     for path in shelbi_state::scaffold_project_workflow(&local_alias).map_err(|e| anyhow!(e))? {
         println!("✓ wrote project workflow: {}", path.display());
     }
-    if shelbi_state::scaffold_zenmode(&local_alias).map_err(|e| anyhow!(e))?
-        == shelbi_state::ZenmodeOutcome::Created
-    {
-        let zenmode_path = shelbi_state::zenmode_path(&local_alias).map_err(|e| anyhow!(e))?;
-        println!("✓ wrote Zen policy: {}", zenmode_path.display());
+    match shelbi_state::scaffold_zenmode(&local_alias).map_err(|e| anyhow!(e))? {
+        shelbi_state::ZenmodeOutcome::Created => {
+            let path = shelbi_state::zenmode_path(&local_alias).map_err(|e| anyhow!(e))?;
+            println!("✓ wrote Zen policy: {}", path.display());
+        }
+        shelbi_state::ZenmodeOutcome::Migrated => {
+            let path = shelbi_state::zenmode_path(&local_alias).map_err(|e| anyhow!(e))?;
+            println!(
+                "✓ pinned legacy Zen PR commands in {} (custom prose preserved)",
+                path.display()
+            );
+        }
+        shelbi_state::ZenmodeOutcome::Unchanged => {}
     }
 
     println!();
@@ -834,6 +853,12 @@ pub(super) fn print_agent_materialize_outcome(outcome: &AgentMaterializeOutcome)
                 println!("(preserved your custom agents/{agent}/instructions.md)");
             }
         }
+        AgentMaterializeOutcome::MigratedZenCommands { agent, .. } => {
+            println!(
+                "✓ pinned legacy Zen PR commands in custom agents/{agent}/instructions.md \
+                 (all other prose preserved)"
+            );
+        }
         AgentMaterializeOutcome::RepairedRequiredSections {
             agent, sections, ..
         } => {
@@ -974,8 +999,66 @@ mod tests {
             "re-run should have materialized default agents"
         );
 
-        // And a second re-run is a clean no-op (still idempotent).
+        // Simulate an existing installation whose customized policy still
+        // carries the exact stock unpinned command snippets. Idempotent init
+        // must apply the narrow safety migration before this automation can
+        // be reloaded, while retaining all surrounding prose.
+        let orchestrator_path =
+            shelbi_state::agent_instructions_path("halfapp", shelbi_state::ORCHESTRATOR_AGENT)
+                .unwrap();
+        let mut orchestrator = std::fs::read_to_string(&orchestrator_path)
+            .unwrap()
+            .replace(
+                "shelbi zen pr-create <task-id> --match-head-commit <head_sha>",
+                "shelbi zen pr-create <task-id>",
+            )
+            .replace(
+                "shelbi zen pr-merge <pr> --match-head-commit <head_sha>",
+                "shelbi zen pr-merge <pr>",
+            );
+        orchestrator.push_str("\nLocal orchestrator suffix.\n");
+        std::fs::write(&orchestrator_path, orchestrator).unwrap();
+
+        let zenmode_path = shelbi_state::zenmode_path("halfapp").unwrap();
+        let mut zenmode = std::fs::read_to_string(&zenmode_path)
+            .unwrap()
+            .replace(
+                "shelbi zen pr-create <task-id> --match-head-commit <head_sha>",
+                "shelbi zen pr-create <task-id>",
+            )
+            .replace(
+                "shelbi zen pr-merge <pr-number> --match-head-commit <head_sha>",
+                "shelbi zen pr-merge <pr-number>",
+            );
+        zenmode.push_str("\nLocal Zen suffix.\n");
+        std::fs::write(&zenmode_path, zenmode).unwrap();
+
         scaffold_project(&resolved, InitMode::Global).unwrap();
+        let migrated_orchestrator = std::fs::read_to_string(&orchestrator_path).unwrap();
+        assert!(migrated_orchestrator
+            .contains("shelbi zen pr-create <task-id> --match-head-commit <head_sha>"));
+        assert!(migrated_orchestrator
+            .contains("shelbi zen pr-merge <pr> --match-head-commit <head_sha>"));
+        assert!(migrated_orchestrator.contains("Local orchestrator suffix."));
+        let migrated_zenmode = std::fs::read_to_string(&zenmode_path).unwrap();
+        assert!(migrated_zenmode
+            .contains("shelbi zen pr-create <task-id> --match-head-commit <head_sha>"));
+        assert!(migrated_zenmode
+            .contains("shelbi zen pr-merge <pr-number> --match-head-commit <head_sha>"));
+        assert!(migrated_zenmode.contains("Local Zen suffix."));
+
+        // A later re-run is a clean no-op (still idempotent).
+        let orchestrator_after_migration = migrated_orchestrator.clone();
+        let zenmode_after_migration = migrated_zenmode.clone();
+        scaffold_project(&resolved, InitMode::Global).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&orchestrator_path).unwrap(),
+            orchestrator_after_migration
+        );
+        assert_eq!(
+            std::fs::read_to_string(&zenmode_path).unwrap(),
+            zenmode_after_migration
+        );
 
         std::env::remove_var("SHELBI_HOME");
     }

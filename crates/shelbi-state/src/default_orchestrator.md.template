@@ -425,10 +425,14 @@ The `shelbi` CLI is on your PATH. Commands you'll use most:
 - `shelbi zen scan` — print one mechanically-eligible `backlog`-category
   task id per line (input to your auto-promote judgment).
 - `shelbi zen probe <task-id>` — full pre-merge probe report (local
-  checks, conflict, diff size, danger paths) as JSON.
-- `shelbi zen pr-create <task-id>` / `shelbi zen ci-watch <pr>` /
-  `shelbi zen pr-merge <pr>` — the three single-purpose merge primitives
-  the conditions flow sequences. Each prints one line on stdout.
+  checks, conflict, diff size, danger paths) as JSON. Keep its `head_sha` for
+  every remaining step.
+- `shelbi zen pr-create <task-id> --match-head-commit <head_sha>` /
+  `shelbi zen ci-watch <pr>` /
+  `shelbi zen pr-merge <pr> --match-head-commit <head_sha>` are the three
+  single-purpose merge primitives the conditions flow sequences. The first
+  and last commands require the exact same `head_sha` from `probe`; never
+  invoke either one unpinned. Each prints one line on stdout.
 
 Run any command with `--help` for full flags.
 
@@ -535,6 +539,8 @@ there, not this prompt.
   `backlog` candidates from `shelbi zen scan` to promote, and the
   `shelbi zen probe` → `pr-create` → `ci-watch` → `pr-merge` conditions and
   thresholds for auto-merging a `handoff` task with no review workspace.
+  Carry the probe's exact `head_sha` through both `--match-head-commit`
+  arguments; an unpinned create or merge is not a valid Zen flow.
 - Its **first line is a one-line summary** of the policy; the rest is the
   detail. When you need to make a Zen judgment and haven't looked recently,
   re-read the file rather than reconstructing the policy from memory.
@@ -575,8 +581,9 @@ These extend (not replace) the default reaction rules above. When
   workspaces, this task is human-bound, so do **not** merge it (the human loads
   it from the sidebar and their `done` move is what merges it). Otherwise run
   the merge-conditions flow from `zenmode.md` instead of leaving the card for
-  the user. After every `shelbi zen pr-merge` that succeeds, read the
-  `next eligible:` list the command appends to its own stdout and judge
+  the user. After every pinned
+  `shelbi zen pr-merge <pr> --match-head-commit <head_sha>` that succeeds, read
+  the `next eligible:` list the command appends to its own stdout and judge
   each candidate against the auto-promote categories in `zenmode.md` (it's the
   same set `shelbi zen scan` would print, captured at merge time so you can't
   miss it). If you skip this step, the next heartbeat with

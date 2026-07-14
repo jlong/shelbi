@@ -18,7 +18,7 @@
 //! while still leaning on gh's own exit-code contract (0 / 1 / 8) for the
 //! verdict.
 
-use std::path::PathBuf;
+use std::path::{Component, PathBuf};
 use std::process::Output;
 use std::time::{Duration, Instant};
 
@@ -215,24 +215,10 @@ fn red_from_output(stdout: &str, stderr: &str) -> PollOutcome {
     PollOutcome::Red { check, summary }
 }
 
-/// Push the task's branch and open a PR. Idempotent: if an open PR for the
-/// branch already exists, reuse it after verifying that its head is the exact
-/// task branch commit that was pushed.
-///
-/// This compatibility entry point snapshots the task branch when called. Zen
-/// flows that already probed the branch should call [`pr_create_at_head`] so a
-/// branch move between the probe and this operation is rejected too.
-pub fn pr_create(
-    project: &Project,
-    project_name: &str,
-    task: &Task,
-    task_body: &str,
-) -> Result<u64> {
-    pr_create_impl(project, project_name, task, task_body, None)
-}
-
-/// [`pr_create`] pinned to the exact branch commit previously reviewed by a
-/// Zen probe.
+/// Push the task's branch and open a PR, pinned to the exact branch commit
+/// previously reviewed by a Zen probe. Idempotent: if an open PR for the
+/// branch already exists, reuse it only after verifying that its head is the
+/// exact task branch commit that was pushed.
 pub fn pr_create_at_head(
     project: &Project,
     project_name: &str,
@@ -240,7 +226,7 @@ pub fn pr_create_at_head(
     task_body: &str,
     expected_head: &str,
 ) -> Result<u64> {
-    pr_create_impl(project, project_name, task, task_body, Some(expected_head))
+    pr_create_impl(project, project_name, task, task_body, expected_head)
 }
 
 fn pr_create_impl(
@@ -248,7 +234,7 @@ fn pr_create_impl(
     project_name: &str,
     task: &Task,
     task_body: &str,
-    expected_head: Option<&str>,
+    expected_head: &str,
 ) -> Result<u64> {
     let (host, worktree) = locate_workspace_worktree(project, task)?;
     let wt = worktree.to_string_lossy().into_owned();
@@ -265,9 +251,9 @@ fn pr_create_impl(
     let local_ref = format!("refs/heads/{branch}");
     let branch_commit = format!("{local_ref}^{{commit}}");
     let operation_head = probe_head_sha(&host, &worktree, &branch_commit)?;
-    if let Some(expected) = expected_head.filter(|sha| *sha != operation_head) {
+    if expected_head != operation_head {
         return Err(Error::Other(format!(
-            "task branch `{branch}` moved since it was probed: expected {expected}, found \
+            "task branch `{branch}` moved since it was probed: expected {expected_head}, found \
              {operation_head}; refusing to push or report a PR ready for CI or merge \
              (re-run `shelbi zen probe {}`)",
             task.id
@@ -543,12 +529,10 @@ fn merge_state_status(host: &Host, wt: &str, pr_str: &str) -> Result<String> {
 /// next dispatch.
 ///
 /// `expected_head` pins the merge to the exact commit the probe and
-/// ci-watch evaluated: when `Some`, gh receives `--match-head-commit
-/// <sha>` and refuses server-side if the PR head has moved since — the
-/// TOCTOU window between "checks were green on X" and "merge whatever
-/// the head is now" is closed at the source. `None` preserves the
-/// unpinned behavior for manual invocations that never probed.
-pub fn pr_merge(project: &Project, pr: u64, expected_head: Option<&str>) -> Result<Option<String>> {
+/// ci-watch evaluated. GitHub receives `--match-head-commit <sha>` and
+/// refuses server-side if the PR head has moved since, closing the TOCTOU
+/// window between "checks were green on X" and the merge.
+pub fn pr_merge(project: &Project, pr: u64, expected_head: &str) -> Result<Option<String>> {
     let (host, dir) = locate_hub_workdir(project)?;
     let wt = dir.to_string_lossy().into_owned();
     let pr_str = pr.to_string();
@@ -559,18 +543,16 @@ pub fn pr_merge(project: &Project, pr: u64, expected_head: Option<&str>) -> Resu
     let out = run_in_dir(&host, &wt, &argv)?;
     if !out.status.success() {
         let mut stderr = String::from_utf8_lossy(&out.stderr).into_owned();
-        if let Some(sha) = expected_head {
-            // gh's own message names the mismatched SHAs but not the fix;
-            // tell the orchestrator what to do about it.
-            if !stderr.is_empty() && !stderr.ends_with('\n') {
-                stderr.push('\n');
-            }
-            stderr.push_str(&format!(
-                "shelbi: merge was pinned to head {sha} — if the branch \
-                 gained commits since the probe, re-run `shelbi zen probe` \
-                 (and ci-watch) and retry with the new head_sha"
-            ));
+        // gh's own message names the mismatched SHAs but not the fix;
+        // tell the orchestrator what to do about it.
+        if !stderr.is_empty() && !stderr.ends_with('\n') {
+            stderr.push('\n');
         }
+        stderr.push_str(&format!(
+            "shelbi: merge was pinned to head {expected_head} — if the branch \
+             gained commits since the probe, re-run `shelbi zen probe` \
+             (and ci-watch) and retry with the new head_sha"
+        ));
         return Err(Error::Command {
             cmd: args.join(" "),
             status: out.status.to_string(),
@@ -637,15 +619,13 @@ fn delete_remote_head_branch(host: &Host, wt: &str, pr_str: &str) {
 /// the task branch checked out (the normal case in shelbi's flow) and gh
 /// then propagates the cleanup failure as a non-zero exit even though the
 /// merge landed. [`pr_merge`] deletes the remote branch itself afterward.
-pub fn pr_merge_args(pr: &str, strategy_flag: &str, expected_head: Option<&str>) -> Vec<String> {
+pub fn pr_merge_args(pr: &str, strategy_flag: &str, expected_head: &str) -> Vec<String> {
     let mut args: Vec<String> = ["gh", "pr", "merge", pr, strategy_flag]
         .iter()
         .map(|s| s.to_string())
         .collect();
-    if let Some(sha) = expected_head {
-        args.push("--match-head-commit".to_string());
-        args.push(sha.to_string());
-    }
+    args.push("--match-head-commit".to_string());
+    args.push(expected_head.to_string());
     args
 }
 
@@ -737,8 +717,8 @@ mod tests {
     }
 
     #[test]
-    fn pr_merge_args_pins_to_expected_head_when_given() {
-        let args = pr_merge_args("42", "--squash", Some("abc123"));
+    fn pr_merge_args_always_pins_to_expected_head() {
+        let args = pr_merge_args("42", "--squash", "abc123");
         assert_eq!(
             args,
             vec![
@@ -754,23 +734,12 @@ mod tests {
     }
 
     #[test]
-    fn pr_merge_args_stays_unpinned_without_expected_head() {
-        // Manual invocations that never probed keep the legacy shape —
-        // no stray `--match-head-commit` flag with nothing to match.
-        let args = pr_merge_args("7", "--merge", None);
-        assert_eq!(args, vec!["gh", "pr", "merge", "7", "--merge"]);
-        assert!(!args.iter().any(|a| a == "--match-head-commit"));
-    }
-
-    #[test]
     fn pr_merge_args_never_deletes_branch() {
         // `--delete-branch` would also delete the local branch, which fails
         // when the finishing workspace's worktree still has it checked out;
         // pr_merge deletes only the remote branch afterward instead.
-        let pinned = pr_merge_args("1", "--squash", Some("sha"));
-        let unpinned = pr_merge_args("1", "--squash", None);
-        assert!(!pinned.iter().any(|a| a == "--delete-branch"));
-        assert!(!unpinned.iter().any(|a| a == "--delete-branch"));
+        let args = pr_merge_args("1", "--squash", "sha");
+        assert!(!args.iter().any(|a| a == "--delete-branch"));
     }
 
     #[test]
@@ -1484,7 +1453,7 @@ esac
     }
 
     #[test]
-    fn current_open_pr_is_verified_and_reused() {
+    fn current_open_pr_is_verified_and_reused_at_the_probed_head() {
         let _lock = crate::test_lock::acquire();
         let (base, origin, worktree) = setup_repo(true);
         // Finished workspaces are normally detached at handoff. The branch
@@ -1497,7 +1466,13 @@ esac
         let log = install_gh_stub(stub.path(), &origin, Some(21), None);
         let result = {
             let _env = EnvGuard::install(stub.path());
-            pr_create(&project(base.path()), PROJECT_NAME, &task(), "body")
+            pr_create_at_head(
+                &project(base.path()),
+                PROJECT_NAME,
+                &task(),
+                "body",
+                &reviewed_head,
+            )
         };
 
         assert_eq!(result.unwrap(), 21);
@@ -1766,6 +1741,7 @@ pub fn probe_in_workflow(
     let _workspace_lock = shelbi_state::lock_workspace(&project.name, &workspace.name)?;
     let host = machine.host();
     let repository_anchor = workspace_worktree(&machine, workspace);
+    let shared_cargo_target = machine.work_dir.join("target");
     let branch = normalize_probe_branch(branch)?;
     let task_ref = format!("refs/heads/{branch}");
     let initial_head =
@@ -1785,6 +1761,7 @@ pub fn probe_in_workflow(
         task,
         &host,
         &repository_anchor,
+        &shared_cargo_target,
         &probe_worktree,
         &branch,
         &task_ref,
@@ -1811,6 +1788,7 @@ fn probe_isolated_task_ref(
     task: &Task,
     host: &Host,
     repository_anchor: &std::path::Path,
+    shared_cargo_target: &std::path::Path,
     probe_worktree: &std::path::Path,
     branch: &str,
     task_ref: &str,
@@ -1876,7 +1854,16 @@ fn probe_isolated_task_ref(
     let local_checks = if rebase_conflict.conflicts {
         Vec::new()
     } else {
-        probe_local_checks(host, probe_worktree, project, workflow, task)?
+        probe_local_checks(
+            host,
+            repository_anchor,
+            probe_worktree,
+            shared_cargo_target,
+            &head_sha,
+            project,
+            workflow,
+            task,
+        )?
     };
 
     let final_temp_head = probe_head_sha(host, probe_worktree, "HEAD^{commit}")?;
@@ -2140,9 +2127,13 @@ fn resolve_workspace<'a>(
 // ---------------------------------------------------------------------------
 // local_checks
 
+#[allow(clippy::too_many_arguments)]
 fn probe_local_checks(
     host: &Host,
+    repository_anchor: &std::path::Path,
     worktree: &std::path::Path,
+    shared_cargo_target: &std::path::Path,
+    expected_head: &str,
     project: &Project,
     workflow: Option<&Workflow>,
     task: &Task,
@@ -2153,6 +2144,7 @@ fn probe_local_checks(
     }
 
     ensure_worktree_present(host, worktree)?;
+    bootstrap_isolated_node_dependencies(host, repository_anchor, worktree)?;
 
     // Best-effort log file on the hub. A failure here just means the log
     // is missing; it doesn't block the probe.
@@ -2163,13 +2155,405 @@ fn probe_local_checks(
 
     let mut out = Vec::with_capacity(commands.len());
     for cmd in commands {
-        let res = run_one_check(host, worktree, &cmd);
+        let mut res =
+            run_one_check_with_shared_cargo_target(host, worktree, &cmd, Some(shared_cargo_target));
+        let checkout_changed = verify_check_checkout(host, worktree, expected_head, &mut res)?;
         if let Some(p) = &log_path {
             let _ = append_log(p, &res);
         }
         out.push(res);
+        if checkout_changed {
+            // Even ignored build artifacts may now have been derived from
+            // changed source. Do not let a later check observe them.
+            break;
+        }
     }
     Ok(out)
+}
+
+/// Keep every command in a multi-check probe pinned to the same commit. Build
+/// artifacts in ignored paths may survive for later checks, but changes to
+/// tracked/index content, a moved HEAD, or new non-ignored source files make
+/// the check fail and stop the sequence before another command can observe
+/// state derived from those changes.
+fn verify_check_checkout(
+    host: &Host,
+    worktree: &std::path::Path,
+    expected_head: &str,
+    check: &mut LocalCheck,
+) -> Result<bool> {
+    let wt = worktree.to_string_lossy().into_owned();
+    let actual_head = probe_head_sha(host, worktree, "HEAD^{commit}")?;
+    let status = shelbi_ssh::run_capture(
+        host,
+        [
+            "git",
+            "-C",
+            wt.as_str(),
+            "status",
+            "--porcelain=v1",
+            "--untracked-files=all",
+        ],
+    )?;
+    if actual_head == expected_head && status.trim().is_empty() {
+        return Ok(false);
+    }
+
+    if check.exit_code == 0 {
+        check.exit_code = 1;
+    }
+    let mut detail = Vec::new();
+    if actual_head != expected_head {
+        detail.push(format!("HEAD moved to {actual_head}"));
+    }
+    if !status.trim().is_empty() {
+        detail.push(format!("working tree changed: {}", status.trim()));
+    }
+    let combined = format!(
+        "{}\nshelbi: local check changed the isolated checkout ({}) - remaining local checks \
+         were skipped so no result can drift from probed commit {expected_head}",
+        check.output_tail.trim_end(),
+        detail.join("; ")
+    );
+    check.output_tail = tail_lines(&combined, OUTPUT_TAIL_LINES);
+    Ok(true)
+}
+
+/// Populate dependency directories that Git intentionally omits from a fresh
+/// worktree. Package roots come from the exact reviewed commit, while the
+/// installed `node_modules` source comes from the persistent repository
+/// workspace on the same machine. Each tree is copied independently into the
+/// isolated checkout. Symlinks are preserved only when their fully resolved
+/// target stays inside that checkout, retaining package-manager layout without
+/// leaving a write-through path into the replacement task or an external store.
+///
+/// Copy-on-write is preferred on macOS (`cp -cR`) and reflink-capable GNU
+/// systems (`cp -a --reflink=auto`). The portable recursive fallback favors
+/// correctness over speed when neither optimization exists.
+fn bootstrap_isolated_node_dependencies(
+    host: &Host,
+    repository_anchor: &std::path::Path,
+    probe_worktree: &std::path::Path,
+) -> Result<()> {
+    let probe = probe_worktree.to_string_lossy().into_owned();
+    let mut dependency_roots = Vec::new();
+    let package_paths = shelbi_ssh::run_capture(
+        host,
+        [
+            "git",
+            "-C",
+            probe.as_str(),
+            "ls-files",
+            "-z",
+            "--",
+            "package.json",
+            ":(glob)**/package.json",
+        ],
+    )?;
+
+    for raw in package_paths.split_terminator('\0') {
+        let package_path = std::path::Path::new(raw);
+        if package_path.file_name().and_then(|name| name.to_str()) != Some("package.json")
+            || !package_path
+                .components()
+                .all(|part| matches!(part, Component::Normal(_)))
+        {
+            return Err(Error::Other(format!(
+                "refusing to import installed dependencies for unsafe package path `{raw}`"
+            )));
+        }
+
+        let package_dir = package_path
+            .parent()
+            .unwrap_or_else(|| std::path::Path::new(""));
+        let relative_dependencies = package_dir.join("node_modules");
+        let source = repository_anchor.join(&relative_dependencies);
+        let destination = probe_worktree.join(&relative_dependencies);
+        let source_text = source.to_string_lossy().into_owned();
+        let destination_text = destination.to_string_lossy().into_owned();
+
+        let destination_exists =
+            shelbi_ssh::run(host, ["test", "-e", destination_text.as_str()]).map_err(Error::Io)?;
+        let destination_is_link =
+            shelbi_ssh::run(host, ["test", "-L", destination_text.as_str()]).map_err(Error::Io)?;
+        if destination_exists.status.success() || destination_is_link.status.success() {
+            // A project that deliberately tracks node_modules already has
+            // the reviewed content in the isolated checkout. Never overlay
+            // persistent ignored state on top of it, but still validate its
+            // links against the same no-escape rule.
+            dependency_roots.push(destination);
+            continue;
+        }
+
+        let source_exists =
+            shelbi_ssh::run(host, ["test", "-d", source_text.as_str()]).map_err(Error::Io)?;
+        if !source_exists.status.success() {
+            continue;
+        }
+
+        copy_dependency_tree(host, &source, &destination)?;
+        dependency_roots.push(destination);
+    }
+    validate_isolated_dependency_links(host, probe_worktree, &dependency_roots)
+}
+
+fn copy_dependency_tree(
+    host: &Host,
+    source: &std::path::Path,
+    destination: &std::path::Path,
+) -> Result<()> {
+    // Appending `/.` follows a top-level node_modules symlink, if present,
+    // while recursive copy semantics retain internal links such as .bin
+    // entries. The caller validates every copied link before checks run.
+    let source_contents = format!("{}/.", source.to_string_lossy());
+    let destination_text = destination.to_string_lossy().into_owned();
+    let attempts = [
+        vec![
+            "cp",
+            "-cR",
+            source_contents.as_str(),
+            destination_text.as_str(),
+        ],
+        vec![
+            "cp",
+            "-a",
+            "--reflink=auto",
+            source_contents.as_str(),
+            destination_text.as_str(),
+        ],
+        vec![
+            "cp",
+            "-R",
+            source_contents.as_str(),
+            destination_text.as_str(),
+        ],
+    ];
+    let mut diagnostics = Vec::new();
+
+    for args in attempts {
+        let out = shelbi_ssh::run(host, args.iter().copied()).map_err(Error::Io)?;
+        if out.status.success() {
+            return Ok(());
+        }
+        let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
+        if !stderr.is_empty() {
+            diagnostics.push(stderr);
+        }
+
+        // An unsupported option normally fails before creating anything, but
+        // clean a possible partial destination before trying the next copy
+        // strategy. The path is generated beneath the isolated worktree and
+        // always ends in a validated package-root `node_modules` component.
+        let cleanup =
+            shelbi_ssh::run(host, ["rm", "-rf", destination_text.as_str()]).map_err(Error::Io)?;
+        if !cleanup.status.success() {
+            return Err(Error::Command {
+                cmd: format!("rm -rf {destination_text}"),
+                status: cleanup.status.to_string(),
+                stderr: String::from_utf8_lossy(&cleanup.stderr).into_owned(),
+            });
+        }
+    }
+
+    Err(Error::Other(format!(
+        "could not copy installed dependencies from {} into the isolated Zen probe at {}{}",
+        source.display(),
+        destination.display(),
+        if diagnostics.is_empty() {
+            String::new()
+        } else {
+            format!(": {}", diagnostics.join("; "))
+        }
+    )))
+}
+
+fn validate_isolated_dependency_links(
+    host: &Host,
+    probe_worktree: &std::path::Path,
+    dependency_roots: &[PathBuf],
+) -> Result<()> {
+    if dependency_roots.is_empty() {
+        return Ok(());
+    }
+
+    // One remote round trip collects path/target NUL-delimited pairs. `find`
+    // does not follow links, so a hostile cycle cannot make the scan recurse
+    // outside the disposable worktree.
+    let probe = probe_worktree.to_string_lossy().into_owned();
+    let scan_script = r#"find "$1" -type l -exec sh -c '
+for link do
+    printf "%s\\000" "$link" || exit 1
+    readlink "$link" || exit 1
+    printf "\\000" || exit 1
+done
+' sh {} +"#;
+    let out = shelbi_ssh::run(host, ["sh", "-c", scan_script, "sh", probe.as_str()])
+        .map_err(Error::Io)?;
+    if !out.status.success() {
+        return Err(Error::Command {
+            cmd: format!("find {probe} -type l -exec readlink"),
+            status: out.status.to_string(),
+            stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
+        });
+    }
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    if stdout.contains('\u{fffd}') {
+        return Err(Error::Other(
+            "refusing to validate installed dependency links with non-UTF-8 paths".into(),
+        ));
+    }
+    let fields: Vec<&str> = stdout.split_terminator('\0').collect();
+    if fields.len() % 2 != 0 {
+        return Err(Error::Other(
+            "installed dependency link scan returned an incomplete path/target pair".into(),
+        ));
+    }
+
+    let probe_root = normalize_absolute_path(probe_worktree).ok_or_else(|| {
+        Error::Other(format!(
+            "isolated Zen probe path `{}` is not a safe absolute path",
+            probe_worktree.display()
+        ))
+    })?;
+    let dependency_roots: Vec<PathBuf> = dependency_roots
+        .iter()
+        .map(|path| {
+            normalize_absolute_path(path).ok_or_else(|| {
+                Error::Other(format!(
+                    "isolated dependency path `{}` is not a safe absolute path",
+                    path.display()
+                ))
+            })
+        })
+        .collect::<Result<_>>()?;
+    let mut links = std::collections::HashMap::new();
+    for pair in fields.chunks_exact(2) {
+        let path = normalize_absolute_path(std::path::Path::new(pair[0])).ok_or_else(|| {
+            Error::Other(format!(
+                "installed dependency link `{}` is not a safe absolute path",
+                pair[0]
+            ))
+        })?;
+        let target = pair[1].strip_suffix('\n').unwrap_or(pair[1]);
+        links.insert(path, PathBuf::from(target));
+    }
+
+    for link in links
+        .keys()
+        .filter(|link| dependency_roots.iter().any(|root| link.starts_with(root)))
+    {
+        let resolved = resolve_link_path(link, &links).ok_or_else(|| {
+            Error::Other(format!(
+                "installed dependency link `{}` has a cyclic or unsafe target; refusing to run \
+                 isolated Zen checks",
+                link.display()
+            ))
+        })?;
+        if !resolved.starts_with(&probe_root) {
+            return Err(Error::Other(format!(
+                "installed dependency link `{}` resolves outside the isolated Zen checkout to \
+                 `{}`; refusing to run checks because writes could escape into persistent state",
+                link.display(),
+                resolved.display()
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn normalize_absolute_path(path: &std::path::Path) -> Option<PathBuf> {
+    if !path.is_absolute() {
+        return None;
+    }
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::Prefix(prefix) => normalized.push(prefix.as_os_str()),
+            Component::RootDir => normalized.push(std::path::MAIN_SEPARATOR_STR),
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if !normalized.pop() {
+                    return None;
+                }
+            }
+            Component::Normal(part) => normalized.push(part),
+        }
+    }
+    Some(normalized)
+}
+
+fn resolve_link_path(
+    start: &std::path::Path,
+    links: &std::collections::HashMap<PathBuf, PathBuf>,
+) -> Option<PathBuf> {
+    if !start.is_absolute() {
+        return None;
+    }
+    let mut pending = owned_path_components(start);
+    let mut resolved = PathBuf::new();
+    let mut followed_links = 0usize;
+
+    while let Some(component) = pending.pop_front() {
+        match component {
+            OwnedPathComponent::Prefix(prefix) => {
+                resolved.clear();
+                resolved.push(prefix);
+            }
+            OwnedPathComponent::RootDir => {
+                resolved.clear();
+                resolved.push(std::path::MAIN_SEPARATOR_STR);
+            }
+            OwnedPathComponent::CurDir => {}
+            OwnedPathComponent::ParentDir => {
+                if !resolved.pop() {
+                    return None;
+                }
+            }
+            OwnedPathComponent::Normal(part) => {
+                resolved.push(part);
+                let Some(target) = links.get(&resolved) else {
+                    continue;
+                };
+                followed_links += 1;
+                if followed_links > 128 || !resolved.pop() {
+                    return None;
+                }
+
+                // Process the target before the original remainder. This is
+                // intentionally component-by-component: for a target such as
+                // `bridge/../file`, the kernel resolves `bridge` before it
+                // applies `..`, and the validator must do the same.
+                let mut target_components = owned_path_components(target);
+                while let Some(target_component) = target_components.pop_back() {
+                    pending.push_front(target_component);
+                }
+            }
+        }
+    }
+    resolved.is_absolute().then_some(resolved)
+}
+
+#[derive(Clone)]
+enum OwnedPathComponent {
+    Prefix(std::ffi::OsString),
+    RootDir,
+    CurDir,
+    ParentDir,
+    Normal(std::ffi::OsString),
+}
+
+fn owned_path_components(path: &std::path::Path) -> std::collections::VecDeque<OwnedPathComponent> {
+    path.components()
+        .map(|component| match component {
+            Component::Prefix(prefix) => {
+                OwnedPathComponent::Prefix(prefix.as_os_str().to_os_string())
+            }
+            Component::RootDir => OwnedPathComponent::RootDir,
+            Component::CurDir => OwnedPathComponent::CurDir,
+            Component::ParentDir => OwnedPathComponent::ParentDir,
+            Component::Normal(part) => OwnedPathComponent::Normal(part.to_os_string()),
+        })
+        .collect()
 }
 
 /// Refuse to launch any check whose `cd <worktree>` would silently land
@@ -2189,13 +2573,31 @@ fn ensure_worktree_present(host: &Host, worktree: &std::path::Path) -> Result<()
     Ok(())
 }
 
+#[cfg(test)]
 fn run_one_check(host: &Host, worktree: &std::path::Path, cmd: &str) -> LocalCheck {
+    run_one_check_with_shared_cargo_target(host, worktree, cmd, None)
+}
+
+fn run_one_check_with_shared_cargo_target(
+    host: &Host,
+    worktree: &std::path::Path,
+    cmd: &str,
+    shared_cargo_target: Option<&std::path::Path>,
+) -> LocalCheck {
     let wt = worktree.to_string_lossy().into_owned();
     // We `cd` into the worktree first because some checks care about the
     // working directory, not just argv[0]'s path — anything that walks up
     // to a project root (Cargo.toml / package.json / pyproject.toml /
     // go.mod / mix.exs / Gemfile / ...) breaks if launched from `$HOME`.
-    let script = format!("cd {} && {}", shell_escape(&wt), cmd);
+    let cargo_setup = shared_cargo_target
+        .map(|target| {
+            format!(
+                "if [ -z \"${{CARGO_TARGET_DIR:-}}\" ]; then export CARGO_TARGET_DIR={}; fi; ",
+                shell_escape(&target.to_string_lossy())
+            )
+        })
+        .unwrap_or_default();
+    let script = format!("{cargo_setup}cd {} && {}", shell_escape(&wt), cmd);
 
     let started = Instant::now();
     let output = run_check_script(host, &script);
@@ -3104,6 +3506,7 @@ mod probe_tests {
 
     struct ProbeHomeGuard {
         previous: Option<std::ffi::OsString>,
+        previous_cargo_target: Option<std::ffi::OsString>,
         _home: tempfile::TempDir,
     }
 
@@ -3111,9 +3514,12 @@ mod probe_tests {
         fn install() -> Self {
             let home = tempfile::tempdir().unwrap();
             let previous = std::env::var_os("SHELBI_HOME");
+            let previous_cargo_target = std::env::var_os("CARGO_TARGET_DIR");
             std::env::set_var("SHELBI_HOME", home.path());
+            std::env::remove_var("CARGO_TARGET_DIR");
             Self {
                 previous,
+                previous_cargo_target,
                 _home: home,
             }
         }
@@ -3124,6 +3530,10 @@ mod probe_tests {
             match self.previous.take() {
                 Some(previous) => std::env::set_var("SHELBI_HOME", previous),
                 None => std::env::remove_var("SHELBI_HOME"),
+            }
+            match self.previous_cargo_target.take() {
+                Some(previous) => std::env::set_var("CARGO_TARGET_DIR", previous),
+                None => std::env::remove_var("CARGO_TARGET_DIR"),
             }
         }
     }
@@ -3543,6 +3953,338 @@ mod probe_tests {
         assert_eq!(
             report.head_sha, before,
             "head_sha must be the (unmoved) branch tip"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn reused_workspace_probe_copies_ignored_dependencies_for_workflow_checks() {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+
+        let _lock = crate::test_lock::acquire();
+        let _home = ProbeHomeGuard::install();
+        let (base, _origin, wt) = setup_origin_and_worktree();
+
+        // Package metadata is tracked, while the installed dependency tree is
+        // intentionally ignored just like site/node_modules in this repo.
+        std::fs::create_dir_all(wt.join("site")).unwrap();
+        std::fs::write(wt.join(".gitignore"), "site/node_modules/\n").unwrap();
+        std::fs::write(wt.join("site/package.json"), "{\"private\":true}\n").unwrap();
+        std::fs::write(wt.join("replacement.txt"), "replacement base\n").unwrap();
+        run_git(
+            &wt,
+            &["add", ".gitignore", "site/package.json", "replacement.txt"],
+        );
+        run_git(&wt, &["commit", "-q", "-m", "add site package"]);
+        run_git(&wt, &["push", "-q", "origin", "main"]);
+
+        run_git(&wt, &["checkout", "-q", "-b", "shelbi/task1"]);
+        std::fs::write(wt.join("site/reviewed.txt"), "old reviewed task\n").unwrap();
+        run_git(&wt, &["add", "site/reviewed.txt"]);
+        run_git(&wt, &["commit", "-q", "-m", "reviewed site task"]);
+        let reviewed_head = branch_sha(&wt, "shelbi/task1");
+        detach_for_handoff(&wt, "shelbi/task1");
+
+        // The freed slot now serves an unrelated replacement task with both
+        // staged and unstaged work. Its ignored dependencies are the only
+        // installed copy available to the old task's isolated probe.
+        run_git(&wt, &["checkout", "-q", "-b", "replacement-task", "main"]);
+        std::fs::write(wt.join("replacement.txt"), "replacement staged\n").unwrap();
+        run_git(&wt, &["add", "replacement.txt"]);
+        std::fs::write(wt.join("replacement.txt"), "replacement unstaged\n").unwrap();
+        std::fs::write(wt.join("replacement-untracked.txt"), "untracked\n").unwrap();
+
+        let dependency = wt.join("site/node_modules/review-tool");
+        let dependency_bin = wt.join("site/node_modules/.bin");
+        std::fs::create_dir_all(&dependency).unwrap();
+        std::fs::create_dir_all(&dependency_bin).unwrap();
+        let script = dependency.join("check-reviewed");
+        std::fs::write(
+            &script,
+            "#!/bin/sh\n\
+test \"$(cat reviewed.txt)\" = \"old reviewed task\" || exit 21\n\
+test \"$(cat node_modules/review-tool/source-marker)\" = pristine || exit 22\n\
+printf 'mutated only in probe\\n' > node_modules/review-tool/source-marker\n\
+printf 'checked:%s\\n' \"$(git rev-parse HEAD)\"\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::write(dependency.join("source-marker"), "pristine\n").unwrap();
+        symlink(
+            "../review-tool/check-reviewed",
+            dependency_bin.join("review-tool"),
+        )
+        .unwrap();
+
+        let replacement_branch_before =
+            probe_git_stdout(&wt, &["rev-parse", "--abbrev-ref", "HEAD"]);
+        let replacement_head_before = head_sha(&wt);
+        let replacement_status_before =
+            probe_git_stdout(&wt, &["status", "--porcelain=v1", "--untracked-files=all"]);
+        let replacement_index_before = probe_git_stdout(&wt, &["diff", "--cached", "--binary"]);
+        let replacement_diff_before = probe_git_stdout(&wt, &["diff", "--binary"]);
+        let replacement_file_before = std::fs::read(wt.join("replacement.txt")).unwrap();
+        let replacement_untracked_before =
+            std::fs::read(wt.join("replacement-untracked.txt")).unwrap();
+        let source_dependency_before = std::fs::read(dependency.join("source-marker")).unwrap();
+
+        let project = probe_project(base.path(), &["exit 99"]);
+        let mut workflow = shelbi_core::default_workflow();
+        workflow.zen = Some(shelbi_core::WorkflowZenConfig {
+            checks: Some(ZenChecks {
+                local: vec!["cd site && test -L node_modules/.bin/review-tool && \
+                     ./node_modules/.bin/review-tool"
+                    .into()],
+            }),
+            ..Default::default()
+        });
+        let report = probe_in_workflow(
+            &project,
+            Some(&workflow),
+            &probe_task("shelbi/task1"),
+            "shelbi/task1",
+            RebasePolicy::RebaseOntoDefault,
+        )
+        .unwrap();
+
+        assert_eq!(report.head_sha, reviewed_head);
+        assert_eq!(report.head_sha, branch_sha(&wt, "shelbi/task1"));
+        assert_eq!(report.local_checks.len(), 1);
+        assert_eq!(
+            report.local_checks[0].exit_code, 0,
+            "ignored dependency-backed check failed: {}",
+            report.local_checks[0].output_tail
+        );
+        assert!(
+            report.local_checks[0]
+                .output_tail
+                .contains(&format!("checked:{}", report.head_sha)),
+            "check must run against the reviewed task commit: {}",
+            report.local_checks[0].output_tail
+        );
+
+        // The dependency was an independent copy: the check's write did not
+        // flow back through a symlink/hardlink into the replacement slot.
+        assert_eq!(
+            std::fs::read(dependency.join("source-marker")).unwrap(),
+            source_dependency_before
+        );
+        assert!(
+            std::fs::symlink_metadata(dependency_bin.join("review-tool"))
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "source .bin link should remain untouched"
+        );
+        assert_eq!(
+            probe_git_stdout(&wt, &["rev-parse", "--abbrev-ref", "HEAD"]),
+            replacement_branch_before
+        );
+        assert_eq!(head_sha(&wt), replacement_head_before);
+        assert_eq!(
+            probe_git_stdout(&wt, &["status", "--porcelain=v1", "--untracked-files=all"]),
+            replacement_status_before
+        );
+        assert_eq!(
+            probe_git_stdout(&wt, &["diff", "--cached", "--binary"]),
+            replacement_index_before
+        );
+        assert_eq!(
+            probe_git_stdout(&wt, &["diff", "--binary"]),
+            replacement_diff_before
+        );
+        assert_eq!(
+            std::fs::read(wt.join("replacement.txt")).unwrap(),
+            replacement_file_before
+        );
+        assert_eq!(
+            std::fs::read(wt.join("replacement-untracked.txt")).unwrap(),
+            replacement_untracked_before
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn isolated_probe_rejects_dependency_links_that_escape_the_checkout() {
+        use std::os::unix::fs::symlink;
+
+        let _lock = crate::test_lock::acquire();
+        let _home = ProbeHomeGuard::install();
+        let (base, _origin, wt) = setup_origin_and_worktree();
+
+        let external = base.path().join("persistent-package-store");
+        std::fs::create_dir_all(external.join("dir")).unwrap();
+        let external_marker = external.join("marker");
+        std::fs::write(&external_marker, "pristine\n").unwrap();
+
+        run_git(&wt, &["checkout", "-q", "-b", "shelbi/task1"]);
+        std::fs::write(wt.join(".gitignore"), "node_modules/\n").unwrap();
+        std::fs::write(wt.join("package.json"), "{\"private\":true}\n").unwrap();
+        // The intermediate tracked link is outside node_modules, so it is not
+        // independently subject to dependency-root validation. The copied
+        // dependency link must still resolve it before applying `..`.
+        symlink(external.join("dir"), wt.join("bridge")).unwrap();
+        run_git(&wt, &["add", ".gitignore", "package.json", "bridge"]);
+        run_git(&wt, &["commit", "-q", "-m", "reviewed package task"]);
+        let reviewed_head = branch_sha(&wt, "shelbi/task1");
+        detach_for_handoff(&wt, "shelbi/task1");
+
+        let dependencies = wt.join("node_modules");
+        std::fs::create_dir_all(&dependencies).unwrap();
+        symlink("../bridge/../marker", dependencies.join("escape-chain")).unwrap();
+
+        let project = probe_project(base.path(), &["true"]);
+        let err = probe_in_workflow(
+            &project,
+            None,
+            &probe_task("shelbi/task1"),
+            "shelbi/task1",
+            RebasePolicy::RebaseOntoDefault,
+        )
+        .unwrap_err()
+        .to_string();
+
+        assert!(
+            err.contains("resolves outside the isolated Zen checkout"),
+            "{err}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&external_marker).unwrap(),
+            "pristine\n"
+        );
+        assert_eq!(branch_sha(&wt, "shelbi/task1"), reviewed_head);
+        assert!(
+            std::fs::symlink_metadata(dependencies.join("escape-chain"))
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "source dependency link must remain untouched"
+        );
+    }
+
+    #[test]
+    fn checkout_mutation_stops_later_local_checks() {
+        let _lock = crate::test_lock::acquire();
+        let _home = ProbeHomeGuard::install();
+        let (base, _origin, wt) = setup_origin_and_worktree();
+
+        run_git(&wt, &["checkout", "-q", "-b", "shelbi/task1"]);
+        std::fs::write(wt.join("seed.txt"), "reviewed task\n").unwrap();
+        run_git(&wt, &["add", "seed.txt"]);
+        run_git(&wt, &["commit", "-q", "-m", "reviewed task"]);
+        let reviewed_head = branch_sha(&wt, "shelbi/task1");
+        detach_for_handoff(&wt, "shelbi/task1");
+
+        let project = probe_project(
+            base.path(),
+            &[
+                "printf 'tampered\\n' > seed.txt; printf 'leaked\\n' > probe-leak.txt",
+                "printf 'ran\\n' > \"$CARGO_TARGET_DIR/zen-check-after-mutation\"",
+            ],
+        );
+        let report = probe_in_workflow(
+            &project,
+            None,
+            &probe_task("shelbi/task1"),
+            "shelbi/task1",
+            RebasePolicy::RebaseOntoDefault,
+        )
+        .unwrap();
+
+        assert_eq!(report.head_sha, reviewed_head);
+        assert_eq!(
+            report.local_checks.len(),
+            1,
+            "no later check may observe state derived from changed reviewed content"
+        );
+        assert_eq!(
+            report.local_checks[0].exit_code, 1,
+            "a check that changes reviewed source must fail closed"
+        );
+        assert!(
+            report.local_checks[0]
+                .output_tail
+                .contains("remaining local checks were skipped"),
+            "{}",
+            report.local_checks[0].output_tail
+        );
+        assert!(
+            !base.path().join("target/zen-check-after-mutation").exists(),
+            "the later check must not execute"
+        );
+        assert_eq!(branch_sha(&wt, "shelbi/task1"), reviewed_head);
+    }
+
+    #[test]
+    fn isolated_probes_share_the_machine_cargo_target_cache() {
+        let _lock = crate::test_lock::acquire();
+        let _home = ProbeHomeGuard::install();
+        let (base, _origin, wt) = setup_origin_and_worktree();
+
+        run_git(&wt, &["checkout", "-q", "-b", "shelbi/task1"]);
+        std::fs::write(wt.join("work.txt"), "task work\n").unwrap();
+        run_git(&wt, &["add", "work.txt"]);
+        run_git(&wt, &["commit", "-q", "-m", "task work"]);
+        detach_for_handoff(&wt, "shelbi/task1");
+
+        let cache_check = "mkdir -p \"$CARGO_TARGET_DIR\"; \
+if test -f \"$CARGO_TARGET_DIR/zen-probe-sentinel\"; then echo cache:warm; \
+else echo cache:cold; : > \"$CARGO_TARGET_DIR/zen-probe-sentinel\"; fi; \
+printf 'target:%s\\n' \"$CARGO_TARGET_DIR\"";
+        let project = probe_project(base.path(), &[cache_check]);
+        let task = probe_task("shelbi/task1");
+
+        let first = probe_in_workflow(
+            &project,
+            None,
+            &task,
+            "shelbi/task1",
+            RebasePolicy::RebaseOntoDefault,
+        )
+        .unwrap();
+        assert_eq!(first.local_checks[0].exit_code, 0);
+        assert!(
+            first.local_checks[0].output_tail.contains("cache:cold"),
+            "{}",
+            first.local_checks[0].output_tail
+        );
+
+        let second = probe_in_workflow(
+            &project,
+            None,
+            &task,
+            "shelbi/task1",
+            RebasePolicy::RebaseOntoDefault,
+        )
+        .unwrap();
+        assert_eq!(second.local_checks[0].exit_code, 0);
+        assert!(
+            second.local_checks[0].output_tail.contains("cache:warm"),
+            "{}",
+            second.local_checks[0].output_tail
+        );
+
+        let shared_target = base.path().join("target");
+        assert!(shared_target.join("zen-probe-sentinel").is_file());
+        assert!(
+            second.local_checks[0]
+                .output_tail
+                .contains(&format!("target:{}", shared_target.display())),
+            "{}",
+            second.local_checks[0].output_tail
+        );
+        assert!(
+            !shared_target.starts_with(&wt),
+            "shared cache must live outside the replacement workspace"
+        );
+        let worktrees = probe_git_stdout(&wt, &["worktree", "list", "--porcelain"]);
+        assert_eq!(
+            worktrees
+                .lines()
+                .filter(|line| line.starts_with("worktree "))
+                .count(),
+            1,
+            "probe cleanup must not delete the shared cache or retain temp worktrees:\n{worktrees}"
         );
     }
 

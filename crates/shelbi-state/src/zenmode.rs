@@ -10,9 +10,9 @@
 //! fuller auto-promote + merge policy.
 //!
 //! Like `agents/*/instructions.md`, the file is user-editable and
-//! self-heal-preserving: once written it is never clobbered, so edits
-//! (including edits to the first-line summary) survive a reload. Only a
-//! genuinely missing file is (re)created.
+//! self-heal-preserving: custom prose (including the first-line summary)
+//! survives a reload. The only in-place migration rewrites exact legacy Zen
+//! PR command tokens that could otherwise merge an unprobed head.
 
 use std::path::PathBuf;
 
@@ -44,16 +44,50 @@ pub enum ZenmodeOutcome {
     /// The file already existed and was left untouched — user edits
     /// (including the first-line summary) are preserved byte-for-byte.
     Unchanged,
+    /// Exact legacy unpinned Zen PR command tokens were upgraded in place.
+    /// Every other byte, including user-customized prose, was preserved.
+    Migrated,
 }
 
-/// Write the default `zenmode.md` when absent, preserving any existing file
-/// (and its user edits) byte-for-byte. Used by both `shelbi init` (fresh
-/// project) and the `shelbi reload` self-heal path (adds the file to an
-/// existing project that predates it), mirroring how `instructions.md` is
-/// preserved on reload.
+const LEGACY_ZEN_COMMAND_REPLACEMENTS: [(&str, &str); 3] = [
+    (
+        "`shelbi zen pr-create <task-id>`",
+        "`shelbi zen pr-create <task-id> --match-head-commit <head_sha>`",
+    ),
+    (
+        "`shelbi zen pr-merge <pr-number>`",
+        "`shelbi zen pr-merge <pr-number> --match-head-commit <head_sha>`",
+    ),
+    (
+        "`shelbi zen pr-merge <pr>`",
+        "`shelbi zen pr-merge <pr> --match-head-commit <head_sha>`",
+    ),
+];
+
+/// Replace only the exact backtick-delimited command forms shipped by older
+/// Shelbi versions. Requiring the delimiters avoids rewriting user-authored
+/// variants, while the pinned forms do not match their legacy token and are
+/// therefore idempotent.
+pub(crate) fn migrate_legacy_zen_commands(body: &str) -> Option<String> {
+    let mut migrated = body.to_string();
+    for (legacy, pinned) in LEGACY_ZEN_COMMAND_REPLACEMENTS {
+        migrated = migrated.replace(legacy, pinned);
+    }
+    (migrated != body).then_some(migrated)
+}
+
+/// Write the default `zenmode.md` when absent. Existing custom content is
+/// preserved except for the exact legacy unpinned Zen PR command tokens above,
+/// which are atomically upgraded so old automation fails closed after an
+/// install/reload. Used by both `shelbi init` and `shelbi reload`.
 pub fn scaffold_zenmode(project: &str) -> Result<ZenmodeOutcome> {
     let path = zenmode_path(project)?;
     if path.exists() {
+        let current = crate::read_to_string_at(&path).map_err(Error::Io)?;
+        if let Some(migrated) = migrate_legacy_zen_commands(&current) {
+            atomic_write(&path, migrated.as_bytes())?;
+            return Ok(ZenmodeOutcome::Migrated);
+        }
         return Ok(ZenmodeOutcome::Unchanged);
     }
     atomic_write(&path, DEFAULT_ZENMODE.as_bytes())?;
@@ -125,6 +159,10 @@ mod tests {
             .contains("shelbi zen pr-create <task-id> --match-head-commit <head_sha>"));
         assert!(DEFAULT_ZENMODE
             .contains("shelbi zen pr-merge <pr-number> --match-head-commit <head_sha>"));
+        assert!(
+            migrate_legacy_zen_commands(DEFAULT_ZENMODE).is_none(),
+            "the bundled policy must not contain legacy unpinned PR commands"
+        );
     }
 
     #[test]
@@ -143,6 +181,56 @@ mod tests {
         fs::write(&path, edited).unwrap();
         assert_eq!(scaffold_zenmode("p").unwrap(), ZenmodeOutcome::Unchanged);
         assert_eq!(fs::read_to_string(&path).unwrap(), edited);
+
+        std::env::remove_var("SHELBI_HOME");
+    }
+
+    #[test]
+    fn scaffold_migrates_only_exact_legacy_pr_commands_in_custom_policy() {
+        let _g = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+
+        let path = zenmode_path("p").unwrap();
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let legacy = "Zen: keep my custom summary.\n\n\
+Custom preface.\n\
+Run `shelbi zen pr-create <task-id>` after my private gate.\n\
+Then `shelbi zen pr-merge <pr-number>`.\n\
+Custom suffix.\n";
+        fs::write(&path, legacy).unwrap();
+
+        assert_eq!(scaffold_zenmode("p").unwrap(), ZenmodeOutcome::Migrated);
+        let expected = legacy
+            .replace(
+                "`shelbi zen pr-create <task-id>`",
+                "`shelbi zen pr-create <task-id> --match-head-commit <head_sha>`",
+            )
+            .replace(
+                "`shelbi zen pr-merge <pr-number>`",
+                "`shelbi zen pr-merge <pr-number> --match-head-commit <head_sha>`",
+            );
+        assert_eq!(fs::read_to_string(&path).unwrap(), expected);
+        assert_eq!(scaffold_zenmode("p").unwrap(), ZenmodeOutcome::Unchanged);
+        assert_eq!(fs::read_to_string(&path).unwrap(), expected);
+
+        std::env::remove_var("SHELBI_HOME");
+    }
+
+    #[test]
+    fn scaffold_preserves_genuinely_custom_pr_policy_byte_for_byte() {
+        let _g = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+
+        let path = zenmode_path("p").unwrap();
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let custom = "Zen: human merge only.\n\n\
+Never run the stock PR flow. Use `my-safe-merge --reviewed-sha SHA`.\n";
+        fs::write(&path, custom).unwrap();
+
+        assert_eq!(scaffold_zenmode("p").unwrap(), ZenmodeOutcome::Unchanged);
+        assert_eq!(fs::read_to_string(&path).unwrap(), custom);
 
         std::env::remove_var("SHELBI_HOME");
     }
