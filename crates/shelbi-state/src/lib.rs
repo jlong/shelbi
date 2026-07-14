@@ -103,6 +103,10 @@ pub use workspace_status::{
     PaneMarker, WorkspaceState, WorkspaceStatus, ZenHeartbeatCue, DAEMON_ACK,
     EXPECTED_TEARDOWN_MAX_AGE, ORCH_EVENT_CALLBACK_SOCK_ENV,
 };
+pub use workspace_status::{
+    event_cursor_path, event_log_current_base, event_log_head, read_event_log_from,
+    read_or_initialize_event_cursor, write_event_cursor, EventLogRead,
+};
 pub use zenmode::{
     read_zenmode_summary, scaffold_zenmode, zenmode_path, ZenmodeOutcome, DEFAULT_ZENMODE,
     ZENMODE_FILE,

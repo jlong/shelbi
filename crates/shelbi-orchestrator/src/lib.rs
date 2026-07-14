@@ -19,6 +19,7 @@ use shelbi_state::keymap::{load_keymaps, GlobalAction};
 
 pub mod actions;
 pub mod branch;
+pub(crate) mod codex_rpc;
 pub mod dispatch;
 mod git;
 pub mod githook;
@@ -366,14 +367,6 @@ pub fn focus_workspace(project_name: &str, workspace_name: &str) -> Result<()> {
 pub fn ensure_dashboard(project_name: &str) -> Result<BootstrapStatus> {
     let project = shelbi_state::load_project(project_name)?;
 
-    // Serialize the whole bootstrap. `ensure_dashboard` is check-then-act
-    // (count panes, split if <2); two callers racing it (CLI + TUI launcher)
-    // would each split and double-split the dashboard or orphan the
-    // orchestrator pane (F11). The loser blocks here, then finds the layout
-    // already present and heals it below. Held until the guard drops at end
-    // of scope.
-    let _bootstrap_lock = shelbi_state::lock_dashboard(project_name)?;
-
     let hub = project
         .machines
         .iter()
@@ -396,6 +389,39 @@ pub fn ensure_dashboard(project_name: &str) -> Result<BootstrapStatus> {
     let addr = dashboard_addr(project_name);
     let session = &addr.session;
     let dashboard = format!("{session}:dashboard");
+
+    // A live two-pane dashboard is attachable even if configuration changed
+    // away from Codex: attaching does not replace the native thread owner.
+    // Every cold/recovery path must instead reject that runner transition
+    // before creating the dashboard lock or making any bootstrap mutation.
+    let dashboard_reattachable = dashboard_has_two_panes(&host, session, &dashboard)?;
+    if !dashboard_reattachable {
+        handoff::validate_orchestrator_runner_transition(
+            project_name,
+            &project.orchestrator.runner,
+            &runner_spec.command,
+        )?;
+    }
+
+    // Serialize the whole bootstrap. `ensure_dashboard` is check-then-act
+    // (count panes, split if <2); two callers racing it (CLI + TUI launcher)
+    // would each split and double-split the dashboard or orphan the
+    // orchestrator pane (F11). The loser blocks here, then finds the layout
+    // already present and heals it below. Held until the guard drops at end
+    // of scope.
+    let _bootstrap_lock = shelbi_state::lock_dashboard(project_name)?;
+
+    // The layout may have changed while this caller waited for the lock. A
+    // vanished/missing second pane turns an attach into a replacement launch,
+    // so re-run the transition guard before any mutation in that case.
+    let dashboard_reattachable = dashboard_has_two_panes(&host, session, &dashboard)?;
+    if !dashboard_reattachable {
+        handoff::validate_orchestrator_runner_transition(
+            project_name,
+            &project.orchestrator.runner,
+            &runner_spec.command,
+        )?;
+    }
 
     // Install the session-closed cleanup hook before doing anything else.
     // Idempotent and project-agnostic — set every ensure_dashboard call so
@@ -461,7 +487,7 @@ pub fn ensure_dashboard(project_name: &str) -> Result<BootstrapStatus> {
 
     let shelbi_bin = current_exe_string()?;
     let sidebar_cmd_str = sidebar_cmd(&shelbi_bin, project_name);
-    let launch = launch_with_bootstrap(&runner_spec, project_name, &workdir);
+    let launch = orchestrator_launch_command(&shelbi_bin, &runner_spec, project_name, &workdir);
     let orch_cmd = orchestrator_pane_cmd(
         &shelbi_bin,
         project_name,
@@ -536,7 +562,9 @@ pub fn ensure_dashboard(project_name: &str) -> Result<BootstrapStatus> {
         return Ok(BootstrapStatus::AlreadyRunning);
     }
 
-    // 3. Split the dashboard window: orchestrator on the right.
+    // 3. Split the dashboard window: orchestrator on the right. The captured
+    // runner and native-thread transition were validated before bootstrap
+    // mutation above; do not introduce a later rejection after side effects.
     //    Initial split is 50/50 — the sidebar-clamp hooks installed
     //    below set the final sizing as soon as a client attaches (or
     //    immediately, if we're being run from inside one).
@@ -587,6 +615,27 @@ pub fn ensure_dashboard(project_name: &str) -> Result<BootstrapStatus> {
     ensure_hidden_views(&host, session, project_name, &shelbi_bin)?;
 
     Ok(BootstrapStatus::Started)
+}
+
+/// Whether the existing dashboard can be attached without launching or
+/// replacing an orchestrator pane. All probes are read-only so callers can
+/// safely use this to gate lifecycle validation before bootstrap mutations.
+fn dashboard_has_two_panes(
+    host: &shelbi_core::Host,
+    session: &str,
+    dashboard: &str,
+) -> Result<bool> {
+    if !shelbi_tmux::has_session(host, session)? {
+        return Ok(false);
+    }
+    let windows =
+        shelbi_ssh::run_capture(host, ["tmux", "list-windows", "-t", session, "-F", "#W"])?;
+    if !windows.lines().any(|window| window.trim() == "dashboard") {
+        return Ok(false);
+    }
+    let panes =
+        shelbi_ssh::run_capture(host, ["tmux", "list-panes", "-t", dashboard, "-F", "#P"])?;
+    Ok(panes.lines().filter(|line| !line.trim().is_empty()).count() >= 2)
 }
 
 /// Resolve the palette-open chord from the user's keys.yaml (with this
@@ -1025,8 +1074,35 @@ const ORCH_BOOTSTRAP_PROMPT: &str = "Run the \"Bootstrap on session start\" sequ
     task/workspace/heartbeat/pane-death facts through the normal reaction rules, and \
     only then answer.";
 
-/// Wrap `launch_command(runner_spec)` with the orchestrator's
-/// auto-bootstrap context.
+/// Build the command owned by the orchestrator pane.
+///
+/// Codex is routed through Shelbi's native app-server bridge. The bridge owns
+/// the exact Codex thread and attaches the visible TUI to it, so board events
+/// never need to be pasted into the pane. Claude and custom runners retain
+/// their standalone launch behavior.
+fn orchestrator_launch_command(
+    shelbi_bin: &str,
+    spec: &shelbi_core::AgentRunnerSpec,
+    project_name: &str,
+    workdir: &std::path::Path,
+) -> String {
+    if is_codex_runner(spec) {
+        codex_bridge_cmd(shelbi_bin, project_name)
+    } else {
+        launch_with_bootstrap(spec, project_name, workdir)
+    }
+}
+
+fn codex_bridge_cmd(shelbi_bin: &str, project_name: &str) -> String {
+    format!(
+        "{bin} __codex-orchestrator {project}",
+        bin = shelbi_agent::shell_escape(shelbi_bin),
+        project = shelbi_agent::shell_escape(project_name),
+    )
+}
+
+/// Wrap a standalone runner command with the orchestrator's auto-bootstrap
+/// context.
 ///
 /// Claude receives the composed `agents/orchestrator/instructions.md`
 /// through `--append-system-prompt` and the bootstrap request as its
@@ -1050,13 +1126,27 @@ fn launch_with_bootstrap(
             prompt = shelbi_agent::shell_escape(ORCH_BOOTSTRAP_PROMPT),
         )
     } else if is_codex_runner(spec) {
-        format!(
-            "{launch} {prompt}",
-            prompt = codex_orchestrator_prompt_arg(project_name, workdir),
-        )
+        codex_standalone_launch(spec, project_name, workdir)
     } else {
         launch
     }
+}
+
+/// Conservative compatibility launch used by the native Codex bridge when
+/// the configured Codex binary does not support app-server/remote TUI mode.
+///
+/// This keeps the durable turn-boundary polling contract from the standalone
+/// integration, but it does not authorize any tmux wake injection.
+pub(crate) fn codex_standalone_launch(
+    spec: &shelbi_core::AgentRunnerSpec,
+    project_name: &str,
+    workdir: &std::path::Path,
+) -> String {
+    let launch = shelbi_agent::launch_command(spec);
+    format!(
+        "{launch} {prompt}",
+        prompt = codex_orchestrator_prompt_arg(project_name, workdir),
+    )
 }
 
 fn is_claude_runner(spec: &shelbi_core::AgentRunnerSpec) -> bool {
@@ -1282,6 +1372,13 @@ pub fn reload_target(project_name: &str, target: &ReloadTarget) -> Result<Reload
         )));
     }
 
+    // Handoff failures are normally best-effort, but a native Codex thread
+    // cannot be serialized into a different runner. Make that transition a
+    // hard preflight error before any pane in an all/chat reload is touched.
+    if matches!(target, ReloadTarget::All | ReloadTarget::Chat) {
+        handoff::validate_configured_orchestrator_transition(project_name)?;
+    }
+
     let shelbi_bin = current_exe_string()?;
     let mut report = ReloadReport::default();
 
@@ -1482,6 +1579,16 @@ fn reload_orchestrator_pane(
             };
         }
     };
+    if let Err(e) = handoff::validate_orchestrator_runner_transition(
+        project_name,
+        &project.orchestrator.runner,
+        &runner_spec.command,
+    ) {
+        return PaneReloadStatus::Failed {
+            target: format!("{session}:dashboard.{{right}}"),
+            reason: e.to_string(),
+        };
+    }
     let workdir = match shelbi_state::project_dir(project_name) {
         Ok(d) => d,
         Err(e) => {
@@ -1508,7 +1615,7 @@ fn reload_orchestrator_pane(
         );
     }
 
-    let launch = launch_with_bootstrap(&runner_spec, project_name, &workdir);
+    let launch = orchestrator_launch_command(shelbi_bin, &runner_spec, project_name, &workdir);
     let cmd = orchestrator_pane_cmd(
         shelbi_bin,
         project_name,
@@ -1944,6 +2051,32 @@ mod pane_cmd_tests {
         assert!(
             !out.contains("--append-system-prompt"),
             "Codex must not receive Claude-only flags: {out}"
+        );
+    }
+
+    #[test]
+    fn orchestrator_launch_routes_codex_through_native_bridge() {
+        let spec = shelbi_core::AgentRunnerSpec {
+            command: "codex".into(),
+            flags: vec!["--dangerously-bypass-approvals-and-sandbox".into()],
+            prompt_injection: None,
+            dialog_signatures: vec![],
+        };
+        let out = orchestrator_launch_command(
+            "/usr/local/bin/shelbi",
+            &spec,
+            "myapp",
+            std::path::Path::new("/tmp/myapp"),
+        );
+        assert_eq!(out, "/usr/local/bin/shelbi __codex-orchestrator myapp");
+    }
+
+    #[test]
+    fn codex_bridge_cmd_shell_escapes_binary_and_project() {
+        let out = codex_bridge_cmd("/Users/jane doe/bin/shelbi", "my project");
+        assert_eq!(
+            out,
+            "'/Users/jane doe/bin/shelbi' __codex-orchestrator 'my project'"
         );
     }
 
@@ -2466,6 +2599,146 @@ mod reload_target_tmux_tests {
             .output();
     }
 
+    fn session_exists(name: &str) -> bool {
+        std::process::Command::new("tmux")
+            .args(["has-session", "-t", name])
+            .output()
+            .map(|output| output.status.success())
+            .unwrap_or(false)
+    }
+
+    struct HomeGuard(Option<std::ffi::OsString>);
+
+    impl HomeGuard {
+        fn install(home: &std::path::Path) -> Self {
+            let previous = std::env::var_os("SHELBI_HOME");
+            std::env::set_var("SHELBI_HOME", home);
+            Self(previous)
+        }
+    }
+
+    impl Drop for HomeGuard {
+        fn drop(&mut self) {
+            match self.0.take() {
+                Some(home) => std::env::set_var("SHELBI_HOME", home),
+                None => std::env::remove_var("SHELBI_HOME"),
+            }
+        }
+    }
+
+    struct SessionGuard(Vec<String>);
+
+    impl SessionGuard {
+        fn new(sessions: &[&str]) -> Self {
+            Self(sessions.iter().map(|session| (*session).to_string()).collect())
+        }
+    }
+
+    impl Drop for SessionGuard {
+        fn drop(&mut self) {
+            for session in &self.0 {
+                kill_session(session);
+            }
+        }
+    }
+
+    #[derive(Clone, Debug, Default, PartialEq, Eq)]
+    struct TmuxGlobals {
+        cleanup_hook: Option<String>,
+        palette_binding: Option<String>,
+    }
+
+    impl TmuxGlobals {
+        fn capture() -> Option<Self> {
+            let hooks = std::process::Command::new("tmux")
+                .args(["show-hooks", "-g"])
+                .output()
+                .ok()?;
+            let bindings = std::process::Command::new("tmux")
+                .args(["list-keys", "-T", "root"])
+                .output()
+                .ok()?;
+            if !hooks.status.success() || !bindings.status.success() {
+                return None;
+            }
+            let cleanup_hook = String::from_utf8_lossy(&hooks.stdout)
+                .lines()
+                .find(|line| line.starts_with("session-closed[42] "))
+                .map(str::to_string);
+            let palette_binding = String::from_utf8_lossy(&bindings.stdout)
+                .lines()
+                .find(|line| {
+                    let fields = line.split_whitespace().collect::<Vec<_>>();
+                    fields
+                        .windows(3)
+                        .any(|window| window == ["-T", "root", "C-p"])
+                })
+                .map(str::to_string);
+            Some(Self {
+                cleanup_hook,
+                palette_binding,
+            })
+        }
+    }
+
+    struct TmuxGlobalsGuard(Option<TmuxGlobals>);
+
+    impl TmuxGlobalsGuard {
+        fn capture() -> Self {
+            Self(TmuxGlobals::capture())
+        }
+
+        fn snapshot(&self) -> Option<TmuxGlobals> {
+            self.0.clone()
+        }
+    }
+
+    impl Drop for TmuxGlobalsGuard {
+        fn drop(&mut self) {
+            let Some(previous) = self.0.take() else {
+                return;
+            };
+            let _ = std::process::Command::new("tmux")
+                .args(["set-hook", "-g", "-u", "session-closed[42]"])
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status();
+            if let Some(hook) = previous.cleanup_hook {
+                if let Some((name, command)) = hook.split_once(' ') {
+                    let _ = std::process::Command::new("tmux")
+                        .args(["set-hook", "-g", name, command])
+                        .stdout(std::process::Stdio::null())
+                        .stderr(std::process::Stdio::null())
+                        .status();
+                }
+            }
+            let _ = std::process::Command::new("tmux")
+                .args(["unbind-key", "-T", "root", "C-p"])
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status();
+            if let Some(binding) = previous.palette_binding {
+                source_tmux_command(&format!("{binding}\n"));
+            }
+        }
+    }
+
+    fn source_tmux_command(command: &str) {
+        let Ok(mut child) = std::process::Command::new("tmux")
+            .args(["source-file", "-"])
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+        else {
+            return;
+        };
+        if let Some(mut stdin) = child.stdin.take() {
+            let _ = std::io::Write::write_all(&mut stdin, command.as_bytes());
+        }
+        let _ = child.wait();
+    }
+
     fn start_session(name: &str, win: &str) {
         for _ in 0..50 {
             let _ = std::process::Command::new("tmux")
@@ -2484,6 +2757,63 @@ mod reload_target_tmux_tests {
             std::thread::sleep(std::time::Duration::from_millis(20));
         }
         panic!("tmux session `{name}` never came up");
+    }
+
+    fn non_codex_project(
+        project_name: &str,
+        hub_work_dir: &std::path::Path,
+    ) -> shelbi_core::Project {
+        shelbi_core::Project {
+            name: project_name.into(),
+            default_branch: "main".into(),
+            default_workflow: None,
+            config_mode: None,
+            orchestrator: shelbi_core::OrchestratorSpec {
+                runner: "claude".into(),
+            },
+            agent_runners: std::collections::BTreeMap::from([(
+                "claude".into(),
+                shelbi_core::AgentRunnerSpec {
+                    command: "claude".into(),
+                    flags: vec![],
+                    prompt_injection: None,
+                    dialog_signatures: vec![],
+                },
+            )]),
+            github_url: None,
+            workspace_poll_interval_secs: 5,
+            workspace_permissions_mode: "auto".into(),
+            workspace_settings_template: None,
+            zen: shelbi_core::ZenConfig::default(),
+            heartbeat: shelbi_core::HeartbeatConfig::default(),
+            git: shelbi_core::GitConfig::default(),
+            repo: hub_work_dir.to_string_lossy().into_owned(),
+            machines: vec![shelbi_core::Machine {
+                name: "hub".into(),
+                kind: shelbi_core::MachineKind::Local,
+                work_dir: hub_work_dir.into(),
+                host: None,
+                tags: Vec::new(),
+                forward: None,
+            }],
+            editor: None,
+            workspaces: Vec::new(),
+            detected_shapes: Vec::new(),
+        }
+    }
+
+    fn seed_active_native_thread(project_name: &str) -> std::path::PathBuf {
+        let project_dir = shelbi_state::project_dir(project_name).unwrap();
+        std::fs::create_dir_all(&project_dir).unwrap();
+        let state_path = project_dir.join("codex-thread.json");
+        std::fs::write(
+            &state_path,
+            format!(
+                r#"{{"version":1,"project":"{project_name}","thread_id":"thread-owned","bootstrap_generation":3,"native_active":true}}"#
+            ),
+        )
+        .unwrap();
+        state_path
     }
 
     /// `reload tasks` respawns the tasks stash pane and touches nothing else.
@@ -2572,6 +2902,272 @@ mod reload_target_tmux_tests {
             err.to_string().contains("not running"),
             "expected a not-running error, got: {err}"
         );
+    }
+
+    #[test]
+    fn chat_reload_rejects_native_to_non_codex_before_respawn() {
+        if !tmux_available() {
+            eprintln!("skipping: tmux not on PATH");
+            return;
+        }
+        let _lock = crate::test_lock::acquire();
+        let temp = tempfile::tempdir().unwrap();
+        let _home = HomeGuard::install(temp.path());
+
+        let project_name = format!("native-switch-{}", std::process::id());
+        let hub_work_dir = temp.path().join("repo");
+        std::fs::create_dir_all(&hub_work_dir).unwrap();
+        let project = non_codex_project(&project_name, &hub_work_dir);
+        shelbi_state::save_project(&project).unwrap();
+        let state_path = seed_active_native_thread(&project_name);
+
+        let session = format!("shelbi-{project_name}");
+        kill_session(&session);
+        let _sessions = SessionGuard::new(&[&session]);
+        start_session(&session, "dashboard");
+        let pane_before = std::process::Command::new("tmux")
+            .args([
+                "display-message",
+                "-p",
+                "-t",
+                &format!("{session}:dashboard.0"),
+                "-F",
+                "#{pane_id} #{pane_pid}",
+            ])
+            .output()
+            .unwrap()
+            .stdout;
+        let state_before = std::fs::read(&state_path).unwrap();
+
+        let error = reload_target(&project_name, &ReloadTarget::Chat)
+            .expect_err("native-to-Claude reload must fail before respawn")
+            .to_string();
+        assert!(error.contains("native-to-legacy handoff"), "{error}");
+        let pane_after = std::process::Command::new("tmux")
+            .args([
+                "display-message",
+                "-p",
+                "-t",
+                &format!("{session}:dashboard.0"),
+                "-F",
+                "#{pane_id} #{pane_pid}",
+            ])
+            .output()
+            .unwrap()
+            .stdout;
+        assert_eq!(pane_after, pane_before, "orchestrator pane was respawned");
+        assert_eq!(std::fs::read(&state_path).unwrap(), state_before);
+
+    }
+
+    #[test]
+    fn dashboard_recovery_rejects_native_to_non_codex_before_split() {
+        if !tmux_available() {
+            eprintln!("skipping: tmux not on PATH");
+            return;
+        }
+        let _lock = crate::test_lock::acquire();
+        let temp = tempfile::tempdir().unwrap();
+        let _home = HomeGuard::install(temp.path());
+
+        let project_name = format!("native-start-switch-{}", std::process::id());
+        let hub_work_dir = temp.path().join("repo");
+        std::fs::create_dir_all(&hub_work_dir).unwrap();
+        shelbi_state::save_project(&non_codex_project(&project_name, &hub_work_dir)).unwrap();
+        let state_path = seed_active_native_thread(&project_name);
+        let state_before = std::fs::read(&state_path).unwrap();
+
+        let session = format!("shelbi-{project_name}");
+        kill_session(&session);
+        let stash = format!("_{session}");
+        kill_session(&stash);
+        let _sessions = SessionGuard::new(&[&session, &stash]);
+        start_session(&session, "dashboard");
+        let pane_before = std::process::Command::new("tmux")
+            .args([
+                "display-message",
+                "-p",
+                "-t",
+                &format!("{session}:dashboard.0"),
+                "-F",
+                "#{pane_id} #{pane_pid}",
+            ])
+            .output()
+            .unwrap()
+            .stdout;
+
+        let error = ensure_dashboard(&project_name)
+            .expect_err("offline native-to-Claude start must fail before split")
+            .to_string();
+        assert!(error.contains("native-to-legacy handoff"), "{error}");
+        let panes = std::process::Command::new("tmux")
+            .args([
+                "list-panes",
+                "-t",
+                &format!("{session}:dashboard"),
+                "-F",
+                "#{pane_id} #{pane_pid}",
+            ])
+            .output()
+            .unwrap()
+            .stdout;
+        assert_eq!(panes, pane_before, "a replacement orchestrator was split");
+        assert_eq!(std::fs::read(&state_path).unwrap(), state_before);
+    }
+
+    #[test]
+    fn cold_dashboard_rejection_is_side_effect_free() {
+        if !tmux_available() {
+            eprintln!("skipping: tmux not on PATH");
+            return;
+        }
+        let _lock = crate::test_lock::acquire();
+        let temp = tempfile::tempdir().unwrap();
+        let _home = HomeGuard::install(temp.path());
+
+        let project_name = format!("native-cold-switch-{}", std::process::id());
+        let hub_work_dir = temp.path().join("repo");
+        std::fs::create_dir_all(&hub_work_dir).unwrap();
+        let git_init = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&hub_work_dir)
+            .args(["init", "-q"])
+            .status()
+            .unwrap();
+        assert!(git_init.success(), "fixture git init failed");
+        shelbi_state::save_project(&non_codex_project(&project_name, &hub_work_dir)).unwrap();
+
+        // Settle load-time status migrations before taking the no-mutation
+        // snapshot, then provide real source context and a one-shot handoff
+        // marker that the old ordering would deploy/consume.
+        shelbi_state::load_project(&project_name).unwrap();
+        let instructions_path = shelbi_state::agent_instructions_path(
+            &project_name,
+            shelbi_state::ORCHESTRATOR_AGENT,
+        )
+        .unwrap();
+        std::fs::create_dir_all(instructions_path.parent().unwrap()).unwrap();
+        std::fs::write(&instructions_path, "# Fixture orchestrator\n").unwrap();
+        let handoff_path = shelbi_state::orchestrator_handoff_path(&project_name).unwrap();
+        let handoff_before = b"handoff must survive rejected cold launch\n";
+        std::fs::write(&handoff_path, handoff_before).unwrap();
+
+        let native_state_path = seed_active_native_thread(&project_name);
+        let native_state_before = std::fs::read(&native_state_path).unwrap();
+        let project_dir = shelbi_state::project_dir(&project_name).unwrap();
+        let context_dir = project_dir.join(".claude");
+        let clamp_script = project_dir.join("sidebar-clamp.sh");
+        let dashboard_lock = project_dir.join("dashboard.lock");
+        let project_state_path = project_dir.join("state.json");
+        let project_state_before = std::fs::read(&project_state_path).ok();
+        let global_state_path = temp.path().join("state.json");
+        let global_state_before = std::fs::read(&global_state_path).ok();
+        let git_hook = hub_work_dir.join(".git/hooks/pre-commit");
+
+        assert!(!context_dir.exists());
+        assert!(!clamp_script.exists());
+        assert!(!dashboard_lock.exists());
+        assert!(!git_hook.exists());
+
+        let session = format!("shelbi-{project_name}");
+        let stash = format!("_{session}");
+        kill_session(&session);
+        kill_session(&stash);
+        let _sessions = SessionGuard::new(&[&session, &stash]);
+        let tmux_globals = TmuxGlobalsGuard::capture();
+        let tmux_globals_before = tmux_globals.snapshot();
+        assert!(!session_exists(&session));
+        assert!(!session_exists(&stash));
+
+        let error = ensure_dashboard(&project_name)
+            .expect_err("native-to-Claude cold launch must fail before all bootstrap mutation")
+            .to_string();
+        assert!(error.contains("native-to-legacy handoff"), "{error}");
+
+        assert!(!session_exists(&session), "dashboard session was created");
+        assert!(!session_exists(&stash), "hidden-view session was created");
+        assert!(!context_dir.exists(), "orchestrator context was deployed");
+        assert!(!clamp_script.exists(), "sidebar bootstrap script was written");
+        assert!(!dashboard_lock.exists(), "dashboard lock marker was created");
+        assert!(!git_hook.exists(), "hub pre-commit hook was installed");
+        assert_eq!(std::fs::read(&native_state_path).unwrap(), native_state_before);
+        assert_eq!(std::fs::read(&handoff_path).unwrap(), handoff_before);
+        assert_eq!(std::fs::read(&project_state_path).ok(), project_state_before);
+        assert_eq!(std::fs::read(&global_state_path).ok(), global_state_before);
+        assert_eq!(
+            TmuxGlobals::capture().unwrap_or_default(),
+            tmux_globals_before.unwrap_or_default()
+        );
+    }
+
+    #[test]
+    fn running_two_pane_dashboard_remains_reattachable_after_runner_change() {
+        if !tmux_available() {
+            eprintln!("skipping: tmux not on PATH");
+            return;
+        }
+        let _lock = crate::test_lock::acquire();
+        let temp = tempfile::tempdir().unwrap();
+        let _home = HomeGuard::install(temp.path());
+
+        let project_name = format!("native-attach-switch-{}", std::process::id());
+        let hub_work_dir = temp.path().join("repo");
+        std::fs::create_dir_all(&hub_work_dir).unwrap();
+        shelbi_state::save_project(&non_codex_project(&project_name, &hub_work_dir)).unwrap();
+        let native_state_path = seed_active_native_thread(&project_name);
+        let native_state_before = std::fs::read(&native_state_path).unwrap();
+
+        let session = format!("shelbi-{project_name}");
+        let stash = format!("_{session}");
+        kill_session(&session);
+        kill_session(&stash);
+        let _sessions = SessionGuard::new(&[&session, &stash]);
+        start_session(&session, "dashboard");
+        let split = std::process::Command::new("tmux")
+            .args([
+                "split-window",
+                "-d",
+                "-h",
+                "-t",
+                &format!("{session}:dashboard"),
+                "sh",
+                "-c",
+                "sleep 30",
+            ])
+            .status()
+            .unwrap();
+        assert!(split.success(), "fixture dashboard split failed");
+        let _tmux_globals = TmuxGlobalsGuard::capture();
+        let panes_before = std::process::Command::new("tmux")
+            .args([
+                "list-panes",
+                "-t",
+                &format!("{session}:dashboard"),
+                "-F",
+                "#{pane_id} #{pane_pid}",
+            ])
+            .output()
+            .unwrap()
+            .stdout;
+
+        assert_eq!(
+            ensure_dashboard(&project_name).unwrap(),
+            BootstrapStatus::AlreadyRunning,
+            "an existing two-pane dashboard should attach without a replacement launch"
+        );
+        let panes_after = std::process::Command::new("tmux")
+            .args([
+                "list-panes",
+                "-t",
+                &format!("{session}:dashboard"),
+                "-F",
+                "#{pane_id} #{pane_pid}",
+            ])
+            .output()
+            .unwrap()
+            .stdout;
+        assert_eq!(panes_after, panes_before, "the live dashboard was replaced");
+        assert_eq!(std::fs::read(&native_state_path).unwrap(), native_state_before);
     }
 }
 

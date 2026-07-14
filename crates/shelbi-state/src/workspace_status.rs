@@ -15,9 +15,10 @@
 //! markers; they don't own these files.
 
 use std::fs;
-use std::io::Write;
+use std::io::{Read, Seek, SeekFrom, Write};
+use std::os::unix::fs::MetadataExt;
 use std::os::unix::net::UnixStream;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
 use chrono::{DateTime, Utc};
@@ -25,7 +26,7 @@ use serde::{Deserialize, Serialize};
 
 use shelbi_core::{Column, Result, DEFAULT_WORKFLOW_NAME};
 
-use crate::{atomic_write, ensure_dir, shelbi_home};
+use crate::{acquire_file_lock, atomic_write, ensure_dir, project_dir, projects_dir, shelbi_home};
 
 /// Harness callback socket for push-capable orchestrator runners.
 ///
@@ -334,6 +335,480 @@ pub fn clear_expected_teardown(workspace: &str) -> Result<()> {
 /// `~/.shelbi/events.log`.
 pub fn events_log_path() -> Result<PathBuf> {
     Ok(shelbi_home()?.join("events.log"))
+}
+
+const EVENT_LOG_INDEX_VERSION: u8 = 1;
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+struct EventLogIndex {
+    version: u8,
+    previous_base: Option<u64>,
+    current_base: u64,
+}
+
+impl Default for EventLogIndex {
+    fn default() -> Self {
+        Self {
+            version: EVENT_LOG_INDEX_VERSION,
+            previous_base: None,
+            current_base: 0,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+struct EventLogRotation {
+    version: u8,
+    old_base: u64,
+    old_len: u64,
+    old_dev: u64,
+    old_ino: u64,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+struct EventLogMigration {
+    version: u8,
+    current_len: u64,
+}
+
+/// Raw bytes read from the retained event-log generations using one monotonic
+/// logical byte cursor. `start + bytes.len()` is the logical head captured by
+/// this read; callers may hold back a final unterminated line and advance less.
+#[derive(Debug)]
+pub struct EventLogRead {
+    pub start: u64,
+    pub head: u64,
+    pub bytes: Vec<u8>,
+}
+
+fn event_log_index_path(path: &Path) -> PathBuf {
+    path.with_extension("log.index.json")
+}
+
+fn event_log_rotation_path(path: &Path) -> PathBuf {
+    path.with_extension("log.rotation.json")
+}
+
+fn event_log_migration_path(path: &Path) -> PathBuf {
+    path.with_extension("log.migration.json")
+}
+
+fn event_log_lock_path(path: &Path) -> PathBuf {
+    path.with_extension("log.lock")
+}
+
+fn save_event_log_index(path: &Path, index: &EventLogIndex) -> Result<()> {
+    let bytes = serde_json::to_vec(index)
+        .map_err(|e| shelbi_core::Error::Other(format!("serialize event-log index: {e}")))?;
+    atomic_write(&event_log_index_path(path), &bytes)
+}
+
+fn event_cursor_paths() -> Result<Vec<PathBuf>> {
+    let dir = projects_dir()?;
+    let entries = match fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(shelbi_core::Error::Io(e)),
+    };
+    let mut paths = Vec::new();
+    for entry in entries {
+        let entry = entry.map_err(shelbi_core::Error::Io)?;
+        if entry.file_type().map_err(shelbi_core::Error::Io)?.is_dir() {
+            paths.push(entry.path().join("event-cursor"));
+        }
+    }
+    paths.sort();
+    Ok(paths)
+}
+
+fn load_or_create_event_log_migration(path: &Path, current_len: u64) -> Result<EventLogMigration> {
+    let migration_path = event_log_migration_path(path);
+    match fs::read_to_string(&migration_path) {
+        Ok(text) => {
+            let migration: EventLogMigration = serde_json::from_str(&text).map_err(|e| {
+                shelbi_core::Error::Other(format!("invalid event-log migration marker: {e}"))
+            })?;
+            if migration.version != EVENT_LOG_INDEX_VERSION {
+                return Err(shelbi_core::Error::Other(format!(
+                    "unsupported event-log migration version {}",
+                    migration.version
+                )));
+            }
+            Ok(migration)
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            let migration = EventLogMigration {
+                version: EVENT_LOG_INDEX_VERSION,
+                current_len,
+            };
+            let bytes = serde_json::to_vec(&migration).map_err(|e| {
+                shelbi_core::Error::Other(format!("serialize event-log migration marker: {e}"))
+            })?;
+            atomic_write(&migration_path, &bytes)?;
+            Ok(migration)
+        }
+        Err(e) => Err(shelbi_core::Error::Io(e)),
+    }
+}
+
+fn cleanup_event_log_migration(path: &Path) {
+    let migration_path = event_log_migration_path(path);
+    if let Err(error) = fs::remove_file(&migration_path) {
+        if error.kind() != std::io::ErrorKind::NotFound {
+            tracing::warn!(
+                %error,
+                path = %migration_path.display(),
+                "event-log migration committed but marker cleanup failed"
+            );
+        }
+    }
+}
+
+/// Before the logical index existed, project cursors were physical offsets
+/// into the current `events.log`. The legacy reader treated an offset beyond
+/// the current file length as a rotation and restarted at zero. Preserve that
+/// behavior exactly once, while establishing the first logical index; after
+/// the index exists, a future cursor is corruption and must fail closed.
+fn normalize_legacy_event_cursors(current_len: u64) -> Result<()> {
+    for cursor_path in event_cursor_paths()? {
+        let text = match fs::read_to_string(&cursor_path) {
+            Ok(text) => text,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => return Err(shelbi_core::Error::Io(e)),
+        };
+        if text
+            .trim()
+            .parse::<u64>()
+            .map_or(true, |cursor| cursor > current_len)
+        {
+            atomic_write(&cursor_path, b"0")?;
+        }
+    }
+    Ok(())
+}
+
+/// Finish or roll back the narrow rename/index crash window. Writers create
+/// the journal before renaming current to `.1`, and do not recreate current
+/// until the new index is durable. The journal's source identity and length
+/// distinguish a genuine pre-rename current file from one recreated by a
+/// degraded writer after rename.
+fn optional_metadata(path: &Path) -> Result<Option<fs::Metadata>> {
+    match fs::metadata(path) {
+        Ok(metadata) => Ok(Some(metadata)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(shelbi_core::Error::Io(e)),
+    }
+}
+
+fn metadata_matches_rotation_source(
+    metadata: &fs::Metadata,
+    rotation: &EventLogRotation,
+) -> bool {
+    metadata.len() == rotation.old_len
+        && metadata_has_rotation_source_identity(metadata, rotation)
+}
+
+fn metadata_is_pre_rename_source(
+    metadata: &fs::Metadata,
+    rotation: &EventLogRotation,
+) -> bool {
+    metadata.len() >= rotation.old_len
+        && metadata_has_rotation_source_identity(metadata, rotation)
+}
+
+fn metadata_has_rotation_source_identity(
+    metadata: &fs::Metadata,
+    rotation: &EventLogRotation,
+) -> bool {
+    metadata.dev() == rotation.old_dev && metadata.ino() == rotation.old_ino
+}
+
+fn recover_event_log_rotation(path: &Path, index: &mut EventLogIndex) -> Result<()> {
+    let journal_path = event_log_rotation_path(path);
+    let text = match fs::read_to_string(&journal_path) {
+        Ok(text) => text,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(shelbi_core::Error::Io(e)),
+    };
+    let rotation: EventLogRotation = serde_json::from_str(&text).map_err(|e| {
+        shelbi_core::Error::Other(format!("invalid event-log rotation journal: {e}"))
+    })?;
+    if rotation.version != EVENT_LOG_INDEX_VERSION {
+        return Err(shelbi_core::Error::Other(format!(
+            "unsupported event-log rotation journal version {}",
+            rotation.version
+        )));
+    }
+
+    let new_base = rotation.old_base.saturating_add(rotation.old_len);
+    let rotated = path.with_extension("log.1");
+    let current_metadata = optional_metadata(path)?;
+    let rotated_metadata = optional_metadata(&rotated)?;
+    let current_is_source = current_metadata
+        .as_ref()
+        .is_some_and(|metadata| metadata_is_pre_rename_source(metadata, &rotation));
+    let rotated_is_source = rotated_metadata
+        .as_ref()
+        .is_some_and(|metadata| metadata_matches_rotation_source(metadata, &rotation));
+
+    if index.current_base == new_base && index.previous_base == Some(rotation.old_base) {
+        if !rotated_is_source {
+            return Err(shelbi_core::Error::Other(
+                "committed event-log rotation does not match retained generation".into(),
+            ));
+        }
+        if let Err(error) = fs::remove_file(&journal_path) {
+            if error.kind() != std::io::ErrorKind::NotFound {
+                tracing::warn!(
+                    %error,
+                    path = %journal_path.display(),
+                    "committed event-log rotation journal cleanup failed"
+                );
+            }
+        }
+        return Ok(());
+    }
+
+    if index.current_base != rotation.old_base {
+        return Err(shelbi_core::Error::Other(
+            "event-log rotation journal does not match the persisted index".into(),
+        ));
+    }
+
+    if current_is_source {
+        // The process stopped after journaling but before rename. Leave
+        // current untouched; the next append can retry rotation.
+        if let Err(error) = fs::remove_file(&journal_path) {
+            if error.kind() != std::io::ErrorKind::NotFound {
+                tracing::warn!(
+                    %error,
+                    path = %journal_path.display(),
+                    "pre-rename event-log rotation journal cleanup failed"
+                );
+            }
+        }
+        return Ok(());
+    }
+
+    if current_metadata.is_some() {
+        return Err(shelbi_core::Error::Other(
+            "event-log current file changed after rotation was journaled; refusing ambiguous recovery"
+                .into(),
+        ));
+    }
+    if !rotated_is_source {
+        return Err(shelbi_core::Error::Other(
+            "event-log rotated generation does not match its recovery journal".into(),
+        ));
+    }
+    *index = EventLogIndex {
+        version: EVENT_LOG_INDEX_VERSION,
+        previous_base: Some(rotation.old_base),
+        current_base: new_base,
+    };
+    save_event_log_index(path, index)?;
+    if let Err(error) = fs::remove_file(&journal_path) {
+        if error.kind() != std::io::ErrorKind::NotFound {
+            tracing::warn!(
+                %error,
+                path = %journal_path.display(),
+                "recovered event-log rotation journal cleanup failed"
+            );
+        }
+    }
+    Ok(())
+}
+
+fn load_event_log_index(path: &Path) -> Result<EventLogIndex> {
+    let index_path = event_log_index_path(path);
+    let (mut index, index_was_absent) = match fs::read_to_string(&index_path) {
+        Ok(text) => (
+            serde_json::from_str::<EventLogIndex>(&text)
+                .map_err(|e| shelbi_core::Error::Other(format!("invalid event-log index: {e}")))?,
+            false,
+        ),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => (EventLogIndex::default(), true),
+        Err(e) => return Err(shelbi_core::Error::Io(e)),
+    };
+    if index.version != EVENT_LOG_INDEX_VERSION {
+        return Err(shelbi_core::Error::Other(format!(
+            "unsupported event-log index version {}",
+            index.version
+        )));
+    }
+    recover_event_log_rotation(path, &mut index)?;
+    let index_is_established = match fs::metadata(&index_path) {
+        Ok(_) => true,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
+        Err(e) => return Err(shelbi_core::Error::Io(e)),
+    };
+    if index_was_absent && !index_is_established {
+        let current_len = match fs::metadata(path) {
+            Ok(metadata) => metadata.len(),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => 0,
+            Err(e) => return Err(shelbi_core::Error::Io(e)),
+        };
+        let migration = load_or_create_event_log_migration(path, current_len)?;
+        normalize_legacy_event_cursors(migration.current_len)?;
+        save_event_log_index(path, &index)?;
+        cleanup_event_log_migration(path);
+    } else if index_is_established {
+        cleanup_event_log_migration(path);
+    }
+    Ok(index)
+}
+
+/// Logical start of the current `events.log` generation. Missing project
+/// cursors initialize here, preserving the historical behavior of starting at
+/// the current log rather than replaying an already-rotated legacy `.1`.
+pub fn event_log_current_base() -> Result<u64> {
+    let path = events_log_path()?;
+    let _lock = acquire_file_lock(&event_log_lock_path(&path))?;
+    Ok(load_event_log_index(&path)?.current_base)
+}
+
+pub fn event_log_head() -> Result<u64> {
+    let path = events_log_path()?;
+    let _lock = acquire_file_lock(&event_log_lock_path(&path))?;
+    let index = load_event_log_index(&path)?;
+    let len = match fs::metadata(path) {
+        Ok(metadata) => metadata.len(),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => 0,
+        Err(e) => return Err(shelbi_core::Error::Io(e)),
+    };
+    Ok(index.current_base.saturating_add(len))
+}
+
+fn append_exact_log_range(
+    path: &Path,
+    offset: u64,
+    len: u64,
+    bytes: &mut Vec<u8>,
+) -> Result<()> {
+    if len == 0 {
+        return Ok(());
+    }
+    let mut file = fs::File::open(path)
+        .map_err(|e| shelbi_core::Error::Io(crate::annotate_io_error(path, e)))?;
+    file.seek(SeekFrom::Start(offset))
+        .map_err(shelbi_core::Error::Io)?;
+    let before = bytes.len();
+    file.take(len)
+        .read_to_end(bytes)
+        .map_err(shelbi_core::Error::Io)?;
+    let read = (bytes.len() - before) as u64;
+    if read != len {
+        return Err(shelbi_core::Error::Other(format!(
+            "event-log range in {} changed while reading: expected {len} bytes, read {read}",
+            path.display()
+        )));
+    }
+    Ok(())
+}
+
+/// Read retained event bytes from a monotonic logical cursor. A cursor in the
+/// prior generation drains the remainder of `.1` and then current in one
+/// contiguous result. Expired or future cursors fail closed instead of being
+/// silently reset to a different generation.
+pub fn read_event_log_from(cursor: u64) -> Result<EventLogRead> {
+    let path = events_log_path()?;
+    let _lock = acquire_file_lock(&event_log_lock_path(&path))?;
+    let index = load_event_log_index(&path)?;
+    let current_len = match fs::metadata(&path) {
+        Ok(metadata) => metadata.len(),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => 0,
+        Err(e) => return Err(shelbi_core::Error::Io(e)),
+    };
+    let head = index.current_base.saturating_add(current_len);
+    let earliest = index.previous_base.unwrap_or(index.current_base);
+    if cursor < earliest {
+        return Err(shelbi_core::Error::Other(format!(
+            "event cursor {cursor} predates earliest retained cursor {earliest}"
+        )));
+    }
+    if cursor > head {
+        return Err(shelbi_core::Error::Other(format!(
+            "event cursor {cursor} is ahead of event-log head {head}"
+        )));
+    }
+
+    let mut bytes = Vec::with_capacity((head - cursor) as usize);
+    if cursor < index.current_base {
+        let previous_base = index.previous_base.ok_or_else(|| {
+            shelbi_core::Error::Other("event cursor requires an unavailable generation".into())
+        })?;
+        let rotated = path.with_extension("log.1");
+        let expected_previous_len = index
+            .current_base
+            .checked_sub(previous_base)
+            .ok_or_else(|| shelbi_core::Error::Other("invalid event-log generation bases".into()))?;
+        let retained_len = fs::metadata(&rotated)
+            .map_err(|e| shelbi_core::Error::Io(crate::annotate_io_error(&rotated, e)))?
+            .len();
+        if retained_len != expected_previous_len {
+            return Err(shelbi_core::Error::Other(format!(
+                "retained event-log generation length {retained_len} does not match indexed length {expected_previous_len}"
+            )));
+        }
+        append_exact_log_range(
+            &rotated,
+            cursor - previous_base,
+            index.current_base - cursor,
+            &mut bytes,
+        )?;
+        let retained_len_after = fs::metadata(&rotated)
+            .map_err(|e| shelbi_core::Error::Io(crate::annotate_io_error(&rotated, e)))?
+            .len();
+        if retained_len_after != expected_previous_len {
+            return Err(shelbi_core::Error::Other(format!(
+                "retained event-log generation changed while reading: expected {expected_previous_len} bytes, found {retained_len_after}"
+            )));
+        }
+    }
+    let current_offset = cursor.saturating_sub(index.current_base);
+    let current_read_len = current_len.checked_sub(current_offset).ok_or_else(|| {
+        shelbi_core::Error::Other("event cursor is outside the current generation".into())
+    })?;
+    append_exact_log_range(&path, current_offset, current_read_len, &mut bytes)?;
+    Ok(EventLogRead {
+        start: cursor,
+        head,
+        bytes,
+    })
+}
+
+pub fn event_cursor_path(project: &str) -> Result<PathBuf> {
+    Ok(project_dir(project)?.join("event-cursor"))
+}
+
+/// Read a project's applied cursor, registering a missing cursor at the start
+/// of the current generation before any later rotation can discard it.
+pub fn read_or_initialize_event_cursor(project: &str) -> Result<u64> {
+    let path = event_cursor_path(project)?;
+    let log_path = events_log_path()?;
+    let _lock = acquire_file_lock(&event_log_lock_path(&log_path))?;
+    let index = load_event_log_index(&log_path)?;
+    match fs::read_to_string(&path) {
+        Ok(text) => text.trim().parse().map_err(|_| {
+            shelbi_core::Error::Other(format!("invalid event cursor in {}", path.display()))
+        }),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            let cursor = index.current_base;
+            atomic_write(&path, cursor.to_string().as_bytes())?;
+            Ok(cursor)
+        }
+        Err(e) => Err(shelbi_core::Error::Io(e)),
+    }
+}
+
+pub fn write_event_cursor(project: &str, cursor: u64) -> Result<()> {
+    let path = event_cursor_path(project)?;
+    let log_path = events_log_path()?;
+    let _lock = acquire_file_lock(&event_log_lock_path(&log_path))?;
+    // Deliberately do not load or create the global index here. Upgrade
+    // migration must be able to observe a legacy cursor while the index is
+    // still absent; the next read initializes both under this same lock.
+    atomic_write(&path, cursor.to_string().as_bytes())
 }
 
 /// Local Unix-domain socket the hub daemon (`shelbi daemon`) listens on.
@@ -1165,17 +1640,50 @@ fn append_event_line(line: &str) -> Result<()> {
     if let Some(parent) = path.parent() {
         ensure_dir(parent)?;
     }
-    maybe_rotate_events_log(&path, EVENTS_LOG_MAX_BYTES);
     let mut buf = String::with_capacity(line.len() + 1);
     buf.push_str(line);
     buf.push('\n');
-    let mut f = fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&path)
-        .map_err(|e| shelbi_core::Error::Io(crate::annotate_io_error(&path, e)))?;
-    f.write_all(buf.as_bytes())
-        .map_err(|e| shelbi_core::Error::Io(crate::annotate_io_error(&path, e)))?;
+    {
+        let _lock = acquire_file_lock(&event_log_lock_path(&path))?;
+        match load_event_log_index(&path) {
+            Ok(mut index) => {
+                match maybe_rotate_events_log(&path, EVENTS_LOG_MAX_BYTES, &mut index) {
+                    Ok(_) => {}
+                    Err(EventLogRotationFailure::BeforeRename(error)) => {
+                        tracing::warn!(
+                            %error,
+                            path = %path.display(),
+                            "event-log rotation preparation failed; appending without rotation"
+                        );
+                    }
+                    Err(EventLogRotationFailure::AfterRename(error)) => {
+                        return Err(shelbi_core::Error::Other(format!(
+                            "event-log rotation failed after renaming current data; recovery is required before append: {error}"
+                        )));
+                    }
+                }
+            }
+            Err(error) if pending_rotation_is_post_rename_or_ambiguous(&path) => {
+                return Err(shelbi_core::Error::Other(format!(
+                    "event-log bookkeeping failed with a pending post-rename rotation; refusing an ambiguous append: {error}"
+                )));
+            }
+            Err(error) => {
+                tracing::warn!(
+                    %error,
+                    path = %path.display(),
+                    "event-log bookkeeping unavailable; appending without rotation"
+                );
+            }
+        }
+        let mut f = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .map_err(|e| shelbi_core::Error::Io(crate::annotate_io_error(&path, e)))?;
+        f.write_all(buf.as_bytes())
+            .map_err(|e| shelbi_core::Error::Io(crate::annotate_io_error(&path, e)))?;
+    }
     deliver_event_envelope(&EventEnvelope::from_log_line(line));
     Ok(())
 }
@@ -1220,20 +1728,196 @@ fn deliver_event_envelope(envelope: &EventEnvelope) {
 /// dropped on the next rotation.
 const EVENTS_LOG_MAX_BYTES: u64 = 8 * 1024 * 1024;
 
-/// Best-effort size-based rotation: if `path` (the current `events.log`)
-/// is at least `max_bytes`, rename it to `events.log.1` — replacing any
-/// prior generation — so the next append starts a fresh file. Racy by
-/// design under concurrent appenders: whichever writer wins the rename
-/// rotates, and a loser that then stats the fresh small file simply skips
-/// (which is correct). Every error is swallowed — a rotation hiccup must
-/// never block an event write, which is the caller's actual job.
-fn maybe_rotate_events_log(path: &std::path::Path, max_bytes: u64) {
+#[derive(Debug)]
+enum EventLogRotationFailure {
+    /// No rename completed, so the current file is still safe to append.
+    BeforeRename(shelbi_core::Error),
+    /// The current file moved to `.1`; callers must recover before appending
+    /// instead of guessing which generation owns the next logical offset.
+    AfterRename(shelbi_core::Error),
+}
+
+/// A failed bookkeeping load is normally safe to bypass because no rename
+/// was attempted by the current append. With a pending journal, bypass is
+/// safe only when the current file still has the journaled source identity;
+/// a missing, replaced, or uninspectable source may be post-rename.
+fn pending_rotation_is_post_rename_or_ambiguous(path: &Path) -> bool {
+    let journal_path = event_log_rotation_path(path);
+    let text = match fs::read_to_string(&journal_path) {
+        Ok(text) => text,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return false,
+        Err(_) => return true,
+    };
+    let rotation: EventLogRotation = match serde_json::from_str(&text) {
+        Ok(rotation) => rotation,
+        Err(_) if malformed_journal_is_definitely_pre_rename(path) => {
+            if let Err(error) = fs::remove_file(&journal_path) {
+                if error.kind() != std::io::ErrorKind::NotFound {
+                    tracing::warn!(
+                        %error,
+                        path = %journal_path.display(),
+                        "malformed pre-rename event-log journal cleanup failed"
+                    );
+                }
+            }
+            return false;
+        }
+        Err(_) => return true,
+    };
     match fs::metadata(path) {
-        Ok(m) if m.len() >= max_bytes => {}
-        _ => return,
+        Ok(metadata) => !metadata_is_pre_rename_source(&metadata, &rotation),
+        Err(_) => true,
     }
+}
+
+/// A malformed journal has lost the source inode needed for exact recovery.
+/// It is still positively pre-rename when current remains over the rotation
+/// threshold and the retained generation still matches the persisted index:
+/// the rename would have replaced that retained file (or created it for the
+/// first generation). Any other shape remains ambiguous and fails closed.
+fn malformed_journal_is_definitely_pre_rename(path: &Path) -> bool {
+    let current = match fs::metadata(path) {
+        Ok(metadata) if metadata.len() >= EVENTS_LOG_MAX_BYTES => metadata,
+        _ => return false,
+    };
+    let index = match fs::read_to_string(event_log_index_path(path))
+        .ok()
+        .and_then(|text| serde_json::from_str::<EventLogIndex>(&text).ok())
+    {
+        Some(index) if index.version == EVENT_LOG_INDEX_VERSION => index,
+        _ => return false,
+    };
     let rotated = path.with_extension("log.1");
-    let _ = fs::rename(path, &rotated);
+    (match index.previous_base {
+        None => rotated.try_exists().ok() == Some(false),
+        Some(previous_base) => index
+            .current_base
+            .checked_sub(previous_base)
+            .and_then(|expected_len| {
+                fs::metadata(rotated)
+                    .ok()
+                    .map(|metadata| metadata.len() == expected_len)
+            })
+            .unwrap_or(false),
+    }) && current.is_file()
+}
+
+/// Return true when an indexed `.1` still contains bytes needed by any
+/// registered project cursor. Malformed cursors block destructive rotation;
+/// preserving the log is safer than guessing that corrupt state was applied.
+fn prior_generation_is_needed(current_base: u64) -> Result<bool> {
+    let dir = projects_dir()?;
+    let entries = match fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(e) => return Err(shelbi_core::Error::Io(e)),
+    };
+    for entry in entries {
+        let entry = entry.map_err(shelbi_core::Error::Io)?;
+        if !entry.file_type().map_err(shelbi_core::Error::Io)?.is_dir() {
+            continue;
+        }
+        let cursor_path = entry.path().join("event-cursor");
+        let text = match fs::read_to_string(&cursor_path) {
+            Ok(text) => text,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => return Err(shelbi_core::Error::Io(e)),
+        };
+        let Ok(cursor) = text.trim().parse::<u64>() else {
+            tracing::warn!(
+                path = %cursor_path.display(),
+                "malformed event cursor blocks destructive log rotation"
+            );
+            return Ok(true);
+        };
+        if cursor < current_base {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// Size-based rotation with monotonic logical offsets. The caller holds the
+/// event-log lock. A second rotation is deferred while a registered cursor
+/// still needs `.1`; the current file may temporarily exceed the soft size
+/// bound, but durable facts are never discarded to enforce that bound.
+fn maybe_rotate_events_log(
+    path: &Path,
+    max_bytes: u64,
+    index: &mut EventLogIndex,
+) -> std::result::Result<bool, EventLogRotationFailure> {
+    let metadata = match fs::metadata(path) {
+        Ok(metadata) if metadata.len() >= max_bytes => metadata,
+        Ok(_) => return Ok(false),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(e) => {
+            return Err(EventLogRotationFailure::BeforeRename(
+                shelbi_core::Error::Io(e),
+            ))
+        }
+    };
+    let len = metadata.len();
+    if index.previous_base.is_some() {
+        match prior_generation_is_needed(index.current_base) {
+            Ok(true) => return Ok(false),
+            Ok(false) => {}
+            Err(error) => return Err(EventLogRotationFailure::BeforeRename(error)),
+        }
+    }
+
+    let journal = EventLogRotation {
+        version: EVENT_LOG_INDEX_VERSION,
+        old_base: index.current_base,
+        old_len: len,
+        old_dev: metadata.dev(),
+        old_ino: metadata.ino(),
+    };
+    let journal_bytes = serde_json::to_vec(&journal).map_err(|e| {
+        EventLogRotationFailure::BeforeRename(shelbi_core::Error::Other(format!(
+            "serialize event-log rotation: {e}"
+        )))
+    })?;
+    atomic_write(&event_log_rotation_path(path), &journal_bytes)
+        .map_err(EventLogRotationFailure::BeforeRename)?;
+    let rotated = path.with_extension("log.1");
+    if let Err(error) = fs::rename(path, &rotated) {
+        let error = shelbi_core::Error::Io(crate::annotate_io_error(path, error));
+        return match fs::metadata(path) {
+            Ok(_) => {
+                let _ = fs::remove_file(event_log_rotation_path(path));
+                Err(EventLogRotationFailure::BeforeRename(error))
+            }
+            Err(_) => Err(EventLogRotationFailure::AfterRename(error)),
+        };
+    }
+    let rotated_metadata = fs::metadata(&rotated).map_err(|error| {
+        EventLogRotationFailure::AfterRename(shelbi_core::Error::Io(
+            crate::annotate_io_error(&rotated, error),
+        ))
+    })?;
+    if !metadata_matches_rotation_source(&rotated_metadata, &journal) {
+        return Err(EventLogRotationFailure::AfterRename(
+            shelbi_core::Error::Other(
+                "event-log source changed across rename; refusing to commit its index".into(),
+            ),
+        ));
+    }
+    *index = EventLogIndex {
+        version: EVENT_LOG_INDEX_VERSION,
+        previous_base: Some(journal.old_base),
+        current_base: journal.old_base.saturating_add(journal.old_len),
+    };
+    save_event_log_index(path, index).map_err(EventLogRotationFailure::AfterRename)?;
+    if let Err(error) = fs::remove_file(event_log_rotation_path(path)) {
+        if error.kind() != std::io::ErrorKind::NotFound {
+            tracing::warn!(
+                %error,
+                path = %event_log_rotation_path(path).display(),
+                "event-log index committed but rotation journal cleanup failed"
+            );
+        }
+    }
+    Ok(true)
 }
 
 fn sanitize_reason(s: &str) -> String {
@@ -1291,6 +1975,17 @@ mod tests {
         ));
         std::fs::create_dir_all(&p).unwrap();
         p
+    }
+
+    fn journal_for(path: &Path, old_base: u64) -> EventLogRotation {
+        let metadata = std::fs::metadata(path).unwrap();
+        EventLogRotation {
+            version: EVENT_LOG_INDEX_VERSION,
+            old_base,
+            old_len: metadata.len(),
+            old_dev: metadata.dev(),
+            old_ino: metadata.ino(),
+        }
     }
 
     #[test]
@@ -1445,25 +2140,447 @@ mod tests {
         let path = events_log_path().unwrap();
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         let rotated = path.with_extension("log.1");
+        let mut index = load_event_log_index(&path).unwrap();
 
         // Under the (test) threshold: no rotation, file untouched.
         std::fs::write(&path, "small\n").unwrap();
-        maybe_rotate_events_log(&path, 1024);
+        assert!(!maybe_rotate_events_log(&path, 1024, &mut index).unwrap());
         assert!(path.exists());
         assert!(!rotated.exists());
 
         // At/over the threshold: current log renames to `.1`, leaving room
         // for a fresh file on the next append.
         std::fs::write(&path, "x".repeat(2048)).unwrap();
-        maybe_rotate_events_log(&path, 1024);
+        assert!(maybe_rotate_events_log(&path, 1024, &mut index).unwrap());
         assert!(!path.exists(), "over-size log should be rotated away");
         assert!(rotated.exists(), "rotated generation should exist");
+        assert_eq!(index.previous_base, Some(0));
+        assert_eq!(index.current_base, 2048);
 
         // A second rotation replaces the prior `.1` rather than erroring.
         std::fs::write(&path, "y".repeat(2048)).unwrap();
-        maybe_rotate_events_log(&path, 1024);
+        assert!(maybe_rotate_events_log(&path, 1024, &mut index).unwrap());
         assert!(rotated.exists());
         assert_eq!(std::fs::read(&rotated).unwrap(), b"y".repeat(2048));
+        assert_eq!(index.previous_base, Some(2048));
+        assert_eq!(index.current_base, 4096);
+
+        std::env::remove_var("SHELBI_HOME");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn malformed_pre_rename_bookkeeping_does_not_suppress_event_append() {
+        let _g = TEST_LOCK.lock().unwrap();
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+
+        let path = events_log_path().unwrap();
+        let original = "x".repeat(EVENTS_LOG_MAX_BYTES as usize);
+        std::fs::write(&path, &original).unwrap();
+        std::fs::write(event_log_index_path(&path), b"{not-json").unwrap();
+
+        append_workspace_event("demo", "alpha", None, WorkspaceState::Working).unwrap();
+
+        let current = std::fs::read_to_string(&path).unwrap();
+        assert!(current.len() > original.len());
+        assert!(current.contains("project=demo workspace=alpha"));
+        assert!(!path.with_extension("log.1").exists());
+
+        std::env::remove_var("SHELBI_HOME");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn malformed_pre_rename_journal_does_not_suppress_event_append() {
+        let _g = TEST_LOCK.lock().unwrap();
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+
+        let path = events_log_path().unwrap();
+        load_event_log_index(&path).unwrap();
+        let original = "x".repeat(EVENTS_LOG_MAX_BYTES as usize);
+        std::fs::write(&path, &original).unwrap();
+        std::fs::write(event_log_rotation_path(&path), b"{not-json").unwrap();
+
+        append_workspace_event("demo", "alpha", None, WorkspaceState::Working).unwrap();
+
+        let current = std::fs::read_to_string(&path).unwrap();
+        assert!(current.len() > original.len());
+        assert!(current.contains("project=demo workspace=alpha"));
+        assert!(!event_log_rotation_path(&path).exists());
+        assert!(!path.with_extension("log.1").exists());
+
+        std::env::remove_var("SHELBI_HOME");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn pre_rename_journal_remains_recoverable_after_unindexed_appends() {
+        let _g = TEST_LOCK.lock().unwrap();
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+
+        let path = events_log_path().unwrap();
+        std::fs::write(&path, b"current-generation\n").unwrap();
+        let index = load_event_log_index(&path).unwrap();
+        let journal = journal_for(&path, index.current_base);
+        atomic_write(
+            &event_log_rotation_path(&path),
+            &serde_json::to_vec(&journal).unwrap(),
+        )
+        .unwrap();
+        std::fs::write(event_log_index_path(&path), b"{not-json").unwrap();
+
+        append_workspace_event("demo", "alpha", None, WorkspaceState::Working).unwrap();
+        append_workspace_event("demo", "bravo", None, WorkspaceState::Working).unwrap();
+        let current = std::fs::read_to_string(&path).unwrap();
+        assert!(current.contains("workspace=alpha"));
+        assert!(current.contains("workspace=bravo"));
+
+        save_event_log_index(&path, &index).unwrap();
+        assert_eq!(load_event_log_index(&path).unwrap().current_base, 0);
+        assert!(!event_log_rotation_path(&path).exists());
+
+        std::env::remove_var("SHELBI_HOME");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn legacy_migration_retry_keeps_original_length_cutoff_after_append() {
+        let _g = TEST_LOCK.lock().unwrap();
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+
+        let path = events_log_path().unwrap();
+        std::fs::write(&path, b"x\n").unwrap();
+        let broken_cursor = project_dir("a-broken").unwrap().join("event-cursor");
+        std::fs::create_dir_all(&broken_cursor).unwrap();
+        write_event_cursor("z-demo", 50).unwrap();
+
+        // The sorted migration sweep fails on a-broken after persisting its
+        // original two-byte cutoff. The event itself must still append.
+        append_workspace_event("z-demo", "alpha", None, WorkspaceState::Working).unwrap();
+        assert!(std::fs::metadata(&path).unwrap().len() > 50);
+        assert!(!event_log_index_path(&path).exists());
+        assert!(event_log_migration_path(&path).exists());
+
+        std::fs::remove_dir(&broken_cursor).unwrap();
+        assert_eq!(read_or_initialize_event_cursor("z-demo").unwrap(), 0);
+        assert!(event_log_index_path(&path).exists());
+        assert!(!event_log_migration_path(&path).exists());
+
+        std::env::remove_var("SHELBI_HOME");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn malformed_legacy_cursor_normalizes_once_then_fails_closed() {
+        let _g = TEST_LOCK.lock().unwrap();
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+
+        let path = event_cursor_path("demo").unwrap();
+        atomic_write(&path, b"not-a-cursor").unwrap();
+        assert_eq!(read_or_initialize_event_cursor("demo").unwrap(), 0);
+
+        atomic_write(&path, b"still-not-a-cursor").unwrap();
+        let error = read_or_initialize_event_cursor("demo").unwrap_err();
+        assert!(error.to_string().contains("invalid event cursor"));
+
+        std::env::remove_var("SHELBI_HOME");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn ambiguous_post_rename_bookkeeping_refuses_to_create_current_log() {
+        let _g = TEST_LOCK.lock().unwrap();
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+
+        let path = events_log_path().unwrap();
+        let rotated = path.with_extension("log.1");
+        std::fs::write(&rotated, b"renamed-generation\n").unwrap();
+        std::fs::write(event_log_index_path(&path), b"{not-json").unwrap();
+        let journal = journal_for(&rotated, 0);
+        atomic_write(
+            &event_log_rotation_path(&path),
+            &serde_json::to_vec(&journal).unwrap(),
+        )
+        .unwrap();
+
+        let error = append_workspace_event("demo", "alpha", None, WorkspaceState::Working)
+            .unwrap_err();
+        assert!(error.to_string().contains("ambiguous append"));
+        assert!(!path.exists());
+
+        std::env::remove_var("SHELBI_HOME");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn malformed_journal_with_missing_current_refuses_ambiguous_append() {
+        let _g = TEST_LOCK.lock().unwrap();
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+
+        let path = events_log_path().unwrap();
+        load_event_log_index(&path).unwrap();
+        std::fs::write(path.with_extension("log.1"), b"renamed-generation\n").unwrap();
+        std::fs::write(event_log_rotation_path(&path), b"{not-json").unwrap();
+
+        let error = append_workspace_event("demo", "alpha", None, WorkspaceState::Working)
+            .unwrap_err();
+        assert!(error.to_string().contains("ambiguous append"));
+        assert!(!path.exists());
+
+        std::env::remove_var("SHELBI_HOME");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn recovery_rejects_current_recreated_after_rename() {
+        let _g = TEST_LOCK.lock().unwrap();
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+
+        let path = events_log_path().unwrap();
+        let index = load_event_log_index(&path).unwrap();
+        std::fs::write(&path, b"renamed-generation\n").unwrap();
+        let journal = journal_for(&path, index.current_base);
+        atomic_write(
+            &event_log_rotation_path(&path),
+            &serde_json::to_vec(&journal).unwrap(),
+        )
+        .unwrap();
+        std::fs::rename(&path, path.with_extension("log.1")).unwrap();
+        std::fs::write(&path, b"degraded-writer-current\n").unwrap();
+
+        let error = load_event_log_index(&path).unwrap_err();
+        assert!(error.to_string().contains("refusing ambiguous recovery"));
+        assert!(event_log_rotation_path(&path).exists());
+        let append_error = append_workspace_event(
+            "demo",
+            "alpha",
+            None,
+            WorkspaceState::Working,
+        )
+        .unwrap_err();
+        assert!(append_error.to_string().contains("ambiguous append"));
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            b"degraded-writer-current\n"
+        );
+
+        std::env::remove_var("SHELBI_HOME");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn recovery_rejects_rotated_generation_with_wrong_length() {
+        let _g = TEST_LOCK.lock().unwrap();
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+
+        let path = events_log_path().unwrap();
+        let index = load_event_log_index(&path).unwrap();
+        std::fs::write(&path, b"renamed-generation\n").unwrap();
+        let journal = journal_for(&path, index.current_base);
+        atomic_write(
+            &event_log_rotation_path(&path),
+            &serde_json::to_vec(&journal).unwrap(),
+        )
+        .unwrap();
+        let rotated = path.with_extension("log.1");
+        std::fs::rename(&path, &rotated).unwrap();
+        std::fs::write(&rotated, b"truncated\n").unwrap();
+
+        let error = load_event_log_index(&path).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("rotated generation does not match"));
+        assert!(event_log_rotation_path(&path).exists());
+
+        std::env::remove_var("SHELBI_HOME");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn rotation_journal_before_rename_rolls_back_without_moving_current() {
+        let _g = TEST_LOCK.lock().unwrap();
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+
+        let path = events_log_path().unwrap();
+        let current = b"current-generation\n";
+        std::fs::write(&path, current).unwrap();
+        let index = load_event_log_index(&path).unwrap();
+        let journal = journal_for(&path, index.current_base);
+        atomic_write(
+            &event_log_rotation_path(&path),
+            &serde_json::to_vec(&journal).unwrap(),
+        )
+        .unwrap();
+
+        let recovered = load_event_log_index(&path).unwrap();
+        assert_eq!(recovered.previous_base, index.previous_base);
+        assert_eq!(recovered.current_base, index.current_base);
+        assert_eq!(std::fs::read(&path).unwrap(), current);
+        assert!(!event_log_rotation_path(&path).exists());
+
+        std::env::remove_var("SHELBI_HOME");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn rotation_journal_after_rename_reconstructs_logical_index() {
+        let _g = TEST_LOCK.lock().unwrap();
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+
+        let path = events_log_path().unwrap();
+        let index = load_event_log_index(&path).unwrap();
+        let previous = b"previous-generation\n";
+        std::fs::write(&path, previous).unwrap();
+        let journal = journal_for(&path, index.current_base);
+        atomic_write(
+            &event_log_rotation_path(&path),
+            &serde_json::to_vec(&journal).unwrap(),
+        )
+        .unwrap();
+        std::fs::rename(&path, path.with_extension("log.1")).unwrap();
+
+        let recovered = load_event_log_index(&path).unwrap();
+        assert_eq!(recovered.previous_base, Some(index.current_base));
+        assert_eq!(
+            recovered.current_base,
+            index.current_base + previous.len() as u64
+        );
+        assert!(!event_log_rotation_path(&path).exists());
+        let persisted: EventLogIndex = serde_json::from_str(
+            &std::fs::read_to_string(event_log_index_path(&path)).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(persisted.previous_base, recovered.previous_base);
+        assert_eq!(persisted.current_base, recovered.current_base);
+
+        std::env::remove_var("SHELBI_HOME");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn committed_rotation_index_cleans_up_leftover_journal() {
+        let _g = TEST_LOCK.lock().unwrap();
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+
+        let path = events_log_path().unwrap();
+        let index = load_event_log_index(&path).unwrap();
+        let previous = b"previous-generation\n";
+        std::fs::write(&path, previous).unwrap();
+        let journal = journal_for(&path, index.current_base);
+        atomic_write(
+            &event_log_rotation_path(&path),
+            &serde_json::to_vec(&journal).unwrap(),
+        )
+        .unwrap();
+        std::fs::rename(&path, path.with_extension("log.1")).unwrap();
+        let committed = EventLogIndex {
+            version: EVENT_LOG_INDEX_VERSION,
+            previous_base: Some(journal.old_base),
+            current_base: journal.old_base + journal.old_len,
+        };
+        save_event_log_index(&path, &committed).unwrap();
+        std::fs::write(&path, b"new-current\n").unwrap();
+
+        let recovered = load_event_log_index(&path).unwrap();
+        assert_eq!(recovered.previous_base, committed.previous_base);
+        assert_eq!(recovered.current_base, committed.current_base);
+        assert!(!event_log_rotation_path(&path).exists());
+        assert_eq!(std::fs::read(&path).unwrap(), b"new-current\n");
+
+        std::env::remove_var("SHELBI_HOME");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn logical_cursor_reads_rotated_tail_before_regrown_current_prefix() {
+        let _g = TEST_LOCK.lock().unwrap();
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+
+        let path = events_log_path().unwrap();
+        let old_first = b"old-first\n";
+        let old_second = b"old-second\n";
+        let mut old = old_first.to_vec();
+        old.extend_from_slice(old_second);
+        std::fs::write(&path, &old).unwrap();
+        let cursor = old_first.len() as u64;
+        let mut index = load_event_log_index(&path).unwrap();
+        assert!(maybe_rotate_events_log(&path, 1, &mut index).unwrap());
+
+        // Grow current beyond the old physical cursor. A length-only reader
+        // would now seek `cursor` into this generation and skip its prefix.
+        let current = b"new-prefix-longer-than-old-cursor\nnew-second\n";
+        assert!(current.len() as u64 > cursor);
+        std::fs::write(&path, current).unwrap();
+
+        let read = read_event_log_from(cursor).unwrap();
+        let mut expected = old_second.to_vec();
+        expected.extend_from_slice(current);
+        assert_eq!(read.bytes, expected);
+        assert_eq!(read.start, cursor);
+        assert_eq!(read.head, old.len() as u64 + current.len() as u64);
+
+        std::env::remove_var("SHELBI_HOME");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn logical_reader_rejects_mismatched_retained_generation_length() {
+        let _g = TEST_LOCK.lock().unwrap();
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+
+        let path = events_log_path().unwrap();
+        std::fs::write(&path, b"complete-generation\n").unwrap();
+        let mut index = load_event_log_index(&path).unwrap();
+        assert!(maybe_rotate_events_log(&path, 1, &mut index).unwrap());
+        std::fs::write(path.with_extension("log.1"), b"short\n").unwrap();
+        std::fs::write(&path, b"current\n").unwrap();
+
+        let error = read_event_log_from(0).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("does not match indexed length"));
+
+        std::env::remove_var("SHELBI_HOME");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn rotation_waits_for_slowest_of_two_project_cursors() {
+        let _g = TEST_LOCK.lock().unwrap();
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+
+        let path = events_log_path().unwrap();
+        std::fs::write(&path, b"first-generation\n").unwrap();
+        let mut index = load_event_log_index(&path).unwrap();
+        assert!(maybe_rotate_events_log(&path, 1, &mut index).unwrap());
+        let current_base = index.current_base;
+
+        std::fs::create_dir_all(project_dir("fast").unwrap()).unwrap();
+        std::fs::create_dir_all(project_dir("slow").unwrap()).unwrap();
+        write_event_cursor("fast", current_base).unwrap();
+        write_event_cursor("slow", 0).unwrap();
+        std::fs::write(&path, b"second-generation\n").unwrap();
+        assert!(!maybe_rotate_events_log(&path, 1, &mut index).unwrap());
+        assert_eq!(index.current_base, current_base);
+
+        write_event_cursor("slow", current_base).unwrap();
+        assert!(maybe_rotate_events_log(&path, 1, &mut index).unwrap());
+        assert!(index.current_base > current_base);
 
         std::env::remove_var("SHELBI_HOME");
         let _ = std::fs::remove_dir_all(&home);

@@ -15,10 +15,14 @@ shelbi-tmux = { workspace = true }
 shelbi-ssh = { workspace = true }
 shelbi-agent = { workspace = true }
 serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
 tracing = { workspace = true }
 chrono = { workspace = true }
 chrono-tz = { workspace = true }
 globset = "0.4"
+tungstenite = { workspace = true }
+libc = { workspace = true }
 
 [dev-dependencies]
 tempfile = "3"
