@@ -13,6 +13,7 @@ use std::process::{Command, Output};
 use std::time::Duration;
 
 use anyhow::{anyhow, bail, Context, Result};
+use clap::ValueEnum;
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
 use inquire::{Confirm, Select, Text};
@@ -45,7 +46,7 @@ pub fn text(label: &str, default: &str) -> Result<String> {
         .with_context(|| format!("text prompt {label:?}"))
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, ValueEnum)]
 pub(crate) enum Runner {
     Claude,
     Codex,
@@ -102,7 +103,75 @@ pub(crate) struct DetectedSetupPlan {
     pub(crate) git_init_root: Option<PathBuf>,
 }
 
+/// Script-provided replacements for the editable fields on the detected setup
+/// card. The repository root is intentionally absent: callers choose it before
+/// detection so deferred Git initialization remains approved for that exact
+/// path rather than accidentally prompting after an override.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct SetupPlanOverrides {
+    pub(crate) project_name: Option<String>,
+    pub(crate) default_branch: Option<String>,
+    pub(crate) remote_url: Option<String>,
+    pub(crate) orchestrator_runner: Option<Runner>,
+    pub(crate) workspace_count: Option<u32>,
+    pub(crate) workspace_preset: Option<WorkspaceNamePreset>,
+}
+
 impl DetectedSetupPlan {
+    /// Apply explicit scripted values after detection. Every error here is a
+    /// prerequisite failure and therefore happens before Git initialization or
+    /// project scaffolding begins.
+    pub(crate) fn apply_overrides(&mut self, overrides: SetupPlanOverrides) -> Result<()> {
+        if let Some(project_name) = overrides.project_name {
+            self.project_name =
+                crate::project_root::normalize_project_name_announced(project_name.trim())?;
+        }
+        if let Some(default_branch) = overrides.default_branch {
+            let default_branch = default_branch.trim();
+            if default_branch.is_empty() {
+                bail!("--default-branch must not be empty");
+            }
+            shelbi_core::validate_branch(default_branch)
+                .map_err(|error| anyhow!("invalid --default-branch {default_branch:?}: {error}"))?;
+            self.default_branch = default_branch.to_string();
+        }
+        if let Some(remote_url) = overrides.remote_url {
+            self.remote_url = remote_url_for_storage(&remote_url);
+        }
+        if let Some(orchestrator_runner) = overrides.orchestrator_runner {
+            if !self
+                .detected_runners
+                .iter()
+                .any(|detected| detected.runner == orchestrator_runner)
+            {
+                bail!(
+                    "requested orchestrator runner {} was not found on PATH; installed supported runners: {}",
+                    orchestrator_runner,
+                    self.detected_runners
+                        .iter()
+                        .map(|detected| detected.runner.id())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                );
+            }
+            self.orchestrator_runner = orchestrator_runner;
+        }
+        if let Some(workspace_count) = overrides.workspace_count {
+            if workspace_count == 0 {
+                bail!("--workspace-count must be at least 1");
+            }
+            self.workspace_count = workspace_count;
+        }
+        if let Some(workspace_preset) = overrides.workspace_preset {
+            self.workspace_preset = workspace_preset;
+        }
+
+        // Keep schema validation ahead of every write. The shared commit
+        // boundary repeats this check for interactive Customize callers.
+        let _ = self.to_project()?;
+        Ok(())
+    }
+
     pub(crate) fn to_project(&self) -> Result<Project> {
         let hub = Machine {
             name: "hub".to_string(),
@@ -201,9 +270,19 @@ pub(crate) fn detect_setup_plan(
     root: &Path,
     explicit_runner: Option<Runner>,
 ) -> Result<DetectedSetupPlan> {
+    preserve_in_repo_pickup_contract(root)?;
     let mut probe = RealSetupProbe;
     let mut sink = SilentPreflight;
     detect_setup_plan_with(root, explicit_runner, &mut probe, &mut sink)
+}
+
+/// Commit a fully resolved setup plan without reading the terminal. This uses
+/// the same creation function as Enter on the interactive card; the UI shim
+/// deliberately errors if a future change accidentally reaches any prompt.
+pub(crate) fn accept_setup_plan(plan: DetectedSetupPlan) -> Result<SetupOutcome> {
+    let mut probe = RealSetupProbe;
+    let mut ui = NonInteractiveSetupUi::default();
+    create_project_from_plan(plan, &mut probe, &mut ui)
 }
 
 fn detect_setup_plan_with<P, S>(
@@ -282,7 +361,12 @@ where
     P: SetupProbe,
     U: SetupUi,
 {
+    // Interactive customization can change every editable field. Validate the
+    // complete resolved plan before Git init so bad input cannot leave a
+    // repository or partial project behind.
+    let _ = plan.to_project()?;
     ensure_project_registration_available(&plan.project_name)?;
+    preflight_persistence(&plan)?;
     let current_git = probe.git_defaults(&plan.repo_root);
     if let Some(failure) = &current_git.probe_failure {
         bail!(failure.clone());
@@ -293,24 +377,112 @@ where
             ui.message("No files were written. Choose a Git repository and try Shelbi again.")?;
             return Ok(SetupOutcome::Quit);
         }
-        initialize_git_if_needed(&plan.repo_root, probe)?;
+        initialize_git_if_needed(&plan.repo_root, &plan.default_branch, probe)?;
     }
     persist_plan(&plan)?;
     ui.message(&format!("✓ Project {} created.", plan.project_name))?;
     Ok(SetupOutcome::Created(plan.project_name))
 }
 
-fn initialize_git_if_needed<P>(repo_root: &Path, probe: &mut P) -> Result<()>
+fn initialize_git_if_needed<P>(repo_root: &Path, default_branch: &str, probe: &mut P) -> Result<()>
 where
     P: SetupProbe,
 {
-    probe.init_git(repo_root)?;
+    probe.init_git(repo_root, default_branch)?;
     if !probe.git_defaults(repo_root).inside_git {
         bail!(
             "git init reported success, but {} is still not a Git repository",
             repo_root.display()
         );
     }
+    Ok(())
+}
+
+/// Verify that all state destinations needed by the scaffold are structurally
+/// usable and writable before deferred `git init` changes the repository.
+/// Write probes are complete sibling temp files removed immediately; no Shelbi
+/// directory or discoverable project registration is created here.
+fn preflight_persistence(plan: &DetectedSetupPlan) -> Result<()> {
+    let home = shelbi_state::shelbi_home().map_err(|error| anyhow!(error))?;
+    let projects = shelbi_state::projects_dir().map_err(|error| anyhow!(error))?;
+    let sessions = shelbi_state::sessions_dir().map_err(|error| anyhow!(error))?;
+    let project_dir =
+        shelbi_state::project_dir(&plan.project_name).map_err(|error| anyhow!(error))?;
+    let ssh = shelbi_state::ssh_control_dir().map_err(|error| anyhow!(error))?;
+
+    for directory in [
+        home.as_path(),
+        projects.as_path(),
+        sessions.as_path(),
+        project_dir.as_path(),
+    ] {
+        ensure_directory_or_missing(directory)?;
+        probe_nearest_writable_directory(directory)?;
+    }
+    for required_directory in shelbi_state::STANDARD_SUBDIRS
+        .iter()
+        .map(|name| home.join(name))
+        .chain(std::iter::once(ssh))
+    {
+        ensure_directory_or_missing(&required_directory)?;
+    }
+
+    let default_session = sessions.join("default.yaml");
+    if default_session.exists() {
+        let contents = std::fs::read_to_string(&default_session)
+            .with_context(|| format!("reading {}", default_session.display()))?;
+        serde_yaml::from_str::<shelbi_core::Session>(&contents).with_context(|| {
+            format!(
+                "{} is not a valid Shelbi session; repair or remove it, then run Shelbi again",
+                default_session.display()
+            )
+        })?;
+    }
+
+    let template = project_dir.join("workspace-settings.json.template");
+    if template.exists() {
+        let _ = std::fs::read_to_string(&template)
+            .with_context(|| format!("reading {}", template.display()))?;
+    }
+    Ok(())
+}
+
+fn ensure_directory_or_missing(path: &Path) -> Result<()> {
+    match std::fs::metadata(path) {
+        Ok(metadata) if metadata.is_dir() => Ok(()),
+        Ok(_) => bail!("{} exists but is not a directory", path.display()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error).with_context(|| format!("inspecting {}", path.display())),
+    }
+}
+
+fn probe_nearest_writable_directory(path: &Path) -> Result<()> {
+    let mut ancestor = path;
+    loop {
+        match std::fs::metadata(ancestor) {
+            Ok(metadata) if metadata.is_dir() => break,
+            Ok(_) => bail!("{} exists but is not a directory", ancestor.display()),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                ancestor = ancestor.parent().ok_or_else(|| {
+                    anyhow!("no existing parent directory for {}", path.display())
+                })?;
+            }
+            Err(error) => {
+                return Err(error).with_context(|| format!("inspecting {}", ancestor.display()));
+            }
+        }
+    }
+
+    let target = ancestor.join(".shelbi-init-write-probe");
+    let (temp_path, file) = create_sibling_temp(&target).with_context(|| {
+        format!(
+            "Shelbi state destination {} is not writable",
+            path.display()
+        )
+    })?;
+    drop(file);
+    std::fs::remove_file(&temp_path)
+        .with_context(|| format!("removing state write probe {}", temp_path.display()))?;
     Ok(())
 }
 
@@ -572,7 +744,7 @@ fn git_text(cwd: &Path, args: &[&str]) -> Option<String> {
 
 trait SetupProbe {
     fn git_defaults(&mut self, root: &Path) -> GitDefaults;
-    fn init_git(&mut self, root: &Path) -> Result<()>;
+    fn init_git(&mut self, root: &Path, default_branch: &str) -> Result<()>;
     fn runner_version(&mut self, runner: Runner) -> Option<String>;
     fn tmux_version(&mut self) -> Option<String>;
     fn cpu_count(&mut self) -> usize;
@@ -586,9 +758,9 @@ impl SetupProbe for RealSetupProbe {
         GitDefaults::probe(root)
     }
 
-    fn init_git(&mut self, root: &Path) -> Result<()> {
+    fn init_git(&mut self, root: &Path, default_branch: &str) -> Result<()> {
         let output = Command::new("git")
-            .args(["init", "-b", "main"])
+            .args(["init", "-b", default_branch])
             .current_dir(root)
             .output()
             .with_context(|| format!("running git init in {}", root.display()))?;
@@ -815,9 +987,9 @@ fn resolve_runner(runners: &[DetectedRunner], explicit_runner: Option<Runner>) -
     }
     match runners {
         [only] => Ok(only.runner),
-        _ => bail!(
-            "both claude and codex are on PATH; pass an explicit runner for non-interactive setup"
-        ),
+        _ => {
+            bail!("both claude and codex are on PATH; rerun with --runner claude or --runner codex")
+        }
     }
 }
 
@@ -905,6 +1077,48 @@ trait SetupUi: PreflightSink {
 
 struct RealSetupUi {
     stdout: io::Stdout,
+}
+
+struct NonInteractiveSetupUi {
+    stdout: io::Stdout,
+}
+
+impl Default for NonInteractiveSetupUi {
+    fn default() -> Self {
+        Self {
+            stdout: io::stdout(),
+        }
+    }
+}
+
+impl PreflightSink for NonInteractiveSetupUi {
+    fn emit(&mut self, _item: PreflightItem) -> Result<()> {
+        Ok(())
+    }
+}
+
+impl SetupUi for NonInteractiveSetupUi {
+    fn confirm_git_init(&mut self, _root: &Path) -> Result<bool> {
+        bail!("non-interactive setup reached an unexpected Git confirmation")
+    }
+
+    fn select_runner(&mut self, _runners: &[DetectedRunner]) -> Result<Runner> {
+        bail!("non-interactive setup reached an unexpected runner prompt")
+    }
+
+    fn plan_action(&mut self, _plan: &DetectedSetupPlan) -> Result<PlanAction> {
+        bail!("non-interactive setup reached an unexpected plan-card prompt")
+    }
+
+    fn customize(&mut self, _plan: &DetectedSetupPlan) -> Result<DetectedSetupPlan> {
+        bail!("non-interactive setup reached an unexpected customization prompt")
+    }
+
+    fn message(&mut self, message: &str) -> Result<()> {
+        writeln!(self.stdout, "{message}")?;
+        self.stdout.flush()?;
+        Ok(())
+    }
 }
 
 impl Default for RealSetupUi {
@@ -1635,7 +1849,7 @@ mod tests {
             }
         }
 
-        fn init_git(&mut self, _root: &Path) -> Result<()> {
+        fn init_git(&mut self, _root: &Path, _default_branch: &str) -> Result<()> {
             self.init_calls += 1;
             if let Some(error) = &self.init_error {
                 bail!(error.clone());
@@ -1784,7 +1998,7 @@ mod tests {
         assert!(resolve_runner(&[claude.clone(), codex.clone()], None)
             .unwrap_err()
             .to_string()
-            .contains("explicit runner"));
+            .contains("--runner claude"));
         assert_eq!(
             resolve_runner(&[claude.clone(), codex], Some(Runner::Codex)).unwrap(),
             Runner::Codex
@@ -1793,6 +2007,78 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("was not found on PATH"));
+    }
+
+    #[test]
+    fn scripted_overrides_win_deterministically_and_validate_before_writes() {
+        let root = TempDir::new().unwrap();
+        let mut plan = fixture_plan(root.path(), Runner::Codex);
+        plan.detected_runners = vec![
+            fixture_runner(Runner::Claude),
+            fixture_runner(Runner::Codex),
+        ];
+
+        plan.apply_overrides(SetupPlanOverrides {
+            project_name: Some("My Demo".to_string()),
+            default_branch: Some(" develop ".to_string()),
+            remote_url: Some(
+                "https://user:secret@github.com/example/demo.git?token=hidden".to_string(),
+            ),
+            orchestrator_runner: Some(Runner::Claude),
+            workspace_count: Some(3),
+            workspace_preset: Some(WorkspaceNamePreset::ToyStory),
+        })
+        .unwrap();
+
+        assert_eq!(plan.project_name, "my-demo");
+        assert_eq!(plan.default_branch, "develop");
+        assert_eq!(
+            plan.remote_url.as_deref(),
+            Some("https://github.com/example/demo.git")
+        );
+        assert_eq!(plan.selected_runner, Runner::Codex);
+        assert_eq!(plan.orchestrator_runner, Runner::Claude);
+        assert_eq!(plan.workspace_count, 3);
+        assert_eq!(plan.workspace_preset, WorkspaceNamePreset::ToyStory);
+
+        let project = plan.to_project().unwrap();
+        assert_eq!(project.orchestrator.runner, "claude");
+        assert_eq!(project.workspaces.len(), 4);
+        assert_eq!(project.workspaces[0].name, "woody");
+        assert!(project
+            .workspaces
+            .iter()
+            .all(|workspace| workspace.runner == "codex"));
+
+        let mut zero = fixture_plan(root.path(), Runner::Claude);
+        assert!(zero
+            .apply_overrides(SetupPlanOverrides {
+                workspace_count: Some(0),
+                ..SetupPlanOverrides::default()
+            })
+            .unwrap_err()
+            .to_string()
+            .contains("at least 1"));
+
+        let mut invalid_branch = fixture_plan(root.path(), Runner::Claude);
+        assert!(invalid_branch
+            .apply_overrides(SetupPlanOverrides {
+                default_branch: Some("bad..branch".to_string()),
+                ..SetupPlanOverrides::default()
+            })
+            .unwrap_err()
+            .to_string()
+            .contains("invalid --default-branch"));
+
+        let mut unavailable = fixture_plan(root.path(), Runner::Claude);
+        assert!(unavailable
+            .apply_overrides(SetupPlanOverrides {
+                orchestrator_runner: Some(Runner::Codex),
+                ..SetupPlanOverrides::default()
+            })
+            .unwrap_err()
+            .to_string()
+            .contains("orchestrator runner codex was not found"));
     }
 
     #[test]
@@ -1925,7 +2211,11 @@ mod tests {
 
     #[test]
     fn non_git_decline_and_q_are_write_free_then_launch_initializes_once() {
+        let _lock = ENV_LOCK.lock().unwrap();
         let root = TempDir::new().unwrap();
+        let home = root.path().join("home");
+        let env = EnvGuard::new(&["SHELBI_HOME"]);
+        env.set("SHELBI_HOME", &home);
         let non_git = GitDefaults {
             inside_git: false,
             repo_root: None,
@@ -1962,7 +2252,7 @@ mod tests {
         let mut launch_probe = FakeProbe::ready(root.path(), vec![fixture_runner(Runner::Claude)]);
         launch_probe.git_before_init = non_git.clone();
         launch_probe.git_after_init = Some(fixture_git(root.path()));
-        initialize_git_if_needed(root.path(), &mut launch_probe).unwrap();
+        initialize_git_if_needed(root.path(), "main", &mut launch_probe).unwrap();
         assert_eq!(launch_probe.init_calls, 1);
 
         let mut failed_probe = FakeProbe::ready(root.path(), vec![fixture_runner(Runner::Claude)]);
@@ -2396,6 +2686,63 @@ mod tests {
         assert!(
             !shelbi_state::read_global_state().unwrap().first_run_seen,
             "the machine's first project must arm the launch hint"
+        );
+    }
+
+    #[test]
+    fn interactive_enter_and_scripted_acceptance_persist_identical_state() {
+        fn snapshot_files(root: &Path) -> BTreeMap<PathBuf, Vec<u8>> {
+            fn visit(base: &Path, path: &Path, files: &mut BTreeMap<PathBuf, Vec<u8>>) {
+                let mut entries = std::fs::read_dir(path)
+                    .unwrap()
+                    .map(|entry| entry.unwrap().path())
+                    .collect::<Vec<_>>();
+                entries.sort();
+                for entry in entries {
+                    if entry.is_dir() {
+                        visit(base, &entry, files);
+                    } else {
+                        files.insert(
+                            entry.strip_prefix(base).unwrap().to_path_buf(),
+                            std::fs::read(&entry).unwrap(),
+                        );
+                    }
+                }
+            }
+
+            let mut files = BTreeMap::new();
+            visit(root, root, &mut files);
+            files
+        }
+
+        let _lock = ENV_LOCK.lock().unwrap();
+        let temp = TempDir::new().unwrap();
+        let root = temp.path().join("shaft");
+        let interactive_home = temp.path().join("interactive-home");
+        let scripted_home = temp.path().join("scripted-home");
+        std::fs::create_dir_all(&root).unwrap();
+        git(&root, &["init", "-q", "-b", "main"]);
+        let env = EnvGuard::new(&["SHELBI_HOME"]);
+        let plan = fixture_plan(&root, Runner::Codex);
+
+        env.set("SHELBI_HOME", &interactive_home);
+        let mut interactive_probe = FakeProbe::ready(&root, vec![fixture_runner(Runner::Codex)]);
+        let mut interactive_ui = MockUi::new(PlanAction::Launch);
+        assert_eq!(
+            create_project_from_plan(plan.clone(), &mut interactive_probe, &mut interactive_ui)
+                .unwrap(),
+            SetupOutcome::Created("shaft".to_string())
+        );
+
+        env.set("SHELBI_HOME", &scripted_home);
+        assert_eq!(
+            accept_setup_plan(plan).unwrap(),
+            SetupOutcome::Created("shaft".to_string())
+        );
+
+        assert_eq!(
+            snapshot_files(&interactive_home),
+            snapshot_files(&scripted_home)
         );
     }
 

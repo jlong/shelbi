@@ -4,12 +4,14 @@ use std::path::{Path, PathBuf};
 use anyhow::{anyhow, bail, Context, Result};
 use clap::{Args as ClapArgs, ValueEnum};
 use inquire::Select;
+use shelbi_core::WorkspaceNamePreset;
 use shelbi_state::AgentMaterializeOutcome;
 
 use crate::project_root::{
     project_name_collides, resolve_root_for_init, validate_project_name, validate_root,
     ResolvedProjectRoot, RootValidation,
 };
+use crate::wizard::{self, Runner, SetupPlanOverrides};
 
 pub mod heuristic;
 
@@ -54,25 +56,60 @@ impl InitMode {
 }
 
 #[derive(Debug, ClapArgs)]
+#[command(after_long_help = "Examples:\n  shelbi init -y\n  shelbi init -y --runner codex")]
 pub struct Args {
     /// Override the project name. Defaults to the basename of the
     /// project root (current directory or `--root`).
     #[arg(long)]
     pub project: Option<String>,
 
-    /// Project root directory — the repo `shelbi` will manage. Skips
-    /// the interactive "Project root?" prompt. Required when stdin
-    /// is not a TTY (CI, piped input).
+    /// Project root directory — the repo `shelbi` will manage. Defaults to
+    /// the current directory with `-y`; otherwise skips the interactive
+    /// "Project root?" prompt and is required when stdin is not a TTY.
     #[arg(long)]
     pub root: Option<PathBuf>,
+
+    /// Agent runner for every generated workspace. In `-y` mode Shelbi
+    /// detects this when exactly one supported runner is on PATH. When both
+    /// are installed, pass `--runner claude` or `--runner codex`.
+    #[arg(long, value_enum, value_name = "RUNNER")]
+    pub(crate) runner: Option<Runner>,
+
+    /// Override the detected default Git branch in `-y` mode.
+    #[arg(long, alias = "branch", value_name = "BRANCH")]
+    pub(crate) default_branch: Option<String>,
+
+    /// Override the detected origin URL in `-y` mode. Credentials are removed
+    /// before the URL is written. Pass an empty value to omit the URL.
+    #[arg(long, alias = "remote", value_name = "URL")]
+    pub(crate) github_url: Option<String>,
+
+    /// Number of development workspaces to generate in `-y` mode. A separate
+    /// review workspace is always added.
+    #[arg(
+        long,
+        alias = "workspaces",
+        value_name = "COUNT",
+        value_parser = clap::value_parser!(u32).range(1..)
+    )]
+    pub(crate) workspace_count: Option<u32>,
+
+    /// Workspace naming preset in `-y` mode: phonetic, greek, or toy-story.
+    #[arg(long, value_name = "PRESET", value_parser = parse_workspace_preset)]
+    pub(crate) workspace_preset: Option<WorkspaceNamePreset>,
+
+    /// Override the orchestrator runner in `-y` mode. Defaults to `--runner`
+    /// (or the single detected runner) and must also be installed on PATH.
+    #[arg(long, value_enum, value_name = "RUNNER")]
+    pub(crate) orchestrator_runner: Option<Runner>,
 
     /// Where the project config should live: `in-repo` writes a
     /// committed `<repo>/.shelbi/project.yaml` shared with the team;
     /// `global` keeps everything under `~/.shelbi/projects/`. In
     /// interactive contexts this may be omitted — the wizard asks and
-    /// prefills a recommendation. In non-interactive contexts this
-    /// flag is REQUIRED: shelbi refuses to silently pick a mode for
-    /// scripted callers.
+    /// prefills a recommendation. In the legacy flow, non-interactive callers
+    /// must choose it explicitly. It cannot be combined with `-y`, whose
+    /// detected plan uses the onboarding card's global layout.
     #[arg(long, value_enum)]
     pub mode: Option<InitMode>,
 
@@ -89,7 +126,33 @@ pub struct Args {
     pub pick_up: bool,
 }
 
-pub fn run(args: Args) -> Result<()> {
+impl Args {
+    fn has_detected_plan_overrides(&self) -> bool {
+        self.runner.is_some()
+            || self.default_branch.is_some()
+            || self.github_url.is_some()
+            || self.workspace_count.is_some()
+            || self.workspace_preset.is_some()
+            || self.orchestrator_runner.is_some()
+    }
+}
+
+fn parse_workspace_preset(value: &str) -> std::result::Result<WorkspaceNamePreset, String> {
+    value
+        .parse::<WorkspaceNamePreset>()
+        .map_err(|error| error.to_string())
+}
+
+pub fn run(args: Args, assume_yes: bool) -> Result<()> {
+    if assume_yes {
+        return run_detected_plan(args);
+    }
+    if args.has_detected_plan_overrides() {
+        bail!(
+            "detected-plan overrides require `shelbi init -y`; without `-y`, use the existing interactive init flow"
+        );
+    }
+
     if args.pick_up {
         let outcome = run_pick_up(args)?;
         println!();
@@ -126,6 +189,59 @@ pub fn run(args: Args) -> Result<()> {
     println!("  2. add the project to ~/.shelbi/sessions/default.yaml's projects: list");
     println!("  3. spawn your first agent: shelbi spawn TASK --on hub --runner claude \"…\"");
     Ok(())
+}
+
+/// Resolve, validate, and commit the detected onboarding plan without ever
+/// consulting stdin or terminal state. Legacy config-mode and pick-up setup
+/// stay on the existing path because neither is represented by the detected
+/// card model.
+fn run_detected_plan(args: Args) -> Result<()> {
+    if args.pick_up || args.mode.is_some() {
+        bail!(
+            "`shelbi init -y` cannot be combined with `--pick-up` or `--mode`; run those legacy flows without `-y`"
+        );
+    }
+
+    let root = noninteractive_project_root(args.root.as_deref())?;
+    if let Some(project) =
+        shelbi_state::resolve_project_for_cwd(&root).map_err(|error| anyhow!(error))?
+    {
+        println!("✓ Project {project} is already configured.");
+        return Ok(());
+    }
+
+    let mut plan = wizard::detect_setup_plan(&root, args.runner)?;
+    plan.apply_overrides(SetupPlanOverrides {
+        project_name: args.project,
+        default_branch: args.default_branch,
+        remote_url: args.github_url,
+        orchestrator_runner: args.orchestrator_runner,
+        workspace_count: args.workspace_count,
+        workspace_preset: args.workspace_preset,
+    })?;
+    match wizard::accept_setup_plan(plan)? {
+        wizard::SetupOutcome::Created(_) => Ok(()),
+        wizard::SetupOutcome::Quit => {
+            bail!("non-interactive setup quit before creating the project")
+        }
+    }
+}
+
+fn noninteractive_project_root(requested: Option<&Path>) -> Result<PathBuf> {
+    let cwd = std::env::current_dir().context("reading current directory")?;
+    let root = match requested {
+        Some(path) if path.is_absolute() => path.to_path_buf(),
+        Some(path) => cwd.join(path),
+        None => cwd,
+    };
+    if !root.exists() {
+        bail!("project root {} does not exist", root.display());
+    }
+    if !root.is_dir() {
+        bail!("project root {} is not a directory", root.display());
+    }
+    std::fs::canonicalize(&root)
+        .with_context(|| format!("resolving project root {}", root.display()))
 }
 
 /// `shelbi init` entry point factored so the no-subcommand first-run

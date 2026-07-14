@@ -15,7 +15,9 @@ mod wizard;
 struct Cli {
     /// Override the shelbi root directory (default: baked at install time;
     /// also overridable via $SHELBI_ROOT). The flag wins over both env vars
-    /// and the compile-time default; `~/.shelbi` is the final fallback.
+    /// and the compile-time default; `~/.shelbi` is the final fallback. With
+    /// `init`, place this before the subcommand; `init --root PATH` names the
+    /// project root instead.
     #[arg(long, global = true, value_name = "PATH")]
     root: Option<std::path::PathBuf>,
 
@@ -25,10 +27,9 @@ struct Cli {
     #[arg(long, short = 'p', global = true, env = "SHELBI_PROJECT")]
     project: Option<String>,
 
-    /// Assume "yes" for interactive confirmations — currently the offer
-    /// to run `shelbi daemon restart` when a command detects the running
-    /// daemon's version doesn't match this CLI.
-    #[arg(long, global = true)]
+    /// Accept the detected `shelbi init` plan without prompts. For other
+    /// commands, assume "yes" when an optional confirmation supports it.
+    #[arg(long, short = 'y', global = true)]
     yes: bool,
 
     #[command(subcommand)]
@@ -201,8 +202,13 @@ enum Cmd {
     },
     /// Attach the terminal to a workspace's tmux pane.
     Attach { id: String },
-    /// Scaffold ~/.shelbi/ and (optionally) a starter project YAML.
-    /// Offers a choice of *global* mode (config lives at
+    /// Initialize a Shelbi project. `shelbi init -y` detects the repository,
+    /// runner, tmux, and workspace plan, then scaffolds it without prompts.
+    /// If both Claude and Codex are installed, add `--runner claude` or
+    /// `--runner codex`.
+    ///
+    /// Without `-y`, Shelbi preserves the legacy config-location flow and
+    /// offers a choice of *global* mode (config lives at
     /// ~/.shelbi/projects/<name>.yaml) or *in-repo* mode (shared config
     /// committed at <repo>/.shelbi/project.yaml so teammates get it on
     /// clone). Pass `--pick-up` on a cloned repo carrying an existing
@@ -313,10 +319,20 @@ enum Cmd {
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
-    if let Some(root) = cli.root.clone() {
-        // Stash before any helper reads the resolved root. `expand_tilde_*`
-        // happens inside `resolve()` so the user can pass `~/scratch`.
-        shelbi_state::set_root_override(root);
+    let init_has_project_root = matches!(cli.cmd.as_ref(), Some(Cmd::Init(_)))
+        && init_project_root_was_explicit(std::env::args_os());
+    // `init` has historically used `--root` for the project root while the
+    // top-level CLI uses the same global spelling for Shelbi's state root.
+    // clap exposes that shared value in both structs. Preserve conventional
+    // scope: before `init` it is the global state root; after `init` it is the
+    // project root. `$SHELBI_ROOT` can express a separate state root when the
+    // project-root form is used.
+    if !init_has_project_root {
+        if let Some(root) = cli.root.clone() {
+            // Stash before any helper reads the resolved root. `expand_tilde_*`
+            // happens inside `resolve()` so the user can pass `~/scratch`.
+            shelbi_state::set_root_override(root);
+        }
     }
     if cli.yes {
         // Carried through the environment (like `--root` via the override
@@ -365,7 +381,14 @@ fn main() -> Result<()> {
         Some(Cmd::Zen { cmd }) => commands::zen::run(cli.project, cmd),
         Some(Cmd::Action { cmd }) => commands::action::run(cli.project, cmd),
         Some(Cmd::Attach { id }) => commands::attach::run(cli.project, id),
-        Some(Cmd::Init(args)) => commands::init::run(args),
+        Some(Cmd::Init(mut args)) => {
+            if !init_has_project_root {
+                // A global `--root` is propagated into the subcommand's field
+                // by clap because both intentionally share the spelling.
+                args.root = None;
+            }
+            commands::init::run(args, cli.yes)
+        }
         Some(Cmd::Wizard) => commands::wizard::run(false).map(|_| ()),
         Some(Cmd::Orchestrate(args)) => commands::orchestrate::run(cli.project, args),
         Some(Cmd::Orchestrator { cmd }) => commands::orchestrator::run(cli.project, cmd),
@@ -383,6 +406,31 @@ fn main() -> Result<()> {
         Some(Cmd::ZenHeartbeat { project }) => commands::zen_lifecycle::heartbeat(&project),
         Some(Cmd::ZenOrchExit { project }) => commands::zen_lifecycle::orch_exit(&project),
     }
+}
+
+fn init_project_root_was_explicit<I, S>(args: I) -> bool
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<std::ffi::OsStr>,
+{
+    let args = args
+        .into_iter()
+        .map(|arg| arg.as_ref().to_string_lossy().into_owned())
+        .collect::<Vec<_>>();
+    let mut index = 1;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--root" | "--project" | "-p" => index += 2,
+            "--yes" | "-y" => index += 1,
+            "init" => {
+                return args[index + 1..]
+                    .iter()
+                    .any(|arg| arg == "--root" || arg.starts_with("--root="));
+            }
+            _ => index += 1,
+        }
+    }
+    false
 }
 
 /// `shelbi` with no subcommand. Dispatches based on what's on disk:
@@ -540,6 +588,109 @@ mod cli_tests {
     use clap::error::ErrorKind;
     use clap::Parser;
     use commands::workspace::WorkspaceCmd;
+
+    #[test]
+    fn init_yes_parses_every_detected_plan_override() {
+        let cli = Cli::parse_from([
+            "shelbi",
+            "init",
+            "-y",
+            "--project",
+            "demo",
+            "--root",
+            "/tmp/demo",
+            "--runner",
+            "codex",
+            "--default-branch",
+            "develop",
+            "--github-url",
+            "https://github.com/example/demo.git",
+            "--workspace-count",
+            "3",
+            "--workspace-preset",
+            "toy-story",
+            "--orchestrator-runner",
+            "claude",
+        ]);
+        assert!(cli.yes);
+        assert_eq!(cli.root.as_deref(), Some(std::path::Path::new("/tmp/demo")));
+        assert!(init_project_root_was_explicit([
+            "shelbi",
+            "init",
+            "--root",
+            "/tmp/demo"
+        ]));
+        let Some(Cmd::Init(args)) = cli.cmd else {
+            panic!("expected init command");
+        };
+        assert_eq!(args.project.as_deref(), Some("demo"));
+        assert_eq!(
+            args.root.as_deref(),
+            Some(std::path::Path::new("/tmp/demo"))
+        );
+        assert_eq!(args.runner, Some(wizard::Runner::Codex));
+        assert_eq!(args.default_branch.as_deref(), Some("develop"));
+        assert_eq!(
+            args.github_url.as_deref(),
+            Some("https://github.com/example/demo.git")
+        );
+        assert_eq!(args.workspace_count, Some(3));
+        assert_eq!(
+            args.workspace_preset,
+            Some(shelbi_core::WorkspaceNamePreset::ToyStory)
+        );
+        assert_eq!(args.orchestrator_runner, Some(wizard::Runner::Claude));
+    }
+
+    #[test]
+    fn init_root_scope_distinguishes_global_state_from_project_root() {
+        assert!(!init_project_root_was_explicit([
+            "shelbi", "--root", "/tmp/state", "init", "-y"
+        ]));
+        assert!(!init_project_root_was_explicit([
+            "shelbi",
+            "--project",
+            "init",
+            "init",
+            "-y"
+        ]));
+        assert!(init_project_root_was_explicit([
+            "shelbi",
+            "init",
+            "-y",
+            "--root=/tmp/project"
+        ]));
+    }
+
+    #[test]
+    fn init_help_is_copyable_and_documents_detected_plan_flags() {
+        let error = Cli::try_parse_from(["shelbi", "init", "--help"]).unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::DisplayHelp);
+        let help = error.to_string();
+        for expected in [
+            "shelbi init -y",
+            "shelbi init -y --runner codex",
+            "-y, --yes",
+            "--runner <RUNNER>",
+            "--project <PROJECT>",
+            "--root <ROOT>",
+            "--default-branch <BRANCH>",
+            "--github-url <URL>",
+            "--workspace-count <COUNT>",
+            "--workspace-preset <PRESET>",
+            "--orchestrator-runner <RUNNER>",
+        ] {
+            assert!(help.contains(expected), "missing `{expected}` in:\n{help}");
+        }
+        assert!(
+            help.contains("claude"),
+            "runner values missing from:\n{help}"
+        );
+        assert!(
+            help.contains("codex"),
+            "runner values missing from:\n{help}"
+        );
+    }
 
     /// `shelbi worker list` resolves to the same handler as
     /// `shelbi workspace list` — clap parses both into the dispatch
