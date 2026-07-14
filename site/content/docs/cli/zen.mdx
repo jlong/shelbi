@@ -85,10 +85,10 @@ prompt applies the judgment categories on top of this list. See
 shelbi zen dry-run [OPTIONS]
 ```
 
-Preview what Zen Mode would do without touching any state. On every
-tick the backlog scan and the merge-conditions bar are evaluated, and
-each "would have …" decision is logged to stdout, the dedicated
-dry-run log (`~/.shelbi/logs/zen-dryrun.log`), and the activity feed.
+Preview what Zen Mode would do without changing task, board, PR, or branch
+state. On every tick the backlog scan and merge-conditions bar are evaluated,
+and each "would have …" decision is logged to stdout, the dedicated dry-run
+log (`~/.shelbi/logs/zen-dryrun.log`), and the activity feed.
 No PRs, merges, or board moves happen. Use it before flipping Zen on
 for real to confirm the policy matches your intent.
 
@@ -108,8 +108,12 @@ pretty JSON. Covers the four pre-PR conditions the orchestrator
 checks before opening a PR: local checks, merge-conflict probe, diff
 size, and danger-path matches.
 
-The task must be assigned to a workspace so the probe knows which
-worktree to read from.
+The task must be assigned to a workspace so the probe can locate the
+repository that holds its named branch. Shelbi checks out that exact branch
+commit in an isolated temporary worktree, so a newer task reusing the assigned
+workspace is not modified or tested by mistake. A successful rebase advances
+the durable task branch, and the report's `head_sha` identifies the exact
+commit used for every check and fact.
 
 | Argument | Type | Default | Description |
 | --- | --- | --- | --- |
@@ -118,16 +122,20 @@ worktree to read from.
 ## pr-create
 
 ```text
-shelbi zen pr-create <ID>
+shelbi zen pr-create [OPTIONS] <ID>
 ```
 
-Push the workspace's branch and open a PR for the task. Idempotent.
-If an open PR for the branch already exists, returns its number
-instead of opening a second one. Prints the PR number on stdout.
+Push the task's named branch and open a PR. Idempotent. If an open PR for
+the branch already exists, Shelbi updates the branch and returns its number
+only after the PR head matches the exact task branch commit that was pushed.
+Otherwise, it opens a new PR. Prints the PR number on stdout. Pass the probe's
+`head_sha` with `--match-head-commit` to reject any branch movement between
+review and PR creation.
 
 | Argument | Type | Default | Description |
 | --- | --- | --- | --- |
 | `<ID>` | string | — | Task id whose branch to push and PR (required). |
+| `--match-head-commit <SHA>` | string | none | Require the task branch to match this probe SHA before pushing. |
 
 ## ci-watch
 
@@ -205,8 +213,11 @@ Drive the full merge flow manually, one primitive at a time,
 exactly the sequence the orchestrator runs internally:
 
 ```bash
-PR=$(shelbi zen pr-create docs-write-cli-reference-pages)
-shelbi zen ci-watch "$PR" --timeout 10m && shelbi zen pr-merge "$PR"
+REPORT=$(shelbi zen probe docs-write-cli-reference-pages)
+HEAD_SHA=$(printf '%s\n' "$REPORT" | jq -r .head_sha)
+PR=$(shelbi zen pr-create docs-write-cli-reference-pages --match-head-commit "$HEAD_SHA")
+shelbi zen ci-watch "$PR" --timeout 10m && \
+  shelbi zen pr-merge "$PR" --match-head-commit "$HEAD_SHA"
 ```
 
 Pause Zen during a release window without aborting in-flight merges:

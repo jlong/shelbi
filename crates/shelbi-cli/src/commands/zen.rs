@@ -69,13 +69,20 @@ pub enum ZenCmd {
     /// the Zen track.
     Status,
     /// Run every probe primitive for `task` and print the JSON report.
-    /// The task must be assigned to a workspace so we know which worktree
-    /// to probe.
+    /// The task must be assigned to a workspace so we can locate the
+    /// repository containing its named branch.
     Probe { task_id: String },
-    /// Push the workspace's branch and open a PR for the task. Idempotent —
-    /// returns the existing PR number if one is already open for the
-    /// branch. Prints the PR number on stdout.
-    PrCreate { task_id: String },
+    /// Push the task's named branch and open a PR. Idempotent: reuses an
+    /// existing open PR only after its head matches the pushed task ref.
+    /// Prints the PR number on stdout.
+    PrCreate {
+        task_id: String,
+        /// Head SHA the task branch must still be at before anything is
+        /// pushed (the `head_sha` field of the probe report). On mismatch,
+        /// re-run `shelbi zen probe` and retry with the fresh SHA.
+        #[arg(long, value_name = "SHA")]
+        match_head_commit: Option<String>,
+    },
     /// Watch the PR's checks until they settle or the timeout fires.
     /// Prints `green` / `red:<check>:<summary>` / `timeout` on stdout.
     /// Exit code is 0 only for `green`.
@@ -126,9 +133,9 @@ pub enum ZenCmd {
     /// auto-promotion, one per line, in priority order. Mechanical only —
     /// the orchestrator's prompt applies the judgment categories on top.
     Scan,
-    /// Preview what Zen Mode would do without touching any state. Runs
-    /// the backlog scan and the merge-conditions bar on every tick and
-    /// logs each "would have …" decision to stdout, a dedicated dry-run
+    /// Preview what Zen Mode would do without changing task, board, PR, or
+    /// branch state. Runs the backlog scan and merge-conditions bar each tick,
+    /// then logs each "would have …" decision to stdout, a dedicated dry-run
     /// log (`~/.shelbi/logs/zen-dryrun.log`), and the activity feed.
     /// Use this before flipping Zen on for real to confirm the policy
     /// matches your intent. No PRs, merges, or board moves happen.
@@ -169,11 +176,15 @@ pub fn run(project_opt: Option<String>, cmd: ZenCmd) -> Result<()> {
             // means we fall back to project-level zen config — matching
             // legacy `zen::probe` behavior.
             let workflow = load_workflow_for_task(&project_name, &tf.task);
-            let branch = tf
-                .task
-                .branch
-                .clone()
-                .unwrap_or_else(|| format!("shelbi/{}", tf.task.id));
+            // Use the same explicit/workflow/project/login fallback chain as
+            // dispatch and PR creation. A hard-coded fallback here could
+            // probe one ref and later ask `pr-create` to publish another.
+            let branch = shelbi_orchestrator::branch::branch_name_for_task(
+                &project,
+                workflow.as_ref(),
+                &tf.task,
+            )
+            .map_err(|e| anyhow!(e))?;
             // `zen probe` wants facts about the branch as it would land
             // *today* — fetch the current default and rebase onto it first
             // so a re-probe after a blocker merges reflects the merged fix
@@ -189,11 +200,23 @@ pub fn run(project_opt: Option<String>, cmd: ZenCmd) -> Result<()> {
             println!("{}", serde_json::to_string_pretty(&report)?);
             Ok(())
         }
-        ZenCmd::PrCreate { task_id } => {
+        ZenCmd::PrCreate {
+            task_id,
+            match_head_commit,
+        } => {
             let project = load_project(&project_name).map_err(|e| anyhow!(e))?;
             let tf = shelbi_state::load_task(&project_name, &task_id).map_err(|e| anyhow!(e))?;
-            let pr = zen::pr_create(&project, &project_name, &tf.task, &tf.body)
-                .map_err(|e| anyhow!(e))?;
+            let pr = match match_head_commit.as_deref() {
+                Some(expected_head) => zen::pr_create_at_head(
+                    &project,
+                    &project_name,
+                    &tf.task,
+                    &tf.body,
+                    expected_head,
+                ),
+                None => zen::pr_create(&project, &project_name, &tf.task, &tf.body),
+            }
+            .map_err(|e| anyhow!(e))?;
             println!("{pr}");
             Ok(())
         }

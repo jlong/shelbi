@@ -174,6 +174,43 @@ pub(crate) fn lookup_open_pr(host: &Host, wt: &str, branch: &str) -> Result<Opti
     parse_open_pr_list(&String::from_utf8_lossy(&out.stdout), branch)
 }
 
+/// Return the commit currently at an open PR's head.
+///
+/// Zen PR creation uses this after pushing the named task branch so a PR
+/// number cannot cross into CI watching or merging unless GitHub reports the
+/// exact reviewed commit that was just pushed.
+pub(crate) fn lookup_pr_head_oid(host: &Host, wt: &str, pr: u64) -> Result<String> {
+    let pr_str = pr.to_string();
+    let out = run_in_dir(
+        host,
+        wt,
+        &[
+            "gh",
+            "pr",
+            "view",
+            &pr_str,
+            "--json",
+            "headRefOid",
+            "--jq",
+            ".headRefOid",
+        ],
+    )?;
+    if !out.status.success() {
+        return Err(Error::Command {
+            cmd: format!("gh pr view {pr_str} --json headRefOid"),
+            status: out.status.to_string(),
+            stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
+        });
+    }
+    let oid = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if oid.is_empty() {
+        return Err(Error::Other(format!(
+            "gh pr view {pr_str}: headRefOid is empty"
+        )));
+    }
+    Ok(oid)
+}
+
 /// Parse `gh pr list`'s one-number-per-line `--jq .[].number` output.
 /// Split out of [`lookup_open_pr`] so the zero/one/many rules are
 /// unit-testable without gh.
@@ -312,20 +349,29 @@ pub(crate) fn wait_for_merge_commit_sha(host: &Host, wt: &str, pr: u64) -> Resul
     }
 }
 
-/// `git log -1 --format=%s` in `wt` — used as the default PR title when
-/// opening a fresh PR. Falls back to a generic title only if the caller
-/// preprocesses the empty case; we prefer surfacing a hard error here so
-/// a broken worktree doesn't silently produce a blank-title PR.
-pub(crate) fn head_commit_subject(host: &Host, wt: &str) -> Result<String> {
-    let out = run_in_dir(host, wt, &["git", "log", "-1", "--format=%s"])?;
+/// `git log -1 --format=%s <revision>` in `wt`, used as the default PR title
+/// when opening a fresh PR. Callers choose the revision explicitly so an idle
+/// workspace that has since checked out another task cannot lend that new
+/// task's title to an older branch's PR.
+pub(crate) fn commit_subject(host: &Host, wt: &str, revision: &str) -> Result<String> {
+    let out = run_in_dir(
+        host,
+        wt,
+        &["git", "log", "-1", "--format=%s", revision, "--"],
+    )?;
     if !out.status.success() {
         return Err(Error::Command {
-            cmd: format!("git -C {wt} log -1 --format=%s"),
+            cmd: format!("git -C {wt} log -1 --format=%s {revision} --"),
             status: out.status.to_string(),
             stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
         });
     }
     Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
+}
+
+/// [`commit_subject`] for the worktree's current `HEAD`.
+pub(crate) fn head_commit_subject(host: &Host, wt: &str) -> Result<String> {
+    commit_subject(host, wt, "HEAD")
 }
 
 /// Lay out the PR body: the task summary (or an empty body when the task

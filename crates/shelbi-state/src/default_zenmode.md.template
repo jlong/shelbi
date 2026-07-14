@@ -83,14 +83,15 @@ conditions to the report:
 
 If all pre-PR conditions pass:
 
-5. Run `shelbi zen pr-create <task-id>` to push + open the PR. Capture the PR
-   number it prints.
+5. Run `shelbi zen pr-create <task-id> --match-head-commit <head_sha>` using
+   the exact `head_sha` from the probe report. Capture the PR number it prints.
 6. Run `shelbi zen ci-watch <pr-number> --timeout 15m`. Stdout is `green`,
    `red:<check>:<summary>`, or `timeout`. The condition: must be `green`.
-7. If green: run `shelbi zen pr-merge <pr-number>` to squash + delete branch.
-   Move the task into `done` and emit `reason=orchestrator:zen-merge` with the
-   merge SHA. The command appends a `next eligible:` list to its stdout, read
-   it before moving on.
+7. If green, use that same probe SHA to run
+   `shelbi zen pr-merge <pr-number> --match-head-commit <head_sha>` and squash +
+   delete the branch. Move the task into `done` and emit
+   `reason=orchestrator:zen-merge` with the merge SHA. The command appends a
+   `next eligible:` list to its stdout, read it before moving on.
 8. If red or timeout: leave in `handoff`; emit `reason=zen:failed-checks` (red)
    or `reason=zen:ci-timeout`.
 

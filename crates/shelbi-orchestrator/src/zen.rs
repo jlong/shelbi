@@ -5,11 +5,12 @@
 //! Same shape as the readiness probe primitives: Rust performs the I/O,
 //! the orchestrator's prompt makes the decisions.
 //!
-//! `pr_create` runs against the workspace's worktree (the branch lives there
-//! until it's pushed). `ci_watch` and `pr_merge` run on the project's
-//! first local machine — by convention the hub — because by the time the
-//! orchestrator is watching CI the branch is already on origin and gh is
-//! happy from any checkout of the repo.
+//! `pr_create` resolves the task's durable named branch through its assigned
+//! workspace repository, without trusting that workspace's current checkout.
+//! `ci_watch` and `pr_merge` run on the project's first local machine — by
+//! convention the hub — because by the time the orchestrator is watching CI
+//! the branch is already on origin and gh is happy from any checkout of the
+//! repo.
 //!
 //! Polling vs. `gh pr checks --watch`: `--watch` has no built-in timeout
 //! and `timeout(1)` is not standard on macOS. Polling `gh pr checks`
@@ -30,8 +31,8 @@ use shelbi_core::{
 
 use crate::branch;
 use crate::git::{
-    compose_pr_body, head_commit_subject, locate_hub_workdir, locate_workspace_worktree,
-    login_shell_prefix, lookup_open_pr, parse_pr_number_from_url, run_in_dir,
+    commit_subject, compose_pr_body, locate_hub_workdir, locate_workspace_worktree,
+    login_shell_prefix, lookup_open_pr, lookup_pr_head_oid, parse_pr_number_from_url, run_in_dir,
     run_login_shell_script, wait_for_merge_commit_sha,
 };
 use crate::workspace::{rebase_workspace_branch_onto_default, workspace_worktree, RebaseOutcome};
@@ -214,14 +215,40 @@ fn red_from_output(stdout: &str, stderr: &str) -> PollOutcome {
     PollOutcome::Red { check, summary }
 }
 
-/// Push the task's branch and open a PR. Idempotent — if an open PR for
-/// the branch already exists, returns its number instead of opening a
-/// second one.
+/// Push the task's branch and open a PR. Idempotent: if an open PR for the
+/// branch already exists, reuse it after verifying that its head is the exact
+/// task branch commit that was pushed.
+///
+/// This compatibility entry point snapshots the task branch when called. Zen
+/// flows that already probed the branch should call [`pr_create_at_head`] so a
+/// branch move between the probe and this operation is rejected too.
 pub fn pr_create(
     project: &Project,
     project_name: &str,
     task: &Task,
     task_body: &str,
+) -> Result<u64> {
+    pr_create_impl(project, project_name, task, task_body, None)
+}
+
+/// [`pr_create`] pinned to the exact branch commit previously reviewed by a
+/// Zen probe.
+pub fn pr_create_at_head(
+    project: &Project,
+    project_name: &str,
+    task: &Task,
+    task_body: &str,
+    expected_head: &str,
+) -> Result<u64> {
+    pr_create_impl(project, project_name, task, task_body, Some(expected_head))
+}
+
+fn pr_create_impl(
+    project: &Project,
+    project_name: &str,
+    task: &Task,
+    task_body: &str,
+    expected_head: Option<&str>,
 ) -> Result<u64> {
     let (host, worktree) = locate_workspace_worktree(project, task)?;
     let wt = worktree.to_string_lossy().into_owned();
@@ -230,34 +257,75 @@ pub fn pr_create(
     let branch = branch::branch_name_for_task(project, Some(&workflow), task)?;
     let target = project.base_branch();
 
-    // Idempotency: if a PR for this branch is already open, return it
-    // unchanged. Picking `state=open` intentionally — a closed/merged PR
-    // for this branch is stale; a fresh push warrants a fresh PR.
-    if let Some(num) = lookup_open_pr(&host, &wt, &branch)? {
-        return Ok(num);
+    // Handoff detaches the finished worktree and immediately frees its slot.
+    // A later dispatch may therefore put this worktree's HEAD on an unrelated
+    // task while the old task remains assigned to the workspace in Review.
+    // The surviving named task ref is the durable authority; the worktree is
+    // only an execution anchor for git and gh.
+    let local_ref = format!("refs/heads/{branch}");
+    let branch_commit = format!("{local_ref}^{{commit}}");
+    let operation_head = probe_head_sha(&host, &worktree, &branch_commit)?;
+    if let Some(expected) = expected_head.filter(|sha| *sha != operation_head) {
+        return Err(Error::Other(format!(
+            "task branch `{branch}` moved since it was probed: expected {expected}, found \
+             {operation_head}; refusing to push or report a PR ready for CI or merge \
+             (re-run `shelbi zen probe {}`)",
+            task.id
+        )));
     }
 
-    // Push (with -u so gh has a tracking branch to work against).
-    let push = run_in_dir(&host, &wt, &["git", "push", "-u", "origin", &branch])?;
+    // Push the immutable commit snapshot before looking up an existing PR.
+    // Using the OID as the refspec source prevents a concurrent local ref move
+    // from changing what git publishes during negotiation. This is a normal,
+    // non-force push: fast-forward stale PR branches advance, while rewritten
+    // or divergent remote branches are rejected rather than overwritten.
+    let refspec = format!("{operation_head}:{local_ref}");
+    let push = run_in_dir(&host, &wt, &["git", "push", "origin", "--", &refspec])?;
     if !push.status.success() {
+        let mut stderr = String::from_utf8_lossy(&push.stderr).into_owned();
+        if !stderr.is_empty() && !stderr.ends_with('\n') {
+            stderr.push('\n');
+        }
+        stderr.push_str(&format!(
+            "shelbi: task branch `{branch}` at {operation_head} was not pushed; refusing to \
+             reuse or create a PR because the remote branch may have been rewritten or diverged"
+        ));
         return Err(Error::Command {
-            cmd: format!("git -C {wt} push -u origin {branch}"),
+            cmd: format!("git -C {wt} push origin -- {refspec}"),
             status: push.status.to_string(),
-            stderr: String::from_utf8_lossy(&push.stderr).into_owned(),
+            stderr,
         });
     }
+    verify_task_branch_head(
+        &host,
+        &worktree,
+        &branch,
+        &operation_head,
+        "while it was being pushed",
+    )?;
 
-    // Race window: a server-side push hook or a branch-protection setup
-    // can auto-open a PR. Re-check before we open our own.
+    // Idempotency, after the push: an existing PR now has the opportunity to
+    // advance to the reviewed task commit. Picking `state=open` intentionally;
+    // a closed or merged PR for this branch is stale and a fresh push warrants
+    // a fresh PR. A server-side push hook may also have opened a PR, so this
+    // lookup covers both normal reuse and that race window.
     if let Some(num) = lookup_open_pr(&host, &wt, &branch)? {
+        verify_pr_head(&host, &worktree, &branch, num, &operation_head)?;
         return Ok(num);
     }
 
-    let title = head_commit_subject(&host, &wt)?;
+    let title = commit_subject(&host, &wt, &operation_head)?;
     let task_path = shelbi_state::task_path(project_name, &task.id)?
         .to_string_lossy()
         .into_owned();
     let body = compose_pr_body(task_body, &task_path);
+    verify_task_branch_head(
+        &host,
+        &worktree,
+        &branch,
+        &operation_head,
+        "before a new PR was created",
+    )?;
 
     let out = run_in_dir(
         &host,
@@ -275,12 +343,69 @@ pub fn pr_create(
         });
     }
     let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
-    parse_pr_number_from_url(stdout.trim()).ok_or_else(|| {
+    let num = parse_pr_number_from_url(stdout.trim()).ok_or_else(|| {
         Error::Other(format!(
             "gh pr create returned `{}` — couldn't parse a PR number out of it",
             stdout.trim()
         ))
-    })
+    })?;
+    verify_pr_head(&host, &worktree, &branch, num, &operation_head)?;
+    Ok(num)
+}
+
+/// Prove that `pr` still names the exact reviewed task branch commit before
+/// its number is allowed to reach CI watching or merging.
+fn verify_pr_head(
+    host: &Host,
+    worktree: &std::path::Path,
+    branch: &str,
+    pr: u64,
+    pushed_head: &str,
+) -> Result<()> {
+    let wt = worktree.to_string_lossy().into_owned();
+    verify_task_branch_head(
+        host,
+        worktree,
+        branch,
+        pushed_head,
+        "before its PR head was verified",
+    )?;
+    let pr_head = lookup_pr_head_oid(host, &wt, pr)?;
+    verify_task_branch_head(
+        host,
+        worktree,
+        branch,
+        pushed_head,
+        "while its PR head was being verified",
+    )?;
+    if pr_head != pushed_head {
+        return Err(Error::Other(format!(
+            "open PR #{pr} for branch `{branch}` points to {pr_head}, but the reviewed task \
+             branch commit is {pushed_head}; refusing to report the stale PR ready for CI or merge"
+        )));
+    }
+    Ok(())
+}
+
+/// Re-read the durable task branch ref and require it to stay on the commit
+/// this PR operation snapshotted. The assigned worktree's `HEAD` is
+/// intentionally irrelevant because the slot may already serve another task.
+fn verify_task_branch_head(
+    host: &Host,
+    worktree: &std::path::Path,
+    branch: &str,
+    expected_head: &str,
+    context: &str,
+) -> Result<()> {
+    let local_ref = format!("refs/heads/{branch}^{{commit}}");
+    let current_head = probe_head_sha(host, worktree, &local_ref)?;
+    if current_head != expected_head {
+        return Err(Error::Other(format!(
+            "task branch `{branch}` moved from {expected_head} to {current_head} {context}; \
+             refusing to report its PR ready for CI or merge"
+        )));
+    }
+    Ok(())
 }
 
 /// Poll `gh pr checks` on `pr` until every watched check settles (pass
@@ -787,6 +912,725 @@ mod tests {
     }
 }
 
+#[cfg(all(test, unix))]
+mod pr_create_tests {
+    use super::*;
+    use std::collections::BTreeMap;
+    use std::ffi::OsString;
+    use std::os::unix::fs::PermissionsExt;
+    use std::path::{Path, PathBuf};
+    use std::process::Command;
+
+    use shelbi_core::{
+        AgentRunnerSpec, GitConfig, HeartbeatConfig, MachineKind, OrchestratorSpec, ZenConfig,
+        ZenDangerPaths,
+    };
+
+    const TASK_BRANCH: &str = "jlong/reviewed-head";
+    const REPLACEMENT_BRANCH: &str = "jlong/replacement-task";
+    const PROJECT_NAME: &str = "pr-create-test";
+
+    struct EnvGuard {
+        shell: Option<OsString>,
+        home: Option<OsString>,
+        shelbi_home: Option<OsString>,
+    }
+
+    impl EnvGuard {
+        fn install(home: &Path) -> Self {
+            let guard = Self {
+                shell: std::env::var_os("SHELL"),
+                home: std::env::var_os("HOME"),
+                shelbi_home: std::env::var_os("SHELBI_HOME"),
+            };
+            std::fs::create_dir_all(home.join("shelbi-home")).unwrap();
+            std::env::set_var("SHELL", "/bin/sh");
+            std::env::set_var("HOME", home);
+            std::env::set_var("SHELBI_HOME", home.join("shelbi-home"));
+            guard
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            restore_env("SHELL", self.shell.take());
+            restore_env("HOME", self.home.take());
+            restore_env("SHELBI_HOME", self.shelbi_home.take());
+        }
+    }
+
+    fn restore_env(key: &str, value: Option<OsString>) {
+        match value {
+            Some(value) => std::env::set_var(key, value),
+            None => std::env::remove_var(key),
+        }
+    }
+
+    fn run_git(dir: &Path, args: &[&str]) {
+        let out = Command::new("git")
+            .current_dir(dir)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "git {} failed in {}: {}",
+            args.join(" "),
+            dir.display(),
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    fn git_stdout(dir: &Path, args: &[&str]) -> String {
+        let out = Command::new("git")
+            .current_dir(dir)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "git {} failed in {}: {}",
+            args.join(" "),
+            dir.display(),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
+    /// Create a real bare origin and a workspace clone at the path Shelbi
+    /// resolves for `ws1`. The task branch starts with one reviewed commit;
+    /// callers choose whether that initial head is already on origin.
+    fn setup_repo(push_task_branch: bool) -> (tempfile::TempDir, PathBuf, PathBuf) {
+        let base = tempfile::tempdir().unwrap();
+        let origin = base.path().join("origin.git");
+        run_git(
+            base.path(),
+            &[
+                "init",
+                "-q",
+                "--bare",
+                "-b",
+                "main",
+                origin.to_str().unwrap(),
+            ],
+        );
+
+        let worktree = base.path().join(".shelbi").join("wt").join("ws1");
+        std::fs::create_dir_all(worktree.parent().unwrap()).unwrap();
+        run_git(
+            base.path(),
+            &[
+                "clone",
+                "-q",
+                origin.to_str().unwrap(),
+                worktree.to_str().unwrap(),
+            ],
+        );
+        run_git(&worktree, &["config", "user.email", "test@example.com"]);
+        run_git(&worktree, &["config", "user.name", "Test"]);
+
+        std::fs::write(worktree.join("seed.txt"), "seed\n").unwrap();
+        run_git(&worktree, &["add", "seed.txt"]);
+        run_git(&worktree, &["commit", "-q", "-m", "seed main"]);
+        run_git(&worktree, &["push", "-q", "-u", "origin", "main"]);
+        run_git(&worktree, &["checkout", "-q", "-b", TASK_BRANCH]);
+        std::fs::write(worktree.join("task.txt"), "initial task work\n").unwrap();
+        run_git(&worktree, &["add", "task.txt"]);
+        run_git(&worktree, &["commit", "-q", "-m", "initial task work"]);
+        if push_task_branch {
+            run_git(&worktree, &["push", "-q", "-u", "origin", TASK_BRANCH]);
+        }
+
+        (base, origin, worktree)
+    }
+
+    fn project(work_dir: &Path) -> Project {
+        let mut runners = BTreeMap::new();
+        runners.insert(
+            "claude".to_string(),
+            AgentRunnerSpec {
+                command: "claude".into(),
+                flags: Vec::new(),
+                prompt_injection: None,
+                dialog_signatures: Vec::new(),
+            },
+        );
+        Project {
+            name: PROJECT_NAME.into(),
+            repo: work_dir.to_string_lossy().into_owned(),
+            default_branch: "main".into(),
+            default_workflow: None,
+            config_mode: None,
+            machines: vec![Machine {
+                name: "hub".into(),
+                kind: MachineKind::Local,
+                work_dir: work_dir.to_path_buf(),
+                host: None,
+                tags: Vec::new(),
+                forward: None,
+            }],
+            orchestrator: OrchestratorSpec {
+                runner: "claude".into(),
+            },
+            agent_runners: runners,
+            editor: None,
+            github_url: None,
+            workspaces: vec![WorkspaceSpec {
+                name: "ws1".into(),
+                machine: "hub".into(),
+                runner: "claude".into(),
+                tags: Vec::new(),
+                slot: None,
+            }],
+            workspace_poll_interval_secs: 5,
+            workspace_permissions_mode: "auto".into(),
+            workspace_settings_template: None,
+            zen: ZenConfig::default(),
+            heartbeat: HeartbeatConfig::default(),
+            detected_shapes: Vec::new(),
+            git: GitConfig::default(),
+        }
+    }
+
+    fn project_with_probe_check(work_dir: &Path) -> Project {
+        let mut project = project(work_dir);
+        project.zen.checks.local = vec![
+            "test -f task.txt && test -f base-fix.txt && test ! -e replacement.txt && git rev-parse HEAD"
+                .into(),
+        ];
+        project.zen.danger_paths = ZenDangerPaths::Override(vec!["task.txt".into()]);
+        project
+    }
+
+    fn task() -> Task {
+        let now = chrono::Utc::now();
+        Task {
+            id: "reviewed-head".into(),
+            title: "reviewed head".into(),
+            column: Column::review(),
+            priority: 0,
+            assigned_to: Some("ws1".into()),
+            workflow: None,
+            branch: Some(TASK_BRANCH.into()),
+            depends_on: Vec::new(),
+            prefers_machine: None,
+            zen: None,
+            created_at: now,
+            updated_at: now,
+            params: BTreeMap::new(),
+        }
+    }
+
+    fn local_head(worktree: &Path) -> String {
+        git_stdout(worktree, &["rev-parse", "HEAD"])
+    }
+
+    fn task_branch_head(worktree: &Path) -> String {
+        git_stdout(
+            worktree,
+            &["rev-parse", &format!("refs/heads/{TASK_BRANCH}")],
+        )
+    }
+
+    fn remote_head(origin: &Path) -> String {
+        git_stdout(
+            origin.parent().unwrap(),
+            &[
+                "--git-dir",
+                origin.to_str().unwrap(),
+                "rev-parse",
+                &format!("refs/heads/{TASK_BRANCH}"),
+            ],
+        )
+    }
+
+    fn remote_branch_exists(worktree: &Path) -> bool {
+        !git_stdout(worktree, &["ls-remote", "--heads", "origin", TASK_BRANCH]).is_empty()
+    }
+
+    fn gh_calls(log: &Path) -> String {
+        std::fs::read_to_string(log).unwrap_or_default()
+    }
+
+    /// Install a stateful `gh` stub in a login-shell PATH. `pr list` exposes
+    /// `initial_pr`, `pr create` creates #42, and `pr view` normally reports
+    /// the real bare-origin branch tip. `head_override` simulates GitHub still
+    /// reporting an obsolete PR head after a push.
+    fn install_gh_stub(
+        stub_home: &Path,
+        origin: &Path,
+        initial_pr: Option<u64>,
+        head_override: Option<&str>,
+    ) -> PathBuf {
+        let bin = stub_home.join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let number_file = stub_home.join("pr-number");
+        let override_file = stub_home.join("head-override");
+        let log_file = stub_home.join("gh.log");
+        if let Some(number) = initial_pr {
+            std::fs::write(&number_file, format!("{number}\n")).unwrap();
+        }
+        if let Some(oid) = head_override {
+            std::fs::write(&override_file, format!("{oid}\n")).unwrap();
+        }
+
+        let q = shelbi_agent::shell_escape;
+        let script = format!(
+            r#"#!/bin/sh
+printf '%s\n' "$*" >> {log}
+case "$1 $2" in
+  "pr list")
+    if [ -f {number} ]; then cat {number}; fi
+    ;;
+  "pr view")
+    if [ -f {head_override} ]; then
+      cat {head_override}
+    else
+      git --git-dir={origin} rev-parse {remote_ref}
+    fi
+    ;;
+  "pr create")
+    printf '%s\n' 42 > {number}
+    printf '%s\n' https://github.com/example/repo/pull/42
+    ;;
+  *)
+    printf 'unexpected gh invocation: %s\n' "$*" >&2
+    exit 64
+    ;;
+esac
+"#,
+            log = q(&log_file.to_string_lossy()),
+            number = q(&number_file.to_string_lossy()),
+            head_override = q(&override_file.to_string_lossy()),
+            origin = q(&origin.to_string_lossy()),
+            remote_ref = q(&format!("refs/heads/{TASK_BRANCH}")),
+        );
+        let gh = bin.join("gh");
+        std::fs::write(&gh, script).unwrap();
+        std::fs::set_permissions(&gh, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::write(
+            stub_home.join(".profile"),
+            format!("export PATH=\"{}:$PATH\"\n", bin.display()),
+        )
+        .unwrap();
+        log_file
+    }
+
+    fn advance_local_head(worktree: &Path) -> String {
+        std::fs::write(worktree.join("reviewed.txt"), "reviewed local head\n").unwrap();
+        run_git(worktree, &["add", "reviewed.txt"]);
+        run_git(worktree, &["commit", "-q", "-m", "reviewed local head"]);
+        task_branch_head(worktree)
+    }
+
+    /// Model the real lifecycle after handoff: the poller detaches the
+    /// finished worktree, then a later dispatch reattaches that same slot to a
+    /// different task. The old task branch ref survives in the repository.
+    fn reattach_workspace_to_replacement_task(worktree: &Path) -> String {
+        let detached = crate::workspace::detach_workspace_worktree(&Host::Local, worktree);
+        assert!(
+            matches!(detached, crate::workspace::DetachOutcome::Detached { .. }),
+            "handoff detachment failed: {detached:?}"
+        );
+        run_git(
+            worktree,
+            &["checkout", "-q", "-b", REPLACEMENT_BRANCH, "main"],
+        );
+        std::fs::write(worktree.join("replacement.txt"), "replacement task\n").unwrap();
+        run_git(worktree, &["add", "replacement.txt"]);
+        run_git(worktree, &["commit", "-q", "-m", "replacement task work"]);
+        local_head(worktree)
+    }
+
+    fn advance_origin_main_with_base_fix(base: &Path, origin: &Path) {
+        let bump = base.join("advance-main-for-probe");
+        run_git(
+            base,
+            &[
+                "clone",
+                "-q",
+                origin.to_str().unwrap(),
+                bump.to_str().unwrap(),
+            ],
+        );
+        run_git(&bump, &["config", "user.email", "test@example.com"]);
+        run_git(&bump, &["config", "user.name", "Test"]);
+        std::fs::write(bump.join("base-fix.txt"), "new default content\n").unwrap();
+        run_git(&bump, &["add", "base-fix.txt"]);
+        run_git(&bump, &["commit", "-q", "-m", "advance main"]);
+        run_git(&bump, &["push", "-q", "origin", "main"]);
+    }
+
+    /// Rewrite the reviewed task tip so the local and remote branches become
+    /// siblings. A normal push must reject this rather than overwrite the
+    /// stale remote PR branch.
+    fn rewrite_local_task_head(worktree: &Path) -> String {
+        std::fs::write(worktree.join("task.txt"), "rewritten reviewed work\n").unwrap();
+        run_git(worktree, &["add", "task.txt"]);
+        run_git(worktree, &["commit", "-q", "--amend", "--no-edit"]);
+        task_branch_head(worktree)
+    }
+
+    #[test]
+    fn stale_open_pr_is_updated_and_verified_before_reuse() {
+        let _lock = crate::test_lock::acquire();
+        let (base, origin, worktree) = setup_repo(true);
+        let stale_head = remote_head(&origin);
+        let reviewed_head = advance_local_head(&worktree);
+        assert_ne!(stale_head, reviewed_head);
+
+        let stub = tempfile::tempdir().unwrap();
+        let log = install_gh_stub(stub.path(), &origin, Some(379), None);
+        let result = {
+            let _env = EnvGuard::install(stub.path());
+            pr_create_at_head(
+                &project(base.path()),
+                PROJECT_NAME,
+                &task(),
+                "body",
+                &reviewed_head,
+            )
+        };
+
+        assert_eq!(result.unwrap(), 379);
+        assert_eq!(
+            remote_head(&origin),
+            reviewed_head,
+            "PR #379's remote branch must advance to the exact reviewed task ref before reuse"
+        );
+        let calls = gh_calls(&log);
+        assert!(calls.contains("pr list"), "{calls}");
+        assert!(calls.contains("pr view 379 --json headRefOid"), "{calls}");
+        assert!(!calls.contains("pr create"), "{calls}");
+    }
+
+    #[test]
+    fn reattached_workspace_reuses_old_tasks_exact_reviewed_branch() {
+        let _lock = crate::test_lock::acquire();
+        let (base, origin, worktree) = setup_repo(true);
+        let reviewed_head = advance_local_head(&worktree);
+        // Handoff detaches the finished checkout, then a replacement task is
+        // dispatched before either the probe or PR creation runs.
+        let replacement_head = reattach_workspace_to_replacement_task(&worktree);
+        let project = project(base.path());
+        let stub = tempfile::tempdir().unwrap();
+        let log = install_gh_stub(stub.path(), &origin, Some(379), None);
+        let (report, result) = {
+            let _env = EnvGuard::install(stub.path());
+            let report = probe(&project, &task(), &format!("refs/heads/{TASK_BRANCH}")).unwrap();
+            let result =
+                pr_create_at_head(&project, PROJECT_NAME, &task(), "body", &report.head_sha);
+            (report, result)
+        };
+        assert_eq!(report.head_sha, reviewed_head);
+        assert_ne!(replacement_head, reviewed_head);
+        assert_eq!(task_branch_head(&worktree), reviewed_head);
+
+        assert_eq!(result.unwrap(), 379);
+        assert_eq!(remote_head(&origin), reviewed_head);
+        assert_eq!(task_branch_head(&worktree), reviewed_head);
+        assert_eq!(local_head(&worktree), replacement_head);
+        assert_eq!(
+            git_stdout(&worktree, &["rev-parse", "--abbrev-ref", "HEAD"]),
+            REPLACEMENT_BRANCH,
+            "PR creation must not disturb the task now occupying the workspace"
+        );
+        let calls = gh_calls(&log);
+        assert!(
+            calls.contains(&format!("pr list --head {TASK_BRANCH}")),
+            "{calls}"
+        );
+        assert!(calls.contains("pr view 379 --json headRefOid"), "{calls}");
+        assert!(!calls.contains("pr create"), "{calls}");
+    }
+
+    #[test]
+    fn recycled_workspace_probe_rebases_old_task_and_pins_new_pr_to_reported_head() {
+        let _lock = crate::test_lock::acquire();
+        let (base, origin, worktree) = setup_repo(false);
+        let old_task_head = task_branch_head(&worktree);
+        run_git(
+            &worktree,
+            &["update-ref", "refs/heads/review-sibling", &old_task_head],
+        );
+        run_git(&worktree, &["config", "rebase.updateRefs", "true"]);
+        let replacement_head = reattach_workspace_to_replacement_task(&worktree);
+
+        // Model a replacement worker with staged, unstaged, and untracked
+        // state. The old task's probe must leave every byte and index entry
+        // alone even though the task still names this workspace assignment.
+        std::fs::write(worktree.join("replacement.txt"), "staged replacement\n").unwrap();
+        run_git(&worktree, &["add", "replacement.txt"]);
+        std::fs::write(worktree.join("replacement.txt"), "unstaged replacement\n").unwrap();
+        std::fs::write(worktree.join("replacement-untracked.txt"), "untracked\n").unwrap();
+        let replacement_branch_before =
+            git_stdout(&worktree, &["rev-parse", "--abbrev-ref", "HEAD"]);
+        let replacement_status_before = git_stdout(
+            &worktree,
+            &["status", "--porcelain=v1", "--untracked-files=all"],
+        );
+        let replacement_index_before = git_stdout(&worktree, &["diff", "--cached", "--binary"]);
+        let replacement_diff_before = git_stdout(&worktree, &["diff", "--binary"]);
+        let replacement_file_before = std::fs::read(worktree.join("replacement.txt")).unwrap();
+        let replacement_untracked_before =
+            std::fs::read(worktree.join("replacement-untracked.txt")).unwrap();
+        assert!(!worktree.join("task.txt").exists());
+
+        let stale_tracking_main = git_stdout(&worktree, &["rev-parse", "origin/main"]);
+        advance_origin_main_with_base_fix(base.path(), &origin);
+        // A user's fetch refspec need not update origin/main. The probe must
+        // use the exact commit fetched into FETCH_HEAD, not a stale tracking
+        // ref left behind by the clone.
+        run_git(&worktree, &["config", "--unset-all", "remote.origin.fetch"]);
+        run_git(
+            &worktree,
+            &[
+                "config",
+                "--add",
+                "remote.origin.fetch",
+                "+refs/heads/unrelated:refs/remotes/origin/unrelated",
+            ],
+        );
+        let project = project_with_probe_check(base.path());
+        let stub = tempfile::tempdir().unwrap();
+        let log = install_gh_stub(stub.path(), &origin, None, None);
+        let (report, pr) = {
+            let _env = EnvGuard::install(stub.path());
+            let report = probe_in_workflow(
+                &project,
+                None,
+                &task(),
+                TASK_BRANCH,
+                RebasePolicy::RebaseOntoDefault,
+            )
+            .unwrap();
+            let pr = pr_create_at_head(&project, PROJECT_NAME, &task(), "body", &report.head_sha)
+                .unwrap();
+            (report, pr)
+        };
+
+        assert_eq!(pr, 42);
+        assert_ne!(report.head_sha, old_task_head, "the stale task must rebase");
+        assert_eq!(report.head_sha, task_branch_head(&worktree));
+        assert_eq!(report.head_sha, remote_head(&origin));
+        assert_eq!(
+            git_stdout(&worktree, &["rev-parse", "origin/main"]),
+            stale_tracking_main,
+            "the regression requires origin/main to remain stale"
+        );
+        assert_eq!(
+            git_stdout(&worktree, &["rev-parse", "refs/heads/review-sibling"]),
+            old_task_head,
+            "--no-update-refs must override user config until Shelbi CAS-updates the task ref"
+        );
+        assert!(!report.rebase_conflict.conflicts);
+        assert!(!report.merge_conflict.conflicts);
+        assert_eq!(
+            report.diff_size,
+            DiffSize {
+                files: 1,
+                lines_added: 1,
+                lines_removed: 0,
+            }
+        );
+        assert_eq!(report.danger_paths.matched, vec!["task.txt"]);
+        assert_eq!(report.local_checks.len(), 1);
+        assert_eq!(report.local_checks[0].exit_code, 0);
+        assert_eq!(report.local_checks[0].output_tail, report.head_sha);
+
+        assert_eq!(local_head(&worktree), replacement_head);
+        assert_eq!(
+            git_stdout(&worktree, &["rev-parse", "--abbrev-ref", "HEAD"]),
+            replacement_branch_before
+        );
+        assert_eq!(
+            git_stdout(
+                &worktree,
+                &["status", "--porcelain=v1", "--untracked-files=all"]
+            ),
+            replacement_status_before
+        );
+        assert_eq!(
+            git_stdout(&worktree, &["diff", "--cached", "--binary"]),
+            replacement_index_before
+        );
+        assert_eq!(
+            git_stdout(&worktree, &["diff", "--binary"]),
+            replacement_diff_before
+        );
+        assert_eq!(
+            std::fs::read(worktree.join("replacement.txt")).unwrap(),
+            replacement_file_before
+        );
+        assert_eq!(
+            std::fs::read(worktree.join("replacement-untracked.txt")).unwrap(),
+            replacement_untracked_before
+        );
+        assert!(!worktree.join("task.txt").exists());
+        assert!(!worktree.join("base-fix.txt").exists());
+
+        let worktree_list = git_stdout(&worktree, &["worktree", "list", "--porcelain"]);
+        assert_eq!(
+            worktree_list
+                .lines()
+                .filter(|line| line.starts_with("worktree "))
+                .count(),
+            1,
+            "the isolated probe worktree must be removed:\n{worktree_list}"
+        );
+        let calls = gh_calls(&log);
+        assert!(calls.contains("pr create --head"), "{calls}");
+        assert!(calls.contains("pr view 42 --json headRefOid"), "{calls}");
+    }
+
+    #[test]
+    fn current_open_pr_is_verified_and_reused() {
+        let _lock = crate::test_lock::acquire();
+        let (base, origin, worktree) = setup_repo(true);
+        // Finished workspaces are normally detached at handoff. The branch
+        // ref and HEAD still name the same commit, so reuse must work without
+        // requiring an attached checkout.
+        run_git(&worktree, &["checkout", "-q", "--detach"]);
+        let reviewed_head = task_branch_head(&worktree);
+
+        let stub = tempfile::tempdir().unwrap();
+        let log = install_gh_stub(stub.path(), &origin, Some(21), None);
+        let result = {
+            let _env = EnvGuard::install(stub.path());
+            pr_create(&project(base.path()), PROJECT_NAME, &task(), "body")
+        };
+
+        assert_eq!(result.unwrap(), 21);
+        assert_eq!(remote_head(&origin), reviewed_head);
+        let calls = gh_calls(&log);
+        assert!(calls.contains("pr view 21 --json headRefOid"), "{calls}");
+        assert!(!calls.contains("pr create"), "{calls}");
+    }
+
+    #[test]
+    fn new_pr_uses_reviewed_branch_when_workspace_has_been_reattached() {
+        let _lock = crate::test_lock::acquire();
+        let (base, origin, worktree) = setup_repo(false);
+        let reviewed_head = task_branch_head(&worktree);
+        let replacement_head = reattach_workspace_to_replacement_task(&worktree);
+
+        let stub = tempfile::tempdir().unwrap();
+        let log = install_gh_stub(stub.path(), &origin, None, None);
+        let result = {
+            let _env = EnvGuard::install(stub.path());
+            pr_create_at_head(
+                &project(base.path()),
+                PROJECT_NAME,
+                &task(),
+                "body",
+                &reviewed_head,
+            )
+        };
+
+        assert_eq!(result.unwrap(), 42);
+        assert_eq!(remote_head(&origin), reviewed_head);
+        assert_eq!(local_head(&worktree), replacement_head);
+        let calls = gh_calls(&log);
+        assert!(calls.contains("pr create --head"), "{calls}");
+        assert!(calls.contains("--title initial task work"), "{calls}");
+        assert!(!calls.contains("--title replacement task work"), "{calls}");
+        assert!(calls.contains("pr view 42 --json headRefOid"), "{calls}");
+    }
+
+    #[test]
+    fn task_branch_moving_after_probe_is_rejected_before_push() {
+        let _lock = crate::test_lock::acquire();
+        let (base, origin, worktree) = setup_repo(false);
+        let probed_head = task_branch_head(&worktree);
+        let moved_head = advance_local_head(&worktree);
+
+        let stub = tempfile::tempdir().unwrap();
+        let log = install_gh_stub(stub.path(), &origin, Some(379), None);
+        let result = {
+            let _env = EnvGuard::install(stub.path());
+            pr_create_at_head(
+                &project(base.path()),
+                PROJECT_NAME,
+                &task(),
+                "body",
+                &probed_head,
+            )
+        };
+
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("moved since it was probed"), "{err}");
+        assert!(err.contains(&probed_head), "{err}");
+        assert!(err.contains(&moved_head), "{err}");
+        assert!(!remote_branch_exists(&worktree));
+        assert!(gh_calls(&log).is_empty());
+    }
+
+    #[test]
+    fn rewritten_task_branch_is_rejected_without_reusing_stale_pr() {
+        let _lock = crate::test_lock::acquire();
+        let (base, origin, worktree) = setup_repo(true);
+        let stale_remote_head = remote_head(&origin);
+        let reviewed_head = rewrite_local_task_head(&worktree);
+        assert_ne!(stale_remote_head, reviewed_head);
+
+        let stub = tempfile::tempdir().unwrap();
+        let log = install_gh_stub(stub.path(), &origin, Some(379), None);
+        let result = {
+            let _env = EnvGuard::install(stub.path());
+            pr_create_at_head(
+                &project(base.path()),
+                PROJECT_NAME,
+                &task(),
+                "body",
+                &reviewed_head,
+            )
+        };
+
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains(TASK_BRANCH), "{err}");
+        assert!(err.contains(&reviewed_head), "{err}");
+        assert!(err.contains("rewritten or diverged"), "{err}");
+        assert_eq!(remote_head(&origin), stale_remote_head);
+        assert_eq!(task_branch_head(&worktree), reviewed_head);
+        assert!(
+            gh_calls(&log).is_empty(),
+            "a rejected push must not allow stale PR #379 into the workflow"
+        );
+    }
+
+    #[test]
+    fn pr_head_mismatch_is_rejected_without_returning_stale_number() {
+        let _lock = crate::test_lock::acquire();
+        let (base, origin, worktree) = setup_repo(true);
+        let stale_head = remote_head(&origin);
+        let reviewed_head = advance_local_head(&worktree);
+
+        let stub = tempfile::tempdir().unwrap();
+        install_gh_stub(stub.path(), &origin, Some(379), Some(&stale_head));
+        let result = {
+            let _env = EnvGuard::install(stub.path());
+            pr_create_at_head(
+                &project(base.path()),
+                PROJECT_NAME,
+                &task(),
+                "body",
+                &reviewed_head,
+            )
+        };
+
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("PR #379"), "{err}");
+        assert!(err.contains(&stale_head), "{err}");
+        assert!(err.contains(&reviewed_head), "{err}");
+        assert!(err.contains("refusing to report"), "{err}");
+        assert_eq!(
+            remote_head(&origin),
+            reviewed_head,
+            "the safe push may succeed, but a stale GitHub head must still block reuse"
+        );
+    }
+}
+
 // ===========================================================================
 // Probe primitives — local checks, conflict, diff size, danger paths
 // ===========================================================================
@@ -845,18 +1689,19 @@ pub struct DangerPaths {
 pub struct ProbeReport {
     /// The branch tip every fact in this report was computed against,
     /// captured *after* the optional rebase. The orchestrator hands it
-    /// back to `shelbi zen pr-merge --match-head-commit <sha>` so the
-    /// merge is pinned to exactly the commit that was probed — a commit
-    /// pushed after the probe makes the merge refuse instead of landing
-    /// unchecked.
+    /// back to both `shelbi zen pr-create --match-head-commit <sha>` and
+    /// `shelbi zen pr-merge --match-head-commit <sha>` so the published PR
+    /// and eventual merge are pinned to exactly the commit that was probed.
+    /// A branch move after the probe makes either operation refuse instead of
+    /// publishing or landing unchecked content.
     pub head_sha: String,
     pub local_checks: Vec<LocalCheck>,
     pub merge_conflict: ConflictProbe,
     /// Outcome of rebasing the branch onto the *current* default before the
     /// probe ran. Populated only under [`RebasePolicy::RebaseOntoDefault`];
     /// always clean under `AsIs`. When `conflicts` is true the rebase was
-    /// aborted (worktree left on the pre-rebase HEAD) and the local checks
-    /// were skipped — `files` names the conflicting paths.
+    /// aborted (the durable task ref stays at its pre-rebase commit) and the
+    /// local checks were skipped — `files` names the conflicting paths.
     pub rebase_conflict: ConflictProbe,
     pub diff_size: DiffSize,
     pub danger_paths: DangerPaths,
@@ -866,15 +1711,15 @@ pub struct ProbeReport {
 /// default before gathering facts.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RebasePolicy {
-    /// Fetch the project's default branch and rebase the workspace branch
-    /// onto it before probing, so every fact reflects the default as it
-    /// stands *now* — not as it stood at handoff. This is what
-    /// `shelbi zen probe` wants: a re-probe after a blocker merges must
-    /// reflect the merged fix without a manual `git rebase`.
+    /// Fetch the project's default branch and rebase the named task branch
+    /// onto it in an isolated worktree before probing, so every fact reflects
+    /// the default as it stands *now* — not as it stood at handoff. A clean
+    /// rebase advances the durable task ref only after the isolated checks
+    /// and facts all describe the same new commit.
     RebaseOntoDefault,
-    /// Probe the worktree exactly as it sits — no fetch, no rewrite. Used
-    /// by the read-only dry-run preview (which must not mutate any
-    /// worktree) and the legacy [`probe`] entry point.
+    /// Probe an isolated checkout of the named task ref with no fetch or ref
+    /// rewrite. Used by the read-only dry-run preview and the legacy
+    /// [`probe`] entry point.
     AsIs,
 }
 
@@ -883,11 +1728,12 @@ pub enum RebasePolicy {
 
 /// Run every primitive for `task` on `branch` and return the report.
 ///
-/// Resolves the workspace's worktree (and machine) from `task.assigned_to` —
-/// the probe always operates against the workspace that produced the branch,
-/// not against the hub's parent repo. This matters for remote workspaces: the
-/// branch only exists in the remote worktree's git repo until it's
-/// pushed.
+/// Resolves the workspace's repository (and machine) from `task.assigned_to`,
+/// then checks out the named task ref in a temporary worktree. The assigned
+/// workspace's current branch and files are never used as probe input. This
+/// matters after handoff, when that workspace may already serve another task,
+/// and for remote workspaces, where the unpushed task ref exists only on the
+/// worker machine.
 ///
 /// Legacy entry point (workflow-unaware) — calls
 /// [`probe_in_workflow`] with `workflow = None`. New callers should
@@ -914,51 +1760,150 @@ pub fn probe_in_workflow(
     policy: RebasePolicy,
 ) -> Result<ProbeReport> {
     let (machine, workspace) = resolve_workspace(project, task)?;
+    // Dispatch holds this same lock across sync_worktree/checkout/spawn. Keep
+    // it for the whole probe so a freed slot cannot begin another checkout
+    // between our named-ref snapshot and compare-and-swap update.
+    let _workspace_lock = shelbi_state::lock_workspace(&project.name, &workspace.name)?;
     let host = machine.host();
-    let worktree = workspace_worktree(&machine, workspace);
+    let repository_anchor = workspace_worktree(&machine, workspace);
+    let branch = normalize_probe_branch(branch)?;
+    let task_ref = format!("refs/heads/{branch}");
+    let initial_head =
+        probe_head_sha(&host, &repository_anchor, &format!("{task_ref}^{{commit}}"))?;
 
-    // Resolve the base ref every fact below is computed against. Under
-    // `RebaseOntoDefault` we fetch the current default and rebase the branch
-    // onto it first, so the probe reflects the default as it stands *now* —
-    // a prereq fix that merged after handoff is already absorbed before the
-    // local checks run, and `base` points at the freshly-fetched ref so the
-    // conflict/diff/danger facts line up with it. Under `AsIs` (the
-    // read-only dry-run preview and the legacy entry point) nothing is
-    // fetched or rewritten.
+    // Handoff detaches a finished task and immediately makes its workspace
+    // reusable. The assigned path may therefore be checked out on a wholly
+    // different task by the time Zen probes the old review. Use it only as a
+    // repository anchor: every mutable and content-sensitive operation runs
+    // in a throwaway detached worktree at the exact named-ref snapshot.
+    let probe_worktree = unique_probe_worktree_path(&repository_anchor, &task.id);
+    add_probe_worktree(&host, &repository_anchor, &probe_worktree, &initial_head)?;
+
+    let probe_result = probe_isolated_task_ref(
+        project,
+        workflow,
+        task,
+        &host,
+        &repository_anchor,
+        &probe_worktree,
+        &branch,
+        &task_ref,
+        &initial_head,
+        policy,
+    );
+    let cleanup_result = remove_probe_worktree(&host, &repository_anchor, &probe_worktree);
+
+    match (probe_result, cleanup_result) {
+        (Err(probe_err), Err(cleanup_err)) => Err(Error::Other(format!(
+            "{probe_err}; additionally failed to remove the isolated probe worktree: \
+             {cleanup_err}"
+        ))),
+        (Err(probe_err), Ok(())) => Err(probe_err),
+        (Ok(_), Err(cleanup_err)) => Err(cleanup_err),
+        (Ok(report), Ok(())) => Ok(report),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn probe_isolated_task_ref(
+    project: &Project,
+    workflow: Option<&Workflow>,
+    task: &Task,
+    host: &Host,
+    repository_anchor: &std::path::Path,
+    probe_worktree: &std::path::Path,
+    branch: &str,
+    task_ref: &str,
+    initial_head: &str,
+    policy: RebasePolicy,
+) -> Result<ProbeReport> {
+    // Freeze the base OID too. A concurrent fetch must not make rebase and
+    // diff inspection silently describe different versions of the default
+    // branch within one report.
     let default_branch = project.base_branch();
-    let (base, rebase_conflict) = match policy {
-        RebasePolicy::AsIs => (default_branch.to_string(), ConflictProbe::default()),
+    let base_ref = match policy {
+        RebasePolicy::AsIs => default_branch.to_string(),
+        RebasePolicy::RebaseOntoDefault => fetch_probe_base(host, probe_worktree, default_branch),
+    };
+    let base_sha = probe_head_sha(host, probe_worktree, &format!("{base_ref}^{{commit}}"))?;
+
+    let rebase_conflict = match policy {
+        RebasePolicy::AsIs => ConflictProbe::default(),
         RebasePolicy::RebaseOntoDefault => {
-            let target = fetch_probe_base(&host, &worktree, default_branch);
-            let outcome = rebase_workspace_branch_onto_default(&host, &worktree, &target);
-            let conflict = match &outcome {
+            match rebase_workspace_branch_onto_default(host, probe_worktree, &base_sha) {
+                RebaseOutcome::AlreadyUpToDate { .. } | RebaseOutcome::Rebased { .. } => {
+                    ConflictProbe::default()
+                }
                 RebaseOutcome::Conflict { files, .. } => ConflictProbe {
                     conflicts: true,
-                    files: files.clone(),
+                    files,
                 },
-                _ => ConflictProbe::default(),
-            };
-            (target, conflict)
+                RebaseOutcome::Skipped { reason } => {
+                    return Err(Error::Other(format!(
+                        "could not rebase task branch `{branch}` in its isolated Zen probe: \
+                         {reason}; refusing to report unverified probe results"
+                    )));
+                }
+            }
         }
     };
 
-    // Capture the branch tip *after* the rebase settled — this is the
-    // commit every fact below describes, and the SHA the orchestrator
-    // must pin the eventual `pr-merge` to.
-    let head_sha = probe_head_sha(&host, &worktree, branch)?;
-
-    let merge_conflict = probe_merge_conflict(&host, &worktree, branch, &base)?;
-    let diff_size = probe_diff_size(&host, &worktree, branch, &base)?;
-    let danger_paths = probe_danger_paths(project, workflow, &host, &worktree, branch, &base)?;
-    // A rebase conflict means the rebase was aborted and the worktree is
-    // back on the stale handoff HEAD. Running the local checks now would
-    // re-test the exact stale state the probe is meant to move past, so skip
-    // them and let `rebase_conflict` carry the signal.
+    // The detached temp worktree is the sole content authority for this
+    // report. A clean rebase changes only its HEAD for now; the durable named
+    // ref is advanced with an expected-old compare-and-swap after every fact
+    // and local check has successfully inspected this exact commit.
+    let head_sha = probe_head_sha(host, probe_worktree, "HEAD^{commit}")?;
+    if rebase_conflict.conflicts && head_sha != initial_head {
+        return Err(Error::Other(format!(
+            "the conflicted rebase for task branch `{branch}` did not restore its isolated \
+             checkout from {head_sha} to the original commit {initial_head}; refusing to \
+             advance or report the task branch"
+        )));
+    }
+    let merge_conflict = probe_merge_conflict(host, probe_worktree, &head_sha, &base_sha)?;
+    let diff_size = probe_diff_size(host, probe_worktree, &head_sha, &base_sha)?;
+    let danger_paths = probe_danger_paths(
+        project,
+        workflow,
+        host,
+        probe_worktree,
+        &head_sha,
+        &base_sha,
+    )?;
+    // A rebase conflict was aborted back to the pre-probe commit. Testing
+    // that stale content would be misleading, so the conflict itself blocks
+    // the merge and local checks stay empty.
     let local_checks = if rebase_conflict.conflicts {
         Vec::new()
     } else {
-        probe_local_checks(&host, &worktree, project, workflow, task)?
+        probe_local_checks(host, probe_worktree, project, workflow, task)?
     };
+
+    let final_temp_head = probe_head_sha(host, probe_worktree, "HEAD^{commit}")?;
+    if final_temp_head != head_sha {
+        return Err(Error::Other(format!(
+            "a local Zen check moved the isolated task checkout from {head_sha} to \
+             {final_temp_head}; refusing to report results for a different commit"
+        )));
+    }
+
+    if !rebase_conflict.conflicts && head_sha != initial_head {
+        advance_probed_task_ref(
+            host,
+            repository_anchor,
+            branch,
+            task_ref,
+            initial_head,
+            &head_sha,
+        )?;
+    }
+    verify_task_branch_head(
+        host,
+        repository_anchor,
+        branch,
+        &head_sha,
+        "while its isolated Zen probe was finishing",
+    )?;
 
     Ok(ProbeReport {
         head_sha,
@@ -968,6 +1913,168 @@ pub fn probe_in_workflow(
         diff_size,
         danger_paths,
     })
+}
+
+fn normalize_probe_branch(branch: &str) -> Result<String> {
+    let branch = branch.strip_prefix("refs/heads/").unwrap_or(branch);
+    shelbi_core::validate_branch(branch)
+        .map_err(|e| Error::Other(format!("cannot probe task branch `{branch}`: {e}")))?;
+    Ok(branch.to_string())
+}
+
+fn unique_probe_worktree_path(repository_anchor: &std::path::Path, task_id: &str) -> PathBuf {
+    static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let seq = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    // Task ids can approach GitHub's 255-byte ref limit. Keep the diagnostic
+    // fragment short so the generated path component stays below NAME_MAX;
+    // pid + process-local sequence provide uniqueness.
+    let safe_id: String = task_id
+        .chars()
+        .take(48)
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    repository_anchor
+        .parent()
+        .unwrap_or(repository_anchor)
+        .join(format!(
+            ".shelbi-probe-{}-{safe_id}-{seq}",
+            std::process::id()
+        ))
+}
+
+fn add_probe_worktree(
+    host: &Host,
+    repository_anchor: &std::path::Path,
+    probe_worktree: &std::path::Path,
+    head_sha: &str,
+) -> Result<()> {
+    let anchor = repository_anchor.to_string_lossy().into_owned();
+    let probe = probe_worktree.to_string_lossy().into_owned();
+    let out = shelbi_ssh::run(
+        host,
+        [
+            "git", "-C", &anchor, "worktree", "add", "--detach", &probe, head_sha,
+        ],
+    )
+    .map_err(Error::Io)?;
+    if !out.status.success() {
+        // Checkout hooks and smudge filters can fail after git has already
+        // registered and populated the worktree. Do not leave that partial
+        // probe behind just because `worktree add` itself returned non-zero.
+        let _ = remove_probe_worktree(host, repository_anchor, probe_worktree);
+        return Err(Error::Command {
+            cmd: format!("git -C {anchor} worktree add --detach {probe} {head_sha}"),
+            status: out.status.to_string(),
+            stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
+        });
+    }
+    Ok(())
+}
+
+fn remove_probe_worktree(
+    host: &Host,
+    repository_anchor: &std::path::Path,
+    probe_worktree: &std::path::Path,
+) -> Result<()> {
+    let anchor = repository_anchor.to_string_lossy().into_owned();
+    let probe = probe_worktree.to_string_lossy().into_owned();
+    let out = shelbi_ssh::run(
+        host,
+        [
+            "git", "-C", &anchor, "worktree", "remove", "--force", &probe,
+        ],
+    )
+    .map_err(Error::Io)?;
+    if !out.status.success() {
+        return Err(Error::Command {
+            cmd: format!("git -C {anchor} worktree remove --force {probe}"),
+            status: out.status.to_string(),
+            stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
+        });
+    }
+    Ok(())
+}
+
+fn advance_probed_task_ref(
+    host: &Host,
+    repository_anchor: &std::path::Path,
+    branch: &str,
+    task_ref: &str,
+    expected_head: &str,
+    probed_head: &str,
+) -> Result<()> {
+    let anchor = repository_anchor.to_string_lossy().into_owned();
+    let checked_out = task_ref_checkout_paths(host, repository_anchor, task_ref)?;
+    if !checked_out.is_empty() {
+        return Err(Error::Other(format!(
+            "task branch `{branch}` is still checked out in {}; refusing to advance it from \
+             an isolated Zen probe because that would disturb another worktree",
+            checked_out.join(", ")
+        )));
+    }
+
+    let out = shelbi_ssh::run(
+        host,
+        [
+            "git",
+            "-C",
+            &anchor,
+            "update-ref",
+            task_ref,
+            probed_head,
+            expected_head,
+        ],
+    )
+    .map_err(Error::Io)?;
+    if !out.status.success() {
+        let current = probe_head_sha(host, repository_anchor, &format!("{task_ref}^{{commit}}"))
+            .unwrap_or_else(|_| "<missing>".to_string());
+        if current != expected_head {
+            return Err(Error::Other(format!(
+                "task branch `{branch}` moved from {expected_head} to {current} while its \
+                 isolated Zen probe was running; refusing to replace the concurrent update \
+                 with probed commit {probed_head}"
+            )));
+        }
+        return Err(Error::Command {
+            cmd: format!("git -C {anchor} update-ref {task_ref} {probed_head} {expected_head}"),
+            status: out.status.to_string(),
+            stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
+        });
+    }
+    Ok(())
+}
+
+fn task_ref_checkout_paths(
+    host: &Host,
+    repository_anchor: &std::path::Path,
+    task_ref: &str,
+) -> Result<Vec<String>> {
+    let anchor = repository_anchor.to_string_lossy().into_owned();
+    let porcelain = shelbi_ssh::run_capture(
+        host,
+        ["git", "-C", &anchor, "worktree", "list", "--porcelain"],
+    )?;
+    let mut paths = Vec::new();
+    let mut current_path: Option<&str> = None;
+    for line in porcelain.lines() {
+        if let Some(path) = line.strip_prefix("worktree ") {
+            current_path = Some(path);
+        } else if line.strip_prefix("branch ") == Some(task_ref) {
+            if let Some(path) = current_path {
+                paths.push(path.to_string());
+            }
+        } else if line.is_empty() {
+            current_path = None;
+        }
+    }
+    Ok(paths)
 }
 
 /// Resolve `branch`'s tip SHA in the workspace worktree. Read-only —
@@ -981,18 +2088,28 @@ fn probe_head_sha(host: &Host, worktree: &std::path::Path, branch: &str) -> Resu
 /// Fetch `base` from `origin` into the workspace worktree and return the
 /// ref the probe should rebase onto and compare against.
 ///
-/// On a successful fetch that's the freshly-updated remote-tracking ref
-/// (`origin/<base>`), so the probe sees whatever merged upstream since the
-/// workspace handed off — the case where the hub's local `<base>` is stale
-/// because the fix landed via a GitHub PR merge, not a local one. A fetch
-/// failure — no `origin` remote (local-only project), an offline host, an
-/// unknown branch name — is non-fatal: we fall back to the local `<base>`
-/// ref the worktree already has, which is exactly the pre-fetch behavior.
-/// This fetch is the only network call the probe makes.
+/// On a successful fetch this returns `FETCH_HEAD`, which names the exact
+/// commit Git just received even when a custom fetch refspec does not update
+/// `origin/<base>`. The caller immediately freezes it to an OID. A fetch
+/// failure — no `origin` remote (local-only project), an offline host, or an
+/// unknown branch name — is non-fatal: we fall back to the local `<base>` ref
+/// the repository already has. This is the probe's only network call.
 fn fetch_probe_base(host: &Host, worktree: &std::path::Path, base: &str) -> String {
     let wt = worktree.to_string_lossy().into_owned();
-    match shelbi_ssh::run(host, ["git", "-C", wt.as_str(), "fetch", "origin", base]) {
-        Ok(o) if o.status.success() => format!("origin/{base}"),
+    let remote_ref = format!("refs/heads/{base}");
+    match shelbi_ssh::run(
+        host,
+        [
+            "git",
+            "-C",
+            wt.as_str(),
+            "fetch",
+            "origin",
+            "--",
+            remote_ref.as_str(),
+        ],
+    ) {
+        Ok(o) if o.status.success() => "FETCH_HEAD".to_string(),
         _ => base.to_string(),
     }
 }
@@ -1985,6 +3102,32 @@ mod probe_tests {
         ZenConfig,
     };
 
+    struct ProbeHomeGuard {
+        previous: Option<std::ffi::OsString>,
+        _home: tempfile::TempDir,
+    }
+
+    impl ProbeHomeGuard {
+        fn install() -> Self {
+            let home = tempfile::tempdir().unwrap();
+            let previous = std::env::var_os("SHELBI_HOME");
+            std::env::set_var("SHELBI_HOME", home.path());
+            Self {
+                previous,
+                _home: home,
+            }
+        }
+    }
+
+    impl Drop for ProbeHomeGuard {
+        fn drop(&mut self) {
+            match self.previous.take() {
+                Some(previous) => std::env::set_var("SHELBI_HOME", previous),
+                None => std::env::remove_var("SHELBI_HOME"),
+            }
+        }
+    }
+
     /// Stand up an `origin` bare repo seeded with `main` (one commit adding
     /// `seed.txt`) and clone it into the workspace's conventional worktree
     /// path. Returns the temp base (machine work_dir), the origin path, and
@@ -2159,8 +3302,69 @@ mod probe_tests {
         .to_string()
     }
 
+    fn probe_git_stdout(repo: &std::path::Path, args: &[&str]) -> String {
+        let out = Command::new("git")
+            .current_dir(repo)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "git {} failed in {}: {}",
+            args.join(" "),
+            repo.display(),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
+    fn branch_sha(repo: &std::path::Path, branch: &str) -> String {
+        probe_git_stdout(repo, &["rev-parse", &format!("refs/heads/{branch}")])
+    }
+
+    fn detach_for_handoff(repo: &std::path::Path, branch: &str) {
+        let outcome = crate::workspace::detach_workspace_worktree(&Host::Local, repo);
+        assert_eq!(
+            outcome,
+            crate::workspace::DetachOutcome::Detached {
+                from_branch: Some(branch.into())
+            }
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn failed_probe_worktree_checkout_is_removed() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let (_base, _origin, wt) = setup_origin_and_worktree();
+        let hook = wt.join(".git/hooks/post-checkout");
+        std::fs::write(&hook, "#!/bin/sh\nexit 1\n").unwrap();
+        std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let probe_path = unique_probe_worktree_path(&wt, "hook-failure");
+        let head = head_sha(&wt);
+        let err = add_probe_worktree(&Host::Local, &wt, &probe_path, &head)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("worktree add"), "{err}");
+
+        let worktrees = probe_git_stdout(&wt, &["worktree", "list", "--porcelain"]);
+        assert!(
+            !worktrees.contains(&probe_path.to_string_lossy().into_owned()),
+            "failed checkout left a registered probe worktree:\n{worktrees}"
+        );
+        assert!(
+            !probe_path.exists(),
+            "failed checkout left probe files at {}",
+            probe_path.display()
+        );
+    }
+
     #[test]
     fn probe_rebases_stale_worktree_onto_advanced_default() {
+        let _lock = crate::test_lock::acquire();
+        let _home = ProbeHomeGuard::install();
         // (a) The default advanced (a blocker fix added `fix.txt`) after the
         // workspace handed off. The probe must fetch + rebase so the local
         // check — which only passes when `fix.txt` is present — sees the new
@@ -2173,7 +3377,9 @@ mod probe_tests {
         std::fs::write(wt.join("work.txt"), "task work\n").unwrap();
         run_git(&wt, &["add", "-A"]);
         run_git(&wt, &["commit", "-q", "-m", "task work"]);
-        let before = head_sha(&wt);
+        let before = branch_sha(&wt, "shelbi/task1");
+        detach_for_handoff(&wt, "shelbi/task1");
+        let detached_workspace_head = head_sha(&wt);
 
         // Blocker fix lands on origin/main after handoff.
         advance_origin_main(base.path(), &origin, "add fix", |r| {
@@ -2198,23 +3404,35 @@ mod probe_tests {
             "check should see the rebased default (fix.txt present): {}",
             report.local_checks[0].output_tail
         );
-        // The branch was actually rewritten onto the advanced default.
-        assert_ne!(head_sha(&wt), before, "HEAD must move after the rebase");
+        // The durable task ref was rewritten onto the advanced default, but
+        // the detached workspace checkout was not touched.
+        assert_ne!(
+            branch_sha(&wt, "shelbi/task1"),
+            before,
+            "task branch must move after the rebase"
+        );
+        assert_eq!(
+            head_sha(&wt),
+            detached_workspace_head,
+            "the handed-off workspace HEAD must remain untouched"
+        );
         assert!(
-            wt.join("fix.txt").exists(),
-            "worktree must contain the fix after rebase"
+            !wt.join("fix.txt").exists(),
+            "the assigned workspace must not receive files from the probe rebase"
         );
         // The report pins the *post-rebase* tip — the SHA pr-merge must be
         // matched against, not the stale handoff commit.
         assert_eq!(
             report.head_sha,
-            head_sha(&wt),
+            branch_sha(&wt, "shelbi/task1"),
             "head_sha must be the rebased branch tip"
         );
     }
 
     #[test]
     fn probe_reports_rebase_conflict_and_skips_checks() {
+        let _lock = crate::test_lock::acquire();
+        let _home = ProbeHomeGuard::install();
         // (b) The default advanced on the same lines the task touched, so the
         // rebase conflicts. The probe must report `rebase_conflict` with the
         // conflicting file, abort the rebase, and NOT run the local checks.
@@ -2224,6 +3442,9 @@ mod probe_tests {
         run_git(&wt, &["checkout", "-q", "-b", "shelbi/task1"]);
         std::fs::write(wt.join("seed.txt"), "task side\n").unwrap();
         run_git(&wt, &["commit", "-q", "-am", "task edits seed"]);
+        let task_head = branch_sha(&wt, "shelbi/task1");
+        detach_for_handoff(&wt, "shelbi/task1");
+        let detached_workspace_head = head_sha(&wt);
 
         // Conflicting edit lands on origin/main.
         advance_origin_main(base.path(), &origin, "main edits seed", |r| {
@@ -2257,8 +3478,12 @@ mod probe_tests {
             "local checks must be skipped on rebase conflict, got {:?}",
             report.local_checks
         );
+        assert_eq!(report.head_sha, task_head);
+        assert_eq!(branch_sha(&wt, "shelbi/task1"), task_head);
+        assert_eq!(head_sha(&wt), detached_workspace_head);
 
-        // The abort left the worktree clean and on the original branch HEAD.
+        // The conflict and abort happened only in the temporary worktree.
+        // The detached assigned workspace remains clean and unchanged.
         let status = Command::new("git")
             .current_dir(&wt)
             .args(["status", "--porcelain"])
@@ -2272,6 +3497,8 @@ mod probe_tests {
 
     #[test]
     fn probe_on_current_worktree_does_not_rewrite_and_runs_checks() {
+        let _lock = crate::test_lock::acquire();
+        let _home = ProbeHomeGuard::install();
         // (c) The worktree already contains the current default — fetch is a
         // no-op, the rebase is up-to-date, and the checks run immediately. We
         // prove "no extra work" by asserting HEAD is byte-for-byte unchanged
@@ -2282,7 +3509,9 @@ mod probe_tests {
         std::fs::write(wt.join("work.txt"), "task work\n").unwrap();
         run_git(&wt, &["add", "-A"]);
         run_git(&wt, &["commit", "-q", "-m", "task work"]);
-        let before = head_sha(&wt);
+        let before = branch_sha(&wt, "shelbi/task1");
+        detach_for_handoff(&wt, "shelbi/task1");
+        let detached_workspace_head = head_sha(&wt);
 
         let project = probe_project(base.path(), &["true"]);
         let task = probe_task("shelbi/task1");
@@ -2306,14 +3535,58 @@ mod probe_tests {
         );
         assert_eq!(report.local_checks[0].exit_code, 0);
         assert_eq!(
-            head_sha(&wt),
+            branch_sha(&wt, "shelbi/task1"),
             before,
             "an up-to-date branch must not be rewritten"
         );
+        assert_eq!(head_sha(&wt), detached_workspace_head);
         assert_eq!(
             report.head_sha, before,
             "head_sha must be the (unmoved) branch tip"
         );
+    }
+
+    #[test]
+    fn advancing_probed_ref_rejects_a_concurrent_branch_move() {
+        let (base, _origin, wt) = setup_origin_and_worktree();
+        run_git(&wt, &["checkout", "-q", "-b", "shelbi/task1"]);
+        std::fs::write(wt.join("work.txt"), "task work\n").unwrap();
+        run_git(&wt, &["add", "work.txt"]);
+        run_git(&wt, &["commit", "-q", "-m", "task work"]);
+        let expected = branch_sha(&wt, "shelbi/task1");
+        detach_for_handoff(&wt, "shelbi/task1");
+
+        run_git(&wt, &["checkout", "-q", "-b", "concurrent", "main"]);
+        std::fs::write(wt.join("concurrent.txt"), "concurrent work\n").unwrap();
+        run_git(&wt, &["add", "concurrent.txt"]);
+        run_git(&wt, &["commit", "-q", "-m", "concurrent update"]);
+        let concurrent = head_sha(&wt);
+        let proposed = probe_git_stdout(&wt, &["rev-parse", "main"]);
+        run_git(
+            &wt,
+            &[
+                "update-ref",
+                "refs/heads/shelbi/task1",
+                &concurrent,
+                &expected,
+            ],
+        );
+
+        let err = advance_probed_task_ref(
+            &Host::Local,
+            &wt,
+            "shelbi/task1",
+            "refs/heads/shelbi/task1",
+            &expected,
+            &proposed,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("moved"), "{err}");
+        assert!(err.contains(&expected), "{err}");
+        assert!(err.contains(&concurrent), "{err}");
+        assert_eq!(branch_sha(&wt, "shelbi/task1"), concurrent);
+        drop(base);
     }
 }
 
@@ -2744,18 +4017,18 @@ mod scan_tests {
 // Dry-run preview — what would Zen do, without doing it
 // ===========================================================================
 //
-// `dry_run_tick` runs the same two read-only steps Zen Mode runs every loop:
+// `dry_run_tick` runs the same two non-publishing steps Zen Mode runs each loop:
 //
 // 1. Scan the backlog for mechanically-eligible auto-promotion candidates.
 // 2. Probe every task currently in `review` and apply the default mechanical
 //    bar (the thresholds documented in the orchestrator prompt template).
 //
 // It returns one `DryRunDecision` per finding so the CLI can log "would
-// have …" without touching any state. The orchestrator's judgment layer
-// (the auto-promote categories in the prompt) is *not* simulated — that
-// requires an LLM. The decisions for backlog candidates make this
-// explicit by labelling them `WouldConsiderAutoPromote` rather than
-// `WouldAutoPromote`.
+// have …" without changing durable task, board, PR, or branch state. The
+// orchestrator's judgment layer (the auto-promote categories in the prompt)
+// is *not* simulated — that requires an LLM. The decisions for backlog
+// candidates make this explicit by labelling them `WouldConsiderAutoPromote`
+// rather than `WouldAutoPromote`.
 
 /// Default merge-conditions thresholds — mirror the values in the
 /// orchestrator prompt template (`default_orchestrator.md.template`,
@@ -2829,11 +4102,12 @@ impl DryRunAction {
     }
 }
 
-/// Run one read-only Zen pass for `project` and return every decision
-/// the live loop would have made. Probes (which shell out) are best-
-/// effort: a probe that errors is surfaced as a `BlockMerge` decision
-/// labelled `probe-failed` so the user still sees the task, rather than
-/// silently dropping it.
+/// Run one non-publishing Zen pass for `project` and return every decision the
+/// live loop would have made. Task, board, PR, and branch state remain
+/// unchanged; probes use transient isolated worktrees for accurate local
+/// checks. Probes are best-effort: an error is surfaced as a `BlockMerge`
+/// decision labelled `probe-failed` so the user still sees the task, rather
+/// than silently dropping it.
 ///
 /// The merge bar is **action-based**: for each task in a `handoff`-
 /// category status, we look up the task's workflow and apply the bar
@@ -2891,8 +4165,8 @@ pub fn dry_run_tick(project: &Project) -> Result<Vec<DryRunDecision>> {
             continue;
         }
         let branch = branch::branch_name_for_task(project, workflow_ref, &tf.task)?;
-        // Dry-run is a read-only preview — never fetch or rewrite a
-        // worktree here. `AsIs` keeps the branch exactly as it sits.
+        // Dry-run never fetches or rewrites the task ref. `AsIs` probes its
+        // exact commit in a transient isolated worktree.
         match probe_in_workflow(project, workflow_ref, &tf.task, &branch, RebasePolicy::AsIs) {
             Ok(report) => {
                 decisions.push(evaluate_probe(&tf.task.id, &report));

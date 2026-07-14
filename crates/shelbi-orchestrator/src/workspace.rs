@@ -334,18 +334,18 @@ pub enum RebaseOutcome {
     /// Default branch is already an ancestor of the workspace's HEAD — the
     /// branch is up to date and no rewrite was needed.
     AlreadyUpToDate { default_sha: String },
-    /// Rebase finished cleanly; the workspace's branch is now on top of
-    /// `default_sha`. `before_sha`/`after_sha` are HEAD before/after the
-    /// rewrite — equal when the rebase ran but produced an empty result
-    /// (rare; harmless).
+    /// Rebase finished cleanly; the worktree's HEAD is now on top of
+    /// `default_sha` (and its branch moved too when HEAD was attached).
+    /// `before_sha`/`after_sha` are HEAD before/after the rewrite — equal
+    /// when the rebase ran but produced an empty result (rare; harmless).
     Rebased {
         before_sha: String,
         after_sha: String,
         default_sha: String,
     },
     /// Rebase ran into conflicts. We aborted it so the worktree returned to
-    /// a clean state and the workspace's branch HEAD is unchanged — the human
-    /// reviewer will resolve the conflict during the review checkout.
+    /// a clean state at its exact original HEAD. A failed or inexact abort is
+    /// reported as [`RebaseOutcome::Skipped`] instead.
     Conflict {
         default_sha: String,
         stderr_excerpt: String,
@@ -411,8 +411,8 @@ impl RebaseOutcome {
     }
 }
 
-/// Rebase the workspace's current branch in `worktree` onto `default_branch`,
-/// leaving the worktree on the same branch (now rewritten) on success.
+/// Rebase `worktree`'s current HEAD onto `default_branch`. An attached HEAD
+/// advances its branch; a detached HEAD remains detached at the rebased tip.
 ///
 /// Why this exists: when a prereq task lands on `main` after a workspace has
 /// already started its own task, the workspace's branch sits one or more
@@ -434,8 +434,9 @@ impl RebaseOutcome {
 ///   to a rebase conflict). The workspace is expected to have committed
 ///   before writing the review marker; a dirty worktree returns
 ///   [`RebaseOutcome::Skipped`].
-/// - On conflict we run `git rebase --abort` and return
-///   [`RebaseOutcome::Conflict`] — the workspace's branch HEAD is unchanged.
+/// - On conflict we require `git rebase --abort` to restore the exact original
+///   HEAD before returning [`RebaseOutcome::Conflict`]. Otherwise the outcome
+///   is `Skipped`, so no caller can consume a partial rebase as a valid tip.
 /// - Never panics; every git failure surfaces as `Skipped` or `Conflict`
 ///   so the caller can log it and continue the review promotion.
 pub fn rebase_workspace_branch_onto_default(
@@ -521,10 +522,23 @@ pub fn rebase_workspace_branch_onto_default(
         return RebaseOutcome::AlreadyUpToDate { default_sha };
     }
 
-    // 4. Run the rebase. Plain `git rebase` (no autostash — we already
-    //    proved the worktree is clean; no `--rebase-merges` — workspaces
-    //    produce linear branches).
-    let out = match shelbi_ssh::run(host, ["git", "-C", &wt_str, "rebase", default_branch]) {
+    // 4. Run the rebase. No autostash (we already proved the worktree is
+    //    clean), no `--rebase-merges` (workspaces produce linear branches),
+    //    and explicitly no `--update-refs`. The latter prevents a user's
+    //    `rebase.updateRefs=true` setting from rewriting sibling task refs;
+    //    callers that intentionally advance another durable ref do so with
+    //    their own compare-and-swap after the rebase succeeds.
+    let out = match shelbi_ssh::run(
+        host,
+        [
+            "git",
+            "-C",
+            &wt_str,
+            "rebase",
+            "--no-update-refs",
+            default_branch,
+        ],
+    ) {
         Ok(o) => o,
         Err(e) => {
             return RebaseOutcome::Skipped {
@@ -557,12 +571,6 @@ pub fn rebase_workspace_branch_onto_default(
         })
         .unwrap_or_default();
 
-        // Abort so the worktree returns to its pre-rebase state — the
-        // workspace's branch HEAD is unchanged and the next `git status` is
-        // clean. Abort is best-effort: a hung rebase that won't abort would
-        // leave the worktree in an interactive state, but we still want to
-        // log the conflict and let the review proceed.
-        let _ = shelbi_ssh::run(host, ["git", "-C", &wt_str, "rebase", "--abort"]);
         let stderr = String::from_utf8_lossy(&out.stderr);
         let stdout = String::from_utf8_lossy(&out.stdout);
         let combined = format!("{stderr}{stdout}");
@@ -581,6 +589,49 @@ pub fn rebase_workspace_branch_onto_default(
                     .unwrap_or("rebase failed")
                     .to_string()
             });
+
+        // Abort must restore the exact pre-rebase commit before we can call
+        // this a safely-contained conflict. A detached rebase can leave HEAD
+        // on the new base or a partially replayed commit while conflicted;
+        // treating a failed abort as an ordinary conflict would let callers
+        // mistake that partial result for a usable branch tip.
+        let abort = match shelbi_ssh::run(host, ["git", "-C", &wt_str, "rebase", "--abort"]) {
+            Ok(abort) => abort,
+            Err(e) => {
+                return RebaseOutcome::Skipped {
+                    reason: format!("rebase_abort_spawn_failed:{e}"),
+                }
+            }
+        };
+        if !abort.status.success() {
+            let abort_stderr = String::from_utf8_lossy(&abort.stderr);
+            let detail = abort_stderr
+                .lines()
+                .map(str::trim)
+                .find(|line| !line.is_empty())
+                .unwrap_or("git rebase --abort failed");
+            return RebaseOutcome::Skipped {
+                reason: format!("rebase_abort_failed:{detail}"),
+            };
+        }
+        let restored_head = match shelbi_ssh::run_capture(
+            host,
+            ["git", "-C", &wt_str, "rev-parse", "HEAD"],
+        ) {
+            Ok(sha) => sha.trim().to_string(),
+            Err(e) => {
+                return RebaseOutcome::Skipped {
+                    reason: format!("post_abort_rev_parse_HEAD_failed:{e}"),
+                }
+            }
+        };
+        if restored_head != before_sha {
+            return RebaseOutcome::Skipped {
+                reason: format!(
+                    "rebase_abort_restored_wrong_HEAD(expected_{before_sha},found_{restored_head})"
+                ),
+            };
+        }
         return RebaseOutcome::Conflict {
             default_sha,
             stderr_excerpt: excerpt,

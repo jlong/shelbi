@@ -121,6 +121,10 @@ mod tests {
         // The fuller policy follows below the summary.
         assert!(DEFAULT_ZENMODE.contains("Auto-promote judgment categories"));
         assert!(DEFAULT_ZENMODE.contains("Merge conditions"));
+        assert!(DEFAULT_ZENMODE
+            .contains("shelbi zen pr-create <task-id> --match-head-commit <head_sha>"));
+        assert!(DEFAULT_ZENMODE
+            .contains("shelbi zen pr-merge <pr-number> --match-head-commit <head_sha>"));
     }
 
     #[test]
