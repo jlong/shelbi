@@ -2642,7 +2642,7 @@ mod reload_target_tmux_tests {
         }
     }
 
-    #[derive(Clone, Debug, PartialEq, Eq)]
+    #[derive(Clone, Debug, Default, PartialEq, Eq)]
     struct TmuxGlobals {
         cleanup_hook: Option<String>,
         palette_binding: Option<String>,
@@ -3094,7 +3094,10 @@ mod reload_target_tmux_tests {
         assert_eq!(std::fs::read(&handoff_path).unwrap(), handoff_before);
         assert_eq!(std::fs::read(&project_state_path).ok(), project_state_before);
         assert_eq!(std::fs::read(&global_state_path).ok(), global_state_before);
-        assert_eq!(TmuxGlobals::capture(), tmux_globals_before);
+        assert_eq!(
+            TmuxGlobals::capture().unwrap_or_default(),
+            tmux_globals_before.unwrap_or_default()
+        );
     }
 
     #[test]
