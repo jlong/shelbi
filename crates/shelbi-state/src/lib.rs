@@ -1001,6 +1001,11 @@ pub struct State {
     /// guidepost.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub claude_md_migration_hinted: bool,
+    /// One-shot latch armed while a new project's scaffold is published.
+    /// The first orchestrator launch atomically claims it before injecting
+    /// the contextual greeting; legacy projects default to `false`.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub contextual_greeting_pending: bool,
     /// Explicit Kanban-column collapse overrides keyed by
     /// `"<workflow_name>:<status_id>"`. Only deviations from the
     /// auto-default are persisted — an empty / non-existent entry means
@@ -1741,6 +1746,27 @@ pub fn update_state<R>(project: &str, f: impl FnOnce(&mut State) -> Result<R>) -
         write_state_to(&path, &state)?;
     }
     Ok(out)
+}
+
+/// Mark a newly scaffolded project for a contextual greeting on its first
+/// orchestrator launch. Re-arming an already-pending project is a no-op.
+pub fn arm_contextual_greeting(project: &str) -> Result<()> {
+    update_state(project, |state| {
+        state.contextual_greeting_pending = true;
+        Ok(())
+    })
+}
+
+/// Atomically claim a project's pending contextual greeting.
+///
+/// Returns `true` for exactly one claimant after the latch is armed and
+/// `false` for legacy projects, reloads, resumes, and subsequent launches.
+pub fn claim_contextual_greeting(project: &str) -> Result<bool> {
+    update_state(project, |state| {
+        let pending = state.contextual_greeting_pending;
+        state.contextual_greeting_pending = false;
+        Ok(pending)
+    })
 }
 
 /// Persist `target` as the project's `zen_mode` and append a
@@ -2780,6 +2806,9 @@ mod tests {
         // stays byte-compatible with the pre-`extra` schema.
         let json = serde_json::to_string(&State::default()).unwrap();
         assert_eq!(json, "{\"zen_mode\":\"off\"}");
+
+        let legacy: State = serde_json::from_str("{\"zen_mode\":\"off\"}").unwrap();
+        assert!(!legacy.contextual_greeting_pending);
     }
 
     #[test]
@@ -3842,6 +3871,28 @@ mod tests {
         assert_eq!(s, State::default());
         assert_eq!(s.zen_mode, ZenModeState::Off);
         assert!(s.zen_last_crashed_at.is_none());
+        assert!(!s.contextual_greeting_pending);
+        std::env::remove_var("SHELBI_HOME");
+    }
+
+    #[test]
+    fn contextual_greeting_claim_is_one_shot_and_project_scoped() {
+        let _g = TEST_LOCK.lock().unwrap();
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+
+        assert!(!claim_contextual_greeting("alpha").unwrap());
+        arm_contextual_greeting("alpha").unwrap();
+        arm_contextual_greeting("bravo").unwrap();
+
+        assert!(claim_contextual_greeting("alpha").unwrap());
+        assert!(!claim_contextual_greeting("alpha").unwrap());
+        assert!(read_state("bravo").unwrap().contextual_greeting_pending);
+        assert!(claim_contextual_greeting("bravo").unwrap());
+        assert!(!claim_contextual_greeting("bravo").unwrap());
+
+        assert!(!read_state("alpha").unwrap().contextual_greeting_pending);
+        assert!(!read_state("bravo").unwrap().contextual_greeting_pending);
         std::env::remove_var("SHELBI_HOME");
     }
 

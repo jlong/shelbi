@@ -196,8 +196,8 @@ fn resolve_scripted(
     let name = pick_name(&path, force_name)?;
     if project_name_collides(&name)? {
         bail!(
-            "a shelbi project named `{name}` already exists at \
-             ~/.shelbi/projects/{name}.yaml — remove the existing YAML or pass \
+            "a shelbi project named `{name}` already exists under \
+             ~/.shelbi/projects — remove the existing registration or pass \
              --project NAME to pick a different name"
         );
     }
@@ -263,8 +263,8 @@ fn prompt_loop(cwd: &Path, force_name: Option<&str>) -> Result<ResolvedProjectRo
 
         if project_name_collides(&name)? {
             let proceed = Confirm::new(&format!(
-                "⚠ a shelbi project named `{name}` already exists at \
-                 ~/.shelbi/projects/{name}.yaml. Re-initialize?"
+                "⚠ a shelbi project named `{name}` already exists under \
+                 ~/.shelbi/projects. Re-initialize?"
             ))
             .with_default(false)
             .prompt()
@@ -488,7 +488,7 @@ mod tests {
         std::fs::create_dir_all(home.join("projects/split")).unwrap();
         std::fs::write(
             home.join("projects/split/local.yaml"),
-            "repo: /tmp/split\n",
+            "name: split\nrepo: /tmp/split\n",
         )
         .unwrap();
         assert!(project_name_collides("taken").unwrap());

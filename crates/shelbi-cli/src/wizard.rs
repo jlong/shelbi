@@ -543,8 +543,17 @@ fn persist_plan(plan: &DetectedSetupPlan) -> Result<()> {
     // files. Publish a complete temporary file with an atomic no-clobber link
     // so neither an interruption nor a concurrent setup can leave a partial
     // or replaced registration at the discoverable path.
-    if split_registration.exists() {
-        return Err(project_collision_error(&project.name, &split_registration));
+    // Serialize the registration commit with dashboard bootstrap. This keeps
+    // a concurrent setup loser from re-arming the greeting after the winner's
+    // first dashboard already consumed it, and prevents a dashboard from
+    // observing the registration between publication and arming.
+    let _dashboard_lock = shelbi_state::lock_dashboard(&project.name)
+        .map_err(|error| anyhow!(error))?;
+    if let Some(existing) = [&flat_registration, &split_registration]
+        .into_iter()
+        .find(|path| path.exists())
+    {
+        return Err(project_collision_error(&project.name, existing));
     }
     // Missing first_run_seen means "already seen" for upgrade safety. Arm
     // the hint explicitly only while publishing this machine's first project,
@@ -553,6 +562,7 @@ fn persist_plan(plan: &DetectedSetupPlan) -> Result<()> {
     if is_first_registration {
         shelbi_state::arm_first_run_hint().map_err(|error| anyhow!(error))?;
     }
+    shelbi_state::arm_contextual_greeting(&project.name).map_err(|error| anyhow!(error))?;
     write_new_project_registration(
         &flat_registration,
         registration_yaml.as_bytes(),
@@ -1483,7 +1493,7 @@ fn atomic_replace_file(path: &Path, contents: &[u8]) -> Result<()> {
     Ok(())
 }
 
-fn create_sibling_temp(path: &Path) -> Result<(PathBuf, std::fs::File)> {
+pub(crate) fn create_sibling_temp(path: &Path) -> Result<(PathBuf, std::fs::File)> {
     use std::sync::atomic::{AtomicU64, Ordering};
 
     static NEXT_TEMP: AtomicU64 = AtomicU64::new(0);
@@ -2696,6 +2706,12 @@ mod tests {
         assert!(
             !shelbi_state::read_global_state().unwrap().first_run_seen,
             "the machine's first project must arm the launch hint"
+        );
+        assert!(
+            shelbi_state::read_state("shaft")
+                .unwrap()
+                .contextual_greeting_pending,
+            "new project must be armed for its one-shot contextual greeting"
         );
     }
 

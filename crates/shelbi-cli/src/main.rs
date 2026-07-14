@@ -272,7 +272,13 @@ enum Cmd {
     /// remote TUI for one project. Not for direct use.
     #[command(hide = true)]
     #[command(name = "__codex-orchestrator")]
-    CodexOrchestrator { project: String },
+    CodexOrchestrator {
+        project: String,
+        /// Carry the already-claimed first-project welcome into the native
+        /// bridge. Hidden with the internal command and never set by users.
+        #[arg(long, hide = true)]
+        first_launch: bool,
+    },
     /// Toggle Zen Mode or run its primitives. `shelbi zen on/off/pause` flip
     /// the trust boundary for auto-promotion and exact-provenance auto-merge.
     /// `probe` reports facts about a finished branch (checks,
@@ -396,8 +402,11 @@ fn main() -> Result<()> {
         Some(Cmd::Sidebar { project }) => shelbi_tui::run_sidebar(&project).context("sidebar"),
         Some(Cmd::Tasks { project }) => shelbi_tui::run_tasks(&project).context("tasks"),
         Some(Cmd::Activity { project }) => shelbi_tui::run_activity(&project).context("activity"),
-        Some(Cmd::CodexOrchestrator { project }) => {
-            shelbi_orchestrator::wake::run_codex_bridge(&project)
+        Some(Cmd::CodexOrchestrator {
+            project,
+            first_launch,
+        }) => {
+            shelbi_orchestrator::wake::run_codex_bridge(&project, first_launch)
                 .map_err(|e| anyhow::anyhow!(e.to_string()))
         }
         Some(Cmd::Popup) => commands::popup::run(),
@@ -770,9 +779,26 @@ mod cli_tests {
     fn codex_orchestrator_bridge_command_is_hidden_but_parseable() {
         let cli = Cli::parse_from(["shelbi", "__codex-orchestrator", "myapp"]);
         match cli.cmd {
-            Some(Cmd::CodexOrchestrator { project }) if project == "myapp" => {}
+            Some(Cmd::CodexOrchestrator {
+                project,
+                first_launch,
+            }) if project == "myapp" && !first_launch => {}
             other => panic!("expected CodexOrchestrator {{ myapp }}, got {other:?}"),
         }
+
+        let first = Cli::parse_from([
+            "shelbi",
+            "__codex-orchestrator",
+            "myapp",
+            "--first-launch",
+        ]);
+        assert!(matches!(
+            first.cmd,
+            Some(Cmd::CodexOrchestrator {
+                project,
+                first_launch: true,
+            }) if project == "myapp"
+        ));
 
         let help = Cli::try_parse_from(["shelbi", "--help"])
             .expect_err("--help exits through clap")
