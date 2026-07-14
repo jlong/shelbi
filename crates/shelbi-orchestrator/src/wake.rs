@@ -70,15 +70,26 @@ pub fn maybe_wake_codex(project: &Project, state: &mut CodexWakeState) {
     };
     let profile = SubmitProfile::CodexUi;
     let baseline = PaneBaseline::capture(&host, &addr, profile);
-    if !should_submit(state, pending, baseline.is_actively_busy()) {
+    if !should_submit(state, pending, baseline.is_codex_wake_ready()) {
         return;
     }
 
-    // Re-check idleness at the shared submit guard. A user can start a turn
-    // between the baseline capture and delivery; in that race we defer rather
-    // than type into the active turn's queue.
-    let may_submit = || !PaneBaseline::capture(&host, &addr, profile).is_actively_busy();
-    match crate::submit::send_verified_guarded(&host, &addr, WAKE_PROMPT, &baseline, may_submit) {
+    // Re-check the live composer at the shared submit guard immediately before
+    // text delivery. A user can start typing or submit a turn after the
+    // baseline capture; either race revokes delivery without touching tmux.
+    let may_deliver = || crate::submit::codex_wake_ready(&host, &addr);
+    // Once our text is parked, the composer is no longer empty. Preserve the
+    // verifier's one dropped-Enter retry, but require a fresh capture showing
+    // exactly our prompt so appended user text can never be submitted with it.
+    let may_retry_enter = || crate::submit::codex_wake_retry_ready(&host, &addr, WAKE_PROMPT);
+    match crate::submit::send_verified_guarded_with_guards(
+        &host,
+        &addr,
+        WAKE_PROMPT,
+        &baseline,
+        may_deliver,
+        may_retry_enter,
+    ) {
         Ok(SubmitStatus::Submitted { .. }) => state.woken_through = pending.through,
         Ok(status) => tracing::warn!(
             project = %project.name,
@@ -113,8 +124,8 @@ fn wake_delivery_error_summary(error: &Error) -> String {
     }
 }
 
-fn should_submit(state: &CodexWakeState, pending: PendingWake, active: bool) -> bool {
-    !active && pending.through > state.woken_through
+fn should_submit(state: &CodexWakeState, pending: PendingWake, pane_ready: bool) -> bool {
+    pane_ready && pending.through > state.woken_through
 }
 
 fn scan_pending(project: &Project) -> shelbi_core::Result<Option<PendingWake>> {
@@ -208,7 +219,6 @@ fn line_priority(
         return Some(WakePriority::WorkspaceFree);
     }
     if words.contains(&"heartbeat") {
-        let zen_actionable = fields.get("zen").is_some_and(|zen| *zen == "on");
         let capacity_actionable = fields
             .get("zen_eligible")
             .and_then(|n| n.parse::<usize>().ok())
@@ -219,7 +229,7 @@ fn line_priority(
                 .and_then(|n| n.parse::<usize>().ok())
                 .unwrap_or(0)
                 > 0;
-        if board_in_flight || zen_actionable || capacity_actionable {
+        if board_in_flight || capacity_actionable {
             return Some(WakePriority::Heartbeat);
         }
     }
@@ -284,12 +294,60 @@ mod tests {
 
     #[test]
     fn quiet_heartbeat_is_not_actionable_but_inflight_heartbeat_is() {
-        let line = "t project=demo heartbeat zen_eligible=0 idle_workspaces=2";
+        let line = "t project=demo heartbeat zen=on zen_eligible=0 idle_workspaces=9";
         assert_eq!(line_priority(line, "demo", false), None);
         assert_eq!(
             line_priority(line, "demo", true),
             Some(WakePriority::Heartbeat)
         );
+    }
+
+    #[test]
+    fn heartbeat_requires_both_eligible_work_and_idle_capacity() {
+        assert_eq!(
+            line_priority(
+                "t project=demo heartbeat zen=on zen_eligible=2 idle_workspaces=1",
+                "demo",
+                false,
+            ),
+            Some(WakePriority::Heartbeat)
+        );
+        for line in [
+            "t project=demo heartbeat zen=on zen_eligible=2 idle_workspaces=0",
+            "t project=demo heartbeat zen=on zen_eligible=0 idle_workspaces=9",
+            "t project=demo heartbeat zen=on zen_eligible=nope idle_workspaces=9",
+            "t project=demo heartbeat zen=on",
+        ] {
+            assert_eq!(line_priority(line, "demo", false), None, "line: {line}");
+        }
+    }
+
+    #[test]
+    fn transition_wakes_remain_actionable() {
+        assert_eq!(
+            line_priority(
+                "t project=demo task=ours backlog -> queued to_category=ready",
+                "demo",
+                false,
+            ),
+            Some(WakePriority::Ready)
+        );
+        assert_eq!(
+            line_priority(
+                "t project=demo task=ours active -> review to_category=handoff",
+                "demo",
+                false,
+            ),
+            Some(WakePriority::Handoff)
+        );
+        for state in ["awaiting_input", "idle"] {
+            let line = format!("t project=demo workspace=alpha working -> {state}");
+            assert_eq!(
+                line_priority(&line, "demo", false),
+                Some(WakePriority::WorkspaceFree),
+                "state: {state}"
+            );
+        }
     }
 
     #[test]
@@ -309,17 +367,25 @@ mod tests {
     }
 
     #[test]
+    fn quiet_heartbeat_after_actionable_event_does_not_extend_wake_position() {
+        let actionable = "t project=demo task=ours x -> todo to_category=ready\n";
+        let quiet = "t project=demo heartbeat zen=on zen_eligible=0 idle_workspaces=9\n";
+        let pending = scan_text(&format!("{actionable}{quiet}"), 11, "demo", false).unwrap();
+        assert_eq!(pending.through, 11 + actionable.len() as u64);
+    }
+
+    #[test]
     fn idle_codex_with_pending_event_is_eligible_for_wake() {
         let state = CodexWakeState::default();
         let pending = PendingWake { through: 42 };
-        assert!(should_submit(&state, pending, false));
+        assert!(should_submit(&state, pending, true));
     }
 
     #[test]
     fn active_codex_turn_defers_pending_wake() {
         let state = CodexWakeState::default();
         let pending = PendingWake { through: 42 };
-        assert!(!should_submit(&state, pending, true));
+        assert!(!should_submit(&state, pending, false));
     }
 
     #[test]
@@ -327,7 +393,7 @@ mod tests {
         let state = CodexWakeState::default();
         let pending = PendingWake { through: 42 };
         // No successful result advanced the watermark, so the next tick retries.
-        assert!(should_submit(&state, pending, false));
+        assert!(should_submit(&state, pending, true));
     }
 
     #[test]
@@ -335,7 +401,7 @@ mod tests {
         let mut state = CodexWakeState::default();
         let pending = PendingWake { through: 42 };
         state.woken_through = pending.through;
-        assert!(!should_submit(&state, pending, false));
+        assert!(!should_submit(&state, pending, true));
     }
 
     #[test]
@@ -405,7 +471,7 @@ mod tests {
             &script,
             "#!/bin/sh\n\
              stty -echo\n\
-             printf '\\033[2J\\033[H› Ask Codex to do anything\\n\\n  ? for shortcuts\\n'\n\
+             printf '\\033[2J\\033[H› Explain this codebase\\n\\n  ? for shortcuts\\n'\n\
              IFS= read -r line\n\
              printf '%s\\n' \"$line\" > \"$1\"\n\
              printf '\\033[2J\\033[H• Working (1s)\\n  esc to interrupt\\n'\n\
@@ -502,12 +568,15 @@ mod tests {
                 .output()
                 .unwrap();
             screen = String::from_utf8_lossy(&output.stdout).into_owned();
-            if screen.contains("Ask Codex") {
+            if screen.contains("Explain this codebase") {
                 break;
             }
             std::thread::sleep(Duration::from_millis(20));
         }
-        assert!(screen.contains("Ask Codex"), "fixture never became idle: {screen}");
+        assert!(
+            screen.contains("Explain this codebase"),
+            "fixture never became idle: {screen}"
+        );
 
         let mut runners = BTreeMap::new();
         runners.insert(
