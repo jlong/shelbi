@@ -1,51 +1,52 @@
 ---
 title: shelbi wizard
 order: 11
-summary: Run the interactive onboarding walkthrough that sets up a project and writes its config — idempotent, so it skips setup when the project already exists.
+summary: Run the same detected, one-confirmation project setup used by first-run Shelbi.
 ---
 
 ```text
-shelbi wizard [OPTIONS]
+shelbi wizard
 ```
 
-`shelbi wizard` is the guided front door to Shelbi. It walks you through project
-setup (auto-filling what it can from the current git checkout when there is one)
-and writes `~/.shelbi/projects/<name>.yaml`. It's the interactive counterpart
-to [`shelbi init`](/docs/cli/init): reach for the wizard when you'd rather answer
-prompts than assemble flags.
+`shelbi wizard` is the explicit interactive entry point for Shelbi's first
+project setup. It inspects the current Git checkout and machine, prints the
+preflight results, and presents one setup card:
 
-The walkthrough is **idempotent**. If a project is already on disk, the wizard
-detects it and skips setup rather than clobbering your config, so it's safe to
-re-run. For the end-to-end onboarding story (from install through your first
-task), follow the
-[Create your first project](/docs/guides/getting-started/first-project) guide,
-which drives this command.
+```text
+Enter launch    c customize    q quit
+```
 
-## Options
+Press Enter to create the detected plan and launch the dashboard. Press `c` to
+edit the prefilled project, repository, branch, remote, runner, workspace, and
+orchestrator values. Press `q`, Esc, or Ctrl+C to leave without project state.
 
-| Flag | Type | Default | Description |
-| --- | --- | --- | --- |
-| `--root <PATH>` | string | install-time default, else `~/.shelbi` | Override the Shelbi root directory. The flag wins over `$SHELBI_ROOT` and the compile-time default. |
-| `-p, --project <PROJECT>` | string | `$SHELBI_PROJECT` / cwd lookup | Project to operate on. Defaults to the project named in `$SHELBI_PROJECT`, or the registered project whose `work_dir` contains the current directory. |
+If both Claude Code and Codex are detected, the wizard first asks `Which
+agent?`. If the current directory is not a Git repository, it first asks
+permission to run `git init -b main`. Missing tmux or runner prerequisites stop
+setup before the card and print an install-and-retry message.
+
+The command is idempotent at the project-registration level. If any project is
+already registered, it completes without creating another one. Use
+`shelbi project add` to run the shared setup flow for an additional project.
 
 ## Examples
 
-Run the onboarding walkthrough from inside the repo you want to manage:
+Run setup explicitly from the repository you want Shelbi to manage:
 
 ```bash
+cd ~/code/myapp
 shelbi wizard
 ```
 
-Re-run it later, and setup is skipped because the project already exists:
+For automation, use the non-interactive detected-plan path instead:
 
 ```bash
-shelbi wizard
+shelbi init -y --runner codex
 ```
 
 ## See also
 
-- [Create your first project](/docs/guides/getting-started/first-project) — the
-  getting-started guide that walks through this wizard step by step.
-- [`shelbi init`](/docs/cli/init) — the flag-driven, scriptable form of the same
-  setup, with the global vs in-repo mode choice.
-- [`shelbi project`](/docs/cli/project) — add further projects after the first.
+- [Set up your first project](/docs/guides/getting-started/first-project) for
+  every happy-path and edge-path screen.
+- [`shelbi init`](/docs/cli/init) for scriptable setup and config pick-up.
+- [`shelbi project`](/docs/cli/project) for additional projects.

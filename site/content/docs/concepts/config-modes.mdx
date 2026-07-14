@@ -17,8 +17,9 @@ Shelbi splits everything it writes to disk into two categories:
 default, *global mode*), or committed to the repo itself (*in-repo mode*).
 State always lives under `~/.shelbi/`, regardless of mode.
 
-You pick a mode once, at `shelbi init` time; you can move a project from
-global to in-repo later with a one-shot command.
+First-run `shelbi` and `shelbi init -y` create global-mode config. You can move
+a project to in-repo mode later with a one-shot command. The legacy interactive
+`shelbi init` path also offers an explicit `--mode` choice.
 
 <Callout type="tip" title="Which mode?">
 
@@ -47,7 +48,7 @@ than silently letting one side win.
 
 ## Global mode
 
-The default. `shelbi init` (or the interactive wizard) writes
+The default. First-run `shelbi`, the interactive wizard, and `shelbi init -y` write
 `~/.shelbi/projects/<name>.yaml` with everything (shared and
 user-local) in one flat file. Nothing is added to your repo. The
 project only exists on your machine.
@@ -330,8 +331,7 @@ kill its task, reload, then re-dispatch.
   reference for the YAML this page routes to disk, including the exact
   shared vs. user-local field split.
 - [Set up your first project](/docs/guides/getting-started/first-project) —
-  the wizard walkthrough (defaults to global mode; the `--mode` picker
-  chooses in-repo).
+  the detected, one-confirmation global-mode setup.
 - [`shelbi reload`](/docs/cli/reload) — respawn the TUI panes after
   editing the YAML or installing a new binary.
 - `shelbi init --help` and `shelbi project migrate-to-in-repo --help` —

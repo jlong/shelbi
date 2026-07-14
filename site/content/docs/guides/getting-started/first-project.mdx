@@ -1,320 +1,164 @@
 ---
 title: Set up your first project
 order: 12
-summary: Walk through the wizard, declare your workspaces, and write the project YAML.
+summary: Let Shelbi inspect your repo and machine, confirm one setup card, and land on a dashboard that is ready to use.
 ---
 
-<CopyPromptBanner prompt="Set up a Shelbi project for the git repo in my current directory. Run `shelbi` (or `shelbi wizard`) and walk me through it: name the project, confirm the repo path and default branch, declare the hub machine and any SSH remotes, then pick an agent runner (claude or codex), a workspace count, and a naming style. The result is a project YAML at ~/.shelbi/projects/<name>.yaml." />
+<CopyPromptBanner prompt="Set up Shelbi for the Git repository in my current directory. Run `shelbi`, review the preflight and detected setup card with me, and press Enter only after I approve it. If I want to change a detected value, use `c` to Customize. Do not hand-write the generated config." />
 
-A Shelbi *project* is a git repo plus the machines it runs on, the agent
-runners those machines have, and the named pool of workspaces that pick up
-tasks. All of that lives in a single YAML file at
-`~/.shelbi/projects/<name>.yaml` in the default **global mode**. To let
-teammates share your workflows and agent prompts across clones instead,
-[in-repo mode](/docs/concepts/config-modes) commits the shared half of the
-config to the repo itself. The wizard offers the choice during setup.
-
-This page walks through global-mode setup. In-repo setup follows the same
-prompts; only the shared file's location differs, and the wizard makes that
-choice explicit.
-
-## Start the wizard
-
-From inside the repo you want to set up:
+From the Git repository you want Shelbi to manage, install and start it:
 
 ```bash
-shelbi
+brew install jlong/shelbi/shelbi && shelbi
 ```
 
-With no projects on disk, `shelbi` drops you straight into the wizard.
-You can also run it explicitly any time:
+On the happy path, Shelbi asks one question: launch the detected plan? It does
+not write project state until you confirm the card.
 
-```bash
-shelbi wizard
+## 1. Watch the preflight
+
+First-run setup prints the Shelbi banner, then checks the environment in front
+of you. A typical preflight looks like this:
+
+```text
+  ✓ git repo            ~/code/myapp
+  ✓ default branch      main
+  ✓ remote              github.com:you/myapp.git
+  ✓ agent               codex 0.27.0 on PATH
+  ✓ tmux                3.5a
+  ✓ machine             10 cores, recommending 4 workspaces
 ```
 
-The first thing you see is the block-character banner:
+Shelbi detects the repository root, default branch, origin, supported agent
+runners, tmux, and a workspace count suited to the machine. The values appear
+as each check completes.
 
-<TerminalBanner />
+<Callout type="note" title="If both runners are installed">
 
-The wizard walks one project through setup. It's idempotent. Re-running
-skips anything already on disk.
+When both Claude Code and Codex are on `PATH`, Shelbi cannot infer which one
+you prefer. It asks exactly one runner question before the plan card:
 
-## Project setup
-
-Each prompt has a sensible default, shown in brackets. Press Enter to
-accept; type to override.
-
-<Steps>
-<Step title="Repo basics">
-
-```
-? Project name: myapp
-? Path to the repo: /Users/you/Workspaces/myapp
-? Default branch: main
-? GitHub repo URL (optional): git@github.com:you/myapp.git
+```text
+? Which agent?
+  claude (<detected version>)
+  codex (<detected version>)
 ```
 
-Auto-fills from your environment:
-
-- **Project name** — the basename of the current directory.
-- **Path to the repo** — the current working directory.
-- **Default branch** — probed from `git symbolic-ref refs/remotes/origin/HEAD`, falling back to `main`.
-- **GitHub repo URL** — `git remote get-url origin`, blank if there's no remote.
-
-The project name has to be a kebab/snake-case identifier (letters, digits,
-`-`, `_`). It's the slug used in `~/.shelbi/projects/<name>.yaml`, in the
-tmux session name (`shelbi-<name>`), and on the CLI (`shelbi -p <name>`).
-
-</Step>
-<Step title="The hub">
-
-```
-? Hub machine name: hub
-? Hub work directory: /Users/you/Workspaces/myapp
-```
-
-The **hub** is the machine you're sitting at. It owns the tmux session,
-runs the orchestrator pane, and holds any local workspaces. The work
-directory is where local worktrees get created, usually the repo path.
-
-</Step>
-<Step title="Remote machines (optional)">
-
-```
-? Add a remote machine? Yes
-  ? Remote machine name: devbox
-  ? SSH host: devbox.local
-  ? Work directory on remote: /home/you/work/myapp
-? Add another remote machine? No
-```
-
-A remote machine is any host you can reach over `ssh` without a password
-prompt, with `tmux` and your agent CLI installed. Shelbi prefixes every
-command with `ssh <host> --` and runs the workspaces there in tmux panes
-you can attach to from the hub.
-
-The SSH host defaults to the machine name, convenient if your
-`~/.ssh/config` already aliases hosts (so `devbox` resolves to a full
-host). The work directory is the path on that *remote* where worktrees
-live.
-
-You can add more machines later by editing the YAML directly and running
-`shelbi reload`.
-
-</Step>
-<Step title="Workspaces">
-
-```
-? Agent runner (used by every workspace): claude
-  (memory: 64 GB → recommended 5 workspaces per machine — configurable later)
-? Workspace count per machine: 4
-? Workspace naming style: NATO phonetic (alpha, bravo, charlie…)
-? Orchestrator runner: claude
-```
-
-- **Agent runner** — `claude` or `codex`. Every workspace uses the same
-  runner by default; you can mix runners by editing the YAML later.
-- **Workspace count per machine** — the wizard suggests a number based on
-  total RAM, budgeting roughly 10 GB per workspace on single-machine
-  setups and 12 GB when work spreads across machines. Clamped to
-  `[1, 16]`. Override with whatever fits your machine.
-- **Workspace naming style** — three presets to choose from:
-
-| Preset | Names |
-|---|---|
-| NATO phonetic | alpha, bravo, charlie, delta, echo, foxtrot, golf, … |
-| Greek letters | alpha, beta, gamma, delta, epsilon, zeta, eta, … |
-| Toy Story | woody, buzz, jessie, rex, hamm, slinky, bullseye, … |
-
-Workspaces are laid out machine by machine: the first N names go to the
-hub, the next N to the first remote, and so on.
-
-- **Orchestrator runner** — the agent CLI that runs in window 1 and
-  talks to you. Usually the same as the workspace runner, but you can mix.
-
-</Step>
-</Steps>
-
-The wizard writes the YAML, creates the per-workspace directories under
-`~/.shelbi/workspaces/<name>/`, and launches the TUI. Project resolution
-is by reverse-lookup against the registered YAMLs. No marker file is
-dropped in your repo.
-
-The dashboard opens on an empty board: your workspaces idle in the
-sidebar, nothing dispatched yet.
-
-<AppMockup preset="starter" />
-
-## The project YAML
-
-The wizard's output looks like this:
-
-```yaml
-# ~/.shelbi/projects/myapp.yaml
-name: myapp
-repo: /Users/you/Workspaces/myapp
-default_branch: main
-github_url: git@github.com:you/myapp.git
-machines:
-  - name: hub
-    kind: local
-    work_dir: /Users/you/Workspaces/myapp
-  - name: devbox
-    kind: ssh
-    host: devbox.local
-    work_dir: /home/you/work/myapp
-orchestrator:
-  runner: claude
-agent_runners:
-  claude: { command: claude, flags: [] }
-  codex:  { command: codex,  flags: [] }
-workspaces:
-  - { name: alpha,   machine: hub,    runner: claude }
-  - { name: bravo,   machine: hub,    runner: claude }
-  - { name: charlie, machine: hub,    runner: claude }
-  - { name: delta,   machine: hub,    runner: claude }
-  - { name: echo,    machine: devbox, runner: claude }
-  - { name: foxtrot, machine: devbox, runner: claude }
-  - { name: golf,    machine: devbox, runner: claude }
-  - { name: hotel,   machine: devbox, runner: claude }
-```
-
-Field by field:
-
-- **`name`** — the project slug.
-- **`repo`** — absolute path to the local checkout. Used as the source
-  for worktree creation.
-- **`default_branch`** — what new task branches fork from, and what
-  `shelbi merge` lands them on.
-- **`github_url`** — optional, informational. The merge `--pr` flow
-  still resolves the remote via local git config.
-- **`machines[]`** — every host the project can run on.
-  - `name` — referenced by `workspaces[].machine`.
-  - `kind` — `local` for the hub, `ssh` for a remote.
-  - `work_dir` — where worktrees live on that machine.
-  - `host` — SSH hostname (required when `kind: ssh`).
-- **`orchestrator.runner`** — which agent runner powers the
-  orchestrator window. This is independent from the workspace runners.
-- **`agent_runners`** — the runner registry. Each entry is a
-  `command` plus optional `flags` appended to every invocation. Add
-  custom runners here (e.g. `aider`) to make them available to workspaces.
-- **`workspaces[]`** — the fixed workspace pool. Each workspace is a name,
-  the machine it lives on, and the runner it uses. Order matters: the
-  orchestrator picks free workspaces in declaration order when
-  dispatching. Change these `runner` values, or run
-  `shelbi workspace set-runner <runner> --all`, to switch existing worker
-  slots after setup.
-
-### Optional keys
-
-A few keys aren't written by the wizard but you can add by hand. The most
-useful:
-
-- **`heartbeat`** — how often the hub poller appends a `project=<name>
-  heartbeat` line to [`~/.shelbi/events.log`](/docs/concepts/events-log)
-  when the board is otherwise quiet. The orchestrator follows the log
-  with `shelbi events tail --follow`; the heartbeat is its guaranteed
-  recurring wake-up when nothing else has fired.
-
-  The cadence is **adaptive**: it holds at the standard `interval`
-  (default `3m`) while there's supervisable work in flight, then backs
-  off exponentially once the board goes quiescent, doubling each idle
-  tick up to `max` (default `60m`), and snaps back to `interval` on the
-  next real event. See the
-  [`heartbeat` field reference](/docs/configuration/project#heartbeat).
-
-  Accepts a bare duration string with an explicit unit suffix like `45s`,
-  `3m`, or `1h` (this sets `interval` and keeps the default `max`), a map
-  that sets both bounds, or the literal `"off"` (quote it; YAML otherwise
-  reads bare `off` as the boolean `false`). Bare integers like
-  `heartbeat: 180` are rejected: there's no implicit unit, on purpose.
-
-  ```yaml
-  heartbeat: 3m                     # standard interval, default 60m cap
-  heartbeat: 90s                    # tighter cadence
-  heartbeat: { interval: 3m, max: 30m }  # both bounds explicit
-  heartbeat: "off"                  # disable
-  ```
-
-  <Callout type="warning" title="Quote the off value">
-
-  Write `heartbeat: "off"` with the quotes. Bare `heartbeat: off` is read
-  by YAML as the boolean `false`, not the string `off`, a silent way to
-  get behavior you didn't ask for.
-
-  </Callout>
-
-  Emission also resets against everything else in the log: if a real
-  line landed since the last heartbeat (a workspace transition, a task
-  move), that event already woke the orchestrator, so the next tick
-  skips its emission and resets the cadence to the standard `interval`
-  rather than padding an already-active feed.
-
-  Heartbeats are intentionally absent from the TUI activity feed.
-  They'd produce one "nothing happened" row every few minutes. Use
-  `shelbi events tail` if you want to see them.
-
-### Naming workspaces by hand
-
-The wizard's presets cover most cases, but the names are just strings.
-Nothing about `alpha` or `woody` is special. If you'd rather use roles,
-project codes, or your team's nicknames, edit `workspaces[]` directly:
-
-```yaml
-workspaces:
-  - { name: frontend,  machine: hub,    runner: claude }
-  - { name: backend,   machine: hub,    runner: claude }
-  - { name: refactor,  machine: devbox, runner: codex  }
-```
-
-Each workspace name has to be a unique kebab/snake-case identifier across
-the project.
-
-<Callout type="note" title="Renaming leaves the old worktree behind">
-
-Renaming a workspace means the next dispatch creates a *new* worktree
-directory under `~/.shelbi/workspaces/<name>/`. The old one isn't deleted
-automatically. Remove the stale directory by hand if you want the disk back.
+Choose one and setup continues. This is the only extra question on an otherwise
+detected Git repository.
 
 </Callout>
 
-### Hub vs SSH machines
+## 2. Confirm the setup card
 
-Two `kind`s, two stories:
+After preflight, Shelbi summarizes everything it will create:
 
-- **`local`** — work runs in your hub's tmux session, in panes you can
-  jump straight to with `Enter` on the sidebar row. Worktrees are
-  created in the hub's `work_dir`.
-- **`ssh`** — Shelbi opens an ssh proxy window into a tmux session on
-  the remote. Tasks check out branches into the remote's `work_dir`
-  and the workspace runs there. You can still watch the pane live from
-  the hub; you just have one extra tmux session between you and it.
+```text
+  ┌─ myapp ────────────────────────────────────────┐
+  │                                                          │
+  │  repo        ~/code/myapp (main)                         │
+  │  github      github.com:you/myapp.git                    │
+  │  agent       codex                                       │
+  │  workspaces  alpha bravo charlie delta + review (hub)    │
+  │  workflows   task (branch → PR → review) · subtask       │
+  │  agents      orchestrator · developer · review           │
+  │              (+ qa, security, adversarial, opt-in)       │
+  │                                                          │
+  │  Everything above is editable later: Ctrl+Space → "Edit" │
+  └──────────────────────────────────────────────────────────┘
 
-You can declare any mix. A common setup is a few local workspaces on the
-hub for fast iteration plus a beefier remote for slow or
-memory-hungry tasks.
-
-## Reload after editing
-
-Edit the YAML by hand any time: add a machine, rename a workspace, swap
-runners. Then refresh the live dashboard:
-
-```bash
-shelbi reload
+  Enter launch    c customize    q quit
 ```
 
-This respawns the sidebar, Tasks, and Review panes against the new
-config without restarting the orchestrator or losing your chat history.
+- Press **Enter** to create the project and open the dashboard.
+- Press **`c`** to customize the detected values before creating anything.
+- Press **`q`**, **Esc**, or **Ctrl+C** to quit without writing project state.
+
+The displayed plan includes the local `hub`, development workspaces, a separate
+review workspace, the shipped `task` and `subtask` workflows, and the default
+agent roles. Both built-in runner declarations remain available in settings,
+even though the detected runner is selected for the generated workspaces.
+
+### Customize instead
+
+Pressing `c` opens the detailed path. Each detected value is prefilled, so
+press Enter to keep it or edit it:
+
+```text
+Customize setup. Press Enter to keep each detected value.
+
+? Project name:
+? Path to the repo:
+? Default branch:
+? GitHub repo URL (optional):
+? Agent runner (used by every workspace):
+? Workspace count per machine:
+? Workspace naming style:
+? Orchestrator runner:
+```
+
+This is where you can choose a different project name or root, change the
+branch or remote, size and name the workspace pool, or use a different runner
+for the orchestrator.
+
+## 3. Land on the dashboard
+
+After Enter, Shelbi prints `✓ Project <name> created.` and launches the TUI.
+The new board contains one Backlog card named **Welcome to Shelbi** and the
+sidebar briefly shows:
+
+```text
+Ctrl+P palette · type E to edit settings
+```
+
+The Welcome card is the first hands-on tour. Promote it from Backlog to Todo
+and watch Shelbi dispatch it to an available workspace in the sidebar. Open the
+command palette with `Ctrl+P`; type `E` to find project and agent settings.
+The card is only a guide and is safe to delete.
+
+To change settings later, use that `Ctrl+P`, then `E` path. You can also edit
+the generated project files directly and run `shelbi reload`. See
+[Project configuration](/docs/configuration/project) for the full schema and
+[Config modes](/docs/concepts/config-modes) if you want to share config through
+the repository.
+
+## Edge cases before the card
+
+### The directory is not a Git repository
+
+Shelbi asks before initializing Git:
+
+```text
+? <path> is not a Git repo. Initialize one here with git init -b main? (Y/n)
+```
+
+Accept to continue. Decline and Shelbi writes nothing, then prints:
+
+```text
+No files were written. Run git init -b main and try Shelbi again.
+```
+
+### A prerequisite is missing
+
+Failed checks are shown with `✗`, and setup stops with a concrete next step.
+For example:
+
+```text
+  ✗ tmux                not found on PATH
+
+tmux was not found on PATH. Run brew install tmux, then start Shelbi again.
+```
+
+If no supported runner is found, Shelbi points to Claude Code and Codex install
+instructions and asks you to authenticate one before starting Shelbi again.
+No partial project is left behind.
+
+## Add another project
+
+Run `shelbi project add` from another repository. It uses the same preflight,
+card, Customize path, and dashboard launch as first-run setup.
 
 ## Next
 
-You have a project on disk and a workspace pool waiting on work. Time to
-[run your first task](/docs/guides/getting-started/first-task).
-
-Want teammates to clone this project's workflows, agent prompts, and
-runner settings? See [Config modes](/docs/concepts/config-modes). The
-`shelbi project migrate-to-in-repo` command splits the shared half of
-this file into `<repo>/.shelbi/project.yaml` (committed) and moves
-`workflows/`, `agents/`, and the workspace-settings template into the
-repo alongside it.
+Your project is configured and the Welcome card is ready. Continue with
+[Run your first task](/docs/guides/getting-started/first-task).

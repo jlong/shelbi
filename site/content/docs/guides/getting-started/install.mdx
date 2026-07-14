@@ -4,22 +4,27 @@ order: 11
 summary: Install Shelbi with Homebrew on macOS, APT on Ubuntu, or from source for development.
 ---
 
-<CopyPromptBanner prompt="Install Shelbi on my machine. On macOS, use Homebrew: `brew tap jlong/shelbi && brew trust jlong/shelbi && brew install shelbi`. On Ubuntu amd64, add the Shelbi APT keyring from https://apt.shelbi.dev/shelbi-archive-keyring.gpg, add the `https://apt.shelbi.dev stable main` source list with signed-by=/etc/apt/keyrings/shelbi-archive-keyring.gpg, then run `sudo apt update && sudo apt install shelbi`. After install, verify with `shelbi --version` and make sure I have at least one authenticated agent CLI such as claude or codex." />
+<CopyPromptBanner prompt="Install and start Shelbi on my machine. On macOS, run `brew install jlong/shelbi/shelbi && shelbi`. On Ubuntu amd64, add the Shelbi APT keyring from https://apt.shelbi.dev/shelbi-archive-keyring.gpg, add the `https://apt.shelbi.dev stable main` source list with signed-by=/etc/apt/keyrings/shelbi-archive-keyring.gpg, then run `sudo apt update && sudo apt install shelbi`, followed by `shelbi`. Make sure tmux 3.2+ and one authenticated agent CLI, claude or codex, are available." />
 
-Shelbi publishes prebuilt releases for macOS and Ubuntu. Pick the package
-manager for the machine where you run the hub:
+On macOS, install Shelbi and start its first-run setup in one command:
+
+```bash
+brew install jlong/shelbi/shelbi && shelbi
+```
+
+Shelbi checks your prerequisites and current Git checkout before it writes
+anything. See [Set up your first project](/docs/guides/getting-started/first-project)
+for the one-confirmation flow.
+
+Shelbi also publishes a prebuilt Ubuntu package. The full package-manager
+commands are:
 
 <CodeTabs group="install-os">
   <CodeTab label="macOS">
 
   ```bash
-  brew tap jlong/shelbi
-  brew trust jlong/shelbi
-  brew install shelbi
+  brew install jlong/shelbi/shelbi
   ```
-
-  `brew trust` authorizes the tap's formula; recent Homebrew requires it for
-  taps outside homebrew-core.
 
   </CodeTab>
   <CodeTab label="Ubuntu">
@@ -102,13 +107,14 @@ Install `tmux` with your package manager:
 Remote workspaces need the same `tmux` and agent CLI on the machine they
 run on, plus an `ssh` host you can reach without a password prompt.
 
-## Verify
+## Verify or start later
 
 ```bash
-shelbi --version
+shelbi
 ```
 
-You should see the installed version.
+With no project configured, this starts the guided setup. To check only the
+installed version, run `shelbi --version`.
 
 ## Verify release artifacts manually
 

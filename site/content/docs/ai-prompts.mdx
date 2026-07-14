@@ -25,7 +25,7 @@ rather than guessing.
 <CopyPromptBanner
   title="Set up my first Shelbi project"
   description="Install Shelbi and configure this repository, with the docs as the source of truth."
-  prompt={`I want to set up Shelbi on this repository. Use the official docs: the index is at https://shelbi.dev/llms.txt, and any page is available as clean markdown by appending .md to its URL (for example https://shelbi.dev/docs/guides/getting-started/install.md). Read the Getting Started section, then walk me through it step by step — installing the binary, running the setup wizard, declaring my workspaces, and writing the project YAML. Ask me whatever you need about my machine and git host before you generate any config.`}
+  prompt={`I want to set up Shelbi on this repository. Use the official docs: the index is at https://shelbi.dev/llms.txt, and any page is available as clean markdown by appending .md to its URL (for example https://shelbi.dev/docs/guides/getting-started/install.md). Read the Getting Started section, install Shelbi, run the detected preflight, and help me review its one-question setup card. Use the Customize path only if I want to change a detected value. Do not hand-write config that Shelbi can generate.`}
 />
 
 <CopyPromptBanner

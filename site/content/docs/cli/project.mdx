@@ -1,7 +1,7 @@
 ---
 title: shelbi project
 order: 12
-summary: Manage projects — add a new one interactively, or migrate an existing global-mode project into committed in-repo mode.
+summary: "Manage projects: add a new one with the detected setup card, or migrate an existing global-mode project into committed in-repo mode."
 ---
 
 ```text
@@ -21,7 +21,7 @@ project whose `work_dir` contains the current directory) flags.
 
 | Command | Description |
 | --- | --- |
-| `add` | Set up a new project interactively — walks the same prompt sequence as initial onboarding (project name, machines, workspaces, runners) and writes `~/.shelbi/projects/<name>.yaml`. |
+| `add` | Run the same preflight and one-confirmation setup as first-run Shelbi, then launch the new project's dashboard. |
 | `migrate-to-in-repo` | Migrate an existing global-mode project into in-repo mode. |
 
 ## add
@@ -30,10 +30,10 @@ project whose `work_dir` contains the current directory) flags.
 shelbi project add [OPTIONS]
 ```
 
-Set up a new project interactively. It walks through the same prompts as initial
-onboarding (project name, machines, workspaces, runners) and writes
-`~/.shelbi/projects/<name>.yaml`. Unlike first-run onboarding, it does **not**
-launch the TUI on completion.
+Set up a new project interactively. Shelbi detects the current Git repository,
+runner, tmux, and workspace recommendation, then shows the same setup card as
+first-run onboarding. Press Enter to create the project and launch its TUI, or
+press `c` to customize the prefilled values first.
 
 ## migrate-to-in-repo
 
@@ -96,4 +96,4 @@ shelbi project migrate-to-in-repo --yes
   full on-disk layout, and the `.gitignore` list `migrate-to-in-repo` prints.
 - [`shelbi init`](/docs/cli/init) — first-time scaffolding, including the
   `--pick-up` flow for cloning a teammate's in-repo config.
-- [`shelbi wizard`](/docs/cli/wizard) — the interactive onboarding walkthrough.
+- [`shelbi wizard`](/docs/cli/wizard): the detected one-confirmation setup.
