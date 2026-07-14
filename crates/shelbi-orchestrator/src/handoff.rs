@@ -8,11 +8,11 @@
 //! [`crate::workspace::deploy_agent_context`]) and deletes it after
 //! reading — handoff is one-shot, not persistent state.
 //!
-//! Mechanism: we type a request into the orchestrator pane's tmux
-//! `send-keys` input (the pane is running claude) and poll the
-//! filesystem for the handoff file to appear. A 30s timeout caps the
-//! wait — a missing handoff degrades to a cold start on the next
-//! orchestrator, not a stuck reload/quit.
+//! Mechanism: for Claude, custom runners, and a one-time migration from a
+//! standalone Codex pane, we type a request into the orchestrator pane and
+//! poll the filesystem for the handoff file. Once Codex has a persisted
+//! native thread, that thread is the handoff and this module never touches
+//! its composer. A 30s timeout caps legacy handoff waits.
 
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
@@ -35,6 +35,9 @@ const POLL_INTERVAL: Duration = Duration::from_millis(250);
 /// Outcome of [`request_orchestrator_handoff`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum HandoffOutcome {
+    /// Codex continuity is owned by its persisted app-server thread. Shelbi
+    /// must not paste a handoff request into the visible remote-TUI composer.
+    NativeThread,
     /// Orchestrator wrote the file within the timeout. Caller should
     /// proceed; the next launch will splice and delete it.
     Written {
@@ -59,6 +62,11 @@ pub enum HandoffOutcome {
 /// `agents/orchestrator/handoff.md`, then poll for the file to appear
 /// up to [`HANDOFF_TIMEOUT`].
 ///
+/// A project-matching persisted native Codex thread returns
+/// [`HandoffOutcome::NativeThread`] before any tmux lookup or write. A Codex
+/// pane without that state is an old standalone pane and gets the existing
+/// one-time best-effort handoff so an install/reload can migrate its context.
+///
 /// Idempotent and best-effort: any stale handoff file from a previous
 /// run is removed before the request goes out so we don't false-
 /// positive on a leftover. The session-env lookup is the same
@@ -71,6 +79,19 @@ pub enum HandoffOutcome {
 /// outcome variant comes back — every variant of [`HandoffOutcome`] is
 /// "okay to proceed" semantics, distinguished only for logging.
 pub fn request_orchestrator_handoff(project_name: &str) -> Result<HandoffOutcome> {
+    // Ownership describes the pane that is live now, not the runner that the
+    // project is configured to launch next. A Codex -> Claude/custom reload
+    // must not paste a migration request into the still-live native Codex TUI.
+    let persisted_native_thread = crate::wake::has_persisted_codex_thread(project_name)?;
+    if uses_native_thread_continuity(persisted_native_thread) {
+        return Ok(HandoffOutcome::NativeThread);
+    }
+
+    let project = shelbi_state::load_project(project_name)?;
+    let _runner = project
+        .runner(&project.orchestrator.runner)
+        .ok_or_else(|| Error::UnknownRunner(project.orchestrator.runner.clone()))?;
+
     let session = format!("shelbi-{project_name}");
     if !local_session_exists(&session)? {
         return Ok(HandoffOutcome::PaneNotAlive);
@@ -103,6 +124,10 @@ pub fn request_orchestrator_handoff(project_name: &str) -> Result<HandoffOutcome
         std::thread::sleep(POLL_INTERVAL);
     }
     Ok(HandoffOutcome::Timeout)
+}
+
+pub(crate) fn uses_native_thread_continuity(persisted_native_thread: bool) -> bool {
+    persisted_native_thread
 }
 
 /// Text we type into the orchestrator's input. Phrased so the agent
@@ -271,5 +296,15 @@ mod tests {
         assert_eq!(written, written.clone());
         assert_ne!(written, HandoffOutcome::Timeout);
         assert_ne!(HandoffOutcome::PaneNotAlive, HandoffOutcome::Timeout);
+        assert_ne!(HandoffOutcome::NativeThread, HandoffOutcome::Timeout);
+    }
+
+    #[test]
+    fn live_native_thread_skips_composer_handoff_across_runner_changes() {
+        assert!(uses_native_thread_continuity(true));
+        assert!(
+            !uses_native_thread_continuity(false),
+            "a legacy Codex pane needs one migration handoff"
+        );
     }
 }

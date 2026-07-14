@@ -202,6 +202,9 @@ fn print_pane_if_attempted(name: &str, status: &PaneReloadStatus) {
 
 fn print_handoff(outcome: &HandoffOutcome) {
     match outcome {
+        HandoffOutcome::NativeThread => {
+            println!("  · handoff   skipped (Codex native thread retained)");
+        }
         HandoffOutcome::Written { path } => {
             println!("  ✓ handoff   captured ({})", path.display());
         }

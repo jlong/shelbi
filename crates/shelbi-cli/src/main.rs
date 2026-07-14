@@ -262,6 +262,11 @@ enum Cmd {
     #[command(hide = true)]
     #[command(name = "__activity")]
     Activity { project: String },
+    /// (internal) Own the Codex app-server, exact orchestrator thread, and
+    /// remote TUI for one project. Not for direct use.
+    #[command(hide = true)]
+    #[command(name = "__codex-orchestrator")]
+    CodexOrchestrator { project: String },
     /// Toggle Zen Mode or run its primitives. `shelbi zen on/off/pause` flip
     /// the trust boundary that lets the orchestrator auto-merge and
     /// auto-promote. `probe` reports facts about a finished branch (checks,
@@ -368,6 +373,10 @@ fn main() -> Result<()> {
         Some(Cmd::Sidebar { project }) => shelbi_tui::run_sidebar(&project).context("sidebar"),
         Some(Cmd::Tasks { project }) => shelbi_tui::run_tasks(&project).context("tasks"),
         Some(Cmd::Activity { project }) => shelbi_tui::run_activity(&project).context("activity"),
+        Some(Cmd::CodexOrchestrator { project }) => {
+            shelbi_orchestrator::wake::run_codex_bridge(&project)
+                .map_err(|e| anyhow::anyhow!(e.to_string()))
+        }
         Some(Cmd::Popup) => commands::popup::run(),
         Some(Cmd::Palette { project }) => commands::palette::run(project),
         Some(Cmd::ZenOrchStart { project }) => commands::zen_lifecycle::orch_start(&project),
@@ -488,9 +497,9 @@ fn is_inquire_cancel(e: &anyhow::Error) -> bool {
 
 /// Initialize the tracing subscriber.
 ///
-/// For internal ratatui subcommands (`__sidebar`, `__tasks`,
-/// `__activity`) we route output to `~/.shelbi/logs/tui.log` instead of
-/// stderr. The TUI process
+/// For internal TUI-owning subcommands (`__sidebar`, `__tasks`,
+/// `__activity`, `__codex-orchestrator`) we route output to
+/// `~/.shelbi/logs/tui.log` instead of stderr. The process
 /// shares its TTY with ratatui's draw cycle, and any stray stderr write
 /// corrupts the cursor position — leaving raw `tracing` lines bleeding across
 /// the sidebar until the next full repaint (e.g. a resize). For all other
@@ -500,7 +509,10 @@ fn init_tracing(cmd: Option<&Cmd>) {
     let filter = EnvFilter::try_from_env("SHELBI_LOG").unwrap_or_else(|_| EnvFilter::new("info"));
     let is_tui = matches!(
         cmd,
-        Some(Cmd::Sidebar { .. }) | Some(Cmd::Tasks { .. }) | Some(Cmd::Activity { .. })
+        Some(Cmd::Sidebar { .. })
+            | Some(Cmd::Tasks { .. })
+            | Some(Cmd::Activity { .. })
+            | Some(Cmd::CodexOrchestrator { .. })
     );
     if is_tui {
         if let Some(file) = open_tui_log_file() {
@@ -613,6 +625,23 @@ mod cli_tests {
             }) if name == "alpha" && as_pane && resume => {}
             other => panic!("expected Open {{ alpha, as_pane, resume }}, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn codex_orchestrator_bridge_command_is_hidden_but_parseable() {
+        let cli = Cli::parse_from(["shelbi", "__codex-orchestrator", "myapp"]);
+        match cli.cmd {
+            Some(Cmd::CodexOrchestrator { project }) if project == "myapp" => {}
+            other => panic!("expected CodexOrchestrator {{ myapp }}, got {other:?}"),
+        }
+
+        let help = Cli::try_parse_from(["shelbi", "--help"])
+            .expect_err("--help exits through clap")
+            .to_string();
+        assert!(
+            !help.contains("__codex-orchestrator"),
+            "internal bridge command leaked into help: {help}"
+        );
     }
 
     /// `project_yaml_exists` is the predicate `default_entry` uses to

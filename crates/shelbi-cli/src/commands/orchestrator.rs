@@ -4,13 +4,13 @@
 //! cursors. They intentionally do not dispatch work or mutate board state.
 
 use std::collections::{BTreeMap, HashSet};
-use std::fs;
-use std::io::{Read, Seek, SeekFrom};
-use std::path::PathBuf;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use anyhow::{anyhow, Context, Result};
+#[cfg(test)]
+use std::path::PathBuf;
+
+use anyhow::{anyhow, Result};
 use clap::Subcommand;
 use serde::Serialize;
 
@@ -84,23 +84,10 @@ fn wait_next(project: &str, mut cursor: u64, timeout: Duration) -> Result<DrainR
 }
 
 fn drain_once(project: &str, cursor: u64) -> Result<DrainResponse> {
-    let path = shelbi_state::events_log_path().map_err(|e| anyhow!(e))?;
     let scope = ProjectScope::load(project)?;
-
-    let mut file = match fs::File::open(&path) {
-        Ok(f) => f,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            return Ok(DrainResponse::empty(project, 0));
-        }
-        Err(e) => return Err(anyhow::Error::new(e).context("opening events.log")),
-    };
-
-    let len = file.metadata().context("stat events.log")?.len();
-    let start = if cursor > len { 0 } else { cursor };
-    file.seek(SeekFrom::Start(start))
-        .context("seek events.log")?;
-    let mut buf = Vec::with_capacity((len - start) as usize);
-    file.read_to_end(&mut buf).context("read events.log")?;
+    let read = shelbi_state::read_event_log_from(cursor).map_err(|e| anyhow!(e))?;
+    let start = read.start;
+    let buf = read.bytes;
 
     let complete_len = match buf.iter().rposition(|b| *b == b'\n') {
         Some(idx) => idx + 1,
@@ -154,34 +141,17 @@ fn drain_persisted(project: &str, cursor_override: Option<u64>) -> Result<DrainR
 /// under `.claude/` — Shelbi state is runner-agnostic (the Codex runner
 /// drains the same stream) and `.claude/` is deployed agent config, not
 /// durable state.
+#[cfg(test)]
 fn cursor_path(project: &str) -> Result<PathBuf> {
-    Ok(shelbi_state::project_dir(project)
-        .map_err(|e| anyhow!(e))?
-        .join("event-cursor"))
+    shelbi_state::event_cursor_path(project).map_err(|e| anyhow!(e))
 }
 
 fn read_persisted_cursor(project: &str) -> Result<u64> {
-    let path = cursor_path(project)?;
-    match fs::read_to_string(&path) {
-        // A missing or malformed cursor file resumes from the log start,
-        // matching the old shell `cat ... || echo 0` behavior.
-        Ok(text) => Ok(text.trim().parse().unwrap_or(0)),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(0),
-        Err(e) => Err(anyhow::Error::new(e).context("reading event cursor")),
-    }
+    shelbi_state::read_or_initialize_event_cursor(project).map_err(|e| anyhow!(e))
 }
 
 fn write_persisted_cursor(project: &str, cursor: u64) -> Result<()> {
-    let path = cursor_path(project)?;
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).context("creating project dir for event cursor")?;
-    }
-    // Write-then-rename so a torn write never leaves a partial cursor a
-    // later drain would misparse to 0 and replay the whole log.
-    let tmp = path.with_extension("tmp");
-    fs::write(&tmp, cursor.to_string()).context("writing event cursor")?;
-    fs::rename(&tmp, &path).context("persisting event cursor")?;
-    Ok(())
+    shelbi_state::write_event_cursor(project, cursor).map_err(|e| anyhow!(e))
 }
 
 fn parse_cursor(cursor: &str) -> Result<u64> {
@@ -218,17 +188,6 @@ struct DrainResponse {
     #[serde(skip)]
     cursor_offset: u64,
     events: Vec<NormalizedEvent>,
-}
-
-impl DrainResponse {
-    fn empty(project: &str, cursor: u64) -> Self {
-        Self {
-            project: project.to_string(),
-            cursor: cursor.to_string(),
-            cursor_offset: cursor,
-            events: Vec::new(),
-        }
-    }
 }
 
 #[derive(Debug, Serialize)]
@@ -398,6 +357,7 @@ impl ParsedLine {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
     use crate::commands::test_support::ENV_LOCK;
     use chrono::Utc;
     use shelbi_core::{Column, Task};
@@ -592,14 +552,86 @@ mod tests {
     }
 
     #[test]
-    fn stale_cursor_after_rotation_restarts_at_current_log_start() {
+    fn future_cursor_fails_closed_instead_of_replaying_another_generation() {
         let (_guard, _tmp) = setup_home();
         append_workspace_event("demo", "alpha", None, WorkspaceState::Working).unwrap();
 
-        let response = drain_once("demo", 999_999).unwrap();
+        let error = drain_once("demo", 999_999).unwrap_err();
+        assert!(error.to_string().contains("ahead of event-log head"));
+    }
 
-        assert_eq!(response.events.len(), 1);
-        assert_eq!(response.events[0].workspace.as_deref(), Some("alpha"));
+    #[test]
+    fn legacy_future_cursor_is_normalized_only_before_index_establishment() {
+        let (_guard, _tmp) = setup_home();
+        let path = shelbi_state::events_log_path().unwrap();
+        let line = "t project=demo workspace=alpha none -> working\n";
+        fs::write(&path, line).unwrap();
+        shelbi_state::write_event_cursor("demo", 999_999).unwrap();
+        let index_path = path.with_extension("log.index.json");
+        assert!(!index_path.exists());
+
+        let migrated = drain_persisted("demo", None).unwrap();
+        assert_eq!(migrated.events.len(), 1);
+        assert_eq!(migrated.events[0].workspace.as_deref(), Some("alpha"));
+        assert_eq!(migrated.cursor_offset, line.len() as u64);
+        assert!(index_path.exists());
+
+        // Once the logical index exists, the same impossible cursor is no
+        // longer legacy rotation evidence and must fail closed.
+        shelbi_state::write_event_cursor("demo", 999_999).unwrap();
+        let error = drain_persisted("demo", None).unwrap_err();
+        assert!(error.to_string().contains("ahead of event-log head"));
+        assert_eq!(
+            fs::read_to_string(cursor_path("demo").unwrap())
+                .unwrap()
+                .trim(),
+            "999999"
+        );
+    }
+
+    #[test]
+    fn drain_crosses_rotation_without_skipping_regrown_current_prefix() {
+        let (_guard, _tmp) = setup_home();
+        let path = shelbi_state::events_log_path().unwrap();
+        let first = "t project=demo workspace=first none -> working\n";
+        let second = "t project=demo workspace=second none -> working\n";
+        let foreign = "t project=other workspace=filler none -> working\n";
+        let mut old = String::with_capacity(8 * 1024 * 1024 + foreign.len());
+        old.push_str(first);
+        old.push_str(second);
+        while old.len() < 8 * 1024 * 1024 {
+            old.push_str(foreign);
+        }
+        fs::write(&path, old).unwrap();
+        let cursor = first.len() as u64;
+
+        // This append rotates the over-size old file and creates a current
+        // generation. Make current longer than the old physical cursor so the
+        // regression cannot be hidden by the historical `cursor > len` reset.
+        for index in 0..4 {
+            append_workspace_event(
+                "demo",
+                &format!("current-{index}"),
+                None,
+                WorkspaceState::Working,
+            )
+            .unwrap();
+        }
+        assert!(fs::metadata(&path).unwrap().len() > cursor);
+
+        let response = drain_once("demo", cursor).unwrap();
+        assert_eq!(response.events[0].workspace.as_deref(), Some("second"));
+        for index in 0..4 {
+            let expected = format!("current-{index}");
+            assert!(response
+                .events
+                .iter()
+                .any(|event| event.workspace.as_deref() == Some(expected.as_str())));
+        }
+        assert!(response
+            .events
+            .iter()
+            .all(|event| event.workspace.as_deref() != Some("filler")));
     }
 
     #[test]

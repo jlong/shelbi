@@ -19,6 +19,7 @@ use shelbi_state::keymap::{load_keymaps, GlobalAction};
 
 pub mod actions;
 pub mod branch;
+pub(crate) mod codex_rpc;
 pub mod dispatch;
 mod git;
 pub mod githook;
@@ -461,7 +462,7 @@ pub fn ensure_dashboard(project_name: &str) -> Result<BootstrapStatus> {
 
     let shelbi_bin = current_exe_string()?;
     let sidebar_cmd_str = sidebar_cmd(&shelbi_bin, project_name);
-    let launch = launch_with_bootstrap(&runner_spec, project_name, &workdir);
+    let launch = orchestrator_launch_command(&shelbi_bin, &runner_spec, project_name, &workdir);
     let orch_cmd = orchestrator_pane_cmd(
         &shelbi_bin,
         project_name,
@@ -537,6 +538,13 @@ pub fn ensure_dashboard(project_name: &str) -> Result<BootstrapStatus> {
     }
 
     // 3. Split the dashboard window: orchestrator on the right.
+    // If configuration changed away from Codex while the project was shut
+    // down, this launch replaces the persisted native owner. Clear the
+    // marker before creating the non-Codex pane so later lifecycle handoffs
+    // use that runner's normal migration path.
+    if !shelbi_agent::is_codex_runner(&runner_spec.command) {
+        wake::mark_persisted_codex_thread_inactive(project_name, &workdir)?;
+    }
     //    Initial split is 50/50 — the sidebar-clamp hooks installed
     //    below set the final sizing as soon as a client attaches (or
     //    immediately, if we're being run from inside one).
@@ -1025,8 +1033,35 @@ const ORCH_BOOTSTRAP_PROMPT: &str = "Run the \"Bootstrap on session start\" sequ
     task/workspace/heartbeat/pane-death facts through the normal reaction rules, and \
     only then answer.";
 
-/// Wrap `launch_command(runner_spec)` with the orchestrator's
-/// auto-bootstrap context.
+/// Build the command owned by the orchestrator pane.
+///
+/// Codex is routed through Shelbi's native app-server bridge. The bridge owns
+/// the exact Codex thread and attaches the visible TUI to it, so board events
+/// never need to be pasted into the pane. Claude and custom runners retain
+/// their standalone launch behavior.
+fn orchestrator_launch_command(
+    shelbi_bin: &str,
+    spec: &shelbi_core::AgentRunnerSpec,
+    project_name: &str,
+    workdir: &std::path::Path,
+) -> String {
+    if is_codex_runner(spec) {
+        codex_bridge_cmd(shelbi_bin, project_name)
+    } else {
+        launch_with_bootstrap(spec, project_name, workdir)
+    }
+}
+
+fn codex_bridge_cmd(shelbi_bin: &str, project_name: &str) -> String {
+    format!(
+        "{bin} __codex-orchestrator {project}",
+        bin = shelbi_agent::shell_escape(shelbi_bin),
+        project = shelbi_agent::shell_escape(project_name),
+    )
+}
+
+/// Wrap a standalone runner command with the orchestrator's auto-bootstrap
+/// context.
 ///
 /// Claude receives the composed `agents/orchestrator/instructions.md`
 /// through `--append-system-prompt` and the bootstrap request as its
@@ -1050,13 +1085,27 @@ fn launch_with_bootstrap(
             prompt = shelbi_agent::shell_escape(ORCH_BOOTSTRAP_PROMPT),
         )
     } else if is_codex_runner(spec) {
-        format!(
-            "{launch} {prompt}",
-            prompt = codex_orchestrator_prompt_arg(project_name, workdir),
-        )
+        codex_standalone_launch(spec, project_name, workdir)
     } else {
         launch
     }
+}
+
+/// Conservative compatibility launch used by the native Codex bridge when
+/// the configured Codex binary does not support app-server/remote TUI mode.
+///
+/// This keeps the durable turn-boundary polling contract from the standalone
+/// integration, but it does not authorize any tmux wake injection.
+pub(crate) fn codex_standalone_launch(
+    spec: &shelbi_core::AgentRunnerSpec,
+    project_name: &str,
+    workdir: &std::path::Path,
+) -> String {
+    let launch = shelbi_agent::launch_command(spec);
+    format!(
+        "{launch} {prompt}",
+        prompt = codex_orchestrator_prompt_arg(project_name, workdir),
+    )
 }
 
 fn is_claude_runner(spec: &shelbi_core::AgentRunnerSpec) -> bool {
@@ -1508,7 +1557,7 @@ fn reload_orchestrator_pane(
         );
     }
 
-    let launch = launch_with_bootstrap(&runner_spec, project_name, &workdir);
+    let launch = orchestrator_launch_command(shelbi_bin, &runner_spec, project_name, &workdir);
     let cmd = orchestrator_pane_cmd(
         shelbi_bin,
         project_name,
@@ -1538,7 +1587,39 @@ fn reload_orchestrator_pane(
             };
         }
     };
-    respawn_pane(&target, &cmd)
+    let switching_from_native = if shelbi_agent::is_codex_runner(&runner_spec.command) {
+        false
+    } else {
+        match wake::has_persisted_codex_thread(project_name) {
+            Ok(active) => active,
+            Err(e) => {
+                return PaneReloadStatus::Failed {
+                    target,
+                    reason: format!("read Codex native ownership: {e}"),
+                };
+            }
+        }
+    };
+    if switching_from_native {
+        if let Err(e) = wake::mark_persisted_codex_thread_inactive(project_name, &workdir) {
+            return PaneReloadStatus::Failed {
+                target,
+                reason: format!("deactivate Codex native ownership: {e}"),
+            };
+        }
+    }
+
+    let status = respawn_pane(&target, &cmd);
+    if switching_from_native && matches!(status, PaneReloadStatus::Failed { .. }) {
+        if let Err(e) = wake::mark_persisted_codex_thread_active(project_name, &workdir) {
+            tracing::warn!(
+                project = project_name,
+                error = %e,
+                "failed to restore Codex native ownership after runner-change respawn failed",
+            );
+        }
+    }
+    status
 }
 
 fn mark_orchestrator_reload_expected(project_name: &str) -> Result<()> {
@@ -1944,6 +2025,32 @@ mod pane_cmd_tests {
         assert!(
             !out.contains("--append-system-prompt"),
             "Codex must not receive Claude-only flags: {out}"
+        );
+    }
+
+    #[test]
+    fn orchestrator_launch_routes_codex_through_native_bridge() {
+        let spec = shelbi_core::AgentRunnerSpec {
+            command: "codex".into(),
+            flags: vec!["--dangerously-bypass-approvals-and-sandbox".into()],
+            prompt_injection: None,
+            dialog_signatures: vec![],
+        };
+        let out = orchestrator_launch_command(
+            "/usr/local/bin/shelbi",
+            &spec,
+            "myapp",
+            std::path::Path::new("/tmp/myapp"),
+        );
+        assert_eq!(out, "/usr/local/bin/shelbi __codex-orchestrator myapp");
+    }
+
+    #[test]
+    fn codex_bridge_cmd_shell_escapes_binary_and_project() {
+        let out = codex_bridge_cmd("/Users/jane doe/bin/shelbi", "my project");
+        assert_eq!(
+            out,
+            "'/Users/jane doe/bin/shelbi' __codex-orchestrator 'my project'"
         );
     }
 
