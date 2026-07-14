@@ -284,34 +284,22 @@ fn pr_create_impl(
 ) -> Result<u64> {
     let (host, worktree) = locate_workspace_worktree(project, task)?;
     let wt = worktree.to_string_lossy().into_owned();
-    let workflow = shelbi_state::load_task_workflow(project_name, project, task)?;
-    let branch = branch::branch_name_for_task(project, Some(&workflow), task)?;
-    let resolved_base = resolve_probe_base(project, Some(&workflow), task)?;
-    if resolved_base != expected.base_branch {
-        return Err(Error::Other(format!(
-            "task `{}` now resolves base `{resolved_base}`, but its Zen probe froze `{}`; \
-             refusing to publish under changed workflow/dependency state (re-run \
-             `shelbi zen probe {}`)",
-            task.id, expected.base_branch, task.id
-        )));
-    }
-    let (origin_repository, push_target) =
-        lookup_origin_repository_with_push_target(&host, &wt)?;
-    expected.verify_repository(&origin_repository, "before publishing")?;
-    let current_base_sha = remote_branch_sha(
-        &host,
-        &wt,
-        &push_target,
-        &expected.base_branch,
-        "before publishing",
-    )?;
-    if current_base_sha != expected.base_sha {
-        return Err(Error::Other(format!(
-            "base `{}` moved after the Zen probe: expected {}, found {} before publishing; \
-             refusing to create or reuse a PR (re-run `shelbi zen probe {}`)",
-            expected.base_branch, expected.base_sha, current_base_sha, task.id
-        )));
-    }
+    // The probe already resolved workflow/dependency policy and froze the
+    // resulting base. Do not reload mutable workflow config here. The durable
+    // task branch recorded at dispatch and the probe identity are the only
+    // cross-phase authorities.
+    let branch = task
+        .branch
+        .as_deref()
+        .filter(|branch| !branch.trim().is_empty())
+        .ok_or_else(|| {
+            Error::Other(format!(
+                "task `{}` has no durable branch to publish; re-run dispatch and the Zen probe",
+                task.id
+            ))
+        })?;
+    shelbi_core::validate_branch(branch)
+        .map_err(|error| Error::Other(format!("cannot publish task branch `{branch}`: {error}")))?;
 
     // Handoff detaches the finished worktree and immediately frees its slot.
     // A later dispatch may therefore put this worktree's HEAD on an unrelated
@@ -328,6 +316,24 @@ fn pr_create_impl(
              (re-run `shelbi zen probe {}`)",
             expected.head_sha,
             task.id
+        )));
+    }
+
+    let (origin_repository, push_target) =
+        lookup_origin_repository_with_push_target(&host, &wt)?;
+    expected.verify_repository(&origin_repository, "before publishing")?;
+    let current_base_sha = remote_branch_sha(
+        &host,
+        &wt,
+        &push_target,
+        &expected.base_branch,
+        "before publishing",
+    )?;
+    if current_base_sha != expected.base_sha {
+        return Err(Error::Other(format!(
+            "base `{}` moved after the Zen probe: expected {}, found {} before publishing; \
+             refusing to create or reuse a PR (re-run `shelbi zen probe {}`)",
+            expected.base_branch, expected.base_sha, current_base_sha, task.id
         )));
     }
 
@@ -3657,10 +3663,11 @@ esac
         assert!(err.contains("rewritten or diverged"), "{err}");
         assert_eq!(remote_head(&origin), stale_remote_head);
         assert_eq!(task_branch_head(&worktree), reviewed_head);
-        assert!(
-            gh_calls(&log).is_empty(),
-            "a rejected push must not allow stale PR #379 into the workflow"
-        );
+        let calls = gh_calls(&log);
+        assert!(calls.contains("repo view"), "{calls}");
+        assert!(!calls.contains("pr list"), "{calls}");
+        assert!(!calls.contains("pr view"), "{calls}");
+        assert!(!calls.contains("pr create"), "{calls}");
     }
 
     #[test]
