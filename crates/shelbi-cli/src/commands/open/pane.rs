@@ -121,6 +121,7 @@ pub fn run(
         if !worktree.exists() || (dispatched && !worktree_valid(&worktree)) {
             if let Some(branch) = resolve_task_branch(project, task) {
                 if let Err(e) = orch_workspace::ensure_workspace_worktree(
+                    &project.name,
                     machine,
                     workspace,
                     &branch,

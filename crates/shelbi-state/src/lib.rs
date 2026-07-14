@@ -602,6 +602,27 @@ pub fn lock_workspace(project: &str, workspace: &str) -> Result<WorkspaceLock> {
     Ok(WorkspaceLock(acquire_file_lock(&path)?))
 }
 
+/// Public RAII handle for the per-project Git worktree/ref lock.
+///
+/// This lock coordinates named-branch checkout with ref rewrites across all
+/// of a project's workspace slots. It is intentionally project-wide: two
+/// machine aliases may identify the same repository, while briefly
+/// serializing distinct repositories is safe.
+#[must_use = "the Git worktree lock is released as soon as the guard is dropped"]
+pub struct GitWorktreeLock(#[allow(dead_code)] FileLockGuard);
+
+/// Block until the project's Git worktree/ref lock is held.
+///
+/// Callers that also need a [`WorkspaceLock`] must acquire that workspace
+/// lock first and this lock second. No code may acquire a workspace lock while
+/// holding this guard. Keeping that order prevents two dispatch/probe paths
+/// from deadlocking while still making a named checkout atomic with a Zen
+/// probe's worktree scan and compare-and-swap ref update.
+pub fn lock_git_worktrees(project: &str) -> Result<GitWorktreeLock> {
+    let path = project_dir(project)?.join("git-worktrees.lock");
+    Ok(GitWorktreeLock(acquire_file_lock(&path)?))
+}
+
 /// Public RAII handle for the per-project dashboard-bootstrap lock. Wraps a
 /// [`FileLockGuard`] so `shelbi-orchestrator` can serialize `ensure_dashboard`
 /// without reaching the internal lock primitive. Released when dropped.

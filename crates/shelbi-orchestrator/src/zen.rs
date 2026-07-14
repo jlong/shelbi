@@ -1735,9 +1735,10 @@ pub fn probe_in_workflow(
     policy: RebasePolicy,
 ) -> Result<ProbeReport> {
     let (machine, workspace) = resolve_workspace(project, task)?;
-    // Dispatch holds this same lock across sync_worktree/checkout/spawn. Keep
-    // it for the whole probe so a freed slot cannot begin another checkout
-    // between our named-ref snapshot and compare-and-swap update.
+    // Keep the assigned slot stable while the probe copies its ignored
+    // installed dependencies. This lock cannot coordinate a checkout in a
+    // different slot; finalizing the named ref uses the project-wide Git
+    // worktree/ref lock below for that purpose.
     let _workspace_lock = shelbi_state::lock_workspace(&project.name, &workspace.name)?;
     let host = machine.host();
     let repository_anchor = workspace_worktree(&machine, workspace);
@@ -1874,22 +1875,14 @@ fn probe_isolated_task_ref(
         )));
     }
 
-    if !rebase_conflict.conflicts && head_sha != initial_head {
-        advance_probed_task_ref(
-            host,
-            repository_anchor,
-            branch,
-            task_ref,
-            initial_head,
-            &head_sha,
-        )?;
-    }
-    verify_task_branch_head(
+    finalize_probed_task_ref(
+        &project.name,
         host,
         repository_anchor,
         branch,
+        task_ref,
+        initial_head,
         &head_sha,
-        "while its isolated Zen probe was finishing",
     )?;
 
     Ok(ProbeReport {
@@ -1988,7 +1981,8 @@ fn remove_probe_worktree(
     Ok(())
 }
 
-fn advance_probed_task_ref(
+fn finalize_probed_task_ref(
+    project_name: &str,
     host: &Host,
     repository_anchor: &std::path::Path,
     branch: &str,
@@ -1996,46 +1990,90 @@ fn advance_probed_task_ref(
     expected_head: &str,
     probed_head: &str,
 ) -> Result<()> {
-    let anchor = repository_anchor.to_string_lossy().into_owned();
-    let checked_out = task_ref_checkout_paths(host, repository_anchor, task_ref)?;
-    if !checked_out.is_empty() {
-        return Err(Error::Other(format!(
-            "task branch `{branch}` is still checked out in {}; refusing to advance it from \
-             an isolated Zen probe because that would disturb another worktree",
-            checked_out.join(", ")
-        )));
-    }
-
-    let out = shelbi_ssh::run(
+    finalize_probed_task_ref_after_scan(
+        project_name,
         host,
-        [
-            "git",
-            "-C",
-            &anchor,
-            "update-ref",
-            task_ref,
-            probed_head,
-            expected_head,
-        ],
+        repository_anchor,
+        branch,
+        task_ref,
+        expected_head,
+        probed_head,
+        || {},
     )
-    .map_err(Error::Io)?;
-    if !out.status.success() {
-        let current = probe_head_sha(host, repository_anchor, &format!("{task_ref}^{{commit}}"))
-            .unwrap_or_else(|_| "<missing>".to_string());
-        if current != expected_head {
+}
+
+#[allow(clippy::too_many_arguments)]
+fn finalize_probed_task_ref_after_scan<F: FnOnce()>(
+    project_name: &str,
+    host: &Host,
+    repository_anchor: &std::path::Path,
+    branch: &str,
+    task_ref: &str,
+    expected_head: &str,
+    probed_head: &str,
+    after_scan: F,
+) -> Result<()> {
+    // Lock order is workspace -> Git worktrees/refs: probe_in_workflow still
+    // holds the assigned workspace lock. Dispatch, resume, pane recovery, and
+    // legacy spawn all take this same inner lock before attaching a named ref.
+    // Keep it through final verification so scan + CAS + pin confirmation are
+    // one critical section.
+    let _git_worktree_lock = shelbi_state::lock_git_worktrees(project_name)?;
+    let anchor = repository_anchor.to_string_lossy().into_owned();
+    if expected_head != probed_head {
+        let checked_out = task_ref_checkout_paths(host, repository_anchor, task_ref)?;
+        if !checked_out.is_empty() {
             return Err(Error::Other(format!(
-                "task branch `{branch}` moved from {expected_head} to {current} while its \
-                 isolated Zen probe was running; refusing to replace the concurrent update \
-                 with probed commit {probed_head}"
+                "task branch `{branch}` is still checked out in {}; refusing to advance it from \
+                 an isolated Zen probe because that would disturb another worktree",
+                checked_out.join(", ")
             )));
         }
-        return Err(Error::Command {
-            cmd: format!("git -C {anchor} update-ref {task_ref} {probed_head} {expected_head}"),
-            status: out.status.to_string(),
-            stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
-        });
+
+        // Test hook for the exact reviewed race: a second named checkout is
+        // started after this empty scan and must remain blocked until the CAS
+        // and verification finish under the lock.
+        after_scan();
+
+        let out = shelbi_ssh::run(
+            host,
+            [
+                "git",
+                "-C",
+                &anchor,
+                "update-ref",
+                task_ref,
+                probed_head,
+                expected_head,
+            ],
+        )
+        .map_err(Error::Io)?;
+        if !out.status.success() {
+            let current =
+                probe_head_sha(host, repository_anchor, &format!("{task_ref}^{{commit}}"))
+                    .unwrap_or_else(|_| "<missing>".to_string());
+            if current != expected_head {
+                return Err(Error::Other(format!(
+                    "task branch `{branch}` moved from {expected_head} to {current} while its \
+                     isolated Zen probe was running; refusing to replace the concurrent update \
+                     with probed commit {probed_head}"
+                )));
+            }
+            return Err(Error::Command {
+                cmd: format!("git -C {anchor} update-ref {task_ref} {probed_head} {expected_head}"),
+                status: out.status.to_string(),
+                stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
+            });
+        }
     }
-    Ok(())
+
+    verify_task_branch_head(
+        host,
+        repository_anchor,
+        branch,
+        probed_head,
+        "while its isolated Zen probe was finishing",
+    )
 }
 
 fn task_ref_checkout_paths(
@@ -4289,7 +4327,128 @@ printf 'target:%s\\n' \"$CARGO_TARGET_DIR\"";
     }
 
     #[test]
+    fn checkout_cannot_attach_between_probe_scan_and_ref_advance() {
+        let _lock = crate::test_lock::acquire();
+        let _home = ProbeHomeGuard::install();
+        let (_base, _origin, wt) = setup_origin_and_worktree();
+
+        // The reviewed task ref is durable but no longer checked out after
+        // handoff. A separate branch models the isolated probe's rewritten
+        // result without moving the task ref yet.
+        run_git(&wt, &["checkout", "-q", "-b", "shelbi/task1"]);
+        std::fs::write(wt.join("reviewed.txt"), "reviewed task\n").unwrap();
+        run_git(&wt, &["add", "reviewed.txt"]);
+        run_git(&wt, &["commit", "-q", "-m", "reviewed task"]);
+        let expected = branch_sha(&wt, "shelbi/task1");
+        detach_for_handoff(&wt, "shelbi/task1");
+
+        run_git(&wt, &["checkout", "-q", "-b", "probed-result"]);
+        std::fs::write(wt.join("probed-only.txt"), "exact probed tree\n").unwrap();
+        run_git(&wt, &["add", "probed-only.txt"]);
+        run_git(&wt, &["commit", "-q", "-m", "probed result"]);
+        let proposed = head_sha(&wt);
+        assert_eq!(branch_sha(&wt, "shelbi/task1"), expected);
+
+        // A missing second workspace will attempt the real pane-recovery
+        // named-attach path against this same repository.
+        let machine = Machine {
+            name: "nested-hub".into(),
+            kind: MachineKind::Local,
+            work_dir: wt.clone(),
+            host: None,
+            tags: Vec::new(),
+            forward: None,
+        };
+        let workspace = WorkspaceSpec {
+            name: "ws2".into(),
+            machine: machine.name.clone(),
+            runner: "claude".into(),
+            tags: Vec::new(),
+            slot: None,
+        };
+        let attached_worktree = crate::workspace::workspace_worktree(&machine, &workspace);
+        assert!(!attached_worktree.exists());
+
+        let (scanned_tx, scanned_rx) = std::sync::mpsc::channel();
+        let (resume_tx, resume_rx) = std::sync::mpsc::channel();
+        let probe_repo = wt.clone();
+        let probe_expected = expected.clone();
+        let probe_proposed = proposed.clone();
+        let probe_thread = std::thread::spawn(move || {
+            finalize_probed_task_ref_after_scan(
+                "probe-test",
+                &Host::Local,
+                &probe_repo,
+                "shelbi/task1",
+                "refs/heads/shelbi/task1",
+                &probe_expected,
+                &probe_proposed,
+                || {
+                    scanned_tx.send(()).unwrap();
+                    resume_rx.recv().unwrap();
+                },
+            )
+        });
+
+        // Wait until the probe has observed no checkout while holding the Git
+        // lock, then start the second workspace attach at that exact point.
+        scanned_rx.recv().unwrap();
+        let (attempting_tx, attempting_rx) = std::sync::mpsc::channel();
+        let (completed_tx, completed_rx) = std::sync::mpsc::channel();
+        let attach_machine = machine.clone();
+        let attach_workspace = workspace.clone();
+        let attach_thread = std::thread::spawn(move || {
+            attempting_tx.send(()).unwrap();
+            let result = crate::workspace::ensure_workspace_worktree(
+                "probe-test",
+                &attach_machine,
+                &attach_workspace,
+                "shelbi/task1",
+                "main",
+            );
+            completed_tx.send(()).unwrap();
+            result
+        });
+        attempting_rx.recv().unwrap();
+
+        // The attach must not finish while the probe is paused between scan
+        // and CAS. Without the shared lock it checks out `expected` here, then
+        // the CAS silently leaves its symbolic HEAD at `proposed` while its
+        // index and files still describe `expected`.
+        let completed_while_paused = completed_rx.recv_timeout(Duration::from_millis(500));
+        resume_tx.send(()).unwrap();
+
+        probe_thread.join().unwrap().unwrap();
+        attach_thread.join().unwrap().unwrap();
+        assert!(
+            matches!(
+                completed_while_paused,
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+            ),
+            "the second workspace attached while probe scan/CAS was paused"
+        );
+
+        assert_eq!(branch_sha(&wt, "shelbi/task1"), proposed);
+        assert_eq!(
+            probe_git_stdout(&attached_worktree, &["rev-parse", "--abbrev-ref", "HEAD"]),
+            "shelbi/task1"
+        );
+        assert_eq!(head_sha(&attached_worktree), proposed);
+        assert_eq!(
+            std::fs::read_to_string(attached_worktree.join("probed-only.txt")).unwrap(),
+            "exact probed tree\n"
+        );
+        assert_eq!(
+            probe_git_stdout(&attached_worktree, &["status", "--porcelain"]),
+            "",
+            "the attached worktree's index/files must match the advanced ref"
+        );
+    }
+
+    #[test]
     fn advancing_probed_ref_rejects_a_concurrent_branch_move() {
+        let _lock = crate::test_lock::acquire();
+        let _home = ProbeHomeGuard::install();
         let (base, _origin, wt) = setup_origin_and_worktree();
         run_git(&wt, &["checkout", "-q", "-b", "shelbi/task1"]);
         std::fs::write(wt.join("work.txt"), "task work\n").unwrap();
@@ -4314,7 +4473,8 @@ printf 'target:%s\\n' \"$CARGO_TARGET_DIR\"";
             ],
         );
 
-        let err = advance_probed_task_ref(
+        let err = finalize_probed_task_ref(
+            "probe-test",
             &Host::Local,
             &wt,
             "shelbi/task1",

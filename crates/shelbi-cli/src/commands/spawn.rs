@@ -91,7 +91,12 @@ pub fn run(project_opt: Option<String>, args: Args) -> Result<()> {
     ensure_gitignored(&host, &machine)?;
 
     // 2. Create the worktree (git worktree add -b <branch> <path>).
+    // Lock order is workspace -> Git worktrees/refs. Keep the inner lock
+    // scoped to named checkout; pane startup must not hold it.
+    let git_worktree_lock = shelbi_state::lock_git_worktrees(&project_name)
+        .map_err(|e| anyhow!(e))?;
     create_worktree(&host, &machine, &branch, &worktree, &project)?;
+    drop(git_worktree_lock);
 
     // 3. Spawn the workspace tmux pane. We open it with an interactive shell
     //    (no inline command) so the user's rc files run and pick up tools

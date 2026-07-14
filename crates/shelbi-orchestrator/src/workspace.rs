@@ -1024,6 +1024,12 @@ pub fn start_workspace_on_task(spec: StartSpec<'_>) -> Result<TmuxAddr> {
     );
 
     // 1. Make sure the worktree exists + is on the right branch, clean.
+    //    Lock order is workspace -> Git worktrees/refs everywhere. Hold the
+    //    project-wide Git lock through the post-checkout verification so a
+    //    Zen probe cannot rewrite the ref between checkout and verification.
+    //    It must be dropped before pane startup: the pane wrapper may call
+    //    ensure_workspace_worktree while this function waits for readiness.
+    let git_worktree_lock = shelbi_state::lock_git_worktrees(&spec.project.name)?;
     //    A failure here (dirty worktree, unreachable origin during the
     //    fresh-cut fetch, git error) aborts the dispatch before any pane
     //    is touched — surface it in events.log so `shelbi events tail`
@@ -1064,6 +1070,7 @@ pub fn start_workspace_on_task(spec: StartSpec<'_>) -> Result<TmuxAddr> {
         }
         return Err(e);
     }
+    drop(git_worktree_lock);
 
     // The worktree is now clean and ready, but the old pane is still intact.
     // Validate the runner here so a missing `codex`/`claude` binary is an
@@ -1167,6 +1174,9 @@ pub fn resume_workspace_on_task(spec: StartSpec<'_>) -> Result<TmuxAddr> {
     // tree. Only recreate the worktree if it's gone entirely. A failure here
     // aborts before any pane is touched — surface it in events.log so the stall
     // is visible to `shelbi events tail` and the orchestrator, not just the CLI.
+    // Lock order is workspace -> Git worktrees/refs. Drop the inner lock
+    // before pane startup for the same wrapper-reentry reason as start.
+    let git_worktree_lock = shelbi_state::lock_git_worktrees(&spec.project.name)?;
     if let Err(e) = sync_worktree_for_resume(
         &host,
         &machine,
@@ -1184,6 +1194,7 @@ pub fn resume_workspace_on_task(spec: StartSpec<'_>) -> Result<TmuxAddr> {
         }
         return Err(e);
     }
+    drop(git_worktree_lock);
 
     // Prefer true conversation-resume for claude; every other runner falls back
     // to plain prompt re-injection (the agent reads its own prior work).
@@ -3232,6 +3243,7 @@ fn sync_worktree_for_resume(
 /// drift from the resume path and, like resume, never resets or bails on an
 /// existing worktree — the only case it acts on is a fully-missing one.
 pub fn ensure_workspace_worktree(
+    project_name: &str,
     machine: &Machine,
     workspace: &WorkspaceSpec,
     branch: &str,
@@ -3239,6 +3251,10 @@ pub fn ensure_workspace_worktree(
 ) -> Result<()> {
     let host = machine.host();
     let worktree = workspace_worktree(machine, workspace);
+    // This recovery path sometimes runs without an outer workspace lock. It
+    // therefore takes the Git lock directly; callers that do hold a workspace
+    // lock already follow the required workspace -> Git ordering.
+    let _git_worktree_lock = shelbi_state::lock_git_worktrees(project_name)?;
     sync_worktree_for_resume(&host, machine, &worktree, branch, default_branch)
 }
 
@@ -5888,6 +5904,32 @@ mod sync_worktree_git_tests {
     use shelbi_core::{AgentRunnerSpec, MachineKind, OrchestratorSpec, WorkspaceSpec};
     use std::collections::BTreeMap;
 
+    struct StateHomeGuard {
+        previous: Option<std::ffi::OsString>,
+        _home: tempfile::TempDir,
+    }
+
+    impl StateHomeGuard {
+        fn install() -> Self {
+            let home = tempfile::tempdir().unwrap();
+            let previous = std::env::var_os("SHELBI_HOME");
+            std::env::set_var("SHELBI_HOME", home.path());
+            Self {
+                previous,
+                _home: home,
+            }
+        }
+    }
+
+    impl Drop for StateHomeGuard {
+        fn drop(&mut self) {
+            match self.previous.take() {
+                Some(previous) => std::env::set_var("SHELBI_HOME", previous),
+                None => std::env::remove_var("SHELBI_HOME"),
+            }
+        }
+    }
+
     fn git_available() -> bool {
         std::process::Command::new("git")
             .arg("--version")
@@ -6025,6 +6067,8 @@ mod sync_worktree_git_tests {
 
     #[test]
     fn ensure_workspace_worktree_creates_missing_worktree_on_task_branch() {
+        let _state_lock = crate::test_lock::acquire();
+        let _home = StateHomeGuard::install();
         // bug-review-workspace-open-creates-missing-worktree: a task is
         // assigned to a workspace (e.g. a review workspace on a task already
         // in Review) but the workspace's worktree was never created. The pane
@@ -6047,7 +6091,14 @@ mod sync_worktree_git_tests {
         let wt = workspace_worktree(&machine, workspace);
         assert!(!wt.exists(), "worktree must start missing");
 
-        ensure_workspace_worktree(&machine, workspace, "shelbi/review-me", "main").unwrap();
+        ensure_workspace_worktree(
+            &project.name,
+            &machine,
+            workspace,
+            "shelbi/review-me",
+            "main",
+        )
+        .unwrap();
 
         assert!(
             wt.join(".git").exists(),
@@ -6109,6 +6160,8 @@ mod sync_worktree_git_tests {
 
     #[test]
     fn ensure_workspace_worktree_preserves_existing_worktree() {
+        let _state_lock = crate::test_lock::acquire();
+        let _home = StateHomeGuard::install();
         // The recovery must never disturb an in-flight worktree: if one
         // already exists (even dirty, even on another branch), `ensure` is a
         // no-op. Otherwise opening a workspace mid-task could reset the branch
@@ -6135,7 +6188,14 @@ mod sync_worktree_git_tests {
         .unwrap();
         std::fs::write(wt.join("wip.txt"), "uncommitted\n").unwrap();
 
-        ensure_workspace_worktree(&machine, workspace, "shelbi/other", "main").unwrap();
+        ensure_workspace_worktree(
+            &project.name,
+            &machine,
+            workspace,
+            "shelbi/other",
+            "main",
+        )
+        .unwrap();
 
         assert_eq!(
             head_of(&wt),
