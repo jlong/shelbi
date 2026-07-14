@@ -17,6 +17,7 @@ use std::collections::{BTreeMap, HashSet, VecDeque};
 use std::fs;
 use std::io;
 use std::os::unix::ffi::OsStrExt;
+use std::os::unix::fs::{DirBuilderExt, FileTypeExt, MetadataExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
@@ -35,8 +36,10 @@ use crate::codex_rpc::{CodexRpcClient, CodexRpcError, CodexRpcNotification};
 
 const THREAD_STATE_FILE: &str = "codex-thread.json";
 const EVENT_QUEUE_FILE: &str = "codex-event-queue.json";
+const NATIVE_RUNTIME_DIR: &str = "codex-native-runtime";
 const PROJECT_SOCKET_FILE: &str = "codex-app-server.sock";
 const TUI_RELAY_SOCKET_FILE: &str = "codex-tui-relay.sock";
+const SOCKET_PATH_MAX_BYTES: usize = 90;
 const STATE_VERSION: u8 = 1;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const RPC_TIMEOUT: Duration = Duration::from_secs(5);
@@ -58,12 +61,6 @@ enum WakePriority {
     Handoff,
     ZenMode,
     SupervisionGaveUp,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum NativeFailureAction {
-    Restart,
-    StandaloneFallback,
 }
 
 #[derive(Debug)]
@@ -140,23 +137,26 @@ fn classify_persisted_resume_rejection(
     }
 }
 
-fn native_failure_action(
-    was_native_ready: bool,
-    tui_ready: bool,
-    protocol_unsupported: bool,
-) -> NativeFailureAction {
-    if protocol_unsupported || (!was_native_ready && !tui_ready) {
-        NativeFailureAction::StandaloneFallback
-    } else {
-        NativeFailureAction::Restart
+fn retry_native_start<T>(
+    mut start: impl FnMut() -> NativeStartupResult<T>,
+    mut on_transient: impl FnMut(&NativeStartupError),
+) -> NativeStartupResult<T> {
+    loop {
+        match start() {
+            Ok(value) => return Ok(value),
+            Err(error) if !error.protocol_unsupported => on_transient(&error),
+            Err(error) => return Err(error),
+        }
     }
 }
 
 /// Run the project-scoped Codex bridge in the orchestrator pane.
 ///
-/// Native startup failures fall back to the existing standalone Codex launch,
-/// whose prompt requires durable event draining at turn boundaries. The
-/// compatibility path deliberately has no autonomous tmux injection.
+/// Positive native protocol/capability incompatibility falls back to the
+/// existing standalone Codex launch, whose prompt requires durable event
+/// draining at turn boundaries. Transient startup and pre-ready failures retry
+/// the native bridge with its durable queue intact. The compatibility path
+/// deliberately has no autonomous tmux injection.
 pub fn run_codex_bridge(project_name: &str) -> Result<()> {
     let project = shelbi_state::load_project(project_name)?;
     let runner = project
@@ -172,60 +172,54 @@ pub fn run_codex_bridge(project_name: &str) -> Result<()> {
 
     let workdir = shelbi_state::project_dir(project_name)?;
     let developer_instructions = developer_instructions(project_name, &workdir)?;
-    // Once a project has successfully established native ownership, transient
-    // app-server startup/resume failures must not demote it to standalone and
-    // abandon the exact persisted conversation during reload.
-    let mut was_native_ready = persisted_native_thread_is_active(&workdir, project_name)?;
     loop {
-        match NativeBridge::start(
-            project.clone(),
-            runner.clone(),
-            workdir.clone(),
-            developer_instructions.clone(),
-        ) {
-            Ok(mut bridge) => {
-                let result = bridge.run();
-                let failure_action = native_failure_action(
-                    was_native_ready,
-                    bridge.tui_ready,
-                    bridge.protocol_unsupported,
-                );
-                was_native_ready |= bridge.tui_ready;
-                drop(bridge);
-
-                match result {
-                    Ok(()) => return Ok(()),
-                    Err(error) if failure_action == NativeFailureAction::StandaloneFallback => {
-                        eprintln!(
-                            "shelbi: Codex native event bridge unavailable ({error}); \
-                             continuing in standalone turn-boundary polling mode"
-                        );
-                        return run_standalone(&runner, project_name, &workdir);
-                    }
-                    Err(error) => {
-                        tracing::warn!(
-                            project = project_name,
-                            %error,
-                            "Codex native event bridge interrupted; restarting app-server and exact thread"
-                        );
-                        thread::sleep(RECONNECT_INTERVAL);
-                    }
-                }
-            }
-            Err(error) if was_native_ready && !error.protocol_unsupported => {
+        let mut bridge = match retry_native_start(
+            || {
+                NativeBridge::start(
+                    project.clone(),
+                    runner.clone(),
+                    workdir.clone(),
+                    developer_instructions.clone(),
+                )
+            },
+            |error| {
                 tracing::warn!(
                     project = project_name,
                     %error,
-                    "Codex native bridge restart deferred; durable events remain queued"
+                    "Codex native bridge startup deferred; durable events remain queued"
                 );
                 thread::sleep(RECONNECT_INTERVAL);
-            }
+            },
+        ) {
+            Ok(bridge) => bridge,
             Err(error) => {
                 eprintln!(
                     "shelbi: Codex native event bridge unavailable ({error}); \
                      continuing in standalone turn-boundary polling mode"
                 );
                 return run_standalone(&runner, project_name, &workdir);
+            }
+        };
+
+        let result = bridge.run();
+        let protocol_unsupported = bridge.protocol_unsupported;
+        drop(bridge);
+        match result {
+            Ok(()) => return Ok(()),
+            Err(error) if protocol_unsupported => {
+                eprintln!(
+                    "shelbi: Codex native event bridge unavailable ({error}); \
+                     continuing in standalone turn-boundary polling mode"
+                );
+                return run_standalone(&runner, project_name, &workdir);
+            }
+            Err(error) => {
+                tracing::warn!(
+                    project = project_name,
+                    %error,
+                    "Codex native event bridge interrupted; restarting app-server and exact thread"
+                );
+                thread::sleep(RECONNECT_INTERVAL);
             }
         }
     }
@@ -310,8 +304,11 @@ impl NativeBridge {
         developer_instructions: String,
     ) -> NativeStartupResult<Self> {
         verify_remote_tui_support(&runner)?;
-        let socket_path = project_socket_path(&project.name, &workdir);
-        let mut server = AppServerProcess::start(&runner.command, socket_path.clone())
+        let socket_paths = native_socket_paths(&project.name, &workdir);
+        prepare_private_runtime_dir(&socket_paths.runtime_dir)
+            .map_err(NativeStartupError::transient)?;
+        let socket_path = socket_paths.app_server.clone();
+        let mut server = AppServerProcess::start(&runner, &workdir, socket_path.clone())
             .map_err(NativeStartupError::transient)?;
         let mut rpc = connect_until_ready(&socket_path, &mut server)?;
         let (thread_id, generation, response) =
@@ -337,7 +334,7 @@ impl NativeBridge {
         queue
             .save(&queue_path)
             .map_err(NativeStartupError::transient)?;
-        let relay_socket_path = tui_relay_socket_path(&project.name, &workdir);
+        let relay_socket_path = socket_paths.tui_relay;
         let tui_relay = TuiRelay::start(
             relay_socket_path.clone(),
             socket_path.clone(),
@@ -868,25 +865,45 @@ struct AppServerProcess {
 }
 
 impl AppServerProcess {
-    fn start(command: &str, socket_path: PathBuf) -> Result<Self> {
+    fn start(
+        runner: &shelbi_core::AgentRunnerSpec,
+        workdir: &Path,
+        socket_path: PathBuf,
+    ) -> Result<Self> {
+        let parent = socket_path.parent().ok_or_else(|| {
+            Error::Other(format!(
+                "Codex app-server socket has no runtime directory: {}",
+                socket_path.display()
+            ))
+        })?;
+        prepare_private_runtime_dir(parent)?;
         match fs::remove_file(&socket_path) {
             Ok(()) => {}
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
             Err(error) => return Err(Error::Io(error)),
         }
-        if let Some(parent) = socket_path.parent() {
-            fs::create_dir_all(parent).map_err(Error::Io)?;
-        }
-        let endpoint = format!("unix://{}", socket_path.to_string_lossy());
-        let child = Command::new(command)
-            .args(["app-server", "--listen", &endpoint])
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
+        let child = app_server_command(runner, workdir, &socket_path)
             .spawn()
             .map_err(Error::Io)?;
         Ok(Self { child, socket_path })
     }
+}
+
+fn app_server_command(
+    runner: &shelbi_core::AgentRunnerSpec,
+    workdir: &Path,
+    socket_path: &Path,
+) -> Command {
+    let endpoint = format!("unix://{}", socket_path.to_string_lossy());
+    let mut command = Command::new(&runner.command);
+    command
+        .args(&runner.flags)
+        .args(["app-server", "--listen", &endpoint])
+        .current_dir(workdir)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    command
 }
 
 impl Drop for AppServerProcess {
@@ -919,15 +936,20 @@ struct TuiRelay {
 
 impl TuiRelay {
     fn start(socket_path: PathBuf, upstream_path: PathBuf, thread_id: String) -> Result<Self> {
+        let parent = socket_path.parent().ok_or_else(|| {
+            Error::Other(format!(
+                "Codex TUI relay socket has no runtime directory: {}",
+                socket_path.display()
+            ))
+        })?;
+        prepare_private_runtime_dir(parent)?;
         match fs::remove_file(&socket_path) {
             Ok(()) => {}
             Err(error) if error.kind() == io::ErrorKind::NotFound => {}
             Err(error) => return Err(Error::Io(error)),
         }
-        if let Some(parent) = socket_path.parent() {
-            fs::create_dir_all(parent).map_err(Error::Io)?;
-        }
         let listener = UnixListener::bind(&socket_path).map_err(Error::Io)?;
+        secure_socket_permissions(&socket_path)?;
         listener.set_nonblocking(true).map_err(Error::Io)?;
 
         let (event_tx, events) = mpsc::channel();
@@ -1213,6 +1235,7 @@ fn connect_until_ready(
             ))));
         }
         if socket_path.exists() {
+            secure_socket_permissions(socket_path).map_err(NativeStartupError::transient)?;
             match CodexRpcClient::connect(
                 socket_path,
                 "shelbi",
@@ -1242,6 +1265,7 @@ fn verify_remote_tui_support(
     runner: &shelbi_core::AgentRunnerSpec,
 ) -> NativeStartupResult<()> {
     let output = Command::new(&runner.command)
+        .args(&runner.flags)
         .args(["resume", "--help"])
         .stdin(Stdio::null())
         .output()
@@ -1313,12 +1337,36 @@ fn spawn_remote_tui(
         .map_err(Error::Io)
 }
 
-fn project_socket_path(project: &str, workdir: &Path) -> PathBuf {
-    let local = workdir.join(PROJECT_SOCKET_FILE);
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct NativeSocketPaths {
+    runtime_dir: PathBuf,
+    app_server: PathBuf,
+    tui_relay: PathBuf,
+}
+
+impl NativeSocketPaths {
+    fn in_dir(runtime_dir: PathBuf) -> Self {
+        Self {
+            app_server: runtime_dir.join(PROJECT_SOCKET_FILE),
+            tui_relay: runtime_dir.join(TUI_RELAY_SOCKET_FILE),
+            runtime_dir,
+        }
+    }
+
+    fn fits_socket_limit(&self) -> bool {
+        [&self.app_server, &self.tui_relay]
+            .into_iter()
+            .all(|path| path.as_os_str().as_bytes().len() <= SOCKET_PATH_MAX_BYTES)
+    }
+}
+
+fn native_socket_paths(project: &str, workdir: &Path) -> NativeSocketPaths {
+    let local = NativeSocketPaths::in_dir(workdir.join(NATIVE_RUNTIME_DIR));
     // macOS has a 104-byte sockaddr_un path. Keep ordinary project state
-    // self-contained, but use a deterministic short path for deeply nested
-    // custom roots.
-    if local.as_os_str().as_bytes().len() <= 90 {
+    // self-contained, but use a deterministic short private directory for
+    // deeply nested custom roots. Check both full socket paths, not only the
+    // directory, so the relay cannot cross the limit independently.
+    if local.fits_socket_limit() {
         return local;
     }
     let mut hash = 0xcbf29ce484222325_u64;
@@ -1330,27 +1378,108 @@ fn project_socket_path(project: &str, workdir: &Path) -> PathBuf {
         hash ^= u64::from(*byte);
         hash = hash.wrapping_mul(0x100000001b3);
     }
-    let root = if cfg!(target_os = "macos") {
+    let preferred_root = if cfg!(target_os = "macos") {
         PathBuf::from("/private/tmp")
     } else {
         std::env::temp_dir()
     };
-    root.join(format!("shelbi-codex-{hash:016x}.sock"))
+    let preferred = NativeSocketPaths::in_dir(
+        preferred_root.join(format!("shelbi-codex-{hash:016x}")),
+    );
+    if preferred.fits_socket_limit() {
+        preferred
+    } else {
+        NativeSocketPaths::in_dir(
+            Path::new("/tmp").join(format!("shelbi-codex-{hash:016x}")),
+        )
+    }
 }
 
-fn tui_relay_socket_path(project: &str, workdir: &Path) -> PathBuf {
-    let app_server = project_socket_path(project, workdir);
-    if app_server.parent() == Some(workdir) {
-        workdir.join(TUI_RELAY_SOCKET_FILE)
-    } else {
-        app_server.with_file_name(format!(
-            "{}-tui.sock",
-            app_server
-                .file_stem()
-                .and_then(|stem| stem.to_str())
-                .unwrap_or("shelbi-codex")
-        ))
+fn prepare_private_runtime_dir(runtime_dir: &Path) -> Result<()> {
+    match fs::symlink_metadata(runtime_dir) {
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            return Err(Error::Other(format!(
+                "refusing symlinked Codex runtime directory {}",
+                runtime_dir.display()
+            )))
+        }
+        Ok(metadata) if !metadata.is_dir() => {
+            return Err(Error::Other(format!(
+                "Codex runtime path is not a directory: {}",
+                runtime_dir.display()
+            )))
+        }
+        Ok(_) => {}
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            let mut builder = fs::DirBuilder::new();
+            builder.recursive(true).mode(0o700);
+            builder.create(runtime_dir).map_err(Error::Io)?;
+        }
+        Err(error) => return Err(Error::Io(error)),
     }
+
+    let metadata = fs::symlink_metadata(runtime_dir).map_err(Error::Io)?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err(Error::Other(format!(
+            "Codex runtime path changed during setup: {}",
+            runtime_dir.display()
+        )));
+    }
+    ensure_current_user_owns(&metadata, runtime_dir, "runtime directory")?;
+    fs::set_permissions(runtime_dir, fs::Permissions::from_mode(0o700)).map_err(Error::Io)?;
+    let mode = fs::symlink_metadata(runtime_dir)
+        .map_err(Error::Io)?
+        .permissions()
+        .mode()
+        & 0o777;
+    if mode != 0o700 {
+        return Err(Error::Other(format!(
+            "Codex runtime directory {} has mode {mode:o}, expected 700",
+            runtime_dir.display()
+        )));
+    }
+    Ok(())
+}
+
+fn secure_socket_permissions(socket_path: &Path) -> Result<()> {
+    let metadata = fs::symlink_metadata(socket_path).map_err(Error::Io)?;
+    if metadata.file_type().is_symlink() || !metadata.file_type().is_socket() {
+        return Err(Error::Other(format!(
+            "Codex socket path is not a Unix socket: {}",
+            socket_path.display()
+        )));
+    }
+    ensure_current_user_owns(&metadata, socket_path, "socket")?;
+    fs::set_permissions(socket_path, fs::Permissions::from_mode(0o600)).map_err(Error::Io)?;
+    let mode = fs::symlink_metadata(socket_path)
+        .map_err(Error::Io)?
+        .permissions()
+        .mode()
+        & 0o777;
+    if mode != 0o600 {
+        return Err(Error::Other(format!(
+            "Codex socket {} has mode {mode:o}, expected 600",
+            socket_path.display()
+        )));
+    }
+    Ok(())
+}
+
+fn ensure_current_user_owns(
+    metadata: &fs::Metadata,
+    path: &Path,
+    kind: &str,
+) -> Result<()> {
+    // SAFETY: geteuid has no preconditions and does not dereference pointers.
+    let current_uid = unsafe { libc::geteuid() };
+    if metadata.uid() != current_uid {
+        return Err(Error::Other(format!(
+            "Codex {kind} {} is owned by uid {}, expected {current_uid}",
+            path.display(),
+            metadata.uid()
+        )));
+    }
+    Ok(())
 }
 
 fn developer_instructions(project: &str, workdir: &Path) -> Result<String> {
@@ -1539,10 +1668,6 @@ pub(crate) fn mark_persisted_codex_thread_inactive(
     workdir: &Path,
 ) -> Result<()> {
     set_persisted_codex_thread_active(project, workdir, false)
-}
-
-pub(crate) fn mark_persisted_codex_thread_active(project: &str, workdir: &Path) -> Result<()> {
-    set_persisted_codex_thread_active(project, workdir, true)
 }
 
 fn set_persisted_codex_thread_active(
@@ -3206,20 +3331,12 @@ mod tests {
             data: None,
         });
         assert!(incompatible.protocol_unsupported);
-        assert_eq!(
-            native_failure_action(true, false, incompatible.protocol_unsupported),
-            NativeFailureAction::StandaloneFallback
-        );
 
         let transient = NativeStartupError::from_rpc(CodexRpcError::Connect(io::Error::new(
             io::ErrorKind::ConnectionRefused,
             "temporarily unavailable",
         )));
         assert!(!transient.protocol_unsupported);
-        assert_eq!(
-            native_failure_action(true, false, transient.protocol_unsupported),
-            NativeFailureAction::Restart
-        );
 
         assert!(remote_tui_help_definitively_unsupported(
             b"",
@@ -3269,32 +3386,169 @@ mod tests {
     }
 
     #[test]
-    fn native_failures_restart_after_readiness_and_fallback_for_legacy_protocols() {
-        assert_eq!(
-            native_failure_action(true, true, false),
-            NativeFailureAction::Restart
+    fn first_launch_transient_failure_retries_native_with_queue_intact() {
+        let temp = tempfile::tempdir().unwrap();
+        let queue_path = temp.path().join(EVENT_QUEUE_FILE);
+        let expected_batches = VecDeque::from([batch("demo", 4, 42)]);
+        DurableQueue {
+            project: "demo".into(),
+            batches: expected_batches.clone(),
+        }
+        .save(&queue_path)
+        .unwrap();
+
+        let mut attempts = 0;
+        let started = retry_native_start(
+            || {
+                attempts += 1;
+                if attempts == 1 {
+                    return Err(NativeStartupError::transient(Error::Other(
+                        "app-server socket temporarily unavailable".into(),
+                    )));
+                }
+                let restored = DurableQueue::load(&queue_path, "demo")
+                    .map_err(NativeStartupError::transient)?;
+                assert_eq!(restored.project, "demo");
+                assert_eq!(restored.batches, expected_batches);
+                Ok("native-ready")
+            },
+            |_| {},
+        )
+        .unwrap();
+        assert_eq!(started, "native-ready");
+        assert_eq!(attempts, 2, "cold transient startup must be retried");
+
+        let mut incompatible_attempts = 0;
+        let incompatible: NativeStartupResult<()> = retry_native_start(
+            || {
+                incompatible_attempts += 1;
+                Err(NativeStartupError::incompatible(
+                    "app-server protocol is unsupported",
+                ))
+            },
+            |_| panic!("positive incompatibility must not be retried"),
         );
+        assert!(incompatible.unwrap_err().protocol_unsupported);
+        assert_eq!(incompatible_attempts, 1);
+    }
+
+    #[test]
+    fn app_server_launch_preserves_runner_flags_and_workdir() {
+        let runner = shelbi_core::AgentRunnerSpec {
+            command: "/opt/tools/codex".into(),
+            flags: vec![
+                "--model".into(),
+                "gpt-x".into(),
+                "--profile".into(),
+                "shelbi".into(),
+                "-c".into(),
+                "approval_policy=never".into(),
+                "--sandbox".into(),
+                "workspace-write".into(),
+            ],
+            prompt_injection: None,
+            dialog_signatures: vec![],
+        };
+        let workdir = Path::new("/tmp/shelbi project");
+        let socket = Path::new("/tmp/shelbi-runtime/app.sock");
+        let command = app_server_command(&runner, workdir, socket);
+        assert_eq!(command.get_program(), "/opt/tools/codex");
+        assert_eq!(command.get_current_dir(), Some(workdir));
         assert_eq!(
-            native_failure_action(true, false, false),
-            NativeFailureAction::Restart
-        );
-        assert_eq!(
-            native_failure_action(false, false, false),
-            NativeFailureAction::StandaloneFallback
-        );
-        assert_eq!(
-            native_failure_action(true, true, true),
-            NativeFailureAction::StandaloneFallback
+            command.get_args().collect::<Vec<_>>(),
+            vec![
+                "--model",
+                "gpt-x",
+                "--profile",
+                "shelbi",
+                "-c",
+                "approval_policy=never",
+                "--sandbox",
+                "workspace-write",
+                "app-server",
+                "--listen",
+                "unix:///tmp/shelbi-runtime/app.sock",
+            ]
         );
     }
 
     #[test]
-    fn long_project_roots_use_a_deterministic_short_socket() {
-        let root = PathBuf::from(format!("/very/{}", "long/".repeat(40)));
-        let first = project_socket_path("demo", &root);
-        let second = project_socket_path("demo", &root);
+    fn native_sockets_use_an_owner_only_runtime_and_socket_modes() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = native_socket_paths("demo", temp.path());
+        assert_eq!(paths.app_server.parent(), Some(paths.runtime_dir.as_path()));
+        assert_eq!(paths.tui_relay.parent(), Some(paths.runtime_dir.as_path()));
+        fs::create_dir_all(&paths.runtime_dir).unwrap();
+        fs::set_permissions(&paths.runtime_dir, fs::Permissions::from_mode(0o755)).unwrap();
+
+        prepare_private_runtime_dir(&paths.runtime_dir).unwrap();
+        let runtime_mode = fs::metadata(&paths.runtime_dir)
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(runtime_mode, 0o700);
+
+        let app_listener = UnixListener::bind(&paths.app_server).unwrap();
+        fs::set_permissions(&paths.app_server, fs::Permissions::from_mode(0o777)).unwrap();
+        secure_socket_permissions(&paths.app_server).unwrap();
+        let app_mode = fs::metadata(&paths.app_server)
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(app_mode, 0o600);
+        drop(app_listener);
+        fs::remove_file(&paths.app_server).unwrap();
+
+        let relay = TuiRelay::start(
+            paths.tui_relay.clone(),
+            paths.runtime_dir.join("unused-upstream.sock"),
+            "thread-owned".into(),
+        )
+        .unwrap();
+        let relay_mode = fs::metadata(&paths.tui_relay)
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(relay_mode, 0o600);
+        drop(relay);
+
+        let real_dir = temp.path().join("attacker-owned-target");
+        fs::create_dir_all(&real_dir).unwrap();
+        let symlink_dir = temp.path().join("predictable-runtime-link");
+        std::os::unix::fs::symlink(&real_dir, &symlink_dir).unwrap();
+        let error = prepare_private_runtime_dir(&symlink_dir)
+            .expect_err("predictable runtime symlinks must fail closed")
+            .to_string();
+        assert!(error.contains("refusing symlinked"), "{error}");
+
+        if !paths.runtime_dir.starts_with(temp.path()) {
+            let _ = fs::remove_dir_all(&paths.runtime_dir);
+        }
+    }
+
+    #[test]
+    fn long_project_roots_use_a_deterministic_short_private_runtime() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("long".repeat(80));
+        let first = native_socket_paths("demo", &root);
+        let second = native_socket_paths("demo", &root);
         assert_eq!(first, second);
-        assert!(first.as_os_str().as_bytes().len() <= 90);
+        assert!(first.fits_socket_limit());
+        assert_eq!(first.app_server.parent(), Some(first.runtime_dir.as_path()));
+        assert_eq!(first.tui_relay.parent(), Some(first.runtime_dir.as_path()));
+        assert!(!first.runtime_dir.starts_with(&root));
+
+        prepare_private_runtime_dir(&first.runtime_dir).unwrap();
+        let mode = fs::metadata(&first.runtime_dir)
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o700);
+        fs::remove_dir_all(&first.runtime_dir).unwrap();
     }
 
     #[test]

@@ -11,8 +11,10 @@
 //! Mechanism: for Claude, custom runners, and a one-time migration from a
 //! standalone Codex pane, we type a request into the orchestrator pane and
 //! poll the filesystem for the handoff file. Once Codex has a persisted
-//! native thread, that thread is the handoff and this module never touches
-//! its composer. A 30s timeout caps legacy handoff waits.
+//! native thread, that thread is the handoff only while the configured runner
+//! remains Codex; a native-to-legacy runner switch fails before pane mutation
+//! because Shelbi cannot safely serialize that thread through the composer.
+//! A 30s timeout caps legacy handoff waits.
 
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
@@ -79,11 +81,11 @@ pub enum HandoffOutcome {
 /// outcome variant comes back — every variant of [`HandoffOutcome`] is
 /// "okay to proceed" semantics, distinguished only for logging.
 pub fn request_orchestrator_handoff(project_name: &str) -> Result<HandoffOutcome> {
-    // Ownership describes the pane that is live now, not the runner that the
-    // project is configured to launch next. A Codex -> Claude/custom reload
-    // must not paste a migration request into the still-live native Codex TUI.
-    let persisted_native_thread = crate::wake::has_persisted_codex_thread(project_name)?;
-    if uses_native_thread_continuity(persisted_native_thread) {
+    // The native thread is the handoff only for a same-runner Codex reload.
+    // A Codex -> Claude/custom switch cannot safely use composer transport,
+    // so the shared preflight returns a hard error before the caller tears
+    // down the pane.
+    if validate_configured_orchestrator_transition(project_name)? {
         return Ok(HandoffOutcome::NativeThread);
     }
 
@@ -124,6 +126,64 @@ pub fn request_orchestrator_handoff(project_name: &str) -> Result<HandoffOutcome
         std::thread::sleep(POLL_INTERVAL);
     }
     Ok(HandoffOutcome::Timeout)
+}
+
+/// Validate continuity between the live orchestrator and the runner currently
+/// selected in project configuration.
+///
+/// Returns `true` when an active native Codex thread supplies same-runner
+/// continuity, and `false` for legacy/standalone panes that still use the
+/// file-based handoff. A native Codex thread cannot be cold-started as a
+/// different runner: fail explicitly and leave the thread marker intact.
+pub(crate) fn validate_configured_orchestrator_transition(project_name: &str) -> Result<bool> {
+    let project = shelbi_state::load_project(project_name)?;
+    let runner = project
+        .runner(&project.orchestrator.runner)
+        .ok_or_else(|| Error::UnknownRunner(project.orchestrator.runner.clone()))?;
+    validate_orchestrator_runner_transition(
+        project_name,
+        &project.orchestrator.runner,
+        &runner.command,
+    )
+}
+
+/// Validate the exact runner already selected for an imminent launch.
+///
+/// Callers must pass the captured runner rather than reloading configuration:
+/// otherwise a concurrent config edit could validate Codex while stale
+/// non-Codex argv is about to be started.
+pub(crate) fn validate_orchestrator_runner_transition(
+    project_name: &str,
+    runner_name: &str,
+    runner_command: &str,
+) -> Result<bool> {
+    let persisted_native_thread = crate::wake::has_persisted_codex_thread(project_name)?;
+    validate_native_runner_transition(
+        persisted_native_thread,
+        project_name,
+        runner_name,
+        runner_command,
+    )
+}
+
+fn validate_native_runner_transition(
+    persisted_native_thread: bool,
+    project_name: &str,
+    runner_name: &str,
+    runner_command: &str,
+) -> Result<bool> {
+    if !uses_native_thread_continuity(persisted_native_thread) {
+        return Ok(false);
+    }
+    if shelbi_agent::is_codex_runner(runner_command) {
+        return Ok(true);
+    }
+    Err(Error::Other(format!(
+        "cannot switch project `{project_name}` from its active native Codex thread to \
+         orchestrator runner `{runner_name}` (`{runner_command}`): Shelbi cannot safely \
+         materialize a native-to-legacy handoff; restore the Codex runner before \
+         starting or reloading the orchestrator (the native thread was left intact)"
+    )))
 }
 
 pub(crate) fn uses_native_thread_continuity(persisted_native_thread: bool) -> bool {
@@ -269,6 +329,40 @@ fn send_to_pane(pane_id: &str, text: &str) -> std::result::Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
+
+    fn project_with_runner(name: &str, command: &str) -> shelbi_core::Project {
+        shelbi_core::Project {
+            name: "demo".into(),
+            default_branch: "main".into(),
+            default_workflow: None,
+            config_mode: None,
+            orchestrator: shelbi_core::OrchestratorSpec {
+                runner: name.into(),
+            },
+            agent_runners: std::collections::BTreeMap::from([(
+                name.into(),
+                shelbi_core::AgentRunnerSpec {
+                    command: command.into(),
+                    flags: vec![],
+                    prompt_injection: None,
+                    dialog_signatures: vec![],
+                },
+            )]),
+            github_url: None,
+            workspace_poll_interval_secs: 5,
+            workspace_permissions_mode: "auto".into(),
+            workspace_settings_template: None,
+            zen: shelbi_core::ZenConfig::default(),
+            heartbeat: shelbi_core::HeartbeatConfig::default(),
+            git: shelbi_core::GitConfig::default(),
+            repo: "/tmp/demo".into(),
+            machines: Vec::new(),
+            editor: None,
+            workspaces: Vec::new(),
+            detected_shapes: Vec::new(),
+        }
+    }
 
     #[test]
     fn handoff_request_message_names_the_relative_path() {
@@ -300,11 +394,77 @@ mod tests {
     }
 
     #[test]
-    fn live_native_thread_skips_composer_handoff_across_runner_changes() {
-        assert!(uses_native_thread_continuity(true));
+    fn live_native_thread_is_continuity_only_for_a_codex_reload() {
+        assert!(validate_native_runner_transition(true, "demo", "codex", "codex").unwrap());
+        assert!(validate_native_runner_transition(
+            true,
+            "demo",
+            "codex-custom",
+            "/opt/codex/bin/codex"
+        )
+        .unwrap());
         assert!(
-            !uses_native_thread_continuity(false),
-            "a legacy Codex pane needs one migration handoff"
+            !validate_native_runner_transition(false, "demo", "claude", "claude").unwrap(),
+            "a legacy pane still needs the file-based migration handoff"
         );
+
+        let error = validate_native_runner_transition(true, "demo", "claude", "claude")
+            .expect_err("native Codex to Claude must fail before a cold respawn")
+            .to_string();
+        assert!(error.contains("cannot switch project `demo`"), "{error}");
+        assert!(error.contains("native-to-legacy handoff"), "{error}");
+        assert!(error.contains("native thread was left intact"), "{error}");
+    }
+
+    #[test]
+    fn configured_runner_switch_rejects_without_mutating_native_state() {
+        let _lock = crate::test_lock::acquire();
+        let previous_home = std::env::var_os("SHELBI_HOME");
+        let temp = tempfile::tempdir().unwrap();
+        std::env::set_var("SHELBI_HOME", temp.path());
+
+        shelbi_state::save_project(&project_with_runner("codex", "codex")).unwrap();
+        let project_dir = shelbi_state::project_dir("demo").unwrap();
+        fs::create_dir_all(&project_dir).unwrap();
+        let state_path = project_dir.join("codex-thread.json");
+        fs::write(
+            &state_path,
+            r#"{"version":1,"project":"demo","thread_id":"thread-owned","bootstrap_generation":3,"native_active":true}"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            request_orchestrator_handoff("demo").unwrap(),
+            HandoffOutcome::NativeThread,
+            "same-runner native reload must return before any tmux composer lookup"
+        );
+
+        shelbi_state::save_project(&project_with_runner("claude", "claude")).unwrap();
+        let before = fs::read(&state_path).unwrap();
+        let error = validate_configured_orchestrator_transition("demo")
+            .expect_err("native Codex to Claude must be rejected")
+            .to_string();
+        assert!(error.contains("orchestrator runner `claude`"), "{error}");
+        assert_eq!(fs::read(&state_path).unwrap(), before);
+        assert!(crate::wake::has_persisted_codex_thread("demo").unwrap());
+
+        // The immediate launch guard validates captured argv, not a freshly
+        // reloaded config value. Even if config changes back to Codex after a
+        // caller captured Claude, that stale Claude launch stays forbidden.
+        shelbi_state::save_project(&project_with_runner("codex", "codex")).unwrap();
+        let stale_error = validate_orchestrator_runner_transition(
+            "demo",
+            "captured-claude",
+            "/opt/claude/bin/claude",
+        )
+        .expect_err("captured non-Codex argv must not be authorized by later config")
+        .to_string();
+        assert!(stale_error.contains("captured-claude"), "{stale_error}");
+        assert_eq!(fs::read(&state_path).unwrap(), before);
+
+        match previous_home {
+            Some(home) => std::env::set_var("SHELBI_HOME", home),
+            None => std::env::remove_var("SHELBI_HOME"),
+        }
     }
 }
