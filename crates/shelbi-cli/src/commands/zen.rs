@@ -53,8 +53,8 @@ const DRYRUN_DEFAULT_INTERVAL: Duration = Duration::from_secs(5);
 /// pegging a core and hammering the log. Clamp up to this instead.
 const DRYRUN_MIN_INTERVAL: Duration = Duration::from_secs(1);
 
-/// Immutable repository/base/head identity emitted by `zen probe` and
-/// required by every later PR-flow primitive. Keeping the five values in one
+/// Immutable repository/base/integration/head identity emitted by `zen probe`
+/// and required by every later PR-flow primitive. Keeping the values in one
 /// flattened argument group makes it harder for the CLI paths to accidentally
 /// validate only the head while silently recomputing mutable project state.
 #[derive(Debug, Args)]
@@ -72,6 +72,9 @@ pub struct PinnedIdentityArgs {
     /// Base commit from the probe report's `base_sha` field.
     #[arg(long, value_name = "SHA")]
     pub match_base_commit: String,
+    /// Candidate commit from the probe report's `integration_sha` field.
+    #[arg(long, value_name = "SHA")]
+    pub match_integration_commit: String,
     /// Reviewed head from the probe report's `head_sha` field.
     #[arg(long, value_name = "SHA")]
     pub match_head_commit: String,
@@ -84,6 +87,7 @@ impl PinnedIdentityArgs {
             repository_id: self.match_repository_id,
             base_branch: self.match_base_branch,
             base_sha: self.match_base_commit,
+            integration_sha: self.match_integration_commit,
             head_sha: self.match_head_commit,
         }
     }
@@ -300,14 +304,6 @@ pub fn run(project_opt: Option<String>, cmd: ZenCmd) -> Result<()> {
                 // Merged, but GitHub hadn't recorded the merge commit yet
                 // when polling gave up — success, just without a SHA.
                 zen::PrMergeOutcome::Merged(None) => println!("sha-pending"),
-                zen::PrMergeOutcome::Queued => {
-                    println!("queued");
-                    eprintln!(
-                        "pr-merge: GitHub accepted the pinned head into its merge queue; \
-                         leave the task in handoff and retry this command after it lands"
-                    );
-                    std::process::exit(2);
-                }
             }
             // Forcing function: append the post-merge eligibility scan to the
             // command's own stdout so the orchestrator can't drop the scan it's

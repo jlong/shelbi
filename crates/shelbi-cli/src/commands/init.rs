@@ -1176,15 +1176,15 @@ mod tests {
         let mut orchestrator = std::fs::read_to_string(&orchestrator_path)
             .unwrap()
             .replace(
-                "shelbi zen pr-create <task-id> --match-repository <repository> --match-repository-id <repository_id> --match-base-branch <base_branch> --match-base-commit <base_sha> --match-head-commit <head_sha>",
+                "shelbi zen pr-create <task-id> --match-repository <repository> --match-repository-id <repository_id> --match-base-branch <base_branch> --match-base-commit <base_sha> --match-integration-commit <integration_sha> --match-head-commit <head_sha>",
                 "shelbi zen pr-create <task-id> --match-head-commit <head_sha>",
             )
             .replace(
-                "shelbi zen ci-watch <pr> --match-repository <repository> --match-repository-id <repository_id> --match-base-branch <base_branch> --match-base-commit <base_sha> --match-head-commit <head_sha>",
+                "shelbi zen ci-watch <pr> --match-repository <repository> --match-repository-id <repository_id> --match-base-branch <base_branch> --match-base-commit <base_sha> --match-integration-commit <integration_sha> --match-head-commit <head_sha>",
                 "shelbi zen ci-watch <pr> --match-head-commit <head_sha>",
             )
             .replace(
-                "shelbi zen pr-merge <pr> --match-repository <repository> --match-repository-id <repository_id> --match-base-branch <base_branch> --match-base-commit <base_sha> --match-head-commit <head_sha>",
+                "shelbi zen pr-merge <pr> --match-repository <repository> --match-repository-id <repository_id> --match-base-branch <base_branch> --match-base-commit <base_sha> --match-integration-commit <integration_sha> --match-head-commit <head_sha>",
                 "shelbi zen pr-merge <pr> --match-head-commit <head_sha>",
             );
         orchestrator.push_str("\nLocal orchestrator suffix.\n");
@@ -1194,15 +1194,15 @@ mod tests {
         let mut zenmode = std::fs::read_to_string(&zenmode_path)
             .unwrap()
             .replace(
-                "shelbi zen pr-create <task-id> --match-repository <repository> --match-repository-id <repository_id> --match-base-branch <base_branch> --match-base-commit <base_sha> --match-head-commit <head_sha>",
+                "shelbi zen pr-create <task-id> --match-repository <repository> --match-repository-id <repository_id> --match-base-branch <base_branch> --match-base-commit <base_sha> --match-integration-commit <integration_sha> --match-head-commit <head_sha>",
                 "shelbi zen pr-create <task-id> --match-head-commit <head_sha>",
             )
             .replace(
-                "shelbi zen ci-watch <pr-number> --match-repository <repository> --match-repository-id <repository_id> --match-base-branch <base_branch> --match-base-commit <base_sha> --match-head-commit <head_sha> --timeout 15m",
+                "shelbi zen ci-watch <pr-number> --match-repository <repository> --match-repository-id <repository_id> --match-base-branch <base_branch> --match-base-commit <base_sha> --match-integration-commit <integration_sha> --match-head-commit <head_sha> --timeout 15m",
                 "shelbi zen ci-watch <pr-number> --match-head-commit <head_sha> --timeout 15m",
             )
             .replace(
-                "shelbi zen pr-merge <pr-number> --match-repository <repository> --match-repository-id <repository_id> --match-base-branch <base_branch> --match-base-commit <base_sha> --match-head-commit <head_sha>",
+                "shelbi zen pr-merge <pr-number> --match-repository <repository> --match-repository-id <repository_id> --match-base-branch <base_branch> --match-base-commit <base_sha> --match-integration-commit <integration_sha> --match-head-commit <head_sha>",
                 "shelbi zen pr-merge <pr-number> --match-head-commit <head_sha>",
             );
         zenmode.push_str("\nLocal Zen suffix.\n");
@@ -1210,14 +1210,14 @@ mod tests {
 
         scaffold_project(&resolved, InitMode::Global).unwrap();
         let migrated_orchestrator = std::fs::read_to_string(&orchestrator_path).unwrap();
-        assert!(migrated_orchestrator.contains("shelbi zen pr-create <task-id> --match-repository <repository> --match-repository-id <repository_id> --match-base-branch <base_branch> --match-base-commit <base_sha> --match-head-commit <head_sha>"));
-        assert!(migrated_orchestrator.contains("shelbi zen ci-watch <pr> --match-repository <repository> --match-repository-id <repository_id> --match-base-branch <base_branch> --match-base-commit <base_sha> --match-head-commit <head_sha>"));
-        assert!(migrated_orchestrator.contains("shelbi zen pr-merge <pr> --match-repository <repository> --match-repository-id <repository_id> --match-base-branch <base_branch> --match-base-commit <base_sha> --match-head-commit <head_sha>"));
+        assert!(migrated_orchestrator.contains("shelbi zen pr-create <task-id> --match-repository <repository> --match-repository-id <repository_id> --match-base-branch <base_branch> --match-base-commit <base_sha> --match-integration-commit <integration_sha> --match-head-commit <head_sha>"));
+        assert!(migrated_orchestrator.contains("shelbi zen ci-watch <pr> --match-repository <repository> --match-repository-id <repository_id> --match-base-branch <base_branch> --match-base-commit <base_sha> --match-integration-commit <integration_sha> --match-head-commit <head_sha>"));
+        assert!(migrated_orchestrator.contains("shelbi zen pr-merge <pr> --match-repository <repository> --match-repository-id <repository_id> --match-base-branch <base_branch> --match-base-commit <base_sha> --match-integration-commit <integration_sha> --match-head-commit <head_sha>"));
         assert!(migrated_orchestrator.contains("Local orchestrator suffix."));
         let migrated_zenmode = std::fs::read_to_string(&zenmode_path).unwrap();
-        assert!(migrated_zenmode.contains("shelbi zen pr-create <task-id> --match-repository <repository> --match-repository-id <repository_id> --match-base-branch <base_branch> --match-base-commit <base_sha> --match-head-commit <head_sha>"));
-        assert!(migrated_zenmode.contains("shelbi zen ci-watch <pr-number> --match-repository <repository> --match-repository-id <repository_id> --match-base-branch <base_branch> --match-base-commit <base_sha> --match-head-commit <head_sha> --timeout 15m"));
-        assert!(migrated_zenmode.contains("shelbi zen pr-merge <pr-number> --match-repository <repository> --match-repository-id <repository_id> --match-base-branch <base_branch> --match-base-commit <base_sha> --match-head-commit <head_sha>"));
+        assert!(migrated_zenmode.contains("shelbi zen pr-create <task-id> --match-repository <repository> --match-repository-id <repository_id> --match-base-branch <base_branch> --match-base-commit <base_sha> --match-integration-commit <integration_sha> --match-head-commit <head_sha>"));
+        assert!(migrated_zenmode.contains("shelbi zen ci-watch <pr-number> --match-repository <repository> --match-repository-id <repository_id> --match-base-branch <base_branch> --match-base-commit <base_sha> --match-integration-commit <integration_sha> --match-head-commit <head_sha> --timeout 15m"));
+        assert!(migrated_zenmode.contains("shelbi zen pr-merge <pr-number> --match-repository <repository> --match-repository-id <repository_id> --match-base-branch <base_branch> --match-base-commit <base_sha> --match-integration-commit <integration_sha> --match-head-commit <head_sha>"));
         assert!(migrated_zenmode.contains("Local Zen suffix."));
 
         // A later re-run is a clean no-op (still idempotent).

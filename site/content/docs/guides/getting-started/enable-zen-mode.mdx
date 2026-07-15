@@ -161,11 +161,13 @@ review-marker -> probe -> local checks -> merge conflict -> diff size
 ```
 
 Each step is a single-purpose CLI primitive (see
-[`shelbi zen`](/docs/cli/zen)). The probe's repository, base, and head identity
-is passed unchanged through every command. GitHub's `expectedHeadOid` leases
-the head only, not the base or repository. A concurrent same-head retarget
-during the merge mutation remains a documented limitation for separate human
-design, so this flow must not be described as atomically base-pinned.
+[`shelbi zen`](/docs/cli/zen)). The probe's repository, base, reviewed head,
+and prebuilt integration commit are passed unchanged through every command.
+CI runs on that candidate. Landing advances only the reviewed base ref from
+the reviewed base commit to the candidate with Git's compare-and-swap lease,
+so a same-head PR retarget cannot redirect the update. The atomic boundary is
+the remote Git ref, not GitHub PR metadata. Repositories that require protected
+PR or merge-queue mutations stay in review for a human merge.
 
 ```
 2026-06-22T14:31:08+00:00 task=tighten-rate-limit-error-copy review -> done reason=orchestrator:zen-merge sha=abc1234

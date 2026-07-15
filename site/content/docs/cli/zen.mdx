@@ -112,9 +112,10 @@ repository that holds its named branch. Shelbi checks out that exact branch
 commit in an isolated temporary worktree, so a newer task reusing the assigned
 workspace is not modified or tested by mistake. A successful rebase advances
 the durable task branch. The report freezes `repository`, `repository_id`,
-`base_branch`, `base_sha`, and `head_sha`. Together those fields identify the
+`base_branch`, `base_sha`, `integration_sha`, and `head_sha`. Together those fields identify the
 exact repository and workflow base used for every check and fact, plus the
-reviewed task commit. Pass the same five values to every later PR command.
+reviewed task commit and exact squash candidate. Pass the same six values to
+every later PR command.
 
 | Argument | Type | Default | Description |
 | --- | --- | --- | --- |
@@ -123,7 +124,7 @@ reviewed task commit. Pass the same five values to every later PR command.
 ## pr-create
 
 ```text
-shelbi zen pr-create <ID> --match-repository <REPOSITORY> --match-repository-id <REPOSITORY_ID> --match-base-branch <BRANCH> --match-base-commit <BASE_SHA> --match-head-commit <HEAD_SHA>
+shelbi zen pr-create <ID> --match-repository <REPOSITORY> --match-repository-id <REPOSITORY_ID> --match-base-branch <BRANCH> --match-base-commit <BASE_SHA> --match-integration-commit <INTEGRATION_SHA> --match-head-commit <HEAD_SHA>
 ```
 
 Push the task's named branch and open a PR. Idempotent. If an open PR for
@@ -135,7 +136,7 @@ Reuse also requires the exact task branch, resolved workflow base branch and
 commit, and `origin` repository identity. A same-named PR aimed at another
 base or coming from another repository is rejected.
 
-All five `--match-*` flags are required. Copy them from the immediately
+All six `--match-*` flags are required. Copy them from the immediately
 preceding `probe` report without re-resolving configuration or `origin`.
 Shelbi rejects the operation if any part of that identity moved after the
 probe, so mutable workflow, remote, or branch state cannot silently replace
@@ -148,12 +149,13 @@ what was reviewed.
 | `--match-repository-id <REPOSITORY_ID>` | string | required | Require the immutable GitHub repository id to equal probe `repository_id`. |
 | `--match-base-branch <BRANCH>` | string | required | Require the PR target to equal probe `base_branch`. |
 | `--match-base-commit <SHA>` | string | required | Require the resolved target commit to equal probe `base_sha`. |
-| `--match-head-commit <SHA>` | string | required | Require the task branch and published PR head to match this probe SHA. |
+| `--match-integration-commit <SHA>` | string | required | Require the published PR head to equal probe `integration_sha`. |
+| `--match-head-commit <SHA>` | string | required | Require the durable task branch to match probe `head_sha`. |
 
 ## ci-watch
 
 ```text
-shelbi zen ci-watch <PR_NUMBER> --match-repository <REPOSITORY> --match-repository-id <REPOSITORY_ID> --match-base-branch <BRANCH> --match-base-commit <BASE_SHA> --match-head-commit <HEAD_SHA> [OPTIONS]
+shelbi zen ci-watch <PR_NUMBER> --match-repository <REPOSITORY> --match-repository-id <REPOSITORY_ID> --match-base-branch <BRANCH> --match-base-commit <BASE_SHA> --match-integration-commit <INTEGRATION_SHA> --match-head-commit <HEAD_SHA> [OPTIONS]
 ```
 
 Watch the PR's checks until they settle or the timeout fires. Prints one of:
@@ -170,7 +172,7 @@ rows exist, a blocked merge state keeps waiting for a required context that has
 not reported, while an optional failed check does not override passing required
 checks.
 
-All five `--match-*` values must be the unchanged probe identity passed to
+All six `--match-*` values must be the unchanged probe identity passed to
 `pr-create`. Each poll verifies that original repository, base name and commit,
 and head commit. Shelbi reads the PR identity and status rollup together,
 including which contexts are required, and grades that one atomic snapshot.
@@ -185,29 +187,28 @@ the whole pinned flow must restart from a fresh probe.
 | `--match-repository-id <REPOSITORY_ID>` | string | required | Require probe `repository_id` on every snapshot. |
 | `--match-base-branch <BRANCH>` | string | required | Require probe `base_branch` on every snapshot. |
 | `--match-base-commit <SHA>` | string | required | Require probe `base_sha` on every snapshot. |
-| `--match-head-commit <SHA>` | string | required | Require the live PR head to stay at the probe SHA throughout the watch. |
+| `--match-integration-commit <SHA>` | string | required | Require the live PR head to stay at probe `integration_sha`. |
+| `--match-head-commit <SHA>` | string | required | Bind the candidate back to probe `head_sha`. |
 | `--timeout <DURATION>` | duration | project's `zen.ci_timeout` (default `15m`) | Override the wait. Accepts `30s`, `5m`, `2h`, `1d`, or a bare integer of seconds. |
 | `--task <TASK_ID>` | string | — | Resolve the default timeout against the task's workflow's `zen.ci_timeout` (falling back to the project value). Without it, the project default is used directly. |
 
 ## pr-merge
 
 ```text
-shelbi zen pr-merge <PR_NUMBER> --match-repository <REPOSITORY> --match-repository-id <REPOSITORY_ID> --match-base-branch <BRANCH> --match-base-commit <BASE_SHA> --match-head-commit <HEAD_SHA>
+shelbi zen pr-merge <PR_NUMBER> --match-repository <REPOSITORY> --match-repository-id <REPOSITORY_ID> --match-base-branch <BRANCH> --match-base-commit <BASE_SHA> --match-integration-commit <INTEGRATION_SHA> --match-head-commit <HEAD_SHA>
 ```
 
-Land the PR with the configured strategy after `ci-watch` reports `green`.
-Shelbi validates the complete probe identity before the GitHub merge or queue
-mutation and verifies the result afterward. It supplies `expectedHeadOid`,
-which atomically leases the reviewed head only. GitHub exposes no atomic
-expected-base or expected-repository input.
+Land the prebuilt squash candidate after `ci-watch` reports `green`. Shelbi
+verifies that `integration_sha` has sole parent `base_sha` and exactly the tree
+of `head_sha`, then advances only `refs/heads/<base_branch>` from `base_sha` to
+`integration_sha` with Git's compare-and-swap lease. A concurrent same-head PR
+retarget cannot redirect that update. This atomicity applies to the remote ref
+update, not to GitHub PR metadata.
 
-This leaves a precise residual limitation: a concurrent retarget with an
-unchanged head between validation and mutation can land or enqueue into the
-new base, and a post-response rejection is too late to undo it. The limitation
-requires separate human design and this path must not be described as atomic
-base pinning. Ordinary merge and queue behavior otherwise remains unchanged.
-A landed PR prints its merge SHA or `sha-pending`; a queued PR prints `queued`
-and remains in handoff for a later exact-provenance retry.
+Repositories with branch protection, active rulesets, required-PR rules,
+fork heads, merge queues, or a non-squash strategy cannot use this boundary.
+Zen leaves the base unchanged and tells a human to review and merge through the
+repository's required GitHub workflow. A landed candidate prints its SHA.
 
 | Argument or flag | Type | Default | Description |
 | --- | --- | --- | --- |
@@ -216,6 +217,7 @@ and remains in handoff for a later exact-provenance retry.
 | `--match-repository-id <REPOSITORY_ID>` | string | required | Require probe `repository_id`. |
 | `--match-base-branch <BRANCH>` | string | required | Require probe `base_branch`. |
 | `--match-base-commit <SHA>` | string | required | Require probe `base_sha`. |
+| `--match-integration-commit <SHA>` | string | required | Require probe `integration_sha`. |
 | `--match-head-commit <SHA>` | string | required | Require probe `head_sha`. |
 
 ## Examples
@@ -261,8 +263,9 @@ REPOSITORY=$(printf '%s\n' "$REPORT" | jq -r .repository)
 REPOSITORY_ID=$(printf '%s\n' "$REPORT" | jq -r .repository_id)
 BASE_BRANCH=$(printf '%s\n' "$REPORT" | jq -r .base_branch)
 BASE_SHA=$(printf '%s\n' "$REPORT" | jq -r .base_sha)
+INTEGRATION_SHA=$(printf '%s\n' "$REPORT" | jq -r .integration_sha)
 HEAD_SHA=$(printf '%s\n' "$REPORT" | jq -r .head_sha)
-PIN=(--match-repository "$REPOSITORY" --match-repository-id "$REPOSITORY_ID" --match-base-branch "$BASE_BRANCH" --match-base-commit "$BASE_SHA" --match-head-commit "$HEAD_SHA")
+PIN=(--match-repository "$REPOSITORY" --match-repository-id "$REPOSITORY_ID" --match-base-branch "$BASE_BRANCH" --match-base-commit "$BASE_SHA" --match-integration-commit "$INTEGRATION_SHA" --match-head-commit "$HEAD_SHA")
 PR=$(shelbi zen pr-create docs-write-cli-reference-pages "${PIN[@]}")
 shelbi zen ci-watch "$PR" "${PIN[@]}" --timeout 10m
 shelbi zen pr-merge "$PR" "${PIN[@]}"

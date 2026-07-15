@@ -143,11 +143,13 @@ The conditions, in order:
    `zen.danger_paths.extend` + the active workflow's `zen.danger_paths`
    override, if any) bails out.
 5. **PR opens cleanly** via
-   `shelbi zen pr-create <id> --match-repository <repository> --match-repository-id <repository_id> --match-base-branch <base_branch> --match-base-commit <base_sha> --match-head-commit <head_sha>`. All five values are copied directly from the probe report. The PR is returned
+   `shelbi zen pr-create <id> --match-repository <repository> --match-repository-id <repository_id> --match-base-branch <base_branch> --match-base-commit <base_sha> --match-integration-commit <integration_sha> --match-head-commit <head_sha>`. All six values are copied directly from the probe report. The PR is returned
    only after its remote identity matches the exact repository, resolved
-   workflow base name and commit, task branch, and reviewed head.
+   workflow base name and commit, task branch, reviewed head, and prebuilt
+   integration commit. The PR head is the integration commit so CI runs on
+   the exact object eligible to land.
 6. **CI is green**:
-   `shelbi zen ci-watch <pr> --match-repository <repository> --match-repository-id <repository_id> --match-base-branch <base_branch> --match-base-commit <base_sha> --match-head-commit <head_sha> --task <id>` polls
+   `shelbi zen ci-watch <pr> --match-repository <repository> --match-repository-id <repository_id> --match-base-branch <base_branch> --match-base-commit <base_sha> --match-integration-commit <integration_sha> --match-head-commit <head_sha> --task <id>` polls
    the PR number returned by that creation step, using the same complete probe
    identity. One GraphQL response per poll binds the repository, base, PR head, latest commit,
    required contexts, their results, and GitHub's merge state. A blocked state
@@ -162,10 +164,10 @@ The conditions, in order:
    A-to-B-to-A change both bail instead of authorizing a merge. A snapshot
    that would require pagination also fails closed.
 7. **Landing** via
-   `shelbi zen pr-merge <pr> --match-repository <repository> --match-repository-id <repository_id> --match-base-branch <base_branch> --match-base-commit <base_sha> --match-head-commit <head_sha>`, passing the same probe identity again. Shelbi validates repository, base, and head before the GitHub merge or queue mutation and verifies the result afterward. GitHub's `expectedHeadOid` atomically leases the head only; it exposes no expected-base or expected-repository input. A concurrent same-head retarget between validation and mutation can therefore change the landing target, and a post-response check is too late to undo it. This residual requires separate human design and is not atomic base pinning. Ordinary merge and queue behavior remains unchanged.
+   `shelbi zen pr-merge <pr> --match-repository <repository> --match-repository-id <repository_id> --match-base-branch <base_branch> --match-base-commit <base_sha> --match-integration-commit <integration_sha> --match-head-commit <head_sha>`, passing the same probe identity again. The candidate has sole parent `base_sha` and exactly the tree of `head_sha`. Shelbi then updates only `refs/heads/<base_branch>` from `base_sha` to `integration_sha` with `--force-with-lease`. A same-head PR retarget cannot redirect that ref update. The lease is atomic at the remote Git ref, not across GitHub PR metadata. Protected branches, required-PR rules, forks, merge queues, and non-squash strategies fail closed with a human-review instruction.
 
-The probe's `repository`, `repository_id`, `base_branch`, `base_sha`, and
-`head_sha` form the contract for the whole sequence. They are not recomputed
+The probe's `repository`, `repository_id`, `base_branch`, `base_sha`,
+`integration_sha`, and `head_sha` form the contract for the whole sequence. They are not recomputed
 between steps: PR creation publishes into that repository and base, CI grades
 that identity continuously, and the landing boundary verifies it again. A
 workflow, origin, base, or head change requires a fresh probe and a new flow.

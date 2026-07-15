@@ -924,6 +924,7 @@ mod cli_tests {
             ("--match-repository-id", "R_123"),
             ("--match-base-branch", "feature/app"),
             ("--match-base-commit", "base123"),
+            ("--match-integration-commit", "integration123"),
             ("--match-head-commit", "head123"),
         ];
         for command in [
@@ -959,6 +960,8 @@ mod cli_tests {
             "feature/app",
             "--match-base-commit",
             "base123",
+            "--match-integration-commit",
+            "integration123",
             "--match-head-commit",
             "head123",
         ]);
@@ -974,6 +977,7 @@ mod cli_tests {
                 && identity.match_repository_id == "R_123"
                 && identity.match_base_branch == "feature/app"
                 && identity.match_base_commit == "base123"
+                && identity.match_integration_commit == "integration123"
                 && identity.match_head_commit == "head123"
         ));
 
@@ -990,6 +994,8 @@ mod cli_tests {
             "feature/app",
             "--match-base-commit",
             "base123",
+            "--match-integration-commit",
+            "integration123",
             "--match-head-commit",
             "head123",
         ]);
@@ -1005,6 +1011,7 @@ mod cli_tests {
                 && identity.match_repository_id == "R_123"
                 && identity.match_base_branch == "feature/app"
                 && identity.match_base_commit == "base123"
+                && identity.match_integration_commit == "integration123"
                 && identity.match_head_commit == "head123"
         ));
 
@@ -1021,6 +1028,8 @@ mod cli_tests {
             "feature/app",
             "--match-base-commit",
             "base123",
+            "--match-integration-commit",
+            "integration123",
             "--match-head-commit",
             "head123",
         ]);
@@ -1035,6 +1044,7 @@ mod cli_tests {
                 && identity.match_repository_id == "R_123"
                 && identity.match_base_branch == "feature/app"
                 && identity.match_base_commit == "base123"
+                && identity.match_integration_commit == "integration123"
                 && identity.match_head_commit == "head123"
         ));
     }

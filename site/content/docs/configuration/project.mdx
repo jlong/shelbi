@@ -298,7 +298,7 @@ and how they integrate back. See [the merge command](/docs/cli/merge).
 | --- | --- | --- | --- | --- |
 | `base_branch` | string | no | `default_branch` | Branch new work is based on and merged into. Falls back to the project's `default_branch`. |
 | `branch_prefix` | string | no | GitHub username, then `user` | Prefix for generated task branches when a task omits `branch:` and its workflow does not override the prefix. Shelbi cuts `<branch_prefix>/<task-id>`. |
-| `merge_strategy` | `squash` \| `merge` \| `rebase` | no | `squash` | How `shelbi merge` and Zen's auto-merge integrate a workspace branch. Maps 1:1 onto `gh pr merge --{squash,merge,rebase}`. |
+| `merge_strategy` | `squash` \| `merge` \| `rebase` | no | `squash` | How `shelbi merge` integrates a workspace branch. Zen exact-ref auto-integration currently supports `squash`; other strategies require human PR merge. |
 
 ```yaml
 git:
