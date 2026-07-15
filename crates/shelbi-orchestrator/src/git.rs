@@ -55,6 +55,25 @@ pub(crate) fn run_login_shell_script(host: &Host, script: &str) -> std::io::Resu
     shelbi_ssh::run(host, login_shell_argv(host, script))
 }
 
+/// Like [`run_login_shell_script`], but bound the child's total wall-clock
+/// time: if the login shell (and whatever it spawns) hasn't finished within
+/// `deadline`, it is killed and the call returns `ErrorKind::TimedOut`.
+///
+/// This is the guard the Zen local-check runner uses. A local check is
+/// arbitrary user-supplied shell (`cargo test --workspace`, `npm test`, …);
+/// on a loaded hub such a command can wedge for many minutes — long enough
+/// that a worker looping on verification, or `shelbi zen probe` itself,
+/// appears hung. Without a deadline the wedge propagates all the way up and
+/// stalls the orchestrator; with one, the check fails fast and CI (which
+/// runs the authoritative suite in isolation) stays the source of truth.
+pub(crate) fn run_login_shell_script_with_deadline(
+    host: &Host,
+    script: &str,
+    deadline: std::time::Duration,
+) -> std::io::Result<Output> {
+    shelbi_ssh::run_with_deadline(host, login_shell_argv(host, script), deadline)
+}
+
 /// The argv `run_login_shell_script` hands to `shelbi_ssh::run` for `host`.
 /// Split out so tests can inspect / round-trip the wire without spawning a
 /// real command.
