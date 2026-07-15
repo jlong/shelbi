@@ -1,0 +1,157 @@
+---
+competitor: Herdr
+slug: herdr
+competitorUrl: https://herdr.dev/
+summary: A terminal-native agent multiplexer in Rust. "tmux for agents" with persistent PTYs, SSH reattach, agent-state awareness, and a local socket API.
+---
+
+{/*
+  Herdr (herdr.dev) is the closest neighbor to Shelbi in the whole
+  landscape: both are terminal-native, Rust, persistent, SSH-first agent
+  runtimes. Do not conflate it with Herd (joinherd.ai), the desktop IDE
+  covered in `herd.mdx` — different product, confusingly similar name. The
+  honest difference here is the shape of the work surface, not raw
+  capability, so this page stays scrupulous about Herdr's real strengths.
+*/}
+
+## At a glance
+
+| Dimension          | Shelbi                                       | Herdr                                            |
+| ------------------ | -------------------------------------------- | ------------------------------------------------ |
+| Form factor        | Terminal Kanban + tmux panes                 | Terminal multiplexer (pane grid), mouse-first    |
+| Work surface       | Five-column Kanban with triage and priority  | Live agent panes, no board                       |
+| Scheduler          | LLM orchestrator dispatching from events log | Human-driven multiplexer, the substrate not a scheduler |
+| Review flow        | `review` column, don't merge until signoff   | Live agent handoff, no board-level review gate   |
+| Autonomy           | Zen Mode (auto-promote, self-review, gated merge) | None                                        |
+| Pool               | Fixed declared workers across machines, `prefers_machine` routing | Ad-hoc panes                |
+| Automation API     | Events log + CLI                             | CLI + JSON socket API + agent-to-agent comms + plugin marketplace |
+| Language / binary  | Rust                                         | Rust, single binary                              |
+| License            | MIT                                          | AGPL-3.0 + commercial                            |
+| Maturity           | Newer                                        | ~16.8k stars, v0.7.4                             |
+
+## Where Shelbi excels
+
+### A Kanban board, not a pane grid
+
+Shelbi's surface is a five-column Kanban: `backlog → todo → in_progress →
+review → done`. Work is typed tasks with explicit triage, priority
+(`shelbi task prio --top|--up|--set N`), and assignment (`shelbi task
+assign`). The backlog-versus-ready boundary lets you decide what to work
+on before committing to it.
+
+Herdr's surface is a multiplexer: panes of live agents, mouse-first, with
+agent-state awareness layered on top. It is a grid of running terminals,
+not a queue of typed cards with a review gate. If you want a board that
+tracks what's ready, in flight, and waiting on you, that lives outside
+Herdr.
+
+### An LLM orchestrator that dispatches
+
+The orchestrator is a Claude agent in window 1 of the project's tmux
+session. It tails `~/.shelbi/events.log`, matches lines like `task=fix-login
+todo -> in_progress` against its reaction rules, and dispatches the next
+ready task to whichever worker just freed up. Its instructions live in a
+prompt file you can fork per project.
+
+Herdr multiplexes agents a human drives. It is the substrate that keeps
+agents alive and reachable, not the scheduler that decides what runs next.
+The operator stays the dispatcher.
+
+### Review-first, don't merge until signoff
+
+Finished work lands in a `review` column with the branch ready to inspect,
+and the default is don't merge until a human signs off. A worker signals
+completion by writing its task id to a marker file the hub poller watches;
+the handoff survives machine sleep, network blips, and SSH drops.
+
+Herdr has live handoff between agents, but no board-level review gate. Work
+moves agent to agent in the panes; there is no separate staging column that
+holds a branch until a human promotes it.
+
+### Zen Mode for gated autonomy
+
+Shelbi can act as lead: auto-promote ready work, self-review, and merge
+passing changes through configurable gates (required checks, CI wait,
+danger-path guards). You opt into as much or as little of the loop as you
+trust, and the gates are yours to set.
+
+Herdr has no equivalent autonomous merge loop. It keeps agents running and
+reachable; deciding what merges stays with you at every step.
+
+### A fixed pool that spans machines
+
+Shelbi workers are named slots declared once in project YAML, living across
+however many machines you list. A worker on `devbox` and a worker on `hub`
+show up as named slots the orchestrator routes work to over SSH, and a task
+can pin itself to a host with `prefers_machine: devbox` when it needs a GPU,
+a local model, or a specific build environment.
+
+Herdr spins up panes ad hoc. It reaches any box over SSH, but there is no
+declared roster of named workers or per-task host routing.
+
+### MIT, no AGPL obligations
+
+Shelbi is MIT. For a team that wants to embed, fork, or modify the
+orchestration loop without copyleft obligations, that is a real
+differentiator. Herdr is dual-licensed AGPL-3.0-or-later plus a commercial
+license for organizations that cannot comply with AGPL.
+
+## Where Herdr excels
+
+### More mature and more widely adopted
+
+Herdr is further along its version line than Shelbi, at v0.7.4 with roughly
+16.8k GitHub stars and a single author shipping actively. If proven mileage
+and a large user base matter to you, Herdr has both today.
+
+### A larger automation surface and plugin ecosystem
+
+Herdr exposes a CLI and a local JSON socket API that scripts, tools, and
+agents can use to drive sessions programmatically: spawn panes, read
+output, synchronize work. On top of that sits a GitHub-based plugin
+marketplace the project says carries 150+ community plugins. Shelbi's
+automation surface is the events log and CLI, which is leaner.
+
+### Agent-to-agent socket comms as a first-class primitive
+
+Through that same socket API, Herdr agents can coordinate directly with
+each other, not only with a human operator. If agent-to-agent coordination
+is load-bearing in your workflow, Herdr treats it as a built-in primitive
+rather than something you assemble yourself.
+
+### Mouse-first polish lowers the tmux learning curve
+
+Herdr's pane management is mouse-first, a deliberate departure from the
+keyboard-first tmux and zellij model, with keyboard and mouse both
+first-class. For people who find tmux's muscle memory a barrier, that
+polish is a genuine on-ramp. Shelbi leans on tmux conventions and assumes
+you're comfortable there.
+
+### A simpler mental model when you just want the multiplexer
+
+A pure multiplexer is easier to reason about if all you want is "many
+agents, one terminal, over SSH" without a board or an autonomous loop.
+Herdr's persistent PTYs, tmux-style detach and reattach, restart-restore,
+and reattach from any device (including a phone) deliver exactly that,
+with less to learn than a full orchestration model.
+
+## Choose Shelbi if…
+
+- You want a Kanban queue across machines you already own, with explicit
+  triage, priority, and per-task host routing.
+- Review-before-merge is non-negotiable and you want a staging column that
+  holds a branch until a human signs off.
+- You want the orchestration loop to be inspectable code you can fork per
+  project, not a substrate you drive by hand.
+- You want optional hands-off autonomous merging under your own gates.
+- MIT licensing matters and AGPL obligations are a non-starter.
+
+## Choose Herdr if…
+
+- You want a polished, mouse-first terminal multiplexer for many agents
+  over SSH, and you don't need a task board or an autonomous merge loop.
+- Agent-to-agent socket coordination is load-bearing for your workflow.
+- A larger plugin ecosystem and a more proven, widely-starred tool matter
+  to you today.
+- You want the simplest possible mental model: many agents, one terminal,
+  reattachable from any device.
