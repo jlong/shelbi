@@ -56,7 +56,7 @@ carries:
 ```
 2026-06-22T14:24:03+00:00 task=fix-login backlog -> todo reason=user:cli
 2026-06-22T14:24:11+00:00 task=fix-login todo -> in_progress reason=orchestrator:auto-dispatch_worker=alpha
-2026-06-22T14:31:52+00:00 task=fix-login in_progress -> review reason=worker:review-marker
+2026-06-22T14:31:52+00:00 task=fix-login in_progress -> review reason=workspace:ready-marker
 ```
 
 - `<from-column>` and `<to-column>` are the snake_case status names
@@ -164,7 +164,7 @@ content.
 2026-06-22T14:24:11+00:00 task=fix-login todo -> in_progress reason=orchestrator:auto-dispatch_worker=alpha
 2026-06-22T14:24:11+00:00 worker=alpha awaiting_input -> working
 2026-06-22T14:31:50+00:00 worker=alpha working -> awaiting_input
-2026-06-22T14:31:52+00:00 task=fix-login in_progress -> review reason=worker:review-marker
+2026-06-22T14:31:52+00:00 task=fix-login in_progress -> review reason=workspace:ready-marker
 ```
 
 That five-line burst is what one task moving through the system looks
@@ -187,7 +187,7 @@ consistent set:
 | `user:tui:…`                                       | the Kanban TUI                           | You moved the card with `H`/`L` in the TUI.                                        |
 | `user:promote`                                     | a `--reason` you passed                  | Free-form: anything starting with `user:` reads as "the human chose this."         |
 | `orchestrator:auto-dispatch worker=<name>`         | the orchestrator's `shelbi task start`   | The orchestrator picked a free workspace and dispatched per its routing rules.     |
-| `worker:review-marker`                             | the hub poller                           | The workspace wrote its review-ready marker; the poller promoted the task to review. |
+| `workspace:ready-marker`                           | the hub poller                           | The workspace wrote its ready marker; the poller promoted the task to review. (Historical aliases `workspace:review-marker` and `worker:review-marker` still parse.) |
 
 These aren't enforced by code. They're a convention the orchestrator
 parses to decide whether *it* triggered an event (and shouldn't react)
@@ -196,7 +196,7 @@ attention to today:
 
 - A `user:*` reason on `backlog -> todo` means "newly triaged." Try to
   dispatch.
-- `worker:review-marker` on `in_progress -> review` means "the assigned
+- `workspace:ready-marker` on `in_progress -> review` means "the assigned
   workspace just became free." Find it the next task.
 - `orchestrator:auto-dispatch …` is the orchestrator's own action; it
   doesn't react to it (otherwise it would loop).

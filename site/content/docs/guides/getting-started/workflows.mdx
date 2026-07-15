@@ -662,7 +662,7 @@ workspace's pane. Instead:
 3. If the file is non-empty and names a task that's in an
    `active`-category status for this workspace, the poller moves the
    task into the next `handoff` status, clears the marker, and
-   appends `task=<id> <from> -> <to> reason=worker:review-marker` to
+   appends `task=<id> <from> -> <to> reason=workspace:ready-marker` to
    the events log.
 
 The orchestrator hears about it through its `shelbi events tail
