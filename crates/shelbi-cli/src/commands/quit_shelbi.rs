@@ -14,8 +14,6 @@
 
 use std::path::Path;
 
-use anyhow::Result;
-
 use shelbi_core::Host;
 use shelbi_orchestrator::workspace as orch_workspace;
 
@@ -130,90 +128,12 @@ fn any_user_dirty_line(porcelain: &str) -> bool {
     })
 }
 
-/// Tear down every shelbi tmux session on this host.
-///
-/// First, fan out: ask every live orchestrator pane to write its
-/// `agents/orchestrator/handoff.md` in parallel. Each request runs in
-/// its own thread (capped at 30s by
-/// [`shelbi_orchestrator::handoff::request_orchestrator_handoff`]) so a
-/// multi-project quit doesn't serialize the per-project wait. Files
-/// persist between quit and the next launch; the next instance
-/// ingests + deletes them.
-///
-/// Synchronously: per project, kill workspace panes (local windows +
-/// remote `shelbi-w-*` sessions), clear the zen crash heartbeat so the
-/// next launch doesn't misread the quit as a crash, and append a
-/// `closed reason=user:quit-shelbi` row to events.log. These steps need
-/// shelbi state (project YAML, events.log) and are too involved to
-/// ship to a server-side shell snippet.
-///
-/// Then asynchronously (via `tmux run-shell -b`): kill every
-/// `_shelbi-<name>` stash and every `shelbi-<name>` main session, then
-/// `detach-client` as a flush for clients that were attached to a
-/// non-shelbi session.
-///
-/// The async hop matters: this function runs inside the popup process
-/// spawned by `tmux display-popup -E shelbi __palette …`. The popup's
-/// pane lives inside whichever `shelbi-<name>` session the user
-/// summoned the palette from — so killing that session synchronously
-/// would send SIGHUP to this process before the rest of the teardown
-/// loop could run, leaving the main session alive and the user staring
-/// at a frozen popup. Handing the kills to `tmux run-shell -b` forks
-/// them inside the tmux server process, which is owned by launchd /
-/// the user's shell — independent of any pane or client lifecycle.
-///
-/// Idempotent throughout — `kill-session` on an absent target is a
-/// no-op, and best-effort tmux/SSH errors don't abort the rest of
-/// the teardown.
-pub fn run() -> Result<()> {
-    let listing = list_sessions_listing();
-    let names: Vec<String> = shelbi_project_session_names(&listing).collect();
-
-    // Fan out the handoff requests so multiple projects' orchestrators
-    // can write their handoff in parallel. Each thread is bounded by
-    // the 30s timeout inside `request_orchestrator_handoff`, so the
-    // worst-case wait is ~30s regardless of how many projects are
-    // live. Best-effort — every variant of the outcome is "okay to
-    // proceed" and we don't surface it to the user here.
-    let handoff_threads: Vec<_> = names
-        .iter()
-        .cloned()
-        .map(|name| {
-            std::thread::spawn(move || {
-                let _ = shelbi_orchestrator::handoff::request_orchestrator_handoff(&name);
-            })
-        })
-        .collect();
-    for t in handoff_threads {
-        let _ = t.join();
-    }
-
-    for name in &names {
-        let _ = shelbi_state::zen_clear_crash(name);
-        if let Ok(p) = shelbi_state::load_project(name) {
-            for workspace in &p.workspaces {
-                let Some(machine) = p.machine(&workspace.machine) else {
-                    continue;
-                };
-                let host = machine.host();
-                let Ok(addr) = orch_workspace::workspace_tmux_addr(&p, workspace) else {
-                    continue;
-                };
-                // Remote workspace kills happen over SSH; an unreachable
-                // host returns Err here. Swallow so one unreachable
-                // machine doesn't block the rest of the teardown.
-                let _ = orch_workspace::kill_workspace_pane(&host, &addr, &workspace.name);
-            }
-        }
-        let _ = shelbi_state::append_project_event(name, "closed", "user:quit-shelbi");
-    }
-
-    let script = build_local_teardown_script(&names);
-    if !script.is_empty() {
-        let _ = super::run_tmux(["run-shell", "-b", &script]);
-    }
-
-    Ok(())
+/// Every project name with a live `shelbi-<name>` session, in the order
+/// [`list_managed_projects`] would present them. Used by the progress
+/// path to seed both the handoff fan-out and the backstop teardown
+/// script from one enumeration.
+pub(crate) fn project_names() -> Vec<String> {
+    shelbi_project_session_names(&list_sessions_listing()).collect()
 }
 
 /// Build the shell snippet that tears down the hub's tmux sessions:
@@ -223,10 +143,16 @@ pub fn run() -> Result<()> {
 /// `run-shell` entirely.
 ///
 /// Stderr is silenced (`2>/dev/null`) because `kill-session` on a
-/// session that's already gone — possible if `quit_project` raced —
-/// prints to stderr and would clutter tmux's job log without
-/// signalling anything actionable.
-fn build_local_teardown_script(names: &[String]) -> String {
+/// session that's already gone — possible if `quit_project` raced, or
+/// because the progress path already killed a `_shelbi-<name>` stash in
+/// the foreground — prints to stderr and would clutter tmux's job log
+/// without signalling anything actionable.
+///
+/// This snippet is the interruption backstop: the progress path fires it
+/// via `tmux run-shell -b` as its last act, so the kills are forked into
+/// the tmux server process and survive the popup process dying to its own
+/// SIGHUP when its host session is killed here.
+pub(crate) fn build_local_teardown_script(names: &[String]) -> String {
     if names.is_empty() {
         return String::new();
     }
