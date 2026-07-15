@@ -302,7 +302,7 @@ fn pick_name(path: &Path, force_name: Option<&str>) -> Result<String> {
 /// non-existent paths — we want validation to report the user's typed
 /// path verbatim ("`/tmp/nope` doesn't exist"), not a canonicalized
 /// form they didn't type.
-fn absolutize(cwd: &Path, path: &Path) -> PathBuf {
+pub(crate) fn absolutize(cwd: &Path, path: &Path) -> PathBuf {
     let raw = path.to_string_lossy();
     let expanded: PathBuf = if raw == "~" {
         dirs::home_dir().unwrap_or_else(|| path.to_path_buf())

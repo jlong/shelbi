@@ -72,6 +72,24 @@ pub fn run(project: String) -> Result<()> {
     let (chosen, switch_target, quit_project_confirmed) = loop {
         let chosen = picker_loop(&mut term, &mut state, &keymaps);
         match &chosen {
+            Ok(Some(entry)) if entry.id == "action:add-project" => {
+                // Native ratatui form in the palette's own alt-screen. On a
+                // valid confirm it returns the collected values; on cancel it
+                // returns None and we bounce back into the main picker (state
+                // preserved) so a mis-selection doesn't kick the user out.
+                let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+                match super::add_project::run(&mut term, &keymaps, &cwd)? {
+                    Some(form) => {
+                        // Creation prints to stdout and then opens the new
+                        // project's dashboard, so hand the terminal back first
+                        // (mirrors the edit-dispatch / teardown ownership).
+                        restore_terminal(&mut term)?;
+                        create_and_open_project(form)?;
+                        return Ok(());
+                    }
+                    None => continue,
+                }
+            }
             Ok(Some(entry)) if entry.id == "action:switch-project" => {
                 let target = run_project_picker(&mut term, &project, &keymaps)?;
                 break (chosen, target, false);
@@ -418,6 +436,17 @@ fn build_entries(app: &App, zen_mode: ZenModeState, zen_chord: ZenToggleChord) -
     // `E` / `Edit` / `settings` surfaces them. Placed ahead of the global
     // action trail so "Quit Shelbi" stays the structurally-last entry.
     out.extend(edit_entries(&app.project_name));
+    // Sits with the other project actions. Placed ahead of Switch/Quit so
+    // an empty-query palette reads Add → Switch → Quit top-to-bottom.
+    out.push(Entry {
+        id: "action:add-project".into(),
+        label: "Add project".into(),
+        kind: EntryKind::Action,
+        subtitle: Some("create + register a new project (same as `shelbi init`)".into()),
+        shortcut: None,
+        decoration: None,
+        hidden_until_query: false,
+    });
     out.push(Entry {
         id: "action:switch-project".into(),
         label: "Switch Project".into(),
@@ -1395,6 +1424,34 @@ fn format_active_workspaces(n: usize) -> String {
         1 => "(1 active workspace)".to_string(),
         n => format!("({n} active workspaces)"),
     }
+}
+
+/// Create + register the project the Add-Project dialog collected, then open
+/// its dashboard. Drives the exact `shelbi init` scaffolder
+/// ([`super::init::scaffold_with_prompt`]) non-interactively — root, name, and
+/// config mode are all pinned, so it takes the scripted branches (no prompt)
+/// and the on-disk result is identical to a command-line `shelbi init
+/// --project … --root … --mode …`. On success we open the new project right
+/// away (the natural next step after explicitly adding it), reusing the same
+/// [`switch_to_project`] path the Switch-Project action uses.
+///
+/// Runs after the terminal has been restored, so the scaffolder's progress
+/// lines land on a clean normal-mode terminal.
+fn create_and_open_project(form: super::add_project::AddProjectForm) -> Result<()> {
+    let args = super::init::Args {
+        project: Some(form.name),
+        root: Some(form.root),
+        mode: Some(form.mode),
+        runner: None,
+        default_branch: None,
+        github_url: None,
+        workspace_count: None,
+        workspace_preset: None,
+        orchestrator_runner: None,
+        pick_up: false,
+    };
+    let resolved = super::init::scaffold_with_prompt(args)?;
+    switch_to_project(&resolved.name)
 }
 
 /// Launch (or focus) `target`'s dashboard and move the attached client to it.
