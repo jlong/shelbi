@@ -18,6 +18,7 @@ const DOCS = [
 const COMPARE = [
   { label: "Conductor", href: "/vs/conductor" },
   { label: "Herd", href: "/vs/herd" },
+  { label: "Herdr", href: "/vs/herdr" },
   { label: "OpenHands", href: "/vs/openhands" },
   { label: "Devin", href: "/vs/devin" },
   { label: "Sketch.dev", href: "/vs/sketch" },
