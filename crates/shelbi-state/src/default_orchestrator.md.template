@@ -143,11 +143,19 @@ Your live feed is `~/.shelbi/events.log`. The line shapes you'll see most:
   many workspaces have no active-category task. See the heartbeat reaction
   rule for how they force a skipped scan back into the loop under Zen.
 
-You read it via `shelbi events tail --follow`. Each new line is a trigger
-that may demand a dispatch. Pattern-match task lines on the
-`from_category=` / `to_category=` tokens, not the literal `<from> -> <to>`
-status names — that's what keeps the reaction rules below correct under
-custom workflows.
+You consume it via `shelbi orchestrator events next --follow` — a durable
+claim/ack feed over the same stream. It emits normalized event *batches* as
+JSON, each tagged with a stable `delivery_id`
+(`shelbi-event/<project>/<from>-<through>`). Reading a batch does **not**
+advance the durable cursor: the batch stays in flight until you run
+`shelbi orchestrator events ack <delivery-id>`, and until then it is
+re-delivered verbatim (same delivery id) on any restart. That is the
+at-least-once guarantee — an event you have not yet acked survives a crash
+between reading it and reacting to it, unlike a raw tail. Each batch carries
+the exact `ack` command to run in its `ack` field. Pattern-match task events on
+the `from_category=` / `to_category=` metadata, not the literal
+`<from> -> <to>` status names — that's what keeps the reaction rules below
+correct under custom workflows.
 
 ## Bootstrap on session start
 
@@ -177,46 +185,58 @@ before answering the user:
      (write-then-delete), so re-running the same command later will
      not re-surface the note; treat any handoff block you see as
      one-shot guidance from a previous session or from the user.
-2. Start `shelbi events tail --follow` in the background using the Bash
-   tool's `run_in_background: true`. Watch it with `Monitor` — every
-   emitted line is a trigger you must consider. `project=<name>
-   heartbeat` lines are emitted by the hub poller on an adaptive cadence
-   (not user input) — standard while work is in flight, backing off on a
-   quiescent board; they fire the bounded sweep in the reaction rule
-   below and otherwise produce no output.
+2. Start `shelbi orchestrator events next --follow` in the background using
+   the Bash tool's `run_in_background: true`. Watch it with `Monitor` — every
+   emitted batch is a trigger you must consider. For each batch: apply every
+   event's facts through the reaction rules below, **then** run the batch's
+   `ack` command (`shelbi orchestrator events ack <delivery-id>`) so the feed
+   advances to the next batch. Ack only *after* reacting — a crash before the
+   ack re-delivers the same batch on restart, which is exactly the guarantee
+   you want. `project=<name> heartbeat` events are emitted by the hub poller
+   on an adaptive cadence (not user input) — standard while work is in flight,
+   backing off on a quiescent board; they fire the bounded sweep in the
+   reaction rule below and otherwise produce no output. (Ack them too — an
+   un-acked heartbeat batch stalls the feed.)
 
-Keep the snapshot in your head and update it as events arrive. If the tail
-process dies (Monitor reports the task ended), restart it on your next
-turn.
+Keep the snapshot in your head and update it as batches arrive. If the feed
+process dies (Monitor reports the task ended), restart it on your next turn;
+it resumes from the durable cursor, so any batch you had not acked is
+re-delivered.
 
-## Polling-only event drain
+## Polling-only claim/ack drain
 
 Some runners cannot receive asynchronous Monitor callbacks while they are
 thinking or answering. In those polling-only harnesses, the background
-`shelbi events tail --follow` process is only a compatibility watch: before
-every user-facing reply, drain project events yourself and treat the batch as
-new input before you answer.
+`shelbi orchestrator events next --follow` feed is only a compatibility watch:
+before every user-facing reply, claim the pending batch yourself and treat it
+as new input before you answer.
 
-Use the durable cursor primitive:
+Claim the next batch without advancing the cursor:
 
-    shelbi orchestrator events drain
+    shelbi orchestrator events next --follow
 
-The cursor is persisted for you in the project config dir
-(`~/.shelbi/projects/<name>/event-cursor`), so `drain` resumes from and
-advances it automatically — no cwd-relative bookkeeping, and it works the
-same no matter which directory your shell happens to be sitting in. Pass
-`--cursor <N>` only to replay from an explicit offset (e.g. `--cursor 0` for
-the whole log).
+reads continuously; for a single turn-boundary claim you can instead read one
+batch and ack it. The durable cursor is persisted for you in the project
+config dir (`~/.shelbi/projects/<name>/event-cursor`) and is advanced **only**
+by:
 
-If the JSON response contains events, apply the normal reaction rules below
-first, then produce your reply. If the command is unavailable, fall back to
-reading `~/.shelbi/events.log` from the last stored byte offset and keep the
-same cursor discipline so events are neither missed nor replayed.
+    shelbi orchestrator events ack <delivery-id>
 
-The drain layer only delivers facts. Do not invent scheduling inside the drain
-step; after each batch, decide normally whether to dispatch, Zen-scan,
-surface a pane death, or simply answer the user. The JSON `kind`
-field distinguishes `task_transition`, `workspace_transition`, `heartbeat`,
+So the discipline is claim → react → ack, once per turn. If you crash between
+claim and ack, the same batch (same delivery id) comes back — apply its facts
+and ack; a duplicate ack of an already-acked batch is a harmless no-op, so you
+never miss or replay an event.
+
+> Legacy: `shelbi orchestrator events drain` still exists and advances the
+> cursor on read (no ack). It is kept only for compatibility with harnesses
+> predating the claim/ack feed; prefer `events next --follow` + `events ack`.
+> `--cursor <N>` on either replays from an explicit offset (e.g. `--cursor 0`
+> for the whole log).
+
+The feed only delivers facts. Do not invent scheduling inside the claim step;
+after each batch, decide normally whether to dispatch, Zen-scan, surface a
+pane death, or simply answer the user. Each event's JSON `kind` field
+distinguishes `task_transition`, `workspace_transition`, `heartbeat`,
 `pane_death`, `send`, and other event classes, and the original line is
 preserved in `raw`.
 
@@ -419,8 +439,13 @@ The `shelbi` CLI is on your PATH. Commands you'll use most:
 - `shelbi task prio <id> --top|--up|--down|--bottom|--set N` — reorder.
 - `shelbi workspace list` — see the pool and what each workspace is on.
 - `shelbi workspace stop <name>` — kill a workspace's pane.
-- `shelbi events tail [--follow]` — read or stream the event log. Use
-  `--follow` with `run_in_background: true` for the live feed.
+- `shelbi orchestrator events next --follow` — the durable claim/ack event
+  feed. Run with `run_in_background: true` and watch it with `Monitor`; ack
+  each batch with `shelbi orchestrator events ack <delivery-id>` after
+  reacting. This is your primary live watch (see "Bootstrap on session start").
+- `shelbi events tail [--follow]` — raw, un-acked event-log view for humans
+  and quick inspection. Not the durable watch; use the `orchestrator events`
+  feed for auto-dispatch.
 - `shelbi zen status` — current mode + configured local checks.
 - `shelbi zen scan` — print one mechanically-eligible `backlog`-category
   task id per line (input to your auto-promote judgment).
