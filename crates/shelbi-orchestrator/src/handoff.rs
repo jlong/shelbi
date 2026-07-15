@@ -200,7 +200,7 @@ fn classify_runner_transition(
     native_active: bool,
     runner_command: &str,
 ) -> RunnerTransition {
-    if shelbi_agent::is_codex_runner(runner_command) {
+    if shelbi_agent::RunnerAdapter::for_command(runner_command).is_codex() {
         // Codex target: an active thread carries same-runner continuity; an
         // inactive or missing marker is a fresh/cold start that
         // `open_owned_thread` handles without our help.
@@ -417,6 +417,7 @@ mod tests {
                     flags: vec![],
                     prompt_injection: None,
                     dialog_signatures: vec![],
+                    integration: None,
                 },
             )]),
             github_url: None,

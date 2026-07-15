@@ -35,6 +35,9 @@ pub mod workspace;
 pub mod zen;
 
 #[cfg(test)]
+mod golden;
+
+#[cfg(test)]
 pub(crate) mod test_lock {
     //! Shared mutex for any orchestrator-crate test that mutates the
     //! process-wide `SHELBI_HOME` env var. `actions.rs` and `lifecycle.rs`
@@ -1173,7 +1176,7 @@ fn orchestrator_launch_command(
     workdir: &std::path::Path,
     first_launch_repo: Option<&std::path::Path>,
 ) -> String {
-    if is_codex_runner(spec) {
+    if shelbi_agent::RunnerAdapter::for_spec(spec).is_codex() {
         codex_bridge_cmd(shelbi_bin, project_name, first_launch_repo.is_some())
     } else {
         let bootstrap_prompt = orchestrator_bootstrap_prompt(
@@ -1216,13 +1219,14 @@ fn launch_with_bootstrap(
     bootstrap_prompt: &str,
 ) -> String {
     let launch = shelbi_agent::launch_command(spec);
-    if is_claude_runner(spec) {
+    let adapter = shelbi_agent::RunnerAdapter::for_spec(spec);
+    if adapter.is_claude() {
         format!(
             "{launch} --append-system-prompt \"$(cat {rel})\" {prompt}",
             rel = shelbi_agent::shell_escape(ORCH_AGENT_INSTRUCTIONS_REL),
             prompt = shelbi_agent::shell_escape(bootstrap_prompt),
         )
-    } else if is_codex_runner(spec) {
+    } else if adapter.is_codex() {
         codex_standalone_launch(spec, project_name, workdir, bootstrap_prompt)
     } else {
         launch
@@ -1245,20 +1249,6 @@ pub(crate) fn codex_standalone_launch(
         "{launch} {prompt}",
         prompt = codex_orchestrator_prompt_arg(project_name, workdir, bootstrap_prompt),
     )
-}
-
-fn is_claude_runner(spec: &shelbi_core::AgentRunnerSpec) -> bool {
-    std::path::Path::new(&spec.command)
-        .file_name()
-        .and_then(|s| s.to_str())
-        == Some("claude")
-}
-
-fn is_codex_runner(spec: &shelbi_core::AgentRunnerSpec) -> bool {
-    std::path::Path::new(&spec.command)
-        .file_name()
-        .and_then(|s| s.to_str())
-        == Some("codex")
 }
 
 fn codex_orchestrator_prompt_arg(
@@ -2101,6 +2091,7 @@ mod pane_cmd_tests {
             flags: vec![],
             prompt_injection: None,
             dialog_signatures: vec![],
+            integration: None,
         };
         let out = launch_with_bootstrap(
             &spec,
@@ -2220,6 +2211,7 @@ mod pane_cmd_tests {
             flags: vec![],
             prompt_injection: None,
             dialog_signatures: vec![],
+            integration: None,
         };
         let repo = std::path::Path::new("/tmp/my repo");
         let out = orchestrator_launch_command(
@@ -2242,6 +2234,7 @@ mod pane_cmd_tests {
             flags: vec!["--permission-mode".into(), "auto".into()],
             prompt_injection: None,
             dialog_signatures: vec![],
+            integration: None,
         };
         let out = launch_with_bootstrap(
             &spec,
@@ -2276,6 +2269,7 @@ mod pane_cmd_tests {
             flags: vec!["--print".into()],
             prompt_injection: None,
             dialog_signatures: vec![],
+            integration: None,
         };
         let out = launch_with_bootstrap(
             &spec,
@@ -2320,6 +2314,7 @@ mod pane_cmd_tests {
             flags: vec!["--dangerously-bypass-approvals-and-sandbox".into()],
             prompt_injection: None,
             dialog_signatures: vec![],
+            integration: None,
         };
         let out = orchestrator_launch_command(
             "/usr/local/bin/shelbi",
@@ -2338,6 +2333,7 @@ mod pane_cmd_tests {
             flags: vec![],
             prompt_injection: None,
             dialog_signatures: vec![],
+            integration: None,
         };
         let first = orchestrator_launch_command(
             "/usr/local/bin/shelbi",
@@ -2377,6 +2373,7 @@ mod pane_cmd_tests {
             flags: vec!["--foo".into()],
             prompt_injection: None,
             dialog_signatures: vec![],
+            integration: None,
         };
         let out = launch_with_bootstrap(
             &spec,
@@ -2396,6 +2393,7 @@ mod pane_cmd_tests {
             flags: vec![],
             prompt_injection: None,
             dialog_signatures: vec![],
+            integration: None,
         };
         let out = launch_with_bootstrap(
             &spec,
@@ -2416,6 +2414,7 @@ mod pane_cmd_tests {
             flags: vec![],
             prompt_injection: None,
             dialog_signatures: vec![],
+            integration: None,
         };
         let out = launch_with_bootstrap(
             &spec,
@@ -3083,6 +3082,7 @@ mod reload_target_tmux_tests {
                     flags: vec![],
                     prompt_injection: None,
                     dialog_signatures: vec![],
+                    integration: None,
                 },
             )]),
             github_url: None,
@@ -3584,6 +3584,7 @@ mod reload_workspace_tmux_tests {
                 flags: vec![],
                 prompt_injection: None,
                 dialog_signatures: vec![],
+                integration: None,
             },
         );
         let project = Project {

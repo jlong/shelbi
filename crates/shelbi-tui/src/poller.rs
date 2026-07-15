@@ -697,7 +697,7 @@ fn poll_one(
     // modal and is commonly clobbered again during resume.
     let runner_is_claude = project
         .runner(&workspace.runner)
-        .is_some_and(|runner| shelbi_agent::is_claude_runner(&runner.command));
+        .is_some_and(|runner| shelbi_agent::RunnerAdapter::for_spec(runner).is_claude());
     if !runner_is_claude && *limit_resume != LimitResumeState::Idle {
         if limit_resume.tracked_task().is_some() {
             if let Err(e) = append_limit_resume_event(
@@ -1581,7 +1581,7 @@ fn limit_resume_eligible_now(project_name: &str, workspace_name: &str, task_id: 
     };
     let runner_is_claude = project
         .runner(&workspace.runner)
-        .is_some_and(|runner| shelbi_agent::is_claude_runner(&runner.command));
+        .is_some_and(|runner| shelbi_agent::RunnerAdapter::for_spec(runner).is_claude());
     runner_is_claude && current_task_for(&project, workspace_name).as_deref() == Some(task_id)
 }
 
@@ -2972,6 +2972,7 @@ mod tests {
                 flags: vec![],
                 prompt_injection: None,
                 dialog_signatures: vec![],
+                integration: None,
             },
         );
         Project {

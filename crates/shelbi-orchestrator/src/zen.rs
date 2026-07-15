@@ -2239,6 +2239,7 @@ mod pr_create_tests {
                 flags: Vec::new(),
                 prompt_injection: None,
                 dialog_signatures: Vec::new(),
+                integration: None,
             },
         );
         Project {
@@ -7439,6 +7440,7 @@ mod probe_tests {
                 flags: vec![],
                 prompt_injection: None,
                 dialog_signatures: vec![],
+                integration: None,
             },
         );
         Project {

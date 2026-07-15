@@ -220,7 +220,7 @@ pub fn run_codex_bridge(project_name: &str, first_launch: bool) -> Result<()> {
         .runner(&project.orchestrator.runner)
         .ok_or_else(|| Error::UnknownRunner(project.orchestrator.runner.clone()))?
         .clone();
-    if !shelbi_agent::is_codex_runner(&runner.command) {
+    if !shelbi_agent::RunnerAdapter::for_spec(&runner).is_codex() {
         return Err(Error::Other(format!(
             "orchestrator runner `{}` is not Codex",
             project.orchestrator.runner
@@ -3930,6 +3930,7 @@ mod tests {
             ],
             prompt_injection: None,
             dialog_signatures: vec![],
+            integration: None,
         };
         let workdir = Path::new("/tmp/shelbi project");
         let socket = Path::new("/tmp/shelbi-runtime/app.sock");

@@ -1,0 +1,1 @@
+claude --permission-mode auto --append-system-prompt "$(cat .claude/agent-instructions.md)"

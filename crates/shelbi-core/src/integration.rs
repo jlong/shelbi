@@ -45,3 +45,24 @@ impl fmt::Display for IntegrationMode {
         formatter.write_str(self.as_str())
     }
 }
+
+/// The transport tier Shelbi has with a runner along each contract axis — the
+/// per-runner capability record the adapter publishes.
+///
+/// Every field is one of [`IntegrationMode`]'s three tiers. This exists to
+/// make the runner's integration profile a single inspectable value (feeding
+/// the same surfacing as [`IntegrationMode`]); nothing in the scheduler
+/// branches on it. Build one with [`crate::RunnerKind::capabilities`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CapabilityLadder {
+    /// Delivering the initial task context / prompt into the pane.
+    pub context_delivery: IntegrationMode,
+    /// Waking the agent when a board event arrives.
+    pub event_wake: IntegrationMode,
+    /// Reading the agent's live state back (pane-title markers, thread state).
+    pub state_observation: IntegrationMode,
+    /// Pushing hub→workspace messages to the agent.
+    pub message_delivery: IntegrationMode,
+    /// Restoring prior context after a pane restart.
+    pub resume: IntegrationMode,
+}

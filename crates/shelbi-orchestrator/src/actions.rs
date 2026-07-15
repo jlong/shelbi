@@ -1476,6 +1476,7 @@ mod tests {
                 flags: vec![],
                 prompt_injection: None,
                 dialog_signatures: vec![],
+                integration: None,
             },
         );
         Project {
@@ -1543,6 +1544,7 @@ mod tests {
                 flags: vec![],
                 prompt_injection: None,
                 dialog_signatures: vec![],
+                integration: None,
             },
         );
         let project = Project {
@@ -1625,6 +1627,7 @@ mod tests {
                 flags: vec![],
                 prompt_injection: None,
                 dialog_signatures: vec![],
+                integration: None,
             },
         );
         let project = Project {
@@ -1699,6 +1702,7 @@ mod tests {
                 flags: vec![],
                 prompt_injection: None,
                 dialog_signatures: vec![],
+                integration: None,
             },
         );
         let project = Project {
@@ -1997,6 +2001,7 @@ mod tests {
                 flags: vec![],
                 prompt_injection: None,
                 dialog_signatures: vec![],
+                integration: None,
             },
         );
         Project {

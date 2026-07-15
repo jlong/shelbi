@@ -138,12 +138,11 @@ fn workspace_integration_modes(
 /// markers from (Claude Code, Codex) is `conventional`; an unrecognized runner
 /// is `degraded` (polling contract only).
 fn workspace_integration_mode(runner_command: &str) -> IntegrationMode {
-    if shelbi_agent::is_claude_runner(runner_command)
-        || shelbi_agent::is_codex_runner(runner_command)
-    {
-        IntegrationMode::Conventional
-    } else {
-        IntegrationMode::Degraded
+    match shelbi_agent::RunnerAdapter::for_command(runner_command).kind() {
+        shelbi_core::RunnerKind::Claude | shelbi_core::RunnerKind::Codex => {
+            IntegrationMode::Conventional
+        }
+        shelbi_core::RunnerKind::Generic => IntegrationMode::Degraded,
     }
 }
 

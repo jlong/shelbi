@@ -2673,6 +2673,7 @@ mod tests {
                 flags: vec![],
                 prompt_injection: None,
                 dialog_signatures: vec![],
+                integration: None,
             },
         );
         Project {

@@ -859,6 +859,7 @@ mod tests {
             flags: vec!["-c".into(), "exit 0".into()],
             prompt_injection: None,
             dialog_signatures: vec![],
+            integration: None,
         };
         let project = fixture_project("demo", machine.clone(), workspace.clone(), runner);
 
@@ -920,6 +921,7 @@ mod tests {
             flags: vec!["-c".into(), cmd],
             prompt_injection: None,
             dialog_signatures: vec![],
+            integration: None,
         };
         let project = fixture_project("demo", machine.clone(), workspace.clone(), runner);
 
@@ -968,6 +970,7 @@ mod tests {
             flags: vec!["-c".into(), "exit 42".into()],
             prompt_injection: None,
             dialog_signatures: vec![],
+            integration: None,
         };
         let project = fixture_project("demo", machine.clone(), workspace.clone(), runner);
 
@@ -1335,6 +1338,7 @@ mod tests {
             ],
             prompt_injection: None,
             dialog_signatures: vec![],
+            integration: None,
         };
         let project = fixture_project("demo", machine.clone(), workspace.clone(), runner);
 
@@ -1385,6 +1389,7 @@ mod tests {
             flags: vec!["-c".into(), format!("touch {}", marker.display())],
             prompt_injection: None,
             dialog_signatures: vec![],
+            integration: None,
         };
         let project = fixture_project("demo", machine.clone(), workspace.clone(), runner);
 
@@ -1444,6 +1449,7 @@ mod tests {
             flags: vec!["-c".into(), "touch agent-ran".into()],
             prompt_injection: None,
             dialog_signatures: vec![],
+            integration: None,
         };
         let project = fixture_project("demo", machine.clone(), workspace.clone(), runner);
 
@@ -1519,6 +1525,7 @@ mod tests {
                 ),
             ],
             prompt_injection: None, dialog_signatures: vec![],
+            integration: None,
         };
         let project = fixture_project("demo", machine.clone(), workspace.clone(), runner);
 
@@ -1623,6 +1630,7 @@ mod tests {
             flags: vec!["-c".into(), mark_cmd],
             prompt_injection: None,
             dialog_signatures: vec![],
+            integration: None,
         };
         let project = fixture_project("demo", machine.clone(), workspace.clone(), runner);
 
@@ -1692,6 +1700,7 @@ mod tests {
             flags: vec!["-c".into(), stale_plant],
             prompt_injection: None,
             dialog_signatures: vec![],
+            integration: None,
         };
         let project = fixture_project("demo", machine.clone(), workspace.clone(), runner);
 
@@ -1749,6 +1758,7 @@ mod tests {
             flags: vec!["-c".into(), "exit 0".into()],
             prompt_injection: None,
             dialog_signatures: vec![],
+            integration: None,
         };
         let project = fixture_project("demo", machine.clone(), workspace.clone(), runner);
 
@@ -1818,6 +1828,7 @@ mod tests {
             ],
             prompt_injection: None,
             dialog_signatures: vec![],
+            integration: None,
         };
         let project = fixture_project("demo", machine.clone(), workspace.clone(), runner);
 

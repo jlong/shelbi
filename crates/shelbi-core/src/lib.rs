@@ -10,7 +10,7 @@ pub mod workflow;
 pub mod workspace_names;
 
 pub use error::{Error, Result};
-pub use integration::IntegrationMode;
+pub use integration::{CapabilityLadder, IntegrationMode};
 pub use model::{
     checks_for_task, checks_for_task_in_workflow, ci_timeout_for_workflow,
     danger_paths_for_project, danger_paths_for_workflow, default_dialog_signatures,
@@ -20,7 +20,8 @@ pub use model::{
     AgentRunnerSpec, Column, ConfigMode, DialogSignature, ForwardMode, GitConfig, HeartbeatConfig,
     Host, Machine, MachineKind, MergeStrategy, OrchestratorSpec, ParamDiagnostic, Project,
     ProjectShape,
-    PromptInjectionKind, PromptInjectionSpec, Session, SessionProject, Status, Task, TaskZenConfig,
+    PromptInjectionKind, PromptInjectionSpec, RunnerKind, Session, SessionProject, Status, Task,
+    TaskZenConfig,
     TmuxAddr, WorkspaceSpec, ZenChecks, ZenConfig, ZenDangerPaths, BUILTIN_DANGER_PATHS,
     DEFAULT_WORKFLOW_NAME, HEARTBEAT_DEFAULT, KNOWN_OPTIONAL_TASK_FIELDS, LOCAL_PROJECT_FIELDS,
     MAX_TASK_ID_LEN, SHARED_PROJECT_FIELDS, SUBTASK_WORKFLOW_NAME, TASK_WORKFLOW_NAME,

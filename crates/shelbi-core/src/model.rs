@@ -217,29 +217,31 @@ impl DialogSignature {
 /// option) rather than a bare substring, and drives a first-class *paused*
 /// workspace state (⏸ badge) instead of a generic `blocked` advisory.
 pub fn default_dialog_signatures(command: &str) -> Vec<DialogSignature> {
-    let base = Path::new(command)
-        .file_name()
-        .and_then(|s| s.to_str())
-        .unwrap_or(command);
-    match base {
-        "claude" => vec![
+    match RunnerKind::from_command(command) {
+        RunnerKind::Claude => vec![
             DialogSignature::new("trust", "Do you trust the files"),
             DialogSignature::new("trust", "trust this folder"),
             DialogSignature::new("permission", "Enter to confirm"),
         ],
-        _ => Vec::new(),
+        RunnerKind::Codex | RunnerKind::Generic => Vec::new(),
     }
 }
 
 pub fn default_prompt_injection(command: &str) -> PromptInjectionSpec {
-    let base = Path::new(command)
-        .file_name()
-        .and_then(|s| s.to_str())
-        .unwrap_or(command);
-    match base {
-        "claude" | "codex" => PromptInjectionSpec::positional_arg(),
-        "aider" => PromptInjectionSpec::flag_file("--message-file"),
-        _ => PromptInjectionSpec::stdin(),
+    match RunnerKind::from_command(command) {
+        RunnerKind::Claude | RunnerKind::Codex => PromptInjectionSpec::positional_arg(),
+        // Among unrecognized runners, `aider` reads its prompt from a file;
+        // every other runner gets the stdin default.
+        RunnerKind::Generic => {
+            let base = Path::new(command)
+                .file_name()
+                .and_then(|s| s.to_str())
+                .unwrap_or(command);
+            match base {
+                "aider" => PromptInjectionSpec::flag_file("--message-file"),
+                _ => PromptInjectionSpec::stdin(),
+            }
+        }
     }
 }
 
@@ -1038,6 +1040,100 @@ pub struct AgentRunnerSpec {
     /// a rebuild.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub dialog_signatures: Vec<DialogSignature>,
+    /// Explicit runner-adapter selection. When set, this overrides the
+    /// basename auto-detection so a wrapper executable (whose basename Shelbi
+    /// wouldn't recognize) can still pin the Claude / Codex / generic contract.
+    /// Absent (the default) means "detect from `command`" and is elided from
+    /// the wire form, so existing runner specs round-trip byte-for-byte. See
+    /// [`RunnerKind::detect`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub integration: Option<RunnerKind>,
+}
+
+/// Which built-in runner adapter drives a runner. Auto-detected from the
+/// runner's executable basename, or pinned explicitly via the runner spec's
+/// [`integration`](AgentRunnerSpec::integration) field.
+///
+/// This is the single classification that the launch-flag assembly, submit
+/// profile, readiness probe, resume strategy, hook wiring, and capability
+/// ladder all key off — every one of those decisions reasons about a
+/// `RunnerKind` (in practice through `shelbi_agent::RunnerAdapter`) rather than
+/// re-deriving the basename itself.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum RunnerKind {
+    Claude,
+    Codex,
+    Generic,
+}
+
+impl RunnerKind {
+    /// Classify a runner purely by its executable basename — the historical
+    /// auto-detection. Keyed off the path basename so `/usr/local/bin/claude`
+    /// classifies the same as a bare `claude`.
+    ///
+    /// This is the **one** place the `claude` / `codex` basenames are matched;
+    /// a grep-guard test keeps the comparison from spreading back out across
+    /// the workspace.
+    pub fn from_command(command: &str) -> Self {
+        match Path::new(command).file_name().and_then(|s| s.to_str()) {
+            Some("claude") => RunnerKind::Claude,
+            Some("codex") => RunnerKind::Codex,
+            _ => RunnerKind::Generic,
+        }
+    }
+
+    /// Resolve the adapter kind for a runner spec: the explicit `integration:`
+    /// field when set, otherwise basename auto-detection. The field is an
+    /// override rather than a supplement, so a wrapper binary Shelbi wouldn't
+    /// recognize by name still selects the intended contract.
+    pub fn detect(spec: &AgentRunnerSpec) -> Self {
+        spec.integration
+            .unwrap_or_else(|| Self::from_command(&spec.command))
+    }
+
+    /// The lowercase wire / diagnostic token for this kind — matches the
+    /// `integration:` YAML values.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            RunnerKind::Claude => "claude",
+            RunnerKind::Codex => "codex",
+            RunnerKind::Generic => "generic",
+        }
+    }
+
+    /// The per-contract transport tiers Shelbi has with this runner. Purely
+    /// descriptive (it feeds the integration-health surfacing, not the
+    /// scheduler): Claude runs the verified tmux-submission + OSC-hook
+    /// `conventional` contract on every axis; Codex matches it except that it
+    /// has no verified hook push, so its message delivery falls to `degraded`
+    /// polling; an unrecognized runner is `degraded` throughout.
+    pub fn capabilities(self) -> crate::CapabilityLadder {
+        use crate::IntegrationMode::{Conventional, Degraded};
+        match self {
+            RunnerKind::Claude => crate::CapabilityLadder {
+                context_delivery: Conventional,
+                event_wake: Conventional,
+                state_observation: Conventional,
+                message_delivery: Conventional,
+                resume: Conventional,
+            },
+            RunnerKind::Codex => crate::CapabilityLadder {
+                context_delivery: Conventional,
+                event_wake: Conventional,
+                state_observation: Conventional,
+                message_delivery: Degraded,
+                resume: Conventional,
+            },
+            RunnerKind::Generic => crate::CapabilityLadder {
+                context_delivery: Degraded,
+                event_wake: Degraded,
+                state_observation: Degraded,
+                message_delivery: Degraded,
+                resume: Degraded,
+            },
+        }
+    }
 }
 
 impl AgentRunnerSpec {
@@ -3017,6 +3113,7 @@ workspace_settings_template: /etc/shelbi/p.json
                 flags: vec![],
                 prompt_injection: None,
                 dialog_signatures: vec![],
+                integration: None,
             },
         );
         let project = Project {
@@ -3125,6 +3222,7 @@ workspaces:
                 flags: vec![],
                 prompt_injection: None,
                 dialog_signatures: vec![],
+                integration: None,
             },
         );
         let machine = |name: &str| Machine {
@@ -3382,6 +3480,7 @@ workspaces:
                 flags: vec![],
                 prompt_injection: None,
                 dialog_signatures: vec![],
+                integration: None,
             },
         );
         Project {
@@ -4001,6 +4100,7 @@ updated_at: 2026-06-19T00:00:00Z
             flags: vec![],
             prompt_injection: None,
             dialog_signatures: vec![],
+            integration: None,
         };
         assert_eq!(
             spec.effective_dialog_signatures(),
@@ -4015,6 +4115,7 @@ updated_at: 2026-06-19T00:00:00Z
             flags: vec![],
             prompt_injection: None,
             dialog_signatures: vec![custom.clone()],
+            integration: None,
         };
         assert_eq!(spec.effective_dialog_signatures(), vec![custom]);
     }
@@ -4026,6 +4127,7 @@ updated_at: 2026-06-19T00:00:00Z
             flags: vec![],
             prompt_injection: None,
             dialog_signatures: vec![DialogSignature::new("usage-limit", "Stop and wait")],
+            integration: None,
         };
         let y = serde_yaml::to_string(&spec).unwrap();
         assert!(y.contains("dialog_signatures"), "got {y:?}");
@@ -4040,6 +4142,51 @@ updated_at: 2026-06-19T00:00:00Z
             !y2.contains("dialog_signatures"),
             "should be elided: {y2:?}"
         );
+    }
+
+    #[test]
+    fn integration_field_is_backward_compatible_and_overrides_detection() {
+        // Absent field: basename auto-detection, and the key is elided on the
+        // way back out so existing runner specs round-trip byte-for-byte.
+        let auto: AgentRunnerSpec = serde_yaml::from_str("command: codex\n").unwrap();
+        assert_eq!(auto.integration, None);
+        assert_eq!(RunnerKind::detect(&auto), RunnerKind::Codex);
+        let y = serde_yaml::to_string(&auto).unwrap();
+        assert!(!y.contains("integration"), "should be elided: {y:?}");
+
+        // Explicit field overrides basename detection: a wrapper executable
+        // whose basename Shelbi wouldn't recognize still selects the Claude
+        // adapter.
+        let pinned: AgentRunnerSpec =
+            serde_yaml::from_str("command: my-claude-wrapper\nintegration: claude\n").unwrap();
+        assert_eq!(pinned.integration, Some(RunnerKind::Claude));
+        assert_eq!(RunnerKind::detect(&pinned), RunnerKind::Claude);
+        // ...and it round-trips through YAML as the lowercase token.
+        let y = serde_yaml::to_string(&pinned).unwrap();
+        assert!(y.contains("integration: claude"), "got {y:?}");
+        let back: AgentRunnerSpec = serde_yaml::from_str(&y).unwrap();
+        assert_eq!(back.integration, Some(RunnerKind::Claude));
+
+        // The field can also force the generic contract onto a recognized
+        // basename.
+        let generic: AgentRunnerSpec =
+            serde_yaml::from_str("command: claude\nintegration: generic\n").unwrap();
+        assert_eq!(RunnerKind::detect(&generic), RunnerKind::Generic);
+    }
+
+    #[test]
+    fn runner_kind_capabilities_match_the_documented_contract() {
+        use crate::IntegrationMode::{Conventional, Degraded};
+        assert_eq!(RunnerKind::Claude.capabilities().message_delivery, Conventional);
+        assert_eq!(RunnerKind::Claude.capabilities().resume, Conventional);
+        // Codex matches the conventional contract except message delivery,
+        // which falls to degraded polling (no verified hook push).
+        assert_eq!(RunnerKind::Codex.capabilities().context_delivery, Conventional);
+        assert_eq!(RunnerKind::Codex.capabilities().message_delivery, Degraded);
+        // Generic runners are degraded on every axis.
+        let g = RunnerKind::Generic.capabilities();
+        assert_eq!(g.context_delivery, Degraded);
+        assert_eq!(g.resume, Degraded);
     }
 
     #[test]
@@ -4540,6 +4687,7 @@ git:
                 flags: vec!["--verbose".into()],
                 prompt_injection: None,
                 dialog_signatures: vec![],
+                integration: None,
             },
         );
         Project {
