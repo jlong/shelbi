@@ -7,7 +7,7 @@
 //! (`session_id`, `--resume`, streaming JSON), but the v1 surface stays
 //! intentionally minimal.
 
-use shelbi_core::AgentRunnerSpec;
+use shelbi_core::{AgentRunnerSpec, CapabilityLadder, RunnerKind};
 
 /// POSIX shell-quoting, re-exported from `shelbi-core` so the historical
 /// `shelbi_agent::shell_escape` path keeps working for the command-string
@@ -26,23 +26,144 @@ pub fn launch_command(spec: &AgentRunnerSpec) -> String {
     parts.join(" ")
 }
 
-/// Whether `command` launches Claude Code. Keyed off the path basename so a
-/// runner declared as `/usr/local/bin/claude` classifies the same as a bare
-/// `claude`.
-pub fn is_claude_runner(command: &str) -> bool {
-    std::path::Path::new(command)
-        .file_name()
-        .and_then(|s| s.to_str())
-        == Some("claude")
+/// How Shelbi restores a runner's prior context when a workspace is resumed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResumeStrategy {
+    /// Reload the most recent transcript in the pane's cwd (`claude
+    /// --continue`) — the strongest resume Shelbi can drive.
+    Transcript,
+    /// Re-open the runner's own native conversation thread (the Codex bridge's
+    /// persisted owned thread).
+    NativeThread,
+    /// No transcript/thread affordance: relaunch cold and let the agent
+    /// re-read its own prior work from the worktree.
+    ColdBanner,
 }
 
-/// Whether `command` launches Codex. Keyed off the path basename so a runner
-/// declared as `/opt/homebrew/bin/codex` classifies the same as a bare `codex`.
-pub fn is_codex_runner(command: &str) -> bool {
-    std::path::Path::new(command)
-        .file_name()
-        .and_then(|s| s.to_str())
-        == Some("codex")
+/// The single per-runner integration adapter.
+///
+/// Constructed once by detection — an explicit `integration:` field on the
+/// runner spec, else the executable basename — and then consulted for every
+/// runner-specific decision: launch-flag assembly ([`with_permission_mode`],
+/// [`with_continue`]), message channel, resume strategy, capability ladder,
+/// and the readiness/submit gating that higher crates dispatch off
+/// [`kind`](RunnerAdapter::kind). Confining the `claude` / `codex`
+/// classification behind this constructor is the whole point: callers reason
+/// about the adapter, never re-derive the basename.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RunnerAdapter {
+    kind: RunnerKind,
+}
+
+impl RunnerAdapter {
+    /// Build the adapter for a runner spec — honoring an explicit
+    /// `integration:` field, else auto-detecting from the command basename.
+    pub fn for_spec(spec: &AgentRunnerSpec) -> Self {
+        Self {
+            kind: RunnerKind::detect(spec),
+        }
+    }
+
+    /// Build the adapter from a bare command string, with no explicit-field
+    /// override available. Prefer [`for_spec`](RunnerAdapter::for_spec)
+    /// wherever the full spec is in hand so the `integration:` override is
+    /// honored.
+    pub fn for_command(command: &str) -> Self {
+        Self {
+            kind: RunnerKind::from_command(command),
+        }
+    }
+
+    /// The detected runner kind.
+    pub fn kind(self) -> RunnerKind {
+        self.kind
+    }
+
+    /// Whether this runner is Claude Code.
+    pub fn is_claude(self) -> bool {
+        self.kind == RunnerKind::Claude
+    }
+
+    /// Whether this runner is Codex.
+    pub fn is_codex(self) -> bool {
+        self.kind == RunnerKind::Codex
+    }
+
+    /// The per-contract transport tiers Shelbi has with this runner.
+    pub fn capabilities(self) -> CapabilityLadder {
+        self.kind.capabilities()
+    }
+
+    /// How a resumed workspace on this runner recovers its prior context.
+    pub fn resume_strategy(self) -> ResumeStrategy {
+        match self.kind {
+            RunnerKind::Claude => ResumeStrategy::Transcript,
+            RunnerKind::Codex => ResumeStrategy::NativeThread,
+            RunnerKind::Generic => ResumeStrategy::ColdBanner,
+        }
+    }
+
+    /// Which delivery channel this runner uses for hub→workspace messages.
+    /// See [`message_channel`] for the health basis behind each runner's mode.
+    pub fn message_channel(self) -> MessageChannel {
+        if self.is_claude() {
+            MessageChannel::Hooks
+        } else {
+            MessageChannel::Polling
+        }
+    }
+
+    /// Does this runner pull hub→workspace messages by polling the log itself?
+    pub fn polls_for_messages(self) -> bool {
+        matches!(self.message_channel(), MessageChannel::Polling)
+    }
+
+    /// Whether the startup path should run Claude's bordered-composer
+    /// readiness probe before typing the prompt. Only Claude has one; every
+    /// other runner is delivered to without the probe.
+    pub fn needs_claude_readiness_probe(self) -> bool {
+        self.is_claude()
+    }
+
+    /// Return a copy of `spec` with `--permission-mode <mode>` appended when
+    /// this runner is `claude` and the mode is non-default. See the free
+    /// [`with_permission_mode`] wrapper for the full rationale; this is the
+    /// adapter-scoped form that skips re-detecting the runner kind.
+    pub fn with_permission_mode(self, spec: &AgentRunnerSpec, mode: &str) -> AgentRunnerSpec {
+        if !self.is_claude() || mode == "default" {
+            return spec.clone();
+        }
+        if spec
+            .flags
+            .iter()
+            .any(|f| f == "--permission-mode" || f.starts_with("--permission-mode="))
+        {
+            return spec.clone();
+        }
+        let mut out = spec.clone();
+        out.flags.push("--permission-mode".into());
+        out.flags.push(mode.into());
+        out
+    }
+
+    /// Return a copy of `spec` with `--continue` appended when this runner is
+    /// `claude` and `resume` is set. See the free [`with_continue`] wrapper
+    /// for the full rationale.
+    pub fn with_continue(self, spec: &AgentRunnerSpec, resume: bool) -> AgentRunnerSpec {
+        if !resume || !self.is_claude() {
+            return spec.clone();
+        }
+        if spec
+            .flags
+            .iter()
+            .any(|f| f == "--continue" || f == "-c" || f == "--resume")
+        {
+            return spec.clone();
+        }
+        let mut out = spec.clone();
+        out.flags.push("--continue".into());
+        out
+    }
 }
 
 /// Return a copy of `spec` with `--permission-mode <mode>` appended when the
@@ -59,20 +180,7 @@ pub fn is_codex_runner(command: &str) -> bool {
 /// right-most wins — but they clutter pane captures and obscure which mode
 /// the workspace is actually running in.
 pub fn with_permission_mode(spec: &AgentRunnerSpec, mode: &str) -> AgentRunnerSpec {
-    if !is_claude_runner(&spec.command) || mode == "default" {
-        return spec.clone();
-    }
-    if spec
-        .flags
-        .iter()
-        .any(|f| f == "--permission-mode" || f.starts_with("--permission-mode="))
-    {
-        return spec.clone();
-    }
-    let mut out = spec.clone();
-    out.flags.push("--permission-mode".into());
-    out.flags.push(mode.into());
-    out
+    RunnerAdapter::for_spec(spec).with_permission_mode(spec, mode)
 }
 
 /// Return a copy of `spec` with `--continue` appended when the runner is
@@ -89,19 +197,7 @@ pub fn with_permission_mode(spec: &AgentRunnerSpec, mode: &str) -> AgentRunnerSp
 /// Idempotent: a YAML that already carries `--continue` / `-c` / `--resume`
 /// in `flags` isn't given a second copy.
 pub fn with_continue(spec: &AgentRunnerSpec, resume: bool) -> AgentRunnerSpec {
-    if !resume || !is_claude_runner(&spec.command) {
-        return spec.clone();
-    }
-    if spec
-        .flags
-        .iter()
-        .any(|f| f == "--continue" || f == "-c" || f == "--resume")
-    {
-        return spec.clone();
-    }
-    let mut out = spec.clone();
-    out.flags.push("--continue".into());
-    out
+    RunnerAdapter::for_spec(spec).with_continue(spec, resume)
 }
 
 /// How a runner receives hub→workspace messages (a `shelbi message`).
@@ -149,11 +245,7 @@ impl MessageChannel {
 /// per-launch mode log both derive from it, so hooks and polling can never
 /// disagree about a runner.
 pub fn message_channel(spec: &AgentRunnerSpec) -> MessageChannel {
-    if is_claude_runner(&spec.command) {
-        MessageChannel::Hooks
-    } else {
-        MessageChannel::Polling
-    }
+    RunnerAdapter::for_spec(spec).message_channel()
 }
 
 /// Does this runner pull hub→workspace messages by polling the log itself?
@@ -169,6 +261,82 @@ pub fn polls_for_messages(spec: &AgentRunnerSpec) -> bool {
 mod tests {
     use super::*;
 
+    /// Recursively collect every `.rs` file under `dir`.
+    fn rust_sources(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                if path.file_name().and_then(|n| n.to_str()) == Some("target") {
+                    continue;
+                }
+                rust_sources(&path, out);
+            } else if path.extension().and_then(|e| e.to_str()) == Some("rs") {
+                out.push(path);
+            }
+        }
+    }
+
+    /// Grep-guard: the runner *basename* classification is allowed to live in
+    /// exactly one place — [`shelbi_core::RunnerKind::from_command`] in
+    /// `shelbi-core/src/model.rs`. Every other module must reason about a
+    /// [`RunnerAdapter`] / [`RunnerKind`] instead of re-deriving `claude` /
+    /// `codex` from the command string. This keeps the consolidation from
+    /// silently eroding back into scattered branches.
+    #[test]
+    fn runner_basename_checks_are_confined_to_adapter_detection() {
+        // The crates workspace root: `.../crates/shelbi-agent` → `.../crates`.
+        let crates_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("shelbi-agent lives under the crates dir")
+            .to_path_buf();
+        let mut files = Vec::new();
+        rust_sources(&crates_root, &mut files);
+        assert!(
+            files.len() > 20,
+            "expected to walk the whole crates tree, only found {} files",
+            files.len()
+        );
+
+        // Built at runtime so this guard's own source doesn't trip it.
+        let removed_helpers = [
+            format!("is_claude{}", "_runner"),
+            format!("is_codex{}", "_runner"),
+        ];
+        let basename_needles = [
+            format!("Some({:?})", "claude"),
+            format!("Some({:?})", "codex"),
+        ];
+        let allowed = std::path::Path::new("shelbi-core")
+            .join("src")
+            .join("model.rs");
+
+        for file in &files {
+            let text = std::fs::read_to_string(file).unwrap_or_default();
+            for needle in &removed_helpers {
+                assert!(
+                    !text.contains(needle.as_str()),
+                    "`{needle}` was removed in favor of RunnerAdapter but still \
+                     appears in {}",
+                    file.display()
+                );
+            }
+            if file.ends_with(&allowed) {
+                continue;
+            }
+            for needle in &basename_needles {
+                assert!(
+                    !text.contains(needle.as_str()),
+                    "runner basename check `{needle}` must be confined to \
+                     RunnerKind::from_command, but appears in {}",
+                    file.display()
+                );
+            }
+        }
+    }
+
     #[test]
     fn launch_command_minimal() {
         let spec = AgentRunnerSpec {
@@ -176,6 +344,7 @@ mod tests {
             flags: vec![],
             prompt_injection: None,
             dialog_signatures: vec![],
+            integration: None,
         };
         assert_eq!(launch_command(&spec), "claude");
     }
@@ -187,6 +356,7 @@ mod tests {
             flags: vec!["--print".into(), "thinking".into()],
             prompt_injection: None,
             dialog_signatures: vec![],
+            integration: None,
         };
         assert_eq!(launch_command(&spec), "codex --print thinking");
     }
@@ -198,6 +368,7 @@ mod tests {
             flags: vec![],
             prompt_injection: None,
             dialog_signatures: vec![],
+            integration: None,
         };
         let out = with_permission_mode(&spec, "auto");
         assert_eq!(out.command, "claude");
@@ -212,6 +383,7 @@ mod tests {
             flags: vec!["--dangerously-skip-permissions".into()],
             prompt_injection: None,
             dialog_signatures: vec![],
+            integration: None,
         };
         let out = with_permission_mode(&spec, "acceptEdits");
         assert_eq!(
@@ -233,6 +405,7 @@ mod tests {
             flags: vec![],
             prompt_injection: None,
             dialog_signatures: vec![],
+            integration: None,
         };
         let out = with_permission_mode(&spec, "auto");
         assert_eq!(out.flags, vec!["--permission-mode", "auto"]);
@@ -245,6 +418,7 @@ mod tests {
             flags: vec!["--print".into()],
             prompt_injection: None,
             dialog_signatures: vec![],
+            integration: None,
         };
         let out = with_permission_mode(&spec, "auto");
         // Codex doesn't understand --permission-mode; leave it alone.
@@ -260,6 +434,7 @@ mod tests {
             flags: vec![],
             prompt_injection: None,
             dialog_signatures: vec![],
+            integration: None,
         };
         let out = with_permission_mode(&spec, "default");
         assert!(out.flags.is_empty());
@@ -277,6 +452,7 @@ mod tests {
             flags: vec!["--permission-mode".into(), "auto".into()],
             prompt_injection: None,
             dialog_signatures: vec![],
+            integration: None,
         };
         let out = with_permission_mode(&spec, "auto");
         assert_eq!(out.flags, vec!["--permission-mode", "auto"]);
@@ -294,6 +470,7 @@ mod tests {
             flags: vec!["--permission-mode=plan".into()],
             prompt_injection: None,
             dialog_signatures: vec![],
+            integration: None,
         };
         let out = with_permission_mode(&spec, "auto");
         assert_eq!(out.flags, vec!["--permission-mode=plan"]);
@@ -310,6 +487,7 @@ mod tests {
             flags: vec!["--permission-mode".into(), "plan".into()],
             prompt_injection: None,
             dialog_signatures: vec![],
+            integration: None,
         };
         let out = with_permission_mode(&spec, "auto");
         assert_eq!(out.flags, vec!["--permission-mode", "plan"]);
@@ -321,6 +499,7 @@ mod tests {
             flags: vec![],
             prompt_injection: None,
             dialog_signatures: vec![],
+            integration: None,
         }
     }
 
@@ -328,6 +507,34 @@ mod tests {
     fn claude_does_not_poll_for_messages() {
         assert!(!polls_for_messages(&runner("claude")));
         assert!(!polls_for_messages(&runner("/usr/local/bin/claude")));
+    }
+
+    #[test]
+    fn adapter_honors_explicit_integration_field() {
+        // A wrapper executable whose basename is unrecognized, pinned to the
+        // Claude adapter, drives every Claude-only decision.
+        let mut wrapped = runner("my-claude-wrapper");
+        wrapped.integration = Some(RunnerKind::Claude);
+        let adapter = RunnerAdapter::for_spec(&wrapped);
+        assert!(adapter.is_claude());
+        assert_eq!(adapter.message_channel(), MessageChannel::Hooks);
+        assert_eq!(adapter.resume_strategy(), ResumeStrategy::Transcript);
+        assert!(adapter.needs_claude_readiness_probe());
+        // Launch-flag assembly follows the adapter, not the basename.
+        assert_eq!(
+            with_permission_mode(&wrapped, "auto").flags,
+            vec!["--permission-mode", "auto"]
+        );
+
+        // Detection strategy for each kind.
+        assert_eq!(
+            RunnerAdapter::for_command("codex").resume_strategy(),
+            ResumeStrategy::NativeThread
+        );
+        assert_eq!(
+            RunnerAdapter::for_command("aider").resume_strategy(),
+            ResumeStrategy::ColdBanner
+        );
     }
 
     #[test]
@@ -389,6 +596,7 @@ mod tests {
                 flags: vec![existing.into()],
                 prompt_injection: None,
                 dialog_signatures: vec![],
+                integration: None,
             };
             let out = with_continue(&spec, true);
             assert_eq!(
@@ -406,6 +614,7 @@ mod tests {
             flags: vec!["--permission-mode".into(), "auto".into()],
             prompt_injection: None,
             dialog_signatures: vec![],
+            integration: None,
         };
         let out = with_continue(&spec, true);
         assert_eq!(out.flags, vec!["--permission-mode", "auto", "--continue"]);

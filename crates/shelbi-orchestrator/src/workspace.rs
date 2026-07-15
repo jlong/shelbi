@@ -1198,7 +1198,10 @@ pub fn resume_workspace_on_task(spec: StartSpec<'_>) -> Result<TmuxAddr> {
 
     // Prefer true conversation-resume for claude; every other runner falls back
     // to plain prompt re-injection (the agent reads its own prior work).
-    let resume = shelbi_agent::is_claude_runner(&runner.command);
+    let resume = matches!(
+        shelbi_agent::RunnerAdapter::for_spec(&runner).resume_strategy(),
+        shelbi_agent::ResumeStrategy::Transcript
+    );
     let prompt = compose_resume_prompt(
         spec.task_id,
         spec.branch,
@@ -1433,7 +1436,7 @@ fn deploy_and_spawn(a: SpawnArgs<'_>) -> Result<()> {
         if record_dispatch_submit(a.addr, a.task_id, &a.workspace.name, status) {
             return Ok(());
         }
-        if shelbi_agent::is_claude_runner(&a.runner.command)
+        if shelbi_agent::RunnerAdapter::for_spec(a.runner).needs_claude_readiness_probe()
             && crate::ready::wait_for_claude_ready(a.host, a.addr, crate::ready::READY_TIMEOUT)?
         {
             let status = crate::submit::send_verified(a.host, a.addr, a.prompt, &baseline)?;
@@ -1703,7 +1706,7 @@ fn require_auto_mode_supported(
     // Only the `claude` CLI accepts `--permission-mode`; other runners
     // (codex etc.) reject the flag, so the version probe is meaningless
     // for them.
-    if !shelbi_agent::is_claude_runner(&runner.command) {
+    if !shelbi_agent::RunnerAdapter::for_spec(runner).is_claude() {
         return Ok(());
     }
     let Some(version) = probe_claude_version(host) else {
@@ -1770,12 +1773,10 @@ fn require_runner_available(host: &Host, runner: &shelbi_core::AgentRunnerSpec) 
 }
 
 fn runner_label(command: &str) -> &'static str {
-    if shelbi_agent::is_claude_runner(command) {
-        "Claude"
-    } else if shelbi_agent::is_codex_runner(command) {
-        "Codex"
-    } else {
-        "agent runner"
+    match shelbi_agent::RunnerAdapter::for_command(command).kind() {
+        shelbi_core::RunnerKind::Claude => "Claude",
+        shelbi_core::RunnerKind::Codex => "Codex",
+        shelbi_core::RunnerKind::Generic => "agent runner",
     }
 }
 
@@ -1939,13 +1940,13 @@ const PANE_IDLE_SH: &str = "#!/bin/sh\nprintf '\\033]2;shelbi:idle\\007'\n";
 const PANE_WORKING_SH: &str = "#!/bin/sh\nprintf '\\033]2;shelbi:working\\007'\n";
 const PANE_BLOCKED_SH: &str = "#!/bin/sh\nprintf '\\033]2;shelbi:blocked\\007'\n";
 
-struct RunnerHookFile {
-    rel_path: &'static str,
-    body: &'static str,
-    executable: bool,
+pub(crate) struct RunnerHookFile {
+    pub(crate) rel_path: &'static str,
+    pub(crate) body: &'static str,
+    pub(crate) executable: bool,
 }
 
-const RUNNER_HOOK_FILES: &[RunnerHookFile] = &[
+pub(crate) const RUNNER_HOOK_FILES: &[RunnerHookFile] = &[
     RunnerHookFile {
         rel_path: ".shelbi/hooks/session-start.sh",
         body: MESSAGE_TAIL_START_SH,
@@ -2165,7 +2166,7 @@ fn render_startup_prompt(
     runner: &shelbi_core::AgentRunnerSpec,
 ) -> String {
     let mut out = String::new();
-    if include_agent_instructions && !shelbi_agent::is_claude_runner(&runner.command) {
+    if include_agent_instructions && !shelbi_agent::RunnerAdapter::for_spec(runner).is_claude() {
         out.push_str("Read `.claude/agent-instructions.md` first. ");
         out.push_str(
             "Treat it as your developer-agent instructions for this Shelbi workspace.\n\n",
@@ -2558,11 +2559,7 @@ fn with_agent_system_prompt(
     let Some(rel) = instructions_rel else {
         return launch.to_string();
     };
-    let is_claude = std::path::Path::new(&runner.command)
-        .file_name()
-        .and_then(|s| s.to_str())
-        == Some("claude");
-    if !is_claude {
+    if !shelbi_agent::RunnerAdapter::for_spec(runner).is_claude() {
         // Other runners (codex etc.) don't understand the flag; leave
         // them alone. The agent's instructions.md is still deployed to
         // the worktree for callers that want to read it manually.
@@ -2578,7 +2575,7 @@ fn effective_prompt_injection_for_spawn(
     runner: &shelbi_core::AgentRunnerSpec,
     resume: bool,
 ) -> shelbi_core::PromptInjectionSpec {
-    if resume && shelbi_agent::is_claude_runner(&runner.command) {
+    if resume && shelbi_agent::RunnerAdapter::for_spec(runner).is_claude() {
         return shelbi_core::PromptInjectionSpec::paste();
     }
     runner.effective_prompt_injection()
@@ -3417,6 +3414,7 @@ mod tests {
                 flags: vec![],
                 prompt_injection: None,
                 dialog_signatures: vec![],
+                integration: None,
             },
         );
         Project {
@@ -3714,6 +3712,7 @@ mod tests {
             flags: vec!["--print".into()],
             prompt_injection: None,
             dialog_signatures: vec![],
+            integration: None,
         };
         let launch = workspace_launch_command(&codex, &p.workspace_permissions_mode, false, true);
         assert!(
@@ -3742,6 +3741,7 @@ mod tests {
             flags: vec!["--model".into(), "gpt-5".into()],
             prompt_injection: None,
             dialog_signatures: vec![],
+            integration: None,
         };
         let launch = workspace_launch_command_with_startup_prompt(
             &codex,
@@ -3775,6 +3775,7 @@ mod tests {
             flags: vec![],
             prompt_injection: None,
             dialog_signatures: vec![],
+            integration: None,
         };
         let launch = workspace_launch_command_with_startup_prompt(
             &claude,
@@ -3798,6 +3799,7 @@ mod tests {
             flags: vec![],
             prompt_injection: None,
             dialog_signatures: vec![],
+            integration: None,
         };
         let launch = workspace_launch_command_with_startup_prompt(
             &claude,
@@ -3820,6 +3822,7 @@ mod tests {
             flags: vec![],
             prompt_injection: None,
             dialog_signatures: vec![],
+            integration: None,
         };
         let rendered = render_startup_prompt("Do the task.\n", true, &codex);
         assert!(
@@ -4078,6 +4081,7 @@ mod tests {
             flags: vec![],
             prompt_injection: None,
             dialog_signatures: vec![],
+            integration: None,
         };
         for mode in ["acceptEdits", "bypassPermissions", "plan", "default"] {
             require_auto_mode_supported(&Host::Local, &runner, mode).unwrap();
@@ -4137,6 +4141,7 @@ mod tests {
                 flags: vec!["--permission-mode".into(), "auto".into()],
                 prompt_injection: None,
                 dialog_signatures: vec![],
+                integration: None,
             },
         );
         let runner = p.runner("claude").unwrap().clone();
@@ -4160,6 +4165,7 @@ mod tests {
                 flags: vec!["--print".into()],
                 prompt_injection: None,
                 dialog_signatures: vec![],
+                integration: None,
             },
         );
         let runner = p.runner("codex").unwrap().clone();
@@ -4235,6 +4241,7 @@ mod tests {
             flags: vec!["--print".into()],
             prompt_injection: None,
             dialog_signatures: vec![],
+            integration: None,
         };
         require_auto_mode_supported(&Host::Local, &runner, "auto").unwrap();
     }
@@ -4652,6 +4659,7 @@ mod tests {
             flags: vec![],
             prompt_injection: None,
             dialog_signatures: vec![],
+            integration: None,
         };
         let launch = "claude --permission-mode auto";
         let out = with_agent_system_prompt(launch, Some(WORKTREE_AGENT_INSTRUCTIONS_REL), &runner);
@@ -4679,12 +4687,14 @@ mod tests {
             flags: vec![],
             prompt_injection: None,
             dialog_signatures: vec![],
+            integration: None,
         };
         let codex = AgentRunnerSpec {
             command: "codex".into(),
             flags: vec![],
             prompt_injection: None,
             dialog_signatures: vec![],
+            integration: None,
         };
         let base = "claude --permission-mode auto";
 
@@ -5990,6 +6000,7 @@ mod sync_worktree_git_tests {
                 flags: vec![],
                 prompt_injection: None,
                 dialog_signatures: vec![],
+                integration: None,
             },
         );
         Project {
@@ -6686,6 +6697,7 @@ mod sync_worktree_freshcut_tests {
                 flags: vec![],
                 prompt_injection: None,
                 dialog_signatures: vec![],
+                integration: None,
             },
         );
         Project {
@@ -7049,6 +7061,7 @@ mod sync_worktree_freshcut_tests {
                 flags: vec![],
                 prompt_injection: None,
                 dialog_signatures: vec![],
+                integration: None,
             },
         );
         let project = Project {

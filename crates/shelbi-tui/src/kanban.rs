@@ -3513,6 +3513,7 @@ mod tests {
                         flags: vec![],
                         prompt_injection: None,
                         dialog_signatures: vec![],
+                        integration: None,
                     },
                 );
                 m
@@ -5234,6 +5235,7 @@ mod tests {
                         flags: vec![],
                         prompt_injection: None,
                         dialog_signatures: vec![],
+                        integration: None,
                     },
                 );
                 m

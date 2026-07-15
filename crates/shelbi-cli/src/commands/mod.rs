@@ -285,6 +285,7 @@ pub(crate) mod test_support {
                 flags: vec![],
                 prompt_injection: None,
                 dialog_signatures: vec![],
+                integration: None,
             },
         );
         let project = Project {

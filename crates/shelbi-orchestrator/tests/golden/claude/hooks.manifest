@@ -1,0 +1,70 @@
+.shelbi/hooks/session-start.sh
+exec
+----
+#!/bin/sh
+mkdir -p .shelbi/messages
+if [ -z "${TASK_ID:-}" ]; then
+  printf '%s no TASK_ID in env; message-tail not started (sidebar-click pane, or dispatch env leak)\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> .shelbi/messages/.no-task-id.log
+  echo 'shelbi: SessionStart hook: TASK_ID unset; message channel disabled for this session' >&2
+  exit 0
+fi
+LOCKDIR=.shelbi/messages/$TASK_ID.tail.d
+if [ -f "$LOCKDIR/pid" ]; then
+  kill "$(cat "$LOCKDIR/pid")" 2>/dev/null || true
+  rm -rf "$LOCKDIR"
+fi
+mkdir -p "$LOCKDIR"
+touch .shelbi/messages/$TASK_ID.log
+tail -f -n 0 .shelbi/messages/$TASK_ID.log > .shelbi/messages/$TASK_ID.unread.log 2>/dev/null &
+echo $! > "$LOCKDIR/pid"
+
+========
+.shelbi/hooks/stop.sh
+exec
+----
+#!/bin/sh
+[ -n "${TASK_ID:-}" ] || exit 0
+UNREAD=.shelbi/messages/$TASK_ID.unread.log
+PROC=$UNREAD.processing
+if [ -s "$UNREAD" ]; then
+  mv "$UNREAD" "$PROC"
+  touch "$UNREAD"
+  echo "<system-reminder>New orchestrator messages:"
+  cat "$PROC"
+  echo "</system-reminder>"
+  HUB_ADDR="${SHELBI_HUB_ADDR:-${SHELBI_HUB_SOCK:+unix:$SHELBI_HUB_SOCK}}"
+  if [ -n "$HUB_ADDR" ] && command -v jq >/dev/null 2>&1 && command -v nc >/dev/null 2>&1; then
+    jq -r '.msg_id // empty' "$PROC" 2>/dev/null | while read MSG_ID; do
+      [ -n "$MSG_ID" ] || continue
+      ACK=$(printf '{"verb":"message-ack","project":"%s","task_id":"%s","msg_id":"%s"}\n' "$PROJECT" "$TASK_ID" "$MSG_ID")
+      case "$HUB_ADDR" in
+        tcp:*) HP=${HUB_ADDR#tcp:}; printf '%s' "$ACK" | nc "${HP%:*}" "${HP##*:}" 2>/dev/null || true ;;
+        unix:*) printf '%s' "$ACK" | nc -U "${HUB_ADDR#unix:}" 2>/dev/null || true ;;
+      esac
+    done
+  fi
+  rm "$PROC"
+fi
+
+========
+.shelbi/hooks/pane-idle.sh
+exec
+----
+#!/bin/sh
+printf '\033]2;shelbi:idle\007'
+
+========
+.shelbi/hooks/pane-working.sh
+exec
+----
+#!/bin/sh
+printf '\033]2;shelbi:working\007'
+
+========
+.shelbi/hooks/pane-blocked.sh
+exec
+----
+#!/bin/sh
+printf '\033]2;shelbi:blocked\007'
+
+========

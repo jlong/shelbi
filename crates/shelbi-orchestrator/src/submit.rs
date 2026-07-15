@@ -57,12 +57,10 @@ pub enum SubmitProfile {
 
 impl SubmitProfile {
     pub fn for_runner(runner: &AgentRunnerSpec) -> Self {
-        if shelbi_agent::is_claude_runner(&runner.command) {
-            Self::ClaudeUi
-        } else if shelbi_agent::is_codex_runner(&runner.command) {
-            Self::CodexUi
-        } else {
-            Self::DeliveryOnly
+        match shelbi_agent::RunnerAdapter::for_spec(runner).kind() {
+            shelbi_core::RunnerKind::Claude => Self::ClaudeUi,
+            shelbi_core::RunnerKind::Codex => Self::CodexUi,
+            shelbi_core::RunnerKind::Generic => Self::DeliveryOnly,
         }
     }
 
@@ -832,6 +830,7 @@ mod tests {
             flags: Vec::new(),
             prompt_injection: None,
             dialog_signatures: Vec::new(),
+            integration: None,
         }
     }
 
