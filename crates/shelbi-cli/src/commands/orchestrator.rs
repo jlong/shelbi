@@ -420,6 +420,114 @@ mod tests {
             .unwrap_or_else(|| panic!("missing {kind} event for {id}: {:?}", response.events))
     }
 
+    /// Golden test: `events drain` output must stay byte-for-byte stable for
+    /// a fixed `events.log` fixture. The fixture pins the on-disk timestamps
+    /// (so the result is deterministic), the per-line byte cursors, the
+    /// project-scope filtering, and the whole `event_kind` vocabulary this
+    /// command projects onto the stream. If this diff moves, a runner that
+    /// parses the drain JSON has to be re-checked — it is not a free refactor.
+    #[test]
+    fn drain_output_is_byte_stable_for_a_fixed_log_fixture() {
+        let (_guard, _tmp) = setup_home();
+        let fixture = "\
+2026-01-02T03:04:05+00:00 project=demo task=fix-1 workflow=task todo -> in_progress reason=dispatch from_category=backlog to_category=active
+2026-01-02T03:04:06+00:00 project=demo workspace=alpha working -> awaiting_input
+2026-01-02T03:04:07+00:00 project=demo heartbeat zen_eligible=1 idle_workspaces=2
+2026-01-02T03:04:08+00:00 send project=demo workspace=alpha status=stuck detail=unconfirmed_after_retry
+2026-01-02T03:04:09+00:00 project=demo workspace=alpha pane_alive=false reason=signal:SIGHUP
+2026-01-02T03:04:10+00:00 project=other workspace=beta working -> awaiting_input
+";
+        fs::write(shelbi_state::events_log_path().unwrap(), fixture).unwrap();
+
+        let response = drain_once("demo", 0).unwrap();
+        let json = serde_json::to_string_pretty(&response).unwrap();
+
+        let expected = r#"{
+  "project": "demo",
+  "cursor": "582",
+  "events": [
+    {
+      "cursor": "141",
+      "offset": 0,
+      "timestamp": "2026-01-02T03:04:05+00:00",
+      "kind": "task_transition",
+      "raw": "2026-01-02T03:04:05+00:00 project=demo task=fix-1 workflow=task todo -> in_progress reason=dispatch from_category=backlog to_category=active",
+      "task": "fix-1",
+      "workflow": "task",
+      "from": "todo",
+      "to": "in_progress",
+      "reason": "dispatch",
+      "metadata": {
+        "from_category": "backlog",
+        "project": "demo",
+        "reason": "dispatch",
+        "task": "fix-1",
+        "to_category": "active",
+        "workflow": "task"
+      }
+    },
+    {
+      "cursor": "222",
+      "offset": 141,
+      "timestamp": "2026-01-02T03:04:06+00:00",
+      "kind": "workspace_transition",
+      "raw": "2026-01-02T03:04:06+00:00 project=demo workspace=alpha working -> awaiting_input",
+      "workspace": "alpha",
+      "from": "working",
+      "to": "awaiting_input",
+      "metadata": {
+        "project": "demo",
+        "workspace": "alpha"
+      }
+    },
+    {
+      "cursor": "304",
+      "offset": 222,
+      "timestamp": "2026-01-02T03:04:07+00:00",
+      "kind": "heartbeat",
+      "raw": "2026-01-02T03:04:07+00:00 project=demo heartbeat zen_eligible=1 idle_workspaces=2",
+      "metadata": {
+        "heartbeat": "true",
+        "idle_workspaces": "2",
+        "project": "demo",
+        "zen_eligible": "1"
+      }
+    },
+    {
+      "cursor": "408",
+      "offset": 304,
+      "timestamp": "2026-01-02T03:04:08+00:00",
+      "kind": "send",
+      "raw": "2026-01-02T03:04:08+00:00 send project=demo workspace=alpha status=stuck detail=unconfirmed_after_retry",
+      "workspace": "alpha",
+      "metadata": {
+        "detail": "unconfirmed_after_retry",
+        "project": "demo",
+        "send": "true",
+        "status": "stuck",
+        "workspace": "alpha"
+      }
+    },
+    {
+      "cursor": "501",
+      "offset": 408,
+      "timestamp": "2026-01-02T03:04:09+00:00",
+      "kind": "pane_death",
+      "raw": "2026-01-02T03:04:09+00:00 project=demo workspace=alpha pane_alive=false reason=signal:SIGHUP",
+      "workspace": "alpha",
+      "reason": "signal:SIGHUP",
+      "metadata": {
+        "pane_alive": "false",
+        "project": "demo",
+        "reason": "signal:SIGHUP",
+        "workspace": "alpha"
+      }
+    }
+  ]
+}"#;
+        assert_eq!(json, expected, "drain golden output drifted:\n{json}");
+    }
+
     #[test]
     fn drain_filters_by_project_and_returns_cursor() {
         let (_guard, _tmp) = setup_home();

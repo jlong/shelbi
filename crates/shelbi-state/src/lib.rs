@@ -20,6 +20,7 @@ use shelbi_core::{
 };
 
 mod agent_workspaces;
+mod event_log;
 mod hub_config;
 mod hub_version;
 pub mod keymap;
@@ -89,26 +90,23 @@ pub use workflows::{
     resolve_task_workflow_name, save_project_statuses, scaffold_project_statuses,
     scaffold_project_workflow, statuses_path, workflow_path, workflows_dir,
 };
-pub use workspace_status::{
+pub use event_log::{
     append_clarification_event, append_dispatch_event, append_external_event,
     append_heartbeat_event, append_integration_event, append_limit_resume_event,
-    append_message_ack_event,
-    append_message_event, append_project_event, append_rebase_event, append_send_event,
-    append_supervision_event, append_task_event,
-    append_workspace_dialog_event, append_workspace_event, append_workspace_pane_event,
-    append_workspace_pause_event, append_worktree_detach_event, append_zen_dryrun_event,
-    append_zen_mode_event,
-    clear_expected_teardown, consume_expected_teardown, emit_event_body, events_log_path,
-    expected_teardown_marker_path, hub_socket_path, load_workspace_status, mark_expected_teardown,
-    parse_pane_title_marker, parse_pane_title_state, save_workspace_status, task_event_body,
-    supervision_shutdown_key, workspace_status_path, workspaces_dir, EventEnvelope, EventKind,
-    HandoffCause, PaneMarker, WorkspaceState, WorkspaceStatus, ZenHeartbeatCue, DAEMON_ACK,
-    EXPECTED_TEARDOWN_MAX_AGE, ORCH_EVENT_CALLBACK_SOCK_ENV, READY_MARKER_HANDOFF_ALIASES,
-    READY_MARKER_HANDOFF_CAUSE,
+    append_message_ack_event, append_message_event, append_project_event, append_rebase_event,
+    append_send_event, append_supervision_event, append_task_event, append_workspace_dialog_event,
+    append_workspace_event, append_workspace_pane_event, append_workspace_pause_event,
+    append_worktree_detach_event, append_zen_dryrun_event, append_zen_mode_event, delivery_id,
+    emit_event_body, event_cursor_path, event_log_current_base, event_log_head, events_log_path,
+    read_event_log_from, read_or_initialize_event_cursor, task_event_body, write_event_cursor,
+    EventEnvelope, EventKind, EventLogRead, HandoffCause, ZenHeartbeatCue, DAEMON_ACK,
+    ORCH_EVENT_CALLBACK_SOCK_ENV, READY_MARKER_HANDOFF_ALIASES, READY_MARKER_HANDOFF_CAUSE,
 };
 pub use workspace_status::{
-    event_cursor_path, event_log_current_base, event_log_head, read_event_log_from,
-    read_or_initialize_event_cursor, write_event_cursor, EventLogRead,
+    clear_expected_teardown, consume_expected_teardown, expected_teardown_marker_path,
+    hub_socket_path, load_workspace_status, mark_expected_teardown, parse_pane_title_marker,
+    parse_pane_title_state, save_workspace_status, supervision_shutdown_key, workspace_status_path,
+    workspaces_dir, PaneMarker, WorkspaceState, WorkspaceStatus, EXPECTED_TEARDOWN_MAX_AGE,
 };
 pub use zenmode::{
     read_zenmode_summary, scaffold_zenmode, zenmode_path, ZenmodeOutcome, DEFAULT_ZENMODE,

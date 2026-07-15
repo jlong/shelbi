@@ -2660,7 +2660,9 @@ fn oversized_event_marker(
 }
 
 fn stable_message_id(project: &str, from: u64, through: u64) -> String {
-    format!("shelbi-event/{project}/{from}-{through}")
+    // Delegate to the shared event-log core so the durable queue's batch ids
+    // are derived identically to any other consumer of the stream.
+    shelbi_state::delivery_id(project, from, through)
 }
 
 fn event_batch_input(
