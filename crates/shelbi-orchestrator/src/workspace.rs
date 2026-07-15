@@ -1276,6 +1276,23 @@ fn deploy_and_spawn(a: SpawnArgs<'_>) -> Result<()> {
     deploy_workspace_settings(a.host, a.worktree, &rendered)?;
     deploy_runner_hooks(a.host, a.worktree)?;
 
+    // Decide + record the hub→workspace message channel for THIS launch. The
+    // mode is derived from the runner's verified hook health (see
+    // `shelbi_agent::message_channel`), not assumed, and the event line makes
+    // the choice auditable when a message goes undelivered — polling means the
+    // prompt carries the pull contract; hooks means the pane pushes.
+    let channel = shelbi_agent::message_channel(a.runner);
+    let runner_name = std::path::Path::new(&a.runner.command)
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or(a.runner.command.as_str());
+    append_dispatch_status(
+        a.task_id,
+        &a.workspace.name,
+        "message-channel",
+        &format!("mode={} runner={}", channel.as_str(), runner_name),
+    );
+
     // 2b. Deploy the dispatched agent's `instructions.md` + skills into the
     //     worktree's `.claude/` footprint. The instructions file becomes the
     //     runner's `--append-system-prompt` source (see step 4); the skills
@@ -1869,7 +1886,6 @@ pub fn deploy_workspace_settings(
 /// debugging an agent that loaded the wrong prompt.
 pub const WORKTREE_AGENT_INSTRUCTIONS_REL: &str = ".claude/agent-instructions.md";
 pub const WORKTREE_STARTUP_PROMPT_REL: &str = ".shelbi/startup-prompt.md";
-pub const WORKTREE_CODEX_HOOKS_REL: &str = ".shelbi/hooks/codex.toml";
 
 /// Relative path (from the worktree root) where the dispatched agent's
 /// `skills/` directory is mounted. Claude Code auto-loads any
@@ -1923,13 +1939,6 @@ const PANE_IDLE_SH: &str = "#!/bin/sh\nprintf '\\033]2;shelbi:idle\\007'\n";
 const PANE_WORKING_SH: &str = "#!/bin/sh\nprintf '\\033]2;shelbi:working\\007'\n";
 const PANE_BLOCKED_SH: &str = "#!/bin/sh\nprintf '\\033]2;shelbi:blocked\\007'\n";
 
-const CODEX_HOOKS_TOML: &str = r#"SessionStart = ".shelbi/hooks/codex.session-start"
-UserPromptSubmit = ".shelbi/hooks/codex.pane-working"
-PreToolUse = ".shelbi/hooks/codex.pane-working"
-PostToolUse = ".shelbi/hooks/codex.stop"
-Stop = [".shelbi/hooks/codex.pane-idle", ".shelbi/hooks/codex.stop"]
-"#;
-
 struct RunnerHookFile {
     rel_path: &'static str,
     body: &'static str,
@@ -1962,40 +1971,18 @@ const RUNNER_HOOK_FILES: &[RunnerHookFile] = &[
         body: PANE_BLOCKED_SH,
         executable: true,
     },
-    RunnerHookFile {
-        rel_path: ".shelbi/hooks/codex.session-start",
-        body: MESSAGE_TAIL_START_SH,
-        executable: true,
-    },
-    RunnerHookFile {
-        rel_path: ".shelbi/hooks/codex.stop",
-        body: MESSAGE_DRAIN_STOP_SH,
-        executable: true,
-    },
-    RunnerHookFile {
-        rel_path: ".shelbi/hooks/codex.pane-idle",
-        body: PANE_IDLE_SH,
-        executable: true,
-    },
-    RunnerHookFile {
-        rel_path: ".shelbi/hooks/codex.pane-working",
-        body: PANE_WORKING_SH,
-        executable: true,
-    },
-    RunnerHookFile {
-        rel_path: WORKTREE_CODEX_HOOKS_REL,
-        body: CODEX_HOOKS_TOML,
-        executable: false,
-    },
 ];
 
 /// Deploy Shelbi-owned hook implementations under `<worktree>/.shelbi/hooks`.
 ///
-/// Runner-owned config files stay as thin adapters: Claude's
-/// `.claude/settings.json` calls the `claude.*` scripts, and Codex is launched
-/// with `core.hooksPath=.shelbi/hooks/codex.toml`. The hook bodies live in
-/// Shelbi's scratch namespace so dispatches do not overwrite user-owned
-/// `.codex/` config and only rewrite Shelbi-owned files.
+/// Only Claude has a Shelbi-wired hook channel: its `.claude/settings.json`
+/// calls the `claude.*` scripts deployed here. Codex is not wired for hooks —
+/// the installed CLI rejects the `-c core.hooksPath` override under strict
+/// validation and its only hook config layers (`~/.codex/`, `<repo>/.codex/`)
+/// are user-owned, so Codex falls back to prompt-level polling (see
+/// [`shelbi_agent::message_channel`]) and no `codex.*` files are deployed. The
+/// hook bodies live in Shelbi's scratch namespace so dispatches never overwrite
+/// user-owned `.codex/`/`.claude/` config and only rewrite Shelbi-owned files.
 pub fn deploy_runner_hooks(host: &Host, worktree: &Path) -> Result<()> {
     for file in RUNNER_HOOK_FILES {
         deploy_runner_hook_file(host, worktree, file)?;
@@ -2536,8 +2523,7 @@ pub fn workspace_launch_command_with_startup_prompt(
     // so the pane reloads its prior conversation instead of starting cold —
     // see [`shelbi_agent::with_continue`]. It's a no-op for a normal dispatch
     // and for non-claude runners.
-    let runner_with_hooks = shelbi_agent::with_codex_hooks(runner, WORKTREE_CODEX_HOOKS_REL);
-    let runner_with_mode = shelbi_agent::with_permission_mode(&runner_with_hooks, permissions_mode);
+    let runner_with_mode = shelbi_agent::with_permission_mode(runner, permissions_mode);
     let runner_resolved = shelbi_agent::with_continue(&runner_with_mode, resume);
     let launch = with_agent_system_prompt(
         &shelbi_agent::launch_command(&runner_resolved),
@@ -3727,9 +3713,11 @@ mod tests {
             !launch.contains("--continue"),
             "non-claude runner must not get --continue: {launch}"
         );
+        // Codex is a polling runner: no hook flags are injected. The installed
+        // CLI rejects `-c core.hooksPath` under strict validation.
         assert!(
-            launch.contains("core.hooksPath=.shelbi/hooks/codex.toml"),
-            "codex still gets Shelbi hook wiring: {launch}"
+            !launch.contains("core.hooksPath") && !launch.contains("bypass-hook-trust"),
+            "codex must not get any hook wiring flags: {launch}"
         );
 
         // A normal (non-resume) dispatch never adds --continue, even for claude.
@@ -3757,7 +3745,7 @@ mod tests {
         );
         assert_eq!(
             launch,
-            "codex --model gpt-5 -c core.hooksPath=.shelbi/hooks/codex.toml --dangerously-bypass-hook-trust \"$(cat .shelbi/startup-prompt.md)\"",
+            "codex --model gpt-5 \"$(cat .shelbi/startup-prompt.md)\"",
         );
         assert!(
             !launch.contains("--permission-mode"),
@@ -4152,10 +4140,11 @@ mod tests {
     }
 
     #[test]
-    fn spawn_path_wires_codex_hooks_without_claude_permission_mode() {
-        // Codex doesn't understand --permission-mode; injecting it would
-        // crash the runner on launch. It does receive Shelbi's Codex hook
-        // config path.
+    fn spawn_path_launches_codex_without_claude_or_hook_flags() {
+        // Codex doesn't understand --permission-mode; injecting it would crash
+        // the runner on launch. It also gets no hook wiring — the installed CLI
+        // rejects `-c core.hooksPath` under strict validation — so the launch
+        // is just the runner command plus its own flags.
         let mut p = fixture_project();
         p.agent_runners.insert(
             "codex".into(),
@@ -4168,11 +4157,10 @@ mod tests {
         );
         let runner = p.runner("codex").unwrap().clone();
         let launch = workspace_launch_command(&runner, &p.workspace_permissions_mode, false, false);
-        assert_eq!(
-            launch,
-            "codex --print -c core.hooksPath=.shelbi/hooks/codex.toml --dangerously-bypass-hook-trust",
-        );
+        assert_eq!(launch, "codex --print");
         assert!(!launch.contains("--permission-mode"));
+        assert!(!launch.contains("core.hooksPath"));
+        assert!(!launch.contains("bypass-hook-trust"));
     }
 
     #[test]
@@ -4274,7 +4262,7 @@ mod tests {
     }
 
     #[test]
-    fn deploy_runner_hooks_writes_shelbi_owned_scripts_and_codex_config() {
+    fn deploy_runner_hooks_writes_shelbi_owned_claude_scripts_only() {
         let tmp = std::env::temp_dir().join(format!(
             "shelbi-runner-hooks-test-{}-{}",
             std::process::id(),
@@ -4290,10 +4278,21 @@ mod tests {
 
         let claude_start = worktree.join(".shelbi/hooks/claude.session-start");
         let claude_stop = worktree.join(".shelbi/hooks/claude.stop");
-        let codex_config = worktree.join(WORKTREE_CODEX_HOOKS_REL);
         assert!(claude_start.is_file(), "missing {}", claude_start.display());
         assert!(claude_stop.is_file(), "missing {}", claude_stop.display());
-        assert!(codex_config.is_file(), "missing {}", codex_config.display());
+
+        // Codex is a polling runner (no verified hook channel), so no codex.*
+        // hook files or the invalid codex.toml are deployed. An earlier version
+        // wrote a `.shelbi/hooks/codex.toml` wired via `-c core.hooksPath`, a
+        // flag the installed Codex CLI rejects under strict validation.
+        assert!(
+            !worktree.join(".shelbi/hooks/codex.toml").exists(),
+            "codex hooks are not wired; codex.toml must not be deployed",
+        );
+        assert!(
+            !worktree.join(".shelbi/hooks/codex.session-start").exists(),
+            "codex hook scripts must not be deployed",
+        );
 
         let start_body = std::fs::read_to_string(&claude_start).unwrap();
         assert!(start_body.contains(".shelbi/messages/$TASK_ID.tail.d"));
@@ -4303,11 +4302,6 @@ mod tests {
         assert!(stop_body.contains("UNREAD=.shelbi/messages/$TASK_ID.unread.log"));
         assert!(stop_body.contains("message-ack"));
         assert!(stop_body.contains("$SHELBI_HUB_SOCK"));
-
-        let codex_body = std::fs::read_to_string(&codex_config).unwrap();
-        assert!(codex_body.contains("SessionStart = \".shelbi/hooks/codex.session-start\""));
-        assert!(codex_body.contains("PostToolUse = \".shelbi/hooks/codex.stop\""));
-        assert!(codex_body.contains("Stop = [\".shelbi/hooks/codex.pane-idle\""));
 
         #[cfg(unix)]
         {

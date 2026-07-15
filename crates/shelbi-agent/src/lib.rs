@@ -104,54 +104,65 @@ pub fn with_continue(spec: &AgentRunnerSpec, resume: bool) -> AgentRunnerSpec {
     out
 }
 
-/// Return a copy of `spec` with Codex's hook config path wired to Shelbi's
-/// per-worktree adapter. The installed Codex CLI exposes hooks through
-/// `-c core.hooksPath=<path>` and requires either persisted hook trust or the
-/// explicit automation flag `--dangerously-bypass-hook-trust`. Shelbi deploys
-/// the hook config and scripts under `.shelbi/hooks/`, so this helper only
-/// touches Codex launch flags and leaves user-owned `.codex/` config alone.
+/// How a runner receives hub→workspace messages (a `shelbi message`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MessageChannel {
+    /// Shelbi wires runner hooks it has verified are healthy on this runner,
+    /// so the pane pushes new messages into the agent itself and the
+    /// workspace prompt carries no polling contract.
+    Hooks,
+    /// No verified-healthy hook channel exists for this runner, so the
+    /// workspace prompt must instruct the agent to tail
+    /// `.shelbi/messages/<task-id>.log` itself on a concrete cadence and ack
+    /// each line.
+    Polling,
+}
+
+impl MessageChannel {
+    /// Stable token for a dispatch event / status detail line.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            MessageChannel::Hooks => "hooks",
+            MessageChannel::Polling => "polling",
+        }
+    }
+}
+
+/// Resolve which delivery channel a runner uses, keyed off a *verified hook
+/// health* signal rather than the executable basename alone.
 ///
-/// Idempotent: user-authored runner flags that already set `core.hooksPath`
-/// or hook-trust behavior win. That keeps explicit project YAML in control and
-/// avoids duplicate flags in the pane command.
-pub fn with_codex_hooks(spec: &AgentRunnerSpec, hooks_path: &str) -> AgentRunnerSpec {
-    if !is_codex_runner(&spec.command) {
-        return spec.clone();
+/// - **Claude** receives messages through hooks Shelbi wires in
+///   `.claude/settings.json` — a Shelbi-owned config layer — and that push
+///   path is the proven, shipped default, so claude resolves to
+///   [`MessageChannel::Hooks`].
+/// - **Codex and every other runner** resolve to [`MessageChannel::Polling`].
+///   The installed Codex CLI rejects the `-c core.hooksPath=<path>` override
+///   Shelbi previously passed (`unknown configuration field 'core'` under
+///   strict validation), and Codex only discovers hooks from `~/.codex/` or
+///   `<repo>/.codex/` (both user-owned, which Shelbi must not overwrite) or
+///   plugin manifests. With no supported, non-destructive hook layer whose
+///   handshake Shelbi has verified — and Codex `Stop` hooks additionally
+///   requiring JSON output the shared drain script does not emit — there is no
+///   verified-healthy hook channel to wire, so Codex polls until one is proven.
+///
+/// Keep this the single decision point: `polls_for_messages` and the
+/// per-launch mode log both derive from it, so hooks and polling can never
+/// disagree about a runner.
+pub fn message_channel(spec: &AgentRunnerSpec) -> MessageChannel {
+    if is_claude_runner(&spec.command) {
+        MessageChannel::Hooks
+    } else {
+        MessageChannel::Polling
     }
-
-    let mut out = spec.clone();
-    let has_hooks_path = out.flags.windows(2).any(|w| {
-        matches!(w, [flag, value] if (flag == "-c" || flag == "--config") && value.starts_with("core.hooksPath="))
-    }) || out
-        .flags
-        .iter()
-        .any(|f| f.starts_with("-c core.hooksPath=") || f.starts_with("--config core.hooksPath="));
-    if !has_hooks_path {
-        out.flags.push("-c".into());
-        out.flags.push(format!("core.hooksPath={hooks_path}"));
-    }
-
-    if !out
-        .flags
-        .iter()
-        .any(|f| f == "--dangerously-bypass-hook-trust")
-    {
-        out.flags.push("--dangerously-bypass-hook-trust".into());
-    }
-
-    out
 }
 
 /// Does this runner pull hub→workspace messages by polling the log itself?
 ///
-/// Claude and Codex receive messages through runner hooks Shelbi deploys under
-/// `.shelbi/hooks/`, so they do not need prompt-level polling. Every other
-/// runner (aider, custom CLIs, …) has no supported hook surface Shelbi knows
-/// how to wire, so the workspace prompt must instruct it to tail
-/// `.shelbi/messages/<task-id>.log` on a concrete cadence and ack each line
-/// itself.
+/// The complement of a verified-healthy hook channel: any runner Shelbi has
+/// not proven can push messages through hooks must be told to poll. See
+/// [`message_channel`] for the health basis behind each runner's mode.
 pub fn polls_for_messages(spec: &AgentRunnerSpec) -> bool {
-    !(is_claude_runner(&spec.command) || is_codex_runner(&spec.command))
+    matches!(message_channel(spec), MessageChannel::Polling)
 }
 
 #[cfg(test)]
@@ -320,9 +331,23 @@ mod tests {
     }
 
     #[test]
-    fn codex_does_not_poll_for_messages_when_hooks_are_wired() {
-        assert!(!polls_for_messages(&runner("codex")));
-        assert!(!polls_for_messages(&runner("/opt/bin/codex")));
+    fn codex_polls_for_messages_without_a_verified_hook_channel() {
+        // The installed Codex CLI rejects the `-c core.hooksPath` override and
+        // exposes no non-destructive hook layer Shelbi can wire, so Codex must
+        // fall back to prompt-level polling rather than be silently classified
+        // hook-capable by basename.
+        assert!(polls_for_messages(&runner("codex")));
+        assert!(polls_for_messages(&runner("/opt/bin/codex")));
+        assert_eq!(message_channel(&runner("codex")), MessageChannel::Polling);
+    }
+
+    #[test]
+    fn claude_uses_the_hook_channel() {
+        assert_eq!(message_channel(&runner("claude")), MessageChannel::Hooks);
+        assert_eq!(
+            message_channel(&runner("/usr/local/bin/claude")),
+            MessageChannel::Hooks
+        );
     }
 
     #[test]
@@ -332,56 +357,6 @@ mod tests {
         // so it classifies as a polling runner — consistent with how
         // `with_permission_mode` keys off the exact basename.
         assert!(polls_for_messages(&runner("claude.exe")));
-    }
-
-    #[test]
-    fn with_codex_hooks_adds_hooks_path_and_trust_bypass() {
-        let out = with_codex_hooks(&runner("codex"), ".shelbi/hooks/codex.toml");
-        assert_eq!(
-            out.flags,
-            vec![
-                "-c",
-                "core.hooksPath=.shelbi/hooks/codex.toml",
-                "--dangerously-bypass-hook-trust",
-            ],
-        );
-        assert_eq!(
-            launch_command(&out),
-            "codex -c core.hooksPath=.shelbi/hooks/codex.toml --dangerously-bypass-hook-trust",
-        );
-    }
-
-    #[test]
-    fn with_codex_hooks_recognizes_absolute_codex_paths() {
-        let out = with_codex_hooks(
-            &runner("/opt/homebrew/bin/codex"),
-            ".shelbi/hooks/codex.toml",
-        );
-        assert_eq!(out.flags[0], "-c");
-        assert_eq!(out.flags[1], "core.hooksPath=.shelbi/hooks/codex.toml");
-    }
-
-    #[test]
-    fn with_codex_hooks_preserves_user_hooks_path_and_trust_flag() {
-        let spec = AgentRunnerSpec {
-            command: "codex".into(),
-            flags: vec![
-                "-c".into(),
-                "core.hooksPath=.custom/hooks.toml".into(),
-                "--dangerously-bypass-hook-trust".into(),
-            ],
-            prompt_injection: None,
-            dialog_signatures: vec![],
-        };
-        let out = with_codex_hooks(&spec, ".shelbi/hooks/codex.toml");
-        assert_eq!(
-            out.flags,
-            vec![
-                "-c",
-                "core.hooksPath=.custom/hooks.toml",
-                "--dangerously-bypass-hook-trust",
-            ],
-        );
     }
 
     #[test]
