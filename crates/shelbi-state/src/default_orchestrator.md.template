@@ -203,7 +203,7 @@ process dies (Monitor reports the task ended), restart it on your next turn;
 it resumes from the durable cursor, so any batch you had not acked is
 re-delivered.
 
-## Polling-only claim/ack drain
+## Polling-only event drain
 
 Some runners cannot receive asynchronous Monitor callbacks while they are
 thinking or answering. In those polling-only harnesses, the background
