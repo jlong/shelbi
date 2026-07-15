@@ -1929,6 +1929,75 @@ pub(crate) fn mark_persisted_codex_thread_inactive(
     Ok(())
 }
 
+/// Whether a Codex thread marker file exists for `project`, independent of
+/// whether it is still active. The native-to-legacy runner-switch migration
+/// archives even a stale (`native_active: false`) marker, so it must detect the
+/// file itself rather than relying on [`has_persisted_codex_thread`], which is
+/// gated on the active flag.
+pub(crate) fn persisted_codex_thread_file_exists(project: &str) -> Result<bool> {
+    let workdir = shelbi_state::project_dir(project)?;
+    Ok(workdir.join(THREAD_STATE_FILE).exists())
+}
+
+/// Archive the persisted Codex thread marker so a native-to-legacy runner
+/// switch can proceed without destroying the recoverable thread id. Renames
+/// `codex-thread.json` to `codex-thread.json.archived-<unix_secs>` and returns
+/// the archived path. A missing marker is a no-op returning `None`, which keeps
+/// repeated preflight calls idempotent (the second call finds nothing to move).
+pub(crate) fn archive_persisted_codex_thread(project: &str) -> Result<Option<PathBuf>> {
+    let workdir = shelbi_state::project_dir(project)?;
+    let path = workdir.join(THREAD_STATE_FILE);
+    if !path.exists() {
+        return Ok(None);
+    }
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_secs())
+        .unwrap_or(0);
+    let archived = workdir.join(format!("{THREAD_STATE_FILE}.archived-{stamp}"));
+    fs::rename(&path, &archived).map_err(Error::Io)?;
+    Ok(Some(archived))
+}
+
+/// Stable delivery ids (`message_id`) of durable Codex event batches that still
+/// carry actionable events past the applied cursor. Empty means the native
+/// queue holds nothing the orchestrator would still act on — the safe
+/// precondition for switching away from the Codex runner. Non-actionable
+/// (quiet) batches never wake a turn on their own, so they never block a
+/// switch; blocking on them would be a dead end no drain could clear.
+pub(crate) fn pending_codex_delivery_ids(project: &str) -> Result<Vec<String>> {
+    let workdir = shelbi_state::project_dir(project)?;
+    let queue = DurableQueue::load(&workdir.join(EVENT_QUEUE_FILE), project)?;
+    let cursor = read_applied_cursor(project)?;
+    Ok(queue.pending_delivery_ids(cursor))
+}
+
+/// Seed a single pending, actionable batch into a project's durable queue.
+/// Test-only bridge so the handoff module can exercise the migration's
+/// queue-drain guard without reaching into private queue internals.
+#[cfg(test)]
+pub(crate) fn seed_pending_codex_batch(project: &str, from: u64, through: u64) -> Result<String> {
+    let workdir = shelbi_state::project_dir(project)?;
+    let event = NormalizedEvent {
+        cursor: through,
+        offset: from,
+        timestamp: Some("t".into()),
+        kind: "task_transition".into(),
+        raw: format!("t project={project} task=x a -> b to_category=ready"),
+        metadata: BTreeMap::from([
+            ("project".into(), project.into()),
+            ("task".into(), "x".into()),
+        ]),
+    };
+    let queue = DurableQueue {
+        project: project.to_string(),
+        batches: VecDeque::from([QueuedBatch::new(project, from, through, vec![event])]),
+    };
+    let message_id = queue.batches[0].message_id.clone();
+    queue.save(&workdir.join(EVENT_QUEUE_FILE))?;
+    Ok(message_id)
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 enum ThreadPhase {
     Idle,
@@ -2369,6 +2438,18 @@ impl DurableQueue {
             .skip(pending)
             .any(|batch| batch.actionable)
             .then_some(pending)
+    }
+
+    /// Message ids of batches that still carry actionable events past the
+    /// applied cursor. Batches at or below the cursor are already drained;
+    /// quiet (non-actionable) batches never trigger their own delivery, so
+    /// neither category blocks a native-to-legacy runner switch.
+    fn pending_delivery_ids(&self, applied_cursor: u64) -> Vec<String> {
+        self.batches
+            .iter()
+            .filter(|batch| batch.actionable && batch.through > applied_cursor)
+            .map(|batch| batch.message_id.clone())
+            .collect()
     }
 
     fn reconcile_thread(
@@ -3614,6 +3695,58 @@ mod tests {
             &[json!(7)]
         )
         .is_some());
+    }
+
+    #[test]
+    fn pending_delivery_ids_reports_only_undrained_actionable_batches() {
+        let mut queue = DurableQueue {
+            project: "demo".into(),
+            batches: VecDeque::new(),
+        };
+        // Fully drained (through <= cursor): excluded.
+        queue.batches.push_back(batch("demo", 0, 10));
+        // Undrained + actionable: reported.
+        let pending = batch("demo", 10, 20);
+        let pending_id = pending.message_id.clone();
+        queue.batches.push_back(pending);
+        // Undrained but quiet (non-actionable): never blocks a switch.
+        let mut quiet = batch("demo", 20, 30);
+        quiet.actionable = false;
+        queue.batches.push_back(quiet);
+
+        assert_eq!(queue.pending_delivery_ids(10), vec![pending_id]);
+        // With the cursor past everything, nothing is pending.
+        assert!(queue.pending_delivery_ids(30).is_empty());
+    }
+
+    #[test]
+    fn archive_persisted_codex_thread_renames_and_is_idempotent() {
+        let _lock = crate::test_lock::acquire();
+        let previous_home = std::env::var_os("SHELBI_HOME");
+        let temp = tempfile::tempdir().unwrap();
+        std::env::set_var("SHELBI_HOME", temp.path());
+
+        let workdir = shelbi_state::project_dir("demo").unwrap();
+        fs::create_dir_all(&workdir).unwrap();
+        let path = workdir.join(THREAD_STATE_FILE);
+        fs::write(&path, "{}").unwrap();
+
+        let archived = archive_persisted_codex_thread("demo").unwrap().unwrap();
+        assert!(!path.exists());
+        assert!(archived.exists());
+        assert!(archived
+            .file_name()
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .starts_with("codex-thread.json.archived-"));
+        // Nothing left to archive on a repeat call.
+        assert!(archive_persisted_codex_thread("demo").unwrap().is_none());
+
+        match previous_home {
+            Some(home) => std::env::set_var("SHELBI_HOME", home),
+            None => std::env::remove_var("SHELBI_HOME"),
+        }
     }
 
     #[test]

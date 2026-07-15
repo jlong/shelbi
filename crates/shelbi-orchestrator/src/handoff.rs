@@ -12,9 +12,13 @@
 //! standalone Codex pane, we type a request into the orchestrator pane and
 //! poll the filesystem for the handoff file. Once Codex has a persisted
 //! native thread, that thread is the handoff only while the configured runner
-//! remains Codex; a native-to-legacy runner switch fails before pane mutation
-//! because Shelbi cannot safely serialize that thread through the composer.
-//! A 30s timeout caps legacy handoff waits.
+//! remains Codex; switching to a non-Codex runner instead runs a guided
+//! migration before any pane mutation. Shelbi cannot serialize the native
+//! thread through the composer, so it archives the thread marker (leaving the
+//! id recoverable) and proceeds with the file-based handoff — but only after
+//! confirming the durable event queue has no undelivered actionable batches.
+//! If batches are still pending it refuses and names them, so no board events
+//! are silently dropped. A 30s timeout caps legacy handoff waits.
 
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
@@ -82,9 +86,11 @@ pub enum HandoffOutcome {
 /// "okay to proceed" semantics, distinguished only for logging.
 pub fn request_orchestrator_handoff(project_name: &str) -> Result<HandoffOutcome> {
     // The native thread is the handoff only for a same-runner Codex reload.
-    // A Codex -> Claude/custom switch cannot safely use composer transport,
-    // so the shared preflight returns a hard error before the caller tears
-    // down the pane.
+    // A Codex -> Claude/custom switch cannot use composer transport, so the
+    // shared preflight instead archives the thread marker (once the durable
+    // queue is drained) and returns `false`, letting the caller fall through
+    // to the file-based handoff. A still-pending queue surfaces here as a hard
+    // error so the caller aborts before tearing down the pane.
     if validate_configured_orchestrator_transition(project_name)? {
         return Ok(HandoffOutcome::NativeThread);
     }
@@ -132,9 +138,11 @@ pub fn request_orchestrator_handoff(project_name: &str) -> Result<HandoffOutcome
 /// selected in project configuration.
 ///
 /// Returns `true` when an active native Codex thread supplies same-runner
-/// continuity, and `false` for legacy/standalone panes that still use the
-/// file-based handoff. A native Codex thread cannot be cold-started as a
-/// different runner: fail explicitly and leave the thread marker intact.
+/// continuity, and `false` for legacy/standalone panes that use the file-based
+/// handoff. Switching from a native Codex thread to a non-Codex runner is
+/// migrated in place: the thread marker is archived (once the durable queue is
+/// drained) so the switch proceeds, otherwise the switch is refused with the
+/// pending delivery ids and the marker left intact.
 pub(crate) fn validate_configured_orchestrator_transition(project_name: &str) -> Result<bool> {
     let project = shelbi_state::load_project(project_name)?;
     let runner = project
@@ -157,35 +165,97 @@ pub(crate) fn validate_orchestrator_runner_transition(
     runner_name: &str,
     runner_command: &str,
 ) -> Result<bool> {
-    let persisted_native_thread = crate::wake::has_persisted_codex_thread(project_name)?;
-    validate_native_runner_transition(
-        persisted_native_thread,
-        project_name,
-        runner_name,
-        runner_command,
-    )
+    let native_active = crate::wake::has_persisted_codex_thread(project_name)?;
+    // A stale marker (`native_active: false`) is invisible to
+    // `has_persisted_codex_thread` but still needs archiving on a switch, so
+    // probe the file directly when the active check comes back negative.
+    let thread_file_present =
+        native_active || crate::wake::persisted_codex_thread_file_exists(project_name)?;
+    match classify_runner_transition(thread_file_present, native_active, runner_command) {
+        RunnerTransition::NativeContinuity => Ok(true),
+        RunnerTransition::LegacyProceed => Ok(false),
+        RunnerTransition::MigrateToLegacy => {
+            migrate_native_thread_to_legacy(project_name, runner_name, runner_command)?;
+            Ok(false)
+        }
+    }
 }
 
-fn validate_native_runner_transition(
-    persisted_native_thread: bool,
+/// Decision for an imminent orchestrator launch, given the persisted Codex
+/// thread state and the runner argv about to start.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RunnerTransition {
+    /// Same-runner Codex reload: the live native thread is the handoff.
+    NativeContinuity,
+    /// Legacy/cold path with no native thread marker to migrate.
+    LegacyProceed,
+    /// Native thread marker (active, or stale with `native_active: false`) with
+    /// a non-Codex target: archive the marker after the durable-queue drain
+    /// check, then proceed with the file-based handoff.
+    MigrateToLegacy,
+}
+
+fn classify_runner_transition(
+    thread_file_present: bool,
+    native_active: bool,
+    runner_command: &str,
+) -> RunnerTransition {
+    if shelbi_agent::is_codex_runner(runner_command) {
+        // Codex target: an active thread carries same-runner continuity; an
+        // inactive or missing marker is a fresh/cold start that
+        // `open_owned_thread` handles without our help.
+        return if native_active {
+            RunnerTransition::NativeContinuity
+        } else {
+            RunnerTransition::LegacyProceed
+        };
+    }
+    // Non-Codex target: any thread marker must be archived before the switch,
+    // including a stale one — leaving it would let a later Codex reload resume a
+    // thread the user has moved on from.
+    if thread_file_present {
+        RunnerTransition::MigrateToLegacy
+    } else {
+        RunnerTransition::LegacyProceed
+    }
+}
+
+/// Guided native-to-legacy migration. Refuses only when the durable queue still
+/// holds undelivered actionable batches — naming them so the user can restore
+/// the Codex runner, drain them, and retry — otherwise archives the thread
+/// marker so the id stays recoverable and lets the switch proceed.
+fn migrate_native_thread_to_legacy(
     project_name: &str,
     runner_name: &str,
     runner_command: &str,
-) -> Result<bool> {
-    if !uses_native_thread_continuity(persisted_native_thread) {
-        return Ok(false);
+) -> Result<()> {
+    let pending = crate::wake::pending_codex_delivery_ids(project_name)?;
+    if !pending.is_empty() {
+        return Err(Error::Other(format!(
+            "cannot switch project `{project_name}` to orchestrator runner \
+             `{runner_name}` (`{runner_command}`): the Codex event queue still holds \
+             {count} undelivered batch(es) [{ids}]. Restore the Codex runner and let \
+             the orchestrator drain them (each batch leaves the queue once its events \
+             are applied), then retry the switch. The native thread was left intact.",
+            count = pending.len(),
+            ids = pending.join(", "),
+        )));
     }
-    if shelbi_agent::is_codex_runner(runner_command) {
-        return Ok(true);
+    if let Some(archived) = crate::wake::archive_persisted_codex_thread(project_name)? {
+        tracing::info!(
+            project = project_name,
+            archived = %archived.display(),
+            "archived native Codex thread marker for runner switch"
+        );
     }
-    Err(Error::Other(format!(
-        "cannot switch project `{project_name}` from its active native Codex thread to \
-         orchestrator runner `{runner_name}` (`{runner_command}`): Shelbi cannot safely \
-         materialize a native-to-legacy handoff; restore the Codex runner before \
-         starting or reloading the orchestrator (the native thread was left intact)"
-    )))
+    Ok(())
 }
 
+/// Whether a persisted, active native thread supplies same-runner continuity.
+/// Retained as a named predicate for the wake-module tests that assert the
+/// migration boundary; the launch guards now route through
+/// [`classify_runner_transition`].
+#[cfg(test)]
 pub(crate) fn uses_native_thread_continuity(persisted_native_thread: bool) -> bool {
     persisted_native_thread
 }
@@ -394,77 +464,169 @@ mod tests {
     }
 
     #[test]
-    fn live_native_thread_is_continuity_only_for_a_codex_reload() {
-        assert!(validate_native_runner_transition(true, "demo", "codex", "codex").unwrap());
-        assert!(validate_native_runner_transition(
-            true,
-            "demo",
-            "codex-custom",
-            "/opt/codex/bin/codex"
-        )
-        .unwrap());
-        assert!(
-            !validate_native_runner_transition(false, "demo", "claude", "claude").unwrap(),
-            "a legacy pane still needs the file-based migration handoff"
+    fn classify_routes_each_runner_transition() {
+        // Active native thread + a Codex target is same-runner continuity.
+        assert_eq!(
+            classify_runner_transition(true, true, "codex"),
+            RunnerTransition::NativeContinuity
         );
-
-        let error = validate_native_runner_transition(true, "demo", "claude", "claude")
-            .expect_err("native Codex to Claude must fail before a cold respawn")
-            .to_string();
-        assert!(error.contains("cannot switch project `demo`"), "{error}");
-        assert!(error.contains("native-to-legacy handoff"), "{error}");
-        assert!(error.contains("native thread was left intact"), "{error}");
+        assert_eq!(
+            classify_runner_transition(true, true, "/opt/codex/bin/codex"),
+            RunnerTransition::NativeContinuity
+        );
+        // Active native thread + a non-Codex target migrates instead of erroring.
+        assert_eq!(
+            classify_runner_transition(true, true, "claude"),
+            RunnerTransition::MigrateToLegacy
+        );
+        // A stale marker (present but inactive) still gets archived on a switch.
+        assert_eq!(
+            classify_runner_transition(true, false, "claude"),
+            RunnerTransition::MigrateToLegacy
+        );
+        // No marker at all: nothing to migrate on either target.
+        assert_eq!(
+            classify_runner_transition(false, false, "claude"),
+            RunnerTransition::LegacyProceed
+        );
+        // Inactive/missing marker + Codex target is a fresh cold start.
+        assert_eq!(
+            classify_runner_transition(false, false, "codex"),
+            RunnerTransition::LegacyProceed
+        );
     }
 
-    #[test]
-    fn configured_runner_switch_rejects_without_mutating_native_state() {
+    /// Install `SHELBI_HOME` for the duration of a closure, restoring the prior
+    /// value afterward. Serialized by `test_lock` because it mutates env.
+    fn with_temp_home(body: impl FnOnce(&std::path::Path)) {
         let _lock = crate::test_lock::acquire();
         let previous_home = std::env::var_os("SHELBI_HOME");
         let temp = tempfile::tempdir().unwrap();
         std::env::set_var("SHELBI_HOME", temp.path());
+        body(temp.path());
+        match previous_home {
+            Some(home) => std::env::set_var("SHELBI_HOME", home),
+            None => std::env::remove_var("SHELBI_HOME"),
+        }
+    }
 
-        shelbi_state::save_project(&project_with_runner("codex", "codex")).unwrap();
+    fn write_thread_marker(native_active: bool) -> PathBuf {
         let project_dir = shelbi_state::project_dir("demo").unwrap();
         fs::create_dir_all(&project_dir).unwrap();
         let state_path = project_dir.join("codex-thread.json");
         fs::write(
             &state_path,
-            r#"{"version":1,"project":"demo","thread_id":"thread-owned","bootstrap_generation":3,"native_active":true}"#,
+            format!(
+                r#"{{"version":1,"project":"demo","thread_id":"thread-owned","bootstrap_generation":3,"native_active":{native_active}}}"#,
+            ),
         )
         .unwrap();
+        state_path
+    }
 
-        assert_eq!(
-            request_orchestrator_handoff("demo").unwrap(),
-            HandoffOutcome::NativeThread,
-            "same-runner native reload must return before any tmux composer lookup"
-        );
+    fn archived_marker(project_dir: &std::path::Path) -> Option<PathBuf> {
+        fs::read_dir(project_dir)
+            .unwrap()
+            .filter_map(|entry| entry.ok().map(|e| e.path()))
+            .find(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.starts_with("codex-thread.json.archived-"))
+            })
+    }
 
-        shelbi_state::save_project(&project_with_runner("claude", "claude")).unwrap();
-        let before = fs::read(&state_path).unwrap();
-        let error = validate_configured_orchestrator_transition("demo")
-            .expect_err("native Codex to Claude must be rejected")
+    #[test]
+    fn active_native_switch_with_drained_queue_archives_and_proceeds() {
+        with_temp_home(|_| {
+            shelbi_state::save_project(&project_with_runner("codex", "codex")).unwrap();
+            let state_path = write_thread_marker(true);
+            let project_dir = state_path.parent().unwrap().to_path_buf();
+
+            // Same-runner reload is still native continuity, untouched.
+            assert_eq!(
+                request_orchestrator_handoff("demo").unwrap(),
+                HandoffOutcome::NativeThread,
+            );
+
+            // Switch to Claude: no pending queue, so it migrates and proceeds.
+            shelbi_state::save_project(&project_with_runner("claude", "claude")).unwrap();
+            assert!(
+                !validate_configured_orchestrator_transition("demo").unwrap(),
+                "a drained native thread must migrate to the file-based handoff"
+            );
+            assert!(!state_path.exists(), "the live marker should be archived");
+            assert!(
+                archived_marker(&project_dir).is_some(),
+                "an archived marker must remain for recovery"
+            );
+            assert!(!crate::wake::has_persisted_codex_thread("demo").unwrap());
+
+            // Idempotent: a second preflight has nothing left to archive.
+            assert!(!validate_configured_orchestrator_transition("demo").unwrap());
+        });
+    }
+
+    #[test]
+    fn stale_inactive_marker_is_archived_immediately() {
+        with_temp_home(|_| {
+            shelbi_state::save_project(&project_with_runner("claude", "claude")).unwrap();
+            let state_path = write_thread_marker(false);
+            let project_dir = state_path.parent().unwrap().to_path_buf();
+
+            assert!(
+                !validate_configured_orchestrator_transition("demo").unwrap(),
+                "an inactive marker must never block a switch"
+            );
+            assert!(!state_path.exists());
+            assert!(archived_marker(&project_dir).is_some());
+        });
+    }
+
+    #[test]
+    fn pending_queue_blocks_switch_and_names_delivery_ids() {
+        with_temp_home(|_| {
+            shelbi_state::save_project(&project_with_runner("codex", "codex")).unwrap();
+            let state_path = write_thread_marker(true);
+            let before = fs::read(&state_path).unwrap();
+            let message_id = crate::wake::seed_pending_codex_batch("demo", 4, 42).unwrap();
+
+            shelbi_state::save_project(&project_with_runner("claude", "claude")).unwrap();
+            let error = validate_configured_orchestrator_transition("demo")
+                .expect_err("a pending queue must block the switch")
+                .to_string();
+            assert!(error.contains("orchestrator runner `claude`"), "{error}");
+            assert!(error.contains(&message_id), "must name the delivery id: {error}");
+            assert!(error.contains("undelivered"), "{error}");
+            assert!(error.contains("Restore the Codex runner"), "{error}");
+
+            // The switch is refused, so the native thread is left intact.
+            assert_eq!(fs::read(&state_path).unwrap(), before);
+            assert!(crate::wake::has_persisted_codex_thread("demo").unwrap());
+        });
+    }
+
+    #[test]
+    fn captured_non_codex_argv_is_not_authorized_by_later_config() {
+        with_temp_home(|_| {
+            // Marker + Codex config, but a caller already captured Claude argv.
+            shelbi_state::save_project(&project_with_runner("codex", "codex")).unwrap();
+            let state_path = write_thread_marker(true);
+            let project_dir = state_path.parent().unwrap().to_path_buf();
+            crate::wake::seed_pending_codex_batch("demo", 4, 42).unwrap();
+
+            // The immediate launch guard validates captured argv, not a freshly
+            // reloaded config value: a pending queue blocks the captured Claude
+            // launch even though config still reads Codex.
+            let error = validate_orchestrator_runner_transition(
+                "demo",
+                "captured-claude",
+                "/opt/claude/bin/claude",
+            )
+            .expect_err("captured non-Codex argv must go through the migration guard")
             .to_string();
-        assert!(error.contains("orchestrator runner `claude`"), "{error}");
-        assert_eq!(fs::read(&state_path).unwrap(), before);
-        assert!(crate::wake::has_persisted_codex_thread("demo").unwrap());
-
-        // The immediate launch guard validates captured argv, not a freshly
-        // reloaded config value. Even if config changes back to Codex after a
-        // caller captured Claude, that stale Claude launch stays forbidden.
-        shelbi_state::save_project(&project_with_runner("codex", "codex")).unwrap();
-        let stale_error = validate_orchestrator_runner_transition(
-            "demo",
-            "captured-claude",
-            "/opt/claude/bin/claude",
-        )
-        .expect_err("captured non-Codex argv must not be authorized by later config")
-        .to_string();
-        assert!(stale_error.contains("captured-claude"), "{stale_error}");
-        assert_eq!(fs::read(&state_path).unwrap(), before);
-
-        match previous_home {
-            Some(home) => std::env::set_var("SHELBI_HOME", home),
-            None => std::env::remove_var("SHELBI_HOME"),
-        }
+            assert!(error.contains("captured-claude"), "{error}");
+            assert!(state_path.exists(), "a blocked switch leaves the marker intact");
+            assert!(archived_marker(&project_dir).is_none());
+        });
     }
 }

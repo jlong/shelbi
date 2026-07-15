@@ -3220,6 +3220,9 @@ mod reload_target_tmux_tests {
         let project = non_codex_project(&project_name, &hub_work_dir);
         shelbi_state::save_project(&project).unwrap();
         let state_path = seed_active_native_thread(&project_name);
+        // An undelivered batch forces the migration guard to refuse the switch,
+        // so the reject-before-respawn invariant still holds.
+        crate::wake::seed_pending_codex_batch(&project_name, 4, 42).unwrap();
 
         let session = format!("shelbi-{project_name}");
         kill_session(&session);
@@ -3242,7 +3245,7 @@ mod reload_target_tmux_tests {
         let error = reload_target(&project_name, &ReloadTarget::Chat)
             .expect_err("native-to-Claude reload must fail before respawn")
             .to_string();
-        assert!(error.contains("native-to-legacy handoff"), "{error}");
+        assert!(error.contains("undelivered"), "{error}");
         let pane_after = std::process::Command::new("tmux")
             .args([
                 "display-message",
@@ -3275,6 +3278,8 @@ mod reload_target_tmux_tests {
         std::fs::create_dir_all(&hub_work_dir).unwrap();
         shelbi_state::save_project(&non_codex_project(&project_name, &hub_work_dir)).unwrap();
         let state_path = seed_active_native_thread(&project_name);
+        // A pending queue makes the migration refuse before the recovery split.
+        crate::wake::seed_pending_codex_batch(&project_name, 4, 42).unwrap();
         let state_before = std::fs::read(&state_path).unwrap();
 
         let session = format!("shelbi-{project_name}");
@@ -3299,7 +3304,7 @@ mod reload_target_tmux_tests {
         let error = ensure_dashboard(&project_name)
             .expect_err("offline native-to-Claude start must fail before split")
             .to_string();
-        assert!(error.contains("native-to-legacy handoff"), "{error}");
+        assert!(error.contains("undelivered"), "{error}");
         let panes = std::process::Command::new("tmux")
             .args([
                 "list-panes",
@@ -3353,6 +3358,11 @@ mod reload_target_tmux_tests {
         std::fs::write(&handoff_path, handoff_before).unwrap();
 
         let native_state_path = seed_active_native_thread(&project_name);
+        // Seed an undelivered batch so the migration guard rejects, and settle
+        // the applied cursor up front so the guard's drain check reads existing
+        // state rather than initializing anything during the rejected launch.
+        crate::wake::seed_pending_codex_batch(&project_name, 4, 42).unwrap();
+        shelbi_state::write_event_cursor(&project_name, 0).unwrap();
         let native_state_before = std::fs::read(&native_state_path).unwrap();
         let project_dir = shelbi_state::project_dir(&project_name).unwrap();
         let context_dir = project_dir.join(".claude");
@@ -3382,7 +3392,7 @@ mod reload_target_tmux_tests {
         let error = ensure_dashboard(&project_name)
             .expect_err("native-to-Claude cold launch must fail before all bootstrap mutation")
             .to_string();
-        assert!(error.contains("native-to-legacy handoff"), "{error}");
+        assert!(error.contains("undelivered"), "{error}");
 
         assert!(!session_exists(&session), "dashboard session was created");
         assert!(!session_exists(&stash), "hidden-view session was created");
