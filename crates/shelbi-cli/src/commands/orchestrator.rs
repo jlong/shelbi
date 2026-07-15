@@ -389,7 +389,7 @@ struct DrainResponse {
     events: Vec<NormalizedEvent>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, PartialEq, Eq)]
 struct NormalizedEvent {
     cursor: String,
     offset: u64,
