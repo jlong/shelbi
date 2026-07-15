@@ -2169,11 +2169,11 @@ After green, run `shelbi zen pr-merge <pr-number> --match-head-commit <head_sha>
             let body = fs::read_to_string(&settings).unwrap();
             assert!(body.contains("SessionStart"), "{name} missing SessionStart");
             assert!(
-                body.contains(".shelbi/hooks/claude.session-start"),
+                body.contains(".shelbi/hooks/session-start.sh"),
                 "{name} missing SessionStart hook adapter"
             );
             assert!(
-                body.contains(".shelbi/hooks/claude.stop"),
+                body.contains(".shelbi/hooks/stop.sh"),
                 "{name} missing Stop message-inject hook adapter"
             );
             assert!(

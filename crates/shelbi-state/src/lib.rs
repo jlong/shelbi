@@ -2842,8 +2842,8 @@ mod tests {
         // poller depends on, as script references under .shelbi/hooks.
         assert!(!rendered.contains("\"permissions\""));
         assert!(!rendered.contains("{{workspace_permissions_mode}}"));
-        assert!(rendered.contains(".shelbi/hooks/claude.pane-idle"));
-        assert!(rendered.contains(".shelbi/hooks/claude.pane-working"));
+        assert!(rendered.contains(".shelbi/hooks/pane-idle.sh"));
+        assert!(rendered.contains(".shelbi/hooks/pane-working.sh"));
         let _: serde_json::Value = serde_json::from_str(&rendered).unwrap();
         std::env::remove_var("SHELBI_HOME");
     }
@@ -2900,11 +2900,11 @@ mod tests {
         assert!(s.contains("Notification"));
         assert!(s.contains("UserPromptSubmit"));
         assert!(s.contains("PreToolUse"));
-        assert!(s.contains(".shelbi/hooks/claude.session-start"));
-        assert!(s.contains(".shelbi/hooks/claude.stop"));
-        assert!(s.contains(".shelbi/hooks/claude.pane-idle"));
-        assert!(s.contains(".shelbi/hooks/claude.pane-blocked"));
-        assert!(s.contains(".shelbi/hooks/claude.pane-working"));
+        assert!(s.contains(".shelbi/hooks/session-start.sh"));
+        assert!(s.contains(".shelbi/hooks/stop.sh"));
+        assert!(s.contains(".shelbi/hooks/pane-idle.sh"));
+        assert!(s.contains(".shelbi/hooks/pane-blocked.sh"));
+        assert!(s.contains(".shelbi/hooks/pane-working.sh"));
         assert!(
             !s.contains(".shelbi/messages/$TASK_ID.tail.d"),
             "hook bodies must live under .shelbi/hooks, not inline in settings.json",
@@ -2935,15 +2935,15 @@ mod tests {
             serde_json::from_str(DEFAULT_WORKSPACE_SETTINGS_TEMPLATE).unwrap();
         assert_eq!(
             v["hooks"]["SessionStart"][0]["hooks"][0]["command"],
-            ".shelbi/hooks/claude.session-start",
+            ".shelbi/hooks/session-start.sh",
         );
         assert_eq!(
             v["hooks"]["Stop"][0]["hooks"][0]["command"],
-            ".shelbi/hooks/claude.pane-idle",
+            ".shelbi/hooks/pane-idle.sh",
         );
         assert_eq!(
             v["hooks"]["Stop"][1]["hooks"][0]["command"],
-            ".shelbi/hooks/claude.stop",
+            ".shelbi/hooks/stop.sh",
         );
     }
 

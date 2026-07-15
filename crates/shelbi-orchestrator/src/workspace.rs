@@ -1947,27 +1947,27 @@ struct RunnerHookFile {
 
 const RUNNER_HOOK_FILES: &[RunnerHookFile] = &[
     RunnerHookFile {
-        rel_path: ".shelbi/hooks/claude.session-start",
+        rel_path: ".shelbi/hooks/session-start.sh",
         body: MESSAGE_TAIL_START_SH,
         executable: true,
     },
     RunnerHookFile {
-        rel_path: ".shelbi/hooks/claude.stop",
+        rel_path: ".shelbi/hooks/stop.sh",
         body: MESSAGE_DRAIN_STOP_SH,
         executable: true,
     },
     RunnerHookFile {
-        rel_path: ".shelbi/hooks/claude.pane-idle",
+        rel_path: ".shelbi/hooks/pane-idle.sh",
         body: PANE_IDLE_SH,
         executable: true,
     },
     RunnerHookFile {
-        rel_path: ".shelbi/hooks/claude.pane-working",
+        rel_path: ".shelbi/hooks/pane-working.sh",
         body: PANE_WORKING_SH,
         executable: true,
     },
     RunnerHookFile {
-        rel_path: ".shelbi/hooks/claude.pane-blocked",
+        rel_path: ".shelbi/hooks/pane-blocked.sh",
         body: PANE_BLOCKED_SH,
         executable: true,
     },
@@ -1975,14 +1975,21 @@ const RUNNER_HOOK_FILES: &[RunnerHookFile] = &[
 
 /// Deploy Shelbi-owned hook implementations under `<worktree>/.shelbi/hooks`.
 ///
-/// Only Claude has a Shelbi-wired hook channel: its `.claude/settings.json`
-/// calls the `claude.*` scripts deployed here. Codex is not wired for hooks —
-/// the installed CLI rejects the `-c core.hooksPath` override under strict
-/// validation and its only hook config layers (`~/.codex/`, `<repo>/.codex/`)
-/// are user-owned, so Codex falls back to prompt-level polling (see
-/// [`shelbi_agent::message_channel`]) and no `codex.*` files are deployed. The
-/// hook bodies live in Shelbi's scratch namespace so dispatches never overwrite
-/// user-owned `.codex/`/`.claude/` config and only rewrite Shelbi-owned files.
+/// The scripts are runner-neutral: one copy of each hook body
+/// (`session-start.sh`, `stop.sh`, `pane-idle.sh`, ...) lives here and each
+/// runner's config shim points at the shared path. Only Claude has a
+/// Shelbi-wired hook channel today: its `.claude/settings.json` maps the
+/// SessionStart/Stop/Notification/UserPromptSubmit/PreToolUse events onto these
+/// scripts. Codex is not wired for hooks — the installed CLI rejects the
+/// `-c core.hooksPath` override under strict validation and its only hook config
+/// layers (`~/.codex/`, `<repo>/.codex/`) are user-owned, so Codex falls back to
+/// prompt-level polling (see [`shelbi_agent::message_channel`]) and deploys no
+/// hook config of its own. The bodies live in Shelbi's scratch namespace so
+/// dispatches never overwrite user-owned `.codex/`/`.claude/` config and only
+/// rewrite Shelbi-owned files. A workspace deployed by an older shelbi keeps its
+/// stale `claude.*` filenames on disk; nothing regenerates them, and the next
+/// launch re-renders settings.json to reference the neutral scripts, so a live
+/// workspace converges on relaunch without manual cleanup.
 pub fn deploy_runner_hooks(host: &Host, worktree: &Path) -> Result<()> {
     for file in RUNNER_HOOK_FILES {
         deploy_runner_hook_file(host, worktree, file)?;
@@ -4262,7 +4269,7 @@ mod tests {
     }
 
     #[test]
-    fn deploy_runner_hooks_writes_shelbi_owned_claude_scripts_only() {
+    fn deploy_runner_hooks_writes_shelbi_owned_neutral_scripts_only() {
         let tmp = std::env::temp_dir().join(format!(
             "shelbi-runner-hooks-test-{}-{}",
             std::process::id(),
@@ -4276,10 +4283,16 @@ mod tests {
 
         deploy_runner_hooks(&Host::Local, &worktree).unwrap();
 
-        let claude_start = worktree.join(".shelbi/hooks/claude.session-start");
-        let claude_stop = worktree.join(".shelbi/hooks/claude.stop");
-        assert!(claude_start.is_file(), "missing {}", claude_start.display());
-        assert!(claude_stop.is_file(), "missing {}", claude_stop.display());
+        // The hook scripts are runner-neutral — one copy of each body, no
+        // per-runner (`claude.*`/`codex.*`) duplicates.
+        let start = worktree.join(".shelbi/hooks/session-start.sh");
+        let stop = worktree.join(".shelbi/hooks/stop.sh");
+        assert!(start.is_file(), "missing {}", start.display());
+        assert!(stop.is_file(), "missing {}", stop.display());
+        assert!(
+            !worktree.join(".shelbi/hooks/claude.session-start").exists(),
+            "per-runner claude.* filenames must no longer be deployed",
+        );
 
         // Codex is a polling runner (no verified hook channel), so no codex.*
         // hook files or the invalid codex.toml are deployed. An earlier version
@@ -4294,11 +4307,11 @@ mod tests {
             "codex hook scripts must not be deployed",
         );
 
-        let start_body = std::fs::read_to_string(&claude_start).unwrap();
+        let start_body = std::fs::read_to_string(&start).unwrap();
         assert!(start_body.contains(".shelbi/messages/$TASK_ID.tail.d"));
         assert!(start_body.contains(".no-task-id.log"));
 
-        let stop_body = std::fs::read_to_string(&claude_stop).unwrap();
+        let stop_body = std::fs::read_to_string(&stop).unwrap();
         assert!(stop_body.contains("UNREAD=.shelbi/messages/$TASK_ID.unread.log"));
         assert!(stop_body.contains("message-ack"));
         assert!(stop_body.contains("$SHELBI_HUB_SOCK"));
@@ -4306,7 +4319,7 @@ mod tests {
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            let mode = std::fs::metadata(&claude_start)
+            let mode = std::fs::metadata(&start)
                 .unwrap()
                 .permissions()
                 .mode()
@@ -4336,7 +4349,7 @@ mod tests {
         std::fs::create_dir_all(&worktree).unwrap();
         deploy_runner_hooks(&Host::Local, &worktree).unwrap();
 
-        let script = ".shelbi/hooks/claude.session-start";
+        let script = ".shelbi/hooks/session-start.sh";
         let missing = std::process::Command::new("sh")
             .arg("-c")
             .arg(script)
