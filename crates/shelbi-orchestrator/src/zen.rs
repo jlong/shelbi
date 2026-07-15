@@ -34,7 +34,7 @@ use crate::git::{
     login_shell_prefix, lookup_open_pr_in_repository, lookup_origin_repository,
     lookup_origin_repository_selector,
     lookup_origin_repository_with_push_target, lookup_pr_identity, parse_pr_number_from_url,
-    run_in_dir, run_login_shell_script, RepositoryIdentity,
+    run_in_dir, run_login_shell_script_with_deadline, RepositoryIdentity,
 };
 use crate::workspace::{rebase_workspace_branch_onto_default, workspace_worktree, RebaseOutcome};
 
@@ -6287,6 +6287,16 @@ fn run_one_check_with_shared_cargo_target(
             }
             (code, buf)
         }
+        Err(e) if e.kind() == std::io::ErrorKind::TimedOut => (
+            LOCAL_CHECK_TIMED_OUT_EXIT,
+            format!(
+                "(shelbi: check exceeded the {}s local-check timeout and was terminated. \
+                 This bound keeps a wedged check from stalling `shelbi zen probe` on a \
+                 loaded machine — the full suite runs in CI. Raise \
+                 SHELBI_LOCAL_CHECK_TIMEOUT_SECS if this check is legitimately slower.)\n",
+                local_check_timeout().as_secs()
+            ),
+        ),
         Err(e) => (-1, format!("(shelbi: failed to launch command: {e})\n")),
     };
 
@@ -6315,7 +6325,34 @@ fn run_one_check_with_shared_cargo_target(
 /// terminal — see [`login_shell_prefix`] for the host-specific shell
 /// resolution.
 fn run_check_script(host: &Host, script: &str) -> std::io::Result<Output> {
-    run_login_shell_script(host, script)
+    run_login_shell_script_with_deadline(host, script, local_check_timeout())
+}
+
+/// Default wall-clock budget for a single Zen local check. Generous enough
+/// that a cold `cargo build && cargo test --workspace` on a slow-but-healthy
+/// machine finishes comfortably, but bounded so a wedged check (the loaded-hub
+/// hang that traps workers in multi-hour verification loops) fails fast
+/// instead of stalling `shelbi zen probe` and the orchestrator behind it.
+const DEFAULT_LOCAL_CHECK_TIMEOUT: Duration = Duration::from_secs(20 * 60);
+
+/// Exit code reported for a check killed by [`local_check_timeout`]. Matches
+/// GNU `timeout(1)`'s convention so the number reads the same to anyone who
+/// has seen a shell `timeout` fire.
+const LOCAL_CHECK_TIMED_OUT_EXIT: i32 = 124;
+
+/// Per-check wall-clock budget, overridable via `SHELBI_LOCAL_CHECK_TIMEOUT_SECS`
+/// for the rare host whose legitimate suite genuinely runs longer than the
+/// default (or a test that wants a tiny budget). A value of `0` — or any
+/// unparseable value — falls back to the default rather than disabling the
+/// guard, since "no timeout" is the failure mode this exists to prevent.
+fn local_check_timeout() -> Duration {
+    match std::env::var("SHELBI_LOCAL_CHECK_TIMEOUT_SECS") {
+        Ok(raw) => match raw.trim().parse::<u64>() {
+            Ok(secs) if secs > 0 => Duration::from_secs(secs),
+            _ => DEFAULT_LOCAL_CHECK_TIMEOUT,
+        },
+        Err(_) => DEFAULT_LOCAL_CHECK_TIMEOUT,
+    }
 }
 
 /// If the check exited 127 (POSIX "command not found"), append a shelbi
@@ -7118,6 +7155,50 @@ mod probe_tests {
             res.output_tail.contains("login-shell-tool-ran"),
             "expected fake tool's output, got: {}",
             res.output_tail
+        );
+    }
+
+    #[test]
+    fn local_check_that_hangs_is_killed_at_the_deadline() {
+        // The loaded-hub failure this whole change targets: a local check
+        // (real-world `cargo test --workspace`) wedges for many minutes. With
+        // a bounded per-check deadline it must fail *fast* with a distinct
+        // exit code instead of stalling the probe. We stand in a 30s `sleep`
+        // for the wedge and pin the budget to 1s so the test itself is quick.
+        let _guard = crate::test_lock::acquire();
+        let prev_shell = std::env::var_os("SHELL");
+        let prev_timeout = std::env::var_os("SHELBI_LOCAL_CHECK_TIMEOUT_SECS");
+        std::env::set_var("SHELL", "/bin/sh");
+        std::env::set_var("SHELBI_LOCAL_CHECK_TIMEOUT_SECS", "1");
+
+        let tmp = tempfile::tempdir().unwrap();
+        let started = Instant::now();
+        let res = run_one_check(&Host::Local, tmp.path(), "sleep 30");
+        let elapsed = started.elapsed();
+
+        match prev_shell {
+            Some(v) => std::env::set_var("SHELL", v),
+            None => std::env::remove_var("SHELL"),
+        }
+        match prev_timeout {
+            Some(v) => std::env::set_var("SHELBI_LOCAL_CHECK_TIMEOUT_SECS", v),
+            None => std::env::remove_var("SHELBI_LOCAL_CHECK_TIMEOUT_SECS"),
+        }
+
+        assert_eq!(
+            res.exit_code, LOCAL_CHECK_TIMED_OUT_EXIT,
+            "a wedged check must report the timeout exit code; got: {}",
+            res.output_tail
+        );
+        assert!(
+            res.output_tail.contains("local-check timeout"),
+            "timed-out check should explain itself; got: {}",
+            res.output_tail
+        );
+        assert!(
+            elapsed < Duration::from_secs(15),
+            "the check must be killed near the 1s deadline, not run the full 30s sleep; \
+             took {elapsed:?}"
         );
     }
 

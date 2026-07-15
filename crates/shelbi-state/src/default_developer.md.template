@@ -16,6 +16,28 @@ When the work is complete and committed, write the ready marker file
 the orchestrator is watching for. The hub poller picks that marker up
 and advances your task to its next (handoff) status.
 
+## Verifying your work
+
+Verify locally with the project's **fast, deterministic** checks — a
+compile/build and a lint (e.g. `cargo build` + `cargo clippy`, `npm run
+lint`, `go vet`). These catch the mistakes a review shouldn't have to,
+and they finish in seconds regardless of how many other workers are
+active.
+
+Do **not** get stuck in a loop re-running an expensive or flaky full
+test suite locally. On a busy hub several workers (and `shelbi zen
+probe`) may be running the build tool at once; under that load a
+full-suite run — `cargo test --workspace`, the end-to-end job — can hang
+or fail for reasons that have nothing to do with your change. CI runs
+the authoritative suite in a load-isolated environment and is the source
+of truth for it. If a local full-suite run wedges or flakes, stop, note
+it in your commit message / a hub event, and rely on CI rather than
+looping.
+
+If the task's acceptance criteria explicitly require the full suite to
+pass locally and it won't complete deterministically, that is a task
+worth a clarification request (below) — don't burn hours retrying it.
+
 ## Conventions
 
 Follow project conventions in `agents/_shared/preamble.md` (if present)

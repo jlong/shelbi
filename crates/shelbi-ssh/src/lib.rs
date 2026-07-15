@@ -351,6 +351,18 @@ where
     cmd.stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    // Put the child in its own process group so a timeout can kill the whole
+    // tree, not just the direct child. Without this, killing e.g. a login
+    // shell leaves its grandchildren (`cargo test` and everything it spawned)
+    // running — and, worse, still holding the write ends of our stdout/stderr
+    // pipes, so the reader threads below never see EOF and the deadline path
+    // blocks until the orphans finish anyway. `process_group(0)` makes the
+    // child a group leader (pgid == pid); we signal `-pid` on timeout.
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        cmd.process_group(0);
+    }
     tracing::debug!(?cmd, host = ?host, ?deadline, "ssh::run_with_deadline");
     let mut child = cmd.spawn()?;
 
@@ -375,8 +387,21 @@ where
             break status;
         }
         if start.elapsed() >= deadline {
-            // Kill (best-effort — the child may have exited in the gap) and
-            // reap so the long-lived hub daemon doesn't accumulate zombies.
+            // Kill the whole process group (best-effort — the child may have
+            // exited in the gap), then reap so the long-lived hub daemon
+            // doesn't accumulate zombies. The group signal reaches any
+            // grandchildren the child spawned; `child.kill()` is the fallback
+            // for the (non-unix / group-setup-failed) case where we only have
+            // the direct child.
+            #[cfg(unix)]
+            {
+                // Safety: `kill(2)` with a negative pid signals the process
+                // group; no memory is touched. `child.id()` is the group
+                // leader's pid because we set `process_group(0)` above.
+                unsafe {
+                    libc::kill(-(child.id() as libc::pid_t), libc::SIGKILL);
+                }
+            }
             let _ = child.kill();
             let _ = child.wait();
             // The kill closed the pipes, so the readers see EOF and finish.
@@ -1145,6 +1170,32 @@ mod tests {
         assert!(
             start.elapsed() < Duration::from_secs(5),
             "deadline enforcement took {:?}",
+            start.elapsed()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn run_with_deadline_kills_the_whole_process_group() {
+        // The real hub failure: the timed-out command is a *shell* that has
+        // spawned a long-running grandchild (`cargo test` and its tree). If we
+        // only kill the direct child, the grandchild keeps running AND keeps
+        // the inherited stdout/stderr pipes open, so the deadline path blocks
+        // on the pipe readers until the grandchild finishes on its own. The
+        // process-group kill must reach the grandchild so this returns fast.
+        let start = std::time::Instant::now();
+        let err = run_with_deadline(
+            &Host::Local,
+            // `exec` would make sleep the direct child; we deliberately keep
+            // the shell as the leader and sleep as a distinct grandchild.
+            ["sh", "-c", "sleep 30"],
+            Duration::from_millis(200),
+        )
+        .expect_err("hung grandchild must time out");
+        assert_eq!(err.kind(), std::io::ErrorKind::TimedOut, "err: {err}");
+        assert!(
+            start.elapsed() < Duration::from_secs(5),
+            "group kill must not block on the orphaned grandchild; took {:?}",
             start.elapsed()
         );
     }

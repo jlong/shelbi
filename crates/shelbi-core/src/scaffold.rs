@@ -182,12 +182,20 @@ git:
 ",
     },
     Section {
-        prose: &["Zen Mode: local checks that gate a promotion, CI wait, and danger globs."],
+        prose: &[
+            "Zen Mode: local checks that gate a promotion, CI wait, and danger globs.",
+            "Keep `local` checks fast and deterministic (a build + a lint). They run",
+            "on every promotion and on each `shelbi zen probe`, so a slow or flaky",
+            "full test suite here hangs workers under concurrent load. Let CI own the",
+            "authoritative full suite; a wedged local check is bounded by",
+            "SHELBI_LOCAL_CHECK_TIMEOUT_SECS (default 1200) and fails fast.",
+        ],
         yaml: "\
 zen:
   checks:
     local:
-      - cargo test --workspace
+      - cargo build --workspace   # fast; full `cargo test` runs in CI
+      - cargo clippy --workspace --all-targets -- -D warnings
   ci_timeout: 900            # seconds Zen waits for CI. Default 900 (15m)
   danger_paths:
     extend: [\".env\", \"infra/**\"]   # or `override: [...]`, or a bare list
