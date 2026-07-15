@@ -10,7 +10,7 @@ use std::{
 use anyhow::{anyhow, Result};
 use chrono::{DateTime, Utc};
 use clap::Subcommand;
-use shelbi_core::{Column, ConfigMode, Task, WorkspaceSpec};
+use shelbi_core::{Column, ConfigMode, IntegrationMode, Task, WorkspaceSpec};
 use shelbi_orchestrator::workspace as orch_workspace;
 use shelbi_state::WorkspaceStatus;
 
@@ -105,10 +105,46 @@ pub(crate) fn print_workspaces(project: &str) -> Result<()> {
     let assigned: Vec<&Task> = in_progress.iter().map(|tf| &tf.task).collect();
 
     let occupied = occupied_idle_workspaces(&p, &assigned)?;
-    for line in render_list_with_occupied(&p.workspaces, &assigned, &occupied)? {
+    let modes = workspace_integration_modes(&p);
+    for line in render_list_with_occupied(&p.workspaces, &assigned, &occupied, &modes)? {
         println!("{line}");
     }
     Ok(())
+}
+
+/// The integration transport tier for each declared workspace, keyed by
+/// workspace name. Workspace agents don't run the native Codex bridge; their
+/// tier is decided by whether Shelbi can push/verify against the runner —
+/// Claude Code and Codex panes get the verified tmux-submission + OSC-hook
+/// contract (`conventional`), anything Shelbi can only poll is `degraded`.
+fn workspace_integration_modes(
+    project: &shelbi_core::Project,
+) -> BTreeMap<String, IntegrationMode> {
+    project
+        .workspaces
+        .iter()
+        .map(|workspace| {
+            let mode = project
+                .runner(&workspace.runner)
+                .map(|runner| workspace_integration_mode(&runner.command))
+                .unwrap_or(IntegrationMode::Degraded);
+            (workspace.name.clone(), mode)
+        })
+        .collect()
+}
+
+/// Classify a workspace runner command into its integration tier. A runner
+/// Shelbi knows how to wake with verified submission and read OSC pane-title
+/// markers from (Claude Code, Codex) is `conventional`; an unrecognized runner
+/// is `degraded` (polling contract only).
+fn workspace_integration_mode(runner_command: &str) -> IntegrationMode {
+    if shelbi_agent::is_claude_runner(runner_command)
+        || shelbi_agent::is_codex_runner(runner_command)
+    {
+        IntegrationMode::Conventional
+    } else {
+        IntegrationMode::Degraded
+    }
 }
 
 /// Why an idle workspace's STATE cell isn't the plain `idle` token. A
@@ -206,18 +242,19 @@ fn render_list(
     workspaces: &[WorkspaceSpec],
     in_progress: &[&Task],
 ) -> Result<Vec<String>> {
-    render_list_with_occupied(workspaces, in_progress, &BTreeMap::new())
+    render_list_with_occupied(workspaces, in_progress, &BTreeMap::new(), &BTreeMap::new())
 }
 
 fn render_list_with_occupied(
     workspaces: &[WorkspaceSpec],
     in_progress: &[&Task],
     occupied_idle: &BTreeMap<String, OccupiedKind>,
+    integration: &BTreeMap<String, IntegrationMode>,
 ) -> Result<Vec<String>> {
     let mut out = Vec::with_capacity(workspaces.len() + 1);
     out.push(format!(
-        "{:<12} {:<8} {:<14} {:<14} {}",
-        "NAME", "HOST", "RUNNER", "AGENT", "STATE"
+        "{:<12} {:<8} {:<14} {:<14} {:<13} {}",
+        "NAME", "HOST", "RUNNER", "AGENT", "INTEG", "STATE"
     ));
     for workspace in workspaces {
         let mine: Vec<&Task> = in_progress
@@ -248,9 +285,16 @@ fn render_list_with_occupied(
                 .join(", ");
             (agent, format!("in_progress: {ids}"))
         };
+        // Missing entry (the bare `render_list` helper passes an empty map)
+        // defaults to `conventional` — the tier an ordinary Claude Code
+        // workspace runs at.
+        let integ = integration
+            .get(&workspace.name)
+            .copied()
+            .unwrap_or(IntegrationMode::Conventional);
         out.push(format!(
-            "{:<12} {:<8} {:<14} {:<14} {}",
-            workspace.name, workspace.machine, workspace.runner, agent, state
+            "{:<12} {:<8} {:<14} {:<14} {:<13} {}",
+            workspace.name, workspace.machine, workspace.runner, agent, integ, state
         ));
     }
     Ok(out)
@@ -592,6 +636,49 @@ mod tests {
         // The legacy `claude` column is gone.
         assert!(!header.contains("CLAUDE"));
         assert!(!header.contains("MODEL"));
+        // The integration tier column sits between AGENT and STATE so STATE
+        // stays the trailing free-form cell.
+        let integ_at = header.find("INTEG").unwrap();
+        assert!(agent_at < integ_at);
+        assert!(integ_at < state_at);
+    }
+
+    #[test]
+    fn render_list_surfaces_per_workspace_integration_tier() {
+        let workspaces = vec![
+            make_workspace("alpha", "hub", "opus-4-7"),
+            make_workspace("bravo", "hub", "opus-4-7"),
+        ];
+        let in_progress: Vec<&Task> = Vec::new();
+        // alpha runs a hook-capable runner (conventional); bravo's runner is
+        // unrecognized, so it can only be polled (degraded).
+        let modes = BTreeMap::from([
+            ("alpha".to_string(), IntegrationMode::Conventional),
+            ("bravo".to_string(), IntegrationMode::Degraded),
+        ]);
+
+        let rows =
+            render_list_with_occupied(&workspaces, &in_progress, &BTreeMap::new(), &modes).unwrap();
+        assert!(rows[1].contains("conventional"), "row: {}", rows[1]);
+        assert!(rows[2].contains("degraded"), "row: {}", rows[2]);
+        // STATE stays last: an idle workspace still ends with `idle`.
+        assert!(rows[1].trim_end().ends_with("idle"), "row: {}", rows[1]);
+    }
+
+    #[test]
+    fn workspace_integration_mode_classifies_runner_commands() {
+        assert_eq!(
+            workspace_integration_mode("claude"),
+            IntegrationMode::Conventional
+        );
+        assert_eq!(
+            workspace_integration_mode("/opt/homebrew/bin/codex"),
+            IntegrationMode::Conventional
+        );
+        assert_eq!(
+            workspace_integration_mode("some-unknown-runner"),
+            IntegrationMode::Degraded
+        );
     }
 
     #[test]
@@ -661,7 +748,7 @@ mod tests {
         let in_progress: Vec<&Task> = Vec::new();
         let occupied = BTreeMap::from([("delta".to_string(), OccupiedKind::Orphaned)]);
 
-        let rows = render_list_with_occupied(&workspaces, &in_progress, &occupied).unwrap();
+        let rows = render_list_with_occupied(&workspaces, &in_progress, &occupied, &BTreeMap::new()).unwrap();
         let row = &rows[1];
         assert!(row.contains("delta"), "row: {row}");
         assert!(row.contains(&format!(" {IDLE_AGENT_CELL} ")), "row: {row}");
@@ -678,7 +765,7 @@ mod tests {
         let in_progress: Vec<&Task> = Vec::new();
         let occupied = BTreeMap::from([("delta".to_string(), OccupiedKind::UserShell)]);
 
-        let rows = render_list_with_occupied(&workspaces, &in_progress, &occupied).unwrap();
+        let rows = render_list_with_occupied(&workspaces, &in_progress, &occupied, &BTreeMap::new()).unwrap();
         let row = &rows[1];
         assert!(row.contains("delta"), "row: {row}");
         assert!(row.contains(&format!(" {IDLE_AGENT_CELL} ")), "row: {row}");
@@ -703,7 +790,7 @@ mod tests {
             ),
         )]);
 
-        let rows = render_list_with_occupied(&workspaces, &in_progress, &occupied).unwrap();
+        let rows = render_list_with_occupied(&workspaces, &in_progress, &occupied, &BTreeMap::new()).unwrap();
         let row = &rows[1];
         assert!(row.contains("delta"), "row: {row}");
         assert!(row.contains(&format!(" {IDLE_AGENT_CELL} ")), "row: {row}");
@@ -722,7 +809,7 @@ mod tests {
         let in_progress: Vec<&Task> = vec![&task];
         let occupied = BTreeMap::from([("delta".to_string(), OccupiedKind::Orphaned)]);
 
-        let rows = render_list_with_occupied(&workspaces, &in_progress, &occupied).unwrap();
+        let rows = render_list_with_occupied(&workspaces, &in_progress, &occupied, &BTreeMap::new()).unwrap();
         let row = &rows[1];
         assert!(row.contains("in_progress: bug-fix"), "row: {row}");
         assert!(!row.contains("orphaned session"), "row: {row}");

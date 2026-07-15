@@ -1,4 +1,5 @@
 pub mod error;
+pub mod integration;
 pub mod model;
 pub mod placeholders;
 pub mod scaffold;
@@ -9,6 +10,7 @@ pub mod workflow;
 pub mod workspace_names;
 
 pub use error::{Error, Result};
+pub use integration::IntegrationMode;
 pub use model::{
     checks_for_task, checks_for_task_in_workflow, ci_timeout_for_workflow,
     danger_paths_for_project, danger_paths_for_workflow, default_dialog_signatures,

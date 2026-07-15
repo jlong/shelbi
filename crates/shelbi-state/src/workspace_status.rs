@@ -24,7 +24,7 @@ use std::time::{Duration, SystemTime};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-use shelbi_core::{Column, Result, DEFAULT_WORKFLOW_NAME};
+use shelbi_core::{Column, IntegrationMode, Result, DEFAULT_WORKFLOW_NAME};
 
 use crate::{acquire_file_lock, atomic_write, ensure_dir, project_dir, projects_dir, shelbi_home};
 
@@ -89,6 +89,7 @@ pub enum EventKind {
     Zen,
     ZenDryrun,
     Supervision,
+    Integration,
     Project,
     External,
 }
@@ -126,6 +127,8 @@ impl EventKind {
             EventKind::ZenDryrun
         } else if body.contains(" supervision=") {
             EventKind::Supervision
+        } else if body.contains(" integration ") {
+            EventKind::Integration
         } else if body.contains(" project=") || body.starts_with("project=") {
             EventKind::Project
         } else {
@@ -1178,6 +1181,41 @@ pub fn append_project_event(project: &str, action: &str, reason: &str) -> Result
     append_event_line(&format!("{ts} project={project} {action} reason={reason}"))
 }
 
+/// Append a per-agent integration-mode transition to `~/.shelbi/events.log`:
+///
+/// ```text
+/// <rfc3339> project=<p> agent=<name> integration wake=<mode> messages=<mode> reason=<short>
+/// ```
+///
+/// Emitted when an agent's transport tier changes — currently the orchestrator's
+/// Codex native bridge engaging (`wake=structured messages=structured`) or
+/// falling back to standalone turn-boundary polling
+/// (`wake=degraded messages=degraded`). The `wake` and `messages` axes are
+/// carried separately (event delivery *into* the agent vs. state readback
+/// *from* it) so they can diverge later; today both reflect the same underlying
+/// transport for a given agent.
+///
+/// Observability only: no reaction rule schedules off this line. `reason` is a
+/// short machine token (`protocol-incompatible`, `version-gate`,
+/// `native-bridge-reengaged`, …) folded to a single record; the leading
+/// `project=<name>` scope matches every other event so a hub-global tail can
+/// tell two projects' same-named agents apart.
+pub fn append_integration_event(
+    project: &str,
+    agent: &str,
+    wake: IntegrationMode,
+    messages: IntegrationMode,
+    reason: &str,
+) -> Result<()> {
+    let ts = Utc::now().to_rfc3339();
+    let project = sanitize_field(project);
+    let agent = sanitize_field(agent);
+    let reason = sanitize_reason(reason);
+    append_event_line(&format!(
+        "{ts} project={project} agent={agent} integration wake={wake} messages={messages} reason={reason}"
+    ))
+}
+
 /// Append a supervision line recording an automatic pane relaunch or a
 /// crash-loop give-up to `~/.shelbi/events.log`.
 ///
@@ -2087,6 +2125,52 @@ mod tests {
             serde_json::to_value(&send).unwrap()["kind"],
             serde_json::json!("send")
         );
+    }
+
+    #[test]
+    fn integration_event_line_classifies_and_round_trips() {
+        let line = append_integration_line_for_test(
+            "demo",
+            "orchestrator",
+            IntegrationMode::Degraded,
+            IntegrationMode::Degraded,
+            "protocol-incompatible",
+        );
+        // The ` integration ` discriminator must win over the trailing
+        // `project=` / `reason=` fields so the envelope isn't mislabeled as a
+        // generic project or workspace event.
+        let envelope = EventEnvelope::from_log_line(&line);
+        assert_eq!(envelope.kind, EventKind::Integration);
+        assert_eq!(envelope.project.as_deref(), Some("demo"));
+        assert_eq!(
+            serde_json::to_value(&envelope).unwrap()["kind"],
+            serde_json::json!("integration")
+        );
+        assert!(line.contains("agent=orchestrator"), "line: {line}");
+        assert!(
+            line.contains("wake=degraded messages=degraded"),
+            "line: {line}"
+        );
+        assert!(line.contains("reason=protocol-incompatible"), "line: {line}");
+    }
+
+    /// Build the exact `append_integration_event` line body without touching
+    /// the on-disk log, so the classifier can be checked in isolation.
+    fn append_integration_line_for_test(
+        project: &str,
+        agent: &str,
+        wake: IntegrationMode,
+        messages: IntegrationMode,
+        reason: &str,
+    ) -> String {
+        format!(
+            "2026-07-06T12:03:00+00:00 project={} agent={} integration wake={} messages={} reason={}",
+            sanitize_field(project),
+            sanitize_field(agent),
+            wake,
+            messages,
+            sanitize_reason(reason),
+        )
     }
 
     #[test]
