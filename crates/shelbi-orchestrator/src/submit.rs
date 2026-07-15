@@ -410,6 +410,77 @@ fn verify_submitted_with(
     )
 }
 
+/// Verify that a prompt **seeded through the launch command** (a positional-arg
+/// / flag-file / stdin injection — *not* typed into the input box) actually
+/// submitted and drove the pane busy. Returns `true` the moment a busy signal
+/// appears, `false` if none does within `timeout`.
+///
+/// This is deliberately stricter than [`verify_submitted`]. The paste path
+/// proves a submit three ways, one of which is "the input box no longer holds
+/// the delivered text." That signal is meaningless for a launch-seed: the
+/// prompt was passed as a CLI argument, so it is NEVER typed into the box — an
+/// empty *idle* box therefore trivially "doesn't hold our text" from the
+/// instant claude draws it, and counting that as a clear would false-confirm a
+/// seed that never submitted (claude left sitting at an empty prompt, `Ctx 0`;
+/// observed 2026-07-15 re-dispatching to bravo, where the board read
+/// `in_progress` while the pane was idle). A launch-seed only counts as
+/// submitted on a POSITIVE busy signal: the `shelbi:working` title marker or
+/// claude/codex actively processing a turn.
+///
+/// On `false` the caller falls back to a typed paste of the same prompt, whose
+/// cleared-box signal *is* trustworthy because it types the text into the box.
+pub fn verify_seeded(
+    host: &Host,
+    addr: &TmuxAddr,
+    baseline: &PaneBaseline,
+    timeout: std::time::Duration,
+) -> bool {
+    // Delivery-only runners expose no pane chrome to read; there is nothing to
+    // verify here. The caller records that capability gap explicitly (an
+    // `unverified` dispatch, exactly as the paste path does for these runners),
+    // so never claim a busy signal we cannot actually observe.
+    if !baseline.profile.has_ui_verifier() {
+        return false;
+    }
+    let start = std::time::Instant::now();
+    loop {
+        let title = if baseline.profile == SubmitProfile::ClaudeUi && !baseline.title_working {
+            shelbi_tmux::pane_title(host, addr).unwrap_or_default()
+        } else {
+            String::new()
+        };
+        let screen =
+            shelbi_tmux::capture_history(host, addr, PROMPT_SUBMIT_SCROLLBACK).unwrap_or_default();
+        if seed_busy_signal(&title, &screen, baseline) {
+            return true;
+        }
+        if start.elapsed() >= timeout {
+            return false;
+        }
+        std::thread::sleep(PROMPT_SUBMIT_POLL);
+    }
+}
+
+/// Pure decision core for [`verify_seeded`]: does the captured `title` / `screen`
+/// show a POSITIVE busy signal for this profile? Unlike
+/// [`screen_shows_submitted_profile`] there is deliberately no cleared-box
+/// branch — see [`verify_seeded`] for why an empty box cannot be trusted for a
+/// launch-seed.
+fn seed_busy_signal(title: &str, screen: &str, baseline: &PaneBaseline) -> bool {
+    if baseline.profile == SubmitProfile::ClaudeUi
+        && !baseline.title_working
+        && title_signals_submit(title)
+    {
+        return true;
+    }
+    let processing = match baseline.profile {
+        SubmitProfile::ClaudeUi => claude_is_processing(screen),
+        SubmitProfile::CodexUi => codex_is_processing(screen),
+        SubmitProfile::DeliveryOnly => false,
+    };
+    processing && !baseline.busy
+}
+
 /// Poll the pane until we have proof the text got submitted, or `timeout`
 /// elapses. Capture failures during the poll are transient (the SSH socket
 /// can hiccup); we just ignore them and keep polling.
@@ -993,6 +1064,89 @@ mod tests {
         assert_eq!(retries.get(), 1);
     }
 
+    #[test]
+    fn seed_verify_rejects_an_empty_idle_input_box() {
+        // The bug: a launch-seeded prompt that never submitted leaves claude at
+        // an empty, idle input box (`Ctx 0`). Because the seed was never typed
+        // into the box, the paste path's "box no longer holds our text" signal
+        // is trivially true here — so the seed verifier must NOT trust it, or it
+        // false-confirms a dispatch onto an idle worker.
+        let baseline = PaneBaseline::fresh(SubmitProfile::ClaudeUi);
+        assert!(
+            !seed_busy_signal("shelbi:idle", INPUT_BOX_SCREEN, &baseline),
+            "an empty idle input box must not read as a submitted seed"
+        );
+    }
+
+    #[test]
+    fn seed_verify_confirms_a_busy_pane() {
+        let baseline = PaneBaseline::fresh(SubmitProfile::ClaudeUi);
+        // Claude's live spinner footer (title already clobbered by its own OSC).
+        assert!(seed_busy_signal("", BUSY_SCREEN_SPINNER, &baseline));
+        // The `esc to interrupt` footer is an equally valid busy signal.
+        assert!(seed_busy_signal("", BUSY_SCREEN_ESC_FOOTER, &baseline));
+    }
+
+    #[test]
+    fn seed_verify_confirms_on_the_working_title_marker() {
+        let baseline = PaneBaseline::fresh(SubmitProfile::ClaudeUi);
+        // Even with an otherwise-idle-looking screen, the `shelbi:working` title
+        // the UserPromptSubmit hook writes is proof the seed submitted.
+        assert!(seed_busy_signal(
+            "foo shelbi:working",
+            INPUT_BOX_SCREEN,
+            &baseline
+        ));
+        // ...but `shelbi:idle` / `shelbi:review` etc. are not.
+        assert!(!seed_busy_signal(
+            "foo shelbi:idle",
+            INPUT_BOX_SCREEN,
+            &baseline
+        ));
+    }
+
+    #[test]
+    fn seed_verify_suppresses_a_working_title_that_predates_the_seed() {
+        // A baseline that already carried `shelbi:working` means the marker is
+        // not proof THIS seed submitted; the title signal must be suppressed and
+        // the (idle) screen leaves nothing else to confirm.
+        let mut baseline = PaneBaseline::fresh(SubmitProfile::ClaudeUi);
+        baseline.title_working = true;
+        assert!(!seed_busy_signal(
+            "foo shelbi:working",
+            INPUT_BOX_SCREEN,
+            &baseline
+        ));
+    }
+
+    #[test]
+    fn seed_verify_handles_codex_busy_and_idle_composers() {
+        let baseline = PaneBaseline::fresh(SubmitProfile::CodexUi);
+        let busy = "• Working (4s)\n  esc to interrupt";
+        let idle = "› Ask Codex to do anything\n\n  ? for shortcuts";
+        assert!(seed_busy_signal("", busy, &baseline));
+        // An empty codex composer must not read as a submitted seed either.
+        assert!(!seed_busy_signal("", idle, &baseline));
+    }
+
+    #[test]
+    fn seed_verify_never_claims_busy_for_delivery_only_runners() {
+        // Delivery-only runners have no pane chrome; the seed verifier must
+        // return `false` so the caller records an explicit `unverified` dispatch
+        // instead of a busy signal it cannot observe.
+        let baseline = PaneBaseline::fresh(SubmitProfile::DeliveryOnly);
+        let addr = TmuxAddr {
+            session: "does-not-exist".into(),
+            window: "agent".into(),
+        };
+        assert!(!verify_seeded(
+            &Host::Local,
+            &addr,
+            &baseline,
+            std::time::Duration::from_millis(0)
+        ));
+    }
+
     fn visible_short_message(text: &str) -> String {
         format!(
             "────────────────────────────────────────────────────\n\
@@ -1103,6 +1257,106 @@ mod tests {
                 "trial {trial} did not submit"
             );
         }
+    }
+
+    #[test]
+    fn seed_verify_drives_real_tmux_idle_vs_busy() {
+        // Functional check on a real tmux server that the launch-seed verifier
+        // distinguishes the two states the dispatch race produces:
+        //   * an idle, empty input box (the seed's Enter was dropped — claude
+        //     sits at `Ctx 0`): must NOT confirm, so dispatch retries/aborts
+        //     instead of falsely reporting `in_progress`.
+        //   * a genuinely busy pane (the seed submitted): must confirm.
+        // The pure-logic core is covered above; this exercises the real
+        // `capture_history` / `pane_title` path the seed verifier walks.
+        let tmp = tempfile::tempdir().unwrap();
+
+        // Idle box that never goes busy — the bug's symptom.
+        let idle_script = tmp.path().join("idle-seed.sh");
+        std::fs::write(
+            &idle_script,
+            "#!/bin/sh\n\
+             printf '\\033[2J\\033[H────────────────────────────────────────\\n❯\\n────────────────────────────────────────\\n  ? for shortcuts\\n'\n\
+             sleep 5\n",
+        )
+        .unwrap();
+
+        // A pane that comes up already processing — a seed that submitted.
+        let busy_script = tmp.path().join("busy-seed.sh");
+        std::fs::write(
+            &busy_script,
+            "#!/bin/sh\n\
+             printf '\\033[2J\\033[H✳ Working on the seeded prompt\\n────────────────────────────────────────\\n❯\\n────────────────────────────────────────\\n  esc to interrupt\\n'\n\
+             sleep 5\n",
+        )
+        .unwrap();
+
+        let run = |script: &std::path::Path, marker: &str| -> Option<bool> {
+            let session = format!(
+                "shelbi-seed-test-{}-{}",
+                std::process::id(),
+                marker.replace(' ', "_")
+            );
+            let started = std::process::Command::new("tmux")
+                .args([
+                    "new-session",
+                    "-d",
+                    "-s",
+                    &session,
+                    "-n",
+                    "agent",
+                    "sh",
+                    script.to_str().unwrap(),
+                ])
+                .status();
+            // tmux is optional in development/test containers; match the repo's
+            // skip convention when no server can be created.
+            let Ok(started) = started else { return None };
+            if !started.success() {
+                return None;
+            }
+            let addr = TmuxAddr {
+                session: session.clone(),
+                window: "agent".into(),
+            };
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+            while std::time::Instant::now() < deadline {
+                if shelbi_tmux::capture(&Host::Local, &addr)
+                    .unwrap_or_default()
+                    .contains(marker)
+                {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            let baseline = PaneBaseline::fresh(SubmitProfile::ClaudeUi);
+            let confirmed = verify_seeded(
+                &Host::Local,
+                &addr,
+                &baseline,
+                std::time::Duration::from_millis(600),
+            );
+            let _ = std::process::Command::new("tmux")
+                .args(["kill-session", "-t", &session])
+                .status();
+            Some(confirmed)
+        };
+
+        let Some(idle_confirmed) = run(&idle_script, "? for shortcuts") else {
+            return; // no tmux server available
+        };
+        assert!(
+            !idle_confirmed,
+            "an idle empty box (dropped seed) must not read as a submitted dispatch"
+        );
+
+        let Some(busy_confirmed) = run(&busy_script, "esc to interrupt") else {
+            return;
+        };
+        assert!(
+            busy_confirmed,
+            "a busy pane (submitted seed) must confirm the dispatch"
+        );
     }
 
     /// Opt-in acceptance path against the actual Claude Code TUI. Unlike the

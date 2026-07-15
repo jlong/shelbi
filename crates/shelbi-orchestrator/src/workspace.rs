@@ -1428,24 +1428,85 @@ fn deploy_and_spawn(a: SpawnArgs<'_>) -> Result<()> {
     if launch_seed {
         // The pane was just killed + recreated (step 3), so it carries no
         // scrollback from a prior run — any busy signal is genuinely this
-        // dispatch. The fresh baseline keeps every submit signal live. The
-        // prompt was seeded via the launch command itself, so the first pass
-        // is verify-only (nothing to deliver).
+        // dispatch. The prompt was seeded via the launch command itself
+        // (positional arg / flag-file / stdin), NOT typed into the input box,
+        // so this pass is verify-only (nothing to deliver).
         let baseline = crate::submit::PaneBaseline::fresh(submit_profile);
-        let status = crate::submit::verify_submitted(a.host, a.addr, a.prompt, &baseline);
-        if record_dispatch_submit(a.addr, a.task_id, &a.workspace.name, status) {
+
+        // A delivery-only runner exposes no pane chrome to verify; the shared
+        // split delivery already ran through the launch command, so record it
+        // as explicitly unverified (the same verdict the paste path gives these
+        // runners) rather than demand a busy signal we cannot read.
+        if !submit_profile.has_ui_verifier() {
+            append_dispatch_status(
+                a.task_id,
+                &a.workspace.name,
+                "unverified",
+                "verification_unsupported",
+            );
             return Ok(());
         }
+
+        // Confirm the seed ONLY on a positive busy signal. Crucially we do NOT
+        // accept a cleared/empty input box here: the seed was never typed into
+        // the box, so an idle empty box (claude sitting at `Ctx 0`) trivially
+        // "doesn't hold our text" and would false-confirm a seed that never
+        // submitted — the recurring submission-race bug (observed 2026-07-15
+        // re-dispatching to bravo: the pane sat idle at an empty prompt while
+        // the board read `in_progress`). `verify_seeded` leans only on the
+        // `shelbi:working` title marker / active-processing footer.
+        if crate::submit::verify_seeded(a.host, a.addr, &baseline, crate::ready::READY_TIMEOUT) {
+            append_dispatch_status(
+                a.task_id,
+                &a.workspace.name,
+                "confirmed",
+                "seed_busy_observed",
+            );
+            return Ok(());
+        }
+
+        // The seed did not drive the pane busy. Fall back to a readiness-gated
+        // typed paste of the same prompt: wait for the input box, then type +
+        // verified-submit into it. Its cleared-box signal IS trustworthy here
+        // because we type the text into the box, and `send_verified`'s single
+        // retry Enter bounds the attempts. Only claude exposes the readiness
+        // parser this fallback needs.
         if shelbi_agent::RunnerAdapter::for_spec(a.runner).needs_claude_readiness_probe()
             && crate::ready::wait_for_claude_ready(a.host, a.addr, crate::ready::READY_TIMEOUT)?
         {
-            let status = crate::submit::send_verified(a.host, a.addr, a.prompt, &baseline)?;
-            if record_dispatch_submit(a.addr, a.task_id, &a.workspace.name, status) {
-                return Ok(());
+            match crate::submit::send_verified(a.host, a.addr, a.prompt, &baseline)? {
+                crate::submit::SubmitStatus::Submitted { detail } => {
+                    append_dispatch_status(a.task_id, &a.workspace.name, "confirmed", detail);
+                    return Ok(());
+                }
+                crate::submit::SubmitStatus::DeliveredUnverified { detail } => {
+                    append_dispatch_status(a.task_id, &a.workspace.name, "unverified", detail);
+                    return Ok(());
+                }
+                // No submission signal even after the paste + retry Enter — fall
+                // through to the terminal stuck event below.
+                crate::submit::SubmitStatus::EligibilityRevoked
+                | crate::submit::SubmitStatus::StillInBox
+                | crate::submit::SubmitStatus::Unconfirmed => {}
             }
         }
+
+        // Seed never went busy and the paste fallback did not submit either.
+        // Emit a visible `status=stuck` event (not a false `confirmed`) so the
+        // orchestrator and `shelbi events tail` see the stall, and fail loudly
+        // so the caller leaves the task in its ready-category column for a
+        // clean retry.
+        append_dispatch_status(
+            a.task_id,
+            &a.workspace.name,
+            "stuck",
+            "no_busy_signal_after_seed_and_paste",
+        );
         return Err(Error::Other(format!(
-            "dispatch to {} was not confirmed — no busy signal after launch-seed delivery",
+            "dispatch to {} was not confirmed — the launch-seeded prompt never \
+             drove the pane busy and the readiness-gated paste fallback did not \
+             submit either. Dispatch aborted so the task stays put for retry; \
+             check the workspace pane.",
             a.addr.target(),
         )));
     }
