@@ -5,7 +5,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": ".shelbi/hooks/claude.session-start"
+            "command": ".shelbi/hooks/session-start.sh"
           }
         ]
       }
@@ -13,14 +13,14 @@
     "Stop": [
       {
         "hooks": [
-          { "type": "command", "command": ".shelbi/hooks/claude.pane-idle" }
+          { "type": "command", "command": ".shelbi/hooks/pane-idle.sh" }
         ]
       },
       {
         "hooks": [
           {
             "type": "command",
-            "command": ".shelbi/hooks/claude.stop"
+            "command": ".shelbi/hooks/stop.sh"
           }
         ]
       }
@@ -28,21 +28,21 @@
     "Notification": [
       {
         "hooks": [
-          { "type": "command", "command": ".shelbi/hooks/claude.pane-blocked" }
+          { "type": "command", "command": ".shelbi/hooks/pane-blocked.sh" }
         ]
       }
     ],
     "UserPromptSubmit": [
       {
         "hooks": [
-          { "type": "command", "command": ".shelbi/hooks/claude.pane-working" }
+          { "type": "command", "command": ".shelbi/hooks/pane-working.sh" }
         ]
       }
     ],
     "PreToolUse": [
       {
         "hooks": [
-          { "type": "command", "command": ".shelbi/hooks/claude.pane-working" }
+          { "type": "command", "command": ".shelbi/hooks/pane-working.sh" }
         ]
       }
     ]
