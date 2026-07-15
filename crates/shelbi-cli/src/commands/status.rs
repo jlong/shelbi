@@ -29,7 +29,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{anyhow, Result};
 use chrono::{DateTime, Duration, Utc};
 use clap::Subcommand;
-use shelbi_core::{Column, MachineKind, Project, StatusCategory};
+use shelbi_core::{Column, IntegrationMode, MachineKind, Project, StatusCategory};
 use shelbi_state::{read_state, ZenModeState};
 
 use super::require_project;
@@ -171,6 +171,7 @@ fn print_full(project: &str) -> Result<()> {
     println!("## Workspaces");
     println!();
     super::workspace::print_workspaces(project)?;
+    print_orchestrator_integration(project)?;
 
     println!();
     println!("## Zen");
@@ -193,6 +194,47 @@ fn print_full(project: &str) -> Result<()> {
     println!();
     println!("daemon: {}", super::hub_version::status_line());
     Ok(())
+}
+
+/// Print the orchestrator's integration-health line for the `## Workspaces`
+/// section. The declared workspaces already carry their `INTEG` column; the
+/// orchestrator has no workspace slot, so it gets this dedicated line — the
+/// one place a disengaged native Codex bridge (and any stuck delivery queue)
+/// becomes visible without hand-reading `codex-thread.json`.
+fn print_orchestrator_integration(project: &str) -> Result<()> {
+    let health =
+        shelbi_orchestrator::wake::codex_integration_health(project).map_err(|e| anyhow!(e))?;
+    println!("{}", orchestrator_integration_line(health.as_ref()));
+    Ok(())
+}
+
+/// Format the orchestrator integration line. `None` means the orchestrator
+/// runner isn't the native Codex bridge, so it reports the ordinary
+/// verified-submission tier (`conventional`). A disengaged bridge reports
+/// `degraded` with its recorded `reason=`; an undelivered queue appends
+/// `pending_batches=` and the `oldest=` event timestamp so a stuck queue is
+/// visible at a glance.
+fn orchestrator_integration_line(
+    health: Option<&shelbi_orchestrator::wake::CodexIntegrationHealth>,
+) -> String {
+    let Some(health) = health else {
+        return format!("orchestrator  integration={}", IntegrationMode::Conventional);
+    };
+    let mut line = format!("orchestrator  integration={}", health.mode());
+    match &health.inactive_reason {
+        Some(reason) => line.push_str(&format!(" reason={reason}")),
+        // A disengaged bridge with no recorded reason predates reason tracking;
+        // still flag it rather than leaving the `degraded` unexplained.
+        None if !health.native_active => line.push_str(" reason=unknown"),
+        None => {}
+    }
+    if health.pending_batches > 0 {
+        line.push_str(&format!(" pending_batches={}", health.pending_batches));
+        if let Some(timestamp) = &health.oldest_pending_timestamp {
+            line.push_str(&format!(" oldest={timestamp}"));
+        }
+    }
+    line
 }
 
 fn print_zen_full(zen: &ZenSnapshot) {
@@ -452,6 +494,59 @@ mod tests {
         ));
         std::fs::create_dir_all(&p).unwrap();
         p
+    }
+
+    #[test]
+    fn orchestrator_integration_line_defaults_to_conventional_without_a_codex_thread() {
+        // No persisted Codex thread => the orchestrator isn't the native
+        // bridge, so it reports the ordinary verified-submission tier.
+        let line = orchestrator_integration_line(None);
+        assert_eq!(line, "orchestrator  integration=conventional");
+    }
+
+    #[test]
+    fn orchestrator_integration_line_reports_structured_active_bridge() {
+        let health = shelbi_orchestrator::wake::CodexIntegrationHealth {
+            native_active: true,
+            inactive_reason: None,
+            pending_batches: 0,
+            oldest_pending_timestamp: None,
+        };
+        assert_eq!(
+            orchestrator_integration_line(Some(&health)),
+            "orchestrator  integration=structured"
+        );
+    }
+
+    #[test]
+    fn orchestrator_integration_line_flags_degraded_reason_and_pending_queue() {
+        let health = shelbi_orchestrator::wake::CodexIntegrationHealth {
+            native_active: false,
+            inactive_reason: Some("protocol-incompatible".into()),
+            pending_batches: 2,
+            oldest_pending_timestamp: Some("2026-07-15T09:00:00+00:00".into()),
+        };
+        assert_eq!(
+            orchestrator_integration_line(Some(&health)),
+            "orchestrator  integration=degraded reason=protocol-incompatible \
+             pending_batches=2 oldest=2026-07-15T09:00:00+00:00"
+        );
+    }
+
+    #[test]
+    fn orchestrator_integration_line_flags_reasonless_legacy_disengagement() {
+        // A `native_active: false` thread file written before reason tracking
+        // still surfaces as degraded rather than an unexplained mode.
+        let health = shelbi_orchestrator::wake::CodexIntegrationHealth {
+            native_active: false,
+            inactive_reason: None,
+            pending_batches: 0,
+            oldest_pending_timestamp: None,
+        };
+        assert_eq!(
+            orchestrator_integration_line(Some(&health)),
+            "orchestrator  integration=degraded reason=unknown"
+        );
     }
 
     #[test]

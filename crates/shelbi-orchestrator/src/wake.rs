@@ -29,11 +29,15 @@ use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use shelbi_core::{Error, Project, Result, StatusCategory};
+use shelbi_core::{Error, IntegrationMode, Project, Result, StatusCategory};
 use tungstenite::{accept, client, Message, WebSocket};
 
 use crate::codex_rpc::{CodexRpcClient, CodexRpcError, CodexRpcNotification};
 
+/// Agent name used for the orchestrator pane in integration-mode events and
+/// status output. Workspace agents carry their declared workspace name; the
+/// orchestrator has no workspace slot, so it gets this stable label.
+const ORCHESTRATOR_AGENT_NAME: &str = "orchestrator";
 const THREAD_STATE_FILE: &str = "codex-thread.json";
 const EVENT_QUEUE_FILE: &str = "codex-event-queue.json";
 const NATIVE_RUNTIME_DIR: &str = "codex-native-runtime";
@@ -63,10 +67,38 @@ enum WakePriority {
     SupervisionGaveUp,
 }
 
+/// Why the native Codex bridge disengaged and dropped to standalone
+/// turn-boundary polling. Recorded in `codex-thread.json` and emitted on the
+/// integration-mode transition event so a degraded orchestrator is traceable
+/// to a cause instead of discovered by hand-reading JSON. Only
+/// [`FallbackReason::ProtocolIncompatible`] and [`FallbackReason::VersionGate`]
+/// actually trigger a fallback today (transient spawn/socket failures retry the
+/// native bridge with its durable queue intact); the other variants classify
+/// the cause faithfully should a future path fall back on them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FallbackReason {
+    SpawnFailure,
+    SocketError,
+    ProtocolIncompatible,
+    VersionGate,
+}
+
+impl FallbackReason {
+    fn as_token(self) -> &'static str {
+        match self {
+            FallbackReason::SpawnFailure => "spawn-failure",
+            FallbackReason::SocketError => "socket-error",
+            FallbackReason::ProtocolIncompatible => "protocol-incompatible",
+            FallbackReason::VersionGate => "version-gate",
+        }
+    }
+}
+
 #[derive(Debug)]
 struct NativeStartupError {
     error: Error,
     protocol_unsupported: bool,
+    reason: FallbackReason,
 }
 
 impl NativeStartupError {
@@ -74,6 +106,22 @@ impl NativeStartupError {
         Self {
             error,
             protocol_unsupported: false,
+            // Transient failures retry rather than fall back, so this reason is
+            // inert; classify as a socket error since that's the dominant
+            // transient cause (connect/timeout).
+            reason: FallbackReason::SocketError,
+        }
+    }
+
+    /// A transient failure to spawn one of the bridge's child processes (the
+    /// app-server or the remote TUI). Retries like any other transient error;
+    /// carries [`FallbackReason::SpawnFailure`] so the cause is classified
+    /// correctly if a future path ever falls back on it.
+    fn spawn(error: Error) -> Self {
+        Self {
+            error,
+            protocol_unsupported: false,
+            reason: FallbackReason::SpawnFailure,
         }
     }
 
@@ -83,9 +131,15 @@ impl NativeStartupError {
             CodexRpcError::Remote { code, message, .. }
                 if protocol_incompatible(*code, message)
         );
+        let reason = if protocol_unsupported {
+            FallbackReason::ProtocolIncompatible
+        } else {
+            FallbackReason::SocketError
+        };
         Self {
             error: rpc_error(error),
             protocol_unsupported,
+            reason,
         }
     }
 
@@ -93,6 +147,9 @@ impl NativeStartupError {
         Self {
             error: Error::Other(message.into()),
             protocol_unsupported: true,
+            // The only production caller is the `resume --remote` capability
+            // probe — a version/capability gate, not a live protocol rejection.
+            reason: FallbackReason::VersionGate,
         }
     }
 }
@@ -207,11 +264,18 @@ pub fn run_codex_bridge(project_name: &str, first_launch: bool) -> Result<()> {
         ) {
             Ok(bridge) => bridge,
             Err(error) => {
+                let reason = error.reason;
                 eprintln!(
                     "shelbi: Codex native event bridge unavailable ({error}); \
                      continuing in standalone turn-boundary polling mode"
                 );
-                return run_standalone(&runner, project_name, &workdir, &bootstrap_prompt);
+                return run_standalone(
+                    &runner,
+                    project_name,
+                    &workdir,
+                    &bootstrap_prompt,
+                    reason,
+                );
             }
         };
 
@@ -236,7 +300,16 @@ pub fn run_codex_bridge(project_name: &str, first_launch: bool) -> Result<()> {
                     &repo_root,
                     first_launch_pending,
                 );
-                return run_standalone(&runner, project_name, &workdir, &fallback_prompt);
+                // Every in-run path that sets `protocol_unsupported` (a rejected
+                // resume via the TUI relay, or a method/params rejection on a
+                // required RPC) is a live protocol incompatibility.
+                return run_standalone(
+                    &runner,
+                    project_name,
+                    &workdir,
+                    &fallback_prompt,
+                    FallbackReason::ProtocolIncompatible,
+                );
             }
             Err(error) => {
                 tracing::warn!(
@@ -255,13 +328,31 @@ fn run_standalone(
     project_name: &str,
     workdir: &Path,
     bootstrap_prompt: &str,
+    reason: FallbackReason,
 ) -> Result<()> {
     // A native attempt may already have persisted the owned thread before a
     // later protocol/TUI failure selects compatibility mode. Mark it inactive
     // first so reload and quit give this standalone pane its migration
     // handoff instead of mistaking the parked native identity for the live
-    // conversation.
-    mark_persisted_codex_thread_inactive(project_name, workdir)?;
+    // conversation. Recording the cause makes the disengaged bridge legible in
+    // `shelbi status --full`.
+    mark_persisted_codex_thread_inactive(project_name, workdir, reason)?;
+    // Surface the degraded transition on the same stream every other event
+    // rides. Best-effort: the durable thread state above is the authority, so a
+    // failed append never blocks the standalone launch.
+    if let Err(error) = shelbi_state::append_integration_event(
+        project_name,
+        ORCHESTRATOR_AGENT_NAME,
+        IntegrationMode::Degraded,
+        IntegrationMode::Degraded,
+        reason.as_token(),
+    ) {
+        tracing::warn!(
+            project = project_name,
+            %error,
+            "failed to record Codex bridge fallback integration event"
+        );
+    }
     let launch =
         crate::codex_standalone_launch(runner, project_name, workdir, bootstrap_prompt);
     let status = Command::new("sh")
@@ -357,7 +448,7 @@ impl NativeBridge {
             .map_err(NativeStartupError::transient)?;
         let socket_path = socket_paths.app_server.clone();
         let mut server = AppServerProcess::start(&runner, &workdir, socket_path.clone())
-            .map_err(NativeStartupError::transient)?;
+            .map_err(NativeStartupError::spawn)?;
         let mut rpc = connect_until_ready(&socket_path, &mut server)?;
         let (thread_id, generation, response) =
             open_owned_thread(&mut rpc, &project.name, &workdir, &developer_instructions)?;
@@ -390,7 +481,7 @@ impl NativeBridge {
         )
         .map_err(NativeStartupError::transient)?;
         let tui = spawn_remote_tui(&runner, &workdir, &relay_socket_path, &thread_id)
-            .map_err(NativeStartupError::transient)?;
+            .map_err(NativeStartupError::spawn)?;
 
         let bootstrap_message_id = bootstrap_message_id(
             &project.name,
@@ -1558,6 +1649,13 @@ struct PersistedThread {
     bootstrap_generation: u64,
     #[serde(default)]
     native_active: bool,
+    /// Short machine token for why the native bridge last disengaged (see
+    /// [`FallbackReason::as_token`]). Set alongside `native_active = false` on a
+    /// standalone fallback and cleared when the native bridge re-engages. Absent
+    /// on thread files written before this field existed, so a legacy
+    /// `native_active: false` surfaces as degraded-with-unknown-reason.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    native_inactive_reason: Option<String>,
 }
 
 fn open_owned_thread(
@@ -1581,9 +1679,29 @@ fn open_owned_thread(
         );
         match response {
             Ok(response) => {
+                let was_disengaged = !state.native_active;
                 state.bootstrap_generation = state.bootstrap_generation.saturating_add(1);
                 state.native_active = true;
+                state.native_inactive_reason = None;
                 save_json_atomic(&path, &state).map_err(NativeStartupError::transient)?;
+                // Only a genuine degraded -> structured recovery is worth a
+                // transition event; a normal restart resumes an already-active
+                // thread and stays silent.
+                if was_disengaged {
+                    if let Err(error) = shelbi_state::append_integration_event(
+                        project,
+                        ORCHESTRATOR_AGENT_NAME,
+                        IntegrationMode::Structured,
+                        IntegrationMode::Structured,
+                        "native-bridge-reengaged",
+                    ) {
+                        tracing::warn!(
+                            project,
+                            %error,
+                            "failed to record Codex bridge re-engagement integration event"
+                        );
+                    }
+                }
                 return Ok((state.thread_id, state.bootstrap_generation, response));
             }
             Err(error @ CodexRpcError::Remote { .. }) => {
@@ -1646,6 +1764,7 @@ fn open_owned_thread(
         thread_id: thread_id.clone(),
         bootstrap_generation: 1,
         native_active: true,
+        native_inactive_reason: None,
     };
     save_json_atomic(&path, &state).map_err(NativeStartupError::transient)?;
     Ok((thread_id, 1, response))
@@ -1718,24 +1837,93 @@ fn persisted_native_thread_is_active(workdir: &Path, project: &str) -> Result<bo
     Ok(load_thread_state(&path, project)?.is_some_and(|state| state.native_active))
 }
 
+/// The orchestrator's Codex native-bridge integration health, read from the
+/// on-disk `codex-thread.json` and `codex-event-queue.json`. This is the
+/// read-side counterpart to the state [`run_codex_bridge`] persists — it lets
+/// `shelbi status --full` flag a disengaged bridge and a stuck delivery queue
+/// without duplicating the queue/thread parsing that lives in this module.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CodexIntegrationHealth {
+    /// Whether the native bridge currently owns an active thread. `false` means
+    /// the bridge fell back to standalone turn-boundary polling.
+    pub native_active: bool,
+    /// Short machine token for why the bridge disengaged, when known. `None`
+    /// when the bridge is active or the fallback predates reason recording.
+    pub inactive_reason: Option<String>,
+    /// Count of durable event batches not yet delivered to Codex (Pending or
+    /// InFlight). A non-zero value while `native_active` is `false` is the
+    /// signature of a stuck queue.
+    pub pending_batches: usize,
+    /// RFC3339 timestamp of the oldest event inside an undelivered batch, when
+    /// any undelivered event carried one. Surfaces queue age at a glance.
+    pub oldest_pending_timestamp: Option<String>,
+}
+
+impl CodexIntegrationHealth {
+    /// The integration mode this snapshot maps to: `structured` while the
+    /// native bridge is engaged, `degraded` once it has fallen back.
+    pub fn mode(&self) -> IntegrationMode {
+        if self.native_active {
+            IntegrationMode::Structured
+        } else {
+            IntegrationMode::Degraded
+        }
+    }
+}
+
+/// Read the orchestrator's Codex integration health for `project`. Returns
+/// `Ok(None)` when the project has no persisted Codex thread at all — i.e. the
+/// orchestrator runner isn't the native Codex bridge, so there's no
+/// native/standalone distinction to report.
+pub fn codex_integration_health(project: &str) -> Result<Option<CodexIntegrationHealth>> {
+    let workdir = shelbi_state::project_dir(project)?;
+    read_codex_integration_health(&workdir, project)
+}
+
+fn read_codex_integration_health(
+    workdir: &Path,
+    project: &str,
+) -> Result<Option<CodexIntegrationHealth>> {
+    let thread_path = workdir.join(THREAD_STATE_FILE);
+    let Some(state) = load_thread_state(&thread_path, project)? else {
+        return Ok(None);
+    };
+    let queue_path = workdir.join(EVENT_QUEUE_FILE);
+    let queue = DurableQueue::load(&queue_path, project)?;
+    let undelivered: Vec<&QueuedBatch> = queue
+        .batches
+        .iter()
+        .filter(|batch| !matches!(batch.status, DeliveryStatus::Delivered { .. }))
+        .collect();
+    // Timestamps live on the events, not the batch; the earliest across every
+    // undelivered batch is the queue's age. RFC3339 sorts lexicographically.
+    let oldest_pending_timestamp = undelivered
+        .iter()
+        .flat_map(|batch| batch.events.iter())
+        .filter_map(|event| event.timestamp.as_deref())
+        .min()
+        .map(str::to_string);
+    Ok(Some(CodexIntegrationHealth {
+        native_active: state.native_active,
+        inactive_reason: state.native_inactive_reason.clone(),
+        pending_batches: undelivered.len(),
+        oldest_pending_timestamp,
+    }))
+}
+
 pub(crate) fn mark_persisted_codex_thread_inactive(
     project: &str,
     workdir: &Path,
-) -> Result<()> {
-    set_persisted_codex_thread_active(project, workdir, false)
-}
-
-fn set_persisted_codex_thread_active(
-    project: &str,
-    workdir: &Path,
-    native_active: bool,
+    reason: FallbackReason,
 ) -> Result<()> {
     let path = workdir.join(THREAD_STATE_FILE);
     let Some(mut state) = load_thread_state(&path, project)? else {
         return Ok(());
     };
-    if state.native_active != native_active {
-        state.native_active = native_active;
+    let reason_token = reason.as_token();
+    if state.native_active || state.native_inactive_reason.as_deref() != Some(reason_token) {
+        state.native_active = false;
+        state.native_inactive_reason = Some(reason_token.to_string());
         save_json_atomic(&path, &state)?;
     }
     Ok(())
@@ -3440,15 +3628,27 @@ mod tests {
                 thread_id: "thread-owned".into(),
                 bootstrap_generation: 3,
                 native_active: true,
+                native_inactive_reason: None,
             },
         )
         .unwrap();
         assert!(persisted_native_thread_is_active(temp.path(), "demo").unwrap());
         assert!(crate::handoff::uses_native_thread_continuity(true));
 
-        mark_persisted_codex_thread_inactive("demo", temp.path()).unwrap();
+        mark_persisted_codex_thread_inactive(
+            "demo",
+            temp.path(),
+            FallbackReason::ProtocolIncompatible,
+        )
+        .unwrap();
         let state = load_thread_state(&path, "demo").unwrap().unwrap();
         assert!(!state.native_active);
+        // The disengagement records its cause so `shelbi status --full` can
+        // flag *why* the native bridge dropped, not just that it did.
+        assert_eq!(
+            state.native_inactive_reason.as_deref(),
+            Some("protocol-incompatible")
+        );
         assert!(!persisted_native_thread_is_active(temp.path(), "demo").unwrap());
         assert!(
             !crate::handoff::uses_native_thread_continuity(state.native_active),
@@ -3456,8 +3656,80 @@ mod tests {
         );
 
         let missing = temp.path().join("missing");
-        mark_persisted_codex_thread_inactive("demo", &missing).unwrap();
+        mark_persisted_codex_thread_inactive("demo", &missing, FallbackReason::VersionGate)
+            .unwrap();
         assert!(!crate::handoff::uses_native_thread_continuity(false));
+    }
+
+    #[test]
+    fn codex_integration_health_flags_degraded_reason_and_pending_queue() {
+        let temp = tempfile::tempdir().unwrap();
+        // A disengaged native bridge that recorded its cause.
+        save_json_atomic(
+            &temp.path().join(THREAD_STATE_FILE),
+            &PersistedThread {
+                version: STATE_VERSION,
+                project: "demo".into(),
+                thread_id: "thread-owned".into(),
+                bootstrap_generation: 2,
+                native_active: false,
+                native_inactive_reason: Some("protocol-incompatible".into()),
+            },
+        )
+        .unwrap();
+        // One undelivered (Pending) batch carrying a timestamped event.
+        DurableQueue {
+            project: "demo".into(),
+            batches: VecDeque::from([batch("demo", 4, 42)]),
+        }
+        .save(&temp.path().join(EVENT_QUEUE_FILE))
+        .unwrap();
+
+        let health = read_codex_integration_health(temp.path(), "demo")
+            .unwrap()
+            .expect("thread file present");
+        assert!(!health.native_active);
+        assert_eq!(health.mode(), IntegrationMode::Degraded);
+        assert_eq!(
+            health.inactive_reason.as_deref(),
+            Some("protocol-incompatible")
+        );
+        assert_eq!(health.pending_batches, 1);
+        assert_eq!(health.oldest_pending_timestamp.as_deref(), Some("t"));
+    }
+
+    #[test]
+    fn codex_integration_health_active_bridge_is_structured_and_drained() {
+        let temp = tempfile::tempdir().unwrap();
+        save_json_atomic(
+            &temp.path().join(THREAD_STATE_FILE),
+            &PersistedThread {
+                version: STATE_VERSION,
+                project: "demo".into(),
+                thread_id: "thread-owned".into(),
+                bootstrap_generation: 1,
+                native_active: true,
+                native_inactive_reason: None,
+            },
+        )
+        .unwrap();
+
+        let health = read_codex_integration_health(temp.path(), "demo")
+            .unwrap()
+            .expect("thread file present");
+        assert!(health.native_active);
+        assert_eq!(health.mode(), IntegrationMode::Structured);
+        assert_eq!(health.inactive_reason, None);
+        assert_eq!(health.pending_batches, 0);
+        assert_eq!(health.oldest_pending_timestamp, None);
+    }
+
+    #[test]
+    fn codex_integration_health_absent_without_a_thread_file() {
+        let temp = tempfile::tempdir().unwrap();
+        assert!(read_codex_integration_health(temp.path(), "demo")
+            .unwrap()
+            .is_none());
     }
 
     #[test]
