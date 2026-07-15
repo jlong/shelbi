@@ -162,7 +162,7 @@ backward compatibility):
 
 - `task=<id> ... to_category=ready reason=user:*` → find a free eligible
   workspace, dispatch.
-- `task=<id> ... to_category=handoff reason=worker:review-marker` →
+- `task=<id> ... to_category=handoff reason=workspace:ready-marker` →
   the finishing dev workspace has already closed its session, so it's
   *already free*. Find it the next ready task. If the handoff status
   requires [review tags](/docs/concepts/review-workspaces), also route the
@@ -254,7 +254,7 @@ A few things worth keeping when you fork the default prompt:
   `Todo` to `Ready` or splits `Review` into `Code Review` + `QA` will
   fall through the matches.
 - The reaction rules tied to specific reason strings (`user:*`,
-  `worker:review-marker`, `orchestrator:auto-dispatch …`). These are
+  `workspace:ready-marker`, `orchestrator:auto-dispatch …`). These are
   the contract the rest of Shelbi expects the orchestrator to honor.
 - The "you are the scheduler" framing. Without it, the agent reverts to
   chatbot mode and waits to be told what to do, which defeats the

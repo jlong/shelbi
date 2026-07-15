@@ -99,10 +99,11 @@ pub use workspace_status::{
     append_zen_mode_event,
     clear_expected_teardown, consume_expected_teardown, emit_event_body, events_log_path,
     expected_teardown_marker_path, hub_socket_path, load_workspace_status, mark_expected_teardown,
-    parse_pane_title_marker, parse_pane_title_state, save_workspace_status,
+    parse_pane_title_marker, parse_pane_title_state, save_workspace_status, task_event_body,
     supervision_shutdown_key, workspace_status_path, workspaces_dir, EventEnvelope, EventKind,
-    PaneMarker, WorkspaceState, WorkspaceStatus, ZenHeartbeatCue, DAEMON_ACK,
-    EXPECTED_TEARDOWN_MAX_AGE, ORCH_EVENT_CALLBACK_SOCK_ENV,
+    HandoffCause, PaneMarker, WorkspaceState, WorkspaceStatus, ZenHeartbeatCue, DAEMON_ACK,
+    EXPECTED_TEARDOWN_MAX_AGE, ORCH_EVENT_CALLBACK_SOCK_ENV, READY_MARKER_HANDOFF_ALIASES,
+    READY_MARKER_HANDOFF_CAUSE,
 };
 pub use workspace_status::{
     event_cursor_path, event_log_current_base, event_log_head, read_event_log_from,

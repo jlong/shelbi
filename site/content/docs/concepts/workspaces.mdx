@@ -212,7 +212,7 @@ it finds a non-empty value:
 2. Moves the task to the next `handoff` status (`review` in the default
    workflow).
 3. Clears the marker.
-4. Appends `task=<id> in_progress -> review reason=worker:review-marker` to
+4. Appends `task=<id> in_progress -> review reason=workspace:ready-marker` to
    the events log.
 
 The workspace never runs `shelbi` itself. The marker file is the *entire*

@@ -75,7 +75,7 @@ rest of the system. Edit them carefully, but don't delete:
   Drop any of these and the orchestrator boots without state.
 - **The reaction rules tied to specific reason strings.** The
   orchestrator dispatches on `user:*` promotions, rolls workspaces on
-  `worker:review-marker`, and wakes on `heartbeat` lines. The rest
+  `workspace:ready-marker`, and wakes on `heartbeat` lines. The rest
   of Shelbi emits those strings. Your prompt has to recognize them.
 - **The "you are the scheduler" framing.** Without it, the agent
   reverts to chatbot mode and waits to be told what to do. The

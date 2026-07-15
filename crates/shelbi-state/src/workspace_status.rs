@@ -134,6 +134,58 @@ impl EventKind {
     }
 }
 
+/// The normalized, canonical cause token for the ready-marker handoff: a
+/// worker wrote its ready marker and the hub poller promoted the task into the
+/// handoff (review) category. This is the single source of truth for that wire
+/// token — the emitter (the poller's ready-handoff path calls
+/// [`append_task_event`] with this) and the orchestrator instruction template
+/// both key off this exact string, so they can never drift apart silently
+/// (`ready_marker_handoff_contract` pins them together).
+pub const READY_MARKER_HANDOFF_CAUSE: &str = "workspace:ready-marker";
+
+/// Every historical `reason=` token that has meant the ready-marker handoff.
+/// The canonical spelling changed over time
+/// (`worker:review-marker` → `workspace:review-marker` →
+/// `workspace:ready-marker`), so all three must keep classifying as this cause
+/// or old `events.log` lines — and any long-lived orchestrator rules keyed off
+/// the older token — would stop parsing. The canonical
+/// [`READY_MARKER_HANDOFF_CAUSE`] is listed first.
+pub const READY_MARKER_HANDOFF_ALIASES: &[&str] = &[
+    READY_MARKER_HANDOFF_CAUSE,
+    "workspace:review-marker",
+    "worker:review-marker",
+];
+
+/// A recognized, typed transition cause parsed from an `events.log` line's
+/// `reason=` token. Lets callers match on the *meaning* of a handoff instead
+/// of string-comparing against the drifting historical spellings.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HandoffCause {
+    /// A worker's ready marker promoted its task into the handoff category.
+    /// See [`READY_MARKER_HANDOFF_CAUSE`] / [`READY_MARKER_HANDOFF_ALIASES`].
+    ReadyMarker,
+}
+
+impl HandoffCause {
+    /// Classify a raw `reason=` token, accepting every historical alias.
+    /// Returns `None` for a reason that isn't a recognized handoff cause.
+    pub fn from_reason(reason: &str) -> Option<Self> {
+        if READY_MARKER_HANDOFF_ALIASES.contains(&reason) {
+            Some(HandoffCause::ReadyMarker)
+        } else {
+            None
+        }
+    }
+
+    /// The normalized token this cause serializes to (what fresh emitter
+    /// output carries, regardless of which alias was parsed in).
+    pub fn as_token(self) -> &'static str {
+        match self {
+            HandoffCause::ReadyMarker => READY_MARKER_HANDOFF_CAUSE,
+        }
+    }
+}
+
 /// The marker emitted by the workspace's claude hooks. `idle` from the hook
 /// wire-format maps to [`WorkspaceState::AwaitingInput`] — Stop fires when
 /// claude finishes a turn and is waiting for the next prompt, which is
@@ -1073,6 +1125,30 @@ pub fn append_task_event(
     reason: &str,
 ) -> Result<()> {
     let ts = Utc::now().to_rfc3339();
+    let body = task_event_body(project, task_id, workflow, from, to, reason);
+    let line = format!("{ts} {body}");
+    match append_event_line(&line) {
+        Ok(()) => Ok(()),
+        Err(e) if is_permission_denied(&e) => emit_event_body(&body),
+        Err(e) => Err(e),
+    }
+}
+
+/// Format the body of a task-transition event line — everything after the
+/// leading `<rfc3339>` timestamp. Single source of truth for the wire shape,
+/// shared by [`append_task_event`] (both its direct-append and socket-fallback
+/// paths) and the contract tests, so a test can feed genuine emitter output
+/// through [`EventEnvelope::from_log_line`] rather than a hand-typed
+/// approximation. Every interpolated field is sanitized the same way the
+/// append path always has.
+pub fn task_event_body(
+    project: &str,
+    task_id: &str,
+    workflow: &str,
+    from: Column,
+    to: Column,
+    reason: &str,
+) -> String {
     let project = sanitize_field(project);
     let task_id = sanitize_field(task_id);
     let reason = sanitize_reason(reason);
@@ -1083,16 +1159,10 @@ pub fn append_task_event(
     };
     let from_category = from.category();
     let to_category = to.category();
-    let body = format!(
+    format!(
         "project={project} task={task_id} workflow={workflow_name} {from} -> {to} \
          reason={reason} from_category={from_category} to_category={to_category}"
-    );
-    let line = format!("{ts} {body}");
-    match append_event_line(&line) {
-        Ok(()) => Ok(()),
-        Err(e) if is_permission_denied(&e) => emit_event_body(&body),
-        Err(e) => Err(e),
-    }
+    )
 }
 
 /// Append `<rfc3339> project=<name> <action> reason=<reason>` to
@@ -3574,6 +3644,103 @@ mod tests {
         assert_eq!(parsed[1][9], "to_category=handoff");
 
         std::env::remove_var("SHELBI_HOME");
+    }
+
+    /// Contract test binding the ready-marker handoff emitter to the
+    /// orchestrator-facing fields the instruction template documents. Feeds
+    /// *genuine* emitter output ([`task_event_body`], the exact body
+    /// [`append_task_event`] writes) through the *real* event parser
+    /// ([`EventEnvelope::from_log_line`] + [`event_field`]) and asserts the
+    /// four fields a reaction rule keys off — `kind`, `reason`,
+    /// `from_category`, `to_category` — are what the template shows. The token
+    /// itself is sourced from [`READY_MARKER_HANDOFF_CAUSE`] on both sides, so
+    /// the emitter and the docs can't drift apart without failing here.
+    #[test]
+    fn ready_marker_handoff_contract() {
+        // The emitter promotes `in_progress -> review` (active -> handoff)
+        // when a worker's ready marker fires — see the poller's
+        // `maybe_apply_ready_handoff`.
+        let body = task_event_body(
+            "demo",
+            "fix-login",
+            "default",
+            Column::in_progress(),
+            Column::review(),
+            READY_MARKER_HANDOFF_CAUSE,
+        );
+        // Prefix a timestamp exactly as the append path does, then parse the
+        // whole record back through the shipping parser.
+        let line = format!("2026-06-22T14:31:52+00:00 {body}");
+        let envelope = EventEnvelope::from_log_line(&line);
+
+        // `kind`: classified as a task transition, not a workspace/pane event.
+        assert_eq!(envelope.kind, EventKind::Task, "line: {line}");
+
+        // The three positional/keyed fields the orchestrator template matches.
+        assert_eq!(
+            event_field(&body, "reason"),
+            Some(READY_MARKER_HANDOFF_CAUSE),
+            "reason token drifted from the constant"
+        );
+        assert_eq!(event_field(&body, "from_category"), Some("active"));
+        assert_eq!(event_field(&body, "to_category"), Some("handoff"));
+
+        // The token classifies as a handoff cause on the typed parser path.
+        assert_eq!(
+            HandoffCause::from_reason(READY_MARKER_HANDOFF_CAUSE),
+            Some(HandoffCause::ReadyMarker),
+        );
+
+        // The orchestrator instruction template documents this exact token and
+        // category — this is the "one constant, two consumers" pin.
+        let template = crate::agent_workspaces::DEFAULT_ORCHESTRATOR_INSTRUCTIONS;
+        assert!(
+            template.contains(&format!(
+                "to_category=handoff reason={READY_MARKER_HANDOFF_CAUSE}"
+            )),
+            "orchestrator template no longer documents the normalized ready-marker \
+             handoff cause `{READY_MARKER_HANDOFF_CAUSE}`; update the template so it \
+             matches the emitter",
+        );
+        // And it must not still carry a superseded spelling.
+        assert!(
+            !template.contains("reason=workspace:review-marker")
+                && !template.contains("reason=worker:review-marker"),
+            "orchestrator template still references a historical ready-marker token; \
+             normalize it to `{READY_MARKER_HANDOFF_CAUSE}`",
+        );
+    }
+
+    /// Every historical spelling of the ready-marker handoff still classifies
+    /// as the same typed cause, so old `events.log` lines keep parsing.
+    #[test]
+    fn ready_marker_handoff_accepts_historical_aliases() {
+        for token in READY_MARKER_HANDOFF_ALIASES {
+            assert_eq!(
+                HandoffCause::from_reason(token),
+                Some(HandoffCause::ReadyMarker),
+                "historical token `{token}` no longer classifies as a handoff cause",
+            );
+        }
+        // The three tokens the task calls out are all covered.
+        for token in [
+            "workspace:ready-marker",
+            "workspace:review-marker",
+            "worker:review-marker",
+        ] {
+            assert_eq!(HandoffCause::from_reason(token), Some(HandoffCause::ReadyMarker));
+        }
+        // A normalized round-trip lands on the canonical token regardless of
+        // which alias was parsed in.
+        assert_eq!(
+            HandoffCause::from_reason("worker:review-marker")
+                .unwrap()
+                .as_token(),
+            READY_MARKER_HANDOFF_CAUSE,
+        );
+        // Unrelated reasons are not misclassified.
+        assert_eq!(HandoffCause::from_reason("user:cli"), None);
+        assert_eq!(HandoffCause::from_reason("orchestrator:auto-dispatch"), None);
     }
 
     #[test]

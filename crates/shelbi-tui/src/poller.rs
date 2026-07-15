@@ -1691,7 +1691,7 @@ fn maybe_apply_ready_handoff(
                         &workflow,
                         from,
                         to,
-                        "workspace:ready-marker",
+                        shelbi_state::READY_MARKER_HANDOFF_CAUSE,
                     ) {
                         tracing::warn!(workspace = %workspace.name, task = %task_id, error = %e, "append_task_event failed");
                     }

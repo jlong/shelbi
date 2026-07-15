@@ -252,7 +252,7 @@ One bullet per event prefix. React to every matching line.
   delivery. A legacy spawn agent has no durable task-message equivalent, so
   report that case instead.
 
-- `task=<id> ... to_category=handoff reason=workspace:review-marker` → the
+- `task=<id> ... to_category=handoff reason=workspace:ready-marker` → the
   assigned workspace finished. Two independent things to do:
 
   1. **Reload the workspace that just freed.** The dev workspace closed its own
@@ -578,7 +578,7 @@ These extend (not replace) the default reaction rules above. When
 `zen_active` is true, apply the categories and conditions from `zenmode.md`
 (re-read it if you're unsure):
 
-- On `task=<id> ... to_category=handoff reason=workspace:review-marker`:
+- On `task=<id> ... to_category=handoff reason=workspace:ready-marker`:
   apply the review-workspace gate first — if the project has review
   workspaces, this task is human-bound, so do **not** merge it (the human loads
   it from the sidebar and their `done` move is what merges it). Otherwise run
