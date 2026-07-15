@@ -112,10 +112,39 @@ pub fn is_trust_dialog(screen: &str) -> bool {
 /// permission-confirm, …) that no hook or pane-title marker will ever
 /// surface — the pane stays alive and its title keeps reading
 /// `shelbi:working` while all real progress is stuck behind the modal.
+///
+/// ## Why the substring match alone isn't enough
+///
+/// The signatures are plain substrings (`Do you trust the files`,
+/// `Enter to confirm`, …), so a worker whose pane merely *shows* that text —
+/// editing this detector's code, a runner adapter carrying trust-dialog
+/// signature strings, a diff, docs, or chat about the feature — would match and
+/// get flipped to `blocked reason=dialog:*`. That misfire was observed live: a
+/// workspace actively editing runner-adapter code (containing the trust
+/// signatures and `--dangerously-bypass-hook-trust`) with its spinner running
+/// was flagged blocked. A false block is worse than a missed one: if the
+/// orchestrator "clears" it with a stray Enter, that keystroke corrupts the
+/// worker's live edit.
+///
+/// So, exactly as [`detect_usage_limit`] does, we first veto on the two signals
+/// that prove the pane is *working, not stalled*: Claude's live ready input box
+/// ([`is_input_ready`]) or its active-turn footer ([`is_claude_busy`], the
+/// `esc to interrupt` spinner). A genuine blocking dialog replaces both, and
+/// `capture` samples only the visible screen (no scrollback), so these are
+/// reliable "this pane isn't behind a modal" evidence. This trades away
+/// catching a hypothetical dialog that somehow coexists with a live footer (we
+/// would rather miss that than block a healthy worker) for robustness against
+/// the false positive.
 pub fn detect_blocking_dialog(
     screen: &str,
     signatures: &[shelbi_core::DialogSignature],
 ) -> Option<String> {
+    // A live, ready input box or an active-turn footer means the pane is
+    // working — any dialog wording present is mere on-screen content, not a
+    // modal the pane is blocked behind.
+    if is_input_ready(screen) || is_claude_busy(screen) {
+        return None;
+    }
     let lower = screen.to_ascii_lowercase();
     signatures
         .iter()
@@ -538,6 +567,38 @@ mod tests {
 
         // Empty signature list never matches, even on a real dialog.
         assert!(detect_blocking_dialog(TRUST_DIALOG_SCREEN, &[]).is_none());
+    }
+
+    #[test]
+    fn detect_blocking_dialog_ignores_dialog_strings_while_working() {
+        // THE REGRESSION (observed live 2026-07-15): a worker editing code that
+        // carries the trust/permission signature strings must NOT be flagged
+        // blocked while its pane shows it is actively working. The dialog
+        // wording is on screen as source content, not as a modal.
+        let sigs = shelbi_core::default_dialog_signatures("claude");
+
+        // Active turn: the spinner footer (`esc to interrupt`) vetoes.
+        let busy_editing = "\
+    DialogSignature::new(\"trust\", \"Do you trust the files\"),
+    DialogSignature::new(\"permission\", \"Enter to confirm\"),
+    // flag: --dangerously-bypass-hook-trust
+
+· Working… (esc to interrupt)";
+        assert!(is_claude_busy(busy_editing));
+        assert!(detect_blocking_dialog(busy_editing, &sigs).is_none());
+
+        // Idle at the input box: the ready footer vetoes just the same.
+        let ready_editing = format!(
+            "{busy_editing}\n  ⏵⏵ accept edits on (shift+tab to cycle)",
+        );
+        assert!(is_input_ready(&ready_editing));
+        assert!(detect_blocking_dialog(&ready_editing, &sigs).is_none());
+
+        // Sanity: the genuine dialog (no live footer) is still detected.
+        assert_eq!(
+            detect_blocking_dialog(TRUST_DIALOG_SCREEN, &sigs).as_deref(),
+            Some("trust")
+        );
     }
 
     #[test]
