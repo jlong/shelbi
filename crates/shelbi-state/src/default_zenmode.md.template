@@ -85,7 +85,15 @@ If all pre-PR conditions pass:
 
 5. Freeze the probe's `repository`, `repository_id`, `base_branch`, `base_sha`,
    `integration_sha`, and `head_sha`. Run `shelbi zen pr-create <task-id> --match-repository <repository> --match-repository-id <repository_id> --match-base-branch <base_branch> --match-base-commit <base_sha> --match-integration-commit <integration_sha> --match-head-commit <head_sha>`
-   using those exact values. Capture the PR number it prints.
+   using those exact values, and also pass `--match-published-head-commit <published_head_sha>`
+   from the probe's `published_head_sha` field. When the probe rebased the branch
+   onto a moved base, `head_sha` is a local-only commit while `published_head_sha`
+   is the pre-rebase tip the remote branch still points at; that flag lets
+   pr-create replace the tip it reviewed instead of refusing it as a concurrent
+   update. Capture the PR number it prints. Exit code 75 means the push landed
+   but GitHub's PR view had not caught up yet: re-run the exact same command (it
+   is idempotent). Exit code 1 is a real mismatch: leave the task in `handoff`
+   and re-probe.
 6. Run `shelbi zen ci-watch <pr-number> --match-repository <repository> --match-repository-id <repository_id> --match-base-branch <base_branch> --match-base-commit <base_sha> --match-integration-commit <integration_sha> --match-head-commit <head_sha> --timeout 15m`
    using that same probe identity. Stdout is `green`,
    `red:<check>:<summary>`, or `timeout`. The condition: must be `green`.

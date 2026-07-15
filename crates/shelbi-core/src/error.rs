@@ -94,6 +94,17 @@ pub enum Error {
         stderr: String,
     },
 
+    /// A verification read could not confirm a state that one of Shelbi's own
+    /// authoritative writes already established — the canonical case is
+    /// GitHub's eventually-consistent PR API still reporting an obsolete head
+    /// commit seconds after a `git push` that the branch ref already reflects.
+    /// This is retry-safe: re-running the same (idempotent) command once the
+    /// read propagates succeeds. It is deliberately distinct from a hard
+    /// provenance mismatch ([`Error::Other`]) so callers can map "retry me"
+    /// and "never merge this" to different exit codes.
+    #[error("{0}")]
+    TransientVerification(String),
+
     #[error("unknown task id(s) in depends_on: {0}")]
     UnknownDepends(String),
 
@@ -134,6 +145,16 @@ pub enum Error {
 
     #[error("{0}")]
     Other(String),
+}
+
+impl Error {
+    /// True for a read that could not yet confirm one of Shelbi's own
+    /// authoritative writes (see [`Error::TransientVerification`]). Callers
+    /// use this to map retry-safe failures to a distinct exit code instead of
+    /// a hard "do not merge" failure.
+    pub fn is_transient(&self) -> bool {
+        matches!(self, Error::TransientVerification(_))
+    }
 }
 
 fn missing_task_params_message(workflow: &str, params: &[String]) -> String {
