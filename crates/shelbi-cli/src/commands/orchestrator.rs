@@ -4,6 +4,7 @@
 //! cursors. They intentionally do not dispatch work or mutate board state.
 
 use std::collections::{BTreeMap, HashSet};
+use std::io::Write;
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -35,14 +36,35 @@ pub enum OrchestratorEventsCmd {
         #[arg(long)]
         cursor: Option<String>,
     },
-    /// Wait up to `--timeout` for the next non-empty project event batch.
+    /// Wait up to `--timeout` for the next non-empty project event batch, or
+    /// with `--follow` stream durable event batches continuously (claim/ack).
     Next {
         /// Durable cursor returned by a prior drain. Use `0` for the first read.
+        /// Ignored under `--follow`, which always resumes from the persisted
+        /// durable cursor.
         #[arg(long, default_value = "0")]
         cursor: String,
-        /// Maximum wait, e.g. `10s`, `2m`, `1h`.
+        /// Maximum wait, e.g. `10s`, `2m`, `1h`. Required unless `--follow` is
+        /// set; ignored when it is.
         #[arg(long)]
-        timeout: String,
+        timeout: Option<String>,
+        /// Stream normalized event batches as they arrive, each tagged with a
+        /// stable `shelbi-event/<project>/<from>-<through>` delivery id.
+        /// Reading does NOT advance the durable cursor — `events ack` does — so
+        /// an unacknowledged batch is re-delivered verbatim on restart
+        /// (at-least-once). This is the Claude orchestrator's durable
+        /// replacement for a raw `shelbi events tail --follow` watch.
+        #[arg(long)]
+        follow: bool,
+    },
+    /// Advance the durable cursor past an acknowledged batch delivery id.
+    ///
+    /// The counterpart to `events next --follow`: apply a batch's facts, then
+    /// ack its `shelbi-event/<project>/<from>-<through>` id so the feed stops
+    /// re-delivering it. Idempotent — a duplicate ack never rewinds the stream.
+    Ack {
+        /// The delivery id printed by `events next --follow`.
+        delivery_id: String,
     },
 }
 
@@ -55,11 +77,23 @@ pub fn run(project_opt: Option<String>, cmd: OrchestratorCmd) -> Result<()> {
                 let response = drain_persisted(&project, cursor_override)?;
                 print_response(&response)
             }
-            OrchestratorEventsCmd::Next { cursor, timeout } => {
-                let timeout = super::events::parse_duration(&timeout)?;
-                let response = wait_next(&project, parse_cursor(&cursor)?, timeout)?;
-                print_response(&response)
+            OrchestratorEventsCmd::Next {
+                cursor,
+                timeout,
+                follow,
+            } => {
+                if follow {
+                    run_feed(&project)
+                } else {
+                    let timeout = timeout.ok_or_else(|| {
+                        anyhow!("`events next` requires --timeout unless --follow is set")
+                    })?;
+                    let timeout = super::events::parse_duration(&timeout)?;
+                    let response = wait_next(&project, parse_cursor(&cursor)?, timeout)?;
+                    print_response(&response)
+                }
             }
+            OrchestratorEventsCmd::Ack { delivery_id } => ack_delivery(&project, &delivery_id),
         },
     }
 }
@@ -81,6 +115,171 @@ fn wait_next(project: &str, mut cursor: u64, timeout: Duration) -> Result<DrainR
         let remaining = deadline.saturating_duration_since(Instant::now());
         thread::sleep(remaining.min(Duration::from_millis(250)));
     }
+}
+
+/// Poll cadence for the durable feed. Matches `events tail --follow` so the
+/// live-latency characteristics of the two watches are identical.
+const FEED_POLL: Duration = Duration::from_millis(250);
+
+/// Durable claim/ack event feed — the Claude orchestrator's replacement for a
+/// raw `shelbi events tail --follow` watch.
+///
+/// Streams normalized event batches keyed on stable delivery ids, resuming
+/// from the persisted durable cursor. Unlike `drain`, reading here never
+/// advances the cursor: a batch stays "in flight" until
+/// `events ack <delivery-id>` moves the cursor past it. Two consequences fall
+/// straight out of that:
+///
+/// * A crash between emit and ack re-delivers the identical batch (same
+///   delivery id) on restart — at-least-once, the guarantee the Codex bridge
+///   already gives its runner.
+/// * An acked batch is never seen again, because the cursor has moved past it.
+///
+/// The feed advances one acknowledged batch at a time: events that arrive
+/// while a batch is in flight wait for the ack and ride the next batch. That
+/// lock-step keeps every delivery id a pure function of the range it covers,
+/// which is what makes the restart identity hold. The whole pending tail is
+/// delivered as a single batch (same read shape as `drain`); memory is bounded
+/// by the log's own rotation, not by this command.
+fn run_feed(project: &str) -> Result<()> {
+    // The cursor value we have already emitted a batch for. While it matches
+    // the persisted cursor we hold the in-flight batch instead of re-scanning,
+    // so new events wait for the ack rather than growing the batch under a
+    // churning delivery id.
+    let mut emitted_at: Option<u64> = None;
+    loop {
+        let cursor = read_persisted_cursor(project)?;
+        if emitted_at != Some(cursor) {
+            if let Some(batch) = scan_feed_batch(project, cursor)? {
+                emit_feed_batch(&batch)?;
+                emitted_at = Some(cursor);
+            }
+        }
+        thread::sleep(FEED_POLL);
+    }
+}
+
+/// Scan the next deliverable batch starting at `cursor` WITHOUT advancing the
+/// durable cursor. Returns `None` when no project-scoped events are pending.
+fn scan_feed_batch(project: &str, cursor: u64) -> Result<Option<FeedBatch>> {
+    let response = drain_once(project, cursor)?;
+    if response.events.is_empty() {
+        return Ok(None);
+    }
+    let through = response.cursor_offset;
+    // Derive the batch id from the shared event-log core so the feed keys its
+    // batches identically to the Codex native bridge.
+    let delivery_id = shelbi_state::delivery_id(project, cursor, through);
+    Ok(Some(FeedBatch {
+        ack: format!("shelbi orchestrator events ack {delivery_id}"),
+        delivery_id,
+        project: project.to_string(),
+        cursor: FeedCursor {
+            from: cursor.to_string(),
+            through: through.to_string(),
+        },
+        events: response.events,
+    }))
+}
+
+fn emit_feed_batch(batch: &FeedBatch) -> Result<()> {
+    // Explicit flush: stdout is a pipe under `run_in_background`, so the block
+    // buffer would otherwise hide the batch from the Monitor watch until the
+    // next batch (or process exit) forced a flush.
+    let mut stdout = std::io::stdout().lock();
+    serde_json::to_writer_pretty(&mut stdout, batch)?;
+    stdout.write_all(b"\n")?;
+    stdout.flush()?;
+    Ok(())
+}
+
+/// Advance the durable cursor past an acknowledged batch.
+///
+/// Idempotent by design: acking a batch already behind the cursor is a no-op,
+/// so re-acking a re-delivered batch the orchestrator had in fact processed
+/// never rewinds the stream. It refuses to jump the cursor *forward* over a
+/// gap (`from` beyond the current cursor), which would silently drop the
+/// unacknowledged events in between.
+fn ack_delivery(project: &str, delivery_id: &str) -> Result<()> {
+    let (id_project, from, through) = parse_delivery_id(delivery_id)?;
+    if id_project != project {
+        return Err(anyhow!(
+            "delivery id `{delivery_id}` is scoped to project `{id_project}`, not `{project}`"
+        ));
+    }
+    let current = read_persisted_cursor(project)?;
+    let (outcome, cursor_after) = if through <= current {
+        // Already drained past this batch — a duplicate or stale ack.
+        ("already-acked", current)
+    } else if from <= current {
+        write_persisted_cursor(project, through)?;
+        ("acked", through)
+    } else {
+        return Err(anyhow!(
+            "delivery id `{delivery_id}` starts at {from} but the durable cursor is at {current}; \
+             acking it would skip unacknowledged events — ack the pending batch first"
+        ));
+    };
+    let response = AckResponse {
+        project: project.to_string(),
+        delivery_id: delivery_id.to_string(),
+        outcome: outcome.to_string(),
+        cursor: cursor_after.to_string(),
+    };
+    println!("{}", serde_json::to_string_pretty(&response)?);
+    Ok(())
+}
+
+/// Parse `shelbi-event/<project>/<from>-<through>` into its parts. `<from>` and
+/// `<through>` are the logical byte cursors the batch covers. The project
+/// segment may itself contain `/`, so the numeric range is split off the tail.
+fn parse_delivery_id(delivery_id: &str) -> Result<(String, u64, u64)> {
+    let rest = delivery_id
+        .strip_prefix("shelbi-event/")
+        .ok_or_else(|| anyhow!("`{delivery_id}` is not a shelbi-event delivery id"))?;
+    let (project, range) = rest.rsplit_once('/').ok_or_else(|| {
+        anyhow!("`{delivery_id}` is missing its `<project>/<from>-<through>` range")
+    })?;
+    let (from, through) = range
+        .rsplit_once('-')
+        .ok_or_else(|| anyhow!("`{delivery_id}` range `{range}` is not `<from>-<through>`"))?;
+    if project.is_empty() {
+        return Err(anyhow!("`{delivery_id}` has an empty project segment"));
+    }
+    let from = parse_cursor(from)?;
+    let through = parse_cursor(through)?;
+    if through < from {
+        return Err(anyhow!(
+            "`{delivery_id}` range ends ({through}) before it starts ({from})"
+        ));
+    }
+    Ok((project.to_string(), from, through))
+}
+
+#[derive(Debug, Serialize)]
+struct FeedBatch {
+    delivery_id: String,
+    project: String,
+    cursor: FeedCursor,
+    /// The exact command that advances the durable cursor past this batch.
+    /// Re-emitted verbatim on every restart until it is acked.
+    ack: String,
+    events: Vec<NormalizedEvent>,
+}
+
+#[derive(Debug, Serialize)]
+struct FeedCursor {
+    from: String,
+    through: String,
+}
+
+#[derive(Debug, Serialize)]
+struct AckResponse {
+    project: String,
+    delivery_id: String,
+    /// `acked` (cursor advanced) or `already-acked` (idempotent no-op).
+    outcome: String,
+    cursor: String,
 }
 
 fn drain_once(project: &str, cursor: u64) -> Result<DrainResponse> {
@@ -190,7 +389,7 @@ struct DrainResponse {
     events: Vec<NormalizedEvent>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, PartialEq, Eq)]
 struct NormalizedEvent {
     cursor: String,
     offset: u64,
@@ -1048,6 +1247,173 @@ mod tests {
     fn read_persisted_cursor_defaults_to_zero_when_absent() {
         let (_guard, _tmp) = setup_home();
         assert_eq!(read_persisted_cursor("demo").unwrap(), 0);
+    }
+
+    fn read_cursor(project: &str) -> u64 {
+        read_persisted_cursor(project).unwrap()
+    }
+
+    #[test]
+    fn feed_batch_uses_the_codex_delivery_id_scheme() {
+        let (_guard, _tmp) = setup_home();
+        save_demo_task("demo", "first");
+        append_task_event(
+            "demo",
+            "first",
+            "default",
+            Column::todo(),
+            Column::done(),
+            "one",
+        )
+        .unwrap();
+
+        let cursor = read_cursor("demo");
+        let batch = scan_feed_batch("demo", cursor).unwrap().unwrap();
+
+        // The id is the shared core's derivation, byte-for-byte.
+        let through: u64 = batch.cursor.through.parse().unwrap();
+        assert_eq!(
+            batch.delivery_id,
+            shelbi_state::delivery_id("demo", cursor, through)
+        );
+        assert!(batch.delivery_id.starts_with("shelbi-event/demo/"));
+        assert_eq!(batch.ack, format!("shelbi orchestrator events ack {}", batch.delivery_id));
+        assert_eq!(batch.cursor.from, cursor.to_string());
+    }
+
+    #[test]
+    fn feed_reads_do_not_advance_the_durable_cursor() {
+        let (_guard, _tmp) = setup_home();
+        save_demo_task("demo", "first");
+        append_task_event(
+            "demo",
+            "first",
+            "default",
+            Column::todo(),
+            Column::done(),
+            "one",
+        )
+        .unwrap();
+
+        let before = read_cursor("demo");
+        let first = scan_feed_batch("demo", before).unwrap().unwrap();
+        // Reading again from the still-unadvanced cursor re-derives the exact
+        // same batch — this is the crash-between-emit-and-ack restart path.
+        let replay = scan_feed_batch("demo", read_cursor("demo")).unwrap().unwrap();
+
+        assert_eq!(read_cursor("demo"), before, "feed read must not advance the cursor");
+        assert_eq!(first.delivery_id, replay.delivery_id);
+        assert_eq!(first.events, replay.events);
+    }
+
+    #[test]
+    fn acked_batch_is_never_redelivered_across_restart() {
+        let (_guard, _tmp) = setup_home();
+        save_demo_task("demo", "first");
+        append_task_event(
+            "demo",
+            "first",
+            "default",
+            Column::todo(),
+            Column::done(),
+            "one",
+        )
+        .unwrap();
+
+        // Emit the batch (crash-safe: cursor still at the batch start).
+        let cursor = read_cursor("demo");
+        let batch = scan_feed_batch("demo", cursor).unwrap().unwrap();
+
+        // Restart before ack: same batch, same delivery id.
+        assert_eq!(
+            scan_feed_batch("demo", read_cursor("demo")).unwrap().unwrap().delivery_id,
+            batch.delivery_id
+        );
+
+        // Ack advances the durable cursor past the batch.
+        ack_delivery("demo", &batch.delivery_id).unwrap();
+        assert!(read_cursor("demo") > cursor);
+
+        // Restart after ack: the batch is gone, nothing pending.
+        assert!(scan_feed_batch("demo", read_cursor("demo")).unwrap().is_none());
+
+        // A fresh event produces a distinct, contiguous batch.
+        save_demo_task("demo", "second");
+        append_task_event(
+            "demo",
+            "second",
+            "default",
+            Column::todo(),
+            Column::done(),
+            "two",
+        )
+        .unwrap();
+        let next = scan_feed_batch("demo", read_cursor("demo")).unwrap().unwrap();
+        assert_ne!(next.delivery_id, batch.delivery_id);
+        assert_eq!(next.cursor.from, batch.cursor.through);
+        assert_eq!(next.events.len(), 1);
+        assert_eq!(next.events[0].task.as_deref(), Some("second"));
+    }
+
+    #[test]
+    fn ack_is_idempotent_and_refuses_to_skip_a_gap() {
+        let (_guard, _tmp) = setup_home();
+        save_demo_task("demo", "first");
+        append_task_event(
+            "demo",
+            "first",
+            "default",
+            Column::todo(),
+            Column::done(),
+            "one",
+        )
+        .unwrap();
+        let batch = scan_feed_batch("demo", read_cursor("demo")).unwrap().unwrap();
+        let through: u64 = batch.cursor.through.parse().unwrap();
+
+        ack_delivery("demo", &batch.delivery_id).unwrap();
+        assert_eq!(read_cursor("demo"), through);
+
+        // Re-acking the same (now behind-cursor) batch is a harmless no-op.
+        ack_delivery("demo", &batch.delivery_id).unwrap();
+        assert_eq!(read_cursor("demo"), through, "duplicate ack must not rewind");
+
+        // Acking a batch that starts beyond the cursor would skip events.
+        let gap = shelbi_state::delivery_id("demo", through + 100, through + 200);
+        let error = ack_delivery("demo", &gap).unwrap_err();
+        assert!(error.to_string().contains("skip unacknowledged events"));
+        assert_eq!(read_cursor("demo"), through, "rejected ack must not advance");
+
+        // Foreign-project delivery id is refused.
+        let foreign = shelbi_state::delivery_id("other", 0, 10);
+        assert!(ack_delivery("demo", &foreign).unwrap_err().to_string().contains("scoped to project"));
+    }
+
+    #[test]
+    fn parse_delivery_id_roundtrips_and_rejects_garbage() {
+        let id = shelbi_state::delivery_id("demo", 12, 345);
+        assert_eq!(parse_delivery_id(&id).unwrap(), ("demo".to_string(), 12, 345));
+
+        assert!(parse_delivery_id("shelbi-event/demo/12").is_err());
+        assert!(parse_delivery_id("not-a-delivery-id").is_err());
+        assert!(parse_delivery_id("shelbi-event//0-1").is_err());
+        // Range that ends before it starts is rejected.
+        assert!(parse_delivery_id("shelbi-event/demo/10-5").is_err());
+    }
+
+    #[test]
+    fn feed_batch_filters_by_project_like_drain() {
+        let (_guard, _tmp) = setup_home();
+        append_workspace_event("demo", "alpha", None, WorkspaceState::Working).unwrap();
+        append_workspace_event("other", "beta", None, WorkspaceState::Working).unwrap();
+
+        let batch = scan_feed_batch("demo", read_cursor("demo")).unwrap().unwrap();
+        assert_eq!(batch.events.len(), 1);
+        assert_eq!(batch.events[0].workspace.as_deref(), Some("alpha"));
+        // The cross-project line is consumed by the cursor range but not
+        // surfaced — same scoping the ack must advance across.
+        ack_delivery("demo", &batch.delivery_id).unwrap();
+        assert!(scan_feed_batch("demo", read_cursor("demo")).unwrap().is_none());
     }
 
     #[test]

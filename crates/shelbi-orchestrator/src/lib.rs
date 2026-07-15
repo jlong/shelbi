@@ -1096,19 +1096,20 @@ fn sidebar_cmd(shelbi_bin: &str, project_name: &str) -> String {
 /// it runs the "Bootstrap on session start" sequence from its
 /// `instructions.md` without waiting for the user to type "start
 /// monitoring". The prompt names every step verbatim so the agent can't
-/// elide arming the `shelbi events tail --follow` watch — that's the
-/// step that turns auto-dispatch back on after a cold start.
+/// elide arming the `shelbi orchestrator events next --follow` durable feed —
+/// that's the step that turns auto-dispatch back on after a cold start.
 const ORCH_BOOTSTRAP_PROMPT: &str = "Run the \"Bootstrap on session start\" sequence \
     from your instructions now: snapshot `shelbi task list`, `shelbi workspace list`, and \
     `shelbi zen status`; scan recent `~/.shelbi/events.log` for a \
-    `zen=off reason=crash-recovery` line; then start `shelbi events tail --follow` \
-    in the background and watch it with the Monitor tool so auto-dispatch reacts \
-    to new transitions. If this runner cannot receive asynchronous Monitor callbacks, \
-    also follow the \"Polling-only event drain\" section: before every user-facing \
-    reply, run `shelbi orchestrator events drain` (the durable cursor is persisted \
-    for you in the project config dir and resumes automatically), apply any returned \
-    task/workspace/heartbeat/pane-death facts through the normal reaction rules, and \
-    only then answer.";
+    `zen=off reason=crash-recovery` line; then start \
+    `shelbi orchestrator events next --follow` in the background and watch it with the \
+    Monitor tool so auto-dispatch reacts to new event batches. Apply each batch's facts \
+    through the reaction rules, then run its `shelbi orchestrator events ack \
+    <delivery-id>` command — ack only after reacting, so a crash re-delivers an \
+    unacked batch. If this runner cannot receive asynchronous Monitor callbacks, also \
+    follow the \"Polling-only claim/ack drain\" section: before every user-facing reply, \
+    claim the pending batch, apply any returned task/workspace/heartbeat/pane-death \
+    facts through the normal reaction rules, ack it, and only then answer.";
 
 /// Compose the recurring orchestrator bootstrap with the optional one-shot
 /// first-project welcome. Repository inspection stays inside the local agent
@@ -2118,8 +2119,12 @@ mod pane_cmd_tests {
             "missing escaped prompt: {out}"
         );
         assert!(
-            out.contains("shelbi events tail --follow"),
-            "prompt must name the tail command"
+            out.contains("shelbi orchestrator events next --follow"),
+            "prompt must name the durable feed command"
+        );
+        assert!(
+            out.contains("shelbi orchestrator events ack"),
+            "prompt must name the ack command that advances the durable cursor"
         );
         assert!(
             out.contains("Monitor tool"),
