@@ -9,10 +9,28 @@ mod wizard;
 #[command(
     name = "shelbi",
     version,
+    // We define our own `--version` flag below so we can bind the short `-v`
+    // to it; disable the auto-generated one to avoid a duplicate flag.
+    disable_version_flag = true,
     about = "Open-source agent orchestrator for the terminal",
     long_about = None,
 )]
 struct Cli {
+    /// Print version information and exit.
+    //
+    // Heads-up for a future `--verbose` author: `-v` is conventionally
+    // "verbose" in many CLIs, and clap's own default version short is `-V`
+    // (uppercase). The user explicitly asked for `-v` -> version, so it lives
+    // here (with `-V` kept as an alias). If you add `--verbose`, you'll need
+    // to move version off `-v` to resolve the collision.
+    #[arg(
+        short = 'v',
+        short_alias = 'V',
+        long = "version",
+        action = clap::ArgAction::Version,
+    )]
+    version: (),
+
     /// Override the shelbi root directory (default: baked at install time;
     /// also overridable via $SHELBI_ROOT). The flag wins over both env vars
     /// and the compile-time default; `~/.shelbi` is the final fallback. With
