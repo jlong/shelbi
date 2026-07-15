@@ -227,6 +227,10 @@ claim and ack, the same batch (same delivery id) comes back — apply its facts
 and ack; a duplicate ack of an already-acked batch is a harmless no-op, so you
 never miss or replay an event.
 
+If the feed command is unavailable, fall back to
+reading `~/.shelbi/events.log` from the last stored byte offset and keep the
+same cursor discipline so events are neither missed nor replayed.
+
 > Legacy: `shelbi orchestrator events drain` still exists and advances the
 > cursor on read (no ack). It is kept only for compatibility with harnesses
 > predating the claim/ack feed; prefer `events next --follow` + `events ack`.
