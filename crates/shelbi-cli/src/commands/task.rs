@@ -935,32 +935,116 @@ fn start(
     }
 
     println!("→ launching {workspace_name} on {id} (branch: {branch}, agent: {agent_name})");
-    let addr = match shelbi_orchestrator::workspace::start_workspace_on_task(
-        shelbi_orchestrator::workspace::StartSpec {
-            project: &project_yaml,
-            workspace,
-            task_id: id,
-            branch: &branch,
-            task_body: &tf.body,
-            agent: Some(agent_name.as_str()),
-        },
-    ) {
-        Ok(addr) => addr,
-        Err(e) => {
-            // Spawn failed. Roll the card back to its pre-start position so
-            // a failed launch doesn't leave it wedged in `in_progress`
-            // assigned to a workspace that isn't running. Best-effort: the
-            // original spawn error is what the user needs to see, but a
-            // rollback failure is surfaced too so a half-moved board isn't
-            // silent.
-            if let Err(re) = rollback_start(project, &original, &tf.body, prev_column.clone()) {
-                eprintln!(
-                    "warning: `{id}` was moved to in_progress but the spawn failed and the \
-                     rollback also failed ({re}); run `shelbi task move {id} --to {prev_column}` \
-                     to recover"
-                );
+
+    // Bound the launch phase. `start_workspace_on_task` already caps its
+    // *internal* readiness/submit waits, but the steps before the pane is even
+    // created — the dispatch + git-worktree locks, a `git fetch` on a fresh
+    // branch cut, and the auto-mode + runner-availability SSH probes — have no
+    // ceiling of their own and can each block indefinitely on a wedged network
+    // or a lock held by a crashed peer. Left unbounded, a single stuck step
+    // hangs `shelbi task start` forever with the card already moved to
+    // `in_progress` and assigned but no pane and no dispatch event: the
+    // phantom-in_progress bug (observed 2026-07-15 on alpha). Run the launch on
+    // a worker thread and cap the wait; on timeout we record a
+    // `dispatch … status=failed` event, roll the card back, and fail loudly.
+    //
+    // Owned clones are moved into the thread so a genuinely-stuck launch can be
+    // abandoned rather than joined: we never block on the hung thread, and the
+    // OS reaps it (releasing any process-scoped locks it holds) when this
+    // short-lived CLI process exits moments later.
+    let launch_deadline = launch_timeout();
+    let addr = {
+        let project_owned = project_yaml.clone();
+        let workspace_owned = workspace.clone();
+        let task_id_owned = id.to_string();
+        let branch_owned = branch.clone();
+        let body_owned = tf.body.clone();
+        let agent_owned = agent_name.clone();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let result = shelbi_orchestrator::workspace::start_workspace_on_task(
+                shelbi_orchestrator::workspace::StartSpec {
+                    project: &project_owned,
+                    workspace: &workspace_owned,
+                    task_id: &task_id_owned,
+                    branch: &branch_owned,
+                    task_body: &body_owned,
+                    agent: Some(agent_owned.as_str()),
+                },
+            );
+            // The receiver is gone if we already timed out — ignore the error.
+            let _ = tx.send(result);
+        });
+
+        match rx.recv_timeout(launch_deadline) {
+            Ok(Ok(addr)) => addr,
+            Ok(Err(e)) => {
+                // Spawn failed cleanly. Roll the card back to its pre-start
+                // position so a failed launch doesn't leave it wedged in
+                // `in_progress` assigned to a workspace that isn't running.
+                // Best-effort: the original spawn error is what the user needs
+                // to see, but a rollback failure is surfaced too so a
+                // half-moved board isn't silent.
+                if let Err(re) = rollback_start(project, &original, &tf.body, prev_column.clone()) {
+                    eprintln!(
+                        "warning: `{id}` was moved to in_progress but the spawn failed and the \
+                         rollback also failed ({re}); run `shelbi task move {id} --to \
+                         {prev_column}` to recover"
+                    );
+                }
+                return Err(anyhow!(e).context("launching workspace"));
             }
-            return Err(anyhow!(e).context("launching workspace"));
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                // Launch blew past the ceiling — the worker thread is still
+                // blocked on git/ssh/a stale lock. Record a failed-dispatch
+                // event so the stall is visible in `~/.shelbi/events.log`
+                // (not something you find by `ps`-grepping a stuck process),
+                // roll the card back, and fail loudly. The abandoned thread
+                // dies with this process.
+                if let Err(le) = shelbi_state::append_dispatch_event(
+                    id,
+                    &workspace_name,
+                    "failed",
+                    &format!("launch_timeout_after_{}s", launch_deadline.as_secs()),
+                ) {
+                    eprintln!("warning: append_dispatch_event failed: {le}");
+                }
+                if let Err(re) = rollback_start(project, &original, &tf.body, prev_column.clone()) {
+                    eprintln!(
+                        "warning: `{id}` launch timed out and the rollback also failed ({re}); \
+                         run `shelbi task move {id} --to {prev_column}` to recover"
+                    );
+                }
+                return Err(anyhow!(
+                    "launching workspace `{workspace_name}` on `{id}` timed out after {}s — \
+                     dispatch aborted and the task rolled back to `{prev_column}`. The launch \
+                     likely blocked on git/ssh or a stale lock; check the workspace pane, then \
+                     re-run the dispatch.",
+                    launch_deadline.as_secs(),
+                ));
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                // Worker thread panicked before sending its result. Treat as a
+                // failed launch: record it, roll the card back, and surface it.
+                if let Err(le) = shelbi_state::append_dispatch_event(
+                    id,
+                    &workspace_name,
+                    "failed",
+                    "launch_thread_panicked",
+                ) {
+                    eprintln!("warning: append_dispatch_event failed: {le}");
+                }
+                if let Err(re) = rollback_start(project, &original, &tf.body, prev_column.clone()) {
+                    eprintln!(
+                        "warning: `{id}` launch thread died and the rollback also failed ({re}); \
+                         run `shelbi task move {id} --to {prev_column}` to recover"
+                    );
+                }
+                return Err(anyhow!(
+                    "launching workspace `{workspace_name}` on `{id}` failed: the launch thread \
+                     terminated unexpectedly before reporting a result"
+                ));
+            }
         }
     };
 
@@ -1010,6 +1094,27 @@ fn rollback_start(project: &str, original: &Task, body: &str, prev_column: Colum
 /// the activity-feed parser without breaking the single-token contract.
 fn dispatch_reason_with_agent(base: &str, agent: &str) -> String {
     format!("{base} agent={agent}")
+}
+
+/// Default wall-clock ceiling for the whole launch phase of `shelbi task
+/// start` (worktree sync, SSH probes, pane creation, and the readiness/submit
+/// wait). Generous enough to cover a cold `git fetch` on a fresh cut plus the
+/// two 30s internal readiness probes without tripping on a healthy-but-slow
+/// machine, while still bounding the pathological "blocked forever" case that
+/// produced the phantom in_progress.
+const DEFAULT_LAUNCH_TIMEOUT_MS: u64 = 180_000;
+
+/// The launch-phase deadline, env-overridable via `SHELBI_LAUNCH_TIMEOUT_MS`
+/// (milliseconds) and clamped to a sane range so a fat-fingered override can't
+/// re-introduce an effectively-unbounded wait or starve a legitimately slow
+/// cold start. Mirrors the `SHELBI_PROBE_TIMEOUT_MS` knob on the slot probe.
+fn launch_timeout() -> std::time::Duration {
+    let ms = std::env::var("SHELBI_LAUNCH_TIMEOUT_MS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(DEFAULT_LAUNCH_TIMEOUT_MS)
+        .clamp(10_000, 1_800_000);
+    std::time::Duration::from_millis(ms)
 }
 
 /// `shelbi task resume` — relaunch the assigned workspace on the task it is
@@ -1867,6 +1972,56 @@ workspaces:
             sanitized,
             "orchestrator:auto-dispatch_workspace=alpha_agent=developer"
         );
+    }
+
+    #[test]
+    fn launch_timeout_defaults_and_clamps_env_override() {
+        // The launch-phase watchdog must never collapse to 0 (which would fail
+        // every dispatch instantly) nor blow back out to effectively-unbounded,
+        // regardless of what `SHELBI_LAUNCH_TIMEOUT_MS` is set to. Mirrors the
+        // probe-deadline clamp test.
+        let _g = TEST_LOCK.lock().unwrap();
+        let prev = std::env::var_os("SHELBI_LAUNCH_TIMEOUT_MS");
+
+        std::env::remove_var("SHELBI_LAUNCH_TIMEOUT_MS");
+        assert_eq!(
+            launch_timeout(),
+            std::time::Duration::from_millis(DEFAULT_LAUNCH_TIMEOUT_MS),
+            "default"
+        );
+
+        std::env::set_var("SHELBI_LAUNCH_TIMEOUT_MS", "100");
+        assert_eq!(
+            launch_timeout(),
+            std::time::Duration::from_millis(10_000),
+            "clamps low"
+        );
+
+        std::env::set_var("SHELBI_LAUNCH_TIMEOUT_MS", "99999999");
+        assert_eq!(
+            launch_timeout(),
+            std::time::Duration::from_millis(1_800_000),
+            "clamps high"
+        );
+
+        std::env::set_var("SHELBI_LAUNCH_TIMEOUT_MS", "garbage");
+        assert_eq!(
+            launch_timeout(),
+            std::time::Duration::from_millis(DEFAULT_LAUNCH_TIMEOUT_MS),
+            "falls back on unparseable"
+        );
+
+        std::env::set_var("SHELBI_LAUNCH_TIMEOUT_MS", "45000");
+        assert_eq!(
+            launch_timeout(),
+            std::time::Duration::from_millis(45_000),
+            "honors an in-range override"
+        );
+
+        match prev {
+            Some(v) => std::env::set_var("SHELBI_LAUNCH_TIMEOUT_MS", v),
+            None => std::env::remove_var("SHELBI_LAUNCH_TIMEOUT_MS"),
+        }
     }
 
     #[test]
