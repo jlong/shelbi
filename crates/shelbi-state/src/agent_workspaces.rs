@@ -1509,19 +1509,19 @@ After green, run `shelbi zen pr-merge <pr-number> --match-head-commit <head_sha>
         let expected = custom
             .replace(
                 "`shelbi zen pr-create <task-id> --match-head-commit <head_sha>`",
-                "`shelbi zen pr-create <task-id> --match-repository <repository> --match-repository-id <repository_id> --match-base-branch <base_branch> --match-base-commit <base_sha> --match-head-commit <head_sha>`",
+                "`shelbi zen pr-create <task-id> --match-repository <repository> --match-repository-id <repository_id> --match-base-branch <base_branch> --match-base-commit <base_sha> --match-integration-commit <integration_sha> --match-head-commit <head_sha>`",
             )
             .replace(
                 "`shelbi zen ci-watch <pr> --match-head-commit <head_sha>`",
-                "`shelbi zen ci-watch <pr> --match-repository <repository> --match-repository-id <repository_id> --match-base-branch <base_branch> --match-base-commit <base_sha> --match-head-commit <head_sha>`",
+                "`shelbi zen ci-watch <pr> --match-repository <repository> --match-repository-id <repository_id> --match-base-branch <base_branch> --match-base-commit <base_sha> --match-integration-commit <integration_sha> --match-head-commit <head_sha>`",
             )
             .replace(
                 "`shelbi zen pr-merge <pr> --match-head-commit <head_sha>`",
-                "`shelbi zen pr-merge <pr> --match-repository <repository> --match-repository-id <repository_id> --match-base-branch <base_branch> --match-base-commit <base_sha> --match-head-commit <head_sha>`",
+                "`shelbi zen pr-merge <pr> --match-repository <repository> --match-repository-id <repository_id> --match-base-branch <base_branch> --match-base-commit <base_sha> --match-integration-commit <integration_sha> --match-head-commit <head_sha>`",
             )
             .replace(
                 "`shelbi zen pr-merge <pr-number> --match-head-commit <head_sha>`",
-                "`shelbi zen pr-merge <pr-number> --match-repository <repository> --match-repository-id <repository_id> --match-base-branch <base_branch> --match-base-commit <base_sha> --match-head-commit <head_sha>`",
+                "`shelbi zen pr-merge <pr-number> --match-repository <repository> --match-repository-id <repository_id> --match-base-branch <base_branch> --match-base-commit <base_sha> --match-integration-commit <integration_sha> --match-head-commit <head_sha>`",
             );
         assert_eq!(fs::read_to_string(&path).unwrap(), expected);
         assert!(fs::read_to_string(&path)
@@ -1725,15 +1725,19 @@ After green, run `shelbi zen pr-merge <pr-number> --match-head-commit <head_sha>
         assert!(!DEFAULT_ORCHESTRATOR_INSTRUCTIONS.is_empty());
         assert!(DEFAULT_ORCHESTRATOR_INSTRUCTIONS.contains("# You are the Orchestrator"));
         assert!(DEFAULT_ORCHESTRATOR_INSTRUCTIONS.contains(
-            "shelbi zen pr-create <task-id> --match-repository <repository> --match-repository-id <repository_id> --match-base-branch <base_branch> --match-base-commit <base_sha> --match-head-commit <head_sha>"
+            "shelbi zen pr-create <task-id> --match-repository <repository> --match-repository-id <repository_id> --match-base-branch <base_branch> --match-base-commit <base_sha> --match-integration-commit <integration_sha> --match-head-commit <head_sha>"
         ));
         assert!(DEFAULT_ORCHESTRATOR_INSTRUCTIONS.contains(
-            "shelbi zen ci-watch <pr> --match-repository <repository> --match-repository-id <repository_id> --match-base-branch <base_branch> --match-base-commit <base_sha> --match-head-commit <head_sha>"
+            "shelbi zen ci-watch <pr> --match-repository <repository> --match-repository-id <repository_id> --match-base-branch <base_branch> --match-base-commit <base_sha> --match-integration-commit <integration_sha> --match-head-commit <head_sha>"
         ));
         assert!(DEFAULT_ORCHESTRATOR_INSTRUCTIONS.contains(
-            "shelbi zen pr-merge <pr> --match-repository <repository> --match-repository-id <repository_id> --match-base-branch <base_branch> --match-base-commit <base_sha> --match-head-commit <head_sha>"
+            "shelbi zen pr-merge <pr> --match-repository <repository> --match-repository-id <repository_id> --match-base-branch <base_branch> --match-base-commit <base_sha> --match-integration-commit <integration_sha> --match-head-commit <head_sha>"
         ));
-        assert!(DEFAULT_ORCHESTRATOR_INSTRUCTIONS.contains("atomically leases only"));
+        assert!(DEFAULT_ORCHESTRATOR_INSTRUCTIONS.contains(
+            "advances only the frozen base ref from `base_sha` to\n  `integration_sha` with Git's compare-and-swap lease"
+        ));
+        assert!(DEFAULT_ORCHESTRATOR_INSTRUCTIONS
+            .contains("Describe atomicity only\n  at that remote-ref update boundary"));
         assert!(
             crate::zenmode::migrate_legacy_zen_commands(DEFAULT_ORCHESTRATOR_INSTRUCTIONS)
                 .is_none(),

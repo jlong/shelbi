@@ -84,22 +84,21 @@ conditions to the report:
 If all pre-PR conditions pass:
 
 5. Freeze the probe's `repository`, `repository_id`, `base_branch`, `base_sha`,
-   and `head_sha`. Run `shelbi zen pr-create <task-id> --match-repository <repository> --match-repository-id <repository_id> --match-base-branch <base_branch> --match-base-commit <base_sha> --match-head-commit <head_sha>`
+   `integration_sha`, and `head_sha`. Run `shelbi zen pr-create <task-id> --match-repository <repository> --match-repository-id <repository_id> --match-base-branch <base_branch> --match-base-commit <base_sha> --match-integration-commit <integration_sha> --match-head-commit <head_sha>`
    using those exact values. Capture the PR number it prints.
-6. Run `shelbi zen ci-watch <pr-number> --match-repository <repository> --match-repository-id <repository_id> --match-base-branch <base_branch> --match-base-commit <base_sha> --match-head-commit <head_sha> --timeout 15m`
+6. Run `shelbi zen ci-watch <pr-number> --match-repository <repository> --match-repository-id <repository_id> --match-base-branch <base_branch> --match-base-commit <base_sha> --match-integration-commit <integration_sha> --match-head-commit <head_sha> --timeout 15m`
    using that same probe identity. Stdout is `green`,
    `red:<check>:<summary>`, or `timeout`. The condition: must be `green`.
    Any identity movement fails closed; never recompute or substitute a probe
    field after CI begins.
-7. If green, run `shelbi zen pr-merge <pr-number> --match-repository <repository> --match-repository-id <repository_id> --match-base-branch <base_branch> --match-base-commit <base_sha> --match-head-commit <head_sha>`
-   with that same identity. The command validates repository, base, and head,
-   then supplies `expectedHeadOid` to GitHub's merge or queue mutation. That is
-   an atomic head lease only, not an atomic repository or base lease. A
-   concurrent same-head retarget between validation and mutation remains a
-   documented limitation for separate human design; do not describe this path
-   as atomically base-pinned. If it prints `queued` and exits 2, leave the task
-   in `handoff` and retry the same pinned command later. Only after a merge SHA
-   or `sha-pending` result, move the task into `done` and emit
+7. If green, run `shelbi zen pr-merge <pr-number> --match-repository <repository> --match-repository-id <repository_id> --match-base-branch <base_branch> --match-base-commit <base_sha> --match-integration-commit <integration_sha> --match-head-commit <head_sha>`
+   with that same identity. The command verifies the candidate has sole parent
+   `base_sha` and the exact tree of `head_sha`, then atomically advances only
+   `refs/heads/<base_branch>` from `base_sha` to `integration_sha` with Git's
+   compare-and-swap lease. If branch protection, rulesets, a merge queue, a
+   fork, permissions, or a non-squash strategy prevent that exact-ref path,
+   leave the task in `handoff` and follow the command's human-review action.
+   Only after a candidate SHA result, move the task into `done` and emit
    `reason=orchestrator:zen-merge` with the merge SHA.
 8. If red or timeout: leave in `handoff`; emit `reason=zen:failed-checks` (red)
    or `reason=zen:ci-timeout`.
