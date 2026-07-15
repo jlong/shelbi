@@ -1541,8 +1541,8 @@ mod tests {
         let entries = build_entries(&app, ZenModeState::Off, ZenToggleChord::AltZ);
         let ids: Vec<&str> = entries.iter().map(|e| e.id.as_str()).collect();
         // View block first (Chat/Tasks/Activity), then the mode toggle,
-        // then the global actions trail. Workspaces/reviews/agents are
-        // empty in this fixture so they don't appear.
+        // then the global actions trail (Add → Switch → Quit). Workspaces/
+        // reviews/agents are empty in this fixture so they don't appear.
         assert_eq!(
             ids,
             vec![
@@ -1550,6 +1550,7 @@ mod tests {
                 "view:tasks",
                 "view:activity",
                 "action:toggle-zen",
+                "action:add-project",
                 "action:switch-project",
                 "action:quit-project",
                 "action:quit-shelbi",
