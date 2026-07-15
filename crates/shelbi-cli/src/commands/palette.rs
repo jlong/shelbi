@@ -108,20 +108,25 @@ pub fn run(project: String) -> Result<()> {
         _ => false,
     };
 
-    restore_terminal(&mut term)?;
-
-    if let Some(target) = switch_target {
-        switch_to_project(&target)?;
-    } else if quit_project_confirmed {
-        super::quit_project::run(&project)?;
+    // The two quit paths render a live progress view in the palette's own
+    // alt-screen, so they keep the terminal until they're done and restore
+    // it themselves right before firing the detached self-kill. Every other
+    // path restores here first, then acts on the clean terminal.
+    if quit_project_confirmed {
+        super::teardown::quit_project_with_progress(&mut term, &project)?;
     } else if quit_shelbi_confirmed {
-        super::quit_shelbi::run()?;
-    } else if let Some(entry) = chosen {
-        if entry.id != "action:switch-project"
-            && entry.id != "action:quit-project"
-            && entry.id != "action:quit-shelbi"
-        {
-            dispatch(&project, &entry)?;
+        super::teardown::quit_shelbi_with_progress(&mut term)?;
+    } else {
+        restore_terminal(&mut term)?;
+        if let Some(target) = switch_target {
+            switch_to_project(&target)?;
+        } else if let Some(entry) = chosen {
+            if entry.id != "action:switch-project"
+                && entry.id != "action:quit-project"
+                && entry.id != "action:quit-shelbi"
+            {
+                dispatch(&project, &entry)?;
+            }
         }
     }
     Ok(())

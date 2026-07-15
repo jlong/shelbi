@@ -25,6 +25,7 @@ pub mod spawn;
 pub mod status;
 pub mod tail;
 pub mod task;
+pub mod teardown;
 pub mod wizard;
 pub mod workflow;
 pub mod workspace;

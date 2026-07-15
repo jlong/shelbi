@@ -7,8 +7,6 @@
 //! only catches the local stash) and dropped the user wherever tmux
 //! happened to switch by default.
 
-use anyhow::{anyhow, Result};
-
 use shelbi_core::Column;
 use shelbi_orchestrator::workspace as orch_workspace;
 use shelbi_state::WorkspaceState;
@@ -30,70 +28,34 @@ pub struct ActiveWorkspace {
     pub task: String,
 }
 
-/// Quit `project`:
-///
-/// 1. Ask the live orchestrator to write
-///    `agents/orchestrator/handoff.md` covering its in-flight state.
-///    The file persists between quit and the next `shelbi` launch
-///    (deleted only after the new instance ingests it), so a
-///    quit/start cycle carries the orchestrator's mid-thought
-///    context forward. Best-effort — a missing/timed-out handoff
-///    degrades to a cold next start, not a stuck quit.
-/// 2. Kill every workspace pane (local windows + remote sessions). The user
-///    is closing the whole project, so we don't try to preserve in-flight
-///    task assignments here — the cards stay on the board and get picked
-///    up the next time the project's dispatched.
-/// 3. Pick the most-recently-attached *other* `shelbi-*` session.
-/// 4. `switch-client` to it BEFORE killing the current session — without
-///    this the popup's tmux client briefly disconnects, which can flash
-///    a bare terminal at the user.
-/// 5. Kill the hidden stash session (`_shelbi-<project>`) and then the
-///    visible session (`shelbi-<project>`). Both are idempotent and
-///    cleared by the local `session-closed` hook anyway, but doing the
-///    work explicitly keeps the teardown order deterministic.
-/// 6. Append a `project=<name> closed reason=user:quit-project` line to
-///    the events log so the activity feed shows the close.
-///
-/// Before killing anything we also clear `state.json::zen_last_crashed_at`.
-/// The orchestrator pane's heartbeat loop writes a fresh timestamp every
-/// 60s; tearing the session down via `kill-session` sends SIGHUP to the
-/// pane and prevents the wrapper's own `__zen-orch-exit` from running, so
-/// without this explicit clear the next start would misread the quit as
-/// a crash and auto-disable Zen.
-pub fn run(project: &str) -> Result<()> {
-    let p = shelbi_state::load_project(project).map_err(|e| anyhow!(e))?;
-
-    // Capture the orchestrator's in-flight state before any kill. We
-    // ignore the outcome — list_active_workspaces and the palette
-    // popover have already shown the user what's about to happen and
-    // they confirmed; a degraded handoff (timeout, send failed) means
-    // the next start is cold, not that the quit should fail.
-    let _ = shelbi_orchestrator::handoff::request_orchestrator_handoff(project);
-
-    let _ = shelbi_state::zen_clear_crash(project);
-
-    for workspace in &p.workspaces {
-        let Some(machine) = p.machine(&workspace.machine) else {
-            continue;
-        };
-        let host = machine.host();
-        let Ok(addr) = orch_workspace::workspace_tmux_addr(&p, workspace) else {
-            continue;
-        };
-        let _ = orch_workspace::kill_workspace_pane(&host, &addr, &workspace.name);
-    }
-
+/// The most-recently-attached *other* `shelbi-*` session the attached
+/// client should land on once `project` is torn down, or `None` when this
+/// is the only shelbi project open. The progress path `switch-client`s to
+/// it BEFORE the `shelbi-<project>` self-kill fires — without this the
+/// popup's tmux client briefly disconnects, which can flash a bare
+/// terminal at the user.
+pub(crate) fn next_session_target(project: &str) -> Option<String> {
     let current = format!("shelbi-{project}");
-    if let Some(target) = pick_next_session(&list_sessions(), &current) {
-        let _ = super::run_tmux(["switch-client", "-t", &target]);
-    }
+    pick_next_session(&list_sessions(), &current)
+}
 
-    let _ = super::run_tmux(["kill-session", "-t", &format!("_shelbi-{project}")]);
-    let _ = super::run_tmux(["kill-session", "-t", &current]);
-
-    let _ = shelbi_state::append_project_event(project, "closed", "user:quit-project");
-
-    Ok(())
+/// Build the interruption backstop for a single-project quit: kill the
+/// hidden stash (`_shelbi-<project>`) and then the visible session
+/// (`shelbi-<project>`). The progress path fires this via
+/// `tmux run-shell -b` as its last act so the self-kill is forked into the
+/// tmux server and survives the popup process dying to its own SIGHUP.
+///
+/// No `detach-client` here (unlike the whole-host quit): the progress path
+/// `switch-client`s the attached client to the next project first, so a
+/// blanket detach would bounce the user off the session they just landed
+/// on. Stderr is silenced because both kills are idempotent — the stash
+/// may already be gone via the foreground pass or the `session-closed`
+/// hook, and `kill-session` on an absent target is noisy but harmless.
+pub(crate) fn build_project_teardown_script(project: &str) -> String {
+    format!(
+        "tmux kill-session -t _shelbi-{project} 2>/dev/null; \
+         tmux kill-session -t shelbi-{project} 2>/dev/null; true"
+    )
 }
 
 /// Enumerate declared workspaces whose tmux pane is currently live, decorated
@@ -320,6 +282,42 @@ shelbi-bravo 0
         // observed a marker yet, so show `working` rather than dropping
         // the row or guessing idle.
         assert_eq!(workspace_state_label(true, None), "working");
+    }
+
+    #[test]
+    fn teardown_script_kills_stash_then_main_and_ends_with_true() {
+        // The backstop must kill `_shelbi-*` before `shelbi-*` (stash first,
+        // matching the whole-host quit) and end with `true` so a raced kill
+        // returning non-zero doesn't surface in tmux's run-shell job log.
+        let script = build_project_teardown_script("alpha");
+        let stash_pos = script.find("kill-session -t _shelbi-alpha").unwrap();
+        let main_pos = script.find("kill-session -t shelbi-alpha").unwrap();
+        assert!(
+            stash_pos < main_pos,
+            "_shelbi-* must be killed before shelbi-* (script={script:?})"
+        );
+        assert!(script.trim_end().ends_with("true"), "script={script:?}");
+    }
+
+    #[test]
+    fn teardown_script_silences_kill_session_stderr() {
+        // Both kills are idempotent — the stash may already be gone from the
+        // foreground progress pass — so absent-target noise is redirected.
+        let script = build_project_teardown_script("alpha");
+        assert!(script.contains("kill-session -t _shelbi-alpha 2>/dev/null"));
+        assert!(script.contains("kill-session -t shelbi-alpha 2>/dev/null"));
+    }
+
+    #[test]
+    fn teardown_script_does_not_detach_client() {
+        // Unlike the whole-host quit, a single-project quit switches the
+        // client to the next project first, so a blanket detach-client would
+        // bounce the user off the session they just landed on.
+        let script = build_project_teardown_script("alpha");
+        assert!(
+            !script.contains("detach-client"),
+            "single-project teardown must not detach (script={script:?})"
+        );
     }
 
     #[test]
