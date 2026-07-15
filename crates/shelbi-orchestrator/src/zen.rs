@@ -95,6 +95,20 @@ pub struct PinnedPrIdentity {
     /// lease onto the base ref.
     pub integration_sha: String,
     pub head_sha: String,
+    /// The task branch tip as it stood *before* this probe's optional rebase —
+    /// the commit the remote task branch is expected to still point at when
+    /// `pr-create` publishes. Equal to `head_sha` when no rebase moved the
+    /// branch. When the probe rebased onto a moved base, `head_sha` is the
+    /// locally constructed (never-pushed) rebased head while this is the
+    /// still-published pre-rebase head. `pr-create` accepts this OID as a
+    /// legitimate remote tip to replace, because the flow itself rebased away
+    /// from it — it is not a concurrent update.
+    ///
+    /// `None` when the caller (an older orchestrator prompt) did not supply it;
+    /// the guard then falls back to its pre-existing reviewed-head /
+    /// integration / ancestor acceptance, so the rebased-head case stays
+    /// unpublishable exactly as it did before this field existed.
+    pub published_head_sha: Option<String>,
 }
 
 impl PinnedPrIdentity {
@@ -262,6 +276,31 @@ fn red_from_output(stdout: &str, stderr: &str) -> PollOutcome {
     PollOutcome::Red { check, summary }
 }
 
+/// How the PR-head verification tolerates GitHub's eventually-consistent PR
+/// API. Immediately after a push the branch ref is authoritative, but the
+/// PR object's `headRefOid` can still report the pre-push commit for a few
+/// seconds. We re-read the PR view a bounded number of times, sleeping
+/// `backoff` between attempts, before falling back to the authoritative remote
+/// ref to classify the mismatch as transient (retry-safe) or real.
+#[derive(Debug, Clone, Copy)]
+struct PrHeadVerifyRetry {
+    /// Total PR-view reads (>= 1). Attempt 1 is the initial read.
+    attempts: u32,
+    /// Fixed delay slept between attempts.
+    backoff: Duration,
+}
+
+impl Default for PrHeadVerifyRetry {
+    fn default() -> Self {
+        // ~10s total across five gaps — comfortably longer than the PR API's
+        // usual propagation lag without stalling the merge flow for minutes.
+        Self {
+            attempts: 6,
+            backoff: Duration::from_secs(2),
+        }
+    }
+}
+
 /// Push the task's branch and open a PR, pinned to the exact branch commit
 /// previously reviewed by a Zen probe. Idempotent: if an open PR for the
 /// branch already exists, reuse it only after verifying that its head is the
@@ -273,7 +312,14 @@ pub fn pr_create_at_head(
     task_body: &str,
     expected: &PinnedPrIdentity,
 ) -> Result<u64> {
-    pr_create_impl(project, project_name, task, task_body, expected)
+    pr_create_impl(
+        project,
+        project_name,
+        task,
+        task_body,
+        expected,
+        PrHeadVerifyRetry::default(),
+    )
 }
 
 fn pr_create_impl(
@@ -282,6 +328,7 @@ fn pr_create_impl(
     task: &Task,
     task_body: &str,
     expected: &PinnedPrIdentity,
+    head_retry: PrHeadVerifyRetry,
 ) -> Result<u64> {
     let (host, worktree) = locate_workspace_worktree(project, task)?;
     let wt = worktree.to_string_lossy().into_owned();
@@ -351,9 +398,22 @@ fn pr_create_impl(
     // task ref is itself leased to the reviewed task head (or the already
     // published integration OID on retry); an unrelated update is never
     // overwritten.
+    //
+    // The probe may have rebased the branch onto a moved base, advancing the
+    // durable local ref to a never-pushed `head_sha` while the remote tip still
+    // holds the pre-rebase `published_head_sha`. That pre-rebase commit is the
+    // flow's own prior state — the exact tip the probe rebased away from — so
+    // it is an accepted lease target, not a concurrent update. `published_head`
+    // is absent only for older orchestrator prompts that predate the flag; the
+    // ancestor/integration fallbacks below then apply exactly as before.
+    let published_head = expected.published_head_sha.as_deref();
     let remote_task_head = optional_remote_branch_sha(&host, &wt, &push_target, branch)?;
     let remote_is_reviewed_ancestor = match remote_task_head.as_deref() {
-        Some(oid) if oid != expected.head_sha && oid != expected.integration_sha => {
+        Some(oid)
+            if oid != expected.head_sha
+                && oid != expected.integration_sha
+                && Some(oid) != published_head =>
+        {
             let ancestor = run_in_dir(
                 &host,
                 &wt,
@@ -373,11 +433,12 @@ fn pr_create_impl(
     };
     if !remote_is_reviewed_ancestor {
         return Err(Error::Other(format!(
-            "remote task branch `{branch}` moved to {}, expected reviewed head {} or published \
-             integration {}; refusing to replace the concurrent update",
+            "remote task branch `{branch}` moved to {}, expected reviewed head {}, published \
+             integration {}, or pre-rebase head {}; refusing to replace the concurrent update",
             remote_task_head.as_deref().unwrap_or(""),
             expected.head_sha,
-            expected.integration_sha
+            expected.integration_sha,
+            published_head.unwrap_or("(none)")
         )));
     }
     let lease = format!(
@@ -432,9 +493,11 @@ fn pr_create_impl(
             &expected.base_branch,
             &expected.base_sha,
             &origin_repository,
+            &push_target,
             num,
             &operation_head,
             &expected.integration_sha,
+            head_retry,
         )?;
         return Ok(num);
     }
@@ -495,15 +558,33 @@ fn pr_create_impl(
         &expected.base_branch,
         &expected.base_sha,
         &origin_repository,
+        &push_target,
         num,
         &operation_head,
         &expected.integration_sha,
+        head_retry,
     )?;
     Ok(num)
 }
 
 /// Prove that `pr` still names the exact reviewed task branch commit before
 /// its number is allowed to reach CI watching or merging.
+///
+/// The structural fields (head/base branch, base OID, head repository) are
+/// checked once and fail closed on mismatch. The head OID is treated
+/// differently: GitHub's PR API is eventually consistent, so right after a push
+/// the PR object can still report the pre-push commit even though the branch
+/// ref already advanced. That single field is re-read with backoff
+/// (`head_retry`). If it never converges, the authoritative remote branch ref
+/// decides the verdict:
+///
+/// - remote ref == `pushed_head` → the branch is correct and GitHub's PR view
+///   is merely lagging beyond our budget. Returns [`Error::TransientVerification`]
+///   so the caller can retry the (idempotent) publish rather than treating it
+///   as a hard mismatch — this is the false failure the guard used to report on
+///   its own just-completed push.
+/// - remote ref != `pushed_head` → the branch itself moved after our push (a
+///   real concurrent update / wrong PR). Returns [`Error::Other`]: do not merge.
 #[allow(clippy::too_many_arguments)]
 fn verify_pr_identity(
     host: &Host,
@@ -512,9 +593,11 @@ fn verify_pr_identity(
     target: &str,
     expected_base_sha: &str,
     origin_repository: &RepositoryIdentity,
+    push_target: &str,
     pr: u64,
     reviewed_head: &str,
     pushed_head: &str,
+    head_retry: PrHeadVerifyRetry,
 ) -> Result<()> {
     let wt = worktree.to_string_lossy().into_owned();
     verify_task_branch_head(
@@ -524,14 +607,67 @@ fn verify_pr_identity(
         reviewed_head,
         "before its PR head was verified",
     )?;
-    let identity = lookup_pr_identity(host, &wt, &origin_repository.selector, pr)?;
-    verify_task_branch_head(
-        host,
-        worktree,
-        branch,
-        reviewed_head,
-        "while its PR head was being verified",
-    )?;
+
+    let attempts = head_retry.attempts.max(1);
+    let mut last_head_oid = String::new();
+    for attempt in 0..attempts {
+        let identity = lookup_pr_identity(host, &wt, &origin_repository.selector, pr)?;
+        verify_task_branch_head(
+            host,
+            worktree,
+            branch,
+            reviewed_head,
+            "while its PR head was being verified",
+        )?;
+        verify_pr_structural_identity(
+            &identity,
+            branch,
+            target,
+            expected_base_sha,
+            origin_repository,
+            pr,
+        )?;
+        if identity.head_oid == pushed_head {
+            return Ok(());
+        }
+        last_head_oid = identity.head_oid;
+        if attempt + 1 < attempts {
+            std::thread::sleep(head_retry.backoff);
+        }
+    }
+
+    // The PR view still disagrees after every retry. The remote branch ref is
+    // strongly consistent (unlike the PR object), so it is the tiebreaker
+    // between "GitHub is slow" and "someone moved the branch".
+    let remote_tip = optional_remote_branch_sha(host, &wt, push_target, branch)?;
+    if remote_tip.as_deref() == Some(pushed_head) {
+        return Err(Error::TransientVerification(format!(
+            "open PR #{pr} for branch `{branch}` still reports head {last_head_oid} through \
+             GitHub's API, but the branch ref already points at the pushed integration commit \
+             {pushed_head}; GitHub's eventually-consistent PR view has not caught up. Re-run \
+             `shelbi zen pr-create` (idempotent) once it propagates"
+        )));
+    }
+    Err(Error::Other(format!(
+        "open PR #{pr} for branch `{branch}` points to {last_head_oid}, but the reviewed \
+         integration candidate is {pushed_head} (remote tip {}); refusing to report the stale \
+         PR ready for CI or merge",
+        remote_tip.as_deref().unwrap_or("absent")
+    )))
+}
+
+/// Check every non-head field of a PR's identity against the reviewed
+/// provenance. These fields do not lag GitHub's API the way the head OID does
+/// right after a push, so a mismatch here is always a hard, non-retryable
+/// refusal.
+fn verify_pr_structural_identity(
+    identity: &crate::git::PrIdentity,
+    branch: &str,
+    target: &str,
+    expected_base_sha: &str,
+    origin_repository: &RepositoryIdentity,
+    pr: u64,
+) -> Result<()> {
     if identity.head_ref != branch {
         return Err(Error::Other(format!(
             "open PR #{pr} reports head branch `{}`, but Shelbi pushed reviewed branch \
@@ -563,13 +699,6 @@ fn verify_pr_identity(
             identity.head_repository.id,
             origin_repository.name_with_owner,
             origin_repository.id
-        )));
-    }
-    if identity.head_oid != pushed_head {
-        return Err(Error::Other(format!(
-            "open PR #{pr} for branch `{branch}` points to {}, but the reviewed integration \
-             candidate is {pushed_head}; refusing to report the stale PR ready for CI or merge",
-            identity.head_oid
         )));
     }
     Ok(())
@@ -2192,6 +2321,7 @@ mod pr_create_tests {
             base_sha: base_sha.into(),
             integration_sha: head_sha.into(),
             head_sha: head_sha.into(),
+            published_head_sha: None,
         }
     }
 
@@ -2235,6 +2365,7 @@ mod pr_create_tests {
             base_sha: report.base_sha.clone(),
             integration_sha: report.integration_sha.clone(),
             head_sha: report.head_sha.clone(),
+            published_head_sha: Some(report.published_head_sha.clone()),
         }
     }
 
@@ -2280,6 +2411,7 @@ mod pr_create_tests {
             base_sha,
             integration_sha,
             head_sha: head_sha.into(),
+            published_head_sha: None,
         }
     }
 
@@ -2391,6 +2523,78 @@ esac
             repository_id_override = q(&repository_id_override.to_string_lossy()),
             repository_name_override = q(&repository_name_override.to_string_lossy()),
             repository_url_override = q(&repository_url_override.to_string_lossy()),
+            origin = q(&origin.to_string_lossy()),
+            remote_ref = q(&format!("refs/heads/{TASK_BRANCH}")),
+            task_branch = q(TASK_BRANCH),
+            origin_repository_id = q(ORIGIN_REPOSITORY_ID),
+            origin_repository_name = q(ORIGIN_REPOSITORY_NAME),
+            origin_repository_url = q("https://github.com/example/repo"),
+        );
+        let gh = bin.join("gh");
+        std::fs::write(&gh, script).unwrap();
+        std::fs::set_permissions(&gh, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::write(
+            stub_home.join(".profile"),
+            format!("export PATH=\"{}:$PATH\"\n", bin.display()),
+        )
+        .unwrap();
+        log_file
+    }
+
+    /// Install a `gh` stub that models GitHub's eventually-consistent PR view
+    /// after a fresh `pr create`: `pr list` reports no existing PR (so the flow
+    /// creates one, numbered 42), and the first `lag_reads` `pr view` calls
+    /// report `stale_head` before the view converges to the branch's real tip.
+    /// Everything else mirrors [`install_gh_stub`].
+    fn install_gh_stub_lagging_created_pr(
+        stub_home: &Path,
+        origin: &Path,
+        stale_head: &str,
+        lag_reads: u32,
+    ) -> PathBuf {
+        let bin = stub_home.join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let log_file = stub_home.join("gh.log");
+        let view_reads = stub_home.join("pr-view-reads");
+        let q = shelbi_agent::shell_escape;
+        let script = format!(
+            r#"#!/bin/sh
+printf '%s\n' "$*" >> {log}
+case "$1 $2" in
+  "repo view")
+    printf '%s\n' {origin_repository_id} {origin_repository_name} {origin_repository_url}
+    ;;
+  "pr list")
+    ;;
+  "pr create")
+    printf '%s\n' https://github.com/example/repo/pull/42
+    ;;
+  "pr view")
+    reads=0
+    if [ -f {view_reads} ]; then reads=$(cat {view_reads}); fi
+    reads=$((reads + 1))
+    printf '%s\n' "$reads" > {view_reads}
+    if [ "$reads" -le {lag_reads} ]; then
+      printf '%s\n' {stale_head}
+    else
+      git --git-dir={origin} rev-parse {remote_ref}
+    fi
+    printf '%s\n' {task_branch}
+    printf '%s\n' main
+    git --git-dir={origin} rev-parse refs/heads/main
+    printf '%s\n' {origin_repository_id}
+    printf '%s\n' {origin_repository_name}
+    ;;
+  *)
+    printf 'unexpected gh invocation: %s\n' "$*" >&2
+    exit 64
+    ;;
+esac
+"#,
+            log = q(&log_file.to_string_lossy()),
+            view_reads = q(&view_reads.to_string_lossy()),
+            lag_reads = lag_reads,
+            stale_head = q(stale_head),
             origin = q(&origin.to_string_lossy()),
             remote_ref = q(&format!("refs/heads/{TASK_BRANCH}")),
             task_branch = q(TASK_BRANCH),
@@ -3312,7 +3516,12 @@ esac
             )
         };
 
-        let err = result.unwrap_err().to_string();
+        let err = result.unwrap_err();
+        assert!(
+            !err.is_transient(),
+            "a genuine concurrent update is a hard mismatch, not retry-safe: {err}"
+        );
+        let err = err.to_string();
         assert!(err.contains(TASK_BRANCH), "{err}");
         assert!(err.contains(&reviewed_head), "{err}");
         assert!(err.contains("concurrent update"), "{err}");
@@ -3325,8 +3534,22 @@ esac
         assert!(!calls.contains("pr create"), "{calls}");
     }
 
+    /// A fast head-verify schedule for tests: exhaust the retries with no
+    /// wall-clock sleep so the eventually-consistent / permanently-stale paths
+    /// resolve immediately.
+    fn fast_head_retry() -> PrHeadVerifyRetry {
+        PrHeadVerifyRetry {
+            attempts: 8,
+            backoff: Duration::from_millis(0),
+        }
+    }
+
     #[test]
-    fn pr_head_mismatch_is_rejected_without_returning_stale_number() {
+    fn permanently_lagging_pr_head_after_own_push_is_classified_transient() {
+        // The push landed (remote branch == the pushed integration commit) but
+        // GitHub's PR API keeps reporting the pre-push head. Because the
+        // authoritative remote ref already matches the pushed commit, this is a
+        // retry-safe verification lag, not a hard "do not merge" mismatch.
         let _lock = crate::test_lock::acquire();
         let (base, origin, worktree) = setup_repo(true);
         let stale_head = remote_head(&origin);
@@ -3337,25 +3560,140 @@ esac
         let identity = pr_identity(&worktree, &origin, &reviewed_head);
         let result = {
             let _env = EnvGuard::install(stub.path());
-            pr_create_at_head(
+            pr_create_impl(
                 &project(base.path()),
                 PROJECT_NAME,
                 &task(),
                 "body",
                 &identity,
+                fast_head_retry(),
             )
         };
 
-        let err = result.unwrap_err().to_string();
-        assert!(err.contains("PR #379"), "{err}");
-        assert!(err.contains(&stale_head), "{err}");
-        assert!(err.contains(&identity.integration_sha), "{err}");
-        assert!(err.contains("refusing to report"), "{err}");
+        let err = result.unwrap_err();
+        assert!(
+            err.is_transient(),
+            "a lagging PR view over a correct branch must be retry-safe, got: {err}"
+        );
+        let msg = err.to_string();
+        assert!(msg.contains("PR #379"), "{msg}");
+        assert!(msg.contains(&stale_head), "{msg}");
+        assert!(msg.contains(&identity.integration_sha), "{msg}");
+        assert!(msg.contains("has not caught up"), "{msg}");
         assert_eq!(
             remote_head(&origin),
             identity.integration_sha,
-            "the safe push may succeed, but a stale GitHub head must still block reuse"
+            "the safe push still lands; only the PR view lags"
         );
+    }
+
+    #[test]
+    fn eventually_consistent_pr_head_succeeds_after_its_own_push() {
+        // Regression for the live failure: pr-create pushed the reviewed
+        // integration commit and opened the PR, then GitHub's PR API briefly
+        // reported the previous head before converging. With retry/backoff the
+        // publish must succeed instead of false-failing on its own push.
+        let _lock = crate::test_lock::acquire();
+        let (base, origin, worktree) = setup_repo(false);
+        let reviewed_head = task_branch_head(&worktree);
+
+        let stub = tempfile::tempdir().unwrap();
+        // A plausible obsolete head the PR view returns on the first read only.
+        let stale_head = "a".repeat(40);
+        let log =
+            install_gh_stub_lagging_created_pr(stub.path(), &origin, &stale_head, 1);
+        let identity = pr_identity(&worktree, &origin, &reviewed_head);
+        let result = {
+            let _env = EnvGuard::install(stub.path());
+            pr_create_impl(
+                &project(base.path()),
+                PROJECT_NAME,
+                &task(),
+                "body",
+                &identity,
+                fast_head_retry(),
+            )
+        };
+
+        assert_eq!(result.unwrap(), 42);
+        assert_eq!(
+            remote_head(&origin),
+            identity.integration_sha,
+            "the reviewed integration commit must be published to the branch"
+        );
+        let calls = gh_calls(&log);
+        assert!(calls.contains("pr create"), "{calls}");
+        // The lagging first read forced at least a second pr view.
+        assert!(
+            calls.matches("pr view 42").count() >= 2,
+            "expected a retried pr view, got: {calls}"
+        );
+    }
+
+    #[test]
+    fn pushed_branch_rebased_onto_moved_base_publishes_over_pre_rebase_remote_tip() {
+        // Regression for the second live failure: the base moved after the
+        // task branch was cut and pushed. `zen probe` rebases the branch onto
+        // the moved base, producing a never-pushed local `head_sha` while the
+        // remote tip still holds the pre-rebase commit. pr-create must publish
+        // over that pre-rebase tip (its own prior state) rather than refusing
+        // it as a concurrent update.
+        let _lock = crate::test_lock::acquire();
+        let (base, origin, worktree) = setup_repo(true);
+        let published_head = remote_head(&origin);
+        assert_eq!(task_branch_head(&worktree), published_head);
+        // Handoff detaches the finished worktree; the probe then advances the
+        // task ref in an isolated checkout. Model that so the rebase can move
+        // the durable ref.
+        run_git(&worktree, &["checkout", "-q", "--detach"]);
+
+        // The default branch advances after the branch was pushed.
+        advance_origin_main_with_base_fix(base.path(), &origin);
+
+        let project = project(base.path());
+        let stub = tempfile::tempdir().unwrap();
+        let log = install_gh_stub(stub.path(), &origin, None, None);
+        let (report, result) = {
+            let _env = EnvGuard::install(stub.path());
+            let report = probe_in_workflow(
+                &project,
+                None,
+                &task(),
+                TASK_BRANCH,
+                RebasePolicy::RebaseOntoDefault,
+            )
+            .unwrap();
+            let identity = report_identity(&report);
+            let result = pr_create_impl(
+                &project,
+                PROJECT_NAME,
+                &task(),
+                "body",
+                &identity,
+                fast_head_retry(),
+            );
+            (report, result)
+        };
+
+        // The probe rebased: the reviewed head is a new, unpublished commit
+        // while the pre-rebase commit is what the remote still points at.
+        assert_ne!(
+            report.head_sha, published_head,
+            "the branch must rebase onto the moved base"
+        );
+        assert_eq!(
+            report.published_head_sha, published_head,
+            "the report must carry the still-published pre-rebase head"
+        );
+
+        assert_eq!(result.unwrap(), 42);
+        assert_eq!(
+            remote_head(&origin),
+            report.integration_sha,
+            "pr-create must replace the pre-rebase remote tip with the reviewed \
+             integration commit"
+        );
+        assert!(gh_calls(&log).contains("pr create"), "should open a fresh PR");
     }
 
     #[test]
@@ -3969,6 +4307,15 @@ pub struct ProbeReport {
     /// workflow, origin, or PR move after the probe makes the flow refuse
     /// instead of publishing, grading, or landing unchecked content.
     pub head_sha: String,
+    /// The branch tip this probe started from, before its optional rebase.
+    /// Equals `head_sha` when no rebase moved the branch. When a clean rebase
+    /// advanced `head_sha` to a never-pushed local commit, this stays the
+    /// still-published pre-rebase head — the OID the remote task branch is
+    /// expected to point at. The orchestrator hands it to `shelbi zen
+    /// pr-create` as `--match-published-head-commit` so the publish guard
+    /// recognizes the pre-rebase remote tip as the flow's own prior state
+    /// rather than a concurrent update.
+    pub published_head_sha: String,
     pub local_checks: Vec<LocalCheck>,
     pub merge_conflict: ConflictProbe,
     /// Outcome of rebasing the branch onto the exact resolved task base before the
@@ -4223,6 +4570,11 @@ fn probe_isolated_task_ref(
         base_sha,
         integration_sha,
         head_sha,
+        // `initial_head` is the branch tip before the optional rebase above.
+        // A clean rebase advanced `head_sha` past it in this isolated
+        // worktree, but the durable ref was CAS-advanced to `head_sha` only;
+        // the remote task branch (if any) still points at `initial_head`.
+        published_head_sha: initial_head.to_string(),
         local_checks,
         merge_conflict,
         rebase_conflict,
@@ -9946,6 +10298,7 @@ mod dry_run_tests {
             base_sha: "basebeef".into(),
             integration_sha: "integrationbeef".into(),
             head_sha: "deadbeef".into(),
+            published_head_sha: "deadbeef".into(),
             local_checks: vec![LocalCheck {
                 command: "cargo test".into(),
                 exit_code: 0,

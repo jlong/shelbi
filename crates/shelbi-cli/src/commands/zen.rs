@@ -53,6 +53,14 @@ const DRYRUN_DEFAULT_INTERVAL: Duration = Duration::from_secs(5);
 /// pegging a core and hammering the log. Clamp up to this instead.
 const DRYRUN_MIN_INTERVAL: Duration = Duration::from_secs(1);
 
+/// Exit code for `pr-create` when the push succeeded but a verification read
+/// could not yet confirm it (see `shelbi_core::Error::TransientVerification`).
+/// Matches the `EX_TEMPFAIL` convention from `sysexits.h`: "temporary failure;
+/// the user is invited to retry". Kept distinct from the code-1 hard mismatch
+/// so the orchestrator can retry the idempotent publish rather than parking the
+/// task as a real provenance failure.
+const TRANSIENT_VERIFICATION_EXIT: i32 = 75;
+
 /// Immutable repository/base/integration/head identity emitted by `zen probe`
 /// and required by every later PR-flow primitive. Keeping the values in one
 /// flattened argument group makes it harder for the CLI paths to accidentally
@@ -78,6 +86,15 @@ pub struct PinnedIdentityArgs {
     /// Reviewed head from the probe report's `head_sha` field.
     #[arg(long, value_name = "SHA")]
     pub match_head_commit: String,
+    /// Pre-rebase branch tip from the probe report's `published_head_sha`
+    /// field. Optional: only `pr-create` uses it, and only when the probe
+    /// rebased the branch onto a moved base (so `head_sha` is a never-pushed
+    /// local commit while the remote task branch still points at this OID).
+    /// Passing it lets `pr-create` recognize the pre-rebase remote tip as the
+    /// flow's own prior state instead of a concurrent update. Omitting it
+    /// preserves the pre-existing acceptance rules.
+    #[arg(long, value_name = "SHA")]
+    pub match_published_head_commit: Option<String>,
 }
 
 impl PinnedIdentityArgs {
@@ -89,6 +106,7 @@ impl PinnedIdentityArgs {
             base_sha: self.match_base_commit,
             integration_sha: self.match_integration_commit,
             head_sha: self.match_head_commit,
+            published_head_sha: self.match_published_head_commit,
         }
     }
 }
@@ -115,6 +133,11 @@ pub enum ZenCmd {
     /// Push the task's named branch and open a PR. Idempotent: reuses an
     /// existing open PR only after its head matches the pushed task ref.
     /// Prints the PR number on stdout.
+    ///
+    /// Exit codes: 0 on success; 75 (EX_TEMPFAIL) when the push succeeded but
+    /// GitHub's eventually-consistent PR view could not yet confirm the pushed
+    /// head (retry-safe: re-run this same command); 1 for a hard provenance
+    /// mismatch that must not be merged.
     PrCreate {
         task_id: String,
         /// Exact repository, resolved base, and reviewed head emitted by the
@@ -247,10 +270,22 @@ pub fn run(project_opt: Option<String>, cmd: ZenCmd) -> Result<()> {
             let project = load_project(&project_name).map_err(|e| anyhow!(e))?;
             let tf = shelbi_state::load_task(&project_name, &task_id).map_err(|e| anyhow!(e))?;
             let identity = identity.into_pinned_identity();
-            let pr = zen::pr_create_at_head(&project, &project_name, &tf.task, &tf.body, &identity)
-                .map_err(|e| anyhow!(e))?;
-            println!("{pr}");
-            Ok(())
+            match zen::pr_create_at_head(&project, &project_name, &tf.task, &tf.body, &identity) {
+                Ok(pr) => {
+                    println!("{pr}");
+                    Ok(())
+                }
+                // The push landed but a verification read could not confirm it
+                // yet. Distinct exit code so the orchestrator retries the
+                // idempotent publish instead of treating this as "do not
+                // merge". Stdout stays empty (no PR number) so nothing
+                // downstream mistakes a transient failure for a ready PR.
+                Err(e) if e.is_transient() => {
+                    eprintln!("zen pr-create: {e}");
+                    std::process::exit(TRANSIENT_VERIFICATION_EXIT);
+                }
+                Err(e) => Err(anyhow!(e)),
+            }
         }
         ZenCmd::CiWatch {
             pr_number,
