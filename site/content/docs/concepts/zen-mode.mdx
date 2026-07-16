@@ -45,6 +45,280 @@ with three fallback chords:
 …plus a "skip" option that leaves the toggle unbound (use the CLI
 instead). Your pick is persisted to `~/.shelbi/shelbi.yaml`.
 
+## Turning it off
+
+Three levels of "stop":
+
+- **`shelbi zen off`** (or `Alt+Z` toggle): hard off. No new
+  auto-promotions, and the orchestrator stops initiating the merge
+  bar on any `merge`-action transition. Anything already mid-flight
+  in the conditions flow runs to completion on its current trajectory.
+- **`shelbi zen pause`**: softer. No new auto-promotions, but the
+  merge bar keeps applying to in-flight tasks that reach a
+  `merge`-action transition. Use this when you want to triage
+  incoming work yourself without losing validation already in motion.
+- **Per-task pull-back**: `shelbi task move <id> --to backlog`
+  from a handoff status pulls a specific card out of Zen's hands
+  without changing the global mode.
+
+### Crash recovery
+
+<Callout type="warning" title="A crash disables Zen — on purpose">
+
+If the orchestrator pane dies mid-session (kill signal, SIGHUP,
+machine power loss), Zen Mode auto-disables on the next orchestrator
+start. The wrapper script around the orchestrator runner writes a
+heartbeat every 60s; if the previous run ended without a graceful
+exit and Zen was on, the next start flips it off, writes a
+`zen=off reason=crash-recovery` event line, and prints a stderr
+warning so you see it immediately.
+
+</Callout>
+
+Re-enable manually with `shelbi zen on` once you've reviewed any
+in-flight work. The orchestrator's bootstrap also scans recent event
+lines for this pattern and calls it out in its first reply.
+
+## The `zenmode.md` file
+
+This is the power-user invitation. Both halves of Zen policy, the
+auto-promote judgment categories and the
+[merge conditions](#the-high-confidence-bar), live in one user-owned
+file per project:
+
+```text
+~/.shelbi/projects/<name>/zenmode.md
+```
+
+(For an in-repo project it resolves to `<repo>/.shelbi/zenmode.md`
+instead.)
+
+`zenmode.md` is the **live source of truth for what Zen Mode means in
+that project.** The orchestrator reads it in full at bootstrap and
+re-reads it periodically, prompted by the heartbeat, to keep its
+behavior aligned with your intent. The Rust side never inspects the
+prose. The file exists purely for the orchestrator, so you can edit it
+freely to tune Zen, and your changes take effect without a rebuild.
+`shelbi reload` [preserves your edits](/docs/cli/reload) to
+`zenmode.md`; it only migrates exact legacy stock command snippets and
+leaves your surrounding prose intact.
+
+### The first line is the heartbeat summary
+
+The **first line of `zenmode.md` is the one-line summary the heartbeat
+echoes back** to the orchestrator. While Zen is on, every few ticks a
+`zen=on` [heartbeat](/docs/concepts/events-log#heartbeats) carries that
+first line verbatim as a live reminder of what Zen means here, read
+fresh each time so an edit shows up immediately. Roughly once an hour
+the heartbeat instead injects a fuller "re-read `zenmode.md` now"
+instruction, so the orchestrator refreshes the full policy before its
+next Zen decision rather than acting on a faded memory.
+
+Because that first line is what gets re-injected, keep it a single
+accurate line: **if you change what Zen means below, change the first
+line too.** It is the fastest lever on the orchestrator's live
+behavior.
+
+### The file shape
+
+A `zenmode.md` is the summary line, then the policy sections the
+orchestrator applies. This is the exact file `shelbi` writes for a new
+project:
+
+{/* Keep this block verbatim-in-sync with
+    crates/shelbi-state/src/default_zenmode.md.template */}
+
+```markdown
+Zen: auto-promote eligible backlog and run the exact-provenance merge flow on handoff without asking.
+
+# Zen Mode policy
+
+This file is the source of truth for what Zen Mode means in **this** project.
+The orchestrator reads it (and re-reads it periodically, prompted by the
+heartbeat) to keep its behavior aligned with your intent. The Rust side never
+inspects the prose below, so edit it freely to tune Zen for your project.
+
+The **first line of this file is the one-line summary** the heartbeat echoes
+back to the orchestrator every few ticks. Keep it a single line and keep it
+accurate: if you change what Zen means here, change that line too, because that
+is what gets re-injected as a live reminder.
+
+When Zen is on the orchestrator acts as lead rather than scheduler. It may:
+
+1. Auto-merge work that passes the merge-conditions flow below.
+2. Auto-promote `backlog`-category tasks into `ready` when they fit at least
+   one of the judgment categories below.
+
+When Zen is `paused` it stops starting new auto-promotions but keeps applying
+the merge-conditions flow to in-flight tasks that reach `handoff`. When Zen is
+`off` the orchestrator is a plain scheduler: it dispatches what you promote and
+leaves handoffs for you.
+
+## Auto-promote judgment categories
+
+The mechanical eligibility scan (`shelbi zen scan`) hands the orchestrator
+`backlog`-category task ids that are safe from a state-machine standpoint: not
+blocked, not opt-out, no file overlap with anything in flight. From that list,
+**only auto-promote** a candidate if **at least one** of these is true:
+
+1. **It's the kind of work the user generally trusts you with.** Look at the
+   `done`-category column. Does the user routinely accept tasks of this shape
+   without changes? (Examples: docs typo fixes, dependency bumps, content
+   sweeps that match a recently-stated convention.) If their done-history shows
+   pattern acceptance, this is in scope.
+2. **It's part of fixing an issue the user recently raised.** Did the user
+   mention this bug, feature, or concern in conversation in the last few turns?
+   Tasks that respond to something the user explicitly asked for are in scope.
+3. **It's part of a larger body of work the user explicitly kicked off.** If
+   the user filed a batch of related tasks (e.g. 13 vs-pages, a multi-step
+   refactor), the remaining items in that batch are in scope.
+
+If a candidate fits none of these, **leave it in `backlog`** and surface it in
+your next user-facing reply: *"I considered promoting `<task>` but wasn't sure
+if it fits your intent, want me to?"* Also emit
+`reason=orchestrator:zen-decline reason-text=<short>` on the task so the
+activity feed shows what you considered.
+
+For ones you do promote, run `shelbi task move <id> --to <ready-status>
+--reason "orchestrator:zen-promote category=<n>"` (`<ready-status>` is the
+literal `ready`-category status name from the active workflow, `todo` in the
+default) and then dispatch per the normal auto-dispatch contract.
+
+## Merge conditions
+
+**First, the review-workspace gate.** If the project declares review
+workspaces, a task reaching `handoff` is destined for a **human** to inspect on
+a running server, that's the entire point of the review workspace. So do
+**not** run the merge-conditions flow on it, and do **not** merge it: leave it
+in the review status for the human to load from the sidebar and resolve (there
+is no `shelbi review` command for you to run). The human accepts by moving it
+to `done` (which is when it merges per existing rules) or bounces it back to
+`ready`. Zen never auto-merges a review-routed task out from under the human.
+Only when the project has **no** review workspace does `handoff` mean "ready to
+auto-merge", the case the rest of this section covers.
+
+When a task enters `handoff` and Zen is on (and the project has no review
+workspaces), run `shelbi zen probe <task-id>` to get a JSON report covering
+local checks, merge conflicts, diff size, and danger-path matches. Apply these
+conditions to the report:
+
+1. **All `local_checks` must have `exit_code == 0`.** If any failed, leave in
+   `handoff` and emit `reason=zen:failed-checks` with the failing command +
+   output tail.
+2. **`merge_conflict.conflicts` must be `false`.** Otherwise emit
+   `reason=zen:merge-conflict` with the files.
+3. **`diff_size.files` <= 30 AND `diff_size.lines_added + lines_removed` <=
+   2000.** Otherwise emit `reason=zen:diff-too-large` with the stats.
+4. **`danger_paths.matched` must be empty.** Otherwise emit
+   `reason=zen:danger-path` with the paths.
+
+If all pre-PR conditions pass:
+
+5. Freeze the probe's `repository`, `repository_id`, `base_branch`, `base_sha`,
+   `integration_sha`, and `head_sha`. Run `shelbi zen pr-create <task-id> --match-repository <repository> --match-repository-id <repository_id> --match-base-branch <base_branch> --match-base-commit <base_sha> --match-integration-commit <integration_sha> --match-head-commit <head_sha>`
+   using those exact values, and also pass `--match-published-head-commit <published_head_sha>`
+   from the probe's `published_head_sha` field. When the probe rebased the branch
+   onto a moved base, `head_sha` is a local-only commit while `published_head_sha`
+   is the pre-rebase tip the remote branch still points at; that flag lets
+   pr-create replace the tip it reviewed instead of refusing it as a concurrent
+   update. Capture the PR number it prints. Exit code 75 means the push landed
+   but GitHub's PR view had not caught up yet: re-run the exact same command (it
+   is idempotent). Exit code 1 is a real mismatch: leave the task in `handoff`
+   and re-probe.
+6. Run `shelbi zen ci-watch <pr-number> --match-repository <repository> --match-repository-id <repository_id> --match-base-branch <base_branch> --match-base-commit <base_sha> --match-integration-commit <integration_sha> --match-head-commit <head_sha> --timeout 15m`
+   using that same probe identity. Stdout is `green`,
+   `red:<check>:<summary>`, or `timeout`. The condition: must be `green`.
+   Any identity movement fails closed; never recompute or substitute a probe
+   field after CI begins.
+7. If green, run `shelbi zen pr-merge <pr-number> --match-repository <repository> --match-repository-id <repository_id> --match-base-branch <base_branch> --match-base-commit <base_sha> --match-integration-commit <integration_sha> --match-head-commit <head_sha>`
+   with that same identity. The command verifies the candidate has sole parent
+   `base_sha` and the exact tree of `head_sha`, then atomically advances only
+   `refs/heads/<base_branch>` from `base_sha` to `integration_sha` with Git's
+   compare-and-swap lease. If branch protection, rulesets, a merge queue, a
+   fork, permissions, or a non-squash strategy prevent that exact-ref path,
+   leave the task in `handoff` and follow the command's human-review action.
+   Only after a candidate SHA result, move the task into `done` and emit
+   `reason=orchestrator:zen-merge` with the merge SHA.
+8. If red or timeout: leave in `handoff`; emit `reason=zen:failed-checks` (red)
+   or `reason=zen:ci-timeout`.
+
+## Customization
+
+Edit this file to tune Zen Mode per project. The prose is the source of truth
+for both auto-promote and merge policy, and for the one-line summary at the
+top.
+
+- **Summary line** — rewrite the first line to match whatever policy you set
+  below. It is what the heartbeat re-injects, so it is the fastest lever on the
+  orchestrator's live behavior.
+- **Auto-promote judgment categories** — add ("anything tagged `automation:`
+  is always in scope"), tighten ("only auto-promote if the user has accepted
+  >=3 tasks of this shape without changes"), or replace the list entirely.
+- **Merge conditions** — raise/lower the diff-size thresholds, accept partial
+  CI red ("if only the integration-test job is red, treat as green"), add new
+  pre-merge probes ("before merging anything touching `migrations/`, also
+  require a passing `shelbi db dry-run`"), or change which conditions are
+  strict vs warnings.
+```
+
+The default ships with these categories and conditions filled in. Edit
+the sections in place to reshape them.
+
+### Relationship to the orchestrator prompt
+
+Earlier versions inlined the judgment categories and merge conditions in
+the orchestrator's prompt, the `## Zen Mode` section of
+`agents/orchestrator/instructions.md`. They no longer live there. That
+section now just tells the orchestrator to treat `zenmode.md` as the
+source of truth and to re-read it on the heartbeat cues above. So
+**edit `zenmode.md` to tune Zen policy, not the prompt.** The
+[orchestrator instructions](/docs/concepts/orchestrator#customizing-the-prompt-per-project)
+remain yours to customize for how the orchestrator *reacts* to events,
+but the Zen policy itself belongs in `zenmode.md`.
+
+A starter override that tightens Zen's judgment, edited directly in
+`zenmode.md`:
+
+```markdown
+Zen: auto-merge docs/content and automation-tagged tasks; hold everything else for me.
+
+## Auto-promote judgment categories
+
+Promote a candidate only if **at least one** is true:
+
+1. **Tagged `automation:` in the title.** Always in scope: these are
+   bot-filed PR-bumps and lint sweeps we have years of acceptance
+   history on.
+2. **Touches only `docs/**` or `site/content/**`.** Content edits are
+   reversible and never reach prod.
+3. **The user has accepted ≥3 tasks of the same shape (same
+   verb-prefix, same target directory) without changes in the last
+   week.** Track this against the `done` column.
+
+## Merge conditions
+
+(Inherit from the default; see the bundled template.)
+```
+
+Note the first line changed to match the tighter policy. That new
+summary is what the heartbeat now re-injects.
+
+Other places to tune, all in the same file:
+
+- **Raise/lower the diff thresholds**: change `files ≤ 30` to
+  whatever fits the project's typical PR size.
+- **Accept partial CI red**: "if only the integration-test job is
+  red, treat as green" is a common project-specific carve-out.
+- **Add pre-merge probes**: "before merging anything touching
+  `migrations/`, also require a passing `shelbi db dry-run`."
+- **Replace categories entirely** with a project-specific
+  taxonomy.
+
+The Rust side never parses any of this, so the prose is the source of
+truth. That is the whole design: Zen's policy is one markdown file you
+own. For the CLI that flips Zen on and off, see
+[`shelbi zen`](/docs/cli/zen).
+
 ## What Zen does: two paths
 
 Zen Mode does exactly two things the default scheduler doesn't:
@@ -62,36 +336,6 @@ Zen Mode does exactly two things the default scheduler doesn't:
 The mechanical layer is in Rust. The judgment layer is in the
 orchestrator's prompt, which means **you own it** and can tune it
 per project. That's the most important point on this page.
-
-## Per-status automation is declarative
-
-Zen's *judgment* (which backlog items are in scope, where the confidence
-bar sits) is prompt prose, covered below. But the more basic question of
-**which statuses the orchestrator is allowed to act on, and which agent it
-uses**, is no longer prompt prose at all. It's the
-[`owner` and `agent` fields](/docs/guides/getting-started/workflows#owners-and-agents) on
-each workflow status.
-
-This is what changed. Behaviors that used to be paragraphs in the
-orchestrator's prompt are now lines of YAML:
-
-- **"Auto-merge but don't auto-promote."** Make the merge-bearing handoff
-  status `owner: agent`, but leave `Backlog` as `owner: user`. The
-  orchestrator lands finished work while your triage queue stays yours.
-  Previously this was a carve-out you wrote into the prompt; now it is two
-  `owner:` values.
-- **"Review with QA before a human signs off."** Give the `Review` status
-  `owner: agent, agent: qa`. The [`qa` agent](/docs/concepts/agents) runs
-  the review pass automatically; a downstream `owner: user` status holds
-  the final accept. Which agent reviews is data, not a prompt instruction.
-
-Flipping Zen on/off still gates whether the orchestrator *exercises* this
-autonomy at all. But once Zen is on, the workflow YAML (not the prompt)
-decides per status whether the orchestrator acts and which agent it loads.
-The prompt is left to hold only the genuinely judgment-shaped policy: scope
-and the confidence bar. See
-[owners and agents](/docs/guides/getting-started/workflows#owners-and-agents) for the
-field semantics and the four validation rules.
 
 ## The high-confidence bar
 
@@ -279,134 +523,35 @@ wasn't sure. Want me to?"). It also emits
 `reason=orchestrator:zen-decline reason-text=<short>` so the
 activity feed shows what was considered and why.
 
-## Tuning Zen: the `zenmode.md` file
+## Per-status automation is declarative
 
-This is the power-user invitation. Both halves of Zen policy, the
-auto-promote judgment categories above and the
-[merge conditions](#the-high-confidence-bar), live in one user-owned
-file per project:
+Zen's *judgment* (which backlog items are in scope, where the confidence
+bar sits) is prompt prose, covered below. But the more basic question of
+**which statuses the orchestrator is allowed to act on, and which agent it
+uses**, is no longer prompt prose at all. It's the
+[`owner` and `agent` fields](/docs/guides/getting-started/workflows#owners-and-agents) on
+each workflow status.
 
-```text
-~/.shelbi/projects/<name>/zenmode.md
-```
+This is what changed. Behaviors that used to be paragraphs in the
+orchestrator's prompt are now lines of YAML:
 
-(For an in-repo project it resolves to `<repo>/.shelbi/zenmode.md`
-instead.)
+- **"Auto-merge but don't auto-promote."** Make the merge-bearing handoff
+  status `owner: agent`, but leave `Backlog` as `owner: user`. The
+  orchestrator lands finished work while your triage queue stays yours.
+  Previously this was a carve-out you wrote into the prompt; now it is two
+  `owner:` values.
+- **"Review with QA before a human signs off."** Give the `Review` status
+  `owner: agent, agent: qa`. The [`qa` agent](/docs/concepts/agents) runs
+  the review pass automatically; a downstream `owner: user` status holds
+  the final accept. Which agent reviews is data, not a prompt instruction.
 
-`zenmode.md` is the **live source of truth for what Zen Mode means in
-that project.** The orchestrator reads it in full at bootstrap and
-re-reads it periodically, prompted by the heartbeat, to keep its
-behavior aligned with your intent. The Rust side never inspects the
-prose. The file exists purely for the orchestrator, so you can edit it
-freely to tune Zen, and your changes take effect without a rebuild.
-`shelbi reload` [preserves your edits](/docs/cli/reload) to
-`zenmode.md`; it only migrates exact legacy stock command snippets and
-leaves your surrounding prose intact.
-
-### The first line is the heartbeat summary
-
-The **first line of `zenmode.md` is the one-line summary the heartbeat
-echoes back** to the orchestrator. While Zen is on, every few ticks a
-`zen=on` [heartbeat](/docs/concepts/events-log#heartbeats) carries that
-first line verbatim as a live reminder of what Zen means here, read
-fresh each time so an edit shows up immediately. Roughly once an hour
-the heartbeat instead injects a fuller "re-read `zenmode.md` now"
-instruction, so the orchestrator refreshes the full policy before its
-next Zen decision rather than acting on a faded memory.
-
-Because that first line is what gets re-injected, keep it a single
-accurate line: **if you change what Zen means below, change the first
-line too.** It is the fastest lever on the orchestrator's live
-behavior.
-
-### The file shape
-
-A `zenmode.md` is the summary line, then the policy sections the
-orchestrator applies:
-
-```markdown
-Zen: auto-promote eligible backlog and run the exact-provenance merge flow on handoff without asking.
-
-# Zen Mode policy
-
-This file is the source of truth for what Zen Mode means in **this** project.
-The orchestrator reads it (and re-reads it periodically, prompted by the
-heartbeat). The Rust side never inspects the prose, so edit it freely.
-
-## Auto-promote judgment categories
-
-From the mechanically-eligible list (`shelbi zen scan`), only auto-promote a
-candidate if **at least one** is true:
-
-1. **It's the kind of work the user generally trusts you with.**
-2. **It's part of fixing an issue the user recently raised.**
-3. **It's part of a larger body of work the user explicitly kicked off.**
-
-## Merge conditions
-
-Run `shelbi zen probe` and apply, in order: all local checks pass, no merge
-conflict, `files ≤ 30` and `lines_added + lines_removed ≤ 2000`, no
-danger-path matches, then the `pr-create` → `ci-watch` → `pr-merge`
-exact-provenance flow.
-```
-
-The default ships with these categories and conditions filled in. Edit
-the sections in place to reshape them.
-
-### Relationship to the orchestrator prompt
-
-Earlier versions inlined the judgment categories and merge conditions in
-the orchestrator's prompt, the `## Zen Mode` section of
-`agents/orchestrator/instructions.md`. They no longer live there. That
-section now just tells the orchestrator to treat `zenmode.md` as the
-source of truth and to re-read it on the heartbeat cues above. So
-**edit `zenmode.md` to tune Zen policy, not the prompt.** The
-[orchestrator instructions](/docs/concepts/orchestrator#customizing-the-prompt-per-project)
-remain yours to customize for how the orchestrator *reacts* to events,
-but the Zen policy itself belongs in `zenmode.md`.
-
-A starter override that tightens Zen's judgment, edited directly in
-`zenmode.md`:
-
-```markdown
-Zen: auto-merge docs/content and automation-tagged tasks; hold everything else for me.
-
-## Auto-promote judgment categories
-
-Promote a candidate only if **at least one** is true:
-
-1. **Tagged `automation:` in the title.** Always in scope: these are
-   bot-filed PR-bumps and lint sweeps we have years of acceptance
-   history on.
-2. **Touches only `docs/**` or `site/content/**`.** Content edits are
-   reversible and never reach prod.
-3. **The user has accepted ≥3 tasks of the same shape (same
-   verb-prefix, same target directory) without changes in the last
-   week.** Track this against the `done` column.
-
-## Merge conditions
-
-(Inherit from the default; see the bundled template.)
-```
-
-Note the first line changed to match the tighter policy. That new
-summary is what the heartbeat now re-injects.
-
-Other places to tune, all in the same file:
-
-- **Raise/lower the diff thresholds**: change `files ≤ 30` to
-  whatever fits the project's typical PR size.
-- **Accept partial CI red**: "if only the integration-test job is
-  red, treat as green" is a common project-specific carve-out.
-- **Add pre-merge probes**: "before merging anything touching
-  `migrations/`, also require a passing `shelbi db dry-run`."
-- **Replace categories entirely** with a project-specific
-  taxonomy.
-
-The Rust side never parses any of this, so the prose is the source of
-truth. That is the whole design: Zen's policy is one markdown file you
-own. For the CLI that flips Zen on and off, see
-[`shelbi zen`](/docs/cli/zen).
+Flipping Zen on/off still gates whether the orchestrator *exercises* this
+autonomy at all. But once Zen is on, the workflow YAML (not the prompt)
+decides per status whether the orchestrator acts and which agent it loads.
+The prompt is left to hold only the genuinely judgment-shaped policy: scope
+and the confidence bar. See
+[owners and agents](/docs/guides/getting-started/workflows#owners-and-agents) for the
+field semantics and the four validation rules.
 
 ## Per-task overrides
 
@@ -524,40 +669,6 @@ Run `shelbi zen status` to see the resolved list for your project
 came from where). When any workflow declares its own `zen:` block, the
 status output also lists each one and which dimensions it overrides,
 with the resolved per-workflow values printed underneath.
-
-## Turning it off
-
-Three levels of "stop":
-
-- **`shelbi zen off`** (or `Alt+Z` toggle): hard off. No new
-  auto-promotions, and the orchestrator stops initiating the merge
-  bar on any `merge`-action transition. Anything already mid-flight
-  in the conditions flow runs to completion on its current trajectory.
-- **`shelbi zen pause`**: softer. No new auto-promotions, but the
-  merge bar keeps applying to in-flight tasks that reach a
-  `merge`-action transition. Use this when you want to triage
-  incoming work yourself without losing validation already in motion.
-- **Per-task pull-back**: `shelbi task move <id> --to backlog`
-  from a handoff status pulls a specific card out of Zen's hands
-  without changing the global mode.
-
-### Crash recovery
-
-<Callout type="warning" title="A crash disables Zen — on purpose">
-
-If the orchestrator pane dies mid-session (kill signal, SIGHUP,
-machine power loss), Zen Mode auto-disables on the next orchestrator
-start. The wrapper script around the orchestrator runner writes a
-heartbeat every 60s; if the previous run ended without a graceful
-exit and Zen was on, the next start flips it off, writes a
-`zen=off reason=crash-recovery` event line, and prints a stderr
-warning so you see it immediately.
-
-</Callout>
-
-Re-enable manually with `shelbi zen on` once you've reviewed any
-in-flight work. The orchestrator's bootstrap also scans recent event
-lines for this pattern and calls it out in its first reply.
 
 ## The activity feed
 
