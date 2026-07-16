@@ -105,8 +105,19 @@ fn remote_hub_socket_token() -> &'static str {
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_nanos())
             .unwrap_or(0);
-        format!("{uid}-{pid}-{start:x}")
+        format_remote_hub_socket_token(uid, pid, start)
     })
+}
+
+/// Format the remote landing-socket identity token from the **current
+/// process's** uid, pid, and start instant. Kept pure (no globals) so a test
+/// can prove the token is a function of live process identity — the fix for
+/// issue #319's stale-id wedge: a restarted daemon (new pid, later start)
+/// mints a fresh token and can never reuse a dead process's id. The pid is
+/// folded together with the start instant so that even a pid reused after a
+/// restart still yields a distinct token.
+fn format_remote_hub_socket_token(uid: u32, pid: u32, start: u128) -> String {
+    format!("{uid}-{pid}-{start:x}")
 }
 
 /// Daemon PID file: `$SHELBI_HOME/shelbi.pid`. Used by the cleanup
@@ -700,6 +711,43 @@ mod tests {
         std::env::set_var("SHELBI_REMOTE_HUB_SOCK", "/run/foo.sock");
         assert_eq!(remote_hub_socket_path(), PathBuf::from("/run/foo.sock"));
         std::env::remove_var("SHELBI_REMOTE_HUB_SOCK");
+    }
+
+    #[test]
+    fn remote_hub_socket_token_is_minted_from_live_process_identity() {
+        let _g = lock_test();
+        // Issue #319, fix #3: the reverse-forward socket id must be re-derived
+        // from the current daemon on (re)start, never a persisted/stale value.
+        // The token is a pure function of (uid, pid, start), so a fresh process
+        // (new pid and/or later start) can only ever mint a fresh token.
+        assert_eq!(
+            format_remote_hub_socket_token(1002, 2009629, 0x18bfca46d7fbdc7c),
+            "1002-2009629-18bfca46d7fbdc7c",
+            "token layout is <uid>-<pid>-<start:x>"
+        );
+
+        // A different pid — the shape of a daemon restart — yields a different
+        // token, so the id cannot survive the restart unchanged.
+        assert_ne!(
+            format_remote_hub_socket_token(1002, 2009629, 0x18bfca46d7fbdc7c),
+            format_remote_hub_socket_token(1002, 2009630, 0x18bfca46d7fbdc7c),
+        );
+        // And a reused pid with a later start still diverges, so even PID
+        // recycling after a restart can't collide onto a dead process's path.
+        assert_ne!(
+            format_remote_hub_socket_token(1002, 2009629, 0x18bfca46d7fbdc7c),
+            format_remote_hub_socket_token(1002, 2009629, 0x18bfca46d7fbdc7d),
+        );
+
+        // The live token is minted from THIS process's pid — proving the
+        // derivation is tied to the running process, not read back from
+        // disk/state. Assert on the token directly (not the full path) so a
+        // concurrent test toggling SHELBI_REMOTE_HUB_SOCK can't perturb it.
+        let token = remote_hub_socket_token();
+        assert!(
+            token.contains(&format!("-{}-", std::process::id())),
+            "live socket token must embed the current pid: {token}"
+        );
     }
 
     #[test]
