@@ -328,17 +328,19 @@ controls whether Shelbi cuts a fresh branch or uses an existing one.
 id: build-login-form
 title: Build the login form
 workflow: default
-# branch:  ← omitted → orchestrator generates <prefix>/build-login-form on dispatch
+# branch:  ← omitted → orchestrator generates jlong/build-login-form on dispatch
 ---
 ```
 
 - **Omitted at creation.** When the task moves into its first
   `active`-category status (typically `InProgress`), the orchestrator
   cuts a fresh branch off the workflow's resolved `base_branch`, names it
-  `<prefix>/<task-id>` using workflow `git.branch_prefix`, project
-  `git.branch_prefix`, or your GitHub username, and writes the name back
-  into the task's frontmatter. The user never types a branch name. This is
-  the common case.
+  by rendering the workflow's (or project's) `git.branch` template (the
+  shipped `task` workflow uses `{{github_user}}/{{id}}`, so
+  `build-login-form` becomes `jlong/build-login-form`), and writes the name
+  back into the task's frontmatter. When no `branch` template is configured,
+  Shelbi falls back to your GitHub username. The user never types a branch
+  name. This is the common case.
 - **Set at creation.** The orchestrator uses that branch as-is. No new
   branch is cut. This is how **release tasks** work: the user already
   knows the branch (typically `feature/<name>`) and pre-fills it.
@@ -510,7 +512,8 @@ is written into the project config so `task` is the default.
 ### task
 
 `workflows/task.yaml` is the review-gated default: a task branches off
-`main` as `task/<id>`, moves through `Backlog → Todo → In Progress →
+`main` as `<your-github-user>/<id>` (the shipped `branch:
+'{{github_user}}/{{id}}'` template), moves through `Backlog → Todo → In Progress →
 Review → Done` (with a `Canceled` archive status), and squash-merges to
 `main` on accept. It opens exactly one PR, on `In Progress → Review`,
 which is both the review surface and, once accepted, what lands on `main`.
@@ -522,7 +525,7 @@ description: "Branch work with a review gate: the default track shipped with eve
 
 git:
   base_branch: main
-  branch_prefix: task
+  branch: '{{github_user}}/{{id}}'
   merge_strategy: squash
 
 statuses:
@@ -575,7 +578,7 @@ description: A piece of a parent task, squash-merged into the parent's branch wi
 
 git:
   base_branch: task/{{task}}      # resolves to the parent task's branch
-  branch_prefix: subtask
+  branch: 'subtask/{{id}}'
   merge_strategy: squash
 
 statuses:
