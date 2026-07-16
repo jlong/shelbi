@@ -587,6 +587,11 @@ agent_runners:
         }));
         let git = wf.git.as_ref().expect("git block is active");
         assert_eq!(git.base_branch.as_deref(), Some("task/{{task}}"));
+        // Names branches from a full template (`subtask/<id>`, no github_user),
+        // not a prefix; `branch_prefix` is unset (the two are mutually
+        // exclusive).
+        assert_eq!(git.branch.as_deref(), Some("subtask/{{id}}"));
+        assert_eq!(git.branch_prefix, None);
 
         // Uncomment round-trip still valid.
         Workflow::from_yaml_str(&uncomment(&yaml))

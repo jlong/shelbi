@@ -575,7 +575,7 @@ description: A piece of a parent task, squash-merged into the parent's branch wi
 
 git:
   base_branch: task/{{task}}      # resolves to the parent task's branch
-  branch_prefix: subtask
+  branch: 'subtask/{{id}}'        # e.g. subtask/add-csv-export
   merge_strategy: squash
 
 statuses:
