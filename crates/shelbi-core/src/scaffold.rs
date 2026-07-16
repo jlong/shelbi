@@ -561,7 +561,10 @@ agent_runners:
         assert_eq!(open_prs, 1, "task opens exactly one PR");
         let git = wf.git.as_ref().expect("git block is active");
         assert_eq!(git.base_branch.as_deref(), Some("main"));
-        assert_eq!(git.branch_prefix.as_deref(), Some("task"));
+        // The shipped task workflow names branches from a full template, not
+        // a prefix; `branch_prefix` is unset (the two are mutually exclusive).
+        assert_eq!(git.branch.as_deref(), Some("{{github_user}}/{{id}}"));
+        assert_eq!(git.branch_prefix, None);
 
         // Uncommenting the additive blocks (initial_status, zen) must not
         // collide with the already-active transitions/git.

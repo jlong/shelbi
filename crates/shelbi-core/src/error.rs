@@ -143,6 +143,16 @@ pub enum Error {
         expected_in: &'static str,
     },
 
+    /// A `git:` block declares both `branch` and `branch_prefix`. They are
+    /// mutually exclusive branch-naming strategies — a block picks one. The
+    /// message names both keys and the offending workflow/project so the fix
+    /// is unambiguous.
+    #[error(
+        "{scope}: `git.branch` and `git.branch_prefix` are mutually exclusive \
+         — set one, not both"
+    )]
+    GitBranchConflict { scope: String },
+
     #[error("{0}")]
     Other(String),
 }

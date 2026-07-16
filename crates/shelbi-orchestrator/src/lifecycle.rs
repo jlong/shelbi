@@ -343,6 +343,7 @@ mod tests {
         let mut w = shelbi_core::default_workflow();
         w.git = Some(shelbi_core::GitConfig {
             base_branch: Some(base.to_string()),
+            branch: None,
             branch_prefix: None,
             merge_strategy: shelbi_core::MergeStrategy::Squash,
         });

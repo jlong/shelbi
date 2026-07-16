@@ -339,12 +339,25 @@ impl Workflow {
         }
 
         if let Some(git) = &self.git {
+            git.validate_branch_exclusivity(&format!("workflow `{}`", self.name))?;
             if let Some(prefix) = &git.branch_prefix {
                 if !prefix.contains("{{") {
                     validate_branch_prefix(prefix).map_err(|e| {
                         workflow_err(format!(
                             "workflow `{}`: git.branch_prefix `{}` is invalid: {e}",
                             self.name, prefix
+                        ))
+                    })?;
+                }
+            }
+            // A literal `git.branch` (no `{{var}}`) is validated here; a
+            // template is checked after rendering in the branch resolver.
+            if let Some(branch) = &git.branch {
+                if !branch.contains("{{") {
+                    crate::validate_branch(branch).map_err(|e| {
+                        workflow_err(format!(
+                            "workflow `{}`: git.branch `{}` is invalid: {e}",
+                            self.name, branch
                         ))
                     })?;
                 }
@@ -460,6 +473,13 @@ impl Workflow {
         }
         Ok(Some(GitConfig {
             base_branch,
+            // `branch` is a full-name template that resolves against an
+            // augmented context (`{{github_user}}`, `{{id}}`) the branch
+            // resolver supplies — not just the task params available here.
+            // Pass it through raw so this substitution pass never records
+            // those vars as "missing"; `branch::branch_name_for_task`
+            // renders it with the full context.
+            branch: git.branch.clone(),
             branch_prefix,
             merge_strategy: git.merge_strategy,
         }))
@@ -686,7 +706,11 @@ pub fn task_workflow() -> Workflow {
         ]),
         git: Some(GitConfig {
             base_branch: Some("main".into()),
-            branch_prefix: Some(crate::TASK_WORKFLOW_NAME.into()),
+            // Full-name template: `<github_user>/<id>`, e.g. `jlong/fix-login`.
+            // Rendered by the branch resolver against `{{github_user}}` (the
+            // authenticated GitHub login) and `{{id}}` (the task id).
+            branch: Some("{{github_user}}/{{id}}".into()),
+            branch_prefix: None,
             merge_strategy: crate::MergeStrategy::Squash,
         }),
         zen: None,
@@ -768,6 +792,7 @@ pub fn subtask_workflow() -> Workflow {
             // Interpolated from the subtask's `task:` frontmatter (the parent
             // task's id) at dispatch — see [`Workflow::resolve_git`].
             base_branch: Some("task/{{task}}".into()),
+            branch: None,
             branch_prefix: Some(crate::SUBTASK_WORKFLOW_NAME.into()),
             merge_strategy: crate::MergeStrategy::Squash,
         }),
@@ -1715,10 +1740,11 @@ statuses:
         assert_eq!(review.agent.as_deref(), Some("review"));
         assert_eq!(review.tags, vec!["review".to_string()]);
 
-        // Git: branch off main as task/<id>, squash-merge back.
+        // Git: branch off main as <github_user>/<id>, squash-merge back.
         let git = wf.git.as_ref().expect("git block");
         assert_eq!(git.base_branch.as_deref(), Some("main"));
-        assert_eq!(git.branch_prefix.as_deref(), Some("task"));
+        assert_eq!(git.branch.as_deref(), Some("{{github_user}}/{{id}}"));
+        assert_eq!(git.branch_prefix, None);
         assert_eq!(git.merge_strategy, MergeStrategy::Squash);
 
         // Exactly one PR — a single open_pr edge, on in-progress -> review.
@@ -2563,6 +2589,65 @@ git:
         assert_eq!(resolved.base_branch.as_deref(), Some("main"));
         assert_eq!(resolved.branch_prefix.as_deref(), Some("releases"));
         assert_eq!(resolved.merge_strategy, MergeStrategy::Squash);
+    }
+
+    #[test]
+    fn resolve_git_passes_branch_template_through_raw() {
+        // `git.branch` resolves against `{{github_user}}`/`{{id}}`, which are
+        // supplied by the branch resolver — not the task params here. So
+        // `resolve_git` must pass the template through untouched rather than
+        // report those vars as missing (which would break base_branch-only
+        // callers like the poller under the shipped `task` workflow).
+        let yaml = r#"
+name: task
+statuses:
+  - { name: Todo, category: ready, owner: agent, agent: orchestrator }
+git:
+  base_branch: main
+  branch: '{{github_user}}/{{id}}'
+"#;
+        let wf = Workflow::from_yaml_str(yaml).unwrap();
+        let resolved = wf
+            .resolve_git(&params(&[]))
+            .expect("no missing-param error for branch template")
+            .expect("git block present");
+        assert_eq!(resolved.base_branch.as_deref(), Some("main"));
+        assert_eq!(resolved.branch.as_deref(), Some("{{github_user}}/{{id}}"));
+    }
+
+    #[test]
+    fn workflow_git_branch_and_branch_prefix_are_mutually_exclusive() {
+        let yaml = r#"
+name: task
+statuses:
+  - { name: Todo, category: ready, owner: agent, agent: orchestrator }
+git:
+  branch: '{{github_user}}/{{id}}'
+  branch_prefix: task
+"#;
+        // `from_yaml_str` runs `validate`, so the conflict surfaces at parse.
+        let err = Workflow::from_yaml_str(yaml).expect_err("branch + branch_prefix must conflict");
+        let msg = err.to_string();
+        assert!(msg.contains("git.branch"), "got: {msg}");
+        assert!(msg.contains("git.branch_prefix"), "got: {msg}");
+        assert!(msg.contains("workflow `task`"), "got: {msg}");
+    }
+
+    #[test]
+    fn workflow_git_literal_branch_is_validated() {
+        // A non-templated `branch` is charset-checked at validate time (run by
+        // `from_yaml_str`).
+        let yaml = r#"
+name: task
+statuses:
+  - { name: Todo, category: ready, owner: agent, agent: orchestrator }
+git:
+  branch: 'bad branch'
+"#;
+        assert!(
+            Workflow::from_yaml_str(yaml).is_err(),
+            "invalid literal branch must fail"
+        );
     }
 
     fn transition_target_workflow(target: &str) -> Workflow {
