@@ -154,7 +154,7 @@ plus the raw status.yaml contents.
 
 <Callout type="note" title="Serving a review branch is a transition, not a subcommand">
 
-Booting a dev server for review is no longer a workspace subcommand. A review
+Booting a dev server for review is not a workspace subcommand. A review
 status boots and tears down its server through
 [transition `run`/`ready` commands](/docs/configuration/workflow#run-ready-and-teardown);
 see [review workspaces](/docs/concepts/review-workspaces) for the full model.
@@ -193,16 +193,6 @@ Inspect a single workspace's raw status without spawning a tmux probe:
 ```bash
 shelbi workspace status alpha
 ```
-
-## Deprecation: `shelbi worker`
-
-`shelbi worker` is a deprecated alias for `shelbi workspace`. Every
-subcommand still works under the old name (`shelbi worker list`,
-`shelbi worker stop bravo`) and prints a one-line deprecation notice
-pointing at the new spelling. The alias is kept so muscle memory and
-existing scripts don't break; new docs, output, and tab-completion use
-`workspace`. The alias may be removed in a future release, so migrate when
-convenient.
 
 ## See also
 

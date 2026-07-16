@@ -45,19 +45,18 @@ Every shelbi-routed `ssh` invocation carries a reverse forward so remote workers
 can write to the hub's events log over the multiplexed channel. The TUI poller
 rechecks that forward on a slow cadence and repairs it if it has gone stale.
 
-Two failure modes are transient (direct SSH stays healthy) but were noisy in the
-events log, so the recheck now handles them explicitly:
+Two failure modes are transient (direct SSH stays healthy) but can be noisy in the
+events log, so the recheck handles them explicitly:
 
 - A flaky `master_open` is retried with exponential backoff before it is
   reported. A blip that self-heals is logged once as
   `detail=master_open_recovered attempts=N status=established`; only an outage
   that survives the whole retry budget logs `detail=master_open_failed
   attempts=N status=failed`.
-- Loopback-port exhaustion on a TCP-fallback host is now surfaced distinctly as
-  `detail=loopback_port_exhausted band=<lo>-<hi>` rather than the ambiguous old
-  "no free loopback port in band" line, so it reads apart from a master-open
-  blip. Before allocating, the recheck reclaims the port its own prior master
-  was holding, then sweeps the configured band.
+- Loopback-port exhaustion on a TCP-fallback host is surfaced distinctly as
+  `detail=loopback_port_exhausted band=<lo>-<hi>`, so it reads apart from a
+  master-open blip. Before allocating, the recheck reclaims the port its own
+  prior master was holding, then sweeps the configured band.
 
 These environment variables tune the behavior (all optional; sensible defaults
 apply):
