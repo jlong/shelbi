@@ -1,4 +1,4 @@
-Zen: auto-promote eligible backlog and run the exact-provenance merge flow on handoff without asking.
+Zen: auto-promote eligible backlog, evaluate each handoff in a fresh context, and run the exact-provenance merge flow without asking.
 
 # Zen Mode policy
 
@@ -81,9 +81,28 @@ conditions to the report:
 4. **`danger_paths.matched` must be empty.** Otherwise emit
    `reason=zen:danger-path` with the paths.
 
-If all pre-PR conditions pass:
+If all four pre-PR probe conditions pass, the branch is mechanically clean.
+Before opening a PR, run the fresh-context evaluation gate; only if it returns
+`PASS` do the pr-create/ci-watch/pr-merge steps run:
 
-5. Freeze the probe's `repository`, `repository_id`, `base_branch`, `base_sha`,
+5. **Fresh-context evaluation.** A green mechanical probe proves the branch
+   builds and does not conflict; it does not prove the branch does what the
+   task asked. Spawn a read-only evaluator subagent (an `Explore`-type agent,
+   no write/edit tools) in a fresh context that never saw the build. Give it
+   the task's acceptance criteria and the branch diff (`git diff
+   <base_branch>...<branch>`) and have it return `PASS` or `NEEDS_WORK` with
+   specific findings, checking that:
+   - the diff satisfies every acceptance criterion the task states;
+   - the diff stays within the task's declared scope, with no unrelated files
+     and, in particular, no large deletions or reverts of code the task never
+     mentions (the signature of a branch cut from a stale base);
+   - the branch carries real new commits ahead of `<base_branch>` and its
+     content is not already present in the base under a different commit (a
+     branch whose diff is dominated by undoing recently-merged work, or whose
+     change is already merged under another SHA, must never be merged).
+   If the evaluator returns `NEEDS_WORK`, bounce the task to `ready` with the
+   findings and emit `reason=zen:evaluator-reject` with a one-line summary.
+6. Freeze the probe's `repository`, `repository_id`, `base_branch`, `base_sha`,
    `integration_sha`, and `head_sha`. Run `shelbi zen pr-create <task-id> --match-repository <repository> --match-repository-id <repository_id> --match-base-branch <base_branch> --match-base-commit <base_sha> --match-integration-commit <integration_sha> --match-head-commit <head_sha>`
    using those exact values, and also pass `--match-published-head-commit <published_head_sha>`
    from the probe's `published_head_sha` field. When the probe rebased the branch
@@ -94,12 +113,12 @@ If all pre-PR conditions pass:
    but GitHub's PR view had not caught up yet: re-run the exact same command (it
    is idempotent). Exit code 1 is a real mismatch: leave the task in `handoff`
    and re-probe.
-6. Run `shelbi zen ci-watch <pr-number> --match-repository <repository> --match-repository-id <repository_id> --match-base-branch <base_branch> --match-base-commit <base_sha> --match-integration-commit <integration_sha> --match-head-commit <head_sha> --timeout 15m`
+7. Run `shelbi zen ci-watch <pr-number> --match-repository <repository> --match-repository-id <repository_id> --match-base-branch <base_branch> --match-base-commit <base_sha> --match-integration-commit <integration_sha> --match-head-commit <head_sha> --timeout 15m`
    using that same probe identity. Stdout is `green`,
    `red:<check>:<summary>`, or `timeout`. The condition: must be `green`.
    Any identity movement fails closed; never recompute or substitute a probe
    field after CI begins.
-7. If green, run `shelbi zen pr-merge <pr-number> --match-repository <repository> --match-repository-id <repository_id> --match-base-branch <base_branch> --match-base-commit <base_sha> --match-integration-commit <integration_sha> --match-head-commit <head_sha>`
+8. If green, run `shelbi zen pr-merge <pr-number> --match-repository <repository> --match-repository-id <repository_id> --match-base-branch <base_branch> --match-base-commit <base_sha> --match-integration-commit <integration_sha> --match-head-commit <head_sha>`
    with that same identity. The command verifies the candidate has sole parent
    `base_sha` and the exact tree of `head_sha`, then atomically advances only
    `refs/heads/<base_branch>` from `base_sha` to `integration_sha` with Git's
@@ -108,7 +127,7 @@ If all pre-PR conditions pass:
    leave the task in `handoff` and follow the command's human-review action.
    Only after a candidate SHA result, move the task into `done` and emit
    `reason=orchestrator:zen-merge` with the merge SHA.
-8. If red or timeout: leave in `handoff`; emit `reason=zen:failed-checks` (red)
+9. If red or timeout: leave in `handoff`; emit `reason=zen:failed-checks` (red)
    or `reason=zen:ci-timeout`.
 
 ## Customization
