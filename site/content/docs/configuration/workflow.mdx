@@ -59,9 +59,8 @@ transitions:
 
 <Callout type="tip" title="Reference-only form">
 
-Since [#197](https://github.com/jlong/shelbi/pull/197), a workflow status
-entry carries **only** `id`, `owner`, and optional `agent`. The display
-`name` and `category` are declared once in
+A workflow status entry carries **only** `id`, `owner`, and optional
+`agent`. The display `name` and `category` are declared once in
 [`statuses.yaml`](/docs/configuration/statuses). Repeating an inline
 `name:` or `category:` here fails the load. This keeps identity from
 drifting across workflows.

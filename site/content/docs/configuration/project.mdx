@@ -66,7 +66,7 @@ workspaces:
 | `machines` | list of [Machine](#machines) | yes | — | The hosts workspaces run on. User-local. |
 | `orchestrator` | [Orchestrator](#orchestrator) | yes | — | Which runner boots the orchestrator. |
 | `agent_runners` | map of name → [AgentRunner](#agent-runners) | yes | — | The command lines agents and the orchestrator are launched with. |
-| `workspaces` | list of [Workspace](#workspaces) | no | `[]` | Fixed pool of workspace slots. User-local. Also accepts the legacy key `workers`. |
+| `workspaces` | list of [Workspace](#workspaces) | no | `[]` | Fixed pool of workspace slots. User-local. |
 | `zen` | [Zen](#zen) | no | all defaults | Zen Mode check list, CI timeout, and danger paths. |
 | `editor` | string | no | `$EDITOR` | Editor invoked by `shelbi … edit` commands. User-local. |
 | `github_url` | string | no | — | Informational GitHub URL recorded by the setup wizard. |
@@ -212,15 +212,9 @@ Leave `orchestrator.runner` unchanged unless you also want to change the
 dashboard/orchestrator pane. Run `shelbi workspace list` afterward; its
 `RUNNER` column shows the runner each workspace will launch.
 
-<Callout type="note" title="Legacy review designator folds into tags">
-
-The retired per-slot review designator is still read for backward
-compatibility — it folds into the `review` tag on load and is never written
-back — but prefer `tags:` in new configs. See
-[review workspaces](/docs/concepts/review-workspaces#legacy-configs) for the
-exact migration and the tag-routing model that replaced it.
-
-</Callout>
+Route a slot to review work by giving it the `review` tag. See
+[review workspaces](/docs/concepts/review-workspaces) for the tag-routing
+model.
 
 ## zen
 
