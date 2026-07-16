@@ -2,7 +2,11 @@
 //!
 //! - `on/off/pause/status` toggle and report Zen Mode state.
 //! - `probe` reports facts about a finished branch (local checks, conflict,
-//!   diff size, danger paths) as JSON.
+//!   diff size, danger paths) as JSON, exit 0. If the probe's own setup fails
+//!   (e.g. a git fetch/rebase over the SSH origin times out) it prints a
+//!   structured JSON error naming the failing step and exits
+//!   [`PROBE_COULD_NOT_RUN_EXIT`] — never a bare empty stdout — so a caller can
+//!   tell "probe could not run" apart from "probe ran, a check failed".
 //! - `pr-create/ci-watch/pr-merge` are the single-purpose PR primitives the
 //!   orchestrator sequences to drive a merge.
 //!
@@ -60,6 +64,19 @@ const DRYRUN_MIN_INTERVAL: Duration = Duration::from_secs(1);
 /// so the orchestrator can retry the idempotent publish rather than parking the
 /// task as a real provenance failure.
 const TRANSIENT_VERIFICATION_EXIT: i32 = 75;
+
+/// Exit code for `zen probe` when the probe could not run to completion — an
+/// internal setup step (fetching/rebasing the base over the SSH origin,
+/// creating the isolated worktree, resolving the repository identity) failed,
+/// so no report exists. A successful probe always exits 0, even when a local
+/// check fails: that outcome lives in the report's `local_checks`. Keeping
+/// "probe could not run" on its own exit code — paired with a structured JSON
+/// error on stdout — lets an orchestrator branch on it without parsing stderr,
+/// and never mistake the old empty-stdout/exit-1 failure for a benign no-op.
+/// The finer classification (which step failed, retry-safe or not) rides in
+/// the JSON `kind` field. Distinct from the generic exit 1 that `anyhow`
+/// propagation and clap arg errors (exit 2) produce.
+const PROBE_COULD_NOT_RUN_EXIT: i32 = 3;
 
 /// Immutable repository/base/integration/head identity emitted by `zen probe`
 /// and required by every later PR-flow primitive. Keeping the values in one
@@ -214,6 +231,48 @@ pub enum ZenCmd {
     },
 }
 
+/// Render the structured JSON error `zen probe` prints to stdout when the
+/// probe could not run (see [`PROBE_COULD_NOT_RUN_EXIT`]). Building it through
+/// serde guarantees valid escaping, so a stderr tail full of quotes or
+/// newlines can't corrupt the object. `error` carries the full human-readable
+/// message (which already names the failing git command and its stderr);
+/// `kind` classifies the failing step so a caller can branch without parsing
+/// prose; `detail` is the failing command's stderr tail when we have one.
+fn probe_error_json(e: &shelbi_core::Error) -> String {
+    use shelbi_core::Error;
+
+    #[derive(serde::Serialize)]
+    struct ProbeErrorReport<'a> {
+        error: String,
+        kind: &'a str,
+        detail: String,
+    }
+
+    let kind = match e {
+        Error::Command { cmd, .. } if cmd.contains("fetch") => "git_fetch_failed",
+        Error::Command { .. } => "git_command_failed",
+        Error::Io(_) => "io_error",
+        Error::TransientVerification(_) => "transient_verification",
+        _ => "probe_failed",
+    };
+    let detail = match e {
+        Error::Command { stderr, .. } => stderr.trim_end().to_string(),
+        _ => String::new(),
+    };
+    let report = ProbeErrorReport {
+        error: e.to_string(),
+        kind,
+        detail,
+    };
+    // to_string_pretty on a struct of owned strings is effectively infallible;
+    // fall back to a minimal, still-valid object rather than an empty stdout.
+    serde_json::to_string_pretty(&report).unwrap_or_else(|_| {
+        "{\n  \"error\": \"probe failed and its error could not be serialized\",\n  \
+         \"kind\": \"probe_failed\"\n}"
+            .to_string()
+    })
+}
+
 pub fn run(project_opt: Option<String>, cmd: ZenCmd) -> Result<()> {
     let project_name = require_project(project_opt)?;
 
@@ -255,16 +314,32 @@ pub fn run(project_opt: Option<String>, cmd: ZenCmd) -> Result<()> {
             // onto it first
             // so a re-probe after a blocker merges reflects the merged fix
             // without a manual `git rebase`.
-            let report = zen::probe_in_workflow(
+            match zen::probe_in_workflow(
                 &project,
                 Some(&workflow),
                 &tf.task,
                 &branch,
                 zen::RebasePolicy::RebaseOntoDefault,
-            )
-            .map_err(|e| anyhow!(e))?;
-            println!("{}", serde_json::to_string_pretty(&report)?);
-            Ok(())
+            ) {
+                Ok(report) => {
+                    println!("{}", serde_json::to_string_pretty(&report)?);
+                    Ok(())
+                }
+                // The probe's own setup failed (canonically a git fetch/rebase
+                // against the SSH `origin` timing out during a network blip), so
+                // there is no report. Emit a structured JSON error on *stdout* —
+                // never a bare empty stdout — naming the failing step, mirror it
+                // on stderr, and exit on a dedicated code. That lets an
+                // orchestrator distinguish "probe could not run" from "probe
+                // ran, a local check failed" (which exits 0 with the failure in
+                // the report's `local_checks`). See `zen pr-create` above for
+                // the same emit-then-exit shape.
+                Err(e) => {
+                    eprintln!("zen probe: {e}");
+                    println!("{}", probe_error_json(&e));
+                    std::process::exit(PROBE_COULD_NOT_RUN_EXIT);
+                }
+            }
         }
         ZenCmd::PrCreate { task_id, identity } => {
             let project = load_project(&project_name).map_err(|e| anyhow!(e))?;
@@ -788,5 +863,50 @@ mod tests {
         // Explicit no-op marker beats silence — the orchestrator confirms it
         // didn't miss anything.
         assert_eq!(format_next_eligible(&[]), "next eligible: none");
+    }
+
+    #[test]
+    fn probe_error_json_classifies_a_fetch_over_ssh_timeout() {
+        // The exact failure from the field report: git fetch of the base over
+        // the SSH origin timed out. It must produce a named, machine-readable
+        // object — never the old empty stdout.
+        let e = shelbi_core::Error::Command {
+            cmd: "git -C /wt fetch --no-tags origin -- refs/heads/main:refs/shelbi/probe-base/1-0"
+                .into(),
+            status: "exit status: 128".into(),
+            stderr: "ssh_dispatch_run_fatal: Connection to 140.82.113.4 port 22: \
+                     Operation timed out\nfatal: Could not read from remote repository."
+                .into(),
+        };
+        let json: serde_json::Value = serde_json::from_str(&probe_error_json(&e)).unwrap();
+        assert_eq!(json["kind"], "git_fetch_failed");
+        assert!(json["error"].as_str().unwrap().contains("fetch"));
+        assert!(json["detail"]
+            .as_str()
+            .unwrap()
+            .contains("Operation timed out"));
+    }
+
+    #[test]
+    fn probe_error_json_distinguishes_a_non_fetch_git_command() {
+        let e = shelbi_core::Error::Command {
+            cmd: "git -C /wt update-ref -d refs/shelbi/probe-base/1-0".into(),
+            status: "exit status: 1".into(),
+            stderr: "error: cannot lock ref".into(),
+        };
+        let json: serde_json::Value = serde_json::from_str(&probe_error_json(&e)).unwrap();
+        assert_eq!(json["kind"], "git_command_failed");
+    }
+
+    #[test]
+    fn probe_error_json_labels_a_provenance_failure_as_probe_failed() {
+        // Non-command errors (e.g. a skipped rebase or moved-checkout guard)
+        // are real failures too — they still get named output, not silence,
+        // and a distinct `kind` so a caller doesn't read them as retry-safe.
+        let e = shelbi_core::Error::Other("could not rebase task branch `x`".into());
+        let json: serde_json::Value = serde_json::from_str(&probe_error_json(&e)).unwrap();
+        assert_eq!(json["kind"], "probe_failed");
+        assert_eq!(json["detail"], "");
+        assert!(json["error"].as_str().unwrap().contains("rebase"));
     }
 }
