@@ -341,6 +341,25 @@ mod tests {
     }
 
     #[test]
+    fn shipped_subtask_workflow_renders_subtask_id_without_github_user() {
+        // The shipped subtask workflow uses `branch: 'subtask/{{id}}'`. It must
+        // render to `subtask/<id>` with NO github_user prefix even when a login
+        // is available — the old `branch_prefix: subtask` path never prepended
+        // the login, and the migration to a full template preserves that output.
+        let p = project(None);
+        let wf = shelbi_core::subtask_workflow();
+        let mut t = task("add-csv-export", None, Some("subtask"));
+        // The subtask's `task:` frontmatter names its parent, which the
+        // templated `base_branch: task/{{task}}` needs to resolve.
+        t.params
+            .insert("task".into(), serde_yaml::Value::String("add-auth".into()));
+        assert_eq!(
+            branch_name_for_task_with_login(&p, Some(&wf), &t, || Some("jlong".into())).unwrap(),
+            "subtask/add-csv-export"
+        );
+    }
+
+    #[test]
     fn workflow_branch_template_wins_over_project_branch_prefix() {
         let p = project(Some("project"));
         let wf = workflow_with_branch("{{github_user}}/{{id}}");

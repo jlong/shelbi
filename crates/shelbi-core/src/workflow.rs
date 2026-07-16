@@ -792,8 +792,12 @@ pub fn subtask_workflow() -> Workflow {
             // Interpolated from the subtask's `task:` frontmatter (the parent
             // task's id) at dispatch — see [`Workflow::resolve_git`].
             base_branch: Some("task/{{task}}".into()),
-            branch: None,
-            branch_prefix: Some(crate::SUBTASK_WORKFLOW_NAME.into()),
+            // Full-name template: `subtask/<id>`, e.g. `subtask/add-csv-export`.
+            // Deliberately omits `{{github_user}}` — the old `branch_prefix`
+            // path never prepended the login, so the generated branch stays
+            // `subtask/<id>`. Rendered by the branch resolver against `{{id}}`.
+            branch: Some("subtask/{{id}}".into()),
+            branch_prefix: None,
             merge_strategy: crate::MergeStrategy::Squash,
         }),
         zen: None,
@@ -1781,6 +1785,11 @@ statuses:
         // Branches from and merges into the parent task's branch, templated.
         let git = wf.git.as_ref().expect("git block");
         assert_eq!(git.base_branch.as_deref(), Some("task/{{task}}"));
+        // Names branches from a full template (`subtask/<id>`, no github_user),
+        // not a prefix; `branch_prefix` is unset (the two are mutually
+        // exclusive).
+        assert_eq!(git.branch.as_deref(), Some("subtask/{{id}}"));
+        assert_eq!(git.branch_prefix, None);
         assert_eq!(git.merge_strategy, MergeStrategy::Squash);
 
         // Never opens a PR: no open_pr / push_branch on any edge.
