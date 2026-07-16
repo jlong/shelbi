@@ -1201,6 +1201,7 @@ dependencies = [
  "libc",
  "serde",
  "serde_json",
+ "serde_yaml",
  "shelbi-agent",
  "shelbi-core",
  "shelbi-ssh",

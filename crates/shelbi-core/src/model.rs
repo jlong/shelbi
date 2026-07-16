@@ -497,10 +497,24 @@ pub struct GitConfig {
     /// `None`, callers fall back to [`Project::default_branch`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub base_branch: Option<String>,
-    /// Prefix for generated task branches. When a task omits `branch:`,
-    /// Shelbi cuts `<branch_prefix>/<task-id>`. Workflow-level `git:`
-    /// blocks may override this field; when no config supplies it, the
-    /// orchestrator falls back to the authenticated GitHub username.
+    /// Full branch-name **template** for generated task branches — the
+    /// preferred alternative to [`branch_prefix`]. When a task omits
+    /// `branch:` frontmatter and this is set, the generated branch is this
+    /// template rendered through `{{var}}` substitution (`{{github_user}}`,
+    /// `{{id}}`, plus the task's frontmatter params) and then validated. So
+    /// `branch: '{{github_user}}/{{id}}'` yields e.g. `jlong/fix-login`.
+    ///
+    /// Mutually exclusive with [`branch_prefix`]: a single `git:` block may
+    /// declare one or the other, never both (enforced by
+    /// [`GitConfig::validate_branch_exclusivity`]). Workflow-level `git:`
+    /// blocks override the project block, as with every git field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub branch: Option<String>,
+    /// Prefix for generated task branches — the secondary alternative to
+    /// [`branch`]. When a task omits `branch:`, Shelbi cuts
+    /// `<branch_prefix>/<task-id>`. Workflow-level `git:` blocks may
+    /// override this field; when no config supplies it, the orchestrator
+    /// falls back to the authenticated GitHub username.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub branch_prefix: Option<String>,
     /// How `shelbi merge` (and Zen Mode's auto-merge path) integrates a
@@ -508,6 +522,21 @@ pub struct GitConfig {
     /// [`MergeStrategy::Squash`] preserves the historical behavior.
     #[serde(default)]
     pub merge_strategy: MergeStrategy,
+}
+
+impl GitConfig {
+    /// Reject a `git:` block that declares **both** [`branch`](GitConfig::branch)
+    /// and [`branch_prefix`](GitConfig::branch_prefix) — the two are mutually
+    /// exclusive branch-naming strategies. `scope` names the offending
+    /// workflow/project so the error points at the file to fix.
+    pub fn validate_branch_exclusivity(&self, scope: &str) -> crate::Result<()> {
+        if self.branch.is_some() && self.branch_prefix.is_some() {
+            return Err(crate::Error::GitBranchConflict {
+                scope: scope.to_string(),
+            });
+        }
+        Ok(())
+    }
 }
 
 /// How a workspace branch is integrated back into the base branch. Maps
@@ -670,8 +699,17 @@ impl Project {
         if let Some(name) = &self.default_workflow {
             validate_workflow_name(name)?;
         }
+        self.git
+            .validate_branch_exclusivity(&format!("project `{}`", self.name))?;
         if let Some(prefix) = &self.git.branch_prefix {
             validate_branch_prefix(prefix)?;
+        }
+        // A literal `git.branch` (no `{{var}}`) is validated eagerly; a
+        // template is checked after rendering in the branch resolver.
+        if let Some(branch) = &self.git.branch {
+            if !branch.contains("{{") {
+                validate_branch(branch)?;
+            }
         }
         if self.runner(&self.orchestrator.runner).is_none() {
             return Err(crate::Error::UnknownRunner(
@@ -4454,6 +4492,70 @@ git:
         assert!(y.contains("base_branch: trunk"), "got: {y}");
         let back: GitConfig = serde_yaml::from_str(&y).unwrap();
         assert_eq!(cfg, back);
+    }
+
+    #[test]
+    fn project_yaml_parses_git_branch_template() {
+        let yaml = r#"
+name: p
+repo: r
+default_branch: main
+machines:
+  - { name: hub, kind: local, work_dir: /tmp }
+orchestrator: { runner: claude }
+agent_runners:
+  claude: { command: claude, flags: [] }
+git:
+  branch: '{{github_user}}/{{id}}'
+"#;
+        let p: Project = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(p.git.branch.as_deref(), Some("{{github_user}}/{{id}}"));
+        assert_eq!(p.git.branch_prefix, None);
+        // A templated branch validates (the `{{var}}` guard defers charset
+        // checks to render time).
+        p.validate_workspaces().expect("templated branch validates");
+    }
+
+    #[test]
+    fn project_git_branch_and_branch_prefix_are_mutually_exclusive() {
+        let yaml = r#"
+name: p
+repo: r
+default_branch: main
+machines:
+  - { name: hub, kind: local, work_dir: /tmp }
+orchestrator: { runner: claude }
+agent_runners:
+  claude: { command: claude, flags: [] }
+git:
+  branch: '{{github_user}}/{{id}}'
+  branch_prefix: task
+"#;
+        let p: Project = serde_yaml::from_str(yaml).unwrap();
+        let err = p
+            .validate_workspaces()
+            .expect_err("branch + branch_prefix must conflict");
+        // The message names both keys and the offending project.
+        let msg = err.to_string();
+        assert!(msg.contains("git.branch"), "got: {msg}");
+        assert!(msg.contains("git.branch_prefix"), "got: {msg}");
+        assert!(msg.contains("project `p`"), "got: {msg}");
+    }
+
+    #[test]
+    fn git_config_validate_branch_exclusivity_allows_one_key() {
+        let branch_only = GitConfig {
+            branch: Some("{{github_user}}/{{id}}".into()),
+            ..Default::default()
+        };
+        assert!(branch_only.validate_branch_exclusivity("project `p`").is_ok());
+        let prefix_only = GitConfig {
+            branch_prefix: Some("task".into()),
+            ..Default::default()
+        };
+        assert!(prefix_only.validate_branch_exclusivity("project `p`").is_ok());
+        let neither = GitConfig::default();
+        assert!(neither.validate_branch_exclusivity("project `p`").is_ok());
     }
 
     #[test]
