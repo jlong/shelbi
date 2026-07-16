@@ -157,8 +157,7 @@ the tail process dies and it has to rebuild.
 The reaction rules pattern-match the **category** tokens on each task
 event line, not the literal `<from> -> <to>` status pair. That's what
 keeps these rules correct under a workflow that renames or splits
-statuses (the `worker=` token on workspace lines is retained for
-backward compatibility):
+statuses:
 
 - `task=<id> ... to_category=ready reason=user:*` → find a free eligible
   workspace, dispatch.
@@ -228,15 +227,10 @@ repair in its output; the rest of your prompt is preserved.
 
 ### Prompt artifact
 
-Earlier versions had you edit an `ORCHESTRATOR.md` override and treated
-`~/.shelbi/projects/<name>/CLAUDE.md` as the source of the prompt. That's
-deprecated. The *source* is now `agents/orchestrator/instructions.md` plus
+The *source* you edit is `agents/orchestrator/instructions.md` plus
 `agents/_shared/preamble.md`; the generated
 `.claude/agent-instructions.md` is a rendered artifact. Don't hand-edit
-it; your changes are overwritten on the next render. If you have content
-in an old `CLAUDE.md`, move the project-wide parts into
-`_shared/preamble.md` and the orchestrator-specific parts into
-`agents/orchestrator/instructions.md`.
+it; your changes are overwritten on the next render.
 
 A few things worth keeping when you fork the default prompt:
 

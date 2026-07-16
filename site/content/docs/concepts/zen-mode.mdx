@@ -100,8 +100,7 @@ behavior aligned with your intent. The Rust side never inspects the
 prose. The file exists purely for the orchestrator, so you can edit it
 freely to tune Zen, and your changes take effect without a rebuild.
 `shelbi reload` [preserves your edits](/docs/cli/reload) to
-`zenmode.md`; it only migrates exact legacy stock command snippets and
-leaves your surrounding prose intact.
+`zenmode.md`, leaving your prose intact.
 
 ### The first line is the heartbeat summary
 
@@ -266,11 +265,11 @@ the sections in place to reshape them.
 
 ### Relationship to the orchestrator prompt
 
-Earlier versions inlined the judgment categories and merge conditions in
-the orchestrator's prompt, the `## Zen Mode` section of
-`agents/orchestrator/instructions.md`. They no longer live there. That
-section now just tells the orchestrator to treat `zenmode.md` as the
-source of truth and to re-read it on the heartbeat cues above. So
+The judgment categories and merge conditions live in `zenmode.md`, not in
+the orchestrator's prompt. The `## Zen Mode` section of
+`agents/orchestrator/instructions.md` tells the orchestrator to treat
+`zenmode.md` as the source of truth and to re-read it on the heartbeat cues
+above. So
 **edit `zenmode.md` to tune Zen policy, not the prompt.** The
 [orchestrator instructions](/docs/concepts/orchestrator#customizing-the-prompt-per-project)
 remain yours to customize for how the orchestrator *reacts* to events,
@@ -342,8 +341,8 @@ per project. That's the most important point on this page.
 The bar fires on **any [workflow](/docs/guides/getting-started/workflows#transitions)
 transition whose `actions:` list includes `merge`**, not on the
 `Review` column per se. The canonical default workflow happens to put
-`merge` on the `Review → Done` edge, so the practical effect is the
-same as before: a task that hands off to `review` trips the bar. But a
+`merge` on the `Review → Done` edge, so in practice a task that hands off
+to `review` trips the bar. But a
 trunk-based workflow that skips `Review` entirely and merges straight
 from `InProgress → Done` runs through the *same* probe. Gating is
 action-based, not status-pair-based. See [What fires Zen Mode's
@@ -361,15 +360,6 @@ what happened.
 merge-transition -> probe -> local checks -> merge conflict -> diff size
                  -> danger paths -> exact-provenance PR flow -> landing
 ```
-
-<Callout type="note" title="Back-compat fallback">
-
-A workflow with no `transitions:` block at all (every existing
-`default.yaml` on disk) still fires the bar on the legacy `Review` status.
-New workflows that declare a `transitions:` block get the action-based
-semantic exclusively.
-
-</Callout>
 
 The conditions, in order:
 
@@ -528,18 +518,16 @@ activity feed shows what was considered and why.
 Zen's *judgment* (which backlog items are in scope, where the confidence
 bar sits) is prompt prose, covered below. But the more basic question of
 **which statuses the orchestrator is allowed to act on, and which agent it
-uses**, is no longer prompt prose at all. It's the
+uses**, is not prompt prose at all. It's the
 [`owner` and `agent` fields](/docs/guides/getting-started/workflows#owners-and-agents) on
 each workflow status.
 
-This is what changed. Behaviors that used to be paragraphs in the
-orchestrator's prompt are now lines of YAML:
+Two examples:
 
 - **"Auto-merge but don't auto-promote."** Make the merge-bearing handoff
   status `owner: agent`, but leave `Backlog` as `owner: user`. The
-  orchestrator lands finished work while your triage queue stays yours.
-  Previously this was a carve-out you wrote into the prompt; now it is two
-  `owner:` values.
+  orchestrator lands finished work while your triage queue stays yours. It's
+  two `owner:` values.
 - **"Review with QA before a human signs off."** Give the `Review` status
   `owner: agent, agent: qa`. The [`qa` agent](/docs/concepts/agents) runs
   the review pass automatically; a downstream `owner: user` status holds
@@ -548,7 +536,7 @@ orchestrator's prompt are now lines of YAML:
 Flipping Zen on/off still gates whether the orchestrator *exercises* this
 autonomy at all. But once Zen is on, the workflow YAML (not the prompt)
 decides per status whether the orchestrator acts and which agent it loads.
-The prompt is left to hold only the genuinely judgment-shaped policy: scope
+The prompt holds only the genuinely judgment-shaped policy: scope
 and the confidence bar. See
 [owners and agents](/docs/guides/getting-started/workflows#owners-and-agents) for the
 field semantics and the four validation rules.

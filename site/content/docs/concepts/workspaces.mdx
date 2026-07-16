@@ -43,15 +43,6 @@ a `qa` agent on the next, and it's why a workflow can say "review this status
 with the security agent" without caring which workspace is free to do it.
 The workspace supplies the compute; the task's status supplies the agent.
 
-<Callout type="note" title="Legacy naming: worker">
-
-Earlier versions of Shelbi called this slot a *worker* and conflated it
-with the agent running inside. The CLI keeps `shelbi worker` as a
-[deprecated alias](/docs/cli/workspace#deprecation-shelbi-worker), and the
-events log still uses the `worker=<name>` token for backward compatibility.
-
-</Callout>
-
 ## The pool model
 
 The pool is declared up front in the project YAML and stays fixed:
