@@ -542,20 +542,37 @@ fn drop_master(hostname: &str) {
     let _ = cmd.output();
 }
 
+/// Assemble the argv (after the `ssh` program) for a Unix-socket master open
+/// that rebinds the `-R` reverse forward with `StreamLocalBindUnlink=yes`:
+/// the full control opts (which carry the `-R` spec), then the unlink option,
+/// then `<host> -- true`. Split out so the arg shape is unit-testable without
+/// shelling out — mirrors [`build_tcp_master_args`].
+///
+/// `StreamLocalBindUnlink=yes` is what lets the master rebind cleanly when a
+/// stale remote landing socket is already sitting at the `-R` target path:
+/// OpenSSH unlinks it on bind instead of failing the forward with
+/// `landing_socket_missing`. It rides only on this dedicated master open, not
+/// on ordinary multiplexed slave commands — a slave carrying it could replace
+/// an already-healthy listener for only the lifetime of that one command.
+fn build_stream_local_unlink_master_args(hostname: &str) -> Vec<String> {
+    let mut args = build_ssh_control_opts(hostname);
+    args.push("-o".to_string());
+    args.push("StreamLocalBindUnlink=yes".to_string());
+    args.push(hostname.to_string());
+    args.push("--".to_string());
+    args.push("true".to_string());
+    args
+}
+
 /// Open a fresh ControlMaster with the reverse-forward unlink option enabled.
 /// Callers must drop the existing master first; applying
 /// StreamLocalBindUnlink to ordinary multiplexed slave commands could replace
 /// an already-healthy listener for only the lifetime of that slave.
 fn open_master_with_stream_local_unlink(hostname: &str) -> std::io::Result<Output> {
     let mut cmd = Command::new("ssh");
-    for o in build_ssh_control_opts(hostname) {
-        cmd.arg(o);
+    for a in build_stream_local_unlink_master_args(hostname) {
+        cmd.arg(a);
     }
-    cmd.arg("-o")
-        .arg("StreamLocalBindUnlink=yes")
-        .arg(hostname)
-        .arg("--")
-        .arg("true");
     tracing::debug!(?cmd, host = %hostname, "ssh::open_master_with_stream_local_unlink");
     cmd.output()
 }
@@ -1305,6 +1322,33 @@ mod tests {
 
         // Ends with `<host> -- true` — the cheapest remote no-op that persists
         // the master.
+        let tail = &args[args.len() - 3..];
+        assert_eq!(tail, ["devbox", "--", "true"], "unexpected tail: {args:?}");
+    }
+
+    #[test]
+    fn stream_local_unlink_master_args_carry_the_unlink_option_and_reverse_forward() {
+        // Issue #319, fix #2: the master that (re)binds the Unix `-R` forward
+        // must set StreamLocalBindUnlink=yes so a pre-existing/stale remote
+        // landing socket at the target path is unlinked on bind instead of
+        // wedging the forward with a persistent `landing_socket_missing` loop.
+        let args = build_stream_local_unlink_master_args("devbox");
+
+        assert!(
+            args.windows(2)
+                .any(|w| w == ["-o", "StreamLocalBindUnlink=yes"]),
+            "master open must carry StreamLocalBindUnlink=yes: {args:?}"
+        );
+
+        // It still carries the reverse forward it is repairing — the unlink
+        // option is meaningless without the `-R` bind it protects.
+        assert!(
+            args.iter().any(|a| a == "-R"),
+            "master open must still carry the -R reverse forward: {args:?}"
+        );
+
+        // Ends with `<host> -- true` — the cheapest remote no-op that opens
+        // (and, via ControlPersist, keeps) the master.
         let tail = &args[args.len() - 3..];
         assert_eq!(tail, ["devbox", "--", "true"], "unexpected tail: {args:?}");
     }
