@@ -2338,22 +2338,10 @@ mod pr_create_tests {
         );
         let mut identity = pinned_identity(head_sha, &base_sha);
         let tree = git_stdout(worktree, &["rev-parse", &format!("{head_sha}^{{tree}}")]);
+        let message = git_stdout(worktree, &["show", "-s", "--format=%B", head_sha]);
         identity.integration_sha = git_stdout(
             worktree,
-            &[
-                "-c",
-                "user.name=Shelbi Zen",
-                "-c",
-                "user.email=zen@shelbi.dev",
-                "commit-tree",
-                &tree,
-                "-p",
-                &base_sha,
-                "-m",
-                &format!(
-                    "test integration\n\nShelbi-Reviewed-Head: {head_sha}\nShelbi-Reviewed-Base: {base_sha}"
-                ),
-            ],
+            &["commit-tree", &tree, "-p", &base_sha, "-m", &message],
         );
         identity
     }
@@ -2388,22 +2376,10 @@ mod pr_create_tests {
     fn pinned_pr_identity(worktree: &Path, head_sha: &str) -> PinnedPrIdentity {
         let base_sha = git_stdout(worktree, &["rev-parse", "main"]);
         let tree = git_stdout(worktree, &["rev-parse", &format!("{head_sha}^{{tree}}")]);
+        let message = git_stdout(worktree, &["show", "-s", "--format=%B", head_sha]);
         let integration_sha = git_stdout(
             worktree,
-            &[
-                "-c",
-                "user.name=Shelbi Zen",
-                "-c",
-                "user.email=zen@shelbi.dev",
-                "commit-tree",
-                &tree,
-                "-p",
-                &base_sha,
-                "-m",
-                &format!(
-                    "test integration\n\nShelbi-Reviewed-Head: {head_sha}\nShelbi-Reviewed-Base: {base_sha}"
-                ),
-            ],
+            &["commit-tree", &tree, "-p", &base_sha, "-m", &message],
         );
         PinnedPrIdentity {
             repository: "github.com/example/repo".into(),
@@ -3893,19 +3869,12 @@ esac
         let forged = git_stdout(
             &worktree,
             &[
-                "-c",
-                "user.name=Shelbi Zen",
-                "-c",
-                "user.email=zen@shelbi.dev",
                 "commit-tree",
                 &available_tree,
                 "-p",
                 &base_sha,
                 "-m",
-                &format!(
-                    "forged integration\n\nShelbi-Reviewed-Head: {unavailable_head}\n\
-                     Shelbi-Reviewed-Base: {base_sha}"
-                ),
+                "forged integration",
             ],
         );
 
@@ -3921,6 +3890,32 @@ esac
 
         assert!(error.contains(unavailable_head), "{error}");
         assert!(error.contains("rev-parse"), "{error}");
+    }
+
+    #[test]
+    fn integration_commit_uses_configured_identity_and_reviewed_message() {
+        let _lock = crate::test_lock::acquire();
+        let (_base, _origin, worktree) = setup_repo(false);
+        let base_sha = git_stdout(&worktree, &["rev-parse", "main"]);
+        let head_sha = git_stdout(&worktree, &["rev-parse", "HEAD"]);
+
+        let integration =
+            create_squash_integration_commit(&Host::Local, &worktree, &base_sha, &head_sha, "squash")
+                .unwrap();
+
+        // Authored and committed by the worktree's configured identity, not a
+        // synthetic bot.
+        let fields = git_stdout(
+            &worktree,
+            &["show", "-s", "--format=%an%n%ae%n%cn%n%ce", &integration],
+        );
+        assert_eq!(fields, "Test\ntest@example.com\nTest\ntest@example.com");
+
+        // The worker's real subject lands, and nothing references Shelbi.
+        let subject = git_stdout(&worktree, &["show", "-s", "--format=%s", &integration]);
+        assert_eq!(subject, "initial task work");
+        let raw = git_stdout(&worktree, &["show", "-s", "--format=%an%n%ae%n%B", &integration]);
+        assert!(!raw.contains("Shelbi"), "{raw}");
     }
 
     #[test]
@@ -4599,25 +4594,17 @@ fn create_squash_integration_commit(
     }
     let wt = worktree.to_string_lossy();
     let tree = probe_head_sha(host, worktree, &format!("{head_sha}^{{tree}}"))?;
-    let message = format!(
-        "Shelbi Zen integration\n\nShelbi-Reviewed-Head: {head_sha}\nShelbi-Reviewed-Base: {base_sha}"
-    );
+    // Fail closed if the ambient git identity is missing: `git commit-tree`
+    // would otherwise auto-synthesize a `user@host` identity, silently
+    // attributing the landed commit to a fabricated author.
+    require_git_identity(host, &wt)?;
+    // Land the worker's real subject + body so the commit that lands on the
+    // base describes the actual change, not a generic integration marker.
+    let message = commit_message(host, &wt, head_sha)?;
     let out = run_in_dir(
         host,
         &wt,
-        &[
-            "git",
-            "-c",
-            "user.name=Shelbi Zen",
-            "-c",
-            "user.email=zen@shelbi.dev",
-            "commit-tree",
-            &tree,
-            "-p",
-            base_sha,
-            "-m",
-            &message,
-        ],
+        &["git", "commit-tree", &tree, "-p", base_sha, "-m", &message],
     )?;
     if !out.status.success() {
         return Err(Error::Command {
@@ -4629,6 +4616,38 @@ fn create_squash_integration_commit(
     let integration_sha = String::from_utf8_lossy(&out.stdout).trim().to_string();
     verify_integration_commit(host, &wt, base_sha, head_sha, &integration_sha)?;
     Ok(integration_sha)
+}
+
+/// Resolve the worker's real commit message (subject + body) from `head_sha`
+/// via `git show -s --format=%B`, so the integration commit reads like the
+/// change it lands rather than a generic marker.
+fn commit_message(host: &Host, wt: &str, head_sha: &str) -> Result<String> {
+    let out = run_in_dir(host, wt, &["git", "show", "-s", "--format=%B", head_sha])?;
+    if !out.status.success() {
+        return Err(Error::Command {
+            cmd: format!("git -C {wt} show -s --format=%B {head_sha}"),
+            status: out.status.to_string(),
+            stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
+        });
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).trim_end().to_string())
+}
+
+/// Require an ambient `user.name`/`user.email` before creating the integration
+/// commit. `git commit-tree` would otherwise fabricate a `user@host` identity;
+/// we fail closed with a clear error instead of landing a synthetic author.
+fn require_git_identity(host: &Host, wt: &str) -> Result<()> {
+    for key in ["user.name", "user.email"] {
+        let out = run_in_dir(host, wt, &["git", "config", "--get", key])?;
+        let value = String::from_utf8_lossy(&out.stdout);
+        if !out.status.success() || value.trim().is_empty() {
+            return Err(Error::Other(format!(
+                "no git `{key}` is configured for the integration commit; set the repository or \
+                 host git identity so the landed commit is authored by the user"
+            )));
+        }
+    }
+    Ok(())
 }
 
 fn checkout_probe_commit(host: &Host, worktree: &std::path::Path, oid: &str) -> Result<()> {
@@ -4671,16 +4690,9 @@ fn verify_integration_commit(
         &format!("{head_sha}^{{tree}}"),
     )?;
     let head_tree_matches = head_tree == integration_tree;
-    let message = run_in_dir(
-        host,
-        wt,
-        &["git", "show", "-s", "--format=%B", integration_sha],
-    )?;
-    let message = String::from_utf8_lossy(&message.stdout);
-    let head_trailer = format!("Shelbi-Reviewed-Head: {head_sha}");
-    let base_trailer = format!("Shelbi-Reviewed-Base: {base_sha}");
-    let trailers_match = message.lines().any(|line| line == head_trailer)
-        && message.lines().any(|line| line == base_trailer);
+    // The sole-parent==base and tree==reviewed-head checks are the integrity
+    // guarantee: the commit's only parent is the reviewed base and its tree is
+    // byte-for-byte the reviewed head. No message trailer is required.
     let parent_count = run_in_dir(
         host,
         wt,
@@ -4693,7 +4705,6 @@ fn verify_integration_commit(
         || parent_fields != 2
         || parent != base_sha
         || !head_tree_matches
-        || !trailers_match
     {
         return Err(Error::Other(format!(
             "integration commit {integration_sha} does not have sole parent {base_sha} and \
