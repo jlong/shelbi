@@ -72,11 +72,11 @@ Detected-plan overrides require `-y`. The `-y` path cannot be combined with
 
 ## Config-location and pick-up options
 
-Without `-y`, `shelbi init` retains the explicit config-mode workflow:
+Without `-y`, `shelbi init` uses the explicit config-mode workflow:
 
 | Flag | Type | Default | Description |
 | --- | --- | --- | --- |
-| `--mode <MODE>` | `in-repo` \| `global` | asked interactively | Choose committed in-repo config or per-user global config. Required for this legacy path when stdin is not a TTY. |
+| `--mode <MODE>` | `in-repo` \| `global` | asked interactively | Choose committed in-repo config or per-user global config. Required for this path when stdin is not a TTY. |
 | `--pick-up` | flag | off | Register an existing committed `<repo>/.shelbi/project.yaml` after cloning a teammate's project. |
 
 Register an existing in-repo project like this:
