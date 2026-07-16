@@ -13,7 +13,7 @@ partial files fall back to built-in defaults, never an error.
 <Callout type="note" title="Home resolution">
 
 `~/.shelbi/` is the default base. It can be relocated via `--root`, then
-`$SHELBI_ROOT`, then the legacy `$SHELBI_HOME`, before falling back to
+`$SHELBI_ROOT`, then `$SHELBI_HOME`, before falling back to
 `$HOME/.shelbi`. Every path below joins a filename onto that base.
 
 </Callout>
@@ -29,7 +29,7 @@ omits a block, resolves to defaults.
 
 | Field | Type | Required | Default | Description |
 | --- | --- | --- | --- | --- |
-| `keymap.zen_toggle` | [chord](#zen_toggle-chords) | no | `alt-z` | Chord that toggles Zen Mode on and off. **Legacy** — a one-shot migration moves a non-default value into `keys.yaml` (`defaults.global.zen_toggle`) and resets this field. Prefer setting it in `keys.yaml`. |
+| `keymap.zen_toggle` | [chord](#zen_toggle-chords) | no | `alt-z` | Chord that toggles Zen Mode on and off. The canonical place to set it is `keys.yaml` (`defaults.global.zen_toggle`). |
 
 ```yaml
 # ~/.shelbi/config.yaml
@@ -57,15 +57,6 @@ project (`projects.<name>`). Parse errors never fail the load. A
 mistyped entry is skipped and that action keeps its built-in chord.
 
 **Path:** `~/.shelbi/keys.yaml`
-
-<Callout type="note" title="Migrated from keys.yml">
-
-Older versions named this file `keys.yml`. Shelbi now standardizes on
-`.yaml` and migrates automatically on load: a legacy `keys.yml` is
-renamed to `keys.yaml` on the next launch (only when no `keys.yaml`
-already exists). No action needed.
-
-</Callout>
 
 ### Shape
 
