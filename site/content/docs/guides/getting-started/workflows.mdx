@@ -47,11 +47,10 @@ When `workflow:` is absent, Shelbi checks the project config for
 default_workflow: task
 ```
 
-That makes new and existing tasks without `workflow:` behave as if they
-declared `workflow: task`. Fresh projects get `default_workflow: task`
-written by the scaffold, so the review-gated `task` flow is the default out
-of the box. If the project field is omitted (a pre-existing board that never
-set it), Shelbi keeps the backward-compatible built-in fallback of `default`.
+That makes tasks without `workflow:` behave as if they declared
+`workflow: task`. Fresh projects get `default_workflow: task` written by the
+scaffold, so the review-gated `task` flow is the default out of the box. If
+the project field is omitted, Shelbi falls back to the built-in `default`.
 A configured default must name an existing `workflows/<name>.yaml`; if it does
 not, project loading fails with a workflow error instead of silently falling
 back.
@@ -231,8 +230,7 @@ names the workflow and status:
 Because the `owner`/`agent` pair lives in the workflow YAML, *per-status
 automation is data, not prompt prose*. Whether the orchestrator acts at a
 given edge is the `owner` field; which agent it uses is the `agent` field.
-That turns choices that used to be buried in the orchestrator's prompt into
-a YAML edit:
+That makes each of these choices a YAML edit:
 
 - **"Auto-merge but don't auto-promote."** Keep `Backlog` as
   `owner: user` (you still triage), but make the merge-bearing handoff
@@ -494,10 +492,10 @@ column: Designing               # uses a status name from the assigned workflow
 
 If `workflow:` is absent, the task uses `default_workflow:` from project
 config. If the project does not declare one, Shelbi falls back to `default`.
-If an explicit task `workflow:` references a missing definition, legacy
-best-effort paths fall back to the built-in `default`; a missing configured
-project default fails project loading because that would otherwise reroute
-every implicit task silently.
+If an explicit task `workflow:` references a missing definition, Shelbi
+falls back to the built-in `default`; a missing configured project default
+fails project loading because that would otherwise reroute every implicit
+task silently.
 
 A task is bound to its workflow at creation. **Cross-workflow moves are
 not allowed.** To switch a task into a different workflow, create a
@@ -599,13 +597,11 @@ system reasons in categories.
 
 ### The built-in `default` fallback
 
-The `default` workflow name still exists as a **built-in fallback** for
-pre-existing boards. If a project has no `workflows/` directory at all
-(legacy state), or a task names a `workflow:` that can't be found, Shelbi
-falls back to the built-in `default`. Existing task files are not modified.
-A task with no `workflow:` field is treated as belonging to the project
-default workflow (`task` on a freshly scaffolded project), or `default` when
-the project configures none, so there's nothing to backfill.
+The `default` workflow name is a **built-in fallback**. If a project has no
+`workflows/` directory at all, or a task names a `workflow:` that can't be
+found, Shelbi falls back to the built-in `default`. A task with no
+`workflow:` field belongs to the project default workflow (`task` on a
+freshly scaffolded project), or `default` when the project configures none.
 
 ### Lifecycle: who moves a task between the default statuses
 

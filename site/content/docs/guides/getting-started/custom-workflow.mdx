@@ -40,11 +40,10 @@ prompt. No flags, no env vars, no MCP.
 
 <Callout type="warning" title="Don't hand-edit CLAUDE.md">
 
-The legacy `ORCHESTRATOR.md` override file is deprecated. If you have content
-there from an earlier version, move project-wide bits into
-`_shared/preamble.md` and orchestrator-specific bits into
-`agents/orchestrator/instructions.md`. `CLAUDE.md` is now a rendered artifact.
-Every `shelbi reload` overwrites it, so hand-edits are silently lost.
+`CLAUDE.md` is a rendered artifact. Put project-wide bits in
+`_shared/preamble.md` and orchestrator-specific bits in
+`agents/orchestrator/instructions.md`. Every `shelbi reload` overwrites
+`CLAUDE.md`, so hand-edits are silently lost.
 
 </Callout>
 

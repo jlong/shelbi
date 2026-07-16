@@ -204,15 +204,14 @@ shelbi events tail --follow
 ```
 
 You'll see the column moves and the workspace state changes interleaved,
-exactly what the orchestrator is reacting to (the `worker=` token on
-those lines is the retained backward-compatible spelling):
+exactly what the orchestrator is reacting to:
 
 ```
 2026-06-22T14:11:02+00:00 task=add-csv-export-to-reports backlog -> todo reason=user:cli
-2026-06-22T14:11:02+00:00 task=add-csv-export-to-reports todo -> in_progress reason=orchestrator:auto-dispatch_worker=alpha
-2026-06-22T14:11:03+00:00 worker=alpha none -> working
+2026-06-22T14:11:02+00:00 task=add-csv-export-to-reports todo -> in_progress reason=orchestrator:auto-dispatch_workspace=alpha
+2026-06-22T14:11:03+00:00 workspace=alpha none -> working
 2026-06-22T14:11:04+00:00 task=fix-cookie-domain-bug-on-safari-sso backlog -> todo reason=user:cli
-2026-06-22T14:11:04+00:00 task=fix-cookie-domain-bug-on-safari-sso todo -> in_progress reason=orchestrator:auto-dispatch_worker=bravo
+2026-06-22T14:11:04+00:00 task=fix-cookie-domain-bug-on-safari-sso todo -> in_progress reason=orchestrator:auto-dispatch_workspace=bravo
 …
 ```
 
@@ -282,8 +281,8 @@ intent for breakage:
   workspace on the target machine (kill another task, or remove the
   preference).
 - **The workspace's pane died.** The orchestrator surfaces it
-  (`worker=<name> pane_alive=false`, the retained backward-compatible
-  token) and waits for you. Re-launch with `Enter` on the workspace
+  (`workspace=<name> pane_alive=false`) and waits for you. Re-launch with
+  `Enter` on the workspace
   row, or `shelbi workspace stop <name>` to release the in-flight task
   back to `todo`.
 - **The mid-conversation guard.** If you're actively chatting with
