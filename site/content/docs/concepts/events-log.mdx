@@ -30,19 +30,19 @@ carries:
 ### Workspace transitions
 
 ```
-<rfc3339-timestamp> worker=<name> <prev-state> -> <new-state>
+<rfc3339-timestamp> workspace=<name> <prev-state> -> <new-state>
 ```
 
 ```
-2026-06-22T14:22:11+00:00 worker=alpha none -> working
-2026-06-22T14:23:47+00:00 worker=alpha working -> awaiting_input
-2026-06-22T14:23:48+00:00 worker=alpha awaiting_input -> working
+2026-06-22T14:22:11+00:00 workspace=alpha none -> working
+2026-06-22T14:23:47+00:00 workspace=alpha working -> awaiting_input
+2026-06-22T14:23:48+00:00 workspace=alpha awaiting_input -> working
 ```
 
 - `<prev-state>` is `none` on the first observation of that workspace.
 - States: `working`, `awaiting_input`, `blocked`. See
   [workspace states](/docs/concepts/workspaces#workspace-states).
-- The `worker=` token names a [workspace](/docs/concepts/workspaces).
+- The `workspace=` token names the [workspace](/docs/concepts/workspaces) whose state changed.
 - Written by the hub-side poller every time it observes a state change
   (not on every tick, only on actual transitions).
 
@@ -54,7 +54,7 @@ carries:
 
 ```
 2026-06-22T14:24:03+00:00 task=fix-login backlog -> todo reason=user:cli
-2026-06-22T14:24:11+00:00 task=fix-login todo -> in_progress reason=orchestrator:auto-dispatch_worker=alpha
+2026-06-22T14:24:11+00:00 task=fix-login todo -> in_progress reason=orchestrator:auto-dispatch_workspace=alpha
 2026-06-22T14:31:52+00:00 task=fix-login in_progress -> review reason=workspace:ready-marker
 ```
 
@@ -117,9 +117,9 @@ this log records, rendered for a human instead of grepped:
 <AppMockup terminalTitle="jlong@hub — shelbi" activeView="activity" />
 
 The orchestrator distinguishes the line kinds by the second token
-(`task=`, `worker=`, `project=`, `dispatch`, `mode=zen`,
+(`task=`, `workspace=`, `project=`, `dispatch`, `mode=zen`,
 `zen-dryrun`). New line shapes get added over time;
-consumers that only recognize `task=` and `worker=` should fall through
+consumers that only recognize `task=` and `workspace=` should fall through
 gracefully on the rest.
 
 ## Atomicity
@@ -160,9 +160,9 @@ content.
 
 ```text
 2026-06-22T14:24:03+00:00 task=fix-login backlog -> todo reason=user:cli
-2026-06-22T14:24:11+00:00 task=fix-login todo -> in_progress reason=orchestrator:auto-dispatch_worker=alpha
-2026-06-22T14:24:11+00:00 worker=alpha awaiting_input -> working
-2026-06-22T14:31:50+00:00 worker=alpha working -> awaiting_input
+2026-06-22T14:24:11+00:00 task=fix-login todo -> in_progress reason=orchestrator:auto-dispatch_workspace=alpha
+2026-06-22T14:24:11+00:00 workspace=alpha awaiting_input -> working
+2026-06-22T14:31:50+00:00 workspace=alpha working -> awaiting_input
 2026-06-22T14:31:52+00:00 task=fix-login in_progress -> review reason=workspace:ready-marker
 ```
 
@@ -185,7 +185,7 @@ consistent set:
 | `user:cli:start`                                   | `shelbi task start`                      | You launched a workspace on a task from the CLI.                                   |
 | `user:tui:…`                                       | the Kanban TUI                           | You moved the card with `H`/`L` in the TUI.                                        |
 | `user:promote`                                     | a `--reason` you passed                  | Free-form: anything starting with `user:` reads as "the human chose this."         |
-| `orchestrator:auto-dispatch worker=<name>`         | the orchestrator's `shelbi task start`   | The orchestrator picked a free workspace and dispatched per its routing rules.     |
+| `orchestrator:auto-dispatch workspace=<name>`         | the orchestrator's `shelbi task start`   | The orchestrator picked a free workspace and dispatched per its routing rules.     |
 | `workspace:ready-marker`                           | the hub poller                           | The workspace wrote its ready marker; the poller promoted the task to review. |
 
 These aren't enforced by code. They're a convention the orchestrator
@@ -212,7 +212,7 @@ contract is:
   via rename.
 - One line per event, RFC3339 timestamp first, ASCII fields separated
   by single spaces.
-- Two prefixes (`worker=` or `task=`) keyed off the second
+- Two prefixes (`workspace=` or `task=`) keyed off the second
   whitespace-separated token after the timestamp.
 - Reason strings are tokens (no whitespace). If you need to embed
   structured data, encode it inside the token (the convention
