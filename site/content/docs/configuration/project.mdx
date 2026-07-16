@@ -294,19 +294,22 @@ and how they integrate back. See [the merge command](/docs/cli/merge).
 | Field | Type | Required | Default | Description |
 | --- | --- | --- | --- | --- |
 | `base_branch` | string | no | `default_branch` | Branch new work is based on and merged into. Falls back to the project's `default_branch`. |
-| `branch_prefix` | string | no | GitHub username, then `user` | Prefix for generated task branches when a task omits `branch:` and its workflow does not override the prefix. Shelbi cuts `<branch_prefix>/<task-id>`. |
+| `branch` | string | no | none | Full branch-name template for generated task branches when a task omits `branch:`. Rendered with `{{var}}` substitution, including `{{github_user}}` (authenticated GitHub username) and `{{id}}` (task id), plus the task's frontmatter params. So `branch: '{{github_user}}/{{id}}'` yields e.g. `jlong/fix-login`. |
 | `merge_strategy` | `squash` \| `merge` \| `rebase` | no | `squash` | How `shelbi merge` integrates a workspace branch. Zen exact-ref auto-integration currently supports `squash`; other strategies require human PR merge. |
 
 ```yaml
 git:
   base_branch: develop
-  branch_prefix: jlong
+  branch: '{{github_user}}/{{id}}'
   merge_strategy: rebase
 ```
 
-`branch_prefix` accepts the same safe branch characters Shelbi allows for
-generated refs: ASCII letters, numbers, `-`, `_`, and `/`. It must not end
-with `/`. An explicit task `branch:` still wins over every prefix setting.
+After substitution, `branch` must use the same safe characters Shelbi allows
+for generated refs: ASCII letters, numbers, `-`, `_`, and `/`. It must not end
+with `/`. Resolution runs in order: an explicit `branch:` in the task's
+frontmatter wins; otherwise Shelbi renders `git.branch`; when neither is set it
+names the branch after your authenticated GitHub username, falling back to
+`user`. The shipped `task` workflow sets `branch: '{{github_user}}/{{id}}'`.
 
 ## See also
 

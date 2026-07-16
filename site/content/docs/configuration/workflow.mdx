@@ -183,27 +183,27 @@ task on such an edge is an error, not a silent hub-side run.
 ## git
 
 Per-workflow override of the project's [`git:`](/docs/configuration/project#git)
-block. When omitted, the workflow inherits `base_branch`, `branch_prefix`, and
+block. When omitted, the workflow inherits `base_branch`, `branch`, and
 `merge_strategy` from the project. Field values may contain `{{var}}`
 placeholders resolved against task params at load time.
 
 | Field | Type | Required | Default | Description |
 | --- | --- | --- | --- | --- |
 | `base_branch` | string | no | project's `base_branch` | Branch this workflow's tasks are based on and merged into. |
-| `branch_prefix` | string | no | project's `branch_prefix` | Prefix for generated task branches in this workflow. Shelbi cuts `<branch_prefix>/<task-id>` when a task omits `branch:`. |
+| `branch` | string | no | project's `branch` | Full branch-name template for generated task branches in this workflow, rendered with `{{var}}` substitution when a task omits `branch:`. The shipped `task` workflow uses `branch: '{{github_user}}/{{id}}'`. |
 | `merge_strategy` | `squash` \| `merge` \| `rebase` | no | project's `merge_strategy` | How this workflow's branches integrate back. |
 
 ```yaml
 git:
   base_branch: develop
-  branch_prefix: app
+  branch: 'app/{{id}}'
   merge_strategy: squash
 ```
 
-Explicit task `branch:` frontmatter still wins over a workflow prefix. If no
-task, workflow, or project prefix is configured, Shelbi uses the authenticated
-GitHub username as the generated branch prefix, falling back to `user` when it
-cannot determine one.
+Explicit task `branch:` frontmatter still wins over a workflow `branch`
+template. If no task, workflow, or project `branch` is configured, Shelbi names
+the generated branch after your authenticated GitHub username, falling back to
+`user` when it cannot determine one.
 
 ## zen
 
