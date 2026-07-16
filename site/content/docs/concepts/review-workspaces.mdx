@@ -50,8 +50,8 @@ statuses:
 
 When a task enters that status, the orchestrator routes it to a **free
 workspace whose effective tags are a superset of the status's required set**
-(set-AND). Empty required tags — the default — match any free workspace, which
-is the historical "any idle slot" behavior. So `tags: [review]` on the status
+(set-AND). Empty required tags — the default — match any free workspace, so
+any idle slot qualifies. `tags: [review]` on the status
 plus `tags: [review]` on a machine is all it takes to pin review work to
 review slots. Nothing in the routing branches on the literal word "review" —
 it's the same superset query every tag uses.
@@ -191,20 +191,6 @@ action-based rule: Zen's high-confidence bar fires on any transition whose
 `actions` include `merge`. Keep `merge` off the *enter*-review edge and on the
 *accept* edge (as above) so the orchestrator holds the task for you rather than
 crossing the accept boundary on its own.
-
-## Legacy configs
-
-Earlier releases modeled review with bespoke keys instead of the generic
-primitives above. They still load, so an old project YAML keeps working, but
-they're deprecated:
-
-- **`role: review`** on a workspace (and `role: dev`) — folded into `tags` on
-  load: `role: review` becomes the `review` tag, `role: dev` becomes no tag.
-  The key is never written back; prefer `tags:` directly.
-- **The `review:` block** on the project (`base_port`, `port_stride`, `setup`,
-  `serve`, `ready_probe`, …) — no longer a field. It's silently ignored on
-  load. Its job is now done by workspace `slot` / `$SLOT` and transition
-  `run` / `ready` commands.
 
 There is no `is_review` flag or dedicated review command; review is entirely
 the tag-plus-transition model on this page.

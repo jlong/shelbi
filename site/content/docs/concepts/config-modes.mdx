@@ -13,12 +13,12 @@ Shelbi splits everything it writes to disk into two categories:
   events log, workspace status files, the orchestrator's dashboard
   worktree. Two teammates on the same project have different state.
 
-**Config can live in two places**: under your `$HOME` (the historical
-default, *global mode*), or committed to the repo itself (*in-repo mode*).
+**Config can live in two places**: under your `$HOME` (the default,
+*global mode*), or committed to the repo itself (*in-repo mode*).
 State always lives under `~/.shelbi/`, regardless of mode.
 
 First-run `shelbi` and `shelbi init -y` create global-mode config. You can move
-a project to in-repo mode later with a one-shot command. The legacy interactive
+a project to in-repo mode later with a one-shot command. The interactive
 `shelbi init` path also offers an explicit `--mode` choice.
 
 <Callout type="tip" title="Which mode?">
@@ -190,7 +190,8 @@ existing global-mode project into the in-repo layout:
    removes.
 3. Prints the `.gitignore` snippet above and offers to auto-append it
    (interactively), or applies it non-interactively with `--yes`.
-4. Deletes the now-superseded `~/.shelbi/projects/<name>.yaml`.
+4. Deletes the original `~/.shelbi/projects/<name>.yaml`, whose contents
+   now live in the two files above.
 
 State (`state.json`, `tasks/`, `HANDOFF.md`, `.claude/`, `workspaces/`,
 `events.log`) stays put under `~/.shelbi/`.

@@ -42,8 +42,7 @@ carries:
 - `<prev-state>` is `none` on the first observation of that workspace.
 - States: `working`, `awaiting_input`, `blocked`. See
   [workspace states](/docs/concepts/workspaces#workspace-states).
-- The `worker=` token is retained for backward compatibility. The
-  slot it names is a [workspace](/docs/concepts/workspaces).
+- The `worker=` token names a [workspace](/docs/concepts/workspaces).
 - Written by the hub-side poller every time it observes a state change
   (not on every tick, only on actual transitions).
 
@@ -120,7 +119,7 @@ this log records, rendered for a human instead of grepped:
 The orchestrator distinguishes the line kinds by the second token
 (`task=`, `worker=`, `project=`, `dispatch`, `mode=zen`,
 `zen-dryrun`). New line shapes get added over time;
-consumers that only know the two original prefixes should fall through
+consumers that only recognize `task=` and `worker=` should fall through
 gracefully on the rest.
 
 ## Atomicity
@@ -187,7 +186,7 @@ consistent set:
 | `user:tui:…`                                       | the Kanban TUI                           | You moved the card with `H`/`L` in the TUI.                                        |
 | `user:promote`                                     | a `--reason` you passed                  | Free-form: anything starting with `user:` reads as "the human chose this."         |
 | `orchestrator:auto-dispatch worker=<name>`         | the orchestrator's `shelbi task start`   | The orchestrator picked a free workspace and dispatched per its routing rules.     |
-| `workspace:ready-marker`                           | the hub poller                           | The workspace wrote its ready marker; the poller promoted the task to review. (Historical aliases `workspace:review-marker` and `worker:review-marker` still parse.) |
+| `workspace:ready-marker`                           | the hub poller                           | The workspace wrote its ready marker; the poller promoted the task to review. |
 
 These aren't enforced by code. They're a convention the orchestrator
 parses to decide whether *it* triggered an event (and shouldn't react)
