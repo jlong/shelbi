@@ -279,51 +279,120 @@ wasn't sure. Want me to?"). It also emits
 `reason=orchestrator:zen-decline reason-text=<short>` so the
 activity feed shows what was considered and why.
 
-### Tuning the judgment categories for your project
+## Tuning Zen: the `zenmode.md` file
 
-This is the power-user invitation. The judgment categories live in
-the orchestrator's prompt, the section titled `## Zen Mode` in the
-default template. **You can edit it.**
-
-The orchestrator is a [project-local agent with shipped defaults](/docs/concepts/agents),
-so its prompt is a file you own:
+This is the power-user invitation. Both halves of Zen policy, the
+auto-promote judgment categories above and the
+[merge conditions](#the-high-confidence-bar), live in one user-owned
+file per project:
 
 ```text
-~/.shelbi/projects/<name>/agents/orchestrator/instructions.md
+~/.shelbi/projects/<name>/zenmode.md
 ```
 
-Edit it directly, or run `shelbi agent edit orchestrator`. The
-composed output (preamble + instructions) is rewritten to
-`~/.shelbi/projects/<name>/CLAUDE.md` on every `ensure_dashboard` call,
-so your changes take effect on the next `shelbi reload`.
+(For an in-repo project it resolves to `<repo>/.shelbi/zenmode.md`
+instead.)
 
-A starter override that tunes Zen's judgment:
+`zenmode.md` is the **live source of truth for what Zen Mode means in
+that project.** The orchestrator reads it in full at bootstrap and
+re-reads it periodically, prompted by the heartbeat, to keep its
+behavior aligned with your intent. The Rust side never inspects the
+prose. The file exists purely for the orchestrator, so you can edit it
+freely to tune Zen, and your changes take effect without a rebuild.
+`shelbi reload` [preserves your edits](/docs/cli/reload) to
+`zenmode.md`; it only migrates exact legacy stock command snippets and
+leaves your surrounding prose intact.
+
+### The first line is the heartbeat summary
+
+The **first line of `zenmode.md` is the one-line summary the heartbeat
+echoes back** to the orchestrator. While Zen is on, every few ticks a
+`zen=on` [heartbeat](/docs/concepts/events-log#heartbeats) carries that
+first line verbatim as a live reminder of what Zen means here, read
+fresh each time so an edit shows up immediately. Roughly once an hour
+the heartbeat instead injects a fuller "re-read `zenmode.md` now"
+instruction, so the orchestrator refreshes the full policy before its
+next Zen decision rather than acting on a faded memory.
+
+Because that first line is what gets re-injected, keep it a single
+accurate line: **if you change what Zen means below, change the first
+line too.** It is the fastest lever on the orchestrator's live
+behavior.
+
+### The file shape
+
+A `zenmode.md` is the summary line, then the policy sections the
+orchestrator applies:
 
 ```markdown
-## Zen Mode
+Zen: auto-promote eligible backlog and run the exact-provenance merge flow on handoff without asking.
 
-### Auto-promote judgment categories
+# Zen Mode policy
+
+This file is the source of truth for what Zen Mode means in **this** project.
+The orchestrator reads it (and re-reads it periodically, prompted by the
+heartbeat). The Rust side never inspects the prose, so edit it freely.
+
+## Auto-promote judgment categories
+
+From the mechanically-eligible list (`shelbi zen scan`), only auto-promote a
+candidate if **at least one** is true:
+
+1. **It's the kind of work the user generally trusts you with.**
+2. **It's part of fixing an issue the user recently raised.**
+3. **It's part of a larger body of work the user explicitly kicked off.**
+
+## Merge conditions
+
+Run `shelbi zen probe` and apply, in order: all local checks pass, no merge
+conflict, `files ≤ 30` and `lines_added + lines_removed ≤ 2000`, no
+danger-path matches, then the `pr-create` → `ci-watch` → `pr-merge`
+exact-provenance flow.
+```
+
+The default ships with these categories and conditions filled in. Edit
+the sections in place to reshape them.
+
+### Relationship to the orchestrator prompt
+
+Earlier versions inlined the judgment categories and merge conditions in
+the orchestrator's prompt, the `## Zen Mode` section of
+`agents/orchestrator/instructions.md`. They no longer live there. That
+section now just tells the orchestrator to treat `zenmode.md` as the
+source of truth and to re-read it on the heartbeat cues above. So
+**edit `zenmode.md` to tune Zen policy, not the prompt.** The
+[orchestrator instructions](/docs/concepts/orchestrator#customizing-the-prompt-per-project)
+remain yours to customize for how the orchestrator *reacts* to events,
+but the Zen policy itself belongs in `zenmode.md`.
+
+A starter override that tightens Zen's judgment, edited directly in
+`zenmode.md`:
+
+```markdown
+Zen: auto-merge docs/content and automation-tagged tasks; hold everything else for me.
+
+## Auto-promote judgment categories
 
 Promote a candidate only if **at least one** is true:
 
-1. **Tagged `automation:` in the title.** Always in scope — these
-   are bot-filed PR-bumps and lint sweeps we have years of
-   acceptance history on.
-2. **Touches only `docs/**` or `site/content/**`.** Content edits
-   are reversible and never reach prod.
+1. **Tagged `automation:` in the title.** Always in scope: these are
+   bot-filed PR-bumps and lint sweeps we have years of acceptance
+   history on.
+2. **Touches only `docs/**` or `site/content/**`.** Content edits are
+   reversible and never reach prod.
 3. **The user has accepted ≥3 tasks of the same shape (same
    verb-prefix, same target directory) without changes in the last
    week.** Track this against the `done` column.
 
-If none of the above, leave it in backlog and surface in the next
-reply.
+## Merge conditions
 
-### Merge conditions
-
-(Inherit from the default — see the bundled template.)
+(Inherit from the default; see the bundled template.)
 ```
 
-Other places to tune:
+Note the first line changed to match the tighter policy. That new
+summary is what the heartbeat now re-injects.
+
+Other places to tune, all in the same file:
 
 - **Raise/lower the diff thresholds**: change `files ≤ 30` to
   whatever fits the project's typical PR size.
@@ -334,12 +403,10 @@ Other places to tune:
 - **Replace categories entirely** with a project-specific
   taxonomy.
 
-The Rust side never inspects this section, so the prose is the
-source of truth. That's the whole design. Zen's policy is one
-markdown file you own.
-
-For more on how the prompt gets wired in, see
-[customizing the prompt per project](/docs/concepts/orchestrator#customizing-the-prompt-per-project).
+The Rust side never parses any of this, so the prose is the source of
+truth. That is the whole design: Zen's policy is one markdown file you
+own. For the CLI that flips Zen on and off, see
+[`shelbi zen`](/docs/cli/zen).
 
 ## Per-task overrides
 
