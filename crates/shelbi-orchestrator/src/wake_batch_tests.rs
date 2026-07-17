@@ -43,11 +43,17 @@ fn normalized_event(index: usize, raw_bytes: usize) -> NormalizedEvent {
 
 #[test]
 fn offline_quiet_chunks_wait_then_flush_fifo_when_action_arrives() {
-    let quiet_line = "t project=demo heartbeat zen=on zen_eligible=0 idle_workspaces=9\n";
+    // A genuinely non-deliverable owned quiet line: pane death is neither
+    // actionable nor keep-alive, so it exercises the buffer/FIFO/directional
+    // machinery. (Quiet heartbeats are now keep-alive and deliverable on their
+    // own; see the keep-alive tests in the wake module.)
+    let quiet_line = "t project=demo workspace=alpha pane_alive=false reason=exit:1\n";
     let quiet = quiet_line.repeat(EVENT_BATCH_MAX_EVENTS + 5);
     let quiet_chunks = scan_chunks(&quiet, 0);
     assert!(quiet_chunks.len() >= 2, "quiet catch-up must be split");
-    assert!(quiet_chunks.iter().all(|batch| !batch.actionable));
+    assert!(quiet_chunks
+        .iter()
+        .all(|batch| !batch.actionable && !batch.keep_alive));
 
     let mut queue = DurableQueue {
         project: PROJECT.into(),
@@ -223,6 +229,7 @@ fn persisted_over_limit_legacy_batch_is_rebuilt_from_the_durable_cursor() {
         events: Vec::new(),
         input: escaped_input,
         actionable: true,
+        keep_alive: false,
         attempted: false,
         status: DeliveryStatus::Pending,
     };
