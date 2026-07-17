@@ -7,6 +7,7 @@ pub mod config;
 pub mod daemon;
 pub mod diff;
 pub mod events;
+pub mod guard;
 pub mod hub_version;
 pub mod init;
 pub mod list;

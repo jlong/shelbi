@@ -2507,8 +2507,10 @@ fn remote_cd_launch(
         ),
         None => String::new(),
     };
+    // `SHELBI_MANAGED_CONTEXT=1` marks this as a Shelbi-managed pane so the
+    // commit guard governs the agent (a no-op in a plain shell). See `githook`.
     format!(
-        "cd {wd} && LANG=C.UTF-8 {port_env}{hub_env}exec \"${{SHELL:-/bin/bash}}\" -lc {launch}",
+        "cd {wd} && LANG=C.UTF-8 SHELBI_MANAGED_CONTEXT=1 {port_env}{hub_env}exec \"${{SHELL:-/bin/bash}}\" -lc {launch}",
         wd = shelbi_agent::shell_escape(&worktree.to_string_lossy()),
         launch = shelbi_agent::shell_escape(launch),
     )
@@ -4609,6 +4611,15 @@ mod tests {
             "still cd's into the worktree: {line}"
         );
         assert!(line.contains("LANG=C.UTF-8"), "LANG fix preserved: {line}");
+        // Remote worker panes are Shelbi-managed contexts too, so they carry
+        // the commit-guard marker ahead of the exec'd shell.
+        let marker_at = line
+            .find("SHELBI_MANAGED_CONTEXT=1")
+            .expect("managed-context marker present");
+        assert!(
+            marker_at < exec_at,
+            "SHELBI_MANAGED_CONTEXT must come BEFORE exec: {line}"
+        );
     }
 
     /// `$SHELBI_REMOTE_HUB_SOCK` is the hub-side override knob (per

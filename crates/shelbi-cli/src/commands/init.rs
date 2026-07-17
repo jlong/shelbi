@@ -663,6 +663,16 @@ fn scaffold_project(resolved: &ResolvedProjectRoot, mode: InitMode) -> Result<()
         }
         shelbi_state::ZenmodeOutcome::Unchanged => {}
     }
+
+    // Disclose and install the context-scoped default-branch commit guard now,
+    // with the user's knowledge — this is the consented install. Project open
+    // only *refreshes* an already-installed hook, so it's never created
+    // silently behind the user's back ([[feedback-no-silent-git-hook-install]]).
+    // Best-effort: a non-git root or a foreign hook degrades quietly, and the
+    // user can always add it later with `shelbi guard install`.
+    if let Ok(project) = shelbi_state::load_project(&resolved.name) {
+        crate::commands::guard::install_at_init(&project, &resolved.path);
+    }
     Ok(())
 }
 

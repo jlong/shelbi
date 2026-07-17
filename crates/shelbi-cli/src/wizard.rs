@@ -382,6 +382,13 @@ where
     }
     persist_plan(&plan)?;
     ui.message(&format!("✓ Project {} created.", plan.project_name))?;
+
+    // Disclose and install the context-scoped default-branch commit guard as
+    // part of this consented setup — never silently on a later project open.
+    // Best-effort: failure to write a hook must not fail project creation.
+    if let Ok(project) = plan.to_project() {
+        crate::commands::guard::install_at_init(&project, &plan.repo_root);
+    }
     Ok(SetupOutcome::Created(plan.project_name))
 }
 

@@ -307,6 +307,14 @@ enum Cmd {
         #[command(subcommand)]
         cmd: commands::zen::ZenCmd,
     },
+    /// Manage the hub checkout's context-scoped default-branch commit guard
+    /// (the Shelbi-managed `pre-commit` hook). `install`/`uninstall`/`status`.
+    /// The hook only blocks commits from inside a Shelbi-managed agent pane —
+    /// your own shell is never governed.
+    Guard {
+        #[command(subcommand)]
+        cmd: commands::guard::GuardCmd,
+    },
     /// Run a single-purpose workflow action primitive. `push-branch`,
     /// `open-pr`, `merge`, `close-pr`, `delete-branch`, and `restack`
     /// are the git/gh primitives the workflow `transitions:` block can
@@ -403,6 +411,7 @@ fn main() -> Result<()> {
         Some(Cmd::Events { cmd }) => commands::events::run(cmd),
         Some(Cmd::Daemon { cmd }) => commands::daemon::run(cmd),
         Some(Cmd::Zen { cmd }) => commands::zen::run(cli.project, cmd),
+        Some(Cmd::Guard { cmd }) => commands::guard::run(cli.project, cmd),
         Some(Cmd::Action { cmd }) => commands::action::run(cli.project, cmd),
         Some(Cmd::Attach { id }) => commands::attach::run(cli.project, id),
         Some(Cmd::Init(mut args)) => {
