@@ -59,12 +59,27 @@ const THREAD_INIT_ITEM: &str =
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 enum WakePriority {
+    /// A quiet-board heartbeat that carries no actionable work. Codex is
+    /// push-only, so it still needs the heartbeat typed into its prompt to run
+    /// a turn and drain/react; this keep-alive tier delivers exactly that. It
+    /// sits below every actionable tier and, unlike them, never advances
+    /// actionable wake state (runner-switch gating, coalesce direction), so a
+    /// quiet heartbeat can never mask or re-order a pending actionable batch.
+    HeartbeatKeepAlive,
     Heartbeat,
     WorkspaceFree,
     Ready,
     Handoff,
     ZenMode,
     SupervisionGaveUp,
+}
+
+impl WakePriority {
+    /// True for the low-priority keep-alive tier, which makes a batch
+    /// deliverable to Codex without counting as actionable.
+    fn is_keep_alive(self) -> bool {
+        matches!(self, WakePriority::HeartbeatKeepAlive)
+    }
 }
 
 /// Why the native Codex bridge disengaged and dropped to standalone
@@ -2211,11 +2226,19 @@ struct QueuedBatch {
     events: Vec<NormalizedEvent>,
     input: String,
     /// Quiet chunks are retained to bound catch-up memory but become
-    /// deliverable only when this or a later queued chunk is actionable.
-    /// Older queue files contain only actionable batches, so missing values
-    /// deliberately deserialize as true.
+    /// deliverable only when this or a later queued chunk is actionable
+    /// (or keep-alive; see `keep_alive`). Older queue files contain only
+    /// actionable batches, so missing values deliberately deserialize as true.
     #[serde(default = "default_true")]
     actionable: bool,
+    /// A quiet heartbeat carries no actionable work but must still nudge the
+    /// Codex push path so it runs a turn instead of stalling. Such a batch is
+    /// deliverable via `next_pending` yet, unlike an actionable batch, never
+    /// advances actionable wake state (`pending_delivery_ids`) or flips the
+    /// coalesce direction gate. Absent in older queue files, so it defaults
+    /// to false.
+    #[serde(default)]
+    keep_alive: bool,
     #[serde(default)]
     attempted: bool,
     #[serde(default)]
@@ -2225,15 +2248,16 @@ struct QueuedBatch {
 impl QueuedBatch {
     #[cfg(test)]
     fn new(project: &str, from: u64, through: u64, events: Vec<NormalizedEvent>) -> Self {
-        Self::new_with_actionable(project, from, through, events, true)
+        Self::new_with_flags(project, from, through, events, true, false)
     }
 
-    fn new_with_actionable(
+    fn new_with_flags(
         project: &str,
         from: u64,
         through: u64,
         events: Vec<NormalizedEvent>,
         actionable: bool,
+        keep_alive: bool,
     ) -> Self {
         let message_id = stable_message_id(project, from, through);
         let input = event_batch_input(project, from, through, &message_id, &events);
@@ -2246,6 +2270,7 @@ impl QueuedBatch {
             events,
             input,
             actionable,
+            keep_alive,
             attempted: false,
             status: DeliveryStatus::Pending,
         }
@@ -2278,6 +2303,7 @@ impl QueuedBatch {
         self.message_id = message_id;
         self.input = input;
         self.actionable |= newer.actionable;
+        self.keep_alive |= newer.keep_alive;
         true
     }
 }
@@ -2433,10 +2459,15 @@ impl DurableQueue {
             .batches
             .iter()
             .position(|batch| batch.status == DeliveryStatus::Pending)?;
+        // FIFO delivery: return the earliest pending batch when it, or a later
+        // queued batch, warrants a wake. A keep-alive (quiet heartbeat) batch
+        // counts here so Codex is nudged on a quiet board, but it is not
+        // actionable, so `pending_delivery_ids` still ignores it and a quiet
+        // heartbeat never advances actionable wake position.
         self.batches
             .iter()
             .skip(pending)
-            .any(|batch| batch.actionable)
+            .any(|batch| batch.actionable || batch.keep_alive)
             .then_some(pending)
     }
 
@@ -2558,6 +2589,7 @@ fn scan_text_batch(
     let mut through = start;
     let mut events = Vec::new();
     let mut actionable = false;
+    let mut keep_alive = false;
 
     for line_with_newline in text.split_inclusive('\n') {
         let line_start = offset;
@@ -2567,10 +2599,10 @@ fn scan_text_batch(
         let owned = parsed.as_ref().is_some_and(|parsed| {
             parsed.fields.get("project").map(String::as_str) == Some(project)
         });
-        let line_actionable = owned
-            && parsed
-                .as_ref()
-                .is_some_and(|parsed| line_priority(parsed, board_in_flight).is_some());
+        let priority = owned
+            .then_some(parsed.as_ref())
+            .flatten()
+            .and_then(|parsed| line_priority(parsed, board_in_flight));
         let event = if owned {
             let parsed = parsed.as_ref().expect("owned line was parsed");
             if line.len() > EVENT_BATCH_MAX_SERIALIZED_INPUT_BYTES {
@@ -2615,11 +2647,16 @@ fn scan_text_batch(
         }
         events = candidate_events;
         through = offset;
-        actionable |= line_actionable;
+        match priority {
+            Some(priority) if priority.is_keep_alive() => keep_alive = true,
+            Some(_) => actionable = true,
+            None => {}
+        }
     }
 
-    (through > start)
-        .then(|| QueuedBatch::new_with_actionable(project, start, through, events, actionable))
+    (through > start).then(|| {
+        QueuedBatch::new_with_flags(project, start, through, events, actionable, keep_alive)
+    })
 }
 
 fn batch_fits(project: &str, from: u64, through: u64, events: &[NormalizedEvent]) -> bool {
@@ -2762,6 +2799,14 @@ fn line_priority(parsed: &ParsedLine, board_in_flight: bool) -> Option<WakePrior
         if board_in_flight || capacity_actionable {
             return Some(WakePriority::Heartbeat);
         }
+        // A quiet heartbeat still keeps the Codex push path live: without a
+        // wake typed into its prompt Codex stalls until the next user turn.
+        // Deliver it at the keep-alive tier so it nudges Codex to run a turn
+        // without advancing actionable wake state. This is naturally
+        // rate-limited by the hub's adaptive heartbeat cadence (standard
+        // ~3m in flight, exponential backoff to a 60m cap once quiescent), so
+        // no separate throttle is needed on a quiet board.
+        return Some(WakePriority::HeartbeatKeepAlive);
     }
     None
 }
@@ -2981,9 +3026,19 @@ mod tests {
     }
 
     #[test]
-    fn quiet_heartbeat_is_not_actionable_but_inflight_is() {
+    fn quiet_heartbeat_is_keep_alive_and_inflight_is_actionable() {
+        // A quiet heartbeat no longer returns None: it must keep the Codex push
+        // path live, so it wakes at the low-priority keep-alive tier. In-flight
+        // work still wakes it at the normal actionable Heartbeat tier.
         let heartbeat = parsed("t project=demo heartbeat zen=on zen_eligible=0 idle_workspaces=9");
-        assert_eq!(line_priority(&heartbeat, false), None);
+        assert_eq!(
+            line_priority(&heartbeat, false),
+            Some(WakePriority::HeartbeatKeepAlive)
+        );
+        assert!(WakePriority::HeartbeatKeepAlive.is_keep_alive());
+        assert!(!WakePriority::Heartbeat.is_keep_alive());
+        // Keep-alive is the lowest tier, below every actionable tier.
+        assert!(WakePriority::HeartbeatKeepAlive < WakePriority::Heartbeat);
         assert_eq!(
             line_priority(&heartbeat, true),
             Some(WakePriority::Heartbeat)
@@ -2999,6 +3054,9 @@ mod tests {
             ),
             Some(WakePriority::Heartbeat)
         );
+        // Without both eligible work and idle capacity a heartbeat is not
+        // actionable, but it still keeps Codex alive at the keep-alive tier
+        // rather than falling through to None.
         for line in [
             "t project=demo heartbeat zen=on zen_eligible=2 idle_workspaces=0",
             "t project=demo heartbeat zen=on zen_eligible=0 idle_workspaces=9",
@@ -3006,7 +3064,11 @@ mod tests {
             "t project=demo heartbeat zen=paused zen_eligible=2 idle_workspaces=9",
             "t project=demo heartbeat zen_eligible=2 idle_workspaces=9",
         ] {
-            assert_eq!(line_priority(&parsed(line), false), None, "line: {line}");
+            assert_eq!(
+                line_priority(&parsed(line), false),
+                Some(WakePriority::HeartbeatKeepAlive),
+                "line: {line}"
+            );
         }
     }
 
@@ -3222,21 +3284,32 @@ mod tests {
     }
 
     #[test]
-    fn scan_suppresses_quiet_zen_heartbeat_but_keeps_actionable_heartbeats() {
+    fn scan_marks_quiet_heartbeat_keep_alive_and_capacity_heartbeat_actionable() {
+        // A quiet heartbeat is non-actionable but keep-alive: it never advances
+        // actionable wake state, yet it still makes the batch deliverable so
+        // Codex is nudged (see `keep_alive_heartbeat_batch_is_deliverable`).
         let quiet = "t project=demo heartbeat zen=on zen_eligible=0 idle_workspaces=9\n";
         let quiet_batch = scan_text_batch("demo", 0, quiet, false).unwrap();
         assert!(!quiet_batch.actionable);
+        assert!(quiet_batch.keep_alive);
+        assert_eq!(quiet_batch.events.len(), 1);
+        assert_eq!(quiet_batch.events[0].kind, "heartbeat");
 
+        // Eligible work plus idle capacity is actionable, not merely keep-alive.
         let capacity = "t project=demo heartbeat zen=on zen_eligible=2 idle_workspaces=1\n";
         let batch = scan_text_batch("demo", 0, capacity, false).unwrap();
         assert_eq!(batch.events.len(), 1);
         assert_eq!(batch.events[0].kind, "heartbeat");
         assert_eq!(batch.through, capacity.len() as u64);
         assert!(batch.actionable);
+        assert!(!batch.keep_alive);
 
+        // In-flight board work also makes a quiet heartbeat actionable.
         let inflight = scan_text_batch("demo", 0, quiet, true).unwrap();
         assert_eq!(inflight.events.len(), 1);
         assert_eq!(inflight.through, quiet.len() as u64);
+        assert!(inflight.actionable);
+        assert!(!inflight.keep_alive);
     }
 
     #[test]
@@ -3719,6 +3792,50 @@ mod tests {
         assert_eq!(queue.pending_delivery_ids(10), vec![pending_id]);
         // With the cursor past everything, nothing is pending.
         assert!(queue.pending_delivery_ids(30).is_empty());
+    }
+
+    #[test]
+    fn keep_alive_heartbeat_batch_is_deliverable_without_advancing_wake_position() {
+        // A quiet-board heartbeat: no in-flight work, no eligible+idle capacity.
+        let quiet = "t project=demo heartbeat zen=on zen_eligible=0 idle_workspaces=9\n";
+        let keep_alive = scan_text_batch("demo", 0, quiet, false).unwrap();
+        assert!(keep_alive.keep_alive);
+        assert!(!keep_alive.actionable);
+
+        let mut queue = DurableQueue {
+            project: "demo".into(),
+            batches: VecDeque::from([keep_alive]),
+        };
+        // Deliverable: next_pending returns the keep-alive batch so Codex is
+        // nudged and runs a turn, and for_batch would inject it via turn/start.
+        assert_eq!(queue.next_pending(), Some(0));
+        let call =
+            DeliveryCall::for_batch(&ThreadPhase::Idle, "thread-1", &queue.batches[0]).unwrap();
+        assert_eq!(call.method, "turn/start");
+        // But it is not actionable: it never advances actionable wake position
+        // or blocks a native-to-legacy runner switch.
+        assert!(queue.pending_delivery_ids(0).is_empty());
+    }
+
+    #[test]
+    fn quiet_heartbeat_does_not_mask_or_advance_past_actionable_batch() {
+        // A keep-alive heartbeat queued ahead of a genuinely actionable batch.
+        let quiet = "t project=demo heartbeat zen=on zen_eligible=0 idle_workspaces=9\n";
+        let keep_alive = scan_text_batch("demo", 0, quiet, false).unwrap();
+        let boundary = keep_alive.through;
+        let actionable = batch("demo", boundary, boundary + 40);
+        let actionable_id = actionable.message_id.clone();
+
+        let mut queue = DurableQueue {
+            project: "demo".into(),
+            batches: VecDeque::from([keep_alive, actionable]),
+        };
+        // FIFO delivery: the earliest pending batch is delivered first, exactly
+        // as before. The keep-alive never re-orders the queue.
+        assert_eq!(queue.next_pending(), Some(0));
+        // Only the actionable batch advances actionable wake position; the quiet
+        // heartbeat neither masks nor is reported alongside it.
+        assert_eq!(queue.pending_delivery_ids(0), vec![actionable_id]);
     }
 
     #[test]
