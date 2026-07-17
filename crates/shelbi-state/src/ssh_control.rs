@@ -694,6 +694,11 @@ mod tests {
 
     #[test]
     fn remote_hub_socket_defaults_to_per_session_tmp_and_env_overrides() {
+        // Serialize behind the shared env lock: this test mutates the
+        // process-global SHELBI_REMOTE_HUB_SOCK, and a sibling that reads
+        // or clears it would otherwise race and drop the override
+        // (classic env-var test flake — see #319-adjacent CI red).
+        let _g = lock_test();
         std::env::remove_var("SHELBI_REMOTE_HUB_SOCK");
         let uid = unsafe { libc::getuid() };
         let path = remote_hub_socket_path();
