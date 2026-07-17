@@ -9,9 +9,72 @@ on `main`, newest first. This page is hand-curated: it tracks capabilities, not
 every commit, so small copy edits and cosmetic tweaks are folded away. Entries
 are prose with `code` and links where they earn their place.
 
+### Unreleased
+
+**`git.branch` branch-name templates.** The git block gains a `branch` template
+key that parameterizes the branch names Shelbi cuts for tasks, rendered with
+`{{var}}` substitution, and mutually exclusive with the older `branch_prefix`.
+The shipped `subtask` workflow now cuts its branches from a `branch` template
+instead of a prefix. See the [git block reference](/docs/configuration/workflow#git).
+
+### July 15, 2026
+
+**v0.5.0. Shelbi runs on Codex, not just Claude.** The orchestrator and workers
+can now run under Codex as a first-class runner alongside Claude. A
+`RunnerAdapter` capability model unifies per-runner behavior so dispatch, the
+board, and supervision treat both the same way, backed by a durable event and
+wake queue that survives restarts; Claude consumes that same durable feed and
+acknowledges each item so nothing is dropped or replayed. Where a runner has no
+lifecycle hooks, Shelbi fills the gap: Codex workers receive orchestrator
+messages by polling, and an idle Codex orchestrator wakes on board events rather
+than waiting for a prompt. `shelbi status` surfaces per-agent integration health
+and names the fallback reason when a runner is degraded, and switching a project
+between the Codex-native and legacy runners is a guided migration rather than a
+hand edit.
+
+**A detected getting-started plan.** `shelbi init` now reads the shape of the
+project and proposes a tailored setup plan instead of a one-size-fits-all
+default.
+
+**CLI version-mismatch detection.** The hub daemon warns when a workspace's
+`shelbi` CLI version has drifted from the hub's, so a stale binary on a remote
+machine shows up as a notice instead of confusing behavior.
+
+**"Add project" from the palette.** A new palette flow adds a project through a
+details dialog, without dropping back to the wizard.
+
+**Zen merge-safety hardening.** Zen's PR create and merge steps now match on
+exact provenance, so they no longer false-fail on Zen's own push or a rebased
+head, and local checks run under a per-check timeout so a loaded hub fails fast
+instead of hanging on one wedged check.
+
+### July 10, 2026
+
+**v0.4.0. A user-owned Zen policy that stays in context.** The Zen autopilot
+policy is now a user-editable `zenmode.md` file, and the hub re-injects its
+one-line summary into the orchestrator on a heartbeat cadence, so the policy
+keeps steering even as the orchestrator's context turns over. See
+[Zen Mode](/docs/concepts/zen-mode).
+
+**`shelbi reload <target>`.** Reload one piece in place, a workflow, an agent's
+instructions, or config, without restarting the whole hub.
+
+**Palette and workspace conveniences.** The command palette gains "Edit …
+Settings" openers, hidden until you query for them, and clicking an idle
+workspace now opens a user shell in its tmux window instead of doing nothing.
+
+**Auto-resume of usage-limit-stalled workers.** A worker parked on an agent
+usage limit now resumes automatically when its quota window resets, rather than
+sitting paused until you nudge it.
+
+**Sturdier under bad remotes.** `list` and `status` bound their per-workspace
+probes so a single wedged SSH host can't hang the whole command, and a worker's
+worktree detaches from its task branch on handoff so the branch is free to merge
+and clean up.
+
 ### July 9, 2026
 
-**A batteries-included default install.** `shelbi init` now sets up the loop
+**v0.3.0. A batteries-included default install.** `shelbi init` now sets up the loop
 most projects want without any YAML editing. Two things landed. First, six
 agent presets materialize on first load instead of three: the
 `orchestrator`, `developer`, and `review` roles that run the core loop, plus
