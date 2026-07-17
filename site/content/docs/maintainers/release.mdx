@@ -94,6 +94,12 @@ The version output must match the tag you intend to publish:
 ./target/release/shelbi --version | grep "shelbi $VERSION"
 ```
 
+Curate the changelog before tagging. `site/content/docs/changelog.mdx` is
+hand-maintained and updates nowhere else, so add or finish this version's entry
+now: a feature-level, newest-first note dated to when the work landed on `main`,
+folding internal refactors into the capability they enabled. Commit it to `main`
+before the tag so the published site matches the release.
+
 ## GoReleaser Dry Run
 
 Validate the GoReleaser configuration:
