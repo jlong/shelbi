@@ -34,10 +34,14 @@ over SSH. The repo is a Rust workspace plus a Next.js marketing/docs site.
 
 ## Git discipline
 
-- Never commit on `main`. Shelbi installs a managed pre-commit guard when it
-  can, but leaves an existing user-authored hook untouched. Work happens on
-  task branches cut by dispatch (e.g. `jlong/<task-id>`) or `fix/<slug>`
-  branches for hand fixes.
+- Never commit on `main`. At `shelbi init` (with disclosure) Shelbi installs a
+  context-scoped pre-commit guard in the hub checkout; it blocks commits to a
+  protected branch ONLY from inside a Shelbi-managed agent pane (which exports
+  `SHELBI_MANAGED_CONTEXT`), so a human's plain-shell commits are never
+  governed. It's refresh-only on later opens (never silently created), removable
+  with `shelbi guard uninstall`, cleaned up on teardown, and never overwrites a
+  user-authored hook. Work happens on task branches cut by dispatch (e.g.
+  `jlong/<task-id>`) or `fix/<slug>` branches for hand fixes.
 - `main` is protected: changes land only via squash-merged PRs.
 
 ## Conventions

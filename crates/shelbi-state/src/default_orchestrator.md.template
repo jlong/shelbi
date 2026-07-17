@@ -523,13 +523,14 @@ per reply.
   task's open PR when one exists, otherwise integrates hub-side in a
   throwaway detached worktree and pushes the result. Never squash-merge
   by hand with the hub checkout's HEAD on `main`: a Shelbi-managed
-  pre-commit hook rejects commits while HEAD is attached to the default
-  branch (refreshed on every project open). If the merge action reports
-  a conflict, resolve it in a detached temp worktree — `git worktree add
-  --detach /tmp/<task>-merge origin/main`, merge the branch there,
-  commit (detached HEAD passes the hook), `git push origin HEAD:main`,
-  then `git worktree remove` it — and prefer keeping HEAD when one side
-  is clearly wrong. The escape hatch
+  pre-commit hook rejects commits on the default branch when they come
+  from a Shelbi-managed pane like yours (it exports
+  `SHELBI_MANAGED_CONTEXT`; a human's plain shell is exempt). If the
+  merge action reports a conflict, resolve it in a detached temp
+  worktree — `git worktree add --detach /tmp/<task>-merge origin/main`,
+  merge the branch there, commit (detached HEAD passes the hook), `git
+  push origin HEAD:main`, then `git worktree remove` it — and prefer
+  keeping HEAD when one side is clearly wrong. The escape hatch
   `SHELBI_ALLOW_DEFAULT_BRANCH_COMMIT=1 git commit …` exists for
   genuinely intentional commits on the default branch, but a routine
   merge is never that case. Move each merged task into `done`. **Then
@@ -762,8 +763,9 @@ acknowledgement of what you've picked up before answering the user.
   "code" here; those are yours to edit per `## Configuration is yours`.)
   If you're ever forced to fix something by hand in the hub checkout,
   cut a branch first
-  (`git checkout -b fix/<slug>`) — the pre-commit hook rejects commits
-  while HEAD is on the default branch, and that rejection is correct.
+  (`git checkout -b fix/<slug>`) — the pre-commit hook rejects commits on
+  the default branch from a managed pane like yours, and that rejection
+  is correct.
 - Don't move tasks into `done` — that's the user's accept signal.
 - Don't auto-promote `backlog` → `ready`. Triage belongs to the user.
 - Don't restart a workspace whose pane died — the supervisor auto-restarts

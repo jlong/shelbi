@@ -49,6 +49,12 @@ const ENV_TASK_ID: &str = "TASK_ID";
 /// override.
 const ENV_HUB_SOCK: &str = "SHELBI_HUB_SOCK";
 
+/// Marker Shelbi exports into managed panes. The hub's `pre-commit` guard is
+/// a no-op unless this is present, so it governs Shelbi's own agents without
+/// touching the human's plain-shell commits. See
+/// [`shelbi_orchestrator::githook::MANAGED_CONTEXT_ENV`].
+const ENV_MANAGED_CONTEXT: &str = "SHELBI_MANAGED_CONTEXT";
+
 /// Build the `sh -c …`-suitable command string that re-enters this
 /// binary under `--as-pane`. Exposed so `focus_or_create` and
 /// `start_workspace_on_task` use the exact same string and can't drift.
@@ -267,6 +273,11 @@ pub fn run(
         .env(ENV_PROJECT, &project.name)
         .env(ENV_TASK_ID, &task_id)
         .env(ENV_HUB_SOCK, &hub_sock)
+        // Mark this as a Shelbi-managed context so the hub commit guard
+        // (a no-op in a plain shell) blocks the worker agent from committing
+        // directly on a protected branch. Set for every workspace pane —
+        // dispatched or sidebar-clicked — since all are Shelbi-managed.
+        .env(ENV_MANAGED_CONTEXT, "1")
         .stdin(Stdio::inherit())
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit())

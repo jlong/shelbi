@@ -431,31 +431,39 @@ pub fn ensure_dashboard(project_name: &str) -> Result<BootstrapStatus> {
     // it survives shelbi upgrades and tmux-server restarts.
     install_stash_cleanup_hook(&host)?;
 
-    // Install/refresh the hub checkout's default-branch commit guard
-    // (bug-worker-commit-landed-on-hub-main-checkout): a pre-commit hook
-    // that rejects commits while HEAD is attached to the default branch,
-    // so an agent session working in the hub checkout can't land code on
-    // local `main` before cutting a branch. Best-effort — a work_dir
-    // that isn't a git repo (fresh setup, test fixture) or a foreign user
-    // hook degrades to a loud warning, not a failed project open.
-    let mut protected: Vec<&str> = vec![&project.default_branch];
-    if project.base_branch() != project.default_branch {
-        protected.push(project.base_branch());
-    }
-    match githook::install_hub_branch_guard(&hub.work_dir, &protected) {
+    // Refresh — never silently install — the hub checkout's context-scoped
+    // default-branch commit guard (bug-worker-commit-landed-on-hub-main-checkout).
+    // The hook only governs commits made from a Shelbi-managed pane (which
+    // exports `SHELBI_MANAGED_CONTEXT`), so an agent working in the hub
+    // checkout can't land code on `main` before cutting a branch, while the
+    // human's own commits are untouched. Installation is disclosed/consented
+    // at `shelbi init` / `shelbi guard install`; here we pass `RefreshOnly` so
+    // project open updates an already-installed hook but never writes a new
+    // one the user didn't opt into ([[feedback-no-silent-git-hook-install]]).
+    // Best-effort — a non-repo work_dir or a foreign user hook degrades to a
+    // warning, not a failed open.
+    let protected = protected_default_branches(&project);
+    let protected_refs: Vec<&str> = protected.iter().map(String::as_str).collect();
+    match githook::install_hub_branch_guard(
+        &hub.work_dir,
+        &protected_refs,
+        githook::InstallMode::RefreshOnly,
+    ) {
         Ok(githook::HookInstall::SkippedForeignHook) => {
             eprintln!(
                 "shelbi: warning: {}/.git/hooks/pre-commit is user-authored — \
-                 the default-branch commit guard was NOT installed; commits on \
-                 `{}` in the hub checkout stay unguarded",
+                 the default-branch commit guard was NOT refreshed; commits on \
+                 `{}` from a Shelbi pane in the hub checkout stay unguarded",
                 hub.work_dir.display(),
                 project.default_branch,
             );
         }
+        // SkippedNotInstalled is the normal "user hasn't opted in" state —
+        // stay silent so open doesn't nag about a hook they declined.
         Ok(_) => {}
         Err(e) => {
             eprintln!(
-                "shelbi: warning: couldn't install the default-branch commit \
+                "shelbi: warning: couldn't refresh the default-branch commit \
                  guard in {}: {e}",
                 hub.work_dir.display(),
             );
@@ -1072,6 +1080,18 @@ fn install_stash_cleanup_hook(host: &shelbi_core::Host) -> Result<()> {
     Ok(())
 }
 
+/// The branches the hub commit guard protects: the project's
+/// `default_branch`, plus `git.base_branch` when it differs. Shared by
+/// `ensure_dashboard` (refresh on open) and `shelbi guard install` so the
+/// two can't disagree about what "protected" means.
+pub fn protected_default_branches(project: &shelbi_core::Project) -> Vec<String> {
+    let mut protected = vec![project.default_branch.clone()];
+    if project.base_branch() != project.default_branch {
+        protected.push(project.base_branch().to_string());
+    }
+    protected
+}
+
 // ---------------------------------------------------------------------------
 // Shelbi-owned pane command builders.
 //
@@ -1326,9 +1346,12 @@ fn orchestrator_pane_cmd(
     let sess = shelbi_agent::shell_escape(session);
     let wd = shelbi_agent::shell_escape(workdir);
     let interval = ORCH_HEARTBEAT_INTERVAL_SECS;
+    // `SHELBI_MANAGED_CONTEXT=1` marks this as a Shelbi-managed pane so the
+    // hub commit guard (a no-op elsewhere) blocks the orchestrator from
+    // committing directly on a protected branch. See `githook`.
     format!(
         "cd {wd} && \
-         export SHELBI_PROJECT={proj} SHELBI_TMUX_SESSION={sess} && \
+         export SHELBI_PROJECT={proj} SHELBI_TMUX_SESSION={sess} SHELBI_MANAGED_CONTEXT=1 && \
          {bin} __zen-orch-start {proj}; \
          ({bin} __zen-heartbeat {proj}; \
             while sleep {interval}; do {bin} __zen-heartbeat {proj}; done) & \
@@ -2006,6 +2029,9 @@ mod pane_cmd_tests {
         // paths skip the quoting branch — see shelbi_agent::shell_escape.
         assert!(out.starts_with("cd /Users/me/.shelbi/projects/myapp && "));
         assert!(out.contains("export SHELBI_PROJECT=myapp SHELBI_TMUX_SESSION=shelbi-myapp"));
+        // The orchestrator pane is a Shelbi-managed context, so the hub
+        // commit guard governs it.
+        assert!(out.contains("SHELBI_MANAGED_CONTEXT=1"));
         // Crash recovery check runs before the heartbeat loop spawns.
         let start_idx = out
             .find("__zen-orch-start myapp")

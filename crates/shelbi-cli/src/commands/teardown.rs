@@ -49,7 +49,7 @@ use ratatui::{
     Frame, Terminal,
 };
 
-use shelbi_core::{Project, WorkspaceSpec};
+use shelbi_core::{MachineKind, Project, WorkspaceSpec};
 use shelbi_orchestrator::handoff::HandoffOutcome;
 use shelbi_orchestrator::workspace as orch_workspace;
 
@@ -344,6 +344,14 @@ fn teardown_project(progress: &Progress, pi: usize, project: &str, reason: &str)
         for (wi, workspace) in p.workspaces.iter().enumerate() {
             progress.set_workspace(pi, wi, Step::Active);
             progress.set_workspace(pi, wi, kill_one_workspace(&p, workspace));
+        }
+
+        // Remove the Shelbi-managed commit guard from the hub checkout so
+        // nothing Shelbi installed lingers after the user tears the project
+        // down — the trust fix requires it not persist past use. Best-effort,
+        // and a user-authored hook is never touched (SkippedForeignHook).
+        if let Some(hub) = p.machines.iter().find(|m| matches!(m.kind, MachineKind::Local)) {
+            let _ = shelbi_orchestrator::githook::uninstall_hub_branch_guard(&hub.work_dir);
         }
     }
 
