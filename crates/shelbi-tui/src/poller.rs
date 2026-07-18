@@ -2977,6 +2977,7 @@ mod tests {
         );
         Project {
             name: "demo".into(),
+            display_name: None,
             repo: "git@example:demo.git".into(),
             default_branch: "main".into(),
             default_workflow: None,

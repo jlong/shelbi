@@ -30,6 +30,7 @@ impl Drop for HomeGuard {
 fn test_project() -> Project {
     Project {
         name: PROJECT.into(),
+        display_name: None,
         default_branch: "main".into(),
         default_workflow: None,
         config_mode: None,

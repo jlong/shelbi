@@ -592,6 +592,7 @@ mod tests {
         );
         Project {
             name: name.into(),
+            display_name: None,
             repo: repo.to_string_lossy().into_owned(),
             default_branch: "main".into(),
             default_workflow: None,

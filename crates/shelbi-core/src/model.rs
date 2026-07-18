@@ -48,6 +48,16 @@ pub struct SessionProject {
 pub struct Project {
     // --- shared -----------------------------------------------------------
     pub name: String,
+    /// Optional human-readable label for the project. The `name` above is
+    /// always the slug/id — it keys the on-disk folder, the settings file,
+    /// the tmux session, the event-log `project=` field, and every state
+    /// key. `display_name` is *display-only*: it's what a human sees in the
+    /// sidebar and command palette when set. Legacy projects have no
+    /// `display_name` and render under `name` exactly as before (see
+    /// [`Project::display_label`]). Elided from the wire form when unset so
+    /// existing project YAMLs round-trip byte-for-byte.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_name: Option<String>,
     #[serde(default = "default_branch")]
     pub default_branch: String,
     /// Project-level default workflow for tasks that omit `workflow:`.
@@ -151,6 +161,7 @@ pub enum ConfigMode {
 /// Matches the order of the shared fields on [`Project`].
 pub const SHARED_PROJECT_FIELDS: &[&str] = &[
     "name",
+    "display_name",
     "default_branch",
     "default_workflow",
     "config_mode",
@@ -597,6 +608,18 @@ fn default_workspace_permissions_mode() -> String {
 impl Project {
     pub fn machine(&self, name: &str) -> Option<&Machine> {
         self.machines.iter().find(|m| m.name == name)
+    }
+
+    /// The label to show a human for this project: [`display_name`] when set,
+    /// otherwise the slug [`name`]. Every user-facing render (sidebar,
+    /// command palette) goes through here so a legacy project — one with no
+    /// `display_name` — reads exactly as it did before, while a project that
+    /// carries a human-readable label shows it.
+    ///
+    /// [`display_name`]: Project::display_name
+    /// [`name`]: Project::name
+    pub fn display_label(&self) -> &str {
+        self.display_name.as_deref().unwrap_or(&self.name)
     }
 
     /// Effective base branch — `git.base_branch` when set, otherwise the
@@ -2742,6 +2765,40 @@ updated_at: 2026-06-19T00:00:00Z
     }
 
     #[test]
+    fn display_label_falls_back_to_name_and_prefers_display_name() {
+        let base = "\
+name: contextstore
+repo: /tmp/cs
+machines:
+  - { name: hub, kind: local, work_dir: /tmp }
+orchestrator: { runner: claude }
+agent_runners:
+  claude: { command: claude, flags: [] }
+";
+        // Legacy project (no display_name): label is the slug, and the field
+        // is elided on the way back out so the YAML round-trips unchanged.
+        let legacy = Project::from_yaml_str(base).unwrap();
+        assert_eq!(legacy.display_name, None);
+        assert_eq!(legacy.display_label(), "contextstore");
+        let out = serde_yaml::to_string(&legacy).unwrap();
+        assert!(
+            !out.contains("display_name"),
+            "an unset display_name must not be serialized:\n{out}"
+        );
+
+        // With a display_name set, the human label wins while `name` stays the
+        // slug used for every storage key.
+        let labeled_yaml = format!("display_name: ContextStore\n{base}");
+        let labeled = Project::from_yaml_str(&labeled_yaml).unwrap();
+        assert_eq!(labeled.name, "contextstore");
+        assert_eq!(labeled.display_name.as_deref(), Some("ContextStore"));
+        assert_eq!(labeled.display_label(), "ContextStore");
+        assert!(serde_yaml::to_string(&labeled)
+            .unwrap()
+            .contains("display_name: ContextStore"));
+    }
+
+    #[test]
     fn task_is_blocked_when_any_dep_not_done() {
         let now = chrono::Utc::now();
         let task = Task {
@@ -3156,6 +3213,7 @@ workspace_settings_template: /etc/shelbi/p.json
         );
         let project = Project {
             name: "p".into(),
+            display_name: None,
             repo: "r".into(),
             default_branch: "main".into(),
             default_workflow: None,
@@ -3273,6 +3331,7 @@ workspaces:
         };
         Project {
             name: "p".into(),
+            display_name: None,
             repo: "r".into(),
             default_branch: "main".into(),
             default_workflow: None,
@@ -3523,6 +3582,7 @@ workspaces:
         );
         Project {
             name: "p".into(),
+            display_name: None,
             repo: "r".into(),
             default_branch: "main".into(),
             default_workflow: None,
@@ -4794,6 +4854,7 @@ git:
         );
         Project {
             name: "shelbi".into(),
+            display_name: None,
             default_branch: "main".into(),
             default_workflow: None,
             config_mode: Some(ConfigMode::InRepo),

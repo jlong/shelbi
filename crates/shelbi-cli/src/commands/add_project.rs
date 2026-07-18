@@ -30,14 +30,14 @@ use ratatui::{
     layout::Rect,
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Clear, Paragraph},
+    widgets::{Block, Borders, Clear, Paragraph, Wrap},
     Frame, Terminal,
 };
 use shelbi_state::keymap::{GlobalAction, KeyChord, Keymaps};
 
 use super::init::InitMode;
 use crate::project_root::{
-    absolutize, project_name_collides, validate_project_name, validate_root, RootValidation,
+    absolutize, project_name_collides, validate_root, RootValidation,
 };
 
 /// The three focusable controls, in Tab order.
@@ -78,6 +78,12 @@ impl FormState {
 
 /// The validated result the loop returns on a successful confirm. Ready
 /// to drive [`super::init::scaffold_with_prompt`] verbatim.
+///
+/// `name` is the **human-readable** name exactly as the user typed it (any
+/// characters). The scaffolder slugifies it into the on-disk id and records
+/// the original as `display_name` only when the two differ — the same path a
+/// command-line `shelbi init --project "<name>"` takes — so both entry points
+/// behave identically.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AddProjectForm {
     pub name: String,
@@ -236,23 +242,37 @@ impl Detected {
     }
 }
 
+/// Slugify the entered name the same way the scaffolder will. Returns the
+/// derived id (`ContextStore` → `contextstore`, `My App` → `my-app`), or
+/// `None` when the input has no `[a-z0-9]` to build an id from (empty or
+/// all-punctuation). The dialog uses this for both the live preview line and
+/// the pre-submit collision check, so what the preview shows is exactly the
+/// id the project lands under.
+fn derived_slug(name: &str) -> Option<String> {
+    shelbi_core::normalize_project_name(name.trim()).ok()
+}
+
 /// Validate the current form against disk. Returns the ready-to-scaffold
 /// [`AddProjectForm`] on success, or a user-facing inline error string on
-/// failure. Mirrors the guards `shelbi init` applies (`validate_project_name`,
-/// `project_name_collides`, `validate_root`) so the dialog rejects a
-/// duplicate name or a bad path here — before anything is written.
+/// failure. Any human-readable name is accepted — it's slugified into the
+/// on-disk id ([`derived_slug`]) and the collision / path guards run against
+/// that slug, mirroring what `shelbi init` does before anything is written.
 fn validate(state: &FormState, cwd: &Path) -> std::result::Result<AddProjectForm, String> {
     let name = state.name.trim();
     if name.is_empty() {
         return Err("Enter a project name.".to_string());
     }
-    if let Err(e) = validate_project_name(name) {
-        return Err(e.to_string());
-    }
-    match project_name_collides(name) {
+    // Slugify for storage. Only an empty / all-punctuation name has nothing to
+    // build an id from — every other human-readable name is accepted.
+    let slug = derived_slug(name).ok_or_else(|| {
+        format!("`{name}` has no letters or digits to build an id from — try a name like `my-app`.")
+    })?;
+    // Collision is checked on the SLUG (the folder / settings-file id), not the
+    // display name, so two different labels that slugify the same still clash.
+    match project_name_collides(&slug) {
         Ok(true) => {
             return Err(format!(
-                "A shelbi project named `{name}` already exists — pick another name."
+                "a project already lives at `{slug}` — pick a different name."
             ))
         }
         Ok(false) => {}
@@ -337,12 +357,13 @@ pub fn run<B: ratatui::backend::Backend>(
     }
 }
 
-/// Paint the dialog overlay. Centered bordered card matching the
-/// Zen-intro popover's anchor, with the three fields, the detected line,
-/// an inline error row (blank when clean), and the key hints.
+/// Paint the dialog. The card **fills the palette window** (the whole `area`
+/// the palette occupies) rather than a small centered box, so the fields, the
+/// derived-slug preview, and long error/notice text always have room and never
+/// truncate. Holds the three fields, the derived id/path preview, the detected
+/// line, an inline error row (blank when clean), and the key hints.
 fn render(f: &mut Frame, area: Rect, state: &FormState, detected: &Detected) {
-    let overlay = centered_rect(60, 14, area);
-    f.render_widget(Clear, overlay);
+    f.render_widget(Clear, area);
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::default().fg(Color::Cyan))
@@ -352,8 +373,8 @@ fn render(f: &mut Frame, area: Rect, state: &FormState, detected: &Detected) {
                 .fg(Color::Cyan)
                 .add_modifier(Modifier::BOLD),
         )));
-    let inner = block.inner(overlay);
-    f.render_widget(block, overlay);
+    let inner = block.inner(area);
+    f.render_widget(block, area);
 
     let mut lines: Vec<Line> = Vec::new();
     lines.push(Line::raw(""));
@@ -366,6 +387,7 @@ fn render(f: &mut Frame, area: Rect, state: &FormState, detected: &Detected) {
     lines.push(config_line(state.mode, state.focus == Field::Config));
     lines.push(Line::raw(""));
     lines.push(Line::from(detected.line()));
+    lines.push(preview_line(&state.name, state.mode));
     lines.push(Line::raw(""));
     // Error row is reserved unconditionally so the hints don't reflow when
     // a validation message appears.
@@ -382,7 +404,39 @@ fn render(f: &mut Frame, area: Rect, state: &FormState, detected: &Detected) {
         Style::default().fg(Color::DarkGray),
     )]));
 
-    f.render_widget(Paragraph::new(lines), inner);
+    // Wrap long lines (a lengthy repo path or a long validation message) onto
+    // the next row instead of clipping them — with the dialog now filling the
+    // whole palette window there's room, and nothing should ever truncate.
+    f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
+}
+
+/// The live "where this lands" preview: the derived slug and the path its
+/// config will be written to. Shows a dimmed hint while the name is still
+/// empty / all-punctuation so the row never renders a bogus id.
+fn preview_line(name: &str, mode: InitMode) -> Line<'static> {
+    let label_style = Style::default().fg(Color::Gray);
+    match derived_slug(name) {
+        Some(slug) => {
+            let path = match mode {
+                InitMode::Global => format!("~/.shelbi/projects/{slug}.yaml"),
+                InitMode::InRepo => "<repo>/.shelbi/project.yaml".to_string(),
+            };
+            Line::from(vec![
+                Span::styled("Folder / id: ", label_style),
+                Span::styled(
+                    slug,
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(format!("   ({path})"), Style::default().fg(Color::DarkGray)),
+            ])
+        }
+        None => Line::from(Span::styled(
+            "Folder / id: (type a name to see the derived id)",
+            Style::default().fg(Color::DarkGray),
+        )),
+    }
 }
 
 /// One labelled text field. The focused field shows a cyan cursor bar
@@ -438,22 +492,6 @@ fn config_line(mode: InitMode, focused: bool) -> Line<'static> {
         Span::raw("   "),
         Span::styled(global.to_string(), opt_style(mode == InitMode::Global)),
     ])
-}
-
-/// Center a `w × h` rect inside `area`, clipping to the available size.
-/// Mirrors the helper in [`super::zen_intro`] so the two overlays anchor
-/// identically.
-fn centered_rect(w: u16, h: u16, area: Rect) -> Rect {
-    let w = w.min(area.width);
-    let h = h.min(area.height);
-    let x = area.x + (area.width.saturating_sub(w)) / 2;
-    let y = area.y + (area.height.saturating_sub(h)) / 2;
-    Rect {
-        x,
-        y,
-        width: w,
-        height: h,
-    }
 }
 
 #[cfg(test)]
@@ -557,14 +595,84 @@ mod tests {
     }
 
     #[test]
-    fn validate_rejects_empty_and_bad_names() {
+    fn validate_rejects_empty_and_all_punctuation_names() {
         let cwd = Path::new("/tmp");
         let mut s = FormState::new(cwd);
         s.name = String::new();
         assert!(validate(&s, cwd).is_err());
-        // Uppercase / spaces fail the storage charset gate.
+        // An all-punctuation name has nothing to slugify → clear suggestion.
+        s.name = "!!!".to_string();
+        let err = validate(&s, cwd).unwrap_err();
+        assert!(err.contains("my-app"), "expected a suggestion, got: {err}");
+    }
+
+    #[test]
+    fn derived_slug_slugifies_human_readable_names() {
+        assert_eq!(derived_slug("ContextStore").as_deref(), Some("contextstore"));
+        assert_eq!(derived_slug("My App").as_deref(), Some("my-app"));
+        assert_eq!(derived_slug("  Foo Bar!! ").as_deref(), Some("foo-bar"));
+        // Already-clean slug passes through unchanged.
+        assert_eq!(derived_slug("my-app").as_deref(), Some("my-app"));
+        // Nothing to build an id from.
+        assert_eq!(derived_slug(""), None);
+        assert_eq!(derived_slug("!!!"), None);
+    }
+
+    /// A mixed-case / spaced name is accepted (not rejected as it once was):
+    /// `validate` keeps the raw human-readable name on the form so the
+    /// scaffolder can slugify it and record the original as `display_name`.
+    #[test]
+    fn validate_accepts_human_readable_name_and_keeps_it_raw() {
+        let _g = crate::commands::test_support::ENV_LOCK.lock().unwrap();
+        let home = std::env::temp_dir().join(format!(
+            "shelbi-add-project-accept-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(home.join("projects")).unwrap();
+        std::env::set_var("SHELBI_HOME", &home);
+
+        // `/tmp` exists (non-git is allowed), so only the name path is exercised.
+        let cwd = Path::new("/tmp");
+        let mut s = FormState::new(cwd);
         s.name = "My App".to_string();
-        assert!(validate(&s, cwd).is_err());
+        let form = validate(&s, cwd).expect("human-readable name should be accepted");
+        // The form carries the raw name; slugification happens downstream.
+        assert_eq!(form.name, "My App");
+
+        std::env::remove_var("SHELBI_HOME");
+    }
+
+    /// Collision is checked against the derived slug, so two different labels
+    /// that slugify to the same id clash — and the error names the slug.
+    #[test]
+    fn validate_rejects_slug_collision() {
+        let _g = crate::commands::test_support::ENV_LOCK.lock().unwrap();
+        let home = std::env::temp_dir().join(format!(
+            "shelbi-add-project-collide-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(home.join("projects")).unwrap();
+        std::fs::write(home.join("projects/contextstore.yaml"), "name: contextstore\n").unwrap();
+        std::env::set_var("SHELBI_HOME", &home);
+
+        let cwd = Path::new("/tmp");
+        let mut s = FormState::new(cwd);
+        s.name = "ContextStore".to_string();
+        let err = validate(&s, cwd).unwrap_err();
+        assert!(
+            err.contains("contextstore"),
+            "collision error should name the slug, got: {err}"
+        );
+
+        std::env::remove_var("SHELBI_HOME");
     }
 
     #[test]

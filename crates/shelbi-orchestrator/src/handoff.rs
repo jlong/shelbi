@@ -404,6 +404,7 @@ mod tests {
     fn project_with_runner(name: &str, command: &str) -> shelbi_core::Project {
         shelbi_core::Project {
             name: "demo".into(),
+            display_name: None,
             default_branch: "main".into(),
             default_workflow: None,
             config_mode: None,

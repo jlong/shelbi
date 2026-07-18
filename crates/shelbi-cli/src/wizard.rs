@@ -87,6 +87,11 @@ pub(crate) struct DetectedRunner {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct DetectedSetupPlan {
     pub(crate) project_name: String,
+    /// Human-readable label recorded when the entered/detected name was
+    /// slugified into a different `project_name` (e.g. `My Demo` →
+    /// `my-demo`). `None` when the name was already a clean slug, so the
+    /// project YAML stays free of a redundant `display_name`.
+    pub(crate) display_name: Option<String>,
     pub(crate) repo_root: PathBuf,
     pub(crate) default_branch: String,
     pub(crate) remote_url: Option<String>,
@@ -123,8 +128,9 @@ impl DetectedSetupPlan {
     /// project scaffolding begins.
     pub(crate) fn apply_overrides(&mut self, overrides: SetupPlanOverrides) -> Result<()> {
         if let Some(project_name) = overrides.project_name {
-            self.project_name =
-                crate::project_root::normalize_project_name_announced(project_name.trim())?;
+            let (slug, display_name) = crate::project_root::slug_and_display(&project_name)?;
+            self.project_name = slug;
+            self.display_name = display_name;
         }
         if let Some(default_branch) = overrides.default_branch {
             let default_branch = default_branch.trim();
@@ -210,6 +216,7 @@ impl DetectedSetupPlan {
 
         let project = Project {
             name: self.project_name.clone(),
+            display_name: self.display_name.clone(),
             repo: self.repo_root.display().to_string(),
             default_branch: self.default_branch.clone(),
             default_workflow: Some(shelbi_core::TASK_WORKFLOW_NAME.to_string()),
@@ -969,8 +976,10 @@ fn assemble_plan(
 ) -> DetectedSetupPlan {
     let repo_root = snapshot.git.repo_root.unwrap_or_else(|| PathBuf::from("."));
     let git_init_root = initialize_git.then(|| repo_root.clone());
+    let (project_name, display_name) = wizard_default_project_name(&repo_root);
     DetectedSetupPlan {
-        project_name: wizard_default_project_name(&repo_root),
+        project_name,
+        display_name,
         repo_root,
         default_branch: snapshot
             .git
@@ -1277,7 +1286,8 @@ fn customize_from(plan: &DetectedSetupPlan) -> Result<DetectedSetupPlan> {
     println!("Customize setup. Press Enter to keep each detected value.");
     println!();
 
-    let project_name = prompt_project_name(&plan.project_name)?;
+    let (project_name, display_name) =
+        prompt_project_name(plan.display_name.as_deref().unwrap_or(&plan.project_name))?;
     let repo_raw = text("Path to the repo:", &plan.repo_root.display().to_string())?;
     let repo_root = PathBuf::from(repo_raw.trim());
     let default_branch = text("Default branch:", &plan.default_branch)?
@@ -1316,6 +1326,7 @@ fn customize_from(plan: &DetectedSetupPlan) -> Result<DetectedSetupPlan> {
 
     Ok(DetectedSetupPlan {
         project_name,
+        display_name,
         repo_root,
         default_branch,
         remote_url,
@@ -1371,14 +1382,24 @@ impl Display for PresetChoice {
     }
 }
 
-fn wizard_default_project_name(cwd: &Path) -> String {
+/// The default project name derived from the repo basename: the slug plus the
+/// human-readable label to keep when slugifying changed it. Falls back to
+/// `my-project` (no label) when the basename has nothing to slugify.
+fn wizard_default_project_name(cwd: &Path) -> (String, Option<String>) {
     cwd.file_name()
         .and_then(|name| name.to_str())
-        .and_then(|name| shelbi_core::normalize_project_name(name).ok())
-        .unwrap_or_else(|| "my-project".to_string())
+        .and_then(|raw| {
+            shelbi_core::normalize_project_name(raw)
+                .ok()
+                .map(|slug| {
+                    let display = (slug != raw).then(|| raw.to_string());
+                    (slug, display)
+                })
+        })
+        .unwrap_or_else(|| ("my-project".to_string(), None))
 }
 
-fn prompt_project_name(default: &str) -> Result<String> {
+fn prompt_project_name(default: &str) -> Result<(String, Option<String>)> {
     use inquire::validator::{ErrorMessage, Validation};
 
     let validator = |value: &str| -> std::result::Result<Validation, inquire::CustomUserError> {
@@ -1395,7 +1416,7 @@ fn prompt_project_name(default: &str) -> Result<String> {
         .with_validator(validator)
         .prompt()
         .context("project name prompt")?;
-    crate::project_root::normalize_project_name_announced(raw.trim())
+    crate::project_root::slug_and_display(&raw)
 }
 
 fn workspace_count_recommendation(machine_count: u32) -> (u32, Option<String>) {
@@ -1823,6 +1844,7 @@ mod tests {
     fn fixture_plan(root: &Path, runner: Runner) -> DetectedSetupPlan {
         DetectedSetupPlan {
             project_name: "shaft".to_string(),
+            display_name: None,
             repo_root: root.to_path_buf(),
             default_branch: "main".to_string(),
             remote_url: Some("git@github.com:jlong/shaft.git".to_string()),
@@ -3055,13 +3077,16 @@ mod tests {
 
         assert_eq!(
             wizard_default_project_name(Path::new("/tmp/Shaft")),
-            "shaft"
+            ("shaft".to_string(), Some("Shaft".to_string()))
         );
         assert_eq!(
             wizard_default_project_name(Path::new("/tmp/My App")),
-            "my-app"
+            ("my-app".to_string(), Some("My App".to_string()))
         );
-        assert_eq!(wizard_default_project_name(Path::new("/")), "my-project");
+        assert_eq!(
+            wizard_default_project_name(Path::new("/")),
+            ("my-project".to_string(), None)
+        );
     }
 
     #[test]
