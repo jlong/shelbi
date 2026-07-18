@@ -25,9 +25,7 @@ use ratatui::{
     widgets::{Block, Borders, Clear, Paragraph},
     Frame, Terminal,
 };
-use shelbi_state::{
-    load_user_config, save_user_config, user_config_path, UserConfig, ZenToggleChord,
-};
+use shelbi_state::{load_user_config, save_user_config, user_config_path, ZenToggleChord};
 
 use crate::keymap::matches_zen_toggle;
 
@@ -171,9 +169,10 @@ where
     }
 
     let chord = run_probe_and_chooser(term, &mut CrosstermEvents, PROBE_TIMEOUT)?;
-    let cfg = UserConfig {
-        keymap: shelbi_state::Keymap { zen_toggle: chord },
-    };
+    // Load-and-mutate so writing the probed chord preserves any other config
+    // the user already set (e.g. `editor:`) rather than clobbering it.
+    let mut cfg = load_user_config().unwrap_or_default();
+    cfg.keymap.zen_toggle = chord;
     save_user_config(&cfg).context("writing ~/.shelbi/config.yaml")?;
     Ok(chord)
 }

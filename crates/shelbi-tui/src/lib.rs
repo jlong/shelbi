@@ -26,6 +26,7 @@ mod kanban;
 mod keymap;
 mod markdown;
 mod poller;
+mod review_panel;
 mod sidebar;
 pub mod theme;
 mod zen_probe;
@@ -273,6 +274,27 @@ pub fn run_activity(project_name: &str) -> Result<()> {
 
     restore_terminal(&mut term).context("restoring terminal")?;
     result
+}
+
+/// Run the review-panel ratatui view in the current pane. Hosted in the
+/// third pane of the review interface (see
+/// [`shelbi_orchestrator::review_ui`]); swaps the middle content pane
+/// between the reviewer chat and the editor, and drives Approve / Reject.
+pub fn run_review_panel(project_name: &str, task_id: &str) -> Result<()> {
+    review_panel::run_review_panel(project_name, task_id)
+}
+
+/// `pub(crate)` shim so [`review_panel`] can reuse the shared terminal
+/// setup without duplicating the raw-mode / alt-screen dance.
+pub(crate) fn setup_terminal_pub() -> Result<Terminal<CrosstermBackend<io::Stdout>>> {
+    setup_terminal()
+}
+
+/// `pub(crate)` shim mirroring [`setup_terminal_pub`] for teardown.
+pub(crate) fn restore_terminal_pub<B: ratatui::backend::Backend + std::io::Write>(
+    term: &mut Terminal<B>,
+) -> Result<()> {
+    restore_terminal(term)
 }
 
 /// Enter raw mode + alt screen + mouse capture. Tmux only forwards mouse

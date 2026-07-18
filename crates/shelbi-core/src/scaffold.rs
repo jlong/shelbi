@@ -420,6 +420,11 @@ keymap:
   ## ctrl-g, ctrl-shift-z, none.
   zen_toggle: alt-z
 
+## Editor the review interface's \"Edit in <editor>\" view opens in the review
+## worktree. Falls back to $EDITOR, then vim. May carry flags (e.g. code --wait).
+## The sidebar label reflects the resolved editor name (Edit in Vim, Edit in Helix).
+# editor: vim
+
 ## Keybinding overrides live in the sibling file ~/.shelbi/keys.yaml.
 ## See https://shelbi.dev/docs/configuration/global
 ";

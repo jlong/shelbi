@@ -589,18 +589,26 @@ impl App {
                 }
             }
             View::ReviewTask(id) => match self.start_review(id) {
-                Ok(focus_target) => {
-                    let _ = run_tmux(["select-window", "-t", &focus_target]);
-                    self.status_line = format!("▶ reviewing {id}");
-                }
+                Ok(outcome) => self.status_line = outcome,
                 Err(e) => self.status_line = format!("review `{id}` failed: {e}"),
             },
         }
     }
 
+    /// Open the review interface for a Ready-for-review task, or kick off a
+    /// background load for a still-Queued one. Delegates to
+    /// [`shelbi_orchestrator::review_ui::open_review_interface`], which
+    /// reshapes the dashboard into the three-column layout (Ready) or starts
+    /// the review agent detached without stealing focus (Queued).
     fn start_review(&self, id: &str) -> Result<String> {
-        shelbi_orchestrator::load::load_task_by_id(&self.project_name, id)
-            .map_err(|e| anyhow::anyhow!(e))
+        use shelbi_orchestrator::review_ui::ReviewOpenOutcome;
+        let outcome = shelbi_orchestrator::review_ui::open_review_interface(&self.project_name, id)
+            .map_err(|e| anyhow::anyhow!(e))?;
+        Ok(match outcome {
+            ReviewOpenOutcome::Opened(_) => format!("▶ reviewing {id}"),
+            ReviewOpenOutcome::Loading => format!("loading review for {id}…"),
+            ReviewOpenOutcome::RemoteFallback(note) => note,
+        })
     }
 
     /// Flip `state.json::zen_mode` between On and Off via the shared
@@ -865,50 +873,39 @@ fn load_workspaces(project: &str) -> Result<Vec<WorkspaceOverview>> {
         Err(_) => return Ok(Vec::new()),
     };
     let in_progress = shelbi_state::list_column(project, Column::in_progress()).unwrap_or_default();
-    // A review workspace's loaded task sits in the Review column (it's *loaded*
-    // onto the slot, never promoted from in-progress), so its "serving" state
-    // isn't visible in the in-progress scan. Read the Review column too and use
-    // it for review workspaces so a serving slot reads `Review` / active rather
-    // than `idle` — the §16 mockup's `▸ review-1  Review`.
-    let review_col = shelbi_state::list_column(project, Column::review()).unwrap_or_default();
     let mut out = Vec::with_capacity(p.workspaces.len());
     for workspace in &p.workspaces {
+        // Review-tagged slots never appear under `— Workspaces —`; their
+        // capacity surfaces exclusively through the Ready/Queued for Review
+        // sections (spec §17). A slot that is *both* a dev and review surface
+        // (extra tags) still counts as review here — the review sections own
+        // it. Dev workspaces (no `review` tag) list as before, on every
+        // project whether or not it declares review slots.
+        if p.effective_tags(workspace).contains("review") {
+            continue;
+        }
         let machine = match p.machine(&workspace.machine) {
             Some(m) => m,
             None => continue, // mis-configured workspace, skip silently
         };
         let is_remote = !machine.host().is_local();
+        // Only a dev workspace's own in-progress task marks it active; review
+        // slots were skipped above, so no Review-column scan is needed here.
         let assigned_task = in_progress
             .iter()
-            .find(|tf| tf.task.assigned_to.as_deref() == Some(workspace.name.as_str()))
-            .or_else(|| {
-                // Only review slots pick up a Review-column task as their
-                // active work; a dev workspace pinned to a queued Review task
-                // has already closed its session (spec §16) and reads idle.
-                if !p.effective_tags(workspace).contains("review") {
-                    return None;
-                }
-                review_col
-                    .iter()
-                    .find(|tf| tf.task.assigned_to.as_deref() == Some(workspace.name.as_str()))
-            });
+            .find(|tf| tf.task.assigned_to.as_deref() == Some(workspace.name.as_str()));
         let current_task = assigned_task.map(|tf| tf.task.id.clone());
         // Mirror `shelbi workspace list`'s AGENT column: take the task's
         // frontmatter `agent:` when present (matching the lookup the
         // task-start path uses to load agent instructions/skills), and
-        // fall back to the project's default task agent. A review workspace
-        // always loads the `review` agent, whatever the task pinned for dev.
-        // Idle workspaces get `None` — the renderer surfaces "idle" in that
-        // case rather than the default agent name.
+        // fall back to the project's default task agent. Idle workspaces get
+        // `None` — the renderer surfaces "idle" in that case rather than the
+        // default agent name.
         let agent = assigned_task.map(|tf| {
-            if p.effective_tags(workspace).contains("review") {
-                shelbi_state::REVIEW_AGENT.to_string()
-            } else {
-                tf.task
-                    .param_str("agent")
-                    .map(str::to_string)
-                    .unwrap_or_else(|| DEFAULT_TASK_AGENT.to_string())
-            }
+            tf.task
+                .param_str("agent")
+                .map(str::to_string)
+                .unwrap_or_else(|| DEFAULT_TASK_AGENT.to_string())
         });
         let badge = derive_workspace_badge(&workspace.name, current_task.is_some());
         out.push(WorkspaceOverview {
@@ -1287,6 +1284,37 @@ mod tests {
         std::env::remove_var("SHELBI_HOME");
     }
 
+    /// AC1: a `review`-tagged slot never appears under `— Workspaces —`; only
+    /// dev workspaces list there, whether or not the project declares review
+    /// slots.
+    #[test]
+    fn load_workspaces_excludes_review_tagged_slots() {
+        let _g = TEST_LOCK.lock().unwrap();
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+
+        let mut project = fixture_project();
+        project.workspaces.push(WorkspaceSpec {
+            name: "rev-1".into(),
+            machine: "hub".into(),
+            runner: "claude".into(),
+            tags: vec!["review".into()],
+            slot: None,
+        });
+        shelbi_state::save_project(&project).unwrap();
+
+        let workspaces = load_workspaces("demo").unwrap();
+        let names: Vec<_> = workspaces.iter().map(|w| w.name.as_str()).collect();
+        assert!(names.contains(&"alpha"), "dev workspace listed: {names:?}");
+        assert!(names.contains(&"delta"), "dev workspace listed: {names:?}");
+        assert!(
+            !names.contains(&"rev-1"),
+            "review slot must be absent from the Workspaces section: {names:?}"
+        );
+
+        std::env::remove_var("SHELBI_HOME");
+    }
+
     #[test]
     fn rows_include_workspaces_with_idle_and_working_badges() {
         let _g = TEST_LOCK.lock().unwrap();
@@ -1500,12 +1528,12 @@ mod tests {
     }
 
     #[test]
-    fn review_workspace_row_shows_review_agent_when_serving_a_loaded_task() {
-        // Spec §16 mockup: a review slot with a task loaded onto it reads
-        // `Review` / active on its Workspaces-section row, not `idle` — even
-        // though the loaded task lives in the Review column (never
-        // in-progress). A dev workspace pinned to a Review task, by contrast,
-        // has closed its session and reads idle.
+    fn review_slot_is_absent_from_workspaces_even_when_serving_a_loaded_task() {
+        // AC1: the Workspaces section lists dev slots only. Even a review slot
+        // actively serving a loaded task (its task in the Review column,
+        // assigned to it) must not appear there — its capacity lives in the
+        // Ready/Queued for Review sections instead. This exercises the
+        // "project *with* review workspaces" branch of the criterion.
         let _g = TEST_LOCK.lock().unwrap();
         let home = fresh_home();
         std::env::set_var("SHELBI_HOME", &home);
@@ -1536,17 +1564,10 @@ mod tests {
         .unwrap();
 
         let workspaces = load_workspaces("demo").unwrap();
-        let review = workspaces.iter().find(|w| w.name == "review-1").unwrap();
-        assert_eq!(
-            review.agent.as_deref(),
-            Some("review"),
-            "a serving review slot surfaces the `review` agent, not a dev default"
-        );
-        assert_eq!(review.current_task.as_deref(), Some("loaded"));
-        assert_ne!(
-            review.badge,
-            WorkspaceBadge::Idle,
-            "a serving review slot is active, not idle"
+        assert!(
+            workspaces.iter().all(|w| w.name != "review-1"),
+            "review slot must not surface under Workspaces, got: {:?}",
+            workspaces.iter().map(|w| &w.name).collect::<Vec<_>>()
         );
 
         std::env::remove_var("SHELBI_HOME");
