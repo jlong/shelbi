@@ -4,7 +4,6 @@ use std::path::{Path, PathBuf};
 use anyhow::{anyhow, bail, Context, Result};
 use clap::{Args as ClapArgs, ValueEnum};
 use inquire::Select;
-use shelbi_core::WorkspaceNamePreset;
 use shelbi_state::AgentMaterializeOutcome;
 
 use crate::project_root::{
@@ -84,20 +83,6 @@ pub struct Args {
     #[arg(long, alias = "remote", value_name = "URL")]
     pub(crate) github_url: Option<String>,
 
-    /// Number of development workspaces to generate in `-y` mode. A separate
-    /// review workspace is always added.
-    #[arg(
-        long,
-        alias = "workspaces",
-        value_name = "COUNT",
-        value_parser = clap::value_parser!(u32).range(1..)
-    )]
-    pub(crate) workspace_count: Option<u32>,
-
-    /// Workspace naming preset in `-y` mode: phonetic, greek, or toy-story.
-    #[arg(long, value_name = "PRESET", value_parser = parse_workspace_preset)]
-    pub(crate) workspace_preset: Option<WorkspaceNamePreset>,
-
     /// Override the orchestrator runner in `-y` mode. Defaults to `--runner`
     /// (or the single detected runner) and must also be installed on PATH.
     #[arg(long, value_enum, value_name = "RUNNER")]
@@ -131,16 +116,8 @@ impl Args {
         self.runner.is_some()
             || self.default_branch.is_some()
             || self.github_url.is_some()
-            || self.workspace_count.is_some()
-            || self.workspace_preset.is_some()
             || self.orchestrator_runner.is_some()
     }
-}
-
-fn parse_workspace_preset(value: &str) -> std::result::Result<WorkspaceNamePreset, String> {
-    value
-        .parse::<WorkspaceNamePreset>()
-        .map_err(|error| error.to_string())
 }
 
 pub fn run(args: Args, assume_yes: bool) -> Result<()> {
@@ -216,8 +193,6 @@ fn run_detected_plan(args: Args) -> Result<()> {
         default_branch: args.default_branch,
         remote_url: args.github_url,
         orchestrator_runner: args.orchestrator_runner,
-        workspace_count: args.workspace_count,
-        workspace_preset: args.workspace_preset,
     })?;
     match wizard::accept_setup_plan(plan)? {
         wizard::SetupOutcome::Created(_) => Ok(()),
@@ -1588,8 +1563,6 @@ mod tests {
             runner: None,
             default_branch: None,
             github_url: None,
-            workspace_count: None,
-            workspace_preset: None,
             orchestrator_runner: None,
             mode: None,
             pick_up: true,

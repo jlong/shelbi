@@ -259,10 +259,8 @@ fn yes_mode_with_one_runner_initializes_git_while_stdin_is_open() {
     let project = load_project(&home, "demo");
     assert_eq!(project.default_branch, "develop");
     assert_eq!(project.orchestrator.runner, "claude");
-    assert!(project
-        .workspaces
-        .iter()
-        .all(|workspace| workspace.runner == "claude"));
+    // The pool is provisioned by the orchestrator's first-boot interview.
+    assert!(project.workspaces.is_empty());
     let branch = Command::new(real_program("git"))
         .args(["branch", "--show-current"])
         .current_dir(&repo)
@@ -364,10 +362,8 @@ fn ambiguous_runners_fail_without_state_until_runner_flag_resolves_them() {
     );
     let project = load_project(&resolved_home, "ambiguous");
     assert_eq!(project.orchestrator.runner, "codex");
-    assert!(project
-        .workspaces
-        .iter()
-        .all(|workspace| workspace.runner == "codex"));
+    // The pool is provisioned by the orchestrator's first-boot interview.
+    assert!(project.workspaces.is_empty());
 }
 
 #[test]
@@ -511,10 +507,6 @@ fn all_explicit_plan_flags_override_detected_defaults() {
             "develop",
             "--github-url",
             "https://user:secret@github.com/example/scripted.git?token=hidden",
-            "--workspace-count",
-            "2",
-            "--workspace-preset",
-            "toy-story",
             "--orchestrator-runner",
             "claude",
         ],
@@ -534,14 +526,9 @@ fn all_explicit_plan_flags_override_detected_defaults() {
         Some("https://github.com/example/scripted.git")
     );
     assert_eq!(project.orchestrator.runner, "claude");
-    assert_eq!(project.workspaces.len(), 3);
-    assert_eq!(project.workspaces[0].name, "woody");
-    assert_eq!(project.workspaces[1].name, "buzz");
-    assert_eq!(project.workspaces[2].name, "review");
-    assert!(project
-        .workspaces
-        .iter()
-        .all(|workspace| workspace.runner == "codex"));
+    // Workspace provisioning moved to the orchestrator's first-boot interview,
+    // so a freshly-init'd project ships with an empty pool.
+    assert!(project.workspaces.is_empty());
 }
 
 #[test]
