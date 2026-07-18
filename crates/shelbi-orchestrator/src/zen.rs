@@ -454,12 +454,18 @@ fn pr_create_impl(
     };
     if !remote_is_reviewed_ancestor {
         return Err(Error::Other(format!(
-            "remote task branch `{branch}` moved to {}, expected reviewed head {}, published \
-             integration {}, or pre-rebase head {}; refusing to replace the concurrent update",
-            remote_task_head.as_deref().unwrap_or(""),
+            "remote task branch `{branch}` moved to {}, which is none of the reviewed head {}, \
+             the published integration {}, or the pre-rebase tip {} the probe recorded; refusing \
+             to replace what looks like a concurrent update. Re-run `shelbi zen probe {}` — the \
+             probe re-reads the live remote tip, so if the branch has simply settled at a new \
+             commit the fresh report reconciles it. If this recurs, an actor outside this flow is \
+             pushing to `{branch}`; stop that push (or reassign the branch) before retrying, \
+             because Zen will keep refusing to overwrite an unreviewed remote head.",
+            remote_task_head.as_deref().unwrap_or("(deleted)"),
             expected.head_sha,
             expected.integration_sha,
-            published_head.unwrap_or("(none)")
+            published_head.unwrap_or("(none)"),
+            task.id
         )));
     }
     let lease = format!(
@@ -4007,6 +4013,93 @@ esac
     }
 
     #[test]
+    fn reprobed_branch_keeps_the_still_published_remote_tip_across_probes() {
+        // Regression for the dead-end this task fixes. The first probe rebases
+        // the branch onto a moved base, advancing the durable *local* ref to a
+        // never-pushed commit while the remote tip stays at the pre-rebase
+        // head. A *second* probe then runs (main moved again, or the
+        // orchestrator simply re-probed). Its `initial_head` is now the first
+        // probe's rebased local ref — a commit the remote never saw — so
+        // recording that as the published head would leave `pr-create` unable
+        // to reconcile the genuine remote tip with any pin, looping on
+        // "re-run probe". The published head must instead track the live remote
+        // tip, which never moved.
+        let _lock = crate::test_lock::acquire();
+        let (base, origin, worktree) = setup_repo(true);
+        let published_head = remote_head(&origin);
+        assert_eq!(task_branch_head(&worktree), published_head);
+        // Handoff detaches the finished worktree so the probe may advance the
+        // durable ref in its own isolated checkout.
+        run_git(&worktree, &["checkout", "-q", "--detach"]);
+
+        // The base advances once after the branch was pushed. Only the first
+        // probe rebases; the second finds the branch already on the base.
+        advance_origin_main_with_base_fix(base.path(), &origin);
+
+        let project = project(base.path());
+        let stub = tempfile::tempdir().unwrap();
+        let log = install_gh_stub(stub.path(), &origin, None, None);
+        let (first, second, result) = {
+            let _env = EnvGuard::install(stub.path());
+            let first = probe_in_workflow(
+                &project,
+                None,
+                &task(),
+                TASK_BRANCH,
+                RebasePolicy::RebaseOntoDefault,
+            )
+            .unwrap();
+            // Re-probe with no further base movement: this is where the old
+            // code lost the remote tip, because `initial_head` is now `first`'s
+            // rebased (never-pushed) local ref.
+            let second = probe_in_workflow(
+                &project,
+                None,
+                &task(),
+                TASK_BRANCH,
+                RebasePolicy::RebaseOntoDefault,
+            )
+            .unwrap();
+            let identity = report_identity(&second);
+            let result = pr_create_impl(
+                &project,
+                PROJECT_NAME,
+                &task(),
+                "body",
+                &identity,
+                fast_head_retry(),
+            );
+            (first, second, result)
+        };
+
+        // The first probe rebased away from the published tip; the second found
+        // the branch already rebased and did not move it further.
+        assert_ne!(first.head_sha, published_head, "the first probe must rebase");
+        assert_eq!(
+            second.head_sha, first.head_sha,
+            "the re-probe must not move the already-rebased head"
+        );
+        // Both probes report the *same* still-published remote tip — the second
+        // must not substitute its diverged local `initial_head`.
+        assert_eq!(first.published_head_sha, published_head);
+        assert_eq!(
+            second.published_head_sha, published_head,
+            "the re-probe must carry the live remote tip, not the local ref it inherited"
+        );
+
+        // With the honest pin, pr-create publishes over the pre-rebase remote
+        // tip instead of dead-ending on the concurrent-update guard.
+        assert_eq!(result.unwrap(), 42);
+        assert_eq!(
+            remote_head(&origin),
+            second.integration_sha,
+            "pr-create must replace the still-published remote tip with the reviewed \
+             integration commit"
+        );
+        assert!(gh_calls(&log).contains("pr create"), "should open a fresh PR");
+    }
+
+    #[test]
     fn open_pr_targeting_wrong_base_is_rejected() {
         let _lock = crate::test_lock::acquire();
         let (base, origin, worktree) = setup_repo(true);
@@ -4772,14 +4865,19 @@ pub struct ProbeReport {
     /// workflow, origin, or PR move after the probe makes the flow refuse
     /// instead of publishing, grading, or landing unchecked content.
     pub head_sha: String,
-    /// The branch tip this probe started from, before its optional rebase.
-    /// Equals `head_sha` when no rebase moved the branch. When a clean rebase
-    /// advanced `head_sha` to a never-pushed local commit, this stays the
-    /// still-published pre-rebase head — the OID the remote task branch is
-    /// expected to point at. The orchestrator hands it to `shelbi zen
-    /// pr-create` as `--match-published-head-commit` so the publish guard
-    /// recognizes the pre-rebase remote tip as the flow's own prior state
-    /// rather than a concurrent update.
+    /// The OID the remote task branch actually points at, read from the remote
+    /// at probe time (falling back to the local pre-rebase head when the branch
+    /// has no remote tip yet). Equals `head_sha` when nothing moved the branch.
+    /// When a clean rebase advanced `head_sha` to a never-pushed local commit,
+    /// this stays the still-published remote tip. It is read from the remote —
+    /// not assumed equal to the local pre-rebase ref — because a *prior* probe
+    /// may already have CAS-advanced the local ref past the remote, so on a
+    /// re-probe the inherited local head is itself unpublished. The
+    /// orchestrator hands this to `shelbi zen pr-create` as
+    /// `--match-published-head-commit` so the publish guard recognizes the
+    /// remote tip as the flow's own prior state rather than a concurrent
+    /// update, and so a genuine concurrent push (remote moved *since* the
+    /// probe) still fails closed.
     pub published_head_sha: String,
     pub local_checks: Vec<LocalCheck>,
     pub merge_conflict: ConflictProbe,
@@ -4861,7 +4959,7 @@ pub fn probe_in_workflow(
     let host = machine.host();
     let repository_anchor = workspace_worktree(&machine, workspace);
     let repository_anchor_string = repository_anchor.to_string_lossy();
-    let repository =
+    let (repository, origin_push_target) =
         lookup_probe_repository_identity(&host, repository_anchor_string.as_ref())?;
     let shared_cargo_target = machine.work_dir.join("target");
     let shared_node_cache = machine.work_dir.join(".shelbi/cache/zen-node");
@@ -4869,6 +4967,27 @@ pub fn probe_in_workflow(
     let task_ref = format!("refs/heads/{branch}");
     let initial_head =
         probe_head_sha(&host, &repository_anchor, &format!("{task_ref}^{{commit}}"))?;
+
+    // The report's `published_head_sha` is the OID the *remote* task branch is
+    // expected to still point at when `pr-create` publishes — read it from the
+    // remote, not from the durable local ref. A prior probe may already have
+    // CAS-advanced the local ref past the remote (a clean rebase moves the
+    // local ref but never pushes), so `initial_head` on a *re-probe* is a
+    // never-published commit. Recording that as the published head is what
+    // dead-ended `pr-create`: the concurrent-update guard then had no pin that
+    // matched the genuine remote tip, and re-probing only re-diverged the ref.
+    // Reading the live remote keeps the pin honest across re-probes so the
+    // guard still distinguishes the flow's own rebase (remote unchanged since
+    // the probe) from a real concurrent push (remote moved). A branch with no
+    // remote tip yet (never pushed, or a local-only repo) falls back to the
+    // local pre-rebase head, which is all `pr-create` can lease against anyway.
+    let published_head = optional_remote_branch_sha(
+        &host,
+        repository_anchor_string.as_ref(),
+        &origin_push_target,
+        &branch,
+    )?
+    .unwrap_or_else(|| initial_head.clone());
 
     // Handoff detaches a finished task and immediately makes its workspace
     // reusable. The assigned path may therefore be checked out on a wholly
@@ -4891,6 +5010,7 @@ pub fn probe_in_workflow(
             &branch,
             &task_ref,
             &initial_head,
+            &published_head,
             &base_branch,
             &repository,
             policy,
@@ -4922,6 +5042,7 @@ fn probe_isolated_task_ref(
     branch: &str,
     task_ref: &str,
     initial_head: &str,
+    published_head: &str,
     base_branch: &str,
     repository: &RepositoryIdentity,
     policy: RebasePolicy,
@@ -5050,11 +5171,14 @@ fn probe_isolated_task_ref(
         base_sha,
         integration_sha,
         head_sha,
-        // `initial_head` is the branch tip before the optional rebase above.
-        // A clean rebase advanced `head_sha` past it in this isolated
-        // worktree, but the durable ref was CAS-advanced to `head_sha` only;
-        // the remote task branch (if any) still points at `initial_head`.
-        published_head_sha: initial_head.to_string(),
+        // The still-published remote tip, resolved from the remote in
+        // `probe_in_workflow`. A clean rebase advanced `head_sha` past the
+        // local ref in this isolated worktree, but the durable ref was
+        // CAS-advanced to `head_sha` only; the remote task branch (if any)
+        // still points at `published_head`. Read from the remote rather than
+        // assumed equal to `initial_head` so it stays correct after a re-probe
+        // whose prior rebase already moved the local ref off the remote tip.
+        published_head_sha: published_head.to_string(),
         local_checks,
         merge_conflict,
         rebase_conflict,
@@ -5666,12 +5790,17 @@ fn resolve_probe_base(
     crate::lifecycle::resolve_base_branch(project, workflow, task, &all_tasks)
 }
 
+/// Resolve the probe's origin identity together with the exact push target
+/// that produced it. The push target is the credential-free remote the probe
+/// reads the still-published task tip from (see [`optional_remote_branch_sha`]
+/// in `probe_in_workflow`), so it must be resolved once alongside the identity
+/// rather than re-derived from a mutable remote name later.
 fn lookup_probe_repository_identity(
     host: &Host,
     repository_anchor: &str,
-) -> Result<RepositoryIdentity> {
-    match lookup_origin_repository(host, repository_anchor) {
-        Ok(repository) => Ok(repository),
+) -> Result<(RepositoryIdentity, String)> {
+    match lookup_origin_repository_with_push_target(host, repository_anchor) {
+        Ok(resolved) => Ok(resolved),
         Err(github_error) => {
             // Hermetic/local-only probes have no GitHub object id. Preserve a
             // deterministic identity for their filesystem origin; network
@@ -5680,12 +5809,17 @@ fn lookup_probe_repository_identity(
             if !std::path::Path::new(&selector).is_absolute() {
                 return Err(github_error);
             }
-            Ok(RepositoryIdentity {
-                id: format!("local:{selector}"),
-                name_with_owner: selector.clone(),
+            Ok((
+                RepositoryIdentity {
+                    id: format!("local:{selector}"),
+                    name_with_owner: selector.clone(),
+                    selector: selector.clone(),
+                    host: "local".into(),
+                },
+                // A local filesystem origin is its own credential-free push
+                // target, usable directly as an `ls-remote` remote.
                 selector,
-                host: "local".into(),
-            })
+            ))
         }
     }
 }
