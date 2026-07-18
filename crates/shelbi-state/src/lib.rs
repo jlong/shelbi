@@ -92,7 +92,7 @@ pub use workflows::{
 };
 pub use event_log::{
     append_clarification_event, append_dispatch_event, append_external_event,
-    append_heartbeat_event, append_integration_event, append_limit_resume_event,
+    append_handoff_event, append_heartbeat_event, append_integration_event, append_limit_resume_event,
     append_message_ack_event, append_message_event, append_project_event, append_rebase_event,
     append_send_event, append_supervision_event, append_task_event, append_workspace_dialog_event,
     append_workspace_event, append_workspace_pane_event, append_workspace_pause_event,

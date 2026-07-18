@@ -958,6 +958,29 @@ pub fn append_project_event(project: &str, action: &str, reason: &str) -> Result
     append_event_line(&format!("{ts} project={project} {action} reason={reason}"))
 }
 
+/// Append `<rfc3339> project=<project> handoff outcome=<outcome> detail=<detail>`
+/// to `~/.shelbi/events.log`. Emitted once per orchestrator handoff attempt on
+/// every teardown/reload path (quit, quit-project, reload), so a failed or
+/// unconfirmed handoff is diagnosable post-hoc — the whole flow was previously
+/// invisible in the log.
+///
+/// `outcome` is a short stable token describing the handoff verdict
+/// (`written`, `native-thread`, `pane-not-alive`, `timeout`, `send-failed`,
+/// `unconfirmed`); `detail` carries the written path, the send-error reason, or
+/// the submission-verification detail (`-` when there's nothing extra to say).
+/// Both are folded to single tokens so the line stays parseable. The leading
+/// `project=<name>` scope matches every other event so a hub-global tail can
+/// tell two projects' handoffs apart.
+pub fn append_handoff_event(project: &str, outcome: &str, detail: &str) -> Result<()> {
+    let ts = Utc::now().to_rfc3339();
+    let project = sanitize_field(project);
+    let outcome = sanitize_reason(outcome);
+    let detail = sanitize_reason(detail);
+    append_event_line(&format!(
+        "{ts} project={project} handoff outcome={outcome} detail={detail}"
+    ))
+}
+
 /// Append a per-agent integration-mode transition to `~/.shelbi/events.log`:
 ///
 /// ```text
@@ -1931,6 +1954,29 @@ mod tests {
             messages,
             sanitize_reason(reason),
         )
+    }
+
+    #[test]
+    fn handoff_event_line_is_scoped_parseable_and_sanitized() {
+        let _g = TEST_LOCK.lock().unwrap();
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+
+        // A reason with whitespace/newlines must fold to a single token so the
+        // line stays a parseable one-record `key=value` log entry.
+        append_handoff_event("alpha", "send-failed", "pane gone\naway").unwrap();
+
+        let log = std::fs::read_to_string(events_log_path().unwrap()).unwrap();
+        let line = log.trim_end();
+        assert!(
+            line.contains("project=alpha handoff outcome=send-failed"),
+            "unexpected handoff line: {line}"
+        );
+        assert!(line.contains("detail=pane_gone_away"), "detail not folded: {line}");
+        assert_eq!(line.lines().count(), 1, "handoff event must be one line: {line}");
+
+        std::env::remove_var("SHELBI_HOME");
+        let _ = std::fs::remove_dir_all(&home);
     }
 
     #[test]

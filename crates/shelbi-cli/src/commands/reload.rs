@@ -251,6 +251,12 @@ fn print_handoff(outcome: &HandoffOutcome) {
         HandoffOutcome::SendFailed { reason } => {
             println!("  ⚠ handoff   couldn't ask the orchestrator: {reason}");
         }
+        HandoffOutcome::SubmitUnconfirmed { detail } => {
+            println!(
+                "  ⚠ handoff   request delivered but not confirmed submitted \
+                 ({detail}); next start may be cold"
+            );
+        }
     }
 }
 
