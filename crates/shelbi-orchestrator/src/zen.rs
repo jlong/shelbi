@@ -3354,6 +3354,29 @@ esac
         run_git(&bump, &["push", "-q", "origin", "main"]);
     }
 
+    /// Advance origin/main past the task branch's base *and* land the task
+    /// branch's own content under a different squash SHA. The task commit adds
+    /// `task.txt` with `initial task work\n` (see `setup_repo`); re-adding a
+    /// new `task.txt` with identical bytes produces a patch-id-equivalent
+    /// commit, modelling a GitHub squash-merge. A follow-up commit pushes the
+    /// branch further behind so the stale-base signature is unambiguous.
+    fn squash_merge_task_content_into_origin_main(base: &Path, origin: &Path) {
+        let bump = base.join("advance-main-already-merged");
+        run_git(
+            base,
+            &["clone", "-q", origin.to_str().unwrap(), bump.to_str().unwrap()],
+        );
+        run_git(&bump, &["config", "user.email", "test@example.com"]);
+        run_git(&bump, &["config", "user.name", "Test"]);
+        std::fs::write(bump.join("task.txt"), "initial task work\n").unwrap();
+        run_git(&bump, &["add", "task.txt"]);
+        run_git(&bump, &["commit", "-q", "-m", "squash-merge task content (#123)"]);
+        std::fs::write(bump.join("later.txt"), "later unrelated work\n").unwrap();
+        run_git(&bump, &["add", "later.txt"]);
+        run_git(&bump, &["commit", "-q", "-m", "later unrelated work"]);
+        run_git(&bump, &["push", "-q", "origin", "main"]);
+    }
+
     /// Rewrite the reviewed task tip so the local and remote branches become
     /// siblings. A normal push must reject this rather than overwrite the
     /// stale remote PR branch.
@@ -3534,6 +3557,19 @@ esac
                 lines_removed: 0,
             }
         );
+        // Divergence is measured from the *published* pre-rebase head (cut from
+        // the old base), so it still sees the one genuine commit ahead and the
+        // one commit the base advanced by — and correctly reports it as not
+        // already merged.
+        assert_eq!(
+            report.branch_divergence,
+            BranchDivergence {
+                ahead: 1,
+                behind: 1,
+                ahead_already_in_base: 0,
+                already_merged: false,
+            }
+        );
         assert_eq!(report.danger_paths.matched, vec!["task.txt"]);
         assert_eq!(report.local_checks.len(), 1);
         assert_eq!(report.local_checks[0].exit_code, 0);
@@ -3588,6 +3624,63 @@ esac
             calls.contains("pr view 42 --repo github.com/example/repo --json headRefOid,headRefName,baseRefName,baseRefOid,headRepository"),
             "{calls}"
         );
+    }
+
+    #[test]
+    fn probe_flags_a_branch_whose_content_is_already_merged_into_a_moved_base() {
+        let _lock = crate::test_lock::acquire();
+        let (base, origin, worktree) = setup_repo(false);
+        let published_head = task_branch_head(&worktree);
+        // Handoff detaches the finished checkout; the task branch ref must not
+        // stay checked out or the probe refuses to advance it.
+        run_git(&worktree, &["checkout", "-q", "--detach"]);
+        // main moves past the branch's base and lands the branch's own content
+        // under a fresh squash SHA — the exact stale-base / already-merged case.
+        squash_merge_task_content_into_origin_main(base.path(), &origin);
+
+        let project = project(base.path());
+        let stub = tempfile::tempdir().unwrap();
+        let _log = install_gh_stub(stub.path(), &origin, None, None);
+        let report = {
+            let _env = EnvGuard::install(stub.path());
+            probe_in_workflow(
+                &project,
+                None,
+                &task(),
+                TASK_BRANCH,
+                RebasePolicy::RebaseOntoDefault,
+            )
+            .unwrap()
+        };
+
+        // Rebasing onto the moved base drops the redundant (already-applied)
+        // commit, collapsing the isolated checkout onto the base. The old probe
+        // stopped here and reported a clean, empty, conflict-free change.
+        assert_eq!(report.head_sha, report.base_sha);
+        assert_eq!(report.diff_size, DiffSize::default());
+        assert!(!report.merge_conflict.conflicts);
+        assert!(!report.rebase_conflict.conflicts);
+
+        // Divergence is measured from the *published* head (still carrying the
+        // commit), so it exposes the redundancy the empty diff hid: one commit
+        // ahead, that same commit already present in the base by patch-id, and
+        // two commits behind the moved base.
+        assert_eq!(report.published_head_sha, published_head);
+        assert!(
+            report.branch_divergence.already_merged,
+            "expected already_merged, got {:?}",
+            report.branch_divergence
+        );
+        assert_eq!(report.branch_divergence.ahead, 1);
+        assert_eq!(report.branch_divergence.ahead_already_in_base, 1);
+        assert_eq!(report.branch_divergence.behind, 2);
+
+        // The stale/redundant signal is actionable: the dry-run gate blocks the
+        // merge with an `already-merged` reason instead of waving the tiny diff
+        // through.
+        let decision = evaluate_probe("t", &report);
+        assert_eq!(decision.action, DryRunAction::BlockMerge);
+        assert_eq!(decision.detail, "already-merged");
     }
 
     #[test]
@@ -4594,6 +4687,37 @@ pub struct DiffSize {
     pub lines_removed: usize,
 }
 
+/// The probed branch head's commit-graph relationship to the resolved base.
+///
+/// `diff_size` alone can't distinguish a normal small change from a stale or
+/// already-merged branch: a branch whose one commit was already squash-merged
+/// into the base under a different SHA still shows a small, clean three-dot
+/// diff against its (old) merge base. These counts, computed from the
+/// *published branch head* against the current base, expose that case.
+#[derive(Debug, Clone, Default, Serialize, PartialEq, Eq)]
+pub struct BranchDivergence {
+    /// Commits the branch head carries that the base lacks
+    /// (`git rev-list --count base..head`). Zero means the branch tip is an
+    /// ancestor of the base — nothing new to land.
+    pub ahead: usize,
+    /// Commits the base carries that the branch head lacks — how far the base
+    /// has moved on since the branch was cut (`git rev-list --count
+    /// head..base`).
+    pub behind: usize,
+    /// Of the `ahead` commits, how many are already present in the base by
+    /// `git patch-id` equivalence (`git cherry base head` lines prefixed `-`).
+    /// A squash-merge lands identical content under a fresh SHA, so these
+    /// commits are byte-for-byte redundant even though their OIDs differ.
+    pub ahead_already_in_base: usize,
+    /// Every commit the branch carries is already present in the base by
+    /// patch-id: merging adds nothing (and, against a base that has moved on,
+    /// can revert already-landed work). True only when `ahead > 0` and
+    /// `ahead_already_in_base == ahead`. This is the stale-base / redundant
+    /// signature — set even when `diff_size` looks like a small clean change,
+    /// so a caller can distinguish it from a normal mergeable diff.
+    pub already_merged: bool,
+}
+
 /// Subset of the branch's changed files that match one of the project's
 /// configured danger globs (built-ins plus extends / override per
 /// [`shelbi_core::danger_paths_for_project`]).
@@ -4645,6 +4769,11 @@ pub struct ProbeReport {
     /// local checks were skipped — `files` names the conflicting paths.
     pub rebase_conflict: ConflictProbe,
     pub diff_size: DiffSize,
+    /// Ahead/behind and patch-id redundancy of the published branch head
+    /// against the current base. Lets a caller flag a stale-base or
+    /// already-merged branch that `diff_size` alone would report as a normal
+    /// small clean change.
+    pub branch_divergence: BranchDivergence,
     pub danger_paths: DangerPaths,
 }
 
@@ -4830,6 +4959,16 @@ fn probe_isolated_task_ref(
     }
     let merge_conflict = probe_merge_conflict(host, probe_worktree, &head_sha, &base_sha)?;
     let diff_size = probe_diff_size(host, probe_worktree, &head_sha, &base_sha)?;
+    // Divergence is measured from `initial_head` — the *published* branch head,
+    // before this probe's optional rebase — not from `head_sha`. Under
+    // `RebaseOntoDefault` a redundant commit whose content is already in the
+    // base is rebased *away*, so the post-rebase `head_sha` collapses onto the
+    // base and would report zero divergence and an empty diff (the exact
+    // stale-base miss this signal exists to catch). The pre-rebase published
+    // head still carries the commit, so `git cherry` can spot it as patch-id
+    // redundant against the base.
+    let branch_divergence =
+        probe_branch_divergence(host, probe_worktree, initial_head, &base_sha)?;
     let danger_paths = probe_danger_paths(
         project,
         workflow,
@@ -4899,6 +5038,7 @@ fn probe_isolated_task_ref(
         merge_conflict,
         rebase_conflict,
         diff_size,
+        branch_divergence,
         danger_paths,
     })
 }
@@ -6932,6 +7072,76 @@ pub fn parse_shortstat(s: &str) -> DiffSize {
 fn strip_suffix_then_parse(s: &str, suffix: &str) -> Option<usize> {
     s.strip_suffix(suffix)
         .and_then(|head| head.trim().parse::<usize>().ok())
+}
+
+// ---------------------------------------------------------------------------
+// branch_divergence
+
+/// Compute how the published branch `head` diverges from `base` and how much
+/// of what it carries the base already has.
+///
+/// `head` is the frozen published branch head (the same OID `diff_size` and
+/// the PR flow use), never the workspace's live checkout — so a real one-commit
+/// branch can never report zero divergence just because its slot was recycled
+/// to a checkout sitting at the base.
+fn probe_branch_divergence(
+    host: &Host,
+    worktree: &std::path::Path,
+    head: &str,
+    base: &str,
+) -> Result<BranchDivergence> {
+    let wt = worktree.to_string_lossy().into_owned();
+
+    // `--left-right --count base...head` prints "<left>\t<right>": left =
+    // commits reachable from `base` but not `head` (behind), right = commits
+    // reachable from `head` but not `base` (ahead).
+    let range = format!("{base}...{head}");
+    let counts = shelbi_ssh::run_capture(
+        host,
+        [
+            "git",
+            "-C",
+            wt.as_str(),
+            "rev-list",
+            "--left-right",
+            "--count",
+            range.as_str(),
+        ],
+    )?;
+    let mut fields = counts.split_whitespace();
+    let behind = fields
+        .next()
+        .and_then(|s| s.parse::<usize>().ok())
+        .unwrap_or(0);
+    let ahead = fields
+        .next()
+        .and_then(|s| s.parse::<usize>().ok())
+        .unwrap_or(0);
+
+    // `git cherry <base> <head>` lists each commit on `head` not reachable from
+    // `base`, one per line, prefixed `-` when an equivalent patch (by
+    // `git patch-id`) already exists in `base` and `+` when it is genuinely
+    // new. A squash-merge relands identical content under a fresh SHA, so those
+    // commits are patch-id equivalent and show up as `-` even though their OIDs
+    // differ. Counting the `-` lines tells us how much of the branch's content
+    // the base already carries.
+    let cherry = shelbi_ssh::run_capture(host, ["git", "-C", wt.as_str(), "cherry", base, head])?;
+    let ahead_already_in_base = cherry
+        .lines()
+        .filter(|line| line.trim_start().starts_with('-'))
+        .count();
+
+    // Only meaningful when the branch actually carries commits: a branch with
+    // nothing ahead has no content to be redundant. When every ahead commit is
+    // already present, merging is a no-op (or a revert against a moved base).
+    let already_merged = ahead > 0 && ahead_already_in_base == ahead;
+
+    Ok(BranchDivergence {
+        ahead,
+        behind,
+        ahead_already_in_base,
+        already_merged,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -10671,6 +10881,25 @@ pub fn evaluate_probe(task_id: &str, report: &ProbeReport) -> DryRunDecision {
             explanation: format!("merge conflict in: {files}"),
         };
     }
+    // A stale-base / already-merged branch shows a small, clean, conflict-free
+    // three-dot diff, so it slips past every size and conflict gate above. Its
+    // content is already in the base by patch-id, so merging is a redundant
+    // no-op (or a revert of already-landed work). Block it before the diff-size
+    // gate, which would otherwise wave the misleadingly tiny diff through.
+    if report.branch_divergence.already_merged {
+        return DryRunDecision {
+            action: DryRunAction::BlockMerge,
+            task_id: task_id.to_string(),
+            detail: "already-merged".into(),
+            explanation: format!(
+                "branch content already present in base by patch-id ({} of {} commit(s) \
+                 already merged, {} behind base); merging would be a no-op or revert",
+                report.branch_divergence.ahead_already_in_base,
+                report.branch_divergence.ahead,
+                report.branch_divergence.behind,
+            ),
+        };
+    }
     let total_lines = report.diff_size.lines_added + report.diff_size.lines_removed;
     if report.diff_size.files > DRYRUN_MAX_DIFF_FILES || total_lines > DRYRUN_MAX_DIFF_LINES {
         return DryRunDecision {
@@ -10730,6 +10959,12 @@ mod dry_run_tests {
                 files: 3,
                 lines_added: 40,
                 lines_removed: 5,
+            },
+            branch_divergence: BranchDivergence {
+                ahead: 1,
+                behind: 0,
+                ahead_already_in_base: 0,
+                already_merged: false,
             },
             danger_paths: DangerPaths::default(),
         }
@@ -10815,6 +11050,42 @@ mod dry_run_tests {
         assert_eq!(d.action, DryRunAction::BlockMerge);
         assert_eq!(d.detail, "danger-path");
         assert!(d.explanation.contains(".github/workflows/ci.yml"));
+    }
+
+    #[test]
+    fn already_merged_branch_blocks_merge_despite_tiny_clean_diff() {
+        // The stale-base signature: a small, conflict-free diff whose content
+        // is already in the base by patch-id. It must not merge even though it
+        // sails past every size and conflict gate.
+        let mut r = ok_report();
+        r.diff_size = DiffSize {
+            files: 1,
+            lines_added: 1,
+            lines_removed: 0,
+        };
+        r.branch_divergence = BranchDivergence {
+            ahead: 1,
+            behind: 7,
+            ahead_already_in_base: 1,
+            already_merged: true,
+        };
+        let d = evaluate_probe("t", &r);
+        assert_eq!(d.action, DryRunAction::BlockMerge);
+        assert_eq!(d.detail, "already-merged");
+        assert!(d.explanation.contains("already present in base"));
+    }
+
+    #[test]
+    fn already_merged_outranks_diff_size_gate() {
+        // A redundant branch that is also oversize must report the redundancy
+        // first: "already merged" is the more fundamental reason not to land it.
+        let mut r = ok_report();
+        r.diff_size.files = DRYRUN_MAX_DIFF_FILES + 1;
+        r.branch_divergence.already_merged = true;
+        r.branch_divergence.ahead = 1;
+        r.branch_divergence.ahead_already_in_base = 1;
+        let d = evaluate_probe("t", &r);
+        assert_eq!(d.detail, "already-merged");
     }
 
     #[test]
