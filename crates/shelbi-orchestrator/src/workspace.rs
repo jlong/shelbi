@@ -58,7 +58,7 @@ fn current_exe_string() -> Result<String> {
 ///
 /// Returns the surviving records (each still `XY <path>`) so error messages
 /// keep their familiar shape.
-fn user_dirty_porcelain_lines(porcelain_z: &str) -> Vec<&str> {
+pub(crate) fn user_dirty_porcelain_lines(porcelain_z: &str) -> Vec<&str> {
     let mut out = Vec::new();
     let mut records = porcelain_z.split('\0');
     while let Some(record) = records.next() {

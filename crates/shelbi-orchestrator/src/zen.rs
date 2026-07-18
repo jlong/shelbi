@@ -16,6 +16,27 @@
 //! commit, check results, and requiredness all come from the same response.
 //! This keeps the timeout in stdlib timers and prevents head movement between
 //! separate metadata and check-result commands from authorizing a merge.
+//!
+//! ## Probe vs. the hub's primary checkout
+//!
+//! The readiness probe runs entirely inside a throwaway *detached* worktree and
+//! only advances the durable task ref (via compare-and-swap) after every fact
+//! and local check has inspected the exact reviewed commit. Advancing that ref
+//! is the one moment the probe touches shared repository state, and git refuses
+//! to move a ref that is HEAD of a live worktree.
+//!
+//! The hub's **primary** checkout (`machine.work_dir`, the repository's main
+//! worktree) can legitimately end up parked on a task branch — a human left it
+//! there, or `shelbi merge --rebase` (`integrate_branch`) ran `git rebase
+//! <target> <branch>`, which checks the branch out first and, if the rebase
+//! conflicts and bails before the follow-up `checkout <target>`, leaves the
+//! primary sitting on `<branch>`. A repo cloned without a local default branch
+//! (only `origin/main`) has no natural branch to rest on, so the primary stays
+//! pinned to whatever was last checked out. None of this involves an active
+//! worker, so [`free_task_ref_for_advance`] self-recovers by detaching the
+//! primary in place (working tree untouched) rather than dead-ending the probe.
+//! A *linked* `.shelbi/wt/*` worktree holding the branch is a real worker
+//! collision and still blocks, with a structured error naming it and the fix.
 
 use std::path::{Component, PathBuf};
 use std::process::Output;
@@ -5322,14 +5343,22 @@ fn finalize_probed_task_ref_after_scan<F: FnOnce()>(
     let _git_worktree_lock = shelbi_state::lock_git_worktrees(project_name)?;
     let anchor = repository_anchor.to_string_lossy().into_owned();
     if expected_head != probed_head {
-        let checked_out = task_ref_checkout_paths(host, repository_anchor, task_ref)?;
-        if !checked_out.is_empty() {
-            return Err(Error::Other(format!(
-                "task branch `{branch}` is still checked out in {}; refusing to advance it from \
-                 an isolated Zen probe because that would disturb another worktree",
-                checked_out.join(", ")
-            )));
-        }
+        // The rebase moved the branch, so the durable ref must be advanced.
+        // Git refuses to move a ref that is HEAD of a live worktree, and doing
+        // so would desync that worktree's HEAD from its working tree. Resolve
+        // the obstruction rather than failing outright when it's safe to:
+        //
+        //   * The hub's *primary* checkout (the repository's main worktree) is
+        //     not an active worker — it may simply be parked on this branch
+        //     (a human left it there, or an aborted `shelbi merge --rebase`
+        //     did — see the module note). Detaching it *in place* rewrites only
+        //     HEAD's symref, leaving the working tree byte-for-byte unchanged,
+        //     so the probe self-recovers instead of dead-ending on the primary
+        //     checkout's state.
+        //   * A *linked* workspace worktree holding the branch is a genuine
+        //     collision with another worker; that still blocks, with a clear
+        //     structured error naming the worktree and the remedy.
+        free_task_ref_for_advance(host, repository_anchor, branch, task_ref)?;
 
         // Test hook for the exact reviewed race: a second named checkout is
         // started after this empty scan and must remain blocked until the CAS
@@ -5401,6 +5430,129 @@ fn task_ref_checkout_paths(
         }
     }
     Ok(paths)
+}
+
+/// The repository's main (primary) worktree — the original clone directory
+/// (`machine.work_dir` in production). `git worktree list --porcelain` always
+/// lists it first, ahead of every linked worktree, so the first `worktree`
+/// entry identifies it. Distinguished from the `.shelbi/wt/*` linked worktrees
+/// because the isolated probe may safely detach the primary in place to free a
+/// task-branch ref, but must never disturb an active worker's linked worktree.
+fn probe_main_worktree_path(
+    host: &Host,
+    repository_anchor: &std::path::Path,
+) -> Result<String> {
+    let anchor = repository_anchor.to_string_lossy().into_owned();
+    let porcelain = shelbi_ssh::run_capture(
+        host,
+        ["git", "-C", &anchor, "worktree", "list", "--porcelain"],
+    )?;
+    porcelain
+        .lines()
+        .find_map(|line| line.strip_prefix("worktree ").map(str::to_string))
+        .ok_or_else(|| {
+            Error::Other(format!(
+                "git -C {anchor} worktree list --porcelain reported no worktrees; \
+                 cannot identify the repository's primary checkout"
+            ))
+        })
+}
+
+/// Clear the way to advance the durable task ref when a rebase moved `branch`.
+///
+/// If nothing holds `branch`, this is a no-op. If the only holder is the hub's
+/// primary checkout (the main worktree), detach it in place so the ref is free
+/// — safe because detaching rewrites only HEAD's symref and leaves the working
+/// tree untouched. If a linked workspace worktree holds it (an active worker),
+/// or the primary checkout has uncommitted user work we'd rather not touch,
+/// refuse with a clear, non-empty structured error that names the blocking
+/// worktree and the remedy.
+fn free_task_ref_for_advance(
+    host: &Host,
+    repository_anchor: &std::path::Path,
+    branch: &str,
+    task_ref: &str,
+) -> Result<()> {
+    let checked_out = task_ref_checkout_paths(host, repository_anchor, task_ref)?;
+    if checked_out.is_empty() {
+        return Ok(());
+    }
+
+    let main_worktree = probe_main_worktree_path(host, repository_anchor)?;
+
+    // Git allows a branch to be checked out in at most one worktree, but treat
+    // the set generally: any holder that is not the primary checkout is a
+    // linked worker worktree and blocks.
+    let linked: Vec<&String> = checked_out
+        .iter()
+        .filter(|path| **path != main_worktree)
+        .collect();
+    if !linked.is_empty() {
+        return Err(Error::Other(format!(
+            "task branch `{branch}` is still checked out in another workspace worktree ({}); \
+             refusing to advance it from an isolated Zen probe because that would disturb an \
+             active worker. Detach or reassign that worktree (e.g. `git -C <worktree> switch \
+             --detach`) and re-probe.",
+            linked
+                .iter()
+                .map(|p| p.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        )));
+    }
+
+    // Only the hub's primary checkout holds the branch. Detach it in place if
+    // it carries no user-authored changes.
+    detach_primary_checkout_for_probe(host, &main_worktree, branch)?;
+
+    // A concurrent actor could have re-claimed the ref between the detach and
+    // here; confirm it's genuinely free before the caller's compare-and-swap.
+    let still = task_ref_checkout_paths(host, repository_anchor, task_ref)?;
+    if !still.is_empty() {
+        return Err(Error::Other(format!(
+            "task branch `{branch}` was re-checked-out in {} after freeing the hub's primary \
+             checkout; refusing to advance it from an isolated Zen probe. Free the branch and \
+             re-probe.",
+            still.join(", ")
+        )));
+    }
+    Ok(())
+}
+
+/// Detach the hub's primary checkout (the main worktree) in place so a
+/// task-branch ref it holds becomes free for the probe to advance. Refuses if
+/// the checkout has user-authored changes (shelbi's own `.claude/` / `.shelbi/`
+/// footprint is carved out) — detaching wouldn't lose them, but masking pending
+/// user work behind a silent HEAD move is worse than a clear error.
+fn detach_primary_checkout_for_probe(
+    host: &Host,
+    primary: &str,
+    branch: &str,
+) -> Result<()> {
+    let dirty = shelbi_ssh::run_capture(
+        host,
+        ["git", "-C", primary, "status", "--porcelain", "-z"],
+    )?;
+    let user_dirty = crate::workspace::user_dirty_porcelain_lines(&dirty);
+    if !user_dirty.is_empty() {
+        return Err(Error::Other(format!(
+            "task branch `{branch}` is checked out in the hub's primary checkout at {primary}, \
+             which has uncommitted changes; refusing to detach it from an isolated Zen probe. \
+             Commit, stash, or discard those changes (or run `git -C {primary} switch --detach`) \
+             and re-probe."
+        )));
+    }
+
+    let out = shelbi_ssh::run(host, ["git", "-C", primary, "checkout", "--detach"])
+        .map_err(Error::Io)?;
+    if !out.status.success() {
+        return Err(Error::Command {
+            cmd: format!("git -C {primary} checkout --detach"),
+            status: out.status.to_string(),
+            stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
+        });
+    }
+    Ok(())
 }
 
 /// Resolve `branch`'s tip SHA in the workspace worktree. Read-only —
@@ -8268,6 +8420,195 @@ mod probe_tests {
             report.head_sha,
             branch_sha(&wt, "shelbi/task1"),
             "head_sha must be the rebased branch tip"
+        );
+    }
+
+    #[test]
+    fn probe_self_recovers_when_primary_checkout_holds_the_task_branch() {
+        let _lock = crate::test_lock::acquire();
+        let _home = ProbeHomeGuard::install();
+        // Regression (fix-zen-hub-primary-checkout-left-on-a-feature-branch):
+        // the hub's primary checkout is parked ON the task branch — never
+        // detached at handoff, and with no local default branch to rest on.
+        // The rebase moves the branch, so the probe must advance the durable
+        // ref; it must self-recover by detaching the primary in place rather
+        // than dead-ending because the branch is "still checked out".
+        let (base, origin, wt) = setup_origin_and_worktree();
+
+        run_git(&wt, &["checkout", "-q", "-b", "shelbi/task1"]);
+        std::fs::write(wt.join("work.txt"), "task work\n").unwrap();
+        run_git(&wt, &["add", "-A"]);
+        run_git(&wt, &["commit", "-q", "-m", "task work"]);
+        let before = branch_sha(&wt, "shelbi/task1");
+        // Deliberately NOT detached: the primary stays pinned to the branch.
+
+        // Blocker fix lands on origin/main, forcing a rebase that moves the tip.
+        advance_origin_main(base.path(), &origin, "add fix", |r| {
+            std::fs::write(r.join("fix.txt"), "fixed\n").unwrap();
+        });
+
+        let project = probe_project(base.path(), &["test -f fix.txt"]);
+        let task = probe_task("shelbi/task1");
+        let report = probe_in_workflow(
+            &project,
+            None,
+            &task,
+            "shelbi/task1",
+            RebasePolicy::RebaseOntoDefault,
+        )
+        .unwrap();
+
+        assert!(!report.rebase_conflict.conflicts, "clean rebase expected");
+        assert_eq!(report.local_checks.len(), 1, "the local check must run");
+        assert_eq!(
+            report.local_checks[0].exit_code, 0,
+            "check should see the rebased default: {}",
+            report.local_checks[0].output_tail
+        );
+
+        // The durable ref advanced onto the rebased default.
+        assert_ne!(
+            branch_sha(&wt, "shelbi/task1"),
+            before,
+            "task branch must advance after the rebase"
+        );
+        assert_eq!(
+            report.head_sha,
+            branch_sha(&wt, "shelbi/task1"),
+            "head_sha must be the rebased branch tip"
+        );
+
+        // The primary checkout was detached in place: HEAD stayed on the
+        // pre-probe commit and the working tree is byte-for-byte intact.
+        assert_eq!(
+            head_sha(&wt),
+            before,
+            "primary HEAD must stay at the reviewed commit"
+        );
+        assert_eq!(
+            probe_git_stdout(&wt, &["rev-parse", "--abbrev-ref", "HEAD"]),
+            "HEAD",
+            "primary checkout must be detached to free the branch ref"
+        );
+        assert!(
+            wt.join("work.txt").exists(),
+            "primary working tree must be preserved"
+        );
+        assert!(
+            !wt.join("fix.txt").exists(),
+            "primary must not receive files from the probe's rebase"
+        );
+    }
+
+    #[test]
+    fn probe_blocks_when_a_linked_workspace_worktree_holds_the_task_branch() {
+        let _lock = crate::test_lock::acquire();
+        let _home = ProbeHomeGuard::install();
+        // A *second* workspace worktree (an active worker) holds the branch.
+        // Unlike the primary checkout, detaching it would disturb that worker,
+        // so the probe must refuse with a structured error naming the worktree
+        // — and must not advance the ref.
+        let (base, origin, wt) = setup_origin_and_worktree();
+
+        run_git(&wt, &["checkout", "-q", "-b", "shelbi/task1"]);
+        std::fs::write(wt.join("work.txt"), "task work\n").unwrap();
+        run_git(&wt, &["add", "-A"]);
+        run_git(&wt, &["commit", "-q", "-m", "task work"]);
+        let before = branch_sha(&wt, "shelbi/task1");
+
+        // Free the branch from the primary, then hand it to a linked worktree.
+        run_git(&wt, &["checkout", "-q", "--detach"]);
+        let linked = base.path().join("linked-ws");
+        run_git(
+            &wt,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                linked.to_str().unwrap(),
+                "shelbi/task1",
+            ],
+        );
+
+        // Force a rebase that would move the branch, reaching the advance path.
+        advance_origin_main(base.path(), &origin, "add fix", |r| {
+            std::fs::write(r.join("fix.txt"), "fixed\n").unwrap();
+        });
+
+        let project = probe_project(base.path(), &["test -f fix.txt"]);
+        let task = probe_task("shelbi/task1");
+        let err = probe_in_workflow(
+            &project,
+            None,
+            &task,
+            "shelbi/task1",
+            RebasePolicy::RebaseOntoDefault,
+        )
+        .unwrap_err()
+        .to_string();
+
+        assert!(
+            err.contains("another workspace worktree"),
+            "error must name the collision class: {err}"
+        );
+        assert!(
+            err.contains("linked-ws"),
+            "error must name the blocking worktree: {err}"
+        );
+        assert_eq!(
+            branch_sha(&wt, "shelbi/task1"),
+            before,
+            "a blocked probe must not advance the branch ref"
+        );
+    }
+
+    #[test]
+    fn probe_blocks_when_primary_checkout_on_the_branch_is_dirty() {
+        let _lock = crate::test_lock::acquire();
+        let _home = ProbeHomeGuard::install();
+        // The primary checkout holds the branch AND has uncommitted user work.
+        // Detaching wouldn't lose it, but silently moving HEAD out from under
+        // pending edits is worse than a clear error, so the probe refuses and
+        // names the remedy — without advancing the ref.
+        let (base, origin, wt) = setup_origin_and_worktree();
+
+        run_git(&wt, &["checkout", "-q", "-b", "shelbi/task1"]);
+        std::fs::write(wt.join("work.txt"), "task work\n").unwrap();
+        run_git(&wt, &["add", "-A"]);
+        run_git(&wt, &["commit", "-q", "-m", "task work"]);
+        let before = branch_sha(&wt, "shelbi/task1");
+        // Uncommitted user edit in the primary checkout.
+        std::fs::write(wt.join("work.txt"), "uncommitted user edit\n").unwrap();
+
+        advance_origin_main(base.path(), &origin, "add fix", |r| {
+            std::fs::write(r.join("fix.txt"), "fixed\n").unwrap();
+        });
+
+        let project = probe_project(base.path(), &["test -f fix.txt"]);
+        let task = probe_task("shelbi/task1");
+        let err = probe_in_workflow(
+            &project,
+            None,
+            &task,
+            "shelbi/task1",
+            RebasePolicy::RebaseOntoDefault,
+        )
+        .unwrap_err()
+        .to_string();
+
+        assert!(
+            err.contains("uncommitted changes"),
+            "error must explain the dirty primary checkout: {err}"
+        );
+        assert_eq!(
+            branch_sha(&wt, "shelbi/task1"),
+            before,
+            "a blocked probe must not advance the branch ref"
+        );
+        assert_eq!(
+            std::fs::read_to_string(wt.join("work.txt")).unwrap(),
+            "uncommitted user edit\n",
+            "the user's uncommitted work must be left untouched"
         );
     }
 
