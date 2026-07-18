@@ -24,16 +24,30 @@ use std::process::Command;
 
 use anyhow::{anyhow, bail, Context, Result};
 
-/// launchd `Label`. macOS-only: the Linux build compiles the systemd
-/// branch instead and uses [`SYSTEMD_SERVICE_NAME`] for its identifier.
+/// launchd `Label` (and the basename of the plist we install into
+/// `~/Library/LaunchAgents`). Reverse-DNS of shelbi.dev, the project's own
+/// domain. macOS-only: the Linux build compiles the systemd branch instead
+/// and uses [`SYSTEMD_SERVICE_NAME`] for its identifier.
 #[cfg(target_os = "macos")]
-const SERVICE_LABEL: &str = "co.32pixels.shelbi";
+const SERVICE_LABEL: &str = "dev.shelbi.daemon";
+/// The pre-rename launchd label. `install` retires any agent still
+/// registered under it (see [`migrate_legacy_launchd`]) so upgrading from a
+/// build that used the old label doesn't leave two supervisors running.
+/// This is the sole remaining reference to the retired identifier and
+/// exists only to clean it up.
+#[cfg(target_os = "macos")]
+const LEGACY_SERVICE_LABEL: &str = "co.32pixels.shelbi";
 /// systemd needs the `.service` suffix on most commands. Centralized so a
 /// future rename touches one place. `dead_code` allowed because the
 /// constant is only referenced from `cfg(target_os = "linux")` arms;
 /// macOS builds compile it but never read it.
 #[allow(dead_code)]
-const SYSTEMD_SERVICE_NAME: &str = "shelbi.service";
+const SYSTEMD_SERVICE_NAME: &str = "dev.shelbi.daemon.service";
+/// The pre-rename systemd unit name, retired on install for the same
+/// reason as [`LEGACY_SERVICE_LABEL`]. `dead_code` allowed for the same
+/// `cfg` reason as [`SYSTEMD_SERVICE_NAME`].
+#[allow(dead_code)]
+const LEGACY_SYSTEMD_SERVICE_NAME: &str = "shelbi.service";
 
 #[cfg(target_os = "macos")]
 pub(super) fn install() -> Result<()> {
@@ -138,10 +152,14 @@ fn install_launchd() -> Result<()> {
     fs::write(&plist_path, plist)
         .with_context(|| format!("writing launchd plist {}", plist_path.display()))?;
 
+    // Retire any daemon left over under the pre-rename label before we
+    // bootstrap the new one, so an upgrade doesn't leave two supervisors.
+    let uid = current_uid();
+    migrate_legacy_launchd(uid);
+
     // Idempotent reinstall: bootout the old instance (if any) before
     // bootstrapping the freshly-written plist. bootout returns non-zero
     // when nothing is loaded; that's fine — swallow it.
-    let uid = current_uid();
     let _ = Command::new("launchctl")
         .args(["bootout", &gui_target(uid)])
         .status();
@@ -280,6 +298,44 @@ fn launch_agent_plist_path() -> Result<PathBuf> {
         .join(format!("{SERVICE_LABEL}.plist")))
 }
 
+/// Path of the plist installed under the pre-rename label.
+#[cfg(target_os = "macos")]
+fn legacy_launch_agent_plist_path() -> Result<PathBuf> {
+    let home = dirs::home_dir().context("resolving $HOME for LaunchAgents path")?;
+    Ok(home
+        .join("Library/LaunchAgents")
+        .join(format!("{LEGACY_SERVICE_LABEL}.plist")))
+}
+
+/// `launchctl bootout` target for the pre-rename service.
+#[cfg(target_os = "macos")]
+fn legacy_gui_target(uid: u32) -> String {
+    format!("gui/{uid}/{LEGACY_SERVICE_LABEL}")
+}
+
+/// Retire a daemon still registered under the pre-rename launchd label so
+/// an in-place upgrade doesn't leave the old and new agents both running.
+/// Best-effort: `bootout` tolerates "not loaded" and plist removal only
+/// warns on a real error — a migration hiccup must never abort a fresh
+/// install.
+#[cfg(target_os = "macos")]
+fn migrate_legacy_launchd(uid: u32) {
+    let _ = Command::new("launchctl")
+        .args(["bootout", &legacy_gui_target(uid)])
+        .status();
+    match legacy_launch_agent_plist_path() {
+        Ok(path) if path.exists() => match fs::remove_file(&path) {
+            Ok(()) => println!("✓ removed legacy launchd plist {}", path.display()),
+            Err(e) => eprintln!(
+                "warning: could not remove legacy launchd plist {}: {e}",
+                path.display()
+            ),
+        },
+        Ok(_) => {}
+        Err(e) => eprintln!("warning: could not resolve legacy plist path: {e}"),
+    }
+}
+
 /// Inputs that go into the rendered plist. Bundled into a struct so the
 /// renderer is pure (testable without touching the filesystem). macOS-only:
 /// the Linux build supervises via systemd and never renders a plist.
@@ -395,6 +451,10 @@ fn install_systemd() -> Result<()> {
     fs::write(&unit_path, unit)
         .with_context(|| format!("writing systemd unit {}", unit_path.display()))?;
 
+    // Retire any unit left over under the pre-rename name before enabling
+    // the new one, so an upgrade doesn't leave two supervisors.
+    migrate_legacy_systemd();
+
     run_systemctl(&["daemon-reload"])?;
     run_systemctl(&["enable", "--now", SYSTEMD_SERVICE_NAME])?;
 
@@ -468,6 +528,37 @@ fn systemd_unit_path() -> Result<PathBuf> {
     Ok(home.join(".config/systemd/user").join(SYSTEMD_SERVICE_NAME))
 }
 
+/// Path of the systemd user unit installed under the pre-rename name.
+#[cfg(target_os = "linux")]
+fn legacy_systemd_unit_path() -> Result<PathBuf> {
+    let home = dirs::home_dir().context("resolving $HOME for systemd unit path")?;
+    Ok(home
+        .join(".config/systemd/user")
+        .join(LEGACY_SYSTEMD_SERVICE_NAME))
+}
+
+/// Stop, disable, and remove any user unit left over under the pre-rename
+/// name so an in-place upgrade doesn't leave two supervisors running.
+/// Best-effort: `disable --now` tolerates "no such unit" and unit removal
+/// only warns on a real error — a migration hiccup must never abort a fresh
+/// install.
+#[cfg(target_os = "linux")]
+fn migrate_legacy_systemd() {
+    let _ = run_systemctl(&["disable", "--now", LEGACY_SYSTEMD_SERVICE_NAME]);
+    match legacy_systemd_unit_path() {
+        Ok(path) if path.exists() => match fs::remove_file(&path) {
+            Ok(()) => println!("✓ removed legacy systemd unit {}", path.display()),
+            Err(e) => eprintln!(
+                "warning: could not remove legacy systemd unit {}: {e}",
+                path.display()
+            ),
+        },
+        Ok(_) => {}
+        Err(e) => eprintln!("warning: could not resolve legacy unit path: {e}"),
+    }
+    let _ = run_systemctl(&["daemon-reload"]);
+}
+
 #[cfg(target_os = "linux")]
 fn run_systemctl(args: &[&str]) -> Result<()> {
     let status = Command::new("systemctl")
@@ -518,7 +609,7 @@ fn render_systemd_unit(inputs: &SystemdInputs) -> String {
     format!(
         "[Unit]
 Description=Shelbi hub daemon
-Documentation=https://github.com/32pixelsco/shelbi
+Documentation=https://github.com/jlong/shelbi
 After=default.target
 
 [Service]
@@ -555,8 +646,12 @@ mod tests {
         };
         let plist = render_launchd_plist(&inputs);
         assert!(
-            plist.contains("<string>co.32pixels.shelbi</string>"),
+            plist.contains("<string>dev.shelbi.daemon</string>"),
             "{plist}"
+        );
+        assert!(
+            !plist.contains(LEGACY_SERVICE_LABEL),
+            "legacy label leaked into plist: {plist}"
         );
         assert!(
             plist.contains("<string>/Users/dev/bin/shelbi</string>"),
@@ -626,6 +721,45 @@ mod tests {
             unit.contains("WantedBy=default.target"),
             "install target: {unit}"
         );
+        assert!(
+            unit.contains("Documentation=https://github.com/jlong/shelbi"),
+            "documentation url: {unit}"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn legacy_launchd_cleanup_targets_old_label() {
+        // The migration must aim `launchctl bootout` and the plist delete
+        // at the retired label, and that target must differ from the new
+        // one — otherwise the cleanup would tear down the fresh install.
+        assert_eq!(
+            legacy_gui_target(501),
+            format!("gui/501/{LEGACY_SERVICE_LABEL}")
+        );
+        assert_ne!(legacy_gui_target(501), gui_target(501));
+        let legacy_plist = legacy_launch_agent_plist_path().unwrap();
+        assert!(
+            legacy_plist.ends_with(format!("{LEGACY_SERVICE_LABEL}.plist")),
+            "legacy plist path: {}",
+            legacy_plist.display()
+        );
+        assert_ne!(legacy_plist, launch_agent_plist_path().unwrap());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn legacy_systemd_cleanup_targets_old_unit() {
+        // The migration must aim `systemctl disable --now` and the unit
+        // delete at the retired unit name, distinct from the new one.
+        assert_ne!(LEGACY_SYSTEMD_SERVICE_NAME, SYSTEMD_SERVICE_NAME);
+        let legacy = legacy_systemd_unit_path().unwrap();
+        assert!(
+            legacy.ends_with(LEGACY_SYSTEMD_SERVICE_NAME),
+            "legacy unit path: {}",
+            legacy.display()
+        );
+        assert_ne!(legacy, systemd_unit_path().unwrap());
     }
 
     #[cfg(target_os = "macos")]

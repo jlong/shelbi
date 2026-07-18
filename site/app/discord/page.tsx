@@ -4,7 +4,7 @@ import type { SVGProps } from "react"
 export const metadata: Metadata = {
   title: "Join the Shelbi Discord — Shelbi",
   description:
-    "Join the 32pixels Discord to ask questions, share what you are building with Shelbi, and follow development.",
+    "Join the Shelbi Discord to ask questions, share what you are building with Shelbi, and follow development.",
 }
 
 // Discord invite is read from the environment so it can be rotated
@@ -32,7 +32,7 @@ export default function DiscordPage() {
         Join the Shelbi community
       </h1>
       <p className="mt-2 max-w-xl text-gray-7">
-        The 32pixels Discord is where Shelbi work happens in the open. Ask
+        The Shelbi Discord is where Shelbi work happens in the open. Ask
         questions, share what you are building, and follow development as it
         lands. Low key and developer-first.
       </p>
@@ -44,7 +44,7 @@ export default function DiscordPage() {
         className="mt-6 inline-flex items-center gap-2 rounded-sm border border-accent px-3 py-1.5 font-sans text-sm font-medium text-accent transition-colors hover:bg-accent hover:text-bg"
       >
         <DiscordIcon className="h-4 w-4" aria-hidden="true" />
-        Join the 32pixels Discord
+        Join the Shelbi Discord
       </a>
     </main>
   )
