@@ -26,8 +26,38 @@ const DEFAULT_TASK_AGENT: &str = "developer";
 /// column reads cleanly in a non-fancy terminal.
 const IDLE_AGENT_CELL: &str = "-";
 
+/// Exit code for `shelbi workspace add` when it refuses to touch a
+/// user-authored `.claude/settings.local.json`. Distinct from the generic
+/// failure code (1) so the orchestrator (or a script) can tell "merge these
+/// hooks and re-run" apart from any other error.
+pub const SETTINGS_MERGE_REQUIRED_EXIT: i32 = 3;
+
 #[derive(Debug, Subcommand)]
 pub enum WorkspaceCmd {
+    /// Add a workspace to the project's pool on the local machine and
+    /// materialize its worktree (wiring Shelbi's Claude hooks into
+    /// `.claude/settings.local.json`). Refuses a name that already exists or
+    /// slug-collides with an existing workspace.
+    Add {
+        /// Name for the new workspace (task-id character set: lowercase
+        /// letters, digits, `-`, `_`).
+        name: String,
+        /// Machine to place the workspace on. Defaults to the local hub.
+        #[arg(long)]
+        machine: Option<String>,
+        /// Runner for the workspace. Defaults to an existing workspace's runner
+        /// (or the sole declared runner when there's exactly one).
+        #[arg(long)]
+        runner: Option<String>,
+    },
+    /// Remove a workspace from the pool and tear down its worktree + pane.
+    /// Refuses a workspace with an active task unless `--force`.
+    Rm {
+        name: String,
+        /// Remove even if the workspace holds an in-progress/review task.
+        #[arg(long)]
+        force: bool,
+    },
     /// List declared workspaces with their host, runner name, currently
     /// loaded agent (or `-` when idle), and state
     /// (`idle` / `in_progress: <task-id>`).
@@ -71,6 +101,12 @@ pub fn run(project_opt: Option<String>, cmd: WorkspaceCmd) -> Result<()> {
         _ => super::hub_version::ensure_daemon_matches_for_mutation()?,
     }
     match cmd {
+        WorkspaceCmd::Add {
+            name,
+            machine,
+            runner,
+        } => add(&project, &name, machine.as_deref(), runner.as_deref()),
+        WorkspaceCmd::Rm { name, force } => rm(&project, &name, force),
         WorkspaceCmd::List => list(&project),
         WorkspaceCmd::SetRunner { runner, names, all } => {
             set_runner(&project, &runner, &names, all)
@@ -78,6 +114,212 @@ pub fn run(project_opt: Option<String>, cmd: WorkspaceCmd) -> Result<()> {
         WorkspaceCmd::Stop { name, keep_task } => stop(&project, &name, keep_task),
         WorkspaceCmd::Status { name } => status(&project, name.as_deref()),
     }
+}
+
+/// `shelbi workspace add <name>` — append a workspace to the pool on the local
+/// machine, materialize its worktree, and wire Shelbi's Claude hooks into
+/// `.claude/settings.local.json`.
+///
+/// Ordering is deliberate: we materialize + wire BEFORE persisting the pool
+/// entry, and only save the YAML once wiring succeeds. That's what makes the
+/// case-4 (user-authored settings) merge flow work — the command exits without
+/// having added the name, so when the orchestrator merges the hooks and re-runs
+/// `workspace add <name>`, the name-collision guard doesn't refuse the re-run.
+/// The worktree materialize is idempotent, so re-running is cheap.
+fn add(project: &str, name: &str, machine: Option<&str>, runner: Option<&str>) -> Result<()> {
+    let mut p = shelbi_state::load_project(project).map_err(|e| anyhow!(e))?;
+
+    let spec = plan_workspace_add(&p, name, machine, runner)?;
+    let machine_name = spec.machine.clone();
+    let runner_name = spec.runner.clone();
+
+    let machine = p
+        .machine(&machine_name)
+        .ok_or_else(|| anyhow!("unknown machine `{machine_name}`"))?
+        .clone();
+    orch_workspace::materialize_idle_worktree(project, &machine, &spec, p.base_branch())
+        .map_err(|e| anyhow!(e))?;
+
+    // Wire Shelbi's Claude hooks into settings.local.json. Only meaningful for
+    // Claude runners (codex/other pollers ignore the file), so skip the wiring
+    // for a non-Claude runner but still succeed the add.
+    let is_claude = p
+        .runner(&runner_name)
+        .map(|r| shelbi_agent::RunnerAdapter::for_command(&r.command).is_claude())
+        .unwrap_or(false);
+    if is_claude {
+        let host = machine.host();
+        let worktree = orch_workspace::workspace_worktree(&machine, &spec);
+        // The candidate (pool + new spec) is what the settings renderer reads.
+        let mut candidate = p.clone();
+        candidate.workspaces.push(spec.clone());
+        let block = orch_workspace::render_workspace_settings_preferring_agent(&candidate, None)
+            .map_err(|e| anyhow!(e))?;
+        match orch_workspace::wire_settings_local(&host, &worktree, name, &block)
+            .map_err(|e| anyhow!(e))?
+        {
+            orch_workspace::SettingsWireResult::Wired => {}
+            orch_workspace::SettingsWireResult::MergeRequired { message } => {
+                // Case 4: user-authored settings.local.json. Print the
+                // structured, orchestrator-addressed message and exit with a
+                // DISTINCT status WITHOUT persisting the pool entry.
+                eprintln!("{message}");
+                std::process::exit(SETTINGS_MERGE_REQUIRED_EXIT);
+            }
+        }
+    }
+
+    // Wiring succeeded — now persist the pool entry.
+    p.workspaces.push(spec);
+    save_workspace_config(&p)?;
+    println!("✓ added workspace `{name}` (machine {machine_name}, runner {runner_name})");
+    Ok(())
+}
+
+/// Validate + resolve a `workspace add` into a ready-to-persist
+/// [`WorkspaceSpec`] without touching disk: rejects an invalid name, an exact
+/// or slug collision with an existing workspace, and an unknown/undefaultable
+/// machine/runner. Pure over `p` so the collision + defaulting rules are
+/// unit-testable without a real worktree/git.
+fn plan_workspace_add(
+    p: &shelbi_core::Project,
+    name: &str,
+    machine: Option<&str>,
+    runner: Option<&str>,
+) -> Result<WorkspaceSpec> {
+    // Name must be a valid id (used as a tmux window + worktree dir name) and
+    // must not collide — exactly, or by slug — with an existing workspace.
+    shelbi_core::validate_task_id(name)
+        .map_err(|e| anyhow!("invalid workspace name `{name}`: {e}"))?;
+    let new_slug = shelbi_core::normalize_project_name(name)
+        .map_err(|_| anyhow!("workspace name `{name}` does not reduce to a valid slug"))?;
+    for w in &p.workspaces {
+        if w.name == name {
+            return Err(anyhow!("workspace `{name}` already exists"));
+        }
+        if shelbi_core::normalize_project_name(&w.name)
+            .map(|s| s == new_slug)
+            .unwrap_or(false)
+        {
+            return Err(anyhow!(
+                "workspace name `{name}` slug-collides with existing workspace `{}`",
+                w.name
+            ));
+        }
+    }
+
+    let spec = WorkspaceSpec {
+        name: name.to_string(),
+        machine: resolve_add_machine(p, machine)?,
+        runner: resolve_add_runner(p, runner)?,
+        tags: Vec::new(),
+        slot: None,
+    };
+
+    // Validate machine/runner references via a dry-run clone so a bad
+    // `--machine`/`--runner` fails before any disk work.
+    let mut candidate = p.clone();
+    candidate.workspaces.push(spec.clone());
+    candidate.validate_workspaces().map_err(|e| anyhow!(e))?;
+    Ok(spec)
+}
+
+/// Resolve the machine for `workspace add`: the explicit `--machine`, else the
+/// local hub. Errors when `--machine` names an unknown/non-local machine or
+/// when the project declares no local machine at all.
+fn resolve_add_machine(p: &shelbi_core::Project, machine: Option<&str>) -> Result<String> {
+    if let Some(name) = machine {
+        let m = p
+            .machine(name)
+            .ok_or_else(|| anyhow!("unknown machine `{name}`"))?;
+        return Ok(m.name.clone());
+    }
+    p.machines
+        .iter()
+        .find(|m| m.host().is_local())
+        .map(|m| m.name.clone())
+        .ok_or_else(|| anyhow!("project declares no local machine to host the workspace"))
+}
+
+/// Resolve the runner for `workspace add`: the explicit `--runner`, else an
+/// existing workspace's runner, else the sole declared runner. Errors when
+/// `--runner` is unknown or when no default can be inferred.
+fn resolve_add_runner(p: &shelbi_core::Project, runner: Option<&str>) -> Result<String> {
+    if let Some(name) = runner {
+        if !p.agent_runners.contains_key(name) {
+            return Err(anyhow!(
+                "runner `{name}` is not declared in agent_runners (known: {})",
+                p.agent_runners
+                    .keys()
+                    .map(|s| s.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ));
+        }
+        return Ok(name.to_string());
+    }
+    if let Some(w) = p.workspaces.first() {
+        return Ok(w.runner.clone());
+    }
+    if p.agent_runners.len() == 1 {
+        return Ok(p.agent_runners.keys().next().unwrap().clone());
+    }
+    Err(anyhow!(
+        "no default runner: pass --runner (known: {})",
+        p.agent_runners
+            .keys()
+            .map(|s| s.as_str())
+            .collect::<Vec<_>>()
+            .join(", ")
+    ))
+}
+
+/// `shelbi workspace rm <name>` — remove a workspace from the pool and tear
+/// down its worktree + pane. Refuses a workspace holding an active
+/// (in-progress/review) task unless `--force`.
+fn rm(project: &str, name: &str, force: bool) -> Result<()> {
+    let mut p = shelbi_state::load_project(project).map_err(|e| anyhow!(e))?;
+    let workspace = p
+        .workspace(name)
+        .ok_or_else(|| {
+            anyhow!(
+                "workspace `{name}` not declared in project `{project}` (known: {})",
+                p.workspaces
+                    .iter()
+                    .map(|w| w.name.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
+        })?
+        .clone();
+
+    if !force {
+        if let Some(task) = active_task_for(project, name) {
+            return Err(anyhow!(
+                "workspace `{name}` has an active task `{task}` — release it \
+                 (`shelbi workspace stop {name}`) or pass --force"
+            ));
+        }
+    }
+
+    let machine = p
+        .machine(&workspace.machine)
+        .ok_or_else(|| anyhow!("workspace references unknown machine `{}`", workspace.machine))?
+        .clone();
+
+    // Kill any live pane, then tear down the worktree. Both are best-effort /
+    // idempotent so a partially-provisioned workspace still removes cleanly.
+    let addr = orch_workspace::workspace_tmux_addr(&p, &workspace).map_err(|e| anyhow!(e))?;
+    if let Err(e) = orch_workspace::kill_workspace_pane(&machine.host(), &addr, name) {
+        eprintln!("warning: killing pane for `{name}`: {e}");
+    }
+    orch_workspace::remove_workspace_worktree(project, &machine, &workspace)
+        .map_err(|e| anyhow!(e))?;
+
+    p.workspaces.retain(|w| w.name != name);
+    save_workspace_config(&p)?;
+    println!("✓ removed workspace `{name}`");
+    Ok(())
 }
 
 fn list(project: &str) -> Result<()> {
@@ -416,7 +658,6 @@ fn stop(project: &str, name: &str, keep_task: bool) -> Result<()> {
 /// The task currently loaded on `workspace` — an in-progress or review-column
 /// task assigned to it. Resolves the task a workspace is holding when the
 /// caller doesn't already have `$TASK_ID` in the environment.
-#[cfg_attr(not(test), allow(dead_code))]
 fn active_task_for(project: &str, workspace: &str) -> Option<String> {
     for column in [Column::in_progress(), Column::review()] {
         if let Ok(tasks) = shelbi_state::list_column(project, column) {
@@ -910,6 +1151,94 @@ workspaces:
         assert!(rows[1].contains("claude"), "row: {}", rows[1]);
         assert!(rows[2].contains("bravo"), "row: {}", rows[2]);
         assert!(rows[2].contains("codex"), "row: {}", rows[2]);
+    }
+
+    #[test]
+    fn plan_workspace_add_defaults_machine_and_runner() {
+        let p = mixed_runner_project();
+        // No overrides: local hub machine + first existing workspace's runner.
+        let spec = plan_workspace_add(&p, "charlie", None, None).unwrap();
+        assert_eq!(spec.name, "charlie");
+        assert_eq!(spec.machine, "hub");
+        assert_eq!(spec.runner, "claude"); // alpha's runner
+        assert!(spec.tags.is_empty());
+        assert_eq!(spec.slot, None);
+    }
+
+    #[test]
+    fn plan_workspace_add_honors_overrides() {
+        let p = mixed_runner_project();
+        // Bind the overrides so the shelbi-agent grep-guard (which forbids a
+        // basename literal wrapped in Some(...) outside RunnerKind::from_command)
+        // stays green.
+        let machine = Some("hub");
+        let runner_override = "codex";
+        let spec = plan_workspace_add(&p, "charlie", machine, Some(runner_override)).unwrap();
+        assert_eq!(spec.machine, "hub");
+        assert_eq!(spec.runner, "codex");
+    }
+
+    #[test]
+    fn plan_workspace_add_rejects_exact_and_slug_collisions() {
+        let p = mixed_runner_project();
+        // Exact name.
+        let err = plan_workspace_add(&p, "alpha", None, None).unwrap_err();
+        assert!(err.to_string().contains("already exists"), "{err}");
+        // Slug collision: `alpha-` is a valid id but normalizes (trailing `-`
+        // trimmed) onto the existing `alpha`.
+        let err2 = plan_workspace_add(&p, "alpha-", None, None).unwrap_err();
+        assert!(err2.to_string().contains("slug-collides"), "{err2}");
+    }
+
+    #[test]
+    fn plan_workspace_add_rejects_invalid_name() {
+        let p = mixed_runner_project();
+        let err = plan_workspace_add(&p, "Has Spaces", None, None).unwrap_err();
+        assert!(err.to_string().contains("invalid workspace name"), "{err}");
+    }
+
+    #[test]
+    fn plan_workspace_add_rejects_unknown_runner() {
+        let p = mixed_runner_project();
+        let err = plan_workspace_add(&p, "charlie", None, Some("aider")).unwrap_err();
+        assert!(err.to_string().contains("agent_runners"), "{err}");
+    }
+
+    #[test]
+    fn add_then_rm_round_trips_the_pool_yaml() {
+        let _g = TEST_LOCK.lock().unwrap();
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+
+        // Persist a project so load/save round-trips through disk.
+        let p = mixed_runner_project();
+        shelbi_state::save_project(&p).unwrap();
+
+        // Simulate the pool mutation halves of add/rm (the disk-touching
+        // worktree steps are covered by the orchestrator crate). Add appends;
+        // rm removes; both go through the same save path the commands use.
+        let mut after_add = shelbi_state::load_project("p").unwrap();
+        let spec = plan_workspace_add(&after_add, "charlie", None, None).unwrap();
+        after_add.workspaces.push(spec);
+        save_workspace_config(&after_add).unwrap();
+
+        let reloaded = shelbi_state::load_project("p").unwrap();
+        assert!(reloaded.workspace("charlie").is_some());
+        assert_eq!(reloaded.workspaces.len(), 3);
+
+        let mut after_rm = reloaded;
+        after_rm.workspaces.retain(|w| w.name != "charlie");
+        save_workspace_config(&after_rm).unwrap();
+
+        let final_p = shelbi_state::load_project("p").unwrap();
+        assert!(final_p.workspace("charlie").is_none());
+        assert_eq!(final_p.workspaces.len(), 2);
+        // The untouched workspaces survive verbatim.
+        assert!(final_p.workspace("alpha").is_some());
+        assert!(final_p.workspace("bravo").is_some());
+
+        std::env::remove_var("SHELBI_HOME");
+        let _ = std::fs::remove_dir_all(&home);
     }
 
     #[test]
