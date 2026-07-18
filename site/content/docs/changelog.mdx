@@ -9,13 +9,47 @@ on `main`, newest first. This page is hand-curated: it tracks capabilities, not
 every commit, so small copy edits and cosmetic tweaks are folded away. Entries
 are prose with `code` and links where they earn their place.
 
-### Unreleased
+### July 18, 2026
+
+**v0.6.0. Workspaces, project names, and safer worktree integration.**
+
+**Workspaces are provisioned by the orchestrator, not hand-edited YAML.** New
+commands `shelbi workspace add <name>` and `shelbi workspace rm <name>` manage
+the pool, and a fresh project's workspaces are created through a first-boot
+interview: the orchestrator asks how many and which naming scheme (phonetic,
+greek, or toy-story) and creates them on the current machine. `shelbi init` no
+longer auto-provisions a pool.
+
+**Shelbi no longer overwrites your worktree settings.** Its Claude hooks are
+wired into `.claude/settings.local.json` — which Claude merges additively —
+instead of clobbering a committed `.claude/settings.json`. A pre-existing
+user-authored file is left untouched; the orchestrator merges the hooks in.
+
+**The default-branch commit guard only fires inside Shelbi.** The `pre-commit`
+guard that keeps agents from landing work directly on the default branch is now
+scoped to Shelbi-managed panes, so your own commits from a normal shell are
+never blocked. Its install is disclosed at `shelbi init`, and
+`shelbi guard uninstall` removes it.
+
+**Project names can be anything.** Name a project `ContextStore` or `My App`;
+Shelbi slugifies it for the on-disk folder and settings file and shows the
+human-readable name in the sidebar and command palette.
 
 **`git.branch` branch-name templates.** The git block gains a `branch` template
 key that parameterizes the branch names Shelbi cuts for tasks, rendered with
 `{{var}}` substitution, and mutually exclusive with the older `branch_prefix`.
 The shipped `subtask` workflow now cuts its branches from a `branch` template
 instead of a prefix. See the [git block reference](/docs/configuration/workflow#git).
+
+**Zen gained a fresh-context evaluator gate.** Before auto-merging a handoff,
+Zen spawns a read-only evaluator that checks the diff against the task's
+acceptance criteria and scope, so a branch that builds but doesn't do what the
+task asked is caught. Zen integration commits are now authored by you with the
+worker's real commit message rather than a synthetic bot identity.
+
+**Codex orchestrator liveness.** The heartbeat keep-alive that nudges a
+Codex-native orchestrator was restored, and `shelbi zen probe` now emits a
+structured JSON error when its own setup fails instead of empty output.
 
 ### July 15, 2026
 
