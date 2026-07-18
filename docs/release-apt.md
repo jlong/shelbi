@@ -5,8 +5,8 @@ Shelbi's Ubuntu packages are published through a signed static APT repository.
 ## Public Endpoint
 
 - APT repository: `https://apt.shelbi.dev/`
-- Hosting repository: `shelbi-apt` (set the `APT_REPO` repository variable, for
-  example `jlong/shelbi-apt`)
+- Hosting repository: `jlong/shelbi-apt` (set the `APT_REPO` repository
+  variable). Served by Vercel — see [Hosting](#hosting).
 - Suite: `stable`
 - Component: `main`
 - Architecture: `amd64`
@@ -23,6 +23,27 @@ dists/stable/Release.gpg
 dists/stable/main/binary-amd64/Packages
 dists/stable/main/binary-amd64/Packages.gz
 ```
+
+## Hosting
+
+`apt.shelbi.dev` is served by **Vercel** (not GitHub Pages). The `shelbi-apt`
+Vercel project (team `32pixels`) is git-connected to the `jlong/shelbi-apt`
+repository, so every publish commit (see [Publish Flow](#publish-flow))
+auto-deploys the static tree. Vercel provisions and renews the TLS certificate
+for `apt.shelbi.dev` automatically (Let's Encrypt), so the endpoint always
+serves a valid per-hostname cert.
+
+DNS: `apt.shelbi.dev` is a `CNAME` to the target shown in the project's Domains
+settings (a `*.vercel-dns-*.com` host). There is no `CNAME` file in the repo and
+no GitHub Pages configuration. Pages previously served the domain with only a
+`*.github.io` fallback cert, which failed hostname verification — the reason the
+install-verify job failed on every release before this migration.
+
+A `vercel.json` at the repo root serves the tree verbatim (no `cleanUrls` or
+`trailingSlash` rewrites) and sets cache headers: `pool/**` (versioned `.deb`s)
+is cached immutably; `dists/**` metadata (`Release`, `InRelease`, `Packages`) is
+`must-revalidate` so `apt` never fetches a stale index. Vercel also purges its
+CDN on each deploy.
 
 ## Signing Key
 
