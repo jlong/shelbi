@@ -1267,16 +1267,34 @@ const NON_CLAUDE_PASTE_STARTUP_SETTLE: std::time::Duration = std::time::Duration
 /// dispatch event and returns `Err`, so the caller can leave the task put
 /// for a retry.
 fn deploy_and_spawn(a: SpawnArgs<'_>) -> Result<()> {
-    // 2. Drop a rendered .claude/settings.json into the worktree so the
-    //    runner picks up shelbi's window-title hooks (idle/working/blocked)
-    //    and the per-task message-tail hooks (Phase 7 push delivery).
-    //    Prefer the dispatched agent's `agents/<role>/settings.json` when
-    //    present so role-specific hook customization actually takes effect
-    //    on the worktree's Claude Code session; fall back to the
-    //    project-wide template otherwise. Overwrite is fine — this is the
-    //    entire on-workspace footprint and we re-render it on every start.
-    let rendered = render_workspace_settings_preferring_agent(a.project, a.agent)?;
-    deploy_workspace_settings(a.host, a.worktree, &rendered)?;
+    // 2. Self-heal Shelbi's hook wiring in `.claude/settings.local.json` —
+    //    Claude Code's local, gitignored scope, which merges *additively* with
+    //    any committed `.claude/settings.json` so the user's hooks and Shelbi's
+    //    both run. We no longer clobber `settings.json` on every dispatch (that
+    //    silently overwrote committed project settings); instead we re-run the
+    //    same add-time wiring so a worktree that lost the block (a reset/pruned
+    //    slot, or one materialized by an older shelbi) is re-wired before the
+    //    session starts. Only Claude reads this file — codex and other polling
+    //    runners skip it entirely, so their dispatch path is unaffected. A
+    //    user-authored `settings.local.json` we don't recognize is never
+    //    mechanically merged: we record an orchestrator merge-request and abort
+    //    the dispatch so a human/orchestrator resolves it (see
+    //    `wire_settings_local`).
+    if shelbi_agent::RunnerAdapter::for_spec(a.runner).is_claude() {
+        let block = render_workspace_settings_preferring_agent(a.project, a.agent)?;
+        match wire_settings_local(a.host, a.worktree, &a.workspace.name, &block)? {
+            SettingsWireResult::Wired => {}
+            SettingsWireResult::MergeRequired { message } => {
+                append_dispatch_status(
+                    a.task_id,
+                    &a.workspace.name,
+                    "settings-merge-required",
+                    "file=.claude/settings.local.json reason=user-authored-settings-needs-hook-merge",
+                );
+                return Err(Error::Other(message));
+            }
+        }
+    }
     deploy_runner_hooks(a.host, a.worktree)?;
 
     // Decide + record the hub→workspace message channel for THIS launch. The
@@ -1914,29 +1932,266 @@ pub fn render_workspace_settings_preferring_agent(
     ))
 }
 
-/// Write the rendered workspace `settings.json` to `<worktree>/.claude/` on
-/// `host`. Local hosts get a direct filesystem write; remote hosts get an
-/// `ssh mkdir -p` followed by `scp` of the rendered file. The workspace
-/// machine never executes any shelbi code — this file is the whole
-/// on-workspace footprint.
-pub fn deploy_workspace_settings(
+/// Relative path (from the worktree root) of Claude Code's local settings
+/// scope, where Shelbi wires its window-title + message-tail hooks. This is
+/// gitignored and merges *additively* with a committed `.claude/settings.json`,
+/// so the user's hooks and Shelbi's both run.
+pub const WORKTREE_SETTINGS_LOCAL_REL: &str = ".claude/settings.local.json";
+
+/// The identifying marker for Shelbi's injected hooks: every command Shelbi
+/// wires references a script under this worktree-relative directory. Because
+/// the prefix is exclusive to Shelbi's own scratch namespace, its presence in a
+/// hook command is a reliable, version-stable signal that a given hook is
+/// Shelbi's — even after the block has been merged into a larger user-authored
+/// file. Refreshing the block never depends on byte-for-byte template equality,
+/// so template changes across shelbi versions don't misclassify.
+const SHELBI_HOOK_COMMAND_PREFIX: &str = ".shelbi/hooks/";
+
+/// Outcome of [`wire_settings_local`].
+pub enum SettingsWireResult {
+    /// The hook block is present (written, refreshed, or already merged in).
+    Wired,
+    /// A user-authored `settings.local.json` without Shelbi's block is on disk.
+    /// Shelbi refuses to mechanically merge or overwrite it; `message` is the
+    /// orchestrator-addressed instruction (naming the workspace + file and
+    /// printing the exact hook template to merge).
+    MergeRequired { message: String },
+}
+
+/// Wire Shelbi's hook block into `<worktree>/.claude/settings.local.json`
+/// without ever clobbering user-authored content. Decision tree:
+///
+/// 1. **Absent** (the normal case — the file is gitignored, so it isn't in a
+///    fresh checkout) → write Shelbi's block directly.
+/// 2. **Present, Shelbi-only** (the only top-level key is `hooks` and every
+///    command is Shelbi-owned) → refresh in place with the current block.
+/// 3. **Present, user content that already contains Shelbi's block** (the
+///    orchestrator merged it) → nothing to do; the hooks are wired.
+/// 4. **Present, user content WITHOUT Shelbi's block** → do not touch it.
+///    Return [`SettingsWireResult::MergeRequired`] carrying the
+///    orchestrator-addressed merge instruction.
+///
+/// `shelbi_block` is the rendered hooks JSON (see
+/// [`render_workspace_settings_preferring_agent`]). Only Claude Code reads this
+/// file — callers gate on the runner being Claude.
+pub fn wire_settings_local(
     host: &Host,
     worktree: &std::path::Path,
-    rendered: &str,
+    workspace_name: &str,
+    shelbi_block: &str,
+) -> Result<SettingsWireResult> {
+    let settings_local = worktree.join(WORKTREE_SETTINGS_LOCAL_REL);
+    match read_worktree_text(host, &settings_local)? {
+        None => {
+            // Case 1: absent → write our block directly.
+            write_worktree_text(host, &settings_local, shelbi_block, "settings-local")?;
+            cleanup_legacy_shelbi_settings_json(host, worktree)?;
+            Ok(SettingsWireResult::Wired)
+        }
+        Some(content) => match serde_json::from_str::<serde_json::Value>(&content) {
+            Ok(value) if is_shelbi_only_settings(&value) => {
+                // Case 2: Shelbi-only → refresh in place.
+                write_worktree_text(host, &settings_local, shelbi_block, "settings-local")?;
+                cleanup_legacy_shelbi_settings_json(host, worktree)?;
+                Ok(SettingsWireResult::Wired)
+            }
+            Ok(value) if settings_contain_shelbi_hooks(&value) => {
+                // Case 3: user content that already carries our block (the
+                // orchestrator merged it on a prior pass). Nothing to do.
+                cleanup_legacy_shelbi_settings_json(host, worktree)?;
+                Ok(SettingsWireResult::Wired)
+            }
+            // Case 4: user-authored content without our block — or JSON we
+            // can't parse and therefore can't safely reason about. Never
+            // mechanically merge; ask the orchestrator to do it.
+            _ => Ok(SettingsWireResult::MergeRequired {
+                message: orchestrator_merge_message(
+                    workspace_name,
+                    &settings_local,
+                    shelbi_block,
+                ),
+            }),
+        },
+    }
+}
+
+/// True iff `value` is exactly Shelbi's own wiring: an object whose sole
+/// top-level key is `hooks`, with at least one hook command and *every* command
+/// referencing a Shelbi-owned script (the [`SHELBI_HOOK_COMMAND_PREFIX`]
+/// marker). This is the "refresh in place" (case 2) signal — a file we know we
+/// own entirely and may overwrite.
+fn is_shelbi_only_settings(value: &serde_json::Value) -> bool {
+    let Some(obj) = value.as_object() else {
+        return false;
+    };
+    if obj.len() != 1 {
+        return false;
+    }
+    let Some(hooks) = obj.get("hooks") else {
+        return false;
+    };
+    let mut saw_command = false;
+    let all_shelbi = for_each_hook_command(hooks, &mut |cmd| {
+        saw_command = true;
+        cmd.starts_with(SHELBI_HOOK_COMMAND_PREFIX)
+    });
+    all_shelbi && saw_command
+}
+
+/// True iff `value`'s `hooks` contain at least one Shelbi-owned command. Unlike
+/// [`is_shelbi_only_settings`] this tolerates arbitrary surrounding user
+/// content — it answers "has Shelbi's block already been merged into this
+/// file?" (case 3), so a re-run after an orchestrator merge succeeds instead of
+/// looping on the merge request.
+fn settings_contain_shelbi_hooks(value: &serde_json::Value) -> bool {
+    let Some(hooks) = value.as_object().and_then(|o| o.get("hooks")) else {
+        return false;
+    };
+    let mut found = false;
+    // Return `true` from the visitor to keep scanning; we only need one hit.
+    for_each_hook_command(hooks, &mut |cmd| {
+        if cmd.starts_with(SHELBI_HOOK_COMMAND_PREFIX) {
+            found = true;
+        }
+        true
+    });
+    found
+}
+
+/// Walk every `command` string in a Claude-Code `hooks` object
+/// (`{ Event: [ { hooks: [ { command }, ... ] }, ... ] }`), calling `f` on
+/// each. Returns `true` iff `f` returned `true` for every command AND the shape
+/// was well-formed throughout; a structurally unexpected node short-circuits to
+/// `false`. Pure structural walk — used by both classifiers above.
+fn for_each_hook_command(hooks: &serde_json::Value, f: &mut dyn FnMut(&str) -> bool) -> bool {
+    let Some(events) = hooks.as_object() else {
+        return false;
+    };
+    for groups in events.values() {
+        let Some(groups) = groups.as_array() else {
+            return false;
+        };
+        for group in groups {
+            let Some(inner) = group.get("hooks").and_then(|h| h.as_array()) else {
+                return false;
+            };
+            for hook in inner {
+                let Some(cmd) = hook.get("command").and_then(|c| c.as_str()) else {
+                    return false;
+                };
+                if !f(cmd) {
+                    return false;
+                }
+            }
+        }
+    }
+    true
+}
+
+/// Build the orchestrator-addressed message for case 4 — a user-authored
+/// `settings.local.json` we won't touch. Pure so it's unit-testable. It names
+/// the workspace + file, prints the exact hook JSON to merge, and is explicitly
+/// addressed to the orchestrator (which merges intelligently, writes the file,
+/// and re-runs `shelbi workspace add`).
+fn orchestrator_merge_message(
+    workspace_name: &str,
+    settings_local: &std::path::Path,
+    shelbi_block: &str,
+) -> String {
+    format!(
+        "workspace `{ws}`: a user-authored {path} already exists and does not \
+contain Shelbi's hook block.\n\
+Shelbi will not overwrite or blind-merge it.\n\
+ORCHESTRATOR: merge these hooks into the existing settings.local.json, \
+preserving the user's content, then re-run `shelbi workspace add {ws}` \
+(which will then see the block is present and succeed).\n\
+\n\
+----- BEGIN shelbi hook template -----\n\
+{block}\n\
+----- END shelbi hook template -----\n",
+        ws = workspace_name,
+        path = settings_local.display(),
+        block = shelbi_block.trim_end(),
+    )
+}
+
+/// Remove a *legacy* Shelbi-written `.claude/settings.json` left by an older
+/// shelbi that clobbered the committed scope. We only delete it when it is (a)
+/// git-untracked (a deploy artifact, not a file the user committed) and (b)
+/// exclusively Shelbi's own hook block — so a project that *commits*
+/// `settings.json` keeps it verbatim. Without this, Claude would merge the
+/// stale `settings.json` hooks with the new `settings.local.json` hooks and run
+/// each twice. Best-effort: a removal failure is not fatal to wiring.
+fn cleanup_legacy_shelbi_settings_json(host: &Host, worktree: &std::path::Path) -> Result<()> {
+    let settings = worktree.join(".claude").join("settings.json");
+    let Some(content) = read_worktree_text(host, &settings)? else {
+        return Ok(());
+    };
+    // A committed settings.json (git-tracked) is the user's — never touch it.
+    if git_tracks_path(host, worktree, ".claude/settings.json") {
+        return Ok(());
+    }
+    if let Ok(value) = serde_json::from_str::<serde_json::Value>(&content) {
+        if is_shelbi_only_settings(&value) {
+            let _ = shelbi_ssh::run(host, ["rm", "-f", &settings.to_string_lossy()]);
+        }
+    }
+    Ok(())
+}
+
+/// True iff `rel` (worktree-relative) is tracked in the worktree's git index.
+/// A non-git worktree or any git failure reports `false` (treat as untracked).
+fn git_tracks_path(host: &Host, worktree: &std::path::Path, rel: &str) -> bool {
+    let wt = worktree.to_string_lossy();
+    shelbi_ssh::run(host, ["git", "-C", &wt, "ls-files", "--error-unmatch", rel])
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+
+/// Read a worktree text file on `host`, returning `None` when it's absent.
+/// Local hosts read the filesystem directly; remote hosts `cat` over SSH (a
+/// non-zero exit — the missing-file case — maps to `None`).
+fn read_worktree_text(host: &Host, path: &std::path::Path) -> Result<Option<String>> {
+    match host {
+        Host::Local => match std::fs::read_to_string(path) {
+            Ok(s) => Ok(Some(s)),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(Error::Io(e)),
+        },
+        Host::Ssh { .. } => {
+            let path = path.to_string_lossy();
+            let out = shelbi_ssh::run(host, ["cat", path.as_ref()]).map_err(Error::Io)?;
+            if !out.status.success() {
+                return Ok(None);
+            }
+            Ok(Some(String::from_utf8_lossy(&out.stdout).into_owned()))
+        }
+    }
+}
+
+/// Write `body` to `dest_path` on `host`, creating the parent dir first.
+/// Mirrors [`deploy_agent_instructions`]'s local-vs-remote split.
+fn write_worktree_text(
+    host: &Host,
+    dest_path: &std::path::Path,
+    body: &str,
+    tag: &str,
 ) -> Result<()> {
-    let claude_dir = worktree.join(".claude");
-    let settings_path = claude_dir.join("settings.json");
+    let dir = dest_path.parent().ok_or_else(|| {
+        Error::Other(format!("invalid worktree path `{}`", dest_path.display()))
+    })?;
     match host {
         Host::Local => {
-            std::fs::create_dir_all(&claude_dir).map_err(Error::Io)?;
-            std::fs::write(&settings_path, rendered).map_err(Error::Io)?;
+            std::fs::create_dir_all(dir).map_err(Error::Io)?;
+            std::fs::write(dest_path, body).map_err(Error::Io)?;
             Ok(())
         }
-        Host::Ssh { host: ssh_host } => scp_settings_to_remote(
+        Host::Ssh { host: ssh_host } => scp_text_to_remote(
             ssh_host,
-            &claude_dir.to_string_lossy(),
-            &settings_path.to_string_lossy(),
-            rendered,
+            &dir.to_string_lossy(),
+            &dest_path.to_string_lossy(),
+            body,
+            tag,
         ),
     }
 }
@@ -2201,7 +2456,7 @@ fn splice_orchestrator_handoff(composed: &str, handoff: &str) -> String {
 
 /// Write `instructions` to `<worktree>/.claude/agent-instructions.md` so
 /// the runner can `--append-system-prompt "$(cat …)"` from it on launch.
-/// Mirrors [`deploy_workspace_settings`]'s local-vs-remote split.
+/// Mirrors [`write_worktree_text`]'s local-vs-remote split.
 pub fn deploy_agent_instructions(host: &Host, worktree: &Path, instructions: &str) -> Result<()> {
     let claude_dir = worktree.join(".claude");
     let dest_path = claude_dir.join("agent-instructions.md");
@@ -2683,21 +2938,6 @@ fn with_startup_prompt(
 /// through `shelbi_ssh` (and its per-arg escaping), so it escapes here.
 fn scp_remote_target(ssh_host: &str, remote_path: &str) -> String {
     format!("{ssh_host}:{}", shelbi_agent::shell_escape(remote_path))
-}
-
-fn scp_settings_to_remote(
-    ssh_host: &str,
-    remote_dir: &str,
-    remote_path: &str,
-    rendered: &str,
-) -> Result<()> {
-    scp_text_to_remote(
-        ssh_host,
-        remote_dir,
-        remote_path,
-        rendered,
-        "workspace-settings",
-    )
 }
 
 /// Push `body` to `remote_path` on `ssh_host`, ensuring `remote_dir`
@@ -3309,6 +3549,107 @@ pub fn ensure_workspace_worktree(
     // lock already follow the required workspace -> Git ordering.
     let _git_worktree_lock = shelbi_state::lock_git_worktrees(project_name)?;
     sync_worktree_for_resume(&host, machine, &worktree, branch, default_branch)
+}
+
+/// Materialize an *idle* workspace worktree for `shelbi workspace add` — the
+/// resting state a slot sits in between tasks, before any task branch exists.
+///
+/// Unlike the dispatch/resume paths, there is no task branch yet, so the
+/// worktree is created with a **detached HEAD** at a fresh base
+/// (`resolve_fresh_cut_base(default_branch)` — `origin/<default>` when a remote
+/// exists, else the local default). A detached checkout is deliberate: the
+/// project's default branch is already checked out in the main working tree and
+/// git refuses to check the same branch out twice, and a resting slot must not
+/// hold the default branch anyway. The first dispatch onto the slot switches it
+/// onto the task branch via [`sync_worktree`] (a detached HEAD reads as not-on-
+/// branch, so it checks out the task branch cleanly).
+///
+/// Idempotent: an already-materialized worktree (valid `.git`) is left as-is.
+/// Shares the stale-`.git`-gitlink healing with the other worktree paths.
+pub fn materialize_idle_worktree(
+    project_name: &str,
+    machine: &Machine,
+    workspace: &WorkspaceSpec,
+    default_branch: &str,
+) -> Result<()> {
+    let host = machine.host();
+    let worktree = workspace_worktree(machine, workspace);
+    let _git_worktree_lock = shelbi_state::lock_git_worktrees(project_name)?;
+
+    let repo = machine.work_dir.to_string_lossy().into_owned();
+    let wt_str = worktree.to_string_lossy().into_owned();
+
+    // Prune stale bookkeeping, then heal a present-but-invalid worktree dir
+    // (created but never got its `.git`) exactly as the sync paths do.
+    let _ = shelbi_ssh::run(&host, ["git", "-C", &repo, "worktree", "prune"]);
+
+    let has_git = shelbi_ssh::run(&host, ["test", "-d", &format!("{wt_str}/.git")])
+        .map_err(Error::Io)?
+        .status
+        .success()
+        || shelbi_ssh::run(&host, ["test", "-f", &format!("{wt_str}/.git")])
+            .map_err(Error::Io)?
+            .status
+            .success();
+    if has_git {
+        // Already materialized — leave it exactly as it is.
+        return Ok(());
+    }
+
+    let dir_present = shelbi_ssh::run(&host, ["test", "-d", &wt_str])
+        .map_err(Error::Io)?
+        .status
+        .success();
+    if dir_present {
+        let _ = shelbi_ssh::run(
+            &host,
+            ["git", "-C", &repo, "worktree", "remove", "--force", &wt_str],
+        );
+        let _ = shelbi_ssh::run(&host, ["rm", "-rf", &wt_str]);
+    }
+
+    let base = resolve_fresh_cut_base(&host, &repo, default_branch)?;
+    let argv = [
+        "git", "-C", &repo, "worktree", "add", "--detach", &wt_str, &base,
+    ];
+    let out = shelbi_ssh::run(&host, argv).map_err(Error::Io)?;
+    if !out.status.success() {
+        return Err(Error::Command {
+            cmd: argv.join(" "),
+            status: out.status.to_string(),
+            stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
+        });
+    }
+    Ok(())
+}
+
+/// Tear down a workspace's worktree for `shelbi workspace rm` —
+/// `git worktree remove --force` followed by a best-effort `rm -rf` so a
+/// lingering dir (e.g. a present-but-invalid one git won't remove) is cleared
+/// too. Idempotent: a workspace whose worktree was never materialized (nothing
+/// registered, no dir) is a no-op success. Callers kill the pane first.
+pub fn remove_workspace_worktree(
+    project_name: &str,
+    machine: &Machine,
+    workspace: &WorkspaceSpec,
+) -> Result<()> {
+    let host = machine.host();
+    let worktree = workspace_worktree(machine, workspace);
+    let _git_worktree_lock = shelbi_state::lock_git_worktrees(project_name)?;
+
+    let repo = machine.work_dir.to_string_lossy().into_owned();
+    let wt_str = worktree.to_string_lossy().into_owned();
+
+    // Best-effort git deregistration — a `remove` that finds nothing
+    // registered is a harmless non-zero exit — then force-delete the dir so no
+    // stale tree is left behind, and prune the (now dangling) bookkeeping.
+    let _ = shelbi_ssh::run(
+        &host,
+        ["git", "-C", &repo, "worktree", "remove", "--force", &wt_str],
+    );
+    let _ = shelbi_ssh::run(&host, ["rm", "-rf", &wt_str]);
+    let _ = shelbi_ssh::run(&host, ["git", "-C", &repo, "worktree", "prune"]);
+    Ok(())
 }
 
 /// If a workspace worktree on this machine is currently on `branch`, switch
@@ -4100,6 +4441,170 @@ mod tests {
         );
     }
 
+    fn wiring_tmp_worktree(tag: &str) -> std::path::PathBuf {
+        let tmp = std::env::temp_dir().join(format!(
+            "shelbi-wire-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let wt = tmp.join("wt");
+        std::fs::create_dir_all(wt.join(".claude")).unwrap();
+        wt
+    }
+
+    /// A minimal Shelbi hook block — the marker is the exclusive
+    /// `.shelbi/hooks/` command prefix, not byte-for-byte template identity.
+    const TEST_SHELBI_BLOCK: &str = r#"{
+  "hooks": {
+    "SessionStart": [
+      { "hooks": [ { "type": "command", "command": ".shelbi/hooks/session-start.sh" } ] }
+    ]
+  }
+}
+"#;
+
+    #[test]
+    fn is_shelbi_only_settings_recognizes_own_block() {
+        let v: serde_json::Value = serde_json::from_str(TEST_SHELBI_BLOCK).unwrap();
+        assert!(is_shelbi_only_settings(&v));
+        assert!(settings_contain_shelbi_hooks(&v));
+    }
+
+    #[test]
+    fn is_shelbi_only_settings_rejects_extra_keys_and_foreign_commands() {
+        // Extra top-level key → not Shelbi-only.
+        let with_perms: serde_json::Value = serde_json::from_str(
+            r#"{"permissions":{"defaultMode":"auto"},"hooks":{"SessionStart":[{"hooks":[{"type":"command","command":".shelbi/hooks/session-start.sh"}]}]}}"#,
+        )
+        .unwrap();
+        assert!(!is_shelbi_only_settings(&with_perms));
+        // But Shelbi's block IS present (merged) → case 3 detection fires.
+        assert!(settings_contain_shelbi_hooks(&with_perms));
+
+        // A user hook that isn't Shelbi-owned → neither only nor present.
+        let foreign: serde_json::Value = serde_json::from_str(
+            r#"{"hooks":{"SessionStart":[{"hooks":[{"type":"command","command":"./my-hook.sh"}]}]}}"#,
+        )
+        .unwrap();
+        assert!(!is_shelbi_only_settings(&foreign));
+        assert!(!settings_contain_shelbi_hooks(&foreign));
+    }
+
+    #[test]
+    fn wire_settings_local_writes_when_absent() {
+        let wt = wiring_tmp_worktree("absent");
+        let res = wire_settings_local(&Host::Local, &wt, "alpha", TEST_SHELBI_BLOCK).unwrap();
+        assert!(matches!(res, SettingsWireResult::Wired));
+        let written =
+            std::fs::read_to_string(wt.join(".claude/settings.local.json")).unwrap();
+        assert_eq!(written, TEST_SHELBI_BLOCK);
+        let _ = std::fs::remove_dir_all(wt.parent().unwrap());
+    }
+
+    #[test]
+    fn wire_settings_local_refreshes_shelbi_only_without_duplicating() {
+        let wt = wiring_tmp_worktree("refresh");
+        let path = wt.join(".claude/settings.local.json");
+        // Seed with an older Shelbi-only block (different formatting/content
+        // but same `.shelbi/hooks/` marker).
+        std::fs::write(
+            &path,
+            r#"{"hooks":{"Stop":[{"hooks":[{"type":"command","command":".shelbi/hooks/stop.sh"}]}]}}"#,
+        )
+        .unwrap();
+        let res = wire_settings_local(&Host::Local, &wt, "alpha", TEST_SHELBI_BLOCK).unwrap();
+        assert!(matches!(res, SettingsWireResult::Wired));
+        // Refreshed in place to the current block — exactly once, no append.
+        let written = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(written, TEST_SHELBI_BLOCK);
+        assert_eq!(written.matches(".shelbi/hooks/session-start.sh").count(), 1);
+        let _ = std::fs::remove_dir_all(wt.parent().unwrap());
+    }
+
+    #[test]
+    fn wire_settings_local_is_noop_when_user_file_already_has_block() {
+        let wt = wiring_tmp_worktree("merged");
+        let path = wt.join(".claude/settings.local.json");
+        // User content that the orchestrator already merged Shelbi's block into.
+        let merged = r#"{"permissions":{"defaultMode":"auto"},"hooks":{"SessionStart":[{"hooks":[{"type":"command","command":".shelbi/hooks/session-start.sh"}]},{"hooks":[{"type":"command","command":"./my-hook.sh"}]}]}}"#;
+        std::fs::write(&path, merged).unwrap();
+        let res = wire_settings_local(&Host::Local, &wt, "alpha", TEST_SHELBI_BLOCK).unwrap();
+        assert!(matches!(res, SettingsWireResult::Wired));
+        // Left byte-for-byte untouched — the user's hook survives.
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), merged);
+        let _ = std::fs::remove_dir_all(wt.parent().unwrap());
+    }
+
+    #[test]
+    fn wire_settings_local_refuses_user_file_without_block() {
+        let wt = wiring_tmp_worktree("usercontent");
+        let path = wt.join(".claude/settings.local.json");
+        let user = r#"{"permissions":{"defaultMode":"plan"},"hooks":{"SessionStart":[{"hooks":[{"type":"command","command":"./my-hook.sh"}]}]}}"#;
+        std::fs::write(&path, user).unwrap();
+        let res = wire_settings_local(&Host::Local, &wt, "myws", TEST_SHELBI_BLOCK).unwrap();
+        match res {
+            SettingsWireResult::MergeRequired { message } => {
+                assert!(message.contains("myws"), "message: {message}");
+                assert!(message.contains("settings.local.json"), "message: {message}");
+                assert!(message.contains("ORCHESTRATOR"), "message: {message}");
+                // Prints the exact hook template to merge.
+                assert!(
+                    message.contains(".shelbi/hooks/session-start.sh"),
+                    "message must carry the template: {message}"
+                );
+            }
+            SettingsWireResult::Wired => panic!("expected MergeRequired, got Wired"),
+        }
+        // The user's file is never touched.
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), user);
+        let _ = std::fs::remove_dir_all(wt.parent().unwrap());
+    }
+
+    #[test]
+    fn wire_settings_local_reports_merge_for_unparseable_content() {
+        let wt = wiring_tmp_worktree("garbage");
+        let path = wt.join(".claude/settings.local.json");
+        std::fs::write(&path, "{ this is not valid json").unwrap();
+        let res = wire_settings_local(&Host::Local, &wt, "myws", TEST_SHELBI_BLOCK).unwrap();
+        assert!(matches!(res, SettingsWireResult::MergeRequired { .. }));
+        let _ = std::fs::remove_dir_all(wt.parent().unwrap());
+    }
+
+    #[test]
+    fn wire_settings_local_removes_legacy_shelbi_only_settings_json() {
+        // A worktree carrying a stale, Shelbi-owned settings.json (from an
+        // older shelbi) plus no settings.local.json. Not a git repo, so the
+        // settings.json reads as untracked → the legacy cleanup removes it so
+        // Claude doesn't run the hooks twice.
+        let wt = wiring_tmp_worktree("legacy");
+        let legacy = wt.join(".claude/settings.json");
+        std::fs::write(&legacy, TEST_SHELBI_BLOCK).unwrap();
+        let res = wire_settings_local(&Host::Local, &wt, "alpha", TEST_SHELBI_BLOCK).unwrap();
+        assert!(matches!(res, SettingsWireResult::Wired));
+        assert!(
+            !legacy.exists(),
+            "legacy Shelbi-only settings.json should be removed to avoid duplicate hooks"
+        );
+        assert!(wt.join(".claude/settings.local.json").is_file());
+        let _ = std::fs::remove_dir_all(wt.parent().unwrap());
+    }
+
+    #[test]
+    fn wire_settings_local_keeps_user_authored_settings_json() {
+        // A user-authored settings.json (not Shelbi-only) is left in place —
+        // Claude merges it with settings.local.json so both hook sets run.
+        let wt = wiring_tmp_worktree("userjson");
+        let user_json = wt.join(".claude/settings.json");
+        let body = r#"{"permissions":{"defaultMode":"auto"}}"#;
+        std::fs::write(&user_json, body).unwrap();
+        wire_settings_local(&Host::Local, &wt, "alpha", TEST_SHELBI_BLOCK).unwrap();
+        assert_eq!(std::fs::read_to_string(&user_json).unwrap(), body);
+        let _ = std::fs::remove_dir_all(wt.parent().unwrap());
+    }
+
     #[test]
     fn parses_typical_claude_version_output() {
         assert_eq!(
@@ -4308,35 +4813,6 @@ mod tests {
             integration: None,
         };
         require_auto_mode_supported(&Host::Local, &runner, "auto").unwrap();
-    }
-
-    #[test]
-    fn deploy_workspace_settings_writes_local_file_and_creates_dir() {
-        let tmp = std::env::temp_dir().join(format!(
-            "shelbi-deploy-test-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        let worktree = tmp.join("wt");
-        std::fs::create_dir_all(&worktree).unwrap();
-        let rendered = r#"{"permissions":{"defaultMode":"acceptEdits"}}"#;
-
-        deploy_workspace_settings(&Host::Local, &worktree, rendered).unwrap();
-
-        let settings = worktree.join(".claude/settings.json");
-        let actual = std::fs::read_to_string(&settings).unwrap();
-        assert_eq!(actual, rendered);
-
-        // Idempotent: a second call overwrites without error.
-        let updated = r#"{"permissions":{"defaultMode":"plan"}}"#;
-        deploy_workspace_settings(&Host::Local, &worktree, updated).unwrap();
-        let actual2 = std::fs::read_to_string(&settings).unwrap();
-        assert_eq!(actual2, updated);
-
-        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     #[test]
