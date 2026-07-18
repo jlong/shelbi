@@ -28,6 +28,9 @@ pub fn sidebar_loop<B: Backend>(term: &mut Terminal<B>, app: &mut App) -> Result
     let keymaps = app.keymaps().clone();
     while !app.should_quit {
         app.maybe_refresh().ok();
+        // Drain any in-flight background review load so the spinner/outcome
+        // shows up on the next frame without the UI thread ever blocking.
+        app.poll_review_load();
 
         term.draw(|f| sidebar::render_full(f, app, f.area()))?;
 
@@ -55,6 +58,12 @@ pub fn sidebar_loop<B: Backend>(term: &mut Terminal<B>, app: &mut App) -> Result
 /// Anything not bound returns [`Outcome::Continue`] so unfamiliar chords
 /// fall through silently rather than triggering a default action.
 pub fn handle_sidebar_key(app: &mut App, key: KeyEvent, km: &Keymaps) -> Outcome {
+    // A modal review-load confirm swallows every key until it's dismissed —
+    // no global chord or nav binding fires underneath it. `review_prompt_key`
+    // returns `false` when no prompt is open, so normal dispatch continues.
+    if app.review_prompt_key(key) {
+        return Outcome::Continue;
+    }
     if let Some(global) = km.global.dispatch(key) {
         return match global {
             GlobalAction::Quit => Outcome::Quit,
@@ -91,6 +100,12 @@ pub fn handle_sidebar_key(app: &mut App, key: KeyEvent, km: &Keymaps) -> Outcome
 /// nav-then-Enter). Scroll wheel walks the selection up/down without
 /// activating, so a user can preview which row is highlighted.
 pub fn handle_mouse(app: &mut App, mouse: MouseEvent) {
+    // While the review-load confirm is up it's modal — swallow clicks so a
+    // stray press doesn't activate a row behind the dialog. The dialog is
+    // dismissed/confirmed from the keyboard.
+    if app.review_prompt_open() {
+        return;
+    }
     match mouse.kind {
         MouseEventKind::Down(MouseButton::Left) => {
             if let Some(idx) = app.row_at(mouse.column, mouse.row) {
