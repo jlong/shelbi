@@ -37,7 +37,7 @@ nfpms:
     file_name_template: "{{ .ProjectName }}_{{ .Version }}_{{ .Arch }}"
     vendor: Shelbi
     homepage: https://github.com/jlong/shelbi
-    maintainer: John W. Long <john@32pixels.co>
+    maintainer: John W. Long <john@johnwlong.com>
     description: Open-source agent orchestrator built on tmux.
     license: MIT
     section: devel

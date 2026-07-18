@@ -27,7 +27,7 @@ dists/stable/main/binary-amd64/Packages.gz
 ## Hosting
 
 `apt.shelbi.dev` is served by **Vercel** (not GitHub Pages). The `shelbi-apt`
-Vercel project (team `32pixels`) is git-connected to the `jlong/shelbi-apt`
+Vercel project is git-connected to the `jlong/shelbi-apt`
 repository, so every publish commit (see [Publish Flow](#publish-flow))
 auto-deploys the static tree. Vercel provisions and renews the TLS certificate
 for `apt.shelbi.dev` automatically (Let's Encrypt), so the endpoint always

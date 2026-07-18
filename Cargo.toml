@@ -19,7 +19,7 @@ edition = "2021"
 rust-version = "1.80"
 license = "MIT"
 repository = "https://github.com/jlong/shelbi"
-authors = ["John W. Long <john@32pixels.co>"]
+authors = ["John W. Long <john@johnwlong.com>"]
 
 [workspace.dependencies]
 # shared deps, pinned at the workspace root
