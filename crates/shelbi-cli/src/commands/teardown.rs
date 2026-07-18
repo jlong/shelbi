@@ -290,10 +290,13 @@ fn worker_quit_project(progress: &Progress, project: &str) {
 fn worker_quit_shelbi(progress: &Progress, names: &[String]) {
     let _finish = FinishGuard(progress.clone());
     // Fan the handoff requests out so multiple orchestrators write in
-    // parallel; each is bounded by the 30s timeout inside
-    // `request_orchestrator_handoff`, so the worst-case wait is ~30s
-    // regardless of how many projects are live. The render loop shows each
-    // line's spinner + elapsed hint while its thread is in flight.
+    // parallel. Each is bounded inside `request_orchestrator_handoff` (a
+    // capped verified-submit window plus the 30s file-poll timeout), so the
+    // worst-case wait stays bounded regardless of how many projects are live —
+    // and, crucially, the per-project tmux paste is now staged through a
+    // per-invocation-unique buffer, so parallel handoffs no longer race on one
+    // shared buffer. The render loop shows each line's spinner + elapsed hint
+    // while its thread is in flight.
     let handoff_threads: Vec<_> = names
         .iter()
         .enumerate()

@@ -9,8 +9,11 @@
 //! reading — handoff is one-shot, not persistent state.
 //!
 //! Mechanism: for Claude, custom runners, and a one-time migration from a
-//! standalone Codex pane, we type a request into the orchestrator pane and
-//! poll the filesystem for the handoff file. Once Codex has a persisted
+//! standalone Codex pane, we deliver a request into the orchestrator pane
+//! through the shared verified-submit path ([`crate::submit`]) — the same
+//! paste-then-separate-Enter-then-confirm-busy sequence the worker nudges use,
+//! so the request is actually *submitted* rather than left parked in the
+//! composer — and poll the filesystem for the handoff file. Once Codex has a persisted
 //! native thread, that thread is the handoff only while the configured runner
 //! remains Codex; switching to a non-Codex runner instead runs a guided
 //! migration before any pane mutation. Shelbi cannot serialize the native
@@ -23,7 +26,9 @@
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
-use shelbi_core::{Error, Result};
+use shelbi_core::{Error, Host, Result, TmuxAddr};
+
+use crate::submit::{self, SubmitStatus};
 
 /// Hard cap on how long we'll block a reload/quit waiting for the
 /// orchestrator to write its handoff. The orchestrator's response time
@@ -62,6 +67,43 @@ pub enum HandoffOutcome {
     /// because the pane id disappeared between the alive check and
     /// the send). Caller should proceed; same degradation as Timeout.
     SendFailed { reason: String },
+    /// The request text was delivered but we couldn't confirm the orchestrator
+    /// actually *submitted* it within the bounded verify window — the text is
+    /// still parked in the composer, or no busy signal appeared. This is the
+    /// classic paste/Enter race symptom (the same class the worker-nudge
+    /// verified-submit path closes): rather than block the full file-poll
+    /// timeout on a message the orchestrator never accepted, we fail fast.
+    /// Caller should proceed; the next orchestrator starts cold.
+    SubmitUnconfirmed { detail: String },
+}
+
+impl HandoffOutcome {
+    /// Short, stable token for the `events.log` handoff line. Kept terse and
+    /// hyphen-joined so a hub-global tail can filter on it.
+    pub fn event_token(&self) -> &'static str {
+        match self {
+            HandoffOutcome::NativeThread => "native-thread",
+            HandoffOutcome::Written { .. } => "written",
+            HandoffOutcome::PaneNotAlive => "pane-not-alive",
+            HandoffOutcome::Timeout => "timeout",
+            HandoffOutcome::SendFailed { .. } => "send-failed",
+            HandoffOutcome::SubmitUnconfirmed { .. } => "unconfirmed",
+        }
+    }
+
+    /// The extra context to log alongside the token: the written path, the
+    /// send-error reason, or the submission-verification detail. `-` when the
+    /// outcome carries nothing more to say.
+    pub fn event_detail(&self) -> String {
+        match self {
+            HandoffOutcome::Written { path } => path.display().to_string(),
+            HandoffOutcome::SendFailed { reason } => reason.clone(),
+            HandoffOutcome::SubmitUnconfirmed { detail } => detail.clone(),
+            HandoffOutcome::NativeThread
+            | HandoffOutcome::PaneNotAlive
+            | HandoffOutcome::Timeout => "-".to_string(),
+        }
+    }
 }
 
 /// Ask the live orchestrator pane to write
@@ -85,6 +127,19 @@ pub enum HandoffOutcome {
 /// outcome variant comes back — every variant of [`HandoffOutcome`] is
 /// "okay to proceed" semantics, distinguished only for logging.
 pub fn request_orchestrator_handoff(project_name: &str) -> Result<HandoffOutcome> {
+    let outcome = request_orchestrator_handoff_inner(project_name)?;
+    // Make the whole handoff flow diagnosable post-hoc — it used to be
+    // invisible in `events.log`. Best-effort: a logging failure must never
+    // change the teardown/reload verdict the caller is about to act on.
+    let _ = shelbi_state::append_handoff_event(
+        project_name,
+        outcome.event_token(),
+        &outcome.event_detail(),
+    );
+    Ok(outcome)
+}
+
+fn request_orchestrator_handoff_inner(project_name: &str) -> Result<HandoffOutcome> {
     // The native thread is the handoff only for a same-runner Codex reload.
     // A Codex -> Claude/custom switch cannot use composer transport, so the
     // shared preflight instead archives the thread marker (once the durable
@@ -96,9 +151,10 @@ pub fn request_orchestrator_handoff(project_name: &str) -> Result<HandoffOutcome
     }
 
     let project = shelbi_state::load_project(project_name)?;
-    let _runner = project
+    let runner = project
         .runner(&project.orchestrator.runner)
         .ok_or_else(|| Error::UnknownRunner(project.orchestrator.runner.clone()))?;
+    let profile = submit::SubmitProfile::for_runner(runner);
 
     let session = format!("shelbi-{project_name}");
     if !local_session_exists(&session)? {
@@ -120,8 +176,26 @@ pub fn request_orchestrator_handoff(project_name: &str) -> Result<HandoffOutcome
     let _ = std::fs::remove_file(&handoff_path);
 
     let request = handoff_request_message();
-    if let Err(reason) = send_to_pane(&pane_id, &request) {
-        return Ok(HandoffOutcome::SendFailed { reason });
+    // Deliver AND verify the submission through the shared verified-submit
+    // path the worker nudges use. This fixes two bugs at once:
+    //   * the parallel-teardown buffer collision — `submit`/`shelbi_tmux`
+    //     stage the paste through a per-invocation-unique buffer, so two
+    //     projects handing off at the same instant can no longer clobber or
+    //     delete each other's staged text (the old hardcoded `shelbi-handoff`
+    //     buffer name races); and
+    //   * the paste/Enter submission race — the Enter is sent as a separate
+    //     key event after a settle, then we confirm the pane actually went
+    //     busy (retrying Enter once), rather than trusting that tmux exited 0.
+    let addr = TmuxAddr::pane_id(pane_id);
+    let baseline = submit::PaneBaseline::capture(&Host::Local, &addr, profile);
+    let status = match submit::send_verified(&Host::Local, &addr, &request, &baseline) {
+        Ok(status) => status,
+        Err(e) => return Ok(HandoffOutcome::SendFailed { reason: e.to_string() }),
+    };
+    if let SubmitOutcome::FailFast(outcome) = classify_submit(status) {
+        // The orchestrator never accepted the message; don't burn the full
+        // file-poll timeout waiting on a write that will never come.
+        return Ok(outcome);
     }
 
     let deadline = Instant::now() + HANDOFF_TIMEOUT;
@@ -132,6 +206,43 @@ pub fn request_orchestrator_handoff(project_name: &str) -> Result<HandoffOutcome
         std::thread::sleep(POLL_INTERVAL);
     }
     Ok(HandoffOutcome::Timeout)
+}
+
+/// What to do after the verified-submit verdict comes back.
+enum SubmitOutcome {
+    /// The message submitted (or was delivered to a runner we can't verify) —
+    /// poll the filesystem for the handoff file.
+    PollForFile,
+    /// The message never submitted — return this outcome immediately rather
+    /// than waiting the full file-poll timeout.
+    FailFast(HandoffOutcome),
+}
+
+/// Map a [`SubmitStatus`] to whether the handoff should proceed to the file
+/// poll or fail fast. A confirmed submit — or a delivery-only runner whose UI
+/// Shelbi can't inspect — proceeds; a stuck/unconfirmable submit fails fast so
+/// teardown stays bounded and the failure is surfaced instead of masquerading
+/// as a plain timeout.
+fn classify_submit(status: SubmitStatus) -> SubmitOutcome {
+    match status {
+        SubmitStatus::Submitted { .. } | SubmitStatus::DeliveredUnverified { .. } => {
+            SubmitOutcome::PollForFile
+        }
+        SubmitStatus::StillInBox => SubmitOutcome::FailFast(HandoffOutcome::SubmitUnconfirmed {
+            detail: "still-in-box".to_string(),
+        }),
+        SubmitStatus::Unconfirmed => SubmitOutcome::FailFast(HandoffOutcome::SubmitUnconfirmed {
+            detail: "unconfirmed".to_string(),
+        }),
+        // The guard passed to `send_verified` here is always-true, so this is
+        // unreachable in practice; treat it as an unconfirmed submit rather
+        // than silently polling.
+        SubmitStatus::EligibilityRevoked => {
+            SubmitOutcome::FailFast(HandoffOutcome::SubmitUnconfirmed {
+                detail: "eligibility-revoked".to_string(),
+            })
+        }
+    }
 }
 
 /// Validate continuity between the live orchestrator and the runner currently
@@ -337,65 +448,6 @@ fn pane_alive(pane_id: &str) -> Result<bool> {
     Ok(stdout.lines().any(|l| l.trim() == pane_id))
 }
 
-/// Stage `text` through tmux's paste-buffer + paste it to the pane,
-/// then send `Enter` to submit. Mirrors `shelbi_tmux::send_line`'s
-/// multi-line path so the message lands as one atomic paste — the
-/// claude UI's heuristic paste-detection bundles it into one user
-/// turn instead of splitting on intra-message Enters.
-fn send_to_pane(pane_id: &str, text: &str) -> std::result::Result<(), String> {
-    const BUFFER: &str = "shelbi-handoff";
-    // load-buffer reads from stdin so embedded whitespace and shell
-    // metacharacters don't get re-parsed by argv joining.
-    let mut child = std::process::Command::new("tmux")
-        .args(["load-buffer", "-b", BUFFER, "-"])
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .map_err(|e| format!("tmux load-buffer spawn: {e}"))?;
-    {
-        use std::io::Write;
-        let stdin = child
-            .stdin
-            .as_mut()
-            .ok_or_else(|| "tmux load-buffer: failed to open stdin".to_string())?;
-        stdin
-            .write_all(text.as_bytes())
-            .map_err(|e| format!("tmux load-buffer write: {e}"))?;
-    }
-    let load = child
-        .wait_with_output()
-        .map_err(|e| format!("tmux load-buffer wait: {e}"))?;
-    if !load.status.success() {
-        return Err(format!(
-            "tmux load-buffer failed: {}",
-            String::from_utf8_lossy(&load.stderr).trim()
-        ));
-    }
-
-    let paste = std::process::Command::new("tmux")
-        .args(["paste-buffer", "-p", "-d", "-b", BUFFER, "-t", pane_id])
-        .output()
-        .map_err(|e| format!("tmux paste-buffer: {e}"))?;
-    if !paste.status.success() {
-        return Err(format!(
-            "tmux paste-buffer failed: {}",
-            String::from_utf8_lossy(&paste.stderr).trim()
-        ));
-    }
-    let enter = std::process::Command::new("tmux")
-        .args(["send-keys", "-t", pane_id, "Enter"])
-        .output()
-        .map_err(|e| format!("tmux send-keys Enter: {e}"))?;
-    if !enter.status.success() {
-        return Err(format!(
-            "tmux send-keys Enter failed: {}",
-            String::from_utf8_lossy(&enter.stderr).trim()
-        ));
-    }
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -452,6 +504,82 @@ mod tests {
     }
 
     #[test]
+    fn handoff_request_submits_through_verified_path_on_real_tmux() {
+        // The core fix: the (long, multi-line) handoff request must actually
+        // get *submitted* to the orchestrator pane — the paste/Enter race the
+        // verified-submit path closes — not merely pasted. This drives a fake
+        // Claude pane through the same `send_verified` sequence
+        // `request_orchestrator_handoff` now uses and asserts the pane went
+        // busy (proof Enter landed), exercising the real tmux paste-buffer +
+        // separate-Enter + confirm-busy path rather than the pure closures.
+        let tmp = tempfile::tempdir().unwrap();
+        let script = tmp.path().join("fake-claude.sh");
+        fs::write(
+            &script,
+            "#!/bin/sh\n\
+             stty -echo\n\
+             printf '\\033[2J\\033[H────────────────────────────────────────\\n❯\\n────────────────────────────────────────\\n  ? for shortcuts\\n'\n\
+             IFS= read -r line\n\
+             printf '\\033[2J\\033[H✳ Working on message\\n────────────────────────────────────────\\n❯\\n────────────────────────────────────────\\n  esc to interrupt\\n'\n\
+             sleep 2\n",
+        )
+        .unwrap();
+
+        let session = format!("shelbi-handoff-test-{}", std::process::id());
+        let started = std::process::Command::new("tmux")
+            .args([
+                "new-session",
+                "-d",
+                "-s",
+                &session,
+                "-n",
+                "agent",
+                "sh",
+                script.to_str().unwrap(),
+            ])
+            .status();
+        // tmux is optional in dev/test containers and the workspace sandbox may
+        // deny socket access — match the repo's existing optional-tmux skip.
+        let Ok(started) = started else {
+            return;
+        };
+        if !started.success() {
+            return;
+        }
+
+        let addr = TmuxAddr {
+            session: session.clone(),
+            window: "agent".into(),
+        };
+        let ready_deadline = Instant::now() + Duration::from_secs(2);
+        while Instant::now() < ready_deadline {
+            if shelbi_tmux::capture(&Host::Local, &addr)
+                .unwrap_or_default()
+                .contains("? for shortcuts")
+            {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+
+        let baseline = submit::PaneBaseline::capture(&Host::Local, &addr, submit::SubmitProfile::ClaudeUi);
+        let result = submit::send_verified(
+            &Host::Local,
+            &addr,
+            &handoff_request_message(),
+            &baseline,
+        );
+        let _ = std::process::Command::new("tmux")
+            .args(["kill-session", "-t", &session])
+            .status();
+
+        assert!(
+            matches!(result, Ok(SubmitStatus::Submitted { .. })),
+            "handoff request must verify as submitted, got {result:?}"
+        );
+    }
+
+    #[test]
     fn handoff_outcome_variants_distinguish_proceed_reasons() {
         // No semantic assertions here — the variants are an enum we
         // only ever match on for logging. This test just locks in
@@ -463,6 +591,77 @@ mod tests {
         assert_ne!(written, HandoffOutcome::Timeout);
         assert_ne!(HandoffOutcome::PaneNotAlive, HandoffOutcome::Timeout);
         assert_ne!(HandoffOutcome::NativeThread, HandoffOutcome::Timeout);
+    }
+
+    #[test]
+    fn classify_submit_polls_on_confirmed_or_unverified_and_fails_fast_when_stuck() {
+        // A confirmed submit (either window) proceeds to the file poll.
+        assert!(matches!(
+            classify_submit(SubmitStatus::Submitted {
+                detail: "busy_observed"
+            }),
+            SubmitOutcome::PollForFile
+        ));
+        // A delivery-only runner we can't inspect still proceeds — best-effort,
+        // exactly as the pre-verification handoff did.
+        assert!(matches!(
+            classify_submit(SubmitStatus::DeliveredUnverified {
+                detail: "verification_unsupported"
+            }),
+            SubmitOutcome::PollForFile
+        ));
+        // Text visibly parked in the composer after the retry Enter is the
+        // race symptom — fail fast to a bounded `unconfirmed`, not a full
+        // file-poll timeout.
+        match classify_submit(SubmitStatus::StillInBox) {
+            SubmitOutcome::FailFast(HandoffOutcome::SubmitUnconfirmed { detail }) => {
+                assert_eq!(detail, "still-in-box");
+            }
+            _ => panic!("StillInBox must fail fast to an unconfirmed outcome"),
+        }
+        // No signal at all is likewise unconfirmed.
+        assert!(matches!(
+            classify_submit(SubmitStatus::Unconfirmed),
+            SubmitOutcome::FailFast(HandoffOutcome::SubmitUnconfirmed { .. })
+        ));
+    }
+
+    #[test]
+    fn event_token_and_detail_cover_every_outcome() {
+        // The events.log line the teardown/reload paths emit must have a stable
+        // token per outcome so a hub-global tail can filter on it.
+        assert_eq!(HandoffOutcome::NativeThread.event_token(), "native-thread");
+        assert_eq!(HandoffOutcome::PaneNotAlive.event_token(), "pane-not-alive");
+        assert_eq!(HandoffOutcome::Timeout.event_token(), "timeout");
+        assert_eq!(
+            HandoffOutcome::SendFailed {
+                reason: "boom".into()
+            }
+            .event_token(),
+            "send-failed"
+        );
+        let written = HandoffOutcome::Written {
+            path: PathBuf::from("/tmp/handoff.md"),
+        };
+        assert_eq!(written.event_token(), "written");
+        assert_eq!(written.event_detail(), "/tmp/handoff.md");
+        // Detail carries the reason / verification note verbatim (the sink
+        // sanitizes whitespace) and `-` when there's nothing extra.
+        assert_eq!(
+            HandoffOutcome::SendFailed {
+                reason: "pane gone".into()
+            }
+            .event_detail(),
+            "pane gone"
+        );
+        assert_eq!(
+            HandoffOutcome::SubmitUnconfirmed {
+                detail: "still-in-box".into()
+            }
+            .event_token(),
+            "unconfirmed"
+        );
+        assert_eq!(HandoffOutcome::Timeout.event_detail(), "-");
     }
 
     #[test]
