@@ -160,9 +160,11 @@ fn add(project: &str, name: &str, machine: Option<&str>, runner: Option<&str>) -
         {
             orch_workspace::SettingsWireResult::Wired => {}
             orch_workspace::SettingsWireResult::MergeRequired { message } => {
-                // Case 4: user-authored settings.local.json. Print the
-                // structured, orchestrator-addressed message and exit with a
-                // DISTINCT status WITHOUT persisting the pool entry.
+                // A user-authored settings.local.json whose shape Shelbi can't
+                // safely self-heal (unparseable, or a non-object/odd `hooks`
+                // shape). Print the structured, orchestrator-addressed message
+                // and exit with a DISTINCT status WITHOUT persisting the pool
+                // entry.
                 eprintln!("{message}");
                 std::process::exit(SETTINGS_MERGE_REQUIRED_EXIT);
             }
