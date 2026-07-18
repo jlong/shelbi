@@ -5935,6 +5935,10 @@ mod user_shell_tmux_tests {
             eprintln!("skipping: tmux not on PATH");
             return;
         }
+        // Serialize with every other SHELBI_HOME-mutating test in the crate:
+        // this test rewrites the env var, and the default multithreaded runner
+        // would otherwise race concurrent readers (flaking hub probes).
+        let _lock = crate::test_lock::acquire();
         // Isolate on a private tmux server so the mark file the kill writes
         // (SHELBI_HOME-scoped) and the session can't collide with a real hub.
         let home = std::env::temp_dir().join(format!("shelbi-reap-{}", std::process::id()));
