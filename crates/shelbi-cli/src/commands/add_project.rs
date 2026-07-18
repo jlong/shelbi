@@ -187,9 +187,9 @@ fn toggle_config(state: &mut FormState, key: KeyEvent) {
 
 /// Cheap, cached detection shown on the "Detected:" line. Deliberately
 /// limited to the git-repo check `validate_root` already performs — the
-/// heavier default-branch / workspace-count / machine detection
-/// `shelbi init` runs is deferred to the scaffold step so the dialog
-/// stays responsive per keystroke.
+/// heavier default-branch / runner / machine detection `shelbi init` runs
+/// is deferred to the scaffold step so the dialog stays responsive per
+/// keystroke.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Detected {
     exists: bool,

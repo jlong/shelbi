@@ -548,8 +548,9 @@ The `Review` status is where the review workspace comes in. It's
 carries `tags: [review]`. When a task lands here, the orchestrator dispatches
 it to a **`review`-tagged workspace** and loads the [Reviewer
 agent](/docs/concepts/agents), which stands up the running app so you can
-click through the branch before you merge. The scaffold provisions one
-`review`-tagged workspace slot on the hub for exactly this. See
+click through the branch before you merge. Declare a `review`-tagged workspace
+slot on the hub for exactly this (add `tags: [review]` to a workspace in the
+project YAML). See
 [Review workspaces](/docs/concepts/review-workspaces) for the tag-matching
 rules and how the dev server is booted.
 

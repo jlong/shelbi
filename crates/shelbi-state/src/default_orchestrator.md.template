@@ -203,6 +203,65 @@ process dies (Monitor reports the task ended), restart it on your next turn;
 it resumes from the durable cursor, so any batch you had not acked is
 re-delivered.
 
+If the Workspaces snapshot shows the pool is **empty**, run the first-boot
+workspace-provisioning interview below before you start dispatching — a project
+with no workspaces can't do any work.
+
+## First-boot workspace provisioning
+
+`shelbi init` no longer provisions workspaces; a freshly-created project ships
+with an **empty pool** and defers the choice to you. The first-boot signal is
+simply that the project has **no workspaces**: the Workspaces section of
+`shelbi status --full` (equivalently `shelbi workspace list`) shows none, and a
+`workspaces: []` pool reads as count 0. When you see that at bootstrap, run this
+interview once, then fall through to normal operation.
+
+**This step needs your questions tool, which only works in an interactive
+session.** In a non-interactive / headless run (cron, a scripted launch) the
+tool is unavailable, so provision nothing and leave the pool empty — the next
+interactive boot runs the interview. There is deliberately **no flag fallback**.
+
+Interactively, ask the user two questions with your questions tool (Claude:
+`AskUserQuestion`; Codex: `ask_user_question`):
+
+1. **How many workspaces?** Offer a small set of sensible options — e.g. `2`,
+   `3`, `5` — plus a custom entry. Each workspace is a long-lived slot (one
+   worktree, one task at a time): more slots run more work in parallel but cost
+   more memory and CPU on the machine.
+2. **Naming scheme?** Offer the three presets (take the first *count* names from
+   whichever the user picks):
+   - **Phonetic** — alpha, bravo, charlie, delta, echo, foxtrot, golf, hotel, …
+   - **Greek** — alpha, beta, gamma, delta, epsilon, zeta, eta, theta, …
+   - **ToyStory** — woody, buzz, jessie, rex, hamm, slinky, bullseye, …
+
+These are the exact `shelbi_core::workspace_names` presets — generate names by
+taking the first *count* entries in order (keep them in sync if the presets ever
+change). Then create each workspace on the **current / local machine**, one call
+per generated name, in order:
+
+    shelbi workspace add <name>
+
+`workspace add` places the slot on the local hub, materializes its worktree, and
+wires Shelbi's Claude hooks into `.claude/settings.local.json`.
+
+**Handle the settings.local.json merge request.** If the repo already has a
+user-authored `.claude/settings.local.json` that doesn't contain Shelbi's hook
+block, `workspace add` refuses to touch it: it prints a structured message
+addressed to you (it begins `workspace <name>: a user-authored … already
+exists`) carrying the exact hook JSON to merge between
+`----- BEGIN shelbi hook template -----` / `----- END shelbi hook template -----`
+markers, and exits **without** adding the workspace. When you see it:
+
+1. Read the existing `.claude/settings.local.json`.
+2. Merge Shelbi's printed hook block into it, **preserving the user's own
+   content** — add the hook entries; never overwrite unrelated keys.
+3. Write the merged file back.
+4. Re-run `shelbi workspace add <name>` — it now sees the block is present and
+   succeeds.
+
+Once every workspace is created the pool is no longer empty, so this step won't
+fire again. Then continue with the normal bootstrap and start dispatching.
+
 ## Polling-only event drain
 
 Some runners cannot receive asynchronous Monitor callbacks while they are

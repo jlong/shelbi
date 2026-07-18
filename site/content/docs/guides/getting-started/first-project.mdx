@@ -59,7 +59,7 @@ After preflight, Shelbi summarizes everything it will create:
   │  repo        ~/code/myapp (main)                         │
   │  github      github.com:you/myapp.git                    │
   │  agent       codex                                       │
-  │  workspaces  alpha bravo charlie delta + review (hub)    │
+  │  workspaces  created on first boot                       │
   │  workflows   task (branch → PR → review) · subtask       │
   │  agents      orchestrator · developer · review           │
   │              (+ qa, security, adversarial, opt-in)       │
@@ -74,10 +74,13 @@ After preflight, Shelbi summarizes everything it will create:
 - Press **`c`** to customize the detected values before creating anything.
 - Press **`q`**, **Esc**, or **Ctrl+C** to quit without writing project state.
 
-The displayed plan includes the local `hub`, development workspaces, a separate
-review workspace, the shipped `task` and `subtask` workflows, and the default
-agent roles. Both built-in runner declarations remain available in settings,
-even though the detected runner is selected for the generated workspaces.
+The displayed plan includes the local `hub`, the shipped `task` and `subtask`
+workflows, and the default agent roles. Both built-in runner declarations remain
+available in settings, even though the detected runner is the one the
+orchestrator uses for the workspaces it creates. The **workspace pool starts
+empty**: the orchestrator provisions it on first boot, asking how many
+workspaces and which naming scheme you want and creating each with `shelbi
+workspace add`.
 
 ### Customize instead
 
@@ -92,14 +95,13 @@ Customize setup. Press Enter to keep each detected value.
 ? Default branch:
 ? GitHub repo URL (optional):
 ? Agent runner (used by every workspace):
-? Workspace count per machine:
-? Workspace naming style:
 ? Orchestrator runner:
 ```
 
 This is where you can choose a different project name or root, change the
-branch or remote, size and name the workspace pool, or use a different runner
-for the orchestrator.
+branch or remote, or use a different runner for the orchestrator. Workspaces
+themselves are sized and named later, in the orchestrator's first-boot
+interview.
 
 ## 3. Land on the dashboard
 

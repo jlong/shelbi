@@ -18,8 +18,7 @@ use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifier
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
 use inquire::{Confirm, Select, Text};
 use shelbi_core::{
-    format_bytes_short, recommended_workspace_count, total_memory_bytes, AgentRunnerSpec, Machine,
-    MachineKind, OrchestratorSpec, Project, WorkspaceNamePreset, WorkspaceSpec,
+    AgentRunnerSpec, Machine, MachineKind, OrchestratorSpec, Project,
 };
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
@@ -100,8 +99,6 @@ pub(crate) struct DetectedSetupPlan {
     pub(crate) detected_runners: Vec<DetectedRunner>,
     pub(crate) tmux_version: String,
     pub(crate) cpu_count: usize,
-    pub(crate) workspace_count: u32,
-    pub(crate) workspace_preset: WorkspaceNamePreset,
     /// Repository path approved for deferred `git init`. `None` means the
     /// detected root was already a repository. Keeping the path (rather than
     /// only a bool) lets Customize safely distinguish a newly chosen path.
@@ -118,8 +115,6 @@ pub(crate) struct SetupPlanOverrides {
     pub(crate) default_branch: Option<String>,
     pub(crate) remote_url: Option<String>,
     pub(crate) orchestrator_runner: Option<Runner>,
-    pub(crate) workspace_count: Option<u32>,
-    pub(crate) workspace_preset: Option<WorkspaceNamePreset>,
 }
 
 impl DetectedSetupPlan {
@@ -162,15 +157,6 @@ impl DetectedSetupPlan {
             }
             self.orchestrator_runner = orchestrator_runner;
         }
-        if let Some(workspace_count) = overrides.workspace_count {
-            if workspace_count == 0 {
-                bail!("--workspace-count must be at least 1");
-            }
-            self.workspace_count = workspace_count;
-        }
-        if let Some(workspace_preset) = overrides.workspace_preset {
-            self.workspace_preset = workspace_preset;
-        }
 
         // Keep schema validation ahead of every write. The shared commit
         // boundary repeats this check for interactive Customize callers.
@@ -187,13 +173,12 @@ impl DetectedSetupPlan {
             tags: Vec::new(),
             forward: None,
         };
-        let mut workspaces = assign_workspace_names(
-            std::slice::from_ref(&hub),
-            self.workspace_count,
-            self.workspace_preset,
-            self.selected_runner,
-        )?;
-        append_review_workspace(&mut workspaces, &hub, self.selected_runner);
+        // A freshly-init'd project ships with an empty workspace pool. The
+        // orchestrator provisions the pool on first boot via its questions
+        // tool (see the "Bootstrap on session start" first-boot step in the
+        // orchestrator instructions), creating each slot with
+        // `shelbi workspace add`.
+        let workspaces = Vec::new();
 
         // Selection is intentionally singular, but both built-in runner
         // declarations stay available so installing or switching later is a
@@ -780,7 +765,6 @@ trait SetupProbe {
     fn runner_version(&mut self, runner: Runner) -> Option<String>;
     fn tmux_version(&mut self) -> Option<String>;
     fn cpu_count(&mut self) -> usize;
-    fn workspace_recommendation(&mut self) -> (u32, Option<String>);
 }
 
 struct RealSetupProbe;
@@ -816,10 +800,6 @@ impl SetupProbe for RealSetupProbe {
         std::thread::available_parallelism()
             .map(usize::from)
             .unwrap_or(1)
-    }
-
-    fn workspace_recommendation(&mut self) -> (u32, Option<String>) {
-        workspace_count_recommendation(1)
     }
 }
 
@@ -875,7 +855,6 @@ struct DetectionSnapshot {
     runners: Vec<DetectedRunner>,
     tmux_version: String,
     cpu_count: usize,
-    workspace_count: u32,
 }
 
 fn detect_snapshot<P, S>(git: GitDefaults, probe: &mut P, sink: &mut S) -> Result<DetectionSnapshot>
@@ -935,14 +914,9 @@ where
     }
 
     let cpu_count = probe.cpu_count().max(1);
-    let (workspace_count, _) = probe.workspace_recommendation();
     sink.emit(PreflightItem::ok(
         "machine",
-        format!(
-            "{cpu_count} core{}, recommending {workspace_count} workspace{}",
-            if cpu_count == 1 { "" } else { "s" },
-            if workspace_count == 1 { "" } else { "s" }
-        ),
+        format!("{cpu_count} core{}", if cpu_count == 1 { "" } else { "s" }),
     ))?;
 
     if runners.is_empty() {
@@ -965,7 +939,6 @@ where
         runners,
         tmux_version,
         cpu_count,
-        workspace_count: workspace_count.max(1),
     })
 }
 
@@ -995,8 +968,6 @@ fn assemble_plan(
         detected_runners: snapshot.runners,
         tmux_version: snapshot.tmux_version,
         cpu_count: snapshot.cpu_count,
-        workspace_count: snapshot.workspace_count,
-        workspace_preset: WorkspaceNamePreset::Phonetic,
         git_init_root,
     }
 }
@@ -1304,20 +1275,6 @@ fn customize_from(plan: &DetectedSetupPlan) -> Result<DetectedSetupPlan> {
         &plan.detected_runners,
         plan.selected_runner,
     )?;
-    let workspace_count = prompt_workspace_count(plan.workspace_count)?;
-    let presets = WorkspaceNamePreset::ALL
-        .into_iter()
-        .map(PresetChoice)
-        .collect::<Vec<_>>();
-    let preset_cursor = WorkspaceNamePreset::ALL
-        .iter()
-        .position(|preset| *preset == plan.workspace_preset)
-        .unwrap_or(0);
-    let workspace_preset = Select::new("Workspace naming style:", presets)
-        .with_starting_cursor(preset_cursor)
-        .prompt()
-        .context("workspace naming style selection")?
-        .0;
     let orchestrator_runner = prompt_runner(
         "Orchestrator runner:",
         &plan.detected_runners,
@@ -1335,8 +1292,6 @@ fn customize_from(plan: &DetectedSetupPlan) -> Result<DetectedSetupPlan> {
         detected_runners: plan.detected_runners.clone(),
         tmux_version: plan.tmux_version.clone(),
         cpu_count: plan.cpu_count,
-        workspace_count,
-        workspace_preset,
         git_init_root: plan.git_init_root.clone(),
     })
 }
@@ -1374,14 +1329,6 @@ fn customization_runner_choices(runners: &[DetectedRunner]) -> Vec<RunnerChoice>
         .collect()
 }
 
-struct PresetChoice(WorkspaceNamePreset);
-
-impl Display for PresetChoice {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(self.0.label())
-    }
-}
-
 /// The default project name derived from the repo basename: the slug plus the
 /// human-readable label to keep when slugifying changed it. Falls back to
 /// `my-project` (no label) when the basename has nothing to slugify.
@@ -1417,73 +1364,6 @@ fn prompt_project_name(default: &str) -> Result<(String, Option<String>)> {
         .prompt()
         .context("project name prompt")?;
     crate::project_root::slug_and_display(&raw)
-}
-
-fn workspace_count_recommendation(machine_count: u32) -> (u32, Option<String>) {
-    match total_memory_bytes() {
-        Ok(bytes) => {
-            let count = recommended_workspace_count(bytes, machine_count);
-            let hint = format!(
-                "memory: {} → recommended {} workspace{} per machine",
-                format_bytes_short(bytes),
-                count,
-                if count == 1 { "" } else { "s" }
-            );
-            (count, Some(hint))
-        }
-        Err(_) => (1, None),
-    }
-}
-
-fn prompt_workspace_count(default: u32) -> Result<u32> {
-    loop {
-        let raw = text("Workspace count per machine:", &default.to_string())?;
-        match raw.trim().parse::<u32>() {
-            Ok(value) if value >= 1 => return Ok(value),
-            _ => println!("  (expected a positive integer)"),
-        }
-    }
-}
-
-fn assign_workspace_names(
-    machines: &[Machine],
-    count: u32,
-    preset: WorkspaceNamePreset,
-    runner: Runner,
-) -> Result<Vec<WorkspaceSpec>> {
-    let preset_names = preset.names();
-    let total = (count as usize) * machines.len();
-    let mut workspaces = Vec::with_capacity(total);
-    let mut cursor = 0usize;
-    for machine in machines {
-        for slot in 0..count {
-            let name = if cursor < preset_names.len() {
-                let name = preset_names[cursor].to_string();
-                cursor += 1;
-                name
-            } else {
-                format!("{}-{}", machine.name, slot + 1)
-            };
-            workspaces.push(WorkspaceSpec {
-                name,
-                machine: machine.name.clone(),
-                runner: runner.id().to_string(),
-                tags: Vec::new(),
-                slot: None,
-            });
-        }
-    }
-    Ok(workspaces)
-}
-
-fn append_review_workspace(workspaces: &mut Vec<WorkspaceSpec>, hub: &Machine, runner: Runner) {
-    workspaces.push(WorkspaceSpec {
-        name: "review".to_string(),
-        machine: hub.name.clone(),
-        runner: runner.id().to_string(),
-        tags: vec!["review".to_string()],
-        slot: None,
-    });
 }
 
 fn write_workspace_settings_template(project: &str) -> Result<()> {
@@ -1591,7 +1471,10 @@ fn render_plan_card(writer: &mut impl Write, plan: &DetectedSetupPlan) -> Result
             .unwrap_or_else(|| "not configured".to_string()),
     ));
     lines.extend(card_rows("agent", plan.selected_runner.id()));
-    lines.extend(card_rows("workspaces", &workspace_summary(plan)));
+    lines.extend(card_rows(
+        "workspaces",
+        "created at first boot (orchestrator interview)",
+    ));
     lines.extend(card_rows(
         "workflows",
         "task (branch → PR → review) · subtask",
@@ -1709,29 +1592,6 @@ fn render_card_line(writer: &mut impl Write, width: usize, content: &str) -> Res
     let padding = width.saturating_sub(content.width());
     writeln!(writer, "  │{content}{}│", " ".repeat(padding))?;
     Ok(())
-}
-
-fn workspace_summary(plan: &DetectedSetupPlan) -> String {
-    let hub = Machine {
-        name: "hub".into(),
-        kind: MachineKind::Local,
-        work_dir: plan.repo_root.clone(),
-        host: None,
-        tags: Vec::new(),
-        forward: None,
-    };
-    let names = assign_workspace_names(
-        &[hub],
-        plan.workspace_count,
-        plan.workspace_preset,
-        plan.selected_runner,
-    )
-    .unwrap_or_default()
-    .into_iter()
-    .map(|workspace| workspace.name)
-    .collect::<Vec<_>>()
-    .join(" ");
-    format!("{names} + review (hub)")
 }
 
 fn display_path(path: &Path) -> String {
@@ -1853,8 +1713,6 @@ mod tests {
             detected_runners: vec![fixture_runner(runner)],
             tmux_version: "3.5a".to_string(),
             cpu_count: 10,
-            workspace_count: 4,
-            workspace_preset: WorkspaceNamePreset::Phonetic,
             git_init_root: None,
         }
     }
@@ -1865,7 +1723,6 @@ mod tests {
         runners: Vec<DetectedRunner>,
         tmux_version: Option<String>,
         cpu_count: usize,
-        workspace_count: u32,
         init_calls: usize,
         init_error: Option<String>,
     }
@@ -1878,7 +1735,6 @@ mod tests {
                 runners,
                 tmux_version: Some("3.5a".to_string()),
                 cpu_count: 10,
-                workspace_count: 4,
                 init_calls: 0,
                 init_error: None,
             }
@@ -1917,10 +1773,6 @@ mod tests {
 
         fn cpu_count(&mut self) -> usize {
             self.cpu_count
-        }
-
-        fn workspace_recommendation(&mut self) -> (u32, Option<String>) {
-            (self.workspace_count, None)
         }
     }
 
@@ -2075,8 +1927,6 @@ mod tests {
                 "https://user:secret@github.com/example/demo.git?token=hidden".to_string(),
             ),
             orchestrator_runner: Some(Runner::Claude),
-            workspace_count: Some(3),
-            workspace_preset: Some(WorkspaceNamePreset::ToyStory),
         })
         .unwrap();
 
@@ -2088,27 +1938,12 @@ mod tests {
         );
         assert_eq!(plan.selected_runner, Runner::Codex);
         assert_eq!(plan.orchestrator_runner, Runner::Claude);
-        assert_eq!(plan.workspace_count, 3);
-        assert_eq!(plan.workspace_preset, WorkspaceNamePreset::ToyStory);
 
         let project = plan.to_project().unwrap();
         assert_eq!(project.orchestrator.runner, "claude");
-        assert_eq!(project.workspaces.len(), 4);
-        assert_eq!(project.workspaces[0].name, "woody");
-        assert!(project
-            .workspaces
-            .iter()
-            .all(|workspace| workspace.runner == "codex"));
-
-        let mut zero = fixture_plan(root.path(), Runner::Claude);
-        assert!(zero
-            .apply_overrides(SetupPlanOverrides {
-                workspace_count: Some(0),
-                ..SetupPlanOverrides::default()
-            })
-            .unwrap_err()
-            .to_string()
-            .contains("at least 1"));
+        // Workspace provisioning is deferred to the orchestrator's first-boot
+        // interview, so a scripted init produces an empty pool.
+        assert!(project.workspaces.is_empty());
 
         let mut invalid_branch = fixture_plan(root.path(), Runner::Claude);
         assert!(invalid_branch
@@ -2236,7 +2071,7 @@ mod tests {
         assert!(ui.preflight.iter().all(|item| item.success));
         assert!(ui.preflight[3].value.contains("claude 2.1.0"));
         assert!(ui.preflight[3].value.contains("codex 0.101.0"));
-        assert_eq!(ui.preflight[5].value, "10 cores, recommending 4 workspaces");
+        assert_eq!(ui.preflight[5].value, "10 cores");
     }
 
     #[test]
@@ -2471,10 +2306,9 @@ mod tests {
     }
 
     #[test]
-    fn plan_card_renders_complete_six_workspace_plan_without_truncation() {
+    fn plan_card_renders_complete_plan_without_truncation() {
         let root = Path::new("/Users/example/Workspaces/shaft");
-        let mut plan = fixture_plan(root, Runner::Claude);
-        plan.workspace_count = 6;
+        let plan = fixture_plan(root, Runner::Claude);
         let mut writer = RecordingWriter::default();
         render_plan_card(&mut writer, &plan).unwrap();
         let card = writer.text();
@@ -2482,7 +2316,10 @@ mod tests {
             "shaft",
             "github.com/jlong/shaft",
             "claude",
-            "alpha bravo charlie delta echo foxtrot + review (hub)",
+            // Workspaces are no longer provisioned at init — the card points
+            // at the orchestrator's first-boot interview instead of listing
+            // slot names.
+            "created at first boot (orchestrator interview)",
             "task (branch → PR → review) · subtask",
             "orchestrator · developer · review",
             "(+ qa, security, adversarial, opt-in)",
@@ -2498,23 +2335,19 @@ mod tests {
             "card discarded detected fields:\n{card}"
         );
         assert!(
-            card.contains("workspaces  alpha"),
+            card.contains("workspaces  created at first boot"),
             "card labels ran together:\n{card}"
         );
     }
 
     #[test]
-    fn plan_card_wraps_large_recommendations_to_terminal_friendly_width() {
+    fn plan_card_wraps_long_values_to_terminal_friendly_width() {
         let mut plan = fixture_plan(Path::new("/tmp/shaft"), Runner::Claude);
-        plan.workspace_count = 16;
         plan.repo_root = PathBuf::from(format!("/tmp/{}", "專案".repeat(24)));
         let mut writer = RecordingWriter::default();
         render_plan_card(&mut writer, &plan).unwrap();
         let card = writer.text();
 
-        for name in WorkspaceNamePreset::Phonetic.names().iter().take(16) {
-            assert!(card.contains(name), "missing workspace {name:?}:\n{card}");
-        }
         for line in card.lines() {
             assert!(
                 line.width() <= MAX_CARD_INNER_WIDTH + 4,
@@ -2641,19 +2474,14 @@ mod tests {
     }
 
     #[test]
-    fn default_plan_propagates_selected_runner_to_all_workspaces_and_orchestrator() {
+    fn default_plan_sets_orchestrator_runner_and_empty_pool() {
         let root = TempDir::new().unwrap();
         let plan = fixture_plan(root.path(), Runner::Codex);
         let project = plan.to_project().unwrap();
         assert_eq!(project.orchestrator.runner, "codex");
-        assert_eq!(project.workspaces.len(), 5);
-        assert!(project
-            .workspaces
-            .iter()
-            .all(|workspace| workspace.runner == "codex"));
-        let review = project.workspaces.last().unwrap();
-        assert_eq!(review.name, "review");
-        assert_eq!(review.tags, vec!["review".to_string()]);
+        // Workspaces are provisioned by the orchestrator's first-boot
+        // interview, not at init — a fresh project has an empty pool.
+        assert!(project.workspaces.is_empty());
         assert_eq!(project.default_workflow.as_deref(), Some("task"));
         assert_eq!(
             project
@@ -2941,8 +2769,6 @@ mod tests {
             detected.remote_url.as_deref(),
             Some("git@github.com:jlong/shaft.git")
         );
-        assert_eq!(detected.workspace_count, 4);
-        assert_eq!(detected.workspace_preset, WorkspaceNamePreset::Phonetic);
         assert_eq!(detected.selected_runner, Runner::Claude);
         assert_eq!(detected.orchestrator_runner, Runner::Claude);
         assert_eq!(detected.detected_runners.len(), 2);
@@ -2952,10 +2778,9 @@ mod tests {
         let saved = shelbi_state::load_project("custom-shaft").unwrap();
         assert_eq!(saved.default_branch, "develop");
         assert_eq!(saved.orchestrator.runner, "claude");
-        assert!(saved
-            .workspaces
-            .iter()
-            .all(|workspace| workspace.runner == "codex"));
+        // The pool is provisioned later by the orchestrator's first-boot
+        // interview, so the saved project starts empty.
+        assert!(saved.workspaces.is_empty());
     }
 
     #[test]
@@ -3035,46 +2860,7 @@ mod tests {
     }
 
     #[test]
-    fn assign_workspace_names_and_project_name_helpers_retain_existing_behavior() {
-        let machines = vec![
-            Machine {
-                name: "hub".into(),
-                kind: MachineKind::Local,
-                work_dir: "/tmp".into(),
-                host: None,
-                tags: Vec::new(),
-                forward: None,
-            },
-            Machine {
-                name: "remote".into(),
-                kind: MachineKind::Ssh,
-                work_dir: "/tmp".into(),
-                host: Some("remote".into()),
-                tags: Vec::new(),
-                forward: None,
-            },
-        ];
-        let workspaces =
-            assign_workspace_names(&machines, 2, WorkspaceNamePreset::Phonetic, Runner::Claude)
-                .unwrap();
-        let names = workspaces
-            .iter()
-            .map(|workspace| workspace.name.as_str())
-            .collect::<Vec<_>>();
-        assert_eq!(names, vec!["alpha", "bravo", "charlie", "delta"]);
-        assert_eq!(workspaces[2].machine, "remote");
-
-        let fallback = assign_workspace_names(
-            &machines[..1],
-            22,
-            WorkspaceNamePreset::ToyStory,
-            Runner::Codex,
-        )
-        .unwrap();
-        assert_eq!(fallback[0].name, "woody");
-        assert_eq!(fallback[20].name, "hub-21");
-        assert!(fallback.iter().all(|workspace| workspace.runner == "codex"));
-
+    fn project_name_helper_retains_existing_behavior() {
         assert_eq!(
             wizard_default_project_name(Path::new("/tmp/Shaft")),
             ("shaft".to_string(), Some("Shaft".to_string()))
@@ -3087,14 +2873,5 @@ mod tests {
             wizard_default_project_name(Path::new("/")),
             ("my-project".to_string(), None)
         );
-    }
-
-    #[test]
-    fn workspace_recommendation_contract_remains_positive() {
-        let (count, hint) = workspace_count_recommendation(1);
-        assert!(count >= 1);
-        if let Some(hint) = hint {
-            assert!(hint.contains("recommended"));
-        }
     }
 }

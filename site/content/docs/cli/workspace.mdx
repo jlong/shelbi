@@ -8,11 +8,13 @@ summary: Inspect and control the project's declared workspace pool — list slot
 shelbi workspace <SUBCOMMAND> [OPTIONS]
 ```
 
-`shelbi workspace` is read-mostly: the pool is declared in the project YAML and
-doesn't change at runtime. There's no `workspace add` or `workspace rm`. You
-use it to observe (what's idle or working, which runner and agent are loaded
-where), change existing slot runners, and intervene (stop a pane to release a
-stuck task).
+`shelbi workspace` manages the project's declared workspace pool. A freshly
+[`init`](/docs/cli/init)'d project starts with an empty pool; the orchestrator
+provisions it on first boot (asking how many workspaces and which naming scheme),
+adding each slot with `shelbi workspace add <name>`. Beyond that you use these
+commands to observe (what's idle or working, which runner and agent are loaded
+where), grow or shrink the pool (`add` / `rm`), change existing slot runners, and
+intervene (stop a pane to release a stuck task).
 
 A [workspace](/docs/concepts/workspaces) is capacity: a machine, a tmux pane,
 and a worktree; the [agent](/docs/concepts/agents) inside it is chosen per task

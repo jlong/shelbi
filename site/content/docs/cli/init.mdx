@@ -16,9 +16,14 @@ shelbi init [OPTIONS]
 
 The `-y` path performs the full prerequisite and project validation before it
 writes anything. It uses the current directory by default, detects the Git
-root, branch, origin, runner, tmux, workspace count, and naming preset, then
-creates the same project and Welcome card as Enter on the interactive setup
-card.
+root, branch, origin, runner, and tmux, then creates the same project and
+Welcome card as Enter on the interactive setup card.
+
+The project is created with an **empty workspace pool**. `shelbi init` no longer
+provisions workspaces; the orchestrator sets them up on first boot by asking how
+many workspaces and which naming scheme you want, then creating each one with
+[`shelbi workspace add`](/docs/cli/workspace). Run `shelbi` interactively for that
+first-boot interview.
 
 ## Automation
 
@@ -42,9 +47,9 @@ For a different checkout or CI workspace:
 shelbi init -y --root /workspace/myapp --runner claude
 ```
 
-`--runner` selects the runner for generated workspaces and is also the default
-orchestrator runner. Use `--orchestrator-runner` only when those should differ.
-The selected runners must be installed on `PATH`.
+`--runner` selects the runner for the workspaces the orchestrator later creates
+and is also the default orchestrator runner. Use `--orchestrator-runner` only
+when those should differ. The selected runners must be installed on `PATH`.
 
 <Callout type="warning" title="Do not omit --runner when both are installed">
 
@@ -60,11 +65,9 @@ Pass `--runner claude` or `--runner codex` to make automation deterministic.
 | `-y, --yes` | flag | off | Accept the detected plan without prompts. This is a global flag and may appear before or after `init`. |
 | `--project <PROJECT>` | string | project-root basename | Override the generated project name. |
 | `--root <ROOT>` | path | current directory with `-y` | Repository Shelbi will manage. |
-| `--runner <RUNNER>` | `claude` \| `codex` | the only detected runner | Runner for generated workspaces. Required when both supported runners are installed. |
+| `--runner <RUNNER>` | `claude` \| `codex` | the only detected runner | Runner for the workspaces the orchestrator creates on first boot. Required when both supported runners are installed. |
 | `--default-branch <BRANCH>` | string | detected branch, then `main` | Override the detected default branch. `--branch` is an alias. |
 | `--github-url <URL>` | string | detected origin | Override the detected origin URL. `--remote` is an alias; pass an empty value to omit it. |
-| `--workspace-count <COUNT>` | integer, at least 1 | machine recommendation | Number of development workspaces. A separate review workspace is always added. `--workspaces` is an alias. |
-| `--workspace-preset <PRESET>` | `phonetic` \| `greek` \| `toy-story` | detected default | Naming preset for generated workspaces. |
 | `--orchestrator-runner <RUNNER>` | `claude` \| `codex` | selected `--runner` | Use a different installed runner for the orchestrator. |
 
 Detected-plan overrides require `-y`. The `-y` path cannot be combined with

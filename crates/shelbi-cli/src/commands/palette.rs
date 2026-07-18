@@ -1458,8 +1458,6 @@ fn create_and_open_project(form: super::add_project::AddProjectForm) -> Result<(
         runner: None,
         default_branch: None,
         github_url: None,
-        workspace_count: None,
-        workspace_preset: None,
         orchestrator_runner: None,
         pick_up: false,
     };

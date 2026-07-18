@@ -641,10 +641,6 @@ mod cli_tests {
             "develop",
             "--github-url",
             "https://github.com/example/demo.git",
-            "--workspace-count",
-            "3",
-            "--workspace-preset",
-            "toy-story",
             "--orchestrator-runner",
             "claude",
         ]);
@@ -669,11 +665,6 @@ mod cli_tests {
         assert_eq!(
             args.github_url.as_deref(),
             Some("https://github.com/example/demo.git")
-        );
-        assert_eq!(args.workspace_count, Some(3));
-        assert_eq!(
-            args.workspace_preset,
-            Some(shelbi_core::WorkspaceNamePreset::ToyStory)
         );
         assert_eq!(args.orchestrator_runner, Some(wizard::Runner::Claude));
     }
@@ -712,8 +703,6 @@ mod cli_tests {
             "--root <ROOT>",
             "--default-branch <BRANCH>",
             "--github-url <URL>",
-            "--workspace-count <COUNT>",
-            "--workspace-preset <PRESET>",
             "--orchestrator-runner <RUNNER>",
         ] {
             assert!(help.contains(expected), "missing `{expected}` in:\n{help}");
