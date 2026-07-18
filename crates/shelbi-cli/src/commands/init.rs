@@ -395,6 +395,12 @@ impl std::fmt::Display for ModeChoice {
 #[derive(serde::Serialize)]
 struct ProjectYaml<'a> {
     name: &'a str,
+    /// Human-readable label. Emitted only when the entered name was slugified
+    /// into a different `name` (e.g. `ContextStore` → `contextstore`), so a
+    /// project whose name is already a clean slug stays byte-identical to the
+    /// pre-`display_name` shape.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    display_name: Option<&'a str>,
     repo: &'a str,
     default_branch: &'a str,
     /// Emitted only for in-repo projects (`config_mode: in-repo`). Global
@@ -454,6 +460,7 @@ struct RunnerYaml<'a> {
 /// can never reach disk.
 fn render_project_yaml(
     name: &str,
+    display_name: Option<&str>,
     repo: &str,
     work_dir: &Path,
     config_mode: Option<&str>,
@@ -477,6 +484,7 @@ fn render_project_yaml(
     );
     let doc = ProjectYaml {
         name,
+        display_name,
         repo,
         default_branch: "main",
         config_mode,
@@ -610,8 +618,13 @@ fn scaffold_project(resolved: &ResolvedProjectRoot, mode: InitMode) -> Result<()
             ),
             InitMode::Global => (String::new(), None),
         };
-        let yaml =
-            render_project_yaml(&resolved.name, &repo_field, &resolved.path, config_mode)?;
+        let yaml = render_project_yaml(
+            &resolved.name,
+            resolved.display_name.as_deref(),
+            &repo_field,
+            &resolved.path,
+            config_mode,
+        )?;
         if write_new_project_registration(&resolved.name, &yaml_path, &yaml)? {
             println!("✓ wrote project: {}", yaml_path.display());
         } else {
@@ -620,7 +633,7 @@ fn scaffold_project(resolved: &ResolvedProjectRoot, mode: InitMode) -> Result<()
     }
 
     if mode == InitMode::InRepo {
-        write_in_repo_config(&resolved.path, &resolved.name)?;
+        write_in_repo_config(&resolved.path, &resolved.name, resolved.display_name.as_deref())?;
     }
 
     write_workspace_settings_template(&resolved.name)?;
@@ -684,7 +697,7 @@ fn scaffold_project(resolved: &ResolvedProjectRoot, mode: InitMode) -> Result<()
 /// contract with every future clone of the repo, so the shared surface
 /// is the one field that has to be stable while the rest of the config
 /// schema evolves.
-fn write_in_repo_config(root: &Path, name: &str) -> Result<()> {
+fn write_in_repo_config(root: &Path, name: &str, display_name: Option<&str>) -> Result<()> {
     let dir = root.join(".shelbi");
     let path = dir.join("project.yaml");
     if path.exists() {
@@ -692,9 +705,25 @@ fn write_in_repo_config(root: &Path, name: &str) -> Result<()> {
         return Ok(());
     }
     shelbi_state::ensure_dir(&dir).map_err(|e| anyhow!(e))?;
-    std::fs::write(&path, format!("name: {name}\n"))?;
+    // `display_name` is a shared field, so it belongs in the committed half
+    // alongside the canonical `name`. Rendered through serde so a label with
+    // YAML-significant characters (spaces, colons) is quoted correctly rather
+    // than string-interpolated.
+    let doc = InRepoConfigYaml { name, display_name };
+    let body = serde_yaml::to_string(&doc).context("serializing in-repo config")?;
+    std::fs::write(&path, body)?;
     println!("✓ wrote in-repo config: {}", path.display());
     Ok(())
+}
+
+/// The committed `<repo>/.shelbi/project.yaml` shape: the canonical slug plus
+/// the optional human-readable label. Kept minimal on purpose — the committed
+/// config is a contract with every future clone.
+#[derive(serde::Serialize)]
+struct InRepoConfigYaml<'a> {
+    name: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    display_name: Option<&'a str>,
 }
 
 /// Best-effort read of the canonical `name:` from a committed
@@ -824,6 +853,9 @@ fn run_pick_up(args: Args) -> Result<PickUpOutcome> {
     // repo's committed `.shelbi/`, not a divergent global copy.
     let yaml = render_project_yaml(
         &local_alias,
+        // The committed `<repo>/.shelbi/project.yaml` already carries any
+        // `display_name`; the local mirror keys everything on the alias slug.
+        None,
         &repo_root.to_string_lossy(),
         &repo_root,
         Some("in-repo"),
@@ -1070,7 +1102,7 @@ mod tests {
     /// write is the file the loader reads.
     #[test]
     fn render_project_yaml_round_trips_through_the_loader() {
-        let yaml = render_project_yaml("my-app", "", Path::new("/tmp/my-app"), None).unwrap();
+        let yaml = render_project_yaml("my-app", None, "", Path::new("/tmp/my-app"), None).unwrap();
         let project: shelbi_core::Project = serde_yaml::from_str(&yaml).unwrap();
         assert_eq!(project.name, "my-app");
         assert_eq!(project.default_branch, "main");
@@ -1090,13 +1122,44 @@ mod tests {
             .any(|w| project.effective_tags(w).contains("review")));
     }
 
+    /// A slugified project records the original human-readable name as
+    /// `display_name`, which round-trips through the loader; an already-clean
+    /// name emits no `display_name` key at all so legacy YAMLs stay byte-identical.
+    #[test]
+    fn render_project_yaml_records_display_name_only_when_slugified() {
+        // Slug differs from the entered label → display_name is emitted.
+        let yaml = render_project_yaml(
+            "contextstore",
+            Some("ContextStore"),
+            "",
+            Path::new("/tmp/cs"),
+            None,
+        )
+        .unwrap();
+        let project: shelbi_core::Project = serde_yaml::from_str(&yaml).unwrap();
+        assert_eq!(project.name, "contextstore");
+        assert_eq!(project.display_name.as_deref(), Some("ContextStore"));
+        assert_eq!(project.display_label(), "ContextStore");
+
+        // No display_name → the key is absent (byte-for-byte with the old shape).
+        let plain =
+            render_project_yaml("my-app", None, "", Path::new("/tmp/my-app"), None).unwrap();
+        assert!(
+            !plain.contains("display_name"),
+            "an unset display_name must not appear in the YAML:\n{plain}"
+        );
+        let project: shelbi_core::Project = serde_yaml::from_str(&plain).unwrap();
+        assert_eq!(project.display_name, None);
+        assert_eq!(project.display_label(), "my-app");
+    }
+
     /// The scaffolded project YAML is self-documenting: a docs-linked header
     /// plus commented-out examples for optional features. As written those
     /// blocks are inert (only the required fields are active), and the docs
     /// pointer matches the Configuration section's route.
     #[test]
     fn render_project_yaml_is_self_documenting() {
-        let yaml = render_project_yaml("my-app", "", Path::new("/tmp/my-app"), None).unwrap();
+        let yaml = render_project_yaml("my-app", None, "", Path::new("/tmp/my-app"), None).unwrap();
         assert!(
             yaml.contains("https://shelbi.dev/docs/configuration/project"),
             "missing docs header: {yaml}"
@@ -1120,12 +1183,12 @@ mod tests {
     #[test]
     fn render_project_yaml_escapes_hostile_work_dir_and_rejects_bad_names() {
         let tricky = Path::new("/tmp/weird #dir: value");
-        let yaml = render_project_yaml("safe", "", tricky, None).unwrap();
+        let yaml = render_project_yaml("safe", None, "", tricky, None).unwrap();
         let project: shelbi_core::Project = serde_yaml::from_str(&yaml).unwrap();
         assert_eq!(project.machines[0].work_dir, tricky.to_path_buf());
 
-        assert!(render_project_yaml("../../evil", "", Path::new("/tmp"), None).is_err());
-        assert!(render_project_yaml("has\nnewline", "", Path::new("/tmp"), None).is_err());
+        assert!(render_project_yaml("../../evil", None, "", Path::new("/tmp"), None).is_err());
+        assert!(render_project_yaml("has\nnewline", None, "", Path::new("/tmp"), None).is_err());
     }
 
     /// F4: a scaffold that crashed after writing the YAML but before
@@ -1142,6 +1205,7 @@ mod tests {
         let resolved = ResolvedProjectRoot {
             path: project_root.clone(),
             name: "halfapp".to_string(),
+            display_name: None,
         };
 
         // Simulate a crash right after the YAML was written: the project
@@ -1340,6 +1404,7 @@ mod tests {
         let resolved = ResolvedProjectRoot {
             path: project_root.clone(),
             name: "myapp".to_string(),
+            display_name: None,
         };
         scaffold_project(&resolved, InitMode::Global).unwrap();
 
@@ -1393,6 +1458,7 @@ mod tests {
         let resolved = ResolvedProjectRoot {
             path: project_root.clone(),
             name: "team-app".to_string(),
+            display_name: None,
         };
         scaffold_project(&resolved, InitMode::InRepo).unwrap();
 

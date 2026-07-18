@@ -123,6 +123,20 @@ pub fn normalize_project_name_announced(raw: &str) -> Result<String> {
     Ok(normalized)
 }
 
+/// Slugify a captured name **and** report the human-readable label to keep.
+/// The label is the original entry (trimmed); it's returned as `Some` only
+/// when slugifying actually changed it, so a name that's already a clean slug
+/// never grows a redundant `display_name`. The normalization is announced the
+/// same way [`normalize_project_name_announced`] does. Shared by the
+/// `shelbi init` resolver ([`pick_name`]) and the `-y` wizard so both entry
+/// points record `display_name` identically.
+pub(crate) fn slug_and_display(raw: &str) -> Result<(String, Option<String>)> {
+    let raw = raw.trim().to_string();
+    let slug = normalize_project_name_announced(&raw)?;
+    let display_name = (slug != raw).then(|| raw.clone());
+    Ok((slug, display_name))
+}
+
 /// Project name derived from a chosen root: the basename of the path,
 /// unchanged. Returns `None` if the path has no usable file component
 /// (e.g. `/`).
@@ -144,7 +158,14 @@ pub fn project_name_collides(name: &str) -> Result<bool> {
 #[derive(Debug, Clone)]
 pub struct ResolvedProjectRoot {
     pub path: PathBuf,
+    /// The slug/id — a valid `[a-z0-9_-]` path component. Keys the on-disk
+    /// folder, settings file, tmux session, and every state entry.
     pub name: String,
+    /// The human-readable label the name was derived from, recorded only when
+    /// slugifying actually changed it (e.g. `ContextStore` → `contextstore`).
+    /// `None` when the entered name already equalled its slug, so a project
+    /// whose name needs no massaging stays free of a redundant `display_name`.
+    pub display_name: Option<String>,
 }
 
 /// End-to-end resolver used by `shelbi init`. Picks `force_root` if
@@ -193,7 +214,7 @@ fn resolve_scripted(
             );
         }
     }
-    let name = pick_name(&path, force_name)?;
+    let (name, display_name) = pick_name(&path, force_name)?;
     if project_name_collides(&name)? {
         bail!(
             "a shelbi project named `{name}` already exists under \
@@ -201,7 +222,11 @@ fn resolve_scripted(
              --project NAME to pick a different name"
         );
     }
-    Ok(ResolvedProjectRoot { path, name })
+    Ok(ResolvedProjectRoot {
+        path,
+        name,
+        display_name,
+    })
 }
 
 /// Interactive prompt loop. Matches the wireframes in the task brief:
@@ -253,7 +278,7 @@ fn prompt_loop(cwd: &Path, force_name: Option<&str>) -> Result<ResolvedProjectRo
             }
         }
 
-        let name = match pick_name(&candidate, force_name) {
+        let (name, display_name) = match pick_name(&candidate, force_name) {
             Ok(n) => n,
             Err(e) => {
                 println!("✗ {e}");
@@ -277,11 +302,16 @@ fn prompt_loop(cwd: &Path, force_name: Option<&str>) -> Result<ResolvedProjectRo
         return Ok(ResolvedProjectRoot {
             path: candidate,
             name,
+            display_name,
         });
     }
 }
 
-fn pick_name(path: &Path, force_name: Option<&str>) -> Result<String> {
+/// Derive the storage slug from the captured name, plus the human-readable
+/// label to keep when they differ. The label is the original entry (trimmed);
+/// it's returned as `Some` only when slugifying changed it, so a name that's
+/// already a clean slug never grows a redundant `display_name`.
+fn pick_name(path: &Path, force_name: Option<&str>) -> Result<(String, Option<String>)> {
     let raw = match force_name {
         Some(n) => n.to_string(),
         None => project_name_from_root(path).ok_or_else(|| {
@@ -293,8 +323,9 @@ fn pick_name(path: &Path, force_name: Option<&str>) -> Result<String> {
     };
     // Normalize the captured name (folder basename or `--project` override)
     // into the agent-id charset before it becomes a path component. A folder
-    // like `Shaft` becomes project `shaft` instead of erroring at launch.
-    normalize_project_name_announced(&raw)
+    // like `Shaft` becomes project `shaft` instead of erroring at launch, and
+    // the original is preserved as the display label.
+    slug_and_display(&raw)
 }
 
 /// Expand `~` / `~/...` against `$HOME` and resolve relative paths
@@ -413,14 +444,27 @@ mod tests {
     #[test]
     fn pick_name_normalizes_force_name() {
         let cwd = PathBuf::from("/tmp/cwd");
-        // A valid name passes through unchanged.
-        assert_eq!(pick_name(&cwd, Some("ok-name")).unwrap(), "ok-name");
-        // Uppercase / spaces are slugified rather than rejected.
-        assert_eq!(pick_name(&cwd, Some("Shaft")).unwrap(), "shaft");
-        assert_eq!(pick_name(&cwd, Some("My App")).unwrap(), "my-app");
+        // A valid name passes through unchanged, with no display_name recorded.
+        assert_eq!(
+            pick_name(&cwd, Some("ok-name")).unwrap(),
+            ("ok-name".to_string(), None)
+        );
+        // Uppercase / spaces are slugified rather than rejected, and the
+        // original human-readable form is preserved as the display_name.
+        assert_eq!(
+            pick_name(&cwd, Some("Shaft")).unwrap(),
+            ("shaft".to_string(), Some("Shaft".to_string()))
+        );
+        assert_eq!(
+            pick_name(&cwd, Some("My App")).unwrap(),
+            ("my-app".to_string(), Some("My App".to_string()))
+        );
         // Traversal metacharacters are neutralized by normalization (the
         // `/` and `.` are stripped), so no `../`-style name survives.
-        assert_eq!(pick_name(&cwd, Some("../evil")).unwrap(), "evil");
+        assert_eq!(
+            pick_name(&cwd, Some("../evil")).unwrap(),
+            ("evil".to_string(), Some("../evil".to_string()))
+        );
         // An all-punctuation name can't be normalized → clear error.
         assert!(pick_name(&cwd, Some("...")).is_err());
     }
@@ -438,7 +482,7 @@ mod tests {
             ("/tmp/My App", "my-app"),
             ("/tmp/shelbi.rs", "shelbi-rs"),
         ] {
-            let got = pick_name(Path::new(dir), None).unwrap();
+            let (got, _display) = pick_name(Path::new(dir), None).unwrap();
             assert_eq!(got, want, "basename of {dir}");
             // The derived name must satisfy the storage chokepoint — the
             // same validator dashboard/agent-id setup relies on — so it

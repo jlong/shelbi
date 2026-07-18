@@ -1016,7 +1016,11 @@ fn filter_projects(projects: &[ProjectSummary], query: &str) -> Vec<ProjectSumma
     let mut hits: Vec<(ProjectSummary, u16)> = projects
         .iter()
         .filter_map(|p| {
-            shelbi_palette::score_pattern(&mut matcher, &pattern, &p.name).and_then(|s| {
+            // Match against both the human label and the slug so a user can
+            // type either the display name (`ContextStore`) or the id
+            // (`contextstore`) and still find the project.
+            let haystack = format!("{} {}", p.display_label(), p.name);
+            shelbi_palette::score_pattern(&mut matcher, &pattern, &haystack).and_then(|s| {
                 if s == 0 {
                     None
                 } else {
@@ -1081,14 +1085,23 @@ fn render_project_picker(
             } else {
                 "workspaces"
             };
-            let spans = vec![
+            // Show the human-readable label. When it differs from the slug,
+            // trail a dimmed `(slug)` so the id stays discoverable.
+            let label = p.display_label();
+            let mut spans = vec![
                 Span::styled(" ◉ ", Style::default().fg(Color::DarkGray)),
-                Span::raw(format!("{:<22}", p.name)),
-                Span::styled(
-                    format!("  {} {m} · {} {w}", p.machine_count, p.workspace_count),
-                    Style::default().fg(Color::DarkGray),
-                ),
+                Span::raw(format!("{label:<22}")),
             ];
+            if p.display_name.is_some() {
+                spans.push(Span::styled(
+                    format!("{} ", p.name),
+                    Style::default().fg(Color::DarkGray),
+                ));
+            }
+            spans.push(Span::styled(
+                format!("  {} {m} · {} {w}", p.machine_count, p.workspace_count),
+                Style::default().fg(Color::DarkGray),
+            ));
             ListItem::new(Line::from(spans))
         })
         .collect();

@@ -139,6 +139,11 @@ pub fn status_decoration(s: shelbi_core::Status) -> Decoration {
 
 pub struct App {
     pub project_name: String,
+    /// Human-readable label for the project, loaded from the project YAML's
+    /// `display_name` each refresh. `None` for legacy projects (and until the
+    /// first refresh), which then render under `project_name`. Read via
+    /// [`App::display_label`].
+    pub display_name: Option<String>,
     pub agents: Vec<Agent>,
     pub workspaces: Vec<WorkspaceOverview>,
     /// Tasks in the Review column that are **loaded on a review worktree** —
@@ -200,6 +205,7 @@ impl App {
     pub fn new_sidebar(project_name: impl Into<String>) -> Self {
         Self {
             project_name: project_name.into(),
+            display_name: None,
             agents: Vec::new(),
             workspaces: Vec::new(),
             ready_review: Vec::new(),
@@ -246,6 +252,13 @@ impl App {
     /// re-parsing `keys.yaml` per keystroke.
     pub fn keymaps(&self) -> &Keymaps {
         &self.keymaps
+    }
+
+    /// The label shown in the sidebar header: the project's `display_name`
+    /// when set, otherwise the slug `project_name` — so a legacy project reads
+    /// exactly as before. Mirrors [`shelbi_core::Project::display_label`].
+    pub fn display_label(&self) -> &str {
+        self.display_name.as_deref().unwrap_or(&self.project_name)
     }
 
     /// The cached host-platform chord-display convention. Detected once at
@@ -446,6 +459,11 @@ impl App {
         // refresh cadence so a stale red mismatch clears without requiring a
         // separate `shelbi reload sidebar`.
         self.probe_daemon_version();
+        // Refresh the human-readable label from the project YAML. A load
+        // failure (fresh/half-set-up project) leaves the slug showing.
+        self.display_name = shelbi_state::load_project(&self.project_name)
+            .ok()
+            .and_then(|p| p.display_name);
         self.agents = load_agents(&self.project_name).unwrap_or_default();
         let review =
             shelbi_state::list_column(&self.project_name, Column::review()).unwrap_or_default();
@@ -1156,6 +1174,7 @@ mod tests {
         );
         Project {
             name: "demo".into(),
+            display_name: None,
             repo: "git@example:demo.git".into(),
             default_branch: "main".into(),
             default_workflow: None,

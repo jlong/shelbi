@@ -2678,6 +2678,7 @@ mod tests {
         );
         Project {
             name: name.into(),
+            display_name: None,
             repo: "r".into(),
             default_branch: "main".into(),
             default_workflow: None,

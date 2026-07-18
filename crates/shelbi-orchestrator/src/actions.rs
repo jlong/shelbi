@@ -1481,6 +1481,7 @@ mod tests {
         );
         Project {
             name: "fixture".into(),
+            display_name: None,
             repo: repo.to_string_lossy().into(),
             default_branch: "main".into(),
             default_workflow: None,
@@ -1549,6 +1550,7 @@ mod tests {
         );
         let project = Project {
             name: "fixture".into(),
+            display_name: None,
             repo: repo.to_string_lossy().into(),
             default_branch: "main".into(),
             default_workflow: None,
@@ -1632,6 +1634,7 @@ mod tests {
         );
         let project = Project {
             name: "fixture".into(),
+            display_name: None,
             repo: local.to_string_lossy().into(),
             default_branch: "main".into(),
             default_workflow: None,
@@ -1707,6 +1710,7 @@ mod tests {
         );
         let project = Project {
             name: "fixture".into(),
+            display_name: None,
             repo: local.to_string_lossy().into(),
             default_branch: "main".into(),
             default_workflow: None,
@@ -2006,6 +2010,7 @@ mod tests {
         );
         Project {
             name: "fixture".into(),
+            display_name: None,
             repo: local.to_string_lossy().into(),
             default_branch: "main".into(),
             default_workflow: None,

@@ -40,6 +40,10 @@ use crate::keymap::format_chord_or_unbound;
 /// index inside the currently focused column.
 pub struct KanbanApp {
     pub project_name: String,
+    /// Human-readable label from the project YAML's `display_name`, reloaded
+    /// each refresh. `None` for legacy projects (and until the first refresh),
+    /// which then show the slug. Rendered via [`KanbanApp::display_label`].
+    pub display_name: Option<String>,
     pub tasks: Vec<TaskFile>,
     pub selected_column: usize,
     pub selected_row: usize,
@@ -354,6 +358,7 @@ impl KanbanApp {
         let all_columns = kanban_columns_from(&project_statuses, None);
         Self {
             project_name: project_name.into(),
+            display_name: None,
             tasks: Vec::new(),
             selected_column: 0,
             selected_row: 0,
@@ -381,6 +386,13 @@ impl KanbanApp {
             header_hits: Vec::new(),
             column_overrides: std::collections::BTreeMap::new(),
         }
+    }
+
+    /// The label shown in the board title: the project's `display_name` when
+    /// set, otherwise the slug `project_name`. Mirrors
+    /// [`shelbi_core::Project::display_label`].
+    pub fn display_label(&self) -> &str {
+        self.display_name.as_deref().unwrap_or(&self.project_name)
     }
 
     /// Borrow the keymaps the footers render hints from. Populated by
@@ -673,10 +685,12 @@ impl KanbanApp {
         match shelbi_state::load_project(&self.project_name) {
             Ok(p) => {
                 self.default_workflow_name = p.default_workflow_name().to_string();
+                self.display_name = p.display_name.clone();
                 self.workspaces = p.workspaces.into_iter().map(|w| w.name).collect();
             }
             Err(_) => {
                 self.default_workflow_name = DEFAULT_WORKFLOW_NAME.to_string();
+                self.display_name = None;
                 self.workspaces = Vec::new();
             }
         }
@@ -1484,7 +1498,7 @@ fn render_title(f: &mut Frame, app: &mut KanbanApp, area: Rect) {
     let left = Line::from(vec![
         Span::styled("Tasks · ", Style::default().fg(Color::DarkGray)),
         Span::styled(
-            app.project_name.clone(),
+            app.display_label().to_string(),
             Style::default()
                 .fg(Color::Cyan)
                 .add_modifier(Modifier::BOLD),
@@ -3488,6 +3502,7 @@ mod tests {
         // Project needs to exist so refresh() can populate workspaces.
         let project = shelbi_core::Project {
             name: "demo".into(),
+            display_name: None,
             repo: "git@example:demo.git".into(),
             default_branch: "main".into(),
             default_workflow: None,
@@ -5210,6 +5225,7 @@ mod tests {
 
         let project = shelbi_core::Project {
             name: "demo".into(),
+            display_name: None,
             repo: "git@example:demo.git".into(),
             default_branch: "main".into(),
             default_workflow: Some("app".into()),

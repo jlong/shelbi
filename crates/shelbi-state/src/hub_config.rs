@@ -69,11 +69,24 @@ pub fn touch_project_launched(project: &str) -> Result<()> {
 /// existing `workspace list`.
 #[derive(Debug, Clone)]
 pub struct ProjectSummary {
+    /// The slug/id — used for switching, tmux sessions, and every state key.
     pub name: String,
+    /// Optional human-readable label. `None` for legacy projects, which then
+    /// display under `name`. Pickers render [`ProjectSummary::display_label`].
+    pub display_name: Option<String>,
     pub repo_path: String,
     pub machine_count: usize,
     pub workspace_count: usize,
     pub last_launched: Option<DateTime<Utc>>,
+}
+
+impl ProjectSummary {
+    /// The label to show a human: [`display_name`](Self::display_name) when
+    /// set, otherwise the slug [`name`](Self::name). Mirrors
+    /// [`shelbi_core::Project::display_label`].
+    pub fn display_label(&self) -> &str {
+        self.display_name.as_deref().unwrap_or(&self.name)
+    }
 }
 
 /// Scan `~/.shelbi/projects/*.yaml`, decorate each with the hub config's
@@ -108,6 +121,7 @@ pub fn list_projects() -> Result<Vec<ProjectSummary>> {
             .and_then(|m| m.last_launched);
         out.push(ProjectSummary {
             name: project.name.clone(),
+            display_name: project.display_name.clone(),
             repo_path: project.repo.clone(),
             machine_count: project.machines.len(),
             workspace_count: project.workspaces.len(),

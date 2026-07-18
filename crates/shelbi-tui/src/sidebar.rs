@@ -50,7 +50,7 @@ fn render_list(f: &mut Frame, app: &mut App, area: Rect) {
 
     let title = Paragraph::new(vec![
         Line::from(Span::styled(
-            app.project_name.clone(),
+            app.display_label().to_string(),
             Style::default()
                 .fg(Color::Cyan)
                 .add_modifier(Modifier::BOLD),
