@@ -1349,6 +1349,7 @@ fn deploy_and_spawn(a: SpawnArgs<'_>) -> Result<()> {
         let block = render_workspace_settings_preferring_agent(a.project, a.agent)?;
         match wire_settings_local(a.host, a.worktree, &a.workspace.name, &block)? {
             SettingsWireResult::Wired => {}
+            SettingsWireResult::SelfHealed => disclose_settings_selfheal(&a.workspace.name),
             SettingsWireResult::MergeRequired { message } => {
                 append_dispatch_status(
                     a.task_id,
@@ -1829,6 +1830,30 @@ fn append_dispatch_status(task_id: &str, workspace: &str, status: &str, detail: 
     }
 }
 
+/// Disclose a launch/add-time self-heal of `settings.local.json` (case 4 of
+/// [`wire_settings_local`]): record one `events.log` line and print a one-line
+/// notice to the dispatch/add output. Shared by both wiring call sites (the
+/// dispatch path here and `workspace add` in the CLI) so the disclosure is
+/// identical wherever the merge happens.
+///
+/// The merge is safe and additive (see [`merge_shelbi_hooks_into`]), but it
+/// modifies a user-facing config file — so per the project's never-silently-
+/// modify-user-config principle, every such write leaves a visible trace. The
+/// no-op wiring cases ([`SettingsWireResult::Wired`]) call nothing.
+pub fn disclose_settings_selfheal(workspace: &str) {
+    if let Err(e) = shelbi_state::append_settings_selfheal_event(
+        workspace,
+        WORKTREE_SETTINGS_LOCAL_REL,
+        "hooks-merged",
+    ) {
+        eprintln!("shelbi: failed to record settings self-heal in events.log: {e}");
+    }
+    eprintln!(
+        "shelbi: self-healed {WORKTREE_SETTINGS_LOCAL_REL} for workspace `{workspace}` \
+         — merged Shelbi's hook block into your settings (user content preserved)"
+    );
+}
+
 /// The minimum claude version that understands `--permission-mode auto`.
 /// Older versions either silently fall back to `default` or reject the flag,
 /// and the workspace pauses on every Bash prompt.
@@ -2014,8 +2039,17 @@ const SHELBI_HOOK_COMMAND_PREFIX: &str = ".shelbi/hooks/";
 
 /// Outcome of [`wire_settings_local`].
 pub enum SettingsWireResult {
-    /// The hook block is present (written, refreshed, or already merged in).
+    /// The hook block is present without a user-facing config write worth
+    /// disclosing: it was written into an absent file (case 1), refreshed in a
+    /// Shelbi-only file (case 2), or already merged in and left untouched
+    /// (case 3, a no-op). Callers pass silently.
     Wired,
+    /// A user-authored `settings.local.json` was self-healed in place: Shelbi
+    /// additively merged its hook block into a parseable, hook-less user file
+    /// (case 4), preserving every user key. Because this modifies a user-facing
+    /// config file, callers disclose it (an events.log line + a one-line
+    /// notice) rather than passing silently like [`SettingsWireResult::Wired`].
+    SelfHealed,
     /// A user-authored `settings.local.json` without Shelbi's block is on disk.
     /// Shelbi refuses to mechanically merge or overwrite it; `message` is the
     /// orchestrator-addressed instruction (naming the workspace + file and
@@ -2086,7 +2120,7 @@ pub fn wire_settings_local(
                 Some(merged) => {
                     write_worktree_text(host, &settings_local, &merged, "settings-local")?;
                     cleanup_legacy_shelbi_settings_json(host, worktree)?;
-                    Ok(SettingsWireResult::Wired)
+                    Ok(SettingsWireResult::SelfHealed)
                 }
                 // Case 5: a shape we can't reason about (non-object root, or a
                 // `hooks` value that isn't the expected object-of-arrays).
@@ -4752,7 +4786,9 @@ mod tests {
         let user = r#"{ "permissions": { "allow": ["Bash(cargo check *)"] } }"#;
         std::fs::write(&path, user).unwrap();
         let res = wire_settings_local(&Host::Local, &wt, "myws", TEST_SHELBI_BLOCK).unwrap();
-        assert!(matches!(res, SettingsWireResult::Wired));
+        // Case 4: a real self-heal WRITE — distinct from a no-op wiring so the
+        // caller can disclose it.
+        assert!(matches!(res, SettingsWireResult::SelfHealed));
         let written = std::fs::read_to_string(&path).unwrap();
         let v: serde_json::Value = serde_json::from_str(&written).unwrap();
         // User's permissions survived verbatim.
@@ -4764,7 +4800,8 @@ mod tests {
         assert!(settings_contain_shelbi_hooks(&v));
         assert_eq!(written.matches(".shelbi/hooks/session-start.sh").count(), 1);
 
-        // Idempotent: a second wire is a no-op (case 3), no duplicate hook.
+        // Idempotent: a second wire is a no-op (case 3), no duplicate hook and
+        // — critically — no second self-heal disclosure.
         let res2 = wire_settings_local(&Host::Local, &wt, "myws", TEST_SHELBI_BLOCK).unwrap();
         assert!(matches!(res2, SettingsWireResult::Wired));
         let written2 = std::fs::read_to_string(&path).unwrap();
@@ -4782,7 +4819,7 @@ mod tests {
         let user = r#"{"permissions":{"defaultMode":"plan"},"hooks":{"SessionStart":[{"hooks":[{"type":"command","command":"./my-hook.sh"}]}]}}"#;
         std::fs::write(&path, user).unwrap();
         let res = wire_settings_local(&Host::Local, &wt, "myws", TEST_SHELBI_BLOCK).unwrap();
-        assert!(matches!(res, SettingsWireResult::Wired));
+        assert!(matches!(res, SettingsWireResult::SelfHealed));
         let written = std::fs::read_to_string(&path).unwrap();
         // Both the user's hook and Shelbi's hook are present under SessionStart.
         assert!(written.contains("./my-hook.sh"), "user hook lost: {written}");
