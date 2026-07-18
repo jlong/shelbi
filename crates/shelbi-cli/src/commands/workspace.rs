@@ -159,6 +159,9 @@ fn add(project: &str, name: &str, machine: Option<&str>, runner: Option<&str>) -
             .map_err(|e| anyhow!(e))?
         {
             orch_workspace::SettingsWireResult::Wired => {}
+            orch_workspace::SettingsWireResult::SelfHealed => {
+                orch_workspace::disclose_settings_selfheal(name);
+            }
             orch_workspace::SettingsWireResult::MergeRequired { message } => {
                 // A user-authored settings.local.json whose shape Shelbi can't
                 // safely self-heal (unparseable, or a non-object/odd `hooks`

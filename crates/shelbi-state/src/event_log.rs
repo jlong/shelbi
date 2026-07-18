@@ -1266,6 +1266,29 @@ pub fn append_send_event(project: &str, workspace: &str, status: &str, detail: &
     ))
 }
 
+/// Append `<rfc3339> settings-selfheal workspace=<name> path=<path> detail=<detail>`
+/// to `~/.shelbi/events.log`. Emitted when the launch/add path self-heals a
+/// parseable but hook-less `settings.local.json` by additively merging Shelbi's
+/// hook block in (case 4 of `wire_settings_local`), preserving every user key.
+///
+/// Only the self-heal WRITE records a line — the no-op wiring cases (writing an
+/// absent file, refreshing a Shelbi-only file, or an already-merged file) stay
+/// silent. Because the self-heal modifies a user-facing config file, the
+/// presence of this line is the disclosure that such a write happened, matching
+/// the project principle of never silently touching user config.
+///
+/// `path` is folded like a free-text reason (whitespace → `_`) so its `/`
+/// separators survive; `workspace` is pinned to the strict identifier allowlist.
+pub fn append_settings_selfheal_event(workspace: &str, path: &str, detail: &str) -> Result<()> {
+    let ts = Utc::now().to_rfc3339();
+    let workspace = sanitize_field(workspace);
+    let path = sanitize_reason(path);
+    let detail = sanitize_reason(detail);
+    append_event_line(&format!(
+        "{ts} settings-selfheal workspace={workspace} path={path} detail={detail}"
+    ))
+}
+
 /// Append `<rfc3339> project=<project> workspace=<name> pane_alive=<bool> reason=<short>`
 /// to `~/.shelbi/events.log`. Emitted by the `shelbi open --as-pane`
 /// wrapper when its agent subprocess exits (any reason — clean exit,
@@ -3197,6 +3220,35 @@ mod tests {
             "{}",
             lines[1]
         );
+
+        std::env::remove_var("SHELBI_HOME");
+    }
+
+    #[test]
+    fn append_settings_selfheal_event_writes_disclosure_line() {
+        let _g = TEST_LOCK.lock().unwrap();
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+
+        append_settings_selfheal_event("alpha", ".claude/settings.local.json", "hooks-merged")
+            .unwrap();
+        let log = std::fs::read_to_string(events_log_path().unwrap()).unwrap();
+        let lines: Vec<&str> = log.lines().collect();
+        assert_eq!(lines.len(), 1);
+        // Leading RFC3339 timestamp, then the `settings-selfheal` verb keyed by
+        // workspace + file — the disclosure that a user-facing config was
+        // modified.
+        assert!(DateTime::parse_from_rfc3339(lines[0].split_whitespace().next().unwrap()).is_ok());
+        assert!(
+            lines[0].contains(
+                " settings-selfheal workspace=alpha path=.claude/settings.local.json detail=hooks-merged"
+            ),
+            "{}",
+            lines[0]
+        );
+        // The path's `/` separators survive (folded like a reason, not pinned to
+        // the identifier allowlist).
+        assert!(lines[0].contains("path=.claude/settings.local.json"), "{}", lines[0]);
 
         std::env::remove_var("SHELBI_HOME");
     }
