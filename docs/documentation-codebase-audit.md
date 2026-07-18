@@ -73,7 +73,6 @@ Status terms: **reviewed** means substantive Shelbi claims were compared with im
 | `docs/release.md` | Reviewed | Current automation-oriented release runbook. |
 | `docs/release-apt.md` | Reviewed | APT publication implementation and workflow inputs. |
 | `docs/release/homebrew-tap.md` | Reviewed | Tap bootstrap and verification guidance. |
-| `packaging/homebrew-shelbi/README.md` | Reviewed | Bootstrap tap workflow and consumer commands. |
 | `examples/daily.yaml` | Reviewed | Session example; schema matches `Session`. |
 | `examples/myapp.yaml` | Reviewed | Minimal legacy/global project example; valid but not advertised as fresh scaffold output. |
 | `.github/workflows/*.yml`, `.goreleaser.yaml`, `scripts/release/*` | Reviewed as implementation evidence | Automation/configuration, not prose documentation inventory. |

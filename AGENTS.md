@@ -19,7 +19,6 @@ over SSH. The repo is a Rust workspace plus a Next.js marketing/docs site.
 - `crates/shelbi-ssh`: local/SSH command execution wrapper
 - `site/`: Next.js marketing and docs site (has its own AGENTS.md)
 - `scripts/`: install script; release scripts in `scripts/release/`
-- `packaging/`: Homebrew tap bootstrap source (`packaging/homebrew-shelbi/`)
 - `docs/`: release runbooks
 - `<machine.work_dir>/.shelbi/wt/`: persistent workspace worktrees. Never touch
   another workspace's worktree.
