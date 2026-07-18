@@ -663,6 +663,53 @@ fn list_windows_argv(addr: &TmuxAddr) -> Vec<String> {
     ]
 }
 
+/// Argv listing a session's windows as `<window_id> <window_name>` pairs.
+/// Where [`list_windows_argv`] answers "is *a* window with this name alive?",
+/// this lets the caller find EVERY window id bound to a slot's name — the set a
+/// name-based `-t =session:=name` target can't reach, since that spelling
+/// resolves to only the first match.
+fn list_window_ids_argv(addr: &TmuxAddr) -> Vec<String> {
+    vec![
+        "tmux".into(),
+        "list-windows".into(),
+        "-t".into(),
+        format!("={}", addr.session),
+        "-F".into(),
+        "#{window_id} #{window_name}".into(),
+    ]
+}
+
+/// Parse `tmux list-windows -F '#{window_id} #{window_name}'` output into the
+/// window ids whose name exactly equals `window`. A window name can carry
+/// spaces (Claude rewrites its window title mid-session), so split only on the
+/// FIRST space: the id (`@<n>`, never spaced) is the head and the untouched
+/// tail is the name.
+fn slot_window_ids_from_list(stdout: &str, window: &str) -> Vec<String> {
+    stdout
+        .lines()
+        .filter_map(|line| {
+            let (id, name) = line.trim_end().split_once(' ')?;
+            (name == window).then(|| id.to_string())
+        })
+        .collect()
+}
+
+/// Every tmux window id currently bound to a local slot's name. Local
+/// workspaces are windows inside the shared project session, so a slot can
+/// (under a raced relaunch — e.g. the crash supervisor and a `shelbi task
+/// resume` both re-running `new-window` before the prior window is torn down)
+/// accrete more than one window sharing its name. Teardown has to reap all of
+/// them, so it enumerates ids here rather than trusting a single name match.
+fn local_slot_window_ids(host: &Host, addr: &TmuxAddr) -> Result<Vec<String>> {
+    let out = shelbi_ssh::run(host, list_window_ids_argv(addr)).map_err(Error::Io)?;
+    if !out.status.success() {
+        // No session / no server → nothing is bound to the slot.
+        return Ok(Vec::new());
+    }
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    Ok(slot_window_ids_from_list(&stdout, &addr.window))
+}
+
 /// Does the workspace have a live tmux pane right now?
 pub fn workspace_pane_alive(host: &Host, addr: &TmuxAddr) -> Result<bool> {
     // Local: check `session:window` exists. Remote: it's a whole session.
@@ -914,13 +961,22 @@ fn transport_failure_reason(out: &std::process::Output) -> String {
 /// tripping the orchestrator's "pane died, surface to user" reaction rule
 /// right before the replacement pane comes up. See
 /// bug-workspace-pane-alive-false-sighup-fires-spuriously-right-after-dispatch.
+///
+/// Local teardown reaps EVERY window bound to the slot's name, not just the
+/// first. `new-window -n <name>` happily creates a second window with a name
+/// that's already taken, so a raced relaunch (the crash supervisor and a
+/// `shelbi task resume` both re-standing-up the same slot) can leave two
+/// windows sharing the name. A single `kill-window -t =session:=name` resolves
+/// to only the first, stranding the other as an `orphaned session` that
+/// survives a ready-marker handoff teardown and holds the slot un-dispatchable.
+/// Enumerating window ids and killing each closes the slot whole. See
+/// fix-resume-ready-marker-orphaned-session.
 pub fn kill_workspace_pane(host: &Host, addr: &TmuxAddr, workspace_name: &str) -> Result<()> {
-    // Local: `kill-window -t session:window` (the dashboard session
-    // must stay alive). Remote: `kill-session -t session` (the session
-    // IS the workspace).
+    // Local: `kill-window` (the dashboard session must stay alive).
+    // Remote: `kill-session -t session` (the session IS the workspace).
     //
     // The liveness check has to differ too. For local we look for the
-    // workspace's window inside the shared dashboard session. For remote
+    // workspace's window(s) inside the shared dashboard session. For remote
     // we look for the session itself — NOT for a window named `agent`
     // — because tmux's `automatic-rename` (on by default) renames the
     // window after whatever command is running (`claude`, `bash`, …),
@@ -928,16 +984,23 @@ pub fn kill_workspace_pane(host: &Host, addr: &TmuxAddr, workspace_name: &str) -
     // around to collide with the next `task start`.
     match host {
         Host::Local => {
-            if !workspace_slot_alive(host, addr)? {
+            let window_ids = local_slot_window_ids(host, addr)?;
+            if window_ids.is_empty() {
                 return Ok(());
             }
             // Best-effort — the wrapper's fallback (fire the event with
             // its historical reason) is the pre-fix behavior, so a mark
-            // failure just degrades to that.
+            // failure just degrades to that. Set once before killing any
+            // window so the (first) wrapper to exit consumes it.
             let _ = shelbi_state::mark_expected_teardown(workspace_name);
-            let target = shelbi_tmux::command_target(addr);
-            let _ = shelbi_ssh::run(host, ["tmux", "kill-window", "-t", &target])
-                .map_err(Error::Io)?;
+            // Kill by window id (exact, unique) so a name that's since been
+            // rewritten by the wrapper can't dodge the target, and so a
+            // duplicate-named window can't survive by hiding behind the
+            // first match.
+            for id in &window_ids {
+                let _ = shelbi_ssh::run(host, ["tmux", "kill-window", "-t", id.as_str()])
+                    .map_err(Error::Io)?;
+            }
         }
         Host::Ssh { .. } => {
             if !workspace_slot_alive(host, addr)? {
@@ -3982,6 +4045,40 @@ mod tests {
     }
 
     #[test]
+    fn slot_window_ids_matches_every_window_with_the_slot_name() {
+        // Two windows share the slot name `alice` (a raced relaunch left a
+        // duplicate). Teardown must reap BOTH, so both ids come back — the
+        // single-name-match a `-t =session:=alice` target uses would strand
+        // the second as an orphaned session.
+        let listing = "@3 alice\n@7 orch\n@9 alice\n";
+        assert_eq!(
+            slot_window_ids_from_list(listing, "alice"),
+            vec!["@3".to_string(), "@9".to_string()],
+        );
+    }
+
+    #[test]
+    fn slot_window_ids_splits_on_first_space_so_spaced_names_still_match() {
+        // Claude rewrites its window title, which can contain spaces. The id
+        // (`@<n>`) never does, so splitting on the FIRST space keeps a spaced
+        // name intact for the exact comparison.
+        let listing = "@1 shelbi working\n@2 alice\n";
+        assert_eq!(
+            slot_window_ids_from_list(listing, "shelbi working"),
+            vec!["@1".to_string()],
+        );
+        assert!(slot_window_ids_from_list(listing, "shelbi").is_empty());
+    }
+
+    #[test]
+    fn slot_window_ids_empty_when_no_window_carries_the_name() {
+        // A dead / renamed-away slot yields nothing to reap.
+        let listing = "@4 orch\n@5 bob\n";
+        assert!(slot_window_ids_from_list(listing, "alice").is_empty());
+        assert!(slot_window_ids_from_list("", "alice").is_empty());
+    }
+
+    #[test]
     fn worktree_path_under_machine_workdir() {
         let p = fixture_project();
         let wt = workspace_worktree(&p.machines[0], &p.workspaces[0]);
@@ -5823,6 +5920,77 @@ mod user_shell_tmux_tests {
             !workspace_user_shell_open(&host, &addr).unwrap(),
             "dead slot must not read as a user shell"
         );
+    }
+
+    /// Regression for the resumed-pane orphan: a raced relaunch can leave two
+    /// windows sharing the slot's name (a `shelbi task resume` `new-window`
+    /// stacking on the crash supervisor's). A ready-marker handoff calls
+    /// `kill_workspace_pane`, which must close the slot WHOLE — killing only
+    /// the first name match would strand the second as an `orphaned session`
+    /// that holds the slot un-dispatchable. See
+    /// fix-resume-ready-marker-orphaned-session.
+    #[test]
+    fn kill_workspace_pane_reaps_duplicate_windows_sharing_the_slot_name() {
+        if !tmux_available() {
+            eprintln!("skipping: tmux not on PATH");
+            return;
+        }
+        // Isolate on a private tmux server so the mark file the kill writes
+        // (SHELBI_HOME-scoped) and the session can't collide with a real hub.
+        let home = std::env::temp_dir().join(format!("shelbi-reap-{}", std::process::id()));
+        std::fs::create_dir_all(&home).unwrap();
+        let prev_home = std::env::var("SHELBI_HOME").ok();
+        std::env::set_var("SHELBI_HOME", &home);
+
+        let session = format!("shelbi-test-reap-{}", std::process::id());
+        kill_session(&session);
+        // Two windows both named `alice`: the stale orphan and the fresh
+        // resumed pane. tmux happily allows the duplicate name.
+        let ok = std::process::Command::new("tmux")
+            .args([
+                "new-session", "-d", "-s", &session, "-n", "alice", "sh", "-c", "sleep 30",
+            ])
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        assert!(ok, "failed to create test session `{session}`");
+        let ok = std::process::Command::new("tmux")
+            .args([
+                "new-window", "-d", "-t", &format!("={session}:"), "-n", "alice", "sh", "-c",
+                "sleep 30",
+            ])
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        assert!(ok, "failed to create duplicate window in `{session}`");
+
+        let host = Host::Local;
+        let addr = TmuxAddr {
+            session: session.clone(),
+            window: "alice".into(),
+        };
+        // Both duplicates are visible up front.
+        assert_eq!(
+            local_slot_window_ids(&host, &addr).unwrap().len(),
+            2,
+            "precondition: two windows share the slot name"
+        );
+
+        kill_workspace_pane(&host, &addr, "alice").expect("kill_workspace_pane must succeed");
+
+        // The slot is now empty — NEITHER duplicate survives as an orphan.
+        assert!(
+            !workspace_pane_alive(&host, &addr).unwrap(),
+            "kill_workspace_pane must reap every window bound to the slot name"
+        );
+        assert!(local_slot_window_ids(&host, &addr).unwrap().is_empty());
+
+        kill_session(&session);
+        match prev_home {
+            Some(h) => std::env::set_var("SHELBI_HOME", h),
+            None => std::env::remove_var("SHELBI_HOME"),
+        }
+        let _ = std::fs::remove_dir_all(&home);
     }
 }
 
