@@ -1273,13 +1273,15 @@ fn deploy_and_spawn(a: SpawnArgs<'_>) -> Result<()> {
     //    both run. We no longer clobber `settings.json` on every dispatch (that
     //    silently overwrote committed project settings); instead we re-run the
     //    same add-time wiring so a worktree that lost the block (a reset/pruned
-    //    slot, or one materialized by an older shelbi) is re-wired before the
+    //    slot, one materialized by an older shelbi, or a Claude permission-save
+    //    that rewrote the file and dropped the hooks) is re-wired before the
     //    session starts. Only Claude reads this file — codex and other polling
     //    runners skip it entirely, so their dispatch path is unaffected. A
-    //    user-authored `settings.local.json` we don't recognize is never
-    //    mechanically merged: we record an orchestrator merge-request and abort
-    //    the dispatch so a human/orchestrator resolves it (see
-    //    `wire_settings_local`).
+    //    parseable user-authored `settings.local.json` is self-healed in place
+    //    (Shelbi's hooks merged in additively, user content preserved); only a
+    //    shape we can't reason about (unparseable, non-object root, odd `hooks`)
+    //    records an orchestrator merge-request and aborts the dispatch so a
+    //    human/orchestrator resolves it (see `wire_settings_local`).
     if shelbi_agent::RunnerAdapter::for_spec(a.runner).is_claude() {
         let block = render_workspace_settings_preferring_agent(a.project, a.agent)?;
         match wire_settings_local(a.host, a.worktree, &a.workspace.name, &block)? {
@@ -1965,11 +1967,21 @@ pub enum SettingsWireResult {
 ///    fresh checkout) → write Shelbi's block directly.
 /// 2. **Present, Shelbi-only** (the only top-level key is `hooks` and every
 ///    command is Shelbi-owned) → refresh in place with the current block.
-/// 3. **Present, user content that already contains Shelbi's block** (the
-///    orchestrator merged it) → nothing to do; the hooks are wired.
-/// 4. **Present, user content WITHOUT Shelbi's block** → do not touch it.
-///    Return [`SettingsWireResult::MergeRequired`] carrying the
-///    orchestrator-addressed merge instruction.
+/// 3. **Present, user content that already contains Shelbi's block** (a prior
+///    self-heal / orchestrator merge) → nothing to do; the hooks are wired.
+/// 4. **Present, user content WITHOUT Shelbi's block, but a parseable object we
+///    can additively merge into** → self-heal by merging Shelbi's hooks in,
+///    preserving every user key (see [`merge_shelbi_hooks_into`]). This is the
+///    common recovery case: Claude Code rewrote the file on a permission grant
+///    (leaving e.g. `{ "permissions": { "allow": [...] } }`) or the worktree was
+///    re-materialized, and the hook block was lost. Shelbi re-adds hooks it
+///    fully owns without touching the user's content, so dispatch no longer
+///    stalls on a manual merge.
+/// 5. **Present, but content we can't reason about structurally** (unparseable
+///    JSON, a non-object root, or a `hooks` value that isn't the expected
+///    object-of-arrays) → do not touch it. Return
+///    [`SettingsWireResult::MergeRequired`] carrying the orchestrator-addressed
+///    merge instruction.
 ///
 /// `shelbi_block` is the rendered hooks JSON (see
 /// [`render_workspace_settings_preferring_agent`]). Only Claude Code reads this
@@ -1996,15 +2008,36 @@ pub fn wire_settings_local(
                 Ok(SettingsWireResult::Wired)
             }
             Ok(value) if settings_contain_shelbi_hooks(&value) => {
-                // Case 3: user content that already carries our block (the
-                // orchestrator merged it on a prior pass). Nothing to do.
+                // Case 3: user content that already carries our block (a prior
+                // self-heal / orchestrator merge). Nothing to do.
                 cleanup_legacy_shelbi_settings_json(host, worktree)?;
                 Ok(SettingsWireResult::Wired)
             }
-            // Case 4: user-authored content without our block — or JSON we
-            // can't parse and therefore can't safely reason about. Never
-            // mechanically merge; ask the orchestrator to do it.
-            _ => Ok(SettingsWireResult::MergeRequired {
+            // Case 4: user-authored content without our block. If it's a plain
+            // JSON object we can additively merge into, self-heal by merging our
+            // hooks in — preserving every user key. This recovers a worktree
+            // whose hook block was dropped (a Claude permission-save rewrite, or
+            // a re-materialized worktree) without stalling dispatch on a manual
+            // merge.
+            Ok(value) => match merge_shelbi_hooks_into(&value, shelbi_block) {
+                Some(merged) => {
+                    write_worktree_text(host, &settings_local, &merged, "settings-local")?;
+                    cleanup_legacy_shelbi_settings_json(host, worktree)?;
+                    Ok(SettingsWireResult::Wired)
+                }
+                // Case 5: a shape we can't reason about (non-object root, or a
+                // `hooks` value that isn't the expected object-of-arrays).
+                // Never mechanically merge; ask the orchestrator to do it.
+                None => Ok(SettingsWireResult::MergeRequired {
+                    message: orchestrator_merge_message(
+                        workspace_name,
+                        &settings_local,
+                        shelbi_block,
+                    ),
+                }),
+            },
+            // Case 5: unparseable JSON — we can't safely reason about it.
+            Err(_) => Ok(SettingsWireResult::MergeRequired {
                 message: orchestrator_merge_message(
                     workspace_name,
                     &settings_local,
@@ -2056,6 +2089,60 @@ fn settings_contain_shelbi_hooks(value: &serde_json::Value) -> bool {
         true
     });
     found
+}
+
+/// Additively merge Shelbi's hook block into a parseable, Shelbi-hook-less
+/// user `settings.local.json`, preserving every user key. This is the
+/// launch-time self-heal for the common failure where Claude Code rewrote the
+/// file on a permission grant (leaving e.g.
+/// `{ "permissions": { "allow": [...] } }`) or a worktree was re-materialized,
+/// dropping Shelbi's hook block.
+///
+/// Returns `Some(pretty_json)` when the merge is unambiguously safe — `user` is
+/// a JSON object with no `hooks` key, or a `hooks` object whose per-event values
+/// are arrays we can *append* Shelbi's groups to. Appending (never replacing)
+/// means the merge strictly preserves any user-authored hooks: their hooks and
+/// Shelbi's both run, matching how Claude Code merges hook groups.
+///
+/// Returns `None` (→ orchestrator merge request) for shapes we can't reason
+/// about structurally: a non-object root, or a `hooks` value that isn't the
+/// expected object-of-arrays.
+///
+/// Callers only reach here when Shelbi's own hooks are *not* already present
+/// (case 3 caught that), so a merge never duplicates Shelbi's block, and a
+/// re-run after a self-heal is a no-op.
+fn merge_shelbi_hooks_into(user: &serde_json::Value, shelbi_block: &str) -> Option<String> {
+    let user_obj = user.as_object()?;
+    let block: serde_json::Value = serde_json::from_str(shelbi_block).ok()?;
+    let shelbi_hooks = block.as_object()?.get("hooks")?.as_object()?;
+
+    let mut merged = user_obj.clone();
+    // Start from the user's existing `hooks` (must be an object if present) or
+    // an empty map when there's no `hooks` key at all.
+    let mut hooks = match merged.get("hooks") {
+        Some(serde_json::Value::Object(existing)) => existing.clone(),
+        // A `hooks` value that isn't an object is a shape we won't guess at.
+        Some(_) => return None,
+        None => serde_json::Map::new(),
+    };
+    for (event, groups) in shelbi_hooks {
+        let shelbi_groups = groups.as_array()?;
+        match hooks.get_mut(event) {
+            Some(serde_json::Value::Array(existing)) => {
+                existing.extend(shelbi_groups.iter().cloned());
+            }
+            // An event value that isn't an array is unexpected — bail rather
+            // than clobber it.
+            Some(_) => return None,
+            None => {
+                hooks.insert(event.clone(), serde_json::Value::Array(shelbi_groups.clone()));
+            }
+        }
+    }
+    merged.insert("hooks".to_string(), serde_json::Value::Object(hooks));
+    let mut out = serde_json::to_string_pretty(&serde_json::Value::Object(merged)).ok()?;
+    out.push('\n');
+    Some(out)
 }
 
 /// Walk every `command` string in a Claude-Code `hooks` object
@@ -4494,6 +4581,25 @@ mod tests {
     }
 
     #[test]
+    fn merge_shelbi_hooks_into_rejects_unmergeable_shapes() {
+        // `hooks` present but not an object → None.
+        let bad_hooks: serde_json::Value =
+            serde_json::from_str(r#"{"hooks":"nope"}"#).unwrap();
+        assert!(merge_shelbi_hooks_into(&bad_hooks, TEST_SHELBI_BLOCK).is_none());
+        // An event value that isn't an array → None.
+        let bad_event: serde_json::Value =
+            serde_json::from_str(r#"{"hooks":{"SessionStart":"nope"}}"#).unwrap();
+        assert!(merge_shelbi_hooks_into(&bad_event, TEST_SHELBI_BLOCK).is_none());
+        // Non-object root → None.
+        let arr: serde_json::Value = serde_json::from_str("[]").unwrap();
+        assert!(merge_shelbi_hooks_into(&arr, TEST_SHELBI_BLOCK).is_none());
+        // Plain object with no hooks → Some (safe insert).
+        let obj: serde_json::Value =
+            serde_json::from_str(r#"{"permissions":{}}"#).unwrap();
+        assert!(merge_shelbi_hooks_into(&obj, TEST_SHELBI_BLOCK).is_some());
+    }
+
+    #[test]
     fn wire_settings_local_writes_when_absent() {
         let wt = wiring_tmp_worktree("absent");
         let res = wire_settings_local(&Host::Local, &wt, "alpha", TEST_SHELBI_BLOCK).unwrap();
@@ -4539,27 +4645,57 @@ mod tests {
     }
 
     #[test]
-    fn wire_settings_local_refuses_user_file_without_block() {
-        let wt = wiring_tmp_worktree("usercontent");
+    fn wire_settings_local_self_heals_permissions_only_file() {
+        // The exact reported failure: Claude Code (or a re-materialized
+        // worktree) left a permissions-only settings.local.json with no hook
+        // block. Launch must self-heal by merging Shelbi's hooks in while
+        // preserving the user's permissions — not stall on a manual merge.
+        let wt = wiring_tmp_worktree("permsonly");
+        let path = wt.join(".claude/settings.local.json");
+        let user = r#"{ "permissions": { "allow": ["Bash(cargo check *)"] } }"#;
+        std::fs::write(&path, user).unwrap();
+        let res = wire_settings_local(&Host::Local, &wt, "myws", TEST_SHELBI_BLOCK).unwrap();
+        assert!(matches!(res, SettingsWireResult::Wired));
+        let written = std::fs::read_to_string(&path).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&written).unwrap();
+        // User's permissions survived verbatim.
+        assert_eq!(
+            v["permissions"]["allow"][0].as_str(),
+            Some("Bash(cargo check *)")
+        );
+        // Shelbi's hook block is now present.
+        assert!(settings_contain_shelbi_hooks(&v));
+        assert_eq!(written.matches(".shelbi/hooks/session-start.sh").count(), 1);
+
+        // Idempotent: a second wire is a no-op (case 3), no duplicate hook.
+        let res2 = wire_settings_local(&Host::Local, &wt, "myws", TEST_SHELBI_BLOCK).unwrap();
+        assert!(matches!(res2, SettingsWireResult::Wired));
+        let written2 = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(written2, written, "re-wire must not change the file");
+        let _ = std::fs::remove_dir_all(wt.parent().unwrap());
+    }
+
+    #[test]
+    fn wire_settings_local_self_heals_preserving_user_hooks() {
+        // A user with their own (non-Shelbi) hook plus permissions. The
+        // self-heal appends Shelbi's group so BOTH hooks run — the user's hook
+        // is preserved, not replaced.
+        let wt = wiring_tmp_worktree("userhooks");
         let path = wt.join(".claude/settings.local.json");
         let user = r#"{"permissions":{"defaultMode":"plan"},"hooks":{"SessionStart":[{"hooks":[{"type":"command","command":"./my-hook.sh"}]}]}}"#;
         std::fs::write(&path, user).unwrap();
         let res = wire_settings_local(&Host::Local, &wt, "myws", TEST_SHELBI_BLOCK).unwrap();
-        match res {
-            SettingsWireResult::MergeRequired { message } => {
-                assert!(message.contains("myws"), "message: {message}");
-                assert!(message.contains("settings.local.json"), "message: {message}");
-                assert!(message.contains("ORCHESTRATOR"), "message: {message}");
-                // Prints the exact hook template to merge.
-                assert!(
-                    message.contains(".shelbi/hooks/session-start.sh"),
-                    "message must carry the template: {message}"
-                );
-            }
-            SettingsWireResult::Wired => panic!("expected MergeRequired, got Wired"),
-        }
-        // The user's file is never touched.
-        assert_eq!(std::fs::read_to_string(&path).unwrap(), user);
+        assert!(matches!(res, SettingsWireResult::Wired));
+        let written = std::fs::read_to_string(&path).unwrap();
+        // Both the user's hook and Shelbi's hook are present under SessionStart.
+        assert!(written.contains("./my-hook.sh"), "user hook lost: {written}");
+        assert!(
+            written.contains(".shelbi/hooks/session-start.sh"),
+            "shelbi hook not merged: {written}"
+        );
+        let v: serde_json::Value = serde_json::from_str(&written).unwrap();
+        assert_eq!(v["permissions"]["defaultMode"].as_str(), Some("plan"));
+        assert!(settings_contain_shelbi_hooks(&v));
         let _ = std::fs::remove_dir_all(wt.parent().unwrap());
     }
 
@@ -4567,9 +4703,26 @@ mod tests {
     fn wire_settings_local_reports_merge_for_unparseable_content() {
         let wt = wiring_tmp_worktree("garbage");
         let path = wt.join(".claude/settings.local.json");
-        std::fs::write(&path, "{ this is not valid json").unwrap();
+        let garbage = "{ this is not valid json";
+        std::fs::write(&path, garbage).unwrap();
         let res = wire_settings_local(&Host::Local, &wt, "myws", TEST_SHELBI_BLOCK).unwrap();
         assert!(matches!(res, SettingsWireResult::MergeRequired { .. }));
+        // Unparseable content is never touched.
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), garbage);
+        let _ = std::fs::remove_dir_all(wt.parent().unwrap());
+    }
+
+    #[test]
+    fn wire_settings_local_reports_merge_for_non_object_root() {
+        // A JSON array (or any non-object root) is a shape we won't guess at —
+        // fall back to the orchestrator merge request rather than mangle it.
+        let wt = wiring_tmp_worktree("nonobject");
+        let path = wt.join(".claude/settings.local.json");
+        let user = r#"["not", "an", "object"]"#;
+        std::fs::write(&path, user).unwrap();
+        let res = wire_settings_local(&Host::Local, &wt, "myws", TEST_SHELBI_BLOCK).unwrap();
+        assert!(matches!(res, SettingsWireResult::MergeRequired { .. }));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), user);
         let _ = std::fs::remove_dir_all(wt.parent().unwrap());
     }
 
