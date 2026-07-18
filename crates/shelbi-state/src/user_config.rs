@@ -26,6 +26,16 @@ pub fn user_config_path() -> Result<PathBuf> {
 pub struct UserConfig {
     #[serde(default)]
     pub keymap: Keymap,
+
+    /// Editor command the review interface's "Edit in <editor>" view
+    /// launches in the task's review worktree. Hub-wide (not per-project)
+    /// so a reviewer's editor choice follows them across every project.
+    /// Resolution order is [`resolve_editor`]: this setting, then
+    /// `$EDITOR`, then `vim`. May be a bare command (`hx`) or a command
+    /// with flags (`code --wait`); the display label is derived from the
+    /// program name (see [`editor_display_name`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub editor: Option<String>,
 }
 
 /// Keymap overrides. Today just the Zen Mode toggle chord — extended as new
@@ -118,6 +128,56 @@ pub fn load_user_config() -> Result<UserConfig> {
     }
     let text = fs::read_to_string(&path)?;
     Ok(serde_yaml::from_str(&text)?)
+}
+
+/// Fallback editor when neither the config nor `$EDITOR` names one.
+pub const DEFAULT_EDITOR: &str = "vim";
+
+/// Resolve the editor command the review interface's "Edit in <editor>"
+/// view launches, in precedence order:
+///
+/// 1. `~/.shelbi/config.yaml::editor` (hub-wide reviewer preference),
+/// 2. the `$EDITOR` environment variable,
+/// 3. `vim` ([`DEFAULT_EDITOR`]).
+///
+/// A blank/whitespace value at either layer is skipped rather than
+/// launching an empty command. The returned string is the full command
+/// (it may carry flags, e.g. `code --wait`); split it before exec.
+pub fn resolve_editor() -> String {
+    let from_config = load_user_config().ok().and_then(|c| c.editor);
+    let from_env = std::env::var("EDITOR").ok();
+    resolve_editor_from(from_config, from_env)
+}
+
+/// Pure precedence core of [`resolve_editor`]: config editor, then `$EDITOR`,
+/// then `vim`, skipping blank/whitespace values at each layer. Split out so
+/// the precedence is unit-testable without touching the filesystem or env.
+pub(crate) fn resolve_editor_from(config: Option<String>, env: Option<String>) -> String {
+    for candidate in [config, env].into_iter().flatten() {
+        if !candidate.trim().is_empty() {
+            return candidate;
+        }
+    }
+    DEFAULT_EDITOR.to_string()
+}
+
+/// Human-facing name of an editor command for the "Edit in <name>"
+/// sidebar label — the program's basename, first letter upper-cased
+/// (`vim` → `Vim`, `/usr/bin/hx` → `Hx`, `code --wait` → `Code`). Flags
+/// and directory components are dropped. Empty input yields an empty
+/// string so callers can guard.
+pub fn editor_display_name(command: &str) -> String {
+    let program = command.split_whitespace().next().unwrap_or("");
+    let base = program
+        .rsplit(['/', '\\'])
+        .next()
+        .unwrap_or(program)
+        .trim();
+    let mut chars = base.chars();
+    match chars.next() {
+        Some(first) => first.to_uppercase().collect::<String>() + chars.as_str(),
+        None => String::new(),
+    }
 }
 
 /// Atomically write the user config to `~/.shelbi/config.yaml`.
@@ -240,5 +300,57 @@ mod tests {
         cfg.keymap.zen_toggle = ZenToggleChord::CtrlShiftZ;
         let yaml = serde_yaml::to_string(&cfg).unwrap();
         assert!(yaml.contains("ctrl-shift-z"), "got: {yaml}");
+    }
+
+    #[test]
+    fn editor_precedence_is_config_then_env_then_vim() {
+        // Config wins over $EDITOR.
+        assert_eq!(
+            resolve_editor_from(Some("hx".into()), Some("nano".into())),
+            "hx"
+        );
+        // Blank config falls through to $EDITOR.
+        assert_eq!(
+            resolve_editor_from(Some("  ".into()), Some("nano".into())),
+            "nano"
+        );
+        // No config, no env → vim.
+        assert_eq!(resolve_editor_from(None, None), "vim");
+        // Blank env with no config → vim.
+        assert_eq!(resolve_editor_from(None, Some(String::new())), "vim");
+        // A command with flags is preserved verbatim.
+        assert_eq!(
+            resolve_editor_from(Some("code --wait".into()), None),
+            "code --wait"
+        );
+    }
+
+    #[test]
+    fn editor_display_name_titlecases_the_basename() {
+        assert_eq!(editor_display_name("vim"), "Vim");
+        assert_eq!(editor_display_name("hx"), "Hx");
+        assert_eq!(editor_display_name("/usr/local/bin/nvim"), "Nvim");
+        // Flags are dropped; only the program name drives the label.
+        assert_eq!(editor_display_name("code --wait"), "Code");
+        assert_eq!(editor_display_name(""), "");
+    }
+
+    #[test]
+    fn editor_round_trips_through_yaml_and_is_omitted_when_unset() {
+        let _g = LOCK.lock().unwrap();
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+        let cfg = UserConfig {
+            editor: Some("hx".into()),
+            ..UserConfig::default()
+        };
+        save_user_config(&cfg).unwrap();
+        let back = load_user_config().unwrap();
+        assert_eq!(back.editor.as_deref(), Some("hx"));
+
+        // A default config omits the key entirely (lean on-disk form).
+        let yaml = serde_yaml::to_string(&UserConfig::default()).unwrap();
+        assert!(!yaml.contains("editor"), "unset editor omitted: {yaml}");
+        std::env::remove_var("SHELBI_HOME");
     }
 }

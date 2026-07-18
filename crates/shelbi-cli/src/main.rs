@@ -286,6 +286,11 @@ enum Cmd {
     #[command(hide = true)]
     #[command(name = "__activity")]
     Activity { project: String },
+    /// (internal) Run the review-panel ratatui view inside the review
+    /// interface's third pane. Not for direct use.
+    #[command(hide = true)]
+    #[command(name = "__review-panel")]
+    ReviewPanel { project: String, task: String },
     /// (internal) Own the Codex app-server, exact orchestrator thread, and
     /// remote TUI for one project. Not for direct use.
     #[command(hide = true)]
@@ -429,6 +434,9 @@ fn main() -> Result<()> {
         Some(Cmd::Sidebar { project }) => shelbi_tui::run_sidebar(&project).context("sidebar"),
         Some(Cmd::Tasks { project }) => shelbi_tui::run_tasks(&project).context("tasks"),
         Some(Cmd::Activity { project }) => shelbi_tui::run_activity(&project).context("activity"),
+        Some(Cmd::ReviewPanel { project, task }) => {
+            shelbi_tui::run_review_panel(&project, &task).context("review-panel")
+        }
         Some(Cmd::CodexOrchestrator {
             project,
             first_launch,
@@ -583,6 +591,7 @@ fn init_tracing(cmd: Option<&Cmd>) {
         Some(Cmd::Sidebar { .. })
             | Some(Cmd::Tasks { .. })
             | Some(Cmd::Activity { .. })
+            | Some(Cmd::ReviewPanel { .. })
             | Some(Cmd::CodexOrchestrator { .. })
     );
     if is_tui {

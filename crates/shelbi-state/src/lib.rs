@@ -82,8 +82,9 @@ pub use ssh_control::{
     TCP_FORWARD_PORT_BASE, TCP_FORWARD_PORT_SPAN,
 };
 pub use user_config::{
-    load_user_config, save_user_config, scaffold_user_config_if_missing, user_config_path, Keymap,
-    UserConfig, ZenToggleChord,
+    editor_display_name, load_user_config, resolve_editor, save_user_config,
+    scaffold_user_config_if_missing, user_config_path, Keymap, UserConfig, ZenToggleChord,
+    DEFAULT_EDITOR,
 };
 pub use workflows::{
     list_workflows, load_project_statuses, load_task_workflow, load_workflow,
@@ -2508,6 +2509,71 @@ fn resolved_task_workflow_name_for_project(project: &str, task: &Task) -> Result
         .unwrap_or_else(|_| task.workflow_or_default().to_string()))
 }
 
+/// Marked-up header the review interface's **Reject** action appends to a
+/// task body before bouncing it back for rework. Kept as a `##` section so
+/// the next worker reads the feedback as part of the task requirements, not
+/// as a mid-task message. `date` is the pre-formatted date the caller
+/// stamps (e.g. `2026-07-18`); passed in rather than read from the clock so
+/// the formatting is unit-testable.
+pub fn format_review_feedback_section(reason: &str, date: &str) -> String {
+    format!(
+        "\n\n## Review feedback (rejected {date})\n\n{}\n",
+        reason.trim()
+    )
+}
+
+/// **Reject** a task under review: append the reviewer's `reason` to the
+/// task body as a [`format_review_feedback_section`] block, then move the
+/// card back to the workflow's ready status (`todo` in the default
+/// workflow) and clear its `assigned_to` — all in one locked write, so a
+/// crash can't leave the card edited-but-not-moved or unowned-but-still-in-
+/// review. The freed review workspace is picked up by the poller exactly as
+/// on any move out of the review status.
+///
+/// `date` is the pre-formatted rejection date stamped into the section
+/// header (passed in for testability). Returns `Some((from, to, workflow))`
+/// when the column changed so the caller can append a move event, mirroring
+/// [`move_task`]; `None` only if the task was somehow already in the ready
+/// status (the body edit and owner-clear still land).
+pub fn reject_review_task(
+    project: &str,
+    id: &str,
+    reason: &str,
+    date: &str,
+) -> Result<Option<(Column, Column, String)>> {
+    hub_version::ensure_daemon_matches_for_mutation()?;
+    let _lock = lock_tasks(project)?;
+    let TaskFile { mut task, body } = load_task(project, id)?;
+    let old_column = task.column.clone();
+    let workflow = resolved_task_workflow_name_for_project(project, &task)?;
+
+    // Resolve the ready status the card bounces to from the task's workflow;
+    // fall back to the stock `todo` column if the workflow can't be loaded or
+    // declares no ready status, so a config hiccup still frees the slot.
+    let ready_column = load_project(project)
+        .ok()
+        .and_then(|p| load_task_workflow(project, &p, &task).ok())
+        .and_then(|wf| wf.ready_status().map(|s| Column::from_status_id(&s.id)))
+        .unwrap_or_else(Column::todo);
+
+    let new_body = format!("{}{}", body, format_review_feedback_section(reason, date));
+
+    let already_ready = old_column == ready_column;
+    task.assigned_to = None;
+    if !already_ready {
+        task.column = ready_column.clone();
+        task.priority = list_column(project, ready_column.clone())?.len() as u32;
+    }
+    task.updated_at = chrono::Utc::now();
+    save_task_unlocked(project, &task, &new_body)?;
+    if already_ready {
+        return Ok(None);
+    }
+    renumber_column_unlocked(project, old_column.clone())?;
+    renumber_column_unlocked(project, ready_column.clone())?;
+    Ok(Some((old_column, ready_column, workflow)))
+}
+
 /// Re-position `id` to slot `new_priority` within its current column. Other
 /// tasks shift to keep the column contiguous from 0.
 pub fn set_task_priority(project: &str, id: &str, new_priority: u32) -> Result<()> {
@@ -3355,6 +3421,48 @@ mod tests {
 
         // Fully clean (Todo + unowned) → genuine no-op.
         assert_eq!(release_task_to_todo("p", "t").unwrap(), None);
+
+        std::env::remove_var("SHELBI_HOME");
+    }
+
+    #[test]
+    fn format_review_feedback_section_is_a_marked_block() {
+        let section = format_review_feedback_section("  fix the null deref  ", "2026-07-18");
+        assert!(section.contains("## Review feedback (rejected 2026-07-18)"));
+        assert!(section.contains("fix the null deref"));
+        // The reason is trimmed and the header is separated from prior body.
+        assert!(section.starts_with("\n\n## Review feedback"));
+        assert!(!section.contains("  fix"), "reason trimmed: {section:?}");
+    }
+
+    #[test]
+    fn reject_review_task_appends_feedback_moves_to_todo_and_unassigns() {
+        let _g = TEST_LOCK.lock().unwrap();
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+
+        let mut task = make_task("fix-login", Column::review(), 0);
+        task.assigned_to = Some("rev-1".to_string());
+        save_task("p", &task, "Original task body.").unwrap();
+
+        let moved =
+            reject_review_task("p", "fix-login", "restore the disconnect handler", "2026-07-18")
+                .unwrap();
+        // No project YAML in this harness → workflow resolves to the default
+        // and the ready column falls back to `todo`.
+        assert_eq!(
+            moved,
+            Some((Column::review(), Column::todo(), "default".into()))
+        );
+
+        let after = load_task("p", "fix-login").unwrap();
+        assert_eq!(after.task.column, Column::todo());
+        assert_eq!(after.task.assigned_to, None, "review slot freed");
+        // The feedback is baked into the body so the next dispatch sees it as
+        // part of the task requirements.
+        assert!(after.body.contains("Original task body."));
+        assert!(after.body.contains("## Review feedback (rejected 2026-07-18)"));
+        assert!(after.body.contains("restore the disconnect handler"));
 
         std::env::remove_var("SHELBI_HOME");
     }

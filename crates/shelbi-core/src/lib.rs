@@ -31,8 +31,8 @@ pub use shell::shell_escape;
 pub use statuses::{default_project_statuses, ProjectStatus, ProjectStatuses};
 pub use system_memory::{format_bytes_short, recommended_workspace_count, total_memory_bytes};
 pub use workflow::{
-    default_workflow, subtask_workflow, task_workflow, InlineIdentityField, Owner,
-    Status as WorkflowStatus, StatusCategory, Transition, TransitionAction, Workflow,
+    default_workflow, substitute_review_url, subtask_workflow, task_workflow, InlineIdentityField,
+    Owner, Status as WorkflowStatus, StatusCategory, Transition, TransitionAction, Workflow,
     WorkflowZenConfig,
 };
 pub use workspace_names::WorkspaceNamePreset;

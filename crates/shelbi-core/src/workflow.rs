@@ -165,6 +165,45 @@ impl Workflow {
         self.statuses.iter().find(|s| s.id == id)
     }
 
+    /// The status a task moves *into* on a plain forward step out of
+    /// `from` — the status immediately after `from` in declared
+    /// (`statuses.yaml`) order. This is the "move the card one column
+    /// right" step the Kanban board takes, so the review interface's
+    /// **Approve** action reuses it to land on the normal accept target
+    /// (`review -> done` in the default workflow) without duplicating the
+    /// board's column-walk. Returns `None` when `from` isn't declared or
+    /// is already the last status.
+    pub fn forward_status(&self, from: &str) -> Option<&Status> {
+        let pos = self.statuses.iter().position(|s| s.id == from)?;
+        self.statuses.get(pos + 1)
+    }
+
+    /// The workflow's ready status — the first [`StatusCategory::Ready`]
+    /// status in declared order (`todo` in the default workflow). The
+    /// review interface's **Reject** action bounces a task here so normal
+    /// auto-dispatch picks it back up. `None` when the workflow declares
+    /// no ready status (a terminal-only or trunk workflow).
+    pub fn ready_status(&self) -> Option<&Status> {
+        self.statuses
+            .iter()
+            .find(|s| s.category == StatusCategory::Ready)
+    }
+
+    /// The reviewable URL declared for the server that stands `status_id`
+    /// up, if any — the `url:` on an incoming transition into that status
+    /// (the serve/ready block). Scans every declared transition whose
+    /// `to` is `status_id` and returns the first `url:` found, so the
+    /// review interface can decide whether to render the "Open Browser"
+    /// action. Returns the raw string; `$PORT` / `$SLOT` substitution is
+    /// the caller's job (see [`crate::substitute_review_url`]).
+    pub fn review_url_for_status(&self, status_id: &str) -> Option<&str> {
+        self.transitions
+            .as_ref()?
+            .iter()
+            .find(|t| t.to == status_id && t.url.is_some())
+            .and_then(|t| t.url.as_deref())
+    }
+
     /// True iff `from -> to` is a legal status move. Both arguments are
     /// status ids ([`Status::id`]). Per `Plans/workflows.md` §11,
     /// transitions are any-to-any: both ids just have to be declared in
@@ -816,6 +855,7 @@ fn transition(from: &str, to: &str, actions: &[TransitionAction]) -> Transition 
         run: Vec::new(),
         ready: None,
         ready_timeout: None,
+        url: None,
     }
 }
 
@@ -1134,6 +1174,19 @@ pub struct Transition {
         skip_serializing_if = "Option::is_none"
     )]
     pub ready_timeout: Option<Duration>,
+
+    /// Reviewable URL for the server this transition's [`run`](Self::run)
+    /// stands up — the address the "Open Browser" action in the review
+    /// interface opens (e.g. `https://localhost:3000`, or
+    /// `http://localhost:$PORT` with the review slot's port substituted).
+    /// Sits in the same serve/ready block as `run:`/`ready:` because that's
+    /// where the review server is declared; only web projects set it, and
+    /// the review sidebar renders the browser action only when it's present.
+    /// `$PORT` / `$SLOT` placeholders are substituted against the review
+    /// workspace's slot when the action fires (see
+    /// [`crate::substitute_review_url`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
 }
 
 impl Transition {
@@ -1508,6 +1561,27 @@ fn format_legacy_warning(workflow_name: &str, migrations: &[StatusMigration]) ->
         }
     }
     buf
+}
+
+// ---------------------------------------------------------------------------
+// Review URL substitution
+
+/// Resolve the concrete URL the review interface's "Open Browser" action
+/// should open, given a configured [`Transition::url`] template and the
+/// review slot's port. Substitutes the `$PORT` / `$SLOT` / `${PORT}` /
+/// `${SLOT}` placeholders (both spellings) with `port`; a `None` port
+/// leaves any placeholder untouched (the literal template is returned, so
+/// a fixed URL like `https://localhost:3000` round-trips unchanged).
+pub fn substitute_review_url(template: &str, port: Option<u16>) -> String {
+    let Some(port) = port else {
+        return template.to_string();
+    };
+    let p = port.to_string();
+    template
+        .replace("${PORT}", &p)
+        .replace("$PORT", &p)
+        .replace("${SLOT}", &p)
+        .replace("$SLOT", &p)
 }
 
 // ---------------------------------------------------------------------------
@@ -2121,6 +2195,7 @@ transitions:
             run: Vec::new(),
             ready: None,
             ready_timeout: None,
+            url: None,
         };
         assert_eq!(bare.ready_timeout_or_default(), Duration::from_secs(90));
         let out = serde_yaml::to_string(&bare).unwrap();
@@ -3034,5 +3109,78 @@ statuses:
         };
         let y = serde_yaml::to_string(&s).unwrap();
         assert!(!y.contains("agent:"), "unexpected agent: in {y}");
+    }
+
+    #[test]
+    fn forward_status_is_the_next_declared_status() {
+        let wf = default_workflow();
+        // The default track is backlog → todo → in-progress → review → done;
+        // Approve steps review forward to done (the accept target).
+        assert_eq!(wf.forward_status("review").map(|s| s.id.as_str()), Some("done"));
+        assert_eq!(
+            wf.forward_status("in-progress").map(|s| s.id.as_str()),
+            Some("review")
+        );
+        // The very last declared status has nowhere forward to go.
+        let last = wf.statuses.last().unwrap().id.clone();
+        assert_eq!(wf.forward_status(&last), None);
+        // An unknown status resolves to nothing rather than panicking.
+        assert_eq!(wf.forward_status("nope"), None);
+    }
+
+    #[test]
+    fn ready_status_is_the_first_ready_category_status() {
+        let wf = default_workflow();
+        // `todo` is the ready-category status Reject bounces to.
+        assert_eq!(wf.ready_status().map(|s| s.id.as_str()), Some("todo"));
+    }
+
+    #[test]
+    fn review_url_is_read_from_the_incoming_transition_serve_block() {
+        let yaml = r#"
+name: web
+statuses:
+  - { id: in-progress, name: In progress, category: active, owner: agent, agent: developer }
+  - { id: review, name: Review, category: handoff, owner: user, agent: review, tags: [review] }
+  - { id: done, name: Done, category: done, owner: user }
+transitions:
+  - from: in-progress
+    to: review
+    run: ["npm run dev -- --port $PORT &"]
+    ready: "curl -sf http://localhost:$PORT"
+    url: "http://localhost:$PORT"
+  - from: review
+    to: done
+    actions: [merge, delete_branch]
+"#;
+        let wf = Workflow::from_yaml_str(yaml).unwrap();
+        assert_eq!(
+            wf.review_url_for_status("review"),
+            Some("http://localhost:$PORT")
+        );
+        // A status with no incoming url transition has none.
+        assert_eq!(wf.review_url_for_status("done"), None);
+    }
+
+    #[test]
+    fn substitute_review_url_fills_port_placeholders_both_spellings() {
+        assert_eq!(
+            substitute_review_url("http://localhost:$PORT", Some(3010)),
+            "http://localhost:3010"
+        );
+        assert_eq!(
+            substitute_review_url("http://localhost:${PORT}/app", Some(3010)),
+            "http://localhost:3010/app"
+        );
+        // A literal URL round-trips untouched.
+        assert_eq!(
+            substitute_review_url("https://localhost:3000", Some(3010)),
+            "https://localhost:3000"
+        );
+        // No port → placeholder left as-is (best-effort literal).
+        assert_eq!(
+            substitute_review_url("http://localhost:$PORT", None),
+            "http://localhost:$PORT"
+        );
     }
 }
