@@ -1,7 +1,9 @@
 use std::collections::BTreeSet;
+use std::sync::mpsc::{channel, Receiver, TryRecvError};
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
+use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::layout::Rect;
 use shelbi_core::{Agent, Column, Status};
 use shelbi_palette::{Decoration, DecorationColor};
@@ -199,6 +201,38 @@ pub struct App {
     /// True when the probed daemon version differs from this binary —
     /// the footer paints [`App::daemon_version_line`] red instead of dim.
     pub daemon_version_mismatch: bool,
+    /// The open "Load onto a review workspace?" confirm, raised when the
+    /// user activates a Queued-for-Review row. A modal: while `Some`, the
+    /// sidebar swallows keys/clicks and routes them to
+    /// [`App::review_prompt_key`]. `None` when nothing is being confirmed.
+    pub review_prompt: Option<ReviewLoadPrompt>,
+    /// An in-flight review load running on a background thread, so the git
+    /// checkout / install / dispatch round-trip never blocks the UI thread.
+    /// [`App::poll_review_load`] drains its channel each loop tick and swaps
+    /// the outcome (or an animated spinner) into [`App::status_line`].
+    review_job: Option<ReviewLoadJob>,
+}
+
+/// A pending "Load onto a review workspace?" confirmation. Resolved by a
+/// keypress: y/Enter confirms (only when a slot is free), n/Esc dismisses.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReviewLoadPrompt {
+    pub task_id: String,
+    pub task_title: String,
+    /// The free `review`-tagged workspace the load will target, resolved
+    /// when the prompt is raised. `None` when every review slot is busy —
+    /// the dialog then only reports "none free" and any key dismisses it.
+    pub workspace: Option<String>,
+}
+
+/// A review load running on a worker thread. Holds the channel the thread
+/// reports its outcome on plus the start instant that drives the status-line
+/// spinner while the load is in flight.
+struct ReviewLoadJob {
+    task_id: String,
+    workspace: String,
+    rx: Receiver<std::result::Result<String, String>>,
+    started: Instant,
 }
 
 impl App {
@@ -222,6 +256,8 @@ impl App {
             collapsed_machines: BTreeSet::new(),
             daemon_version_line: None,
             daemon_version_mismatch: false,
+            review_prompt: None,
+            review_job: None,
         }
     }
 
@@ -588,10 +624,138 @@ impl App {
                     self.status_line = format!("▶ {id}");
                 }
             }
-            View::ReviewTask(id) => match self.start_review(id) {
-                Ok(outcome) => self.status_line = outcome,
-                Err(e) => self.status_line = format!("review `{id}` failed: {e}"),
-            },
+            View::ReviewTask(id) => {
+                // A Queued row isn't loaded on a review slot yet: ask before
+                // loading (and load onto a *review* workspace, never the dev
+                // pane that built it). A Ready row is already served, so it
+                // opens the review interface straight away.
+                if self.queued_review.iter().any(|e| e.task_id == *id) {
+                    self.open_review_load_prompt(id);
+                } else {
+                    match self.start_review(id) {
+                        Ok(outcome) => self.status_line = outcome,
+                        Err(e) => self.status_line = format!("review `{id}` failed: {e}"),
+                    }
+                }
+            }
+        }
+    }
+
+    /// Raise the "Load onto a review workspace?" confirm for a Queued row.
+    /// Resolves a free `review`-tagged slot up front so the dialog can name
+    /// the target (or report none free). Nothing is loaded here — that waits
+    /// for [`App::review_prompt_key`] to see a confirmation. A no-op when a
+    /// prior load is still running, so two clicks can't stack dispatches.
+    fn open_review_load_prompt(&mut self, id: &str) {
+        if self.review_job.is_some() {
+            self.status_line = "a review load is already in progress…".into();
+            return;
+        }
+        let task_title = self
+            .queued_review
+            .iter()
+            .find(|e| e.task_id == *id)
+            .map(|e| e.title.clone())
+            .unwrap_or_else(|| id.to_string());
+        let workspace = match shelbi_orchestrator::load::free_review_workspaces(&self.project_name) {
+            Ok(free) => free.into_iter().next().map(|w| w.name),
+            Err(e) => {
+                self.status_line = format!("review slots query failed: {e}");
+                return;
+            }
+        };
+        self.review_prompt = Some(ReviewLoadPrompt {
+            task_id: id.to_string(),
+            task_title,
+            workspace,
+        });
+    }
+
+    /// Feed one key to the open review-load confirm. Returns `true` when a
+    /// prompt was open (the key is consumed by the modal); `false` lets the
+    /// normal keymap dispatch run. y/Enter confirms when a slot is free;
+    /// everything else — including any key when no slot is free — dismisses.
+    pub fn review_prompt_key(&mut self, key: KeyEvent) -> bool {
+        let Some(prompt) = self.review_prompt.as_ref() else {
+            return false;
+        };
+        let confirm = matches!(key.code, KeyCode::Char('y' | 'Y') | KeyCode::Enter);
+        if confirm && prompt.workspace.is_some() {
+            self.confirm_review_load();
+        } else {
+            self.review_prompt = None;
+        }
+        true
+    }
+
+    /// Whether the modal review-load confirm is currently open. Read by the
+    /// mouse handler (to swallow clicks) and the renderer (to draw the
+    /// overlay).
+    pub fn review_prompt_open(&self) -> bool {
+        self.review_prompt.is_some()
+    }
+
+    /// Kick off the review load on a worker thread so the UI thread never
+    /// blocks on the checkout / install / dispatch round-trip. The target is
+    /// the free review slot named in the prompt, so the dev workspace is
+    /// never dispatched to. Progress surfaces as a spinner in the status
+    /// line; [`App::poll_review_load`] swaps the outcome in when the thread
+    /// finishes.
+    fn confirm_review_load(&mut self) {
+        let Some(prompt) = self.review_prompt.take() else {
+            return;
+        };
+        let Some(workspace) = prompt.workspace else {
+            return;
+        };
+        let (tx, rx) = channel();
+        let project = self.project_name.clone();
+        let task_id = prompt.task_id.clone();
+        let ws = workspace.clone();
+        std::thread::spawn(move || {
+            let result = shelbi_orchestrator::load::load_review_task(&project, &task_id, &ws)
+                .map_err(|e| e.to_string());
+            let _ = tx.send(result);
+        });
+        self.status_line = format!("⠋ loading {} onto {workspace}…", prompt.task_id);
+        self.review_job = Some(ReviewLoadJob {
+            task_id: prompt.task_id,
+            workspace,
+            rx,
+            started: Instant::now(),
+        });
+    }
+
+    /// Advance any in-flight review load: pull the outcome if the worker
+    /// finished, otherwise refresh the spinner frame. Called once per sidebar
+    /// event-loop tick so the status line stays live without ever blocking on
+    /// the load.
+    pub fn poll_review_load(&mut self) {
+        let Some(job) = self.review_job.as_ref() else {
+            return;
+        };
+        match job.rx.try_recv() {
+            Ok(Ok(_target)) => {
+                // The review workspace is now checking out / serving; the next
+                // refresh moves the card into the Ready-for-Review section.
+                self.status_line = format!("loading review for {}…", job.task_id);
+                self.review_job = None;
+            }
+            Ok(Err(e)) => {
+                self.status_line = format!("review load failed: {e}");
+                self.review_job = None;
+            }
+            Err(TryRecvError::Disconnected) => {
+                self.status_line = format!("review load for {} was interrupted", job.task_id);
+                self.review_job = None;
+            }
+            Err(TryRecvError::Empty) => {
+                const FRAMES: [char; 10] =
+                    ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
+                let idx = (job.started.elapsed().as_millis() / 100) as usize % FRAMES.len();
+                self.status_line =
+                    format!("{} loading {} onto {}…", FRAMES[idx], job.task_id, job.workspace);
+            }
         }
     }
 
@@ -2716,5 +2880,113 @@ mod tests {
         assert_eq!(app.zen_mode, shelbi_state::ZenModeState::On);
 
         std::env::remove_var("SHELBI_HOME");
+    }
+
+    fn key(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, crossterm::event::KeyModifiers::NONE)
+    }
+
+    fn prompt(workspace: Option<&str>) -> ReviewLoadPrompt {
+        ReviewLoadPrompt {
+            task_id: "t-1".into(),
+            task_title: "Fix the thing".into(),
+            workspace: workspace.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn review_prompt_key_is_a_no_op_when_no_prompt_is_open() {
+        let mut app = App::new_sidebar("demo");
+        // No modal up: the key isn't consumed, so normal dispatch still runs.
+        assert!(!app.review_prompt_key(key(KeyCode::Enter)));
+        assert!(app.review_prompt.is_none());
+        assert!(app.review_job.is_none());
+    }
+
+    #[test]
+    fn review_prompt_esc_and_n_dismiss_without_loading() {
+        for code in [KeyCode::Esc, KeyCode::Char('n')] {
+            let mut app = App::new_sidebar("demo");
+            app.review_prompt = Some(prompt(Some("review-1")));
+            assert!(app.review_prompt_key(key(code)));
+            assert!(app.review_prompt.is_none(), "{code:?} should close the modal");
+            // Declining never spawns a load.
+            assert!(app.review_job.is_none(), "{code:?} must not dispatch");
+        }
+    }
+
+    #[test]
+    fn review_prompt_any_key_dismisses_when_no_slot_is_free() {
+        // With no free review workspace the dialog is informational — even the
+        // confirm keys just dismiss it, and nothing is ever loaded.
+        for code in [KeyCode::Enter, KeyCode::Char('y'), KeyCode::Esc] {
+            let mut app = App::new_sidebar("demo");
+            app.review_prompt = Some(prompt(None));
+            assert!(app.review_prompt_key(key(code)));
+            assert!(app.review_prompt.is_none());
+            assert!(app.review_job.is_none(), "{code:?} must not dispatch with no free slot");
+        }
+    }
+
+    #[test]
+    fn poll_review_load_surfaces_success_and_clears_the_job() {
+        let mut app = App::new_sidebar("demo");
+        let (tx, rx) = channel();
+        app.review_job = Some(ReviewLoadJob {
+            task_id: "t-1".into(),
+            workspace: "review-1".into(),
+            rx,
+            started: Instant::now(),
+        });
+        tx.send(Ok("shelbi-demo:review-1".into())).unwrap();
+        app.poll_review_load();
+        assert!(app.review_job.is_none(), "a finished load clears the job");
+        assert!(
+            app.status_line.contains("loading review for t-1"),
+            "got: {}",
+            app.status_line
+        );
+    }
+
+    #[test]
+    fn poll_review_load_surfaces_failure_and_clears_the_job() {
+        let mut app = App::new_sidebar("demo");
+        let (tx, rx) = channel();
+        app.review_job = Some(ReviewLoadJob {
+            task_id: "t-1".into(),
+            workspace: "review-1".into(),
+            rx,
+            started: Instant::now(),
+        });
+        tx.send(Err("every review slot is busy".into())).unwrap();
+        app.poll_review_load();
+        assert!(app.review_job.is_none());
+        assert!(
+            app.status_line.contains("review load failed")
+                && app.status_line.contains("busy"),
+            "got: {}",
+            app.status_line
+        );
+    }
+
+    #[test]
+    fn poll_review_load_animates_a_spinner_while_in_flight() {
+        let mut app = App::new_sidebar("demo");
+        // Keep the sender alive so the channel stays connected but empty.
+        let (_tx, rx) = channel::<std::result::Result<String, String>>();
+        app.review_job = Some(ReviewLoadJob {
+            task_id: "t-1".into(),
+            workspace: "review-1".into(),
+            rx,
+            started: Instant::now(),
+        });
+        app.poll_review_load();
+        // Still pending: the job survives and the status line shows progress.
+        assert!(app.review_job.is_some(), "an unfinished load stays pending");
+        assert!(
+            app.status_line.contains("loading t-1 onto review-1"),
+            "got: {}",
+            app.status_line
+        );
     }
 }
