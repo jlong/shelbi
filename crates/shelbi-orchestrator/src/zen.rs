@@ -1433,7 +1433,22 @@ pub fn pr_merge(
             "auto-merge or a merge queue controls this branch",
         ));
     }
-    ensure_exact_ref_capability(&host, &wt, &repository, &expected.base_branch, pr)?;
+    match classify_base_merge_capability(
+        &host,
+        &wt,
+        &repository,
+        &expected.base_branch,
+        project.merge_strategy().as_str(),
+        pr,
+    )? {
+        // A satisfiable `pull_request` rule forbids the direct leased push but
+        // permits the repository's own PR merge — land through it.
+        BaseMergeCapability::PullRequestMerge => {
+            return merge_via_pull_request(&host, &wt, &repository, &push_target, pr, expected);
+        }
+        // No rule requires a PR: keep the cryptographically pinned leased push.
+        BaseMergeCapability::LeasedPush => {}
+    }
 
     let base_ref = format!("refs/heads/{}", expected.base_branch);
     let lease = format!("--force-with-lease={base_ref}:{}", expected.base_sha);
@@ -1472,8 +1487,97 @@ pub fn pr_merge(
         &repository.selector,
         pr,
         &expected.integration_sha,
+        false,
     );
     Ok(PrMergeOutcome::Merged(Some(expected.integration_sha.clone())))
+}
+
+/// Land the reviewed integration candidate through GitHub's own PR squash
+/// merge. Used when the base branch carries a satisfiable `pull_request` rule:
+/// the direct leased push is forbidden, but the PR merge is the repository's
+/// required workflow. `--match-head-commit` pins the merge to the exact
+/// reviewed head so GitHub can only act on what Zen verified — if the head
+/// moved, GitHub refuses and nothing lands.
+fn merge_via_pull_request(
+    host: &Host,
+    wt: &str,
+    repository: &RepositoryIdentity,
+    push_target: &str,
+    pr: u64,
+    expected: &PinnedPrIdentity,
+) -> Result<PrMergeOutcome> {
+    let pr_str = pr.to_string();
+    let merge = run_in_dir(
+        host,
+        wt,
+        &[
+            "gh",
+            "pr",
+            "merge",
+            &pr_str,
+            "--repo",
+            &repository.selector,
+            "--squash",
+            "--match-head-commit",
+            &expected.integration_sha,
+        ],
+    )?;
+    if !merge.status.success() {
+        return Err(unsupported_exact_ref_message(
+            pr,
+            &format!(
+                "GitHub declined the required PR squash-merge: {}",
+                String::from_utf8_lossy(&merge.stderr).trim()
+            ),
+        ));
+    }
+    // Best-effort head-branch cleanup; a deletion rule degrades this to a
+    // warning rather than a merge failure.
+    delete_remote_head_branch(
+        host,
+        wt,
+        push_target,
+        &repository.selector,
+        pr,
+        &expected.integration_sha,
+        true,
+    );
+    // GitHub authored a fresh squash commit whose SHA Zen cannot predict;
+    // surface it when recorded, otherwise report the merge as landed.
+    Ok(PrMergeOutcome::Merged(merged_commit_oid(
+        host,
+        wt,
+        &repository.selector,
+        pr,
+    )))
+}
+
+/// Read the recorded merge commit SHA for a merged PR. Best-effort — returns
+/// `None` when GitHub has not yet published it.
+fn merged_commit_oid(host: &Host, wt: &str, repository: &str, pr: u64) -> Option<String> {
+    let pr_str = pr.to_string();
+    let out = run_in_dir(
+        host,
+        wt,
+        &[
+            "gh",
+            "pr",
+            "view",
+            &pr_str,
+            "--repo",
+            repository,
+            "--json",
+            "mergeCommit",
+            "--jq",
+            ".mergeCommit.oid // empty",
+        ],
+    )
+    .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let oid = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    (!oid.is_empty()).then_some(oid)
 }
 
 fn unsupported_exact_ref_message(pr: u64, reason: &str) -> Error {
@@ -1511,14 +1615,42 @@ fn ensure_commit_available(
     Ok(())
 }
 
-fn ensure_exact_ref_capability(
+/// How Zen may land the reviewed integration candidate given the base
+/// branch's active rules and classic protection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BaseMergeCapability {
+    /// No active rule requires a pull request, so Zen leases the integration
+    /// commit directly onto the base ref — the cryptographically pinned path.
+    LeasedPush,
+    /// A satisfiable `pull_request` rule governs the base branch, so the
+    /// candidate must land through GitHub's own PR merge.
+    PullRequestMerge,
+}
+
+fn rule_type(rule: &serde_json::Value) -> &str {
+    rule.get("type").and_then(serde_json::Value::as_str).unwrap_or_default()
+}
+
+/// Decide how PR #`pr` may land on `base_branch`. Instead of bailing on the
+/// mere presence of a ruleset, this inspects each rule's parameters:
+///
+/// - `deletion` / `non_fast_forward` (and other non-PR rules) never block a
+///   fast-forward integration and fall through to the leased-push path.
+/// - a satisfiable `pull_request` rule (no required approvals, no required
+///   code-owner review, and the configured merge method allowed) routes to
+///   GitHub's PR merge — the repository's required workflow.
+/// - genuinely blocking parameters (required approvals, required code-owner
+///   review, a disallowed merge method, or a required merge queue) refuse with
+///   the specific offending rule named.
+fn classify_base_merge_capability(
     host: &Host,
     wt: &str,
     repository: &RepositoryIdentity,
     base_branch: &str,
+    merge_method: &str,
     pr: u64,
-) -> Result<()> {
-    let (owner, name) = repository_owner_and_name(repository, "exact-ref capability")?;
+) -> Result<BaseMergeCapability> {
+    let (owner, name) = repository_owner_and_name(repository, "base merge capability")?;
     let rules_path = format!("repos/{owner}/{name}/rules/branches/{base_branch}");
     let rules = run_in_dir(
         host,
@@ -1536,13 +1668,79 @@ fn ensure_exact_ref_capability(
             "GitHub returned invalid active-rules JSON for `{base_branch}`: {error}"
         ))
     })?;
-    if !matches!(active_rules.as_array(), Some(rules) if rules.is_empty()) {
+    let active_rules = active_rules.as_array().ok_or_else(|| {
+        Error::Other(format!(
+            "GitHub returned non-array active-rules JSON for `{base_branch}`"
+        ))
+    })?;
+
+    // A required merge queue is a hard stop: Zen neither enqueues nor waits on
+    // queue admission.
+    if active_rules.iter().any(|rule| rule_type(rule) == "merge_queue") {
         return Err(unsupported_exact_ref_message(
             pr,
-            "the base branch has active rules (including possible required-PR or queue rules)",
+            &format!("the base branch `{base_branch}` requires a merge queue (`merge_queue` rule)"),
         ));
     }
 
+    // A `pull_request` rule forbids the direct leased push, but if its
+    // parameters are satisfiable Zen lands through GitHub's PR merge instead.
+    if let Some(rule) = active_rules
+        .iter()
+        .find(|rule| rule_type(rule) == "pull_request")
+    {
+        let params = rule.get("parameters");
+        let approvals = params
+            .and_then(|params| params.get("required_approving_review_count"))
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0);
+        if approvals > 0 {
+            return Err(unsupported_exact_ref_message(
+                pr,
+                &format!(
+                    "the base branch `{base_branch}` `pull_request` rule requires \
+                     {approvals} approving review(s)"
+                ),
+            ));
+        }
+        if params
+            .and_then(|params| params.get("require_code_owner_review"))
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false)
+        {
+            return Err(unsupported_exact_ref_message(
+                pr,
+                &format!(
+                    "the base branch `{base_branch}` `pull_request` rule requires code-owner review"
+                ),
+            ));
+        }
+        // `allowed_merge_methods` absent means every method is allowed.
+        if let Some(methods) = params
+            .and_then(|params| params.get("allowed_merge_methods"))
+            .and_then(serde_json::Value::as_array)
+        {
+            let allowed = methods
+                .iter()
+                .filter_map(serde_json::Value::as_str)
+                .any(|method| method.eq_ignore_ascii_case(merge_method));
+            if !allowed {
+                return Err(unsupported_exact_ref_message(
+                    pr,
+                    &format!(
+                        "the base branch `{base_branch}` `pull_request` rule does not allow the \
+                         `{merge_method}` merge method"
+                    ),
+                ));
+            }
+        }
+        return Ok(BaseMergeCapability::PullRequestMerge);
+    }
+
+    // No `pull_request` or `merge_queue` rule. `deletion`, `non_fast_forward`,
+    // required-check, and similar rules do not block a fast-forward leased push
+    // of the integration commit, so fall through to the classic
+    // branch-protection probe and the pinned leased-push path.
     let protection_path = format!("repos/{owner}/{name}/branches/{base_branch}/protection");
     let protection = run_in_dir(
         host,
@@ -1568,7 +1766,7 @@ fn ensure_exact_ref_capability(
             "branch-protection state could not be proven absent",
         ));
     }
-    Ok(())
+    Ok(BaseMergeCapability::LeasedPush)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1768,6 +1966,7 @@ fn delete_remote_head_branch(
     repository: &str,
     pr: u64,
     expected_head: &str,
+    warn_on_failure: bool,
 ) {
     let pr_str = pr.to_string();
     let view = run_in_dir(
@@ -1794,8 +1993,17 @@ fn delete_remote_head_branch(
         return;
     }
     let lease = format!("--force-with-lease=refs/heads/{head_ref}:{expected_head}");
-    let delete = format!(":refs/heads/{head_ref}");
-    let _ = run_in_dir(host, wt, &["git", "push", &lease, push_target, &delete]);
+    let refspec = format!(":refs/heads/{head_ref}");
+    let deleted = run_in_dir(host, wt, &["git", "push", &lease, push_target, &refspec]);
+    if warn_on_failure && !matches!(&deleted, Ok(out) if out.status.success()) {
+        // The merge already landed; a `deletion` rule (or a moved head) can
+        // still block the head-branch cleanup. Degrade to a warning rather
+        // than failing the command.
+        eprintln!(
+            "warning: PR #{pr} merged, but its head branch `{head_ref}` could not be deleted \
+             (it may be covered by a deletion rule); delete it manually"
+        );
+    }
 }
 
 fn reject_graphql_errors(value: &serde_json::Value, pr: u64, operation: &str) -> Result<()> {
@@ -2618,6 +2826,8 @@ esac
         let merged_snapshot = stub_home.join("merged.json");
         let enqueue_response = stub_home.join("enqueue.json");
         let merge_response = stub_home.join("merge.json");
+        let merge_commit = stub_home.join("merge-commit");
+        std::fs::write(&merge_commit, "pr-merge-commit\n").unwrap();
 
         let pending_snapshot = |state: &str, queue_head: Option<&str>, merge_oid: Option<&str>| {
             serde_json::json!({
@@ -2694,6 +2904,9 @@ case "$1 $2" in
       *headRefOid,headRefName,baseRefName,baseRefOid,headRepository*)
         printf '%s\n' {reviewed_head} {task_branch} "$(cat {pr_base})" {reviewed_base} {origin_repository_id} {origin_repository_name}
         ;;
+      *mergeCommit*)
+        cat {merge_commit}
+        ;;
       *headRefName*)
         printf '%s\n' {task_branch}
         ;;
@@ -2702,6 +2915,10 @@ case "$1 $2" in
         exit 64
         ;;
     esac
+    ;;
+  "pr merge")
+    printf '%s\n' "$*" >> {log}
+    : > {merged_marker}
     ;;
   "api graphql")
     operation=unknown
@@ -2782,6 +2999,7 @@ esac
             merged_snapshot = q(&merged_snapshot.to_string_lossy()),
             enqueue_response = q(&enqueue_response.to_string_lossy()),
             merge_response = q(&merge_response.to_string_lossy()),
+            merge_commit = q(&merge_commit.to_string_lossy()),
             reviewed_head = q(reviewed_head),
             reviewed_base = q(reviewed_base),
             task_branch = q(TASK_BRANCH),
@@ -4005,36 +4223,141 @@ esac
     }
 
     #[test]
-    fn branch_protection_and_rules_fail_before_integration_with_human_path() {
+    fn classic_branch_protection_fails_before_integration_with_human_path() {
         let _lock = crate::test_lock::acquire();
-        for capability in ["protection", "rules"] {
+        let (base, origin, worktree) = setup_repo(true);
+        let reviewed_head = task_branch_head(&worktree);
+        let expected = pinned_pr_identity(&worktree, &reviewed_head);
+        let stub = tempfile::tempdir().unwrap();
+        install_pr_merge_stub(stub.path(), &expected, false);
+        std::fs::write(stub.path().join("protected"), "yes\n").unwrap();
+        let error = {
+            let _env = EnvGuard::install(stub.path());
+            pr_merge(&ci_project(base.path(), &worktree), 379, &expected)
+                .unwrap_err()
+                .to_string()
+        };
+        assert!(error.contains("No code was landed"), "{error}");
+        assert!(error.contains("human"), "{error}");
+        let remote_base = git_stdout(
+            origin.parent().unwrap(),
+            &["--git-dir", origin.to_str().unwrap(), "rev-parse", "refs/heads/main"],
+        );
+        assert_eq!(remote_base, expected.base_sha);
+    }
+
+    /// A 0-approval `pull_request` rule that allows squash is the repository's
+    /// required workflow: Zen must land through GitHub's PR merge instead of
+    /// refusing on the mere presence of a ruleset.
+    #[test]
+    fn satisfiable_pull_request_rule_lands_via_github_pr_merge() {
+        let _lock = crate::test_lock::acquire();
+        let (base, origin, worktree) = setup_repo(true);
+        let reviewed_head = task_branch_head(&worktree);
+        let expected = pinned_pr_identity(&worktree, &reviewed_head);
+        let stub = tempfile::tempdir().unwrap();
+        let (log, _pr_base) = install_pr_merge_stub(stub.path(), &expected, false);
+        std::fs::write(
+            stub.path().join("rules.json"),
+            r#"[{"type":"deletion"},{"type":"non_fast_forward"},
+                {"type":"pull_request","parameters":{
+                    "required_approving_review_count":0,
+                    "require_code_owner_review":false,
+                    "allowed_merge_methods":["merge","squash","rebase"]}}]"#,
+        )
+        .unwrap();
+        let outcome = {
+            let _env = EnvGuard::install(stub.path());
+            pr_merge(&ci_project(base.path(), &worktree), 379, &expected).unwrap()
+        };
+        // GitHub authored the squash commit; Zen surfaces its recorded SHA.
+        assert_eq!(
+            outcome,
+            PrMergeOutcome::Merged(Some("pr-merge-commit".to_string()))
+        );
+        let calls = gh_calls(&log);
+        assert!(calls.contains("pr merge 379"), "{calls}");
+        assert!(calls.contains("--match-head-commit"), "{calls}");
+        assert!(calls.contains(expected.integration_sha.as_str()), "{calls}");
+        // The leased direct push must never run on the PR-merge path — GitHub
+        // owns the landing, so the base ref is untouched by Zen.
+        let remote_base = git_stdout(
+            origin.parent().unwrap(),
+            &["--git-dir", origin.to_str().unwrap(), "rev-parse", "refs/heads/main"],
+        );
+        assert_eq!(remote_base, expected.base_sha);
+    }
+
+    /// `deletion` / `non_fast_forward` rules alone never require a PR: Zen keeps
+    /// the cryptographically pinned leased push.
+    #[test]
+    fn deletion_and_non_fast_forward_rules_alone_keep_leased_push() {
+        let _lock = crate::test_lock::acquire();
+        let (base, origin, worktree) = setup_repo(true);
+        let reviewed_head = task_branch_head(&worktree);
+        let expected = pinned_pr_identity(&worktree, &reviewed_head);
+        let stub = tempfile::tempdir().unwrap();
+        let (log, _pr_base) = install_pr_merge_stub(stub.path(), &expected, false);
+        std::fs::write(
+            stub.path().join("rules.json"),
+            r#"[{"type":"deletion"},{"type":"non_fast_forward"}]"#,
+        )
+        .unwrap();
+        let outcome = {
+            let _env = EnvGuard::install(stub.path());
+            pr_merge(&ci_project(base.path(), &worktree), 379, &expected).unwrap()
+        };
+        assert_eq!(
+            outcome,
+            PrMergeOutcome::Merged(Some(expected.integration_sha.clone()))
+        );
+        let calls = gh_calls(&log);
+        assert!(!calls.contains("pr merge"), "{calls}");
+        let landed = git_stdout(
+            origin.parent().unwrap(),
+            &["--git-dir", origin.to_str().unwrap(), "rev-parse", "refs/heads/main"],
+        );
+        assert_eq!(landed, expected.integration_sha);
+    }
+
+    /// Genuinely blocking ruleset parameters keep the refusal, and the error
+    /// names the exact offending rule.
+    #[test]
+    fn blocking_ruleset_parameters_refuse_and_name_the_rule() {
+        let _lock = crate::test_lock::acquire();
+        let cases: [(&str, &str); 3] = [
+            (
+                r#"[{"type":"pull_request","parameters":{"required_approving_review_count":1}}]"#,
+                "1 approving review",
+            ),
+            (
+                r#"[{"type":"pull_request","parameters":{
+                    "required_approving_review_count":0,
+                    "allowed_merge_methods":["merge","rebase"]}}]"#,
+                "does not allow the `squash`",
+            ),
+            (r#"[{"type":"merge_queue"}]"#, "merge queue"),
+        ];
+        for (rules_json, needle) in cases {
             let (base, origin, worktree) = setup_repo(true);
             let reviewed_head = task_branch_head(&worktree);
             let expected = pinned_pr_identity(&worktree, &reviewed_head);
             let stub = tempfile::tempdir().unwrap();
             install_pr_merge_stub(stub.path(), &expected, false);
-            if capability == "protection" {
-                std::fs::write(stub.path().join("protected"), "yes\n").unwrap();
-            } else {
-                std::fs::write(
-                    stub.path().join("rules.json"),
-                    r#"[{"type":"pull_request"}]"#,
-                )
-                .unwrap();
-            }
+            std::fs::write(stub.path().join("rules.json"), rules_json).unwrap();
             let error = {
                 let _env = EnvGuard::install(stub.path());
                 pr_merge(&ci_project(base.path(), &worktree), 379, &expected)
                     .unwrap_err()
                     .to_string()
             };
+            assert!(error.contains(needle), "expected `{needle}` in: {error}");
             assert!(error.contains("No code was landed"), "{error}");
-            assert!(error.contains("human"), "{error}");
             let remote_base = git_stdout(
                 origin.parent().unwrap(),
                 &["--git-dir", origin.to_str().unwrap(), "rev-parse", "refs/heads/main"],
             );
-            assert_eq!(remote_base, expected.base_sha);
+            assert_eq!(remote_base, expected.base_sha, "case: {needle}");
         }
     }
 
