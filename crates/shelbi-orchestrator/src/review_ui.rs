@@ -1,26 +1,28 @@
-//! The review interface's orchestration layer: reshape the dashboard window
-//! into the faithful three-column layout (sidebar | reviewer content |
-//! review panel), switch the middle content between the reviewer chat and an
-//! editor, and run the Approve / Reject transitions.
+//! The review interface's orchestration layer: build the faithful
+//! three-column layout (sidebar | review agent/server | review panel) inside
+//! the **review workspace's own window**, switch the middle content between
+//! the reviewer chat and an editor, and run the Approve / Reject transitions.
 //!
 //! ## Layout mechanics
 //!
-//! The dashboard window normally holds two panes — the ratatui sidebar
-//! (left) and a content slot (right) other views `swap-pane` into. Opening
-//! the review interface:
+//! Under the window-per-workspace model every review slot has its own window
+//! (`shelbi-<proj>:<workspace>`) in the attached session, already holding the
+//! review agent/server pane. Opening the review interface:
 //!
-//! 1. splits a **third** pane onto the right running `shelbi review-panel`
-//!    (the [`crate`]-external ratatui right sidebar), and
-//! 2. `swap-pane`s the review workspace's chat pane into the **middle**
-//!    content slot.
+//! 1. splits a pane onto the **right** of that agent pane running `shelbi
+//!    review-panel` (the [`crate`]-external ratatui right sidebar), and
+//! 2. `select-window`s the review window — the session's
+//!    `after-select-window` hook relocates the single traveling sidebar to
+//!    its **left**, giving `sidebar | agent | panel`.
 //!
-//! Because `swap-pane` exchanges pane *positions* (pane ids travel with
-//! their process), there is no stable "middle position id". We track the
-//! pane id currently occupying the middle in the session env var
-//! `SHELBI_REVIEW_MID`, updating it on every swap; [`show_review_view`]
-//! swaps the requested pane against whatever's there. Closing the interface
-//! restores the original content pane to the middle, kills the panel/editor
-//! panes, and clears the env vars.
+//! The dashboard window is never touched, so a review load adds no pane
+//! there. Because `swap-pane` exchanges pane *positions* (pane ids travel
+//! with their process), the middle column has no stable "position id" — we
+//! track the pane id currently occupying the middle in the session env var
+//! `SHELBI_REVIEW_MID`, updating it on every swap; [`show_review_view`] swaps
+//! the requested pane (chat or editor) against whatever's there. Closing the
+//! interface restores the chat pane to the middle, kills the panel/editor
+//! panes, clears the env vars, and returns focus to the dashboard.
 //!
 //! Only **local** (hub) review workspaces can be embedded — `swap-pane`
 //! can't reach a pane living in a remote workspace's own tmux server — so a
@@ -41,9 +43,6 @@ use crate::load;
 /// Session env var holding the pane id currently shown in the middle content
 /// slot. Updated on every [`show_review_view`] swap.
 const MID_KEY: &str = "SHELBI_REVIEW_MID";
-/// Session env var holding the original dashboard content pane id, so
-/// [`close_review_interface`] can restore the two-pane layout.
-const CONTENT_KEY: &str = "SHELBI_REVIEW_CONTENT";
 /// Session env var holding the review-panel (right sidebar) pane id.
 const PANEL_KEY: &str = "SHELBI_REVIEW_PANEL";
 /// Session env var holding the lazily-created editor pane id.
@@ -129,16 +128,6 @@ fn unset_session_var(session: &str, key: &str) {
     let _ = tmux_run(&["set-environment", "-t", session, "-u", key]);
 }
 
-/// Pane id currently sitting in the dashboard's right (content) slot.
-fn content_pane_id(session: &str) -> Result<String> {
-    let target = format!("{session}:dashboard.{{right}}");
-    let id = tmux_capture(&["display-message", "-p", "-t", &target, "#{pane_id}"])?;
-    if id.is_empty() {
-        return Err(Error::Other("dashboard has no content pane".into()));
-    }
-    Ok(id)
-}
-
 /// First pane id of a local workspace's window (`shelbi-<proj>:<ws>`).
 fn local_workspace_pane_id(session: &str, window: &str) -> Result<String> {
     let target = format!("{session}:{window}");
@@ -157,8 +146,12 @@ fn local_workspace_pane_id(session: &str, window: &str) -> Result<String> {
 ///
 /// If the task isn't loaded onto a review workspace yet, kicks off a
 /// background load (detached pane — no focus steal) and returns
-/// [`ReviewOpenOutcome::Loading`]. Otherwise builds the three-pane layout
-/// and returns the tmux target to focus.
+/// [`ReviewOpenOutcome::Loading`]. Otherwise builds the three-column layout
+/// **inside the review workspace's own window** — splitting the review panel
+/// onto the right of the agent/server pane and switching to that window so
+/// the traveling sidebar joins its left — and returns that window's target.
+/// The dashboard window is never reshaped, so a review load adds no pane
+/// there.
 pub fn open_review_interface(project_name: &str, task_id: &str) -> Result<ReviewOpenOutcome> {
     let project = shelbi_state::load_project(project_name)?;
     let tf = shelbi_state::load_task(project_name, task_id)?;
@@ -183,7 +176,7 @@ pub fn open_review_interface(project_name: &str, task_id: &str) -> Result<Review
         .machine(&ws.machine)
         .ok_or_else(|| Error::UnknownMachine(ws.machine.clone()))?;
     let session = format!("shelbi-{project_name}");
-    let dashboard = format!("{session}:dashboard");
+    let review_win = format!("{session}:{}", ws.name);
 
     // Remote review slots live in their own tmux server; swap-pane can't
     // embed them. Degrade to focusing the workspace window.
@@ -195,18 +188,31 @@ pub fn open_review_interface(project_name: &str, task_id: &str) -> Result<Review
         )));
     }
 
-    // Re-entrancy: a prior interface (opened on another review task, or left
-    // over after a panel crash) is torn down first so we never leak its panes.
+    // Reuse: the interface is already up on this same task — just re-focus its
+    // window (the traveling sidebar follows the select-window). Avoids
+    // splitting a second panel on a repeat click.
+    if read_session_var(&session, PANEL_KEY).is_some()
+        && read_session_var(&session, TASK_KEY).as_deref() == Some(task_id)
+    {
+        let _ = tmux_run(&["select-window", "-t", &review_win]);
+        return Ok(ReviewOpenOutcome::Opened(review_win));
+    }
+    // A panel left over from another task (or a crash) is torn down first so we
+    // never leak its panes or stack a second panel into the window.
     if read_session_var(&session, PANEL_KEY).is_some() {
         let _ = close_review_interface(project_name);
     }
 
-    // Capture the original content pane before adding the panel to its right.
-    let content = content_pane_id(&session)?;
-    set_session_var(&session, CONTENT_KEY, &content)?;
+    // The review agent/server pane already occupies the review window — it is
+    // the MIDDLE column. Pin it as the chat/middle before adding the panel.
+    let chat = local_workspace_pane_id(&session, &ws.name)?;
     set_session_var(&session, TASK_KEY, task_id)?;
+    set_session_var(&session, CHAT_KEY, &chat)?;
+    set_session_var(&session, MID_KEY, &chat)?;
 
-    // 1. Split the review panel onto the right of the content pane.
+    // 1. Split the review panel onto the right of the agent pane (detached so
+    //    focus stays on the agent pane — the sidebar join below inserts to the
+    //    left of *that* focused pane, yielding `sidebar | agent | panel`).
     let shelbi_bin = crate::current_exe_string()?;
     let panel_cmd = review_panel_cmd(&shelbi_bin, project_name, task_id);
     let panel_id = tmux_capture(&[
@@ -214,7 +220,7 @@ pub fn open_review_interface(project_name: &str, task_id: &str) -> Result<Review
         "-h",
         "-d",
         "-t",
-        &content,
+        &chat,
         "-P",
         "-F",
         "#{pane_id}",
@@ -224,20 +230,12 @@ pub fn open_review_interface(project_name: &str, task_id: &str) -> Result<Review
     ])?;
     set_session_var(&session, PANEL_KEY, &panel_id)?;
 
-    // 2. Swap the review workspace's chat pane into the middle (content) slot.
-    //    The displaced content pane parks in the workspace window and stays
-    //    there for the whole session, so close can swap it straight back.
-    let chat = local_workspace_pane_id(&session, &ws.name)?;
-    if chat != content {
-        tmux_run(&["swap-pane", "-s", &chat, "-t", &content])?;
-    }
-    set_session_var(&session, CHAT_KEY, &chat)?;
-    set_session_var(&session, MID_KEY, &chat)?;
-
-    // 3. Focus the dashboard + the middle pane.
-    let _ = tmux_run(&["select-window", "-t", &dashboard]);
+    // 2. Switch to the review window; the `after-select-window` hook relocates
+    //    the traveling sidebar to its left and restores focus to the agent
+    //    pane.
+    let _ = tmux_run(&["select-window", "-t", &review_win]);
     let _ = tmux_run(&["select-pane", "-t", &chat]);
-    Ok(ReviewOpenOutcome::Opened(dashboard))
+    Ok(ReviewOpenOutcome::Opened(review_win))
 }
 
 /// Swap the requested view into the middle content slot, preserving both the
@@ -325,33 +323,25 @@ fn ensure_editor_pane(
     Ok(editor_id)
 }
 
-/// Tear the review interface back down to the normal two-pane dashboard:
-/// restore the original content pane to the middle, kill the review-panel
-/// and editor panes, and clear the `SHELBI_REVIEW_*` session vars. Idempotent
+/// Tear the review interface back down: bring the agent/chat pane back to the
+/// review window's middle (if the editor is showing), kill the review-panel
+/// and editor panes, clear the `SHELBI_REVIEW_*` session vars, and return
+/// focus to the dashboard. The review window is left with just its agent pane
+/// (plus the sidebar, which travels back on the dashboard select). Idempotent
 /// and best-effort — a missing var means nothing to undo.
 pub fn close_review_interface(project_name: &str) -> Result<()> {
     let session = format!("shelbi-{project_name}");
     let dashboard = format!("{session}:dashboard");
 
-    let content = read_session_var(&session, CONTENT_KEY);
     let chat = read_session_var(&session, CHAT_KEY);
     let mid = read_session_var(&session, MID_KEY);
 
-    // Restore in two hops so the review agent's chat pane lands back in its
-    // workspace window rather than being stranded in the editor's hidden
-    // window (which the kill below would then destroy):
-    //
-    //   1. bring the chat pane back to the middle (if the editor is showing),
-    //   2. swap the original content pane back into the middle — which returns
-    //      the chat pane to the workspace window it was displaced from at open.
+    // If the editor is currently in the middle, swap the chat pane back so the
+    // agent pane returns to the review window before the editor's hidden
+    // window is destroyed by the kill below.
     if let (Some(chat), Some(mid)) = (chat.as_deref(), mid.as_deref()) {
         if mid != chat {
             let _ = tmux_run(&["swap-pane", "-s", chat, "-t", mid]);
-        }
-    }
-    if let (Some(content), Some(chat)) = (content.as_deref(), chat.as_deref()) {
-        if content != chat {
-            let _ = tmux_run(&["swap-pane", "-s", content, "-t", chat]);
         }
     }
     // Kill the editor (its hidden window closes with it) and the review panel.
@@ -361,7 +351,7 @@ pub fn close_review_interface(project_name: &str) -> Result<()> {
     if let Some(panel) = read_session_var(&session, PANEL_KEY) {
         let _ = tmux_run(&["kill-pane", "-t", &panel]);
     }
-    for key in [MID_KEY, CONTENT_KEY, PANEL_KEY, EDITOR_KEY, CHAT_KEY, TASK_KEY] {
+    for key in [MID_KEY, PANEL_KEY, EDITOR_KEY, CHAT_KEY, TASK_KEY] {
         unset_session_var(&session, key);
     }
     let _ = tmux_run(&["select-window", "-t", &dashboard]);
@@ -460,7 +450,7 @@ mod tests {
 
     #[test]
     fn session_env_keys_are_distinct() {
-        let keys = [MID_KEY, CONTENT_KEY, PANEL_KEY, EDITOR_KEY, CHAT_KEY, TASK_KEY];
+        let keys = [MID_KEY, PANEL_KEY, EDITOR_KEY, CHAT_KEY, TASK_KEY];
         let mut sorted = keys.to_vec();
         sorted.sort_unstable();
         sorted.dedup();

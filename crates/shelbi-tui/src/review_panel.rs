@@ -536,10 +536,10 @@ pub fn run_review_panel(project_name: &str, task_id: &str) -> Result<()> {
 
     let result = review_panel_loop(&mut term, &mut app, project_name);
     crate::restore_terminal_pub(&mut term).ok();
-    // Every exit path (q / Esc / Approve / Reject) tears the three-pane
-    // interface back down to the normal dashboard: restore the middle content
-    // pane and drop the panel/editor panes. Best-effort — the pane is going
-    // away regardless.
+    // Every exit path (q / Esc / Approve / Reject) tears the three-column
+    // interface back down: restore the agent pane to the review window's
+    // middle, drop the panel/editor panes, and return focus to the dashboard.
+    // Best-effort — the pane is going away regardless.
     let _ = shelbi_orchestrator::review_ui::close_review_interface(project_name);
     result
 }
