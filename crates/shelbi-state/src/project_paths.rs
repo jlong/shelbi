@@ -367,6 +367,7 @@ mod tests {
         );
         Project {
             name: name.into(),
+            label: None,
             display_name: None,
             repo: repo.into(),
             default_branch: "main".into(),

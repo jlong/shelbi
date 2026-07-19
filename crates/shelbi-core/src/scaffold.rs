@@ -487,7 +487,8 @@ agent_runners:
         assert!(decorated.contains("https://shelbi.dev/docs/configuration/project"));
         // As written, the optional blocks are inert comments.
         let p = Project::from_yaml_str(&decorated).expect("decorated project parses");
-        assert_eq!(p.name, "myapp");
+        // The YAML `name:` is the free-form label; the id is filename-derived.
+        assert_eq!(p.label.as_deref(), Some("myapp"));
         assert_eq!(p.machines.len(), 1, "ssh example must stay commented");
         // The active starter pool ships (dev + review slot); the extra-workspace
         // example spliced into it stays commented.

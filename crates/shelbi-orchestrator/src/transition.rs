@@ -345,6 +345,7 @@ mod tests {
         );
         Project {
             name: "fixture".into(),
+            label: None,
             display_name: None,
             repo: "/tmp/fixture".into(),
             default_branch: "main".into(),

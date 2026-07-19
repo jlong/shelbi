@@ -4007,6 +4007,7 @@ mod tests {
         );
         Project {
             name: "myapp".into(),
+            label: None,
             display_name: None,
             repo: "git@example:repo.git".into(),
             default_branch: "main".into(),
@@ -6916,6 +6917,7 @@ mod sync_worktree_git_tests {
         );
         Project {
             name: "sync-test".into(),
+            label: None,
             display_name: None,
             repo: repo.to_string_lossy().into(),
             default_branch: "main".into(),
@@ -7614,6 +7616,7 @@ mod sync_worktree_freshcut_tests {
         );
         Project {
             name: "synccut".into(),
+            label: None,
             display_name: None,
             repo: repo.to_string_lossy().into(),
             default_branch: "main".into(),
@@ -7979,6 +7982,7 @@ mod sync_worktree_freshcut_tests {
         );
         let project = Project {
             name: "synccut".into(),
+            label: None,
             display_name: None,
             repo: machine_repo.to_string_lossy().into(),
             default_branch: "main".into(),

@@ -369,13 +369,14 @@ impl std::fmt::Display for ModeChoice {
 /// serializer rather than silently corrupting the file.
 #[derive(serde::Serialize)]
 struct ProjectYaml<'a> {
-    name: &'a str,
-    /// Human-readable label. Emitted only when the entered name was slugified
-    /// into a different `name` (e.g. `ContextStore` → `contextstore`), so a
-    /// project whose name is already a clean slug stays byte-identical to the
-    /// pre-`display_name` shape.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    display_name: Option<&'a str>,
+    /// Free-form human display **label**. The project **id** is the config
+    /// file's basename (`~/.shelbi/projects/<id>.yaml`), so this key never
+    /// carries the id — it is emitted only when the entered name was slugified
+    /// into a different id (e.g. `ContextStore` → id `contextstore`, label
+    /// `ContextStore`). A name that is already a clean slug supplies no label,
+    /// so the key is elided and the id doubles as the display label.
+    #[serde(rename = "name", skip_serializing_if = "Option::is_none")]
+    label: Option<&'a str>,
     repo: &'a str,
     default_branch: &'a str,
     /// Emitted only for in-repo projects (`config_mode: in-repo`). Global
@@ -458,8 +459,10 @@ fn render_project_yaml(
         },
     );
     let doc = ProjectYaml {
-        name,
-        display_name,
+        // `name` is the id — it becomes the filename, not a YAML key. The
+        // optional human label (present only when the entered name was
+        // slugified) is written under the `name:` key.
+        label: display_name,
         repo,
         default_branch: "main",
         config_mode,
@@ -1079,7 +1082,9 @@ mod tests {
     fn render_project_yaml_round_trips_through_the_loader() {
         let yaml = render_project_yaml("my-app", None, "", Path::new("/tmp/my-app"), None).unwrap();
         let project: shelbi_core::Project = serde_yaml::from_str(&yaml).unwrap();
-        assert_eq!(project.name, "my-app");
+        // The id `my-app` lives in the filename; an already-clean id supplies
+        // no `name:` label, so the parsed label is absent.
+        assert_eq!(project.label, None);
         assert_eq!(project.default_branch, "main");
         assert_eq!(project.machines.len(), 1);
         assert_eq!(project.machines[0].name, "hub");
@@ -1097,12 +1102,13 @@ mod tests {
             .any(|w| project.effective_tags(w).contains("review")));
     }
 
-    /// A slugified project records the original human-readable name as
-    /// `display_name`, which round-trips through the loader; an already-clean
-    /// name emits no `display_name` key at all so legacy YAMLs stay byte-identical.
+    /// The id lives in the filename, so the scaffolded YAML carries the
+    /// original human-readable name as the free-form `name:` *label* only when
+    /// the entered name was slugified; an already-clean name emits no top-level
+    /// `name:` key at all (the id-as-filename doubles as the label).
     #[test]
-    fn render_project_yaml_records_display_name_only_when_slugified() {
-        // Slug differs from the entered label → display_name is emitted.
+    fn render_project_yaml_records_label_only_when_slugified() {
+        // Slug differs from the entered label → `name:` (the label) is emitted.
         let yaml = render_project_yaml(
             "contextstore",
             Some("ContextStore"),
@@ -1111,20 +1117,26 @@ mod tests {
             None,
         )
         .unwrap();
-        let project: shelbi_core::Project = serde_yaml::from_str(&yaml).unwrap();
-        assert_eq!(project.name, "contextstore");
-        assert_eq!(project.display_name.as_deref(), Some("ContextStore"));
+        assert!(
+            yaml.lines().any(|l| l == "name: ContextStore"),
+            "the free-form label belongs under the top-level `name:` key:\n{yaml}"
+        );
+        let mut project: shelbi_core::Project = serde_yaml::from_str(&yaml).unwrap();
+        assert_eq!(project.label.as_deref(), Some("ContextStore"));
+        // The loader fills the id from the filename; simulate that here.
+        project.name = "contextstore".to_string();
         assert_eq!(project.display_label(), "ContextStore");
 
-        // No display_name → the key is absent (byte-for-byte with the old shape).
+        // Already-clean name → no label supplied → no top-level `name:` key.
         let plain =
             render_project_yaml("my-app", None, "", Path::new("/tmp/my-app"), None).unwrap();
         assert!(
-            !plain.contains("display_name"),
-            "an unset display_name must not appear in the YAML:\n{plain}"
+            !plain.lines().any(|l| l.starts_with("name:")),
+            "an already-clean id needs no `name:` label key:\n{plain}"
         );
-        let project: shelbi_core::Project = serde_yaml::from_str(&plain).unwrap();
-        assert_eq!(project.display_name, None);
+        let mut project: shelbi_core::Project = serde_yaml::from_str(&plain).unwrap();
+        assert_eq!(project.label, None);
+        project.name = "my-app".to_string();
         assert_eq!(project.display_label(), "my-app");
     }
 

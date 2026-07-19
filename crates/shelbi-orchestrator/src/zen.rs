@@ -2479,6 +2479,7 @@ mod pr_create_tests {
         );
         Project {
             name: PROJECT_NAME.into(),
+            label: None,
             display_name: None,
             repo: work_dir.to_string_lossy().into_owned(),
             default_branch: "main".into(),
@@ -8357,6 +8358,7 @@ mod probe_tests {
         );
         Project {
             name: "probe-test".into(),
+            label: None,
             display_name: None,
             repo: work_dir.to_string_lossy().into(),
             default_branch: "main".into(),

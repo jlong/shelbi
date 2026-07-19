@@ -61,6 +61,12 @@ pub fn project_roots() -> Result<Vec<ProjectRoot>> {
         if path.extension().and_then(|e| e.to_str()) != Some("yaml") {
             continue;
         }
+        // The id is the filename stem, not any YAML key. A file with no usable
+        // stem can't be a registration — skip it like an unparseable one.
+        let id = match path.file_stem().and_then(|s| s.to_str()) {
+            Some(s) if !s.is_empty() => s.to_string(),
+            _ => continue,
+        };
         let text = match fs::read_to_string(&path) {
             Ok(t) => t,
             Err(e) => {
@@ -81,7 +87,7 @@ pub fn project_roots() -> Result<Vec<ProjectRoot>> {
             }
             let canonical = fs::canonicalize(&machine.work_dir).ok();
             out.push(ProjectRoot {
-                name: project.name.clone(),
+                name: id.clone(),
                 work_dir: machine.work_dir.clone(),
                 canonical,
             });

@@ -499,7 +499,7 @@ impl App {
         // failure (fresh/half-set-up project) leaves the slug showing.
         self.display_name = shelbi_state::load_project(&self.project_name)
             .ok()
-            .and_then(|p| p.display_name);
+            .and_then(|p| p.display_name.or(p.label));
         self.agents = load_agents(&self.project_name).unwrap_or_default();
         let review =
             shelbi_state::list_column(&self.project_name, Column::review()).unwrap_or_default();
@@ -1335,6 +1335,7 @@ mod tests {
         );
         Project {
             name: "demo".into(),
+            label: None,
             display_name: None,
             repo: "git@example:demo.git".into(),
             default_branch: "main".into(),
