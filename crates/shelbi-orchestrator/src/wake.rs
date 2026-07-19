@@ -3378,6 +3378,7 @@ mod tests {
 
         let project = Project {
             name: "demo".into(),
+            label: None,
             display_name: None,
             default_branch: "main".into(),
             default_workflow: None,

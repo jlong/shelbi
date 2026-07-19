@@ -200,8 +200,12 @@ impl DetectedSetupPlan {
             .collect::<BTreeMap<_, _>>();
 
         let project = Project {
+            // `name` is the machine id (the registration filename); the
+            // free-form human label (present only when the entered name was
+            // slugified) is serialized under the YAML `name:` key via `label`.
             name: self.project_name.clone(),
-            display_name: self.display_name.clone(),
+            label: self.display_name.clone(),
+            display_name: None,
             repo: self.repo_root.display().to_string(),
             default_branch: self.default_branch.clone(),
             default_workflow: Some(shelbi_core::TASK_WORKFLOW_NAME.to_string()),

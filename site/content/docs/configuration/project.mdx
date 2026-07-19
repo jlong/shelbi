@@ -16,8 +16,22 @@ The file's location depends on the project's
 
 | Mode | Shared fields | User-local fields |
 | --- | --- | --- |
-| Global (default) | `~/.shelbi/projects/<name>.yaml` | same file |
-| In-repo | `<repo>/.shelbi/project.yaml` (committed) | `~/.shelbi/projects/<name>/local.yaml` |
+| Global (default) | `~/.shelbi/projects/<id>.yaml` | same file |
+| In-repo | `<repo>/.shelbi/project.yaml` (committed) | `~/.shelbi/projects/<id>/local.yaml` |
+
+## The project id comes from the filename
+
+A project's **id** is the config file's basename: `~/.shelbi/projects/shelbi.yaml`
+has the id `shelbi`. The id is the machine-facing key: it names the state
+folder (`~/.shelbi/projects/<id>/`), the settings file, the tmux session, the
+event-log `project=<id>` field, and is what `--project` / `$SHELBI_PROJECT`
+match against. It must be a valid slug: lowercase ASCII letters, digits, `-`,
+and `_`, starting with a letter or digit. A file whose stem breaks that rule
+(`Shelbi.yaml`, `my project.yaml`) fails to load with an actionable error;
+the fix is to rename the file, not to edit a field.
+
+The `name:` key *inside* the file is a free-form human **label** (see
+[top-level fields](#top-level-fields)); it never sets the id.
 
 In global mode every field lives in one flat file. In in-repo mode the
 **shared** fields (`name`, `default_branch`, `default_workflow`, `orchestrator`,
@@ -31,8 +45,9 @@ load time. The canonical bucket lists are `SHARED_PROJECT_FIELDS` and
 ## Minimal example
 
 ```yaml
-# ~/.shelbi/projects/myapp.yaml
-name: myapp
+# ~/.shelbi/projects/myapp.yaml (id `myapp`, taken from the filename).
+# `name:` is an optional free-form label; omit it and the id `myapp` shows.
+name: My App
 repo: git@github.com:me/myapp.git
 default_branch: main
 # Optional: tasks without `workflow:` use workflows/app.yaml instead of
@@ -59,7 +74,8 @@ workspaces:
 
 | Field | Type | Required | Default | Description |
 | --- | --- | --- | --- | --- |
-| `name` | string | yes | — | Project identifier. Doubles as the local registry key (`~/.shelbi/projects/<name>.yaml`). |
+| `name` | string | no | the id | Free-form human display **label** (uppercase, spaces, anything) shown in the sidebar and command palette. It is *not* the id; the id comes from the [filename](#the-project-id-comes-from-the-filename). Omit it and the id is displayed. |
+| `display_name` | string | no | — | **Deprecated** alias for `name`, accepted for one release with a load-time warning and removed in the next. Move its value to `name:`. When both are set, `display_name` wins as the label. |
 | `repo` | string | yes | — | Clone URL or path to the repository. User-local. |
 | `default_branch` | string | no | `main` | Branch new work is based on and the fallback merge target when `git.base_branch` is unset. |
 | `default_workflow` | string | no | `default` | Workflow used by tasks that omit `workflow:` frontmatter. Names `workflows/<name>.yaml`; explicit task `workflow:` still wins. |

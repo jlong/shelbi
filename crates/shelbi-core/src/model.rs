@@ -47,15 +47,28 @@ pub struct SessionProject {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Project {
     // --- shared -----------------------------------------------------------
+    /// Machine-facing project **id**. Keys the on-disk folder
+    /// (`~/.shelbi/projects/<id>/`), the settings file, the tmux session,
+    /// the event-log `project=` field, `--project` / `$SHELBI_PROJECT`
+    /// matching, and every state key. It is derived from the config file's
+    /// basename at load time — `~/.shelbi/projects/shelbi.yaml` → `shelbi`
+    /// — and is **never** read from a YAML key, so it is `#[serde(skip)]`.
+    /// The loader ([`shelbi_state::load_project`]) fills it in and validates
+    /// it with the id rules; a hand-built `Project` must set it explicitly.
+    #[serde(skip)]
     pub name: String,
-    /// Optional human-readable label for the project. The `name` above is
-    /// always the slug/id — it keys the on-disk folder, the settings file,
-    /// the tmux session, the event-log `project=` field, and every state
-    /// key. `display_name` is *display-only*: it's what a human sees in the
-    /// sidebar and command palette when set. Legacy projects have no
-    /// `display_name` and render under `name` exactly as before (see
-    /// [`Project::display_label`]). Elided from the wire form when unset so
-    /// existing project YAMLs round-trip byte-for-byte.
+    /// Free-form human **label** for the project, read from the YAML `name:`
+    /// key. Unlike the id it has no charset rules — uppercase, spaces, and
+    /// punctuation are all fine. `None` when the YAML omits `name:`, in which
+    /// case [`Project::display_label`] falls back to the id. Elided from the
+    /// wire form when unset so a minimal project YAML round-trips cleanly.
+    #[serde(rename = "name", default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+    /// Deprecated alias for [`label`](Self::label), read from the legacy
+    /// `display_name:` key. Accepted for one release with a load-time
+    /// deprecation warning and dropped in the next. When both it and `name`
+    /// are present it *wins* as the label (it was explicitly the label under
+    /// the old two-key shape). See [`Project::display_label`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub display_name: Option<String>,
     #[serde(default = "default_branch")]
@@ -610,16 +623,21 @@ impl Project {
         self.machines.iter().find(|m| m.name == name)
     }
 
-    /// The label to show a human for this project: [`display_name`] when set,
-    /// otherwise the slug [`name`]. Every user-facing render (sidebar,
-    /// command palette) goes through here so a legacy project — one with no
-    /// `display_name` — reads exactly as it did before, while a project that
-    /// carries a human-readable label shows it.
+    /// The label to show a human for this project. Precedence: the deprecated
+    /// [`display_name`] alias when set (it was explicitly the label under the
+    /// old shape), then the free-form [`label`] (the YAML `name:` key), then
+    /// the slug [`name`] (the id) as a fallback. Every user-facing render
+    /// (sidebar, command palette) goes through here, so a minimal project
+    /// with no label reads as its id while one carrying a label shows it.
     ///
     /// [`display_name`]: Project::display_name
+    /// [`label`]: Project::label
     /// [`name`]: Project::name
     pub fn display_label(&self) -> &str {
-        self.display_name.as_deref().unwrap_or(&self.name)
+        self.display_name
+            .as_deref()
+            .or(self.label.as_deref())
+            .unwrap_or(&self.name)
     }
 
     /// Effective base branch — `git.base_branch` when set, otherwise the
@@ -2765,9 +2783,8 @@ updated_at: 2026-06-19T00:00:00Z
     }
 
     #[test]
-    fn display_label_falls_back_to_name_and_prefers_display_name() {
+    fn display_label_prefers_display_name_then_label_then_id() {
         let base = "\
-name: contextstore
 repo: /tmp/cs
 machines:
   - { name: hub, kind: local, work_dir: /tmp }
@@ -2775,27 +2792,38 @@ orchestrator: { runner: claude }
 agent_runners:
   claude: { command: claude, flags: [] }
 ";
-        // Legacy project (no display_name): label is the slug, and the field
-        // is elided on the way back out so the YAML round-trips unchanged.
-        let legacy = Project::from_yaml_str(base).unwrap();
-        assert_eq!(legacy.display_name, None);
-        assert_eq!(legacy.display_label(), "contextstore");
-        let out = serde_yaml::to_string(&legacy).unwrap();
+        // No `name:` label at all: the id (filled by the loader, stubbed here)
+        // is the label, and nothing extra is serialized.
+        let mut minimal = Project::from_yaml_str(base).unwrap();
+        assert_eq!(minimal.label, None);
+        assert_eq!(minimal.display_name, None);
+        minimal.name = "contextstore".to_string();
+        assert_eq!(minimal.display_label(), "contextstore");
+        let out = serde_yaml::to_string(&minimal).unwrap();
         assert!(
-            !out.contains("display_name"),
-            "an unset display_name must not be serialized:\n{out}"
+            !out.lines().any(|l| l.starts_with("name:")) && !out.contains("display_name"),
+            "the machine id is never serialized and an unset label carries no top-level `name:`:\n{out}"
         );
 
-        // With a display_name set, the human label wins while `name` stays the
-        // slug used for every storage key.
-        let labeled_yaml = format!("display_name: ContextStore\n{base}");
-        let labeled = Project::from_yaml_str(&labeled_yaml).unwrap();
-        assert_eq!(labeled.name, "contextstore");
-        assert_eq!(labeled.display_name.as_deref(), Some("ContextStore"));
-        assert_eq!(labeled.display_label(), "ContextStore");
+        // The free-form `name:` key is the label; the id (from the filename)
+        // is independent and stays the storage key.
+        let labeled_yaml = format!("name: My Project\n{base}");
+        let mut labeled = Project::from_yaml_str(&labeled_yaml).unwrap();
+        labeled.name = "contextstore".to_string();
+        assert_eq!(labeled.label.as_deref(), Some("My Project"));
+        assert_eq!(labeled.display_label(), "My Project");
         assert!(serde_yaml::to_string(&labeled)
             .unwrap()
-            .contains("display_name: ContextStore"));
+            .contains("name: My Project"));
+
+        // The deprecated `display_name:` alias wins over `name` when both are
+        // present (it was explicitly the label under the old two-key shape).
+        let both_yaml = format!("name: My Project\ndisplay_name: The Real Label\n{base}");
+        let mut both = Project::from_yaml_str(&both_yaml).unwrap();
+        both.name = "contextstore".to_string();
+        assert_eq!(both.label.as_deref(), Some("My Project"));
+        assert_eq!(both.display_name.as_deref(), Some("The Real Label"));
+        assert_eq!(both.display_label(), "The Real Label");
     }
 
     #[test]
@@ -3170,7 +3198,9 @@ agent_runners:
 "#
         );
         let p: Project = serde_yaml::from_str(&yaml).unwrap();
-        assert_eq!(p.name, "p");
+        // The YAML `name:` deserializes into the display label; the id is
+        // filename-derived and not present in a bare serde parse.
+        assert_eq!(p.label.as_deref(), Some("p"));
         let back = serde_yaml::to_string(&p).unwrap();
         assert!(!back.contains(legacy_key));
     }
@@ -3213,6 +3243,7 @@ workspace_settings_template: /etc/shelbi/p.json
         );
         let project = Project {
             name: "p".into(),
+            label: None,
             display_name: None,
             repo: "r".into(),
             default_branch: "main".into(),
@@ -3331,6 +3362,7 @@ workspaces:
         };
         Project {
             name: "p".into(),
+            label: None,
             display_name: None,
             repo: "r".into(),
             default_branch: "main".into(),
@@ -3582,6 +3614,7 @@ workspaces:
         );
         Project {
             name: "p".into(),
+            label: None,
             display_name: None,
             repo: "r".into(),
             default_branch: "main".into(),
@@ -4591,7 +4624,9 @@ git:
   branch: '{{github_user}}/{{id}}'
   branch_prefix: task
 "#;
-        let p: Project = serde_yaml::from_str(yaml).unwrap();
+        let mut p: Project = serde_yaml::from_str(yaml).unwrap();
+        // The id is stamped from the filename by the loader; simulate that.
+        p.name = "p".to_string();
         let err = p
             .validate_workspaces()
             .expect_err("branch + branch_prefix must conflict");
@@ -4854,6 +4889,7 @@ git:
         );
         Project {
             name: "shelbi".into(),
+            label: Some("Shelbi".into()),
             display_name: None,
             default_branch: "main".into(),
             default_workflow: None,
@@ -5219,14 +5255,14 @@ custom_ext: local-side
     }
 
     #[test]
-    fn split_yaml_shared_missing_name_bubbles_up_deserialize_error() {
+    fn split_yaml_shared_missing_required_field_bubbles_up_deserialize_error() {
         // Merging still delegates to the flat Project deserializer for
         // the final assembly, so a required field missing from both
         // halves surfaces as the usual yaml error (not a placement
-        // error). This just documents the seam.
+        // error). `name` is now an *optional* display label, so this uses
+        // `orchestrator` — a genuinely required field — to document the seam.
         let shared = r#"
 default_branch: main
-orchestrator: { runner: claude }
 agent_runners:
   claude: { command: claude, flags: [] }
 "#;
@@ -5236,8 +5272,8 @@ machines:
   - { name: hub, kind: local, work_dir: /tmp }
 "#;
         let err = Project::from_split_yaml_str(shared, local)
-            .expect_err("`name` is required — merge must fail");
+            .expect_err("`orchestrator` is required — merge must fail");
         let msg = err.to_string();
-        assert!(msg.contains("name"), "err was: {msg}");
+        assert!(msg.contains("orchestrator"), "err was: {msg}");
     }
 }

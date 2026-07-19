@@ -446,11 +446,14 @@ fn load_project_for_migration(
     global_yaml_path: &Path,
     local_yaml_path: &Path,
 ) -> Result<Project> {
-    if global_yaml_path.is_file() {
+    // The id is the registry name the migration was invoked with, not any
+    // YAML key (the on-disk `name:` is now a free-form label). Stamp it onto
+    // whichever layout we parse so callers reading `project.name` — including
+    // the emitted split-YAML dir names — get the machine id.
+    let mut project = if global_yaml_path.is_file() {
         let text = fs::read_to_string(global_yaml_path).map_err(Error::Io)?;
-        return Project::from_yaml_str(&text);
-    }
-    if local_yaml_path.is_file() {
+        Project::from_yaml_str(&text)?
+    } else if local_yaml_path.is_file() {
         let local_text = fs::read_to_string(local_yaml_path).map_err(Error::Io)?;
         let repo = extract_repo_from_local_yaml(&local_text, local_yaml_path)?;
         let shared_path = expand_tilde_str(&repo).join(".shelbi").join("project.yaml");
@@ -464,13 +467,16 @@ fn load_project_for_migration(
             )));
         }
         let shared_text = fs::read_to_string(&shared_path).map_err(Error::Io)?;
-        return Project::from_split_yaml_str(&shared_text, &local_text);
-    }
-    Err(Error::Other(format!(
-        "project `{project_name}` not found — no {} and no {}",
-        global_yaml_path.display(),
-        local_yaml_path.display(),
-    )))
+        Project::from_split_yaml_str(&shared_text, &local_text)?
+    } else {
+        return Err(Error::Other(format!(
+            "project `{project_name}` not found — no {} and no {}",
+            global_yaml_path.display(),
+            local_yaml_path.display(),
+        )));
+    };
+    project.name = project_name.to_string();
+    Ok(project)
 }
 
 /// Deserialize just enough of `local.yaml` to recover the `repo:`
@@ -592,6 +598,7 @@ mod tests {
         );
         Project {
             name: name.into(),
+            label: None,
             display_name: None,
             repo: repo.to_string_lossy().into_owned(),
             default_branch: "main".into(),
@@ -1131,7 +1138,9 @@ mod tests {
         // would do once it's mode-aware.
         let shared = fs::read_to_string(repo.join(".shelbi/project.yaml")).unwrap();
         let local = fs::read_to_string(home.join("projects/myapp/local.yaml")).unwrap();
-        let project = Project::from_split_yaml_str(&shared, &local).unwrap();
+        let mut project = Project::from_split_yaml_str(&shared, &local).unwrap();
+        // The id is filename-derived; the loader stamps it — mirror that here.
+        project.name = "myapp".to_string();
         assert_eq!(project.config_mode, Some(ConfigMode::InRepo));
 
         use crate::ProjectPaths;

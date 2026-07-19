@@ -155,6 +155,7 @@ mod tests {
         );
         Project {
             name: "p".into(),
+            label: None,
             display_name: None,
             repo: "/tmp/p".into(),
             default_branch: "main".into(),

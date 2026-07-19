@@ -107,6 +107,12 @@ pub fn list_projects() -> Result<Vec<ProjectSummary>> {
         if path.extension().and_then(|e| e.to_str()) != Some("yaml") {
             continue;
         }
+        // The id is the filename stem, not any YAML key. A file with no usable
+        // stem can't be a project registration — skip it like an unparseable one.
+        let id = match path.file_stem().and_then(|s| s.to_str()) {
+            Some(s) if !s.is_empty() => s.to_string(),
+            _ => continue,
+        };
         let text = match fs::read_to_string(&path) {
             Ok(t) => t,
             Err(_) => continue,
@@ -115,13 +121,12 @@ pub fn list_projects() -> Result<Vec<ProjectSummary>> {
             Ok(p) => p,
             Err(_) => continue,
         };
-        let last_launched = cfg
-            .projects
-            .get(&project.name)
-            .and_then(|m| m.last_launched);
+        let last_launched = cfg.projects.get(&id).and_then(|m| m.last_launched);
         out.push(ProjectSummary {
-            name: project.name.clone(),
-            display_name: project.display_name.clone(),
+            name: id,
+            // Prefer the deprecated `display_name:` alias, then the free-form
+            // `name:` label; `None` renders the id (see `display_label`).
+            display_name: project.display_name.clone().or_else(|| project.label.clone()),
             repo_path: project.repo.clone(),
             machine_count: project.machines.len(),
             workspace_count: project.workspaces.len(),

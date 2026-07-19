@@ -1104,7 +1104,7 @@ mod tests {
     }
 
     fn mixed_runner_project() -> Project {
-        Project::from_yaml_str(
+        let mut p = Project::from_yaml_str(
             r#"
 name: p
 repo: /tmp/p
@@ -1121,11 +1121,15 @@ workspaces:
   - { name: bravo, machine: hub, runner: codex }
 "#,
         )
-        .unwrap()
+        .unwrap();
+        // The id is filename-derived; the loader stamps it — mirror that so
+        // `save_project` writes `p.yaml` rather than an empty-stem file.
+        p.name = "p".to_string();
+        p
     }
 
     fn mixed_runner_in_repo_project() -> Project {
-        Project::from_yaml_str(
+        let mut p = Project::from_yaml_str(
             r#"
 name: p
 config_mode: in-repo
@@ -1143,7 +1147,10 @@ workspaces:
   - { name: bravo, machine: hub, runner: codex }
 "#,
         )
-        .unwrap()
+        .unwrap();
+        // The id is filename-derived; the loader stamps it — mirror that here.
+        p.name = "p".to_string();
+        p
     }
 
     #[test]

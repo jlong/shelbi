@@ -1034,6 +1034,7 @@ mod tests {
         runners.insert(workspace.runner.clone(), runner);
         Project {
             name: name.into(),
+            label: None,
             display_name: None,
             repo: "git@example:repo.git".into(),
             default_branch: "main".into(),

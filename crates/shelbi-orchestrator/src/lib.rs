@@ -3096,6 +3096,7 @@ mod reload_target_tmux_tests {
     ) -> shelbi_core::Project {
         shelbi_core::Project {
             name: project_name.into(),
+            label: None,
             display_name: None,
             default_branch: "main".into(),
             default_workflow: None,
@@ -3617,6 +3618,7 @@ mod reload_workspace_tmux_tests {
         );
         let project = Project {
             name: name.into(),
+            label: None,
             display_name: None,
             repo: "/tmp/repo".into(),
             default_branch: "main".into(),

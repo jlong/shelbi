@@ -93,6 +93,7 @@ pub(crate) mod test_support {
         );
         let project = Project {
             name: project_name.into(),
+            label: None,
             display_name: None,
             repo: repo.to_string_lossy().into(),
             default_branch: "main".into(),

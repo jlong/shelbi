@@ -242,6 +242,7 @@ mod tests {
         );
         Project {
             name: "demo".into(),
+            label: None,
             display_name: None,
             repo: "git@example:demo.git".into(),
             default_branch: "main".into(),

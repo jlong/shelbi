@@ -200,12 +200,16 @@ fn wait_for_init<T>(mut child: Child, input_guard: T) -> CompletedProcess {
 }
 
 fn load_project(home: &Path, name: &str) -> Project {
+    // The id is the config filename stem now, not a YAML key — match on the
+    // file `<name>.yaml` and stamp the id the way the real loader does.
     snapshot_files(home)
-        .into_values()
-        .find_map(|contents| {
-            serde_yaml::from_slice::<Project>(&contents)
-                .ok()
-                .filter(|project| project.name == name)
+        .into_iter()
+        .filter(|(path, _)| path.file_stem().and_then(|s| s.to_str()) == Some(name))
+        .find_map(|(_, contents)| {
+            serde_yaml::from_slice::<Project>(&contents).ok().map(|mut project| {
+                project.name = name.to_string();
+                project
+            })
         })
         .unwrap_or_else(|| panic!("project registration for {name} was not generated"))
 }

@@ -685,7 +685,7 @@ impl KanbanApp {
         match shelbi_state::load_project(&self.project_name) {
             Ok(p) => {
                 self.default_workflow_name = p.default_workflow_name().to_string();
-                self.display_name = p.display_name.clone();
+                self.display_name = p.display_name.clone().or_else(|| p.label.clone());
                 self.workspaces = p.workspaces.into_iter().map(|w| w.name).collect();
             }
             Err(_) => {
@@ -3502,6 +3502,7 @@ mod tests {
         // Project needs to exist so refresh() can populate workspaces.
         let project = shelbi_core::Project {
             name: "demo".into(),
+            label: None,
             display_name: None,
             repo: "git@example:demo.git".into(),
             default_branch: "main".into(),
@@ -5225,6 +5226,7 @@ mod tests {
 
         let project = shelbi_core::Project {
             name: "demo".into(),
+            label: None,
             display_name: None,
             repo: "git@example:demo.git".into(),
             default_branch: "main".into(),

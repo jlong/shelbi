@@ -723,6 +723,7 @@ pub fn load_project(project: &str) -> Result<Project> {
     let mut p = match read_to_string_at(&global_path) {
         Ok(text) => {
             warn_legacy_workers_key(project, &text);
+            warn_project_name_is_now_a_label(project, &text);
             Project::from_yaml_str(&text)?
         }
         // No global YAML — this is either an in-repo project (migrated)
@@ -730,17 +731,23 @@ pub fn load_project(project: &str) -> Result<Project> {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => load_project_split(project)?,
         Err(e) => return Err(shelbi_core::Error::Io(e)),
     };
-    // Defense-in-depth: the project name is interpolated into shell command
-    // strings (tmux pane loops, `--project` args) all over the orchestrator,
-    // and dashboard setup derives an agent id from it. Creation already
-    // normalizes the name into a kebab/snake slug, but a project scaffolded
-    // by a pre-normalization shelbi, or a hand-edited YAML, could carry an
-    // uppercase/space/metacharacter name. Reject it here — the single load
+    // The project **id** is the config file's basename (`shelbi.yaml` → `shelbi`),
+    // not any YAML key — the on-disk `name:` is now a free-form display label.
+    // Stamp the id from the filename stem the loader was handed (for the split
+    // in-repo layout it is the local registry dir name), so every downstream
+    // consumer reading `p.name` gets the machine id.
+    p.name = project.to_string();
+    // Defense-in-depth: the id is interpolated into shell command strings
+    // (tmux pane loops, `--project` args) all over the orchestrator, and
+    // dashboard setup derives an agent id from it. Onboarding normalizes the
+    // filename into a kebab/snake slug, but a file scaffolded by a
+    // pre-normalization shelbi, or hand-renamed, could carry an
+    // uppercase/space/metacharacter stem. Reject it here — the single load
     // chokepoint every dashboard/orchestrator path funnels through — so such
-    // a name can never reach a shell or `validate_agent_id` deep in
+    // an id can never reach a shell or `validate_agent_id` deep in
     // `ensure_dashboard`, and the user gets an actionable rename hint instead
     // of the bare invalid-agent-id crash.
-    validate_loaded_project_name(&p.name)?;
+    validate_loaded_project_name(project)?;
     p.validate_workspaces()?;
     let repo = p.repo.clone();
     p.detect_shapes(repo);
@@ -780,48 +787,118 @@ pub fn load_project(project: &str) -> Result<Project> {
 /// back to the two-file in-repo split. Both branches are read-only.
 fn load_project_bare(project: &str) -> Result<Project> {
     let global_path = projects_dir()?.join(format!("{project}.yaml"));
-    let p = match read_to_string_at(&global_path) {
+    let mut p = match read_to_string_at(&global_path) {
         Ok(text) => Project::from_yaml_str(&text)?,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => load_project_split(project)?,
         Err(e) => return Err(shelbi_core::Error::Io(e)),
     };
-    validate_loaded_project_name(&p.name)?;
+    // The id is the filename stem — see [`load_project`].
+    p.name = project.to_string();
+    validate_loaded_project_name(project)?;
     Ok(p)
 }
 
-/// Guard a *loaded* project's `name:` at the storage chokepoint.
+/// Guard a project's **id** — the config file's basename stem — at the
+/// storage chokepoint.
 ///
 /// Every dashboard/orchestrator entry point loads the project through
-/// [`load_project`] before deriving agent ids and tmux session names from
-/// its `name`, so this is the single place an un-normalized on-disk name can
-/// be stopped before it reaches [`shelbi_core::validate_agent_id`] deep in
+/// [`load_project`] before deriving agent ids and tmux session names from the
+/// id, so this is the single place an un-normalized filename stem can be
+/// stopped before it reaches [`shelbi_core::validate_agent_id`] deep in
 /// `ensure_dashboard` — where it would otherwise surface as the bare, cryptic
 /// `invalid agent id` error (the capitalized-directory launch crash).
 ///
-/// A valid id passes straight through. An invalid one becomes an actionable
-/// error that names the offending project and, when the name can be
-/// slugified, the normalized id to rename it to. Onboarding normalizes names
-/// into this charset up front (see [`shelbi_core::normalize_project_name`]),
-/// so this only ever fires for a project scaffolded by a pre-normalization
-/// shelbi or a hand-edited YAML.
-fn validate_loaded_project_name(name: &str) -> Result<()> {
-    if shelbi_core::validate_agent_id(name).is_ok() {
+/// A valid stem passes straight through. An invalid one becomes an actionable
+/// error naming the offending file and, when the stem can be slugified, the
+/// normalized id to rename the file to. The id now lives in the filename, so
+/// the fix is always to **rename the file** (never to edit a field).
+/// Onboarding normalizes filenames into this charset up front (see
+/// [`shelbi_core::normalize_project_name`]), so this only ever fires for a
+/// file scaffolded by a pre-normalization shelbi or hand-renamed.
+fn validate_loaded_project_name(stem: &str) -> Result<()> {
+    if shelbi_core::validate_agent_id(stem).is_ok() {
         return Ok(());
     }
-    let rename_hint = match shelbi_core::normalize_project_name(name) {
+    let rename_hint = match shelbi_core::normalize_project_name(stem) {
         Ok(suggestion) => format!(
-            "rename it to `{suggestion}`: move ~/.shelbi/projects/{name}.yaml to \
-             ~/.shelbi/projects/{suggestion}.yaml and set its `name:` field to `{suggestion}`"
+            "rename the file to `{suggestion}.yaml`: move ~/.shelbi/projects/{stem}.yaml to \
+             ~/.shelbi/projects/{suggestion}.yaml (the id comes from the filename now — the \
+             `name:` key inside is a free-form display label)"
         ),
-        Err(_) => "rename it to a valid id — lowercase ASCII letters, digits, `-`, and `_`, \
-                   starting with a letter or digit (e.g. `my-app`)"
+        Err(_) => "rename the file to a valid id — lowercase ASCII letters, digits, `-`, and \
+                   `_`, starting with a letter or digit (e.g. `my-app.yaml`)"
             .to_string(),
     };
     Err(shelbi_core::Error::Other(format!(
-        "project name `{name}` is not a valid shelbi id (only lowercase ASCII letters, digits, \
-         `-`, and `_` are allowed, starting with a letter or digit). Dashboard setup derives an \
-         agent id from it and can't launch as-is — {rename_hint}."
+        "project config ~/.shelbi/projects/{stem}.yaml has an invalid id `{stem}` (the id is the \
+         filename stem; only lowercase ASCII letters, digits, `-`, and `_` are allowed, starting \
+         with a letter or digit). Dashboard setup derives an agent id from it and can't launch \
+         as-is — {rename_hint}."
     )))
+}
+
+/// One-time-per-process advisory when a global project YAML's `name:` key is
+/// no longer the id. The id is now the filename stem; `name:` is a free-form
+/// display label. Two cases warrant a nudge:
+///
+/// * A legacy `display_name:` key is present — deprecated, now folded into
+///   `name:` — so tell the user to migrate it (dropped next release).
+/// * A `name:` value that *looks like an id* (passes the id charset) but
+///   differs from the filename stem. That is almost certainly a pre-change
+///   file where `name:` meant the id; the stem now wins, so warn that the
+///   value is only a label. A free-form label (`My Project`) or a `name:`
+///   equal to the stem (the universal legacy convention) is silent.
+///
+/// Best-effort: a YAML that doesn't parse as a mapping is left to the real
+/// loader to reject, and no warning fires. Routed through `tracing::warn!`
+/// (not `eprintln!`) for the same TUI-safety reason as
+/// [`warn_legacy_workers_key`].
+fn warn_project_name_is_now_a_label(stem: &str, yaml: &str) {
+    use std::sync::Mutex;
+    static WARNED: Mutex<Option<HashSet<String>>> = Mutex::new(None);
+
+    #[derive(serde::Deserialize)]
+    struct Head {
+        name: Option<String>,
+        display_name: Option<String>,
+    }
+    let Ok(head) = serde_yaml::from_str::<Head>(yaml) else {
+        return;
+    };
+    let has_display_name = head
+        .display_name
+        .as_deref()
+        .map(|s| !s.trim().is_empty())
+        .unwrap_or(false);
+    let name_looks_like_stray_id = head
+        .name
+        .as_deref()
+        .map(|n| n != stem && shelbi_core::validate_agent_id(n).is_ok())
+        .unwrap_or(false);
+    if !has_display_name && !name_looks_like_stray_id {
+        return;
+    }
+    let mut guard = WARNED.lock().unwrap();
+    let seen = guard.get_or_insert_with(HashSet::new);
+    if !seen.insert(stem.to_string()) {
+        return;
+    }
+    if has_display_name {
+        tracing::warn!(
+            project = stem,
+            "shelbi: project `{stem}` uses the deprecated `display_name:` key; it now serves as \
+             the display label — move its value to `name:` and delete `display_name:` \
+             (the alias will be removed in a future release)"
+        );
+    } else {
+        let name = head.name.as_deref().unwrap_or_default();
+        tracing::warn!(
+            project = stem,
+            "shelbi: project `{stem}`'s `name: {name}` no longer sets the id — the id `{stem}` \
+             comes from the filename now, and `name:` is a free-form display label. Rename the \
+             file if you meant to change the id"
+        );
+    }
 }
 
 /// In-repo fallback for [`load_project`]: read
@@ -2745,6 +2822,7 @@ mod tests {
         );
         Project {
             name: name.into(),
+            label: None,
             display_name: None,
             repo: "r".into(),
             default_branch: "main".into(),
@@ -5322,34 +5400,155 @@ mod tests {
         std::env::remove_var("SHELBI_HOME");
     }
 
-    /// The defensive chokepoint: a project whose on-disk `name:` is not a
-    /// valid agent id (a capitalized folder that a pre-normalization shelbi
-    /// scaffolded, or a hand-edited YAML) must fail `load_project` with an
-    /// actionable rename hint — NOT the bare `invalid agent id` crash that
-    /// `ensure_dashboard` would otherwise surface. This guards the launch
-    /// path even if some future ingress forgets to normalize.
+    /// Write a minimal valid global project YAML at `<stem>.yaml`, prefixing
+    /// the given raw `name:`/`display_name:` lines. Bypasses `save_project`
+    /// so a test controls exactly which naming keys land on disk.
+    fn write_raw_project(home: &Path, stem: &str, naming_lines: &str) {
+        let dir = home.join("projects");
+        std::fs::create_dir_all(&dir).unwrap();
+        let body = format!(
+            "{naming_lines}repo: /tmp/{stem}\n\
+             machines:\n\
+             \x20\x20- {{ name: hub, kind: local, work_dir: /tmp }}\n\
+             orchestrator: {{ runner: claude }}\n\
+             agent_runners:\n\
+             \x20\x20claude: {{ command: claude, flags: [] }}\n"
+        );
+        std::fs::write(dir.join(format!("{stem}.yaml")), body).unwrap();
+    }
+
+    /// The id is the filename stem; the free-form `name:` key is a display
+    /// label. A file `shelbi.yaml` carrying `name: My Project` loads with id
+    /// `shelbi` (every machine-facing key) and label "My Project".
     #[test]
-    fn load_project_rejects_uppercase_name_with_actionable_error() {
+    fn load_project_id_from_filename_name_is_label() {
         let _g = TEST_LOCK.lock().unwrap();
         let home = fresh_home();
         std::env::set_var("SHELBI_HOME", &home);
 
-        // Plant an on-disk YAML whose `name:` is `Shaft`, bypassing
-        // `save_project` (which normalizes/validates on write) so we
-        // exercise the loader's own guard.
+        write_raw_project(&home, "shelbi", "name: My Project\n");
+        let loaded = load_project("shelbi").unwrap();
+        assert_eq!(loaded.name, "shelbi", "id comes from the filename");
+        assert_eq!(loaded.label.as_deref(), Some("My Project"));
+        assert_eq!(loaded.display_label(), "My Project");
+        std::env::remove_var("SHELBI_HOME");
+    }
+
+    /// A YAML with no `name:` key loads and displays the id as its label.
+    #[test]
+    fn load_project_missing_name_labels_as_id() {
+        let _g = TEST_LOCK.lock().unwrap();
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+
+        write_raw_project(&home, "shelbi", "");
+        let loaded = load_project("shelbi").unwrap();
+        assert_eq!(loaded.name, "shelbi");
+        assert_eq!(loaded.label, None);
+        assert_eq!(loaded.display_label(), "shelbi");
+        std::env::remove_var("SHELBI_HOME");
+    }
+
+    /// Legacy convention: `name:` equals the filename stem. Loads with the id
+    /// unchanged; the value now just serves as the (id-equal) label.
+    #[test]
+    fn load_project_legacy_name_equals_stem_loads() {
+        let _g = TEST_LOCK.lock().unwrap();
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+
+        write_raw_project(&home, "shelbi", "name: shelbi\n");
+        let loaded = load_project("shelbi").unwrap();
+        assert_eq!(loaded.name, "shelbi");
+        assert_eq!(loaded.label.as_deref(), Some("shelbi"));
+        assert_eq!(loaded.display_label(), "shelbi");
+        std::env::remove_var("SHELBI_HOME");
+    }
+
+    /// A legacy `name:` that is a valid id but differs from the stem: the stem
+    /// still wins as the id, and the value degrades to a display label.
+    #[test]
+    fn load_project_name_differs_from_stem_stem_wins_as_id() {
+        let _g = TEST_LOCK.lock().unwrap();
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+
+        write_raw_project(&home, "shelbi", "name: legacy-id\n");
+        let loaded = load_project("shelbi").unwrap();
+        // Machine-facing id is the filename, not the stray `name:` value.
+        assert_eq!(loaded.name, "shelbi");
+        assert_eq!(loaded.label.as_deref(), Some("legacy-id"));
+        std::env::remove_var("SHELBI_HOME");
+    }
+
+    /// The deprecated `display_name:` alias is still honored this release and
+    /// wins over `name:` as the label when both are present.
+    #[test]
+    fn load_project_display_name_alias_wins_as_label() {
+        let _g = TEST_LOCK.lock().unwrap();
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+
+        write_raw_project(
+            &home,
+            "shelbi",
+            "name: My Project\ndisplay_name: The Real Label\n",
+        );
+        let loaded = load_project("shelbi").unwrap();
+        assert_eq!(loaded.name, "shelbi");
+        assert_eq!(loaded.label.as_deref(), Some("My Project"));
+        assert_eq!(loaded.display_name.as_deref(), Some("The Real Label"));
+        assert_eq!(loaded.display_label(), "The Real Label");
+        std::env::remove_var("SHELBI_HOME");
+    }
+
+    /// An invalid filename stem (e.g. a space) fails at load with an actionable
+    /// error that names the file — even when the inner `name:` label is fine.
+    #[test]
+    fn load_project_invalid_stem_fails_even_with_valid_label() {
+        let _g = TEST_LOCK.lock().unwrap();
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+
+        write_raw_project(&home, "my project", "name: My Project\n");
+        let err = load_project("my project").unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("my project.yaml"), "should name the file: {msg}");
+        assert!(
+            !matches!(err, shelbi_core::Error::InvalidAgentId(_)),
+            "chokepoint should return an actionable error, not InvalidAgentId"
+        );
+        std::env::remove_var("SHELBI_HOME");
+    }
+
+    /// The defensive chokepoint: a project whose config **filename stem** is
+    /// not a valid agent id (a capitalized file that a pre-normalization
+    /// shelbi scaffolded, or a hand-renamed YAML) must fail `load_project`
+    /// with an actionable rename hint — NOT the bare `invalid agent id` crash
+    /// that `ensure_dashboard` would otherwise surface. This guards the launch
+    /// path even if some future ingress forgets to normalize. The id is the
+    /// filename now, so the fix names the file, not a field.
+    #[test]
+    fn load_project_rejects_uppercase_stem_with_actionable_error() {
+        let _g = TEST_LOCK.lock().unwrap();
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+
+        // Plant an on-disk YAML at `Shaft.yaml` — an invalid stem — bypassing
+        // `save_project` (which normalizes/validates on write) so we exercise
+        // the loader's own guard.
         std::fs::create_dir_all(home.join("projects")).unwrap();
-        let mut p = fixture_project("shaft", None);
-        p.name = "Shaft".to_string();
+        let p = fixture_project("shaft", None);
         let yaml = serde_yaml::to_string(&p).unwrap();
         std::fs::write(home.join("projects/Shaft.yaml"), yaml).unwrap();
 
         let err = load_project("Shaft").unwrap_err();
         let msg = err.to_string();
-        // Names the offending project and suggests the normalized id...
-        assert!(msg.contains("Shaft"), "should name the project: {msg}");
+        // Names the offending file and suggests the normalized id...
+        assert!(msg.contains("Shaft.yaml"), "should name the file: {msg}");
         assert!(
-            msg.contains("`shaft`"),
-            "should suggest the normalized name `shaft`: {msg}"
+            msg.contains("shaft.yaml"),
+            "should suggest renaming the file to `shaft.yaml`: {msg}"
         );
         // ...and is NOT the cryptic bare invalid-agent-id error.
         assert!(
