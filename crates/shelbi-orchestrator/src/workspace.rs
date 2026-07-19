@@ -988,6 +988,11 @@ pub fn kill_workspace_pane(host: &Host, addr: &TmuxAddr, workspace_name: &str) -
             if window_ids.is_empty() {
                 return Ok(());
             }
+            // Rescue the traveling sidebar before the kill: if the user was
+            // viewing this workspace its window holds the single shared
+            // sidebar pane, and `kill-window` would take it down too. This
+            // relocates it back to the dashboard and returns focus there.
+            crate::evict_sidebar_from_windows(host, &addr.session, &window_ids);
             // Best-effort — the wrapper's fallback (fire the event with
             // its historical reason) is the pre-fix behavior, so a mark
             // failure just degrades to that. Set once before killing any

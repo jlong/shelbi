@@ -735,10 +735,14 @@ impl App {
             return;
         };
         match job.rx.try_recv() {
-            Ok(Ok(_target)) => {
-                // The review workspace is now checking out / serving; the next
-                // refresh moves the card into the Ready-for-Review section.
-                self.status_line = format!("loading review for {}…", job.task_id);
+            Ok(Ok(target)) => {
+                // The review workspace's window now holds the server pane;
+                // switch to it so the review is on screen (the traveling
+                // sidebar follows via the `after-select-window` hook). The
+                // next refresh moves the card into the Ready-for-Review
+                // section. Best-effort: a failed switch just leaves focus put.
+                let _ = run_tmux(["select-window", "-t", &target]);
+                self.status_line = format!("▶ reviewing {}", job.task_id);
                 self.review_job = None;
             }
             Ok(Err(e)) => {
@@ -2943,7 +2947,7 @@ mod tests {
         app.poll_review_load();
         assert!(app.review_job.is_none(), "a finished load clears the job");
         assert!(
-            app.status_line.contains("loading review for t-1"),
+            app.status_line.contains("▶ reviewing t-1"),
             "got: {}",
             app.status_line
         );
