@@ -765,9 +765,10 @@ impl App {
 
     /// Open the review interface for a Ready-for-review task, or kick off a
     /// background load for a still-Queued one. Delegates to
-    /// [`shelbi_orchestrator::review_ui::open_review_interface`], which
-    /// reshapes the dashboard into the three-column layout (Ready) or starts
-    /// the review agent detached without stealing focus (Queued).
+    /// [`shelbi_orchestrator::review_ui::open_review_interface`], which builds
+    /// the three-column layout inside the review workspace's own window and
+    /// switches to it (Ready), or starts the review agent detached without
+    /// stealing focus (Queued).
     fn start_review(&self, id: &str) -> Result<String> {
         use shelbi_orchestrator::review_ui::ReviewOpenOutcome;
         let outcome = shelbi_orchestrator::review_ui::open_review_interface(&self.project_name, id)
