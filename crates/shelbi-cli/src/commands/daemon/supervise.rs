@@ -157,25 +157,10 @@ fn install_launchd() -> Result<()> {
     let uid = current_uid();
     migrate_legacy_launchd(uid);
 
-    // Idempotent reinstall: bootout the old instance (if any) before
-    // bootstrapping the freshly-written plist. bootout returns non-zero
-    // when nothing is loaded; that's fine — swallow it.
-    let _ = Command::new("launchctl")
-        .args(["bootout", &gui_target(uid)])
-        .status();
-
-    let status = Command::new("launchctl")
-        .args(["bootstrap", &gui_domain(uid)])
-        .arg(&plist_path)
-        .status()
-        .context("invoking launchctl bootstrap")?;
-    if !status.success() {
-        bail!(
-            "launchctl bootstrap failed (exit {:?}) — see `launchctl print {}` for details",
-            status.code(),
-            gui_target(uid)
-        );
-    }
+    // Idempotent reinstall: bootout the old instance (if any), then
+    // bootstrap the freshly-written plist — retrying through launchd's
+    // transient EIO. See [`bootstrap_launchd`].
+    bootstrap_launchd(uid, &plist_path)?;
 
     println!("✓ installed launchd agent at {}", plist_path.display());
     println!("  label: {SERVICE_LABEL}");
@@ -254,24 +239,87 @@ fn restart_launchd() -> Result<()> {
     let uid = current_uid();
     let target = gui_target(uid);
     // bootout + bootstrap forces launchd to ingest the refreshed plist;
-    // kickstart alone keeps the already-loaded (possibly stale) unit.
-    let _ = Command::new("launchctl")
-        .args(["bootout", &target])
-        .status();
-    let status = Command::new("launchctl")
-        .args(["bootstrap", &gui_domain(uid)])
-        .arg(&plist_path)
-        .status()
-        .context("invoking launchctl bootstrap")?;
-    if !status.success() {
-        bail!(
-            "launchctl bootstrap {} failed — is the agent installed? \
-             (run `shelbi daemon install`)",
-            target
-        );
-    }
+    // kickstart alone keeps the already-loaded (possibly stale) unit. The
+    // retry in [`bootstrap_launchd`] rides out launchd's transient EIO.
+    bootstrap_launchd(uid, &plist_path)?;
     println!("✓ restarted {target} on the current shelbi binary");
     Ok(())
+}
+
+/// Load the freshly-written plist into launchd, booting out any prior
+/// instance first, and retry through the transient `Input/output error`
+/// (EIO, exit 5) that `bootstrap` sometimes returns while an unload is
+/// still settling.
+///
+/// A single bootout+bootstrap pair is not reliable: on a host where the
+/// service is absent, `bootout` prints "No such process" and the following
+/// `bootstrap` can fail with EIO, leaving the daemon DOWN — yet running
+/// `shelbi daemon install` again immediately recovers it. This loops that
+/// recovery in-process (a fresh bootout clears any half-registered unit
+/// between tries) so one invocation is idempotent regardless of the
+/// starting state. `bootout` returns non-zero when nothing is loaded; that
+/// is expected on a first install, so its status and its "No such process"
+/// noise are both swallowed.
+///
+/// Only a genuine, repeated failure — a bootstrap that never succeeds and
+/// leaves the service unloaded — is surfaced as an error.
+#[cfg(target_os = "macos")]
+fn bootstrap_launchd(uid: u32, plist_path: &std::path::Path) -> Result<()> {
+    const ATTEMPTS: u32 = 4;
+    let mut last: Option<(Option<i32>, String)> = None;
+    for attempt in 1..=ATTEMPTS {
+        let _ = Command::new("launchctl")
+            .args(["bootout", &gui_target(uid)])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
+
+        let out = Command::new("launchctl")
+            .args(["bootstrap", &gui_domain(uid)])
+            .arg(plist_path)
+            .output()
+            .context("invoking launchctl bootstrap")?;
+        // Treat a service that ends up loaded as success even if bootstrap
+        // reported non-zero, so a spurious EIO over a good registration
+        // doesn't abort the install.
+        if out.status.success() || service_loaded(uid) {
+            return Ok(());
+        }
+        last = Some((
+            out.status.code(),
+            String::from_utf8_lossy(&out.stderr).trim().to_string(),
+        ));
+        if attempt < ATTEMPTS {
+            // Let launchd finish tearing down the prior unit before the
+            // next bootout+bootstrap.
+            std::thread::sleep(std::time::Duration::from_millis(500));
+        }
+    }
+    let (code, stderr) = last.unwrap_or((None, String::new()));
+    let detail = if stderr.is_empty() {
+        String::new()
+    } else {
+        format!("{stderr}; ")
+    };
+    bail!(
+        "launchctl bootstrap failed (exit {code:?}) after {ATTEMPTS} attempts — \
+         {detail}see `launchctl print {}` for details",
+        gui_target(uid)
+    );
+}
+
+/// True when launchd has the shelbi agent loaded in the user's GUI domain.
+/// Used as the fallback success signal for [`bootstrap_launchd`] when
+/// `bootstrap` returns a spurious non-zero over an already-registered unit.
+#[cfg(target_os = "macos")]
+fn service_loaded(uid: u32) -> bool {
+    Command::new("launchctl")
+        .args(["print", &gui_target(uid)])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
 }
 
 #[cfg(target_os = "macos")]

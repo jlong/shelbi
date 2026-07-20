@@ -124,7 +124,16 @@ echo "==> $("$INSTALL_PATH" --version)"
 if [[ $install_daemon -eq 1 ]]; then
   echo
   echo "==> registering daemon with platform supervisor"
+  # `daemon install` is idempotent: it boots out any prior instance and
+  # (re)loads the freshly built binary's unit, riding out launchd's transient
+  # EIO on bootstrap. A genuine, repeated failure exits non-zero, which the
+  # `set -e` above turns into a loud install failure. On success the daemon is
+  # running; we print its status so the outcome is visible.
   "$INSTALL_PATH" daemon install
+
+  echo
+  echo "==> daemon status"
+  "$INSTALL_PATH" daemon status || true
 
   if [[ "$(uname -s)" == "Linux" ]] && [[ -z "${DISPLAY:-}" ]] && [[ -z "${WAYLAND_DISPLAY:-}" ]]; then
     cat <<'LINGER'
