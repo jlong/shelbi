@@ -31,11 +31,12 @@ pub fn render_full(f: &mut Frame, app: &mut App, area: Rect) {
         .constraints([Constraint::Min(1), Constraint::Length(footer_height)])
         .split(area);
 
-    let list_area = outer[0].inner(Margin {
-        horizontal: 1,
-        vertical: 0,
-    });
-    render_list(f, app, list_area);
+    // The list gets the full sidebar width — the nav section's selection fill
+    // and its half-block bleed rows paint edge-to-edge of the column, so they
+    // can't sit inside the 1-col horizontal padding. render_list re-applies
+    // that padding to the title and the rest-of-list rows itself, the same way
+    // render_footer does for the zen band.
+    render_list(f, app, outer[0]);
     render_footer(f, app, outer[1]);
 
     // The review-load confirm floats over the whole sidebar so it reads as a
@@ -109,6 +110,15 @@ fn render_review_prompt(f: &mut Frame, app: &App, area: Rect) {
     f.render_widget(Paragraph::new(body).wrap(Wrap { trim: true }), inner);
 }
 
+/// 1-col horizontal padding shared by the title, the nav labels, and the
+/// rest-of-list rows. The nav section's full-width fill deliberately bypasses
+/// it (painting from column 0) while its label text re-applies it, so labels
+/// stay aligned with the unselected items below.
+const LIST_INDENT: Margin = Margin {
+    horizontal: 1,
+    vertical: 0,
+};
+
 fn render_list(f: &mut Frame, app: &mut App, area: Rect) {
     // Project-name header — strong color, blank line below for breathing
     // room. The wireframe is the spec: the project is the context, so no
@@ -127,25 +137,140 @@ fn render_list(f: &mut Frame, app: &mut App, area: Rect) {
         )),
         Line::raw(""),
     ]);
-    f.render_widget(title, layout[0]);
+    f.render_widget(title, layout[0].inner(LIST_INDENT));
 
-    let inner = layout[1];
-    app.list_area = inner;
-    let width = inner.width as usize;
+    // `body` spans the full sidebar width. The leading `Row::Nav` rows render
+    // as a custom full-width block (separator lines + half-block selection
+    // bleed); everything after them stays a normal padded `List`.
+    let body = layout[1];
+    app.list_area = body;
+
     let rows = app.rows();
-    let mut items: Vec<ListItem> = Vec::with_capacity(rows.len());
-    for (i, row) in rows.iter().enumerate() {
+    let nav_n = rows
+        .iter()
+        .take_while(|r| matches!(r, Row::Nav { .. }))
+        .count();
+
+    // The nav always reserves a separator line between every pair of items
+    // plus one above the first and below the last, so moving the selection
+    // never shifts the layout — only which separator carries the bleed.
+    let nav_height = (nav_lines(nav_n) as u16).min(body.height);
+    let nav_area = Rect {
+        height: nav_height,
+        ..body
+    };
+    render_nav(f, app, nav_area, nav_n);
+
+    if body.height <= nav_height {
+        return;
+    }
+    let rest = Rect {
+        y: body.y + nav_height,
+        height: body.height - nav_height,
+        ..body
+    }
+    .inner(LIST_INDENT);
+    let width = rest.width as usize;
+    let mut items: Vec<ListItem> = Vec::with_capacity(rows.len().saturating_sub(nav_n));
+    for (i, row) in rows.iter().enumerate().skip(nav_n) {
         let selected = i == app.sidebar_index && row.is_selectable();
         items.push(render_row(row, selected, width));
     }
 
     let mut state = ListState::default();
-    state.select(Some(app.sidebar_index));
+    // Selection into the rest-of-list is offset by the nav rows we peeled off
+    // the front; a nav selection leaves this list unselected (the nav block
+    // paints its own highlight).
+    if app.sidebar_index >= nav_n {
+        state.select(Some(app.sidebar_index - nav_n));
+    }
     // Full-row dark-gray fill on the selected row. fg/bold for the
     // selected text is set per-span in render_row so the contrast against
     // the new bg is explicit.
     let list = List::new(items).highlight_style(Style::default().bg(crate::theme::SELECTION_BG));
-    f.render_stateful_widget(list, inner, &mut state);
+    f.render_stateful_widget(list, rest, &mut state);
+}
+
+/// Rendered line count of the nav block: one item line per nav row plus a
+/// separator line above the first, below the last, and between each pair —
+/// `2n + 1`. Shared by the renderer and [`App::row_at`] so click mapping and
+/// drawing agree on where the rest-of-list begins.
+pub fn nav_lines(nav_n: usize) -> usize {
+    2 * nav_n + 1
+}
+
+/// Lower/upper half-block glyphs used to bleed the selection background half a
+/// cell above and below the selected nav row. Drawn with their *foreground*
+/// set to the selection background colour so the eye reads the fill as
+/// continuing past the row's edges.
+const BLEED_ABOVE: &str = "▄"; // U+2584 LOWER HALF BLOCK — sits above the row
+const BLEED_BELOW: &str = "▀"; // U+2580 UPPER HALF BLOCK — sits below the row
+
+/// Render the Chat / Tasks / Activity nav as a full-width block: a separator
+/// line between (and bracketing) each item, with the selected item's fill
+/// spanning edge to edge and its adjacent separators carrying the half-block
+/// bleed. Text keeps the same 1-col indent as the rest of the list.
+fn render_nav(f: &mut Frame, app: &App, area: Rect, nav_n: usize) {
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
+    let rows = app.rows();
+    let selected = (app.sidebar_index < nav_n).then_some(app.sidebar_index);
+    let width = area.width as usize;
+    let bleed = crate::theme::SELECTION_BG;
+
+    let mut lines: Vec<Line> = Vec::with_capacity(nav_lines(nav_n));
+    for p in 0..=nav_n {
+        // Separator `p` sits between item `p-1` (above) and item `p` (below).
+        // It shows the lower half-block when the item below it is selected and
+        // the upper half-block when the item above it is selected; blank
+        // otherwise. Only one item is ever selected, so the two cases are
+        // mutually exclusive.
+        let glyph = if selected == Some(p) {
+            Some(BLEED_ABOVE)
+        } else if p > 0 && selected == Some(p - 1) {
+            Some(BLEED_BELOW)
+        } else {
+            None
+        };
+        lines.push(match glyph {
+            Some(g) => Line::from(Span::styled(
+                g.repeat(width),
+                Style::default().fg(bleed),
+            )),
+            None => Line::raw(""),
+        });
+        if let Some(Row::Nav { icon, label, .. }) = rows.get(p) {
+            lines.push(nav_item_line(icon, label, selected == Some(p), width, bleed));
+        }
+    }
+    f.render_widget(Paragraph::new(lines), area);
+}
+
+/// One nav item row. Selected rows fill edge to edge with the selection
+/// background (padding the label out to the full width) and render white/bold;
+/// unselected rows are plain gray with no fill. The single leading space keeps
+/// the label aligned with the 1-col-indented rows below.
+fn nav_item_line(
+    icon: &str,
+    label: &str,
+    selected: bool,
+    width: usize,
+    bg: Color,
+) -> Line<'static> {
+    let text = format!(" {icon} {label}");
+    if selected {
+        let pad = width.saturating_sub(text.chars().count());
+        Line::from(Span::styled(
+            format!("{text}{}", " ".repeat(pad)),
+            Style::default()
+                .fg(Color::White)
+                .bg(bg)
+                .add_modifier(Modifier::BOLD),
+        ))
+    } else {
+        Line::from(Span::styled(text, Style::default().fg(Color::Gray)))
+    }
 }
 
 fn render_row(row: &Row, selected: bool, width: usize) -> ListItem<'static> {
@@ -598,6 +723,118 @@ mod tests {
         assert!(joined.contains(want), "expected {want:?} in:\n{joined}");
     }
 
+    /// Render the whole sidebar at a fixed size and return the flattened
+    /// per-row buffer — the nav tests assert on separator/bleed geometry.
+    fn sidebar_rows(app: &mut App, w: u16, h: u16) -> Vec<String> {
+        let backend = TestBackend::new(w, h);
+        let mut term = Terminal::new(backend).unwrap();
+        term.draw(|f| render_full(f, app, f.area())).unwrap();
+        dump(&term)
+    }
+
+    /// A blank separator line sits between every pair of nav items (and above
+    /// the first / below the last), so moving the selection never shifts where
+    /// the labels land. Chat-selected vs Activity-selected must place every
+    /// label on the identical row.
+    #[test]
+    fn nav_separators_keep_labels_from_shifting_across_selection() {
+        let mut chat = App::new_sidebar("demo");
+        chat.sidebar_index = 0; // Chat
+        let chat_rows = sidebar_rows(&mut chat, 24, 20);
+
+        let mut activity = App::new_sidebar("demo");
+        activity.sidebar_index = 2; // Activity
+        let activity_rows = sidebar_rows(&mut activity, 24, 20);
+
+        for label in ["Chat", "Tasks", "Activity"] {
+            assert_eq!(
+                row_y(&chat_rows, label),
+                row_y(&activity_rows, label),
+                "'{label}' must not move when the selection changes"
+            );
+        }
+        // The three items are one blank/bleed row apart in both states.
+        assert_eq!(
+            row_y(&chat_rows, "Tasks") - row_y(&chat_rows, "Chat"),
+            2,
+            "one separator line always sits between adjacent nav items"
+        );
+    }
+
+    /// The selected nav item's adjacent lines carry the half-block bleed: a
+    /// full-width row of U+2584 directly above and U+2580 directly below, both
+    /// spanning the sidebar edge to edge (column 0 through the last column).
+    #[test]
+    fn selected_nav_item_renders_full_width_half_block_bleed() {
+        let width = 24u16;
+        let mut app = App::new_sidebar("demo");
+        app.sidebar_index = 1; // Tasks
+        let rows = sidebar_rows(&mut app, width, 20);
+
+        let tasks_y = row_y(&rows, "Tasks");
+        let above = &rows[tasks_y - 1];
+        let below = &rows[tasks_y + 1];
+        assert_eq!(
+            *above,
+            BLEED_ABOVE.repeat(width as usize),
+            "the line above the selection is full-width U+2584"
+        );
+        assert_eq!(
+            *below,
+            BLEED_BELOW.repeat(width as usize),
+            "the line below the selection is full-width U+2580"
+        );
+        // The unselected items keep plain blank separators — no bleed leaks
+        // onto rows that aren't adjacent to the selection.
+        let chat_y = row_y(&rows, "Chat");
+        assert!(
+            rows[chat_y - 1].trim().is_empty(),
+            "the line above unselected Chat stays blank, got: {:?}",
+            rows[chat_y - 1]
+        );
+    }
+
+    /// The selected row's background fill spans the sidebar edge to edge
+    /// (column 0), while the label text keeps the same 1-col indent as the
+    /// unselected items so nothing shifts horizontally on select.
+    #[test]
+    fn selected_nav_fill_spans_full_width_but_text_keeps_indent() {
+        let width = 24u16;
+        let backend = TestBackend::new(width, 20);
+        let mut term = Terminal::new(backend).unwrap();
+        let mut app = App::new_sidebar("demo");
+        app.sidebar_index = 1; // Tasks
+        term.draw(|f| render_full(f, &mut app, f.area())).unwrap();
+
+        let buf = term.backend().buffer().clone();
+        let rows = dump(&term);
+        let tasks_y = row_y(&rows, "Tasks") as u16;
+
+        // Selection background paints edge to edge: the left gutter (column 0,
+        // left of the label) and the trailing padding out to the last column.
+        // (The one cell after a wide emoji is a ratatui continuation-cell
+        // artifact hidden behind the glyph, so it's not asserted here.)
+        assert_eq!(
+            buf[(0, tasks_y)].bg,
+            crate::theme::SELECTION_BG,
+            "left edge (indent gutter) must carry the selection fill"
+        );
+        for x in (width - 4)..width {
+            assert_eq!(
+                buf[(x, tasks_y)].bg,
+                crate::theme::SELECTION_BG,
+                "right edge padding must carry the selection fill, col {x}"
+            );
+        }
+        // The label itself still starts at the 1-col indent (column 0 is a
+        // blank filled cell, the glyph begins at column 1).
+        assert_eq!(
+            buf[(0, tasks_y)].symbol(),
+            " ",
+            "column 0 is the indent gutter, not the label"
+        );
+    }
+
     /// Unbinding a help-referenced action renders `<unbound>` rather than
     /// panicking or dropping the hint.
     #[test]
@@ -817,7 +1054,9 @@ mod tests {
     /// shape.
     #[test]
     fn workspaces_section_renders_grouped_layout_with_agent_column() {
-        let backend = TestBackend::new(28, 16);
+        // Tall enough that the nav block (now 7 lines: 3 items bracketed by
+        // separator rows) doesn't push the grouped workspace rows off-screen.
+        let backend = TestBackend::new(28, 22);
         let mut term = Terminal::new(backend).unwrap();
         let mut app = App::new_sidebar("demo");
         app.workspaces = vec![
