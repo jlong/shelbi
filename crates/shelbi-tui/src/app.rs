@@ -627,15 +627,14 @@ impl App {
             View::ReviewTask(id) => {
                 // A Queued row isn't loaded on a review slot yet: ask before
                 // loading (and load onto a *review* workspace, never the dev
-                // pane that built it). A Ready row is already served, so it
-                // opens the review interface straight away.
+                // pane that built it). A Ready row is already assigned to a
+                // review slot, so open its review interface straight away —
+                // unless that slot's window was never launched, in which case
+                // `open_ready_review` lazily launches it first.
                 if self.queued_review.iter().any(|e| e.task_id == *id) {
                     self.open_review_load_prompt(id);
                 } else {
-                    match self.start_review(id) {
-                        Ok(outcome) => self.status_line = outcome,
-                        Err(e) => self.status_line = format!("review `{id}` failed: {e}"),
-                    }
+                    self.open_ready_review(id);
                 }
             }
         }
@@ -708,18 +707,40 @@ impl App {
         let Some(workspace) = prompt.workspace else {
             return;
         };
+        self.start_review_load(prompt.task_id, workspace);
+    }
+
+    /// Kick off a background load of `task_id` onto the review slot
+    /// `workspace`, showing a spinner and switching focus when it lands.
+    /// Shared by the Queued-for-Review confirm ([`App::confirm_review_load`])
+    /// and the Ready-but-unlaunched path ([`App::open_ready_review`]) so the
+    /// two dispatch through one code path. A no-op when a prior load is still
+    /// running, so two clicks can't stack dispatches. Emits a `dispatch`
+    /// event so the interaction is observable in `events.log` even before the
+    /// launch itself starts logging.
+    fn start_review_load(&mut self, task_id: String, workspace: String) {
+        if self.review_job.is_some() {
+            self.status_line = "a review load is already in progress…".into();
+            return;
+        }
+        let _ = shelbi_state::append_dispatch_event(
+            &task_id,
+            &workspace,
+            "review-load",
+            "loading branch onto review slot",
+        );
         let (tx, rx) = channel();
         let project = self.project_name.clone();
-        let task_id = prompt.task_id.clone();
+        let tid = task_id.clone();
         let ws = workspace.clone();
         std::thread::spawn(move || {
-            let result = shelbi_orchestrator::load::load_review_task(&project, &task_id, &ws)
+            let result = shelbi_orchestrator::load::load_review_task(&project, &tid, &ws)
                 .map_err(|e| e.to_string());
             let _ = tx.send(result);
         });
-        self.status_line = format!("⠋ loading {} onto {workspace}…", prompt.task_id);
+        self.status_line = format!("⠋ loading {task_id} onto {workspace}…");
         self.review_job = Some(ReviewLoadJob {
-            task_id: prompt.task_id,
+            task_id,
             workspace,
             rx,
             started: Instant::now(),
@@ -763,21 +784,32 @@ impl App {
         }
     }
 
-    /// Open the review interface for a Ready-for-review task, or kick off a
-    /// background load for a still-Queued one. Delegates to
+    /// Open the review interface for a Ready-for-review task. Delegates to
     /// [`shelbi_orchestrator::review_ui::open_review_interface`], which builds
     /// the three-column layout inside the review workspace's own window and
-    /// switches to it (Ready), or starts the review agent detached without
-    /// stealing focus (Queued).
-    fn start_review(&self, id: &str) -> Result<String> {
+    /// switches to it.
+    ///
+    /// When the assigned review slot's window was never launched (its first
+    /// use) or was reaped, `open_review_interface` returns
+    /// [`ReviewOpenOutcome::NeedsLaunch`] instead of failing — the first-run
+    /// regression from window-per-workspace, where the embed used to target a
+    /// nonexistent window and silently no-op. Here that launches the slot in
+    /// the background (checkout + boot the review agent/server, same async
+    /// load the Queued confirm uses) and switches to it once it's up; the
+    /// user re-activates the now-live Ready row to get the embedded interface.
+    fn open_ready_review(&mut self, id: &str) {
         use shelbi_orchestrator::review_ui::ReviewOpenOutcome;
-        let outcome = shelbi_orchestrator::review_ui::open_review_interface(&self.project_name, id)
-            .map_err(|e| anyhow::anyhow!(e))?;
-        Ok(match outcome {
-            ReviewOpenOutcome::Opened(_) => format!("▶ reviewing {id}"),
-            ReviewOpenOutcome::Loading => format!("loading review for {id}…"),
-            ReviewOpenOutcome::RemoteFallback(note) => note,
-        })
+        match shelbi_orchestrator::review_ui::open_review_interface(&self.project_name, id) {
+            Ok(ReviewOpenOutcome::Opened(_)) => self.status_line = format!("▶ reviewing {id}"),
+            Ok(ReviewOpenOutcome::Loading) => {
+                self.status_line = format!("loading review for {id}…")
+            }
+            Ok(ReviewOpenOutcome::RemoteFallback(note)) => self.status_line = note,
+            Ok(ReviewOpenOutcome::NeedsLaunch { workspace }) => {
+                self.start_review_load(id.to_string(), workspace)
+            }
+            Err(e) => self.status_line = format!("review `{id}` failed: {e}"),
+        }
     }
 
     /// Flip `state.json::zen_mode` between On and Off via the shared
@@ -2970,6 +3002,31 @@ mod tests {
         assert!(
             app.status_line.contains("review load failed")
                 && app.status_line.contains("busy"),
+            "got: {}",
+            app.status_line
+        );
+    }
+
+    #[test]
+    fn start_review_load_is_a_no_op_while_a_load_is_in_flight() {
+        let mut app = App::new_sidebar("demo");
+        // Keep the sender alive so the pre-existing job reads as still running.
+        let (_tx, rx) = channel::<std::result::Result<String, String>>();
+        app.review_job = Some(ReviewLoadJob {
+            task_id: "first".into(),
+            workspace: "review-1".into(),
+            rx,
+            started: Instant::now(),
+        });
+        // A second kick-off (e.g. a Ready row whose window is being launched)
+        // while the first load is still in flight is refused — the existing
+        // job is left untouched so two activations can't stack dispatches onto
+        // a review slot. Guard returns before any thread spawn or disk write.
+        app.start_review_load("second".into(), "review-2".into());
+        let job = app.review_job.as_ref().expect("job stays present");
+        assert_eq!(job.task_id, "first", "the in-flight job is not replaced");
+        assert!(
+            app.status_line.contains("already in progress"),
             "got: {}",
             app.status_line
         );
