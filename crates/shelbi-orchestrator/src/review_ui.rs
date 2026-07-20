@@ -73,6 +73,15 @@ pub enum ReviewOpenOutcome {
     /// A remote review slot can't be embedded — the caller focused the
     /// workspace window instead. Carries a human note for the status line.
     RemoteFallback(String),
+    /// The task is assigned to a review slot, but that slot's window isn't
+    /// live yet — first use, or a window reaped by a prior teardown. There's
+    /// nothing to embed into, so the caller must launch the workspace (a
+    /// background load onto this slot, which checks out the branch and boots
+    /// the review agent/server) and re-open once it's up. Carries the review
+    /// workspace name to load onto. Without this the embed would target a
+    /// nonexistent window and silently no-op (the first-run regression from
+    /// window-per-workspace).
+    NeedsLaunch { workspace: String },
 }
 
 // ---------------------------------------------------------------------------
@@ -128,6 +137,16 @@ fn unset_session_var(session: &str, key: &str) {
     let _ = tmux_run(&["set-environment", "-t", session, "-u", key]);
 }
 
+/// Whether a local review workspace's window (`shelbi-<proj>:<ws>`) is live —
+/// i.e. it currently holds at least one pane. A review slot that has never
+/// hosted a task (or whose window was reaped by a prior teardown) has none, so
+/// there is nothing to embed the review interface into and the caller must
+/// launch it first. Piggy-backs on [`local_workspace_pane_id`], which fails
+/// exactly when the window is absent.
+fn review_window_live(session: &str, window: &str) -> bool {
+    local_workspace_pane_id(session, window).is_ok()
+}
+
 /// First pane id of a local workspace's window (`shelbi-<proj>:<ws>`).
 fn local_workspace_pane_id(session: &str, window: &str) -> Result<String> {
     let target = format!("{session}:{window}");
@@ -146,12 +165,15 @@ fn local_workspace_pane_id(session: &str, window: &str) -> Result<String> {
 ///
 /// If the task isn't loaded onto a review workspace yet, kicks off a
 /// background load (detached pane — no focus steal) and returns
-/// [`ReviewOpenOutcome::Loading`]. Otherwise builds the three-column layout
-/// **inside the review workspace's own window** — splitting the review panel
-/// onto the right of the agent/server pane and switching to that window so
-/// the traveling sidebar joins its left — and returns that window's target.
-/// The dashboard window is never reshaped, so a review load adds no pane
-/// there.
+/// [`ReviewOpenOutcome::Loading`]. If it *is* assigned to a review slot but
+/// that slot's window isn't live yet (first use, or a reaped window), returns
+/// [`ReviewOpenOutcome::NeedsLaunch`] so the caller launches the workspace
+/// before re-opening — there is no window to embed into. Otherwise builds the
+/// three-column layout **inside the review workspace's own window** —
+/// splitting the review panel onto the right of the agent/server pane and
+/// switching to that window so the traveling sidebar joins its left — and
+/// returns that window's target. The dashboard window is never reshaped, so a
+/// review load adds no pane there.
 pub fn open_review_interface(project_name: &str, task_id: &str) -> Result<ReviewOpenOutcome> {
     let project = shelbi_state::load_project(project_name)?;
     let tf = shelbi_state::load_task(project_name, task_id)?;
@@ -186,6 +208,22 @@ pub fn open_review_interface(project_name: &str, task_id: &str) -> Result<Review
             "review slot `{}` is remote — opened its window instead of the embedded interface",
             ws.name
         )));
+    }
+
+    // First use / reaped window: the review slot the task is assigned to has
+    // no live window, so there is nothing to embed into. Signal the caller to
+    // launch it (checkout the branch + boot the review agent/server) and
+    // re-open once it's up, rather than splitting a panel against a window that
+    // doesn't exist — which after window-per-workspace (#447) silently no-ops.
+    // Any stale interface state left in the session vars from a prior open of a
+    // now-reaped window is cleared first so the re-open takes the fresh path.
+    if !review_window_live(&session, &ws.name) {
+        if read_session_var(&session, PANEL_KEY).is_some() {
+            let _ = close_review_interface(project_name);
+        }
+        return Ok(ReviewOpenOutcome::NeedsLaunch {
+            workspace: ws.name.clone(),
+        });
     }
 
     // Reuse: the interface is already up on this same task — just re-focus its
