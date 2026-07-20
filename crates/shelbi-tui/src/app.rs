@@ -317,15 +317,34 @@ impl App {
         if row < area.y || row >= area.y.saturating_add(area.height) {
             return None;
         }
-        // Map the clicked line back to a row index. Rows are variable-height
-        // now — a review entry is two lines (title + branch) while every
-        // other row is one — so we walk cumulative heights rather than
-        // assuming line == index. (Matches the renderer's no-scroll case; the
-        // list scrolls only when it overflows, which the click map doesn't
-        // model, same as before.)
+        // Map the clicked line back to a row index. Two regions:
+        //
+        //   1. The leading `Row::Nav` rows render as a full-width block whose
+        //      items are interleaved with separator lines — item `k` sits on
+        //      rendered line `2k + 1`, separators on the even lines between.
+        //   2. Everything after them is a normal variable-height list (a review
+        //      entry is two lines, every other row one), so we walk cumulative
+        //      heights from where the nav block ends.
+        //
+        // (Matches the renderer's no-scroll case; the list scrolls only when it
+        // overflows, which the click map doesn't model, same as before.)
         let target = (row - area.y) as usize;
-        let mut line = 0usize;
-        for (idx, r) in self.rows().iter().enumerate() {
+        let rows = self.rows();
+        let nav_n = rows
+            .iter()
+            .take_while(|r| matches!(r, Row::Nav { .. }))
+            .count();
+        let nav_lines = crate::sidebar::nav_lines(nav_n);
+        if target < nav_lines {
+            // Odd lines are item rows; even lines are inert separators.
+            if target % 2 == 1 {
+                let idx = target / 2;
+                return rows.get(idx).and_then(|r| r.is_selectable().then_some(idx));
+            }
+            return None;
+        }
+        let mut line = nav_lines;
+        for (idx, r) in rows.iter().enumerate().skip(nav_n) {
             let h = row_height(r);
             if target < line + h {
                 return r.is_selectable().then_some(idx);
@@ -1769,6 +1788,10 @@ mod tests {
         app.list_area = Rect::new(0, 0, 40, 20);
 
         let rows = app.rows();
+        let nav_n = rows
+            .iter()
+            .take_while(|r| matches!(r, Row::Nav { .. }))
+            .count();
         let ready_idx = rows
             .iter()
             .position(|r| matches!(r, Row::Review { ready: true, .. }))
@@ -1778,9 +1801,20 @@ mod tests {
             .position(|r| matches!(r, Row::Review { ready: false, .. }))
             .unwrap();
 
-        // Cumulative line of the Ready review row's first line = its index
-        // (all rows above it are height 1). Both its lines map to it.
-        let ready_line = ready_idx as u16;
+        // The nav block renders as `2n + 1` lines (item + bracketing/between
+        // separators), so the rest-of-list starts below it. `line_of` walks
+        // cumulative heights from there, mirroring `row_at`'s own math.
+        let rest_start = crate::sidebar::nav_lines(nav_n) as u16;
+        let line_of = |idx: usize| -> u16 {
+            rest_start
+                + rows[nav_n..idx]
+                    .iter()
+                    .map(|r| row_height(r) as u16)
+                    .sum::<u16>()
+        };
+
+        // Both lines of the two-line Ready review row map to its index.
+        let ready_line = line_of(ready_idx);
         assert_eq!(app.row_at(1, ready_line), Some(ready_idx), "title line");
         assert_eq!(
             app.row_at(1, ready_line + 1),
@@ -1788,9 +1822,8 @@ mod tests {
             "branch line maps to the same review row"
         );
 
-        // The Queued review row sits one line lower than a naive
-        // one-line-per-row map would place it (the Ready row ate two lines).
-        let queued_line = ready_line + 2 /* ready row height */ + 1 /* blank */ + 1 /* header */;
+        // The Queued review row sits below the two-line Ready row without drift.
+        let queued_line = line_of(queued_idx);
         assert_eq!(
             app.row_at(1, queued_line),
             Some(queued_idx),
@@ -1803,17 +1836,21 @@ mod tests {
         );
 
         // A section header line is inert.
-        let ready_hdr = rows
-            .iter()
-            .position(|r| matches!(r, Row::Section { label } if label == "Ready for Review"))
-            .unwrap() as u16;
+        let ready_hdr = line_of(
+            rows.iter()
+                .position(|r| matches!(r, Row::Section { label } if label == "Ready for Review"))
+                .unwrap(),
+        );
         assert_eq!(
             app.row_at(1, ready_hdr),
             None,
             "section headers aren't clickable"
         );
-        // First nav row still maps to index 0.
-        assert_eq!(app.row_at(1, 0), Some(0));
+        // The first nav item renders on line 1 (line 0 is its bleed separator,
+        // which is inert).
+        assert_eq!(app.row_at(1, 0), None, "leading separator line is inert");
+        assert_eq!(app.row_at(1, 1), Some(0), "first nav item is on line 1");
+        assert_eq!(app.row_at(1, 3), Some(1), "second nav item is on line 3");
     }
 
     #[test]
